@@ -19,17 +19,20 @@
 //!   re-encoding;
 //! * the record block is allocated **only after every value has decoded** (a truncated
 //!   image fails without touching the heap);
-//! * the live system `erl` accepts both of our images, decodes them to equal terms and
-//!   re-encodes them to *our exact bytes* — which also proves the cached definition
-//!   hash (the local `make_small(0)` vs. C's `make_hash2`) is not on the wire. That
-//!   test skips loudly when no oracle is available (never a silent pass); the rest of
-//!   the file is offline.
+//! * the **cached definition hash** the decoder stores is the real C value —
+//!   `make_hash2({module, name, is_exported, keys-in-declaration-order})`
+//!   (`erl_record.c:1041-1046`), computed from what the wire carried — and the live
+//!   system `erl` agrees: its `phash2(DeclarationTuple, 1 bsl 32)` is that same value.
+//!   The hash is **not** on the wire, so both sides re-encode to *our exact bytes*,
+//!   and that test skips loudly when no oracle is available (never a silent pass); the
+//!   rest of the file is offline.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use beam_alloc::Heap;
-use beam_term::prelude::{atom_val, make_atom, make_small, AtomTable};
+use beam_term::hashing::{compute_record_definition_hash, make_hash2};
+use beam_term::prelude::{atom_val, is_small, make_atom, make_small, unsigned_value, AtomTable};
 
 use beam_codec::term::{
     is_record, record_declaration_keys, record_definition, record_definition_is_exported,
@@ -234,6 +237,59 @@ fn the_record_block_is_allocated_only_after_every_value_decodes() {
 }
 
 // ---------------------------------------------------------------------------
+// The cached definition hash (offline)
+// ---------------------------------------------------------------------------
+
+/// The decoder stores the **real** cached definition hash — `make_hash2` of
+/// `{module, name, is_exported, keys-in-declaration-order}` (`erl_record.c:1041-1046`,
+/// computed *before* the keys are sorted for storage) — and not the `0` placeholder
+/// the forwarding layer used to pass.
+///
+/// The hash is not on the wire, so this is only observable through term hashing:
+/// `make_hash2` mixes the definition's hash word into a record's `erlang:phash2/1`,
+/// so the *total* hash of the decoded record is pinned here as well.
+#[test]
+fn definition_hash_is_the_c_make_hash2_of_the_declaration_tuple() {
+    let mut atoms = seeded_atoms();
+    let mut heap = Heap::new(256).expect("a heap for a 2-field record");
+    let term = decode_term(DECLARATION_ORDER_IMAGE, &mut heap, &mut atoms)
+        .expect("the hand-written RECORD_EXT image decodes");
+    let def = record_definition(term).unwrap();
+
+    // The definition's module/name/flag/declaration keys — the C hash tuple.
+    assert_eq!(atoms.name(atom_val(record_definition_module(def).unwrap())), Some("m"));
+    assert_eq!(atoms.name(atom_val(record_definition_name(def).unwrap())), Some("r"));
+    assert_eq!(record_definition_is_exported(def).unwrap(), make_atom(AM_FALSE));
+    let decl = record_declaration_keys(def).unwrap();
+    assert_eq!(atoms.name(atom_val(decl[0])), Some("b"));
+    assert_eq!(atoms.name(atom_val(decl[1])), Some("a"));
+
+    // SAFETY: `def` points into the record block `heap` owns and keeps alive.
+    let stored = unsafe { beam_term::record::record_definition_hash(def) }.unwrap();
+    assert!(is_small(stored), "the cached hash is a small integer: {stored:?}");
+    let stored_u32 = unsigned_value(stored) as u32;
+    assert_ne!(stored_u32, 0, "the `0` placeholder must be gone");
+    assert_eq!(
+        stored_u32,
+        compute_record_definition_hash(def, &atoms).unwrap(),
+        "definition word 2 must be the computed `make_hash2` of the declaration tuple"
+    );
+    // The exact C value: the system `erl`'s
+    // `phash2({m, r, false, b, a}, 1 bsl 32)` (asserted live in the oracle test below).
+    assert_eq!(stored_u32, 760_411_670);
+
+    // Downstream observable. `seeded_atoms` interns `a` before `b`, so the decoded
+    // instance stores the values in that sorted-key order ([11, 22]); a real VM's atom
+    // interning order (hence the sorted order) varies per start, which is why the live
+    // check below pins the *declaration-order* tuple rather than this instance total.
+    assert_eq!(
+        make_hash2(term, &atoms).unwrap(),
+        1_587_316_312,
+        "`phash2` of the decoded record must mix the real definition hash"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Live oracle check (skipped loudly without a system `erl`)
 // ---------------------------------------------------------------------------
 //
@@ -352,10 +408,12 @@ fn parse_erl_binary(line: &str) -> Vec<u8> {
 /// equal terms and re-encodes them to our exact bytes.
 ///
 /// The re-encoding equality is the strongest available evidence that the *cached
-/// definition hash* is not on the wire: the oracle's record carries C's real
-/// `make_hash2({module,name,is_exported,keys})` while ours carries the local
-/// `make_small(0)` [`beam_codec::term::make_record`] documents — and the two still
-/// produce byte-identical images.
+/// definition hash* is not on the wire: the oracle's record carries its own
+/// `make_hash2({module,name,is_exported,declaration-keys})` while ours carries the one
+/// we computed from the decoded keys — and the two still produce byte-identical
+/// images. The oracle also prints that hash directly (as the `phash2` of the
+/// declaration tuple), which must equal the value we stored: one `u32`-valued probe
+/// that pins the whole computation against the real ERTS.
 #[test]
 fn oracle_accepts_and_reproduces_our_record_images() {
     let Some(oracle) = oracle_or_skip("oracle_accepts_and_reproduces_our_record_images") else {
@@ -370,19 +428,28 @@ fn oracle_accepts_and_reproduces_our_record_images() {
     let utf8_image = encode_term(term, &atoms).expect("UTF-8 re-encode");
     let latin1_image = encode_latin1(term, &atoms);
 
+    // Our own cached definition hash — compared below against the oracle's.
+    let def = record_definition(term).unwrap();
+    // SAFETY: `def` points into the record block `heap` owns and keeps alive.
+    let our_def_hash = unsigned_value(unsafe { beam_term::record::record_definition_hash(def) }.unwrap())
+        as u32;
+
+    // `{m, r, false, b, a}` is exactly the tuple C hashes, in declaration order
+    // (`erl_record.c:1041-1044`); `phash2(_, 1 bsl 32)` is the untruncated `make_hash2`.
     let eval = format!(
         "U = binary_to_term({utf8}), \
          L = binary_to_term({latin1}), \
          io:format(\"eq ~w~n\", [U =:= L]), \
          io:format(\"reenc ~w~n\", [term_to_binary(U)]), \
          io:format(\"rt ~w~n\", [binary_to_term(term_to_binary(U)) =:= U]), \
+         io:format(\"dh ~w~n\", [erlang:phash2({{m,r,false,b,a}}, 1 bsl 32)]), \
          io:format(\"print ~w~n\", [U])",
         utf8 = erl_binary(&utf8_image),
         latin1 = erl_binary(&latin1_image),
     );
     let out = run_erl(&oracle, &eval);
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 4, "the oracle printed {out:?}");
+    assert_eq!(lines.len(), 5, "the oracle printed {out:?}");
     assert_eq!(lines[0], "eq true", "both flavours must decode to equal records");
     assert_eq!(lines[2], "rt true", "the oracle's own round-trip must hold");
     // The oracle's re-encoding of the record is byte-identical to ours.
@@ -392,10 +459,18 @@ fn oracle_accepts_and_reproduces_our_record_images() {
         "the oracle re-encodes our record to different bytes: {}",
         lines[1]
     );
+    // The oracle's `make_hash2` of the definition tuple equals the hash we stored —
+    // the cached definition hash is the real C value, not a placeholder.
+    assert_eq!(
+        lines[3],
+        format!("dh {our_def_hash}"),
+        "our cached definition hash differs from the oracle's `make_hash2` of the \
+         declaration tuple"
+    );
     // … and the decoded record prints as a record (not a plain tuple / raw binary).
     assert!(
-        lines[3].contains("#m:r{"),
+        lines[4].contains("#m:r{"),
         "the oracle did not print a native record: {}",
-        lines[3]
+        lines[4]
     );
 }

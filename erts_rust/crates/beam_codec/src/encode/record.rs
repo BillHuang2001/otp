@@ -126,7 +126,7 @@ mod tests {
             (beam_term::prelude::make_atom(b), make_small(22)),
             (beam_term::prelude::make_atom(a), make_small(11)),
         ];
-        let rec = make_record(&mut heap, m, r, false, &fields).unwrap();
+        let rec = make_record(&mut heap, &t, m, r, false, &fields).unwrap();
 
         let bytes = encode_term_body(rec, &t).unwrap();
         let mut expected = vec![67u8];
@@ -150,7 +150,7 @@ mod tests {
 
         // A zero-field exported record.
         let mut heap = Heap::new(record_block_words(0)).expect("a sized heap");
-        let rec = make_record(&mut heap, m, r, true, &[]).unwrap();
+        let rec = make_record(&mut heap, &t, m, r, true, &[]).unwrap();
         let mut expected = vec![67u8];
         expected.extend_from_slice(&0u32.to_be_bytes());
         expected.push(1); // exported
