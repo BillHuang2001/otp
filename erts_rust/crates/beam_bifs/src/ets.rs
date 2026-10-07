@@ -45,22 +45,35 @@
 //! [`TableInfo::entries`], because that helper needs a `&mut AtomTable` and a BIF
 //! may only borrow the atom table immutably (`ctx.atoms()`), while the field-name
 //! and value atoms are interned through [`BifContext::intern_atom`]. This
-//! reproduces [`TableInfo::entries`] field-for-field (see [`info_field`]).
-//! `ets:info(T, Item)` raises `badarg` for an unknown `Item` — the verified
-//! system `erl` behaviour (it does **not** return `undefined`).
+//! reproduces [`TableInfo::entries`] field-for-field (see [`info_field`]), with one
+//! deliberate difference: `id` is the table's **tid reference** — the very handle
+//! ref thing [`crate::access::make_ref_thing`] built for this table, so
+//! `ets:info(T, id) =:= T` and `is_reference(ets:info(T, id))` both hold, exactly as
+//! in the oracle (`TableInfo::id` is the raw numeric id, which is only the
+//! registry key here). `ets:info(T, Item)` raises `badarg` for an unknown `Item` —
+//! the verified system `erl` behaviour (it does **not** return `undefined`).
+//!
+//! # The match family (see [`matches`] for the BIFs)
+//!
+//! The pattern-based half of the `ets` API lives in the child module [`matches`]:
+//! `ets:match/1,2,3`, `ets:match_object/1,2,3` and the count/delete BIFs
+//! (`ets:select_count/2`, `ets:select_delete/2`, `ets:match_delete/2`), sharing
+//! this module's continuation registry, its handle/`badarg` contract and its
+//! chunk renderer.
 //!
 //! # Deliberately not implemented (see the crate `CONTEXT.md`)
 //!
-//! The rest of the match-spec family (`match`/`match_object`/`select_count`/
-//! `select_delete`/`match_delete`, `foldl`/`foldr`) needs the match-spec
-//! machinery this pass does not wire up; the `*_lookup` navigation forms
-//! and the ownership verbs (`rename`/`safe_fixtable`/`give_away`/`setopts`/
-//! `whereis`/`give_away`) are out of M1 scope; and access-control/ownership
-//! enforcement is a documented M1 simplification (the [`Table`] primitives are
-//! owner-level and do not consult the access mode).
+//! The rest of the match-spec family (`select_replace/2`, `match_spec_compile/1`,
+//! `match_spec_run/2`, `foldl`/`foldr`) needs machinery this pass does not wire up;
+//! the `*_lookup` navigation forms and the ownership verbs (`rename`/
+//! `safe_fixtable`/`give_away`/`setopts`/`whereis`/`give_away`) are out of M1
+//! scope; and access-control/ownership enforcement is a documented M1
+//! simplification (the [`Table`] primitives are owner-level and do not consult the
+//! access mode).
 
 use std::collections::HashMap;
 
+use beam_alloc::Heap;
 use beam_common::Result;
 use beam_ets::{
     compile, key_of, Access, MatchContinuation, Table, TableId, TableInfo, TableKind, TableOptions,
@@ -76,6 +89,11 @@ use crate::error::{badarg, unsupported_bif};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
+/// The `ets:match`/`match_object` families and the count/delete BIFs.
+///
+/// They share this module's continuation registry, handle contract and chunk
+/// renderer, so they are a child of `ets` (declared here, not in `src/lib.rs`).
+mod matches;
 /// The navigation terminator (`ets:first/1` … `ets:prev/2` at the end of the
 /// iteration order). The atom's *name* is `$end_of_table` (the printname of
 /// `atom.names`' `EOT='$end_of_table'`).
@@ -237,6 +255,8 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "select", 1, select_1);
     reg.register("ets", "select", 2, select_2);
     reg.register("ets", "select", 3, select_3);
+    // The match family and the count/delete verbs (child module `matches`).
+    matches::register(reg);
 }
 
 // --------------------------------------------------------------- creation
@@ -679,7 +699,7 @@ fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let outcome = table.select_limit(&spec, limit, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
     let (results, cont) = outcome?;
-    finish_select(ctx, handle, results, cont)
+    finish_chunk(ctx, handle, results, cont)
 }
 
 /// `ets:select(Continuation)` — resumes an [`select_3`] traversal.
@@ -687,7 +707,23 @@ fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// The argument is a continuation ref thing returned by an earlier `select/3`
 /// (or `select/1`); an unknown one is `badarg`.
 fn select_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    resume_continuation(ctx, args[0], Table::select_continue)
+}
+
+/// Resumes the continuation named by `cont_term` with `resume` and renders the
+/// resulting chunk.
+///
+/// Shared by every `/1` entry point of the select family (`ets:select/1`,
+/// `ets:match/1`, `ets:match_object/1` — see the child module [`matches`]): the
+/// continuation registry is table-scoped, and the originating `/3` call stored the
+/// compiled spec inside the state, so the resume needs nothing but the opaque
+/// continuation term. An unknown continuation is `badarg`.
+pub(super) fn resume_continuation(
+    ctx: &mut BifContext<'_>,
+    cont_term: Eterm,
+    resume: impl FnOnce(&Table, &MatchContinuation, &AtomTable, &mut Heap) -> Result<Traversal>,
+) -> Result<Eterm> {
+    let handle = ref_thing_id(cont_term)?;
     let (table_handle, cont) = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
         tables.take_continuation(handle).ok_or_else(badarg)?
@@ -695,13 +731,14 @@ fn select_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
     let table = take_table(ctx, table_handle)?;
     let atoms = ctx.atoms().clone();
-    let outcome = table.select_continue(&cont, &atoms, ctx.heap());
+    let outcome = resume(&table, &cont, &atoms, ctx.heap());
     restore_table(ctx, table_handle, table)?;
     let (results, next) = outcome?;
-    finish_select(ctx, table_handle, results, next)
+    finish_chunk(ctx, table_handle, results, next)
 }
 
-/// Renders one `select` chunk exactly as the oracle (erts-17.1) does:
+/// Renders one chunk of the select/match family exactly as the oracle (erts-17.1)
+/// does:
 ///
 /// * a produced continuation ⇒ the 2-tuple `{Results, ContTerm}`, where
 ///   `ContTerm` is a fresh continuation ref thing;
@@ -709,7 +746,7 @@ fn select_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///   **bare** atom `'$end_of_table'` when `Results` is empty (verified against the
 ///   system `erl`: a 4-object table with `limit` 2 renders the final chunk as the
 ///   bare atom while a 5-object table renders `{[{5,a}], '$end_of_table'}`).
-fn finish_select(
+pub(super) fn finish_chunk(
     ctx: &mut BifContext<'_>,
     table: u64,
     results: Vec<Eterm>,
@@ -734,16 +771,20 @@ fn finish_select(
     }
 }
 
+/// The `(results, continuation)` pair a chunked traversal step returns — the shape
+/// of every `beam_ets` `*_limit` / `*_continue` method.
+pub(super) type Traversal = (Vec<Eterm>, Option<MatchContinuation>);
+
 // ----------------------------------------------------------------- helpers
 
 /// Removes the table under `handle`, or `badarg` when it is unknown.
-fn take_table(ctx: &mut BifContext<'_>, handle: u64) -> Result<Table> {
+pub(super) fn take_table(ctx: &mut BifContext<'_>, handle: u64) -> Result<Table> {
     let tables = ctx.tables().ok_or_else(unsupported_bif)?;
     tables.remove(handle).ok_or_else(badarg)
 }
 
 /// Puts `table` back under `handle`.
-fn restore_table(ctx: &mut BifContext<'_>, handle: u64, table: Table) -> Result<()> {
+pub(super) fn restore_table(ctx: &mut BifContext<'_>, handle: u64, table: Table) -> Result<()> {
     let tables = ctx.tables().ok_or_else(unsupported_bif)?;
     tables.insert(handle, table);
     Ok(())
@@ -756,7 +797,7 @@ fn copy_out(term: Eterm, ctx: &mut BifContext<'_>) -> Result<Eterm> {
 
 /// Copies every object of a table-aliasing vector onto the caller's heap and
 /// returns them as a list.
-fn copy_out_list(objects: Vec<Eterm>, ctx: &mut BifContext<'_>) -> Result<Eterm> {
+pub(super) fn copy_out_list(objects: Vec<Eterm>, ctx: &mut BifContext<'_>) -> Result<Eterm> {
     let mut copied = Vec::with_capacity(objects.len());
     for object in objects {
         copied.push(beam_message::copy_struct_simple(object, ctx.heap())?);
@@ -773,10 +814,10 @@ fn key_or_end(ctx: &mut BifContext<'_>, key: Option<Eterm>) -> Result<Eterm> {
     }
 }
 
-/// The 1-based element position argument of `lookup_element`/`update_element`
-/// (a non-integer or a negative value is `badarg`; `0` is rejected downstream by
-/// [`Table`]).
-fn element_pos(term: Eterm) -> Result<usize> {
+/// The 1-based element position argument of `lookup_element`/`update_element`,
+/// reused as the `ets:select/3`-family **limit** (a non-integer or a negative
+/// value is `badarg`; `0` is rejected downstream by [`Table`]).
+pub(super) fn element_pos(term: Eterm) -> Result<usize> {
     if !is_small(term) {
         return Err(badarg());
     }
@@ -794,15 +835,24 @@ fn element_pos(term: Eterm) -> Result<usize> {
 /// This reproduces [`TableInfo::entries`] field-for-field — [`entries`] cannot be
 /// called directly because it needs a `&mut AtomTable` while a BIF may only borrow
 /// the atom table immutably (`ctx.atoms()`), so the field-name and value atoms are
-/// instead interned through [`BifContext::intern_atom`]. Two fields are fixed by
+/// instead interned through [`BifContext::intern_atom`]. Three fields are fixed by
 /// the M1 runtime shape rather than by the table: `owner` and a set `heir` are the
 /// atom `undefined` (there is no pid term yet), and `node` is always
-/// `nonode@nohost` (the runtime is never distributed).
+/// `nonode@nohost` (the runtime is never distributed). `id` deliberately differs
+/// from [`TableInfo::entries`]' numeric id: it is the table's **tid reference** —
+/// the same [`crate::access::make_ref_thing`] handle `ets:new/2` returned, so
+/// `ets:info(T, id) =:= T` and `is_reference(ets:info(T, id))` hold exactly as in
+/// the oracle.
 ///
 /// [`entries`]: TableInfo::entries
 fn info_field(ctx: &mut BifContext<'_>, info: &TableInfo, item: &str) -> Result<Eterm> {
     match item {
-        "id" => ctx.int(info.id.raw() as i64),
+        // The oracle's `id` is the table's tid *reference* (`#Ref<…>`), and it is
+        // the very term `ets:new/2` handed out (verified: `ets:info(T, id) =:= T`
+        // ⇒ `true`). `TableInfo::id` is the raw numeric id (the registry key), so
+        // it is re-wrapped into the handle ref thing rather than returned as a
+        // small int.
+        "id" => make_ref_thing(ctx.heap(), info.id.raw()),
         // The CATREE path: the oracle reports decentralized counters only for an
         // `ordered_set` whose normalized `write_concurrency` flag is on.
         "decentralized_counters" => ctx.boolean(info.kind.is_ordered() && info.write_concurrency),
@@ -901,7 +951,7 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::NIL;
 
-    use crate::access::{is_tuple, ref_thing_id, tuple_element, tuple_size};
+    use crate::access::{is_reference, is_tuple, ref_thing_id, tuple_element, tuple_size};
 
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
@@ -1386,12 +1436,17 @@ mod tests {
         let name = info_2(&mut ctx, &[handle, name_item]).expect("info/2 name");
         assert_eq!(atoms.name(atom_val(name)), Some("mytab"));
 
-        // `info/2` `id` is the table's numeric id (`TableInfo::entries` renders it
-        // as a small int, not the tid the oracle reports — see `info_field`).
+        // `info/2` `id` is the table's *tid reference* — the very handle ref thing
+        // `ets:new/2` handed out, so it reads back to the same registry key (the
+        // oracle: `ets:info(T, id) =:= T` ⇒ `true`, `is_reference/1` ⇒ `true`).
         let id_item = ctx.atom("id").expect("seeded");
         let id = info_2(&mut ctx, &[handle, id_item]).expect("info/2 id");
-        assert_eq!(id, ctx.int(ref_thing_id(handle).expect("handle id") as i64).unwrap());
-
+        assert!(is_reference(id), "info/2 `id` is not a reference");
+        assert_eq!(
+            ref_thing_id(id).expect("id is a ref thing"),
+            ref_thing_id(handle).expect("handle id")
+        );
+        assert!(beam_term::compare::eq(id, handle, &atoms), "id =:= T");
         // The full proplist has one pair per `INFO_ITEMS` entry — the oracle's 15
         // fields, in the oracle's order.
         assert_eq!(INFO_ITEMS.len(), 15);
