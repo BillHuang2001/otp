@@ -60,14 +60,17 @@ mod process;
 mod test_support;
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext};
+use beam_process::ProcessId;
 use beam_term::{atom_val, is_atom, is_small, make_atom, make_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::format;
+use crate::timers::TimerTarget;
 
 impl RuntimeContext<'_> {
     /// The runtime-native BIF floor, consulted **before** the `beam_bifs` registry.
@@ -125,6 +128,8 @@ impl RuntimeContext<'_> {
                 Some(self.application_which_applications())
             }
             ("erlang", "make_ref", 0) => Some(self.make_ref_0()),
+            ("erlang", "send_after", 3) => Some(self.send_after_3(args)),
+            ("erlang", "cancel_timer", 1) => Some(self.cancel_timer_1(args)),
             ("erlang", "spawn", 1) => Some(self.spawn_1(args)),
             ("erlang", "spawn", 2) => Some(self.spawn_2(args)),
             ("erlang", "spawn", 3) => Some(self.spawn_3(args)),
@@ -224,6 +229,117 @@ impl RuntimeContext<'_> {
         };
         let arity = call_args.len() as u32;
         self.call_bif(&module, &function, arity, &call_args)
+    }
+
+    // -- erlang:send_after/3, erlang:cancel_timer/1 ---------------------------
+
+    /// `erlang:send_after(Time, Dest, Msg)`: deliver `Msg` to `Dest` `Time` milliseconds
+    /// from now, and return the `#Ref<>` timer reference `erlang:cancel_timer/1` takes.
+    ///
+    /// The timer is **not** a thread: it is a deadline pushed onto the runtime's own
+    /// [`Timers`](crate::timers) heap, which the scheduler loop advances — a pass fires every
+    /// deadline that has passed (delivering the message into the target's mailbox through
+    /// `beam_process`'s ordinary deliver path, so a blocked receiver is woken exactly as a
+    /// `send` wakes it) and, with nothing else to run, sleeps until the earliest one. The
+    /// reference comes from [`Runtime::refs_mut`](crate::Runtime::refs_mut) — the runtime's
+    /// **one** reference id space, so it can never collide with a `make_ref/0`/monitor
+    /// reference.
+    ///
+    /// Oracle parity (verified against `erl`, OTP 29):
+    ///
+    /// * `Time` must be a non-negative integer that fits a monotonic deadline; anything else
+    ///   (`-1`, `bad`, a bignum, an absurd delay) raises `badarg` — the C's
+    ///   `parse_timeout_pos` failure (`erl_hl_timer.c:2567`);
+    /// * `Dest` must be a pid or a registered **name**: `erl_hl_timer.c:1799` answers
+    ///   `badarg` for anything else (`send_after(5, foo, x)` with an unregistered atom is
+    ///   therefore *accepted* and its message simply finds no process when it fires);
+    /// * a delivery to a pid that has since died is dropped, not an error.
+    pub(super) fn send_after_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let delay = self.timer_delay(*args.first().ok_or(BeamError::BadArg)?)?;
+        let target = self.timer_target(*args.get(1).ok_or(BeamError::BadArg)?)?;
+        let message = *args.get(2).ok_or(BeamError::BadArg)?;
+        let reference = self.mint_timer_ref()?;
+        let from = self.pid().to_eterm();
+        self.runtime
+            .timers_mut()
+            .schedule(delay, target, from, message, reference);
+        Ok(reference)
+    }
+
+    /// `erlang:cancel_timer(Ref)`: cancel a pending timer, answering how long was left.
+    ///
+    /// The oracle's three answers (`cancel_timer_1` → `access_bif_timer`,
+    /// `erl_hl_timer.c:2622`, verified against `erl`):
+    ///
+    /// * a timer reference that is **still pending** → the remaining time in milliseconds,
+    ///   and the message is never delivered;
+    /// * a reference that already **fired** or was already cancelled → the atom `false`
+    ///   (a `#Ref<>` this runtime minted for something else — `make_ref/0`, a monitor —
+    ///   answers `false` too);
+    /// * anything that is not a reference at all → `badarg`.
+    pub(super) fn cancel_timer_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let term = *args.first().ok_or(BeamError::BadArg)?;
+        // A timer reference, or a reference this runtime minted for something else
+        // (`make_ref/0`/`monitor/2`) — anything else is not a reference and is `badarg`.
+        if !self.runtime.timers.is_timer_ref(term)
+            && !self.runtime.references.contains_key(&term)
+        {
+            return Err(BeamError::BadArg);
+        }
+        match self.runtime.timers_mut().cancel(term) {
+            Some(remaining) => {
+                // Whole milliseconds, truncated — the oracle answers the same unit.
+                let millis = i64::try_from(remaining.as_millis()).unwrap_or(i64::MAX);
+                Ok(make_small(millis))
+            }
+            None => self.atom("false"),
+        }
+    }
+
+    /// The delay of a timer BIF: a non-negative integer of milliseconds that a monotonic
+    /// deadline can actually represent (the oracle's `parse_timeout_pos` validation).
+    fn timer_delay(&self, term: Eterm) -> Result<Duration> {
+        if !is_small(term) {
+            return Err(BeamError::BadArg);
+        }
+        let millis = u64::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)?;
+        let delay = Duration::from_millis(millis);
+        // An unrepresentable deadline is the oracle's `badarg` (its time validation fails
+        // too), never a silently saturated one that would fire at the wrong moment.
+        if Instant::now().checked_add(delay).is_none() {
+            return Err(BeamError::BadArg);
+        }
+        Ok(delay)
+    }
+
+    /// The destination of a timer: a pid (pinned now) or a registered name (resolved when
+    /// the timer fires).
+    fn timer_target(&self, term: Eterm) -> Result<TimerTarget> {
+        if let Ok(pid) = ProcessId::from_eterm(term) {
+            return Ok(TimerTarget::Pid(pid));
+        }
+        if is_atom(term) {
+            return Ok(TimerTarget::Name(atom_val(term)));
+        }
+        // A port, a tuple (`{Name, Node}` included) or any other term: the C's
+        // `is_not_internal_pid(rcvr) && is_not_atom(rcvr)` check answers `badarg`.
+        Err(BeamError::BadArg)
+    }
+
+    /// A fresh `#Ref<>` for a timer, from the runtime's one reference id space.
+    ///
+    /// The term is built on a pooled BIF heap (see
+    /// [`Runtime::take_bif_heap`](crate::Runtime::take_bif_heap)), which never moves or resets
+    /// its terms, so it stays valid for the runtime's lifetime. This is the same three-line
+    /// mint the process/reference floor uses for `make_ref/0`/`monitor/2`; it cannot call that
+    /// module's private helper, but it draws from the same allocator, so the id space stays
+    /// single and an id is never reused.
+    fn mint_timer_ref(&mut self) -> Result<Eterm> {
+        let reference = self.runtime.refs_mut().next();
+        let mut heap = self.runtime.take_bif_heap()?;
+        let term = reference.to_eterm(&mut heap);
+        self.runtime.put_bif_heap(heap);
+        term
     }
 
     // -- erlang:system_info/1 -------------------------------------------------
@@ -535,6 +651,140 @@ mod tests {
         let error = call(&mut runtime, "erlang", "display", &[make_small(1), make_small(2)])
             .expect_err("display/2 is no BIF");
         assert_eq!(error.as_atom(), Some("undef"), "{error}");
+    }
+
+    // -- erlang:send_after/3, erlang:cancel_timer/1 ---------------------------
+
+    /// Oracle: `R = erlang:send_after(50, self(), hello), is_reference(R)` ⇒ `true`, and
+    /// `erlang:cancel_timer(R)` ⇒ the remaining milliseconds (an integer).
+    #[test]
+    fn send_after_answers_a_cancellable_reference() {
+        let mut runtime = runtime();
+        let me = call(&mut runtime, "erlang", "self", &[]).expect("self/0");
+        let hello = atom(&mut runtime, "hello");
+        let reference = call(&mut runtime, "erlang", "send_after", &[make_small(50), me, hello])
+            .expect("send_after/3");
+        assert!(
+            runtime.timers.is_timer_ref(reference),
+            "the answer is the timer's own #Ref<>"
+        );
+        assert_eq!(runtime.timers.pending_count(), 1);
+
+        let remaining =
+            call(&mut runtime, "erlang", "cancel_timer", &[reference]).expect("cancel_timer/1");
+        assert!(is_small(remaining), "the remaining time is an integer");
+        let millis = signed_value(remaining);
+        assert!(
+            (0..=50).contains(&millis),
+            "the remaining time of a 50 ms timer is within its delay: {millis}"
+        );
+        assert_eq!(runtime.timers.pending_count(), 0, "it will not fire");
+
+        // A reference that already fired or was already cancelled is `false`; a reference
+        // this runtime minted for something else (`make_ref/0`) is `false` too.
+        let again =
+            call(&mut runtime, "erlang", "cancel_timer", &[reference]).expect("cancel_timer/1");
+        assert_eq!(runtime.atom_name_of(again).as_deref(), Some("false"));
+        let plain = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
+        let answer = call(&mut runtime, "erlang", "cancel_timer", &[plain]).expect("cancel_timer/1");
+        assert_eq!(runtime.atom_name_of(answer).as_deref(), Some("false"));
+    }
+
+    /// Oracle: `erlang:send_after(10, foo, x)` ⇒ a `#Ref<>` — a registered **name** is a
+    /// valid destination (`erl_hl_timer.c:1799` accepts a pid or an atom).
+    #[test]
+    fn send_after_accepts_a_registered_name() {
+        let mut runtime = runtime();
+        let name = atom(&mut runtime, "nobody_is_registered");
+        let reference =
+            call(&mut runtime, "erlang", "send_after", &[make_small(10), name, make_small(1)])
+                .expect("an atom destination is accepted");
+        assert!(runtime.timers.is_timer_ref(reference));
+        assert_eq!(runtime.timers.pending_count(), 1);
+    }
+
+    /// Oracle: `erlang:send_after(-1, self(), x)` / `(bad, self(), x)` / `(5, foo, x)` are
+    /// `badarg` — a port or any other destination too (`is_not_internal_pid(rcvr) &&
+    /// is_not_atom(rcvr)`, `erl_hl_timer.c:1799`).
+    #[test]
+    fn send_after_validates_the_time_and_the_destination() {
+        let mut runtime = runtime();
+        let me = call(&mut runtime, "erlang", "self", &[]).expect("self/0");
+        let message = make_small(1);
+        let bad = atom(&mut runtime, "bad");
+        for time in [make_small(-1), bad, NIL] {
+            assert!(
+                matches!(
+                    call(&mut runtime, "erlang", "send_after", &[time, me, message]),
+                    Err(BeamError::BadArg)
+                ),
+                "a time that is not a non-negative integer is badarg"
+            );
+        }
+        let tuple = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_tuple(&mut context, &[make_small(1), make_small(2)]).expect("a tuple")
+        };
+        for destination in [make_small(7), NIL, tuple] {
+            assert!(
+                matches!(
+                    call(
+                        &mut runtime,
+                        "erlang",
+                        "send_after",
+                        &[make_small(5), destination, message]
+                    ),
+                    Err(BeamError::BadArg)
+                ),
+                "a destination that is neither a pid nor an atom is badarg"
+            );
+        }
+        assert_eq!(
+            runtime.timers.pending_count(),
+            0,
+            "a refused send_after schedules nothing"
+        );
+    }
+
+    /// Oracle: `erlang:cancel_timer(foo)` / `(1)` ⇒ `badarg` — only a *reference* is
+    /// cancellable, even though a reference that is not a timer answers `false`.
+    #[test]
+    fn cancel_timer_rejects_a_non_reference() {
+        let mut runtime = runtime();
+        for term in [make_small(1), NIL] {
+            assert!(
+                matches!(
+                    call(&mut runtime, "erlang", "cancel_timer", &[term]),
+                    Err(BeamError::BadArg)
+                ),
+                "a term that is not a reference is badarg"
+            );
+        }
+    }
+
+    /// The timer BIFs are no longer capability gaps: `send_after/3` and `cancel_timer/1`
+    /// are served by this floor, so only the remaining arities stay listed.
+    #[test]
+    fn the_timer_bifs_are_no_longer_reported_as_gaps() {
+        let runtime = runtime();
+        for (function, arity) in [("send_after", 3), ("cancel_timer", 1)] {
+            assert!(
+                !error::is_known_unimplemented_bif(&runtime.registry, function, arity),
+                "{function}/{arity} is served by the floor"
+            );
+        }
+        for (function, arity) in [
+            ("send_after", 4),
+            ("cancel_timer", 2),
+            ("start_timer", 3),
+            ("start_timer", 4),
+        ] {
+            assert!(
+                error::is_known_unimplemented_bif(&runtime.registry, function, arity),
+                "{function}/{arity} is still a Milestone-1 gap"
+            );
+        }
     }
 
     // -- os:cmd/1 -------------------------------------------------------------
