@@ -418,6 +418,27 @@ whole-region scan.)
   its address and a reference to it is left verbatim, not a spurious exhaustion). `tests/immix_measure.rs`
   is the measured gate (table in Design Decisions §Measured). `from_config(&GcConfig::default())` must
   select the Copying path.
+- **`tests/heap_sizing.rs` — the heap-size policy evidence.** Growth/shrink boundaries, min/max clamping,
+  `from_spawn_opts` rounding through `next_heap_size`, the `fullsweep_after` counter incl. 0 (both
+  strategies escalate `Minor,Minor,Major` at 2 and `Major,Major` at 0), a tiny nursery growing and an
+  oversized nursery/mature shrinking, the relocating Immix fullsweep, the `HeapInfo` derivation + item
+  order, and an oracle cross-check against the system `erl` (SKIPS LOUDLY if `erl` is absent).
+- **`tests/gc_pressure.rs` / `gc_pressure_structures.rs` / `gc_pressure_offheap.rs` — correctness under
+  pressure.** Threshold pressure (many minors/majors at `fullsweep_after` 1/2/default; the nursery is empty
+  and every root intact after *each* collection, through both strategies); a HAMT map promoted then
+  fullswept (interior nodes relocated across two disjoint spaces); shared/cyclic graphs copied once
+  (`GcStats::objects_copied`) with the cycle closing on the copies; a dead off-heap refc binary swept
+  (refcount → 0, payload freed exactly once, no double-free) and a fun whose env holds a refc binary kept
+  while live / released once garbage. Liveness for the off-heap cases comes from the test's caller-side
+  predicate (the documented contract).
+- **`tests/fragments.rs` — the fragment evidence.** A fragment-built graph (incl. a graph spanning two
+  fragments) copies into a `HeapSpace` intact with the root relocated and the shared list copied once
+  (`used_words`); an off-heap refc binary transfers with correct refcounts and is freed exactly once; a
+  dropped fragment reclaims its words and off-heap entries (`FragmentCounters`); edge cases (immediate /
+  already-destination / foreign term shared; too-small destination → typed `BeamError::Alloc`); and the
+  documented rootset contract end-to-end (`materialize` → `gather_roots` → `collect` → `scatter_roots`).
+- **`tests/immix_workloads.rs` — the multi-workload measurement** (table in Design Decisions §Measured;
+  deterministic counts asserted, pause times only printed).
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
