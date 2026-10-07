@@ -230,10 +230,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   main loop, and turns the resulting `PortNotification`s into `{Port,{data,Data}}`/`{Port,{exit_status,…}}`
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
-  `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
-  `total=431 agree=429 mismatch=0 unsupported=2 skipped=0`** (re-measured at this node's HEAD). The 2
-  `unsupported` are `records/get_definition_unknown_record` (A.7) and `wire/new_fun_ext_encode`
-  (A.5, `beam_rt`'s `local_fun` gap); **no case disagrees** (`mismatch=0`, `skipped=0`).
+  `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches** on the
+  supported module-run subset; the reported corpus total differs between node CONTEXT.md files
+  (`crates/CONTEXT.md` `431/429/2` vs `beam_rt/CONTEXT.md` `541/540/1`) — the `records/*` A.7 cases now agree
+  via `beam_rt`'s `RecordBridge`, so the newer total is likelier — re-measure before quoting. The one
+  remaining `unsupported` is `wire/new_fun_ext_encode` (A.5, `beam_rt` not yet supplying the `Local`-fun
+  identity); **no case disagrees** (`mismatch=0`, `skipped=0`).
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
   bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
   `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
