@@ -3,11 +3,12 @@
 //! The oracle prints a container under `~p`/`~P` with `io_lib_pretty`, which breaks
 //! it across lines when its single-line rendering is **at least**
 //! `line_length - column` characters long (80 and 1 by default, i.e. 79). This
-//! crate now reproduces that break for a container all of whose elements are
-//! themselves single-line ("atomic") — proper/improper lists, tagged and untagged
-//! tuples, and maps of atomic pairs — and keeps the typed `error:badarg` for the
-//! forms it does not model (a container holding another container, a non-printable
-//! bitstring, a depth-limited `~P`). See the `crate::io`/`crate::print` module docs.
+//! crate reproduces that break through a faithful port of `io_lib_pretty`'s
+//! template/`pp`/`cind` machinery, so **nested containers** (`[[1,2,3],[4,5,6]]`)
+//! and a **depth-limited `~P`** (`~P [[1,2,3],[4,5,6]] 2` ⇒ `[[...]|...]`) re-flow
+//! exactly like the oracle. The only re-flow form still refused with a typed
+//! `error:badarg` is the left-adjusted `~-<n>p`, which `io_lib_format:print/12` has
+//! no clause for (the oracle raises `badarg` for it too).
 //!
 //! Every expectation is the literal output of
 //!
@@ -17,8 +18,9 @@
 //!
 //! on the OTP 29 / erts-17.1 oracle. `io:format` is asserted on the exact capture
 //! bytes; `io_lib:format` on the deep list's flattening AND — for the narrowest
-//! repro — its exact nesting.
-
+//! repro and the nested containers — its exact nesting. Map goldens use integer keys,
+//! whose order both the oracle and this crate agree on (OTP leaves map order
+//! unspecified).
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink};
 use beam_common::BeamError;
@@ -53,6 +55,15 @@ fn run_io(
     fmt: &[u8],
     build: impl FnOnce(&mut BifContext<'_>, &BifRegistry) -> Eterm,
 ) -> (Vec<u8>, Result<(), BeamError>) {
+    run_io_args(reg, fmt, |ctx, reg| vec![build(ctx, reg)])
+}
+
+/// Runs `io:format(Fmt, Args)` through a `BytesSink`; returns `(bytes, result)`.
+fn run_io_args(
+    reg: &BifRegistry,
+    fmt: &[u8],
+    build: impl FnOnce(&mut BifContext<'_>, &BifRegistry) -> Vec<Eterm>,
+) -> (Vec<u8>, Result<(), BeamError>) {
     let mut heap = Heap::new(1 << 20).expect("test heap");
     let atoms = seeded_atoms();
     let mut sink = BytesSink::new();
@@ -61,13 +72,38 @@ fn run_io(
         let mut ctx =
             BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
         let format = byte_list(&mut ctx, fmt);
-        let arg = build(&mut ctx, reg);
-        let args = ctx.list(&[arg]).expect("a short arg list fits");
+        let args = build(&mut ctx, reg);
+        let args = ctx.list(&args).expect("a short arg list fits");
         result = reg
             .call("io", "format", 2, &mut ctx, &[format, args])
             .map(|_| ());
     }
     (sink.contents().to_vec(), result)
+}
+
+/// Renders `io_lib:format(Fmt, Args)`'s **deep list** as text with `~w`, so the
+/// exact nesting is asserted (not just the flattened characters). This is the same
+/// dump form `tests/io_lib.rs` uses.
+fn deep_text(
+    reg: &BifRegistry,
+    fmt: &[u8],
+    build: impl FnOnce(&mut BifContext<'_>, &BifRegistry) -> Vec<Eterm>,
+) -> Result<String, BeamError> {
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut sink = BytesSink::new();
+    {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+        let format = byte_list(&mut ctx, fmt);
+        let args = build(&mut ctx, reg);
+        let args = ctx.list(&args).expect("a short arg list fits");
+        let deep = reg.call("io_lib", "format", 2, &mut ctx, &[format, args])?;
+        let dump = byte_list(&mut ctx, b"~w");
+        let dump_args = ctx.list(&[deep]).expect("a short arg list fits");
+        reg.call("io", "format", 2, &mut ctx, &[dump, dump_args])?;
+    }
+    Ok(String::from_utf8(sink.contents().to_vec()).expect("ASCII"))
 }
 
 /// Runs `io_lib:format("~p", [Arg])` in the **caller's** heap (so the returned
@@ -282,24 +318,365 @@ fn latin1_printable_binaries_are_the_oracles_string_leaf() {
     assert_eq!(String::from_utf8(out).expect("UTF-8"), want);
 }
 
+/// Nested containers re-flow like the oracle (`io_lib_pretty:pp` recurses through
+/// `pp_element`/`pp_list`), and a **depth-limited `~P`** is rendered rather than
+/// refused. Both were a typed `badarg` before the full `io_lib_pretty` port; every
+/// golden below is the OTP 29.1.1 oracle's `io:format` text.
 #[test]
-fn reflow_forms_not_modelled_stay_a_typed_badarg() {
+fn nested_containers_reflow_like_the_oracle() {
     let reg = default_registry();
 
-    // A container holding another container is not modelled.
-    let (_out, result) = run_io(&reg, b"~p", |ctx, _| {
+    // `[[1,2,3],[4,5,6]]` is 25 characters — one line, no break.
+    let (out, result) = run_io(&reg, b"~p", |ctx, _| {
+        let a = int_list(ctx, 1..=3);
+        let b = int_list(ctx, 4..=6);
+        ctx.list(&[a, b]).expect("fits")
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(String::from_utf8(out).expect("ASCII"), "[[1,2,3],[4,5,6]]");
+
+    // `{a,{1,2,3}}` — a nested tagged tuple.
+    let (out, result) = run_io(&reg, b"~p", |ctx, _| {
+        let a = ctx.atom("a").expect("seeded");
+        let one = ctx.int(1).expect("fits");
+        let two = ctx.int(2).expect("fits");
+        let three = ctx.int(3).expect("fits");
+        let inner = ctx.tuple(&[one, two, three]).expect("fits");
+        ctx.tuple(&[a, inner]).expect("fits")
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(String::from_utf8(out).expect("ASCII"), "{a,{1,2,3}}");
+
+    // `[lists:seq(1,28), 1]` is 79 characters: the inner list is written flat
+    // (`pp_element` fits it), then the element that follows starts a new line.
+    let (out, result) = run_io(&reg, b"~p", |ctx, _| {
         let inner = int_list(ctx, 1..=28);
-        ctx.list(&[inner, ctx.int(1).expect("fits")]).expect("fits")
+        let one = ctx.int(1).expect("fits");
+        ctx.list(&[inner, one]).expect("fits")
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        String::from_utf8(out).expect("ASCII"),
+        "[[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28],\n 1]"
+    );
+
+    // `[[[1,2],[3,4]]]` at depth 5 (`~P`) — the inner tuple/list re-flows too.
+    let (out, result) = run_io_args(&reg, b"~P", |ctx, _| {
+        let a = int_list(ctx, 1..=2);
+        let b = int_list(ctx, 3..=4);
+        let inner = ctx.list(&[a, b]).expect("fits");
+        let term = ctx.list(&[inner]).expect("fits");
+        vec![term, ctx.int(5).expect("fits")]
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(String::from_utf8(out).expect("ASCII"), "[[[1,2],[3|...]]]");
+}
+
+/// The depth-limited `~P` goldens, all live-probed on the oracle.
+#[test]
+fn depth_limited_renderings_reflow_like_the_oracle() {
+    let reg = default_registry();
+
+    // `~P [[1,2,3],[4,5,6]] D`.
+    let nested6 = |ctx: &mut BifContext<'_>| {
+        let a = int_list(ctx, 1..=3);
+        let b = int_list(ctx, 4..=6);
+        ctx.list(&[a, b]).expect("fits")
+    };
+    for (depth, want) in [
+        (3i64, "[[1|...],[...]]"),
+        (2, "[[...]|...]"),
+        (1, "[...]"),
+        (0, "..."),
+    ] {
+        let (out, result) = run_io_args(&reg, b"~P", |ctx, _| {
+            let term = nested6(ctx);
+            vec![term, ctx.int(depth).expect("fits")]
+        });
+        assert!(result.is_ok(), "~P depth {depth}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII"),
+            want,
+            "~P depth {depth}"
+        );
+    }
+
+    // `~P {a,[1,2,3]} D` — the tag indents the continuation.
+    let tag_list = |ctx: &mut BifContext<'_>| {
+        let a = ctx.atom("a").expect("seeded");
+        let l = int_list(ctx, 1..=3);
+        ctx.tuple(&[a, l]).expect("fits")
+    };
+    for (depth, want) in [(3i64, "{a,[...]}"), (2, "{a,...}"), (4, "{a,[1|...]}")] {
+        let (out, result) = run_io_args(&reg, b"~P", |ctx, _| {
+            let term = tag_list(ctx);
+            vec![term, ctx.int(depth).expect("fits")]
+        });
+        assert!(result.is_ok(), "~P {{a,[1,2,3]}} {depth}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII"),
+            want,
+            "~P {{a,[1,2,3]}} {depth}"
+        );
+    }
+
+    // `~P {[1,2],3} 2` — an untagged tuple whose first element is itself elided,
+    // so the tuple takes `pp_list`'s `,` separator (not `pp_tag_tuple`).
+    let (out, result) = run_io_args(&reg, b"~P", |ctx, _| {
+        let l = int_list(ctx, 1..=2);
+        let three = ctx.int(3).expect("fits");
+        let term = ctx.tuple(&[l, three]).expect("fits");
+        vec![term, ctx.int(2).expect("fits")]
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(String::from_utf8(out).expect("ASCII"), "{[...],...}");
+
+    // `~P lists:seq(1,10) 2` and `~P [[1,2]|3] 3` (an improper nested list).
+    let (out, result) = run_io_args(&reg, b"~P", |ctx, _| {
+        let term = int_list(ctx, 1..=10);
+        vec![term, ctx.int(2).expect("fits")]
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(String::from_utf8(out).expect("ASCII"), "[1|...]");
+
+    let (out, result) = run_io_args(&reg, b"~P", |ctx, _| {
+        let inner = int_list(ctx, 1..=2);
+        let three = ctx.int(3).expect("fits");
+        let term = ctx.cons(inner, three).expect("fits");
+        vec![term, ctx.int(3).expect("fits")]
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(String::from_utf8(out).expect("ASCII"), "[[1|...]|3]");
+
+    // `~P <<1,2,3>> D`, `~P <<1,2,3,4,5>> 3`, `~W <<1,2,3,4,5>> 2`.
+    let bin3 = |ctx: &mut BifContext<'_>, reg: &BifRegistry| binary(ctx, reg, &[1, 2, 3]);
+    for (depth, want) in [(3i64, "<<1,2,...>>"), (4, "<<1,2,3>>")] {
+        let (out, result) = run_io_args(&reg, b"~P", |ctx, reg| {
+            let term = bin3(ctx, reg);
+            vec![term, ctx.int(depth).expect("fits")]
+        });
+        assert!(result.is_ok(), "~P <<1,2,3>> {depth}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII"),
+            want,
+            "~P <<1,2,3>> {depth}"
+        );
+    }
+    let bin5 = |ctx: &mut BifContext<'_>, reg: &BifRegistry| binary(ctx, reg, &[1, 2, 3, 4, 5]);
+    let (out, result) = run_io_args(&reg, b"~P", |ctx, reg| {
+        let term = bin5(ctx, reg);
+        vec![term, ctx.int(3).expect("fits")]
+    });
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(String::from_utf8(out).expect("ASCII"), "<<1,2,...>>");
+
+    // NOTE: `~W` (the depth-limited `~w`) does **not** go through
+    // `crate::print::pretty_chunk` — `io.rs` renders it with the flat
+    // `term_chunk` — so its depth-limited binary truncation is pinned by
+    // `tests/io_lib.rs`, not here.
+    // `~P <<"abcdef">> D` — the printable binary leaf truncates by element count.
+    let binstr = |ctx: &mut BifContext<'_>, reg: &BifRegistry| binary(ctx, reg, b"abcdef");
+    for (depth, want) in [
+        (2i64, "<<\"abcd\"...>>"),
+        (3, "<<\"abcdef\">>"),
+        (1, "<<...>>"),
+    ] {
+        let (out, result) = run_io_args(&reg, b"~P", |ctx, reg| {
+            let term = binstr(ctx, reg);
+            vec![term, ctx.int(depth).expect("fits")]
+        });
+        assert!(result.is_ok(), "~P <<\"abcdef\">> {depth}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII"),
+            want,
+            "~P <<\"abcdef\">> {depth}"
+        );
+    }
+
+    // `~P {1,2,3,4} D` and `~P [1,2,3,4,5,6] D`.
+    for (depth, want) in [(2i64, "{1,...}"), (3, "{1,2,...}")] {
+        let (out, result) = run_io_args(&reg, b"~P", |ctx, _| {
+            let elems: Vec<Eterm> = (1..=4).map(|i| ctx.int(i).expect("fits")).collect();
+            let term = ctx.tuple(&elems).expect("fits");
+            vec![term, ctx.int(depth).expect("fits")]
+        });
+        assert!(result.is_ok(), "~P {{1,2,3,4}} {depth}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII"),
+            want,
+            "~P {{1,2,3,4}} {depth}"
+        );
+    }
+    for (depth, want) in [(3i64, "[1,2|...]"), (5, "[1,2,3,4|...]")] {
+        let (out, result) = run_io_args(&reg, b"~P", |ctx, _| {
+            let term = int_list(ctx, 1..=6);
+            vec![term, ctx.int(depth).expect("fits")]
+        });
+        assert!(result.is_ok(), "~P [1..6] {depth}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII"),
+            want,
+            "~P [1..6] {depth}"
+        );
+    }
+
+    // `~P #{1 => 1,2 => 2,3 => 3,4 => 4} D` (integer keys — an order both the
+    // oracle and this crate agree on; OTP leaves map order unspecified).
+    let map4 = |ctx: &mut BifContext<'_>, reg: &BifRegistry| {
+        let pairs: Vec<Eterm> = (1..=4)
+            .map(|i| {
+                ctx.tuple(&[ctx.int(i).expect("fits"), ctx.int(i).expect("fits")])
+                    .expect("fits")
+            })
+            .collect();
+        let list = ctx.list(&pairs).expect("fits");
+        reg.call("maps", "from_list", 1, ctx, &[list])
+            .expect("maps:from_list fits")
+    };
+    for (depth, want) in [
+        (2i64, "#{1 => 1,...}"),
+        (4, "#{1 => 1,2 => 2,3 => 3,...}"),
+    ] {
+        let (out, result) = run_io_args(&reg, b"~P", |ctx, reg| {
+            let term = map4(ctx, reg);
+            vec![term, ctx.int(depth).expect("fits")]
+        });
+        assert!(result.is_ok(), "~P map4 {depth}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII"),
+            want,
+            "~P map4 {depth}"
+        );
+    }
+
+    // `~P #{1 => [1,2,3], 2 => {4,5}} D` — nested map values.
+    let nested_map = |ctx: &mut BifContext<'_>, reg: &BifRegistry| {
+        let l = int_list(ctx, 1..=3);
+        let four = ctx.int(4).expect("fits");
+        let five = ctx.int(5).expect("fits");
+        let t = ctx.tuple(&[four, five]).expect("fits");
+        let one = ctx.int(1).expect("fits");
+        let two = ctx.int(2).expect("fits");
+        let p1 = ctx.tuple(&[one, l]).expect("fits");
+        let p2 = ctx.tuple(&[two, t]).expect("fits");
+        let pairs = ctx.list(&[p1, p2]).expect("fits");
+        reg.call("maps", "from_list", 1, ctx, &[pairs])
+            .expect("maps:from_list fits")
+    };
+    for (depth, want) in [
+        (3i64, "#{1 => [1|...],2 => {4,...}}"),
+        (2, "#{1 => [...],...}"),
+    ] {
+        let (out, result) = run_io_args(&reg, b"~P", |ctx, reg| {
+            let term = nested_map(ctx, reg);
+            vec![term, ctx.int(depth).expect("fits")]
+        });
+        assert!(result.is_ok(), "~P nested map {depth}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out).expect("ASCII"),
+            want,
+            "~P nested map {depth}"
+        );
+    }
+
+    // `~p {ok,lists:seq(1,30)}` — a tagged tuple whose tag indent (4) is inherited
+    // by the nested list's own `indent(1, …)`, so the continuation is 5 wide.
+    let (out, result) = run_io(&reg, b"~p", |ctx, _| {
+        let ok = ctx.atom("ok").expect("seeded");
+        let mut elems = vec![ok];
+        elems.extend((1..=30).map(|i| ctx.int(i).expect("fits")));
+        ctx.tuple(&elems).expect("fits")
+    });
+    assert!(result.is_ok(), "{result:?}");
+    let seq: Vec<String> = (1..=30).map(|i| i.to_string()).collect();
+    assert_eq!(
+        String::from_utf8(out).expect("ASCII"),
+        format!("{{ok,[{}],\n     {}]}}", seq[..27].join(","), seq[27..].join(","))
+    );
+}
+
+/// The re-flow's **exact nesting** (not only its flattened text), dumped with `~w`
+/// — the oracle's `io_lib:format` result as a char-list tree. A differing nesting is
+/// a failure even when the text agrees (the spliced `...`/`#{`/` => ` sub-lists are
+/// what makes it agree).
+#[test]
+fn nested_reflow_nesting_matches_the_oracles_deep_list() {
+    let reg = default_registry();
+
+    let (nested, dump) = (
+        |ctx: &mut BifContext<'_>| {
+            let a = int_list(ctx, 1..=3);
+            let b = int_list(ctx, 4..=6);
+            ctx.list(&[a, b]).expect("fits")
+        },
+        "[[91,[[91,[[49],44,[50],44,[51]],93],44,[91,[[52],44,[53],44,[54]],93]],93]]",
+    );
+    let got = deep_text(&reg, b"~p", |ctx, _| vec![nested(ctx)]).expect("fits");
+    assert_eq!(got, dump);
+
+    let got = deep_text(&reg, b"~P", |ctx, _| {
+        let t = nested(ctx);
+        vec![t, ctx.int(3).expect("fits")]
+    })
+    .expect("fits");
+    assert_eq!(
+        got,
+        "[[91,[[91,[[49],124,46,46,46],93],44,[91,[46,46,46],93]],93]]"
+    );
+
+    // `~P {a,[1,2,3]} 2` — the elided list is a nested `[46,46,46]` *inside* the
+    // tuple's element list, and the `,...` of an elided map pair is spliced.
+    let got = deep_text(&reg, b"~P", |ctx, _| {
+        let a = ctx.atom("a").expect("seeded");
+        let l = int_list(ctx, 1..=3);
+        let t = ctx.tuple(&[a, l]).expect("fits");
+        vec![t, ctx.int(2).expect("fits")]
+    })
+    .expect("fits");
+    assert_eq!(got, "[[123,[[97],44,46,46,46],125]]");
+
+    let got = deep_text(&reg, b"~P", |ctx, reg| {
+        let pairs: Vec<Eterm> = (1..=4)
+            .map(|i| {
+                ctx.tuple(&[ctx.int(i).expect("fits"), ctx.int(i).expect("fits")])
+                    .expect("fits")
+            })
+            .collect();
+        let list = ctx.list(&pairs).expect("fits");
+        let m = reg
+            .call("maps", "from_list", 1, ctx, &[list])
+            .expect("maps:from_list fits");
+        vec![m, ctx.int(4).expect("fits")]
+    })
+    .expect("fits");
+    assert_eq!(
+        got,
+        "[[35,123,[[[49],[32,61,62,32],[49]],44,[[50],[32,61,62,32],[50]],44,\
+         [[51],[32,61,62,32],[51]],44,46,46,46],125]]"
+    );
+}
+
+/// The one remaining re-flow gap: a left-adjusted `~p`/`~P` has **no clause** in
+/// `io_lib_format:print/12`, so the oracle raises `error:badarg` — as does this
+/// crate. A depth-limited `~P` with a *missing* depth argument is `badarg` in the
+/// oracle too (`io_lib_format` takes the depth from the argument list).
+#[test]
+fn left_adjusted_and_argument_short_p_renderings_stay_a_typed_badarg() {
+    let reg = default_registry();
+
+    let (_out, result) = run_io(&reg, b"~-p", |ctx, _| int_list(ctx, 1..=4));
+    assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
+    let (_out, result) = run_io_args(&reg, b"~-10P", |ctx, _| {
+        let t = int_list(ctx, 1..=4);
+        vec![t, ctx.int(2).expect("fits")]
     });
     assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
 
-    // A depth-limited `~P` is not modelled either.
+    // `io_lib:format("~100P", [lists:seq(1,40)])` ⇒ `{error,badarg}` on the oracle.
     let (_out, result) = run_io(&reg, b"~100P", |ctx, _| int_list(ctx, 1..=40));
     assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
-
-    // A left-adjusted `~p` has no clause in `io_lib_format` (`io_lib_format:print/12`
-    // only matches the non-left `~p`/`~P`, so the oracle raises `badarg` for it).
-    let (_out, result) = run_io(&reg, b"~-p", |ctx, _| int_list(ctx, 1..=4));
+    // `io_lib:format("~W", [[1,2,3]])` ⇒ `{error,badarg}`.
+    let (_out, result) = run_io(&reg, b"~W", |ctx, _| int_list(ctx, 1..=3));
     assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
 }
 
