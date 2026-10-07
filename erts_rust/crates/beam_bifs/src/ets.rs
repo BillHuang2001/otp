@@ -56,16 +56,22 @@
 //! # The match family (see [`matches`] for the BIFs)
 //!
 //! The pattern-based half of the `ets` API lives in the child module [`matches`]:
-//! `ets:match/1,2,3`, `ets:match_object/1,2,3` and the count/delete BIFs
-//! (`ets:select_count/2`, `ets:select_delete/2`, `ets:match_delete/2`), sharing
-//! this module's continuation registry, its handle/`badarg` contract and its
-//! chunk renderer.
+//! `ets:match/1,2,3`, `ets:match_object/1,2,3` and the verb BIFs
+//! (`ets:select_count/2`, `ets:select_delete/2`, `ets:select_replace/2`,
+//! `ets:match_delete/2`), sharing this module's continuation registry, its
+//! handle/`badarg` contract and its chunk renderer.
+//!
+//! # The compiled match-spec family (see [`specs`] for the BIFs)
+//!
+//! `ets:match_spec_compile/1` and `ets:match_spec_run/2` live in the child module
+//! [`specs`], which owns the opaque compiled-spec handle and the
+//! [`TableRegistry::insert_spec`]/[`TableRegistry::spec_raw`] registry entry that
+//! backs it.
 //!
 //! # Deliberately not implemented (see the crate `CONTEXT.md`)
 //!
-//! The rest of the match-spec family (`select_replace/2`, `match_spec_compile/1`,
-//! `match_spec_run/2`, `foldl`/`foldr`) needs machinery this pass does not wire up;
-//! the `*_lookup` navigation forms and the ownership verbs (`rename`/
+//! `ets:foldl/3`/`foldr/3` need the `FunCaller` seam and are not wired up here; the
+//! `*_lookup` navigation forms and the ownership verbs (`rename`/
 //! `safe_fixtable`/`give_away`/`setopts`/`whereis`/`give_away`) are out of M1
 //! scope; and access-control/ownership enforcement is a documented M1
 //! simplification (the [`Table`] primitives are owner-level and do not consult the
@@ -94,6 +100,12 @@ use crate::registry::BifRegistry;
 /// They share this module's continuation registry, handle contract and chunk
 /// renderer, so they are a child of `ets` (declared here, not in `src/lib.rs`).
 mod matches;
+/// The compiled match-spec family (`ets:match_spec_compile/1`,
+/// `ets:match_spec_run/2`): the opaque compiled-spec handle and its registry.
+///
+/// It shares this module's handle contract and [`TableRegistry`]'s compiled-spec
+/// map, so it is a child of `ets` (declared here, not in `src/lib.rs`).
+mod specs;
 /// The navigation terminator (`ets:first/1` … `ets:prev/2` at the end of the
 /// iteration order). The atom's *name* is `$end_of_table` (the printname of
 /// `atom.names`' `EOT='$end_of_table'`).
@@ -127,6 +139,16 @@ const INFO_ITEMS: &[&str] = &[
 /// thing therefore never compares `=:=` to a table handle.
 const CONTINUATION_ID_BASE: u64 = 1 << 40;
 
+/// The base of the compiled-match-spec id namespace.
+///
+/// A compiled spec (see [`specs`]) is another on-heap ref thing whose id is a
+/// registry key, so it needs its own namespace: this base is disjoint from the
+/// table-handle ids ([`TableId::next`] counts up from `1`) and from
+/// [`CONTINUATION_ID_BASE`] (`1 << 40` — a run would need ~2^40 live continuations
+/// before its counter could reach this base), so a compiled-spec ref never compares
+/// `=:=` to a table handle or a continuation, and vice versa.
+const SPEC_ID_BASE: u64 = 1 << 48;
+
 /// A live `ets:select/3` continuation: the traversal state plus the handle of the
 /// table it belongs to, so `ets:select/1` can find the table again.
 struct Continuation {
@@ -146,6 +168,13 @@ pub struct TableRegistry {
     continuations: HashMap<u64, Continuation>,
     /// The next continuation id to hand out.
     next_continuation: u64,
+    /// The live `ets:match_spec_compile/1` specs, keyed by the numeric id of the
+    /// compiled-spec ref thing handed to Erlang. The value is the **raw** spec term
+    /// the caller compiled, which is what [`beam_ets::match_spec_run`] consumes (see
+    /// [`TableRegistry::insert_spec`] and the [`specs`] module docs).
+    specs: HashMap<u64, Eterm>,
+    /// The next compiled-spec id to hand out.
+    next_spec: u64,
 }
 
 impl TableRegistry {
@@ -155,6 +184,8 @@ impl TableRegistry {
             tables: HashMap::new(),
             continuations: HashMap::new(),
             next_continuation: CONTINUATION_ID_BASE,
+            specs: HashMap::new(),
+            next_spec: SPEC_ID_BASE,
         }
     }
 
@@ -219,6 +250,29 @@ impl TableRegistry {
             .remove(&handle)
             .map(|cont| (cont.table, cont.state))
     }
+
+    /// Registers the spec term `raw` as a live compiled match spec, returning the
+    /// fresh spec id (the id of the ref thing `ets:match_spec_compile/1` hands to
+    /// Erlang).
+    ///
+    /// The **raw** term is stored — not a compiled form — because
+    /// [`beam_ets::match_spec_run`] takes the raw clause list and compiles it
+    /// itself; the compile in `match_spec_compile/1` is what validates the spec.
+    /// See the [`specs`] module docs for the M1 substitution and its heap-lifetime
+    /// caveat.
+    pub fn insert_spec(&mut self, raw: Eterm) -> u64 {
+        let handle = self.next_spec;
+        self.next_spec += 1;
+        self.specs.insert(handle, raw);
+        handle
+    }
+
+    /// The raw spec term registered under the compiled-spec `handle`, if any
+    /// (`None` when the handle is unknown — the caller raises `badarg`, as for a
+    /// forged reference).
+    pub fn spec_raw(&self, handle: u64) -> Option<Eterm> {
+        self.specs.get(&handle).copied()
+    }
 }
 
 /// Registers the implemented `ets:*` BIFs (see the module docs for the scope).
@@ -257,6 +311,8 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "select", 3, select_3);
     // The match family and the count/delete verbs (child module `matches`).
     matches::register(reg);
+    // The compiled match-spec family (child module `specs`).
+    specs::register(reg);
 }
 
 // --------------------------------------------------------------- creation

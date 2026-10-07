@@ -1,6 +1,6 @@
 //! The **match family** of the `ets` bridge: `ets:match/1,2,3`,
-//! `ets:match_object/1,2,3` and the count/delete verbs
-//! (`ets:select_count/2`, `ets:select_delete/2`, `ets:match_delete/2`).
+//! `ets:match_object/1,2,3` and the verb BIFs (`ets:select_count/2`,
+//! `ets:select_delete/2`, `ets:select_replace/2`, `ets:match_delete/2`).
 //!
 //! These BIFs are the pattern-based half of the `ets` API. A *pattern* is a term
 //! whose atoms `'$N'` are variables and whose `'_'` is a wildcard; `beam_ets`
@@ -26,7 +26,9 @@
 //! * `ets:match/2` and `ets:match_object/2` return a list of results — the empty
 //!   list, never `'$end_of_table'`, when nothing matched.
 //! * `ets:select_count/2` returns the number of objects whose clause value is
-//!   `true`; `ets:select_delete/2` returns the number of objects deleted.
+//!   `true`; `ets:select_delete/2` returns the number of objects deleted;
+//!   `ets:select_replace/2` returns the number of objects replaced (and is
+//!   `badarg` on a `bag` before the spec or the contents are looked at).
 //! * `ets:match_delete/2` returns the atom **`true`** — not a count. It is a
 //!   *stdlib* function, not a BIF (`bif.tab` has only `ets:internal_select_delete/2`;
 //!   `lib/stdlib/src/ets.erl:2777` is
@@ -52,7 +54,7 @@ use crate::context::BifContext;
 use crate::error::system_limit;
 use crate::registry::BifRegistry;
 
-/// Registers the match family and the count/delete BIFs.
+/// Registers the match family and the count/delete/replace BIFs.
 pub(super) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "match", 1, match_1);
     reg.register("ets", "match", 2, match_2);
@@ -62,6 +64,7 @@ pub(super) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "match_object", 3, match_object_3);
     reg.register("ets", "select_count", 2, select_count_2);
     reg.register("ets", "select_delete", 2, select_delete_2);
+    reg.register("ets", "select_replace", 2, select_replace_2);
     reg.register("ets", "match_delete", 2, match_delete_2);
 }
 
@@ -174,6 +177,26 @@ fn select_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     count_term(ctx, outcome?)
 }
 
+/// `ets:select_replace(Tab, MatchSpec)` — replace every object the spec selects
+/// with the value of its clause's body, returning how many objects were replaced.
+///
+/// `MatchSpec` is a raw match-spec list compiled by [`compile`]; a **compiled**
+/// spec from `ets:match_spec_compile/1` is *not* accepted here — the oracle raises
+/// `badarg` (verified against OTP 29 / erts-17.1), and [`compile`] rejects the ref
+/// thing for the same reason it rejects any non-list spec. A `bag` table is
+/// `badarg` before the spec or the contents are looked at
+/// (`beam_ets::Table::select_replace`); a replacement that does not keep the
+/// matched object's key makes the whole call `badarg` with the table unchanged.
+fn select_replace_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let handle = ref_thing_id(args[0])?;
+    let spec = compile(args[1], ctx.atoms())?;
+    let mut table = take_table(ctx, handle)?;
+    let atoms = ctx.atoms().clone();
+    let outcome = table.select_replace(&spec, &atoms, ctx.heap());
+    restore_table(ctx, handle, table)?;
+    count_term(ctx, outcome?)
+}
+
 /// `ets:match_delete(Tab, Pattern)` — deletes every object matching `Pattern` and
 /// returns the atom `true` (see the module docs: the oracle's stdlib wrapper
 /// discards the deleted count).
@@ -207,7 +230,7 @@ mod tests {
     use beam_term::{atom_val, signed_value, AtomTable};
 
     use crate::access::{ref_thing_id, tuple_element};
-    use crate::ets::{insert_2, new_2, TableRegistry};
+    use crate::ets::{insert_2, lookup_2, new_2, TableRegistry};
     use crate::print::proper_list;
 
     /// The atom names the tests below need.
@@ -216,7 +239,11 @@ mod tests {
         atoms.seed([
             "true",
             "set",
+            "bag",
+            "duplicate_bag",
             "mytab",
+            "bagtab",
+            "duptab",
             "a",
             "b",
             "z",
@@ -237,8 +264,13 @@ mod tests {
 
     /// Creates a `set` table through the `ets:new/2` BIF and returns its handle.
     fn new_table(ctx: &mut BifContext<'_>, name: &str) -> Eterm {
+        new_table_kind(ctx, name, "set")
+    }
+
+    /// Creates a table of `kind` through the `ets:new/2` BIF.
+    fn new_table_kind(ctx: &mut BifContext<'_>, name: &str, kind: &str) -> Eterm {
         let name = ctx.atom(name).expect("seeded");
-        let kind = ctx.atom("set").expect("seeded");
+        let kind = ctx.atom(kind).expect("seeded");
         let opts = ctx.list(&[kind]).expect("fits");
         new_2(ctx, &[name, opts]).expect("ets:new")
     }
@@ -277,6 +309,32 @@ mod tests {
         let v1 = ctx.atom("$1").expect("seeded");
         let v2 = ctx.atom("$2").expect("seeded");
         let head = ctx.tuple(&[v1, v2]).expect("fits");
+        let guards = ctx.list(&[]).expect("fits");
+        let body = ctx.list(&[ctx.atom("true").expect("seeded")]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+
+    /// The replacing spec `[{{'$1','$2'}, [], [{{'$1',b}}]}]` — matches every
+    /// 2-tuple and replaces it with `{Key, b}`, keeping the key at position 1.
+    fn replace_spec(ctx: &mut BifContext<'_>) -> Eterm {
+        let v1 = ctx.atom("$1").expect("seeded");
+        let v2 = ctx.atom("$2").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let head = ctx.tuple(&[v1, v2]).expect("fits");
+        let guards = ctx.list(&[]).expect("fits");
+        // The `{{ … }}` construction form: a 1-tuple holding the tuple to build.
+        let constructed = ctx.tuple(&[v1, b]).expect("fits");
+        let body_item = ctx.tuple(&[constructed]).expect("fits");
+        let body = ctx.list(&[body_item]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+
+    /// `[{{z}, [], [true]}]` — a spec whose head matches no 2-tuple object.
+    fn no_match_spec(ctx: &mut BifContext<'_>) -> Eterm {
+        let z = ctx.atom("z").expect("seeded");
+        let head = ctx.tuple(&[z]).expect("fits");
         let guards = ctx.list(&[]).expect("fits");
         let body = ctx.list(&[ctx.atom("true").expect("seeded")]).expect("fits");
         let clause = ctx.tuple(&[head, guards, body]).expect("fits");
@@ -414,7 +472,82 @@ mod tests {
     }
 
     #[test]
-    fn this_module_registers_its_nine_keys() {
+    fn select_replace_swaps_kept_key_objects_and_rejects_a_bag() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = new_table(&mut ctx, "mytab");
+        two_objects(&mut ctx, handle);
+
+        // On a `set`: both objects match, both replacements keep the key, so the
+        // count is 2 and `{a,1}`/`{b,2}` become `{a,b}`/`{b,b}` (verified).
+        let spec = replace_spec(&mut ctx);
+        let count = select_replace_2(&mut ctx, &[handle, spec]).expect("ets:select_replace/2");
+        assert_eq!(signed_value(count), 2);
+        let a = ctx.atom("a").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let a_b = ctx.tuple(&[a, b]).expect("fits");
+        let b_b = ctx.tuple(&[b, b]).expect("fits");
+        let stored = proper_list(lookup_2(&mut ctx, &[handle, a]).expect("lookup a")).expect("list");
+        assert_eq!(stored.len(), 1);
+        assert!(beam_term::compare::eq(stored[0], a_b, &atoms));
+        let stored = proper_list(lookup_2(&mut ctx, &[handle, b]).expect("lookup b")).expect("list");
+        assert_eq!(stored.len(), 1);
+        assert!(beam_term::compare::eq(stored[0], b_b, &atoms));
+
+        // A spec that matches nothing replaces nothing (the oracle's count is 0).
+        let spec = no_match_spec(&mut ctx);
+        let count = select_replace_2(&mut ctx, &[handle, spec]).expect("no match");
+        assert_eq!(signed_value(count), 0);
+
+        // On a `bag` the whole call is `badarg` — before the spec or the contents
+        // are looked at, so a never-matching spec is `badarg` too (verified).
+        let bag = new_table_kind(&mut ctx, "bagtab", "bag");
+        let spec = replace_spec(&mut ctx);
+        assert!(matches!(
+            select_replace_2(&mut ctx, &[bag, spec]),
+            Err(BeamError::BadArg)
+        ));
+        let spec = no_match_spec(&mut ctx);
+        assert!(matches!(
+            select_replace_2(&mut ctx, &[bag, spec]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A `duplicate_bag` is supported (`{a,1}` ⇒ `{a,b}`).
+        let dup = new_table_kind(&mut ctx, "duptab", "duplicate_bag");
+        let obj = pair(&mut ctx, "a", 1);
+        insert_2(&mut ctx, &[dup, obj]).expect("insert");
+        let spec = replace_spec(&mut ctx);
+        let count = select_replace_2(&mut ctx, &[dup, spec]).expect("duplicate_bag replace");
+        assert_eq!(signed_value(count), 1);
+        let stored = proper_list(lookup_2(&mut ctx, &[dup, a]).expect("lookup")).expect("list");
+        assert_eq!(stored.len(), 1);
+        assert!(beam_term::compare::eq(stored[0], a_b, &atoms));
+
+        // A malformed spec and a non-ref handle are `badarg`.
+        let one = ctx.int(1).expect("fits");
+        assert!(matches!(
+            select_replace_2(&mut ctx, &[handle, one]),
+            Err(BeamError::BadArg)
+        ));
+        let spec = replace_spec(&mut ctx);
+        assert!(matches!(
+            select_replace_2(&mut ctx, &[one, spec]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A *compiled* spec (a ref thing) is not a select-family spec: the oracle
+        // raises `badarg`, and so does this — the ref fails `compile`. A table
+        // handle is exactly such a ref thing the specs registry does not know.
+        assert!(matches!(
+            select_replace_2(&mut ctx, &[handle, handle]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn this_module_registers_its_ten_keys() {
         let reg = BifRegistry::with_core_bifs();
         for (name, arity) in [
             ("match", 1u32),
@@ -425,6 +558,7 @@ mod tests {
             ("match_object", 3),
             ("select_count", 2),
             ("select_delete", 2),
+            ("select_replace", 2),
             ("match_delete", 2),
         ] {
             assert!(reg.contains("ets", name, arity), "ets:{name}/{arity}");

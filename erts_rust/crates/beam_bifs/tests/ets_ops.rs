@@ -170,7 +170,11 @@ fn registration_covers_every_new_ets_bif() {
         ("match_object", 3),
         ("select_count", 2),
         ("select_delete", 2),
+        ("select_replace", 2),
         ("match_delete", 2),
+        // The compiled match-spec family.
+        ("match_spec_compile", 1),
+        ("match_spec_run", 2),
     ] {
         let expected = name != "size";
         assert_eq!(
@@ -689,6 +693,7 @@ fn badarg_cases_are_typed() {
         ("match_object", 3, vec![one, pattern, two]),
         ("select_count", 2, vec![one, true_spec(&mut ctx)]),
         ("select_delete", 2, vec![one, true_spec(&mut ctx)]),
+        ("select_replace", 2, vec![one, true_spec(&mut ctx)]),
         ("match_delete", 2, vec![one, pattern]),
     ] {
         assert!(
@@ -767,6 +772,14 @@ fn ets_bifs_without_a_registry_are_unsupported() {
             BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
         new_table(&reg, &mut ctx, "my_tab", "set")
     };
+    // A compiled-spec handle is built the same way (it too needs the registry).
+    let compiled = {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+        let spec = replace_spec(&mut ctx);
+        reg.call("ets", "match_spec_compile", 1, &mut ctx, &[spec])
+            .expect("ets:match_spec_compile/1")
+    };
 
     // No `.with_tables(...)`: a table operation on the valid handle reports a
     // typed `unsupported_bif` raise rather than a fabricated table.
@@ -777,14 +790,15 @@ fn ets_bifs_without_a_registry_are_unsupported() {
     let pattern = both_vars_pattern(&mut ctx);
     let spec = true_spec(&mut ctx);
     let two = ctx.int(2).expect("fits");
+    let list = ctx.list(&[]).expect("fits");
     for (name, arity, args) in [
         ("member", 2u32, vec![handle, key]),
         ("info", 1, vec![handle]),
         ("first", 1, vec![handle]),
         ("tab2list", 1, vec![handle]),
         ("delete", 1, vec![handle]),
-        // The match family and the count/delete verbs reach the registry only after
-        // their handle decodes, so they report the same missing-registry raise.
+        // The match family and the count/delete/replace verbs reach the registry
+        // only after their handle decodes, so they report the same raise.
         ("match", 1, vec![handle]),
         ("match", 2, vec![handle, pattern]),
         ("match", 3, vec![handle, pattern, two]),
@@ -793,7 +807,13 @@ fn ets_bifs_without_a_registry_are_unsupported() {
         ("match_object", 3, vec![handle, pattern, two]),
         ("select_count", 2, vec![handle, spec]),
         ("select_delete", 2, vec![handle, spec]),
+        ("select_replace", 2, vec![handle, spec]),
         ("match_delete", 2, vec![handle, pattern]),
+        // The compiled match-spec family: `match_spec_compile/1` compiles (it needs
+        // no handle) and then reaches the registry; `match_spec_run/2` decodes its
+        // valid compiled handle first.
+        ("match_spec_compile", 1, vec![spec]),
+        ("match_spec_run", 2, vec![list, compiled]),
     ] {
         let err = reg
             .call("ets", name, arity, &mut ctx, &args)
@@ -1057,6 +1077,25 @@ fn key_pattern(ctx: &mut BifContext<'_>, key: &str) -> Eterm {
     let key = ctx.atom(key).expect("seeded");
     let any = ctx.atom("_").expect("seeded");
     ctx.tuple(&[key, any]).expect("fits")
+}
+
+/// The replacing spec `[{{'$1','$2'}, [], [{{'$1',b}}]}]` — matches every 2-tuple
+/// and replaces it with `{Key, b}`, keeping the key at position 1.
+///
+/// This is the oracle's `ets:select_replace/2` idiom (the `{{ … }}` construction
+/// form is a 1-tuple holding the tuple to build); it is the raw spec term
+/// `ets:match_spec_compile/1` and `ets:select_replace/2` take.
+fn replace_spec(ctx: &mut BifContext<'_>) -> Eterm {
+    let v1 = ctx.atom("$1").expect("seeded");
+    let v2 = ctx.atom("$2").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let head = ctx.tuple(&[v1, v2]).expect("fits");
+    let guards = ctx.list(&[]).expect("fits");
+    let constructed = ctx.tuple(&[v1, b]).expect("fits");
+    let body_item = ctx.tuple(&[constructed]).expect("fits");
+    let body = ctx.list(&[body_item]).expect("fits");
+    let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+    ctx.list(&[clause]).expect("fits")
 }
 
 #[test]
@@ -1419,4 +1458,190 @@ fn select_count_select_delete_and_match_delete_return_the_oracle_values() {
         .call("ets", "select_count", 2, &mut ctx, &[handle, spec])
         .expect("ets:select_count/2 after keyed match_delete");
     assert_eq!(signed_value(count), 2);
+}
+#[test]
+fn match_spec_compile_run_and_select_replace_behave_like_the_oracle() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+
+    // ---- ets:match_spec_compile/1 returns a `#Ref<…>` (verified: is_reference/1).
+    let spec = replace_spec(&mut ctx);
+    let compiled = reg
+        .call("ets", "match_spec_compile", 1, &mut ctx, &[spec])
+        .expect("ets:match_spec_compile/1");
+    let is_ref = reg
+        .call("erlang", "is_reference", 1, &mut ctx, &[compiled])
+        .expect("erlang:is_reference/1");
+    assert!(
+        is_true(&atoms, is_ref),
+        "ets:match_spec_compile/1 must return a reference"
+    );
+
+    // Every compile is a fresh handle.
+    let spec = replace_spec(&mut ctx);
+    let compiled2 = reg
+        .call("ets", "match_spec_compile", 1, &mut ctx, &[spec])
+        .expect("ets:match_spec_compile/1");
+    let same = reg
+        .call("erlang", "=:=", 2, &mut ctx, &[compiled, compiled2])
+        .expect("erlang:=:=/2");
+    assert!(
+        is_false(&atoms, same),
+        "each ets:match_spec_compile/1 must return a fresh handle"
+    );
+
+    // A malformed spec is `badarg` (verified: `ets:match_spec_compile(bad)` and
+    // `ets:match_spec_compile([{bad}])`).
+    let bad = ctx.int(1).expect("fits");
+    assert!(matches!(
+        reg.call("ets", "match_spec_compile", 1, &mut ctx, &[bad]),
+        Err(BeamError::BadArg)
+    ));
+    let bad_clause = ctx.tuple(&[bad]).expect("fits");
+    let bad_spec = ctx.list(&[bad_clause]).expect("fits");
+    assert!(matches!(
+        reg.call("ets", "match_spec_compile", 1, &mut ctx, &[bad_spec]),
+        Err(BeamError::BadArg)
+    ));
+
+    // ---- ets:match_spec_run/2 runs the *compiled* handle over a list.
+    let a1 = object(&mut ctx, "a", 1);
+    let b2 = object(&mut ctx, "b", 2);
+    let list = ctx.list(&[a1, b2]).expect("fits");
+    let got = reg
+        .call("ets", "match_spec_run", 2, &mut ctx, &[list, compiled])
+        .expect("ets:match_spec_run/2");
+    let a = ctx.atom("a").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let a_b = ctx.tuple(&[a, b]).expect("fits");
+    let b_b = ctx.tuple(&[b, b]).expect("fits");
+    let expected = ctx.list(&[a_b, b_b]).expect("fits");
+    assert!(
+        beam_term::compare::eq(got, expected, &atoms),
+        "ets:match_spec_run/2 projection mismatch"
+    );
+
+    // A non-matching element is dropped (an atom is not a 2-tuple), and an empty
+    // list yields the empty list (verified: `[]` in both cases).
+    let z = ctx.atom("z").expect("seeded");
+    let nonmatching = ctx.list(&[z]).expect("fits");
+    let got = reg
+        .call("ets", "match_spec_run", 2, &mut ctx, &[nonmatching, compiled])
+        .expect("ets:match_spec_run/2 no match");
+    assert_eq!(length(&reg, &mut ctx, got), 0);
+    let empty = ctx.list(&[]).expect("fits");
+    let got = reg
+        .call("ets", "match_spec_run", 2, &mut ctx, &[empty, compiled])
+        .expect("ets:match_spec_run/2 empty");
+    assert_eq!(length(&reg, &mut ctx, got), 0);
+
+    // A **raw** clause list as the spec is `badarg` — the oracle's match_spec_run/2
+    // takes only the compiled handle, the direct opposite of the select family.
+    let raw = replace_spec(&mut ctx);
+    assert!(matches!(
+        reg.call("ets", "match_spec_run", 2, &mut ctx, &[list, raw]),
+        Err(BeamError::BadArg)
+    ));
+
+    // A non-reference spec, a non-list first argument and an improper list are all
+    // `badarg` (all verified).
+    let one = ctx.int(1).expect("fits");
+    assert!(matches!(
+        reg.call("ets", "match_spec_run", 2, &mut ctx, &[list, one]),
+        Err(BeamError::BadArg)
+    ));
+    assert!(matches!(
+        reg.call("ets", "match_spec_run", 2, &mut ctx, &[one, compiled]),
+        Err(BeamError::BadArg)
+    ));
+    let improper = ctx.cons(a1, z).expect("fits");
+    assert!(matches!(
+        reg.call("ets", "match_spec_run", 2, &mut ctx, &[improper, compiled]),
+        Err(BeamError::BadArg)
+    ));
+
+    // A *forged* compiled handle (a ref thing the specs registry does not know) is
+    // `badarg`: the table handle built below is exactly such a reference.
+    let table = new_table(&reg, &mut ctx, "my_tab", "set");
+    assert!(matches!(
+        reg.call("ets", "match_spec_run", 2, &mut ctx, &[list, table]),
+        Err(BeamError::BadArg)
+    ));
+
+    // ---- The compiled handle is NOT accepted by the select family (badarg).
+    for (name, arity, args) in [
+        ("select", 2u32, vec![table, compiled]),
+        ("select_count", 2, vec![table, compiled]),
+        ("select_delete", 2, vec![table, compiled]),
+        ("select_replace", 2, vec![table, compiled]),
+    ] {
+        assert!(
+            matches!(
+                reg.call("ets", name, arity, &mut ctx, &args),
+                Err(BeamError::BadArg)
+            ),
+            "ets:{name}/{arity} must reject a compiled spec (badarg)"
+        );
+    }
+
+    // ---- ets:select_replace/2 replaces and counts (verified counts).
+    insert_ordered(&reg, &mut ctx, table, &["a", "b", "c"]);
+    let spec = replace_spec(&mut ctx);
+    let count = reg
+        .call("ets", "select_replace", 2, &mut ctx, &[table, spec])
+        .expect("ets:select_replace/2");
+    assert_eq!(signed_value(count), 3, "every 2-tuple object is replaced");
+    // The replacements landed: `{a,1}`/`{b,2}`/`{c,3}` ⇒ `{a,b}`/`{b,b}`/`{c,b}`.
+    let stored = reg
+        .call("ets", "lookup", 2, &mut ctx, &[table, a])
+        .expect("ets:lookup/2");
+    let stored = nth(&reg, &mut ctx, 1, stored);
+    assert!(beam_term::compare::eq(stored, a_b, &atoms));
+    let c = ctx.atom("c").expect("seeded");
+    let c_b = ctx.tuple(&[c, b]).expect("fits");
+    let stored = reg
+        .call("ets", "lookup", 2, &mut ctx, &[table, c])
+        .expect("ets:lookup/2");
+    let stored = nth(&reg, &mut ctx, 1, stored);
+    assert!(beam_term::compare::eq(stored, c_b, &atoms));
+
+    // On a `bag` the whole call is `badarg` — even for a never-matching spec (the
+    // oracle rejects the table kind before the contents).
+    let bag = new_table(&reg, &mut ctx, "tab2", "bag");
+    let spec = replace_spec(&mut ctx);
+    assert!(matches!(
+        reg.call("ets", "select_replace", 2, &mut ctx, &[bag, spec]),
+        Err(BeamError::BadArg)
+    ));
+    let spec = no_match_spec(&mut ctx);
+    assert!(matches!(
+        reg.call("ets", "select_replace", 2, &mut ctx, &[bag, spec]),
+        Err(BeamError::BadArg)
+    ));
+
+    // A `duplicate_bag` is supported.
+    let dup = new_table(&reg, &mut ctx, "tab2", "duplicate_bag");
+    let obj = object(&mut ctx, "a", 1);
+    reg.call("ets", "insert", 2, &mut ctx, &[dup, obj])
+        .expect("insert");
+    let spec = replace_spec(&mut ctx);
+    let count = reg
+        .call("ets", "select_replace", 2, &mut ctx, &[dup, spec])
+        .expect("ets:select_replace/2 duplicate_bag");
+    assert_eq!(signed_value(count), 1);
+
+    // A malformed spec and a non-ref handle are `badarg`.
+    assert!(matches!(
+        reg.call("ets", "select_replace", 2, &mut ctx, &[table, one]),
+        Err(BeamError::BadArg)
+    ));
+    let spec = replace_spec(&mut ctx);
+    assert!(matches!(
+        reg.call("ets", "select_replace", 2, &mut ctx, &[one, spec]),
+        Err(BeamError::BadArg)
+    ));
 }
