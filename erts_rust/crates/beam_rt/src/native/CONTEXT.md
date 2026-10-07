@@ -44,7 +44,7 @@ before the registry.
 | item | shape |
 |---|---|
 | `registered_name` | see the wrapping rules above (the one special item) |
-| `status` | `running`/`runnable`/`waiting`/`suspended`/`exiting` from `ProcessState` |
+| `status` | `running` for the calling process (single-threaded runtime), else `runnable`/`waiting`/`suspended`/`exiting` from `ProcessState` |
 | `message_queue_len` | integer — the mailbox length |
 | `messages` | list of the queued payload terms, FIFO (**wrapped** like every other item) |
 | `links` | list of the linked pids |
