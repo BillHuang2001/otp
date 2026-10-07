@@ -22,8 +22,8 @@
 //! knowledge of a peer's port — the peer knows ours. The connector half (and the
 //! `net_kernel` `{setup,…}`/`{nodeup,…}` protocol on top of an established link)
 //! is Stage-5 work and is *not* implemented here; a link this runtime accepts is
-//! handshaked and then carries its bytes (Phase 1 stops at `Established`, see
-//! [`DistConnection::state`]).
+//! handshaked and then carries an inbound `send`/`reg_send` into the addressed
+//! local process's mailbox (see [`DistNode::dispatch_inbound`]).
 //!
 //! # Driving
 //!
@@ -33,7 +33,9 @@
 //! ([`DIST_READ_SLICE`]) so one pump can never stall the scheduler: a pump reads
 //! what has arrived, feeds it to the driver, writes the driver's reply and moves
 //! on. No second poller is started — a node with no link costs one `accept`
-//! (`WouldBlock`) per pass.
+//! (`WouldBlock`) per pass. [`DistNode::dispatch_inbound`] then drains what every
+//! **established** link decoded and routes the `send` family into the mailboxes
+//! (the scheduler pass's distribution-delivery half).
 //!
 //! # Honest limits (Milestone 1)
 //!
@@ -50,10 +52,17 @@
 //!   `node@host` (see [`NodeName`]) — a bare advertised name is refused by a real
 //!   peer. (`inet:gethostname/0`'s host is read from
 //!   `/proc/sys/kernel/hostname`, falling back to `$HOSTNAME`.)
-//! * **Inbound control messages are not delivered.** A link's decoded
-//!   `DOP_*` messages stay queued in the driver (Phase 2 delivers them into the
-//!   target process's mailbox); nothing is decoded on the critical path, so a
-//!   message this runtime cannot decode can never fail a scheduler pass.
+//! * **Inbound control messages are delivered for the `send` family.** An
+//!   **established** link's decoded `DOP_SEND*`/`DOP_REG_SEND*` control messages
+//!   are routed to the addressed **local** process's mailbox by
+//!   [`DistNode::dispatch_inbound`] through the [`LocalDeliverySink`] (the runtime
+//!   side of `beam_dist`'s [`InboundSink`] seam). Every other classified delivery
+//!   (aliases, links, exit and monitor signals, the distributed-spawn family) has
+//!   no correct local seam in this runtime and is reported as the honest
+//!   [`DeliveryOutcome::Unsupported`] — never a fabricated or mis-addressed
+//!   delivery. A message the runtime cannot decode or classify **retires that one
+//!   link** (recorded in [`DistNode::last_link_error`]); it never fails a scheduler
+//!   pass.
 //! * **A broken link is dropped, not raised.** A protocol error or a write
 //!   failure retires that one link and is recorded in
 //!   [`DistNode::last_link_error`]; it never aborts the runtime.
@@ -62,11 +71,16 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_dist::connection::TcpTransport;
 use beam_dist::driver::{ConnectionDriver, DriverState};
 use beam_dist::epmd::{Alive2Req, Alive2Resp, EpmdClient, EPMD_DEFAULT_ADDR};
+use beam_dist::{Delivery, DeliveryOutcome, Dispatched, InboundSink};
 use beam_dist::TcpListener;
+use beam_process::{PidTarget, ProcessId, ProcessTable};
+use beam_term::prelude::{atom_val, is_atom, make_atom, Atom, Eterm};
+use beam_term::AtomTable;
 
 /// The address the distribution listener binds: the wildcard on an OS-chosen
 /// port, exactly the oracle's default (`inet_dist_use_interface` unset).
@@ -80,6 +94,17 @@ pub const DIST_READ_SLICE: Duration = Duration::from_millis(25);
 /// The largest number of connections accepted in one pump (the accept loop is
 /// drained, but a flood is bounded per pass).
 const MAX_ACCEPTS_PER_PUMP: usize = 8;
+
+/// The scratch heap used to decode an inbound control message (words).
+///
+/// One decoded message at a time is materialised here; the delivery immediately
+/// **copies** it into the receiver's own heap, so the arena is reset between
+/// drains. It is sized to hold a full non-fragmented distribution message
+/// ([`beam_dist::DIST_FRAGMENT_SIZE`]); a larger reassembled fragmented message
+/// that does not fit retires the link with a recorded reason, exactly as any
+/// other undecodable message does (see [`DistNode::last_link_error`]) — a bounded,
+/// honest Milestone-1 limit, never a wrong delivery.
+const DIST_DISPATCH_HEAP_WORDS: usize = 1 << 16;
 
 /// The node's name, split into the three forms the distribution wire needs.
 ///
@@ -290,6 +315,22 @@ impl DistConnection {
         }
         Ok(events)
     }
+
+    /// Decodes, classifies and routes every control message this link has queued,
+    /// returning one [`Dispatched`] record per message in arrival order.
+    ///
+    /// A thin forwarder to [`ConnectionDriver::dispatch_inbound`]: the driver owns
+    /// the queue and the receive atom cache, the sink owns the routing (see
+    /// [`LocalDeliverySink`]). An `Err` is a link-level decode/classification
+    /// failure — the caller retires the link and records the reason.
+    fn dispatch_inbound(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+        sink: &mut dyn InboundSink,
+    ) -> Result<Vec<Dispatched>> {
+        self.driver.dispatch_inbound(heap, atoms, sink)
+    }
 }
 
 /// A read that timed out (or would have blocked) is "no data", never an error.
@@ -324,6 +365,10 @@ pub struct DistNode {
     registration_attempted: bool,
     /// Why the most recently retired link was dropped (recorded, never raised).
     last_link_error: Option<String>,
+    /// The scratch arena an inbound control message is decoded on by
+    /// [`DistNode::dispatch_inbound`] (reset per drain — the delivery copies the
+    /// term out immediately). See [`DIST_DISPATCH_HEAP_WORDS`].
+    dispatch_heap: Heap,
 }
 
 impl DistNode {
@@ -356,6 +401,7 @@ impl DistNode {
             registration_error: None,
             registration_attempted: false,
             last_link_error: None,
+            dispatch_heap: Heap::new(DIST_DISPATCH_HEAP_WORDS)?,
         })
     }
 
@@ -470,6 +516,77 @@ impl DistNode {
         });
     }
 
+    /// Whether at least one accepted link has completed the `'N'` handshake.
+    ///
+    /// The cheap guard the scheduler pass uses to skip the inbound-delivery half
+    /// entirely (and never allocate the decode arena) for a node with no usable
+    /// link — the common case.
+    pub fn has_established_link(&self) -> bool {
+        self.connections.iter().any(DistConnection::is_established)
+    }
+
+    /// Decodes, classifies and **routes** every control message queued on every
+    /// **established** link through `sink` (the runtime's [`InboundSink`] — see
+    /// [`LocalDeliverySink`]), returning how many were actually delivered to a
+    /// local mailbox.
+    ///
+    /// This is the scheduler pass's **inbound-delivery half**, driven next to
+    /// [`DistNode::pump`] once both the process table and the runtime are live (see
+    /// `crate::runtime::Runtime::dispatch_dist_inbound`). The decode arena is reset
+    /// per drain; the sink copies each delivered term into the receiver's own heap
+    /// immediately.
+    ///
+    /// A **link-level** failure — a message this runtime cannot decode or classify
+    /// (`beam_dist`'s `BadArg` from a truncated/malformed control message) — retires
+    /// **that one link** and records the reason in [`DistNode::last_link_error`],
+    /// exactly as [`DistNode::pump`] does; it is never propagated, so a hostile or
+    /// broken peer can neither fail nor stall a scheduler pass. The existing links
+    /// (and their already-dispatched messages) are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Never: the returned `Result` exists only to keep the scheduler-pass call
+    /// site uniform (this method reports at most zero-link/zero-message progress).
+    pub fn dispatch_inbound(
+        &mut self,
+        atoms: &mut AtomTable,
+        sink: &mut dyn InboundSink,
+    ) -> Result<usize> {
+        // A fresh arena per drain: nothing decoded here outlives it (the delivery
+        // copies out), so the previous drain's arena is reclaimed wholesale.
+        self.dispatch_heap.reset();
+        let mut delivered = 0;
+        let mut index = 0;
+        while index < self.connections.len() {
+            if !self.connections[index].is_established() {
+                index += 1;
+                continue;
+            }
+            // The decode arena (`self.dispatch_heap`) and the link
+            // (`self.connections[index]`) are disjoint fields, so both are borrowed
+            // for the duration of the decode only.
+            let outcome = {
+                let heap = &mut self.dispatch_heap;
+                self.connections[index].dispatch_inbound(heap, atoms, sink)
+            };
+            match outcome {
+                Ok(dispatched) => {
+                    // Only a real mailbox delivery can have woken a blocked
+                    // receiver, so only those count towards the pass's `delivered`
+                    // tally (`Resume`-on-send is the caller's next step).
+                    delivered += dispatched
+                        .iter()
+                        .filter(|record| record.outcome == DeliveryOutcome::Delivered)
+                        .count();
+                    index += 1;
+                }
+                // A decode/classification failure retires just this link (recorded,
+                // never raised) — the scheduler pass carries on.
+                Err(err) => self.retire(index, err),
+            }
+        }
+        Ok(delivered)
+    }
     /// Accepts one pending connection, or `None` when none is waiting.
     ///
     /// # Errors
@@ -582,6 +699,191 @@ pub fn resolve_cookie(init_args: &crate::config::InitArgs) -> Vec<u8> {
 /// started without a cookie is reachable only by a peer that agrees on the same
 /// default (a wrong cookie simply fails the handshake — never a false success).
 const DEFAULT_COOKIE: &[u8] = b"nocookie";
+
+/// The fixed local-node name of a runtime with **no** node (`-name`/`-sname` absent).
+///
+/// The distribution decoder materialises an addressed pid as an **external** pid
+/// whose node slot is the peer's atom, so a runtime that is not a node needs *some*
+/// node name to compare against. This is the same identity
+/// [`crate::context`]'s node bridge hands `beam_codec` — the oracle's
+/// `nonode@nohost` (it is seeded into the core atom table at boot), with creation
+/// `0`. A pid addressed to any real node is therefore a foreign process to a
+/// non-node runtime, exactly as it should be.
+pub const NONODE_NAME: &str = "nonode@nohost";
+
+// ---------------------------------------------------------------------------
+// Inbound delivery: the runtime side of `beam_dist`'s `InboundSink` seam
+// ---------------------------------------------------------------------------
+
+/// The runtime's [`InboundSink`]: routes a classified inbound [`Delivery`] from a
+/// distribution link to the addressed **local** process.
+///
+/// This is `beam_dist`'s "production implementation belongs to `beam_rt`" seam
+/// (`beam_dist::delivery`): the value/protocol crate classifies the control
+/// message, this sink resolves the addressee against *this* runtime's process
+/// table and enqueues the message through `beam_process`'s own delivery path (so a
+/// blocked receiver is woken on the table's wake list and resumed by the
+/// scheduler, exactly as a port or timer message wakes it).
+///
+/// # Scope (honest)
+///
+/// Only the **`send` family** is routed: a `DOP_SEND*` to a local pid and a
+/// `DOP_REG_SEND*` to a registered local name
+/// ([`Delivery::Send`]/[`Delivery::RegSend`]). Every other classified delivery —
+/// process aliases ([`Delivery::AliasSend`]), the link/exit family
+/// ([`Delivery::Link`]/[`Delivery::Exit`]/[`Delivery::Exit2`]), the monitor family
+/// ([`Delivery::Monitor`]/[`Delivery::Demonitor`]/[`Delivery::MonitorExit`]), the
+/// unlink-id handshake ([`Delivery::UnlinkId`]/[`Delivery::UnlinkIdAck`]), the
+/// group-leader change ([`Delivery::GroupLeader`]) and the recognised-but-
+/// unclassified opcodes ([`Delivery::Other`]) — is reported as
+/// [`DeliveryOutcome::Unsupported`]: `beam_process`'s link/monitor/party
+/// structures only accept *local* peers, so there is no correct seam to install a
+/// remote counterpart and a fabricated one would be far worse than an honest gap.
+///
+/// Nothing is ever delivered to the *wrong* process: an addressed pid that is not
+/// a process of this node (another node, or a stale incarnation of this one) is
+/// [`DeliveryOutcome::NoSuchProcess`], never a lookup by number alone.
+pub struct LocalDeliverySink<'a> {
+    /// The runtime's process table the delivery is enqueued into.
+    table: &'a mut ProcessTable,
+    /// This node's full `node@host` name, as the interned atom term a decoded
+    /// external pid carries in its node slot.
+    local_node: Eterm,
+    /// This node's creation (the incarnation the pid must belong to).
+    local_creation: u32,
+}
+
+impl<'a> LocalDeliverySink<'a> {
+    /// A sink over `table` for a node named by `local_node` (its interned atom) with
+    /// the given `local_creation`.
+    pub fn new(table: &'a mut ProcessTable, local_node: Atom, local_creation: u32) -> Self {
+        LocalDeliverySink {
+            table,
+            local_node: make_atom(local_node),
+            local_creation,
+        }
+    }
+}
+
+impl InboundSink for LocalDeliverySink<'_> {
+    fn deliver(&mut self, delivery: &Delivery) -> Result<DeliveryOutcome> {
+        match delivery {
+            Delivery::Send {
+                from,
+                to,
+                message,
+                ..
+            } => self.deliver_to_pid(*from, *to, *message),
+            Delivery::RegSend {
+                from,
+                name,
+                message,
+                ..
+            } => self.deliver_to_name(*from, *name, *message),
+            // Every other delivery has no correct local seam here (see the type
+            // docs): the honest `Unsupported`, never a fabricated/mis-addressed
+            // delivery.
+            _ => Ok(DeliveryOutcome::Unsupported),
+        }
+    }
+}
+
+/// Where an addressed pid term points (see [`LocalDeliverySink::resolve`]).
+enum Target {
+    /// A local process in this node's table.
+    Local(ProcessId),
+    /// Not a process of *this* node (another node, or a stale incarnation).
+    Foreign,
+    /// Not a pid at all — outside the wire contract for this opcode.
+    NotAPid,
+}
+
+impl LocalDeliverySink<'_> {
+    /// Routes a `DOP_SEND*` to the addressed local pid.
+    fn deliver_to_pid(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        message: Eterm,
+    ) -> Result<DeliveryOutcome> {
+        match self.resolve(to) {
+            Target::Local(pid) => self.enqueue(pid, from, message),
+            Target::Foreign => Ok(DeliveryOutcome::NoSuchProcess),
+            Target::NotAPid => Ok(DeliveryOutcome::Unsupported),
+        }
+    }
+
+    /// Routes a `DOP_REG_SEND*` to the addressed registered local name.
+    fn deliver_to_name(
+        &mut self,
+        from: Eterm,
+        name: Eterm,
+        message: Eterm,
+    ) -> Result<DeliveryOutcome> {
+        if !is_atom(name) {
+            // `DOP_REG_SEND`'s `ToName` is an atom (`dist.c:2486`); anything else is
+            // outside the contract for this opcode.
+            return Ok(DeliveryOutcome::Unsupported);
+        }
+        match self.table.whereis(atom_val(name)) {
+            Some(pid) => self.enqueue(pid, from, message),
+            // A name nobody holds drops the message (the oracle drops it too — it
+            // answers the peer with nothing, `dist.c:2506-2509`).
+            None => Ok(DeliveryOutcome::NoSuchProcess),
+        }
+    }
+
+    /// Classifies an addressed pid term as a process of this node.
+    ///
+    /// An **internal** pid immediate is a local process by construction. The
+    /// distribution decoder materialises a pid as an **external** pid thing
+    /// (`beam_codec`), so a destination on this node arrives as an external pid
+    /// whose node atom and creation match ours — and only then is it looked up (by
+    /// number *and* serial, never number alone).
+    fn resolve(&self, term: Eterm) -> Target {
+        match PidTarget::from_eterm(term) {
+            Ok(PidTarget::Local(pid)) => Target::Local(pid),
+            Ok(PidTarget::Remote(remote))
+                if remote.node() == self.local_node
+                    && remote.creation() == self.local_creation =>
+            {
+                Target::Local(ProcessId::new(
+                    u64::from(remote.number()),
+                    u64::from(remote.serial()),
+                ))
+            }
+            Ok(PidTarget::Remote(_)) => Target::Foreign,
+            Err(_) => Target::NotAPid,
+        }
+    }
+
+    /// Enqueues `message` (from `from`) into `pid`'s mailbox, waking a blocked
+    /// receiver through the process table's own wake list.
+    fn enqueue(
+        &mut self,
+        pid: ProcessId,
+        from: Eterm,
+        message: Eterm,
+    ) -> Result<DeliveryOutcome> {
+        if !self.table.contains(pid) {
+            // The pid decoded to a slot this table does not hold (a dead process, or
+            // a number that was never ours).
+            return Ok(DeliveryOutcome::NoSuchProcess);
+        }
+        match self.table.deliver_simple(pid, from, message) {
+            Ok(_) => Ok(DeliveryOutcome::Delivered),
+            // The receiver's heap could not hold the message even after a
+            // collection (this runtime has no inbound heap-fragment delivery). Drop
+            // it rather than mis-deliver it, and keep the link up: one oversized
+            // message from a peer must not tear the link down. Reported honestly as
+            // `Dropped`.
+            Err(BeamError::Alloc(_)) => Ok(DeliveryOutcome::Dropped),
+            // Anything else is an unexpected table invariant break — surface it (the
+            // caller retires the offending link) rather than swallowing it.
+            Err(err) => Err(err),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

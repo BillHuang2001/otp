@@ -227,6 +227,17 @@ pub struct Runtime {
     /// [`Runtime::pump_dist`] from the scheduler pass, next to the port half. See
     /// [`crate::dist`] for exactly how little of distribution this implements.
     dist: Option<DistNode>,
+    /// Whether a scheduler pass **routes** inbound distribution control messages into
+    /// local mailboxes ([`Runtime::dispatch_dist_inbound`]).
+    ///
+    /// Default **`false`**: a node still accepts a peer, completes the `'N'`
+    /// handshake and pumps its links, but nothing a peer sends is enqueued — so the
+    /// differential corpus, whose `-eval` probes must stay byte-identical to the
+    /// oracle, never observes a delivery it did not ask for.
+    /// [`Runtime::allow_inbound_delivery`] turns it on; the explicit
+    /// [`Runtime::dispatch_inbound`] entry never consults it (an explicit caller has
+    /// already asked).
+    inbound_delivery: bool,
 }
 
 impl Runtime {
@@ -304,6 +315,7 @@ impl Runtime {
             timer_resumes: HashMap::new(),
             timer_wakes: Vec::new(),
             dist,
+            inbound_delivery: false,
         })
     }
 
@@ -878,6 +890,27 @@ impl Runtime {
         self.dist.as_ref().map(|node| node.node_name())
     }
 
+    /// Turns routing of **inbound** distribution control messages into local mailboxes
+    /// on or off for the scheduler pass ([`Runtime::dispatch_dist_inbound`]).
+    ///
+    /// Off by default (see the `inbound_delivery` field): a node handshakes and pumps
+    /// its links either way, but only with this enabled does the pass route what a
+    /// peer decoded — a `DOP_SEND*`/`DOP_REG_SEND*` — into the addressed local
+    /// process's mailbox. Enabling it is what makes a peer's message observable to the
+    /// running code; leaving it off keeps a runtime's behaviour byte-identical to one
+    /// with no inbound traffic.
+    ///
+    /// This is a runtime capability, not an emulator switch: no `-name`/`-sname` →
+    /// no node → nothing to route.
+    pub fn allow_inbound_delivery(&mut self, allow: bool) {
+        self.inbound_delivery = allow;
+    }
+
+    /// Whether the scheduler pass routes inbound distribution deliveries (see
+    /// [`Runtime::allow_inbound_delivery`]).
+    pub fn inbound_delivery_enabled(&self) -> bool {
+        self.inbound_delivery
+    }
     /// Materializes parsed command-line arguments into terms on the shared atom table
     /// and heap (an atom's index can only be assigned here).
     ///
