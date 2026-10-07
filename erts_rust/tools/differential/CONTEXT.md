@@ -139,20 +139,20 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - The driver echo round trip runs only once `beam_rt run` drives the full scheduler (`Runtime::run_scheduled`); a single engine pass never runs the scheduler's port half, so the receiver blocks and the CLI exits `3` with `beam_rt: unsupported: … blocked` (a capability gap, never a mismatch, never a hang).
 
 ## Known Issues / Notes for Agents
-- **The Rust side is a partial runtime; today's gate is 0 mismatches** (652-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **652 total · 651 agree · 0 mismatch · 1 unsupported · 0 skipped** (`gate.sh` → exit `3`).
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (661-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` group, the C-driver group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
+  - Current rollup (**stable across repeated runs**): **661 total · 660 agree · 0 mismatch · 1 unsupported · 0 skipped** (`gate.sh` → exit `3`).
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
 | A.1 | 154 | 154 | 0 | 0 | 0 |
-| A.2 | 167 | 167 | 0 | 0 | 0 |
-| A.3 | 29 | 29 | 0 | 0 | 0 |
-| A.4 | 60 | 60 | 0 | 0 | 0 |
+| A.2 | 170 | 170 | 0 | 0 | 0 |
+| A.3 | 31 | 31 | 0 | 0 | 0 |
+| A.4 | 61 | 61 | 0 | 0 | 0 |
 | A.5 | 64 | 63 | 0 | 1 | 0 |
-| A.6 | 31 | 31 | 0 | 0 | 0 |
+| A.6 | 37 | 37 | 0 | 0 | 0 |
 | A.7 | 246 | 246 | 0 | 0 | 0 |
-| A.8 | 43 | 43 | 0 | 0 | 0 |
+| A.8 | 49 | 49 | 0 | 0 | 0 |
 | A.9 | 52 | 52 | 0 | 0 | 0 |
 
 - **The 1 `unsupported` case (an honest capability gap, not a mismatch).** Its golden is the oracle's own output, so it flips to `agree` automatically once the gap closes:
