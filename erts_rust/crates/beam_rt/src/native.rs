@@ -94,6 +94,7 @@ impl RuntimeContext<'_> {
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
             ("erlang", "process_info", 2) => Some(self.process_info_2(args)),
+            ("erlang", "process_info", 1) => Some(self.process_info_1(args)),
             ("init", "get_argument", 1) => Some(self.get_argument(args)),
             ("init", "get_plain_arguments", 0) => Some(self.get_plain_arguments()),
             ("init", "get_arguments", 0) => Some(self.get_arguments()),
