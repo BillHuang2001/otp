@@ -76,13 +76,15 @@ cp function_clause_fixture.erl "$SCRATCH/fcgen/"
 ( cd "$SCRATCH/fcgen" && erlc +deterministic function_clause_fixture.erl )
 cp "$SCRATCH/fcgen/function_clause_fixture.beam" function_clause_fixture.beam
 
-# recv_after.beam (1064 bytes) — compiled in place with the system erlc
-erlc -o tests/fixtures tests/fixtures/recv_after.erl
+# recv_after.beam (824 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_recv_after_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp recv_after.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic recv_after.erl )
+cp "$SCRATCH/gen/recv_after.beam" recv_after.beam
 ```
-`recv_after.beam` is the one exception to the `+deterministic` recipe above: it is compiled
-**in place** (run from the crate root), so its `CInf.source` and `Dbgi` chunks record the
-`.erl` path rather than being stripped. It is otherwise a plain system-`erlc` image and
-nothing in the tests depends on the embedded path.
+Every fixture is built with `+deterministic` in a `$TMPDIR` scratch dir, so no
+absolute checkout path is embedded in any committed `.beam`.
 
 The repo-root `.gitignore` ignores `*.beam` globally, so a (re)built fixture must be
 **force-added**: `git add -f sched.beam`.
