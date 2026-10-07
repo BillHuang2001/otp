@@ -631,15 +631,10 @@ mod tests {
         assert_eq!(native_need(ascii, &atoms), Some(3));
 
         // A two-byte and a three-byte code point, and a nested list.
-        let nested = ctx
-            .list(&[
-                ctx.int(0xE5).unwrap(),
-                ctx
-                    .list(&[ctx.int(0xE4).unwrap(), ctx.int(0xF6).unwrap()])
-                    .unwrap(),
-                ctx.int(0x1F600).unwrap(),
-            ])
-            .expect("fits");
+        let inner = ctx.list(&[ctx.int(0xE4).unwrap(), ctx.int(0xF6).unwrap()]).expect("fits");
+        let first = ctx.int(0xE5).unwrap();
+        let emoji = ctx.int(0x1F600).unwrap();
+        let nested = ctx.list(&[first, inner, emoji]).expect("fits");
         assert_eq!(native_need(nested, &atoms), Some(2 + 2 + 2 + 4));
         let mut out = Vec::new();
         assert_eq!(native_put(nested, &atoms, &mut out), Some(()));
@@ -707,7 +702,7 @@ mod tests {
         assert!(value > i64::MAX as i128);
         let promoted = int_from_i128(&mut ctx, value).expect("promotes");
         assert!(
-            beam_codec::term::big_parts(promoted).is_some(),
+            beam_codec::term::big_parts(promoted).is_ok(),
             "a value past 2^63 must be a heap bignum"
         );
     }
@@ -737,7 +732,8 @@ mod tests {
             assert!(matches!(unsetenv_1(&mut ctx, &[bad_key]), Err(BeamError::BadArg)));
             assert!(matches!(putenv_2(&mut ctx, &[bad_key, value]), Err(BeamError::BadArg)));
         }
-        assert!(matches!(putenv_2(&mut ctx, &[key, ctx.atom("abc").unwrap()]), Err(BeamError::BadArg)));
+        let atom_value = ctx.atom("abc").unwrap();
+        assert!(matches!(putenv_2(&mut ctx, &[key, atom_value]), Err(BeamError::BadArg)));
 
         // `os:env/0` is a list of 2-tuples.
         let env = os_env_0(&mut ctx, &[]).expect("env");

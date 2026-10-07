@@ -260,7 +260,8 @@ fn env_and_getenv_reject_badarg_shapes() {
     let env = call(&reg, &mut ctx, "os", "env", 0, &[]).expect("os:env/0");
     let first = call(&reg, &mut ctx, "erlang", "hd", 1, &[env]).expect("hd");
     assert_eq!(as_int(call(&reg, &mut ctx, "erlang", "tuple_size", 1, &[first]).expect("size")), 2);
-    let first_key = call(&reg, &mut ctx, "erlang", "element", 2, &[ctx.int(1).expect("fits"), first]).expect("element");
+    let one = ctx.int(1).expect("fits");
+    let first_key = call(&reg, &mut ctx, "erlang", "element", 2, &[one, first]).expect("element");
     let bytes: Vec<u8> = list_elements(&reg, &mut ctx, first_key)
         .into_iter()
         .map(|e| as_int(e) as u8)
@@ -485,8 +486,10 @@ fn internal_native2name_and_is_translatable() {
         let bin = binary_term(&reg, &mut ctx, &bad_utf8);
         let out = call(&reg, &mut ctx, "prim_file", "internal_native2name", 1, &[bin]).expect("n2n");
         assert_eq!(as_int(call(&reg, &mut ctx, "erlang", "tuple_size", 1, &[out]).expect("size")), 2);
-        let tag = call(&reg, &mut ctx, "erlang", "element", 2, &[ctx.int(1).expect("fits"), out]).expect("element");
-        let reason = call(&reg, &mut ctx, "erlang", "element", 2, &[ctx.int(2).expect("fits"), out]).expect("element");
+        let one = ctx.int(1).expect("fits");
+        let two = ctx.int(2).expect("fits");
+        let tag = call(&reg, &mut ctx, "erlang", "element", 2, &[one, out]).expect("element");
+        let reason = call(&reg, &mut ctx, "erlang", "element", 2, &[two, out]).expect("element");
         assert_eq!(atom_name(&atoms, tag), "error");
         assert_eq!(atom_name(&atoms, reason), "warning");
     }
