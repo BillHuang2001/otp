@@ -91,7 +91,7 @@
 //!
 //! The four **execution-position** items (`current_function`, `initial_call`,
 //! `current_location`, `current_stacktrace`) are therefore *conditionally* answerable rather
-//! than gaps: they are built by the engine's read-only [`Machine`] accessors out of the
+//! than gaps: they are built by the engine's read-only [`Machine`](beam_engine::Machine) accessors out of the
 //! process's own entry module, which is what [`RuntimeContext::position_value`] reads
 //! through the [`engines`](RuntimeContext::engines) view of the runner state. They are served
 //! for a process this runtime scheduled and left parked — the case the oracle's values below
@@ -147,7 +147,7 @@
 //!   `message_queue_data` process flag in M1 that could change it).
 
 use beam_common::{BeamError, Result};
-use beam_engine::{terms, Machine};
+use beam_engine::terms;
 use beam_gc::{HeapInfo, HeapObservable};
 use beam_process::{MonitorKind, ProcessId, ProcessState};
 use beam_term::{make_small, Eterm, NIL};
@@ -465,7 +465,7 @@ impl RuntimeContext<'_> {
 
     /// The value of one **execution-position** item — where the process is executing.
     ///
-    /// The terms come from [`Machine`]'s read-only accessors (`beam_engine`), the only
+    /// The terms come from [`Machine`](beam_engine::Machine)'s read-only accessors (`beam_engine`), the only
     /// builders of those shapes; the module whose `M`/`F`/`A` atoms a position resolves in
     /// is the process's **entry** module, and the engines of the current scheduler pass
     /// (else the runtime's own) are what
