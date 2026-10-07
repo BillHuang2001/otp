@@ -526,10 +526,6 @@ lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
     `init_ack`, `set_os_pid`, `busy_msgq_limits`, `failure_eof`/`failure_atom`/`failure_posix`/`failure`, `exit`,
     `set_busy_port`, `set_port_control_flags`, `get_port_flags`, `async_port_key`, `get_now`,
     `binary_get_refc`/`binary_inc_refc`/`binary_dec_refc`.
-  - **`driver_create_port` / `add_driver_entry` / `remove_driver_entry` / `driver_lock_driver` are SERVED by this
-    crate** ([`DriverTable`](src/abi/table.rs): `add_entry`/`add_loaded`/`remove_entry`/`lock_driver`/`create_port`)
-    but the `ErlDrvApi` slots stay `None` until `beam_abi` adds the four wiring hooks — see the exact signatures in
-    `src/abi/mod.rs`. `beam_abi` must not be edited from this node.
   - **monitors & port data lock** — the `driver_monitor_*` family needs `monitor_process`/`demonitor_process`/
     `get_monitored_process`/`compare_monitors`; the whole `driver_pdl_*` family needs a port-data-lock accessor
     group.
