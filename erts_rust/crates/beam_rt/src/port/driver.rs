@@ -178,6 +178,7 @@ impl DriverPort {
         }
         self.atoms.name(beam_term::atom_val(term))
     }
+
     /// Interns the names recorded by [`DriverHost::intern_atom`] into `atoms`, in order.
     ///
     /// The same deferred-commit rule as the NIF host (`crate::nif`'s `NifHostImpl`): the runtime's
@@ -191,9 +192,10 @@ impl DriverPort {
     /// Builds the one per-port environment for this driver.
     ///
     /// The returned [`DriverEnv`] must stay alive — and must not be moved — for as long as any
-    /// `ErlDrvPort` derived from it is used (see the module docs). One host is one port, and the
-    /// host is not shared, so exactly one environment is meaningful; a second call is harmless
-    /// (`DriverEnv` is a zero-sized wrapper over the host pointer) but pointless.
+    /// `ErlDrvPort` derived from it is used (the `ErlDrvPort` **is** the environment's own address;
+    /// see the module docs). One host is one port and the host is not shared, so exactly one
+    /// environment is meaningful; nothing stops a second call, but the two would define the same
+    /// port.
     pub fn environment(&mut self) -> DriverEnv {
         DriverEnv::new(self)
     }
