@@ -824,3 +824,44 @@
         );
         assert_eq!(store.words(), 3, "only the new copy is live table storage");
     }
+
+    /// The **global empty tuple** — the one literal whose liveness this store can
+    /// prove (`beam_term::tuple::tuple0` backs it with a leaked, never-reclaimed
+    /// word) — is shared rather than duplicated, exactly as the C does for
+    /// `ERTS_GLOBAL_LIT_EMPTY_TUPLE`. A copy that would otherwise cost
+    /// `header + 2 elements + the literal's own header` costs only the outer tuple.
+    #[test]
+    fn the_global_empty_tuple_literal_is_shared_not_copied() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(32);
+        // `{1, {}}`: the inner `{}` is the shared global literal.
+        let with_literal = heap.tuple(&[make_small(1), tuple0()]).unwrap();
+        // `{1, 2}`: the same shape with an immediate element, for a like-for-like
+        // word count.
+        let with_immediate = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
+
+        let mut store = test_store();
+        let copied = store.copy(with_literal).expect("a tuple is copyable");
+        assert_eq!(
+            store.words(),
+            3,
+            "only the outer tuple is copied — the nested literal contributes no words"
+        );
+        // The element is the very same literal word, not a heap copy of it.
+        // SAFETY: `copied` is a live 2-element tuple just written by `copy`.
+        assert_eq!(unsafe { tuple_element(copied, 1) }, tuple0());
+        assert!(eq(copied, with_literal, &atoms), "the copy is structurally equal");
+        assert_eq!(store.free(copied), 3);
+
+        // A literal root is shared outright: it owns no store storage at all.
+        let root = store.copy(tuple0()).expect("a literal root is copyable");
+        assert_eq!(root, tuple0());
+        assert_eq!(store.words(), 0, "a shared literal root costs no words");
+        assert_eq!(store.free(root), 0, "and has nothing to reclaim");
+
+        // A `{}`-free term of the same arity copies to the same size, which is what
+        // makes the `3` above meaningful (there is no hidden extra allocation).
+        let copied2 = store.copy(with_immediate).expect("a tuple is copyable");
+        assert_eq!(store.words(), 3);
+        assert_eq!(store.free(copied2), 3);
+    }

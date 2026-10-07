@@ -519,3 +519,132 @@ fn the_element_list_lookups_follow_the_read_gate() {
         }
     }
 }
+
+/// `ets:select_replace/2` is **write**-gated: a denied requester gets `badarg` and
+/// the table is left exactly as it was; a permitted one rewrites every object.
+#[test]
+fn select_replace_follows_the_write_gate() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+    // The keys `seeded_table` inserts, and the value it gives each.
+    let keys = [0i64, 10, 20, 30, 40, 50];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let mut atoms = AtomTable::new();
+            let mut heap = Heap::new(2048);
+            let mut t = seeded_table(access, owner, &mut heap, &atoms);
+
+            // `[{{{ '$1', 99 }}}]` — the `{{ … }}` tuple-construction body keeps the
+            // key (`'$1'`) and sets the value to 99. (A bare 2-tuple in a body is a
+            // *function call*, not a constructor — see `select::expr`.)
+            let dollar1 = make_atom(atoms.intern("$1"));
+            let underscore = interned_atom(&mut atoms, "_");
+            let inner = heap.tuple(&[dollar1, make_small(99)]).unwrap();
+            let construction = heap.tuple(&[inner]).unwrap();
+            let head = heap.tuple(&[dollar1, underscore]).unwrap();
+            let body = proper_list(&mut heap, &[construction]);
+            let clause = heap.tuple(&[head, NIL, body]).unwrap();
+            let spec_term = proper_list(&mut heap, &[clause]);
+            let spec = compile(spec_term, &atoms).expect("a valid match spec");
+
+            let (_, write_ok) = expected(access, owner, requester);
+            let tag = format!("{access:?}/{who}");
+
+            // The select family builds its results on a `beam_alloc::Heap` (the
+            // caller's heap), distinct from the `beam_term` test arena above.
+            let mut out = rebuild_heap();
+            let replaced = t
+                .as_requester(requester)
+                .select_replace(&spec, &atoms, &mut out);
+            assert_gate(replaced, write_ok, &format!("{tag} select_replace"));
+
+            for key in keys {
+                let got = t
+                    .lookup_element_or(make_small(key), 2, make_small(-1), &atoms)
+                    .unwrap();
+                let want = if write_ok {
+                    make_small(99)
+                } else {
+                    make_small(key * 100)
+                };
+                assert!(
+                    eq(got, want, &atoms),
+                    "{tag}: key {key} is {}",
+                    if write_ok { "rewritten" } else { "untouched" }
+                );
+            }
+        }
+    }
+}
+
+/// The limited `/3` forms and their `/1` resumptions are **read**-gated. The
+/// continuation used here is produced by an always-permitted (owner) view of the
+/// same table, so the requester under test can fail *only* on the gate.
+#[test]
+fn the_limited_and_continuation_forms_follow_the_read_gate() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let mut atoms = AtomTable::new();
+            let mut heap = Heap::new(2048);
+            let mut t = seeded_table(access, owner, &mut heap, &atoms);
+            let spec = every_object_spec(&mut heap, &mut atoms);
+            let pattern = wildcard_pattern(&mut heap, &mut atoms);
+            let (read_ok, _) = expected(access, owner, requester);
+            let tag = format!("{access:?}/{who}");
+
+            let continuation = t
+                .as_requester(Some(owner))
+                .select_limit(&spec, 2, &atoms, &mut rebuild_heap())
+                .unwrap()
+                .1
+                .expect("six objects with limit 2 yield a continuation");
+
+            // The select family builds its results on a `beam_alloc::Heap` (the
+            // caller's heap), distinct from the `beam_term` test arena above.
+            let mut out = rebuild_heap();
+            let view = t.as_requester(requester);
+            assert_gate(
+                view.select_limit(&spec, 2, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} select_limit"),
+            );
+            assert_gate(
+                view.select_continue(&continuation, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} select_continue"),
+            );
+            assert_gate(
+                view.match_object_limit(pattern, 2, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} match_object_limit"),
+            );
+            assert_gate(
+                view.match_object_continue(&continuation, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} match_object_continue"),
+            );
+            assert_gate(
+                view.match_limit(pattern, 2, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} match_limit"),
+            );
+            assert_gate(
+                view.match_continue(&continuation, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} match_continue"),
+            );
+
+            if read_ok {
+                let (chunk, next) = view.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+                assert_eq!(chunk.len(), 2, "{tag}: an exact limit-sized chunk");
+                assert!(next.is_some(), "{tag}: a full chunk carries a continuation");
+            }
+        }
+    }
+}
