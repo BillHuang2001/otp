@@ -18,7 +18,9 @@
 //!
 //! | BIF | Ground truth | Oracle probe |
 //! |---|---|---|
-//! | `erts_internal:term_type/1` | `erl_map.c:3336-3417` | `1`→`fixnum`, `a`→`atom`, `{x}`→`tuple`, `#{a=>1}`→`flatmap`, `self()`→`pid`, `1.0`→`hfloat`, `[]`→`nil`, `[1,2]`→`list`, `fun erts_internal:term_type/1`→`export` |
+//! | `erts_internal:term_type/1` | `erl_map.c:3336-3417` | `1`→`fixnum`, `a`→`atom`, `{x}`→`tuple`, `#{a=>1}`→`flatmap`, `self()`→`pid`, `1.0`→`hfloat`, `[]`→`nil`, `[1,2]`→`list`, `fun erts_internal:term_type/1`→`export`, `1 bsl 100`→`bignum`, `<a wire external pid/port/reference>`→`external_pid`/`external_port`/`external_reference` |
+//! | `erts_internal:get_dflags/0` | `dist.c:5566-5592` | `{erts_dflags,468283523004,17230663572,468283523004,8396866,8192}` — the same fixed record on a non-distributed and on a `-sname` node |
+//! | `erts_internal:beamfile_chunk/2` | `beam_bif_load.c:165-201` | `byte_size(beamfile_chunk(element(2,code:get_object_code(lists)),"Code"))`→`30110`; `"Nope"`→`undefined`; `"code"`→`undefined`; `5`/`"Code"`→`error:badarg` |
 //! | `erts_internal:map_to_tuple_keys/1` | `erl_map.c:3318-3328` | `#{a=>1,b=>2,c=>3}`→a keys tuple; `#{}`→`{}`; a hashmap→`badarg`; `[1,2]`→`error:{badmap,[1,2]}` |
 //! | `erts_internal:binary_to_integer/2` | `big.c:4186-4232` (`chars_to_integer`) | `<<"ff">>,16`→`255`; `<<"-ff">>,16`→`-255`; `<<>>,10`→`badarg`; `<<"10">>,37`→`badarg`; 19 digits→`big` |
 //! | `erts_internal:list_to_integer/2` | `big.c:4234-4355` | `"10",10`→`{10,[]}`; `"12ab",10`→`{12,"ab"}`; `[]`→`no_integer`; `foo`→`not_a_list`; 18 nines→`big` |
@@ -26,17 +28,25 @@
 //! | `erts_internal:perf_counter_unit/0` | `erl_time_sup.c:2537` | `1000000000` |
 //! | `erts_internal:get_creation/0` | `dist.c:5594-5604` | `undefined` on a non-distributed node |
 //! | `erts_internal:is_process_alive/1` | `erl_bif_info.c:4069` | `self()`→`true`; after a process exits→`false`; `foo`→`error:badarg` |
+//! | `erts_internal:no_aux_work_threads/0` | `erl_process.c:9234-9237` (`:6219-6223`) | `erl`→`17` (16 schedulers + 1 + no dirty-alloc instances); `erl +S 1`→`2` |
 //! | `erts_internal:processes_next/1` | `bif.c:4111-4120` | `processes_next(1000000000000)`→`badarg`; `foo`→`badarg` |
 //! | `erts_internal:term_to_string/1,2` | `bif.c:4160-4189` | `{a,1}`→`"{a,1}"` (one line, `~w`); a limit `1`→`error:badarg` |
 //!
 //! # Deliberate Milestone-1 divergences (documented, deterministic)
 //!
-//! * `term_type/1` reports every byte-aligned binary as `sub_binary`. The C
-//!   distinguishes `heap_binary` / `sub_binary` / `refc_binary` from the *boxed
-//!   header subtag*, which `beam_term` exposes only through `unsafe` predicates and
-//!   `beam_rt` is `#![deny(unsafe_code)]`. `sub_binary` is what the oracle reports
-//!   for every binary the compiler materialises from the literal area (the terms
-//!   `erts_debug:size/1` — the only caller — actually walks).
+//! * `term_type/1` reports every byte-aligned binary as `sub_binary`. The C splits the
+//!   binary family into `heap_binary` / `sub_binary` / `refc_binary` by the *boxed
+//!   header subtag* (`erl_map.c:3368-3376`), and the only predicates that read it
+//!   (`beam_term::boxed::is_internal_ref` and its siblings) are `unsafe` — which
+//!   `beam_rt` is `#![deny(unsafe_code)]` against. The oracle answers `heap_binary` for
+//!   `binary:part(<<"abcd">>,1,2)` and `sub_binary` for `<<1,2>>`; this runtime answers
+//!   `sub_binary` for both.
+//! * `no_aux_work_threads/0` answers *this* runtime's own scheduler count `+ 1`, so its
+//!   **default** is as many threads short as this runtime's `system_info(schedulers)`
+//!   is short of the oracle's (the count is `available_parallelism()` — affinity- and
+//!   cgroup-aware — while ERTS reads the online processor count). With an explicit
+//!   `+S N` the two agree exactly (`+S 1` ⇒ `2`). Both figures are self-consistent and
+//!   derived, never hardcoded — the same deliberate basis as `erlang:processes/0`.
 //! * `processes_next/1` is index-addressed over *this* runtime's process table
 //!   (one pid per call, in table order) instead of the C ptab's paginated index
 //!   space; `erlang:processes/0` is already a documented divergence for the same
@@ -53,17 +63,42 @@
 //! list and the machinery each one needs (distribution, the application controller,
 //! microstate accounting, code purge, tracing, atomics/counters resources, the
 //! system-task protocol, …).
+//!
+//! `erts_internal:beamfile_module_md5/1` (`beam_bif_load.c:205-229`) is deliberately
+//! still unclaimed: the digest is the one `crate::context::bridges::module_md5`
+//! already computes for the `NEW_FUN_EXT` identity, but that helper is `pub(super)`
+//! to the `context` module and its body is a real chunk-layout digest (the `FunT`
+//! 24-byte record walk with `OldUniq` forced to zero, `beam_file.c:1751-1829`), not a
+//! lookup of a stored checksum — re-deriving it here would duplicate that parsing, and
+//! this file may not change the helper's visibility.
 
 use beam_common::{BeamError, ExitReason, LiveReason, Raise, Result};
 use beam_engine::terms;
+use beam_loader::container::{ChunkId, Container};
 use beam_process::ProcessId;
 use beam_term::{
-    is_atom, is_catch, is_internal_pid, is_internal_port, is_list, is_nil, is_small, make_small,
-    signed_value, Eterm,
+    is_atom, is_byte, is_catch, is_internal_pid, is_internal_port, is_list, is_nil, is_small,
+    make_small, signed_value, Eterm,
 };
 
 use super::RuntimeContext;
 use crate::error;
+
+/// `DFLAG_DIST_DEFAULT` — ERTS's preferred distribution-flag set (`dist.h:113-122`).
+///
+/// The whole flag word, as the oracle's `erts_internal:get_dflags/0` reports it. The
+/// value is a build-time constant (`ERTS_GLOBAL_LIT_DFLAGS_RECORD`), so it is identical
+/// on a non-distributed and on a distributed node and is pinned against the oracle by
+/// the unit test below.
+const DFLAG_DIST_DEFAULT: i64 = 468_283_523_004;
+/// `DFLAG_DIST_MANDATORY` (`dist.h:80-98`) — the flags every peer must support.
+const DFLAG_DIST_MANDATORY: i64 = 17_230_663_572;
+/// `DFLAG_DIST_ADDABLE` (`dist.h:126`) — `DFLAG_DIST_DEFAULT` under its other name.
+const DFLAG_DIST_ADDABLE: i64 = 468_283_523_004;
+/// `DFLAG_DIST_REJECTABLE` (`dist.h:129-132`).
+const DFLAG_DIST_REJECTABLE: i64 = 8_396_866;
+/// `DFLAG_DIST_STRICT_ORDER` (`dist.h:135`) — `DFLAG_DIST_HDR_ATOM_CACHE`.
+const DFLAG_DIST_STRICT_ORDER: i64 = 8_192;
 
 /// The number of base-`b` digits that always fit a small integer —
 /// `digits_per_small_lookup` (`big.c:4115-4122`), `b = 2..=36`, the 64-bit table.
@@ -184,6 +219,8 @@ impl RuntimeContext<'_> {
     ) -> Option<Result<Eterm>> {
         match (function, arity) {
             ("term_type", 1) => Some(self.erts_term_type(args)),
+            ("get_dflags", 0) => Some(self.erts_get_dflags()),
+            ("beamfile_chunk", 2) => Some(self.erts_beamfile_chunk(args)),
             ("map_to_tuple_keys", 1) => Some(self.erts_map_to_tuple_keys(args)),
             ("binary_to_integer", 2) => Some(self.erts_binary_to_integer(args)),
             ("list_to_integer", 2) => Some(self.erts_list_to_integer(args)),
@@ -191,6 +228,7 @@ impl RuntimeContext<'_> {
             ("perf_counter_unit", 0) => Some(self.erts_perf_counter_unit()),
             ("get_creation", 0) => Some(self.erts_get_creation()),
             ("is_process_alive", 1) => Some(self.erts_is_process_alive(args)),
+            ("no_aux_work_threads", 0) => Some(self.erts_no_aux_work_threads()),
             ("processes_next", 1) => Some(self.erts_processes_next(args)),
             ("term_to_string", 1) => Some(self.erts_term_to_string(args, false)),
             ("term_to_string", 2) => Some(self.erts_term_to_string(args, true)),
@@ -205,11 +243,11 @@ impl RuntimeContext<'_> {
     ///
     /// # Errors
     ///
-    /// A boxed family this crate's safe classifier cannot name (a bignum, an
-    /// internal reference, an external pid/port/reference, or a non-byte-aligned
-    /// bitstring) is a typed
-    /// [`unsupported`](crate::error::unsupported) gap — never a substituted name.
-    /// As every valid term has a type, the C never raises here.
+    /// A boxed family this crate's safe classifier cannot name is a typed
+    /// [`unsupported`](crate::error::unsupported) gap — never a substituted name: an
+    /// internal `reference` (`beam_term::boxed::is_internal_ref` is `unsafe`) and a
+    /// non-byte-aligned bitstring. As every valid term has a type, the C never raises
+    /// here.
     fn erts_term_type(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
         // `TAG_PRIMARY_IMMED1` (the C's inner switches) and `TAG_PRIMARY_LIST`.
@@ -234,9 +272,10 @@ impl RuntimeContext<'_> {
         if is_list(term) {
             return self.atom("list");
         }
-        // `TAG_PRIMARY_BOXED`: the C switches on the header subtag. The subtag is
-        // reachable here only through the safe classifiers of `beam_engine::terms`
-        // and `beam_term::map`; see the module docs for the two gaps.
+        // `TAG_PRIMARY_BOXED`: the C switches on the header subtag, which is reachable
+        // here only through the safe classifiers of `beam_engine::terms`,
+        // `beam_codec::term` and `beam_term::map`. Each probe below matches its own
+        // subtag, so none can fire for a family already classified above.
         if terms::tuple_arity(term).is_ok() {
             return self.atom("tuple");
         }
@@ -260,14 +299,115 @@ impl RuntimeContext<'_> {
             };
         }
         if terms::binary_bytes(term).is_ok() {
-            // Milestone-1 divergence: all byte-aligned binaries report
-            // `sub_binary` (see the module docs).
+            // Every byte-aligned binary — heap, sub or refc — reports `sub_binary`
+            // (see the module docs).
             return self.atom("sub_binary");
         }
+        // `POS_BIG_SUBTAG` / `NEG_BIG_SUBTAG` (`erl_map.c:3374-3376`).
+        if beam_codec::term::big_parts(term).is_ok() {
+            return self.atom("bignum");
+        }
+        // The three `EXTERNAL_*_SUBTAG` families (`erl_map.c:3379-3386`).
+        if beam_codec::term::external_pid_parts(term).is_ok() {
+            return self.atom("external_pid");
+        }
+        if beam_codec::term::external_port_parts(term).is_ok() {
+            return self.atom("external_port");
+        }
+        if beam_codec::term::external_ref_parts(term).is_ok() {
+            return self.atom("external_reference");
+        }
         Err(error::unsupported(
-            "erts_internal:term_type/1: boxed family outside the safe M1 classifier (bignum, \
-             reference, external pid/port/reference, non-byte-aligned bitstring)",
+            "erts_internal:term_type/1: boxed family outside the safe M1 classifier (an \
+             internal reference, a non-byte-aligned bitstring)",
         ))
+    }
+
+    // -- erts_internal:get_dflags/0 ------------------------------------------
+
+    /// `erts_internal:get_dflags/0` — the node's distribution-flag record
+    /// (`dist.c:5566-5592`).
+    ///
+    /// The C returns `ERTS_GLOBAL_LIT_DFLAGS_RECORD`, a build-time literal, whenever the
+    /// internal `erts_dflags_test_remove` mask is clear — so the answer is the same fixed
+    /// 6-tuple on a non-distributed node and on a `-sname` node alike. The two values
+    /// above 2^32 are 60-bit `fixnum`s in the oracle (they are *slots* in a literal
+    /// record, not heap-built bignums), so `term_to_binary/1` renders them through the
+    /// codec's `SMALL_BIG_EXT` path for a wide fixnum; the unit test pins the whole
+    /// image byte-for-byte against the oracle.
+    ///
+    /// # Errors
+    ///
+    /// The heap/Term writers' own errors (a full heap). The C never raises.
+    fn erts_get_dflags(&mut self) -> Result<Eterm> {
+        let tag = self.atom("erts_dflags")?;
+        terms::make_tuple(
+            self,
+            &[
+                tag,
+                make_small(DFLAG_DIST_DEFAULT),
+                make_small(DFLAG_DIST_MANDATORY),
+                make_small(DFLAG_DIST_ADDABLE),
+                make_small(DFLAG_DIST_REJECTABLE),
+                make_small(DFLAG_DIST_STRICT_ORDER),
+            ],
+        )
+    }
+
+    // -- erts_internal:beamfile_chunk/2 --------------------------------------
+
+    /// `erts_internal:beamfile_chunk/2` — a named chunk's payload of a `.beam` image
+    /// (`beam_bif_load.c:165-201`).
+    ///
+    /// The chunk name is a four-element byte list (`read_iff_list`, `:139-163`) matched
+    /// against the container's four-byte ASCII tags **case-sensitively**. A chunk that
+    /// is absent — or present with a zero-length payload, which the C's
+    /// `chunk.size > 0` guard also rejects — answers the atom `undefined`; an image the
+    /// container cannot parse (`iff_init`'s `FOR1` assert, or `read_beam_chunks`'s
+    /// `BEAM` form-type assert) answers `undefined` too.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the first argument is not a byte-aligned binary, or
+    /// the second is not exactly a four-element byte list — the C's `BADARG` for both.
+    fn erts_beamfile_chunk(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let binary = *args.first().ok_or(BeamError::BadArg)?;
+        let name = *args.get(1).ok_or(BeamError::BadArg)?;
+        let Some(tag) = iff_list_tag(name) else {
+            return Err(BeamError::BadArg);
+        };
+        let bytes = terms::binary_bytes(binary).map_err(|_| BeamError::BadArg)?;
+        let payload = match beam_loader::container::parse(bytes) {
+            Ok(container) => chunk_payload(&container, ChunkId(tag))
+                .filter(|data| !data.is_empty())
+                .map(<[u8]>::to_vec),
+            Err(_) => None,
+        };
+        match payload {
+            // The payload is built on the runtime's pointer-stable `-eval` heap — the
+            // same `beam_codec::term::make_binary` writer `prim_file:read_file/1` uses,
+            // which has no 64-byte on-heap limit.
+            Some(data) => beam_codec::term::make_binary(self.eval_heap(), &data),
+            None => self.atom("undefined"),
+        }
+    }
+
+    // -- erts_internal:no_aux_work_threads/0 ---------------------------------
+
+    /// `erts_internal:no_aux_work_threads/0` — the auxiliary work-thread count
+    /// (`erl_process.c:9234-9237`, set at `:6219-6223`).
+    ///
+    /// The C computes `normal_schedulers + 1 + erts_no_dirty_alloc_instances`; the
+    /// dirty-alloc term comes from `+dai`, which this runtime does not model, so it is
+    /// `0` — exactly the oracle's own default. The scheduler count is this runtime's
+    /// (`+S N`, else the processor count); see the module docs for the default-count
+    /// divergence.
+    ///
+    /// # Errors
+    ///
+    /// None: the answer is always a small integer.
+    fn erts_no_aux_work_threads(&mut self) -> Result<Eterm> {
+        Ok(make_small(crate::info::schedulers_count(self.runtime) + 1))
     }
 
     // -- erts_internal:map_to_tuple_keys/1 -----------------------------------
@@ -606,11 +746,49 @@ fn cons_cdr(term: Eterm) -> Result<Eterm> {
     terms::cons_tail(term)
 }
 
+/// The C's `read_iff_list` (`beam_bif_load.c:139-163`): the four bytes of a
+/// well-formed four-element byte list (big-endian, as the C shifts them in), or `None`
+/// for the C's `badarg`.
+///
+/// Exactly four cells, each `CAR` a byte (a small integer in `0..=255`), terminated by
+/// `NIL` — so a too-short, too-long, improper, non-byte or non-list name is rejected.
+fn iff_list_tag(term: Eterm) -> Option<[u8; 4]> {
+    let mut tag = [0u8; 4];
+    let mut rest = term;
+    for slot in &mut tag {
+        if !is_list(rest) {
+            return None;
+        }
+        let octet = terms::cons_head(rest).ok()?;
+        if !is_byte(octet) {
+            return None;
+        }
+        *slot = signed_value(octet) as u8;
+        rest = terms::cons_tail(rest).ok()?;
+    }
+    is_nil(rest).then_some(tag)
+}
+
+/// The payload of the **last** chunk tagged `id`, or `None` when there is none.
+///
+/// `read_beam_chunks` (`beam_file.c:1556-1581`) walks the whole directory and keeps
+/// overwriting its answer slot, so a duplicate tag resolves to the *last* occurrence —
+/// not the first, which is what [`Container::find`] would give. The caller applies the
+/// C's `chunk.size > 0` guard (`beam_bif_load.c:190`).
+fn chunk_payload<'b>(container: &Container<'b>, id: ChunkId) -> Option<&'b [u8]> {
+    container
+        .chunks
+        .iter()
+        .rev()
+        .find(|chunk| chunk.id == id)
+        .map(|chunk| chunk.data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::RuntimeContext;
-    use crate::native::test_support::{atom, call, chars, runtime, string_of};
+    use crate::native::test_support::{atom, call, chars, runtime, string_of, system_runtime};
     use crate::runtime::Runtime;
     use beam_bifs::NullSink;
     use beam_term::NIL;
@@ -700,6 +878,53 @@ mod tests {
         map(runtime, &pairs)
     }
 
+    /// `bytes` as a binary on the runtime's long-lived `-eval` heap.
+    ///
+    /// Built by the same `beam_codec::term::make_binary` the `beamfile_chunk/2`
+    /// implementation uses, so a whole `.beam` image — far past
+    /// `beam_engine::terms::make_heap_binary`'s 64-byte on-heap limit — is
+    /// representable.
+    fn big_binary(runtime: &mut Runtime, bytes: &[u8]) -> Eterm {
+        eval_heap_term(runtime, |heap| beam_codec::term::make_binary(heap, bytes))
+    }
+
+    /// A minimal `FOR1`/`BEAM` container holding `(tag, payload)` chunks, padded to the
+    /// 4-byte boundary exactly as the wire format requires.
+    ///
+    /// This only *builds* bytes; the production path still parses them through
+    /// `beam_loader::container` (no second parser exists).
+    fn iff_image(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (tag, payload) in chunks {
+            body.extend_from_slice(*tag);
+            body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            body.extend_from_slice(payload);
+            body.extend(std::iter::repeat(0u8).take((4 - (payload.len() % 4)) % 4));
+        }
+        let mut image = Vec::new();
+        image.extend_from_slice(b"FOR1");
+        image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
+        image.extend_from_slice(b"BEAM");
+        image.extend_from_slice(&body);
+        image
+    }
+
+    /// The system `lists.beam` image — what the oracle's
+    /// `element(2, code:get_object_code(lists))` returns — or `None`, in which case the
+    /// caller skips **loudly**.
+    fn lists_beam(runtime: &mut Runtime) -> Option<Vec<u8>> {
+        let Some(path) = runtime.find_module_file("lists") else {
+            eprintln!("SKIP: the system `lists.beam` is not on the code path");
+            return None;
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                eprintln!("SKIP: cannot read {}: {error}", path.display());
+                None
+            }
+        }
+    }
     // -- erts_internal:term_type/1 (oracle: OTP 29.1.1 / erts-17.1) ------------
 
     /// Oracle: `erts_internal:term_type(T)` for `1`/`a`/`{x}`/`#{a=>1}`/`self()`/`1.0`/`[]`/
@@ -762,20 +987,52 @@ mod tests {
         assert_eq!(type_of(&mut runtime, export), "export");
     }
 
-    /// The three boxed families `beam_term`'s **safe** API cannot name are a typed
-    /// capability gap here. Each is a `// documented divergence:` — the oracle answers a
-    /// name (`bignum`/`reference`/`sub_binary`), this runtime reports `unsupported`
-    /// rather than substituting a wrong name (the module docs' rule).
+    /// Oracle: `1 bsl 100` ⇒ `bignum`; `binary_to_term(<<131,88,118,0,2,110,49,0,0,0,1,
+    /// 0,0,0,2,0,0,0,0>>)` ⇒ `external_pid`; `binary_to_term(<<131,89,118,0,2,110,49,0,
+    /// 0,0,1,0,0,0,1>>)` ⇒ `external_port`; `binary_to_term(<<131,90,0,1,118,0,2,110,49,
+    /// 0,0,0,1,0,0,0,2>>)` ⇒ `external_reference`.
+    #[test]
+    fn term_type_names_the_boxed_families_the_safe_api_reaches() {
+        let mut runtime = runtime();
+
+        // `1 bsl 100` = 2^36 · 2^64 — a two-limb bignum (`make_big` takes the limbs
+        // least-significant first).
+        let big = eval_heap_term(&mut runtime, |heap| {
+            beam_codec::term::make_big(heap, false, &[0, 1u64 << 36])
+        });
+        assert_eq!(type_of(&mut runtime, big), "bignum");
+
+        // The three wire `EXTERNAL_*` families, decoded from the oracle's own images.
+        for (wire, expected) in [
+            (
+                &[
+                    131u8, 88, 118, 0, 2, 110, 49, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0,
+                ][..],
+                "external_pid",
+            ),
+            (
+                &[131, 89, 118, 0, 2, 110, 49, 0, 0, 0, 1, 0, 0, 0, 1][..],
+                "external_port",
+            ),
+            (
+                &[131, 90, 0, 1, 118, 0, 2, 110, 49, 0, 0, 0, 1, 0, 0, 0, 2][..],
+                "external_reference",
+            ),
+        ] {
+            let image = binary(&mut runtime, wire);
+            let term = call(&mut runtime, "erlang", "binary_to_term", &[image])
+                .unwrap_or_else(|e| panic!("binary_to_term of {expected}: {e}"));
+            assert_eq!(type_of(&mut runtime, term), expected);
+        }
+    }
+
+    /// The boxed families `beam_term`'s **safe** API cannot name are a typed capability
+    /// gap here — never a substituted name (the module docs' rule). Two remain: an
+    /// internal `reference` (the oracle answers `reference`) and a non-byte-aligned
+    /// bitstring (the oracle answers `sub_binary`).
     #[test]
     fn term_type_reports_a_typed_gap_for_families_the_safe_classifier_cannot_name() {
         let mut runtime = runtime();
-
-        // documented divergence: the oracle answers `bignum`.
-        let big = eval_heap_term(&mut runtime, |heap| {
-            beam_codec::term::make_big(heap, false, &[1])
-        });
-        let error = erts(&mut runtime, "term_type", &[big]).expect_err("a bignum is a typed gap");
-        assert!(error::unsupported_reason(&error).is_some(), "{error}");
 
         // documented divergence: the oracle answers `reference`.
         let reference = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
@@ -790,7 +1047,13 @@ mod tests {
         });
         let error = erts(&mut runtime, "term_type", &[bits])
             .expect_err("a non-byte-aligned bitstring is a typed gap");
-        assert!(error::unsupported_reason(&error).is_some(), "{error}");
+        assert_eq!(
+            error::unsupported_reason(&error).as_deref(),
+            Some(
+                "erts_internal:term_type/1: boxed family outside the safe M1 classifier (an \
+                 internal reference, a non-byte-aligned bitstring)"
+            )
+        );
     }
 
     // -- erts_internal:map_to_tuple_keys/1 ------------------------------------
@@ -1085,6 +1348,220 @@ mod tests {
         assert_eq!(ok_name(&mut runtime, "get_creation", &[]), "undefined");
     }
 
+    // -- erts_internal:get_dflags/0 -------------------------------------------
+
+    /// `term_to_binary(erts_internal:get_dflags())`, from
+    /// `erl -noshell -eval 'io:format("~p~n",[term_to_binary(erts_internal:get_dflags())]),halt().'`.
+    ///
+    /// It pins two things at once: the record's exact shape/values and the *encoding* of
+    /// the two wide slots (`468283523004` and `17230663572` are 60-bit fixnums in the
+    /// oracle, and a fixnum past signed-32-bit goes out as `SMALL_BIG_EXT` with its
+    /// magnitude as base-256 bytes, least-significant first — `110,5,0,188,127,223,7,109`
+    /// for the first, `110,5,0,148,15,7,3,4` for the second). The two small slots take the
+    /// plain `INTEGER_EXT` form (`98,0,128,32,66` = `8396866`, `98,0,0,32,0` = `8192`).
+    const ORACLE_DFLAGS_IMAGE: &[u8] = &[
+        131, 104, 6, 119, 11, 101, 114, 116, 115, 95, 100, 102, 108, 97, 103, 115, 110, 5, 0, 188,
+        127, 223, 7, 109, 110, 5, 0, 148, 15, 7, 3, 4, 110, 5, 0, 188, 127, 223, 7, 109, 98, 0,
+        128, 32, 66, 98, 0, 0, 32, 0,
+    ];
+
+    /// Oracle: `erts_internal:get_dflags()` ⇒
+    /// `{erts_dflags,468283523004,17230663572,468283523004,8396866,8192}` — the identical
+    /// record on a non-distributed and on a `-sname` node (`ERTS_GLOBAL_LIT_DFLAGS_RECORD`
+    /// is a build-time literal, so the answer does not depend on the node's state).
+    #[test]
+    fn get_dflags_is_the_oracles_fixed_flag_record() {
+        let mut runtime = runtime();
+        let dflags = erts(&mut runtime, "get_dflags", &[]).expect("get_dflags/0");
+        assert_eq!(terms::tuple_arity(dflags).expect("a 6-tuple"), 6);
+
+        let element = |index: usize| terms::tuple_element(dflags, index).expect("an element");
+        assert_eq!(runtime.atom_name_of(element(0)), Some("erts_dflags"));
+        let values: Vec<i64> = (1..6).map(|index| signed_value(element(index))).collect();
+        assert_eq!(
+            values,
+            [
+                468_283_523_004,
+                17_230_663_572,
+                468_283_523_004,
+                8_396_866,
+                8_192
+            ]
+        );
+
+        // The wire image must be byte-identical to the oracle's (this is what pins the
+        // wide slots' encoding).
+        let image =
+            call(&mut runtime, "erlang", "term_to_binary", &[dflags]).expect("term_to_binary/1");
+        assert_eq!(
+            terms::binary_bytes(image).expect("a binary"),
+            ORACLE_DFLAGS_IMAGE
+        );
+    }
+
+    // -- erts_internal:beamfile_chunk/2 ---------------------------------------
+
+    /// Oracle: `byte_size(erts_internal:beamfile_chunk(element(2,
+    /// code:get_object_code(lists)),"Code"))` ⇒ `30110`; the same call with `"Nope"` ⇒
+    /// `undefined` and with the lowercase `"code"` ⇒ `undefined` (the tags match
+    /// case-sensitively).
+    #[test]
+    fn beamfile_chunk_answers_a_named_chunk_of_a_real_beam() {
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let Some(bytes) = lists_beam(&mut runtime) else {
+            return;
+        };
+        let beam = big_binary(&mut runtime, &bytes);
+
+        let code = chars(&mut runtime, "Code");
+        let chunk = erts(&mut runtime, "beamfile_chunk", &[beam, code]).expect("the Code chunk");
+        assert_eq!(terms::binary_bytes(chunk).expect("a binary").len(), 30110);
+
+        let nope = chars(&mut runtime, "Nope");
+        assert_eq!(
+            ok_name(&mut runtime, "beamfile_chunk", &[beam, nope]),
+            "undefined"
+        );
+
+        let lowercase = chars(&mut runtime, "code");
+        assert_eq!(
+            ok_name(&mut runtime, "beamfile_chunk", &[beam, lowercase]),
+            "undefined"
+        );
+    }
+
+    /// Oracle: a non-binary first argument, and a name that is not exactly a
+    /// four-element byte list (too short, too long, improper, a binary, an out-of-range
+    /// element, an atom, `[]`), each raise `error:badarg` — `read_iff_list`
+    /// (`beam_bif_load.c:139-163`) / `erts_get_aligned_binary_bytes`.
+    #[test]
+    fn beamfile_chunk_rejects_a_non_binary_and_a_malformed_name() {
+        let mut runtime = runtime();
+        let bytes = iff_image(&[(b"Test", b"xy")]);
+        let beam = big_binary(&mut runtime, &bytes);
+
+        let five = make_small(5);
+        let code = chars(&mut runtime, "Code");
+        assert!(matches!(
+            erts(&mut runtime, "beamfile_chunk", &[five, code]),
+            Err(BeamError::BadArg)
+        ));
+
+        for name in ["Cod", "Codee", ""] {
+            let name = chars(&mut runtime, name);
+            assert!(
+                matches!(
+                    erts(&mut runtime, "beamfile_chunk", &[beam, name]),
+                    Err(BeamError::BadArg)
+                ),
+                "{name:?}"
+            );
+        }
+
+        let name_binary = binary(&mut runtime, b"Code");
+        assert!(matches!(
+            erts(&mut runtime, "beamfile_chunk", &[beam, name_binary]),
+            Err(BeamError::BadArg)
+        ));
+
+        let name_atom = atom(&mut runtime, "code");
+        assert!(matches!(
+            erts(&mut runtime, "beamfile_chunk", &[beam, name_atom]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A four-element list whose first element is not a byte.
+        let wide = heap_term(&mut runtime, |ctx| {
+            terms::make_list(ctx, &[make_small(256), make_small(111), make_small(100)])
+        });
+        assert!(matches!(
+            erts(&mut runtime, "beamfile_chunk", &[beam, wide]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A proper four-element list terminated by a non-`NIL` tail.
+        let improper = heap_term(&mut runtime, |ctx| {
+            let mut list = make_small(65);
+            for car in [101, 100, 111, 67] {
+                list = terms::make_cons(ctx, make_small(car), list)?;
+            }
+            Ok(list)
+        });
+        assert!(matches!(
+            erts(&mut runtime, "beamfile_chunk", &[beam, improper]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// Oracle: an image the container cannot parse — `<<"garbage">>` and
+    /// `<<"FOR1",4:32,"NOPE">>` (a non-`BEAM` form type) — answers `undefined`; a chunk
+    /// that is present but empty answers `undefined` (the C's `chunk.size > 0` guard,
+    /// `beam_bif_load.c:190`); and a **duplicated** tag resolves to the *last*
+    /// occurrence (`read_beam_chunks`, `beam_file.c:1556-1581`, keeps overwriting its
+    /// slot — the oracle answers `<<"\t\t">>` for a `"Test"` chunk written twice as
+    /// `<<1,2,3>>` then `<<9,9>>`).
+    #[test]
+    fn beamfile_chunk_answers_undefined_for_absent_empty_and_unparseable_chunks() {
+        let mut runtime = runtime();
+
+        let garbage = big_binary(&mut runtime, b"garbage");
+        let code = chars(&mut runtime, "Code");
+        assert_eq!(
+            ok_name(&mut runtime, "beamfile_chunk", &[garbage, code]),
+            "undefined"
+        );
+
+        // A well-formed `FOR1` whose form type is not `BEAM`.
+        let non_beam = big_binary(&mut runtime, b"FOR1\x00\x00\x00\x04NOPE");
+        assert_eq!(
+            ok_name(&mut runtime, "beamfile_chunk", &[non_beam, code]),
+            "undefined"
+        );
+
+        let empty_chunk = big_binary(&mut runtime, &iff_image(&[(b"Zero", b"")]));
+        let zero = chars(&mut runtime, "Zero");
+        assert_eq!(
+            ok_name(&mut runtime, "beamfile_chunk", &[empty_chunk, zero]),
+            "undefined"
+        );
+
+        let duplicated = big_binary(
+            &mut runtime,
+            &iff_image(&[(b"Test", &[1, 2, 3]), (b"Test", &[9, 9])]),
+        );
+        let test = chars(&mut runtime, "Test");
+        let last = erts(&mut runtime, "beamfile_chunk", &[duplicated, test])
+            .expect("the duplicated chunk");
+        assert_eq!(terms::binary_bytes(last).expect("a binary"), [9, 9]);
+    }
+
+    // -- erts_internal:no_aux_work_threads/0 ----------------------------------
+
+    /// Oracle: `erl -noshell -eval 'io:format("~p~n",[erts_internal:no_aux_work_threads()]),
+    /// halt().'` ⇒ `17` on this 16-scheduler machine; `erl +S 1 …` ⇒ `2`; `erl +S 3 …`
+    /// ⇒ `4` (`erl_process.c:6219-6223`: `normal_schedulers + 1 +
+    /// erts_no_dirty_alloc_instances`, the last being `0` without `+dai`).
+    #[test]
+    fn no_aux_work_threads_is_the_scheduler_count_plus_one() {
+        for (configured, expected) in [(1u32, 2i64), (3, 4), (5, 6)] {
+            let mut runtime =
+                Runtime::new(crate::config::RuntimeConfig::default().with_schedulers(configured))
+                    .unwrap_or_else(|e| panic!("+S {configured}: {e}"));
+            let answer =
+                erts(&mut runtime, "no_aux_work_threads", &[]).expect("no_aux_work_threads/0");
+            assert_eq!(signed_value(answer), expected, "+S {configured}");
+        }
+
+        // The default follows *this* runtime's own scheduler count — a documented
+        // divergence only in that count's basis (`available_parallelism()`, which is
+        // affinity/cgroup-aware, vs ERTS's online processor count).
+        let mut default = runtime();
+        let expected = crate::info::schedulers_count(&default) + 1;
+        let answer = erts(&mut default, "no_aux_work_threads", &[]).expect("the default count");
+        assert_eq!(signed_value(answer), expected);
+    }
     // -- erts_internal:is_process_alive/1 -------------------------------------
 
     /// Oracle: `is_process_alive(self())` ⇒ `true`; an atom or a binary ⇒
