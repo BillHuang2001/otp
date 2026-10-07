@@ -63,6 +63,11 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>` — picks minor vs major (policy),
     escalating a would-not-fit minor to a major
   - `collect_minor(&mut self, roots) -> Result<GcStats>`; `collect_major(&mut self, roots) -> Result<GcStats>`
+  - `minor_gcs() -> u32` — minors since the last fullsweep (`GEN_GCS`); `impl HeapObservable` (see `heap_info.rs`)
+  - After **every** collection the (now empty) nursery is re-sized from `HeapPolicy::young_after_collection`
+    (the C minor-time young-heap resize, `erl_gc.c:1493`) and a fullsweep sizes the fresh mature space from
+    `HeapPolicy::mature_after_fullsweep` (the C `adjust_after_fullsweep`) — a small nursery grows under
+    allocation pressure and an oversized one shrinks toward its live set (see Design Decisions).
 
 ### `immix/mod.rs` + `immix/collect.rs` — the mark-region mature space (`ImmixSpace`)
 - `pub struct ImmixSpace` — line/block mark-region mature generation. Geometry: `LINE_WORDS` 16,
