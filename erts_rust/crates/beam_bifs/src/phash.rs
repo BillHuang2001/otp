@@ -591,7 +591,7 @@ fn block_hash(bytes: &[u8], initval: u32) -> u32 {
         a = a.wrapping_add(le_u32(&bytes[k..]));
         b = b.wrapping_add(le_u32(&bytes[k + 4..]));
         c = c.wrapping_add(le_u32(&bytes[k + 8..]));
-        c = mix(a, b, c);
+        (a, b, c) = mix3(a, b, c);
         k += 12;
     }
     // `block_hash_final_bytes`: the length is folded into `c`, then the ≤11 tail
@@ -632,7 +632,7 @@ fn block_hash(bytes: &[u8], initval: u32) -> u32 {
     if l >= 1 {
         a = a.wrapping_add(u32::from(fin[0]));
     }
-    mix(a, b, c)
+    mix3(a, b, c).2
 }
 
 /// `make_hash2(term)` (`erl_term_hashing.c:1598-1601`) — the full 32-bit hash, as
@@ -976,8 +976,9 @@ fn phash2_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 #[cfg(test)]
 mod tests {
     //! Unit tests for the pieces `../../tests/phash.rs` cannot reach directly: the
-    //! `atom_hash` hashpjw (including the latin1 clutch) and the bit-exactness of
-    //! the wrapping `step` helper. The oracle-pinned end-to-end values live in the
+    //! `atom_hash` hashpjw (including the latin1 clutch), the bit-exactness of the
+    //! wrapping `step` helper, the `MIX` rounds, the `block_hash` fold and the
+    //! `IS_SSMALL28` boundaries. The oracle-pinned end-to-end values live in the
     //! integration suite.
 
     use super::*;
@@ -1034,5 +1035,41 @@ mod tests {
             }
         }
         assert_eq!(atom_hvalue("\u{100}"), (expected & 0xFFFF_FFFF) as u32);
+    }
+
+    #[test]
+    fn mix_matches_the_c_rounds() {
+        // The C `MIX(a,b,c)` (`erl_term_hashing.c:428-439`) mutates all three of its
+        // lvalues; `mix` returns only the final `c` and `mix3` returns the whole
+        // triple. Both values below are the C result for `(a,b,c) = (1,2,3)`.
+        assert_eq!(mix(1, 2, 3), 3_082_062_082);
+        assert_eq!(mix3(1, 2, 3), (120_349_509, 1_098_030_347, 3_082_062_082));
+    }
+
+    #[test]
+    fn block_hash_matches_the_c_twelve_byte_fold() {
+        // `payload[i] = (i*7+3) mod 256`. `HCONST_13` is the initial value the
+        // binary/bitstring rule passes (`hash2_bitstring`), and the low 27 bits of
+        // the result are the oracle's `erlang:phash2/1` value (43353299 for 12
+        // bytes, 101390983 for 13 bytes). The 12-byte input exercises the unrolled
+        // loop once (carrying the mutated `a`/`b` into the tail fold); the 13-byte
+        // input adds one tail byte to the carried `a`.
+        let p12 = [3u8, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80];
+        let p13 = [3u8, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87];
+        assert_eq!(block_hash(&p12, HCONST_13), 3_398_796_499);
+        assert_eq!(block_hash(&p12, HCONST_13) & 0x07FF_FFFF, 43_353_299);
+        assert_eq!(block_hash(&p13, HCONST_13), 504_044_167);
+        assert_eq!(block_hash(&p13, HCONST_13) & 0x07FF_FFFF, 101_390_983);
+    }
+
+    #[test]
+    fn is_ssmall28_has_the_documented_boundaries() {
+        // `IS_SSMALL28(x)` (`erl_term_hashing.c:914`): `x ∈ [-2^27, 2^27)`.
+        assert!(is_ssmall28(0));
+        assert!(is_ssmall28((1 << 27) - 1));
+        assert!(!is_ssmall28(1 << 27));
+        assert!(is_ssmall28(-(1 << 27)));
+        assert!(is_ssmall28(-((1 << 27) - 1)));
+        assert!(!is_ssmall28(-(1 << 27) - 1));
     }
 }

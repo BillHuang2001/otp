@@ -7,9 +7,6 @@
 //! differential values are *not* derivable from the term alone — that is the whole
 //! point of pinning them.
 //!
-//! One case is `#[ignore]`d: it pins a binary payload of ≥ 12 bytes, which the
-//! current `block_hash` in `src/phash.rs` hashes wrongly (see its FIXME).
-//!
 //! The tests drive only the public API — [`BifRegistry`]/[`BifContext`] plus the
 //! declared dependency crates (`beam_alloc` for the heap, `beam_codec::term` for
 //! the binary/bitstring/bignum constructors).
@@ -906,59 +903,147 @@ fn records_still_raise_unsupported_bif() {
 }
 
 // ---------------------------------------------------------------------------
-// A pinned, currently-failing edge case (`#[ignore]`d — it documents a bug in
-// `src/phash.rs`, which this node does not own)
+// Binaries and bitstrings
 // ---------------------------------------------------------------------------
 
 /// `phash2/1` of a binary payload of **12 bytes or more**, against the oracle.
 ///
-/// FIXME(src/phash.rs): `block_hash`'s 12-byte unrolled loop is an incorrect
-/// translation of the C `MIX`. The C's `MIX` macro (`erl_term_hashing.c:428-439`)
-/// mutates `a`, `b` *and* `c` in place, and `block_hash` carries the mutated
-/// `ctx->a`/`ctx->b` into `block_hash_final_bytes` (which keeps adding the tail
-/// bytes to them). This crate's `mix(a, b, c) -> u32` returns only `c`, so after
-/// each 12-byte iteration the loop keeps the **pre-mix** `a`/`b` — every payload
-/// of ≥ 12 bytes therefore hashes to a wrong value. Payloads of < 12 bytes take
-/// the tail-only path and are correct, which is why the other cases here pass.
-///
-/// Verified against an independently compiled transcription of the C
-/// (`block_hash_setup`/`block_hash_buffer`/`block_hash_final_bytes`) for lengths
-/// 1, 2, 3, 11, 12, 13, 24, 25 — all agree with `erl`, while this crate's
-/// `block_hash` agrees only for the four lengths below 12.
-///
-/// The fix is to have `MIX` return `(a, b, c)` (e.g. a `mix3` helper alongside the
-/// existing `mix`) and use it both in the loop and for the final fold; that makes
-/// all eight lengths agree with the oracle. Remove this `#[ignore]` once it lands.
+/// A length of ≥ 12 exercises `block_hash`'s 12-byte unrolled loop, whose `MIX`
+/// folds the mutated `a`/`b`/`c` forward into the tail-bytes fold — so these
+/// values pin both the per-iteration carry and the final fold (lengths 0..11 only
+/// take the tail path).
 #[test]
-#[ignore = "FIXME(src/phash.rs): block_hash drops the C MIX's in-place a/b updates, so \
-            payloads >= 12 bytes hash wrong (unowned by this node; drop this attribute \
-            once fixed)"]
 fn phash2_binaries_of_twelve_bytes_or_more_match_the_oracle() {
     run(|_reg, ctx| {
-        // `payload[i] = (i * 7 + 3) mod 256`, so each length is distinguishable.
-        let payload12: &[u8] = &[3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80];
-        let payload13: &[u8] = &[3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87];
-        let payload24: &[u8] = &[
-            3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87, 94, 101, 108, 115, 122, 129, 136,
-            143, 150, 157, 164,
-        ];
-        let payload25: &[u8] = &[
-            3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87, 94, 101, 108, 115, 122, 129, 136,
-            143, 150, 157, 164, 171,
-        ];
-
-        for (bytes, expected) in [
-            (payload12, 43_353_299u32),
-            (payload13, 101_390_983),
-            (payload24, 11_879_809),
-            (payload25, 19_225_834),
-        ] {
-            let bin = make_binary(ctx.heap(), bytes).expect("fits");
+        for (len, expected) in BINARY_SWEEP {
+            let bytes = sweep_payload(len);
+            let bin = make_binary(ctx.heap(), &bytes).expect("fits");
             assert_phash2(
                 ctx,
                 &[bin],
-                i64::from(expected),
-                &format!("phash2(a {}-byte binary)", bytes.len()),
+                expected,
+                &format!("phash2(a {len}-byte binary)"),
+            );
+        }
+    });
+}
+
+/// `payload[i] = (i * 7 + 3) mod 256`, so every length is distinguishable.
+fn sweep_payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| ((i * 7 + 3) % 256) as u8).collect()
+}
+
+/// `(length, oracle erlang:phash2/1)` for `sweep_payload(length)`, covering 0..=64
+/// (all tail lengths and several loop iterations) plus a few 100+/1000+ payloads.
+const BINARY_SWEEP: [(usize, i64); 70] = [
+    (0, 13_708_901),
+    (1, 110_786_568),
+    (2, 66_323_310),
+    (3, 54_114_709),
+    (4, 29_944_881),
+    (5, 46_655_611),
+    (6, 60_461_966),
+    (7, 87_067_119),
+    (8, 29_465_626),
+    (9, 115_750_623),
+    (10, 13_298_210),
+    (11, 6_277_990),
+    (12, 43_353_299),
+    (13, 101_390_983),
+    (14, 16_032_732),
+    (15, 129_358_774),
+    (16, 127_549_786),
+    (17, 63_262_311),
+    (18, 98_915_469),
+    (19, 109_044_614),
+    (20, 95_852_011),
+    (21, 30_756_980),
+    (22, 82_493_865),
+    (23, 101_444_995),
+    (24, 11_879_809),
+    (25, 19_225_834),
+    (26, 37_272_023),
+    (27, 33_331_196),
+    (28, 113_893_337),
+    (29, 32_449_564),
+    (30, 58_858_503),
+    (31, 130_388_158),
+    (32, 27_873_932),
+    (33, 107_969_872),
+    (34, 34_568_304),
+    (35, 37_708_219),
+    (36, 52_616_682),
+    (37, 83_758_007),
+    (38, 106_657_277),
+    (39, 82_778_620),
+    (40, 4_148_690),
+    (41, 46_351_670),
+    (42, 65_061_131),
+    (43, 57_748_611),
+    (44, 58_602_716),
+    (45, 79_122_520),
+    (46, 19_092_667),
+    (47, 24_720_672),
+    (48, 87_896_660),
+    (49, 19_009_191),
+    (50, 106_899_171),
+    (51, 22_914_714),
+    (52, 41_431_194),
+    (53, 12_085_088),
+    (54, 51_274_675),
+    (55, 66_913_128),
+    (56, 57_933_425),
+    (57, 47_943_959),
+    (58, 105_731_260),
+    (59, 66_071_240),
+    (60, 59_671_866),
+    (61, 46_414_219),
+    (62, 93_247_227),
+    (63, 50_941_664),
+    (64, 39_181_186),
+    (100, 60_468_140),
+    (200, 970_580),
+    (1000, 98_493_776),
+    (1001, 74_767_649),
+    (1200, 128_287_640),
+];
+
+/// `phash2/1` of a **non-byte-aligned** bitstring `<<Payload/binary, R:R>>`.
+///
+/// This pins the trailing-bits fold (`HCONST_15`) after a `block_hash` that itself
+/// ran one full 12-byte iteration on the byte-aligned prefix.
+#[test]
+fn phash2_non_byte_aligned_bitstrings_match_the_oracle() {
+    run(|_reg, ctx| {
+        // `(payload length in bytes, trailing bits, oracle value)`.
+        let cases: [(usize, u8, i64); 16] = [
+            (11, 1, 128_602_037),
+            (11, 3, 18_899_048),
+            (11, 5, 19_126_151),
+            (11, 7, 50_145_949),
+            (12, 1, 15_612_406),
+            (12, 3, 108_349_436),
+            (12, 5, 64_923_878),
+            (12, 7, 26_910_108),
+            (13, 1, 45_084_759),
+            (13, 3, 57_191_926),
+            (13, 5, 113_897_411),
+            (13, 7, 93_853_623),
+            (14, 1, 93_395_084),
+            (14, 3, 54_513_294),
+            (14, 5, 54_518_462),
+            (14, 7, 54_265_566),
+        ];
+        for (k, r, expected) in cases {
+            let mut bytes = sweep_payload(k);
+            // `R` in the top `r` bits (the MSB-first packing `make_bitstring` wants).
+            bytes.push(r << (8 - r));
+            let bits = make_bitstring(ctx.heap(), &bytes, k * 8 + usize::from(r)).expect("fits");
+            assert_phash2(
+                ctx,
+                &[bits],
+                expected,
+                &format!("phash2(<<{k}-byte payload, {r}:{r}>>)"),
             );
         }
     });

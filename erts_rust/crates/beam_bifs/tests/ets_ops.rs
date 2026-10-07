@@ -48,6 +48,14 @@ fn seeded_atoms() -> AtomTable {
         "compressed",
         "read_concurrency",
         "write_concurrency",
+        "decentralized_counters",
+        "heir",
+        "none",
+        "node",
+        "nonode@nohost",
+        // The match-spec variables the `ets:select` specs use.
+        "$1",
+        "$2",
         "my_tab",
         "tab2",
         "a",
@@ -146,6 +154,9 @@ fn registration_covers_every_new_ets_bif() {
         ("update_counter", 3),
         ("update_counter", 4),
         ("update_element", 3),
+        ("select", 1),
+        ("select", 2),
+        ("select", 3),
     ] {
         let expected = name != "size";
         assert_eq!(
@@ -488,18 +499,41 @@ fn info_reports_the_table_fields() {
         );
     }
 
-    // `info/2` `id` is the table handle (structurally equal, as the oracle's is).
+    // `info/2` `id` reproduces `TableInfo::entries`: the table's numeric id as a
+    // small integer (the oracle reports a tid reference here instead — see the
+    // `ets.rs` `info_field` docs).
     let id_item = ctx.atom("id").expect("seeded");
     let id = reg
         .call("ets", "info", 2, &mut ctx, &[handle, id_item])
         .expect("info/2 id");
-    assert!(beam_term::compare::eq(id, handle, &atoms));
+    let is_int = reg
+        .call("erlang", "is_integer", 1, &mut ctx, &[id])
+        .expect("erlang:is_integer");
+    assert!(is_true(&atoms, is_int), "info/2 `id` is not an integer");
 
-    // `info/1` is a proplist with one `{Item, Value}` pair per field.
+    // `heir` is `none` on a fresh table; `node` is `nonode@nohost`; a `set` reports
+    // `decentralized_counters => false` (verified against the system `erl`).
+    for (item, expected) in [
+        ("heir", ctx.atom("none").unwrap()),
+        ("node", ctx.atom("nonode@nohost").unwrap()),
+        ("decentralized_counters", ctx.atom("false").unwrap()),
+    ] {
+        let item = ctx.atom(item).expect("seeded");
+        let value = reg
+            .call("ets", "info", 2, &mut ctx, &[handle, item])
+            .expect("ets:info/2");
+        assert!(
+            beam_term::compare::eq(value, expected, &atoms),
+            "info/2 item mismatch"
+        );
+    }
+
+    // `info/1` is the oracle's 15-field proplist, in the oracle's order, with one
+    // `{Item, Value}` pair per field.
     let proplist = reg
         .call("ets", "info", 1, &mut ctx, &[handle])
         .expect("ets:info/1");
-    assert_eq!(length(&reg, &mut ctx, proplist), 12);
+    assert_eq!(length(&reg, &mut ctx, proplist), 15);
     let first_pair = nth(&reg, &mut ctx, 1, proplist);
     assert_eq!(element(&reg, &mut ctx, 1, first_pair), id_item);
 
@@ -737,4 +771,202 @@ fn ets_bifs_without_a_registry_are_unsupported() {
         is_raise_atom(&err, "unsupported_bif"),
         "ets:new/2 without a registry: {err:?}"
     );
+}
+
+/// The `ets:select/2` spec `[{{'$1','$2'}, [], [{{'$1','$2'}}]}]` — the whole
+/// matched object per match — built on `ctx`.
+///
+/// This is the raw (uncompiled) spec list every `ets:select` entry point takes;
+/// `beam_ets::compile` lowers it inside the BIF.
+fn whole_object_spec(ctx: &mut BifContext<'_>) -> Eterm {
+    let v1 = ctx.atom("$1").expect("seeded");
+    let v2 = ctx.atom("$2").expect("seeded");
+    let head = ctx.tuple(&[v1, v2]).expect("fits");
+    let guards = ctx.list(&[]).expect("fits");
+    // The `{{ … }}` construct form is a 1-tuple holding the tuple to build.
+    let projected = ctx.tuple(&[v1, v2]).expect("fits");
+    let body_item = ctx.tuple(&[projected]).expect("fits");
+    let body = ctx.list(&[body_item]).expect("fits");
+    let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+    ctx.list(&[clause]).expect("fits")
+}
+
+/// The 1-based key/value-carrying ordered objects `{a,1} … ` for `keys`, inserted
+/// into `handle` (they insert in ascending key order).
+fn insert_ordered(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    handle: Eterm,
+    keys: &[&str],
+) {
+    for (i, key) in keys.iter().enumerate() {
+        let obj = object(ctx, key, i as i64 + 1);
+        reg.call("ets", "insert", 2, ctx, &[handle, obj])
+            .expect("insert");
+    }
+}
+
+#[test]
+fn select_2_projects_every_matching_object_in_iteration_order() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+    // An `ordered_set` iterates in key order, so the projection is deterministic
+    // (a `set`'s order is unspecified).
+    let handle = new_table(&reg, &mut ctx, "tab2", "ordered_set");
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b", "c"]);
+
+    let spec = whole_object_spec(&mut ctx);
+    let got = reg
+        .call("ets", "select", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select/2");
+
+    // Verified against the system `erl`: the body `{{'$1','$2'}}` yields the whole
+    // object per match, in iteration order.
+    let a = object(&mut ctx, "a", 1);
+    let b = object(&mut ctx, "b", 2);
+    let c = object(&mut ctx, "c", 3);
+    let expected = ctx.list(&[a, b, c]).expect("fits");
+    assert!(
+        beam_term::compare::eq(got, expected, &atoms),
+        "ets:select/2 projection mismatch"
+    );
+
+    // No matches ⇒ the empty list (the oracle returns `[]`, not `'$end_of_table'`).
+    let no_match = ctx.int(99).expect("fits");
+    let no_match_head = ctx.tuple(&[no_match, no_match]).expect("fits");
+    let guards = ctx.list(&[]).expect("fits");
+    let body = ctx.list(&[no_match]).expect("fits");
+    let clause = ctx.tuple(&[no_match_head, guards, body]).expect("fits");
+    let spec = ctx.list(&[clause]).expect("fits");
+    let empty = reg
+        .call("ets", "select", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select/2 no match");
+    assert_eq!(length(&reg, &mut ctx, empty), 0);
+
+    // A malformed spec is `badarg`, as is a non-ref handle.
+    let one = ctx.int(1).expect("fits");
+    assert!(matches!(
+        reg.call("ets", "select", 2, &mut ctx, &[handle, one]),
+        Err(BeamError::BadArg)
+    ));
+    let spec = whole_object_spec(&mut ctx);
+    assert!(matches!(
+        reg.call("ets", "select", 2, &mut ctx, &[one, spec]),
+        Err(BeamError::BadArg)
+    ));
+}
+
+#[test]
+fn select_3_limit_and_select_1_continuations_round_trip() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+    let handle = new_table(&reg, &mut ctx, "tab2", "ordered_set");
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b", "c", "p"]);
+    let spec = whole_object_spec(&mut ctx);
+    let two = ctx.int(2).expect("fits");
+    let end = ctx.atom("$end_of_table").expect("seeded");
+
+    // Chunk 1: `{Results, Continuation}` — two results and a continuation ref
+    // thing (never the `'$end_of_table'` atom).
+    let chunk1 = reg
+        .call("ets", "select", 3, &mut ctx, &[handle, spec, two])
+        .expect("ets:select/3");
+    let results1 = element(&reg, &mut ctx, 1, chunk1);
+    let cont1 = element(&reg, &mut ctx, 2, chunk1);
+    assert_eq!(length(&reg, &mut ctx, results1), 2);
+    let objects = [object(&mut ctx, "a", 1), object(&mut ctx, "b", 2)];
+    let expected1 = ctx.list(&objects).expect("fits");
+    assert!(beam_term::compare::eq(results1, expected1, &atoms));
+    assert!(!beam_term::compare::eq(cont1, end, &atoms), "chunk 1 produced no continuation");
+
+    // Chunk 2: the second `limit`-sized chunk, off the continuation.
+    let chunk2 = reg
+        .call("ets", "select", 1, &mut ctx, &[cont1])
+        .expect("ets:select/1");
+    let results2 = element(&reg, &mut ctx, 1, chunk2);
+    let cont2 = element(&reg, &mut ctx, 2, chunk2);
+    assert_eq!(length(&reg, &mut ctx, results2), 2);
+    let objects = [object(&mut ctx, "c", 3), object(&mut ctx, "p", 4)];
+    let expected2 = ctx.list(&objects).expect("fits");
+    assert!(beam_term::compare::eq(results2, expected2, &atoms));
+
+    // Chunk 3: the traversal finished after the limit landed on the last object, so
+    // the results are empty and the oracle renders the **bare** `'$end_of_table'`
+    // atom (verified against erts-17.1).
+    let chunk3 = reg
+        .call("ets", "select", 1, &mut ctx, &[cont2])
+        .expect("ets:select/1");
+    assert_eq!(
+        atoms.name(atom_val(chunk3)),
+        Some("$end_of_table"),
+        "an exhausted continuation must render as the bare '$end_of_table'"
+    );
+
+    // An unknown continuation handle is `badarg` (a plain table handle names no
+    // continuation).
+    assert!(matches!(
+        reg.call("ets", "select", 1, &mut ctx, &[handle]),
+        Err(BeamError::BadArg)
+    ));
+
+    // `limit == 0` is `badarg` (the oracle raises it).
+    let zero = ctx.int(0).expect("fits");
+    let spec = whole_object_spec(&mut ctx);
+    assert!(matches!(
+        reg.call("ets", "select", 3, &mut ctx, &[handle, spec, zero]),
+        Err(BeamError::BadArg)
+    ));
+    // A non-integer limit is `badarg` too.
+    let spec = whole_object_spec(&mut ctx);
+    let bad_limit = ctx.atom("a").expect("seeded");
+    assert!(matches!(
+        reg.call("ets", "select", 3, &mut ctx, &[handle, spec, bad_limit]),
+        Err(BeamError::BadArg)
+    ));
+}
+
+#[test]
+fn select_3_final_chunk_is_a_tuple_when_it_carries_results() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+    let handle = new_table(&reg, &mut ctx, "tab2", "ordered_set");
+    // Five objects: `limit` 2 gives 2+cont, 2+cont, then a **tuple** chunk
+    // `{[Last], '$end_of_table'}` (the oracle renders the trailing results inside a
+    // tuple, unlike the empty case which is the bare atom).
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b", "c", "p", "q"]);
+    let spec = whole_object_spec(&mut ctx);
+    let two = ctx.int(2).expect("fits");
+
+    let chunk1 = reg
+        .call("ets", "select", 3, &mut ctx, &[handle, spec, two])
+        .expect("ets:select/3");
+    let cont1 = element(&reg, &mut ctx, 2, chunk1);
+    let chunk2 = reg
+        .call("ets", "select", 1, &mut ctx, &[cont1])
+        .expect("ets:select/1");
+    let cont2 = element(&reg, &mut ctx, 2, chunk2);
+
+    let chunk3 = reg
+        .call("ets", "select", 1, &mut ctx, &[cont2])
+        .expect("ets:select/1");
+    let results3 = element(&reg, &mut ctx, 1, chunk3);
+    let terminator = element(&reg, &mut ctx, 2, chunk3);
+    assert_eq!(length(&reg, &mut ctx, results3), 1);
+    let q = object(&mut ctx, "q", 5);
+    let expected = ctx.list(&[q]).expect("fits");
+    assert!(beam_term::compare::eq(results3, expected, &atoms));
+    let end = ctx.atom("$end_of_table").expect("seeded");
+    assert!(beam_term::compare::eq(terminator, end, &atoms));
 }
