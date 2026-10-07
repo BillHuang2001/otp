@@ -11,6 +11,12 @@
 //! a successful load is itself the proof that the shim's symbols are linked into, and exported
 //! from, the test binary.
 //!
+//! # Term lifetime
+//!
+//! A NIF's result is allocated on the **host arena** behind the call's `NifEnv` (contract A.3), so
+//! the returned `Eterm` is only valid while that arena is alive. [`call`] therefore returns a
+//! [`Session`] that owns the host as well as the term, and every test reads the term through it.
+//!
 //! # Why this test is gated
 //!
 //! The whole file is `#[cfg(beam_abi_variadic_shim)]`: `build.rs` sets that cfg only when it
@@ -36,27 +42,69 @@ const MODULE: &str = "nif_variadic";
 // Driving the fixture through the crate's own `dlopen` NIF loader
 // ---------------------------------------------------------------------------------------------
 
+/// A live NIF call: the term the fixture returned **plus the host arena it was built in**.
+///
+/// A NIF builds its result through the `enif_make_*` constructors, which allocate on the *host*
+/// arena behind the call's `NifEnv` (contract A.3) — so the returned `Eterm` is only meaningful for
+/// as long as that arena is alive. Keeping the host in the session is what makes the term readable
+/// after [`call`] returns; without it the term is a dangling pointer into a freed heap and reads
+/// back as zeroed words (`beam_alloc`'s allocator path zeroes released payload before handing it
+/// out again), which is exactly the `tuple_size == 0` / "not a list" symptom.
+///
+/// Field order is load-bearing twice over:
+///
+/// * `_host` is behind a [`Box`] so that moving the session cannot move the host itself —
+///   [`load`] erased its `&mut dyn NifHost` borrow into a raw pointer that
+///   [`NifLibrary`]'s `Drop` reads back to run the `unload` callback;
+/// * fields drop in declaration order, so `_library` (whose `Drop` dereferences that raw host
+///   pointer) is dropped **before** the host it points at.
+///
+/// Both fields are held purely for their `Drop` — hence the leading underscores and the
+/// `dead_code` exemption they carry.
+struct Session {
+    /// The loaded library; dropped before the host (see the type-level note).
+    _library: NifLibrary,
+    /// The host arena every term this session holds was allocated from.
+    _host: Box<TestHost>,
+    /// The term the called NIF returned.
+    term: Eterm,
+}
+
+impl Session {
+    /// The term the NIF returned (valid while this session is alive).
+    fn term(&self) -> Eterm {
+        self.term
+    }
+}
+
 /// Compile + load the fixture, then make one call.
 ///
 /// Returns `None` after a loud skip when the toolchain is unavailable, and panics with a readable
 /// message when the library fails to load (a load failure here is *always* a shim problem, never an
 /// environment problem — the environment was checked first).
-fn call(name: &str, arity: u32, args: &[Eterm]) -> Option<Eterm> {
+fn call(name: &str, arity: u32, args: &[Eterm]) -> Option<Session> {
     let so = compile_so(MODULE, FIXTURE_C)?;
     let Some(path) = so.to_str().map(str::to_string) else {
         skip("compiled .so path is not valid UTF-8");
         return None;
     };
-    let mut host = TestHost::new();
-    // The host must outlive the library (its `unload` callback borrows it), so `host` is declared
-    // before `library` and dropped after it.
-    let library: NifLibrary = load(&path, MODULE, &mut host, Eterm::nil())
+    // Boxed so the host keeps one address for the whole session: `load` stores a raw pointer to it.
+    let mut host = Box::new(TestHost::new());
+    let library: NifLibrary = load(&path, MODULE, &mut *host, Eterm::nil())
         .unwrap_or_else(|err| panic!("the variadic fixture must load ({err:?})"));
-    let mut env = NifEnv::new(&mut host);
-    match library.call(&mut env, name, arity, args) {
-        Ok(term) => Some(term),
-        Err(err) => panic!("{MODULE}:{name}/{arity} must return a term ({err:?})"),
-    }
+    // The env borrows the host, so it must not outlive the call that produced the term.
+    let term = {
+        let mut env = NifEnv::new(&mut *host);
+        match library.call(&mut env, name, arity, args) {
+            Ok(term) => term,
+            Err(err) => panic!("{MODULE}:{name}/{arity} must return a term ({err:?})"),
+        }
+    };
+    Some(Session {
+        _library: library,
+        _host: host,
+        term,
+    })
 }
 
 /// Read a proper list of small integers back into bytes.
@@ -120,9 +168,10 @@ fn smalls() -> [Eterm; 3] {
 #[test]
 fn variadic_make_tuple_preserves_arity_and_order() {
     let args = smalls();
-    let Some(term) = call("tuple3", 3, &args) else {
+    let Some(session) = call("tuple3", 3, &args) else {
         return;
     };
+    let term = session.term();
     // SAFETY: `tuple3` returns a tuple (the fixture calls `enif_make_tuple`).
     assert!(unsafe { prelude::is_tuple(term) });
     // SAFETY: `term` is a live tuple.
@@ -140,10 +189,10 @@ fn variadic_make_tuple_preserves_arity_and_order() {
 #[test]
 fn variadic_make_list_preserves_order() {
     let args = smalls();
-    let Some(term) = call("list3", 3, &args) else {
+    let Some(session) = call("list3", 3, &args) else {
         return;
     };
-    assert_eq!(bytes(term), Some(vec![1, 2, 3]));
+    assert_eq!(bytes(session.term()), Some(vec![1, 2, 3]));
 }
 
 /// The ERTS `*printf` subset: `%d`, `%s`, `%#x` and the ERTS-specific `%p`.
@@ -152,10 +201,10 @@ fn variadic_make_list_preserves_order() {
 /// digits, where libc would print `(nil)`.
 #[test]
 fn snprintf_matches_the_erts_format_subset() {
-    let Some(term) = call("snprintf_mixed", 0, &[]) else {
+    let Some(session) = call("snprintf_mixed", 0, &[]) else {
         return;
     };
-    let (text, ret) = pair(term);
+    let (text, ret) = pair(session.term());
     assert_eq!(text, "a=-7 s=hi x=0xff p=0x0000000000000000");
     assert_eq!(ret, text.len() as i64, "the return value is the length");
 }
@@ -164,10 +213,10 @@ fn snprintf_matches_the_erts_format_subset() {
 /// the formatter produced, not what `write_sn` copied.
 #[test]
 fn snprintf_truncates_but_returns_the_full_length() {
-    let Some(term) = call("snprintf_trunc", 0, &[]) else {
+    let Some(session) = call("snprintf_trunc", 0, &[]) else {
         return;
     };
-    let (text, ret) = pair(term);
+    let (text, ret) = pair(session.term());
     assert_eq!(text, "abc", "a 4-byte buffer holds 3 bytes plus the NUL");
     assert_eq!(ret, 6, "the return value is the full rendered length");
 }
@@ -175,10 +224,10 @@ fn snprintf_truncates_but_returns_the_full_length() {
 /// `enif_vsnprintf` — the `va_list` form — behaves exactly like `enif_snprintf`.
 #[test]
 fn vsnprintf_matches_the_variadic_form() {
-    let Some(term) = call("vsnprintf_len", 0, &[]) else {
+    let Some(session) = call("vsnprintf_len", 0, &[]) else {
         return;
     };
-    let (text, ret) = pair(term);
+    let (text, ret) = pair(session.term());
     assert_eq!(text, "file-42");
     assert_eq!(ret, 7);
 }
@@ -186,10 +235,10 @@ fn vsnprintf_matches_the_variadic_form() {
 /// `enif_fprintf` really writes to the stream it is handed.
 #[test]
 fn fprintf_writes_to_the_stream() {
-    let Some(term) = call("fprintf_file", 0, &[]) else {
+    let Some(session) = call("fprintf_file", 0, &[]) else {
         return;
     };
-    let (text, ret) = pair(term);
+    let (text, ret) = pair(session.term());
     assert_eq!(text, "file-42");
     assert_eq!(ret, 7);
 }
@@ -197,10 +246,10 @@ fn fprintf_writes_to_the_stream() {
 /// `enif_vfprintf` — the `va_list` stream form.
 #[test]
 fn vfprintf_writes_to_the_stream() {
-    let Some(term) = call("vfprintf_file", 0, &[]) else {
+    let Some(session) = call("vfprintf_file", 0, &[]) else {
         return;
     };
-    let (text, ret) = pair(term);
+    let (text, ret) = pair(session.term());
     assert_eq!(text, "ab");
     assert_eq!(ret, 2);
 }
@@ -211,9 +260,10 @@ fn vfprintf_writes_to_the_stream() {
 fn set_option_is_einval_without_a_loading_module_instance() {
     for option in 1..=3 {
         let args = [prelude::make_small(option)];
-        let Some(term) = call("set_option", 1, &args) else {
+        let Some(session) = call("set_option", 1, &args) else {
             return;
         };
+        let term = session.term();
         assert!(is_small(term));
         assert_eq!(
             signed_value(term),
