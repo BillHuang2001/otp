@@ -19,6 +19,13 @@
  *   - `enif_alloc_resource` + `enif_sizeof_resource` round-trip the payload size;
  *   - `enif_make_resource` yields a term that `enif_get_resource` resolves to the same payload
  *     **only** for the exact type (0 for another type, a plain int, a plain binary);
+ *   - **the round trip hands back the payload a NIF wrote** (`roundtrip_value/0` writes 42 into the
+ *     resource and reads it back through the pointer `enif_get_resource` returned — the oracle
+ *     prints `42` there, so this is the pinned divergence), and
+ *   - **the destructor's count and ordering** (`dtor_probe/0` releases two tagged objects and
+ *     `dtor_state/0` reports how many destructors ran, in which order, with which payload byte); and
+ *   - **process liveness** (`liveness/1` — `enif_is_process_alive` on the calling process, on an
+ *     undefined pid, and on a caller-supplied "other" pid, plus `enif_is_current_process_alive`);
  *   - `enif_make_resource_binary` returns a binary whose bytes are the given bytes and which is
  *     itself a resource handle;
  *   - `enif_keep_resource`/`enif_release_resource` balance, and the destructor runs on the release
@@ -60,6 +67,11 @@ static ErlNifResourceType *res_dy = NULL;   /* dtor + dyncall */
 
 static int main_dtor_runs = 0;
 static int main_dtor_last_byte = -1;
+/* The payload tags of every `main_dtor` run, most recent last (one byte each). `dtor_probe/0`
+ * resets it so `dtor_state/0` reports the probe's own destructor ORDER (`0x1122` = the object
+ * tagged `0x11` was destroyed before the one tagged `0x22`). */
+static unsigned main_dtor_order = 0;
+static int dtor_base = 0; /* `main_dtor_runs` when the last `dtor_probe/0` started */
 static int x_dtor_runs = 0;
 static int x_stop_runs = 0;
 static int x_down_runs = 0;
@@ -69,7 +81,9 @@ static void main_dtor(ErlNifEnv *env, void *obj) {
     (void)env;
     main_dtor_runs++;
     if (obj != NULL) {
-        main_dtor_last_byte = (int)((const unsigned char *)obj)[0];
+        unsigned b = (unsigned)((const unsigned char *)obj)[0];
+        main_dtor_last_byte = (int)b;
+        main_dtor_order = (main_dtor_order << 8) | b;
     }
 }
 
@@ -254,9 +268,15 @@ static ERL_NIF_TERM roundtrip(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
     int r_int;
     int r_binary;
     int r_resbin;
+    int dtor_base;
+    int x_dtor_base;
     (void)argc;
     (void)argv;
 
+    /* Every destructor count below is a DELTA from this call's start, so the result does not depend
+     * on which NIF the test called first. */
+    dtor_base = main_dtor_runs;
+    x_dtor_base = x_dtor_runs;
     /* --- allocate a 13-byte payload and report its size ---------------------------------- */
     obj = enif_alloc_resource(res_main, 13);
     if (obj == NULL) {
@@ -305,11 +325,11 @@ static ERL_NIF_TERM roundtrip(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
     /* --- keep / release balance --------------------------------------------------------- */
     enif_keep_resource(obj);
     enif_release_resource(obj);
-    out[5] = small(env, main_dtor_runs); /* still alive: 0 */
+    out[5] = small(env, main_dtor_runs - dtor_base); /* still alive: 0 */
 
     /* --- the release that reaches zero runs the destructor ------------------------------ */
     enif_release_resource(obj);
-    out[6] = small(env, main_dtor_runs);
+    out[6] = small(env, main_dtor_runs - dtor_base);
     out[7] = small(env, main_dtor_last_byte); /* 0x40 */
 
     /* --- the (now stale) term no longer resolves ---------------------------------------- */
@@ -328,7 +348,7 @@ static ERL_NIF_TERM roundtrip(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
         void *xo = enif_alloc_resource(res_x, 9);
         out[14] = small(env, xo == NULL ? -1 : (int)enif_sizeof_resource(xo));
         enif_release_resource(xo); /* runs x_dtor */
-        out[15] = small(env, x_dtor_runs);
+        out[15] = small(env, x_dtor_runs - x_dtor_base);
     }
 
     return enif_make_tuple_from_array(env, out, 16);
@@ -402,11 +422,163 @@ static ERL_NIF_TERM dyn_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     return enif_make_tuple_from_array(env, out, 8);
 }
 
+/*
+ * roundtrip_value/0 -> {get_ok, value, wrongtype_get, wrongtype_untouched, int_get}
+ *
+ * The measured divergence this pins: `enif_make_resource` + `enif_get_resource` must round-trip, so
+ * the `int` a NIF wrote into the resource is readable back through the pointer `enif_get_resource`
+ * handed out. The oracle prints `{1,42,0,1,0}` there; the Rust runtime used to raise `badarg`.
+ */
+static ERL_NIF_TERM roundtrip_value(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM out[5];
+    ERL_NIF_TERM term;
+    void *obj;
+    void *got;
+    void *sentinel = (void *)(uintptr_t)0xdeadbeef;
+    int ok;
+    int value = -1;
+    int wrong;
+    int wrong_untouched;
+    int int_get;
+    (void)argc;
+    (void)argv;
+
+    obj = enif_alloc_resource(res_main, sizeof(int));
+    if (obj == NULL) {
+        return enif_make_badarg(env);
+    }
+    *(int *)obj = 42;
+    term = enif_make_resource(env, obj);
+
+    got = sentinel;
+    ok = enif_get_resource(env, term, res_main, &got);
+    if (ok && got != NULL && got != sentinel) {
+        value = *(int *)got;
+    }
+
+    got = sentinel;
+    wrong = enif_get_resource(env, term, res_x, &got);
+    wrong_untouched = (got == sentinel) ? 1 : 0;
+
+    got = sentinel;
+    int_get = enif_get_resource(env, enif_make_int(env, 42), res_main, &got);
+
+    /* The single reference `enif_alloc_resource` took. (In the oracle the resource *term* holds a
+     * second reference, so its destructor only runs once the term is collected — see the module
+     * docs of `src/nif/enif/resources.rs`.) */
+    enif_release_resource(obj);
+
+    out[0] = small(env, ok);
+    out[1] = small(env, value);
+    out[2] = small(env, wrong);
+    out[3] = small(env, wrong_untouched);
+    out[4] = small(env, int_get);
+    return enif_make_tuple_from_array(env, out, 5);
+}
+
+/*
+ * liveness/1 -> {self_ok, self_alive, current_alive, undefined_flag, undefined_alive,
+ *                other_get_ok, other_alive}
+ *
+ * `enif_is_process_alive` on the *calling* process must be `1` — the oracle's `erts_proc_lookup`
+ * always finds it (`erl_nif.c:2330`). `enif_is_current_process_alive` is `1` too, an undefined pid
+ * is never alive, and the caller-supplied pid (`argv[0]`) is the "other" process: a live one must
+ * answer `1`, a dead one `0`.
+ */
+static ERL_NIF_TERM liveness(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM out[7];
+    ErlNifPid self;
+    ErlNifPid undefined;
+    ErlNifPid other;
+    int self_ok;
+    int other_get_ok;
+    (void)argc;
+
+    self_ok = (enif_self(env, &self) != NULL);
+
+    enif_set_pid_undefined(&undefined);
+
+    other_get_ok = enif_get_local_pid(env, argv[0], &other);
+    if (!other_get_ok) {
+        enif_set_pid_undefined(&other);
+    }
+
+    out[0] = small(env, self_ok);
+    out[1] = small(env, self_ok ? enif_is_process_alive(env, &self) : -1);
+    out[2] = small(env, enif_is_current_process_alive(env));
+    out[3] = small(env, enif_is_pid_undefined(&undefined));
+    out[4] = small(env, enif_is_process_alive(env, &undefined));
+    out[5] = small(env, other_get_ok);
+    out[6] = small(env, other_get_ok ? enif_is_process_alive(env, &other) : -1);
+    return enif_make_tuple_from_array(env, out, 7);
+}
+
+/*
+ * dtor_probe/0 -> {allocs_ok, released_to_zero}
+ *
+ * Releases two tagged objects (`0x11`, `0x22`) to reference count zero: one of them only after a
+ * `keep`, and with a `NULL` release and a `NULL` keep in between. Nothing about the destructor is
+ * read here, because the oracle runs destructors on a *different* thread — the counts and the order
+ * are read by `dtor_state/0` afterwards (the oracle test sleeps first).
+ */
+static ERL_NIF_TERM dtor_probe(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM out[2];
+    void *a;
+    void *b;
+    (void)argc;
+    (void)argv;
+
+    dtor_base = main_dtor_runs;
+    main_dtor_order = 0;
+
+    a = enif_alloc_resource(res_main, 2);
+    b = enif_alloc_resource(res_main, 2);
+    if (a == NULL || b == NULL) {
+        return enif_make_badarg(env);
+    }
+    ((unsigned char *)a)[0] = 0x11;
+    ((unsigned char *)b)[0] = 0x22;
+
+    enif_keep_resource(a);       /* a: 2 */
+    enif_release_resource(a);    /* a: 1 — a live keep, so no destructor */
+    enif_release_resource(NULL); /* a NULL release is a no-op */
+    enif_keep_resource(NULL);    /* ...and so is a NULL keep */
+    enif_release_resource(a);    /* a: 0 — destructor #1 (tag 0x11) */
+    enif_release_resource(b);    /* b: 0 — destructor #2 (tag 0x22) */
+
+    out[0] = small(env, 1); /* both allocations succeeded */
+    out[1] = small(env, 2); /* two objects were released to zero */
+    return enif_make_tuple_from_array(env, out, 2);
+}
+
+/*
+ * dtor_state/0 -> {runs_since_probe, order_code, last_byte}
+ *
+ * `runs_since_probe` is how many `res_main` destructors ran since `dtor_probe/0` started (the oracle
+ * needs a moment for them; this runtime runs them synchronously). `order_code` is the tags of those
+ * destructors, most recent last: `0x1122` = 4386 means the object tagged `0x11` was destroyed before
+ * the one tagged `0x22`.
+ */
+static ERL_NIF_TERM dtor_state(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM out[3];
+    (void)argc;
+    (void)argv;
+
+    out[0] = small(env, main_dtor_runs - dtor_base);
+    out[1] = small(env, (int)main_dtor_order);
+    out[2] = small(env, main_dtor_last_byte);
+    return enif_make_tuple_from_array(env, out, 3);
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"load_status", 0, load_status, 0},
     {"reopen_main", 0, reopen_main, 0},
     {"create_only_existing", 0, create_only_existing, 0},
     {"roundtrip", 0, roundtrip, 0},
+    {"roundtrip_value", 0, roundtrip_value, 0},
+    {"liveness", 1, liveness, 0},
+    {"dtor_probe", 0, dtor_probe, 0},
+    {"dtor_state", 0, dtor_state, 0},
     {"dyn_call", 0, dyn_call, 0},
 };
 

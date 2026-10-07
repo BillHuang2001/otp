@@ -348,8 +348,11 @@ pub unsafe extern "C" fn enif_whereis_port(
 /// `int enif_is_current_process_alive(ErlNifEnv *env);`
 ///
 /// Returns `1` when the calling process is alive. The C refuses a non-scheduler or process-less
-/// environment by aborting the emulator (`erl_nif.c:2311-2318`); an unusable `env` — or a host that
-/// does not implement the hook — answers the C's "not alive" `0` here.
+/// environment by aborting the emulator (`erl_nif.c:2311-2318`); an unusable `env` answers the C's
+/// "not alive" `0` here. When the host implements no explicit `is_current_process_alive` hook it is
+/// answered from [`NifHost::self_pid`]: a host that can name the calling process (`beam_rt` does)
+/// proves the process exists, which is the C's own condition (`erts_get_current_process()` non-null).
+/// Only a host that can do neither answers `0`.
 ///
 /// # Safety
 ///
@@ -361,14 +364,21 @@ pub unsafe extern "C" fn enif_is_current_process_alive(
     let Some(e) = (unsafe { env_mut(env) }) else {
         return 0;
     };
-    matches!(e.host().is_current_process_alive(), Some(true)) as c_int
+    match e.host().is_current_process_alive() {
+        Some(alive) => alive as c_int,
+        // No hook: the calling process is alive iff the host can name it.
+        None => e.host().self_pid().is_some() as c_int,
+    }
 }
 
 /// `int enif_is_process_alive(ErlNifEnv *env, ErlNifPid *pid);`
 ///
 /// Returns `1` when `*pid` names a live local process — the C's `!!erts_proc_lookup(proc->pid)`
-/// (`erl_nif.c:2330`). The pid term is opaque at this layer; a dead, foreign or malformed id is the
-/// host's `false` (the C's lookup failure), and an unsupported host answers `0`.
+/// (`erl_nif.c:2330`). The **calling** process is answered first, from [`NifHost::self_pid`]: the C's
+/// `erts_proc_lookup` always finds it, and the real runtime has no `is_process_alive` hook, so this is
+/// what makes `enif_is_process_alive(env, enif_self(env, &pid))` answer the oracle's `1` there. Every
+/// other pid is the host's [`NifHost::is_process_alive`] answer (a dead, foreign or malformed id is
+/// the host's `false`; an unsupported host answers `0`).
 ///
 /// # Safety
 ///
@@ -387,6 +397,14 @@ pub unsafe extern "C" fn enif_is_process_alive(
     }
     // SAFETY: `pid` is non-null and readable (caller contract).
     let pid = t(unsafe { (*pid).pid });
+    // The calling process is alive by definition, and the host can always name it through
+    // `self_pid`; answering this *before* the hook is what keeps the answer correct on a host
+    // without an `is_process_alive` hook (the real runtime).
+    if let Some(self_pid) = e.host().self_pid() {
+        if self_pid == pid {
+            return 1;
+        }
+    }
     matches!(e.host().is_process_alive(pid), Some(true)) as c_int
 }
 
