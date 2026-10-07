@@ -18,6 +18,7 @@ use std::ptr;
 use std::ptr::NonNull;
 
 use beam_alloc::prelude::*;
+use beam_alloc::CarrierPolicy;
 use beam_alloc::Strategy;
 use beam_common::{AllocKind, BeamError};
 use beam_term::prelude::{
@@ -196,10 +197,11 @@ fn thousands_of_mixed_size_allocations_force_many_carriers() {
 }
 
 #[test]
-fn the_large_threshold_splits_the_slab_and_dedicated_paths() {
+fn the_sbct_threshold_splits_the_shared_and_dedicated_paths() {
     let alloc = small_allocator("threshold");
-    // At the threshold the block is carved from a slab carrier, so the footprint
-    // jumps to the whole carrier.
+    let sbct = CarrierPolicy::default().small_block_carrier_threshold();
+    // At the size-class threshold the block is carved from a slab carrier, so the
+    // footprint jumps to the whole carrier.
     let at_threshold = layout(1024, MIN_ALIGN);
     let ptr = alloc.alloc(at_threshold).expect("alloc");
     assert_eq!(alloc.carrier_bytes(), 64 * 1024);
@@ -207,42 +209,71 @@ fn the_large_threshold_splits_the_slab_and_dedicated_paths() {
     // SAFETY: live allocation freed exactly once.
     unsafe { alloc.dealloc(ptr, at_threshold) };
 
-    // One byte above it, the block gets a carrier of its own: header + payload,
-    // rounded up to the allocation unit.
+    // One byte above the ladder the request is *shared*: it is carved out of a pooled
+    // variable-size multi-block carrier (sized by the policy's `smbcs` floor — 1 MiB by
+    // default, not the allocator's own 64 KiB carrier size), not given a carrier of its
+    // own. So the dedicate-vs-share boundary is `sbct`, not the ladder threshold.
     let above = layout(1025, MIN_ALIGN);
     let ptr = alloc.alloc(above).expect("alloc");
-    let dedicated = alloc.carrier_bytes() - 64 * 1024;
-    assert!(
-        (16 + 1025..=16 + 1025 + 15).contains(&dedicated),
-        "dedicated carrier should be the block itself, saw {dedicated}"
+    assert_eq!(
+        alloc.carrier_count(),
+        2,
+        "the slab carrier plus one shared variable-size carrier"
     );
-    assert_eq!(alloc.carrier_count(), 2);
+    assert_eq!(
+        alloc.stats().sbc_carriers,
+        0,
+        "no dedicated carrier was mapped"
+    );
+    assert_eq!(alloc.carrier_bytes(), 64 * 1024 + 1024 * 1024);
     // SAFETY: live allocation freed exactly once.
     unsafe { alloc.dealloc(ptr, above) };
     assert_eq!(
         alloc.carrier_count(),
         1,
+        "the empty variable-size carrier coalesced and went back to the OS"
+    );
+
+    // At the policy's single-block-carrier threshold the block really does get a carrier
+    // of its own: header + payload, rounded up to the allocation unit.
+    let dedicated = layout(sbct, MIN_ALIGN);
+    let ptr = alloc.alloc(dedicated).expect("alloc");
+    let own = alloc.carrier_bytes() - 64 * 1024;
+    assert!(
+        (16 + sbct..=16 + sbct + 15).contains(&own),
+        "the dedicated carrier should be the block itself, saw {own}"
+    );
+    assert_eq!(alloc.stats().sbc_carriers, 1);
+    assert_eq!(alloc.carrier_count(), 2);
+    // SAFETY: live allocation freed exactly once.
+    unsafe { alloc.dealloc(ptr, dedicated) };
+    assert_eq!(
+        alloc.carrier_count(),
+        1,
         "the dedicated carrier went back to the OS"
     );
+    assert_eq!(alloc.stats().live_bytes, 0);
 }
 
 #[test]
-fn large_blocks_get_dedicated_carriers_that_are_released_on_free() {
+fn blocks_at_or_above_the_sbct_get_dedicated_carriers_that_are_released_on_free() {
     let alloc = small_allocator("large");
     let baseline = alloc.stats();
-    let l = layout(64 * 1024, MIN_ALIGN);
+    let sbct = CarrierPolicy::default().small_block_carrier_threshold();
+    let l = layout(sbct, MIN_ALIGN);
     let first = alloc.alloc(l).expect("alloc");
     let second = alloc.alloc(l).expect("alloc");
     assert_ne!(first.as_ptr(), second.as_ptr());
-    // SAFETY: each allocation holds 64 KiB of writable bytes.
+    // SAFETY: each allocation holds `sbct` writable bytes.
     unsafe {
-        ptr::write_bytes(first.as_ptr(), 0x11, 64 * 1024);
-        ptr::write_bytes(second.as_ptr(), 0x22, 64 * 1024);
+        ptr::write_bytes(first.as_ptr(), 0x11, sbct);
+        ptr::write_bytes(second.as_ptr(), 0x22, sbct);
     }
     let stats = alloc.stats();
+    assert_eq!(stats.sbc_carriers, baseline.sbc_carriers + 2);
     assert_eq!(stats.carriers, baseline.carriers + 2);
     assert_eq!(stats.live_blocks, 2);
-    assert!(stats.carrier_bytes >= baseline.carrier_bytes + 128 * 1024);
+    assert!(stats.carrier_bytes >= baseline.carrier_bytes + 2 * sbct);
     assert_eq!(stats.peak_live_bytes, stats.live_bytes);
 
     // SAFETY: both are live allocations on this allocator, freed exactly once.
@@ -252,11 +283,11 @@ fn large_blocks_get_dedicated_carriers_that_are_released_on_free() {
     }
     let stats = alloc.stats();
     assert_eq!(stats.carriers, baseline.carriers);
+    assert_eq!(stats.sbc_carriers, baseline.sbc_carriers);
     assert_eq!(stats.carrier_bytes, baseline.carrier_bytes);
     assert_eq!(stats.live_blocks, 0);
     assert_eq!(stats.live_bytes, 0);
 }
-
 #[test]
 fn realloc_preserves_the_payload_when_growing_and_shrinking() {
     let alloc = small_allocator("realloc");
@@ -411,19 +442,38 @@ fn a_custom_size_class_table_drives_the_paths() {
     // SAFETY: live allocation freed exactly once.
     unsafe { alloc.dealloc(ptr, small) };
 
-    // One byte past it, the request gets a carrier of its own.
+    // One byte past the table's threshold the request is *shared*: it is carved out of
+    // a pooled variable-size multi-block carrier (sized by the policy's `smbcs` floor,
+    // 1 MiB), never given a carrier of its own — the routing boundary is `sbct`, not the
+    // class table's threshold.
     let above = layout(129, MIN_ALIGN);
     let ptr = alloc.alloc(above).expect("alloc");
-    let dedicated = alloc.stats().live_bytes;
+    let block = alloc.stats().live_bytes;
     assert!(
-        (16 + 129..=16 + 129 + 15).contains(&dedicated),
-        "saw {dedicated}"
+        (16 + 129..=16 + 129 + 15).contains(&block),
+        "the block is the request rounded up to the allocation unit, saw {block}"
     );
+    assert_eq!(
+        alloc.stats().sbc_carriers,
+        0,
+        "no dedicated carrier was mapped"
+    );
+    assert_eq!(
+        alloc.stats().mbc_carriers,
+        2,
+        "the slab carrier plus the shared MBC"
+    );
+    assert_eq!(alloc.carrier_bytes(), 4096 + 1024 * 1024);
     // SAFETY: live allocation freed exactly once.
     unsafe { alloc.dealloc(ptr, above) };
     assert_eq!(alloc.stats().live_bytes, 0);
+    assert_eq!(
+        alloc.stats().mbc_carriers,
+        1,
+        "the empty variable-size carrier went back"
+    );
+    assert_eq!(alloc.carrier_bytes(), 4096);
 }
-
 #[test]
 fn strategy_and_config_accessors_accept_every_variant() {
     for strategy in [
@@ -601,5 +651,195 @@ fn dropping_an_allocator_releases_every_carrier_it_mapped() {
     // Deliberately drop the allocator with live blocks still outstanding: every
     // carrier must still be handed back to the OS (in debug builds the `munmap` in
     // `Carrier::unmap` is asserted to succeed, so a leak would be loud here).
+    drop(alloc);
+}
+
+#[test]
+fn mid_size_blocks_share_one_variable_size_carrier_until_it_is_fully_free() {
+    let alloc = small_allocator("shared");
+    let baseline = alloc.stats();
+    assert_eq!(baseline, AllocStats::default());
+    // 2000 bytes is above the size-class ladder and far below `sbct` (512 KiB), so every
+    // one of these requests may share a carrier: they are carved out of one pooled
+    // variable-size multi-block carrier (the legacy `mb_alloc`).
+    let l = layout(2000, MIN_ALIGN);
+    let mut live = Vec::new();
+    let mut footprint = None;
+    for _ in 0..200 {
+        live.push(alloc.alloc(l).expect("alloc"));
+        let stats = alloc.stats();
+        assert_eq!(
+            stats.mbc_carriers,
+            baseline.mbc_carriers + 1,
+            "one MBC serves them all"
+        );
+        assert_eq!(
+            stats.sbc_carriers, baseline.sbc_carriers,
+            "a mid request never maps a dedicated carrier"
+        );
+        match footprint {
+            Some(bytes) => assert_eq!(stats.carrier_bytes, bytes, "the footprint stays flat"),
+            None => footprint = Some(stats.carrier_bytes),
+        }
+    }
+    let stats = alloc.stats();
+    assert_eq!(stats.live_blocks, 200);
+    assert_eq!(stats.live_bytes, 200 * (16 + 2000));
+    assert_eq!(stats.peak_live_bytes, stats.live_bytes);
+
+    // SAFETY: every pointer is live and freed exactly once with its own layout.
+    unsafe {
+        for ptr in live {
+            alloc.dealloc(ptr, l);
+        }
+    }
+    // Freeing everything coalesces the carrier back into a single free block spanning it,
+    // which is what releases the segment: not one byte of the allocator's footprint is
+    // left behind (there were no slab or dedicated carriers in this test at all).
+    let after = alloc.stats();
+    assert_eq!(after.live_blocks, 0);
+    assert_eq!(after.live_bytes, 0);
+    assert_eq!(after.carriers, 0);
+    assert_eq!(after.sbc_carriers, 0);
+    assert_eq!(after.mbc_carriers, 0);
+    assert_eq!(after.carrier_bytes, 0);
+    assert_eq!(after.free_calls, 200);
+}
+
+#[test]
+fn a_fragmented_variable_size_carrier_reuses_its_holes_and_coalesces_back() {
+    let alloc = small_allocator("defrag");
+    let baseline = alloc.stats();
+    let l = layout(2000, MIN_ALIGN);
+    let mut first: Vec<NonNull<u8>> = (0..100).map(|_| alloc.alloc(l).expect("alloc")).collect();
+    let stats = alloc.stats();
+    assert_eq!(stats.mbc_carriers, baseline.mbc_carriers + 1);
+    let footprint = stats.carrier_bytes;
+
+    // Free every other block: the carrier is now a comb of 50 free 2016-byte holes
+    // interleaved with 50 live blocks.
+    // SAFETY: each pointer is live here and freed exactly once.
+    unsafe {
+        for index in (0..first.len()).step_by(2) {
+            alloc.dealloc(first[index], l);
+        }
+    }
+    let fragmented = alloc.stats();
+    assert_eq!(fragmented.live_blocks, 50);
+    assert_eq!(
+        fragmented.mbc_carriers, baseline.mbc_carriers,
+        "the carrier is still pooled"
+    );
+
+    // The holes are big enough for the same size, so a second batch is served from them:
+    // no carrier is added and the footprint does not grow. This is what coalescing and
+    // the free list buy — a fragmented carrier stays usable.
+    for index in (0..first.len()).step_by(2) {
+        first[index] = alloc.alloc(l).expect("realloc from a hole");
+    }
+    let refilled = alloc.stats();
+    assert_eq!(
+        refilled.mbc_carriers,
+        baseline.mbc_carriers + 1,
+        "no new carrier"
+    );
+    assert_eq!(refilled.carrier_bytes, footprint, "and no new footprint");
+    assert_eq!(refilled.live_blocks, 100);
+
+    // Freeing everything in a scattered order coalesces the whole carrier and returns it,
+    // so the allocator is exactly back to its baseline.
+    // SAFETY: every pointer is live and freed exactly once.
+    unsafe {
+        for ptr in first
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .chain(first.iter().step_by(2))
+        {
+            alloc.dealloc(*ptr, l);
+        }
+    }
+    let after = alloc.stats();
+    assert_eq!(after.live_blocks, baseline.live_blocks);
+    assert_eq!(after.live_bytes, baseline.live_bytes);
+    assert_eq!(after.carriers, baseline.carriers);
+    assert_eq!(after.sbc_carriers, baseline.sbc_carriers);
+    assert_eq!(after.mbc_carriers, baseline.mbc_carriers);
+    assert_eq!(after.carrier_bytes, baseline.carrier_bytes);
+}
+
+#[test]
+fn a_mixed_slab_mid_and_large_workload_returns_to_its_steady_state() {
+    let alloc = small_allocator("steady");
+    let sbct = CarrierPolicy::default().small_block_carrier_threshold();
+    // Slab carriers are retained for the allocator's lifetime (the documented policy), so
+    // the baseline this workload returns to is the allocator's *steady state* — taken
+    // after the slab carrier exists — not a fresh allocator's all-zero stats.
+    let warm = alloc.alloc(layout(1024, MIN_ALIGN)).expect("warm-up");
+    // SAFETY: live allocation freed exactly once.
+    unsafe { alloc.dealloc(warm, layout(1024, MIN_ALIGN)) };
+    let baseline = alloc.stats();
+    assert_eq!(baseline.live_blocks, 0);
+    assert_eq!(baseline.live_bytes, 0);
+    assert_eq!(baseline.sbc_carriers, 0);
+    assert!(baseline.mbc_carriers >= 1, "the slab carrier exists");
+
+    // A long mixed sequence over all three paths: slab blocks (all inside one class, so
+    // the retained slab carrier serves them and the baseline stays comparable), mid blocks
+    // sharing variable-size carriers, and dedicated single-block carriers at or above
+    // `sbct`.
+    let mut live: Vec<(NonNull<u8>, Layout)> = Vec::new();
+    for index in 0..200usize {
+        let l = match index % 4 {
+            0 => layout(1 + (index * 37) % 512, MIN_ALIGN),
+            1 => layout(2000 + (index * 24) % 300, MIN_ALIGN),
+            2 => layout(4097 + (index * 64) % 5000, MIN_ALIGN),
+            _ => layout(sbct + (index % 3) * 4096, MIN_ALIGN),
+        };
+        live.push((alloc.alloc(l).expect("alloc"), l));
+    }
+    let loaded = alloc.stats();
+    assert_eq!(loaded.live_blocks, 200);
+    assert!(loaded.sbc_carriers >= 1, "the dedicated path ran");
+
+    // Free every other block first, then the rest, so the coalescing merges happen across
+    // holes rather than against untouched neighbours.
+    let mut order: Vec<usize> = (0..live.len()).collect();
+    order.sort_by_key(|&index| (index % 2, index));
+    for index in order {
+        let (ptr, l) = live[index];
+        // SAFETY: every pointer is live here and freed exactly once with its own layout.
+        unsafe { alloc.dealloc(ptr, l) };
+    }
+    let after = alloc.stats();
+    assert_eq!(after.live_blocks, baseline.live_blocks);
+    assert_eq!(after.live_bytes, baseline.live_bytes);
+    assert_eq!(after.carriers, baseline.carriers);
+    assert_eq!(after.carrier_bytes, baseline.carrier_bytes);
+    assert_eq!(after.sbc_carriers, baseline.sbc_carriers);
+    assert_eq!(after.mbc_carriers, baseline.mbc_carriers);
+    assert_eq!(after.carriers, after.sbc_carriers + after.mbc_carriers);
+}
+
+#[test]
+fn dropping_an_allocator_releases_live_slab_mid_and_large_carriers() {
+    let alloc = small_allocator("drop-mixed");
+    let sbct = CarrierPolicy::default().small_block_carrier_threshold();
+    let _slab = alloc.alloc(layout(64, MIN_ALIGN)).expect("slab");
+    let _mid: Vec<NonNull<u8>> = (0..8)
+        .map(|_| alloc.alloc(layout(2000, MIN_ALIGN)).expect("mid"))
+        .collect();
+    let _large = alloc.alloc(layout(sbct, MIN_ALIGN)).expect("large");
+    let stats = alloc.stats();
+    assert_eq!(stats.sbc_carriers, 1);
+    assert_eq!(
+        stats.mbc_carriers, 2,
+        "the slab carrier plus the variable-size one"
+    );
+    assert_eq!(stats.live_blocks, 10);
+    // Deliberately drop the allocator with live slab, mid and large blocks: `Drop` drains
+    // the variable-size pool first and then the single-block table, so every mapping is
+    // released exactly once (the `munmap` in `Carrier::unmap` is asserted in debug
+    // builds, which makes a missed release loud here).
     drop(alloc);
 }
