@@ -23,6 +23,11 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 * `is_allocator_switch` / `parse_allocator` — the `-M*`/`+M*` family.
 * `parse_max_ports` (`+Q`), `parse_max_processes` (`+P`), `parse_kernel_poll` (`+K`), `parse_sbt` (`+sbt`), `parse_emu_flavor` (`-emu_flavor`).
 * the ground-truth constants `ERTS_MIN_PORTS`/`ERTS_MAX_PORTS`/`ERTS_MIN_PROCESSES`/`ERTS_MAX_PROCESSES` and `SCHEDULER_BIND_TYPES`.
+`vars.rs` (the `ERL_*` variables **outside** the `*FLAGS` merge; see the section below):
+* `ErlEnv` — `{ inetrc, max_ports, crash_dump, crash_dump_seconds, rootdir, max_ets_tables, fullsweep_after }`, every field `Option` (`None` = unset).
+* `from_env(&dyn Env) -> ErlEnv` — re-exported at `beam_rt::cli` (`pub use vars::{from_env, ErlEnv}`).
+* `has_plus_q_switch(&[String]) -> bool` (`pub(super)`) — the `+Q`-wins-over-`ERL_MAX_PORTS` test.
+* per-variable private parsers (`parse_max_ports`, `parse_atoi_var`, `c_atoi`) so each is unit-testable alone.
 
 ## The supported switches (the exact A.6 surface)
 | Switch | Effect in `beam_rt` |
@@ -65,6 +70,29 @@ A merged token is then indistinguishable from a command-line flag to `init:get_a
 * `#` is an ordinary character — it is **not** a comment.
 * An empty string yields no tokens; a quoted empty group (`""`) yields one empty token.
 
+## Environment variables beyond the `*FLAGS` chain (`vars.rs`)
+A **second** family is read outside `initial_argv_massage` — by the emulator's start-up `getenv`s (`erts/emulator/beam/erl_init.c:1327-1344`, `erl_crash_dump.c:427-457`), by `inet_config` (`lib/kernel/src/inet_config.erl:436`) and by the `erl` **launcher script** (`ERL_ROOTDIR`).
+`vars::from_env` parses them into `RuntimeConfig::env` (`config.env_vars()`); **none is an init argument** — verified against the oracle (OTP 29.1.1 / erts-17.1), where `init:get_argument(inetrc|crash_dump|crash_dump_seconds|max_ports|max_ets_tables|fullsweep_after)` is the bare atom `error`, so none is ever recorded in `InitArgs`.
+
+| Variable | Oracle effect | `beam_rt` handling | Observable? |
+|---|---|---|---|
+| `ERL_MAX_PORTS` | `atoi`, then **clamped** into `[1024, 134217727]` (`erl_init.c:1341`); sizes the port table | `ErlEnv::max_ports` (the clamped `usize`) **and** injected into `extra_emulator_flags` as `+Q <clamped>` when the merged argv has no `+Q` | via `+Q` in `extra_emulator_flags`; the runtime's own `system_info` has no `port_limit` key yet (seam below) |
+| `ERL_INETRC` | path the `inet` resolver reads at start-up | `ErlEnv::inetrc` (verbatim; `Some("")` when set-but-empty) | no — parsed-but-inert (M1 has no resolver) |
+| `ERL_CRASH_DUMP` | crash-dump file name (emulator default `erl_crash.dump`) | `ErlEnv::crash_dump` (verbatim) | no — parsed-but-inert (no crash-dump subsystem) |
+| `ERL_CRASH_DUMP_SECONDS` | `atoi` (`erl_crash_dump.c:451-457`): `0` = no dump + break now, `< 0` = dump until complete, `> 0` = alarm-bounded | `ErlEnv::crash_dump_seconds` (`i64`; a malformed value is `atoi`'s `0`) | no — parsed-but-inert |
+| `ERL_ROOTDIR` | OTP-root relocation honoured by the `erl` **launcher script** | `ErlEnv::rootdir` (verbatim) | no — parsed-but-inert (this binary is not relocatable) |
+| `ERL_MAX_ETS_TABLES` | `atoi` (`erl_init.c:1328-1331`); `0` = the emulator default | `ErlEnv::max_ets_tables` (`i64`) | no — parsed-but-inert (no ETS table limit here) |
+| `ERL_FULLSWEEP_AFTER` | `atoi` (`erl_init.c:1334-1338`); the emulator stores it in a `Uint16` gen-GC interval | `ErlEnv::fullsweep_after` (`i64`, stored **untruncated** — no gen-GC consumer exists) | no — parsed-but-inert |
+
+**Numeric semantics** are the C's `atoi` (`vars::c_atoi`): leading whitespace, an optional sign, then digits, stopping at the first non-digit — so a non-numeric value is `0`, never a dropped variable and never a wrong value.
+`ERL_MAX_PORTS` is the one member with an effect, and it is reproduced through the channel `+Q` already uses:
+
+* the clamp is what the emulator does to the value (`1`/`100`/`bogus` ⇒ 1024, `999999999` ⇒ 134217727); the `2000 ⇒ 2048` step the oracle **observes** in `system_info(port_limit)` is the port table's power-of-two sizing, an emulator concern this parser deliberately does not model;
+* a `+Q` **anywhere in the merged argv** — the command line or `ERL_AFLAGS`/`ERL_FLAGS`/`ERL_ZFLAGS` — overrides the variable outright (oracle: `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both observe 4096), so `ERL_MAX_PORTS` is injected **only** when no `+Q` is present;
+* the asymmetry is the oracle's: `+Q` **validates** (and rejects out-of-range), `ERL_MAX_PORTS` **clamps silently**.
+`parse` stays pure — it never reads an environment, so it always yields `ErlEnv::default()`; only `parse_with_env` fills `env_vars` (and performs the `+Q` routing).
+**Seam (sibling-owned):** the value becomes *observable* only once `../info.rs` gains a `port_limit` `system_info` key; until then it is preserved in `extra_emulator_flags`, not applied.
+
 ## Init arguments (`init:get_argument/1`) — the exact recording rule
 The parser reproduces the oracle's split between emulator/`init` switches and flags:
 * A **`-`-switch** (recognized or not) is recorded as an `InitArgs` occurrence — the source of `init:get_argument/1`.
@@ -100,11 +128,15 @@ A runtime **halt** the program requests is neither: it exits with the requested 
 ## Test Strategy
 * `env.rs` in-module tests: the tokenizer (whitespace runs, quote grouping/concatenation, escapes, `#`, empty input, multi-token expansion) and the merge (order, unset omission, per-variable tokenization, `ERL_FLAGS` before `ERL_ZFLAGS`).
 * `flags.rs` in-module tests: the `+Q`/`+P` ranges, the `+sbt` literals, `+K`, `-emu_flavor`, and the `-M*`/`+M*` allocator grammar.
+* `vars.rs` in-module tests: each variable alone and unset (`None`), the `atoi` primitive (`c_atoi`, incl. sign/whitespace/trailing garbage/saturation), the `ERL_MAX_PORTS` clamp (`1`/`100`/`2000`/`999999999`/`bogus`), a malformed `ERL_CRASH_DUMP_SECONDS` and a non-numeric `ERL_MAX_ETS_TABLES`, and the `+Q` token detection.
 * `../cli.rs` in-module tests: every switch, the init-argument recording rule, the `run` grammar, the trailing-dot `-eval`, and the four exit codes.
 * `../../tests/cli_flags.rs` (integration): the **built binary** honours the `ERL_*FLAGS` merge — each variable reaches `init:get_argument/1`, the full merge order, tokenization at the CLI boundary — with golden values pinned from the oracle, plus a direct cross-check against the system `erl` that **skips loudly** when `erl` is unavailable.
+* `../../tests/cli_env.rs` (integration): the second environment family through `beam_rt::cli::parse_with_env` + `MapEnv` (the clamped `+Q` injection, the `+Q`-override cases, `parse`'s purity, every field landing in `config.env_vars()`, and that none becomes an init argument), plus oracle probes of `system_info(port_limit)` that **skip loudly** when `erl` is unavailable.
 
 ## Routing Table
 * `env.rs` → the `Env` trait, `ProcessEnv`/`MapEnv`, `tokenize`, `merge_argv`, `otp_flags_var` (the `ERL_*FLAGS` surface)
 * `flags.rs` → the validators for the emulator switches with no runtime-visible effect (`+Q`/`+P`/`+K`/`+sbt`/`-emu_flavor`/`-M*`+`+M*`) and their ground-truth constants
-* `../cli.rs` → the switch parser (`parse`/`parse_with_env`), the `USAGE` text, the `run` driver and the four `EXIT_*` codes (the parent of this directory)
+* `vars.rs` → the `ErlEnv` model + `from_env` for the `ERL_*` variables **outside** the `*FLAGS` merge (`ERL_MAX_PORTS`/`ERL_INETRC`/`ERL_CRASH_DUMP`/`ERL_CRASH_DUMP_SECONDS`/`ERL_ROOTDIR`/`ERL_MAX_ETS_TABLES`/`ERL_FULLSWEEP_AFTER`)
+* `../cli.rs` → the switch parser (`parse`/`parse_with_env`, incl. the `ERL_MAX_PORTS` → `+Q` routing), the `USAGE` text, the `run` driver and the four `EXIT_*` codes (the parent of this directory)
 * `../../tests/cli_flags.rs` → the A.6 integration suite at the executable boundary
+* `../../tests/cli_env.rs` → the A.6 integration suite for the non-`*FLAGS` environment variables

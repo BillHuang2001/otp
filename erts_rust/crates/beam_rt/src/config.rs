@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use beam_gc::{next_heap_size, HeapPolicy, DEFAULT_MIN_HEAP_WORDS};
 
+use crate::cli::ErlEnv;
 use crate::config::Action::{Boot, Version};
 
 /// The emulator start-up surface — `beam_common`'s A.6 configuration skeleton.
@@ -328,12 +329,20 @@ pub struct RuntimeConfig {
     pub init_args: InitArgs,
     /// The action to perform.
     pub action: Action,
+    /// The `ERL_*` environment variables read **outside** the `ERL_*FLAGS` merge chain
+    /// (contract A.6): `ERL_INETRC`, `ERL_MAX_PORTS`, `ERL_CRASH_DUMP`,
+    /// `ERL_CRASH_DUMP_SECONDS`, `ERL_ROOTDIR`, `ERL_MAX_ETS_TABLES` and
+    /// `ERL_FULLSWEEP_AFTER`. Empty for the **pure** [`crate::cli::parse`] — only
+    /// [`crate::cli::parse_with_env`] reads an environment, and it is where
+    /// `ERL_MAX_PORTS` is turned into a `+Q` entry of
+    /// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags).
+    pub env: ErlEnv,
 }
 
 impl Default for RuntimeConfig {
     /// The defaults of a bare `beam_rt` invocation: a `jit` emulator, an empty code
     /// path, a [`DEFAULT_HEAP_WORDS`]-word heap, the emulator's heap-size defaults, no
-    /// init arguments and [`Action::Boot`].
+    /// init arguments, [`Action::Boot`] and no environment variables.
     fn default() -> Self {
         RuntimeConfig {
             emulator: EmulatorConfig::default(),
@@ -342,6 +351,7 @@ impl Default for RuntimeConfig {
             heap: HeapOptions::default(),
             init_args: InitArgs::default(),
             action: Boot,
+            env: ErlEnv::default(),
         }
     }
 }
@@ -417,6 +427,22 @@ impl RuntimeConfig {
         &self.heap
     }
 
+    /// The `ERL_*` environment variables read outside the `ERL_*FLAGS` merge chain
+    /// (`ERL_INETRC`, `ERL_MAX_PORTS`, `ERL_CRASH_DUMP`, `ERL_CRASH_DUMP_SECONDS`,
+    /// `ERL_ROOTDIR`, `ERL_MAX_ETS_TABLES`, `ERL_FULLSWEEP_AFTER`).
+    ///
+    /// Empty after the pure [`crate::cli::parse`]; filled in by
+    /// [`crate::cli::parse_with_env`].
+    pub fn env_vars(&self) -> &ErlEnv {
+        &self.env
+    }
+
+    /// Replaces the parsed `ERL_*` environment variables.
+    pub fn with_env_vars(mut self, env: ErlEnv) -> Self {
+        self.env = env;
+        self
+    }
+
     /// Whether the configured action is [`Action::Version`].
     pub fn is_version(&self) -> bool {
         self.action == Version
@@ -439,6 +465,7 @@ mod tests {
         assert_eq!(config.heap, HeapOptions::default());
         assert!(config.init_args.is_empty());
         assert_eq!(config.action, Action::Boot);
+        assert_eq!(config.env_vars(), &ErlEnv::default());
         assert!(!config.is_version());
     }
 
@@ -555,6 +582,14 @@ mod tests {
         let replaced = config.with_emulator(EmulatorConfig::default());
         assert_eq!(replaced.emulator, EmulatorConfig::default());
         assert_eq!(replaced.code_paths, vec![PathBuf::from("/code/b")]);
+        // The `ERL_*` (non-`*FLAGS`) environment family is a separate, replaceable field.
+        let with_env = replaced.with_env_vars(ErlEnv {
+            max_ports: Some(1024),
+            ..ErlEnv::default()
+        });
+        assert_eq!(with_env.env_vars().max_ports, Some(1024));
+        assert_eq!(with_env.env_vars().inetrc, None);
+        assert_eq!(with_env.init_args, InitArgs::default());
     }
 
     #[test]

@@ -100,7 +100,9 @@ use crate::runtime::Runtime;
 
 mod env;
 mod flags;
+mod vars;
 pub use env::{merge_argv, otp_flags_var, tokenize, Env, MapEnv, ProcessEnv};
+pub use vars::{from_env, ErlEnv};
 
 /// The usage text, printed on a usage (exit 2) error.
 pub const USAGE: &str = "\
@@ -138,6 +140,10 @@ Switches:
 
 Environment (merged into the command line, real erl's order):
   ERL_OTP<ver>_FLAGS, ERL_AFLAGS, ERL_FLAGS, ERL_ZFLAGS
+Environment (read by the emulator/launcher; never an init argument):
+  ERL_MAX_PORTS (clamped into 1024..=134217727, then applied as +Q when no +Q is given)
+  ERL_INETRC, ERL_CRASH_DUMP, ERL_CRASH_DUMP_SECONDS, ERL_ROOTDIR,
+  ERL_MAX_ETS_TABLES, ERL_FULLSWEEP_AFTER (parsed and reported, inert in this milestone)
 
 Actions:
   run FILE MOD:FUNC/ARITY [ARG...]
@@ -174,6 +180,26 @@ pub const EXIT_UNSUPPORTED: i32 = 3;
 /// merge is [`env::merge_argv`] and the result is handed to the **pure** [`parse`], so an
 /// environment flag is indistinguishable from a command-line flag (contract A.6).
 ///
+/// The **second** environment family — the variables the emulator (and the `erl` launcher)
+/// read directly, outside that merge — is read into [`RuntimeConfig::env`] by
+/// [`vars::from_env`]. None of them is an init argument (verified against OTP 29.1.1 /
+/// erts-17.1; see [`vars`]).
+///
+/// # `ERL_MAX_PORTS`
+///
+/// `ERL_MAX_PORTS` is the one member of that family with a modelled effect: the emulator
+/// `atoi`s it and clamps it into `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]` (`erl_init.c:1341`).
+/// This runtime has no `port_limit` [`system_info`](crate::info) key yet, so the clamped
+/// value is routed into the **same channel the `+Q` switch already uses** —
+/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) — and only
+/// when the merged command line carries **no** `+Q` of its own. A command-line or
+/// `ERL_FLAGS` `+Q` therefore wins outright, exactly as in the oracle, where
+/// `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both observe a
+/// `port_limit` of 4096.
+///
+/// The value becomes *observable* only once `crate::info` gains a `port_limit` key (a
+/// sibling's surface); until then it is preserved, not applied.
+///
 /// [`parse`] itself never reads the process environment: the differential harness and the
 /// unit tests call it directly, and [`run`] calls this function with [`ProcessEnv`].
 ///
@@ -181,7 +207,19 @@ pub const EXIT_UNSUPPORTED: i32 = 3;
 ///
 /// Exactly the errors [`parse`] reports for the merged command line.
 pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
-    parse(&env::merge_argv(args, env))
+    let merged = env::merge_argv(args, env);
+    let mut config = parse(&merged)?;
+    let env_vars = vars::from_env(env);
+    // `ERL_MAX_PORTS` acts exactly like a `+Q` the command line does not already carry
+    // (the oracle: any `+Q` in the merged argv overrides the variable). The two tokens go
+    // into `extra_emulator_flags` through the same primitive `+Q` uses.
+    if let Some(max_ports) = env_vars.max_ports {
+        if !vars::has_plus_q_switch(&merged) {
+            preserve_emulator_flag(&mut config.emulator, "+Q", &max_ports.to_string());
+        }
+    }
+    config.env = env_vars;
+    Ok(config)
 }
 
 /// Parses `args` (which **exclude** `argv[0]`) into a [`RuntimeConfig`].
@@ -349,6 +387,9 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         heap: builder.heap,
         init_args: builder.init_args,
         action: builder.action,
+        // The environment family is read only by `parse_with_env`; the pure `parse` sees
+        // an empty one (it must never read the process environment).
+        env: ErlEnv::default(),
     })
 }
 
@@ -424,8 +465,7 @@ impl Builder {
     /// emulator flag in the oracle, so `init:get_argument('Q'|'K'|'sbt'|'MMscs')` is the
     /// bare atom `error` (verified against OTP 29.1.1 / erts-17.1).
     fn preserve(&mut self, switch: &str, value: &str) {
-        self.emulator.extra_emulator_flags.push(switch.to_string());
-        self.emulator.extra_emulator_flags.push(value.to_string());
+        preserve_emulator_flag(&mut self.emulator, switch, value);
     }
 
     /// Applies a `+hmaxk`/`+hmaxel`/`+hmaxib` boolean value to the heap options.
@@ -478,6 +518,17 @@ fn is_switch(argument: &str) -> bool {
 /// (`--nope` → `nope`, `+Weird` → `Weird`, `-pa` → `pa`).
 fn flag_name(switch: &str) -> &str {
     switch.trim_start_matches(|c| c == '-' || c == '+')
+}
+
+/// Preserves an emulator switch and its value **verbatim** in
+/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags): the switch
+/// token followed by the value token, in that order.
+///
+/// Shared by the parser's [`Builder::preserve`] and by [`parse_with_env`]'s
+/// `ERL_MAX_PORTS` → `+Q` routing, so both fill the channel identically.
+fn preserve_emulator_flag(emulator: &mut EmulatorConfig, switch: &str, value: &str) {
+    emulator.extra_emulator_flags.push(switch.to_string());
+    emulator.extra_emulator_flags.push(value.to_string());
 }
 
 /// The tokens from `from` up to (but not including) the next switch, plus the index of
