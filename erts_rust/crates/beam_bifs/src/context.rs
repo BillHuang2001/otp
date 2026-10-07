@@ -23,7 +23,8 @@
 //!   for `term_to_binary`), a [`ModuleInfo`] (`erlang:get_module_info/1,2`) and a
 //!   [`ProcessHook`] (the process/name/global-state queries — `whereis/1`,
 //!   `register/2`, `unregister/1`, `registered/0`, `is_process_alive/1`,
-//!   `processes/0` and `ports/0`).
+//!   `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2` and
+//!   `group_leader/0`).
 //!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
 //!   concrete implementations; an unset seam means `io:format` writes to stdout
 //!   and the `send`/`ets`/`call_fun`/port/dict/nif/process BIFs report
@@ -430,29 +431,57 @@ pub trait ModuleInfo {
     ) -> Result<Option<Eterm>>;
 }
 
-/// The runtime's process/name/global-state queries: the name registry, process
-/// liveness, and the process and port inventories.
+/// What one `erlang:process_info/2` item resolves to.
 ///
-/// The seven BIFs behind this seam — `erlang:whereis/1`, `register/2`,
-/// `unregister/1`, `registered/0`, `is_process_alive/1`, `processes/0` and
-/// `ports/0` — answer questions about the *running* node: the name registry
-/// (`beam_process`/`beam_rt`'s process table) and the port table. None of that is
-/// reachable from a BIF, so every operation routes through this hook, whose
-/// concrete implementation the runtime supplies. With no hook installed **every**
-/// one of those BIFs reports a typed `unsupported_bif` capability gap — never a
-/// fabricated empty list, never `undefined` and never `false`
+/// The three outcomes are exactly the ones the oracle distinguishes, and their
+/// *order* matters: the C validates every requested item (`pi_arg2ix`) **before** it
+/// inspects the process (`process_info_bif`, `erl_bif_info.c:1556-1564`), so an
+/// unknown item is `badarg` even for a dead pid (probed: `process_info(<dead>,
+/// [status, frobnicate])` ⇒ `badarg` while `process_info(<dead>, [status])` ⇒
+/// `undefined`). A hook therefore answers [`ProcessInfoItem::Unknown`] without
+/// consulting the process table, and only then reports [`ProcessInfoItem::Dead`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProcessInfoItem {
+    /// The item's value, built on the caller's heap.
+    Value(Eterm),
+    /// The item is not one this runtime reports — the oracle's `badarg`.
+    Unknown,
+    /// `pid` names no live process — the oracle's `undefined`.
+    Dead,
+}
+
+/// The runtime's process/name/global-state queries: the name registry, process
+/// liveness, the process and port inventories, per-process introspection and the
+/// per-process flags.
+///
+/// The eleven BIFs behind this seam — `erlang:whereis/1`, `register/2`,
+/// `unregister/1`, `registered/0`, `is_process_alive/1`, `processes/0`,
+/// `ports/0`, `process_info/1`, `process_info/2`, `process_flag/2` and
+/// `group_leader/0` — answer questions about the *running* node: the name registry
+/// (`beam_process`/`beam_rt`'s process table), the port table and the per-process
+/// state (flags, group leader, message queue, …). None of that is reachable from a
+/// BIF, so every operation routes through this hook, whose concrete implementation
+/// the runtime supplies. With no hook installed **every** one of those BIFs reports
+/// a typed `unsupported_bif` capability gap — never a fabricated empty list, never
+/// `undefined`, never `false` and never a made-up previous flag value
 /// (workspace `CONTEXT.md` §3).
 ///
 /// The BIF layer still owns the `badarg` cases the arguments alone decide (a
 /// non-atom name, the atom `undefined` as a name, an `id` that is neither an
-/// internal pid nor an internal port, a non-pid) and checks them *before* the
-/// hook is consulted.
+/// internal pid nor an internal port, a non-pid, a non-atom flag, an item
+/// specification that is neither an atom nor a proper list of atoms) and checks
+/// them *before* the hook is consulted.
 ///
 /// Ground truth (read-only): `../../erts/emulator/beam/bif.c`
-/// (`register_2:2310`, `unregister_1:2324`, `whereis_1:2342`, `processes_0:4101`,
+/// (`register_2:2310`, `unregister_1:2324`, `whereis_1:2342`, `process_flag_2:2028`,
+/// `process_flag_aux:1897`, `group_leader_0:4903`, `processes_0:4101`,
 /// `ports_0:4129`), `../../erts/emulator/beam/register.c`
-/// (`erts_register_name:175`, `erts_whereis_name_to_id:277`, `registered_0:576`)
-/// and `../../erts/emulator/beam/erl_bif_info.c` (`is_process_alive_1:4069`).
+/// (`erts_register_name:175`, `erts_whereis_name_to_id:277`, `registered_0:576`),
+/// `../../erts/emulator/beam/erl_bif_info.c` (`process_info_1:1561`,
+/// `process_info_2:1556`, `process_info_aux:1567`, `pi_1_keys:1008`,
+/// `is_process_alive_1:4069`) and `../../erts/emulator/beam/bif.tab`
+/// (`group_leader/0:78`, `process_flag/2:129`, `process_info/1:131`,
+/// `process_info/2:132`).
 pub trait ProcessHook {
     /// `whereis(Name)` — the id registered under `name`, or `None` when `name` is
     /// not registered (the BIF renders the atom `undefined`;
@@ -531,6 +560,77 @@ pub trait ProcessHook {
     ///
     /// Reports a table failure as a [`BeamError`].
     fn ports(&mut self) -> Result<Vec<PortId>>;
+
+    /// `process_info/1` — the item names this runtime reports for `pid`, in the
+    /// order the oracle reports them (the C's `pi_1_keys`, `erl_bif_info.c:1008`),
+    /// or `Ok(None)` when `pid` names no live process (the BIF renders the atom
+    /// `undefined`).
+    ///
+    /// The set is the runtime's own: the oracle's `pi_1_keys` **omits**
+    /// `registered_name` for a process that has no registered name
+    /// (`erl_bif_info.c:1606-1633` documents this inconsistency), so a fixed item
+    /// list built by the BIF layer would be wrong. Handing the list back from the
+    /// hook makes a fabricated item list impossible; the hook need not (and must
+    /// not) include an item it cannot resolve through
+    /// [`ProcessHook::process_info_item`].
+    ///
+    /// # Errors
+    ///
+    /// Reports a table failure as a [`BeamError`].
+    fn process_info_keys(&mut self, pid: ProcessId) -> Result<Option<Vec<Atom>>>;
+
+    /// `process_info/2` — one item's value for `pid`, built on `heap`.
+    ///
+    /// `item` is validated **first** (`pi_arg2ix`): an item this runtime does not
+    /// report is [`ProcessInfoItem::Unknown`] — the oracle's `badarg`, which is
+    /// decided before the process is inspected (see [`ProcessInfoItem`]). Only when
+    /// `item` is known does the hook look the process up, answering
+    /// [`ProcessInfoItem::Dead`] for a pid that names no live process (the oracle's
+    /// `undefined`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a table/rendering failure as a [`BeamError`].
+    fn process_info_item(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        pid: ProcessId,
+        item: Atom,
+    ) -> Result<ProcessInfoItem>;
+
+    /// `process_flag(Flag, Value)` — sets `flag` to `value` and returns the
+    /// **previous** value (`process_flag_2`, `bif.c:2028`), or `Ok(None)` for the
+    /// oracle's `badarg`.
+    ///
+    /// `Ok(None)` covers both failure classes the hook owns: a flag this runtime
+    /// does not implement (the C's dispatch chain falls through to
+    /// `process_flag_aux`, whose `am_badarg` becomes `BIF_ERROR(…, BADARG)`,
+    /// `bif.c:2024,2233`) and an illegal `value` for a known flag (e.g.
+    /// `trap_exit` with a non-boolean). The BIF layer has already checked that
+    /// `flag` is an atom; the undocumented `{monitor_nodes, N}` tuple form is a
+    /// distribution feature and stays the argument-only `badarg`.
+    ///
+    /// # Errors
+    ///
+    /// Reports a process-state failure as a [`BeamError`].
+    fn process_flag(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        flag: Atom,
+        value: Eterm,
+    ) -> Result<Option<Eterm>>;
+
+    /// `group_leader/0` — the calling process's group leader (`group_leader_0`,
+    /// `bif.c:4903`, which returns `BIF_P->group_leader`).
+    ///
+    /// The oracle renders it as a pid term; the BIF layer does the rendering.
+    ///
+    /// # Errors
+    ///
+    /// Reports a table failure as a [`BeamError`].
+    fn group_leader(&mut self) -> Result<ProcessId>;
 }
 
 /// What a BIF may read and write during one call.
@@ -891,6 +991,69 @@ impl<'a> BifContext<'a> {
             None => Err(crate::error::unsupported_bif()),
         }
     }
+
+    /// The item names `erlang:process_info/1` reports for `pid`, in the hook's
+    /// order, or `None` when `pid` names no live process (the BIF renders
+    /// `undefined`) — the seam behind `erlang:process_info/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_process_info_keys(&mut self, pid: ProcessId) -> Result<Option<Vec<Atom>>> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.process_info_keys(pid),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// One `erlang:process_info/2` item's outcome for `pid` — the seam behind
+    /// `erlang:process_info/2`.
+    ///
+    /// The item is validated before the process is inspected, so an unknown item is
+    /// [`ProcessInfoItem::Unknown`] even for a dead pid (see that type).
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_process_info_item(&mut self, pid: ProcessId, item: Atom) -> Result<ProcessInfoItem> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.process_info_item(self.heap, self.atoms, pid, item),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Sets the process flag `flag` to `value` through the installed
+    /// [`ProcessHook`], returning the **previous** value, or `None` for the
+    /// oracle's `badarg` (an unknown flag or an illegal value) — the seam behind
+    /// `erlang:process_flag/2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_process_flag(&mut self, flag: Atom, value: Eterm) -> Result<Option<Eterm>> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.process_flag(self.heap, self.atoms, flag, value),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The calling process's group leader through the installed [`ProcessHook`] —
+    /// the seam behind `erlang:group_leader/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_group_leader(&mut self) -> Result<ProcessId> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.group_leader(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
     /// The installed table registry, if any.
     pub fn tables(&mut self) -> Option<&mut TableRegistry> {
         self.tables.as_deref_mut()
