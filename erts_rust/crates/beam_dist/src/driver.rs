@@ -83,6 +83,7 @@ use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
 use crate::auth::{gen_challenge, gen_digest, verify};
 use crate::connection::Handshake;
 use crate::control::{decode_control, encode_control_cached, ControlMessage};
+use crate::delivery::{Delivery, Dispatched, InboundSink};
 use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
@@ -474,6 +475,45 @@ impl ConnectionDriver {
         Ok(Some(message))
     }
 
+    /// Decodes **and classifies** the next queued inbound control message, or
+    /// returns `None` when none is pending.
+    ///
+    /// This is [`next_message`](Self::next_message) followed by
+    /// [`Delivery::classify`] — the semantic view a runtime routes.
+    pub fn next_delivery(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+    ) -> Result<Option<Delivery>> {
+        match self.next_message(heap, atoms)? {
+            Some(message) => Ok(Some(Delivery::classify(&message)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Decodes, classifies and **routes** every queued inbound control message
+    /// through `sink`, returning a [`Dispatched`] record per message in arrival
+    /// order.
+    ///
+    /// This is the inbound delivery seam: the caller (e.g. `beam_rt`) supplies an
+    /// [`InboundSink`] over its process table/mailbox. Draining all queued messages
+    /// matches the driver's own `step` loop. A classification failure (a
+    /// message-carrying opcode with no trailing message) is returned as `Err` and
+    /// does **not** alter the link state; messages already dispatched stay
+    /// dispatched.
+    pub fn dispatch_inbound(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+        sink: &mut dyn InboundSink,
+    ) -> Result<Vec<Dispatched>> {
+        let mut dispatched = Vec::new();
+        while let Some(delivery) = self.next_delivery(heap, atoms)? {
+            let outcome = sink.deliver(&delivery)?;
+            dispatched.push(Dispatched { delivery, outcome });
+        }
+        Ok(dispatched)
+    }
     /// Encodes and queues one `DOP_*` control message.
     ///
     /// Every referenced atom is routed through the outbound atom cache
