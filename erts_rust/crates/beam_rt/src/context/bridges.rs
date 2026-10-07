@@ -2,26 +2,26 @@
 //!
 //! The engine's [`ExecutionContext`](super::RuntimeContext) dispatch is plain Rust, so a few
 //! `beam_bifs` BIF families cannot run themselves: they need to apply a fun ([`FunBridge`]),
-//! reach the running process's dictionary ([`DictBridge`]), `dlopen` a NIF ([`NifBridge`]) or
-//! read a loaded module's record definitions ([`RecordBridge`]). Each bridge borrows a
-//! different slice of the runtime and therefore cannot co-exist with the others, so
-//! `call_registered` installs exactly one per call. [`SharedSink`] is the shared, cloneable
-//! `io:format` destination every context (outer and nested) writes through, and
-//! [`PendingInterner`] is the deferred, predicted-index atom interner (see the parent
-//! module docs for the full rationale).
+//! reach the running process's dictionary ([`DictBridge`]), `dlopen` a NIF ([`NifBridge`]),
+//! read a loaded module's record definitions ([`RecordBridge`]) or deliver a message
+//! ([`SendBridge`]). Each bridge borrows a different slice of the runtime and therefore cannot
+//! co-exist with the others, so `call_registered` installs exactly one per call. [`SharedSink`]
+//! is the shared, cloneable `io:format` destination every context (outer and nested) writes
+//! through, and [`PendingInterner`] is the deferred, predicted-index atom interner (see the
+//! parent module docs for the full rationale).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use beam_bifs::{
     AtomInterner, DictHook, FunCaller, LocalNode, OutputSink, RecordDefinitionView,
-    RecordFieldView, RecordSource,
+    RecordFieldView, RecordSource, SendHook,
 };
 use beam_common::{BeamError, Result};
 use beam_engine::ExecutionContext;
 use beam_loader::Module;
-use beam_process::{ProcessId, ProcessTable};
-use beam_term::{Atom, AtomTable, Eterm};
+use beam_process::{PortId, ProcessId, ProcessTable};
+use beam_term::{atom_val, is_atom, Atom, AtomTable, Eterm};
 
 use crate::codeserver::CodeServer;
 use crate::error;
@@ -194,6 +194,135 @@ impl DictHook for DictBridge<'_> {
     fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>> {
         Ok(self.process_mut()?.dict().get_keys_for_value(value))
     }
+}
+
+/// The `beam_bifs` message-delivery seam: `erlang:send/2` and `erlang:'!'/2`.
+///
+/// `erlang:send/2` is a plain Rust function that cannot reach the destination process's
+/// mailbox itself, so it routes every delivery through the [`SendHook`] — this is the concrete
+/// provider the runtime installs. It borrows the whole runtime (exactly like [`FunBridge`]) and
+/// delegates to the runtime's **existing** send path,
+/// [`RuntimeContext::send_message`](super::RuntimeContext::send_message), so a BIF delivery is
+/// the delivery the compiled `send` instruction performs: the payload is resolved, copied into
+/// the recipient's heap and enqueued, and a payload too large for that heap falls back to the
+/// heap-fragment model. **Nothing about delivery is re-implemented here.**
+///
+/// # Destination semantics (the C `do_send`, `bif.c:2469-2674`)
+///
+/// * An **internal pid** — whether or not a process currently exists for it. The C looks the
+///   pid up and reports *success* without delivering when `erts_proc_lookup_raw` finds nothing
+///   (`bif.c:2478-2480`), so a send to a dead or never-created pid **succeeds silently**.
+///   [`send_message`](ExecutionContext::send_message) reports that case as
+///   [`BeamError::TermNotFound`], which this bridge folds back into the oracle's success —
+///   that is the oracle's semantics, not a swallowed failure.
+/// * A **registered name** (an atom) — resolved through [`ProcessTable::whereis`], the same
+///   "name → id" resolution the C does with `erts_whereis_name_to_id` (`bif.c:2507`), and the
+///   message is delivered to the registered process. A name that is *not* registered is the
+///   oracle's `error:badarg` (`bif.c:2536`, `SEND_BADARG`).
+/// * A destination the oracle accepts but this runtime cannot serve yet is an honest typed
+///   **capability gap** rather than a fabricated value:
+///   * a **port** (`erlang:send(Port, Data)`, `bif.c:2551-2613`) needs the port subsystem's
+///     write path;
+///   * a **`{Name, Node}`** tuple (`bif.c:2614-2667`) is a distributed send (contract A.5).
+/// * Anything else (`42`, a list, a 3-element tuple, …) is the oracle's `error:badarg` (the
+///   C's final `else` arm, `bif.c:2668-2674` and the tuple shape checks at `bif.c:2617-2621`).
+pub(super) struct SendBridge<'a> {
+    /// The runtime the delivery runs on.
+    pub(super) runtime: &'a mut Runtime,
+    /// The sender's pid: the `from` of every delivery (the C's `p->common.id`), so
+    /// `erlang:send(self(), M)` reaches the very mailbox the following `receive` scans.
+    pub(super) mailbox_pid: ProcessId,
+    /// The outer call's process table, if any — a scheduler pass supplies one, a `-eval`
+    /// context resolves against the runtime's own (see [`RuntimeContext::for_process`]).
+    pub(super) mailbox_table: Option<&'a mut ProcessTable>,
+    /// The caller's shared output sink, cloned from the outer context like [`FunBridge`]'s.
+    pub(super) output: Option<SharedSink<'a>>,
+    /// The outer call's scheduler-pump permission (a `send` never pumps the scheduler, but
+    /// the nested context is built with the caller's identity intact).
+    pub(super) may_pump_scheduler: bool,
+    /// The outer call's executing-module name (see [`RuntimeContext::current_module`]).
+    pub(super) current_module: Option<String>,
+}
+
+impl SendBridge<'_> {
+    /// Resolves a `send` destination term to the internal pid term to deliver to.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for the destinations the oracle rejects with `badarg`; a typed
+    /// capability gap ([`crate::error::unsupported`]) for the ones it accepts but this
+    /// runtime cannot serve yet (see the struct docs).
+    fn resolve(&self, to: Eterm) -> Result<Eterm> {
+        if ProcessId::is_process(to) {
+            return Ok(to);
+        }
+        if is_atom(to) {
+            let table: &ProcessTable = match self.mailbox_table {
+                Some(ref table) => table,
+                None => &self.runtime.processes,
+            };
+            return match table.whereis(atom_val(to)) {
+                Some(pid) => Ok(pid.to_eterm()),
+                // An atom name no process is registered under: the oracle's only failing
+                // (correctly typed) destination (`bif.c:2536`).
+                None => Err(BeamError::BadArg),
+            };
+        }
+        if PortId::from_eterm(to).is_ok() {
+            return Err(error::unsupported(
+                "erlang:send/2 to a port: the port write path is not wired",
+            ));
+        }
+        if let Some((name, node)) = two_atom_tuple(self.runtime.code_server.atoms(), to) {
+            return Err(error::unsupported(&format!(
+                "erlang:send/2 to {name}@{node}: distributed send is not implemented"
+            )));
+        }
+        Err(BeamError::BadArg)
+    }
+}
+
+impl SendHook for SendBridge<'_> {
+    fn send(&mut self, to: Eterm, term: Eterm) -> Result<()> {
+        let target = self.resolve(to)?;
+        // The nested context inherits the sender's identity (pid + table) so the delivery
+        // runs exactly as the compiled `send` instruction's does.
+        let mut ctx = RuntimeContext {
+            runtime: self.runtime,
+            output: self.output.clone(),
+            mailbox_pid: self.mailbox_pid,
+            mailbox_table: self.mailbox_table.as_deref_mut(),
+            may_pump_scheduler: self.may_pump_scheduler,
+            current_module: self.current_module.clone(),
+        };
+        match ctx.send_message(target, term) {
+            // No process for the pid: the C drops the message and reports success
+            // (`bif.c:2478-2480`); the table's typed not-found is that same case.
+            Err(BeamError::TermNotFound) => Ok(()),
+            delivered => delivered,
+        }
+    }
+}
+
+/// The `{Name, Node}` pair of an atom/atom 2-tuple destination, if `to` is one.
+///
+/// The C only treats a 2-tuple of **atoms** as a remote send (`bif.c:2614-2621`); every other
+/// tuple shape is `SEND_BADARG`. Milestone-1 has no distributed send, so this only feeds the
+/// capability-gap message. A non-2-tuple, a non-tuple, or a tuple with a non-atom element
+/// yields `None` (which the caller turns into `badarg`, the oracle's reason). The two atoms are
+/// resolved to their names through the shared table, so the diagnostic names the destination.
+fn two_atom_tuple(atoms: &AtomTable, to: Eterm) -> Option<(String, String)> {
+    if beam_engine::terms::tuple_arity(to).ok()? != 2 {
+        return None;
+    }
+    let name = beam_engine::terms::tuple_element(to, 0).ok()?;
+    let node = beam_engine::terms::tuple_element(to, 1).ok()?;
+    if !is_atom(name) || !is_atom(node) {
+        return None;
+    }
+    let name = atoms.name(atom_val(name))?.to_string();
+    let node = atoms.name(atom_val(node))?.to_string();
+    Some((name, node))
 }
 
 /// The `beam_bifs` NIF-loading seam: `dlopen`s a NIF library and registers it with the runtime.
