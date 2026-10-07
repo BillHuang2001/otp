@@ -58,6 +58,29 @@ byte-aligned binary as `sub_binary`, and returns a typed `unsupported` for the b
 *safe* `beam_term` API cannot name (bignum, reference, external pid/port/ref, non-byte-aligned
 bitstring) where the oracle names them.
 
+### `prim.rs` — the served `prim_file` BIFs (contract A.7, the `prim_*` preloaded modules)
+`RuntimeContext::prim_file_call(function, arity, args) -> Option<Result<Eterm>>`. `prim_file` is a
+**preloaded** module whose BIFs are the C `prim_file_nif.c` NIFs; the floor claims the subset whose
+whole observable contract is pinned byte-for-byte against the oracle, backed by the host's own file
+system (`std::fs`/`std::env`) — "primitive" is exactly what this layer is for.
+
+| BIF | Ground truth | Behaviour (oracle-verified, OTP 29.1.1 / erts-17.1) |
+|---|---|---|
+| `get_cwd/0` | `prim_file.erl:787` → `get_cwd_nif` → `efile_get_cwd` (`unix_prim_file.c:1050`, `getcwd(3)`), decoded by `internal_native2name` | `{ok, Cwd}` with `Cwd` a **string** (char list); a native path that is not valid UTF-8 is the C's `{ok,{error,warning}}` (`erl_unicode.c:2774-2789`, warning type `warning`); an `errno` ⇒ `{error, Reason}` |
+| `get_cwd/1` | `prim_file.erl:771-778` (pure Erlang clauses) | `[Letter,$:]` (`A`–`Z`/`a`–`z`) ⇒ `{error,enotsup}` (Unix `efile_get_device_cwd` is a constant `ENOTSUP`, `unix_prim_file.c:1042`); any other cons cell (incl. an **improper** list — the `[_|_]` clause) ⇒ `{error,einval}`; anything else ⇒ `{error,badarg}` |
+| `read_file/1` | `prim_file.erl:564-570` → `read_file_nif`; the path through `encode_path` = `internal_name2native` (`erl_unicode.c:2629`) | `{ok, Binary}`; `enoent`/`eisdir`/`enotdir`/`eloop`/`eacces`/… via `errno`; a **bad path** ⇒ the **value** `{error,badarg}` (the wrapper's `try … catch error:badarg`, never a raise) |
+
+The path contract (reproduced from `encode_path/1`): a **binary** (its bytes verbatim; a NUL ⇒
+badarg) or an **iolist** of code points — nested lists flattened, a nested **binary** ⇒ badarg
+(`erts_native_filename_need` never flattens one) — encoded as UTF-8, the Unix native filename
+encoding. An atom ⇒ badarg (`erl_unicode.c:2645`); a NUL, a code point that is not a Unicode scalar
+value (`:2306-2354`), a non-integer element, or an improper tail ⇒ badarg. The walk is iterative
+with an explicit stack (mirroring the C's `ESTACK`), so nesting depth cannot exhaust the Rust stack.
+The file contents are built by `beam_codec::term::make_binary` on the pointer-stable `eval_heap`
+(no 64-byte limit, unlike `beam_engine::terms::make_heap_binary`); the `errno`→atom mapping is the
+C's (`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with the C's own
+`errno_<n>` form (`:47`) for an errno outside the table.
+
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
   read only through `beam_engine::terms` (heap-seam builders/readers), `beam_codec::term`
