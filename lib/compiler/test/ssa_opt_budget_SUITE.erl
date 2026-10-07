@@ -118,11 +118,14 @@ gates_run_rich(Config) ->
     ok.
 
 %% The gates only skip passes that provably cannot fire, so enabling them
-%% must not change the generated code at all.
+%% must not change the generated code at all. Both builds enable the three
+%% opt-in passes that the gates guard - the comparison must be against the
+%% same option set without the gates, because the opt-in passes themselves
+%% do change the code when they fire.
 gates_do_not_change_output(Config) ->
-    Sets = [{plain, [binary,no_spawn_compiler_process]},
-            {gates, [binary,no_spawn_compiler_process,ssa_opt_gates,
-                     loop_opt,fusion_opt,fbip_opt]}],
+    Opts = [binary,no_spawn_compiler_process,loop_opt,fusion_opt,fbip_opt],
+    Sets = [{plain, Opts},
+            {gates, [ssa_opt_gates | Opts]}],
     Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
     ?assertEqual(code_of(key(plain, Builds)), code_of(key(gates, Builds))),
     ok.
@@ -226,6 +229,7 @@ battery() ->
      {bin, [[<<>>],[<<1,2,3>>],[<<"hello">>]]},
      {rec, [[1],[42],[x]]},
      {rec_loop, [[0],[1],[5]]},
+     {rec_fresh, [[1],[42],[-7]]},
      {ex, [[2],[0],[-4]]}].
 
 %% Run `Mod:Fun(Args)' in the code that was just loaded. The result is
@@ -264,7 +268,7 @@ build(File, Opts) ->
 %% part of it, so builds with different options can be compared directly.
 code_of({_Mod, Bin}) ->
     case beam_disasm:file(Bin) of
-        {beam_file, _Mod, _Exports, _Attrs, _CompileInfo, Code} -> Code;
+        {beam_file, _, _Exports, _Attrs, _CompileInfo, Code} -> Code;
         {error, Mod, Reason} -> ct:fail({beam_disasm_failed, Mod, Reason})
     end.
 
@@ -307,12 +311,14 @@ flat_probe() ->
     "h([H | _]) -> H;\n"
     "h(_) -> none.\n".
 
-%% A receive loop, a map lookup guard and record updates: all three gates
-%% are open, and there is enough work here to make the watchdog fire when it
-%% is given a zero budget.
+%% A receive loop, a map lookup guard, record updates and an update of the
+%% result of a local freshly-allocating function: all three gates are open,
+%% and there is enough work here to make the watchdog fire when it is given a
+%% zero budget.
 rich_probe() ->
     "-module(ssa_opt_budget_rich).\n"
-    "-export([arith/1,lst/1,mp/1,cmp/2,bin/1,rec/1,rec_loop/1,ex/1,loop/1]).\n"
+    "-export([arith/1,lst/1,mp/1,cmp/2,bin/1,rec/1,rec_loop/1,rec_fresh/1,\n"
+    "         mk_fresh/1,ex/1,loop/0]).\n"
     "-record(r, {a = 0, b = 0}).\n"
     "\n"
     "arith(X) when is_integer(X) -> X + 1;\n"
@@ -333,6 +339,18 @@ rich_probe() ->
     "\n"
     "rec(X) ->\n"
     "    R0 = #r{a = X, b = X + 1},\n"
+    "    R1 = R0#r{b = X + 2},\n"
+    "    {R1#r.a, R1#r.b}.\n"
+    "\n"
+    "%% A local function that always returns a freshly allocated record. The\n"
+    "%% ordinary destructive-update pass cannot see through the call and\n"
+    "%% leaves the update of its result as a copying update, which is exactly\n"
+    "%% the shape the opt-in FBIP pass rewrites (and therefore what opens its\n"
+    "%% eligibility gate).\n"
+    "mk_fresh(X) -> #r{a = X}.\n"
+    "\n"
+    "rec_fresh(X) ->\n"
+    "    R0 = mk_fresh(X),\n"
     "    R1 = R0#r{b = X + 2},\n"
     "    {R1#r.a, R1#r.b}.\n"
     "\n"
