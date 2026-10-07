@@ -450,7 +450,10 @@ whole-region scan.)
 ## Known Gaps (intentionally NOT covered in Milestone-1)
 - **GenImmix is integrated and measured, but stays off the default path** (decision + numbers in Design
   Decisions §Measured): it wins on copying work only, and only on a large long-lived mature generation,
-  while losing on footprint and (there) pause. `MatureKind::Copying` remains the default.
+  while losing on footprint and (there) pause. `MatureKind::Copying` remains the default. The option is
+  reachable only through `AnyCollector::from_config` / `GenImmixCollector` inside this crate and its
+  tests — no runtime consumer selects `MatureKind::Immix` yet (`beam_process` owns a concrete
+  `Collector`; `beam_rt`/`beam_bifs` use neither `AnyCollector` nor `HeapInfo`).
 - **The Immix region is fixed-size and never grows.** `ImmixSpace` wraps a `beam_alloc::Heap` and, like
   every semi-space here, grows by GC *replacement* rather than reallocation. A major reclaims in place,
   but if the live nursery still does not fit afterwards the collector returns a typed heap exhaustion
