@@ -70,7 +70,28 @@ A merged token is then indistinguishable from a command-line flag to `init:get_a
 * `#` is an ordinary character — it is **not** a comment.
 * An empty string yields no tokens; a quoted empty group (`""`) yields one empty token.
 
-## Init arguments (`init:get_argument/1`) — the exact recording rule
+## Environment variables beyond the `*FLAGS` chain (`vars.rs`)
+A **second** family is read outside `initial_argv_massage` — by the emulator's start-up `getenv`s (`erts/emulator/beam/erl_init.c:1327-1344`, `erl_crash_dump.c:427-457`), by `inet_config` (`lib/kernel/src/inet_config.erl:436`) and by the `erl` **launcher script** (`ERL_ROOTDIR`).
+`vars::from_env` parses them into `RuntimeConfig::env` (`config.env_vars()`); **none is an init argument** — verified against the oracle (OTP 29.1.1 / erts-17.1), where `init:get_argument(inetrc|crash_dump|crash_dump_seconds|max_ports|max_ets_tables|fullsweep_after)` is the bare atom `error`, so none is ever recorded in `InitArgs`.
+
+| Variable | Oracle effect | `beam_rt` handling | Observable? |
+|---|---|---|---|
+| `ERL_MAX_PORTS` | `atoi`, then **clamped** into `[1024, 134217727]` (`erl_init.c:1341`); sizes the port table | `ErlEnv::max_ports` (the clamped `usize`) **and** injected into `extra_emulator_flags` as `+Q <clamped>` when the merged argv has no `+Q` | via `+Q` in `extra_emulator_flags`; the runtime's own `system_info` has no `port_limit` key yet (seam below) |
+| `ERL_INETRC` | path the `inet` resolver reads at start-up | `ErlEnv::inetrc` (verbatim; `Some("")` when set-but-empty) | no — parsed-but-inert (M1 has no resolver) |
+| `ERL_CRASH_DUMP` | crash-dump file name (emulator default `erl_crash.dump`) | `ErlEnv::crash_dump` (verbatim) | no — parsed-but-inert (no crash-dump subsystem) |
+| `ERL_CRASH_DUMP_SECONDS` | `atoi` (`erl_crash_dump.c:451-457`): `0` = no dump + break now, `< 0` = dump until complete, `> 0` = alarm-bounded | `ErlEnv::crash_dump_seconds` (`i64`; a malformed value is `atoi`'s `0`) | no — parsed-but-inert |
+| `ERL_ROOTDIR` | OTP-root relocation honoured by the `erl` **launcher script** | `ErlEnv::rootdir` (verbatim) | no — parsed-but-inert (this binary is not relocatable) |
+| `ERL_MAX_ETS_TABLES` | `atoi` (`erl_init.c:1328-1331`); `0` = the emulator default | `ErlEnv::max_ets_tables` (`i64`) | no — parsed-but-inert (no ETS table limit here) |
+| `ERL_FULLSWEEP_AFTER` | `atoi` (`erl_init.c:1334-1338`); the emulator stores it in a `Uint16` gen-GC interval | `ErlEnv::fullsweep_after` (`i64`, stored **untruncated** — no gen-GC consumer exists) | no — parsed-but-inert |
+
+**Numeric semantics** are the C's `atoi` (`vars::c_atoi`): leading whitespace, an optional sign, then digits, stopping at the first non-digit — so a non-numeric value is `0`, never a dropped variable and never a wrong value.
+`ERL_MAX_PORTS` is the one member with an effect, and it is reproduced through the channel `+Q` already uses:
+
+* the clamp is what the emulator does to the value (`1`/`100`/`bogus` ⇒ 1024, `999999999` ⇒ 134217727); the `2000 ⇒ 2048` step the oracle **observes** in `system_info(port_limit)` is the port table's power-of-two sizing, an emulator concern this parser deliberately does not model;
+* a `+Q` **anywhere in the merged argv** — the command line or `ERL_AFLAGS`/`ERL_FLAGS`/`ERL_ZFLAGS` — overrides the variable outright (oracle: `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both observe 4096), so `ERL_MAX_PORTS` is injected **only** when no `+Q` is present;
+* the asymmetry is the oracle's: `+Q` **validates** (and rejects out-of-range), `ERL_MAX_PORTS` **clamps silently**.
+`parse` stays pure — it never reads an environment, so it always yields `ErlEnv::default()`; only `parse_with_env` fills `env_vars` (and performs the `+Q` routing).
+**Seam (sibling-owned):** the value becomes *observable* only once `../info.rs` gains a `port_limit` `system_info` key; until then it is preserved in `extra_emulator_flags`, not applied.
 The parser reproduces the oracle's split between emulator/`init` switches and flags:
 * A **`-`-switch** (recognized or not) is recorded as an `InitArgs` occurrence — the source of `init:get_argument/1`.
 * A **`+`-flag** is an **emulator** flag and is **not** recorded (the oracle's `init:get_argument('S'|'Q'|'K'|'A'|'P'|'sbt')` is the bare atom `error`).
