@@ -26,10 +26,14 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
+use beam_dist::driver::ConnectionDriver;
+use beam_dist::Dispatched;
 use beam_process::{ProcessId, ProcessState, ProcessTable, Scheduler, SignalAtoms};
 use beam_term::Eterm;
 
+use crate::dist::{LocalDeliverySink, NONODE_NAME};
 use crate::error;
 use crate::runtime::Runtime;
 use crate::runner::RuntimeRunner;
@@ -482,7 +486,19 @@ impl Runtime {
                 Ok(0) => {}
                 Ok(count) => delivered += count,
             }
-            // The timer half: deliver every `erlang:send_after/3` message whose deadline has
+            // The inbound-delivery half: route what the established links decoded into the
+            // addressed local process's mailbox. A delivery is what wakes a receiver
+            // blocked in a compiled `receive`, so it enqueues the woken process and goes
+            // round again — the same resume-on-send path a port or timer message takes.
+            match self.dispatch_dist_inbound(&mut table) {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    scheduler.resume_woken(&mut table);
+                    continue;
+                }
+            }            // The timer half: deliver every `erlang:send_after/3` message whose deadline has
             // passed (which may wake a blocked receiver, exactly like a port message) and
             // resume every process whose finite `receive … after T` deadline fired.
             match self.fire_due_timers(&mut table) {
@@ -539,6 +555,102 @@ impl Runtime {
         }
     }
 
+    /// Routes the inbound control messages `driver` has queued into this runtime's
+    /// **local process mailboxes** — the runtime side of `beam_dist`'s
+    /// [`InboundSink`] seam (contract A.5).
+    ///
+    /// `beam_dist` owns the protocol: it frames a link, decodes an inbound control
+    /// message and classifies it into a [`Delivery`](beam_dist::Delivery). Routing is
+    /// the runtime's job, and this is the explicit entry: every decoded delivery goes
+    /// to a [`LocalDeliverySink`] built over **this** runtime's process table, so a
+    /// `DOP_SEND*` reaches the addressed local process's mailbox through
+    /// `beam_process`'s own delivery path (a blocked receiver is placed on the
+    /// table's wake list, so the next pass resumes it) and a `DOP_REG_SEND*` is
+    /// resolved against the runtime's own name registry.
+    ///
+    /// The decode runs on the **runtime's own atom table**, so the atom indices a
+    /// delivery carries are exactly the ones `whereis` and the engine compare — a
+    /// channel whose indices came from another table could address the wrong process,
+    /// so the invariant is kept inside this method rather than left to the caller.
+    /// `heap` is the scratch arena the decoded terms are materialised on; the
+    /// delivery copies each term into the receiver's own heap, so nothing outlives
+    /// it.
+    ///
+    /// Returns one [`Dispatched`] record per queued control message, in arrival
+    /// order, carrying the classified delivery and what the sink did with it. The
+    /// outcomes are honest: a delivery this runtime cannot route is
+    /// [`DeliveryOutcome::Unsupported`], an addressed process that is not a process of
+    /// *this* node is [`DeliveryOutcome::NoSuchProcess`] — never a mis-delivery.
+    ///
+    /// A runtime that is not a distributed node has the fixed `nonode@nohost`
+    /// identity, exactly the one [`crate::context`]'s node identity hands
+    /// `beam_codec`: an addressed pid on any other node is then a foreign process.
+    ///
+    /// # Errors
+    ///
+    /// A link-level decode/classification failure (a truncated or malformed control
+    /// message). The caller decides what to do with the link — the scheduler pass
+    /// retires it and records the reason ([`crate::dist::DistNode::last_link_error`])
+    /// rather than failing the pass.
+    pub fn dispatch_inbound(
+        &mut self,
+        heap: &mut Heap,
+        driver: &mut ConnectionDriver,
+    ) -> Result<Vec<Dispatched>> {
+        let (name, creation) = match self.dist.as_ref() {
+            Some(node) => (node.node_name().to_string(), node.creation()),
+            // Not a node: the fixed M1 local-node identity (creation 0), the same one
+            // `crate::context::bridges`'s `NodeIdentity` gives `beam_codec`.
+            None => (NONODE_NAME.to_string(), 0),
+        };
+        let atom = self.code_server.atoms_mut().intern(&name);
+        let mut sink = LocalDeliverySink::new(&mut self.processes, atom, creation);
+        driver.dispatch_inbound(heap, self.code_server.atoms_mut(), &mut sink)
+    }
+
+    /// The **inbound-delivery half** of a scheduler pass (contract A.5).
+    ///
+    /// Drains what every **established** link decoded and routes the `send` family
+    /// into the addressed local process's mailbox ([`crate::dist::DistNode::dispatch_inbound`]
+    /// over a [`LocalDeliverySink`] on the live process table), returning how many
+    /// messages were really delivered.
+    ///
+    /// It is driven from inside [`Runtime::scheduler_pass`] — *not* from
+    /// [`crate::dist::DistNode::pump`] — because the sink needs the pass's
+    /// **`&mut ProcessTable`** at the same time as the runtime's atom table and the
+    /// node, and the pass is the only place all three are live at once (the table is
+    /// moved out of the runtime for the duration, see
+    /// [`Runtime::take_processes`]).
+    ///
+    /// A no-op unless [`Runtime::allow_inbound_delivery`] turned the capability on
+    /// (the default) **and** the node has an established link — so a runtime with no
+    /// node, no traffic or the capability off pays one bool test per pass and never
+    /// allocates the decode arena. All of that makes it `Ok(0)`, never a raise: a
+    /// link-level failure retires just that link and records why
+    /// ([`crate::dist::DistNode::last_link_error`]), so a hostile or broken peer can
+    /// neither fail nor stall a scheduler pass.
+    ///
+    /// # Errors
+    ///
+    /// Never in practice (see above); the `Result` keeps the pass's call sites
+    /// uniform.
+    pub(crate) fn dispatch_dist_inbound(&mut self, table: &mut ProcessTable) -> Result<usize> {
+        if !self.inbound_delivery {
+            return Ok(0);
+        }
+        // Split borrows: the node and the code server are disjoint fields, so the
+        // node's name/creation can be read while its own decode arena is used.
+        let Some(node) = self.dist.as_mut() else {
+            return Ok(0);
+        };
+        if !node.has_established_link() {
+            return Ok(0);
+        }
+        let creation = node.creation();
+        let name_atom = self.code_server.atoms_mut().intern(node.node_name());
+        let mut sink = LocalDeliverySink::new(table, name_atom, creation);
+        node.dispatch_inbound(self.code_server.atoms_mut(), &mut sink)
+    }
     /// How long this pass may sleep waiting for the next timer deadline, or `None` when it
     /// must not (or cannot) wait — see [`TimerWait`].
     ///

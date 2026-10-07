@@ -33,7 +33,7 @@ per-function bodies. Files:
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
-| `erts_internal.rs` | the `erts_internal` floor (13 BIFs) — see below |
+| `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
 | `prim.rs` | the `prim_file` floor (11 entries) — see below |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
@@ -68,6 +68,9 @@ before the registry.
 | item | shape |
 |---|---|
 | `registered_name` | see the wrapping rules above (the one special item) |
+| `current_function` / `initial_call` | `{M,F,A}` of the function the process is in / was entered at, from the engine (`Machine::current_function`/`initial_call`) — see the execution-position note below |
+| `current_location` | `{M,F,A,[{file,File},{line,Line}]}` from the engine (`Machine::current_location`) |
+| `current_stacktrace` | the cooked stacktrace `[{M,F,A,Location}, …]`, innermost frame first (`Machine::current_stacktrace`) |
 | `status` | `running` for the calling process (single-threaded runtime), else `runnable`/`waiting`/`suspended`/`exiting` from `ProcessState` |
 | `message_queue_len` | integer — the mailbox length |
 | `messages` | list of the queued payload terms, FIFO (**wrapped** like every other item) |
@@ -92,13 +95,34 @@ before the registry.
 | `last_calls` | `false` (no tracing subsystem in M1) |
 | `memory` | this process's real bytes (`(total_heap_size + stack_size) * 8` + off-heap overhead) |
 
-#### Honest typed `unsupported` items (valid oracle names this runtime cannot answer)
+#### The execution-position items (the engine's view of *where* a process is)
+`current_function`/`initial_call`/`current_location`/`current_stacktrace` are read from the
+process's saved instruction pointer through the engine's read-only accessors
+(`beam_engine::Machine::current_function` / `initial_call` / `current_location` /
+`current_stacktrace`, whose builders are shared with the exception family's `build_stacktrace`).
+`RuntimeContext::position_value` reaches them via `RuntimeContext::engines()` →
+`runner::RunnerState::engine_at(pid) -> Option<(&Module, &Machine)>` (the runner's slice) or the
+runtime's own runner state outside a pass. Two things make this answerable only *conditionally*:
+- the **process table** must hold the pid: `snapshot` reads it through
+  `RuntimeContext::process_table` — the **pass** table when the context is a scheduler slice (a
+  pass *moves* the process table out of the runtime, leaving an empty placeholder), else the
+  runtime's own;
+- the pid must have a **readable engine/entry**: a **fun-bodied** process has no module to name
+  `M`/`F` from, the **caller's own** process has its `Machine` moved out of the runner state while
+  it runs, and a never-scheduled pid has none at all. Those report `Ok(None)` — the honest
+  "cannot answer": the item is **omitted** by `process_info/1` (like an unregistered
+  `registered_name`) and is the typed `unsupported` capability gap by `process_info/2`.
+
+The end-to-end proof is `tests/position.rs`: `recv:wait/0` parks in a `receive` (fixture
+`tests/fixtures/recv.erl`, clause head on **line 12**), a **second** process (`recv:probe_b/1`)
+probes the parked pid, and the returned term is compared line-for-line against the live system
+`erl` oracle (`[{current_function,{recv,wait,0}}, {initial_call,{recv,wait,0}},
+{current_location,{recv,wait,0,[{file,"recv.erl"},{line,12}]}},
+{current_stacktrace,[{recv,wait,0,[{file,"recv.erl"},{line,12}]}]}]`).#### Honest typed `unsupported` items (valid oracle names this runtime cannot answer)
 Each raises the capability gap `unsupported: process_info: <name> …` (exit 3) — never a fabricated
 value and never a false `badarg`. The gap names the missing accessor/hook:
 | item | missing accessor / hook |
 |---|---|
-| `current_function`, `current_location`, `current_stacktrace` | the engine's current function/pc: `Machine` is moved **out** of `Runtime` for the duration of a scheduler pass and exposes no current-function/pc accessor |
-| `initial_call` | no `$initial_call` / initial-MFA field on `beam_process::Process` |
 | `catchlevel` | the runtime has no catch-frame store reachable from here |
 | `sequential_trace_token` | no `seq_trace` subsystem |
 | `backtrace` | no binary backtrace (see `current_stacktrace`) |
@@ -111,8 +135,10 @@ An item this runtime cannot answer is **omitted** by `process_info/1` (the same 
 for an unregistered `registered_name`), so the list is a genuine, shorter-by-construction answer.
 
 #### Documented divergences (correct-but-different-by-construction — do NOT "fix" to a hardcoded figure)
-- **Count:** `/1` emits 15 (registered) / 14 (unregistered) items vs the oracle's 17 / 16, because
-  `current_function`/`initial_call` are honestly omitted as unsupported.
+- **Count:** `/1` emits 15 (registered) / 14 (unregistered) items vs the oracle's 17 / 16 **for a
+  process with no readable execution position** — the `-eval` root process making its own call has
+  no engine, so `current_function`/`initial_call` are omitted (see the execution-position note). For
+  a process with a readable position the two are emitted and the count matches the oracle's.
 - **`heap_size`** agrees with the oracle's 233 (the 233-word nursery), but **`total_heap_size`** is
   **466** (this collector pre-allocates a 233-word mature generation). The real figure is reported
   deliberately — inventing 233 would be a lie.
@@ -136,6 +162,7 @@ claim so it falls through to the registry.
 | `term_type/1` | `erl_map.c:3336-3417` | the C's family name: `fixnum`, `atom`, `tuple`, `flatmap`, `hashmap`, `pid`, `port`, `nil`, `catch`, `list`, `hfloat`, `fun`, `export`, `sub_binary`, `bignum`, `external_pid`, `external_port`, `external_reference` |
 | `get_dflags/0` | `dist.c:5566-5592` | the fixed flag record `{erts_dflags,468283523004,17230663572,468283523004,8396866,8192}` — identical on a non-distributed node and on a `-sname` node; two slots exceed 2^32 (wide fixnums), and the term's `term_to_binary/1` image is byte-exact to the oracle's |
 | `beamfile_chunk/2` | `beam_bif_load.c:165-201` | a named `.beam` chunk's payload as a **binary**; `undefined` for an absent or zero-length chunk or an unparseable container (a duplicate tag resolves to the **last** occurrence — `read_beam_chunks`, `beam_file.c:1556-1581`); `badarg` for a non-binary first arg or a name that is not a list of small ints. Chunk ids are the 4-byte ASCII tags, **case-sensitive**. Read through the public `beam_loader::container`, never hand-rolled parsing |
+| `beamfile_module_md5/1` | `beam_bif_load.c:203-229` | the module checksum as a **bare 16-byte binary** — the C's `erts_new_binary_from_data(sizeof beam.checksum, beam.checksum)`, **not** `beam_lib:md5/1`'s `{ok,{Module,Md5}}` wrapper (that is the Erlang-side shape). `undefined` for an image `beamfile_read` cannot parse (a malformed container, or a `FunT` chunk that is not `4 + 24n` bytes ⇒ `BEAMFILE_READ_CORRUPT_LAMBDA_TABLE`); `badarg` for a non-binary argument. The digest is `crate::context::module_md5` — the same chunk-layout digest the `NEW_FUN_EXT` identity uses, **not** a stored value |
 | `map_to_tuple_keys/1` | `erl_map.c:3318-3328` | a **flat** map's keys tuple (atom keys in atom-index order); a hashmap ⇒ `badarg`; a non-map ⇒ `error:{badmap,Term}` (structured, live reason term) |
 | `binary_to_integer/2` | `big.c:4186-4232` | the C's *value* atoms: a small int, `big`, or `badarg` |
 | `list_to_integer/2` | `big.c:4234-4355` | `{Value, Rest}`, or `no_integer`/`not_a_list`/`badarg`/`big` |
@@ -156,12 +183,6 @@ Documented divergences (deterministic, never a wrong value):
   `reference` and a non-byte-aligned bitstring.
 - `no_aux_work_threads/0` derives from this runtime's own scheduler count (see the table), and
   `processes_next/1` is index-addressed over *this* table.
-- `beamfile_module_md5/1` is **not** served: its derivation (`beam_bif_load.c:205-229`) is the
-  bespoke chunk-layout digest already implemented at `crate::context::bridges::module_md5`
-  (`pub(super)`, outside this node). Serving it needs only that function's visibility raised to
-  `pub(crate)` — no re-derivation here (that would duplicate `beam_term`-level parsing the crate
-  keeps in one place).
-
 ### `prim.rs` — the served `prim_file` BIFs (contract A.7, the `prim_*` preloaded modules)
 `RuntimeContext::prim_file_call(function, arity, args) -> Option<Result<Eterm>>`. `prim_file` is a
 **preloaded** module whose BIFs are the C `prim_file_nif.c` NIFs; the floor claims the subset whose
@@ -255,7 +276,7 @@ form (`:47`) for an errno outside the table.
 - `process.rs` / `port.rs` → the process/registry/reference and port-write surfaces (contracts A.4/A.8)
 - `test_support.rs` → the shared fixtures
 - `../context/mod.rs` → `RuntimeContext::call_bif` / `try_native`'s caller and the host seams
-- `../context/bridges.rs` → `module_md5` (the `.beam` MD5 digest `beamfile_module_md5/1` needs, currently `pub(super)`)
+- `../context/bridges.rs` → `module_md5` (the `.beam` MD5 digest `beamfile_module_md5/1` serves, re-exported `pub(crate)` by `../context/mod.rs` so the floor reuses it instead of re-deriving the chunk parse)
 - `../runtime.rs`, `../codeserver.rs`, `../boot.rs`, `../port.rs`, `../timers.rs`, `../dist.rs` →
   the runtime state these BIFs read (owned elsewhere)
 - `../error.rs` → `unsupported`/`undef`/`halt`/`live_reason_term` and the known-unimplemented list
