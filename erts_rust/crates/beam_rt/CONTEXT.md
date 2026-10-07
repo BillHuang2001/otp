@@ -185,7 +185,7 @@ The API Surface section above owns the detail; each entry here is the module's o
 * `src/boot.rs` → `PreloadedModules` (A.7) + `CORE_ATOMS` + the boot banner; declares `src/boot/{preloaded,bootscript}.rs` (see `src/boot/CONTEXT.md`). `PRELOADED_MODULE_NAMES` is the oracle's **exact** `erlang:pre_loaded/0` list *and* order; `CORE_ATOMS` tail groups are **append-only**.
 * `src/port.rs` → the A.4 `PortHook` provider + the `{spawn_driver, Name}` routing (see the API + Known-Issues sections).
 * `src/port/driver.rs` → the driver C ABI host (A.4): `DriverPort`/`Driver`/`load_driver`/`DriverPortAdapter` (see the API section).
-* `src/dist.rs` → the distributed node (A.5 phase 1): `DistNode`/`DistConnection`/`NodeName`/`resolve_cookie` (see the API + Known-Issues sections).
+* `src/dist.rs` → the distributed node (A.5 phases 1–2): `DistNode`/`DistConnection`/`NodeName`/`resolve_cookie` + inbound delivery (`LocalDeliverySink`, `DistNode::dispatch_inbound`; see the API + Known-Issues sections).
 * `src/info.rs` + `src/info/` → the A.8 introspection surface (see [`src/info/CONTEXT.md`](src/info/CONTEXT.md) for the per-key catalog); `tests/system_info_oracle.rs` is the A.8 oracle comparison (shape + value vs the real `erl`; skips loudly without a toolchain).
 * `src/context/` → the concrete `ExecutionContext` glue (`mod.rs`, `bridges.rs`, `fun_identity.rs`, `tests.rs`, test-only `test_support.rs`) — see the API section.
 * `src/timers.rs` → the runtime-local deadline min-heap behind `send_after/3` **and** finite `receive … after T`, advanced only by the scheduler loop.
