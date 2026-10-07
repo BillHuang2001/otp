@@ -27,10 +27,16 @@
 //! | [`nif`] | A.3 — the observable `erlang:nif_error/1` NIF surface |
 //! | [`nif_so`] | A.3 — the NIF C ABI *end to end*: a real `.so`-backed NIF round trip |
 //! | [`driver`] | A.4 — the observable port/`spawn`-driver surface |
+//! | [`driver_ports`] | A.4 — the `open_port/2` grammar: error shapes + the `{fd,N}` form |
 //! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
+//! | [`wire_ids`] | A.2/A.5 — `term_to_binary` of a local pid / port id |
 //! | [`flags`] | A.6 — CLI / configuration |
 //! | [`bifs`] | A.7 — BIF / OTP app surface |
+//! | [`phash`] | A.7 — `phash/2` and `phash2/1,2` (the externally-observable legacy hashes) |
+//! | [`binmatch`] | A.7 — `binary:compile_pattern/1` + the compiled match/matches/split family |
+//! | [`printing`] | A.7 — the `~p`/`~W` printer and `short` float formatting |
 //! | [`ets`] | A.7 — ETS tables: the `ets:*` BIF surface the runtime serves |
+//! | [`ets_spec`] | A.7 — the `ets` match-spec / `select` family + the `info/1,2` fields |
 //! | [`system_info`] | A.8 — introspection |
 //! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
 //! | [`modules`] | A.2/A.1/A.7 — a freshly `erlc`-compiled module run under both runtimes |
@@ -47,21 +53,27 @@
 //! observable through the black-box CLI at all.
 
 mod bifs;
+mod binmatch;
 mod boot;
 mod driver;
+mod driver_ports;
 mod errors;
 mod etf;
 mod ets;
+mod ets_spec;
 mod flags;
 mod mexec;
 mod modules;
 mod nif;
 mod nif_so;
+mod phash;
+mod printing;
 mod records;
 mod semantics;
 mod system_info;
 mod terms;
 mod wire;
+mod wire_ids;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -319,9 +331,15 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(nif_so::group());
     cases.extend(records::group());
     cases.extend(driver::group());
+    cases.extend(driver_ports::group());
     cases.extend(wire::group());
+    cases.extend(wire_ids::group());
     cases.extend(bifs::group());
+    cases.extend(phash::group());
+    cases.extend(binmatch::group());
+    cases.extend(printing::group());
     cases.extend(ets::group());
+    cases.extend(ets_spec::group());
     cases.extend(system_info::group());
     cases.extend(boot::group());
     cases.extend(flags::group());
