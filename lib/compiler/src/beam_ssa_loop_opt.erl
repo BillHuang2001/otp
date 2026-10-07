@@ -57,10 +57,17 @@
 %%%    the integer-valued operations inside the loop, so a value computed
 %%%    from an induction variable is described too.
 %%%
-%%%    No rewrite of the induction variable itself is performed: nothing is
-%%%    gained by writing `V + (-1)' for `V - 1', and re-associating or
-%%%    hoisting the recurrence would change when it is evaluated. The
-%%%    canonical description exists to licence the rewrites of item 4.
+%%%    The induction variable is not otherwise rewritten: nothing is gained
+%%%    by writing `V + (-1)' for `V - 1', and re-associating or hoisting the
+%%%    recurrence would change when it is evaluated. The canonical
+%%%    description exists to licence the rewrites of item 4.
+%%%
+%%%    The one canonicalisation that *is* an IR rewrite is the operand order
+%%%    of a commutative arithmetic instruction: `C + V' and `C * V' (a
+%%%    literal on the left, a variable on the right) become `V + C' and
+%%%    `V * C', so that every recurrence has a single syntactic shape. `+'
+%%%    and `*' are commutative for every number and fail on the same
+%%%    non-number operands, so neither a value nor an exception changes.
 %%%
 %%% 4. Strength reduction. An arithmetic instruction is rewritten *in place*
 %%%    (same block, same destination) into a cheaper operation, and only
@@ -801,6 +808,16 @@ reduce_block(L, Kinds, Blocks0) ->
     Is = [reduce_instr(I, Kinds) || I <- Blk0#b_blk.is],
     Blocks0#{L := Blk0#b_blk{is=Is}}.
 
+%% Canonicalise the operand order of a commutative arithmetic instruction that
+%% was written with a literal on the left (`C + V', `C * V') into the canonical
+%% `V Op C' shape, so that every recurrence and every product has one syntactic
+%% form. `+' and `*' are commutative for every number (a float sum/product does
+%% not depend on the operand order) and fail on exactly the same non-number
+%% operands, so no value and no exception changes. This is what lets the step
+%% `1 + V' be recognised as the same iteration step as `V + 1'.
+reduce_instr(#b_set{op={bif,Op}, args=[#b_literal{}=A, #b_var{}=B]}=I, Kinds)
+  when Op =:= '+'; Op =:= '*' ->
+    reduce_instr(I#b_set{args=[B, A]}, Kinds);
 reduce_instr(#b_set{op={bif,'*'}, args=[A, B]}=I, Kinds) ->
     case strength_mul(A, B, Kinds) of
         no -> I;
