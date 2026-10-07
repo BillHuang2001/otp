@@ -23,6 +23,11 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 * `is_allocator_switch` / `parse_allocator` — the `-M*`/`+M*` family.
 * `parse_max_ports` (`+Q`), `parse_max_processes` (`+P`), `parse_kernel_poll` (`+K`), `parse_sbt` (`+sbt`), `parse_emu_flavor` (`-emu_flavor`).
 * the ground-truth constants `ERTS_MIN_PORTS`/`ERTS_MAX_PORTS`/`ERTS_MIN_PROCESSES`/`ERTS_MAX_PROCESSES` and `SCHEDULER_BIND_TYPES`.
+`vars.rs` (the `ERL_*` variables **outside** the `*FLAGS` merge; see the section below):
+* `ErlEnv` — `{ inetrc, max_ports, crash_dump, crash_dump_seconds, rootdir, max_ets_tables, fullsweep_after }`, every field `Option` (`None` = unset).
+* `from_env(&dyn Env) -> ErlEnv` — re-exported at `beam_rt::cli` (`pub use vars::{from_env, ErlEnv}`).
+* `has_plus_q_switch(&[String]) -> bool` (`pub(super)`) — the `+Q`-wins-over-`ERL_MAX_PORTS` test.
+* per-variable private parsers (`parse_max_ports`, `parse_atoi_var`, `c_atoi`) so each is unit-testable alone.
 
 ## The supported switches (the exact A.6 surface)
 | Switch | Effect in `beam_rt` |
