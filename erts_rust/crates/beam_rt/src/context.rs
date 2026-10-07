@@ -1820,7 +1820,13 @@ mod tests {
             "records",
             "get_definition",
             2
-        ) && !RuntimeContext::uses_nif_loader("records", "get_definition", 2));
+        ));
+        // It is not the NIF-loading arm either: the two bridges are mutually exclusive.
+        assert!(!RuntimeContext::uses_nif_loader(
+            "records",
+            "get_definition",
+            2
+        ));
     }
 
     #[test]
