@@ -169,7 +169,7 @@ New OTP-30 roster entries not yet implemented: `erlang:is_integer/3` (referenced
 
 ## Routing Table
 - `src/lib.rs` -> crate docs, module wiring, root re-exports, `prelude`, `#![deny(unsafe_code)]`
-- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (the 319-key roster), `default_registry`
+- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (the 320-key roster), `default_registry`
 - `src/context.rs` -> `BifContext`, the ten seams, `NifLoadError`/`RecordDefinitionView`/`RecordFieldView`, `current_module`, the sink impls
 - `src/error.rs` -> the `pub(crate)` failure constructors, the `raise_*` builders, `raise_term`/`raise_error_term`/`structured_error`
 - `src/access.rs` -> the ONLY `#[allow(unsafe_code)]` module: term/int/float/bignum wrappers, `fun_arity`/`is_record`, bitstring + flatmap access, native-record read/write, the M1 ref thing
