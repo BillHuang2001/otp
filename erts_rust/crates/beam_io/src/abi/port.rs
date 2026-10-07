@@ -454,6 +454,14 @@ impl Driver for DriverPort {
         Ok(bytes)
     }
 
+    /// `ready_async`/`async_free`: hand the driver its finished `driver_async` jobs.
+    ///
+    /// This is the `Driver::drive_async` drive point over the C entry's async slots; the work
+    /// lives in [`DriverPort::poll_async`] (which the runtime may also call directly).
+    fn drive_async(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        self.poll_async(ctx)
+    }
+
     /// The `driver_set_timer` deadline, as the port's next `TIMEOUT`.
     fn next_timeout(&self) -> Option<Instant> {
         self.abi.state().deadline()

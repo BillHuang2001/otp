@@ -323,6 +323,25 @@ impl PortRegistry {
         }
     }
 
+    /// Drives port `id`'s asynchronous driver completions, returning how many were processed.
+    ///
+    /// A `driver_async` job finishes on a worker thread; the runtime then hands it to the driver's
+    /// `ready_async` (or runs its `async_free`). There is no readiness- or reduction-driven port
+    /// task for that hand-off in Milestone-1 — the C does it from `call_async_ready` on the port's
+    /// scheduler — so the runtime calls this from its main loop, once per port-task round, to let
+    /// a port with pending jobs make progress (see [`Driver::drive_async`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the port's driver
+    /// returns from [`Driver::drive_async`].
+    pub fn drive_async(&mut self, poller: &mut Poller, id: PortId) -> Result<usize> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => port.drive_async(poller),
+            None => Err(error::badarg()),
+        }
+    }
+
     /// Takes the reaped exit status of the OS child behind port `id`, once.
     ///
     /// This is the seam a runtime uses to synthesize the `{Port, {exit_status, Status}}`

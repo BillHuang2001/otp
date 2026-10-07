@@ -316,6 +316,30 @@ pub trait Driver {
         Ok(())
     }
 
+    /// Drives the driver's **asynchronous completions**, returning how many were processed; the
+    /// default drains nothing.
+    ///
+    /// `driver_async` schedules a job on a worker thread (`erl_async.c`); when it finishes, the
+    /// runtime hands its result to the driver's `ready_async` callback (or runs its `async_free`).
+    /// The C does that from `call_async_ready` on the port's scheduler, but this crate has **no
+    /// port-task kind for async work** in Milestone-1 (a `PortTaskKind::Async` is a documented
+    /// follow-up), so the runtime calls this at a port-task-round **drive point** instead — one
+    /// call per round is enough for pending jobs to make progress.
+    ///
+    /// A driver with no async support inherits `Ok(0)`. The C-ABI bridge
+    /// ([`crate::abi::DriverPort`]) overrides it with
+    /// [`DriverPort::poll_async`](crate::abi::DriverPort::poll_async), which runs each finished
+    /// job's `ready_async` (or its `async_free`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `beam_common::BeamError` when driving the completions fails; the C's
+    /// `ready_async`/`async_free` are `void` callbacks, so the bridge always answers `Ok`.
+    fn drive_async(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        let _ = ctx;
+        Ok(0)
+    }
+
     /// Takes the reaped exit status of the OS child this port owns, **once**.
     ///
     /// A driver that starts no child — the built-in [`crate::drivers::FdDriver`] and

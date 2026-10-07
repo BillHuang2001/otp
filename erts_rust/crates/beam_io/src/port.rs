@@ -471,6 +471,33 @@ impl Port {
         result
     }
 
+    /// Drives the driver's asynchronous completions, returning how many were processed.
+    ///
+    /// The port-task round has **no task kind** for `driver_async` completion in Milestone-1 (the
+    /// C runs `ready_async` from `call_async_ready` on the port's scheduler), so the runtime calls
+    /// this explicitly — mirroring every other driver interaction, the port's `TIMEOUT` task is
+    /// re-armed from [`Driver::next_timeout`] afterwards (see [`Port::refresh_timeout`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the driver's [`Driver::drive_async`] returns.
+    pub fn drive_async(&mut self, poller: &mut Poller) -> Result<usize> {
+        let id = self.id;
+        let result = {
+            let Port {
+                driver,
+                input,
+                output,
+                arms,
+                ..
+            } = self;
+            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            driver.drive_async(&mut ctx)
+        };
+        self.refresh_timeout();
+        result
+    }
+
     /// Takes the reaped exit status of the OS child this port owns, once.
     ///
     /// Forwards to the driver's [`Driver::take_exit_status`]: a port whose driver starts no

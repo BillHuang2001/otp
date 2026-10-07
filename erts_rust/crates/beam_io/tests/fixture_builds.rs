@@ -9,25 +9,19 @@
 //! 1. compiles the fixture with the system `cc` against the system `erl_driver.h` and asserts a
 //!    shared object was produced (the fixture must stay buildable — a broken fixture is a hard
 //!    failure, not a skip); and
-//! 2. attempts to load it (`dlopen(RTLD_NOW)` + `driver_init` + `ErlDrvEntry`) and asserts the
-//!    loaded driver reports `"host_driver"`.
+//! 2. loads it with the crate-level loader `beam_abi::driver::loader::load` and asserts the loaded
+//!    driver reports `"host_driver"`.
 //!
 //! # Skip-vs-fail policy
 //!
 //! Step 1 skips **loudly** when no C compiler or OTP include directory is present, but fails
-//! whenever the toolchain *is* present and the fixture does not build. Step 2 skips **loudly** when
-//! the load fails for a wiring reason: resolving the fixture's `driver_*` imports needs the host
-//! (`beam_abi`'s `driver_*` slots) exported from the test binary via
-//! `-Wl,--export-dynamic` (a sibling `build.rs`), which may not be present on this branch. A load
-//! failure is never a test failure — only a name mismatch from a *successful* load is.
-//!
-//! # Why the load probe is local
-//!
-//! The crate-level loader is `beam_abi::driver::loader::load(path, name)`; it is not referenced
-//! here because `beam_abi` is not a `beam_io` dependency on this branch (a sibling task owns
-//! `Cargo.toml`) and a hard reference would be a compile error. [`support::probe_driver_name`]
-//! performs the equivalent `dlopen`/`driver_init`/`driver_name` read with `libc` alone — see the
-//! `support` module docs.
+//! whenever the toolchain *is* present and the fixture does not build. Step 2 is a **hard failure**
+//! too: resolving the fixture's `driver_*` imports needs the host (`beam_abi`'s `driver_*` slots)
+//! exported from the test binary via `-Wl,--export-dynamic` (a sibling `build.rs`) **and** a
+//! reference that pulls `beam_abi`'s `drv` object file into the link — see
+//! [`force_driver_symbols_link`]. A load failure therefore means the wiring is broken (`dlopen`
+//! reports `undefined symbol: driver_mk_port`), which is exactly the kind of regression this test
+//! must catch, not skip over.
 
 mod support;
 
@@ -38,6 +32,16 @@ use support::{cc_available, compile_so, erl_include_dir, probe_driver_name, scra
 /// The committed C fixture.
 fn fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver.c")
+}
+
+/// Force the `#[no_mangle]` `driver_*` host symbols into this test binary's **dynamic** symbol
+/// table (see `tests/abi_driver.rs`, which carries the long explanation).
+///
+/// Naming [`beam_abi::driver::drv::driver_api_table`] — the `#[used]` table holding them — is what
+/// pulls `beam_abi`'s `drv` object file into the link; `build.rs`'s `-Wl,--export-dynamic` then
+/// puts them in `.dynsym` so the fixture's `dlopen(RTLD_NOW)` can bind them.
+fn force_driver_symbols_link() {
+    let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
 }
 
 /// Compile the driver fixture and load it: the produced `.so` must report the driver name
@@ -71,17 +75,21 @@ fn host_driver_fixture_builds_and_loads() {
 
     // The object exists and is a real driver; now prove it can be loaded. `RTLD_NOW` means every
     // `driver_*` import must be resolvable from the loading process, so a failure here is a wiring
-    // gap (no exported host symbols), not a fixture bug — skip rather than fail.
-    match probe_driver_name(&so) {
-        Ok(Some(name)) => assert_eq!(
-            name, "host_driver",
+    // gap (the host symbols are not exported), never a fixture bug — and never something to skip.
+    force_driver_symbols_link();
+    let path = so.to_str().expect("the fixture path is valid UTF-8");
+    match beam_abi::driver::loader::load(path, "host_driver") {
+        Ok(library) => assert_eq!(
+            library.name(),
+            "host_driver",
             "a loaded driver must report the name its `driver_init` entry carries"
         ),
-        Ok(None) => skip("host_driver: the object loaded but driver_init returned NULL"),
-        Err(err) => skip(&format!(
-            "host_driver: dlopen(RTLD_NOW) failed — the driver_* host symbols / \
-             -Wl,--export-dynamic wiring may not be present yet: {err}"
-        )),
+        Err(err) => panic!(
+            "the host_driver fixture could not be loaded with dlopen(RTLD_NOW): {err}\n\
+             an `undefined symbol: driver_*` here means the driver_* host symbols are not in this \
+             test binary's dynamic symbol table — check build.rs's -Wl,--export-dynamic and the \
+             driver_api_table() reference in force_driver_symbols_link()."
+        ),
     }
 }
 
@@ -128,7 +136,13 @@ fn compile_so_reports_failure_for_a_broken_source() {
     );
 }
 
-/// The load probe must report an error (never panic, never a false success) for a missing object.
+/// The libc-only load probe must report an error (never panic, never a false success) for a missing
+/// object.
+///
+/// `support::probe_driver_name` is the dependency-free `dlopen` check kept alongside the real
+/// loader: it exposes the dynamic loader's own error text (which `beam_abi`'s typed
+/// `DriverLoadError` keeps too, see the load assertion above), so the "a missing object must be an
+/// error" contract is pinned at the rawest level as well.
 #[test]
 fn probe_reports_an_error_for_a_missing_object() {
     let missing = scratch_dir("host-driver-missing").join("does-not-exist.so");

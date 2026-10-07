@@ -120,6 +120,8 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `output_len()`, `open(&mut Poller)`, `output(&mut Poller, &[u8]) -> Result<usize>`, `ready_input(&mut Poller)`,
   `ready_output(&mut Poller) -> Result<usize>`, `control(&mut Poller, command, arg) -> Result<Vec<u8>>`,
   `close(&mut Poller)`, `take_exit_status() -> Result<Option<i32>>` (forwards to the driver),
+  `drive_async(&mut Poller) -> Result<usize>` (drives the driver's `driver_async` completions via
+  `Driver::drive_async`, then refreshes the port timer),
   `notify_exit(&mut Poller, PortExitReason) -> Result<()>` (the once-only port-exit notification), and the
   scheduling surface `queue_output(&[u8])`, `schedule_task(PortTaskKind) -> bool`,
   `schedule_timeout(Instant) -> bool`, `arm_timeout(Instant)`, `cancel_timeout() -> bool`,
@@ -157,6 +159,10 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   - `notify_port_exit(poller, id, reason: PortExitReason) -> Result<()>` — the port-exit notification channel:
     invokes the driver's `Driver::port_exit` **at most once** per port (a repeat is a no-op), leaves the port live
     with its registrations armed, and is independent of the later `close`/`stop`; `BadArg` for an unknown/released id.
+  - `drive_async(poller, id) -> Result<usize>` — the async drive point: calls the port's driver's
+    `Driver::drive_async` (for a loaded driver, `poll_async`), so a port with pending `driver_async` jobs makes
+    progress. The runtime must call it once per port-task round (there is no `PortTaskKind::Async` in M1);
+    `BadArg` for an unknown id.
 ### `driver.rs`
 - `pub struct DriverFlags(u32)` — `Copy + Eq`; `empty()`; const `SOFT_BUSY`; `contains(DriverFlags)`.
 - `pub enum PortExitReason { Closed, OwnerExited, Normal }` (`Copy + Eq + Debug`) — the vocabulary of the
@@ -172,7 +178,10 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `next_timeout() -> Option<Instant>` (= `None`; the driver's **declaration** of the next deadline it wants
   `Driver::timeout` at — mirrored into the port's `TIMEOUT` task after each interaction, deadline-gated so it
   never fires early), `port_exit(ctx, PortExitReason) -> Result<()>` (= `Ok(())`; the once-only, advisory
-  port-exit notification, distinct from the teardown `stop`), and
+  port-exit notification, distinct from the teardown `stop`),
+  `drive_async(ctx) -> Result<usize>` (= `Ok(0)`; the `driver_async`-completion **drive point** — there is no
+  port-task kind for async work in M1, so the runtime drains a port's finished jobs through here; overridden by
+  `DriverPort` with `poll_async`), and
   `take_exit_status() -> Result<Option<i32>>` (= `Ok(None)`; the exit-status seam, overridden only by `SpawnDriver`).
 - `pub type DriverFactory = fn() -> Result<Box<dyn Driver>>`.
 - `pub struct DriverRegistry` — name→factory (the `driver_tab.c` seam): `new()`, `with_builtins()`
@@ -356,11 +365,28 @@ foreign code; the three modules are a `pub` sub-tree (`pub use crate::abi::*`).
 
 ## Test Strategy
 Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io`
-**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **207 tests, 0 failures** (1 ignored
+**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **219 tests, 0 failures** (1 ignored
 doc-test) — `163` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
-`drivers/{fd,line_buffer,binary_io,efile,spawn,inet}`, and `abi/{host,port}`) + `tests/poller.rs` `8` +
-`tests/port.rs` `4` + `tests/port_task.rs` `4` + `tests/spawn.rs` `18` + `tests/inet.rs` `3` +
-`tests/driver_seams.rs` `5` + `2` doctests (the `!Send`/`!Sync` compile-fail pins on `PortRegistry`).
+`drivers/{fd,line_buffer,binary_io,efile,spawn,inet}`, and `abi/{host,port}`) + `tests/abi_driver.rs` `8` +
+`tests/poller.rs` `8` + `tests/port.rs` `4` + `tests/port_task.rs` `4` + `tests/spawn.rs` `18` +
+`tests/inet.rs` `3` + `tests/driver_seams.rs` `5` + `tests/fixture_builds.rs` `4` + `2` doctests (the
+`!Send`/`!Sync` compile-fail pins on `PortRegistry`).
+`tests/fixture_builds.rs` (integration, a real system `cc`): compiles `tests/fixtures/host_driver.c` and asserts
+`beam_abi::driver::loader::load(path, "host_driver")` yields a library named `host_driver` (a real load, not the
+old libc-based `driver_name` probe); a missing object is a typed load error; a missing `cc`/`erl_nif.h` SKIPs loudly.
+`tests/abi_driver.rs` (integration, **the end-to-end C-driver path**) — the fixture `.so` loaded through
+`beam_io::abi::port::make_loaded`, opened as a real port over a real `Poller` + `PortRegistry`, and driven through
+the port-task round: the driver's `output` callback echoes back `b"hello"` (and `b"HELLO"` with the `upper` start
+token, proving `start`'s command parsing reached the driver); a `port_command` write-readiness task reaches
+`ready_output` (`b"W"`); verb `5` (`erl_drv_output_term`) delivers exactly one `send_term` carrying the 2-tuple
+`{host_driver, 1}` (inspected structurally via `beam_term`); verb `2` arms a timer (`next_deadline()` `Some`, no
+early fire) then fires `b"T"` and verb `3` cancels it (`next_deadline()` `None`); verb `4` selects a `pipe(2)` read
+end so written bytes arrive as a `Data` notification through `ready_input`, and verb `7` deselects; verb `6`
+schedules a `driver_async` job whose completion `PortRegistry::drive_async` drives (≥ 1 processed); and `close`
+runs `stop`, releases the port and reports `PortNotification::Closed`. Each test SKIPs loudly only when
+`cc`/`erl_nif.h` are absent; a `dlopen` failure PANICS with the `undefined symbol` hint (it means the symbol link
+is broken, never a silent skip). The test binary references `beam_abi::driver::drv::driver_api_table()` so
+`-Wl,--export-dynamic` exports the `#[no_mangle]` `driver_*` symbols the fixture's `dlopen(RTLD_NOW)` resolves.
 The `src/abi/` in-module suites are 18 tests (`host.rs` `10` + `port.rs` `8`): `AbiHost::output` landing in the
 port **input** queue and failing (`-1`) with no context installed; `driver_select` register/**re-register in
 place**/de-select (incl. de-selecting an unknown fd) against a real socketpair + the `Poller::is_empty` after;
@@ -596,12 +622,21 @@ that a built-in (`"fd"`) and a loaded (`.so`) driver are both a `Box<dyn Driver>
   - **deliberately `None`** — the binary-refcount trio (`driver_binary_get_refc`/`inc_refc`/`dec_refc`): the
     frozen `ErlDrvBinary` is exactly `{ orig_size, orig_bytes }` (16 bytes) with no refcount word, so there is
     nothing to report or adjust.
-- **The end-to-end real-`.so` test lives in a sibling task.** `src/abi/` is covered by in-module tests over a
-  real poller/socketpair (and a missing-`.so` load), but the end-to-end C-driver test — a `tests/fixtures/host_driver.c`
-  built with the system `cc`, loaded via `beam_abi::driver::loader::load` + `DriverPort::load`, opened through
-  `PortRegistry::open`, driven through `execute_port_tasks` with `poll_async` — is owned by a sibling task; the
-  `build.rs` `-Wl,--export-dynamic` link-arg and the `driver_api_table()` reachability test here are what let it
-  link the `#[no_mangle]` `driver_*` symbols.
+- **The end-to-end real-`.so` test lives in this crate (`tests/abi_driver.rs`).** `src/abi/` is covered by
+  in-module tests over a real poller/socketpair (and a missing-`.so` load), and the end-to-end C-driver test — a
+  `tests/fixtures/host_driver.c` built with the system `cc`, loaded via `beam_abi::driver::loader::load` +
+  `make_loaded`, opened through `PortRegistry::open`, driven through `execute_port_tasks` + `drive_async` — is
+  `tests/abi_driver.rs`; `tests/fixture_builds.rs` asserts the real load too. The `build.rs`
+  `-Wl,--export-dynamic` link-arg **and** a reference to `driver_api_table()` from the test binary are both
+  required to link the `#[no_mangle]` `driver_*` symbols into its dynamic symbol table (either alone leaves the
+  fixture's `dlopen(RTLD_NOW)` failing with `undefined symbol: driver_mk_port`).
+- **A driver's own worker thread has no installed `DriverContext` in M1.** `host_async_invoke` (the fixture's
+  `driver_async` work) runs on a plain `std::thread`; the port context is installed only around a `DriverPort`
+  callback, so a `driver_output` from the worker returns `-1` and its bytes are dropped. What *is* driven is the
+  completion hand-off (`ready_async`/`async_free`) through the `Drive::drive_async` seam once the runtime calls it.
+- **The `driver_async` completion drive point is `PortRegistry::drive_async(poller, id)`.** There is no
+  `PortTaskKind::Async` in M1, so the runtime (which owns the poll loop) must call it once per port-task round for
+  a port with pending jobs to progress — the documented analog of the C's `call_async_ready`.
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
   `ERTS_POLL_USE_WAKEUP` beyond `Waker`; the single-thread invariant is enforced on `Port`/`PortRegistry` (see
   Constraints) but **not** guarded on `Poller` itself — use it from one thread.
