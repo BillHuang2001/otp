@@ -157,6 +157,16 @@ fn registration_covers_every_new_ets_bif() {
         ("select", 1),
         ("select", 2),
         ("select", 3),
+        // The match family and the count/delete verbs.
+        ("match", 1),
+        ("match", 2),
+        ("match", 3),
+        ("match_object", 1),
+        ("match_object", 2),
+        ("match_object", 3),
+        ("select_count", 2),
+        ("select_delete", 2),
+        ("match_delete", 2),
     ] {
         let expected = name != "size";
         assert_eq!(
@@ -499,18 +509,21 @@ fn info_reports_the_table_fields() {
         );
     }
 
-    // `info/2` `id` reproduces `TableInfo::entries`: the table's numeric id as a
-    // small integer (the oracle reports a tid reference here instead — see the
-    // `ets.rs` `info_field` docs).
+    // `info/2` `id` is the table's **tid reference** — the very handle ref thing
+    // `ets:new/2` handed out, so `is_reference(ets:info(T, id))` is `true` and
+    // `ets:info(T, id) =:= T` holds (both verified against the system `erl`).
     let id_item = ctx.atom("id").expect("seeded");
     let id = reg
         .call("ets", "info", 2, &mut ctx, &[handle, id_item])
         .expect("info/2 id");
-    let is_int = reg
-        .call("erlang", "is_integer", 1, &mut ctx, &[id])
-        .expect("erlang:is_integer");
-    assert!(is_true(&atoms, is_int), "info/2 `id` is not an integer");
-
+    let is_ref = reg
+        .call("erlang", "is_reference", 1, &mut ctx, &[id])
+        .expect("erlang:is_reference");
+    assert!(is_true(&atoms, is_ref), "info/2 `id` is not a reference");
+    assert!(
+        beam_term::compare::eq(id, handle, &atoms),
+        "ets:info(T, id) must be =:= T"
+    );
     // `heir` is `none` on a fresh table; `node` is `nonode@nohost`; a `set` reports
     // `decentralized_counters => false` (verified against the system `erl`).
     for (item, expected) in [
