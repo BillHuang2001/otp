@@ -41,7 +41,7 @@ claim so it falls through to the registry.
 
 | BIF | Ground truth | Behaviour (oracle-verified, OTP 29.1.1 / erts-17.1) |
 |---|---|---|
-| `term_type/1` | `erl_map.c:3336-3417` | `fixnum`/`atom`/`tuple`/`flatmap`/`hashmap`/`pid`/`port`/`nil`/`catch`/`list`/`hfloat`/`sun_fun`→`fun`/`export`/`sub_binary` |
+| `term_type/1` | `erl_map.c:3336-3417` | `fixnum`, `atom`, `tuple`, `flatmap`, `hashmap`, `pid`, `port`, `nil`, `catch`, `list`, `hfloat`, `fun`, `export`, `sub_binary` |
 | `map_to_tuple_keys/1` | `erl_map.c:3318-3328` | a **flat** map's keys tuple (atom keys in atom-index order); a hashmap ⇒ `badarg`; a non-map ⇒ `error:{badmap,Term}` (structured, live reason term) |
 | `binary_to_integer/2` | `big.c:4186-4232` | the C's *value* atoms: a small int, `big`, or `badarg` |
 | `list_to_integer/2` | `big.c:4234-4355` | `{Value, Rest}`, or `no_integer`/`not_a_list`/`badarg`/`big` |
