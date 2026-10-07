@@ -178,8 +178,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   interiors that are not externally pinned are read through the owning `beam_term` accessors (e.g. the
   HAMT node shapes via `map_header_type`/`map_header_val`/`header_arity`), never re-derived.
 - **`copy_struct_shared` reuses `copy.rs`'s `shallow` primitive** — the copy logic exists once.
-- **Deps (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `beam_alloc`, `beam_codec`, `beam_gc`,
-  `libc` (the `beam_gc` edge is described under Design Decisions). No new external dependencies.
+- **Deps (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `beam_alloc`, `beam_gc` (the `beam_gc`
+  edge is described under Design Decisions). `beam_codec` and `libc` are also declared there but are
+  **unused** — no `beam_codec`/`libc` reference exists in `src/` or `tests/`. No new external dependencies.
 - Files target ~1000 lines; one responsibility per file. Licensing Apache-2.0.
 ## Design Decisions
 - **Fidelity scope: a correct, iterative *tree* copy, not the C's single-allocation `htop`/`hbot` layout.**
