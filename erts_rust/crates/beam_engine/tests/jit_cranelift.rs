@@ -3683,17 +3683,24 @@ fn the_inlined_tuple_reads_agree_and_deopt_like_the_interpreter() {
         "a constant source must be a typed error, got {got:?}"
     );
 
-    // Deopt: a non-tuple source — the guard rejects at run time.
+    // Deopt: a non-tuple source — the guard rejects at run time. `get_tuple_element`
+    // raises the family's exact `{badmatch, Value}`; the arity switch has no arity to
+    // match (C's `get_arity` yields `NIL`), so it takes its fail branch and answers
+    // the fail arm's `0`.
     for bad in [make_small(1), NIL] {
         let got = agree_shape(&backend, &compiled, &module, "tuple_elem0", 1, &[bad], None);
         assert!(
             got.is_err(),
             "tuple_elem0({bad:?}) must be a typed error, got {got:?}"
         );
-        let got = agree_shape(&backend, &compiled, &module, "tuple_arity", 1, &[bad], None);
-        assert!(
-            got.is_err(),
-            "tuple_arity({bad:?}) must be a typed error, got {got:?}"
+        let _ = agree_shape(
+            &backend,
+            &compiled,
+            &module,
+            "tuple_arity",
+            1,
+            &[bad],
+            Some(make_small(0)),
         );
     }
 

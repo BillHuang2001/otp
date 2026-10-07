@@ -12,7 +12,10 @@
 //!   preceding type test: a `get_tuple_element`/`get_list`/`get_hd`/`get_tl` on a
 //!   non-matching term raises `{badmatch, Value}` — a `Step::Goto` into a live catch
 //!   frame, or a typed [`BeamError`] out of [`Machine::run_export`] when there is
-//!   none.
+//!   none. A `select_tuple_arity` on a non-tuple source has no arity at all (C's
+//!   `get_arity` yields `NIL`), so it matches no alternative and takes the switch's
+//!   `fail` branch — raising `{badmatch, Value}` only when the switch is exhaustive
+//!   (`NO_FAIL`).
 //!
 //! Every error is a typed [`BeamError`] — no test panics on runtime data.
 
@@ -539,7 +542,12 @@ fn select_tuple_arity_without_a_fail_label_raises_badmatch() {
 }
 
 #[test]
-fn select_tuple_arity_on_a_non_tuple_is_a_typed_error() {
+fn select_tuple_arity_on_a_non_tuple_branches_to_the_fail_label() {
+    // C's `select_val_lin.get_arity` (ground truth `emu/select_instrs.tab:122-128`)
+    // sets the switch value of a non-tuple source to `NIL`, and `execute`
+    // (`:130-153`) then finds no alternative equal to it and takes the ordinary
+    // `$FAIL($Fail)` jump — so a non-tuple source branches to `fail` exactly like an
+    // arity that matches no destination.
     let code = vec![
         Instr::Label(Label(1)),
         Instr::SelectTupleArity {
@@ -548,16 +556,58 @@ fn select_tuple_arity_on_a_non_tuple_is_a_typed_error() {
             destinations: vec![(Operand::Integer(1), Label(10))],
         },
         Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
         Instr::Return,
         Instr::Label(Label(10)),
+        Instr::Move {
+            src: Operand::Integer(100),
+            dst: Operand::X(0),
+        },
         Instr::Return,
     ];
     let mut fixture = Fixture::new();
     let entry = fixture.add_function("f", 1, code);
     let module = fixture.finish();
+
     let mut ctx = MinimalContext::new();
-    // A non-tuple source cannot yield an arity.
-    assert!(run(&module, entry, &[make_small(3)], &mut ctx).is_err());
+    // `[]`, a small int and an atom: none is a tuple, so the switch takes `fail`.
+    let an_atom = make_atom(export_atom(&module, "f"));
+    for source in [NIL, make_small(3), an_atom] {
+        assert_eq!(
+            run(&module, entry, &[source], &mut ctx).unwrap(),
+            make_small(0),
+            "a non-tuple source ({source:?}) must branch to the fail label"
+        );
+    }
+}
+
+#[test]
+fn select_tuple_arity_on_a_non_tuple_without_a_fail_label_raises_badmatch() {
+    // The `NO_FAIL` (exhaustive) switch has no branch target, so its no-match path —
+    // which a non-tuple source also takes — raises `{badmatch, Value}` exactly as an
+    // unmatched arity does.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::SelectTupleArity {
+            tuple: Operand::X(0),
+            fail: NO_FAIL,
+            destinations: vec![(Operand::Integer(2), Label(10))],
+        },
+        Instr::Label(Label(10)),
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let badmatch = fixture.atom("badmatch");
+    let entry = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+
+    let mut ctx = MinimalContext::new();
+    let value = make_small(7);
+    let (result, machine) = run_inspected(&module, entry, &[value], &mut ctx);
+    assert_badmatch(result, &machine, badmatch, value);
 }
 
 #[test]
