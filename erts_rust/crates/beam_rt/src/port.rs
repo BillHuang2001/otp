@@ -1644,6 +1644,7 @@ mod tests {
     fn test_meta(command: &str) -> PortMeta {
         PortMeta {
             command: command.to_string(),
+            kind: PortName::Spawn,
             os_pid: None,
             stream: StreamType::List,
             notify_exit: false,
