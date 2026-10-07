@@ -67,6 +67,7 @@ use super::{jit_step_one, CompiledModule};
 
 mod aggregate;
 mod arith;
+mod compare;
 mod link;
 mod r#move;
 mod operands;
@@ -79,6 +80,7 @@ use aggregate::{
     try_inline_select_tuple_arity,
 };
 use arith::try_inline_gc_bif;
+use compare::try_inline_comparison;
 use link::{emit_frame_teardown, Linker};
 use operands::x_offset;
 use r#move::{try_inline_move, try_inline_swap};
@@ -286,6 +288,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
     let mut instructions = 0usize;
     let mut blocks = 0usize;
     let mut gc_bifs = 0usize;
+    let mut cmp_bifs = 0usize;
     let mut list_reads = 0usize;
     let mut tuple_paths = 0usize;
     for function in &module.functions {
@@ -293,7 +296,11 @@ fn code_capacity_estimate(module: &Module) -> usize {
         blocks += function.blocks.len();
         for instr in &function.code {
             match instr {
-                Instr::GcBif { .. } => gc_bifs += 1,
+                Instr::Bif { .. } => cmp_bifs += 1,
+                Instr::GcBif { .. } => {
+                    gc_bifs += 1;
+                    cmp_bifs += 1;
+                }
                 Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => {
                     list_reads += 1
                 }
@@ -308,6 +315,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
     128 * blocks
         + INSTRUCTION_BYTES * instructions
         + FAST_PATH_BYTES * gc_bifs
+        + COMPARE_PATH_BYTES * cmp_bifs
         + LIST_PATH_BYTES * list_reads
         + TUPLE_PATH_BYTES * tuple_paths
         + DEFAULT_CAPACITY
@@ -331,6 +339,15 @@ const INSTRUCTION_BYTES: usize = 192;
 /// constant compare) plus the [`emit_step_and_continue`] fallback it branches to
 /// (~150 bytes).
 const FAST_PATH_BYTES: usize = 384;
+
+/// The code-size budget reserved for one comparison BIF (see
+/// [`code_capacity_estimate`]): the two operand loads (~20 bytes), the two small-int
+/// guards with their mask materialisation (~40), the compare/branch (~10), both
+/// `true`/`false` materialisations with their skip jumps (~45) and the
+/// [`emit_step_and_continue`] fallback it branches to (~150, also covered by the
+/// per-instruction [`INSTRUCTION_BYTES`]). Deliberately loose: under-estimating
+/// would turn a large module into a `SystemLimit` compile error.
+const COMPARE_PATH_BYTES: usize = 256;
 
 /// The code-size budget reserved for one `get_list`/`get_hd`/`get_tl` (see
 /// [`code_capacity_estimate`]): the guarded cons-cell read — a mask/test/branch, the
@@ -527,7 +544,44 @@ fn emit_block(
             // (any other BIF, an un-addressable operand, or a register the budget
             // could not cache) it is exactly the `_` arm below.
             Instr::GcBif { .. } => {
-                if !try_inline_gc_bif(buffer, module, instr, allocation, done, func, pc, highest_touched)? {
+                let inlined = try_inline_gc_bif(
+                    buffer,
+                    module,
+                    instr,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? || try_inline_comparison(
+                    buffer,
+                    module,
+                    instr,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )?;
+                if !inlined {
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                }
+            }
+            // The comparison BIFs (`erlang`'s `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=`),
+            // which the compiler emits as a **non-collecting** `bif` (see [`compare`]).
+            // Any other BIF, an un-addressable operand, or a module without both
+            // `true`/`false` interned is the `_` arm below.
+            Instr::Bif { .. } => {
+                if !try_inline_comparison(
+                    buffer,
+                    module,
+                    instr,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }

@@ -223,15 +223,25 @@ fn compare_shape(kind: TestKind, lhs: TestSrc, rhs: TestSrc) -> Option<(Guard, C
         |src: TestSrc| matches!(src, TestSrc::Small(_) | TestSrc::Immediate(_));
     match kind {
         TestKind::IsEqExact | TestKind::IsNeExact => {
-            if !is_const(lhs) && !is_const(rhs) {
-                return None;
-            }
             let cond = if kind == TestKind::IsEqExact {
                 Cond::E
             } else {
                 Cond::Ne
             };
-            Some((Guard::None, cond))
+            match (lhs, rhs) {
+                // Two runtime values: guard **both** as small ints, after which a plain
+                // word compare *is* `=:=` — `make_small(v) == v*16 + 15` is injective
+                // and `cmp`'s raw-word fast path is exact. Two distinct boxed terms
+                // (equal floats, bignums, tuples, …) share no word, but neither is a
+                // small, so the guard sends them to the helper (which compares `cmp`'s
+                // own way) rather than fabricating a word-compare answer.
+                (TestSrc::Reg(_), TestSrc::Reg(_)) => Some((Guard::Both, cond)),
+                // At least one operand is a constant immediate, which is `=:=` only to
+                // the identical word (see the module comment): a plain word compare is
+                // already exact.
+                _ if is_const(lhs) || is_const(rhs) => Some((Guard::None, cond)),
+                _ => None,
+            }
         }
         TestKind::IsEq | TestKind::IsNe => {
             let cond = if kind == TestKind::IsEq { Cond::E } else { Cond::Ne };

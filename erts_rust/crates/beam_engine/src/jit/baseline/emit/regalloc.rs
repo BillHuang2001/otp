@@ -17,6 +17,7 @@ use super::aggregate::{
     get_hd_shape, get_list_shape, get_tl_shape, get_tuple_element_shape, select_tuple_arity_plan,
 };
 use super::arith::fast_arith;
+use super::compare::comparison_shape;
 use super::operands::{constant_word, x_register};
 use super::select::select_val_plan;
 use super::test::{test_plan, TestSrc};
@@ -208,6 +209,18 @@ fn cacheable_touches(
         Instr::GcBif { .. } => {
             if let Some(fast) = fast_arith(module, instr) {
                 touches.extend(fast.registers());
+            } else if let Some(plan) = comparison_shape(module, instr) {
+                touches.extend(plan.registers());
+            }
+        }
+        // A comparison BIF (`Instr::Bif` is the settled corpus's form) is charged its
+        // operand registers and its destination, and only when
+        // [`comparison_shape`] claims it (another BIF, an un-addressable operand, or a
+        // module without both `true`/`false` interned keeps the whole instruction on
+        // the helper, which contributes no native touch).
+        Instr::Bif { .. } => {
+            if let Some(plan) = comparison_shape(module, instr) {
+                touches.extend(plan.registers());
             }
         }
         Instr::Test { kind, fail, args } => {
