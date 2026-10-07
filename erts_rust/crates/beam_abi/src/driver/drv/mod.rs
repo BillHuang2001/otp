@@ -23,9 +23,12 @@
 //! * `port` — **part 2, port/host-dependent**: the functions whose `ErlDrvPort` operand **is** the
 //!   pointer [`DriverEnv::as_port`] hands out ([`DriverEnv::from_port`] recovers it), plus their
 //!   `populate` step;
-//! * `lifecycle`, `pdl`, `queues`, `threads` — **not-yet-implemented families**: each owns the slot
-//!   list for one group of the C surface and contributes a (currently no-op) `populate` step, so a
-//!   later workstream can wire that family without editing this file.
+//! * `lifecycle`, `queues`, `threads` — **not-yet-implemented families**: each owns the slot list
+//!   for one group of the C surface and contributes a (currently no-op) `populate` step, so a later
+//!   workstream can wire that family without editing this file;
+//! * `pdl` — **implemented**: the port data lock, the driver monitors, the deprecated
+//!   `driver_get_now` wall clock, and the (deliberately `None`) binary refcount trio — see that
+//!   file's header for the semantics and the documented deviations.
 //!
 //! # Table assembly
 //!
@@ -70,13 +73,10 @@
 //!   `remove_driver_entry`, `driver_lock_driver`, `erl_drv_init_ack`, `erl_drv_set_os_pid`,
 //!   `erl_drv_busy_msgq_limits`, the `driver_failure*`/`driver_exit` family, `set_busy_port`,
 //!   `set_port_control_flags`, `get_port_flags`.
-//! * **monitors & port data lock** — the `driver_monitor_*` family and the whole `driver_pdl_*`
-//!   family.
 //! * **async thread pool** — `driver_async_port_key` (the "fair" async key is derived from the
 //!   port's id term, which this seam has no representation for).
 //! * **threads** — the whole `erl_drv_mutex_*`/`erl_drv_cond_*`/`erl_drv_rwlock_*`/`erl_drv_tsd_*`/
 //!   `erl_drv_thread_*`/`erl_drv_*_name` family.
-//! * **deprecated** — `driver_get_now` (`ERL_DRV_DEPRECATED_FUNC`).
 //!
 //! The **binary refcount trio** (`driver_binary_get_refc`/`inc_refc`/`dec_refc`) is `None` too, and
 //! deliberately: the frozen [`ErlDrvBinary`](crate::driver::types::ErlDrvBinary) layout is exactly `{ orig_size, orig_bytes }` (16 bytes,
@@ -301,14 +301,12 @@ mod tests {
         assert!(t.driver_vec_to_buf.is_none());
         assert!(t.driver_enq.is_none());
         assert!(t.driver_pushq.is_none());
-        assert!(t.driver_monitor_process.is_none());
         assert!(t.erl_drv_mutex_create.is_none());
         assert!(t.driver_create_port.is_none());
         assert!(t.driver_async_port_key.is_none());
         assert!(t.erl_drv_init_ack.is_none());
         assert!(t.set_busy_port.is_none());
         assert!(t.driver_failure_eof.is_none());
-        assert!(t.driver_pdl_create.is_none());
         // No refcount word exists in the frozen `ErlDrvBinary` layout.
         assert!(t.driver_binary_get_refc.is_none());
         assert!(t.driver_binary_inc_refc.is_none());
