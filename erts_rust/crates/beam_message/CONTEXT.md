@@ -379,6 +379,7 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value
 - `tests/external.rs` → external pid/port/ref verbatim copy + node linkage/refcounting
 - `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path
+- `tests/fun.rs` → closure copy correctness: `make_fun`/`make_fun3` blocks sized/walked from the frozen `beam_term::fun` layout, `=:=` equality, byte-identical `NEW_FUN_EXT`, callability, `env[0]` fix-up
 - `tests/fragments.rs` → the fragment-model evidence: `send` vs `send_fragmented`, `move_into` (payload onto the receiver heap + off-heap transfer), the multi-fragment chain, refc-binary handle move, accounting
 - `../../erts/emulator/beam/copy.c` → the authoritative copier (`copy_struct_x`/`size_object_x`/`copy_shared_*`/`erts_move_multi_frags`) (read-only)
 - `../../erts/emulator/beam/erl_message.h` / `erl_message.c` → the message envelope, `ErlHeapFragment`, queue layout (read-only)
