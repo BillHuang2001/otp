@@ -112,7 +112,11 @@ fn assert_probe(envs: &[(&str, &str)], values: &[&str]) {
         stderr(&output)
     );
     assert_eq!(stdout(&output), expected(values), "env {envs:?}");
-    assert!(output.stderr.is_empty(), "env {envs:?}: {}", stderr(&output));
+    assert!(
+        output.stderr.is_empty(),
+        "env {envs:?}: {}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -170,13 +174,7 @@ fn the_full_merge_order_is_otp_aflags_command_line_flags_zflags() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        expected(&[
-            "otpcookie",
-            "acookie",
-            "cmdcookie",
-            "fcookie",
-            "zcookie"
-        ])
+        expected(&["otpcookie", "acookie", "cmdcookie", "fcookie", "zcookie"])
     );
     assert!(output.stderr.is_empty(), "stderr: {}", stderr(&output));
 }
@@ -206,10 +204,7 @@ fn an_env_value_is_tokenized_into_argv() {
     // A backslash escapes the following space, keeping the value one token.
     assert_probe(&[("ERL_FLAGS", "-setcookie one\\ two")], &["one two"]);
     // Several switches in one variable all land in argv.
-    assert_probe(
-        &[("ERL_FLAGS", "-noshell -setcookie multi")],
-        &["multi"],
-    );
+    assert_probe(&[("ERL_FLAGS", "-noshell -setcookie multi")], &["multi"]);
 }
 
 /// An unset variable contributes nothing: the flag is absent (`init:get_argument/1` is

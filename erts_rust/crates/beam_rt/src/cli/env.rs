@@ -223,7 +223,10 @@ mod tests {
     #[test]
     fn whitespace_runs_are_a_single_separator() {
         assert_eq!(tokenize("  a   b  "), tokens(&["a", "b"]));
-        assert_eq!(tokenize("a\tb\nc\rd\x0be\x0cf"), tokens(&["a", "b", "c", "d", "e", "f"]));
+        assert_eq!(
+            tokenize("a\tb\nc\rd\x0be\x0cf"),
+            tokens(&["a", "b", "c", "d", "e", "f"])
+        );
     }
 
     #[test]
@@ -294,11 +297,11 @@ mod tests {
         assert_eq!(merge_argv(&args, &MapEnv::default()), args);
 
         // Only `ERL_FLAGS` set ⇒ appended after the command line.
-        let env = MapEnv(HashMap::from([(
-            "ERL_FLAGS".to_string(),
-            "-f".to_string(),
-        )]));
-        assert_eq!(merge_argv(&args, &env), tokens(&["-noshell", "-eval", "1", "-f"]));
+        let env = MapEnv(HashMap::from([("ERL_FLAGS".to_string(), "-f".to_string())]));
+        assert_eq!(
+            merge_argv(&args, &env),
+            tokens(&["-noshell", "-eval", "1", "-f"])
+        );
 
         // Only `ERL_AFLAGS` set ⇒ prepended before the command line.
         let env = MapEnv(HashMap::from([(
@@ -315,7 +318,10 @@ mod tests {
     fn merge_tokenizes_each_variable_independently() {
         let env = MapEnv(HashMap::from([
             ("ERL_AFLAGS".to_string(), "-a 1".to_string()),
-            ("ERL_FLAGS".to_string(), "-b 2 -c \"three four\"".to_string()),
+            (
+                "ERL_FLAGS".to_string(),
+                "-b 2 -c \"three four\"".to_string(),
+            ),
         ]));
         let args = tokens(&["-cmd"]);
         assert_eq!(
