@@ -1,0 +1,5 @@
+conftest.c: In function 'main':
+conftest.c:67:5: warning: argument to variable-length array is too large [-Wvla-larger-than=]
+   67 | int x[(2*__atomic_always_lock_free(sizeof(__int128_t), 0))-1]; volatile __int128_t var; __int128_t res = __atomic_fetch_and(&var, (__int128_t) 0, __ATOMIC_RELAXED); res = __atomic_fetch_and(&var, (__int128_t) 0, __ATOMIC_ACQUIRE); res = __atomic_fetch_and(&var, (__int128_t) 0, __ATOMIC_RELEASE);
+      |     ^
+conftest.c:67:5: note: limit is 9223372036854775807 bytes, but argument is 18446744073709551612

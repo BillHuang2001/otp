@@ -1,0 +1,70 @@
+/* confdefs.h */
+#define PACKAGE_NAME ""
+#define PACKAGE_TARNAME ""
+#define PACKAGE_VERSION ""
+#define PACKAGE_STRING ""
+#define PACKAGE_BUGREPORT ""
+#define PACKAGE_URL ""
+#define ASSUMED_CACHE_LINE_SIZE 64
+#define ERTS_ENABLE_MSACC 1
+#define ERTS_NO_RETPOLINE 
+#define HAVE_STDIO_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_STRING_H 1
+#define HAVE_INTTYPES_H 1
+#define HAVE_STDINT_H 1
+#define HAVE_STRINGS_H 1
+#define HAVE_SYS_STAT_H 1
+#define HAVE_SYS_TYPES_H 1
+#define HAVE_UNISTD_H 1
+#define HAVE_SYS_TIME_H 1
+#define STDC_HEADERS 1
+#define SIZEOF_TIME_T 8
+#define SIZEOF_VOID_P 8
+#define HAVE_LIBM 1
+#define HAVE_LIBDL 1
+#define HAVE_LIBDL 1
+#define HAVE_LIBUTIL 1
+#define ETHR_TRUST_GCC_ATOMIC_BUILTINS_MEMORY_BARRIERS 0
+#define SIZEOF_VOID_P 8
+#define HAVE_PTHREAD_H 1
+#define HAVE_CLOCK_GETRES 1
+#define ETHR_HAVE_CLOCK_GETTIME_MONOTONIC 1
+#define ETHR_MONOTONIC_CLOCK_ID CLOCK_MONOTONIC
+#define ETHR_PTHREADS 1
+#define ETHR_HAVE_PTHREAD_H 1
+#define ETHR_HAVE_SCHED_H 1
+#define ETHR_HAVE_SYS_TIME_H 1
+#define ETHR_HAVE_USABLE_PTHREAD_STACK_MIN 1
+#define ETHR_HAVE_PTHREAD_SPIN_LOCK 1
+#define ETHR_HAVE_SCHED_YIELD 1
+#define ETHR_SCHED_YIELD_RET_INT 1
+#define ETHR_HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP 1
+#define ETHR_HAVE_PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP 1
+#define ETHR_HAVE_PTHREAD_ATTR_SETGUARDSIZE 1
+#define ETHR_HAVE_PTHREAD_COND_TIMEDWAIT_MONOTONIC 1
+#define ETHR_HAVE_LINUX_FUTEX 1
+#define ETHR_HAVE_PTHREAD_SETNAME_NP_2 1
+#define ETHR_HAVE_PTHREAD_GETNAME_NP_3 1
+#define SIZEOF_SHORT 2
+#define SIZEOF_INT 4
+#define SIZEOF_LONG 8
+#define SIZEOF_LONG_LONG 8
+#define SIZEOF___INT128_T 16
+#define ETHR_HAVE___sync_synchronize ~0
+#define ETHR_HAVE___sync_add_and_fetch 12
+#define ETHR_HAVE___sync_fetch_and_and 12
+#define ETHR_HAVE___sync_fetch_and_or 12
+#define ETHR_HAVE___sync_val_compare_and_swap 12
+#define ETHR_HAVE___atomic_store_n 28
+#define ETHR_HAVE___atomic_load_n 28
+#define ETHR_HAVE___atomic_add_fetch 28
+/* end confdefs.h.  */
+
+int
+main (void)
+{
+int x[(2*__atomic_always_lock_free(sizeof(__int128_t), 0))-1]; volatile __int128_t var; __int128_t res = __atomic_fetch_and(&var, (__int128_t) 0, __ATOMIC_RELAXED); res = __atomic_fetch_and(&var, (__int128_t) 0, __ATOMIC_ACQUIRE); res = __atomic_fetch_and(&var, (__int128_t) 0, __ATOMIC_RELEASE);
+  ;
+  return 0;
+}
