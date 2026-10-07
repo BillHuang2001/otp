@@ -463,7 +463,13 @@ whole-region scan.)
 - **Frame-aware stack relocation** (`copy_erlang_stack`), the process dictionary, on-heap message/signal
   queues and saved BIF/NIF arguments as sub-rootsets — owned by `beam_process`; this crate takes a flat
   root slice.
-- **Heap-fragment (`ErlHeapFragment`) copy-in and the `heap_frags` rootset** (`erts_copy_one_frag`).
+- **The fragment copier is non-destructive and has no `ERTS_HOLE_MARKER` / in-place offset rewrite.**
+  `fragment.rs` reads the fragment and copies into the destination, where the C `erts_copy_one_frag`
+  destructively forwards in place; the equivalent in-place root rewrite is `copy_roots_into` /
+  `copy_term_into`. `FragmentChain` uses a `Vec` where the C links with `next`/`last`, and its off-heap list
+  is the union of the per-fragment lists (the same set of objects the C stores in the first fragment). A
+  failure mid-copy leaves already-copied words as garbage in the destination (still a valid heap —
+  immutability means the collector never needs to know).
 - **Literal-area collection** (`erts_garbage_collect_literals`, literal-area purge/`xptr_tag`) — literals
   are treated as permanent and left verbatim.
 - **A.6 runtime heap options** (`+hms`, `+hmbs`, …) — this crate exposes `HeapPolicy`, not the CLI
