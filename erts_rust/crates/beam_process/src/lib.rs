@@ -49,6 +49,7 @@
 #![warn(missing_docs)]
 
 pub mod dict;
+pub mod dirty;
 pub mod fragments;
 pub mod link;
 pub mod monitor;
@@ -63,10 +64,13 @@ pub mod run_queue;
 pub mod scheduler;
 pub mod signal;
 pub mod signal_queue;
+pub mod smp;
+pub mod timer;
 
 mod error; // pub(crate) constructors only — NOT public
 
 pub use crate::dict::*;
+pub use crate::dirty::*;
 pub use crate::fragments::*;
 pub use crate::link::*;
 pub use crate::monitor::*;
@@ -81,10 +85,13 @@ pub use crate::run_queue::*;
 pub use crate::scheduler::*;
 pub use crate::signal::*;
 pub use crate::signal_queue::*;
+pub use crate::smp::*;
+pub use crate::timer::*;
 
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
     pub use crate::dict::*;
+    pub use crate::dirty::*;
     pub use crate::fragments::*;
     pub use crate::link::*;
     pub use crate::monitor::*;
@@ -99,4 +106,6 @@ pub mod prelude {
     pub use crate::scheduler::*;
     pub use crate::signal::*;
     pub use crate::signal_queue::*;
+    pub use crate::smp::*;
+    pub use crate::timer::*;
 }
