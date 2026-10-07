@@ -85,7 +85,7 @@
 %%%   literals, which is not enough to make unrolling worthwhile (or safe) in
 %%%   the common case. Unrolling is therefore deferred rather than guessed.
 
--export([opt/1]).
+-export([opt/1, eligible/1]).
 
 -include("beam_ssa.hrl").
 -import_record(beam_ssa_opt, [opt_st]).
@@ -154,6 +154,54 @@ opt({#opt_st{ssa=Linear0}=St, FuncDb}) when is_list(Linear0) ->
     {St#opt_st{ssa=Linear}, FuncDb};
 opt({St, FuncDb}) ->
     {St, FuncDb}.
+
+%% Eligibility precondition used by the opt-in per-pass budget/watchdog
+%% driver (`beam_ssa_opt_budget', wired in `beam_ssa_opt:gate/1'): true when
+%% the function's CFG contains a cycle, i.e. when there can be a loop to
+%% optimize.
+%%
+%% This is only a NECESSARY condition, a cheap filter that lets the driver
+%% skip the pass for the majority of functions; whether a specific loop can
+%% be optimized remains the business of the pass itself.
+%%
+%% The state is a linear (reverse postorder) block list at this point in the
+%% pipeline. In reverse postorder every edge of acyclic control flow goes
+%% from an earlier to a later block, while every cycle produces at least one
+%% edge whose target is not after its source. Testing "some successor is not
+%% later than the block itself" is therefore a sound over-approximation of
+%% "this function has a loop", and it costs O(V+E) with no dominator
+%% computation.
+-spec eligible({#opt_st{}, term()}) -> boolean().
+eligible({#opt_st{ssa=Linear}, _FuncDb}) when is_list(Linear) ->
+    has_back_edge(Linear);
+eligible(_) ->
+    %% The SSA is in block-map form, where opt/1 is a no-op.
+    false.
+
+has_back_edge(Linear) ->
+    Index = index_blocks(Linear, #{}, 0),
+    scan_edges(Linear, Index).
+
+index_blocks([{L,_}|Blocks], Map, I) ->
+    index_blocks(Blocks, Map#{L => I}, I + 1);
+index_blocks([], Map, _I) ->
+    Map.
+
+scan_edges([{L,#b_blk{last=Last}}|Blocks], Index) ->
+    case has_back_succ(succs_last(Last), map_get(L, Index), Index) of
+        true -> true;
+        false -> scan_edges(Blocks, Index)
+    end;
+scan_edges([], _Index) ->
+    false.
+
+has_back_succ([S|Ss], I, Index) ->
+    case Index of
+        #{S := SI} when SI =< I -> true;
+        _ -> has_back_succ(Ss, I, Index)
+    end;
+has_back_succ([], _I, _Index) ->
+    false.
 
 %%% ------------------------------------------------------------------
 %%% Driver
