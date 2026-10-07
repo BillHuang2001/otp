@@ -486,9 +486,12 @@ fn validate_allocator(switch: &str, args: &[String], index: usize) -> Result<usi
         }
         'M' => mseg(sub, switch, &mut reader)?,
         'Y' => system_alloc(sub, switch, &mut reader)?,
+        // `argv[i][3] == 'a'`: the `e` is already stripped from `sub`, so only the
+        // trailing `a` of the `ea` option name remains to be consumed
+        // (`erl_alloc.c:1733-1783`).
         'e' => {
             let rest = sub
-                .strip_prefix("ea")
+                .strip_prefix("a")
                 .ok_or_else(|| error::bad_switch_value(switch, sub))?;
             let value = reader.value(rest, switch)?;
             match value.as_str() {
@@ -838,18 +841,66 @@ mod tests {
         );
     }
 
-    /// **Known divergence (reported, not fixed here):** the `-Mea` arm of the C
-    /// (`erl_alloc.c:1733-1783`, `argv[i][3] == 'a'`) is not reproduced — the validator
-    /// looks for the text `ea` *after* the `e`, so both `+Mea <value>` and
-    /// `+Mea<value>` are rejected where the oracle accepts `min`/`max`/`r9c`/`r10b`/`r11b`
-    /// (`erl +Mea min -noshell -eval 'halt(0).'` exits 0).
+    /// `+Mea <value>` — the emulator-wide allocator preset (`erl_alloc.c:1733-1783`):
+    /// `argv[i][3] == 'a'` confirms the option is `ea`, and the value follows it.
+    ///
+    /// Oracle: `erl -noshell +Mea min -eval 'io:format("ok~n"),halt().'` exits 0 and
+    /// prints `ok`; so do `max`/`r9c`/`r10b`/`r11b`. A missing value (`+Mea`) and an
+    /// unknown value (`+Mea 1024`) are both rejected.
     #[test]
-    fn allocator_mea_is_a_known_divergence() {
-        for argv in [args(&["+Mea", "min"]), args(&["+Meamin"])] {
-            assert!(
-                parse_allocator(&argv[0], &argv, 0).is_err(),
-                "{argv:?}: the current validator rejects it (the oracle accepts it)"
+    fn allocator_mea_accepts_the_documented_presets() {
+        for value in ["min", "max", "r9c", "r10b", "r11b"] {
+            // Both spellings: the value in the next token, and concatenated.
+            let split = args(&["+Mea", value]);
+            assert_eq!(
+                parse_allocator("+Mea", &split, 0)
+                    .unwrap_or_else(|e| panic!("`+Mea {value}` must be accepted: {e}")),
+                2,
+                "{split:?} must consume the value token"
+            );
+            let joined = args(&[&format!("+Mea{value}")]);
+            assert_eq!(
+                parse_allocator(&joined[0], &joined, 0)
+                    .unwrap_or_else(|e| panic!("`+Mea{value}` must be accepted: {e}")),
+                1,
+                "{joined:?} must consume no extra token"
             );
         }
+        // A missing value is an error, never an empty one …
+        assert!(parse_allocator("+Mea", &args(&["+Mea"]), 0).is_err());
+        // … and an unknown preset is rejected too.
+        for value in ["1024", "", "MIN", "min "] {
+            let argv = args(&["+Mea", value]);
+            assert!(
+                parse_allocator("+Mea", &argv, 0).is_err(),
+                "{argv:?} must be rejected"
+            );
+        }
+        let argv = args(&["+Mea1024"]);
+        assert!(parse_allocator("+Mea1024", &argv, 0).is_err(), "{argv:?}");
+    }
+
+    /// The sibling `-Mdai`/`-Mlpm` arms share the "already-stripped letter" shape and
+    /// must stay accepted after the `+Mea` fix.
+    ///
+    /// Oracle: `+Mdai max` and `+Mlpm all` both exit 0.
+    #[test]
+    fn allocator_sibling_letter_arms_stay_accepted() {
+        assert_eq!(
+            parse_allocator("+Mdai", &args(&["+Mdai", "max"]), 0).expect("accepted"),
+            2
+        );
+        assert_eq!(
+            parse_allocator("+Mlpm", &args(&["+Mlpm", "all"]), 0).expect("accepted"),
+            2
+        );
+        assert_eq!(
+            parse_allocator("+Mdai1000", &args(&["+Mdai1000"]), 0).expect("accepted"),
+            1
+        );
+        assert_eq!(
+            parse_allocator("+Mlpmall", &args(&["+Mlpmall"]), 0).expect("accepted"),
+            1
+        );
     }
 }

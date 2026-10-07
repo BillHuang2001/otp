@@ -717,6 +717,11 @@ const AGREEING_CASES: &[FlagCase] = &[
         rust_code: 2,
     },
     FlagCase {
+        description: "+Mea min (the emulator-wide allocator preset)",
+        args: &["+Mea", "min"],
+        rust_code: 0,
+    },
+    FlagCase {
         description: "+Mea 1024 (an unknown -Mea value)",
         args: &["+Mea", "1024"],
         rust_code: 2,
@@ -815,12 +820,6 @@ const DIVERGENT_CASES: &[(&str, &[&str], bool, i32)] = &[
     (
         "+K bogus (the emulator never validates the +K value)",
         &["+K", "bogus"],
-        true,
-        2,
-    ),
-    (
-        "+Mea min (the validator's -Mea arm is incomplete — a reported bug)",
-        &["+Mea", "min"],
         true,
         2,
     ),
