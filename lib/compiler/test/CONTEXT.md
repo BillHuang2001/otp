@@ -64,6 +64,15 @@ Dummy `.erl` stubs are generated (`ERL_DUMMY_FILES`) so the release test dir has
 - `beam_debug_info_SUITE` compiles itself with `-compile([beam_debug_info])` on purpose (to disassemble a module carrying debug info).
 - `beam_validator_SUITE_data/*.S` are hand-written BEAM assembly listings fed to `beam_validator` (invalid ones must be rejected); `beam_ssa_check_SUITE_data/*.erl` carry `%%` directives consumed by `beam_ssa_check` to assert SSA annotations.
 
+## Running A Single Suite Without ct_run (verified recipe)
+`ts_install_cth.beam` is NOT built into `common_test/ebin` in a plain in-tree build, so `suite/0`'s `{ct_hooks,[ts_install_cth]}` cannot be resolved and neither `ct_run` nor `ct:run_test/1` will start these suites. Drive the callbacks directly instead:
+1. Build the tree (`./otp_build configure && make`) and compile the suites you need into a scratch ebin with the same lint flags the Makefile uses:
+   `./bin/erlc -I lib/stdlib/include -I lib/compiler/test -o "$SCRATCH/ebin" +clint +clint0 +ssalint +nowarn_missing_spec_documented lib/compiler/test/<SUITE>.erl lib/compiler/test/test_lib.erl`
+2. Run a driver that adds that ebin to the code path **at startup** and calls the callbacks itself (never from an escript: an escript preloads the system `compile` before `code:add_patha/1` takes effect; an `erl -noshell -pa <ebin> -eval ...` is safe). For each suite: `init_per_suite([{priv_dir,Dir}])`, then for every entry of `all/0` either call the testcase with that Config, or (for `{group,G}`) call `init_per_group(G,Config)`, run the testcases listed for `G` in `groups/0`, then `end_per_group/2`; finish with `end_per_suite/1`. `groups/0` entries may be 2- or 3-tuples (`{Name,TCs}` / `{Name,Props,TCs}`) and may contain non-testcase properties such as `parallel`.
+3. Wrap each testcase call in `try ... catch Class:Reason -> {Class,Reason} end`. A failing testcase shows up as `exit:{test_case_failed,Reason}` (`ct:fail/1` is just `exit({test_case_failed,Reason})`) or as an `error:{assertEqual,...}`/`erlang:error` from `assert.hrl`; both are caught, so no Common Test process is needed.
+4. The scratch ebin must be a directory of its own: `erl -pa` on a directory with tens of thousands of entries (e.g. the shared `$TMPDIR`) makes the node fail to start.
+This repository's `ssa_opt_budget_SUITE`, `beam_ssa_loop_opt_SUITE`, `beam_ssa_fus_SUITE`, `beam_ssa_fbip_SUITE` and `beam_ssa_SUITE` were all run this way.
+
 ## Test Strategy / Routing Table
 | Suite group | What it covers |
 | --- | --- |
