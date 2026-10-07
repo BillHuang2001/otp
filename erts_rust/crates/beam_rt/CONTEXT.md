@@ -104,6 +104,7 @@ The floor is the BIFs that are really *runtime* operations — they read/write t
 | `-smp enable\|disable\|auto` | select the scheduler model; recorded as an init argument (M1 runs single-threaded) |
 | `+A N` | async-thread pool size → preserved verbatim in `emulator.extra_emulator_flags` |
 | `+P N` | max process count → `emulator.max_processes` |
+| `+hms N` / `+hmbs N` / `+hmax N` / `+hmaxk\|el\|ib B` | GC heap policy (`beam_gc::HeapPolicy`), rounded through the growth table; visible in `garbage_collection` |
 | `-name N` / `-sname N` | node name → `emulator.node_name`; **makes the runtime a distributed node** (A.5 phase 1: a bound listener + `epmd` registration + the accepting handshake — see `src/dist.rs`) |
 | `run <file.beam> <mod>:<func>/<arity> [int-arg…]` | **the vertical slice**: load the file, run, **print** the result |
 * `-eval` grammar (`src/eval/{parse,ast,mod}.rs`): the Erlang **expression** subset — literals in every base, lists/tuples/maps/binaries, the full operator set with precedence, `case`/`if`/`begin`/`try`/`catch`/`receive`, `fun`s, and list/map/**binary** comprehensions (incl. a binary generator). An `erl_eval`-style tree-walk evaluates it, dispatching arithmetic/comparison/**bit operators** to the **`beam_bifs` `erlang` registry** (only `and`/`or`/`xor`/`not`/`andalso`/`orelse`/`++`/`--` stay special forms). Binary segments accumulate a bit buffer (byte-aligned ⇒ a **binary**, else a **bitstring**); a map literal uses the sorted `make_map`. Outside the grammar is a **capability gap** (exit 3).
@@ -182,6 +183,8 @@ Unsupported is emitted for a `-eval` expression outside the grammar (`src/eval/p
 * **GC observables: `process_info/2` answers three items, with one documented divergence.** `garbage_collection` is the oracle's five-item proplist (non-hardcoded) and `heap_size` agrees (233), but `total_heap_size` reports **466** (vs the oracle's 233) because this collector pre-allocates a 233-word mature generation. A pid not in the table is `undefined`; an unknown/non-atom item or a non-pid is `badarg`. `erlang:process_info/1` remains unimplemented.
 * **Heap has no GC** — a runaway allocation returns `SystemLimit`.
 * **No whole-system memory introspection.** `erlang:memory/0,1` and `erlang:statistics/1` are **not** registered BIFs (exit 1); the memory numbers it *does* answer are `process_info/2`'s heap items, `system_info(allocated_areas)` / `{allocator, A}` and `ets:info(T, memory)`.
+
+* **The heap switches are modelled; some rejection details are not.** `+hms`/`+hmbs` set a `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000` → `min_heap_size` 1598, `+hmbs 5000` → `min_bin_vheap_size` 6772) and `+hmax*` the `max_heap_size` map; a malformed value is exit 2 (`USAGE`) where the oracle exits 1 (`bad heap size`), the oracle's `atoi`/`ErtsStrToSint` laxness is not reproduced, and this runtime records every switch as an init argument where real `erl` records none.
 
 ## Notes for Agents
 * **Read `../CONTEXT.md` and the two `../../ERTS_RUST_REWRITE_*.md` design docs before changing the glue**; this crate is where the Stage-1 engine meets the Stage-5 core.
