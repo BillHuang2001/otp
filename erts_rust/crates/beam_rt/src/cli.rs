@@ -1440,6 +1440,210 @@ mod tests {
         assert_eq!(error::unsupported_reason(&error), None);
     }
 
+    /// The A.6 configuration switches (`-setcookie`/`-config`/`-boot`): a `-`-switch, so
+    /// each is an **init argument**, exactly as the oracle
+    /// (`erl -setcookie abc -noshell -eval 'io:format("~w~n",[init:get_argument(setcookie)]), halt().'`
+    /// ⇒ `{ok,[["abc"]]}`; verified against OTP 29.1.1 / erts-17.1).
+    #[test]
+    fn the_configuration_switches_are_recorded_as_init_arguments() {
+        let config = parsed(&["-setcookie", "abc"]);
+        assert_eq!(config.emulator.cookie.as_deref(), Some("abc"));
+        assert_eq!(
+            config.init_args.get("setcookie"),
+            Some(vec![&["abc".to_string()][..]])
+        );
+        // Every occurrence is recorded (`{ok,[["one"],["two"]]}`); the modelled cookie is
+        // the last one.
+        let config = parsed(&["-setcookie", "one", "-setcookie", "two"]);
+        assert_eq!(config.emulator.cookie.as_deref(), Some("two"));
+        assert_eq!(
+            config.init_args.get("setcookie"),
+            Some(vec![&["one".to_string()][..], &["two".to_string()][..]])
+        );
+
+        let config = parsed(&["-config", "/etc/app.config"]);
+        assert_eq!(
+            config.init_args.get("config"),
+            Some(vec![&["/etc/app.config".to_string()][..]])
+        );
+        let config = parsed(&["-boot", "/boot/start"]);
+        assert_eq!(
+            config.init_args.get("boot"),
+            Some(vec![&["/boot/start".to_string()][..]])
+        );
+
+        // A missing operand of any of the three is a usage error, never a capability gap.
+        for switch in ["-setcookie", "-config", "-boot"] {
+            let error = parse_args(&[switch]).expect_err("a missing operand");
+            assert_eq!(error::unsupported_reason(&error), None, "{switch}");
+        }
+    }
+
+    /// `-emu_flavor F` records the value as an init argument and selects the flavor:
+    /// `emu` ⇒ [`beam_common::Flavor::Emu`], `jit`/`smp` ⇒ [`beam_common::Flavor::Jit`].
+    ///
+    /// Divergence: the oracle's `erlexec` accepts only `smp` (`-emu_flavor emu` ⇒
+    /// `erlexec: Invalid emulator type or flavor.`, exit 1); accepting `emu`/`jit` is what
+    /// makes [`beam_common::Flavor::Emu`] reachable here. For `smp` the recorded value is
+    /// the same (`{ok,[["smp"]]}`).
+    #[test]
+    fn emu_flavor_switch_selects_the_flavor_and_is_recorded() {
+        let config = parsed(&["-emu_flavor", "emu"]);
+        assert_eq!(config.emulator.flavor, beam_common::Flavor::Emu);
+        assert_eq!(
+            config.emulator.features,
+            beam_common::FeatureFlags::for_flavor(beam_common::Flavor::Emu)
+        );
+        assert_eq!(
+            config.init_args.get("emu_flavor"),
+            Some(vec![&["emu".to_string()][..]])
+        );
+        for value in ["jit", "smp"] {
+            let config = parsed(&["-emu_flavor", value]);
+            assert_eq!(config.emulator.flavor, beam_common::Flavor::Jit);
+            assert_eq!(
+                config.emulator.features,
+                beam_common::FeatureFlags::for_flavor(beam_common::Flavor::Jit)
+            );
+            assert_eq!(
+                config.init_args.get("emu_flavor"),
+                Some(vec![&[value.to_string()][..]])
+            );
+        }
+        for args in [&["-emu_flavor", "bogus"][..], &["-emu_flavor"][..]] {
+            let error = parse_args(args).expect_err("a bad/missing flavor is a usage error");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The `+Q`/`+P`/`+K`/`+sbt` emulator switches: validated against the legacy C, and
+    /// **never** init arguments (in the oracle every `+`-flag is an emulator flag, so
+    /// `init:get_argument('Q'|'P'|'K'|'sbt')` is the bare atom `error`).
+    ///
+    /// Oracle (OTP 29.1.1 / erts-17.1): `+Q`/`+P` accept `legacy`/`1024`/`134217727`
+    /// (exit 0) and reject `1000`/`0`/`134217728`/`abc` (exit 1); all nine `+sbt` types
+    /// exit 0 and `+sbt bogus` exits 1; `+K bogus` exits 0 (the emulator does not
+    /// validate it — `erl_check_io.c:2467`).
+    #[test]
+    fn limit_switches_are_validated_preserved_and_never_init_arguments() {
+        // `+Q` — preserved only: nothing about the runtime changes.
+        for value in ["1024", "134217727", "legacy"] {
+            let config = parsed(&["+Q", value]);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                vec!["+Q".to_string(), value.to_string()]
+            );
+            assert_eq!(config.init_args.get("Q"), None);
+        }
+        for value in ["1000", "0", "1023", "134217728", "abc", "1024abc", ""] {
+            let error = parse_args(&["+Q", value]).expect_err("a bad +Q value");
+            assert_eq!(error::unsupported_reason(&error), None, "{value:?}");
+        }
+        assert!(parse_args(&["+Q"]).is_err(), "+Q needs a value");
+
+        // `+P` — modelled as the emulator's process limit; `legacy` keeps the default.
+        let config = parsed(&["+P", "1024"]);
+        assert_eq!(config.emulator.max_processes, Some(1024));
+        assert_eq!(config.init_args.get("P"), None);
+        assert!(config.emulator.extra_emulator_flags.is_empty());
+        assert_eq!(parsed(&["+P", "legacy"]).emulator.max_processes, None);
+        assert_eq!(
+            parsed(&["+P", "134217727"]).emulator.max_processes,
+            Some(134_217_727)
+        );
+        for value in ["1000", "0", "134217728", "abc", ""] {
+            let error = parse_args(&["+P", value]).expect_err("a bad +P value");
+            assert_eq!(error::unsupported_reason(&error), None, "{value:?}");
+        }
+        assert!(parse_args(&["+P"]).is_err(), "+P needs a value");
+
+        // `+K` — preserved; the oracle accepts *any* value here, so validating the two
+        // literals is a documented divergence (`erl +K bogus …` exits 0).
+        for value in ["true", "false"] {
+            let config = parsed(&["+K", value]);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                vec!["+K".to_string(), value.to_string()]
+            );
+            assert_eq!(config.init_args.get("K"), None);
+        }
+        let error = parse_args(&["+K", "bogus"]).expect_err("beam_rt validates the literals");
+        assert_eq!(error::unsupported_reason(&error), None);
+        assert!(parse_args(&["+K"]).is_err(), "+K needs a value");
+
+        // `+sbt` — the nine bind types of `erl_cpu_topology.c:628-647`.
+        for value in ["u", "db", "s", "ps", "ts", "tnnps", "nnps", "nnts", "ns"] {
+            let config = parsed(&["+sbt", value]);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                vec!["+sbt".to_string(), value.to_string()]
+            );
+            assert_eq!(config.init_args.get("sbt"), None);
+        }
+        for args in [&["+sbt", "bogus"][..], &["+sbt"][..]] {
+            let error = parse_args(args).expect_err("a bad/missing +sbt value");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The `-M*`/`+M*` allocator family: recognized, **never** an init argument; `-M*` is
+    /// accepted unvalidated (oracle parity — `erlexec` never forwards it to the emulator)
+    /// while `+M*` is validated against the `erl_alloc.c` grammar.
+    #[test]
+    fn allocator_switches_are_accepted_and_never_init_arguments() {
+        // The validated `+M*` forms (in-token and next-token values both work).
+        for args in [
+            &["+MMscs", "1024"][..],
+            &["+MMscs1024"][..],
+            &["+MBas", "aobf"][..],
+            &["+MBasbf"][..],
+            &["+Mlpm", "no"][..],
+            &["+MYe", "true"][..],
+            &["+MIscs", "100"][..],
+            &["+MMamcbf", "100"][..],
+            &["+MZas", "chaosff"][..],
+        ] {
+            let config = parsed(args);
+            assert_eq!(config.action, Action::Boot, "{args:?}");
+            assert!(
+                config.init_args.is_empty(),
+                "{args:?} must record no init argument"
+            );
+        }
+
+        // `-M*` is passed through unvalidated (as `erlexec` does) …
+        for args in [&["-Mfoo"][..], &["-M"][..], &["-Mea"][..]] {
+            let config = parsed(args);
+            assert_eq!(config.action, Action::Boot, "{args:?}");
+            assert!(
+                config.init_args.is_empty(),
+                "{args:?} must record no init argument"
+            );
+        }
+        // … while a `+M*` value is validated (the oracle rejects all of these with exit 1;
+        // `beam_rt` reports its uniform usage error instead).
+        for args in [
+            &["+Mfoo"][..],
+            &["+M"][..],
+            &["+MMscs", "bogus"][..],
+            &["+MBas", "chaosff"][..],
+        ] {
+            let error = parse_args(args).expect_err("a bad +M* value");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+
+        // A `-M*` value is **not** consumed, so a following token is a stray argument
+        // (`erl -Mea 1024 …` accepts it — a documented divergence of the pass-through).
+        let error = parse_args(&["-Mea", "1024"]).expect_err("the -M* value is not consumed");
+        assert_eq!(error::unsupported_reason(&error), None);
+
+        // **Known divergence (reported, not fixed here):** the validator's `-Mea` arm does
+        // not reproduce the C's `argv[i][3] == 'a'` (`erl_alloc.c:1733-1783`), so `+Mea min`
+        // is rejected where the oracle exits 0.
+        let error = parse_args(&["+Mea", "min"]).expect_err("the known -Mea divergence");
+        assert_eq!(error::unsupported_reason(&error), None);
+    }
+
     #[test]
     fn usage_text_documents_every_supported_switch() {
         for spelling in [
@@ -1453,7 +1657,17 @@ mod tests {
             "+S",
             "+A",
             "+P",
+            "+Q",
+            "+K",
+            "+sbt",
+            "-MNAME",
+            "+MM",
+            "+MB",
             "-name",
+            "-setcookie",
+            "-config",
+            "-boot",
+            "-emu_flavor",
             "run ",
         ] {
             assert!(USAGE.contains(spelling), "USAGE must mention {spelling}");

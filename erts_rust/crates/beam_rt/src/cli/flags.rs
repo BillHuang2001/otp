@@ -547,3 +547,289 @@ fn validate_allocator(switch: &str, args: &[String], index: usize) -> Result<usi
     }
     Ok(reader.index + 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The argv a switch is parsed from, as the parser sees it.
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|argument| argument.to_string()).collect()
+    }
+
+    /// `+Q N`: `legacy`, or an integer in `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]`
+    /// (`erl_init.c:1888-1905`).
+    ///
+    /// Oracle (OTP 29.1.1 / erts-17.1):
+    /// `erl +Q 1024|134217727|legacy -noshell -eval 'halt(0).'` exits 0;
+    /// `+Q 1000|0|134217728|abc` exits 1 (`bad number of ports <v>` + usage).
+    #[test]
+    fn max_ports_accepts_legacy_and_the_oracle_range() {
+        for value in ["1024", "134217727", "legacy"] {
+            assert!(parse_max_ports("+Q", value).is_ok(), "{value:?} must be accepted");
+        }
+        for value in [
+            "1000",
+            "0",
+            "1023",
+            "134217728",
+            "-1",
+            "abc",
+            "",
+            // `ErtsStrToSint` silently ignores a trailing suffix; this parser does not
+            // (a documented divergence — the oracle accepts `+Q 1024abc` as 1024).
+            "1024abc",
+        ] {
+            assert!(parse_max_ports("+Q", value).is_err(), "{value:?} must be rejected");
+        }
+    }
+
+    /// `+P N`: the same range (`erl_init.c:1870-1886`); `legacy` keeps the default
+    /// (`None`).
+    ///
+    /// Oracle: `+P 1024|134217727|legacy` exits 0; `+P 1000|0|134217728|abc` exits 1
+    /// (`bad number of processes <v>` + usage).
+    #[test]
+    fn max_processes_accepts_legacy_and_the_oracle_range() {
+        assert_eq!(parse_max_processes("+P", "1024").expect("valid"), Some(1024));
+        assert_eq!(
+            parse_max_processes("+P", "134217727").expect("valid"),
+            Some(134_217_727)
+        );
+        assert_eq!(parse_max_processes("+P", "legacy").expect("valid"), None);
+        for value in ["1000", "0", "1023", "134217728", "-1", "abc", ""] {
+            assert!(
+                parse_max_processes("+P", value).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+    }
+
+    /// `+K true|false`.
+    ///
+    /// The oracle does **not** validate this value at all (`erl +K bogus -noshell
+    /// -eval 'halt(0).'` exits 0 — `erl_check_io.c:2467` merely `get_arg`s it), so
+    /// rejecting anything else is `beam_rt`'s documented divergence.
+    #[test]
+    fn kernel_poll_accepts_the_two_literals() {
+        for value in ["true", "false"] {
+            assert!(parse_kernel_poll("+K", value).is_ok(), "{value:?}");
+        }
+        for value in ["bogus", "TRUE", "", "1"] {
+            assert!(parse_kernel_poll("+K", value).is_err(), "{value:?}");
+        }
+    }
+
+    /// `+sbt <type>`: the nine bind types of `erl_cpu_topology.c:628-647`.
+    ///
+    /// Oracle: all nine exit 0; `+sbt bogus` exits 1.
+    #[test]
+    fn sbt_accepts_the_nine_bind_types() {
+        assert_eq!(
+            SCHEDULER_BIND_TYPES,
+            ["u", "db", "s", "ps", "ts", "tnnps", "nnps", "nnts", "ns"]
+        );
+        for value in SCHEDULER_BIND_TYPES {
+            assert!(parse_sbt("+sbt", value).is_ok(), "{value:?}");
+        }
+        for value in ["bogus", "", "U", "nnts ", "ts2"] {
+            assert!(parse_sbt("+sbt", value).is_err(), "{value:?}");
+        }
+    }
+
+    /// `-emu_flavor F`: `emu` ⇒ [`Flavor::Emu`], `jit`/`smp` ⇒ [`Flavor::Jit`].
+    ///
+    /// Divergence: the oracle's `erlexec` accepts only `smp` (`-emu_flavor emu` ⇒
+    /// `erlexec: Invalid emulator type or flavor.`, exit 1); accepting `emu`/`jit` is
+    /// what makes [`Flavor::Emu`] reachable.
+    #[test]
+    fn emu_flavor_selects_the_documented_values() {
+        let flavor = |value: &str| {
+            parse_emu_flavor("-emu_flavor", value).expect("a documented flavor")
+        };
+        assert_eq!(flavor("emu"), beam_common::Flavor::Emu);
+        assert_eq!(flavor("jit"), beam_common::Flavor::Jit);
+        assert_eq!(flavor("smp"), beam_common::Flavor::Jit);
+        for value in ["bogus", "", "EMU", "emu "] {
+            assert!(parse_emu_flavor("-emu_flavor", value).is_err(), "{value:?}");
+        }
+    }
+
+    /// The `-M*`/`+M*` recognition (`erlexec.c:1009-1028`).
+    #[test]
+    fn is_allocator_switch_recognizes_both_prefixes() {
+        for argument in ["-M", "+M", "-Mfoo", "+Mfoo", "-Mea", "+Mea", "+MMscs", "+MBas"] {
+            assert!(is_allocator_switch(argument), "{argument:?}");
+        }
+        for argument in ["-m", "+m", "-eval", "+S", "M", "-", "--M", "-+M", ""] {
+            assert!(!is_allocator_switch(argument), "{argument:?}");
+        }
+    }
+
+    /// The `+M*` grammar's **accepted** spellings — both value forms (in-token text and
+    /// the following token), for each allocator letter family.
+    ///
+    /// Oracle: every one of these exits 0.
+    #[test]
+    fn allocator_accepts_the_documented_spellings() {
+        // (switch token, following token, expected next index)
+        let cases: &[(&str, Option<&str>, usize)] = &[
+            // `+MM*` — the memory segment (mseg) options.
+            ("+MMscs", Some("1024"), 2),
+            ("+MMscs1024", None, 1),
+            ("+MMamcbf", Some("100"), 2),
+            ("+MMamcbf100", None, 1),
+            // `lp` is the one mseg option whose name is two characters longer than the
+            // `-MM` prefix, so `-MMlp on` / `-MMlpon` are the accepted spellings
+            // (`erl_alloc.c:1682-1706` reads `argv[i]+5`).
+            ("+MMlp", Some("on"), 2),
+            ("+MMlpon", None, 1),
+            // `+MB*` — one alloc-util allocator (`binary_alloc`).
+            ("+MBas", Some("aobf"), 2),
+            ("+MBasbf", None, 1),
+            // `+MZ*` — `test_alloc`, the only allocator that knows `chaosff`.
+            ("+MZas", Some("chaosff"), 2),
+            ("+MZaschaosff", None, 1),
+            // `+MIscs` — the `literal_alloc`-specific mseg option.
+            ("+MIscs", Some("100"), 2),
+            ("+MIscs100", None, 1),
+            // `+MYe` — the system allocator.
+            ("+MYe", Some("true"), 2),
+            ("+MYetrue", None, 1),
+            // `+Mlpm` — lock all physical memory.
+            ("+Mlpmno", None, 1),
+        ];
+        for (switch, next, expected) in cases {
+            let mut argv = vec![switch.to_string()];
+            if let Some(next) = next {
+                argv.push(next.to_string());
+            }
+            let result = parse_allocator(switch, &argv, 0);
+            assert_eq!(
+                result.expect("a documented `+M*` spelling must be accepted"),
+                *expected,
+                "{argv:?} must consume {expected} token(s)"
+            );
+        }
+    }
+
+    /// The `+M*` grammar's **rejected** letters and values.
+    ///
+    /// Oracle: `+Mfoo`, `+M`, `+MMscs bogus`, `+MBas chaosff` all exit 1.
+    #[test]
+    fn allocator_rejects_unknown_letters_and_values() {
+        for (switch, next) in [
+            ("+Mfoo", None),
+            ("+M", None),
+            ("+MMscs", Some("bogus")),
+            ("+MBas", Some("chaosff")),
+            ("+MYe", Some("false")),
+            ("+Mlpm", Some("maybe")),
+        ] {
+            let mut argv = vec![switch.to_string()];
+            if let Some(next) = next {
+                argv.push(next.to_string());
+            }
+            assert!(
+                parse_allocator(switch, &argv, 0).is_err(),
+                "{argv:?} must be rejected"
+            );
+        }
+    }
+
+    /// The five per-allocator **capability gates** (`erl_alloc.c:676-760`,
+    /// `1296,1423,1454,1531`).
+    ///
+    /// Oracle: `+MIe false`, `+MTe false`, `+MIt true`, `+MIcp B`, `+MTacul 50` all
+    /// exit 1 — `literal_alloc` allows none of the three, `temp_alloc` only `t true`.
+    #[test]
+    fn allocator_capability_gates_reject_what_the_c_c_rejects() {
+        let cases: &[(&str, &str)] = &[
+            // `literal_alloc` (`I`) cannot be disabled …
+            ("+MIe", "false"),
+            // … nor can `temp_alloc` (`T`).
+            ("+MTe", "false"),
+            // `literal_alloc` does not allow the thread-specific `t true`.
+            ("+MIt", "true"),
+            // `literal_alloc` disallows carrier migration (`cp`).
+            ("+MIcp", "B"),
+            // `temp_alloc` disallows carrier migration (`acul`).
+            ("+MTacul", "50"),
+        ];
+        for (switch, value) in cases {
+            let argv = args(&[switch, value]);
+            assert!(
+                parse_allocator(switch, &argv, 0).is_err(),
+                "[{switch} {value}] must be rejected by the capability gate"
+            );
+        }
+        // The same values are accepted where the capability *is* allowed: a normal
+        // alloc-util allocator (`B`) may be disabled / migrated.
+        assert_eq!(parse_allocator("+MBe", &args(&["+MBe", "false"]), 0).expect("allowed"), 2);
+        assert_eq!(parse_allocator("+MBcp", &args(&["+MBcp", "B"]), 0).expect("allowed"), 2);
+        // … and `-Mu*` bypasses the gates (`u_switch = 1`).
+        assert_eq!(parse_allocator("+Mue", &args(&["+Mue", "false"]), 0).expect("allowed"), 2);
+    }
+
+    /// The per-token value reader (`erl_alloc.c:get_value`, 1115-1131): the text after
+    /// the option name **within the same token** is the value; only when it is empty is
+    /// the next token used, and a next token of exactly `--` is never a value.
+    #[test]
+    fn allocator_reads_the_in_token_value_before_the_next_token() {
+        let next_index = |switch: &str, argv: &[&str]| {
+            parse_allocator(switch, &args(argv), 0)
+                .expect("the documented spelling must be accepted")
+        };
+        // In-token text wins and consumes no extra token.
+        assert_eq!(next_index("+MMscs1024", &["+MMscs1024"]), 1);
+        // An empty in-token remainder falls through to the next token.
+        assert_eq!(next_index("+MMscs", &["+MMscs", "1024"]), 2);
+        // A missing value (end of argv, or `--`) is an error, never an empty value.
+        assert!(parse_allocator("+MMscs", &args(&["+MMscs"]), 0).is_err());
+        assert!(parse_allocator("+MMscs", &args(&["+MMscs", "--"]), 0).is_err());
+    }
+
+    /// `-M*` is **accepted unvalidated** (the oracle's `erlexec` never forwards it to the
+    /// emulator: `erlexec.c:865`), and — unlike a `+M*` value — its next token is **not**
+    /// consumed.
+    ///
+    /// Oracle: `-Mfoo`, `-M`, `-Mea 1024` all exit 0.
+    #[test]
+    fn allocator_dash_m_is_unvalidated_and_consumes_no_value() {
+        // Any body is accepted, including one a `+M*` flag would reject, and the index
+        // only ever advances past the switch itself.
+        for switch in ["-Mfoo", "-M", "-MMscs", "-Mea"] {
+            assert_eq!(
+                parse_allocator(switch, &args(&[switch]), 0).expect("unvalidated"),
+                1,
+                "{switch}"
+            );
+        }
+        // The next token is *not* consumed, so `-Mea 1024` leaves `1024` as a stray
+        // argument (the oracle instead treats it as the flag's value — a documented
+        // divergence of the pass-through).
+        let argv = args(&["-Mea", "1024"]);
+        assert_eq!(parse_allocator("-Mea", &argv, 0).expect("unvalidated"), 1);
+        // A `+M*` value *is* consumed whenever the option has one (`erl_alloc.c`'s
+        // `get_value`), which is the whole difference.
+        assert_eq!(
+            parse_allocator("+MMscs", &args(&["+MMscs", "1024"]), 0).expect("validated"),
+            2
+        );
+    }
+
+    /// **Known divergence (reported, not fixed here):** the `-Mea` arm of the C
+    /// (`erl_alloc.c:1733-1783`, `argv[i][3] == 'a'`) is not reproduced — the validator
+    /// looks for the text `ea` *after* the `e`, so both `+Mea <value>` and
+    /// `+Mea<value>` are rejected where the oracle accepts `min`/`max`/`r9c`/`r10b`/`r11b`
+    /// (`erl +Mea min -noshell -eval 'halt(0).'` exits 0).
+    #[test]
+    fn allocator_mea_is_a_known_divergence() {
+        for argv in [args(&["+Mea", "min"]), args(&["+Meamin"])] {
+            assert!(
+                parse_allocator(&argv[0], &argv, 0).is_err(),
+                "{argv:?}: the current validator rejects it (the oracle accepts it)"
+            );
+        }
+    }
+}
