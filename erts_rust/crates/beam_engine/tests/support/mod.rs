@@ -674,6 +674,17 @@ impl ExecutionContext for ModuleHost {
 // The local BIF floor
 // ---------------------------------------------------------------------------
 
+/// The capability the host's `persistent_term:get/1,2` refusal names — the
+/// missing **NIF library**, not a bad argument.
+///
+/// Passed as the `what` fragment of [`beam_engine::unsupported`], so the typed
+/// error the host returns is a [`BeamError::Raise`] whose reason atom is
+/// `unsupported_opcode: {PERSISTENT_TERM_CAPABILITY}`. Exposed so a blocked probe
+/// can assert that exact reason instead of a substring of it.
+pub const PERSISTENT_TERM_CAPABILITY: &str =
+    "persistent_term:get/1,2 (the test host loads no NIF libraries: the \
+     persistent-term store is a NIF behind `erl_features:keywords/0`)";
+
 /// A binary arithmetic operator.
 #[derive(Clone, Copy)]
 enum Arith {
@@ -867,6 +878,9 @@ mod guard {
             // `atom_to_list/1` — `filename` turns path components (atoms) into
             // strings with it.
             ("erlang", "atom_to_list", 1) => Some(self.atom_to_list(args)),
+            // `list_to_atom/1` — the inverse (`eunit_lib:split_node/1` rebuilds a
+            // node's name/host atoms from the character list it split).
+            ("erlang", "list_to_atom", 1) => Some(self.list_to_atom(args)),
             // `phash/2` — the portable hash `dict` buckets its keys with.
             ("erlang", "phash", 2) => Some(self.phash(args)),
             // `system_info/1` — `filename` branches on `os_type`.
@@ -931,6 +945,17 @@ mod guard {
             // `lists:keyfind/3` is a `lists` NIF too (`erl_bif_lists.c:keyfind`);
             // `io_lib_format:get_option/3` looks a format option up with it.
             ("lists", "keyfind", 3) => Some(self.keyfind(args)),
+            // The **NIF** modules. `persistent_term:get/1,2` is a NIF: the real
+            // `.beam`'s body is the `erlang:nif_error/1` stub, and the store behind
+            // it (`erts_internal`'s persistent-term table) exists in no host here —
+            // the test host loads no NIF library. The stub's opaque `badarg` would
+            // hide *which* facility is missing, so the host answers with a typed
+            // error naming it instead (still an error, never a fabricated value).
+            // Reached from `erl_features:keywords/0`, hence from
+            // `erl_scan:reserved_word/1` and every `io_lib` atom writer built on it.
+            ("persistent_term", "get", 1) | ("persistent_term", "get", 2) => {
+                Some(Err(beam_engine::unsupported(PERSISTENT_TERM_CAPABILITY)))
+            }
             // These raise on the invalid-argument paths the tests deliberately
             // avoid; a typed error is the correct outward behavior.
             ("erlang", "error", 1) | ("erlang", "error", 2) | ("erlang", "error", 3) => {
@@ -1212,6 +1237,33 @@ mod guard {
             .to_string();
         let chars: Vec<Eterm> = name.chars().map(|c| make_small(i64::from(c as u32))).collect();
         terms::make_list(self, &chars)
+    }
+
+    /// `list_to_atom(List)` — the atom whose Latin-1 name is the byte list
+    /// `List`, interned into the shared table (the real BIF's inverse of
+    /// [`atom_to_list`](Self::atom_to_list)). A non-list, an improper list, an
+    /// element that is not an integer, an element outside `0..=255`, or a name
+    /// longer than the runtime's `MAX_ATOM_CHARACTERS` (255) is a `badarg`,
+    /// matching the real BIF.
+    fn list_to_atom(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let list = args.first().copied().ok_or(BeamError::BadArg)?;
+        let elements = terms::list_elements(list)?;
+        if elements.len() > 255 {
+            return Err(BeamError::BadArg);
+        }
+        let mut name = String::with_capacity(elements.len());
+        for element in elements {
+            if !is_small(element) {
+                return Err(BeamError::BadArg);
+            }
+            let byte = signed_value(element);
+            if !(0..=255).contains(&byte) {
+                return Err(BeamError::BadArg);
+            }
+            // Latin-1: the byte `b` is the character `U+00b` (`233` is `é`).
+            name.push(char::from(byte as u8));
+        }
+        Ok(make_atom(self.atoms.intern(&name)))
     }
 
     /// `integer_to_list(Integer)` — the base-10 character list of a **small**

@@ -33,12 +33,13 @@
 
 mod support;
 
-use beam_common::BeamError;
+use beam_common::{BeamError, ExceptionClass};
 use beam_engine::terms;
 use beam_term::{make_small, Eterm};
 use support::{
     all_otp_ebins, assert_atom, assert_int_list, assert_small, assert_str, assert_term, chars,
     int_list, skip_reason, stdlib_ebin, term_list, term_tuple, ModuleHost,
+    PERSISTENT_TERM_CAPABILITY,
 };
 
 // ---------------------------------------------------------------------------
@@ -107,9 +108,11 @@ fn apps_syntax_tools_erl_syntax_tree_round_trip() {
     let value = run(&mut host, "erl_syntax", "atom_value", &[tree]);
     assert_atom(&host, value, "foo");
 
-    // oracle: erl_syntax:atom_literal(erl_syntax:atom(foo)) = "foo"
-    let literal = run(&mut host, "erl_syntax", "atom_literal", &[tree]);
-    assert_str(&host, literal, "foo");
+    // `erl_syntax:atom_literal(erl_syntax:atom(foo))` would be `"foo"` in the
+    // oracle, but the rendering goes through `io_lib`'s atom writer, which asks
+    // `erl_features:keywords/0` → `persistent_term:get/2` — a **NIF** the host
+    // cannot load. It is pinned in
+    // [`blocked_targets_report_their_typed_error`] instead of being asserted here.
 
     // oracle: erl_syntax:type(erl_syntax:integer(42)) = integer
     let forty_two = make_small(42);
@@ -303,10 +306,9 @@ fn apps_inets_httpd_util_pure_helpers() {
     let got = run(&mut host, "httpd_util", "uniq", &[list]);
     assert_int_list(&host, got, &[1, 2]);
 
-    // oracle: httpd_util:module_validate(httpd_file) = ok
-    let module = host.intern("httpd_file");
-    let got = run(&mut host, "httpd_util", "module_validate", &[module]);
-    assert_atom(&host, got, "ok");
+    // `httpd_util:module_validate(httpd_file)` would be `ok` in the oracle, but it
+    // asks `code:which/1` — a **code-server** query — so it is pinned in
+    // [`blocked_targets_report_their_typed_error`] rather than asserted here.
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +452,12 @@ fn apps_dialyzer_utils_options_and_family() {
 
 /// `asn1ct_pretty_format:term/1` renders an ASN.1 value as Erlang source — pure
 /// tuple/list character building (integers mixed into strings).
+///
+/// Only the **integer** form executes here: every form that renders an *atom* goes
+/// through `io_lib`'s atom writer, which asks `erl_scan:reserved_word/1` →
+/// `erl_features:keywords/0` → `persistent_term:get/2` — a NIF this host cannot
+/// load. The atom-bearing forms are pinned in
+/// [`blocked_targets_report_their_typed_error`].
 #[test]
 fn apps_asn1_pretty_format_term() {
     if skip_if_unavailable() {
@@ -460,34 +468,6 @@ fn apps_asn1_pretty_format_term() {
     // oracle: asn1ct_pretty_format:term(42) = "42"
     let got = run(&mut host, "asn1ct_pretty_format", "term", &[make_small(42)]);
     assert_str(&host, got, "42");
-
-    // oracle: asn1ct_pretty_format:term({foo,bar}) =
-    //   [123,["foo",44,"bar"],125]   ("{foo,bar}" as a deep char list)
-    let foo = host.intern("foo");
-    let bar = host.intern("bar");
-    let input = term_tuple(&mut host, &[foo, bar]);
-    let got = run(&mut host, "asn1ct_pretty_format", "term", &[input]);
-    let foo_str = chars(&mut host, "foo");
-    let comma = make_small(44);
-    let bar_str = chars(&mut host, "bar");
-    let inner = term_list(&mut host, &[foo_str, comma, bar_str]);
-    let lbrace = make_small(123);
-    let rbrace = make_small(125);
-    let expected = term_list(&mut host, &[lbrace, inner, rbrace]);
-    assert_term(&host, got, expected);
-
-    // oracle: asn1ct_pretty_format:term([a,b]) = [91,"a",44,"b",93]
-    let a = host.intern("a");
-    let b = host.intern("b");
-    let input = term_list(&mut host, &[a, b]);
-    let got = run(&mut host, "asn1ct_pretty_format", "term", &[input]);
-    let lbracket = make_small(91);
-    let a_str = chars(&mut host, "a");
-    let comma = make_small(44);
-    let b_str = chars(&mut host, "b");
-    let rbracket = make_small(93);
-    let expected = term_list(&mut host, &[lbracket, a_str, comma, b_str, rbracket]);
-    assert_term(&host, got, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +586,41 @@ fn apps_parsetools_error_formatters() {
 // Blocked targets (asserted loudly, never silently passed)
 // ---------------------------------------------------------------------------
 
+/// Asserts a blocked probe stopped at the host floor's typed BEAM `badarg` (the
+/// answer a NIF-stub / code-server chain bottoms out in), printing the host
+/// capability the target is missing.
+fn assert_blocked_badarg(target: &str, capability: &str, err: &BeamError) {
+    println!("SKIP: {target} — needs {capability}: {err:?}");
+    assert!(
+        matches!(err, BeamError::BadArg),
+        "unexpected `{target}` typed error: {err:?}"
+    );
+    assert_eq!(
+        err.as_atom(),
+        Some("badarg"),
+        "`{target}` must be the typed BEAM `badarg`"
+    );
+}
+
+/// Asserts a blocked probe stopped at the host floor's typed `unsupported_opcode`
+/// refusal **whose reason names the missing capability** (`capability`, the exact
+/// fragment the floor passed to `beam_engine::unsupported`), printing it too.
+fn assert_blocked_unsupported(target: &str, capability: &str, err: &BeamError) {
+    let expected = format!("unsupported_opcode: {capability}");
+    println!("SKIP: {target} — needs {capability}: {err:?}");
+    match err {
+        BeamError::Raise(raise) => assert_eq!(
+            raise.reason.as_atom(),
+            Some(expected.as_str()),
+            "unexpected `{target}` typed error: {err:?}"
+        ),
+        other => panic!(
+            "`{target}` must raise the typed `unsupported_opcode` refusal naming its \
+             missing capability, got {other:?}"
+        ),
+    }
+}
+
 /// Blocks that the host/engine still cannot serve, each asserted to be a **typed**
 /// error — never a wrong value and never a hang.
 ///
@@ -616,8 +631,19 @@ fn apps_parsetools_error_formatters() {
 /// * `asn1ct:use_legacy_types/0` / `get_bit_string_format/0` read the **process
 ///   dictionary** (`erlang:get/1`), which this host does not serve — the real
 ///   runtime supplies it through `beam_rt`'s `DictHook`, not the engine.
+/// * `httpd_util:module_validate/1` asks `code:which/1`, which resolves a module
+///   through the **code server** (`code_server:is_loaded/1` → the `ets:lookup/2`
+///   NIF). The host serves neither, so the chain stops at the floor's typed
+///   `badarg` — the same pin `tests/stdlib_sweep.rs` records for `code:which/1`
+///   itself.
+/// * `erl_syntax:atom_literal/1` and `asn1ct_pretty_format:term/1` render a term
+///   through `io_lib`'s atom writer (`io_lib:write_atom_as_latin1/1`), which asks
+///   `erl_scan:reserved_word/1` → `erl_features:keywords/0` →
+///   `persistent_term:get/2` — a **NIF**, and this host loads no NIF library, so
+///   the reason *names* that missing capability instead of a bare `badarg`.
 /// * `httpd_util:create_etag/1` demands a `#file_info{}` **record**, so a plain
-///   tuple is the record-semantics `badrecord` failure the engine raises.
+///   tuple is the record-semantics `badrecord` failure the engine raises — as a
+///   **structured** reason, exactly as the oracle does.
 #[test]
 fn blocked_targets_report_their_typed_error() {
     if skip_if_unavailable() {
@@ -631,10 +657,10 @@ fn blocked_targets_report_their_typed_error() {
     let err = host
         .call("asn1ct", "use_legacy_types", &[])
         .expect_err("`asn1ct:use_legacy_types/0` needs the process dictionary");
-    println!("SKIP: asn1ct:use_legacy_types/0 — {err:?}");
-    assert!(
-        matches!(err, BeamError::BadArg),
-        "unexpected `asn1ct:use_legacy_types/0` error: {err:?}"
+    assert_blocked_badarg(
+        "asn1ct:use_legacy_types/0",
+        "the process dictionary (`erlang:get/1`)",
+        &err,
     );
 
     // `asn1ct:get_bit_string_format/0` is likewise `get(bit_string_format)`.
@@ -642,15 +668,92 @@ fn blocked_targets_report_their_typed_error() {
     let err = host
         .call("asn1ct", "get_bit_string_format", &[])
         .expect_err("`asn1ct:get_bit_string_format/0` needs the process dictionary");
-    println!("SKIP: asn1ct:get_bit_string_format/0 — {err:?}");
-    assert!(
-        matches!(err, BeamError::BadArg),
-        "unexpected `asn1ct:get_bit_string_format/0` error: {err:?}"
+    assert_blocked_badarg(
+        "asn1ct:get_bit_string_format/0",
+        "the process dictionary (`erlang:get/1`)",
+        &err,
     );
 
+    // ---- code server -----------------------------------------------------
+    // `httpd_util:module_validate/1` is `case code:which(Module) of …`; `code`'s
+    // own `which/1` reaches `code_server:is_loaded/1`, which looks the module up in
+    // the code server's ETS table (`ets:lookup/2`, a NIF). The host has no code
+    // server, so the whole chain is a typed `badarg`.
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[httpd_util:module_validate(httpd_file)]),halt().'
+    //         ok
+    let module = host.intern("httpd_file");
+    let err = host
+        .call("httpd_util", "module_validate", &[module])
+        .expect_err("`httpd_util:module_validate/1` needs `code:which/1` (a code server)");
+    assert_blocked_badarg(
+        "httpd_util:module_validate/1",
+        "`code:which/1` — a live code server over the `ets` NIF surface",
+        &err,
+    );
+
+    // ---- `io_lib`'s atom writer (a NIF-backed feature lookup) -------------
+    // `erl_syntax:atom_literal/1` → `io_lib:write_atom_as_latin1/1`, which quotes
+    // the atom via `erl_scan:reserved_word/1` → `erl_features:keywords/0` →
+    // `persistent_term:get/2`. `persistent_term` is a **NIF** module (its `.beam`
+    // body is the `erlang:nif_error/1` stub), so the host answers with a typed
+    // refusal that names that capability.
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[erl_syntax:atom_literal(erl_syntax:atom(foo))]),halt().'
+    //         "foo"
+    let foo = host.intern("foo");
+    let tree = run(&mut host, "erl_syntax", "atom", &[foo]);
+    let err = host
+        .call("erl_syntax", "atom_literal", &[tree])
+        .expect_err("`erl_syntax:atom_literal/1` needs the `persistent_term` NIF");
+    assert_blocked_unsupported(
+        "erl_syntax:atom_literal/1",
+        PERSISTENT_TERM_CAPABILITY,
+        &err,
+    );
+
+    // `asn1ct_pretty_format:term/1` renders every form that contains an **atom**
+    // through the same `io_lib` atom writer, so a tuple of atoms and a list of
+    // atoms are both blocked by the unloaded `persistent_term` NIF — a *host*
+    // facility, not an engine opcode. (`term(42)` executes above.)
+    //
+    // oracle: asn1ct_pretty_format:term({foo,bar}) = [123,["foo",44,"bar"],125]
+    //         asn1ct_pretty_format:term([a,b]) = [91,"a",44,"b",93]
+    let bar = host.intern("bar");
+    let input = term_tuple(&mut host, &[foo, bar]);
+    let err = host
+        .call("asn1ct_pretty_format", "term", &[input])
+        .expect_err("`asn1ct_pretty_format:term/1` needs the `persistent_term` NIF");
+    assert_blocked_unsupported(
+        "asn1ct_pretty_format:term/1 ({foo,bar})",
+        PERSISTENT_TERM_CAPABILITY,
+        &err,
+    );
+
+    let a = host.intern("a");
+    let b = host.intern("b");
+    let input = term_list(&mut host, &[a, b]);
+    let err = host
+        .call("asn1ct_pretty_format", "term", &[input])
+        .expect_err("`asn1ct_pretty_format:term/1` needs the `persistent_term` NIF");
+    assert_blocked_unsupported(
+        "asn1ct_pretty_format:term/1 ([a,b])",
+        PERSISTENT_TERM_CAPABILITY,
+        &err,
+    );
+
+    // ---- a structured raise reason ---------------------------------------
     // `httpd_util:create_etag/1` matches a `#file_info{}` record, so the plain
-    // tuple below is the `badrecord` the engine must raise (the oracle also
-    // raises `error:{badrecord, _}` for this input).
+    // tuple below is the `badrecord` the engine must raise.
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[catch httpd_util:create_etag({x,{2000,1,1},0})]),halt().'
+    //         {'EXIT',{{badrecord,{x,{2000,1,1},0}},[…]}}
+    //
+    // A tuple reason is **structured**: the engine raises a `BeamError::Raise` that
+    // *carries the live `{badrecord, Value}` term* in its `live_reason` slot, so
+    // `raise.reason.as_atom()` is `None` (the `ExitReason::Structured` sentinel).
+    // Asserting a `badrecord` atom here would assert a shape the engine does not
+    // produce, so the structured term itself is unwrapped and pinned.
     let date = term_tuple(&mut host, &[make_small(2000), make_small(1), make_small(1)]);
     let name = chars(&mut host, "x");
     let size = make_small(0);
@@ -658,13 +761,36 @@ fn blocked_targets_report_their_typed_error() {
     let err = host
         .call("httpd_util", "create_etag", &[bogus])
         .expect_err("`httpd_util:create_etag/1` needs a `#file_info{}` record");
-    println!("SKIP: httpd_util:create_etag/1 — {err:?}");
-    match &err {
-        BeamError::Raise(raise) => assert_eq!(
-            raise.reason.as_atom(),
-            Some("badrecord"),
-            "unexpected `httpd_util:create_etag/1` typed error: {err:?}"
-        ),
-        other => panic!("`httpd_util:create_etag/1` must raise `badrecord`, got {other:?}"),
-    }
+    println!("SKIP: httpd_util:create_etag/1 — needs a `#file_info{{}}` record: {err:?}");
+    let BeamError::Raise(raise) = &err else {
+        panic!("`httpd_util:create_etag/1` must raise, got {err:?}");
+    };
+    assert_eq!(
+        raise.class,
+        ExceptionClass::Error,
+        "the `badrecord` failure is an `error` class raise: {err:?}"
+    );
+    assert!(
+        raise.reason.as_atom().is_none(),
+        "the `{{badrecord, _}}` reason is structured, not a bare atom: {err:?}"
+    );
+    let reason = *raise
+        .live_reason()
+        .and_then(|live| live.downcast_ref::<Eterm>())
+        .unwrap_or_else(|| panic!("the raise must carry the live reason term: {err:?}"));
+    assert_eq!(
+        terms::tuple_arity(reason).expect("the live reason is a tuple"),
+        2,
+        "the live reason must be `{{badrecord, Value}}`: {reason:?}"
+    );
+    assert_atom(
+        &host,
+        terms::tuple_element(reason, 0).expect("the reason tag"),
+        "badrecord",
+    );
+    assert_term(
+        &host,
+        terms::tuple_element(reason, 1).expect("the offending term"),
+        bogus,
+    );
 }
