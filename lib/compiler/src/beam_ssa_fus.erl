@@ -123,13 +123,17 @@ ssa_opt_fus({#opt_st{ssa=Blocks0}=St, FuncDb}) ->
 
 %% Eligibility precondition used by the opt-in per-pass budget/watchdog
 %% driver (`beam_ssa_opt_budget', wired in `beam_ssa_opt:gate/1'): true when
-%% the function contains a block that ends with a `has_map_field' test whose
-%% success edge starts with a `get_map_element' of the same key.
+%% the function contains a block whose last instruction is a `has_map_field'
+%% test on the same variable as the block's conditional branch, and whose
+%% success edge starts with a `get_map_element' of the same map and key.
+%% These are exactly the conditions `fuse_blk/3' tests before it does any
+%% work, so a pass for which the gate is false cannot change the code.
 %%
 %% This is only a NECESSARY condition - a cheap filter that lets the driver
 %% skip the pass for functions that cannot fuse anything. Whether the fusion
-%% is actually legal (the map operand must be type-proven to be a map) is
-%% decided by the pass itself.
+%% is actually legal (the map operand must be type-proven to be a map, the
+%% extraction must be the only thing on the success edge, ...) is decided by
+%% the pass itself.
 -spec eligible({#opt_st{}, term()}) -> boolean().
 eligible({#opt_st{ssa=SSA}, _FuncDb}) ->
     has_candidate(maps:from_list(normalize(SSA))).
@@ -138,9 +142,9 @@ has_candidate(Blocks) ->
     lists:any(fun({_L,Blk}) -> candidate_block(Blk, Blocks) end,
               maps:to_list(Blocks)).
 
-candidate_block(#b_blk{is=Is,last=#b_br{succ=LSucc}}, Blocks) ->
+candidate_block(#b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc}}, Blocks) ->
     case lists:reverse(Is) of
-        [#b_set{op=has_map_field,args=[Map,Key]}, _|_] ->
+        [#b_set{op=has_map_field,dst=Bool,args=[Map,Key]}|_] ->
             candidate_succ(Blocks, LSucc, Map, Key);
         _ ->
             false
