@@ -30,11 +30,13 @@
 //! # The `~p` printable-string rule
 //!
 //! With `printable = true` (the `~p`/`~P` directives) a **non-empty proper list
-//! whose every element is a small integer in `32..=126`** renders as a `"…"`
-//! string, escaping `"` and `\`; `~w` (`printable = false`) never applies the
-//! rule. So `~p` of `"abc"` is `"abc"` while `~w` of `"abc"` is `[97,98,99]`, and
-//! `~p` of `[]` is `[]` (the rule requires a *non-empty* list). The same rule is
-//! applied to **binaries**, which then render as `<<"…">>`.
+//! whose every element is a printable latin1 character** (`16#20..=16#7E`,
+//! `16#A0..=16#FF`, or one of `\t \n \r \v \b \f \e`) renders as a `"…"` string,
+//! escaping `"`, `\` and those control characters (and leaving `16#A0..=16#FF`
+//! verbatim); `~w` (`printable = false`) never applies the rule. So `~p` of
+//! `"abc"` is `"abc"` while `~w` of `"abc"` is `[97,98,99]`, and `~p` of `[]` is
+//! `[]` (the rule requires a *non-empty* list). The same rule is applied to
+//! **binaries**, which then render as `<<"…">>`.
 //!
 //! # Maps
 //!
@@ -257,21 +259,21 @@ pub(crate) fn is_reflowable(term: Eterm) -> bool {
     false
 }
 
-/// Whether `term` is a non-empty proper list of small integers in `32..=126`
-/// (the printable-string rule).
+/// Whether `term` is a non-empty proper list of printable latin1 characters (the
+/// printable-string rule; see [`char_printable`]).
 fn list_printable(term: Eterm) -> bool {
     match proper_list(term) {
         Some(elems) if !elems.is_empty() => {
-            elems.iter().all(|&e| is_small(e) && (32..=126).contains(&signed_value(e)))
+            elems.iter().all(|&e| is_small(e) && char_printable(signed_value(e)))
         }
         _ => false,
     }
 }
 
-/// Whether `term` is a non-empty binary whose every byte is in `32..=126`.
+/// Whether `term` is a non-empty binary whose every byte is printable latin1.
 fn binary_printable(term: Eterm) -> bool {
     match bits::bytes(term) {
-        Ok(bytes) if !bytes.is_empty() => bytes.iter().all(|&b| (32..=126).contains(&b)),
+        Ok(bytes) if !bytes.is_empty() => bytes.iter().all(|&b| latin1_printable_char(b)),
         _ => false,
     }
 }
@@ -339,6 +341,13 @@ fn latin1_printable_char(c: u8) -> bool {
     (0x20..=0x7E).contains(&c)
         || (0xA0..=0xFF).contains(&c)
         || matches!(c, 0x09 | 0x0A | 0x0D | 0x0B | 0x08 | 0x0C | 0x1B)
+}
+
+/// [`latin1_printable_char`] for a small integer's value: the value must be a byte
+/// (`0..=255`) that is a printable latin1 character. A value outside the byte
+/// range is never printable.
+fn char_printable(value: i64) -> bool {
+    (0..=255).contains(&value) && latin1_printable_char(value as u8)
 }
 
 /// `io_lib_pretty`'s `{{bin, S}}` re-flow for a **non-printable byte-aligned**
@@ -1181,8 +1190,8 @@ fn render_bitstring_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Ch
         Chunk::Char('>'),
     ]))
 }
-/// The byte values of `term` iff it is a non-empty proper list of small integers
-/// in `32..=126` (the `~p` printable-string rule).
+/// The byte values of `term` iff it is a non-empty proper list of printable latin1
+/// characters (the `~p` printable-string rule; see [`char_printable`]).
 fn printable_string(term: Eterm) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut cur = term;
@@ -1192,7 +1201,7 @@ fn printable_string(term: Eterm) -> Option<Vec<u8>> {
             return None;
         }
         let value = signed_value(head);
-        if !(32..=126).contains(&value) {
+        if !char_printable(value) {
             return None;
         }
         bytes.push(value as u8);
@@ -1204,22 +1213,33 @@ fn printable_string(term: Eterm) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Whether every byte is in `32..=126` and the binary is non-empty (the `~p`
+/// Whether every byte is printable latin1 and the binary is non-empty (the `~p`
 /// printable-binary rule, mirroring [`printable_string`]).
 fn printable_bytes(bytes: &[u8]) -> bool {
-    !bytes.is_empty() && bytes.iter().all(|&b| (32..=126).contains(&b))
+    !bytes.is_empty() && bytes.iter().all(|&b| latin1_printable_char(b))
 }
 
-/// Renders `bytes` as a double-quoted string, escaping `"` and `\`.
+/// Renders `bytes` as a double-quoted string, escaping `"`, `\` and the latin1
+/// control characters the oracle's `io_lib:string_char/4` escapes (`\b \t \n \v \f
+/// \r \e`). Bytes `16#A0..=16#FF` are emitted verbatim as their Unicode code point
+/// (the enclosing [`Chunk`] is a Rust `String`, so the oracle's UTF-8 output — e.g.
+/// `c2 a0` for `16#A0` — comes out byte-for-byte).
 fn quoted_string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
     for &byte in bytes {
-        let ch = byte as char;
-        if ch == '"' || ch == '\\' {
-            out.push('\\');
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            0x08 => out.push_str("\\b"),
+            0x09 => out.push_str("\\t"),
+            0x0A => out.push_str("\\n"),
+            0x0B => out.push_str("\\v"),
+            0x0C => out.push_str("\\f"),
+            0x0D => out.push_str("\\r"),
+            0x1B => out.push_str("\\e"),
+            _ => out.push(char::from(byte)),
         }
-        out.push(ch);
     }
     out.push('"');
     out

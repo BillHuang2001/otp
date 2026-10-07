@@ -268,13 +268,24 @@ fn nonprintable_binary_reflow_matches_the_oracle() {
 }
 
 #[test]
-fn unsupported_reflow_forms_stay_a_typed_badarg() {
-    // An all-printable (latin1) binary is the oracle's quoted-string leaf
-    // (`io_lib:printable_bin0/5` is `{true, …}`), which this model does not
-    // reproduce — refused rather than packed.
+fn latin1_printable_binaries_are_the_oracles_string_leaf() {
+    // A `16#A0` byte IS a printable latin1 character (`16#A0..=16#FF`), so the
+    // oracle takes `io_lib:printable_bin0/5`'s `{true, …}` arm and prints the
+    // quoted-string leaf on ONE line however long — never re-flowed. The bytes are
+    // UTF-8, so each `16#A0` is `c2 a0`:
+    //     io:format("~p", [list_to_binary(lists:duplicate(100, 16#A0))])
+    //     => <<"…………………">>   (204 bytes)
     let reg = default_registry();
-    let (_out, result) = run_io(&reg, b"~p", |ctx, reg| binary(ctx, reg, &[0xA0u8; 100]));
-    assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
+    let (out, result) = run_io(&reg, b"~p", |ctx, reg| binary(ctx, reg, &[0xA0u8; 100]));
+    assert!(result.is_ok(), "{result:?}");
+    let want = format!("<<\"{}\">>", "\u{a0}".repeat(100));
+    assert_eq!(String::from_utf8(out).expect("UTF-8"), want);
+}
+
+#[test]
+fn reflow_forms_not_modelled_stay_a_typed_badarg() {
+    let reg = default_registry();
+
     // A container holding another container is not modelled.
     let (_out, result) = run_io(&reg, b"~p", |ctx, _| {
         let inner = int_list(ctx, 1..=28);
@@ -282,9 +293,58 @@ fn unsupported_reflow_forms_stay_a_typed_badarg() {
     });
     assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
 
-    // A depth-limited `~P` keeps the typed error.
+    // A depth-limited `~P` is not modelled either.
     let (_out, result) = run_io(&reg, b"~100P", |ctx, _| int_list(ctx, 1..=40));
     assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
+
+    // A left-adjusted `~p` has no clause in `io_lib_format` (`io_lib_format:print/12`
+    // only matches the non-left `~p`/`~P`, so the oracle raises `badarg` for it).
+    let (_out, result) = run_io(&reg, b"~-p", |ctx, _| int_list(ctx, 1..=4));
+    assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
+}
+
+#[test]
+fn the_latin1_printable_rule_and_its_escapes_match_the_oracle() {
+    // `io:format("~p", [L])` on the OTP 29.1.1 oracle (printable range = latin1):
+    // a byte is printable iff `16#20..=16#7E`, `16#A0..=16#FF`, or one of the
+    // control characters `\t \n \r \v \b \f \e` (`16#09 16#0A 16#0D 16#0B 16#08
+    // 16#0C 16#1B`). `16#00` and `16#7F` are NOT printable.
+    let reg = default_registry();
+    let cases: &[(&[u8], &str)] = &[
+        // `~p [10,97]` => "\na" (the newline is a string character, escaped).
+        (&[10, 97], "\"\\na\""),
+        // `~p [0,160,255]` => [0,160,255] (0 is not printable, so not a string).
+        (&[0, 160, 255], "[0,160,255]"),
+        // `~p [159,160]` => [159,160] (159 is not printable).
+        (&[159, 160], "[159,160]"),
+        // `~p [200,201]` => "ÈÉ" (200/201 are printable latin1).
+        (&[200, 201], "\"\u{c8}\u{c9}\""),
+        // `~p [160,160]` => two UTF-8 `c2 a0` between quotes.
+        (&[160, 160], "\"\u{a0}\u{a0}\""),
+    ];
+    for (bytes, want) in cases {
+        let (out, result) = run_io(&reg, b"~p", |ctx, _| byte_list(ctx, bytes));
+        assert!(result.is_ok(), "~p {bytes:?}: {result:?}");
+        assert_eq!(
+            String::from_utf8(out.clone()).expect("UTF-8"),
+            *want,
+            "~p {bytes:?}"
+        );
+    }
+
+    // `~p [9,11,8,12,13,27,92,34]` => "\t\v\b\f\r\e\\\""
+    // (the seven latin1 control escapes, then the escaped `\` and `"`).
+    let (out, result) = run_io(&reg, b"~p", |ctx, _| {
+        byte_list(ctx, &[9, 11, 8, 12, 13, 27, 92, 34])
+    });
+    assert!(result.is_ok(), "{result:?}");
+    let want: String = [
+        '"', '\\', 't', '\\', 'v', '\\', 'b', '\\', 'f', '\\', 'r', '\\', 'e', '\\', '\\', '\\',
+        '"', '"',
+    ]
+    .iter()
+    .collect();
+    assert_eq!(String::from_utf8(out).expect("UTF-8"), want);
 }
 
 #[test]
