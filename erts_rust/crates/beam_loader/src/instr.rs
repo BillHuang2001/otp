@@ -1099,10 +1099,17 @@ pub enum Instr {
     // ---- fallback ----------------------------------------------------------
     /// An opcode the loader deliberately does not model, preserved losslessly.
     ///
-    /// The residual set is documented in `lower`: obsolete `genop.tab` entries
-    /// (which a loader is required to refuse anyway) and the OTP-29 native-record
-    /// family, whose operands need record-descriptor modelling the IR does not own
-    /// yet.
+    /// The residual set is the retired/transform-only `genop.tab` entries the
+    /// compiler never emits: [`Opcode::set_tuple_element`] plus the `-`-prefixed
+    /// obsolete entries (`is_constant/2`, `make_fun2/1`, `allocate_zero/2`, the
+    /// legacy `bs_*` forms, …). The compiler emits none of them, so the census over
+    /// the installed stdlib/kernel/compiler modules is empty
+    /// (`tests/generic_census.rs`) — no module lowers to `Generic` in practice.
+    ///
+    /// This variant is reached only from the single catch-all arm in `lower`
+    /// (`src/lower/instr.rs`), which is **opcode-keyed**: every other arm either
+    /// lowers to a named variant or returns a typed error on an operand-shape
+    /// mismatch, so no opcode lowers to `Generic` conditionally.
     Generic {
         /// The opcode.
         op: Opcode,

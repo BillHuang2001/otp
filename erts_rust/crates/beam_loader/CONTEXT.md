@@ -443,13 +443,18 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   a chunk size that overruns the file, an unknown/out-of-range opcode byte, an out-of-range atom/label
   index, a truncated operand varint, a `z` sub-tag `0`/unknown, a structurally wrong `HeapNeed` operand
   and a compressed `LitT` ⇒ each a typed `BeamError` (no panic).
-- **`tests/real_modules.rs`:** loads every `.beam` of the installed OTP `stdlib`/`kernel`/`compiler`
-  `ebin` dirs through the public pipeline and asserts that every discovered module loads (zero failures
-  tolerated: any parse failure fails the test, and each is printed by name with its typed error), plus a
-  floor on the discovered module count. A second test walks the decoded `LitT` literals of the real
-  `maps` and `gen_server` modules and asserts the nested `EXPORT_EXT` funs resolve to their
-  `{module,function,arity}` (`fun maps:remove/2`, `gen_server:format_log/1,2`) — semantic evidence, not a
-  count. Loudly skips when the system `erl`/OTP is unavailable.
+- **`tests/real_modules.rs`:** the broad real-OTP LOAD sweep. The `lib` root is discovered
+  generically — `$ERTS_LIB_DIR` when set, else `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'`
+  (no hardcoded app names) — then every `.beam` under it is collected recursively (each versioned app
+  dir's `ebin`, plus doc/examples & `proper_ext`). On this install that is **34 applications / 1366
+  modules**; every one is loaded through the public pipeline and must load (zero failures tolerated: any
+  parse failure fails the test, and each is printed by relative path with its exact typed error), plus
+  the "loaded but yielded no function" check. Floors are `total ≥ 1000` modules and `app_count ≥ 30`, well
+  below the real counts. A second test walks the decoded `LitT` literals of the real `maps` and
+  `gen_server` modules (via the single-app `app_ebin("stdlib")` helper) and asserts the nested
+  `EXPORT_EXT` funs resolve to their `{module,function,arity}` (`fun maps:remove/2`,
+  `gen_server:format_log/1,2`) — semantic evidence, not a count. Loudly skips when the system `erl`/OTP is
+  unavailable (`skip_reason` still requires `stdlib`+`kernel`).
 - **`tests/widened_ir.rs`** also loads `tests/fixtures/bsalloc.beam` (the `bs_create_bin` `z,3` operand).
 - **`tests/records.rs`:** the `Recs` chunk over `tests/fixtures/records_fixture.beam` — the parsed
   definitions reproduce the pinned `records:get_definition/2` output (declaration order, every default
@@ -468,16 +473,15 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - Cross-checks against the real system ERTS belong to the sibling `../tools/differential/` harness.
 
 ## Known Issues / Intentional M1 gaps
-- **Residual `Instr::Generic` opcodes — 133 of 193 typed, 60 Generic.** 108 opcodes lower to a named
+- **`Instr::Generic` fallback opcodes — 133 of 193 typed, 60 Generic.** 108 opcodes lower to a named
   `Instr` mapping (`src/lower/instr.rs`) and the 25 `is_*`/`test_arity` opcodes to `Instr::Test`, so 133
   of the 193 `genop.tab` opcodes are typed; the other 60 keep `Instr::Generic`. 59 of those are the
   `-`-prefixed obsolete/transform-only entries the compiler never emits (`is_constant/2`, `make_fun2/1`,
   `allocate_zero/2`, the legacy `bs_*` forms, …); the 60th is **`set_tuple_element/3` (opcode 67)** — a
-  non-obsolete `genop.tab` entry that is also never emitted (the compiler emits `put_tuple2`).
-  `tests/generic_census.rs` pins the observed residual set (the installed compiler emits none of them);
-  it is a deliberate, lossless gap — never a wrong result. (The `Instr::Generic` doc comment in
-  `src/instr.rs:1100-1105` still lists the native-record family as unmodelled; that is stale — 186-193
-  all have typed variants.)
+  non-obsolete `genop.tab` entry that is also never emitted (the compiler emits `put_tuple2`). The
+  compiler emits none of the 60, so the observed residual census over the installed stdlib/kernel/compiler
+  modules is **empty** (`tests/generic_census.rs` pins it); it is a deliberate, lossless gap — never a
+  wrong result.
 - **Lowering is strictly 1:1 — no `ops.tab` transform / superinstruction combining.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`; it does not expand multi-instruction sequences nor build the C loader's superinstructions (the C does that from `emu/ops.tab` in `beam_load.c`). A `.beam` file carries only generic opcodes, so this is an engine-side optimization the interpreter does not need — never a correctness gap.
 - **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
 - **Contract A.2 divergences from the C loader (`beam_load.c`/`beam_file.c`), both currently unenforced:**
@@ -522,7 +526,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/` → container/IR/widened-IR/records/negative/real-module integration tests
 - `tests/records.rs` → `Recs`-chunk integration tests: declaration order, every default encoding, name/atom lookups, the pinned-`ORACLE` ↔ live-`erl` `records:get_definition/2` cross-check (bounded), and malformed-image rejection through `load` beside a well-formed control image
 - `tests/generic_census.rs` → the residual `Instr::Generic` census over the installed OTP (asserts the unmodelled-opcode set equals the documented baseline)
-- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
+- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep over the whole `lib` root (all 34 apps / 1366 modules recursively; every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
 - `tests/native_record.rs` → real-module structural check of the OTP-29 native-record family (186-193): the `erl_eval` `is_any_native_record` positive control, a stdlib/kernel/compiler sweep asserting **no** family member lowers to `Instr::Generic`, and a system-`erlc`-compiled native-record module proving 186-191 lower typed; loud skip when `erl`/`erlc`/OTP is absent
 - `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
