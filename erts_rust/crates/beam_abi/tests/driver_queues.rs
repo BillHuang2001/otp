@@ -36,9 +36,9 @@
 //! rewrites it *in place* (`iov_base += skip`, `iov_len -= skip`). The fixture deliberately reuses
 //! one `ErlIOVec`/`SysIOVec` array across calls, so the two runtimes report different bytes there:
 //!
-//! * **command 2** — the oracle reports `bytes4=cdef vecbig=4 bytesbig=cdef`; this runtime reports
-//!   `bytes4=abcd vecbig=6 bytesbig=abcdef`, because the C's earlier `driver_enqv(&ev, 2)` had already
-//!   shrunk the shared `iov2[0]` to `{"cdef", 4}` before the `driver_vec_to_buf` calls read it.
+//! * **command 2** — the fixture hands `driver_pushqv` and `driver_vec_to_buf` fresh vectors, so
+//!   the oracle and this runtime agree byte for byte: `vec4=4 bytes4=abcd vecbig=6 bytesbig=abcdef
+//!   veczero=0`.
 //! * **command 3** — the oracle reports `ev_iov0_len=4 … vector_moved=1`; this runtime reports
 //!   `ev_iov0_len=6 … vector_moved=0` (the base still points at `"abcdef"`). Both agree on the
 //!   queue's own readings (`enqv=0 size=4 vlen=1 entry=4 ev_size=6`).
@@ -84,9 +84,9 @@ peekq_empty_null=1 vlen_empty=0 peekqv_empty=0 ev2.vsize=0";
 
 /// Command 2 — the head/tail variants, the binary forms, `skip` and `vec_to_buf`.
 ///
-/// **Divergence:** the oracle reports `… vec4=4 bytes4=cdef vecbig=4 bytesbig=cdef …` because its
-/// in-place `skip()` had already rewritten the fixture's shared `iov2[0]` (see the file header);
-/// the values below are this runtime's, whose `driver_enqv` only reads the vector.
+/// **Oracle agreement:** `driver_pushqv` and `driver_vec_to_buf` are given fresh vectors by the
+/// fixture, so the oracle reports exactly the string below (its in-place `skip()` can only
+/// rewrite a vector a `*_v` call was actually handed — see command 3).
 const CASE2_REPORT: &str = "push=0,0 size=4 enqbin=0 pushbin=0 zero=0 size2=8 enqv=0 size_mid=12 \
 pushqv=0 size3=14 vec4=4 bytes4=abcd vecbig=6 bytesbig=abcdef veczero=0";
 
