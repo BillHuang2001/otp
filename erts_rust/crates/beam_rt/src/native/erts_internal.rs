@@ -726,8 +726,9 @@ mod tests {
         let float = heap_term(&mut runtime, |ctx| terms::make_float(ctx, 1.0));
         assert_eq!(type_of(&mut runtime, float), "hfloat");
 
-        let list =
-            heap_term(&mut runtime, |ctx| terms::make_list(ctx, &[make_small(1), make_small(2)]));
+        let list = heap_term(&mut runtime, |ctx| {
+            terms::make_list(ctx, &[make_small(1), make_small(2)])
+        });
         assert_eq!(type_of(&mut runtime, list), "list");
 
         let binary = heap_term(&mut runtime, |ctx| terms::make_heap_binary(ctx, &[1, 2]));
@@ -770,7 +771,9 @@ mod tests {
         let mut runtime = runtime();
 
         // documented divergence: the oracle answers `bignum`.
-        let big = eval_heap_term(&mut runtime, |heap| beam_codec::term::make_big(heap, false, &[1]));
+        let big = eval_heap_term(&mut runtime, |heap| {
+            beam_codec::term::make_big(heap, false, &[1])
+        });
         let error = erts(&mut runtime, "term_type", &[big]).expect_err("a bignum is a typed gap");
         assert!(error::unsupported_reason(&error).is_some(), "{error}");
 
@@ -864,7 +867,10 @@ mod tests {
         let tag = terms::tuple_element(reason, 0).expect("the tag");
         assert_eq!(runtime.atom_name_of(tag), Some("badmap"));
         let payload = terms::tuple_element(reason, 1).expect("the offending term");
-        assert_eq!(terms::list_elements(payload).expect("a list"), vec![one, two]);
+        assert_eq!(
+            terms::list_elements(payload).expect("a list"),
+            vec![one, two]
+        );
     }
 
     // -- erts_internal:binary_to_integer/2 ------------------------------------
@@ -886,8 +892,12 @@ mod tests {
             (b"000", 10, 0),
         ] {
             let input = binary(&mut runtime, bytes);
-            let answer = erts(&mut runtime, "binary_to_integer", &[input, make_small(base)])
-                .expect("a small integer");
+            let answer = erts(
+                &mut runtime,
+                "binary_to_integer",
+                &[input, make_small(base)],
+            )
+            .expect("a small integer");
             assert_eq!(signed_value(answer), expected, "{bytes:?} base {base}");
         }
     }
@@ -904,19 +914,44 @@ mod tests {
         let float_base = heap_term(&mut runtime, |ctx| terms::make_float(ctx, 16.0));
         let list_base = heap_term(&mut runtime, |ctx| terms::make_list(ctx, &[make_small(10)]));
 
-        assert_eq!(ok_name(&mut runtime, "binary_to_integer", &[empty, make_small(10)]), "badarg");
-        assert_eq!(ok_name(&mut runtime, "binary_to_integer", &[ten, make_small(37)]), "badarg");
-        assert_eq!(ok_name(&mut runtime, "binary_to_integer", &[ten, make_small(1)]), "badarg");
-        assert_eq!(ok_name(&mut runtime, "binary_to_integer", &[ten, float_base]), "badarg");
-        assert_eq!(ok_name(&mut runtime, "binary_to_integer", &[ten, list_base]), "badarg");
-        assert_eq!(ok_name(&mut runtime, "binary_to_integer", &[spaced, make_small(10)]), "badarg");
         assert_eq!(
-            ok_name(&mut runtime, "binary_to_integer", &[make_small(1), make_small(10)]),
+            ok_name(&mut runtime, "binary_to_integer", &[empty, make_small(10)]),
+            "badarg"
+        );
+        assert_eq!(
+            ok_name(&mut runtime, "binary_to_integer", &[ten, make_small(37)]),
+            "badarg"
+        );
+        assert_eq!(
+            ok_name(&mut runtime, "binary_to_integer", &[ten, make_small(1)]),
+            "badarg"
+        );
+        assert_eq!(
+            ok_name(&mut runtime, "binary_to_integer", &[ten, float_base]),
+            "badarg"
+        );
+        assert_eq!(
+            ok_name(&mut runtime, "binary_to_integer", &[ten, list_base]),
+            "badarg"
+        );
+        assert_eq!(
+            ok_name(&mut runtime, "binary_to_integer", &[spaced, make_small(10)]),
+            "badarg"
+        );
+        assert_eq!(
+            ok_name(
+                &mut runtime,
+                "binary_to_integer",
+                &[make_small(1), make_small(10)]
+            ),
             "badarg"
         );
         // An invalid digit for the base is the same value atom (`<<"z">>,10`).
         let z = binary(&mut runtime, b"z");
-        assert_eq!(ok_name(&mut runtime, "binary_to_integer", &[z, make_small(10)]), "badarg");
+        assert_eq!(
+            ok_name(&mut runtime, "binary_to_integer", &[z, make_small(10)]),
+            "badarg"
+        );
     }
 
     /// Oracle: a magnitude past the small-integer digit count is the **value** atom
@@ -935,8 +970,12 @@ mod tests {
         }
         // 17 digits still fit the small-integer path.
         let seventeen = binary(&mut runtime, b"99999999999999999");
-        let answer = erts(&mut runtime, "binary_to_integer", &[seventeen, make_small(10)])
-            .expect("a small integer");
+        let answer = erts(
+            &mut runtime,
+            "binary_to_integer",
+            &[seventeen, make_small(10)],
+        )
+        .expect("a small integer");
         assert_eq!(signed_value(answer), 99_999_999_999_999_999);
     }
 
@@ -963,7 +1002,11 @@ mod tests {
                 .expect("a value and a rest");
             let (value, tail) = value_and_rest(answer);
             assert_eq!(value, expected, "{text:?} base {base}");
-            assert_eq!(string_of(tail), rest, "{text:?} base {base}: the unconsumed tail");
+            assert_eq!(
+                string_of(tail),
+                rest,
+                "{text:?} base {base}: the unconsumed tail"
+            );
         }
     }
 
@@ -987,9 +1030,15 @@ mod tests {
         );
 
         let foo = atom(&mut runtime, "foo");
-        let not_a_char = heap_term(&mut runtime, |ctx| terms::make_list(ctx, &[foo, make_small(1)]));
+        let not_a_char = heap_term(&mut runtime, |ctx| {
+            terms::make_list(ctx, &[foo, make_small(1)])
+        });
         assert_eq!(
-            ok_name(&mut runtime, "list_to_integer", &[not_a_char, make_small(10)]),
+            ok_name(
+                &mut runtime,
+                "list_to_integer",
+                &[not_a_char, make_small(10)]
+            ),
             "no_integer"
         );
 
@@ -1005,8 +1054,14 @@ mod tests {
         );
 
         let ten = chars(&mut runtime, "10");
-        assert_eq!(ok_name(&mut runtime, "list_to_integer", &[ten, make_small(37)]), "badarg");
-        assert_eq!(ok_name(&mut runtime, "list_to_integer", &[ten, make_small(1)]), "badarg");
+        assert_eq!(
+            ok_name(&mut runtime, "list_to_integer", &[ten, make_small(37)]),
+            "badarg"
+        );
+        assert_eq!(
+            ok_name(&mut runtime, "list_to_integer", &[ten, make_small(1)]),
+            "badarg"
+        );
     }
 
     // -- erts_internal:time_unit/0, perf_counter_unit/0, get_creation/0 -------
@@ -1060,7 +1115,11 @@ mod tests {
     fn processes_next_rejects_a_huge_index_and_a_non_integer() {
         let mut runtime = runtime();
         assert!(matches!(
-            erts(&mut runtime, "processes_next", &[make_small(1_000_000_000_000)]),
+            erts(
+                &mut runtime,
+                "processes_next",
+                &[make_small(1_000_000_000_000)]
+            ),
             Err(BeamError::BadArg)
         ));
         let foo = atom(&mut runtime, "foo");
@@ -1080,7 +1139,8 @@ mod tests {
     #[test]
     fn processes_next_walks_this_runtimes_process_table() {
         let mut runtime = runtime();
-        let answer = erts(&mut runtime, "processes_next", &[make_small(0)]).expect("the first batch");
+        let answer =
+            erts(&mut runtime, "processes_next", &[make_small(0)]).expect("the first batch");
         assert_eq!(terms::tuple_arity(answer).expect("a 2-tuple"), 2);
         let index = terms::tuple_element(answer, 0).expect("the index");
         assert_eq!(signed_value(index), 1, "the next index");
@@ -1093,7 +1153,12 @@ mod tests {
         let limit = terms::list_elements(all).expect("a list").len() as i64;
         let answer =
             erts(&mut runtime, "processes_next", &[make_small(limit)]).expect("at the limit");
-        assert_eq!(terms::tuple_element(answer, 0).map(signed_value).expect("the index"), limit);
+        assert_eq!(
+            terms::tuple_element(answer, 0)
+                .map(signed_value)
+                .expect("the index"),
+            limit
+        );
         assert!(
             terms::list_elements(terms::tuple_element(answer, 1).expect("the batch"))
                 .expect("a list")
@@ -1110,14 +1175,15 @@ mod tests {
     fn term_to_string_renders_one_line_with_the_w_control() {
         let mut runtime = runtime();
         let a = atom(&mut runtime, "a");
-        let tuple = heap_term(&mut runtime, |ctx| terms::make_tuple(ctx, &[a, make_small(1)]));
+        let tuple = heap_term(&mut runtime, |ctx| {
+            terms::make_tuple(ctx, &[a, make_small(1)])
+        });
 
         let text = erts(&mut runtime, "term_to_string", &[tuple]).expect("term_to_string/1");
         assert_eq!(string_of(text), "{a,1}");
 
         let undefined = atom(&mut runtime, "undefined");
-        let text =
-            erts(&mut runtime, "term_to_string", &[tuple, undefined]).expect("the /2 form");
+        let text = erts(&mut runtime, "term_to_string", &[tuple, undefined]).expect("the /2 form");
         assert_eq!(string_of(text), "{a,1}");
     }
 
@@ -1127,7 +1193,9 @@ mod tests {
     fn term_to_string_rejects_a_limit_of_one_and_a_non_numeric_limit() {
         let mut runtime = runtime();
         let a = atom(&mut runtime, "a");
-        let tuple = heap_term(&mut runtime, |ctx| terms::make_tuple(ctx, &[a, make_small(1)]));
+        let tuple = heap_term(&mut runtime, |ctx| {
+            terms::make_tuple(ctx, &[a, make_small(1)])
+        });
 
         assert!(matches!(
             erts(&mut runtime, "term_to_string", &[tuple, make_small(1)]),
@@ -1148,7 +1216,9 @@ mod tests {
     fn term_to_string_reports_a_typed_gap_for_a_numeric_depth_limit() {
         let mut runtime = runtime();
         let a = atom(&mut runtime, "a");
-        let tuple = heap_term(&mut runtime, |ctx| terms::make_tuple(ctx, &[a, make_small(1)]));
+        let tuple = heap_term(&mut runtime, |ctx| {
+            terms::make_tuple(ctx, &[a, make_small(1)])
+        });
         let error = erts(&mut runtime, "term_to_string", &[tuple, make_small(4)])
             .expect_err("the numeric limit is a typed gap");
         assert_eq!(
@@ -1164,12 +1234,14 @@ mod tests {
     #[test]
     fn cmp_term_falls_through_to_the_registry() {
         let mut runtime = runtime();
-        let less = erts(&mut runtime, "cmp_term", &[make_small(1), make_small(2)]).expect("cmp_term/2");
+        let less =
+            erts(&mut runtime, "cmp_term", &[make_small(1), make_small(2)]).expect("cmp_term/2");
         assert_eq!(signed_value(less), -1);
         let greater =
             erts(&mut runtime, "cmp_term", &[make_small(2), make_small(1)]).expect("cmp_term/2");
         assert_eq!(signed_value(greater), 1);
-        let equal = erts(&mut runtime, "cmp_term", &[make_small(1), make_small(1)]).expect("cmp_term/2");
+        let equal =
+            erts(&mut runtime, "cmp_term", &[make_small(1), make_small(1)]).expect("cmp_term/2");
         assert_eq!(signed_value(equal), 0);
     }
 
