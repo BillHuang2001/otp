@@ -263,9 +263,10 @@ fn term_mentions_a_map(term: Eterm) -> bool {
 /// `db_format_dmc_err_info`'s `{error, IntList}` entry (`erl_db_util.c:3178-3182`).
 ///
 /// The message is an **int list** of latin1 bytes, not a binary (verified).
-/// The atoms are interned through the context's `AtomInterner` seam because the
-/// `beam_bifs` grammar checker / `error` atoms need not be pre-interned here; an
-/// unknown atom without the hook is a typed `TermNotFound`, never a wrong atom.
+/// The `error` atom (used both as the outer tuple tag and as the per-entry
+/// severity) is interned through the context's `AtomInterner` seam because it
+/// need not be pre-interned in a minimal embedding; an unknown atom without the
+/// hook is a typed `TermNotFound`, never a wrong atom.
 fn lint_error(ctx: &mut BifContext<'_>, message: &str) -> Result<Eterm> {
     let severity = ctx.intern_atom("error")?;
     let mut chars = Vec::with_capacity(message.len());
