@@ -5,8 +5,10 @@
 //! is exercised here — `insert_new/2`, `delete/2`, `delete_object/2`,
 //! `delete_all_objects/1`, `member/2`, `lookup_element/3,4`, `take/2`,
 //! `first/1`, `last/1`, `next/2`, `prev/2`, `info/1,2`, `tab2list/1`,
-//! `update_counter/3,4` and `update_element/3` — including the `badarg` cases and
-//! the no-registry `unsupported_bif` contract.
+//! `update_counter/3,4`, `update_element/3`, the `select/1,2,3` family and the
+//! `match/1,2,3` / `match_object/1,2,3` / `select_count/2` / `select_delete/2` /
+//! `match_delete/2` families — including the `badarg` cases and the no-registry
+//! `unsupported_bif` contract.
 //!
 //! Terms are asserted **structurally** with [`beam_term::compare::eq`]; list and
 //! tuple destructuring goes through the registered `erlang`/`lists` BIFs
@@ -56,6 +58,8 @@ fn seeded_atoms() -> AtomTable {
         // The match-spec variables the `ets:select` specs use.
         "$1",
         "$2",
+        // The wildcard and the remaining names the match-family tests use.
+        "_",
         "my_tab",
         "tab2",
         "a",
@@ -657,6 +661,9 @@ fn badarg_cases_are_typed() {
     reg.call("ets", "insert", 2, &mut ctx, &[handle, obj_a])
         .expect("insert");
 
+    // The `{'$1','$2'}` pattern the match-family handle checks use.
+    let pattern = both_vars_pattern(&mut ctx);
+
     // A non-table handle (a small int) is `badarg` for every BIF.
     for (name, arity, args) in [
         ("insert_new", 2u32, vec![one, obj_a]),
@@ -674,6 +681,15 @@ fn badarg_cases_are_typed() {
         ("tab2list", 1, vec![one]),
         ("update_counter", 3, vec![one, a, one]),
         ("update_element", 3, vec![one, a, two]),
+        ("match", 1, vec![one]),
+        ("match", 2, vec![one, pattern]),
+        ("match", 3, vec![one, pattern, two]),
+        ("match_object", 1, vec![one]),
+        ("match_object", 2, vec![one, pattern]),
+        ("match_object", 3, vec![one, pattern, two]),
+        ("select_count", 2, vec![one, true_spec(&mut ctx)]),
+        ("select_delete", 2, vec![one, true_spec(&mut ctx)]),
+        ("match_delete", 2, vec![one, pattern]),
     ] {
         assert!(
             matches!(
@@ -756,13 +772,28 @@ fn ets_bifs_without_a_registry_are_unsupported() {
     // typed `unsupported_bif` raise rather than a fabricated table.
     let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
     let key = ctx.atom("a").expect("seeded");
-
+    // The arguments the match-family entries need; none of them touches the
+    // registry (they are built on the context heap).
+    let pattern = both_vars_pattern(&mut ctx);
+    let spec = true_spec(&mut ctx);
+    let two = ctx.int(2).expect("fits");
     for (name, arity, args) in [
         ("member", 2u32, vec![handle, key]),
         ("info", 1, vec![handle]),
         ("first", 1, vec![handle]),
         ("tab2list", 1, vec![handle]),
         ("delete", 1, vec![handle]),
+        // The match family and the count/delete verbs reach the registry only after
+        // their handle decodes, so they report the same missing-registry raise.
+        ("match", 1, vec![handle]),
+        ("match", 2, vec![handle, pattern]),
+        ("match", 3, vec![handle, pattern, two]),
+        ("match_object", 1, vec![handle]),
+        ("match_object", 2, vec![handle, pattern]),
+        ("match_object", 3, vec![handle, pattern, two]),
+        ("select_count", 2, vec![handle, spec]),
+        ("select_delete", 2, vec![handle, spec]),
+        ("match_delete", 2, vec![handle, pattern]),
     ] {
         let err = reg
             .call("ets", name, arity, &mut ctx, &args)
@@ -982,4 +1013,410 @@ fn select_3_final_chunk_is_a_tuple_when_it_carries_results() {
     assert!(beam_term::compare::eq(results3, expected, &atoms));
     let end = ctx.atom("$end_of_table").expect("seeded");
     assert!(beam_term::compare::eq(terminator, end, &atoms));
+}
+
+// ------------------------------------------------------------- match family
+
+/// The `{'$1','$2'}` match pattern: both variables bound, so `ets:match/2`
+/// yields `[Key, Value]` per object and `ets:match_object/2` yields `{Key, Value}`.
+///
+/// Unlike a *match spec* (where a clause's second element is the guard list), a
+/// `ets:match/2` pattern is the bare head term — the assertions below are the
+/// oracle's (`ets:match(T, {'$1','$2'})` on `{1,a}` ⇒ `[[1,a]]`).
+fn both_vars_pattern(ctx: &mut BifContext<'_>) -> Eterm {
+    let v1 = ctx.atom("$1").expect("seeded");
+    let v2 = ctx.atom("$2").expect("seeded");
+    ctx.tuple(&[v1, v2]).expect("fits")
+}
+
+/// The counting/deleting spec `[{{'$1','$2'}, [], [true]}]` — one clause whose body
+/// is the boolean `true`, so `ets:select_count/2` counts every 2-tuple and
+/// `ets:select_delete/2` deletes them.
+fn true_spec(ctx: &mut BifContext<'_>) -> Eterm {
+    let v1 = ctx.atom("$1").expect("seeded");
+    let v2 = ctx.atom("$2").expect("seeded");
+    let head = ctx.tuple(&[v1, v2]).expect("fits");
+    let guards = ctx.list(&[]).expect("fits");
+    let body = ctx.list(&[ctx.atom("true").expect("seeded")]).expect("fits");
+    let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+    ctx.list(&[clause]).expect("fits")
+}
+
+/// `[{{z}, [], [true]}]` — a spec whose head matches no object of a 2-tuple table.
+fn no_match_spec(ctx: &mut BifContext<'_>) -> Eterm {
+    let z = ctx.atom("z").expect("seeded");
+    let head = ctx.tuple(&[z]).expect("fits");
+    let guards = ctx.list(&[]).expect("fits");
+    let body = ctx.list(&[ctx.atom("true").expect("seeded")]).expect("fits");
+    let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+    ctx.list(&[clause]).expect("fits")
+}
+
+/// A literal `{Key, '_'}` match pattern — binds nothing, matches one key.
+fn key_pattern(ctx: &mut BifContext<'_>, key: &str) -> Eterm {
+    let key = ctx.atom(key).expect("seeded");
+    let any = ctx.atom("_").expect("seeded");
+    ctx.tuple(&[key, any]).expect("fits")
+}
+
+#[test]
+fn match_2_binds_every_variable_and_match_object_2_returns_whole_objects() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+    // An `ordered_set` iterates in key order, so the results are deterministic.
+    let handle = new_table(&reg, &mut ctx, "tab2", "ordered_set");
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b", "c"]);
+
+    // `ets:match(T, {'$1','$2'})` ⇒ `[[Key, Value], …]` (verified against erts-17.1:
+    // `[[1,a]]` for the single object `{1,a}`).
+    let pattern = both_vars_pattern(&mut ctx);
+    let got = reg
+        .call("ets", "match", 2, &mut ctx, &[handle, pattern])
+        .expect("ets:match/2");
+    let pairs = [
+        ctx.list(&[ctx.atom("a").unwrap(), ctx.int(1).unwrap()])
+            .expect("fits"),
+        ctx.list(&[ctx.atom("b").unwrap(), ctx.int(2).unwrap()])
+            .expect("fits"),
+        ctx.list(&[ctx.atom("c").unwrap(), ctx.int(3).unwrap()])
+            .expect("fits"),
+    ];
+    let expected = ctx.list(&pairs).expect("fits");
+    assert!(
+        beam_term::compare::eq(got, expected, &atoms),
+        "ets:match/2 binding lists mismatch"
+    );
+
+    // `ets:match_object/2` ⇒ the whole objects.
+    let pattern = both_vars_pattern(&mut ctx);
+    let got = reg
+        .call("ets", "match_object", 2, &mut ctx, &[handle, pattern])
+        .expect("ets:match_object/2");
+    let objects = [
+        object(&mut ctx, "a", 1),
+        object(&mut ctx, "b", 2),
+        object(&mut ctx, "c", 3),
+    ];
+    let expected = ctx.list(&objects).expect("fits");
+    assert!(
+        beam_term::compare::eq(got, expected, &atoms),
+        "ets:match_object/2 whole-object mismatch"
+    );
+
+    // A pattern that matches nothing yields the **empty list** for both — never
+    // `'$end_of_table'` (verified: `ets:match(T, {x,y})` ⇒ `[]`).
+    let literal = {
+        let z = ctx.atom("z").expect("seeded");
+        ctx.tuple(&[z, z]).expect("fits")
+    };
+    let got = reg
+        .call("ets", "match", 2, &mut ctx, &[handle, literal])
+        .expect("ets:match/2 no match");
+    assert_eq!(length(&reg, &mut ctx, got), 0);
+    let got = reg
+        .call("ets", "match_object", 2, &mut ctx, &[handle, literal])
+        .expect("ets:match_object/2 no match");
+    assert_eq!(length(&reg, &mut ctx, got), 0);
+}
+
+#[test]
+fn match_3_and_match_1_chunk_through_the_shared_continuation_renderer() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+    let handle = new_table(&reg, &mut ctx, "tab2", "ordered_set");
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b", "c", "p"]);
+    let two = ctx.int(2).expect("fits");
+    let end = ctx.atom("$end_of_table").expect("seeded");
+
+    // Chunk 1 of `ets:match/3`: two binding lists plus a continuation.
+    let pattern = both_vars_pattern(&mut ctx);
+    let chunk1 = reg
+        .call("ets", "match", 3, &mut ctx, &[handle, pattern, two])
+        .expect("ets:match/3");
+    let results1 = element(&reg, &mut ctx, 1, chunk1);
+    let cont1 = element(&reg, &mut ctx, 2, chunk1);
+    let pairs = [
+        ctx.list(&[ctx.atom("a").unwrap(), ctx.int(1).unwrap()])
+            .expect("fits"),
+        ctx.list(&[ctx.atom("b").unwrap(), ctx.int(2).unwrap()])
+            .expect("fits"),
+    ];
+    let expected1 = ctx.list(&pairs).expect("fits");
+    assert!(beam_term::compare::eq(results1, expected1, &atoms));
+    assert!(
+        !beam_term::compare::eq(cont1, end, &atoms),
+        "ets:match/3 produced no continuation"
+    );
+
+    // Chunk 2 off `ets:match/1`.
+    let chunk2 = reg
+        .call("ets", "match", 1, &mut ctx, &[cont1])
+        .expect("ets:match/1");
+    let results2 = element(&reg, &mut ctx, 1, chunk2);
+    let cont2 = element(&reg, &mut ctx, 2, chunk2);
+    let pairs = [
+        ctx.list(&[ctx.atom("c").unwrap(), ctx.int(3).unwrap()])
+            .expect("fits"),
+        ctx.list(&[ctx.atom("p").unwrap(), ctx.int(4).unwrap()])
+            .expect("fits"),
+    ];
+    let expected2 = ctx.list(&pairs).expect("fits");
+    assert!(beam_term::compare::eq(results2, expected2, &atoms));
+
+    // Chunk 3: the limit landed on the last object, so the resume finds nothing and
+    // the oracle renders the **bare** `'$end_of_table'` atom.
+    let chunk3 = reg
+        .call("ets", "match", 1, &mut ctx, &[cont2])
+        .expect("ets:match/1");
+    assert_eq!(
+        atoms.name(atom_val(chunk3)),
+        Some("$end_of_table"),
+        "an exhausted `ets:match/1` must render as the bare '$end_of_table'"
+    );
+
+    // The same round trip through `ets:match_object/3`+`/1`: whole objects, and the
+    // final chunk is again the bare atom.
+    let pattern = both_vars_pattern(&mut ctx);
+    let chunk1 = reg
+        .call("ets", "match_object", 3, &mut ctx, &[handle, pattern, two])
+        .expect("ets:match_object/3");
+    let objects = [object(&mut ctx, "a", 1), object(&mut ctx, "b", 2)];
+    let expected = ctx.list(&objects).expect("fits");
+    assert!(beam_term::compare::eq(
+        element(&reg, &mut ctx, 1, chunk1),
+        expected,
+        &atoms
+    ));
+    let cont1 = element(&reg, &mut ctx, 2, chunk1);
+    let chunk2 = reg
+        .call("ets", "match_object", 1, &mut ctx, &[cont1])
+        .expect("ets:match_object/1");
+    let objects = [object(&mut ctx, "c", 3), object(&mut ctx, "p", 4)];
+    let expected = ctx.list(&objects).expect("fits");
+    assert!(beam_term::compare::eq(
+        element(&reg, &mut ctx, 1, chunk2),
+        expected,
+        &atoms
+    ));
+    let cont2 = element(&reg, &mut ctx, 2, chunk2);
+    let chunk3 = reg
+        .call("ets", "match_object", 1, &mut ctx, &[cont2])
+        .expect("ets:match_object/1");
+    assert_eq!(atoms.name(atom_val(chunk3)), Some("$end_of_table"));
+}
+
+#[test]
+fn match_3_final_chunk_is_a_tuple_when_it_carries_results() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+    let handle = new_table(&reg, &mut ctx, "tab2", "ordered_set");
+    // Five objects: `limit` 2 gives 2+cont, 2+cont, then the **tuple** chunk
+    // `{[Last], '$end_of_table'}` (verified: `ets:match/1` renders trailing results
+    // inside a tuple, unlike the empty case).
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b", "c", "p", "q"]);
+    let two = ctx.int(2).expect("fits");
+
+    let pattern = both_vars_pattern(&mut ctx);
+    let chunk1 = reg
+        .call("ets", "match", 3, &mut ctx, &[handle, pattern, two])
+        .expect("ets:match/3");
+    let cont1 = element(&reg, &mut ctx, 2, chunk1);
+    let chunk2 = reg
+        .call("ets", "match", 1, &mut ctx, &[cont1])
+        .expect("ets:match/1");
+    let cont2 = element(&reg, &mut ctx, 2, chunk2);
+    let chunk3 = reg
+        .call("ets", "match", 1, &mut ctx, &[cont2])
+        .expect("ets:match/1");
+    let results3 = element(&reg, &mut ctx, 1, chunk3);
+    let terminator = element(&reg, &mut ctx, 2, chunk3);
+    let pairs = [ctx
+        .list(&[ctx.atom("q").unwrap(), ctx.int(5).unwrap()])
+        .expect("fits")];
+    let expected = ctx.list(&pairs).expect("fits");
+    assert!(beam_term::compare::eq(results3, expected, &atoms));
+    let end = ctx.atom("$end_of_table").expect("seeded");
+    assert!(beam_term::compare::eq(terminator, end, &atoms));
+}
+
+#[test]
+fn match_family_limit_and_continuation_badarg_cases() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+    let handle = new_table(&reg, &mut ctx, "tab2", "set");
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b"]);
+
+    let zero = ctx.int(0).expect("fits");
+    let one = ctx.int(1).expect("fits");
+
+    // `limit == 0` is `badarg` for both `/3` forms (verified against erts-17.1), as
+    // is a negative or non-integer limit.
+    for name in ["match", "match_object"] {
+        let pattern = both_vars_pattern(&mut ctx);
+        assert!(
+            matches!(
+                reg.call("ets", name, 3, &mut ctx, &[handle, pattern, zero]),
+                Err(BeamError::BadArg)
+            ),
+            "ets:{name}/3 with limit 0"
+        );
+        let pattern = both_vars_pattern(&mut ctx);
+        let minus_one = ctx.int(-1).expect("fits");
+        assert!(matches!(
+            reg.call("ets", name, 3, &mut ctx, &[handle, pattern, minus_one]),
+            Err(BeamError::BadArg)
+        ));
+        let pattern = both_vars_pattern(&mut ctx);
+        let bad_limit = ctx.atom("a").expect("seeded");
+        assert!(matches!(
+            reg.call("ets", name, 3, &mut ctx, &[handle, pattern, bad_limit]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    // A `/1` form on something that is not a live continuation is `badarg`: the
+    // table handle names no continuation (verified: `ets:match(T)` ⇒ badarg), and
+    // neither does a non-ref term.
+    assert!(matches!(
+        reg.call("ets", "match", 1, &mut ctx, &[handle]),
+        Err(BeamError::BadArg)
+    ));
+    assert!(matches!(
+        reg.call("ets", "match_object", 1, &mut ctx, &[handle]),
+        Err(BeamError::BadArg)
+    ));
+    assert!(matches!(
+        reg.call("ets", "match", 1, &mut ctx, &[one]),
+        Err(BeamError::BadArg)
+    ));
+
+    // A continuation of a **deleted** table is `badarg` (deleting the table drops
+    // its continuations).
+    let pattern = both_vars_pattern(&mut ctx);
+    let chunk = reg
+        .call("ets", "match", 3, &mut ctx, &[handle, pattern, one])
+        .expect("ets:match/3");
+    let stale = element(&reg, &mut ctx, 2, chunk);
+    let deleted = reg
+        .call("ets", "delete", 1, &mut ctx, &[handle])
+        .expect("ets:delete/1");
+    assert!(is_true(&atoms, deleted));
+    assert!(matches!(
+        reg.call("ets", "match", 1, &mut ctx, &[stale]),
+        Err(BeamError::BadArg)
+    ));
+}
+
+#[test]
+fn select_count_select_delete_and_match_delete_return_the_oracle_values() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+    let handle = new_table(&reg, &mut ctx, "tab2", "ordered_set");
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b", "c", "p"]);
+
+    // `ets:select_count/2` ⇒ a small int (verified: 4 for the four 2-tuples).
+    let spec = true_spec(&mut ctx);
+    let count = reg
+        .call("ets", "select_count", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select_count/2");
+    assert_eq!(signed_value(count), 4);
+    let is_int = reg
+        .call("erlang", "is_integer", 1, &mut ctx, &[count])
+        .expect("erlang:is_integer");
+    assert!(is_true(&atoms, is_int), "ets:select_count/2 must return a small int");
+
+    // A spec whose head matches nothing counts `0` (verified).
+    let spec = no_match_spec(&mut ctx);
+    let count = reg
+        .call("ets", "select_count", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select_count/2 no match");
+    assert_eq!(signed_value(count), 0);
+
+    // `ets:select_delete/2` ⇒ the number deleted (verified: 0 when nothing matches,
+    // then the table size, then 0 again).
+    let spec = no_match_spec(&mut ctx);
+    let deleted = reg
+        .call("ets", "select_delete", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select_delete/2 no match");
+    assert_eq!(signed_value(deleted), 0);
+    let spec = true_spec(&mut ctx);
+    let deleted = reg
+        .call("ets", "select_delete", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select_delete/2");
+    assert_eq!(signed_value(deleted), 4);
+    let spec = true_spec(&mut ctx);
+    let deleted = reg
+        .call("ets", "select_delete", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select_delete/2 empty");
+    assert_eq!(signed_value(deleted), 0);
+
+    // `ets:match_delete/2` ⇒ the atom `true` (the oracle's stdlib wrapper discards
+    // the deleted count) and **not** the count.
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b", "c", "p"]);
+    let pattern = both_vars_pattern(&mut ctx);
+    let result = reg
+        .call("ets", "match_delete", 2, &mut ctx, &[handle, pattern])
+        .expect("ets:match_delete/2");
+    assert!(
+        is_true(&atoms, result),
+        "ets:match_delete/2 must return `true`, got {result:?}"
+    );
+    let spec = true_spec(&mut ctx);
+    let count = reg
+        .call("ets", "select_count", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select_count/2 after match_delete");
+    assert_eq!(signed_value(count), 0);
+
+    // A pattern that matches nothing still returns `true` and deletes nothing
+    // (verified: `ets:match_delete(T, {x,'_'})` ⇒ `true` with the table intact).
+    insert_ordered(&reg, &mut ctx, handle, &["a", "b"]);
+    let literal = key_pattern(&mut ctx, "z");
+    let result = reg
+        .call("ets", "match_delete", 2, &mut ctx, &[handle, literal])
+        .expect("ets:match_delete/2 no match");
+    assert!(is_true(&atoms, result));
+    let spec = true_spec(&mut ctx);
+    let count = reg
+        .call("ets", "select_count", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select_count/2 after no-op match_delete");
+    assert_eq!(signed_value(count), 2);
+
+    // A `{Key, '_'}` pattern removes exactly that key's entry: `q` goes, the
+    // `{a,1}`/`{b,2}` entries stay (verified with `ets:match_delete(T, {1,'_'})`).
+    insert_ordered(&reg, &mut ctx, handle, &["q"]);
+    let only_q = key_pattern(&mut ctx, "q");
+    let result = reg
+        .call("ets", "match_delete", 2, &mut ctx, &[handle, only_q])
+        .expect("ets:match_delete/2 by key");
+    assert!(is_true(&atoms, result));
+    let q = ctx.atom("q").expect("seeded");
+    let lookup = reg
+        .call("ets", "lookup", 2, &mut ctx, &[handle, q])
+        .expect("ets:lookup/2");
+    assert_eq!(length(&reg, &mut ctx, lookup), 0);
+    let spec = true_spec(&mut ctx);
+    let count = reg
+        .call("ets", "select_count", 2, &mut ctx, &[handle, spec])
+        .expect("ets:select_count/2 after keyed match_delete");
+    assert_eq!(signed_value(count), 2);
 }
