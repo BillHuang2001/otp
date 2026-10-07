@@ -19,7 +19,7 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 
 ### `bench`
 - `bench list [--json]` — list workloads + their prerequisite-probe status.
-- `bench run [--quick|--full] [--workloads <ids>] [--runtime <sys|rust|all>] [--out <dir>] [--json]` — run workloads, write results JSON.
+- `bench run [--quick|--full] [--workloads <ids,csv>] [--runtime <sys|rust|all>] [--out <dir>] [--out-file <path>] [--repo <id>=<path>] [--json] [--verbose]` — run workloads, write results JSON.
 - `bench baseline [--quick]` — measure the system-ERTS baseline only.
 - `bench compare <a.json> <b.json> [--json]` — diff two result sets.
 - Exit codes: `0` run completed (per-workload `skipped(reason)` is not fatal); `2` usage/env error. A workload that *errors* is recorded `failed` in JSON.
