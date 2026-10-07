@@ -358,5 +358,70 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "lists/usort_2_degenerate",
+            description: "lists:usort/2 reproduces the oracle for degenerate (non-total) comparators",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `usort/2` is a faithful port of the pure-Erlang `lists.erl` (`usort_1` /
+                // `ufsplit_*` / `ufmergel`), so the *ordering of equal elements* is
+                // observable. The five comparators below are the `lists.erl` `Fun(A, B) -> true
+                // if A =< B` shapes: an always-true and an always-false comparator, a reversed
+                // arithmetic comparison (`A > B` keeps equal elements, `A >= B` removes them),
+                // the expected ascending total order (`A =< B`), and one that is inconsistent
+                // for equal elements (`A < B`). Every list is the small duplicate-bearing input
+                // [3,1,2,1,2].
+                expr: "{lists:usort(fun(_,_) -> true end, [3,1,2,1,2]), \
+                       lists:usort(fun(_,_) -> false end, [1,2,3]), \
+                       lists:usort(fun(A,B) -> A > B end, [3,1,2,1,2]), \
+                       lists:usort(fun(A,B) -> A >= B end, [3,1,2,1,2]), \
+                       lists:usort(fun(A,B) -> A =< B end, [3,1,2,1,2]), \
+                       lists:usort(fun(A,B) -> A < B end, [3,1,2,1,2])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[3],[3,2,1],[3,2,2,1,1],[3,2,1],[1,2,3],[1,1,2,2,3]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "lists/usort_1_dedup",
+            description: "lists:usort/1 removes duplicates and collapses arithmetic-equal elements",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `usort/1` keeps the *first* of each arithmetically-equal run, so
+                // `[1.0, 1, 2]` collapses to `[1.0, 2]` while `[1, 1.0, 2]` collapses to
+                // `[1, 2]` — the surviving representative is observable. The last list is the
+                // `lists.erl` doc example (mixed types, repeated elements).
+                expr: "{lists:usort([1.0, 1, 2]), lists:usort([1, 1.0, 2]), \
+                       lists:usort([3,2,a,3,2,a,1,3,b,2,2,1])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[1.0,2],[1,2],[1,2,3,a,b]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "lists/fun_taking_eval",
+            description: "the fun-taking lists BIFs run through the -eval `FunCaller` seam",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // `lists:map/2`, `lists:foldl/3` and `lists:sort/2` take a fun a BIF cannot
+                // invoke itself, so they exercise the runtime's `FunCaller` seam end to end on
+                // the `-eval` path (a literal fun is applied by the evaluator).
+                expr: "{lists:map(fun(X) -> X*2 end, [1,2,3]), \
+                       lists:foldl(fun(X, Acc) -> X+Acc end, 0, [1,2,3,4]), \
+                       lists:sort(fun(A,B) -> A =< B end, [3,1,2,1,3])}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[2,4,6],10,[1,1,2,3,3]}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
