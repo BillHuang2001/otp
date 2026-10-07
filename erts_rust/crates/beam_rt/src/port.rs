@@ -186,6 +186,8 @@ pub const PORT_INFO_ATOMS: &[&str] = &[
     "input",
     "output",
     "monitors",
+    // A `/2`-only item whose unregistered value (`[]`) the native floor answers itself.
+    "registered_name",
     // The shape of a `monitors` entry.
     "process",
 ];
