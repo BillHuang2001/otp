@@ -32,6 +32,7 @@ source of truth for what is native; each submodule below owns the per-function b
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor — see below |
+| `prim.rs` | the `prim_file` floor (`get_cwd/0,1`, `read_file/1`) — see below |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
 ### `erts_internal.rs` — the served BIFs (contract A.7)
