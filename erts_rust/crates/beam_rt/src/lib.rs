@@ -28,6 +28,9 @@
 //! * [`format`] — term printing, which drives the registered `io:format/2` `~p`/`~w` printer.
 //! * [`native`] — the runtime-native BIF floor (`halt`, `display`, `io:put_chars`,
 //!   `erlang:apply`, `erlang:system_info`, `init:get_argument`) consulted before the registry.
+//! * [`dist`] — the **distributed node** (contract A.5, Phase 1): the `epmd`
+//!   registration, the bound distribution listener and the accepting half of the
+//!   `'N'` handshake, pumped from [`Runtime`]'s scheduler pass.
 //!
 //! # Contracts
 //!
@@ -46,6 +49,7 @@ pub mod cli;
 pub mod codeserver;
 pub mod config;
 pub mod context;
+pub mod dist;
 pub mod error;
 pub mod eval;
 pub mod format;
@@ -68,6 +72,7 @@ pub use crate::eval::eval;
 pub use crate::format::{term_to_string, term_to_string_w};
 pub use crate::info::{system_info_value, InfoValue, SUPPORTED_KEYS};
 pub use crate::port::{PortName, PortRegistry, RuntimePorts, StreamType, PORT_INFO_ATOMS};
+pub use crate::dist::{DistConnection, DistNode, NodeName};
 pub use crate::runtime::Runtime;
 /// The conventional glob-import surface for downstream crates.
 ///
@@ -80,6 +85,7 @@ pub mod prelude {
     pub use crate::codeserver::CodeServer;
     pub use crate::config::{Action, ArgTerm, EmulatorConfig, InitArgs, RuntimeConfig};
     pub use crate::context::RuntimeContext;
+    pub use crate::dist::{DistConnection, DistNode, NodeName};
     pub use crate::eval::eval;
     pub use crate::format::{term_to_string, term_to_string_w};
     pub use crate::info::{system_info_value, InfoValue};

@@ -42,6 +42,7 @@ use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
 use crate::context::RuntimeContext;
+use crate::dist::{resolve_cookie, DistNode};
 use crate::error;
 use crate::eval::FunBody;
 use crate::format;
@@ -249,6 +250,14 @@ pub struct Runtime {
     /// parked process runnable, and [`Runtime::absorb_timer_wakes`] turns it into a run-queue
     /// entry at the same points the other wake sources are absorbed.
     timer_wakes: Vec<ProcessId>,
+    /// The **distributed node** (contract A.5, Phase 1), when `-name`/`-sname` was given.
+    ///
+    /// `None` for a runtime with no node name — the default, and what every
+    /// differential `-eval` case without a node switch sees. When present, the
+    /// node is bound (and published to `epmd`) at construction and driven by
+    /// [`Runtime::pump_dist`] from the scheduler pass, next to the port half. See
+    /// [`crate::dist`] for exactly how little of distribution this implements.
+    dist: Option<DistNode>,
 }
 
 impl Runtime {
@@ -290,6 +299,14 @@ impl Runtime {
         // A zero-word heap can hold nothing, so the configured size is floored: the
         // runtime must always be able to run the smallest program.
         let heap_words = config.heap_words.max(MIN_HEAP_WORDS);
+        // A configured node name (`-name`/`-sname`) makes this a **distributed node**:
+        // the listener is bound here (a bind failure is a genuine start-up error, never
+        // a silently un-distributed runtime) and the node is published to `epmd` on the
+        // first scheduler pass. The cookie comes from `-setcookie`/`$HOME/.erlang.cookie`.
+        let dist = match config.emulator.node_name.as_deref() {
+            Some(name) => Some(DistNode::start(name, resolve_cookie(&config.init_args))?),
+            None => None,
+        };
         Ok(Runtime {
             config,
             registry: Rc::new(BifRegistry::with_core_bifs()),
@@ -317,6 +334,7 @@ impl Runtime {
             timers: Timers::new(),
             timer_resumes: HashMap::new(),
             timer_wakes: Vec::new(),
+            dist,
         })
     }
 
@@ -1040,6 +1058,16 @@ impl Runtime {
                     continue;
                 }
             }
+            // The distribution half: accept a pending inbound connection and drive every
+            // live link's handshake one step (contract A.5, Phase 1). Non-blocking, so a
+            // runtime with no node (or a node with no traffic) pays nothing; a link that
+            // made progress counts as work, so a bare `-eval`/scheduler loop keeps
+            // pumping while a peer is mid-handshake.
+            match self.pump_dist() {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => delivered += count,
+            }
             // The timer half: deliver every `erlang:send_after/3` message whose deadline has
             // passed (which may wake a blocked receiver, exactly like a port message) and
             // resume every process whose finite `receive … after T` deadline fired.
@@ -1075,6 +1103,41 @@ impl Runtime {
         self.put_processes(table);
         outcome?;
         Ok((ran, delivered))
+    }
+
+    /// The **distribution half** of a scheduler pass (contract A.5, Phase 1).
+    ///
+    /// Drives the live distributed node ([`crate::dist::DistNode::pump`]): publishes it
+    /// to `epmd` on the first pass, accepts whatever inbound connections are pending and
+    /// advances every link's handshake. `Ok(0)` for a runtime with no node name (the
+    /// common case) or a node with nothing to do, so a pass never waits here — the node's
+    /// sockets are non-blocking and only a peer that has already sent bytes is read.
+    ///
+    /// # Errors
+    ///
+    /// Only the listener's own `accept` failures. A *link*'s failure is retired and
+    /// recorded by the node itself ([`crate::dist::DistNode::last_link_error`]), never
+    /// raised: a hostile or broken peer must not be able to fail a scheduler pass.
+    pub(crate) fn pump_dist(&mut self) -> Result<usize> {
+        match self.dist.as_mut() {
+            Some(node) => node.pump(),
+            None => Ok(0),
+        }
+    }
+
+    /// The runtime's distributed node, when `-name`/`-sname` configured one.
+    ///
+    /// The observable surface of contract A.5's Phase 1: the node's name, its listen
+    /// port, whether `epmd` accepted the registration, and every live link with its
+    /// handshake state (`DistConnection::is_established`) and peer name. `None` means
+    /// this runtime is not a node (`nonode@nohost`).
+    pub fn dist_node(&self) -> Option<&DistNode> {
+        self.dist.as_ref()
+    }
+
+    /// The node's full name (`node@host`), when this runtime is a distributed node.
+    pub fn node_name(&self) -> Option<&str> {
+        self.dist.as_ref().map(|node| node.node_name())
     }
 
     /// How long this pass may sleep waiting for the next timer deadline, or `None` when it
