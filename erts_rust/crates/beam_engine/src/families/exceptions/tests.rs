@@ -1,0 +1,98 @@
+//! Unit tests for the exception / raise instruction family.
+//!
+//! Split by responsibility across submodules: [`handlers`] (the `try`/`catch`
+//! frame push, the handler opcodes and `catch_end`), [`raising`] (the raising
+//! opcodes, the re-raise opcode and `raw_raise`), [`stacktrace`]
+//! (`build_stacktrace`) and [`end_to_end`] (whole synthetic sequences). The
+//! shared fixture scaffolding lives here.
+
+use super::*;
+use crate::context::MinimalContext;
+use beam_common::{BeamError, ExceptionClass, ExitReason};
+use beam_loader::{Function, HeapNeed, LineEntry};
+use beam_term::{cmp, make_small};
+
+/// A tiny module builder with an owned atom table (mirrors the `Fixture`
+/// scaffolding in `tests/opcodes.rs`, kept local so the unit tests here do not
+/// depend on integration-test helpers).
+struct Fixture {
+    module: Module,
+}
+
+impl Fixture {
+    fn new(extra_atoms: &[&str]) -> Fixture {
+        let mut module = Module::default();
+        module.name = module.atom_table.intern("m");
+        for name in extra_atoms {
+            module.atom_table.intern(name);
+        }
+        Fixture { module }
+    }
+
+    /// Append a function whose code starts with `entry`; returns its label.
+    fn add_function(&mut self, name: &str, arity: u32, code: Vec<Instr>) -> Label {
+        let name = self.module.atom_table.intern(name);
+        let module = self.module.name;
+        let mut labels = BTreeMap::new();
+        for (index, instr) in code.iter().enumerate() {
+            if let Instr::Label(label) = instr {
+                labels.insert(*label, index);
+            }
+        }
+        let entry = labels.keys().next().copied().unwrap_or(Label(0));
+        self.module.functions.push(Function {
+            func_label: entry,
+            entry_label: entry,
+            module,
+            name,
+            arity,
+            code,
+            blocks: Vec::new(),
+            labels,
+        });
+        entry
+    }
+
+    fn finish(self) -> Module {
+        self.module
+    }
+}
+
+/// Empty label map; fine for instructions that raise (they do not jump).
+fn no_labels() -> BTreeMap<Label, (u32, u32)> {
+    BTreeMap::new()
+}
+
+/// Run one instruction body with a machine that has a bottom frame.
+fn exec_one(
+    module: &Module,
+    instr: &Instr,
+    machine: &mut Machine,
+    ctx: &mut MinimalContext,
+) -> Result<Option<Step>> {
+    exec(machine, module, &no_labels(), instr, 0, 0, ctx)
+}
+
+/// Assert that `reason` (an `Eterm`) equals the tuple `[tag, elem]`.
+fn assert_reason_tuple(
+    cmp_ctx: &mut MinimalContext,
+    module: &Module,
+    reason: Eterm,
+    tag: &str,
+    elem: Eterm,
+) {
+    let expected = terms::make_tuple(
+        cmp_ctx,
+        &[make_atom(module.atom_table.lookup(tag).unwrap()), elem],
+    )
+    .unwrap();
+    assert!(
+        cmp(reason, expected, &module.atom_table).is_eq(),
+        "reason does not equal {{{tag}, ..}}"
+    );
+}
+
+mod end_to_end;
+mod handlers;
+mod raising;
+mod stacktrace;
