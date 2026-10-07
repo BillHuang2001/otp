@@ -354,6 +354,17 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   is exact.
 
 ## Known Issues / Remaining Gaps
+- **No inbound `DOP_*` has semantic dispatch.** `Connection::recv` and `ConnectionDriver::next_message`
+  decode *any* opcode into a [`ControlMessage`] and never act on it — the crate performs no link /
+  monitor / spawn / exit side effects, so a runtime must interpret the returned opcode. The only
+  opcode-selecting logic is the outbound `DFLAG_SEND_SENDER` → `DOP_SEND_SENDER` vs `DOP_SEND` choice;
+  typed send helpers exist for `Send(_Sender)`/`RegSend`/`Link`/`Exit`/`MonitorP`/`DemonitorP` only,
+  and every other opcode is reachable solely through the generic `send_control` (all 30 `Dop` variants
+  are encodable/decodable; encoding is opcode-agnostic).
+- **Stale in-source doc comment (no behavior impact).** `connection.rs::accept_server`'s doc says "an
+  outbound `Complement` is sent when `DFLAG_HANDSHAKE_23` was negotiated", but the code correctly sends
+  **none** (the module doc and `connect_client_core` are right: the `'c'` `Complement` exists only for
+  the legacy `'n'` name, which this crate does not speak).
 - **Spawn/payload/altact control opcodes are recognised but not executed.** The full `DOP_*`
   vocabulary and the in-term bit vocabularies (`DistSpawnFlags`/`AltactSigFlags`) are present, and
   `DOP_ALTACT_SIG_SEND`'s variable arity is tolerated at decode, but there is **no** end-to-end
