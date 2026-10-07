@@ -12,6 +12,7 @@
 //! | `io:put_chars/1,2` | writes to the process's output sink (the device argument is accepted and ignored) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
 //! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
+//! | `erts_alloc:info/0` | reports the runtime's own allocator inventory — every number is a live `beam_alloc` counter, not a constant (contract A.8) |
 //! | `erlang:process_info/2` | reads a **process's** heap/GC observables out of this runtime's own process table (`beam_gc`'s `HeapInfo`; contract A.8) |
 //! | `init:get_argument/1` | reads the parsed command line (contract A.6, `RuntimeConfig::init_args`) |
 //! | `init:get_plain_arguments/0` | the (always empty) plain-argument list — the CLI models no plain arguments |
@@ -46,10 +47,11 @@
 //!
 //! The floor is split by responsibility: the `erlang`-core items and the shared helpers live
 //! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`], the
-//! `erlang:*` process/registry/reference entries in [`process`] and the `application:*`
-//! entries in [`application`]. The submodules reach the shared helpers through `super`
-//! (they are `pub(super)`).
+//! `erlang:*` process/registry/reference entries in [`process`], the `application:*`
+//! entries in [`application`] and the allocator inventory in [`alloc`]. The submodules reach
+//! the shared helpers through `super` (they are `pub(super)`).
 
+mod alloc;
 mod application;
 mod code;
 mod init;
@@ -94,6 +96,7 @@ impl RuntimeContext<'_> {
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
             ("erlang", "process_info", 2) => Some(self.process_info_2(args)),
+            ("erts_alloc", "info", 0) => Some(self.erts_alloc_info()),
             ("init", "get_argument", 1) => Some(self.get_argument(args)),
             ("init", "get_plain_arguments", 0) => Some(self.get_plain_arguments()),
             ("init", "get_arguments", 0) => Some(self.get_arguments()),
