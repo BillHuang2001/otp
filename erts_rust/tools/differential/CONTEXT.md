@@ -139,8 +139,8 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - A driver case is **expressible but trips one test**: a module-run case claiming `Contract::DriverAbi` fails `src/corpus/mod.rs::module_run_cases_are_registered_and_well_formed`, whose allow-list is `BeamAsm|LanguageSemantics|OtpApps|NifAbi` — add `Contract::DriverAbi` there. Then reuse `NifFixture::CompiledLibrary` (it compiles against the erts include dir, which also holds `erl_driver.h`) and open the driver from the module as `open_port({spawn_driver, Dir ++ "/<name>"}, …)`; `beam_rt`'s `driver_lookup` treats a name containing `/` as the object path (`<name>.so`) and validates the entry name against the file stem. A working C-driver fixture pattern is `../../crates/beam_io/tests/fixtures/host_driver.c`.
 
 ## Known Issues / Notes for Agents
-- **The Rust side is a partial runtime; today's gate is 0 mismatches** (608-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **608 total · 607 agree · 0 mismatch · 1 unsupported · 0 skipped** (`gate.sh` → exit `3`).
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (652-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
+  - Current rollup (**stable across repeated runs**): **652 total · 651 agree · 0 mismatch · 1 unsupported · 0 skipped** (`gate.sh` → exit `3`).
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
@@ -150,9 +150,9 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 | A.3 | 29 | 29 | 0 | 0 | 0 |
 | A.4 | 60 | 60 | 0 | 0 | 0 |
 | A.5 | 64 | 63 | 0 | 1 | 0 |
-| A.6 | 16 | 16 | 0 | 0 | 0 |
+| A.6 | 31 | 31 | 0 | 0 | 0 |
 | A.7 | 246 | 246 | 0 | 0 | 0 |
-| A.8 | 9 | 9 | 0 | 0 | 0 |
+| A.8 | 43 | 43 | 0 | 0 | 0 |
 | A.9 | 52 | 52 | 0 | 0 | 0 |
 
 - **The 1 `unsupported` case (an honest capability gap, not a mismatch).** Its golden is the oracle's own output, so it flips to `agree` automatically once the gap closes:
