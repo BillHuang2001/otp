@@ -726,9 +726,16 @@ fn a_fragmented_variable_size_carrier_reuses_its_holes_and_coalesces_back() {
     }
     let fragmented = alloc.stats();
     assert_eq!(fragmented.live_blocks, 50);
+    // Fragmentation must not cost a *new* mapping: the 50 holes and the 50 live blocks
+    // still share the one carrier that was mapped above. That carrier cannot be released
+    // yet either — a variable-size carrier goes back to the OS only when freeing its last
+    // block coalesces the whole segment into a single free block (`is_fully_free`), which
+    // the all-freed assertion at the end of this test pins — so the count stays at
+    // `baseline + 1` rather than dropping to the bare baseline.
     assert_eq!(
-        fragmented.mbc_carriers, baseline.mbc_carriers,
-        "the carrier is still pooled"
+        fragmented.mbc_carriers,
+        baseline.mbc_carriers + 1,
+        "a carrier with live blocks stays pooled (and no second one is mapped)"
     );
 
     // The holes are big enough for the same size, so a second batch is served from them:
@@ -774,24 +781,31 @@ fn a_mixed_slab_mid_and_large_workload_returns_to_its_steady_state() {
     let sbct = CarrierPolicy::default().small_block_carrier_threshold();
     // Slab carriers are retained for the allocator's lifetime (the documented policy), so
     // the baseline this workload returns to is the allocator's *steady state* — taken
-    // after the slab carrier exists — not a fresh allocator's all-zero stats.
-    let warm = alloc.alloc(layout(1024, MIN_ALIGN)).expect("warm-up");
+    // after the slab carrier exists — not a fresh allocator's all-zero stats. The warm-up
+    // uses the **one** slab size the workload below also uses (`SLAB_SIZE`), so a single
+    // retained slab carrier serves the whole run: a second slab size would map a second
+    // per-class carrier, which would legitimately still be there at the end.
+    const SLAB_SIZE: usize = 512;
+    let warm = alloc.alloc(layout(SLAB_SIZE, MIN_ALIGN)).expect("warm-up");
     // SAFETY: live allocation freed exactly once.
-    unsafe { alloc.dealloc(warm, layout(1024, MIN_ALIGN)) };
+    unsafe { alloc.dealloc(warm, layout(SLAB_SIZE, MIN_ALIGN)) };
     let baseline = alloc.stats();
     assert_eq!(baseline.live_blocks, 0);
     assert_eq!(baseline.live_bytes, 0);
     assert_eq!(baseline.sbc_carriers, 0);
-    assert!(baseline.mbc_carriers >= 1, "the slab carrier exists");
+    assert_eq!(
+        baseline.mbc_carriers, 1,
+        "exactly the one slab carrier the warm-up mapped"
+    );
 
-    // A long mixed sequence over all three paths: slab blocks (all inside one class, so
-    // the retained slab carrier serves them and the baseline stays comparable), mid blocks
+    // A long mixed sequence over all three paths: slab blocks (all the same class, so the
+    // retained slab carrier serves them and the steady state stays comparable), mid blocks
     // sharing variable-size carriers, and dedicated single-block carriers at or above
     // `sbct`.
     let mut live: Vec<(NonNull<u8>, Layout)> = Vec::new();
     for index in 0..200usize {
         let l = match index % 4 {
-            0 => layout(1 + (index * 37) % 512, MIN_ALIGN),
+            0 => layout(SLAB_SIZE, MIN_ALIGN),
             1 => layout(2000 + (index * 24) % 300, MIN_ALIGN),
             2 => layout(4097 + (index * 64) % 5000, MIN_ALIGN),
             _ => layout(sbct + (index % 3) * 4096, MIN_ALIGN),
@@ -814,10 +828,20 @@ fn a_mixed_slab_mid_and_large_workload_returns_to_its_steady_state() {
     let after = alloc.stats();
     assert_eq!(after.live_blocks, baseline.live_blocks);
     assert_eq!(after.live_bytes, baseline.live_bytes);
-    assert_eq!(after.carriers, baseline.carriers);
+    // Both other paths hand their mapping back: a variable-size mid carrier is released
+    // once its last block is freed (the segment coalesces), and a dedicated single-block
+    // carrier is released on its only free. Only the slab carrier is retained (M1 policy),
+    // so the retained set is exactly the warm-up's one carrier.
+    assert_eq!(
+        after.carriers, baseline.carriers,
+        "only the retained slab carrier survives; mid and dedicated carriers are released"
+    );
     assert_eq!(after.carrier_bytes, baseline.carrier_bytes);
     assert_eq!(after.sbc_carriers, baseline.sbc_carriers);
-    assert_eq!(after.mbc_carriers, baseline.mbc_carriers);
+    assert_eq!(
+        after.mbc_carriers, baseline.mbc_carriers,
+        "the retained slab carrier alone, plus no leftover variable-size carrier"
+    );
     assert_eq!(after.carriers, after.sbc_carriers + after.mbc_carriers);
 }
 
