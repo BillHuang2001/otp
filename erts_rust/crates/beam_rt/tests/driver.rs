@@ -767,3 +767,125 @@ fn a_spawn_driver_port_delivers_driver_output_to_its_owner() {
 
     fixture.cleanup();
 }
+
+// ---------------------------------------------------------------------------------------------
+// The driver event/timer surface: `driver_select` → `ready_input`, `driver_set_timer` → `timeout`
+// ---------------------------------------------------------------------------------------------
+
+/// The committed C source of the **event/timer** fixture, compiled at test time by
+/// [`compile_c`] under the stem `event` (the `driver_name` its entry declares).
+const EVENT_DRIVER_C: &str = include_str!("fixtures/event_driver.c");
+
+/// The committed Erlang half of the same test; `{path}` is replaced by the compiled driver's path
+/// (see `tests/fixtures/README.md` — the path only exists at test time, so no `.beam` is committed).
+const EVENT_DRIVER_ERL: &str = include_str!("fixtures/event_driver.erl");
+
+/// The two driver callbacks the runtime's **poller** has to drive for a driver port reach the port's
+/// owner: the descriptor the driver selected with `driver_select` runs its `ready_input` when it
+/// becomes readable (`"R"`), and the deadline it armed with `driver_set_timer` runs its `timeout` at
+/// its deadline (`"T"`).
+///
+/// # Why this is the only proof of the event/timer surface
+///
+/// The two services are the only `DriverHost` requests that cannot be answered by a value the host
+/// captures: both must reach the runtime's poller — `driver_select` registers the driver's own
+/// descriptor with it, and `driver_set_timer`'s deadline has to be mirrored into the port's
+/// `TIMEOUT` task and clamp the poll round. [`beam_abi`] cannot test that (it has no poller), and
+/// the in-module `beam_rt` tests use a Rust recorder driver, not a real C driver. Here a real
+/// driver object is `dlopen`ed, its `start` callback really arms a select on one end of an internal
+/// `pipe(2)` and a 50 ms timer, and Erlang drives it through `Runtime`:
+///
+/// 1. `port_command(<<"go">>)` reaches the driver's `output`, which writes one byte to the pipe's
+///    write end — making the **selected** read end readable, which is the only reason the runtime's
+///    poller reports it. The scheduled `INPUT` task then runs the driver's `ready_input` (draining
+///    the byte: the poller is edge-triggered), which answers `driver_output("R")`.
+/// 2. The port timer fires at its deadline and runs the driver's `timeout`, which answers
+///    `driver_output("T")`.
+///
+/// Both bytes reach the owner as `{Port, {data, Data}}` messages, and the fixture collects the two
+/// in arrival order (`tests/fixtures/event_driver.erl`), so the returned `{Read, Timer}` tuple is
+/// direct evidence of both callbacks having run. Either one missing shows up as the atom `timeout`
+/// in that position (each `receive` is bounded), so a failure names the path that did not fire.
+///
+/// Oracle ground truth (OTP 29 / `erts-17.1`, verified with this very fixture `.so`): the C
+/// `driver_select` registers the descriptor with the emulator's poll set (`erl_check_io.c`) and
+/// `driver_set_timer` with its timer wheel (`erl_hl_timer.c`), so `ready_input`/`timeout` run
+/// exactly there too:
+///
+/// ```none
+/// $ erl -noshell -eval 'ok = erl_ddll:load_driver("<dir>", "event"),
+///       P = open_port({spawn_driver, "event"}, [binary]),
+///       true = port_command(P, <<"go">>),
+///       A = receive {P,{data,D1}} -> D1 after 5000 -> timeout end,
+///       B = receive {P,{data,D2}} -> D2 after 5000 -> timeout end,
+///       io:format("~p ~p~n", [A, B]), halt(0).'
+/// <<"R">> <<"T">>
+/// ```
+#[test]
+fn a_driver_select_and_a_driver_timer_both_reach_the_owner() {
+    // The A.4 link seam: the `.so` leaves its `driver_*` imports undefined, so the test binary must
+    // publish them (see `the_binary_exports_the_driver_symbols_a_driver_imports`).
+    let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
+
+    let Some(fixture) = compile_c("events", "event", EVENT_DRIVER_C) else {
+        return;
+    };
+    // The Erlang fixture needs the driver's path (the loader appends the `.so` suffix), which only
+    // exists now.
+    let source = EVENT_DRIVER_ERL.replace("{path}", &fixture.stem.display().to_string());
+    let Some(beam) = compile_erl(&fixture.dir, "event_driver", &source) else {
+        fixture.cleanup();
+        return;
+    };
+
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.load_module(&beam).expect("the event fixture loads");
+    let pid = rt
+        .spawn_process("event_driver", "recv", vec![])
+        .expect("spawn event_driver:recv/0");
+
+    // Drive the scheduler until the receiver returns. The receiver opens the port (whose `start`
+    // arms the select and the timer), issues `port_command`, and then blocks in its first
+    // `receive`; the same scheduler pass's port half polls the driver's descriptor, runs the
+    // scheduled `INPUT` task (⇒ `ready_input` ⇒ `"R"`), delivers it into the mailbox and resumes
+    // the receiver; a later pass clamps its poll to the timer's deadline, runs the `TIMEOUT` task
+    // (⇒ `timeout` ⇒ `"T"`) and wakes the receiver for the second message. The bounded loop keeps
+    // the test independent of the timer's latency rather than asserting a single-call fixpoint.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.process_result(pid).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the driver port never produced both of its messages"
+        );
+        rt.run_scheduler().expect("the scheduler pass runs");
+        sleep(Duration::from_millis(5));
+    }
+
+    // The receiver returned `{Read, Timer}` — the two `{Port, {data, Data}}` payloads in arrival
+    // order. Rendered through the runtime's own `~p` printer so a failure names what did arrive
+    // (a missing byte is the atom `timeout` in its position).
+    let result = rt.process_result(pid).expect("the receiver returned");
+    let rendered = rt
+        .format_term_w(result, None)
+        .unwrap_or_else(|error| format!("<unprintable: {error}>"));
+    for (index, byte, label) in [(0, b'R', "ready_input"), (1, b'T', "timeout")] {
+        let element = terms::tuple_element(result, index).unwrap_or_else(|_| {
+            panic!("expected the {{Read, Timer}} tuple of the driver port, got {rendered}")
+        });
+        assert_eq!(
+            terms::binary_bytes(element).unwrap_or_else(|_| panic!(
+                "{label}: expected `{}` as a binary, got {rendered}",
+                char::from(byte)
+            )),
+            &[byte][..],
+            "{label}: the callback's `driver_output` byte must reach the owner (got {rendered})"
+        );
+    }
+    // A returning process exits `normal` (its `x(0)` is not its exit reason), leaves the process
+    // table and leaves nothing queued behind.
+    assert!(rt.process_exit(pid).is_none(), "the receiver exited normally");
+    assert!(rt.processes().get(pid).is_none());
+    assert_eq!(rt.run_queue_len(), 0);
+
+    fixture.cleanup();
+}

@@ -33,6 +33,54 @@ also the differential oracle.
   `timeout`, the compiler-folded `after 0`, a matched queued message, a message that **cancels**
   an armed deadline, and a bare `wait`).
 
+## Driver fixtures (never committed — compiled at test time)
+
+`event_driver.c` and `event_driver.erl` are the **driver event/timer** pair for
+`tests/driver.rs::a_driver_select_and_a_driver_timer_both_reach_the_owner` (contract A.4):
+
+* `event_driver.c` is a real driver shared object: `start` arms `driver_select` on the read end of
+  an internal `pipe(2)` and a `driver_set_timer` deadline, `output` writes one byte to the write end
+  (making the selected descriptor readable), `ready_input` drains that byte and answers
+  `driver_output("R")`, and `timeout` answers `driver_output("T")`. Its entry's `driver_name` is
+  `event`, so the compiled object's stem must be `event` (the name `{spawn_driver, Path}` derives
+  from the path — see `beam_rt::port::driver_lookup`).
+* `event_driver.erl` (`recv/0`) opens that port with `{spawn_driver, "{path}"}`, `port_command`s it
+  one byte, and collects the two `{Port, {data, Data}}` messages — each `receive` bounded by
+  `after 5000`, so a missing byte shows up as the atom `timeout` in its position.
+
+Neither is committed in compiled form, because **both** embed the scratch directory the test builds
+in: the test replaces the `.erl`'s `{path}` placeholder with the compiled `.so`'s path (known only
+then) and compiles the result. The C side is compiled with `$CC` (or `cc`) against the host
+`erl_driver.h`; the Erlang side with the system `erlc`. Both halves are skipped **loudly** (and the
+test returns) when a tool is missing, so a tree without the host toolchain never silently passes.
+
+The Erlang half must never be *committed* as a `.beam` with an absolute path baked in; the test-time
+artifact lives under `$TMPDIR` and can be checked with:
+
+```sh
+strings "$TMPDIR"/beam_rt_driver_events_*/event_driver.beam | rg 'workers|/home/'
+```
+
+(no output = nothing about the checkout leaked). The `.so` and `.beam` the test compiles are removed
+again by the test itself (`Fixture::cleanup`).
+
+Oracle values (the fixture is valid against the real system, verified with the same `.so`):
+
+```sh
+INC=$(erl -noshell -eval 'io:format("~s",[code:lib_dir(erts,include)])' -s init stop)
+cc -shared -fPIC -I"$INC" -o "$TMPDIR/event.so" event_driver.c
+erl -noshell -eval 'ok = erl_ddll:load_driver(os:getenv("TMPDIR"), "event"),
+    P = open_port({spawn_driver, "event"}, [binary]),
+    true = port_command(P, <<"go">>),
+    A = receive {P,{data,D1}} -> D1 after 5000 -> timeout end,
+    B = receive {P,{data,D2}} -> D2 after 5000 -> timeout end,
+    io:format("~p ~p~n",[A,B]), halt(0).'
+# <<"R">> <<"T">>
+```
+
+so `ready_input`'s byte is `<<"R">>`, `timeout`'s is `<<"T">>`, and the runtime's own answer is
+asserted against exactly that pair.
+
 ## Regeneration
 
 `mailbox`, `sched`, `port_recv`, `raise_structured` and `function_clause_fixture` are compiled
