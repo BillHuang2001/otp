@@ -247,6 +247,14 @@ the only place in this crate that holds raw `ErlDrv*` pointers and calls foreign
     runs `ready_async` when the entry has one else the driver's `async_free`; `beam_rt` calls this from the
     port-task round. `make_loaded(path, name, command, host) -> Result<Box<dyn Driver>>` is the built-in/`.so`
     unification helper (see *Design Decisions*).
+  - **Current-host publication** — `DriverPort::call` wraps every callback it routes
+    (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`/`port_exit`/`stop`, plus `poll_async`'s
+    `ready_async` branch) in `beam_abi::with_current_host`, and `poll_async`'s `async_free` branch — which
+    bypasses `call` — publishes separately. These are the only paths that run driver code, so the two port-less
+    slots (`add_driver_entry`/`remove_driver_entry`) reach a host during a callback and answer the C's failure
+    value outside one. The published `&mut dyn DriverHost` is derived from a raw `*mut AbiHost` (the `Box` the
+    port owns) with a documented `// SAFETY:` rationale, so it does not conflict with `call`'s shared borrow of
+    the `DriverPort`.
   - `Driver` mapping: `name` = the entry's name; `flags` = `SOFT_BUSY` iff `ERL_DRV_FLAG_SOFT_BUSY` (other
     `ERL_DRV_FLAG_*` bits have no counterpart); `start` (absent slot or any of
     `ERL_DRV_ERROR_GENERAL`/`ERRNO`/`BADARG` ⇒ `BadArg`, else keeps the `ErlDrvData`); `output`/`ready_output`
