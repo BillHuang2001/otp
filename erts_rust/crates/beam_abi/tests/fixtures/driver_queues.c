@@ -20,7 +20,11 @@
  * Rust (`driver_alloc`/`driver_free`, `driver_alloc_binary`/`driver_free_binary` and the eleven
  * queue functions). A reference to an unimplemented slot would make `dlopen(RTLD_NOW)` fail.
  *
- * # What each control command does (it writes a one-line report into the reply buffer)
+ * # What each control command does (it publishes a one-line report through `driver_output`)
+ *
+ * The report is delivered with `driver_output(st->port, text, strlen(text))` rather than written
+ * into the `control` reply buffer: the emulator's reply buffer truncates at ~63 bytes, which cut
+ * the longer reports off, whereas `driver_output` reaches the port owner verbatim.
  *
  * * `1` — append two 5-byte buffers, then report `driver_sizeq`, the `driver_peekq` entry count and
  *   per-entry byte count, `driver_peekqv`'s byte count and filled vector, a partial `driver_deq`,
@@ -62,14 +66,10 @@ static void qd_stop(ErlDrvData drv_data) {
         driver_free(drv_data);
 }
 
-/* Publish `text` as this control call's reply (truncated to `rlen`) and return its length. */
-static ErlDrvSSizeT publish(char **rbuf, ErlDrvSizeT rlen, const char *text) {
+/* Publish `text` to the port owner through `driver_output` and return its length. */
+static ErlDrvSSizeT publish(qd_state *st, const char *text) {
     size_t n = strlen(text);
-    if (rbuf == NULL || *rbuf == NULL)
-        return 0;
-    if ((ErlDrvSizeT) n > rlen)
-        n = (size_t) rlen;
-    memcpy(*rbuf, text, n);
+    (void) driver_output(st->port, (char *) text, n);
     return (ErlDrvSSizeT) n;
 }
 
@@ -83,6 +83,8 @@ static ErlDrvSSizeT qd_case1(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
     int i, a, b;
     ErlDrvSizeT size1, first, sum, pk, dq3, size2, dqover, size3, dqexact, size4, pk_e;
 
+    (void) rbuf;
+    (void) rlen;
     memset(&ev, 0, sizeof(ev));
     memset(&ev2, 0, sizeof(ev2));
 
@@ -122,7 +124,7 @@ static ErlDrvSSizeT qd_case1(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
              ev.vsize, (size_t) ev.size, (size_t) dq3, (size_t) size2, (size_t) dqover,
              (size_t) size3, (size_t) dqexact, (size_t) size4, (ve == NULL), vlen_e,
              (size_t) pk_e, ev2.vsize);
-    return publish(rbuf, rlen, report);
+    return publish(st, report);
 }
 
 /* Command 2: the head/tail variants, the binary forms, `skip`, and vec_to_buf. */
@@ -138,6 +140,8 @@ static ErlDrvSSizeT qd_case2(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
     int c1, c2, eb, pb, zero, enqv, pushqv;
     ErlDrvSizeT size1, size2, size_mid, size3, r4, rbig, rzero;
 
+    (void) rbuf;
+    (void) rlen;
     c1 = driver_pushq(p, "cd", 2);
     c2 = driver_pushq(p, "ab", 2);
     size1 = driver_sizeq(p);
@@ -147,9 +151,9 @@ static ErlDrvSSizeT qd_case2(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
      * already copied the bytes). */
     bin = driver_alloc_binary(4);
     if (bin == NULL)
-        return publish(rbuf, rlen, "driver_alloc_binary failed");
+        return publish(st, "driver_alloc_binary failed");
     memcpy(bin->orig_bytes, "wxyz", 4);
-    eb = driver_enq_bin(p, bin, 1, 2);      /* "yz" appended */
+    eb = driver_enq_bin(p, bin, 1, 2);      /* "xy" ("wxyz"[1..3]) appended */
     pb = driver_pushq_bin(p, bin, 0, 2);    /* "wx" prepended */
     zero = driver_enq(p, "x", 0);           /* the C's early return: 0, nothing queued */
     size2 = driver_sizeq(p);
@@ -206,7 +210,7 @@ static ErlDrvSSizeT qd_case2(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
              c1, c2, (size_t) size1, eb, pb, zero, (size_t) size2, enqv, (size_t) size_mid,
              pushqv, (size_t) size3, (size_t) r4, bytes4, (size_t) rbig, bytesbig,
              (size_t) rzero);
-    return publish(rbuf, rlen, report);
+    return publish(st, report);
 }
 
 /* Command 3: does `driver_enqv` advance the caller's vector in place? */
@@ -220,6 +224,8 @@ static ErlDrvSSizeT qd_case3(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
     int enqv, vlen = -1, moved;
     ErlDrvSizeT size, entry, iov0_len, ev_size;
 
+    (void) rbuf;
+    (void) rlen;
     binv[0] = NULL;
     iov[0].iov_base = (char *) "abcdef";
     iov[0].iov_len = 6;
@@ -248,7 +254,7 @@ static ErlDrvSSizeT qd_case3(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
     snprintf(report, sizeof(report),
              "enqv=%d size=%zu vlen=%d entry=%zu ev_iov0_len=%zu ev_size=%zu vector_moved=%d",
              enqv, (size_t) size, vlen, (size_t) entry, (size_t) iov0_len, (size_t) ev_size, moved);
-    return publish(rbuf, rlen, report);
+    return publish(st, report);
 }
 
 /* Command 4: the empty-queue readings on a fresh port. */
@@ -260,6 +266,8 @@ static ErlDrvSSizeT qd_case4(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
     int vlen = -1;
     ErlDrvSizeT size, pk, dq0, dq1;
 
+    (void) rbuf;
+    (void) rlen;
     /* Poison the vector so `driver_peekqv`'s zeroing is observable. */
     memset(&ev, 0xAA, sizeof(ev));
 
@@ -274,7 +282,7 @@ static ErlDrvSSizeT qd_case4(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
              "ev.binv_null=%d deq0=%zu deq1=%zu",
              (size_t) size, (v == NULL), vlen, (size_t) pk, ev.vsize, (size_t) ev.size,
              (ev.iov == NULL), (ev.binv == NULL), (size_t) dq0, (size_t) dq1);
-    return publish(rbuf, rlen, report);
+    return publish(st, report);
 }
 
 /* The driver "ioctl" behind `port_control/3`. */
@@ -284,6 +292,8 @@ static ErlDrvSSizeT qd_control(ErlDrvData drv_data, unsigned int command,
     qd_state *st = (qd_state *) drv_data;
     (void) buf;
     (void) len;
+    (void) rbuf;
+    (void) rlen;
     switch (command) {
     case 1:
         return qd_case1(st, rbuf, rlen);
@@ -294,7 +304,7 @@ static ErlDrvSSizeT qd_control(ErlDrvData drv_data, unsigned int command,
     case 4:
         return qd_case4(st, rbuf, rlen);
     default:
-        return publish(rbuf, rlen, "unknown command");
+        return publish(st, "unknown command");
     }
 }
 
