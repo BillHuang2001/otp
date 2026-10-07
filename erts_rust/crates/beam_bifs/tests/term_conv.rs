@@ -1,13 +1,19 @@
 //! Integration tests for the `term_conv` BIFs —
 //! `erlang:bitstring_to_list/1`, `erlang:delete_element/2`,
 //! `erlang:insert_element/3`, `erlang:iolist_to_iovec/1`, `erlang:is_integer/3`,
-//! `erlang:display/1`, `erlang:display_string/2` and
-//! `binary:referenced_byte_size/1` — driven through
+//! `erlang:display/1`, `erlang:display_string/2`,
+//! `binary:referenced_byte_size/1`, and the textual pid/ref/port conversions
+//! `erlang:pid_to_list/1`, `erlang:list_to_pid/1`, `erlang:ref_to_list/1`,
+//! `erlang:list_to_ref/1`, `erlang:pid_to_binary/1`, `erlang:ref_to_binary/1`,
+//! `erlang:port_to_binary/1` — driven through
 //! [`BifRegistry::call`](beam_bifs::BifRegistry::call) (the crate's public seam).
 //!
 //! Every expectation is pinned to the OTP 29 / erts-17.1 oracle; the probe is
 //! quoted at the assertion. One test re-runs the shared goldens under the live
-//! system `erl` and **skips loudly** when the oracle is unavailable.
+//! system `erl` and **skips loudly** when the oracle is unavailable. The three
+//! `*_to_binary/1` keys are OTP-30 additions the oracle does not export, so they
+//! are pinned to `bif.c` instead (see
+//! [`the_to_binary_variants_are_absent_from_the_otp29_oracle`]).
 //!
 //! Bitstring arguments/results are built and read with the sibling **safe**
 //! `beam_codec::term` helpers, because the crate's own bitstring helpers are
@@ -17,10 +23,10 @@
 use std::process::Command;
 
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink};
+use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink, TableRegistry};
 use beam_codec::term as codec_term;
 use beam_common::BeamError;
-use beam_process::ProcessId;
+use beam_process::{PortId, ProcessId};
 use beam_term::{atom_val, compare::eq, is_small, signed_value, AtomTable, Eterm, NIL};
 
 fn seeded_atoms() -> AtomTable {
@@ -886,10 +892,411 @@ fn display_string_reports_the_unmodelled_streams_and_binary_payloads() {
 }
 
 // ---------------------------------------------------------------------------
-// Live oracle cross-check
+// The textual pid/ref/port conversions
+//
+//   pid_to_list/1  list_to_pid/1  ref_to_list/1  list_to_ref/1
+//   pid_to_binary/1  ref_to_binary/1  port_to_binary/1
+//
+// The `*_to_list/1` forms render the same `%T` text the `*_to_binary/1` forms
+// return as bytes, so each golden below pins the charlist and the binary together.
 // ---------------------------------------------------------------------------
 
-/// The goldens the other tests assert, re-run under the live system `erl`.
+/// The bytes of a `*_to_list/1` charlist result.
+fn text_bytes(list: Eterm) -> Vec<u8> {
+    int_elements(list).into_iter().map(|v| v as u8).collect()
+}
+
+/// The bytes of a `*_to_binary/1` result.
+fn binary_text(term: Eterm) -> Vec<u8> {
+    let (packed, size_bits) = bits_of(term);
+    assert_eq!(size_bits % 8, 0, "a byte-aligned binary");
+    packed[..size_bits / 8].to_vec()
+}
+
+/// The charlist of the ASCII `text`.
+fn chars(ctx: &mut BifContext<'_>, text: &str) -> Eterm {
+    let elems: Vec<Eterm> = text
+        .bytes()
+        .map(|b| ctx.int(i64::from(b)).expect("a byte fits"))
+        .collect();
+    ctx.list(&elems).expect("the list fits")
+}
+
+#[test]
+fn pid_to_list_renders_the_oracle_text() {
+    // ORACLE (OTP 29.1.1 / erts-17.1):
+    //   erl -noshell -eval 'io:format("~p~n",[erlang:pid_to_list(erlang:list_to_pid("<0.123.7>"))])'
+    //     => "<0.123.7>"
+    //   erl -noshell -eval 'io:format("~p~n",[erlang:pid_to_list(self())])'
+    //     => "<0.10.0>"
+    //   erl -noshell -eval 'io:format("~p~n",[try erlang:pid_to_list(5) catch error:R -> R end])'
+    //     => badarg
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+
+    let pid = ProcessId::new(123, 7).to_eterm();
+    let text = call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[pid]).expect("a pid");
+    // The exact list of small integers the oracle prints.
+    assert_eq!(int_elements(text), vec![60, 48, 46, 49, 50, 51, 46, 55, 62]);
+    assert_eq!(text_bytes(text), b"<0.123.7>");
+
+    // The oracle's own `-noshell` main process is `<0.10.0>`.
+    let main = ProcessId::new(10, 0).to_eterm();
+    let text = call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[main]).expect("a pid");
+    assert_eq!(text_bytes(text), b"<0.10.0>");
+
+    // A non-pid — an integer, the empty list, a port — is `badarg`.
+    let five = small(&mut ctx, 5);
+    let port = PortId::new(3).to_eterm();
+    for term in [five, NIL, port] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[term]),
+            Err(BeamError::BadArg)
+        ));
+    }
+}
+
+#[test]
+fn list_to_pid_parses_and_round_trips() {
+    // ORACLE:
+    //   erlang:list_to_pid(erlang:pid_to_list(self())) =:= self()   => true
+    //   erlang:list_to_pid("<0.123.7>")                            => <0.123.7>
+    //   erlang:list_to_pid("<0.01.0>")                             => <0.1.0>
+    //   erlang:list_to_pid("<0.0.4294967295>")                     => <0.0.4294967295>
+    //   and `"bogus"`, `"<0.10.0"` (missing `>`), `[300]` (not a byte),
+    //   `<<"<0.1.0>">>` (a binary), `"<0.268435456.0>"` (number past 2^28-1),
+    //   `"<0.0.4294967296>"` (serial past 2^32-1), `"<1.1.0>"` (another node) and a
+    //   65-character string are all `badarg`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+
+    // `list_to_pid(pid_to_list(P)) =:= P`.
+    for pid in [
+        ProcessId::new(123, 7),
+        ProcessId::new(0, 0),
+        ProcessId::new(268_435_455, 4_294_967_295),
+    ] {
+        let text = call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[pid.to_eterm()])
+            .expect("a pid");
+        let back = call(&reg, &mut ctx, "erlang", "list_to_pid", 1, &[text]).expect("a pid text");
+        assert!(
+            eq(back, pid.to_eterm(), &atoms),
+            "the round trip must hold for {pid:?}"
+        );
+    }
+
+    // Leading zeros are accepted, and normalize away.
+    let zeros = chars(&mut ctx, "<0.01.0>");
+    let back = call(&reg, &mut ctx, "erlang", "list_to_pid", 1, &[zeros]).expect("a pid text");
+    assert!(eq(
+        back,
+        ProcessId::new(1, 0).to_eterm(),
+        &atoms
+    ));
+    let text = call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[back]).expect("a pid");
+    assert_eq!(text_bytes(text), b"<0.1.0>");
+
+    // Every malformed string is `badarg` — never a fabricated pid.
+    for bad in [
+        "bogus",
+        "",
+        "<0.10.0",
+        "<0.10.0> ",
+        "<0.10.0.1>",
+        "<1.1.0>",
+        "<0.268435456.0>",
+        "<0.0.4294967296>",
+        "<999999999999999999999999.1.0>",
+        "<0..1>",
+        "<0.+1.0>",
+        "<0.1.0",
+    ] {
+        let text = chars(&mut ctx, bad);
+        assert!(
+            matches!(
+                call(&reg, &mut ctx, "erlang", "list_to_pid", 1, &[text]),
+                Err(BeamError::BadArg)
+            ),
+            "{bad:?} must be badarg"
+        );
+    }
+
+    // The argument must be a proper list of byte-sized small integers.
+    let not_a_byte = ints(&mut ctx, &[300]);
+    let sixty = small(&mut ctx, 60);
+    let forty_eight = small(&mut ctx, 48);
+    let improper = ctx.cons(sixty, forty_eight).expect("fits");
+    let binary = bin(&mut ctx, b"<0.1.0>");
+    let five = small(&mut ctx, 5);
+    for term in [not_a_byte, improper, binary, five] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", "list_to_pid", 1, &[term]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    // `intlist_to_buf`'s 64-byte buffer bound (`bif.c:4538-4547`): a 64-character
+    // string parses, the 65-character form is `badarg`.
+    let mut pid_64 = String::from("<0.");
+    pid_64.push_str(&"0".repeat(57));
+    pid_64.push_str("1.0>");
+    assert_eq!(pid_64.len(), 64);
+    let text = chars(&mut ctx, &pid_64);
+    assert!(call(&reg, &mut ctx, "erlang", "list_to_pid", 1, &[text]).is_ok());
+
+    let mut pid_65 = String::from("<0.");
+    pid_65.push_str(&"0".repeat(58));
+    pid_65.push_str("1.0>");
+    assert_eq!(pid_65.len(), 65);
+    let text = chars(&mut ctx, &pid_65);
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "list_to_pid", 1, &[text]),
+        Err(BeamError::BadArg)
+    ));
+}
+
+#[test]
+fn ref_to_list_renders_the_m1_ref_shape() {
+    // ORACLE:
+    //   erlang:ref_to_list(erlang:list_to_ref("#Ref<0.0.0.7>"))  => "#Ref<0.0.0.7>"
+    //   erlang:is_reference(erlang:list_to_ref("#Ref<0.0.0.1>")) => true
+    //   erlang:list_to_ref(erlang:ref_to_list(erlang:make_ref())) =:= ... => parses
+    //   erlang:ref_to_list(5)                                    => error:badarg
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+
+    // A reference parsed from the canonical M1 shape renders it back verbatim.
+    let text = chars(&mut ctx, "#Ref<0.0.0.7>");
+    let reference =
+        call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[text]).expect("a ref text");
+    let rendered = call(&reg, &mut ctx, "erlang", "ref_to_list", 1, &[reference]).expect("a ref");
+    assert_eq!(text_bytes(rendered), b"#Ref<0.0.0.7>");
+    assert!(eq(
+        call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[rendered]).expect("a ref text"),
+        reference,
+        &atoms
+    ));
+
+    // Leading zeros normalize (`#Ref<00.00.00.01>` => `#Ref<0.0.0.1>` in the oracle).
+    let zeros = chars(&mut ctx, "#Ref<00.00.00.01>");
+    let reference =
+        call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[zeros]).expect("a ref text");
+    let rendered = call(&reg, &mut ctx, "erlang", "ref_to_list", 1, &[reference]).expect("a ref");
+    assert_eq!(text_bytes(rendered), b"#Ref<0.0.0.1>");
+
+    // A non-reference is `badarg`.
+    let five = small(&mut ctx, 5);
+    for term in [five, NIL, ProcessId::new(1, 0).to_eterm()] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", "ref_to_list", 1, &[term]),
+            Err(BeamError::BadArg)
+        ));
+    }
+}
+
+#[test]
+fn ref_to_list_renders_a_runtime_built_reference() {
+    // The ETS bridge hands its table id out as the crate's `access` ref thing
+    // (`src/ets.rs` `new_2`), so a *runtime-built* reference renders the same
+    // `#Ref<0.0.0.N>` text and round-trips — exactly the convention
+    // `src/print.rs`'s `format_ref` and this module's `ref_text` share.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+
+    let name = ctx.atom("bogus").expect("seeded");
+    let tid = call(&reg, &mut ctx, "ets", "new", 2, &[name, NIL]).expect("a table is created");
+    assert!(
+        matches!(
+            call(&reg, &mut ctx, "erlang", "is_reference", 1, &[tid]),
+            Ok(_)
+        ),
+        "the tid is a reference"
+    );
+
+    let rendered = call(&reg, &mut ctx, "erlang", "ref_to_list", 1, &[tid]).expect("a ref");
+    let bytes = text_bytes(rendered);
+    assert!(
+        bytes.starts_with(b"#Ref<0.0.0.") && bytes.ends_with(b">"),
+        "unexpected ref text {bytes:?}"
+    );
+
+    let back = call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[rendered]).expect("a ref text");
+    assert!(eq(back, tid, &atoms), "the runtime ref round-trips");
+}
+
+#[test]
+fn list_to_ref_rejects_shapes_the_m1_ref_thing_cannot_hold() {
+    // The Milestone-1 ref thing is `[header, node, serial, id]`
+    // (`access::make_ref_thing`): one id word, node/serial always `0`. A reference
+    // naming another node (`#Ref<1.0.0.1>`) or a non-zero upper ref number
+    // (`#Ref<0.1.0.1>`) — both fine in the oracle — is a reference this runtime
+    // cannot materialize, so it is `badarg`, never a silently lossy reference.
+    // `"bogus"`, `"#Ref<0.0.0>"` (one number short), `"#Ref<0.0.0.1.2>"` (one too
+    // many) and a 72-character string are likewise `badarg`; the 71-character form
+    // is within `intlist_to_buf`'s buffer (`bif.c:4727-4732`).
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    for bad in [
+        "bogus",
+        "",
+        "#Ref<0.0.0>",
+        "#Ref<0.0.0.1.2>",
+        "#Ref<1.0.0.1>",
+        "#Ref<0.1.0.1>",
+        "#Ref<0.0.1.1>",
+        "#Ref<0.0.0.1",
+        "#Ref<0.0.0.1>>",
+    ] {
+        let text = chars(&mut ctx, bad);
+        assert!(
+            matches!(
+                call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[text]),
+                Err(BeamError::BadArg)
+            ),
+            "{bad:?} must be badarg"
+        );
+    }
+
+    let binary = bin(&mut ctx, b"#Ref<0.0.0.1>");
+    let five = small(&mut ctx, 5);
+    for term in [binary, five, NIL] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[term]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    for (text, len) in [("71", 71usize), ("72", 72usize)] {
+        let mut s = String::from("#Ref<0.");
+        s.push_str(&"0".repeat(len - 13));
+        s.push_str("1.0.1>");
+        assert_eq!(s.len(), len);
+        let t = chars(&mut ctx, &s);
+        let result = call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[t]);
+        assert!(
+            matches!(result, Err(BeamError::BadArg)),
+            "{text}-character string with a non-zero upper ref number must be badarg"
+        );
+    }
+
+    // The buffer bound itself: a 71-character string in the representable shape
+    // parses, the 72-character form is `badarg` (`bif.c:4727-4732`; oracle-verified
+    // at the 71/72 boundary).
+    let mut fits = String::from("#Ref<0.0.0.");
+    fits.push_str(&"0".repeat(58));
+    fits.push_str("1>");
+    assert_eq!(fits.len(), 71);
+    let t = chars(&mut ctx, &fits);
+    let reference = call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[t]).expect("a ref text");
+    let rendered = call(&reg, &mut ctx, "erlang", "ref_to_list", 1, &[reference]).expect("a ref");
+    assert_eq!(text_bytes(rendered), b"#Ref<0.0.0.1>");
+
+    let mut too_long = String::from("#Ref<0.0.0.");
+    too_long.push_str(&"0".repeat(59));
+    too_long.push_str("1>");
+    assert_eq!(too_long.len(), 72);
+    let t = chars(&mut ctx, &too_long);
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[t]),
+        Err(BeamError::BadArg)
+    ));
+}
+
+#[test]
+fn the_to_binary_variants_return_the_list_bytes() {
+    // OTP-30 additions (`bif.c:4879`/`:4886`/`:4893`). The 29.1.1 oracle does not
+    // export them (`erlang:function_exported(erlang,pid_to_binary,1)` => `false`),
+    // so the bytes are pinned to the C instead: `term2binary_dsprintf`
+    // (`bif.c:4863`) renders them through the same `"%T"` format as
+    // `term2list_dsprintf`, so the binary is byte-identical to the `*_to_list/1`
+    // charlist.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(10, 0));
+
+    let pid = ProcessId::new(123, 7).to_eterm();
+    let as_list = call(&reg, &mut ctx, "erlang", "pid_to_list", 1, &[pid]).expect("a pid");
+    let as_binary = call(&reg, &mut ctx, "erlang", "pid_to_binary", 1, &[pid]).expect("a pid");
+    assert_eq!(binary_text(as_binary), b"<0.123.7>");
+    assert_eq!(binary_text(as_binary), text_bytes(as_list));
+
+    let text = chars(&mut ctx, "#Ref<0.0.0.7>");
+    let reference =
+        call(&reg, &mut ctx, "erlang", "list_to_ref", 1, &[text]).expect("a ref text");
+    let as_list = call(&reg, &mut ctx, "erlang", "ref_to_list", 1, &[reference]).expect("a ref");
+    let as_binary =
+        call(&reg, &mut ctx, "erlang", "ref_to_binary", 1, &[reference]).expect("a ref");
+    assert_eq!(binary_text(as_binary), b"#Ref<0.0.0.7>");
+    assert_eq!(binary_text(as_binary), text_bytes(as_list));
+
+    let port = PortId::new(3).to_eterm();
+    let as_binary = call(&reg, &mut ctx, "erlang", "port_to_binary", 1, &[port]).expect("a port");
+    // The oracle's `#Port<0.3>` for `erlang:port_to_list(open_port({spawn,"true"},[]))`.
+    assert_eq!(binary_text(as_binary), b"#Port<0.3>");
+    assert!(matches!(
+        call(
+            &reg,
+            &mut ctx,
+            "erlang",
+            "port_to_list",
+            1,
+            &[port]
+        ),
+        Ok(_)
+    ));
+
+    // Each variant still type-checks its one argument.
+    let five = small(&mut ctx, 5);
+    for (name, term) in [
+        ("pid_to_binary", five),
+        ("ref_to_binary", five),
+        ("port_to_binary", five),
+        ("port_to_binary", pid),
+    ] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", name, 1, &[term]),
+            Err(BeamError::BadArg)
+        ));
+    }
+}
+
+#[test]
+fn the_to_binary_variants_are_absent_from_the_otp29_oracle() {
+    // Documents *why* the three `*_to_binary/1` goldens above are pinned to the C
+    // rather than to the live `erl`: they are OTP-30 additions the installed
+    // 29.1.1 oracle does not export. Skips loudly when the oracle is unavailable.
+    let statement = concat!(
+        "io:format(\"~p~n\",[erlang:function_exported(erlang,pid_to_binary,1)]),",
+        "io:format(\"~p~n\",[erlang:function_exported(erlang,port_to_binary,1)]),",
+        "io:format(\"~p~n\",[erlang:function_exported(erlang,ref_to_binary,1)]),",
+        "halt()."
+    );
+    let Some(stdout) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        stdout,
+        concat!("false\n", "false\n", "false\n"),
+        "the oracle now exports the OTP-30 *_to_binary/1 forms; pin them live"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live oracle cross-check
+// ---------------------------------------------------------------------------/// The goldens the other tests assert, re-run under the live system `erl`.
 ///
 /// One statement per invocation is the most robust shape, so the whole block is a
 /// single `-eval` with `io:format` calls; the oracle's stdout must match exactly.
@@ -921,5 +1328,49 @@ fn the_shared_goldens_match_the_live_oracle() {
             "badarg\n",
         ),
         "the live oracle disagrees with this test file's goldens"
+    );
+}
+
+/// The textual-conversion goldens, re-run under the live system `erl`.
+///
+/// Probes (OTP 29.1.1 / erts-17.1), one statement per `io:format`:
+///
+/// ```text
+/// erl -noshell -eval 'io:format("~p~n",[erlang:pid_to_list(erlang:list_to_pid("<0.123.7>"))])'
+///   => "<0.123.7>"
+/// erl -noshell -eval 'io:format("~p~n",[erlang:list_to_pid("<0.123.7>")])'
+///   => <0.123.7>
+/// erl -noshell -eval 'io:format("~p~n",[erlang:ref_to_list(erlang:list_to_ref("#Ref<0.0.0.7>"))])'
+///   => "#Ref<0.0.0.7>"
+/// erl -noshell -eval 'io:format("~p~n",[try erlang:list_to_pid("bogus") catch error:R -> R end])'
+///   => badarg
+/// erl -noshell -eval 'io:format("~p~n",[try erlang:list_to_ref("#Ref<0.0.0") catch error:R -> R end])'
+///   => badarg
+/// ```
+///
+/// Skips loudly when `erl` is unavailable.
+#[test]
+fn the_conversion_goldens_match_the_live_oracle() {
+    let statement = concat!(
+        "io:format(\"~p~n\",[erlang:pid_to_list(erlang:list_to_pid(\"<0.123.7>\"))]),",
+        "io:format(\"~p~n\",[erlang:list_to_pid(\"<0.123.7>\")]),",
+        "io:format(\"~p~n\",[erlang:ref_to_list(erlang:list_to_ref(\"#Ref<0.0.0.7>\"))]),",
+        "io:format(\"~p~n\",[try erlang:list_to_pid(\"bogus\") catch error:R -> R end]),",
+        "io:format(\"~p~n\",[try erlang:list_to_ref(\"#Ref<0.0.0\") catch error:R -> R end]),",
+        "halt()."
+    );
+    let Some(stdout) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        stdout,
+        concat!(
+            "\"<0.123.7>\"\n",
+            "<0.123.7>\n",
+            "\"#Ref<0.0.0.7>\"\n",
+            "badarg\n",
+            "badarg\n",
+        ),
+        "the live oracle disagrees with this test file's conversion goldens"
     );
 }

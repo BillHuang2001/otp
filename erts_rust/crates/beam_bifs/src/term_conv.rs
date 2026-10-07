@@ -1,15 +1,27 @@
 //! Term-conversion and inspection BIFs for `erlang` and `binary`:
 //! `bitstring_to_list/1`, `delete_element/2`, `insert_element/3`,
-//! `iolist_to_iovec/1`, `is_integer/3`, `display/1`, `display_string/2` and
-//! `binary:referenced_byte_size/1`.
+//! `iolist_to_iovec/1`, `is_integer/3`, `display/1`, `display_string/2`,
+//! `binary:referenced_byte_size/1`, and the textual pid/ref/port conversions
+//! `pid_to_list/1`, `list_to_pid/1`, `ref_to_list/1`, `list_to_ref/1`,
+//! `pid_to_binary/1`, `ref_to_binary/1` and `port_to_binary/1`.
 //!
 //! Ground truth (read-only): the entries in `../../erts/emulator/beam/bif.tab`
 //! (`bif erlang:bitstring_to_list/1` :493, `ubif erlang:is_integer/3` :845,
 //! `bif erlang:insert_element/3` :612, `bif erlang:delete_element/2` :613,
 //! `bif erlang:iolist_to_iovec/1` :686, `bif erlang:display/1` :60,
-//! `bif erlang:display_string/2` :61, `bif binary:referenced_byte_size/1` :561)
-//! and their implementations — `binary.c`'s `bitstring_to_list_1`,
-//! `bif.c`'s `insert_element_3`/`delete_element_2`/`display_1`/`display_string_2`,
+//! `bif erlang:display_string/2` :61, `bif binary:referenced_byte_size/1` :561,
+//! `bif erlang:list_to_pid/1` :92, `bif erlang:list_to_ref/1` :94,
+//! `bif erlang:pid_to_list/1` :126, `bif erlang:ref_to_list/1` :273,
+//! `bif erlang:pid_to_binary/1` :866, `bif erlang:port_to_binary/1` :867,
+//! `bif erlang:ref_to_binary/1` :868) and their implementations — `binary.c`'s
+//! `bitstring_to_list_1`,
+//! `bif.c`'s `insert_element_3`/`delete_element_2`/`display_1`/`display_string_2`
+//! and the textual conversions (`pid_to_list_1`:4512, `list_to_pid_1`:4532,
+//! `ref_to_list_1`:4466, `list_to_ref_1`:4712, `pid_to_binary_1`:4879,
+//! `port_to_binary_1`:4886, `ref_to_binary_1`:4893, `term2list_dsprintf`:4450,
+//! `term2binary_dsprintf`:4863), the `%T` renderer in
+//! `erl_printf_term.c` (`REF_DEF`:493, `PID_DEF`:508, `PORT_DEF`:521) and the
+//! string helper `intlist_to_buf` in `utils.c:2828`;
 //! `erl_bif_guard.c`'s `is_integer_3`, `erl_iolist.c`'s `iolist_to_iovec_1` and
 //! `erl_bif_binary.c`'s `binary_referenced_byte_size_1`.
 //!
@@ -17,7 +29,11 @@
 //!
 //! Every BIF above is registered; each one is pinned against the OTP 29 /
 //! erts-17.1 oracle (the probe is quoted at the implementation and in
-//! `tests/term_conv.rs`).
+//! `tests/term_conv.rs`). `pid_to_binary/1`, `ref_to_binary/1` and
+//! `port_to_binary/1` are OTP-30 additions the 29.1.1 oracle does **not** export
+//! (`erlang:function_exported/3` is `false` for all three); their bytes are pinned
+//! to the C instead, which renders them through the same `"%T"` format as the
+//! `*_to_list/1` forms (`term2binary_dsprintf` / `term2list_dsprintf`).
 //!
 //! Two behaviours the oracle has are **not** reproduced, because this runtime has
 //! no seam for them; both are a typed `error:unsupported_bif`, never a wrong
@@ -29,16 +45,28 @@
 //! * `display_string/2` of a binary payload that is not valid UTF-8 — the sink
 //!   takes a `&str`, so the raw bytes cannot be handed through it.
 //!
+//! # The textual conversions and the Milestone-1 identity substitution
+//!
+//! The `*_to_list/1` forms return the `%T` text of a pid/ref/port as a charlist
+//! (`buf_to_intlist`, plus the C's `\n`-free `%T`), the `*_to_binary/1` forms the
+//! same bytes as a binary. The node (channel) part is `0` — this node's *node
+//! number*, which is `0` for the `nonode@nohost` node Milestone-1 always is, the
+//! same substitution `src/port.rs` documents for `#Port<0.Num>` and
+//! `src/print.rs`'s `format_term` for `<0.Num.Ser>`/`#Ref<0.0.0.N>`.
+//!
+//! An **external** pid/port/ref is `badarg`: its node is a frozen external term no
+//! byte-exact text can be derived from, exactly as `crate::print`'s `format_term`
+//! treats it. `list_to_ref/1` accepts only the exact `#Ref<0.0.0.N>` shape this
+//! runtime's own ref thing can hold (see [`parse_ref_text`]).
+//!
 //! # Deliberately out of scope
 //!
-//! `erlang:pid_to_list/1`, `erlang:list_to_pid/1`, `erlang:ref_to_list/1`,
-//! `erlang:list_to_ref/1` and `erlang:external_size/1` are **not** registered: the
-//! first four need the decoded external pid/ref term shape and `external_size`
-//! needs the ETF encoder's size probe. They stay unregistered (`undef`) rather than
-//! approximated.
+//! `erlang:external_size/1` is **not** registered: it needs the ETF encoder's size
+//! probe. It stays unregistered (`undef`) rather than approximated.
 
 use beam_common::Result;
 use beam_codec::term as codec_term;
+use beam_process::{PortId, ProcessId, MAX_PROCESS_NUMBER, MAX_PROCESS_SERIAL};
 use beam_term::prelude::signed_value;
 use beam_term::{atom_val, Eterm, ERL_ONHEAP_BITS_LIMIT, NIL};
 
@@ -46,7 +74,7 @@ use crate::access;
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
-use crate::print::{flatten, term_chunk, UNLIMITED_DEPTH};
+use crate::print::{flatten, proper_list, term_chunk, UNLIMITED_DEPTH};
 use crate::registry::BifRegistry;
 
 // ---------------------------------------------------------------------------
@@ -483,7 +511,326 @@ fn display_string_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.boolean(true)
 }
 
-/// Registers this module's BIFs (eight keys: seven `erlang` and one `binary`).
+// ---------------------------------------------------------------------------
+// The textual pid/ref/port conversions
+//
+//   pid_to_list/1  list_to_pid/1  ref_to_list/1  list_to_ref/1
+//   pid_to_binary/1  ref_to_binary/1  port_to_binary/1
+// ---------------------------------------------------------------------------
+
+/// The node number of the local node — the `%T` renderer's `pid_channel_no` /
+/// `ref_channel_no` / `port_channel_no` (`erl_printf_term.c:512`, `:500`, `:525`),
+/// which is `0` for the `nonode@nohost` node Milestone-1 always is. The same
+/// constant `src/port.rs` uses for `#Port<0.Num>`.
+const LOCAL_NODE_NUMBER: u64 = 0;
+
+/// The largest `erlang:list_to_pid/1` string `intlist_to_buf` accepts: the C buffer
+/// is 65 bytes and the call limit 64 (`bif.c:4538-4547`), so a longer list is
+/// `badarg` even when it spells a valid pid (oracle: a 65-character
+/// `<0.000…001.0>` ⇒ `badarg`, while the 64-character form parses).
+const PID_TEXT_MAX: usize = 64;
+
+/// The largest `erlang:list_to_ref/1` string: the C buffer is
+/// `5 + (1 + ERTS_MAX_REF_NUMBERS)*(10 + 1) + 1 == 72` bytes with the call limit
+/// `sizeof(buf) - 1 == 71` (`bif.c:4727-4732`) — a 72-character list is `badarg`
+/// (oracle-verified at the 71/72 boundary).
+const REF_TEXT_MAX: usize = 71;
+
+/// The largest id the Milestone-1 ref thing can hold: its `id` word is a 60-bit
+/// small integer (`access::make_ref_thing`), so a larger number names a reference
+/// this runtime cannot materialize.
+const MAX_INTERNAL_REF_NUMBER: u64 = (1 << 59) - 1;
+
+/// The `%T` text of an internal pid as raw bytes — `<channel.number.serial>`
+/// (`erl_printf_term.c:508-519`): the channel is the local node's, then the
+/// process-table number, then the serial. The same shape `crate::print`'s
+/// `format_term` renders (`src/print.rs:328-333`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a pid
+/// (`erlang:pid_to_list(5)` ⇒ `badarg`). An **external** pid is likewise `badarg`:
+/// its node is a frozen external term no byte-exact text can be derived from, the
+/// same treatment `crate::print`'s `format_term` gives it.
+fn pid_text(term: Eterm) -> Result<Vec<u8>> {
+    if !access::is_pid(term) {
+        return Err(badarg());
+    }
+    // `ProcessId::from_eterm` is the crate's pid decode; it is `badarg` for an
+    // external pid (the internal-only immediate).
+    let pid = ProcessId::from_eterm(term)?;
+    Ok(format!(
+        "<{}.{}.{}>",
+        LOCAL_NODE_NUMBER,
+        pid.number(),
+        pid.serial()
+    )
+    .into_bytes())
+}
+
+/// The `%T` text of an internal port as raw bytes — `#Port<channel.number>`
+/// (`erl_printf_term.c:521-530`), the shape `src/port.rs`'s `port_to_list/1`
+/// builds as a charlist.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a port,
+/// or is an external one.
+fn port_text(term: Eterm) -> Result<Vec<u8>> {
+    if !access::is_port(term) {
+        return Err(badarg());
+    }
+    let port = PortId::from_eterm(term)?;
+    Ok(format!("#Port<{}.{}>", LOCAL_NODE_NUMBER, port.number()).into_bytes())
+}
+
+/// The `%T` text of an internal reference as raw bytes — `#Ref<channel.n2.n1.n0>`
+/// (`erl_printf_term.c:493-507`; the ref numbers print most significant first).
+///
+/// The Milestone-1 ref thing is `[header, node, serial, id]`
+/// (`access::make_ref_thing`, this crate's only producer of an internal ref), so it
+/// carries **one** id word; the rendered text is the `#Ref<0.0.0.N>` shape
+/// `src/print.rs`'s `format_ref` already emits.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a
+/// reference (`erlang:ref_to_list(5)` ⇒ `badarg`), or is an external one (its node
+/// is a frozen external term).
+fn ref_text(term: Eterm) -> Result<Vec<u8>> {
+    if !access::is_reference(term) {
+        return Err(badarg());
+    }
+    let id = access::ref_thing_id(term)?;
+    Ok(format!("#Ref<{}.0.0.{}>", LOCAL_NODE_NUMBER, id).into_bytes())
+}
+
+/// Collects `term` into the bytes of a proper list of byte-sized small integers —
+/// the C `intlist_to_buf` (`utils.c:2828`): `[]` yields no bytes, and a non-list, an
+/// improper list, a non-integer element, an element outside `0..=255`, or a list
+/// longer than `max_len` (the C's buffer bound) is `badarg`. The walk is bounded by
+/// the list's own length.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) as described above.
+fn string_bytes(term: Eterm, max_len: usize) -> Result<Vec<u8>> {
+    let elems = proper_list(term).ok_or_else(badarg)?;
+    if elems.len() > max_len {
+        return Err(badarg());
+    }
+    let mut bytes = Vec::with_capacity(elems.len());
+    for elem in elems {
+        if !access::is_small(elem) {
+            return Err(badarg());
+        }
+        bytes.push(u8::try_from(signed_value(elem)).map_err(|_| badarg())?);
+    }
+    Ok(bytes)
+}
+
+/// The charlist `[b0, b1, …]` of the bytes `bytes` (`buf_to_intlist`, `bif.c:4461`).
+///
+/// # Errors
+///
+/// Propagates a heap-allocation failure.
+fn bytes_to_string(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Result<Eterm> {
+    let mut elems = Vec::with_capacity(bytes.len());
+    for byte in bytes {
+        elems.push(ctx.int(i64::from(*byte))?);
+    }
+    ctx.list(&elems)
+}
+
+/// The `u64` value of a non-empty run of ASCII digits — the C's
+/// `while (*cp >= '0' && *cp <= '9')` field scan (`bif.c:4555`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for an empty field, a sign,
+/// whitespace, any non-digit, or a value past `u64` (`<999999999999999999999999.1.0>`
+/// ⇒ `badarg`). The scan is bounded by the field's own length.
+fn parse_digits(field: &str) -> Result<u64> {
+    if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(badarg());
+    }
+    field.parse::<u64>().map_err(|_| badarg())
+}
+
+/// Parses `<channel.number.serial>` into the internal pid it names (`bif.c:4532`).
+///
+/// The grammar is the C's: a leading `<`, three non-empty decimal fields separated
+/// by `.`, a trailing `>`, and nothing else. The channel must be the local node's
+/// (`0`); the number and serial must fit the internal pid immediate
+/// (`beam_process::{MAX_PROCESS_NUMBER, MAX_PROCESS_SERIAL}`), the C's
+/// `ERTS_MAX_INTERNAL_PID_NUMBER`/`_SERIAL` checks, so `<0.268435456.0>` and
+/// `<0.0.4294967296>` are `badarg`. Leading zeros are accepted (`<0.01.0>` ⇒
+/// `<0.1.0>`), as in the C.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for every deviation.
+fn parse_pid_text(bytes: &[u8]) -> Result<ProcessId> {
+    let text = core::str::from_utf8(bytes).map_err(|_| badarg())?;
+    let body = text
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .ok_or_else(badarg)?;
+    let mut fields = body.split('.');
+    let channel = parse_digits(fields.next().ok_or_else(badarg)?)?;
+    let number = parse_digits(fields.next().ok_or_else(badarg)?)?;
+    let serial = parse_digits(fields.next().ok_or_else(badarg)?)?;
+    if fields.next().is_some() || channel != LOCAL_NODE_NUMBER {
+        return Err(badarg());
+    }
+    if number > MAX_PROCESS_NUMBER || serial > MAX_PROCESS_SERIAL {
+        return Err(badarg());
+    }
+    Ok(ProcessId::new(number, serial))
+}
+
+/// Parses `#Ref<0.0.0.N>` (the shape [`ref_text`] renders) into the Milestone-1
+/// ref thing's id (`bif.c:4712`).
+///
+/// The textual form is `#Ref<channel.n2.n1.n0>`. The Milestone-1 ref thing carries a
+/// **single** id word plus the (always zero) node/serial words, so only the exact
+/// `#Ref<0.0.0.N>` shape is representable: a non-local channel, a non-zero upper ref
+/// number, or a shape with the wrong field count (`#Ref<0.0.0>`,
+/// `#Ref<0.0.0.1.2>`) names a reference this runtime cannot materialize and is
+/// `badarg` — never a fabricated term. Leading zeros are accepted
+/// (`#Ref<00.00.00.01>` ⇒ `#Ref<0.0.0.1>`), as in the C.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for every deviation.
+fn parse_ref_text(bytes: &[u8]) -> Result<u64> {
+    let text = core::str::from_utf8(bytes).map_err(|_| badarg())?;
+    let body = text
+        .strip_prefix("#Ref<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .ok_or_else(badarg)?;
+    let mut fields = body.split('.');
+    let channel = parse_digits(fields.next().ok_or_else(badarg)?)?;
+    let upper1 = parse_digits(fields.next().ok_or_else(badarg)?)?;
+    let upper0 = parse_digits(fields.next().ok_or_else(badarg)?)?;
+    let id = parse_digits(fields.next().ok_or_else(badarg)?)?;
+    if fields.next().is_some() {
+        return Err(badarg());
+    }
+    if channel != LOCAL_NODE_NUMBER || upper1 != 0 || upper0 != 0 {
+        return Err(badarg());
+    }
+    if id > MAX_INTERNAL_REF_NUMBER {
+        return Err(badarg());
+    }
+    Ok(id)
+}
+
+/// `pid_to_list(Pid)` (`bif.c:4512`) — the pid's `%T` text as a charlist.
+///
+/// Pinned to the oracle: `pid_to_list(list_to_pid("<0.123.7>"))` ⇒
+/// `"<0.123.7>"` (`[60,48,46,49,50,51,46,55,62]`), `pid_to_list(self())` ⇒
+/// `"<0.10.0>"`; a non-pid is `badarg`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text`].
+fn pid_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let text = pid_text(args[0])?;
+    bytes_to_string(ctx, &text)
+}
+
+/// `pid_to_binary(Pid)` (`bif.c:4879`) — the *same* `%T` bytes as
+/// [`pid_to_list_1`], as a binary. An OTP-30 addition the 29.1.1 oracle does not
+/// export; the bytes are the C's shared `term2binary_dsprintf` format.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`pid_text`], or
+/// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when the heap cannot fit the
+/// binary.
+fn pid_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let text = pid_text(args[0])?;
+    bits::make_binary(ctx.heap(), &text)
+}
+
+/// `list_to_pid(PidString)` (`bif.c:4532`) — the internal pid the text names.
+///
+/// Pinned to the oracle: `list_to_pid("<0.123.7>")` ⇒ `<0.123.7>` and
+/// `list_to_pid(pid_to_list(P)) =:= P`. `list_to_pid("bogus")`, a missing field
+/// (`"<0.10.0"`), a non-byte element (`[300]`), a binary argument and an
+/// out-of-range field (`"<0.268435456.0>"`) are all `badarg`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a malformed string, an
+/// argument that is not a proper list of bytes, or a pid the internal immediate
+/// cannot hold. The context is unused (nothing is allocated).
+fn list_to_pid_1(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let bytes = string_bytes(args[0], PID_TEXT_MAX)?;
+    Ok(parse_pid_text(&bytes)?.to_eterm())
+}
+
+/// `ref_to_list(Ref)` (`bif.c:4466`) — the reference's `%T` text as a charlist.
+///
+/// Pinned to the oracle: `ref_to_list(list_to_ref("#Ref<0.0.0.7>"))` ⇒
+/// `"#Ref<0.0.0.7>"`, and a reference built by the runtime's own ref thing renders
+/// the same `#Ref<0.0.0.N>` shape; a non-reference is `badarg`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text`].
+fn ref_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let text = ref_text(args[0])?;
+    bytes_to_string(ctx, &text)
+}
+
+/// `ref_to_binary(Ref)` (`bif.c:4893`) — the same `%T` bytes as [`ref_to_list_1`],
+/// as a binary. OTP-30 only (see [`pid_to_binary_1`]).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`ref_text`], or
+/// [`BeamError::Alloc`](beam_common::BeamError::Alloc).
+fn ref_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let text = ref_text(args[0])?;
+    bits::make_binary(ctx.heap(), &text)
+}
+
+/// `port_to_binary(Port)` (`bif.c:4886`) — the port's `#Port<channel.number>` text as
+/// a binary. OTP-30 only (see [`pid_to_binary_1`]).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) per [`port_text`], or
+/// [`BeamError::Alloc`](beam_common::BeamError::Alloc).
+fn port_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let text = port_text(args[0])?;
+    bits::make_binary(ctx.heap(), &text)
+}
+
+/// `list_to_ref(RefString)` (`bif.c:4712`) — the internal reference the text names.
+///
+/// Pinned to the `#Ref<0.0.0.N>` shape this runtime's ref thing holds, so
+/// `list_to_ref(ref_to_list(R)) =:= R`. `list_to_ref("bogus")`,
+/// `list_to_ref("#Ref<0.0.0>")`, `list_to_ref("#Ref<0.0.0.1.2>")`,
+/// `list_to_ref("#Ref<1.0.0.1>")` and `list_to_ref("#Ref<0.1.0.1>")` are all
+/// `badarg`: the last two name a reference whose node/upper ref numbers this
+/// runtime's single-id-word ref thing cannot carry, so they are an honest gap
+/// rather than a fabricated reference (see [`parse_ref_text`]).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a malformed string, an
+/// argument that is not a proper list of bytes, or an unrepresentable reference;
+/// otherwise propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc).
+fn list_to_ref_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let bytes = string_bytes(args[0], REF_TEXT_MAX)?;
+    let id = parse_ref_text(&bytes)?;
+    access::make_ref_thing(ctx.heap(), id)
+}
+
+/// Registers this module's BIFs (fifteen keys: fourteen `erlang` and one `binary`).
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "bitstring_to_list", 1, bitstring_to_list_1);
     reg.register("erlang", "delete_element", 2, delete_element_2);
@@ -493,6 +840,13 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "display", 1, display_1);
     reg.register("erlang", "display_string", 2, display_string_2);
     reg.register("binary", "referenced_byte_size", 1, referenced_byte_size_1);
+    reg.register("erlang", "pid_to_list", 1, pid_to_list_1);
+    reg.register("erlang", "list_to_pid", 1, list_to_pid_1);
+    reg.register("erlang", "ref_to_list", 1, ref_to_list_1);
+    reg.register("erlang", "list_to_ref", 1, list_to_ref_1);
+    reg.register("erlang", "pid_to_binary", 1, pid_to_binary_1);
+    reg.register("erlang", "ref_to_binary", 1, ref_to_binary_1);
+    reg.register("erlang", "port_to_binary", 1, port_to_binary_1);
 }
 
 #[cfg(test)]
@@ -520,12 +874,133 @@ mod tests {
     fn register_installs_the_roster() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
-        assert_eq!(reg.len(), 8);
+        assert_eq!(reg.len(), 15);
         assert!(reg.contains("erlang", "bitstring_to_list", 1));
         assert!(reg.contains("binary", "referenced_byte_size", 1));
+        for name in [
+            "pid_to_list",
+            "list_to_pid",
+            "ref_to_list",
+            "list_to_ref",
+            "pid_to_binary",
+            "ref_to_binary",
+            "port_to_binary",
+        ] {
+            assert!(reg.contains("erlang", name, 1), "{name}/1 is registered");
+        }
         // Deliberately out of scope, so unregistered.
-        assert!(!reg.contains("erlang", "pid_to_list", 1));
         assert!(!reg.contains("erlang", "external_size", 1));
+    }
+
+    #[test]
+    fn the_textual_conversions_round_trip_and_reject_bad_text() {
+        with_ctx(|ctx| {
+            // `pid_to_list/1` / `list_to_pid/1`: `<0.123.7>` round-trips.
+            let pid = ProcessId::new(123, 7).to_eterm();
+            let text = pid_to_list_1(ctx, &[pid]).expect("a pid");
+            assert_eq!(string_of(text), "<0.123.7>");
+            let back = list_to_pid_1(ctx, &[text]).expect("the text parses");
+            assert_eq!(ProcessId::from_eterm(back).expect("a pid"), ProcessId::new(123, 7));
+
+            // Leading zeros are accepted; out-of-range fields are `badarg`.
+            let zeros = byte_chars(ctx, b"<0.01.0>");
+            let back = list_to_pid_1(ctx, &[zeros]).expect("the text parses");
+            assert_eq!(ProcessId::from_eterm(back).expect("a pid"), ProcessId::new(1, 0));
+            for bad in ["<0.268435456.0>", "<0.0.4294967296>", "<1.0.0>", "<0.0.0.0>", "<0.1.0"] {
+                let text = byte_chars(ctx, bad.as_bytes());
+                assert!(matches!(list_to_pid_1(ctx, &[text]), Err(BeamError::BadArg)));
+            }
+
+            // `ref_to_list/1` / `list_to_ref/1`: `#Ref<0.0.0.7>` round-trips.
+            let text = byte_chars(ctx, b"#Ref<0.0.0.7>");
+            let reference = list_to_ref_1(ctx, &[text]).expect("the text parses");
+            let back = ref_to_list_1(ctx, &[reference]).expect("a reference");
+            assert_eq!(string_of(back), "#Ref<0.0.0.7>");
+            // Leading zeros normalize.
+            let zeros = byte_chars(ctx, b"#Ref<00.00.00.07>");
+            let reference = list_to_ref_1(ctx, &[zeros]).expect("the text parses");
+            let back = ref_to_list_1(ctx, &[reference]).expect("a reference");
+            assert_eq!(string_of(back), "#Ref<0.0.0.7>");
+            // A shape the single-id-word ref thing cannot carry is `badarg`.
+            for bad in ["bogus", "#Ref<0.0.0>", "#Ref<0.0.0.1.2>", "#Ref<1.0.0.1>", "#Ref<0.1.0.1>"] {
+                let text = byte_chars(ctx, bad.as_bytes());
+                assert!(matches!(list_to_ref_1(ctx, &[text]), Err(BeamError::BadArg)));
+            }
+
+            // A non-pid/non-ref and the `_to_binary` byte equality.
+            let five = make_small(5);
+            assert!(matches!(pid_to_list_1(ctx, &[five]), Err(BeamError::BadArg)));
+            assert!(matches!(pid_to_binary_1(ctx, &[five]), Err(BeamError::BadArg)));
+            assert!(matches!(ref_to_list_1(ctx, &[NIL]), Err(BeamError::BadArg)));
+            assert!(matches!(ref_to_binary_1(ctx, &[NIL]), Err(BeamError::BadArg)));
+            assert!(matches!(port_to_binary_1(ctx, &[NIL]), Err(BeamError::BadArg)));
+            let pid = ProcessId::new(123, 7).to_eterm();
+            let as_list = pid_to_list_1(ctx, &[pid]).expect("a pid");
+            let as_binary = pid_to_binary_1(ctx, &[pid]).expect("a pid");
+            assert_eq!(
+                bits::bytes(as_binary).expect("a binary"),
+                string_of(as_list).into_bytes()
+            );
+            let port = beam_process::PortId::new(3).to_eterm();
+            assert_eq!(
+                bits::bytes(port_to_binary_1(ctx, &[port]).expect("a port")).expect("a binary"),
+                b"#Port<0.3>"
+            );
+        });
+    }
+
+    /// The bytes of the charlist `list`, as a `String`.
+    fn string_of(list: Eterm) -> String {
+        let mut out = Vec::new();
+        let mut cur = list;
+        while access::is_list(cur) {
+            out.push(u8::try_from(signed_value(access::car(cur))).expect("a byte"));
+            cur = access::cdr(cur);
+        }
+        String::from_utf8(out).expect("ASCII")
+    }
+
+    /// The charlist of the bytes `bytes`.
+    fn byte_chars(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Eterm {
+        let elems: Vec<Eterm> = bytes.iter().map(|b| ctx.int(i64::from(*b)).expect("fits")).collect();
+        ctx.list(&elems).expect("fits")
+    }
+
+    #[test]
+    fn the_string_length_bounds_mirror_the_c_buffers() {
+        // `list_to_pid/1`'s buffer is 65 bytes with a 64-byte call limit and
+        // `list_to_ref/1`'s is 72 with a 71-byte limit (`bif.c:4538`, `bif.c:4727`):
+        // a string one byte past either limit is `badarg` even when it parses.
+        with_ctx(|ctx| {
+            let mut pid_64 = String::from("<0.");
+            pid_64.push_str(&"0".repeat(57));
+            pid_64.push_str("1.0>");
+            assert_eq!(pid_64.len(), 64);
+            let text = byte_chars(ctx, pid_64.as_bytes());
+            assert!(list_to_pid_1(ctx, &[text]).is_ok(), "64 bytes is accepted");
+
+            let mut pid_65 = String::from("<0.");
+            pid_65.push_str(&"0".repeat(58));
+            pid_65.push_str("1.0>");
+            assert_eq!(pid_65.len(), 65);
+            let text = byte_chars(ctx, pid_65.as_bytes());
+            assert!(matches!(list_to_pid_1(ctx, &[text]), Err(BeamError::BadArg)));
+
+            let mut ref_71 = String::from("#Ref<0.");
+            ref_71.push_str(&"0".repeat(58));
+            ref_71.push_str("1.2.3>");
+            assert_eq!(ref_71.len(), 71);
+            let text = byte_chars(ctx, ref_71.as_bytes());
+            // In range for the C buffer, but `1.2.3` is not the M1 shape.
+            assert!(matches!(list_to_ref_1(ctx, &[text]), Err(BeamError::BadArg)));
+
+            let mut ref_72 = String::from("#Ref<0.");
+            ref_72.push_str(&"0".repeat(59));
+            ref_72.push_str("1.2.3>");
+            assert_eq!(ref_72.len(), 72);
+            let text = byte_chars(ctx, ref_72.as_bytes());
+            assert!(matches!(list_to_ref_1(ctx, &[text]), Err(BeamError::BadArg)));
+        });
     }
 
     #[test]
