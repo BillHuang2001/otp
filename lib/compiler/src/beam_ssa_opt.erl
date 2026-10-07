@@ -454,12 +454,22 @@ gate(_) ->
     undefined.
 
 %% Passes that must always run, even when the budget is exhausted or the
-%% watchdog fires. These change the representation of the SSA (map <-> linear)
-%% or its block granularity, so skipping one would leave the state in a form
-%% that later passes do not expect.
+%% watchdog fires.
+%%
+%% `ssa_opt_split_blocks', `ssa_opt_linearize' and `ssa_opt_blockify' change
+%% the representation of the SSA (map <-> linear) or its block granularity, so
+%% skipping one would leave the state in a form that later passes do not
+%% expect.
+%%
+%% `ssa_opt_type_finish' (beam_ssa_type:opt_finish/3) is what turns the types
+%% that were computed by the type analysis into the annotations that the code
+%% generator and `beam_validator' rely on. Skipping it makes the code
+%% generator rely on stale or missing type information, which produces code
+%% that `beam_validator' rejects.
 skippable(ssa_opt_split_blocks) -> false;
 skippable(ssa_opt_linearize) -> false;
 skippable(ssa_opt_blockify) -> false;
+skippable(ssa_opt_type_finish) -> false;
 skippable(_) -> true.
 
 %% Builds a function information map with basic information about incoming and

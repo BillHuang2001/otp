@@ -61,8 +61,9 @@
 %% derives a `no_<name>' option for every pass and substitutes the identity
 %% function for a disabled one. The result is therefore less optimized but
 %% equally correct. Passes that change the representation of the SSA
-%% (map <-> linear) or its block granularity are never skipped by the
-%% driver; see `beam_ssa_opt:skippable/1'.
+%% (map <-> linear), its block granularity, or that finalize the type
+%% annotations the code generator relies on, are never skipped by the driver;
+%% see `beam_ssa_opt:skippable/1'.
 %%
 %% == Process dictionary ==
 %%
