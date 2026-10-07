@@ -41,11 +41,11 @@
 //! ([`a_non_map_is_refused`]), and `get_pair` at HEAD/TAIL
 //! ([`empty_map_reports_head_and_tail_without_yielding_a_pair`]).
 //!
-//! **Open finding (reported, not asserted):** `enif_map_iterator_destroy` on a *never-created*
-//! (all-zero) iterator reads through a null pointer, because it tests `is_hashmap(it.map)` without
-//! the `is_term_word` guard the read paths apply. `debug_assertions` turns that into an abort, so
-//! the fixture deliberately does not call it; `destroy` on a *created* iterator (both flat and hash
-//! arms) runs in every other NIF here.
+//! `enif_map_iterator_destroy` is idempotent and safe on a *never-created* (all-zero) iterator:
+//! it applies the same `is_term_word` guard the read paths do, so a zeroed `it.map` is a no-op, and
+//! `destroy` on a *created* iterator (both flat and hash arms) runs in every other NIF here. The
+//! fixture's `nonmap/0` double-destroys a never-created iterator to pin this
+//! ([`a_non_map_is_refused`]).
 //!
 //! # Skip-vs-fail policy
 //!
@@ -303,11 +303,10 @@ fn empty_map_reports_head_and_tail_without_yielding_a_pair() {
 
 /// `create` refusals: a non-map, and `get_pair` on the untouched (zeroed) iterator.
 ///
-/// `enif_map_iterator_destroy` is **not** exercised on the never-created iterator here: it tests
-/// `is_hashmap(it.map)` without the `is_term_word` guard the read paths apply, so a zeroed iterator
-/// (`map == 0`) makes it read through a null pointer. That is an open finding reported by this
-/// test-suite author, not something a passing test can assert; `destroy` on a *created* iterator is
-/// covered by every other test in this file.
+/// The fixture's `nonmap/0` also calls `enif_map_iterator_destroy` **twice** on that never-created
+/// (all-zero) iterator, so this test pins that `destroy` is a safe no-op there: it applies the same
+/// `is_term_word` guard the read paths do, so a zeroed `map == 0` is never treated as a boxed term.
+/// `destroy` on a *created* iterator is covered by every other test in this file.
 #[test]
 fn a_non_map_is_refused() {
     let Some(so) = compile_fixture() else { return };
