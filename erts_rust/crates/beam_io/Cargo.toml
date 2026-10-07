@@ -9,6 +9,8 @@ description = "Poller/reactor (epoll/kqueue/io_uring), ports and built-in driver
 beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
 beam_process = { path = "../beam_process" }
+beam_alloc.workspace = true
+beam_abi.workspace = true
 libc.workspace = true
 mio.workspace = true
 

@@ -58,6 +58,16 @@ impl DriverFlags {
         DriverFlags(0)
     }
 
+    /// The union of two flag sets (every flag in `self` or in `other`).
+    ///
+    /// The C-ABI bridge ([`crate::abi::DriverPort`]) uses this to map an `ErlDrvEntry`'s
+    /// `driver_flags` bitfield onto this crate's flag vocabulary, which has no single
+    /// `from_bits` constructor (the field is private on purpose — flags are only ever
+    /// combined from the named constants).
+    pub const fn union(self, other: DriverFlags) -> DriverFlags {
+        DriverFlags(self.0 | other.0)
+    }
+
     /// Whether this set contains every flag in `other`.
     pub fn contains(self, other: DriverFlags) -> bool {
         self.0 & other.0 == other.0

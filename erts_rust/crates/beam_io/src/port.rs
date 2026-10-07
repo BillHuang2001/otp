@@ -85,9 +85,6 @@ pub struct Port {
     output: ByteQueue,
     /// The tasks scheduled on this port, in kind-priority order.
     tasks: PortTaskQueue,
-    /// Set when an `INPUT` task has run since the last notification harvest; it marks the
-    /// port as a candidate for a [`PortNotification::Data`] report.
-    input_pending: bool,
     /// Which readiness directions the driver has registered with the poller (see
     /// [`PortArms`]); the reactor only schedules a direction the driver can serve.
     arms: PortArms,
@@ -108,7 +105,6 @@ impl Port {
             input: ByteQueue::new(),
             output: ByteQueue::new(),
             tasks: PortTaskQueue::new(),
-            input_pending: false,
             arms: PortArms::default(),
             exit_notified: false,
         }
@@ -311,9 +307,8 @@ impl Port {
 
     /// Runs one scheduled `task` against the driver, returning the reductions it cost.
     ///
-    /// `INPUT` runs the driver's `ready_input` and marks the port as a candidate for a
-    /// [`PortNotification::Data`] report; `OUTPUT` runs its `ready_output` (which the driver
-    /// may define in terms of `output`); `TIMEOUT` runs its `timeout`.
+    /// `INPUT` runs the driver's `ready_input`; `OUTPUT` runs its `ready_output` (which the
+    /// driver may define in terms of `output`); `TIMEOUT` runs its `timeout`.
     ///
     /// # Errors
     ///
@@ -322,7 +317,6 @@ impl Port {
         match task.kind() {
             PortTaskKind::Input => {
                 self.ready_input(poller)?;
-                self.input_pending = true;
                 Ok(PortTaskKind::Input.reductions())
             }
             PortTaskKind::Output => {
@@ -336,15 +330,34 @@ impl Port {
         }
     }
 
+    /// Whether this port is holding input bytes it owes its owner.
+    ///
+    /// The buffered input queue is the single source of truth for a
+    /// [`PortNotification::Data`] report (see [`Port::take_input_notification`]): every byte a
+    /// driver hands up — whether from an `INPUT` task's `ready_input` **or** from a
+    /// `driver_output` inside `start`/`control`/`timeout`/`output` — lands in this queue, and the
+    /// port-task round reports whatever is there.
+    pub(crate) fn has_input(&self) -> bool {
+        !self.input.is_empty()
+    }
+
     /// Takes the [`PortNotification::Data`] this port owes, if any.
     ///
-    /// The bytes an `INPUT` task read are drained out of the input queue here; a port that
-    /// ran no `INPUT` task (or whose driver read nothing) yields `None`.
+    /// The buffered input bytes are drained out of the input queue here, so a report happens
+    /// **exactly once per byte**: after this returns `Some`, the queue is empty and the next
+    /// call answers `None` until the driver hands up more input.
+    ///
+    /// The condition is the *queue*, not "an `INPUT` task ran": the legacy C delivers
+    /// `driver_output` to the port owner as soon as the driver makes it, whatever callback it
+    /// came from (`io.c`'s `driver_output`/`erts_port_output`), so a `driver_output` made from
+    /// `start`/`control`/`timeout`/`output` — i.e. outside any `INPUT` task — must reach the
+    /// owner on the next port-task round exactly like one made from `ready_input`. Gating the
+    /// report on an `INPUT` task having run ([`Port::run_task`]) would strand those bytes in the
+    /// queue, which is why the gate was removed.
     pub(crate) fn take_input_notification(&mut self) -> Option<PortNotification> {
-        if !self.input_pending {
+        if !self.has_input() {
             return None;
         }
-        self.input_pending = false;
         let bytes = self.drain_input();
         if bytes.is_empty() {
             None

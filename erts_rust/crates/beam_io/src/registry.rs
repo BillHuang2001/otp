@@ -218,7 +218,7 @@ impl PortRegistry {
     /// The round runs the queued tasks in kind-priority order (`INPUT` → `OUTPUT` →
     /// `TIMEOUT`), stopping as soon as `reds_budget` is exhausted and leaving the rest
     /// queued; a [`PortTaskKind::Timeout`] task whose deadline has not passed is not run.
-    /// Afterwards every port that ran an `INPUT` task has its buffered input drained into a
+    /// Afterwards every port holding buffered input has it drained into a
     /// [`PortNotification::Data`], and every port closed since the previous round is
     /// reported as a [`PortNotification::Closed`].
     ///
