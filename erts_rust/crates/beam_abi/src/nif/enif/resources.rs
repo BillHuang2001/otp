@@ -842,16 +842,32 @@ mod tests {
 
     #[test]
     fn callback_members_switch_reads_from_the_top() {
-        let dtor: ErlNifResourceDtor = |_, _| {};
-        let stop: ErlNifResourceStop = |_, _, _, _| {};
-        let down: ErlNifResourceDown = |_, _, _, _| {};
-        let dyncall: ErlNifResourceDynCall = |_, _, _| {};
+        use crate::common::ErlDrvMonitor;
+        use crate::nif::types::ErlNifPid;
+
+        unsafe extern "C" fn noop_dtor(_: *mut ErlNifEnv, _: *mut c_void) {}
+        unsafe extern "C" fn noop_stop(
+            _: *mut ErlNifEnv,
+            _: *mut c_void,
+            _: libc::c_int,
+            _: libc::c_int,
+        ) {
+        }
+        unsafe extern "C" fn noop_down(
+            _: *mut ErlNifEnv,
+            _: *mut c_void,
+            _: *mut ErlNifPid,
+            _: *mut ErlDrvMonitor,
+        ) {
+        }
+        unsafe extern "C" fn noop_dyncall(_: *mut ErlNifEnv, _: *mut c_void, _: *mut c_void) {}
+
         let init = ErlNifResourceTypeInit {
-            dtor: Some(dtor),
-            stop: Some(stop),
-            down: Some(down),
+            dtor: Some(noop_dtor),
+            stop: Some(noop_stop),
+            down: Some(noop_down),
             members: 4,
-            dyncall: Some(dyncall),
+            dyncall: Some(noop_dyncall),
         };
         let (d, s, w, c) = callbacks(&init, 1);
         assert!(d.is_some() && s.is_none() && w.is_none() && c.is_none());
