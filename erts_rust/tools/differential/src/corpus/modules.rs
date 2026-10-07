@@ -1,9 +1,9 @@
 //! Contract **A.2** — `.beam` binary, and the **observable agreement** evidence.
 //!
-//! These are the corpus's agreement cases. Unlike the expression groups (whose `-eval`
-//! grammar the Rust runtime does not implement yet, so they are an honest `unsupported`),
-//! a compiled `.beam` runs within the Rust runtime's `run` subset, so the two runtimes
-//! actually produce — and are compared on — the same observable value.
+//! These are the corpus's agreement cases. Both kinds of case reach agreement: the
+//! expression groups run the same `-eval` probe under both runtimes, and here a compiled
+//! `.beam` runs within the Rust runtime's `run` action, so the two runtimes actually
+//! produce — and are compared on — the same observable value.
 //!
 //! The module sources are embedded here and compiled at run time with the system `erlc`
 //! (see [`crate::module_build`]). The harness invokes the oracle through

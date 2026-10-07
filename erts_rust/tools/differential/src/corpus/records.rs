@@ -21,12 +21,11 @@
 //!
 //! # The module case: create the record at runtime, then use record *syntax*
 //! A native-record *creation* with compile-time syntax (`#r{a = 1}`) lowers to
-//! `put_record`'s create form, which needs the code server's compile-time record table —
-//! a facility the Rust runtime does not have (a documented capability gap, tracked in
-//! `crates/beam_engine/CONTEXT.md`). The embedded module therefore obtains its record
-//! from the `records:create/4` **BIF** (the same module/name the compile-time
-//! `-record #rec{}` declares) and then uses ordinary record *syntax* on it, so the
-//! access/update/matching opcodes really do execute end to end.
+//! `put_record`'s create form, which the engine reports as a typed `unsupported` (a
+//! documented capability gap, tracked in `crates/beam_engine/CONTEXT.md`). The embedded
+//! module therefore obtains its record from the `records:create/4` **BIF** (the same
+//! module/name the compile-time `-record #rec{}` declares) and then uses ordinary record
+//! *syntax* on it, so the access/update/matching opcodes really do execute end to end.
 //!
 //! # Which native-record opcodes the embedded module executes
 //! The mapping below is read off the system `erlc`'s own disassembly (`erlc -S`), the only
@@ -414,16 +413,34 @@ pub(crate) fn group() -> Vec<Case> {
             "exception error badarg",
             1,
         ),
-        // Deliberately pinned capability gap: the code-server record-table lookup is not
-        // implemented, so the Rust runtime raises its `unsupported_bif` signal (the probe
-        // catches it ⇒ `unsupported`, never a mismatch). The golden is the oracle's own
-        // answer for a record no loaded module defines (`error:badarg`).
+        // `records:get_definition/2` is served by the runtime's `RecordSource` bridge (the
+        // loaded module's `Recs`-chunk definitions reached through the code server), so a
+        // record no loaded module defines reproduces the oracle's plain `error:badarg`. The
+        // golden is the oracle's own answer.
         eval(
             "records/get_definition_unknown_record",
-            "records:get_definition/2 of a record no loaded module defines (Rust: the code-table lookup is a pinned gap)",
+            "records:get_definition/2 of a record no loaded module defines",
             introspection,
             val,
             "records:get_definition(m, r)",
+            "exception error badarg",
+            1,
+        ),
+        eval(
+            "records/get_definition_unloaded_module",
+            "records:get_definition/2 raises badarg for an atom naming a module the node has not loaded",
+            introspection,
+            val,
+            "records:get_definition(no_such_module_is_loaded, r)",
+            "exception error badarg",
+            1,
+        ),
+        eval(
+            "records/get_definition_loaded_module_unknown_record",
+            "records:get_definition/2 raises badarg for a loaded module (lists) that declares no such native record",
+            introspection,
+            val,
+            "records:get_definition(lists, no_such_record_declared)",
             "exception error badarg",
             1,
         ),
@@ -488,13 +505,13 @@ pub(crate) fn group() -> Vec<Case> {
             "ext_upd",
             "5",
         ),
-        // Pinned capability gap: `records:get_definition/2` consults the code server's
-        // native-record table, which the Rust runtime does not implement, so it signals its
-        // documented `unsupported` reason and the Rust side exits 3 ⇒ `unsupported`, never a
-        // mismatch. The golden is the oracle's own answer for the record `nr_native` declares.
+        // `records:get_definition/2` consults the running module's own record definitions
+        // (for `nr_native`, the `-record #rec{}` it declares) through the runtime's
+        // `RecordSource` bridge; the BIF returns the `{Name, FieldNames}` pair, so
+        // `def_fields/0` reports the field count. The golden is the oracle's own answer.
         module_case(
             "records/module_get_definition_declared_record",
-            "records:get_definition/2 of a record the running module declares (Rust: the code-table lookup is a pinned gap)",
+            "records:get_definition/2 of a record the running module declares",
             "def_fields",
             "2",
         ),
@@ -611,8 +628,9 @@ mod tests {
                 "no module case runs {expected}"
             );
         }
-        // The pinned gap cases must be the only `exception`-golden ones whose value is not a
-        // plain-`badarg` language failure; they are the get_definition code-table lookups.
+        // `records/get_definition_unknown_record` raises the oracle's plain `badarg` (a record
+        // no loaded module defines); the runtime reproduces it through its record-definition
+        // lookup.
         assert!(cases
             .iter()
             .any(|c| c.id == "records/get_definition_unknown_record"
