@@ -59,13 +59,6 @@ fn erl_available() -> bool {
     erl_eval("halt(0).").is_some()
 }
 
-/// Whether an `epmd` daemon answers `PORT2_REQ` for a name nobody registered
-/// (a typed error of *some* kind means epmd is reachable).
-fn epmd_reachable() -> bool {
-    beam_dist::epmd::lookup_port(unique("probe").as_bytes()).is_ok()
-        || !epmd_unreachable()
-}
-
 /// Distinguishes "epmd answered `noport`" (reachable) from "no daemon" — the peer
 /// crate returns a typed error for both, so the probe is its own connect.
 fn epmd_unreachable() -> bool {
