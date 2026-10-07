@@ -1374,8 +1374,11 @@ fn ufsplit_1(
                 if call_predicate(ctx, fun, &[z, y])? {
                     // `Z` equal to `Y`: neither advances.
                 } else {
-                    // `Y` < `Z`: `ufsplit_1(Z, Y, L, [X | R], Rs)`.
+                    // `Y` < `Z`: `ufsplit_1(Z, Y, L, [X | R], Rs)` — the pair
+                    // shifts: new `Y` is `Z`, new `X` is the old `Y`, and the old
+                    // `X` is prepended to `R`. Omitting `x = y` duplicates `X`.
                     r.push(x);
+                    x = y;
                     y = z;
                 }
             } else if call_predicate(ctx, fun, &[x, z])? {
@@ -1854,6 +1857,10 @@ mod tests {
     const ORDER_ASC: i64 = 102;
     /// `fun(A, B) -> A >= B end` — the reverse (descending) order.
     const ORDER_DESC: i64 = 103;
+    /// `fun(A, B) -> A < B end` — a non-total strict ascending order.
+    const ORDER_LT: i64 = 104;
+    /// `fun(A, B) -> A > B end` — a non-total strict descending order.
+    const ORDER_GT: i64 = 105;
     impl crate::FunCaller for OrderFuns {
         fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
             let a = beam_term::signed_value(args[0]);
@@ -1863,6 +1870,8 @@ mod tests {
                 ALWAYS_TRUE => true,
                 ORDER_ASC => a <= b,
                 ORDER_DESC => a >= b,
+                ORDER_LT => a < b,
+                ORDER_GT => a > b,
                 other => panic!("unknown sentinel fun {other}"),
             };
             Ok(if result { self.truth } else { self.falsity })
@@ -2689,6 +2698,63 @@ mod tests {
             assert_eq!(show_usort(ctx, ALWAYS_FALSE, l), "[2,1]");
             let l = ints(ctx, &[1, 2, 3, 4, 5]);
             assert_eq!(show_usort(ctx, ALWAYS_FALSE, l), "[5,4,3,2,1]");
+        });
+    }
+
+    /// `usort/2` must agree with the oracle for the four total/strict numeric
+    /// comparators over the six pinning lists. Oracle (erts-17.1):
+    ///
+    /// ```text
+    /// le [1,2,3]   -> [1,2,3]      le [3,2,1]   -> [1,2,3]
+    /// le [1,1,1]   -> [1]          le [2,1,2,1] -> [1,2]
+    /// le []        -> []           le [7]       -> [7]
+    /// lt [1,2,3]   -> [1,2,3]      lt [3,2,1]   -> [1,2,3]
+    /// lt [1,1,1]   -> [1,1,1]      lt [2,1,2,1] -> [1,1,2,2]
+    /// lt []        -> []           lt [7]       -> [7]
+    /// ge [1,2,3]   -> [3,2,1]      ge [3,2,1]   -> [3,2,1]
+    /// ge [1,1,1]   -> [1]          ge [2,1,2,1] -> [2,1]
+    /// ge []        -> []           ge [7]       -> [7]
+    /// gt [1,2,3]   -> [3,2,1]      gt [3,2,1]   -> [3,2,1]
+    /// gt [1,1,1]   -> [1,1,1]      gt [2,1,2,1] -> [2,2,1,1]
+    /// gt []        -> []           gt [7]       -> [7]
+    /// ```
+    #[test]
+    fn usort_with_each_comparator_matches_the_oracle() {
+        let cases: &[(i64, &[i64], &str)] = &[
+            (ORDER_ASC, &[1, 2, 3], "[1,2,3]"),
+            (ORDER_ASC, &[3, 2, 1], "[1,2,3]"),
+            (ORDER_ASC, &[1, 1, 1], "[1]"),
+            (ORDER_ASC, &[2, 1, 2, 1], "[1,2]"),
+            (ORDER_ASC, &[], "[]"),
+            (ORDER_ASC, &[7], "[7]"),
+            (ORDER_LT, &[1, 2, 3], "[1,2,3]"),
+            (ORDER_LT, &[3, 2, 1], "[1,2,3]"),
+            (ORDER_LT, &[1, 1, 1], "[1,1,1]"),
+            (ORDER_LT, &[2, 1, 2, 1], "[1,1,2,2]"),
+            (ORDER_LT, &[], "[]"),
+            (ORDER_LT, &[7], "[7]"),
+            (ORDER_DESC, &[1, 2, 3], "[3,2,1]"),
+            (ORDER_DESC, &[3, 2, 1], "[3,2,1]"),
+            (ORDER_DESC, &[1, 1, 1], "[1]"),
+            (ORDER_DESC, &[2, 1, 2, 1], "[2,1]"),
+            (ORDER_DESC, &[], "[]"),
+            (ORDER_DESC, &[7], "[7]"),
+            (ORDER_GT, &[1, 2, 3], "[3,2,1]"),
+            (ORDER_GT, &[3, 2, 1], "[3,2,1]"),
+            (ORDER_GT, &[1, 1, 1], "[1,1,1]"),
+            (ORDER_GT, &[2, 1, 2, 1], "[2,2,1,1]"),
+            (ORDER_GT, &[], "[]"),
+            (ORDER_GT, &[7], "[7]"),
+        ];
+        with_order_funs(|ctx| {
+            for &(cmp, items, expected) in cases {
+                let l = ints(ctx, items);
+                assert_eq!(
+                    show_usort(ctx, cmp, l),
+                    expected,
+                    "usort/2 comparator {cmp} over {items:?}"
+                );
+            }
         });
     }
 
