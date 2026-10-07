@@ -41,6 +41,7 @@ All three are wired *inside* `src/beam_ssa_opt.erl` (NOT in `compile.erl`'s pass
 
 ## Known Issues
 - A node with `time`/`eprof`/`tprof` options exposes internal pass timing via the process dictionary (`compile__pass_times`) — debugging aid only.
+- There is NO per-pass budget/watchdog: a runaway pass is bounded only by hard caps (`?MAX_REPETITIONS`=16 in `beam_ssa_opt`/`beam_ssa_alias`, `?SS_DEPTH_LIMIT`=30 in `beam_ssa_ss`, `beam_ssa_dead`'s 64-var cap). `time`/`eprof`/`tprof` only measure, they do not bound.
 
 ## Notes for Agents
 - To add or change an optimization: find the owning pass module and its position in the relevant `*_passes/0` builder in `compile.erl`; toggleable passes are wrapped in `{unless,no_<x>_opt,…}` and their flag handled in `expand_opt/2`.
