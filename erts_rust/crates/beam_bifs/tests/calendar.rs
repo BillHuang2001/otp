@@ -20,12 +20,22 @@
 //! One test re-probes the system `erl` **live** and skips loudly when it is not on
 //! `PATH` (the `modinfo.rs` pattern); every fixed-timestamp golden was produced
 //! with OTP 29.1.1 / erts-17.1.
+//!
+//! # Threading
+//!
+//! The calendar BIFs read the C library's process-global timezone state
+//! (`tzset`/`daylight`/`mktime`/`localtime_r`), which is not thread-safe. libtest
+//! runs these tests on parallel threads, so every test takes [`TZ_GUARD`] for its
+//! whole body (see [`tz_guard`]) — running them concurrently makes the C library's
+//! `daylight` flag observable in a half-updated state and the Rust-side local-time
+//! results flaky. The `erl` oracle probe runs in a separate *process* and shares no
+//! memory, so it needs no coordination of its own.
 
 use std::process::Command;
 use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
-
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry};
 use beam_codec::term::{tuple_arity, tuple_element};
@@ -42,6 +52,33 @@ fn seeded_atoms() -> AtomTable {
 /// A heap that outlives the terms the tests inspect (the results point into it).
 fn leaked_heap() -> &'static mut Heap {
     Box::leak(Box::new(Heap::new(8192).expect("test heap")))
+}
+
+/// Serialises every test in this file around the **process-global C-library
+/// timezone state** the calendar BIFs read.
+///
+/// `erlang:date/0`, `time/0`, `localtime/0`, `universaltime_to_localtime/1` and
+/// `localtime_to_universaltime/2` are thin wrappers over the C library's
+/// `tzset`/`daylight`/`mktime`/`localtime_r`, which POSIX does **not** require to be
+/// thread-safe. libtest runs the tests of one binary on parallel threads, so when
+/// several of them drive those BIFs at once the C library's `daylight` flag can be
+/// observed half-updated: `local_to_utc`'s `if !sys_daylight()` then takes the
+/// "timezone without DST" branch and drops the caller's DST hint, which shifts
+/// `localtime_to_universaltime({{2020,6,1},{12,0,0}}, true)` by an hour and makes
+/// `oracle_agrees_on_the_fixed_timestamps` disagree with a perfectly healthy `erl`
+/// oracle (in exactly one run out of three, only under the parallel harness).
+///
+/// Every test that drives a calendar BIF takes this guard for its whole body, so the
+/// shared timezone globals are only ever touched by one thread. The oracle probe
+/// itself is a separate *process* and shares no memory with the test binary, so it
+/// needs no coordination beyond this — the guard exists for the in-process BIF calls
+/// that produce the values compared against the oracle.
+static TZ_GUARD: Mutex<()> = Mutex::new(());
+
+/// Acquires [`TZ_GUARD`], recovering from poisoning: a failed assertion in one test
+/// must report that failure, not cascade `PoisonError`s into every other test.
+fn tz_guard() -> MutexGuard<'static, ()> {
+    TZ_GUARD.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The small-integer value at `index` of the 3-tuple `tuple`.
@@ -141,6 +178,7 @@ fn posix_to_univ(reg: &BifRegistry, heap: &mut Heap, atoms: &AtomTable, secs: i6
 
 #[test]
 fn posixtime_to_universaltime_matches_the_oracle_goldens() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -165,6 +203,7 @@ fn posixtime_to_universaltime_matches_the_oracle_goldens() {
 
 #[test]
 fn posixtime_to_universaltime_accepts_the_i64_extremes() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -181,6 +220,7 @@ fn posixtime_to_universaltime_accepts_the_i64_extremes() {
 
 #[test]
 fn posixtime_to_universaltime_rejects_non_integers() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -207,6 +247,7 @@ fn posixtime_to_universaltime_rejects_non_integers() {
 
 #[test]
 fn universaltime_to_posixtime_matches_the_oracle_goldens() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -232,6 +273,7 @@ fn universaltime_to_posixtime_matches_the_oracle_goldens() {
 
 #[test]
 fn universaltime_to_posixtime_rejects_bad_input() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -280,6 +322,7 @@ fn universaltime_to_posixtime_rejects_bad_input() {
 
 #[test]
 fn universaltime_to_localtime_round_trips_and_rejects_bad_input() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -324,6 +367,7 @@ fn universaltime_to_localtime_round_trips_and_rejects_bad_input() {
 
 #[test]
 fn localtime_to_universaltime_rejects_non_boolean_and_out_of_range() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -351,6 +395,7 @@ fn localtime_to_universaltime_rejects_non_boolean_and_out_of_range() {
 
 #[test]
 fn localtime_to_universaltime_flags_agree_within_two_hours() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -389,6 +434,7 @@ fn localtime_to_universaltime_flags_agree_within_two_hours() {
 
 #[test]
 fn date_time_localtime_and_universaltime_are_well_formed() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -418,6 +464,7 @@ fn date_time_localtime_and_universaltime_are_well_formed() {
 
 #[test]
 fn now_is_strictly_increasing_and_plausible() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
@@ -438,6 +485,7 @@ fn now_is_strictly_increasing_and_plausible() {
 
 #[test]
 fn registry_registers_the_nine_calendar_bifs() {
+    let _tz = tz_guard();
     let reg = default_registry();
 
     for (name, arity) in [
@@ -465,6 +513,12 @@ const ERL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs `<expr>, halt(0).` under the system `erl` and returns its stdout, or `None`
 /// (after a clear skip message) when `erl` cannot be spawned / does not answer.
+///
+/// The probe is self-contained: it owns its child process and its output buffer and
+/// shares no state with any other test. `Command::output()` drains the child's stdout
+/// to **EOF** and reaps it before returning, so the caller always parses a complete
+/// output (never a partial read); a child that cannot finish inside [`ERL_TIMEOUT`]
+/// is reported as an unusable oracle (a loud skip) instead of being half-read.
 fn erl_stdout(expr: &str) -> Option<String> {
     let code = format!("{expr}, halt(0).");
     let (tx, rx) = mpsc::channel();
@@ -504,6 +558,7 @@ fn erl_stdout(expr: &str) -> Option<String> {
 
 #[test]
 fn oracle_agrees_on_the_fixed_timestamps() {
+    let _tz = tz_guard();
     let reg = default_registry();
     let atoms = seeded_atoms();
     let heap = leaked_heap();
