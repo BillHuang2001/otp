@@ -202,7 +202,8 @@ the only place in this crate that holds raw `ErlDrv*` pointers and calls foreign
     `selected: BTreeMap<RawFd, SelectedFd>` (a `BTreeMap` so `ready_input`/`ready_output` pick a **stable** fd),
     `deadline: Option<Instant>` (the `driver_set_timer` deadline) and `jobs: AsyncJobs`.
   - `AbiHost` — the `beam_abi::driver::host::DriverHost` impl, **owning** everything (`port_host: Box<dyn
-    PortHost>`, `heap: Heap`, `state: DriverState`, `ctx: Cell<*mut c_void>`) so it can be `Box`ed behind a stable
+    PortHost>`, `heap: Heap`, `state: DriverState`, `driver: Option<DriverIdentity>`, `ctx: Cell<*mut c_void>`)
+    so it can be `Box`ed behind a stable
     `ErlDrvPort` (a `DRIVER_HEAP_WORDS = 1024`-word term heap). When **no context is installed** every
     port-touching method fails gracefully (`-1`/`None`/no-op) — never derefs null. `DriverHost` behaviors:
     `intern_atom`/`connected_pid`/`caller_pid` → `PortHost`; `output` → pushes onto the port's **input** queue
@@ -212,7 +213,18 @@ the only place in this crate that holds raw `ErlDrv*` pointers and calls foreign
     **neither→READABLE** (M1 does not distinguish `ERL_DRV_USE`; the fd must still be watched for close/error);
     `set_timer` arms `deadline` (returns `0` — M1 always succeeds, no `timeout == NULL` case), `cancel_timer`
     clears it (`0`), `read_timer` reports the remaining ms (`Some(0)` when expired, `None` when none); `r#async` →
-    `AsyncJobs::schedule`, `id as c_long` or (on thread failure) runs the driver's `free(data)` and returns `-1`.
+    `AsyncJobs::schedule`, `id as c_long` or (on thread failure) runs the driver's `free(data)` and returns `-1`;
+    the four **driver-registry** hooks → `add_driver_entry` records `de` in the process-global `DriverTable` (`0`
+    recorded, `1` the entry's `init` refused it — the C's `void` wrapper discards that code, so it is only
+    assertable, and a positive value stays distinguishable from the trait default's `-1` = "no current host"),
+    `remove_driver_entry` forwards the table's `1`/`0`/`-1` unchanged, `lock_driver` answers `0` for a port whose
+    identity is a `dlopen`ed driver (the C consults the **port's own** driver, never a name lookup — so the global
+    table is consulted only to honour its `locked` flag) and `-1` for a bare/statically linked host, and
+    `create_port` answers `ERTS_INVALID_ERL_DRV_PORT` (see *Design Decisions*).
+  - `DriverIdentity { name, loaded }` (`pub(crate)`) — the port's registered driver name and whether it came from
+    a `dlopen`ed object; `AbiHost::new` yields none, `AbiHost::for_driver(host, name, loaded)` / `with_driver(...)`
+    record one (`DriverPort::from_library` sets it from `library.name()` with `loaded = true`). It is a field on
+    `AbiHost`, **not** a `DriverHost` method — a driver never asks its own identity.
 - `job.rs` — `AsyncJobs`: one `std::thread` per job, an `mpsc` completion channel and the `driver_async` queue
   position; `schedule(invoke, data, free)` (`None` `invoke` = fire-and-forget: a valid position, no work, no
   completion) and `drain() -> Vec<AsyncCompletion>`; `AsyncData(*mut c_void)` is the one `unsafe impl Send`.
