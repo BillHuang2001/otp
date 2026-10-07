@@ -13,10 +13,10 @@ use beam_term::{
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
-use super::super::runtime::encode_target;
 use super::arith::{FAST_C, SMALL_MASK};
+use super::link::Linker;
 use super::operands::{small_word, x_offset, x_register};
-use super::{emit_step_and_continue, spill, touch, Allocation};
+use super::{emit_step_and_continue, touch, Allocation};
 
 // ---------------------------------------------------------------------------
 // The word-level `test` subset
@@ -318,6 +318,7 @@ pub(super) fn try_inline_test(
     buffer: &mut CodeBuffer,
     module: &Module,
     labels: &BTreeMap<Label, (u32, u32)>,
+    linker: &Linker<'_>,
     instr: &Instr,
     allocation: &Allocation,
     done: CodeLabel,
@@ -395,10 +396,11 @@ pub(super) fn try_inline_test(
         }
     }
 
-    // --- the test failed: return the fail label's `(func, pc)` --------------
-    spill(buffer, allocation)?;
-    buffer.mov_ri(Reg::Rax, encode_target(plan.fail.0, plan.fail.1))?;
-    buffer.jmp(done)?;
+    // --- the test failed: branch to the fail label --------------------------
+    // A compiled fail block is entered directly (the linker spills the cached
+    // x-registers, leaves this frame and jumps to its entry); any other fail
+    // target returns its `(func, pc)` word to the driver exactly as before.
+    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1)?;
 
     // --- the guard rejected an operand: run the real instruction ------------
     if let Some(deopt) = deopt {
