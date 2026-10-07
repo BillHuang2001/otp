@@ -2200,6 +2200,950 @@ fn the_inlined_mul_agrees_with_the_interpreter_over_a_wide_range() {
 }
 
 // ---------------------------------------------------------------------------
+// The inlined comparison BIFs (`erlang:'=:='/2` … `erlang:'>='/2`)
+// (`src/jit/cranelift/compare.rs`)
+// ---------------------------------------------------------------------------
+//
+// The compiler emits every comparison as a **non-collecting** `{bif,Op,{f,0},Args,Dst}`
+// (`fail = 0`), so leaving one to `jit_step_one` costs a helper round-trip per clause
+// guard. The tier's fast path is a *shape* test (never a value test): load the two
+// operand words, guard the **register** operand(s) as untagged small ints — the only
+// class whose tagged-word signed order is `cmp_arith`'s value order, `make_small` being
+// injective and monotone — `cmp`/`jcc`, and store the module's own `true`/`false` atom
+// into the destination. `=:=`/`=/=` are that word compare; `==`/`/=` and the four
+// orderings are the same compare behind the small-int guard(s).
+//
+// The fast path is entered only when the call is `erlang:<one of the eight>/2` with two
+// addressable x-register/immediate operands, an ordering operator's operands are both
+// *small-int* (an atom/`nil` constant is not word-ordered), the destination is an
+// x-register below `MAX_REGISTER`, and the module's atom table carries both `true` and
+// `false`. Everything else — and every run-time guard rejection — deopts to the shared
+// `jit_step_one`, whose interpreter step is the BIF's exact semantics.
+//
+// Each case below is pinned three ways: the interpreter's answer comes from an installed
+// `beam_term`-ordering floor (so the tier is compared against the real comparison order,
+// not a reimplementation), the artifact's `inlined_comparison_ops()` proves the fast
+// path was **compiled** rather than silently deopted, and a *counting* floor makes "the
+// fast path computed this" (zero calls) vs "the guard rejected this and the helper ran
+// the BIF" (exactly one call) a positive observation.
+
+/// The eight comparison operators with the three fixture names each one uses: the
+/// two-x-register form, the `X(0) <op> 5` form, and the `5 <op> X(0)` form.
+const COMPARISONS: [(&str, &str, &str, &str); 8] = [
+    ("=:=", "exact_eq", "exact_eq_const", "exact_eq_const_lhs"),
+    ("=/=", "exact_ne", "exact_ne_const", "exact_ne_const_lhs"),
+    ("==", "arith_eq", "arith_eq_const", "arith_eq_const_lhs"),
+    ("/=", "arith_ne", "arith_ne_const", "arith_ne_const_lhs"),
+    ("<", "lt", "lt_const", "lt_const_lhs"),
+    ("=<", "le", "le_const", "le_const_lhs"),
+    (">", "gt", "gt_const", "gt_const_lhs"),
+    (">=", "ge", "ge_const", "ge_const_lhs"),
+];
+
+/// The oracle answer of `a <op> b` for two small integers (where `=:=` and `==`, and
+/// `=/=` and `/=`, coincide).
+fn comparison_oracle(op: &str, a: i64, b: i64) -> bool {
+    match op {
+        "=:=" | "==" => a == b,
+        "=/=" | "/=" => a != b,
+        "<" => a < b,
+        "=<" => a <= b,
+        ">" => a > b,
+        ">=" => a >= b,
+        other => panic!("unknown comparison operator {other:?}"),
+    }
+}
+
+/// The fixture module's own `true`/`false` atom as a term — a comparison BIF answers
+/// with an **atom**, not a small integer.
+fn boolean(module: &Module, answer: bool) -> Eterm {
+    make_atom(atom(module, if answer { "true" } else { "false" }))
+}
+
+/// A name resolved in a cloned atom table (see [`comparison_floor`]).
+fn atom_of(atoms: &beam_term::AtomTable, name: &str) -> Atom {
+    atoms
+        .lookup(name)
+        .unwrap_or_else(|| panic!("atom {name:?} not interned"))
+}
+
+/// The ground-truth floor of the eight comparison BIFs: `beam_term`'s own exact /
+/// arithmetic ordering against a clone of the fixture module's atom table. The
+/// interpreter's answer therefore comes from the *real* ordering, so the tier's word
+/// compare is checked against it rather than against a second implementation of it.
+fn comparison_floor(
+    atoms: beam_term::AtomTable,
+) -> impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static {
+    move |module, function, arity, args| {
+        if module != "erlang" || arity != 2 || args.len() != 2 {
+            return Err(BeamError::BadArg);
+        }
+        let (a, b) = (args[0], args[1]);
+        let answer = match function {
+            "=:=" => beam_term::cmp(a, b, &atoms).is_eq(),
+            "=/=" => !beam_term::cmp(a, b, &atoms).is_eq(),
+            "==" => beam_term::cmp_arith(a, b, &atoms).is_eq(),
+            "/=" => !beam_term::cmp_arith(a, b, &atoms).is_eq(),
+            "<" => beam_term::cmp_arith(a, b, &atoms).is_lt(),
+            "=<" => !beam_term::cmp_arith(a, b, &atoms).is_gt(),
+            ">" => beam_term::cmp_arith(a, b, &atoms).is_gt(),
+            ">=" => !beam_term::cmp_arith(a, b, &atoms).is_lt(),
+            _ => return Err(BeamError::BadArg),
+        };
+        let name = if answer { "true" } else { "false" };
+        Ok(make_atom(atom_of(&atoms, name)))
+    }
+}
+
+/// [`comparison_floor`] behind a call counter: the same behaviour, with every call
+/// counted, so a test can tell "the fast path computed this" (zero calls) from "the
+/// guard rejected this and the helper ran the BIF" (one call).
+fn counting_comparison_floor(
+    atoms: beam_term::AtomTable,
+    calls: Arc<AtomicUsize>,
+) -> impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static {
+    let mut floor = comparison_floor(atoms);
+    move |module, function, arity, args| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        floor(module, function, arity, args)
+    }
+}
+
+/// One hand-built exported function of a comparison fixture:
+///
+/// ```text
+///   label E:  {bif|gc_bif} M:F/2 [<args>] -> <dst>
+///             [move <dst> -> x(0)]        ; only when `tail_move`
+///             return
+/// ```
+struct CmpFn {
+    /// The exported name.
+    name: &'static str,
+    /// The arity of the *exported* function (the number of x-register arguments it
+    /// reads) — never the BIF's own arity, which is always 2 here.
+    arity: u32,
+    /// The imported module name (`"erlang"` for every fast-path-eligible shape).
+    module: &'static str,
+    /// The imported function name (one of [`COMPARISONS`] for the positive shapes).
+    bif: &'static str,
+    /// The argument operands, in BIF argument order.
+    args: Vec<ArithSpec>,
+    /// The destination operand.
+    dst: ArithSpec,
+    /// Whether the call is spelled `gc_bif` (the compiler emits `bif` for comparisons,
+    /// but the tier inlines both variants).
+    gc: bool,
+    /// An instruction arity that differs from the import's (a hand-built shape the tier
+    /// must refuse), when set.
+    instr_arity: Option<u8>,
+    /// Whether the fixture appends `move <dst> -> x(0)`, so a fixture whose destination
+    /// is **not** `x(0)` still answers with its result.
+    tail_move: bool,
+}
+
+impl CmpFn {
+    /// A `bif` fixture named `name`, exported at `arity`, calling `erlang:<bif>/2` over
+    /// `args` into `dst`.
+    fn new(
+        name: &'static str,
+        arity: u32,
+        bif: &'static str,
+        args: &[ArithSpec],
+        dst: ArithSpec,
+    ) -> CmpFn {
+        CmpFn {
+            name,
+            arity,
+            module: "erlang",
+            bif,
+            args: args.to_vec(),
+            dst,
+            gc: false,
+            instr_arity: None,
+            tail_move: false,
+        }
+    }
+
+    /// Spell the call `gc_bif` instead of `bif`.
+    fn gc(mut self) -> CmpFn {
+        self.gc = true;
+        self
+    }
+
+    /// Call `<module>:<bif>/2` instead of `erlang:<bif>/2`.
+    fn in_module(mut self, module: &'static str) -> CmpFn {
+        self.module = module;
+        self
+    }
+
+    /// Emit an instruction arity that differs from the import's.
+    fn with_instr_arity(mut self, arity: u8) -> CmpFn {
+        self.instr_arity = Some(arity);
+        self
+    }
+
+    /// Append `move <dst> -> x(0)` before the `return`.
+    fn moving_the_result_to_x0(mut self) -> CmpFn {
+        self.tail_move = true;
+        self
+    }
+}
+
+/// Build a hand-built module (the loader is not involved) whose exported functions are
+/// exactly `fixtures`, against a fresh import per function — with `true`/`false`
+/// interned.
+fn comparison_bif_module(name: &str, fixtures: &[CmpFn]) -> Module {
+    comparison_bif_module_with_atoms(name, fixtures, true)
+}
+
+/// A comparison fixture whose atom table does **not** carry `true`/`false`: the result
+/// words cannot be resolved, so the whole instruction must stay on the helper.
+fn comparison_bif_module_without_booleans(name: &str, fixtures: &[CmpFn]) -> Module {
+    comparison_bif_module_with_atoms(name, fixtures, false)
+}
+
+/// The shared builder of [`comparison_bif_module`].
+fn comparison_bif_module_with_atoms(name: &str, fixtures: &[CmpFn], booleans: bool) -> Module {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern(name);
+    if booleans {
+        module.atom_table.intern("true");
+        module.atom_table.intern("false");
+    }
+
+    let mut next_label = 1u32;
+    for fixture in fixtures {
+        let export = module.atom_table.intern(fixture.name);
+        let module_atom = module.atom_table.intern(fixture.module);
+        let function_atom = module.atom_table.intern(fixture.bif);
+        module.imports.push(Import {
+            module: module_atom,
+            function: function_atom,
+            arity: fixture.args.len() as u32,
+        });
+        let bif = ImportRef((module.imports.len() - 1) as u32);
+
+        let label = Label(next_label);
+        next_label += 1;
+        let arity = fixture.instr_arity.unwrap_or(fixture.args.len() as u8);
+        let args: Vec<Operand> = fixture
+            .args
+            .iter()
+            .map(|spec| spec.operand(&mut module.atom_table))
+            .collect();
+        let dst = fixture.dst.operand(&mut module.atom_table);
+        let call = if fixture.gc {
+            Instr::GcBif {
+                arity,
+                bif,
+                fail: NO_FAIL,
+                live: fixture.arity,
+                args,
+                dst,
+            }
+        } else {
+            Instr::Bif {
+                arity,
+                bif,
+                fail: NO_FAIL,
+                args,
+                dst,
+            }
+        };
+        let mut code = vec![Instr::Label(label), call];
+        if fixture.tail_move {
+            code.push(Instr::Move {
+                src: fixture.dst.operand(&mut module.atom_table),
+                dst: Operand::X(0),
+            });
+        }
+        code.push(Instr::Return);
+
+        let (blocks, labels) = beam_loader::lower::build_blocks(&code);
+        module.functions.push(Function {
+            func_label: label,
+            entry_label: label,
+            module: module.name,
+            name: export,
+            arity: fixture.arity,
+            code,
+            blocks,
+            labels,
+        });
+        module.exports.push(Export {
+            function: export,
+            arity: fixture.arity,
+            label,
+        });
+    }
+    module
+}
+
+/// The fast-path comparison fixtures: the eight operators over two x-registers, the
+/// eight with a small-int constant on either side (so both the `Guard::Lhs` and the
+/// `Guard::Rhs` shapes are covered), a `gc_bif` spelling, a destination that is not
+/// `x(0)`, and the two `Guard::None` constant forms (an atom under `==`, `nil` under
+/// `=:=`).
+fn comparison_bif_fixtures() -> Module {
+    let mut fixtures: Vec<CmpFn> = Vec::new();
+    for &(op, regs, const_rhs, const_lhs) in &COMPARISONS {
+        fixtures.push(CmpFn::new(
+            regs,
+            2,
+            op,
+            &[ArithSpec::X(0), ArithSpec::X(1)],
+            ArithSpec::X(0),
+        ));
+        fixtures.push(CmpFn::new(
+            const_rhs,
+            1,
+            op,
+            &[ArithSpec::X(0), ArithSpec::Int(5)],
+            ArithSpec::X(0),
+        ));
+        fixtures.push(CmpFn::new(
+            const_lhs,
+            1,
+            op,
+            &[ArithSpec::Int(5), ArithSpec::X(0)],
+            ArithSpec::X(0),
+        ));
+    }
+    fixtures.push(
+        CmpFn::new(
+            "gc_eq",
+            2,
+            "=:=",
+            &[ArithSpec::X(0), ArithSpec::X(1)],
+            ArithSpec::X(0),
+        )
+        .gc(),
+    );
+    fixtures.push(
+        CmpFn::new(
+            "gt_dst_two",
+            2,
+            ">",
+            &[ArithSpec::X(0), ArithSpec::X(1)],
+            ArithSpec::X(2),
+        )
+        .moving_the_result_to_x0(),
+    );
+    fixtures.push(CmpFn::new(
+        "arith_eq_atom",
+        1,
+        "==",
+        &[ArithSpec::X(0), ArithSpec::Atom("a")],
+        ArithSpec::X(0),
+    ));
+    fixtures.push(CmpFn::new(
+        "exact_eq_nil",
+        1,
+        "=:=",
+        &[ArithSpec::X(0), ArithSpec::Nil],
+        ArithSpec::X(0),
+    ));
+    comparison_bif_module("cmpbif", &fixtures)
+}
+
+/// The shapes the tier must **not** inline — one per clause of the fast path's shape
+/// test: another BIF, the right BIF name in the wrong module, a non-2 arity (the
+/// import's and the instruction's), a `Y`/float-register/literal operand, a bignum
+/// constant, an atom and a `nil` constant under an *ordering* operator, a `Y`
+/// destination, and a destination past [`MAX_REGISTER`].
+fn non_inlinable_comparison_module() -> Module {
+    comparison_bif_module(
+        "cmpbif_helper",
+        &[
+            CmpFn::new(
+                "divide",
+                2,
+                "div",
+                &[ArithSpec::X(0), ArithSpec::X(1)],
+                ArithSpec::X(0),
+            ),
+            CmpFn::new(
+                "eq_foreign",
+                2,
+                "==",
+                &[ArithSpec::X(0), ArithSpec::X(1)],
+                ArithSpec::X(0),
+            )
+            .in_module("mymod"),
+            CmpFn::new(
+                "eq_arity3",
+                1,
+                "==",
+                &[ArithSpec::X(0), ArithSpec::Int(1), ArithSpec::Int(2)],
+                ArithSpec::X(0),
+            ),
+            CmpFn::new(
+                "eq_instr_arity3",
+                2,
+                "==",
+                &[ArithSpec::X(0), ArithSpec::X(1)],
+                ArithSpec::X(0),
+            )
+            .with_instr_arity(3),
+            CmpFn::new(
+                "lt_y_operand",
+                2,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::Y(0)],
+                ArithSpec::X(0),
+            ),
+            CmpFn::new(
+                "lt_floatreg",
+                1,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::FloatReg(0)],
+                ArithSpec::X(0),
+            ),
+            CmpFn::new(
+                "lt_literal",
+                1,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::Literal(0)],
+                ArithSpec::X(0),
+            ),
+            CmpFn::new(
+                "lt_bigconst",
+                1,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::Int(i64::MAX)],
+                ArithSpec::X(0),
+            ),
+            CmpFn::new(
+                "lt_atom",
+                1,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::Atom("a")],
+                ArithSpec::X(0),
+            ),
+            CmpFn::new(
+                "lt_nil",
+                1,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::Nil],
+                ArithSpec::X(0),
+            ),
+            CmpFn::new(
+                "lt_y_dst",
+                1,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::Int(5)],
+                ArithSpec::Y(0),
+            ),
+            CmpFn::new(
+                "lt_dst_oob",
+                2,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::X(1)],
+                ArithSpec::X(MAX_REGISTER),
+            ),
+        ],
+    )
+}
+
+/// The comparison-BIF counterpart of [`agree_arith`] (whose hook is a plain `fn`
+/// pointer, which cannot carry the cloned atom table): assert the interpreter, the
+/// baseline tier and the Cranelift tier all produce the same outcome for
+/// `export/arity` under the same comparison floor, and return that outcome.
+fn agree_comparison<H>(
+    backend: &CraneliftJit,
+    compiled: &CompiledFunctions,
+    module: &Module,
+    export: &str,
+    arity: u32,
+    args: &[Eterm],
+    hook: H,
+) -> Result<Eterm, BeamError>
+where
+    H: FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static,
+{
+    let interpreted = run_hooked(Tier::Interpreter, module, export, arity, args, hook);
+    let baseline = run_hooked(Tier::BaselineJit, module, export, arity, args, hook);
+    let cranelift = run_compiled_hooked(backend, compiled, module, export, arity, args, hook);
+    assert_same(&baseline, &interpreted, &format!("baseline {export}/{arity}"));
+    assert_same(&cranelift, &interpreted, &format!("cranelift {export}/{arity}"));
+    interpreted
+}
+
+#[test]
+fn the_tier_reports_which_comparison_bifs_it_inlined() {
+    // Artifact-level evidence that the comparison fast path — not `jit_step_one` — was
+    // *compiled*: a module that silently deopted would name no operator here.
+    let compiled = CraneliftJit::new()
+        .compile(&comparison_bif_fixtures())
+        .expect("compile the comparison-BIF fixtures");
+    let ops = compiled.inlined_comparison_ops();
+    for &(op, ..) in &COMPARISONS {
+        assert!(
+            ops.contains(&op),
+            "{op} must take the inline path, got {ops:?}"
+        );
+    }
+    assert_eq!(
+        ops.len(),
+        8,
+        "each of the eight operators is recorded exactly once: {ops:?}"
+    );
+    // The inlined comparison writes x-register `dst` natively, so the driver's
+    // native-entry bound guard must see it.
+    assert!(compiled.highest_native_register().is_some());
+
+    // The negative module holds one fixture per clause of the shape test: none of them
+    // may take the fast path.
+    let compiled = CraneliftJit::new()
+        .compile(&non_inlinable_comparison_module())
+        .expect("compile the non-inlinable comparison fixtures");
+    assert!(
+        compiled.inlined_comparison_ops().is_empty(),
+        "no non-inlinable shape may take the fast path, got {:?}",
+        compiled.inlined_comparison_ops()
+    );
+
+    // ... and neither may a module whose atom table lacks `true`/`false`: the result
+    // word cannot be resolved, so the whole instruction stays on the helper.
+    let compiled = CraneliftJit::new()
+        .compile(&comparison_bif_module_without_booleans(
+            "cmpbif_no_bools",
+            &[CmpFn::new(
+                "lt",
+                2,
+                "<",
+                &[ArithSpec::X(0), ArithSpec::X(1)],
+                ArithSpec::X(0),
+            )],
+        ))
+        .expect("compile the boolean-free fixture");
+    assert!(
+        compiled.inlined_comparison_ops().is_empty(),
+        "a module without `true`/`false` must stay on the helper, got {:?}",
+        compiled.inlined_comparison_ops()
+    );
+}
+
+#[test]
+fn the_inlined_comparison_bifs_agree_over_a_wide_range() {
+    // Every inlined shape is pinned on both its pass and its fail side, across the whole
+    // small-int range (boundaries included, where the tagged-word order is easiest to
+    // get wrong), against the interpreter **and** an independently computed oracle.
+    let module = comparison_bif_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the comparison-BIF fixtures");
+    let atoms = module.atom_table.clone();
+
+    let values = [-40i64, -1, 0, 1, 5, 6, 40, MIN_SMALL, MAX_SMALL];
+    for &(op, regs, const_rhs, const_lhs) in &COMPARISONS {
+        for &a in &values {
+            for &b in &values {
+                let args = [make_small(a), make_small(b)];
+                let got = agree_comparison(
+                    &backend,
+                    &compiled,
+                    &module,
+                    regs,
+                    2,
+                    &args,
+                    comparison_floor(atoms.clone()),
+                );
+                assert_eq!(
+                    got.ok(),
+                    Some(boolean(&module, comparison_oracle(op, a, b))),
+                    "{op}: {a} vs {b}"
+                );
+            }
+            let arg = [make_small(a)];
+            let got = agree_comparison(
+                &backend,
+                &compiled,
+                &module,
+                const_rhs,
+                1,
+                &arg,
+                comparison_floor(atoms.clone()),
+            );
+            assert_eq!(
+                got.ok(),
+                Some(boolean(&module, comparison_oracle(op, a, 5))),
+                "{op}: {a} vs 5"
+            );
+            let got = agree_comparison(
+                &backend,
+                &compiled,
+                &module,
+                const_lhs,
+                1,
+                &arg,
+                comparison_floor(atoms.clone()),
+            );
+            assert_eq!(
+                got.ok(),
+                Some(boolean(&module, comparison_oracle(op, 5, a))),
+                "{op}: 5 vs {a}"
+            );
+        }
+    }
+
+    // The `gc_bif` spelling, the non-`x(0)` destination, and the two guard-free constant
+    // forms (an atom under `==`, `nil` under `=:=`).
+    let args = [make_small(7), make_small(7)];
+    for (export, arity, args, expected) in [
+        ("gc_eq", 2, &args[..], true),
+        ("gt_dst_two", 2, &args[..], false),
+    ] {
+        let got = agree_comparison(
+            &backend,
+            &compiled,
+            &module,
+            export,
+            arity,
+            args,
+            comparison_floor(atoms.clone()),
+        );
+        assert_eq!(got.ok(), Some(boolean(&module, expected)), "{export}");
+    }
+    let an_atom = make_atom(atom(&module, "a"));
+    for (arg, expected) in [(an_atom, true), (make_small(7), false), (NIL, false)] {
+        let got = agree_comparison(
+            &backend,
+            &compiled,
+            &module,
+            "arith_eq_atom",
+            1,
+            &[arg],
+            comparison_floor(atoms.clone()),
+        );
+        assert_eq!(got.ok(), Some(boolean(&module, expected)), "arith_eq_atom");
+    }
+    for (arg, expected) in [(NIL, true), (make_small(7), false), (an_atom, false)] {
+        let got = agree_comparison(
+            &backend,
+            &compiled,
+            &module,
+            "exact_eq_nil",
+            1,
+            &[arg],
+            comparison_floor(atoms.clone()),
+        );
+        assert_eq!(got.ok(), Some(boolean(&module, expected)), "exact_eq_nil");
+    }
+}
+
+#[test]
+fn a_non_small_comparison_operand_deopts_to_the_helper_and_still_agrees() {
+    // The operand guard is a *run-time* test, so the very same instruction inlines one
+    // moment and deopts the next. These cases force the deopt: a boxed float cannot be a
+    // tagged small word, and neither can a bignum, an atom or `[]` — while the artifact
+    // proves the same operator was compiled with the inline path.
+    let module = comparison_bif_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the comparison-BIF fixtures");
+    assert!(compiled.inlined_comparison_ops().contains(&"<"));
+    let atoms = module.atom_table.clone();
+
+    let mut arena = MinimalContext::new();
+    let five_float = terms::make_float(&mut arena, 5.0).expect("the arena allocates a float");
+    let four_float = terms::make_float(&mut arena, 4.0).expect("the arena allocates a float");
+    let bignum = terms::make_integer(&mut arena, i64::MAX).expect("the arena allocates a bignum");
+    let an_atom = make_atom(atom(&module, "a"));
+
+    // The float cases are the interesting ones: `5.0 =:= 5` is `false` (the exact
+    // compare is class-strict) while `5.0 == 5` is `true` (the arithmetic compare is
+    // value-based) — so a raw tagged-word compare on the boxed pointer would answer
+    // `false`/`false` and be caught here.
+    for (export, arity, args, expected) in [
+        ("exact_eq", 2, [five_float, make_small(5)], false),
+        ("exact_ne", 2, [five_float, make_small(5)], true),
+        ("arith_eq", 2, [five_float, make_small(5)], true),
+        ("arith_ne", 2, [five_float, make_small(5)], false),
+        ("lt", 2, [four_float, make_small(5)], true),
+        ("gt", 2, [four_float, make_small(5)], false),
+        ("le", 2, [five_float, make_small(5)], true),
+        ("ge", 2, [five_float, make_small(5)], true),
+    ] {
+        let got = agree_comparison(
+            &backend,
+            &compiled,
+            &module,
+            export,
+            arity,
+            &args,
+            comparison_floor(atoms.clone()),
+        );
+        assert_eq!(got.ok(), Some(boolean(&module, expected)), "{export}(float)");
+    }
+
+    // A bignum, an atom and `[]` against a small: agreed with the interpreter (the
+    // comparison itself has no oracle worth hand-writing, but the deopt must not
+    // fabricate a word-compare answer).
+    for bad in [bignum, an_atom, NIL] {
+        for &(op, regs, ..) in &COMPARISONS {
+            let args = [bad, make_small(5)];
+            let got = agree_comparison(
+                &backend,
+                &compiled,
+                &module,
+                regs,
+                2,
+                &args,
+                comparison_floor(atoms.clone()),
+            );
+            assert!(got.is_ok(), "{op}(boxed, 5) must answer, not raise: {got:?}");
+        }
+    }
+}
+
+#[test]
+fn the_inlined_comparison_never_consults_the_bif_hook() {
+    // Behavioural proof, not an inference: for the same program the interpreter steps the
+    // BIF exactly once, so the Cranelift tier's *zero* calls can only mean the inlined
+    // fast path computed the tagged word itself.
+    let module = comparison_bif_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the comparison-BIF fixtures");
+    assert!(compiled.inlined_comparison_ops().contains(&"<"));
+    let atoms = module.atom_table.clone();
+    let args = [make_small(3), make_small(4)];
+
+    let interpreted_calls = Arc::new(AtomicUsize::new(0));
+    let interpreted = run_hooked(
+        Tier::Interpreter,
+        &module,
+        "lt",
+        2,
+        &args,
+        counting_comparison_floor(atoms.clone(), Arc::clone(&interpreted_calls)),
+    )
+    .expect("lt(3, 4) via the interpreter");
+    assert_eq!(interpreted, boolean(&module, true));
+    assert_eq!(
+        interpreted_calls.load(Ordering::SeqCst),
+        1,
+        "the interpreter must call the BIF exactly once"
+    );
+
+    let jit_calls = Arc::new(AtomicUsize::new(0));
+    let jitted = run_compiled_hooked(
+        &backend,
+        &compiled,
+        &module,
+        "lt",
+        2,
+        &args,
+        counting_comparison_floor(atoms.clone(), Arc::clone(&jit_calls)),
+    )
+    .expect("lt(3, 4) via the cranelift tier");
+    assert_eq!(jitted, boolean(&module, true));
+    assert_eq!(
+        jit_calls.load(Ordering::SeqCst),
+        0,
+        "the inlined fast path must not call the BIF"
+    );
+
+    // A run-time guard rejection *does* reach the floor (a boxed float is not a tagged
+    // small), so the zero above is the fast path's own doing rather than a hook that is
+    // never installed.
+    let mut arena = MinimalContext::new();
+    let five_float = terms::make_float(&mut arena, 5.0).expect("the arena allocates a float");
+    let deopt_calls = Arc::new(AtomicUsize::new(0));
+    let deopted = run_compiled_hooked(
+        &backend,
+        &compiled,
+        &module,
+        "lt",
+        2,
+        &[five_float, make_small(5)],
+        counting_comparison_floor(atoms, Arc::clone(&deopt_calls)),
+    )
+    .expect("lt(5.0, 5) via the cranelift tier");
+    assert_eq!(deopted, boolean(&module, false));
+    assert_eq!(
+        deopt_calls.load(Ordering::SeqCst),
+        1,
+        "a rejected operand must deopt to the helper, which calls the BIF"
+    );
+}
+
+#[test]
+fn non_inlinable_comparison_shapes_stay_on_the_helper() {
+    // Each fixture violates exactly one clause of the fast path's shape test, so the
+    // artifact must inline no operator for this module — and the shapes must still run,
+    // with the helper's *exact* semantics (the interpreter's answer on every tier).
+    let module = non_inlinable_comparison_module();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the non-inlinable comparison fixtures");
+    assert!(
+        compiled.inlined_comparison_ops().is_empty(),
+        "no non-inlinable shape may take the fast path, got {:?}",
+        compiled.inlined_comparison_ops()
+    );
+    let atoms = module.atom_table.clone();
+
+    // Another BIF, the right BIF name in the wrong module, and a non-2 BIF arity: the
+    // floor receives a call it rejects, so every tier reports its typed `BadArg`.
+    for (export, arity, args) in [
+        ("divide", 2, vec![make_small(6), make_small(7)]),
+        ("eq_foreign", 2, vec![make_small(6), make_small(7)]),
+        ("eq_arity3", 1, vec![make_small(6)]),
+    ] {
+        let got = agree_comparison(
+            &backend,
+            &compiled,
+            &module,
+            export,
+            arity,
+            &args,
+            comparison_floor(atoms.clone()),
+        );
+        assert!(matches!(got, Err(BeamError::BadArg)), "{export}: got {got:?}");
+    }
+
+    // A *non-2 instruction* arity over a 2-arity import: the interpreter resolves the
+    // import (so it computes the comparison), while the tier's shape test refuses the
+    // instruction — and the deopt reproduces the interpreter exactly.
+    let got = agree_comparison(
+        &backend,
+        &compiled,
+        &module,
+        "eq_instr_arity3",
+        2,
+        &[make_small(6), make_small(6)],
+        comparison_floor(atoms.clone()),
+    );
+    assert_eq!(got.ok(), Some(boolean(&module, true)), "eq_instr_arity3");
+
+    // A float-register operand (the register file is `NIL`-filled) and an unresolvable
+    // literal: refused at compile time, and the helper's operand read is the engine's
+    // exact semantics.
+    for (export, arity, args) in [
+        ("lt_floatreg", 1, vec![make_small(2)]),
+        ("lt_literal", 1, vec![make_small(2)]),
+    ] {
+        let got = agree_comparison(
+            &backend,
+            &compiled,
+            &module,
+            export,
+            arity,
+            &args,
+            comparison_floor(atoms.clone()),
+        );
+        assert!(got.is_ok(), "{export} must be an answer, not a raise: {got:?}");
+    }
+    let got = agree_comparison(
+        &backend,
+        &compiled,
+        &module,
+        "lt_bigconst",
+        1,
+        &[make_small(2)],
+        comparison_floor(atoms.clone()),
+    );
+    assert_eq!(
+        got.ok(),
+        Some(boolean(&module, true)),
+        "2 < a bignum constant"
+    );
+
+    // The ordering operators with an atom or `nil` constant are refused too (a
+    // non-number is not word-ordered), and the shape still answers.
+    for (export, arg) in [
+        ("lt_atom", make_small(2)),
+        ("lt_nil", make_small(2)),
+        ("lt_atom", NIL),
+        ("lt_nil", NIL),
+    ] {
+        let got = agree_comparison(
+            &backend,
+            &compiled,
+            &module,
+            export,
+            1,
+            &[arg],
+            comparison_floor(atoms.clone()),
+        );
+        assert!(got.is_ok(), "{export} must be an answer, not a raise: {got:?}");
+    }
+
+    // A `Y` destination (the helper's write is the engine's typed `bad_register`, since
+    // the fixture allocates no frame) and a destination past `MAX_REGISTER`.
+    for (export, arity, args) in [
+        ("lt_y_dst", 1, vec![make_small(2)]),
+        ("lt_dst_oob", 2, vec![make_small(2), make_small(3)]),
+    ] {
+        let got = agree_comparison(
+            &backend,
+            &compiled,
+            &module,
+            export,
+            arity,
+            &args,
+            comparison_floor(atoms.clone()),
+        );
+        assert!(got.is_err(), "{export} must be a typed error: {got:?}");
+    }
+}
+
+#[test]
+fn a_comparison_over_a_module_without_booleans_stays_on_the_helper() {
+    // The result words are the *module's* `true`/`false` atoms, so a module whose atom
+    // table lacks them cannot be lowered natively — the instruction must stay on the
+    // helper, whose interpreter step is the BIF's exact semantics (here: the floor
+    // reports it, and a context without one surfaces the same typed error on every tier).
+    let module = comparison_bif_module_without_booleans(
+        "cmpbif_no_bools",
+        &[CmpFn::new(
+            "lt",
+            2,
+            "<",
+            &[ArithSpec::X(0), ArithSpec::X(1)],
+            ArithSpec::X(0),
+        )],
+    );
+    let mut backend = CraneliftJit::new();
+    let compiled = backend.compile(&module).expect("compile the fixture");
+    assert!(compiled.inlined_comparison_ops().is_empty());
+
+    let args = [make_small(3), make_small(4)];
+    let interpreted = run_module(
+        Tier::Interpreter,
+        &module,
+        "lt",
+        2,
+        &args,
+        &mut MinimalContext::new(),
+    );
+    assert_same(
+        &run_module(
+            Tier::BaselineJit,
+            &module,
+            "lt",
+            2,
+            &args,
+            &mut MinimalContext::new(),
+        ),
+        &interpreted,
+        "baseline lt/2 without result atoms",
+    );
+    assert_same(
+        &run_compiled(&backend, &compiled, &module, "lt", 2, &args),
+        &interpreted,
+        "cranelift lt/2 without result atoms",
+    );
+    assert!(interpreted.is_err(), "the fixture has no BIF floor");
+}
+
+// ---------------------------------------------------------------------------
 // The inlined shape instructions (`select_val`, the tuple reads, the list reads)
 // (`src/jit/cranelift/`)
 // ---------------------------------------------------------------------------
