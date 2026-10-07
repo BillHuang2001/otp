@@ -626,8 +626,14 @@ fn term_to_binary_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// The parsed `term_to_binary/2` options (`parse_t2b_opts`, `external.c:1481-1520`).
+///
+/// Crate-visible so that `erlang:external_size/2` (in [`crate::term_conv`]) runs the
+/// **same** parser and the **same** body encoder as `term_to_binary/2`; the oracle's
+/// own `external_size_2` reuses `parse_t2b_opts` and the encoder's size probe
+/// (`external.c:2221-2246`, `external.c:736-743`), so the two BIFs must not drift
+/// on which option lists are valid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct T2bOptions {
+pub(crate) struct T2bOptions {
     /// The selected `{minor_version, N}` (`0..=2`).
     minor_version: u8,
     /// The zlib level of `compressed`/`{compressed, Level}`, `None` when neither was
@@ -669,7 +675,7 @@ const COMPRESSED_OVERHEAD: usize = 5;
 /// improper list), an unknown atom/tuple option, a `{minor_version, N}` outside
 /// `0..=2`, or a `{compressed, Level}` whose level is not a small integer in
 /// `0..=9` — the C `parse_t2b_opts` rejections.
-fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Result<T2bOptions> {
+pub(crate) fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Result<T2bOptions> {
     let mut parsed = T2bOptions::default();
     for item in proper_list(opts).ok_or_else(badarg)? {
         if access::is_atom(item) {
@@ -717,15 +723,45 @@ fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Result<T2bOpt
 ///
 /// The encoder's and zlib's errors (see [`encode_body`]).
 fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
-    let body = encode_body(ctx, term, options)?;
     match options.compression {
-        None => Ok(plain_image(&body)),
-        Some(level) => compressed_image(&body, level),
+        None => plain_image_of(ctx, term, options),
+        Some(level) => compressed_image(&encode_body(ctx, term, options)?, level),
     }
+}
+
+/// The **uncompressed** external image of `term` under `options`: the version byte
+/// followed by [`encode_body`]'s bytes.
+///
+/// This is the image `erlang:term_to_binary/1` produces, and the one
+/// `erlang:external_size/1,2` ([`crate::term_conv`]) sizes.
+///
+/// The oracle's `external_size_2` (`external.c:2221-2246`) validates the whole option
+/// list — `compressed`/`{compressed, Level}` included — but passes only the *flags*
+/// (the `{minor_version, N}` tag set), never the compression level, to its size probe
+/// (`erts_encode_ext_size_2`, `external.c:736-743`, which never deflates). The
+/// documented contract is an upper bound — `byte_size(term_to_binary(T, Opts)) =<
+/// erlang:external_size(T, Opts)` (`../../erts/preloaded/src/erlang.erl:2687-2710`) —
+/// so a compressed image is deliberately **not** what this returns. Oracle-pinned:
+/// `erlang:external_size(lists:duplicate(500,hello),[compressed])` is `3507` while
+/// `byte_size(term_to_binary(lists:duplicate(500,hello),[compressed]))` is `50`.
+///
+/// # Errors
+///
+/// The encoder's errors (see [`encode_body`]).
+pub(crate) fn plain_image_of(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    options: &T2bOptions,
+) -> Result<Vec<u8>> {
+    Ok(plain_image(&encode_body(ctx, term, options)?))
 }
 
 /// Encodes `term` as a **body** — the term with no version byte — under the tag set
 /// `options.minor_version` selects.
+///
+/// Shared by `term_to_binary/1,2` (via [`encode_image`]) and by
+/// `erlang:external_size/1,2` (via [`plain_image_of`]), so both BIFs agree on the tag
+/// set and on what is encodable.
 ///
 /// The three `{minor_version, N}` flavours are [`MinorVersion`]'s (`external.c:1499-1514`:
 /// `DFLAG_UTF8_ATOMS` and `DFLAG_NEW_FLOATS`); the codec owns the tag selection, so an
@@ -749,7 +785,11 @@ fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> 
 /// (an internal pid/port id with no resolvable local node, an off-heap `BinRef`),
 /// `SystemLimit` for a value beyond a wire bound, and `error:unsupported_bif` for the
 /// local (`make_fun3`) fun that has no faithful wire image.
-fn encode_body(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
+pub(crate) fn encode_body(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    options: &T2bOptions,
+) -> Result<Vec<u8>> {
     // The local node identity and the local-fun identity both borrow `ctx` mutably,
     // and the encoder holds an immutable borrow of `ctx`'s atom table for its whole
     // lifetime — so read both first and install them afterwards.

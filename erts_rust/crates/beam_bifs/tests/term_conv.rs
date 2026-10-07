@@ -1,7 +1,7 @@
 //! Integration tests for the `term_conv` BIFs —
 //! `erlang:bitstring_to_list/1`, `erlang:delete_element/2`,
 //! `erlang:insert_element/3`, `erlang:iolist_to_iovec/1`, `erlang:is_integer/3`,
-//! `erlang:display/1`, `erlang:display_string/2`,
+//! `erlang:display/1`, `erlang:display_string/2`, `erlang:external_size/1,2`,
 //! `binary:referenced_byte_size/1`, and the textual pid/ref/port conversions
 //! `erlang:pid_to_list/1`, `erlang:list_to_pid/1`, `erlang:ref_to_list/1`,
 //! `erlang:list_to_ref/1`, `erlang:pid_to_binary/1`, `erlang:ref_to_binary/1`,
@@ -24,6 +24,7 @@ use std::process::Command;
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink, TableRegistry};
+use beam_codec::error::is_unsupported;
 use beam_codec::term as codec_term;
 use beam_common::BeamError;
 use beam_process::{PortId, ProcessId};
@@ -1372,5 +1373,330 @@ fn the_conversion_goldens_match_the_live_oracle() {
             "badarg\n",
         ),
         "the live oracle disagrees with this test file's conversion goldens"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// external_size/1,2
+// ---------------------------------------------------------------------------
+
+/// The atom table the `external_size` tests use: the `term_to_binary/2` option atoms
+/// plus the `nonode@nohost` local-node fallback (so an internal pid has a wire image).
+fn external_size_atoms() -> AtomTable {
+    let mut atoms = AtomTable::new();
+    atoms.seed([
+        "true",
+        "false",
+        "ok",
+        "a",
+        "b",
+        "c",
+        "hello",
+        "compressed",
+        "minor_version",
+        "bogus",
+        "nonode@nohost",
+    ]);
+    atoms
+}
+
+/// The byte length of a binary term the tests built.
+fn binary_len(term: Eterm) -> i64 {
+    let (_, offset, size_bits) = codec_term::bitstring_bytes(term).expect("a binary");
+    assert_eq!(offset % 8, 0, "the image is byte aligned");
+    assert_eq!(size_bits % 8, 0, "the image is a whole number of bytes");
+    (size_bits / 8) as i64
+}
+
+/// The small integer `erlang:external_size/1,2` answered.
+fn reported_size(term: Eterm) -> i64 {
+    assert!(is_small(term), "a size must be a small integer, got {term:?}");
+    signed_value(term)
+}
+
+/// `erlang:external_size/1`.
+fn external_size_1(reg: &BifRegistry, ctx: &mut BifContext<'_>, term: Eterm) -> i64 {
+    reported_size(call(reg, ctx, "erlang", "external_size", 1, &[term]).expect("encodable"))
+}
+
+/// `erlang:external_size/2`.
+fn external_size_2(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    options: Eterm,
+) -> i64 {
+    reported_size(
+        call(reg, ctx, "erlang", "external_size", 2, &[term, options]).expect("encodable"),
+    )
+}
+
+/// `byte_size(erlang:term_to_binary(Term))` — the image `external_size/1` must agree
+/// with for these terms (the documented `Size1 =< Size2` contract,
+/// `erts/preloaded/src/erlang.erl:2658-2679`).
+fn image_len(reg: &BifRegistry, ctx: &mut BifContext<'_>, term: Eterm) -> i64 {
+    binary_len(call(reg, ctx, "erlang", "term_to_binary", 1, &[term]).expect("encodable"))
+}
+
+/// The proper list `items` on the context heap (an option list).
+fn option_list(ctx: &mut BifContext<'_>, items: &[Eterm]) -> Eterm {
+    ctx.list(items).expect("the option list fits")
+}
+
+#[test]
+fn external_size_matches_the_oracle_for_the_primitive_shapes() {
+    // ORACLE (OTP 29.1.1 / erts-17.1), one probe per shape:
+    //   erlang:external_size(5)         => 3
+    //   erlang:external_size(a)         => 4
+    //   erlang:external_size(hello)     => 8
+    //   erlang:external_size([1,2,3])   => 7
+    //   erlang:external_size({a,b,c})   => 12
+    //   erlang:external_size(1.5)       => 10
+    //   erlang:external_size(1 bsl 100) => 17
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = external_size_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let five = small(&mut ctx, 5);
+    let a = ctx.atom("a").expect("seeded");
+    let hello = ctx.atom("hello").expect("seeded");
+    let list = ints(&mut ctx, &[1, 2, 3]);
+    let b = ctx.atom("b").expect("seeded");
+    let c = ctx.atom("c").expect("seeded");
+    let tuple = ctx.tuple(&[a, b, c]).expect("fits");
+    let float = ctx.make_float(1.5).expect("fits");
+    // `1 bsl 100` as the two little-endian 64-bit digits `[0, 1 << 36]`.
+    let big = codec_term::make_big(ctx.heap(), false, &[0, 1 << 36]).expect("2^100 fits");
+
+    for (term, expected) in [
+        (five, 3),
+        (a, 4),
+        (hello, 8),
+        (list, 7),
+        (tuple, 12),
+        (float, 10),
+        (big, 17),
+    ] {
+        assert_eq!(
+            external_size_1(&reg, &mut ctx, term),
+            expected,
+            "external_size/1 disagrees"
+        );
+        assert_eq!(
+            image_len(&reg, &mut ctx, term),
+            expected,
+            "byte_size(term_to_binary/1) disagrees"
+        );
+    }
+}
+
+#[test]
+fn external_size_2_validates_and_applies_the_term_to_binary_options() {
+    // ORACLE (OTP 29.1.1 / erts-17.1):
+    //   erlang:external_size(a)                       => 4
+    //   erlang:external_size(a,[{minor_version,0}])   => 5   (ATOM_EXT)
+    //   erlang:external_size(a,[{minor_version,1}])   => 5   (ATOM_EXT)
+    //   erlang:external_size(1.5,[{minor_version,0}]) => 33  (legacy FLOAT_EXT)
+    //   erlang:external_size(a,[compressed])          => 4   (level never applied)
+    //   erlang:external_size(a,[{compressed,9}])      => 4
+    //   erlang:external_size(5,[bogus])               => badarg
+    //   erlang:external_size(5,[{minor_version,3}])   => badarg
+    //   erlang:external_size(5,[{compressed,10}])     => badarg
+    //   erlang:external_size(5,[a|5])                 => badarg (improper list)
+    //   erlang:external_size(5,5)                     => badarg (not a list)
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = external_size_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let a = ctx.atom("a").expect("seeded");
+    let compressed = ctx.atom("compressed").expect("seeded");
+    let minor_version = ctx.atom("minor_version").expect("seeded");
+    let bogus = ctx.atom("bogus").expect("seeded");
+    let zero = small(&mut ctx, 0);
+    let one = small(&mut ctx, 1);
+    let three = small(&mut ctx, 3);
+    let five = small(&mut ctx, 5);
+    let nine = small(&mut ctx, 9);
+    let ten = small(&mut ctx, 10);
+    let float = ctx.make_float(1.5).expect("fits");
+
+    let mv0 = ctx.tuple(&[minor_version, zero]).expect("fits");
+    let mv1 = ctx.tuple(&[minor_version, one]).expect("fits");
+    let mv3 = ctx.tuple(&[minor_version, three]).expect("fits");
+    let lvl9 = ctx.tuple(&[compressed, nine]).expect("fits");
+    let lvl10 = ctx.tuple(&[compressed, ten]).expect("fits");
+
+    let mv0_opts = option_list(&mut ctx, &[mv0]);
+    let mv1_opts = option_list(&mut ctx, &[mv1]);
+    let mv3_opts = option_list(&mut ctx, &[mv3]);
+    let compressed_opts = option_list(&mut ctx, &[compressed]);
+    let lvl9_opts = option_list(&mut ctx, &[lvl9]);
+    let lvl10_opts = option_list(&mut ctx, &[lvl10]);
+    let bogus_opts = option_list(&mut ctx, &[bogus]);
+    let improper = ctx.cons(a, five).expect("fits");
+
+    assert_eq!(external_size_1(&reg, &mut ctx, a), 4, "the default tag set");
+    assert_eq!(external_size_2(&reg, &mut ctx, a, mv0_opts), 5, "minor_version 0");
+    assert_eq!(external_size_2(&reg, &mut ctx, a, mv1_opts), 5, "minor_version 1");
+    assert_eq!(
+        external_size_2(&reg, &mut ctx, float, mv0_opts),
+        33,
+        "the legacy FLOAT_EXT of minor_version 0"
+    );
+    // `compressed` is validated through the *same* list, but the size probe never
+    // deflates the body (see `the_external_size_of_a_compressible_term_...`).
+    assert_eq!(external_size_2(&reg, &mut ctx, a, compressed_opts), 4, "compressed");
+    assert_eq!(external_size_2(&reg, &mut ctx, a, lvl9_opts), 4, "{{compressed, 9}}");
+
+    // The same options as `term_to_binary/2`: the size is that image's byte length.
+    let mv0_image =
+        call(&reg, &mut ctx, "erlang", "term_to_binary", 2, &[a, mv0_opts]).expect("encodable");
+    assert_eq!(binary_len(mv0_image), 5, "term_to_binary/2 with minor_version 0");
+
+    for bad in [bogus_opts, mv3_opts, lvl10_opts, improper, five] {
+        assert!(
+            matches!(
+                call(&reg, &mut ctx, "erlang", "external_size", 2, &[five, bad]),
+                Err(BeamError::BadArg)
+            ),
+            "a rejected option list must be badarg"
+        );
+    }
+}
+
+#[test]
+fn external_size_of_a_compressible_term_is_the_uncompressed_image() {
+    // ORACLE (OTP 29.1.1 / erts-17.1) for `T = lists:duplicate(500,a)`:
+    //   byte_size(term_to_binary(T))              => 1507
+    //   erlang:external_size(T)                   => 1507
+    //   byte_size(term_to_binary(T,[compressed])) => 33
+    //   erlang:external_size(T,[compressed])      => 1507
+    // and for the 500-byte string `lists:duplicate(500,$a)`: 504 / 504.
+    //
+    // The oracle's `external_size_2` passes only the *flags* to its size probe
+    // (`external.c:2221-2246`, `external.c:736-743`), which never deflates; the
+    // documented contract is the upper bound
+    // `byte_size(term_to_binary(T, Opts)) =< erlang:external_size(T, Opts)`
+    // (`erts/preloaded/src/erlang.erl:2687-2710`).
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = external_size_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let a = ctx.atom("a").expect("seeded");
+    let compressed = ctx.atom("compressed").expect("seeded");
+    let elements = vec![a; 500];
+    let list = ctx.list(&elements).expect("the list fits");
+    let compressed_opts = option_list(&mut ctx, &[compressed]);
+
+    assert_eq!(external_size_1(&reg, &mut ctx, list), 1507, "external_size/1");
+    assert_eq!(
+        external_size_2(&reg, &mut ctx, list, compressed_opts),
+        1507,
+        "the compression level does not shrink the size"
+    );
+    assert_eq!(image_len(&reg, &mut ctx, list), 1507, "the plain image");
+
+    // The byte-list form is a `STRING_EXT` image the oracle sizes at 504 either way.
+    let chars: Vec<Eterm> = (0..500).map(|_| ctx.int(97).expect("fits")).collect();
+    let string = ctx.list(&chars).expect("the list fits");
+    assert_eq!(external_size_1(&reg, &mut ctx, string), 504);
+    assert_eq!(external_size_2(&reg, &mut ctx, string, compressed_opts), 504);
+}
+
+#[test]
+fn external_size_of_an_unencodable_term_is_the_typed_gap() {
+    // With no `LocalNode` hook and no `nonode@nohost` atom, an internal pid has no wire
+    // image: the codec's typed `unsupported_external_term`, never a fabricated number.
+    let reg = default_registry();
+    let mut gap_heap = heap();
+    let mut gap_atoms = AtomTable::new();
+    gap_atoms.seed(["a", "b"].iter().copied());
+    let mut ctx = BifContext::new(&mut gap_heap, &gap_atoms, ProcessId::new(1, 0));
+
+    let self_pid = ctx.self_pid().to_eterm();
+    let nested = ctx.tuple(&[self_pid]).expect("fits");
+    for term in [self_pid, nested] {
+        let err = call(&reg, &mut ctx, "erlang", "external_size", 1, &[term]).unwrap_err();
+        assert!(is_unsupported(&err), "expected a typed gap, got {err:?}");
+        let err = call(&reg, &mut ctx, "erlang", "external_size", 2, &[term, NIL]).unwrap_err();
+        assert!(is_unsupported(&err), "expected a typed gap, got {err:?}");
+    }
+
+    // The very same term sizes once the local node is nameable — `self()` is 29 bytes
+    // in the oracle (`byte_size(term_to_binary(self()))`).
+    let mut nameable_heap = heap();
+    let nameable_atoms = external_size_atoms();
+    let mut ctx = BifContext::new(&mut nameable_heap, &nameable_atoms, ProcessId::new(1, 0));
+    let self_pid = ctx.self_pid().to_eterm();
+    assert_eq!(external_size_1(&reg, &mut ctx, self_pid), 29);
+    assert_eq!(image_len(&reg, &mut ctx, self_pid), 29);
+}
+
+/// The `external_size/1,2` goldens, re-run under the live system `erl`.
+///
+/// Probes (OTP 29.1.1 / erts-17.1), one statement per `io:format`:
+///
+/// ```text
+/// erlang:external_size(5)                       => 3
+/// erlang:external_size(a)                       => 4
+/// erlang:external_size(hello)                   => 8
+/// erlang:external_size([1,2,3])                 => 7
+/// erlang:external_size({a,b,c})                 => 12
+/// erlang:external_size(1.5)                     => 10
+/// erlang:external_size(1 bsl 100)               => 17
+/// erlang:external_size(a,[{minor_version,0}])   => 5
+/// erlang:external_size(1.5,[{minor_version,0}]) => 33
+/// erlang:external_size(lists:duplicate(500,a),[compressed]) => 1507
+/// erlang:external_size(lists:duplicate(500,a))
+///     =:= byte_size(term_to_binary(lists:duplicate(500,a))) => true
+/// erlang:external_size(5,[bogus])               => badarg
+/// erlang:external_size(5,[{compressed,10}])     => badarg
+/// ```
+///
+/// Skips loudly when `erl` is unavailable.
+#[test]
+fn the_external_size_goldens_match_the_live_oracle() {
+    let statement = concat!(
+        "io:format(\"~p~n\",[erlang:external_size(5)]),",
+        "io:format(\"~p~n\",[erlang:external_size(a)]),",
+        "io:format(\"~p~n\",[erlang:external_size(hello)]),",
+        "io:format(\"~p~n\",[erlang:external_size([1,2,3])]),",
+        "io:format(\"~p~n\",[erlang:external_size({a,b,c})]),",
+        "io:format(\"~p~n\",[erlang:external_size(1.5)]),",
+        "io:format(\"~p~n\",[erlang:external_size(1 bsl 100)]),",
+        "io:format(\"~p~n\",[erlang:external_size(a,[{minor_version,0}])]),",
+        "io:format(\"~p~n\",[erlang:external_size(1.5,[{minor_version,0}])]),",
+        "io:format(\"~p~n\",[erlang:external_size(lists:duplicate(500,a),[compressed])]),",
+        "io:format(\"~p~n\",[erlang:external_size(lists:duplicate(500,a)) =:= \
+         byte_size(term_to_binary(lists:duplicate(500,a)))]),",
+        "io:format(\"~p~n\",[try erlang:external_size(5,[bogus]) catch error:R1 -> R1 end]),",
+        "io:format(\"~p~n\",[try erlang:external_size(5,[{compressed,10}]) \
+         catch error:R2 -> R2 end]),",
+        "halt()."
+    );
+    let Some(stdout) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        stdout,
+        concat!(
+            "3\n",
+            "4\n",
+            "8\n",
+            "7\n",
+            "12\n",
+            "10\n",
+            "17\n",
+            "5\n",
+            "33\n",
+            "1507\n",
+            "true\n",
+            "badarg\n",
+            "badarg\n",
+        ),
+        "the live oracle disagrees with this test file's external_size goldens"
     );
 }

@@ -1,7 +1,8 @@
 //! Term-conversion and inspection BIFs for `erlang` and `binary`:
 //! `bitstring_to_list/1`, `delete_element/2`, `insert_element/3`,
 //! `iolist_to_iovec/1`, `is_integer/3`, `display/1`, `display_string/2`,
-//! `binary:referenced_byte_size/1`, and the textual pid/ref/port conversions
+//! `external_size/1,2`, `binary:referenced_byte_size/1`, and the textual
+//! pid/ref/port conversions
 //! `pid_to_list/1`, `list_to_pid/1`, `ref_to_list/1`, `list_to_ref/1`,
 //! `pid_to_binary/1`, `ref_to_binary/1` and `port_to_binary/1`.
 //!
@@ -9,7 +10,8 @@
 //! (`bif erlang:bitstring_to_list/1` :493, `ubif erlang:is_integer/3` :845,
 //! `bif erlang:insert_element/3` :612, `bif erlang:delete_element/2` :613,
 //! `bif erlang:iolist_to_iovec/1` :686, `bif erlang:display/1` :60,
-//! `bif erlang:display_string/2` :61, `bif binary:referenced_byte_size/1` :561,
+//! `bif erlang:display_string/2` :61, `bif erlang:external_size/1` :68,
+//! `bif erlang:external_size/2` :69, `bif binary:referenced_byte_size/1` :561,
 //! `bif erlang:list_to_pid/1` :92, `bif erlang:list_to_ref/1` :94,
 //! `bif erlang:pid_to_list/1` :126, `bif erlang:ref_to_list/1` :273,
 //! `bif erlang:pid_to_binary/1` :866, `bif erlang:port_to_binary/1` :867,
@@ -59,10 +61,24 @@
 //! treats it. `list_to_ref/1` accepts only the exact `#Ref<0.0.0.N>` shape this
 //! runtime's own ref thing can hold (see [`parse_ref_text`]).
 //!
-//! # Deliberately out of scope
+//! # `erlang:external_size/1,2`
 //!
-//! `erlang:external_size/1` is **not** registered: it needs the ETF encoder's size
-//! probe. It stays unregistered (`undef`) rather than approximated.
+//! `external_size(T)` / `external_size(T, Options)` size the external term image
+//! without ever building it. Both delegate to [`crate::binconv`]'s **uncompressed**
+//! image (`plain_image_of`) under the option list `term_to_binary/2` accepts, so the
+//! two BIFs share one option parser and one body encoder and cannot drift.
+//!
+//! The oracle's `external_size_2` (`external.c:2221-2246`) validates
+//! `compressed`/`{compressed, Level}` but passes only the `{minor_version, N}` *flags*
+//! to its size probe (`erts_encode_ext_size_2`, `external.c:736-743`), which never
+//! deflates — the documented contract is the upper bound `byte_size(term_to_binary(T,
+//! Opts)) =< external_size(T, Opts)`
+//! (`../../erts/preloaded/src/erlang.erl:2687-2710`). So `compressed` selects the
+//! *uncompressed* size: oracle-pinned,
+//! `erlang:external_size(lists:duplicate(500,hello),[compressed])` is `3507` (the
+//! plain image) while the compressed image is `50` bytes. A term the codec cannot
+//! encode — an internal pid with no resolvable local node, a local fun with no
+//! identity — stays the codec's typed `unsupported_external_term`, never a number.
 
 use beam_common::Result;
 use beam_codec::term as codec_term;
@@ -71,9 +87,11 @@ use beam_term::prelude::signed_value;
 use beam_term::{atom_val, Eterm, ERL_ONHEAP_BITS_LIMIT, NIL};
 
 use crate::access;
+use crate::arith;
+use crate::binconv::{parse_term_to_binary_options, plain_image_of, T2bOptions};
 use crate::bits;
 use crate::context::BifContext;
-use crate::error::{badarg, unsupported_bif};
+use crate::error::{badarg, system_limit, unsupported_bif};
 use crate::print::{flatten, proper_list, term_chunk, UNLIMITED_DEPTH};
 use crate::registry::BifRegistry;
 
@@ -830,7 +848,85 @@ fn list_to_ref_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     access::make_ref_thing(ctx.heap(), id)
 }
 
-/// Registers this module's BIFs (fifteen keys: fourteen `erlang` and one `binary`).
+// ---------------------------------------------------------------------------
+// external_size/1,2
+// ---------------------------------------------------------------------------
+
+/// `external_size(Term)` (`external.c:2196-2218`) — the byte size of `Term`'s
+/// external term image, without building it.
+///
+/// The oracle's `external_size_1` runs `erts_encode_ext_size`, i.e. the size probe
+/// under the **default** `TERM_TO_BINARY_DFLAGS` — exactly
+/// [`T2bOptions::default`]. Pinned to the oracle:
+/// `external_size(5)` ⇒ `3`, `external_size(a)` ⇒ `4`, `external_size(hello)` ⇒ `8`,
+/// `external_size([1,2,3])` ⇒ `7`, `external_size({a,b,c})` ⇒ `12`,
+/// `external_size(1.5)` ⇒ `10`, `external_size(1 bsl 100)` ⇒ `17` — each equal to
+/// `byte_size(term_to_binary(Term))`, as the doc contract requires
+/// (`Size1 =< Size2`, `../../erts/preloaded/src/erlang.erl:2658-2679`).
+///
+/// # Errors
+///
+/// The encoder's errors (see [`external_size`]).
+fn external_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    external_size(ctx, args[0], &T2bOptions::default())
+}
+
+/// `external_size(Term, Options)` (`external.c:2221-2246`) — the same size under the
+/// option list `term_to_binary/2` accepts.
+///
+/// The option list is validated by the **same** parser `term_to_binary/2` uses, so
+/// the rejections are identical: `external_size(5, [bogus])`,
+/// `external_size(5, [{minor_version, 3}])` and `external_size(5, [{compressed, 10}])`
+/// are all `badarg`. Only `{minor_version, N}` changes the number — it selects the
+/// tag set (`external_size(a, [{minor_version, 0}])` ⇒ `5` and
+/// `[{minor_version, 1}]` ⇒ `5`, against the default `4`; the legacy `FLOAT_EXT` of
+/// `{minor_version, 0}` makes `external_size(1.5, [{minor_version, 0}])` ⇒ `33`).
+/// `compressed`/`{compressed, Level}` is validated but does **not** shrink the result
+/// — see [`external_size`].
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for the option lists
+/// `term_to_binary/2` rejects; the encoder's errors otherwise.
+fn external_size_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let options = parse_term_to_binary_options(ctx.atoms(), args[1])?;
+    external_size(ctx, args[0], &options)
+}
+
+/// The shared `external_size` core: the length of the **uncompressed** external image
+/// of `term` under `options`, as an integer term.
+///
+/// The image is [`plain_image_of`]'s — the version byte plus the same body
+/// `term_to_binary/2` writes under the option list's tag set — so the two BIFs share
+/// one parser and one encoder. The compression level is deliberately ignored:
+/// the oracle's `external_size_2` (`external.c:2221-2246`) never passes it to
+/// `erts_encode_ext_size_2` (`external.c:736-743`), and the documented contract is
+/// `byte_size(term_to_binary(T, Opts)) =< erlang:external_size(T, Opts)`
+/// (`../../erts/preloaded/src/erlang.erl:2687-2710`).
+///
+/// The result is materialized through [`arith::int_from_i64`], the crate's single
+/// small-int-or-bignum promotion path — mirroring the C's `IS_USMALL(0, size) ?
+/// make_small(size) : uint_to_big(size, hp)` (`external.c:2212-2217`), so a size
+/// beyond the 60-bit small range would be a bignum rather than an error.
+///
+/// # Errors
+///
+/// The encoder's errors: `error:unsupported_external_term` for a term the codec
+/// cannot write (an internal pid/port id with no resolvable local node, an off-heap
+/// `BinRef`), `error:unsupported_bif` for a local (`make_fun3`) fun with no identity
+/// hook, `system_limit` for a wire bound that cannot be met. A term the codec cannot
+/// encode is **never** approximated by a number.
+fn external_size(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    options: &T2bOptions,
+) -> Result<Eterm> {
+    let image = plain_image_of(ctx, term, options)?;
+    let size = i64::try_from(image.len()).map_err(|_| system_limit())?;
+    arith::int_from_i64(ctx, size)
+}
+
+/// Registers this module's BIFs (seventeen keys: sixteen `erlang` and one `binary`).
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "bitstring_to_list", 1, bitstring_to_list_1);
     reg.register("erlang", "delete_element", 2, delete_element_2);
@@ -839,6 +935,8 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "is_integer", 3, is_integer_3);
     reg.register("erlang", "display", 1, display_1);
     reg.register("erlang", "display_string", 2, display_string_2);
+    reg.register("erlang", "external_size", 1, external_size_1);
+    reg.register("erlang", "external_size", 2, external_size_2);
     reg.register("binary", "referenced_byte_size", 1, referenced_byte_size_1);
     reg.register("erlang", "pid_to_list", 1, pid_to_list_1);
     reg.register("erlang", "list_to_pid", 1, list_to_pid_1);
@@ -874,7 +972,7 @@ mod tests {
     fn register_installs_the_roster() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
-        assert_eq!(reg.len(), 15);
+        assert_eq!(reg.len(), 17);
         assert!(reg.contains("erlang", "bitstring_to_list", 1));
         assert!(reg.contains("binary", "referenced_byte_size", 1));
         for name in [
@@ -888,8 +986,9 @@ mod tests {
         ] {
             assert!(reg.contains("erlang", name, 1), "{name}/1 is registered");
         }
-        // Deliberately out of scope, so unregistered.
-        assert!(!reg.contains("erlang", "external_size", 1));
+        // Both `external_size` arities are registered (`bif.tab:68-69`).
+        assert!(reg.contains("erlang", "external_size", 1));
+        assert!(reg.contains("erlang", "external_size", 2));
     }
 
     #[test]
