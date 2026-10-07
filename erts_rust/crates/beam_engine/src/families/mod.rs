@@ -54,7 +54,7 @@ use crate::Step;
 /// `": <name>"` (the instruction's `ops.tab` spelling, see [`instr_name`]).
 pub(crate) const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed";
 mod bitstrings;
-mod exceptions;
+pub(crate) mod exceptions;
 mod floats;
 mod funs;
 mod lists;

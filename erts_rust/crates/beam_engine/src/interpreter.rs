@@ -101,6 +101,17 @@ impl Machine {
         // `Operand::Literal(idx)` (the module is fixed for the whole run; see the
         // `Machine::literals` field docs). `reset()` cleared any previous binding.
         self.set_literals(module.literals.clone());
+        // Record the run's entry function — the engine's analogue of ERTS's
+        // `$initial_call` — **once** per run: `reset` cleared it for a fresh run,
+        // and `resume_outcome` re-enters the same run through this entry without
+        // resetting, so an existing recording is never overwritten (the process's
+        // initial call is fixed for the life of the run). A `func` outside the
+        // module records nothing rather than a bogus entry.
+        if self.entry_call.is_none() {
+            if let Some(function) = module.functions.get(func as usize) {
+                self.entry_call = Some((func, function.arity));
+            }
+        }
         let labels = build_label_map(module);
         self.run_loop_with_map(module, &labels, func, pc, ctx)
     }
@@ -135,6 +146,15 @@ impl Machine {
         pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Step> {
+        // Record the machine's execution position: the read-only "saved instruction
+        // pointer" behind `Machine::current_code` and the derived
+        // `current_function`/`current_location`/`current_stacktrace`
+        // (`process_info/2`). Every *interpreted* instruction passes through here —
+        // the dispatch loop below and the native tiers' per-instruction deopt helper
+        // both call it — so the address is exact at every suspension point (a
+        // blocking `wait` is interpreted, never inlined); a natively-executed JIT
+        // block does not update it (see the field docs).
+        self.current_code = Some((func, pc));
         // The instruction borrows `module` (never `self`), so mutating the machine
         // in the arms below is sound and clone-free.
         let instr = match module.functions.get(func as usize) {
