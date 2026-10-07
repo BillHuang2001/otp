@@ -2,8 +2,8 @@
 //!
 //! `tests/fixtures/nif_env.c` is a real C NIF — compiled at test time with the system `cc` against
 //! the system `erl_nif.h` — whose `enif_make_existing_atom(_len)`, `enif_select`, `enif_select_x`,
-//! `enif_priv_data` and `enif_make_copy` calls are **undefined** in the `.so` and are bound at
-//! `dlopen(RTLD_NOW)` against this test binary's dynamic symbol table (`build.rs` adds
+//! `enif_priv_data`, `enif_make_copy` and `enif_alloc_env` calls are **undefined** in the `.so` and
+//! are bound at `dlopen(RTLD_NOW)` against this test binary's dynamic symbol table (`build.rs` adds
 //! `-Wl,--export-dynamic`). So a successful load already proves those `#[no_mangle]` definitions
 //! exist and are callable; the assertions below then pin the *observable behaviour* of each.
 //!
@@ -22,6 +22,11 @@
 //! * `enif_make_copy` — `make_copy(dst_env, src_term, NULL)` (`erl_nif.c:1194-1197`). With no copy
 //!   engine behind the `NifHost::make_copy` hook this crate answers `THE_NON_VALUE` (raw 0) — never
 //!   a term aliasing the source env's memory.
+//! * `enif_alloc_env` — `erts_alloc(ERTS_ALC_T_NIF, …)` + `setup_nif_env` (`erl_nif.c:669-675`).
+//!   This crate delegates the allocation to `NifHost::alloc_env` on the host of the **current NIF
+//!   call** (the thread-local stack `NifEnv::new` publishes and `NifEnv`'s `Drop` withdraws), so a
+//!   supporting host's own pointer comes back verbatim, and a host without support — or a call made
+//!   outside any NIF call — is `NULL` (never a crate-owned env with unusable atoms).
 //!
 //! # Skip-vs-fail policy
 //!
@@ -34,9 +39,9 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use beam_abi::common::{ErlNifSelectFlags, ERL_NIF_SELECT_INVALID_EVENT};
-use beam_abi::nif::enif::enif_free_env;
+use beam_abi::nif::enif::{enif_alloc_env, enif_free_env};
 use beam_abi::nif::loader::load;
-use beam_abi::nif::types::ErlNifEvent;
+use beam_abi::nif::types::{ErlNifEnv, ErlNifEvent};
 use beam_abi::{NifEnv, NifHost};
 use beam_alloc::Heap;
 use beam_term::atom::AtomTable;
@@ -59,8 +64,8 @@ const MODULE: &str = "test_nif_env";
 /// The pointer the host reports from `priv_data` when it has private data.
 static PRIV_MARKER: u8 = 0;
 
-/// A host whose `existing_atom`/`priv_data`/`select` hooks are test-controlled, so the `enif_*`
-/// layer's delegation is observable end-to-end.
+/// A host whose `existing_atom`/`priv_data`/`select`/`alloc_env` hooks are test-controlled, so the
+/// `enif_*` layer's delegation is observable end-to-end.
 struct EnvHost {
     heap: Heap,
     atoms: AtomTable,
@@ -68,6 +73,8 @@ struct EnvHost {
     select_code: Option<c_int>,
     /// Whether the host has private data (`enif_priv_data` non-NULL).
     with_priv: bool,
+    /// What `alloc_env` answers (`None` = unsupported, the trait default).
+    env_ptr: Option<*mut ErlNifEnv>,
 }
 
 impl EnvHost {
@@ -77,7 +84,18 @@ impl EnvHost {
             atoms: AtomTable::new(),
             select_code,
             with_priv,
+            env_ptr: None,
         }
+    }
+
+    /// Give the host a message-env allocation to hand out from `alloc_env`.
+    ///
+    /// The pointer is a bare sentinel: a host cannot build a genuine `NifEnv` for itself through
+    /// this crate's public API, and the contract of `enif_alloc_env` is "the *host's* env", so the
+    /// tests below pin the pointer **identity** the hook promised.
+    fn with_alloc_env(mut self, ptr: *mut ErlNifEnv) -> EnvHost {
+        self.env_ptr = Some(ptr);
+        self
     }
 }
 
@@ -110,6 +128,10 @@ impl NifHost for EnvHost {
         } else {
             core::ptr::null_mut()
         }
+    }
+
+    fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
+        self.env_ptr
     }
 
     fn select(
@@ -305,13 +327,65 @@ fn priv_data_and_make_copy_go_through_the_host_hooks() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// enif_alloc_env — the host of the current NIF call, reached from a void entry point
+// ---------------------------------------------------------------------------------------------
+
+/// `enif_alloc_env(void)` reaches the host of the **current NIF call**: the pointer that host handed
+/// out comes back through the C ABI, and a host without `alloc_env` support (the trait default)
+/// yields `NULL`.
+///
+/// The returned pointer is a host-owned allocation this crate never dereferences (a test host cannot
+/// produce a genuine `NifEnv` through the public API), so the assertion is **identity** — which is
+/// exactly what `enif_alloc_env` promises: "the host's env", with the host's atom table behind it
+/// (see `src/nif/enif/envs.rs`). Nothing is freed: the sentinel is not an allocation this crate or
+/// the host made, and the C fixture never touches it either.
+#[test]
+fn alloc_env_reaches_the_current_host_through_a_real_c_nif() {
+    let Some(so) = compile_fixture() else { return };
+    let Some(path) = so_path(&so) else { return };
+
+    // A host with NO `alloc_env` support: `enif_alloc_env()` is NULL inside the call too.
+    let mut host = EnvHost::new(None, false);
+    let lib = load(&path, MODULE, &mut host, Eterm::nil())
+        .expect("the fixture must load: every enif_* it imports is defined by this crate");
+    {
+        let mut env = NifEnv::new(&mut host);
+        assert_same(
+            lib.call(&mut env, "alloc_env", 0, &[]).expect("alloc_env/0"),
+            make_small(0),
+            "a host with no alloc_env support answers NULL",
+        );
+    }
+
+    // A host WITH support: the host's own pointer comes back verbatim.
+    let want: *mut ErlNifEnv = 0x0000_1234_5678_9abcu64 as usize as *mut ErlNifEnv;
+    let mut host = EnvHost::new(None, false).with_alloc_env(want);
+    let lib = load(&path, MODULE, &mut host, Eterm::nil())
+        .expect("the fixture must load: every enif_* it imports is defined by this crate");
+    {
+        let mut env = NifEnv::new(&mut host);
+        assert_same(
+            lib.call(&mut env, "alloc_env", 0, &[]).expect("alloc_env/0"),
+            make_small(want as usize as i64),
+            "the host's env pointer comes back through the C ABI",
+        );
+    }
+
+    // Outside the call (the env is dropped) there is no host any more, so the answer is NULL again —
+    // the current-host stack never keeps a stale host alive.
+    // SAFETY: no env is live on this thread here, which is exactly what the call reports.
+    assert!(unsafe { enif_alloc_env() }.is_null());
+}
+
+// ---------------------------------------------------------------------------------------------
 // enif_free_env — the symbol is real and never frees memory the host does not own
 // ---------------------------------------------------------------------------------------------
 
-/// `enif_free_env` cannot be driven from the fixture: a C call is only meaningful on an env from
-/// `enif_alloc_env`, which this crate deliberately leaves `None` (see `src/nif/enif/envs.rs`). The
-/// symbol is therefore driven directly here — it is `Some` in the table and exported, so the fixture
-/// *could* reference it; what is asserted is its contract on the two pointers that reach it today.
+/// `enif_free_env` is driven directly rather than from the fixture: a C `enif_free_env` call is only
+/// meaningful on an env that came from `enif_alloc_env`, and the test hosts above hand out a bare
+/// sentinel rather than a real allocation (`alloc_env/0` only reports that pointer's identity). The
+/// symbol is `Some` in the table and exported, so what is asserted is its contract on the two
+/// pointers that reach it today — null, and an env the host does not own.
 #[test]
 fn enif_free_env_is_null_safe_and_never_frees_a_foreign_env() {
     let mut host = EnvHost::new(None, false);

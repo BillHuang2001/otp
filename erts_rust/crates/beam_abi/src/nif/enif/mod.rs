@@ -34,22 +34,22 @@
 //! | [`resources`] | the resource-type family |
 //! | [`select`] | `enif_select` / `enif_select_x` |
 //! | [`process`] | monitors, send, port command, whereis, `enif_schedule_nif` |
-//! | [`envs`] | `enif_free_env` / `enif_make_copy` / `enif_priv_data` |
+//! | [`envs`] | `enif_alloc_env` / `enif_free_env` / `enif_make_copy` / `enif_priv_data` |
 //! | [`variadic`] | the seven C-variadic slots (C shim behind `cfg(beam_abi_variadic_shim)`) |
 //!
-//! # The one slot left `None`
+//! # The slots still `None`
 //!
-//! `enif_alloc_env` is deliberately `None` (see [`envs`]): it takes **no argument**, so there is no
-//! handle to reach a [`super::host::NifHost`] through, and a crate-owned env could not intern atoms
-//! into the runtime's atom table (it would hand back a *wrong term*). A NIF that calls it fails
-//! **loudly** at `dlopen(RTLD_NOW)` with `undefined symbol: enif_alloc_env`.
+//! Only the seven **C-variadic** slots (`enif_make_tuple`, `enif_make_list`, `enif_set_option`,
+//! `enif_fprintf`, `enif_snprintf`, `enif_vfprintf`, `enif_vsnprintf`) can be `None`: `...` in a `fn`
+//! *definition* is nightly-only (rust-lang/rust#44930), so [`variadic`] defines them in the C shim
+//! `csrc/nif_variadic.c`, which handles the `va_list` and forwards straight back into this crate's
+//! `#[no_mangle]` helpers. `build.rs` sets the cfg only when it could compile the shim; **without a C
+//! compiler those seven slots stay `None`**.
 //!
-//! The seven **C-variadic** slots (`enif_make_tuple`, `enif_make_list`, `enif_set_option`,
-//! `enif_fprintf`, `enif_snprintf`, `enif_vfprintf`, `enif_vsnprintf`) cannot be defined in stable
-//! Rust (`...` in a `fn` *definition* is nightly-only, rust-lang/rust#44930), so [`variadic`] defines
-//! them in the C shim `csrc/nif_variadic.c`, which handles the `va_list` and forwards straight back
-//! into this crate's `#[no_mangle]` helpers. `build.rs` sets the cfg only when it could compile the
-//! shim; **without a C compiler those seven slots stay `None`**.
+//! `enif_alloc_env` — the last non-variadic slot to be filled — is populated by [`envs`]. It takes no
+//! argument, so it reaches the host of the NIF call the calling thread is inside through the
+//! thread-local stack `super::host::NifEnv` publishes (and its `Drop` withdraws), and answers `NULL`
+//! — never a wrong term — when no env is live or the host has no `alloc_env` support.
 //!
 //! # Honest limitations (never a wrong result)
 //!
