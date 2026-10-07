@@ -37,13 +37,16 @@
 //!
 //! [`NifHostImpl`] leaves `term_to_binary`/`binary_to_term`/`make_ref` at the trait defaults
 //! (the typed `None`), so an `enif_term_to_binary`/`enif_binary_to_term`/`enif_make_ref` NIF
-//! reports failure rather than fabricating a term. `erlang:load_nif/2` on an
-//! already-loaded module is a `reload` (the oracle's rule since OTP 20).
+//! reports failure rather than fabricating a term. It **does** implement `alloc_env`/`free_env`,
+//! so `enif_alloc_env()` returns a live message environment whose atoms are the runtime's own
+//! (see [`NifHost::alloc_env`]), and `erlang:load_nif/2` on an already-loaded module is a `reload`
+//! (the oracle's rule since OTP 20).
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use beam_abi::nif::loader::{NifCallError, NifLibrary};
+use beam_abi::nif::types::ErlNifEnv;
 use beam_abi::{NifEnv, NifHost};
 use beam_alloc::Heap;
 use beam_bifs::AtomInterner;
@@ -162,6 +165,12 @@ pub(crate) struct NifHostImpl {
     interner: PendingInterner,
     /// `erlang:self()` as seen by the NIF.
     self_pid: Eterm,
+    /// The message environments this host allocated for `enif_alloc_env` and still owns.
+    ///
+    /// Each is a live [`NifEnv`] (its raw host pointer erased, so the field is lifetime-free) held
+    /// here so `enif_free_env` can find it by pointer; dropping the host drops any env a NIF forgot
+    /// to free. See [`NifHost::alloc_env`].
+    envs: Vec<Box<NifEnv>>,
 }
 
 impl NifHostImpl {
@@ -177,6 +186,7 @@ impl NifHostImpl {
             atoms,
             interner,
             self_pid,
+            envs: Vec::new(),
         }
     }
 
@@ -211,6 +221,50 @@ impl NifHost for NifHostImpl {
     /// `erlang:self()` inside the NIF — the pid the calling process runs as.
     fn self_pid(&mut self) -> Option<Eterm> {
         Some(self.self_pid)
+    }
+
+    /// `enif_alloc_env()` — a fresh message environment owned by this host.
+    ///
+    /// The C allocates a **process-independent** environment whose heap *and* atom table are the
+    /// runtime's (`erl_nif.c:669-675`); the message env idiom (`enif_alloc_env` → build a term →
+    /// `enif_send` → `enif_free_env`) needs both, so the env here is a live [`NifEnv`] over **this
+    /// same host**: its `intern_atom`/`heap` are the running runtime's, so an atom built on it is
+    /// the same index the call env builds — never a wrong term.
+    ///
+    /// `NifEnv::new` erases the host borrow into a raw pointer, so the env is lifetime-free and can
+    /// be owned by this host (`envs`) until [`NifHost::free_env`] — or this host's drop — releases
+    /// it. It is reached only via `enif_alloc_env`'s current-NIF-call host (`with_current_host`),
+    /// which is this host, so the re-publication `NifEnv::new` performs is a no-op for reachability
+    /// (the innermost host is unchanged) and its token is withdrawn when the env drops.
+    ///
+    /// `None` is never returned here while the host is live: the C never answers `NULL` (an
+    /// allocation failure aborts the emulator). The `None` case belongs to a host that does not
+    /// support the hook (the trait default) or a thread not inside a NIF call (no current host).
+    fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
+        let mut env = Box::new(NifEnv::new(self));
+        let ptr = env.as_ptr();
+        self.envs.push(env);
+        Some(ptr)
+    }
+
+    /// `enif_free_env(env)` — release an environment [`NifHost::alloc_env`] handed out.
+    ///
+    /// `true` when `env` is one of this host's message envs (which is then dropped, withdrawing its
+    /// current-host token); `false` for a per-call env or an unknown pointer — memory this host does
+    /// not own is never freed (`beam_abi`'s `enif_free_env` already ignores the `false`).
+    fn free_env(&mut self, env: *mut ErlNifEnv) -> bool {
+        if env.is_null() {
+            return false;
+        }
+        let Some(index) = self
+            .envs
+            .iter_mut()
+            .position(|owned| (**owned).as_ptr() == env)
+        else {
+            return false;
+        };
+        self.envs.swap_remove(index);
+        true
     }
 }
 
