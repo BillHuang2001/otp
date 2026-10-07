@@ -59,7 +59,7 @@ All three are wired *inside* `src/beam_ssa_opt.erl` (NOT in `compile.erl`'s pass
 - `scripts/smoke` is a manual, release-time end-to-end check (builds Elixir + Mix projects) — not part of CI/CT.
 
 ## Routing Table
-- `src/` → all compiler sources: `compile` API + pass pipeline, Core Erlang (`v3_core`/`cerl*`/`sys_core_*`), BEAM SSA (`beam_core_to_ssa`/`beam_ssa*`/`beam_types`), codegen & assembly (`beam_ssa_codegen`/`beam_asm`/`beam_a`/`beam_block`/`beam_jump`/`beam_validator`/`beam_disasm`), generated `beam_opcodes`/`core_parse`
+- `src/` → all compiler sources: `compile` API + pass pipeline, Core Erlang (`v3_core`/`cerl*`/`sys_core_*`), BEAM SSA (`beam_core_to_ssa`/`beam_ssa*`/`beam_types`), codegen & assembly (`beam_ssa_codegen`/`beam_asm`/`beam_a`/`beam_block`/`beam_jump`/`beam_validator`/`beam_disasm`), generated `beam_opcodes`/`core_parse`; also the opt-in Stage 2 passes `beam_ssa_loop_opt` (`loop_opt`), `beam_ssa_fus` (`fusion_opt`), `beam_ssa_fbip` (`fbip_opt`)
 - `test/` → Common Test suites (feature suites, cloned option-set suites, pass suites, property tests, fixture data dirs)
 - `doc/` → ExDoc build config (`docs.exs`), `Makefile` (via `make/doc.mk`), and `notes.md` (app release notes)
 - `internal_doc/` → contributor-facing internals docs: `beam_ssa.md` (SSA invariants), `ssa_checks.md` (SSA checkers), `cerl-notes.md`
