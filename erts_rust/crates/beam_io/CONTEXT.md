@@ -611,7 +611,9 @@ lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
   (`SpawnSpec`/`SpawnOptions`/`SpawnStream`/`build_command`) into a sibling module and keep the driver in
   `spawn.rs`. The `tcp_inet` raw socket-syscall helpers
   (`socket_fd`/`accept_socket`/`has_peer`/`local_port`/`is_listening`/`socket_error`/`shutdown_socket`/`close_fd`)
-  could move to a third inet sibling if that file grows past baseline.
+  could move to a third inet sibling if that file grows past baseline. `src/abi/port.rs` is 762 (≈640 source +
+  its in-module tests) and `src/abi/host.rs` is 1066 (≈601 source + ≈465 tests) — both over 1000 only because of
+  their in-module suites; if either grows, split its test module into a sibling `tests/` file rather than the source.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
