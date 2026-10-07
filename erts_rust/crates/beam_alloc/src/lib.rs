@@ -24,10 +24,12 @@
 //!
 //! The cross-crate contract is [`allocator`], [`heap`], [`size_class`],
 //! [`registry`], [`stats`] and [`types`] (the `erts_alloc` allocator/class/type
-//! inventory); [`block`], [`carrier`], [`free_list`], [`strategy`] and [`mseg`]
-//! are implementation modules (public for testing and reuse, but not part of the
-//! contract). Errors are always `beam_common::{Result, BeamError}` — this crate
-//! adds no error type of its own.
+//! inventory); [`block`], [`carrier`], [`free_list`], [`strategy`], [`policy`]
+//! and [`mseg`] are implementation modules (public for testing and reuse, but not
+//! part of the contract — [`policy`]'s [`CarrierPolicy`] is allocator
+//! *configuration*, the same role [`strategy`]'s [`Strategy`] plays for
+//! [`crate::allocator::AllocatorConfig`]). Errors are always
+//! `beam_common::{Result, BeamError}` — this crate adds no error type of its own.
 //!
 //! [`Eterm`]: beam_term::prelude::Eterm
 
@@ -36,6 +38,7 @@ pub mod carrier;
 pub mod free_list;
 pub mod size_class;
 pub mod strategy;
+pub mod policy;
 pub mod stats;
 pub mod types;
 pub mod mseg;
@@ -52,6 +55,7 @@ pub use crate::allocator::{
 };
 pub use crate::binary::RefcBinary;
 pub use crate::heap::Heap;
+pub use crate::policy::{CarrierPolicy, PolicyOptionKind};
 pub use crate::refcount::RefCount;
 pub use crate::registry::{all_stats, allocator, default_allocator, AllocType};
 pub use crate::size_class::SizeClasses;
