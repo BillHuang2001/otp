@@ -5,11 +5,14 @@
 
 use std::process::Command;
 
+use beam_bifs::NullSink;
 use beam_common::BeamError;
 use beam_engine::terms;
+use beam_gc::HeapObservable;
 use beam_process::ProcessId;
 use beam_term::{atom_val, is_atom, make_small, signed_value, Eterm, NIL};
 
+use crate::context::RuntimeContext;
 use crate::native::test_support::{atom, call, runtime};
 
 /// The runtime's own root process — a live process in the process table.
@@ -20,6 +23,27 @@ fn root_pid(runtime: &mut crate::Runtime) -> Eterm {
 /// A pid the process table never allocated.
 fn dead_pid() -> Eterm {
     ProcessId::new(999_999, 0).to_eterm()
+}
+
+/// `items` as an Erlang list (the `terms::*` builders need an [`ExecutionContext`]).
+fn make_list(runtime: &mut crate::Runtime, items: &[Eterm]) -> Eterm {
+    let mut sink = NullSink;
+    let mut context = RuntimeContext::with_output(runtime, &mut sink);
+    terms::make_list(&mut context, items).expect("a list")
+}
+
+/// `items` as an Erlang tuple.
+fn make_tuple(runtime: &mut crate::Runtime, items: &[Eterm]) -> Eterm {
+    let mut sink = NullSink;
+    let mut context = RuntimeContext::with_output(runtime, &mut sink);
+    terms::make_tuple(&mut context, items).expect("a tuple")
+}
+
+/// `car` consed onto `cdr` (possibly an improper list).
+fn make_cons(runtime: &mut crate::Runtime, car: Eterm, cdr: Eterm) -> Eterm {
+    let mut sink = NullSink;
+    let mut context = RuntimeContext::with_output(runtime, &mut sink);
+    terms::make_cons(&mut context, car, cdr).expect("a cons")
 }
 
 /// Looks an item up on `pid`.
@@ -46,6 +70,7 @@ fn keys_of(runtime: &mut crate::Runtime, reply: Eterm) -> Vec<String> {
             runtime
                 .atom_name_of(terms::tuple_element(*entry, 0).expect("key"))
                 .expect("a key atom")
+                .to_string()
         })
         .collect()
 }
@@ -60,17 +85,18 @@ fn entries_of(reply: Eterm) -> Vec<(Eterm, Eterm)> {
 }
 
 #[test]
-fn process_info_1_is_the_oracle_order_with_registered_name_skipped() {
+fn process_info_1_is_the_oracle_order_with_registered_name_first() {
     let mut runtime = runtime();
     let pid = root_pid(&mut runtime);
     let reply = call(&mut runtime, "erlang", "process_info", &[pid]).expect("process_info/1");
     let keys = keys_of(&mut runtime, reply);
-    // The root process is unregistered, so `registered_name` is skipped (the C's nil skip,
-    // `erl_bif_info.c:1175`), and the two engine-derived items are honestly omitted — leaving
-    // these 14, in the oracle's relative order (checked against the live oracle below).
+    // The root process is registered as `init`, so `registered_name` is emitted (wrapped) first,
+    // and the two engine-derived items (`current_function`/`initial_call`) are honestly omitted
+    // as unsupported — leaving these 15, in the oracle's relative order (checked below).
     assert_eq!(
         keys,
         vec![
+            "registered_name",
             "status",
             "message_queue_len",
             "links",
@@ -110,7 +136,7 @@ fn the_list_form_returns_wrapped_pairs_in_order_with_duplicates() {
     let pid = root_pid(&mut runtime);
     let status = atom(&mut runtime, "status");
     let heap = atom(&mut runtime, "heap_size");
-    let list = terms::make_list(&mut runtime, &[status, heap, status]).expect("a list");
+    let list = make_list(&mut runtime, &[status, heap, status]);
     let reply = call(&mut runtime, "erlang", "process_info", &[pid, list]).expect("process_info/2");
     let entries = entries_of(reply);
     assert_eq!(entries.len(), 3, "duplicates are repeated");
@@ -139,14 +165,27 @@ fn an_empty_list_on_a_live_pid_is_the_empty_list_and_on_a_dead_pid_is_undefined(
 }
 
 #[test]
-fn registered_name_is_bare_in_the_single_form_and_wrapped_in_the_list_form() {
+fn registered_name_is_wrapped_when_registered_and_bare_empty_when_unregistered() {
     let mut runtime = runtime();
     let pid = root_pid(&mut runtime);
-    // Unregistered: the single-atom form is the bare `[]`; the list form wraps it.
-    let bare = info(&mut runtime, pid, "registered_name").expect("process_info/2");
-    assert_eq!(bare, NIL, "the bare empty list");
+    // The root process is registered as `init`: the single-atom form is the WRAPPED pair.
+    let (key, value) = pair(info(&mut runtime, pid, "registered_name").expect("process_info/2"));
+    assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
+    assert_eq!(runtime.atom_name_of(value), Some("init"));
+    // The list form is wrapped too.
     let name = atom(&mut runtime, "registered_name");
-    let list = terms::make_list(&mut runtime, &[name]).expect("a list");
+    let list = make_list(&mut runtime, &[name]);
+    let reply = call(&mut runtime, "erlang", "process_info", &[pid, list]).expect("process_info/2");
+    let (key, value) = pair(terms::list_elements(reply).expect("a list")[0]);
+    assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
+    assert_eq!(runtime.atom_name_of(value), Some("init"));
+    // Unregister `init` so the root becomes a LIVE, unregistered pid: the single-atom form is
+    // then the BARE `[]` (the oracle's `always_wrap = 0` nil case), while the list form wraps it.
+    let init = atom(&mut runtime, "init");
+    call(&mut runtime, "erlang", "unregister", &[init]).expect("unregister");
+    assert_eq!(info(&mut runtime, pid, "registered_name").expect("process_info/2"), NIL);
+    let name = atom(&mut runtime, "registered_name");
+    let list = make_list(&mut runtime, &[name]);
     let reply = call(&mut runtime, "erlang", "process_info", &[pid, list]).expect("process_info/2");
     let (key, value) = pair(terms::list_elements(reply).expect("a list")[0]);
     assert_eq!(runtime.atom_name_of(key), Some("registered_name"));
@@ -159,7 +198,7 @@ fn the_dictionary_tuple_form_echoes_the_key_and_answers_undefined_when_absent() 
     let pid = root_pid(&mut runtime);
     let tag = atom(&mut runtime, "dictionary");
     let key = atom(&mut runtime, "no_such_key");
-    let option = terms::make_tuple(&mut runtime, &[tag, key]).expect("a 2-tuple");
+    let option = make_tuple(&mut runtime, &[tag, key]);
     let reply = call(&mut runtime, "erlang", "process_info", &[pid, option]).expect("process_info");
     let (echo, value) = pair(reply);
     // The echo is the `{dictionary, Key}` tuple itself.
@@ -179,7 +218,10 @@ fn the_reachable_items_have_their_oracle_shapes() {
     let (key, value) = pair(info(&mut runtime, pid, "message_queue_len").expect("mq len"));
     assert_eq!(runtime.atom_name_of(key), Some("message_queue_len"));
     assert_eq!(signed_value(value), 0);
-    assert_eq!(info(&mut runtime, pid, "messages").expect("messages"), NIL);
+    // Unlike `registered_name`, `messages` is wrapped: the oracle answers `{messages, []}`.
+    let (key, value) = pair(info(&mut runtime, pid, "messages").expect("messages"));
+    assert_eq!(runtime.atom_name_of(key), Some("messages"));
+    assert_eq!(value, NIL);
 
     for empty_list_item in ["links", "monitors", "monitored_by", "dictionary", "suspending"] {
         let (key, value) = pair(info(&mut runtime, pid, empty_list_item).expect("empty item"));
@@ -288,7 +330,7 @@ fn an_unknown_item_is_badarg_even_for_a_bogus_pid() {
             Err(BeamError::BadArg)
         ));
         // An unknown item inside a list is badarg too, even for a dead pid.
-        let list = terms::make_list(&mut runtime, &[status, nonsense]).expect("a list");
+        let list = make_list(&mut runtime, &[status, nonsense]);
         assert!(matches!(
             call(&mut runtime, "erlang", "process_info", &[pid, list]),
             Err(BeamError::BadArg)
@@ -298,13 +340,13 @@ fn an_unknown_item_is_badarg_even_for_a_bogus_pid() {
             call(&mut runtime, "erlang", "process_info", &[pid, make_small(7)]),
             Err(BeamError::BadArg)
         ));
-        let improper = terms::make_cons(&mut runtime, status, make_small(7)).expect("a cons");
+        let improper = make_cons(&mut runtime, status, make_small(7));
         assert!(matches!(
             call(&mut runtime, "erlang", "process_info", &[pid, improper]),
             Err(BeamError::BadArg)
         ));
         let tag = atom(&mut runtime, "status");
-        let bogus = terms::make_tuple(&mut runtime, &[tag, make_small(1)]).expect("a tuple");
+        let bogus = make_tuple(&mut runtime, &[tag, make_small(1)]);
         assert!(matches!(
             call(&mut runtime, "erlang", "process_info", &[pid, bogus]),
             Err(BeamError::BadArg)
@@ -415,12 +457,16 @@ fn heap_size_and_total_heap_size_are_the_processes_real_capacities() {
 
 /// Runs `erl` and returns `process_info/1`'s item names in order, or `None` when the system
 /// `erl` is unavailable (the test then skips **loudly**).
+///
+/// The probe queries a **registered** process, so the oracle emits all 17 `pi_1_keys` (with
+/// `{registered_name, probe_reg}` first) rather than omitting `registered_name`.
 fn oracle_pi_1_keys() -> Option<Vec<String>> {
     let output = Command::new("erl")
         .args([
             "-noshell",
             "-eval",
-            "io:format(\"~p~n\",[[element(1,X) || X <- process_info(self())]]), halt().",
+            "P = spawn(fun() -> receive stop -> ok end end), register(probe_reg, P), \
+             io:format(\"~p~n\",[[element(1,X) || X <- process_info(P)]]), halt().",
         ])
         .output()
         .ok()?;
@@ -451,8 +497,8 @@ fn the_implemented_item_order_is_a_subsequence_of_the_oracles() {
     };
     assert_eq!(
         oracle.len(),
-        16,
-        "the oracle's process_info/1 emits 16 items: {oracle:?}"
+        17,
+        "the oracle's process_info/1 emits 17 items for a registered process: {oracle:?}"
     );
     // Every item this runtime emits must appear in the oracle's list, in the same relative
     // order — the oracle order is the contract.

@@ -10,18 +10,22 @@
 //! `{dictionary, Key}`:
 //!
 //! * `process_info(Pid, Item)` → `{Item, Value}` — except `registered_name`, whose value is
-//!   the **bare** name atom (`[]` when the process is unregistered). The C's
+//!   the **bare** name atom, and the bare `[]` when the process is **unregistered**. The C's
 //!   `always_wrap = !is_atom(opt)` (`erl_bif_info.c:1556`) is what makes that one item
-//!   unwrapped.
+//!   unwrapped in the single-atom form.
 //! * `process_info(Pid, [Item, …])` → `[{Item, Value}, …]`, in the requested order, with
-//!   duplicates repeated. Here `registered_name` **is** wrapped (`{registered_name, []}`).
+//!   duplicates repeated. Here `registered_name` **is** wrapped in both cases:
+//!   `{registered_name, Name}` or `{registered_name, []}`.
 //! * `process_info(Pid, {dictionary, Key})` → `{{dictionary, Key}, Value|undefined}`.
 //!
 //! `erlang:process_info/1` answers the **fixed** key set of the C's `pi_1_keys[]`
-//! (`erl_bif_info.c:1008-1026`), in that exact order, with the same 16 items the oracle
-//! emits. It uses `always_wrap = 0`, so an unregistered `registered_name` is the bare `[]`
-//! — which the C's multi-item loop treats as "no value" and **skips** (`erl_bif_info.c:1175`),
-//! which is why `process_info/1` reports 16 items, not 17.
+//! (`erl_bif_info.c:1008-1026`), in that exact order. For a **registered** process it emits
+//! all 17 items, `{registered_name, Name}` first; for an **unregistered** one it **omits**
+//! `registered_name` and emits the remaining 16. (The C skips it because `always_wrap = 0`
+//! makes an unregistered `registered_name` the bare `[]`, which the multi-item loop treats as
+//! "no value": `erl_bif_info.c:1175`.) This runtime further omits the two engine-derived items
+//! it honestly cannot answer (`current_function`/`initial_call`), so its count is 2 fewer than
+//! the oracle's in each case (15 registered, 14 unregistered).
 //!
 //! # The failure modes (verified against OTP 29.1.1 / erts-17.1)
 //!
@@ -37,7 +41,7 @@
 //!
 //! | item | shape |
 //! |---|---|
-//! | `registered_name` | the name atom, `[]` when unregistered (bare in `/2`-atom form) |
+//! | `registered_name` | `{registered_name, Name}` when registered; the bare `[]` (unregistered) in the `/2`-atom form, `{registered_name, []}` in the list form, omitted by `/1` |
 //! | `status` | `running`/`runnable`/`waiting`/`suspended`/`exiting` from [`ProcessState`] |
 //! | `message_queue_len` | the mailbox length |
 //! | `messages` | the queued payload terms, FIFO |
@@ -289,8 +293,10 @@ fn bool_atom(value: bool) -> &'static str {
 impl RuntimeContext<'_> {
     /// `erlang:process_info(Pid)`.
     ///
-    /// Answers the fixed [`PI_1_KEYS`] set in that order (the oracle's 16-item list),
-    /// `undefined` for a pid that is not in the process table and `badarg` for a non-pid.
+    /// Answers the fixed [`PI_1_KEYS`] set in that order (all 17 keys for a **registered**
+    /// process — `{registered_name, Name}` first — and 16, with `registered_name` omitted, for
+    /// an **unregistered** one), `undefined` for a pid that is not in the process table and
+    /// `badarg` for a non-pid.
     /// An item this runtime cannot answer is **omitted** — the same mechanism the C uses to
     /// drop an unregistered `registered_name` (see the module docs) — so the list is a
     /// genuine, shorter-by-construction answer rather than a fabricated one; the omitted
@@ -304,12 +310,13 @@ impl RuntimeContext<'_> {
         let mut entries = Vec::with_capacity(PI_1_KEYS.len());
         for name in PI_1_KEYS {
             if *name == "registered_name" {
-                // always_wrap = 0 here: the bare name atom, or `[]` — which the C skips.
                 match &snapshot.registered_name {
+                    // The C's `nil` skip (`erl_bif_info.c:1175`): an unregistered process omits the item.
                     None => continue,
                     Some(_) => {
                         let value = self.registered_name_value(&snapshot)?;
-                        entries.push(value);
+                        let key = self.atom(name)?;
+                        entries.push(terms::make_tuple(self, &[key, value])?);
                         continue;
                     }
                 }
@@ -347,6 +354,14 @@ impl RuntimeContext<'_> {
 
         match parsed {
             ParsedOption::Single(item) => {
+                // The C's `always_wrap = !is_atom(opt)` is clear in the single-atom form, so an
+                // *unregistered* `registered_name` is the bare `[]` — not `{registered_name, []}`
+                // (verified against OTP 29.1.1: `process_info(P, registered_name)` ⇒ `[]`).
+                if matches!(&item, Item::Atom(name) if name == "registered_name")
+                    && snapshot.registered_name.is_none()
+                {
+                    return Ok(NIL);
+                }
                 let value = self.item_value(&item, &snapshot, false)?;
                 let key = item.key(self)?;
                 terms::make_tuple(self, &[key, value])
