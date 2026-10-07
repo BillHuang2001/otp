@@ -54,7 +54,7 @@ pub(super) const ERTS_MAX_PROCESSES: i64 = 134_217_727;
 
 /// Whether `argument` is an `-M*`/`+M*` allocator switch (`erlexec.c:1009-1028`).
 pub(super) fn is_allocator_switch(argument: &str) -> bool {
-    argument.starts_with("-M") || argument.starts_with("+M")
+    argument.starts_with("+M")
 }
 
 /// `+Q N` — the maximum number of ports: `legacy`, or an integer in
@@ -124,19 +124,17 @@ pub(super) fn parse_emu_flavor(switch: &str, value: &str) -> Result<beam_common:
 /// Validates a `+M*` allocator switch (`erl_alloc.c:handle_args`), returning the
 /// index of the next switch (the value may be the following token).
 ///
-/// A `-M*` switch is accepted without validation (the oracle never validates it —
-/// see the module docs); only `+M*` reaches [`validate_allocator`].
+/// Only a `+M*` flag reaches this path: `erlexec` rewrites `+M*` to an **emulator**
+/// flag (`argv[i][0] = '-'` + `add_Eargs`, `erlexec.c:886-892`), which the emulator's
+/// allocator parser validates. A user-supplied `-M*` is never rewritten — it is an
+/// ordinary unknown `-flag`, so [`is_allocator_switch`] does not match it and the
+/// generic path records it as an init argument (`-Mfoo 1` ⇒ `init:get_argument('Mfoo')`
+/// = `{ok,[["1"]]}`; verified OTP 29.1.1 / erts-17.1).
 pub(super) fn parse_allocator(
     switch: &str,
     args: &[String],
     index: usize,
 ) -> Result<usize> {
-    if switch.starts_with("-M") {
-        // Parity with `erl`: a `-M*` flag is passed through unvalidated, and its value
-        // (if any) is *not* consumed here — `-Mfoo 1` leaves `1` as a stray argument,
-        // exactly as the oracle's `add_arg` pass-through does not eat it either.
-        return Ok(index + 1);
-    }
     validate_allocator(switch, args, index)
 }
 
@@ -669,13 +667,16 @@ mod tests {
 
     /// The `-M*`/`+M*` recognition (`erlexec.c:1009-1028`).
     #[test]
-    fn is_allocator_switch_recognizes_both_prefixes() {
-        for argument in [
-            "-M", "+M", "-Mfoo", "+Mfoo", "-Mea", "+Mea", "+MMscs", "+MBas",
-        ] {
+    fn is_allocator_switch_matches_only_the_plus_form() {
+        // Only a `+M*` flag is rewritten by `erlexec` to an emulator flag and validated.
+        for argument in ["+M", "+Mfoo", "+Mea", "+MMscs", "+MBas"] {
             assert!(is_allocator_switch(argument), "{argument:?}");
         }
-        for argument in ["-m", "+m", "-eval", "+S", "M", "-", "--M", "-+M", ""] {
+        // A `-M*` flag is an ordinary unknown `-flag` (recorded as an init argument),
+        // so it must NOT be claimed by the allocator path.
+        for argument in [
+            "-M", "-Mfoo", "-Mea", "-m", "+m", "-eval", "+S", "M", "-", "--M", "-+M", "",
+        ] {
             assert!(!is_allocator_switch(argument), "{argument:?}");
         }
     }
@@ -816,28 +817,19 @@ mod tests {
     /// emulator: `erlexec.c:865`), and — unlike a `+M*` value — its next token is **not**
     /// consumed.
     ///
-    /// Oracle: `-Mfoo`, `-M`, `-Mea 1024` all exit 0.
+    /// Only a `+M*` flag reaches [`parse_allocator`] (a user `-M*` is an ordinary unknown
+    /// `-flag`, recorded by the generic path), so this pins the `+M*` value-consumption
+    /// contract: a value in the following token is consumed (`erl_alloc.c`'s `get_value`).
     #[test]
-    fn allocator_dash_m_is_unvalidated_and_consumes_no_value() {
-        // Any body is accepted, including one a `+M*` flag would reject, and the index
-        // only ever advances past the switch itself.
-        for switch in ["-Mfoo", "-M", "-MMscs", "-Mea"] {
-            assert_eq!(
-                parse_allocator(switch, &args(&[switch]), 0).expect("unvalidated"),
-                1,
-                "{switch}"
-            );
-        }
-        // The next token is *not* consumed, so `-Mea 1024` leaves `1024` as a stray
-        // argument (the oracle instead treats it as the flag's value — a documented
-        // divergence of the pass-through).
-        let argv = args(&["-Mea", "1024"]);
-        assert_eq!(parse_allocator("-Mea", &argv, 0).expect("unvalidated"), 1);
-        // A `+M*` value *is* consumed whenever the option has one (`erl_alloc.c`'s
-        // `get_value`), which is the whole difference.
+    fn allocator_plus_m_consumes_a_following_token_value() {
         assert_eq!(
             parse_allocator("+MMscs", &args(&["+MMscs", "1024"]), 0).expect("validated"),
             2
+        );
+        // The in-token form advances only past the switch itself.
+        assert_eq!(
+            parse_allocator("+MMscs1024", &args(&["+MMscs1024"]), 0).expect("validated"),
+            1
         );
     }
 

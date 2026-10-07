@@ -752,13 +752,18 @@ const AGREEING_CASES: &[FlagCase] = &[
         rust_code: 2,
     },
     FlagCase {
-        description: "-Mfoo (a -M* flag is never forwarded to the emulator)",
+        description: "-Mfoo (a -M* flag is an ordinary unknown -flag)",
         args: &["-Mfoo"],
         rust_code: 0,
     },
     FlagCase {
         description: "-M (the bare -M* prefix)",
         args: &["-M"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "-Mea 1024 (a -M* value is consumed as the init argument's value)",
+        args: &["-Mea", "1024"],
         rust_code: 0,
     },
     FlagCase {
@@ -820,12 +825,6 @@ const DIVERGENT_CASES: &[(&str, &[&str], bool, i32)] = &[
     (
         "+K bogus (the emulator never validates the +K value)",
         &["+K", "bogus"],
-        true,
-        2,
-    ),
-    (
-        "-Mea 1024 (a -M* value is not consumed, so `1024` is a stray argument)",
-        &["-Mea", "1024"],
         true,
         2,
     ),

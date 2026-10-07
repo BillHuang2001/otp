@@ -1662,17 +1662,30 @@ mod tests {
             );
         }
 
-        // `-M*` is passed through unvalidated (as `erlexec` does) …
-        for args in [&["-Mfoo"][..], &["-M"][..], &["-Mea"][..]] {
+        // A **`-M*`** flag is not an emulator flag at all: `erlexec` never rewrites it, so
+        // the emulator sees an ordinary unknown `-flag` and `init` records it as an init
+        // argument (name = the token minus the leading `-`, values = the following
+        // non-switch tokens). Verified against OTP 29.1.1 / erts-17.1:
+        // `erl -noshell -Mfoo 1 …` ⇒ `init:get_argument('Mfoo')` = `{ok,[["1"]]}`.
+        for (args, name, values) in [
+            (&["-Mfoo"][..], "Mfoo", Vec::<String>::new()),
+            (&["-M"][..], "M", Vec::new()),
+            (&["-Mea"][..], "Mea", Vec::new()),
+            (&["-Mfoo", "1"][..], "Mfoo", vec!["1".to_string()]),
+            (&["-Mea", "min"][..], "Mea", vec!["min".to_string()]),
+            (&["-Mea", "1024"][..], "Mea", vec!["1024".to_string()]),
+        ] {
             let config = parsed(args);
             assert_eq!(config.action, Action::Boot, "{args:?}");
-            assert!(
-                config.init_args.is_empty(),
-                "{args:?} must record no init argument"
+            assert_eq!(
+                config.init_args.get(name),
+                Some(vec![values.as_slice()]),
+                "{args:?}"
             );
         }
-        // … while a `+M*` value is validated (the oracle rejects all of these with exit 1;
-        // `beam_rt` reports its uniform usage error instead).
+
+        // `+M*`, by contrast, *is* an emulator flag and its value is validated (the oracle
+        // rejects all of these with exit 1; `beam_rt` reports its uniform usage error).
         for args in [
             &["+Mfoo"][..],
             &["+M"][..],
@@ -1683,16 +1696,15 @@ mod tests {
             assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
         }
 
-        // A `-M*` value is **not** consumed, so a following token is a stray argument
-        // (`erl -Mea 1024 …` accepts it — a documented divergence of the pass-through).
-        let error = parse_args(&["-Mea", "1024"]).expect_err("the -M* value is not consumed");
-        assert_eq!(error::unsupported_reason(&error), None);
-
-        // **Known divergence (reported, not fixed here):** the validator's `-Mea` arm does
-        // not reproduce the C's `argv[i][3] == 'a'` (`erl_alloc.c:1733-1783`), so `+Mea min`
-        // is rejected where the oracle exits 0.
-        let error = parse_args(&["+Mea", "min"]).expect_err("the known -Mea divergence");
-        assert_eq!(error::unsupported_reason(&error), None);
+        // `+Mea <preset>` is the emulator-wide allocator preset the oracle accepts
+        // (`erl_alloc.c:1733-1783`; `+Mea min` exits 0). Like every `+`-flag it is
+        // validated, consumes its value, and records no init argument.
+        let config = parsed(&["+Mea", "min"]);
+        assert_eq!(config.action, Action::Boot);
+        assert!(
+            config.init_args.is_empty(),
+            "+Mea min records no init argument"
+        );
     }
 
     #[test]
