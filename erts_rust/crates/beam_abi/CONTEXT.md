@@ -319,7 +319,8 @@ A NIF `.so` leaves `enif_*` and a driver `.so` leaves `driver_*`/`erl_drv_*` **u
 - Malformed-term guard: a bare `THE_NON_VALUE` / `HEADER`-tagged word is rejected at the term-inspecting entry points (the C would deref it); a *forged* pointer-tagged word is still undetectable from the word alone, exactly as in the C.
 
 ## Driver host layer (implemented)
-### `driver_*` / `erl_drv_*` functions (`src/driver/drv.rs`)
+### `driver_*` / `erl_drv_*` functions (`src/driver/drv/{mod.rs, mem.rs, port.rs}`)
+This is a directory module split along the C ABI's own seam: `mod.rs` holds the module docs, the shared `env_for` helper, the exported `driver_term_nil` data symbol and the `#[used] static DRIVER_API` table (so the signature check against the one frozen table lives there); `mem.rs` is part 1 (host-free) and `port.rs` is part 2 (port/host-dependent).
 Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of its matching
 `driver::api` field, and lands in the `#[used] static DRIVER_API` published through
 `pub fn driver_api_table() -> &'static ErlDrvApi`.
@@ -415,7 +416,7 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
 - `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`)
 - `src/driver/api.rs` → `ErlDrvApi` (111-entry `driver_*`/`erl_drv_*` function table) + `ErlDrvApi::empty()`
 - `src/driver/host.rs` → the driver host seam: `DriverHost` (heap/atoms/output/send_term + defaulted select/timer/async/pid services) + `DriverEnv` (per-port env behind the opaque `*mut ErlDrvPort_`, `as_port`/`from_port`) + `decode_term_spec` (the reverse-Polish term-data decoder)
-- `src/driver/drv.rs` → the implemented `driver_*` host functions + `driver_api_table()` / `#[used] static DRIVER_API` (the frozen-surface table; keeps the `#[no_mangle]` symbols linked) + the `driver_term_nil` data symbol
+- `src/driver/drv/` → a directory module split along the C ABI's host-free/port-dependent seam: `mod.rs` (module docs + the shared `env_for` helper + `driver_api_table()` / `#[used] static DRIVER_API`, the frozen-surface table that keeps the `#[no_mangle]` symbols linked + the `driver_term_nil` data symbol), `mem.rs` (part 1, the implemented host-free `driver_*` host functions), `port.rs` (part 2, the implemented port/host-dependent `driver_*` host functions)
 - `src/driver/loader.rs` → the dynamic driver loader: `DriverLibrary`, `DriverLoadError`/`DriverCallError`, `load()` (dlopen/dlsym `driver_init` + oracle-order `ErlDrvEntry` validation), the per-callback wrappers, `Drop` (finish + dlclose)
 - `src/layout.rs` → the compile-time layout freeze (all `const _: () = assert!(...)` for the table above)
 - `tests/common/mod.rs` → shared test helpers (NOT a test target: a subdirectory module pulled in with `mod common;`): `erl_include_dir` (resolves the dir holding `erl_nif.h` *and* `erl_driver.h`), `cc_available`, `compile_so`, `skip`, `TestHost`, `TestDriverHost`
