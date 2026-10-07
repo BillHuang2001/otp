@@ -15,6 +15,7 @@
 //!   spill             ; the cached x-registers back into `machine.x` — MANDATORY:
 //!                     ; this is the tier's whole liveness / root-set model, so a
 //!                     ; linked exit must never skip it (see [`super::spill`])
+//!   mov rdi, [rsp+RUNTIME_SLOT_DISP]  ; `rt` for the successor's prologue
 //!   lea rsp, [rsp+24] ; drop the `rt` slot
 //!   pop rbx ; pop rbp ; pop r12 … pop r15   ; leave the frame, restoring the
 //!                                           ; caller's callee-saved registers
@@ -22,6 +23,14 @@
 //!                           ; original return address is untouched, so *its* `ret`
 //!                           ; returns to the driver
 //! ```
+//!
+//! The `rdi` reload is what makes a `jmp` equivalent to the driver's `call`: the
+//! driver passes `rt` in `rdi` (System V's first argument), so a block reached by a
+//! jump must find it there too — its prologue stores `rdi` into *its* `rt` slot and
+//! loads `rbx` (the `machine.x` base) from it. `rdi` is caller-saved and is not one
+//! of the registers [`emit_frame_teardown`] pops, so the reloaded value survives
+//! both the teardown and the jump. The `ret`-terminated `done` epilogue does **not**
+//! need it: it returns to the driver, which never reads `rdi` afterwards.
 //!
 //! The return word is deliberately **not** computed: the successor is responsible
 //! for the word the driver eventually sees, exactly as if the driver had decoded
@@ -54,7 +63,7 @@ use beam_common::Result;
 use crate::jit::emitter::{CodeBuffer, Label as CodeLabel, Reg};
 
 use super::super::runtime::encode_target;
-use super::{spill, Allocation, SAVED_REGISTERS};
+use super::{spill, Allocation, RUNTIME_SLOT_DISP, SAVED_REGISTERS};
 
 /// The compiled blocks a branch may jump to directly, keyed by `(func, block
 /// start)` — the same key the driver's entry table uses.
@@ -83,7 +92,9 @@ impl<'a> Linker<'a> {
     ///
     /// The cached x-registers are spilled on **both** paths, before the frame is
     /// torn down — that spill *is* the tier's liveness/root-set model, so an exit
-    /// may never skip it.
+    /// may never skip it. The linked path additionally reloads this block's `rt`
+    /// into `rdi` (the block ABI's first argument), because a successor entered by a
+    /// `jmp` gets no `call` to set it.
     pub(super) fn emit_exit(
         &self,
         buffer: &mut CodeBuffer,
@@ -95,6 +106,11 @@ impl<'a> Linker<'a> {
         match self.entries.get(&(func, pc)) {
             Some(&target) => {
                 spill(buffer, allocation)?;
+                // `rt` for the successor's prologue: it stores `rdi` into *its* `rt`
+                // slot and loads `rbx` from it. `rdi` is not one of the registers the
+                // teardown pops, so the reloaded value survives the teardown and the
+                // jump.
+                buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
                 emit_frame_teardown(buffer)?;
                 buffer.jmp(target)
             }
@@ -136,13 +152,44 @@ mod tests {
         unsafe { std::slice::from_raw_parts(buffer.code_ptr(), buffer.len()).to_vec() }
     }
 
-    /// The last five bytes of `code` read as a `jmp rel32`, as
-    /// `(site offset, displacement)`.
+    /// The bytes the emitter itself produces for `f` on a throwaway buffer.
+    ///
+    /// The expected encodings of the pieces an exit is composed of are always taken
+    /// from `CodeBuffer` rather than hard-coded, so a test pins the *composition* of
+    /// the exit (`spill`, reload, teardown, jump) without pinning a single byte
+    /// offset — an emitter encoding detail (a `REX.W` prefix, a displacement form)
+    /// cannot make the test lie about the linker.
+    fn encoded(f: impl FnOnce(&mut CodeBuffer)) -> Vec<u8> {
+        let mut buffer = CodeBuffer::new().unwrap();
+        f(&mut buffer);
+        emitted(&buffer)
+    }
+
+    /// The trailing `jmp rel32` of `code`, as `(site offset, displacement)`.
+    ///
+    /// The exit *ends* in that jump on both paths, so the caller passes exactly the
+    /// exit's bytes — not a buffer with anything (a filler, an epilogue) appended.
     fn trailing_jump(code: &[u8]) -> (usize, i32) {
         let site = code.len() - 5;
         assert_eq!(code[site], 0xE9, "the exit must end in a `jmp rel32`");
         let rel = i32::from_le_bytes(code[site + 1..site + 5].try_into().unwrap());
         (site, rel)
+    }
+
+    /// `spill` of `allocation`, as emitted.
+    fn spill_bytes(allocation: &Allocation) -> Vec<u8> {
+        encoded(|buffer| spill(buffer, allocation).unwrap())
+    }
+
+    /// The linked exit's `mov rdi, [rsp + RUNTIME_SLOT_DISP]` — the reload that
+    /// hands the successor's prologue its `rt` — as emitted.
+    fn reload_bytes() -> Vec<u8> {
+        encoded(|buffer| buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP).unwrap())
+    }
+
+    /// `emit_frame_teardown`, as emitted.
+    fn teardown_bytes() -> Vec<u8> {
+        encoded(|buffer| emit_frame_teardown(buffer).unwrap())
     }
 
     #[test]
@@ -158,7 +205,7 @@ mod tests {
         linker
             .emit_exit(&mut buffer, &allocation, done, 0, 7)
             .unwrap();
-        let jmp_site = buffer.len() - 5;
+        let exit_len = buffer.len();
         // A filler byte between the exit and the successor's entry, so the
         // displacement is non-trivial (a `jmp` to the very next byte would be 0).
         buffer.ret().unwrap();
@@ -168,21 +215,78 @@ mod tests {
         buffer.seal().unwrap();
 
         let code = emitted(&buffer);
-        let (site, rel) = trailing_jump(&code);
-        assert_eq!(site, jmp_site);
+        let exit = &code[..exit_len];
+        let (site, rel) = trailing_jump(exit);
+        assert_eq!(site, exit_len - 5, "the jump is the exit's last 5 bytes");
+        // A `rel32` is measured from the end of the instruction (`jmp` is `E9` + the
+        // four displacement bytes), so the landing address is `site + 5 + rel`.
         assert_eq!(
-            rel,
-            target_at as i32 - (jmp_site + 4) as i32,
+            (site + 5) as i64 + i64::from(rel),
+            target_at as i64,
             "the direct jump must land on the successor's entry"
         );
-        // The frame is torn down before the jump (the `lea rsp, [rsp+24]` the
-        // prologue's `lea rsp, [rsp-24]` is the inverse of).
-        assert_eq!(&code[..2], &[0x48, 0x8D], "`lea rsp, [rsp+24]`");
+
+        // The exact composition: the spill, the `rt` reload the successor's prologue
+        // reads out of `rdi`, the frame teardown and the jump — nothing else.
+        let mut expected = spill_bytes(&allocation);
+        expected.extend(reload_bytes());
+        assert!(!reload_bytes().is_empty(), "the reload is what the fix adds");
+        expected.extend(teardown_bytes());
+        assert_eq!(
+            &exit[..expected.len()],
+            &expected[..],
+            "the exit is spill + `mov rdi, [rsp+rt]` + frame teardown + `jmp rel32`"
+        );
+        assert_eq!(exit.len(), expected.len() + 5, "plus the 5-byte `jmp rel32`");
+
         // And the return word is *not* materialised: no `movabs rax, imm64`.
         assert!(
-            !code.windows(2).any(|w| w == [0x48, 0xB8]),
+            !exit.windows(2).any(|w| w == [0x48, 0xB8]),
             "a linked exit never materialises a return word in rax"
         );
+    }
+
+    #[test]
+    fn a_linked_exit_reloads_its_runtime_pointer_for_the_successor() {
+        // The regression this pins: a successor reached by `jmp` is *not* entered
+        // through the driver's `call`, so nothing sets the `rdi` its prologue stores
+        // as its `rt`. The reload must read this block's own `rt` slot **before** the
+        // teardown releases that slot.
+        let mut buffer = CodeBuffer::new().unwrap();
+        let target = buffer.label();
+        let done = buffer.label();
+        let mut entries = BTreeMap::new();
+        entries.insert((0u32, 7u32), target);
+        let linker = Linker::new(&entries);
+        let allocation = Allocation::default();
+
+        linker
+            .emit_exit(&mut buffer, &allocation, done, 0, 7)
+            .unwrap();
+        let exit_len = buffer.len();
+        buffer.bind(target).unwrap();
+        buffer.bind(done).unwrap();
+        buffer.seal().unwrap();
+
+        let exit = &emitted(&buffer)[..exit_len];
+        // It reads the block's own slot: `[rsp + RUNTIME_SLOT_DISP]`.
+        assert_eq!(RUNTIME_SLOT_DISP, 0, "the prologue reserves the slot at rsp");
+        let reload = reload_bytes();
+        let reload_at = exit
+            .windows(reload.len())
+            .position(|window| window == reload.as_slice())
+            .expect("the linked exit must reload `rdi` from the block's `rt` slot");
+        let teardown = teardown_bytes();
+        let teardown_at = exit
+            .windows(teardown.len())
+            .position(|window| window == teardown.as_slice())
+            .expect("the linked exit must tear its frame down");
+        assert!(
+            reload_at < teardown_at,
+            "the reload must precede the teardown (which drops the slot)"
+        );
+        // … and it is reloaded into `rdi`, where the successor's prologue looks for it.
+        assert_eq!(reload[2] & 0b0011_1000, 0b0011_1000, "the load targets `rdi`");
     }
 
     #[test]
@@ -197,52 +301,104 @@ mod tests {
         linker
             .emit_exit(&mut buffer, &allocation, done, 0, 7)
             .unwrap();
-        let end = buffer.len();
+        let exit_len = buffer.len();
         buffer.bind(done).unwrap();
         buffer.seal().unwrap();
 
         let code = emitted(&buffer);
-        let (site, rel) = trailing_jump(&code);
-        assert_eq!(site, end - 5);
+        let exit = &code[..exit_len];
+        let (site, rel) = trailing_jump(exit);
+        assert_eq!(site, exit_len - 5);
         assert_eq!(rel, 0, "the epilogue follows the exit immediately");
-        // The word is materialised by a `movabs rax, encode_target(0, 7)`.
-        assert_eq!(&code[end - 10..end - 8], &[0x48, 0xB8]);
-        let word = i64::from_le_bytes(code[end - 8..end].try_into().unwrap());
+
+        // The word is materialised in `rax`, then control goes to the shared epilogue
+        // (which `ret`s, so no `rdi` reload is needed here).
+        let mut expected = spill_bytes(&allocation);
+        let word_bytes = encoded(|buffer| buffer.mov_ri(Reg::Rax, encode_target(0, 7)).unwrap());
+        expected.extend_from_slice(&word_bytes);
+        assert_eq!(
+            &exit[..expected.len()],
+            &expected[..],
+            "the deopt exit is spill + the return word in rax + `jmp rel32`"
+        );
+        assert_eq!(exit.len(), expected.len() + 5);
+        // The materialised word really is `encode_target(0, 7)`.
+        let word = i64::from_le_bytes(
+            exit[expected.len() - 8..expected.len()]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(word, encode_target(0, 7));
+
+        // An unlinkable exit never reloads `rdi`: no frame is entered by a jump.
+        let reload = reload_bytes();
+        assert!(
+            !exit
+                .windows(reload.len())
+                .any(|window| window == reload.as_slice()),
+            "only the linked path readies `rdi` for a successor"
+        );
     }
 
     #[test]
     fn every_exit_spills_the_cached_registers_before_leaving_the_frame() {
         // The spill is the tier's liveness model: with one cached x-register (x0 in
-        // r12) the exit must store it to `[rbx + 0]` *before* the frame teardown.
-        let mut buffer = CodeBuffer::new().unwrap();
-        let target = buffer.label();
-        let done = buffer.label();
-        let mut entries = BTreeMap::new();
-        entries.insert((0u32, 0u32), target);
-        let linker = Linker::new(&entries);
+        // r12) the exit must store it to `[rbx + 0]` *before* the frame teardown — on
+        // the linked path too, because the successor's prologue reloads `machine.x`.
         let allocation = Allocation {
             slots: vec![(0u32, Reg::R12)],
         };
+        let store = encoded(|buffer| buffer.mov_mr(Reg::Rbx, 0, Reg::R12).unwrap());
+        let spill = spill_bytes(&allocation);
+        assert_eq!(spill, store, "the spill stores x0 from r12 to `machine.x`");
 
-        linker
-            .emit_exit(&mut buffer, &allocation, done, 0, 0)
-            .unwrap();
-        buffer.bind(target).unwrap();
-        buffer.bind(done).unwrap();
-        buffer.seal().unwrap();
+        for (func, pc, linkable) in [(0u32, 0u32, true), (0u32, 7u32, false)] {
+            let mut buffer = CodeBuffer::new().unwrap();
+            let target = buffer.label();
+            let done = buffer.label();
+            let mut entries = BTreeMap::new();
+            if linkable {
+                entries.insert((func, pc), target);
+            }
+            let linker = Linker::new(&entries);
 
-        let code = emitted(&buffer);
-        // `mov [rbx + 0], r12` — the spill store, first.
-        assert_eq!(&code[..7], &[0x44, 0x89, 0xA3, 0x00, 0x00, 0x00, 0x00]);
-        // `lea rsp, [rsp+24]` immediately after it.
-        assert_eq!(&code[7..9], &[0x48, 0x8D]);
-        assert_eq!(code[9], 0xA4, "`lea rsp, [rsp+disp32]` (SIB form)");
-        // `pop rbx` is the first restore (the pushes run in `SAVED_REGISTERS` order,
-        // the pops in reverse).
-        assert_eq!(code[13], 24, "the `rt` slot displacement");
-        assert!(code[17..].contains(&0x5B), "`pop rbx`");
-        // And the exit is the spill, the teardown and the jump — nothing else.
-        assert_eq!(code.len(), 7 + 8 + 10 + 5);
+            linker
+                .emit_exit(&mut buffer, &allocation, done, func, pc)
+                .unwrap();
+            let exit_len = buffer.len();
+            buffer.bind(target).unwrap();
+            buffer.bind(done).unwrap();
+            buffer.seal().unwrap();
+
+            let exit = &emitted(&buffer)[..exit_len];
+            let what = if linkable { "linked" } else { "unlinkable" };
+            // The spill comes first, byte for byte.
+            assert_eq!(
+                &exit[..spill.len()],
+                &spill[..],
+                "{what} exit: the spill must come first"
+            );
+            let mut rest = spill.len();
+            // Then the path's own middle (the reload, or the return word in rax) …
+            let middle = if linkable {
+                reload_bytes()
+            } else {
+                encoded(|buffer| buffer.mov_ri(Reg::Rax, encode_target(func, pc)).unwrap())
+            };
+            assert_eq!(&exit[rest..rest + middle.len()], &middle[..], "{what} exit");
+            rest += middle.len();
+            if linkable {
+                // … and on the linked path the teardown follows the reload.
+                let teardown = teardown_bytes();
+                assert_eq!(
+                    &exit[rest..rest + teardown.len()],
+                    &teardown[..],
+                    "{what} exit: the frame teardown"
+                );
+                rest += teardown.len();
+            }
+            // And the exit is exactly the spill, the middle, the teardown and the jump.
+            assert_eq!(exit.len(), rest + 5, "{what} exit length");
+        }
     }
 }
