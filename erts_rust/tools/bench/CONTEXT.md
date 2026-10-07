@@ -259,7 +259,48 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   and is a no-op skip otherwise, so `cargo test -p bench` stays green in any environment.
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p bench` GREEN and
   `... test --workspace` GREEN, plus a demonstrated `run --quick` producing real numbers for
-  `baseline`/`erlc_compiler`/`elixir_compiler`/`cowboy` and honest `skipped(reason)` rows for the rest.
+  `baseline`/`erlc_compiler`/`elixir_compiler`/`cowboy`/`foreign` and honest `skipped(reason)` rows
+  for the rest.
+
+## Runbook — reproducing the sys-vs-rust numbers
+
+Nothing below is required for a code review; it is how the `foreign` table above was produced and how
+to reproduce/refresh it. Build both the driver and the Rust runtime once, then run one workload:
+
+```sh
+# 1. build (from the repo root; the committed wrapper supplies a writable CARGO_HOME)
+erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p bench -p beam_rt
+
+# 2. the cross-runtime foreign numbers (sys + rust, side-by-side) — ~15 s
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime all --workloads foreign \
+    --out-file erts_rust/tools/bench/out/foreign-bench.json
+
+# 3. the opt-in nix toolchain workloads (rebar3 present only via the Nix store here)
+BENCH_TRY_NIX=1 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --quick --runtime sys --workloads khepri \
+    --out-file erts_rust/tools/bench/out/khepri-nix.json
+```
+
+`foreign` runs under **both** runtimes; every other repo workload is `sys`-only, so a `--runtime all`
+report shows a genuine sys-vs-rust row only for `baseline`, `slice`, and `foreign`. Read the numbers as
+*reproducible on this host*, not milestone results (single host, `--quick` sample counts).
+
+**Skip reasons, re-verified on this host (2026):**
+- `plb` → `skipped(dotnet-absent)`: `dotnet` is on neither `PATH` nor in the Nix store
+  (`ls -d /nix/store/*dotnet*` → 0 built outputs), and the `nixpkgs#dotnet-sdk` fallback is
+  deliberately not enabled. Note: PLB carries Elixir `.ex` algorithm sources, so a dotnet-free
+  `elixir`/escript path is conceivable but unimplemented.
+- `emqx` → `skipped(not-a-rebar3-project)`: EMQX has no root `rebar.config` (it builds via
+  `make`/`mix`), so `rebar3 compile` would be a silent no-op. Independent of `rebar3` availability.
+- `khepri` → **runs** with `BENCH_TRY_NIX=1` (`rebar3` 3.27.1 resolves from the Nix store); without it,
+  `skipped(rebar3-absent)` — `rebar3` is not on `PATH`.
+
+**Regression guard:** `tests/integration.rs::a_real_foreign_workload_is_measured_under_both_runtimes`
+asserts the `foreign` workload stays `Runtimes::Both` and keeps declaring contracts A.1/A.2, so the
+cross-runtime Rust coverage cannot silently disappear. `foreign.rs`'s unit tests pin the case table
+(sources present, calibrated `N`, `N_sys > N_rust`), the per-side argv, and the startup-cancelling
+per-call math.
 
 ## Measured (quick profile — refreshed on the `foreign`-workload change; see `git log` for the commit)
 Real numbers from two `--quick` runs on the build host. Artifacts: `out/milestone.json`
