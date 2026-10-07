@@ -24,10 +24,11 @@
 //!    the metadata no-ops fall through to `pc + 1`, an inlinable `move` writes the
 //!    destination x-register slot and falls through to `pc + 1`, an inlinable
 //!    small-int `gc_bif` falls through to `pc + 1` on its fast path, an inlinable
-//!    `test` branches to its `fail` label (or falls through to `pc + 1` on
-//!    success), and a `jump` whose label resolves **inside this IR function**
-//!    jumps straight to the label's `pc` (a `jump` into a *different* IR function
-//!    returns the encoded `(func, pc)` word to the driver); or
+//!    comparison BIF falls through to `pc + 1` after writing its `true`/`false`
+//!    word, an inlinable `test` branches to its `fail` label (or falls through to
+//!    `pc + 1` on success), and a `jump` whose label resolves **inside this IR
+//!    function** jumps straight to the label's `pc` (a `jump` into a *different* IR
+//!    function returns the encoded `(func, pc)` word to the driver); or
 //! 2. calls the shared per-instruction helper
 //!    `jit_step_one(rt, FUNC_INDEX, pc)` — the **same** interpreter-backed helper
 //!    the baseline tier uses
@@ -66,11 +67,13 @@
 //! Everything outside the set above: `func_info` (the failed-clause raise, which
 //! must **not** be a no-op — see the interpreter's `Instr::FuncInfo` arm), `swap`,
 //! every call/return/frame instruction, every `test` shape outside
-//! [`inline::inline_test`]'s provably-exact subset (see that function), `select_*`, every
-//! BIF outside the two the fast path recognises, `move` with a `Y` (or other
-//! non-x) operand or an x-register index past the engine's `MAX_REGISTER` bound,
-//! and a `jump` to a label the module does not define (so the interpreter's exact
-//! `unknown_label` error surfaces). Each of those runs through `jit_step_one`.
+//! [`inline::inline_test`]'s provably-exact subset (see that function), `select_*`,
+//! every BIF outside the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` fast path and the
+//! eight comparison BIFs [`compare::inline_comparison`] recognises, a `move` with a
+//! `Y` (or other non-x) operand or an x-register index past the engine's
+//! `MAX_REGISTER` bound, and a `jump` to a label the module does not define (so the
+//! interpreter's exact `bad_register` / `unknown_label` error surfaces). Each of
+//! those runs through `jit_step_one`.
 //!
 //! # The inlined `test` subset
 //!
@@ -81,17 +84,28 @@
 //!
 //! * the word-level type tests `is_nil`, `is_atom`, `is_list`, `is_nonempty_list`
 //!   and `is_boolean` (the last against the module's `true`/`false` atom words);
-//! * `is_lt`/`is_ge`/`is_eq`/`is_ne`/`is_eq_exact`/`is_ne_exact` when at least one
-//!   operand is a constant-immediate (a small int, an atom or `nil`) or, for the
-//!   non-exact kinds, both are x-registers — after guarding the register operand(s)
-//!   as untagged small ints (`(w & 0xF) == 0xF`) so the *tagged-word* signed order
-//!   is the interpreter's value/arithmetic order.
+//! * `is_eq_exact`/`is_ne_exact` over two x-registers, guarded as untagged small
+//!   ints (`(w & 0xF) == 0xF`) so a plain word compare *is* `cmp`'s exact equality,
+//!   and over any shape with at least one constant-immediate operand;
+//! * `is_eq`/`is_ne`/`is_lt`/`is_ge` when at least one operand is a
+//!   constant-immediate (a small int, an atom or `nil`) or, for the non-exact kinds,
+//!   both are x-registers — after guarding the register operand(s) as untagged small
+//!   ints so the *tagged-word* signed order is the interpreter's
+//!   value/arithmetic order.
 //!
 //! `fail == NO_FAIL` (which *raises*), an unresolved fail label, a `Y`/float/literal
-//! operand, a bignum constant, two registers for the exact kinds, and every other
-//! `TestKind` (`is_integer`, `is_tuple`, `is_function2`, …) stay on `jit_step_one`.
-//! A failed small-int guard likewise deopts to the helper, so the fast path can only
-//! ever *replace* a result the interpreter would compute identically.
+//! operand, a bignum constant, and every other `TestKind` (`is_integer`, `is_tuple`,
+//! `is_function2`, …) stay on `jit_step_one`. A failed small-int guard likewise deopts
+//! to the helper, so the fast path can only ever *replace* a result the interpreter
+//! would compute identically.
+//!
+//! # The inlined comparison-BIF subset
+//!
+//! The eight `erlang` comparison operators are the compiler's clause guards and
+//! boolean bodies, emitted as a **non-collecting** `bif`, so [`compare`] lowers the
+//! provably word-exact shapes natively (returning the module's own `true`/`false`
+//! atom word) and deopts everything else — see [`compare::inline_comparison`] for the
+//! rule set, which is the baseline tier's rule for rule.
 //!
 //! # `unsafe`
 //!
@@ -119,6 +133,7 @@ use crate::jit::JitBackend;
 use crate::machine::Machine;
 
 mod codegen;
+mod compare;
 mod inline;
 mod report;
 mod shape;
@@ -247,6 +262,18 @@ pub struct CompiledFunctions {
     /// [`inlined_tests`]: CompiledFunctions::inlined_tests
     /// [`inlined_gc_bif_ops`]: CompiledFunctions::inlined_gc_bif_ops
     inlined_gc_bifs: Vec<SmallArith>,
+    /// The comparison-BIF operators the tier inlined natively (deduped, in
+    /// first-inlined order), named by their `erlang` BIF spelling (`"=:="`, `"<"`, …).
+    ///
+    /// The same kind of artifact-level observation as [`inlined_tests`] and
+    /// [`inlined_gc_bifs`] — the evidence that the comparison fast paths (see
+    /// `src/jit/cranelift/compare.rs`) were compiled rather than silently deopted (see
+    /// [`inlined_comparison_ops`]).
+    ///
+    /// [`inlined_tests`]: CompiledFunctions::inlined_tests
+    /// [`inlined_gc_bifs`]: CompiledFunctions::inlined_gc_bifs
+    /// [`inlined_comparison_ops`]: CompiledFunctions::inlined_comparison_ops
+    inlined_comparisons: Vec<&'static str>,
     /// How many `select_val` instructions the tier inlined natively.
     ///
     /// The same kind of artifact-level observation as [`inlined_tests`] — the
@@ -318,6 +345,20 @@ impl CompiledFunctions {
     /// own [`name`](SmallArith::name).
     pub fn inlined_gc_bif_ops(&self) -> &[SmallArith] {
         &self.inlined_gc_bifs
+    }
+
+    /// The comparison-BIF operators this artifact inlined natively, deduped and in
+    /// first-inlined order (empty when the tier inlined none). Each entry is the
+    /// operator's `erlang` BIF spelling: `"=:="`, `"=/="`, `"=="`, `"/="`, `"<"`,
+    /// `"=<"`, `">"` or `">="`.
+    ///
+    /// Read-only introspection, the comparison counterpart of
+    /// [`inlined_gc_bif_ops`](CompiledFunctions::inlined_gc_bif_ops): it names **which**
+    /// operators the compile actually took the inline path for, so a test can prove
+    /// the fast path ran instead of silently deopting to `jit_step_one` (agreeing
+    /// results alone would not).
+    pub fn inlined_comparison_ops(&self) -> &[&'static str] {
+        &self.inlined_comparisons
     }
 
     /// How many `select_val` instructions this artifact inlined natively (zero when

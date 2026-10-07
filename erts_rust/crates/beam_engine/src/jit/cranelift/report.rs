@@ -12,9 +12,9 @@ use beam_loader::TestKind;
 ///
 /// The codegen records what it actually inlined here so the artifact
 /// ([`CompiledFunctions`]) can expose it: the highest natively addressed x-register
-/// (the driver's native-entry guard reads it), the set of inlined `test` kinds and
-/// the set of inlined small-int `gc_bif` ops (evidence that the fast paths — not
-/// `jit_step_one` — ran).
+/// (the driver's native-entry guard reads it), the set of inlined `test` kinds, the
+/// set of inlined small-int `gc_bif` ops and the set of inlined comparison BIFs
+/// (evidence that the fast paths — not `jit_step_one` — ran).
 #[derive(Default)]
 pub(super) struct CodegenReport {
     /// The highest x-register index any inlined instruction addresses natively.
@@ -24,6 +24,9 @@ pub(super) struct CodegenReport {
     /// The small-int `gc_bif` ops inlined natively (deduped, in first-inlined
     /// order).
     pub(super) inlined_gc_bifs: Vec<SmallArith>,
+    /// The comparison-BIF operators inlined natively (deduped, in first-inlined
+    /// order), named by their `erlang` BIF spelling (`"=:="`, `"<"`, …).
+    pub(super) inlined_comparisons: Vec<&'static str>,
     /// How many `select_val` instructions were inlined natively.
     pub(super) inlined_select_vals: usize,
     /// The tuple-read kinds inlined natively (deduped, in first-inlined order):
@@ -54,6 +57,14 @@ impl CodegenReport {
     pub(super) fn inlined_gc_bif(&mut self, op: SmallArith) {
         if !self.inlined_gc_bifs.contains(&op) {
             self.inlined_gc_bifs.push(op);
+        }
+    }
+
+    /// Record that the comparison BIF `op` (its `erlang` spelling) was inlined
+    /// natively.
+    pub(super) fn inlined_comparison(&mut self, op: &'static str) {
+        if !self.inlined_comparisons.contains(&op) {
+            self.inlined_comparisons.push(op);
         }
     }
 

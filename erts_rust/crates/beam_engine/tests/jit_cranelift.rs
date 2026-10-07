@@ -40,7 +40,7 @@ use std::sync::Arc;
 use beam_common::BeamError;
 use beam_engine::jit::cranelift::{CompiledFunctions, CraneliftJit, SmallArith};
 use beam_engine::jit::JitBackend;
-use beam_engine::{available_tiers, terms, Machine, MinimalContext, Tier};
+use beam_engine::{available_tiers, terms, Machine, MinimalContext, Tier, MAX_REGISTER};
 use beam_loader::{
     load_file, Export, Function, Import, ImportRef, Instr, Label, Module, Operand, TestKind,
     NO_FAIL,
@@ -837,21 +837,14 @@ fn a_float_operand_deopts_to_the_helper_and_still_agrees() {
 
 #[test]
 fn non_inlinable_test_shapes_stay_on_the_helper() {
-    // A boxed-term/structural test and the *exact* kinds over two x-registers (whose
-    // words may differ for `=:=` terms) are outside the subset: the artifact must
-    // name no inlined kind for this module, and the shapes must still run — through
-    // one interpreter step each.
+    // A boxed-term/structural test is outside the subset: the artifact must name no
+    // inlined kind for this module, and the shapes must still run — through one
+    // interpreter step each.
     let module = test_module(
         "helper",
         &[
             TestFn::new("is_integer", 1, TestKind::IsInteger, &[Spec::X(0)]),
             TestFn::new("is_tuple", 1, TestKind::IsTuple, &[Spec::X(0)]),
-            TestFn::new(
-                "eq_exact_regs",
-                2,
-                TestKind::IsEqExact,
-                &[Spec::X(0), Spec::X(1)],
-            ),
         ],
     );
     let compiled = CraneliftJit::new()
@@ -877,15 +870,89 @@ fn non_inlinable_test_shapes_stay_on_the_helper() {
     assert_eq!(run("is_integer", 1, &[make_small(3)]), flag(true));
     assert_eq!(run("is_integer", 1, &[NIL]), flag(false));
     assert_eq!(run("is_tuple", 1, &[make_small(3)]), flag(false));
-    // The exact compare over two registers answers `=:=`'s value through the helper.
-    assert_eq!(
-        run("eq_exact_regs", 2, &[make_small(7), make_small(7)]),
-        flag(true)
+}
+
+#[test]
+fn inlined_exact_two_register_compares_agree() {
+    // `is_eq_exact`/`is_ne_exact` over two x-registers is a plain word compare behind
+    // a both-small-int guard, so the tier inlines it and must agree with the
+    // interpreter bit for bit.
+    let module = test_module(
+        "exact_regs",
+        &[
+            TestFn::new("eq_regs", 2, TestKind::IsEqExact, &[Spec::X(0), Spec::X(1)]),
+            TestFn::new("ne_regs", 2, TestKind::IsNeExact, &[Spec::X(0), Spec::X(1)]),
+        ],
     );
-    assert_eq!(
-        run("eq_exact_regs", 2, &[make_small(7), make_small(8)]),
-        flag(false)
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the exact-compare fixtures");
+    let kinds = compiled.inlined_test_kinds();
+    assert!(kinds.contains(&TestKind::IsEqExact), "got {kinds:?}");
+    assert!(kinds.contains(&TestKind::IsNeExact), "got {kinds:?}");
+
+    // The inline path is only entered once the guard has accepted *both* operands as
+    // untagged small ints, so pin both the pass and the fail side across the whole
+    // small-int range, boundaries included.
+    let values = [MIN_SMALL, -40, -1, 0, 1, 5, 11, 40, MAX_SMALL];
+    for &a in &values {
+        for &b in &values {
+            let args = [make_small(a), make_small(b)];
+            agree_tiers(&backend, &compiled, &module, "eq_regs", 2, &args, flag(a == b));
+            agree_tiers(&backend, &compiled, &module, "ne_regs", 2, &args, flag(a != b));
+        }
+    }
+
+    // A non-small operand deopts the guard and lands on the shared helper; the values
+    // still agree with the interpreter (and, for a float, with `=:=`'s answer — the
+    // boxed word is a pointer, so a raw word compare would answer `false`).
+    let mut arena = MinimalContext::new();
+    let five_float = terms::make_float(&mut arena, 5.0).expect("the arena allocates a float");
+    agree_tiers(
+        &backend,
+        &compiled,
+        &module,
+        "eq_regs",
+        2,
+        &[five_float, make_small(5)],
+        flag(false),
     );
+    agree_tiers(
+        &backend,
+        &compiled,
+        &module,
+        "ne_regs",
+        2,
+        &[five_float, make_small(5)],
+        flag(true),
+    );
+    agree_tiers(
+        &backend,
+        &compiled,
+        &module,
+        "eq_regs",
+        2,
+        &[five_float, five_float],
+        flag(true),
+    );
+
+    // The baseline tier inlines exactly the same shape, so the two native tiers must
+    // answer identically on the same inputs (the interpreter is the reference).
+    for (a, b) in [(5, 5), (5, 6), (MIN_SMALL, MAX_SMALL)] {
+        let args = [make_small(a), make_small(b)];
+        agree_tiers(&backend, &compiled, &module, "eq_regs", 2, &args, flag(a == b));
+        let baseline = run_module(
+            Tier::BaselineJit,
+            &module,
+            "eq_regs",
+            2,
+            &args,
+            &mut MinimalContext::new(),
+        )
+        .expect("baseline eq_regs");
+        assert_eq!(baseline, flag(a == b), "baseline diverged from the interpreter");
+    }
 }
 
 #[test]
@@ -1111,19 +1178,25 @@ enum ArithSpec {
     FloatReg(u32),
     /// A static-literal operand (`z,4`) — never a small-int constant either.
     Literal(u32),
-    /// A `Y` (stack slot) operand — neither an x-register nor a constant.
+    /// A`Y` (stack slot) operand — neither an x-register nor a constant.
     Y(u32),
+    /// An atom constant operand, interned in the fixture module's atom table.
+    Atom(&'static str),
+    /// The `nil` constant operand.
+    Nil,
 }
 
 impl ArithSpec {
-    /// The loader operand this spec stands for.
-    fn operand(self) -> Operand {
+    /// The loader operand this spec stands for, interning an atom name in `atoms`.
+    fn operand(self, atoms: &mut beam_term::AtomTable) -> Operand {
         match self {
             ArithSpec::X(n) => Operand::X(n),
             ArithSpec::Int(value) => Operand::Integer(value),
             ArithSpec::FloatReg(n) => Operand::FloatReg(n),
             ArithSpec::Literal(index) => Operand::Literal(index),
             ArithSpec::Y(n) => Operand::Y(n),
+            ArithSpec::Atom(name) => Operand::Atom(atoms.intern(name)),
+            ArithSpec::Nil => Operand::Nil,
         }
     }
 }
@@ -1212,13 +1285,17 @@ fn arith_module(name: &str, functions: &[ArithFn]) -> Module {
                 bif,
                 fail: NO_FAIL,
                 live: fixture.arity,
-                args: fixture.args.iter().map(|spec| spec.operand()).collect(),
-                dst: fixture.dst.operand(),
+                args: fixture
+                    .args
+                    .iter()
+                    .map(|spec| spec.operand(&mut module.atom_table))
+                    .collect(),
+                dst: fixture.dst.operand(&mut module.atom_table),
             },
         ];
         if fixture.tail_move {
             code.push(Instr::Move {
-                src: fixture.dst.operand(),
+                src: fixture.dst.operand(&mut module.atom_table),
                 dst: Operand::X(0),
             });
         }

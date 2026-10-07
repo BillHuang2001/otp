@@ -23,6 +23,7 @@ use cranelift_module::{default_libcall_names, FuncId, Linkage, Module as ClModul
 
 use crate::jit::baseline::{encode_target, jit_step_one};
 
+use super::compare::{emit_inline_comparison, inline_comparison};
 use super::inline::{
     emit_inline_arith, emit_inline_move, emit_inline_test, fast_arith, inline_move, inline_test,
 };
@@ -148,6 +149,7 @@ pub(super) fn compile_module(
         highest_native_register: report.highest_native_register,
         inlined_tests: report.inlined_tests,
         inlined_gc_bifs: report.inlined_gc_bifs,
+        inlined_comparisons: report.inlined_comparisons,
         inlined_select_vals: report.inlined_select_vals,
         inlined_tuple_reads: report.inlined_tuple_reads,
         inlined_list_reads: report.inlined_list_reads,
@@ -413,9 +415,10 @@ fn emit_pc(
             }
         }
         // The BIFs the tier inlines: the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` fast
-        // path. It is a *shape* test (never a value test) — every mismatch, and every
-        // run-time guard failure, falls through to the helper, whose interpreter step
-        // is the BIF's exact semantics (including the `fail`-label / raise split).
+        // path first (a *shape* test, never a value test), then the eight comparison
+        // BIFs (see [`compare`]). Every mismatch, and every run-time guard failure,
+        // falls through to the helper, whose interpreter step is the BIF's exact
+        // semantics (including the `fail`-label / raise split).
         Some(gc_bif @ Instr::GcBif { .. }) => {
             if let Some(fast) = fast_arith(module, gc_bif) {
                 report.inlined_gc_bif(fast.op);
@@ -427,6 +430,44 @@ fn emit_pc(
                     func_index,
                     rt,
                     &fast,
+                    helper,
+                    this_func,
+                    report,
+                );
+                return;
+            }
+            if let Some(plan) = inline_comparison(module, gc_bif) {
+                report.inlined_comparison(plan.op.name());
+                emit_inline_comparison(
+                    builder,
+                    cfg,
+                    pc,
+                    code_len,
+                    func_index,
+                    rt,
+                    &plan,
+                    helper,
+                    this_func,
+                    report,
+                );
+                return;
+            }
+        }
+        // The comparison BIFs (`erlang`'s `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=`),
+        // which the compiler emits as a **non-collecting** `bif` (see [`compare`]).
+        // Any other BIF, an un-addressable operand, or a module without both
+        // `true`/`false` interned falls through to the helper.
+        Some(bif @ Instr::Bif { .. }) => {
+            if let Some(plan) = inline_comparison(module, bif) {
+                report.inlined_comparison(plan.op.name());
+                emit_inline_comparison(
+                    builder,
+                    cfg,
+                    pc,
+                    code_len,
+                    func_index,
+                    rt,
+                    &plan,
                     helper,
                     this_func,
                     report,
