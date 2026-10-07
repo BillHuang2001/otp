@@ -40,17 +40,18 @@
 //! ([`crate::module_build::MISSING_CC_REASON`] / `MISSING_ERL_NIF_REASON`) — never a pass,
 //! never a crash.
 //!
-//! # Honest handoff: the echo round trip is *not* a case
+//! # The echo round trip (the driver hands bytes *back* to Erlang)
 //!
-//! The strongest A.4 evidence would be the driver's `driver_output` bytes arriving in the
-//! owner's mailbox (`port_command` → `output` callback → `{Port, {data, Bytes}}`). It runs
-//! under `beam_rt -eval` (verified: `<<"hello">>`) but **not** under `beam_rt run`, whose
-//! `run_export` performs a single engine pass and never runs the scheduler's **port half**,
-//! so the receiver blocks and the CLI exits `3` with
-//! `beam_rt: unsupported: opcode: run: process blocked (no message available)`. That is a
-//! capability gap (it would classify as `unsupported`, never a mismatch), but it would pin
-//! no agreement today — so it is reported here instead of added, and lands the moment `run`
-//! drives the scheduler.
+//! The strongest A.4 evidence is the driver's `driver_output` bytes arriving in the owner's
+//! mailbox: `port_command(P, <<"hello">>)` → the driver's `output` callback →
+//! `driver_output(P, "hello", 5)` → a `{P, {data, <<"hello">>}}` message. Selector `6` pins
+//! exactly that round trip: it sends `<<"hello">>` and verifies the bytes it receives back
+//! equal `<<"hello">>` (returning `1`), so the observable is a VM-stable integer line like
+//! every other branch (the corpus requires it of a module-run case; the echoed *value* is
+//! `<<"hello">>`). It became runnable once `beam_rt run` drove the full scheduler
+//! (`Runtime::run_scheduled`): before that, `run` performed a single engine pass and never
+//! ran the scheduler's port half, so the receiver blocked and the CLI exited `3` with
+//! `beam_rt: unsupported: … blocked` (a capability gap, never a mismatch).
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 use crate::module_build::NifFixture;
@@ -79,7 +80,10 @@ classify(N) ->
                  _ -> 0
              end;
         4 -> P = open(Dir, ""), yn(erlang:port_command(P, <<"hello">>));
-        5 -> P = open(Dir, " upper"), yn(erlang:is_port(P))
+        5 -> P = open(Dir, " upper"), yn(erlang:is_port(P));
+        6 -> P = open(Dir, ""),
+             true = erlang:port_command(P, <<"hello">>),
+             receive {P, {data, Bytes}} -> yn(Bytes =:= <<"hello">>) end
     end.
 
 yn(true) -> 1;
@@ -217,6 +221,11 @@ pub(crate) fn group() -> Vec<Case> {
             "driver_c/spawn_driver_name_may_carry_a_command",
             "a {spawn_driver, Name} whose name carries a command string still opens the driver",
             &[5],
+        ),
+        case(
+            "driver_c/port_command_echo_round_trip",
+            "the driver's driver_output bytes arrive as {Port, {data, <<\"hello\">>}}: port_command round trip",
+            &[6],
         ),
     ]
 }
