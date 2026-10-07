@@ -10,7 +10,7 @@
 //! a *port*: registration with a poller, the input/output byte queues, timers and the port-task
 //! round are this crate's ([`beam_io`](crate)). This module is the bridge.
 //!
-//! It is small on purpose and has exactly three moving parts:
+//! It is small on purpose and has exactly four moving parts:
 //!
 //! * [`host`] — [`PortHost`], the one runtime service this crate cannot supply (atom interning, so
 //!   that a term built by a driver lands in the *runtime's* atom table), and [`AbiHost`], the
@@ -25,6 +25,29 @@
 //!   `ready_input`/`ready_output`/`timeout`/`control`/`stop` onto the driver's callbacks, installs
 //!   the port context around each call, and forwards the driver's own `driver_*` calls back into
 //!   [`AbiHost`].
+//! * [`table`] — [`DriverTable`], the **process-global** driver registry (the C's `driver_list`)
+//!   plus its port-creation service: the `beam_io` half of `add_driver_entry` /
+//!   `remove_driver_entry` / `driver_lock_driver` / `driver_create_port`. Those four `beam_abi`
+//!   `ErlDrvApi` slots are `None` today; wiring them needs four new *defaulted*
+//!   [`DriverHost`](beam_abi::driver::host::DriverHost) methods forwarding to this table (a
+//!   per-port host reaches the process-global table, exactly as a driver callback reaches the
+//!   global list in the C):
+//!
+//!   ```text
+//!   fn add_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int;            // -> table.add_entry(de)
+//!   fn remove_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int;         // -> table.remove_entry(de)
+//!   fn lock_driver(&mut self) -> c_int;                                       // -> table.lock(<this port's driver name>)
+//!   fn create_port(&mut self, creator: ErlDrvPort, connected: ErlDrvTermData,
+//!                  name: *mut c_char, drv_data: ErlDrvData) -> ErlDrvPort;   // -> table.create_port(...)
+//!   ```
+//!
+//!   `table` (a `&DriverTable`, defaulting to [`DriverTable::global`]) would become a **fifth**
+//!   optional hook alongside [`PortHost`]: `driver_create_port` additionally needs the runtime's
+//!   [`PortRegistry`](crate::PortRegistry)/[`Poller`](crate::Poller) and a `Box<dyn PortHost>` for
+//!   the new port, which is why the hook belongs on [`PortHost`] (the runtime-services seam) rather
+//!   than on the per-port `DriverHost`. `AbiHost` knows neither its own driver's name nor the
+//!   registry, so a `driver_lock_driver`/`driver_create_port` forwarding also needs the port's
+//!   registered driver name handed to [`AbiHost`] at construction.
 //!
 //! # The `ErlDrvPort` a driver sees
 //!
@@ -57,7 +80,9 @@
 pub mod host;
 pub mod job;
 pub mod port;
+pub mod table;
 
 pub use host::{AbiHost, DriverState, LocalAtomPortHost, PortHost};
 pub use job::AsyncJobs;
 pub use port::{make_loaded, DriverPort};
+pub use table::{DriverTable, RegisteredDriver};

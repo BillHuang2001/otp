@@ -24,9 +24,19 @@
  * `start(port, command)` parses a simple, whitespace/comma separated command string:
  *
  *   * `fd=<n>`   — the descriptor the port will `driver_select` on (default: none, `-1`);
+ *   * `log=<path>` — a file every callback appends a line to (`start`, `output`, `stop`),
+ *     so a host can observe the *order* in which the driver's callbacks ran; when absent no
+ *     file is ever touched (the pre-existing tests are unaffected);
  *   * `upper`     — a mode token: `output` upper-cases the bytes it echoes back.
  *
  * Anything else is ignored. The parsed state is stored in the per-port `host_state`.
+ *
+ * ## The callback log
+ *
+ * When `log=<path>` is given, `start`, `output` and `stop` each append one line (`"start"`,
+ * `"output"`, `"stop"`) to that file, in the order they ran. That is the observable evidence
+ * a port created from the process-global driver table really ran the driver's `start`/`stop`
+ * callbacks, in order, around its data path.
  *
  * ## The control vocabulary (integer commands, `port_control/3`)
  *
@@ -52,6 +62,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -63,7 +74,20 @@ typedef struct {
     int timeouts;      /* how many times `timeout` fired */
     int reads;         /* how many times `ready_input` fired */
     char mode[16];     /* the mode token from the command string ("" when none) */
+    char log[512];     /* path every callback appends an event line to ("" when none) */
 } host_state;
+
+/* Append `what` as one line to the per-port log file, if the command asked for one. */
+static void log_event(const host_state *st, const char *what) {
+    FILE *f;
+    if (st == NULL || st->log[0] == '\0')
+        return;
+    f = fopen(st->log, "a");
+    if (f == NULL)
+        return;
+    fprintf(f, "%s\n", what);
+    fclose(f);
+}
 
 /* Copy at most `cap` bytes of `src` into `dst`, NUL-terminating: a tiny, dependency-free `strncpy`. */
 static void copy_token(char *dst, size_t cap, const char *src, size_t n) {
@@ -75,11 +99,13 @@ static void copy_token(char *dst, size_t cap, const char *src, size_t n) {
     dst[i] = '\0';
 }
 
-/* Parse `fd=<n>` and a bare mode token out of the whitespace/comma separated command string. */
+/* Parse `fd=<n>`, `log=<path>` and a bare mode token out of the whitespace/comma separated
+ * command string. */
 static void parse_command(host_state *st, const char *command) {
     const char *p = command;
     st->fd = -1;
     st->mode[0] = '\0';
+    st->log[0] = '\0';
     if (p == NULL)
         return;
     while (*p != '\0') {
@@ -89,6 +115,12 @@ static void parse_command(host_state *st, const char *command) {
             break;
         if (strncmp(p, "fd=", 3) == 0) {
             st->fd = (int) strtol(p + 3, NULL, 10);
+        } else if (strncmp(p, "log=", 4) == 0) {
+            const char *s = p + 4;
+            size_t n = 0;
+            while (s[n] != '\0' && s[n] != ' ' && s[n] != '\t' && s[n] != ',')
+                n++;
+            copy_token(st->log, sizeof(st->log), s, n);
         } else {
             const char *s = p;
             size_t n = 0;
@@ -118,13 +150,18 @@ static ErlDrvData host_start(ErlDrvPort port, char *command) {
     st->timeouts = 0;
     st->reads = 0;
     st->mode[0] = '\0';
+    st->log[0] = '\0';
     parse_command(st, command);
+    log_event(st, "start");
     return (ErlDrvData) st;
 }
 
 static void host_stop(ErlDrvData drv_data) {
-    if (drv_data != NULL)
-        driver_free(drv_data);
+    host_state *st = (host_state *) drv_data;
+    if (st == NULL)
+        return;
+    log_event(st, "stop");
+    driver_free(drv_data);
 }
 
 /* Echo whatever Erlang sends to the port back to its owner. `output` receives no port argument,
@@ -134,6 +171,7 @@ static void host_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     host_state *st = (host_state *) drv_data;
     if (st == NULL)
         return;
+    log_event(st, "output");
     if (strcmp(st->mode, "upper") == 0 && buf != NULL) {
         ErlDrvSizeT i;
         for (i = 0; i < len; i++)

@@ -36,6 +36,27 @@ pub(crate) fn system_limit() -> BeamError {
     BeamError::SystemLimit
 }
 
+/// The error for a capability this crate does not model yet: the `notsup` raise.
+///
+/// Used where the oracle *would* succeed but Milestone-1 has no mechanism for it — e.g.
+/// creating a port from a **statically linked** driver entry, which needs a
+/// [`Driver`](crate::driver::Driver) adapter over a raw `ErlDrvEntry` this crate does not
+/// have. A raise (rather than a silent `badarg`) keeps the gap distinguishable from a wrong
+/// argument, and never fabricates a port.
+pub(crate) fn notsup() -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom("notsup")))
+}
+
+/// The error for a driver entry whose `init` callback refused registration
+/// (`driver_init_failed`).
+///
+/// The oracle's `erts_add_driver_entry` drops the entry again and returns the callback's
+/// non-zero result; the load path renders that as `{error,driver_init_failed}`
+/// (`erl_bif_ddll.c:1519-1525`). Carrying the same atom keeps the failure observable.
+pub(crate) fn driver_init_failed() -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom("driver_init_failed")))
+}
+
 /// The BEAM atom name the system Erlang reports for a POSIX `errno`, or `None` for a code
 /// this crate does not recognise.
 ///

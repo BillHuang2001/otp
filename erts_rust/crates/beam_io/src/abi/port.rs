@@ -80,6 +80,7 @@
 
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 use std::time::Instant;
 
 use libc::{c_char, c_int, c_uint};
@@ -107,7 +108,13 @@ const CONTROL_REPLY_CAPACITY: usize = 4096;
 /// A loaded C driver, presented as a [`Driver`](crate::driver::Driver).
 pub struct DriverPort {
     /// The `dlopen` handle and the driver's `ErlDrvEntry`; kept alive for the port's whole life.
-    lib: DriverLibrary,
+    ///
+    /// Shared through an [`Arc`] so the *process-global driver
+    /// table* ([`crate::abi::DriverTable`]) can keep the same loaded driver registered while
+    /// ports are created from it, and so several ports of one driver share a single `dlopen`
+    /// handle. The `DriverLibrary`'s `Drop` (`finish` + `dlclose`) runs when the last owner
+    /// goes — the load path's `do_unload_driver_entry` order.
+    lib: Arc<DriverLibrary>,
     /// The driver name the entry declares (the C's `drv->name`), reported by [`Driver::name`].
     name: String,
     /// The `open_port/2` command string, NUL-terminated, handed to `start`.
@@ -145,9 +152,37 @@ impl DriverPort {
         command: impl Into<String>,
         port_host: Box<dyn PortHost>,
     ) -> Result<DriverPort> {
+        // The command is validated **before** the object is opened, so a NUL-bearing command is
+        // reported as the argument fault it is rather than as a load failure.
         let command = CString::new(command.into()).map_err(|_| error::badarg())?;
         let lib = load(path, name).map_err(load_failure)?;
-        let name = lib.name();
+        DriverPort::from_library(Arc::new(lib), command, port_host)
+    }
+
+    /// Wraps an **already loaded** driver (a [`DriverLibrary`] owned by this crate or by the
+    /// process-global driver table) as a [`Driver`](crate::driver::Driver) over `port_host`.
+    ///
+    /// This is the constructor the process-global registry
+    /// ([`DriverTable::create_port`](crate::abi::DriverTable::create_port)) uses: it holds a
+    /// registration's [`Arc<DriverLibrary>`] and opens a new port from it **without** a
+    /// second `dlopen`. The entry's `init` callback is *not* run here — the load path already
+    /// ran it (`do_load_driver_entry` → `erts_add_driver_entry` → `init_driver`), and
+    /// [`Driver::start`] runs for the new port in
+    /// [`PortRegistry::open`](crate::PortRegistry::open).
+    ///
+    /// `command` is the NUL-terminated `open_port/2` command string the driver's `start`
+    /// callback receives; building it (`CString::new`) is the caller's job, so an interior
+    /// NUL is refused there.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the term-heap allocation returns (see [`AbiHost::new`]).
+    pub fn from_library(
+        library: Arc<DriverLibrary>,
+        command: CString,
+        port_host: Box<dyn PortHost>,
+    ) -> Result<DriverPort> {
+        let name = library.name();
         let mut abi = Box::new(AbiHost::new(port_host)?);
         // The `ErlDrvPort` a driver sees is `DriverEnv::as_port()`'s pointer, so the env must point
         // at an allocation that never moves. `abi` is boxed here (stable address) and both boxes are
@@ -155,7 +190,7 @@ impl DriverPort {
         // env stores stays valid, and `DriverPort` never hands the env out by value.
         let env = Box::new(DriverEnv::new(&mut *abi));
         Ok(DriverPort {
-            lib,
+            lib: library,
             name,
             command,
             abi,
