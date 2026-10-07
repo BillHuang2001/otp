@@ -220,6 +220,23 @@ Design Decisions).
   `MAX_ESTABLISHED_PACKET_BODY`. The connection owns an `OutboundAtomCache` that `send_payload` drains
   via `take_header()`.
 
+### `src/delivery.rs` — inbound `DOP_*` delivery classification + the `InboundSink` seam (safe)
+Turns a decoded [`ControlMessage`] into its **semantic** delivery and routes it to the local recipient.
+- `enum Delivery { Send{from,to,message,token}, RegSend{from,cookie,name,message,token},
+  AliasSend{..}, Link{..}, Exit{..}, Exit2{..}, UnlinkId{id,from,to}, UnlinkIdAck{..},
+  Monitor{watcher,watched,reference}, Demonitor{..}, MonitorExit{..}, GroupLeader{from,to},
+  Other(Dop) }` + `Delivery::dop()` and `Delivery::classify(&ControlMessage) -> Result<Delivery>`
+  (argument order from `dist.c`; a recognised-but-unclassified opcode — spawn/payload-exit/
+  altact-sig/`DOP_UNLINK` — is `Other(dop)`, never a substituted send).
+- `enum DeliveryOutcome { Delivered, NoSuchProcess, Unsupported, Dropped }`,
+  `struct Dispatched { delivery, outcome }`.
+- `trait InboundSink { fn deliver(&mut self, &Delivery) -> Result<DeliveryOutcome> }` — **defaulted**
+  to `Unsupported` (a runtime with no process registry never mis-delivers); `struct UnsupportedSink`
+  is the do-nothing impl. The production impl belongs to `beam_rt` (over `beam_process`/`Mailbox`) —
+  keeping the value layer free of the message/process crates (dependency DAG).
+- `ConnectionDriver::next_delivery`/`dispatch_inbound` (non-blocking) and
+  `Connection::recv_delivery`/`dispatch_inbound` (blocking) are the two entry points.
+
 ### `src/driver.rs` — the non-blocking poll/step state machine (safe)
 `struct ConnectionDriver` + `enum DriverState { Handshaking, Established, Closed, Failed }` +
 `enum StepOutcome { WouldBlock, Handshaking, Established, Progress, Closed, Failed }`. **Byte-fed**: the
@@ -403,6 +420,7 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `src/atom_cache.rs` → `SegmentCache`/`ReceiveAtomCache`/`OutboundAtomCache`, `apply_header`, and the
   `beam_codec::AtomCacheWriter` impl on `OutboundAtomCache` (the outbound `intern` hook)
 - `src/control.rs` → the `DOP_*` control-message tuple codec (`encode_control`/`encode_control_cached`)
+- `src/delivery.rs` → inbound `DOP_*` delivery: `Delivery` (classify a `ControlMessage`), the defaulted `InboundSink` seam + `UnsupportedSink` (routing lives in `beam_rt`)
 - `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation),
   `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache) with
   `send_control`/`send_message`/`send_tick`/`recv` + the typed `send_reg_send`/`send_link`/`send_exit`/
