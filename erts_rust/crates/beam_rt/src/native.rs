@@ -12,6 +12,7 @@
 //! | `io:put_chars/1,2` | writes to the process's output sink (the device argument is accepted and ignored) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
 //! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
+//! | `erlang:process_info/2` | reads a **process's** heap/GC observables out of this runtime's own process table (`beam_gc`'s `HeapInfo`; contract A.8) |
 //! | `init:get_argument/1` | reads the parsed command line (contract A.6, `RuntimeConfig::init_args`) |
 //! | `init:get_plain_arguments/0` | the (always empty) plain-argument list — the CLI models no plain arguments |
 //! | `init:get_arguments/0` | the whole command line, in order, from `RuntimeConfig::init_args` |
@@ -52,6 +53,7 @@
 mod application;
 mod code;
 mod init;
+mod memory;
 mod port;
 mod process;
 #[cfg(test)]
@@ -88,6 +90,7 @@ impl RuntimeContext<'_> {
             ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
+            ("erlang", "process_info", 2) => Some(self.process_info_2(args)),
             ("init", "get_argument", 1) => Some(self.get_argument(args)),
             ("init", "get_plain_arguments", 0) => Some(self.get_plain_arguments()),
             ("init", "get_arguments", 0) => Some(self.get_arguments()),
@@ -233,11 +236,53 @@ impl RuntimeContext<'_> {
     /// truth for the supported keys. An unknown key yields
     /// [`BeamError::BadArg`] — the bare `badarg` the oracle raises — so `-eval`'s
     /// `catch`/`try` sees exactly what loaded code would.
+    ///
+    /// The one **tuple** key the oracle accepts and this runtime answers,
+    /// `{allocator, A}`, is routed to [`crate::info::allocator_report`] (the
+    /// `beam_alloc` adoption; `A` outside the alloc-util names is the oracle's `badarg`).
+    /// The report is materialized on the same info heap `Runtime::system_info` uses, so
+    /// the returned term has the identical lifetime contract as an atom-key answer.
     fn system_info_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let key_term = *args.first().ok_or(BeamError::BadArg)?;
+        if terms::tuple_arity(key_term).is_ok() {
+            return self.system_info_tuple(key_term);
+        }
         let key = self
-            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .atom_name(key_term)
             .ok_or(BeamError::BadArg)?;
         self.runtime.system_info(&key)
+    }
+
+    /// The `{allocator, A}` form of `erlang:system_info/1`.
+    ///
+    /// Any other 2-tuple tag (or a tuple of another arity) is `badarg` — the oracle
+    /// answers no other tuple key this runtime models. `A` is read as an atom name; a
+    /// name outside the alloc-util set is `badarg`, exactly as
+    /// `system_info({allocator, foo_alloc})` is in the oracle.
+    fn system_info_tuple(&mut self, key_term: Eterm) -> Result<Eterm> {
+        if terms::tuple_arity(key_term)? != 2 {
+            return Err(BeamError::BadArg);
+        }
+        let tag = self
+            .atom_name(terms::tuple_element(key_term, 0)?)
+            .ok_or(BeamError::BadArg)?;
+        if tag != "allocator" {
+            return Err(BeamError::BadArg);
+        }
+        let name = self
+            .atom_name(terms::tuple_element(key_term, 1)?)
+            .ok_or(BeamError::BadArg)?;
+        let value = crate::info::allocator_report(&name)?;
+        // Materialize on the runtime's own info heap — the same snippet
+        // `Runtime::system_info` uses (the tuple path cannot call it, which takes a
+        // `&str` key).
+        let crate::Runtime {
+            info_heap,
+            code_server,
+            ..
+        } = self.runtime;
+        info_heap.reset();
+        value.to_eterm(info_heap, code_server.atoms())
     }
 
     // -- os:cmd/1 -------------------------------------------------------------

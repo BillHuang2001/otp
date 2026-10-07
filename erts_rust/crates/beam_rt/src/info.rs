@@ -33,6 +33,10 @@ use crate::error;
 use crate::runtime::Runtime;
 
 /// The keys [`system_info_value`] answers — the A.8 subset this runtime supports.
+///
+/// The list holds **atom** keys only; the one tuple key the oracle accepts that this
+/// runtime answers, `{allocator, A}`, is handled by the tuple path in
+/// [`crate::native`]'s `system_info/1` (it is dispatched to [`allocator_report`]).
 pub const SUPPORTED_KEYS: &[&str] = &[
     "version",
     "otp_release",
@@ -47,10 +51,14 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "threads",
     "emu_flavor",
     "schedulers",
+    "alloc_util_allocators",
+    "allocated_areas",
+    "garbage_collection",
 ];
 
 /// The **complete** atom vocabulary of this surface — every name [`system_info_value`]
-/// can answer as an [`InfoValue::Atom`] (or inside an [`InfoValue::Tuple`]).
+/// can answer as an [`InfoValue::Atom`] (or nested inside one of its list/tuple
+/// variants), and every name [`crate::native`]'s `process_info/2` can emit.
 ///
 /// [`InfoValue::to_eterm`] resolves an [`InfoValue::Atom`] through the runtime's own
 /// atom table and reports [`BeamError::TermNotFound`] for a name the table does not
@@ -58,16 +66,92 @@ pub const SUPPORTED_KEYS: &[&str] = &[
 /// [`SUPPORTED_KEYS`] is materialized. It is spelled out here — rather than left to the
 /// seeding site — so "the introspection surface is materializable" is checkable in one
 /// place (the test below seeds exactly this list and materializes every key). The boot
-/// core seed ([`crate::boot::CORE_ATOMS`]) already interns the platform/boolean group;
-/// interning is idempotent and name-keyed, so seeding both is harmless.
+/// core seed ([`crate::boot::seed_core_atoms`]) interns this whole list after
+/// [`crate::boot::CORE_ATOMS`]; interning is idempotent and name-keyed, so overlapping
+/// with the core set is harmless, and **appending** to this list keeps every index the
+/// core seed assigned before it unchanged.
 pub const INFO_ATOMS: &[&str] = &[
     // `os_type` (`{unix,linux}` / `{win32,nt}`) and `threads` (`true` / `false`).
     "unix", "linux", "win32", "nt", "true", "false",
     // `emu_flavor` (`jit` for the JIT emulator, `emu` for the plain interpreter).
     "jit", "emu",
+    // `alloc_util_allocators`: the ten alloc-util allocator names, in the oracle's order
+    // (verified against OTP 29/erts-17.1). `beam_alloc::registry::alloc_util_allocators`
+    // yields exactly these, in exactly this order.
+    "temp_alloc",
+    "sl_alloc",
+    "std_alloc",
+    "ll_alloc",
+    "eheap_alloc",
+    "ets_alloc",
+    "fix_alloc",
+    "literal_alloc",
+    "binary_alloc",
+    "driver_alloc",
+    // `allocated_areas`: the oracle's 19 item names, in order.
+    "sys_misc",
+    "static",
+    "atom_space",
+    "atom_table",
+    "module_table",
+    "export_table",
+    "export_list",
+    "register_table",
+    "fun_table",
+    "fun_list",
+    "module_refs",
+    "loaded_code",
+    "dist_table",
+    "node_table",
+    "bif_timer",
+    "process_table",
+    "port_table",
+    "ets_misc",
+    "external_alloc",
+    // `{allocator, A}`: the tuple tag plus the row names
+    // `beam_alloc::stats::AllocatorInfo::from_stats` emits (`info_carriers`/`info_calls`
+    // in `erl_alloc_util.c`, `info_status` in `erl_mseg.c`).
+    "allocator",
+    "blocks",
+    "bytes",
+    "carriers",
+    "carriers size",
+    "sbcs carriers",
+    "mbcs carriers",
+    "alloc calls",
+    "free calls",
+    "realloc calls",
+    "mseg carriers",
+    "mseg carriers size",
+    "mseg cache_hits",
+    "mseg unmaps",
+    // `garbage_collection` (the `system_info/1` key and the `process_info/2` item): the
+    // five item names in the oracle's emitted order (`erl_bif_info.c:2082-2093`).
+    "garbage_collection",
+    "max_heap_size",
+    "min_bin_vheap_size",
+    "min_heap_size",
+    "fullsweep_after",
+    "minor_gcs",
+    // The `max_heap_size` process-flag map (`process_info(Pid, garbage_collection)`).
+    "error_logger",
+    "include_shared_binaries",
+    "kill",
+    "size",
+    // The remaining `process_info/2` items and the reply for a pid that is not live.
+    "heap_size",
+    "total_heap_size",
+    "undefined",
 ];
 
 /// A `system_info/1` value, independent of any heap.
+///
+/// The first five variants are the scalar shapes; [`InfoValue::List`] and
+/// [`InfoValue::Tupled`] are the generic containers the richer keys
+/// (`alloc_util_allocators`, `allocated_areas`, `{allocator, A}`,
+/// `garbage_collection`) are built from — a `{Key, Value}` row is
+/// `Tupled(vec![Atom(key), value])`, so the oracle's proplists and its mixed-arity
+/// tuples (`{atom_space, Bytes, Bytes}`) are both expressible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InfoValue {
     /// A small integer (materialized as a small-int immediate).
@@ -80,6 +164,10 @@ pub enum InfoValue {
     Bool(bool),
     /// A two-element tuple of atoms, by name.
     Tuple(&'static str, &'static str),
+    /// A proper list, in order (materialized element by element, head first).
+    List(Vec<InfoValue>),
+    /// A tuple of arbitrary arity, in order.
+    Tupled(Vec<InfoValue>),
 }
 
 impl InfoValue {
@@ -92,7 +180,7 @@ impl InfoValue {
     /// * [`BeamError::TermNotFound`] when an atom this value names is not interned in
     ///   `atoms` — never an invented atom. A runtime materializing this crate's keys
     ///   seeds [`INFO_ATOMS`], which covers every atom the surface can emit;
-    /// * the heap's allocation failure for a string or a tuple.
+    /// * the heap's allocation failure for a string, a list or a tuple.
     pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm> {
         match self {
             InfoValue::Int(value) => try_make_small(*value).map_err(|_| BeamError::SystemLimit),
@@ -109,6 +197,26 @@ impl InfoValue {
                 let first = atom_term(atoms, first)?;
                 let second = atom_term(atoms, second)?;
                 heap.tuple(&[first, second])
+            }
+            InfoValue::List(elements) => {
+                // Materialize the elements first (they may need heap space of their own),
+                // then build the spine, so a nested container cannot be half-written.
+                let mut terms = Vec::with_capacity(elements.len());
+                for element in elements {
+                    terms.push(element.to_eterm(heap, atoms)?);
+                }
+                let mut list = NIL;
+                for term in terms.into_iter().rev() {
+                    list = heap.cons(term, list)?;
+                }
+                Ok(list)
+            }
+            InfoValue::Tupled(elements) => {
+                let mut terms = Vec::with_capacity(elements.len());
+                for element in elements {
+                    terms.push(element.to_eterm(heap, atoms)?);
+                }
+                heap.tuple(&terms)
             }
         }
     }
@@ -153,8 +261,253 @@ pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
         "threads" => Ok(InfoValue::Bool(true)),
         "emu_flavor" => Ok(emu_flavor(rt)),
         "schedulers" => Ok(InfoValue::Int(schedulers(rt))),
+        "alloc_util_allocators" => Ok(alloc_util_allocators()),
+        "allocated_areas" => allocated_areas(rt),
+        "garbage_collection" => Ok(garbage_collection()),
         other => Err(error::unknown_info_key(other)),
     }
+}
+
+// -- the allocator/GC introspection keys (`beam_alloc` / `beam_gc` adoption) -----------
+
+/// `system_info(alloc_util_allocators)` — the *alloc-util* allocator names.
+///
+/// Verified against the oracle (OTP 29 / erts-17.1):
+/// `erl -noshell -eval 'io:format("~p~n",[erlang:system_info(alloc_util_allocators)]).'`
+/// prints `[temp_alloc,sl_alloc,std_alloc,ll_alloc,eheap_alloc,ets_alloc,fix_alloc,
+/// literal_alloc,binary_alloc,driver_alloc]` — which is exactly
+/// [`beam_alloc::registry::alloc_util_allocators`] (the C
+/// `erts_alloc_util_allocators`, `erl_alloc.c:2789`, i.e. every [`AllocatorId`] but
+/// `sys_alloc` — the raw system allocator — and `test_alloc`), in the same order.
+///
+/// [`AllocatorId`]: beam_alloc::types::AllocatorId
+fn alloc_util_allocators() -> InfoValue {
+    InfoValue::List(
+        beam_alloc::registry::alloc_util_allocators()
+            .into_iter()
+            .map(InfoValue::Atom)
+            .collect(),
+    )
+}
+
+/// The **effective** default heap policy: the emulator defaults a process started
+/// without `spawn_opt` heap options gets.
+///
+/// [`beam_gc::HeapPolicy::default`] is the *unbounded floor*
+/// (`min_heap_words == 0`), whereas the oracle reports the C's `H_DEFAULT_SIZE`
+/// (233 words). [`beam_gc::HeapPolicy::from_spawn_opts`] applies exactly that floor (and
+/// the C's binary-vheap floor) to a requested value, so routing the defaults through it
+/// yields the oracle's `min_heap_size` (233), `min_bin_vheap_size` (46422) and
+/// `fullsweep_after` (65535) **without hardcoding any of them** — the numbers come from
+/// `beam_gc`'s growth table, which is itself derived from `erl_init.c`.
+fn effective_default_policy() -> beam_gc::HeapPolicy {
+    effective_policy(&beam_gc::HeapPolicy::default())
+}
+
+/// The policy a collector started with `base` reports to the oracle.
+///
+/// `beam_gc`'s [`HeapPolicy::default`](beam_gc::HeapPolicy::default) keeps
+/// `min_heap_words` at 0 (an *unbounded floor*), but every process the runtime spawns
+/// goes through the C's spawn path, whose minimum is `H_DEFAULT_SIZE` (233 words). This
+/// is the same conversion [`beam_gc::HeapPolicy::from_spawn_opts`] applies, so a process
+/// with no explicit heap options reports the emulator default rather than the sentinel.
+pub(crate) fn effective_policy(base: &beam_gc::HeapPolicy) -> beam_gc::HeapPolicy {
+    beam_gc::HeapPolicy::from_spawn_opts(
+        base.min_heap_words,
+        base.min_bin_vheap_words,
+        base.fullsweep_after,
+    )
+}
+
+/// `system_info(garbage_collection)` — the emulator-wide GC policy knobs.
+///
+/// Verified against the oracle (OTP 29 / erts-17.1): `[{max_heap_size,0},
+/// {min_bin_vheap_size,46422},{min_heap_size,233},{fullsweep_after,65535}]`. Note that
+/// `max_heap_size` is the **bare integer** here, unlike the flag *map*
+/// `process_info(Pid, garbage_collection)` reports.
+///
+/// The values are the [`effective_default_policy`] bounds, i.e. the same figures the
+/// per-process item reports for a process with no explicit heap options — the four keys
+/// [`beam_gc::GARBAGE_COLLECTION_KEYS`] names minus `minor_gcs`, which is a per-process
+/// counter with no emulator-wide counterpart.
+fn garbage_collection() -> InfoValue {
+    // `HeapInfo` owns the oracle's item order; the sizes are irrelevant for this key.
+    let info = beam_gc::HeapInfo::new(&effective_default_policy(), 0, 0, 0);
+    let items = info.items();
+    InfoValue::List(
+        items[..4]
+            .iter()
+            .map(|(key, value)| row(key, usize_to_int(*value)))
+            .collect(),
+    )
+}
+
+/// `system_info(allocated_areas)` — the runtime's own allocation-area footprints, in the
+/// oracle's 19-item order and arity.
+///
+/// Verified against the oracle (OTP 29 / erts-17.1), which emits exactly these names in
+/// this order (the C `erts_allocated_areas`, `erl_alloc.c:2580-2699`):
+/// `sys_misc`, `static`, `atom_space` (a **three**-element tuple), `atom_table`,
+/// `module_table`, `export_table`, `export_list`, `register_table`, `fun_table`,
+/// `fun_list`, `module_refs`, `loaded_code`, `dist_table`, `node_table`, `bif_timer`,
+/// `process_table`, `port_table`, `ets_misc`, `external_alloc`.
+///
+/// The oracle's *values* are run-dependent byte counts of a completely different
+/// emulator, so none of them can be mirrored. Every value here is instead **derived from
+/// state this runtime actually has** — never a hardcoded oracle figure, which would be a
+/// lie about a different process:
+///
+/// | item | value |
+/// |---|---|
+/// | `atom_space` | `{atom_space, B, B}`, `B` = the atom table's index slots |
+/// | `atom_table` | `B` |
+/// | `module_table`, `loaded_code` | one slot per **loaded** code module |
+/// | `register_table` | one slot per locally **registered** name |
+/// | `process_table` | one slot per **live** process |
+/// | `port_table` | one slot per **live** port |
+/// | `ets_misc` | one slot per **live** ETS table |
+/// | every other item | `0` |
+///
+/// A "slot" is [`std::mem::size_of::<usize>`] bytes — the word the runtime's own tables
+/// spend per entry — so the figures are a real (if coarse) lower bound on this runtime's
+/// footprint, in the byte unit the oracle uses. The `0` items are the ones this runtime
+/// has **no counterpart** for (no `export`/BIF-timer/`fun` table, no distribution or node
+/// table, no external port-driver allocator), and a `0` is honest where an invented
+/// figure would not be.
+fn allocated_areas(rt: &Runtime) -> Result<InfoValue> {
+    let slot = std::mem::size_of::<usize>() as i64;
+    let atoms = slot * rt.code_server.atoms().len() as i64;
+    let modules = slot * rt.loaded_modules().len() as i64;
+    let registered = slot * rt.processes().registered().count() as i64;
+    let processes = slot * rt.processes().len() as i64;
+    let ports = slot * live_ports(rt)?;
+    let tables = slot * live_tables(rt)?;
+    Ok(InfoValue::List(vec![
+        row("sys_misc", 0),
+        row("static", 0),
+        InfoValue::Tupled(vec![
+            InfoValue::Atom("atom_space"),
+            InfoValue::Int(atoms),
+            InfoValue::Int(atoms),
+        ]),
+        row("atom_table", atoms),
+        row("module_table", modules),
+        row("export_table", 0),
+        row("export_list", 0),
+        row("register_table", registered),
+        row("fun_table", 0),
+        row("fun_list", 0),
+        row("module_refs", 0),
+        row("loaded_code", modules),
+        row("dist_table", 0),
+        row("node_table", 0),
+        row("bif_timer", 0),
+        row("process_table", processes),
+        row("port_table", ports),
+        row("ets_misc", tables),
+        row("external_alloc", 0),
+    ]))
+}
+
+/// A `{Key, Value}` row of an `InfoValue` proplist.
+fn row(key: &'static str, value: i64) -> InfoValue {
+    InfoValue::Tupled(vec![InfoValue::Atom(key), InfoValue::Int(value)])
+}
+
+/// The number of live ports, or the typed capability gap when the shared port registry is
+/// already borrowed (the same rule [`port_count`] follows — never a panic).
+fn live_ports(rt: &Runtime) -> Result<i64> {
+    match rt.ports.try_borrow() {
+        Ok(registry) => Ok(registry.len() as i64),
+        Err(_) => Err(error::unsupported(
+            "erlang:system_info(allocated_areas): the port registry is already borrowed",
+        )),
+    }
+}
+
+/// The number of live ETS tables, or the typed capability gap when the shared table
+/// registry is already borrowed.
+fn live_tables(rt: &Runtime) -> Result<i64> {
+    match rt.tables.try_borrow() {
+        Ok(tables) => Ok(tables.len() as i64),
+        Err(_) => Err(error::unsupported(
+            "erlang:system_info(allocated_areas): the ETS table registry is already borrowed",
+        )),
+    }
+}
+
+/// `system_info({allocator, A})` — the measured counters of the alloc-util allocator `A`,
+/// as a list of `{Key, Value}` rows.
+///
+/// This is the `beam_alloc` handoff the crate `CONTEXT.md` names: the rows are
+/// [`beam_alloc::stats::AllocatorInfo::from_stats`] over a **live** snapshot
+/// ([`beam_alloc::registry::all_stats`]), so every figure is a real measurement of *this*
+/// process — the allocator name, the carrier counts, the call counters and the
+/// process-global segment statistics of `beam_alloc`'s registry.
+///
+/// # Documented divergence from the oracle
+///
+/// The oracle wraps the same underlying counters in one `{instance, N, [...]}` entry per
+/// allocator **instance** (`N` = the scheduler count; on this machine
+/// `erl -noshell -eval 'io:format("~p~n",[erlang:system_info({allocator,std_alloc})]).'`
+/// prints 17 `{instance, …}` entries, each with `versions`/`options`/`mbcs`/`sbcs`/
+/// `calls` sub-items). This runtime has a **single** allocator per type
+/// (`beam_alloc::registry`) and models no per-instance carrier pool or `versions` string,
+/// so it reports the flat, real `{Key, Value}` row set `beam_alloc` can actually produce
+/// rather than inventing an instance count or a version string.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for an atom that is not one of the ten alloc-util allocator
+/// names — the oracle's answer for an unknown name (`system_info({allocator, foo_alloc})`
+/// ⇒ `error:badarg`).
+pub fn allocator_report(name: &str) -> Result<InfoValue> {
+    let static_name = beam_alloc::registry::alloc_util_allocators()
+        .into_iter()
+        .find(|candidate| *candidate == name)
+        .ok_or(BeamError::BadArg)?;
+    let stats = beam_alloc::registry::all_stats()
+        .into_iter()
+        .find(|(allocator, _)| allocator.as_str() == static_name)
+        .map(|(_, stats)| stats)
+        .ok_or(BeamError::BadArg)?;
+    let report = beam_alloc::stats::AllocatorInfo::from_stats(static_name, &stats);
+    let mut rows = Vec::with_capacity(report.items.len());
+    for item in &report.items {
+        rows.push(InfoValue::Tupled(vec![
+            InfoValue::Atom(item.key),
+            allocator_value(item.value)?,
+        ]));
+    }
+    Ok(InfoValue::List(rows))
+}
+
+/// One [`beam_alloc`](beam_alloc::stats::InfoValue) report value as an [`InfoValue`].
+///
+/// A counter wider than a 60-bit small integer would not be materializable, so it is the
+/// typed capability gap ([`BeamError::SystemLimit`]) rather than a truncated number.
+fn allocator_value(value: beam_alloc::stats::InfoValue) -> Result<InfoValue> {
+    match value {
+        beam_alloc::stats::InfoValue::U64(value) => usize_to_int_result(value as usize),
+        beam_alloc::stats::InfoValue::Usize(value) => usize_to_int_result(value),
+        beam_alloc::stats::InfoValue::Text(text) => Ok(InfoValue::Str(text.to_string())),
+    }
+}
+
+/// `value` as an [`InfoValue::Int`], or [`BeamError::SystemLimit`] when it cannot be a
+/// small integer.
+fn usize_to_int_result(value: usize) -> Result<InfoValue> {
+    i64::try_from(value)
+        .map(InfoValue::Int)
+        .map_err(|_| BeamError::SystemLimit)
+}
+
+/// `value` as an `i64`, saturating at the small-integer range's practical bound.
+///
+/// Used only for the table-footprint figures of [`allocated_areas`], where the operand is
+/// a table length times the word size — far inside the range on any real machine.
+fn usize_to_int(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 /// The execution-engine flavor of this runtime, as the oracle reports it.
@@ -292,7 +645,7 @@ mod tests {
             system_info_value(key, &rt)
                 .unwrap_or_else(|error| panic!("system_info({key}) failed: {error}"));
         }
-        assert_eq!(SUPPORTED_KEYS.len(), 13);
+        assert_eq!(SUPPORTED_KEYS.len(), 16);
     }
 
     #[test]
@@ -630,6 +983,274 @@ mod tests {
         )
         .expect("the printer renders it");
         assert_eq!(rendered, "\"17.1\"\n");
+    }
+
+    #[test]
+    fn alloc_util_allocators_matches_the_oracle_list() {
+        // Pinned against the oracle (OTP 29 / erts-17.1):
+        // `erl -noshell -eval 'io:format("~p~n",[erlang:system_info(alloc_util_allocators)]).'`
+        // — set **and** order.
+        let rt = runtime();
+        let value = system_info_value("alloc_util_allocators", &rt).expect("alloc_util_allocators");
+        let names: Vec<&str> = match &value {
+            InfoValue::List(elements) => elements
+                .iter()
+                .map(|element| match element {
+                    InfoValue::Atom(name) => *name,
+                    other => panic!("an allocator name must be an atom, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("alloc_util_allocators must be a list, got {other:?}"),
+        };
+        assert_eq!(
+            names,
+            [
+                "temp_alloc",
+                "sl_alloc",
+                "std_alloc",
+                "ll_alloc",
+                "eheap_alloc",
+                "ets_alloc",
+                "fix_alloc",
+                "literal_alloc",
+                "binary_alloc",
+                "driver_alloc",
+            ]
+        );
+    }
+
+    #[test]
+    fn allocators_is_badarg_like_the_oracle() {
+        // Verified: `erlang:system_info(allocators)` raises `error:badarg` in OTP 29 /
+        // erts-17.1, so this runtime must not answer it either.
+        let rt = runtime();
+        assert!(matches!(
+            system_info_value("allocators", &rt),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn allocated_areas_has_the_oracle_names_arities_and_derivations() {
+        // The oracle's 19 items, in order (`erts_allocated_areas`,
+        // `erl_alloc.c:2580-2699`), with `atom_space` as its three-element tuple.
+        let rt = runtime();
+        let value = system_info_value("allocated_areas", &rt).expect("allocated_areas");
+        let rows = match &value {
+            InfoValue::List(rows) => rows,
+            other => panic!("allocated_areas must be a list, got {other:?}"),
+        };
+        let expected = [
+            "sys_misc",
+            "static",
+            "atom_space",
+            "atom_table",
+            "module_table",
+            "export_table",
+            "export_list",
+            "register_table",
+            "fun_table",
+            "fun_list",
+            "module_refs",
+            "loaded_code",
+            "dist_table",
+            "node_table",
+            "bif_timer",
+            "process_table",
+            "port_table",
+            "ets_misc",
+            "external_alloc",
+        ];
+        let pairs: Vec<(String, Vec<i64>)> = rows
+            .iter()
+            .map(|row| match row {
+                InfoValue::Tupled(fields) => {
+                    let name = match &fields[0] {
+                        InfoValue::Atom(name) => (*name).to_string(),
+                        other => panic!("a row's first field must be an atom, got {other:?}"),
+                    };
+                    let values = fields[1..]
+                        .iter()
+                        .map(|field| match field {
+                            InfoValue::Int(value) => *value,
+                            other => panic!("{name}'s value must be an integer, got {other:?}"),
+                        })
+                        .collect();
+                    (name, values)
+                }
+                other => panic!("a row must be a tuple, got {other:?}"),
+            })
+            .collect();
+        let names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, expected);
+        assert_eq!(pairs[2].1.len(), 2, "atom_space carries a value and a peak");
+
+        // The measured items reflect *this* runtime's own state (never a hardcoded oracle
+        // figure): the atom table always holds the boot seed and the runtime always has
+        // its root process, while the items with no counterpart are honestly `0`.
+        let value_of = |name: &str| -> i64 {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .unwrap_or_else(|| panic!("{name} must be present"))
+                .1[0]
+        };
+        assert!(value_of("atom_table") > 0, "the atom table holds the core seed");
+        assert!(value_of("process_table") > 0, "the runtime has its root process");
+        for absent in [
+            "bif_timer",
+            "dist_table",
+            "node_table",
+            "external_alloc",
+            "export_table",
+            "fun_table",
+        ] {
+            assert_eq!(value_of(absent), 0, "{absent} has no counterpart here");
+        }
+    }
+
+    #[test]
+    fn garbage_collection_matches_the_oracle_list() {
+        // Pinned against the oracle (OTP 29 / erts-17.1):
+        // `erl -noshell -eval 'io:format("~p~n",[erlang:system_info(garbage_collection)]).'`
+        // prints `[{max_heap_size,0},{min_bin_vheap_size,46422},{min_heap_size,233},
+        // {fullsweep_after,65535}]` — `max_heap_size` is the **bare integer** here, and
+        // none of the values is hardcoded: they come from `beam_gc`'s growth table.
+        let rt = runtime();
+        let value = system_info_value("garbage_collection", &rt).expect("garbage_collection");
+        let expected = [
+            ("max_heap_size", 0_i64),
+            ("min_bin_vheap_size", 46_422),
+            ("min_heap_size", 233),
+            ("fullsweep_after", 65_535),
+        ];
+        let rows = match &value {
+            InfoValue::List(rows) => rows,
+            other => panic!("garbage_collection must be a list, got {other:?}"),
+        };
+        assert_eq!(rows.len(), expected.len());
+        for (row, (key, expected_value)) in rows.iter().zip(expected) {
+            assert_eq!(
+                *row,
+                InfoValue::Tupled(vec![InfoValue::Atom(key), InfoValue::Int(expected_value)])
+            );
+        }
+    }
+
+    #[test]
+    fn allocator_report_carries_the_measured_counters() {
+        let value = allocator_report("std_alloc").expect("std_alloc is an alloc-util allocator");
+        let rows = match &value {
+            InfoValue::List(rows) => rows,
+            other => panic!("an allocator report must be a list, got {other:?}"),
+        };
+        let keys: Vec<&str> = rows
+            .iter()
+            .map(|row| match row {
+                InfoValue::Tupled(fields) => match &fields[0] {
+                    InfoValue::Atom(key) => *key,
+                    other => panic!("a row key must be an atom, got {other:?}"),
+                },
+                other => panic!("a row must be a tuple, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "blocks",
+                "bytes",
+                "carriers",
+                "carriers size",
+                "sbcs carriers",
+                "mbcs carriers",
+                "alloc calls",
+                "free calls",
+                "realloc calls",
+                "mseg carriers",
+                "mseg carriers size",
+                "mseg cache_hits",
+                "mseg unmaps",
+            ]
+        );
+        // The report is a live measurement: every value exists and is non-negative.
+        for row in rows {
+            let InfoValue::Tupled(fields) = row else {
+                panic!("a row must be a tuple, got {row:?}");
+            };
+            assert!(
+                matches!(&fields[1], InfoValue::Int(value) if *value >= 0),
+                "{row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allocator_report_rejects_a_name_that_is_not_an_alloc_util_allocator() {
+        // The oracle raises `error:badarg` for an unknown allocator name
+        // (`system_info({allocator, foo_alloc})`).
+        for name in ["foo_alloc", "std", "sys_alloc", "test_alloc", "", "eheap"] {
+            assert!(
+                matches!(allocator_report(name), Err(BeamError::BadArg)),
+                "{name} must be badarg"
+            );
+        }
+        // Every one of the ten alloc-util names answers with its own report.
+        let names = beam_alloc::registry::alloc_util_allocators();
+        assert_eq!(names.len(), 10);
+        for name in names {
+            assert!(allocator_report(name).is_ok(), "{name} must answer");
+        }
+    }
+
+    #[test]
+    fn the_container_variants_materialize() {
+        use beam_engine::terms;
+
+        let mut heap = Heap::new(1_024).expect("test heap");
+        let atoms = seeded_atoms();
+        let term = InfoValue::List(vec![
+            InfoValue::Atom("unix"),
+            InfoValue::Tupled(vec![InfoValue::Atom("linux"), InfoValue::Int(3)]),
+        ])
+        .to_eterm(&mut heap, &atoms)
+        .expect("materialize");
+        let elements = terms::list_elements(term).expect("a list");
+        assert_eq!(elements.len(), 2);
+        assert_eq!(atoms.name(atom_val(elements[0])), Some("unix"));
+        assert_eq!(terms::tuple_arity(elements[1]).expect("a tuple"), 2);
+        assert_eq!(
+            signed_value(terms::tuple_element(elements[1], 1).expect("an element")),
+            3
+        );
+
+        // An empty list is `[]` and a nullary tuple is legal too.
+        assert_eq!(
+            InfoValue::List(Vec::new())
+                .to_eterm(&mut heap, &atoms)
+                .expect("nil"),
+            NIL
+        );
+        assert_eq!(
+            terms::tuple_arity(
+                InfoValue::Tupled(Vec::new())
+                    .to_eterm(&mut heap, &atoms)
+                    .expect("{}")
+            )
+            .expect("a tuple"),
+            0
+        );
+
+        // A missing atom *inside* a container is reported, never invented.
+        let mut unseeded = AtomTable::new();
+        assert!(matches!(
+            InfoValue::List(vec![InfoValue::Atom("unix")]).to_eterm(&mut heap, &unseeded),
+            Err(BeamError::TermNotFound)
+        ));
+        assert!(matches!(
+            InfoValue::Tupled(vec![InfoValue::Int(1), InfoValue::Atom("linux")])
+                .to_eterm(&mut heap, &unseeded),
+            Err(BeamError::TermNotFound)
+        ));
     }
 
     #[test]
