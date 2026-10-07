@@ -14,7 +14,7 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `differential run <case-id> [--json] [--out <dir>]` — run one built-in conformance case both ways; print the comparison.
 - `differential compare <expr> [--pa <dir>] [--json] [--out <dir>]` — ad-hoc: evaluate an Erlang expression under both runtimes and compare.
 - `differential suite [--strict] [--json] [--out <dir>]` — run the built-in conformance corpus.
-- `differential list [--json]` — list corpus case ids + the compatibility contract each covers.
+- `differential list [--by-contract] [--json] [--out <dir>]` — list corpus case ids + the compatibility contract each covers (`--by-contract` adds a per-contract case-count rollup).
 - Exit codes: `0` all executed cases agreed (skips/unsupported reported, not fatal); `1` ≥1 **mismatch**; `2` usage/env error. `--strict` escalates `unsupported`/`skipped` to a failure exit.
 
 ### `bench`
