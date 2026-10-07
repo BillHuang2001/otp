@@ -1,32 +1,48 @@
 //! The message envelope ([`Message`]) and the per-process FIFO message queue ([`Queue`]).
 //!
 //! `Message` mirrors the legacy C `ErtsMessage` fields `m[0]`/`m[1]`/`m[2]`
-//! (`ERL_MESSAGE_TERM`/`_TOKEN`/`_FROM`) plus the off-heap objects the payload owns. `Queue` is a
-//! **pure data structure**: waiting, the save queue, signal ordering and priority handling are
-//! `beam_process`'s, not this crate's.
+//! (`ERL_MESSAGE_TERM`/`_TOKEN`/`_FROM`) plus the off-heap objects the payload owns: the MSO
+//! handles of its off-heap references, the refc binaries whose payloads it shares, and the
+//! external-thing node references it holds. `Queue` is a **pure data structure**: waiting, the
+//! save queue, signal ordering and priority handling are `beam_process`'s, not this crate's.
 
 use std::collections::VecDeque;
 
+use beam_alloc::RefcBinary;
 use beam_term::prelude::*;
 
+use crate::fragment::Fragments;
+use crate::node::NodeEntry;
 use crate::off_heap::MsoHandle;
 
 /// A copied message: the payload term, the sender identity and the off-heap objects it owns.
+///
+/// A payload that fits the receiver's heap lives *in that heap* and the message holds no
+/// fragments. A payload that does not fit instead lives in one or more [`Fragments`] (the
+/// `ErlHeapFragment` chain), and [`payload`](Message::payload) points into them; the fragments own
+/// the payload's off-heap objects for its lifetime, so `off_heap`/`binaries`/`nodes` are then empty.
 pub struct Message {
     payload: Eterm,
     from: Eterm,
     token: Eterm,
     off_heap: Vec<MsoHandle>,
+    binaries: Vec<RefcBinary>,
+    nodes: Vec<NodeEntry>,
+    fragments: Option<Fragments>,
 }
 
 impl Message {
-    /// A new message carrying `payload` from `from`, with no token and no off-heap objects.
+    /// A new message carrying `payload` from `from`, with no token, no off-heap objects and no
+    /// fragments.
     pub fn new(payload: Eterm, from: Eterm) -> Message {
         Message {
             payload,
             from,
             token: NIL,
             off_heap: Vec::new(),
+            binaries: Vec::new(),
+            nodes: Vec::new(),
+            fragments: None,
         }
     }
 
@@ -39,6 +55,26 @@ impl Message {
     /// Sets the off-heap objects the payload owns (they were refcounted during the copy).
     pub fn with_off_heap(mut self, off_heap: Vec<MsoHandle>) -> Message {
         self.off_heap = off_heap;
+        self
+    }
+
+    /// Sets the refc binaries whose off-heap payloads the message shares (they were refcounted
+    /// during the copy).
+    pub fn with_binaries(mut self, binaries: Vec<RefcBinary>) -> Message {
+        self.binaries = binaries;
+        self
+    }
+
+    /// Sets the external-thing node references the payload holds (they were refcounted during the
+    /// copy).
+    pub fn with_nodes(mut self, nodes: Vec<NodeEntry>) -> Message {
+        self.nodes = nodes;
+        self
+    }
+
+    /// Sets the heap fragments holding a payload that did not fit the receiver's heap.
+    pub fn with_fragments(mut self, fragments: Fragments) -> Message {
+        self.fragments = Some(fragments);
         self
     }
 
@@ -60,6 +96,28 @@ impl Message {
     /// The off-heap objects the payload owns.
     pub fn off_heap(&self) -> &[MsoHandle] {
         &self.off_heap
+    }
+
+    /// The refc binaries whose off-heap payloads the payload owns.
+    pub fn binaries(&self) -> &[RefcBinary] {
+        &self.binaries
+    }
+
+    /// The external-thing node references the payload holds.
+    pub fn nodes(&self) -> &[NodeEntry] {
+        &self.nodes
+    }
+
+    /// The heap fragments holding the payload, or `None` when the payload lives in the receiver's
+    /// heap.
+    pub fn fragments(&self) -> Option<&Fragments> {
+        self.fragments.as_ref()
+    }
+
+    /// The heap fragments, mutably — for the receiver to [`move_into`](Fragments::move_into) its
+    /// own heap.
+    pub fn fragments_mut(&mut self) -> Option<&mut Fragments> {
+        self.fragments.as_mut()
     }
 }
 
@@ -199,10 +257,44 @@ mod tests {
         assert_eq!(message.from(), from);
         assert_eq!(message.token(), NIL);
         assert!(message.off_heap().is_empty());
+        assert!(message.binaries().is_empty());
+        assert!(message.nodes().is_empty());
+        assert!(message.fragments().is_none(), "a heap-resident payload has no fragments");
 
         let message = message.with_token(make_small(1));
         assert_eq!(message.token(), make_small(1));
         assert_eq!(message.payload(), payload);
+    }
+
+    #[test]
+    fn a_fragmented_message_reports_its_fragments() {
+        use crate::fragment::{Fragments, HeapFragment};
+
+        let mut fragments = Fragments::new();
+        fragments.push(HeapFragment::new(8).expect("the fragment allocates"));
+        let mut message = Message::new(make_small(1), make_small(0)).with_fragments(fragments);
+
+        let reported = message.fragments().expect("the fragments travel with the message");
+        assert_eq!(reported.len(), 1);
+        assert!(message.fragments_mut().is_some());
+    }
+
+    #[test]
+    fn the_binary_and_node_lists_travel_with_the_message() {
+        use crate::node::NodeEntry;
+        use beam_alloc::RefcBinary;
+
+        let mut atoms = AtomTable::new();
+        let node = make_atom(atoms.intern("nonode@nohost"));
+
+        let message = Message::new(make_small(1), make_small(0))
+            .with_binaries(vec![RefcBinary::new(&[9, 9, 9]).expect("the payload allocates")])
+            .with_nodes(vec![NodeEntry::new(node, 2)]);
+        assert_eq!(message.binaries().len(), 1);
+        assert_eq!(message.binaries()[0].as_bytes(), &[9, 9, 9]);
+        assert_eq!(message.nodes().len(), 1);
+        assert_eq!(message.nodes()[0].node().raw(), node.raw());
+        assert_eq!(message.nodes()[0].creation(), 2);
     }
 
     #[test]

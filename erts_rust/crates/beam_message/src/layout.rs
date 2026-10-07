@@ -132,6 +132,48 @@ pub(crate) fn is_off_heap_term(term: Eterm) -> bool {
     is_off_heap_container(unsafe { *boxed_val(term) })
 }
 
+/// Whether the compound term `term` is a full refc binary — the 8-word
+/// `[BinRef(3)][ErlSubBits(5)]` pair whose root is the `ErlSubBits` and whose `orig` slot points
+/// at the `BinRef`.
+///
+/// Distinct from the standalone MSO container ([`is_off_heap_term`], a bare `HEADER_BIN_REF`
+/// thing whose `val` is an MSO slot): this is the real off-heap binary payload handle.
+pub(crate) fn is_refc_binary_term(term: Eterm) -> bool {
+    // SAFETY: the copier only calls this on a live boxed word whose header is initialized.
+    unsafe { beam_term::refc::is_refc_binary(term) }
+}
+
+/// Whether `header` is the head word of an external pid, port or reference (`ExternalThing`).
+pub(crate) fn is_external_header(header: Eterm) -> bool {
+    let subtag = header.raw() & TAG_HEADER_MASK;
+    subtag == EXTERNAL_PID_SUBTAG || subtag == EXTERNAL_PORT_SUBTAG || subtag == EXTERNAL_REF_SUBTAG
+}
+
+/// The `(node, creation)` identity of the external pid/port/reference `term`, or `None` when
+/// `header` is not an `ExternalThing` head word.
+///
+/// `term` must be a live external thing. The node is returned as the sysname atom term (the M1
+/// substitution `beam_term::thing` documents) and `creation` from the thing's `next` slot.
+pub(crate) fn external_node_creation(header: Eterm, term: Eterm) -> Option<(Eterm, u32)> {
+    match header.raw() & TAG_HEADER_MASK {
+        // SAFETY: `header` proves `term` is a live external thing of that kind, so the
+        // `external_*_parts` preconditions hold.
+        EXTERNAL_PID_SUBTAG => {
+            let (node, _number, _serial, creation) = unsafe { external_pid_parts(term) };
+            Some((node, creation))
+        }
+        EXTERNAL_PORT_SUBTAG => {
+            let (node, _number, creation) = unsafe { external_port_parts(term) };
+            Some((node, creation))
+        }
+        EXTERNAL_REF_SUBTAG => {
+            let (node, _ids, creation) = unsafe { external_ref_parts(term) };
+            Some((node, creation))
+        }
+        _ => None,
+    }
+}
+
 /// The off-heap slot stored in the container `container` (its `val` word).
 ///
 /// Precondition: `container` is a live off-heap reference container (`is_off_heap_term`).
