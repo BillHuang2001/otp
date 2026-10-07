@@ -33,7 +33,10 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use beam_rt::info::{system_info_value, InfoValue, SUPPORTED_KEYS, UNSUPPORTED_KEYS};
+use beam_rt::cli::{parse, parse_with_env, MapEnv};
+use beam_rt::info::{
+    system_info_value, tuple_key_value, InfoValue, SUPPORTED_KEYS, UNSUPPORTED_KEYS,
+};
 use beam_rt::{Runtime, RuntimeConfig};
 
 /// Keys whose **value** must equal the oracle's. Every entry is an interface constant
@@ -69,6 +72,7 @@ const ORACLE_EQUAL_KEYS: &[&str] = &[
     "heap_type",
     "message_queue_data",
     "scheduler_bind_type",
+    "context_reductions",
     "thread_pool_size",
     "min_heap_size",
     "min_bin_vheap_size",
@@ -378,6 +382,157 @@ fn oracle_answers(keys: &[&str]) -> Option<HashMap<String, String>> {
 /// Whether the oracle refused a key (`catch` wrapped its `error:badarg` in `{'EXIT',…}`).
 fn oracle_rejected(text: &str) -> bool {
     text.trim_start().starts_with("{'EXIT'")
+}
+
+/// Runs a real `erl` with `argv` (between `-noshell` and `-eval`) and `env`, and returns
+/// its trimmed stdout.
+///
+/// Every `ERL_*` variable this suite drives is stripped first, so a case is exactly what
+/// the test sets rather than what the environment happens to carry. `None` when no `erl`
+/// can be executed — the caller skips loudly.
+fn oracle_run(argv: &[&str], env: &[(&str, &str)], expr: &str) -> Option<String> {
+    let mut command = Command::new("erl");
+    for name in [
+        "ERL_OTP30_FLAGS",
+        "ERL_AFLAGS",
+        "ERL_FLAGS",
+        "ERL_ZFLAGS",
+        "ERL_MAX_PORTS",
+    ] {
+        command.env_remove(name);
+    }
+    command.args(["-noshell"]);
+    command.args(argv);
+    command.args(["-eval", expr]);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The `+Q`/`ERL_MAX_PORTS` sizing rule, against the **real** oracle.
+///
+/// `erts_ptab_init_table` rounds the requested table size up to the next power of two
+/// (`erl_ptab.c:383-388`) and caps it at `ERTS_PTAB_MAX_SIZE` (`1 << 27`); `erts_ptab_max`
+/// reports a table at that cap as `ERTS_PTAB_MAX_SIZE - 1` = `134217727`
+/// (`erl_ptab.h:266-270`), which is also the largest value `+Q` accepts. So the reported
+/// `port_limit` is `min(next_power_of_two(N), 134217727)` for a request, and
+/// `ERTS_DEFAULT_MAX_PORTS` (`65536`) for no request / `legacy`.
+///
+/// Every row is measured on both sides: the oracle's own printed value must equal the
+/// expected figure (so a wrong expectation cannot pass silently), and this runtime's
+/// `system_info(port_limit)` must equal the oracle's.
+#[test]
+fn the_port_limit_matrix_matches_the_oracle() {
+    const PROBE: &str = "io:format(\"~p\", [erlang:system_info(port_limit)]), halt(0).";
+
+    // `+Q <N>` (the `legacy` row is the emulator's default table).
+    for (value, expected) in [
+        ("1024", 1024i64),
+        ("1025", 2048),
+        ("2000", 2048),
+        ("3000", 4096),
+        ("4096", 4096),
+        ("4097", 8192),
+        ("67108863", 67_108_864),
+        ("67108864", 67_108_864),
+        ("134217726", 134_217_727),
+        ("134217727", 134_217_727),
+        ("legacy", 65_536),
+    ] {
+        let Some(oracle) = oracle_run(&["+Q", value], &[], PROBE) else {
+            eprintln!("SKIP the_port_limit_matrix_matches_the_oracle: no system `erl`");
+            return;
+        };
+        assert_eq!(oracle, expected.to_string(), "the oracle itself, +Q {value}");
+        let args = vec!["+Q".to_string(), value.to_string()];
+        let config = parse(&args).expect("+Q parses");
+        let rt = Runtime::new(config).expect("a runtime");
+        assert_eq!(
+            render(&system_info_value("port_limit", &rt).expect("port_limit")),
+            oracle,
+            "+Q {value} ({args:?})"
+        );
+    }
+
+    // No `+Q` at all.
+    let Some(oracle) = oracle_run(&[], &[], PROBE) else {
+        eprintln!("SKIP the_port_limit_matrix_matches_the_oracle: no system `erl`");
+        return;
+    };
+    assert_eq!(oracle, "65536", "the oracle itself, no +Q");
+    let rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+    assert_eq!(
+        render(&system_info_value("port_limit", &rt).expect("port_limit")),
+        oracle
+    );
+
+    // `ERL_MAX_PORTS` is clamped and then sized by exactly the same rule.
+    for (value, expected) in [
+        ("1", 1024i64),
+        ("100", 1024),
+        ("1024", 1024),
+        ("2000", 2048),
+        ("3000", 4096),
+        ("65536", 65_536),
+        ("999999999", 134_217_727),
+        ("bogus", 1024),
+    ] {
+        let Some(oracle) = oracle_run(&[], &[("ERL_MAX_PORTS", value)], PROBE) else {
+            eprintln!("SKIP the_port_limit_matrix_matches_the_oracle: no system `erl`");
+            return;
+        };
+        assert_eq!(
+            oracle,
+            expected.to_string(),
+            "the oracle itself, ERL_MAX_PORTS={value}"
+        );
+        let env = MapEnv(HashMap::from([(
+            "ERL_MAX_PORTS".to_string(),
+            value.to_string(),
+        )]));
+        let config = parse_with_env(&[], &env).expect("the environment parses");
+        let rt = Runtime::new(config).expect("a runtime");
+        assert_eq!(
+            render(&system_info_value("port_limit", &rt).expect("port_limit")),
+            oracle,
+            "ERL_MAX_PORTS={value}"
+        );
+    }
+}
+
+/// `{wordsize, W}` — the second tuple key the oracle answers, and a genuine fact about
+/// the host both runtimes share (`erl_bif_info.c:2521-2527`).
+#[test]
+fn the_wordsize_tuple_key_matches_the_oracle() {
+    for word in ["internal", "external"] {
+        let expr =
+            format!("io:format(\"~p\", [erlang:system_info({{wordsize,{word}}})]), halt(0).");
+        let Some(oracle) = oracle_run(&[], &[], &expr) else {
+            eprintln!("SKIP the_wordsize_tuple_key_matches_the_oracle: no system `erl`");
+            return;
+        };
+        let ours = tuple_key_value("wordsize", word).unwrap_or_else(|e| panic!("{word}: {e}"));
+        assert_eq!(render(&ours), oracle, "{{wordsize,{word}}}");
+    }
+
+    // An unknown word is the oracle's `badarg`, and so is an unknown tag — never an
+    // invented answer.
+    let expr = "io:format(\"~p\", [catch erlang:system_info({wordsize,foo})]), halt(0).";
+    if let Some(oracle) = oracle_run(&[], &[], expr) {
+        assert!(
+            oracle_rejected(&oracle),
+            "the oracle must reject {{wordsize,foo}}: {oracle}"
+        );
+    } else {
+        eprintln!("SKIP the_wordsize_tuple_key_matches_the_oracle: no system `erl`");
+    }
+    assert!(tuple_key_value("wordsize", "foo").is_err());
+    assert!(tuple_key_value("nonsense", "external").is_err());
 }
 
 #[test]

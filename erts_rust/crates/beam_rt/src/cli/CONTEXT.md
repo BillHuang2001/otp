@@ -76,7 +76,7 @@ A **second** family is read outside `initial_argv_massage` — by the emulator's
 
 | Variable | Oracle effect | `beam_rt` handling | Observable? |
 |---|---|---|---|
-| `ERL_MAX_PORTS` | `atoi`, then **clamped** into `[1024, 134217727]` (`erl_init.c:1341`); sizes the port table | `ErlEnv::max_ports` (the clamped `usize`) **and** injected into `extra_emulator_flags` as `+Q <clamped>` when the merged argv has no `+Q` | via `+Q` in `extra_emulator_flags`; the runtime's own `system_info` has no `port_limit` key yet (seam below) |
+| `ERL_MAX_PORTS` | `atoi`, then **clamped** into `[1024, 134217727]` (`erl_init.c:1341`); sizes the port table | `ErlEnv::max_ports` (the clamped `usize`) **and**, when the merged argv has no `+Q`, `RuntimeConfig::max_ports` (the same request field `+Q N` sets) **and** a preserved `+Q <clamped>` in `extra_emulator_flags` | yes — `system_info(port_limit)` (the power-of-two table sizing on top of the request is `../info`'s) |
 | `ERL_INETRC` | path the `inet` resolver reads at start-up | `ErlEnv::inetrc` (verbatim; `Some("")` when set-but-empty) | no — parsed-but-inert (M1 has no resolver) |
 | `ERL_CRASH_DUMP` | crash-dump file name (emulator default `erl_crash.dump`) | `ErlEnv::crash_dump` (verbatim) | no — parsed-but-inert (no crash-dump subsystem) |
 | `ERL_CRASH_DUMP_SECONDS` | `atoi` (`erl_crash_dump.c:451-457`): `0` = no dump + break now, `< 0` = dump until complete, `> 0` = alarm-bounded | `ErlEnv::crash_dump_seconds` (`i64`; a malformed value is `atoi`'s `0`) | no — parsed-but-inert |
@@ -85,13 +85,13 @@ A **second** family is read outside `initial_argv_massage` — by the emulator's
 | `ERL_FULLSWEEP_AFTER` | `atoi` (`erl_init.c:1334-1338`); the emulator stores it in a `Uint16` gen-GC interval | `ErlEnv::fullsweep_after` (`i64`, stored **untruncated** — no gen-GC consumer exists) | no — parsed-but-inert |
 
 **Numeric semantics** are the C's `atoi` (`vars::c_atoi`): leading whitespace, an optional sign, then digits, stopping at the first non-digit — so a non-numeric value is `0`, never a dropped variable and never a wrong value.
-`ERL_MAX_PORTS` is the one member with an effect, and it is reproduced through the channel `+Q` already uses:
+`ERL_MAX_PORTS` is the one member with an effect, and it is applied exactly as a `+Q` the merged argv does not already carry:
 
-* the clamp is what the emulator does to the value (`1`/`100`/`bogus` ⇒ 1024, `999999999` ⇒ 134217727); the `2000 ⇒ 2048` step the oracle **observes** in `system_info(port_limit)` is the port table's power-of-two sizing, an emulator concern this parser deliberately does not model;
-* a `+Q` **anywhere in the merged argv** — the command line or `ERL_AFLAGS`/`ERL_FLAGS`/`ERL_ZFLAGS` — overrides the variable outright (oracle: `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both observe 4096), so `ERL_MAX_PORTS` is injected **only** when no `+Q` is present;
+* the clamp is what the emulator does to the value (`1`/`100`/`bogus` ⇒ 1024, `999999999` ⇒ 134217727); the `2000 ⇒ 2048` step the oracle **observes** in `system_info(port_limit)` is the port table's power-of-two sizing (`erts_ptab_init_table`/`erts_ptab_max`, `erl_ptab.c:383-388`/`erl_ptab.h:266-270`), which `../info`'s `port_limit` applies to every request — this parser models the clamp only;
+* a `+Q` **anywhere in the merged argv** — the command line or `ERL_AFLAGS`/`ERL_FLAGS`/`ERL_ZFLAGS` — overrides the variable outright (oracle: `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both observe 4096), so `ERL_MAX_PORTS` is applied **only** when no `+Q` is present;
 * the asymmetry is the oracle's: `+Q` **validates** (and rejects out-of-range), `ERL_MAX_PORTS` **clamps silently**.
-`parse` stays pure — it never reads an environment, so it always yields `ErlEnv::default()`; only `parse_with_env` fills `env_vars` (and performs the `+Q` routing).
-**Seam (sibling-owned):** the value becomes *observable* only once `../info.rs` gains a `port_limit` `system_info` key; until then it is preserved in `extra_emulator_flags`, not applied.
+`parse` stays pure — it never reads an environment, so it always yields `ErlEnv::default()` and `max_ports: None`; only `parse_with_env` fills `env_vars` and performs the `+Q`/`ERL_MAX_PORTS` routing.
+`+Q N` itself sets `RuntimeConfig::max_ports` to the validated request (`+Q legacy` ⇒ `None`, the default table) and preserves the two tokens in `extra_emulator_flags` verbatim.
 
 ## Init arguments (`init:get_argument/1`) — the exact recording rule
 The parser reproduces the oracle's split between emulator/`init` switches and flags:
@@ -131,12 +131,12 @@ A runtime **halt** the program requests is neither: it exits with the requested 
 * `vars.rs` in-module tests: each variable alone and unset (`None`), the `atoi` primitive (`c_atoi`, incl. sign/whitespace/trailing garbage/saturation), the `ERL_MAX_PORTS` clamp (`1`/`100`/`2000`/`999999999`/`bogus`), a malformed `ERL_CRASH_DUMP_SECONDS` and a non-numeric `ERL_MAX_ETS_TABLES`, and the `+Q` token detection.
 * `../cli.rs` in-module tests: every switch, the init-argument recording rule, the `run` grammar, the trailing-dot `-eval`, and the four exit codes.
 * `../../tests/cli_flags.rs` (integration): the **built binary** honours the `ERL_*FLAGS` merge — each variable reaches `init:get_argument/1`, the full merge order, tokenization at the CLI boundary — with golden values pinned from the oracle, plus a direct cross-check against the system `erl` that **skips loudly** when `erl` is unavailable.
-* `../../tests/cli_env.rs` (integration): the second environment family through `beam_rt::cli::parse_with_env` + `MapEnv` (the clamped `+Q` injection, the `+Q`-override cases, `parse`'s purity, every field landing in `config.env_vars()`, and that none becomes an init argument), plus oracle probes of `system_info(port_limit)` that **skip loudly** when `erl` is unavailable.
+* `../../tests/cli_env.rs` (integration): the second environment family through `beam_rt::cli::parse_with_env` + `MapEnv` (the clamped `+Q` injection **and** the `config.max_ports` request it records, the `+Q`-override cases, `parse`'s purity, every field landing in `config.env_vars()`, and that none becomes an init argument), plus oracle probes of `system_info(port_limit)` that **skip loudly** when `erl` is unavailable. The full `+Q`/`ERL_MAX_PORTS` `port_limit` matrix against this runtime lives in `../../tests/system_info_oracle.rs`.
 
 ## Routing Table
 * `env.rs` → the `Env` trait, `ProcessEnv`/`MapEnv`, `tokenize`, `merge_argv`, `otp_flags_var` (the `ERL_*FLAGS` surface)
 * `flags.rs` → the validators for the emulator switches with no runtime-visible effect (`+Q`/`+P`/`+K`/`+sbt`/`-emu_flavor`/`-M*`+`+M*`) and their ground-truth constants
 * `vars.rs` → the `ErlEnv` model + `from_env` for the `ERL_*` variables **outside** the `*FLAGS` merge (`ERL_MAX_PORTS`/`ERL_INETRC`/`ERL_CRASH_DUMP`/`ERL_CRASH_DUMP_SECONDS`/`ERL_ROOTDIR`/`ERL_MAX_ETS_TABLES`/`ERL_FULLSWEEP_AFTER`)
-* `../cli.rs` → the switch parser (`parse`/`parse_with_env`, incl. the `ERL_MAX_PORTS` → `+Q` routing), the `USAGE` text, the `run` driver and the four `EXIT_*` codes (the parent of this directory)
+* `../cli.rs` → the switch parser (`parse`/`parse_with_env`, incl. the `+Q` / `ERL_MAX_PORTS` → `RuntimeConfig::max_ports` request), the `USAGE` text, the `run` driver and the four `EXIT_*` codes (the parent of this directory)
 * `../../tests/cli_flags.rs` → the A.6 integration suite at the executable boundary
 * `../../tests/cli_env.rs` → the A.6 integration suite for the non-`*FLAGS` environment variables

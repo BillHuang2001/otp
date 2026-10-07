@@ -20,11 +20,23 @@
 //! | `multi_scheduling` | atom, `enabled`/`disabled` |
 //! | `multi_scheduling_blockers` / `normal_multi_scheduling_blockers` | `[]` |
 //! | `thread_pool_size` | int (`1`) |
+//! | `context_reductions` | int (`4000`, the `CONTEXT_REDS` interface constant) |
 
 use beam_common::Result;
 
 use super::{logical_processors, schedulers_count, InfoValue};
 use crate::runtime::Runtime;
+
+/// `CONTEXT_REDS` (`erts/emulator/beam/erl_vm.h:47`: *"Swap process out after this
+/// number"*) — the emulator's reduction quantum.
+///
+/// `erlang:system_info(context_reductions)` is `make_small(CONTEXT_REDS)`
+/// (`erl_bif_info.c:3363-3364`), i.e. a **compile-time constant of the ERTS interface**,
+/// like `atom_limit`/`ets_limit` — not a measured property of a particular run. The
+/// oracle reports `4000` for every invocation (verified against OTP 29.1.1 / erts-17.1).
+/// This runtime's scheduler does not pre-empt on reductions yet (a documented M1 gap,
+/// `beam_rt/CONTEXT.md`), so the number is reported as the interface constant it is.
+const CONTEXT_REDS: i64 = 4000;
 
 /// The `system_info/1` value of a `schedulers`-family key, or `None` when `key` is not
 /// ours.
@@ -55,6 +67,7 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
             Some(Ok(InfoValue::List(Vec::new())))
         }
         "thread_pool_size" => Some(Ok(InfoValue::Int(1))),
+        "context_reductions" => Some(Ok(InfoValue::Int(CONTEXT_REDS))),
         _ => None,
     }
 }

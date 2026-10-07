@@ -35,8 +35,10 @@
 //! through [`RuntimeConfig::env_vars`](crate::config::RuntimeConfig::env_vars)) but
 //! **inert**: it changes no behaviour, and it is never silently dropped and never
 //! replaced by a wrong value. The one exception is `ERL_MAX_PORTS`, whose effect is
-//! routed into the channel the `+Q` switch already uses (see [`has_plus_q_switch`] and
-//! [`crate::cli::parse_with_env`]).
+//! routed into the request channel the `+Q` switch uses (see [`has_plus_q_switch`] and
+//! [`crate::cli::parse_with_env`]): the clamped value becomes the configuration's
+//! port-table request, and the power-of-two **table sizing** on top of it is applied by
+//! [`crate::info`]'s `port_limit`.
 
 use super::flags::{ERTS_MAX_PORTS, ERTS_MIN_PORTS};
 use super::Env;
@@ -76,7 +78,8 @@ pub struct ErlEnv {
     ///
     /// The clamp is all this models. The emulator additionally rounds the table to a power
     /// of two (so `ERL_MAX_PORTS=2000` observes a `port_limit` of 2048) — that is
-    /// port-table sizing, an emulator concern, not a property of the variable.
+    /// port-table sizing, an emulator concern applied where the value becomes observable
+    /// ([`crate::info`]'s `port_limit`), not a property of the variable.
     pub max_ports: Option<usize>,
     /// `ERL_CRASH_DUMP` — the crash-dump **file name** (the emulator's default is
     /// `erl_crash.dump`). **Inert in M1** (no crash-dump subsystem).
@@ -134,6 +137,10 @@ pub fn from_env(env: &dyn Env) -> ErlEnv {
 /// `ERL_MAX_PORTS` of `1`/`100` observes a `port_limit` of 1024, `2000` observes 2048,
 /// `999999999` observes 134217727 and a non-numeric value (`bogus`) observes the 1024
 /// floor — while unset observes the 65536 default.
+///
+/// The returned value is the **clamped request**; the `2000 ⇒ 2048` step is the
+/// port-table power-of-two sizing, which [`crate::info`]'s `port_limit` applies to every
+/// request regardless of whether it came from here or from `+Q`.
 fn parse_max_ports(env: &dyn Env) -> Option<usize> {
     parse_atoi_var(env, MAX_PORTS_VAR)
         .map(|value| value.clamp(ERTS_MIN_PORTS, ERTS_MAX_PORTS) as usize)
@@ -240,7 +247,8 @@ mod tests {
     }
 
     /// The `ERL_MAX_PORTS` clamp, pinned to the oracle's observed `port_limit` for each
-    /// value (the port-table power-of-two rounding is deliberately *not* modelled):
+    /// value (the port-table power-of-two rounding is applied downstream, by
+    /// [`crate::info`]'s `port_limit`):
     ///
     /// ```text
     /// ERL_MAX_PORTS=1         erl … system_info(port_limit) → 1024

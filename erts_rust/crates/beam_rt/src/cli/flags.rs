@@ -57,14 +57,22 @@ pub(super) fn is_allocator_switch(argument: &str) -> bool {
     argument.starts_with("+M")
 }
 
-/// `+Q N` — the maximum number of ports: `legacy`, or an integer in
-/// `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]` (`erl_init.c:1888-1905`).
-pub(super) fn parse_max_ports(switch: &str, value: &str) -> Result<()> {
+/// `+Q N` — the maximum number of ports: `legacy` (`None`, the emulator's default
+/// table), or an integer in `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]` (`erl_init.c:1888-1905`).
+///
+/// The returned number is the **requested** table size, not the one the oracle reports
+/// through `system_info(port_limit)`: the emulator additionally rounds the table up to a
+/// power of two (`+Q 2000` observes 2048, `+Q 134217726` observes 134217727). That
+/// sizing step is applied by [`crate::info`]'s `port_limit`, where the request becomes
+/// observable — exactly as it is for `ERL_MAX_PORTS` (see [`crate::cli::vars`]).
+pub(super) fn parse_max_ports(switch: &str, value: &str) -> Result<Option<usize>> {
     if value == "legacy" {
-        return Ok(());
+        return Ok(None);
     }
     match value.parse::<i64>() {
-        Ok(number) if (ERTS_MIN_PORTS..=ERTS_MAX_PORTS).contains(&number) => Ok(()),
+        Ok(number) if (ERTS_MIN_PORTS..=ERTS_MAX_PORTS).contains(&number) => {
+            Ok(Some(number as usize))
+        }
         _ => Err(error::bad_switch_value(switch, value)),
     }
 }
@@ -558,20 +566,21 @@ mod tests {
         list.iter().map(|argument| argument.to_string()).collect()
     }
 
-    /// `+Q N`: `legacy`, or an integer in `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]`
-    /// (`erl_init.c:1888-1905`).
+    /// `+Q N`: `legacy` (the default table, `None`), or an integer in
+    /// `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]` (`erl_init.c:1888-1905`).
     ///
     /// Oracle (OTP 29.1.1 / erts-17.1):
     /// `erl +Q 1024|134217727|legacy -noshell -eval 'halt(0).'` exits 0;
     /// `+Q 1000|0|134217728|abc` exits 1 (`bad number of ports <v>` + usage).
     #[test]
     fn max_ports_accepts_legacy_and_the_oracle_range() {
-        for value in ["1024", "134217727", "legacy"] {
-            assert!(
-                parse_max_ports("+Q", value).is_ok(),
-                "{value:?} must be accepted"
-            );
-        }
+        assert_eq!(parse_max_ports("+Q", "1024").expect("valid"), Some(1024));
+        assert_eq!(
+            parse_max_ports("+Q", "134217727").expect("valid"),
+            Some(134_217_727)
+        );
+        // `legacy` keeps the emulator's default table — no request at all.
+        assert_eq!(parse_max_ports("+Q", "legacy").expect("valid"), None);
         for value in [
             "1000",
             "0",
