@@ -280,11 +280,13 @@ impl<'a> Encoder<'a> {
             return self.encode_map(keys, values);
         }
         // A > 32-key map is a *hash map* (HAMT), which `flatmap_parts` rejects. Its pairs
-        // come back in the map's **stored** (HAMT traversal) order; emit them through the
-        // same MAP_EXT emitter. This probe matches only a genuine map, so it cannot shadow
-        // any term the flat path already handled (see §"Map key encode order").
+        // come back in the map's **stored** (ascending HAMT node-slot pre-order) order; the
+        // C encoder walks that same tree through a LIFO work stack, i.e. in the *reverse*
+        // order, so `encode_hashmap_pairs` reverses before emitting. This probe matches only
+        // a genuine map, so it cannot shadow any term the flat path already handled (see
+        // §"Map key encode order").
         if let Ok(pairs) = map_pairs_storage_order(term) {
-            return self.encode_map_pairs(&pairs);
+            return self.encode_hashmap_pairs(&pairs);
         }
         if let Ok((node, number, serial, creation)) = external_pid_parts(term) {
             return self.encode_pid(node, number, serial, creation);
@@ -553,8 +555,7 @@ impl<'a> Encoder<'a> {
 
     /// Encodes a map as `MAP_EXT` from its `(keys, values)` storage slices.
     ///
-    /// A thin wrapper over [`encode_map_pairs`](Self::encode_map_pairs) for the flat-map
-    /// path, whose pairs arrive as two parallel slices.
+    /// The flat-map path's emitter, whose pairs arrive as two parallel slices.
     ///
     /// The pair order is emitted **as stored** (interleaved `K1,V1,…,Kn,Vn`): the codec
     /// preserves the map's order and deliberately does **not** sort or dedupe it. Order is
@@ -574,16 +575,25 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes a map as `MAP_EXT` from its `(key, value)` pairs, **in the given order**.
+    /// Encodes a **hash map** (> 32 pairs, a HAMT) as `MAP_EXT`, in the C encoder's wire
+    /// order.
     ///
-    /// Both the flat-map path ([`encode_map`](Self::encode_map)) and the hash-map path
-    /// (the [`map_pairs_storage_order`] probe in [`encode`](Self::encode)) funnel through
-    /// this emitter, so a flat and a hash map share one wire implementation. The pairs are
-    /// emitted verbatim (interleaved `K1,V1,…,Kn,Vn`) and never sorted, deduped or
-    /// reordered; the count must fit the `arityval` 24-bit field, else `SystemLimit`.
-    fn encode_map_pairs(&mut self, pairs: &[(Eterm, Eterm)]) -> Result<()> {
+    /// [`map_pairs_storage_order`] returns the HAMT's pairs in **ascending node-slot
+    /// pre-order** (its slot walk iterates slots `0..sz`, descending depth-first at each
+    /// slot). The C encoder's non-`deterministic` HAMT branch (`external.c:3745-3823`)
+    /// instead pushes each node's slots onto a **LIFO** work stack
+    /// (`WSTACK_FAST_PUSH(ENC_HASHMAP_NODE)`/`WSTACK_FAST_PUSH(*ptr++)`) and pops them
+    /// (`WSTACK_POP` is a pre-decrement pop), so it visits slots in **descending** index
+    /// order — the exact reverse of the ascending pre-order. The collision-node tuple takes
+    /// the same path (`external.c:3415-3427`), so a single reversal of the flattened pair
+    /// list reproduces the oracle's bytes.
+    ///
+    /// A flat map is a single leaf run and is **not** reversed: the C emits it in stored
+    /// order (`external.c:3391-3401`/`3745-3769`), which [`encode_map`](Self::encode_map)
+    /// preserves. The pair count must fit the `arityval` 24-bit field, else `SystemLimit`.
+    fn encode_hashmap_pairs(&mut self, pairs: &[(Eterm, Eterm)]) -> Result<()> {
         self.encode_map_header(pairs.len())?;
-        for (key, value) in pairs {
+        for (key, value) in pairs.iter().rev() {
             self.encode(*key)?;
             self.encode(*value)?;
         }
