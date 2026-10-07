@@ -427,6 +427,24 @@ pub(crate) fn group() -> Vec<Case> {
             "exception error badarg",
             1,
         ),
+        eval(
+            "records/get_definition_unloaded_module",
+            "records:get_definition/2 raises badarg for an atom naming a module the node has not loaded",
+            introspection,
+            val,
+            "records:get_definition(no_such_module_is_loaded, r)",
+            "exception error badarg",
+            1,
+        ),
+        eval(
+            "records/get_definition_loaded_module_unknown_record",
+            "records:get_definition/2 raises badarg for a loaded module (lists) that declares no such native record",
+            introspection,
+            val,
+            "records:get_definition(lists, no_such_record_declared)",
+            "exception error badarg",
+            1,
+        ),
         // --- A.2/A.1/A.7: the native-record opcodes, executed by a compiled module --------
         module_case(
             "records/module_native_record_get_field",
