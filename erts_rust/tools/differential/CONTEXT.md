@@ -123,26 +123,24 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - **`gate.sh` layers the CI exit codes on the binary.** The binary keeps its `0/1/2` contract (and lenient `run` stays `0` for an unsupported case); the script reads the report's top-level `summary` and maps mismatch→`1`, unsupported/skipped→`3`. See the *gate.sh* section.
 
 ## Known Issues / Notes for Agents
-- **The Rust side is a partial runtime; today's gate is 0 mismatches** (541-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **541 total · 536 agree · 0 mismatch · 5 unsupported · 0 skipped** (`gate.sh` → exit `3`).
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (600-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
+  - Current rollup (**stable across repeated runs**): **600 total · 599 agree · 0 mismatch · 1 unsupported · 0 skipped** (`gate.sh` → exit `3`).
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
-| A.1 language semantics | 154 | 153 | 0 | 1 | 0 |
-| A.2 .beam binary/ETF bytes | 157 | 154 | 0 | 3 | 0 |
+| A.1 language semantics | 154 | 154 | 0 | 0 | 0 |
+| A.2 .beam binary/ETF bytes | 159 | 159 | 0 | 0 | 0 |
 | A.3 NIF C ABI | 26 | 26 | 0 | 0 | 0 |
-| A.4 driver C ABI / port | 49 | 49 | 0 | 0 | 0 |
-| A.5 distribution wire protocol | 62 | 61 | 0 | 1 | 0 |
+| A.4 driver C ABI / port | 55 | 55 | 0 | 0 | 0 |
+| A.5 distribution wire protocol | 64 | 63 | 0 | 1 | 0 |
 | A.6 CLI flags and configuration | 16 | 16 | 0 | 0 | 0 |
-| A.7 OTP application contracts | 195 | 193 | 0 | 2 | 0 |
+| A.7 OTP application contracts | 246 | 246 | 0 | 0 | 0 |
 | A.8 introspection / system_info | 9 | 9 | 0 | 0 | 0 |
 | A.9 build and bootstrapping | 52 | 52 | 0 | 0 | 0 |
 
-- **The 5 `unsupported` cases (all honest capability gaps, none a mismatch).** Their goldens are the oracle's own output, so each flips to `agree` automatically once the gap closes:
-  - **external-term ETF encode:** `etf/term_to_binary_new_pid_ext` and `etf/term_to_binary_v4_port_ext` (`beam_rt: unsupported: external_term`) — a pid/port cannot be encoded; the cases assert the stable tag-byte shape (`binary:at(term_to_binary(X),1)` ⇒ `88` / `120`).
-  - **code-server record table:** `records/get_definition_unknown_record` and `records/module_get_definition_declared_record` (`records:get_definition/2`; `beam_rt: unsupported: bif`) — the record-definition-table lookup is unimplemented.
-  - **`local_fun`:** `wire/new_fun_ext_encode` (`beam_rt: unsupported: local_fun`) — a lambda cannot be encoded as `NEW_FUN_EXT`.
+- **The 1 `unsupported` case (an honest capability gap, not a mismatch).** Its golden is the oracle's own output, so it flips to `agree` automatically once the gap closes:
+  - **`local_fun`:** `wire/new_fun_ext_encode` (`beam_rt: unsupported: local_fun`) — a lambda is an evaluator closure that the `beam_rt` `-eval` path cannot give a faithful `NEW_FUN_EXT` image. `beam_codec` has `Encoder::with_fun_identity`; the remaining blocker is runtime wiring (`beam_rt`).
   The NIF cases also degrade to `skipped` (not a failure) when `cc`/`erl_nif.h` is absent, exactly like the `erlc`-less module cases.
 - **`--strict`** exits `1` while any `unsupported`/`skipped`/`mismatch` remains; `tests/cli.rs` pins that a lenient (`run`) invocation on an unsupported case stays exit `0`.
 - **A probe expression must not bind `V`, `C`, or `R`.** The probe wrapper binds `of V -> … catch C:R -> …`, so a user expression that also binds `V`/`C`/`R` makes the *oracle* fail to compile the wrapped expression (`unsafe_var`, empty stdout, exit 1) — a guaranteed false mismatch. Use other variable names (e.g. `Reason`, `Msg`).
