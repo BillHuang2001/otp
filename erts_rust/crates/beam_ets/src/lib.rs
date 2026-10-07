@@ -1,4 +1,4 @@
-#![doc = "ETS tables (set/ordered_set/hash family) with B-tree and CHAMP interiors."]
+#![doc = "ETS tables: `set` over CHAMP or chained-bucket hash indexes, `ordered_set` over a B+-tree."]
 
 //! ETS tables and their interior data structures.
 //!
@@ -7,6 +7,12 @@
 //! Part I §A.1 (term/key/value semantics) and §A.8 (`ets:info/1` introspection),
 //! plus the Stage-3 row of Part II §H: `set`, `ordered_set`, `bag` and
 //! `duplicate_bag` over hash-indexed and ordered interiors.
+//!
+//! The interiors are: a **CHAMP** open-addressing index for `set`
+//! ([`ChampInterior`], the default — a compressed bitmap HAMT over the key hash),
+//! a **chained-bucket** hash index ([`HashInterior`]) for `bag`/`duplicate_bag`
+//! (and, optionally, `set` via [`SetInterior::Chained`]), and a **K-ary B+-tree**
+//! ([`OrderedSetInterior`]) for `ordered_set`.
 //!
 //! Per workspace `CONTEXT.md` §2 the interior shapes (bucket layout, hash-map
 //! thresholds, tree fan-out, load factors) are *not* externally pinned; only the
@@ -28,6 +34,7 @@
 //! also documents the honest M1 gaps (a `select`/deep-copy subset, no concurrency
 //! or owner enforcement) under *Known Issues*.
 
+pub mod champ_interior;
 pub mod error;
 pub mod hash_interior;
 pub mod info;
@@ -38,8 +45,14 @@ pub mod select;
 pub mod store;
 pub mod table;
 
+#[cfg(test)]
+mod interior_bench;
+#[cfg(test)]
+mod interior_parity;
+
 // Flat re-exports of every public item in this crate. (`crate::error` exposes
 // only `pub(crate)` helpers, so it is intentionally not re-exported here.)
+pub use crate::champ_interior::*;
 pub use crate::hash_interior::*;
 pub use crate::info::*;
 pub use crate::key::*;
@@ -51,6 +64,7 @@ pub use crate::table::*;
 
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
+    pub use crate::champ_interior::*;
     pub use crate::hash_interior::*;
     pub use crate::info::*;
     pub use crate::key::*;

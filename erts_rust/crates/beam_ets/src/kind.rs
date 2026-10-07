@@ -66,6 +66,40 @@ impl TableKind {
     }
 }
 
+/// The index shape backing a **`set`** table.
+///
+/// The interior shape is not externally pinned (workspace `CONTEXT.md` §2): this
+/// is the crate-internal selection knob for the one kind that has two competing
+/// interiors ([`crate::HashInterior`], the chained index shared with
+/// `bag`/`duplicate_bag`, and [`crate::ChampInterior`], the open-addressing
+/// CHAMP). The multi-object kinds and `ordered_set` ignore it — they always use
+/// the chained index and the B+-tree respectively.
+///
+/// Constructor: [`Table::with_set_interior`](crate::Table::with_set_interior).
+/// The [`Default`] is the measured winner (see `docs/interior_selection.md` and
+/// the crate benchmark `src/interior_bench.rs`); `Test Strategy` in the crate
+/// `CONTEXT.md` pins it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SetInterior {
+    /// The chained-bucket hash index (`HashInterior`): a bucket array of
+    /// `(key, Vec<object>)` entries, doubling past a 3/4 load factor.
+    Chained,
+    /// The CHAMP open-addressing index (`ChampInterior`): compressed bitmap
+    /// nodes over the key hash, one inline slot per key.
+    #[default]
+    Champ,
+}
+
+impl SetInterior {
+    /// A short name for diagnostics and docs (`"chained"` / `"champ"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SetInterior::Chained => "chained",
+            SetInterior::Champ => "champ",
+        }
+    }
+}
+
 /// The table access mode — the `protection` option of `ets:new/2`.
 ///
 /// The default is [`Protected`](Access::Protected), matching `ets:new/2`.

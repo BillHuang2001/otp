@@ -22,7 +22,7 @@ use beam_term::prelude::*;
 use crate::error::badarg;
 use crate::info::TableInfo;
 use crate::key::{key_of, object_elements};
-use crate::kind::{can_read, can_write, Access, TableKind, TableOptions};
+use crate::kind::{can_read, can_write, Access, SetInterior, TableKind, TableOptions};
 use crate::select::SelectPredicate;
 use crate::store::TermStore;
 
@@ -111,6 +111,10 @@ pub struct Table {
     heir: Option<Heir>,
     /// The table-owned term storage (the copy boundary).
     store: TermStore,
+    /// Which `set` index this table uses (ignored by the other kinds). Recorded so
+    /// [`delete_all_objects`](Table::delete_all_objects) rebuilds the *same*
+    /// interior the table started with.
+    set_interior: SetInterior,
     /// The interior index dispatching the table ops.
     interior: Box<dyn Interior>,
     /// Whether the table is fixed for safe traversal
@@ -127,6 +131,10 @@ pub struct Table {
 impl Table {
     /// A new table with the given identifier and options, allocating through the
     /// registered ETS allocator.
+    ///
+    /// A `set` table uses the crate's default `set` interior
+    /// ([`SetInterior::default`]); use [`Table::with_set_interior`] to select the
+    /// other one.
     pub fn new(id: TableId, opts: TableOptions) -> Result<Table> {
         Table::build(id, opts, TermStore::with_default_allocator())
     }
@@ -136,22 +144,52 @@ impl Table {
         Table::build(id, opts, TermStore::new(alloc))
     }
 
+    /// A new table whose **`set`** interior is chosen explicitly.
+    ///
+    /// The selection only affects [`TableKind::Set`]; the other kinds keep their
+    /// own index. It exists so the two `set` interiors can be measured and
+    /// cross-checked against each other; production callers use [`Table::new`],
+    /// which selects [`SetInterior::default`].
+    pub fn with_set_interior(
+        id: TableId,
+        opts: TableOptions,
+        interior: SetInterior,
+    ) -> Result<Table> {
+        Table::build_with(id, opts, TermStore::with_default_allocator(), interior)
+    }
+
     /// The shared constructor: assemble the metadata, the store and the interior
-    /// for `opts`.
+    /// for `opts`, with the default `set` interior.
     fn build(id: TableId, opts: TableOptions, store: TermStore) -> Result<Table> {
-        let interior = build_interior(opts.kind());
+        Table::build_with(id, opts, store, SetInterior::default())
+    }
+
+    /// The shared constructor with an explicit `set`-interior selection.
+    fn build_with(
+        id: TableId,
+        opts: TableOptions,
+        store: TermStore,
+        set_interior: SetInterior,
+    ) -> Result<Table> {
+        let interior = build_interior(opts.kind(), set_interior);
         Ok(Table {
             id,
             opts,
             owner: None,
             heir: None,
             store,
+            set_interior,
             interior,
             fixed: false,
             deferred_frees: Vec::new(),
         })
     }
 
+    /// The `set` interior this table was built with (ignored by the other kinds,
+    /// which have a single index each).
+    pub fn set_interior(&self) -> SetInterior {
+        self.set_interior
+    }
     /// The table identifier.
     pub fn id(&self) -> TableId {
         self.id
@@ -408,14 +446,15 @@ impl Table {
             // live and is never handed out again) and the index is rebuilt empty.
             let objects: Vec<Eterm> = self.interior.iter_objects().collect();
             self.deferred_frees.extend(objects);
-            self.interior = build_interior(self.opts.kind());
+            self.interior = build_interior(self.opts.kind(), self.set_interior);
             return;
         }
         // Not fixed: `reset` releases every block the store owns (so the per-object
         // runs of the deleted objects go with them) and leaves the store immediately
-        // usable again; a fresh interior of the same kind is then empty.
+        // usable again; a fresh interior of the same kind and `set` shape is then
+        // empty.
         self.store.reset();
-        self.interior = build_interior(self.opts.kind());
+        self.interior = build_interior(self.opts.kind(), self.set_interior);
     }
 
     /// `ets:safe_fixtable/2`: set (or clear) the table's *fix* flag.

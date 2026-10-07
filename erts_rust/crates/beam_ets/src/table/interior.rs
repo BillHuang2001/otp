@@ -9,10 +9,11 @@
 use beam_common::Result;
 use beam_term::prelude::*;
 
+use crate::champ_interior::ChampInterior;
 use crate::error::badarg;
 use crate::hash_interior::HashInterior;
 use crate::key::key_of;
-use crate::kind::TableKind;
+use crate::kind::{SetInterior, TableKind};
 use crate::ordered_interior::OrderedSetInterior;
 
 use super::update::{add_counters, object_arity, read_counter, replace_elements};
@@ -241,13 +242,16 @@ pub(crate) trait Interior: Send + Sync {
     }
 }
 
-/// Build the interior matching `kind`: the hash index for `set`/`bag`/
-/// `duplicate_bag`, the key-sorted index for `ordered_set`.
-pub(super) fn build_interior(kind: TableKind) -> Box<dyn Interior> {
+/// Build the interior matching `kind`: the CHAMP or chained hash index for
+/// `set` (per `set_interior`), the chained hash index for `bag`/`duplicate_bag`,
+/// the key-sorted B+-tree for `ordered_set`.
+pub(super) fn build_interior(kind: TableKind, set_interior: SetInterior) -> Box<dyn Interior> {
     match kind {
-        TableKind::Set | TableKind::Bag | TableKind::DuplicateBag => {
-            Box::new(HashInterior::new(kind))
-        }
+        TableKind::Set => match set_interior {
+            SetInterior::Champ => Box::new(ChampInterior::new()),
+            SetInterior::Chained => Box::new(HashInterior::new(kind)),
+        },
+        TableKind::Bag | TableKind::DuplicateBag => Box::new(HashInterior::new(kind)),
         TableKind::OrderedSet => Box::new(OrderedSetInterior::new()),
     }
 }

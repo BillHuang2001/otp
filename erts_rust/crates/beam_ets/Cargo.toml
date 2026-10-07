@@ -3,7 +3,7 @@ name = "beam_ets"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ETS tables (set/ordered_set/hash family) with B-tree and CHAMP interiors."
+description = "ETS tables: set over CHAMP or chained-bucket hash indexes, ordered_set over a B+-tree."
 
 [dependencies]
 beam_common = { path = "../beam_common" }
