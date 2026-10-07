@@ -2,7 +2,8 @@
 //! `integer_to_list/1,2`, `list_to_integer/1,2`, `float_to_list/1,2`,
 //! `list_to_float/1`, `atom_to_list/1`, `list_to_atom/1`,
 //! `list_to_existing_atom/1`, `min/2`, `max/2`, `round/1`, `trunc/1`, `float/1`,
-//! `ceil/1`, `floor/1`, `make_tuple/2,3`, `append_element/2`, `raise/3`, `node/0`.
+//! `ceil/1`, `floor/1`, `make_tuple/2,3`, `append_element/2`, `raise/3`,
+//! `node/0,1`.
 //!
 //! Ground truth (read-only): `../../erts/emulator/beam/bif.tab` (the roster),
 //! `bif.c` (`integer_to_list`, `float_to_list`, `list_to_float`, `make_tuple`,
@@ -44,7 +45,10 @@
 //!   `{a,x,c}` (the third argument is a list of `{Index, Value}` 2-tuples, *not*
 //!   a list of values); an index outside `1..=Arity` ⇒ `badarg`;
 //!   `append_element({1,2}, 3)` ⇒ `{1,2,3}`.
-//! * `node()` ⇒ `nonode@nohost`.
+//! * `node()` ⇒ `nonode@nohost`, and `node(X)` ⇒ `nonode@nohost` for a **local**
+//!   pid/port/reference. `node(X)` of an **external** (another node's)
+//!   pid/port/reference returns the node atom embedded in the term; any other
+//!   argument (`42`, `{a}`, `foo`, `1.0`, `<<>>`) is `badarg`.
 //!
 //! # Documented Milestone-1 gaps (never a silently wrong result)
 //!
@@ -72,9 +76,10 @@
 
 use core::cmp::Ordering;
 
-use beam_common::{ExceptionClass, Result};
+use beam_codec::term as codec_term;
+use beam_common::{BeamError, ExceptionClass, Result};
 use beam_term::compare::cmp_arith;
-use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, make_atom, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access;
 use crate::arith;
@@ -447,7 +452,7 @@ fn append_element_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 // ---------------------------------------------------------------------------
-// raise/3 and node/0
+// raise/3, node/0 and node/1
 // ---------------------------------------------------------------------------
 
 /// The exception class of `raise/3`'s first argument, which must be the atom
@@ -532,15 +537,98 @@ fn raise_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     })
 }
 
-/// `node()` — the atom `nonode@nohost` (Milestone-1 never starts distribution).
+/// The atom naming the **local** node — the node every internal pid/port/ref
+/// belongs to.
+///
+/// Ground truth `erl_node_container_utils.h:74-76,93`: an internal node container
+/// has an *implicit* reference to this node, so `node_container_node_name(x)` is
+/// `internal_node_name(x) = erts_this_node->sysname`.
+///
+/// Resolved through [`BifContext::local_node`] (the optional
+/// [`LocalNode`](crate::context::LocalNode) seam), which falls back to the
+/// Milestone-1 runtime's fixed, non-distributed identity
+/// `(nonode@nohost, creation 0)` when no hook is installed. `node/0` and the local
+/// arm of `node/1` share this helper so the two can never disagree.
 ///
 /// # Errors
 ///
-/// [`BeamError::TermNotFound`](beam_common::BeamError::TermNotFound) when the
-/// runtime's atom table does not hold `nonode@nohost` (it is a standard
-/// `atom.names` entry, so this only signals an unseeded table).
+/// [`BeamError::TermNotFound`](beam_common::BeamError::TermNotFound) when no hook
+/// is installed and the atom table does not hold `nonode@nohost` (an unseeded
+/// table), or when an installed hook reports the identity unknown. Every node of
+/// the oracle is nameable, so this can only mean the Rust runtime is not fully
+/// wired; fabricating an atom here would be a wrong result.
+fn local_node_atom(ctx: &mut BifContext<'_>) -> Result<Eterm> {
+    match ctx.local_node() {
+        Some((node, _creation)) => Ok(make_atom(node)),
+        None => Err(BeamError::TermNotFound),
+    }
+}
+
+/// `node()` — the local node's name atom (`dist.c:6253-6256`:
+/// `BIF_RET(erts_this_dist_entry->sysname)`).
+///
+/// Milestone-1 never starts distribution, so the identity is the fixed
+/// `nonode@nohost` (through the [`LocalNode`](crate::context::LocalNode) seam; see
+/// [`local_node_atom`]).
+///
+/// # Errors
+///
+/// As [`local_node_atom`].
 fn node_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    ctx.atom("nonode@nohost")
+    local_node_atom(ctx)
+}
+
+/// `node(X)` — the node atom of the pid, port or reference `X`
+/// (`dist.c:6242-6248`):
+///
+/// ```c
+/// if (is_not_node_container(BIF_ARG_1)) BIF_ERROR(BIF_P, BADARG);
+/// BIF_RET(node_container_node_name(BIF_ARG_1));
+/// ```
+///
+/// `is_node_container(x) = is_internal(x) || is_external(x)` (`is_internal` =
+/// internal pid/port/ref, `erl_node_container_utils.h:86-91`). An **internal**
+/// container belongs to the local node ([`local_node_atom`]); for an **external**
+/// one `node_container_node_name(x)` is `external_node_name(x)` — the node atom
+/// stored in the term's frozen `[header, node, next, data]` block
+/// (`erl_node_container_utils.h:74-76,94`), which
+/// `beam_term::thing::external_{pid,port,ref}_parts` reads back and the safe
+/// `beam_codec::term` wrappers expose.
+///
+/// Pinned to the oracle (OTP 29.1.1 / erts-17.1): `node(self())`,
+/// `node(list_to_pid("<0.1.0>"))`, `node(make_ref())` and a port from
+/// `open_port` are all `nonode@nohost`; `binary_to_term` of a `NEW_PID_EXT`
+/// (`88`)/`NEW_PORT_EXT` (`89`)/`NEWER_REFERENCE_EXT` (`90`) naming `remote@host`
+/// is `remote@host`; `42`, `{a}`, `foo`, `1.0` and `<<>>` are `badarg`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `X` is not a pid, port or reference; otherwise as
+/// [`local_node_atom`].
+fn node_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let term = args[0];
+    if access::is_internal_pid(term)
+        || access::is_internal_port(term)
+        || access::is_internal_ref(term)
+    {
+        return local_node_atom(ctx);
+    }
+    // The `external_*_parts` readers are the safe inverses of the writers in
+    // `beam_term::thing`; the node slot (`word 1`) holds the sysname atom term
+    // itself (the documented M1 substitution for the C's node-registry pointer).
+    if access::is_external_pid(term) {
+        let (node, _, _, _) = codec_term::external_pid_parts(term)?;
+        return Ok(node);
+    }
+    if access::is_external_port(term) {
+        let (node, _, _) = codec_term::external_port_parts(term)?;
+        return Ok(node);
+    }
+    if access::is_external_ref(term) {
+        let (node, _, _) = codec_term::external_ref_parts(term)?;
+        return Ok(node);
+    }
+    Err(badarg())
 }
 
 /// Registers the pure `erlang` conversion/numeric BIFs.
@@ -567,6 +655,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "append_element", 2, append_element_2);
     reg.register("erlang", "raise", 3, raise_3);
     reg.register("erlang", "node", 0, node_0);
+    reg.register("erlang", "node", 1, node_1);
 }
 
 #[cfg(test)]
@@ -1446,12 +1535,13 @@ mod tests {
             ("append_element", 2),
             ("raise", 3),
             ("node", 0),
+            ("node", 1),
         ] {
             assert!(
                 reg.contains("erlang", name, arity),
                 "missing erlang:{name}/{arity}"
             );
         }
-        assert_eq!(reg.len(), 22);
+        assert_eq!(reg.len(), 23);
     }
 }
