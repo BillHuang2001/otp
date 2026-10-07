@@ -129,6 +129,10 @@ liveness maps.
     `beam_rt` calls after a send made **outside** a slice.
   - `run_ready<R>(&mut self, table, runner, max_slices: Option<u64>) -> Result<u64>` — run until the
     ready queue is empty or `max_slices` slices ran.
+- **Reduction accounting is delegated to the runner.** `DEFAULT_REDUCTIONS_PER_SLICE` is handed to
+  `ProcessRunner::run` as its `budget` argument; the scheduler never reads or resets
+  `Process::reductions` (`process.rs:367-379` — the accessors are exercised only by tests). The runner
+  owns the reds count and decides when to return `RunOutcome::Yield`.
 - **Shared slice helpers (the SMP reuse seam).** `pub(crate) run_one<R, F>(pid, table, runner,
   reductions, enqueue: F)` and `pub(crate) drain_woken_into<F>(table, enqueue: F)` hold the slice
   semantics (`run_slice`/`resume_woken` delegate to them). The SMP pool calls the same helpers with a
