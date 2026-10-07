@@ -458,9 +458,11 @@ fn the_enif_table_is_populated_for_every_process_family_slot() {
     assert!(table.enif_get_local_pid.is_some());
     assert!(table.enif_get_local_port.is_some());
     assert!(table.enif_make_new_binary.is_some());
-    // The C-variadic slots the fixture must avoid stay `None` (stable Rust cannot define them).
-    assert!(table.enif_make_tuple.is_none());
-    assert!(table.enif_make_list.is_none());
+    // The C-variadic slots are populated only when the C shim linked (that is the whole point of
+    // the `beam_abi_variadic_shim` cfg — see `src/nif/enif/variadic.rs`); the fixture avoids them
+    // either way, since stable Rust cannot define a C-variadic `fn` itself.
+    assert_eq!(table.enif_make_tuple.is_some(), cfg!(beam_abi_variadic_shim));
+    assert_eq!(table.enif_make_list.is_some(), cfg!(beam_abi_variadic_shim));
 }
 
 // ---------------------------------------------------------------------------------------------
