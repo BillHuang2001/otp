@@ -76,6 +76,7 @@ MODULES =  \
 	beam_ssa_lint \
 	beam_ssa_loop_opt \
 	beam_ssa_opt \
+	beam_ssa_opt_budget \
 	beam_ssa_pp \
 	beam_ssa_pre_codegen \
 	beam_ssa_recv \

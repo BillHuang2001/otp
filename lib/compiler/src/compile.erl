@@ -1315,6 +1315,22 @@ expand_opt(no_module_opt=O, Os) ->
     [O,no_recv_opt | Os];
 expand_opt({check_ssa,Tag}, Os) ->
     [check_ssa, Tag | Os];
+expand_opt(ssa_opt_budget, Os) ->
+    %% Opt-in cumulative time budget for the SSA optimization phases
+    %% (see beam_ssa_opt_budget). Default off.
+    [ssa_opt_budget|Os];
+expand_opt({ssa_opt_budget,_}=O, Os) ->
+    [O|Os];
+expand_opt(ssa_opt_watchdog, Os) ->
+    %% Opt-in per-pass time bound for the SSA optimization passes
+    %% (see beam_ssa_opt_budget). Default off.
+    [ssa_opt_watchdog|Os];
+expand_opt({ssa_opt_watchdog,_}=O, Os) ->
+    [O|Os];
+expand_opt(ssa_opt_gates, Os) ->
+    %% Opt-in eligibility gates and statistics for the SSA optimization
+    %% passes (see beam_ssa_opt_budget). Default off.
+    [ssa_opt_gates|Os];
 expand_opt(time, Os) ->
     [{time,fun print_pass_times/2}|Os];
 expand_opt(O, Os) -> [O|Os].
@@ -3258,7 +3274,15 @@ options() ->
     %% List them explicitly so that they show up in --help.
     help([{iff,loop_opt,  {ssa_opt_loop_opt,fun(_) -> ok end}},
           {iff,fusion_opt,{ssa_opt_fus,     fun(_) -> ok end}},
-          {iff,fbip_opt,  {ssa_opt_fbip,    fun(_) -> ok end}}]).
+          {iff,fbip_opt,  {ssa_opt_fbip,    fun(_) -> ok end}}]),
+    %% Likewise for the opt-in SSA pass budget/watchdog and eligibility
+    %% gates (see beam_ssa_opt_budget).
+    help([{iff,ssa_opt_budget,
+           {desc,"Set a time budget (ms) for the SSA optimization phases"}},
+          {iff,ssa_opt_watchdog,
+           {desc,"Bound the time (ms) of a single SSA optimization pass"}},
+          {iff,ssa_opt_gates,
+           {desc,"Enable the SSA pass eligibility gates and statistics"}}]).
 help([{delay,Ps}|T]) ->
     help(Ps),
     help(T);
@@ -3267,6 +3291,9 @@ help([{iff,Flag,{src_listing,Ext}}|T]) ->
     help(T);
 help([{iff,Flag,{listing,Ext}}|T]) ->
     io:fwrite("~p - Generate .~s file\n", [Flag,Ext]),
+    help(T);
+help([{iff,Flag,{desc,Text}}|T]) ->
+    io:fwrite("~p - ~s\n", [Flag,Text]),
     help(T);
 help([{iff,Flag,{Name,Fun}}|T]) when is_function(Fun) ->
     io:fwrite("~p - Run ~s\n", [Flag,Name]),

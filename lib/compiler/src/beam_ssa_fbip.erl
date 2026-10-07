@@ -99,7 +99,7 @@
 -module(beam_ssa_fbip).
 -moduledoc false.
 
--export([opt/2]).
+-export([opt/2, eligible/1]).
 
 -import(lists, [all/2, member/2]).
 
@@ -135,6 +135,33 @@
 opt(StMap, FuncDb) ->
     StMap1 = iterate(StMap, ?MAX_ITERATIONS),
     {StMap1, FuncDb}.
+
+%% Eligibility precondition used by the opt-in per-pass budget/watchdog
+%% driver (`beam_ssa_opt_budget', wired in
+%% `beam_ssa_destructive_update:opt/2'): true when at least one function in
+%% the module contains an `update_record' that is not already `inplace',
+%% i.e. an update that the pass could possibly rewrite.
+%%
+%% This is only a NECESSARY condition - a cheap filter, O(number of
+%% instructions), that lets the driver skip the pass for modules without any
+%% record update at all. Whether an update is actually sound to rewrite is
+%% decided by the pass itself.
+-spec eligible(st_map()) -> boolean().
+eligible(StMap) ->
+    lists:any(fun(#opt_st{ssa=Linear}) -> eligible_linear(Linear) end,
+              maps:values(StMap)).
+
+eligible_linear([{_Lbl,#b_blk{is=Is}}|Blocks]) ->
+    case lists:any(fun(#b_set{op=update_record,args=[#b_literal{val=Hint}|_]}) ->
+                           Hint =/= inplace;
+                      (_) ->
+                           false
+                   end, Is) of
+        true -> true;
+        false -> eligible_linear(Blocks)
+    end;
+eligible_linear([]) ->
+    false.
 
 %%
 %% Fixpoint over the module: recompute the fresh returning functions

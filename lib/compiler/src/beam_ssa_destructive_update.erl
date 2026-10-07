@@ -156,8 +156,19 @@ opt(StMap, FuncDb) ->
             %% Opt-in FBIP pass (enabled by the +fbip_opt option; flagged
             %% by beam_ssa_opt:late_epilogue_passes/1). Runs after the
             %% regular alias and destructive-update transforms.
+            %%
+            %% The pass declares a cheap eligibility precondition (the
+            %% module contains a copying update_record) and runs under the
+            %% opt-in per-pass budget/watchdog when one of the
+            %% ssa_opt_budget/ssa_opt_watchdog/ssa_opt_gates options is
+            %% given; otherwise beam_ssa_opt_budget:run/5 calls the pass
+            %% directly.
             {StMap1,FuncDb1} = Result,
-            beam_ssa_fbip:opt(StMap1, FuncDb1);
+            beam_ssa_opt_budget:run(ssa_opt_fbip,
+                                    fun({SM,FD}) -> beam_ssa_fbip:opt(SM, FD) end,
+                                    fun({SM,_FD}) -> beam_ssa_fbip:eligible(SM) end,
+                                    true,
+                                    {StMap1,FuncDb1});
         _ ->
             Result
     end.

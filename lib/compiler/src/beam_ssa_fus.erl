@@ -104,7 +104,7 @@
 -module(beam_ssa_fus).
 -moduledoc false.
 
--export([ssa_opt_fus/1]).
+-export([ssa_opt_fus/1, eligible/1]).
 
 -include("beam_ssa.hrl").
 -include("beam_types.hrl").
@@ -120,6 +120,41 @@
 ssa_opt_fus({#opt_st{ssa=Blocks0}=St, FuncDb}) ->
     Blocks = normalize(Blocks0),
     {St#opt_st{ssa=fuse(Blocks)}, FuncDb}.
+
+%% Eligibility precondition used by the opt-in per-pass budget/watchdog
+%% driver (`beam_ssa_opt_budget', wired in `beam_ssa_opt:gate/1'): true when
+%% the function contains a block that ends with a `has_map_field' test whose
+%% success edge starts with a `get_map_element' of the same key.
+%%
+%% This is only a NECESSARY condition - a cheap filter that lets the driver
+%% skip the pass for functions that cannot fuse anything. Whether the fusion
+%% is actually legal (the map operand must be type-proven to be a map) is
+%% decided by the pass itself.
+-spec eligible({#opt_st{}, term()}) -> boolean().
+eligible({#opt_st{ssa=SSA}, _FuncDb}) ->
+    has_candidate(maps:from_list(normalize(SSA))).
+
+has_candidate(Blocks) ->
+    lists:any(fun({_L,Blk}) -> candidate_block(Blk, Blocks) end,
+              maps:to_list(Blocks)).
+
+candidate_block(#b_blk{is=Is,last=#b_br{succ=LSucc}}, Blocks) ->
+    case lists:reverse(Is) of
+        [#b_set{op=has_map_field,args=[Map,Key]}, _|_] ->
+            candidate_succ(Blocks, LSucc, Map, Key);
+        _ ->
+            false
+    end;
+candidate_block(_Blk, _Blocks) ->
+    false.
+
+candidate_succ(Blocks, LSucc, Map, Key) ->
+    case Blocks of
+        #{LSucc := #b_blk{is=[#b_set{op=get_map_element,args=[Map,Key]}|_]}} ->
+            true;
+        _ ->
+            false
+    end.
 
 %% The pass runs inside the repeated (fixpoint) phase, where the SSA is kept as
 %% a linearized list. Be defensive in case the representation has been changed
