@@ -48,17 +48,23 @@
 //!   `driver_create_port` is deliberately never **called**: the oracle blocks forever on a driver
 //!   name it does not know (`io.c:786`, measured), so pinning a call would hang the gate.
 //! * selector `8`, **`driver_c/driver_lock_driver_answers_the_ports_driver`** — a fixture whose
-//!   `start` refuses the port unless `driver_lock_driver(port)` answers `0`. The oracle answers
-//!   `0` (the port's driver has a `dlopen` handle) and the port opens; the Rust runtime's
-//!   `lock_driver` hook is not implemented, so it answers the trait default `-1`, `start`
-//!   refuses the port and the module raises `unsupported_driver_lock_driver` ⇒ exit `3` — an
-//!   honest **capability gap**, never a mismatch.
+//!   `output` callback answers `driver_lock_driver(port)` as one byte (`'1'` for the C's `0`).
+//!   The oracle answers `0` (the port's driver has a `dlopen` handle) and the port opens; the
+//!   Rust runtime's `lock_driver` hook is not implemented, so it answers the trait default `-1`
+//!   and the module raises `unsupported_driver_lock_driver` ⇒ exit `3` — an honest
+//!   **capability gap**, never a mismatch.
 //! * selector `9`, **`driver_c/add_then_remove_driver_entry_reports_removed`** — a fixture whose
-//!   `start` refuses the port unless `remove_driver_entry(&e) == 1` right after
-//!   `add_driver_entry(&e)`. The oracle answers `1` (the entry is not a dynamic driver, so it may
-//!   be removed) and the port opens; the Rust entry-list slots reach no published host from a
-//!   `beam_rt` callback, so `remove` answers `0` and the module raises
-//!   `unsupported_add_remove_driver_entry` ⇒ exit `3`.
+//!   `output` callback runs `add_driver_entry(&e)` then `remove_driver_entry(&e)` and answers the
+//!   removal's value as one byte (`'1'` for the C's `1`). The oracle answers `1` (the entry is
+//!   not a dynamic driver, so it may be removed) and the port opens; the Rust entry-list slots
+//!   reach no published host from a `beam_rt` callback, so `remove` answers `0` and the module
+//!   raises `unsupported_add_remove_driver_entry` ⇒ exit `3`.
+//!
+//! Selectors `8` and `9` carry the answer over the **proven `driver_output` channel** rather
+//! than refusing the port: a driver that refuses its port is an *uncatchable* runtime error on
+//! the Rust side (the CLI exits `1`), so a refused port could only ever be a mismatch. The byte
+//! channel is observable on both runtimes (it is what selector `6` pins) and stays correct if
+//! the runtime later implements the hooks — the answer becomes `'1'` and the case `agree`s.
 //!
 //! (The family's `driver_create_port` observable has no case for the blocking reason above.)
 //!
@@ -113,19 +119,24 @@ classify(N) ->
         6 -> P = open(Dir, ""),
              true = erlang:port_command(P, <<"hello">>),
              receive {P, {data, Bytes}} -> yn(Bytes =:= <<"hello">>) end;
-        %% `7` opens the port the registry fixture's always-succeeding `start` allows.
+        %% `7` opens the port: the registry fixture references all four registry slots and its
+        %% `start` always succeeds.
         7 -> P = open(Dir, ""), yn(erlang:is_port(P));
-        %% `8` and `9` are the same question asked of a fixture whose `start` refuses the port
-        %% unless the runtime answers a registry slot the way the oracle does; a refused port is
-        %% the module's one way of turning that into the documented capability-gap signal.
-        8 -> case catch open(Dir, "") of
-                 P when is_port(P) -> 1;
-                 _ -> erlang:error(unsupported_driver_lock_driver)
-             end;
-        9 -> case catch open(Dir, "") of
-                 P when is_port(P) -> 1;
-                 _ -> erlang:error(unsupported_add_remove_driver_entry)
-             end
+        %% `8` and `9` ask a fixture to answer a registry question and hand the answer back
+        %% through the proven `driver_output` channel (a *refused* port would be an uncatchable
+        %% runtime error here, not an Erlang exception, so the answer travels as bytes). `1`
+        %% means the runtime answered the slot the way the oracle does; anything else is the
+        %% documented capability gap.
+        8 -> registry_answer(open(Dir, ""), <<"lock">>, unsupported_driver_lock_driver);
+        9 -> registry_answer(open(Dir, ""), <<"entry">>, unsupported_add_remove_driver_entry)
+    end.
+
+%% Send the fixture's command and classify the one-byte answer it echoes back.
+registry_answer(P, Command, Gap) ->
+    true = erlang:port_command(P, Command),
+    receive
+        {P, {data, <<"1">>}} -> 1;
+        {P, {data, _}} -> erlang:error(Gap)
     end.
 
 yn(true) -> 1;
@@ -275,8 +286,12 @@ DRIVER_INIT(host_driver) {
 }
 "#;
 
-/// The **lock** fixture (selector `8`): opens only if `driver_lock_driver(port)` answers `0`.
-const LOCK_DRIVER_C: &str = r#"/* A real driver .so (contract A.4) that requires its port's own driver to be lockable. */
+/// The **lock** fixture (selector `8`): reports whether its port's own driver is lockable.
+///
+/// The answer reaches Erlang as one `driver_output` byte (`'1'` when `driver_lock_driver(port)`
+/// answers `0`), because a *refused* port would be an uncatchable runtime error rather than an
+/// Erlang exception — so the observable travels through the proven `output` round trip instead.
+const LOCK_DRIVER_C: &str = r#"/* A real driver .so (contract A.4) that reports whether its port's own driver is lockable. */
 #include <erl_driver.h>
 
 typedef struct {
@@ -286,10 +301,6 @@ typedef struct {
 static ErlDrvData lock_start(ErlDrvPort port, char *command) {
     lock_state *st;
     (void) command;
-    /* `driver_lock_driver` answers 0 for a driver with a `dlopen` handle and -1 otherwise
-     * (the C's `prt->drv_ptr->handle == NULL`, `io.c:7337`). */
-    if (driver_lock_driver(port) != 0)
-        return (ErlDrvData) -1;
     st = (lock_state *) driver_alloc(sizeof(lock_state));
     if (st == NULL)
         return (ErlDrvData) -1;
@@ -302,11 +313,18 @@ static void lock_stop(ErlDrvData drv_data) {
         driver_free(drv_data);
 }
 
+/* Answer the registry question and hand it back as one byte: '1' when the port's *own* driver is
+ * lockable — `driver_lock_driver` answers 0 for a driver with a `dlopen` handle and -1 otherwise
+ * (the C's `prt->drv_ptr->handle == NULL`, `io.c:7337`) — and '0' otherwise. */
 static void lock_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     lock_state *st = (lock_state *) drv_data;
+    char answer;
+    (void) buf;
+    (void) len;
     if (st == NULL)
         return;
-    (void) driver_output(st->port, buf, len);
+    answer = (driver_lock_driver(st->port) == 0) ? '1' : '0';
+    (void) driver_output(st->port, &answer, 1);
 }
 
 static ErlDrvEntry lock_entry = {
@@ -325,8 +343,8 @@ DRIVER_INIT(host_driver) {
 }
 "#;
 
-/// The **entry-list** fixture (selector `9`): opens only if `add_driver_entry` then
-/// `remove_driver_entry` reports the entry was removed (`1`).
+/// The **entry-list** fixture (selector `9`): reports whether `add_driver_entry` then
+/// `remove_driver_entry` round-trips its own entry out of the driver list.
 const ENTRY_DRIVER_C: &str = r#"/* A real driver .so (contract A.4) that round-trips its own entry through the driver list. */
 #include <erl_driver.h>
 
@@ -334,18 +352,12 @@ typedef struct {
     ErlDrvPort port;
 } entry_state;
 
-/* Forward declaration: `start` adds this very entry to the list and removes it again. */
+/* Forward declaration: the answer adds this very entry to the list and removes it again. */
 static ErlDrvEntry entry_entry;
 
 static ErlDrvData entry_start(ErlDrvPort port, char *command) {
     entry_state *st;
     (void) command;
-    /* `add_driver_entry` returns void by contract; the observable is that the entry can then be
-     * removed again — `remove_driver_entry` answers 1 for a non-dynamic entry, 0 when it is not
-     * listed. */
-    add_driver_entry(&entry_entry);
-    if (remove_driver_entry(&entry_entry) != 1)
-        return (ErlDrvData) -1;
     st = (entry_state *) driver_alloc(sizeof(entry_state));
     if (st == NULL)
         return (ErlDrvData) -1;
@@ -358,11 +370,19 @@ static void entry_stop(ErlDrvData drv_data) {
         driver_free(drv_data);
 }
 
+/* Add this very entry to the driver list (the slot returns void by contract), then remove it
+ * again and hand the outcome back as one byte: '1' when the removal reported the entry removed
+ * (the C's 1 for a non-dynamic entry), '0' otherwise. */
 static void entry_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     entry_state *st = (entry_state *) drv_data;
+    char answer;
+    (void) buf;
+    (void) len;
     if (st == NULL)
         return;
-    (void) driver_output(st->port, buf, len);
+    add_driver_entry(&entry_entry);
+    answer = (remove_driver_entry(&entry_entry) == 1) ? '1' : '0';
+    (void) driver_output(st->port, &answer, 1);
 }
 
 static ErlDrvEntry entry_entry = {
@@ -477,13 +497,13 @@ pub(crate) fn group() -> Vec<Case> {
         ),
         case(
             "driver_c/driver_lock_driver_answers_the_ports_driver",
-            "driver_lock_driver(port) is 0 for the port's own driver: the port opens (else a capability gap)",
+            "driver_lock_driver(port) answers 0 for the port's own driver: the driver echoes 1 (else a capability gap)",
             &[8],
             LOCK_DRIVER,
         ),
         case(
             "driver_c/add_then_remove_driver_entry_reports_removed",
-            "remove_driver_entry after add_driver_entry reports the entry removed (else a capability gap)",
+            "remove_driver_entry after add_driver_entry reports the entry removed: the driver echoes 1 (else a capability gap)",
             &[9],
             ENTRY_DRIVER,
         ),
