@@ -483,7 +483,7 @@ whole-region scan.)
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `move_size`/`move_*`, `collect`
-- `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver
+- `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver, per-collection growth/shrink + `minor_gcs`
 - `src/config.rs` → GC-strategy seam: `GcConfig` + `MatureKind::{Copying,Immix}` (default `Copying`; `Immix` = the measurement-gated GenImmix option). `AnyCollector::from_config` is the dispatcher that honours it
 - `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, accounting views (`ImmixStats`/`ImmixCounters`)
 - `src/immix/collect.rs` → `ImmixSpace` mark/classify/evacuate/finalize phases + its `EvacDest` impl
