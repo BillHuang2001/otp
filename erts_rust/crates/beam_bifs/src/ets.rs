@@ -260,6 +260,11 @@ impl TableRegistry {
     /// itself; the compile in `match_spec_compile/1` is what validates the spec.
     /// See the [`specs`] module docs for the M1 substitution and its heap-lifetime
     /// caveat.
+    ///
+    /// Unlike the oracle, which garbage-collects an unreferenced compiled spec, an
+    /// entry is never reclaimed here (no `ets` BIF releases a compiled spec), so a
+    /// runtime that compiles specs in a loop grows this map for its lifetime — a
+    /// documented M1 leak, not a wrong result.
     pub fn insert_spec(&mut self, raw: Eterm) -> u64 {
         let handle = self.next_spec;
         self.next_spec += 1;
