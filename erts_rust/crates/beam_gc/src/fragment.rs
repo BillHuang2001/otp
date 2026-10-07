@@ -98,18 +98,6 @@ use crate::error::heap_exhausted;
 use crate::mso::{OffHeap, OffHeapEntry};
 use crate::space::HeapSpace;
 
-/// How many source objects a copy of a fragment term relocated.
-///
-/// A deliberately small, self-contained result: the caller rarely needs more than this, and the
-/// crate adds no public error/result type of its own.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FragmentCopy {
-    /// The number of objects (`Boxed` + `List`) copied into the destination.
-    pub objects: usize,
-    /// The number of destination words the copy occupies.
-    pub words: usize,
-}
-
 // ---------------------------------------------------------------------------
 // Fragment accounting
 // ---------------------------------------------------------------------------
