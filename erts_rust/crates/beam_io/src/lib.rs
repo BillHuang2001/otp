@@ -12,12 +12,15 @@
 //! 2. the **[`Port`](port::Port)** ([`port`]) — a process-like I/O endpoint owning an
 //!    input and an output byte queue, a lifecycle and a driver handle, allocated from
 //!    `beam_process`'s port table; and
-//! 3. the **driver interface + built-in drivers** ([`driver`], [`drivers`]) — a Rust
-//!    [`Driver`](driver::Driver) trait today, with the frozen C-ABI
-//!    (`beam_abi::driver`) bridge as documented future work, plus the built-in
-//!    byte-stream driver ([`drivers::FdDriver`], `"fd"`), the [`drivers::EfileDriver`]
-//!    (`"efile"`) built on it, the OS-child [`drivers::SpawnDriver`] (`"spawn"`) and the
-//!    TCP socket [`drivers::TcpInetDriver`] (`"tcp_inet"`).
+//! 3. the **driver interface, built-in drivers and the C-ABI host layer** ([`driver`],
+//!    [`drivers`], [`abi`]) — a Rust [`Driver`](driver::Driver) trait that *both* a built-in
+//!    driver ([`drivers::FdDriver`], `"fd"`; the [`drivers::EfileDriver`] `"efile"` built on
+//!    it; the OS-child [`drivers::SpawnDriver`] `"spawn"`; the TCP socket
+//!    [`drivers::TcpInetDriver`] `"tcp_inet"`) *and* a loaded C driver `.so` present. The
+//!    [`abi`] module is the frozen-C-ABI bridge (contract A.4): [`abi::DriverPort`] adapts a
+//!    `beam_abi::driver::loader::DriverLibrary` to [`Driver`](driver::Driver), [`abi::AbiHost`]
+//!    implements `beam_abi::driver::host::DriverHost` over this crate's poller/queues/timer,
+//!    and [`abi::PortHost`] is the one runtime hook `beam_io` cannot fill (atom interning).
 //!
 //! Supporting types: [`timer`] (poll deadlines), [`queue`] (the port byte buffers) and
 //! [`port_task`] (per-port task scheduling: the ERTS port-task queue, its reduction costs
@@ -31,8 +34,10 @@
 //! tests plus the `tests/poller.rs` / `tests/port.rs` / `tests/port_task.rs` / `tests/spawn.rs`
 //! / `tests/inet.rs` integration suites (real OS fds, end-to-end `pipe(2)` round-trip, real
 //! child processes, real loopback TCP connections with an `erl`-oracle reply cross-check,
-//! scheduled port tasks and the wake-through-`beam_process` path). The frozen C-ABI driver bridge and the port-task
-//! *scheduler* wiring (poll threads, port run queues) remain follow-ups —
+//! scheduled port tasks and the wake-through-`beam_process` path). The frozen C-ABI driver
+//! bridge ([`abi`]) is implemented as a real host layer — a loaded `ErlDrvEntry` runs as a
+//! [`Driver`](driver::Driver) through [`abi::DriverPort`] + [`abi::AbiHost`] — and the
+//! port-task *scheduler* wiring (poll threads, port run queues) remains a follow-up —
 //! [`PortRegistry::execute_port_tasks`] is the drive point the runtime calls.
 //!
 //! # Contracts
@@ -51,6 +56,7 @@
 
 #![warn(missing_docs)]
 
+pub mod abi;
 pub mod driver;
 pub mod drivers;
 pub mod poller;
@@ -62,6 +68,7 @@ pub mod timer;
 
 mod error; // `pub(crate)` constructors only — NOT public
 
+pub use crate::abi::*;
 pub use crate::driver::*;
 pub use crate::drivers::*;
 pub use crate::poller::*;
@@ -80,9 +87,12 @@ pub use crate::timer::*;
 /// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`PortExitReason`], [`FdDriver`],
 /// [`EfileDriver`],
 /// [`SpawnDriver`], [`SpawnSpec`], [`SpawnOptions`], [`SpawnStream`], [`build_command`],
-/// [`TcpInetDriver`], [`InetState`]) and the timer/queue helpers ([`Timeout`], [`Timer`],
+/// [`TcpInetDriver`], [`InetState`]), the driver C-ABI host layer ([`DriverPort`],
+/// [`PortHost`], [`AbiHost`], [`LocalAtomPortHost`], [`DriverState`], [`AsyncJobs`],
+/// [`make_loaded`]) and the timer/queue helpers ([`Timeout`], [`Timer`],
 /// [`ByteQueue`]) into scope.
 pub mod prelude {
+    pub use crate::abi::*;
     pub use crate::driver::*;
     pub use crate::drivers::*;
     pub use crate::poller::*;
