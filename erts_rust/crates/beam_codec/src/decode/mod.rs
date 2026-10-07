@@ -22,10 +22,12 @@ use beam_common::Result;
 use beam_term::prelude::{
     is_atom, make_atom, make_small, try_make_small, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL, NIL,
 };
+use beam_term::refc::ERL_ONHEAP_BITS_LIMIT;
 use beam_term::{AtomTable, Eterm};
 
 use crate::atom_cache::AtomCache;
 use crate::error::{bad_arg, system_limit};
+use crate::off_heap::OffHeapBinaries;
 use crate::reader::Reader;
 use crate::tag::{Tag, COMPRESSED_EXT, VERSION_MAGIC};
 
@@ -51,6 +53,9 @@ pub struct Decoder<'a> {
     reader: Reader<'a>,
     /// The distribution atom cache, when an `ATOM_CACHE_REF` may appear.
     cache: Option<&'a AtomCache>,
+    /// The off-heap binary host, when a large binary's payload should live off the
+    /// process heap (see [`Decoder::with_off_heap`]).
+    off_heap: Option<&'a mut dyn OffHeapBinaries>,
 }
 
 impl<'a> Decoder<'a> {
@@ -63,17 +68,35 @@ impl<'a> Decoder<'a> {
         if reader.u8()? != VERSION_MAGIC {
             return Err(bad_arg());
         }
-        Ok(Decoder { reader, cache: None })
+        Ok(Decoder { reader, cache: None, off_heap: None })
     }
 
     /// Creates a decoder for a body: **no** leading version byte.
     pub fn new_body(bytes: &'a [u8]) -> Decoder<'a> {
-        Decoder { reader: Reader::new(bytes), cache: None }
+        Decoder { reader: Reader::new(bytes), cache: None, off_heap: None }
     }
 
     /// Attaches the distribution atom cache used to resolve `ATOM_CACHE_REF` (`82`).
     pub fn with_atom_cache(self, cache: &'a AtomCache) -> Decoder<'a> {
-        Decoder { reader: self.reader, cache: Some(cache) }
+        Decoder { reader: self.reader, cache: Some(cache), off_heap: self.off_heap }
+    }
+
+    /// Attaches the [`OffHeapBinaries`] host that owns the payload of a **large**
+    /// decoded binary.
+    ///
+    /// With a host installed, a `BINARY_EXT`/`BIT_BINARY_EXT` whose size exceeds
+    /// [`ERL_ONHEAP_BITS_LIMIT`] (512 bits, i.e. 64 bytes) is materialized as the
+    /// off-heap `[BinRef][ErlSubBits]` pair — the C's `refc_binary` path — the payload
+    /// coming from the host (see [`OffHeapBinaries::alloc_refc_payload`]). Without a
+    /// host (the default) every bitstring stays on-heap, exactly as before the seam
+    /// existed. The same on-heap/off-heap split holds for `BIT_BINARY_EXT`, whose size
+    /// in bits may exceed the limit while its byte count does not.
+    ///
+    /// The decoded term is observably identical either way:
+    /// [`crate::term::bitstring_bytes`]/[`crate::term::bitstring_size_bits`] read both
+    /// representations, so `byte_size/1`, the contents and the ETF image cannot differ.
+    pub fn with_off_heap(self, host: &'a mut dyn OffHeapBinaries) -> Decoder<'a> {
+        Decoder { reader: self.reader, cache: self.cache, off_heap: Some(host) }
     }
 
     /// Decodes the next term into `heap`, interning its atoms into `atoms`.
@@ -475,8 +498,8 @@ impl<'a> Decoder<'a> {
         crate::term::make_big(heap, negative, &bytes_to_digits(magnitude))
     }
 
-    /// Decodes `BINARY_EXT`/`BIT_BINARY_EXT` into an on-heap bitstring
-    /// (`external.c:4896-4923`).
+    /// Decodes `BINARY_EXT`/`BIT_BINARY_EXT` into a bitstring
+    /// (`external.c:4893-4980`).
     ///
     /// The wire is `[len:4 BE][data]` for a binary and `[len:4 BE][bits:1][data]`
     /// for a bit binary — the length field comes **before** the trailing-bit count.
@@ -485,6 +508,13 @@ impl<'a> Decoder<'a> {
     /// `BeamError::BadArg`, never a blind allocation. For `BIT_BINARY_EXT` the
     /// trailing-bit count must be `1..=8` and `len * 8` must be at least 8 (i.e.
     /// `len != 0`), exactly as the C, and `size_in_bits = len * 8 - (8 - bits)`.
+    ///
+    /// **On-heap vs off-heap.** Like the C, the size in **bits** decides the
+    /// representation: at most [`ERL_ONHEAP_BITS_LIMIT`] bits becomes an on-heap
+    /// `ErlHeapBits` block ([`crate::term::make_bitstring`]); more becomes the
+    /// off-heap `[BinRef][ErlSubBits]` pair ([`crate::term::make_refc_binary`]) whose
+    /// payload comes from the installed [`OffHeapBinaries`] host. Without a host every
+    /// bitstring stays on-heap — the same observable term, so nothing regresses.
     ///
     /// The C clears the unused trailing bits of the last byte before copying; here
     /// [`crate::term::make_bitstring`] zeroes them, so the term carries no garbage
@@ -507,14 +537,19 @@ impl<'a> Decoder<'a> {
         // `len` is at most `u32::MAX`, so this cannot overflow on 64-bit; the guard
         // keeps the arithmetic total on every target.
         let size_in_bits = len.checked_mul(8).ok_or_else(system_limit)?;
-        if tag == Tag::BitBinary {
+        let size_in_bits = if tag == Tag::BitBinary {
             if !(1..=8).contains(&trailing_bits) || size_in_bits < 8 {
                 return Err(bad_arg());
             }
-            let size_in_bits = size_in_bits - (8 - usize::from(trailing_bits));
-            crate::term::make_bitstring(heap, data, size_in_bits)
+            size_in_bits - (8 - usize::from(trailing_bits))
         } else {
-            crate::term::make_binary(heap, data)
+            size_in_bits
+        };
+        match self.off_heap.as_deref_mut() {
+            Some(host) if size_in_bits > ERL_ONHEAP_BITS_LIMIT => {
+                crate::term::make_refc_binary(heap, host, data, 0, size_in_bits)
+            }
+            _ => crate::term::make_bitstring(heap, data, size_in_bits),
         }
     }
 }
