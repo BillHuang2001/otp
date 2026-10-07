@@ -32,7 +32,7 @@ It depends on **all** other crates (wave 6) but must **call down, never duplicat
 * `ensure_heap` → `heap_available() >= heap_need` else `BeamError::SystemLimit` (no GC).
 `call_bif` installs `RuntimePorts` + a `NodeIdentity` in **every** arm and exactly **one** bridge — the only place the engine's seam meets the Stage-5 core (keeps the Stage-1/Stage-5 DAG acyclic).
 
-### The four host-seam bridges (`context.rs`)
+### The four host-seam bridges (`context/bridges.rs`)
 `call_registered` installs exactly **one** of four bridges (each needs a borrow the others cannot co-exist with); `NodeIdentity` (no borrow) rides alongside:
 * **`NifBridge`** (`beam_bifs::NifLoader`; `("erlang","load_nif",2)`) — checked **before** the filesystem, so a second `load_nif` for a module that already has a library is `NifLoadError::Reload` (the oracle's rule since OTP 20), not a `dlopen`; a load failure is mapped variant-for-variant by `map_load_error` and **returned**, never raised. Its host shares this call's `PendingInterner`, so a name the C `load` callback interns and one the BIF interns land in one predicted list.
 * **`RecordBridge`** (`beam_bifs::RecordSource`; gated by `uses_record_source(module,function,arity) == ("records","get_definition",2)`) — answers from the **loaded module's** `Recs` chunk (a `&CodeServer` read): `Module::record_by_name` (`beam_loader::ir`), each field atom **name-resolved** through the module's own atom table (where `beam_loader` interned the `AtU8` names), the `default` term passed through. An unloaded module or an undeclared record ⇒ `Ok(None)` ⇒ the oracle's plain `badarg` (C: `erl_record.c:1342-1403`); an unresolvable field atom is a typed `TermNotFound`, never a fabricated name.
