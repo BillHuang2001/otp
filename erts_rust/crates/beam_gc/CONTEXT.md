@@ -104,15 +104,64 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 
 ### `policy.rs` — heap-size policy (the `erts_next_heap_size` analogue)
 - `pub struct HeapPolicy` — `min_heap_words`, `max_heap_words` (0 = unbounded), `fullsweep_after`
-  (default 65535), `initial_young_words` (233), `initial_mature_words`, `need_reserve_words`;
+  (default 65535), `min_bin_vheap_words` (default 46422 = `next_heap_size(32768, 0)`, the C
+  `BIN_VH_MIN_SIZE`), `initial_young_words` (233), `initial_mature_words`, `need_reserve_words`;
   `default()`, `from_min_max(min, max)`, builder.
+  - `from_spawn_opts(min_heap_words, min_bin_vheap_words, fullsweep_after)` — the C `spawn_opt` rule
+    (`erl_process.c:12321-12349`): each requested minimum is floored and then rounded through
+    `erts_next_heap_size(x, 0)`, so a stored minimum is a growth-table fixed point.
+  - `fullsweep_due(minor_gcs) -> bool` — `minor_gcs >= fullsweep_after` (the C `GEN_GCS >= MAX_GEN_GCS`);
+    `fullsweep_after == 0` forces a fullsweep on every collection.
   - `next_words(size, offset) -> usize`; `size_after_fullsweep(live_words, need_words) -> usize`;
-    `should_grow(...)`, `should_shrink(...)`.
+    `mature_after_fullsweep(capacity, live, need) -> usize` (grow / shrink / keep — the C
+    `adjust_after_fullsweep`, `erl_gc.c:2061-2098`); `young_after_collection(capacity, used) -> usize`
+    (the C minor-time young resize, `erl_gc.c:1493`); `should_grow(...)`, `should_shrink(...)`.
+- `pub const DEFAULT_MIN_HEAP_WORDS: usize = 233` — the C `H_DEFAULT_SIZE`.
 - `pub fn heap_sizes() -> &'static [usize]` — the curated growth table (Fibonacci+1 to index 23, then
   +20%, capped at `2^53 / word`), `LazyLock`-built from `erts_init_gc` (`erl_gc.c:240-303`).
 - `pub fn next_heap_size(size, offset) -> usize` — `erts_next_heap_size` over that table.
 
-### `mso.rs` — off-heap refcounted large objects & refc binaries
+### `heap_info.rs` — the `garbage_collection` observables
+- `pub struct HeapInfo { minor_gcs, fullsweep_after, min_heap_size, min_bin_vheap_size, max_heap_size,
+  heap_size, total_heap_size }` — the `erlang:process_info(Pid, garbage_collection)` item
+  (`ERTS_PI_IX_GARBAGE_COLLECTION`, `erl_bif_info.c:2073`).
+  - `new(...)`; `values() -> [usize; 5]`; `items() -> [(&'static str, usize); 5]`;
+    `of<C: HeapObservable + ?Sized>(collector: &C) -> HeapInfo` (derived from any collector).
+- `pub trait HeapObservable` — `minor_gcs()`/`heap_size_words()`/`total_heap_size_words()`/`heap_policy()`;
+  implemented by `Collector`, `GenImmixCollector` and `AnyCollector` (`AnyCollector::heap_info()` too).
+- `pub const GARBAGE_COLLECTION_KEYS: [&str; 5]` — the oracle's emitted key order
+  (`max_heap_size, min_bin_vheap_size, min_heap_size, fullsweep_after, minor_gcs`); defaults
+  `min_heap_size 233`, `min_bin_vheap_size 46422`, `fullsweep_after 65535`, `max_heap_size 0`.
+- Word accounting: `heap_size` = the nursery capacity (C `HEAP_SIZE`); `total_heap_size` = nursery + mature
+  capacity (C `heap_sz + old heap`); the message buffer is `beam_message`'s (not counted here).
+
+### `fragment.rs` — heap fragments (collector-side support)
+A fragment is a bump-allocated `beam_alloc::Heap` region **outside** every process `HeapSpace`
+(the C `ErlHeapFragment`); the collector cannot relocate a term it does not own, so the contract is
+**"materialize then collect"** (see Design Decisions).
+- `pub struct HeapFragment` — one fragment + its own `OffHeap` list + `FragmentCounters`.
+  - `new`/`with_allocator`/`with_counters`/`with_allocator_and_counters`;
+    `capacity_words`/`used_words`/`available_words`/`base`/`top`/`limit`/`contains`/`contains_term`;
+    `heap()`/`heap_mut()`; `off_heap`/`off_heap_len`/`off_heap_bytes`;
+    `register_off_heap(impl Into<OffHeapEntry>) -> slot`; `sweep_off_heap`; `move_off_heap_into(&mut OffHeap)`.
+  - `copy_term(&self, root, &mut HeapSpace) -> Result<Eterm>` (shares off-heap — the fragment keeps
+    ownership) and `copy_term_into(&mut self, root, to, dst_off_heap) -> Result<Eterm>` (transfers off-heap
+    ownership: clone into `dst_off_heap` + release the fragment's ref). A term already in the destination, an
+    immediate, or a literal is returned unchanged.
+- `pub struct FragmentChain` — the C `next`/`last` list: `push`/`first`/`last`/`get`/`iter`/`len`/`clear`,
+  aggregate views (`used_words`/`capacity_words`/`off_heap_*`), `move_off_heap_into`, and the chain-level
+  copy-in `copy_roots_into(&mut [Eterm], to, dst_off_heap) -> Result<usize>` (one memo spans the whole chain,
+  so a graph spanning fragments copies correctly).
+- `pub struct FragmentRoots` — the additive rootset hook: `push`/`as_slice`/`as_mut_slice`/`clear`;
+  `materialize(&mut chain, &mut HeapSpace, &mut OffHeap) -> Result<usize>` (relocate fragment-resident roots
+  into the process heap **in place**); `gather_roots(&mut Vec<Eterm>) -> start` / `scatter_roots(&[Eterm], start)`.
+- `pub struct FragmentCounters` — clonable shared counters (`created`/`dropped`/`live`/`words`/
+  `off_heap_bytes`/`off_heap_bytes_peak`) — the no-leak observability.
+- The copier is a private iterative, sharing-preserving, **non-destructive** graph copier built on
+  `copy.rs`'s `pub(crate)` `move_size`/`for_each_ref` (the frozen layout rules stay in one place); there is
+  no `ERTS_HOLE_MARKER` support and no in-place offset rewrite (see Known Gaps).
+
+### `stats.rs` — `GcStats`
 - `RefCount` — **re-exported** from `beam_alloc` (`pub use beam_alloc::RefCount;`); the workspace's single
   `erts_refc_*` primitive (`new`, `count`, `inc`, `dec`, `dec_and_test(min)`). This crate defines no count
   of its own; both `beam_gc::RefCount` and `beam_gc::mso::RefCount` resolve.
