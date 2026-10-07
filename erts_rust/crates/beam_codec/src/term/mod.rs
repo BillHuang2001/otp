@@ -38,7 +38,7 @@ mod fun;
 mod record;
 pub use binary::{
     bit_count_to_bytes, bitstring_bytes, bitstring_parts, bitstring_size_bits, make_binary,
-    make_bitstring, BITSTRING_POINTER_FLAG_MASK,
+    make_bitstring, make_refc_binary, BITSTRING_POINTER_FLAG_MASK,
 };
 /// The whole fun / export forwarding layer ([`fun`]): the boxed fun-term
 /// constructors, the term-level accessors and the frozen layout surface

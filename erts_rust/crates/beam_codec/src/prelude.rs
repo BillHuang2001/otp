@@ -17,6 +17,7 @@ pub use crate::error::{
     is_unsupported, is_unsupported_local_fun, unsupported, unsupported_local_fun, LOCAL_FUN_REASON,
     UNSUPPORTED_REASON,
 };
+pub use crate::off_heap::OffHeapBinaries;
 pub use crate::reader::Reader;
 pub use crate::tag::*;
 pub use crate::term::{
