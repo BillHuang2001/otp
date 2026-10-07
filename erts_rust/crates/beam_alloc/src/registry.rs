@@ -6,6 +6,12 @@
 //! table, so `erts_alloc(TYPE, size)` (and its Rust replacement) has a single
 //! allocator instance per type.
 //!
+//! The allocator *inventory* itself (which allocators and types exist, their
+//! classes and capability flags) is owned by [`crate::types`]; this module maps
+//! each [`AllocatorId`] to its live [`AllocRef`] and answers the registry-shaped
+//! queries the legacy C API exposes (`erts_alloc_util_allocators`, per-allocator
+//! type listing).
+//!
 //! In Milestone 1 every type uses the same default [`AllocatorConfig`]; per-type
 //! tuning and thread-specific instances are documented gaps.
 
@@ -13,83 +19,20 @@ use std::sync::{Arc, LazyLock};
 
 use crate::allocator::{AllocRef, AllocatorConfig, CarrierAllocator};
 use crate::stats::AllocStats;
+use crate::types::AllocatorId;
 
-/// The allocation classes the runtime registers.
-///
-/// Curated from the `allocator` records of `erts/emulator/beam/erl_alloc.types`
-/// (the canonical names are returned by [`AllocType::as_str`]).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum AllocType {
-    /// Long-lived, system-wide allocations (`sys_alloc`).
-    System,
-    /// Very short-lived temporary allocations (`temp_alloc`).
-    Temporary,
-    /// Short-lived allocations (`sl_alloc`).
-    ShortLived,
-    /// General-purpose allocations (`std_alloc`).
-    Standard,
-    /// Long-lived allocations (`ll_alloc`).
-    LongLived,
-    /// Erlang process heaps (`eheap_alloc`).
-    EHeap,
-    /// ETS table data (`ets_alloc`).
-    Ets,
-    /// Literals / constant terms (`literal_alloc`).
-    Literal,
-    /// Off-heap binaries (`binary_alloc`).
-    Binary,
-    /// Port drivers (`driver_alloc`).
-    Driver,
-    /// Fixed-size blocks (`fix_alloc`).
-    FixedSize,
-    /// Test allocators (`test_alloc`).
-    Test,
-}
+/// Backwards-compatible alias: `AllocType` is the historical name of the
+/// per-allocator id. The id now lives in [`crate::types::AllocatorId`] (beside the
+/// full type table it indexes), but every existing path —
+/// `beam_alloc::AllocType::Ets`, `beam_alloc::registry::AllocType`,
+/// `beam_alloc::prelude::AllocType` — keeps working unchanged, including
+/// `AllocType::ALL`, `as_str()` and `index()`.
+pub use crate::types::AllocatorId as AllocType;
 
-impl AllocType {
-    /// Every allocation type, in registration order.
-    pub const ALL: [AllocType; 12] = [
-        AllocType::System,
-        AllocType::Temporary,
-        AllocType::ShortLived,
-        AllocType::Standard,
-        AllocType::LongLived,
-        AllocType::EHeap,
-        AllocType::Ets,
-        AllocType::Literal,
-        AllocType::Binary,
-        AllocType::Driver,
-        AllocType::FixedSize,
-        AllocType::Test,
-    ];
-
-    /// The stable allocator name of this type (as in `erl_alloc.types`).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AllocType::System => "sys_alloc",
-            AllocType::Temporary => "temp_alloc",
-            AllocType::ShortLived => "sl_alloc",
-            AllocType::Standard => "std_alloc",
-            AllocType::LongLived => "ll_alloc",
-            AllocType::EHeap => "eheap_alloc",
-            AllocType::Ets => "ets_alloc",
-            AllocType::Literal => "literal_alloc",
-            AllocType::Binary => "binary_alloc",
-            AllocType::Driver => "driver_alloc",
-            AllocType::FixedSize => "fix_alloc",
-            AllocType::Test => "test_alloc",
-        }
-    }
-
-    /// The index of this type in [`AllocType::ALL`].
-    pub fn index(&self) -> usize {
-        *self as usize
-    }
-}
-
-/// One lazily-created allocator per [`AllocType`], indexed by [`AllocType::index`].
+/// One lazily-created allocator per [`AllocatorId`], indexed by
+/// [`AllocatorId::index`].
 static ALLOCATORS: LazyLock<[AllocRef; 12]> = LazyLock::new(|| {
-    AllocType::ALL.map(|ty| -> AllocRef {
+    AllocatorId::ALL.map(|ty| -> AllocRef {
         let config = AllocatorConfig::builder().name(ty.as_str()).build();
         // `CarrierAllocator::new` only reserves bookkeeping and maps no carrier, so a
         // failure here means a broken build, not runtime OOM. This `expect` is the
@@ -110,13 +53,110 @@ pub fn allocator(ty: AllocType) -> &'static AllocRef {
 
 /// The default allocator (the [`AllocType::Standard`] instance).
 pub fn default_allocator() -> &'static AllocRef {
-    allocator(AllocType::Standard)
+    allocator(AllocatorId::Standard)
 }
 
-/// A snapshot of every registered allocator's counters.
+/// A snapshot of every registered allocator's counters, in [`AllocatorId::ALL`]
+/// order.
 pub fn all_stats() -> Vec<(AllocType, AllocStats)> {
-    AllocType::ALL
+    AllocatorId::ALL
         .iter()
         .map(|&ty| (ty, allocator(ty).stats()))
         .collect()
+}
+
+/// The names of the *alloc-util* allocators, in [`AllocatorId::ALL`] order.
+///
+/// Mirrors the C `erts_alloc_util_allocators` (`erl_alloc.c:2789`), which returns
+/// every allocator **except** `sys_alloc` (it is the raw system allocator, not a
+/// carrier-based alloc-util allocator) and `test_alloc` (disabled by default and
+/// only intended for the VM's own testing).
+pub fn alloc_util_allocators() -> Vec<&'static str> {
+    AllocatorId::ALL
+        .iter()
+        .filter(|ty| !matches!(ty, AllocatorId::System | AllocatorId::Test))
+        .map(|ty| ty.as_str())
+        .collect()
+}
+
+/// Every type bound to `allocator`, in [`crate::types::ALLOC_TYPES`] (file)
+/// order — the Rust counterpart of the per-allocator type listing used by the
+/// `allocator`-info reporting.
+pub fn types_for(allocator: AllocatorId) -> Vec<crate::types::TypeId> {
+    crate::types::types_for_allocator(allocator).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{TypeFlags, TypeId, ALLOC_TYPES, TYPE_COUNT};
+
+    #[test]
+    fn registry_provides_one_named_allocator_per_id() {
+        for ty in AllocatorId::ALL {
+            assert_eq!(allocator(ty).name(), ty.as_str());
+        }
+        assert_eq!(default_allocator().name(), AllocatorId::Standard.as_str());
+    }
+
+    #[test]
+    fn all_stats_covers_every_allocator_in_order() {
+        let stats = all_stats();
+        assert_eq!(stats.len(), AllocatorId::ALL.len());
+        for (snapshot, ty) in stats.iter().zip(AllocatorId::ALL) {
+            assert_eq!(snapshot.0, ty);
+        }
+    }
+
+    #[test]
+    fn alloc_util_allocators_excludes_sys_and_test() {
+        let names = alloc_util_allocators();
+        assert_eq!(names.len(), 10);
+        assert!(!names.contains(&"sys_alloc"));
+        assert!(!names.contains(&"test_alloc"));
+        assert!(names.contains(&"std_alloc"));
+        assert!(names.contains(&"eheap_alloc"));
+        // Declaration order is preserved.
+        let expected: Vec<&str> = AllocatorId::ALL
+            .iter()
+            .filter(|ty| !matches!(ty, AllocatorId::System | AllocatorId::Test))
+            .map(|ty| ty.as_str())
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn types_for_agrees_with_the_type_table() {
+        let mut total = 0usize;
+        for ty in AllocatorId::ALL {
+            let ids: Vec<TypeId> = types_for(ty);
+            assert!(!ids.is_empty());
+            for id in &ids {
+                assert_eq!(id.allocator(), ty);
+                assert_eq!(id.flags(), TypeFlags::for_allocator(ty));
+            }
+            total += ids.len();
+        }
+        assert_eq!(total, TYPE_COUNT);
+        assert_eq!(ALLOC_TYPES.len(), TYPE_COUNT);
+    }
+
+    #[test]
+    fn alloc_type_alias_keeps_the_historic_paths() {
+        // The alias must expose the same items the pre-refactor `registry::AllocType`
+        // did: the variant names, `ALL`, `as_str` and `index`.
+        let ty: AllocType = AllocType::Ets;
+        assert_eq!(ty.as_str(), "ets_alloc");
+        assert_eq!(AllocType::ALL.len(), 12);
+        assert_eq!(ty.index(), AllocatorId::Ets.index());
+
+        // `AllocType` and `AllocatorId` are literally the same type, so the alias
+        // is fully interchangeable at every call site.
+        let same: AllocatorId = ty;
+        assert_eq!(allocator(same).name(), "ets_alloc");
+        assert_eq!(
+            allocator(AllocType::Standard).name(),
+            default_allocator().name()
+        );
+    }
 }
