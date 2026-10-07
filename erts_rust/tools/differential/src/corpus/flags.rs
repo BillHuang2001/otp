@@ -253,6 +253,122 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- emulator `+`-flags: observable through system_info, never through init --------
+        // A `+`-flag is consumed by the emulator's own argv parser and is *not* recorded as
+        // an `init` argument (verified: `init:get_argument/1` answers `error` for each), so
+        // the two halves below pin both sides of that rule.
+        Case {
+            id: "flags/plus_p_sets_process_limit",
+            description: "the +P emulator flag changes the observable process_limit",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(process_limit)",
+                extra_argv: &["+P", "2048"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2048"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_k_sets_kernel_poll",
+            description: "the +K emulator flag changes the observable kernel_poll setting",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(kernel_poll)",
+                extra_argv: &["+K", "true"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_sbt_sets_scheduler_bind_type",
+            description: "the +sbt emulator flag changes the observable scheduler_bind_type",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(scheduler_bind_type)",
+                extra_argv: &["+sbt", "u"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok unbound"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_p_is_not_an_init_argument",
+            description: "a +P emulator flag is consumed by the emulator and not recorded by init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('P')",
+                extra_argv: &["+P", "2048"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_q_is_not_an_init_argument",
+            description: "a +Q emulator flag is consumed by the emulator and not recorded by init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('Q')",
+                extra_argv: &["+Q", "4096"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_k_is_not_an_init_argument",
+            description: "a +K emulator flag is consumed by the emulator and not recorded by init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('K')",
+                extra_argv: &["+K", "true"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_sbt_is_not_an_init_argument",
+            description: "a +sbt emulator flag is consumed by the emulator and not recorded by init",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument('sbt')",
+                extra_argv: &["+sbt", "u"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/boot_switch_value",
+            description: "a recognized -boot switch is recorded verbatim for init:get_argument/1",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(boot)",
+                extra_argv: &["-boot", "start_clean"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[115,116,97,114,116,95,99,108,101,97,110]]]}"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -264,10 +380,26 @@ mod tests {
 
     use super::{group, CaseKind, Contract, Probe};
 
+    /// Every case decodes the command line through `init:get_argument/1` with the drop-in
+    /// `-noshell … -eval` argv, and the pinned goldens are the exact occurrences a conforming
+    /// parser must expose.
+    ///
+    /// Three families are exempt from the `init:get_argument` shape **on purpose**: the
+    /// `+`-flags (`+P`/`+K`/`+sbt`) are consumed by the emulator's own argv parser, so the
+    /// only way to observe them is the *other* half of the flag contract —
+    /// `erlang:system_info/1`. Their goldens are therefore `ok <system_info value>`; the
+    /// cases that assert the emulator did *not* leak them into `init` keep the
+    /// `init:get_argument` shape. `-boot` is an ordinary recorded switch and keeps the
+    /// `{ok,[…]}` golden shape.
     #[test]
-    fn every_case_is_a_cli_eval_case_with_an_init_argument_probe() {
+    fn every_case_is_a_cli_eval_case_with_an_init_or_system_info_probe() {
         for case in group() {
-            assert_eq!(case.contracts, &[Contract::Cli], "case {}", case.id);
+            assert!(
+                case.contracts == [Contract::Cli]
+                    || case.contracts == [Contract::Cli, Contract::Introspection],
+                "case {}: A.6 cases are CLI cases (a +-flag case also evidences A.8)",
+                case.id
+            );
             assert!(
                 case.id.starts_with("flags/"),
                 "case {} is outside the flags group",
@@ -288,8 +420,11 @@ mod tests {
             };
             assert_eq!(probe, Probe::Value, "case {}", case.id);
             assert!(
-                expr.starts_with("init:get_argument(") || expr == "init:get_plain_arguments()",
-                "case {}: A.6 is observed through init:get_argument/1 (or get_plain_arguments/0), got {expr}",
+                expr.starts_with("init:get_argument(")
+                    || expr == "init:get_plain_arguments()"
+                    || expr.starts_with("erlang:system_info("),
+                "case {}: A.6 is observed through init:get_argument/1, get_plain_arguments/0 \
+                 or (for a +-flag) erlang:system_info/1, got {expr}",
                 case.id
             );
             // The golden is the valueless `-noshell` occurrence `[]`, the error atom, a
@@ -297,7 +432,12 @@ mod tests {
             let golden = case.golden.stdout.expect("every case pins a golden");
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
             assert!(
-                golden.starts_with("ok {ok,[") || golden == "ok error" || golden == "ok []",
+                golden.starts_with("ok {ok,[")
+                    || golden == "ok error"
+                    || golden == "ok []"
+                    || golden == "ok 2048"
+                    || golden == "ok true"
+                    || golden == "ok unbound",
                 "case {}: unexpected golden {golden:?}",
                 case.id
             );

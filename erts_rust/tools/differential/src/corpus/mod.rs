@@ -57,6 +57,7 @@ mod bifs;
 mod binmatch;
 mod boot;
 mod driver;
+mod driver_c;
 mod driver_ports;
 mod errors;
 mod etf;
@@ -67,6 +68,7 @@ mod math_bifs;
 mod mexec;
 mod modules;
 mod nif;
+mod nif_res;
 mod nif_so;
 mod phash;
 mod printing;
@@ -331,8 +333,10 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(errors::group());
     cases.extend(nif::group());
     cases.extend(nif_so::group());
+    cases.extend(nif_res::group());
     cases.extend(records::group());
     cases.extend(driver::group());
+    cases.extend(driver_c::group());
     cases.extend(driver_ports::group());
     cases.extend(wire::group());
     cases.extend(wire_ids::group());
@@ -542,6 +546,12 @@ mod tests {
                             // from C against the host `erl_nif.h` and its functions run
                             // under both runtimes (see `super::nif_so`).
                             | Contract::NifAbi
+                            // `driver_c` (A.4): a module-run case that opens a **real C
+                            // driver** `.so` compiled against the host `erl_driver.h` and
+                            // drives it through the port lifecycle (`start` → `output` →
+                            // `stop`) evidences the driver C ABI end to end
+                            // (see `super::driver_c`).
+                            | Contract::DriverAbi
                     )),
                 "case {}: a module-run case may only claim the contracts it evidences",
                 case.id
