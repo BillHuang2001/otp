@@ -571,6 +571,16 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
   C returns the static string `"unknown"`.
 - **`sync::tsd_*` passes the key straight to pthreads unchecked** (no `used_tsd_keys[]` validation);
   an invalid/destroyed key makes `set`/`get` a safe no-op (`NULL`) where the C aborts.
+- **The four driver-registry slots are wired but not yet reachable from the running runtime.** They are
+  populated in the frozen table (a driver `.so` that binds them now `dlopen`s on the Rust side) and the
+  `beam_io` host implements the hooks, but a `DriverHost` only ever sees them if the runtime (a) publishes
+  itself with [`with_current_host`] for the two port-free slots and (b) passes a `DriverEnv::as_port()`
+  handle **and** overrides the hooks for the two port-carrying ones. `beam_rt`'s driver host does neither
+  today — it implements `DriverHost` for its own `DriverEnv`-backed host but leaves the four hooks at
+  their trait defaults, and `beam_io`'s A.4 host layer is not on its `.so` driver path. A real driver
+  callback calling them therefore observes the C's own failure defaults: measured under `beam_rt run`,
+  `driver_lock_driver` answers `-1` and `remove_driver_entry` `0` where the oracle answers `0`/`1`.
+  Making them agree is a `beam_rt` change (its hooks + a `with_current_host` wrapper).
 - **`driver_create_port` is implementable but not yet plumbed.** The hook needs a live
   `PortRegistry`+`Poller`+driver-table reachable from a per-port `DriverHost`, which no host supplies
   today; until `beam_io` hands those to its host the hook returns the invalid-port sentinel. Likewise
@@ -655,4 +665,4 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
 - `../../../ERTS_RUST_REWRITE_EVALUATION.md` §A.3/A.4; `../../../ERTS_RUST_REWRITE_DEEPDIVE.md` §C (the frozen-header seam).
 - `../beam_term/` → the internal `Eterm` this crate transmutes to/from (`nif::term`).
 - `../beam_alloc/` → the production bump `Heap` the host seam hands out (`NifHost::heap`).
-- `../beam_rt/`, `../beam_bifs/`, `../beam_io/` → the runtime owners of the `NifHost`/`DriverHost` seams and the implementors of the remaining `ErlDrvApi` slots (the binary-refcount trio and the drivers behind the poller). `beam_io` implements the four driver-registry hooks over its driver table / port registry and wraps each driver callback in `beam_abi::with_current_host`; `beam_rt` implements `NifHost::alloc_env` so `enif_alloc_env` can return a real message env.
+- `../beam_rt/`, `../beam_bifs/`, `../beam_io/` → the runtime owners of the `NifHost`/`DriverHost` seams and the implementors of the remaining `ErlDrvApi` slots (the binary-refcount trio and the drivers behind the poller). `beam_io` implements the four driver-registry hooks over its driver table / port registry and wraps each driver callback **it** routes in `beam_abi::with_current_host`. `beam_rt` implements `DriverHost` for its own per-port `DriverEnv`-backed host (so the A.4 host layer of `beam_io` is *not* on the runtime's `.so` driver path), but it neither overrides the four registry hooks nor publishes a current host, and does not override `NifHost::alloc_env` — so both families answer the C's failure defaults in the running runtime (see *Known gaps*).
