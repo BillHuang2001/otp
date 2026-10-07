@@ -291,6 +291,18 @@ mod tests {
             t.driver_cancel_timer.is_some(),
             t.driver_read_timer.is_some(),
             t.driver_async.is_some(),
+            // Part 3: the port-queue family (`queues`).
+            t.driver_vec_to_buf.is_some(),
+            t.driver_enq.is_some(),
+            t.driver_pushq.is_some(),
+            t.driver_deq.is_some(),
+            t.driver_sizeq.is_some(),
+            t.driver_enq_bin.is_some(),
+            t.driver_pushq_bin.is_some(),
+            t.driver_peekqv.is_some(),
+            t.driver_peekq.is_some(),
+            t.driver_enqv.is_some(),
+            t.driver_pushqv.is_some(),
         ];
         assert!(
             populated.iter().all(|&p| p),
@@ -298,9 +310,6 @@ mod tests {
         );
 
         // The families that need runtime structure this seam does not expose stay `None`.
-        assert!(t.driver_vec_to_buf.is_none());
-        assert!(t.driver_enq.is_none());
-        assert!(t.driver_pushq.is_none());
         assert!(t.erl_drv_mutex_create.is_none());
         assert!(t.driver_create_port.is_none());
         assert!(t.driver_async_port_key.is_none());

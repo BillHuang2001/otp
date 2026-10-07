@@ -175,8 +175,8 @@ fn the_driver_table_is_populated_for_every_symbol_the_fixture_imports() {
     assert!(table.driver_mk_port.is_some());
     assert!(table.erl_drv_output_term.is_some());
     assert!(table.driver_system_info.is_some());
-    // A slot whose subsystem this seam does not expose stays `None` (the port-queue family).
-    assert!(table.driver_enq.is_none());
+    // A slot whose subsystem this seam does not expose stays `None` (the port-lifecycle family).
+    assert!(table.driver_create_port.is_none());
 }
 
 // ---------------------------------------------------------------------------------------------
