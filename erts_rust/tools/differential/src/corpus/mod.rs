@@ -34,6 +34,7 @@
 //! | [`bifs`] | A.7 — BIF / OTP app surface |
 //! | [`phash`] | A.7 — `phash/2` and `phash2/1,2` (the externally-observable legacy hashes) |
 //! | [`binmatch`] | A.7 — `binary:compile_pattern/1` + the compiled match/matches/split family |
+//! | [`math_bifs`] | A.7 — the `math` module: bit-exact values + the `badarith` failure surface |
 //! | [`printing`] | A.7 — the `~p`/`~W` printer and `short` float formatting |
 //! | [`ets`] | A.7 — ETS tables: the `ets:*` BIF surface the runtime serves |
 //! | [`ets_spec`] | A.7 — the `ets` match-spec / `select` family + the `info/1,2` fields |
@@ -62,6 +63,7 @@ mod etf;
 mod ets;
 mod ets_spec;
 mod flags;
+mod math_bifs;
 mod mexec;
 mod modules;
 mod nif;
@@ -337,6 +339,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(bifs::group());
     cases.extend(phash::group());
     cases.extend(binmatch::group());
+    cases.extend(math_bifs::group());
     cases.extend(printing::group());
     cases.extend(ets::group());
     cases.extend(ets_spec::group());
