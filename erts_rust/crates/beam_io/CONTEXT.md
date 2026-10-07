@@ -188,8 +188,8 @@ The bridge that presents a **loaded C driver** (`beam_abi::driver::loader::load`
 the only place in this crate that holds raw `ErlDrv*` pointers and calls foreign code; the four modules are a
 `pub` sub-tree (`pub use crate::abi::*`).
 - `mod.rs` — module docs (the derivation, the stable `ErlDrvPort` handle, the built-in/`.so` unification, the
-  `unsafe`-module marking, the `beam_abi` wiring the four `driver_*` slots still need) + `pub mod host; job;
-  port; table;` + re-exports.
+  `unsafe`-module marking, where each of the four process-global `driver_*` slots reaches or refuses) + `pub mod
+  host; job; port; table;` + re-exports.
 - `host.rs`:
   - `pub trait PortHost` — the runtime hook `beam_io` cannot fill. Required `intern_atom(name) -> Option<Eterm>`;
     defaulted `connected_pid()`/`caller_pid()` (both `None`) and `send_term(to, term) -> bool` (default `false`;
