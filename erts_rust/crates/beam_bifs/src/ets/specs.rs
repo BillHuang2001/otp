@@ -234,6 +234,18 @@ mod tests {
             "ets:match_spec_run/2 projection mismatch"
         );
 
+        // The handle stays live across calls — the oracle's compiled spec is
+        // reusable and the registry does not consume the entry.
+        let a2 = pair(&mut ctx, "a", 2);
+        let second_input = ctx.list(&[a2]).expect("fits");
+        let got = match_spec_run_2(&mut ctx, &[second_input, handle]).expect("reuse");
+        let a_b = ctx.tuple(&[ctx.atom("a").unwrap(), ctx.atom("b").unwrap()]).expect("fits");
+        let expected = ctx.list(&[a_b]).expect("fits");
+        assert!(
+            beam_term::compare::eq(got, expected, &atoms),
+            "a compiled-spec handle must be reusable"
+        );
+
         // A non-matching element is dropped: an atom is not a 2-tuple, so the head
         // never matches it.
         let foo = ctx.atom("foo").expect("seeded");
