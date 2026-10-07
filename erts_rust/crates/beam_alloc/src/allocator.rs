@@ -35,9 +35,9 @@
 
 use core::alloc::Layout;
 use core::ffi::c_void;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use beam_common::Result;
 use parking_lot::Mutex;
@@ -50,8 +50,9 @@ use crate::carrier::{os_page_size, round_up_unit, Carrier};
 use crate::error;
 use crate::free_list::FreeList;
 use crate::size_class::SizeClasses;
-use crate::stats::{AllocStats, Counters};
+use crate::stats::{AllocStats, AllocatorInfo, Counters, TypeStats};
 use crate::strategy::Strategy;
+use crate::types::{AllocatorId, TypeId};
 
 /// Byte alignment of a [`beam_term::prelude::Eterm`] word
 /// (`align_of::<Eterm>()`).
@@ -112,6 +113,162 @@ pub trait Allocator: Send + Sync + 'static {
         // in-bounds and non-aliasing.
         unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, layout.size()) };
         Ok(ptr)
+    }
+
+    // -- Typed (interposition) surface ----------------------------------------------
+    //
+    // The methods below are the *typed* counterparts of `alloc`/`realloc`/`dealloc`:
+    // they carry the allocation [`TypeId`] the caller is allocating for, so an
+    // allocator can attribute the request to the legacy per-type table
+    // (`erts_alloc(TYPE, size)` -> the `blocks[<name>]` rows of
+    // `erts_alloc:info/0`). Every one of them has a default that forwards to the
+    // untyped method, so the trait stays object-safe and an allocator that does not
+    // track types (`stats.rs`'s per-type table is optional) needs no change.
+    //
+    // Untyped and typed calls are *not* interchangeable accounting-wise: an allocator
+    // that implements the typed methods must record the type-attributed event once
+    // (which, for this crate's carrier allocator, also performs the aggregate
+    // accounting), and must never additionally record the untyped aggregate event.
+
+    /// Allocates `layout` for allocation type `ty`.
+    ///
+    /// The default forwards to [`alloc`](Allocator::alloc) and records nothing about
+    /// `ty`; an allocator that keeps a per-type table overrides this (and must then
+    /// perform the aggregate accounting itself so an event is recorded exactly once).
+    fn alloc_typed(&self, _ty: TypeId, layout: Layout) -> Result<NonNull<u8>> {
+        self.alloc(layout)
+    }
+
+    /// Grows or shrinks an allocation of type `ty` to `new_size` bytes, preserving its
+    /// contents up to the smaller of the old and new sizes.
+    ///
+    /// The typed counterpart of [`realloc`](Allocator::realloc); the default forwards
+    /// to it.
+    fn realloc_typed(
+        &self,
+        _ty: TypeId,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_size: usize,
+    ) -> Result<NonNull<u8>> {
+        self.realloc(ptr, old_layout, new_size)
+    }
+
+    /// Frees an allocation of type `ty` previously returned by
+    /// [`alloc_typed`](Allocator::alloc_typed) (or [`realloc_typed`](Allocator::realloc_typed))
+    /// on *this* allocator.
+    ///
+    /// The typed counterpart of [`dealloc`](Allocator::dealloc); the default forwards
+    /// to it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must have been returned by `alloc_typed`/`realloc_typed` on this
+    /// allocator, must not be used afterwards, and `layout` must be the layout it was
+    /// allocated with.
+    unsafe fn dealloc_typed(&self, _ty: TypeId, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller upheld `dealloc`'s contract.
+        unsafe { self.dealloc(ptr, layout) }
+    }
+
+    /// Allocates `size` bytes of allocation type `ty` at the default alignment
+    /// ([`MIN_ALIGN`]).
+    ///
+    /// "Unsized" because the caller supplies only a byte count, not a full
+    /// [`Layout`] — the shape the legacy `erts_alloc(TYPE, size)` macro and a driver's
+    /// `erl_drv_alloc` have. The default forwards to
+    /// [`alloc_bytes`](Allocator::alloc_bytes).
+    fn alloc_unsized(&self, _ty: TypeId, size: usize) -> Result<NonNull<u8>> {
+        self.alloc_bytes(size)
+    }
+
+    /// Frees the block whose payload is `ptr`, knowing only the pointer.
+    ///
+    /// This is the interposition-friendly inverse of
+    /// [`alloc_unsized`](Allocator::alloc_unsized) (`erts_free(TYPE, ptr)` /
+    /// `erl_drv_free`): the caller does not — and cannot — pass the original layout,
+    /// so the allocator must recover it from the block itself.
+    ///
+    /// # Default behaviour (a bounded header probe)
+    ///
+    /// An allocator that keeps a header *in band* (immediately before the payload) can
+    /// reconstruct the layout; one that does not cannot identify a bare pointer and
+    /// must not free anything. The default therefore probes, in order, the candidate
+    /// alignments this crate's carrier model supports — [`MIN_ALIGN`] followed by
+    /// every power of two up to and including [`os_page_size`] — and calls
+    /// [`dealloc_typed`](Allocator::dealloc_typed) for the **first** candidate whose
+    /// in-band header passes the plausibility check. Two properties make that safe
+    /// and cheap:
+    ///
+    /// * **Bounded.** Only `1 + log2(os_page_size() / MIN_ALIGN)` candidates are
+    ///   tried (9 for a 4 KiB page), whatever the alignment the block was allocated
+    ///   with.
+    /// * **No double free.** The candidate set produces pairwise *distinct* payload
+    ///   offsets `padding_for(align)` — `0` for [`MIN_ALIGN`] and `align - UNIT_SIZE`
+    ///   for each larger power of two — and the plausibility check requires the
+    ///   header's recorded offset to equal the candidate's, so at most one candidate
+    ///   can ever describe a given block.
+    ///
+    /// A pointer that no candidate recognises is left alone (logged, never freed), so
+    /// the default never frees a pointer it cannot identify. The probed layout carries
+    /// only the recovered alignment (its size is `0`): a layout-less free cannot know
+    /// the size, and this crate's [`dealloc`](Allocator::dealloc) derives the whole
+    /// block, size included, from the alignment and the recorded header. An allocator
+    /// whose `dealloc` needs the exact size must override this method.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be `null` or a pointer previously returned by
+    /// [`alloc_unsized`](Allocator::alloc_unsized)/[`alloc_typed`](Allocator::alloc_typed)
+    /// on *this* allocator and not yet freed. A pointer the allocator does not
+    /// recognise is refused, but the pointer itself still has to be a value the
+    /// allocator could plausibly have produced (in particular, a pointer into memory
+    /// this process may read just below).
+    unsafe fn dealloc_unsized(&self, ty: TypeId, ptr: NonNull<u8>) {
+        let payload = ptr.as_ptr();
+        for align in probe_alignments() {
+            let offset = padding_for(align);
+            let block_start = payload.wrapping_sub(BLOCK_HEADER_SIZE + offset);
+            if !plausible_header_at(block_start, offset) {
+                continue;
+            }
+            // SAFETY: `dealloc_typed`'s contract is `ptr` came from a typed allocation
+            // on this allocator; the in-band header just identified it as a block
+            // allocated with alignment `align`, and it is freed exactly once because
+            // no other candidate can share this payload offset.
+            if let Ok(layout) = Layout::from_size_align(0, align) {
+                unsafe { self.dealloc_typed(ty, ptr, layout) };
+            }
+            return;
+        }
+        beam_common::beam_debug!(
+            "beam_alloc: refusing to free an unrecognised block at {payload:p}"
+        );
+    }
+
+    /// The per-*type* counters this allocator has accumulated for allocation type
+    /// `ty`.
+    ///
+    /// The default reports the all-zero value: an allocator that does not keep the
+    /// per-type table records nothing. Introspection only — it must not be called on
+    /// an allocation hot path.
+    fn type_stats(&self, _ty: TypeId) -> TypeStats {
+        TypeStats::default()
+    }
+
+    /// The allocator's `=allocator:<name>` report section.
+    ///
+    /// Returns the per-allocator item list of
+    /// [`AllocatorInfo::from_stats`](crate::stats::AllocatorInfo::from_stats) over
+    /// [`stats`](Allocator::stats). The default adds no per-type rows; an allocator
+    /// that keeps a per-type table overrides this to append one
+    /// [`push_type`](crate::stats::AllocatorInfo::push_type) row set per allocation
+    /// type bound to it.
+    ///
+    /// Introspection only — it snapshots the counters and builds a `Vec`, so it must
+    /// never run on an allocation hot path.
+    fn allocator_info(&self) -> AllocatorInfo {
+        AllocatorInfo::from_stats(report_name(self.name()), &self.stats())
     }
 }
 
@@ -249,6 +406,91 @@ fn padding_for(align: usize) -> usize {
     }
 }
 
+/// The alignments [`Allocator::dealloc_unsized`] probes, in order.
+///
+/// [`MIN_ALIGN`] comes first and stands in for every alignment at or below it (they
+/// all have a zero payload offset); each following entry is the next power of two up
+/// to and including [`os_page_size`], the largest alignment the carrier model serves.
+/// The sequence is finite — `1 + log2(os_page_size() / MIN_ALIGN)` items — and its
+/// entries have pairwise distinct payload offsets ([`padding_for`]), which is what
+/// keeps the probe from ever matching one block twice.
+fn probe_alignments() -> impl Iterator<Item = usize> {
+    let page = os_page_size();
+    let mut next = MIN_ALIGN;
+    core::iter::from_fn(move || {
+        if next > page {
+            return None;
+        }
+        let align = next;
+        next = next.saturating_mul(2);
+        Some(align)
+    })
+}
+
+/// Whether `header` looks like one this crate's carrier allocator wrote for a payload
+/// at padding `offset`.
+fn plausible_header(header: &BlockHdr, offset: usize) -> bool {
+    let flags = BlockFlags::from_bits(header.flags);
+    header.size % UNIT_SIZE == 0
+        && header.size >= BLOCK_HEADER_SIZE + offset
+        && header.size <= MAX_BLOCK_SIZE
+        && header.payload_offset == offset
+        && header.flags & !ALL_FLAGS == 0
+        && (header.class == CLASS_NONE) == flags.is_large()
+        && (header.class == CLASS_NONE || usize::from(header.class) < MAX_CLASS_COUNT)
+}
+
+/// The module-level form of the header plausibility check, reading the header word at
+/// `block_start`.
+///
+/// Used by the default [`Allocator::dealloc_unsized`] probe (the concrete
+/// [`CarrierAllocator`] reaches the same predicate through its own `locate`).
+fn plausible_header_at(block_start: *mut u8, offset: usize) -> bool {
+    // SAFETY: `block_start` is where this crate's carrier allocator puts the header of
+    // a block allocated with the candidate alignment, so the 16-byte read is in-bounds
+    // for any block *this crate* created. The caller's contract is that `block_start`
+    // is a plausible address (a pointer this allocator could have produced); a header
+    // that is not one of ours is rejected by the predicate below instead of trusted,
+    // and a caller that violates the contract yields an unverifiable address that the
+    // predicate merely declines to recognise.
+    let header = unsafe { BlockHeader::load(block_start) };
+    plausible_header(&header, offset)
+}
+
+/// The [`AllocatorId`] whose declared name is `name`, if any.
+///
+/// The registry names every allocator after its id ([`AllocatorId::as_str`]), so this
+/// is how an allocator recovers "which declared allocator am I?" for the
+/// `=allocator:<name>` report and for its allocation-type listing.
+fn allocator_id_for_name(name: &str) -> Option<AllocatorId> {
+    AllocatorId::ALL.into_iter().find(|id| id.as_str() == name)
+}
+
+/// Resolves an allocator's runtime `name` to the `&'static str` an
+/// [`AllocatorInfo`] carries.
+///
+/// The report stores its allocator name as a `&'static str` (it is compared against
+/// the declared allocator identifiers), while an allocator's configured name is a
+/// runtime `String`. A name that matches a declared [`AllocatorId`] — every allocator
+/// the registry builds — resolves to that id's already-`'static` name and allocates
+/// nothing. Any other name (only a directly-constructed test allocator) is interned
+/// **once** in a process-global table, so repeated report snapshots neither leak
+/// repeatedly nor grow without bound.
+fn report_name(name: &str) -> &'static str {
+    if let Some(id) = allocator_id_for_name(name) {
+        return id.as_str();
+    }
+    static INTERNED: LazyLock<Mutex<HashSet<&'static str>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let mut interned = INTERNED.lock();
+    if let Some(&known) = interned.get(name) {
+        return known;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    interned.insert(leaked);
+    leaked
+}
+
 /// The mutable, mutex-guarded state of a [`CarrierAllocator`].
 #[derive(Default)]
 struct AllocatorState {
@@ -302,16 +544,54 @@ impl AllocatorState {
         Some(removed)
     }
 
-    /// Records a newly mapped carrier.
-    fn note_carrier_up(&mut self, bytes: usize) {
-        self.counters.note_carrier_up(bytes);
+    /// Records a newly mapped *single-block* carrier (the dedicated carrier of a large
+    /// request), which the report counts as an SBC and as part of the aggregate.
+    fn note_sbc_carrier_up(&mut self, bytes: usize) {
+        self.counters.note_sbc_carrier_up(bytes);
         self.mapped_bytes = self.mapped_bytes.saturating_add(bytes);
     }
 
-    /// Records a carrier returned to the OS.
-    fn note_carrier_down(&mut self, bytes: usize) {
-        self.counters.note_carrier_down(bytes);
+    /// Records a single-block carrier of `bytes` returned to the OS.
+    fn note_sbc_carrier_down(&mut self, bytes: usize) {
+        self.counters.note_sbc_carrier_down(bytes);
         self.mapped_bytes = self.mapped_bytes.saturating_sub(bytes);
+    }
+
+    /// Records a newly mapped *multi-block* carrier (a slab carrier subdivided into one
+    /// class's blocks), which the report counts as an MBC and as part of the aggregate.
+    fn note_mbc_carrier_up(&mut self, bytes: usize) {
+        self.counters.note_mbc_carrier_up(bytes);
+        self.mapped_bytes = self.mapped_bytes.saturating_add(bytes);
+    }
+
+    /// Records a multi-block carrier of `bytes` returned to the OS.
+    #[allow(dead_code)]
+    fn note_mbc_carrier_down(&mut self, bytes: usize) {
+        self.counters.note_mbc_carrier_down(bytes);
+        self.mapped_bytes = self.mapped_bytes.saturating_sub(bytes);
+    }
+
+    /// Records a successful allocation of `bytes`, attributing it to `ty` when the
+    /// caller asked for per-type accounting.
+    ///
+    /// The typed counter method performs the aggregate accounting itself, so exactly
+    /// one of the two branches runs for a given event: the
+    /// `stats.carriers == stats.sbc_carriers + stats.mbc_carriers` invariant and the
+    /// `live_blocks`/`live_bytes` totals stay exact.
+    fn note_alloc_for(&mut self, ty: Option<TypeId>, bytes: usize) {
+        match ty {
+            Some(ty) => self.counters.note_alloc_typed(ty.index(), bytes),
+            None => self.counters.note_alloc(bytes),
+        }
+    }
+
+    /// Records a free of `bytes`, attributing it to `ty` when the caller asked for
+    /// per-type accounting.
+    fn note_free_for(&mut self, ty: Option<TypeId>, bytes: usize) {
+        match ty {
+            Some(ty) => self.counters.note_free_typed(ty.index(), bytes),
+            None => self.counters.note_free(bytes),
+        }
     }
 
     /// Bumps the per-carrier free-block tally for `base`.
@@ -434,14 +714,7 @@ impl CarrierAllocator {
     /// Whether `header` looks like one this allocator wrote for a payload at
     /// padding `offset`.
     fn plausible(header: &BlockHdr, offset: usize) -> bool {
-        let flags = BlockFlags::from_bits(header.flags);
-        header.size % UNIT_SIZE == 0
-            && header.size >= BLOCK_HEADER_SIZE + offset
-            && header.size <= MAX_BLOCK_SIZE
-            && header.payload_offset == offset
-            && header.flags & !ALL_FLAGS == 0
-            && (header.class == CLASS_NONE) == flags.is_large()
-            && (header.class == CLASS_NONE || usize::from(header.class) < MAX_CLASS_COUNT)
+        plausible_header(header, offset)
     }
 
     /// Rejects an allocation that would push the mapped footprint past the
@@ -456,8 +729,13 @@ impl CarrierAllocator {
     }
 
     /// The slab path: serves `size` bytes from the `size <= large_threshold` class
-    /// with `MIN_ALIGN`-or-weaker alignment.
-    fn alloc_small(&self, state: &mut AllocatorState, size: usize) -> Result<NonNull<u8>> {
+    /// with `MIN_ALIGN`-or-weaker alignment, recording the allocation for `ty`.
+    fn alloc_small(
+        &self,
+        state: &mut AllocatorState,
+        size: usize,
+        ty: Option<TypeId>,
+    ) -> Result<NonNull<u8>> {
         let classes = &self.config.classes;
         let Some(class) = classes.class_for(size) else {
             return Err(error::carrier_failure(size));
@@ -497,7 +775,7 @@ impl CarrierAllocator {
         // mapping, `UNIT_SIZE`-aligned, and not overlapping the payload handed out
         // below.
         unsafe { BlockHeader::store(block_start, header) };
-        state.counters.note_alloc(block_size);
+        state.note_alloc_for(ty, block_size);
         // SAFETY: `payload` points into a live carrier mapping and is non-null (it is
         // derived from a successful `mmap` base).
         Ok(unsafe { NonNull::new_unchecked(payload) })
@@ -523,7 +801,7 @@ impl CarrierAllocator {
         carrier.set_block_count(0);
         carrier.set_free_count(0);
         let mapped = carrier.size();
-        state.note_carrier_up(mapped);
+        state.note_mbc_carrier_up(mapped);
         let index = state.insert_carrier(carrier);
         let class = class as u16;
         let AllocatorState {
@@ -535,12 +813,14 @@ impl CarrierAllocator {
     }
 
     /// The large path: a dedicated single-block carrier for a request larger than
-    /// the threshold or more aligned than [`MIN_ALIGN`].
+    /// the threshold or more aligned than [`MIN_ALIGN`], recording the allocation for
+    /// `ty`.
     fn alloc_large(
         &self,
         state: &mut AllocatorState,
         size: usize,
         align: usize,
+        ty: Option<TypeId>,
     ) -> Result<NonNull<u8>> {
         let payload_offset = padding_for(align);
         let needed = BLOCK_HEADER_SIZE
@@ -561,7 +841,7 @@ impl CarrierAllocator {
         carrier.set_class(None);
         carrier.set_block_count(1);
         carrier.set_free_count(0);
-        state.note_carrier_up(block_size);
+        state.note_sbc_carrier_up(block_size);
         state.insert_carrier(carrier);
         let mut flags = BlockFlags::empty();
         flags.set_large();
@@ -576,17 +856,21 @@ impl CarrierAllocator {
         // SAFETY: `base` is the start of the mapping this block owns, is
         // `UNIT_SIZE`-aligned, and the header occupies its first 16 bytes only.
         unsafe { BlockHeader::store(base, header) };
-        state.counters.note_alloc(block_size);
+        state.note_alloc_for(ty, block_size);
         // SAFETY: the payload starts `BLOCK_HEADER_SIZE + payload_offset` bytes into a
         // mapping of `block_size >=` that plus `size` bytes, so it is in-bounds; it is
         // non-null because it derives from a page-aligned mapping base.
         let payload = unsafe { base.add(BLOCK_HEADER_SIZE + payload_offset) };
         Ok(unsafe { NonNull::new_unchecked(payload) })
     }
-}
 
-impl Allocator for CarrierAllocator {
-    fn alloc(&self, layout: Layout) -> Result<NonNull<u8>> {
+    /// The shared allocation path behind [`Allocator::alloc`] and
+    /// [`Allocator::alloc_typed`].
+    ///
+    /// `ty` is `None` for the untyped entry point (aggregate accounting only) and
+    /// `Some(..)` when the caller asked for per-type attribution; the chosen branch
+    /// records the allocation exactly once.
+    fn alloc_impl(&self, layout: Layout, ty: Option<TypeId>) -> Result<NonNull<u8>> {
         let size = layout.size();
         let align = layout.align();
         if !align.is_power_of_two() || align > os_page_size() {
@@ -594,17 +878,21 @@ impl Allocator for CarrierAllocator {
         }
         let mut state = self.state.lock();
         if size <= self.config.classes.large_threshold() && align <= UNIT_SIZE {
-            self.alloc_small(&mut state, size)
+            self.alloc_small(&mut state, size, ty)
         } else {
-            self.alloc_large(&mut state, size, align)
+            self.alloc_large(&mut state, size, align, ty)
         }
     }
 
-    fn realloc(
+    /// The shared reallocation path behind [`Allocator::realloc`] and
+    /// [`Allocator::realloc_typed`]; `ty` selects the accounting of the alloc + free
+    /// pair a growing move performs.
+    fn realloc_impl(
         &self,
         ptr: NonNull<u8>,
         old_layout: Layout,
         new_size: usize,
+        ty: Option<TypeId>,
     ) -> Result<NonNull<u8>> {
         let old_size = old_layout.size();
         let align = old_layout.align();
@@ -615,7 +903,8 @@ impl Allocator for CarrierAllocator {
         let capacity = header.size - BLOCK_HEADER_SIZE - header.payload_offset;
         if new_size <= capacity {
             // The block's payload capacity is unchanged, so the header (and hence the
-            // byte accounting) stays as it is: the caller simply uses less of it.
+            // byte accounting) stays as it is: the caller simply uses less of it. The
+            // block keeps its allocation type, so no per-type event is due either.
             self.state.lock().counters.note_realloc();
             return Ok(ptr);
         }
@@ -624,7 +913,7 @@ impl Allocator for CarrierAllocator {
         // NOTE: the move performs a real alloc + free, so `alloc_calls`/`free_calls`
         // also advance; `live_bytes` stays exact because both sides use the block's
         // own recorded size.
-        let new_ptr = self.alloc(new_layout)?;
+        let new_ptr = self.alloc_impl(new_layout, ty)?;
         // SAFETY: both blocks are live and owned exclusively by the caller, the copy
         // length fits both (it is at most the old block's capacity and the new
         // block's), and the two blocks are distinct allocations, hence disjoint.
@@ -634,11 +923,18 @@ impl Allocator for CarrierAllocator {
         self.state.lock().counters.note_realloc();
         // SAFETY: `ptr`/`old_layout` are the caller's live allocation on this
         // allocator and it is not used after this call.
-        unsafe { self.dealloc(ptr, old_layout) };
+        unsafe { self.dealloc_impl(ptr, old_layout, ty) };
         Ok(new_ptr)
     }
 
-    unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
+    /// The shared free path behind [`Allocator::dealloc`] and
+    /// [`Allocator::dealloc_typed`].
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Allocator::dealloc`]: `ptr` must be a live allocation of
+    /// this allocator made with `layout`, and must not be used afterwards.
+    unsafe fn dealloc_impl(&self, ptr: NonNull<u8>, layout: Layout, ty: Option<TypeId>) {
         let payload = ptr.as_ptr();
         let Some((block_start, header)) = Self::locate(payload, layout.align()) else {
             beam_common::beam_debug!(
@@ -657,8 +953,8 @@ impl Allocator for CarrierAllocator {
                     // was just removed from the allocator's table, so the mapping is
                     // unmapped exactly once.
                     unsafe { carrier.unmap() };
-                    state.note_carrier_down(header.size);
-                    state.counters.note_free(header.size);
+                    state.note_sbc_carrier_down(header.size);
+                    state.note_free_for(ty, header.size);
                 }
                 None => beam_common::beam_debug!(
                     "beam_alloc: large block without a registered carrier at {payload:p}"
@@ -687,11 +983,100 @@ impl Allocator for CarrierAllocator {
         // mapping, and the block is the caller's exclusively until it is returned here.
         unsafe { BlockHeader::store(block_start, returned) };
         match state.return_block(class, payload, header.carrier as usize) {
-            Ok(()) => state.counters.note_free(header.size),
+            Ok(()) => state.note_free_for(ty, header.size),
             Err(_) => beam_common::beam_debug!(
                 "beam_alloc: could not return a block of class {class} to its free list"
             ),
         }
+    }
+}
+
+impl Allocator for CarrierAllocator {
+    fn alloc(&self, layout: Layout) -> Result<NonNull<u8>> {
+        self.alloc_impl(layout, None)
+    }
+
+    fn alloc_typed(&self, ty: TypeId, layout: Layout) -> Result<NonNull<u8>> {
+        self.alloc_impl(layout, Some(ty))
+    }
+
+    fn realloc(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_size: usize,
+    ) -> Result<NonNull<u8>> {
+        self.realloc_impl(ptr, old_layout, new_size, None)
+    }
+
+    fn realloc_typed(
+        &self,
+        ty: TypeId,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_size: usize,
+    ) -> Result<NonNull<u8>> {
+        self.realloc_impl(ptr, old_layout, new_size, Some(ty))
+    }
+
+    unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: forwarded unchanged from the caller.
+        unsafe { self.dealloc_impl(ptr, layout, None) };
+    }
+
+    unsafe fn dealloc_typed(&self, ty: TypeId, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: forwarded unchanged from the caller.
+        unsafe { self.dealloc_impl(ptr, layout, Some(ty)) };
+    }
+
+    fn alloc_unsized(&self, ty: TypeId, size: usize) -> Result<NonNull<u8>> {
+        let layout = Layout::from_size_align(size, MIN_ALIGN)
+            .map_err(|_| error::bad_align(MIN_ALIGN))?;
+        self.alloc_impl(layout, Some(ty))
+    }
+
+    unsafe fn dealloc_unsized(&self, ty: TypeId, ptr: NonNull<u8>) {
+        let payload = ptr.as_ptr();
+        // The same bounded probe the trait default describes, driven by this
+        // allocator's own `locate`/`plausible` header check: `MIN_ALIGN` (payload
+        // offset 0, covering every alignment at or below it) followed by each power of
+        // two up to the page size. The candidates have pairwise distinct payload
+        // offsets, so at most one can match and the block is freed at most once; a
+        // pointer nothing recognises is refused.
+        for align in probe_alignments() {
+            if Self::locate(payload, align).is_some() {
+                if let Ok(layout) = Layout::from_size_align(0, align) {
+                    // SAFETY: `ptr` is a live block of this allocator (the caller's
+                    // contract) whose header `locate` has just accepted for `align`.
+                    unsafe { self.dealloc_impl(ptr, layout, Some(ty)) };
+                }
+                return;
+            }
+        }
+        beam_common::beam_debug!(
+            "beam_alloc: refusing to free an unrecognised block at {payload:p}"
+        );
+    }
+
+    fn type_stats(&self, ty: TypeId) -> TypeStats {
+        // The per-type table lives in the allocator's counters (a mismatched typed
+        // free saturates at zero rather than corrupting it), so the snapshot is the
+        // only reader: `AllocStats::type_stats` is the accessor for one slot.
+        self.state.lock().counters.snapshot().type_stats(ty.index())
+    }
+
+    fn allocator_info(&self) -> AllocatorInfo {
+        let stats = self.stats();
+        let mut info = AllocatorInfo::from_stats(report_name(self.name()), &stats);
+        // A registry allocator is named after its `AllocatorId`, which is what tells it
+        // which allocation types are bound to it; a directly-constructed allocator has
+        // no id and reports only its per-allocator items.
+        if let Some(id) = allocator_id_for_name(self.name()) {
+            for ty in crate::types::types_for_allocator(id) {
+                info.push_type(ty.name(), stats.type_stats(ty.index()));
+            }
+        }
+        info
     }
 
     fn stats(&self) -> AllocStats {
