@@ -32,8 +32,8 @@ use beam_term::{make_small, Atom, Eterm};
 // `families::dispatch` "widened opcode not yet executed" sentinel. A regression
 // that turns a typed error into a value (or into the sentinel) fails here.
 //
-// Corpus reachability (evidence: `tests/census.rs`'s counts over the installed
-// OTP's 261 stdlib/kernel/compiler modules, 793,319 instructions):
+// Corpus reachability (evidence: `tests/census.rs`'s counts over the whole installed
+// OTP — 1366 `.beam` over 34 applications, 2,942,736 instructions):
 //   * CORPUS-REACHABLE  — the installed toolchain emits the instruction today, so
 //     the gap is a live limitation a real module can hit.
 //   * FORWARD-COMPAT-ONLY — the instruction has **zero** corpus occurrences, so the
@@ -323,18 +323,38 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         );
     }
     {
-        // `put_record`'s **create** form (`Src == nil`): the C resolves the record
-        // definition through the code server's record table (`erl_record.c:102-170`),
-        // a facility this runtime does not have. FORWARD-COMPAT (see above).
+        // `put_record`'s **create** form (`Src == nil`) now builds the running
+        // module's **own** record (`src/families/records/mod.rs::create_native_record`
+        // over `beam_loader::Module::records`). The one genuine remaining gap is an
+        // `Id` naming **another module's** record: C resolves that through the code
+        // server's record table (`erl_create_native_record_jit`,
+        // `erl_record.c:412-500`), a facility this runtime does not have — never a
+        // guessed definition. The `{Module,Name}` pair is a real tuple term, so it is
+        // materialized in `x(0)` and passed as a register operand (the foreign module
+        // `other` differs from the running module `gap`). FORWARD-COMPAT (see above):
+        // no installed toolchain emits the native-record family.
         let mut f = GapFixture::new();
+        let foreign = f.atom("other");
         let rec = f.atom("rec");
         let code = vec![
             Instr::Label(Label(1)),
+            Instr::Move {
+                src: Operand::Atom(foreign),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::Atom(rec),
+                dst: Operand::X(1),
+            },
+            Instr::PutTuple2 {
+                dst: Operand::X(0),
+                elements: vec![Operand::X(0), Operand::X(1)],
+            },
             Instr::PutRecord {
                 fail: NO_FAIL,
-                id: Operand::Atom(rec),
+                id: Operand::X(0),
                 src: Operand::Nil,
-                dst: Operand::X(0),
+                dst: Operand::X(2),
                 live: 0,
                 updates: vec![],
             },
@@ -343,9 +363,9 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         let entry = f.add_function("f", 0, code);
         let module = f.finish();
         pin(
-            "put_record/create",
+            "put_record/create-foreign-module",
             run_gap(&module, entry, &[]),
-            "put_record: create (record definition table unavailable)",
+            "put_record: create: no record definition table for another module",
         );
     }
     {

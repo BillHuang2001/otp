@@ -16,12 +16,27 @@
 //! described below:
 //!
 //! * this file — the module docs, the shared `env_for` helper, the exported `driver_term_nil` data
-//!   symbol, and the `#[used]` [`DRIVER_API`] table that names every implemented slot (so the
-//!   signature check against the one frozen table lives here);
+//!   symbol, and the `#[used]` [`DRIVER_API`] table assembled from the per-file `populate` chain
+//!   (so the signature check against the one frozen table lives here);
 //! * `mem` — **part 1, host-free**: the functions that need no port, no scheduler and no runtime
-//!   service;
+//!   service, plus their `populate` step;
 //! * `port` — **part 2, port/host-dependent**: the functions whose `ErlDrvPort` operand **is** the
-//!   pointer [`DriverEnv::as_port`] hands out ([`DriverEnv::from_port`] recovers it).
+//!   pointer [`DriverEnv::as_port`] hands out ([`DriverEnv::from_port`] recovers it), plus their
+//!   `populate` step;
+//! * `lifecycle`, `queues`, `threads` — **not-yet-implemented families**: each owns the slot list
+//!   for one group of the C surface and contributes a (currently no-op) `populate` step, so a later
+//!   workstream can wire that family without editing this file;
+//! * `pdl` — **implemented**: the port data lock, the driver monitors, the deprecated
+//!   `driver_get_now` wall clock, and the (deliberately `None`) binary refcount trio — see that
+//!   file's header for the semantics and the documented deviations.
+//!
+//! # Table assembly
+//!
+//! [`DRIVER_API`] starts from the all-`None` [`EMPTY_DRIVER_API`] and is threaded through the
+//! `const fn populate` of every file above, innermost-first
+//! (`lifecycle → pdl → queues → threads → mem → port`). Each file is therefore the single owner of
+//! the `Some(…)` list for the slots it implements; the whole chain is `const`, so it folds at
+//! compile time and the frozen table's *shape* is unchanged.
 //!
 //! # Scope: part 1 (host-free) and part 2 (port/host-dependent)
 //!
@@ -58,13 +73,10 @@
 //!   `remove_driver_entry`, `driver_lock_driver`, `erl_drv_init_ack`, `erl_drv_set_os_pid`,
 //!   `erl_drv_busy_msgq_limits`, the `driver_failure*`/`driver_exit` family, `set_busy_port`,
 //!   `set_port_control_flags`, `get_port_flags`.
-//! * **monitors & port data lock** — the `driver_monitor_*` family and the whole `driver_pdl_*`
-//!   family.
 //! * **async thread pool** — `driver_async_port_key` (the "fair" async key is derived from the
 //!   port's id term, which this seam has no representation for).
 //! * **threads** — the whole `erl_drv_mutex_*`/`erl_drv_cond_*`/`erl_drv_rwlock_*`/`erl_drv_tsd_*`/
 //!   `erl_drv_thread_*`/`erl_drv_*_name` family.
-//! * **deprecated** — `driver_get_now` (`ERL_DRV_DEPRECATED_FUNC`).
 //!
 //! The **binary refcount trio** (`driver_binary_get_refc`/`inc_refc`/`dec_refc`) is `None` too, and
 //! deliberately: the frozen [`ErlDrvBinary`](crate::driver::types::ErlDrvBinary) layout is exactly `{ orig_size, orig_bytes }` (16 bytes,
@@ -113,8 +125,12 @@
 //! recovery ([`DriverEnv::from_port`]) and the raw operand reads of the term-data/vector/binary
 //! arguments; each is reached only through one documented helper.
 
+mod lifecycle;
 mod mem;
+mod pdl;
 mod port;
+mod queues;
+mod threads;
 
 use beam_term::prelude::NIL;
 
@@ -183,48 +199,16 @@ const EMPTY_DRIVER_API: ErlDrvApi = unsafe { core::mem::zeroed() };
 /// `#[used]` keeps this static (and hence the `#[no_mangle]` functions it names) in the linkage, so a
 /// driver `.so` loaded into the process can resolve them. Slots left `None` are listed in the module
 /// header.
+///
+/// The table is assembled by a `const fn` `populate` chain: **each file owns the `Some(…)` list for
+/// the slots it implements** (`mem` the host-free group, `port` the port/host-dependent group, and
+/// the `lifecycle`/`pdl`/`queues`/`threads` family stubs the not-yet-implemented groups), so a later
+/// workstream can wire a family without ever editing this file. The chain starts from the all-`None`
+/// [`EMPTY_DRIVER_API`], and every step is `const`, so it folds entirely at compile time.
 #[used]
-static DRIVER_API: ErlDrvApi = ErlDrvApi {
-    driver_alloc: Some(driver_alloc),
-    driver_free: Some(driver_free),
-    driver_realloc: Some(driver_realloc),
-    driver_alloc_binary: Some(driver_alloc_binary),
-    driver_realloc_binary: Some(driver_realloc_binary),
-    driver_free_binary: Some(driver_free_binary),
-    // Part 2: the port/host-dependent slots (see the module header).
-    driver_output: Some(driver_output),
-    driver_output2: Some(driver_output2),
-    driver_output_binary: Some(driver_output_binary),
-    driver_outputv: Some(driver_outputv),
-    driver_output_term: Some(driver_output_term),
-    driver_send_term: Some(driver_send_term),
-    erl_drv_output_term: Some(erl_drv_output_term),
-    erl_drv_send_term: Some(erl_drv_send_term),
-    driver_mk_atom: Some(driver_mk_atom),
-    driver_mk_port: Some(driver_mk_port),
-    driver_connected: Some(driver_connected),
-    driver_caller: Some(driver_caller),
-    driver_select: Some(driver_select),
-    driver_set_timer: Some(driver_set_timer),
-    driver_cancel_timer: Some(driver_cancel_timer),
-    driver_read_timer: Some(driver_read_timer),
-    driver_async: Some(driver_async),
-    driver_system_info: Some(driver_system_info),
-    null_func: Some(null_func),
-    erl_errno_id: Some(erl_errno_id),
-    erl_drv_consume_timeslice: Some(erl_drv_consume_timeslice),
-    erl_drv_monotonic_time: Some(erl_drv_monotonic_time),
-    erl_drv_time_offset: Some(erl_drv_time_offset),
-    erl_drv_convert_time_unit: Some(erl_drv_convert_time_unit),
-    driver_dl_open: Some(driver_dl_open),
-    driver_dl_sym: Some(driver_dl_sym),
-    driver_dl_close: Some(driver_dl_close),
-    driver_dl_error: Some(driver_dl_error),
-    erl_drv_putenv: Some(erl_drv_putenv),
-    erl_drv_getenv: Some(erl_drv_getenv),
-    driver_mk_term_nil: Some(driver_mk_term_nil),
-    ..EMPTY_DRIVER_API
-};
+static DRIVER_API: ErlDrvApi = lifecycle::populate(pdl::populate(queues::populate(
+    threads::populate(mem::populate(port::populate(EMPTY_DRIVER_API))),
+)));
 
 /// The populated `driver_*` / `erl_drv_*` table (see [`DRIVER_API`]).
 pub fn driver_api_table() -> &'static ErlDrvApi {
@@ -307,25 +291,30 @@ mod tests {
             t.driver_cancel_timer.is_some(),
             t.driver_read_timer.is_some(),
             t.driver_async.is_some(),
+            // Part 3: the port-queue family (`queues`).
+            t.driver_vec_to_buf.is_some(),
+            t.driver_enq.is_some(),
+            t.driver_pushq.is_some(),
+            t.driver_deq.is_some(),
+            t.driver_sizeq.is_some(),
+            t.driver_enq_bin.is_some(),
+            t.driver_pushq_bin.is_some(),
+            t.driver_peekqv.is_some(),
+            t.driver_peekq.is_some(),
+            t.driver_enqv.is_some(),
+            t.driver_pushqv.is_some(),
         ];
         assert!(
             populated.iter().all(|&p| p),
             "every implemented slot must be populated: {populated:?}"
         );
 
-        // The families that need runtime structure this seam does not expose stay `None`.
-        assert!(t.driver_vec_to_buf.is_none());
-        assert!(t.driver_enq.is_none());
-        assert!(t.driver_pushq.is_none());
-        assert!(t.driver_monitor_process.is_none());
-        assert!(t.erl_drv_mutex_create.is_none());
+        // The families that need runtime structure this seam does not expose stay `None`
+        // (`driver_create_port` needs a real port registry; the binary-refcount trio has no
+        // refcount word in the frozen `ErlDrvBinary` layout). Which of the other slots are still
+        // `None` is deliberately NOT asserted here — it changes as families land, and each
+        // family's own test pins its own slots. See `CONTEXT.md` for the current status.
         assert!(t.driver_create_port.is_none());
-        assert!(t.driver_async_port_key.is_none());
-        assert!(t.erl_drv_init_ack.is_none());
-        assert!(t.set_busy_port.is_none());
-        assert!(t.driver_failure_eof.is_none());
-        assert!(t.driver_pdl_create.is_none());
-        // No refcount word exists in the frozen `ErlDrvBinary` layout.
         assert!(t.driver_binary_get_refc.is_none());
         assert!(t.driver_binary_inc_refc.is_none());
         assert!(t.driver_binary_dec_refc.is_none());

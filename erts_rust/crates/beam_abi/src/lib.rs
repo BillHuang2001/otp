@@ -7,10 +7,12 @@
 //! `erl_driver.h`) so that a NIF/driver compiled against the *unmodified* OTP headers links against
 //! Rust ERTS and behaves identically. This is the **link-time frozen-header seam** of Part II §C.
 //!
-//! The crate **declares types only** — no `enif_*`/`erl_drv_*` function bodies live here (those
-//! belong to the NIF/driver subsystem in a later pass). What is frozen now is the shape of the
-//! boundary: the types, the layouts, the term transmute, and the `ErlNifApi`/`ErlDrvApi` tables the
-//! runtime must implement and export.
+//! The crate freezes the *shape* of the boundary (the types, the layouts, the term transmute, the
+//! `ErlNifApi`/`ErlDrvApi` function tables) **and implements both host sides**: the `enif_*` bodies
+//! live in [`nif::enif`] (one file per family — `175` of the `176` LP64 slots populated, the seven
+//! C-variadic ones behind the `csrc/nif_variadic.c` shim) and the `driver_*`/`erl_drv_*` bodies in
+//! [`driver::drv`] (`104` of `111` slots). Each side also has a `dlopen`-based loader ([`nif::loader`],
+//! [`driver::loader`]).
 //!
 //! Layouts are pinned by compile-time assertions in [`layout`]; a mismatch is a compile error.
 //!
@@ -31,6 +33,7 @@ pub mod common;
 pub mod driver;
 pub mod layout;
 pub mod nif;
+pub mod sync;
 
 // ---------------------------------------------------------------------------------------------
 // ABI version constants (`erl_nif.h`, `erl_driver.h`)

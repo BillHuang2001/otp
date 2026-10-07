@@ -20,16 +20,31 @@
 //!      **no** core arm and **no** family claims.
 //!
 //!    The census asserts (c) is **empty**: every one of the 106 variants is owned.
+//!    At this revision the measured dynamic split is **49 EXECUTED + 57
+//!    CLAIMED-BLOCKED + 0 UNCLAIMED** (pinned below as `EXECUTED_VARIANTS` /
+//!    `CLAIMED_BLOCKED_VARIANTS`). Many CLAIMED-BLOCKED rows are **probe artifacts**,
+//!    not real gaps: the roster drives every atom-ish operand as the degenerate
+//!    `Operand::Nil` (a real operand the family then rejects with a typed error), so
+//!    e.g. `IsNativeRecord`/`IsRecordAccessible` report `… : module`/`… : scope`
+//!    because the family correctly requires an atom the probe never supplies, and
+//!    `PutRecord`'s `id: nil()` probe is neither an atom nor a `{Module,Name}` pair.
+//!    Those variants have zero corpus occurrences (the installed toolchain does not
+//!    enable the `native_record` feature); the real capability gaps are named in
+//!    `tests/gaps.rs`.
 //!
 //! 2. [`interpreter_execution_census_over_every_test_kind`] does the same for all
-//!    25 [`TestKind`]s packed into one `Instr::Test` each.
+//!    25 [`TestKind`]s packed into one `Instr::Test` each; all **25/25** execute
+//!    (0 claimed-blocked, 0 unclaimed).
 //!
-//! 3. [`corpus_reachability_census`] loads **every** `.beam` of the installed OTP
-//!    `stdlib`/`kernel`/`compiler`, walks every lowered instruction of every
-//!    function, and counts occurrences per variant — the quantitative evidence for
-//!    which variants real compiler output actually emits. It asserts that every
-//!    variant with a non-zero corpus count is class (a) or (b) (nothing the corpus
-//!    reaches may be unclaimed) and names the zero-occurrence variants explicitly.
+//! 3. [`corpus_reachability_census`] loads **every** `.beam` of the whole installed
+//!    OTP (the generic `support::all_otp_beams` walk — every application, its `ebin`
+//!    modules plus any compiled examples it ships), walks every lowered instruction
+//!    of every function, and counts occurrences per variant — the quantitative
+//!    evidence for which variants real compiler output actually emits. It asserts
+//!    that every variant with a non-zero corpus count is class (a) or (b) (nothing
+//!    the corpus reaches may be unclaimed) and names the zero-occurrence variants
+//!    explicitly. (This is the same file set `tests/stdlib_sweep.rs` proves loads in
+//!    full — currently ≈1366 `.beam` over ≈34 applications.)
 //!
 //! # Synthetic-module mechanics
 //!
@@ -71,7 +86,6 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use beam_common::Result;
 use beam_engine::{Machine, MinimalContext};
@@ -80,7 +94,7 @@ use beam_loader::{
     TestKind,
 };
 use beam_term::{Atom, Eterm};
-use support::{app_ebin, skip_reason};
+use support::{all_otp_beams, skip_reason};
 
 /// The sentinel `beam_engine::families::dispatch` returns for an instruction that
 /// **no** core arm and **no** instruction family claims.
@@ -93,6 +107,25 @@ const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed";
 /// The number of `beam_loader::Instr` variants this census must drive (the enum's
 /// own roster; a mismatch means the hand-written roster below drifted).
 const INSTR_VARIANTS: usize = 106;
+
+/// The number of [`TestKind`]s (the enum's own roster).
+const TEST_KINDS: usize = 25;
+
+/// The measured **dynamic** classification of the [`INSTR_VARIANTS`] variants at
+/// this census's revision: the probe reached a `Step`/return for **49** of them
+/// (class (a) EXECUTED) and observed a typed, owned capability error for **57**
+/// (class (b) CLAIMED-BLOCKED); **0** are unclaimed.
+///
+/// These are the *dynamic* counts, not the *static* family assignment (30 core arms
+/// + 76 family-owned): a family-owned variant whose degenerate probe happens to
+/// execute classifies as EXECUTED — `SelectTupleArity` on a non-tuple takes the
+/// `fail` branch, exactly like an unmatched arity, and `GetRecordElements`/
+/// `GetRecordElementsId`/`GetRecordField`/`UpdateRecordId` branch to `fail` on a
+/// non-record source. The counts are pinned so a change of classification (a real
+/// regression, or a newly executed variant) fails the build.
+const EXECUTED_VARIANTS: usize = 49;
+/// See [`EXECUTED_VARIANTS`]; class (b) CLAIMED-BLOCKED.
+const CLAIMED_BLOCKED_VARIANTS: usize = 57;
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -369,6 +402,24 @@ fn interpreter_execution_census_over_every_instr_variant() {
         "these {INSTR_VARIANTS} variant(s) have NO core arm and NO claiming family \
          (the `{UNCLAIMED_PREFIX}` sentinel): {unclaimed_names:?}"
     );
+
+    // The dynamic split is pinned (see `EXECUTED_VARIANTS`): a newly executed
+    // variant — or a family/core regression into a typed error — changes it and
+    // must be an intentional, re-measured update.
+    assert_eq!(
+        executed, EXECUTED_VARIANTS,
+        "the census executed {executed} variants, expected {EXECUTED_VARIANTS}"
+    );
+    assert_eq!(
+        blocked, CLAIMED_BLOCKED_VARIANTS,
+        "the census found {blocked} CLAIMED-BLOCKED variants, expected \
+         {CLAIMED_BLOCKED_VARIANTS}"
+    );
+    assert_eq!(
+        executed + blocked + unclaimed,
+        INSTR_VARIANTS,
+        "the census classes must partition all {INSTR_VARIANTS} variants"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +484,20 @@ fn interpreter_execution_census_over_every_test_kind() {
         "these TestKind(s) are not handled by the interpreter's test evaluation: \
          {unclaimed_names:?}"
     );
+
+    // The roster must cover every kind, and all 25/25 must execute (0 claimed-blocked,
+    // 0 unclaimed): the interpreter's test evaluation owns every `TestKind`.
+    assert_eq!(
+        rows.len(),
+        TEST_KINDS,
+        "the census drove {} TestKind(s), expected {TEST_KINDS}",
+        rows.len()
+    );
+    assert_eq!(
+        executed, TEST_KINDS,
+        "only {executed} of {TEST_KINDS} TestKind(s) executed — every kind must"
+    );
+    assert_eq!(blocked, 0, "{blocked} TestKind(s) are CLAIMED-BLOCKED");
 }
 
 /// The `(name, operands)` pair per [`TestKind`], with a correct operand count so the
@@ -483,9 +548,13 @@ fn kind_of(name: &str) -> TestKind {
 // Test 3 — the corpus reachability census
 // ---------------------------------------------------------------------------
 
-/// Walk every `.beam` of the installed OTP `stdlib`/`kernel`/`compiler`, count the
-/// occurrences of every [`Instr`] variant (and every [`TestKind`]), and assert that
-/// nothing the corpus reaches is unclaimed.
+/// Walk **every** `.beam` of the whole installed OTP (the generic
+/// [`support::all_otp_beams`] walk — every application, its `ebin` modules plus any
+/// compiled examples it ships), count the occurrences of every [`Instr`] variant
+/// (and every [`TestKind`]), and assert that nothing the corpus reaches is unclaimed.
+///
+/// This is the same file set `tests/stdlib_sweep.rs::sweep_loads_every_installed_beam`
+/// proves loads in full (currently ≈1366 `.beam` over ≈34 applications).
 #[test]
 fn corpus_reachability_census() {
     if let Some(reason) = skip_reason() {
@@ -493,71 +562,44 @@ fn corpus_reachability_census() {
         return;
     }
 
-    let mut dirs: Vec<(&str, PathBuf)> = Vec::new();
-    for app in ["stdlib", "kernel", "compiler"] {
-        if let Some(dir) = app_ebin(app) {
-            dirs.push((app, dir));
-        }
-    }
-    assert!(
-        !dirs.is_empty(),
-        "no OTP application `ebin` directory was found to sweep"
-    );
+    let beams = all_otp_beams().unwrap_or_default();
+    assert!(!beams.is_empty(), "no OTP `.beam` file was found to sweep");
 
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut kind_counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut modules_total = 0usize;
     let mut modules_loaded = 0usize;
     let mut instr_total = 0usize;
-    let mut per_app: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut per_app: BTreeMap<String, usize> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
 
-    for (app, dir) in &dirs {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().map(|ext| ext == "beam").unwrap_or(false))
-            .collect();
-        files.sort();
-        *per_app.entry(app).or_default() += files.len();
-
-        for path in files {
-            modules_total += 1;
-            let file = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            match load_file(&path) {
-                Ok(module) => {
-                    modules_loaded += 1;
-                    for function in &module.functions {
-                        for instr in &function.code {
-                            instr_total += 1;
-                            *counts.entry(variant_name(instr)).or_default() += 1;
-                            if let Instr::Test { kind, .. } = instr {
-                                *kind_counts.entry(test_kind_name(*kind)).or_default() += 1;
-                            }
+    for beam in &beams {
+        modules_total += 1;
+        *per_app.entry(beam.app.clone()).or_default() += 1;
+        match load_file(&beam.path) {
+            Ok(module) => {
+                modules_loaded += 1;
+                for function in &module.functions {
+                    for instr in &function.code {
+                        instr_total += 1;
+                        *counts.entry(variant_name(instr)).or_default() += 1;
+                        if let Instr::Test { kind, .. } = instr {
+                            *kind_counts.entry(test_kind_name(*kind)).or_default() += 1;
                         }
                     }
                 }
-                Err(error) => {
-                    println!("CENSUS-LOAD-FAIL {app}/{file}: {error:?}");
-                    failures.push(format!("{app}/{file}"));
-                }
+            }
+            Err(error) => {
+                println!("CENSUS-LOAD-FAIL {}/{}: {error:?}", beam.app, beam.module);
+                failures.push(format!("{}/{}", beam.app, beam.module));
             }
         }
     }
 
-    let apps: Vec<String> = per_app
-        .iter()
-        .map(|(app, count)| format!("{app}={count}"))
-        .collect();
     println!(
-        "CENSUS corpus: modules={modules_loaded}/{modules_total} instructions={instr_total} \
-         ({})",
-        apps.join(" ")
+        "CENSUS corpus: modules={modules_loaded}/{modules_total} apps={} \
+         instructions={instr_total}",
+        per_app.len()
     );
 
     let rows = variant_census();
@@ -631,9 +673,15 @@ fn corpus_reachability_census() {
 
     assert!(modules_loaded > 0, "the corpus census loaded no modules");
     assert!(
-        modules_total >= 150,
-        "the corpus census only found {modules_total} `.beam` files — expected \
-         stdlib+kernel (≈200)"
+        modules_total >= 1000,
+        "the corpus census only found {modules_total} `.beam` files — expected the \
+         whole installed OTP (≈1366 over ≈34 applications)"
+    );
+    assert!(
+        per_app.len() >= 20,
+        "the corpus census only covered {} applications — expected the whole \
+         installed OTP (≈34)",
+        per_app.len()
     );
     assert!(
         failures.is_empty(),

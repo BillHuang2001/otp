@@ -20,22 +20,38 @@
 //! | `+hmax N` | maximum heap size, in words (`0` = unlimited) |
 //! | `+hmaxk B` / `+hmaxel B` / `+hmaxib B` | the `+hmax` kill / error-logger / shared-binary flags (`true`\|`false`) |
 //! | `-name N` / `-sname N` | distribution node name |
+//! | `-setcookie C` | distribution cookie (recorded as an init argument; sets `emulator.cookie`) |
+//! | `-config F` | config file, recorded as the init argument `config` |
+//! | `-boot F` | boot script, recorded as the init argument `boot` (consumed by the A.7 boot path) |
+//! | `-emu_flavor F` | emulator flavor: `emu` ⇒ interpreter, `jit`/`smp` ⇒ JIT (recorded) |
+//! | `+Q N` | maximum number of ports (`legacy`, or `1024..=134217727`) |
+//! | `+K true\|false` | kernel-poll switch |
+//! | `+sbt TYPE` | scheduler bind type (`u`/`db`/`s`/`ps`/`ts`/`tnnps`/`nnps`/`nnts`/`ns`) |
+//! | `-M*` / `+MM*` / `+MB*` | ERTS allocator flags (the `+M*` forms are validated; all preserved verbatim) |
 //! | `run File Mod:Func/Arity [Args…]` | load `File`, run the function and print the result |
 //!
-//! # Unknown switches are init arguments, not errors
+//! # `ERL_*FLAGS`
 //!
-//! A switch that is **not** in the table above is **not** a usage error: real `erl`
-//! hands every command-line flag to `init:get_argument/1` (verified:
-//! `erl -noshell --nope -eval 'halt(0).'` exits 0). So an unrecognized `-flag`/`+flag`
-//! is recorded as an init argument — its name the flag with the leading `-`/`+` run
-//! removed, its values the following tokens that do not themselves start with `-`/`+` —
-//! and parsing continues. Only a **stray positional argument** (a token that is neither
-//! a switch, nor part of an action) is a usage error.
+//! The [`run`] driver first merges the `ERL_*FLAGS` environment variables into the
+//! command line, in real `erl`'s order (`initial_argv_massage`):
+//! `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]` — so a
+//! tokenized environment flag is indistinguishable from a command-line flag to
+//! `init:get_argument/1`. See [`parse_with_env`] and [`env`].
 //!
-//! Every *recognized* switch is recorded the same way ([`InitArgs`]), so a program can
-//! observe its own command line: `-noshell` is one valueless occurrence
+//! # Init arguments (`init:get_argument/1`), exactly as the oracle
+//!
+//! A switch that is **not** in the table above is **not** a usage error (real `erl`
+//! accepts unmodeled switches: `erl -noshell --nope -eval 'halt(0).'` exits 0), and
+//! only a **stray positional argument** is a usage error.
+//!
+//! Which switches become **init arguments** follows the oracle exactly: a **`-`-switch**
+//! (recognized or not) is recorded, while a **`+`-flag** and the `-eval`/`-s`/`-run`
+//! Start instructions are consumed by the emulator/`init` and are **not** (the oracle's
+//! `init:get_argument('S'|'Q'|eval|s|run)` is the bare atom `error`; verified against
+//! OTP 29.1.1 / erts-17.1). So `-noshell` is one valueless occurrence
 //! (`init:get_argument(noshell)` ⇒ `{ok,[[]]}`) and `-pa /a -pa /b` is two occurrences
-//! (`{ok,[["/a"],["/b"]]}`).
+//! (`{ok,[["/a"],["/b"]]}`). The oracle additionally reports its own
+//! `root`/`bindir`/`progname`/`home` entries, which this runtime does not model.
 //!
 //! # The `run` argument grammar
 //!
@@ -82,6 +98,12 @@ use crate::config::{
 use crate::error;
 use crate::runtime::Runtime;
 
+mod env;
+mod flags;
+mod vars;
+pub use env::{merge_argv, otp_flags_var, tokenize, Env, MapEnv, ProcessEnv};
+pub use vars::{from_env, ErlEnv};
+
 /// The usage text, printed on a usage (exit 2) error.
 pub const USAGE: &str = "\
 Usage: beam_rt [switch...] [action]
@@ -97,7 +119,11 @@ Switches:
   +S N[:N]                  number of normal schedulers
   -smp enable|disable|auto  SMP scheduler model (only 'disable' changes behaviour)
   +A N                      async-thread pool size (preserved verbatim)
-  +P N                      maximum number of processes
+  +P N                      maximum number of processes (legacy, or 1024..=134217727)
+  +Q N                      maximum number of ports (legacy, or 1024..=134217727)
+  +K true|false             kernel-poll switch
+  +sbt TYPE                 scheduler bind type (u|db|s|ps|ts|tnnps|nnps|nnts|ns)
+  -MNAME[=VALUE]            ERTS allocator flag (also +MM.../+MB...; preserved verbatim)
   +hms N                    minimum heap size, in words
   +hmbs N                   minimum binary virtual heap size, in words
   +hmax N                   maximum heap size, in words (0 = unlimited)
@@ -105,7 +131,19 @@ Switches:
   +hmaxel true|false        log an error report at +hmax (default true)
   +hmaxib true|false        count shared binaries towards +hmax (default false)
   -name N, -sname N         distribution node name
-  any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1)
+  -setcookie C              distribution cookie
+  -config FILE              configuration file (recorded as init:get_argument(config))
+  -boot FILE                boot script (recorded as init:get_argument(boot))
+  -emu_flavor emu|jit|smp   emulator flavor
+  any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1);
+                            a +FLAG is an emulator flag and is not an init argument
+
+Environment (merged into the command line, real erl's order):
+  ERL_OTP<ver>_FLAGS, ERL_AFLAGS, ERL_FLAGS, ERL_ZFLAGS
+Environment (read by the emulator/launcher; never an init argument):
+  ERL_MAX_PORTS (clamped into 1024..=134217727, then applied as +Q when no +Q is given)
+  ERL_INETRC, ERL_CRASH_DUMP, ERL_CRASH_DUMP_SECONDS, ERL_ROOTDIR,
+  ERL_MAX_ETS_TABLES, ERL_FULLSWEEP_AFTER (parsed and reported, inert in this milestone)
 
 Actions:
   run FILE MOD:FUNC/ARITY [ARG...]
@@ -134,11 +172,64 @@ pub const EXIT_USAGE: i32 = 2;
 /// "broken" and "badly invoked".
 pub const EXIT_UNSUPPORTED: i32 = 3;
 
+/// Parses `args` merged with the `ERL_*FLAGS` environment variables.
+///
+/// Real `erl` merges four environment variables into the command line before `init`
+/// sees it (`erts/etc/common/erlexec.c`, `initial_argv_massage`):
+/// `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]`. The
+/// merge is [`env::merge_argv`] and the result is handed to the **pure** [`parse`], so an
+/// environment flag is indistinguishable from a command-line flag (contract A.6).
+///
+/// The **second** environment family — the variables the emulator (and the `erl` launcher)
+/// read directly, outside that merge — is read into [`RuntimeConfig::env`] by
+/// [`vars::from_env`]. None of them is an init argument (verified against OTP 29.1.1 /
+/// erts-17.1; see [`vars`]).
+///
+/// # `ERL_MAX_PORTS`
+///
+/// `ERL_MAX_PORTS` is the one member of that family with a modelled effect: the emulator
+/// `atoi`s it and clamps it into `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]` (`erl_init.c:1341`).
+/// This runtime has no `port_limit` [`system_info`](crate::info) key yet, so the clamped
+/// value is routed into the **same channel the `+Q` switch already uses** —
+/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) — and only
+/// when the merged command line carries **no** `+Q` of its own. A command-line or
+/// `ERL_FLAGS` `+Q` therefore wins outright, exactly as in the oracle, where
+/// `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both observe a
+/// `port_limit` of 4096.
+///
+/// The value becomes *observable* only once `crate::info` gains a `port_limit` key (a
+/// sibling's surface); until then it is preserved, not applied.
+///
+/// [`parse`] itself never reads the process environment: the differential harness and the
+/// unit tests call it directly, and [`run`] calls this function with [`ProcessEnv`].
+///
+/// # Errors
+///
+/// Exactly the errors [`parse`] reports for the merged command line.
+pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
+    let merged = env::merge_argv(args, env);
+    let mut config = parse(&merged)?;
+    let env_vars = vars::from_env(env);
+    // `ERL_MAX_PORTS` acts exactly like a `+Q` the command line does not already carry
+    // (the oracle: any `+Q` in the merged argv overrides the variable). The two tokens go
+    // into `extra_emulator_flags` through the same primitive `+Q` uses.
+    if let Some(max_ports) = env_vars.max_ports {
+        if !vars::has_plus_q_switch(&merged) {
+            preserve_emulator_flag(&mut config.emulator, "+Q", &max_ports.to_string());
+        }
+    }
+    config.env = env_vars;
+    Ok(config)
+}
+
 /// Parses `args` (which **exclude** `argv[0]`) into a [`RuntimeConfig`].
 ///
-/// Every recognized switch is recorded, in order, as an [`InitArgs`] occurrence (the
-/// source of `init:get_argument/1`), as is every *unrecognized* `-flag`/`+flag` — real
-/// `erl` accepts unmodeled switches as init arguments, so they are never a usage error.
+/// A **`-`-switch** is recorded, in order, as an [`InitArgs`] occurrence (the source of
+/// `init:get_argument/1`) — as is an *unrecognized* `-flag`. A **`+`-flag**, and the
+/// `-eval`/`-s`/`-run` Start instructions, are consumed by the emulator/`init` and are
+/// **not** init arguments (verified against OTP 29.1.1 / erts-17.1, where
+/// `init:get_argument('S'|'Q'|eval|s|run)` is the bare atom `error`). An unmodeled
+/// switch is never a usage error.
 ///
 /// # Errors
 ///
@@ -172,7 +263,10 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             }
             "-eval" => {
                 let expr = value_of(args, index, "-eval")?;
-                builder.record(argument, vec![expr.clone()]);
+                // `-eval` is a **Start instruction**, not an init argument: the oracle
+                // consumes it in `init`'s `parse_boot_args/1`, so
+                // `init:get_argument(eval)` is the bare atom `error` (verified against
+                // OTP 29.1.1 / erts-17.1).
                 builder.action = Action::Eval(strip_trailing_dot(&expr));
                 index += 2;
             }
@@ -194,10 +288,50 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.emulator.node_name = Some(value);
                 index += 2;
             }
+            "-setcookie" => {
+                let value = value_of(args, index, "-setcookie")?;
+                builder.record(argument, vec![value.clone()]);
+                builder.emulator.cookie = Some(value);
+                index += 2;
+            }
+            "-config" | "-boot" => {
+                let value = value_of(args, index, argument)?;
+                builder.record(argument, vec![value]);
+                index += 2;
+            }
+            "-emu_flavor" => {
+                let value = value_of(args, index, "-emu_flavor")?;
+                builder.record(argument, vec![value.clone()]);
+                let flavor = flags::parse_emu_flavor("-emu_flavor", &value)?;
+                builder.emulator.features =
+                    beam_common::FeatureFlags::for_flavor(flavor);
+                builder.emulator.flavor = flavor;
+                index += 2;
+            }
+            "+Q" => {
+                let value = value_of(args, index, "+Q")?;
+                flags::parse_max_ports("+Q", &value)?;
+                builder.preserve("+Q", &value);
+                index += 2;
+            }
+            "+K" => {
+                let value = value_of(args, index, "+K")?;
+                flags::parse_kernel_poll("+K", &value)?;
+                builder.preserve("+K", &value);
+                index += 2;
+            }
+            "+sbt" => {
+                let value = value_of(args, index, "+sbt")?;
+                flags::parse_sbt("+sbt", &value)?;
+                builder.preserve("+sbt", &value);
+                index += 2;
+            }
+            other if flags::is_allocator_switch(other) => {
+                index = flags::parse_allocator(&args[index], args, index)?;
+            }
             "+S" => {
                 let value = value_of(args, index, "+S")?;
                 builder.emulator.schedulers = Some(parse_schedulers(&value)?);
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "-smp" => index = parse_smp_switch(args, index, &mut builder),
@@ -206,21 +340,17 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // The async-thread pool is not modelled by the runtime core; it is
                 // preserved **verbatim** so nothing is lost (the A.6 skeleton contract).
                 parse_u32("+A", &value)?;
-                builder.emulator.extra_emulator_flags.push("+A".to_string());
-                builder.emulator.extra_emulator_flags.push(value.clone());
-                builder.record(argument, vec![value]);
+                builder.preserve("+A", &value);
                 index += 2;
             }
             "+P" => {
                 let value = value_of(args, index, "+P")?;
-                builder.emulator.max_processes = Some(parse_usize("+P", &value)?);
-                builder.record(argument, vec![value]);
+                builder.emulator.max_processes = flags::parse_max_processes("+P", &value)?;
                 index += 2;
             }
             "+hms" => {
                 let value = value_of(args, index, "+hms")?;
                 builder.heap.set_min_heap_words(parse_heap_words("+hms", &value)?);
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "+hmbs" => {
@@ -228,7 +358,6 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder
                     .heap
                     .set_min_bin_vheap_words(parse_heap_words("+hmbs", &value)?);
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "+hmax" => {
@@ -236,13 +365,11 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder
                     .heap
                     .set_max_heap_words(parse_max_heap_size(&value)?);
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "+hmaxk" | "+hmaxel" | "+hmaxib" => {
                 let value = value_of(args, index, argument)?;
                 builder.set_max_heap_flag(argument, &value)?;
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "-s" => index = builder.parse_apply(args, index, "-s")?,
@@ -260,6 +387,9 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         heap: builder.heap,
         init_args: builder.init_args,
         action: builder.action,
+        // The environment family is read only by `parse_with_env`; the pure `parse` sees
+        // an empty one (it must never read the process environment).
+        env: ErlEnv::default(),
     })
 }
 
@@ -307,9 +437,10 @@ impl Builder {
             .cloned()
             .ok_or_else(|| error::missing_value(switch))?;
         let (arguments, next) = collect_tail(args, index + 3);
-        let mut values = vec![module.clone(), function.clone()];
-        values.extend(arguments.iter().cloned());
-        self.record(switch, values);
+        // `-s`/`-run` are **Start instructions**, not init arguments: `init` consumes
+        // them in `parse_boot_args/1`, so `init:get_argument(s|run)` is the bare atom
+        // `error` (verified against OTP 29.1.1 / erts-17.1).
+        let _ = &arguments;
         self.action = if switch == "-s" {
             Action::Apply {
                 module,
@@ -326,9 +457,17 @@ impl Builder {
         Ok(next)
     }
 
-    /// Records an unrecognized `-flag`/`+flag` and its values as an init argument and
-    /// returns the index of the next switch — the real `erl` behaviour.
+    /// Preserves an emulator switch and its value **verbatim** in
+    /// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags), so
+    /// an unmodeled emulator flag is not lost (the A.6 skeleton contract).
     ///
+    /// It is deliberately **not** recorded as an init argument: every `+`-flag is an
+    /// emulator flag in the oracle, so `init:get_argument('Q'|'K'|'sbt'|'MMscs')` is the
+    /// bare atom `error` (verified against OTP 29.1.1 / erts-17.1).
+    fn preserve(&mut self, switch: &str, value: &str) {
+        preserve_emulator_flag(&mut self.emulator, switch, value);
+    }
+
     /// Applies a `+hmaxk`/`+hmaxel`/`+hmaxib` boolean value to the heap options.
     ///
     /// Only the two literals `true`/`false` are accepted: the C compares the value with
@@ -349,15 +488,23 @@ impl Builder {
         Ok(())
     }
 
-    /// Records an unrecognized `-flag`/`+flag` and its values as an init argument and
-    /// returns the index of the next switch — the real `erl` behaviour.
+    /// Records an unrecognized `-flag` (and its values) as an init argument and returns
+    /// the index of the next switch — the real `erl` behaviour.
     ///
-    /// This is **not** an error: `erl -noshell --nope -eval 'halt(0).'` exits 0, so an
-    /// unmodeled switch is data, not a malformed invocation. The values are the
+    /// Only an unrecognized **`-`flag** becomes an init argument: `erlexec` forwards
+    /// `-x` through `add_arg` (where `init` sees it), while `+x` is rewritten to `-x` and
+    /// passed as an **emulator** flag (`erts/etc/common/erlexec.c:871-1102`). So
+    /// `init:get_argument(Weird)` is `{ok,[[]]}` for `-Weird` and the bare atom `error`
+    /// for `+Weird` (verified: OTP 29.1.1 / erts-17.1). Neither is a usage error:
+    /// `erl -noshell --nope +Weird -eval 'halt(0).'` exits 0. The values are the
     /// following tokens that do not themselves start with `-` or `+`.
     fn record_unmodeled(&mut self, args: &[String], index: usize) -> usize {
         let (values, next) = collect_tail(args, index + 1);
-        self.record(&args[index], values);
+        // Only an unrecognized `-flag` is an init argument; a `+flag` is an emulator flag
+        // and is invisible to `init:get_argument/1` (see the method's docs).
+        if args[index].starts_with('-') {
+            self.record(&args[index], values);
+        }
         next
     }
 }
@@ -371,6 +518,17 @@ fn is_switch(argument: &str) -> bool {
 /// (`--nope` → `nope`, `+Weird` → `Weird`, `-pa` → `pa`).
 fn flag_name(switch: &str) -> &str {
     switch.trim_start_matches(|c| c == '-' || c == '+')
+}
+
+/// Preserves an emulator switch and its value **verbatim** in
+/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags): the switch
+/// token followed by the value token, in that order.
+///
+/// Shared by the parser's [`Builder::preserve`] and by [`parse_with_env`]'s
+/// `ERL_MAX_PORTS` → `+Q` routing, so both fill the channel identically.
+fn preserve_emulator_flag(emulator: &mut EmulatorConfig, switch: &str, value: &str) {
+    emulator.extra_emulator_flags.push(switch.to_string());
+    emulator.extra_emulator_flags.push(value.to_string());
 }
 
 /// The tokens from `from` up to (but not including) the next switch, plus the index of
@@ -408,13 +566,6 @@ fn strip_trailing_dot(expr: &str) -> String {
 fn parse_u32(switch: &str, value: &str) -> Result<u32> {
     value
         .parse::<u32>()
-        .map_err(|_| error::bad_switch_value(switch, value))
-}
-
-/// Parses a `usize` switch value.
-fn parse_usize(switch: &str, value: &str) -> Result<usize> {
-    value
-        .parse::<usize>()
         .map_err(|_| error::bad_switch_value(switch, value))
 }
 
@@ -685,7 +836,7 @@ fn split_top_level<'a>(token: &'a str, inner: &'a str) -> Result<Vec<&'a str>> {
 /// and no usage text. A **halt** the program requested wins over all of them: the
 /// runtime exits with that status, printing nothing.
 pub fn run(args: Vec<String>) -> i32 {
-    let config = match parse(&args) {
+    let config = match parse_with_env(&args, &ProcessEnv) {
         Ok(config) => config,
         Err(error) => {
             if let Some(reason) = error::unsupported_reason(&error) {
@@ -901,10 +1052,9 @@ mod tests {
         let config = parsed(&["-noshell", "-eval", "(1+2)*3"]);
         assert_eq!(config.action, Action::Eval("(1+2)*3".to_string()));
         assert!(parse_args(&["-eval"]).is_err(), "-eval needs a value");
-        assert_eq!(
-            config.init_args.get("eval"),
-            Some(vec![&["(1+2)*3".to_string()][..]])
-        );
+        // `-eval` is a Start instruction, not an init argument: the oracle's
+        // `init:get_argument(eval)` is `error`.
+        assert_eq!(config.init_args.get("eval"), None);
     }
 
     #[test]
@@ -918,11 +1068,8 @@ mod tests {
             parsed(&["-eval", "2+3.."]).action,
             Action::Eval("2+3.".to_string())
         );
-        // The recorded init argument is the raw token.
-        assert_eq!(
-            parsed(&["-eval", "2+3."]).init_args.get("eval"),
-            Some(vec![&["2+3.".to_string()][..]])
-        );
+        // `-eval` is a Start instruction, so it is not an init argument.
+        assert_eq!(parsed(&["-eval", "2+3."]).init_args.get("eval"), None);
     }
 
     #[test]
@@ -953,18 +1100,21 @@ mod tests {
     fn emulator_switches_are_mapped() {
         let config = parsed(&["+S", "4"]);
         assert_eq!(config.emulator.schedulers, Some(4));
-        assert_eq!(config.init_args.get("S"), Some(vec![&["4".to_string()][..]]));
+        // A `+`-flag is an emulator flag, never an init argument.
+        assert_eq!(config.init_args.get("S"), None);
         let config = parsed(&["+S", "8:4"]);
         assert_eq!(config.emulator.schedulers, Some(8));
-        let config = parsed(&["+P", "1000"]);
-        assert_eq!(config.emulator.max_processes, Some(1000));
+        let config = parsed(&["+P", "1024"]);
+        assert_eq!(config.emulator.max_processes, Some(1024));
+        // `+P` is bounded by `[ERTS_MIN_PROCESSES=1024, ERTS_MAX_PROCESSES]`.
+        assert!(parse_args(&["+P", "1000"]).is_err());
         let config = parsed(&["+A", "16"]);
         assert_eq!(
             config.emulator.extra_emulator_flags,
             vec!["+A".to_string(), "16".to_string()]
         );
         assert_eq!(config.emulator.schedulers, None);
-        assert_eq!(config.init_args.get("A"), Some(vec![&["16".to_string()][..]]));
+        assert_eq!(config.init_args.get("A"), None);
         assert!(parse_args(&["+S", "x"]).is_err());
         assert!(parse_args(&["+S", "1:x"]).is_err());
         assert!(parse_args(&["+P", "-1"]).is_err());
@@ -981,31 +1131,25 @@ mod tests {
     ///   → min_bin_vheap_size 6772, min_heap_size 1598
     /// ```
     ///
-    /// The values are recorded as init arguments like every other switch of this runtime
-    /// (real `erl` does *not* report them — `erl +hms 1000 … -eval
-    /// 'init:get_argument(hms)'` ⇒ `error`, since they are emulator flags consumed by
-    /// `erlexec`; this runtime records every switch, as it already does for `+S`/`+P`).
+    /// `+hms`/`+hmbs` are emulator flags: real `erl` does *not* report them
+    /// (`erl +hms 1000 … -eval 'init:get_argument(hms)'` ⇒ `error`), and neither does
+    /// this runtime — no `+`-flag is an init argument.
     #[test]
-    fn heap_size_switches_are_parsed_and_recorded() {
+    fn heap_size_switches_are_parsed() {
         let config = parsed(&["+hms", "1000", "+hmbs", "5000"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 1598);
         assert_eq!(config.heap_options().policy().min_bin_vheap_words, 6772);
-        assert_eq!(config.init_args.get("hms"), Some(vec![&["1000".to_string()][..]]));
-        assert_eq!(config.init_args.get("hmbs"), Some(vec![&["5000".to_string()][..]]));
+        assert_eq!(config.init_args.get("hms"), None);
+        assert_eq!(config.init_args.get("hmbs"), None);
         // A recognized heap switch is modelled, so it is *not* a verbatim extra flag
-        // (unlike `+A`) — but it is still an init argument, and every other switch is left
-        // exactly as it was.
+        // (unlike `+A`) — and, like every `+`-flag, it is not an init argument.
         assert!(config.emulator.extra_emulator_flags.is_empty());
         assert_eq!(config.heap_words, DEFAULT_HEAP_WORDS);
         assert_eq!(config.action, Action::Boot);
 
-        // The last occurrence wins, and both are recorded in order.
+        // The last occurrence wins.
         let config = parsed(&["+hms", "100", "+hms", "234"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 376);
-        assert_eq!(
-            config.init_args.get("hms"),
-            Some(vec![&["100".to_string()][..], &["234".to_string()][..]])
-        );
         // `+hms 0`, a negative and a non-numeric value are all rejected — the emulator
         // rejects anything `<= 0` (`erl_init.c:1554-1567`) or non-numeric (`atoi`).
         for args in [
@@ -1032,7 +1176,7 @@ mod tests {
     ///   → #{error_logger=>false,include_shared_binaries=>true,kill=>false,size=>1000}
     /// ```
     #[test]
-    fn max_heap_switches_are_parsed_and_recorded() {
+    fn max_heap_switches_are_parsed() {
         let config = parsed(&[
             "+hmax",
             "1000000",
@@ -1054,16 +1198,11 @@ mod tests {
         );
         assert_eq!(
             config.init_args.get("hmax"),
-            Some(vec![&["1000000".to_string()][..]])
+            None,
+            "a `+`-flag is never an init argument"
         );
-        assert_eq!(
-            config.init_args.get("hmaxk"),
-            Some(vec![&["false".to_string()][..]])
-        );
-        assert_eq!(
-            config.init_args.get("hmaxib"),
-            Some(vec![&["true".to_string()][..]])
-        );
+        assert_eq!(config.init_args.get("hmaxk"), None);
+        assert_eq!(config.init_args.get("hmaxib"), None);
         // `+hmax 0` is the emulator's own "no limit" value.
         assert_eq!(parsed(&["+hmax", "0"]).heap_options().policy().max_heap_words, 0);
         // A negative, a non-numeric or an out-of-range value is rejected (the C bounds it
@@ -1083,23 +1222,20 @@ mod tests {
         }
     }
 
-    /// Unmodeled flags keep their old behaviour when a modelled heap switch sits next to
-    /// them: recorded as init arguments (and, for `+A`, preserved verbatim), with parsing
-    /// continuing onto the next switch.
+    /// Unmodeled flags keep their behaviour when a modelled heap switch sits next to
+    /// them: a `+`-flag is accepted (and, for `+A`, preserved verbatim) but is not an init
+    /// argument, and parsing continues onto the next switch.
     #[test]
     fn unmodeled_flags_are_unaffected_by_the_heap_switches() {
         let config = parsed(&["+hms", "1000", "+zzz", "1", "2", "+A", "16"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 1598);
-        assert_eq!(
-            config.init_args.get("zzz"),
-            Some(vec![&["1".to_string(), "2".to_string()][..]])
-        );
+        assert_eq!(config.init_args.get("zzz"), None);
         assert_eq!(
             config.emulator.extra_emulator_flags,
             vec!["+A".to_string(), "16".to_string()]
         );
-        assert_eq!(config.init_args.get("hms"), Some(vec![&["1000".to_string()][..]]));
-        // An unrecognized flag on its own still boots (recorded, not a usage error).
+        assert_eq!(config.init_args.get("hms"), None);
+        // An unrecognized flag on its own still boots (accepted, not a usage error).
         assert_eq!(parsed(&["+Weird"]).heap_options(), &HeapOptions::default());
     }
 
@@ -1158,15 +1294,8 @@ mod tests {
             }
         );
         assert_eq!(config.emulator.schedulers, Some(2));
-        assert_eq!(
-            config.init_args.get("s"),
-            Some(vec![&[
-                "init".to_string(),
-                "stop".to_string(),
-                "a".to_string(),
-                "b".to_string()
-            ][..]])
-        );
+        // `-s` is a Start instruction, not an init argument.
+        assert_eq!(config.init_args.get("s"), None);
 
         let config = parsed(&["-s", "init", "stop"]);
         assert_eq!(
@@ -1193,7 +1322,8 @@ mod tests {
             }
         );
         assert_eq!(config.emulator.schedulers, Some(2));
-        assert_eq!(config.init_args.get("run").map(|found| found.len()), Some(1));
+        // `-run` is a Start instruction, not an init argument.
+        assert_eq!(config.init_args.get("run"), None);
         assert!(parse_args(&["-run", "init"]).is_err(), "-run needs a function");
         assert!(parse_args(&["-run"]).is_err());
     }
@@ -1336,8 +1466,10 @@ mod tests {
         assert_eq!(config.action, Action::Boot);
         assert_eq!(config.init_args.get("nope"), Some(vec![&[][..]]));
 
+        // A `+`-flag is an emulator flag: accepted, but invisible to
+        // `init:get_argument/1` (the oracle reports `error`).
         let config = parsed(&["+Weird"]);
-        assert!(config.init_args.get("Weird").is_some());
+        assert_eq!(config.init_args.get("Weird"), None);
 
         let config = parsed(&["-emu_flavor", "emu"]);
         assert_eq!(
@@ -1359,6 +1491,222 @@ mod tests {
         assert_eq!(error::unsupported_reason(&error), None);
     }
 
+    /// The A.6 configuration switches (`-setcookie`/`-config`/`-boot`): a `-`-switch, so
+    /// each is an **init argument**, exactly as the oracle
+    /// (`erl -setcookie abc -noshell -eval 'io:format("~w~n",[init:get_argument(setcookie)]), halt().'`
+    /// ⇒ `{ok,[["abc"]]}`; verified against OTP 29.1.1 / erts-17.1).
+    #[test]
+    fn the_configuration_switches_are_recorded_as_init_arguments() {
+        let config = parsed(&["-setcookie", "abc"]);
+        assert_eq!(config.emulator.cookie.as_deref(), Some("abc"));
+        assert_eq!(
+            config.init_args.get("setcookie"),
+            Some(vec![&["abc".to_string()][..]])
+        );
+        // Every occurrence is recorded (`{ok,[["one"],["two"]]}`); the modelled cookie is
+        // the last one.
+        let config = parsed(&["-setcookie", "one", "-setcookie", "two"]);
+        assert_eq!(config.emulator.cookie.as_deref(), Some("two"));
+        assert_eq!(
+            config.init_args.get("setcookie"),
+            Some(vec![&["one".to_string()][..], &["two".to_string()][..]])
+        );
+
+        let config = parsed(&["-config", "/etc/app.config"]);
+        assert_eq!(
+            config.init_args.get("config"),
+            Some(vec![&["/etc/app.config".to_string()][..]])
+        );
+        let config = parsed(&["-boot", "/boot/start"]);
+        assert_eq!(
+            config.init_args.get("boot"),
+            Some(vec![&["/boot/start".to_string()][..]])
+        );
+
+        // A missing operand of any of the three is a usage error, never a capability gap.
+        for switch in ["-setcookie", "-config", "-boot"] {
+            let error = parse_args(&[switch]).expect_err("a missing operand");
+            assert_eq!(error::unsupported_reason(&error), None, "{switch}");
+        }
+    }
+
+    /// `-emu_flavor F` records the value as an init argument and selects the flavor:
+    /// `emu` ⇒ [`beam_common::Flavor::Emu`], `jit`/`smp` ⇒ [`beam_common::Flavor::Jit`].
+    ///
+    /// Divergence: the oracle's `erlexec` accepts only `smp` (`-emu_flavor emu` ⇒
+    /// `erlexec: Invalid emulator type or flavor.`, exit 1); accepting `emu`/`jit` is what
+    /// makes [`beam_common::Flavor::Emu`] reachable here. For `smp` the recorded value is
+    /// the same (`{ok,[["smp"]]}`).
+    #[test]
+    fn emu_flavor_switch_selects_the_flavor_and_is_recorded() {
+        let config = parsed(&["-emu_flavor", "emu"]);
+        assert_eq!(config.emulator.flavor, beam_common::Flavor::Emu);
+        assert_eq!(
+            config.emulator.features,
+            beam_common::FeatureFlags::for_flavor(beam_common::Flavor::Emu)
+        );
+        assert_eq!(
+            config.init_args.get("emu_flavor"),
+            Some(vec![&["emu".to_string()][..]])
+        );
+        for value in ["jit", "smp"] {
+            let config = parsed(&["-emu_flavor", value]);
+            assert_eq!(config.emulator.flavor, beam_common::Flavor::Jit);
+            assert_eq!(
+                config.emulator.features,
+                beam_common::FeatureFlags::for_flavor(beam_common::Flavor::Jit)
+            );
+            assert_eq!(
+                config.init_args.get("emu_flavor"),
+                Some(vec![&[value.to_string()][..]])
+            );
+        }
+        for args in [&["-emu_flavor", "bogus"][..], &["-emu_flavor"][..]] {
+            let error = parse_args(args).expect_err("a bad/missing flavor is a usage error");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The `+Q`/`+P`/`+K`/`+sbt` emulator switches: validated against the legacy C, and
+    /// **never** init arguments (in the oracle every `+`-flag is an emulator flag, so
+    /// `init:get_argument('Q'|'P'|'K'|'sbt')` is the bare atom `error`).
+    ///
+    /// Oracle (OTP 29.1.1 / erts-17.1): `+Q`/`+P` accept `legacy`/`1024`/`134217727`
+    /// (exit 0) and reject `1000`/`0`/`134217728`/`abc` (exit 1); all nine `+sbt` types
+    /// exit 0 and `+sbt bogus` exits 1; `+K bogus` exits 0 (the emulator does not
+    /// validate it — `erl_check_io.c:2467`).
+    #[test]
+    fn limit_switches_are_validated_preserved_and_never_init_arguments() {
+        // `+Q` — preserved only: nothing about the runtime changes.
+        for value in ["1024", "134217727", "legacy"] {
+            let config = parsed(&["+Q", value]);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                vec!["+Q".to_string(), value.to_string()]
+            );
+            assert_eq!(config.init_args.get("Q"), None);
+        }
+        for value in ["1000", "0", "1023", "134217728", "abc", "1024abc", ""] {
+            let error = parse_args(&["+Q", value]).expect_err("a bad +Q value");
+            assert_eq!(error::unsupported_reason(&error), None, "{value:?}");
+        }
+        assert!(parse_args(&["+Q"]).is_err(), "+Q needs a value");
+
+        // `+P` — modelled as the emulator's process limit; `legacy` keeps the default.
+        let config = parsed(&["+P", "1024"]);
+        assert_eq!(config.emulator.max_processes, Some(1024));
+        assert_eq!(config.init_args.get("P"), None);
+        assert!(config.emulator.extra_emulator_flags.is_empty());
+        assert_eq!(parsed(&["+P", "legacy"]).emulator.max_processes, None);
+        assert_eq!(
+            parsed(&["+P", "134217727"]).emulator.max_processes,
+            Some(134_217_727)
+        );
+        for value in ["1000", "0", "134217728", "abc", ""] {
+            let error = parse_args(&["+P", value]).expect_err("a bad +P value");
+            assert_eq!(error::unsupported_reason(&error), None, "{value:?}");
+        }
+        assert!(parse_args(&["+P"]).is_err(), "+P needs a value");
+
+        // `+K` — preserved; the oracle accepts *any* value here, so validating the two
+        // literals is a documented divergence (`erl +K bogus …` exits 0).
+        for value in ["true", "false"] {
+            let config = parsed(&["+K", value]);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                vec!["+K".to_string(), value.to_string()]
+            );
+            assert_eq!(config.init_args.get("K"), None);
+        }
+        let error = parse_args(&["+K", "bogus"]).expect_err("beam_rt validates the literals");
+        assert_eq!(error::unsupported_reason(&error), None);
+        assert!(parse_args(&["+K"]).is_err(), "+K needs a value");
+
+        // `+sbt` — the nine bind types of `erl_cpu_topology.c:628-647`.
+        for value in ["u", "db", "s", "ps", "ts", "tnnps", "nnps", "nnts", "ns"] {
+            let config = parsed(&["+sbt", value]);
+            assert_eq!(
+                config.emulator.extra_emulator_flags,
+                vec!["+sbt".to_string(), value.to_string()]
+            );
+            assert_eq!(config.init_args.get("sbt"), None);
+        }
+        for args in [&["+sbt", "bogus"][..], &["+sbt"][..]] {
+            let error = parse_args(args).expect_err("a bad/missing +sbt value");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The `-M*`/`+M*` allocator family: recognized, **never** an init argument; `-M*` is
+    /// accepted unvalidated (oracle parity — `erlexec` never forwards it to the emulator)
+    /// while `+M*` is validated against the `erl_alloc.c` grammar.
+    #[test]
+    fn allocator_switches_are_accepted_and_never_init_arguments() {
+        // The validated `+M*` forms (in-token and next-token values both work).
+        for args in [
+            &["+MMscs", "1024"][..],
+            &["+MMscs1024"][..],
+            &["+MBas", "aobf"][..],
+            &["+MBasbf"][..],
+            &["+Mlpm", "no"][..],
+            &["+MYe", "true"][..],
+            &["+MIscs", "100"][..],
+            &["+MMamcbf", "100"][..],
+            &["+MZas", "chaosff"][..],
+        ] {
+            let config = parsed(args);
+            assert_eq!(config.action, Action::Boot, "{args:?}");
+            assert!(
+                config.init_args.is_empty(),
+                "{args:?} must record no init argument"
+            );
+        }
+
+        // A **`-M*`** flag is not an emulator flag at all: `erlexec` never rewrites it, so
+        // the emulator sees an ordinary unknown `-flag` and `init` records it as an init
+        // argument (name = the token minus the leading `-`, values = the following
+        // non-switch tokens). Verified against OTP 29.1.1 / erts-17.1:
+        // `erl -noshell -Mfoo 1 …` ⇒ `init:get_argument('Mfoo')` = `{ok,[["1"]]}`.
+        for (args, name, values) in [
+            (&["-Mfoo"][..], "Mfoo", Vec::<String>::new()),
+            (&["-M"][..], "M", Vec::new()),
+            (&["-Mea"][..], "Mea", Vec::new()),
+            (&["-Mfoo", "1"][..], "Mfoo", vec!["1".to_string()]),
+            (&["-Mea", "min"][..], "Mea", vec!["min".to_string()]),
+            (&["-Mea", "1024"][..], "Mea", vec!["1024".to_string()]),
+        ] {
+            let config = parsed(args);
+            assert_eq!(config.action, Action::Boot, "{args:?}");
+            assert_eq!(
+                config.init_args.get(name),
+                Some(vec![values.as_slice()]),
+                "{args:?}"
+            );
+        }
+
+        // `+M*`, by contrast, *is* an emulator flag and its value is validated (the oracle
+        // rejects all of these with exit 1; `beam_rt` reports its uniform usage error).
+        for args in [
+            &["+Mfoo"][..],
+            &["+M"][..],
+            &["+MMscs", "bogus"][..],
+            &["+MBas", "chaosff"][..],
+        ] {
+            let error = parse_args(args).expect_err("a bad +M* value");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+
+        // `+Mea <preset>` is the emulator-wide allocator preset the oracle accepts
+        // (`erl_alloc.c:1733-1783`; `+Mea min` exits 0). Like every `+`-flag it is
+        // validated, consumes its value, and records no init argument.
+        let config = parsed(&["+Mea", "min"]);
+        assert_eq!(config.action, Action::Boot);
+        assert!(
+            config.init_args.is_empty(),
+            "+Mea min records no init argument"
+        );
+    }
+
     #[test]
     fn usage_text_documents_every_supported_switch() {
         for spelling in [
@@ -1372,7 +1720,17 @@ mod tests {
             "+S",
             "+A",
             "+P",
+            "+Q",
+            "+K",
+            "+sbt",
+            "-MNAME",
+            "+MM",
+            "+MB",
             "-name",
+            "-setcookie",
+            "-config",
+            "-boot",
+            "-emu_flavor",
             "run ",
         ] {
             assert!(USAGE.contains(spelling), "USAGE must mention {spelling}");

@@ -209,12 +209,19 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 ## Status (Milestone 1)
 - **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
   erts_rust/Cargo.toml --workspace` is warning-free. `cargo test --manifest-path
-  erts_rust/Cargo.toml --workspace --no-fail-fast` is fully green (3444 tests passing, 0 failures,
-  re-measured at this node's HEAD).
-- **Real-module LOAD coverage is complete for the installed OTP:** both `beam_loader`'s
-  `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` assert that **all 261**
-  installed `stdlib`/`kernel`/`compiler` `.beam` modules load (stdlib=98, kernel=104, compiler=59),
-  with no allowlist.
+  erts_rust/Cargo.toml --workspace --no-fail-fast` is fully green (4669 tests passing, 0 failures,
+  re-measured at this node's HEAD); `-p beam_loader -p beam_engine` alone is 1098 passed / 0 failed.
+- **Real-module LOAD coverage is complete for the ENTIRE installed OTP:** `beam_loader`'s
+  `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` discover the lib root generically
+  (`code:lib_dir()`, no hardcoded app names) and assert that **all 1366 `.beam` across 34 application
+  directories** load, with no allowlist and **zero failures**.
+- **Engine execution breadth reaches beyond stdlib/kernel/compiler:** `beam_engine`'s `tests/apps_lists.rs`
+  runs oracle-cross-checked functions from parsetools (yecc/leex), syntax_tools, xmerl, inets, edoc, eunit,
+  dialyzer, asn1 and snmp; `tests/census.rs` now reaches **1366/1366 modules / 2,942,736 instructions with
+  zero unmodelled opcodes**, and the `Instr` census is **106 = 49 executed + 57 claimed-blocked + 0
+  unclaimed** — the "claimed-blocked" rows are overwhelmingly degenerate synthetic-probe inputs (NIL
+  registers / empty tables), not gaps; the genuine residue is host-seam work (mailbox / BIF / global-atom)
+  owned by `beam_rt`/`beam_bifs`, plus a now-closed `PutRecord` create form.
 - **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
   `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's

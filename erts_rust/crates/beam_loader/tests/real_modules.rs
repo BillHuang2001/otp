@@ -2,9 +2,10 @@
 //!
 //! Where `tests/container.rs`, `tests/ir.rs` and `tests/widened_ir.rs` load a
 //! couple of committed oracle fixtures, this file is the *wide* evidence: it walks
-//! the real `ebin` directories of the installed OTP (`stdlib`, `kernel`, and
-//! `compiler` when present) and loads **every** `*.beam` through the crate's public
-//! entry point [`beam_loader::load_file`] — the whole pipeline
+//! the **whole installed OTP `lib` root** — every versioned application directory
+//! and every `*.beam` found under it, recursively (ebin plus doc/examples and
+//! `proper_ext`) — and loads each one through the crate's public entry point
+//! [`beam_loader::load_file`], i.e. the whole pipeline
 //! (`container::parse` → `chunk::parse` → `decode::decode_stream` →
 //! `lower::build_module`).
 //!
@@ -12,7 +13,7 @@
 //!
 //! * **Load breadth.** The public loader pipeline parses an entire real OTP
 //!   install; a broken walk (a missing application, a directory-resolution bug) is
-//!   caught by a floor on the number of modules discovered.
+//!   caught by floors on the number of applications and modules discovered.
 //! * **Every discovered module must load.** A single module failing to parse fails
 //!   the test — a load failure is a regression, never tolerated. Each failure is
 //!   still printed by name with its exact typed error before the test fails.
@@ -21,15 +22,20 @@
 //!   literals, and asserts the decoded funs still carry their `{module, function,
 //!   arity}` identity — so the sweep proves *what* decoded, not merely *how many*.
 //!
+//! # Locating the OTP install (generic, no hardcoded application names)
+//!
+//! The `lib` root is resolved at test time by [`otp_lib_dir`]: `$ERTS_LIB_DIR`
+//! when set (it must be the `lib` root), otherwise
+//! `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'` — OTP's own
+//! `code:lib_dir/0`. The versioned application directories are the root's direct
+//! subdirectories; the `.beam` files are collected recursively beneath each.
+//!
 //! # Skip-vs-assert policy (explicit)
 //!
 //! * **A missing OTP install skips LOUDLY.** When `erl` is absent (or the
-//!   `stdlib`/`kernel` `ebin` directories cannot be located) the test prints
-//!   `SKIP: <reason>` and returns — it never fails in that case. It never silently
-//!   passes without OTP.
-//!
-//! Ground truth is the system OTP install itself; the `ebin` directories are
-//! located at **test time** (see [`app_ebin`]).
+//!   `stdlib`/`kernel` `ebin` directories cannot be located, or the `lib` root
+//!   cannot be read) the test prints `SKIP: <reason>` and returns — it never fails
+//!   in that case. It never silently passes without OTP.
 //!
 //! # Running
 //!
@@ -37,7 +43,7 @@
 //! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_loader
 //! ```
 //!
-//! With `-- --nocapture` the per-module failures and the `loaded N/M` summary are
+//! With `-- --nocapture` the per-module failures and the `SWEEP: …` summary are
 //! printed.
 
 use std::fmt::Write as _;
@@ -50,15 +56,39 @@ use beam_loader::Module;
 use beam_term::prelude::{is_list, Eterm};
 
 // ---------------------------------------------------------------------------
-// Locating the installed OTP `ebin` directories
+// Locating the installed OTP `lib` root and its `ebin` directories
 // ---------------------------------------------------------------------------
 
-/// One application `ebin` directory to sweep, with its application name and the
-/// sorted `*.beam` module basenames it holds.
-struct SweepDir {
-    app: &'static str,
-    dir: PathBuf,
-    modules: Vec<String>,
+/// The running Erlang's `lib` root — the directory holding the versioned
+/// application directories (`stdlib-2.0`, `kernel-11.0`, …) — or `None` when it
+/// cannot be located.
+///
+/// Resolution order:
+/// 1. `$ERTS_LIB_DIR` when set (it must be the `lib` root);
+/// 2. `erl -noshell -eval 'io:format("~s",[code:lib_dir()]),halt().'` evaluated at
+///    test time (OTP's `code:lib_dir/0`).
+///
+/// A caller that gets `None` must **skip loudly** (never fail) — see
+/// [`skip_reason`].
+fn otp_lib_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("ERTS_LIB_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+
+    let output = Command::new("erl")
+        .args([
+            "-noshell",
+            "-eval",
+            "io:format(\"~s\",[code:lib_dir()]),halt().",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let root = root.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
 /// The `ebin` directory of the running Erlang's `app` application (`stdlib`,
@@ -135,40 +165,79 @@ fn skip_reason() -> Option<String> {
     None
 }
 
-/// The installed-OTP applications swept: `stdlib` and `kernel` are required
-/// (guaranteed present by [`skip_reason`]); `compiler` is swept too when present
-/// (extra evidence, never a failure).
-fn sweep_dirs() -> Vec<SweepDir> {
-    let mut dirs = Vec::new();
-    for app in ["stdlib", "kernel", "compiler"] {
-        let Some(dir) = app_ebin(app) else {
-            continue;
-        };
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut modules: Vec<String> = entries
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().map(|ext| ext == "beam").unwrap_or(false))
-            .filter_map(|path| {
-                path.file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-            })
-            .collect();
-        modules.sort();
-        dirs.push(SweepDir { app, dir, modules });
+// ---------------------------------------------------------------------------
+// Discovering every `.beam` under the OTP `lib` root
+// ---------------------------------------------------------------------------
+
+/// The discovered OTP install: the versioned application directories that hold at
+/// least one `.beam`, and every `.beam` file found beneath the `lib` root.
+struct LibSweep {
+    root: PathBuf,
+    /// Number of versioned application directories that contributed at least one
+    /// `.beam` file.
+    app_count: usize,
+    /// Every `.beam` file under the root, in sorted order.
+    beams: Vec<PathBuf>,
+}
+
+/// Recursively collects every `*.beam` file beneath `dir` into `out`.
+fn collect_beams(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_beams(&path, out);
+        } else if path.extension().map(|ext| ext == "beam").unwrap_or(false) {
+            out.push(path);
+        }
     }
-    dirs
+}
+
+/// Discovers the installed OTP applications and every `.beam` under `root`. Each
+/// direct subdirectory of `root` is a versioned application directory; one that
+/// yields no `.beam` (e.g. `erl_interface`, which ships no `ebin`) is not counted.
+fn lib_sweep(root: &Path) -> Option<LibSweep> {
+    let mut apps: Vec<PathBuf> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    apps.sort();
+
+    let mut app_count = 0usize;
+    let mut beams = Vec::new();
+    for app in &apps {
+        let mut app_beams = Vec::new();
+        collect_beams(app, &mut app_beams);
+        if !app_beams.is_empty() {
+            app_count += 1;
+            beams.append(&mut app_beams);
+        }
+    }
+    beams.sort();
+    Some(LibSweep {
+        root: root.to_path_buf(),
+        app_count,
+        beams,
+    })
+}
+
+/// A short, stable label for reporting: `path` relative to `root` when possible.
+fn rel_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).display().to_string()
 }
 
 // ---------------------------------------------------------------------------
 // The sweep
 // ---------------------------------------------------------------------------
 
-/// Loads every `*.beam` in the sweep directories through [`beam_loader::load_file`]
-/// (the public pipeline) and proves each one parses to a usable module. Every load
-/// failure is a hard test failure: a module that stops loading is a regression.
+/// Loads every `*.beam` under the installed OTP `lib` root through
+/// [`beam_loader::load_file`] (the public pipeline) and proves each one parses to a
+/// usable module. Every load failure is a hard test failure: a module that stops
+/// loading is a regression.
 #[test]
 fn loads_every_installed_otp_beam() {
     if let Some(reason) = skip_reason() {
@@ -176,62 +245,87 @@ fn loads_every_installed_otp_beam() {
         return;
     }
 
-    let dirs = sweep_dirs();
+    let Some(root) = otp_lib_dir() else {
+        eprintln!(
+            "SKIP: could not resolve the OTP `lib` root (need `erl` on PATH or $ERTS_LIB_DIR) — \
+             the real-module sweep requires the installed OTP `.beam` files"
+        );
+        return;
+    };
+    let Some(sweep) = lib_sweep(&root) else {
+        eprintln!(
+            "SKIP: OTP `lib` root {} is not a readable directory — \
+             the real-module sweep requires the installed OTP `.beam` files",
+            root.display()
+        );
+        return;
+    };
     assert!(
-        !dirs.is_empty(),
-        "the sweep found no OTP `ebin` directories to load"
+        !sweep.beams.is_empty(),
+        "the sweep found no `.beam` files under {}",
+        sweep.root.display()
     );
 
-    let mut total = 0usize;
+    println!(
+        "SWEEP: discovered {} application(s) and {} `.beam` module(s) under {}",
+        sweep.app_count,
+        sweep.beams.len(),
+        sweep.root.display()
+    );
+
+    let total = sweep.beams.len();
     let mut loaded = 0usize;
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut empty: Vec<String> = Vec::new();
 
-    for dir in &dirs {
-        for module in &dir.modules {
-            total += 1;
-            let path = dir.dir.join(format!("{module}.beam"));
-            match beam_loader::load_file(&path) {
-                Ok(loaded_module) => {
-                    loaded += 1;
-                    // A successful load must have produced at least one function:
-                    // an empty function list means the pipeline parsed the chunks
-                    // but silently dropped the code — still a defect.
-                    if loaded_module.functions.is_empty() {
-                        empty.push(format!("{}:{module}", dir.app));
-                    }
+    for path in &sweep.beams {
+        let label = rel_label(&sweep.root, path);
+        match beam_loader::load_file(path) {
+            Ok(loaded_module) => {
+                loaded += 1;
+                // A successful load must have produced at least one function: an
+                // empty function list means the pipeline parsed the chunks but
+                // silently dropped the code — still a defect.
+                if loaded_module.functions.is_empty() {
+                    empty.push(label);
                 }
-                Err(error) => {
-                    // Surface every failure loudly, with the exact typed error; the
-                    // assertion below then fails the test on any of them.
-                    let message = format!("{error:?}");
-                    println!("LOAD-FAIL {module}: {message}");
-                    failures.push((module.clone(), message));
-                }
+            }
+            Err(error) => {
+                // Surface every failure loudly, with the exact typed error; the
+                // assertion below then fails the test on any of them.
+                let message = format!("{error:?}");
+                println!("LOAD-FAIL {label}: {message}");
+                failures.push((label, message));
             }
         }
     }
 
     let mut report = String::new();
-    let _ = write!(report, "SWEEP: loaded {loaded}/{total} modules");
-    for dir in &dirs {
-        let _ = write!(report, " ({}={})", dir.app, dir.modules.len());
-    }
+    let _ = write!(
+        report,
+        "SWEEP: loaded {loaded}/{total} module(s) across {} application(s)",
+        sweep.app_count
+    );
     println!("{report}");
     if !failures.is_empty() {
         println!("SWEEP: {} load failure(s):", failures.len());
-        for (module, error) in &failures {
-            println!("  - {module}: {error}");
+        for (label, error) in &failures {
+            println!("  - {label}: {error}");
         }
     }
 
-    // A broad real sweep must cover a large number of modules. The floor is well
-    // below the real count (stdlib+kernel ≈ 200) so an OTP point release
-    // adding/removing a few modules does not break it, but a broken walk (or a
-    // missing application) does.
+    // A broad real sweep must cover the whole install. The floors are well below
+    // the real count (≈35 apps, ≈1366 modules) so an OTP point release
+    // adding/removing a few does not break them, but a broken walk (or a missing
+    // application) does.
     assert!(
-        total >= 150,
-        "the sweep only found {total} `.beam` files — expected stdlib+kernel (≈200)"
+        sweep.app_count >= 30,
+        "the sweep only found {} application(s) — expected the full OTP install (≈35)",
+        sweep.app_count
+    );
+    assert!(
+        total >= 1000,
+        "the sweep only found {total} `.beam` files — expected the full OTP `lib` root (≈1366)"
     );
     assert!(
         loaded == total,

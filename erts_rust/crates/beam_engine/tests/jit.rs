@@ -2290,9 +2290,10 @@ fn arity_switches_match_the_interpreter_on_real_tuples() {
 
 #[test]
 fn a_non_tuple_arity_switch_source_deopts_and_agrees_with_the_interpreter() {
-    // A non-tuple source is the interpreter's typed `unsupported` (the switch is only
-    // emitted behind an `is_tuple` test); the guard can only reject, so the helper's
-    // exact error is what both tiers must report.
+    // A non-tuple source has no arity at all (C's `get_arity` sets the switch value to
+    // `NIL`), so it matches no alternative and takes the ordinary fail branch; the
+    // tier's guard can only reject the shape, so both tiers report the fail arm's
+    // answer.
     let mut heap = Heap::new(64);
     let cons = heap.cons(make_small(1), NIL).expect("a cons cell");
     let module = arity_switch_module("select_arity", Label(10));
@@ -2300,9 +2301,10 @@ fn a_non_tuple_arity_switch_source_deopts_and_agrees_with_the_interpreter() {
 
     for source in [NIL, make_small(7), scrutinee, cons] {
         let agreed = agree_module(&module, "read", 2, &[NIL, source]);
-        assert!(
-            matches!(agreed, Err(BeamError::Raise(_))),
-            "expected the typed `select_tuple_arity` unsupported for {source:?}, got {agreed:?}"
+        assert_eq!(
+            agreed.unwrap_or_else(|err| panic!("non-tuple source {source:?}: {err:?}")),
+            make_small(-1),
+            "a non-tuple source ({source:?}) must take the arity switch's fail branch"
         );
     }
 }

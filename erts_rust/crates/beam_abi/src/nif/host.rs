@@ -16,11 +16,14 @@
 //! `unsafe` is confined to [`NifEnv::host`] and [`NifEnv::from_opaque`], each documented with a
 //! `# Safety` section / `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
 
+use libc::{c_int, c_void};
+
 use beam_alloc::Heap;
 use beam_term::prelude::Eterm;
 
-use crate::nif::types::ErlNifEnv;
-
+use crate::common::{ErlDrvSysInfo, ErlNifSelectFlags};
+use crate::nif::term::ERL_NIF_TERM;
+use crate::nif::types::{ErlNifEnv, ErlNifEvent};
 /// Services the runtime provides to the `enif_*` implementations of one NIF call.
 pub trait NifHost {
     /// The term-allocation arena for the duration of the current call. Must not reallocate while a
@@ -52,6 +55,175 @@ pub trait NifHost {
 
     /// `erlang:make_ref/0` (default: unsupported).
     fn make_ref(&mut self) -> Option<Eterm> {
+        None
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Hooks for the `enif_*` families that are not wired to this crate yet
+    // -----------------------------------------------------------------------------------------
+    //
+    // Every hook below is a **declaration only**: its default reports "unsupported" (`None`, a null
+    // pointer, or `false`), so nobody implementing [`NifHost`] has to change, and the family file
+    // that owns the matching `enif_*` function drives real runtime behaviour once the subsystem
+    // behind it exists. Each names the C function it backs.
+
+    /// Look up an atom **without creating it** (C `enif_make_existing_atom`); default: unsupported.
+    fn existing_atom(&mut self, name: &str) -> Option<Eterm> {
+        let _ = name;
+        None
+    }
+
+    /// The NIF library's private data pointer (C `enif_priv_data`); default: null.
+    fn priv_data(&mut self) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+
+    /// The emulator's information block (C `enif_system_info`, which fills an `ErlNifSysInfo`,
+    /// i.e. an [`ErlDrvSysInfo`]); default: unsupported.
+    fn system_info(&mut self) -> Option<ErlDrvSysInfo> {
+        None
+    }
+
+    /// A new unique integer (C `enif_make_unique_integer`). `positive`/`monotonic` are the
+    /// `ERL_NIF_UNIQUE_POSITIVE`/`ERL_NIF_UNIQUE_MONOTONIC` properties; default: unsupported.
+    fn unique_integer(&mut self, positive: bool, monotonic: bool) -> Option<Eterm> {
+        let _ = (positive, monotonic);
+        None
+    }
+
+    /// Charge `percent` of a timeslice against the calling process (C `enif_consume_timeslice`);
+    /// `true` when the process should yield the scheduler. Default: `false`.
+    fn consume_timeslice(&mut self, percent: c_int) -> bool {
+        let _ = percent;
+        false
+    }
+
+    /// Whether the process `pid` is alive (C `enif_is_process_alive`); default: unsupported.
+    fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
+        let _ = pid;
+        None
+    }
+
+    /// Whether the port `port` is alive (C `enif_is_port_alive`); default: unsupported.
+    fn is_port_alive(&mut self, port: Eterm) -> Option<bool> {
+        let _ = port;
+        None
+    }
+
+    /// Whether the calling process is alive (C `enif_is_current_process_alive`); default:
+    /// unsupported.
+    fn is_current_process_alive(&mut self) -> Option<bool> {
+        None
+    }
+
+    /// Send `msg` to the pid `to` (C `enif_send`). `from` is the sending pid — the owner of the
+    /// `msg_env` the message terms belong to — or `None` for the calling process. Default:
+    /// unsupported.
+    fn send(&mut self, to: Eterm, from: Option<Eterm>, msg: Eterm) -> Option<bool> {
+        let _ = (to, from, msg);
+        None
+    }
+
+    /// Send `data` to the port `port` (C `enif_port_command`); default: unsupported.
+    fn port_command(&mut self, port: Eterm, data: Eterm) -> Option<bool> {
+        let _ = (port, data);
+        None
+    }
+
+    /// Resolve the **registered name** `name` to a pid (C `enif_whereis_pid`); default:
+    /// unsupported.
+    fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm> {
+        let _ = name;
+        None
+    }
+
+    /// Resolve the **registered name** `name` to a port (C `enif_whereis_port`); default:
+    /// unsupported.
+    fn whereis_port(&mut self, name: Eterm) -> Option<Eterm> {
+        let _ = name;
+        None
+    }
+
+    /// Monitor the process `pid`, returning the monitor term the caller stores (C
+    /// `enif_monitor_process`); default: unsupported.
+    fn monitor_process(&mut self, pid: Eterm) -> Option<Eterm> {
+        let _ = pid;
+        None
+    }
+
+    /// Cancel the monitor identified by `monitor` (C `enif_demonitor_process`); default:
+    /// unsupported.
+    fn demonitor_process(&mut self, monitor: Eterm) -> Option<bool> {
+        let _ = monitor;
+        None
+    }
+
+    /// Register (or cancel) poll interest in the OS event `event` (C `enif_select`): `obj` is the
+    /// resource the notification is delivered to, `pid` the recipient (`None` = the calling
+    /// process) and `reference` the ref that comes with the notification. Returns the C result
+    /// code; default: unsupported.
+    fn select(
+        &mut self,
+        event: ErlNifEvent,
+        mode: ErlNifSelectFlags,
+        obj: *mut c_void,
+        pid: Option<Eterm>,
+        reference: Eterm,
+    ) -> Option<c_int> {
+        let _ = (event, mode, obj, pid, reference);
+        None
+    }
+
+    /// Schedule `fptr` to run as `fun_name`, possibly on a dirty scheduler (C `enif_schedule_nif`),
+    /// returning the term of the scheduled call; default: unsupported.
+    fn schedule_nif(
+        &mut self,
+        fun_name: &str,
+        flags: c_int,
+        fptr: unsafe extern "C" fn(*mut ErlNifEnv, c_int, *const ERL_NIF_TERM) -> ERL_NIF_TERM,
+        argc: usize,
+    ) -> Option<Eterm> {
+        let _ = (fun_name, flags, fptr, argc);
+        None
+    }
+
+    /// Create a fresh, process-independent term environment (C `enif_alloc_env`) for the
+    /// `enif_send`/`enif_make_copy` "message env" idiom; the host owns the returned env (which is
+    /// what the C-facing opaque `*mut ErlNifEnv` designates). Default: unsupported.
+    fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
+        None
+    }
+
+    /// Destroy an environment created by [`NifHost::alloc_env`] (C `enif_free_env`); default:
+    /// unsupported.
+    fn free_env(&mut self, env: *mut ErlNifEnv) -> bool {
+        let _ = env;
+        false
+    }
+
+    /// Copy `term` out of a foreign environment into this host's heap (C `enif_make_copy`); default:
+    /// unsupported.
+    fn make_copy(&mut self, term: Eterm) -> Option<Eterm> {
+        let _ = term;
+        None
+    }
+
+    /// Resolve a resource term owned by **another** NIF module and call that type's `dyncall`
+    /// (C `enif_dynamic_resource_call`), returning the C result code (`0` = the call was made).
+    /// `env` is the live calling environment, `module`/`name` the atoms identifying the target
+    /// resource type, `resource` the resource term and `call_data` the opaque callback argument.
+    /// Default: unsupported (`None`), which the caller turns into the C's failure code `1`. A
+    /// resource term this crate itself minted is handled before this hook is consulted (see
+    /// [`super::enif::resources`]), so the hook is only reached for foreign types.
+    fn dynamic_resource_call(
+        &mut self,
+        env: *mut ErlNifEnv,
+        module: Eterm,
+        name: Eterm,
+        resource: Eterm,
+        call_data: *mut c_void,
+    ) -> Option<c_int> {
+        let _ = (env, module, name, resource, call_data);
         None
     }
 }

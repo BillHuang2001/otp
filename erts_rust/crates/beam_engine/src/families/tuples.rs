@@ -18,12 +18,13 @@
 //!   word unchecked, so this is the **safety net**: anything else raises
 //!   `{badmatch, Source}` (class `error`).
 //! - `SelectTupleArity { tuple, fail, destinations }` — switch on the source
-//!   tuple's arity. The value must be a tuple; a non-tuple is a documented typed
-//!   error (`select_tuple_arity` is only emitted after an `is_tuple` test of the
-//!   same fail label, so the case is unreachable for compiler output). Otherwise
-//!   the matching `(Integer(n), Label)` alternative wins; with no match it falls to
-//!   `fail`, or — when `fail` is `NO_FAIL` (an exhaustive switch) — raises
-//!   `{badmatch, Tuple}`.
+//!   tuple's arity. A non-tuple source has no arity at all (C's `get_arity` sets the
+//!   switch value to `NIL`, which no integer alternative can equal), so it matches
+//!   nothing and takes exactly the same `$FAIL(Fail)` path as an unmatched arity;
+//!   `select_tuple_arity` is only emitted after an `is_tuple` test of the same fail
+//!   label, so that path is unreachable for compiler output. The matching
+//!   `(Integer(n), Label)` alternative wins; with no match it falls to `fail`, or —
+//!   when `fail` is `NO_FAIL` (an exhaustive switch) — raises `{badmatch, Tuple}`.
 //!
 //! Every failure is a typed [`beam_common::BeamError`]: `write_operand`/
 //! `read_operand` propagate, an unsupported operand is `error::unsupported`, and
@@ -93,17 +94,18 @@ pub(crate) fn exec(
             destinations,
         } => {
             let value = read_operand(machine, ctx, tuple)?;
-            // The arity switch is only emitted behind an `is_tuple` test; a
-            // non-tuple source is the documented typed-error gap.
-            let arity = match terms::tuple_arity(value) {
-                Ok(arity) => arity,
-                Err(_) => return Err(error::unsupported("select_tuple_arity: non-tuple")),
-            };
+            // C's `select_val_lin.get_arity` sets the switch value of a non-tuple
+            // source to `NIL` (`select_instrs.tab:122-128`), and `execute` then finds
+            // no alternative equal to it and takes the ordinary `$FAIL($Fail)` jump
+            // (`:130-153`) — so a non-tuple behaves exactly like an arity that matches
+            // no destination.
+            let arity = terms::tuple_arity(value).ok();
             let mut target = None;
             for (candidate, label) in destinations {
                 // Arities are decoded as `{integer, N}` operands; a non-integer
-                // alternative can never equal an arity and is skipped.
-                if let Operand::Integer(n) = candidate {
+                // alternative can never equal an arity and is skipped. A non-tuple
+                // source has no arity and so matches nothing.
+                if let (Some(arity), Operand::Integer(n)) = (arity, candidate) {
                     if *n >= 0 && *n as usize == arity {
                         target = Some(*label);
                         break;

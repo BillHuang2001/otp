@@ -20,6 +20,7 @@ use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
 use beam_term::prelude::Eterm;
 
+use crate::driver::api::ErlDrvApi;
 use crate::driver::host::decode_term_spec;
 use crate::driver::types::{
     ErlDrvBinary, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlDrvTermData, ErlIOVec,
@@ -577,6 +578,41 @@ pub unsafe extern "C" fn driver_async(
         Some(env) => env.host().r#async(ix, key, invoke, data, free),
         None => -1,
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Table assembly (part 2 of the frozen `ErlDrvApi`)
+// ---------------------------------------------------------------------------------------------
+
+/// Populate the **port/host-dependent** slots of the frozen `ErlDrvApi` this file implements
+/// (part 2).
+///
+/// Called from [`super::DRIVER_API`]'s `populate` chain, so this file — not `mod.rs` — owns the
+/// `Some(…)` list for the functions it defines. Every field is `const`-assignable, so the whole
+/// chain folds at compile time.
+///
+/// Implements: the `driver_output*` family, the term-data family, the port queries
+/// (`driver_mk_atom`/`driver_mk_port`/`driver_connected`/`driver_caller`) and the
+/// select/timer/async group.
+pub(super) const fn populate(mut api: ErlDrvApi) -> ErlDrvApi {
+    api.driver_output = Some(driver_output);
+    api.driver_output2 = Some(driver_output2);
+    api.driver_output_binary = Some(driver_output_binary);
+    api.driver_outputv = Some(driver_outputv);
+    api.driver_output_term = Some(driver_output_term);
+    api.driver_send_term = Some(driver_send_term);
+    api.erl_drv_output_term = Some(erl_drv_output_term);
+    api.erl_drv_send_term = Some(erl_drv_send_term);
+    api.driver_mk_atom = Some(driver_mk_atom);
+    api.driver_mk_port = Some(driver_mk_port);
+    api.driver_connected = Some(driver_connected);
+    api.driver_caller = Some(driver_caller);
+    api.driver_select = Some(driver_select);
+    api.driver_set_timer = Some(driver_set_timer);
+    api.driver_cancel_timer = Some(driver_cancel_timer);
+    api.driver_read_timer = Some(driver_read_timer);
+    api.driver_async = Some(driver_async);
+    api
 }
 
 #[cfg(test)]
