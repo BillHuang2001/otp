@@ -1241,7 +1241,7 @@ mod tests {
         );
 
         // A missing atom *inside* a container is reported, never invented.
-        let mut unseeded = AtomTable::new();
+        let unseeded = AtomTable::new();
         assert!(matches!(
             InfoValue::List(vec![InfoValue::Atom("unix")]).to_eterm(&mut heap, &unseeded),
             Err(BeamError::TermNotFound)

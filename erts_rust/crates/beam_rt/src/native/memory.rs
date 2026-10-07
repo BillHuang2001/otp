@@ -50,7 +50,7 @@
 //! number is a property of *this* runtime's heap, and inventing `233` would be a lie.
 
 use beam_common::{BeamError, Result};
-use beam_engine::{terms, ExecutionContext};
+use beam_engine::terms;
 use beam_gc::{HeapInfo, HeapObservable, HeapPolicy};
 use beam_process::ProcessId;
 use beam_term::{make_small, Eterm};
