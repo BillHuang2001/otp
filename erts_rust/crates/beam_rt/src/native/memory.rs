@@ -34,10 +34,11 @@
 //! The key order is [`beam_gc::GARBAGE_COLLECTION_KEYS`]; `max_heap_size` is the flag
 //! **map** here (`size` is the raw word bound, 0 = unlimited), unlike the bare integer
 //! `erlang:system_info(garbage_collection)` reports. `min_heap_size` /
-//! `min_bin_vheap_size` / `fullsweep_after` come from the process's own policy routed
-//! through the C's spawn floor ([`crate::info::effective_policy`]), and `minor_gcs` is
-//! the collector's real counter — today always `0`, because this runtime runs no GC
-//! (Milestone 1). Nothing here is hardcoded from the oracle.
+//! `min_bin_vheap_size` / `fullsweep_after` come from the **emulator's** heap-size options
+//! — the `+hms`/`+hmbs`/`+hmax*`-configured policy the process was seeded with
+//! ([`crate::info::effective_policy`]), so `+hms 1000 +hmbs 5000` reports 1598 / 6772 —
+//! and `minor_gcs` is the collector's real counter (today always `0`: this runtime runs
+//! no GC). Nothing here is hardcoded from the oracle.
 //!
 //! # Documented divergence: `heap_size` / `total_heap_size`
 //!
@@ -51,11 +52,12 @@
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_gc::{HeapInfo, HeapObservable, HeapPolicy};
+use beam_gc::{HeapInfo, HeapObservable};
 use beam_process::ProcessId;
 use beam_term::{make_small, Eterm};
 
 use super::RuntimeContext;
+use crate::config::MaxHeapFlags;
 
 /// The `erlang:process_info/2` item names this runtime answers.
 ///
@@ -69,8 +71,6 @@ const ITEMS: &[&str] = &["garbage_collection", "heap_size", "total_heap_size"];
 /// engine's heap afterwards, which needs `&mut` access to the runtime the collector lives
 /// in.
 struct Measurements {
-    /// The collector's own policy (routed through the C spawn floor when reported).
-    policy: HeapPolicy,
     /// Minor collections run so far (the real counter — `0` until a GC runs).
     minor_gcs: u32,
     /// The nursery's capacity, in words.
@@ -119,7 +119,6 @@ impl RuntimeContext<'_> {
     fn measurements(&self, pid: ProcessId) -> Option<Measurements> {
         let collector = self.runtime.processes().get(pid)?.collector();
         Some(Measurements {
-            policy: collector.heap_policy().clone(),
             minor_gcs: collector.minor_gcs(),
             heap_size: collector.heap_size_words(),
             total_heap_size: collector.total_heap_size_words(),
@@ -128,19 +127,26 @@ impl RuntimeContext<'_> {
 
     /// The `garbage_collection` value: the oracle's five `{Key, Value}` pairs, in
     /// [`beam_gc::GARBAGE_COLLECTION_KEYS`] order.
+    ///
+    /// The bounds come from the **emulator's** heap-size options
+    /// ([`effective_policy`](crate::info::effective_policy)), i.e. the `+hms`/`+hmbs`/
+    /// `+hmax`-configured policy the process was seeded with — the C's
+    /// `p->min_heap_size`/`p->min_bin_vheap_size`/`p->max_heap_size`. The *sizes* are this
+    /// process's own measurement.
     fn garbage_collection(&mut self, measurements: &Measurements) -> Result<Eterm> {
-        let policy = crate::info::effective_policy(&measurements.policy);
+        let policy = crate::info::effective_policy(self.runtime);
         let info = HeapInfo::new(
             &policy,
             measurements.minor_gcs,
             measurements.heap_size,
             measurements.total_heap_size,
         );
+        let flags = self.runtime.config().heap_options().max_heap_flags();
         let mut entries = Vec::with_capacity(5);
         for (key, value) in info.items() {
             let value = match key {
                 // The one item whose value is a container: the flag map.
-                "max_heap_size" => self.max_heap_size_map(value)?,
+                "max_heap_size" => self.max_heap_size_map(value, flags)?,
                 _ => make_small(value as i64),
             };
             let key = self.atom(key)?;
@@ -149,25 +155,37 @@ impl RuntimeContext<'_> {
         terms::make_list(self, &entries)
     }
 
-    /// The `max_heap_size` process-flag map: `#{size => N, kill => true,
-    /// error_logger => true, include_shared_binaries => false}` — the OTP defaults for a
-    /// process with no explicit limit, which is what this runtime spawns (`size` is the
-    /// raw word bound, 0 = unlimited).
-    fn max_heap_size_map(&mut self, size: usize) -> Result<Eterm> {
-        let entries = [
-            ("error_logger", self.atom("true")?),
-            ("include_shared_binaries", self.atom("false")?),
-            ("kill", self.atom("true")?),
-            ("size", make_small(size as i64)),
+    /// The `max_heap_size` process-flag map: `#{size => N, kill => F, error_logger => F,
+    /// include_shared_binaries => F}` — the OTP defaults for a process with no explicit
+    /// limit (`kill`/`error_logger` on, shared binaries excluded), overridden by
+    /// `+hmaxk`/`+hmaxel`/`+hmaxib`. `size` is the raw word bound (0 = unlimited).
+    fn max_heap_size_map(&mut self, size: usize, flags: MaxHeapFlags) -> Result<Eterm> {
+        // The oracle's entry order (verified against OTP 29.1.1 / erts-17.1) — the same
+        // order the flag *map* is built in, `size` last.
+        let booleans = [
+            ("error_logger", flags.error_logger),
+            ("include_shared_binaries", flags.include_shared_binaries),
+            ("kill", flags.kill),
         ];
-        let mut pairs = Vec::with_capacity(entries.len());
-        for (key, value) in entries {
+        let mut pairs = Vec::with_capacity(booleans.len() + 1);
+        for (key, flag) in booleans {
+            let value = self.atom(bool_atom(flag))?;
             pairs.push((self.atom(key)?, value));
         }
+        pairs.push((self.atom("size")?, make_small(size as i64)));
         // An owned handle to the shared table keeps the caller's `&mut self` free for the
         // map builder (`terms::make_map` needs both the context and the table).
         let atoms = self.runtime.code_server.atoms_handle();
         terms::make_map(self, &pairs, &atoms)
+    }
+}
+
+/// The atom name of a boolean flag value (`true` / `false`).
+fn bool_atom(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
     }
 }
 
@@ -232,6 +250,79 @@ mod tests {
             if let Some(expected_value) = expected_value {
                 assert_eq!(signed_value(*value), expected_value, "{name}");
             }
+        }
+    }
+
+    /// The heap options really reach the per-process item, pinned against the oracle
+    /// (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// erl +hms 1000 +hmbs 5000 -noshell \
+    ///     -eval 'io:format("~p~n",[process_info(self(),garbage_collection)]), halt().'
+    ///   → [{max_heap_size,#{error_logger=>true,include_shared_binaries=>false,kill=>true,
+    ///                       size=>0}},
+    ///      {min_bin_vheap_size,6772},{min_heap_size,1598},{fullsweep_after,65535},
+    ///      {minor_gcs,0}]
+    /// erl +hmaxk false +hmaxel false +hmaxib true -noshell -eval … (same probe)
+    ///   → the map reads #{error_logger=>false,include_shared_binaries=>true,kill=>false,…}
+    /// ```
+    #[test]
+    fn heap_options_reach_garbage_collection() {
+        // The default runtime reports the oracle's 233 / 46422 (see the test above); a
+        // `+hms`/`+hmbs` runtime reports the growth-table rounding of the raw request.
+        let argv: Vec<String> = ["+hms", "1000", "+hmbs", "5000"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let config = crate::cli::parse(&argv).expect("+hms 1000 +hmbs 5000 parses");
+        let mut runtime = crate::Runtime::new(config).expect("a configured runtime");
+        let pid = root_pid(&mut runtime);
+        let item_term = item(&mut runtime, "garbage_collection");
+        let reply = call(&mut runtime, "erlang", "process_info", &[pid, item_term])
+            .expect("process_info/2");
+        let pairs = pairs_of(reply);
+        let expected = [
+            ("max_heap_size", None),
+            ("min_bin_vheap_size", Some(6_772_i64)),
+            ("min_heap_size", Some(1_598)),
+            ("fullsweep_after", Some(65_535)),
+            ("minor_gcs", Some(0)),
+        ];
+        assert_eq!(pairs.len(), expected.len());
+        for ((key, value), (name, expected_value)) in pairs.iter().zip(expected) {
+            assert_eq!(runtime.atom_name_of(*key), Some(name));
+            if let Some(expected_value) = expected_value {
+                assert_eq!(signed_value(*value), expected_value, "{name}");
+            }
+        }
+
+        // … and the `+hmax*` flag word is what the map reports.
+        let argv: Vec<String> = ["+hmaxk", "false", "+hmaxel", "false", "+hmaxib", "true"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let config = crate::cli::parse(&argv).expect("the +hmax* flags parse");
+        let mut runtime = crate::Runtime::new(config).expect("a configured runtime");
+        let pid = root_pid(&mut runtime);
+        let item_term = item(&mut runtime, "garbage_collection");
+        let reply = call(&mut runtime, "erlang", "process_info", &[pid, item_term])
+            .expect("process_info/2");
+        let map = pairs_of(reply)[0].1;
+        let atoms = runtime.code_server().atoms();
+        let entries = beam_term::map::map_pairs(map, atoms).expect("a map");
+        let value_of = |name: &str| -> Eterm {
+            entries
+                .iter()
+                .find(|(key, _)| atoms.name(atom_val(*key)) == Some(name))
+                .unwrap_or_else(|| panic!("{name} must be present"))
+                .1
+        };
+        for (name, expected) in [
+            ("kill", "false"),
+            ("error_logger", "false"),
+            ("include_shared_binaries", "true"),
+        ] {
+            assert_eq!(atoms.name(atom_val(value_of(name))), Some(expected), "{name}");
         }
     }
 

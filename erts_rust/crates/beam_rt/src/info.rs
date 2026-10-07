@@ -263,7 +263,7 @@ pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
         "schedulers" => Ok(InfoValue::Int(schedulers(rt))),
         "alloc_util_allocators" => Ok(alloc_util_allocators()),
         "allocated_areas" => allocated_areas(rt),
-        "garbage_collection" => Ok(garbage_collection()),
+        "garbage_collection" => Ok(garbage_collection(rt)),
         other => Err(error::unknown_info_key(other)),
     }
 }
@@ -290,49 +290,38 @@ fn alloc_util_allocators() -> InfoValue {
     )
 }
 
-/// The **effective** default heap policy: the emulator defaults a process started
-/// without `spawn_opt` heap options gets.
+/// The **effective** heap policy this runtime reports: the emulator's heap-size options
+/// (`+hms`/`+hmbs`/`+hmax*`) as parsed by the CLI.
 ///
-/// [`beam_gc::HeapPolicy::default`] is the *unbounded floor*
-/// (`min_heap_words == 0`), whereas the oracle reports the C's `H_DEFAULT_SIZE`
-/// (233 words). [`beam_gc::HeapPolicy::from_spawn_opts`] applies exactly that floor (and
-/// the C's binary-vheap floor) to a requested value, so routing the defaults through it
-/// yields the oracle's `min_heap_size` (233), `min_bin_vheap_size` (46422) and
-/// `fullsweep_after` (65535) **without hardcoding any of them** — the numbers come from
-/// `beam_gc`'s growth table, which is itself derived from `erl_init.c`.
-fn effective_default_policy() -> beam_gc::HeapPolicy {
-    effective_policy(&beam_gc::HeapPolicy::default())
-}
-
-/// The policy a collector started with `base` reports to the oracle.
-///
-/// `beam_gc`'s [`HeapPolicy::default`](beam_gc::HeapPolicy::default) keeps
-/// `min_heap_words` at 0 (an *unbounded floor*), but every process the runtime spawns
-/// goes through the C's spawn path, whose minimum is `H_DEFAULT_SIZE` (233 words). This
-/// is the same conversion [`beam_gc::HeapPolicy::from_spawn_opts`] applies, so a process
-/// with no explicit heap options reports the emulator default rather than the sentinel.
-pub(crate) fn effective_policy(base: &beam_gc::HeapPolicy) -> beam_gc::HeapPolicy {
-    beam_gc::HeapPolicy::from_spawn_opts(
-        base.min_heap_words,
-        base.min_bin_vheap_words,
-        base.fullsweep_after,
-    )
+/// [`beam_gc::HeapPolicy::default`] is the *unbounded floor* (`min_heap_words == 0`),
+/// whereas the oracle reports the C's `H_DEFAULT_SIZE` (233 words); `beam_gc`'s
+/// [`HeapPolicy::from_spawn_opts`] is the spawn path that applies that floor.
+/// [`HeapOptions`](crate::config::HeapOptions) already carries the settled emulator
+/// figures — the defaults are 233 / 46422 / 65535 and a `+hms 1000` / `+hmbs 5000`
+/// invocation reports 1598 / 6772 — all computed from `beam_gc`'s constants and growth
+/// table, never hardcoded from the oracle. Reporting it (rather than re-deriving it from
+/// a collector's policy) matches the C, where `min_heap_size`/`min_bin_vheap_size` are
+/// seeded per process from the emulator defaults.
+pub(crate) fn effective_policy(rt: &Runtime) -> beam_gc::HeapPolicy {
+    rt.config().heap_options().policy().clone()
 }
 
 /// `system_info(garbage_collection)` — the emulator-wide GC policy knobs.
 ///
-/// Verified against the oracle (OTP 29 / erts-17.1): `[{max_heap_size,0},
-/// {min_bin_vheap_size,46422},{min_heap_size,233},{fullsweep_after,65535}]`. Note that
+/// Verified against the oracle (OTP 29.1.1 / erts-17.1): `[{max_heap_size,0},
+/// {min_bin_vheap_size,46422},{min_heap_size,233},{fullsweep_after,65535}]`, and an
+/// invocation with `+hms 1000 +hmbs 5000` ⇒ `[{max_heap_size,0},
+/// {min_bin_vheap_size,6772},{min_heap_size,1598},{fullsweep_after,65535}]`. Note that
 /// `max_heap_size` is the **bare integer** here, unlike the flag *map*
 /// `process_info(Pid, garbage_collection)` reports.
 ///
-/// The values are the [`effective_default_policy`] bounds, i.e. the same figures the
-/// per-process item reports for a process with no explicit heap options — the four keys
-/// [`beam_gc::GARBAGE_COLLECTION_KEYS`] names minus `minor_gcs`, which is a per-process
-/// counter with no emulator-wide counterpart.
-fn garbage_collection() -> InfoValue {
+/// The values are the emulator's heap-size options ([`effective_policy`]), i.e. the same
+/// figures the per-process item reports for a process with no explicit heap options — the
+/// four keys [`beam_gc::GARBAGE_COLLECTION_KEYS`] names minus `minor_gcs`, which is a
+/// per-process counter with no emulator-wide counterpart.
+fn garbage_collection(rt: &Runtime) -> InfoValue {
     // `HeapInfo` owns the oracle's item order; the sizes are irrelevant for this key.
-    let info = beam_gc::HeapInfo::new(&effective_default_policy(), 0, 0, 0);
+    let info = beam_gc::HeapInfo::new(&effective_policy(rt), 0, 0, 0);
     let items = info.items();
     InfoValue::List(
         items[..4]
@@ -1135,6 +1124,69 @@ mod tests {
                 InfoValue::Tupled(vec![InfoValue::Atom(key), InfoValue::Int(expected_value)])
             );
         }
+    }
+
+    /// The emulator-wide GC knobs follow the configured heap options, pinned against the
+    /// oracle (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// erl +hms 1000 +hmbs 5000 -noshell \
+    ///     -eval 'io:format("~p~n",[erlang:system_info(garbage_collection)]), halt().'
+    ///   → [{max_heap_size,0},{min_bin_vheap_size,6772},{min_heap_size,1598},
+    ///      {fullsweep_after,65535}]
+    /// ```
+    ///
+    /// The *values* are `beam_gc`'s growth-table figures, not literals from the oracle.
+    #[test]
+    fn garbage_collection_follows_the_configured_heap_options() {
+        let argv: Vec<String> = ["+hms", "1000", "+hmbs", "5000"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let config = crate::cli::parse(&argv).expect("+hms 1000 +hmbs 5000 parses");
+        let rt = Runtime::new(config).expect("a runtime with the configured heap options");
+        let value = system_info_value("garbage_collection", &rt).expect("garbage_collection");
+        let expected = [
+            ("max_heap_size", 0_i64),
+            ("min_bin_vheap_size", 6772),
+            ("min_heap_size", 1598),
+            ("fullsweep_after", 65_535),
+        ];
+        let rows = match &value {
+            InfoValue::List(rows) => rows,
+            other => panic!("garbage_collection must be a list, got {other:?}"),
+        };
+        assert_eq!(rows.len(), expected.len());
+        for (row, (key, expected_value)) in rows.iter().zip(expected) {
+            assert_eq!(
+                *row,
+                InfoValue::Tupled(vec![InfoValue::Atom(key), InfoValue::Int(expected_value)]),
+                "{key}"
+            );
+        }
+        // … and `+hmax` is the bare integer the oracle reports for `max_heap_size`.
+        let argv: Vec<String> = ["+hmax", "1000000"].iter().map(|arg| arg.to_string()).collect();
+        let config = crate::cli::parse(&argv).expect("+hmax 1000000 parses");
+        let rt = Runtime::new(config).expect("a runtime with +hmax");
+        let value = system_info_value("garbage_collection", &rt).expect("garbage_collection");
+        assert_eq!(
+            value,
+            InfoValue::List(vec![
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("max_heap_size"),
+                    InfoValue::Int(1_000_000)
+                ]),
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("min_bin_vheap_size"),
+                    InfoValue::Int(46_422)
+                ]),
+                InfoValue::Tupled(vec![InfoValue::Atom("min_heap_size"), InfoValue::Int(233)]),
+                InfoValue::Tupled(vec![
+                    InfoValue::Atom("fullsweep_after"),
+                    InfoValue::Int(65_535)
+                ]),
+            ])
+        );
     }
 
     #[test]

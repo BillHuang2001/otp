@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use beam_gc::{next_heap_size, HeapPolicy, DEFAULT_MIN_HEAP_WORDS};
+
 use crate::config::Action::{Boot, Version};
 
 /// The emulator start-up surface — `beam_common`'s A.6 configuration skeleton.
@@ -20,6 +22,155 @@ pub type EmulatorConfig = beam_common::RuntimeConfig;
 /// The default process-heap size in term words (64 Ki words — ample for the
 /// Milestone-1 vertical slice; there is no collector yet, see `runtime.rs`).
 pub const DEFAULT_HEAP_WORDS: usize = 65_536;
+
+/// The `+hmax*` boolean flags — the C `H_MAX_FLAGS` word (`erl_init.c:814-815`,
+/// `erl_init.c:1592-1624`).
+///
+/// They only change the flag **map** `erlang:process_info(Pid, garbage_collection)`
+/// reports for the `max_heap_size` item, not the limit itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxHeapFlags {
+    /// `+hmaxk true|false` — kill the process at the limit (the C
+    /// `MAX_HEAP_SIZE_KILL`; default `true`).
+    pub kill: bool,
+    /// `+hmaxel true|false` — log an error report at the limit (the C
+    /// `MAX_HEAP_SIZE_LOG`; default `true`).
+    pub error_logger: bool,
+    /// `+hmaxib true|false` — count off-heap binaries towards the limit (the C
+    /// `MAX_HEAP_SIZE_INCLUDE_OH_BINS`; default `false`).
+    pub include_shared_binaries: bool,
+}
+
+impl Default for MaxHeapFlags {
+    /// The emulator defaults (`erl_init.c:814-815`): kill and error-logger on, shared
+    /// binaries excluded.
+    fn default() -> Self {
+        MaxHeapFlags {
+            kill: true,
+            error_logger: true,
+            include_shared_binaries: false,
+        }
+    }
+}
+
+/// The heap-size emulator options — `+hms`, `+hmbs` and the `+hmax*` family — as the
+/// [`HeapPolicy`] the runtime's GC introspection reports.
+///
+/// # The emulator-flag rounding rule
+///
+/// A `+hms`/`+hmbs` value is a **raw request**, not a final size: the C rounds it through
+/// its curated growth table (`erts_next_heap_size(x, 0)`) before it becomes a process's
+/// `min_heap_size` / `min_bin_vheap_size`. Verified against the oracle (OTP 29.1.1 /
+/// erts-17.1):
+///
+/// ```text
+/// erl +hms 1000 +hmbs 5000 -noshell \
+///     -eval 'io:format("~p~n",[process_info(self(),garbage_collection)]), halt().'
+///   → min_bin_vheap_size 6772, min_heap_size 1598, fullsweep_after 65535
+/// erl -noshell -eval 'io:format("~p~n",[process_info(self(),garbage_collection)]), halt().'
+///   → min_bin_vheap_size 46422, min_heap_size 233, fullsweep_after 65535
+/// ```
+///
+/// So [`set_min_heap_words`](HeapOptions::set_min_heap_words) stores
+/// `next_heap_size(words, 0)` — `+hms 1000` ⇒ 1598, `+hms 100` ⇒ 142, `+hms 234` ⇒ 376 —
+/// with **no** `H_DEFAULT_SIZE` floor (`+hms 100` really does report 142, below the
+/// default 233), unlike the `spawn_opt` rule
+/// [`HeapPolicy::from_spawn_opts`](beam_gc::HeapPolicy::from_spawn_opts) applies. The
+/// `+hms`/`+hmbs` values are *not* recorded in the runtime's init arguments by real `erl`
+/// (`erl +hms 1000 … -eval 'init:get_argument(hms)'` ⇒ `error`), but this runtime records
+/// every emulator switch, exactly as it already does for `+S`/`+P`/`+A`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapOptions {
+    /// The policy the runtime reports through `system_info`/`process_info` — the
+    /// emulator defaults with the recognized switches applied.
+    policy: HeapPolicy,
+    /// The `+hmaxk`/`+hmaxel`/`+hmaxib` flag word.
+    max_heap_flags: MaxHeapFlags,
+}
+
+impl Default for HeapOptions {
+    /// The emulator defaults a process with no `spawn_opt` heap options gets: the C
+    /// `H_DEFAULT_SIZE` (233) for `min_heap_size`, `erts_next_heap_size(32768, 0)`
+    /// (46422, from `beam_gc`) for `min_bin_vheap_size`, `fullsweep_after` 65535, no max
+    /// heap size, and [`MaxHeapFlags::default`].
+    ///
+    /// The values come from `beam_gc` (the C's own constants and growth table), never from
+    /// the oracle's printed figures.
+    fn default() -> Self {
+        HeapOptions {
+            policy: HeapPolicy {
+                min_heap_words: DEFAULT_MIN_HEAP_WORDS,
+                ..HeapPolicy::default()
+            },
+            max_heap_flags: MaxHeapFlags::default(),
+        }
+    }
+}
+
+impl HeapOptions {
+    /// The emulator defaults (same as [`Default::default`]).
+    pub fn new() -> HeapOptions {
+        HeapOptions::default()
+    }
+
+    /// The policy the runtime's GC introspection reports.
+    pub fn policy(&self) -> &HeapPolicy {
+        &self.policy
+    }
+
+    /// The `+hmax*` flag word.
+    pub fn max_heap_flags(&self) -> MaxHeapFlags {
+        self.max_heap_flags
+    }
+
+    /// Sets the `+hms` minimum heap size, in raw requested words — rounded through the
+    /// growth table exactly as the emulator does (see the type docs).
+    pub fn set_min_heap_words(&mut self, words: usize) {
+        self.policy.min_heap_words = next_heap_size(words, 0);
+    }
+
+    /// Sets the `+hmbs` minimum binary virtual heap size, in raw requested words —
+    /// rounded through the growth table exactly as the emulator does.
+    pub fn set_min_bin_vheap_words(&mut self, words: usize) {
+        self.policy.min_bin_vheap_words = next_heap_size(words, 0);
+    }
+
+    /// Sets the `+hmax` maximum heap size in words (`0` = unlimited, the emulator's
+    /// default). The emulator compares the value against `MAX_SMALL`; the caller — the CLI
+    /// — enforces that bound.
+    pub fn set_max_heap_words(&mut self, words: usize) {
+        self.policy.max_heap_words = words;
+    }
+
+    /// Sets the `+hmax*` flag word.
+    pub fn set_max_heap_flags(&mut self, flags: MaxHeapFlags) {
+        self.max_heap_flags = flags;
+    }
+
+    /// [`set_min_heap_words`](HeapOptions::set_min_heap_words), chainable.
+    pub fn with_min_heap_words(mut self, words: usize) -> HeapOptions {
+        self.set_min_heap_words(words);
+        self
+    }
+
+    /// [`set_min_bin_vheap_words`](HeapOptions::set_min_bin_vheap_words), chainable.
+    pub fn with_min_bin_vheap_words(mut self, words: usize) -> HeapOptions {
+        self.set_min_bin_vheap_words(words);
+        self
+    }
+
+    /// [`set_max_heap_words`](HeapOptions::set_max_heap_words), chainable.
+    pub fn with_max_heap_words(mut self, words: usize) -> HeapOptions {
+        self.set_max_heap_words(words);
+        self
+    }
+
+    /// [`set_max_heap_flags`](HeapOptions::set_max_heap_flags), chainable.
+    pub fn with_max_heap_flags(mut self, flags: MaxHeapFlags) -> HeapOptions {
+        self.set_max_heap_flags(flags);
+        self
+    }
+}
 
 /// The parsed **init arguments**: for every command-line flag, the list of its
 /// occurrences, each occurrence being the list of values that followed it.
@@ -170,6 +321,9 @@ pub struct RuntimeConfig {
     pub code_paths: Vec<PathBuf>,
     /// The process-heap size in term words.
     pub heap_words: usize,
+    /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) the runtime reports
+    /// through its GC introspection (contract A.6 → A.8).
+    pub heap: HeapOptions,
     /// The parsed init arguments (contract A.6; the source of `init:get_argument/1`).
     pub init_args: InitArgs,
     /// The action to perform.
@@ -178,12 +332,14 @@ pub struct RuntimeConfig {
 
 impl Default for RuntimeConfig {
     /// The defaults of a bare `beam_rt` invocation: a `jit` emulator, an empty code
-    /// path, a [`DEFAULT_HEAP_WORDS`]-word heap, no init arguments and [`Action::Boot`].
+    /// path, a [`DEFAULT_HEAP_WORDS`]-word heap, the emulator's heap-size defaults, no
+    /// init arguments and [`Action::Boot`].
     fn default() -> Self {
         RuntimeConfig {
             emulator: EmulatorConfig::default(),
             code_paths: Vec::new(),
             heap_words: DEFAULT_HEAP_WORDS,
+            heap: HeapOptions::default(),
             init_args: InitArgs::default(),
             action: Boot,
         }
@@ -226,6 +382,12 @@ impl RuntimeConfig {
         self
     }
 
+    /// Replaces the heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`).
+    pub fn with_heap_options(mut self, heap: HeapOptions) -> Self {
+        self.heap = heap;
+        self
+    }
+
     /// Replaces the emulator start-up surface.
     pub fn with_emulator(mut self, emulator: EmulatorConfig) -> Self {
         self.emulator = emulator;
@@ -250,6 +412,11 @@ impl RuntimeConfig {
         self
     }
 
+    /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) of this invocation.
+    pub fn heap_options(&self) -> &HeapOptions {
+        &self.heap
+    }
+
     /// Whether the configured action is [`Action::Version`].
     pub fn is_version(&self) -> bool {
         self.action == Version
@@ -269,9 +436,95 @@ mod tests {
         assert_eq!(config.emulator, EmulatorConfig::default());
         assert!(config.code_paths.is_empty());
         assert_eq!(config.heap_words, DEFAULT_HEAP_WORDS);
+        assert_eq!(config.heap, HeapOptions::default());
         assert!(config.init_args.is_empty());
         assert_eq!(config.action, Action::Boot);
         assert!(!config.is_version());
+    }
+
+    /// The emulator defaults, pinned against the oracle (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// erl -noshell -eval 'io:format("~p~n",[process_info(self(),garbage_collection)]), halt().'
+    ///   → [{max_heap_size,#{error_logger=>true,include_shared_binaries=>false,kill=>true,
+    ///                       size=>0}},
+    ///      {min_bin_vheap_size,46422},{min_heap_size,233},{fullsweep_after,65535},
+    ///      {minor_gcs,0}]
+    /// ```
+    #[test]
+    fn default_heap_options_are_the_emulator_defaults() {
+        let heap = HeapOptions::default();
+        assert_eq!(heap.policy().min_heap_words, 233);
+        assert_eq!(heap.policy().min_bin_vheap_words, 46_422);
+        assert_eq!(heap.policy().fullsweep_after, 65_535);
+        assert_eq!(heap.policy().max_heap_words, 0);
+        assert_eq!(
+            heap.max_heap_flags(),
+            MaxHeapFlags {
+                kill: true,
+                error_logger: true,
+                include_shared_binaries: false,
+            }
+        );
+        // The two figures come from `beam_gc` (the C `H_DEFAULT_SIZE` and the growth
+        // table), not from a literal in this crate.
+        assert_eq!(heap.policy().min_heap_words, beam_gc::DEFAULT_MIN_HEAP_WORDS);
+        assert_eq!(
+            heap.policy().min_bin_vheap_words,
+            beam_gc::HeapPolicy::default().min_bin_vheap_words
+        );
+    }
+
+    /// The emulator-flag rounding rule, pinned against the oracle (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// erl +hms 1000 +hmbs 5000 -noshell \
+    ///     -eval 'io:format("~p~n",[process_info(self(),garbage_collection)]), halt().'
+    ///   → min_bin_vheap_size 6772, min_heap_size 1598, fullsweep_after 65535
+    ///   (and the same probe with +hms 100 / +hms 234 / +hmbs 46423 → 142 / 376 / 75113)
+    /// ```
+    ///
+    /// A requested size is rounded **up** through `beam_gc`'s growth table
+    /// (`erts_next_heap_size(x, 0)`) with no `H_DEFAULT_SIZE` floor — `+hms 100` really
+    /// does report 142, *below* the 233 default.
+    #[test]
+    fn heap_options_round_through_the_growth_table() {
+        for (requested, rounded) in [
+            (100, 142),
+            (233, 233),
+            (234, 376),
+            (1000, 1598),
+            (46_423, 75_113),
+        ] {
+            let heap = HeapOptions::new()
+                .with_min_heap_words(requested)
+                .with_min_bin_vheap_words(requested);
+            assert_eq!(
+                heap.policy().min_heap_words,
+                rounded,
+                "+hms {requested} rounds to {rounded}"
+            );
+            assert_eq!(
+                heap.policy().min_bin_vheap_words,
+                rounded,
+                "+hmbs {requested} rounds to {rounded}"
+            );
+            // The rounding is `beam_gc`'s own primitive, not a table in this crate.
+            assert_eq!(heap.policy().min_heap_words, beam_gc::next_heap_size(requested, 0));
+        }
+        // `+hmax` is stored verbatim (`0` = unlimited) and the flag word is a separate knob.
+        let bounded = HeapOptions::new().with_max_heap_words(1_000_000);
+        assert_eq!(bounded.policy().max_heap_words, 1_000_000);
+        assert_eq!(bounded.policy().min_heap_words, 233);
+        let flags = MaxHeapFlags {
+            kill: false,
+            error_logger: false,
+            include_shared_binaries: true,
+        };
+        assert_eq!(
+            HeapOptions::new().with_max_heap_flags(flags).max_heap_flags(),
+            flags
+        );
     }
 
     #[test]
@@ -291,7 +544,14 @@ mod tests {
         assert_eq!(config.emulator.schedulers, Some(2));
         assert_eq!(config.emulator.max_processes, Some(1000));
         assert_eq!(config.emulator.node_name.as_deref(), Some("beam@host"));
-        // `with_emulator` replaces the whole A.6 skeleton, so it is a separate step.
+        assert_eq!(config.heap_options(), &HeapOptions::default());
+        // `with_heap_options` replaces the whole heap-size option set.
+        let heaps = config
+            .clone()
+            .with_heap_options(HeapOptions::new().with_max_heap_words(4711));
+        assert_eq!(heaps.heap_options().policy().max_heap_words, 4711);
+        assert_eq!(heaps.heap_words, 1024);
+        // … and `with_emulator` replaces the whole A.6 skeleton, so it is a separate step.
         let replaced = config.with_emulator(EmulatorConfig::default());
         assert_eq!(replaced.emulator, EmulatorConfig::default());
         assert_eq!(replaced.code_paths, vec![PathBuf::from("/code/b")]);
