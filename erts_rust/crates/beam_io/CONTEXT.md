@@ -258,8 +258,9 @@ the only place in this crate that holds raw `ErlDrv*` pointers and calls foreign
     `port_exit` → `process_exit` (null `*mut ErlDrvMonitor`) if present, else `emergency_close` if present, else a
     no-op; `take_exit_status` = the default `Ok(None)`; `stop` (absent ⇒ no-op).
 - `table.rs` — the **process-global driver registry and its port-creation service** (the `beam_io` half of the four
-  `ErlDrvApi` slots `beam_abi` reports as `None`). `unsafe`-marked (it stores/derefs `*mut ErlDrvEntry` and calls
-  the entry's `init`); the one `unsafe impl Send for Inner` (mutex-serialized) carries a rationale.
+  `ErlDrvApi` slots, reached from a driver through [`AbiHost`](src/abi/host.rs)). `unsafe`-marked (it stores/derefs
+  `*mut ErlDrvEntry` and calls the entry's `init`); the one `unsafe impl Send for Inner` (mutex-serialized) carries
+  a rationale.
   - `DriverTable` — `global()` (the C's one `driver_list`; `OnceLock`) and `new()` (an isolated table, for tests).
     `add_entry(*mut ErlDrvEntry)` (**`unsafe`**; the C's `add_driver_entry`) records a **statically linked** entry
     after running its `init` (`Option<fn() -> c_int>`; non-zero ⇒ the `driver_init_failed` raise and **no**
