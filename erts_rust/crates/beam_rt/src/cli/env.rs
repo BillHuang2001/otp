@@ -214,8 +214,7 @@ pub fn merge_argv(args: &[String], env: &dyn Env) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// The bytes of `s` rendered as an Erlang byte list — the shape of the tokens the
-    /// oracle reports for these variables.
+    /// The expected tokens as owned `String`s (the left side of every assertion).
     fn tokens(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| v.to_string()).collect()
     }
@@ -240,7 +239,8 @@ mod tests {
 
     #[test]
     fn adjacent_quotes_concatenate_into_one_token() {
-        // Verified against the oracle: `ERL_FLAGS='-g "a b"'c d''` ⇒ `{ok,[[["a bc d"]]]}`.
+        // Verified against the oracle: `ERL_FLAGS="-g \"a b\"'c d'"` makes
+        // `init:get_argument(g)` = `{ok,[["a bc d"]]}` — one token, quotes stripped.
         assert_eq!(tokenize("\"a b\"'c d'"), tokens(&["a bc d"]));
     }
 
