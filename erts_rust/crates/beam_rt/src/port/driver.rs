@@ -16,38 +16,36 @@
 //! `ErlDrvPort` a driver callback gets, and `beam_abi`'s host functions recover it with
 //! `DriverEnv::from_port`. `DriverEnv::new` erases the borrow of the host into a raw pointer (a
 //! documented `mem::transmute` inside `beam_abi`), so the caller must keep the host alive **and in
-//! place** for as long as the environment (and every port handle derived from it) is used. The
-//! [`Driver::open_port`] accessor is the one place that invariant is stated for this crate: the
-//! environment is a local of the caller's scope, and the host lives in a `Box` that never moves.
+//! place** for as long as the environment (and every port handle derived from it) is used.
+//! [`DriverPortAdapter::start`] is the one place that invariant is stated for this crate: the host
+//! lives in a `Box` that never moves, and the environment is itself `Box`ed **before** its handle is
+//! taken, because the handle *is* the environment's own address — a driver may keep it in its
+//! private state for the port's whole life (the A.4 fixture does exactly that).
 //!
 //! # What phase 1 proves
 //!
 //! A real C driver `.so`, compiled against the system `erl_driver.h`, is `dlopen`ed, validated and
 //! driven: the driver's `start` callback allocates its private state through the runtime's
 //! `driver_alloc`, its `output` callback echoes through `driver_output`, and the bytes land in
-//! [`DriverPort::outputs`]. The driver's `driver_*` imports are left **undefined** by the linker and
+//! [`DriverPort::outputs`]. [`DriverPortAdapter`] then routes those bytes end to end: a
+//! `{spawn_driver, Name}` port queued from Erlang reaches the driver's `output` callback through
+//! `port_command`, and the echo comes back to the owner as `{Port, {data, Data}}`. The driver's
+//! `driver_*` imports are left **undefined** by the linker and
 //! bind at `dlopen(RTLD_NOW)` out of the loading process's **dynamic symbol table**
 //! (`build.rs`'s `-Wl,--export-dynamic`, anchored by
 //! [`PortRegistry::new`](crate::port::PortRegistry::new)'s `black_box` reference to
 //! [`beam_abi::driver::drv::driver_api_table`]). `tests/driver.rs` pins the mechanism with
-//! `nm -D` / `readelf --dyn-syms`.
+//! `nm -D` / `readelf --dyn-syms` and the end-to-end delivery.
 //!
 //! # What is NOT wired yet (the typed gaps)
 //!
-//! * **`open_port({spawn_driver, Name}, …)` is not routed here.** [`crate::port::RuntimePorts`]
-//!   still answers only `{spawn, Cmd}` / `{spawn_executable, Path}` / `{fd, N}`; a `spawn_driver`
-//!   name is [`BeamError`](beam_common::BeamError)'s `BadArg`, never a silent no-op. Wiring it
-//!   needs, beyond this host, the driver's **port lifecycle**: a `beam_io` `Driver` that owns the
-//!   `ErlDrvEntry` callbacks (`output`/`control`/`timeout`/`ready_input`), turns captured
-//!   `driver_output` bytes into the owning process's `{Port, {data, …}}` message, and runs
-//!   `stop`/`finish` at close.
 //! * **`select` / `set_timer` / `cancel_timer` / `read_timer` / `async` keep the `DriverHost`
 //!   defaults** (`-1` / `None`), i.e. "unsupported": the runtime has no timer wheel or async pool
 //!   wired into the host yet, so a driver that asks for one gets the C's own failure code rather
 //!   than a fabricated success.
 //! * **`send_term` is captured, not delivered.** The decoded term is recorded in
 //!   [`DriverPort::sent`]; turning it into a port message to the owner needs the same port
-//!   lifecycle as `spawn_driver` above.
+//!   lifecycle that carries `driver_output` bytes today.
 
 use std::rc::Rc;
 
@@ -320,9 +318,12 @@ pub struct DriverPortAdapter {
     driver: Option<Driver>,
     /// The per-port environment the `ErlDrvPort` handed to the driver **is** (see the module docs).
     ///
-    /// Held for the port's whole life: it must not be dropped (or moved) while the driver holds
-    /// the port handle, which it may do for as long as the port lives.
-    env: Option<DriverEnv>,
+    /// **Boxed, and that is load-bearing:** [`DriverEnv::as_port`] hands the driver the
+    /// environment's *own address*, so the environment must not move while the driver holds the
+    /// port handle (which it may, for as long as the port lives — the fixture even stores it in its
+    /// private state). A `Box` is allocated before `as_port` runs and only ever moves as a pointer,
+    /// so the handle stays valid for the port's whole life.
+    env: Option<Box<DriverEnv>>,
     /// The private state the driver's `start` returned — what every later callback receives.
     state: beam_abi::driver::types::ErlDrvData,
     /// The driver name this port was loaded as.
@@ -397,10 +398,13 @@ impl beam_io::Driver for DriverPortAdapter {
         let Some(driver) = self.driver.as_mut() else {
             return Err(BeamError::BadArg);
         };
+        // `DriverEnv::as_port` returns the environment's own address, so the environment must be
+        // allocated **before** the handle is taken and must not move afterwards: a `Box` is stable,
+        // and the driver's `start` may keep the handle in its private state (the A.4 fixture does).
         // `DriverEnv` carries no lifetime, so the `&mut` borrow of the host ends with this call;
         // the environment (and so the handle) stays valid because the host lives in a `Box` that
         // never moves.
-        let mut env = driver.host_mut().environment();
+        let mut env = Box::new(driver.host_mut().environment());
         let port = env.as_port();
         self.env = Some(env);
         let command = std::ffi::CString::new(self.command.as_str()).map_err(|_| BeamError::BadArg)?;
