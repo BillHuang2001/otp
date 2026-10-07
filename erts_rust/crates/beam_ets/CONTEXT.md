@@ -393,6 +393,40 @@ impl Table {
   last-expression body yields `'EXIT'` and evaluation continues, while a guard error means the clause
   does not match. Verified against `erl` (`[{{'_','_'},[],[{hd,5}]}]` ⇒ `['EXIT','EXIT']`).
 
+## Concurrency, fixation & sharing (current state)
+- **`Table` is `Send + Sync` and shareable across processes.** `Table` holds only plain `Eterm` data
+  plus a `Box<dyn Interior>` (`pub(crate) trait Interior: Send + Sync`) and a `TermStore` (which
+  carries `unsafe impl Send`/`Sync` with a `// SAFETY:` rationale — `beam_alloc::Allocator: Send +
+  Sync + 'static`, and every write path takes `&mut self`). `pub struct SharedTable`
+  (`src/table/shared.rs`) wraps `Arc<RwLock<Table>>` with `new`/`id`/`ref_count`/`read`/`write`/
+  `with_read`/`with_write`/`try_into_inner` + `Clone`/`Debug`. A poisoned lock yields the **typed**
+  `unsupported_ets: table lock poisoned` error — never a panic, never a wrong result. Holding one
+  `write()` guard across a check-then-act makes `insert_new`/`update_counter`/`select_replace` atomic,
+  so concurrent writers lose no updates. (Fine-grained `{write_concurrency}` affects throughput only,
+  never observable results.)
+- **`ets:safe_fixtable/2` fixation = deferred reclamation.** `Table::set_fixation(bool)` /
+  `is_fixed()` / `deferred_objects()`: while fixed, every *removed* object's storage is pushed onto
+  `deferred_frees` instead of being freed, and `delete_all_objects` defers each root (rebuilding the
+  interior) rather than `reset()`ing the arena; unfixing flushes the deferred frees. So
+  `ets:info(T, memory)` is held while fixed and *falls* at unfix, matching the oracle. `deferred_frees`
+  is deliberately **not** counted in `memory()` (table-owned, not live objects).
+- **Access enforcement covers the newer ops.** `TableAccess` (`src/table/access.rs`) gates
+  `select_replace` as a *write* and every `/3` + `/1` limited/continuation form as a *read*
+  (`select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/
+  `match_object_continue`).
+- **Subterm sharing (the copy-boundary trim).** `TermStore::copy_term` shares exactly the one literal
+  whose liveness the crate can prove — the global empty tuple (`tuple0()`; C `copy.c:130-140`).
+  `beam_term::literal::LiteralArea` literals are **deep-copied** (the area can be dropped and the
+  crate holds no handle, so the C's `in_literal_purge_area` guard cannot be honoured). `{keypos, N}`
+  keys live inside the stored tuple (no separate key copy); `compressed` is parsed/reported with no
+  storage effect (honest gap, see Known Issues).
+- **New evidence:** `tests/ets_shared.rs` (5 tests — `Send`/`Sync`, 8-writer no-lost-update, reader
+  consistency, owner-only writer under concurrency, cross-thread move), `tests/ets_fixtable.rs` (5 —
+  fix/unfix idempotence, storage held while fixed and released at unfix, `delete_all_objects` under
+  fixation, ordered walk-and-delete under fixation, hash anchor still required when fixed),
+  `tests/ets_access.rs` (+2 — the `select_replace`/limited-form gates), `src/store/tests.rs` (+1 — the
+  empty-tuple literal is shared, not copied).
+
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
   split out to keep `store/mod.rs` small): kind/options, key validation, store copy/free/reuse and
