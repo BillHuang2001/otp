@@ -6,7 +6,7 @@ Failure is **return-based** (`../CONTEXT.md` §3): `BadArg`/`BadArith`/`BadArity
 Ground truth (read-only): `../../erts/emulator/beam/` (file list in the Routing Table), `../../erts/emulator/sys/common/erl_float_short.cpp` and the stdlib sources `erlang.erl`, `erts_internal.erl`, `ets.erl`, `lists.erl`, `maps.erl`, `io_lib.erl`/`io_lib_format.erl`/`io_lib_pretty.erl`, `unicode.erl`, `string.erl`.
 
 ## API Surface (FROZEN, `beam_rt` and tests design against this; additive-only changes)
-Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifContext` + its ten seams (below); the views `RecordDefinitionView`/`RecordFieldView`; sinks `StdoutSink`/`NullSink`/`BytesSink`; `NifLoadError`; `raise_error`/`raise_exit`/`raise_throw`; `exit_reason_from_term`/`reason_term_from_exit_reason`; `TableRegistry`.
+Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifContext` + its ten seams (below); the views `RecordDefinitionView`/`RecordFieldView`; sinks `StdoutSink`/`NullSink`/`BytesSink`; `NifLoadError`; `raise_error`/`raise_exit`/`raise_throw`; `exit_reason_from_term`/`reason_term_from_exit_reason`; `TableRegistry`. The public module `beam_bifs::bif_tab` (the `bif.tab` surface, below) is **not** in the prelude — it is validation tooling, not a runtime seam.
 - **`registry.rs`**, `BifFn = fn(&mut BifContext<'_>, &[Eterm]) -> Result<Eterm>`; `BifRegistry` (`HashMap<(String, String, u32), BifFn>`; `new`/`is_empty`/`len`/`names` (sorted)/`entries`), `with_core_bifs()` (the **320-key** roster) = `default_registry()`, `register(module, function, arity, f) -> Option<BifFn>`, `lookup`/`contains`, `call(module, function, arity, ctx, args) -> Result<Eterm>` (unknown key => `error::undefined_bif`; `args.len() != arity` => `BeamError::BadArity`); the loader/engine resolves a BIF from `Module.imports` by this key, and operator BIFs keep their *quoted* `bif.tab` names (`"+"`, `"=<"`, `"=:="`, `"!"`, `"++"`, `"not"`, …).
   `with_core_bifs` calls each module's `pub(crate) fn register` in order: `arith`, `bool`, `compare`, `type_test`, `term_ops`, `convert`, `lists`, `maps`, `math`, `binary`, `binconv`, `unicode`, `time`, `phash`, `proc`, `dict`, `reason`, `string`, `io`, `ets` (wiring `ets::matches`/`ets::specs`), `port`, `records`, `nif`.
 - **`context.rs`**, `BifContext<'a>`, fields heap/atoms/self_pid/current_module/output/sender/tables/interner/fun_caller/port/dict/nif_loader/record_source/local_node/fun_identity; builders `new(heap, atoms, self_pid)` + `with_output`/`with_sender`/`with_tables`/`with_atom_interner`/`with_fun_caller`/`with_port_hook`/`with_dict_hook`/`with_nif_loader`/`with_record_source`/`with_local_node`/`with_local_fun_identity`/`with_current_module`; accessors `heap`/`atoms`/`self_pid`/`current_module`/`write_output`/`sender`/`nif_loader`/`tables`/`dict_put`/`dict_get`/`dict_erase`/`dict_get_keys`/`dict_get_keys_for_value`; seam calls `call_fun`/`open_port`/`close_port`/`port_info`/`record_definition`/`local_node`/`local_fun_identity`; constructors `int`/`atom`/`intern_atom`/`boolean`/`ok`/`make_float`/`tuple`/`cons`/`list`.
@@ -26,6 +26,33 @@ Root + `beam_bifs::prelude::*`: `BifRegistry`/`BifFn`/`default_registry`; `BifCo
 - **`binary` (24):** `at/2 part/2,3 copy/1,2 list_to_bin/1 bin_to_list/1,2,3 decode_unsigned/1,2 encode_unsigned/1,2 first/1 last/1 compile_pattern/1 split/2,3 match/2,3 matches/2,3 longest_common_prefix/1 longest_common_suffix/1`.
 - **`string` (1):** `string:list_to_float/1`, the only real `bif.tab` `string` BIF (a prefix scanner returning `{Float, Rest}` or `{error, no_float}`/`{error, not_a_list}`); `string:to_integer/1` is **pure Erlang** (`../../lib/stdlib/src/string.erl`, not in `bif.tab`), so not registered here, and `string:pad_integer/3` does not exist in OTP. **`unicode` (6):** `characters_to_binary/1,2,3 characters_to_list/1,2 bin_is_7bit/1`. **`io` (3):** `io:format/1,2`, `io:printable_range/0` (the atom `latin1`). **`io_lib` (3):** `io_lib:format/2,3`, `io_lib:printable_list/1`.
 - **`ets` (37):** 25 keys in `ets.rs` + 10 in `ets/matches.rs` + 2 in `ets/specs.rs`, enumerated once in the `ets` bridge section. **`records` (8):** `get/2 get_module/1 get_name/1 get_field_names/1 is_exported/1 create/4 update/4 get_definition/2`. **`erts_internal`:** only `cmp_term/2` (the 9th `compare.rs` key).
+
+## The `bif.tab` surface & coverage census (`src/bif_tab.rs`, `tests/bif_tab.rs`)
+The registry is hand-written (a `BifFn` is a `fn` pointer, so a BIF cannot be table-driven and
+`with_core_bifs` is **not** built from the table). `bif_tab` restores the machine-checkable tie to the
+source data: `BifTab::parse` reads `../../../erts/emulator/beam/bif.tab` using its **real** grammar,
+read off the file — `bif`/`ubif`/`hbif` + `module:name/arity` + an ignored trailing `C-name` column,
+whole-line `#` comments, quoted names (`'+'`, `'=:='`, `'/'`) **unquoted** to recover the registry key,
+and `name/lo-hi` arity ranges (parsed, though none occur). `?MODULE` and `C_`/`#`/`-` directives do
+**not** occur and are not invented (an unknown directive is a parse error). `census(tab, registry)`
+partitions declared ⊎ missing and implemented ⊎ fast paths; it is **validation only, dispatch is
+unchanged**. Census (pinned by `tests/bif_tab.rs`; regenerate with `-- --nocapture`):
+
+| kind | declared | implemented | missing |
+|---|---|---|---|
+| `bif` | 476 | 168 | |
+| `ubif` | 73 | 71 | |
+| `hbif` | 7 | 2 | |
+| **total** | **556** | **241** | **315** |
+
+`registry = 320` = 241 declared + **79 stdlib fast paths** (`lists.erl`/`maps.erl`/`ets.erl`/… exports
+`bif.tab` does not declare; a mistyped BIF surfaces as *both* an undeclared fast path and a gap). The
+**315 declared-but-missing** BIFs (their `module:name/arity` list is enumerated by the pinned test,
+never fabricated) per module: `erlang` 135, `erts_internal` 70, `erts_debug` 20, `ets` 19,
+`erl_debugger` 13, `os` 10, `re` 8, `atomics` 7, `code` 7, `erl_ddll` 7, `persistent_term` 7,
+`prim_file` 4, `erts_literal_area_collector` 2, `erts_trace_cleaner` 2, `binary`/`error_logger`/`file`/
+`net_kernel` 1 each. Most are process/global-state-coupled (the `erlang`/`erts_internal` gap: signals,
+the registry, timers, node/dist, tracing, code loading) — see "Capability-gap audit" below.
 
 ## The `records` module (native records, `records.rs`)
 OTP 29 introduced **native records** (`-record` as a first-class value); their frozen interior `ErtsRecordDefinition`/`ErtsRecordInstance` is `beam_term::record` (the term-layout LCA), these BIFs its surface. Ground truth `erl_record.c`: `records_create_4:904-1085`, `update_4:1087-1245`, `get_2:1247-1274`, `get_module_1`/`get_name_1`/`get_field_names_1:1276-1326`, `is_exported_1:1328-1340`, `get_definition_2:1342-1365`.
@@ -111,8 +138,8 @@ The 37 `ets:*` keys over `TableRegistry`/`beam_ets::Table`; ground truth `erl_db
 - **Files target ~1000 lines.** Several exceed that only via their in-module `#[cfg(test)]` suites (`src/ets.rs` 1752 with tests, `src/binary.rs` ~2557 (~1360 impl), `src/phash.rs` ~1039), each implementation section staying under ~1300 lines; the printer and the ets bridge are **split by responsibility** (see the Routing Table). Licensing Apache-2.0.
 
 ## Test Strategy
-- Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded `beam_term::AtomTable` (the well-known atoms) with a `BytesSink`/`NullSink` capture; `cargo test -p beam_bifs` runs **360** lib tests + **236** integration tests = **596 passed, 0 failed**.
-- **`tests/` integration suite** (public API only): **236** tests across **26** files, all oracle-pinned, `phash.rs` 23, `ets_ops.rs` 20, `lists_funs.rs` 18, `pretty_print.rs` 13, `pure_bifs.rs` 12, `etf_options.rs` 11, `printable_list.rs` 11, `records.rs` 11, `iolist.rs` 9, `maps_funs.rs` 9, `ports.rs` 9 (mock `PortHook`), `bignum.rs` 8, `bitops.rs` 8, `dict.rs` 8 (mock `DictHook`), `erlang_bifs.rs` 8, `io_lib.rs` 8, `nif.rs` 8 (`load_nif/2` over a mock `NifLoader`: ok/`{error,{Reason,Text}}` per variant/non-string `badarg`/typed-`unsupported_bif` seam gaps + on-demand interning of the failure atoms), `bignum_promotion.rs` 7, `bitstring_print.rs` 6, `bool_bifs.rs` 5 (strict booleans + `is_function/2` + `is_record/1,2,3`), `binary_to_term_atoms.rs` 4, `function_clause.rs` 4, `io_ets.rs` 4, `list_ops.rs` 4, `maps_order.rs` 4 (the `maps:from_list`/`put` oracle key order), `registry.rs` 4 (the `BifRegistry` seam: roster floor, sorted `names()`, `register`/`lookup`, unknown-BIF `undef` + `BadArity`) asserting `reg.len() >= 54` (a floor, not the exact count).
+- Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded `beam_term::AtomTable` (the well-known atoms) with a `BytesSink`/`NullSink` capture; `cargo test -p beam_bifs` runs **366** lib tests + **240** integration tests = **606 passed, 0 failed**.
+- **`tests/` integration suite** (public API only): **240** tests across **27** files, all oracle-pinned, `bif_tab.rs` 4, `phash.rs` 23, `ets_ops.rs` 20, `lists_funs.rs` 18, `pretty_print.rs` 13, `pure_bifs.rs` 12, `etf_options.rs` 11, `printable_list.rs` 11, `records.rs` 11, `iolist.rs` 9, `maps_funs.rs` 9, `ports.rs` 9 (mock `PortHook`), `bignum.rs` 8, `bitops.rs` 8, `dict.rs` 8 (mock `DictHook`), `erlang_bifs.rs` 8, `io_lib.rs` 8, `nif.rs` 8 (`load_nif/2` over a mock `NifLoader`: ok/`{error,{Reason,Text}}` per variant/non-string `badarg`/typed-`unsupported_bif` seam gaps + on-demand interning of the failure atoms), `bignum_promotion.rs` 7, `bitstring_print.rs` 6, `bool_bifs.rs` 5 (strict booleans + `is_function/2` + `is_record/1,2,3`), `binary_to_term_atoms.rs` 4, `function_clause.rs` 4, `io_ets.rs` 4, `list_ops.rs` 4, `maps_order.rs` 4 (the `maps:from_list`/`put` oracle key order), `registry.rs` 4 (the `BifRegistry` seam: roster floor, sorted `names()`, `register`/`lookup`, unknown-BIF `undef` + `BadArity`) asserting `reg.len() >= 54` (a floor, not the exact count). `bif_tab.rs` is the `bif.tab` validation above: it pins the parsed table's shape (`bif` 476 / `ubif` 73 / `hbif` 7) and the registry-vs-declared census, and prints the enumerated gap to stderr — it reads the registry, never altering dispatch.
 - **Oracle cross-checks** back every hard algorithm (sweep sizes cited per section above: `phash2`, `math:atanh/1`, `lists:usort/2`, the `short` float format, `binary:compile_pattern/1` shapes, the whole ets family); bare BIF names are **not** auto-imported under `-eval` (fully qualify, e.g. `erlang:phash2(...)`), and one statement per invocation is most robust.
 - **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs --no-fail-fast` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace` (must stay warning-free); always go through `../../scripts/cargo.sh` (`$HOME` read-only); never `cd`; never touch `../../tools/` or `../../erts/`.
 
@@ -171,6 +198,7 @@ New OTP-30 roster entries not yet implemented: `erlang:is_integer/3` (referenced
 ## Routing Table
 - `src/lib.rs` -> crate docs, module wiring, root re-exports, `prelude`, `#![deny(unsafe_code)]`
 - `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (the 320-key roster), `default_registry`
+- `src/bif_tab.rs` -> the `bif.tab` parser (`BifTab`/`BifTabEntry`/`BifKind`/`BifTabError`, `bif_tab_path`/`read_real_bif_tab`) + the coverage `Census` (`census`); validation only, no dispatch path
 - `src/context.rs` -> `BifContext`, the ten seams, `NifLoadError`/`RecordDefinitionView`/`RecordFieldView`, `current_module`, the sink impls
 - `src/error.rs` -> the `pub(crate)` failure constructors, the `raise_*` builders, `raise_term`/`raise_error_term`/`structured_error`
 - `src/access.rs` -> the ONLY `#[allow(unsafe_code)]` module: term/int/float/bignum wrappers, `fun_arity`/`is_record`, bitstring + flatmap access, native-record read/write, the M1 ref thing
@@ -190,7 +218,7 @@ New OTP-30 roster entries not yet implemented: `erlang:is_integer/3` (referenced
 - `src/nif.rs` -> `erlang:load_nif/2`: `Path` decode, `(current_module, path, load_info)` to the `NifLoader` seam, `ok` or the oracle's `{error, {Reason, Text}}` return, `unsupported_bif` with no seam / unknown module
 - `src/io.rs` / `src/print.rs` -> `io:format/1,2` + `io:printable_range/0` + `io_lib:format/2,3` + `io_lib:printable_list/1` + the directive engine; the `~w`/`~p`/`~W`/`~P` leaf renderer + `mod pretty;`
 - `src/print/pretty.rs` (`mod pretty;` in `src/print.rs`) -> the full `io_lib_pretty` port, alongside `src/print/pretty/cind.rs` (`mod cind;`) -> the non-throwing `cind/7` family
-- `tests/` -> the 26-file, 236-test oracle-pinned integration suite (per-file counts in `## Test Strategy`)
+- `tests/` -> the 27-file, 240-test oracle-pinned integration suite (per-file counts in `## Test Strategy`)
 - `../beam_engine` | `../beam_process` | `../beam_ets` | `../beam_codec` | `../beam_term` | `../beam_loader` | `../beam_io` `CONTEXT.md` -> the `call_bif` seam, `ProcessId`/`PortId`/`PortTable`, the `Table`/match-spec engine, the ETF codec (`with_local_node`, `MinorVersion`), the frozen term API, the `Recs`-chunk `RecordDefinition` the `RecordSource` handoff resolves, the poller/port machinery the handoffs target (read-only)
 - `../../erts/emulator/beam/` (`bif.tab`, `bif.c`/`bif.h`, `erl_bif_*.c`, `erl_arith.c`/`big.c`, `erl_map.c`, `erl_db_*.c`/`erl_db_util.c`, `erl_iolist.c`/`binary.c`, `erl_record.c`/`erl_record.h`, `erl_bif_port.c`, `external.c`, `erl_term_hashing.c`, `erl_unicode.c`, `erl_time_sup.c`/`erl_bif_unique.c`, `erl_bits.h`) and `../../erts/emulator/sys/common/erl_float_short.cpp` -> authoritative names/arities/semantics (read-only)
 

@@ -15,22 +15,37 @@
 //! compared. A case therefore agrees only if the Rust runtime really exports and implements
 //! the `enif_*` slots the library binds.
 //!
-//! # Why only these three selectors are pinned
+//! # Why only these selectors are pinned
 //!
 //! The library is `dlopen(RTLD_NOW)`ed by **both** runtimes, so every `enif_*` it references
 //! must be a symbol the Rust runtime really defines; a missing one fails the *Rust* load
 //! while the oracle loads it — a **mismatch**, not a capability gap. Only the families that
-//! were verified to agree end to end under both runtimes are therefore pinned here. Verified
-//! divergences are reported in this module's doc comment rather than pinned (they are plain
-//! values, so they would be mismatches):
+//! were verified to agree end to end under both runtimes are therefore pinned here.
 //!
-//! * `enif_make_resource` + `enif_get_resource` round trip: the oracle returns `42`, the
-//!   Rust runtime raises `error:badarg` from `enif_get_resource`;
-//! * a resource's **destructor**: the oracle runs it synchronously on the final
-//!   `enif_release_resource` (`dtor_count` is `1`), the Rust runtime reports `0`;
-//! * `enif_is_process_alive` on the calling process: oracle `1`, Rust runtime `0`;
-//! * `enif_monitor_process` on the calling process followed by `enif_demonitor_process`:
-//!   both answer `0` (the monitor is not established), so the case would pin no behaviour.
+//! The resource **round trip** (`enif_make_resource` + `enif_get_resource`) and
+//! **self-liveness** (`enif_is_process_alive` on `enif_self`) were divergences and are now
+//! pinned cases: the oracle and the Rust runtime both answer `42` for the round trip and `1`
+//! for self-liveness (re-verified against the live oracle, OTP 29.1.1 / erts-17.1).
+//!
+//! Two verified divergences are reported here rather than pinned (both are plain values, so
+//! they would be mismatches):
+//!
+//! * a resource's **destructor** is **asynchronous** in the oracle: `erts` schedules it on a
+//!   misc aux-work thread (`nif_resource_dtor_prologue` → `erts_schedule_misc_aux_work`,
+//!   `erl_nif.c`), so a `dtor_count` read inside the same NIF call, right after the final
+//!   `enif_release_resource`, is still `0` there — while the Rust runtime runs the destructor
+//!   synchronously on the releasing thread and reports `1`. The count is not observable
+//!   within the NIF call on the oracle side, so no case pins it. (The related
+//!   `enif_monitor_process` follow-up is likewise unpinnable: both runtimes answer `0` because
+//!   the monitor is not established, so it would pin no behaviour.)
+//! * the **term keeps the object alive past the native release** in the oracle: for
+//!   `alloc → enif_make_resource → enif_release_resource → enif_get_resource` the oracle still
+//!   answers `42` (the documented C contract: "the call to `enif_release_resource` can occur
+//!   immediately after obtaining the term … the resource object is deallocated when the term
+//!   is garbage collected"), while the Rust runtime destroys the block when the native count
+//!   reaches zero and forgets the term binding, so `enif_get_resource` returns `0`.
+//!   `nif_res/resource_make_get_roundtrip` therefore reads the payload **before** releasing
+//!   the native reference, which is where the two runtimes agree.
 //!
 //! # Skip policy (inherited from [`super::nif_so`])
 //!
@@ -47,11 +62,13 @@ use crate::module_build::NifFixture;
 /// in the loading module, and the calls into the library must be **external** (the Rust
 /// runtime intercepts a NIF at external dispatch) — the same three rules `nif_so` pins.
 const NIF_RES_MODULE_SOURCE: &str = r#"-module(nif_res).
--export([classify/1, res_size/0, ioq_size/0, sync_roundtrip/0]).
+-export([classify/1, res_size/0, ioq_size/0, sync_roundtrip/0, res_roundtrip/0, self_alive/0]).
 
 res_size() -> erlang:nif_error(not_loaded).
 ioq_size() -> erlang:nif_error(not_loaded).
 sync_roundtrip() -> erlang:nif_error(not_loaded).
+res_roundtrip() -> erlang:nif_error(not_loaded).
+self_alive() -> erlang:nif_error(not_loaded).
 
 classify(N) ->
     Dir = filename:dirname(code:which(?MODULE)),
@@ -60,7 +77,9 @@ classify(N) ->
             case N of
                 1 -> nif_res:res_size();
                 2 -> nif_res:ioq_size();
-                3 -> nif_res:sync_roundtrip()
+                3 -> nif_res:sync_roundtrip();
+                4 -> nif_res:res_roundtrip();
+                5 -> nif_res:self_alive()
             end;
         {error, {Reason, _Text}} ->
             reason_code(Reason)
@@ -158,10 +177,46 @@ static ERL_NIF_TERM sync_roundtrip(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
     return enif_make_int(env, (thr ? 1 : 0) + 1);
 }
 
+/* The make/get round trip: allocate a resource, mint its term (enif_make_resource), resolve it
+   back through the same type (enif_get_resource) and read the payload field. Returns 42 when
+   the resolved pointer is the allocated one; -1 when enif_get_resource does not match.
+   The release happens *after* the payload is read, so neither runtime's release of the native
+   reference is observed by the value below. */
+static ERL_NIF_TERM res_roundtrip(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    res_t* r = (res_t*) enif_alloc_resource(res_type, sizeof(res_t));
+    res_t* got = NULL;
+    ERL_NIF_TERM term;
+    int value;
+    if (r == NULL)
+        return enif_make_badarg(env);
+    r->value = 42;
+    term = enif_make_resource(env, r);
+    if (!enif_get_resource(env, term, res_type, (void**) &got) || got == NULL) {
+        enif_release_resource(r);
+        return enif_make_int(env, -1);
+    }
+    value = got->value;
+    enif_release_resource(r);
+    return enif_make_int(env, value);
+}
+
+/* Self-liveness: the calling process is alive by definition, so enif_is_process_alive on the
+   pid from enif_self is 1. */
+static ERL_NIF_TERM self_alive(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    ErlNifPid pid;
+    if (!enif_self(env, &pid))
+        return enif_make_int(env, -1);
+    return enif_make_int(env, enif_is_process_alive(env, &pid) ? 1 : 0);
+}
+
 static ErlNifFunc nif_res_funcs[] = {
     {"res_size", 0, res_size, 0},
     {"ioq_size", 0, ioq_size, 0},
-    {"sync_roundtrip", 0, sync_roundtrip, 0}
+    {"sync_roundtrip", 0, sync_roundtrip, 0},
+    {"res_roundtrip", 0, res_roundtrip, 0},
+    {"self_alive", 0, self_alive, 0}
 };
 
 /* `ERL_NIF_INIT` seeds ErlNifEntry.name with the stringified module name (`nif_res`), so this
@@ -224,6 +279,19 @@ pub(crate) fn group() -> Vec<Case> {
             &[3],
             "2",
         ),
+        case(
+            "nif_res/resource_make_get_roundtrip",
+            "enif_make_resource's term resolves back through enif_get_resource to the allocated resource (payload 42)",
+            &[4],
+            // The payload field the round trip wrote before minting the term.
+            "42",
+        ),
+        case(
+            "nif_res/self_process_is_alive",
+            "enif_is_process_alive on the pid from enif_self is 1: the calling process is alive",
+            &[5],
+            "1",
+        ),
     ]
 }
 
@@ -275,7 +343,7 @@ mod tests {
             );
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
         }
-        assert_eq!(selectors.len(), 3, "the group covers three distinct families");
+        assert_eq!(selectors.len(), 5, "the group covers five distinct selectors");
     }
 
     #[test]

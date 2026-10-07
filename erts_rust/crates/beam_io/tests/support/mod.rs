@@ -213,12 +213,27 @@ pub fn compile_so(src: &Path, out: &Path, include: &Path) -> bool {
     }
 }
 
-/// A fresh scratch directory under [`std::env::temp_dir`] (`$TMPDIR`), unique per stem + process +
-/// call, so parallel test binaries do not collide.
+/// A **fresh** scratch directory under [`std::env::temp_dir`] (`$TMPDIR`), unique per stem +
+/// process + call, so parallel test binaries do not collide.
+///
+/// Freshness is part of the contract, not a nicety: a test compiles an object here and the C
+/// fixture *appends* its callback log (`fopen(..., "a")`), so a directory that still holds a
+/// previous run's file makes an assertion read stale lines. The name therefore mixes the process
+/// id, a per-binary call counter and the wall clock, and any directory already at the resulting
+/// path is removed first — guaranteeing an empty directory even in the (now vanishingly unlikely)
+/// case of a recycled process id landing on the same `(stem, counter)` slot.
 pub fn scratch_dir(stem: &str) -> PathBuf {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("beam_io-{stem}-{}-{n}", std::process::id()))
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let dir = std::env::temp_dir().join(format!(
+        "beam_io-{stem}-{}-{n}-{nanos}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
 }
 
 /// Print a loud skip banner (never a silent pass), test-name + reason.

@@ -3,8 +3,9 @@
 ## Intent
 Owns the **observable semantics of `ets:*`** — Erlang Term Storage — over **flat, table-owned term
 storage** (the A.1 "copy boundary"). Implements Part I §A.1 (term/key/value semantics) and §A.8
-(`ets:info/1` introspection) and the Stage-3 row of the plan (Part II §H): `set`, `ordered_set`,
-`bag`, `duplicate_bag` over hash-indexed and B+-tree interiors.
+(`ets:info/1` introspection) and the Stage-3 row of the plan (Part II §H): `set` over a **CHAMP**
+(compressed hash-array mapped prefix-tree) open-addressing index, `bag`/`duplicate_bag` over a
+**chained-bucket** hash index, and `ordered_set` over a **K-ary B+-tree**.
 
 The **interior data structures are NOT externally pinned** (crate-layer `../CONTEXT.md` §2): bucket
 layout, hash-map thresholds, tree fan-out and load factors are implementation choices. Only the
@@ -38,7 +39,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `pub enum Concurrency { None, Read, Write, ReadWrite }`; `as_atom_name()`,
   `from_atom_name(name) -> Option<Concurrency>` — **advisory** (parsed/reported, not enforced; see
   Known Issues).
-- `pub struct TableOptions` (builder; defaults: `Set`, keypos 1, `Protected`, unnamed, uncompressed,
+- `pub enum SetInterior { Chained, #[default] Champ }` (default **`Champ`**) — the crate-internal
+  selection of the `set` interior (`as_str() -> "chained"`/`"champ"`); `Table::with_set_interior`
+  installs it, `Table::set_interior` reports it. Not a `TableOptions` field (no BIF surface) and not
+  consulted by `bag`/`duplicate_bag`/`ordered_set`.- `pub struct TableOptions` (builder; defaults: `Set`, keypos 1, `Protected`, unnamed, uncompressed,
   no concurrency): `new()`, `set_kind`, `set_keypos(usize) -> Result<&mut Self>` (rejects 0),
   `set_access`, `set_named(bool)`, `set_name(Atom)`, `set_compressed(bool)`,
   `set_write_concurrency(bool)`, `set_read_concurrency(bool)`; getters `kind()/keypos()/access()/
@@ -83,6 +87,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 impl Table {
     pub fn new(id: TableId, opts: TableOptions) -> Result<Table>;
     pub fn with_allocator(id: TableId, opts: TableOptions, alloc: AllocRef) -> Result<Table>;
+    pub fn with_set_interior(id: TableId, opts: TableOptions, interior: SetInterior) -> Result<Table>; // opt-in `set` interior
+    pub fn set_interior(&self) -> SetInterior;   // the selected `set` interior (Champ by default)
 
     // metadata
     pub fn id(&self) -> TableId;
@@ -199,9 +205,34 @@ impl Table {
   internals `object_arity`, `read_counter`, `counter_operand`, `counter_operand_error`, `warp_fires`,
   `decode_counter_ops`, `decode_counter_tuple`, `build_list`, `CounterOp`.
 
-### `hash_interior.rs` — hash-indexed interior (`set`/`bag`/`duplicate_bag`)
+### `champ_interior.rs` — CHAMP open-addressing interior (**default `set`**)
+- `pub struct ChampInterior` + `Default`/`new()`: a **compressed hash-array mapped prefix-tree**
+  (CHAMP). Each level consumes `WIDTH = 5` bits of the 64-bit `term_hash` (`index_bit`) and every node
+  keeps its children **compressed** into two bitmaps — `datamap` (inline slots) and `nodemap`
+  (sub-nodes) — so `data`/`nodes` hold only the set bits in ascending bit order (`slot_index` finds a
+  slot by popcount). A key whose full hash collides with another's lives in a `CollisionNode`
+  (popcount-free, key-compared with `eq`), so a pathological hash can never recurse past 64 bits.
+  `Interior` impl: `insert` is an upsert (returns `Ok(true)` — `set` always retains), and
+  `insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`size`/`iter_objects`/
+  `keys`/`memory` are all overridden. `lookup`/`lookup_element` probe with `slot_index` only (no
+  bucket scan). `iter_objects`/`keys` walk depth-first (`collect_into`) — the `set` navigation order
+  is unspecified, so `first_key`/`last_key`/`next_key`/`prev_key` and the `ets:update_*` element ops
+  use the `Interior` trait defaults. `memory()` counts the root inline plus every node/vector
+  (`heap_words`).
+- **Canonicalization (delete).** A removal calls `canonicalize` bottom-up: a sub-node holding exactly
+  one entry (`single_entry`) is **inlined** into its parent as an inline slot (`bit_at` locates the
+  parent's bit), collapsing single-entry chains. Promoting a *multi-entry* sub-node wholesale is
+  provably wrong — a sub-node is indexed by the *next* 5 hash bits, so it must not be probed with the
+  parent's bits; only single-entry inlining preserves routing. `node_insert` needs no
+  canonicalization (an insert only adds entries).
+- Selection: [`SetInterior`] (`kind.rs`) — `Champ` (default) or `Chained`; `build_interior` routes
+  `TableKind::Set` accordingly. `bag`/`duplicate_bag` stay on `HashInterior`, `ordered_set` on the
+  B+-tree. Constructor: `Table::with_set_interior`; `Table::set_interior` reports the selection.
+
+### `hash_interior.rs` — chained hash-index interior (`bag`/`duplicate_bag`; opt-in `set`)
 - `pub struct HashInterior`: buckets `Vec<Vec<Entry>>` (`Entry { key, objs: Vec<Eterm> }`), lookup by
-  `term_hash(key) % buckets` then `eq`; doubles + rehashes past a load factor. `set` keeps ≤ 1 object
+  `term_hash(key) % buckets` then `eq`; doubles + rehashes past a load factor. Used by `bag`/
+  `duplicate_bag` and by `set` when [`SetInterior::Chained`] is selected. For `set` it keeps ≤ 1 object
   per key; `bag` rejects a duplicate *object* within a key via `eq` (its `Interior::insert` returns
   `false`, so the caller reclaims that rejected copy); `duplicate_bag` keeps a multiset.
   Public API for testing/reuse: `new(kind: TableKind)`, `take(key, atoms) -> Vec<Eterm>`,
@@ -292,7 +323,8 @@ impl Table {
   tuple-element accessor in `key.rs`, and the small term-reading blocks in `select/` and
   `table/mod.rs` (`select_all`). Every `unsafe fn` carries a `# Safety` section and every `unsafe`
   block a preceding `// SAFETY:` rationale (`beam_common::safety`); `unsafe_op_in_unsafe_fn` stays
-  clean. `kind`/`info`/`error`/`hash_interior`/`ordered_interior` and most of `table/` are safe Rust.
+  clean. `kind`/`info`/`error`/`champ_interior`/`hash_interior`/`ordered_interior` and most of `table/`
+  are safe Rust.
 - **Files ~1000 lines**, one responsibility per file.
 - **Licensing** Apache-2.0; no new external deps (only `beam_common`/`beam_term`/`beam_alloc`/`libc`).
 
@@ -304,6 +336,20 @@ impl Table {
   iteration via a leaf chain plus the separator invariant `keys[i] == max(child[i])`. Rebalancing is
   borrow-or-merge on underflow. All key comparisons go through `beam_term::compare::cmp` (so `1` and
   `1.0` are distinct keys). Recorded as a structural change for `../../CHANGE.md` (repo-root owned).
+- **`set` defaults to a CHAMP open-addressing interior; `bag`/`duplicate_bag` stay chained.** Adopted
+  on measurement, not faith: `src/interior_bench.rs` compares `HashInterior` (chained) against
+  `ChampInterior` per operation across 4 key shapes × 4 sizes (1e1/1e3/1e5/1e6), timing the *index*
+  only (the `TermStore` copy/match cost is common to both). CHAMP's `champ/old` ratios (CHAMP ÷
+  chained) across shapes/sizes: **insert 0.08–1.07×** (2–12× faster from 1e3 up), **iteration
+  0.20–1.48×** (2–5× faster from 1e3 up), **memory 0.14–0.75×** (2–7× fewer index bytes/entry —
+  e.g. smallint 1e6: 28 vs 194 B), **lookup-hit 0.20–1.50×** (parity once `eq` dominates on
+  binary/tuple keys), but **delete 0.69–2.77×** (consistently 1.6–2.8× *slower*: a removal walks down
+  and canonicalizes) and, on small-int keys, **lookup-miss up to ~2.1× slower** (proving a miss
+  descends a node chain vs one bucket probe). Net win is clear for the insert/iterate/memory profile
+  ETS is optimised for, so `SetInterior::default() == Champ`; the chained interior remains selectable
+  for `set` via `SetInterior::Chained` (`Table::with_set_interior`) and is still the index for
+  `bag`/`duplicate_bag`. The interior shape is unpinned (workspace §2), and the parity tests prove no
+  observable `ets:*` behaviour changes. (Recorded as a structural change for `../../CHANGE.md`.)
 - **Interiors are a private `Interior` trait, not a pinned layout.** The workspace §2 rule says the
   interior is open; the trait lets the shape change without touching `Table` or any dependent. It
   carries **generic defaults** (rebuild-on-heap) with **hash overrides** (in-place destructive
@@ -431,8 +477,23 @@ impl Table {
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
   split out to keep `store/mod.rs` small): kind/options, key validation, store copy/free/reuse and
   `relinquish` (check-out), `Table`-level insert/take store-word accounting, hash-interior ops
-  (incl. the `insert`-retained-bool), B+-tree invariants (incl. 10 000-key churn), select
-  compile/execute, info. 96 unit tests.
+  (incl. the `insert`-retained-bool), CHAMP ops (round-trip, `delete_object` non-match, 2000-key
+  churn, collision-node fallback, index-collision descend, canonicalization-by-inlining, `memory`
+  monotonicity), B+-tree invariants (incl. 10 000-key churn), select compile/execute, info.
+  **112 lib unit tests.**
+- **Cross-interior equivalence + the selection default** (`src/interior_parity.rs`, `#[cfg(test)]`):
+  `champ_is_the_documented_default_set_interior` pins `SetInterior::default() == Champ`; and the
+  chained/CHAMP interiors are driven through a shared LCG-generated operation script (insert /
+  `insert_new` / `lookup` / `member` / `lookup_element` / `update_counter` / `update_element` /
+  `delete` / `delete_object` / `take` / iteration) and must produce **identical** traces for `size`
+  (hence `ets:info(T,size)`), membership, element reads, and `select`/`match` iteration *content*
+  (order-insensitive, since `set` navigation order is unspecified), at `keypos` 1 and 2.
+- **Interior microbenchmark** (`src/interior_bench.rs`, `#[cfg(test)]`): chained vs CHAMP with
+  in-line `size`/hit/miss/iteration count assertions (so a wrong result can never be timed as a fast
+  one). Run with
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets --lib
+  interior_microbenchmark -- --nocapture`; sizes default to `10,1000,100000` and are overridden via
+  the `BEAM_ETS_BENCH_SIZES` (comma list) and `BEAM_ETS_BENCH_SHAPES` env vars.
 - Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`
   (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs` (incl.
@@ -522,26 +583,32 @@ impl Table {
   tests in `tests/ets_replace.rs`). Wherever the oracle accepts, the results agree.
 - **`ets:slot`-style iteration and `tab2file`/`file2tab` are not implemented** (out of scope for this
   pass); `tab2list` plus `first`/`next` cover enumeration.
-- **The `lib.rs` doc line and `Cargo.toml` description say "CHAMP interiors" — inaccurate.** The hash
-  interior is a **chained bucket array** (`src/hash_interior.rs`: `Vec<Vec<Entry>>`, 8 buckets doubling
-  past a 3/4 load factor), *not* a CHAMP/HAMT. The only hash-trie layout in the rewrite is
-  `beam_term::map`'s HAMT (for map *terms*, not ETS). The interior shape is unpinned (crate-layer §2),
-  so this is a doc-string error, not a contract violation — but the doc string must not be trusted.
+- **The two-hash-interior split is deliberate, and the `lib.rs`/`Cargo.toml` docs state it.** `set`
+  defaults to the CHAMP index (`src/champ_interior.rs`); `bag`/`duplicate_bag` use the chained index
+  (`src/hash_interior.rs`: `Vec<Vec<Entry>>`, 8 buckets doubling past a 3/4 load factor); the chained
+  index stays selectable for `set` (`SetInterior::Chained`). CHAMP is a measurement-driven choice, not
+  a like-for-like win: it loses 1.6–2.8× on `delete` and (on small-int keys) up to ~2.1× on lookup
+  *misses* — see the Design Decisions bullet and `src/interior_bench.rs` for the numbers. `beam_term::map`'s
+  HAMT is a separate layout (for map *terms*, not ETS). The interior shape is unpinned (crate-layer §2),
+  so no contract is affected.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `src/kind.rs` → `TableKind`, `Access`, `Concurrency`, `TableOptions`, `can_read`/`can_write`
+- `src/kind.rs` → `TableKind`, `SetInterior` (the `set`-interior selector), `Access`, `Concurrency`, `TableOptions`, `can_read`/`can_write`
 - `src/key.rs` → object/key validation (`key_of`, `is_valid_object`, `object_elements`)
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
-- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors, metadata/ownership accessors, write ops (insert/delete), access checks, `select_all`, module wiring
-- `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior`
+- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors (`new`/`with_allocator`/`with_set_interior`/`set_interior`), metadata/ownership accessors, write ops (insert/delete), access checks, `select_all`, module wiring
+- `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior(kind, set_interior)`
 - `src/table/read.rs` → the read/navigation `impl Table` (lookup/member/lookup_element*/first/last/next/prev/take/size/is_empty/tab2list/memory)
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
 - `src/table/ownership.rs` → `Heir`/`SetOpt` + the `ets:give_away/3` / `{heir, ...}` `setopts/2` semantics + the pid-gap docs
 - `src/table/element.rs` → the table-level `ets:update_counter/3,4` + `ets:update_element/3` operations
 - `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors and `element.rs`)
-- `src/hash_interior.rs` → `HashInterior` (bucket hash index) for `set`/`bag`/`duplicate_bag`
+- `src/champ_interior.rs` → `ChampInterior` (CHAMP open-addressing index) — the **default `set`** interior
+- `src/hash_interior.rs` → `HashInterior` (chained bucket index) for `bag`/`duplicate_bag` (and opt-in `set` via `SetInterior::Chained`)
+- `src/interior_parity.rs` → cross-interior equivalence tests + the default-selection test (`#[cfg(test)]`)
+- `src/interior_bench.rs` → the chained-vs-CHAMP interior microbenchmark (`#[cfg(test)]`)
 - `src/ordered_interior/mod.rs` → `OrderedSetInterior` (B+-tree) for `ordered_set` + its `Interior` impl
 - `src/ordered_interior/node.rs` → node layout, `ORDER`/`MIN_OCCUPANCY`, `NodeStore` arena
 - `src/ordered_interior/tree.rs` → B+-tree insert/lookup/delete + rebalance

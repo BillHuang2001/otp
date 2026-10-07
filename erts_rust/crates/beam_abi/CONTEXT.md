@@ -11,10 +11,10 @@ mismatch here is an ABI break.
 
 The crate freezes the *shape* of the boundary (the types, the layouts, the term transmute, the
 `ErlNifApi`/`ErlDrvApi` function tables) **and implements both host sides**:
-- the **NIF host layer** — the `enif_*` bodies under `src/nif/enif/` (one file per family, **175 of
-  the 176** LP64 slots populated), the `NifHost` seam (`nif::host`) and the `dlopen`-based NIF loader
+- the **NIF host layer** — the `enif_*` bodies under `src/nif/enif/` (one file per family, **all 176**
+  LP64 slots populated), the `NifHost` seam (`nif::host`) and the `dlopen`-based NIF loader
   (`nif::loader`);
-- the **driver host layer** — the `driver_*`/`erl_drv_*` bodies under `src/driver/drv/` (**104 of the
+- the **driver host layer** — the `driver_*`/`erl_drv_*` bodies under `src/driver/drv/` (**108 of the
   111** slots), the `DriverHost` seam (`driver::host`) and the `dlopen`-based driver loader
   (`driver::loader`, `dlsym "driver_init"` plus the oracle's `erlang:load_driver/2` validation order).
 - `src/sync/` holds the **shared pthread facade** both thread families are thin facades over.
@@ -92,7 +92,8 @@ deviation, see Design Decisions). Fields are `Option<unsafe extern "C" fn ...>` 
 constants, and `ERL_NIF_SELECT_*` / `ErlNifSelectFlags` selector bits.
 
 ### Per-family implementation status (MEASURED at this node's HEAD — `Some`/total slots)
-`ErlNifApi` — **175/176** populated. `ErlDrvApi` — **104/111** populated.
+`ErlNifApi` — **176/176** populated (the seven C-variadic slots only when `build.rs` compiled the
+`csrc/nif_variadic.c` shim — cfg `beam_abi_variadic_shim`). `ErlDrvApi` — **108/111** populated.
 
 **NIF families** (`src/nif/enif/*.rs`):
 | family file | slots it owns | `Some`/total |
@@ -111,11 +112,12 @@ constants, and `ERL_NIF_SELECT_*` / `ErlNifSelectFlags` selector bits.
 | `time` | time, env, system info, unique integers, timeslice, `dl*` | 11/11 |
 | `resources` | resource types + allocations | 11/11 |
 | `select` | `enif_select`/`enif_select_x` | 2/2 |
-| `envs` | `enif_free_env`/`enif_make_copy`/`enif_priv_data` | 3/4 (`enif_alloc_env` stays `None`) |
+| `envs` | `enif_alloc_env`/`enif_free_env`/`enif_make_copy`/`enif_priv_data` | 4/4 |
 | `variadic` | the seven C-variadic slots (cfg `beam_abi_variadic_shim`) | 7/7 |
 
-Sole `None`: **`enif_alloc_env`** (no host reachable from a void argument — see `envs.rs` and *Known
-gaps*).
+Every LP64 `enif_*` slot is populated; the seven C-variadic slots are `Some` only when `build.rs`
+compiled the `csrc/nif_variadic.c` shim (otherwise `None`, a loud `dlopen` failure, never a wrong
+result).
 
 **Driver families** (`src/driver/drv/*.rs`):
 | family file | slots it owns | `Some`/total |
@@ -126,9 +128,9 @@ gaps*).
 | `threads` | the `erl_drv_*` thread/synchronisation family (over `crate::sync`) | 33/33 |
 | `pdl` | port data lock + driver monitors + `driver_get_now` | 11/14 |
 | `lifecycle` | failures/exit/attributes/asynchronous init | 12/16 |
+| `registry` | the driver-registry slots (`add_driver_entry`/`remove_driver_entry`/`driver_lock_driver`/`driver_create_port`) | 4/4 |
 
-Seven `None` driver slots: the four lifecycle slots (`add_driver_entry`, `remove_driver_entry`,
-`driver_lock_driver`, `driver_create_port`) and the binary-refcount trio (`driver_binary_get_refc`,
+Three `None` driver slots remain: the binary-refcount trio (`driver_binary_get_refc`,
 `driver_binary_inc_refc`, `driver_binary_dec_refc`).
 
 ### Module layout
@@ -160,6 +162,13 @@ Not part of the C ABI; the *internal* boundary the `enif_*` bodies are written a
   `unsafe from_opaque(*mut ErlNifEnv) -> Option<&mut NifEnv>`, and the pending-exception slot
   (`pending_exception`/`set_exception`/`clear`, the C `enif_raise_exception`/`enif_clear_env`
   semantics). Re-exported at the crate root as `beam_abi::{NifEnv, NifHost}`.
+- **Current-NIF-host stack (host discovery for `enif_alloc_env`).** `NifEnv::new` — the single
+  construction point for every real call env — publishes the host it was given onto a crate-private
+  thread-local stack, and `NifEnv`'s `Drop` pops exactly its own entry (out-of-order drop restores
+  the enclosing host). The read side is `pub(crate) fn with_current_host<R>(f: impl FnOnce(&mut dyn
+  NifHost) -> R) -> Option<R>`; `enif_alloc_env` (which takes no argument) uses it. A thread-local is
+  the sound store because `NifEnv` is `!Clone`/`!Send` (it holds a raw host pointer) and is never
+  moved across threads.
 - `nif::enif` implements the `enif_*` host functions over this seam; `nif::loader` implements the
   dynamic NIF loader / `ErlNifEntry` load contract. See **"NIF host layer"** below.
 
@@ -173,7 +182,18 @@ Not part of the C ABI; the *internal* boundary the `driver_*`/`erl_drv_*` bodies
   `get_port_flags`, the failure/lifecycle hooks `failure`/`port_exit`/`busy_msgq_limits`/`init_ack`/
   `set_os_pid`/`async_port_key`, the monitor hooks `monitor_process`/`demonitor_process`/
   `get_monitored_process`, the PDL hooks `pdl_create`/`pdl_lock`/`pdl_unlock`/`pdl_get_refc`/
-  `pdl_inc_refc`/`pdl_dec_refc`, and `now`.
+  `pdl_inc_refc`/`pdl_dec_refc`, the driver-registry hooks `add_driver_entry`/`remove_driver_entry`/
+  `lock_driver`/`create_port`, and `now`. Each default is the C's own failure value (`-1`/`0`/the
+  invalid-port sentinel) and dereferences no operand.
+- **Current-driver-host publication (`driver::current_host`).** `add_driver_entry`/`remove_driver_entry`
+  carry no port operand, so they cannot recover a host through `DriverEnv::from_port`; they are only
+  meaningful inside a driver callback (C: "to be used by drivers"). The runtime (`beam_io`) publishes
+  the host for the duration of one driver callback via
+  `pub fn with_current_host<R>(host: &mut dyn DriverHost, f: impl FnOnce() -> R) -> R` — a scoped guard
+  that stores the host in a thread-local `Cell<Option<*mut dyn DriverHost>>` and **always restores the
+  previous host on exit** (nesting restores the outer host; a panic/unwind in `f` still restores). With
+  no host published the two entry-list slots answer gracefully (`-1`/`0`) without dereferencing their
+  operand.
 - `pub struct DriverEnv` — the concrete per-port environment behind the C-facing opaque
   `*mut ErlDrvPort_`: `new(&mut dyn DriverHost)`, `host()`, `heap()`, `as_port()`,
   `unsafe from_port(*mut ErlDrvPort_) -> Option<&mut DriverEnv>`. **The `ErlDrvPort` a runtime passes
@@ -430,8 +450,10 @@ writers over the host's `beam_alloc::Heap`, atoms through `NifHost::intern_atom`
 - **`select`** — `enif_select`/`enif_select_x` reproduce the C's argument handling and return codes
   and hand the request to `NifHost::select` (the poller is `beam_io`'s); a request no host can
   service answers `-1`.
-- **`envs`** — `enif_free_env` (hands the env back to `NifHost::free_env`), `enif_make_copy`
-  (`NifHost::make_copy`; `THE_NON_VALUE` when unsupported), `enif_priv_data` (`NifHost::priv_data`).
+- **`envs`** — `enif_alloc_env` (reads the thread-local current-NIF-host and returns
+  `NifHost::alloc_env()`, else `NULL`), `enif_free_env` (hands the env back to `NifHost::free_env`),
+  `enif_make_copy` (`NifHost::make_copy`; `THE_NON_VALUE` when unsupported), `enif_priv_data`
+  (`NifHost::priv_data`).
 - **`variadic`** — the seven C-variadic slots via the C shim (see *The C-variadic shim*).
 
 `pub fn enif_api_table() -> &'static ErlNifApi` returns the `#[used] static ENIF_API` built with the
@@ -491,6 +513,10 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
   `driver_exit` collapsing onto `DriverHost::failure`/`port_exit`), the attributes (`set_busy_port`/
   `set_port_control_flags`/`get_port_flags`, round-tripping through the seam), `erl_drv_busy_msgq_limits`,
   `erl_drv_init_ack`, `erl_drv_set_os_pid`, `driver_async_port_key`.
+- **`registry`** — the driver-registry slots: `add_driver_entry`/`remove_driver_entry` (port-free;
+  forward to whatever host `with_current_host` published, else `-1`/`0`), `driver_lock_driver` and
+  `driver_create_port` (recover the host through the shared `env_for` port helper). Ground truth
+  `io.c:7640`/`7698`/`7324`/`786`.
 
 ### Dynamic loader (`src/driver/loader.rs`)
 `load(path, name) -> Result<DriverLibrary, DriverLoadError>` does `dlopen(path+".so", RTLD_NOW |
@@ -534,18 +560,32 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
   reload policy is consulted (only the *entry* validation).
 
 ## Known gaps (honest, never a wrong result)
-- **`enif_alloc_env` stays `None`.** It takes no argument, so there is no handle to reach a `NifHost`
-  through; a crate-owned env would be unable to intern atoms into the runtime's atom table and would
-  hand back a *wrong term*. A NIF that calls it fails loudly at `dlopen(RTLD_NOW)`.
+- **`enif_alloc_env` answers `NULL` when the host does not implement `alloc_env`** (the trait's
+  default), or when no `NifEnv` is live. `beam_rt`'s `NifHostImpl` does not implement the hook today,
+  so in the real runtime `enif_alloc_env()` returns `NULL` — honest, never a wrong term; the seam is
+  in place for a `beam_rt` owner to fill in. A crate-owned env is not an option (its atoms would be
+  unusable ⇒ a *wrong term*).
 - **No scheduler threads.** `enif_thread_type` can only report `ERL_NIF_THR_UNDEFINED` (a foreign
   thread) or `ERL_NIF_THR_OTHER` (a thread created through `sync::thread_create`) — never a
   scheduler/dirty-scheduler type. An **unnamed** handle's `*_name` accessor returns `NULL` where the
   C returns the static string `"unknown"`.
 - **`sync::tsd_*` passes the key straight to pthreads unchecked** (no `used_tsd_keys[]` validation);
   an invalid/destroyed key makes `set`/`get` a safe no-op (`NULL`) where the C aborts.
-- **Four driver lifecycle slots need a process-global driver table / port registry / driver-handle
-  seam** and stay `None`: `add_driver_entry`, `remove_driver_entry`, `driver_lock_driver`,
-  `driver_create_port`.
+- **The four driver-registry slots are wired but not yet reachable from the running runtime.** They are
+  populated in the frozen table (a driver `.so` that binds them now `dlopen`s on the Rust side) and the
+  `beam_io` host implements the hooks, but a `DriverHost` only ever sees them if the runtime (a) publishes
+  itself with [`with_current_host`] for the two port-free slots and (b) passes a `DriverEnv::as_port()`
+  handle **and** overrides the hooks for the two port-carrying ones. `beam_rt`'s driver host does neither
+  today — it implements `DriverHost` for its own `DriverEnv`-backed host but leaves the four hooks at
+  their trait defaults, and `beam_io`'s A.4 host layer is not on its `.so` driver path. A real driver
+  callback calling them therefore observes the C's own failure defaults: measured under `beam_rt run`,
+  `driver_lock_driver` answers `-1` and `remove_driver_entry` `0` where the oracle answers `0`/`1`.
+  Making them agree is a `beam_rt` change (its hooks + a `with_current_host` wrapper).
+- **`driver_create_port` is implementable but not yet plumbed.** The hook needs a live
+  `PortRegistry`+`Poller`+driver-table reachable from a per-port `DriverHost`, which no host supplies
+  today; until `beam_io` hands those to its host the hook returns the invalid-port sentinel. Likewise
+  `lock_driver` must reflect the port's **own** loaded driver `handle` (C `io.c:7337`), not a
+  global-table lookup by name.
 - **The binary-refcount trio stays `None`** (`driver_binary_get_refc`/`inc_refc`/`dec_refc`): the
   frozen `ErlDrvBinary` is exactly `{ orig_size, orig_bytes }` with **no refcount word**, so there is
   nothing to report or adjust.
@@ -575,13 +615,14 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
 - `src/nif/term.rs` → `ERL_NIF_TERM`/`ERL_NIF_UINT`, `Eterm ↔ ERL_NIF_TERM` transmute seam
 - `src/nif/types.rs` → NIF `#[repr(C)]` structs/enums/flags/fn-type aliases (from `erl_nif.h`), incl. the opaque `ErlNifEnv`
 - `src/nif/api.rs` → `ErlNifApi` (176-entry `enif_*` function table + `ERL_NIF_API_FIELD_COUNT`; generated, header-ordered)
-- `src/nif/host.rs` → the host seam: `NifHost` (heap/atoms + the defaulted service hooks) + `NifEnv` (per-call env behind `*mut ErlNifEnv`, exception slot, `as_ptr`/`from_opaque`)
+- `src/nif/host.rs` → the host seam: `NifHost` (heap/atoms + the defaulted service hooks) + `NifEnv` (per-call env behind `*mut ErlNifEnv`, exception slot, `as_ptr`/`from_opaque`; `new` publishes the host on the thread-local current-host stack, `Drop` pops it) + the `pub(crate)` `with_current_host` reader behind `enif_alloc_env`
 - `src/nif/enif/` → **one file per `enif_*` family** (`mem`, `get`, `make`, `map`, `pred`, `proc`, `process`, `exception`, `threads`, `ioq`, `mapiter`, `time`, `resources`, `select`, `envs`, `variadic`), each owning its `pub(super) const fn populate`; `mod.rs` holds the shared helpers, the submodule wiring and the `ENIF_API` chain; `tests.rs`/`process_tests.rs`/`mapiter_tests.rs` are test-only children
 - `src/nif/loader.rs` → the dynamic NIF loader: `NifLibrary`, `NifLoadError`/`NifCallError`, `load()` (dlopen/dlsym + oracle-order validation), `NifLibrary::call`, `Drop` (unload + dlclose)
-- `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`)
+- `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`) + `ERTS_INVALID_ERL_DRV_PORT` (the invalid-port sentinel, pointer `-1`)
 - `src/driver/api.rs` → `ErlDrvApi` (111-entry `driver_*`/`erl_drv_*` function table) + `ErlDrvApi::empty()`
-- `src/driver/host.rs` → the driver host seam: `DriverHost` (heap/atoms/output/send_term + the defaulted service hooks) + `DriverEnv` (per-port env behind `*mut ErlDrvPort_`, `as_port`/`from_port`) + `decode_term_spec` (the reverse-Polish term-data decoder)
-- `src/driver/drv/` → **one file per driver family** (`mem`, `port`, `queues`, `threads`, `pdl`, `lifecycle`), each owning its `pub(super) const fn populate`; `mod.rs` holds the module docs, the shared `env_for` helper, the `#[used] static DRIVER_API` table + `driver_api_table()`, the `driver_term_nil` data symbol and `binary_payload`; `port_tests.rs` is the path-included child of `port`
+- `src/driver/host.rs` → the driver host seam: `DriverHost` (heap/atoms/output/send_term + the defaulted service hooks, incl. the driver-registry hooks `add_driver_entry`/`remove_driver_entry`/`lock_driver`/`create_port`) + `DriverEnv` (per-port env behind `*mut ErlDrvPort_`, `as_port`/`from_port`) + `decode_term_spec` (the reverse-Polish term-data decoder) + the `with_current_host` re-export
+- `src/driver/current_host.rs` → the thread-local **current-driver-host** publication: `with_current_host(host, f)` (scoped, restores the previous host on exit, nesting-safe) plus the `pub(crate)` reader the two port-free entry-list slots use
+- `src/driver/drv/` → **one file per driver family** (`mem`, `port`, `queues`, `threads`, `pdl`, `lifecycle`, `registry`), each owning its `pub(super) const fn populate`; `mod.rs` holds the module docs, the shared `env_for` helper, the `#[used] static DRIVER_API` table + `driver_api_table()`, the `driver_term_nil` data symbol and `binary_payload`; `port_tests.rs` is the path-included child of `port`
 - `src/driver/loader.rs` → the dynamic driver loader: `DriverLibrary`, `DriverLoadError`/`DriverCallError`, `load()` (dlopen/dlsym `driver_init` + oracle-order `ErlDrvEntry` validation), the per-callback wrappers, `Drop` (finish + dlclose)
 - `src/layout.rs` → the compile-time layout freeze (all `const _: () = assert!(...)` for the table above)
 - `tests/common/mod.rs` → shared test helpers (NOT a test target: a subdirectory module pulled in with `mod common;`): `erl_include_dir`, `cc_available`, `compile_so`, `skip`, `TestHost`, `TestDriverHost`
@@ -624,4 +665,4 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
 - `../../../ERTS_RUST_REWRITE_EVALUATION.md` §A.3/A.4; `../../../ERTS_RUST_REWRITE_DEEPDIVE.md` §C (the frozen-header seam).
 - `../beam_term/` → the internal `Eterm` this crate transmutes to/from (`nif::term`).
 - `../beam_alloc/` → the production bump `Heap` the host seam hands out (`NifHost::heap`).
-- `../beam_rt/`, `../beam_bifs/`, `../beam_io/` → the runtime owners of the `NifHost`/`DriverHost` seams and the implementors of the remaining `ErlNifApi`/`ErlDrvApi` slots (the four driver lifecycle slots, the binary-refcount trio, and the drivers behind the poller).
+- `../beam_rt/`, `../beam_bifs/`, `../beam_io/` → the runtime owners of the `NifHost`/`DriverHost` seams and the implementors of the remaining `ErlDrvApi` slots (the binary-refcount trio and the drivers behind the poller). `beam_io` implements the four driver-registry hooks over its driver table / port registry and wraps each driver callback **it** routes in `beam_abi::with_current_host`. `beam_rt` implements `DriverHost` for its own per-port `DriverEnv`-backed host (so the A.4 host layer of `beam_io` is *not* on the runtime's `.so` driver path), but it neither overrides the four registry hooks nor publishes a current host, and does not override `NifHost::alloc_env` — so both families answer the C's failure defaults in the running runtime (see *Known gaps*).

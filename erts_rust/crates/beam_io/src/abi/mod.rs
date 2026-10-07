@@ -26,28 +26,29 @@
 //!   the port context around each call, and forwards the driver's own `driver_*` calls back into
 //!   [`AbiHost`].
 //! * [`table`] — [`DriverTable`], the **process-global** driver registry (the C's `driver_list`)
-//!   plus its port-creation service: the `beam_io` half of `add_driver_entry` /
-//!   `remove_driver_entry` / `driver_lock_driver` / `driver_create_port`. Those four `beam_abi`
-//!   `ErlDrvApi` slots are `None` today; wiring them needs four new *defaulted*
-//!   [`DriverHost`](beam_abi::driver::host::DriverHost) methods forwarding to this table (a
-//!   per-port host reaches the process-global table, exactly as a driver callback reaches the
-//!   global list in the C):
+//!   plus its port-creation service. It is where the [`AbiHost`] forwards the four `beam_abi`
+//!   `ErlDrvApi` slots that act on structure outside one port — `add_driver_entry`,
+//!   `remove_driver_entry`, `driver_lock_driver` and `driver_create_port`:
 //!
-//!   ```text
-//!   fn add_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int;            // -> table.add_entry(de)
-//!   fn remove_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int;         // -> table.remove_entry(de)
-//!   fn lock_driver(&mut self) -> c_int;                                       // -> table.lock(<this port's driver name>)
-//!   fn create_port(&mut self, creator: ErlDrvPort, connected: ErlDrvTermData,
-//!                  name: *mut c_char, drv_data: ErlDrvData) -> ErlDrvPort;   // -> table.create_port(...)
-//!   ```
+//!   * `add_driver_entry`/`remove_driver_entry` delegate to [`DriverTable::global`]'s
+//!     `add_entry`/`remove_entry`. Because those two slots carry **no** port operand, they reach
+//!     their host through the thread-local publication `beam_abi::with_current_host`, which
+//!     [`DriverPort`] installs around every callback it runs (see [`port`]'s module docs). An
+//!     `add_driver_entry` whose `init` refuses the entry answers a positive non-zero code (the C's
+//!     `void` wrapper discards it); `remove_driver_entry` forwards the table's own `1`/`0`/`-1`.
+//!   * `driver_lock_driver` consults the **port's own** driver, not a name lookup (the C's
+//!     `prt->drv_ptr->handle`). [`AbiHost`] therefore records the port's registered driver identity
+//!     (`AbiHost::for_driver`/`with_driver`, set by [`DriverPort::from_library`]), so a dynamically
+//!     loaded port answers `0` and a bare host answers the C's statically-linked `-1`.
+//!   * `driver_create_port` answers the invalid-port sentinel
+//!     ([`beam_abi::driver::types::ERTS_INVALID_ERL_DRV_PORT`]), the C's single failure answer: a
+//!     driver callback here already holds a `&mut` into the port registry (re-entering
+//!     [`PortRegistry`](crate::PortRegistry)'s `open` would alias it, and could even invalidate the
+//!     live `&mut Port`), and the new port would additionally need a `Box<dyn PortHost>` only
+//!     `beam_rt` can supply. See the method docs on [`AbiHost`] for the full rationale.
 //!
-//!   `table` (a `&DriverTable`, defaulting to [`DriverTable::global`]) would become a **fifth**
-//!   optional hook alongside [`PortHost`]: `driver_create_port` additionally needs the runtime's
-//!   [`PortRegistry`](crate::PortRegistry)/[`Poller`](crate::Poller) and a `Box<dyn PortHost>` for
-//!   the new port, which is why the hook belongs on [`PortHost`] (the runtime-services seam) rather
-//!   than on the per-port `DriverHost`. `AbiHost` knows neither its own driver's name nor the
-//!   registry, so a `driver_lock_driver`/`driver_create_port` forwarding also needs the port's
-//!   registered driver name handed to [`AbiHost`] at construction.
+//!   So the runtime owns the driver list and the port table (as the C's emulator does), [`AbiHost`]
+//!   is the per-port bridge to them, and no slot fabricates a success it cannot honour.
 //!
 //! # The `ErlDrvPort` a driver sees
 //!

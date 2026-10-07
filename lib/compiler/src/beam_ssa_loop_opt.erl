@@ -44,6 +44,51 @@
 %%%    loop header that lies outside the loop. Execution is therefore moved
 %%%    from "once per iteration" to "once per loop entry".
 %%%
+%%% 3. Induction-variable canonicalization. A loop-carried variable of the
+%%%    loop header (a phi with at least one incoming value from outside the
+%%%    loop and at least one from inside it) whose values on the inside
+%%%    edges are all `V + C', `C + V' or `V - C' with the same integer
+%%%    literal C -- or `V' itself, i.e. step zero -- and whose values on the
+%%%    outside edges are all integers, is described by the canonical pair
+%%%    {Init, Step}. From that description the pass *proves*, by induction
+%%%    over the iterations, that the variable is an integer, and -- when the
+%%%    entry value is non-negative and the step is non-negative -- that it
+%%%    is non-negative as well. The same two facts are propagated through
+%%%    the integer-valued operations inside the loop, so a value computed
+%%%    from an induction variable is described too.
+%%%
+%%%    The induction variable is not otherwise rewritten: nothing is gained
+%%%    by writing `V + (-1)' for `V - 1', and re-associating or hoisting the
+%%%    recurrence would change when it is evaluated. The canonical
+%%%    description exists to licence the rewrites of item 4.
+%%%
+%%%    The one canonicalisation that *is* an IR rewrite is the operand order
+%%%    of a commutative arithmetic instruction: `C + V' and `C * V' (a
+%%%    literal on the left, a variable on the right) become `V + C' and
+%%%    `V * C', so that every recurrence has a single syntactic shape. `+'
+%%%    and `*' are commutative for every number and fail on the same
+%%%    non-number operands, so neither a value nor an exception changes.
+%%%
+%%% 4. Strength reduction. An arithmetic instruction is rewritten *in place*
+%%%    (same block, same destination) into a cheaper operation, and only
+%%%    when the rewrite is exact for every value its operands can have:
+%%%
+%%%    * `X * 2^n' (n >= 1, `2^n' a literal) becomes `X bsl n' when X is
+%%%      provably an integer. For integers -- including negative ones and
+%%%      bignums -- `bsl' is exactly multiplication by a power of two.
+%%%    * `X * 2' becomes `X + X' otherwise, which is exact for every
+%%%      number: Erlang doubles a float without rounding, so `X + X' and
+%%%      `X * 2' are the same for floats as well as for integers.
+%%%    * `X div 2^n' (n >= 1) becomes `X bsr n' when X is provably a
+%%%      NON-NEGATIVE integer. `div' truncates toward zero while `bsr'
+%%%      floors, and the two agree exactly for a non-negative dividend; for
+%%%      a dividend that may be negative the rewrite is skipped.
+%%%
+%%%    Everything else is left alone, in particular a multiplication or a
+%%%    division by a literal that is not a power of two, `X div 0' (which
+%%%    must keep raising) and every operation with an operand whose
+%%%    integrality/non-negativity cannot be proved.
+%%%
 %%% CORRECTNESS RULES (conservative by design -- when in doubt, do nothing)
 %%%
 %%% * Only `#b_set{}' value instructions are considered; phis, terminators,
@@ -66,7 +111,18 @@
 %%%   the loop removes it from the hot path without changing any result.
 %%% * Consequently arithmetic is NOT hoisted here: without type information
 %%%   (this pass runs before the SSA type pass) an operation such as `+'
-%%%   cannot be proven non-raising. This is a deliberate, documented limit.
+%%%   cannot be proven non-raising, and moving it would execute it on paths
+%%%   where it was not executed before. Arithmetic is instead
+%%%   *strength-reduced in place* (item 4 above), which never moves an
+%%%   instruction to a path that did not have the original.
+%%% * The strength reducer only ever replaces an operation by one that
+%%%   either succeeds and computes the same value, or fails on exactly the
+%%%   same operands. Since every rewrite requires a proof that the operands
+%%%   are integers (or, for `div' -> `bsr', non-negative integers), the
+%%%   operand set on which the new instruction fails is empty, and no new
+%%%   exception can appear. In particular the divisor is a literal power of
+%%%   two, so no division by zero is ever created and an existing one is
+%%%   never removed.
 %%% * A preheader must exist or be creatable: the loop header must have
 %%%   exactly one predecessor outside the loop. When that predecessor has
 %%%   other successors as well, a fresh preheader block is inserted on the
@@ -78,14 +134,41 @@
 %%%
 %%% NOT IMPLEMENTED (see the report / CONTEXT.md)
 %%%
+%%% REACH LIMITATION (measured): at this pipeline point the CFG of ordinary
+%%% Erlang code contains no optimizable loop -- a self-recursive function is
+%%% still a tail `call' (no back edge) and a `receive' loop's header carries
+%%% no phis. The pass therefore rewrites nothing on real modules: compiling
+%%% `lib/stdlib/src' with and without `+loop_opt' yields byte-identical
+%%% generated code, only the `compile_info' chunk records the option. The
+%%% loop/IV/strength-reduction transforms above are consequently validated on
+%%% hand-built SSA driven directly through `beam_ssa_loop_opt:opt/1'.
+%%%
 %%% * Unrolling. A sound unroller needs an exact trip count. The pass runs in
 %%%   the prologue phase, i.e. before the SSA type analysis, so neither
 %%%   `#t_integer{elements=...}' nor `beam_bounds' information is available;
 %%%   a trip count could only be derived from a syntactic comparison against
 %%%   literals, which is not enough to make unrolling worthwhile (or safe) in
 %%%   the common case. Unrolling is therefore deferred rather than guessed.
+%%% * Accumulator-based strength reduction of a product by a constant that is
+%%%   not a power of two (`X * 3' turned into a second loop-carried variable
+%%%   incremented by the step times 3). It replaces one multiplication by one
+%%%   addition, at the price of a new phi, a new entry computation in the
+%%%   preheader and a rewritten use set -- and the extra work is only repaid
+%%%   when the number of iterations is large, which is not knowable here.
+%%%   A product or quotient by a non-power-of-two constant is therefore left
+%%%   alone, as are `rem' by a power of two (there is no cheap exact form for
+%%%   a negative dividend), `X * 2^n' with an X that may be a float, and a
+%%%   shift by a negative literal.
+%%% * Nothing is ever *moved* by the strength reducer; every rewrite keeps
+%%%   the instruction in its block and its predecessor set, so no evaluation
+%%%   is added on a path that did not have the original operation.
+%%% * Only a hit of the split `div' -> `bsr' rule needs the dividend to be
+%%%   non-negative; the non-negativity proof is the induction-variable one
+%%%   (non-negative entry value and non-negative step) or a value built from
+%%%   non-negative values by `+', `*', `div', `rem', `band', `bor', `bxor',
+%%%   `bsl' or `bsr'. Nothing else is accepted.
 
--export([opt/1]).
+-export([opt/1, eligible/1]).
 
 -include("beam_ssa.hrl").
 -import_record(beam_ssa_opt, [opt_st]).
@@ -141,6 +224,20 @@
                     {is_pid,1}, {is_port,1}, {is_reference,1},
                     {is_tuple,1}]).
 
+%% Arithmetic BIFs whose result is an integer whenever all their operands are
+%% integers. Some of them can raise (`div'/`rem' on a zero divisor, `bsl'/
+%% `bsr' on a negative shift count or a non-integer operand), which is
+%% irrelevant: what is claimed below is only "if this instruction produces a
+%% value, that value is an integer", and the operand facts are themselves
+%% only claimed for values that were produced. `+'/`-'/'*' also accept
+%% floats, but their operands are integers whenever the rule is applied.
+-define(INT_BIFS, ['+','-','*','div','rem','band','bor','bxor','bsl','bsr']).
+
+%% The subset of ?INT_BIFS that also preserves non-negativity: the result is
+%% >= 0 whenever every operand is >= 0. Subtraction is deliberately absent (it
+%% can go negative); so are all float-producing operations.
+-define(NAT_BIFS, ['+','*','div','rem','band','bor','bxor','bsl','bsr']).
+
 -spec opt({#opt_st{}, term()}) -> {#opt_st{}, term()}.
 opt({#opt_st{ssa=Linear0}=St, FuncDb}) when is_list(Linear0) ->
     %% Any unexpected condition skips the optimization; it must never turn a
@@ -154,6 +251,54 @@ opt({#opt_st{ssa=Linear0}=St, FuncDb}) when is_list(Linear0) ->
     {St#opt_st{ssa=Linear}, FuncDb};
 opt({St, FuncDb}) ->
     {St, FuncDb}.
+
+%% Eligibility precondition used by the opt-in per-pass budget/watchdog
+%% driver (`beam_ssa_opt_budget', wired in `beam_ssa_opt:gate/1'): true when
+%% the function's CFG contains a cycle, i.e. when there can be a loop to
+%% optimize.
+%%
+%% This is only a NECESSARY condition, a cheap filter that lets the driver
+%% skip the pass for the majority of functions; whether a specific loop can
+%% be optimized remains the business of the pass itself.
+%%
+%% The state is a linear (reverse postorder) block list at this point in the
+%% pipeline. In reverse postorder every edge of acyclic control flow goes
+%% from an earlier to a later block, while every cycle produces at least one
+%% edge whose target is not after its source. Testing "some successor is not
+%% later than the block itself" is therefore a sound over-approximation of
+%% "this function has a loop", and it costs O(V+E) with no dominator
+%% computation.
+-spec eligible({#opt_st{}, term()}) -> boolean().
+eligible({#opt_st{ssa=Linear}, _FuncDb}) when is_list(Linear) ->
+    has_back_edge(Linear);
+eligible(_) ->
+    %% The SSA is in block-map form, where opt/1 is a no-op.
+    false.
+
+has_back_edge(Linear) ->
+    Index = index_blocks(Linear, #{}, 0),
+    scan_edges(Linear, Index).
+
+index_blocks([{L,_}|Blocks], Map, I) ->
+    index_blocks(Blocks, Map#{L => I}, I + 1);
+index_blocks([], Map, _I) ->
+    Map.
+
+scan_edges([{L,#b_blk{last=Last}}|Blocks], Index) ->
+    case has_back_succ(succs_last(Last), map_get(L, Index), Index) of
+        true -> true;
+        false -> scan_edges(Blocks, Index)
+    end;
+scan_edges([], _Index) ->
+    false.
+
+has_back_succ([S|Ss], I, Index) ->
+    case Index of
+        #{S := SI} when SI =< I -> true;
+        _ -> has_back_succ(Ss, I, Index)
+    end;
+has_back_succ([], _I, _Index) ->
+    false.
 
 %%% ------------------------------------------------------------------
 %%% Driver
@@ -301,7 +446,8 @@ opt_loop({H, Body}, Order0, Blocks0, NextLabel) ->
         [Pre] when Pre =/= H, is_map_key(Pre, Blocks0) ->
             {Blocks1, Pre1, Next1} = ensure_preheader(Pre, H, Blocks0, NextLabel),
             Blocks2 = licm(H, Body, Order0, Pre1, Blocks1),
-            {Blocks2, Next1};
+            Blocks3 = strength_reduce(H, Body, Blocks2),
+            {Blocks3, Next1};
         _ ->
             {Blocks0, NextLabel}
     end.
@@ -420,3 +566,337 @@ invariant_arg(#b_var{}=V, Inv) ->
     not ordsets:is_element(V, Inv);
 invariant_arg(_, _) ->
     false.
+
+%%% ------------------------------------------------------------------
+%%% Induction-variable canonicalization and strength reduction
+%%% ------------------------------------------------------------------
+%%%
+%%% The pass derives two facts over the SSA of a function. Both are stated
+%%% for a *value* (a variable or a literal) and are only ever claimed for a
+%%% value that the instruction actually produces:
+%%%
+%%%   integer(V)     -- whenever the use of V is reached, V is an integer
+%%%   non_negative(V)-- whenever the use of V is reached, V is an integer >= 0
+%%%
+%%% non_negative(V) implies integer(V). The facts are computed by a monotone
+%%% fixed point that starts from "unknown" everywhere (so it is sound: a fact
+%%% is only derived when every rule that derives it has been established) and
+%%% that treats each recognised induction variable as its own case.
+%%%
+%%% The only rules are:
+%%%
+%%%   * an integer literal (non-negative for the stronger fact);
+%%%   * a canonical induction variable (see canonical_ivs/5): the entry value
+%%%     and every step are integers, so the variable is an integer on every
+%%%     iteration; if additionally the entry value is non-negative and every
+%%%     step is non-negative, it is non-negative on every iteration. This is
+%%%     an induction over the iterations, not a fixed-point claim: the loop
+%%%     hypothesis is the fact for the variable itself, the base case is the
+%%%     entry value and the step argument is that a non-negative integer
+%%%     plus a non-negative integer step stays non-negative;
+%%%   * a phi whose incoming values are all integers (respectively all
+%%%     non-negative integers) -- a join of a case or an if;
+%%%   * `{bif,Op}' with Op in ?INT_BIFS (?NAT_BIFS) and all operands
+%%%     integers (non-negative integers).
+%%%
+%%% Nothing else is accepted, and a variable defined outside the loop by an
+%%% instruction this analysis cannot classify is simply "unknown" -- which
+%%% only loses the rewrite.
+%%%
+%%% TRAP: a function argument, a message lifted out of the mailbox or any
+%%% other value with no definition in the function is unknown, even though it
+%%% is very often an integer at run time. The pass runs before the SSA type
+%%% analysis, so nothing here can prove it; guessing would turn `X * 8' into
+%%% `X bsl 3' and break the float and non-number cases.
+
+strength_reduce(H, Body, Blocks0) ->
+    BodySet = ordsets:from_list(Body),
+    Defs = defs_map(Blocks0),
+    %% The induction variables are recognised using only the facts that hold
+    %% without them (an integer literal entry value, or a variable proven
+    %% integer on its own); the facts their canonical description yields are
+    %% then fed into the second fixed point, which the rewrites use.
+    Kinds0 = value_kinds(Defs, #{}),
+    Ivs = canonical_ivs(H, BodySet, Defs, Kinds0, Blocks0),
+    Kinds = value_kinds(Defs, Ivs),
+    lists:foldl(fun(L, B) ->
+                        reduce_block(L, Kinds, B)
+                end, Blocks0, Body).
+
+%% The definition of every variable of the function, used to classify the
+%% operands of the instructions inside the loop.
+defs_map(Blocks) ->
+    maps:fold(
+      fun(_L, #b_blk{is=Is}, Acc) ->
+              lists:foldl(fun(#b_set{dst=#b_var{}=V}=I, A) -> A#{V => I};
+                             (_I, A) -> A
+                          end, Acc, Is)
+      end, #{}, Blocks).
+
+%% value_kinds(Defs, Ivs) -> #{Var => 'nat' | 'int' | 'unknown'}.
+%%  Least fixed point of the value facts. Keys are the variables of the
+%%  function; a variable is mapped to `unknown' when neither fact could be
+%%  established.
+value_kinds(Defs, Ivs) ->
+    Vars = maps:keys(Defs),
+    Initial = maps:from_list([{V, unknown} || V <- Vars]),
+    kinds_fix(Vars, Defs, Ivs, Initial).
+
+kinds_fix(Vars, Defs, Ivs, Kinds0) ->
+    Kinds1 = lists:foldl(fun(V, K) ->
+                                 K#{V => def_kind(V, Defs, Ivs, K)}
+                         end, Kinds0, Vars),
+    case Kinds1 =:= Kinds0 of
+        true -> Kinds1;
+        false -> kinds_fix(Vars, Defs, Ivs, Kinds1)
+    end.
+
+def_kind(V, Defs, Ivs, Kinds) ->
+    case Ivs of
+        #{V := {Init, Step}} ->
+            iv_kind(Init, Step, Kinds);
+        #{} ->
+            case Defs of
+                #{V := Def} -> def_kind_1(Def, Kinds);
+                #{} -> unknown
+            end
+    end.
+
+def_kind_1(#b_set{op=phi, args=Args}, Kinds) ->
+    join_kinds([value_kind(V, Kinds) || {V, _L} <- Args]);
+def_kind_1(#b_set{op={bif,Op}, args=Args}, Kinds) ->
+    Ks = [value_kind(A, Kinds) || A <- Args],
+    case lists:member(Op, ?NAT_BIFS) andalso all_nat(Ks) of
+        true -> nat;
+        false ->
+            case lists:member(Op, ?INT_BIFS) andalso all_int(Ks) of
+                true -> int;
+                false -> unknown
+            end
+    end;
+def_kind_1(_Def, _Kinds) ->
+    unknown.
+
+%% The fact for a canonical induction variable: an integer entry value and
+%% integer steps make it an integer, and a non-negative entry value with
+%% non-negative steps makes it non-negative. A decreasing induction variable
+%% is still an integer, but can go negative, so only the integer fact is used.
+iv_kind(Init, Step, Kinds) ->
+    case value_kind(Init, Kinds) of
+        unknown -> unknown;
+        int -> int;
+        nat when Step >= 0 -> nat;
+        nat -> int
+    end.
+
+value_kind(#b_literal{val=N}, _Kinds) when is_integer(N), N >= 0 ->
+    nat;
+value_kind(#b_literal{val=N}, _Kinds) when is_integer(N) ->
+    int;
+value_kind(#b_var{}=V, Kinds) ->
+    maps:get(V, Kinds, unknown);
+value_kind(_Value, _Kinds) ->
+    unknown.
+
+all_int([]) -> false;
+all_int(Ks) -> lists:all(fun(K) -> K =:= int orelse K =:= nat end, Ks).
+
+all_nat([]) -> false;
+all_nat(Ks) -> lists:all(fun(K) -> K =:= nat end, Ks).
+
+join_kinds([]) -> unknown;
+join_kinds(Ks) ->
+    case all_int(Ks) of
+        true ->
+            case all_nat(Ks) of
+                true -> nat;
+                false -> int
+            end;
+        false ->
+            unknown
+    end.
+
+%% The canonical induction variables of the loop headed by H, i.e. the phis
+%% of H of the shape
+%%
+%%     V = phi({Init, Outside}, [{V + C, Inside} | ...])
+%%
+%% with an integer literal step C (the same on every inside edge, `V' itself
+%% meaning 0) and integer entry values. Returns #{Var => {Init, Step}}.
+canonical_ivs(H, BodySet, Defs, Kinds, Blocks) ->
+    #b_blk{is=Is} = maps:get(H, Blocks),
+    lists:foldl(fun(#b_set{op=phi, dst=#b_var{}=V, args=Args}, Acc) ->
+                        case iv_of(V, Args, BodySet, Defs, Kinds) of
+                            {ok, Iv} -> Acc#{V => Iv};
+                            no -> Acc
+                        end;
+                   (_I, Acc) ->
+                        Acc
+                end, #{}, Is).
+
+iv_of(V, Args, BodySet, Defs, Kinds) ->
+    Outside = [Val || {Val, L} <- Args, not ordsets:is_element(L, BodySet)],
+    Inside = [Val || {Val, L} <- Args, ordsets:is_element(L, BodySet)],
+    case Outside =/= [] andalso Inside =/= [] andalso
+        lists:all(fun(Val) -> integer_value(Val, Kinds) end, Outside) of
+        true ->
+            case steps(Inside, V, Defs) of
+                {ok, Step} ->
+                    %% A loop this pass transforms has exactly one
+                    %% predecessor outside the body (its preheader), so the
+                    %% entry value is unambiguous; if there are several, they
+                    %% must at least all provide the same value.
+                    case lists:usort(Outside) of
+                        [Init] -> {ok, {Init, Step}};
+                        _ -> no
+                    end;
+                no ->
+                    no
+            end;
+        false ->
+            no
+    end.
+
+%% The step of every inside edge must be the same integer literal. A single
+%% inside edge that is not a `V +/- C' recurrence (step/3 returns `no') makes
+%% the variable non-canonical, because its value there is then unknown.
+steps([_|_]=Inside, V, Defs) ->
+    case lists:map(fun(Val) -> step(Val, V, Defs) end, Inside) of
+        [{ok, Step} | Rest] ->
+            case lists:all(fun(S) -> S =:= {ok, Step} end, Rest) of
+                true -> {ok, Step};
+                false -> no
+            end;
+        [_ | _] ->
+            no
+    end;
+steps([], _V, _Defs) ->
+    %% Not loop-carried at all: no induction variable.
+    no.
+
+step(#b_var{name=Name}, #b_var{name=Name}, _Defs) ->
+    {ok, 0};
+step(#b_var{}=W, V, Defs) ->
+    case Defs of
+        #{W := #b_set{op={bif,Op}, args=Args}} -> bif_step(Op, Args, V);
+        #{} -> no
+    end;
+step(_Val, _V, _Defs) ->
+    no.
+
+bif_step('+', Args, V) ->
+    case Args of
+        [V, #b_literal{val=C}] when is_integer(C) -> {ok, C};
+        [#b_literal{val=C}, V] when is_integer(C) -> {ok, C};
+        _ -> no
+    end;
+bif_step('-', Args, V) ->
+    case Args of
+        [V, #b_literal{val=C}] when is_integer(C) -> {ok, -C};
+        _ -> no
+    end;
+bif_step(_Op, _Args, _V) ->
+    no.
+
+integer_value(#b_literal{val=N}, _Kinds) ->
+    is_integer(N);
+integer_value(#b_var{}=V, Kinds) ->
+    case maps:get(V, Kinds, unknown) of
+        nat -> true;
+        int -> true;
+        unknown -> false
+    end;
+integer_value(_Value, _Kinds) ->
+    false.
+
+%% Rewrite the arithmetic in one block of the loop body. Only the operation
+%% and the literal operand change; the destination, the annotations, the
+%% position and the terminators are untouched.
+reduce_block(L, Kinds, Blocks0) ->
+    Blk0 = maps:get(L, Blocks0),
+    Is = [reduce_instr(I, Kinds) || I <- Blk0#b_blk.is],
+    Blocks0#{L := Blk0#b_blk{is=Is}}.
+
+%% Canonicalise the operand order of a commutative arithmetic instruction that
+%% was written with a literal on the left (`C + V', `C * V') into the canonical
+%% `V Op C' shape, so that every recurrence and every product has one syntactic
+%% form. `+' and `*' are commutative for every number (a float sum/product does
+%% not depend on the operand order) and fail on exactly the same non-number
+%% operands, so no value and no exception changes. This is what lets the step
+%% `1 + V' be recognised as the same iteration step as `V + 1'.
+reduce_instr(#b_set{op={bif,Op}, args=[#b_literal{}=A, #b_var{}=B]}=I, Kinds)
+  when Op =:= '+'; Op =:= '*' ->
+    reduce_instr(I#b_set{args=[B, A]}, Kinds);
+reduce_instr(#b_set{op={bif,'*'}, args=[A, B]}=I, Kinds) ->
+    case strength_mul(A, B, Kinds) of
+        no -> I;
+        {Op, Args} -> I#b_set{op={bif,Op}, args=Args}
+    end;
+reduce_instr(#b_set{op={bif,'div'}, args=[A, B]}=I, Kinds) ->
+    case strength_div(A, B, Kinds) of
+        no -> I;
+        {Op, Args} -> I#b_set{op={bif,Op}, args=Args}
+    end;
+reduce_instr(I, _Kinds) ->
+    I.
+
+strength_mul(#b_literal{val=K}, X, Kinds) when is_integer(K) ->
+    strength_mul_1(K, X, Kinds);
+strength_mul(X, #b_literal{val=K}, Kinds) when is_integer(K) ->
+    strength_mul_1(K, X, Kinds);
+strength_mul(_A, _B, _Kinds) ->
+    no.
+
+strength_mul_1(K, X, Kinds) when K > 1 ->
+    case power_of_two(K) of
+        {ok, N} ->
+            case value_kind(X, Kinds) of
+                nat ->
+                    {'bsl', [X, #b_literal{val=N}]};
+                int ->
+                    {'bsl', [X, #b_literal{val=N}]};
+                unknown when K =:= 2 ->
+                    %% X * 2 == X + X for every number: adding a float to
+                    %% itself doubles it without rounding, exactly like
+                    %% multiplying by 2, and both fail on the same values.
+                    {'+', [X, X]};
+                unknown ->
+                    no
+            end;
+        no ->
+            no
+    end;
+strength_mul_1(_K, _X, _Kinds) ->
+    %% A literal factor of 0 or 1 is not a shift and `X * 0'/'X * 1' still
+    %% raise for a non-number, so those are left alone.
+    no.
+
+strength_div(X, #b_literal{val=K}, Kinds) when is_integer(K), K > 1 ->
+    case power_of_two(K) of
+        {ok, N} ->
+            case value_kind(X, Kinds) of
+                nat ->
+                    %% `div' truncates toward zero, `bsr' floors; they agree
+                    %% exactly for a non-negative dividend, and K >= 2 means
+                    %% the original could not have been a division by zero.
+                    {'bsr', [X, #b_literal{val=N}]};
+                _ ->
+                    no
+            end;
+        no ->
+            no
+    end;
+strength_div(_X, _Y, _Kinds) ->
+    %% A divisor that is not a literal power of two >= 2 is left alone: a
+    %% divisor of 0 must keep raising, 1 is not a shift, and the rest has no
+    %% exact shift form.
+    no.
+
+%% {ok, N} when K =:= 1 bsl N and K > 0.
+power_of_two(K) when K > 0, K band (K - 1) =:= 0 ->
+    {ok, pow2_shift(K, 0)};
+power_of_two(_K) ->
+    no.
+
+pow2_shift(1, N) -> N;
+pow2_shift(K, N) -> pow2_shift(K bsr 1, N + 1).

@@ -109,6 +109,10 @@
                     {'ok',beam_ssa:b_module()}.
 
 module(Module0, Opts) ->
+    %% Set up the opt-in per-pass time budget/watchdog and the eligibility
+    %% gates before the phase pass lists are built, because the pass funs are
+    %% wrapped while those lists are constructed.
+    beam_ssa_opt_budget:init(Opts),
     {Module,NifInfo} = isolate_nifs(Module0),
     FuncDb = case proplists:get_value(no_module_opt, Opts, false) of
                  false -> build_func_db(Module);
@@ -156,6 +160,17 @@ fixpoint(_FuncIds, _Order, _Passes, StMap, FuncDb, 0) ->
     %% Too many repetitions. Give up and return what we have.
     {StMap, FuncDb};
 fixpoint(FuncIds0, Order0, Passes, StMap0, FuncDb0, N) when is_map(StMap0) ->
+    case beam_ssa_opt_budget:over_budget() of
+        true ->
+            %% The cumulative SSA optimization budget is exhausted. Stop
+            %% iterating; this is equivalent to a fixpoint repetition count
+            %% of zero, i.e. less optimized but equally correct.
+            {StMap0, FuncDb0};
+        false ->
+            fixpoint_1(FuncIds0, Order0, Passes, StMap0, FuncDb0, N)
+    end.
+
+fixpoint_1(FuncIds0, Order0, Passes, StMap0, FuncDb0, N) ->
     {StMap, FuncDb} = phase(FuncIds0, Passes, StMap0, FuncDb0),
     Repeat = changed(FuncIds0, FuncDb0, FuncDb, StMap0, StMap),
     case sets:is_empty(Repeat) of
@@ -332,7 +347,7 @@ module_passes(Opts) ->
             fun({StMap, FuncDb}) ->
                     beam_ssa_type:opt_start(StMap, FuncDb)
             end}],
-    passes_1(Ps0, Opts).
+    passes_1_module(Ps0, Opts).
 
 %% These passes all benefit from each other (in roughly this order), so they
 %% are repeated as required.
@@ -368,7 +383,7 @@ epilogue_module_passes(Opts) ->
             fun({StMap, FuncDb}) ->
                     beam_ssa_destructive_update:opt(StMap, FuncDb)
             end}],
-    passes_1(Ps0, Opts).
+    passes_1_module(Ps0, Opts).
 
 early_epilogue_passes(Opts) ->
     Ps = [?PASS(ssa_opt_type_finish),
@@ -401,16 +416,87 @@ late_epilogue_passes(Opts) ->
     passes_1(Ps, Opts).
 
 passes_1(Ps, Opts0) ->
+    passes(Ps, Opts0, func).
+
+%% Module-level pass lists run in the compiling process: the opt-in FBIP gate
+%% is evaluated inside beam_ssa_destructive_update:opt/2 (see
+%% beam_ssa_opt_budget), and these passes have their own internal convergence
+%% caps. They are therefore neither time bounded nor skipped.
+passes_1_module(Ps, Opts0) ->
+    passes(Ps, Opts0, module).
+
+passes(Ps, Opts0, Kind) ->
     Negations = [{list_to_atom("no_"++atom_to_list(N)),N} ||
                     {N,_} <:- Ps],
     Opts = proplists:normalize(Opts0, [{negations,Negations}]),
     [case proplists:get_value(Name, Opts, true) of
          true ->
-             P;
+             {Name, wrap_fun(Kind, Name, Fun)};
          false ->
              {NoName,Name} = keyfind(Name, 2, Negations),
              {NoName,fun(S) -> S end}
-         end || {Name,_}=P <- Ps].
+         end || {Name,Fun} <- Ps].
+
+wrap_fun(module, _Name, Fun) ->
+    Fun;
+wrap_fun(func, Name, Fun) ->
+    beam_ssa_opt_budget:wrap_fun(Name, Fun, gate(Name), skippable(Name)).
+
+%% Eligibility preconditions for the opt-in passes (see
+%% beam_ssa_opt_budget). The predicate is a cheap NECESSARY condition for the
+%% pass to change anything, so the driver may skip the pass when it is false.
+%% `undefined' means "always run".
+gate(ssa_opt_loop_opt) ->
+    fun beam_ssa_loop_opt:eligible/1;
+gate(ssa_opt_fus) ->
+    fun beam_ssa_fus:eligible/1;
+gate(_) ->
+    undefined.
+
+%% Passes that must always run, even when the budget is exhausted or the
+%% watchdog fires.
+%%
+%% `ssa_opt_split_blocks', `ssa_opt_linearize' and `ssa_opt_blockify' change
+%% the representation of the SSA (map <-> linear) or its block granularity, so
+%% skipping one would leave the state in a form that later passes do not
+%% expect.
+%%
+%% `ssa_opt_type_finish' (beam_ssa_type:opt_finish/3) is what turns the types
+%% that were computed by the type analysis into the annotations that the code
+%% generator and `beam_validator' rely on. Skipping it makes the code
+%% generator rely on stale or missing type information, which produces code
+%% that `beam_validator' rejects.
+%% `ssa_opt_live' is the only pass that removes instructions whose result has
+%% become dead, and the only pass that strength-reduces the "test only"
+%% counterparts of those instructions before code generation. The code
+%% generator recognises a live `get_map_element' only as the first half of a
+%% `get_map_element' + `{succeeded,_}' pair (`beam_ssa_codegen:cg_block/3'),
+%% and it translates a `bs_start_match' of kind `new' into a `bs_start_match4'
+%% with an infallible operand. Other passes - among them `ssa_opt_type_finish',
+%% which folds a `{succeeded,guard}' marker away once the type analysis has
+%% proven the outcome - regularly leave such an instruction behind with a dead
+%% result, and `ssa_opt_live' is what then either drops it or rewrites it to
+%% `has_map_field'/`is_bitstring' (`live_opt_is/3'). Skipping it lets a bare
+%% `get_map_element' or an unmatched `bs_start_match' reach the code generator,
+%% which either crashes (`beam_ssa_codegen:cg_instr/4' has no clause for a
+%% standalone `get_map_element') or emits code that `beam_validator' rejects
+%% (`bs_start_match4' with a non-binary operand).
+%%
+%% `ssa_opt_bs_ensure' is what annotates the binary-matching blocks and inserts
+%% the `bs_ensure' instructions whose unit tests the code generator depends on.
+%% `beam_ssa_pre_codegen:bs_restores_is/5' asserts that a `bs_match' that skips
+%% all (`beam_ssa_bsm' produces those) is either annotated by this pass or does
+%% not exist; without the annotation the assertion fails and compilation
+%% crashes. Skipping it while the other optimization passes run was observed to
+%% break `lib/kernel/src/file.erl', `lib/kernel/src/inet.erl' and
+%% `lib/eunit/src/eunit_tty.erl'.
+skippable(ssa_opt_split_blocks) -> false;
+skippable(ssa_opt_linearize) -> false;
+skippable(ssa_opt_blockify) -> false;
+skippable(ssa_opt_type_finish) -> false;
+skippable(ssa_opt_live) -> false;
+skippable(ssa_opt_bs_ensure) -> false;
+skippable(_) -> true.
 
 %% Builds a function information map with basic information about incoming and
 %% outgoing local calls, as well as whether the function is exported.

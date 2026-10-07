@@ -335,6 +335,13 @@ pub const PORT_FLAG_BINARY: c_int = 1 << 0;
 /// `PORT_FLAG_LINE` — the port is in line mode.
 pub const PORT_FLAG_LINE: c_int = 1 << 1;
 
+/// `ERTS_INVALID_ERL_DRV_PORT` — the invalid-port sentinel (`erts/emulator/beam/erl_port.h:67`):
+/// the C's `((struct _erl_drv_port *) ((SWord) -1))`, i.e. the pointer `-1`.
+///
+/// It is what `driver_create_port` returns for any failure (`io.c:786`). Its comment explains why it
+/// is not `NULL`: in pre-R16 systems `0` was a valid port handle, so `-1` had to be the invalid one.
+pub const ERTS_INVALID_ERL_DRV_PORT: ErlDrvPort = -1isize as ErlDrvPort;
+
 /// `ERL_DRV_FLAG_USE_PORT_LOCKING` — the emulator locks the port before calls.
 pub const ERL_DRV_FLAG_USE_PORT_LOCKING: c_int = 1 << 0;
 /// `ERL_DRV_FLAG_SOFT_BUSY` — busy state is not scheduled automatically.
@@ -479,6 +486,8 @@ mod tests {
         assert_eq!(ERL_DRV_FLAG_NO_BUSY_MSGQ, 4);
         assert_eq!(ERL_DRV_FLAG_USE_INIT_ACK, 8);
         assert_eq!(DRIVER_CALL_KEEP_BUFFER, 0x1);
+        // The invalid-port sentinel is the pointer `-1` (`erl_port.h:67`), never `NULL`.
+        assert_eq!(ERTS_INVALID_ERL_DRV_PORT as isize, -1);
     }
 
     #[test]

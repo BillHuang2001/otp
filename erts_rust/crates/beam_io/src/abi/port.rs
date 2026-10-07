@@ -39,6 +39,25 @@
 //! ([`DriverPort::poll_async`]); anything else is out of scope until the runtime keeps a per-port
 //! `DriverEnv` alive for the port's whole life.
 //!
+//! # Where the current host is published
+//!
+//! Two frozen `ErlDrvApi` slots carry **no** port operand (`add_driver_entry`/`remove_driver_entry`:
+//! they act on the emulator's process-global `driver_list`), so they cannot recover their host from
+//! a port. The runtime therefore publishes the host it is running driver code for with
+//! [`beam_abi::with_current_host`], and those two slots read it back. Both places this adapter runs
+//! driver code publish it:
+//!
+//! * [`DriverPort::call`] — around **every** callback it routes (`start`/`output`/`ready_input`/
+//!   `ready_output`/`control`/`timeout`/`port_exit`/`stop`), including the `ready_async` branch of
+//!   [`DriverPort::poll_async`]; and
+//! * the `async_free` branch of [`DriverPort::poll_async`], which bypasses `call` (the C's
+//!   `async_free` is `void (*)(void*)`, with no port and no `ready_async`).
+//!
+//! The remaining `Driver` methods ([`Driver::drive_async`] = `poll_async`, [`Driver::next_timeout`],
+//! [`Driver::take_exit_status`]) run no driver code, so they publish nothing. A driver that calls
+//! `driver_*` from a thread it started itself is outside this: no context is installed there (the
+//! M1 limitation above).
+//!
 //! # The floor (documented deviations)
 //!
 //! * **`output`/`ready_output` bytes are treated as consumed.** The C `output`/`ready_output`
@@ -85,7 +104,7 @@ use std::time::Instant;
 
 use libc::{c_char, c_int, c_uint};
 
-use beam_abi::driver::host::DriverEnv;
+use beam_abi::driver::host::{DriverEnv, DriverHost};
 use beam_abi::driver::loader::{load, DriverLibrary};
 use beam_abi::driver::types::{
     ErlDrvData, ErlDrvEvent, ErlDrvMonitor, ErlDrvPort, ErlDrvSizeT, ErlDrvThreadData,
@@ -183,7 +202,7 @@ impl DriverPort {
         port_host: Box<dyn PortHost>,
     ) -> Result<DriverPort> {
         let name = library.name();
-        let mut abi = Box::new(AbiHost::new(port_host)?);
+        let mut abi = Box::new(AbiHost::for_driver(port_host, name.clone(), true)?);
         // The `ErlDrvPort` a driver sees is `DriverEnv::as_port()`'s pointer, so the env must point
         // at an allocation that never moves. `abi` is boxed here (stable address) and both boxes are
         // moved into `DriverPort`, which owns them for the port's whole life — so the raw pointer the
@@ -207,15 +226,33 @@ impl DriverPort {
     ///
     /// The cleanup is a `Drop` guard, so the context is cleared even if the callback body unwinds —
     /// the installed pointer must never outlive the [`DriverContext`] it came from.
+    ///
+    /// The port's host is **published** for the dynamic extent of the callback
+    /// ([`beam_abi::with_current_host`]), so the two frozen driver slots that carry no port operand
+    /// (`add_driver_entry`/`remove_driver_entry`) can reach it. This is the central publication
+    /// point: every `call`-routed driver method (`start`/`output`/`ready_input`/`ready_output`/
+    /// `control`/`timeout`/`port_exit`/`stop`) is covered by it.
     fn call<R>(
         &mut self,
         ctx: &mut DriverContext<'_>,
         f: impl FnOnce(&DriverPort, ErlDrvPort) -> R,
     ) -> R {
         let port = self.env.as_port();
+        // SAFETY: `abi_ptr` is `&mut *self.abi` taken as a raw pointer; that temporary borrow ends
+        // at this statement, so nothing below re-borrows `self.abi` through it in the borrow
+        // checker. The `&mut dyn DriverHost` derived from it reaches only the `AbiHost`'s
+        // interior-mutable state (`Cell`/`DriverState`), which no other live borrow touches: `f`
+        // reads and writes only *other* `DriverPort` fields (`lib`/`data`). The publication is
+        // scoped to the `with_current_host` call, so the pointer is retired before the borrow ends.
+        // This mirrors the crate's existing raw-pointer re-entry (`AbiHost::with_ctx`,
+        // `DriverEnv::new`/`host`).
+        let abi_ptr: *mut AbiHost = &mut *self.abi;
         self.abi.install(ctx);
-        let _guard = CtxGuard(self.abi.as_ref());
-        f(self, port)
+        let _guard = CtxGuard(abi_ptr);
+        // SAFETY: `abi_ptr` is the address of the boxed `AbiHost` field (see above), live for the
+        // whole of this call.
+        let host: &mut dyn DriverHost = unsafe { &mut *abi_ptr };
+        beam_abi::with_current_host(host, || f(self, port))
     }
 
     /// Runs the driver's `ready_async` for each finished `driver_async` job, or its `async_free`
@@ -254,7 +291,17 @@ impl DriverPort {
                 // contract is that exactly one of `ready_async`/`async_free` runs for a completed
                 // job, and the `ready_async`-present case was handled above — so this must run
                 // here, and `beam_io` itself never dereferences the pointer.
-                unsafe { free(job.data.0) };
+                //
+                // `async_free` carries no port, so it is one of the driver entry points that does
+                // not go through `DriverPort::call`; the host is published here for the same reason
+                // `call` publishes it — a driver may call the no-port registry slots
+                // (`add_driver_entry`/`remove_driver_entry`) from any of its callbacks.
+                let abi_ptr: *mut AbiHost = &mut *self.abi;
+                // SAFETY: see `DriverPort::call` — the published `&mut` reaches only the
+                // `AbiHost`'s interior-mutable state and is retired before this iteration's borrow
+                // ends; the closure touches neither `self` nor the host.
+                let host: &mut dyn DriverHost = unsafe { &mut *abi_ptr };
+                beam_abi::with_current_host(host, || unsafe { free(job.data.0) });
             }
             processed += 1;
         }
@@ -263,11 +310,20 @@ impl DriverPort {
 }
 
 /// Clears an [`AbiHost`]'s installed port context when a driver callback returns (or unwinds).
-struct CtxGuard<'a>(&'a AbiHost);
+///
+/// Holds a **raw** pointer rather than a `&AbiHost`: [`DriverPort::call`] publishes the host as a
+/// `&mut dyn DriverHost` for the callback's dynamic extent, which a live shared borrow of the host
+/// would forbid — so the guard deliberately keeps no borrow, only the address of the boxed host the
+/// port owns.
+struct CtxGuard(*mut AbiHost);
 
-impl Drop for CtxGuard<'_> {
+impl Drop for CtxGuard {
     fn drop(&mut self) {
-        self.0.clear();
+        // SAFETY: the pointer is the address of the `AbiHost` this guard was created from in
+        // `DriverPort::call`; that host is a `Box` owned by the live `DriverPort`, so it is valid
+        // for the guard's whole life (which is bounded by the same method), and `clear` only writes
+        // the host's own `Cell` slot.
+        unsafe { (*self.0).clear() };
     }
 }
 

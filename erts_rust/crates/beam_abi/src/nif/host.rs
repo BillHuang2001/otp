@@ -16,6 +16,9 @@
 //! `unsafe` is confined to [`NifEnv::host`] and [`NifEnv::from_opaque`], each documented with a
 //! `# Safety` section / `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
 
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use libc::{c_int, c_void};
 
 use beam_alloc::Heap;
@@ -228,6 +231,75 @@ pub trait NifHost {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The current-NIF-call host stack — how `enif_alloc_env(void)` finds a host
+// ---------------------------------------------------------------------------------------------
+//
+// `enif_alloc_env(void)` takes no argument, so — alone among the `enif_*` entry points — it has no
+// env handle to reach a [`NifHost`] through, and a crate-owned env would have no access to the
+// runtime's atom table (it would hand a NIF a *wrong term*: `nif::enif::envs` has the full
+// argument). The C solves the reachability problem with process-global allocator state; here the
+// equivalent is "the host of the NIF call the calling thread is inside".
+//
+// [`NifEnv`] is exactly that call's handle, and [`NifEnv::new`] is the **single** construction point
+// for a real call env (the runtime and [`crate::nif::loader`] both go through it), so `new`
+// publishes its host on this thread's stack and `NifEnv`'s `Drop` removes it again. While any env is
+// live, the top of the stack is precisely the host of the current NIF call; once the outermost one
+// is dropped the stack is empty and `enif_alloc_env` answers `NULL`.
+//
+// A **stack** rather than a single slot, because a NIF call can nest (the loader's `unload`
+// callback runs inside `NifLibrary::drop`, which may run while an outer call env is still live).
+// Each entry carries the token of the [`NifEnv`] that published it, so an out-of-order drop removes
+// exactly its own entry instead of whichever one happens to be on top.
+//
+// The store is **thread-local**, not global: a NIF call is made on one thread and [`NifEnv`] is not
+// `Send` (it holds a raw host pointer), so the host a thread publishes is only ever read back on
+// that same thread.
+
+thread_local! {
+    /// The hosts published by the [`NifEnv`]s live on this thread, innermost (current) last.
+    static CURRENT_HOSTS: RefCell<Vec<(u64, *mut dyn NifHost)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Identity of the next [`NifEnv`] (see [`CURRENT_HOSTS`]); drawn once per env, never reused.
+static NEXT_ENV_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Publish `host` as the host of the NIF call whose env carries `token` ([`NifEnv::new`]).
+fn push_current_host(token: u64, host: *mut dyn NifHost) {
+    CURRENT_HOSTS.with(|stack| stack.borrow_mut().push((token, host)));
+}
+
+/// Remove `token`'s entry, wherever it sits ([`NifEnv`]'s `Drop`).
+///
+/// Removing a *position* rather than the top keeps the stack sound when envs are dropped out of
+/// nesting order: every env removes its own entry, so the count can only reach zero when every env
+/// is gone — the invariant the "no live env ⇒ `enif_alloc_env` answers `NULL`" rule rests on.
+fn pop_current_host(token: u64) {
+    CURRENT_HOSTS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(pos) = stack.iter().position(|&(t, _)| t == token) {
+            stack.remove(pos);
+        }
+    });
+}
+
+/// Run `f` with the host of the innermost live [`NifEnv`] on this thread, or answer `None` when no
+/// env is live (i.e. this thread is not inside a NIF call).
+///
+/// This is the reachability mechanism behind `enif_alloc_env` (`nif::enif::envs`), the one `enif_*`
+/// entry point that takes no argument and so cannot name a host itself. The thread-local borrow is
+/// released before `f` runs, so `f` may itself construct an env (a nested push).
+pub(crate) fn with_current_host<R>(f: impl FnOnce(&mut dyn NifHost) -> R) -> Option<R> {
+    let host = CURRENT_HOSTS.with(|stack| stack.borrow().last().map(|&(_, host)| host))?;
+    // SAFETY: the entry was pushed by a live `NifEnv`, which by its own contract keeps the host
+    // alive until that env is dropped, and dropping the env removes the entry — so a host named by
+    // an entry on the stack is live. An env holds only the raw pointer (`NifEnv::host` is the only
+    // place it is turned back into a reference, and `NifEnv` is not `Clone`), so no other
+    // `&mut dyn NifHost` into that host is outstanding here, and this reborrow is scoped to `f`.
+    let host: &mut dyn NifHost = unsafe { &mut *host };
+    Some(f(host))
+}
+
 /// The concrete per-call NIF environment behind the C-facing opaque `*mut ErlNifEnv`.
 ///
 /// Holds a raw pointer to the host (so the environment itself is lifetime-free and can be recovered
@@ -241,12 +313,19 @@ pub struct NifEnv {
     /// (The `'static` that a `*mut dyn Trait` spells by default is erased by the documented
     /// lifetime-erasing cast in [`NifEnv::new`].)
     host: *mut dyn NifHost,
+    /// Identity of this env's [`CURRENT_HOSTS`] entry, so `Drop` removes exactly its own.
+    token: u64,
     /// The exception reason recorded by a raise, if any (the C `enif_raise_exception` slot).
     pending_exception: Option<Eterm>,
 }
 
 impl NifEnv {
     /// Wrap `host` in a fresh per-call environment (no pending exception).
+    ///
+    /// The env also **publishes `host` as the current NIF-call host on this thread** (removed again
+    /// by `Drop`) — the mechanism `enif_alloc_env` uses to reach a host from an entry point that
+    /// takes no argument (see `with_current_host` below). Constructing one is therefore reserved for
+    /// a real call env: it is what "this thread is inside a NIF call" means to this crate.
     pub fn new(host: &mut dyn NifHost) -> NifEnv {
         // SAFETY: the only thing reinterpreted here is the erased trait-object lifetime. The
         // C-facing env has no lifetime parameter (`struct enif_environment_t` is plain C), so the
@@ -258,8 +337,11 @@ impl NifEnv {
         // reproduced exactly by `NifEnv::host`. The caller must keep the host alive for as long as
         // the environment is used (`NifEnv` is not `Clone`, so there is exactly one handle).
         let host: *mut dyn NifHost = unsafe { core::mem::transmute(host) };
+        let token = NEXT_ENV_TOKEN.fetch_add(1, Ordering::Relaxed);
+        push_current_host(token, host);
         NifEnv {
             host,
+            token,
             pending_exception: None,
         }
     }
@@ -311,6 +393,18 @@ impl NifEnv {
     /// Clear the pending exception (C `enif_clear_env` semantics).
     pub fn clear(&mut self) {
         self.pending_exception = None;
+    }
+}
+
+impl Drop for NifEnv {
+    /// Withdraw this env's entry from the current-call host stack (the counterpart of the push in
+    /// [`NifEnv::new`]), so `enif_alloc_env` sees the host of the enclosing call again — or no host
+    /// at all, once the outermost env is gone.
+    ///
+    /// The env is the only publisher of its own token and is not `Clone`, so exactly one entry can
+    /// carry it.
+    fn drop(&mut self) {
+        pop_current_host(self.token);
     }
 }
 

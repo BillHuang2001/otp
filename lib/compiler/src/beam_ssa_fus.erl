@@ -21,9 +21,12 @@
 %%
 
 %%%
-%%% This pass performs "map lookup fusion": it rewrites a map key *test*
-%%% followed by a map key *extraction* of the same key into a single
-%%% extraction. That is, the map is looked up once instead of twice.
+%%% This pass performs "map lookup fusion": it removes map key *tests* whose
+%%% result is already implied by a following map key *extraction*, so that the
+%%% map is probed once instead of twice. Two transformations are implemented;
+%%% both are opt-in (compile option `fusion_opt') and share the rule that
+%%% nothing is rewritten unless every condition checked by the pass holds, so
+%%% every uncertain case is left untouched.
 %%%
 %%% Fusion 1 (implemented): when the last instruction of a block is
 %%%
@@ -49,6 +52,10 @@
 %%% The second block is then unreachable and is dropped. The map is thus looked
 %%% up once (`get_map_elements` in the generated BEAM code) instead of twice
 %%% (`has_map_fields`/`is_map_key` plus `get_map_elements`).
+%%%
+%%% Fusion 2 (implemented) generalises Fusion 1 to a whole chain of map key
+%%% tests that is redundant because the extractions cover exactly the tested
+%%% keys - see the comment above `fuse_2_blk/3' below.
 %%%
 %%% Semantics preserved:
 %%%
@@ -78,20 +85,45 @@
 %%% Nothing is rewritten unless all of the conditions checked by `maybe_fuse/9`
 %%% hold; every uncertain case is left untouched.
 %%%
-%%% Fusion 2 (deliberately NOT implemented here): merging a chain of single-key
-%%% `get_map_element/2` operations on the same map and with the same failure
-%%% label into one multi-key lookup. This cannot be expressed in BEAM SSA:
-%%% `get_map_elements/3` exists only as a *BEAM* instruction (genop.tab:158),
-%%% not as an SSA op - `beam_ssa:op()` has no such member and
-%%% `beam_ssa_codegen:cg_block/3` matches `get_map_element` with exactly the
-%%% two arguments `[Map,Key]`. Emitting a multi-key form would require a new
-%%% IR operation plus matching support in the code generator, the validator,
-%%% the liveness/register machinery and the alias analysis. Note also that the
-%%% BEAM-level merge is already performed: `beam_block:opt_maps/2` coalesces
-%%% adjacent `get_map_elements` instructions into one multi-pair
-%%% `get_map_elements` instruction, which is exactly what a chain of
-%%% single-successor `get_map_element` blocks lowers to. Implementing an SSA
-%%% version today would therefore add risk without adding value.
+%%% Fusion 2 (implemented): the same redundancy, generalised to *several*
+%%% keys. When the map operand is type-proven to be a map and a chain of
+%%% single-successor blocks
+%%%
+%%%     LA:  ... has_map_field(Map, K1) -> T1 ; br T1, LB, LFail
+%%%     LB:  ... has_map_field(Map, K2) -> T2 ; br T2, LC, LFail
+%%%     ...
+%%%     LZ:  ... has_map_field(Map, Kn) -> Tn ; br Tn, LSucc, LFail     (n >= 2)
+%%%
+%%% is followed by a chain of single-successor extraction blocks
+%%%
+%%%     LSucc: get_map_element(Map, K1') -> G1 ; succeeded:guard G1 ; br -> .., LFail2
+%%%     ...
+%%%     LEnd:  get_map_element(Map, Kn') -> Gn ; succeeded:guard Gn ; br -> LFinal, LFail2
+%%%
+%%% whose keys are exactly the tested keys (as a set) and which share one
+%%% failure label LFail2, then the whole test chain is redundant and is
+%%% replaced by the extraction chain: every tested key is looked up again (and
+%%% can therefore only succeed) by the extraction chain. Each `has_map_field'
+%%% test block is rewritten into the corresponding extraction (matched by key),
+%%% and the extraction chain's own blocks are dropped. Exactly as in Fusion 1,
+%%% the resulting lookups fail to LFail (the tests' "false" label), which is
+%%% sound because the extraction set already covers the tested keys, so the
+%%% extraction chain's own failure label LFail2 becomes unreachable. The map is
+%%% thus probed once for the extractions instead of once for the tests *plus*
+%%% once for the extractions.
+%%%
+%%% Expressibility: this needs NO new IR operation nor new BEAM instruction.
+%%% The pass only rewrites each test block in place into an equally shaped
+%%% single-key extraction (`get_map_element/2` + `succeeded:guard`, which
+%%% `beam_ssa_codegen:cg_block/3` already matches as the two-element form
+%%% `[get_map_element, succeeded]`), keeping one lookup per block; the
+%%% multi-pair `get_map_elements/3` BEAM instruction is then synthesised by
+%%% `beam_block:opt_maps/2`, which coalesces the adjacent same-failure
+%%% `get_map_elements` instructions the chain lowers to. (Merging the
+%%% extraction chain into a single SSA block would *not* be expressible: there
+%%% is no multi-key SSA op, and `cg_block/3` has no clause for several
+%%% `[get_map_element, succeeded]' pairs in one block. The pass therefore keeps
+%%% the block structure and leaves the coalescing to `beam_block`.)
 %%%
 %%% Fusion 3 (deliberately NOT implemented here): `get_tuple_element/3` chains.
 %%% `ssa_opt_element/1` (prologue passes) plus `ssa_opt_get_tuple_element/1`
@@ -104,7 +136,7 @@
 -module(beam_ssa_fus).
 -moduledoc false.
 
--export([ssa_opt_fus/1]).
+-export([ssa_opt_fus/1, eligible/1]).
 
 -include("beam_ssa.hrl").
 -include("beam_types.hrl").
@@ -120,6 +152,55 @@
 ssa_opt_fus({#opt_st{ssa=Blocks0}=St, FuncDb}) ->
     Blocks = normalize(Blocks0),
     {St#opt_st{ssa=fuse(Blocks)}, FuncDb}.
+
+%% Eligibility precondition used by the opt-in per-pass budget/watchdog
+%% driver (`beam_ssa_opt_budget', wired in `beam_ssa_opt:gate/1'): true when
+%% the function contains a block whose last instruction is a `has_map_field'
+%% test on the same variable as the block's conditional branch, and whose
+%% success edge either starts with a `get_map_element' of the same map and key
+%% (Fusion 1) or is again a `has_map_field' test of the same map with the same
+%% failure label (a possible Fusion 2 test chain).
+%%
+%% This is only a NECESSARY condition - a cheap filter that lets the driver
+%% skip the pass for functions that cannot fuse anything. Whether the fusion
+%% is actually legal (the map operand must be type-proven to be a map, the
+%% extraction must be the only thing on the success edge, the two chains must
+%% cover the same keys, ...) is decided by the pass itself.
+-spec eligible({#opt_st{}, term()}) -> boolean().
+eligible({#opt_st{ssa=SSA}, _FuncDb}) ->
+    has_candidate(maps:from_list(normalize(SSA))).
+
+has_candidate(Blocks) ->
+    lists:any(fun({_L,Blk}) -> candidate_block(Blk, Blocks) end,
+              maps:to_list(Blocks)).
+
+candidate_block(#b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}}, Blocks) ->
+    case lists:reverse(Is) of
+        [#b_set{op=has_map_field,dst=Bool,args=[Map,Key]}|_] ->
+            candidate_succ(Blocks, LSucc, Map, Key, LFail);
+        _ ->
+            false
+    end;
+candidate_block(_Blk, _Blocks) ->
+    false.
+
+candidate_succ(Blocks, LSucc, Map, Key, LFail) ->
+    case Blocks of
+        #{LSucc := #b_blk{is=[#b_set{op=get_map_element,args=[Map,Key]}|_]}} ->
+            %% Fusion 1 candidate: the success edge starts with the extraction
+            %% of the tested key.
+            true;
+        #{LSucc := #b_blk{is=Is,last=#b_br{bool=B,fail=LFail}}} ->
+            %% Fusion 2 candidate: the success edge starts another map-key test
+            %% on the same map with the same failure label (so the test chain
+            %% has at least two elements).
+            case lists:reverse(Is) of
+                [#b_set{op=has_map_field,dst=B,args=[Map,_]}|_] -> true;
+                _ -> false
+            end;
+        _ ->
+            false
+    end.
 
 %% The pass runs inside the repeated (fixpoint) phase, where the SSA is kept as
 %% a linearized list. Be defensive in case the representation has been changed
@@ -156,13 +237,25 @@ scan([], _Blocks) ->
     false.
 
 %%============================================================================
-%% Fusion 1: has_map_field + get_map_element -> get_map_element
+%% Fusion driver: Fusion 1 first, then Fusion 2.
 %%============================================================================
 
 -spec fuse_blk(beam_ssa:label(), beam_ssa:b_blk(), beam_ssa:block_map()) ->
           no | {yes, beam_ssa:block_map()}.
-fuse_blk(LA, #b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}=BrA},
-         Blocks) ->
+fuse_blk(LA, Blk, Blocks) ->
+    case fuse_1_blk(LA, Blk, Blocks) of
+        no -> fuse_2_blk(LA, Blk, Blocks);
+        {yes,_}=Yes -> Yes
+    end.
+
+%%============================================================================
+%% Fusion 1: has_map_field + get_map_element -> get_map_element
+%%============================================================================
+
+-spec fuse_1_blk(beam_ssa:label(), beam_ssa:b_blk(), beam_ssa:block_map()) ->
+          no | {yes, beam_ssa:block_map()}.
+fuse_1_blk(LA, #b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}=BrA},
+           Blocks) ->
     case lists:reverse(Is) of
         [#b_set{op=has_map_field,dst=Bool,args=[Map,Key]}=Hmf | RevPrefix] ->
             fuse_1(LA, lists:reverse(RevPrefix), BrA, Hmf,
@@ -170,7 +263,7 @@ fuse_blk(LA, #b_blk{is=Is,last=#b_br{bool=Bool,succ=LSucc,fail=LFail}=BrA},
         _ ->
             no
     end;
-fuse_blk(_LA, _Blk, _Blocks) ->
+fuse_1_blk(_LA, _Blk, _Blocks) ->
     no.
 
 fuse_1(LA, Prefix, BrA, Hmf, Map, Key, LSucc, LFail, Blocks) ->
@@ -237,6 +330,223 @@ maybe_fuse(LA, LSucc, LSS, LFail, LFail2, HmfBool, HmfType, GetBool, Blocks) ->
     %% `get_map_elements` requires a map operand, while `has_map_field` maps a
     %% non-map to "false". Only fuse when Map is provably a map here.
     andalso is_map_type(HmfType).
+
+%%============================================================================
+%% Fusion 2: chain of map-key tests -> chain of map-key extractions
+%%============================================================================
+
+%% Entry point for Fusion 2 at a block LA whose last instruction is a
+%% `has_map_field' test on the branch variable. LA must be the *first* block of
+%% the test chain (a chain of length 1 is Fusion 1's job, so Fusion 2 requires
+%% at least two tests).
+-spec fuse_2_blk(beam_ssa:label(), beam_ssa:b_blk(), beam_ssa:block_map()) ->
+          no | {yes, beam_ssa:block_map()}.
+fuse_2_blk(LA, #b_blk{is=Is,last=#b_br{bool=T,succ=Succ,fail=LFail}=Br},
+           Blocks) ->
+    case lists:reverse(Is) of
+        [#b_set{op=has_map_field,dst=T}=Hmf | RevPrefix] ->
+            Entry = {LA, lists:reverse(RevPrefix), Br, Hmf},
+            case test_chain(Blocks, Succ, map0(Hmf), LFail, [Entry]) of
+                {Tests, LSucc} when length(Tests) >= 2 ->
+                    fuse_2(LFail, Tests, LSucc, Blocks);
+                _ ->
+                    no
+            end;
+        _ ->
+            no
+    end;
+fuse_2_blk(_LA, _Blk, _Blocks) ->
+    no.
+
+%% The map operand of a `has_map_field' instruction.
+-spec map0(beam_ssa:b_set()) -> beam_ssa:argument().
+map0(#b_set{args=[Map,_]}) -> Map.
+
+%% Collect the maximal chain of map-key tests starting at `L' (a successor of
+%% the block at the front of `Acc'). Every block of the chain must end with
+%% `has_map_field(Map, _)' on the branch variable and branch to the next test
+%% block or, for the last one, to the extraction chain, with the same failure
+%% label LFail throughout.
+-spec test_chain(beam_ssa:block_map(), beam_ssa:label(), beam_ssa:argument(),
+                 beam_ssa:label(), [tuple()]) -> {[tuple()], beam_ssa:label()}.
+test_chain(Blocks, L, Map, LFail, Acc) ->
+    case Blocks of
+        #{L := #b_blk{is=Is,last=#b_br{bool=T,succ=Succ,fail=LFail}=Br}} ->
+            case lists:reverse(Is) of
+                [#b_set{op=has_map_field,dst=T,args=[Map,_]}=Hmf | RevPrefix] ->
+                    Entry = {L, lists:reverse(RevPrefix), Br, Hmf},
+                    case is_test_block(Blocks, Succ, Map, LFail) of
+                        true -> test_chain(Blocks, Succ, Map, LFail, [Entry|Acc]);
+                        false -> {lists:reverse([Entry|Acc]), Succ}
+                    end;
+                _ ->
+                    {lists:reverse(Acc), L}
+            end;
+        _ ->
+            {lists:reverse(Acc), L}
+    end.
+
+%% True when `L' is again a map-key test block on the same map, with the same
+%% failure label.
+-spec is_test_block(beam_ssa:block_map(), beam_ssa:label(), beam_ssa:argument(),
+                    beam_ssa:label()) -> boolean().
+is_test_block(Blocks, L, Map, LFail) ->
+    case Blocks of
+        #{L := #b_blk{is=Is,last=#b_br{bool=T,fail=LFail}}} ->
+            case lists:reverse(Is) of
+                [#b_set{op=has_map_field,dst=T,args=[Map,_]}|_] -> true;
+                _ -> false
+            end;
+        _ ->
+            false
+    end.
+
+-spec fuse_2(beam_ssa:label(), [tuple()], beam_ssa:label(),
+             beam_ssa:block_map()) -> no | {yes, beam_ssa:block_map()}.
+fuse_2(LFail, Tests, LSucc, Blocks) ->
+    {_L, _Prefix, _Br, Hmf} = hd(Tests),
+    case is_map_type(anno_arg_type(Hmf)) of
+        false ->
+            no;
+        true ->
+            case extract_chain(Blocks, LSucc, map0(Hmf)) of
+                {Extracts, LFinal, LFail2} ->
+                    maybe_fuse_2(LFail, Tests, LSucc, Extracts, LFinal,
+                                 LFail2, Blocks);
+                no ->
+                    no
+            end
+    end.
+
+%% Collect the chain of single-key extractions starting at `LSucc'. Every block
+%% must consist of nothing but `get_map_element(Map, _)' + `succeeded:guard'
+%% and branch to the next extraction block (or, for the last one, to LFinal)
+%% with the same failure label LFail2.
+-spec extract_chain(beam_ssa:block_map(), beam_ssa:label(),
+                    beam_ssa:argument()) ->
+          no | {[tuple()], beam_ssa:label(), beam_ssa:label()}.
+extract_chain(Blocks, L, Map) ->
+    case Blocks of
+        #{L := #b_blk{is=[#b_set{op=get_map_element,dst=G,args=[Map,Key]}=Get,
+                               #b_set{op={succeeded,_},dst=T,args=[G]}=Succeeded],
+                      last=#b_br{bool=T,succ=Succ,fail=LFail2}}} ->
+            Entry = {L, Key, G, T, Get, Succeeded},
+            case is_extract_block(Blocks, Succ, Map, LFail2) of
+                true ->
+                    case extract_chain(Blocks, Succ, Map) of
+                        {Es, LFinal, LFail2} -> {[Entry|Es], LFinal, LFail2};
+                        no -> no
+                    end;
+                false ->
+                    {[Entry], Succ, LFail2}
+            end;
+        _ ->
+            no
+    end.
+
+-spec is_extract_block(beam_ssa:block_map(), beam_ssa:label(),
+                       beam_ssa:argument(), beam_ssa:label()) -> boolean().
+is_extract_block(Blocks, L, Map, LFail2) ->
+    case Blocks of
+        #{L := #b_blk{is=[#b_set{op=get_map_element,args=[Map,_]},
+                           #b_set{op={succeeded,_},dst=T,args=[_]}],
+                      last=#b_br{bool=T,fail=LFail2}}} ->
+            true;
+        _ ->
+            false
+    end.
+
+%% All the conditions that must hold for the Fusion 2 rewrite to be provably
+%% valid.
+-spec maybe_fuse_2(beam_ssa:label(), [tuple()], beam_ssa:label(), [tuple()],
+                   beam_ssa:label(), beam_ssa:label(), beam_ssa:block_map()) ->
+          no | {yes, beam_ssa:block_map()}.
+maybe_fuse_2(LFail, Tests, LSucc, Extracts, LFinal, LFail2, Blocks) ->
+    case fusion_2_ok(Tests, LSucc, Extracts, LFinal, LFail, LFail2, Blocks) of
+        true -> {yes,rewrite_2(Tests, Extracts, LFinal, LFail, Blocks)};
+        false -> no
+    end.
+
+-spec fusion_2_ok([tuple()], beam_ssa:label(), [tuple()], beam_ssa:label(),
+                  beam_ssa:label(), beam_ssa:label(), beam_ssa:block_map()) ->
+          boolean().
+fusion_2_ok(Tests, LSucc, Extracts, LFinal, LFail, LFail2, Blocks) ->
+    Special = ?EXCEPTION_BLOCK,
+    TestBlks = [L || {L,_,_,_} <- Tests],
+    Removed = [L || {L,_,_,_,_,_} <- Extracts],
+    TestKeys = [K || {_,_,_,#b_set{args=[_,K]}} <- Tests],
+    ExKeys = [K || {_,K,_,_,_,_} <- Extracts],
+    LastTest = lists:last(TestBlks),
+    %% The two chains must cover exactly the same set of keys, and the keys on
+    %% each side must be distinct so that the test->extraction match is a
+    %% bijection.
+    length(TestKeys) =:= length(ExKeys)
+    andalso lists:sort(TestKeys) =:= lists:sort(ExKeys)
+    andalso lists:usort(TestKeys) =:= lists:sort(TestKeys)
+    andalso lists:usort(ExKeys) =:= lists:sort(ExKeys)
+    %% The exception pseudo block is special and must not take part in the
+    %% rewrite.
+    andalso lists:all(fun(L) -> L =/= Special end,
+                      [LFail, LFail2, LFinal | Removed])
+    %% The removed chain must not contain the labels we keep referring to.
+    andalso not lists:member(LFinal, TestBlks)
+    andalso not lists:member(LFinal, Removed)
+    andalso not lists:member(LFail, TestBlks)
+    andalso not lists:member(LFail, Removed)
+    andalso not lists:member(LFail2, Removed)
+    andalso LFinal =/= LastTest
+    %% Every removed extraction block must have exactly one predecessor (the
+    %% previous block of the chain, or the last test block for the first one).
+    andalso preds(LSucc, Blocks) =:= [LastTest]
+    andalso single_preds(Removed, Blocks)
+    %% The predecessor of LFinal changes (and chain blocks disappear), so phi
+    %% nodes would have to be rewritten; do not fuse in that case.
+    andalso not has_phi(LFinal, Blocks)
+    andalso not has_phi(LFail, Blocks)
+    andalso not has_phi(LFail2, Blocks)
+    andalso lists:all(fun({L,_,_,_,_,_}) -> not has_phi(L, Blocks) end, Extracts)
+    %% Each test result is consumed only by the branch we rewrite.
+    andalso lists:all(fun({_,_,_,#b_set{dst=T}}) ->
+                              use_count(T, Blocks) =:= 1
+                      end, Tests).
+
+%% True when every element of the list (in order) has its predecessor being the
+%% element before it in the list.
+-spec single_preds([beam_ssa:label()], beam_ssa:block_map()) -> boolean().
+single_preds([_A, B | T], Blocks) ->
+    preds(B, Blocks) =:= [_A] andalso single_preds([B|T], Blocks);
+single_preds(_, _Blocks) ->
+    true.
+
+%% Replace each test block by the matching extraction (matched by key) and drop
+%% the original extraction chain.
+-spec rewrite_2([tuple()], [tuple()], beam_ssa:label(), beam_ssa:label(),
+                beam_ssa:block_map()) -> beam_ssa:block_map().
+rewrite_2(Tests, Extracts, LFinal, LFail, Blocks) ->
+    KeyMap = maps:from_list([{K,{Get,Succeeded}} ||
+                                {_L,K,_G,_T,Get,Succeeded} <- Extracts]),
+    LastTest = element(1, lists:last(Tests)),
+    Blocks1 =
+        lists:foldl(fun({L, Prefix, Br, #b_set{args=[_,Key]}}, Acc) ->
+                            {Get0, Succeeded} = maps:get(Key, KeyMap),
+                            %% Drop the type annotations of the moved
+                            %% instruction; the types valid at the extraction
+                            %% site need not be valid at the test site.
+                            Anno = maps:remove(arg_types, Get0#b_set.anno),
+                            Get = Get0#b_set{anno=Anno},
+                            T = Succeeded#b_set.dst,
+                            Succ = case L =:= LastTest of
+                                       true -> LFinal;
+                                       false -> Br#b_br.succ
+                                   end,
+                            Br1 = Br#b_br{bool=T, succ=Succ, fail=LFail},
+                            Blk = #b_blk{is=Prefix ++ [Get, Succeeded], last=Br1},
+                            Acc#{L => Blk}
+                    end, Blocks, Tests),
+    lists:foldl(fun(L, Acc) -> maps:remove(L, Acc) end, Blocks1, extract_labels(Extracts)).
+
+-spec extract_labels([tuple()]) -> [beam_ssa:label()].
+extract_labels(Extracts) -> [L || {L,_,_,_,_,_} <- Extracts].
 
 %% The type of the first argument of the instruction, as recorded by
 %% beam_ssa_type. `false` when unknown.

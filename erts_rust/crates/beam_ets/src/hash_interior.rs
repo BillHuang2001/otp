@@ -1,4 +1,6 @@
-//! Hash-indexed interior for `set`, `bag` and `duplicate_bag`.
+//! Chained-bucket hash interior for `bag` and `duplicate_bag` (and an opt-in
+//! `set` interior, [`crate::SetInterior::Chained`]; `set` defaults to the CHAMP
+//! interior in [`crate::champ_interior`]).
 //!
 //! A bucket array (`Vec` of buckets) indexed by `beam_term::hashing::term_hash`
 //! and searched with `beam_term::compare::eq`; buckets grow (double + rehash)

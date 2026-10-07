@@ -9,10 +9,10 @@
  * process's dynamic symbol table (`build.rs` adds `-Wl,--export-dynamic`).
  *
  * IMPORTANT: this fixture may reference only `enif_*` symbols the crate
- * actually defines (`Some` in the `ErlNifApi` table). In particular it must NOT
- * touch `enif_alloc_env` (deliberately left `None`, see `src/nif/enif/envs.rs`)
- * nor the C-variadic `enif_make_tuple`/`enif_make_list`/… — `dlopen(RTLD_NOW)`
- * fails on any unresolved import.
+ * actually defines (`Some` in the `ErlNifApi` table) — `dlopen(RTLD_NOW)` fails
+ * on any unresolved import — and it must NOT reference the C-variadic
+ * `enif_make_tuple`/`enif_make_list`/… (those bodies exist only in the C shim,
+ * and only when `build.rs` could compile it).
  *
  * What each NIF proves (the Rust side asserts the observable result):
  *
@@ -28,6 +28,8 @@
  *   select_x_ok/0         enif_select_x passes a serviced code through
  *   priv_data/0           enif_priv_data reaches the host's priv_data hook
  *   make_copy/0           enif_make_copy with no copy engine => THE_NON_VALUE (0)
+ *   alloc_env/0           enif_alloc_env reaches the host of the current NIF
+ *                         call: the host's own pointer (or NULL without support)
  */
 
 #include <erl_nif.h>
@@ -149,6 +151,18 @@ static ERL_NIF_TERM make_copy(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
     return enif_make_ulong(env, (unsigned long)copied);
 }
 
+/* enif_alloc_env(void) driven from inside a real NIF call, as an unsigned long
+ * (0 == NULL). The answer is the *host's* env, which this fixture neither
+ * dereferences nor frees — it only reports whether the call reached the hook.
+ * No free is needed: the test hosts below do not hand out a real allocation,
+ * and `enif_alloc_env` itself owns nothing. */
+static ERL_NIF_TERM alloc_env(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    (void)argc;
+    (void)argv;
+    return enif_make_ulong(env, (unsigned long)enif_alloc_env());
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"existing_hit", 0, existing_hit, 0},
     {"existing_miss", 0, existing_miss, 0},
@@ -159,6 +173,7 @@ static ErlNifFunc nif_funcs[] = {
     {"select_x_ok", 0, select_x_ok, 0},
     {"priv_data", 0, priv_data, 0},
     {"make_copy", 0, make_copy, 0},
+    {"alloc_env", 0, alloc_env, 0},
 };
 
 ERL_NIF_INIT(test_nif_env, nif_funcs, nif_load, NULL, NULL, NULL)

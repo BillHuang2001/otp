@@ -436,20 +436,34 @@ fn stop_kills_and_reaps_a_long_lived_child() {
     let mut poller = poller();
     let mut registry = PortRegistry::new();
 
-    let driver = SpawnDriver::new(&shell("sleep 30"), &SpawnOptions::default())
+    let mut driver = SpawnDriver::new(&shell("sleep 30"), &SpawnOptions::default())
         .expect("the shell starts");
     let pid = driver.os_pid().expect("the shell form starts a child");
+    // The driver's own liveness probe reaps a dead child and answers `Some`, so `None` proves
+    // the child is still running (a `sleep 30` cannot have finished).
+    assert_eq!(
+        driver.exited().expect("the liveness probe"),
+        None,
+        "the child is running"
+    );
     let id = registry
         .open(&mut poller, Box::new(driver))
         .expect("the port opens");
 
     // `/proc/<pid>` exists while the process is alive *and* while it is an unreaped zombie,
-    // so its disappearance is evidence of both the kill and the reap.
+    // so its disappearance is evidence of both the kill and the reap. The entry is not always
+    // visible in the instant right after `fork` — a task can miss a `stat` for a moment while
+    // procfs registers it — so wait a bounded moment for the baseline to appear instead of
+    // reading the entry once and calling a transient miss "not running".
     let procfs = Path::new("/proc").exists();
     if procfs {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             Path::new(&format!("/proc/{pid}")).exists(),
-            "the child is running"
+            "the child is visible as a live process"
         );
     }
 

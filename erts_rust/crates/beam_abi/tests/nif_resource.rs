@@ -35,7 +35,6 @@ mod common;
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::rc::Rc;
 
 use beam_abi::nif::enif::enif_api_table;

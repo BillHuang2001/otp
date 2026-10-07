@@ -21,6 +21,9 @@
 //!
 //! * [`registry`] — the `(module, function, arity) → impl` seam ([`BifRegistry`],
 //!   [`BifFn`]) that the engine/`beam_rt` resolves against.
+//! * [`bif_tab`] — the parsed `bif.tab` surface: the real table's grammar, and the
+//!   [`Census`](bif_tab::Census) of registry-vs-declared coverage. Validation only —
+//!   dispatch is unchanged.
 //! * [`context`] — [`BifContext`] and the optional
 //!   `output`/`sender`/`tables`/`fun_caller`/`port` seams.
 //! * [`error`] — the `badarg`/`badarith`/`badarity`/`system_limit` constructors and
@@ -37,6 +40,7 @@
 
 mod access;
 mod arith;
+pub mod bif_tab;
 mod binary;
 mod binconv;
 mod bits;

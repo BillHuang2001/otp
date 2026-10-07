@@ -23,7 +23,13 @@
 //! argv before `init` sees it, so both runtimes are spawned with the same argv **and** the
 //! same environment and the merged switches are observed through the `-eval` probe just
 //! like command-line ones. `ERL_OTP<sysver>_FLAGS` is unpinnable (see the crate CONTEXT
-//! *Known Issues*).
+//! *Known Issues*). `ERL_MAX_PORTS` is the one non-`*FLAGS` variable pinned here: it
+//! requests a port-table size through the same channel as `+Q N`, observed through
+//! `erlang:system_info(port_limit)`.
+//!
+//! The `flags/plus_q_*` cases pin the `+Q N` → `port_limit` sizing (round up to the next
+//! power of two, capped at the hard ceiling), and `flags/erl_max_ports_sets_port_limit`
+//! pins the `ERL_MAX_PORTS` request through the same observable.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -335,6 +341,97 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- `+Q N` → `port_limit`: the emulator's port-table sizing ------------------------
+        // `+Q N` (and `ERL_MAX_PORTS`) request a port-table size; the emulator rounds it up to
+        // the next power of two and caps it at the hard ceiling (`erts_ptab_init_table` /
+        // `erts_ptab_max`), which `erlang:system_info(port_limit)` reports. Every golden below
+        // was taken from the system oracle (OTP 29.1.1 / erts-17.1) with `differential run
+        // <id>`; the no-`+Q` default is pinned separately by `system_info/port_limit`.
+        Case {
+            id: "flags/plus_q_sets_port_limit",
+            description: "the +Q emulator flag changes the observable port_limit to the requested size",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &["+Q", "4096"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 4096"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_q_rounds_a_request_up_to_the_next_power_of_two",
+            description: "a non-power-of-two +Q request (2000) is rounded up to the next power of two (2048)",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &["+Q", "2000"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2048"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_q_just_above_a_power_of_two_doubles_it",
+            description: "a +Q request one over a power of two (1025) rounds to 2048",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &["+Q", "1025"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2048"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_q_3000_rounds_up_to_4096",
+            description: "a +Q request of 3000 rounds up to 4096",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &["+Q", "3000"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 4096"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_q_at_the_hard_ceiling",
+            description: "a +Q request at the hard ceiling (134217727) is reported verbatim",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &["+Q", "134217727"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 134217727"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/erl_max_ports_sets_port_limit",
+            description: "ERL_MAX_PORTS requests a port-table size through the same channel as +Q",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(port_limit)",
+                extra_argv: &[],
+                env: &[("ERL_MAX_PORTS", "3000")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 4096"),
+                exit_code: 0,
+            },
+        },
         Case {
             id: "flags/plus_k_is_not_an_init_argument",
             description: "a +K emulator flag is consumed by the emulator and not recorded by init",
@@ -558,31 +655,73 @@ mod tests {
                 case.id
             );
             // The golden is the valueless `-noshell` occurrence `[]`, the error atom, a
-            // list of per-occurrence value lists, or the (always empty) plain-argument list.
+            // list of per-occurrence value lists, the (always empty) plain-argument list, or
+            // (for a `+`-flag / `ERL_MAX_PORTS` request) an integer `system_info/1` value.
             let golden = case.golden.stdout.expect("every case pins a golden");
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
+            let is_int_value = golden
+                .strip_prefix("ok ")
+                .is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()));
             assert!(
                 golden.starts_with("ok {ok,[")
                     || golden == "ok error"
                     || golden == "ok []"
-                    || golden == "ok 2048"
-                    || golden == "ok 8192"
                     || golden == "ok true"
-                    || golden == "ok unbound",
+                    || golden == "ok unbound"
+                    || is_int_value,
                 "case {}: unexpected golden {golden:?}",
                 case.id
             );
-            // An environment-variable case pins the `ERL_*FLAGS` merge, so it must declare a
-            // non-empty environment drawn from the documented variable set.
+            // An environment-variable case pins either the `ERL_*FLAGS` merge or the
+            // `ERL_MAX_PORTS` port-table request, so it must declare a non-empty environment
+            // drawn from the documented variable set.
             for (name, value) in case.env() {
                 assert!(
-                    matches!(*name, "ERL_AFLAGS" | "ERL_FLAGS" | "ERL_ZFLAGS"),
+                    matches!(
+                        *name,
+                        "ERL_AFLAGS" | "ERL_FLAGS" | "ERL_ZFLAGS" | "ERL_MAX_PORTS"
+                    ),
                     "case {}: unexpected environment variable {name}",
                     case.id
                 );
                 assert!(!value.is_empty(), "case {}: empty {name}", case.id);
             }
         }
+    }
+
+    /// The `+Q N` → `port_limit` sizing matrix and the `ERL_MAX_PORTS` request through the
+    /// same channel: every golden is the system oracle's own answer (OTP 29.1.1 / erts-17.1,
+    /// measured with `erl -noshell +Q <N> -eval
+    /// 'io:format("~p",[erlang:system_info(port_limit)]), halt(0).'`).
+    #[test]
+    fn plus_q_cases_pin_the_oracle_port_table_sizing() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+        for (id, golden) in [
+            ("flags/plus_q_sets_port_limit", "ok 4096"),
+            (
+                "flags/plus_q_rounds_a_request_up_to_the_next_power_of_two",
+                "ok 2048",
+            ),
+            (
+                "flags/plus_q_just_above_a_power_of_two_doubles_it",
+                "ok 2048",
+            ),
+            ("flags/plus_q_3000_rounds_up_to_4096", "ok 4096"),
+            ("flags/plus_q_at_the_hard_ceiling", "ok 134217727"),
+        ] {
+            let case = find(id);
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(
+                case.extra_argv().first(),
+                Some(&"+Q"),
+                "case {id}: the request is a +Q flag"
+            );
+        }
+        // The `ERL_MAX_PORTS` request lands on the same sizing through the environment.
+        let env = find("flags/erl_max_ports_sets_port_limit");
+        assert_eq!(env.env(), &[("ERL_MAX_PORTS", "3000")]);
+        assert_eq!(env.golden.stdout, Some("ok 4096"));
+        assert!(env.extra_argv().is_empty(), "case {}: no argv flag", env.id);
     }
 
     /// The `ERL_*FLAGS` precedence chain is pinned by the environment-variable cases: the
