@@ -43,27 +43,50 @@
 %%     every skippable optimization pass: less optimized, equally correct.
 %%
 %%   {ssa_opt_watchdog, Millis} / ssa_opt_watchdog
-%%     Upper bound on the wall-clock time of a SINGLE skippable pass. The
-%%     pass is run in a monitored child process; when it does not finish in
-%%     time it is killed and treated as if it had not run at all.
+%%     Upper bound on the wall-clock time of a SINGLE pass. The pass is run
+%%     in a monitored child process; when it does not finish in time it is
+%%     killed and the compilation is aborted with
+%%     `error:{ssa_opt_watchdog_timeout,Pass}'. The pass is deliberately not
+%%     skipped; see "Which passes may be skipped" below.
 %%
 %%   ssa_opt_gates
 %%     Enable the eligibility gates and the statistics without setting a
 %%     budget or a watchdog (useful to check that the gates are sound).
 %%
-%% == Equivalence ==
+%% == Which passes may be skipped ==
 %%
-%% Every pass to which the machinery is applied is a pure `State -> State'
-%% function with no observable side effects. Skipping one, either because
-%% its eligibility gate says that it cannot fire or because it ran out of
-%% time, is exactly "the pass did nothing", which the pass framework
-%% already supports as a first-class configuration: `beam_ssa_opt:passes_1/3'
-%% derives a `no_<name>' option for every pass and substitutes the identity
-%% function for a disabled one. The result is therefore less optimized but
-%% equally correct. Passes that change the representation of the SSA
-%% (map <-> linear), its block granularity, or that finalize the type
-%% annotations the code generator relies on, are never skipped by the driver;
-%% see `beam_ssa_opt:skippable/1'.
+%% Skipping an SSA optimization pass is only safe when the *whole* rest of
+%% the optimizer is skipped with it, because later passes and the code
+%% generator rely on shapes that earlier passes produce. Skipping an
+%% arbitrary subset of the passes therefore breaks compilation: with a
+%% standing budget of 0 a bare `get_map_element' reaches
+%% `beam_ssa_codegen:cg_instr/4' (no such clause), and when `ssa_opt_bsm'
+%% runs but `ssa_opt_bs_ensure' does not a `bs_match' that skips all trips
+%% the assertion in `beam_ssa_pre_codegen:bs_restores_is/5'. Both were
+%% observed while compiling e.g. `lib/stdlib/src/string.erl',
+%% `lib/kernel/src/file.erl' and `lib/compiler/test/beam_ssa_SUITE.erl'.
+%%
+%% The machinery is therefore restricted to the one skip discipline that is
+%% sound:
+%%
+%%   * The cumulative budget only ever removes a SUFFIX of the skippable
+%%     passes. The deadline is monotone (it never un-expires), so a pass is
+%%     skipped only if every later skippable pass is skipped as well, which
+%%     is the "optimizer off from here on" configuration the whole-phase
+%%     `no_ssa_opt' option already provides. `beam_ssa_opt:skippable/1'
+%%     lists the passes that are never part of such a suffix because
+%%     skipping them leaves the state inconsistent even then.
+%%
+%%   * The eligibility gates only skip a pass whose own cheap precondition
+%%     proves that it could not have changed anything, which is exactly "the
+%%     pass did nothing".
+%%
+%%   * A watchdog timeout does NOT skip the pass. A timeout can hit any pass
+%%     in the middle of the sequence, which would leave an arbitrary, and
+%%     (because the outcome of the race between the pass and the timer is
+%%     not deterministic) unreproducible subset of the passes unrun; that is
+%%     precisely the unsafe configuration described above. A timed-out pass
+%%     therefore aborts the compilation with a reported error.
 %%
 %% == Process dictionary ==
 %%
@@ -248,11 +271,14 @@ timed_run(Name, Fun, Skippable, State) ->
                     bump(ran, Name),
                     Result;
                 timeout ->
-                    %% The pass did not finish in time. Treat it as if it had
-                    %% not run: the input state is a valid SSA state, so the
-                    %% result is less optimized but equally correct.
+                    %% The pass did not finish in time. Do NOT silently skip
+                    %% it: skipping a pass in the middle of the pass sequence
+                    %% leaves a subset of the optimizations unrun, which
+                    %% breaks the code generator and `beam_ssa_pre_codegen'
+                    %% (see the module comment). Report the offending pass
+                    %% instead.
                     bump(timed_out, Name),
-                    State;
+                    erlang:error({ssa_opt_watchdog_timeout, Name});
                 {raise, Class, Reason, Stack} ->
                     erlang:raise(Class, Reason, Stack)
             end

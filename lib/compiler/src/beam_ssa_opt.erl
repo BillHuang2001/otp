@@ -466,10 +466,36 @@ gate(_) ->
 %% generator and `beam_validator' rely on. Skipping it makes the code
 %% generator rely on stale or missing type information, which produces code
 %% that `beam_validator' rejects.
+%% `ssa_opt_live' is the only pass that removes instructions whose result has
+%% become dead, and the only pass that strength-reduces the "test only"
+%% counterparts of those instructions before code generation. The code
+%% generator recognises a live `get_map_element' only as the first half of a
+%% `get_map_element' + `{succeeded,_}' pair (`beam_ssa_codegen:cg_block/3'),
+%% and it translates a `bs_start_match' of kind `new' into a `bs_start_match4'
+%% with an infallible operand. Other passes - among them `ssa_opt_type_finish',
+%% which folds a `{succeeded,guard}' marker away once the type analysis has
+%% proven the outcome - regularly leave such an instruction behind with a dead
+%% result, and `ssa_opt_live' is what then either drops it or rewrites it to
+%% `has_map_field'/`is_bitstring' (`live_opt_is/3'). Skipping it lets a bare
+%% `get_map_element' or an unmatched `bs_start_match' reach the code generator,
+%% which either crashes (`beam_ssa_codegen:cg_instr/4' has no clause for a
+%% standalone `get_map_element') or emits code that `beam_validator' rejects
+%% (`bs_start_match4' with a non-binary operand).
+%%
+%% `ssa_opt_bs_ensure' is what annotates the binary-matching blocks and inserts
+%% the `bs_ensure' instructions whose unit tests the code generator depends on.
+%% `beam_ssa_pre_codegen:bs_restores_is/5' asserts that a `bs_match' that skips
+%% all (`beam_ssa_bsm' produces those) is either annotated by this pass or does
+%% not exist; without the annotation the assertion fails and compilation
+%% crashes. Skipping it while the other optimization passes run was observed to
+%% break `lib/kernel/src/file.erl', `lib/kernel/src/inet.erl' and
+%% `lib/eunit/src/eunit_tty.erl'.
 skippable(ssa_opt_split_blocks) -> false;
 skippable(ssa_opt_linearize) -> false;
 skippable(ssa_opt_blockify) -> false;
 skippable(ssa_opt_type_finish) -> false;
+skippable(ssa_opt_live) -> false;
+skippable(ssa_opt_bs_ensure) -> false;
 skippable(_) -> true.
 
 %% Builds a function information map with basic information about incoming and

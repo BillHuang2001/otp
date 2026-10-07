@@ -45,7 +45,8 @@
          budget_ample_does_not_change_output/1,
          budget_takes_effect/1,
          watchdog_takes_effect/1,
-         tight_budget_equivalence/1]).
+         tight_budget_equivalence/1,
+         real_module_budget_equivalence/1]).
 
 suite() ->
     [{ct_hooks,[ts_install_cth]}].
@@ -62,7 +63,8 @@ groups() ->
        budget_ample_does_not_change_output,
        budget_takes_effect,
        watchdog_takes_effect,
-       tight_budget_equivalence]}].
+       tight_budget_equivalence,
+       real_module_budget_equivalence]}].
 
 init_per_suite(Config) ->
     Config.
@@ -153,30 +155,76 @@ budget_takes_effect(Config) ->
     check_behaviour(Builds),
     ok.
 
-%% A zero watchdog kills every skippable pass before it can complete; the
-%% pass is then treated as "did nothing". Observable in the statistics, and
-%% behaviour preserving.
+%% A watchdog that is too small for a pass ABORTS the compilation with the
+%% offending pass instead of silently skipping it. Skipping a single pass
+%% leaves an arbitrary subset of the optimizations unrun, which neither the
+%% code generator nor beam_ssa_pre_codegen survives, so a timeout is
+%% reported as an error rather than swallowed. The pass that times out is
+%% not deterministic, but the error is.
 watchdog_takes_effect(Config) ->
-    Sets = [{plain, [binary,no_spawn_compiler_process]},
-            {tight, [binary,no_spawn_compiler_process,{ssa_opt_watchdog,0}]}],
-    Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    Dir = tmp_dir(Config),
+    File = write_probe(Dir, "ssa_opt_budget_rich", rich_probe()),
+    Opts = [binary,return_errors,return_warnings,no_spawn_compiler_process,
+            {ssa_opt_watchdog,0}],
+    Result = compile:file(File, Opts),
+    ?assertMatch({error,_,_}, Result),
+    {error, Errors, _} = Result,
+    ?assertMatch({ssa_opt_watchdog_timeout,_}, crash_reason(Errors)),
     St = stats(),
     ?assert(is_map(St)),
     ?assert(maps:get(timed_out, St) > 0),
-    ?assert(code_of(key(plain, Builds)) =/= code_of(key(tight, Builds))),
-    check_behaviour(Builds),
     ok.
 
-%% Compile the same probe with the default options, with an exhausted
-%% budget and with a zero watchdog, execute all three builds and check that
-%% they agree exactly (including exceptions).
+%% Extract the error reason reported for a compilation pass that crashed.
+crash_reason([{_,D}|_]) when is_list(D) -> crash_reason(D);
+crash_reason([{none,compile,{crash,_,Reason,_}}|_]) -> Reason;
+crash_reason([{none,compile,{crash,_,Reason}}|_]) -> Reason;
+crash_reason(Other) -> Other.
+
+%% Compile the same probe with the default options and with an exhausted
+%% budget, execute both builds and check that they agree exactly (including
+%% exceptions).
 tight_budget_equivalence(Config) ->
     Sets = [{plain, [binary,no_spawn_compiler_process]},
-            {budget, [binary,no_spawn_compiler_process,{ssa_opt_budget,0}]},
-            {watchdog, [binary,no_spawn_compiler_process,{ssa_opt_watchdog,0}]}],
+            {budget, [binary,no_spawn_compiler_process,{ssa_opt_budget,0}]}],
     Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
     check_behaviour(Builds),
     ok.
+
+%% The budget removes a SUFFIX of the skippable optimization passes (see
+%% beam_ssa_opt_budget), so an exhausted budget and a budget expiring in the
+%% middle of the pass sequence are valid configurations. Compile a
+%% real-world-shaped module - this suite's own source, which contains map
+%% guards, binary matching, records, receives and list comprehensions - with
+%% an exhausted budget and with budgets that expire at various points, and
+%% check that the compilation succeeds and that the executable build still
+%% behaves exactly like the default one.
+real_module_budget_equivalence(Config) ->
+    Src = suite_source(),
+    lists:foreach(fun(Opts) ->
+                          ?assertMatch({ok,_,_},
+                                       compile:file(Src, [binary,return_errors|Opts]))
+                  end,
+                  [[{ssa_opt_budget,0}],
+                   [{ssa_opt_budget,1}],
+                   [{ssa_opt_budget,50}],
+                   [{ssa_opt_budget,0},ssa_opt_gates]]),
+    Sets = [{plain, [binary,no_spawn_compiler_process]},
+            {tight, [binary,no_spawn_compiler_process,{ssa_opt_budget,0}]}],
+    Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    check_behaviour(Builds),
+    ok.
+
+%% The path of this suite's source, valid both when running under Common
+%% Test (cwd = this directory) and when the callbacks are driven from a
+%% driver started in the repository root.
+suite_source() ->
+    Candidates = [?FILE, "test/" ++ filename:basename(?FILE),
+                  "lib/compiler/test/" ++ filename:basename(?FILE)],
+    case [F || F <- Candidates, filelib:is_regular(F)] of
+        [F|_] -> F;
+        [] -> ct:fail({no_suite_source, Candidates})
+    end.
 
 %%============================================================================
 %% Checking helpers
