@@ -12,6 +12,7 @@
 //! | `-pa Dir` | add `Dir` to the code path (searched **before** `-pz` directories) |
 //! | `-pz Dir` | add `Dir` to the code path (searched after) |
 //! | `+S N[:N]` | normal scheduler count (the first number) |
+//! | `-smp enable\|disable\|auto` | SMP scheduler model (only `disable` changes behaviour) |
 //! | `+A N` | async-thread pool size, preserved verbatim in `extra_emulator_flags` |
 //! | `+P N` | maximum number of processes |
 //! | `-name N` / `-sname N` | distribution node name |
@@ -88,6 +89,7 @@ Switches:
   -pa DIR                   add DIR to the code path (searched before -pz dirs)
   -pz DIR                   add DIR to the code path (searched after -pa dirs)
   +S N[:N]                  number of normal schedulers
+  -smp enable|disable|auto  SMP scheduler model (only 'disable' changes behaviour)
   +A N                      async-thread pool size (preserved verbatim)
   +P N                      maximum number of processes
   -name N, -sname N         distribution node name
@@ -185,6 +187,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.record(argument, vec![value]);
                 index += 2;
             }
+            "-smp" => index = parse_smp_switch(args, index, &mut builder),
             "+A" => {
                 let value = value_of(args, index, "+A")?;
                 // The async-thread pool is not modelled by the runtime core; it is
@@ -362,6 +365,50 @@ fn parse_schedulers(value: &str) -> Result<u32> {
         return Err(error::bad_switch_value("+S", value));
     }
     Ok(normal)
+}
+
+/// Parses the `-smp` switch, returning the index of the next switch.
+///
+/// `-smp` selects the runtime's scheduler model: `disable` turns SMP off
+/// ([`FeatureFlags::smp`](beam_common::FeatureFlags::smp) becomes `false`), while
+/// `enable`/`auto` leave it on (the default). The value is **optional** and any other
+/// value is accepted and recorded but changes nothing — this matches the oracle, which
+/// accepts `-smp` (with or without a value) and ignores every value but `disable`
+/// (`erl -noshell -smp bogus -eval 'halt().'` exits 0). The one documented divergence is
+/// `-smp disable`: real `erl` rejects it outright (`Argument '-smp disable' not supported.
+/// Use "+S 1" instead.`) whereas this runtime accepts it as the honest "SMP off" request.
+///
+/// The switch is recorded as an init argument exactly like every other switch, so a
+/// program can still observe its own command line (`init:get_argument(smp)`).
+fn parse_smp_switch(args: &[String], index: usize, builder: &mut Builder) -> usize {
+    let value = match args.get(index + 1) {
+        Some(candidate) if !is_switch(candidate) => Some(candidate.clone()),
+        _ => None,
+    };
+    let has_value = value.is_some();
+    if let Some(value) = &value {
+        if let Some(enabled) = parse_smp(value) {
+            builder.emulator.features = builder.emulator.features.with_smp(enabled);
+        }
+    }
+    builder.record("-smp", value.into_iter().collect());
+    if has_value {
+        index + 2
+    } else {
+        index + 1
+    }
+}
+
+/// The [`FeatureFlags::smp`](beam_common::FeatureFlags::smp) an `-smp` *value* selects, or
+/// `None` for a value that is not one of the three documented ones (which changes nothing).
+///
+/// `enable` and `auto` both mean "SMP on" (the default); `disable` means "SMP off".
+fn parse_smp(value: &str) -> Option<bool> {
+    match value {
+        "enable" | "auto" => Some(true),
+        "disable" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parses `run File Mod:Func/Arity [Arg…]`, returning the index past the last argument.
@@ -820,6 +867,36 @@ mod tests {
         assert!(parse_args(&["+P", "-1"]).is_err());
         assert!(parse_args(&["+A", "many"]).is_err());
         assert!(parse_args(&["+S"]).is_err());
+    }
+
+    #[test]
+    fn smp_switch_selects_the_scheduler_model() {
+        // `disable` turns SMP off; it is still recorded as an init argument.
+        let config = parsed(&["-smp", "disable"]);
+        assert!(!config.emulator.features.smp, "disable turns SMP off");
+        assert_eq!(
+            config.init_args.get("smp"),
+            Some(vec![&["disable".to_string()][..]])
+        );
+        // `enable`/`auto` are the default (SMP on).
+        assert!(parsed(&["-smp", "enable"]).emulator.features.smp);
+        assert!(parsed(&["-smp", "auto"]).emulator.features.smp);
+        // A value the runtime does not model is accepted and recorded but changes nothing
+        // (the oracle's leniency: `erl -noshell -smp bogus -eval 'halt().'` exits 0).
+        let config = parsed(&["-smp", "bogus"]);
+        assert!(config.emulator.features.smp, "an unknown value is a no-op");
+        assert_eq!(
+            config.init_args.get("smp"),
+            Some(vec![&["bogus".to_string()][..]])
+        );
+        // A valueless `-smp` is accepted too (recorded with no values).
+        let config = parsed(&["-smp"]);
+        assert!(config.emulator.features.smp);
+        assert_eq!(config.init_args.get("smp"), Some(vec![&[][..]]));
+        // `-smp` consumes only its value: the following switch still parses.
+        let config = parsed(&["-smp", "disable", "+S", "2"]);
+        assert!(!config.emulator.features.smp);
+        assert_eq!(config.emulator.schedulers, Some(2));
     }
 
     #[test]

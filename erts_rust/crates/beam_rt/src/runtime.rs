@@ -1605,6 +1605,76 @@ mod tests {
         assert_eq!(rt.find_module_file("slice"), Some(PathBuf::from(SLICE_BEAM)));
     }
 
+    // -- scheduler count & multi-process progress -----------------------------
+
+    /// `+S N` is the effective scheduler count the runtime **reports** through
+    /// `system_info(schedulers)` — the whole chain from the A.6 command line to the A.8
+    /// observable, pinned at the runtime boundary. (`-smp enable|disable|auto` is parsed and
+    /// stored by the A.6 parser; the reported count is the `+S`/online-processor figure.)
+    #[test]
+    fn a_configured_scheduler_count_is_observable_through_system_info() {
+        let config = crate::cli::parse(&["+S".to_string(), "3".to_string()]).expect("+S 3 parses");
+        let rt = Runtime::new(config).expect("a runtime with +S 3");
+        assert_eq!(
+            rt.system_info_value("schedulers").expect("schedulers"),
+            InfoValue::Int(3)
+        );
+    }
+
+    /// Iterative Fibonacci; the oracle value of `slice:fib/1`.
+    fn fib(n: i64) -> i64 {
+        let (mut a, mut b) = (0i64, 1i64);
+        for _ in 0..n {
+            (a, b) = (b, a + b);
+        }
+        a
+    }
+
+    /// **N** spawned processes each make progress to completion under a **bounded
+    /// round-robin**: every `run_one_slice` step runs exactly one process once, so the number
+    /// of completed processes rises by one per step until the run queue drains.
+    ///
+    /// This is the behavioural guarantee an SMP `SchedulerPool` adoption must preserve (the
+    /// Milestone-1 runtime drives a single-threaded scheduler, so several runnable processes
+    /// are interleaved slice-by-slice and none is starved). The multi-pass counterpart — a
+    /// receiver blocked in `receive` woken by a **timer** rather than the run queue — is
+    /// pinned by [`a_timer_wakes_a_receiver_that_blocked_before_it_fired`].
+    #[test]
+    fn every_spawned_process_makes_progress_to_completion_round_robin() {
+        const N: i64 = 6;
+        let mut rt = runtime();
+        rt.load_module(SLICE_BEAM).expect("load slice.beam");
+
+        let pids: Vec<ProcessId> = (1..=N)
+            .map(|n| {
+                rt.spawn_process("slice", "fib", vec![make_small(n)])
+                    .expect("slice:fib/1 is exported")
+            })
+            .collect();
+        assert_eq!(rt.run_queue_len(), N as usize, "every spawn enqueued one process");
+
+        let completed =
+            |rt: &Runtime| pids.iter().filter(|pid| rt.process_result(**pid).is_some()).count();
+        assert_eq!(completed(&rt), 0, "nothing has run yet");
+
+        for step in 1..=N as usize {
+            let ran = rt.run_one_slice().expect("a bounded step");
+            assert_eq!(ran, 1, "step {step} runs exactly one process");
+            assert_eq!(completed(&rt), step, "one more process completed per step");
+        }
+
+        for (pid, n) in pids.iter().zip(1..=N) {
+            assert_eq!(
+                signed_value(rt.process_result(*pid).expect("the process returned")),
+                fib(n),
+                "every process produced its own result"
+            );
+            assert!(rt.processes().get(*pid).is_none(), "it terminated normally");
+        }
+        assert_eq!(rt.run_queue_len(), 0, "the run queue drained");
+        assert_eq!(rt.run_one_slice().expect("nothing left to run"), 0);
+    }
+
     // -- erlang:send_after/3 on the scheduler path ----------------------------
 
     /// The committed receive fixture (`../beam_engine/tests/fixtures/recv.beam`), reused by
