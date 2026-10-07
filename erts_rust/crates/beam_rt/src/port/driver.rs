@@ -1218,6 +1218,56 @@ mod tests {
         );
     }
 
+    /// The four port-less `DriverHost` registry slots answer the C's own return codes, pinned
+    /// directly against `io.c`'s `add_driver_entry` (`:7640`), `remove_driver_entry` (`:7698`),
+    /// `driver_lock_driver` (`:7324`) and `driver_create_port` (`:787`).
+    ///
+    /// Oracle ground truth (OTP 29 / `erts-17.1`): a C fixture that calls all four hooks from a live
+    /// `{spawn_driver, …}` port prints `0,1,0,-1` (see
+    /// `tests/driver.rs::driver_lock_driver_and_the_entry_registry_agree_with_the_oracle`):
+    /// `driver_lock_driver` answers `0` (the port's driver was `dlopen`ed), `add` then `remove` of a
+    /// helper entry is `1` (recorded, then removed), a second `remove` is `0` (no such entry) and a
+    /// `remove` of the port's **own** dynamically loaded entry is `-1` (`io.c:7709-7713`,
+    /// "Not allowed for dynamic drivers").
+    #[test]
+    fn the_registry_hooks_answer_the_c_codes() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+
+        // A bare host no port lifecycle claimed = the C's statically linked driver:
+        // `driver_lock_driver` reads `prt->drv_ptr->handle == NULL` and answers `-1` (`io.c:7337`).
+        assert_eq!(host.lock_driver(std::ptr::null_mut()), -1);
+
+        // Two distinct entries, compared by address alone (the C's `dp->entry == drv`).
+        let mut a = ErlDrvEntry::default();
+        let mut b = ErlDrvEntry::default();
+
+        // `add_driver_entry` records a statically linked entry: the C's `0`.
+        assert_eq!(host.add_driver_entry(&mut a), 0);
+        // ...and `remove_driver_entry` finds and removes it: the C's `1`.
+        assert_eq!(host.remove_driver_entry(&mut a), 1);
+        // A second removal finds nothing: the C's `0` ("no such entry").
+        assert_eq!(host.remove_driver_entry(&mut a), 0);
+
+        // A null entry is refused (`1`), never a read of `de->driver_name` the C would fault on.
+        assert_eq!(host.add_driver_entry(std::ptr::null_mut()), 1);
+
+        // An entry that was never added is `0` — never a fabricated removal.
+        assert_eq!(host.remove_driver_entry(&mut b), 0);
+
+        // `driver_create_port` has no live port registry reachable here: the C's single failure
+        // sentinel (`erl_port.h:67`).
+        assert_eq!(
+            host.create_port(
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            ERTS_INVALID_ERL_DRV_PORT
+        );
+    }
+
     #[test]
     fn load_driver_reports_the_last_candidates_error() {
         let error = load_driver(&["/nonexistent/beam-rt-driver-test".to_string()], "t")
