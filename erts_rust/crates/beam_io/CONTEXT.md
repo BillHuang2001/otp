@@ -665,6 +665,10 @@ that a built-in (`"fd"`) and a loaded (`.so`) driver are both a `Box<dyn Driver>
 - `src/drivers/spawn.rs` → `SpawnDriver` (the OS-child `spawn` driver, incl. the errno-atom failed-spawn raise and the duplex `{fd, N}` form), `SpawnSpec`/`SpawnOptions`/`SpawnStream` + `build_command` (the term-free `open_port/2` name/options model the runtime decodes into)
 - `src/drivers/inet/mod.rs` + `src/drivers/inet/wire.rs` → `TcpInetDriver`/`make_tcp_inet`/`DRIVER_NAME` (`"tcp_inet"`), `InetState` (the driver state machine + socket syscalls) and the `INET_*`/`TCP_SHUT_*`/`INET_REP_*` codes + packed-address helpers + `errno_name` (the wire vocabulary)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
+- `src/abi/mod.rs` → the driver C-ABI host-layer module docs + wiring (`pub mod host/job/port` + re-exports)
+- `src/abi/host.rs` → `PortHost` (the runtime atom-interning/pid/term-sink hook) + `LocalAtomPortHost` (test host) + `DriverState`/`SelectedFd` (persistent `driver_select`/timer/async state) + `AbiHost` (the `beam_abi::driver::host::DriverHost` impl over the poller/queues/timer)
+- `src/abi/job.rs` → `AsyncJobs` (the `driver_async` worker/bookkeeping) + `AsyncCompletion`/`AsyncData`
+- `src/abi/port.rs` → `DriverPort` (a loaded `ErlDrvEntry` as a `Driver`) + `DriverPort::load`/`poll_async` + `make_loaded` (built-in/`.so` unification) + `driver_flags`/`is_start_failure`/`load_failure`
 - `src/error.rs` → `pub(crate)` error constructors + the errno→BEAM-atom mapping (`errno_atom`) and `spawn_failure` (no new error type)
 - `tests/poller.rs` → registration + readiness on a real OS pipe/socketpair + timeout/waker
 - `tests/port.rs` → `open`→`output`→`poll`→`handle_events`→`read_input` byte round-trip
