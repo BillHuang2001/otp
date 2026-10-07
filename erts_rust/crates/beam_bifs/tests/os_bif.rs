@@ -49,8 +49,37 @@ fn call(
 }
 
 /// The small-integer value of `term`.
+///
+/// Only a valid **small** integer; the clock BIFs return epoch-nanosecond counts
+/// as heap bignums, for which this yields garbage — use [`as_big_int`] there.
 fn as_int(term: Eterm) -> i64 {
     signed_value(term)
+}
+
+/// The value of `term` as an `i128`, small integer **or** heap bignum (the clock
+/// BIFs return epoch-nanosecond readings past the 60-bit small range).
+fn as_big_int(term: Eterm) -> i128 {
+    match beam_codec::term::big_parts(term) {
+        Ok((negative, digits)) => {
+            let mut magnitude: u128 = 0;
+            for (i, limb) in digits.iter().enumerate() {
+                // The readings below are far under `i128`; a limb past its range
+                // saturates rather than shifting out of the type.
+                let shift = 64 * i as u32;
+                if shift >= 128 {
+                    break;
+                }
+                magnitude = magnitude.wrapping_add(u128::from(*limb) << shift);
+            }
+            let value = i128::try_from(magnitude).unwrap_or(i128::MAX);
+            if negative {
+                -value
+            } else {
+                value
+            }
+        }
+        Err(_) => i128::from(signed_value(term)),
+    }
 }
 
 /// The name of an atom term, as the shared atom table spells it.
@@ -112,13 +141,15 @@ fn is_nil_term(reg: &BifRegistry, ctx: &mut BifContext<'_>, term: Eterm) -> bool
     as_int(call(reg, ctx, "erlang", "length", 1, &[term]).expect("length")) == 0
 }
 
-/// `expected`/`got` string comparison over a char list (each element a byte).
+/// `expected`/`got` comparison over a char list whose elements are Unicode
+/// **code points** (`erts_convert_native_to_filename`'s shape): each element is
+/// re-encoded to UTF-8, so `[0xE5, 0xE4, 0xF6]` matches `"åäö"`.
 fn assert_string(reg: &BifRegistry, ctx: &mut BifContext<'_>, term: Eterm, expected: &str) {
-    let bytes: Vec<u8> = list_elements(reg, ctx, term)
+    let text: String = list_elements(reg, ctx, term)
         .into_iter()
-        .map(|e| as_int(e) as u8)
+        .map(|e| char::from_u32(as_int(e) as u32).expect("a code point"))
         .collect();
-    assert_eq!(String::from_utf8_lossy(&bytes), expected);
+    assert_eq!(text, expected);
 }
 
 /// Runs one `-eval` statement under the system `erl`; `None` when the oracle is
@@ -225,7 +256,14 @@ fn env_and_getenv_reject_badarg_shapes() {
     //         code point => badarg; `=` inside a key => badarg;
     //         `os:unsetenv(5)` => badarg.
     let reg = default_registry();
-    let mut heap = heap();
+    // `os:env/0` below renders the WHOLE ambient environment as char lists, which
+    // is far past the small default test heap, so size it from the live
+    // environment (the `src/os_bif.rs` unit test uses the same formula).
+    let (env_bytes, env_entries) =
+        std::env::vars_os().fold((0usize, 0usize), |(bytes, entries), (k, v)| {
+            (bytes + k.len() + v.len(), entries + 1)
+        });
+    let mut heap = Heap::new(2 * env_bytes + 8 * env_entries + 4096).expect("test heap");
     let atoms = seeded_atoms();
     let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
 
@@ -315,33 +353,52 @@ fn system_time_units_follow_the_oracle_set() {
     let thousand = ctx.int(1000).expect("fits");
     let million = ctx.int(1_000_000).expect("fits");
 
-    let lo = as_int(call(&reg, &mut ctx, "os", "system_time", 1, &[ns_atom]).expect("ns"));
-    for unit in [ns_atom, native_atom, perf_atom] {
-        let v = as_int(call(&reg, &mut ctx, "os", "system_time", 1, &[unit]).expect("unit"));
-        assert!(lo <= v, "a nanosecond-unit reading must be >= the earlier one");
-    }
+    // Epoch-nanosecond readings are heap bignums, so they must be read with
+    // `as_big_int` (the small-int `as_int` would yield garbage).
+    //
+    // Each `system_time/1` call re-reads the wall clock, so the coarser unit
+    // cannot be compared to a fixed earlier reading within ±1: instead bracket
+    // every reading between a nanosecond reading taken *before* and one taken
+    // *after*, and require `lo / ratio <= v <= hi / ratio` (`ratio` = ns/unit;
+    // the BIF truncates, and integer division is monotone, so this bound is
+    // exact, not slack).
+    let lo = as_big_int(call(&reg, &mut ctx, "os", "system_time", 1, &[ns_atom]).expect("ns"));
+    let mut readings: Vec<(i128, i128)> = Vec::new();
     for (unit, ratio) in [
+        (ns_atom, 1),
+        (native_atom, 1),
+        (perf_atom, 1),
         (sec_atom, 1_000_000_000),
         (secs_atom, 1_000_000_000),
         (ms_atom, 1_000_000),
         (mss_atom, 1_000_000),
         (us_atom, 1_000),
     ] {
-        let v = as_int(call(&reg, &mut ctx, "os", "system_time", 1, &[unit]).expect("unit"));
-        assert!(
-            (lo / ratio).abs_diff(v) <= 1,
-            "system_time(unit) = {v} does not track {lo} / {ratio}"
-        );
+        let v = as_big_int(call(&reg, &mut ctx, "os", "system_time", 1, &[unit]).expect("unit"));
+        readings.push((ratio, v));
     }
     // The integer forms: `1000` is milliseconds, `1000000` microseconds.
-    let ms_int = as_int(call(&reg, &mut ctx, "os", "system_time", 1, &[thousand]).expect("1000"));
-    let us_int = as_int(call(&reg, &mut ctx, "os", "system_time", 1, &[million]).expect("1e6"));
-    assert!(ms_int.abs_diff(lo / 1_000_000) <= 1);
-    assert!(us_int.abs_diff(lo / 1_000) <= 1);
+    let ms_int =
+        as_big_int(call(&reg, &mut ctx, "os", "system_time", 1, &[thousand]).expect("1000"));
+    let us_int =
+        as_big_int(call(&reg, &mut ctx, "os", "system_time", 1, &[million]).expect("1e6"));
+    let hi = as_big_int(call(&reg, &mut ctx, "os", "system_time", 1, &[ns_atom]).expect("ns"));
+
+    for (ratio, v) in readings {
+        assert!(
+            lo / ratio <= v && v <= hi / ratio,
+            "system_time(ratio {ratio}) = {v} is outside [{}, {}]",
+            lo / ratio,
+            hi / ratio
+        );
+    }
+    assert!(lo / 1_000_000 <= ms_int && ms_int <= hi / 1_000_000);
+    assert!(lo / 1_000 <= us_int && us_int <= hi / 1_000);
+
     // The /0 form is the native (nanosecond) reading, past the small range.
     let zero = call(&reg, &mut ctx, "os", "system_time", 0, &[]).expect("system_time/0");
     assert!(
-        beam_codec::term::big_parts(zero).is_some(),
+        beam_codec::term::big_parts(zero).is_ok(),
         "an epoch-nanosecond count is a bignum"
     );
 
@@ -543,7 +600,7 @@ fn live_oracle_agrees_on_name_conversion_and_units() {
     };
     assert_eq!(
         output.trim(),
-        "<<97,98,99,0>|\"abc\"|{error,warning}|true|true",
+        "<<97,98,99,0>>|\"abc\"|{error,warning}|false|true",
         "the live oracle disagrees with the pinned goldens"
     );
 }
