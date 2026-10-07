@@ -428,8 +428,8 @@ fn flat_size_reports_a_typed_gap_for_divergent_representations() {
 fn term_type_names_every_representation() {
     with_ctx(|reg, ctx| {
         let a = ctx.atom("a").expect("seeded");
-        let module = ctx.atom("erlang").expect("seeded");
-        let function = ctx.atom("map").expect("seeded");
+        let module = ctx.atoms().lookup("erlang").expect("seeded");
+        let function = ctx.atoms().lookup("map").expect("seeded");
         let creator = beam_codec::term::FunPid {
             node: module,
             number: 1,
@@ -610,7 +610,7 @@ fn map_next_folds_a_flat_map_in_list_mode() {
         // `(0, #{}, [])` is the empty accumulator.
         let empty = beam_codec::term::make_flatmap(ctx.heap(), &[]).expect("fits");
         let got = call(reg, ctx, "erts_internal", "map_next", 3, &[make_small(0), empty, NIL]);
-        assert_eq!(got, NIL, "(0, #{}, [])");
+        assert_eq!(got, NIL, "(0, #{{}}, [])");
     });
 }
 
@@ -629,9 +629,8 @@ fn map_next_folds_a_flat_map_in_iterator_mode() {
 
         // `(0, M, iterator)` / `(1, M, iterator)` fold every pair into
         // `{K0, V0, {K1, V1, …, none}}`.
-        let expected = ctx
-            .tuple(&[a, make_small(1), ctx.tuple(&[b, make_small(2), none]).expect("fits")])
-            .expect("fits");
+        let tail = ctx.tuple(&[b, make_small(2), none]).expect("fits");
+        let expected = ctx.tuple(&[a, make_small(1), tail]).expect("fits");
         for what in ["(0, M, iterator)", "(1, M, iterator)"] {
             let path = if what.starts_with("(0") { make_small(0) } else { make_small(1) };
             let got = call(reg, ctx, "erts_internal", "map_next", 3, &[path, map, iterator]);
@@ -641,7 +640,7 @@ fn map_next_folds_a_flat_map_in_iterator_mode() {
         // `(0, #{}, iterator)` is `none`.
         let empty = beam_codec::term::make_flatmap(ctx.heap(), &[]).expect("fits");
         let got = call(reg, ctx, "erts_internal", "map_next", 3, &[make_small(0), empty, iterator]);
-        assert_eq!(got, none, "(0, #{}, iterator)");
+        assert_eq!(got, none, "(0, #{{}}, iterator)");
 
         let _ = (p1, p2);
     });
@@ -664,12 +663,10 @@ fn map_next_walks_the_key_list_of_an_ordered_iterator() {
         let zz = ctx.atom("zz").expect("seeded");
         let just_zz = ctx.list(&[zz]).expect("fits");
 
-        let expect_ab = ctx
-            .tuple(&[a, make_small(1), ctx.tuple(&[b, make_small(2), none]).expect("fits")])
-            .expect("fits");
-        let expect_ba = ctx
-            .tuple(&[b, make_small(2), ctx.tuple(&[a, make_small(1), none]).expect("fits")])
-            .expect("fits");
+        let ab_tail = ctx.tuple(&[b, make_small(2), none]).expect("fits");
+        let expect_ab = ctx.tuple(&[a, make_small(1), ab_tail]).expect("fits");
+        let ba_tail = ctx.tuple(&[a, make_small(1), none]).expect("fits");
+        let expect_ba = ctx.tuple(&[b, make_small(2), ba_tail]).expect("fits");
         let expect_a = ctx
             .tuple(&[a, make_small(1), none])
             .expect("fits");
@@ -691,7 +688,7 @@ fn map_next_walks_the_key_list_of_an_ordered_iterator() {
         assert_eq!(got, none, "([], M, iterator)");
         let empty = beam_codec::term::make_flatmap(ctx.heap(), &[]).expect("fits");
         let got = call(reg, ctx, "erts_internal", "map_next", 3, &[NIL, empty, iterator]);
-        assert_eq!(got, none, "([], #{}, iterator)");
+        assert_eq!(got, none, "([], #{{}}, iterator)");
 
         // A path key the map does not hold is `badarg`.
         assert_badarg(
@@ -802,7 +799,7 @@ fn binary_to_integer_parses_and_returns_its_failure_atoms() {
             let arg = binary(ctx, input.as_bytes());
             let base = if base == 10 { ten } else { sixteen };
             let got = call(reg, ctx, "erts_internal", "binary_to_integer", 2, &[arg, base]);
-            assert_eq!(got, make_small(expected), "binary_to_integer({input}, {base})");
+            assert_eq!(got, make_small(expected), "binary_to_integer({input}, {base:?})");
         }
 
         // The failure *atoms* (`binary_to_integer/2` never raises).
