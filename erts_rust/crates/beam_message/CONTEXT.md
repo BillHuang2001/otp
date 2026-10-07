@@ -178,8 +178,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   interiors that are not externally pinned are read through the owning `beam_term` accessors (e.g. the
   HAMT node shapes via `map_header_type`/`map_header_val`/`header_arity`), never re-derived.
 - **`copy_struct_shared` reuses `copy.rs`'s `shallow` primitive** — the copy logic exists once.
-- **Deps (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `beam_alloc`, `beam_codec`, `beam_gc`,
-  `libc` (the `beam_gc` edge is described under Design Decisions). No new external dependencies.
+- **Deps (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `beam_alloc`, `beam_gc` (the `beam_gc`
+  edge is described under Design Decisions). `beam_codec` and `libc` are also declared there but are
+  **unused** — no `beam_codec`/`libc` reference exists in `src/` or `tests/`. No new external dependencies.
 - Files target ~1000 lines; one responsibility per file. Licensing Apache-2.0.
 ## Design Decisions
 - **Fidelity scope: a correct, iterative *tree* copy, not the C's single-allocation `htop`/`hbot` layout.**
@@ -353,6 +354,18 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   today nothing sweeps them, the `Message`'s own `Drop` releases them. A **fragmented** message instead
   leaves those lists empty: its payload's off-heap objects live in the fragment's `off_heap` table until
   `Fragments::move_into` hands them to the destination table.
+- **Fun blocks are mis-sized/mis-walked: the copier uses the C `ERL_FUN_SIZE` prefix, not the frozen
+  `beam_term::fun` inlined-descriptor layout.** `layout.rs` treats a fun as `[header][2 words][env]` —
+  `object_words` is `ERL_FUN_SIZE + num_free` (line 45) and `for_each_child_slot` visits env slots
+  `ERL_FUN_SIZE..ERL_FUN_SIZE + num_free` (lines 89-93) — i.e. the legacy C `ErlFunThing`
+  (`thing_word` + one `entry` pointer). The frozen layout `beam_term::fun` (and its consumer
+  `beam_gc::copy::{move_size,scan_step}`) instead places the env at `1 + desc_words(kind)` (3 for a
+  `Local`/`External` fun, 11 for an `Imported` one) with block `1 + desc_words(kind) + num_free`.
+  Consequence: `copy_struct` under-sizes a copied fun by `desc_words(kind) - 1` words and visits the
+  wrong slots (for `num_free == 1` it reads the descriptor's 2nd word as a term and never fixes up the
+  real env word, leaving the copied env pointing at the source heap). No test copies a fun, so this is
+  latent; fix by routing funs through `beam_term::fun::{fun_env_offset_header, fun_block_words_header}`.
+  (The `layout.rs` unit tests currently pin the wrong `ERL_FUN_SIZE` geometry.)
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + `size_of_copy`
