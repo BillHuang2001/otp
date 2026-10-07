@@ -129,6 +129,22 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   (`unsupported: …`) yields a note and **no** timing (never a fabricated number). Because a `beam_rt`
   process resolves the system code path by spawning `erl` once when a case first needs a system module,
   the wrapper cases each pay one `erl` startup; the pure-fixture cases do not.
+- `foreign`: **the workload that measures the Rust runtime on real foreign target-project code.**
+  Every repo-backed workload is `SysOnly` (the Rust runtime cannot boot an OTP release, run `rebar3`,
+  or act as `erlc`/`elixirc`), so `foreign` instead picks **pure, self-contained modules from the
+  Cowboy and EMQX checkouts** (`cowboy/src/cowboy_bstr.erl`, `apps/emqx/src/emqx_base62.erl`), copies
+  the `.erl` sources into a `ScratchDir`, compiles them **once** with the system `erlc` together with
+  an embedded driver (`bench_foreign_driver`), and runs the identical `.beam` under **whatever runtime
+  it is scheduled on** — under `--runtime all` that is a genuine side-by-side of the *same* compiled
+  code. Sources are read-only; all `.beam` output lives in the self-cleaning scratch dir.
+  Measurement is **startup-corrected per call**: each case declares a per-runtime loop count `N`
+  (calibrated so a run costs a few hundred ms on Rust and gives an oracle marginal well above the
+  ~±30 ms startup noise) and the program is run twice per sample — at `N` and at `0` iterations — giving
+  `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, and the throughput
+  metric `case_<name>_ns_per_call = (mean(wall@N) − mean(wall@0)) / N × 1e6`, emitted only when positive
+  (else an honest note). Every runtime's stdout must equal `N × per_call` (the driver's accumulator is
+  linear in `N`), recorded in an `observed stdout:` note; a Rust exit `3` records the capability gap and
+  emits **no** timing. All four cases run under both runtimes today.
 
 ### Result JSON schema (stable — `SCHEMA_VERSION = 1`)
 Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in **milliseconds** (f64).
