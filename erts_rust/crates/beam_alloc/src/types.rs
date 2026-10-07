@@ -237,10 +237,12 @@ impl TypeFlags {
 
     /// Every bit defined by this type (the mask used by
     /// [`TypeFlags::from_bits_truncate`]).
-    pub const ALL_BITS: u32 =
-        Self::MSEG_BIT | Self::SUPER_ALIGNED_BIT | Self::FIXED_SIZE_BIT | Self::HEAP_BIT
-            | Self::SBC_BIT
-            | Self::MBC_BIT;
+    pub const ALL_BITS: u32 = Self::MSEG_BIT
+        | Self::SUPER_ALIGNED_BIT
+        | Self::FIXED_SIZE_BIT
+        | Self::HEAP_BIT
+        | Self::SBC_BIT
+        | Self::MBC_BIT;
 
     /// Carriers of this type's allocator are obtained from the memory-segment
     /// (`mseg`) allocator (`Allctr_t::mseg_alloc`).
@@ -662,7 +664,7 @@ impl TypeId {
 
     /// The table row for this type.
     pub fn entry(self) -> &'static TypeEntry {
-        // SAFETY of the index: `TypeId` is only ever constructed by
+        // The index is in range by construction: `TypeId` is only ever made by
         // `from_index`/`from_name`, both of which bounds-check. This is a plain
         // slice index, not `unsafe` — it panics rather than reading out of
         // bounds, and the invariant makes that unreachable.
@@ -726,6 +728,12 @@ pub fn types_for_allocator(allocator: AllocatorId) -> impl Iterator<Item = TypeI
 mod tests {
     use super::*;
 
+    /// A `type`/description name as `erl_alloc.types` allows it: word
+    /// characters only (the generator's own `\w+` pattern).
+    fn is_word_like(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
     #[test]
     fn table_has_exactly_the_active_source_declarations() {
         assert_eq!(TYPE_COUNT, 243);
@@ -734,36 +742,28 @@ mod tests {
     }
 
     #[test]
-    fn names_are_unique_and_non_empty() {
-        let mut seen = std::collections::HashSet::new();
+    fn names_and_descriptions_are_unique_and_word_like() {
+        let mut names = std::collections::HashSet::new();
+        let mut descriptions = std::collections::HashSet::new();
         for entry in ALLOC_TYPES {
-            assert!(!entry.name.is_empty(), "empty type name");
+            assert!(is_word_like(entry.name), "odd type name {:?}", entry.name);
             assert!(
-                entry.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                "type name {:?} is not word-like",
+                names.insert(entry.name),
+                "duplicate type name {:?}",
                 entry.name
             );
-            assert!(seen.insert(entry.name), "duplicate type name {:?}", entry.name);
-        }
-        assert_eq!(seen.len(), TYPE_COUNT);
-
-        let mut descr = std::collections::HashSet::new();
-        for entry in ALLOC_TYPES {
-            assert!(!entry.description.is_empty(), "empty description");
             assert!(
-                entry
-                    .description
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                "description {:?} is not word-like",
+                is_word_like(entry.description),
+                "odd description {:?}",
                 entry.description
             );
             assert!(
-                descr.insert(entry.description),
+                descriptions.insert(entry.description),
                 "duplicate description {:?}",
                 entry.description
             );
         }
+        assert_eq!(names.len(), TYPE_COUNT);
     }
 
     #[test]
@@ -867,10 +867,7 @@ mod tests {
 
         // The last active row is the `TEST` type.
         assert_eq!(ALLOC_TYPES[TYPE_COUNT - 1].name, "TEST");
-        assert_eq!(
-            type_by_name("TEST").unwrap().allocator(),
-            AllocatorId::Test
-        );
+        assert_eq!(type_by_name("TEST").unwrap().allocator(), AllocatorId::Test);
     }
 
     #[test]
@@ -928,12 +925,13 @@ mod tests {
         }
         assert_eq!(total, TYPE_COUNT);
 
-        // A couple of concrete counts straight from the source file.
+        // A few concrete counts straight from the source file.
         assert_eq!(types_for_allocator(AllocatorId::FixedSize).count(), 15);
         assert_eq!(types_for_allocator(AllocatorId::System).count(), 4);
         assert_eq!(types_for_allocator(AllocatorId::EHeap).count(), 5);
         assert_eq!(types_for_allocator(AllocatorId::ShortLived).count(), 73);
         assert_eq!(types_for_allocator(AllocatorId::Literal).count(), 1);
+        assert_eq!(types_for_allocator(AllocatorId::Test).count(), 1);
     }
 
     #[test]
