@@ -8,8 +8,7 @@
 //!   `$FAIL($Fail)` / `$FAIL_HEAD_OR_BODY($Fail)` must produce
 //!   `Step::Goto { func, pc }` for the resolved `fail` label), and
 //! * the [`NO_FAIL`] **capability gap** (a typed `unsupported("<instr>/no_fail")`,
-//!   never a fall-through with a wrong result).
-//!
+//!   never a fall-through with a wrong result).//!
 //! The fixtures are real native records built through [`beam_term::write_record`]
 //! (reached via the family's [`raw`](super::raw) forwarder) into the
 //! [`MinimalContext`] arena, so the tests exercise the frozen layout without ever
@@ -25,8 +24,8 @@
 //!
 //! * [`native`] — `is_native_record` (the definition-identity test),
 //! * [`elements`] — `get_record_elements` / `get_record_elements_id`,
-//! * [`update`] — `put_record` (including its create-form capability gap) and
-//!   `update_record_id`,
+//! * [`update`] — `put_record` (its update path and the create form's typed
+//!   unsupported id cases) and `update_record_id`,
 //! * [`access`] — `is_record_accessible`,
 //! * [`field`] — `get_record_field`.
 //!
