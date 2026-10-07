@@ -11,31 +11,40 @@
 //! This module is safe Rust, like its parent.
 
 use beam_common::Result;
-use beam_term::prelude::make_atom;
+use beam_term::prelude::{make_atom, Atom};
 use beam_term::Eterm;
 
 use crate::error;
 use crate::tag::{EXPORT_EXT, NEW_FUN_EXT};
 use crate::term::{
     fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index, fun_module,
-    fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes, FunKind,
+    fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes, FunKind, FunPid,
 };
 
-use super::Encoder;
+use super::{Encoder, FunIdentity};
 
 impl<'a> Encoder<'a> {
     /// Encodes a fun term by kind (`external.c:3966-4004`).
     ///
     /// `FunKind::External` becomes `EXPORT_EXT` (`113`) and `FunKind::Imported`
-    /// becomes `NEW_FUN_EXT` (`112`). `FunKind::Local` — the `make_fun3` closure —
-    /// has **no** faithful wire image: its inlined descriptor carries no module, no
-    /// 16-byte `uniq` and no creator pid, so it is reported as
-    /// [`crate::error::unsupported_local_fun`] rather than mis-encoded.
+    /// becomes `NEW_FUN_EXT` (`112`).
+    ///
+    /// `FunKind::Local` — the `make_fun3` closure — has **no** self-contained wire
+    /// image: its inlined descriptor carries no module, no 16-byte `uniq` and no
+    /// creator pid. It is encoded as `NEW_FUN_EXT` only when the caller supplied
+    /// that identity through [`Encoder::with_fun_identity`] (the runtime's module
+    /// identity); otherwise it is reported as [`crate::error::unsupported_local_fun`]
+    /// rather than mis-encoded.
     pub(super) fn encode_fun(&mut self, term: Eterm, kind: FunKind) -> Result<()> {
         match kind {
             FunKind::External => self.encode_fun_external(term),
             FunKind::Imported => self.encode_fun_imported(term),
-            FunKind::Local => Err(error::unsupported_local_fun()),
+            // `Option<FunIdentity>` is `Copy`, so the read releases `self` before the
+            // `&mut self` call below.
+            FunKind::Local => match self.fun_identity {
+                Some(identity) => self.encode_fun_local(term, identity),
+                None => Err(error::unsupported_local_fun()),
+            },
         }
     }
 
@@ -82,6 +91,59 @@ impl<'a> Encoder<'a> {
         let creator = fun_creator_pid(term)?;
         let env = fun_env(term)?;
 
+        self.encode_new_fun_ext(
+            arity, num_free, module, &uniq, index, old_index, old_uniq, creator, env,
+        )
+    }
+
+    /// Encodes a local (`make_fun3`) fun as `NEW_FUN_EXT` (`112`).
+    ///
+    /// The C encoder (`external.c:3966-3993`, the `is_local_fun(funp)` branch) treats
+    /// a local fun exactly like an imported one: it writes the same `NEW_FUN_EXT`
+    /// body, taking `arity`/`num_free`/`env` from the **term** and
+    /// `module`/`uniq`/`index`/`old_index`/`old_uniq` from the fun's `ErlFunEntry`
+    /// (the module's lambda table) with the creator pid fixed to
+    /// `erts_init_process_id`. Only the term's own `index` differs in source
+    /// (descriptor word 2 for a local fun vs. word 4 for an imported one —
+    /// [`fun_index`] abstracts that away).
+    ///
+    /// The identity fields a local *term* does not carry come from the supplied
+    /// [`FunIdentity`]; see [`Encoder::with_fun_identity`].
+    fn encode_fun_local(&mut self, term: Eterm, identity: FunIdentity) -> Result<()> {
+        let arity = fun_arity_term(term)?;
+        let num_free = fun_num_free_term(term)?;
+        let index = fun_index(term)?;
+        let env = fun_env(term)?;
+
+        self.encode_new_fun_ext(
+            arity,
+            num_free,
+            identity.module,
+            &identity.uniq,
+            index,
+            identity.old_index,
+            identity.old_uniq,
+            identity.creator,
+            env,
+        )
+    }
+
+    /// Emits the shared `NEW_FUN_EXT` body (used for both imported and, with a
+    /// supplied identity, local funs — see [`Encoder::encode_fun_imported`] and
+    /// [`Encoder::encode_fun_local`]).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_new_fun_ext(
+        &mut self,
+        arity: usize,
+        num_free: usize,
+        module: Atom,
+        uniq: &[u8; 16],
+        index: u32,
+        old_index: u32,
+        old_uniq: u32,
+        creator: FunPid,
+        env: &[Eterm],
+    ) -> Result<()> {
         self.buf.u8(NEW_FUN_EXT);
         // The size field's own position: `size` counts from here (`ep - size_p`).
         let size_pos = self.buf.len();
@@ -89,7 +151,7 @@ impl<'a> Encoder<'a> {
         // `arity`/`num_free` both fit their 8-bit header fields (the layout enforced
         // that when the term was built), so these casts cannot truncate.
         self.buf.u8(arity as u8);
-        self.buf.bytes(&uniq);
+        self.buf.bytes(uniq);
         self.buf.u32be(index);
         self.buf.u32be(num_free as u32);
         self.encode_atom(make_atom(module))?;
@@ -116,7 +178,7 @@ mod tests {
     use beam_term::AtomTable;
 
     use crate::encode::tests::{assert_system_limit, new_heap};
-    use crate::encode::{encode_term, encode_term_body};
+    use crate::encode::{encode_term, encode_term_body, Encoder, FunIdentity};
     use crate::error::{is_unsupported, is_unsupported_local_fun};
     use crate::term::{make_fun_external, make_fun_imported, make_fun_local, FunPid, MAX_ARG};
 
@@ -239,5 +301,53 @@ mod tests {
         );
         // The general "unsupported tag" signal is deliberately *not* reused.
         assert!(!is_unsupported(&err));
+    }
+
+    #[test]
+    fn local_fun_encodes_as_new_fun_ext_with_supplied_identity() {
+        let mut atoms = AtomTable::new();
+        let module = atoms.intern("m");
+        let node = atoms.intern("n1");
+        let mut uniq = [0u8; 16];
+        for (i, byte) in uniq.iter_mut().enumerate() {
+            *byte = i as u8 + 1; // 1..=16
+        }
+        let creator = FunPid {
+            node,
+            number: 0xAAAA_BBBB,
+            serial: 0xCCCC_DDDD,
+            creation: 0x1122_3344,
+        };
+        let env = [make_small(11), make_small(22)];
+        // The term's own descriptor `uniq` is engine-internal and never on the wire,
+        // so an arbitrary value must not affect the bytes.
+        let mut heap = new_heap(64);
+        let local = make_fun_local(&mut heap, 2, 0xDEAD_BEEF, 0x0102_0304, &env).unwrap();
+
+        let identity = FunIdentity::new(module, uniq, 7, 3, creator);
+        let mut encoder = Encoder::new(&atoms).with_fun_identity(identity);
+        encoder.encode(local).unwrap();
+
+        let mut payload = Vec::new();
+        payload.push(2u8); // arity
+        payload.extend_from_slice(&uniq);
+        payload.extend_from_slice(&0x0102_0304u32.to_be_bytes()); // index (term descriptor)
+        payload.extend_from_slice(&2u32.to_be_bytes()); // num_free
+        payload.extend_from_slice(&[119, 1, b'm']); // module atom
+        payload.extend_from_slice(&[97, 7]); // old_index small
+        payload.extend_from_slice(&[97, 3]); // old_uniq small
+        payload.push(88); // NEW_PID_EXT
+        payload.extend_from_slice(&[119, 2, b'n', b'1']);
+        payload.extend_from_slice(&0xAAAA_BBBBu32.to_be_bytes());
+        payload.extend_from_slice(&0xCCCC_DDDDu32.to_be_bytes());
+        payload.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+        payload.extend_from_slice(&[97, 11, 97, 22]); // env[0] first
+
+        let size = 4 + payload.len();
+        let mut expected = vec![131u8, 112];
+        expected.extend_from_slice(&(size as u32).to_be_bytes());
+        expected.extend_from_slice(&payload);
+
+        assert_eq!(encoder.as_bytes(), expected.as_slice());
     }
 }

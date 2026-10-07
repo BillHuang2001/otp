@@ -290,16 +290,16 @@ pub fn flatmap_parts<'a>(term: Eterm) -> Result<(&'a [Eterm], &'a [Eterm])> {
 /// Every `(key, value)` pair of the map `term` in the order the map **stores** them.
 ///
 /// A flat map yields its keys-tuple order; a hash map (HAMT) yields its node-slot
-/// traversal order — the order an image-preserving serializer must reproduce to walk
-/// the map's wire image faithfully. Delegates to
+/// pre-order (slots ascending, descending depth-first at each). Delegates to
 /// [`beam_term::map::map_pairs_storage_order`]. A term that is not a map (or is an
 /// immediate) yields `BeamError::BadArg`.
 ///
 /// This is the reader the encoder uses for a **hash map** (a map [`flatmap_parts`]
-/// rejects); the specific traversal order of a `beam_term`-built HAMT is driven by
-/// `beam_term`'s `term_hash`, not ERTS's `erts_map_hash`, so the pair order of a
-/// locally built HAMT need not match ERTS's own (see the crate `CONTEXT.md`,
-/// §"Map key encode order").
+/// rejects). `beam_term` drives the HAMT trie with the bit-exact `erts_map_hash`, so a
+/// `write_map`-built hash map has the same node structure as the oracle's; the encoder
+/// emits its pairs in the **reverse** of this order, matching the C encoder's LIFO
+/// work-stack walk (see `encode::Encoder::encode_hashmap_pairs` and the crate
+/// `CONTEXT.md`, §"Map key encode order").
 pub fn map_pairs_storage_order(term: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
     beam_term::map::map_pairs_storage_order(term).map_err(Into::into)
 }

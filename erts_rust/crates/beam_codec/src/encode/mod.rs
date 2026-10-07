@@ -33,7 +33,7 @@ use crate::tag::{
 use crate::term::{
     big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
     external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_kind_term, is_record,
-    map_pairs_storage_order, tuple_arity, tuple_element,
+    map_pairs_storage_order, tuple_arity, tuple_element, FunPid,
 };
 use crate::writer::Writer;
 
@@ -110,6 +110,56 @@ enum AtomFlavour {
     Latin1WideOnly,
 }
 
+/// The identity of a [`FunKind::Local`](crate::term::FunKind) fun that its **term
+/// layout does not carry** but the `NEW_FUN_EXT` (`112`) wire form requires.
+///
+/// A `make_fun3` closure (`beam_engine`/`beam_rt`) inlines only its engine-internal
+/// descriptor (`[uniq: u64][index: u32]`); it stores **no** module atom, no 16-byte
+/// module MD5, no `old_index`/`old_uniq` and no creator pid. The C encoder
+/// (`external.c:3966-3993`) resolves those fields through the fun's `ErlFunEntry`
+/// (the running module's lambda table), which only the runtime knows — so they are
+/// an **optional caller input**, supplied through [`Encoder::with_fun_identity`].
+/// The codec never invents them: without one a local fun stays
+/// [`crate::error::unsupported_local_fun`] (classify-don't-lie).
+///
+/// The field meanings mirror `ErlFunEntry` (`erts/emulator/beam/erl_fun.h:31-59`):
+/// `module`/`uniq` identify the compiled module, `old_index`/`old_uniq` are its
+/// legacy lambda identity, and `creator` is the pid the C encoder writes — for a
+/// local fun that is always `erts_init_process_id` (the `init` process), **not** the
+/// fun's own creator (`external.c:3989`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FunIdentity {
+    /// The module the closure was compiled in (`ErlFunEntry.module`).
+    pub module: Atom,
+    /// The module's 16-byte MD5 (`ErlFunEntry.uniq`).
+    pub uniq: [u8; 16],
+    /// The legacy lambda index (`ErlFunEntry.old_index`).
+    pub old_index: u32,
+    /// The legacy lambda unique number (`ErlFunEntry.old_uniq`).
+    pub old_uniq: u32,
+    /// The creator pid written to the wire — `erts_init_process_id` for a local fun.
+    pub creator: FunPid,
+}
+
+impl FunIdentity {
+    /// Builds a fun identity from its five wire fields.
+    pub fn new(
+        module: Atom,
+        uniq: [u8; 16],
+        old_index: u32,
+        old_uniq: u32,
+        creator: FunPid,
+    ) -> FunIdentity {
+        FunIdentity {
+            module,
+            uniq,
+            old_index,
+            old_uniq,
+            creator,
+        }
+    }
+}
+
 /// Incremental external term format encoder.
 ///
 /// Holds a borrowed atom table (the sole source of atom names) and an output
@@ -133,6 +183,11 @@ pub struct Encoder<'a> {
     /// is owned by the runtime, so it is an optional input; without it an internal
     /// id has no wire image.
     local_node: Option<(Atom, u32)>,
+    /// The fun identity supplied by the caller via [`Encoder::with_fun_identity`],
+    /// used to encode a [`FunKind::Local`](crate::term::FunKind) fun as
+    /// `NEW_FUN_EXT`. `None` — the default — keeps such a fun
+    /// [`crate::error::unsupported_local_fun`] (the identity cannot be invented).
+    fun_identity: Option<FunIdentity>,
 }
 
 impl<'a> Encoder<'a> {
@@ -155,6 +210,7 @@ impl<'a> Encoder<'a> {
             minor_version: MinorVersion::V2,
             atom_cache: None,
             local_node: None,
+            fun_identity: None,
         }
     }
 
@@ -232,13 +288,34 @@ impl<'a> Encoder<'a> {
         self
     }
 
+    /// Supplies the module identity needed to encode a
+    /// [`FunKind::Local`](crate::term::FunKind) fun (`make_fun3` closure) as
+    /// `NEW_FUN_EXT` (`112`).
+    ///
+    /// A local fun's term layout stores only its engine-internal descriptor and so
+    /// carries none of the wire fields `NEW_FUN_EXT` needs; [`FunIdentity`] is the
+    /// runtime's module identity (`beam_engine`/`beam_rt`). With it installed, the
+    /// encoder emits a **faithful** `NEW_FUN_EXT` built from the *term's*
+    /// arity/index/`num_free`/environment plus the *supplied* module/`uniq`/
+    /// `old_index`/`old_uniq`/creator — byte-identical to the C encoder's local-fun
+    /// path (`external.c:3966-3993`). Without it a local fun stays
+    /// [`crate::error::unsupported_local_fun`] (never a wrong image).
+    ///
+    /// The default is `None`, so every existing signature and every un-flavoured
+    /// [`encode_term`] is byte-for-byte unchanged.
+    pub fn with_fun_identity(mut self, identity: FunIdentity) -> Self {
+        self.fun_identity = Some(identity);
+        self
+    }
+
     /// Encodes `term`, appending it to the output.
     ///
     /// A tag the M1 term layer does not support yields
-    /// [`crate::error::unsupported`]; a local (`make_fun3`) fun — which has no
-    /// faithful wire image — yields [`crate::error::unsupported_local_fun`]; a value
-    /// beyond a wire bound yields `BeamError::SystemLimit`. The encoder never
-    /// silently mis-encodes.
+    /// [`crate::error::unsupported`]; a local (`make_fun3`) fun **without** a
+    /// [`FunIdentity`] installed via [`Encoder::with_fun_identity`] yields
+    /// [`crate::error::unsupported_local_fun`] (its wire fields are not derivable
+    /// from the term); a value beyond a wire bound yields `BeamError::SystemLimit`.
+    /// The encoder never silently mis-encodes.
     pub fn encode(&mut self, term: Eterm) -> Result<()> {
         // Classification order is deliberate (see the crate `CONTEXT.md`,
         // "`src/encode.rs`"): immediates first, then each boxed family through its
@@ -280,11 +357,13 @@ impl<'a> Encoder<'a> {
             return self.encode_map(keys, values);
         }
         // A > 32-key map is a *hash map* (HAMT), which `flatmap_parts` rejects. Its pairs
-        // come back in the map's **stored** (HAMT traversal) order; emit them through the
-        // same MAP_EXT emitter. This probe matches only a genuine map, so it cannot shadow
-        // any term the flat path already handled (see §"Map key encode order").
+        // come back in the map's **stored** (ascending HAMT node-slot pre-order) order; the
+        // C encoder walks that same tree through a LIFO work stack, i.e. in the *reverse*
+        // order, so `encode_hashmap_pairs` reverses before emitting. This probe matches only
+        // a genuine map, so it cannot shadow any term the flat path already handled (see
+        // §"Map key encode order").
         if let Ok(pairs) = map_pairs_storage_order(term) {
-            return self.encode_map_pairs(&pairs);
+            return self.encode_hashmap_pairs(&pairs);
         }
         if let Ok((node, number, serial, creation)) = external_pid_parts(term) {
             return self.encode_pid(node, number, serial, creation);
@@ -553,8 +632,7 @@ impl<'a> Encoder<'a> {
 
     /// Encodes a map as `MAP_EXT` from its `(keys, values)` storage slices.
     ///
-    /// A thin wrapper over [`encode_map_pairs`](Self::encode_map_pairs) for the flat-map
-    /// path, whose pairs arrive as two parallel slices.
+    /// The flat-map path's emitter, whose pairs arrive as two parallel slices.
     ///
     /// The pair order is emitted **as stored** (interleaved `K1,V1,…,Kn,Vn`): the codec
     /// preserves the map's order and deliberately does **not** sort or dedupe it. Order is
@@ -574,16 +652,25 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes a map as `MAP_EXT` from its `(key, value)` pairs, **in the given order**.
+    /// Encodes a **hash map** (> 32 pairs, a HAMT) as `MAP_EXT`, in the C encoder's wire
+    /// order.
     ///
-    /// Both the flat-map path ([`encode_map`](Self::encode_map)) and the hash-map path
-    /// (the [`map_pairs_storage_order`] probe in [`encode`](Self::encode)) funnel through
-    /// this emitter, so a flat and a hash map share one wire implementation. The pairs are
-    /// emitted verbatim (interleaved `K1,V1,…,Kn,Vn`) and never sorted, deduped or
-    /// reordered; the count must fit the `arityval` 24-bit field, else `SystemLimit`.
-    fn encode_map_pairs(&mut self, pairs: &[(Eterm, Eterm)]) -> Result<()> {
+    /// [`map_pairs_storage_order`] returns the HAMT's pairs in **ascending node-slot
+    /// pre-order** (its slot walk iterates slots `0..sz`, descending depth-first at each
+    /// slot). The C encoder's non-`deterministic` HAMT branch (`external.c:3745-3823`)
+    /// instead pushes each node's slots onto a **LIFO** work stack
+    /// (`WSTACK_FAST_PUSH(ENC_HASHMAP_NODE)`/`WSTACK_FAST_PUSH(*ptr++)`) and pops them
+    /// (`WSTACK_POP` is a pre-decrement pop), so it visits slots in **descending** index
+    /// order — the exact reverse of the ascending pre-order. The collision-node tuple takes
+    /// the same path (`external.c:3415-3427`), so a single reversal of the flattened pair
+    /// list reproduces the oracle's bytes.
+    ///
+    /// A flat map is a single leaf run and is **not** reversed: the C emits it in stored
+    /// order (`external.c:3391-3401`/`3745-3769`), which [`encode_map`](Self::encode_map)
+    /// preserves. The pair count must fit the `arityval` 24-bit field, else `SystemLimit`.
+    fn encode_hashmap_pairs(&mut self, pairs: &[(Eterm, Eterm)]) -> Result<()> {
         self.encode_map_header(pairs.len())?;
-        for (key, value) in pairs {
+        for (key, value) in pairs.iter().rev() {
             self.encode(*key)?;
             self.encode(*value)?;
         }

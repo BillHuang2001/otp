@@ -37,24 +37,24 @@
 //! consequently only meaningful for **non-atom** keys (or for an already-ordered
 //! flatmap), which is why the oracle cross-check below uses an **integer-keyed** corpus.
 //!
-//! ## Hash maps (> 32 pairs) are encoded too
+//! ## Hash maps (> 32 pairs) are encoded too, byte-identically to ERTS
 //!
 //! A map of more than 32 pairs is a **hash map** (HAMT), which
 //! [`beam_codec::term::flatmap_parts`] rejects. The encoder probes
 //! [`beam_codec::term::map_pairs_storage_order`] **after** the flat-map probe and emits
-//! the returned pairs through the same `MAP_EXT` emitter — in the map's *stored* order (a
-//! hash map's HAMT node-slot traversal order, head-array slots in order then
-//! head-bitmap/node-bitmap slots in index order, descending in place; `external.c:3779-3823`),
-//! never sorted. See [`hashmap_terms_encode_and_roundtrip`].
+//! the returned pairs through the hash-map emitter. That reader returns the pairs in
+//! **ascending node-slot pre-order** (slots `0..sz`, descending depth-first at each), but
+//! the C encoder walks the same tree through a **LIFO** work stack
+//! (`external.c:3745-3823`: pushes slots ascending, pops descending), i.e. in the exact
+//! **reverse** order — so the hash-map path reverses the pair list before emitting. See
+//! [`hashmap_terms_encode_and_roundtrip`].
 //!
-//! **Byte-equality with ERTS is not asserted for locally built HAMTs.** `beam_term`'s HAMT
-//! trie is driven by `term_hash`, *not* ERTS's `erts_map_hash` (see `../beam_term/src/map.rs`),
-//! so the slot order — and thus the pair order and the bytes — of a map built by
-//! [`beam_term::map::write_map`] differ from ERTS's own for the same key set. The image is
-//! still **valid and ERTS-decodable** (asserted live by
-//! [`oracle_accepts_our_hashmap_image`]); byte-level oracle agreement for > 32-key maps is
-//! only asserted through the decode(oracle image) → re-encode path with stable (integer)
-//! keys ([`oracle_and_our_encoder_agree_for_integer_keyed_maps`]).
+//! `beam_term` drives the HAMT trie with the **bit-exact** `erts_map_hash`
+//! (`../beam_term/src/map.rs`), so a map built by [`beam_term::map::write_map`] has the
+//! same node structure — and therefore, with the reversal above, the same `MAP_EXT` bytes
+//! — as the oracle's own image of the same key set. That byte-identity is pinned live by
+//! [`hashmap_images_match_the_oracle_byte_exactly`] for maps of 33/40/50/64/100/1000 keys.
+//! [`oracle_accepts_our_hashmap_image`] additionally proves the image is valid wire.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -431,13 +431,16 @@ fn hashmap_terms_encode_and_roundtrip() {
         "the decoded map must hold exactly the original's pairs (as a set)"
     );
 
-    // (c) The wire carries the HAMT's *stored* order — we preserve it, we never sort.
-    //     (Our decoder materializes any MAP_EXT as one flat map, so its keys-tuple order
-    //     *is* the wire order.)
+    // (c) The wire carries the HAMT's *stored* order **reversed** — the C walks the tree
+    //     through a LIFO work stack, so it emits the reverse of the ascending node-slot
+    //     pre-order `map_pairs_storage_order` returns. (Our decoder materializes any
+    //     MAP_EXT as one flat map, so its keys-tuple order *is* the wire order.)
     let wire = map_pairs_storage_order(decoded).unwrap();
+    let mut reversed_stored = stored.clone();
+    reversed_stored.reverse();
     assert_eq!(
-        wire, stored,
-        "MAP_EXT must carry the HAMT storage order, not a sorted order"
+        wire, reversed_stored,
+        "MAP_EXT must carry the reverse of the HAMT storage order (the C's LIFO walk)"
     );
     // ... and that order is NOT the sorted key order (1,2,…,40), proving no sort happened.
     let sorted_keys: Vec<Eterm> = (1..=40).map(make_small).collect();
@@ -451,9 +454,72 @@ fn hashmap_terms_encode_and_roundtrip() {
     assert_eq!(encode_term(decoded, &atoms2).unwrap(), bytes);
 }
 
+/// Our `write_map`-built HAMT must encode **byte-identically** to the oracle's own
+/// `term_to_binary/1` image of the same integer-keyed map, for sizes 33/40/50/64/100/1000.
+///
+/// `beam_term` drives the HAMT with the bit-exact `erts_map_hash`, so our node structure
+/// equals ERTS's; combined with the hash-map path's reversal of the ascending node-slot
+/// pre-order (the C's LIFO work-stack walk — see `encode::Encoder::encode_hashmap_pairs`),
+/// the wire bytes match exactly. Integer keys keep the comparison stable across VM starts
+/// (unlike atom keys — see the module doc).
+#[test]
+fn hashmap_images_match_the_oracle_byte_exactly() {
+    use beam_term::map::{map_words_capacity, write_map};
+
+    let Some(oracle) = oracle_or_skip("hashmap_images_match_the_oracle_byte_exactly") else {
+        return;
+    };
+
+    const SIZES: [i64; 6] = [33, 40, 50, 64, 100, 1000];
+
+    // One oracle spawn for every size: a list of `term_to_binary/1` images, in `SIZES`
+    // order, of `maps:from_list([{N, N*2} || N <- lists:seq(1, Sz)])`.
+    let sizes_list = SIZES
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let images = parse_binary_list(&run_erl(
+        &oracle,
+        &format!(
+            "io:format(\"~w~n\", [ [ term_to_binary(maps:from_list([{{N, N*2}} || N <- lists:seq(1, Sz)])) || Sz <- [{sizes_list}] ] ])"
+        ),
+    ));
+    assert_eq!(images.len(), SIZES.len(), "one oracle image per size");
+
+    for (image, size) in images.iter().zip(SIZES) {
+        assert_eq!(image[0], VERSION_MAGIC, "{size}: version byte");
+        assert_eq!(image[1], MAP_EXT, "{size}: MAP_EXT tag");
+        assert_eq!(
+            u32::from_be_bytes([image[2], image[3], image[4], image[5]]),
+            size as u32,
+            "{size}: pair count"
+        );
+
+        // Build the same map through the real HAMT builder (a > 32-pair map is a hash map).
+        let mut h = heap(1 << 16);
+        let atoms = AtomTable::new();
+        let pairs: Vec<(Eterm, Eterm)> = (1..=size)
+            .map(|n| (make_small(n), make_small(n * 2)))
+            .collect();
+        // SAFETY: `map_words_capacity` is the documented upper bound for `write_map`
+        // (`21n + 18` words for a hash map), and the heap holds at least that many.
+        let hp = unsafe { h.alloc_words(map_words_capacity(pairs.len())) }.unwrap();
+        // SAFETY: `hp` points at `map_words_capacity(size)` exclusively-owned, writable
+        // words, the preconditions `write_map` documents.
+        let map = unsafe { write_map(hp, &pairs, &atoms) }.unwrap();
+
+        let ours = encode_term(map, &atoms).expect("a hash map is encodable");
+        assert_eq!(
+            ours, *image,
+            "{size}-key map: our HAMT image must be byte-identical to the oracle's"
+        );
+    }
+}
+
 /// Feeds our `write_map`-built 40-key HAMT image to the live oracle's `binary_to_term/1`
 /// and asserts the oracle reconstructs a 40-key map with the expected content — proof that
-/// our HAMT traversal output is **valid wire** even though its byte order is not ERTS's own.
+/// our HAMT traversal output is **valid wire**.
 #[test]
 fn oracle_accepts_our_hashmap_image() {
     let Some(oracle) = oracle_or_skip("oracle_accepts_our_hashmap_image") else {
