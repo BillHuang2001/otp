@@ -86,10 +86,9 @@
 //! physically adjacent free blocks. [`FreeList::refile`] is not used yet, so it alone
 //! still carries an `#[allow(dead_code)]`.
 //!
-//! This file runs a little past the crate's ~1000-line guideline: the implementation
-//! is ~620 lines and the rest is the test module that *is* the correctness evidence
-//! for the variable-size machinery (every `unsafe` block also carries its own
-//! `// SAFETY:` rationale, as the crate requires).
+//! The correctness evidence for the variable-size machinery lives in the sibling `tests`
+//! module (every `unsafe` block also carries its own `// SAFETY:` rationale, as the crate
+//! requires).
 
 use core::ptr;
 

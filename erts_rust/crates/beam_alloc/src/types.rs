@@ -8,16 +8,15 @@
 //! generator, which emits the C `ERTS_ALC_A_*`, `ERTS_ALC_C_*` and
 //! `ERTS_ALC_T_*` macros and the type-number helpers used by `erts_alloc`).
 //!
-//! # Why this file is long (and stays one file)
+//! # Why the table is one module
 //!
 //! [`ALLOC_TYPES`] is a hand-maintained table of **243** rows copied in *file
 //! order* from that ground-truth file. The order *is* the allocator-type
 //! numbering (`ERTS_ALC_T_*` is assigned in declaration order by the
 //! generator), and the table's invariants (unique names, complete
 //! allocator/class coverage) are only reviewable with the whole table in one
-//! place — so it deliberately lives in a single module. This makes the file
-//! longer than the crate's usual ~1000-line split rule; the length is one data
-//! table plus its unit tests, not several responsibilities piled together.
+//! place — so the table deliberately lives in a single module; its unit tests
+//! sit in the sibling `tests` module.
 //!
 //! # The filter applied (which declarations are active)
 //!
