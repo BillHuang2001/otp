@@ -157,6 +157,7 @@ mod tests {
             min_heap_words: 12,
             max_heap_words: 4_096,
             fullsweep_after: 7,
+            min_bin_vheap_words: 46_422,
             initial_young_words: 51,
             initial_mature_words: 90,
             need_reserve_words: 128,
@@ -167,10 +168,10 @@ mod tests {
         assert_eq!(config.policy.min_heap_words, 12);
         assert_eq!(config.policy.max_heap_words, 4_096);
         assert_eq!(config.policy.fullsweep_after, 7);
+        assert_eq!(config.policy.min_bin_vheap_words, 46_422);
         assert_eq!(config.policy.initial_young_words, 51);
         assert_eq!(config.policy.initial_mature_words, 90);
-        assert_eq!(config.policy.need_reserve_words, 128);
-    }
+        assert_eq!(config.policy.need_reserve_words, 128);    }
 
     #[test]
     fn clone_and_partial_eq_behave() {

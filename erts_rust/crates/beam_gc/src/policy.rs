@@ -12,6 +12,35 @@ use std::sync::LazyLock;
 /// the +20 % stage.
 const FIBONACCI_STAGE_LEN: usize = 23;
 
+/// The C `H_DEFAULT_SIZE` / minimum process heap size, in words (`erl_vm.h:60`,
+/// `erl_init.c:812`). `erts_next_heap_size(233, 0)` is 233, so the oracle reports
+/// `min_heap_size` as exactly this value.
+pub const DEFAULT_MIN_HEAP_WORDS: usize = 233;
+
+/// The C `VH_DEFAULT_SIZE` (`erl_vm.h:61`): the seed for the minimum binary virtual
+/// heap size. `erl_init.c:284` rounds it through `erts_next_heap_size(x, 0)`, which is
+/// where the oracle's `min_bin_vheap_size` of `46422` comes from.
+const VH_DEFAULT_SIZE_WORDS: usize = 32768;
+
+/// The oracle's default `min_bin_vheap_size`: `erts_next_heap_size(32768, 0)`.
+///
+/// Computed through the growth table rather than hard-coded, so the value can never
+/// drift from `erts_init.c:284`; `default_policy_matches_the_beam_defaults` pins it.
+fn default_min_bin_vheap_words() -> usize {
+    next_heap_size(VH_DEFAULT_SIZE_WORDS, 0)
+}
+
+/// The C `spawn_opt` minimum rounding (`erl_process.c:12321-12349`): a request below
+/// `floor` is replaced by `floor`, anything else is rounded up through
+/// `erts_next_heap_size(x, 0)` so the result is a fixed point of the growth table.
+fn round_spawn_min(requested: usize, floor: usize) -> usize {
+    if requested < floor {
+        floor
+    } else {
+        next_heap_size(requested, 0)
+    }
+}
+
 /// The curated heap-size growth table, built once on first use.
 static HEAP_SIZES: LazyLock<Vec<usize>> = LazyLock::new(build_heap_sizes);
 
@@ -56,8 +85,13 @@ pub struct HeapPolicy {
     pub min_heap_words: usize,
     /// Largest heap the policy will ever size to, in term words (0 = unbounded).
     pub max_heap_words: usize,
-    /// Number of minor collections before a fullsweep is forced (0 disables).
+    /// Number of minor collections before a fullsweep is forced (0 = a fullsweep on
+    /// every collection). The C `max_gen_gcs` (`erl_process.h:1145`), whose default is
+    /// `(Uint16) -1 == 65535` (`erl_init.c:843`).
     pub fullsweep_after: u32,
+    /// Smallest binary virtual heap the policy sizes to, in term words — the C
+    /// `min_vheap_size` / `BIN_VH_MIN_SIZE`, whose default the oracle reports as 46422.
+    pub min_bin_vheap_words: usize,
     /// Initial size of the young (nursery) space, in term words.
     pub initial_young_words: usize,
     /// Initial size of the mature space, in term words.
@@ -67,13 +101,20 @@ pub struct HeapPolicy {
 }
 
 impl HeapPolicy {
-    /// The BEAM defaults: `fullsweep_after` 65535, a 233-word initial young space and
-    /// the curated minimum heap size.
+    /// The BEAM defaults: `fullsweep_after` 65535, a 233-word initial young space, the
+    /// curated minimum heap size and the C default minimum binary virtual heap size
+    /// (`min_bin_vheap_size` 46422).
+    ///
+    /// `min_heap_words` is **0** — *no floor* — rather than the C's 233-word minimum for
+    /// a spawned process. A caller that wants the process default uses
+    /// [`HeapPolicy::from_spawn_opts`] (which applies the C `H_MIN_SIZE` floor);
+    /// `DEFAULT_MIN_HEAP_WORDS` is that value.
     pub fn default() -> HeapPolicy {
         HeapPolicy {
             min_heap_words: 0,
             max_heap_words: 0,
             fullsweep_after: 65535,
+            min_bin_vheap_words: default_min_bin_vheap_words(),
             initial_young_words: 233,
             initial_mature_words: 233,
             need_reserve_words: 64,
@@ -90,6 +131,42 @@ impl HeapPolicy {
         }
     }
 
+    /// A policy for a process started with the `spawn_opt` heap options
+    /// `min_heap_size`, `min_bin_vheap_size` and `fullsweep_after`, applying the C's
+    /// rounding rules (`erl_process.c:12321-12360`).
+    ///
+    /// `min_heap_words` below the C `H_MIN_SIZE` (`DEFAULT_MIN_HEAP_WORDS`, 233) is
+    /// replaced by that minimum rather than rounded up past it; otherwise it is rounded
+    /// through `erts_next_heap_size(x, 0)`, so the stored minimum is a fixed point of the
+    /// growth table — the C's
+    /// `ASSERT(p->min_heap_size == erts_next_heap_size(p->min_heap_size, 0))`
+    /// (`erl_process.c:12575`). `min_bin_vheap_words` follows the identical rule against
+    /// the C default `BIN_VH_MIN_SIZE`. `fullsweep_after` is stored verbatim (the C only
+    /// rejects a negative value).
+    pub fn from_spawn_opts(
+        min_heap_words: usize,
+        min_bin_vheap_words: usize,
+        fullsweep_after: u32,
+    ) -> HeapPolicy {
+        HeapPolicy {
+            min_heap_words: round_spawn_min(min_heap_words, DEFAULT_MIN_HEAP_WORDS),
+            min_bin_vheap_words: round_spawn_min(
+                min_bin_vheap_words,
+                default_min_bin_vheap_words(),
+            ),
+            fullsweep_after,
+            ..HeapPolicy::default()
+        }
+    }
+
+    /// Whether the fullsweep cadence is due after `minor_gcs` minor collections — the C
+    /// `GEN_GCS(p) >= MAX_GEN_GCS(p)` test (`erl_gc.c:694,831`).
+    ///
+    /// A `fullsweep_after` of 0 is due immediately, so *every* collection is a
+    /// fullsweep — exactly as in the C, where `0 >= 0`.
+    pub fn fullsweep_due(&self, minor_gcs: u32) -> bool {
+        minor_gcs >= self.fullsweep_after
+    }
     /// The next size (in words) to grow `size` to, `offset` entries further along the
     /// growth table.
     ///
@@ -124,7 +201,67 @@ impl HeapPolicy {
     pub fn should_shrink(&self, heap_words: usize, need_words: usize) -> bool {
         heap_words > 4 * need_words && heap_words > self.min_heap_words
     }
-}
+
+    /// The mature-space size (in words) to use after a fullsweep that kept `live_words`
+    /// alive and still needs `need_words` — the C `adjust_after_fullsweep` decision
+    /// (`erl_gc.c:2061-2098`) reduced to one target size.
+    ///
+    /// `need_after = live_words + need_words + need_reserve_words` is the room the
+    /// collection must leave behind (`erl_gc.c:2072`). The current `capacity_words` is
+    ///
+    /// * **grown** to `next_words(need_after, 0)` when [`should_grow`](Self::should_grow)
+    ///   holds — a fullsweep always leaves enough room for its own result (`erl_gc.c:2073-2077`);
+    /// * **shrunk** to `next_words(2 * need_after, 0)` when
+    ///   [`should_shrink`](Self::should_shrink) holds — the C's `wanted = 2 * need_after`
+    ///   (`erl_gc.c:2087`);
+    /// * otherwise **kept** as it is.
+    ///
+    /// [`min_heap_words`](Self::min_heap_words) floors and
+    /// [`max_heap_words`](Self::max_heap_words) clamps every result (through
+    /// [`next_words`](Self::next_words)); the shrink branch additionally never returns
+    /// more than the current capacity, so a "shrink" can only ever make the heap smaller.
+    pub fn mature_after_fullsweep(
+        &self,
+        capacity_words: usize,
+        live_words: usize,
+        need_words: usize,
+    ) -> usize {
+        let need_after = live_words
+            .saturating_add(need_words)
+            .saturating_add(self.need_reserve_words);
+        if self.should_grow(capacity_words, need_after) {
+            self.next_words(need_after, 0)
+        } else if self.should_shrink(capacity_words, need_after) {
+            self.next_words(need_after.saturating_mul(2), 0)
+                .min(capacity_words)
+        } else {
+            capacity_words
+        }
+    }
+
+    /// The nursery size (in words) to use after a collection that ran with `used_words`
+    /// live words in a `capacity_words` nursery — the C's minor-time young-heap resize
+    /// `next_heap_size(p, stack_size + MAX(size_before, need), 0)` (`erl_gc.c:1493`).
+    ///
+    /// The next round's request is at least [`need_reserve_words`](Self::need_reserve_words)
+    /// and otherwise whatever the round just used, so a nursery that filled up
+    /// ([`should_grow`](Self::should_grow)) steps up the growth table while one left mostly
+    /// empty ([`should_shrink`](Self::should_shrink)) steps back down to the live set; a
+    /// nursery that was neither keeps its size. Bounded by
+    /// [`min_heap_words`](Self::min_heap_words)/[`max_heap_words`](Self::max_heap_words).
+    pub fn young_after_collection(&self, capacity_words: usize, used_words: usize) -> usize {
+        let request = used_words.max(self.need_reserve_words);
+        if self.should_grow(capacity_words, request) {
+            // The round filled (or nearly filled) the nursery: grow one curated step past
+            // whatever it had, so the next round starts with room to spare.
+            self.next_words(capacity_words.max(request), 1)
+        } else if self.should_shrink(capacity_words, request) {
+            // The round left the nursery mostly empty: fall back to the live set.
+            self.next_words(request, 0)
+        } else {
+            capacity_words
+        }
+    }}
 
 impl Default for HeapPolicy {
     fn default() -> Self {
@@ -247,6 +384,7 @@ mod tests {
         assert_eq!(policy.min_heap_words, 0);
         assert_eq!(policy.max_heap_words, 0);
         assert_eq!(policy.fullsweep_after, 65535);
+        assert_eq!(policy.min_bin_vheap_words, 46_422);
         assert_eq!(policy.initial_young_words, 233);
         assert_eq!(policy.initial_mature_words, 233);
         assert_eq!(policy.need_reserve_words, 64);
@@ -255,6 +393,87 @@ mod tests {
         assert_eq!(via_trait, policy);
     }
 
+    #[test]
+    fn min_bin_vheap_default_is_the_curated_rounding_of_vh_default_size() {
+        // `erl_init.c:284`: `BIN_VH_MIN_SIZE = erts_next_heap_size(VH_DEFAULT_SIZE, 0)`.
+        assert_eq!(VH_DEFAULT_SIZE_WORDS, 32768);
+        assert_eq!(next_heap_size(VH_DEFAULT_SIZE_WORDS, 0), 46_422);
+        assert_eq!(
+            HeapPolicy::default().min_bin_vheap_words,
+            next_heap_size(VH_DEFAULT_SIZE_WORDS, 0)
+        );
+        // `DEFAULT_MIN_HEAP_WORDS` is itself a fixed point of the table.
+        assert_eq!(DEFAULT_MIN_HEAP_WORDS, 233);
+        assert_eq!(next_heap_size(DEFAULT_MIN_HEAP_WORDS, 0), DEFAULT_MIN_HEAP_WORDS);
+    }
+
+    #[test]
+    fn from_spawn_opts_applies_the_c_rounding_rules() {
+        // The process defaults: the oracle reports min_heap_size 233, min_bin_vheap_size
+        // 46422 and fullsweep_after 65535.
+        let default = HeapPolicy::from_spawn_opts(0, 0, 65535);
+        assert_eq!(default.min_heap_words, 233);
+        assert_eq!(default.min_bin_vheap_words, 46_422);
+        assert_eq!(default.fullsweep_after, 65535);
+
+        // A sub-minimum request is replaced by the minimum, never rounded past it.
+        assert_eq!(HeapPolicy::from_spawn_opts(1, 1, 3).min_heap_words, 233);
+        assert_eq!(HeapPolicy::from_spawn_opts(232, 10, 3).min_heap_words, 233);
+        assert_eq!(
+            HeapPolicy::from_spawn_opts(0, 46_421, 3).min_bin_vheap_words,
+            46_422
+        );
+
+        // A request at or above the minimum is rounded up through `next_heap_size(x, 0)`
+        // and is therefore a fixed point of the growth table.
+        assert_eq!(HeapPolicy::from_spawn_opts(233, 0, 7).min_heap_words, 233);
+        assert_eq!(HeapPolicy::from_spawn_opts(234, 0, 7).min_heap_words, 376);
+        assert_eq!(HeapPolicy::from_spawn_opts(377, 0, 7).min_heap_words, 610);
+        assert_eq!(HeapPolicy::from_spawn_opts(46_422, 0, 7).min_heap_words, 46_422);
+        assert_eq!(HeapPolicy::from_spawn_opts(46_423, 0, 7).min_heap_words, 75113);
+
+        for request in [233usize, 234, 376, 377, 1_000, 46_422, 100_000] {
+            let policy = HeapPolicy::from_spawn_opts(request, request, 0);
+            assert_eq!(
+                policy.min_heap_words,
+                next_heap_size(policy.min_heap_words, 0),
+                "the stored minimum must be a growth-table fixed point"
+            );
+            assert_eq!(
+                policy.min_bin_vheap_words,
+                next_heap_size(policy.min_bin_vheap_words, 0)
+            );
+        }
+
+        // `fullsweep_after` is stored verbatim, including 0.
+        assert_eq!(HeapPolicy::from_spawn_opts(233, 0, 0).fullsweep_after, 0);
+        assert_eq!(HeapPolicy::from_spawn_opts(233, 0, 12).fullsweep_after, 12);
+    }
+
+    #[test]
+    fn fullsweep_cadence_including_zero() {
+        let policy = HeapPolicy {
+            fullsweep_after: 2,
+            ..HeapPolicy::default()
+        };
+        assert!(!policy.fullsweep_due(0));
+        assert!(!policy.fullsweep_due(1));
+        assert!(policy.fullsweep_due(2));
+        assert!(policy.fullsweep_due(3));
+
+        // 0 means a fullsweep on *every* collection, exactly as the C `0 >= 0`.
+        let always = HeapPolicy {
+            fullsweep_after: 0,
+            ..HeapPolicy::default()
+        };
+        assert!(always.fullsweep_due(0));
+        assert!(always.fullsweep_due(1));
+
+        // The default 65535 is effectively "never" for any realistic counter.
+        let never = HeapPolicy::default();
+        assert!(!never.fullsweep_due(65_534));
+        assert!(never.fullsweep_due(65_535));
+    }
     #[test]
     fn from_min_max_overrides_only_the_bounds() {
         let policy = HeapPolicy::from_min_max(233, 100_000);
@@ -341,5 +560,94 @@ mod tests {
         };
         assert!(!floored.should_shrink(500, 100));
         assert!(floored.should_shrink(501, 100));
+    }
+
+    #[test]
+    fn mature_after_fullsweep_grows_shrinks_and_keeps() {
+        let policy = HeapPolicy::default();
+
+        // Grown: a mature space too small for the live set gets the curated size that
+        // covers `live + reserve`. `mature_after_fullsweep(12, 13, 0)` asks for 77 words.
+        assert_eq!(policy.mature_after_fullsweep(12, 13, 0), 90);
+        assert_eq!(policy.mature_after_fullsweep(0, 0, 0), 90);
+
+        // Kept: 233 words with a 100-word live set needs 164 — neither grow nor shrink.
+        assert_eq!(policy.mature_after_fullsweep(233, 100, 0), 233);
+
+        // Shrunk: 1000 words keeping 0 needs 64, so `should_shrink` fires and the target is
+        // the curated size of `2 * 64 = 128`, i.e. 142 — never more than the old capacity.
+        assert_eq!(policy.mature_after_fullsweep(1000, 0, 0), 142);
+        assert_eq!(policy.mature_after_fullsweep(1000, 5, 0), 142);
+        assert_eq!(policy.mature_after_fullsweep(1000, 10, 0), 233);
+        // A grown result always covers the live set it was asked about.
+        for live in [0usize, 1, 12, 233, 5_000, 100_000] {
+            let size = policy.mature_after_fullsweep(12, live, 0);
+            assert!(size >= live, "grown size {size} < live {live}");
+        }
+        // A shrunk result always covers the live set too.
+        for live in [0usize, 12, 233] {
+            let size = policy.mature_after_fullsweep(1_000_000, live, 0);
+            assert!(size >= live, "shrunk size {size} < live {live}");
+            assert!(size <= 1_000_000);
+        }
+    }
+
+    #[test]
+    fn mature_after_fullsweep_honours_min_and_max_bounds() {
+        // A minimum floors both the grown and the shrunk target.
+        let floored = HeapPolicy {
+            min_heap_words: 4_096,
+            ..HeapPolicy::default()
+        };
+        assert_eq!(floored.mature_after_fullsweep(12, 13, 0), 4_096);
+        // 8192 words keeping 100 needs 164: the shrink target (curated 328) is floored to
+        // 4096, which is still smaller than 8192.
+        assert_eq!(floored.mature_after_fullsweep(8_192, 100, 0), 4_096);
+        // A capacity already at the floor is never "shrunk" further.
+        assert_eq!(floored.mature_after_fullsweep(4_096, 100, 0), 4_096);
+
+        // A maximum clamps a would-be grow: 12 words needing 464 would go to 610, capped to 512.
+        let capped = HeapPolicy {
+            max_heap_words: 512,
+            ..HeapPolicy::default()
+        };
+        assert_eq!(capped.mature_after_fullsweep(12, 400, 0), 512);
+        // A would-be shrink is clamped by the maximum but is still strictly smaller.
+        assert_eq!(capped.mature_after_fullsweep(100_000, 400, 0), 512);        // The fullsweep always sees the byte-accounted reserve on top of the live set.
+        let default = HeapPolicy::default();
+        assert_eq!(
+            default.mature_after_fullsweep(12, 100, 100),
+            default.next_words(100 + 100 + default.need_reserve_words, 0)
+        );
+    }
+
+    #[test]
+    fn young_after_collection_grows_under_pressure_and_shrinks_when_empty() {
+        let policy = HeapPolicy::default();
+
+        // A full nursery grows one curated step: 233 -> 376.
+        assert_eq!(policy.young_after_collection(233, 233), 376);
+        // "Under pressure" starts once the round used more than 3/4 of the nursery.
+        assert_eq!(policy.young_after_collection(233, 175), 376);
+        assert_eq!(policy.young_after_collection(233, 174), 233);
+
+        // A nursery the round left mostly empty keeps its size (233 is not > 4 * 64).
+        assert_eq!(policy.young_after_collection(233, 13), 233);
+        // A grossly over-sized nursery shrinks back towards the live set.
+        assert_eq!(policy.young_after_collection(1_000, 13), 90);
+        assert_eq!(policy.young_after_collection(1_000, 0), 90);
+
+        // The result is always bounded by the policy.
+        let floored = HeapPolicy {
+            min_heap_words: 500,
+            ..HeapPolicy::default()
+        };
+        let shrunk = floored.young_after_collection(100_000, 0);
+        assert_eq!(shrunk, 500, "the minimum floors the shrunk nursery");
+        let capped = HeapPolicy {
+            max_heap_words: 300,
+            ..HeapPolicy::default()
+        };
+        assert_eq!(capped.young_after_collection(233, 233), 300);
     }
 }
