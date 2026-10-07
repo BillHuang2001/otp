@@ -3,6 +3,10 @@
 //! They exercise the public API against the real OS (`mmap`/`munmap`) and live in a
 //! separate file so that `mseg.rs` stays focused on the implementation.
 
+use core::ptr;
+
+use beam_common::BeamError;
+
 use super::*;
 
 fn allocator() -> MsegAllocator {
