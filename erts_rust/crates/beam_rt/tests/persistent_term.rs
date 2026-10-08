@@ -21,6 +21,7 @@
 use beam_bifs::NullSink;
 use beam_common::BeamError;
 use beam_engine::terms;
+use beam_engine::ExecutionContext;
 use beam_rt::{Runtime, RuntimeContext};
 use beam_term::{is_small, signed_value, Eterm};
 
