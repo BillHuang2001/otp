@@ -221,11 +221,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   directories** load, with no allowlist and **zero failures**.
 - **Engine execution breadth reaches beyond stdlib/kernel/compiler:** `beam_engine`'s `tests/apps_lists.rs`
   runs oracle-cross-checked functions from parsetools (yecc/leex), syntax_tools, xmerl, inets, edoc, eunit,
-  dialyzer, asn1 and snmp; `tests/census.rs` now reaches **1366/1366 modules / 2,942,736 instructions with
-  zero unmodelled opcodes**, and the `Instr` census is **106 = 49 executed + 57 claimed-blocked + 0
-  unclaimed** — the "claimed-blocked" rows are overwhelmingly degenerate synthetic-probe inputs (NIL
-  registers / empty tables), not gaps; the genuine residue is host-seam work (mailbox / BIF / global-atom)
-  owned by `beam_rt`/`beam_bifs`, plus a now-closed `PutRecord` create form.
+  dialyzer, asn1 and snmp; `tests/census.rs` reaches **1366/1366 modules / 2,942,736 instructions with
+  zero unmodelled opcodes** (the 11 unused `Instr` variants are the seven native-record variants — an
+  OTP-29 feature this toolchain does not enable — plus `BsTestTail2`, `ExecutableLine`, `DebugLine` and
+  the `Generic` sentinel).
 - **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
   `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's
