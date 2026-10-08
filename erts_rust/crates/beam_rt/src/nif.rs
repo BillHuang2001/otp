@@ -37,10 +37,11 @@
 //!
 //! [`NifHostImpl`] leaves `term_to_binary`/`binary_to_term`/`make_ref` at the trait defaults
 //! (the typed `None`), so an `enif_term_to_binary`/`enif_binary_to_term`/`enif_make_ref` NIF
-//! reports failure rather than fabricating a term. It **does** implement `alloc_env`/`free_env`,
-//! so `enif_alloc_env()` returns a live message environment whose atoms are the runtime's own
-//! (see [`NifHost::alloc_env`]), and `erlang:load_nif/2` on an already-loaded module is a `reload`
-//! (the oracle's rule since OTP 20).
+//! reports failure rather than fabricating a term. It **does** implement the whole
+//! extra-environment family — `alloc_env`/`free_env` (a live message environment whose atoms are
+//! the runtime's own, see [`NifHost::alloc_env`]) and `make_copy` (the message-env idiom's term
+//! movement, see [`NifHost::make_copy`]) — and `erlang:load_nif/2` on an already-loaded module is
+//! a `reload` (the oracle's rule since OTP 20).
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -50,7 +51,7 @@ use beam_abi::nif::types::ErlNifEnv;
 use beam_abi::{NifEnv, NifHost};
 use beam_alloc::Heap;
 use beam_bifs::AtomInterner;
-use beam_term::prelude::{atom_val, is_atom, make_atom, Eterm};
+use beam_term::prelude::{atom_val, is_atom, is_header, make_atom, Eterm};
 use beam_term::AtomTable;
 
 use crate::context::PendingInterner;
@@ -266,6 +267,37 @@ impl NifHost for NifHostImpl {
         self.envs.swap_remove(index);
         true
     }
+
+    /// `enif_make_copy(dst_env, src_term)` — the message-env idiom's term movement.
+    ///
+    /// In the C the destination env's heap is a *different* heap from the source's, so the term
+    /// must be `size_object`d and `copy_struct`ed onto it (`erl_nif.c:1194-1197`, `:843-858`). Here
+    /// [`NifHost::alloc_env`] builds every message env over **this same host** — one heap, one atom
+    /// table — so a term materialized on the message env already lives on the very heap
+    /// `enif_make_copy` would copy it to, and the copy is *exactly* the identity. The host's heap is
+    /// the runtime's **pointer-stable** pooled BIF heap (never reset, no GC in Milestone 1), so
+    /// reusing the source term is observationally identical to the C's copy and never hands a NIF a
+    /// wrong term (the atoms are the same indices either way).
+    ///
+    /// The trait default would answer `None`, and `enif_make_copy` would then return the ABI's
+    /// `THE_NON_VALUE` — a bare header word that is **not** a term, which a NIF returning it hands
+    /// straight to the engine. This hook is therefore what makes the whole
+    /// `enif_alloc_env` → `enif_make_copy` → `enif_free_env` idiom work; `beam_abi` already refuses
+    /// a non-term *source* before this hook is consulted.
+    fn make_copy(&mut self, term: Eterm) -> Option<Eterm> {
+        Some(term)
+    }
+}
+
+/// Whether `term` is a term word at all (the C `is_value`/`is_term_word` test).
+///
+/// `false` for the ABI's `THE_NON_VALUE` (`0`) and any other bare header word — a word the engine
+/// must never be handed (its primary tag is the one the boxed-term predicates accept, so a bare
+/// header would be dereferenced as a boxed pointer and abort). Used by
+/// [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext) to reject a NIF result that is
+/// not a term, and mirrors `beam_abi`'s own `is_term_word` (which is crate-private there).
+pub(crate) fn is_nif_value(term: Eterm) -> bool {
+    !is_header(term)
 }
 
 /// Maps `beam_abi`'s loader error onto `beam_bifs`'s identically-shaped one.
@@ -293,6 +325,56 @@ mod tests {
     use super::*;
     use beam_term::prelude::{make_small, Atom};
 
+    /// [`NifHost::make_copy`] is the **identity**: `alloc_env` builds the message env over this
+    /// same host, so the message env and the call env share one heap and there is nothing to move.
+    ///
+    /// This is the hook behind `enif_make_copy`. Without it `beam_abi` answers the ABI's
+    /// `THE_NON_VALUE` (a bare header word), which a NIF returning it hands to the engine — the
+    /// gate's `nif_res/alloc_env_roundtrip` then aborted on the term comparison. The end-to-end
+    /// round trip through the real binary is pinned by
+    /// `tests/nif.rs::enif_make_copy_copies_the_message_env_term_into_the_call_env`.
+    #[test]
+    fn make_copy_is_the_identity_over_the_shared_host_heap() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            atoms,
+            PendingInterner::new(0),
+            make_small(7),
+        );
+        let mut env = NifEnv::new(&mut host);
+
+        let atom = env
+            .host()
+            .intern_atom("ok")
+            .expect("interns unconditionally");
+        assert_eq!(
+            env.host().make_copy(atom),
+            Some(atom),
+            "a value copies to itself"
+        );
+        assert_eq!(
+            env.host().make_copy(make_small(42)),
+            Some(make_small(42)),
+            "an immediate copies to itself"
+        );
+    }
+
+    /// A bare header word (the ABI's `THE_NON_VALUE`, and any other non-term) is rejected by
+    /// [`is_nif_value`] — the guard `try_call_nif` uses to keep it out of the engine.
+    #[test]
+    fn a_non_term_result_is_recognised() {
+        assert!(
+            !is_nif_value(Eterm::from_raw(0)),
+            "THE_NON_VALUE is not a term"
+        );
+        assert!(!is_nif_value(beam_term::prelude::make_header(
+            0,
+            beam_term::prelude::FLOAT_SUBTAG
+        )));
+        assert!(is_nif_value(make_small(7)));
+        assert!(is_nif_value(beam_term::prelude::NIL));
+    }
     #[test]
     fn a_fresh_registry_knows_no_library() {
         let registry = NifRegistry::new();

@@ -976,8 +976,10 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// A NIF that records a pending exception (`enif_raise_exception`, `enif_make_badarg`)
     /// raises that reason as a live reason term ([`crate::error::nif_raised`]) — never swallowed
-    /// and never replaced by a placeholder. An unexported `{name, arity}` (impossible here, the
-    /// lookup already confirmed it) is the bare [`crate::error::undef`].
+    /// and never replaced by a placeholder. A NIF that hands back a **non-term** (the ABI's
+    /// `THE_NON_VALUE`, a bare header word) is that broken NIF's diagnostic, never a crash and
+    /// never a fabricated value. An unexported `{name, arity}` (impossible here, the lookup
+    /// already confirmed it) is the bare [`crate::error::undef`].
     fn try_call_nif(
         &mut self,
         module: &str,
@@ -1004,7 +1006,14 @@ impl<'a> RuntimeContext<'a> {
         self.runtime.put_bif_heap(host.into_heap());
         interner.commit(self.runtime.code_server.atoms_mut());
         match outcome {
-            Ok(term) => Ok(Some(term)),
+            // A NIF must hand back a **term** (or record an exception, which `NifLibrary::call`
+            // turns into `Raised`). The ABI's `THE_NON_VALUE` (a bare header word) is not one: the
+            // boxed-term predicates accept its primary tag, so letting it reach the engine would
+            // dereference a null boxed pointer and abort. Report the broken NIF instead — a NIF
+            // returning `enif_make_copy`'s "no value" word (or any other non-term) never crashes
+            // the runtime and never becomes a fabricated value.
+            Ok(term) if crate::nif::is_nif_value(term) => Ok(Some(term)),
+            Ok(_) => Err(error::message("NIF returned a non-value term")),
             Err(NifCallError::Raised(reason)) => Err(error::nif_raised(reason)),
             // Defensive: `lookup` above already confirmed the export, so this cannot happen —
             // but a library raced out from under us would be `undef`, never a fabricated value.
