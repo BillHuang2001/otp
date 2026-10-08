@@ -287,6 +287,31 @@ impl<'a> RuntimeContext<'a> {
         }
     }
 
+    /// Delivers `message` from `from` into the mailbox of the internal pid `to`, with **no**
+    /// trace event emitted — the delivery half of [`ExecutionContext::send_message`], and the
+    /// delivery a trace event itself uses (so emitting an event never emits an event).
+    ///
+    /// `deliver_simple` pushes a woken recipient onto the table's wake list, so the wake
+    /// survives for the scheduler pass; the outcome itself needs no action here. A payload the
+    /// recipient's heap cannot hold is retried through the heap-fragment model
+    /// ([`Self::send_fragmented_message`]) exactly as
+    /// [`send_message`](ExecutionContext::send_message) documents; every other failure —
+    /// including the table's typed not-found for a pid no process exists for — is propagated
+    /// untouched.
+    pub(crate) fn deliver_message(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+    ) -> Result<()> {
+        match self.process_table_mut().deliver_simple(to, from, message) {
+            Ok(_outcome) => Ok(()),
+            Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
+                self.send_fragmented_message(to, from, message)
+            }
+            Err(error) => Err(error),
+        }
+    }
     /// The running process's mailbox **message queue** and **scan state**, borrowed
     /// together.
     ///
@@ -1186,19 +1211,18 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// which is how the real system delivers a large message at all. Any other failure is
     /// propagated untouched, and the ordinary (small-payload) path is unchanged.
     ///
+    /// A completed send also produces two **events** (contract A.8, item 1): the ordinary
+    /// `{trace, Sender, send, Msg, To}` — when the *sending* process is `[send]`-traced — and
+    /// the sequential-trace `{seq_trace, Label, {send, …}}` when its token has the `send`
+    /// flag. Both are delivered to the relevant tracer as messages of their own, after the
+    /// payload ([`Self::trace_send_events`]).
+    ///
     /// [`DeliverOutcome::Woke`]: beam_process::DeliverOutcome::Woke
     fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
-        let to = ProcessId::from_eterm(to)?;
+        let target = ProcessId::from_eterm(to)?;
         let from = self.mailbox_pid.to_eterm();
-        // `deliver_simple` pushes a woken recipient onto the table's wake list, so the
-        // wake survives for the scheduler pass; the outcome itself needs no action here.
-        match self.process_table_mut().deliver_simple(to, from, message) {
-            Ok(_outcome) => Ok(()),
-            Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
-                self.send_fragmented_message(to, from, message)
-            }
-            Err(error) => Err(error),
-        }
+        self.deliver_message(target, from, message)?;
+        self.trace_send_events(to, message)
     }
 
     /// `loop_rec`: the candidate at the current mailbox scan position, `Ok(None)` when

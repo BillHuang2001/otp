@@ -24,6 +24,13 @@
 //!   `{trace_delivered, Tracee, Ref}` and returned;
 //! * `erts_internal:trace/3` (the body `erlang:trace/2,3` calls) for the process targets
 //!   `Pid | all | existing | existing_processes | processes`;
+//! * the **`send` event** of the ordinary trace surface: [`RuntimeContext::trace_send_events`]
+//!   is called by the send seam (the `RuntimeContext::send_message` the engine's `send`
+//!   instruction reaches) after the payload has been delivered and emits `{trace, Sender, send,
+//!   Msg, To}` — or `{trace_ts, …}` with the `timestamp` family's trailing element — to the
+//!   **sending**
+//!   process's tracer, plus the `{seq_trace, Label, {send, …}}` event when the sender's
+//!   sequential-trace token has the `send` flag set;
 //! * `erts_internal:trace_pattern/3` (the body `erlang:trace_pattern/2,3` calls) — the
 //!   **function** trace patterns. [`TraceState`] owns a [`PatternTable`]: one entry per
 //!   installed `{M,F,A}` pattern (wildcard-aware — [`MfaPattern::matches`]) holding its
@@ -33,13 +40,18 @@
 //!
 //! # Deliberately out of scope (a later stage)
 //!
-//! * **Emitting `{trace, …}`/`{trace_ts, …}` event messages.** Nothing here is wired into the
-//!   engine's send/receive/call paths, so setting a flag — or installing a trace *pattern* —
-//!   never produces an event. The flag/pattern state is real (and `trace_info`, plus the
-//!   pattern table, report it), but no message is emitted. [`PatternTable::matches`] is the
-//!   predicate a future `beam_engine` per-call hook calls to decide whether a
+//! * **The other event families.** Only the `send` event is emitted
+//!   ([`RuntimeContext::trace_send_events`]); the `'receive'`, `spawn`, `exit` and
+//!   `call`/`return_to`/`return_from` events have no producer — nothing is wired into the
+//!   engine's receive or call paths, so those flags are state only. [`PatternTable::matches`]
+//!   is the predicate a future `beam_engine` per-call hook calls to decide whether a
 //!   `call`/`return_from`/`return_to` event should be emitted; until that hook exists it is
-//!   only a query.
+//!   only a query. Nor does a **match spec** filter the `send` event (none is compiled — see
+//!   below).
+//! * **Carrying the sequential-trace token with a message.** The `{send, …}` event is emitted,
+//!   but the token is *not* attached to the message the send delivers, so a receiver cannot
+//!   inherit it (that needs a per-message slot in `beam_message`) and no `{'receive', …}`
+//!   event can follow.
 //! * **Match-spec compilation.** A `[match_spec()]` argument is shape-checked and stored
 //!   verbatim ([`MatchSpec::Functions`]); it is never compiled and never applied, so it
 //!   cannot filter an event (there are none to filter). `trace_info`'s `match_spec` item is a
@@ -64,11 +76,14 @@
 //! `../../erts/emulator/beam/erl_trace.c`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime};
 
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext};
 use beam_process::ProcessId;
-use beam_term::{Eterm, NIL};
+use beam_term::{make_small, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 
@@ -528,6 +543,102 @@ impl TraceState {
     }
 }
 
+// Event time stamps -------------------------------------------------------------------------
+
+/// The time-stamp flavour an emitted event carries, selected from the **sending** process's
+/// trace flags.
+///
+/// Whichever flag is set is the flavour; the oracle's precedence is `timestamp` >
+/// `strict_monotonic_timestamp` > `monotonic_timestamp`. A flavour makes the event tag
+/// `trace_ts` instead of `trace` and appends one trailing element (see
+/// [`RuntimeContext::emit_trace_event`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TraceTimestamp {
+    /// `timestamp`: the wall-clock `{MegaSecs, Secs, MicroSecs}` of `erlang:timestamp/0`.
+    Wall,
+    /// `monotonic_timestamp`: the runtime's monotonic clock, in native (nanosecond) units —
+    /// the same unit `erlang:monotonic_time/0` reports.
+    Monotonic,
+    /// `strict_monotonic_timestamp`: `{Nanoseconds, UniqueMonotonicInteger}`, unique across
+    /// the events this runtime emits.
+    StrictMonotonic,
+}
+
+impl TraceTimestamp {
+    /// The flavour `flags` selects, or `None` when no time-stamp flag is set.
+    pub(crate) fn select(flags: TraceFlags) -> Option<TraceTimestamp> {
+        if flags.0 & TIMESTAMP != 0 {
+            Some(TraceTimestamp::Wall)
+        } else if flags.0 & STRICT_MONOTONIC_TIMESTAMP != 0 {
+            Some(TraceTimestamp::StrictMonotonic)
+        } else if flags.0 & MONOTONIC_TIMESTAMP != 0 {
+            Some(TraceTimestamp::Monotonic)
+        } else {
+            None
+        }
+    }
+
+    /// The event tag this flavour produces (`erlang:trace/3`: a time-stamped event is a
+    /// `trace_ts`, whichever of the three flags asked for it).
+    pub(crate) fn tag(self) -> &'static str {
+        "trace_ts"
+    }
+}
+
+/// The `{MegaSecs, Secs, MicroSecs}` triple of `erlang:timestamp/0` for a duration since the
+/// Unix epoch.
+///
+/// The seconds are split into a millions part and a remainder exactly as the `os:timestamp/0`
+/// triple is defined, so `MegaSecs` counts whole millions of seconds and `Secs` is the rest.
+fn wall_clock_triple(since_epoch: Duration) -> (i64, i64, i64) {
+    let seconds = since_epoch.as_secs();
+    (
+        (seconds / 1_000_000) as i64,
+        (seconds % 1_000_000) as i64,
+        i64::from(since_epoch.subsec_micros()),
+    )
+}
+
+/// The `timestamp` flavour's element for the wall clock read now.
+///
+/// A clock before the Unix epoch (which no supported platform reports) is the epoch itself —
+/// never a panic and never a fabricated "now".
+fn wall_clock_now() -> (i64, i64, i64) {
+    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since_epoch) => wall_clock_triple(since_epoch),
+        Err(_) => wall_clock_triple(Duration::ZERO),
+    }
+}
+
+/// The monotonic base of this runtime: the instant the first monotonic time stamp was asked
+/// for.
+///
+/// `timers.rs` keeps no exported epoch (its deadlines are [`Instant`]s compared against each
+/// other), so the base is established here on first use. `Instant` is the platform's monotonic
+/// clock, so the difference never goes backwards and is immune to wall-clock adjustments.
+static MONOTONIC_BASE: OnceLock<Instant> = OnceLock::new();
+
+/// Nanoseconds elapsed since [`MONOTONIC_BASE`] — `erlang:monotonic_time()`'s native unit.
+fn monotonic_nanos() -> i64 {
+    let base = *MONOTONIC_BASE.get_or_init(Instant::now);
+    elapsed_nanos(Instant::now().duration_since(base))
+}
+
+/// A duration in nanoseconds as the integer `erlang:monotonic_time/0` reports (`i64`, which
+/// covers the full `Instant` range — the saturation is the C's own `i64` counter).
+fn elapsed_nanos(elapsed: Duration) -> i64 {
+    elapsed.as_nanos().min(i64::MAX as u128) as i64
+}
+
+/// The `UniqueMonotonicInteger` of a `strict_monotonic_timestamp`: the next value of a
+/// process-wide counter that only ever increases.
+static UNIQUE_MONOTONIC: AtomicU64 = AtomicU64::new(0);
+
+/// The next unique monotonic integer (1-based, strictly increasing per runtime process).
+fn next_unique_monotonic() -> u64 {
+    UNIQUE_MONOTONIC.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 // The BIF layer -----------------------------------------------------------------------------
 
 impl RuntimeContext<'_> {
@@ -676,6 +787,157 @@ impl RuntimeContext<'_> {
             self,
             &[flags_pair, tracer_pair, match_spec_pair, traced_pair],
         )
+    }
+}
+
+// Emitting events ---------------------------------------------------------------------------
+
+impl RuntimeContext<'_> {
+    /// Emits one `{trace, Traced, Event, Payload…}` / `{trace_ts, …}` event message to
+    /// `traced`'s tracer — the single term-building and delivery point for the events the
+    /// ordinary trace surface produces (contract A.8, item 1).
+    ///
+    /// * `traced` is the process the event is **about**, and the one whose flags and tracer are
+    ///   consulted. For the `send` event that is the **sending** process: the `send` flag lives
+    ///   on the sender, so a third party sending *to* a `[send]`-traced process produces no
+    ///   event.
+    /// * `event` is the event atom (`send`) and `payload` are its elements, in order, after the
+    ///   `{trace, Traced, Event, …}` prefix — for a `send` the message and then the destination,
+    ///   i.e. the whole event is `{trace, Sender, send, Msg, To}`.
+    /// * The event is **delivered as a message** to the tracer ([`TraceEntry::tracer`]) — never
+    ///   returned — and delivered through [`RuntimeContext::deliver_message`] rather than the
+    ///   `send` seam, so emitting an event does not itself emit an event. (The oracle's own
+    ///   trace messages bypass tracing the same way; without the bypass a traced sender whose
+    ///   tracer is itself traced would recurse forever.)
+    /// * The trailing element is the [`TraceTimestamp::select`] flavour of the sender's flags,
+    ///   if any; the tag is then `trace_ts` ([`TraceTimestamp::tag`]).
+    ///
+    /// Nothing is emitted when `traced` has no trace entry, when its entry records no tracer,
+    /// or when its `silent` flag is set — a `silent` tracee is the flag that suppresses its
+    /// events, and `erts_internal:trace/3` here records a tracer even for it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the term writers report (a full heap). A tracer the process table no longer
+    /// holds is **not** an error: the event is dropped, exactly as the oracle drops an
+    /// undeliverable trace message (tracing must never fail the traced program).
+    /// `pub(crate)` because it is the emitter [`RuntimeContext::trace_send_events`] builds on;
+    /// the next event family (a `beam_engine` per-call hook) calls it the same way.
+    pub(crate) fn emit_trace_event(
+        &mut self,
+        traced: ProcessId,
+        event: &str,
+        payload: &[Eterm],
+    ) -> Result<()> {
+        let Some(entry) = self.runtime.trace().get(traced).cloned() else {
+            return Ok(());
+        };
+        if entry.flags.0 & SILENT != 0 {
+            return Ok(());
+        }
+        let Some(tracer) = entry.tracer else {
+            return Ok(());
+        };
+        let timestamp = TraceTimestamp::select(entry.flags);
+        let tag = self.atom(timestamp.map_or("trace", TraceTimestamp::tag))?;
+        let event = self.atom(event)?;
+        let from = traced.to_eterm();
+        let mut elements = Vec::with_capacity(payload.len() + 4);
+        elements.push(tag);
+        elements.push(from);
+        elements.push(event);
+        elements.extend_from_slice(payload);
+        if let Some(flavour) = timestamp {
+            let stamp = self.timestamp_term(flavour)?;
+            elements.push(stamp);
+        }
+        let message = terms::make_tuple(self, &elements)?;
+        match self.deliver_message(tracer, from, message) {
+            // No process for the tracer: the oracle drops the event and the traced program's
+            // send stays successful (`bif.c:2478-2480`).
+            Err(BeamError::TermNotFound) => Ok(()),
+            delivered => delivered,
+        }
+    }
+
+    /// The trailing time-stamp element of a `trace_ts` event, for one [`TraceTimestamp`]
+    /// flavour: `{MegaSecs, Secs, MicroSecs}` (wall clock), the nanoseconds since the
+    /// runtime's monotonic base, or `{Nanoseconds, UniqueMonotonicInteger}`.
+    fn timestamp_term(&mut self, flavour: TraceTimestamp) -> Result<Eterm> {
+        match flavour {
+            TraceTimestamp::Wall => {
+                let (mega, secs, micro) = wall_clock_now();
+                let elements = [make_small(mega), make_small(secs), make_small(micro)];
+                terms::make_tuple(self, &elements)
+            }
+            TraceTimestamp::Monotonic => Ok(make_small(monotonic_nanos())),
+            TraceTimestamp::StrictMonotonic => {
+                let nanos = make_small(monotonic_nanos());
+                // The unique integer is a `u64` counter; every value this accepts fits the
+                // 60-bit small range for any realistic uptime (`u32::MAX` events, at least).
+                let unique = make_small(i64::try_from(next_unique_monotonic()).unwrap_or(i64::MAX));
+                let elements = [nanos, unique];
+                terms::make_tuple(self, &elements)
+            }
+        }
+    }
+
+    /// Emits the trace events a **completed** `send` produces for the sending process — the
+    /// runtime's half of contract A.8 item 1. Called by the send seam
+    /// ([`RuntimeContext::send_message`](crate::context::RuntimeContext::send_message)) once the
+    /// payload has been delivered; the caller is the sending process (`self.pid()`), and `to` is
+    /// the destination **term as passed to the send**, which the events carry verbatim.
+    ///
+    /// Two independent events:
+    ///
+    /// 1. the ordinary `{trace, Sender, send, Msg, To}` — emitted only when the sender's trace
+    ///    entry has the `send` bit set ([`RuntimeContext::emit_trace_event`] does the rest);
+    /// 2. the sequential-trace `{seq_trace, Label, {send, Serial, From, To, Msg}}`
+    ///    (`lib/kernel/src/seq_trace.erl:62-90`), emitted only when the sender's token has the
+    ///    `send` flag ([`crate::seq_trace::FLAG_SEND`]). The token is **stamped first** — the
+    ///    documented `Serial` is the counter the send attaches, and stamping also makes this
+    ///    process the token's `From` — and the event is dropped when no system tracer is
+    ///    configured, exactly as `seq_trace:print/1`'s event is
+    ///    (`erlang:system_flag(sequential_tracer, _)` is not implemented).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the term writers report (a full heap); an undeliverable event is not an error
+    /// (see [`RuntimeContext::emit_trace_event`]).
+    pub(crate) fn trace_send_events(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        let sender = self.pid();
+        let send_traced = self
+            .runtime
+            .trace()
+            .get(sender)
+            .is_some_and(|entry| entry.flags.0 & SEND != 0);
+        if send_traced {
+            self.emit_trace_event(sender, "send", &[message, to])?;
+        }
+        let send_token = self
+            .runtime
+            .seq_trace()
+            .token(sender)
+            .filter(|token| token.flags & crate::seq_trace::FLAG_SEND != 0);
+        if let Some(token) = send_token {
+            let from = sender.to_eterm();
+            let stamped = self
+                .runtime
+                .seq_trace_mut()
+                .advance_serial(sender, from)
+                .unwrap_or(token);
+            let tracer = self.runtime.seq_trace().tracer();
+            if let Some(tracer) = tracer {
+                let event = self.seq_trace_send_message(stamped, to, message)?;
+                match self.deliver_message(tracer, from, event) {
+                    // As for the ordinary event: no tracer process means the event is dropped,
+                    // never a failed send.
+                    Err(BeamError::TermNotFound) => {}
+                    delivered => delivered?,
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -832,6 +1094,144 @@ mod tests {
         // The counter is not reset by `clear_all`.
         assert_eq!(state.ref_seq(), 2);
         assert_eq!(state.next_ref_seq(), 3);
+    }
+
+    // The event time stamps (the pure helpers) ----------------------------------------------
+
+    #[test]
+    fn the_wall_clock_triple_is_the_os_timestamp_split() {
+        // 1_234_567 seconds and 890_123 microseconds: two whole mega-seconds and a remainder.
+        assert_eq!(wall_clock_triple(Duration::new(1_234_567, 890_123_000)), (1, 234_567, 890_123));
+        // The epoch itself, and a sub-second duration.
+        assert_eq!(wall_clock_triple(Duration::ZERO), (0, 0, 0));
+        assert_eq!(wall_clock_triple(Duration::from_micros(999_999)), (0, 0, 999_999));
+        // Exactly one mega-second has no remainder.
+        assert_eq!(wall_clock_triple(Duration::from_secs(1_000_000)), (1, 0, 0));
+    }
+
+    #[test]
+    fn the_monotonic_elapsed_time_is_nanoseconds() {
+        assert_eq!(elapsed_nanos(Duration::ZERO), 0);
+        assert_eq!(elapsed_nanos(Duration::from_nanos(7)), 7);
+        assert_eq!(elapsed_nanos(Duration::from_secs(3)), 3_000_000_000);
+        // A duration too large for an `i64` saturates at the C's `i64` counter maximum.
+        assert_eq!(elapsed_nanos(Duration::from_secs(u64::MAX)), i64::MAX);
+    }
+
+    #[test]
+    fn the_timestamp_flavour_precedence_and_tag() {
+        let flavour =
+            |names: &[&str]| TraceTimestamp::select(flags_from_atoms(names).expect("flags"));
+        assert_eq!(flavour(&["send"]), None);
+        assert_eq!(flavour(&["send", "timestamp"]), Some(TraceTimestamp::Wall));
+        assert_eq!(flavour(&["send", "monotonic_timestamp"]), Some(TraceTimestamp::Monotonic));
+        assert_eq!(
+            flavour(&["send", "strict_monotonic_timestamp"]),
+            Some(TraceTimestamp::StrictMonotonic)
+        );
+        // Precedence: `timestamp` > `strict_monotonic_timestamp` > `monotonic_timestamp`.
+        assert_eq!(
+            flavour(&["timestamp", "strict_monotonic_timestamp"]),
+            Some(TraceTimestamp::Wall)
+        );
+        assert_eq!(
+            flavour(&["strict_monotonic_timestamp", "monotonic_timestamp"]),
+            Some(TraceTimestamp::StrictMonotonic)
+        );
+        assert_eq!(
+            flavour(&["timestamp", "strict_monotonic_timestamp", "monotonic_timestamp"]),
+            Some(TraceTimestamp::Wall)
+        );
+        // Whichever flavour asked for it, the event is a `trace_ts`.
+        for names in [
+            vec!["timestamp"],
+            vec!["monotonic_timestamp"],
+            vec!["strict_monotonic_timestamp"],
+        ] {
+            let selected = flavour(&names).expect("a flavour");
+            assert_eq!(selected.tag(), "trace_ts", "{names:?}");
+        }
+    }
+
+    #[test]
+    fn the_monotonic_and_unique_counters_only_go_forwards() {
+        let first = monotonic_nanos();
+        let second = monotonic_nanos();
+        assert!(first >= 0, "the monotonic base is the first read, got {first}");
+        assert!(second >= first, "{second} >= {first}");
+
+        let unique = next_unique_monotonic();
+        assert_eq!(next_unique_monotonic(), unique + 1, "strictly increasing");
+        assert!(next_unique_monotonic() > unique);
+    }
+
+    #[test]
+    fn a_fresh_runtime_process_emits_the_send_event_and_the_seq_trace_event() {
+        use beam_bifs::NullSink;
+
+        let mut rt = crate::Runtime::with_defaults().expect("the default runtime");
+        let pid = rt.self_pid();
+        let label = rt.intern("a-label");
+        let message = rt.intern("payload");
+        let send = rt.intern("send");
+        let trace = rt.intern("trace");
+        let seq_trace = rt.intern("seq_trace");
+        // The sender is `[send]`-traced and reports to itself, and its sequential-trace token
+        // has the `send` flag with a system tracer configured (both unreachable from outside
+        // the crate, which is why this case lives here).
+        rt.trace_mut().set(
+            pid,
+            flags_from_atoms(&["send"]).expect("send"),
+            Some(pid),
+        );
+        rt.seq_trace_mut()
+            .set_flag(pid, pid.to_eterm(), crate::seq_trace::FLAG_SEND, true);
+        rt.seq_trace_mut().set_label(pid, pid.to_eterm(), label);
+        rt.seq_trace_mut().set_tracer(Some(pid));
+
+        let mut sink = NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
+        ctx.send_message(pid.to_eterm(), message).expect("send");
+
+        // The mailbox holds exactly three messages, in order: the payload, the ordinary
+        // `{trace, …}` event, then the sequential-trace `{seq_trace, …}` event.
+        ctx.receive_reset().expect("timeout");
+        let mut messages = Vec::new();
+        while let Some(term) = ctx.receive_next().expect("receive_next") {
+            messages.push(term);
+            ctx.receive_remove().expect("remove_message");
+            assert!(messages.len() < 8, "the mailbox keeps draining: {messages:?}");
+        }
+        assert_eq!(messages.len(), 3, "the payload and the two events");
+
+        // 1. the payload itself.
+        assert_eq!(messages[0], message);
+
+        // 2. `{trace, Sender, send, Msg, To}`.
+        let event = messages[1];
+        assert_eq!(terms::tuple_arity(event).expect("a tuple"), 5);
+        assert_eq!(terms::tuple_element(event, 0).expect("the tag"), trace);
+        assert_eq!(terms::tuple_element(event, 1).expect("the tracee"), pid.to_eterm());
+        assert_eq!(terms::tuple_element(event, 2).expect("the event"), send);
+        assert_eq!(terms::tuple_element(event, 3).expect("the message"), message);
+        assert_eq!(terms::tuple_element(event, 4).expect("the destination"), pid.to_eterm());
+
+        // 3. `{seq_trace, Label, {send, {Previous, Current}, From, To, Msg}}`.
+        let event = messages[2];
+        assert_eq!(terms::tuple_arity(event).expect("a tuple"), 3);
+        assert_eq!(terms::tuple_element(event, 0).expect("the tag"), seq_trace);
+        assert_eq!(terms::tuple_element(event, 1).expect("the label"), label);
+        let payload = terms::tuple_element(event, 2).expect("the payload");
+        assert_eq!(terms::tuple_arity(payload).expect("a tuple"), 5);
+        assert_eq!(terms::tuple_element(payload, 0).expect("the event"), send);
+        let counters = terms::tuple_element(payload, 1).expect("the serial");
+        // `Serial` is the documented `{Previous, Current}` pair; the send stamped it, so the
+        // current counter is 1 (`seq_trace.erl:88-90`).
+        assert_eq!(terms::tuple_element(counters, 0).expect("previous"), make_small(0));
+        assert_eq!(terms::tuple_element(counters, 1).expect("current"), make_small(1));
+        assert_eq!(terms::tuple_element(payload, 2).expect("from"), pid.to_eterm());
+        assert_eq!(terms::tuple_element(payload, 3).expect("to"), pid.to_eterm());
+        assert_eq!(terms::tuple_element(payload, 4).expect("the message"), message);
     }
 
     // The trace-pattern model ---------------------------------------------------------------

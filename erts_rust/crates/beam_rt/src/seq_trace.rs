@@ -15,7 +15,9 @@
 //! * **the flag bitmask** — [`FLAGS`]/[`flag_bit`]/[`decode_flags`]/[`encode_flags`] mirror
 //!   `seq_trace.erl`'s `?SEQ_TRACE_*` constants and its `decode_flags/1`;
 //! * **the output** — [`RuntimeContext::seq_trace_message`] builds the documented
-//!   `{seq_trace, Label, {print, Serial, From, _, Info}}` message a system tracer receives.
+//!   `{seq_trace, Label, {print, Serial, From, _, Info}}` message a system tracer receives,
+//!   and [`RuntimeContext::seq_trace_send_message`] its `{send, …}` sibling (the event the
+//!   send path emits when the sender's token has [`FLAG_SEND`]).
 //!
 //! The whole model is **pure**: [`SeqTrace`] holds no runtime borrow, allocates nothing and
 //! can be unit-tested on its own; only the term-building half
@@ -34,10 +36,11 @@
 //!
 //! # Deliberately out of scope (a later stage)
 //!
-//! * **Token propagation.** A token riding on a sent message, the `receive` side stamping
-//!   `From`/`Serial`/`Lastcnt` from the envelope, and the `{send, …}`/`{'receive', …}` events
-//!   those two produce. Nothing here touches `beam_message`/`beam_process`; a token only ever
-//!   changes through `erlang:seq_trace/2` and the serial bump of a `print`.
+//! * **Token propagation.** A token riding on a sent message and the `receive` side stamping
+//!   `From`/`Serial`/`Lastcnt` from the envelope (and the `{'receive', …}` event that follows).
+//!   The **send** event *is* emitted, by the send path, which stamps the sending process's own
+//!   token; nothing here touches `beam_message`/`beam_process`, so the token is not carried
+//!   with the message.
 //! * **The system tracer.** `erlang:system_flag(sequential_tracer, _)` (and therefore
 //!   `seq_trace:set_system_tracer/1`) is not implemented, so [`SeqTrace::tracer`] stays `None`
 //!   and the message a `print` builds has no recipient. That is **not** a divergence: the
@@ -539,7 +542,7 @@ impl RuntimeContext<'_> {
     }
 
     /// The documented sequential-trace output message
-    /// (`lib/kernel/src/seq_trace.erl:42-90`, the C's `seq_trace_output_generic`,
+    /// (`lib/kernel/src/seq_trace.erl:37-90`, the C's `seq_trace_output_generic`,
     /// `erl_trace.c:968-1029`):
     ///
     /// ```text
@@ -548,15 +551,49 @@ impl RuntimeContext<'_> {
     ///
     /// The fourth payload element is the C's `receiver`, which is `[]` for a `print` event
     /// (`seq_trace_output_generic` is called with `NIL`). The same builder serves the
-    /// `{send, …}`/`{'receive', …}` events a later stage adds, with the receiver term filled
-    /// in — which is why the shape is built here rather than inline in the caller.
+    /// `{send, …}`/`{'receive', …}` events — [`Self::seq_trace_send_message`] is its `send`
+    /// form — which is why the shape is built here rather than inline in the caller.
     pub(crate) fn seq_trace_message(&mut self, token: Token, info: Eterm) -> Result<Eterm> {
-        let tag = self.atom("print")?;
+        self.seq_trace_output("print", token, NIL, info)
+    }
+
+    /// The sequential-trace **send** event
+    /// (`lib/kernel/src/seq_trace.erl:62-68`):
+    ///
+    /// ```text
+    /// {seq_trace, Label, {send, {Lastcnt, Serial}, From, To, Message}}
+    /// ```
+    ///
+    /// `From` is the stamped token's process, `To` the destination as the send carried it and
+    /// `Message` the message itself; `Serial` is the same `{PreviousSerial, ThisSerial}` pair
+    /// a `print` event reports. The send path emits it ([`crate::trace`]'s
+    /// `RuntimeContext::trace_send_events`) when the sender's token has [`FLAG_SEND`]; a token
+    /// with the `timestamp` flag does not add the documented fourth outer element yet.
+    pub(crate) fn seq_trace_send_message(
+        &mut self,
+        token: Token,
+        to: Eterm,
+        message: Eterm,
+    ) -> Result<Eterm> {
+        self.seq_trace_output("send", token, to, message)
+    }
+
+    /// The shared builder behind [`Self::seq_trace_message`] and
+    /// [`Self::seq_trace_send_message`]: the five-element payload `{Tag, {Lastcnt, Serial},
+    /// From, Receiver, Info}` wrapped in `{seq_trace, Label, Payload}`.
+    fn seq_trace_output(
+        &mut self,
+        tag: &str,
+        token: Token,
+        receiver: Eterm,
+        info: Eterm,
+    ) -> Result<Eterm> {
+        let tag = self.atom(tag)?;
         let seq_trace = self.atom("seq_trace")?;
         let lastcnt = make_small(i64::from(token.lastcnt));
         let serial = make_small(i64::from(token.serial));
         let counters = terms::make_tuple(self, &[lastcnt, serial])?;
-        let payload = terms::make_tuple(self, &[tag, counters, token.from, NIL, info])?;
+        let payload = terms::make_tuple(self, &[tag, counters, token.from, receiver, info])?;
         terms::make_tuple(self, &[seq_trace, token.label, payload])
     }
 
