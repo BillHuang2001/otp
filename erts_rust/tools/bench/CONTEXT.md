@@ -276,6 +276,16 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   fails on version skew, hence the per-file fallback.
 - The external-repo CONTEXT.md files (added read-only, no source changes) record each repo's build/bench
   entry points; consult them via `--repo` overrides.
+- **No self-hosted build exists in this crate.** Contract **A.9** is *declared* on `erlc_compiler`
+  (`erlc_compiler.rs` `contracts() -> &["A.9"]`) and `elixir_compiler` (`["A.1","A.9"]`), but **both run
+  only the system oracle** (`runtimes() -> Runtimes::SysOnly`): `erlc_compiler` shells out to the system
+  `erlc` (`erlc_program()`/`proc::which("erlc")`), `elixir_compiler` to the installed `elixirc`. Nothing
+  in the driver runs `compile:file/*`, `erlc`, `rebar3`, or any compiler **under `beam_rt`** — so the
+  crate exercises no compiler *under the Rust runtime* and no genuine self-hosted build. (The
+  `erlc_compiler.rs` module doc line "wall time for both runtimes (oracle and `beam_rt`)" is stale/wrong
+  w.r.t. the `SysOnly` gate.) Genuine end-to-end `beam_rt` execution is confined to `baseline`, `slice`,
+  and `foreign`; the full target apps (Cowboy release, EMQX, Khepri, Elixir) are all `SysOnly` and report
+  `skipped(runtime-unsupported)` under `rust`.
 - `out/` is gitignored by `../../.gitignore` (`/tools/bench/out/`); the standard artifact is
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked**
   `results/` directory (see `RESULTS.md`), which is for committed milestone numbers only — scratch
