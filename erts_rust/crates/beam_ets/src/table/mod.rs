@@ -34,11 +34,13 @@ mod ownership;
 mod read;
 mod shared;
 mod update;
+mod view;
 
 pub use access::TableAccess;
 pub use lifecycle::OwnerDeath;
 pub use ownership::{Heir, SetOpt};
 pub use shared::SharedTable;
+pub use view::{TableRead, TableTerm, TableWrite};
 pub(crate) use interior::Interior;
 use interior::build_interior;
 pub(crate) use update::{add_counters, counter_slot, replace_elements};
