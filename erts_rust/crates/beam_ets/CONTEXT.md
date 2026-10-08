@@ -772,10 +772,12 @@ impl Table {
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs, oracle order)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors (no new error enum)
 - `tests/common/mod.rs` → shared integration-test helpers (one home, no duplication)
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation)
+- `tests/common/oracle.rs` → the shared live-`erl` oracle plumbing (`escript`/`erl` invocation, `$TMPDIR` scratch, loud skip / `BEAM_ETS_REQUIRE_ORACLE`) used by the concurrency tests
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation/ownership/fixtable/shared)
 - `tests/select.rs` → the match-spec compiler + arithmetic integration tests
 - `tests/match_spec_run.rs` → the table-independent `ets:match_spec_run/2` runner tests
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl`
+- `ETS_SURFACE.md` → the `ets:*` coverage census (this crate / `beam_bifs` / missing) + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `../../erts/emulator/beam/erl_db.c` → the API + trap-loop semantics being mirrored (read-only)
 - `../../erts/emulator/beam/erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` → the interiors + key/match handling being mirrored (read-only)
 - `../../erts/emulator/beam/erl_db.h` / `erl_db_hash.h` / `erl_db_tree.h` → flags/fields (read-only)
