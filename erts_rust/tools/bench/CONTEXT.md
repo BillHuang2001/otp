@@ -88,7 +88,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 ### Built-in workloads
 | id | category | target repo / tool | today | skip reason(s) |
 |---|---|---|---|---|
-| `baseline` | startup | oracle `erl` | **runs** (sys+rust) | `beam_rt` `erlang:memory/0,1` probe unsupported ⇒ an explicit `not-run` note on the rust memory probe (the compute loop itself runs on both) |
+| `baseline` | startup | oracle `erl` | **runs** (sys+rust) | — (both runtimes now report `erlang:memory(total)`; a *future* capability gap still degrades, see below) |
 | `erlc_compiler` | compiler | `erlc` over OTP stdlib **+** Elixir `lib/elixir/src` `.erl` sources | **runs** (quick+full) | `erlc-absent`, `corpus-missing` |
 | `elixir_compiler` | compiler | system `elixirc` over a staged `.ex` corpus from the Elixir checkout | **runs** (quick+full) | `elixirc-absent`, `corpus-missing`, `repo-missing` |
 | `plb` | compute | `/home/bill/Source/Programming-Language-Benchmarks` (`dotnet` driver) | skipped / `failed` | `dotnet-absent`, `repo-missing`, `plb-tool-failed`, `plb-no-results` |
@@ -103,11 +103,13 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   ⇒ `compute_loop_ms` + `compute_ops_per_sec`; and a **separate** VM-memory probe
   `-eval 'M = erlang:memory(total), io:format("~p~n",[M]), halt().'` ⇒ the scalar `vm_memory_total_bytes`
   (never conflated with the OS `peak_memory_bytes`, which is the compute runs' RSS). `--quick` uses 10
-  startup runs / 5 compute runs; `--full` 50 / 5. **Capability gaps degrade, they never abort:** `beam_rt`
-  does not implement `erlang:memory/0,1` (it reports a bare `beam_rt: error undef`, exit 1), so its memory
-  probe records **no** metric and the explicit note `vm_memory_total_bytes: not-run (unsupported:
-  erlang:memory/1)`; the compute loop, the startup summary and every other metric are still produced. A
-  genuine (non-capability-gap) probe failure is surfaced verbatim, never fabricated. Note: the loop is
+  startup runs / 5 compute runs; `--full` 50 / 5. **Both runtimes now produce all three metrics:**
+  `beam_rt` implements `erlang:memory/0,1` through the `MemoryHook` seam, so the rust memory probe
+  records a real figure (e.g. 801 088 B) instead of the historical `not-run (unsupported:
+  erlang:memory/1)` note. **Capability gaps degrade, they never abort:** if a runtime does not implement
+  a probed BIF, the probe records **no** metric plus an explicit `… : not-run (unsupported: …)` note,
+  while the compute loop, the startup summary and every other metric are still produced. A genuine
+  (non-capability-gap) probe failure is surfaced verbatim, never fabricated. Note: the loop is
   dominated by the natively-served `lists:seq/2`+`lists:sum/1`, so a near-parity rust figure reflects the
   native floor, **not** interpreter throughput (that is `foreign`).
 - `erlc_compiler`: compiles a bounded deterministic slice (first 30 `.erl` of each corpus) of the in-repo
@@ -217,8 +219,9 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `foreign.rs`).
 - `tests/integration.rs` → hermetic synthetic-report round-trip + `compare` tests (no oracle needed).
 - `tests/oracle_smoke.rs` → `baseline` smoke test against the real oracle (no-op skip when unresolved).
-- `RESULTS.md` → the definitive `--full` results summary (tables, commands, verified skips, caveats).
-- `results/` → committed raw `Report` JSON from the milestone run + the `bench compare` diffs.
+- `RESULTS.md` → the definitive results summary (tables, commands, verified skips, host-load record, caveats).
+- `results/` → committed raw `Report` JSON + `bench compare` diffs: `m3-*` = the current run, `m1-*` = the
+  superseded Milestone-1 snapshot (kept verbatim for reference).
 
 ## Constraints
 - `#![forbid(unsafe_code)]`; **no new crates** (deps resolve offline: `serde`, `serde_json`, `beam_common`).
@@ -253,9 +256,16 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - **`$BENCH_TRY_NIX`** (opt-in, default off): when set, `khepri`/`emqx`/`plb` may resolve `rebar3`/`dotnet`
   via `nix shell nixpkgs#<attr> --command …` instead of a PATH lookup. Without it, PATH-only ⇒ honest
   `skipped(<tool>-absent)`.
-- **Cowboy** builds a relx release in the scratch copy (~40 s, network fetch of cowlib+ranch); the release
+- **Cowboy** builds a relx release in the scratch copy (~40–65 s, network fetch of cowlib+ranch); the release
   start script `foreground` **`exec`s** `erlexec`, so killing the spawned child stops the VM and its pid
   is the Erlang VM (so `VmHWM` polling works).
+- **The benchmark host is shared and usually loaded.** `/proc/loadavg` has been observed at 8–40 running
+  tasks on 14 CPUs (36–46 runnable while the driver was idle). Consequence: absolute latencies/throughputs
+  from `--full --runtime all` runs swing by up to **4.5×** (startup) and **11×** (`cowboy` req/s) between
+  identical runs, because the oracle `erl` (a 14-scheduler SMP VM) loses much more to CPU contention than
+  `beam_rt`. Prefer the **focused cross-runtime run** (`--workloads baseline,slice,foreign`), which is
+  stable to ±5 %, always record `/proc/loadavg` with the numbers, and never quote a single full run as a
+  constant.
 - **Elixir**: the in-repo checkout (`/home/bill/Source/elixir`, `1.21.0-dev`) is unbuilt; the workload
   measures the installed system `elixirc` (1.20.4). Compiling the checkout's stdlib in one `elixirc` batch
   fails on version skew, hence the per-file fallback.
@@ -288,27 +298,40 @@ Nothing below is required for a code review; it is how the `results/` artifacts 
 produced. Build both the driver and the Rust runtime once, then run the workloads:
 
 ```sh
-# 1. build (from the repo root; the committed wrapper supplies a writable CARGO_HOME)
+# 1. build the driver AND the runtime (from the repo root; the wrapper supplies a writable CARGO_HOME)
 erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p bench -p beam_rt
 
-# 2. the primary milestone report (--full, BOTH runtimes, all workloads) — ~4 min
+# 2. the FULL report (--full, BOTH runtimes, all 9 workloads) — ~4-10 min (host-load dependent)
 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --full --runtime all --out-file erts_rust/tools/bench/out/milestone-full.json --verbose
 
-# 3. the opt-in nix toolchain workloads (rebar3 present only via the Nix store here) — ~80 s
+# 3. the FOCUSED cross-runtime report — the reliable source for sys-vs-rust tables (~2 min):
+#    only the three cross-runtime workloads, so both sides see the same machine conditions
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+    run --full --runtime all --workloads baseline,slice,foreign \
+    --out-file erts_rust/tools/bench/out/xrun-full.json --verbose
+
+# 4. the opt-in nix toolchain workloads (rebar3 present only via the Nix store here) — ~80 s
 BENCH_TRY_NIX=1 erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --full --runtime sys --workloads khepri,emqx \
     --out-file erts_rust/tools/bench/out/nix-full.json --verbose
 
-# 4. compare (cross-runtime inside one report, or two files)
-erts_rust/target/release/bench compare erts_rust/tools/bench/out/milestone-full.json
-erts_rust/target/release/bench compare erts_rust/tools/bench/out/milestone-full.json \
-                                       erts_rust/tools/bench/out/milestone-full-2.json
+# 5. compare (cross-runtime inside one report, or two files)
+erts_rust/target/release/bench compare erts_rust/tools/bench/out/xrun-full.json
+erts_rust/target/release/bench compare erts_rust/tools/bench/out/xrun-full.json \
+                                       erts_rust/tools/bench/out/xrun-full-2.json
 ```
 
 `foreign` runs under **both** runtimes; every other repo workload is `sys`-only, so a `--runtime all`
 report shows a genuine sys-vs-rust row only for `baseline`, `slice`, and `foreign`. Read the numbers as
 *reproducible on this host*, not milestone results (single host, finite sample counts).
+
+> **Always measure on a quiet host.** The benchmark host is shared: on the recorded session
+> `/proc/loadavg` sat at **8–40 running tasks on 14 CPUs**, and the four `--full --runtime all` runs
+> taken in one session disagreed by up to **4.5×** on startup latency and **11×** on `cowboy`
+> throughput. The focused cross-runtime run (step 3) is far more stable (two runs agree within ±5 % on
+> all but four rows) because both sides see the same conditions. Check `/proc/loadavg` before and after
+> a run and record it in `RESULTS.md`.
 
 **Skip reasons, re-verified on this host (2026):**
 - `plb` → `skipped(dotnet-absent)`: `dotnet` is on neither `PATH` nor in the Nix store
@@ -333,13 +356,15 @@ cross-runtime Rust coverage cannot silently disappear. `foreign.rs`'s unit tests
 (sources present, calibrated `N`, `N_sys > N_rust`), the per-side argv, and the startup-cancelling
 per-call math.
 
-## Measured — the definitive `--full` verification run
+## Measured — the current verification run
 
-The milestone numbers live in **`RESULTS.md`** (one table per workload category) and are archived as
-raw harness JSON under **`results/`** (`bench-full-runtimes-all.json` = the primary run,
-`…-run2.json` = an identical repetition, `bench-full-nix-khepri-emqx.json`, the `plb` attempt, plus two
-`bench compare` diffs). `RESULTS.md` also carries the full environment record, the exact commands and a
-"what these numbers do and do not mean" section.
+The current numbers live in **`RESULTS.md`** (one table per workload category) and are archived as
+raw harness JSON under **`results/`** as `m3-*` (`m3-bench-xrun-baseline-slice-foreign.json` = the
+primary cross-runtime run, `…-run2.json` = its repetition, `m3-bench-full-runtimes-all.json` = the
+primary full run, `m3-bench-quick-runtimes-all.json`, `m3-bench-full-nix-khepri-emqx.json`, the `plb`
+attempt, plus three `bench compare` diffs). The **superseded Milestone-1** artifacts are kept as
+`m1-*`. `RESULTS.md` also carries the full environment record, the exact commands, the host-load
+record and a "what these numbers do and do not mean" section.
 
 Reference host: NixOS 26.11, `x86_64`, 14 CPUs (Intel Core Ultra 7 356H), 62.3 GiB RAM;
 oracle = system `erl` **OTP 29.1.1 / erts-17.1**, rust = `erts_rust/target/release/beam_rt`
@@ -348,23 +373,26 @@ oracle = system `erl` **OTP 29.1.1 / erts-17.1**, rust = `erts_rust/target/relea
 from the Nix store; `$HOME` read-only. `--full` sample counts: `baseline` startup n=50 / compute n=5;
 `slice` n=25 per case; `foreign` n=10 per case; `cowboy` 16 connections × 5 s (20 000 latency samples).
 
-| workload | runtime | headline (`--full`) |
+| workload | runtime | headline (current run) |
 |---|---|---|
-| `baseline` | sys | startup p50 **118.31 ms** / p99 145.39 ms; compute loop 190.48 ms p50 ⇒ **5.46 M ops/s**; `erlang:memory(total)` 55.3 MB; peak RSS 124.5 MiB |
-| `baseline` | rust | startup p50 **150.86 ms** / p99 172.29 ms (≈ 1.28× sys). The **archived M1** report's compute row is "not run"; the harness now measures the compute loop on both runtimes and only the `erlang:memory/1` probe is a capability gap — see `RESULTS.md` §3.2 |
-| `erlc_compiler` | sys | **9.45 files/s** (7 327 loc/s), 60 files, peak RSS 128.6 MiB |
-| `elixir_compiler` | sys | **4.86 files/s** (2 438 loc/s), 105 attempted → 223 `.beam` via the per-file fallback, peak RSS 202.5 MiB |
-| `cowboy` | sys | **218 788 req/s**, latency p50 0.063 ms / p99 0.387 ms, 0 errors in 1 094 402 req, peak RSS 153.4 MiB |
-| `khepri` | sys | `rebar3 eunit` **76.9 s**, peak RSS 349.0 MiB (`BENCH_TRY_NIX=1`) |
-| `slice` | sys vs rust | 9/9 identical stdout; wall **~parity** (1.11–1.32×) because every case is startup-dominated; peak RSS 68.3 vs **36.7 MiB** |
-| `foreign` | sys vs rust | per-call cost **703×–9 891×** higher under rust; startup ~parity (~130 ms vs ~150 ms); peak RSS 68.7 vs **27.8 MiB** |
+| `baseline` | sys | startup p50 **128.08 ms** / p99 150.56 ms; compute loop 194.65 ms p50 ⇒ **5.11 M ops/s**; `erlang:memory(total)` 36.2 MB; peak RSS 129.8 MiB |
+| `baseline` | rust | startup p50 **154.93 ms** / p99 183.27 ms (**1.21×** sys); compute loop p50 208.06 ms ⇒ **5.03 M ops/s** (≈parity); `erlang:memory(total)` **801 088 B** (real, via the `MemoryHook` seam); peak RSS 33.0 MiB |
+| `erlc_compiler` | sys | **9.12 files/s** (7 070 loc/s), 60 files, peak RSS 129.0 MiB |
+| `elixir_compiler` | sys | **4.82 files/s** (2 419 loc/s), 105 attempted → 223 `.beam` via the per-file fallback, peak RSS 205.7 MiB |
+| `cowboy` | sys | **180 502 req/s**, latency p50 0.070 ms / p99 0.678 ms, 0 errors in 902 807 req, peak RSS 156.1 MiB |
+| `khepri` | sys | `rebar3 eunit` **79.6 s**, peak RSS 361.0 MiB (`BENCH_TRY_NIX=1`) |
+| `slice` | sys vs rust | 9/9 identical stdout; wall **~parity** (1.07–1.28×) because every case is startup-dominated; peak RSS 69.0 vs **36.8 MiB** |
+| `foreign` | sys vs rust | per-call cost **150×–1 499×** higher under rust; startup ~parity (~135 ms vs ~152 ms); peak RSS 68.7 vs **27.6 MiB** |
 | `plb`, `emqx` | sys | not run — verified reasons in `RESULTS.md` §5 |
 
 **The execution-bound result is the `foreign` per-call gap, not the `slice` wall times**: `slice` cases
-are single-call programs whose wall time is dominated by the fixed startup cost below. Run-to-run
-stability (Run 1 vs Run 2, 88 numeric rows, `results/compare-run1-vs-run2.txt`): everything within a
-few percent except `foreign` rust `ns_per_call` (up to **+35 %**) and `slice` rust `string_str_length`
-(**+48 %**) — single-digit-percent figures reproduce, two-digit ones do not.
+are single-call programs whose wall time is dominated by the fixed startup cost below. Since the M1
+archive the `foreign` per-call gap fell from **703×–9 891×** to **150×–1 499×** (the
+whole-`AtomTable`-clone defect was fixed); what remains is the residual per-BIF-call cost below.
+Cross-runtime stability (`results/m3-compare-xrun-run1-vs-run2.txt`, 76 rows): all but four rows within
+±5 %; the movers are `foreign` rust `emqx_base62_encode` `ns_per_call` (**+26 %**) and `startup_ms`
+(**−11 %**), and `foreign` sys `emqx_base62_decode`/`encode` `ns_per_call` (**−15 %** / **−12 %**).
+Full-run stability is far worse — see the Runbook note.
 
 > **`ERTS_STDLIB_DIR` note (a real `beam_rt` behavior, re-measured on this host):** the Rust runtime
 > resolves the system code path by spawning `erl` once per process, so `beam_rt -noshell -eval 'halt().'`
@@ -373,31 +401,39 @@ few percent except `foreign` rust `ns_per_call` (up to **+35 %**) and `slice` ru
 > driver/observer and never mutates the runtime's environment beyond argv — and the effect is confined
 > to the `_startup_ms` metric, which the per-call metric cancels.
 
-## Reading the sys-vs-rust per-call gap (verified)
+## Reading the current sys-vs-rust per-call gap (verified)
 
-The headline `foreign` per-call gap in the M1 report (**703×–9 891×**) is a **real runtime cost, not a
-harness artifact**. The startup-cancelled metric `(mean wall@N − mean wall@0)/N` was cross-checked by
-hand: a plain shell loop calling the same release `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>`
-gives 258 µs/call for `cowboy_bstr:to_lower` vs the harness's 265 µs/call, and ~360 ns for the oracle —
-so CLI re-entry, per-call module reloads and per-call GC are all ruled out.
+The `foreign` per-call gap (**150×–1 499×**, down from M1's 703×–9 891×) is a **real runtime cost, not a
+harness artifact**. The startup-cancelled metric `(mean wall@N − mean wall@0)/N` is stable across the
+two focused runs (run 1 vs run 2 within ±5 % on three of four cases) and reproduces with a plain shell
+loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI re-entry, per-call module
+reloads and per-call GC are all ruled out.
 
-The cost is dominated by a **specific per-BIF-call overhead**, not by interpreter dispatch: `beam_rt`
-deep-clones its whole `AtomTable` on every BIF call (`RuntimeContext::call_registered` commits via
-`Rc::make_mut` while an `atoms` handle is still alive), so each per-iteration BIF (`-`, `byte_size`, …)
-adds tens of µs. Hand-built probe drivers (same `run` action) show: a **BIF-free** interpreted list walk
-≈ 0 marginal/iteration; a `-`-only loop ~80–165 µs/iteration; `-`+`+` ~170–350 µs; a natively served
-`lists:seq(1,N)` ~10 µs/element. `beam_engine`'s interpreter dispatch is itself O(1) and
-allocation-free per instruction, so this is a `beam_rt` host-context defect, not an engine one.
+What remains is a **residual per-BIF-call overhead of ≈ 10.5 µs** in `beam_rt` — a known, still-open
+defect (the M1 whole-`AtomTable` clone is already fixed), so the cost scales with the *number of BIF
+calls per iteration*, not with interpreter dispatch. Measured at the recorded commit with an
+`erlc`-compiled probe (same N-vs-0 method as `foreign`):
+
+| loop (one iteration) | BIFs/iter | rust marginal |
+|---|---|---|
+| `drain([_\|T],A) -> drain(T,A)` (list walk) | 0 | ≈ 0 (within startup noise) |
+| `empty(N,A) -> empty(N-1,A)` | 1 (`-`) | **≈ 10.5 µs** |
+| `add(N,A) -> add(N-1,A+1)` | 2 (`-`,`+`) | **≈ 25.3 µs** |
+
+`beam_engine`'s interpreter dispatch is itself O(1) and allocation-free per instruction, so this is a
+`beam_rt` host-context cost, not an engine one.
 
 Consequence for reading results: startup latency and peak RSS are the trustworthy cross-runtime
-comparisons today; the per-call `ns` figures measure this defect, so treat the exact multiplier as a
-snapshot (run-to-run noise on `foreign` rust `ns_per_call` reaches ±35 %), not a stable constant.
+comparisons today. The four `foreign` rust `ns_per_call` rows — and therefore their `wall_ms` rows,
+about half of which is `N × per_call` — are **dominated by this per-BIF cost** and must not be read as
+fix-independent; treat the exact multiplier as a snapshot. A further `beam_rt` fix to this path is in
+flight; when it lands, re-run the Runbook commands rather than adjusting the numbers.
 
 ## See Also
-- `RESULTS.md` → the definitive `--full` results summary (one table per workload category, exact
-  reproduction commands, verified skip reasons, stability, and "what these numbers do and do not mean").
+- `RESULTS.md` → the current results summary (one table per workload category, exact reproduction
+  commands, verified skip reasons, host-load record, stability, and "what these numbers mean").
 - `results/` → the raw harness JSON behind `RESULTS.md` (committed, so the numbers stay reviewable)
-  plus the two `bench compare` diffs.
+  plus the three `bench compare` diffs; `m1-*` is the superseded Milestone-1 snapshot.
 - `../CONTEXT.md` → the `tools/` node's binding shared conventions (runtime resolution, exit codes, JSON, `out/`).
 - `../../CONTEXT.md` §6/§7 → test strategy, the differential gate, staging.
 - `../../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` → the concrete target workloads + build/bench entry points.

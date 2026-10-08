@@ -1,0 +1,1011 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1791462587232,
+  "profile": "full",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    },
+    {
+      "kind": "rust",
+      "program": "erts_rust/tools/bench/../../target/release/beam_rt",
+      "version": "30",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "baseline",
+      "runtime": "sys",
+      "category": "startup",
+      "description": "system-ERTS startup latency + fixed compute loop",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 50,
+            "min": 108.881922,
+            "max": 150.857408,
+            "mean": 129.10276367999998,
+            "p50": 128.0791395,
+            "p90": 139.1831225,
+            "p99": 150.56243535
+          }
+        },
+        {
+          "name": "compute_loop_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 5,
+            "min": 186.013168,
+            "max": 211.288341,
+            "mean": 195.80064959999999,
+            "p50": 194.65427499999998,
+            "p90": 206.3585294,
+            "p99": 210.79535984
+          }
+        },
+        {
+          "name": "compute_ops_per_sec",
+          "unit": "ops/s",
+          "value": 5107235.354136435
+        },
+        {
+          "name": "vm_memory_total_bytes",
+          "unit": "bytes",
+          "value": 36225616.0
+        }
+      ],
+      "peak_memory_bytes": 136093696,
+      "notes": []
+    },
+    {
+      "workload": "slice",
+      "runtime": "sys",
+      "category": "compute",
+      "description": "the same Erlang module runs under both runtimes (per-case wall time + peak RSS)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_add_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 112.421961,
+            "max": 158.180785,
+            "mean": 135.59086735999998,
+            "p50": 135.91822200000001,
+            "p90": 153.6641488,
+            "p99": 157.68070612
+          }
+        },
+        {
+          "name": "case_add_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68427776.0,
+            "max": 72306688.0,
+            "mean": 69323489.28,
+            "p50": 69181440.0,
+            "p90": 69736857.6,
+            "p99": 72074690.56
+          }
+        },
+        {
+          "name": "case_fib_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 115.318146,
+            "max": 161.157062,
+            "mean": 135.50633576,
+            "p50": 136.230815,
+            "p90": 145.9179464,
+            "p99": 160.2277184
+          }
+        },
+        {
+          "name": "case_fib_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68628480.0,
+            "max": 71585792.0,
+            "mean": 69746524.16,
+            "p50": 69447680.0,
+            "p90": 71032832.0,
+            "p99": 71502233.6
+          }
+        },
+        {
+          "name": "case_pick_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 126.51262299999999,
+            "max": 155.503607,
+            "mean": 138.02221244,
+            "p50": 138.40052699999998,
+            "p90": 146.6282552,
+            "p99": 153.82568059999997
+          }
+        },
+        {
+          "name": "case_pick_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68579328.0,
+            "max": 71516160.0,
+            "mean": 69843517.44,
+            "p50": 69742592.0,
+            "p90": 71240908.8,
+            "p99": 71504363.52
+          }
+        },
+        {
+          "name": "case_calendar_last_day_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 118.527511,
+            "max": 165.880525,
+            "mean": 138.44345856,
+            "p50": 138.561933,
+            "p90": 156.25063219999998,
+            "p99": 164.78513451999999
+          }
+        },
+        {
+          "name": "case_calendar_last_day_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68718592.0,
+            "max": 71061504.0,
+            "mean": 69765365.76,
+            "p50": 69640192.0,
+            "p90": 70653542.4,
+            "p99": 71060520.96
+          }
+        },
+        {
+          "name": "case_queue_from_size_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 111.013382,
+            "max": 161.386593,
+            "mean": 140.76368452000003,
+            "p50": 141.31511899999998,
+            "p90": 154.0052078,
+            "p99": 160.34140548
+          }
+        },
+        {
+          "name": "case_queue_from_size_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68636672.0,
+            "max": 71618560.0,
+            "mean": 69843845.12,
+            "p50": 69742592.0,
+            "p90": 70874726.4,
+            "p99": 71456358.4
+          }
+        },
+        {
+          "name": "case_gb_trees_size_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 117.517007,
+            "max": 160.26005300000003,
+            "mean": 135.73891228,
+            "p50": 136.91547100000003,
+            "p90": 146.0489082,
+            "p99": 157.04566388
+          }
+        },
+        {
+          "name": "case_gb_trees_size_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68763648.0,
+            "max": 71475200.0,
+            "mean": 69503385.6,
+            "p50": 69472256.0,
+            "p90": 70036684.8,
+            "p99": 71165542.39999999
+          }
+        },
+        {
+          "name": "case_base64_encode_size_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 114.616146,
+            "max": 172.422257,
+            "mean": 141.31971188,
+            "p50": 139.398261,
+            "p90": 156.5445702,
+            "p99": 170.93854819999999
+          }
+        },
+        {
+          "name": "case_base64_encode_size_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68718592.0,
+            "max": 71942144.0,
+            "mean": 69685248.0,
+            "p50": 69492736.0,
+            "p90": 70333235.2,
+            "p99": 71894958.08
+          }
+        },
+        {
+          "name": "case_ordsets_from_size_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 112.32378899999999,
+            "max": 162.898806,
+            "mean": 129.88139788,
+            "p50": 128.839415,
+            "p90": 141.71791,
+            "p99": 159.20161871999997
+          }
+        },
+        {
+          "name": "case_ordsets_from_size_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68321280.0,
+            "max": 71544832.0,
+            "mean": 69201264.64,
+            "p50": 68923392.0,
+            "p90": 70197248.0,
+            "p99": 71250903.03999999
+          }
+        },
+        {
+          "name": "case_string_str_length_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 115.349873,
+            "max": 156.366341,
+            "mean": 133.99200359999998,
+            "p50": 134.638868,
+            "p90": 145.1813602,
+            "p99": 154.84420243999998
+          }
+        },
+        {
+          "name": "case_string_str_length_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 68415488.0,
+            "max": 71430144.0,
+            "mean": 69639536.64,
+            "p50": 69541888.0,
+            "p90": 70811648.0,
+            "p99": 71335772.16
+          }
+        }
+      ],
+      "peak_memory_bytes": 72306688,
+      "notes": [
+        "observed stdout: add=5 fib=6765 pick=2 calendar_last_day=29 queue_from_size=3 gb_trees_size=5 base64_encode_size=8 ordsets_from_size=3 string_str_length=5"
+      ]
+    },
+    {
+      "workload": "foreign",
+      "runtime": "sys",
+      "category": "compute",
+      "description": "real Cowboy/EMQX modules run under each runtime (per-call cost + wall latency)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_bstr_to_lower_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 196.852635,
+            "max": 225.97140199999998,
+            "mean": 211.49273320000003,
+            "p50": 210.165998,
+            "p90": 225.64147279999997,
+            "p99": 225.93840907999999
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 10,
+            "min": 68886528.0,
+            "max": 71680000.0,
+            "mean": 69716377.6,
+            "p50": 69476352.0,
+            "p90": 70902169.6,
+            "p99": 71602216.96
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 116.095707,
+            "max": 143.607073,
+            "mean": 131.49608240000003,
+            "p50": 132.559112,
+            "p90": 142.898971,
+            "p99": 143.5362628
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_ns_per_call",
+          "unit": "ns",
+          "value": 399.983254
+        },
+        {
+          "name": "case_bstr_capitalize_token_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 176.28441899999999,
+            "max": 252.822783,
+            "mean": 213.43717199999998,
+            "p50": 215.8312995,
+            "p90": 251.57542980000002,
+            "p99": 252.69804768
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 10,
+            "min": 68571136.0,
+            "max": 72003584.0,
+            "mean": 69820825.6,
+            "p50": 69701632.0,
+            "p90": 70355763.2,
+            "p99": 71838801.92
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 135.125577,
+            "max": 162.271489,
+            "mean": 146.7763638,
+            "p50": 144.969955,
+            "p90": 160.2623362,
+            "p99": 162.07057372
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_ns_per_call",
+          "unit": "ns",
+          "value": 333.304041
+        },
+        {
+          "name": "case_emqx_base62_encode_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 168.470945,
+            "max": 213.801345,
+            "mean": 187.93539270000002,
+            "p50": 187.398876,
+            "p90": 208.53255869999998,
+            "p99": 213.27446637
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 10,
+            "min": 68702208.0,
+            "max": 70447104.0,
+            "mean": 69508710.4,
+            "p50": 69507072.0,
+            "p90": 70144819.2,
+            "p99": 70416875.52
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 111.920861,
+            "max": 147.383919,
+            "mean": 132.0015465,
+            "p50": 130.45862350000002,
+            "p90": 145.5869988,
+            "p99": 147.20422698
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_ns_per_call",
+          "unit": "ns",
+          "value": 279.6692310000002
+        },
+        {
+          "name": "case_emqx_base62_decode_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 251.12614900000003,
+            "max": 280.638878,
+            "mean": 269.5252119,
+            "p50": 270.718389,
+            "p90": 280.2563033,
+            "p99": 280.60062052999996
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 10,
+            "min": 68775936.0,
+            "max": 70930432.0,
+            "mean": 69883494.4,
+            "p50": 69761024.0,
+            "p90": 70812467.2,
+            "p99": 70918635.52
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 117.131921,
+            "max": 145.07963700000002,
+            "mean": 131.26614160000003,
+            "p50": 132.7694295,
+            "p90": 139.1540802,
+            "p99": 144.48708132000002
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_ns_per_call",
+          "unit": "ns",
+          "value": 345.64767575
+        }
+      ],
+      "peak_memory_bytes": 72003584,
+      "notes": [
+        "staged 4 foreign case(s) from 2 distinct source file(s)",
+        "case bstr_to_lower: N=200000 (sys), sources=cowboy/src/cowboy_bstr.erl",
+        "case bstr_capitalize_token: N=200000 (sys), sources=cowboy/src/cowboy_bstr.erl",
+        "case emqx_base62_encode: N=200000 (sys), sources=emqx/apps/emqx/src/emqx_base62.erl",
+        "case emqx_base62_decode: N=400000 (sys), sources=emqx/apps/emqx/src/emqx_base62.erl",
+        "observed stdout: bstr_to_lower=6000000 bstr_capitalize_token=6000000 emqx_base62_encode=3200000 emqx_base62_decode=4400000",
+        "method: per-call cost = (mean wall at N iterations - mean wall at 0 iterations) / N; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of both sides",
+        "cases: 4 ok, 0 unsupported (of 4)"
+      ]
+    },
+    {
+      "workload": "baseline",
+      "runtime": "rust",
+      "category": "startup",
+      "description": "system-ERTS startup latency + fixed compute loop",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 50,
+            "min": 127.80372000000001,
+            "max": 190.573135,
+            "mean": 155.40703018,
+            "p50": 154.92679450000003,
+            "p90": 171.384316,
+            "p99": 183.27055377
+          }
+        },
+        {
+          "name": "compute_loop_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 5,
+            "min": 163.833807,
+            "max": 213.526832,
+            "mean": 198.6188474,
+            "p50": 208.062415,
+            "p90": 211.7628012,
+            "p99": 213.35042892
+          }
+        },
+        {
+          "name": "compute_ops_per_sec",
+          "unit": "ops/s",
+          "value": 5034768.920927692
+        },
+        {
+          "name": "vm_memory_total_bytes",
+          "unit": "bytes",
+          "value": 801088.0
+        }
+      ],
+      "peak_memory_bytes": 34562048,
+      "notes": []
+    },
+    {
+      "workload": "slice",
+      "runtime": "rust",
+      "category": "compute",
+      "description": "the same Erlang module runs under both runtimes (per-case wall time + peak RSS)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_add_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 129.337581,
+            "max": 182.211403,
+            "mean": 151.91126395999996,
+            "p50": 151.713817,
+            "p90": 164.996791,
+            "p99": 178.45045971999997
+          }
+        },
+        {
+          "name": "case_add_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 18141184.0,
+            "max": 18833408.0,
+            "mean": 18606653.44,
+            "p50": 18649088.0,
+            "p90": 18775244.8,
+            "p99": 18828492.8
+          }
+        },
+        {
+          "name": "case_fib_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 136.683798,
+            "max": 170.474934,
+            "mean": 153.98664368,
+            "p50": 153.986224,
+            "p90": 166.53946679999999,
+            "p99": 169.85197176
+          }
+        },
+        {
+          "name": "case_fib_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 18472960.0,
+            "max": 18845696.0,
+            "mean": 18669895.68,
+            "p50": 18657280.0,
+            "p90": 18767872.0,
+            "p99": 18829967.36
+          }
+        },
+        {
+          "name": "case_pick_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 136.617555,
+            "max": 165.616397,
+            "mean": 147.99068444,
+            "p50": 147.832859,
+            "p90": 158.9485122,
+            "p99": 164.246717
+          }
+        },
+        {
+          "name": "case_pick_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 17924096.0,
+            "max": 18751488.0,
+            "mean": 18581422.08,
+            "p50": 18644992.0,
+            "p90": 18729369.6,
+            "p99": 18749521.92
+          }
+        },
+        {
+          "name": "case_calendar_last_day_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 130.980733,
+            "max": 174.67596,
+            "mean": 158.09821084,
+            "p50": 159.43025699999998,
+            "p90": 171.7633254,
+            "p99": 174.260604
+          }
+        },
+        {
+          "name": "case_calendar_last_day_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 19316736.0,
+            "max": 19607552.0,
+            "mean": 19472384.0,
+            "p50": 19460096.0,
+            "p90": 19592806.4,
+            "p99": 19606568.96
+          }
+        },
+        {
+          "name": "case_queue_from_size_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 135.00331,
+            "max": 181.86381200000002,
+            "mean": 157.8056318,
+            "p50": 158.977105,
+            "p90": 174.9852816,
+            "p99": 180.81698624
+          }
+        },
+        {
+          "name": "case_queue_from_size_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 23015424.0,
+            "max": 23355392.0,
+            "mean": 23196139.52,
+            "p50": 23199744.0,
+            "p90": 23302144.0,
+            "p99": 23352442.88
+          }
+        },
+        {
+          "name": "case_gb_trees_size_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 137.63918,
+            "max": 193.59279400000003,
+            "mean": 155.10620744,
+            "p50": 151.30216199999998,
+            "p90": 172.0265738,
+            "p99": 189.60509944
+          }
+        },
+        {
+          "name": "case_gb_trees_size_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 19218432.0,
+            "max": 19509248.0,
+            "mean": 19368837.12,
+            "p50": 19390464.0,
+            "p90": 19457638.4,
+            "p99": 19503349.76
+          }
+        },
+        {
+          "name": "case_base64_encode_size_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 141.683477,
+            "max": 195.222195,
+            "mean": 155.51459176,
+            "p50": 151.233122,
+            "p90": 172.05254200000002,
+            "p99": 194.30062547999998
+          }
+        },
+        {
+          "name": "case_base64_encode_size_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 19136512.0,
+            "max": 20967424.0,
+            "mean": 20765900.8,
+            "p50": 20844544.0,
+            "p90": 20881408.0,
+            "p99": 20961525.76
+          }
+        },
+        {
+          "name": "case_ordsets_from_size_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 129.319844,
+            "max": 169.980996,
+            "mean": 155.31175580000001,
+            "p50": 157.804662,
+            "p90": 165.8249716,
+            "p99": 169.21368216
+          }
+        },
+        {
+          "name": "case_ordsets_from_size_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 17928192.0,
+            "max": 18952192.0,
+            "mean": 18729369.6,
+            "p50": 18821120.0,
+            "p90": 18926796.8,
+            "p99": 18950225.92
+          }
+        },
+        {
+          "name": "case_string_str_length_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 25,
+            "min": 145.49593,
+            "max": 189.00208800000001,
+            "mean": 171.82674344000003,
+            "p50": 172.871064,
+            "p90": 186.29223000000002,
+            "p99": 188.44664472
+          }
+        },
+        {
+          "name": "case_string_str_length_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 25,
+            "min": 38043648.0,
+            "max": 38563840.0,
+            "mean": 38292520.96,
+            "p50": 38285312.0,
+            "p90": 38508134.4,
+            "p99": 38562856.96
+          }
+        }
+      ],
+      "peak_memory_bytes": 38563840,
+      "notes": [
+        "observed stdout: add=5 fib=6765 pick=2 calendar_last_day=29 queue_from_size=3 gb_trees_size=5 base64_encode_size=8 ordsets_from_size=3 string_str_length=5"
+      ]
+    },
+    {
+      "workload": "foreign",
+      "runtime": "rust",
+      "category": "compute",
+      "description": "real Cowboy/EMQX modules run under each runtime (per-call cost + wall latency)",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "case_bstr_to_lower_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 251.34618399999997,
+            "max": 286.030764,
+            "mean": 271.7516096,
+            "p50": 278.00131350000004,
+            "p90": 285.3544275,
+            "p99": 285.96313035
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 10,
+            "min": 27770880.0,
+            "max": 27959296.0,
+            "mean": 27891712.0,
+            "p50": 27893760.0,
+            "p90": 27948236.8,
+            "p99": 27958190.08
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 136.46692299999998,
+            "max": 178.372454,
+            "mean": 152.13834350000002,
+            "p50": 151.09961900000002,
+            "p90": 158.1741977,
+            "p99": 176.35262837000002
+          }
+        },
+        {
+          "name": "case_bstr_to_lower_ns_per_call",
+          "unit": "ns",
+          "value": 59806.633050000004
+        },
+        {
+          "name": "case_bstr_capitalize_token_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 216.816505,
+            "max": 275.368893,
+            "mean": 248.5752282,
+            "p50": 249.3816045,
+            "p90": 268.5193809,
+            "p99": 274.68394179
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 10,
+            "min": 28770304.0,
+            "max": 28954624.0,
+            "mean": 28875571.2,
+            "p50": 28897280.0,
+            "p90": 28936192.0,
+            "p99": 28952780.8
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 140.72771600000002,
+            "max": 181.813779,
+            "mean": 157.4904008,
+            "p50": 156.4464685,
+            "p90": 172.91765339999998,
+            "p99": 180.92416644000002
+          }
+        },
+        {
+          "name": "case_bstr_capitalize_token_ns_per_call",
+          "unit": "ns",
+          "value": 60723.21826666666
+        },
+        {
+          "name": "case_emqx_base62_encode_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 199.94546799999998,
+            "max": 270.094239,
+            "mean": 232.4969353,
+            "p50": 234.427727,
+            "p90": 249.6830391,
+            "p99": 268.05311901000005
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 10,
+            "min": 20463616.0,
+            "max": 20729856.0,
+            "mean": 20596326.4,
+            "p50": 20594688.0,
+            "p90": 20674560.0,
+            "p99": 20724326.4
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 141.301837,
+            "max": 192.544928,
+            "mean": 161.54892410000002,
+            "p50": 157.01383700000002,
+            "p90": 188.4994442,
+            "p99": 192.14037962
+          }
+        },
+        {
+          "name": "case_emqx_base62_encode_ns_per_call",
+          "unit": "ns",
+          "value": 283792.04479999986
+        },
+        {
+          "name": "case_emqx_base62_decode_wall_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 204.67507500000002,
+            "max": 251.49278000000004,
+            "mean": 225.9465489,
+            "p50": 228.441595,
+            "p90": 245.1844208,
+            "p99": 250.86194408000003
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_peak_rss_bytes",
+          "unit": "bytes",
+          "summary": {
+            "count": 10,
+            "min": 20504576.0,
+            "max": 20713472.0,
+            "mean": 20598374.4,
+            "p50": 20586496.0,
+            "p90": 20687667.2,
+            "p99": 20710891.52
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_startup_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 131.52499500000002,
+            "max": 182.317306,
+            "mean": 148.2428137,
+            "p50": 143.60595,
+            "p90": 164.4512791,
+            "p99": 180.53070331
+          }
+        },
+        {
+          "name": "case_emqx_base62_decode_ns_per_call",
+          "unit": "ns",
+          "value": 518024.9013333332
+        }
+      ],
+      "peak_memory_bytes": 28954624,
+      "notes": [
+        "staged 4 foreign case(s) from 2 distinct source file(s)",
+        "case bstr_to_lower: N=2000 (rust), sources=cowboy/src/cowboy_bstr.erl",
+        "case bstr_capitalize_token: N=1500 (rust), sources=cowboy/src/cowboy_bstr.erl",
+        "case emqx_base62_encode: N=250 (rust), sources=emqx/apps/emqx/src/emqx_base62.erl",
+        "case emqx_base62_decode: N=150 (rust), sources=emqx/apps/emqx/src/emqx_base62.erl",
+        "observed stdout: bstr_to_lower=60000 bstr_capitalize_token=45000 emqx_base62_encode=4000 emqx_base62_decode=1650",
+        "method: per-call cost = (mean wall at N iterations - mean wall at 0 iterations) / N; N is per runtime so both marginals are measurable, and the fixed process startup (incl. the Rust runtime's code-path resolution) cancels out of both sides",
+        "cases: 4 ok, 0 unsupported (of 4)"
+      ]
+    }
+  ]
+}
