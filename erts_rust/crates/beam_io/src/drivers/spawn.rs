@@ -21,8 +21,11 @@
 //!
 //! [`SpawnOptions`] carries the honored `open_port/2` options: `binary`/`list`, `{cd, Dir}`,
 //! `{env, [{K, V}]}`, `{args, [String]}` and `exit_status`. [`build_command`] is the single
-//! place the argv vector, the shell-vs-direct choice, `cd`/`env` and the three piped
-//! standard streams live; it is unit-testable without starting anything.
+//! place the argv vector, the shell-vs-direct choice, `cd`/`env` and the three standard streams
+//! live; it is unit-testable without starting anything. The two options that shape the child's
+//! *streams* rather than its process description — `stderr_to_stdout` and `eof` — travel in
+//! their own [`StreamOptions`] value (see below), which
+//! [`SpawnDriver::with_stream_options`] accepts; [`SpawnDriver::new`] uses the defaults.
 //!
 //! # Lifecycle: the child exists before the port does
 //!
@@ -73,9 +76,30 @@
 //! built-in [`crate::drivers::FdDriver`] carries it for the `{line, N}` option).
 //!
 //! The descriptors of a spawned child (`stdin`/`stdout`) belong to the driver and are closed
-//! on EOF/`stop`/`Drop`. The child's **stderr is discarded** ([`Stdio::null`]): nothing it
-//! writes is delivered to the port (the oracle does not deliver a child's stderr either) and
-//! there is no pipe for it to fill, so a child that floods stderr can never block.
+//! on EOF/`stop`/`Drop`. The child's **stderr is inherited** by default (it appears on the
+//! emulator's own stderr and is *not* port data — see the stream options below).
+//!
+//! # The stream options ([`StreamOptions`])
+//!
+//! Two `open_port/2` options shape the child's *streams* rather than its process description,
+//! so they live in their own [`StreamOptions`] value instead of [`SpawnOptions`]. Both default
+//! to `false`, reproducing the oracle:
+//!
+//! * **`stderr_to_stdout`** — the child's descriptor 2 becomes an **exact duplicate of its
+//!   descriptor 1**, so its stderr bytes are delivered as port data and interleave with its
+//!   stdout in true write order. The reference does exactly that
+//!   (`stderrfd = opts->redir_stderr ? ifd[1] : dup(2);`, `spawn_start`,
+//!   `erts/emulator/sys/unix/sys_drivers.c:500`): it points the child's stderr at the very
+//!   pipe its stdout uses. **Without** the option the child's stderr is **inherited** from the
+//!   emulator (`dup(2)`), so it is neither delivered to the port nor discarded — it appears on
+//!   the emulator's own stderr.
+//! * **`eof`** — the port is told when the child's stdout reaches end of file
+//!   ([`Driver::take_eof`], surfaced as [`crate::PortRegistry::take_eof`]), which the runtime
+//!   turns into a bare `eof` message; without it the end of the stream is not reported.
+//!
+//! `stderr_to_stdout` is applied by a child-side `dup2(1, 2)` in a `pre_exec` hook, so no
+//! second pipe is created and byte ordering is exact; `eof` only gates the reporting of the
+//! `read(2) == 0` the driver latches anyway.
 //!
 //! The descriptor of a `{fd, N}` port belongs to the **Erlang side** and is *bidirectional*:
 //! the single adopted descriptor is registered **once** with [`Interest::BOTH`], so it is
@@ -91,12 +115,16 @@
 //! registered as a built-in factory under a name it could never honour. Its
 //! [`Driver::name`] is `"spawn"`.
 //!
-//! # Exit status
+//! # Exit status and end of file
 //!
 //! A port opened with the `exit_status` option can have its child's reaped status taken
 //! **once** through [`Driver::take_exit_status`] (surfaced as
 //! [`crate::PortRegistry::take_exit_status`]). Reaping is repeatable — `Child::try_wait`
 //! caches the status it reaped — so the later `stop`/`Drop` teardown still sees it.
+//!
+//! A port opened with the `eof` option can have its input stream's end taken **once** through
+//! [`Driver::take_eof`] (surfaced as [`crate::PortRegistry::take_eof`]); the driver latches the
+//! `read(2) == 0` end-of-file regardless, so the option only decides whether it is reported.
 //!
 //! # Relation to [`crate::drivers::FdDriver`]
 //!
@@ -110,6 +138,7 @@
 //! `// SAFETY:` rationale.
 
 use std::os::unix::io::{IntoRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
 use beam_common::Result;
@@ -121,6 +150,23 @@ use crate::poller::{Interest, Token};
 
 /// The read buffer size of a single [`Driver::ready_input`] syscall.
 const READ_CHUNK: usize = 64 * 1024;
+
+/// The two `open_port/2` options that shape a spawned child's **streams** rather than its
+/// process description (see the module docs), kept out of [`SpawnOptions`] so that struct stays
+/// the argv/environment description the runtime already builds.
+///
+/// [`Default`] is both options off, which is the oracle's behaviour for an `open_port/2` call
+/// that does not name them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StreamOptions {
+    /// The `stderr_to_stdout` option: the child's stderr is delivered as port data, merged with
+    /// its stdout in true write order (the child's descriptor 2 is made an exact duplicate of
+    /// its descriptor 1). Default: the child's stderr is **inherited** from the emulator.
+    pub stderr_to_stdout: bool,
+    /// The `eof` option: the port is told once when the child's stdout reaches end of file
+    /// ([`Driver::take_eof`]). Default: the end of the stream is not reported.
+    pub eof: bool,
+}
 
 /// The stream type of a spawned port — the `binary`/`list` option of `open_port/2`.
 ///
@@ -223,21 +269,50 @@ pub struct SpawnOptions {
 /// it (the driver's constructor does). It starts nothing itself, so it is directly
 /// unit-testable.
 ///
-/// The child's `stdout` is a pipe (the port's input stream) and its `stdin` is a pipe (what
-/// [`crate::PortRegistry::port_command`] writes to). Its **stderr is discarded**
-/// ([`Stdio::null`]): a child's diagnostics are not port data — the oracle does not deliver
-/// them either — and, unlike a pipe, `/dev/null` can never fill, so a child that writes an
-/// unbounded amount to stderr cannot deadlock on a full pipe.
+/// Every stream option is left at its default, i.e. it behaves exactly like
+/// `build_command_with_stream` with [`StreamOptions::default`]: the child's `stdout` is a
+/// pipe (the port's input stream), its `stdin` is a pipe (what
+/// [`crate::PortRegistry::port_command`] writes to) and its **stderr is inherited**
+/// ([`Stdio::inherit`]) — the oracle's `dup(2)` (`sys_drivers.c:500`) — so a child's
+/// diagnostics reach the emulator's stderr and are never port data. The
+/// `stderr_to_stdout`/`eof` stream options are [`SpawnDriver::with_stream_options`]'s.
 ///
 /// # Errors
 ///
 /// [`beam_common::BeamError::BadArg`] for an argv vector that names no program (an empty
-/// `{spawn, []}`).
+/// `{spawn, []}`), and for the **empty** command/path the oracle rejects
+/// (`open_port({spawn,""},[])` and `open_port({spawn_executable,""},[])` are both
+/// `error:badarg`, verified against erts-17.1, while `{spawn," "}` is accepted).
 pub fn build_command(spec: &SpawnSpec, options: &SpawnOptions) -> Result<Option<Command>> {
+    build_command_with_stream(spec, options, StreamOptions::default())
+}
+
+/// [`build_command`] with the child-stream options [`StreamOptions`] describes.
+///
+/// The process description ([`SpawnSpec`]/[`SpawnOptions`]) is handled exactly as
+/// `build_command` documents; the stream options add the child-side `dup2(1, 2)` of
+/// `stderr_to_stdout` (an **exact** merge into the stdout pipe, never a second pipe). `eof`
+/// needs nothing here — it only gates the *reporting* of the end-of-file the driver latches —
+/// so it is not consulted.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] exactly as `build_command` documents.
+fn build_command_with_stream(
+    spec: &SpawnSpec,
+    options: &SpawnOptions,
+    stream_options: StreamOptions,
+) -> Result<Option<Command>> {
     let mut command = match spec {
         // `{fd, N}` starts nothing: the descriptor is the port's whole I/O stream.
         SpawnSpec::Fd { .. } => return Ok(None),
         SpawnSpec::Spawn { command, argv: None } => {
+            // The oracle rejects an empty name in its own `open_port/2` validation, before any
+            // driver is reached; letting it through would exec an empty program and report
+            // `enoent` for a call the oracle calls `badarg`.
+            if command.is_empty() {
+                return Err(error::badarg());
+            }
             let mut shell = Command::new("/bin/sh");
             shell.arg("-c").arg(command);
             shell
@@ -247,6 +322,9 @@ pub fn build_command(spec: &SpawnSpec, options: &SpawnOptions) -> Result<Option<
         } => program_command(argv)?,
         // `{spawn_executable, Path}` builds its argv from the `args` option.
         SpawnSpec::SpawnExecutable { path } => {
+            if path.is_empty() {
+                return Err(error::badarg());
+            }
             let mut argv = Vec::with_capacity(1 + options.args.len());
             argv.push(path.clone());
             argv.extend(options.args.iter().cloned());
@@ -262,11 +340,46 @@ pub fn build_command(spec: &SpawnSpec, options: &SpawnOptions) -> Result<Option<
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // The child's stderr is **discarded**, not piped: a `Stdio::piped` stderr nobody
-        // drains is a ~64 KiB pipe that deadlocks any child writing more than that to it,
-        // and a child's stderr is not port data (the oracle does not deliver it either).
-        .stderr(Stdio::null());
+        // The child's stderr is **inherited** by default, exactly as the reference's
+        // `dup(2)` makes it (`sys_drivers.c:500`): a child's diagnostics reach the emulator's
+        // stderr, are not port data, and can never block the child on an undrained pipe.
+        .stderr(Stdio::inherit());
+    if stream_options.stderr_to_stdout {
+        // The option the reference honors by handing the child its stdout pipe as stderr as
+        // well (`stderrfd = opts->redir_stderr ? ifd[1] : dup(2)`). The stdio of a
+        // `Command` is set up by the standard library *before* the `pre_exec` hooks run, so by
+        // the time this closure runs the child's descriptor 1 already is the stdout pipe:
+        // duplicating it onto descriptor 2 makes stderr an **exact** alias of stdout (true
+        // write ordering, one pipe, no second buffer).
+        // SAFETY: `CommandExt::pre_exec` is unsafe because the closure runs in the forked
+        // child between `fork` and `exec`, where only async-signal-safe operations are legal;
+        // `dup2` is async-signal-safe (POSIX) and the closure does nothing else. Both
+        // descriptors are the child's own and are open when it runs.
+        unsafe {
+            command.pre_exec(dup_stderr_onto_stdout);
+        }
+    }
     Ok(Some(command))
+}
+
+/// The child-side `pre_exec` hook of the `stderr_to_stdout` option: makes descriptor 2 an exact
+/// duplicate of descriptor 1.
+///
+/// It runs in the forked child after the standard library has set the child's standard streams
+/// up and before `exec`, so descriptor 1 is the port's stdout pipe; `dup2` clears
+/// `FD_CLOEXEC` on the duplicate, so it survives the `exec` as the child's stderr.
+///
+/// # Errors
+///
+/// The failing `dup2` as a [`std::io::Error`]; the standard library turns a failing `pre_exec`
+/// into a failed `Command::spawn`.
+fn dup_stderr_onto_stdout() -> std::io::Result<()> {
+    // SAFETY: `dup2` is async-signal-safe, which is the whole constraint on a `pre_exec`
+    // closure; both descriptors are the child's own and are already open.
+    if unsafe { libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The [`Command`] for an argv vector: `argv[0]` is the program, the rest are its arguments.
@@ -313,6 +426,10 @@ pub struct SpawnDriver {
     exit_status: bool,
     /// Whether that status has already been handed out, so it is reported exactly once.
     exit_reported: bool,
+    /// Whether the `eof` stream option asked for the end-of-file notification.
+    eof_notify: bool,
+    /// Whether that end-of-file has already been handed out, so it is reported exactly once.
+    eof_reported: bool,
     /// Whether the driver owns (and must close) the descriptors. False for an adopted
     /// `{fd, N}` descriptor, which belongs to the Erlang side.
     own_fds: bool,
@@ -327,10 +444,26 @@ pub struct SpawnDriver {
 
 impl SpawnDriver {
     /// Starts the child `spec`/`options` describe — or adopts `{fd, N}` — and returns the
-    /// driver.
+    /// driver, with every [`StreamOptions`] at its default (stderr inherited, no `eof`
+    /// notification).
+    ///
+    /// This is [`SpawnDriver::with_stream_options`] with [`StreamOptions::default`]; see it for
+    /// the full contract.
+    ///
+    /// # Errors
+    ///
+    /// Exactly as [`SpawnDriver::with_stream_options`].
+    pub fn new(spec: &SpawnSpec, options: &SpawnOptions) -> Result<SpawnDriver> {
+        SpawnDriver::with_stream_options(spec, options, StreamOptions::default())
+    }
+
+    /// Starts the child `spec`/`options` describe — or adopts `{fd, N}` — and returns the
+    /// driver, honoring the child-stream options `stream_options` carries.
     ///
     /// This **really** spawns (the poller is not touched until [`Driver::start`]), so a
-    /// failure is reported here, before anything is registered anywhere.
+    /// failure is reported here, before anything is registered anywhere. The `stderr_to_stdout`
+    /// option is applied in the child (a `dup2(1, 2)`); the `eof` option only decides whether
+    /// [`Driver::take_eof`] ever reports the end-of-file the driver latches anyway.
     ///
     /// # Errors
     ///
@@ -342,8 +475,13 @@ impl SpawnDriver {
     /// module). An errno this crate does not recognise falls back to
     /// [`beam_common::BeamError::Io`], as does a failure putting a descriptor in non-blocking
     /// mode (or reaping a child a failed spawn left behind); [`beam_common::BeamError::BadArg`]
-    /// for an `{fd, N}` spec with a negative descriptor or for an empty argv vector.
-    pub fn new(spec: &SpawnSpec, options: &SpawnOptions) -> Result<SpawnDriver> {
+    /// for an `{fd, N}` spec with a negative descriptor, for an empty argv vector, or for the
+    /// empty command/path the oracle rejects.
+    pub fn with_stream_options(
+        spec: &SpawnSpec,
+        options: &SpawnOptions,
+        stream_options: StreamOptions,
+    ) -> Result<SpawnDriver> {
         let command = spec.command();
         if let SpawnSpec::Fd { fd } = spec {
             if *fd < 0 {
@@ -364,22 +502,25 @@ impl SpawnDriver {
                 stream: options.stream,
                 exit_status: options.exit_status,
                 exit_reported: false,
+                eof_notify: stream_options.eof,
+                eof_reported: false,
                 // The descriptor belongs to the Erlang side: deregistered, never closed.
                 own_fds: false,
                 duplex: true,
                 os_pid: None,
             });
         }
-        // `build_command` answers `None` only for the `{fd, N}` form, handled above.
-        let Some(mut built) = build_command(spec, options)? else {
+        // `build_command_with_stream` answers `None` only for the `{fd, N}` form, handled above.
+        let Some(mut built) = build_command_with_stream(spec, options, stream_options)? else {
             return Err(error::badarg());
         };
         let mut child = built.spawn().map_err(error::spawn_failure)?;
         let os_pid = child.id();
         // Take both ends out of the child so the driver owns them as plain descriptors (the
         // same reason `FdDriver` owns its fds: the poller and the syscall wrappers work on
-        // raw descriptors). stderr was discarded by `build_command` (`Stdio::null`), so the
-        // `Child` holds no stderr pipe to drain.
+        // raw descriptors). stderr is never a pipe here (`build_command_with_stream` inherits
+        // it, or makes it a duplicate of the stdout pipe), so the `Child` holds no stderr pipe
+        // to drain.
         let stdin_fd = child.stdin.take().map(IntoRawFd::into_raw_fd);
         let stdout_fd = child.stdout.take().map(IntoRawFd::into_raw_fd);
         // Non-blocking must be in place before either descriptor reaches the poller.
@@ -409,6 +550,8 @@ impl SpawnDriver {
             stream: options.stream,
             exit_status: options.exit_status,
             exit_reported: false,
+            eof_notify: stream_options.eof,
+            eof_reported: false,
             own_fds: true,
             duplex: false,
             os_pid: Some(os_pid),
@@ -482,6 +625,26 @@ impl SpawnDriver {
             }
             None => Ok(None),
         }
+    }
+
+    /// Takes the child's **end-of-file** notification once, when the `eof` stream option asked
+    /// for it.
+    ///
+    /// `Ok(true)` only when the option was set *and* [`SpawnDriver::eof`] has latched the
+    /// `read(2) == 0` the child's stdout reported, and only the first time; every other call
+    /// answers `Ok(false)`. The latch itself is independent of the option, so the driver
+    /// behaves identically without it — only the report is withheld.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; the `Result` mirrors [`Driver::take_eof`] so a future check that
+    /// can fail has a place to report it.
+    pub fn take_eof(&mut self) -> Result<bool> {
+        if !self.eof_notify || !self.read_eof || self.eof_reported {
+            return Ok(false);
+        }
+        self.eof_reported = true;
+        Ok(true)
     }
 
     /// Arms write readiness for `fd` — registering it the first time, re-registering it
@@ -730,6 +893,10 @@ impl Driver for SpawnDriver {
     fn take_exit_status(&mut self) -> Result<Option<i32>> {
         SpawnDriver::take_exit_status(self)
     }
+
+    fn take_eof(&mut self) -> Result<bool> {
+        SpawnDriver::take_eof(self)
+    }
 }
 
 impl Drop for SpawnDriver {
@@ -793,16 +960,66 @@ fn exit_status_code(status: std::process::ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_command, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream};
+    use super::{build_command, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream, StreamOptions};
     use crate::driver::{Driver, DriverContext, PortArms};
     use crate::poller::Poller;
     use crate::queue::ByteQueue;
     use beam_common::BeamError;
     use beam_process::PortId;
     use std::ffi::OsStr;
+    use std::os::unix::io::RawFd;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    /// Drives `driver`'s readiness loop until its input stream latches end-of-file.
+    ///
+    /// Bounded, so a broken driver fails the test instead of hanging it; the poll is retried on
+    /// `EINTR`, which the `SIGCHLD` deliveries of the parallel cases in this binary make a
+    /// normal outcome.
+    fn drive_to_eof(driver: &mut SpawnDriver) {
+        let mut poller = Poller::new().expect("a poll set");
+        let mut input = ByteQueue::new();
+        let mut output = ByteQueue::new();
+        let mut arms = PortArms::default();
+        {
+            let mut ctx = DriverContext::new(
+                PortId::new(1),
+                &mut poller,
+                &mut input,
+                &mut output,
+                &mut arms,
+            );
+            driver.start(&mut ctx).expect("the stdout registration");
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !driver.eof() && Instant::now() < deadline {
+            let events = loop {
+                match poller.poll(Some(Duration::from_millis(100))) {
+                    Ok(events) => break events,
+                    Err(BeamError::Io(err))
+                        if err.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        continue
+                    }
+                    Err(err) => panic!("the poll succeeds: {err:?}"),
+                }
+            };
+            if events
+                .iter()
+                .any(|event| event.ready().readable() || event.ready().is_read_closed())
+            {
+                let mut ctx = DriverContext::new(
+                    PortId::new(1),
+                    &mut poller,
+                    &mut input,
+                    &mut output,
+                    &mut arms,
+                );
+                driver.ready_input(&mut ctx).expect("the read");
+            }
+        }
+        assert!(driver.eof(), "the child's end-of-file is latched");
+    }
     /// A `{spawn, Command}` spec (the shell form).
     fn shell(command: &str) -> SpawnSpec {
         SpawnSpec::Spawn {
@@ -1067,5 +1284,128 @@ mod tests {
         driver.reap_child().expect("the first reap succeeds");
         driver.reap_child().expect("a second reap is a no-op");
         assert_eq!(driver.exited().expect("the wait succeeds"), None);
+    }
+
+    #[test]
+    fn an_empty_shell_command_is_rejected_as_badarg() {
+        // The oracle rejects the empty name in its own `open_port/2` validation
+        // (`open_port({spawn,""},[])` is `error:badarg`, verified against erts-17.1), before
+        // any driver sees it. An empty command reaching `Command::new("/bin/sh")` would run
+        // `sh -c ""` instead — a silently different program, not a failure.
+        let spec = shell("");
+        assert!(matches!(
+            build_command(&spec, &SpawnOptions::default()),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            SpawnDriver::new(&spec, &SpawnOptions::default())
+                .map(|_| ())
+                .err(),
+            Some(BeamError::BadArg)
+        ));
+        // Only the *empty* name is rejected: `{spawn, " "}` is accepted by the oracle.
+        assert!(build_command(&shell(" "), &SpawnOptions::default())
+            .expect("a blank command is accepted")
+            .is_some());
+    }
+
+    #[test]
+    fn an_empty_spawn_executable_path_is_rejected_as_badarg() {
+        // `open_port({spawn_executable,""},[])` is `error:badarg` in the oracle too.
+        let spec = SpawnSpec::SpawnExecutable {
+            path: String::new(),
+        };
+        assert!(matches!(
+            build_command(&spec, &SpawnOptions::default()),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            SpawnDriver::new(&spec, &SpawnOptions::default())
+                .map(|_| ())
+                .err(),
+            Some(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn the_stream_options_default_to_both_off() {
+        let options = StreamOptions::default();
+        assert!(!options.stderr_to_stdout, "the child's stderr is inherited");
+        assert!(!options.eof, "no end-of-file notification is asked for");
+        assert!(StreamOptions {
+            stderr_to_stdout: true,
+            eof: true,
+        } != options);
+    }
+
+    #[test]
+    fn the_eof_notification_is_reported_once_with_the_option() {
+        let options = SpawnOptions::default();
+        let mut driver = SpawnDriver::with_stream_options(
+            &shell("echo hi"),
+            &options,
+            StreamOptions {
+                stderr_to_stdout: false,
+                eof: true,
+            },
+        )
+        .expect("echo starts");
+        assert!(!driver.eof(), "nothing has been read yet");
+        assert!(
+            !driver.take_eof().expect("the check succeeds"),
+            "an end-of-file that has not happened yet is not reported"
+        );
+        drive_to_eof(&mut driver);
+        assert!(
+            driver.take_eof().expect("the check succeeds"),
+            "the end-of-file is reported when the option asked for it"
+        );
+        assert!(
+            !driver.take_eof().expect("the check succeeds"),
+            "and exactly once"
+        );
+    }
+
+    #[test]
+    fn the_eof_notification_is_withheld_without_the_option() {
+        // The latch still happens (`eof()` is true); only the *report* is withheld.
+        let mut driver =
+            SpawnDriver::new(&shell("echo hi"), &SpawnOptions::default()).expect("echo starts");
+        drive_to_eof(&mut driver);
+        assert!(driver.eof(), "the end-of-file is latched anyway");
+        assert!(
+            !driver.take_eof().expect("the check succeeds"),
+            "without the `eof` option the port is never told"
+        );
+    }
+
+    #[test]
+    fn an_adopted_fd_reports_its_end_of_file_once_with_the_option() {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid, writable 2-element array; on success `pipe(2)` fills both
+        // slots with fresh descriptors owned by this test.
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe(2) succeeded");
+        let mut driver = SpawnDriver::with_stream_options(
+            &SpawnSpec::Fd { fd: fds[0] },
+            &SpawnOptions::default(),
+            StreamOptions {
+                stderr_to_stdout: false,
+                eof: true,
+            },
+        )
+        .expect("the descriptor is adopted");
+        // Closing the write end is the adopted descriptor's end of stream.
+        // SAFETY: `fds[1]` is the write end of the pipe created above and is closed once.
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+
+        drive_to_eof(&mut driver);
+        assert!(driver.take_eof().expect("the check succeeds"));
+        assert!(!driver.take_eof().expect("the check succeeds"));
+        // The adopted read end belongs to the Erlang side: the driver never closed it.
+        // SAFETY: `fds[0]` was created by `pipe(2)` above and is closed exactly once here.
+        unsafe {
+            libc::close(fds[0]);
+        }
     }
 }

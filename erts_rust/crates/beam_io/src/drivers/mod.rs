@@ -41,4 +41,6 @@ pub use crate::drivers::inet::{
     INET_TYPE_STREAM, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 pub use crate::drivers::line_buffer::{LineBuffer, DEFAULT_MAX_LINE_LEN};
-pub use crate::drivers::spawn::{build_command, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream};
+pub use crate::drivers::spawn::{
+    build_command, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream, StreamOptions,
+};
