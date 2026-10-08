@@ -224,9 +224,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   directories** load, with no allowlist and **zero failures**.
 - **Engine execution breadth reaches beyond stdlib/kernel/compiler:** `beam_engine`'s `tests/apps_lists.rs`
   runs oracle-cross-checked functions from parsetools (yecc/leex), syntax_tools, xmerl, inets, edoc, eunit,
-  dialyzer, asn1 and snmp; `tests/census.rs` reaches **1366/1366 modules / 2,942,736 instructions with
-  zero unmodelled opcodes** (the 11 unused `Instr` variants are the seven native-record variants — an
-  OTP-29 feature this toolchain does not enable — plus `BsTestTail2`, `ExecutableLine`, `DebugLine` and
+  dialyzer, asn1 and snmp; `tests/census.rs` reaches **1366/1366 modules / 2,888,257 instructions with
+  zero unmodelled opcodes** (the 12 unused `Instr` variants are the seven native-record variants — an
+  OTP-29 feature this toolchain does not enable — plus `Deallocate` (every corpus `deallocate` is
+  fused into `DeallocateReturn` by the loader), `BsTestTail2`, `ExecutableLine`, `DebugLine` and
   the `Generic` sentinel).
 - **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:

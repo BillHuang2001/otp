@@ -122,6 +122,10 @@ pub fn group_functions(instrs: &[RawInstr]) -> Result<Vec<Function>> {
             .get(i + 1)
             .map_or(lowered.len(), |next| next.func_label_idx);
         let code = lowered[cut.func_label_idx..end].to_vec();
+        // The one peephole pass: `deallocate N; return` -> `DeallocateReturn(N)`.
+        // `blocks`/`labels` must be derived from the FUSED code so a block's
+        // `start..end` slice indexes the same vector the engine dispatches on.
+        let code = super::fuse::fuse(code);
         let (blocks, labels) = build_blocks(&code);
         functions.push(Function {
             func_label: cut.func_label,

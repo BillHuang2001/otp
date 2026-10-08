@@ -55,15 +55,17 @@ use beam_term::{make_small, Atom, Eterm};
 // that turns a typed error into a value (or into the sentinel) fails here.
 //
 // Corpus reachability (evidence: `tests/census.rs`'s counts over the whole installed
-// OTP — 1366 `.beam` over 34 applications, 2,942,736 instructions):
+// OTP — 1366 `.beam` over 34 applications, 2,888,257 instructions):
 //   * CORPUS-REACHABLE  — the installed toolchain emits the instruction today, so
 //     the gap is a live limitation a real module can hit.
 //   * FORWARD-COMPAT-ONLY — the instruction has **zero** corpus occurrences, so the
 //     gap exists only for a future toolchain that emits it. The census's full
 //     zero-occurrence set is the 7 OTP-29 native-record opcodes (`IsNativeRecord`,
 //     `GetRecordElements`, `PutRecord`, `IsRecordAccessible`, `GetRecordField`,
-//     `GetRecordElementsId`, `UpdateRecordId`) plus `BsTestTail2`,
-//     `ExecutableLine`, `DebugLine`, `Generic` — 11 of the 106 `Instr` variants.
+//     `GetRecordElementsId`, `UpdateRecordId`) plus `Deallocate` (the loader fuses
+//     every corpus `deallocate;return` into `DeallocateReturn`, so the standalone
+//     variant is unreached), `BsTestTail2`, `ExecutableLine`, `DebugLine`,
+//     `Generic` — 12 of the 107 `Instr` variants.
 //     Toolchain evidence for the native-record family: `erl_features:configurable()`
 //     ⇒ `[compr_assign,maybe_expr]` (`native_record` is not in it), `erlc
 //     -enable-feature native_record` ⇒ "the feature 'native_record' does not

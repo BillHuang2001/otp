@@ -783,8 +783,7 @@ fn list_walk_module(name: &str) -> (Module, Atom) {
             ],
             dst: Operand::X(0),
         },
-        Instr::Deallocate(1),
-        Instr::Return,
+        Instr::DeallocateReturn(1),
         Instr::Label(lbase),
         Instr::Test {
             kind: TestKind::IsNil,
@@ -806,11 +805,15 @@ fn list_walk_module(name: &str) -> (Module, Atom) {
 /// construction.
 ///
 /// Per element the walk **descends** `label(E)`, `test`, `allocate`, `get_list`,
-/// `call` (5 instructions) and, on the way back out, runs `gc_bif '+'`,
-/// `deallocate`, `return` (3) — `8 * N`; the single base case adds `label(E)`,
+/// `call` (5 instructions) and, on the way back out, runs `gc_bif '+'` and the
+/// fused `deallocate_return` (2) — `7 * N`; the single base case adds `label(E)`,
 /// `test`, `label(Lbase)`, `test`, `move`, `return` (6).
+///
+/// The synthetic body bypasses the loader, so it spells the frame pop + return as
+/// the loader's superinstruction `Instr::DeallocateReturn` directly — the shape the
+/// post-fusion loader produces and the interpreter dispatches on.
 fn list_walk_instructions(n: usize) -> usize {
-    8 * n + 6
+    7 * n + 6
 }
 
 /// **The BIF-free recursive list walk**: `sum/1` over a 1,000,000-element list,

@@ -49,6 +49,7 @@ use crate::operand::{Label, Operand};
 
 mod group;
 mod instr;
+pub mod fuse;
 
 pub use group::{build_blocks, group_functions};/// Assembles the IR [`Module`] from the parsed chunks and the decoded instructions.
 ///

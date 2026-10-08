@@ -433,7 +433,10 @@ pub enum Instr {
     },
     /// `return` — return from the current function.
     Return,
-
+    /// `deallocate N; return` — pop the frame, then return. The loader's only
+    /// superinstruction (`lower::fuse`): the compiler emits this pair at every
+    /// non-tail function exit. Behaviour is exactly the two constituents in order.
+    DeallocateReturn(u32),
     // ---- tuples ------------------------------------------------------------
     /// `put_tuple2 Dst {Elements}` — build a tuple from `Elements`.
     PutTuple2 {
