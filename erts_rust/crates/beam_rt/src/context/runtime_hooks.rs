@@ -110,7 +110,7 @@ impl<'a> RuntimeHooksBridge<'a> {
         let target = timers::timer_target(*args.get(1).ok_or(BeamError::BadArg)?)?;
         let message = *args.get(2).ok_or(BeamError::BadArg)?;
         let reference = self.runtime.refs_mut().next().to_eterm(heap)?;
-        let timeout = terms::make_tuple(heap, &[
+        let timeout = heap.tuple(&[
             atom_term(self.runtime.code_server.atoms(), "timeout")?,
             reference,
             message,
@@ -333,7 +333,7 @@ impl<'a> RuntimeHooksBridge<'a> {
         let elements = terms::list_elements(options).map_err(|_| BeamError::BadArg)?;
         let mut abs = false;
         for option in elements {
-            let (key, value) = option_pair(self.runtime.code_server.atoms(), *option)?;
+            let (key, value) = option_pair(self.runtime.code_server.atoms(), option)?;
             if key != "abs" {
                 return Err(BeamError::BadArg);
             }
@@ -355,7 +355,7 @@ impl<'a> RuntimeHooksBridge<'a> {
         let mut async_ = false;
         let mut info = false;
         for option in elements {
-            let (key, value) = option_pair(self.runtime.code_server.atoms(), *option)?;
+            let (key, value) = option_pair(self.runtime.code_server.atoms(), option)?;
             let flag = boolean_value(self.runtime.code_server.atoms(), value)?;
             match key.as_str() {
                 "async" => async_ = flag,

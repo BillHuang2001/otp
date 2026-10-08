@@ -60,6 +60,7 @@ mod memory_hook;
 mod module_info;
 mod persistent_term;
 mod process_bridge;
+mod runtime_hooks;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -95,6 +96,7 @@ use self::memory_hook::RuntimeMemory;
 use self::module_info::ModuleInfoBridge;
 use self::persistent_term::PersistentTermBridge;
 use self::process_bridge::ProcessBridge;
+use self::runtime_hooks::RuntimeHooksBridge;
 
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
 /// output sink that run writes to.
@@ -604,6 +606,12 @@ impl<'a> RuntimeContext<'a> {
         // Whether this is one of the seven `persistent_term:*` BIFs, which need the
         // node-global store bridge (a cheap `Rc` clone: no runtime borrow at all).
         let uses_persistent_term = Self::uses_persistent_term(module, function, arity);
+        // Whether this is one of the runtime-coupled BIF families (the timers, the loaded
+        // export check, the link set) that only the running runtime can answer, and which
+        // need the timer heap / reference space / process table (`&mut Runtime` plus a
+        // `&mut ProcessTable`, like the dict arm — and therefore its own mutually exclusive
+        // arm; see [`RuntimeHooksBridge`]).
+        let uses_runtime_hooks = Self::uses_runtime_hooks(module, function, arity);
         // The local-node identity: `nonode@nohost` with creation 0 (the M1 runtime has no
         // distribution), read from the shared table *before* it is borrowed by the context.
         // Both fields are `Copy`, so this hook needs no runtime borrow at all and every arm
@@ -850,6 +858,33 @@ impl<'a> RuntimeContext<'a> {
                     context = context.with_tables(tables);
                 }
                 registry.call(module, function, arity, &mut context, args)
+            } else if uses_runtime_hooks {
+                // The runtime-coupled BIF families (`RuntimeHooksBridge`): the timer heap and
+                // reference space (`&mut Runtime`) plus the caller's process table
+                // (`&mut ProcessTable`) — the same pair the dict arm resolves, so it is its
+                // own mutually exclusive arm. None of these keys applies a fun argument or
+                // touches the dictionary, so the fun-caller/dict seams are never needed for
+                // one, and every key this bridge does not serve answers the typed capability
+                // gap the defaulted `RuntimeHooks` seam reports (workspace `CONTEXT.md` §3).
+                let mut bridge = RuntimeHooksBridge {
+                    runtime,
+                    table: mailbox_table.as_deref_mut(),
+                    self_pid,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_runtime_hooks(&mut bridge)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
             } else {
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
                 // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
@@ -1026,6 +1061,30 @@ impl<'a> RuntimeContext<'a> {
         )
     }
 
+    /// Whether `(module, function, arity)` is one of the runtime-coupled BIF families the
+    /// [`RuntimeHooksBridge`] serves: the timer family (`erlang:start_timer/3,4`,
+    /// `erlang:send_after/4`, `erlang:cancel_timer/2`), the loaded-export check
+    /// (`erlang:function_exported/3`) and the link set (`erlang:link/1`, `erlang:unlink/1`).
+    ///
+    /// These keys resolve through the **single** `beam_bifs` [`RuntimeHooks`] seam, whose
+    /// default is the typed `unsupported_bif` capability gap. The bridge needs `&mut Runtime`
+    /// (the timer heap, the reference space, the code server) **and** a `&mut ProcessTable`
+    /// (the link set) — the same pair [`DictBridge`]/[`ProcessBridge`] resolve — so it cannot
+    /// co-exist with the fun-caller bridge or the dict/process arms.
+    ///
+    /// [`RuntimeHooks`]: beam_bifs::RuntimeHooks
+    fn uses_runtime_hooks(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("erlang", "start_timer", 3)
+                | ("erlang", "start_timer", 4)
+                | ("erlang", "send_after", 4)
+                | ("erlang", "cancel_timer", 2)
+                | ("erlang", "function_exported", 3)
+                | ("erlang", "link", 1)
+                | ("erlang", "unlink", 1)
+        )
+    }
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
     ///
     /// A perfect no-op on a miss (`Ok(None)`), so it is safe to try before *every* BIF: only a

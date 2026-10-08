@@ -166,6 +166,10 @@ pub const CORE_ATOMS: &[&str] = &[
     "nonode@nohost",
     "bm",
     "ac",
+    // The `RuntimeHooks` timer family emits `{timeout, TRef, Msg}`, so
+    // `erlang:start_timer/3,4` resolves the tag atom from this seed — the bridge may not
+    // intern (the shared table is borrowed immutably for the whole BIF call).
+    "timeout",
     // The `get_module_info/1,2` item vocabulary and the compiler keys an `Attr`/`CInf`
     // chunk's decoded term carries (`vsn`, `version`, `options`, `source`, …). The module
     // seam resolves every atom **by name** into this table (it may not intern), so a name
@@ -439,6 +443,7 @@ mod tests {
             "nonode@nohost",
             "bm",
             "ac",
+            "timeout",
             // The `get_module_info/1,2` item names and the compiler keys an `Attr`/`CInf`
             // chunk carries, appended after the reason/class group (see `CORE_ATOMS`).
             "vsn",
