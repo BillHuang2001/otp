@@ -886,11 +886,18 @@ impl Runtime {
         self.code_server.add_path(dir);
     }
 
-    /// Registers `pid` under the boot-script name `name` (a `{kernelProcess, Name, …}`
-    /// directive's registration half, contract A.7).
+    /// Registers `pid` under the name `name` (the explicit-registration half of the boot
+    /// name space, contract A.7).
     ///
     /// The name is interned into the runtime's shared atom table, so a later
     /// `erlang:whereis/1` resolves it.
+    ///
+    /// The boot-script executor **does not** use this for a `{kernelProcess, …}` directive:
+    /// `init` never registers a kernel process's name — the process registers **itself** (see
+    /// [`crate::boot::bootscript`] and the private `drive::start_kernel_process`), and a
+    /// pre-registration would turn that self-registration into the `badarg` "name already
+    /// registered" that kills the process. This stays the explicit entry point for a caller
+    /// that really needs to install a name before a process runs.
     ///
     /// # Errors
     ///

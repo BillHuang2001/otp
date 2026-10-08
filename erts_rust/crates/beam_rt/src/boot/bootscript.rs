@@ -27,7 +27,7 @@
 //! | `{primLoad, [Mod]}` | load a batch of modules from the code path |
 //! | `{kernel_load_completed}` | the kernel's initial load finished |
 //! | `{module, Mod}` | load one module |
-//! | `{kernelProcess, Name, {M,F,A}}` | spawn (and register) a kernel process |
+//! | `{kernelProcess, Name, {M,F,A}}` | spawn a kernel process (it registers `Name` itself) |
 //! | `{apply, {M,F,A}}` | call `M:F(A...)` |
 //!
 //! An instruction outside this set is a typed **capability gap** ([`crate::error::unsupported`]),
@@ -48,13 +48,13 @@
 //! this executor really drives the runtime's **scheduler**
 //! ([`Runtime::pump_scheduler`](crate::runtime::Runtime::pump_scheduler)) for them:
 //!
-//! * a `{kernelProcess, …}` spawns **and registers** its process and then drives a
-//!   **bounded burst** of scheduler slices, so a long-lived kernel server
-//!   (`heart`, `logger_server`, `application_controller`) can take its first steps —
-//!   typically reaching its `receive` — before a later directive talks to it. The
-//!   directive's contract is spawn+register, so a process that crashes during the burst is
-//!   **not** this directive's error: the failure surfaces at the next directive that
-//!   depends on it;
+//! * a `{kernelProcess, …}` spawns its process and then drives a **bounded burst** of
+//!   scheduler slices, so a long-lived kernel server (`heart`, `logger_server`,
+//!   `application_controller`) can take its first steps — typically reaching its `receive`
+//!   and **registering its own name** — before a later directive talks to it. The executor
+//!   never registers that name: `init` does not either (see
+//!   [`drive::start_kernel_process`]). A process that crashes during the burst is **not**
+//!   this directive's error: the failure surfaces at the next directive that depends on it;
 //! * an `{apply, {M,F,A}}` runs `M:F(A...)` **as this runtime's own process** (the identity
 //!   [`Runtime::eval`](crate::runtime::Runtime::eval) uses, so its process-dictionary side
 //!   effects stay observable), but through the engine's blocking-aware entries: when the
@@ -118,9 +118,12 @@ pub enum Instruction {
     KernelLoadCompleted,
     /// `{module, Mod}` — load one module.
     Module(String),
-    /// `{kernelProcess, Name, {M,F,A}}` — spawn (and register) a kernel process.
+    /// `{kernelProcess, Name, {M,F,A}}` — spawn a kernel process.
+    ///
+    /// `Name` is the name the process registers **itself** under, exactly as `init` treats
+    /// it; the executor never registers it (see [`super::drive::start_kernel_process`]).
     KernelProcess {
-        /// The name the process is registered under.
+        /// The name the process registers under — read back with `erlang:whereis/1`.
         name: String,
         /// The spawned process's entry point.
         mfa: Mfa,
@@ -201,9 +204,10 @@ pub fn read(path: &Path) -> Result<BootScript> {
 /// * a [`Value::Other`] argument is a typed capability gap (it cannot be rebuilt faithfully);
 /// * [`Instruction::Progress`]/[`Instruction::KernelLoadCompleted`] are informational and
 ///   never fail;
-/// * a `{kernelProcess, …}` spawns and registers its process and then drives a bounded
-///   scheduler burst; a `{apply, …}` runs `M:F(A...)` as this runtime's own process and
-///   drives the scheduler whenever it suspends in a `receive`;
+/// * a `{kernelProcess, …}` spawns its process and then drives a bounded scheduler burst,
+///   which ends as soon as the process has registered `name` itself (the executor never
+///   registers it — `init` does not either); a `{apply, …}` runs `M:F(A...)` as this
+///   runtime's own process and drives the scheduler whenever it suspends in a `receive`;
 /// * both drives are bounded by one wall-clock [`DRIVE_DEADLINE`](super::drive::DRIVE_DEADLINE)
 ///   for the whole pass, so the boot never hangs — an exhausted deadline is a typed
 ///   [`error::message`], and a blocked apply with nothing left to wake it is the engine's
@@ -256,16 +260,9 @@ fn execute_instruction(
         }
         Instruction::KernelProcess { name, mfa } => {
             let args = boot_args(runtime, &mfa.args)?;
-            let pid = runtime.spawn_process(&mfa.module, &mfa.function, args)?;
-            runtime.register_boot_process(name, pid)?;
-            // The directive's contract ends at spawn+register, so the spawned process's own
-            // crash is deliberately **not** this directive's error — it surfaces at the next
-            // directive that depends on the process. The burst exists so a long-lived server
-            // can reach its `receive` (and register whatever it registers) first; it is
-            // bounded both by the boot's deadline and by the short burst deadline, and it
-            // normally stops as soon as the run queue drains.
-            let burst = deadline.min(Instant::now() + drive::KERNEL_BURST_DEADLINE);
-            drive::drive_scheduler(runtime, burst, drive::KERNEL_BURST_SLICES).map(|_| ())
+            // `init.erl` does **not** register `Name` itself — the process does (see
+            // [`drive::start_kernel_process`]).
+            drive::start_kernel_process(runtime, name, mfa, args, deadline)
         }
         Instruction::Apply { mfa } => {
             let args = boot_args(runtime, &mfa.args)?;
@@ -1165,12 +1162,18 @@ marked() -> erlang:get(bootscript_mark).
     // -----------------------------------------------------------------------
 
     /// The fixture module of [`a_boot_spawned_process_answers_a_blocked_apply`].
+    ///
+    /// `responder/0` **registers its own name** (the `{kernelProcess, …}` name) exactly as a
+    /// real kernel process does — the executor never registers it, so the registration has to
+    /// come from the process.
     const WAITER_ERL: &str = r#"%% Generated by `beam_rt/src/boot/bootscript.rs` (never committed).
 -module(bootscript_waiter).
 -export([responder/0, ask/0, seen/0]).
-%% The `{kernelProcess, …}` entry: answer one ping, then settle back into the `receive`
-%% so the process stays alive — and registered under the directive's name — afterwards.
+%% The `{kernelProcess, …}` entry: register the directive's name **from the process**
+%% (as `heart`/`logger_server`/`application_controller` each do), answer one ping, then settle
+%% back into the `receive` so the process stays alive — and registered — afterwards.
 responder() ->
+    register(bootscript_kernel, self()),
     receive {ping, From} -> From ! {pong, hello} end.
 %% The `{apply, …}` entry: ping the registered kernel process and block until it answers,
 %% recording the reply in the dictionary of the process the script runs as.
@@ -1183,15 +1186,20 @@ seen() -> erlang:get(bootscript_seen).
 "#;
 
     /// The two process directives really **drive the scheduler**: a `{kernelProcess, …}`
-    /// burst runs the spawned process up to its `receive`, and a later `{apply, …}` that
-    /// blocks on it is resumed by a scheduler drive and completes.
+    /// burst runs the spawned process up to its `receive` — after it has registered the
+    /// directive's name **itself** — and a later `{apply, …}` that blocks on it is resumed by a
+    /// scheduler drive and completes.
     ///
-    /// This is the behaviour those two directives exist for. The script spawns+registers
-    /// `bootscript_kernel` (whose entry settles into a `receive`), then applies `ask/0`,
-    /// which sends that process a ping and blocks in `receive` until it answers. The apply
-    /// can only observe the reply if the burst ran the kernel process *and* the apply's own
-    /// `receive` was resumed after a scheduler drive — with a single-pass apply the send
-    /// would have no one to answer it and the engine would report its typed `blocked`.
+    /// This is the behaviour those two directives exist for. The script spawns
+    /// `bootscript_kernel` (whose entry registers that name and then settles into a
+    /// `receive`), then applies `ask/0`, which resolves the name with `erlang:whereis/1`, sends
+    /// that process a ping and blocks in `receive` until it answers. The apply can only observe
+    /// the reply if the burst ran the kernel process (so its `register/2` happened) *and* the
+    /// apply's own `receive` was resumed after a scheduler drive — with a single-pass apply the
+    /// send would have no one to answer it and the engine would report its typed `blocked`.
+    /// The same test is therefore the regression pin for the executor **not** pre-registering
+    /// the name: a pre-registration would make the fixture's `register/2` a `badarg`, killing
+    /// the process before it ever reached its `receive`.
     #[test]
     fn a_boot_spawned_process_answers_a_blocked_apply() {
         let Some(fixture) = build_fixture(
@@ -1242,6 +1250,132 @@ seen() -> erlang:get(bootscript_seen).
             "the apply must have been resumed by the kernel process's reply"
         );
         fixture.cleanup();
+    }
+
+    // -----------------------------------------------------------------------
+    // The executor does NOT pre-register a kernel-process name
+    // -----------------------------------------------------------------------
+
+    /// The fixture module of [`a_kernel_process_registers_its_own_directive_name`].
+    ///
+    /// `serve/0` registers the *directive's* name **itself** and dies if that
+    /// registration is refused — which is exactly what happens when the executor
+    /// pre-registers the name (`register/2` of a live name is `error:badarg`). `probe/0`
+    /// then resolves the name with `erlang:whereis/1`, so the script's later `{apply, …}`
+    /// can only answer `registered` if the executor left the registration to the process.
+    const SELFREG_ERL: &str = r#"%% Generated by `beam_rt/src/boot/bootscript.rs` (never committed).
+-module(bootscript_selfreg).
+-export([serve/0, probe/0, seen/0]).
+serve() ->
+    register(bootscript_self, self()),
+    loop().
+%% Stay alive (and registered) after answering, so the name really resolves afterwards.
+loop() ->
+    receive {ping, From} -> From ! {pong, registered}, loop() end.
+probe() ->
+    case erlang:whereis(bootscript_self) of
+        Pid when is_pid(Pid) ->
+            Pid ! {ping, self()},
+            receive {pong, Value} -> erlang:put(bootscript_seen, Value) end;
+        undefined ->
+            erlang:put(bootscript_seen, not_registered)
+    end.
+seen() -> erlang:get(bootscript_seen).
+"#;
+
+    /// `init.erl`'s `{kernelProcess, Name, {M,F,A}}` directive **never registers `Name`**:
+    /// `init` runs `apply(M,F,A)` (`erts/preloaded/src/init.erl:1520`) and the process
+    /// registers itself (`heart.erl:187`, `logger_server.erl:55`,
+    /// `application_controller.erl:531`). A pre-registration by the executor would make that
+    /// self-registration `error:badarg` and kill the kernel process — the bug that stopped
+    /// the real `start.boot` with `exit noproc` at instruction 16.
+    ///
+    /// This test pins the corrected contract end to end: the fixture's entry point registers
+    /// the directive's name itself (and would die on a `badarg`), the burst runs it, and the
+    /// script's later `{apply, …}` resolves that name with `erlang:whereis/1` and gets the
+    /// **pid the process registered**.
+    #[test]
+    fn a_kernel_process_registers_its_own_directive_name() {
+        let Some(fixture) = build_fixture(
+            "selfreg",
+            &[("bootscript_selfreg.erl", SELFREG_ERL)],
+            |dir, boot| {
+                format!(
+                    "ok = file:write_file(\"{boot}\", term_to_binary({{script,{{\"t\",\"1\"}},[\
+                     {{preLoaded,[erlang]}},\
+                     {{progress,preloaded}},\
+                     {{path,[\"{dir}\"]}},\
+                     {{module,lists}},\
+                     {{kernelProcess,bootscript_self,{{bootscript_selfreg,serve,[]}}}},\
+                     {{apply,{{bootscript_selfreg,probe,[]}}}}]}})), halt(0).",
+                    boot = boot.display(),
+                    dir = dir.display(),
+                )
+            },
+        ) else {
+            return;
+        };
+        let boot = fixture.dir.join("synthetic.boot");
+        let script = read(&boot).expect("the synthetic script parses");
+        let Instruction::KernelProcess { name, .. } = &script.instructions[4] else {
+            panic!("instruction 4 must be the kernelProcess: {:?}", script.instructions[4]);
+        };
+        assert_eq!(name, "bootscript_self", "the directive names the process");
+
+        let mut config = RuntimeConfig::default();
+        config.code_paths.push(fixture.dir.clone());
+        let mut runtime = Runtime::new(config).expect("the default runtime");
+        runtime
+            .boot_from_script(&boot)
+            .expect("the self-registering kernel process answers the blocked apply");
+        fixture.cleanup();
+
+        // The `{apply, …}` resolved the name with `erlang:whereis/1` and got a live pid, so
+        // the answer is the fixture's `registered` — not `not_registered`, and (because the
+        // fixture's own `register/2` would have been the `badarg` that kills it) not a dead
+        // process either.
+        let seen = runtime
+            .eval("bootscript_selfreg:seen()")
+            .expect("bootscript_selfreg:seen/0");
+        assert_eq!(
+            runtime.atom_name_of(seen),
+            Some("registered"),
+            "the apply must resolve the name the process registered itself"
+        );
+
+        // The name still resolves to the (still alive) self-registered process.
+        let atom = runtime
+            .atoms()
+            .lookup("bootscript_self")
+            .expect("the directive name is in the shared atom table");
+        assert!(
+            runtime.processes().whereis(atom).is_some(),
+            "the self-registered name must still resolve after the burst"
+        );
+    }
+
+    /// `Runtime::register_boot_process` keeps the process table's `name_taken` rule: a second
+    /// registration of a live name is `badarg`, never a silent overwrite.
+    ///
+    /// This is *why* the executor must not pre-register a kernel-process name — the OTP
+    /// kernel processes register themselves (`register(?AC, self())`,
+    /// `gen_server:start_link({local, logger}, …)`), and a pre-registration would make that
+    /// self-registration the same `badarg`. Verified in this runtime and in the live oracle:
+    /// `register(nm,self()), register(nm,self())` raises `error:badarg`.
+    #[test]
+    fn registering_a_live_boot_name_is_badarg() {
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        let pid = runtime.self_pid();
+        runtime
+            .register_boot_process("boot_name_regression", pid)
+            .expect("the first registration succeeds");
+        let error = runtime
+            .register_boot_process("boot_name_regression", pid)
+            .expect_err("re-registering a live name must fail");
+        assert!(
+            matches!(error, BeamError::BadArg),
+            "re-registering a live name must be badarg, got {error}"
+        );
     }
 
     // -----------------------------------------------------------------------

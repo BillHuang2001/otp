@@ -7,13 +7,14 @@
 //! **scheduler** ([`Runtime::pump_scheduler`](crate::runtime::Runtime::pump_scheduler)) for
 //! them:
 //!
-//! * a `{kernelProcess, …}` spawns **and registers** its process and then drives a
-//!   **bounded burst** of scheduler slices, so a long-lived kernel server
-//!   (`heart`, `logger_server`, `application_controller`) can take its first steps —
-//!   typically reaching its `receive` — before a later directive talks to it. The
-//!   directive's contract is spawn+register, so a process that crashes during the burst is
-//!   **not** that directive's error: the failure surfaces at the next directive that
-//!   depends on it;
+//! * a `{kernelProcess, …}` spawns its process and then drives a **bounded burst** of
+//!   scheduler slices, so a long-lived kernel server (`heart`, `logger_server`,
+//!   `application_controller`) can take its first steps — typically reaching its `receive`
+//!   and registering its own name — before a later directive talks to it. The executor never
+//!   registers that name ([`start_kernel_process`] carries the full argument: `init` does not
+//!   either, and a pre-registration makes the process's own `register/2` a `badarg`). A
+//!   process that crashes during the burst is **not** that directive's error: the failure
+//!   surfaces at the next directive that depends on it;
 //! * an `{apply, {M,F,A}}` runs `M:F(A...)` **as this runtime's own process** (the identity
 //!   [`Runtime::eval`](crate::runtime::Runtime::eval) uses, so its process-dictionary side
 //!   effects stay observable), but through the engine's blocking-aware entries: when the
@@ -71,6 +72,78 @@ pub(super) const KERNEL_BURST_SLICES: u64 = 64;
 /// The apply is waiting for a boot-spawned process to *answer* it, so a step has to be long
 /// enough to carry a `gen_server` round trip; the deadline is checked between steps.
 const APPLY_BLOCK_SLICES: u64 = 256;
+
+/// Runs one `{kernelProcess, Name, {M,F,A}}` directive.
+///
+/// `init`'s boot-script evaluator does **not** register the directive's `Name`: its
+/// `eval_script/2` arm dispatches a `{kernelProcess, Server, MFA}` to
+/// `start_in_kernel/5` (`../../erts/preloaded/src/init.erl:1349` and `:1520`), which only
+/// runs `apply(Mod, Fun, Args)` (and reports `{Server, Res}` back for the debug log) — the
+/// **spawned process registers itself**, under exactly that name:
+///
+/// * `heart` — the `{kernelProcess, heart, {heart, start, []}}` target — has `start/0`
+///   `spawn` `heart:init/2`, whose first act is `register(heart, self())`
+///   (`lib/kernel/src/heart.erl:187`);
+/// * `logger` — `{kernelProcess, logger, {logger_server, start_link, []}}` — is registered
+///   by its own `gen_server:start_link({local, logger}, …)`
+///   (`lib/kernel/src/logger_server.erl:45,55`);
+/// * `application_controller` — `{kernelProcess, application_controller,
+///   {application_controller, start, [KernelApp]}}` — has `start/1` `spawn_link` a child
+///   running `init/2`, which opens with `register(application_controller, self())`
+///   (`lib/kernel/src/application_controller.erl:203` and `:531`).
+///
+/// Pre-registering the name here — as this executor used to — therefore makes the process's
+/// own `register/2` the `badarg` "name already registered" (verified in this runtime and in
+/// the live oracle: `register(nm,self()), register(nm,self())` raises `error:badarg`), so the
+/// kernel process dies at its first statement and the name is left registered for a process
+/// that no longer exists. The directive is instead: spawn the entry point, then drive a
+/// **bounded burst** until the process has registered `name` itself.
+///
+/// The burst ends as soon as any of these holds, so it can never hang:
+///
+/// * `name` resolves (`erlang:whereis(Name)` answers a pid) — the normal case, and the point
+///   of the burst: the next directive that talks to the server by name finds it;
+/// * the run queue drains (`pump_scheduler` reports `0`) — the process settled, died or is
+///   blocked, so no further drive could register it;
+/// * the burst deadline ([`KERNEL_BURST_DEADLINE`], also capped by the pass's
+///   [`DRIVE_DEADLINE`]) expires.
+///
+/// A burst that ends **without** `name` being registered is deliberately **not** this
+/// directive's error: `init` never checks the name either, and the failure legitimately
+/// surfaces at the next directive that depends on the process (a `gen_server` call to the
+/// name then fails with `noproc`, exactly as it does in a real `init` whose server crashed on
+/// startup). The name is interned into the shared atom table first, so a later
+/// `erlang:whereis/1`/`Name ! Msg` can resolve it (interning is append-only and never
+/// renumbers an index a loaded module already references).
+///
+/// # Errors
+///
+/// The spawn's own errors — a module or export the code path cannot resolve (the code
+/// server's typed `error:undef`), a bad fun/argument, the process table's diagnostics — plus
+/// [`drive_scheduler`]'s, and (when the burst's own deadline is the pass's exhausted
+/// [`DRIVE_DEADLINE`]) its typed deadline diagnostic.
+pub(super) fn start_kernel_process(
+    runtime: &mut Runtime,
+    name: &str,
+    mfa: &Mfa,
+    args: Vec<Eterm>,
+    deadline: Instant,
+) -> Result<()> {
+    runtime.spawn_process(&mfa.module, &mfa.function, args)?;
+    let atom = runtime.code_server_atoms_mut().intern(name);
+    let burst = deadline.min(Instant::now() + KERNEL_BURST_DEADLINE);
+    loop {
+        if runtime.processes().whereis(atom).is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= burst {
+            return Ok(());
+        }
+        if runtime.pump_scheduler(KERNEL_BURST_SLICES)? == 0 {
+            return Ok(());
+        }
+    }
+}
 
 /// Runs one scheduler drive: repeated bounded [`Runtime::pump_scheduler`] steps until the
 /// scheduler reports that nothing ran, returning the total slices + port deliveries.
