@@ -147,7 +147,9 @@ Crate constants: `DIST_VERSION: u16 = 6`, `DIST_VERSION_5: u16 = 5`, `EPMD_PORT:
   These are the bit fields carried *inside* the `DOP_ALTACT_SIG_SEND` / `DOP_SPAWN_REPLY*` control
   terms (`dist.c:2590-2698`, `dist.c:3090-3146`) — the vocabulary only.
 - Handshake/version tags (`NAME_TAG`, `CHALLENGE_TAG`, `STATUS_TAG`, `CHALLENGE_REPLY_TAG`,
-  `CHALLENGE_ACK_TAG`, `COMPLEMENT_TAG`, `DIST_VER_HIGH`/`LOW`), epmd tags/node types.
+  `CHALLENGE_ACK_TAG`, `COMPLEMENT_TAG`, `DIST_VER_HIGH`/`LOW`) and the epmd tags/node types
+  (`EPMD_ALIVE2_REQ`/`_RESP`/`_X_RESP`, `EPMD_PORT2_REQ` + the alias `EPMD_PORT_PLEASE2_REQ`,
+  `EPMD_NAMES_REQ`, `EPMD_DUMP_REQ` (`'d'`), `EPMD_KILL_REQ` (`'k'`), `EPMD_STOP_REQ` (`'s'`)).
 
 ### `src/transport.rs` — the abstract transport seam (safe)
 - `trait Read` / `trait Write` (with default big-endian helpers) + blanket `trait Transport`.
