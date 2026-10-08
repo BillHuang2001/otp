@@ -104,7 +104,7 @@ impl Battery {
     /// (mirroring the oracle program, which does the same).
     ///
     /// The integer/float interleaving is pinned separately by
-    /// [`Self::ordered_float_key_order`] (a recorded divergence).
+    /// [`Self::ordered_float_key_order`] (the same arithmetic key order).
     fn ordered_mixed_keys(&mut self) -> String {
         // The inserted `(key, tag)` pairs, in the oracle's insertion order. The
         // keys cover every renderer-invisible class (binary) exactly once.
@@ -147,8 +147,7 @@ impl Battery {
 
     /// The integer/float interleaving of an `ordered_set`. `erl` orders numbers
     /// by *value* across representations (`-3 < -2.5 < 0 < 1.5 < 5`); this crate
-    /// groups all integers before all floats, so the case is a recorded
-    /// `KNOWN_DIVERGENCE` (see `../differential.rs`).
+    /// now matches it (`compare::cmp_arith`), so the case is compared strictly.
     fn ordered_float_key_order(&mut self) -> String {
         let i1 = self.atom("i1");
         let i2 = self.atom("i2");

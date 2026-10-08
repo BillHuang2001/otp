@@ -299,9 +299,9 @@ ordered_mixed_keys() ->
     t([IdxOrder, First, Last, NextChain, PrevChain]).
 
 %% Erlang numbers order by *value* across representations: `-3 < -2.5 < 0 <
-%% 1.5 < 5`, so an `ordered_set` interleaves integers and floats. Recorded as a
-%% `KNOWN_DIVERGENCES` entry: our `ordered_set` groups all integers before all
-%% floats (`beam_term::compare::cmp`'s exact-mode code-point rank).
+%% 1.5 < 5`, so an `ordered_set` interleaves integers and floats. This is the
+%% arithmetic key order (`erl_db_tree.c` cmp_key_eq / CMP = erts_cmp(a,b,0,0)),
+%% which `beam_ets`'s `compare::cmp_arith` reproduces, so the case agrees.
 ordered_float_key_order() ->
     In = [{5, i1}, {-3, i2}, {0, i3}, {1.5, f1}, {-2.5, f2}],
     T = new(ordered_set),

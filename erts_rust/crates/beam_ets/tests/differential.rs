@@ -52,7 +52,7 @@
 //! `ordered_set` navigation (`first`/`next`/`last`/`prev`, absent anchors, empty
 //! table, `'$end_of_table'`) plus the **mixed-key key-order** contract over
 //! integers (incl. negative and zero), atoms, tuples, lists and binaries, and the
-//! integer/float interleaving pinned separately (a recorded `KNOWN_DIVERGENCE`);
+//! integer/float interleaving (the arithmetic key order, pinned separately);
 //! `update_counter/3,4` (scalar, `{Pos,Incr}`,
 //! `{Pos,Incr,Threshold,SetValue}`, operation lists, defaults, absent keys,
 //! counter-incapable kinds, and a threshold/default combination); `update_element/3`;
@@ -144,9 +144,11 @@
 //!   runtime ones), and a non-owner `setopts` raises `badarg`
 //!   (`setopts_surface`).
 //! * **Numbers order by value across representations** — an `ordered_set`
-//!   interleaves integers and floats (`-3 < -2.5 < 0 < 1.5 < 5`). This is the one
-//!   case where `beam_ets` disagrees with the oracle today, recorded in
-//!   [`KNOWN_DIVERGENCES`] (`ordered_float_key_order`).
+//!   compares keys arithmetically (`erl_db_tree.c` `cmp_key_eq`, `CMP =
+//!   erts_cmp(a, b, 0, 0)`), so it interleaves integers and floats
+//!   (`-3 < -2.5 < 0 < 1.5 < 5`) and `1` and `1.0` are the *same* key.
+//!   `beam_ets` reproduces this (`compare::cmp_arith`), so
+//!   [`KNOWN_DIVERGENCES`] is empty and every case is compared strictly.
 //! * **Reclamation is invisible.** Repeated insert/delete churn and
 //!   `delete_all_objects/1` leave only an observable trace (`size`, `member`,
 //!   `lookup`, `tab2list`); `memory` and the table `id` are never rendered
@@ -644,22 +646,12 @@ fn expected_map() -> BTreeMap<String, String> {
 /// in the battery (rather than dropping them) keeps the oracle's real behaviour in
 /// `EXPECTED` and the gap actionable.
 ///
-/// **Currently one entry**: the rest of the battery agrees with the live oracle.
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[(
-    "ordered_float_key_order",
-    "`ordered_set` key ordering across representations. `erl` orders numbers by \
-     *value* across integer/float representations (`-3 < -2.5 < 0 < 1.5 < 5`), so \
-     `ets:tab2list`/`first`/`next` interleave them. `beam_ets` groups every \
-     integer before every float: its `OrderedSetInterior` orders keys through \
-     `beam_term::compare::cmp` (exact mode), whose mixed integer/float arm \
-     (`compare.rs::cmp_numbers`, the `(Float, Small) | (Float, Big) | (Small, \
-     Float) | (Big, Float)` case) ranks by representation \
-     (`class_rank(ca).cmp(&class_rank(cb))`) instead of comparing numerically, \
-     giving `[i2,i3,i1,f2,f1]` where the oracle gives `[i2,f2,i3,f1,i1]`. Fix \
-     would be to order `ordered_set` keys with the arithmetic number order \
-     (`compare::cmp_arith`) rather than the exact-mode `cmp`. The rendering of \
-     equal-valued keys is unaffected (no two keys here are equal).",
-)];
+/// **Currently empty**: the whole battery agrees with the live oracle, so every
+/// case is compared strictly. (The single former entry, `ordered_float_key_order`,
+/// recorded `ordered_set` grouping every integer before every float; it was fixed
+/// by ordering keys with `compare::cmp_arith` — ERTS's arithmetic key order — so
+/// the case now agrees and is compared strictly.)
+const KNOWN_DIVERGENCES: &[(&str, &str)] = &[];
 
 /// `true` when `name` is a recorded divergence.
 fn is_known_divergence(name: &str) -> bool {

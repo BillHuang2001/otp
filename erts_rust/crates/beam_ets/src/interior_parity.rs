@@ -21,7 +21,8 @@
 //! [`SortedOrderedInterior`](crate::SortedOrderedInterior)), but the tail of the
 //! trace is **order-sensitive**: `tab2list`, the whole-object walk and
 //! `match_object` must agree not just on *content* but on the exact ascending
-//! `beam_term::compare` order, along with `first`/`last`/`next`/`prev`.
+//! **arithmetic** key order (`beam_term::compare::cmp_arith`, the order ERTS
+//! `ordered_set` uses), along with `first`/`last`/`next`/`prev`.
 
 use crate::kind::{OrderedInterior, SetInterior, TableKind, TableOptions};
 use crate::table::{Table, TableId};
@@ -81,6 +82,27 @@ fn render_result(result: Result<Eterm, BeamError>) -> String {
     }
 }
 
+/// A `[HEADER_FLONUM, bits]` float term, leaked for the test's life (neither the
+/// `beam_term::heap::Heap` arena nor this module has a boxed-float constructor).
+fn float_term(value: f64) -> Eterm {
+    let words: Box<[Eterm; 2]> =
+        Box::new([HEADER_FLONUM, Eterm::from_raw(value.to_bits() as usize)]);
+    let leaked: &'static [Eterm; 2] = Box::leak(words);
+    make_boxed(leaked.as_ptr())
+}
+
+/// A rendering of one **number** term: `i<v>` for a small integer and `f<v>` for
+/// a float, so an integer/float mixed run can be compared without exposing a
+/// float's pointer identity (which [`render`] would, via its `?raw` fallback).
+fn render_number(term: Eterm) -> String {
+    if is_small(term) {
+        return format!("i{}", signed_value(term));
+    }
+    // SAFETY: the numeric mixed-order script only ever builds small ints and
+    // floats, so every non-small term here is a live boxed flonum.
+    let bits = unsafe { float_bits(term) };
+    format!("f{}", f64::from_bits(bits))
+}
 /// One step of the operation script.
 #[derive(Clone, Copy)]
 enum Op {
@@ -425,6 +447,79 @@ fn the_ordered_trace_pins_the_ascending_order() {
     assert_ne!(ordered, reversed, "the ordered table has at least two objects");
 }
 
+/// Insert the numeric mixed-key run into one ordered interior and render the
+/// resulting ascending arithmetic key order by walking `tab2list` (the ordered
+/// object run) and rendering each object's key element.
+fn numeric_order_run(interior: OrderedInterior, atoms: &AtomTable) -> String {
+    let mut heap = Heap::new(256);
+    let mut opts = TableOptions::new();
+    opts.set_kind(TableKind::OrderedSet);
+    let mut table =
+        Table::with_ordered_interior(TableId::next(), opts, interior).expect("table is buildable");
+    // `1` then `1.0` collapse to a single key whose stored object is the *last* one,
+    // so its key element renders as the float `1.0`.
+    for key in [
+        make_small(5),
+        make_small(-3),
+        make_small(0),
+        float_term(1.5),
+        float_term(-2.5),
+        make_small(1),
+        float_term(1.0),
+    ] {
+        table
+            .insert(heap.tuple(&[key, key]).unwrap(), atoms)
+            .unwrap();
+    }
+    assert_eq!(table.size(), 6, "the `1`/`1.0` pair is one key");
+    table
+        .tab2list()
+        .iter()
+        .map(|obj| {
+            // SAFETY: the script only builds 2-tuples.
+            render_number(unsafe { tuple_element(*obj, 0) })
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// The `cmp` -> `cmp_arith` change must leave the two ordered interiors in exact
+/// agreement on the **arithmetic key order**: `{1, a}` and `{1.0, b}` collapse to
+/// one key (the last object wins), and a numeric mixed-key set iterates in value
+/// order across integer/float representations (`-3 < -2.5 < 0 < 1.0 < 1.5 < 5`).
+/// This pins the two ordered interiors against each other on the new order.
+#[test]
+fn ordered_interiors_agree_on_arithmetic_key_order() {
+    let atoms = AtomTable::new();
+
+    // Both interiors collapse the `1`/`1.0` pair to a single key.
+    for interior in [OrderedInterior::BPlusTree, OrderedInterior::Sorted] {
+        let mut heap = Heap::new(64);
+        let mut opts = TableOptions::new();
+        opts.set_kind(TableKind::OrderedSet);
+        let mut table =
+            Table::with_ordered_interior(TableId::next(), opts, interior).expect("buildable");
+        table
+            .insert(heap.tuple(&[make_small(1), make_small(10)]).unwrap(), &atoms)
+            .unwrap();
+        table
+            .insert(heap.tuple(&[float_term(1.0), make_small(20)]).unwrap(), &atoms)
+            .unwrap();
+        assert_eq!(table.size(), 1, "{interior:?}: 1 and 1.0 are the same key");
+        assert!(table.member(make_small(1), &atoms));
+        assert!(table.member(float_term(1.0), &atoms));
+        // Either representation finds the last-inserted object.
+        let want = heap.tuple(&[float_term(1.0), make_small(20)]).unwrap();
+        let found = table.lookup(make_small(1), &atoms);
+        assert!(eq(found[0], want, &atoms), "{interior:?}");
+    }
+
+    // The numeric mixed order renders identically, and in value order.
+    let tree = numeric_order_run(OrderedInterior::BPlusTree, &atoms);
+    let sorted = numeric_order_run(OrderedInterior::Sorted, &atoms);
+    assert_eq!(tree, sorted, "both ordered interiors share the key order");
+    assert_eq!(tree, "i-3|f-2.5|i0|f1|f1.5|i5");
+}
 /// Assert two traces are identical, printing the first mismatch.
 fn compare(chained: &[String], champ: &[String]) {
     assert_eq!(

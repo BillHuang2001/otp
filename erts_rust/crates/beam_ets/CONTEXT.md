@@ -11,7 +11,7 @@ The **interior data structures are NOT externally pinned** (crate-layer `../CONT
 layout, hash-map thresholds, tree fan-out and load factors are implementation choices. Only the
 **semantics** are contract — which object wins on a duplicate key, key equality/ordering, `size`, and
 what `lookup`/`select`/`tab2list`/`first`/`next` return. Term **ordering** and **hashing** are owned
-by `beam_term` (`compare::cmp`/`eq`, `hashing::term_hash`) and MUST NOT be re-implemented here.
+by `beam_term` (`compare::cmp`/`cmp_arith`/`eq`, `hashing::term_hash`) and MUST NOT be re-implemented here.
 
 Legacy ground truth (read-only): `../../erts/emulator/beam/erl_db.c` (API), `erl_db_hash.c`
 (hash tables: `set`/`bag`), `erl_db_tree.c` (`ordered_set`), `erl_db_util.c` (key/term handling, the
@@ -256,12 +256,15 @@ impl Table {
 ### `ordered_interior/` — the ordered `ordered_set` interiors (B+-tree + sorted `Vec`)
 - `mod.rs` — `pub struct OrderedSetInterior` (key-ordered B+-tree, see Design Decisions): `new()`,
   `first`/`last`, `first_key`/`last_key`, `next`/`prev`, `next_from(bound, inclusive)`/
-  `prev_from(bound, inclusive)` (the partial-bound range searches) — all via `beam_term::compare::cmp`.
+  `prev_from(bound, inclusive)` (the partial-bound range searches) — all via `beam_term::compare::cmp_arith`
+  (the **arithmetic** key order ERTS `ordered_set` uses — `erl_db_tree.c` `cmp_key_eq`,
+  `CMP = erts_cmp(a, b, 0, 0)` — so `1` and `1.0` are the *same* key). Whole-object identity
+  (`delete_object/2`) stays the exact `compare::eq`.
   Plus its `Interior` impl (which overrides `first_key`/`last_key`/`next_key`/`prev_key` and
   `memory`). Interior storage (the node arena) **is** counted by `memory()`.
 - `sorted.rs` — `pub struct SortedOrderedInterior`: the alternative `ordered_set` interior
   ([`OrderedInterior::Sorted`]), the **same** observable semantics over one `Vec<Entry>` kept sorted
-  by `beam_term::compare::cmp` (`O(log n)` binary-search lookup via the shared `node::search_entries`,
+  by `beam_term::compare::cmp_arith` (`O(log n)` binary-search lookup via the shared `node::search_entries`,
   `O(n)` `Vec::insert`/`Vec::remove`), with the same inherent navigation and a capacity-based
   `memory()`. Crate-internal `iter()` yields the shared `node::Entry` record.
 - `node.rs` — the arena node layout + `ORDER`/`MIN_OCCUPANCY` constants and the `NodeStore`
@@ -332,8 +335,9 @@ impl Table {
 - **Errors:** only `beam_common::{Result, BeamError}`. `badarg`-style failures ⇒ `BeamError::BadArg`;
   never `panic!`/`unwrap()` on runtime data; no crate-local error enum. Table ops never panic on
   malformed input — they return `Err`.
-- **Never re-implement term order/hash.** Ordering ⇒ `beam_term::compare::cmp`/`eq`; hashing ⇒
-  `beam_term::hashing::term_hash` (workspace Prevent-Duplication rule).
+- **Never re-implement term order/hash.** Ordering ⇒ `beam_term::compare::cmp` (the exact `=:=` order)
+  / `cmp_arith` (the **arithmetic** order ERTS `ordered_set` keys use) / `eq` (whole-object identity);
+  hashing ⇒ `beam_term::hashing::term_hash` (workspace Prevent-Duplication rule).
 - **Table-owned storage only (A.1 copy boundary).** An inserted object is **deep-copied** into the
   table's `TermStore`; the table never retains a pointer into a caller's/process heap. Objects/keys
   returned from reads alias table storage and stay valid for the table's lifetime.
@@ -354,7 +358,10 @@ impl Table {
   and no interior pointer is ever invalidated — matching `erl_db_tree.c`'s shape and giving O(log n)
   insert/lookup/delete and O(log n) ordered iteration via a leaf chain plus the separator invariant
   `keys[i] == max(child[i])`. Rebalancing is borrow-or-merge on underflow. All key comparisons go
-  through `beam_term::compare::cmp` (so `1` and `1.0` are distinct keys). Recorded as a structural
+  through `beam_term::compare::cmp_arith` (the **arithmetic** key order ERTS `ordered_set` uses —
+  `erl_db_tree.c` `cmp_key_eq`, `CMP = erts_cmp(a, b, 0, 0)`), so `1` and `1.0` are the *same* key
+  (the last-inserted object wins; `delete_object/2` still compares whole objects with the exact
+  `compare::eq`). Recorded as a structural
   change for `../../CHANGE.md` (repo-root owned).
 - **`set` defaults to a CHAMP open-addressing interior; `bag`/`duplicate_bag` stay chained.** Adopted
   on measurement, not faith: `src/interior_bench.rs` compares `HashInterior` (chained) against
@@ -408,7 +415,8 @@ impl Table {
   `first_key`/`last_key`/`next_key`/`prev_key`; real ETS likewise does not specify hash traversal order
   (real `erl` returns `first` for `last` on a small set). Only the *order* is unspecified: every key a
   walk yields is a present key, `first`+`next` is a permutation of the stored keys, and `next`/`prev`
-  on an **absent** anchor are `badarg`. `ordered_set` navigation is exact (ascending `beam_term` order;
+  on an **absent** anchor are `badarg`. `ordered_set` navigation is exact (ascending arithmetic key
+  order, `compare::cmp_arith`;
   absent keys read as range bounds).
 - **Access control mirrors `db_check_access`.** `can_read`/`can_write` treat `requester == owner` as
   full access and otherwise apply the `public`/`protected`/`private` matrix; `TableAccess` is the
@@ -519,8 +527,8 @@ impl Table {
   (round-trip, replace/delete, navigation of present/absent keys, `lookup_element` bounds,
   `memory` monotonicity), the B+-tree **mixed-class** order test (`navigates`/iteration over
   integers incl. negative and zero, an atom, a tuple, `[]`, a list and a binary in exactly
-  `beam_term::compare::cmp` order, checked for both ordered interiors — never against the live
-  oracle), select compile/execute, info. **123 lib unit tests.**
+  `beam_term::compare::cmp_arith` order, checked for both ordered interiors — never against the live
+  oracle), select compile/execute, info. **126 lib unit tests.**
 - **Cross-interior equivalence + the selection defaults** (`src/interior_parity.rs`, `#[cfg(test)]`):
   `champ_is_the_documented_default_set_interior` pins `SetInterior::default() == Champ` and
   `bplus_tree_is_the_documented_default_ordered_interior` pins
@@ -533,7 +541,9 @@ impl Table {
   **order-sensitive** tail (`tab2list`, the `first`/`next`-chain walk, the `prev`-chain, `last` and
   `match_object`, all rendered in order) so any ordering divergence is caught, at `keypos` 1 and 2;
   `the_ordered_trace_pins_the_ascending_order` proves that tail really carries order (a reversed run
-  would differ).
+  would differ); `ordered_interiors_agree_on_arithmetic_key_order` pins the `cmp` → `cmp_arith` change
+  on both ordered interiors at once — the `{1,a}`/`{1.0,b}` pair collapses to one key (size 1, last
+  object wins) and the numeric mixed keys iterate in value order (`-3 < -2.5 < 0 < 1.0 < 1.5 < 5`).
 - **Interior microbenchmarks** (`src/interior_bench.rs`, `#[cfg(test)]`): chained vs CHAMP
   (`interior_microbenchmark`) and B+-tree vs sorted `Vec` (`ordered_interior_microbenchmark`), both
   with in-line `size`/hit/miss/iteration count assertions (so a wrong result can never be timed as a
@@ -626,9 +636,6 @@ impl Table {
   `error:undef` — so their absence is correct; `ets:info(T, size)` is the supported spelling of the
   size query.) The `/3` limited forms are implemented but their opaque **continuation terms** and the
   bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's (see the handoff below).
-- **The `TableAccess` view does not cover the new operations.** `select_replace`, the limited forms
-  and `match_spec_run` are not yet exposed through `src/table/access.rs` (owned by another task), so an
-  access-checked caller cannot reach them.
 - **`match_spec_run` accepts a RAW spec, unlike the oracle.** The oracle's `ets:match_spec_run/2`
   requires a spec already compiled by `ets:match_spec_compile/1` (a raw clause list is `badarg`);
   this crate has no compiled-spec *term*, so `run.rs` compiles the raw spec and the bridge must map
@@ -661,7 +668,12 @@ impl Table {
   via `OrderedInterior::Sorted`; there the sorted interior *wins* lookup/iterate/memory but loses
   `O(n)` on insert/delete, so the B+-tree is the default (Design Decisions). The interior shapes are
   unpinned (crate-layer §2), so no contract is affected.
-
+- **`cmp_arith`'s big-integer↔float key comparison is a best-effort `f64` approximation** (a
+  pre-existing `beam_term` gap, not introduced here). ERTS's arithmetic key order (`erl_db_tree.c`
+  `cmp_key_eq`) compares an integer key against a float key numerically; `compare::cmp_arith` does so
+  through `number::number_as_f64`, which rounds an unrepresentable bignum magnitude to `±inf`. This
+  only affects an `ordered_set` whose keys mix an out-of-`f64`-range bignum with a float; every
+  representable integer/float pair (including the small-int/float keys the tests pin) is exact.
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior` + `OrderedInterior` (the interior selectors), `Access`, `Concurrency`, `TableOptions`, `can_read`/`can_write`
