@@ -24,13 +24,15 @@
 //!   `{trace_delivered, Tracee, Ref}` and returned;
 //! * `erts_internal:trace/3` (the body `erlang:trace/2,3` calls) for the process targets
 //!   `Pid | all | existing | existing_processes | processes`;
-//! * the **`send` event** of the ordinary trace surface: [`RuntimeContext::trace_send_events`]
-//!   is called by the send seam (the `RuntimeContext::send_message` the engine's `send`
-//!   instruction reaches) after the payload has been delivered and emits `{trace, Sender, send,
-//!   Msg, To}` — or `{trace_ts, …}` with the `timestamp` family's trailing element — to the
-//!   **sending**
-//!   process's tracer, plus the `{seq_trace, Label, {send, …}}` event when the sender's
-//!   sequential-trace token has the `send` flag set;
+//! * the **`send` and `'receive'` events** of the ordinary trace surface:
+//!   [`RuntimeContext::trace_send_events`] and [`RuntimeContext::trace_receive_events`] are
+//!   called by the send seam (the `RuntimeContext::send_message` the engine's `send`
+//!   instruction reaches). The first, after the payload has been delivered, emits `{trace,
+//!   Sender, send, Msg, To}` — or `{trace_ts, …}` with the `timestamp` family's trailing
+//!   element — to the **sending** process's tracer, plus the `{seq_trace, Label, {send, …}}`
+//!   event when the sender's sequential-trace token has the `send` flag set; the second emits
+//!   `{trace, Receiver, 'receive', Msg}` to the **receiving** process's tracer when that
+//!   process's `'receive'` flag is set, on **enqueue**;
 //! * `erts_internal:trace_pattern/3` (the body `erlang:trace_pattern/2,3` calls) — the
 //!   **function** trace patterns. [`TraceState`] owns a [`PatternTable`]: one entry per
 //!   installed `{M,F,A}` pattern (wildcard-aware — [`MfaPattern::matches`]) holding its
@@ -40,18 +42,21 @@
 //!
 //! # Deliberately out of scope (a later stage)
 //!
-//! * **The other event families.** Only the `send` event is emitted
-//!   ([`RuntimeContext::trace_send_events`]); the `'receive'`, `spawn`, `exit` and
-//!   `call`/`return_to`/`return_from` events have no producer — nothing is wired into the
-//!   engine's receive or call paths, so those flags are state only. [`PatternTable::matches`]
-//!   is the predicate a future `beam_engine` per-call hook calls to decide whether a
-//!   `call`/`return_from`/`return_to` event should be emitted; until that hook exists it is
-//!   only a query. Nor does a **match spec** filter the `send` event (none is compiled — see
-//!   below).
+//! * **The remaining event families.** Two events are emitted, both from the send seam: the
+//!   `send` event ([`RuntimeContext::trace_send_events`]) and the delivered-message
+//!   `{trace, Receiver, 'receive', Msg}` event ([`RuntimeContext::trace_receive_events`],
+//!   emitted on **enqueue** and gated on the *receiver's* flag). The `spawn`, `exit`,
+//!   `register`/`unregister`, `in`/`out` and `call`/`return_to`/`return_from` events have no
+//!   producer — nothing is wired into the engine's spawn/exit or call paths, so those flags
+//!   are state only (deliberately unemitted rather than emitted with an unpinned shape).
+//!   [`PatternTable::matches`] is the predicate a future `beam_engine` per-call hook calls to
+//!   decide whether a `call`/`return_from`/`return_to` event should be emitted; until that hook
+//!   exists it is only a query. Nor does a **match spec** filter the emitted events (none is
+//!   compiled — see below).
 //! * **Carrying the sequential-trace token with a message.** The `{send, …}` event is emitted,
 //!   but the token is *not* attached to the message the send delivers, so a receiver cannot
 //!   inherit it (that needs a per-message slot in `beam_message`) and no `{'receive', …}`
-//!   event can follow.
+//!   sequential-trace event can follow.
 //! * **Match-spec compilation.** A `[match_spec()]` argument is shape-checked and stored
 //!   verbatim ([`MatchSpec::Functions`]); it is never compiled and never applied, so it
 //!   cannot filter an event (there are none to filter). `trace_info`'s `match_spec` item is a
@@ -1266,7 +1271,6 @@ mod tests {
         rt.seq_trace_mut().set_label(sender, sender.to_eterm(), label);
         rt.seq_trace_mut().set_tracer(Some(tracer));
 
-        let mut sink = beam_bifs::NullSink;
         {
             let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, sender);
             ctx.send_message(sender.to_eterm(), message).expect("send");
@@ -1365,7 +1369,6 @@ mod tests {
             Some(sender),
         );
 
-        let mut sink = beam_bifs::NullSink;
         {
             let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, sender);
             ctx.send_message(tracer.to_eterm(), message).expect("send");
@@ -1409,7 +1412,6 @@ mod tests {
             Some(receiver),
         );
 
-        let mut sink = beam_bifs::NullSink;
         {
             let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, sender);
             ctx.send_message(receiver.to_eterm(), message).expect("send");
