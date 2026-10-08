@@ -126,7 +126,7 @@ pub struct Machine {
     /// here is what lets [`Machine::switch_context`] restore context `0`'s binding
     /// when a cross-module callee returns into the caller. Set by
     /// [`Machine::enter_run`], cleared by [`Machine::reset`].
-    entry_literals: Option<SharedLiteralArea>,
+    pub(crate) entry_literals: Option<SharedLiteralArea>,
     /// The registered module contexts (`> 0`) entered through the cross-module
     /// call seam — see [`ModuleContext`] / [`Contexts`].
     ///
@@ -134,7 +134,7 @@ pub struct Machine {
     /// here. **Cleared by [`Machine::reset`] but not by a resume**: a suspended
     /// cross-module frame must still be able to name its module when the host
     /// resumes the process ([`Machine::resume_outcome`]).
-    contexts: Contexts,
+    pub(crate) contexts: Contexts,
     /// The module context currently executing: `0` for the run's entry module,
     /// otherwise a [`Contexts`] id.
     ///
@@ -142,7 +142,7 @@ pub struct Machine {
     /// [`Machine::switch_context`]) and a suspension leaves it at the context the
     /// process blocked in, which is how a resume recovers the module identity of
     /// the reported `(func, pc)`.
-    context: u32,
+    pub(crate) context: u32,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored

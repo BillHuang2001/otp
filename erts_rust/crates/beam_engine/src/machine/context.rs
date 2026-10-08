@@ -113,6 +113,7 @@ impl Contexts {
     }
 
     /// The number of registered contexts (not counting the entry context).
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }

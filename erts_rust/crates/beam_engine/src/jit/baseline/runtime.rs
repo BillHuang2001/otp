@@ -197,6 +197,17 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
         // the typed `blocked` error (never a wrong result and never a silent
         // continue at the `wait`'s own re-examination label).
         Ok(Step::Wait { func, pc }) => encode_wait(func, pc),
+        // A module-context switch (a `call_ext*` the host resolved through
+        // `ExecutionContext::resolve_external_call`) is an **interpreter-driver**
+        // capability: a compiled block's module, label map and literal area are all
+        // bound for one module, so a tier cannot execute another module's code.
+        // Reported as a typed error, never a silently wrong block.
+        Ok(Step::Enter { .. }) => {
+            runtime.error = Some(crate::error::unsupported(
+                "jit: module context switch outside the interpreter driver",
+            ));
+            ERROR
+        }
         Ok(Step::Done) => HALT,
         Err(err) => {
             runtime.error = Some(err);

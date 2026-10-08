@@ -17,7 +17,7 @@ use crate::machine::{Continuation, Machine, RunOutcome};
 use crate::operand::{read_operand, write_operand};
 use crate::Step;
 
-use super::{build_label_map, resolve, LabelMap};
+use super::{resolve, LabelMap};
 
 impl Machine {
     /// The run entry over the current module context: bind the entry module's

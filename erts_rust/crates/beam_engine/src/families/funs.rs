@@ -156,7 +156,11 @@ pub(crate) fn exec(
                     machine.set_x(0, result)?;
                     match machine.continuation()? {
                         Continuation::Halt => Ok(Some(Step::Done)),
-                        Continuation::Address { func, pc } => Ok(Some(Step::Goto { func, pc })),
+                        Continuation::Address {
+                            func,
+                            pc,
+                            context: _,
+                        } => Ok(Some(Step::Goto { func, pc })),
                     }
                 }
                 ApplyTarget::Raised(step) => Ok(Some(step)),
