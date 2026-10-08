@@ -580,15 +580,33 @@ arith_licm(Region, Order0, Pre, Blocks0) ->
     Defs = defs_map(Blocks0),
     Kinds = value_kinds(Defs, #{}),
     Narrowed = narrowed_vars(Region, Blocks0, Defs),
+    Marker = marker_args(Blocks0),
     Order = [L || L <- Order0, ordsets:is_element(L, RegionSet)],
     lists:foldl(fun(L, B) ->
-                        arith_hoist_block(L, Pre, InRegion, Kinds, Narrowed, B)
+                        arith_hoist_block(L, Pre, InRegion, Kinds, Narrowed,
+                                          Marker, B)
                 end, Blocks0, Order).
 
-arith_hoist_block(L, Pre, InRegion, Kinds, Narrowed, Blocks0) ->
+%% Variables consumed by a `{succeeded,_}' receive marker. The marker has to
+%% stay in the same block, immediately after the instruction whose result it
+%% guards (`beam_ssa_codegen:cg_block/3' matches the pair), so an instruction
+%% that produces such a variable is never moved: hoisting it would leave the
+%% marker behind and make code generation fail.
+marker_args(Blocks) ->
+    maps:fold(
+      fun(_L, #b_blk{is=Is}, Acc) ->
+              lists:foldl(
+                fun(#b_set{op={succeeded, _}, args=[#b_var{}=V]}, A) ->
+                        ordsets:add_element(V, A);
+                   (_I, A) ->
+                        A
+                end, Acc, Is)
+      end, ordsets:new(), Blocks).
+
+arith_hoist_block(L, Pre, InRegion, Kinds, Narrowed, Marker, Blocks0) ->
     Blk0 = maps:get(L, Blocks0),
     {Keep, Hoist} =
-        arith_split(Blk0#b_blk.is, InRegion, Kinds, Narrowed, 0, [], []),
+        arith_split(Blk0#b_blk.is, InRegion, Kinds, Narrowed, Marker, 0, [], []),
     case Hoist of
         [] ->
             Blocks0;
@@ -603,27 +621,29 @@ arith_hoist_block(L, Pre, InRegion, Kinds, Narrowed, Blocks0) ->
 %% in this pass has a definition inside the region, and classifying it would
 %% rest on annotations that the loop may narrow. Chains of hoisted arithmetic
 %% are therefore left in the loop.
-arith_split([], _InRegion, _Kinds, _Narrowed, _Cnt, Keep, Hoist) ->
+arith_split([], _InRegion, _Kinds, _Narrowed, _Marker, _Cnt, Keep, Hoist) ->
     {lists:reverse(Keep), lists:reverse(Hoist)};
-arith_split([S | Rest], InRegion, Kinds, Narrowed, Cnt, Keep, Hoist) ->
+arith_split([S | Rest], InRegion, Kinds, Narrowed, Marker, Cnt, Keep, Hoist) ->
     case Cnt < ?MAX_HOIST andalso
-        arith_hoistable(S, InRegion, Kinds, Narrowed) of
+        arith_hoistable(S, InRegion, Kinds, Narrowed, Marker) of
         true ->
-            arith_split(Rest, InRegion, Kinds, Narrowed, Cnt + 1,
+            arith_split(Rest, InRegion, Kinds, Narrowed, Marker, Cnt + 1,
                         Keep, [S | Hoist]);
         false ->
-            arith_split(Rest, InRegion, Kinds, Narrowed, Cnt,
+            arith_split(Rest, InRegion, Kinds, Narrowed, Marker, Cnt,
                         [S | Keep], Hoist)
     end.
 
-arith_hoistable(#b_set{op={bif,Op}, args=[A, B]}=I, InRegion, Kinds, Narrowed) ->
-    lists:member(Op, ?ARITH_BIFS) andalso
+arith_hoistable(#b_set{op={bif,Op}, args=[A, B], dst=Dst}=I, InRegion, Kinds,
+                Narrowed, Marker) ->
+    not ordsets:is_element(Dst, Marker) andalso
+        lists:member(Op, ?ARITH_BIFS) andalso
         invariant_arith_arg(A, InRegion) andalso
         invariant_arith_arg(B, InRegion) andalso
         is_integer_kind(pre_kind(I, 0, A, Narrowed, Kinds)) andalso
         is_integer_kind(pre_kind(I, 1, B, Narrowed, Kinds)) andalso
         second_operand_ok(Op, B);
-arith_hoistable(_I, _InRegion, _Kinds, _Narrowed) ->
+arith_hoistable(_I, _InRegion, _Kinds, _Narrowed, _Marker) ->
     false.
 
 invariant_arith_arg(#b_literal{}, _InRegion) ->
@@ -644,10 +664,18 @@ is_integer_kind(unknown) -> false.
 %% raising there; `bsl'/`bsr' need a literal count in 0..?MAX_LITERAL_SHIFT.
 second_operand_ok(Op, B) when Op =:= 'div'; Op =:= 'rem' ->
     is_nonzero_literal(B);
-second_operand_ok(Op, #b_literal{val=N}) when Op =:= 'bsl'; Op =:= 'bsr' ->
-    is_integer(N) andalso N >= 0 andalso N =< ?MAX_LITERAL_SHIFT;
+second_operand_ok(Op, B) when Op =:= 'bsl'; Op =:= 'bsr' ->
+    is_shift_literal(B);
 second_operand_ok(_Op, _B) ->
     true.
+
+%% `bsl'/`bsr' accept any integer first operand but raise for a negative or a
+%% non-integer count and can hit `system_limit' for a huge one, so the count
+%% must be a literal in `0..?MAX_LITERAL_SHIFT'.
+is_shift_literal(#b_literal{val=N}) when is_integer(N) ->
+    N >= 0 andalso N =< ?MAX_LITERAL_SHIFT;
+is_shift_literal(_B) ->
+    false.
 
 is_nonzero_literal(#b_literal{val=N}) when is_integer(N), N =/= 0 -> true;
 is_nonzero_literal(_B) -> false.
