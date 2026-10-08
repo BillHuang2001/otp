@@ -188,6 +188,23 @@ impl RunQueue {
         }
     }
 
+    /// Moves `pid` to the tail of `priority`'s FIFO **iff** it is currently enqueued at a
+    /// different level, reporting whether it was moved.
+    ///
+    /// This is the run-queue half of a priority change (`process_flag(priority, P)` /
+    /// `spawn_opt(..., [{priority, P}])`). A pid that is **not** enqueued at all (it is running,
+    /// in flight, waiting, suspended or terminated) or is already at `priority` is left
+    /// untouched, so this never double-enqueues and never inserts a pid that was not queued.
+    pub fn reprioritize(&mut self, pid: ProcessId, priority: Priority) -> bool {
+        match self.priority_of(pid) {
+            Some(current) if current != priority => {
+                self.remove(pid);
+                self.enqueue_with_priority(pid, priority);
+                true
+            }
+            _ => false,
+        }
+    }
     /// Iterates every enqueued pid in the order [`RunQueue::dequeue`] would return them
     /// (MAX, then HIGH, then NORMAL, then LOW, FIFO within each level).
     pub fn iter(&self) -> impl Iterator<Item = ProcessId> + '_ {
@@ -414,6 +431,39 @@ mod tests {
         mixed.enqueue_with_priority(pid(4), Priority::Normal);
         assert_eq!(mixed.split_off_half(), vec![pid(3), pid(2)]);
         assert_eq!(mixed.iter().collect::<Vec<_>>(), vec![pid(4), pid(1)]);
+    }
+
+    #[test]
+    fn reprioritize_moves_only_a_differently_queued_pid() {
+        let mut queue = RunQueue::new();
+        queue.enqueue_with_priority(pid(1), Priority::Normal);
+        queue.enqueue_with_priority(pid(2), Priority::Normal);
+
+        // A promotion moves the pid to the tail of the new level; the total is unchanged.
+        assert!(queue.reprioritize(pid(1), Priority::High));
+        assert_eq!(queue.priority_of(pid(1)), Some(Priority::High));
+        assert_eq!(queue.len(), 2, "no duplicate is created");
+
+        // Already at the requested level: nothing to do (and no duplicate).
+        assert!(!queue.reprioritize(pid(1), Priority::High));
+        assert_eq!(queue.priority_of(pid(1)), Some(Priority::High));
+        assert_eq!(queue.len(), 2);
+
+        // A pid that is not queued is never inserted.
+        assert!(!queue.reprioritize(pid(9), Priority::Max));
+        assert_eq!(queue.priority_of(pid(9)), None);
+        assert_eq!(queue.len(), 2);
+
+        // The HIGH pid is now served before the NORMAL one.
+        assert_eq!(queue.dequeue(), Some(pid(1)));
+        assert_eq!(queue.dequeue(), Some(pid(2)));
+
+        // A demotion also moves.
+        let mut queue = RunQueue::new();
+        queue.enqueue_with_priority(pid(3), Priority::Max);
+        assert!(queue.reprioritize(pid(3), Priority::Low));
+        assert_eq!(queue.priority_of(pid(3)), Some(Priority::Low));
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]
