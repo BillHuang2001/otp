@@ -127,8 +127,8 @@ frame+flush `Status::not_allowed()` (the exact 14 bytes `snot_allowed`) before r
 Re-exported at the crate root and via `beam_dist::prelude::*` (see `src/lib.rs`/`src/prelude.rs`).
 
 ### `src/lib.rs`
-`pub mod {auth, atom_cache, connection, control, dist_header, driver, epmd, flags, fragment, framing,
-handshake, prelude, transport}` + `pub mod prelude`, flat `pub use` of the principal items below.
+`pub mod {atom_cache, auth, connection, control, delivery, dist_header, driver, epmd, flags, fragment,
+framing, handshake, prelude, transport}`, flat `pub use` of the principal items below.
 Crate lints: `#![deny(unsafe_code)]`, `#![warn(missing_docs)]`.
 Crate constants: `DIST_VERSION: u16 = 6`, `DIST_VERSION_5: u16 = 5`, `EPMD_PORT: u16 = 4369`,
 `VERSION_MAGIC: u8 = 131` (alias of `beam_codec::VERSION_MAGIC`).
