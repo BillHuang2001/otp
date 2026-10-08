@@ -109,7 +109,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     (the resolution is the caller's explicit pin, or, by default, the automatic rule)
   - `kind() -> MatureKind`; `mature_choice() -> MatureChoice` (the resolved decision, its source recovered
     by comparing the strategy with the rule's verdict — see `selection.rs`); `policy()`; `young()`;
-    `young_mut() -> &mut HeapSpace`; `stats() -> GcStats`; `collect(&mut self, roots) -> Result<Collection>`
+    `young_mut() -> &mut HeapSpace`; `stats() -> GcStats`; `collect(&mut self, roots) -> Result<Collection>`;
+    `ensure_capacity(need_words, roots) -> Result<Collection>`
   - thin forwarding only — lets a caller / test drive one corpus through either strategy.
 
 ### `config.rs` + `selection.rs` — the mature-generation decision
