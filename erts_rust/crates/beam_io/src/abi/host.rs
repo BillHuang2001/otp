@@ -197,29 +197,37 @@ impl PortHost for LocalAtomPortHost {
 /// callback should receive (see [`DriverState::fd_armed`]), so a `driver_select` that flips
 /// direction updates it in place rather than adding an entry.
 ///
-/// The two `ERL_DRV_USE` bits are the driver's *release* contract for this registration (see
-/// [`SelectedFd::wants_stop_select`]); they live here, next to the fd, because the fd is what the
+/// The `ERL_DRV_USE` release obligation is the registration's own (see
+/// [`SelectedFd::wants_stop_select`]); it lives here, next to the fd, because the fd is what the
 /// release callback names.
 pub(crate) struct SelectedFd {
     /// The poller token `DriverContext::register` returned.
     pub(crate) token: Token,
     /// The interest the registration currently expresses.
     pub(crate) interest: Interest,
-    /// The select asked for `ERL_DRV_USE` (`ERL_NIF_SELECT_STOP`): the driver is entitled to a
-    /// `stop_select` callback once this registration is released.
-    pub(crate) use_stop: bool,
-    /// The select was `ERL_DRV_USE_NO_CALLBACK` (`ERL_DRV_USE | ERL_DRV_USE << 1`): the driver
-    /// keeps the `ERL_DRV_USE` bookkeeping but explicitly declined the callback.
-    pub(crate) use_no_callback: bool,
+    /// The registration still owes its owner a `stop_select` callback: a select carried
+    /// `ERL_DRV_USE` (`ERL_NIF_SELECT_STOP`) without the `_NO_CALLBACK` bit, and no later select
+    /// has declined it.
+    pub(crate) owes_stop_select: bool,
 }
 
 impl SelectedFd {
     /// Whether releasing this registration owes the driver a `stop_select` callback.
     ///
-    /// The C fires it exactly for `ERL_DRV_USE` without the `_NO_CALLBACK` bit
+    /// The obligation is **sticky across re-selection**, like the C's `ERTS_EV_FLAG_USED`, which a
+    /// select sets (`if (mode & ERL_DRV_USE) state->flags |= ERTS_EV_FLAG_USED;`,
+    /// `erl_check_io.c:1154-1155`) and a later select on the same fd does **not** clear. Only
+    /// `ERL_DRV_USE_NO_CALLBACK` declines the callback — the C's `no_stop_select_callback` decision
     /// (`(mode & ERL_DRV_USE_NO_CALLBACK) == ERL_DRV_USE`, `erl_check_io.c:1033`, `erl_check_io.c:1179`).
+    ///
+    /// Fidelity note: the C reads that bit off the **releasing call's** `mode`, so a driver that
+    /// never selected with `ERL_DRV_USE` but de-selects with it still gets the callback there. This
+    /// floor instead treats the request as a property of the registration (a select with `READ`
+    /// after `READ | ERL_DRV_USE` keeps the obligation, which the C's sticky flag achieves too),
+    /// and therefore *declines* that nonsensical case. Erring toward the driver's expressed intent
+    /// is the safe direction: it never leaks a handle the driver expected to be told about.
     pub(crate) fn wants_stop_select(&self) -> bool {
-        self.use_stop && !self.use_no_callback
+        self.owes_stop_select
     }
 }
 
@@ -509,17 +517,17 @@ impl DriverHost for AbiHost {
     /// one-registration-per-event model; de-selecting an fd that was never selected succeeds (the
     /// C's `driver_select` is idempotent).
     ///
-    /// The two `ERL_DRV_USE` bits are recorded with the registration
-    /// ([`SelectedFd::wants_stop_select`]) rather than folded into the interest: they only ask for
-    /// the driver's `stop_select` release callback, and `interest_from_mode` therefore leaves them
-    /// out (a `mode` of `ERL_DRV_USE` alone still registers `READABLE`, the "watch it for
-    /// close/error" fallback). A release queues the event the *deselecting* call was given, which
-    /// is the operand the C's `stop_select` receives (`erl_check_io.c:1215`).
+    /// The `ERL_DRV_USE` release obligation is recorded with the registration
+    /// ([`SelectedFd::wants_stop_select`]) rather than folded into the interest: it only asks for
+    /// the driver's `stop_select` release callback, and `interest_from_mode` therefore leaves it out
+    /// (a `mode` of `ERL_DRV_USE` alone still registers `READABLE`, the "watch it for
+    /// close/error" fallback). The obligation is merged on re-selection rather than overwritten (a
+    /// select without the bit keeps a request an earlier select made); a release queues the event
+    /// the *deselecting* call was given, which is the operand the C's `stop_select` receives
+    /// (`erl_check_io.c:1215`).
     fn select(&mut self, _port: ErlDrvPort, event: ErlDrvEvent, mode: c_int, on: c_int) -> c_int {
         let fd = event as usize as RawFd;
         let interest = interest_from_mode(mode);
-        let use_stop = mode & ERL_DRV_USE != 0;
-        let use_no_callback = use_stop && (mode & ERL_DRV_USE_NO_CALLBACK) != ERL_DRV_USE;
 
         if on == 0 {
             let Some(selected) = self.state.selected.remove(&fd) else {
@@ -538,8 +546,16 @@ impl DriverHost for AbiHost {
             };
         }
 
-        let existing = self.state.selected.get(&fd).map(|selected| selected.token);
-        let result = self.with_ctx(|ctx| match existing {
+        let existing = self.state.selected.get(&fd);
+        let token = existing.map(|selected| selected.token);
+        // A select that says nothing about `ERL_DRV_USE` leaves an earlier request in force (the
+        // C's sticky `ERTS_EV_FLAG_USED`); one that carries the `_NO_CALLBACK` bit declines it.
+        let owes_stop_select = match (mode & ERL_DRV_USE != 0, existing) {
+            (false, Some(selected)) => selected.wants_stop_select(),
+            (false, None) => false,
+            (true, _) => (mode & ERL_DRV_USE_NO_CALLBACK) == ERL_DRV_USE,
+        };
+        let result = self.with_ctx(|ctx| match token {
             Some(token) => ctx.reregister(fd, token, interest).map(|()| token),
             None => ctx.register(fd, interest),
         });
@@ -550,8 +566,7 @@ impl DriverHost for AbiHost {
                     SelectedFd {
                         token,
                         interest,
-                        use_stop,
-                        use_no_callback,
+                        owes_stop_select,
                     },
                 );
                 0

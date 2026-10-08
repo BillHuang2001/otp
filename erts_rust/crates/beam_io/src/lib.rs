@@ -48,6 +48,10 @@
 //! [`port_task`] (per-port task scheduling: the ERTS port-task queue, its reduction costs
 //! and the notification seam a task round reports through).
 //!
+//! The [`signal`] module is the **OS-signal facility** — the unsafe `sigaction(2)`/signal
+//! work `beam_rt` (which denies `unsafe_code`) cannot do itself: a self-pipe plus an
+//! async-signal-safe trampoline backing `os:set_signal/2`.
+//!
 //! # Status
 //!
 //! Milestone-1 is implemented (see this crate's `CONTEXT.md`, Milestone-1 scope): the
@@ -86,6 +90,7 @@ pub mod port;
 pub mod port_task;
 pub mod queue;
 pub mod registry;
+pub mod signal;
 pub mod timer;
 
 mod error; // `pub(crate)` constructors only — NOT public
@@ -97,6 +102,7 @@ pub use crate::poller::*;
 pub use crate::port::*;
 pub use crate::port_task::*;
 pub use crate::queue::*;
+pub use crate::signal::*;
 pub use crate::timer::*;
 
 /// The conventional glob-import surface for downstream crates.
@@ -112,7 +118,8 @@ pub use crate::timer::*;
 /// [`TcpInetDriver`], [`InetState`]), the driver C-ABI host layer ([`DriverPort`],
 /// [`PortHost`], [`AbiHost`], [`LocalAtomPortHost`], [`DriverState`], [`AsyncJobs`],
 /// [`make_loaded`], [`DriverTable`], [`RegisteredDriver`]) and the timer/queue helpers
-/// ([`Timeout`], [`Timer`], [`ByteQueue`]) into scope.
+/// ([`Timeout`], [`Timer`], [`ByteQueue`]) plus the OS-signal facility ([`Signal`],
+/// [`Disposition`], [`SignalFacility`]) into scope.
 pub mod prelude {
     pub use crate::abi::*;
     pub use crate::driver::*;
@@ -121,5 +128,6 @@ pub mod prelude {
     pub use crate::port::*;
     pub use crate::port_task::*;
     pub use crate::queue::*;
+    pub use crate::signal::*;
     pub use crate::timer::*;
 }

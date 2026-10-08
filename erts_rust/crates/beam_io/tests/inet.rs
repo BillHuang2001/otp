@@ -72,6 +72,8 @@ const WAIT: Duration = Duration::from_secs(10);
 const INET_REQ_OPEN: u32 = 1;
 const INET_REQ_CLOSE: u32 = 2;
 const INET_REQ_BIND: u32 = 6;
+const INET_REQ_SETOPTS: u32 = 7;
+const INET_REQ_GETOPTS: u32 = 8;
 const INET_REQ_LISTEN: u32 = 27;
 const TCP_REQ_RECV: u32 = 42;
 const TCP_REQ_SHUTDOWN: u32 = 44;
@@ -615,4 +617,115 @@ fn the_peer_close_replies_agree_with_the_erl_oracle() {
     assert_eq!(first, ctl_xerror(reasons[0]), "the first close reply");
     assert_eq!(second, ctl_xerror(reasons[1]), "the later close reply");
     ports.close(&mut poller, id).expect("closes the port");
+}
+
+/// The Erlang side of the socket-option cross-check: it opens a real `"tcp_inet"` port
+/// (`open_port({spawn_driver, …})`, as `prim_inet.erl:103` does), `open`s/`bind`s/`listen`s it
+/// and runs the same `setopts`/`getopts` sequence the Rust driver is given, printing each reply
+/// as comma-separated bytes separated by `|`.
+///
+/// The sequence is the one the option vocabulary pins: set-then-read-back of `nodelay` (`10`),
+/// `keepalive` (`1`), `recbuf` (`7`) and `sndbuf` (`6`); a four-code read-back; an unserved code
+/// (`200`) for either verb; and the payload-framing edge cases (a partial `setopts` record, an
+/// empty `getopts`/`setopts`).
+fn oracle_options_expression() -> String {
+    format!(
+        "M = {CONTROL_MAGIC}, \
+         P = open_port({{spawn_driver, \"tcp_inet\"}}, [binary]), \
+         F = fun(C, A) -> binary_to_list(iolist_to_binary(erlang:port_control(P, C + M, A))) end, \
+         _ = F({INET_REQ_OPEN}, <<1,1,0>>), \
+         _ = F({INET_REQ_BIND}, <<4,0,0>>), \
+         _ = F({INET_REQ_LISTEN}, <<0,5>>), \
+         R = [F({INET_REQ_SETOPTS}, <<10,0,0,0,1>>), \
+              F({INET_REQ_GETOPTS}, <<10>>), \
+              F({INET_REQ_SETOPTS}, <<1,0,0,0,1>>), \
+              F({INET_REQ_GETOPTS}, <<1>>), \
+              F({INET_REQ_SETOPTS}, <<7,0,0,16,0>>), \
+              F({INET_REQ_GETOPTS}, <<7>>), \
+              F({INET_REQ_SETOPTS}, <<6,0,0,16,0>>), \
+              F({INET_REQ_GETOPTS}, <<6>>), \
+              F({INET_REQ_GETOPTS}, <<1,10,6,7>>), \
+              F({INET_REQ_GETOPTS}, <<200>>), \
+              F({INET_REQ_SETOPTS}, <<200,0,0,0,1>>), \
+              F({INET_REQ_SETOPTS}, <<7,0,0>>), \
+              F({INET_REQ_GETOPTS}, <<>>), \
+              F({INET_REQ_SETOPTS}, <<>>)], \
+         S = fun(L) -> lists:flatten(lists:join(\",\", [integer_to_list(B) || B <- L])) end, \
+         io:format(\"~s~n\", [lists:flatten(lists:join(\"|\", [S(L) || L <- R]))])"
+    )
+}
+
+/// The socket-option half of the compatibility gate: the **same** `setopts`/`getopts` sequence
+/// run against the real system `tcp_inet` driver must answer the same reply bytes this floor
+/// answers — including the two buffer read-backs, where the kernel's own value (Linux doubles a
+/// `SO_RCVBUF`/`SO_SNDBUF` request, so a 4096 request reads back as 8192) is what both sides
+/// report. Nothing is hard-coded: the comparison is byte-for-byte against the oracle's dump, and
+/// the doubling is asserted separately so the *measured* value is on the record.
+#[test]
+fn the_socket_option_replies_agree_with_the_erl_oracle() {
+    let Some(stdout) = erl_stdout(&oracle_options_expression()) else {
+        return; // the oracle is unavailable; the check skipped loudly above
+    };
+    let Some(oracle) = parse_reply_dump(&stdout) else {
+        panic!("could not parse the oracle reply dump: {stdout:?}");
+    };
+    assert_eq!(oracle.len(), 14, "fourteen replies: {oracle:?}");
+
+    // The Rust side runs the identical sequence against this floor.
+    let mut poller = poller();
+    let (mut ports, id) = tcp_port(&mut poller);
+    listen_on_loopback(&mut poller, &mut ports, id);
+    let rust: Vec<Vec<u8>> = vec![
+        control(&mut ports, &mut poller, id, "setopts", &[TCP_OPT_NODELAY, 0, 0, 0, 1]),
+        control(&mut ports, &mut poller, id, "getopts", &[TCP_OPT_NODELAY]),
+        control(&mut ports, &mut poller, id, "setopts", &[INET_OPT_KEEPALIVE, 0, 0, 0, 1]),
+        control(&mut ports, &mut poller, id, "getopts", &[INET_OPT_KEEPALIVE]),
+        control(&mut ports, &mut poller, id, "setopts", &[INET_OPT_RCVBUF, 0, 0, 16, 0]),
+        control(&mut ports, &mut poller, id, "getopts", &[INET_OPT_RCVBUF]),
+        control(&mut ports, &mut poller, id, "setopts", &[INET_OPT_SNDBUF, 0, 0, 16, 0]),
+        control(&mut ports, &mut poller, id, "getopts", &[INET_OPT_SNDBUF]),
+        control(
+            &mut ports,
+            &mut poller,
+            id,
+            "getopts",
+            &[INET_OPT_KEEPALIVE, TCP_OPT_NODELAY, INET_OPT_SNDBUF, INET_OPT_RCVBUF],
+        ),
+        control(&mut ports, &mut poller, id, "getopts", &[200]),
+        control(&mut ports, &mut poller, id, "setopts", &[200, 0, 0, 0, 1]),
+        control(&mut ports, &mut poller, id, "setopts", &[INET_OPT_RCVBUF, 0, 0]),
+        control(&mut ports, &mut poller, id, "getopts", &[]),
+        control(&mut ports, &mut poller, id, "setopts", &[]),
+    ];
+    ports.close(&mut poller, id).expect("closes the port");
+
+    eprintln!("oracle option replies: {oracle:?}");
+    eprintln!("rust option replies:   {rust:?}");
+
+    // Every reply must match byte for byte.
+    assert_eq!(rust.len(), oracle.len());
+    for (index, (rust_reply, oracle_reply)) in rust.iter().zip(oracle.iter()).enumerate() {
+        assert_eq!(rust_reply, oracle_reply, "reply {index} disagrees");
+    }
+
+    // The oracle's own buffer read-backs, on the record: both are **twice** the 4096 the
+    // sequence requested (the kernel's `SO_RCVBUF`/`SO_SNDBUF` doubling), which is exactly what
+    // this floor reports because it answers the kernel's `getsockopt(2)` value.
+    let read_back = |reply: &[u8]| u32::from_be_bytes([reply[2], reply[3], reply[4], reply[5]]);
+    assert_eq!(
+        read_back(&oracle[5]),
+        2 * 4096,
+        "the oracle doubles a SO_RCVBUF request (8192 for 4096)"
+    );
+    assert_eq!(
+        read_back(&oracle[7]),
+        2 * 4096,
+        "the oracle doubles a SO_SNDBUF request (8192 for 4096)"
+    );
+    // The oracle's unserved-code and framing replies, spelled out.
+    assert_eq!(oracle[9], ctl_xerror("einval"), "getopts of an unserved code");
+    assert_eq!(oracle[10], ctl_xerror("einval"), "setopts of an unserved code");
+    assert_eq!(oracle[11], vec![INET_REP_OK], "a partial setopts record is ignored");
+    assert_eq!(oracle[12], vec![INET_REP_OK], "an empty getopts payload");
+    assert_eq!(oracle[13], vec![INET_REP_OK], "an empty setopts payload");
 }
