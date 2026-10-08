@@ -515,6 +515,15 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   so it is not wired in — reach for it if a local-link path is ever added.
 - The `Connection` API keeps the *additive* creation parameter additive: `connect_client` and
   `Connection::client` are unchanged and delegate with `CLIENT_CREATION = 0`.
+- **Do not run `cargo fmt` on this crate.** It is intentionally not default-rustfmt-clean; a bulk
+  `rustfmt` pass rewrites ~700 unrelated lines. Hand-format to match the surrounding style.
+- **A remote send needs `{Name, Node}`, not `{Node, Name}`.** `bif.c:2614-2626` matches the tuple
+  arguments in that order, so `{Node, Name} ! Msg` silently delivers nothing — a live test once misread
+  this as "the sandbox drops name-addressed sends". There is no sandbox drop; the tuple order was wrong.
+- **In a live probe, a read timeout is NOT a peer rejection.** `TcpTransport`'s `DEFAULT_READ_TIMEOUT`
+  surfaces as `Io(WouldBlock, errno 11)`: the link is still open and nothing arrived — not a refusal.
+  An orderly end-of-link is the `Ok(0)`/`Closed` path. The same confusion once produced a false
+  "the node rejects client-originated `DOP_MONITOR_P`" claim.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`, `DIST_VERSION`/`EPMD_PORT`
