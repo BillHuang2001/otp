@@ -511,9 +511,12 @@ still reproduces today's collector exactly.
   `[4, 8, 16, 32, 128, 512, 1024]` objects (0.25 → 64 whole Immix blocks) in two shapes (`Line` =
   one line per object; `Small` = 3-word objects, the line-rounding worst case), forced through a fullsweep
   under both strategies, reporting moved objects/words, pinned objects, reclaimed words, resident footprint
-  and pause (fastest of 9, in ns). Every *assertion* is on the deterministic counts (moved words, pinned
-  objects, footprint words); timings are printed only. Two `#[test]`s (one per shape), serialized by a
-  `static SERIAL: Mutex<()>`; the table is in Design Decisions §The automatic rule.
+  and pause (fastest of 9, in ns). Its *only* assertions are per-repetition count reproducibility
+  (`count_signature` equal across the 9 reps) and cross-strategy graph equality (`assert_same_graph`); the
+  moved/pinned/footprint magnitudes and the pause are printed only, never pinned to expected values — the
+  break-even is a human reading of the printed table, not enforced by an assertion. (Contrast
+  `tests/immix_measure.rs`/`tests/immix_workloads.rs`, which DO assert exact counts.) Two `#[test]`s (one per
+  shape), serialized by a `static SERIAL: Mutex<()>`; the table is in Design Decisions §The automatic rule.
 - **`tests/mature_selection.rs` — the rule, its override, and cross-threshold correctness.**
   (1) `select_mature` selects `Copying` below `IMMIX_BREAK_EVEN_WORDS` and `Immix` at/above it, and
   `AnyCollector::from_config` follows the rule for a real collector (`GcConfig::default()` → Copying);
