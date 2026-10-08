@@ -230,28 +230,19 @@ impl Table {
 
 ### `champ_interior.rs` — CHAMP open-addressing interior (**default `set`**)
 - `pub struct ChampInterior` + `Default`/`new()`: a **compressed hash-array mapped prefix-tree**
-  (CHAMP). Each level consumes `WIDTH = 5` bits of the 64-bit `term_hash` (`index_bit`) and every node
-  keeps its children **compressed** into two bitmaps — `datamap` (inline slots) and `nodemap`
-  (sub-nodes) — so `data`/`nodes` hold only the set bits in ascending bit order (`slot_index` finds a
-  slot by popcount). A key whose full hash collides with another's lives in a `CollisionNode`
-  (popcount-free, key-compared with `eq`), so a pathological hash can never recurse past 64 bits.
-  `Interior` impl: `insert` is an upsert (returns `Ok(true)` — `set` always retains), and
-  `insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`size`/`iter_objects`/
-  `keys`/`memory` are all overridden. `lookup`/`lookup_element` probe with `slot_index` only (no
-  bucket scan). `iter_objects`/`keys` walk depth-first (`collect_into`) — the `set` navigation order
-  is unspecified, so `first_key`/`last_key`/`next_key`/`prev_key` and the `ets:update_*` element ops
-  use the `Interior` trait defaults. `memory()` counts the root inline plus every node/vector
-  (`heap_words`).
-- **Canonicalization (delete).** A removal calls `canonicalize` bottom-up: a sub-node holding exactly
-  one entry (`single_entry`) is **inlined** into its parent as an inline slot (`bit_at` locates the
-  parent's bit), collapsing single-entry chains. Promoting a *multi-entry* sub-node wholesale is
-  provably wrong — a sub-node is indexed by the *next* 5 hash bits, so it must not be probed with the
-  parent's bits; only single-entry inlining preserves routing. `node_insert` needs no
-  canonicalization (an insert only adds entries).
-- Selection: [`SetInterior`] (`kind.rs`) — `Champ` (default) or `Chained`; `build_interior(kind,
-  set_interior, ordered_interior)` routes `TableKind::Set` accordingly (and `TableKind::OrderedSet`
-  through [`OrderedInterior`]). `bag`/`duplicate_bag` stay on `HashInterior`; `ordered_set` is the
-  B+-tree (default) or the sorted `Vec`. Constructor: `Table::with_set_interior`;
+  (CHAMP). Each level consumes `WIDTH = 5` bits of the 64-bit `term_hash`; each node compresses its
+  children into a `datamap` (inline slots) + `nodemap` (sub-nodes) pair, so `data`/`nodes` hold only
+  the set bits in ascending bit order (`slot_index` probes by popcount). A full-hash collision lives
+  in a `CollisionNode` (key-compared with `eq`), so a pathological hash cannot recurse past 64 bits.
+  Every `Interior` method is overridden; `insert` is an upsert returning `Ok(true)` (`set` always
+  retains). `iter_objects`/`keys` walk depth-first — `set` navigation order is unspecified, so
+  `first_key`/`last_key`/`next_key`/`prev_key` use the trait defaults.
+- **Delete canonicalization.** A removal calls `canonicalize` bottom-up: a sub-node holding exactly
+  one entry is **inlined** into its parent as an inline slot, collapsing single-entry chains.
+  Promoting a *multi-entry* sub-node wholesale is provably wrong — a sub-node is indexed by the *next*
+  5 hash bits, so the parent's bits must not probe it; only single-entry inlining preserves routing.
+- Selection: `SetInterior` (`kind.rs`) — `Champ` (default) or `Chained`; `build_interior(kind,
+  set_interior, ordered_interior)` routes each kind. Constructor `Table::with_set_interior`;
   `Table::set_interior` reports the selection.
 
 ### `hash_interior.rs` — chained hash-index interior (`bag`/`duplicate_bag`; opt-in `set`)
