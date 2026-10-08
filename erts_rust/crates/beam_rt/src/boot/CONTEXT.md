@@ -44,7 +44,7 @@ these eight directives, the full modelled set:
 | `{primLoad,[Mod]}` (2) | `PrimLoad` | load each name from the code path |
 | `{kernel_load_completed}` (1) | `KernelLoadCompleted` | informational marker; never fails |
 | `{module,Mod}` (2) | `Module` | load one name from the code path |
-| `{kernelProcess,Name,{M,F,A}}` (3) | `KernelProcess` | materialize args, spawn, register `Name` |
+| `{kernelProcess,Name,{M,F,A}}` (3) | `KernelProcess` | materialize args, spawn, then drive a bounded burst so the process registers `Name` **itself** (OTP's `init` never pre-registers a directive name — see below) |
 | `{apply,{M,F,A}}` (2) | `Apply` | materialize args, call `M:F(A...)` through the normal dispatch |
 
 - **`$ROOT`** is the Erlang root derived from `CodeServer::lib_root().parent()` (the same convention as
@@ -57,8 +57,12 @@ these eight directives, the full modelled set:
 - **`execute` boots first** (`Runtime::boot`, idempotent) so `$ROOT` expansion and module loads work on
   a fresh runtime. It **stops at the first directive that cannot run** and returns that typed error.
 - **The two process directives drive the scheduler — bounded, and it never hangs.** A
-  `{kernelProcess, …}` spawns+registers and then runs a **bounded burst** (see below) so a long-lived
-  server reaches its `receive`; an `{apply, …}` runs the export through the engine's blocking-aware
+  `{kernelProcess, …}` spawns and then runs a **bounded burst** (see below) that ends as soon as the
+  directive's `Name` resolves through `whereis` (each OTP kernel process registers its *own* name via
+  `register/2` or a `gen_server` `{local,Name}` start — `erts/preloaded/src/init.erl::start_in_kernel/5`
+  never registers it), the run queue drains, or the burst deadline expires; a burst that ends without the
+  name is deliberately **not** this directive's error (matching `init`, which never checks — the failure
+  surfaces at the next dependent directive). An `{apply, …}` runs the export through the engine's blocking-aware
   entries and drives the scheduler whenever the call suspends, resuming it once a boot-spawned process
   answers. Both drives go through `drive_scheduler` over the crate-internal `Runtime::pump_scheduler`,
   with small per-call slice budgets (`KERNEL_BURST_SLICES` 64, `APPLY_BLOCK_SLICES` 256) between
@@ -68,18 +72,28 @@ these eight directives, the full modelled set:
   soon as a `pump_scheduler` call reports `0`. A capability gap stays an `error::unsupported` raise.
   A `{kernelProcess, …}` burst deliberately does **not** surface the spawned process's own crash —
   the directive's contract is spawn+register, so the failure surfaces at the next dependent directive.
-- **Honest M1 stop.** The full real `start.boot` loads every `primLoad` batch (instructions 0–15 all
-  succeed, incl. the three `kernelProcess` spawns and their bursts) and stops at **instruction 16**,
-  `{apply,{application,load,[{application,stdlib,Props}]}}`, with a `BeamError::Raise` rendered
-  **`exit noproc`**: its `application_controller:load_application/1` → `gen_server:call/2` finds the
-  controller's registration gone because the controller **died during its burst**, its `proc_lib`
-  start hitting the scheduler-boundary refusal `unsupported: erlang:spawn from inside a scheduler
-  slice` (`../native/process.rs::check_spawnable`). Not a wrong value and not a hang. The chain that
-  would advance it: (1) the `check_spawnable` refusal → so `application_controller` can `proc_lib`-spawn
-  while scheduled; (2) a `gen_server` round trip that survives the process-dictionary divergence —
-  `beam_process::Dict` keys by raw `Eterm` word, so a structurally-equal `$ancestors` key misses; (3)
-  a live `application_controller`/`application:load/*` capable of the remaining `application` startup;
-  (4) `application:start_boot/2` and `c:erlangrc/0`, the script's two later `apply` directives.
+- **Honest M1 stop.** The full real `start.boot` executes instructions 0–15 (every `primLoad` batch and
+  the three `kernelProcess` directives, each driven to its process's own registration) and stops at
+  **instruction 16**, `{apply,{application,load,[{application,stdlib,Props}]}}`, with a
+  `BeamError::Raise` rendered **`exit noproc`**: `application:load/1` →
+  `application_controller:load_application/1` → `gen_server:call/2` finds no live registered
+  `application_controller`. Not a wrong value and not a hang. `application_controller:init/1`
+  (`lib/kernel/src/application_controller.erl`) dies before it registers/acks, and the whole remaining
+  chain is outside this directory:
+  1. `init/1:545` calls `ets:new(ac_tab,[set,public,named_table,{read_concurrency,true}])` **uncaught**;
+     the sibling `beam_bifs` (`src/ets.rs::parse_options`) rejects every 2-tuple option except
+     `{keypos,N}` ⇒ `badarg`, killing the child.
+  2. Past that, `load/2:1364` → `add_env/2`'s `ets:insert(ac_tab, {{env,Name,Key},Value})` is `badarg`
+     because the sibling `beam_bifs`' table-taking BIFs decode their table argument with `ref_thing_id`
+     only, so an **atom `named_table` name** is unreachable (`ets:new` also returns a ref where the
+     oracle returns the name atom).
+  3. Instruction 13's `logger` cannot start: `logger_server:start_link/0` → `gen_server:start_link` →
+     `proc_lib:sync_start/2`'s `receive` sits in a **cross-module callee**, and the engine's synchronous
+     `Instr::CallExt` arm folds the callee's suspend into `beam_engine::blocked()` instead of suspending
+     the process (the seam pinned by `../../tests/proc_lib_start.rs`); the later `kernel:start/2` needs
+     the registered `logger`, so this is a real blocker.
+  Instruction 12's `heart` is **benign**: `heart:start/0` returns `ignore` (its internal
+  `throw(no_heart)` is caught). Instructions 17–21 are unreached.
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
@@ -102,7 +116,7 @@ these eight directives, the full modelled set:
   `a_missing_preloaded_module_is_a_typed_error_not_a_silent_skip` (empty code path ⇒ `error::undef`, nothing
   cached). System-install tests **skip loudly** (clear `eprintln!` + early `return`) when no Erlang is
   installed — never silently pass.
-- `boot/bootscript.rs` (6 tests): `reads_the_real_start_boot_into_the_oracle_instruction_sequence` (parses
+- `boot/bootscript.rs` (8 tests): `reads_the_real_start_boot_into_the_oracle_instruction_sequence` (parses
   the committed `bootstrap/bin/start.boot`; pins `{"Erlang/OTP","30"}`, 22 instructions, and the
   instruction list — the huge kernel/stdlib `primLoad` batches by length + first/last name, the
   `application_controller` and `application:load/1` args by shape); the bounded prefix test
@@ -115,7 +129,10 @@ these eight directives, the full modelled set:
   `a_boot_spawned_process_answers_a_blocked_apply` (pins the `./drive.rs` behaviour: a `{kernelProcess, …}`
   burst and a later `{apply, …}` that blocks on the spawned process, resumed by a scheduler drive, its
   dictionary side effect read back through `runtime.eval`); `a_malformed_boot_script_is_a_typed_error`
-  (empty / random bytes / a valid-ETF wrong-shape term / a truncated real script). Every test reads the
+  (empty / random bytes / a valid-ETF wrong-shape term / a truncated real script); the two registration
+  pins `a_kernel_process_registers_its_own_directive_name` (a synthetic boot whose `{kernelProcess,Name,…}`
+  entry registers `Name` itself, later resolved via `whereis`) and `registering_a_live_boot_name_is_badarg`
+  (the name-taken rule a pre-registration would hit). Every test reads the
   committed script via `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../bootstrap/bin/start.boot")`;
   system-install tests **skip loudly** when `erl`/`erlc` or the file are absent.
 - `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry.

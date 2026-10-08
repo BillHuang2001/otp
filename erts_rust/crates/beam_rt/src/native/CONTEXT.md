@@ -32,6 +32,7 @@ per-function bodies. Files:
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4` (incl. the heap-size options → `beam_gc::HeapPolicy`), `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`, `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
+| `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` (per-process, default the root pid; see below) |
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
@@ -89,7 +90,7 @@ before the registry.
 | `trap_exit` | `true`/`false` |
 | `error_handler` | the atom `error_handler` (an unchanging runtime default) |
 | `priority` | the scheduling priority atom (`normal`) |
-| `group_leader` | this runtime's root pid (what `erlang:group_leader/0` answers) |
+| `group_leader` | the process's own group leader (`Runtime::group_leader_of`, default the root pid; set by `erlang:group_leader/2`, inherited on spawn) |
 | `heap_size` / `total_heap_size` | this process's real heap capacities, in words |
 | `stack_size` | the Erlang stack's word count |
 | `reductions` | this process's real reduction counter |
@@ -153,8 +154,10 @@ for an unregistered `registered_name`), so the list is a genuine, shorter-by-con
 - **`status`**: the calling process is `running` (this runtime is single-threaded, so exactly one
   process executes at a time — the oracle's answer for the caller); every other process carries its
   own `ProcessState` (a process parked in `receive` is `waiting`, matching the oracle).
-- **`group_leader`** is this runtime's root pid (the real, live pid `erlang:group_leader/0` answers),
-  not the oracle's `<0.70.0>` io process.
+- **`group_leader`** is the process's own group leader (`Runtime::group_leader_of(pid)`), defaulting to
+  this runtime's root pid and settable by `erlang:group_leader/2` (and inherited on spawn) — one source
+  of truth shared by `erlang:group_leader/0`, the `/2` BIFs and this item. It is this runtime's real
+  pid, not the oracle's `<0.70.0>` io process.
 - **`reductions`** is this process's real counter (the absolute value differs — the code differs).
 - **`error_handler`/`trace`/`suspending`/`last_calls`/`message_queue_data`** are unchanging M1
   defaults (the facts they report are true of this runtime).
@@ -328,7 +331,7 @@ needs:
 - **ETS internals:** `ets_info_binary/1`, `ets_lookup_binary_info/2`, `ets_raw_first/1`,
   `ets_raw_next/2`, `ets_super_user/1`. Needs the raw ETS binary-block traversal (`misc` / `db`
   internals) and ETS protection-level / super-user bookkeeping.
-- **Process & scheduler control/introspection:** `garbage_collect/1`, `group_leader/2,3`,
+- **Process & scheduler control/introspection:** `garbage_collect/1`,
   `process_display/2`, `process_flag/3`, `suspend_process/2`, `is_process_alive/2`,
   `await_result/1`, `flush_monitor_messages/3`, `'@flush_monitor_messages_refopt'/0`. Needs
   GC-on-demand, suspend/resume signalling, and the `{Ref, Result}` await protocol. (`process_display/2`
