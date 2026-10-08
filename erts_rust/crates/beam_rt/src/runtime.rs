@@ -1379,6 +1379,29 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_return_value_becomes_the_documented_system_limit() {
+        // A runtime whose term-construction heaps are at the floor, so a value larger than the
+        // heap is cheap to build. `stabilize_term` copies a process's return value onto the
+        // never-reset `eval_heap`; a value too large for it is a copy-engine exhaustion
+        // (`AllocKind::Message`), which the runtime must report as the emulator's documented
+        // `error:system_limit` — never the raw internal `allocation failure: message (N bytes)`
+        // (see `error::enforce_term_heap_limit`).
+        let mut rt = Runtime::new(RuntimeConfig::new().with_heap_words(MIN_HEAP_WORDS))
+            .expect("the small-heap runtime");
+        // Four words of list per element budget: far more than the eval heap holds.
+        let elems: Vec<Eterm> = (0..(MIN_HEAP_WORDS as i64 * 4)).map(make_small).collect();
+        let big = terms::make_list(&mut rt.arena, &elems).expect("the engine arena is unbounded");
+        assert!(
+            beam_term::size_object(big) > MIN_HEAP_WORDS,
+            "the value must exceed the eval heap to exercise the translation"
+        );
+        assert!(
+            matches!(rt.stabilize_term(big), Err(BeamError::SystemLimit)),
+            "an oversized return value is the documented system_limit, not a raw Alloc"
+        );
+    }
+
+    #[test]
     fn a_runtime_without_a_node_is_not_alive_and_names_nonode() {
         let rt = runtime();
         // No `-name`/`-sname`: no node, so not alive.

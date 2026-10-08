@@ -35,25 +35,44 @@ use beam_term::{atom_val, is_atom, AtomTable, Eterm};
 
 /// Turns a **term-heap exhaustion** into the emulator's documented hard limit.
 ///
-/// `beam_alloc`'s contract is that [`BeamError::Alloc`] with [`AllocKind::Heap`] means
-/// *collect and retry*, **not** a fatal host-level OOM (see the `beam_alloc` crate
-/// `CONTEXT.md`, Design Decisions). Milestone 1 has no collector, so the retry cannot
-/// happen: the honest answer is the emulator's own `error:system_limit` raise — the reason
-/// the C raises when a process exceeds its configured `max_heap_size` (`+hmax`) — which
-/// [`crate::cli`] reports as `beam_rt: system_limit` with
-/// [`EXIT_RUNTIME`](crate::cli::EXIT_RUNTIME).
+/// Two exhaustion classes reach this translation, and both mean *the destination heap could
+/// not hold the term* — a soft, recoverable signal the caller should collect-and-retry, **not**
+/// a fatal host-level OOM:
+///
+/// * [`AllocKind::Heap`] — `beam_alloc`'s per-process heap bump allocator (`beam_alloc` crate
+///   `CONTEXT.md`, Design Decisions);
+/// * [`AllocKind::Message`] — the copy engine's destination-heap exhaustion
+///   ([`beam_message::is_message_heap_exhaustion`]), raised by `copy_struct` and its siblings
+///   when the receiver's message heap cannot hold the copied term.
+///
+/// Milestone 1 has no collector, so the retry cannot happen: the honest answer is the
+/// emulator's own `error:system_limit` raise — the reason the C raises when a process exceeds
+/// its configured `max_heap_size` (`+hmax`) — which [`crate::cli`] reports as
+/// `beam_rt: system_limit` with [`EXIT_RUNTIME`](crate::cli::EXIT_RUNTIME).
 ///
 /// Reporting the raw [`BeamError::Alloc`] instead would print the host-level
-/// `allocation failure: heap (N bytes)` diagnostic, which describes the *internal
-/// allocator* state of this implementation, not a BEAM error a program (or the differential
-/// harness) can reason about.
+/// `allocation failure: heap (N bytes)` / `allocation failure: message (N bytes)` diagnostic,
+/// which describes the *internal* allocator state of this implementation, not a BEAM error a
+/// program (or the differential harness) can reason about.
 ///
 /// Every other error is returned unchanged, so this is a pure translation — nothing is
 /// swallowed.
+///
+/// # Ordering at the message-delivery seam
+///
+/// The *oversized-message* fallback keys on the **raw** [`AllocKind::Message`] error to decide
+/// to retry through the heap-fragment model
+/// ([`RuntimeContext::deliver_message`](crate::context::RuntimeContext)), so this translation
+/// must be applied only **after** that retry has run — never to the first `deliver_simple`
+/// result. Translating earlier would turn the retry trigger into a fatal `system_limit` and
+/// break every oversized delivery.
 pub(crate) fn enforce_term_heap_limit(error: BeamError) -> BeamError {
-    match error {
-        BeamError::Alloc(failure) if failure.kind == AllocKind::Heap => BeamError::SystemLimit,
-        other => other,
+    let exhausted = matches!(&error, BeamError::Alloc(failure) if failure.kind == AllocKind::Heap)
+        || beam_message::is_message_heap_exhaustion(&error);
+    if exhausted {
+        BeamError::SystemLimit
+    } else {
+        error
     }
 }
 /// The prefix every capability-gap reason atom starts with (see the module docs).
@@ -529,6 +548,47 @@ mod tests {
             "unsupported_bif",
         ))));
         assert_eq!(unsupported_reason(&bif).as_deref(), Some("bif"));
+    }
+
+    #[test]
+    fn a_term_heap_exhaustion_becomes_the_documented_system_limit() {
+        use beam_common::AllocFailure;
+        // Both exhaustion classes mean *collect and retry*, which Milestone 1 cannot do: the
+        // per-process heap bump allocator (`AllocKind::Heap`) and the copy engine's
+        // destination-heap exhaustion (`AllocKind::Message` — the message heap). The honest
+        // answer is the emulator's `error:system_limit`, never the internal
+        // `allocation failure: heap|message (N bytes)` text.
+        for kind in [AllocKind::Heap, AllocKind::Message] {
+            let exhausted = BeamError::Alloc(AllocFailure::new(kind, 800));
+            assert!(
+                matches!(enforce_term_heap_limit(exhausted), BeamError::SystemLimit),
+                "AllocKind::{kind:?} exhaustion must translate to system_limit"
+            );
+        }
+    }
+
+    #[test]
+    fn the_translation_passes_every_other_error_through_unchanged() {
+        use beam_common::AllocFailure;
+        // The translation must swallow nothing and must not over-generalize: a **different**
+        // allocation class (a carrier/large-object/other host OOM is not the emulator's
+        // documented `system_limit`) and a non-allocation error both survive verbatim.
+        for error in [
+            BeamError::Alloc(AllocFailure::new(AllocKind::Carrier, 800)),
+            BeamError::Alloc(AllocFailure::new(AllocKind::LargeObject, 800)),
+            BeamError::Alloc(AllocFailure::new(AllocKind::Other, 800)),
+            BeamError::TermNotFound,
+            BeamError::BadArg,
+            undef(),
+        ] {
+            let rendered = error.to_string();
+            let translated = enforce_term_heap_limit(error);
+            assert!(
+                !matches!(translated, BeamError::SystemLimit),
+                "only a Heap/Message exhaustion is translated"
+            );
+            assert_eq!(translated.to_string(), rendered, "the error is unchanged");
+        }
     }
 
     #[test]
