@@ -42,16 +42,29 @@ pub struct CatchFrame {
     /// handler; a raise unwinds the call-frame stack back to it (and drops its Y
     /// slots' descendants) before landing the exception.
     pub frame_index: usize,
+    /// The **module context** the handler's `(func, pc)` belong to (`0` = the run's
+    /// entry module, otherwise a [`ModuleContext`](super::ModuleContext) id).
+    ///
+    /// Stamped by [`Machine::push_catch_frame`] from the context executing when the
+    /// handler was pushed, so a raise that unwinds *across* a cross-module
+    /// `call_ext` lands back in the handler's own module: the landing address is a
+    /// function index into that context's module, and resolving it against the
+    /// raising module would be a wrong result.
+    pub(crate) context: u32,
 }
 
 impl CatchFrame {
     /// A catch frame whose handler is at `pc` in the function at index `func`,
     /// living in the call frame at `frame_index`.
+    ///
+    /// The module context is **not** a parameter: [`Machine::push_catch_frame`]
+    /// stamps it from the context executing when the frame is pushed.
     pub fn new(func: u32, pc: u32, frame_index: usize) -> CatchFrame {
         CatchFrame {
             func,
             pc,
             frame_index,
+            context: 0,
         }
     }
 }
@@ -92,7 +105,13 @@ impl Machine {
     }
 
     /// Push a catch frame (the `try`/`catch` handler target).
-    pub fn push_catch_frame(&mut self, frame: CatchFrame) {
+    ///
+    /// The frame's module context is stamped from the context executing right now
+    /// ([`Machine::current_context`]), so the handler's `(func, pc)` are always
+    /// resolved against the module that pushed them — even when the raise that
+    /// lands there unwinds across a cross-module `call_ext`.
+    pub fn push_catch_frame(&mut self, mut frame: CatchFrame) {
+        frame.context = self.context;
         self.catch_frames.push(frame);
     }
 
@@ -226,10 +245,23 @@ impl Machine {
         let class_atom = self.class_atom(class)?;
         self.unwind_to_frame(frame.frame_index)?;
         self.land_exception(class_atom, reason, trace)?;
-        Ok(Step::Goto {
-            func: frame.func,
-            pc: frame.pc,
-        })
+        // The handler's `(func, pc)` are indices into the *landing context's*
+        // module, which is not necessarily the module the raise happened in (a raise
+        // can unwind across a cross-module `call_ext`). Report the context change so
+        // the driver re-binds the module before executing the handler; an
+        // intra-module landing stays the plain `Goto` it always was.
+        if frame.context == self.context {
+            Ok(Step::Goto {
+                func: frame.func,
+                pc: frame.pc,
+            })
+        } else {
+            Ok(Step::Enter {
+                context: frame.context,
+                func: frame.func,
+                pc: frame.pc,
+            })
+        }
     }
 
     /// Land a *caught* exception in the handler registers.

@@ -172,6 +172,14 @@ impl Machine {
         // Likewise the literal area: it belongs to the module being run and is
         // re-bound by `run_loop`.
         self.literals = None;
+        self.entry_literals = None;
+        // The cross-module call seam's state belongs to the run that is starting: a
+        // fresh run begins in its own entry module (context 0) and has entered no
+        // callee yet. `resume_outcome` deliberately does **not** reset, so a
+        // suspended cross-module frame keeps both its context id and the callee
+        // module handle it must be resumed in.
+        self.contexts.clear();
+        self.context = 0;
         // The execution-position introspection belongs to the run that is starting:
         // `step_instruction` re-records `current_code` and `run_loop` re-records
         // `entry_call` (the `$initial_call` analogue).
