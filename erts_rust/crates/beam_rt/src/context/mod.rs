@@ -299,9 +299,19 @@ impl<'a> RuntimeContext<'a> {
     /// survives for the scheduler pass; the outcome itself needs no action here. A payload the
     /// recipient's heap cannot hold is retried through the heap-fragment model
     /// ([`Self::send_fragmented_message`]) exactly as
-    /// [`send_message`](ExecutionContext::send_message) documents; every other failure —
-    /// including the table's typed not-found for a pid no process exists for — is propagated
-    /// untouched.
+    /// [`send_message`](ExecutionContext::send_message) documents; every other failure — the
+    /// table's typed not-found for a pid no process exists for, and a genuine exhaustion — is
+    /// propagated, the latter translated to the emulator's documented
+    /// `error:system_limit` ([`error::enforce_term_heap_limit`]).
+    ///
+    /// # Ordering (the oversized-message retry)
+    ///
+    /// The retry is triggered by the **raw** [`AllocKind::Message`] failure
+    /// `deliver_simple` returns: it means *the payload did not fit the receiver's heap* and
+    /// is *not* fatal. The translation to `error:system_limit` is therefore applied only to
+    /// what remains **after** the retry has run (the retry's own failure, and the
+    /// non-`Message` arm) — translating the first result would turn the retry trigger into a
+    /// hard error and break every oversized delivery.
     pub(crate) fn deliver_message(
         &mut self,
         to: ProcessId,
@@ -309,11 +319,10 @@ impl<'a> RuntimeContext<'a> {
         message: Eterm,
     ) -> Result<()> {
         match self.process_table_mut().deliver_simple(to, from, message) {
-            Ok(_outcome) => Ok(()),
-            Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
-                self.send_fragmented_message(to, from, message)
-            }
-            Err(error) => Err(error),
+            Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => self
+                .send_fragmented_message(to, from, message)
+                .map_err(error::enforce_term_heap_limit),
+            other => other.map(|_| ()).map_err(error::enforce_term_heap_limit),
         }
     }
     /// The running process's mailbox **message queue** and **scan state**, borrowed
@@ -352,6 +361,15 @@ impl<'a> RuntimeContext<'a> {
     /// public [`beam_message`] fragment primitives the function itself composes (the
     /// message is already known not to fit, so its preflight attempt is redundant anyway);
     /// see the crate `CONTEXT.md` handoff for the seam that would let it be deleted.
+    ///
+    /// # Errors
+    ///
+    /// The failures are **raw**: `HeapFragment::new`'s host-allocation failure and
+    /// `copy_root`'s copy-engine exhaustion ([`AllocKind::Message`]). The single caller
+    /// ([`Self::deliver_message`]) translates a genuine exhaustion to `error:system_limit`
+    /// with [`error::enforce_term_heap_limit`]; that translation lives at the call site
+    /// because the `Message` kind must stay recognizable as the retry trigger on the
+    /// first `deliver_simple` attempt.
     fn send_fragmented_message(&mut self, to: ProcessId, from: Eterm, message: Eterm) -> Result<()> {
         // A fragment sized to hold the whole payload (the C sizes `new_message_buffer` the
         // same way). `size_object` is > 0 for any payload that failed the preflight.
@@ -1396,8 +1414,11 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// [`Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) for a message larger
     /// than it, exactly as the C `erts_try_alloc_message_on_heap` does. That case is
     /// retried through the **heap-fragment** model ([`Self::send_fragmented_message`]),
-    /// which is how the real system delivers a large message at all. Any other failure is
-    /// propagated untouched, and the ordinary (small-payload) path is unchanged.
+    /// which is how the real system delivers a large message at all. A **genuine**
+    /// exhaustion — the copy that still does not fit after the retry, or a non-message-heap
+    /// allocation failure — becomes the emulator's documented `error:system_limit`
+    /// ([`error::enforce_term_heap_limit`]), not the internal `allocation failure: …` text;
+    /// the ordinary (small-payload) path is unchanged.
     ///
     /// A completed send also produces **events** (contract A.8, item 1): the ordinary
     /// `{trace, Sender, send, Msg, To}` — when the *sending* process is `[send]`-traced — and
