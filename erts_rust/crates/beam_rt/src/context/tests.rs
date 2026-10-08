@@ -598,6 +598,64 @@ fn the_send_predicate_selects_only_the_message_sending_bifs() {
 }
 
 #[test]
+fn the_memory_hook_gate_selects_only_the_two_memory_bifs() {
+    // `RuntimeMemory::new` folds every loaded module's `.beam` size (one `stat` syscall
+    // each), so it must be built **only** for the two BIFs that read the `MemoryHook`
+    // seam. A too-narrow gate would turn `erlang:memory/0,1` into the typed
+    // `unsupported_bif` gap; a too-wide one would put the ~10 us scan back on the
+    // arithmetic hot path.
+    assert!(RuntimeContext::uses_memory_hook("erlang", "memory", 0));
+    assert!(RuntimeContext::uses_memory_hook("erlang", "memory", 1));
+    for (module, function, arity) in [
+        ("erlang", "memory", 2),
+        ("erlang", "memory", 3),
+        ("erlang", "processes", 0),
+        ("erts_internal", "memory", 0),
+        ("erlang", "-", 2),
+        ("erlang", "+", 2),
+        ("lists", "memory", 1),
+    ] {
+        assert!(
+            !RuntimeContext::uses_memory_hook(module, function, arity),
+            "{module}:{function}/{arity}"
+        );
+    }
+}
+
+#[test]
+fn the_fun_identity_gate_selects_only_the_external_image_bifs() {
+    // The `LocalFunIdentity` seam is read by exactly one `beam_bifs` code path
+    // (`binconv::encode_body`'s first statement), which `term_to_binary/1,2` reaches
+    // directly and `external_size/1,2` reaches through `plain_image_of`. Every other
+    // registered BIF must skip the `Arc` clone + `PathBuf` allocation the bridge does.
+    for (function, arity) in [
+        ("term_to_binary", 1),
+        ("term_to_binary", 2),
+        ("external_size", 1),
+        ("external_size", 2),
+    ] {
+        assert!(
+            RuntimeContext::uses_fun_identity("erlang", function, arity),
+            "erlang:{function}/{arity}"
+        );
+    }
+    for (module, function, arity) in [
+        ("erlang", "term_to_binary", 0),
+        ("erlang", "term_to_binary", 3),
+        ("erlang", "external_size", 0),
+        ("erlang", "external_size", 3),
+        ("erlang", "binary_to_term", 1),
+        ("erlang", "-", 2),
+        ("lists", "term_to_binary", 1),
+    ] {
+        assert!(
+            !RuntimeContext::uses_fun_identity(module, function, arity),
+            "{module}:{function}/{arity}"
+        );
+    }
+}
+
+#[test]
 fn the_local_node_identity_is_nonode_at_nohost_with_creation_zero() {
     // The runtime's boot seed interns the node-name atom, so the identity resolves and
     // `term_to_binary/1` of an internal pid can emit `NEW_PID_EXT` (88).
