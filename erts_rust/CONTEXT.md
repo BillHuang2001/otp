@@ -92,22 +92,38 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - Benchmark/test targets are the configured foreign repos: Cowboy, Khepri, EMQX, Elixir,
   Programming-Language-Benchmarks. Investigate them read-only; write through the task's tracked worktrees.
 
-## Status (Milestone 1)
+## Status
 - **Crate tree complete:** all 15 crates + 2 tools are architected (each with its own `CONTEXT.md`),
-  implemented, and tested. `scripts/cargo.sh test --workspace` → **1441 tests, 0 failures**, warning-free.
+  implemented, and tested.
+- **Build/test:** `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets`
+  is warning-free (one pre-existing `unused import: Mailbox` warning in `beam_rt`'s `tests/trace.rs` is
+  being fixed separately). `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
+  --no-fail-fast` reports **5762 passed / 3 failed / 1 ignored**; the 3 failures are all in `beam_rt`
+  and stem from `beam_bifs` registering the FULL declared `bif.tab` surface (556 keys; registry 637),
+  which shadows `beam_rt`'s curated `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list — a `beam_rt` fix is in
+  flight and 0 failures are expected once it lands.
 - **Vertical slice WORKS:** `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam` (produced by
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
   outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate:** `tools/differential` reports real oracle-vs-Rust **AGREEMENT** on the
-  supported module-run subset and honest `unsupported` for the rest (0 mismatches). 9-contract corpus
-  is smoke-level today.
-- **Benchmarks (system-ERTS baseline + targets, real numbers):** baseline startup p50 ≈ 116 ms /
-  p99 ≈ 154 ms · Cowboy hello-world **117,813 req/s** (p50 0.064 ms, p99 0.133 ms) · Elixir compiler
-  3.41 files/s · `erlc` 9.89 files/s. `plb`/`khepri`/`emqx` skip honestly (`dotnet`/`rebar3` absent).
-- **Honest M1 coverage gaps** (per-crate `Known Issues`): full XML/crypto-heavy ETF tags, tuples/`
-  lists`/funs/floats/literals/try-catch opcodes, full match-spec compiler, ETS concurrency/access,
-  Cranelift tier (feature-gated off). All return typed errors, never wrong results.
+- **Compatibility gate (`tools/differential`):** `summary: total=667 agree=666 mismatch=0 unsupported=1
+  skipped=0` — per contract A.1 154/154 · A.2 176/176 · A.3 34/34 · A.4 64/64 · A.5 63/64 (+1
+  unsupported) · A.6 37/37 · A.7 246/246 · A.8 49/49 · A.9 52/52. **No case disagrees.** The single
+  `unsupported` is `wire/new_fun_ext_encode` (A.5): an `erl_eval` lambda's closure identity cannot be
+  reproduced without porting `erl_eval`/`erl_scan`/`erl_parse`, so it is **unclosable by design**.
+- **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 637
+  keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through two
+  defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`). Registered-but-unadopted BIFs return a
+  typed `unsupported` until a host hook is installed.
+- **Benchmarks:** current numbers and their measurement caveats live in `tools/bench/RESULTS.md` (its
+  Milestone-1 archive is explicitly marked there). The known hot-path defect is `beam_rt`'s
+  `RuntimeContext::call_registered` deep-cloning the shared `AtomTable` on **every** registered BIF
+  call — ~99% of the marginal per-iteration cost of `beam_rt run …`, and the reason per-call costs on
+  real Cowboy/EMQX functions measure 700×–9 000× the oracle. Root cause verified; fix in flight.
+- **Honest coverage gaps** (per-crate `Known Issues`): the engine tiers and the Cranelift hot tier
+  (`jit-cranelift`, default-OFF) are not yet on `beam_rt`'s execution path; full match-spec compiler;
+  ETS concurrency; `put_record/6`'s create form; several structured-raise-reason degradations; depth of
+  live distribution interop. All return typed errors, never wrong results.
 
 ## Not yet started (future workstreams)
 - **Stage 2 (compiler):** loop opts → operation fusion → FBIP on the existing BEAM-SSA IR
