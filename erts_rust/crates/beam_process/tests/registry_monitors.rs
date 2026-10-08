@@ -837,3 +837,97 @@ fn oracle_process_info_registered_name() {
     f.table.register(name, pid).expect("the name is free");
     assert_eq!(f.table.name_of(pid), Some(name), "`{{registered_name, rn1}}`");
 }
+
+/// The `{'DOWN', Ref, process, Pid, Reason}` a watcher receives carries the **exact** reason the
+/// target died with: `normal` for a normal termination, the full *structured* reason for an
+/// abnormal termination, and `killed` (the rewritten form of `kill`) for `exit(Pid, kill)`.
+///
+/// The oracle prints `normal|{bad,1}|killed` for the three receivers (each target is alive when
+/// it is monitored — it waits for a `go` message — so none of them races a `noproc` DOWN).
+#[test]
+fn oracle_down_reason_fidelity() {
+    let expr = r#"
+        P1 = spawn(fun() -> receive go -> ok end end),
+        M1 = erlang:monitor(process, P1),
+        P1 ! go,
+        R1 = receive {_, M1, _, _, A} -> A after 2000 -> t1 end,
+        P2 = spawn(fun() -> receive go -> exit({bad, 1}) end end),
+        M2 = erlang:monitor(process, P2),
+        P2 ! go,
+        R2 = receive {_, M2, _, _, B} -> B after 2000 -> t2 end,
+        P3 = spawn(fun() -> receive never -> ok end end),
+        M3 = erlang:monitor(process, P3),
+        exit(P3, kill),
+        R3 = receive {_, M3, _, _, C} -> C after 2000 -> t3 end,
+        io:format("~p|~p|~p~n", [R1, R2, R3])
+    "#;
+    if !expect_oracle(expr, "normal|{bad,1}|killed") {
+        return;
+    }
+
+    let mut f = Fixture::new();
+    let down = f.atom("DOWN");
+    let process = f.atom("process");
+    let watcher = f.table.spawn_default().expect("watcher");
+
+    // 1. A normal termination: the reason is the `normal` atom.
+    let normal = f.atom_term("normal");
+    let target1 = f.table.spawn_default().expect("target1");
+    f.table
+        .monitor(watcher, target1, MonitorKind::Process)
+        .expect("both pids are live");
+    f.table.terminate(target1, normal).expect("target1 is live");
+    assert!(!f.table.contains(target1));
+    let payload = f.sole_payload(watcher);
+    assert_pid_down(payload, down, process, target1.to_eterm(), normal);
+    f.drain_one(watcher);
+
+    // 2. An abnormal termination with a *structured* reason built in the dying process's own heap.
+    let bad = f.atom_term("bad");
+    let holder = f.table.spawn_default().expect("holder");
+    let target2 = f.table.spawn_default().expect("target2");
+    let reason = f.tuple_in(target2, &[bad, make_small(1)]);
+    let expected = f.tuple_in(holder, &[bad, make_small(1)]);
+    f.table
+        .monitor(watcher, target2, MonitorKind::Process)
+        .expect("both pids are live");
+    f.table.terminate(target2, reason).expect("target2 is live");
+    let payload = f.sole_payload(watcher);
+    // SAFETY: the payload is the live 5-tuple the table built on the watcher's heap.
+    let delivered = unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(tuple_element(payload, 0), make_atom(down));
+        assert_eq!(tuple_element(payload, 2), make_atom(process));
+        assert_eq!(tuple_element(payload, 3), target2.to_eterm());
+        tuple_element(payload, 4)
+    };
+    assert!(
+        !is_immediate(delivered),
+        "the structured reason was copied, not shared"
+    );
+    assert!(compare::eq(delivered, expected, &f.names));
+    f.drain_one(watcher);
+
+    // 3. `exit(Pid, kill)`: the reason is rewritten to `killed`, never the sent `kill`.
+    let kill = f.atom_term("kill");
+    let killed = f.atom_term("killed");
+    let killer = f.table.spawn_default().expect("killer");
+    let target3 = f.table.spawn_default().expect("target3");
+    f.table
+        .monitor(watcher, target3, MonitorKind::Process)
+        .expect("both pids are live");
+    f.table
+        .send_exit(killer, target3, kill)
+        .expect("target3 is live");
+    assert!(!f.table.contains(target3), "`kill` terminates the target");
+    let payload = f.sole_payload(watcher);
+    assert_pid_down(payload, down, process, target3.to_eterm(), killed);
+    // SAFETY: the live DOWN tuple on the watcher's heap.
+    unsafe {
+        assert_ne!(
+            tuple_element(payload, 4),
+            kill,
+            "the reason is the rewritten `killed`, not the sent `kill`"
+        );
+    }
+}
