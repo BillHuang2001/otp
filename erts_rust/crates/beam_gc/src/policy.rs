@@ -81,9 +81,18 @@ fn build_heap_sizes() -> Vec<usize> {
 /// The process heap-size policy (the `erts_next_heap_size` analogue).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeapPolicy {
-    /// Smallest heap the policy will ever size to, in term words.
+    /// Smallest heap the policy will ever size to, in term words. `0` sets **no floor**.
+    ///
+    /// This is the growth knob's lower bound: whenever the policy computes a target size
+    /// (a nursery resize or a fullsweep mature size), [`next_words`](HeapPolicy::next_words)
+    /// raises it to at least this value, so growth can never shrink a space below it.
     pub min_heap_words: usize,
-    /// Largest heap the policy will ever size to, in term words (0 = unbounded).
+    /// Largest heap the policy will ever size to, in term words. **`0` means unbounded
+    /// growth** — the crate's "no upper bound" encoding: a collection (or
+    /// [`Collector::ensure_capacity`](crate::Collector::ensure_capacity)) may grow the
+    /// nursery and the mature generation to whatever the live set requires, up to the
+    /// growth table's ceiling. Any nonzero value clamps every size the policy computes, and
+    /// is what makes an otherwise-fit collection report the typed heap exhaustion instead.
     pub max_heap_words: usize,
     /// Number of minor collections before a fullsweep is forced (0 = a fullsweep on
     /// every collection). The C `max_gen_gcs` (`erl_process.h:1145`), whose default is
@@ -127,6 +136,23 @@ impl HeapPolicy {
         HeapPolicy {
             min_heap_words: min_words,
             max_heap_words: max_words,
+            ..HeapPolicy::default()
+        }
+    }
+
+    /// A policy that permits **unbounded growth** — the growth knob made explicit.
+    ///
+    /// [`max_heap_words`](Self::max_heap_words) is set to `0`, the crate's "no upper bound"
+    /// encoding, so a collection or an on-demand grow
+    /// ([`Collector::ensure_capacity`](crate::Collector::ensure_capacity)) may size the
+    /// nursery and the mature generation as large as the live set requires (up to the
+    /// growth table's ceiling). [`min_heap_words`](Self::min_heap_words) still floors every
+    /// size. This is exactly [`HeapPolicy::default`]'s growth behaviour; the constructor
+    /// exists so a caller that *wants* unbounded growth can state it rather than rely on the
+    /// default.
+    pub fn unbounded() -> HeapPolicy {
+        HeapPolicy {
+            max_heap_words: 0,
             ..HeapPolicy::default()
         }
     }
