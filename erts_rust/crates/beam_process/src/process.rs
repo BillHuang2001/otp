@@ -565,6 +565,27 @@ impl Process {
         (collector.young_mut().heap_mut(), off_heap)
     }
 
+    /// The process's young (mutator) heap **and** its mailbox, as two disjoint mutable borrows.
+    ///
+    /// [`Process::heap_mut`] and [`Process::mailbox_mut`] each take a whole `&mut self`, so a
+    /// single caller cannot hold the two at once. This accessor exists precisely so such a caller
+    /// can drive an operation that needs *both* simultaneously in one borrow — the motivating one
+    /// is [`beam_message::send_fragmented`], which copies a payload onto the destination heap and
+    /// enqueues the resulting message on the destination queue
+    /// (`send_fragmented(from, term, to_heap, to_queue, ctx, fragment_capacity_words)`), so a host
+    /// can drive the oversized-message fragment path straight into a process's own heap and mailbox
+    /// without destructuring `Process` or reimplementing the enqueue.
+    ///
+    /// `self` is destructured internally, so the compiler proves the two references are disjoint
+    /// borrows of distinct fields of `Collector`/`Process`. Safe Rust only — no raw pointers and
+    /// no `unsafe`.
+    pub fn heap_and_mailbox_mut(&mut self) -> (&mut Heap, &mut Queue) {
+        let Process {
+            collector, mailbox, ..
+        } = self;
+        (collector.young_mut().heap_mut(), mailbox)
+    }
+
     /// The outgoing links.
     pub fn links(&self) -> &Links {
         &self.links

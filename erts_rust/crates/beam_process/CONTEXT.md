@@ -89,12 +89,15 @@ liveness maps.
     `dict(_mut)`, `saved_args(_mut)`, `signals(_mut)`/`pending_signals()`, `off_heap(_mut)`,
     `links(_mut)`, `monitors(_mut)`, `monitored_by(_mut)`, `port_monitors(_mut)`,
     `exit_reason`/`set_exit_reason`.
-  - `heap_and_off_heap_mut(&mut self) -> (&mut Heap, &mut OffHeapTable)` — the **split borrow** accessor
-    handing out the young heap and the off-heap table together (destructures `self`; safe Rust, no raw
-    pointer), so a caller can drive `beam_message::Fragments::move_into(dst, dst_off_heap)` in one
-    borrow — the only way to move a **fragmented** message payload onto the process's heap. The other
-    `*_mut` pairs were audited: the sole other pair with a real caller need is `(heap, mailbox)` (for
-    `beam_message::send_fragmented`), which is **not** split (see the note in Notes for Agents).
+  - **split borrows** (each destructures `self`; safe Rust, no raw pointer, so the compiler proves the
+    two `&mut` are disjoint fields of `Collector`/`Process`): `heap_and_off_heap_mut(&mut self) -> (&mut
+    Heap, &mut OffHeapTable)` hands out the young heap and the off-heap table together, so a caller can
+    drive `beam_message::Fragments::move_into(dst_heap, dst_off_heap)` in one borrow — the only way to
+    move a **fragmented** message payload onto the process's heap; `heap_and_mailbox_mut(&mut self) ->
+    (&mut Heap, &mut Queue)` hands out the young heap and the mailbox together, so a caller can drive
+    `beam_message::send_fragmented(from, term, to_heap, to_queue, ctx, n)` without reimplementing the
+    fragment path. These are the only two `*_mut` pairs with a real caller need (the rest were audited);
+    do not add a combined raw-pointer accessor for any pair.
   - **message delivery:** `deliver(from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) ->
     Result<DeliverOutcome>` — copies `term` into the young heap (collect-and-retry once on
     `AllocKind::Heap`/`Message` exhaustion), enqueues the `Message`, then `wake()`s;
@@ -309,7 +312,10 @@ holds `Process` values directly. (`PortTable` lives in `port.rs`.)
     Vec<ProcessId>`, `woken() -> &[ProcessId]`.
   - **signals / links / monitors (local pids):** `apply_exit_signal(target, ExitSignal) ->
     Result<ExitEffect>`, `link(a, b)`, `unlink(a, b)`, `send_exit(from, to, reason)` (the `exit/2` op),
-    `terminate(pid, reason)`.
+    `terminate(pid, reason)`; the additive `terminate_with_ports(&mut PortTable, pid, reason)` sibling
+    threads the port table so a dying process's outgoing `port_monitors` also remove their matching
+    **incoming** `PortMonitor` entries (`terminate` is its no-ports delegation — see `port.rs`/Design
+    Decisions).
   - **monitors:** `monitor(watcher, target: ProcessId, kind) -> Result<MonitorRef>` — a **non-live**
     target with a live watcher yields `Ok(ref)` plus an immediate
     `{'DOWN', Ref, process, Target, noproc}` in the watcher's mailbox (the oracle's `noproc`);
@@ -335,17 +341,29 @@ holds `Process` values directly. (`PortTable` lives in `port.rs`.)
     on a **remote** external-pid target — `DOP_MONITOR_P` carries no tag) is a typed `unsupported`.
   - **decoupled signal servicing:** `service_signals(pid) -> Result<()>` — drains + applies the pid's
     pending-signal queue in FIFO order, cascading to any process those signals affect (the scheduler
-    calls it at schedule-in); `pending_signals(pid)`, `signals(pid) -> Result<&SignalQueue>`.
+    calls it at schedule-in); the additive `service_signals_with_ports(&mut PortTable, pid)` sibling
+    threads the port table so a schedule-in cascade that terminates a process also cleans its incoming
+    port monitors (the plain form delegates with no ports); `pending_signals(pid)`,
+    `signals(pid) -> Result<&SignalQueue>`.
   - **arbitrary pid terms:** `link_term`/`unlink_term(a, b: Eterm)`, `monitor_term(watcher, target:
     Eterm, kind) -> Result<MonitorRef>`, `send_exit_term(from, to: Eterm, reason)` — a local pid routes
     to the local op, an external pid is recorded + routed (see `remote.rs`); `remote_links(pid)`/
     `remote_monitors(pid)`.
   - **distribution seam:** `set_dist_router(Box<dyn DistSignalRouter>)`, `take_dist_router()`,
     `has_dist_router() -> bool`.
+  - **process-death observer seam:** `set_process_exit_observer(Box<dyn ProcessExitObserver>)`,
+    `take_process_exit_observer() -> Option<Box<dyn ProcessExitObserver>>`,
+    `has_process_exit_observer() -> bool` (mirrors the distribution seam) — the hook a host installs to
+    release per-process resources this crate does not own (ETS tables owned by the dying pid are the
+    motivating case). See `exit_observer.rs`.
   - **whole-node down / port close:** `node_down(node: Eterm, reason)` — resolves + purges every remote
     relationship with `node` (a `{'DOWN', …}` per monitor, a trapped/fatal `{'EXIT', …}` per link);
     `port_closed(&mut PortTable, port, reason)` — drains the port's owner/links/monitors and delivers
-    the `{'DOWN', Ref, port, Port, Reason}` / `{'EXIT', Port, Reason}` shapes.
+    the `{'DOWN', Ref, port, Port, Reason}` / `{'EXIT', Port, Reason}` shapes, and terminates any
+    non-trapping linked peer through `terminate_with_ports` so that peer's own port monitors are cleaned
+    too. This is the **port-died** direction; the reverse (a **watcher process** dies) is handled in
+    `terminate_into` by draining `Process::port_monitors` and calling `PortTable::demonitor` on the
+    matching incoming entries — but only when a port table was threaded in (see `terminate_with_ports`).
   - **name registry:** `register(name, pid) -> Result<()>` (`BadArg` for a taken name **or a non-live
     pid**), `unregister(name) -> Result<()>` (`BadArg` for an unknown name), `whereis(name) ->
     Option<ProcessId>`, `registered()`, `name_of(pid) -> Option<Atom>` (the reverse lookup a
@@ -363,6 +381,28 @@ holds `Process` values directly. (`PortTable` lives in `port.rs`.)
   `ProcessState::Running`. `apply_exit_signal` returns the `exit_policy`-predicted `ExitEffect` for a
   merely-queued signal. A **remote** (external-pid) or **port** signal bypasses the queue entirely (no
   `trap_exit` policy to defer), so `node_down`/`port_closed` materialise it straight into the mailbox.
+### `exit_observer.rs` — the process-death observer seam
+The host hook for per-process resources this crate does not own (the **ETS tables a pid owns** are the
+motivating case). Mirrors the `DistSignalRouter` pattern: a trait object on the table, implemented
+downstream. The table stays free of any dependency on the observing subsystem; with **no** observer
+installed (`None`) behaviour is byte-identical to before the seam existed.
+- `ProcessExitObserver { fn process_exited(&mut self, exit: &ProcessExit<'_>); }` — called **exactly
+  once per death** from `terminate_into`, after the death has been propagated (links/monitors
+  signalled) and **before** `drop(process)` (so `reason`, which may live in the dying heap, is still
+  valid). No `Send` bound (consistent with `router`).
+- `ProcessExit<'a>` — the payload, **private fields + read-only accessors**; built only by the finalizer
+  (`pub(crate) fn new`). Fields: `pid: ProcessId` (the key an observer uses to release its own per-pid
+  state; an immediate ⇒ retainable), `reason: Eterm` (the exit reason exactly as received; may live in
+  the dying heap, so an observer that retains it must copy it), `name: Option<Atom>` (the registered
+  name, captured **before** the registry entry is dropped; an immediate ⇒ retainable; without it the
+  registration would be unobservable), `port_monitors: &'a [PortWatch]` (the drained outgoing port
+  watches; `PortWatch` is plain values ⇒ heap-independent).
+- **Failure policy (documented in the module rustdoc):** an absent observer is a no-op; a **panicking**
+  observer is contained with `std::panic::catch_unwind(AssertUnwindSafe(...))` (the observer gets only
+  an immutable payload and holds no reference to the table, so a panic cannot half-update the table —
+  only the observer's own state), reported via `beam_common::beam_error!`, and termination still
+  completes. Implementations should be cheap (they run on the finalizing scheduler thread) and prefer
+  returning over panicking for expected conditions.
 ### `remote.rs` — remote (external-node) links and monitors
 The **local record** of a process's relationships with processes on other nodes; the wire format is
 `beam_dist`'s, reached through a trait seam (this crate never depends on `beam_dist`).
@@ -444,15 +484,18 @@ re-export keeps `beam_process::PortTable` resolving here.
   (alloc/reuse + relationship round-trips), `progress` (generation bump), `ptab` (alloc/remove/reuse +
   serial bump, name registry, stale-pid rejection, `deliver` wake list, `take` clearing a pending wake,
   the trap/link-`EXIT`/`{'DOWN'}` paths waking a blocked recipient).
-- **`tests/` — the integration evidence pinning the M1 guarantees.** **23 files**, one topic each; the
+- **`tests/` — the integration evidence pinning the M1 guarantees.** **25 files**, one topic each; the
   authoritative per-file list lives in **`tests/CONTEXT.md`**. In short: `scheduler`/`messaging`/
   `signals`/`gc`/`priority`/`pending_signals`/`dict`/`dict_oracle`/`fragments` cover the single-threaded
   scheduler, the mailbox, signals, PCB state and the dictionary (including its `erl`-cross-checked
   structural key/value equality); `ports`/`remote` the port table and distributed links/monitors;
-  `smp`/`lock_scope`/`timers`/`dirty`/`progress` the SMP pool; `registry_monitors`/`monitor_tag` the
+  `process_exit_observer`/`port_monitor_cleanup` the process-death observer seam and the death-side
+  port-monitor cleanup (incl. `erl`-cross-checked oracle probes); `smp`/`lock_scope`/`timers`/`dirty`/
+  `progress` the SMP pool; `registry_monitors`/`monitor_tag` the
   monitor/registration semantics (incl. `noproc`/flush/name targets, the `monitor/3` user tag, and `erl`
-  cross-checks); `preemption` the measured round-robin fairness; `split_borrow` the
-  `heap_and_off_heap_mut` storage identity + `Fragments::move_into`; and
+  cross-checks); `preemption` the measured round-robin fairness; `split_borrow` the two split borrows
+  (`heap_and_off_heap_mut` storage identity + `Fragments::move_into`; `heap_and_mailbox_mut` +
+  `send_fragmented`); and
   `capability_inventory`/`process_info_source`/`spawn_options` the typed-error inventory, the
   `process_info` item→accessor map and the spawn-option composition. `tests/lock_scope.rs` is the
   bounded-quantum-lock evidence (a slice = `ceil(budget/quantum)` runner invocations under one slice; a
@@ -468,8 +511,8 @@ re-export keeps `beam_process::PortTable` resolving here.
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **330 passed / 0 failed / 1 ignored** (160 in-module unit + 169 integration across the
-  23 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
+  Current total: **351 passed / 0 failed / 1 ignored** (160 in-module unit + 190 integration across the
+  25 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
   in `preemption.rs`), warning-free. Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
   never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
@@ -628,6 +671,14 @@ re-export keeps `beam_process::PortTable` resolving here.
 - **Port lifecycle driving** — port scheduling, port signals and the port's read path — remains
   `beam_io`'s; `PortTable` owns only the id plus the ownership/links/monitors, and
   `ProcessTable::port_closed` delivers the closing port's messages.
+- **Port-monitor cleanup on death is complete only when a `PortTable` is threaded in.** `terminate_into`
+  always drains `Process::port_monitors` (and the exit observer always sees them), but the matching
+  *incoming* `PortMonitor` entries are removed from the `PortTable` only when the caller supplies one —
+  i.e. through `terminate_with_ports`/`service_signals_with_ports`/`port_closed`. The port-table-less
+  entry points (`terminate`, `service_signals`, `apply_exit_signal`/`send_exit` (`erlang:exit/2`) and
+  `node_down`) pass no ports; a process killed through one of those has its outgoing watches drained but
+  leaves its incoming `PortMonitor` in place until the owner runs `service_signals_with_ports` at the
+  peer's next schedule-in. A host that owns both tables should terminate through the ports-aware variants.
 - **Exact exit-reason term from `beam_common::ExitReason`**: signal reasons are carried as live `Eterm`
   terms (the deliverable form), not the term-independent `beam_common::ExitReason`; the mapping between
   them belongs to the raising BIF layer (`beam_bifs`).
@@ -652,7 +703,7 @@ re-export keeps `beam_process::PortTable` resolving here.
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
 - `src/registers.rs` → `XRegs`, `Stack`, `Registers` (the root-set containers); `MAX_REG`/`MAX_ARG`
-- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority` and the `port_monitors` watch set; the `heap_and_off_heap_mut` split borrow; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
+- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority` and the `port_monitors` watch set; the `heap_and_off_heap_mut` and `heap_and_mailbox_mut` split borrows; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
 - `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter; keys and `get_keys/1` values compare structurally via `beam_term::compare::eq` through an `Rc<AtomTable>` handle)
 - `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
 - `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing + `reprioritize`)
@@ -666,10 +717,11 @@ re-export keeps `beam_process::PortTable` resolving here.
 - `src/link.rs` → `Links` (bidirectional link set)
 - `src/monitor.rs` → `MonitorRef`, `MonitorKind` (+ `type_name`/`from_type_name`), `PortWatch`, `Monitor`, `MonitoredBy` (field sets frozen — no `tag` field), `Monitors`, `RefAllocator`, `payload_is_down_for`
 - `src/remote.rs` → `RemotePid`, `PidTarget`, `RemoteMonitor`, `DistSignal`, `DistSignalRouter` (the distribution seam)
+- `src/exit_observer.rs` → `ProcessExitObserver` + `ProcessExit` (the process-death observer seam; invoked once per death by `terminate_into`)
 - `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface, the incoming half of a port monitor), `PortMonitor`, `PortClose`
-- `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`, and the `*_with_tag` variants over their `tags` side table) + signal/link hub + decoupled signal servicing + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
+- `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`, and the `*_with_tag` variants over their `tags` side table) + signal/link hub + decoupled signal servicing (`service_signals`, `service_signals_with_ports`) + termination (`terminate`, `terminate_with_ports`, the port-threaded `terminate_into` cascade) + the process-death observer seam + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
 - `src/error.rs` → `pub(crate)` error constructors incl. the typed-`unsupported` raise constructors (no new error type)
-- `tests/*.rs` (23 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the `heap_and_off_heap_mut` storage-identity + `Fragments::move_into` evidence)
+- `tests/*.rs` (25 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence)
 - `tests/CONTEXT.md` → per-file topic list, the anti-flakiness constraint, the gate command
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)
@@ -697,11 +749,11 @@ re-export keeps `beam_process::PortTable` resolving here.
 - Build/test with the manifest path: `erts_rust/scripts/cargo.sh test --manifest-path
   erts_rust/Cargo.toml -p beam_process` (sandbox `$HOME` is read-only — always the wrapper). Never
   `cd`; never touch `../../tools/`.
-- `heap_and_off_heap_mut()` is the ONE split borrow a caller needs for
-  `beam_message::Fragments::move_into` (heap + off-heap table): it destructures `self`, returning two
-  disjoint `&mut` fields in safe Rust (no raw pointer). The `(heap, mailbox)` pair for
-  `beam_message::send_fragmented` still requires the caller to destructure `self` (no split accessor yet
-  — a follow-up if a downstream caller needs it); do not add a combined raw-pointer accessor for either.
+- The crate has **two** split borrows, each destructuring `self` into two disjoint `&mut` fields in safe
+  Rust (no raw pointer): `heap_and_off_heap_mut()` (heap + off-heap table) for
+  `beam_message::Fragments::move_into`, and `heap_and_mailbox_mut()` (heap + mailbox) for
+  `beam_message::send_fragmented`. Do not add a combined raw-pointer accessor for any pair; the other
+  `*_mut` pairs were audited and have no caller need.
 - `beam_alloc::Heap` exhaustion (`AllocKind::Heap`) from the young heap means **collect and retry** (see
   `beam_alloc`/`beam_gc` Design Decisions), not fatal OOM — `Process::deliver` implements that retry.
 - The collector moves live terms, so **every** in-heap reference must be a root. `Process::collect`
@@ -727,7 +779,13 @@ re-export keeps `beam_process::PortTable` resolving here.
   `ProcessTable` side table, never a `Monitor` field — no `Monitor`/`MonitoredBy` shape change); (8) a
   **fragmented** message payload is moved onto the receiver's heap with
   `Process::heap_and_off_heap_mut()` + `beam_message::Fragments::move_into` (heap growth is still needed
-  — `Collector::ensure_capacity` — for a payload larger than the M1 heap).
+  — `Collector::ensure_capacity` — for a payload larger than the M1 heap); (9) release the resources a
+  dead pid owned by installing a `ProcessExitObserver` via `set_process_exit_observer` (the ETS tables a
+  pid owns are the motivating case — key the cleanup on `exit.pid()`; copy `exit.reason()` if retained);
+  (10) once a `PortTable` is kept alongside the `ProcessTable`, terminate through `terminate_with_ports`
+  (and `service_signals_with_ports` at schedule-in) so a dead port-watcher's incoming `PortMonitor` is
+  removed; (11) `beam_message::send_fragmented` through `Process::heap_and_mailbox_mut()` instead of
+  re-composing the fragment primitives.
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, the seam types and the wave-3 dependency position.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1 process semantics, §3 error strategy, §5 GC/memory model, §6 test gate).

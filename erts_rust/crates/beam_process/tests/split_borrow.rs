@@ -1,19 +1,23 @@
-//! Integration evidence for [`Process::heap_and_off_heap_mut`] — the split borrow that lets a
-//! caller hold the young (mutator) heap *and* the off-heap (MSO) table at the same time.
+//! Integration evidence for [`Process::heap_and_off_heap_mut`] and
+//! [`Process::heap_and_mailbox_mut`] — the split borrows that let a caller hold the young
+//! (mutator) heap alongside the off-heap (MSO) table, or alongside the mailbox.
 //!
-//! `Process::heap_mut` and `Process::off_heap_mut` each take a whole `&mut self`, so no caller
-//! can hold both. This suite proves the split accessor hands out the process's **own** storage
-//! (not copies): writing through the two returned references is observed through the `Process`'s
-//! own accessors, the references are pointer-identical to what `heap_mut`/`off_heap_mut` return,
-//! and the motivating consumer — [`beam_message::Fragments::move_into`], which needs both fields
-//! in one borrow — lands the moved payload on the process's real young heap.
+//! `Process::heap_mut`, `Process::off_heap_mut` and `Process::mailbox_mut` each take a whole
+//! `&mut self`, so no caller can hold any two of them. This suite proves the split accessors hand
+//! out the process's **own** storage (not copies): writing through the returned references is
+//! observed through the `Process`'s own accessors, the references are pointer-identical to what
+//! the whole-`self` accessors return, and the motivating consumers — [`beam_message::Fragments::move_into`]
+//! (heap + off-heap table) and [`beam_message::send_fragmented`] (heap + mailbox) — land their
+//! payload on the process's real young heap and real mailbox.
 
 use beam_alloc::Heap;
 use beam_gc::Mso;
-use beam_message::{Fragments, HeapFragment, OffHeapTable};
+use beam_message::{
+    send_fragmented, CopyContext, Fragments, HeapFragment, Message, OffHeapTable, Queue,
+};
 use beam_process::prelude::*;
 use beam_term::compare;
-use beam_term::prelude::{make_small, AtomTable, NIL};
+use beam_term::prelude::{make_small, signed_value, AtomTable, NIL};
 
 /// A pid with the given number and serial 0.
 fn pid(number: u64) -> ProcessId {
@@ -137,5 +141,185 @@ fn fragments_move_into_moves_onto_the_processes_own_heap() {
     assert!(
         compare::eq(payload, moved[0], &AtomTable::new()),
         "the moved term is structurally equal to the source payload"
+    );
+}
+
+#[test]
+fn heap_and_mailbox_mut_hands_out_the_processes_own_storage() {
+    let mut process = Process::new(pid(2)).expect("the default heap allocates");
+    assert_eq!(
+        process.heap_used_words(),
+        0,
+        "a fresh process has an empty young heap"
+    );
+    assert_eq!(
+        process.mailbox().len(),
+        0,
+        "a fresh process has an empty mailbox"
+    );
+
+    // A single call that hands out BOTH references at once. Write through the heap reference
+    // (allocate a term) and through the mailbox reference (enqueue a message), then capture the
+    // addresses handed out.
+    let (heap_addr, mailbox_addr) = {
+        let (heap, mailbox) = process.heap_and_mailbox_mut();
+
+        // Write through the heap reference.
+        let _term = heap
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("the tuple fits the young heap");
+        assert_eq!(
+            heap.used(),
+            3,
+            "the tuple wrote 3 words through this reference"
+        );
+
+        // Write through the mailbox reference.
+        mailbox.enqueue(Message::new(make_small(42), make_small(0)));
+        assert_eq!(
+            mailbox.len(),
+            1,
+            "the message landed in this reference's queue"
+        );
+
+        (heap as *mut Heap, mailbox as *mut Queue)
+    };
+
+    // The `Process` itself observes BOTH writes through its own accessors: the words are on its
+    // young heap and the message is in its own mailbox.
+    assert_eq!(
+        process.heap_used_words(),
+        3,
+        "the write through the heap reference landed on the process's OWN young heap"
+    );
+    assert_eq!(
+        process.mailbox().len(),
+        1,
+        "the message enqueued through the mailbox reference landed in the process's OWN mailbox"
+    );
+    assert_eq!(
+        process.mailbox().peek().map(|m| signed_value(m.payload())),
+        Some(42),
+        "the message the split reference enqueued is looked up through the process's own accessor"
+    );
+
+    // The references are the VERY SAME objects `heap_mut`/`mailbox_mut` return — not copies of
+    // the storage. This rules out an implementation that handed back detached temporaries.
+    assert!(
+        core::ptr::eq(process.heap_mut() as *mut Heap, heap_addr),
+        "the returned heap reference is the process's own young heap (same address)"
+    );
+    assert!(
+        core::ptr::eq(process.mailbox_mut() as *mut Queue, mailbox_addr),
+        "the returned mailbox reference is the process's own queue (same address)"
+    );
+}
+
+#[test]
+fn send_fragmented_through_the_split_borrow_lands_in_the_processes_own_mailbox() {
+    // The motivating consumer of the `(heap, mailbox)` split: `send_fragmented` copies a payload
+    // onto the receiver's heap **and** enqueues the resulting message on the receiver's queue, so
+    // it needs both at once. A source heap holds the payload `[1, 2, 3]`; the copy boundary
+    // resolves off-heap references through `src_off_heap` and registers them in `dst_off_heap`.
+    let mut src = Heap::new(16).expect("the source heap allocates");
+    let payload = {
+        // The list `[1, 2, 3]`, tail-first.
+        let tail = src.cons(make_small(3), NIL).expect("a cons fits");
+        let mid = src.cons(make_small(2), tail).expect("a cons fits");
+        src.cons(make_small(1), mid).expect("a cons fits")
+    };
+    let src_off_heap = OffHeapTable::new();
+    let mut dst_off_heap = OffHeapTable::new();
+    let mut ctx = CopyContext::new(&src_off_heap, &mut dst_off_heap);
+
+    let mut process = Process::new(pid(3)).expect("the default heap allocates");
+    let used_before = process.heap_used_words();
+
+    {
+        // Obtain `(heap, mailbox)` from one `&mut process` — the pair is otherwise unobtainable
+        // because `heap_mut()` and `mailbox_mut()` each take a whole `&mut self`.
+        let (heap, mailbox) = process.heap_and_mailbox_mut();
+        send_fragmented(make_small(7), payload, heap, mailbox, &mut ctx, 0)
+            .expect("the small payload fits the receiver's young heap");
+    }
+
+    // A payload that fits takes the ordinary (non-fragment) `send` branch: the message landed in
+    // the process's OWN mailbox, carrying the copied payload that lives on the process's OWN
+    // young heap.
+    assert_eq!(
+        process.mailbox().len(),
+        1,
+        "the message landed in the process's OWN mailbox"
+    );
+    let message = process.mailbox().peek().expect("the queue is non-empty");
+    assert_eq!(
+        signed_value(message.from()),
+        7,
+        "the sender identity handed to `send_fragmented` was recorded on the message"
+    );
+    assert!(
+        message.fragments().is_none(),
+        "a payload that fits the receiver's heap uses no heap fragment"
+    );
+    assert!(
+        compare::eq(payload, message.payload(), &AtomTable::new()),
+        "the enqueued payload is structurally equal to the source list"
+    );
+    // The payload's 3 cons cells (6 words) were copied onto the RECEIVER's own young heap.
+    assert_eq!(
+        process.heap_used_words(),
+        used_before + 6,
+        "the copied list lives on the process's own young heap (3 cons cells = 6 words)"
+    );
+}
+
+#[test]
+fn send_fragmented_falls_back_to_a_fragment_within_the_processes_own_mailbox() {
+    // The same accessor drives `send_fragmented`'s fragment branch: a payload far larger than the
+    // receiver's young heap makes `copy_struct` fail with `AllocKind::Message`, so the message must
+    // be routed through a heap fragment — still landing in the process's OWN mailbox.
+    let mut src = Heap::new(4096).expect("the source heap allocates");
+    let mut payload = NIL;
+    for value in 0..1000 {
+        payload = src
+            .cons(make_small(value), payload)
+            .expect("a cons fits the source heap");
+    }
+    let src_off_heap = OffHeapTable::new();
+    let mut dst_off_heap = OffHeapTable::new();
+    let mut ctx = CopyContext::new(&src_off_heap, &mut dst_off_heap);
+
+    let mut process = Process::new(pid(4)).expect("the default heap allocates");
+    let used_before = process.heap_used_words();
+
+    {
+        let (heap, mailbox) = process.heap_and_mailbox_mut();
+        send_fragmented(make_small(9), payload, heap, mailbox, &mut ctx, 0)
+            .expect("the oversized payload is routed through a heap fragment");
+    }
+
+    assert_eq!(
+        process.mailbox().len(),
+        1,
+        "the fragmented message landed in the process's OWN mailbox"
+    );
+    let message = process.mailbox().peek().expect("the queue is non-empty");
+    assert_eq!(
+        signed_value(message.from()),
+        9,
+        "the sender identity was recorded"
+    );
+    assert!(
+        message.fragments().is_some(),
+        "a payload too large for the receiver's heap is routed through a heap fragment"
+    );
+    assert_eq!(
+        process.heap_used_words(),
+        used_before,
+        "the fragment — not the young heap — holds the oversized payload"
+    );
+    assert!(
+        compare::eq(payload, message.payload(), &AtomTable::new()),
+        "the fragmented payload is structurally equal to the source list"
     );
 }
