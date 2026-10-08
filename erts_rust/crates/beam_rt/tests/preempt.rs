@@ -17,17 +17,17 @@
 //! * after one slice, the CPU-bound process must **not** have finished (it yielded) and the
 //!   short process must **not** have run yet;
 //! * after the next slice, the short process must have **returned** while the CPU-bound one is
-//!   still unfinished — a budget-ignoring runner could not satisfy this, because it would have
+//!   still unfinished -- a budget-ignoring runner could not satisfy this, because it would have
 //!   finished the first process in slice 1;
 //! * driving the scheduler to completion then finishes the CPU-bound process with the
-//!   **fully-built** list — proving the yield suspended it and lost no work rather than
+//!   **fully-built** list -- proving the yield suspended it and lost no work rather than
 //!   dropping or corrupting it.
 //!
 //! # The fixture
 //!
 //! `tests/fixtures/preempt.beam` (source `preempt.erl`, both committed) is the image. Its
 //! `alloc_loop/1` is a tail-recursive accumulator that builds one cons cell per iteration, so
-//! the compiler emits a `test_heap` before each allocation — the one per-instruction seam the
+//! the compiler emits a `test_heap` before each allocation -- the one per-instruction seam the
 //! reduction budget is charged at. `quick/0` returns the atom `done` in a single slice.
 //!
 //! The committed image is used directly (no toolchain needed beyond the system installation
@@ -64,7 +64,7 @@ const ALLOCATIONS: i64 = 100_000;
 ///
 /// `boot` (and therefore every `spawn_process`, which boots on demand) resolves the system
 /// code path by asking the system `erl`, so a tree without the system installation cannot run
-/// this suite at all — reported as a **loud skip** by [`support::require_oracle`], never a
+/// this suite at all -- reported as a **loud skip** by [`support::require_oracle`], never a
 /// silent pass.
 fn runtime_with(beam: &str) -> Option<Runtime> {
     support::require_oracle("preempt")?;
@@ -157,7 +157,7 @@ fn assert_pre_emption_interleaving(rt: &mut Runtime) {
 /// so a short process spawned second runs and returns while the first is still unfinished.
 ///
 /// This uses the committed image, so it runs whenever the system installation (for the boot
-/// sequence) is present — no `erlc` is needed.
+/// sequence) is present -- no `erlc` is needed.
 #[test]
 fn a_cpu_bound_process_is_pre_empted_so_a_short_process_gets_its_turn() {
     let Some(mut rt) = runtime_with(PREEMPT_BEAM) else {
