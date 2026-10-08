@@ -355,7 +355,8 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   `nif_variadic.rs` (+`nif_variadic.c`, gated on `cfg(beam_abi_variadic_shim)`),
   `driver_end_to_end.rs` (+`test_driver.c`), `driver_lifecycle.rs` (+`driver_lifecycle.c`),
   `driver_queues.rs` (+`driver_queues.c`), `driver_pdl.rs` (+`driver_pdl.c`), `driver_threads.rs`
-  (+`driver_threads.c`).
+  (+`driver_threads.c`), `driver_binary_refc.rs` (+`driver_binary_refc.c` — the dual `driver_init`/
+  `nif_init` fixture shared with the oracle run, below).
 - **Oracle cross-checks that really run** (they skip loudly if `erl`/`erlc`/`cc` are absent):
   `nif_threads.rs` loads the *same* fixture `.so` from the system Erlang and compares the printed
   tuple (excluding `thread_type/0`, the documented scheduler deviation); `nif_mapiter.rs`'s
