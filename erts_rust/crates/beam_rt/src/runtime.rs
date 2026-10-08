@@ -255,6 +255,20 @@ pub struct Runtime {
     /// stands for without reading the thing's payload — which would need `unsafe`, and this
     /// crate is `#![deny(unsafe_code)]`.
     pub(crate) references: HashMap<Eterm, Option<MonitorRef>>,
+    /// The **per-process group leader** (`erlang:group_leader/0,2`), a pid → pid map.
+    ///
+    /// A pid with no entry has this runtime's **root** pid (`self_pid`) as its leader — the
+    /// process OTP's `init` stands in for here, and the value every spawn inherits unless a
+    /// leader was set explicitly (`Runtime::inherit_group_leader`). `erlang:group_leader/0`,
+    /// `erlang:group_leader/2`, `erts_internal:group_leader/2,3` and
+    /// `process_info(Pid, group_leader)` all read this one map through
+    /// [`Runtime::group_leader_of`], so they can never disagree. The model, the oracle
+    /// evidence and the divergences live in [`crate::native::group_leader`].
+    ///
+    /// A terminated process leaves its entry behind, which is harmless: a pid's serial is
+    /// bumped when its table slot is reused ([`ProcessTable::take`]), so the stale key names
+    /// no process that can ever be observed again.
+    pub(crate) group_leaders: HashMap<ProcessId, ProcessId>,
     /// Closures built by the `-eval` evaluator, indexed by the fun term's `index`.
     ///
     /// An `-eval` `fun` may be applied *inside a loaded module* (e.g.
@@ -441,6 +455,7 @@ impl Runtime {
             seq_trace: SeqTrace::new(),
             refs: RefAllocator::new(),
             references: HashMap::new(),
+            group_leaders: HashMap::new(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
             timer_resumes: HashMap::new(),
