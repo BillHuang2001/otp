@@ -644,7 +644,21 @@ impl Table {
 
 ## Known Issues (honest gaps — not full parity)
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
-  there is no locking or per-reader table; a `Table` is single-threaded.
+  there is no fine-grained per-bucket locking; the only real synchronisation is [`SharedTable`]'s
+  coarse `Arc<RwLock<Table>>` (a `{}` table hands out shared access through nothing else).
+- **`SharedTable`'s read results must not outlive the read guard.** `Table` reads return terms that
+  alias table-owned storage (the A.1 copy boundary is on the *insert* side only; see *Design
+  Decisions*). A result kept after the `RwLock` read guard is dropped can be reclaimed by a
+  concurrent writer's delete and its word runs reused by a later same-size insert — the same word
+  then silently re-reads as a *different, well-formed* object. This is a hazard of the
+  `with_read`/`with_write` bare-`T` forms and of any escaped guard-held term, not of the interior
+  (real `ets` has no such constraint because it copies into the calling process's heap). Hosts must
+  consume read results inside the guard, or a future pass must add a copy-out-on-read path / a
+  guard-scoped view type. Pinned by the churn test in `tests/ets_shared.rs`.
+- **The owner-death transition has no caller.** `Table::owner_died` models the transition, but nothing
+  in the runtime invokes it: `beam_bifs`'s `ets:new/2` never records an owner, its `TableRegistry` has
+  no owner index, and `beam_process` has no process-death hook at all. `ETS_SURFACE.md` §7 names the
+  exact API each of those needs.
 - **`ets:info/1` `owner`/`heir` are `undefined` and `id` is a small integer.** `TableInfo::entries` emits the
   oracle's full 15-field order, but `owner` — a pid in the oracle — has no term representation at this
   stage, so it renders as the atom `undefined`, and `id` renders as a small integer rather than a ref.
