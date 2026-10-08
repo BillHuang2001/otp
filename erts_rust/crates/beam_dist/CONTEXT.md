@@ -240,16 +240,24 @@ distribution header carries it).
   Unknown opcode / wrong arity / malformed tuple ⇒ `BeamError::BadArg`. Term encoding is **only**
   `beam_codec`.
 
-### `src/epmd.rs` — `epmd` port-mapper client (safe)
-2-byte-BE-framed **requests** (`ALIVE2_REQ`/`RESP`/`X_RESP`, `PORT2_REQ`/`RESP`, `NAMES`) +
-`struct EpmdClient<T: Transport>` (`publish`/`port_please`/`names`). **Replies are NOT length-framed**
-(`epmd` writes the body straight to the socket) — the client reads them unframed/self-delimiting (see
-Design Decisions).
+### `src/epmd.rs` — `epmd` port-mapper + admin client (safe)
+2-byte-BE-framed **requests** (`ALIVE2_REQ`/`RESP`/`X_RESP`, `PORT2_REQ`/`RESP`, `NAMES_REQ`,
+`DUMP_REQ`, `KILL_REQ`, `STOP_REQ`) + `struct EpmdClient<T: Transport>`
+(`publish`/`port_please`/`names`/`dump`/`kill`/`stop`). **Replies are NOT length-framed** (`epmd` writes
+the body straight to the socket) — the client reads them unframed/self-delimiting (see Design
+Decisions).
 - `EpmdClient<TcpTransport>::connect(addr) -> Result<EpmdClient<TcpTransport>>` and the free
   `epmd::connect(addr)` — a real TCP client to `epmd` (sets `DEFAULT_READ_TIMEOUT` + `TCP_NODELAY`).
 - `epmd::lookup(name) -> Result<Port2Resp>` (raw) and `epmd::lookup_port(name) -> Result<u16>`
   (`Port2Resp::Error` ⇒ `BeamError::Io(NotFound)`, never a silent `0`); both connect to
   `EPMD_DEFAULT_ADDR` (`"127.0.0.1:4369"`, pinned to `EPMD_PORT`).
+- Typed accessors: `Alive2Resp::{is_accepted, is_rejected, is_alive_conflict, creation}`,
+  `Port2Resp::{is_registered, is_not_registered}`.
+- Admin/DUMP codecs: `DumpReq`/`DumpResp`/`DumpLine`/`DumpNodeKind { Active, OldUnused }` (the
+  node-table dump), `KillReq`/`KillResp { Ok, Refused }` (`"OK"`/`"NO"`), `StopReq { name }`/`StopResp
+  { Stopped, NoExist, NoReply }` (success text is **`"STOPPED"`**, not `"OK"` — `epmd_srv.c`).
+  `MAX_DUMP_RESP_BODY` (`1 MiB`) bounds the open-ended `DUMP_RESP`; over-ceiling ⇒ `SystemLimit`.
+  `kill`/`stop` are **codec-only by design** (destructive — never issued by a test).
 - `NamesResp::encode` is lossy on per-node ports (only `epmd_port` + names are retained).
 
 ### `src/connection.rs` — the blocking connection-level API + `TcpStream` adapter (safe)
