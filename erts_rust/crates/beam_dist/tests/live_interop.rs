@@ -52,6 +52,19 @@
 //!    assertion. A monitor the node never observes fails the test rather than being
 //!    reported as "not routed": the bidirectional path that carries it is already
 //!    proven by the assertions above.
+//! 6. **Client-originated `DOP_MONITOR_P` is ACCEPTED, not rejected.** The *other*
+//!    direction of that same protocol is proven LIVE by
+//!    [`live_client_originated_monitor_is_accepted_by_a_real_node`]: this crate's
+//!    client monitors a process on the real node
+//!    (`{DOP_MONITOR_P, OurPid, W, Ref}`, `dist.c:2341`), the node establishes the
+//!    monitor, and when `W` exits the node answers
+//!    `{DOP_MONITOR_P_EXIT, W, OurPid, Ref, Reason}` (`dist.c:1496`/`1516`) which
+//!    the client decodes and asserts field by field; `DOP_DEMONITOR_P` then
+//!    suppresses that signal. The gate `dist.c:2358` requires the watcher pid to
+//!    resolve to *this* link's distribution entry, which is keyed on the node-name
+//!    atom alone (`erl_node_tables.c:286`), so the watcher must carry the full
+//!    `node@host` name advertised in the handshake (see that test's doc comment for
+//!    the measured sweep).
 //!
 //! Every assertion is on **decoded terms** (compared by their encoded body images),
 //! never on raw bytes: atom interning order and heap addresses differ between the
@@ -76,7 +89,7 @@ use beam_codec::term::{
 };
 use beam_dist::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use beam_dist::transport::{Read as TransportRead, Write as TransportWrite};
-use beam_dist::{connect_to_node, Connection, ControlMessage, TcpTransport};
+use beam_dist::{connect_to_node, Connection, ControlMessage, TcpTransport, CLIENT_CREATION};
 use beam_term::prelude::{atom_val, is_atom as term_is_atom, make_atom, make_small};
 use beam_term::{AtomTable, Eterm};
 
@@ -857,12 +870,20 @@ fn live_dop_unlink_id_is_acknowledged_by_a_real_node() {
 /// The node script for the monitor probes.
 ///
 /// It spawns two workers `W1`/`W2` (each answering `{sync, N, From}` with
-/// `{sync_ack, N}` and dying on `{die, Reason}`) and a dispatcher registered as
+/// `{sync_ack, N}` and, on `{die, Reason, From}`, announcing `{dying, Reason}`
+/// back to `From` and then exiting with `Reason`) and a dispatcher registered as
 /// [`REGISTERED_NAME`] that answers `{pids, From}` with `{pids_back, W1, W2}`.
+///
+/// The `{dying, Reason}` acknowledgement is what lets the client prove a worker
+/// *really died* without depending on a monitored-process signal: `W_DIE` is
+/// printed for the wire-level diagnostics and by the `W_MSG` fallback, and the
+/// `{dying, _}` send is the protocol-level evidence.
 const MONITOR_NODE_EVAL: &str = r#"Make = fun() ->
     spawn(fun WLoop() ->
         receive
-            {die, Reason} ->
+            {die, Reason, From} ->
+                io:format("W_DIE ~p~n", [Reason]),
+                From ! {dying, Reason},
                 exit(self(), Reason);
             {sync, N, From} ->
                 From ! {sync_ack, N},
@@ -890,25 +911,72 @@ io:format("READY~n", []),
 timer:sleep(30000),
 halt()."#;
 
-/// **LIVE** probe of the client-originated remote-monitor protocol.
+/// **LIVE** proof of the **client-originated** remote-monitor protocol
+/// (`DOP_MONITOR_P`: our process watches a process on a real node).
 ///
 /// It asks the node for two worker pids (`{pids, From}` -> `{pids_back, W1, W2}`,
 /// which also proves a normal `DOP_REG_SEND` / inbound `DOP_SEND_SENDER` exchange
 /// on this link) and then sends the client-originated signal
 /// `DOP_MONITOR_P` (`{DOP_MONITOR_P, Watcher, Watched, Ref}`, `dist.c:2341`).
 ///
-/// **Observed against a real OTP-29 node:** the node *rejects* it. `dist.c:2360`
-/// aborts the connection with `invalid_message` unless
-/// `external_pid_dist_entry(Watcher) == dep` — the watcher external pid must
-/// resolve to the distribution entry of the very link the message arrived on. A
-/// client advertising creation `0` (this crate's `CLIENT_CREATION`) does not, so
-/// the node closes the link. The test asserts exactly that orderly end-of-link
-/// (`BeamError::BadArg` = short read) — never a hang, and never a fabricated
-/// `DOP_MONITOR_P_EXIT`. The accepted direction of the same protocol (node ->
-/// client `DOP_MONITOR_P`, answered with `DOP_MONITOR_P_EXIT`) is proven LIVE by
+/// **Observed against a real OTP-29 node: the node ACCEPTS it.** The client then
+/// has `W1` exit with reason `boom` (an ordinary `DOP_SEND` of `{die, boom, Pid}`
+/// to the worker, `dist.c:2526`) and the node answers with the monitor-down signal
+/// `{DOP_MONITOR_P_EXIT, W1, ClientPid, Ref, boom}` (built by
+/// `erts_dsig_send_m_exit`, `dist.c:1496`/`1516`, and received at `dist.c:2701`).
+/// Every field is asserted — a **hard**
+/// assertion. Because a node that *rejects* the opcode kills the link
+/// (`invalid_message` -> `erts_kill_dist_connection`, `dist.c:2360`/`3186`), a
+/// *decoded* monitor-down is unambiguous proof of acceptance; equally, a monitor
+/// that was accepted but never registered produces no down and fails the test.
+///
+/// This is the mirror image of the node -> client direction proven LIVE by
 /// [`live_handshake_and_message_exchange_with_a_real_erl_node`].
+///
+/// # The combination that works (and why) — measured, not assumed
+///
+/// The watcher pid's node name must be **the full `node@host` name this link
+/// advertised in the handshake** (`Connection::client`'s `our_name`), with the
+/// pid's creation equal to the advertised [`CLIENT_CREATION`] (`0`). `dist.c:2358`
+/// requires `external_pid_dist_entry(watcher) == dep`, and the lookup behind it is
+/// keyed on the **node-name atom alone**:
+/// `external_pid_dist_entry(x)` = `external_node(x)->dist_entry`
+/// (`erl_node_container_utils.h:1239`/`:142`); decoding a pid builds the node
+/// container with `erts_find_or_insert_node(sysname, cre, …)` (`external.c:3189`),
+/// which sets `dist_entry = erts_find_or_insert_dist_entry(sysname)`
+/// (`erl_node_tables.c:832`), and that hash table's key is the sysname only
+/// (`find_dist_entry`, `erl_node_tables.c:286-292`, fills just `de.sysname`).
+/// `dep`'s sysname is the atom `erlang:setnode/3` was handed — the
+/// `erts_internal:create_dist_channel` primitive (`dist.c:5126-5128`, `:5222`) that
+/// `dist_util.erl:590` calls — i.e. exactly the handshake `Name` field, which a
+/// `'N'` handshake keeps verbatim (`dist_util.erl:783-793`: `list_to_atom(Name)`
+/// when the sender is not dynamic).
+///
+/// A measured sweep over the small space confirms this. Watcher node name
+/// `{client_short}@{host}` (creation `0`, and separately a non-zero creation `1`):
+/// the node accepts `DOP_MONITOR_P` and its monitor-down comes back. Watcher node
+/// name `{client_short}` (short form, both creations): the node resolves that pid
+/// to a *different* `DistEntry`, so **nothing it sends to that pid can be
+/// delivered** — the `{pids_back, W1, W2}` reply to the very first `DOP_REG_SEND`
+/// never arrives, because the reply's `dep` has no connection. (The request itself
+/// is accepted: `dist.c:2486` only requires a pid; it is purely the pid's node
+/// *identity* that does not resolve.) Creation is not part of the `dep`
+/// comparison at all, so the surviving choice is the full name with the advertised
+/// creation.
+///
+/// **The earlier version of this probe was wrong**, not the wire: it recorded a
+/// "rejection" from a bounded read that timed out, but a rejected opcode *closes*
+/// the link while an *accepted* monitor sends nothing until the watched process
+/// dies — so a timeout was consistent with acceptance and proved nothing. The
+/// verdict is now the decoded monitor-down.
+///
+/// The second half pins the companion `DOP_DEMONITOR_P` (`dist.c:2415`, same
+/// `external_pid_dist_entry(watcher) == dep` gate at `:2431`): after monitoring
+/// `W2` and demonitoring it, killing `W2` must produce **no** monitor-down for that
+/// reference (the demonitor is processed on the same ordered link before the kill,
+/// so this is deterministic, not a race).
 #[test]
-fn live_client_originated_monitor_is_rejected_by_a_real_node() {
+fn live_client_originated_monitor_is_accepted_by_a_real_node() {
     let Some(host) = erl_hostname() else {
         eprintln!("SKIP live_interop/monitor: no usable `erl` on PATH");
         return;
@@ -931,11 +999,22 @@ fn live_client_originated_monitor_is_rejected_by_a_real_node() {
     );
 
     let mut conn = handshake_with(&node, &our_node, &cookie);
+    assert!(
+        conn.negotiated().contains(DistFlags::from_bits(beam_dist::flags::DFLAG_DIST_MONITOR)),
+        "an OTP node must negotiate DFLAG_DIST_MONITOR, or it would ignore DOP_MONITOR_P \
+         (flags={:#x})",
+        conn.negotiated().bits()
+    );
+
     let mut atoms = AtomTable::new();
     let mut heap = Heap::new(1 << 20).expect("client heap");
+    // The watcher pid's node name is this link's advertised `node@host` and its
+    // creation is the advertised `CLIENT_CREATION` — see the doc comment: the
+    // node's `dep` gate compares the node-name atom only, so this is the form that
+    // resolves to the link's distribution entry.
     let our_node_atom = make_atom(atoms.intern(&our_node));
-    let our_pid =
-        make_external_pid(&mut heap, our_node_atom, 1, 0, 0).expect("materialize the client pid");
+    let our_pid = make_external_pid(&mut heap, our_node_atom, 1, 0, CLIENT_CREATION)
+        .expect("materialize the client pid");
     let empty = make_atom(atoms.intern(""));
     let to_name = make_atom(atoms.intern(REGISTERED_NAME));
     let pids_tag = make_atom(atoms.intern("pids"));
@@ -955,68 +1034,154 @@ fn live_client_originated_monitor_is_rejected_by_a_real_node() {
     let w1 = tuple_element(pids, 1).expect("worker 1 pid");
     let w2 = tuple_element(pids, 2).expect("worker 2 pid");
 
-    // 1. Client-originated `DOP_MONITOR_P` — the LIVE finding is a **rejection**.
+    // 1. Client-originated `DOP_MONITOR_P` — the node ACCEPTS it.
     //
-    // `dist.c:2341` requires `external_pid_dist_entry(Watcher) == dep`, i.e. the
-    // watching external pid must resolve to the very distribution entry of the
-    // connection the control message arrived on. A client advertising creation `0`
-    // (this crate's `CLIENT_CREATION`, `connection.rs`) does not resolve to that
-    // entry on the node, so the opcode falls through to `invalid_message`
-    // (`dist.c:2360`) and the node **closes the link**. That is asserted, not
-    // papered over: the node must answer with an orderly end-of-link (a short read,
-    // `BeamError::BadArg`), never a hang and never a silently-ignored monitor.
-    //
-    // The *accepted* direction of the same protocol — the node watching the client
-    // (`DOP_MONITOR_P` node -> client) and the client answering
-    // `DOP_MONITOR_P_EXIT` — is proven LIVE by
-    // `live_handshake_and_message_exchange_with_a_real_erl_node` above.
-    let r1 = make_external_ref(&mut heap, our_node_atom, &[1, 1, 1], 0).expect("monitor ref 1");
+    // `{DOP_MONITOR_P, Watcher, Watched, Ref}` with the watcher a **full-name**
+    // external pid of this link (see the doc comment). A rejection would close the
+    // link (`dist.c:2360` -> `:3186`), so the probes below separate the two outcomes
+    // without ever relying on a bare timeout.
+    let r1 = make_external_ref(&mut heap, our_node_atom, &[1, 1, 1], CLIENT_CREATION)
+        .expect("monitor ref 1");
     conn.send_control(Dop::MonitorP, &[our_pid, w1, r1], &atoms).expect("DOP_MONITOR_P W1");
-    let observed = match conn.recv(&mut heap, &mut atoms) {
-        Ok(message) => panic!(
-            "the node ACCEPTED a client-originated DOP_MONITOR_P (got {:?} terms={:?}); the \
-             LIVE observation this test records (from `dist.c:2360`) is that a real node \
-             rejects it and closes the link (stderr: {})",
-            message.dop,
-            message.terms.len(),
-            node.stderr_text()
-        ),
-        Err(err) => err,
-    };
-    eprintln!(
-        "live_interop/monitor: no control message followed a client-originated DOP_MONITOR_P \
-         ({observed:?})"
+    eprintln!("live_interop/monitor: sent DOP_MONITOR_P({{client pid, W1, Ref}})");
+
+    // 2. The link must still be established after the monitor: a round trip with
+    //    the watched worker itself. A rejection closes the link here, so this read
+    //    fails with a clear message instead of silently timing out later.
+    let sync_tag = make_atom(atoms.intern("sync"));
+    let sync_ack = body_image(
+        heap.tuple(&[make_atom(atoms.intern("sync_ack")), make_small(1)])
+            .expect("build the expected sync_ack tuple"),
+        &atoms,
     );
-    // Either an orderly end-of-link (a short read => `BadArg`) or simply nothing at
-    // all (the socket read timeout => `IO(WouldBlock)`, errno 11) is proof that no
-    // monitor was established; what must NOT happen is a control message.
+    let sync = heap.tuple(&[sync_tag, make_small(1), our_pid]).expect("build {sync, 1, Pid}");
+    conn.send_message(our_pid, w1, sync, &atoms).expect("send the sync probe to W1");
+    let acked = recv_until(&mut conn, &mut heap, &mut atoms, EXCHANGE_TIMEOUT, |m, atoms| {
+        send_payload(m)
+            .map(|payload| body_image(payload, atoms) == sync_ack)
+            .unwrap_or(false)
+    });
     assert!(
-        matches!(observed, beam_common::BeamError::BadArg | beam_common::BeamError::Io(_)),
-        "the rejection must be an orderly end-of-link or a silent read timeout, not \
-         {observed:?} (stderr: {})",
+        acked.is_some(),
+        "the node never answered {{sync_ack,1}} after DOP_MONITOR_P — a rejected monitor \
+         closes the link (dist.c:2360), so this proves the monitor did not kill it (stderr: {})",
         node.stderr_text()
     );
 
-    // 2. The demonitor probe runs in the *accepted* direction of the protocol: the
-    //    node watches the client, so it is the node that must send `DOP_DEMONITOR_P`
-    //    when it stops watching (proven implicitly — no such signal follows here),
-    //    while the client answers the node's `DOP_MONITOR_P` with
-    //    `DOP_MONITOR_P_EXIT`. Neither a `DOP_DEMONITOR_P` nor a
-    //    `DOP_MONITOR_P_EXIT` may arrive unsolicited on this link: a bounded read
-    //    must time out (`WouldBlock`), never hang.
-    let _ = (&w2, &r1);
-    match conn.recv(&mut heap, &mut atoms) {
-        Err(err) => eprintln!(
-            "live_interop/monitor: no further control traffic after the rejection — the link \
-             ended cleanly ({err:?})"
-        ),
-        Ok(message) => panic!(
-            "no control message may be sent to a watcher that never established a monitor: \
-             the node sent {:?} (stderr: {})",
-            message.dop,
+    // 3. Make W1 exit with `boom`; the node must report the monitor-down.
+    let die = make_atom(atoms.intern("die"));
+    let boom = make_atom(atoms.intern("boom"));
+    let kill = heap.tuple(&[die, boom, our_pid]).expect("build {die, boom, Pid}");
+    conn.send_message(our_pid, w1, kill, &atoms).expect("send the kill to W1");
+
+    let down = recv_until(&mut conn, &mut heap, &mut atoms, EXCHANGE_TIMEOUT, |m, _| {
+        matches!(m.dop, Dop::MonitorPExit | Dop::PayloadMonitorPExit)
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "the node never sent DOP_MONITOR_P_EXIT after W1 exited — the monitor was not \
+             established (stderr: {})",
             node.stderr_text()
-        ),
+        )
+    });
+    // `{DOP_MONITOR_P_EXIT, watched, watcher, ref, reason}` (`dist.c:1516`) — the
+    // flattened `terms` are the same four for the `DFLAG_EXIT_PAYLOAD` variant
+    // (`dist.c:1512`), which is the one a default-flag link negotiates.
+    assert_eq!(
+        down.terms.len(),
+        4,
+        "the monitor-down carries watched, watcher, ref and reason: {:?}",
+        down.terms
+    );
+    assert_eq!(
+        body_image(down.terms[0], &atoms),
+        body_image(w1, &atoms),
+        "the monitor-down's watched process must be W1 (dist.c:1516's first field)"
+    );
+    assert_eq!(
+        body_image(down.terms[1], &atoms),
+        body_image(our_pid, &atoms),
+        "the monitor-down's watcher must be the client pid that sent DOP_MONITOR_P"
+    );
+    assert_eq!(
+        body_image(down.terms[2], &atoms),
+        body_image(r1, &atoms),
+        "the monitor-down must echo the reference we sent"
+    );
+    assert_eq!(
+        body_image(down.terms[3], &atoms),
+        body_image(boom, &atoms),
+        "the monitor-down's reason must be W1's exit reason"
+    );
+    eprintln!(
+        "live_interop/monitor: the node ACCEPTED the client-originated DOP_MONITOR_P and sent \
+         DOP_{:?} with reason `boom`",
+        down.dop
+    );
+
+    // 4. The companion `DOP_DEMONITOR_P` (`dist.c:2415`): monitor W2, demonitor it,
+    //    then kill it. The node must report `{dying, vanished}` — so W2 really dies
+    //    — and must send NO monitor-down for `r2`, because the demonitor travelled to
+    //    W2 on the same ordered link before the kill.
+    let vanish = make_atom(atoms.intern("vanished"));
+    let r2 = make_external_ref(&mut heap, our_node_atom, &[2, 2, 2], CLIENT_CREATION)
+        .expect("monitor ref 2");
+    conn.send_control(Dop::MonitorP, &[our_pid, w2, r2], &atoms).expect("DOP_MONITOR_P W2");
+    conn.send_control(Dop::DemonitorP, &[our_pid, w2, r2], &atoms)
+        .expect("DOP_DEMONITOR_P W2");
+    let kill2 = heap.tuple(&[die, vanish, our_pid]).expect("build {die, vanished, Pid}");
+    conn.send_message(our_pid, w2, kill2, &atoms).expect("send the kill to W2");
+
+    // Drain until the link goes quiet (one read timeout) and record everything. A
+    // monitor-down for `r2` would arrive here; a dead W2's `{dying, vanished}` also
+    // arrives here, which is what makes the negative result meaningful.
+    let mut w2_died = false;
+    let mut spuriously_down = false;
+    let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+    while Instant::now() < deadline {
+        let message = match conn.recv(&mut heap, &mut atoms) {
+            Ok(message) => message,
+            Err(err) => {
+                eprintln!(
+                    "live_interop/monitor: the link went quiet after the demonitor probe ({err:?})"
+                );
+                break;
+            }
+        };
+        eprintln!(
+            "live_interop/monitor: post-demonitor inbound opcode={:?} terms={}",
+            message.dop,
+            message.terms.len()
+        );
+        if matches!(message.dop, Dop::MonitorPExit | Dop::PayloadMonitorPExit)
+            && message.terms.len() == 4
+            && body_image(message.terms[2], &atoms) == body_image(r2, &atoms)
+        {
+            spuriously_down = true;
+        }
+        if send_payload(&message)
+            .map(|payload| is_tagged_tuple(payload, "dying", 2, &atoms))
+            .unwrap_or(false)
+        {
+            w2_died = true;
+        }
     }
+    assert!(
+        w2_died,
+        "W2 never announced {{dying, vanished}}, so the demonitor negative result would be \
+         vacuous (stderr: {})",
+        node.stderr_text()
+    );
+    assert!(
+        !spuriously_down,
+        "the node sent a monitor-down for a reference it had already been told to demonitor \
+         (stderr: {})",
+        node.stderr_text()
+    );
+    eprintln!(
+        "live_interop/monitor: W2 died after DOP_DEMONITOR_P and no monitor-down followed — \
+         the demonitor was honoured"
+    );
 }
 
 /// The node script for the fragmentation probes: it reports the size of a `big`
