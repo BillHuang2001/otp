@@ -59,6 +59,7 @@ use crate::port::PortRegistry;
 use crate::runner::{ProcessEntry, RunnerState};
 use crate::seq_trace::SeqTrace;
 use crate::timers::{TimerHandle, Timers};
+use crate::trace::TraceState;
 
 mod scheduler;
 
@@ -127,6 +128,14 @@ pub struct Runtime {
     /// recorded here; [`Runtime::scheduler_pass`] absorbs it into the real run queue at the
     /// same points it absorbs the table's own wake list.
     fragment_wakes: Vec<ProcessId>,
+    /// The **process-tracing** state (contract A.8, item 1): one trace entry (flags + tracer)
+    /// per traced pid, plus the monotonic delivery counter behind `erlang:trace_delivered/1`.
+    ///
+    /// It lives on the runtime rather than in a process because it is keyed **by** pid and
+    /// outlives every single-`run_*` call: `erlang:trace/3` in one call must be visible to
+    /// `erlang:trace_info/2` in the next. See [`crate::trace`] for the model and exactly what is
+    /// deferred (event emission and `trace_pattern`).
+    trace: TraceState,
     /// The preloaded-module registry skeleton (contract A.7).
     preloaded: PreloadedModules,
     /// The heaps BIF calls allocate on, used as a stack: a call takes one out, runs, and
@@ -352,6 +361,7 @@ impl Runtime {
             processes,
             mailboxes: HashMap::new(),
             fragment_wakes: Vec::new(),
+            trace: TraceState::new(),
             preloaded: PreloadedModules::standard(),
             bif_heaps: vec![Heap::new(heap_words)?],
             bif_heap_words: heap_words,
@@ -520,7 +530,18 @@ impl Runtime {
     pub(crate) fn seq_trace_mut(&mut self) -> &mut SeqTrace {
         &mut self.seq_trace
     }
-    /// Heap words still available to the running code (unbounded in Milestone-1).
+
+    /// The **process-tracing** state (contract A.8, item 1) — the trace flags and tracers
+    /// `erlang:trace/3` maintains, read by `erlang:trace_info/2` (see [`crate::trace`]).
+    pub(crate) fn trace(&self) -> &TraceState {
+        &self.trace
+    }
+
+    /// The mutable process-tracing state — what `erts_internal:trace/3` and
+    /// `erlang:trace_delivered/1` mutate.
+    pub(crate) fn trace_mut(&mut self) -> &mut TraceState {
+        &mut self.trace
+    }    /// Heap words still available to the running code (unbounded in Milestone-1).
     pub fn arena_available(&self) -> usize {
         self.arena.heap_available()
     }

@@ -172,6 +172,15 @@ impl RuntimeContext<'_> {
             ("erlang", "seq_trace_print", 1) => Some(self.seq_trace_print_1(args)),
             ("erlang", "seq_trace_print", 2) => Some(self.seq_trace_print_2(args)),
             ("erlang", "system_flag", 2) => Some(self.system_flag_2(args)),
+            // Process tracing (contract A.8, item 1) — the trace-flag state and the four BIFs
+            // `bif.tab:217-219` declares. The flag model, `trace_info/2` and `trace_delivered/1`
+            // live in [`crate::trace`]; `erlang:trace/2,3` are the thin wrappers over
+            // `erts_internal:trace/3`, which the [`erts_internal`] floor serves. Emitting
+            // `{trace, …}` events and `trace_pattern` are deliberately out of scope.
+            ("erlang", "trace", 2) => Some(self.erts_trace_2(args)),
+            ("erlang", "trace", 3) => Some(self.erts_trace(args)),
+            ("erlang", "trace_info", 2) => Some(self.trace_info_2(args)),
+            ("erlang", "trace_delivered", 1) => Some(self.trace_delivered_1(args)),
             // The `erts_internal` internal-BIF floor (contract A.7). One arm; the
             // per-function dispatch lives in [`erts_internal`], which answers `None`
             // for anything it does not serve — so `erts_internal:cmp_term/2`, owned

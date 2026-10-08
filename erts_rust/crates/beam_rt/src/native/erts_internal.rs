@@ -236,6 +236,7 @@ impl RuntimeContext<'_> {
             ("processes_next", 1) => Some(self.erts_processes_next(args)),
             ("term_to_string", 1) => Some(self.erts_term_to_string(args, false)),
             ("term_to_string", 2) => Some(self.erts_term_to_string(args, true)),
+            ("trace", 3) => Some(self.erts_trace(args)),
             _ => None,
         }
     }
@@ -724,6 +725,97 @@ impl RuntimeContext<'_> {
         let pid = pids[first as usize];
         let batch = terms::make_list(self, &[pid.to_eterm()])?;
         terms::make_tuple(self, &[make_small(first + 1), batch])
+    }
+
+    // -- erts_internal:trace/3 -----------------------------------------------
+
+    /// `erts_internal:trace/3` — the body `erlang:trace/2,3` calls (`erl_bif_trace.c`'s
+    /// `trace_3`). `PidSpec` selects the tracees, `How` sets (`true`) or clears (`false`) their
+    /// trace flags, and `FlagList` is the flag set to install when setting. The **calling**
+    /// process becomes the tracer.
+    ///
+    /// Only **process** targets are modelled: a pid the process table holds, or one of the group
+    /// atoms `all`/`existing`/`existing_processes`/`processes`, which select every process in the
+    /// table. The port/`new`-style PidSpecs (`new`, `new_processes`, `ports`, `existing_ports`,
+    /// `new_ports`) are the honest typed capability gap — never a fabricated count.
+    ///
+    /// The answer is the number of tracees affected (the C's return value), so a pid the table
+    /// does not hold selects nothing and contributes `0`.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a `PidSpec` that is neither a pid nor the atom `all`, a `How`
+    /// that is not the atom `true`/`false`, a `FlagList` that is not a proper list, an element of
+    /// `FlagList` that is not an atom, or an atom [`crate::trace::flags_from_atoms`] rejects.
+    pub(crate) fn erts_trace(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let pid_spec = *args.first().ok_or(BeamError::BadArg)?;
+        let how = *args.get(1).ok_or(BeamError::BadArg)?;
+        let flag_list = *args.get(2).ok_or(BeamError::BadArg)?;
+        // `How` is the boolean `true` (set) / `false` (clear).
+        let setting = match self.atom_name(how).as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(BeamError::BadArg),
+        };
+        let targets = self.trace_targets(pid_spec)?;
+        if setting {
+            let names = self.trace_flag_names(flag_list)?;
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let flags = crate::trace::flags_from_atoms(&refs).ok_or(BeamError::BadArg)?;
+            let tracer = Some(self.pid());
+            for pid in &targets {
+                self.runtime.trace_mut().set(*pid, flags, tracer);
+            }
+        } else {
+            for pid in &targets {
+                self.runtime.trace_mut().clear(*pid);
+            }
+        }
+        Ok(make_small(targets.len() as i64))
+    }
+
+    /// `erlang:trace(PidSpec, How)` — the `/2` form of [`Self::erts_trace`], with an empty
+    /// `FlagList` (the `erlang.erl` wrapper's own expansion).
+    pub(crate) fn erts_trace_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let pid_spec = *args.first().ok_or(BeamError::BadArg)?;
+        let how = *args.get(1).ok_or(BeamError::BadArg)?;
+        self.erts_trace(&[pid_spec, how, beam_term::NIL])
+    }
+
+    /// The pids a `PidSpec` selects, filtered to those the process table holds. A pid the table
+    /// does not hold selects nothing (the oracle's `0`), so the count an `erts_trace` caller sees
+    /// is always the number of tracees actually affected.
+    fn trace_targets(&mut self, pid_spec: Eterm) -> Result<Vec<ProcessId>> {
+        if let Ok(pid) = ProcessId::from_eterm(pid_spec) {
+            return Ok(if self.process_table_mut().contains(pid) {
+                vec![pid]
+            } else {
+                Vec::new()
+            });
+        }
+        match self.atom_name(pid_spec).as_deref() {
+            Some("all" | "existing" | "existing_processes" | "processes") => {
+                Ok(self.process_table_mut().pids().collect())
+            }
+            Some(name @ ("new" | "new_processes" | "ports" | "existing_ports" | "new_ports")) => {
+                Err(error::unsupported(&format!(
+                    "erts_internal:trace/3 with a `{name}` PidSpec (only process targets are \
+                     implemented)"
+                )))
+            }
+            _ => Err(BeamError::BadArg),
+        }
+    }
+
+    /// The atom names in a `FlagList`, rejecting a non-list or a non-atom element.
+    fn trace_flag_names(&mut self, flag_list: Eterm) -> Result<Vec<String>> {
+        let elements = terms::list_elements(flag_list).map_err(|_| BeamError::BadArg)?;
+        let mut names = Vec::with_capacity(elements.len());
+        for element in elements {
+            let name = self.atom_name(element).ok_or(BeamError::BadArg)?;
+            names.push(name);
+        }
+        Ok(names)
     }
 
     // -- erts_internal:term_to_string/1,2 ------------------------------------

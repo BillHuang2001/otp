@@ -404,7 +404,6 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("garbage_collect", 0),
     ("garbage_collect", 1),
     ("garbage_collect", 2),
-    ("trace", 3),
     ("trace_pattern", 5),
     ("get", 0),
     ("erase", 0),
