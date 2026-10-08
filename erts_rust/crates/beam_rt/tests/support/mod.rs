@@ -36,6 +36,10 @@ use beam_common::BeamError;
 /// [`BeamError::as_atom`] covers both the dedicated `BadArg` reason variant and a `Raise`
 /// whose reason *is* the atom, so both shapes are accepted while a structured (non-bare)
 /// reason still fails loudly — the oracle's `badarg` is never a tuple.
+///
+/// `#[allow(dead_code)]`: this shared module is compiled into **every** integration-test
+/// binary, and the ones that never assert a `badarg` would otherwise warn.
+#[allow(dead_code)]
 pub fn assert_badarg(error: BeamError) {
     assert_eq!(
         error.as_atom(),

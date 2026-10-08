@@ -5,6 +5,13 @@
 //! redirects an [`ensure_heap`](ExecutionContext::ensure_heap) on the slice's own machine
 //! into that probe. See [`RuntimeRunner::run`](crate::runner::RuntimeRunner) for how the
 //! probe's exhaustion becomes a pre-emption.
+//!
+//! Every other [`ExecutionContext`] method — BIF/apply dispatch, the heap and the whole
+//! receive/message seam **and the execution-trace seam**
+//! ([`trace_enabled`](ExecutionContext::trace_enabled) /
+//! [`trace_event`](ExecutionContext::trace_event)) — is forwarded to the slice's real
+//! [`RuntimeContext`] unchanged, so a scheduled process reports `call`/`return_from`/
+//! `return_to` events exactly as the single-pass `Runtime::run_*` path does.
 
 use beam_common::Result;
 use beam_engine::ExecutionContext;
@@ -95,7 +102,8 @@ impl BudgetProbe {
 /// machine **only**. That is what makes the recorded resume address exact and keeps a nested
 /// run from being mistaken for the pre-empted one.
 ///
-/// Everything else is forwarded unchanged; the redirect is purely mechanical.
+/// Everything else — the BIF/apply dispatch, the heap, the receive seam **and the
+/// execution-trace seam** — is forwarded unchanged; the redirect is purely mechanical.
 pub(super) struct BudgetContext<'c, 'a> {
     /// The slice's real context.
     pub(super) inner: &'c mut RuntimeContext<'a>,
@@ -177,5 +185,20 @@ impl ExecutionContext for BudgetContext<'_, '_> {
 
     fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
         ExecutionContext::receive_marker_clear(self.inner, reference)
+    }
+
+    /// Forwarded like every other method (the wrapper redirects only
+    /// [`ensure_heap`](ExecutionContext::ensure_heap)): the slice's machine latches this once
+    /// per run, so a **scheduled** process reports `call`/`return_from`/`return_to` exactly as
+    /// the single-pass `Runtime::run_*` path does.
+    #[inline]
+    fn trace_enabled(&self) -> bool {
+        ExecutionContext::trace_enabled(self.inner)
+    }
+
+    /// Forwarded like every other method (see [`trace_enabled`](ExecutionContext::trace_enabled)):
+    /// the slice's own context decides matching and delivers the `{trace, …}` message.
+    fn trace_event(&mut self, event: beam_engine::TraceEvent<'_>) {
+        ExecutionContext::trace_event(self.inner, event)
     }
 }
