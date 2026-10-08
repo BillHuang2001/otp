@@ -186,7 +186,7 @@ The API Surface section above owns the detail; each entry here is the module's o
 * `src/port/driver.rs` → the driver C ABI host (A.4): `DriverPort`/`Driver`/`load_driver`/`DriverPortAdapter` (see the API section).
 * `src/dist.rs` → the distributed node (A.5 phases 1–2): `DistNode`/`DistConnection`/`NodeName`/`resolve_cookie` + inbound delivery (`LocalDeliverySink`, `DistNode::dispatch_inbound`; see the API + Known-Issues sections).
 * `src/info.rs` + `src/info/` → the A.8 introspection surface (see [`src/info/CONTEXT.md`](src/info/CONTEXT.md) for the per-key catalog); `tests/system_info_oracle.rs` is the A.8 oracle comparison (shape + value vs the real `erl`; skips loudly without a toolchain).
-* `src/context/` → the concrete `ExecutionContext` glue (`mod.rs`, `bridges.rs`, `fun_identity.rs`, `tests.rs`, test-only `test_support.rs`) — see the API section.
+* `src/context/` → the concrete `ExecutionContext` glue (`mod.rs`, `bridges.rs`, `fun_identity.rs`, `process_bridge.rs`, `tests.rs`, test-only `test_support.rs`) — see the API section.
 * `src/timers.rs` → the runtime-local deadline min-heap behind `send_after/3` **and** finite `receive … after T`, advanced only by the scheduler loop.
 * `src/nif.rs` / `build.rs` → the live NIF libraries (A.3) and the `--export-dynamic` link arg (see the NIF section).
 * `src/native.rs` → the runtime-native BIF floor (`try_native`, consulted **before** the registry) + the child `src/native/{init,code,process,port,memory,application,erts_internal,prim,test_support}.rs` (see `src/native/CONTEXT.md`).
