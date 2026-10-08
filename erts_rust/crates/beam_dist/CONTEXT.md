@@ -266,10 +266,12 @@ Decisions).
 - `struct TcpListener` (wrapping `std::net::TcpListener`): `bind(addr)`/`local_addr`/`accept` (yields a
   `TcpTransport` with the read timeout + `TCP_NODELAY`)/`set_nonblocking`/`into_inner` — the server side.
 - Handshake driver (2-byte framing): `connect_client(t, our_name, cookie) -> Result<Handshake>`,
-  `connect_client_with_creation(t, our_name, cookie, creation) -> Result<Handshake>` and
-  `accept_server(t, our_name, cookie, creation) -> Result<Handshake>`, where
-  `struct Handshake { client_flags, server_flags, negotiated, peer_creation, peer_name, buffered }`.
-  `pub const CLIENT_CREATION: u32 = 0` is the default client creation.
+  `connect_client_with_creation(t, our_name, cookie, creation)`, `accept_server(t, our_name, cookie,
+  creation)`, plus the opt-in flag overrides `connect_client_with_flags(t, our_name, cookie, creation,
+  flags)` and `accept_server_with_flags(t, our_name, cookie, creation, flags)`, all
+  `-> Result<Handshake>`, where `struct Handshake { client_flags, server_flags, negotiated,
+  peer_creation, peer_name, peer_visibility, buffered }`. `pub const CLIENT_CREATION: u32 = 0` is the
+  default client creation. `Connection::peer_visibility()` reads the negotiated peer visibility.
 - `connect_to_node(host, node_name, our_name, cookie) -> Result<Connection<TcpTransport>>` (+
   `connect_to_node_with_creation`) — `epmd::lookup_port` → `TcpTransport::connect` → `Connection::client`.
 - Established link (4-byte framing): `struct Connection<T: Transport>` —
