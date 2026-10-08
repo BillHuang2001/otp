@@ -181,6 +181,24 @@ const CANONICAL: &[(&str, u32)] = &[
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub struct TraceFlags(u32);
 
+impl TraceFlags {
+    /// Whether the `call` process flag is set — the gate for the `call`/`return_from` event
+    /// family and the precondition for arming `return_to`.
+    pub(crate) fn has_calls(self) -> bool {
+        self.0 & CALL != 0
+    }
+
+    /// Whether the `return_to` process flag is set.
+    pub(crate) fn has_return_to(self) -> bool {
+        self.0 & RETURN_TO != 0
+    }
+
+    /// Whether the `arity` process flag is set (the `call` event carries the bare arity).
+    pub(crate) fn has_arity(self) -> bool {
+        self.0 & ARITY != 0
+    }
+}
+
 /// Decodes flag atoms into a [`TraceFlags`].
 ///
 /// The `all` atom expands to **every** base flag ([`ALL_BITS`]); repeated atoms are deduplicated
@@ -262,6 +280,23 @@ const PATTERN_CANONICAL: &[(&str, u32)] = &[
 /// [`pattern_flags_from_atoms`]/[`pattern_flags_to_atoms`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub struct PatternFlags(u32);
+
+impl PatternFlags {
+    /// Whether the `local` `trace_pattern` flag is set.
+    pub(crate) fn is_local(self) -> bool {
+        self.0 & PATTERN_LOCAL != 0
+    }
+
+    /// Whether the `global` `trace_pattern` flag is set.
+    pub(crate) fn is_global(self) -> bool {
+        self.0 & PATTERN_GLOBAL != 0
+    }
+
+    /// Whether the `silent` `trace_pattern` flag is set.
+    pub(crate) fn is_silent(self) -> bool {
+        self.0 & PATTERN_SILENT != 0
+    }
+}
 
 /// Decodes a `trace_pattern` `FlagList` into a [`PatternFlags`].
 ///
@@ -1016,6 +1051,53 @@ mod tests {
         "strict_monotonic_timestamp",
         "timestamp",
     ];
+
+    /// The `pub(crate)` accessors the execution-trace seam (`crate::context::trace`) reads:
+    /// each is exactly the private bit it names, and nothing else. The bits are internal, so
+    /// only the atom set is observable — the accessors are pinned against the decoders.
+    #[test]
+    fn the_flag_accessors_select_exactly_their_own_bit() {
+        let calls = flags_from_atoms(&["call"]).expect("call");
+        assert!(calls.has_calls());
+        assert!(!calls.has_return_to());
+        assert!(!calls.has_arity());
+
+        let return_to = flags_from_atoms(&["return_to"]).expect("return_to");
+        assert!(!return_to.has_calls());
+        assert!(return_to.has_return_to());
+
+        let arity = flags_from_atoms(&["arity"]).expect("arity");
+        assert!(arity.has_arity());
+        assert!(!arity.has_calls());
+
+        // `all` sets every base flag, so all three accessors answer `true`.
+        let all = flags_from_atoms(&["all"]).expect("all");
+        assert!(all.has_calls() && all.has_return_to() && all.has_arity());
+
+        // A default (no trace flags) answers `false` for every accessor.
+        let none = TraceFlags::default();
+        assert!(!none.has_calls() && !none.has_return_to() && !none.has_arity());
+
+        // The `trace_pattern` flags are a *different* atom set: none of the three accessors
+        // above may be reached through them, and each pattern accessor names its own bit.
+        let local = pattern_flags_from_atoms(&["local"]).expect("local");
+        assert!(local.is_local());
+        assert!(!local.is_global());
+        assert!(!local.is_silent());
+
+        let global = pattern_flags_from_atoms(&["global"]).expect("global");
+        assert!(global.is_global());
+        assert!(!global.is_local());
+        assert!(!global.is_silent());
+
+        let silent = pattern_flags_from_atoms(&["silent"]).expect("silent");
+        assert!(silent.is_silent());
+        assert!(!silent.is_local() && !silent.is_global());
+
+        // An empty `FlagList` is zero flags: every accessor is `false`.
+        let empty = pattern_flags_from_atoms(&[]).expect("[]");
+        assert!(!empty.is_local() && !empty.is_global() && !empty.is_silent());
+    }
 
     #[test]
     fn a_single_flag_round_trips_through_its_atom() {

@@ -61,7 +61,7 @@ mod module_info;
 mod persistent_term;
 mod process_bridge;
 mod runtime_hooks;
-#[cfg(test)]
+mod trace;#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests;
@@ -1487,5 +1487,26 @@ impl ExecutionContext for RuntimeContext<'_> {
         let (_queue, state) = self.mailbox_parts()?;
         state.clear(reference);
         Ok(())
+    }
+
+    /// Whether the running process requests the `call`/`return_from`/`return_to` execution
+    /// trace family (contract A.8).
+    ///
+    /// The engine asks this **once per run** and latches it into `Machine::trace_on`, so the
+    /// body ([`RuntimeContext::execution_trace_enabled`], in the sibling `context/trace.rs`)
+    /// is a single hash lookup and an untraced run pays one boolean.
+    fn trace_enabled(&self) -> bool {
+        self.execution_trace_enabled()
+    }
+
+    /// Report one execution-trace event (contract A.8).
+    ///
+    /// The body ([`RuntimeContext::execution_trace_event`], in the sibling `context/trace.rs`)
+    /// decides matching against the installed `erlang:trace_pattern/3` table and delivers the
+    /// `{trace, …}` message to the tracee's tracer. It is **infallible**: the engine ignores
+    /// this method's result, so an unresolvable name or an undeliverable event drops the
+    /// event rather than failing the traced program.
+    fn trace_event(&mut self, event: beam_engine::TraceEvent<'_>) {
+        self.execution_trace_event(event);
     }
 }
