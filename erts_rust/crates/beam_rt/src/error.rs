@@ -603,7 +603,9 @@ mod tests {
             "beam_rt_dumps",
         ))));
         assert_eq!(dump_slogan(&padded), None);
-    }    #[test]
+    }
+
+    #[test]
     fn unknown_info_key_is_bare_badarg() {
         assert!(matches!(unknown_info_key("nonsense"), BeamError::BadArg));
         assert_eq!(unknown_info_key("nonsense").as_atom(), Some("badarg"));
