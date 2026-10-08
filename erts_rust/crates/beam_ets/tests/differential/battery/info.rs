@@ -17,7 +17,7 @@ use beam_ets::{Access, Heir, OwnerId, SetOpt};
 impl Battery {
     /// `ets:info(T, Field)`: the reported value, or `badarg` for a key ETS does
     /// not report (the oracle raises rather than answering `undefined`).
-    fn info_field(&mut self, table: &Table, field: &str) -> BeamResult<Eterm> {
+    pub(super) fn info_field(&mut self, table: &Table, field: &str) -> BeamResult<Eterm> {
         let entries = table.info().entries(&mut self.atoms);
         match self.atoms.lookup(field) {
             Some(atom) => entries

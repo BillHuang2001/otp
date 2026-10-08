@@ -78,9 +78,12 @@
 //! multi-object kinds, and `ets:insert/2`-over-a-list atomicity);
 //! the **ownership** surface (`ets:give_away/3` success + the badarg cases, and the
 //! `{heir, ...}` option of `ets:setopts/2`); the **access-control** matrix
-//! (`protected`/`private`/`public` × owner/non-owner read/write/delete) and the
-//! `ets:setopts/2` option surface (only `{heir, ...}` is settable); the
-//! **reclamation-observable** semantics (repeated insert/delete churn and
+//! (`protected`/`private`/`public` × owner/non-owner over the whole operation
+//! set: the read-gated `lookup`/`tab2list`/`first`/`next`/`select`/`match_object`
+//! plus the read-gated `safe_fixtable/2`, the write-gated
+//! `insert`/`insert_new`/`delete`/`delete_object`/`delete_all_objects`/`take`/
+//! `select_delete`, and the **ungated** `ets:info/1,2`) and the
+//! `ets:setopts/2` option surface (only `{heir, ...}` is settable); the//! **reclamation-observable** semantics (repeated insert/delete churn and
 //! `delete_all_objects/1` pinned only by `size`/`member`/`lookup`/`tab2list`,
 //! never `memory` or `id`); and two
 //! 10 001-key tables (`set` + `ordered_set`) exercising size, lookups, the
@@ -139,8 +142,13 @@
 //! * **The access-control matrix is `Db_READ`/`Db_WRITE`**: the owner may always
 //!   read/write; a non-owner may read but not write a `protected` table, may do
 //!   neither on a `private` one, and may do both on a `public` one — every denial
-//!   is `badarg` (`access_control` pins all three modes × owner/non-owner).
-//! * **`ets:setopts/2` settables only `{heir, ...}`** on OTP 29:
+//!   is `badarg`. `access_control` pins all three modes × owner/non-owner over
+//!   the whole operation set: the reads (`lookup`/`tab2list`/`first`/`next`/
+//!   `select`/`match_object`), the read-gated `safe_fixtable/2` (a non-owner may
+//!   fix a `protected` table but not a `private` one), the writes (`insert`/
+//!   `insert_new`/`delete`/`delete_object`/`delete_all_objects`/`take`/
+//!   `select_delete`), and the **ungated** `ets:info/1`/`info/2` — which succeed
+//!   even for a non-owner of a `private` table, the discriminating fact.//! * **`ets:setopts/2` settables only `{heir, ...}`** on OTP 29:
 //!   `{write_concurrency,_}` / `{read_concurrency,_}` / `{decentralized_counters,_}`
 //!   and any unknown option raise `badarg` (they are `ets:new/2` options, not
 //!   runtime ones), and a non-owner `setopts` raises `badarg`
@@ -404,7 +412,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ("ownership_heir", "{none,ok:true,ok:true,none,badarg}"),
     (
         "access_control",
-        "{{ok:[{1,10}],ok:true,ok:true,ok:[{1,10}],badarg,badarg},{ok:[{1,10}],ok:true,ok:true,badarg,badarg,badarg},{ok:[{1,10}],ok:true,ok:true,ok:[{1,10}],ok:true,ok:true}}",
+        "{{{ok:[{1,10}],ok:[{1,10},{2,20}],ok:1,ok:2,ok:[{1,10},{2,20}],ok:[{1,10},{2,20}],ok:true,ok:[compressed,decentralized_counters,heir,id,keypos,memory,name,named_table,node,owner,protection,read_concurrency,size,type,write_concurrency],ok:2,ok:true,ok:false,ok:true,ok:true,ok:true,ok:[{1,10}],ok:2},{ok:[{1,10}],ok:[{1,10},{2,20}],ok:1,ok:2,ok:[{1,10},{2,20}],ok:[{1,10},{2,20}],ok:true,ok:[compressed,decentralized_counters,heir,id,keypos,memory,name,named_table,node,owner,protection,read_concurrency,size,type,write_concurrency],ok:2,badarg,badarg,badarg,badarg,badarg,badarg,badarg}},{{ok:[{1,10}],ok:[{1,10},{2,20}],ok:1,ok:2,ok:[{1,10},{2,20}],ok:[{1,10},{2,20}],ok:true,ok:[compressed,decentralized_counters,heir,id,keypos,memory,name,named_table,node,owner,protection,read_concurrency,size,type,write_concurrency],ok:2,ok:true,ok:false,ok:true,ok:true,ok:true,ok:[{1,10}],ok:2},{badarg,badarg,badarg,badarg,badarg,badarg,badarg,ok:[compressed,decentralized_counters,heir,id,keypos,memory,name,named_table,node,owner,protection,read_concurrency,size,type,write_concurrency],ok:2,badarg,badarg,badarg,badarg,badarg,badarg,badarg}},{{ok:[{1,10}],ok:[{1,10},{2,20}],ok:1,ok:2,ok:[{1,10},{2,20}],ok:[{1,10},{2,20}],ok:true,ok:[compressed,decentralized_counters,heir,id,keypos,memory,name,named_table,node,owner,protection,read_concurrency,size,type,write_concurrency],ok:2,ok:true,ok:false,ok:true,ok:true,ok:true,ok:[{1,10}],ok:2},{ok:[{1,10}],ok:[{1,10},{2,20}],ok:1,ok:2,ok:[{1,10},{2,20}],ok:[{1,10},{2,20}],ok:true,ok:[compressed,decentralized_counters,heir,id,keypos,memory,name,named_table,node,owner,protection,read_concurrency,size,type,write_concurrency],ok:2,ok:true,ok:false,ok:true,ok:true,ok:true,ok:[{1,10}],ok:2}}}",
     ),
     ("setopts_surface", "{ok:true,ok:true,badarg,badarg,badarg,badarg,badarg}"),
     (

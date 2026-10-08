@@ -305,6 +305,19 @@ impl TableAccess<'_> {
         Ok(self.table.is_empty())
     }
 
+    /// `ets:safe_fixtable/2`, requiring **read** access.
+    ///
+    /// The oracle gates `safe_fixtable/2` as a *read*, not a write (`db_get_table_aux`
+    /// with the `DB_READ` status mask): a non-owner may fix a `protected` or `public`
+    /// table but not a `private` one (verified against the system `erl`, OTP 29 /
+    /// erts-17.1). The underlying [`Table::set_fixation`] returns `()`; the checked
+    /// view returns `Result` so a denied call surfaces as `BeamError::BadArg` and, as
+    /// with every other check here, does **not** change the table's fixation state.
+    pub fn set_fixation(&mut self, fixed: bool) -> Result<()> {
+        self.table.check_read(self.requester)?;
+        self.table.set_fixation(fixed);
+        Ok(())
+    }
     // --------------------------------------------- limited / continuation forms
     //
     // The `/3` forms and their `/1` resumptions are all **reads**: they scan the

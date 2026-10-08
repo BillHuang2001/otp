@@ -1,10 +1,19 @@
-//! The **access-control** and **`ets:setopts/2` surface** case group.
+//! The **access-enforcement** case group and the **`ets:setopts/2` surface**.
 //!
 //! * `access_control` pins the `Db_READ`/`Db_WRITE` protection matrix of
-//!   `db_get_table_aux` (`../../erts/emulator/beam/erl_db.c`): the owner may
-//!   always read/write, a *non-owner* may read but not write a `protected`
-//!   table, may do neither on a `private` one, and may do both on a `public` one;
-//!   every denial is `badarg` with `cause => access`.
+//!   `db_get_table_aux` (`../../erts/emulator/beam/erl_db.c`) for the *whole*
+//!   observable operation set. For each mode × {owner, non-owner} it drives:
+//!   the read-gated operations (`lookup`/`tab2list`/`first`/`next`/`select`/
+//!   `match_object` and the read-gated `safe_fixtable/2`), the write-gated ones
+//!   (`insert`/`insert_new`/`delete`/`delete_object`/`delete_all_objects`/
+//!   `take`/`select_delete`), and the **ungated** introspection (`ets:info/1`
+//!   and `ets:info/2` succeed even for a non-owner of a `private` table — the
+//!   discriminating fact). Every operation runs on its **own** fresh, owner-seeded
+//!   `ordered_set`, so a mutation can never perturb a later operation's
+//!   observable; `ordered_set` (not `set`) is used so `first`/`next` are
+//!   deterministic. The crate re-checks the matrix in `TableAccess`
+//!   (`src/table/access.rs`) exactly like the oracle's status masks, and reports
+//!   `ets:info` **without** a requester check — which is the point.
 //! * `setopts_surface` pins the `ets:setopts/2` surface: on OTP 29 only
 //!   `{heir, Pid, Data}` / `{heir, none}` are settable, so every
 //!   `{write_concurrency,_}` / `{read_concurrency,_}` /
@@ -12,19 +21,17 @@
 //!   non-owner `setopts` raises `badarg`.
 //!
 //! The crate models the requester as an opaque [`OwnerId`] and enforces the
-//! matrix in `TableAccess` (`src/table/access.rs`), exactly like the oracle's
-//! status masks; the crate's `SetOpt` (see the `setopts_surface` comment) has no
-//! variant for the concurrency options, so their observable `badarg` is preserved
-//! by construction.
+//! matrix in `TableAccess` (`src/table/access.rs`); the crate's `SetOpt` (see the
+//! `setopts_surface` comment) has no variant for the concurrency options, so
+//! their observable `badarg` is preserved by construction.
 
 use super::*;
 use beam_ets::{Access, Heir, OwnerId, SetOpt};
 
 impl Battery {
-    /// The protection matrix for the three access modes, each as one 6-tuple
-    /// `{owner_read, owner_write, owner_delete, non_owner_read, non_owner_write,
-    /// non_owner_delete}` — the owner always succeeds, the non-owner only where the
-    /// mode admits it.
+    /// The protection matrix for the three access modes, each as one 2-tuple
+    /// `{owner_ops, non_owner_ops}` — the owner always succeeds, the non-owner
+    /// only where the mode admits it.
     fn access_control(&mut self) -> String {
         tuple_of(&[
             self.access_case(Access::Protected),
@@ -33,66 +40,191 @@ impl Battery {
         ])
     }
 
-    /// One protection mode: a table owned by process 1, exercised by the owner
-    /// (process 1) and by a different process (2).
+    /// One protection mode: the whole operation set is run by the owner and by a
+    /// different process, each on its own fresh, owner-seeded table.
     fn access_case(&mut self, access: Access) -> String {
         let owner = OwnerId::new(1);
         let other = OwnerId::new(2);
+        let as_owner = self.access_ops(access, owner, Some(owner));
+        let as_non_owner = self.access_ops(access, owner, Some(other));
+        tuple_of(&[as_owner, as_non_owner])
+    }
+
+    /// The freshly created, owner-seeded table one operation runs on. The
+    /// `ordered_set` kind makes `first`/`next` deterministic (a `set`'s
+    /// navigation order is unspecified, so its keys could not be rendered).
+    fn access_seeded_table(&mut self, access: Access, owner: OwnerId) -> Table {
         let mut options = TableOptions::new();
-        options.set_kind(TableKind::Set).set_access(access);
+        options.set_kind(TableKind::OrderedSet).set_access(access);
         let mut table = Table::new(TableId::next(), options).expect("a fresh table");
         table.set_owner(Some(owner));
+        let first = self.object(1, 10);
+        let second = self.object(2, 20);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
         table
-            .insert(self.object(1, 10), &self.atoms)
-            .expect("insert");
+    }
 
-        // The owner: read, write and delete all succeed.
-        let own_read = cap_terms(
-            table
-                .as_requester(Some(owner))
-                .lookup(make_small(1), &self.atoms),
-            &self.atoms,
-        );
-        let own_write_object = self.object(2, 20);
-        let own_write = cap_unit(
-            table
-                .as_requester(Some(owner))
-                .insert(own_write_object, &self.atoms),
-        );
-        let own_delete = cap_unit(
-            table
-                .as_requester(Some(owner))
-                .delete(make_small(2), &self.atoms),
-        );
+    /// The compiled `[{{'_','_'},[],['$_']}]` — the whole-object select.
+    fn every_object_spec(&mut self) -> MatchSpec {
+        let underscore = self.atom("_");
+        let whole = self.atom("$_");
+        let head = self.tuple(&[underscore, underscore]);
+        let body = self.list(&[whole]);
+        let spec = self.spec(head, NIL, body);
+        compile(spec, &self.atoms).expect("the wildcard spec compiles")
+    }
 
-        // A different process: `protected` allows the read, `private` denies
-        // everything, `public` allows everything; every denial is `badarg`.
-        let non_read = cap_terms(
-            table
-                .as_requester(Some(other))
-                .lookup(make_small(1), &self.atoms),
-            &self.atoms,
-        );
-        let non_write_object = self.object(3, 30);
-        let non_write = cap_unit(
-            table
-                .as_requester(Some(other))
-                .insert(non_write_object, &self.atoms),
-        );
-        let non_delete = cap_unit(
-            table
-                .as_requester(Some(other))
-                .delete(make_small(1), &self.atoms),
-        );
+    /// The compiled `[{{'_','_'},[],[true]}]` — the delete-everything spec.
+    fn delete_all_spec(&mut self) -> MatchSpec {
+        let underscore = self.atom("_");
+        let truth = self.atom("true");
+        let head = self.tuple(&[underscore, underscore]);
+        let body = self.list(&[truth]);
+        let spec = self.spec(head, NIL, body);
+        compile(spec, &self.atoms).expect("the delete-all spec compiles")
+    }
 
-        tuple_of(&[
-            own_read,
-            own_write,
-            own_delete,
-            non_read,
-            non_write,
-            non_delete,
-        ])
+    /// The `{'_','_'}` pattern term matching every 2-tuple object.
+    fn wildcard_object(&mut self) -> Eterm {
+        let underscore = self.atom("_");
+        self.tuple(&[underscore, underscore])
+    }
+
+    /// Every operation of the matrix, in the oracle's order, run by `requester`
+    /// and each on its own fresh table. Reads come first, then the writes — but
+    /// the fresh table per operation is what actually makes the observables
+    /// independent.
+    fn access_ops(&mut self, access: Access, owner: OwnerId, requester: Option<OwnerId>) -> String {
+        let mut ops: Vec<String> = Vec::with_capacity(16);
+
+        // ------------------------------------------------ reads (read-gated)
+
+        // ets:lookup/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let view = table.as_requester(requester);
+            ops.push(cap_terms(
+                view.lookup(make_small(1), &self.atoms),
+                &self.atoms,
+            ));
+        }
+        // ets:tab2list/1
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let view = table.as_requester(requester);
+            ops.push(cap_srt(view.tab2list(), &self.atoms));
+        }
+        // ets:first/1
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let view = table.as_requester(requester);
+            ops.push(cap_opt(view.first(&self.atoms), &self.atoms));
+        }
+        // ets:next/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let view = table.as_requester(requester);
+            ops.push(cap_opt(view.next(make_small(1), &self.atoms), &self.atoms));
+        }
+        // ets:select/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let spec = self.every_object_spec();
+            let view = table.as_requester(requester);
+            ops.push(cap_srt(
+                view.select(&spec, &self.atoms, &mut self.out),
+                &self.atoms,
+            ));
+        }
+        // ets:match_object/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let pattern = self.wildcard_object();
+            let view = table.as_requester(requester);
+            ops.push(cap_srt(
+                view.match_object(pattern, &self.atoms, &mut self.out),
+                &self.atoms,
+            ));
+        }
+        // ets:safe_fixtable/2 — read-gated, not write-gated.
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let mut view = table.as_requester(requester);
+            ops.push(cap_unit(view.set_fixation(true)));
+        }
+        // ets:info/1 — ungated: reported off the table with no requester check.
+        {
+            let table = self.access_seeded_table(access, owner);
+            let entries = table.info().entries(&mut self.atoms);
+            let keys: Vec<Eterm> = entries.iter().map(|(name, _)| make_atom(*name)).collect();
+            ops.push(cap_srt(Ok(keys), &self.atoms));
+        }
+        // ets:info/2 — likewise ungated (the `size` field, the discriminating
+        // fact for a non-owner of a `private` table).
+        {
+            let table = self.access_seeded_table(access, owner);
+            let size = self.info_field(&table, "size");
+            ops.push(cap_value(size, &self.atoms));
+        }
+
+        // ----------------------------------------------- writes (write-gated)
+
+        // ets:insert/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let object = self.object(3, 30);
+            let mut view = table.as_requester(requester);
+            ops.push(cap_unit(view.insert(object, &self.atoms)));
+        }
+        // ets:insert_new/2 (an existing key ⇒ false when permitted)
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let object = self.object(1, 99);
+            let mut view = table.as_requester(requester);
+            ops.push(cap_bool(view.insert_new(object, &self.atoms)));
+        }
+        // ets:delete/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let mut view = table.as_requester(requester);
+            ops.push(cap_unit(view.delete(make_small(1), &self.atoms)));
+        }
+        // ets:delete_object/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let object = self.object(1, 10);
+            let mut view = table.as_requester(requester);
+            ops.push(cap_unit(view.delete_object(object, &self.atoms)));
+        }
+        // ets:delete_all_objects/1
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let mut view = table.as_requester(requester);
+            ops.push(cap_unit(view.delete_all_objects()));
+        }
+        // ets:take/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let mut view = table.as_requester(requester);
+            ops.push(cap_terms(
+                view.take(make_small(1), &self.atoms),
+                &self.atoms,
+            ));
+        }
+        // ets:select_delete/2
+        {
+            let mut table = self.access_seeded_table(access, owner);
+            let spec = self.delete_all_spec();
+            let mut view = table.as_requester(requester);
+            ops.push(cap_count(view.select_delete(
+                &spec,
+                &self.atoms,
+                &mut self.out,
+            )));
+        }
+
+        tuple_of(&ops)
     }
 
     /// The `ets:setopts/2` surface (see the module docs).
