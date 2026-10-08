@@ -170,8 +170,9 @@ join_hints_unchanged(Config) ->
     %% The source is a sub-term of another term, extracted with element/1:
     %% not freshly allocated, so it may be shared with whatever the caller
     %% passed in.
-    unchanged(Builds, join_extracted, 1, {atom,copy}),
+    unchanged(Builds, join_extracted, 1, {atom,reuse}),
     ok.
+
 %% The unsafe witnesses. None of them may be rewritten, and - even more
 %% importantly - the option must not change their hint at all. The
 %% function-argument source is expected to keep the `reuse' that the
@@ -239,6 +240,7 @@ probe_source(Mod) ->
     ["-module(", Mod, ").\n",
      "-export([mk/1,safe/1,sent/1,captured/1,used_twice/1,arg_src/1,\n",
      "         join/1,join_used_twice/1,join_arg/1,join_extracted/1,\n",
+     "         recv_after/1,\n",
      "         lit_inline/1,lit_var/1,lit_case/1]).\n",
      "\n",
      "%% The literal-source probes below update a known-at-compile-time\n",
@@ -290,7 +292,21 @@ probe_source(Mod) ->
      "    Y = case T of true -> 1; _ -> 2 end,\n",
      "    R0 = element(1, T),\n",
      "    R0#r{b=Y}.\n",
-     "\n",     "%% UNSAFE: the value is handed to another process before the update, so\n",
+     "\n",
+     "%% SAFE (widened position rule): the source is defined and updated\n",
+     "%% around a `receive' whose blocks contain a real CFG cycle (the\n",
+     "%% compiler-generated peek/skip loop). The update block itself is off\n",
+     "%% the cycle, so it is dominated by the definition block and no cycle\n",
+     "%% through it avoids the definition block - the pass must still accept\n",
+     "%% it. The pattern can never match (the ref is fresh), so `after 0'\n",
+     "%% always runs and the function is deterministic and non-blocking.\n",
+     "recv_after(X) ->\n",
+     "    Ref = make_ref(),\n",
+     "    V = receive {msg, Ref} -> 1 after 0 -> 2 end,\n",
+     "    R0 = mk(X),\n",
+     "    R0#r{b=V}.\n",
+     "\n",
+     "%% UNSAFE: the value is handed to another process before the update, so\n",
      "%% the update must copy.\n",
      "sent(X) ->\n",
      "    R0 = mk(X),\n",
@@ -430,7 +446,9 @@ cases() ->
                    {s,1,2,3}, {r,1,2}, 42, not_a_record]},
      {lit_inline, [0, ignored]},
      {lit_var,    [0, ignored]},
+     {recv_after, [0, 42, x, [1,2], {a,b}]},
      {lit_case,   [1, 2, other, 0]}].
+
 %% Call `Fun(Arg)' in every build and check that both builds return exactly
 %% the expected result or exception, and that they agree with each other.
 check_calls(Builds, Fun, Args) ->
@@ -456,7 +474,11 @@ expected(join_used_twice, X) ->
 expected(join_arg, {r,A,_B,C}) -> {ok,{r,A,2,C}};
 expected(join_arg, Other) -> {error,{badrecord,Other}};
 expected(join_extracted, {{r,A,_B,C},_}) -> {ok,{r,A,2,C}};
-expected(join_extracted, _Other) -> {error,badarg};expected(sent, X) -> {ok,{r,X,1,undefined}};expected(captured, X) -> {ok,{{r,X,1,undefined},{r,X,undefined,undefined}}};
+expected(join_extracted, _Other) -> {error,badarg};
+expected(recv_after, X) -> {ok,{r,X,2,undefined}};
+expected(sent, X) -> {ok,{r,X,1,undefined}};
+expected(captured, X) ->
+    {ok,{{r,X,1,undefined},{r,X,undefined,undefined}}};
 expected(used_twice, X) -> {ok,{{r,X,undefined,undefined},{r,X,1,undefined}}};
 expected(arg_src, {r,_A,B,C}) -> {ok,{r,1,B,C}};
 expected(arg_src, Other) -> {error,{badrecord,Other}};
