@@ -267,6 +267,16 @@ A fragment is a bump-allocated `beam_alloc::Heap` region **outside** every proce
   `next_heap_size(stack + MAX(size_before, need), 0)` with `size_before` the **pre-collection usage**
   (`erl_gc.c:1493`), so a nursery a round left mostly empty **shrinks** — the rule the pressure tests
   depend on (a test that must keep a large nursery alive raises `min_heap_words`).
+- **On-demand growth is an explicit seam, not a collect side effect.** Growth of the young/mature space
+  normally happens *only* inside a collection (the resizes above); `ensure_capacity(need_words, roots)`
+  (on `Collector`/`GenImmixCollector`/`AnyCollector`) adds the caller-driven path a runtime needs when the
+  mutator demands room: it collects once to reclaim, then grows the now-empty nursery to the smallest
+  curated size covering `need_words` (`grow_nursery`, one bounded step — no loop), returning the
+  `Collection` it ran. It cannot "collect until it fits" because `young_after_collection` sizes the next
+  nursery from the *previous* round's usage — after a collection the nursery is empty, so further collects
+  would shrink it; the explicit grow is the only way to reach an arbitrary request. A `max_heap_words` cap
+  that cannot reach `need_words` yields a typed `heap_exhausted` before any copy.
+  `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap" (see Handoffs for the `beam_rt` adoption).
 - **Fragments are collector-side and additive — "materialize then collect".** A `HeapFragment` is a bump
   region outside every process space plus its own `OffHeap`. The collector cannot relocate a term it does
   not own, so `FragmentRoots::materialize` / `FragmentChain::copy_roots_into` first copy fragment-resident
