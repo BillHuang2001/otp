@@ -6,6 +6,7 @@ in each `src/*.rs` module). Nothing here is production code; each file is one to
 its module docs, the guarantee it pins and how it is made non-flaky.
 
 ## API Surface (what each file pins)
+Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
 1. `scheduler.rs` — pid allocation (+ serial bump on reuse, stale-pid rejection); round-robin
    scheduling order (one slice each, requeued at the tail on `Yield`, `Wait` leaves the queue);
    resume-on-send (blocked receiver re-enqueued in the same slice) + a two-process counter ping-pong.
@@ -21,44 +22,77 @@ its module docs, the guarantee it pins and how it is made non-flaky.
    (`priority`/`sensitive`/`save_calls`).
 6. `pending_signals.rs` — deferred (schedule-in) vs eager application, FIFO across senders, a
    structured reason surviving `collect`.
-7. `ports.rs` — `PortTable` relationship round-trips + `ProcessTable::port_closed` (`{'DOWN', …}` for
-   a monitor, `{'EXIT', Port, Reason}` for a trapping linked process, termination for a non-trapping
-   one, unknown port rejected).
-8. `remote.rs` — an external pid links/monitors via the same table entry points, is recorded
-   separately, and every change is handed to a recording `DistSignalRouter`; `node_down` resolves then
-   purges.
-9. `dict.rs` — `Dict` semantics on the PCB + a structured dict value surviving `collect`.
-10. `fragments.rs` — saved args surviving `collect` + all sub-rootsets relocating in one collect.
-11. `smp.rs` (11 tests) — the SMP pool: N-on-M-scheduler progress (M ∈ {1,4}, 200 pids each, each
-    process running `YIELDS + 1` runner invocations and **one** recorded slice); work stealing (a
-    parked peer steals half of 128 woken receivers); a timer into a blocked receiver;
-    `deliver_simple` wake; a dirty `Reschedule` round trip; lifecycle/observables
-    (`stats`/`scheduler_stats` one entry per scheduler, `run_queue_len` under a gated runner,
-    `shutdown`+`join` returns); a one-scheduler config runs to completion.
-12. `lock_scope.rs` (3 tests) — the **bounded-quantum table lock**: a slice is serviced as
-    `ceil(reductions_per_slice / lock_quantum)` runner invocations (one slice, not one per
-    invocation; `lock_quantum == budget` reproduces the coarse one-lock-hold-per-slice behavior); a
-    cross-thread send is serviced inside another process's slice and the woken peer runs **inside**
-    that slice (both interleaving assertions fail under a whole-slice lock); and the same program
-    keeps the same per-sender message order and `{'EXIT', …}` placement on 1 and 4 schedulers.
-13. `timers.rs` — fire-into-sink with the exact target/message, deadline order (equal deadlines in
-    insertion order), `cancel` prevents + is idempotent, `pending`/`next_deadline`, pre-`start`
-    scheduling, `shutdown`/`join`.
-14. `dirty.rs` — jobs run on dirty worker threads and every completion is routed verbatim
-    (`Reschedule`/`Deliver`), `pending` rises/drains, N-worker concurrency (a `Barrier`), lifecycle +
-    submit-after-shutdown, a 0-worker pool buffers and discards at join, sink-after-submit, a
-    panicking job does not kill the pool, and a repeated `DirtyPool::start(1, 0)` + `join()` loop.
-15. `progress.rs` — `wait` returns only after every active thread reaches the generation (also
-    immediately when already there, and invoking the waker), inactive-thread exclusion (reactivation
-    re-includes), concurrent `bump`s each happen once, `block`/`unblock` nest, `safepoint` never
-    blocks on the caller's own slot, a clone shares the registry/generation/blocking state.
-16. `dict_oracle.rs` (12 tests) — the process dictionary **cross-checked against the real `erl`**
+7. `preemption.rs` — reduction-quantum fairness with **exact measured slice counts** (2/3/4
+   processes interleave strictly round-robin, within one slice of each other; `Wait` leaves the
+   ready queue; `Yield` requeues at the process's own **current** priority). Also pinpoints the truth
+   that Milestone-1 pre-emption is **cooperative only**: the schedule is invariant under the
+   reduction budget, and the "a runner never returns hangs the scheduler" failure mode is stated as
+   an `#[ignore]`d test (it cannot be exercised without hanging the suite).
+8. `dict.rs` — `Dict` semantics on the PCB + a structured dict value surviving `collect`.
+9. `fragments.rs` — saved args surviving `collect` + all sub-rootsets relocating in one collect.
+10. `dict_oracle.rs` (12 tests) — the process dictionary **cross-checked against the real `erl`**
     (OTP 29.1.1 on `PATH`; the suite **skips loudly** when it is absent): the boxed-key reproducer
     (`put({a},1), get({a})` ⇒ `1`) plus tuple/list/map/binary/atom/integer/float keys, `erase` by a
     structurally equal key, repeated puts replacing in place, `get_keys_for_value` with a boxed value,
     a nested composite key, similar-but-unequal keys staying distinct, and `get_keys` key-set
     agreement. Each assertion is the oracle's own answer (a tiny text protocol over `erl -noshell
     -eval`), so it pins the C's `EQ` key/value equality, not just internal consistency.
+11. `registry_monitors.rs` — the local name registry (`register`/`unregister`/`whereis`/`registered`/
+    `name_of`, incl. the `badarg` for a dead pid or an unregistered name), liveness
+    (`is_process_alive`) and exit-reason observability, a monitor of a dead/never-existing target
+    (immediate `noproc` DOWN), a monitor of a registered **name** (the `{Name, Node}` target and the
+    no-local-node typed diagnostic), and the flushed demonitor. The `oracle_*` tests drive the real
+    `erl` and skip loudly when it is absent.
+12. `capability_inventory.rs` — the crate's **typed-error / capability inventory** (objective items
+    2/6/8): the atom-target monitor with no local node installed ⇒ the exact `unsupported`; the
+    `erlang:monitor/2` **type dispatch** (`time_offset`/unknown ⇒ no kind ⇒ the oracle's `badarg`);
+    a non-pid/non-atom/non-port target ⇒ `badarg`; `monitor(port, NotAPort)` ⇒ `badarg`; external-pid
+    operations with **no** `DistSignalRouter` ⇒ documented record-only behaviour (no fabricated
+    message); a relationship mutation on an **unallocated** port ⇒ `badarg` with no side effect; and
+    the live port monitor recorded on both halves (`demonitor_port` removes them; `port_closed`
+    delivers `{'DOWN', Ref, port, Port, Reason}`).
+13. `process_info_source.rs` — the `erlang:process_info/2` **item → accessor** table, derived from
+    this crate's public API alone: `status`/`registered_name`/`message_queue_len`/`links`/`monitors`/
+    `monitored_by`/`trap_exit`/`priority`/`reductions`, with the oracle's `[]`/`undefined`
+    conventions (e.g. `registered_name` is `[]` when unregistered, `status` is `undefined` for a dead
+    pid).
+14. `spawn_options.rs` — the **full spawn-option composition** this crate is responsible for:
+    `alloc_pid` + `HeapPolicy::from_spawn_opts(min_heap, min_bin_vheap, fullsweep)` +
+    `Process::with_policy_and_priority` + `ProcessTable::insert` + priority-correct enqueue, and
+    `{link,_}`/`{monitor,_}` through the table. The applied heap policy is proven to have reached the
+    collector honestly via `Collector::policy()` (and its `fullsweep_due`/initial-space sizing). This
+    is the contract the sibling `beam_rt`/`beam_bifs` spawn-option path adopts.
+15. `ports.rs` — `PortTable` relationship round-trips + `ProcessTable::port_closed` (`{'DOWN', …}` for
+    a monitor, `{'EXIT', Port, Reason}` for a trapping linked process, termination for a non-trapping
+    one, unknown port rejected).
+16. `remote.rs` — an external pid links/monitors via the same table entry points, is recorded
+    separately, and every change is handed to a recording `DistSignalRouter`; `node_down` resolves then
+    purges.
+SMP pool:
+17. `smp.rs` (11 tests) — the SMP pool: N-on-M-scheduler progress (M ∈ {1,4}, 200 pids each, each
+    process running `YIELDS + 1` runner invocations and **one** recorded slice); work stealing (a
+    parked peer steals half of 128 woken receivers); a timer into a blocked receiver;
+    `deliver_simple` wake; a dirty `Reschedule` round trip; lifecycle/observables
+    (`stats`/`scheduler_stats` one entry per scheduler, `run_queue_len` under a gated runner,
+    `shutdown`+`join` returns); a one-scheduler config runs to completion.
+18. `lock_scope.rs` (3 tests) — the **bounded-quantum table lock**: a slice is serviced as
+    `ceil(reductions_per_slice / lock_quantum)` runner invocations (one slice, not one per
+    invocation; `lock_quantum == budget` reproduces the coarse one-lock-hold-per-slice behavior); a
+    cross-thread send is serviced inside another process's slice and the woken peer runs **inside**
+    that slice (both interleaving assertions fail under a whole-slice lock); and the same program
+    keeps the same per-sender message order and `{'EXIT', …}` placement on 1 and 4 schedulers.
+19. `timers.rs` — fire-into-sink with the exact target/message, deadline order (equal deadlines in
+    insertion order), `cancel` prevents + is idempotent, `pending`/`next_deadline`, pre-`start`
+    scheduling, `shutdown`/`join`.
+20. `dirty.rs` — jobs run on dirty worker threads and every completion is routed verbatim
+    (`Reschedule`/`Deliver`), `pending` rises/drains, N-worker concurrency (a `Barrier`), lifecycle +
+    submit-after-shutdown, a 0-worker pool buffers and discards at join, sink-after-submit, a
+    panicking job does not kill the pool, and a repeated `DirtyPool::start(1, 0)` + `join()` loop.
+21. `progress.rs` — `wait` returns only after every active thread reaches the generation (also
+    immediately when already there, and invoking the waker), inactive-thread exclusion (reactivation
+    re-includes), concurrent `bump`s each happen once, `block`/`unblock` nest, `safepoint` never
+    blocks on the caller's own slot, a clone shares the registry/generation/blocking state.
+
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
@@ -68,12 +102,24 @@ its module docs, the guarantee it pins and how it is made non-flaky.
 - `lock_scope.rs` is the **only** file with wall-clock bounds; they are deliberately loose and
   two-sided (a cross-thread send must be serviced far below the slice's duration, and the slice must
   last far above that bound — the anti-vacuity guard).
+- The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, and the `erl` cross-checks in
+  `capability_inventory.rs`) **skip loudly** when `erl` is absent, and must never spawn a child
+  process that inherits `erl`'s stderr (a captured-stderr pipe blocks until the child dies — the
+  probes are written child-free).
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here.
+  `../../../tools/differential/` harness, not here. Current: **312 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
-- `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`, `dict.rs`, `fragments.rs` → the single-threaded scheduler, mailbox, signals, GC roots and PCB state
-- `dict_oracle.rs` → the process-dictionary equality/iteration evidence, cross-checked against the real `erl` (loud skip when absent)- `ports.rs`, `remote.rs` → the port table and distributed links/monitors
-- `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see `../src/smp/CONTEXT.md`)
+- `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
+  `preemption.rs`, `dict.rs`, `fragments.rs` → the single-threaded scheduler, mailbox, signals, GC
+  roots, PCB state and pre-emption/fairness
+- `registry_monitors.rs`, `capability_inventory.rs`, `process_info_source.rs`, `spawn_options.rs` →
+  the process-control surface: name registry + monitors, the typed-error/capability inventory, the
+  `process_info` item→accessor mapping, and the spawn-option composition
+- `dict_oracle.rs`, `registry_monitors.rs` (oracle tests) → `erl`-cross-checked process-dictionary and
+  process-control evidence (loud skip when `erl` is absent)
+- `ports.rs`, `remote.rs` → the port table and distributed links/monitors
+- `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
+  `../src/smp/CONTEXT.md`)
