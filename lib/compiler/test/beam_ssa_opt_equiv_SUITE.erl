@@ -42,9 +42,13 @@
 %% equivalence machinery), and measures compilation time plus the execution
 %% time of each kernel (several batches, minimum taken to reduce noise). It
 %% hard-asserts only that the ON build is not catastrophically slower
-%% (`ON =< OFF * 2'); whether the passes actually make a kernel faster is
+%% (`ON =< OFF * 2'). Whether the passes actually make a kernel faster is
 %% reported, not asserted, because the opt-in passes may legitimately not
-%% change a given kernel at all.
+%% change a given kernel at all. The final "ON faster: yes/no" verdict is
+%% derived from the measured numbers: the aggregate execution time (the sum of
+%% the per-kernel minima) of the ON build against the OFF build, so it reports
+%% `no' when the ON build is slower in total even if some individual kernel is
+%% faster. The number of kernels that are faster is printed alongside it.
 %%
 -module(beam_ssa_opt_equiv_SUITE).
 
@@ -111,9 +115,10 @@ all_passes_equivalence(Config) ->
 
 %% Compile the kernel probe with all three passes OFF and ON, check that both
 %% builds behave identically, and measure compilation time as well as the
-%% execution time of every kernel. Reports the per-kernel numbers and a final
-%% "ON faster: yes/no" verdict; hard-asserts only that the ON build is not
-%% catastrophically slower than the OFF build.
+%% execution time of every kernel. Reports the per-kernel numbers, how many
+%% kernels are faster with the passes ON, and a final "ON faster: yes/no"
+%% verdict derived from the aggregate ON vs OFF execution time; hard-asserts
+%% only that the ON build is not catastrophically slower than the OFF build.
 benchmark(Config) ->
     ModBase = "beam_ssa_opt_bench",
     Dir = tmp_dir(Config),
@@ -134,8 +139,18 @@ benchmark(Config) ->
     Changed = disasm(OffBin) =/= disasm(OnBin),
     TotalOffUs = lists:sum([OffUs || {_, _, OffUs, _} <- Rows]),
     TotalOnUs = lists:sum([OnUs || {_, _, _, OnUs} <- Rows]),
-    AnyFaster = lists:any(fun({_, _, OffUs, OnUs}) -> OnUs < OffUs end, Rows),
-    Verdict = case AnyFaster of true -> "yes"; false -> "no" end,
+    %% The verdict is derived from the measured numbers, not from whether some
+    %% single kernel happened to be faster: the aggregate over all kernels is
+    %% what the passes are supposed to improve, so a build that is slower in
+    %% total must be reported as such. Both the aggregate and the per-kernel
+    %% count are reported; the verdict is never asserted (the opt-in passes
+    %% may legitimately not change a given kernel at all).
+    FasterCount = length([ok || {_, _, OffUs, OnUs} <- Rows, OnUs < OffUs]),
+    KernelCount = length(Rows),
+    Verdict = case TotalOnUs < TotalOffUs of
+                  true -> "yes";
+                  false -> "no"
+              end,
 
     ct:pal("~n=== beam_ssa_opt benchmark (~s) ===", [ModBase]),
     ct:pal("passes changed generated code: ~p", [Changed]),
@@ -151,7 +166,10 @@ benchmark(Config) ->
     ct:pal("total         ~11.3f ~11.3f ~10s",
            [TotalOffUs / 1000, TotalOnUs / 1000,
             speedup_text(TotalOffUs, TotalOnUs)]),
-    ct:pal("VERDICT: ON faster: ~s", [Verdict]),
+    ct:pal("kernels faster ON: ~w of ~w", [FasterCount, KernelCount]),
+    ct:pal("VERDICT: ON faster: ~s (aggregate ~.3f ms ON vs ~.3f ms OFF over ~w kernels, speedup ~s)",
+           [Verdict, TotalOnUs / 1000, TotalOffUs / 1000, KernelCount,
+            speedup_text(TotalOffUs, TotalOnUs)]),
     ok.
 
 %% Compile the equivalence probe with the pass options `PassOpts' OFF and ON
