@@ -1,0 +1,5 @@
+Error! Failed to eval: T = ets:new(t,[ordered_set,public]), ets:insert(T,{1,a}), ets:insert(T,{1.0,b}), io:format("oset size=~p list=~p~n",[ets:size(T),ets:tab2list(T)]), S=ets:new(s,[set,public]), ets:insert(S,{1,a}), ets:insert(S,{1.0,b}), io:format("set size=~p list=~p~n",[ets:size(S),ets:tab2list(S)]), halt().
+
+Runtime terminating during boot ({undef,[{ets,size,[#Ref<0.1609940375.252051457.93954>],[]},{erl_eval,do_apply,7,[{file,"erl_eval.erl"},{line,1044}]},{erl_eval,expr,6,[{file,"erl_eval.erl"},{line,441}]},{erl_eval,expr_list,7,[{file,"erl_eval.erl"},{line,1664}]},{erl_eval,expr_list,5,[{file,"erl_eval.erl"},{line,1660}]},{erl_eval,expr,6,[{file,"erl_eval.erl"},{line,754}]},{erl_eval,exprs,6,[{file,"erl_eval.erl"},{line,276}]},{init,start_it,1,[]}]})
+
+Crash dump is being written to: erl_crash.dump...done
