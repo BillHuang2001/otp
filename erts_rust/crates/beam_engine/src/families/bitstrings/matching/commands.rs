@@ -5,7 +5,7 @@
 //! the commands and is written back into the context once the whole list has
 //! succeeded. `ensure_at_least`/`ensure_exactly` only test; the reads snapshot a
 //! value into a register.
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
@@ -28,7 +28,7 @@ use super::reads::read_integer_field;
 pub(crate) fn run_commands(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     ctx_op: &Operand,
     commands: &[Operand],

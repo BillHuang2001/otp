@@ -8,9 +8,9 @@
 
 use std::collections::BTreeMap;
 
-use beam_loader::{Instr, Label, Module};
+use beam_loader::{Instr, Module};
 
-use crate::interpreter;
+use crate::interpreter::{self, LabelMap};
 use crate::machine::MAX_REGISTER;
 
 use super::aggregate::{
@@ -64,7 +64,7 @@ pub(crate) fn allocate_registers(
 /// [`allocate_registers`] against an already-built module-wide label map.
 fn allocate_registers_with_labels(
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     code: &[Instr],
     start: usize,
     end: usize,
@@ -126,7 +126,7 @@ fn allocate_registers_with_labels(
 /// instruction contributes nothing because it stays on the helper.
 fn cacheable_touches(
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
 ) -> Vec<u32> {
     let mut touches = Vec::new();

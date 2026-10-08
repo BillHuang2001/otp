@@ -2,7 +2,7 @@
 //! and its lowering (the section comment below documents exactly which switches the
 //! tier may lower natively).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Instr, Label, Operand, NO_FAIL};
@@ -62,7 +62,7 @@ pub(super) struct SelectPlan {
 /// (a `NO_FAIL` switch, a non-immediate alternative, an unresolved label, a
 /// scrutinee the tier cannot read word-exactly). See the section comment above.
 pub(super) fn select_val_plan(
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     value: &Operand,
     fail: Label,
     pairs: &[(Operand, Label)],
@@ -72,14 +72,14 @@ pub(super) fn select_val_plan(
         return None;
     }
     // An unresolved label keeps the interpreter's exact `unknown_label`.
-    let fail = *labels.get(&fail)?;
+    let fail = labels.resolve(fail).ok()?;
     // The scrutinee must be an x-register in bound, or an immediate constant.
     let scrutinee = test_src(value)?;
     // Every alternative must be an immediate constant with a resolved target.
     let mut cases = Vec::with_capacity(pairs.len());
     for (candidate, label) in pairs {
         let word = constant_word(candidate)?;
-        let target = *labels.get(label)?;
+        let target = labels.resolve(*label).ok()?;
         cases.push((word, target));
     }
     Some(SelectPlan {
@@ -97,7 +97,7 @@ pub(super) fn select_val_plan(
 /// `jit_step_one`.
 pub(super) fn try_inline_select_val(
     buffer: &mut CodeBuffer,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     linker: &Linker<'_>,
     instr: &Instr,
     allocation: &Allocation,

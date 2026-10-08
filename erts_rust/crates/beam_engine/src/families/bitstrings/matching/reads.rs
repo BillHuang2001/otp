@@ -4,7 +4,7 @@
 //! (`erts_bs_get_float_2`), the UTF-8/16/32 decoders and their skip variants, plus
 //! the pure bit-level arithmetic they are built on. Everything here is plain safe
 //! `&[u8]` arithmetic; the only frozen-header access is through [`raw`].
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
@@ -24,7 +24,7 @@ use super::match_ctx::read_ctx;
 pub(crate) fn skip_utf(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     ctx: &mut dyn ExecutionContext,
     ctx_op: &Operand,
     fail: Label,

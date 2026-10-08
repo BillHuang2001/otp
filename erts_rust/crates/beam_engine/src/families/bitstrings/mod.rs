@@ -42,7 +42,7 @@ mod matching;
 #[allow(unsafe_code)]
 mod raw;
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
@@ -76,7 +76,7 @@ pub(super) const BSF_NATIVE: u32 = 16;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -105,7 +105,7 @@ pub(crate) fn exec(
 pub(super) fn fail_step(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     subject: Eterm,
     ctx: &mut dyn ExecutionContext,
@@ -119,11 +119,8 @@ pub(super) fn fail_step(
 }
 
 /// Resolve a module-local label to its `(function, code)` jump target.
-pub(super) fn goto_label(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> Result<Step> {
-    let (func, pc) = labels
-        .get(&label)
-        .copied()
-        .ok_or_else(|| error::unknown_label(label))?;
+pub(super) fn goto_label(labels: &LabelMap, label: Label) -> Result<Step> {
+    let (func, pc) = labels.resolve(label)?;
     Ok(Step::Goto { func, pc })
 }
 

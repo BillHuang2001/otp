@@ -4,7 +4,7 @@
 //! record; `emu/ops.tab:1643` lowers the `_id` spelling to the same
 //! implementation, so the `Id` operand never reaches the semantics.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use super::*;
 
@@ -18,7 +18,7 @@ fn get_record_elements_writes_each_listed_field_in_list_order() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::GetRecordElements {
             fail: NO_FAIL,
@@ -101,7 +101,7 @@ fn get_record_elements_with_no_fail_is_a_capability_gap() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::GetRecordElements {
             fail: NO_FAIL,
@@ -127,7 +127,7 @@ fn get_record_elements_id_is_get_record_elements_with_the_id_discarded() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::GetRecordElementsId {
             fail: NO_FAIL,
@@ -182,7 +182,7 @@ fn get_record_elements_id_with_no_fail_is_a_capability_gap() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::GetRecordElementsId {
             fail: NO_FAIL,

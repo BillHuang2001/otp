@@ -13,6 +13,7 @@ use crate::context::MinimalContext;
 use beam_common::BeamError;
 use beam_loader::{Atom, Function, Operand};
 use beam_term::make_small;
+use std::collections::BTreeMap;
 
 /// A tiny module builder with an owned atom table (mirrors the `Fixture`
 /// scaffolding in `tests/opcodes.rs`, kept local so the unit tests here do not
@@ -783,7 +784,7 @@ fn put_map_exact_empty_map_without_fail_raises_badkey() {
 fn exec_claims_only_the_map_variants() {
     // A direct `exec` call on a non-map instruction must report "not mine".
     let module = Module::default();
-    let labels = BTreeMap::new();
+    let labels = LabelMap::new();
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     let claimed = exec(

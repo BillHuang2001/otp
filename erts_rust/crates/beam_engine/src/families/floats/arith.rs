@@ -13,7 +13,7 @@
 //! here rejects a non-finite result, so the only failure it can take is a
 //! non-float source.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
@@ -34,7 +34,7 @@ use super::{arithmetic_failure, read_value};
 pub(super) fn binary(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     lhs: &Operand,
     rhs: &Operand,
@@ -66,7 +66,7 @@ pub(super) fn binary(
 pub(super) fn negate(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     src: &Operand,
     dst: &Operand,

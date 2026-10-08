@@ -48,7 +48,7 @@
 //! takes, because `send` carries no fail label (C falls through to
 //! `find_func_info`). Never a panic.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Instr, Label, Module, Operand};
@@ -67,7 +67,7 @@ use crate::Step;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -192,13 +192,13 @@ pub(crate) fn exec(
 ///
 /// A label the module does not define (including the `NO_FAIL` sentinel) is the
 /// shared [`crate::error::unknown_label`] error, never a silent fall-through.
-fn goto_label(labels: &BTreeMap<Label, (u32, u32)>, target: Label) -> Result<Step> {
+fn goto_label(labels: &LabelMap, target: Label) -> Result<Step> {
     let (func, pc) = interpreter::resolve(labels, target)?;
     Ok(Step::Goto { func, pc })
 }
 
 /// Resolve `target` and return the suspend [`Step`] that resumes there.
-fn wait_at(labels: &BTreeMap<Label, (u32, u32)>, target: Label) -> Result<Step> {
+fn wait_at(labels: &LabelMap, target: Label) -> Result<Step> {
     let (func, pc) = interpreter::resolve(labels, target)?;
     Ok(Step::Wait { func, pc })
 }
@@ -324,14 +324,14 @@ mod tests {
     }
 
     /// A label map with `label` at `(func, pc)`.
-    fn labels_with(label: Label, func: u32, pc: u32) -> BTreeMap<Label, (u32, u32)> {
-        BTreeMap::from([(label, (func, pc))])
+    fn labels_with(label: Label, func: u32, pc: u32) -> LabelMap {
+        LabelMap::from([(label, (func, pc))])
     }
 
     #[test]
     fn send_stores_the_message_in_x0_and_calls_the_seam() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         machine.set_x(0, make_small(7)).unwrap();
         machine.set_x(1, make_small(42)).unwrap();
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn send_failure_propagates_without_a_catch_frame() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
         ctx.send_error = Some(BeamError::BadArg);
@@ -368,7 +368,7 @@ mod tests {
         let mut module = Module::default();
         module.atom_table.intern("badarg");
         module.atom_table.intern("error");
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         machine.push_frame(0).unwrap();
         machine.push_catch_frame(CatchFrame::new(0, 9, 0));
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn loop_rec_with_an_unresolved_fail_label_is_a_typed_error() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
 
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn wait_with_an_unresolved_target_is_a_typed_error() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
 
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn timeout_resets_the_scan_and_continues() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
 
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn remove_message_unlinks_and_continues() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
 
@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn recv_marker_reserve_stores_the_opaque_marker() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
 
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn recv_marker_bind_passes_the_marker_and_reference_through() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         machine.set_x(0, make_small(1)).unwrap();
         machine.set_x(1, make_small(2)).unwrap();
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn recv_marker_use_and_clear_pass_the_reference_through() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         machine.set_x(1, make_small(5)).unwrap();
         let mut ctx = StubCtx::new();
@@ -749,7 +749,7 @@ mod tests {
     #[test]
     fn marker_bind_with_an_out_of_range_reference_is_a_typed_error() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
 
@@ -775,7 +775,7 @@ mod tests {
     #[test]
     fn recv_marker_reserve_with_a_non_destination_is_a_typed_error() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
 
@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn a_variant_outside_the_receive_family_is_declined() {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::with_max_register(4);
         let mut ctx = StubCtx::new();
 

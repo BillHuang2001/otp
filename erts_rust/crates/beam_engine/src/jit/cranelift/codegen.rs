@@ -7,11 +7,12 @@
 //! (`jit_step_one`), so the tier's results are interpreter-identical by
 //! construction. See the parent module docs for the full contract.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::mem;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
-use beam_loader::{Function, Instr, Label, Module};
+use beam_loader::{Function, Instr, Module};
 use beam_term::Eterm;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -166,7 +167,7 @@ fn emit_function(
     id: FuncId,
     module: &Module,
     func_index: u32,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     function: &Function,
     entry_pc: u32,
     report: &mut CodegenReport,
@@ -354,7 +355,7 @@ fn emit_pc(
     code_len: usize,
     code: &[Instr],
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     func_index: u32,
     helper: FuncRef,
     rt: Value,
@@ -384,7 +385,7 @@ fn emit_pc(
             }
         }
         Some(Instr::Jump { target }) => {
-            if let Some(&resolved) = labels.get(target) {
+            if let Ok(resolved) = labels.resolve(*target) {
                 emit_target_branch(builder, cfg, code_len, func_index, resolved);
                 return;
             }

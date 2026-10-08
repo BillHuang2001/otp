@@ -64,7 +64,7 @@ mod convert;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
@@ -83,7 +83,7 @@ use crate::Step;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -183,16 +183,13 @@ pub(crate) fn exec(
 fn arithmetic_failure(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
 ) -> Result<Option<Step>> {
     if fail == NO_FAIL {
         return raise_badarith(machine, module).map(Some);
     }
-    let (func, pc) = labels
-        .get(&fail)
-        .copied()
-        .ok_or_else(|| error::unknown_label(fail))?;
+    let (func, pc) = labels.resolve(fail)?;
     Ok(Some(Step::Goto { func, pc }))
 }
 

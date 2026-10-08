@@ -8,7 +8,7 @@
 //! `system_limit` atom, branch vs raise). The writer arms live in [`super::segments`];
 //! the segment loop and dispatch live in [`super`].
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Label, Module, NO_FAIL, Operand};
@@ -116,7 +116,7 @@ pub(super) fn float_nbits(size: usize, unit: usize) -> std::result::Result<usize
 pub(super) fn fail_seg(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     reason: SegReason,
 ) -> Result<std::result::Result<(Vec<u8>, usize), Step>> {
@@ -127,7 +127,7 @@ pub(super) fn fail_seg(
 fn seg_fail_step(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     reason: SegReason,
 ) -> Result<Step> {

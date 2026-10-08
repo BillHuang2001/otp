@@ -64,10 +64,10 @@
 //!   "no catch clause matched" tail of a handler, where that always holds
 //!   (`lib/compiler/src/beam_ssa_*.erl` `resume` ⇒ `{bif,raise,..}`).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Label, Module, Operand};
+use beam_loader::{Instr, Module, Operand};
 use beam_term::{is_nil, make_atom, Eterm, NIL};
 
 use crate::context::ExecutionContext;
@@ -94,7 +94,7 @@ mod tests;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -105,10 +105,7 @@ pub(crate) fn exec(
         // push the handler's catch frame, blank the frame slot (`catches++`, `Y =
         // Fail` in C) and fall through.
         Instr::Try { frame, fail } | Instr::Catch { frame, fail } => {
-            let (handler_func, handler_pc) = labels
-                .get(fail)
-                .copied()
-                .ok_or_else(|| error::unknown_label(*fail))?;
+            let (handler_func, handler_pc) = labels.resolve(*fail)?;
             // The handler lives in the frame that is current *now* (an unwind in
             // `Machine::throw` drops every deeper frame). `saturating_sub` keeps a
             // frame-less machine a typed error rather than a panic.

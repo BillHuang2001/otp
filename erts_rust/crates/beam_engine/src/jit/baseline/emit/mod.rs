@@ -57,9 +57,9 @@
 use std::collections::BTreeMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Label, Module};
+use beam_loader::{Instr, Module};
 
-use crate::interpreter;
+use crate::interpreter::{self, LabelMap};
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAPACITY};
 
 use super::runtime::{encode_target, StepHelper, RUNTIME_XREGS_DISP};
@@ -375,7 +375,7 @@ const TUPLE_PATH_BYTES: usize = 160;
 fn emit_block(
     buffer: &mut CodeBuffer,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     block_labels: &BTreeMap<(u32, u32), CodeLabel>,
     func: u32,
     code: &[Instr],
@@ -585,8 +585,8 @@ fn emit_block(
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }
-            Instr::Jump { target } => match labels.get(target) {
-                Some(&(target_func, target_pc)) => {
+            Instr::Jump { target } => match labels.resolve(*target) {
+                Ok((target_func, target_pc)) => {
                     // A compiled successor is entered **directly** (the linker tears
                     // this block's frame down and jumps to its entry); anything else
                     // returns the `(func, pc)` word to the driver exactly as before.
@@ -596,7 +596,7 @@ fn emit_block(
                 }
                 // An undefined label keeps the interpreter's exact `unknown_label`
                 // error: hand the jump to the helper rather than inventing one.
-                None => emit_step_and_continue(buffer, done, allocation, func, pc)?,
+                Err(_) => emit_step_and_continue(buffer, done, allocation, func, pc)?,
             },
             // The word-level `test` subset (see the section below): a native
             // predicate plus a branch to the resolved fail label. Any other shape —

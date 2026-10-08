@@ -129,11 +129,11 @@
 //! `// SAFETY:` rationale.
 #![allow(unsafe_code)]
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 use std::mem;
 
 use beam_common::Result;
-use beam_loader::{Atom, Label, Module};
+use beam_loader::{Atom, Module};
 use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
@@ -431,7 +431,7 @@ pub(crate) fn run_native(
         machine: machine_ptr,
         x_regs,
         module: module as *const Module,
-        labels: &labels as *const BTreeMap<Label, (u32, u32)>,
+        labels: &labels as *const LabelMap,
         ctx: ctx_ptr,
         error: None,
     };

@@ -40,7 +40,7 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
     // Generated code loads `rt.x_regs` from `[rt + 8]` (`RUNTIME_XREGS_DISP`) and
     // the helper is handed `rt` itself; this pins the two offsets.
     let module = Module::default();
-    let labels = BTreeMap::new();
+    let labels = LabelMap::new();
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::new();
     let rt = JitRuntime {

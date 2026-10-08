@@ -54,10 +54,10 @@
 //! frame to land in (or the module cannot name `badarg`). Never a panic and never
 //! a wrong result.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::{BeamError, ExceptionClass, Result};
-use beam_loader::{Instr, Label, Module};
+use beam_loader::{Instr, Module};
 use beam_term::{atom_val, is_atom, make_atom, Eterm};
 
 use crate::context::ExecutionContext;
@@ -74,7 +74,7 @@ use crate::Step;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -276,8 +276,9 @@ mod tests {
 
     use super::*;
     use beam_common::BeamError;
-    use beam_loader::{FunDescriptor, Function};
+    use beam_loader::{FunDescriptor, Function, Label};
     use beam_term::{make_small, signed_value, Atom};
+    use std::collections::BTreeMap;
 
     use crate::context::MinimalContext;
     use crate::machine::CatchFrame;
@@ -679,7 +680,7 @@ mod tests {
         machine.set_x(3, make_atom(plus)).unwrap(); // a valid atom function
 
         let instr = Instr::Apply { arity: 2 };
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let step = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).unwrap();
         assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
 
@@ -715,7 +716,7 @@ mod tests {
             arity: 2,
             deallocate: 0,
         };
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let step = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).unwrap();
         assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
         assert_eq!(machine.x(1), Some(make_atom(badarg)));
@@ -740,7 +741,7 @@ mod tests {
         machine.set_x(3, make_atom(plus)).unwrap();
 
         let instr = Instr::Apply { arity: 2 };
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let err = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx)
             .expect_err("a non-atom module must fail");
         assert!(matches!(err, BeamError::BadArg));
@@ -764,7 +765,7 @@ mod tests {
         machine.set_x(3, make_atom(plus)).unwrap();
 
         let instr = Instr::Apply { arity: 2 };
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let err = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx)
             .expect_err("no `badarg` atom must fall back to the typed error");
         assert!(matches!(err, BeamError::BadArg));
@@ -895,7 +896,7 @@ mod tests {
 
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let outcome = exec(
             &mut machine,
             &module,

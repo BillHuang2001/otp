@@ -142,7 +142,7 @@ mod raw;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::{ExceptionClass, Result};
 use beam_loader::{Instr, Label, Module, Operand, RecordDefinition, NO_FAIL};
@@ -164,7 +164,7 @@ use crate::Step;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -396,7 +396,7 @@ pub(crate) fn exec(
 /// through would produce a *wrong result* and inventing a BEAM exception reason
 /// would fabricate ground truth the C keeps in `p->freason`/`p->fvalue`.
 fn fail_step(
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     instruction: &str,
 ) -> Result<Step> {
@@ -491,7 +491,7 @@ fn read_record_id(
 /// name the record does not have is the C's `return false` ⇒ `$FAIL($Fail)`.
 fn get_record_elements(
     machine: &mut Machine,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     module: &Module,
     instruction: &str,
     fail: Label,
@@ -524,7 +524,7 @@ fn get_record_elements(
 /// `badfield` ⇒ `$FAIL_HEAD_OR_BODY($Fail)`.
 fn get_record_field(
     machine: &mut Machine,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     module: &Module,
     instruction: &str,
     fail: Label,
@@ -611,7 +611,7 @@ fn get_record_field(
 /// resolve.
 fn create_native_record(
     machine: &mut Machine,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     module: &Module,
     instruction: &str,
     fail: Label,
@@ -754,7 +754,7 @@ fn local_definition<'a>(
 fn create_failure(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     ctx: &mut dyn ExecutionContext,
     instruction: &str,
     fail: Label,
@@ -841,7 +841,7 @@ fn write_local_record(
 /// [`Instr::UpdateRecord`] documents.
 fn update_native_record(
     machine: &mut Machine,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instruction: &str,
     fail: Label,
     src: &Operand,

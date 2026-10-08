@@ -5,7 +5,7 @@
 //! name test); a `{Module, Name}` pair `Id` is the `i_get_record_field` form (the
 //! definition must match that pair **and** be exported).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use super::*;
 
@@ -21,7 +21,7 @@ fn get_record_field_local_form_reads_a_field_without_an_export_requirement() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::GetRecordField {
             fail: NO_FAIL,
@@ -50,7 +50,7 @@ fn get_record_field_local_form_with_the_underscore_name_skips_the_name_test() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::GetRecordField {
             fail: NO_FAIL,
@@ -159,7 +159,7 @@ fn get_record_field_foreign_form_reads_an_exported_record_from_another_module() 
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::GetRecordField {
             fail: NO_FAIL,
@@ -243,7 +243,7 @@ fn get_record_field_with_no_fail_is_a_capability_gap() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::GetRecordField {
             fail: NO_FAIL,

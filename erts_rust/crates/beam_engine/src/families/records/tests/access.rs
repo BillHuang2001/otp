@@ -5,7 +5,7 @@
 //! any other atom is the `$MODULE` wildcard
 //! `erl_is_wildcard_record_accessible` (exported **or** created in that module).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use super::*;
 
@@ -25,7 +25,7 @@ fn is_record_accessible_external_scope_accepts_an_exported_record() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::IsRecordAccessible {
             fail: NO_FAIL,
@@ -80,7 +80,7 @@ fn is_record_accessible_wildcard_scope_accepts_a_record_created_in_that_module()
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::IsRecordAccessible {
             fail: NO_FAIL,
@@ -134,7 +134,7 @@ fn is_record_accessible_with_no_fail_is_a_capability_gap() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::IsRecordAccessible {
             fail: NO_FAIL,

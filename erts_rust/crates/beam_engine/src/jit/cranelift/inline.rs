@@ -8,7 +8,7 @@
 //! reads (`select_val`, the tuple reads, the list reads) live in the sibling
 //! [`super::shape`] module.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_loader::{Instr, Label, Module, Operand, Reg as RegRef, TestKind, NO_FAIL};
 use beam_term::{
@@ -479,7 +479,7 @@ pub(super) fn inline_test(
     kind: TestKind,
     fail: Label,
     args: &[Operand],
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
 ) -> Option<TestPlan> {
     // A `NO_FAIL` test *raises* on failure (the interpreter's typed `test/no_fail`),
     // so it is never inlined: the helper reproduces that exactly.
@@ -488,7 +488,7 @@ pub(super) fn inline_test(
     }
     // An unresolved fail label keeps the interpreter's exact `unknown_label` error,
     // so the whole test stays on the helper.
-    let target = *labels.get(&fail)?;
+    let target = labels.resolve(fail).ok()?;
 
     let type_kind = match kind {
         TestKind::IsNil => Some(TypeTest::Nil),

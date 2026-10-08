@@ -25,10 +25,10 @@
 //! [`Machine::throw_error`] (a `Step::Goto` into a live catch frame, or a typed
 //! `Err` when there is none). Never a panic.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Label, Module};
+use beam_loader::{Instr, Module};
 
 use crate::context::ExecutionContext;
 use crate::machine::Machine;
@@ -43,7 +43,7 @@ use crate::Step;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,

@@ -91,7 +91,7 @@ mod read;
 mod tests;
 mod write;
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::{ExceptionClass, Result};
 use beam_loader::{Instr, Label, Module, NO_FAIL};
@@ -110,7 +110,7 @@ use crate::Step;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -176,11 +176,8 @@ fn position(entries: &[(Eterm, Eterm)], key: Eterm, atoms: &AtomTable) -> Option
 }
 
 /// Jump to `label` (the ground-truth failure path).
-fn goto(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> Result<Step> {
-    let (func, pc) = labels
-        .get(&label)
-        .copied()
-        .ok_or_else(|| error::unknown_label(label))?;
+fn goto(labels: &LabelMap, label: Label) -> Result<Step> {
+    let (func, pc) = labels.resolve(label)?;
     Ok(Step::Goto { func, pc })
 }
 
@@ -190,7 +187,7 @@ fn goto(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> Result<Step> {
 fn fail_or_raise(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     ctx: &mut dyn ExecutionContext,
     fail: Label,
     tag: &str,
@@ -207,7 +204,7 @@ fn fail_or_raise(
 /// jump to `fail`, or report `what` as a documented typed error when `fail` is
 /// [`NO_FAIL`].
 fn jump_or_unsupported(
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     what: &str,
 ) -> Result<Step> {

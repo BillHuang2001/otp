@@ -4,7 +4,7 @@
 //! non-tuple source falls back to `jit_step_one`, which raises the interpreter's
 //! exact `{badmatch, Source}` or reports its typed `unsupported`).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 use std::mem::size_of;
 
 use beam_common::Result;
@@ -515,7 +515,7 @@ impl AritySwitchPlan {
 /// the no-match path — an unresolved label, a non-x-register scrutinee, or an
 /// alternative that is not a non-negative `Integer` with a resolved label.
 pub(super) fn select_tuple_arity_plan(
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     tuple: &Operand,
     fail: Label,
     destinations: &[(Operand, Label)],
@@ -525,7 +525,7 @@ pub(super) fn select_tuple_arity_plan(
         return None;
     }
     // An unresolved label keeps the interpreter's exact `unknown_label`.
-    let fail = *labels.get(&fail)?;
+    let fail = labels.resolve(fail).ok()?;
     let tuple = in_bound_x(tuple)?;
     let mut cases = Vec::with_capacity(destinations.len());
     for (candidate, label) in destinations {
@@ -535,7 +535,7 @@ pub(super) fn select_tuple_arity_plan(
         if *n < 0 {
             return None;
         }
-        let target = *labels.get(label)?;
+        let target = labels.resolve(*label).ok()?;
         cases.push((arity_header(*n), target));
     }
     Some(AritySwitchPlan { tuple, cases, fail })
@@ -551,7 +551,7 @@ pub(super) fn select_tuple_arity_plan(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_inline_select_tuple_arity(
     buffer: &mut CodeBuffer,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     linker: &Linker<'_>,
     tuple: &Operand,
     fail: Label,

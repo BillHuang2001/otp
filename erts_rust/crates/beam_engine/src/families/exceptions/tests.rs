@@ -9,8 +9,9 @@
 use super::*;
 use crate::context::MinimalContext;
 use beam_common::{BeamError, ExceptionClass, ExitReason};
-use beam_loader::{Function, HeapNeed, LineEntry};
+use beam_loader::{Function, HeapNeed, Label, LineEntry};
 use beam_term::{cmp, make_small};
+use std::collections::BTreeMap;
 
 /// A tiny module builder with an owned atom table (mirrors the `Fixture`
 /// scaffolding in `tests/opcodes.rs`, kept local so the unit tests here do not
@@ -59,8 +60,8 @@ impl Fixture {
 }
 
 /// Empty label map; fine for instructions that raise (they do not jump).
-fn no_labels() -> BTreeMap<Label, (u32, u32)> {
-    BTreeMap::new()
+fn no_labels() -> LabelMap {
+    LabelMap::new()
 }
 
 /// Run one instruction body with a machine that has a bottom frame.

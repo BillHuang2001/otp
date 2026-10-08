@@ -14,7 +14,7 @@
 //! operand (the C collector's GC-root count) is unused at M1: there is no moving
 //! collector to relocate terms (the parent module docs carry the full ground truth).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
@@ -33,7 +33,7 @@ use super::{fail_or_raise, position};
 pub(super) fn put_map_assoc(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     ctx: &mut dyn ExecutionContext,
     fail: Label,
     source: &Operand,
@@ -70,7 +70,7 @@ pub(super) fn put_map_assoc(
 pub(super) fn put_map_exact(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     ctx: &mut dyn ExecutionContext,
     fail: Label,
     source: &Operand,

@@ -36,13 +36,12 @@
 //! as no-ops in its metadata arm, and the residual `Instr::Generic` opcodes are
 //! handled by `crate::generic` before the catch-all arm too.)
 
-use std::collections::BTreeMap;
-
 use beam_common::Result;
-use beam_loader::{Instr, Label, Module};
+use beam_loader::{Instr, Module};
 
 use crate::context::ExecutionContext;
 use crate::error;
+use crate::interpreter::LabelMap;
 use crate::machine::Machine;
 use crate::Step;
 
@@ -76,7 +75,7 @@ mod tuples;
 pub(crate) fn dispatch(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -145,7 +144,7 @@ mod tests {
     //! family's tests are the converse: a variant `families::receive` owns must
     //! **never** reach the sentinel again.
 
-    use beam_loader::{Atom, ImportRef, Opcode, Operand, NO_FAIL};
+    use beam_loader::{Atom, ImportRef, Label, Opcode, Operand, NO_FAIL};
 
     use super::*;
     use crate::context::MinimalContext;
@@ -155,7 +154,7 @@ mod tests {
     /// declining family, so defaults suffice.
     fn dispatch_error(instr: &Instr) -> beam_common::BeamError {
         let module = Module::default();
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
         dispatch(&mut machine, &module, &labels, instr, 0, 0, &mut ctx)
@@ -182,7 +181,7 @@ mod tests {
     /// decision.
     fn dispatch_step(
         instr: &Instr,
-        labels: &BTreeMap<Label, (u32, u32)>,
+        labels: &LabelMap,
     ) -> beam_common::Result<Step> {
         let module = Module::default();
         let mut machine = Machine::new();
@@ -215,7 +214,7 @@ mod tests {
         // sentinel; [`super::receive`] owns them now, so `dispatch` reports that
         // family's own error — here the receive seam's typed `unsupported`, since
         // the bare `MinimalContext` below has no mailbox installed.
-        let labels = BTreeMap::new();
+        let labels = LabelMap::new();
         let cases: [(Instr, &str); 4] = [
             (
                 Instr::RecvMarkerReserve {
@@ -256,7 +255,7 @@ mod tests {
     #[test]
     fn the_rest_of_the_receive_family_is_claimed_too() {
         // `loop_rec`/`loop_rec_end` jump through module labels, so give them one.
-        let labels = BTreeMap::from([(Label(3), (0u32, 3u32)), (Label(4), (0u32, 4u32))]);
+        let labels = LabelMap::from([(Label(3), (0u32, 3u32)), (Label(4), (0u32, 4u32))]);
 
         // The send/mailbox opcodes reach the receive seam, whose typed
         // `unsupported` names the method (no mailbox is installed here).

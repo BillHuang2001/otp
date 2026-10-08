@@ -29,8 +29,8 @@ use crate::machine::CatchFrame;
 use crate::terms::{float_value, make_float};
 
 /// An empty label map (only the tests that exercise a `fail` target build one).
-fn no_labels() -> BTreeMap<Label, (u32, u32)> {
-    BTreeMap::new()
+fn no_labels() -> LabelMap {
+    LabelMap::new()
 }
 
 /// A module whose atom table holds the two atoms a `badarith` landing needs
@@ -46,7 +46,7 @@ fn module_with_raise_atoms() -> Module {
 /// Dispatch one instruction through the family with an empty module.
 fn step(
     machine: &mut Machine,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     ctx: &mut MinimalContext,
 ) -> Result<Option<Step>> {
@@ -385,7 +385,7 @@ fn a_live_fail_label_turns_the_failure_into_a_branch() {
     machine.set_fr(0, float(&mut ctx, 1.0)).unwrap();
     machine.set_fr(1, float(&mut ctx, 0.0)).unwrap();
 
-    let mut labels = BTreeMap::new();
+    let mut labels = LabelMap::new();
     labels.insert(Label(7), (2u32, 9u32));
     let instr = Instr::Fdiv {
         fail: Label(7),
@@ -433,7 +433,7 @@ fn a_non_float_operand_takes_the_failure_path() {
         Operand::FloatReg(1),
         Operand::FloatReg(0),
     );
-    let mut labels = BTreeMap::new();
+    let mut labels = LabelMap::new();
     labels.insert(Label(3), (0u32, 4u32));
     assert_eq!(
         step(&mut machine, &labels, &branch, &mut ctx).unwrap(),
@@ -535,7 +535,7 @@ fn a_live_fail_label_still_branches_instead_of_raising() {
     machine.set_fr(0, float(&mut ctx, 1.0)).unwrap();
     machine.set_fr(1, float(&mut ctx, 0.0)).unwrap();
 
-    let mut labels = BTreeMap::new();
+    let mut labels = LabelMap::new();
     labels.insert(Label(7), (2u32, 9u32));
     let instr = fdiv(
         Label(7),
@@ -598,7 +598,7 @@ fn fnegate_of_a_non_float_raises_or_branches() {
         src: Operand::FloatReg(0),
         dst: Operand::FloatReg(1),
     };
-    let mut labels = BTreeMap::new();
+    let mut labels = LabelMap::new();
     labels.insert(Label(5), (1u32, 2u32));
     assert_eq!(
         step(&mut machine, &labels, &branch, &mut ctx).unwrap(),

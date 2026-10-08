@@ -32,7 +32,7 @@
 //! This file owns the fixtures/helpers those submodules share and the
 //! family-membership test.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::BeamError;
 use beam_term::{make_atom, make_small, NIL};
@@ -114,14 +114,14 @@ fn two_field_record(fx: &mut Fixture, ctx: &mut MinimalContext) -> (Eterm, Atom,
 }
 
 /// A label map with `label` resolved to `(func, pc)`.
-fn labels_with(label: Label, func: u32, pc: u32) -> BTreeMap<Label, (u32, u32)> {
-    BTreeMap::from([(label, (func, pc))])
+fn labels_with(label: Label, func: u32, pc: u32) -> LabelMap {
+    LabelMap::from([(label, (func, pc))])
 }
 
 /// Drive one instruction through the family over `machine`/`ctx`.
 fn run(
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     machine: &mut Machine,
     instr: &Instr,
     ctx: &mut MinimalContext,
@@ -154,7 +154,7 @@ fn a_variant_outside_the_records_family_is_declined() {
     assert_eq!(
         run(
             fx.module(),
-            &BTreeMap::new(),
+            &LabelMap::new(),
             &mut machine,
             &Instr::Return,
             &mut ctx

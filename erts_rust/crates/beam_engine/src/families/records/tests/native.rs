@@ -4,7 +4,7 @@
 //! record's own definition carries the two operand atoms as its `module`/`name`,
 //! and fails (or reports the `NO_FAIL` capability gap) otherwise.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use super::*;
 
@@ -19,7 +19,7 @@ fn is_native_record_succeeds_on_a_matching_definition() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::IsNativeRecord {
             fail: NO_FAIL,
@@ -120,7 +120,7 @@ fn is_native_record_with_no_fail_is_a_capability_gap() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::IsNativeRecord {
             fail: NO_FAIL,
@@ -147,7 +147,7 @@ fn is_native_record_reads_the_module_and_name_operands_as_atoms() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::IsNativeRecord {
             fail: NO_FAIL,

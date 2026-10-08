@@ -12,7 +12,7 @@
 //! overrides, `badfield`/`novalue`) in the integration suite `tests/records.rs`,
 //! which can load the committed `records_fixture.beam` and read its definitions.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use super::*;
 
@@ -26,7 +26,7 @@ fn put_record_updates_a_field_and_returns_a_fresh_copy() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::PutRecord {
             fail: NO_FAIL,
@@ -61,7 +61,7 @@ fn put_record_reads_every_update_before_writing_dst() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::PutRecord {
             fail: NO_FAIL,
@@ -126,7 +126,7 @@ fn put_record_with_no_fail_is_a_capability_gap() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::PutRecord {
             fail: NO_FAIL,
@@ -154,7 +154,7 @@ fn put_record_create_with_an_unknown_record_name_is_a_typed_error() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::PutRecord {
             fail: NO_FAIL,
@@ -189,7 +189,7 @@ fn put_record_create_for_another_module_is_a_typed_error() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::PutRecord {
             fail: NO_FAIL,
@@ -221,7 +221,7 @@ fn update_record_id_updates_a_field_and_ignores_the_hint() {
 
     let step = run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::UpdateRecordId {
             fail: NO_FAIL,
@@ -284,7 +284,7 @@ fn update_record_id_with_no_fail_is_a_capability_gap() {
 
     let reason = unsupported_reason(run(
         fx.module(),
-        &BTreeMap::new(),
+        &LabelMap::new(),
         &mut machine,
         &Instr::UpdateRecordId {
             fail: NO_FAIL,

@@ -7,11 +7,11 @@
 //! blocks and the driver that decodes the words these items produce.
 #![allow(unsafe_code)]
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 use std::mem;
 
 use beam_common::BeamError;
-use beam_loader::{Label, Module};
+use beam_loader::Module;
 use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
@@ -83,7 +83,7 @@ pub(crate) struct JitRuntime<'a> {
     /// The module-wide `Label -> (func, pc)` map the helper resolves fail/target
     /// labels through (built once per driver call by
     /// [`interpreter::build_label_map`](crate::interpreter)).
-    pub(crate) labels: *const BTreeMap<Label, (u32, u32)>,
+    pub(crate) labels: *const LabelMap,
     /// The [`ExecutionContext`] seam, handed back as `&mut dyn` to the helper.
     pub(crate) ctx: *mut (dyn ExecutionContext + 'a),
     /// Set by a helper that hit a propagating `Err`; the `ERROR` word tells the

@@ -2,7 +2,7 @@
 //! lowering (the section comment below documents exactly which predicates the tier
 //! may lower natively).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Instr, Label, Module, Operand, TestKind, NO_FAIL};
@@ -147,14 +147,14 @@ pub(super) fn test_plan(
     kind: TestKind,
     fail: Label,
     args: &[Operand],
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
 ) -> Option<TestPlan> {
     // A `NO_FAIL` test *raises* on failure; the helper reproduces that exactly.
     if fail == NO_FAIL {
         return None;
     }
     // An unresolved label keeps the interpreter's exact `unknown_label`.
-    let target = *labels.get(&fail)?;
+    let target = labels.resolve(fail).ok()?;
 
     let pred = match kind {
         TestKind::IsNil => TestPred::IsNil,
@@ -327,7 +327,7 @@ fn guard_small(buffer: &mut CodeBuffer, reg: Reg, deopt: CodeLabel) -> Result<()
 pub(super) fn try_inline_test(
     buffer: &mut CodeBuffer,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     linker: &Linker<'_>,
     instr: &Instr,
     allocation: &Allocation,

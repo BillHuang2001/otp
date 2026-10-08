@@ -16,8 +16,6 @@
 //! `Err(BeamError)`. Every unsupported opcode/operand is a documented typed error,
 //! never a panic.
 
-use std::collections::BTreeMap;
-
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{ImportRef, Instr, Label, Module, Operand, TestKind, NO_FAIL};
 use beam_term::{
@@ -33,33 +31,151 @@ use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::Step;
 
-/// Build the module-wide `Label -> (function index, code index)` map.
+/// The module-wide `Label -> (function index, code index)` index.
+///
+/// A `.beam` module numbers its labels contiguously from `1` (`beam_asm`
+/// renumbers them; `0` is the `NO_FAIL` sentinel), so a label id is a dense
+/// index and the primary form is a flat `Vec<Option<(u32, u32)>>` addressed by
+/// `label.0` — one bounds-checked load, no tree/pointer walk. `resolve` is on the
+/// hottest path (every branch/call/test-fail/select), so it is `#[inline]`.
+///
+/// A module whose ids are *not* dense (a hand-crafted or corrupt file, where one
+/// `label 4000000000` would otherwise reserve tens of gigabytes) uses the sorted
+/// fallback instead; both forms answer identically.
+pub(crate) struct LabelMap {
+    slots: Slots,
+}
+
+/// The two backing representations of a [`LabelMap`].
+enum Slots {
+    /// `slots[label.0]` over ids `0..=max`; `slots[0]` is the unused `NO_FAIL`
+    /// sentinel and stays `None`.
+    Dense(Vec<Option<(u32, u32)>>),
+    /// `(label id, target)` sorted by id, for a sparse id space.
+    Sparse(Vec<(u32, (u32, u32))>),
+}
+
+impl LabelMap {
+    /// An empty index: every lookup is the typed [`crate::error::unknown_label`].
+    pub(crate) fn new() -> LabelMap {
+        LabelMap {
+            slots: Slots::Dense(Vec::new()),
+        }
+    }
+
+    /// Record `label -> (function index, code index)`, an existing entry for the
+    /// same label being replaced (labels are module-unique, so this only matters
+    /// for a malformed/duplicate table — and it matches the previous last-wins
+    /// `BTreeMap::insert`).
+    pub(crate) fn insert(&mut self, label: Label, target: (u32, u32)) {
+        match &mut self.slots {
+            Slots::Dense(slots) => {
+                let index = label.0 as usize;
+                if index >= slots.len() {
+                    slots.resize(index + 1, None);
+                }
+                slots[index] = Some(target);
+            }
+            Slots::Sparse(entries) => match entries.binary_search_by_key(&label.0, |(id, _)| *id) {
+                Ok(found) => match entries.get_mut(found) {
+                    Some(entry) => entry.1 = target,
+                    None => {}
+                },
+                Err(at) => entries.insert(at, (label.0, target)),
+            },
+        }
+    }
+
+    /// Resolve `label` to its `(function index, code index)`; a label the module
+    /// does not define is the typed [`crate::error::unknown_label`].
+    #[inline]
+    pub(crate) fn resolve(&self, label: Label) -> Result<(u32, u32)> {
+        match &self.slots {
+            Slots::Dense(slots) => match slots.get(label.0 as usize) {
+                Some(Some(target)) => Ok(*target),
+                _ => Err(error::unknown_label(label)),
+            },
+            Slots::Sparse(entries) => {
+                match entries.binary_search_by_key(&label.0, |(id, _)| *id) {
+                    Ok(found) => entries
+                        .get(found)
+                        .map(|(_, target)| *target)
+                        .ok_or_else(|| error::unknown_label(label)),
+                    Err(_) => Err(error::unknown_label(label)),
+                }
+            }
+        }
+    }
+}
+
+impl Default for LabelMap {
+    fn default() -> LabelMap {
+        LabelMap::new()
+    }
+}
+
+impl<const N: usize> From<[(Label, (u32, u32)); N]> for LabelMap {
+    fn from(pairs: [(Label, (u32, u32)); N]) -> LabelMap {
+        let mut map = LabelMap::new();
+        for (label, target) in pairs {
+            map.insert(label, target);
+        }
+        map
+    }
+}
+
+/// Build the module-wide [`LabelMap`].
 ///
 /// Labels are module-unique code addresses, so a call/fail target may live in a
 /// different function than the instruction that references it (the slice's
 /// `fib/1` tail-calls into `fib/3`). Every function's [`beam_loader::Function::labels`]
-/// contributes to the one map.
-pub(crate) fn build_label_map(module: &Module) -> BTreeMap<Label, (u32, u32)> {
-    let mut map = BTreeMap::new();
-    for (func_index, function) in module.functions.iter().enumerate() {
-        for (label, &code_index) in &function.labels {
-            map.insert(*label, (func_index as u32, code_index as u32));
+/// contributes to the one index.
+pub(crate) fn build_label_map(module: &Module) -> LabelMap {
+    // One pass to size the index: a real `.beam` numbers its labels `1..=count`,
+    // so `max + 1 == count + 1` and the dense table is exactly as large as the
+    // label set (verified across the installed OTP: density is exactly 1.0).
+    let mut count = 0usize;
+    let mut max = 0u32;
+    for function in &module.functions {
+        count += function.labels.len();
+        for label in function.labels.keys() {
+            if label.0 > max {
+                max = label.0;
+            }
         }
     }
-    map
+    if max as u64 <= (count as u64).saturating_mul(4) + 64 {
+        let mut slots: Vec<Option<(u32, u32)>> = vec![None; max as usize + 1];
+        for (func_index, function) in module.functions.iter().enumerate() {
+            for (label, &code_index) in &function.labels {
+                slots[label.0 as usize] = Some((func_index as u32, code_index as u32));
+            }
+        }
+        LabelMap {
+            slots: Slots::Dense(slots),
+        }
+    } else {
+        let mut entries: Vec<(u32, (u32, u32))> = Vec::with_capacity(count);
+        for (func_index, function) in module.functions.iter().enumerate() {
+            for (label, &code_index) in &function.labels {
+                entries.push((label.0, (func_index as u32, code_index as u32)));
+            }
+        }
+        entries.sort_unstable_by_key(|(id, _)| *id);
+        LabelMap {
+            slots: Slots::Sparse(entries),
+        }
+    }
 }
 
-/// Resolve a label against an already-built map; a missing label is a typed error.
-pub(crate) fn resolve(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> Result<(u32, u32)> {
-    labels
-        .get(&label)
-        .copied()
-        .ok_or_else(|| error::unknown_label(label))
+/// Resolve a label against an already-built index; a missing label is a typed error.
+pub(crate) fn resolve(labels: &LabelMap, label: Label) -> Result<(u32, u32)> {
+    labels.resolve(label)
 }
 
 /// Resolve a module-local label to its `(function index, code offset)`.
 pub(crate) fn resolve_label(module: &Module, label: Label) -> Result<(u32, u32)> {
-    resolve(&build_label_map(module), label)
+    build_label_map(module).resolve(label)
 }
 
 /// Resolve an import reference to `(module name, function name, arity)`.
@@ -141,7 +257,7 @@ impl Machine {
     pub(crate) fn step_instruction(
         &mut self,
         module: &Module,
-        labels: &BTreeMap<Label, (u32, u32)>,
+        labels: &LabelMap,
         func: u32,
         pc: u32,
         ctx: &mut dyn ExecutionContext,
@@ -489,7 +605,7 @@ impl Machine {
     pub(crate) fn run_loop_with_map(
         &mut self,
         module: &Module,
-        labels: &BTreeMap<Label, (u32, u32)>,
+        labels: &LabelMap,
         mut func: u32,
         mut pc: u32,
         ctx: &mut dyn ExecutionContext,
@@ -813,10 +929,97 @@ mod tests {
         let (module, _) =
             module_with_function(vec![Instr::Label(Label(1)), Instr::Return], Vec::new());
         let map = build_label_map(&module);
-        assert_eq!(map.get(&Label(1)), Some(&(0, 0)));
+        assert_eq!(map.resolve(Label(1)).unwrap(), (0, 0));
     }
 
+    /// The index is module-wide: a target living in *another* function resolves to
+    /// that function's `(index, code offset)`.
     #[test]
+    fn label_map_resolves_cross_function_targets() {
+        let (mut module, _) =
+            module_with_function(vec![Instr::Label(Label(1)), Instr::Return], Vec::new());
+        // A second function with labels `2` (offset 0) and `3` (offset 2).
+        let (second, _) = module_with_function(
+            vec![
+                Instr::Label(Label(2)),
+                Instr::Jump { target: Label(3) },
+                Instr::Label(Label(3)),
+                Instr::Return,
+            ],
+            Vec::new(),
+        );
+        module.functions.extend(second.functions);
+
+        let map = build_label_map(&module);
+        assert_eq!(map.resolve(Label(1)).unwrap(), (0, 0));
+        assert_eq!(map.resolve(Label(2)).unwrap(), (1, 0));
+        assert_eq!(map.resolve(Label(3)).unwrap(), (1, 2));
+    }
+
+    /// A missing label is the exact same typed error the previous `BTreeMap` map
+    /// produced, through every entry point (`LabelMap::resolve`, `resolve`,
+    /// `resolve_label`).
+    #[test]
+    fn label_map_missing_label_is_the_same_typed_error() {
+        let (module, _) =
+            module_with_function(vec![Instr::Label(Label(1)), Instr::Return], Vec::new());
+        let map = build_label_map(&module);
+
+        assert!(matches!(map.resolve(Label(99)), Err(BeamError::BadArg)));
+        assert!(matches!(resolve(&map, Label(99)), Err(BeamError::BadArg)));
+        assert!(matches!(
+            resolve_label(&module, Label(99)),
+            Err(BeamError::BadArg)
+        ));
+        // An out-of-range label beyond the dense table is a miss, not a panic.
+        assert!(matches!(
+            map.resolve(Label(u32::MAX)),
+            Err(BeamError::BadArg)
+        ));
+        // `Label(0)` is the `NO_FAIL` sentinel, never a code label.
+        assert!(matches!(map.resolve(NO_FAIL), Err(BeamError::BadArg)));
+    }
+
+    /// A sparse id space takes the sorted fallback (so one far-away id can never
+    /// reserve a huge dense table) and still resolves every defined label.
+    #[test]
+    fn label_map_tolerates_a_sparse_id_space() {
+        // `count = 2` but `max = 4_000_000_000`: a dense table would be ~48 GB.
+        let (module, _) = module_with_function(
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Jump {
+                    target: Label(4_000_000_000),
+                },
+                Instr::Label(Label(4_000_000_000)),
+                Instr::Return,
+            ],
+            Vec::new(),
+        );
+        let map = build_label_map(&module);
+        assert_eq!(map.resolve(Label(1)).unwrap(), (0, 0));
+        assert_eq!(map.resolve(Label(4_000_000_000)).unwrap(), (0, 2));
+        assert!(matches!(map.resolve(Label(2)), Err(BeamError::BadArg)));
+    }
+
+    /// The builder used by tests (`new`/`insert`/`from`) replaces a repeated id
+    /// (last wins), exactly like the `BTreeMap` it replaced.
+    #[test]
+    fn label_map_builder_replaces_a_repeated_label() {
+        let mut map = LabelMap::new();
+        map.insert(Label(7), (0, 1));
+        map.insert(Label(7), (0, 2));
+        map.insert(Label(3), (1, 5));
+        assert_eq!(map.resolve(Label(7)).unwrap(), (0, 2));
+        assert_eq!(map.resolve(Label(3)).unwrap(), (1, 5));
+
+        let from = LabelMap::from([(Label(4), (0, 4u32))]);
+        assert_eq!(from.resolve(Label(4)).unwrap(), (0, 4));
+        assert!(matches!(
+            LabelMap::default().resolve(Label(4)),
+            Err(BeamError::BadArg)
+        ));
+    }    #[test]
     fn resolve_label_of_a_missing_label_is_a_typed_error() {
         let (module, _) = module_with_function(vec![Instr::Return], Vec::new());
         assert!(resolve_label(&module, Label(99)).is_err());

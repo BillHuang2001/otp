@@ -32,10 +32,10 @@
 //! [`match_ctx`] holds match entry and match-context handling; [`commands`] holds the
 //! `bs_match` command interpreter; [`reads`] holds the fixed bit/float/UTF decoders
 //! and the match-side integer/float/UTF readers.
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Label, Module};
+use beam_loader::{Instr, Module};
 
 use crate::context::ExecutionContext;
 use crate::machine::Machine;
@@ -66,7 +66,7 @@ pub(crate) use reads::{
 pub(super) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,

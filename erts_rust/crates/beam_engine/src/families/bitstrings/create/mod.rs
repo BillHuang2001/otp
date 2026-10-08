@@ -65,7 +65,7 @@
 mod segments;
 mod size;
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Instr, Label, Module, Operand};
@@ -93,7 +93,7 @@ const DEFAULT_WRITABLE_SIZE: usize = 1024;
 pub(super) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -150,7 +150,7 @@ pub(super) fn exec(
 fn assemble(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     fail: Label,
     segments: &[Operand],
     ctx: &mut dyn ExecutionContext,

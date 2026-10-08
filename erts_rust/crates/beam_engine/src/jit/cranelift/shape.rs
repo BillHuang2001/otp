@@ -8,7 +8,7 @@
 //! element) deopts to the helper, whose interpreter step is the family's exact
 //! semantics (including its exact typed error / `{badmatch, V}` raise).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 use std::mem;
 
 use beam_loader::{Label, Operand, NO_FAIL};
@@ -78,21 +78,21 @@ pub(super) fn inline_select_val(
     value: &Operand,
     fail: Label,
     pairs: &[(Operand, Label)],
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
 ) -> Option<SelectValPlan> {
     // A `NO_FAIL` switch *raises* when no alternative matches; the helper is exact.
     if fail == NO_FAIL {
         return None;
     }
     // An unresolved label keeps the interpreter's exact `unknown_label`.
-    let fail = *labels.get(&fail)?;
+    let fail = labels.resolve(fail).ok()?;
     // The scrutinee must be an x-register in bound, or an immediate constant.
     let scrutinee = cmp_src(value)?;
     // Every alternative must be an immediate constant with a resolved target.
     let mut cases = Vec::with_capacity(pairs.len());
     for (candidate, label) in pairs {
         let word = constant_word(candidate)?;
-        let target = *labels.get(label)?;
+        let target = labels.resolve(*label).ok()?;
         cases.push((word, target));
     }
     Some(SelectValPlan {
@@ -316,14 +316,14 @@ pub(super) fn inline_select_tuple_arity(
     tuple: &Operand,
     fail: Label,
     destinations: &[(Operand, Label)],
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
 ) -> Option<SelectTupleArityPlan> {
     // A `NO_FAIL` switch raises `{badmatch, Tuple}` when no arity matches, which the
     // engine cannot express inline; the helper is exact.
     if fail == NO_FAIL {
         return None;
     }
-    let fail = *labels.get(&fail)?;
+    let fail = labels.resolve(fail).ok()?;
     let src_x = in_bound_x(tuple)?;
     let mut cases = Vec::new();
     for (candidate, label) in destinations {
@@ -333,7 +333,7 @@ pub(super) fn inline_select_tuple_arity(
         if *n < 0 {
             continue;
         }
-        let target = *labels.get(label)?;
+        let target = labels.resolve(*label).ok()?;
         cases.push((*n, target));
     }
     Some(SelectTupleArityPlan {

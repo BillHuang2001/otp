@@ -32,13 +32,12 @@
 //! [`Machine::throw_error`] (a `Step::Goto` into a live catch frame, or a typed
 //! `Err` when there is none). Never a panic.
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
+use beam_loader::{Instr, Module, Operand, NO_FAIL};
 
 use crate::context::ExecutionContext;
-use crate::error;
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
 use crate::terms;
@@ -51,7 +50,7 @@ use crate::Step;
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     instr: &Instr,
     func: u32,
     pc: u32,
@@ -121,10 +120,7 @@ pub(crate) fn exec(
                 }
                 None => *fail,
             };
-            let (next_func, next_pc) = labels
-                .get(&label)
-                .copied()
-                .ok_or_else(|| error::unknown_label(label))?;
+            let (next_func, next_pc) = labels.resolve(label)?;
             Ok(Some(Step::Goto {
                 func: next_func,
                 pc: next_pc,

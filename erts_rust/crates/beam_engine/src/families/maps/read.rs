@@ -13,7 +13,7 @@
 //! label is `NO_FAIL`; an absent key takes the `fail` branch (the parent module docs
 //! carry the full semantics and the ground truth).
 
-use std::collections::BTreeMap;
+use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
@@ -32,7 +32,7 @@ use super::{fail_or_raise, jump_or_unsupported, lookup};
 pub(super) fn get_map_elements(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     ctx: &mut dyn ExecutionContext,
     fail: Label,
     source: &Operand,
@@ -64,7 +64,7 @@ pub(super) fn get_map_elements(
 pub(super) fn has_map_fields(
     machine: &mut Machine,
     module: &Module,
-    labels: &BTreeMap<Label, (u32, u32)>,
+    labels: &LabelMap,
     ctx: &mut dyn ExecutionContext,
     fail: Label,
     source: &Operand,

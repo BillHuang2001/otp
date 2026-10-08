@@ -11,7 +11,7 @@ fn try_pushes_a_catch_frame_and_blanks_the_slot() {
     let mut machine = Machine::new();
     machine.push_frame(0).unwrap();
     let mut ctx = MinimalContext::new();
-    let mut labels = BTreeMap::new();
+    let mut labels = LabelMap::new();
     labels.insert(Label(3), (0u32, 7u32));
 
     let step = exec(
@@ -38,7 +38,7 @@ fn catch_is_the_same_as_try() {
     let mut machine = Machine::new();
     machine.push_frame(0).unwrap();
     let mut ctx = MinimalContext::new();
-    let mut labels = BTreeMap::new();
+    let mut labels = LabelMap::new();
     labels.insert(Label(9), (0u32, 4u32));
     let step = exec(
         &mut machine,
