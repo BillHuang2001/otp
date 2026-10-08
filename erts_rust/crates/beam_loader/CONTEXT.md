@@ -417,6 +417,19 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   operand can be a bare word count or a `z,3` allocation list. `lower_instr` decodes it through
   `HeapNeed` (exactly as `test_heap`/`allocate` do), taking `HeapNeed::words()` for the `u32` field —
   matching the C `marshal_allocation_list`, which always marshals any `z,3` to a single word total.
+- **Opcode arity is table-indexed and the decode vector is pre-sized (measurement-backed).** `src/decode.rs`
+  builds a `OnceLock<[u8; 256]>` arity table *derived from* `Opcode::from_u8`/`Opcode::arity` (the roster
+  stays the single source of truth; a unit test pins all 256 bytes), turning the per-instruction
+  `Opcode::arity()` linear scan (~33 ns) into an array index (~1 ns); `decode_stream` pre-sizes its
+  instruction vector from `stream.len()/4`, capped so a crafted oversized `Code` chunk cannot force an
+  unbounded reservation. Both were justified by the committed `tests/load_cost.rs` measurement (~5-6 %
+  faster module load overall; decoder stage −3.4 %). The remaining ~30 % of load time is IR-owned-`Vec`
+  allocator churn — a future win needs ownership changes in `src/lower/group.rs`/`src/ir.rs`, not the frozen IR.
+- **Load cost is measured, not guessed.** `tests/load_cost.rs` is the committed, dependency-free
+  measurement (deterministic 200-module sample; ns/instruction, bytes/second, per-stage and per-module
+  breakdown). Its own doc header carries a "recorded reference numbers" table; treat those as indicative
+  and re-measure rather than quote (single-pass wall clock is noisy on shared machines — the per-module
+  aggregate is the stable metric).
 
 ## Test Strategy
 - **Fixtures:** the committed oracle `.beam` files, all compiled from the checked-in `.erl` sources with
