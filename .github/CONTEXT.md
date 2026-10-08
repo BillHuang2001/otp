@@ -41,6 +41,7 @@ Changed-path detection is generated at run time: `scripts/path-filters.sh` and `
 - `osv-scanner-scheduled.yml` also triggers on `pull_request`, but every job is gated to `schedule`, so PR runs are no-ops.
 - `reusable-vex-attest.yml` has no in-repo caller (dispatch-only) and, like `reusable-vendor-vulnerability-scanner.yml`, depends on repo-scoped variables/secrets that do not exist in forks.
 - Workflow file extensions are inconsistent (27 files use `.yaml`, 6 use `.yml`); ratchet/Renovate globs cover both.
+- **No CI coverage of the `erts_rust/` Rust rewrite**: no workflow, composite action, Dockerfile or CI script references `erts_rust`, `cargo`/`rustc`/`rustup`, `beam_abi`, the `differential` harness, `--export-dynamic` or `.rs` files. Every build/test job targets the legacy C/C++ ERTS tree (word-boundary search for `rust`/`cargo`/`rustc`/`differential` under `.github/` is empty of matches). The rewrite's `cargo build/test --workspace` + differential harness are run out-of-band, not by this CI.
 
 ## Notes for Agents
 - Read only the file you need: workflows are self-describing YAML with license headers; the per-directory CONTEXT.md files below carry the contracts, so avoid re-deriving them.
