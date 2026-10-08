@@ -2,10 +2,11 @@
 //! on, pinned at the executable boundary (`CARGO_BIN_EXE_beam_rt`) so it cannot drift
 //! silently.
 //!
-//! The harness measures `<beam_rt> -pa <dir> run <file> <spec> <N> 0`, best-of-k, and
-//! *verifies every measured run*: it compares the child's stdout with the value the
-//! fixture is expected to return (`0` for `pc:add/2`, `N` for `pc:loop/2`). Two facts make
-//! that possible, and both are asserted here:
+//! The harness measures `<beam_rt> -pa <dir> run <file> <spec> <N> 0` at each of two large
+//! iteration counts (a two-point slope, fastest of k with a discarded warm-up), and
+//! *verifies every run* - warm-ups included: it compares the child's stdout with the value
+//! the fixture is expected to return (`0` for `pc:add/2`, `N` for `pc:loop/2`). Two facts
+//! make that possible, and both are asserted here:
 //!
 //! 1. `run` **prints the returned value** (`~w~n`), so a run that did not execute the
 //!    workload is distinguishable from a fast one - the self-check the harness relies on.

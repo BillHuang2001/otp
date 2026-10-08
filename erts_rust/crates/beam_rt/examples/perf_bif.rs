@@ -1,52 +1,100 @@
 //! `perf_bif` - a dependency-free (std-only) **performance-regression harness** for the
-//! `beam_rt` runtime: it measures the *marginal* per-call cost of a compiled Erlang loop
-//! and prints it as a table, so a change to the runtime can be compared against a recorded
-//! baseline instead of a feeling.
+//! `beam_rt` runtime: it measures the *marginal* per-iteration cost of a compiled Erlang
+//! loop and prints it as a table, so a change to the runtime can be compared against a
+//! recorded baseline instead of a feeling.
 //!
 //! # Recipe
 //!
 //! ```text
+//! erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt
 //! erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt --example perf_bif
 //! erts_rust/scripts/cargo.sh run   --manifest-path erts_rust/Cargo.toml --release -p beam_rt --example perf_bif
 //! ```
 //!
-//! The `build` line is also what produces the runtime binary this harness drives (the
-//! `run` line rebuilds and runs it); both must be run from the repository root so that the
-//! example finds `<target>/<profile>/beam_rt` next to itself.
+//! The harness drives the `beam_rt` **binary** (not the example), so that binary must be
+//! built too; both commands must run from the repository root so the example finds
+//! `<target>/<profile>/beam_rt` next to itself.
 //!
-//! # What is measured, and why the figure is *marginal*
-//!
-//! The fixture module - embedded below as a string and compiled at run time with `erlc`
-//! into a temp directory, so no path resolution is needed - is a tail-recursive counter:
-//!
-//! * `pc:add/2` performs **one** arithmetic operation per iteration (`N-1`);
-//! * `pc:loop/2` performs **two** (`N-1` and `A+1`).
-//!
-//! Each iteration is therefore one registered-BIF dispatch round trip for `add` and two
-//! for `loop`, and the *slope difference* between the two is the marginal cost of one
-//! BIF call - the number that moves when dispatch, atom interning or term construction
-//! regress.
-//!
-//! Every workload is run at `N = 0` and at `N = <large>`, best-of-k wall clock, and the
-//! reported figure is
+//! # The fixture
 //!
 //! ```text
-//! ns/call = (t_large - t_0) / (N_large - N_0)
+//! add(0, A)  -> A;
+//! add(N, A)  -> add(N-1, A).
+//!
+//! loop(0, A) -> A;
+//! loop(N, A) -> loop(N-1, A+1).
 //! ```
 //!
-//! The `N = 0` run pays a full process start-up (boot, module load, scheduling) and
-//! nothing else, so subtracting it removes the ~10-150 ms of per-process overhead from
-//! the per-call figure instead of folding it into it.
+//! `pc:add/2` performs **one** arithmetic operation per iteration, `pc:loop/2` **two**.
+//! Both are tail-recursive, so an iteration is one trip around a compiled loop.
+//!
+//! # What the `ns/call` number is (and is NOT)
+//!
+//! Disassembling the compiled fixture (`beam_disasm:file/1`) shows that `N-1` / `N+1` do
+//! **not** compile to a `call_ext erlang:'-'/2` BIF call. They compile to a `gc_bif`
+//! arithmetic **instruction** (`{gc_bif,'-',{f,0},2,[{x,0},{integer,1}],{x,0}}`), and the
+//! recursive call compiles to a local `call_only` tail call.
+//!
+//! `beam_rt run` enters the engine on the **baseline JIT tier** (`Tier::BaselineJit`,
+//! always available). That tier's single bounded optimisation is the guarded small-int
+//! `gc_bif` fast path for `+`/`-`/`*`: the instruction is emitted as a handful of native
+//! instructions and the local `call_only` is linked natively. So `ns/call` here is the
+//! cost of **one iteration of a natively compiled loop** - the guard `test`, the
+//! instruction's arithmetic (inlined once for `add`, twice for `loop`) and the native tail
+//! call.
+//!
+//! It is therefore **not** a registered-BIF dispatch round trip. The runtime only routes a
+//! `gc_bif` through `ExecutionContext::call_bif` (NIF check -> native floor -> registry
+//! lookup -> BIF) when the baseline tier cannot inline it; that path measures roughly two
+//! orders of magnitude more per iteration (verified with a non-inlinable BIF in the same
+//! loop shape). A regression in BIF dispatch / atom interning / term construction moves
+//! this figure only once the tier stops inlining, i.e. as a step change rather than a
+//! slope. The `pc:loop - pc:add` difference isolates **one further natively inlined
+//! small-int arithmetic operation** (empirically ~0.1 ns, about a third of a cycle), not
+//! one further BIF call.
+//!
+//! # Why a two-point slope (and not `t(N) - t(0)`)
+//!
+//! A single process pays ~15-20 ms of start-up (boot, module load, scheduling). Measuring
+//! the workload at `N` and subtracting an `N = 0` run folds that start-up's *jitter*
+//! (+/- several ms) straight into the result - and because the whole workload is often
+//! *smaller* than that jitter, the figure is pure noise (it can even go negative). The
+//! harness therefore cancels the constant start-up **exactly** with a slope across two
+//! large points:
+//!
+//! ```text
+//! ns/call = (t(N2) - t(N1)) / (N2 - N1)
+//! ```
+//!
+//! The per-process cost is added to both `t(N1)` and `t(N2)` and cancels in the
+//! difference. Both points are large enough that the *work* dominates the start-up jitter
+//! (see [`DEFAULT_N1`]), and each point is the **fastest of [`BEST_OF`]** timed runs after
+//! [`WARMUP`] discarded warm-up runs: a timing can only be perturbed upwards, so the
+//! minimum is the best estimator available, and the warm-up absorbs the JIT / code-cache /
+//! filesystem cost of the first run.
+//!
+//! # Never a negative slope
+//!
+//! If `t(N2) <= t(N1)` at a point, the workload is below this host's measurement
+//! resolution there and the harness does **not** print a non-positive figure. It scales
+//! both points up by [`GROWTH_FACTOR`] (at most [`MAX_GROWTH`] times, and never past
+//! [`MAX_N1`]) and re-measures; if the slope is still not positive it **fails loudly**
+//! (exit 1) rather than reporting a number that means nothing. The `pc:loop - pc:add`
+//! "margin of one further arithmetic op" is computed the same way, from the two
+//! calibrated slopes, and is reported as *below measurement resolution* when their
+//! difference is not resolvable - never as a negative number.
 //!
 //! # Configuration
 //!
-//! * `<N>` - the optional first argument: the iteration count (default `200_000`).
-//! * `$PERF_BASELINE_ADD_NS` / `$PERF_BASELINE_LOOP_NS` - a recorded `ns/call` integer per
+//! * `<N1>` - the optional first argument: the **low** iteration count of the slope
+//!   (default [`DEFAULT_N1`]); the high point is `N1 * SPAN_FACTOR`. A small `N1` is
+//!   auto-scaled up (see above) and is more likely to be unresolvable.
+//! * `$PERF_BASELINE_ADD_NS` / `$PERF_BASELINE_LOOP_NS` - a recorded `ns/call` number per
 //!   workload. When either is set, the table gains the
 //!   `baseline_ns | delta_ns | speedup` columns; this is the before/after mechanism.
-//!   **Compare only against a baseline recorded at the same `N`:** the per-call figure is
-//!   not completely `N`-independent (the loop's memory footprint grows with the
-//!   iteration count), so a run at another `N` is a different measurement.
+//!   **Compare only against a baseline recorded with the same slope points:** the figure
+//!   is not completely independent of `N` (the loop's memory footprint grows with the
+//!   iteration count), so a run at other points is a different measurement.
 //! * `$ERTS_STDLIB_DIR` - passed to the child when set, else discovered *cheaply* from the
 //!   `erl` on `$PATH` (a filesystem walk - never a spawn), because an unset value costs
 //!   the child one `erl` start-up per run.
@@ -83,11 +131,31 @@ loop(0, A) -> A;
 loop(N, A) -> loop(N-1, A+1).
 ";
 
-/// The default iteration count (the first command-line argument overrides it).
-const DEFAULT_N: u64 = 200_000;
-/// How often each measurement is repeated; the **fastest** run is reported (a timing can
-/// only be perturbed upwards by the host, so the minimum is the best estimate available).
-const BEST_OF: usize = 3;
+/// The default **low** iteration count of the slope (the first command-line argument
+/// overrides it); the high point is `N1 * SPAN_FACTOR`.
+///
+/// Both points must be large enough that the run's *work* outweighs the ~15-20 ms of
+/// per-process start-up whose jitter the slope has to survive. On the reference host one
+/// iteration costs ~2.5 ns, so `N1 = 16_000_000` is ~40 ms of work against ~17 ms of
+/// start-up and `N2 = 64_000_000` is ~160 ms; the 48M-iteration span makes the slope
+/// reproducible to a few percent run to run. Tuned empirically: a `1_000_000 /
+/// 4_000_000` pair leaves the work (a few ms) *below* the start-up jitter and the slope is
+/// not reproducible at all.
+const DEFAULT_N1: u64 = 16_000_000;
+/// The **high** point of the slope is `N1 * SPAN_FACTOR`.
+const SPAN_FACTOR: u64 = 4;
+/// How many timed runs are kept at each point; the **fastest** is used (a timing can only
+/// be perturbed upwards, so the minimum is the best estimate available).
+const BEST_OF: usize = 5;
+/// How many runs are discarded (untimed) at each point, to warm the JIT / code cache and
+/// the filesystem before the measured samples.
+const WARMUP: usize = 1;
+/// How many times the slope's points may be scaled up when no positive slope is found.
+const MAX_GROWTH: u32 = 3;
+/// The factor each auto-scale multiplies the low point by.
+const GROWTH_FACTOR: u64 = 4;
+/// An absolute cap on the auto-scaled low point: a runaway scale would run for minutes.
+const MAX_N1: u64 = 256_000_000;
 /// The second argument every workload is called with (see [`PC_SOURCE`]).
 const ACCUMULATOR: &str = "0";
 
@@ -104,7 +172,7 @@ struct Workload {
 }
 
 /// The two workloads. `add` does one arithmetic op per iteration, `loop` two, so the
-/// difference of their slopes is the marginal cost of a single BIF call.
+/// difference of their slopes is the marginal cost of a single further arithmetic op.
 const WORKLOADS: [Workload; 2] = [
     Workload {
         label: "pc:add",
@@ -120,25 +188,35 @@ const WORKLOADS: [Workload; 2] = [
     },
 ];
 
-/// One workload's measurements.
+/// One workload's calibrated slope.
 struct Row {
     /// The workload.
     workload: &'static Workload,
-    /// The calibration run's wall clock (`N = 0`): per-process overhead only.
-    at_zero: Duration,
-    /// The measured run's wall clock (`N = n`).
-    at_n: Duration,
+    /// The low iteration count (`t(N1)`).
+    n1: u64,
+    /// The high iteration count (`t(N2)`).
+    n2: u64,
+    /// The fastest measured wall clock at `N1`.
+    at_n1: Duration,
+    /// The fastest measured wall clock at `N2`.
+    at_n2: Duration,
     /// The recorded baseline for this workload, when the environment supplies one.
     baseline: Option<f64>,
 }
 
 impl Row {
+    /// The wall-clock span between the two points (`t(N2) > t(N1)` by construction).
+    fn span(&self) -> Duration {
+        self.at_n2.saturating_sub(self.at_n1)
+    }
+
     /// The marginal cost of one iteration, in nanoseconds.
     ///
-    /// `N >= 1` is enforced by [`iteration_count`], so this is always finite.
-    fn ns_per_call(&self, n: u64) -> f64 {
-        let delta = self.at_n.saturating_sub(self.at_zero);
-        delta.as_nanos() as f64 / n as f64
+    /// [`measure`] only returns a row once `t(N2) > t(N1)` and `N2 > N1`, so the span is at
+    /// least one nanosecond and this is finite and strictly positive - the harness never
+    /// prints a non-positive slope.
+    fn ns_per_call(&self) -> f64 {
+        self.span().as_nanos() as f64 / (self.n2 - self.n1) as f64
     }
 }
 
@@ -172,9 +250,9 @@ fn main() {
     }
 }
 
-/// Measures every workload and prints the two tables.
+/// Measures every workload and prints the slope table.
 fn run() -> Result<(), Failure> {
-    let n = iteration_count()?;
+    let n1 = low_iteration_count()?;
 
     let erlc = find_on_path("erlc").ok_or_else(|| {
         Failure::Skip(
@@ -187,90 +265,124 @@ fn run() -> Result<(), Failure> {
     let runtime = locate_runtime()?;
     let stdlib = discover_stdlib();
 
-    println!("beam_rt performance-regression harness - marginal per-call cost");
+    print_header(&runtime, &beam, n1, stdlib.as_deref());
+
+    let mut rows = Vec::with_capacity(WORKLOADS.len());
+    for workload in &WORKLOADS {
+        rows.push(measure(
+            &runtime,
+            dir.path(),
+            &beam,
+            workload,
+            n1,
+            stdlib.as_deref(),
+        )?);
+    }
+
+    print_table(&rows);
+    print_marginal(&rows);
+    if rows.iter().any(|row| row.baseline.is_some()) {
+        println!(
+            "speedup > 1.00x means faster than the recorded baseline; delta_ns is measured - \
+             baseline, so only compare runs with the same slope points. The two slopes are the \
+             LOW/N2 points named per row and may differ if a row was auto-scaled."
+        );
+    }
+
+    Ok(())
+}
+
+/// Prints the run's configuration and how to read the `ns/call` column.
+fn print_header(runtime: &Path, beam: &Path, n1: u64, stdlib: Option<&Path>) {
+    println!("beam_rt performance-regression harness - marginal per-iteration cost");
     println!("  runtime:          {}", runtime.display());
     println!("  fixture:          {}", beam.display());
-    println!("  iterations:       {n} (best of {BEST_OF})");
+    println!(
+        "  slope:            ns/call = (t(N2) - t(N1)) / (N2 - N1), with N2 = {SPAN_FACTOR} x N1"
+    );
+    println!("  requested N1:     {n1} (auto-scaled up when the slope is not positive)");
+    println!(
+        "  samples:          fastest of {BEST_OF} timed runs at each point ({WARMUP} warm-up discarded)"
+    );
     println!(
         "  ERTS_STDLIB_DIR:  {}",
-        match stdlib.as_deref() {
+        match stdlib {
             Some(dir) => dir.display().to_string(),
             None => "<unset: the child spawns `erl` once per run>".to_string(),
         }
     );
     println!();
-
-    let mut rows = Vec::with_capacity(WORKLOADS.len());
-    for workload in &WORKLOADS {
-        let at_zero = best_of(&runtime, dir.path(), &beam, workload, 0, stdlib.as_deref())?;
-        let at_n = best_of(&runtime, dir.path(), &beam, workload, n, stdlib.as_deref())?;
-        rows.push(Row {
-            workload,
-            at_zero: at_zero.wall,
-            at_n: at_n.wall,
-            baseline: baseline_ns(workload.baseline_var),
-        });
-    }
-
-    // The calibration block: what the `N = 0` run pays (per-process overhead), so the
-    // subtraction behind every `ns/call` figure is visible rather than implied.
-    println!("calibration (N=0: process start-up only, subtracted from every slope)");
-    println!("{:<10} {:>8} {:>12}", "module", "N", "wall_ms");
-    for row in &rows {
-        println!(
-            "{:<10} {:>8} {:>12.1}",
-            row.workload.label,
-            0,
-            milliseconds(row.at_zero)
-        );
-    }
+    println!("  pc.beam lowers `N-1`/`N+1` to a gc_bif arithmetic INSTRUCTION (not a `call_ext` BIF");
+    println!("  call) and the recursion to a local `call_only`. `run` executes on the baseline JIT");
+    println!("  tier, which natively inlines the small-int gc_bif fast path - so `ns/call` is the");
+    println!("  cost of one iteration of a NATIVE loop, not a registered-BIF dispatch round trip.");
     println!();
+}
 
+/// Prints the slope table (one row per workload).
+fn print_table(rows: &[Row]) {
     let with_baseline = rows.iter().any(|row| row.baseline.is_some());
     if with_baseline {
         println!(
-            "{:<10} {:>8} {:>12} {:>14} {:>14} {:>14} {:>9}",
-            "module", "N", "wall_ms", "ns/call", "baseline_ns", "delta_ns", "speedup"
+            "{:<10} {:>12} {:>12} {:>10} {:>10} {:>10} {:>12} {:>12} {:>12} {:>9}",
+            "module",
+            "N1",
+            "N2",
+            "t(N1)_ms",
+            "t(N2)_ms",
+            "span_ms",
+            "ns/call",
+            "baseline_ns",
+            "delta_ns",
+            "speedup"
         );
     } else {
         println!(
-            "{:<10} {:>8} {:>12} {:>14}",
-            "module", "N", "wall_ms", "ns/call"
+            "{:<10} {:>12} {:>12} {:>10} {:>10} {:>10} {:>12}",
+            "module", "N1", "N2", "t(N1)_ms", "t(N2)_ms", "span_ms", "ns/call"
         );
     }
-    for row in &rows {
-        let ns_per_call = row.ns_per_call(n);
+    for row in rows {
+        let ns_per_call = row.ns_per_call();
         let columns = if with_baseline {
             baseline_columns(ns_per_call, row.baseline)
         } else {
             String::new()
         };
         println!(
-            "{:<10} {:>8} {:>12.1} {:>14.1}{columns}",
+            "{:<10} {:>12} {:>12} {:>10.1} {:>10.1} {:>10.1} {:>12.2}{columns}",
             row.workload.label,
-            n,
-            milliseconds(row.at_n),
+            row.n1,
+            row.n2,
+            milliseconds(row.at_n1),
+            milliseconds(row.at_n2),
+            milliseconds(row.span()),
             ns_per_call,
         );
     }
     println!();
+}
 
-    // The slope difference: `loop` runs exactly one more arithmetic BIF per iteration
-    // than `add`, so this isolates a single BIF-dispatch round trip.
-    if let [add, lp] = rows.as_slice() {
-        let difference = lp.ns_per_call(n) - add.ns_per_call(n);
-        println!(
-            "marginal cost of one further arithmetic BIF (pc:loop - pc:add): {difference:.1} ns/call"
-        );
+/// Prints the slope difference between the two workloads.
+///
+/// `pc:loop` runs exactly one more arithmetic op per iteration than `pc:add`, so the
+/// difference of their (robust) slopes isolates a single further inlined arithmetic op.
+/// Because both slopes are calibrated the same way, the difference never goes negative by
+/// itself; if it is not resolvable the harness says so instead of printing a number.
+fn print_marginal(rows: &[Row]) {
+    if let [add, lp] = rows {
+        let difference = lp.ns_per_call() - add.ns_per_call();
+        if difference > 0.0 {
+            println!(
+                "marginal cost of one further arithmetic op (pc:loop - pc:add): {difference:.2} ns/call"
+            );
+        } else {
+            println!(
+                "marginal cost of one further arithmetic op (pc:loop - pc:add): below measurement \
+                 resolution at these points (the two slopes differ by {difference:.2} ns/call)"
+            );
+        }
     }
-    if with_baseline {
-        println!(
-            "speedup > 1.00x means faster than the recorded baseline; delta_ns is measured - \
-             baseline, so only compare runs at the same N."
-        );
-    }
-
-    Ok(())
 }
 
 /// Prints the recorded baseline for `var`, or `None` when it is unset or unparsable.
@@ -300,12 +412,12 @@ fn baseline_ns(var: &str) -> Option<f64> {
 fn baseline_columns(measured_ns: f64, baseline: Option<f64>) -> String {
     match baseline {
         Some(baseline) => format!(
-            "{:>14.1} {:>14.1} {:>9}",
+            " {:>12.1} {:>12.1} {:>9}",
             baseline,
             measured_ns - baseline,
             format!("{:.2}x", baseline / measured_ns)
         ),
-        None => format!("{:>14} {:>14} {:>9}", "-", "-", "-"),
+        None => format!(" {:>12} {:>12} {:>9}", "-", "-", "-"),
     }
 }
 
@@ -317,11 +429,71 @@ struct Timed {
     stdout: String,
 }
 
-/// Runs one workload `BEST_OF` times and returns the fastest run.
+/// Calibrates `workload`'s slope, auto-scaling the points up when no positive slope can be
+/// measured.
 ///
-/// Each run is also the self-check: `run` prints the value the fixture returns (`0` for
-/// `pc:add/2`, `N` for `pc:loop/2`), so a run printing anything else is a genuine failure
-/// rather than a slow measurement.
+/// Returns a [`Row`] only for a **strictly positive** slope: `t(N2) > t(N1)`. A flat or
+/// negative slope means the work is below the host's measurement resolution at the tried
+/// points, so rather than folding that into a meaningless figure the points are scaled up
+/// (by [`GROWTH_FACTOR`], at most [`MAX_GROWTH`] times, never past [`MAX_N1`]) and
+/// re-measured. If every tried point is flat the measurement **fails loudly**.
+fn measure(
+    runtime: &Path,
+    code_dir: &Path,
+    beam: &Path,
+    workload: &'static Workload,
+    base_n1: u64,
+    stdlib: Option<&Path>,
+) -> Result<Row, Failure> {
+    let mut n1 = base_n1;
+    let mut growth = 0u32;
+    loop {
+        let n2 = n1.checked_mul(SPAN_FACTOR).ok_or_else(|| {
+            Failure::Error(format!(
+                "{}: N1={n1} x {SPAN_FACTOR} overflows a 64-bit iteration count",
+                workload.label
+            ))
+        })?;
+        let at_n1 = best_of(runtime, code_dir, beam, workload, n1, stdlib)?;
+        let at_n2 = best_of(runtime, code_dir, beam, workload, n2, stdlib)?;
+        if at_n2 > at_n1 {
+            return Ok(Row {
+                workload,
+                n1,
+                n2,
+                at_n1,
+                at_n2,
+                baseline: baseline_ns(workload.baseline_var),
+            });
+        }
+        let grown = n1.saturating_mul(GROWTH_FACTOR);
+        if growth >= MAX_GROWTH || grown <= n1 || grown > MAX_N1 {
+            return Err(Failure::Error(format!(
+                "{}: no positive slope at any iteration count tried (up to N1={n1}): t(N2)={:.3} \
+                 ms never exceeded t(N1)={:.3} ms. The workload is below this host's measurement \
+                 resolution; refusing to report a non-positive slope.",
+                workload.label,
+                milliseconds(at_n2),
+                milliseconds(at_n1),
+            )));
+        }
+        eprintln!(
+            "note: {}: t(N2) ({:.3} ms) did not exceed t(N1) ({:.3} ms) at N1={n1}; scaling the \
+             slope's points up to N1={grown}",
+            workload.label,
+            milliseconds(at_n2),
+            milliseconds(at_n1),
+        );
+        n1 = grown;
+        growth += 1;
+    }
+}
+
+/// Runs one workload `WARMUP + BEST_OF` times and returns the fastest **timed** run.
+///
+/// Every run (including the discarded warm-ups) is also the self-check: `run` prints the
+/// value the fixture returns (`0` for `pc:add/2`, `N` for `pc:loop/2`), so a run printing
+/// anything else is a genuine failure rather than a slow measurement.
 fn best_of(
     runtime: &Path,
     code_dir: &Path,
@@ -329,10 +501,10 @@ fn best_of(
     workload: &Workload,
     n: u64,
     stdlib: Option<&Path>,
-) -> Result<Timed, Failure> {
+) -> Result<Duration, Failure> {
     let expected = (workload.expected)(n);
-    let mut best: Option<Timed> = None;
-    for _ in 0..BEST_OF {
+    let mut best: Option<Duration> = None;
+    for index in 0..(WARMUP + BEST_OF) {
         let timed = run_once(runtime, code_dir, beam, workload.spec, n, stdlib)?;
         if timed.stdout != expected {
             return Err(Failure::Error(format!(
@@ -341,11 +513,14 @@ fn best_of(
                 workload.spec, timed.stdout
             )));
         }
-        if best.as_ref().map_or(true, |current| timed.wall < current.wall) {
-            best = Some(timed);
+        if index >= WARMUP {
+            best = Some(match best {
+                Some(current) if current <= timed.wall => current,
+                _ => timed.wall,
+            });
         }
     }
-    best.ok_or_else(|| Failure::Error("internal: no measurement was taken".to_string()))
+    best.ok_or_else(|| Failure::Error("internal: no timed run was recorded".to_string()))
 }
 
 /// Runs the runtime once and times it.
@@ -562,19 +737,19 @@ fn ancestors(path: &Path, limit: usize) -> Vec<PathBuf> {
     out
 }
 
-/// The iteration count: the first argument, or [`DEFAULT_N`].
-fn iteration_count() -> Result<u64, Failure> {
+/// The **low** iteration count of the slope: the first argument, or [`DEFAULT_N1`].
+fn low_iteration_count() -> Result<u64, Failure> {
     let mut args = env::args().skip(1);
     let raw = match args.next() {
         Some(raw) => raw,
-        None => return Ok(DEFAULT_N),
+        None => return Ok(DEFAULT_N1),
     };
     if raw == "-h" || raw == "--help" {
         return Err(Failure::Help);
     }
     if args.next().is_some() {
         return Err(Failure::Usage(
-            "too many arguments (only the iteration count is accepted)".to_string(),
+            "too many arguments (only the low iteration count is accepted)".to_string(),
         ));
     }
     let n = raw
@@ -604,9 +779,12 @@ fn skip_loudly(why: &str) {
 
 /// The usage text (`-h`/`--help`, and on a malformed invocation).
 fn print_usage() {
-    println!("usage: perf_bif [N]");
+    println!("usage: perf_bif [N1]");
     println!();
-    println!("  N  iterations per workload, at least 1 (default {DEFAULT_N})");
+    println!(
+        "  N1  the LOW iteration count of the slope, at least 1 (default {DEFAULT_N1});"
+    );
+    println!("      the high point is N1 * {SPAN_FACTOR}");
     println!();
     println!("environment:");
     println!("  PERF_BASELINE_ADD_NS   recorded ns/call for pc:add/2 (adds the comparison columns)");
