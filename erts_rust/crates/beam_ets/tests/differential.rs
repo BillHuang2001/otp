@@ -52,7 +52,9 @@
 //! `ordered_set` navigation (`first`/`next`/`last`/`prev`, absent anchors, empty
 //! table, `'$end_of_table'`) plus the **mixed-key key-order** contract over
 //! integers (incl. negative and zero), atoms, tuples, lists and binaries, and the
-//! integer/float interleaving (the arithmetic key order, pinned separately);
+//! integer/float interleaving (the arithmetic key order, pinned separately),
+//! plus the **replaced key term** of an arithmetically-equal-but-different-term
+//! insert (`{1,a}` then `{1.0,b}`, rendered through `is_float/1`);
 //! `update_counter/3,4` (scalar, `{Pos,Incr}`,
 //! `{Pos,Incr,Threshold,SetValue}`, operation lists, defaults, absent keys,
 //! counter-incapable kinds, and a threshold/default combination); `update_element/3`;
@@ -149,6 +151,11 @@
 //!   (`-3 < -2.5 < 0 < 1.5 < 5`) and `1` and `1.0` are the *same* key.
 //!   `beam_ets` reproduces this (`compare::cmp_arith`), so
 //!   [`KNOWN_DIVERGENCES`] is empty and every case is compared strictly.
+//! * **A replacing insert also replaces the stored key term**: inserting
+//!   `{1.0,b}` over `{1,a}` collapses to one object and makes `ets:first`/
+//!   `ets:last`/`ets:next` report the *last-inserted* key term (`1.0`, and `1` in
+//!   the reverse order) — `ordered_replaced_key_term` pins both orders plus a
+//!   three-key (`1`/`1.0`/`2`) `next` that crosses the collapsed key.
 //! * **Reclamation is invisible.** Repeated insert/delete churn and
 //!   `delete_all_objects/1` leave only an observable trace (`size`, `member`,
 //!   `lookup`, `tab2list`); `memory` and the table `id` are never rendered
@@ -249,6 +256,10 @@ const EXPECTED: &[(&str, &str)] = &[
     (
         "ordered_float_key_order",
         "{[i2,f2,i3,f1,i1],i2,i1,[i2,f2,i3,f1,i1],[i1,f1,i3,f2,i2]}",
+    ),
+    (
+        "ordered_replaced_key_term",
+        "{{1,true,true,$end_of_table},{1,false,false,$end_of_table},{2,true,false,2}}",
     ),
     ("update_counter_3_variants", "{15,12,25,[13,26],[{1,13,26}]}"),
     ("update_counter_3_absent", "{badarg,badarg,0}"),

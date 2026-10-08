@@ -220,6 +220,73 @@ impl Battery {
         ])
     }
 
+    /// An insert whose key is **arithmetically equal** to a stored key but a
+    /// *different term* (`{1,a}` then `{1.0,b}`) replaces the object **and** the
+    /// stored **key term**, so `first`/`last`/`next` report the last-inserted key
+    /// term. Floats are not renderable, so the case renders `is_float/1` of the
+    /// key terms (an atom) rather than the terms themselves.
+    fn ordered_replaced_key_term(&mut self) -> String {
+        let one = make_small(1);
+        let one_float = self.float(1.0);
+        let int_then_float = self.replaced_key_terms(one, one_float);
+        let float_then_int = self.replaced_key_terms(one_float, one);
+        let three = {
+            let mut table = self.table(TableKind::OrderedSet, 1);
+            let key_two = make_small(2);
+            let tags = [self.atom("a"), self.atom("b"), self.atom("c")];
+            for (key, tag) in [(one, tags[0]), (one_float, tags[1]), (key_two, tags[2])] {
+                let object = self.tuple(&[key, tag]);
+                table.insert(object, &self.atoms).expect("insert");
+            }
+            let first = table.first(&self.atoms);
+            let last = table.last(&self.atoms);
+            let next = table
+                .next(first.expect("the table is non-empty"), &self.atoms)
+                .expect("ordered_set next");
+            tuple_of(&[
+                self.r(make_small(table.size() as i64)),
+                self.is_float_key(first),
+                self.is_float_key(last),
+                self.opt(next),
+            ])
+        };
+        tuple_of(&[int_then_float, float_then_int, three])
+    }
+
+    /// The 2-insert collapse: `{FirstKey, a}` then `{SecondKey, b}` (the two keys
+    /// arithmetically equal but different terms), rendered as
+    /// `{Size, is_float(First), is_float(Last), Next}`.
+    fn replaced_key_terms(&mut self, first_key: Eterm, second_key: Eterm) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let first_tag = self.atom("a");
+        let second_tag = self.atom("b");
+        let first_object = self.tuple(&[first_key, first_tag]);
+        table.insert(first_object, &self.atoms).expect("insert");
+        let second_object = self.tuple(&[second_key, second_tag]);
+        table.insert(second_object, &self.atoms).expect("insert");
+        let first = table.first(&self.atoms);
+        let last = table.last(&self.atoms);
+        let next = table
+            .next(first.expect("the table is non-empty"), &self.atoms)
+            .expect("ordered_set next");
+        tuple_of(&[
+            self.r(make_small(table.size() as i64)),
+            self.is_float_key(first),
+            self.is_float_key(last),
+            self.opt(next),
+        ])
+    }
+
+    /// The renderable outcome of the oracle's `is_float(<key term>)` — a float key
+    /// term is not printable, so the case renders the type test as an atom.
+    fn is_float_key(&self, key: Option<Eterm>) -> String {
+        match key {
+            // SAFETY: `is_float` classifies its argument by its tag/header word.
+            Some(term) if unsafe { is_float(term) } => "true".to_string(),
+            _ => "false".to_string(),
+        }
+    }
+
     /// The tag of the inserted key equal to `key` (structural `==`, via
     /// `beam_term::compare::eq`).
     fn tag_of(&self, keys: &[(Eterm, Eterm)], key: Eterm) -> Eterm {
@@ -247,6 +314,10 @@ pub(super) fn navigation_cases(battery: &mut Battery) -> Vec<(String, String)> {
     cases.push((
         "ordered_float_key_order".into(),
         battery.ordered_float_key_order(),
+    ));
+    cases.push((
+        "ordered_replaced_key_term".into(),
+        battery.ordered_replaced_key_term(),
     ));
 
     cases

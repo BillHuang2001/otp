@@ -91,6 +91,7 @@ battery() ->
     emit("ordered_empty_nav", ordered_empty_nav()),
     emit("ordered_mixed_keys", ordered_mixed_keys()),
     emit("ordered_float_key_order", ordered_float_key_order()),
+    emit("ordered_replaced_key_term", ordered_replaced_key_term()),
 
     emit("update_counter_3_variants", update_counter_3_variants()),
     emit("update_counter_3_absent", update_counter_3_absent()),
@@ -313,6 +314,32 @@ ordered_float_key_order() ->
     NextChain = inorder(walk_next_idx(T, ets:first(T), In, [])),
     PrevChain = inorder(walk_prev_idx(T, ets:last(T), In, [])),
     t([IdxOrder, First, Last, NextChain, PrevChain]).
+%% An insert whose key is ARITHMETICALLY EQUAL to a stored key but a DIFFERENT
+%% term (`{1,a}` then `{1.0,b}`) replaces the object *and* the stored key term,
+%% so `ets:first`/`ets:last`/`ets:next` report the last-inserted key term. Floats
+%% are not renderable, so the case renders `is_float/1` of the key terms (an atom)
+%% instead of the terms themselves.
+ordered_replaced_key_term() ->
+    IntThenFloat = replaced_key_terms(1, 1.0),
+    FloatThenInt = replaced_key_terms(1.0, 1),
+    Three = begin
+                T = new(ordered_set),
+                ets:insert(T, {1, a}),
+                ets:insert(T, {1.0, b}),
+                ets:insert(T, {2, c}),
+                t([r(tsize(T)), r(is_float(ets:first(T))),
+                   r(is_float(ets:last(T))), r(ets:next(T, ets:first(T)))])
+            end,
+    t([IntThenFloat, FloatThenInt, Three]).
+
+%% The 2-insert collapse: `{K1, a}` then `{K2, b}`, rendered as
+%% `{Size, is_float(First), is_float(Last), Next}`.
+replaced_key_terms(K1, K2) ->
+    T = new(ordered_set),
+    ets:insert(T, {K1, a}),
+    ets:insert(T, {K2, b}),
+    t([r(tsize(T)), r(is_float(ets:first(T))), r(is_float(ets:last(T))),
+       r(ets:next(T, ets:first(T)))]).
 %% The `ets:next`/`ets:prev` chain, rendering the tag of each visited key (the
 %% key -> tag lookup is `lists:keyfind/3` against the insert list).
 walk_next_idx(_T, '$end_of_table', _In, Acc) -> lists:reverse(Acc);
