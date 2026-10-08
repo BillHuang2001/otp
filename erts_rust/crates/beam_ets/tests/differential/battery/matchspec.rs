@@ -483,6 +483,121 @@ impl Battery {
         self.inorder(&selected)
     }
 
+    /// The whole `select` family over a hand-built `fun2ms`-shaped spec
+    /// (`[{{Head}, [Guards], [Body]}]`), exercising every special body form: a
+    /// bound variable `'$N'`, the whole object `'$_'` and the all-bindings atom
+    /// `'$$'`.
+    ///
+    /// `select_count/2` counts only objects whose body evaluates to `true`, so it
+    /// needs a separate `[true]` body — the `['$1']` body `select/2` uses would
+    /// count zero. `select_replace/2` and `select_delete/2` mutate the table, so
+    /// each runs on its own fresh `ordered_set`.
+    fn fun2ms_spec_family(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        for key in [1i64, 2, 3] {
+            let object = self.tuple(&[make_small(key), make_small(key), make_small(key * 10)]);
+            table.insert(object, &self.atoms).expect("insert");
+        }
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let v3 = self.atom("$3");
+        let wildcard = self.atom("_");
+        let whole = self.atom("$_");
+        let all = self.atom("$$");
+        let gt = self.atom(">");
+        let star = self.atom("*");
+        let truth = self.atom("true");
+
+        let head3 = self.tuple(&[v1, v2, v3]);
+        let guard = self.tuple(&[gt, v3, make_small(15)]);
+        let guards = self.list(&[guard]);
+        let body_var = self.list(&[v1]);
+        let body_true = self.list(&[truth]);
+        let body_whole = self.list(&[whole]);
+        let body_all = self.list(&[all]);
+
+        // `select/2` with the `'$N'` body: the keys above the guard.
+        let sel = self.spec(head3, guards, body_var);
+        let selected = self.select(&table, sel);
+        let r1 = self.inorder(&selected);
+
+        // `select_count/2` with a `[true]` body (the body that counts).
+        let count_spec = self.spec(head3, guards, body_true);
+        let compiled = compile(count_spec, &self.atoms).expect("the spec compiles");
+        let r2 = table
+            .select_count(&compiled, &self.atoms, &mut self.out)
+            .expect("select_count")
+            .to_string();
+
+        // The `match` family over the `{'$1','_','$3'}` pattern.
+        let pattern = self.tuple(&[v1, wildcard, v3]);
+        let mo = table
+            .match_object(pattern, &self.atoms, &mut self.out)
+            .expect("match_object");
+        let mo = self.inorder(&mo);
+        let m = table
+            .match_(pattern, &self.atoms, &mut self.out)
+            .expect("match/2");
+        let m = self.inorder(&m);
+
+        // `select/2` with the `'$_'` whole-object body.
+        let whole_spec = self.spec(pattern, NIL, body_whole);
+        let selected = self.select(&table, whole_spec);
+        let r3 = self.inorder(&selected);
+
+        // `select/2` with the `'$$'` all-bindings body.
+        let all_spec = self.spec(head3, NIL, body_all);
+        let selected = self.select(&table, all_spec);
+        let r4 = self.inorder(&selected);
+
+        // `match_spec_run/2` over a list.
+        let run_head = self.tuple(&[v1, v2]);
+        let run_body = self.list(&[whole]);
+        let run_spec = self.spec(run_head, NIL, run_body);
+        let first = self.object(1, 2);
+        let second = self.object(3, 4);
+        let run_list = self.list(&[first, second]);
+        let r5 = match_spec_run(run_list, run_spec, &self.atoms, &mut self.out)
+            .expect("match_spec_run");
+        let r5 = self.inorder(&r5);
+
+        // `select_replace/2` on a fresh table (the guarded doubling rewrite).
+        let mut replace_table = self.table(TableKind::OrderedSet, 1);
+        for key in [1i64, 2, 3] {
+            replace_table
+                .insert(self.object(key, key * 10), &self.atoms)
+                .expect("insert");
+        }
+        let replace_head = self.tuple(&[v1, v2]);
+        let doubled = self.tuple(&[star, v2, make_small(2)]);
+        let inner = self.tuple(&[v1, doubled]);
+        let construction = self.tuple(&[inner]);
+        let replace_body = self.list(&[construction]);
+        let replace_guard = self.tuple(&[gt, v2, make_small(10)]);
+        let replace_guards = self.list(&[replace_guard]);
+        let replace_spec_term = self.spec(replace_head, replace_guards, replace_body);
+        let replace_spec = compile(replace_spec_term, &self.atoms).expect("the spec compiles");
+        let rc = cap_count(replace_table.select_replace(&replace_spec, &self.atoms, &mut self.out));
+        let rt = self.srt(&replace_table.tab2list());
+
+        // `select_delete/2` on a fresh table (the same guard, a `[true]` body).
+        let mut delete_table = self.table(TableKind::OrderedSet, 1);
+        for key in [1i64, 2, 3] {
+            delete_table
+                .insert(self.object(key, key * 10), &self.atoms)
+                .expect("insert");
+        }
+        let delete_spec_term = self.spec(replace_head, replace_guards, body_true);
+        let delete_spec = compile(delete_spec_term, &self.atoms).expect("the spec compiles");
+        let dc = delete_table
+            .select_delete(&delete_spec, &self.atoms, &mut self.out)
+            .expect("select_delete")
+            .to_string();
+        let dt = self.srt(&delete_table.tab2list());
+
+        tuple_of(&[r1, r2, mo, m, r3, r4, r5, rc, rt, dc, dt])
+    }
+
     /// The compiled spec is what the caller needs; this is the shared
     /// compile-and-run step of the simple select cases.
     fn select(&mut self, table: &Table, spec_term: Eterm) -> Vec<Eterm> {
@@ -544,6 +659,10 @@ pub(super) fn matchspec_cases(battery: &mut Battery) -> Vec<(String, String)> {
         battery.match_spec_run_empty_and_badarg(),
     ));
     cases.push(("body_error_exit".into(), battery.body_error_exit()));
+    cases.push((
+        "fun2ms_spec_family".into(),
+        battery.fun2ms_spec_family(),
+    ));
 
     cases
 }

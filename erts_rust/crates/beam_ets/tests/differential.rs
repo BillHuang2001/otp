@@ -50,12 +50,18 @@
 //! insert_new / duplicate-object / delete_object (matching + non-matching) /
 //! tab2list+size / delete-by-key / take; `{keypos, 2}` insert+lookup+update;
 //! `ordered_set` navigation (`first`/`next`/`last`/`prev`, absent anchors, empty
-//! table, `'$end_of_table'`); `update_counter/3,4` (scalar, `{Pos,Incr}`,
+//! table, `'$end_of_table'`) plus the **mixed-key key-order** contract over
+//! integers (incl. negative and zero), atoms, tuples, lists and binaries, and the
+//! integer/float interleaving pinned separately (a recorded `KNOWN_DIVERGENCE`);
+//! `update_counter/3,4` (scalar, `{Pos,Incr}`,
 //! `{Pos,Incr,Threshold,SetValue}`, operation lists, defaults, absent keys,
-//! counter-incapable kinds); `update_element/3`; `lookup_element/3,4`; `select/2`
+//! counter-incapable kinds, and a threshold/default combination); `update_element/3`;
+//! `lookup_element/3,4`; `select/2`
 //! with variables/wildcards/literals/guards (comparison, type test,
-//! `andalso`/`orelse`) and bodies (`'$_'`, `'$N'`, constants, `{{…}}`
-//! construction); `select_delete/2`+`select_count/2`; the `match` family;
+//! `andalso`/`orelse`) and bodies (`'$_'`, `'$$'`, `'$N'`, constants, `{{…}}`
+//! construction) — incl. a whole `fun2ms`-shaped spec family
+//! (`select`/`select_count`/`select_replace`/`select_delete`/`match`/`match_object`/
+//! `match_spec_run`); `select_delete/2`+`select_count/2`; the `match` family;
 //! malformed specs (`badarg`); `ets:match_spec_run/2` (variable/whole-element/
 //! all-bindings bodies, a repeated head variable, multi-clause first-match-wins,
 //! an empty list, a non-list `badarg`) and the body-error `EXIT` semantics;
@@ -69,7 +75,12 @@
 //! an unknown `ets:info/2` key, `lookup_element/3,4` on the
 //! multi-object kinds, and `ets:insert/2`-over-a-list atomicity);
 //! the **ownership** surface (`ets:give_away/3` success + the badarg cases, and the
-//! `{heir, ...}` option of `ets:setopts/2`); and two
+//! `{heir, ...}` option of `ets:setopts/2`); the **access-control** matrix
+//! (`protected`/`private`/`public` × owner/non-owner read/write/delete) and the
+//! `ets:setopts/2` option surface (only `{heir, ...}` is settable); the
+//! **reclamation-observable** semantics (repeated insert/delete churn and
+//! `delete_all_objects/1` pinned only by `size`/`member`/`lookup`/`tab2list`,
+//! never `memory` or `id`); and two
 //! 10 001-key tables (`set` + `ordered_set`) exercising size, lookups, the
 //! ordered `next` chain and a guarded `select_count`.
 //!
@@ -123,6 +134,23 @@
 //! * **A continuation is an opaque ref** — it is never rendered. The continuation
 //!   cases chain the `/3` entry point and its `/1` resumptions to exhaustion and
 //!   compare only the concatenated, materialized results.
+//! * **The access-control matrix is `Db_READ`/`Db_WRITE`**: the owner may always
+//!   read/write; a non-owner may read but not write a `protected` table, may do
+//!   neither on a `private` one, and may do both on a `public` one — every denial
+//!   is `badarg` (`access_control` pins all three modes × owner/non-owner).
+//! * **`ets:setopts/2` settables only `{heir, ...}`** on OTP 29:
+//!   `{write_concurrency,_}` / `{read_concurrency,_}` / `{decentralized_counters,_}`
+//!   and any unknown option raise `badarg` (they are `ets:new/2` options, not
+//!   runtime ones), and a non-owner `setopts` raises `badarg`
+//!   (`setopts_surface`).
+//! * **Numbers order by value across representations** — an `ordered_set`
+//!   interleaves integers and floats (`-3 < -2.5 < 0 < 1.5 < 5`). This is the one
+//!   case where `beam_ets` disagrees with the oracle today, recorded in
+//!   [`KNOWN_DIVERGENCES`] (`ordered_float_key_order`).
+//! * **Reclamation is invisible.** Repeated insert/delete churn and
+//!   `delete_all_objects/1` leave only an observable trace (`size`, `member`,
+//!   `lookup`, `tab2list`); `memory` and the table `id` are never rendered
+//!   (`reclamation_observable`).
 
 use std::collections::BTreeMap;
 use std::env;
@@ -212,6 +240,14 @@ const EXPECTED: &[(&str, &str)] = &[
         "ordered_empty_nav",
         "{$end_of_table,$end_of_table,$end_of_table,$end_of_table}",
     ),
+    (
+        "ordered_mixed_keys",
+        "{[i2,i3,i1,a1,a2,t1,t2,l1,b1],i2,b1,[i2,i3,i1,a1,a2,t1,t2,l1,b1],[b1,l1,t2,t1,a2,a1,i1,i3,i2]}",
+    ),
+    (
+        "ordered_float_key_order",
+        "{[i2,f2,i3,f1,i1],i2,i1,[i2,f2,i3,f1,i1],[i1,f1,i3,f2,i2]}",
+    ),
     ("update_counter_3_variants", "{15,12,25,[13,26],[{1,13,26}]}"),
     ("update_counter_3_absent", "{badarg,badarg,0}"),
     ("update_counter_3_threshold", "[ok:100,ok:100]"),
@@ -226,6 +262,10 @@ const EXPECTED: &[(&str, &str)] = &[
     (
         "update_counter_4_threshold",
         "[{100,[{1,100}]},{12,[{1,12}]},{100,[{1,100}]},{3,[{1,3}]},{100,[{1,100}]}]",
+    ),
+    (
+        "update_counter_threshold_default",
+        "{15,[{1,15}],-1,[{1,-1}],0,[{1,0}],-5,[{2,-5}],77,[{2,77}]}",
     ),
     ("update_counter_multi_kind", "[badarg,badarg]"),
     (
@@ -302,6 +342,10 @@ const EXPECTED: &[(&str, &str)] = &[
     ("match_spec_run_multi_clause", "[small,big,big]"),
     ("match_spec_run_empty_and_badarg", "{[],badarg}"),
     ("body_error_exit", "[EXIT,EXIT]"),
+    (
+        "fun2ms_spec_family",
+        "{[2,3],2,[{1,1,10},{2,2,20},{3,3,30}],[[1,10],[2,20],[3,30]],[{1,1,10},{2,2,20},{3,3,30}],[[1,1,10],[2,2,20],[3,3,30]],[{1,2},{3,4}],ok:2,[{1,10},{2,40},{3,60}],2,[{1,10}]}",
+    ),
     ("select_replace_small_int", "{ok:2,[{1,10},{2,40},{3,60}]}"),
     ("select_replace_arity1", "{ok:2,[{1},{2}]}"),
     ("select_replace_bag_badarg", "{badarg,[{1,10}]}"),
@@ -339,8 +383,17 @@ const EXPECTED: &[(&str, &str)] = &[
         "insert_list_atomic",
         "{badarg,[{1,10}],badarg,[{a,1}]}",
     ),
+    (
+        "reclamation_observable",
+        "{5,[false,true,true,false],[{4,4}],0,[],1,[{7,70}]}",
+    ),
     ("ownership_give_away", "{ok:true,badarg,badarg,badarg}"),
     ("ownership_heir", "{none,ok:true,ok:true,none,badarg}"),
+    (
+        "access_control",
+        "{{ok:[{1,10}],ok:true,ok:true,ok:[{1,10}],badarg,badarg},{ok:[{1,10}],ok:true,ok:true,badarg,badarg,badarg},{ok:[{1,10}],ok:true,ok:true,ok:[{1,10}],ok:true,ok:true}}",
+    ),
+    ("setopts_surface", "{ok:true,ok:true,badarg,badarg,badarg,badarg,badarg}"),
     (
         "set_large",
         "{10001,[{0,0},{10000,20000},{5000,10000}],5000}",
@@ -591,9 +644,22 @@ fn expected_map() -> BTreeMap<String, String> {
 /// in the battery (rather than dropping them) keeps the oracle's real behaviour in
 /// `EXPECTED` and the gap actionable.
 ///
-/// **Currently empty**: every case in the battery agrees with the live oracle, so
-/// the suite runs with no exclusions.
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[];
+/// **Currently one entry**: the rest of the battery agrees with the live oracle.
+const KNOWN_DIVERGENCES: &[(&str, &str)] = &[(
+    "ordered_float_key_order",
+    "`ordered_set` key ordering across representations. `erl` orders numbers by \
+     *value* across integer/float representations (`-3 < -2.5 < 0 < 1.5 < 5`), so \
+     `ets:tab2list`/`first`/`next` interleave them. `beam_ets` groups every \
+     integer before every float: its `OrderedSetInterior` orders keys through \
+     `beam_term::compare::cmp` (exact mode), whose mixed integer/float arm \
+     (`compare.rs::cmp_numbers`, the `(Float, Small) | (Float, Big) | (Small, \
+     Float) | (Big, Float)` case) ranks by representation \
+     (`class_rank(ca).cmp(&class_rank(cb))`) instead of comparing numerically, \
+     giving `[i2,i3,i1,f2,f1]` where the oracle gives `[i2,f2,i3,f1,i1]`. Fix \
+     would be to order `ordered_set` keys with the arithmetic number order \
+     (`compare::cmp_arith`) rather than the exact-mode `cmp`. The rendering of \
+     equal-valued keys is unaffected (no two keys here are equal).",
+)];
 
 /// `true` when `name` is a recorded divergence.
 fn is_known_divergence(name: &str) -> bool {

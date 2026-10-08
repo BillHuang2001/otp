@@ -13,8 +13,8 @@ use crate::champ_interior::ChampInterior;
 use crate::error::badarg;
 use crate::hash_interior::HashInterior;
 use crate::key::key_of;
-use crate::kind::{SetInterior, TableKind};
-use crate::ordered_interior::OrderedSetInterior;
+use crate::kind::{OrderedInterior, SetInterior, TableKind};
+use crate::ordered_interior::{OrderedSetInterior, SortedOrderedInterior};
 
 use super::update::{add_counters, object_arity, read_counter, replace_elements};
 
@@ -244,14 +244,22 @@ pub(crate) trait Interior: Send + Sync {
 
 /// Build the interior matching `kind`: the CHAMP or chained hash index for
 /// `set` (per `set_interior`), the chained hash index for `bag`/`duplicate_bag`,
-/// the key-sorted B+-tree for `ordered_set`.
-pub(super) fn build_interior(kind: TableKind, set_interior: SetInterior) -> Box<dyn Interior> {
+/// the key-sorted B+-tree or sorted `Vec` for `ordered_set` (per
+/// `ordered_interior`).
+pub(super) fn build_interior(
+    kind: TableKind,
+    set_interior: SetInterior,
+    ordered_interior: OrderedInterior,
+) -> Box<dyn Interior> {
     match kind {
         TableKind::Set => match set_interior {
             SetInterior::Champ => Box::new(ChampInterior::new()),
             SetInterior::Chained => Box::new(HashInterior::new(kind)),
         },
         TableKind::Bag | TableKind::DuplicateBag => Box::new(HashInterior::new(kind)),
-        TableKind::OrderedSet => Box::new(OrderedSetInterior::new()),
+        TableKind::OrderedSet => match ordered_interior {
+            OrderedInterior::BPlusTree => Box::new(OrderedSetInterior::new()),
+            OrderedInterior::Sorted => Box::new(SortedOrderedInterior::new()),
+        },
     }
 }

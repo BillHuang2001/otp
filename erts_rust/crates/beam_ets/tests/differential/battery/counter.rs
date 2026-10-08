@@ -180,6 +180,56 @@ impl Battery {
         list_of(&rendered)
     }
 
+    /// `{Pos, Incr, Threshold, SetValue}` combined with a `/4` default object for
+    /// an absent key (the oracle's `update_counter_threshold_default/0`): a plain
+    /// increment stays below the threshold, crossing it upward (`>=` for a
+    /// positive increment) and downward (`=<` for a negative one) lands on
+    /// `SetValue`, and a value exactly at the threshold is left alone.
+    fn update_counter_threshold_default(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+
+        let operand = self.ints(&[2, 5, 100, 0]);
+        let default = self.ints(&[1, 10]);
+        let v1 = table
+            .update_counter_with(make_small(1), operand, default, &self.atoms, &mut self.out)
+            .expect("update_counter/4");
+        // Rendered *now*: `lookup` aliases table storage and `update_counter`
+        // increments in place, so a term captured here would show a later update.
+        let v1 = self.r(v1);
+        let l1 = self.srt(&table.lookup(make_small(1), &self.atoms));
+
+        let operand = self.ints(&[2, 95, 100, -1]);
+        let v2 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v2 = self.r(v2);
+        let l2 = self.srt(&table.lookup(make_small(1), &self.atoms));
+
+        let operand = self.ints(&[2, 1, 100, 999]);
+        let v3 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v3 = self.r(v3);
+        let l3 = self.srt(&table.lookup(make_small(1), &self.atoms));
+
+        let operand = self.ints(&[2, -20, 0, -5]);
+        let default = self.ints(&[2, 1]);
+        let v4 = table
+            .update_counter_with(make_small(2), operand, default, &self.atoms, &mut self.out)
+            .expect("update_counter/4");
+        let v4 = self.r(v4);
+        let l4 = self.srt(&table.lookup(make_small(2), &self.atoms));
+
+        let operand = self.ints(&[2, -1, 0, 77]);
+        let v5 = table
+            .update_counter(make_small(2), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v5 = self.r(v5);
+        let l5 = self.srt(&table.lookup(make_small(2), &self.atoms));
+
+        tuple_of(&[v1, l1, v2, l2, v3, l3, v4, l4, v5, l5])
+    }
+
     fn update_counter_multi_kind(&mut self) -> String {
         let mut rendered = Vec::new();
         for kind in [TableKind::Bag, TableKind::DuplicateBag] {
@@ -524,6 +574,10 @@ pub(super) fn counter_cases(battery: &mut Battery) -> Vec<(String, String)> {
     cases.push((
         "update_counter_4_threshold".into(),
         battery.update_counter_4_threshold(),
+    ));
+    cases.push((
+        "update_counter_threshold_default".into(),
+        battery.update_counter_threshold_default(),
     ));
     cases.push((
         "update_counter_multi_kind".into(),
