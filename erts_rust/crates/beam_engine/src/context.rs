@@ -340,9 +340,13 @@ pub trait ExecutionContext {
     /// Cheap tracing gate: does the host want `call`/`return_from`/`return_to`
     /// execution-trace events reported for the process currently running?
     ///
-    /// Checked **once per call/return instruction**; the default `false` keeps an
-    /// untraced run at one predictable branch and no event data is built unless it
-    /// returned `true`. This is the engine's side of the oracle's function-trace
+    /// Consulted **once per run** — the driver that executes instructions latches the
+    /// answer into the `Machine::trace_on` flag and the call/return arms then
+    /// read that plain `bool`, so an untraced run pays one `bool` load per call/return
+    /// instruction rather than a vtable call, and the default `false` builds no event
+    /// data. A run is one entry plus its `resume`s: a host that flips the answer
+    /// **mid-run** sees it take effect at the process's next run entry/resume, not at
+    /// the next instruction. This is the engine's side of the oracle's function-trace
     /// breakpoints (contract A.8): a host that turns tracing on arms its own
     /// per-`{M,F,A}` patterns and decides matching in
     /// [`trace_event`](ExecutionContext::trace_event).
@@ -753,6 +757,15 @@ mod tests {
         }
 
         fn trace_event(&mut self, event: TraceEvent<'_>) {
+            // The test double honours its own gate: a host whose `trace_enabled` is
+            // off records nothing even though it implements the report hook. The engine
+            // also gates (it latches the flag once per run), so a real host is only
+            // asked to report while tracing is on; this guard pins that contract on the
+            // host side too, which is what `trace_gate_is_independent_of_reporting`
+            // asserts.
+            if !self.enabled {
+                return;
+            }
             self.events.borrow_mut().push(match event {
                 TraceEvent::Call {
                     module,
