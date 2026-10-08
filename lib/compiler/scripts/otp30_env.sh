@@ -47,7 +47,10 @@ set -e
 
 ERL_TOP="${ERL_TOP:-$(cd "$(dirname "$0")"/../../.. && pwd)}"
 export ERL_TOP
-export CONFIG_SHELL="${CONFIG_SHELL:-$(command -v bash)}"
+# Always use a bash that exists here: the ambient CONFIG_SHELL may point at a
+# stale store path, which would make the generated `configure' scripts fail.
+export CONFIG_SHELL="$(command -v bash)"
+cd "$ERL_TOP"
 JOBS="$(nproc 2>/dev/null || echo 4)"
 
 TARGET_DIR="$ERL_TOP/make/x86_64-pc-linux-gnu"
