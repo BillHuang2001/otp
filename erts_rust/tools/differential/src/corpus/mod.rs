@@ -32,16 +32,16 @@
 //! | [`driver`] | A.4 — the observable port/`spawn`-driver surface |
 //! | [`driver_ports`] | A.4 — the `open_port/2` port-open error shapes + the missing-`spawn_executable` `enoent` shape |
 //! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
-//! | [`wire_ids`] | A.2/A.5 — `term_to_binary` of a local pid / port id |
-//! | [`flags`] | A.6 — CLI / configuration |
-//! | [`bifs`] | A.7 — BIF / OTP app surface |
+//! | [`wire_ids`] | A.2/A.5 — `term_to_binary` of a local pid / port id, plus the A.5 node-identity surface (`node/0,1`, `nodes/0,1`, the `set_cookie/2` family) |
+//! | [`flags`] | A.6 — CLI / configuration (incl. the `+hmax`/`+hmaxk`/`+hmaxel`/`+hmaxib`/`+hms`/`+hmbs` max-heap family) |
+//! | [`bifs`] | A.7 — BIF / OTP app surface (incl. the timer, process-control and code-loading families, `erts_debug:size/1`, `erts_internal:cmp_term/2`) |
 //! | [`phash`] | A.7 — `phash/2` and `phash2/1,2` (the externally-observable legacy hashes) |
 //! | [`binmatch`] | A.7 — `binary:compile_pattern/1` + the compiled match/matches/split family |
 //! | [`math_bifs`] | A.7 — the `math` module: bit-exact values + the `badarith` failure surface |
 //! | [`printing`] | A.7 — the `~p`/`~W` printer and `short` float formatting |
 //! | [`ets`] | A.7 — ETS tables: the `ets:*` BIF surface the runtime serves |
-//! | [`ets_spec`] | A.7 — the `ets` match-spec / `select` family + the `info/1,2` fields |
-//! | [`system_info`] | A.8 — introspection |
+//! | [`ets_spec`] | A.7 — the `ets` match-spec / `select` family + the `info/1,2` fields + the `ordered_set` arithmetic-key rule |
+//! | [`system_info`] | A.8 — introspection (incl. `erlang:memory/0,1` — a Rust capability gap — and the trace / `seq_trace` / `halt` surface) |
 //! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
 //! | [`modules`] | A.2/A.1/A.7 — a freshly `erlc`-compiled module run under both runtimes |
 //! | [`mexec`] | A.2/A.7 — a *real* system stdlib/kernel module executed end to end |
