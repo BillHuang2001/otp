@@ -1051,7 +1051,8 @@ mod tests {
     /// `unsupported`, never a `mismatch`.
     const BOOT_GAP_CASES: &[&str] = &["boot/proc_lib_start_link_blocks_the_boot_path"];
 
-    fn case<'a>(cases: &'a [super::Case], id: &str) -> &'a super::Case {        cases
+    fn case<'a>(cases: &'a [super::Case], id: &str) -> &'a super::Case {
+        cases
             .iter()
             .find(|c| c.id == id)
             .unwrap_or_else(|| panic!("case {id} is missing from the boot group"))
