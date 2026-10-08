@@ -34,14 +34,10 @@
 //! `(…, MS, [acc])` → `[c,a,acc]` (verified), while the forward
 //! `ets:match_spec_run/2` gives `[a,c]`.
 //!
-//! # Registration (the key is shared with the runtime-coupled family)
+//! # Registration
 //!
-//! `src/runtime/other.rs` registers `ets:match_spec_run_r/3` on the `RuntimeHooks`
-//! seam, and `crate::runtime::register` runs **last** in `with_core_bifs`, so the
-//! registry's entry for that key is the seam stub, not [`match_spec_run_r_3`] (both
-//! answer `unsupported_bif` with no hook installed, so nothing observable changes
-//! today). The BIF-level tests below therefore call the function **directly**; a
-//! registry-dispatch test would exercise the stub.
+//! [`match_spec_run_r_3`] is the live registered implementation of
+//! `ets:match_spec_run_r/3`; no other module registers that key.
 //!
 //! # The compiled-spec term is not a select-family spec (verified)
 //!
@@ -657,11 +653,8 @@ mod tests {
         let reg = BifRegistry::with_core_bifs();
         assert!(reg.contains("ets", "match_spec_compile", 1));
         assert!(reg.contains("ets", "match_spec_run", 2));
-        // `ets:match_spec_run_r/3` is registered **here** too, but `src/runtime/`
-        // registers the same key through its `RuntimeHooks` stub and
-        // `crate::runtime::register` runs last in `with_core_bifs`, so the registry's
-        // entry for that key is the stub — which is why this module's own tests call
-        // `match_spec_run_r_3` directly instead of dispatching through the registry.
+        // `ets:match_spec_run_r/3` is registered here by [`match_spec_run_r_3`];
+        // no other module registers that key.
         assert!(reg.contains("ets", "match_spec_run_r", 3));
         // The registry is the *composition* of this module's roster with the parent
         // module's, so an `ets:new/2` key is present too.

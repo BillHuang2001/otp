@@ -64,26 +64,31 @@
 //!   `ets:select_delete/2` are wrappers over; both answer the number of deleted
 //!   objects and are write-gated.
 //!
-//! # Deliberately not registered (honest gaps)
+//! # The verbs served by sibling child modules, and the remaining gaps
 //!
-//! * **`ets:select_reverse/1,2,3`** — a *reverse* traversal of the table (the oracle
-//!   walks an `ordered_set` in descending key order). `beam_ets` has no reverse
-//!   scan (`select_limit`/`select_continue` are forward-only), so the descending
-//!   order could only be fabricated.
-//! * **`ets:give_away/3` / `ets:setopts/2`** — ownership verbs: the oracle takes a
-//!   `pid()`. M1 has no pid term (`ets:info(T, owner)` already renders `undefined`),
-//!   and `setopts/2`'s only modelled option (`{heir, …}`) needs one too.
+//! The verbs that are not registered here are either served by a sibling child
+//! module or an honest typed gap:
+//!
+//! * `ets:select_reverse/1,2,3` lives in [`super::reverse`];
+//! * the `*_lookup` family (`ets:first_lookup/1`, `ets:last_lookup/1`,
+//!   `ets:next_lookup/2`, `ets:prev_lookup/2`) lives in [`super::nav`];
+//! * `ets:match_spec_run_r/3` lives in [`super::specs`];
+//! * the ownership verbs `ets:give_away/3` and `ets:setopts/2` live in
+//!   [`super::adopt`].
+//!
+//! The genuine remaining gaps are:
+//!
 //! * **`ets:slot/2`** — returns the objects of an internal tree node / hash bucket
 //!   slot; the contract pins the *interior layout*, which the crate contract
 //!   explicitly leaves open (§2), so the value cannot be reproduced faithfully.
-//! * **`ets:first_lookup/1`, `last_lookup/1`, `next_lookup/2`, `prev_lookup/2`** —
-//!   the paired *value* traversal of the navigation family; for the hash kinds the
-//!   C walks interior buckets, and the shapes it yields (empty-slot skips,
-//!   `'$end_of_table'` vs `[]`) are interior-specific.
-//! * **`ets:internal_request_all/0`, `match_spec_run_r/3`** — underscore-internal
-//!   helpers of the C implementation (the first answers this scheduler's *fan-in
-//!   reference*); implementation-specific, and not part of the documented `ets`
-//!   surface.
+//! * **`ets:internal_request_all/0`** — an underscore-internal helper of the C
+//!   implementation (it answers this scheduler's *fan-in reference*);
+//!   implementation-specific, and not part of the documented `ets` surface.
+//! * **`ets:setopts/2`'s `{protection, _}` sub-option** — `beam_ets::Table` has no
+//!   access setter, so that single sub-option is the typed `unsupported_bif` gap.
+//!
+//! `ets:slot/2` and `ets:internal_request_all/0` are registered through the
+//! `RuntimeHooks` stub in `src/runtime/other.rs`.
 //!
 //! Everything registered here is pinned against the system `erl` (OTP 29.1.1 /
 //! erts-17.1) — see the in-module tests below and `tests/ets_extra.rs`.
@@ -103,14 +108,12 @@ use super::resolve::{resolve_handle, Gate};
 use super::{parse_updates, restore_table, take_table_gated};
 
 /// Registers the remaining faithful `ets:*` verbs (see the module docs for the
-/// scope and for the deliberately unregistered list).
+/// scope and for the unregistered list).
 ///
-/// `rename/2`, `internal_delete_all/2` and `internal_select_delete/2` are also
-/// registered by `src/runtime/other.rs` through the [`crate::context::RuntimeHooks`]
-/// seam, and `crate::runtime::register` runs **after** `ets::register` in
-/// [`BifRegistry::with_core_bifs`], so in the default registry those stubs still
-/// shadow the implementations here. The in-module tests below therefore call the BIF
-/// functions **directly** rather than through the registry.
+/// The `rename/2`, `internal_delete_all/2` and `internal_select_delete/2`
+/// registrations here are the live ones: `src/runtime/other.rs` registers only the
+/// `ets:slot/2` and `ets:internal_request_all/0` typed gaps, so no key registered
+/// here is shadowed.
 pub(super) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "safe_fixtable", 2, safe_fixtable_2);
     reg.register("ets", "whereis", 1, whereis_1);

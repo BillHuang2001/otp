@@ -117,20 +117,21 @@
 //! `update_counter`/`update_element`/the delete+replace verbs, and no check at all
 //! for `ets:info/1,2`. A denial is `badarg` **and leaves the table in the registry**.
 //!
-//! # Deliberately not implemented (see the crate `CONTEXT.md`)
+//! # The child modules and the remaining gaps (see the crate `CONTEXT.md`)
 //!
 //! The faithful verbs live in the child modules: `ets:safe_fixtable/2`,
-//! `ets:whereis/1`, `ets:update_element/4` and `ets:is_compiled_ms/1` in [`extra`],
-//! and the adopted `ets:all/0`, `ets:setopts/2`, `ets:give_away/3`,
+//! `ets:whereis/1`, `ets:update_element/4`, `ets:is_compiled_ms/1` and the
+//! `ets:rename/2`/`ets:internal_delete_all/2`/`ets:internal_select_delete/2` group
+//! in [`extra`], and the adopted `ets:all/0`, `ets:setopts/2`, `ets:give_away/3`,
 //! `ets:foldl/3` and `ets:foldr/3` in [`adopt`]. (`ets:foldl/3`/`foldr/3` apply the
 //! fun through the `FunCaller` seam, so a non-empty fold is the typed
 //! `unsupported_bif` gap until a host installs it.)
 //!
 //! The verbs that stay **unregistered** are the honest typed gaps documented in
 //! [`adopt`] and [`extra`], each with the exact `beam_ets` API that would close it:
-//! `ets:rename/2` (needs a name setter), `ets:slot/2`,
-//! `ets:match_spec_run_r/3`, the underscore-internal C helpers, and the
-//! `ets:setopts/2` `{protection, _}` sub-option.
+//! `ets:slot/2` and `ets:internal_request_all/0` — seam-backed through the
+//! `RuntimeHooks` stub in `src/runtime/other.rs` — and the `ets:setopts/2`
+//! `{protection, _}` sub-option.
 //!
 //! # The `*_lookup` family (see [`nav`] for the BIFs)
 //!

@@ -67,8 +67,7 @@ use crate::registry::BifRegistry;
 
 use super::{copy_out, copy_out_list, restore_table, resolve, take_table_gated, END_OF_TABLE};
 
-/// Registers the `*_lookup` BIFs (the keys `src/runtime/other.rs` leaves as typed
-/// `RuntimeHooks` gaps until a host adopts them).
+/// Registers the `*_lookup` BIFs.
 pub(super) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "first_lookup", 1, first_lookup_1);
     reg.register("ets", "last_lookup", 1, last_lookup_1);
@@ -81,8 +80,9 @@ pub(super) fn register(reg: &mut BifRegistry) {
 ///
 /// `key` compares the way the navigation primitives do (`=:=` through the
 /// interior's own key identity), and both halves may alias table storage, so both
-/// are copied onto the caller's heap ([`copy_out`]/[`copy_out_list`]) before the
-/// table goes back into the registry.
+/// are copied onto the caller's heap ([`copy_out`]/[`copy_out_list`]) after the
+/// table has gone back into the registry and before the `{Key, [Objects]}` tuple
+/// is built.
 fn key_objects(
     ctx: &mut BifContext<'_>,
     handle: u64,
