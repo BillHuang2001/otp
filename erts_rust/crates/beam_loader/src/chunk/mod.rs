@@ -8,7 +8,12 @@
 //! The chunks are parsed in file order and unknown/obsolete chunks are skipped;
 //! the `Code` instruction stream is retained as a borrowed slice
 //! ([`Chunks::code_stream`]) so instruction decoding is allocation-light.
+//!
+//! [`classify`] is the single in-code table saying how *every* chunk id is treated
+//! (parsed+exposed / parsed-as-raw / tooling-only) so a runtime-relevant chunk cannot
+//! go unnoticed; `tests/chunks.rs` enforces it over the installed OTP corpus.
 pub mod atom;
+pub mod classify;
 pub mod code;
 pub mod line;
 pub mod literal;
@@ -59,6 +64,13 @@ pub struct Chunks<'a> {
     pub attributes: Option<Vec<u8>>,
     /// The raw `CInf` chunk bytes, if present.
     pub compile_info: Option<Vec<u8>>,
+    /// The raw `Meta` chunk bytes, if present.
+    ///
+    /// `Meta` is the compiler's feature/CPU metadata (an external term,
+    /// `compile.erl`'s `?META_CHUNK_NAME`). It is not interpreted by the loader (it is
+    /// classified tooling-only — see [`classify`]) but it is part of the module
+    /// checksum (`beam_file.c:1811-1815`), so it is captured raw rather than dropped.
+    pub meta: Option<Vec<u8>>,
     /// The `Code` header as the IR's [`CodeVersion`].
     pub code_version: CodeVersion,
     /// The `Code` chunk instruction stream (the bytes after the header).
@@ -135,6 +147,10 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         .unwrap_or_default();
     let attributes = chunks.find(ChunkId::ATTR).map(|chunk| misc::raw(chunk.data));
     let compile_info = chunks.find(ChunkId::CINF).map(|chunk| misc::raw(chunk.data));
+    // `Meta` is captured raw for the (future) module checksum; it is otherwise
+    // tooling-only (see `classify`). `Docs` carries no raw copy: it is a large,
+    // compressed ExDoc payload the runtime never reads.
+    let meta = chunks.find(ChunkId::META).map(|chunk| misc::raw(chunk.data));
 
     Ok(Chunks {
         atoms,
@@ -150,6 +166,7 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         strings,
         attributes,
         compile_info,
+        meta,
         code_version,
         code_stream,
     })
@@ -296,6 +313,8 @@ mod tests {
         assert_eq!(chunks.literals, Vec::<Vec<u8>>::new());
         assert!(chunks.attributes.is_some());
         assert!(chunks.compile_info.is_some());
+        // The fixture carries a 45-byte `Meta` chunk, captured raw (tooling-only).
+        assert_eq!(chunks.meta.as_deref().map(<[u8]>::len), Some(45));
     }
 
     #[test]
