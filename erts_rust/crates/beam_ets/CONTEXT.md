@@ -531,21 +531,25 @@ impl Table {
   `ets:info(T, memory)` is held while fixed and *falls* at unfix, matching the oracle. `deferred_frees`
   is deliberately **not** counted in `memory()` (table-owned, not live objects).
 - **Access enforcement covers the newer ops.** `TableAccess` (`src/table/access.rs`) gates
-  `select_replace` as a *write* and every `/3` + `/1` limited/continuation form as a *read*
+  `select_replace` as a *write*, every `/3` + `/1` limited/continuation form as a *read*
   (`select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/
-  `match_object_continue`).
-- **Subterm sharing (the copy-boundary trim).** `TermStore::copy_term` shares exactly the one literal
-  whose liveness the crate can prove — the global empty tuple (`tuple0()`; C `copy.c:130-140`).
-  `beam_term::literal::LiteralArea` literals are **deep-copied** (the area can be dropped and the
-  crate holds no handle, so the C's `in_literal_purge_area` guard cannot be honoured). `{keypos, N}`
-  keys live inside the stored tuple (no separate key copy); `compressed` is parsed/reported with no
-  storage effect (honest gap, see Known Issues).
-- **New evidence:** `tests/ets_shared.rs` (5 tests — `Send`/`Sync`, 8-writer no-lost-update, reader
-  consistency, owner-only writer under concurrency, cross-thread move), `tests/ets_fixtable.rs` (5 —
-  fix/unfix idempotence, storage held while fixed and released at unfix, `delete_all_objects` under
-  fixation, ordered walk-and-delete under fixation, hash anchor still required when fixed),
-  `tests/ets_access.rs` (+2 — the `select_replace`/limited-form gates), `src/store/tests.rs` (+1 — the
-  empty-tuple literal is shared, not copied).
+  `match_object_continue`), and `set_fixation` (`ets:safe_fixtable/2`) as a *read*.
+- **Concurrency evidence (`tests/ets_shared.rs`, 9 tests).** Beyond `Send`/`Sync` (asserted for
+  `Table`, `SharedTable` **and** `TermStore` by a compile-time bound), the 8-writer no-lost-update
+  case, reader consistency, the owner-only writer under concurrency and the cross-thread move, the
+  suite adds `two_interleaved_accessors_yield_the_serial_result` (two handles, two threads, lock-step
+  behind a `Barrier`, exact serial outcome asserted), `concurrent_counter_increments_lose_no_updates`
+  (8×500 `update_counter`; the total **and** the multiset of returned values are exact) and
+  `readers_see_only_consistent_states_under_writer_churn`;
+  `concurrent_counter_total_agrees_with_the_live_oracle` runs the same workload under the real `ets`
+  and compares totals (shared plumbing in `tests/common/oracle.rs`). The `TermStore` `unsafe impl
+  Send`/`Sync` rationales now name the real invariant (no interior mutability; every
+  storage-reaching method takes `&mut self`).
+- **Further evidence:** `tests/ets_fixtable.rs` (5 — fix/unfix idempotence, storage held while fixed
+  and released at unfix, `delete_all_objects` under fixation, ordered walk-and-delete under fixation,
+  hash anchor still required when fixed), `tests/ets_access.rs` (the `select_replace`/limited-form
+  gates + `set_fixation_follows_the_read_gate`), `src/store/tests.rs` (+1 — the empty-tuple literal is
+  shared, not copied).
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
