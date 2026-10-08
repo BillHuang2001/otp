@@ -522,7 +522,8 @@ impl Table {
   `unsupported_ets: table lock poisoned` error — never a panic, never a wrong result. Holding one
   `write()` guard across a check-then-act makes `insert_new`/`update_counter`/`select_replace` atomic,
   so concurrent writers lose no updates. (Fine-grained `{write_concurrency}` affects throughput only,
-  never observable results.)
+  never observable results.) **Read results alias table-owned storage**, so they are valid only while
+  the read guard is held — see Known Issues.
 - **`ets:safe_fixtable/2` fixation = deferred reclamation.** `Table::set_fixation(bool)` /
   `is_fixed()` / `deferred_objects()`: while fixed, every *removed* object's storage is pushed onto
   `deferred_frees` instead of being freed, and `delete_all_objects` defers each root (rebuilding the
