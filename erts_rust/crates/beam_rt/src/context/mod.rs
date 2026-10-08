@@ -56,6 +56,7 @@
 
 mod bridges;
 mod fun_identity;
+mod memory_hook;
 mod module_info;
 mod persistent_term;
 mod process_bridge;
@@ -90,6 +91,7 @@ use self::bridges::{
     SharedSink,
 };
 use self::fun_identity::FunIdentityBridge;
+use self::memory_hook::RuntimeMemory;
 use self::module_info::ModuleInfoBridge;
 use self::persistent_term::PersistentTermBridge;
 use self::process_bridge::ProcessBridge;
@@ -625,6 +627,20 @@ impl<'a> RuntimeContext<'a> {
             caller_module.as_deref(),
             local_node.node,
         );
+        // The node's memory accounting behind `erlang:memory/0,1`: a cheap snapshot holding
+        // the shared atom table plus the figures reachable only *before* the call (the
+        // process table, the code server, the ETS registry) — it needs **no** `&mut Runtime`
+        // borrow, so every arm below can install it. It is built before the ETS `RefCell` is
+        // borrowed for the call, which is why its ETS figure is captured (see
+        // [`RuntimeMemory`]).
+        let mut memory = RuntimeMemory::new(
+            Rc::clone(&atoms),
+            self.mailbox_table
+                .as_deref()
+                .unwrap_or(&self.runtime.processes),
+            &self.runtime.code_server,
+            &tables_handle,
+        );
         let result = {
             let RuntimeContext {
                 runtime,
@@ -675,7 +691,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_dict_hook(&mut dict)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -701,7 +718,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_process_hook(&mut bridge)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -727,7 +745,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_current_module(caller_module.as_deref().unwrap_or(""))
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -748,7 +767,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_record_source(&mut source)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -776,7 +796,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_sender(&mut bridge)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -796,7 +817,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_module_info(&mut source)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -819,7 +841,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_persistent_term(&mut store)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -845,7 +868,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_fun_caller(&mut bridge)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
