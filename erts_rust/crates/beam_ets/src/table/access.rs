@@ -25,7 +25,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use super::{OwnerId, SetOpt, Table};
+use super::{OwnerId, RenameOutcome, SetOpt, Table};
 use crate::select::{MatchContinuation, MatchSpec};
 
 /// An access-enforcing view over a [`Table`] for a specific requester process.
@@ -175,6 +175,29 @@ impl TableAccess<'_> {
     ) -> Result<usize> {
         self.table.check_write(self.requester)?;
         self.table.select_replace(spec, atoms, heap)
+    }
+
+    /// `ets:rename/2`, requiring **write** access.
+    ///
+    /// The oracle resolves the table with the `DB_WRITE` status mask
+    /// (`db_get_table_aux`), so a rename follows the same gate as every other
+    /// write: a non-owner may rename a `public` table, while a non-owner rename
+    /// of a `protected`/`private` table is `badarg`. It is deliberately **not**
+    /// owner-gated the way `ets:give_away/3` is — a rename is a name write, not
+    /// an ownership operation (`src/table/rename.rs` rule 3).
+    ///
+    /// The gate runs **before** the name write, so a denial leaves the table's
+    /// recorded name — like its objects, its [`TableId`](super::TableId), its
+    /// owner and its access mode — untouched. See [`Table::rename`] for the
+    /// name-conflict rules and the registry-rekey obligation the
+    /// [`RenameOutcome`] carries back to the caller.
+    pub fn rename(
+        &mut self,
+        name: Atom,
+        is_taken: impl FnOnce(Atom) -> bool,
+    ) -> Result<RenameOutcome> {
+        self.table.check_write(self.requester)?;
+        self.table.rename(name, is_taken)
     }
 
     // -------------------------------------------------------------------- reads

@@ -28,10 +28,28 @@
 
 mod common;
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use beam_common::BeamError;
-use beam_ets::{compile, Access, MatchSpec, OwnerId, Table, TableId, TableOptions};
+use beam_ets::{
+    compile, Access, Heir, MatchSpec, OwnerId, RenameOutcome, SetOpt, Table, TableId, TableOptions,
+};
 use beam_term::prelude::*;
 use common::*;
+
+/// The wall-clock bound for every live-oracle probe (a wedged `erl` fails the test
+/// instead of hanging the suite).
+const ORACLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One `key -> value` line of an oracle probe (panics — loudly — on a missing key,
+/// so a half-dead oracle cannot masquerade as a passing assertion).
+fn oracle_fact<'a>(facts: &'a HashMap<String, String>, key: &str) -> &'a str {
+    facts
+        .get(key)
+        .unwrap_or_else(|| panic!("the oracle printed no `{key} -> ...` line"))
+        .as_str()
+}
 
 /// Assert that a gated operation either succeeded (when `allowed`) or failed with
 /// exactly `BeamError::BadArg` (when `!allowed`) — never a wrong result.
@@ -275,6 +293,22 @@ fn newly_wrapped_write_ops_follow_the_protection_matrix() {
                 view.update_counter(make_small(20), make_small(1), &atoms, &mut bh),
                 allowed,
                 &format!("{tag} update_counter"),
+            );
+            // The `/4` (`update_counter_with`) form obeys the same write gate. The
+            // default must be a valid object tuple (arity ≥ keypos), even though
+            // key 40 is present and the default is not used.
+            let mut bh = rebuild_heap();
+            let default_object = object(&mut heap, 40, 0);
+            assert_gate(
+                view.update_counter_with(
+                    make_small(40),
+                    make_small(1),
+                    default_object,
+                    &atoms,
+                    &mut bh,
+                ),
+                allowed,
+                &format!("{tag} update_counter_with"),
             );
             let mut bh = rebuild_heap();
             assert_gate(
@@ -716,5 +750,250 @@ fn the_limited_and_continuation_forms_follow_the_read_gate() {
                 assert!(next.is_some(), "{tag}: a full chunk carries a continuation");
             }
         }
+    }
+}
+
+// --------------------- The remaining families' gates + the live oracle ---------------------
+/// `ets:rename/2` is **write**-gated, not owner-gated like `ets:give_away/3`: the owner
+/// may rename in every mode, a non-owner only a `public` table, and a denial leaves the
+/// name untouched. Verified against `erl` (OTP 29 / erts-17.1): `ets:rename/2` resolves
+/// the table with the `DB_WRITE` mask (`db_get_table_aux`).
+#[test]
+fn rename_follows_the_write_gate() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let mut atoms = AtomTable::new();
+            // An *unnamed* table: a rename only overwrites the recorded name and does
+            // no conflict check, so the gate is the only thing that can deny it.
+            let mut opts = TableOptions::new();
+            opts.set_access(access);
+            let mut t = Table::new(TableId::next(), opts).unwrap();
+            t.set_owner(Some(owner));
+            let before = t.name();
+            let new_name = atoms.intern("renamed");
+            let (_, write_ok) = expected(access, owner, requester);
+            let tag = format!("{access:?}/{who}");
+
+            let result = t.as_requester(requester).rename(new_name, |_| false);
+            match (&result, write_ok) {
+                (Ok(RenameOutcome::Unnamed), true) => {}
+                (Err(BeamError::BadArg), false) => {}
+                _ => panic!("{tag} rename: expected allowed={write_ok}, got {result:?}"),
+            }
+            if write_ok {
+                assert_eq!(t.name(), Some(new_name), "{tag}: the name was written");
+            } else {
+                assert_eq!(t.name(), before, "{tag}: a denied rename changed the name");
+            }
+            // A rename is a name write and nothing else — no object moved.
+            assert_eq!(t.size(), 0, "{tag}: rename touched no object");
+        }
+    }
+}
+
+/// `ets:info/1,2` is **never** access-gated: a non-owner (and an ownerless requester)
+/// reads every field of a `private` table. There is no `TableAccess::info` wrapper, so
+/// the introspection surface cannot be gated by construction.
+#[test]
+fn ets_info_is_never_access_gated() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(256);
+        let mut t = seeded_table(access, owner, &mut heap, &atoms);
+
+        // The discriminating fact: a `private` table answers `ets:info` for any
+        // requester, even though every read *and* write is denied to a non-owner.
+        let info = t.info();
+        assert_eq!(
+            info.size, 6,
+            "{access:?}: info is available without a requester check"
+        );
+        assert_eq!(info.access, access, "{access:?}: the mode is reported verbatim");
+        assert_eq!(info.owner, Some(owner), "{access:?}: the owner is reported");
+
+        // A gated op on the *same* table is still denied for a non-owner of a
+        // private table — it is `info` that is ungated, not the table.
+        let denied = t.as_requester(Some(other)).lookup(make_small(0), &atoms);
+        assert_eq!(
+            denied.is_ok(),
+            access != Access::Private,
+            "{access:?}: only a private table denies a non-owner reader"
+        );
+    }
+}
+
+/// The **ownership** operations (`ets:give_away/3`, `ets:setopts/2`) are
+/// owner-gated, not protection-gated: a non-owner is `badarg` in **every** mode,
+/// `public` included, and a denial leaves the owner / the heir untouched. (The
+/// protection matrix never enters their decision — a `public` table is not
+/// `give_away`-able by a stranger.)
+#[test]
+fn the_ownership_operations_are_owner_gated_not_protection_gated() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let new_owner = OwnerId::new(3);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let atoms = AtomTable::new();
+            let mut heap = Heap::new(512);
+            let is_owner = requester == Some(owner);
+            let tag = format!("{access:?}/{who}");
+
+            // `ets:setopts/2` — owner-only in every mode, `public` included.
+            let mut t = seeded_table(access, owner, &mut heap, &atoms);
+            let opt = SetOpt::Heir(Heir {
+                owner: new_owner,
+                data: None,
+            });
+            assert_gate(
+                t.as_requester(requester).setopts(opt),
+                is_owner,
+                &format!("{tag} setopts"),
+            );
+            assert_eq!(
+                t.heir().is_some(),
+                is_owner,
+                "{tag}: setopts is owner-only, whatever the mode"
+            );
+
+            // `ets:give_away/3` likewise: no protection check, only ownership.
+            let mut t = seeded_table(access, owner, &mut heap, &atoms);
+            assert_gate(
+                t.as_requester(requester).give_away(Some(new_owner)),
+                is_owner,
+                &format!("{tag} give_away"),
+            );
+            assert_eq!(
+                t.owner(),
+                if is_owner { Some(new_owner) } else { Some(owner) },
+                "{tag}: give_away is owner-only, whatever the mode"
+            );
+        }
+    }
+}
+
+// ----------------------------------- The live oracle -----------------------------------
+/// The probe: for each protection mode, a spawned (non-owner) process exercises
+/// `lookup` (read), `insert` (write), `safe_fixtable` (read — not write),
+/// `ets:info/2` (never gated) and `ets:rename` (write — not owner), each recorded
+/// as `ok`/`badarg`.
+const ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+%%! -noshell
+main(_) ->
+    P = fun(K, V) -> io:format("~s -> ~p~n", [K, V]) end,
+    C = fun(E) -> try E(), ok catch error:badarg -> badarg end end,
+    Parent = self(),
+    Probe = fun(Prot) ->
+        %% The table is owned by *this* (parent) process; the prober is not.
+        T = ets:new(probe, [set, Prot]),
+        ets:insert(T, {1, 10}),
+        Ref = make_ref(),
+        spawn(fun() ->
+            Parent ! {Ref, {
+                C(fun() -> ets:lookup(T, 1) end),
+                C(fun() -> ets:insert(T, {2, 20}) end),
+                C(fun() -> ets:safe_fixtable(T, true) end),
+                C(fun() -> ets:info(T, size) end),
+                C(fun() -> ets:rename(T, renamed_probe) end)
+            }}
+        end),
+        {Read, Write, Fix, Info, Rename} =
+            receive {Ref, V} -> V after 5000 -> timeout end,
+        S = fun(Field) -> lists:flatten(io_lib:format("~p.~s", [Prot, Field])) end,
+        P(S("read"), Read),
+        P(S("write"), Write),
+        P(S("fix"), Fix),
+        P(S("info"), Info),
+        P(S("rename"), Rename)
+    end,
+    [Probe(X) || X <- [public, protected, private]],
+    halt(0).
+"#;
+
+/// The access matrix, cross-checked **line by line** with the live system `erl`:
+/// the crate's [`TableAccess`] gate for a non-owner must match the oracle's
+/// `ok`/`badarg` for every mode × operation, and `Table::info` (the ungated path)
+/// must answer where the oracle's `ets:info/2` does. The oracle is a **loud skip**
+/// when absent (`BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure).
+#[test]
+fn the_access_matrix_matches_the_live_oracle() {
+    const TEST: &str = "the_access_matrix_matches_the_live_oracle";
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            TEST,
+            "no Erlang oracle found (no `$ERTS_ORACLE`, no `erl`/`escript` on `$PATH`)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(
+        &escript,
+        ORACLE_PROGRAM,
+        &[],
+        "access_matrix",
+        ORACLE_TIMEOUT,
+    );
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut facts: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once(" -> ") {
+            facts.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+
+    for (access, key) in [
+        (Access::Public, "public"),
+        (Access::Protected, "protected"),
+        (Access::Private, "private"),
+    ] {
+        let mut atoms = AtomTable::new();
+        let mut heap = Heap::new(512);
+        let mut t = seeded_table(access, owner, &mut heap, &atoms);
+
+        // `ets:info/1,2` is ungated: the raw path answers regardless of requester
+        // (read *before* the permitted writes below mutate the table).
+        let info = t.info();
+        let info_ok = info.size == 6 && info.owner == Some(owner) && info.access == access;
+
+        // The crate's answers for a NON-owner, through the enforcing view.
+        let (read, write, fix, rename) = {
+            let mut view = t.as_requester(Some(other));
+            let read = view.lookup(make_small(0), &atoms).is_ok();
+            let write = view.insert(object(&mut heap, 99, 99), &atoms).is_ok();
+            let fix = view.set_fixation(true).is_ok();
+            let rename = view.rename(atoms.intern("oracle_renamed"), |_| false).is_ok();
+            (read, write, fix, rename)
+        };
+
+        let got = |ok: bool| if ok { "ok" } else { "badarg" };
+        for (field, crate_ok) in [
+            ("read", read),
+            ("write", write),
+            ("fix", fix),
+            ("rename", rename),
+        ] {
+            assert_eq!(
+                got(crate_ok),
+                oracle_fact(&facts, &format!("{key}.{field}")),
+                "{key}: `{field}` disagrees with the live oracle"
+            );
+        }
+        assert!(info_ok, "{key}: `ets:info` must answer for a non-owner");
+        assert_eq!(
+            oracle_fact(&facts, &format!("{key}.info")),
+            "ok",
+            "{key}: the oracle also reports `ets:info` as ungated"
+        );
     }
 }
