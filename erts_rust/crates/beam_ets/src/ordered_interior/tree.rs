@@ -245,7 +245,16 @@ impl Tree {
         if self.store.node(id).is_leaf() {
             let (pos, found) = search_entries(&self.store.leaf(id).entries, key, atoms);
             if found {
-                self.store.leaf_mut(id).entries[pos].obj = object;
+                // Replace *both* the key term and the object. The stored key may be
+                // arithmetically equal to `key` without being the same term (`1` vs
+                // `1.0`); the oracle's `ordered_set` makes the key follow the stored
+                // object, so `first`/`last`/`next`/`prev`/iteration must observe the
+                // new term. Replacing it is invariant-safe: `cmp_arith`-equality with
+                // the old key keeps every ordering/search/separator comparison —
+                // hence the tree's routing — unchanged.
+                let entry = &mut self.store.leaf_mut(id).entries[pos];
+                entry.key = key;
+                entry.obj = object;
                 return (false, None);
             }
             self.store

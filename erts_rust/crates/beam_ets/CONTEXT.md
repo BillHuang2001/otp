@@ -254,6 +254,16 @@ impl Table {
   so the trait defaults supply them (see Design Decisions, hash-kind navigation order).
 
 ### `ordered_interior/` — the ordered `ordered_set` interiors (B+-tree + sorted `Vec`)
+- **A same-arith-key replace replaces the stored KEY term too** (the key follows the object). Both
+  ordered interiors receive the *new* key term of a replacing insert; when that term is `cmp_arith`-equal
+  to a stored key but a *different term* (`1` vs `1.0`) the stored entry's `key` is overwritten along
+  with its `obj`, so `first_key`/`last_key`/`next_key`/`prev_key`/`keys()`/iteration all observe the
+  last-inserted term — the oracle's behaviour (probed with the system `erl`, OTP 29 / erts-17.1:
+  `{1,a}` then `{1.0,b}` ⇒ `size 1`, `ets:first =:= 1.0`, `ets:last =:= 1.0`,
+  `ets:next(T, ets:first(T)) = '$end_of_table'`; the reverse insert order ⇒ `ets:first =:= 1`).
+  Safe because the old and new terms are `cmp_arith`-equal, so every ordering/separator comparison
+  (and hence the tree's routing) is unchanged; it also keeps each stored key term pointing into the
+  *current* object's storage rather than a reclaimed one. `insert_new` never replaces, so it is untouched.
 - `mod.rs` — `pub struct OrderedSetInterior` (key-ordered B+-tree, see Design Decisions): `new()`,
   `first`/`last`, `first_key`/`last_key`, `next`/`prev`, `next_from(bound, inclusive)`/
   `prev_from(bound, inclusive)` (the partial-bound range searches) — all via `beam_term::compare::cmp_arith`
@@ -266,12 +276,15 @@ impl Table {
   ([`OrderedInterior::Sorted`]), the **same** observable semantics over one `Vec<Entry>` kept sorted
   by `beam_term::compare::cmp_arith` (`O(log n)` binary-search lookup via the shared `node::search_entries`,
   `O(n)` `Vec::insert`/`Vec::remove`), with the same inherent navigation and a capacity-based
-  `memory()`. Crate-internal `iter()` yields the shared `node::Entry` record.
+  `memory()`. Its `insert` applies the same key-follows-object replace rule. Crate-internal `iter()`
+  yields the shared `node::Entry` record.
 - `node.rs` — the arena node layout + `ORDER`/`MIN_OCCUPANCY` constants and the `NodeStore`
   (`NodeId` slots + free list; nodes never relocate); also the shared `Entry` record,
   `search_entries` (used by both interiors) and `words_of`.
-- `tree.rs` — insert/lookup/delete with split + borrow-or-merge rebalance and the separator invariant
-  `keys[i] == max(child[i])`.
+- `tree.rs` — insert/lookup/delete with split + borrow-or-merge rebalance, the insert-replace key-term
+  rule above, and the separator invariant `keys[i] == max(child[i])` (a separator only ever needs to be
+  `cmp_arith`-equal to the child's subtree maximum, which is why overwriting a replaced key term
+  cannot break routing).
 - `iter.rs` — the leaf-chain ordered iterator.
 
 ### `select/` — the match-spec compiler + executor
@@ -322,7 +335,7 @@ impl Table {
   constant `nonode@nohost`; `decentralized_counters` follows the oracle's CATREE
   rule (`ordered_set && write_concurrency`); `owner` (a pid in the oracle) renders as `undefined` and
   `id` as a small integer (see Known Issues). The *observable* `ets:info/1` proplist is built by the
-  sibling `beam_bifs` bridge, not by this method — see the Known Issues handoff.
+  sibling `beam_bifs` bridge, which reproduces this same 15-field order.
 
 ### `error.rs` — failure constructors
 - `pub(crate) fn badarg() -> BeamError` — the `badarg` failures (bad object/`keypos`, absent element,
@@ -361,7 +374,10 @@ impl Table {
   through `beam_term::compare::cmp_arith` (the **arithmetic** key order ERTS `ordered_set` uses —
   `erl_db_tree.c` `cmp_key_eq`, `CMP = erts_cmp(a, b, 0, 0)`), so `1` and `1.0` are the *same* key
   (the last-inserted object wins; `delete_object/2` still compares whole objects with the exact
-  `compare::eq`). Recorded as a structural
+  `compare::eq`). The **stored key term is replaced with it** (the key follows the object): the oracle
+  returns the last-inserted key term from `ets:first`/`ets:last`/`ets:next`/`ets:prev`, and `1` and
+  `1.0` are `cmp_arith`-equal so the replacement leaves every order/separator comparison — and hence
+  the routing — unchanged. Recorded as a structural
   change for `../../CHANGE.md` (repo-root owned).
 - **`set` defaults to a CHAMP open-addressing interior; `bag`/`duplicate_bag` stay chained.** Adopted
   on measurement, not faith: `src/interior_bench.rs` compares `HashInterior` (chained) against
@@ -528,7 +544,10 @@ impl Table {
   `memory` monotonicity), the B+-tree **mixed-class** order test (`navigates`/iteration over
   integers incl. negative and zero, an atom, a tuple, `[]`, a list and a binary in exactly
   `beam_term::compare::cmp_arith` order, checked for both ordered interiors — never against the live
-  oracle), select compile/execute, info. **126 lib unit tests.**
+  oracle), the shared **replace-updates-the-key-term** helper (`check_replace_updates_the_key_term`,
+  driven over both ordered interiors with the int-first and float-first orders, then over a 40-key run
+  that forces B+-tree splits above the replaced key), select compile/execute, info. **129 lib unit
+  tests.**
 - **Cross-interior equivalence + the selection defaults** (`src/interior_parity.rs`, `#[cfg(test)]`):
   `champ_is_the_documented_default_set_interior` pins `SetInterior::default() == Champ` and
   `bplus_tree_is_the_documented_default_ordered_interior` pins
@@ -543,7 +562,11 @@ impl Table {
   `the_ordered_trace_pins_the_ascending_order` proves that tail really carries order (a reversed run
   would differ); `ordered_interiors_agree_on_arithmetic_key_order` pins the `cmp` → `cmp_arith` change
   on both ordered interiors at once — the `{1,a}`/`{1.0,b}` pair collapses to one key (size 1, last
-  object wins) and the numeric mixed keys iterate in value order (`-3 < -2.5 < 0 < 1.0 < 1.5 < 5`).
+  object wins) and the numeric mixed keys iterate in value order (`-3 < -2.5 < 0 < 1.0 < 1.5 < 5`);
+  `ordered_interiors_agree_on_the_replaced_key_term` then pins the *returned key terms*: it drives
+  `{1,a}` then `{1.0,b}` (and the reverse order) through both ordered interiors and asserts they agree
+  and match the oracle's rendering (`first=f1 last=f1 next=end prev=end`, and `i1` when the int is
+  inserted last).
 - **Interior microbenchmarks** (`src/interior_bench.rs`, `#[cfg(test)]`): chained vs CHAMP
   (`interior_microbenchmark`) and B+-tree vs sorted `Vec` (`ordered_interior_microbenchmark`), both
   with in-line `size`/hit/miss/iteration count assertions (so a wrong result can never be timed as a
@@ -555,7 +578,10 @@ impl Table {
   `BEAM_ETS_BENCH_SHAPES` env vars. The ordered benchmark is the crate's slow one (the sorted `Vec`
   is `O(n)` per mutation) — pass `BEAM_ETS_BENCH_SIZES=10,1000,10000` when iterating.
 - Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`
-  (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
+  (incl. `take` reclamation + churn), `ets_order.rs` (arithmetic key identity, incl. the
+  `ordered_set_key_term_follows_the_replaced_object` /
+  `ordered_set_replaced_key_term_keeps_the_arithmetic_order` oracle-verified cases for the replaced
+  key term), `ets_select.rs`, `ets_bag.rs` (incl. the
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs` (incl.
   `entries_emits_the_oracle_field_set_in_order`), `ets_nav.rs` (incl. the order-independent
   hash-navigation contract), `ets_access.rs`, `ets_update.rs`, `ets_ownership.rs` (the
@@ -564,7 +590,7 @@ impl Table {
   `ets_continuation.rs` (the limit/continuation chaining, incl. a live-oracle cross-check),
   `match_spec_run.rs` (the table-independent runner with oracle cross-checks), sharing helpers from
   `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec compiler + arithmetic.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 94 cases
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 101 cases
   (group files `tests/differential/battery/{kind,keypos,navigation,counter,lookup,matchspec,replace,
   continuation,info,large}.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
@@ -593,11 +619,9 @@ impl Table {
   oracle's full 15-field order, but `owner` — a pid in the oracle — has no term representation at this
   stage, so it renders as the atom `undefined`, and `id` renders as a small integer rather than a ref.
   The `heir` field follows the same convention: `none` when unset, `undefined` when a heir is installed
-  (its structured `TableInfo::heir` still carries the pid). **Handoff:** the *observable* `ets:info/1`
-  proplist is produced by the sibling `beam_bifs` bridge
-  (`src/ets.rs`, its own `INFO_ITEMS` + `info_field`), which still emits the older 12-field subset in a
-  different order; it must adopt this completed `entries` (or extend `INFO_ITEMS`/`info_field` to the
-  15-field oracle set and order). This crate does not own `beam_bifs`.
+  (its structured `TableInfo::heir` still carries the pid). The sibling `beam_bifs` bridge renders the
+  observable `ets:info/1` proplist itself (`src/ets.rs`, its own `INFO_ITEMS` + `info_field`) and
+  reproduces the same 15-field order.
 - **Ownership modelling has no pid/liveness concept.** `ets:give_away/3` treats a `None` new owner as
   the oracle's non-pid/dead-pid target (both `badarg`); an *unknown table id* is the registry/BIF
   layer's concern, not this crate's. The `{'ETS-TRANSFER', Tab, FromPid, GiftData}` message the new
@@ -635,7 +659,7 @@ impl Table {
   `ets:match_spec_test/2,3` do **not** exist in OTP 29 — calling `match_spec_test` raises
   `error:undef` — so their absence is correct; `ets:info(T, size)` is the supported spelling of the
   size query.) The `/3` limited forms are implemented but their opaque **continuation terms** and the
-  bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's (see the handoff below).
+  bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's.
 - **`match_spec_run` accepts a RAW spec, unlike the oracle.** The oracle's `ets:match_spec_run/2`
   requires a spec already compiled by `ets:match_spec_compile/1` (a raw clause list is `badarg`);
   this crate has no compiled-spec *term*, so `run.rs` compiles the raw spec and the bridge must map
@@ -655,8 +679,6 @@ impl Table {
   `{element,KeyPos,'$_'}` even when nothing matches; this crate accepts any body whose *value* keeps
   the key, so it diverges on exotic multi-expression bodies (pinned by the `recorded_divergence_*`
   tests in `tests/ets_replace.rs`). Wherever the oracle accepts, the results agree.
-- **`ets:slot`-style iteration and `tab2file`/`file2tab` are not implemented** (out of scope for this
-  pass); `tab2list` plus `first`/`next` cover enumeration.
 - **The interior splits are deliberate, and the `lib.rs`/`Cargo.toml` docs state them.** `set`
   defaults to the CHAMP index (`src/champ_interior.rs`); `bag`/`duplicate_bag` use the chained index
   (`src/hash_interior.rs`: `Vec<Vec<Entry>>`, 8 buckets doubling past a 3/4 load factor); the chained

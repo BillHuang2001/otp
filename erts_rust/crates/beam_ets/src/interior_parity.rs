@@ -520,6 +520,92 @@ fn ordered_interiors_agree_on_arithmetic_key_order() {
     assert_eq!(tree, sorted, "both ordered interiors share the key order");
     assert_eq!(tree, "i-3|f-2.5|i0|f1|f1.5|i5");
 }
+
+/// Render one **key** term returned by the ordered navigation, as `i<v>`/`f<v>`
+/// ([`render_number`]) or `end` for `'$end_of_table'`. Unlike [`render`] this
+/// distinguishes an integer `1` from a float `1.0`, which is exactly the
+/// divergence the replaced-key-term rule is about.
+fn render_key(term: Option<Eterm>) -> String {
+    match term {
+        Some(term) => render_number(term),
+        None => "end".to_string(),
+    }
+}
+
+/// The collapsed-key scenario the oracle pins on the returned **key terms**:
+/// `{1, a}` then `{1.0, b}` (or the reverse order) leaves one key, and
+/// `ets:first`/`ets:last`/`ets:next`/`ets:prev` report the *last-inserted* key
+/// term — the key follows the stored object. Probed with the system `erl`
+/// (OTP 29 / erts-17.1): `{1,a}` then `{1.0,b}` gives `first = 1.0`,
+/// `next(first) = '$end_of_table'`; the reverse order gives `first = 1`.
+fn collapsed_key_run(interior: OrderedInterior, int_first: bool, atoms: &AtomTable) -> String {
+    let mut heap = Heap::new(64);
+    let mut opts = TableOptions::new();
+    opts.set_kind(TableKind::OrderedSet);
+    let mut table =
+        Table::with_ordered_interior(TableId::next(), opts, interior).expect("buildable");
+    let (first, second) = if int_first {
+        (make_small(1), float_term(1.0))
+    } else {
+        (float_term(1.0), make_small(1))
+    };
+    table
+        .insert(heap.tuple(&[first, make_small(10)]).unwrap(), atoms)
+        .unwrap();
+    table
+        .insert(heap.tuple(&[second, make_small(20)]).unwrap(), atoms)
+        .unwrap();
+    assert_eq!(table.size(), 1, "{interior:?}: 1 and 1.0 are one key");
+    let first_key = table.first(atoms);
+    let last = table.last(atoms);
+    let next = first_key.and_then(|key| table.next(key, atoms).unwrap());
+    let prev = last.and_then(|key| table.prev(key, atoms).unwrap());
+    format!(
+        "size={} first={} last={} next={} prev={}",
+        table.size(),
+        render_key(first_key),
+        render_key(last),
+        render_key(next),
+        render_key(prev),
+    )
+}
+
+/// A same-arith-key replace must update the stored **key term**, not just the
+/// object: `1` and `1.0` collapse to one key whose term is the *last-inserted* one
+/// (the oracle's `ets:first`/`last`/`next`/`prev` all report it). Both ordered
+/// interiors must agree on every returned key term — the B+-tree through its
+/// replaced leaf entry, the sorted `Vec` through its replaced entry.
+#[test]
+fn ordered_interiors_agree_on_the_replaced_key_term() {
+    let atoms = AtomTable::new();
+    for int_first in [true, false] {
+        let tree = collapsed_key_run(OrderedInterior::BPlusTree, int_first, &atoms);
+        let sorted = collapsed_key_run(OrderedInterior::Sorted, int_first, &atoms);
+        assert_eq!(
+            tree, sorted,
+            "the two ordered interiors share the stored key term"
+        );
+    }
+
+    // …and the oracle's exact rendering, per insert order.
+    assert_eq!(
+        collapsed_key_run(OrderedInterior::BPlusTree, true, &atoms),
+        "size=1 first=f1 last=f1 next=end prev=end"
+    );
+    assert_eq!(
+        collapsed_key_run(OrderedInterior::Sorted, true, &atoms),
+        "size=1 first=f1 last=f1 next=end prev=end"
+    );
+    assert_eq!(
+        collapsed_key_run(OrderedInterior::BPlusTree, false, &atoms),
+        "size=1 first=i1 last=i1 next=end prev=end"
+    );
+    assert_eq!(
+        collapsed_key_run(OrderedInterior::Sorted, false, &atoms),
+        "size=1 first=i1 last=i1 next=end prev=end"
+    );
+}
+
 /// Assert two traces are identical, printing the first mismatch.
 fn compare(chained: &[String], champ: &[String]) {
     assert_eq!(

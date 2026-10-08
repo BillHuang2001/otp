@@ -439,6 +439,81 @@ mod tests {
         assert_eq!(backward, expected, "the prev-chain is the ascending run");
     }
 
+    /// Oracle-verified replacement rule for `ordered_set`: an insert whose key is
+    /// **arithmetically equal** to a stored key but a **different term** (`1` vs
+    /// `1.0`) replaces both the object *and* the stored key term — the key follows
+    /// the object. Probed against the system `erl` (OTP 29 / erts-17.1):
+    /// `ets:insert(T,{1,a})` then `ets:insert(T,{1.0,b})` on an `ordered_set` leaves
+    /// `size 1`, `ets:first(T) =:= 1.0`, `ets:last(T) =:= 1.0` and
+    /// `ets:next(T, 1.0) =:= '$end_of_table'`; the reverse insert order leaves
+    /// `ets:first(T) =:= 1`. Both ordered interiors must reproduce that, including
+    /// after a 40-key run that forces B+-tree node splits above the replaced key.
+    fn check_replace_updates_the_key_term(
+        interior: &mut dyn Interior,
+        int_first: bool,
+        atoms: &AtomTable,
+    ) {
+        let one = make_small(1);
+        let one_float = float_term(1.0);
+        // Which term the insert order leaves stored: the *last* one.
+        let (old, want) = if int_first {
+            (one, one_float)
+        } else {
+            (one_float, one)
+        };
+
+        interior.insert(old, make_small(10), atoms).unwrap();
+        // An upsert on an equal key retains the object (never a `bag`-style reject).
+        assert!(interior.insert(want, make_small(20), atoms).unwrap());
+        assert_eq!(interior.size(), 1, "1 and 1.0 are the same key");
+
+        // The key term follows the object on every navigation/iteration surface.
+        assert_eq!(
+            interior.first_key(atoms),
+            Some(want),
+            "first carries the last-inserted key term"
+        );
+        assert_eq!(interior.last_key(atoms), Some(want));
+        assert_eq!(interior.keys(), vec![want]);
+        assert_eq!(interior.next_key(one, atoms), None);
+        assert_eq!(interior.prev_key(one_float, atoms), None);
+        // Either spelling of the key reads back the last-inserted object.
+        assert_eq!(interior.lookup(one, atoms), vec![make_small(20)]);
+        assert_eq!(interior.lookup(one_float, atoms), vec![make_small(20)]);
+
+        // Replacing a *subtree maximum* must leave every later search/separator
+        // consistent: drive a 40-key run over the replaced key and assert the whole
+        // ascending key run still leads with the new key term.
+        for v in (2..=40i64).rev() {
+            interior.insert(make_small(v), make_small(v), atoms).unwrap();
+        }
+        assert_eq!(interior.size(), 40);
+        let mut walked = Vec::new();
+        let mut cursor = interior.first_key(atoms);
+        while let Some(key) = cursor {
+            walked.push(key);
+            cursor = interior.next_key(key, atoms);
+        }
+        assert_eq!(walked.len(), 40, "the walk visits every key once");
+        assert_eq!(walked[0], want, "the replaced key still leads the run");
+        for (i, key) in walked.iter().enumerate().skip(1) {
+            assert_eq!(*key, make_small(i as i64 + 1), "walk position {i}");
+        }
+    }
+
+    #[test]
+    fn a_same_arith_key_replace_updates_the_stored_key_term() {
+        let atoms = AtomTable::new();
+        for int_first in [true, false] {
+            let mut tree = OrderedSetInterior::new();
+            check_replace_updates_the_key_term(&mut tree, int_first, &atoms);
+            tree.tree.check_invariants(&atoms);
+
+            let mut sorted = SortedOrderedInterior::new();
+            check_replace_updates_the_key_term(&mut sorted, int_first, &atoms);
+        }
+    }
+
     #[test]
     fn mixed_key_classes_iterate_and_navigate_in_arithmetic_key_order() {
         use beam_term::bitstring::{heap_bits_size_words, write_binary};
@@ -505,8 +580,15 @@ mod tests {
         // Either representation reads back the surviving (last-inserted) object.
         assert_eq!(t.lookup(one, &atoms), vec![one_float]);
         assert_eq!(t.lookup(one_float, &atoms), vec![one_float]);
-        // The stored *key* term is the one inserted first; only its object changed.
-        assert_eq!(ordered_keys(&t, &atoms), vec![one]);
+        // The stored *key* term follows the stored object: the oracle's `ordered_set`
+        // keeps the last-inserted term (probed against the system `erl`, OTP 29 /
+        // erts-17.1 — see the `check_replace_updates_the_key_term` doc comment).
+        assert!(
+            eq(ordered_keys(&t, &atoms)[0], one_float, &atoms),
+            "the replaced key term is the last-inserted one"
+        );
+        assert!(eq(t.first(&atoms).unwrap(), one_float, &atoms));
+        assert!(eq(t.last(&atoms).unwrap(), one_float, &atoms));
         // A single shared key has no neighbours in either representation.
         assert_eq!(t.next(one, &atoms), None);
         assert_eq!(t.prev(one_float, &atoms), None);

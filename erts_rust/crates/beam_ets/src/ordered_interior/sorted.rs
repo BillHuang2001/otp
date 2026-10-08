@@ -148,7 +148,13 @@ impl SortedOrderedInterior {
     pub fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> bool {
         let (pos, found) = self.position(key, atoms);
         if found {
-            self.entries[pos].obj = object;
+            // Replace *both* fields: the stored key may be arithmetically equal to
+            // `key` without being the same term (`1` vs `1.0`) and the oracle makes
+            // the key follow the replaced object (see the B+-tree's `insert_rec`).
+            // The two keys are `cmp_arith`-equal, so the sorted order is unchanged.
+            let entry = &mut self.entries[pos];
+            entry.key = key;
+            entry.obj = object;
             false
         } else {
             self.entries.insert(pos, Entry { key, obj: object });
@@ -273,6 +279,15 @@ mod tests {
     /// A `{Key, Value}` object tuple on `heap`.
     fn object(heap: &mut Heap, key: i64, value: i64) -> Eterm {
         heap.tuple(&[make_small(key), make_small(value)]).unwrap()
+    }
+
+    /// A heap-allocated flonum term (`[HEADER_FLONUM, bits]`); `beam_term` has no
+    /// `Heap::float` constructor, so the two words are leaked for the test's life.
+    fn float_term(value: f64) -> Eterm {
+        let words: Box<[Eterm; 2]> =
+            Box::new([HEADER_FLONUM, Eterm::from_raw(value.to_bits() as usize)]);
+        let leaked: &'static [Eterm; 2] = Box::leak(words);
+        make_boxed(leaked.as_ptr())
     }
 
     #[test]
@@ -413,6 +428,38 @@ mod tests {
             Interior::lookup_element(&t, make_small(99), 0, &atoms),
             Err(BeamError::BadArg)
         ));
+    }
+
+    #[test]
+    fn a_same_arith_key_replace_updates_the_stored_key_term() {
+        // The sorted-`Vec` mirror of the B+-tree test of the same name: an insert on
+        // an arithmetically equal but *different* key term (`1` vs `1.0`) makes the
+        // key follow the replaced object. Probed against the system `erl` (OTP 29 /
+        // erts-17.1): `{1,a}` then `{1.0,b}` leaves `ets:first(T) =:= 1.0`, and the
+        // reverse order leaves `ets:first(T) =:= 1`.
+        let atoms = AtomTable::new();
+        for int_first in [true, false] {
+            let one = make_small(1);
+            let one_float = float_term(1.0);
+            let (old, want) = if int_first {
+                (one, one_float)
+            } else {
+                (one_float, one)
+            };
+
+            let mut t = SortedOrderedInterior::new();
+            assert!(t.insert(old, make_small(10), &atoms));
+            assert!(!t.insert(want, make_small(20), &atoms), "an equal key replaces");
+            assert_eq!(t.len(), 1);
+            assert_eq!(t.first(&atoms), Some(want), "the key follows the object");
+            assert_eq!(t.last(&atoms), Some(want));
+            assert_eq!(Interior::keys(&t), vec![want]);
+            assert_eq!(t.next(one, &atoms), None);
+            assert_eq!(t.prev(one_float, &atoms), None);
+            // Either spelling reads back the last-inserted object.
+            assert_eq!(Interior::lookup(&t, one, &atoms), vec![make_small(20)]);
+            assert_eq!(Interior::lookup(&t, one_float, &atoms), vec![make_small(20)]);
+        }
     }
 
     #[test]

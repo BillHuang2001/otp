@@ -215,6 +215,129 @@ fn ordered_set_delete_object_compares_the_whole_object_exactly() {
 }
 
 #[test]
+fn ordered_set_key_term_follows_the_replaced_object() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(256);
+
+    let one = make_small(1);
+    let one_float = flonum(1.0);
+
+    // Oracle probe (system `erl`, OTP 29 / erts-17.1), int first:
+    //   ets:insert(T,{1,a}), ets:insert(T,{1.0,b}) =>
+    //   size 1, tab2list [{1.0,b}], first 1.0, last 1.0,
+    //   next(T, first) '$end_of_table'.
+    // The stored *key term* is therefore the last-inserted one (the key follows
+    // the replaced object), not the first-inserted `1`.
+    let mut t = new_table(TableKind::OrderedSet);
+    t.insert(heap.tuple(&[one, make_small(10)]).unwrap(), &atoms)
+        .unwrap();
+    t.insert(heap.tuple(&[one_float, make_small(20)]).unwrap(), &atoms)
+        .unwrap();
+
+    assert_eq!(t.size(), 1, "1 and 1.0 are one key");
+    assert_eq!(key_kind(t.first(&atoms)), "f1", "first reports the new key term");
+    assert_eq!(key_kind(t.last(&atoms)), "f1", "last reports the new key term");
+    assert_eq!(
+        key_kind(t.next(t.first(&atoms).unwrap(), &atoms).unwrap()),
+        "end",
+        "the single collapsed key has no successor"
+    );
+    assert_eq!(
+        key_kind(t.prev(t.last(&atoms).unwrap(), &atoms).unwrap()),
+        "end"
+    );
+
+    // `tab2list`/`lookup` still return the last-inserted object, under either
+    // spelling of the key.
+    let want = heap.tuple(&[one_float, make_small(20)]).unwrap();
+    let list = t.tab2list();
+    assert_eq!(list.len(), 1);
+    assert!(eq(list[0], want, &atoms));
+    assert!(eq(t.lookup(one, &atoms)[0], want, &atoms));
+    assert!(eq(t.lookup(one_float, &atoms)[0], want, &atoms));
+
+    // Reverse insert order: the oracle leaves `first =:= 1` / `tab2list [{1,a}]`.
+    let mut t = new_table(TableKind::OrderedSet);
+    t.insert(heap.tuple(&[one_float, make_small(20)]).unwrap(), &atoms)
+        .unwrap();
+    t.insert(heap.tuple(&[one, make_small(10)]).unwrap(), &atoms)
+        .unwrap();
+    assert_eq!(t.size(), 1);
+    assert_eq!(key_kind(t.first(&atoms)), "i1", "the int key term survives");
+    assert_eq!(key_kind(t.last(&atoms)), "i1");
+    assert_eq!(
+        key_kind(t.next(t.first(&atoms).unwrap(), &atoms).unwrap()),
+        "end"
+    );
+    assert!(eq(
+        t.tab2list()[0],
+        heap.tuple(&[one, make_small(10)]).unwrap(),
+        &atoms
+    ));
+}
+
+#[test]
+fn ordered_set_replaced_key_term_keeps_the_arithmetic_order() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(256);
+
+    let one = make_small(1);
+    let one_float = flonum(1.0);
+
+    // Oracle probe (system `erl`, OTP 29 / erts-17.1):
+    //   {1,a}, {1.0,b}, {2,c} => tab2list [{1.0,b},{2,c}], first 1.0,
+    //   next(T, first) 2, last 2, prev(T, last) 1.0.
+    let mut t = new_table(TableKind::OrderedSet);
+    for object in [
+        heap.tuple(&[one, make_small(10)]).unwrap(),
+        heap.tuple(&[one_float, make_small(20)]).unwrap(),
+        heap.tuple(&[make_small(2), make_small(30)]).unwrap(),
+    ] {
+        t.insert(object, &atoms).unwrap();
+    }
+    assert_eq!(t.size(), 2);
+
+    // The collapsed key's term is the float, and it still orders *below* `2`.
+    assert_eq!(key_kind(t.first(&atoms)), "f1");
+    assert_eq!(key_kind(t.last(&atoms)), "i2");
+    let after = t.next(t.first(&atoms).unwrap(), &atoms).unwrap();
+    assert_eq!(key_kind(after), "i2", "next steps past the collapsed key");
+    let before = t.prev(t.last(&atoms).unwrap(), &atoms).unwrap();
+    assert_eq!(key_kind(before), "f1", "prev steps back onto the new key term");
+
+    // The ascending arithmetic order is preserved, and `tab2list` returns the
+    // last-inserted object for the collapsed key.
+    let list = t.tab2list();
+    assert_eq!(list.len(), 2);
+    assert!(eq(
+        list[0],
+        heap.tuple(&[one_float, make_small(20)]).unwrap(),
+        &atoms
+    ));
+    assert!(eq(
+        list[1],
+        heap.tuple(&[make_small(2), make_small(30)]).unwrap(),
+        &atoms
+    ));
+    for window in list.windows(2) {
+        assert_eq!(cmp_arith(window[0], window[1], &atoms), Ordering::Less);
+    }
+}
+
+/// Render a key term returned by `first`/`last`/`next`/`prev` so an integer `1`
+/// and a float `1.0` are distinguishable (`end` is `'$end_of_table'`), matching
+/// the oracle probe output.
+fn key_kind(term: Option<Eterm>) -> String {
+    match term {
+        None => "end".to_string(),
+        Some(term) if is_small(term) => format!("i{}", signed_value(term)),
+        // SAFETY: the terms read here are the ordered table's stored key terms,
+        // which this file only ever builds as small ints or live boxed flonums.
+        Some(term) => format!("f{}", f64::from_bits(unsafe { float_bits(term) })),
+    }
+}
+
+#[test]
 fn ordered_set_iterates_in_ascending_key_order() {
     let mut atoms = AtomTable::new();
     let a = make_atom(atoms.intern("a"));
