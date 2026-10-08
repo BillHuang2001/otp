@@ -26,9 +26,10 @@
 //! * `lifecycle`, `queues`, `threads` — **implemented**: each owns one group of the C surface (port
 //!   lifecycle/attributes, the port queue, the `erl_drv_*` thread family) and contributes its own
 //!   `populate` step;
-//! * `pdl` — **implemented**: the port data lock, the driver monitors, the deprecated
-//!   `driver_get_now` wall clock, and the (deliberately `None`) binary refcount trio — see that
-//!   file's header for the semantics and the documented deviations.
+//! * `pdl` — **implemented**: the port data lock, the driver monitors and the deprecated
+//!   `driver_get_now` wall clock — see that file's header for the semantics and the documented
+//!   deviations. (The binary reference-count trio is **not** here: it shares the driver-binary
+//!   block layout and is therefore owned by `mem`, alongside `driver_alloc_binary`.)
 //! * `registry` — **implemented**: the four slots that reach structure outside one port —
 //!   `add_driver_entry`/`remove_driver_entry` (which reach their host through the thread-local
 //!   [`with_current_host`](crate::driver::current_host::with_current_host) publication, since they
@@ -46,10 +47,12 @@
 //!
 //! **Part 1 — host-free.** The functions that need **no port, no scheduler and no runtime service**:
 //! `driver_alloc`/`driver_free`/`driver_realloc`, `driver_alloc_binary`/`driver_realloc_binary`/
-//! `driver_free_binary`, `driver_system_info`, `null_func`, `erl_errno_id`,
-//! `erl_drv_consume_timeslice`, the time trio (`erl_drv_monotonic_time`/`erl_drv_time_offset`/
-//! `erl_drv_convert_time_unit`), the `driver_dl_open`/`driver_dl_sym`/`driver_dl_close`/
-//! `driver_dl_error` quartet, `erl_drv_putenv`/`erl_drv_getenv` and `driver_mk_term_nil`.
+//! `driver_free_binary`, the binary reference-count trio
+//! (`driver_binary_get_refc`/`inc_refc`/`dec_refc`), `driver_system_info`, `null_func`,
+//! `erl_errno_id`, `erl_drv_consume_timeslice`, the time trio
+//! (`erl_drv_monotonic_time`/`erl_drv_time_offset`/`erl_drv_convert_time_unit`), the
+//! `driver_dl_open`/`driver_dl_sym`/`driver_dl_close`/`driver_dl_error` quartet,
+//! `erl_drv_putenv`/`erl_drv_getenv` and `driver_mk_term_nil`.
 //!
 //! **Part 2 — port/host-dependent.** The functions whose `ErlDrvPort` operand **is** the pointer
 //! [`DriverEnv::as_port`] hands out ([`DriverEnv::from_port`] recovers it) and which therefore
@@ -82,11 +85,12 @@
 //! * **threads** — the whole `erl_drv_mutex_*`/`erl_drv_cond_*`/`erl_drv_rwlock_*`/`erl_drv_tsd_*`/
 //!   `erl_drv_thread_*`/`erl_drv_*_name` family (the `threads` file).
 //!
-//! The **binary refcount trio** (`driver_binary_get_refc`/`inc_refc`/`dec_refc`) — the only slots
-//! left `None` — is deliberately so: the frozen
-//! [`ErlDrvBinary`](crate::driver::types::ErlDrvBinary) layout is exactly `{ orig_size, orig_bytes }`
-//! (16 bytes, asserted in [`crate::driver::types`]) — there is no refcount word, so there is nothing
-//! to report or adjust, and the emulator's private `Binary` header is not part of this ABI.
+//! The **binary reference-count trio** (`driver_binary_get_refc`/`inc_refc`/`dec_refc`) is part of
+//! the driver-binary family and lives in `mem`: the count needs a header of its own, allocated
+//! *before* the frozen public
+//! [`ErlDrvBinary`](crate::driver::types::ErlDrvBinary) (`{ orig_size, orig_bytes }`, 16 bytes,
+//! asserted in [`crate::driver::types`]), exactly mirroring the emulator's private `Binary` header.
+//! The public struct's layout is untouched — see `mem`'s *Driver binaries* section.
 //!
 //! # Documented deviations from the oracle
 //!
@@ -267,6 +271,9 @@ mod tests {
             t.driver_alloc_binary.is_some(),
             t.driver_realloc_binary.is_some(),
             t.driver_free_binary.is_some(),
+            t.driver_binary_get_refc.is_some(),
+            t.driver_binary_inc_refc.is_some(),
+            t.driver_binary_dec_refc.is_some(),
             t.driver_system_info.is_some(),
             t.null_func.is_some(),
             t.erl_errno_id.is_some(),
@@ -322,13 +329,15 @@ mod tests {
             "every implemented slot must be populated: {populated:?}"
         );
 
-        // The only slots this seam leaves `None` are the binary-refcount trio: the frozen
-        // `ErlDrvBinary` layout has no refcount word. Which of the other slots are still `None` is
-        // deliberately NOT asserted here — it changes as families land, and each family's own test
-        // pins its own slots. See `CONTEXT.md` for the current status.
-        assert!(t.driver_binary_get_refc.is_none());
-        assert!(t.driver_binary_inc_refc.is_none());
-        assert!(t.driver_binary_dec_refc.is_none());
+        // The binary-refcount trio belongs to `mem` (it shares the driver-binary block layout).
+        // Which of the *other* slots are still `None` is deliberately NOT asserted here — it
+        // changes as families land, and each family's own test pins its own slots. See `CONTEXT.md`
+        // for the current status.
+        assert!(
+            t.driver_binary_get_refc.is_some()
+                && t.driver_binary_inc_refc.is_some()
+                && t.driver_binary_dec_refc.is_some()
+        );
 
         assert_eq!(size_of_val(t), size_of::<ErlDrvApi>());
     }

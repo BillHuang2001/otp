@@ -298,7 +298,7 @@ fn command(lib: &DriverLibrary, data: ErlDrvData, cmd: u32) -> ErlDrvSSizeT {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn the_family_slots_are_populated_and_the_binary_refcount_trio_stays_none() {
+fn the_family_slots_are_populated_and_the_binary_refcount_trio_is_populated_by_mem() {
     // Calling `driver_api_table()` both pins the frozen table shape and forces the
     // `driver_*`-carrying codegen unit into the link, so `--export-dynamic` can publish it.
     let table = driver_api_table();
@@ -325,11 +325,11 @@ fn the_family_slots_are_populated_and_the_binary_refcount_trio_stays_none() {
     ] {
         assert!(populated, "{name} must be populated");
     }
-    // The binary refcount trio stays `None`: the frozen `ErlDrvBinary` layout is exactly
-    // `{ orig_size, orig_bytes }` with no refcount word, so a count could only be fabricated.
-    assert!(table.driver_binary_get_refc.is_none());
-    assert!(table.driver_binary_inc_refc.is_none());
-    assert!(table.driver_binary_dec_refc.is_none());
+    // The binary refcount trio is populated by the `mem` family (it shares the driver-binary block
+    // layout); it is asserted here too so a break in the `populate` chain is caught from this side.
+    assert!(table.driver_binary_get_refc.is_some());
+    assert!(table.driver_binary_inc_refc.is_some());
+    assert!(table.driver_binary_dec_refc.is_some());
 }
 
 // ---------------------------------------------------------------------------------------------
