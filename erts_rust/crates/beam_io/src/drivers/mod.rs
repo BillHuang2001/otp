@@ -53,7 +53,7 @@ pub mod line_buffer;
 pub mod spawn;
 
 pub use crate::drivers::binary_io::{Phase, PhaseChange};
-pub use crate::drivers::efile::{make_efile, EfileDriver};
+pub use crate::drivers::efile::{make_efile, EfileDriver, FileDataMode};
 pub use crate::drivers::fd::FdDriver;
 pub use crate::drivers::inet::{
     make_tcp_inet, InetState, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET,
