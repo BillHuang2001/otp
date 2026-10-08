@@ -334,9 +334,11 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   is known on the degraded path) and sets it only when the shim compiled.
 
 ## Test Strategy
-- `tests/layout.rs` — re-asserts every size/align/offset from the frozen table at **runtime**:
-  all struct sizes, `ErlNifEntry`/`ErlDrvEntry`/`ErlNifIOVec`/`ErlNifMapIterator` field offsets, and
-  the 4-byte width of every enum/flag type.
+- `tests/layout.rs` — the **runtime mirror** of the `src/layout.rs` compile-time freeze: every
+  size/align/offset in the Frozen layout table below, the `ErlNifMapIterator` **union interior**
+  (`ErlNifMapIteratorUnion`/`Flat`/`Hash`), every scalar-typedef width, every opaque handle, and the
+  full enum-discriminant / flag-bit / versioned-constant surface (`ERL_NIF_*`, `ERL_DRV_*`, `PORT_*`,
+  `ERTS_NAPI_*`).
 - `tests/term_abi.rs` — `size_of::<ERL_NIF_TERM>() == size_of::<usize>() == size_of::<Eterm>()`,
   matching `align_of`, and `nif_from_eterm(eterm_from_nif(t)) == t` round-trips over boundary raw
   values (`NIL`, `make_small(0)`, max small, atom tag) — the A.3 guarantee.
