@@ -1,7 +1,7 @@
-//! The `erlang:*` process, registry and reference floor: `make_ref/0`, the monitor pair
-//! (`monitor/2`, `demonitor/1,2`) and the process/port/registry queries (`ports/0`,
-//! `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`,
-//! `unregister/1`, `module_loaded/1`).
+//! The `erlang:*` process, registry and reference floor: `make_ref/0`, the process/port/
+//! registry queries (`ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`,
+//! `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`) and the spawn family. The
+//! monitors (`monitor/2,3`, `demonitor/1,2`) live in the child [`monitor`] module.
 //!
 //! These are BIFs in name only: every one of them reads or writes the **runtime's** own
 //! process table, port registry or module set, so they live on the runtime-native floor
@@ -11,31 +11,29 @@
 //! the reference allocator ([`RefAllocator`]) — and this module only adapts terms onto it
 //! (call down, never duplicate).
 //!
-//! # One reference id space, and why `demonitor/1` needs a registry
+//! # `make_ref/0`, and the runtime's reference registry
 //!
-//! Every reference the runtime mints — a bare `make_ref/0` and a `monitor/2` reference
-//! alike — comes from [`Runtime::refs_mut`], so an id is never reused and the two can never
-//! collide (the hazard of keeping a second allocator alongside the one `ProcessTable`
-//! already owns).
-//!
-//! `demonitor(Ref)` must recover the [`MonitorRef`] a term stands for. Reading a reference
-//! thing's payload (its id word) needs `beam_term::boxed_val`, which is `unsafe` and this
-//! crate is `#![deny(unsafe_code)]`, so the runtime instead **records every reference it
-//! mints**, keyed by the term itself. A reference term is the address of a freshly
-//! allocated 4-word thing, so the term is a unique key; the entry is `Some(MonitorRef)` for
-//! a monitor reference and `None` for a bare `make_ref/0`. That is also what makes
-//! `demonitor/1`'s argument check exact: a term with no entry is not a reference this
-//! runtime minted, and the oracle's reason for that is `badarg`.
+//! `make_ref/0` mints from [`Runtime::refs_mut`] — the runtime's one reference id space, so
+//! an id is never reused — and records the term as a **bare** reference (`None`, not a
+//! monitor) in [`Runtime::references`](crate::Runtime::references). Reading a reference
+//! thing's payload (its id word) needs `beam_term::boxed_val`, which is `unsafe`, and this
+//! crate is `#![deny(unsafe_code)]`, so that term-keyed registry is the only way a later BIF
+//! can recover what a reference stands for; it is also what makes `demonitor/1`'s argument
+//! check exact (a term with no entry is not a reference this runtime minted, and the
+//! oracle's reason for that is `badarg`). The monitor half of the registry — and the
+//! monitors themselves — is [`monitor`].
 
 use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_process::{MonitoredBy, Monitor, MonitorKind, MonitorRef, PortId, Priority, ProcessId};
+use beam_process::{MonitorKind, MonitorRef, Priority, ProcessId};
 use beam_term::{atom_val, is_atom, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::error;
+
+mod monitor;
 
 /// The `spawn_opt/2,3,4` options the runtime honours.
 ///
@@ -294,67 +292,6 @@ impl RuntimeContext<'_> {
             return terms::make_tuple(self, &[child_term, ref_term]);
         }
         Ok(child_term)
-    }    // -- erlang:monitor/2 and erlang:demonitor/1,2 ----------------------------
-
-    /// `erlang:monitor(process, Target)`: a fresh reference, with the monitor recorded on
-    /// both sides (the caller's outgoing `Monitors` and the target's `monitored_by`).
-    ///
-    /// `Target` may be a pid or a registered **name**; a name with no process still yields
-    /// a reference, exactly as the oracle's does (it answers a `'DOWN'` with reason
-    /// `noproc`), but nothing is recorded for it here.
-    ///
-    /// A `port` kind, a remote `{Name, Node}` target and any other kind are rejected: the
-    /// first two are Milestone-1 capability gaps (no port monitors, no distribution — the
-    /// oracle answers `badarg` and a reference respectively), the last is the oracle's
-    /// `badarg`.
-    pub(super) fn monitor_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let kind = *args.first().ok_or(BeamError::BadArg)?;
-        let target = *args.get(1).ok_or(BeamError::BadArg)?;
-        let kind = self.atom_name(kind).ok_or(BeamError::BadArg)?;
-        match kind.as_str() {
-            "process" => self.monitor_process(target),
-            // A port monitor needs `beam_io`'s port machinery (the oracle's own `port`
-            // monitors live in the emulator's port table), and the target of the oracle's
-            // `monitor(port, X)` must be a port — anything else is `badarg` there too.
-            "port" => match PortId::from_eterm(target) {
-                Ok(_port) => Err(error::unsupported("erlang:monitor/2 on a port")),
-                Err(_) => Err(BeamError::BadArg),
-            },
-            _ => Err(BeamError::BadArg),
-        }
-    }
-
-    /// `erlang:demonitor(Ref)`: removes the monitor and answers `true`.
-    ///
-    /// A reference this runtime minted always answers `true` — including a bare
-    /// `make_ref/0` reference and an already-demonitored one, both of which the oracle also
-    /// answers `true` for. Anything that is not such a reference is `badarg` (the oracle's
-    /// reason for `demonitor(not_a_ref)`).
-    pub(super) fn demonitor_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let term = *args.first().ok_or(BeamError::BadArg)?;
-        self.demonitor(term)
-    }
-
-    /// `erlang:demonitor(Ref, Options)`: `demonitor/1` plus the option list.
-    ///
-    /// The options must be a list of the atoms `info`/`flush` (anything else is `badarg`,
-    /// as the oracle's is). Oracle-verified (OTP 29/erts-17.1): the answer is `false` when
-    /// `info` is among the options and `true` otherwise, whatever the reference backed.
-    pub(super) fn demonitor_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let term = *args.first().ok_or(BeamError::BadArg)?;
-        let options = terms::list_elements(*args.get(1).ok_or(BeamError::BadArg)?)
-            .map_err(|_| BeamError::BadArg)?;
-        let mut info = false;
-        for option in options {
-            match self.atom_name(option).as_deref() {
-                Some("info") => info = true,
-                Some("flush") => {}
-                _ => return Err(BeamError::BadArg),
-            }
-        }
-        // The removal itself is `demonitor/1`'s; only the answer differs.
-        let _ = self.demonitor(term)?;
-        self.atom(if info { "false" } else { "true" })
     }
 
     // -- ports/0, processes/0, pre_loaded/0, group_leader/0 -------------------
@@ -498,105 +435,22 @@ impl RuntimeContext<'_> {
     /// [`Runtime::take_bif_heap`]: crate::Runtime::take_bif_heap
     fn mint_reference(&mut self) -> Result<(MonitorRef, Eterm)> {
         let reference = self.runtime.refs_mut().next();
+        let term = self.reference_term(reference)?;
+        Ok((reference, term))
+    }
+
+    /// `reference` as the on-heap reference thing the oracle's `make_ref/0` builds.
+    ///
+    /// The thing is built on a pooled BIF heap (see [`Runtime::take_bif_heap`]); that heap
+    /// never moves or resets its terms, so the returned term stays valid for the runtime's
+    /// lifetime, and returning the heap to the pool keeps the borrow stack balanced.
+    ///
+    /// [`Runtime::take_bif_heap`]: crate::Runtime::take_bif_heap
+    fn reference_term(&mut self, reference: MonitorRef) -> Result<Eterm> {
         let mut heap = self.runtime.take_bif_heap()?;
         let term = reference.to_eterm(&mut heap);
         self.runtime.put_bif_heap(heap);
-        Ok((reference, term?))
-    }
-
-    /// `erlang:monitor(process, Target)` for the resolved target.
-    fn monitor_process(&mut self, target: Eterm) -> Result<Eterm> {
-        let watcher = self.pid();
-        let watched = self.monitor_target(target)?;
-        let (reference, term) = self.mint_reference()?;
-        if let Some(watched) = watched {
-            self.install_monitor(watcher, watched, reference)?;
-        }
-        // Recorded whatever happened, so `demonitor/1` recognises the reference (a monitor
-        // on a pid the table does not hold still has to be demonitorable).
-        self.runtime.references.insert(term, Some(reference));
-        Ok(term)
-    }
-
-    /// The pid `erlang:monitor(process, Target)` watches, or `None` for a registered name
-    /// that currently has no process.
-    ///
-    /// A pid term always resolves (the oracle returns a reference even for a pid that does
-    /// not exist, and the monitor then fires `noproc`); a name is looked up in the
-    /// register; `{Name, Node}` needs distribution (contract A.5), which Milestone-1 does
-    /// not implement; anything else is `badarg`, the oracle's reason.
-    fn monitor_target(&mut self, target: Eterm) -> Result<Option<ProcessId>> {
-        if let Ok(pid) = ProcessId::from_eterm(target) {
-            return Ok(Some(pid));
-        }
-        if is_atom(target) {
-            return Ok(self.process_table_mut().whereis(atom_val(target)));
-        }
-        if terms::tuple_arity(target).is_ok() {
-            return Err(error::unsupported("erlang:monitor/2 on {Name, Node}"));
-        }
-        Err(BeamError::BadArg)
-    }
-
-    /// Records the monitor `reference` that `watcher` holds on `target`.
-    ///
-    /// Both halves are stored through `beam_process`'s public monitor vocabulary — the
-    /// caller's outgoing [`Monitor`] and the target's incoming [`MonitoredBy`] — the very
-    /// pair `ProcessTable::monitor` stores, so a later
-    /// [`ProcessTable::terminate`](beam_process::ProcessTable::terminate) of the target
-    /// delivers the watcher the matching `'DOWN'` message.
-    ///
-    /// A target the table does not hold gets no incoming entry (the monitor can never
-    /// fire); a **watcher** the table does not hold is the typed capability gap for a
-    /// context running a pid without a process.
-    fn install_monitor(
-        &mut self,
-        watcher: ProcessId,
-        target: ProcessId,
-        reference: MonitorRef,
-    ) -> Result<()> {
-        let kind = MonitorKind::Process;
-        let table = self.process_table_mut();
-        let Some(watcher_process) = table.get_mut(watcher) else {
-            return Err(error::no_process(watcher));
-        };
-        watcher_process.monitors_mut().push(Monitor {
-            reference,
-            target,
-            kind,
-        });
-        if let Some(target_process) = table.get_mut(target) {
-            target_process.monitored_by_mut().push(MonitoredBy {
-                reference,
-                watcher,
-                kind,
-            });
-        }
-        Ok(())
-    }
-
-    /// Removes the monitor `term` stands for (if any) and answers `true`.
-    ///
-    /// # Errors
-    ///
-    /// `badarg` for a term that is not a reference this runtime minted (see the module
-    /// docs) — the oracle's reason for `demonitor(not_a_ref)`. A propagation failure from
-    /// the process table is reported rather than swallowed.
-    fn demonitor(&mut self, term: Eterm) -> Result<Eterm> {
-        match self.runtime.references.get(&term) {
-            Some(Some(reference)) => {
-                let watcher = self.pid();
-                let reference = *reference;
-                // The monitor is left on record, so demonitoring twice answers `true`, as
-                // the oracle's does.
-                self.process_table_mut().demonitor(watcher, reference)?;
-                self.atom("true")
-            }
-            // A bare `make_ref/0` reference backs no monitor; the oracle still answers
-            // `true`.
-            Some(None) => self.atom("true"),
-            None => Err(BeamError::BadArg),
-        }
+        term
     }
 }
 
@@ -608,7 +462,8 @@ mod tests {
 
     use super::*;
     use crate::native::test_support::{atom, call, runtime};
-    use beam_term::{make_small, NIL};
+    use beam_process::PortId;
+    use beam_term::make_small;
 
     /// Whether `term` is a reference, asked through the registry's own `is_reference/1`.
     fn is_reference(runtime: &mut crate::Runtime, term: Eterm) -> bool {
@@ -635,227 +490,6 @@ mod tests {
         assert!(is_reference(&mut runtime, first), "make_ref/0 is a reference");
         assert!(is_reference(&mut runtime, second));
         assert_ne!(first, second, "a reference is never reused");
-    }
-
-    #[test]
-    fn monitor_of_self_returns_a_reference_and_records_both_halves() {
-        let mut runtime = runtime();
-        let pid = runtime.self_pid();
-        let process = atom(&mut runtime, "process");
-        let target = pid.to_eterm();
-        let reference = call(&mut runtime, "erlang", "monitor", &[process, target])
-            .expect("erlang:monitor/2");
-        assert!(
-            is_reference(&mut runtime, reference),
-            "monitor/2 answers a reference"
-        );
-        assert_ne!(
-            reference,
-            call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0"),
-            "a monitor reference is freshly minted"
-        );
-
-        // Both halves of the monitor are recorded on the running process (it monitors
-        // itself), which is exactly what a later `{'DOWN', …}` delivery reads.
-        let recorded = runtime.processes().get(pid).expect("the runtime's process");
-        assert_eq!(recorded.monitors().len(), 1, "the outgoing monitor");
-        assert_eq!(recorded.monitored_by().len(), 1, "the incoming monitor");
-        assert_eq!(
-            recorded.monitored_by()[0].watcher,
-            pid,
-            "the watcher is the running pid"
-        );
-    }
-
-    #[test]
-    fn demonitor_removes_the_monitor_and_answers_true() {
-        let mut runtime = runtime();
-        let pid = runtime.self_pid();
-        let process = atom(&mut runtime, "process");
-        let reference = call(&mut runtime, "erlang", "monitor", &[process, pid.to_eterm()])
-            .expect("erlang:monitor/2");
-        let answer = call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1");
-        assert_eq!(atom_name(&runtime, answer), Some("true"));
-        assert_eq!(
-            runtime.processes().get(pid).expect("the process").monitors().len(),
-            0,
-            "the outgoing monitor is gone"
-        );
-        assert_eq!(
-            runtime
-                .processes()
-                .get(pid)
-                .expect("the process")
-                .monitored_by()
-                .len(),
-            0,
-            "the incoming monitor is gone"
-        );
-        // Demonitoring again is still `true`, as the oracle answers.
-        let again = call(&mut runtime, "erlang", "demonitor", &[reference]).expect("demonitor/1");
-        assert_eq!(atom_name(&runtime, again), Some("true"));
-    }
-
-    #[test]
-    fn demonitor_of_a_bare_reference_is_true_and_of_a_non_reference_is_badarg() {
-        let mut runtime = runtime();
-        // A plain `make_ref/0` reference backs no monitor, and the oracle answers `true`.
-        let plain = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
-        let answer = call(&mut runtime, "erlang", "demonitor", &[plain]).expect("demonitor/1");
-        assert_eq!(atom_name(&runtime, answer), Some("true"));
-        // Anything that is not a reference this runtime minted is `badarg`.
-        for argument in [make_small(42), atom(&mut runtime, "notaref"), NIL] {
-            assert!(
-                matches!(
-                    call(&mut runtime, "erlang", "demonitor", &[argument]),
-                    Err(BeamError::BadArg)
-                ),
-                "demonitor({argument:?}) is badarg"
-            );
-        }
-    }
-
-    #[test]
-    fn demonitor_with_options_matches_the_oracle() {
-        let mut runtime = runtime();
-        let pid = runtime.self_pid();
-        let process = atom(&mut runtime, "process");
-        let reference = call(&mut runtime, "erlang", "monitor", &[process, pid.to_eterm()])
-            .expect("erlang:monitor/2");
-        let empty = {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            terms::make_list(&mut context, &[]).expect("[]")
-        };
-        let answer =
-            call(&mut runtime, "erlang", "demonitor", &[reference, empty]).expect("demonitor/2");
-        assert_eq!(atom_name(&runtime, answer), Some("true"), "[] answers true");
-
-        // `[info]` answers `false` (oracle-verified), and so does `[info, flush]`.
-        let info = atom(&mut runtime, "info");
-        let flush = atom(&mut runtime, "flush");
-        let info_list = {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            terms::make_list(&mut context, &[info]).expect("[info]")
-        };
-        let answer =
-            call(&mut runtime, "erlang", "demonitor", &[reference, info_list]).expect("demonitor/2");
-        assert_eq!(atom_name(&runtime, answer), Some("false"), "[info] answers false");
-
-        let both = {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            terms::make_list(&mut context, &[info, flush]).expect("[info, flush]")
-        };
-        let answer =
-            call(&mut runtime, "erlang", "demonitor", &[reference, both]).expect("demonitor/2");
-        assert_eq!(atom_name(&runtime, answer), Some("false"), "[info, flush] answers false");
-
-        // `[flush]` answers `true`; a malformed option list or a non-list is `badarg`.
-        let flush_list = {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            terms::make_list(&mut context, &[flush]).expect("[flush]")
-        };
-        let answer = call(&mut runtime, "erlang", "demonitor", &[reference, flush_list])
-            .expect("demonitor/2");
-        assert_eq!(atom_name(&runtime, answer), Some("true"), "[flush] answers true");
-
-        let nonsense = atom(&mut runtime, "nope");
-        let bad_options = {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            terms::make_list(&mut context, &[nonsense]).expect("[nope]")
-        };
-        assert!(matches!(
-            call(&mut runtime, "erlang", "demonitor", &[reference, bad_options]),
-            Err(BeamError::BadArg)
-        ));
-        assert!(matches!(
-            call(&mut runtime, "erlang", "demonitor", &[reference, make_small(1)]),
-            Err(BeamError::BadArg)
-        ));
-        // A non-reference is `badarg` whatever the options are.
-        assert!(matches!(
-            call(&mut runtime, "erlang", "demonitor", &[make_small(1), empty]),
-            Err(BeamError::BadArg)
-        ));
-    }
-
-    #[test]
-    fn monitor_of_a_registered_name_resolves_through_the_register() {
-        let mut runtime = runtime();
-        let name = atom(&mut runtime, "myreg");
-        let pid = runtime.self_pid();
-        let pid_term = pid.to_eterm();
-        let registered = call(&mut runtime, "erlang", "register", &[name, pid_term])
-            .expect("erlang:register/2");
-        assert_eq!(atom_name(&runtime, registered), Some("true"));
-
-        let process = atom(&mut runtime, "process");
-        let reference = call(&mut runtime, "erlang", "monitor", &[process, name])
-            .expect("erlang:monitor(process, Name)");
-        assert!(is_reference(&mut runtime, reference));
-        // The monitor is on the *registered* pid, so the running process sees it.
-        assert_eq!(
-            runtime.processes().get(pid).expect("the process").monitors().len(),
-            1
-        );
-
-        // An unregistered name still yields a reference (the oracle does the same), but
-        // nothing is recorded for it.
-        let missing = atom(&mut runtime, "no_such_registered_name");
-        let reference = call(&mut runtime, "erlang", "monitor", &[process, missing])
-            .expect("erlang:monitor(process, Missing)");
-        assert!(is_reference(&mut runtime, reference));
-        assert_eq!(
-            runtime.processes().get(pid).expect("the process").monitors().len(),
-            1,
-            "only the resolvable name produced a recorded monitor"
-        );
-    }
-
-    #[test]
-    fn monitor_rejects_bad_kinds_and_bad_targets() {
-        let mut runtime = runtime();
-        let pid = runtime.self_pid().to_eterm();
-        let bad = atom(&mut runtime, "bad");
-        let port = atom(&mut runtime, "port");
-        let process = atom(&mut runtime, "process");
-        let reference = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
-
-        // A kind that is not an atom, and a kind that is not `process`/`port`.
-        assert!(matches!(
-            call(&mut runtime, "erlang", "monitor", &[make_small(1), pid]),
-            Err(BeamError::BadArg)
-        ));
-        assert!(matches!(
-            call(&mut runtime, "erlang", "monitor", &[bad, pid]),
-            Err(BeamError::BadArg)
-        ));
-        // `port` needs a port target: a pid is `badarg`, as the oracle answers.
-        assert!(matches!(
-            call(&mut runtime, "erlang", "monitor", &[port, pid]),
-            Err(BeamError::BadArg)
-        ));
-        // `process` with a target that is neither a pid, nor a name, nor `{Name, Node}`.
-        assert!(matches!(
-            call(&mut runtime, "erlang", "monitor", &[process, reference]),
-            Err(BeamError::BadArg)
-        ));
-        // A `{Name, Node}` target needs distribution — a Milestone-1 capability gap.
-        let tuple = {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            terms::make_tuple(&mut context, &[bad, bad]).expect("a tuple")
-        };
-        let error = call(&mut runtime, "erlang", "monitor", &[process, tuple])
-            .expect_err("distribution is not implemented");
-        assert!(
-            crate::error::unsupported_reason(&error).is_some(),
-            "a remote monitor is a capability gap: {error}"
-        );
     }
 
     #[test]

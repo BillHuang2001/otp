@@ -155,6 +155,7 @@ impl RuntimeContext<'_> {
             ("erlang", "spawn_opt", 3) => Some(self.spawn_opt_3(args)),
             ("erlang", "spawn_opt", 4) => Some(self.spawn_opt_4(args)),
             ("erlang", "monitor", 2) => Some(self.monitor_2(args)),
+            ("erlang", "monitor", 3) => Some(self.monitor_3(args)),
             ("erlang", "demonitor", 1) => Some(self.demonitor_1(args)),
             ("erlang", "demonitor", 2) => Some(self.demonitor_2(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
