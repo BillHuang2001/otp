@@ -1,0 +1,39 @@
+Dead-source checker report for erts/emulator/**/*.{c,h,cpp,hpp,cc}
+candidates checked: 747   referenced: 721   exempt (retained by rule): 25   deletable: 1
+
+DELETABLE (no build ref, no #include, no symbol use):
+  erts/emulator/drivers/unix/bin_drv.c
+
+EXEMPT (mechanically unreferenced but retained):
+  erts/emulator/asmjit/arm/a64assembler.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/arm/a64builder.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/arm/a64compiler.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/arm/a64formatter.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/arm/a64operand.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/arm/a64rapass.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/arm/armformatter.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/x86/x86builder.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/x86/x86compiler.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/x86/x86formatter.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/x86/x86instdb.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/x86/x86operand.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/asmjit/x86/x86rapass.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
+  erts/emulator/test/nif_SUITE_data/nif_SUITE.1.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.1.2_0.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.1.2_4.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.1.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.2.2_0.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.2.2_4.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.2.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.3.2_0.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.3.2_4.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.3.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.4.c  <- test fixture under test/ (owned by the CT suites)
+  erts/emulator/test/nif_SUITE_data/nif_mod.5.c  <- test fixture under test/ (owned by the CT suites)
+
+WEAK (retained, but the only reference is a non-makefile mention -
+      a CT suite, an escript or a CI list; audit before deleting):
+
+REFERENCED BUT NOT IN AN OBJECT LIST (compilation units reachable only by
+#include / symbol use - i.e. dead-but-referenced; audit before deleting):
+  (none)
