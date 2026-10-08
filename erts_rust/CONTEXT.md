@@ -132,7 +132,9 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   (`../lib/compiler`), per Part II §E/§H. Language-agnostic (Erlang/Elixir/LFE). Not part of the Rust
   runtime rewrite; the Rust runtime must ultimately run the compiler (contract A.9, self-hosted build)
   — that is future work.
-- **Stage 4 completion:** GenImmix mature-generation option (measurement-gated).
+- **Stage 4 adoption:** the copying collector and the measurement-gated GenImmix mature generation
+  (`beam_gc`) are implemented and auto-selected at/above `IMMIX_BREAK_EVEN_WORDS`; no outer crate drives
+  a collector yet (`beam_rt` does not).
 - **Stage 6 (Level-2 clean-room VM):** new ISA + full toolchain — research track with an explicit exit
   criterion (Part II §H).
 - **Legacy-C removal:** delete the corresponding C under `../erts/emulator/beam/` module-by-module as
