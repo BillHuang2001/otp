@@ -429,6 +429,20 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
     and a wide-`i` bignum; `#shared` carrying `-export_record([shared])`). The module is named
     `records_fixture`, **not** `records`, to avoid colliding with the stdlib `records` module (which
     would make the oracle's `records:get_definition/2` loop forever).
+  - `tests/fixtures/nr_def.beam` / `nr_use.beam` from `nr_def.erl` / `nr_use.erl` (`+deterministic`) —
+    the OTP-29 **native-record** pair: `nr_def` defines/exports `#rec`, `nr_use` imports it, defines its
+    own `#local`, and builds/reads/updates both, so together they emit opcodes 186-191
+    (`is_any_native_record`, `is_native_record`, `get_record_elements`, `put_record`,
+    `is_record_accessible`, `get_record_field`); the hand-written OTP-29 `erlc` *does* emit these.
+  - `tests/fixtures/linecov.beam` from `linecov.erl` (`+line_coverage`) — emits `executable_line` (183).
+  - `tests/fixtures/dbgline.beam` from `dbgline.erl` (`+beam_debug_info`) — emits `debug_line` (184).
+  - `tests/fixtures/bstail.beam` from `bstail.erl` (`+no_ssa_opt`) — emits `bs_test_tail2` (121); with SSA
+    opts on, `bs_translate/1` folds it into a `bs_match` `ensure_exactly` command, so `+no_ssa_opt` is
+    needed to observe the generic opcode.
+  - `tests/fixtures/literals_verbatim.beam` / `literals_compressed.beam` (same source
+    `literals_fixture.erl`, the second with `+compressed_literals`) — the two `LitT` framings, covering
+    every literal kind (tuples/lists/maps/floats/bignums/binaries/external funs); plus
+    `literals_oracle.escript`, the independent Erlang-side oracle for the literal sweep.
 - **Ground truth is derived, never guessed:** `beam_disasm:file(...)` plus a byte decode; if a fixture
   byte changes, re-derive the expected IR.
 - **`tests/container.rs`:** the chunk directory (ids/sizes in file order), the `AtU8` atoms, the
