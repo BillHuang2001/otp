@@ -662,7 +662,7 @@ still reproduces today's collector exactly.
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `move_size`/`move_*`, `collect`
-- `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver, per-collection growth/shrink + `minor_gcs`
+- `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver, per-collection growth/shrink + `minor_gcs`, the capacity pre-check (no half-forward) and the `ensure_capacity` growth seam
 - `src/config.rs` → GC-strategy seam: `GcConfig { policy, selection }`, `MatureKind::{Copying,Immix}` (the *strategy*; default `Copying`), `MatureSelection::{Auto,Explicit}` (the *how*; default `Auto` = the automatic rule). `mature()` is the resolved strategy, `mature_choice()` the observable decision
 - `src/selection.rs` → the **automatic rule**: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`, `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice` (`rule_kind`/`is_override`/`describe`). Safe Rust; depends only on `config`/`policy`/`immix`
 - `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, accounting views (`ImmixStats`/`ImmixCounters`)
