@@ -12,6 +12,10 @@
 //! (A `{Name, Node}` 2-tuple is **not** a table argument in OTP 29: verified
 //! `badarg` for every node form.)
 //!
+//! `ets:info/1,2` are the one exception: for a **well-formed** table argument that
+//! names no live table they report the bare atom `undefined`, not `badarg`, so they
+//! resolve through [`resolve_handle_opt`] — see there for the exact split.
+//!
 //! # The owner bridge
 //!
 //! `beam_ets` models the table owner as an opaque [`OwnerId`] (it has no pid
@@ -59,7 +63,8 @@ const NLOCKS_WITH_ITEM_COUNTERS: u64 = 64;
 ///
 /// An unknown atom (no `named_table` has that name), an atom naming a table that
 /// was not created with `named_table`, and any non-atom non-handle term are
-/// `badarg`, exactly as the oracle's `db_get_table_aux` reports.
+/// `badarg`, exactly as the oracle's `db_get_table_aux` reports. (`ets:info/1,2`
+/// answers `undefined` for the first two instead — see [`resolve_handle_opt`].)
 pub(super) fn resolve_handle(ctx: &mut BifContext<'_>, term: Eterm) -> Result<u64> {
     if !is_atom(term) {
         return ref_thing_id(term);
@@ -67,6 +72,49 @@ pub(super) fn resolve_handle(ctx: &mut BifContext<'_>, term: Eterm) -> Result<u6
     let name = atom_val(term);
     let tables = ctx.tables().ok_or_else(unsupported_bif)?;
     tables.lookup_name(name).ok_or_else(badarg)
+}
+
+/// The registry handle a table argument names **when it names a *live* table** —
+/// the `ets:info/1,2` variant of [`resolve_handle`].
+///
+/// `ets:info/1,2` is the one place the oracle answers the bare atom `undefined`
+/// instead of `badarg` for a table argument that is *well-formed* but names
+/// nothing (verified on erts-17.1):
+///
+/// * an **atom** — whether it is an unknown name or the name of a table that was
+///   *not* created with `named_table` — is `undefined`;
+/// * a **handle reference** whose table is gone (a deleted table's tid) is
+///   `undefined`;
+/// * a term of any other shape (`42`, `{Name, Node}`, `[]`, a pid) is still
+///   `badarg`, exactly as [`resolve_handle`] reports.
+///
+/// `None` is the "well-formed but names nothing" case the caller renders as
+/// `undefined`; `Some(handle)` a live table. A missing [`TableRegistry`] stays the
+/// typed [`unsupported_bif`] capability gap, as in [`resolve_handle`].
+///
+/// # M1 deviation
+///
+/// The oracle distinguishes a **tid** reference from an ordinary `make_ref()`
+/// reference (the former is `undefined`, the latter `badarg`), because a tid
+/// carries an internal marker no other reference has. The M1 table handle is an
+/// ordinary ref thing ([`crate::access::make_ref_thing`]), indistinguishable from
+/// any other reference, so this layer cannot tell a deleted tid from a bare ref and
+/// answers `undefined` for both. Every other cell of the matrix above is exact.
+pub(super) fn resolve_handle_opt(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+) -> Result<Option<u64>> {
+    if !is_atom(term) {
+        // A non-atom table argument is a handle reference — anything else is
+        // `badarg` — and a reference names a live table only while the registry
+        // holds its id.
+        let handle = ref_thing_id(term)?;
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        return Ok(tables.contains(handle).then_some(handle));
+    }
+    let name = atom_val(term);
+    let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+    Ok(tables.lookup_name(name))
 }
 
 // ------------------------------------------------------------- owner bridge

@@ -9,11 +9,15 @@
 //! destructuring goes through the registered `erlang`/`lists` BIFs, so the suite
 //! uses only the public API.
 //!
-//! The M1 handle substitution the tests rely on: the runtime hands out a handle
-//! **reference** even for a table created with `named_table` (the oracle hands back
-//! the name atom there). Everything else — the tid `ets:whereis/1` answers, the
-//! `undefined` of an unregistered name, the duplicate-name `badarg`, the
-//! `update_element/4` semantics, the `is_compiled_ms/1` predicate — is the oracle's.
+//! The handle convention the tests rely on is the oracle's: `ets:new(Name,
+//! [named_table])` hands back the **name atom**, every other table a handle
+//! **reference** (`erlang:is_reference/1` true). A table argument may be either
+//! shape — every `ets:*` BIF routes it through the single resolver — so a name
+//! atom is accepted wherever the handle ref is. Everything else is the oracle's:
+//! the tid reference `ets:whereis/1` answers for a registered name (the `undefined`
+//! of an unregistered one or of a non-`named_table` name field), the duplicate-name
+//! `badarg`, the freeing of the name on `ets:delete/1`, the `update_element/4`
+//! semantics and the `is_compiled_ms/1` predicate.
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, TableRegistry};
@@ -141,6 +145,13 @@ fn found(bifs: &BifRegistry, ctx: &mut BifContext<'_>, handle: Eterm, key: &str)
     let objects = lookup(bifs, ctx, handle, key);
     nth(bifs, ctx, 1, objects)
 }
+
+/// The `ets:whereis/1` answer for the (name-atom) argument `name`.
+fn whereis(bifs: &BifRegistry, ctx: &mut BifContext<'_>, name: Eterm) -> Eterm {
+    bifs.call("ets", "whereis", 1, ctx, &[name])
+        .expect("ets:whereis")
+}
+
 /// The raw match spec `[{{'$1','$2'}, [], [{{'$1','$2'}}]}]` (the whole object).
 fn whole_object_spec(ctx: &mut BifContext<'_>) -> Eterm {
     let v1 = ctx.atom("$1").expect("seeded");
@@ -158,8 +169,8 @@ fn whole_object_spec(ctx: &mut BifContext<'_>) -> Eterm {
 
 /// The oracle:
 /// ```text
-/// 1> N = ets:new(ntab,[named_table,set]), ets:whereis(ntab) =:= ets:info(N,id).
-/// true
+/// 1> N = ets:new(ntab,[named_table,set]), {N, ets:whereis(ntab) =:= ets:info(N,id)}.
+/// {ntab,true}
 /// 2> ets:whereis(justname).              % the name field of a plain table
 /// undefined
 /// 3> ets:new(justname,[set]), ets:whereis(justname).
@@ -178,27 +189,35 @@ fn whereis_answers_the_named_tables_tid_and_undefined_otherwise() {
 
     let handle = new_table_ok(&bifs, &mut ctx, "ntab", &["named_table", "set"]);
     let name = ctx.atom("ntab").expect("seeded");
+    // `ets:new(Name, [named_table])` returns the NAME ATOM (the oracle's `{ntab,…}`),
+    // and that name atom is itself a table argument (the single resolver accepts it
+    // wherever the handle ref is accepted).
+    assert!(beam_term::compare::eq(handle, name, &atoms));
+    let object = pair(&mut ctx, "k", 1);
+    let out = bifs
+        .call("ets", "insert", 2, &mut ctx, &[name, object])
+        .expect("ets:insert/2 by name");
+    assert!(is_true(&atoms, out));
+
     let id_item = ctx.atom("id").expect("seeded");
     let id = bifs
         .call("ets", "info", 2, &mut ctx, &[handle, id_item])
         .expect("ets:info/2");
-    // `whereis/1` answers a tid that compares `=:=` to the handle the table's BIFs
-    // take and to `ets:info(T, id)`.
-    let tid = bifs
-        .call("ets", "whereis", 1, &mut ctx, &[name])
-        .expect("ets:whereis/1");
-    assert!(beam_term::compare::eq(tid, handle, &atoms));
+    // `whereis/1` answers the table's **tid**: the very reference `ets:info(T, id)`
+    // returns — not the name atom.
+    let tid = whereis(&bifs, &mut ctx, name);
     assert!(beam_term::compare::eq(tid, id, &atoms));
-
+    assert!(!beam_term::compare::eq(tid, name, &atoms));
+    let out = bifs
+        .call("erlang", "is_reference", 1, &mut ctx, &[tid])
+        .expect("erlang:is_reference/1");
+    assert!(is_true(&atoms, out));
     // An unregistered name is `undefined` — including the name *field* of a table
     // created without `named_table`.
     let _plain = new_table_ok(&bifs, &mut ctx, "justname", &["set"]);
     let justname = ctx.atom("justname").expect("seeded");
-    let missing = bifs
-        .call("ets", "whereis", 1, &mut ctx, &[justname])
-        .expect("ets:whereis/1");
+    let missing = whereis(&bifs, &mut ctx, justname);
     assert!(is_atom_named(&atoms, missing, "undefined"));
-
     // A non-atom is `badarg`.
     let seven = ctx.int(7).expect("fits");
     let err = bifs
@@ -214,13 +233,9 @@ fn whereis_answers_the_named_tables_tid_and_undefined_otherwise() {
 /// 2> ets:new(ntab,[named_table,set]), ets:new(ntab,[set]).     % unnamed: allowed
 /// #Ref<...>
 /// 3> N = ets:new(ntab,[named_table,set]), ets:delete(N),
-///    ets:whereis(ntab), is_reference(ets:new(ntab,[named_table,set])).
+///    {ets:whereis(ntab), is_reference(ets:new(ntab,[named_table,set]))}.
 /// {undefined,false}     % the name is free again; `new` returns the NAME ATOM
 /// ```
-///
-/// (The M1 runtime returns a handle reference for a `named_table` too — the last
-/// assertion is therefore `is_reference =:= true` here; that is the pre-existing
-/// `ets:new/2` handle substitution, not a `whereis/1` property.)
 #[test]
 fn new_rejects_a_duplicate_name_and_delete_frees_it() {
     let bifs = default_registry();
@@ -230,30 +245,57 @@ fn new_rejects_a_duplicate_name_and_delete_frees_it() {
     let mut ctx =
         BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
 
+    let name = ctx.atom("ntab").expect("seeded");
+    // `ets:new(Name, [named_table])` returns the NAME ATOM (the oracle's shape).
     let handle = new_table_ok(&bifs, &mut ctx, "ntab", &["named_table", "set"]);
+    assert!(beam_term::compare::eq(handle, name, &atoms));
+
     // A second `named_table` with the same name is `badarg`; an *unnamed* table
-    // reusing the name is fine (it is not registered).
+    // reusing the name is fine (it is not registered) and is handed back as a plain
+    // handle **reference**, not the name atom.
     let err = new_table(&bifs, &mut ctx, "ntab", &["named_table", "set"]).expect_err("taken");
     assert!(is_badarg(&err), "{err:?}");
-    let _unnamed = new_table_ok(&bifs, &mut ctx, "ntab", &["set"]);
+    let unnamed = new_table_ok(&bifs, &mut ctx, "ntab", &["set"]);
+    assert!(!beam_term::compare::eq(unnamed, name, &atoms));
+    let out = bifs
+        .call("erlang", "is_reference", 1, &mut ctx, &[unnamed])
+        .expect("erlang:is_reference/1");
+    assert!(is_true(&atoms, out));
+    // The registered name still resolves to the *named* table's tid.
+    let id_item = ctx.atom("id").expect("seeded");
+    let tid = bifs
+        .call("ets", "info", 2, &mut ctx, &[handle, id_item])
+        .expect("ets:info/2");
+    assert!(beam_term::compare::eq(
+        whereis(&bifs, &mut ctx, name),
+        tid,
+        &atoms
+    ));
 
-    // Deleting the named table clears its name...
-    let name = ctx.atom("ntab").expect("seeded");
+    // Deleting the named table (by name) clears its name...
     assert!(is_true(
         &atoms,
-        bifs.call("ets", "delete", 1, &mut ctx, &[handle])
+        bifs.call("ets", "delete", 1, &mut ctx, &[name])
             .expect("ets:delete/1")
     ));
-    let missing = bifs
-        .call("ets", "whereis", 1, &mut ctx, &[name])
-        .expect("ets:whereis/1");
-    assert!(is_atom_named(&atoms, missing, "undefined"));
-    // ...so the name can be taken again, and a deleted handle is `badarg`.
-    let _again = new_table_ok(&bifs, &mut ctx, "ntab", &["named_table", "set"]);
+    let gone = whereis(&bifs, &mut ctx, name);
+    assert!(is_atom_named(&atoms, gone, "undefined"));
+
+    // ...and the tid captured before the delete is `badarg` afterwards.
     let err = bifs
-        .call("ets", "delete", 1, &mut ctx, &[handle])
-        .expect_err("deleted handle");
+        .call("ets", "delete", 1, &mut ctx, &[tid])
+        .expect_err("deleted tid");
     assert!(is_badarg(&err), "{err:?}");
+
+    // ...so the name can be taken again, and `new` hands back the name atom again
+    // (a *fresh* table, so a new tid).
+    let again = new_table_ok(&bifs, &mut ctx, "ntab", &["named_table", "set"]);
+    assert!(beam_term::compare::eq(again, name, &atoms));
+    assert!(!beam_term::compare::eq(
+        whereis(&bifs, &mut ctx, name),
+        tid,
+        &atoms
+    ));
 }
 
 // ------------------------------------------------------------- safe_fixtable
