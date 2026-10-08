@@ -79,6 +79,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod allowlist;
 pub mod cli;
 pub mod compare;
 pub mod corpus;
@@ -86,12 +87,14 @@ pub mod error;
 pub mod harness;
 pub mod module_build;
 pub(crate) mod nif_build;
+pub mod ratchet;
 pub mod report;
 pub mod runtime;
 
 #[cfg(test)]
 mod test_support;
 
+pub use allowlist::{AllowEntry, Allowlist};
 pub use compare::{
     compare_observations, compare_observations_with, verdict, verdict_with, FieldDiff, GoldenCheck,
     Observables, SideResult, Verdict,
@@ -102,6 +105,7 @@ pub use harness::{
     compare_expr, run_case, run_suite, CaseOutcome, RuntimeContext, SuiteOutcome,
 };
 pub use module_build::CompiledModule;
+pub use ratchet::RatchetReport;
 pub use report::{CaseReport, ListReport, RunReport, Summary};
 pub use runtime::{
     eval_argv, resolve_oracle, resolve_rust, Observation, RuntimeId, RuntimeSource, RuntimeSpec,

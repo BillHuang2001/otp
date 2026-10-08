@@ -1,0 +1,506 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
+//! The **ratcheted** strict gate: classify the current capability gaps against the
+//! allowlist, render a `GAPS.md`, and derive the suite's exit code.
+//!
+//! A **gap** is a non-agreeing case whose verdict is `Unsupported` *or* `Skipped`. A
+//! `Mismatch` is never a gap — it is always a hard failure. With an allowlist the gate
+//! tolerates the gaps it records and fails the moment an *unauthorized* gap appears (the
+//! allowlist must be widened deliberately) or an entry goes *stale* (its case is no longer
+//! a gap — the allowlist must be tightened). Without an allowlist the behaviour is exactly
+//! as before (`strict` escalates any `unsupported`/`skipped` case to a failure).
+
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::path::Path;
+
+use serde::Serialize;
+
+use crate::allowlist::Allowlist;
+use crate::compare::Verdict;
+use crate::error::{Error, Result};
+use crate::harness::SuiteOutcome;
+use crate::report::{CaseReport, RunReport};
+
+/// Whether `verdict` is a capability gap the allowlist may tolerate.
+///
+/// `Mismatch` is deliberately excluded: a differing observable result is never a gap.
+fn is_gap(verdict: Verdict) -> bool {
+    matches!(verdict, Verdict::Unsupported | Verdict::Skipped)
+}
+
+/// The current run's gap classification against the allowlist.
+///
+/// This is the top-level `ratchet` key of a [`RunReport`] produced with an allowlist; it is
+/// omitted entirely from a run without one, so that report is byte-for-byte unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RatchetReport {
+    /// The allowlist path as given (verbatim), when there was one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowlist: Option<String>,
+    /// Gaps whose case id is recorded in the allowlist.
+    pub allowed: usize,
+    /// Gaps whose case id is *not* recorded — the ratchet must be updated.
+    pub unauthorized: usize,
+    /// Allowlist entries whose case did not reproduce as a gap (a closed gap, a renamed id
+    /// or a typo) — the ratchet must be tightened.
+    pub stale: usize,
+}
+
+impl RatchetReport {
+    /// Classify the case reports of a run against `allowlist`.
+    pub fn classify(cases: &[CaseReport], allowlist: &Allowlist) -> RatchetReport {
+        let mut allowed = 0;
+        let mut unauthorized = 0;
+        let mut gap_ids: BTreeSet<&str> = BTreeSet::new();
+        for case in cases {
+            if !is_gap(case.verdict) {
+                continue;
+            }
+            gap_ids.insert(case.case_id.as_str());
+            if allowlist.contains(&case.case_id) {
+                allowed += 1;
+            } else {
+                unauthorized += 1;
+            }
+        }
+        let stale = allowlist
+            .entries()
+            .iter()
+            .filter(|entry| !gap_ids.contains(entry.case_id.as_str()))
+            .count();
+        RatchetReport {
+            allowlist: allowlist.path().map(|path| path.display().to_string()),
+            allowed,
+            unauthorized,
+            stale,
+        }
+    }
+}
+
+/// Build the run report of a suite run, carrying the ratchet classification of `allowlist`.
+pub fn report_from_suite(suite: &SuiteOutcome, allowlist: &Allowlist) -> RunReport {
+    let cases: Vec<CaseReport> = suite.cases.iter().map(CaseReport::from_outcome).collect();
+    let ratchet = RatchetReport::classify(&cases, allowlist);
+    RunReport::new_with_ratchet(
+        "suite",
+        &suite.context.oracle,
+        suite.context.rust.as_ref(),
+        cases,
+        Some(ratchet),
+    )
+}
+
+/// The process exit code of a suite run.
+///
+/// * `1` on any `mismatch` (always a hard failure);
+/// * with a ratchet: `1` when an unauthorized gap appeared or an entry went stale, else `0`
+///   (an allowlisted gap set is tolerated);
+/// * without a ratchet (today's behaviour): `1` under `strict` when any `unsupported`/
+///   `skipped` case remains, else `0`.
+pub fn suite_exit_code(report: &RunReport, strict: bool) -> i32 {
+    if report.summary.mismatch > 0 {
+        return 1;
+    }
+    if let Some(ratchet) = &report.ratchet {
+        return if ratchet.unauthorized > 0 || ratchet.stale > 0 {
+            1
+        } else {
+            0
+        };
+    }
+    if strict && (report.summary.unsupported > 0 || report.summary.skipped > 0) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Escape a value for a markdown table cell (`|` and line breaks).
+fn cell(text: &str) -> String {
+    text.replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+/// Render the generated `GAPS.md` document of a run.
+///
+/// One table lists every current gap (in `report.cases` order), classified `allowed` or
+/// `unauthorized`; stale allowlist entries follow with status `stale`.
+pub fn gaps_markdown(report: &RunReport, allowlist: &Allowlist) -> String {
+    let ratchet = RatchetReport::classify(&report.cases, allowlist);
+    let summary = &report.summary;
+    let mut out = String::new();
+    out.push_str("# Known capability gaps\n\n");
+    out.push_str(
+        "Generated by `differential suite --strict --allowlist <file> --gaps <path>` — do\n\
+         not hand-edit. Edit the allowlist and re-run the gate instead.\n\n",
+    );
+    let _ = writeln!(
+        out,
+        "Run: total={} agree={} mismatch={} unsupported={} skipped={}\n",
+        summary.total, summary.agree, summary.mismatch, summary.unsupported, summary.skipped
+    );
+    let _ = writeln!(
+        out,
+        "Allowlist: {} entries={} allowed={} unauthorized={} stale={}\n",
+        ratchet.allowlist.as_deref().unwrap_or("(none)"),
+        allowlist.len(),
+        ratchet.allowed,
+        ratchet.unauthorized,
+        ratchet.stale
+    );
+    out.push_str("| Case ID | Verdict | Owning crate | Status | Reason |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for case in &report.cases {
+        if !is_gap(case.verdict) {
+            continue;
+        }
+        let entry = allowlist.get(&case.case_id);
+        let (status, crate_name) = match entry {
+            Some(entry) => ("allowed", entry.crate_name.as_str()),
+            None => ("unauthorized", "—"),
+        };
+        let reason = case.rust.reason.as_deref().unwrap_or("—");
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            cell(&case.case_id),
+            case.verdict.as_str(),
+            cell(crate_name),
+            status,
+            cell(reason)
+        );
+    }
+    let gap_ids: BTreeSet<&str> = report
+        .cases
+        .iter()
+        .filter(|case| is_gap(case.verdict))
+        .map(|case| case.case_id.as_str())
+        .collect();
+    for entry in allowlist.entries() {
+        if gap_ids.contains(entry.case_id.as_str()) {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "| {} | — | {} | stale | {} |",
+            cell(&entry.case_id),
+            cell(&entry.crate_name),
+            cell(&entry.reason)
+        );
+    }
+    out
+}
+
+/// Write the generated `GAPS.md`, creating its parent directory if needed.
+pub fn write_markdown(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|source| {
+                Error::io(
+                    format!("writing the gaps report '{}'", path.display()),
+                    source,
+                )
+            })?;
+        }
+    }
+    std::fs::write(path, text).map_err(|source| {
+        Error::io(
+            format!("writing the gaps report '{}'", path.display()),
+            source,
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gaps_markdown, report_from_suite, suite_exit_code, RatchetReport};
+    use crate::allowlist::Allowlist;
+    use crate::compare::{FieldDiff, SideResult, Verdict};
+    use crate::corpus::Contract;
+    use crate::report::{CaseReport, RunReport, SideReport};
+    use crate::runtime::{RuntimeId, RuntimeSource, RuntimeSpec};
+    use std::path::PathBuf;
+
+    fn spec() -> RuntimeSpec {
+        RuntimeSpec {
+            id: RuntimeId::Oracle,
+            program: PathBuf::from("/x/erl"),
+            source: RuntimeSource::Path,
+        }
+    }
+
+    fn side(available: bool, reason: Option<&str>) -> SideReport {
+        SideReport {
+            available,
+            reason: reason.map(|reason| reason.to_string()),
+            stdout: if available {
+                Some("ok\n".to_string())
+            } else {
+                None
+            },
+            stdout_hex: if available {
+                Some("6f6b0a".to_string())
+            } else {
+                None
+            },
+            exit_code: if available { Some(0) } else { None },
+            matched_golden: None,
+        }
+    }
+
+    fn case(case_id: &str, verdict: Verdict, rust_reason: Option<&str>) -> CaseReport {
+        CaseReport {
+            case_id: case_id.to_string(),
+            description: format!("the {case_id} case"),
+            contracts: vec![Contract::LanguageSemantics],
+            eval: "try (ok) of V -> ok end.".to_string(),
+            verdict,
+            oracle: side(true, None),
+            rust: side(verdict == Verdict::Agree, rust_reason),
+            diffs: Vec::<FieldDiff>::new(),
+        }
+    }
+
+    fn report(cases: Vec<CaseReport>, ratchet: Option<RatchetReport>) -> RunReport {
+        RunReport::new_with_ratchet("suite", &spec(), None, cases, ratchet)
+    }
+
+    fn allowlist(source: &str) -> Allowlist {
+        Allowlist::parse(source, None).expect("parses")
+    }
+
+    #[test]
+    fn classify_buckets_gaps_and_stale_entries() {
+        let cases = vec![
+            case("a/agree", Verdict::Agree, None),
+            case("a/gap", Verdict::Unsupported, Some("beam_rt: unsupported: x")),
+            case("a/skipped", Verdict::Skipped, Some("no erlc")),
+            case("a/other", Verdict::Unsupported, Some("beam_rt: unsupported: y")),
+            case("a/bad", Verdict::Mismatch, None),
+        ];
+        // `a/gap` is allowed; `a/skipped` is NOT; `stale/case` is not reproduced at all.
+        let list = allowlist("a/gap  crate_a  allowed reason\nstale/case  crate_b  a closed gap\n");
+        let ratchet = RatchetReport::classify(&cases, &list);
+        assert_eq!(ratchet.allowed, 1, "{ratchet:?}");
+        assert_eq!(ratchet.unauthorized, 2, "{ratchet:?}");
+        assert_eq!(ratchet.stale, 1, "{ratchet:?}");
+        assert_eq!(ratchet.allowlist, None);
+    }
+
+    #[test]
+    fn a_mismatch_is_never_a_gap() {
+        let cases = vec![case("a/bad", Verdict::Mismatch, None)];
+        let list = allowlist("a/bad  crate  tolerated\n");
+        let ratchet = RatchetReport::classify(&cases, &list);
+        assert_eq!(ratchet.allowed, 0, "{ratchet:?}");
+        assert_eq!(ratchet.unauthorized, 0, "{ratchet:?}");
+        // The entry did not reproduce as a gap → stale (the allowlist must be tightened).
+        assert_eq!(ratchet.stale, 1, "{ratchet:?}");
+    }
+
+    #[test]
+    fn classify_records_the_allowlist_path() {
+        let list = Allowlist::parse("", Some(PathBuf::from("known-gaps.txt"))).expect("parses");
+        let ratchet = RatchetReport::classify(&[], &list);
+        assert_eq!(ratchet.allowlist.as_deref(), Some("known-gaps.txt"));
+        assert_eq!((ratchet.allowed, ratchet.unauthorized, ratchet.stale), (0, 0, 0));
+    }
+
+    #[test]
+    fn suite_exit_code_prioritises_mismatch_then_the_ratchet() {
+        // A mismatch is always exit 1, whatever the ratchet says.
+        let with_mismatch = report(
+            vec![
+                case("a/bad", Verdict::Mismatch, None),
+                case("a/gap", Verdict::Unsupported, Some("x")),
+            ],
+            Some(RatchetReport {
+                allowlist: None,
+                allowed: 1,
+                unauthorized: 0,
+                stale: 0,
+            }),
+        );
+        assert_eq!(suite_exit_code(&with_mismatch, true), 1);
+
+        // An unauthorized gap or a stale entry fails; a clean ratchet tolerates its gaps.
+        let unauthorized = report(
+            vec![case("a/gap", Verdict::Unsupported, Some("x"))],
+            Some(RatchetReport {
+                allowlist: None,
+                allowed: 0,
+                unauthorized: 1,
+                stale: 0,
+            }),
+        );
+        assert_eq!(suite_exit_code(&unauthorized, true), 1);
+
+        let stale = report(
+            vec![case("a/agree", Verdict::Agree, None)],
+            Some(RatchetReport {
+                allowlist: None,
+                allowed: 0,
+                unauthorized: 0,
+                stale: 1,
+            }),
+        );
+        assert_eq!(suite_exit_code(&stale, true), 1);
+
+        let clean = report(
+            vec![
+                case("a/agree", Verdict::Agree, None),
+                case("a/gap", Verdict::Unsupported, Some("x")),
+            ],
+            Some(RatchetReport {
+                allowlist: None,
+                allowed: 1,
+                unauthorized: 0,
+                stale: 0,
+            }),
+        );
+        assert_eq!(suite_exit_code(&clean, true), 0);
+        assert_eq!(suite_exit_code(&clean, false), 0);
+    }
+
+    #[test]
+    fn suite_exit_code_without_a_ratchet_is_todays_behaviour() {
+        let gaps = report(
+            vec![case("a/gap", Verdict::Unsupported, Some("x"))],
+            None,
+        );
+        assert_eq!(suite_exit_code(&gaps, true), 1);
+        assert_eq!(suite_exit_code(&gaps, false), 0);
+
+        let mismatch = report(vec![case("a/bad", Verdict::Mismatch, None)], None);
+        assert_eq!(suite_exit_code(&mismatch, true), 1);
+        assert_eq!(suite_exit_code(&mismatch, false), 1);
+
+        let all_agree = report(vec![case("a/agree", Verdict::Agree, None)], None);
+        assert_eq!(suite_exit_code(&all_agree, true), 0);
+    }
+
+    #[test]
+    fn gaps_markdown_renders_allowed_unauthorized_and_stale_rows() {
+        let cases = vec![
+            case("a/agree", Verdict::Agree, None),
+            case(
+                "a/gap|piped",
+                Verdict::Unsupported,
+                Some("beam_rt: unsupported: a|b\nsecond line"),
+            ),
+            case("a/unauth", Verdict::Skipped, Some("no erlc")),
+        ];
+        let list = allowlist("a/gap|piped  crate_a  an allowed gap\nstale/case  crate_b  a closed gap\n");
+        let run = report(cases, Some(RatchetReport::classify(&[], &list)));
+        let markdown = gaps_markdown(&run, &list);
+
+        assert!(markdown.starts_with("# Known capability gaps"), "{markdown}");
+        assert!(markdown.contains("| Case ID | Verdict | Owning crate | Status | Reason |"));
+        // An allowed gap: its crate comes from the allowlist.
+        assert!(
+            markdown.contains("| a/gap\\|piped | unsupported | crate_a | allowed |"),
+            "{markdown}"
+        );
+        // The reason's `|` is escaped and its newline collapsed.
+        assert!(markdown.contains("beam_rt: unsupported: a\\|b second line"), "{markdown}");
+        // An unauthorized gap: no crate, status `unauthorized`.
+        assert!(
+            markdown.contains("| a/unauth | skipped | — | unauthorized | no erlc |"),
+            "{markdown}"
+        );
+        // A stale entry: verdict `—`, status `stale`, the allowlist's reason.
+        assert!(
+            markdown.contains("| stale/case | — | crate_b | stale | a closed gap |"),
+            "{markdown}"
+        );
+        // An agreeing case never appears.
+        assert!(!markdown.contains("a/agree"), "{markdown}");
+    }
+
+    #[test]
+    fn gaps_markdown_carries_the_run_and_allowlist_lines() {
+        let run = report(
+            vec![case("a/gap", Verdict::Unsupported, Some("x"))],
+            None,
+        );
+        let list = allowlist("a/gap  some_crate  why\n");
+        let markdown = gaps_markdown(&run, &list);
+        assert!(
+            markdown.contains("Run: total=1 agree=0 mismatch=0 unsupported=1 skipped=0"),
+            "{markdown}"
+        );
+        assert!(
+            markdown
+                .contains("Allowlist: (none) entries=1 allowed=1 unauthorized=0 stale=0"),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn report_from_suite_carries_the_ratchet_and_the_suite_exit_code_still_gates() {
+        // A pure synthetic suite: build a real one through the harness is oracle-backed, so
+        // exercise `report_from_suite` only through a constructed `SuiteOutcome`.
+        use crate::harness::{CaseOutcome, RuntimeContext, SuiteOutcome};
+        let make = |case_id: &str, verdict: Verdict| CaseOutcome {
+            case_id: case_id.to_string(),
+            description: "d".to_string(),
+            contracts: vec![Contract::OtpApps],
+            eval: "try (ok) of V -> ok end.".to_string(),
+            oracle_argv: vec!["-noshell".to_string()],
+            rust_argv: vec!["-noshell".to_string()],
+            oracle: SideResult::unsupported("oracle"),
+            rust: SideResult::unsupported("beam_rt: unsupported: x"),
+            golden: crate::compare::GoldenCheck {
+                matched: true,
+                diffs: Vec::new(),
+            },
+            golden_asserted: true,
+            verdict,
+            diffs: Vec::new(),
+            oracle_spec: spec(),
+            rust_spec: None,
+        };
+        let suite = SuiteOutcome {
+            cases: vec![
+                make("a/gap", Verdict::Unsupported),
+                make("a/agree_ish", Verdict::Skipped),
+            ],
+            context: RuntimeContext {
+                oracle: spec(),
+                rust: None,
+            },
+            strict: true,
+            exit_code: 1,
+        };
+        let list = allowlist("a/gap  c  r\n");
+        let report = report_from_suite(&suite, &list);
+        let ratchet = report.ratchet.clone().expect("the report carries a ratchet");
+        assert_eq!(ratchet.allowed, 1);
+        assert_eq!(ratchet.unauthorized, 1);
+        assert_eq!(ratchet.stale, 0);
+        // An unauthorized gap → exit 1.
+        assert_eq!(suite_exit_code(&report, true), 1);
+        // Allowlisting the second gap makes the ratchet clean → exit 0.
+        let list = allowlist("a/gap  c  r\na/agree_ish  c  r\n");
+        let report = report_from_suite(&suite, &list);
+        assert_eq!(suite_exit_code(&report, true), 0);
+    }
+}

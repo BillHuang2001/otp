@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use differential::cli::{self, Command};
 use differential::error::{Error, Result};
 use differential::report::{self, ListReport, RunReport};
-use differential::{corpus, harness};
+use differential::{allowlist::Allowlist, corpus, harness, ratchet};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -97,10 +97,33 @@ fn dispatch(command: Command) -> Result<i32> {
             emit_report(&RunReport::from_case("compare", &outcome), json, out)?;
             Ok(outcome.exit_code())
         }
-        Command::Suite { strict, json, out } => {
+        Command::Suite {
+            strict,
+            allowlist,
+            gaps,
+            json,
+            out,
+        } => {
+            // Load the allowlist FIRST: a missing/unreadable file is a fast usage/env exit 2
+            // with no corpus run.
+            let list = match &allowlist {
+                Some(path) => Some(Allowlist::load(path)?),
+                None => None,
+            };
             let suite = harness::run_suite(strict)?;
-            emit_report(&RunReport::from_suite(&suite), json, out)?;
-            Ok(suite.exit_code)
+            let report = match &list {
+                Some(list) => ratchet::report_from_suite(&suite, list),
+                None => RunReport::from_suite(&suite),
+            };
+            emit_report(&report, json, out)?;
+            if let Some(gaps_path) = &gaps {
+                let empty = Allowlist::empty();
+                let list = list.as_ref().unwrap_or(&empty);
+                let markdown = ratchet::gaps_markdown(&report, list);
+                ratchet::write_markdown(gaps_path, &markdown)?;
+                eprintln!("differential: wrote {}", gaps_path.display());
+            }
+            Ok(ratchet::suite_exit_code(&report, strict))
         }
     }
 }
