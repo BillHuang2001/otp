@@ -552,7 +552,8 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
     opcode; `tests/negative.rs:131-146` exercises exactly this.
   - **No module MD5/checksum.** The C builds `beam->checksum` as an MD5 over `AtU8`+`Code`+`StrT`+`ImpT`+
     `ExpT`+`FunT` (each `OldUniq` zeroed)+`LitT`+`Meta`+`Recs`+`DbgB` at load (`beam_file.c:1751-1830`);
-    the loader computes no checksum (no `checksum`/`md5` symbol anywhere in `src/`).
+    the loader computes no checksum (no `checksum`/`md5` symbol anywhere in `src/`); the `Meta` chunk it
+    feeds on is now captured raw (`Module::meta`), so only the hashing is missing.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 
