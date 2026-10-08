@@ -59,6 +59,7 @@ Changed-path detection is generated at run time: `scripts/path-filters.sh` and `
 - `../CONTEXT.md` — repository root: build system (`configure`, `otp_build`, `Makefile`), `OTP_VERSION`.
 - `../scripts/` — repo-root helpers invoked directly by workflows (`build-otp-tar`, `run-dialyzer`, `license-header.es`).
 - `../make/` and `../otp_build` — the build targets CI drives.
+- `../erts_rust/` — Rust ERTS rewrite workspace (`Cargo.toml`, `rust-toolchain.toml`, `scripts/cargo.sh`, `tools/differential/`, `tools/bench/`); built/tested only by hand, never by any workflow here.
 - `../renovate.json5` — dependency/action-pin update configuration.
 - `../HOWTO/` — INSTALL/TESTING/DEVELOPMENT docs that mirror what CI enforces.
 
