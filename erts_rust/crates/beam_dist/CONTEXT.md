@@ -533,7 +533,9 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `src/transport.rs` → the abstract `Read`/`Write`/`Transport` seam + `MemoryTransport` test double
 - `src/framing.rs` → 2-/4-byte packet-length framing, tick, `PacketHeaderSize`
 - `src/handshake.rs` → `Name`/`Status`/`Challenge`/`ChallengeReply`/`ChallengeAck`/`Complement`
-  codecs, `preferred_flags`/`check_mandatory`, the `ChallengeDigest`/`ChallengeSource` seams
+  codecs, `preferred_flags`/`check_mandatory`, the `ChallengeDigest`/`ChallengeSource` seams,
+  `StatusKind`/`Status::kind`/`error_kind`/`status_error`, and `publish_flag`/`publish_type`/
+  `PublishKind`/`PeerVisibility`
 - `src/auth.rs` → in-tree MD5, `gen_digest`/`verify`/`gen_challenge`, `Md5Digest`/`SystemChallengeSource`
 - `src/dist_header.rs` → the `'D'` header (`N`/`Flags`/`LongAtoms`/`AtomCacheRef`) + the `'E'`
   fragmented-header decode (`FragmentedHeader`)
