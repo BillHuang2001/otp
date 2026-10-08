@@ -33,8 +33,9 @@ pub struct ChunkId(pub [u8; 4]);
 impl ChunkId {
     /// The atom table chunk (`AtU8`, UTF-8 atom names).
     ///
-    /// The obsolete Latin-1 `Atom` chunk id is deliberately not a constant: it is
-    /// superseded by `AtU8` and, if encountered, is treated as an unknown chunk.
+    /// The obsolete Latin-1 `Atom` chunk id is not a usable atom source: it is
+    /// superseded by `AtU8` and is exposed separately as [`ChunkId::OBSOLETE_ATOM`]
+    /// (classified tooling-only; the parser never reads atoms from it).
     pub const ATOM: ChunkId = ChunkId(*b"AtU8");
     /// The instruction stream chunk (`Code`).
     pub const CODE: ChunkId = ChunkId(*b"Code");
@@ -81,6 +82,22 @@ impl ChunkId {
     pub const DBGI: ChunkId = ChunkId(*b"Dbgi");
     /// The (obsolete) native-record chunk (`Recs`).
     pub const RECS: ChunkId = ChunkId(*b"Recs");
+    /// The ExDoc documentation chunk (`Docs`).
+    ///
+    /// Unlike the other ids this one is not in the C reader's chunk directory
+    /// (`beam_file.c`): the compiler emits it as an extra chunk (`compile.erl`), so it
+    /// is recognized here for completeness. Its payload is a *compressed*,
+    /// deterministic external term consumed by ExDoc and `beam_lib`'s documentation
+    /// API; it is tooling-only for the runtime, so [`crate::chunk::parse`] recognizes
+    /// the id but deliberately does not parse it (see [`crate::chunk::classify`]).
+    pub const DOCS: ChunkId = ChunkId(*b"Docs");
+    /// The (obsolete) Latin-1 atom table chunk (`Atom`).
+    ///
+    /// Superseded by [`ChunkId::ATOM`] (`AtU8`) in OTP 20 and earlier; the C reader
+    /// rejects a file whose `AtU8` chunk is missing even when this one is present
+    /// (`beam_file.c:1653-1665`). It is classified tooling-only by
+    /// [`crate::chunk::classify`] and is never used as an atom source.
+    pub const OBSOLETE_ATOM: ChunkId = ChunkId(*b"Atom");
 
     /// Builds a `ChunkId` from its four raw bytes.
     pub fn new(bytes: [u8; 4]) -> ChunkId {

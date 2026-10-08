@@ -144,6 +144,15 @@ pub fn build_module(
     // area they point into exists.
     let records = resolve_records(pending_records, &literals)?;
 
+    // The `Attr` chunk is a module attribute property list encoded as an external term
+    // (`beam_asm.erl:307-310`); decode it into a real term through the module's own
+    // atom table (so its keys share the module's atom identity) — the value
+    // `module_info(attributes)` serves. A malformed payload is a typed error.
+    let attribute_table = crate::attributes::AttributeTable::decode(
+        chunks.attributes.as_deref(),
+        &mut atom_table,
+    )?;
+
     Ok(Module {
         name,
         atoms,
@@ -160,7 +169,9 @@ pub fn build_module(
         literals,
         strings: chunks.strings.clone(),
         attributes: chunks.attributes.clone(),
+        attribute_table: Arc::new(attribute_table),
         compile_info: chunks.compile_info.clone(),
+        meta: chunks.meta.clone(),
     })
 }
 
@@ -1539,6 +1550,7 @@ mod tests {
             strings: Vec::new(),
             attributes: None,
             compile_info: None,
+            meta: None,
             code_version: CodeVersion::default(),
             code_stream: &[],
         }

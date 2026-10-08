@@ -121,6 +121,17 @@ mod tests {
     }
 
     #[test]
+    fn the_framing_carries_payloads_that_are_not_terms() {
+        // The `LitT` framing moves opaque byte records: it neither validates nor decodes
+        // the ETF payload (`crate::literal::LiteralArea` does that, and rejects a
+        // malformed one there). A record that is not a term is returned unchanged.
+        let not_a_term = [0x00, 0xFF, 0x83];
+        assert_eq!(
+            parse(&lit_bytes(0, &[(3, &not_a_term)])).unwrap(),
+            vec![not_a_term.to_vec()]
+        );
+    }
+    #[test]
     fn compressed_chunk_parses_to_the_same_records() {
         let records: &[(u32, &[u8])] = &[
             (3, &[1, 2, 3]),
@@ -170,6 +181,43 @@ mod tests {
         assert!(matches!(err, BeamError::BadArg));
     }
 
+    #[test]
+    fn every_truncation_of_a_compressed_chunk_is_a_typed_error() {
+        // A randomized-ish, multi-block body, so the truncation sweep crosses the
+        // header, several deflate blocks and the trailing Adler-32 checksum.
+        let payload: Vec<u8> = (0..=255u8).cycle().take(20_000).collect();
+        let records: &[(u32, &[u8])] = &[
+            (3, &[1, 2, 3]),
+            (payload.len() as u32, &payload),
+            (5, &[0xFF, 0x00, 0x7F, 0x80, 0x01]),
+        ];
+        let data = compressed_lit_bytes(records, 6);
+
+        for len in 0..data.len() {
+            let err = parse(&data[..len])
+                .err()
+                .unwrap_or_else(|| panic!("truncating to {len} bytes must be rejected"));
+            assert!(matches!(err, BeamError::BadArg), "len {len}: {err:?}");
+        }
+        // The untruncated chunk still parses, so the sweep above is not vacuous.
+        assert_eq!(parse(&data).unwrap(), parse(&lit_bytes(0, records)).unwrap());
+    }
+
+    #[test]
+    fn every_truncation_of_a_verbatim_chunk_is_a_typed_error() {
+        // The record table declares its own count, so a prefix that cuts anywhere
+        // (including exactly on a record boundary) still leaves a record unread.
+        let records: &[(u32, &[u8])] = &[(3, &[1, 2, 3]), (2, &[9, 8]), (0, &[])];
+        let data = lit_bytes(0, records);
+
+        for len in 0..data.len() {
+            let err = parse(&data[..len])
+                .err()
+                .unwrap_or_else(|| panic!("truncating to {len} bytes must be rejected"));
+            assert!(matches!(err, BeamError::BadArg), "len {len}: {err:?}");
+        }
+        assert_eq!(parse(&data).unwrap(), parse(&lit_bytes(0, records)).unwrap());
+    }
     #[test]
     fn uncompressed_size_disagreeing_with_the_inflated_length_is_rejected() {
         let table = record_table(&[(3, &[1, 2, 3])]);

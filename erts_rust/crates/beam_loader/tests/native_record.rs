@@ -16,13 +16,14 @@
 //!
 //! # What this proves
 //!
+//! * **The committed oracle fixture pair `nr_def.beam`/`nr_use.beam`** (compiled by
+//!   the system `erlc` from `tests/fixtures/nr_def.erl`/`nr_use.erl`) lowers
+//!   **186-191** to their typed variants with **none** on the `Instr::Generic`
+//!   fallback, and the module's `Recs` table resolves the native records
+//!   (`#rec`, `#local`) through [`Module::records`]/[`Module::record_by_name`].
 //! * **`erl_eval` (stdlib, the canonical site of 186) actually contains
 //!   `is_any_native_record`**, and it arrives typed — a positive control, so a sweep
 //!   that found nothing could not pass vacuously.
-//! * **A record-using module compiled by the system `erlc` lowers 186-191 typed** —
-//!   [`compiled_native_records_lower_typed`] compiles `-record #rec{…}` /
-//!   `-import_record/2` source and asserts those six variants appear and none is
-//!   `Generic`.
 //! * **No module in the stdlib/kernel/compiler sweep still carries a `Generic` form
 //!   of any family member.**
 //!
@@ -32,20 +33,19 @@
 //! **186** — the `is_record/1` guard, emitted for `erlang:is_record/1` with sites in
 //! `erl_eval`/`io_lib`/`io_lib_pretty`. The other seven are emitted only for *native
 //! records*, which no shipped OTP module uses, so the sweep is a no-regression guard
-//! for 187-193; the compiled-module test is the positive control that actually
+//! for 187-193; the committed fixture pair is the positive control that actually
 //! exercises their lowering. Opcodes **192/193 were added in OTP 30** and are absent
 //! from the installed OTP-29 `beam_opcodes` table, so no system `erlc` can emit them —
 //! their lowering is covered by the crate unit tests (`src/lower/instr.rs`) only.
 //!
 //! # Skip-vs-assert policy
 //!
-//! A missing OTP install (or a missing `erlc`, or a compiler that rejects native-record
-//! syntax) **skips LOUDLY** with a `SKIP:` line and returns — it never fails in that
-//! case, matching `tests/real_modules.rs`.
+//! The installed-corpus test skips **loudly** when the system OTP `.beam` files cannot
+//! be located; the committed-fixture test needs no OTP at all (the `.beam` files are
+//! checked in).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use beam_loader::{Instr, Module, Opcode};
 
@@ -135,13 +135,6 @@ struct Census {
     generic: usize,
 }
 
-impl Census {
-    fn add(&mut self, other: &Census) {
-        self.typed += other.typed;
-        self.generic += other.generic;
-    }
-}
-
 /// Counts the family's typed and residual-`Generic` occurrences in a loaded module.
 fn census(module: &Module) -> Census {
     let mut census = Census::default();
@@ -162,6 +155,61 @@ fn census(module: &Module) -> Census {
         }
     }
     census
+}
+
+/// The names of the family's typed variants that occur in `module`, name-sorted.
+fn variant_names(module: &Module) -> Vec<String> {
+    let mut names = Vec::new();
+    for function in &module.functions {
+        for instr in &function.code {
+            let name = match instr {
+                Instr::IsAnyNativeRecord { .. } => "IsAnyNativeRecord",
+                Instr::IsNativeRecord { .. } => "IsNativeRecord",
+                Instr::GetRecordElements { .. } => "GetRecordElements",
+                Instr::PutRecord { .. } => "PutRecord",
+                Instr::IsRecordAccessible { .. } => "IsRecordAccessible",
+                Instr::GetRecordField { .. } => "GetRecordField",
+                Instr::GetRecordElementsId { .. } => "GetRecordElementsId",
+                Instr::UpdateRecordId { .. } => "UpdateRecordId",
+                _ => continue,
+            };
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+// ---------------------------------------------------------------------------
+// The committed fixtures
+// ---------------------------------------------------------------------------
+
+/// Loads the committed `nr_def.beam` native-record-defining oracle fixture.
+fn load_nr_def() -> Module {
+    beam_loader::load_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/nr_def.beam"
+    ))
+    .expect("the nr_def oracle fixture must load")
+}
+
+/// Loads the committed `nr_use.beam` native-record-consuming oracle fixture.
+fn load_nr_use() -> Module {
+    beam_loader::load_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/nr_use.beam"
+    ))
+    .expect("the nr_use oracle fixture must load")
+}
+
+/// Every lowered instruction of `module`, in function/stream order.
+fn instructions(module: &Module) -> Vec<&Instr> {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| function.code.iter())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -242,105 +290,30 @@ fn native_record_family_never_lowers_generic_in_installed_modules() {
     );
 }
 
-/// The real-`.beam` positive control for the family beyond opcode 186: a module pair
-/// using the OTP-29 native-record syntax, compiled by the system `erlc`, must lower
-/// 186-191 to their typed variants with none on the `Generic` fallback.
-///
-/// Compilation failure (no `erlc`, or a compiler without native-record syntax) skips
-/// **loudly** — it never fails in that case.
+/// The positive control for the whole OTP-29 subset (186-191): the committed, real
+/// `erlc`-compiled fixture pair `nr_def.beam`/`nr_use.beam` must lower 186-191 to their
+/// typed variants with none on the `Generic` fallback, and the native records they
+/// define must resolve through [`Module::records`]/[`Module::record_by_name`].
 #[test]
-fn compiled_native_records_lower_typed() {
-    // The definition module exports its native record; the consumer imports it, so the
-    // consumer emits the cross-module forms (`is_record_accessible`, `get_record_field`
-    // with a `{Module,Name}` literal `Id`).
-    const DEF: &str = r#"-module(nr_def).
--export([mk/0]).
--export_record([rec]).
--record #rec{a, b}.
-mk() -> #rec{a = 1, b = 2}.
-"#;
-    const USE: &str = r#"-module(nr_use).
--export([local_mk/0, local_peek/1, local_fld/1, def_mk/0, def_upd/1, def_fld/1]).
--import_record(nr_def, [rec]).
--record #local{a, b}.
+fn committed_native_records_lower_typed() {
+    let def = load_nr_def();
+    let use_ = load_nr_use();
 
-local_mk() -> #local{a = 1, b = 2}.
-local_peek(R) -> #local{a = A, b = B} = R, {A, B}.
-local_fld(R) -> R#local.a.
-def_mk() -> #recdef:rec{a = 1, b = 2}.
-def_upd(R) -> R#recdef:rec{a = 7}.
-def_fld(R) -> R#recdef:rec.a.
-"#;
-
-    let dir = unique_temp_dir("native_record");
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!("SKIP: cannot create {}: {error}", dir.display());
-        return;
-    }
-    let def = dir.join("nr_def.erl");
-    let use_ = dir.join("nr_use.erl");
-    for (path, source) in [(&def, DEF), (&use_, USE)] {
-        if let Err(error) = std::fs::write(path, source) {
-            eprintln!("SKIP: cannot write {}: {error}", path.display());
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
-    }
-
-    let output = match Command::new("erlc")
-        .arg("+debug_info")
-        .arg("-o")
-        .arg(&dir)
-        .arg(&def)
-        .arg(&use_)
-        // Keep the compiler's cwd out of the source tree (it writes `.beam` next to
-        // `-o`, but any stray output must land in the temp dir regardless).
-        .current_dir(&dir)
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            eprintln!("SKIP: cannot run `erlc`: {error} — need the system OTP compiler");
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
-    };
-    if !output.status.success() {
-        eprintln!(
-            "SKIP: `erlc` rejected the native-record source ({}): {} — this compiler has no \
-             native-record syntax",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+    // No family member may leak through as `Instr::Generic`, in either module.
+    for (name, module) in [("nr_def", &def), ("nr_use", &use_)] {
+        let census = census(module);
+        assert_eq!(
+            census.generic, 0,
+            "{name} must not leave any native-record instruction on Instr::Generic"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-        return;
     }
 
-    let mut total = Census::default();
-    let mut typed_variants = Vec::new();
-    for name in ["nr_def", "nr_use"] {
-        let beam = dir.join(format!("{name}.beam"));
-        let module = match beam_loader::load_file(&beam) {
-            Ok(module) => module,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                panic!("{} must load: {error:?}", beam.display());
-            }
-        };
-        total.add(&census(&module));
-        typed_variants.extend(variant_names(&module));
-    }
-    let _ = std::fs::remove_dir_all(&dir);
+    let mut typed_variants = variant_names(&def);
+    typed_variants.extend(variant_names(&use_));
+    typed_variants.sort();
+    typed_variants.dedup();
+    println!("COMPILED: native-record family typed variants: {typed_variants:?}");
 
-    println!(
-        "COMPILED: native-record family — {} typed site(s), {} on the Generic fallback; \
-         variants: {typed_variants:?}",
-        total.typed, total.generic
-    );
-    assert_eq!(
-        total.generic, 0,
-        "the compiled native-record module must not leave any family member on Instr::Generic"
-    );
     // The source is chosen to emit the whole OTP-29 subset; each variant must appear.
     for expected in [
         "IsAnyNativeRecord",
@@ -352,40 +325,74 @@ def_fld(R) -> R#recdef:rec.a.
     ] {
         assert!(
             typed_variants.iter().any(|name| name == expected),
-            "the compiled module must contain {expected} (found {typed_variants:?})"
+            "the committed fixtures must contain {expected} (found {typed_variants:?})"
         );
     }
-}
 
-/// The names of the family's typed variants that occur in `module`, name-sorted.
-fn variant_names(module: &Module) -> Vec<String> {
-    let mut names = Vec::new();
-    for function in &module.functions {
-        for instr in &function.code {
-            let name = match instr {
-                Instr::IsAnyNativeRecord { .. } => "IsAnyNativeRecord",
-                Instr::IsNativeRecord { .. } => "IsNativeRecord",
-                Instr::GetRecordElements { .. } => "GetRecordElements",
-                Instr::PutRecord { .. } => "PutRecord",
-                Instr::IsRecordAccessible { .. } => "IsRecordAccessible",
-                Instr::GetRecordField { .. } => "GetRecordField",
-                Instr::GetRecordElementsId { .. } => "GetRecordElementsId",
-                Instr::UpdateRecordId { .. } => "UpdateRecordId",
-                _ => continue,
-            };
-            names.push(name.to_string());
+    // Operand-level spot checks, so a variant that merely *exists* is not enough.
+    let use_instrs = instructions(&use_);
+
+    // `is_any_native_record` (the `#local{...} = R` match in `local_peek/1`).
+    let any = use_instrs
+        .iter()
+        .find_map(|instr| match instr {
+            Instr::IsAnyNativeRecord { src, .. } => Some(src.clone()),
+            _ => None,
+        })
+        .expect("nr_use contains `is_any_native_record`");
+    assert_eq!(any, beam_loader::Operand::X(0));
+
+    // `is_record_accessible` with the `external` scope atom (`def_upd/1`, the
+    // cross-module `#recdef:rec{...}` update).
+    let scope = use_instrs
+        .iter()
+        .find_map(|instr| match instr {
+            Instr::IsRecordAccessible { scope, .. } => Some(scope.clone()),
+            _ => None,
+        })
+        .expect("nr_use contains `is_record_accessible`");
+    match scope {
+        beam_loader::Operand::Atom(atom) => {
+            assert_eq!(use_.atom_name(atom), Some("external"));
         }
+        other => panic!("`is_record_accessible` scope must be an atom, got {other:?}"),
     }
-    names.sort();
-    names.dedup();
-    names
+
+    // The native records themselves resolve through the `Recs` table.
+    assert_record(&def, "nr_def", "rec", true);
+    assert_record(&use_, "nr_use", "local", false);
 }
 
-/// A fresh, unique directory under the system temp dir for the compiled fixture.
-fn unique_temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("beam_loader_{tag}_{}_{nanos}", std::process::id()))
+/// Asserts `module` defines exactly one native record `record_name` (exported iff
+/// `is_exported`), whose fields are `a`, `b` with no defaults — the declaration order
+/// of the `#rec{a, b}` / `#local{a, b}` sources.
+fn assert_record(module: &Module, module_name: &str, record_name: &str, is_exported: bool) {
+    assert_eq!(
+        module.records().len(),
+        1,
+        "{module_name} must define exactly one native record"
+    );
+
+    let record = module
+        .record_by_name(record_name)
+        .unwrap_or_else(|| panic!("{module_name} must define a native record `{record_name}`"));
+    assert_eq!(record.is_exported, is_exported);
+
+    let fields: Vec<Option<&str>> = record
+        .fields
+        .iter()
+        .map(|field| module.atom_name(field.name))
+        .collect();
+    assert_eq!(fields, vec![Some("a"), Some("b")]);
+    assert!(
+        record.fields.iter().all(|field| field.default.is_none()),
+        "`#rec{{a, b}}` / `#local{{a, b}}` declare no field defaults"
+    );
+
+    // `record/1` (by module-local atom) agrees with `record_by_name/1`.
+    let atom = module
+        .atom_table
+        .lookup(record_name)
+        .expect("the record name is interned");
+    assert!(module.record(atom).is_some());
 }

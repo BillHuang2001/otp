@@ -83,8 +83,11 @@ impl LiteralArea {
         if raw.is_empty() {
             return Ok(LiteralArea::empty());
         }
-        let total_bytes: usize = raw.iter().map(Vec::len).sum();
-        decode_with_capacity(raw, atoms, estimate_capacity(raw.len(), total_bytes))
+        let (heap, terms) = decode_terms(raw, atoms)?;
+        Ok(LiteralArea {
+            heap: Some(heap),
+            terms,
+        })
     }
 
     /// The literal at `index` (an `Operand::Literal(index)` reference).
@@ -151,27 +154,32 @@ fn estimate_capacity(count: usize, total_bytes: usize) -> usize {
         .saturating_add(AREA_HEADROOM_WORDS)
 }
 
+/// Decodes `raw` into a fresh arena sized from the payloads' total length.
+///
+/// Returns the arena and the decoded terms; shared with
+/// [`crate::attributes::AttributeTable`] so the arena-sizing and heap-growth retry
+/// live in one place.
+pub(crate) fn decode_terms(raw: &[Vec<u8>], atoms: &mut AtomTable) -> Result<(Heap, Vec<Eterm>)> {
+    let total_bytes: usize = raw.iter().map(Vec::len).sum();
+    decode_terms_at_capacity(raw, atoms, estimate_capacity(raw.len(), total_bytes))
+}
+
 /// Decodes `raw` into a fresh arena of at least `initial_capacity` words, growing
 /// the arena (bounded) while the decode is limited by heap exhaustion.
 ///
 /// The heap never grows, so a failed attempt is retried on a *new, larger* arena;
 /// the discarded terms go away with it (the atoms they interned are idempotent).
-fn decode_with_capacity(
+pub(crate) fn decode_terms_at_capacity(
     raw: &[Vec<u8>],
     atoms: &mut AtomTable,
     initial_capacity: usize,
-) -> Result<LiteralArea> {
+) -> Result<(Heap, Vec<Eterm>)> {
     let mut capacity = initial_capacity;
     let mut attempt = 0;
     loop {
         let mut heap = Heap::new(capacity)?;
         match decode_into(raw, &mut heap, atoms) {
-            Ok(terms) => {
-                return Ok(LiteralArea {
-                    heap: Some(heap),
-                    terms,
-                })
-            }
+            Ok(terms) => return Ok((heap, terms)),
             Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Heap => {
                 attempt += 1;
                 if attempt >= MAX_DECODE_ATTEMPTS {
@@ -298,16 +306,55 @@ mod tests {
     }
 
     #[test]
+    fn every_truncation_of_a_payload_is_a_typed_error() {
+        // The record framing may hand over any byte run; a run that stops inside the
+        // term must fail closed at the decoder (the last atom's byte count needs its
+        // full 16 bytes, so no strict prefix is a complete term).
+        let mut atoms = AtomTable::new();
+        for len in 0..ERROR_DIVISION_BY_ZERO.len() {
+            let err = LiteralArea::decode(&[ERROR_DIVISION_BY_ZERO[..len].to_vec()], &mut atoms)
+                .err()
+                .unwrap_or_else(|| panic!("a payload truncated to {len} bytes must be rejected"));
+            assert!(matches!(err, BeamError::BadArg), "len {len}: {err:?}");
+        }
+        // The untruncated payload still decodes, so the sweep above is not vacuous.
+        let area = LiteralArea::decode(&[ERROR_DIVISION_BY_ZERO.to_vec()], &mut atoms).unwrap();
+        assert_eq!(area.len(), 1);
+    }
+
+    #[test]
+    fn a_zlib_compressed_litt_chunk_round_trips_into_terms() {
+        // The compressed `LitT` framing must reach the same decoded terms as the
+        // verbatim one: build the record table, compress it, parse it through
+        // `chunk::literal` and decode the payloads into a literal area.
+        let payload: Vec<u8> = vec![131, 104, 2, 119, 2, 111, 107, 97, 17]; // `{ok,17}`
+        let mut table = 1u32.to_be_bytes().to_vec();
+        table.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        table.extend_from_slice(&payload);
+        let mut chunk = (table.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(&beam_codec::compress::compress(&table, 6).unwrap());
+
+        let raw = crate::chunk::literal::parse(&chunk).unwrap();
+        assert_eq!(raw, vec![payload]);
+
+        let mut atoms = AtomTable::new();
+        let area = LiteralArea::decode(&raw, &mut atoms).unwrap();
+        let term = area.get(0).expect("the single literal decodes");
+        assert_eq!(tuple_arity(term).unwrap(), 2);
+        assert_eq!(tuple_element(term, 0).unwrap(), make_atom(atoms.intern("ok")));
+        assert_eq!(signed_value(tuple_element(term, 1).unwrap()), 17);
+    }
+    #[test]
     fn an_exhausted_decode_is_retried_on_a_larger_heap() {
         let mut atoms = AtomTable::new();
         // A 100-element list needs ~200 words; a one-word first arena forces the
         // decode to fail and be retried with a bigger one.
-        let area = decode_with_capacity(&[small_int_list(100)], &mut atoms, 1).unwrap();
+        let (heap, terms) = decode_terms_at_capacity(&[small_int_list(100)], &mut atoms, 1).unwrap();
 
-        assert_eq!(area.len(), 1);
-        let list = area.get(0).unwrap();
+        assert_eq!(terms.len(), 1);
+        let list = terms[0];
         assert_eq!(signed_value(cons_head(list).unwrap()), 0);
-        assert!(area.heap().unwrap().used() >= 200);
+        assert!(heap.used() >= 200);
     }
 
     #[test]
@@ -315,10 +362,11 @@ mod tests {
         let mut atoms = AtomTable::new();
         // 1500 cons cells need ~3000 words — more than the largest retry arena
         // (the retries double from the 64-word floor, six attempts at most).
-        let err = decode_with_capacity(&[small_int_list(1500)], &mut atoms, 1).unwrap_err();
-        match err {
-            BeamError::Alloc(failure) => assert_eq!(failure.kind, AllocKind::Heap),
-            other => panic!("expected a heap allocation failure, got {other:?}"),
+        // `Heap` is not `Debug`, so match on the `Result` rather than `unwrap_err`.
+        match decode_terms_at_capacity(&[small_int_list(1500)], &mut atoms, 1) {
+            Ok(_) => panic!("expected the decode to fail on the largest retry arena"),
+            Err(BeamError::Alloc(failure)) => assert_eq!(failure.kind, AllocKind::Heap),
+            Err(other) => panic!("expected a heap allocation failure, got {other:?}"),
         }
     }
 

@@ -25,6 +25,7 @@
 //! big-endian cursor); a malformed stream yields `BeamError::BadArg`, never a panic.
 use beam_common::Result;
 use beam_term::{Atom, MAX_SMALL, MIN_SMALL};
+use std::sync::OnceLock;
 
 use crate::error::bad_file;
 use crate::ir::{CodeVersion, TypeTable};
@@ -173,6 +174,17 @@ pub(crate) fn read_tagged<'a>(r: &mut beam_codec::Reader<'a>) -> Result<TaggedNu
     })
 }
 
+/// The largest instruction count [`decode_stream`] pre-reserves.
+///
+/// The reservation is `stream.len() / 4` — the sampled real OTP code streams average
+/// ~4.25 bytes per instruction (`tests/load_cost.rs`) — but a *file-supplied* stream
+/// length must not decide an unbounded up-front allocation, so it is capped here. The
+/// biggest module in the installed OTP carries ~31 000 instructions (same measurement),
+/// so `1 << 18` is far above any real module while bounding the reservation to
+/// `1 << 18` × `size_of::<RawInstr>()`. A stream that outgrows the cap simply grows the
+/// vector as before.
+const MAX_RESERVED_INSTRUCTIONS: usize = 1 << 18;
+
 /// One decoded instruction: opcode, operands and its byte offset in the stream.
 ///
 /// The offset lets [`crate::lower`] attach line/backtrace information and lets the
@@ -187,6 +199,33 @@ pub struct RawInstr {
     pub offset: u32,
 }
 
+/// The per-opcode-byte operand count, in O(1).
+///
+/// The decoder asks for the arity of **every** instruction it decodes, and
+/// [`Opcode::arity`] resolves through a linear scan of the ~193-row
+/// [`crate::opcode::OPCODE_TABLE`] (measured at ~33 ns per call — the single hottest
+/// lookup on the load path; `tests/load_cost.rs` is the measurement that justifies
+/// this table). This function answers the same question with one array index.
+///
+/// The table is **derived once per process** from the roster itself
+/// ([`Opcode::from_u8`] + [`Opcode::arity`]), so it duplicates no generated data: the
+/// roster in [`crate::opcode`] stays the single source of truth and this is only a
+/// cache of it. Byte `0` and every byte outside the roster hold `0`, but a caller never
+/// reads those entries — it looks the arity up only after [`Opcode::from_u8`] has
+/// accepted the byte (see [`decode_stream`]).
+fn opcode_arity(byte: u8) -> u8 {
+    static ARITY: OnceLock<[u8; 256]> = OnceLock::new();
+    ARITY
+        .get_or_init(|| {
+            let mut table = [0u8; 256];
+            for value in 0u16..=255 {
+                if let Some(opcode) = Opcode::from_u8(value as u8) {
+                    table[value as usize] = opcode.arity();
+                }
+            }
+            table
+        })[usize::from(byte)]
+}
 /// Decodes a `Code` instruction stream into [`RawInstr`]s.
 ///
 /// `atoms` maps a *wire* atom index — the magnitude of an `a` operand — to the
@@ -209,7 +248,13 @@ pub fn decode_stream(
     types: &TypeTable,
 ) -> Result<Vec<RawInstr>> {
     let mut r = beam_codec::Reader::new(stream);
-    let mut instrs = Vec::new();
+    // Pre-size the instruction vector from the stream length (capped — see
+    // [`MAX_RESERVED_INSTRUCTIONS`]): a sampled real OTP code stream averages ~4.25 bytes
+    // per instruction, so `len / 4` is a close, cheap estimate that removes the repeated
+    // regrows — and their memmoves — of a multi-thousand-instruction module. It is only
+    // a hint: a stream that outgrows it still grows correctly.
+    let mut instrs =
+        Vec::with_capacity((stream.len() / 4).min(MAX_RESERVED_INSTRUCTIONS));
 
     loop {
         // The stream must be terminated by `int_code_end`; running out of bytes
@@ -231,7 +276,10 @@ pub fn decode_stream(
         }
         let op = Opcode::from_u8(op_byte).ok_or_else(|| bad_file("opcode is not in the roster"))?;
 
-        let arity = usize::from(op.arity());
+        // The operand count comes from the derived table rather than through
+        // `Opcode::arity` (a linear scan of the roster) — see [`opcode_arity`]. The
+        // `derived_arity_table_matches_the_roster` unit test pins the two together.
+        let arity = usize::from(opcode_arity(op_byte));
         let mut operands = Vec::with_capacity(arity);
         for _ in 0..arity {
             operands.push(decode_operand(&mut r, atoms, types)?);
@@ -1149,5 +1197,28 @@ mod tests {
             .filter(|(_, op, _, _)| TestKind::from_opcode(*op).is_some())
             .count();
         assert_eq!(classified, 25);
+    }
+
+    // ---- the derived arity cache -----------------------------------------
+
+    /// The derived O(1) arity table is a *cache* of the roster, so it must agree with
+    /// `Opcode::arity` for every byte a `.beam` file can carry — and answer `0` (never
+    /// a stale value) for the bytes outside the roster, which [`decode_stream`]
+    /// rejects before it ever consults the table.
+    #[test]
+    fn derived_arity_table_matches_the_roster() {
+        for value in 0u16..=255 {
+            let byte = value as u8;
+            let expected = Opcode::from_u8(byte).map_or(0, |opcode| opcode.arity());
+            assert_eq!(
+                opcode_arity(byte),
+                expected,
+                "the derived arity of byte {byte} disagrees with the roster"
+            );
+        }
+        // A byte the roster does not know must never look like a real arity: byte 0 is
+        // not an opcode (`decode_stream` rejects it as a zero opcode byte).
+        assert_eq!(opcode_arity(0), 0);
+        assert!(Opcode::from_u8(0).is_none());
     }
 }
