@@ -222,7 +222,7 @@ Every gap below is a typed `BeamError`, never a silently wrong result.
 - `src/nif.rs` -> `erlang:load_nif/2`: `Path` decode, `(current_module, path, load_info)` to the `NifLoader` seam, `ok` or the oracle's `{error, {Reason, Text}}` return, `unsupported_bif` with no seam / unknown module
 - `src/io.rs` / `src/print.rs` -> `io:format/1,2` + `io:printable_range/0` + `io_lib:format/2,3` + `io_lib:printable_list/1` + the directive engine; the `~w`/`~p`/`~W`/`~P` leaf renderer + `mod pretty;`
 - `src/print/pretty.rs` (`mod pretty;`) / `src/print/pretty/cind.rs` (`mod cind;`) -> the full `io_lib_pretty` port; the non-throwing `cind/7` family
-- `tests/` -> the 41-file, 441-test oracle-pinned integration suite (per-file counts in `## Test Strategy`)
+- `tests/` -> the 42-file, 443-test integration suite (per-file counts in `## Test Strategy`; `registry_hot_path.rs` is the allocation/timing measurement, not an oracle pin)
 - `../beam_engine` | `../beam_process` | `../beam_ets` | `../beam_codec` | `../beam_term` | `../beam_loader` | `../beam_io` -> the `call_bif` seam, `ProcessId`/`PortId`/`PortTable`, the `Table`/match-spec engine, the ETF codec, the frozen term API, the `Recs`-chunk `RecordDefinition`, the poller/port machinery (read-only)
 - `../../erts/emulator/beam/` (`bif.tab`, `bif.c`, `erl_bif_*.c`, `erl_arith.c`/`big.c`, `erl_map.c`, `erl_db_*.c`/`erl_db_util.c`, `erl_iolist.c`/`binary.c`, `erl_record.c`, `erl_bif_port.c`, `packet_parser.c`, `erl_bif_chksum.c`/`erl_md5.c`, `erl_bif_persistent.c`, `register.c`, `external.c`, `erl_term_hashing.c`, `erl_unicode.c`, `erl_time_sup.c`, `erl_bits.h`), `../../erts/emulator/zlib/` and `../../erts/emulator/sys/common/erl_float_short.cpp` -> authoritative names/arities/semantics (read-only)
 
