@@ -562,11 +562,12 @@ still reproduces today's collector exactly.
   consumes `GcConfig`/`AnyCollector` at all yet (`beam_process` owns a concrete `Collector`;
   `beam_rt`/`beam_bifs` use neither `AnyCollector` nor `HeapInfo`), so the rule runs only in this crate's
   tests — the runtime wiring is Stage-5 work.
-- **The Immix region is fixed-size and never grows.** `ImmixSpace` wraps a `beam_alloc::Heap` and, like
-  every semi-space here, grows by GC *replacement* rather than reallocation. A major reclaims in place,
-  but if the live nursery still does not fit afterwards the collector returns a typed heap exhaustion
-  rather than resizing the region (a `beam_rt`/policy decision, like the copying `Collector`'s fresh-space
-  sizing).
+- **The Immix region grows only by GC replacement, and only when the policy asks.** `ImmixSpace` wraps a
+  `beam_alloc::Heap`; it never reallocates in place. A major whose `HeapPolicy::mature_after_fullsweep`
+  target differs from the current capacity **relocates** the whole region into a fresh `ImmixSpace`
+  (`immix_collector.rs::relocate_major`), so the region *does* resize. Only when the policy keeps the same
+  capacity does an in-place major that still cannot hold the promoted nursery return a typed heap
+  exhaustion (no unbounded retry, no partial promotion).
 - **Promotion atomicity is guaranteed only on the *total* line budget.** A minor promotes only when
   `mature.free_lines() >= needed` (the exact line count of the live nursery graph), and a major checks the
   same after reclaiming. Line-granular allocation means an object needs a *contiguous* run of its lines,
