@@ -15,6 +15,20 @@
 //!
 //! `unsafe` is confined to the raw word read/write of the copy loop; every `unsafe` block carries
 //! a `// SAFETY:` rationale.
+//!
+//! # Cycle guard on the preflight
+//!
+//! A term the engine builds is always acyclic, but a *forged* term (a raw write into the heap)
+//! can point back at one of its own ancestors. `beam_term::size_object` — the obvious way to size
+//! the destination — walks a graph with an unbounded worklist, so such a cycle would loop forever
+//! (or exhaust memory). The copy path therefore never calls `size_object` on an unproven graph:
+//! [`preflight_words`] first runs a **bounded** walk of the copy engine's own sizing, and only if
+//! that walk shows the graph does not fit does it (a) reject a cyclic graph with a typed
+//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) via [`is_acyclic`], or (b) fall back to
+//! `size_object` on a graph now known to be acyclic. A cyclic graph is therefore always a typed
+//! error, never a hang, while a normal (acyclic) graph is sized exactly as before.
+
+use std::collections::HashSet;
 
 use beam_alloc::Heap;
 use beam_common::Result;
@@ -98,6 +112,192 @@ fn push_fixup(work: &mut Vec<Fixup>, slot: *mut Eterm, child: Eterm) {
     }
 }
 
+/// Whether a word contributes a destination object the copier must descend into: a compound term
+/// that is **not** shared as-is. Immediates, literal-area terms (shared verbatim) and non-term
+/// (bare header) words are all skipped — they write no destination word and expose no child.
+#[inline]
+fn needs_visit(term: Eterm) -> bool {
+    !is_shared(term) && is_term_word(term)
+}
+
+/// The number of destination words the copier writes for `term` — the copy engine's **own**
+/// sizing, so it is exact and a sound preflight — or `None` as soon as the running total exceeds
+/// `limit`.
+///
+/// It mirrors [`shallow`]/[`copy_refc_binary`]'s allocation exactly: `2` words per cons cell,
+/// [`ERL_BIN_REF_SIZE`] for an off-heap MSO container, [`ERL_REFC_BITS_SIZE`] for a refc binary,
+/// nothing for the shared zero-arity-tuple literal, and [`layout::object_words`] for every other
+/// boxed object (walking its child slots with [`layout::for_each_child_slot`]).
+///
+/// The `limit` is what makes it cycle-safe: a forged cyclic graph revisits its own objects, so its
+/// count grows without bound and the walk stops at `limit` instead of looping forever. Every
+/// compound object contributes at least 2 words, so a graph that terminates this way always
+/// exceeds `limit` — i.e. `Some(n)` is returned only for a graph that is both acyclic and `<=
+/// limit` words.
+fn bounded_words(term: Eterm, limit: usize) -> Option<usize> {
+    let mut total = 0usize;
+    let mut work: Vec<Eterm> = Vec::new();
+    let mut current = term;
+    loop {
+        if needs_visit(current) {
+            match primary_tag(current) {
+                PrimaryTag::List => {
+                    total = total.saturating_add(2);
+                    if total > limit {
+                        return None;
+                    }
+                    // SAFETY: `current` is a live, non-`NIL` cons cell, so both words are readable.
+                    let (head, tail) = unsafe { (car(current), cdr(current)) };
+                    if needs_visit(head) {
+                        work.push(head);
+                    }
+                    if needs_visit(tail) {
+                        work.push(tail);
+                    }
+                }
+                PrimaryTag::Boxed => {
+                    if layout::is_off_heap_term(current) {
+                        total = total.saturating_add(ERL_BIN_REF_SIZE);
+                    } else if layout::is_refc_binary_term(current) {
+                        total = total.saturating_add(ERL_REFC_BITS_SIZE);
+                    } else {
+                        let p = boxed_val(current);
+                        // SAFETY: `current` is a live boxed term, so `p` addresses its header word.
+                        let header = unsafe { *p };
+                        // The zero-arity tuple is the shared global literal: no destination word.
+                        if !(is_arity_value(header) && header_arity(header) == 0) {
+                            total = total.saturating_add(layout::object_words(header, p));
+                            if total > limit {
+                                return None;
+                            }
+                            layout::for_each_child_slot(header, p, |offset| {
+                                // SAFETY: `offset` is an in-bounds slot of the object at `p`.
+                                let child = unsafe { *p.add(offset) };
+                                if needs_visit(child) {
+                                    work.push(child);
+                                }
+                            });
+                        }
+                    }
+                    if total > limit {
+                        return None;
+                    }
+                }
+                // Unreachable: `needs_visit` already excluded non-terms and immediates. Kept for
+                // exhaustiveness — such a word contributes no destination word.
+                PrimaryTag::Header | PrimaryTag::Immed1 => {}
+            }
+        }
+        match work.pop() {
+            Some(next) => current = next,
+            None => return Some(total),
+        }
+    }
+}
+
+/// Whether the term graph rooted at `term` is **acyclic**.
+///
+/// A depth-first walk (`car`/`cdr` for cons cells, [`layout::for_each_child_slot`] for boxed
+/// objects — the same children the copier descends into) that tracks, in `on_path`, exactly the
+/// compound objects on the current DFS path. A revisit of a word still on the path is a back-edge,
+/// i.e. a cycle. Shared objects (`immediates`/literals) and off-heap references are leaves here,
+/// matching the copier: they have no navigable child.
+///
+/// This is only ever called on the *error* path ([`preflight_words`] falls back to it after the
+/// bounded walk has already shown the graph does not fit), so the `HashSet` it needs is never paid
+/// on a normal copy.
+fn is_acyclic(term: Eterm) -> bool {
+    enum Step {
+        Enter(Eterm),
+        Exit(usize),
+    }
+
+    let mut on_path: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<Step> = Vec::new();
+    stack.push(Step::Enter(term));
+
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Exit(addr) => {
+                on_path.remove(&addr);
+            }
+            Step::Enter(t) => {
+                if !needs_visit(t) {
+                    continue;
+                }
+                match primary_tag(t) {
+                    PrimaryTag::List => {
+                        let addr = list_val(t) as usize;
+                        if !on_path.insert(addr) {
+                            return false;
+                        }
+                        // SAFETY: `t` is a live, non-`NIL` cons cell.
+                        let (head, tail) = unsafe { (car(t), cdr(t)) };
+                        stack.push(Step::Exit(addr));
+                        if needs_visit(head) {
+                            stack.push(Step::Enter(head));
+                        }
+                        if needs_visit(tail) {
+                            stack.push(Step::Enter(tail));
+                        }
+                    }
+                    PrimaryTag::Boxed => {
+                        if layout::is_off_heap_term(t) || layout::is_refc_binary_term(t) {
+                            continue;
+                        }
+                        let p = boxed_val(t);
+                        // SAFETY: `t` is a live boxed term, so `p` addresses its header word.
+                        let header = unsafe { *p };
+                        if is_arity_value(header) && header_arity(header) == 0 {
+                            continue;
+                        }
+                        let addr = p as usize;
+                        if !on_path.insert(addr) {
+                            return false;
+                        }
+                        stack.push(Step::Exit(addr));
+                        layout::for_each_child_slot(header, p, |offset| {
+                            // SAFETY: `offset` is an in-bounds slot of the object at `p`.
+                            let child = unsafe { *p.add(offset) };
+                            if needs_visit(child) {
+                                stack.push(Step::Enter(child));
+                            }
+                        });
+                    }
+                    // Unreachable (see `bounded_words`); a non-term has no children.
+                    PrimaryTag::Header | PrimaryTag::Immed1 => {}
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Sizes the destination for a copy of `term` against a destination holding `limit` free words,
+/// returning the flat word count to reserve.
+///
+/// The cycle-safe replacement for a bare `beam_term::size_object` preflight:
+///
+/// * a graph whose copy fits `limit` is sized by [`bounded_words`] — an exact, bounded,
+///   allocation-free walk that cannot hang;
+/// * a graph that does not fit is either **cyclic** (a typed
+///   [`BeamError::BadArg`](beam_common::BeamError::BadArg) — never a hang) or simply too big, in
+///   which case the canonical `beam_term::size_object` now gives the exact count (it is safe to
+///   call because [`is_acyclic`] has just proven the graph terminates).
+///
+/// Either way the caller compares the result against `limit`; a graph that `bounded_words` accepted
+/// is guaranteed `<= limit`.
+pub(crate) fn preflight_words(term: Eterm, limit: usize) -> Result<usize> {
+    match bounded_words(term, limit) {
+        Some(n) => Ok(n),
+        None => {
+            if !is_acyclic(term) {
+                return Err(crate::error::bad_term());
+            }
+            Ok(beam_term::size_object(term))
+        }
+    }
+}
 /// Copies the refc-binary term `src` (the 8-word `[BinRef(3)][ErlSubBits(5)]` pair whose root is
 /// the `ErlSubBits`) onto `to`, **sharing** its off-heap payload.
 ///
@@ -248,8 +448,12 @@ pub(crate) fn shallow(
 pub fn copy_struct(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm> {
     // Preflight the destination capacity against the whole graph's flat word count, so the common
     // exhaustion is attributed to the message heap (`AllocKind::Message`) up front rather than
-    // surfacing mid-copy as a bare heap failure.
-    let needed = beam_term::size_object(term);
+    // surfacing mid-copy as a bare heap failure — and so a graph too large for `to` is refused
+    // **before** any word is written (the destination is left untouched).
+    //
+    // `preflight_words` is the cycle-safe form of `beam_term::size_object`: it bounds its own walk
+    // by `to`'s capacity, so a forged cyclic graph is a typed error instead of an unbounded walk.
+    let needed = preflight_words(term, to.available())?;
     if to.available() < needed {
         return Err(crate::error::heap_exhausted(needed));
     }
