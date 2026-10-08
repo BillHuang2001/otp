@@ -185,21 +185,31 @@ impl ProcessRunner for RuntimeRunner<'_> {
                         function,
                         arity,
                     } => match module.export(*function, *arity) {
-                        // Entered at the export's own label on the **baseline** tier. The
-                        // label entry is the equivalence-preserving route to it: the export
-                        // path only resolves this same label and calls the label path, but
-                        // the baseline *export* driver (`beam_engine`'s `run_native_outcome`)
-                        // never calls `Machine::enter_run`, so the run's `entry_call` stays
-                        // unset and `process_info/2`'s `initial_call`/`current_function` could
-                        // not be answered, whereas the baseline *label* driver records it.
-                        // That is a `beam_engine` gap this crate may not patch (workaround).
+                        // Entered at the export's own label on the **interpreter** tier.
+                        //
+                        // The tier is the interpreter, not the baseline JIT, because the
+                        // slice's process may **switch module context** mid-run: a
+                        // `call_ext*` the host resolves through
+                        // `ExecutionContext::resolve_external_call` (see
+                        // `src/context/mod.rs`) is entered in this same machine as a
+                        // `Step::Enter`, and a native tier has no in-machine module-context
+                        // switch (it reports the typed
+                        // `unsupported("jit: module context switch …")` rather than
+                        // running the callee). The interpreter is also the only tier the
+                        // resume path (`Machine::resume_outcome` below) enters, so both
+                        // halves of a parked-and-resumed process run on one tier.
+                        //
+                        // The label entry stays the equivalence-preserving route to the
+                        // export: `run_label_outcome` calls `Machine::enter_run`, so the
+                        // run's `initial_call`/`current_function` are recorded and
+                        // `process_info/2`'s execution-position items can be answered.
                         Some(label) => engine.machine.run_label_outcome_with_tier(
                             module,
                             label,
                             *arity,
                             &engine.args,
                             &mut budget_ctx,
-                            Tier::BaselineJit,
+                            Tier::Interpreter,
                         ),
                         // An export the module does not define stays the engine's own typed
                         // error, byte for byte (`Machine::run_export_outcome`'s). Unreachable

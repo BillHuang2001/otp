@@ -102,6 +102,26 @@ use crate::context::RuntimeContext;
 use crate::error;
 use crate::format;
 
+/// The module namespaces [`RuntimeContext::try_native`] serves — the floor's own dispatch.
+///
+/// Every one of them is a module the code server can *also* load as a `.beam` (`erlang`,
+/// `io`, `init`, `os`, `code`, `application`, `erts_internal`, `prim_file`), so the
+/// cross-module-call seam ([`RuntimeContext::resolve_external_call`]) must answer
+/// `Ok(None)` for all of them: entering the module body would run it *instead of* the host
+/// implementation. The list is written next to the `try_native` match arms it mirrors, and
+/// [`tests::every_floor_module_is_a_real_try_native_arm`] pins it against that source so it
+/// cannot silently drift out of the host's dispatch.
+pub(crate) const FLOOR_MODULES: [&str; 8] = [
+    "application",
+    "code",
+    "erlang",
+    "erts_internal",
+    "init",
+    "io",
+    "os",
+    "prim_file",
+];
+
 impl RuntimeContext<'_> {
     /// The runtime-native BIF floor, consulted **before** the `beam_bifs` registry.
     ///
@@ -800,6 +820,48 @@ mod tests {
     use super::*;
     use crate::native::test_support::{atom, call, chars, runtime, string_of};
 
+    /// **Drift guard for the cross-module-call seam's exclusion list.**
+    ///
+    /// The seam (`context::RuntimeContext::resolve_external_call`) must answer `Ok(None)`
+    /// for **every** module `try_native` serves — entering such a module's `.beam` would run
+    /// the module body *instead of* the host implementation, a wrong result — and for no
+    /// other module. Both directions are pinned here against the floor's own dispatch source,
+    /// so adding or removing a `try_native` arm without updating [`FLOOR_MODULES`] fails this
+    /// test rather than silently mis-routing a call.
+    #[test]
+    fn every_floor_module_is_a_real_try_native_arm() {
+        let source = include_str!("native.rs");
+        let match_start = source
+            .find("fn try_native(")
+            .expect("`try_native` is the floor's dispatch entry point");
+        let match_end = match_start
+            + source[match_start..]
+                .find("\n            _ => None,")
+                .expect("`try_native`'s match ends in the `_ => None` fall-through");
+        // Every arm's *first* tuple element, taken from the arm lines themselves.
+        let arms: Vec<&str> = source[match_start..match_end]
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("(\""))
+            .filter_map(|rest| rest.split_once('"').map(|(name, _)| name))
+            .collect();
+        assert!(
+            !arms.is_empty(),
+            "the arm scan found no modules — the source layout changed"
+        );
+        for name in &arms {
+            assert!(
+                FLOOR_MODULES.contains(name),
+                "`try_native` serves `{name}` but `FLOOR_MODULES` omits it: the seam would \
+                 enter that module's `.beam` instead of the host implementation"
+            );
+        }
+        for name in FLOOR_MODULES {
+            assert!(
+                arms.contains(&name),
+                "`FLOOR_MODULES` lists `{name}`, which `try_native` does not serve"
+            );
+        }
+    }
     /// A tuple built on the runtime's term arena (the `halt/2` argument shape).
     fn tuple(runtime: &mut crate::runtime::Runtime, elements: &[Eterm]) -> Eterm {
         let mut sink = beam_bifs::NullSink;

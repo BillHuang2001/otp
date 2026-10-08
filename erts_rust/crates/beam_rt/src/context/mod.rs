@@ -94,7 +94,7 @@ use beam_abi::nif::loader::NifCallError;
 use beam_bifs::{BifContext, OutputSink};
 use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
-use beam_loader::Module;
+use beam_loader::{Label, Module};
 use beam_message::{Fragments, HeapFragment, Message, OffHeapTable, Queue};
 use beam_process::{ProcessId, ProcessTable};
 use beam_term::Eterm;
@@ -1364,6 +1364,100 @@ impl ExecutionContext for RuntimeContext<'_> {
         self.run_export(&loaded, function, arity, args)
     }
 
+    /// The engine's **cross-module call seam**
+    /// ([`ExecutionContext::resolve_external_call`]): run a `call_ext*` callee's export **in
+    /// the running machine** instead of recursing through [`Self::call_bif`].
+    ///
+    /// The engine's `CallExt*` arms consult this **before** `call_import` (the route that
+    /// reaches [`Self::call_bif`]): `Ok(Some((arc, label)))` makes the engine register `arc`
+    /// as a module context and `Step::Enter` the callee's export entry with the caller's
+    /// continuation stored in the live frame — so the callee's registers, Erlang stack and
+    /// frames are the *same* root set the slice's own machine already hands
+    /// [`ExecutionContext::ensure_heap`], and the slice's per-call GC latch covers every
+    /// allocation the callee performs (see [`crate::context::gc`]). A recursion through
+    /// `call_bif` instead builds a **second** [`Machine`](beam_engine::Machine) whose
+    /// admission point is never armed, so every allocation past the process's young heap
+    /// falls back to the runtime-wide arena — exactly the memory growth this removes.
+    ///
+    /// # What this must never do
+    ///
+    /// The seam is consulted for **every** `call_ext*`, including the names the
+    /// runtime-native floor ([`crate::native`]) and the `beam_bifs` registry serve. Entering
+    /// a discoverable `.beam` for one of those would run the module body *instead of* the
+    /// host implementation — a wrong result — so the answer is deliberately conservative:
+    ///
+    /// * a name in a namespace the floor serves ([`native::FLOOR_MODULES`]) → `Ok(None)`;
+    /// * a NIF-backed name ([`Runtime::nifs`]), a registered `beam_bifs` name
+    ///   ([`Runtime::registry`]) or the `erlang` BIF namespace → `Ok(None)`;
+    /// * a module that is **not already loaded** → `Ok(None)`: no load-on-demand here, so the
+    ///   first call keeps the synchronous [`Self::call_bif`] path (which loads the module) and
+    ///   every later call is in-machine;
+    /// * a callee whose code touches the machine's **float-register file** → `Ok(None)` (the
+    ///   float guard — see [`crate::context::gc`]: the in-machine callee runs under the
+    ///   caller's recorded module identity, so a collection over it could dangle a live float
+    ///   register);
+    /// * a function atom or export the callee does not have → `Ok(None)`, so the synchronous
+    ///   path reports the oracle's `undef` byte for byte.
+    ///
+    /// Every `Ok(None)` leaves [`Self::call_bif`] — and therefore every observable result —
+    /// unchanged: the seam only ever *substitutes a routing* for a call the synchronous path
+    /// would run through the same code anyway.
+    ///
+    /// [`native::FLOOR_MODULES`]: crate::native::FLOOR_MODULES
+    /// [`Runtime::nifs`]: crate::Runtime
+    fn resolve_external_call(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        // The floor's namespaces: `try_native` serves them for modules that are *also*
+        // loadable `.beam`s (`os`, `code`, `init`, `application`, `prim_file`,
+        // `erts_internal`, `erlang`, `io`), so entering the module body would shadow the host
+        // implementation. The list is the floor's own, and a unit test below pins it against
+        // `try_native`'s source so it can never drift out of the host's dispatch.
+        if crate::native::FLOOR_MODULES.contains(&module) {
+            return Ok(None);
+        }
+        // A loaded NIF replaces the Erlang stub of the same name (the BEAM's dispatch order):
+        // it must keep reaching `try_call_nif` through `call_bif`.
+        if self.runtime.nifs.borrow().lookup(module, function, arity) {
+            return Ok(None);
+        }
+        // A registered `beam_bifs` BIF (the `bif.tab` surface, including the stdlib fast
+        // paths and `ets:*`) is the implementation `call_bif` serves; it is never a `.beam`
+        // body here.
+        if self.runtime.registry.contains(module, function, arity) {
+            return Ok(None);
+        }
+        // No load-on-demand: the first call to an unloaded module goes through `call_bif`,
+        // which loads it and caches it; only an already-loaded module is entered here.
+        let Some(callee) = self.runtime.code_server.module_handle(module) else {
+            return Ok(None);
+        };
+        // The **float guard** (see [`crate::context::gc`]): a module whose code touches the
+        // machine's float-register file must never be collected over — `Machine::fr` holds
+        // *terms* and is not part of the root set `ensure_heap` hands out, so a heap move with
+        // a live float register would dangle it. An in-machine callee runs under the
+        // **caller's** recorded `current_module` (the engine's module-context switch does not
+        // re-enter this context), so entering a float-using callee here could collect under a
+        // float-free caller's identity. Such a callee keeps the synchronous path instead,
+        // which never collects over it — byte for byte its behaviour before this seam.
+        if !self.runtime.module_is_float_free(module, &callee) {
+            return Ok(None);
+        }
+        // Resolve the export in the **callee's own** atom table (`Module` code's atoms are
+        // that table's, never the runtime's shared one) and hand back the export entry label
+        // the synchronous `run_export` would enter. An unknown atom or export is the
+        // synchronous path's `undef`.
+        let Some(function_atom) = callee.atom_table.lookup(function) else {
+            return Ok(None);
+        };
+        match callee.export(function_atom, arity) {
+            Some(label) => Ok(Some((callee, label))),
+            None => Ok(None),
+        }
+    }
     /// Ensures `heap_need` words are available for the running code, collecting the running
     /// process's own young heap when it cannot serve them (see [`crate::context::gc`]).
     ///

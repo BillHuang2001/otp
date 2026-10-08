@@ -26,15 +26,20 @@
 //! into that probe. See [`RuntimeRunner::run`](crate::runner::RuntimeRunner) for how the
 //! probe's exhaustion becomes a pre-emption.
 //!
-//! Every other [`ExecutionContext`] method — BIF/apply dispatch, the heap and the whole
-//! receive/message seam **and the execution-trace seam**
-//! ([`trace_enabled`](ExecutionContext::trace_enabled) /
+//! Every other [`ExecutionContext`] method — BIF/apply dispatch, the heap, the whole
+//! receive/message seam, the cross-module-call seam
+//! ([`resolve_external_call`](ExecutionContext::resolve_external_call)) **and the
+//! execution-trace seam** ([`trace_enabled`](ExecutionContext::trace_enabled) /
 //! [`trace_event`](ExecutionContext::trace_event)) — is forwarded to the slice's real
 //! [`RuntimeContext`] unchanged, so a scheduled process reports `call`/`return_from`/
-//! `return_to` events exactly as the single-pass `Runtime::run_*` path does.
+//! `return_to` events exactly as the single-pass `Runtime::run_*` path does and a
+//! `call_ext*` the host can run in-machine is entered in this very slice.
+
+use std::sync::Arc;
 
 use beam_common::Result;
 use beam_engine::ExecutionContext;
+use beam_loader::{Label, Module};
 use beam_term::Eterm;
 
 use crate::context::RuntimeContext;
@@ -142,6 +147,26 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::call_bif(self.inner, module, function, arity, args)
     }
 
+    /// Forwarded like every other method (the wrapper redirects only
+    /// [`ensure_heap`](ExecutionContext::ensure_heap)).
+    ///
+    /// This one is **load-bearing** rather than merely faithful: the slice's machine runs on
+    /// *this* wrapper, so without the forward the engine would never see the real context's
+    /// cross-module-call seam (`RuntimeContext::resolve_external_call`) and a `call_ext*`
+    /// would always take the synchronous `call_bif` route — a second `Machine` whose GC
+    /// admission point is never armed, so the callee's allocations fall back to the
+    /// runtime-wide arena and the process's peak memory grows with the loop count. Forwarding
+    /// lets the engine `Step::Enter` the callee **inside this same machine**, whose
+    /// [`ensure_heap`](ExecutionContext::ensure_heap) above charges the budget *and* arms the
+    /// collection latch for it.
+    fn resolve_external_call(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        ExecutionContext::resolve_external_call(self.inner, module, function, arity)
+    }
     /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
     /// for that one admission point first.
     ///
