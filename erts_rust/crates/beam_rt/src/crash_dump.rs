@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use beam_common::{BeamError, Result};
-use beam_term::{is_immediate, size_object, AtomTable, Eterm};
+use beam_term::{is_immediate, size_object, Eterm};
 
 use crate::cli::ErlEnv;
 use crate::info::{self, InfoValue};
