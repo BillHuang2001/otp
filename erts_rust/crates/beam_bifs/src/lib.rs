@@ -35,6 +35,10 @@
 //!   registering its implementations through its own `register` entry point.
 //! * [`ets`] — the [`TableRegistry`] bridge over `beam_ets::Table`; the table handle
 //!   is an on-heap `Ref` thing (the M1 substitution for a real `tid()`).
+//! * [`hook_sets`] — the curated "hook-needed" BIF sets ([`MEMORY_HOOK_BIFS`],
+//!   [`LOCAL_FUN_IDENTITY_BIFS`] and their allocation-free predicates), so a host
+//!   gates the optional `MemoryHook`/`LocalFunIdentity` seams off the authoritative
+//!   list instead of a privately re-derived copy.
 
 #![deny(unsafe_code)]
 
@@ -55,6 +59,7 @@ mod error;
 mod erts_internal;
 mod ets;
 mod fun_info;
+pub mod hook_sets;
 mod io;
 mod lists;
 mod maps;
@@ -90,6 +95,9 @@ pub use crate::context::{
 };
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
+pub use crate::hook_sets::{
+    needs_local_fun_identity, needs_memory_hook, LOCAL_FUN_IDENTITY_BIFS, MEMORY_HOOK_BIFS,
+};
 pub use crate::reason::{exit_reason_from_term, reason_term_from_exit_reason};
 pub use crate::registry::{default_registry, BifFn, BifRegistry};
 
@@ -105,6 +113,7 @@ pub mod prelude {
         DictHook, FunCaller, LocalFunIdentity, LocalNode, MemoryHook, ModuleInfo, NifLoadError,
         NifLoader, NullSink, OutputSink, PersistentTerm, PortHook, ProcessHook, ProcessInfoItem,
         RecordDefinitionView, RecordFieldView, RecordSource, RuntimeHooks, SendHook, StdoutSink,
-        TableRegistry,
+        TableRegistry, LOCAL_FUN_IDENTITY_BIFS, MEMORY_HOOK_BIFS, needs_local_fun_identity,
+        needs_memory_hook,
     };
 }
