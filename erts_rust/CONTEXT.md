@@ -81,8 +81,10 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - Licensing: Apache-2.0 (matches OTP); deps Apache-2.0/MIT only.
 
 ## Notes for Agents
-- `cargo build --workspace` / `cargo test --workspace` are the iteration commands (lld linker in a bare
-  container, mold in the Nix devShell; `opt-level=1` dev, deps at `opt-level=2`).
+- Iterate with `scripts/cargo.sh build|test --manifest-path erts_rust/Cargo.toml --workspace`
+  (`--all-targets` for a full build) — a bare `cargo` from the repo root cannot resolve the workspace
+  manifest. lld linker in a bare container, mold in the Nix devShell; `opt-level=1` dev, deps at
+  `opt-level=2`.
 - **Read-only `$HOME` in this sandbox:** cargo's default `CARGO_HOME` (`$HOME/.cargo`) is unwritable, so
   builds MUST set a writable one. Use the committed wrapper: `scripts/cargo.sh build --workspace`
   (it selects `$HOME/.cache/cargo-home`, falling back to `$TMPDIR/cargo-home`), or export
