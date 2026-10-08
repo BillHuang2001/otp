@@ -20,9 +20,22 @@ use crate::config::Action::{Boot, Version};
 /// view it *is* the emulator configuration; the full `+`/`-`/`-M*` parser lives here.
 pub type EmulatorConfig = beam_common::RuntimeConfig;
 
-/// The default process-heap size in term words (64 Ki words — ample for the
-/// Milestone-1 vertical slice; there is no collector yet, see `runtime.rs`).
-pub const DEFAULT_HEAP_WORDS: usize = 65_536;
+/// The default term-heap size in term words (16 Mi words = 128 MiB of address space).
+///
+/// This is the size of the runtime's term-construction heaps (the BIF-heap pool and the
+/// `-eval` heap — see `runtime.rs`). Milestone 1 has **no collector and no heap-growth
+/// path** (growth-by-collection is Stage 4), so the heap is a plain bump arena whose
+/// capacity *is* the memory limit: a workload that fits, runs; one that does not, raises
+/// the emulator's documented `error:system_limit` (never a host-level allocation abort —
+/// see `error::enforce_term_heap_limit`).
+///
+/// A realistic allocation-heavy loop (the benchmark's `lists:seq(1, 1_000_000)`, i.e. 2 Mi
+/// words of cons cells) must fit, so the default is set well above the old 64 Ki-word
+/// slice budget. The carrier maps the block lazily (`beam_alloc` maps it
+/// `MAP_PRIVATE|MAP_ANONYMOUS` and only touched pages become resident), so the 128 MiB of
+/// address space costs ~nothing in RSS for a program that allocates little: the bare
+/// `beam_rt -noshell -eval 'halt().'` peak RSS is unchanged (~17.8 MB).
+pub const DEFAULT_HEAP_WORDS: usize = 1 << 24;
 
 /// The `+hmax*` boolean flags — the C `H_MAX_FLAGS` word (`erl_init.c:814-815`,
 /// `erl_init.c:1592-1624`).

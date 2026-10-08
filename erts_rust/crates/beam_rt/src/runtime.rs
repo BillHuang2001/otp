@@ -71,6 +71,26 @@ const INFO_HEAP_WORDS: usize = 4_096;
 /// The smallest process heap a runtime accepts (`heap_words` is floored at this).
 const MIN_HEAP_WORDS: usize = 1_024;
 
+/// The size in term words of the runtime's term-construction heaps (the BIF-heap pool and
+/// the `-eval` heap) for `config`.
+///
+/// It is [`RuntimeConfig::heap_words`] (default [`DEFAULT_HEAP_WORDS`]), floored at
+/// [`MIN_HEAP_WORDS`] so the smallest program still has room, and **capped by `+hmax`**
+/// when that switch is given: `+hmax N` is the emulator's maximum heap size, so a workload
+/// needing more than `N` words must hit the limit. Milestone 1 has no collector to grow
+/// the heap with (see [`crate::runtime`] and the crate `CONTEXT.md`), so the cap is
+/// enforced by *sizing* the heap; the allocation that would exceed it fails and
+/// [`crate::error::enforce_term_heap_limit`] turns that into the documented
+/// `error:system_limit` raise. A `+hmax` below [`MIN_HEAP_WORDS`] is floored, exactly as
+/// `heap_words` is.
+fn term_heap_words(config: &RuntimeConfig) -> usize {
+    let base = config.heap_words.max(MIN_HEAP_WORDS);
+    match config.heap_options().policy().max_heap_words {
+        0 => base,
+        max => base.min(max.max(MIN_HEAP_WORDS)),
+    }
+}
+
 /// The Rust ERTS runtime.
 pub struct Runtime {
     /// The configuration this runtime was created with.
@@ -289,9 +309,9 @@ impl Runtime {
         processes
             .register(init_name, self_pid)
             .map_err(|_| error::message("boot: the `init` name is already registered"))?;
-        // A zero-word heap can hold nothing, so the configured size is floored: the
-        // runtime must always be able to run the smallest program.
-        let heap_words = config.heap_words.max(MIN_HEAP_WORDS);
+        // A zero-word heap can hold nothing, so the configured size is floored — and a
+        // `+hmax` the emulator was given is the ceiling (see `term_heap_words`).
+        let heap_words = term_heap_words(&config);
         // A configured node name (`-name`/`-sname`) makes this a **distributed node**:
         // the listener is bound here (a bind failure is a genuine start-up error, never
         // a silently un-distributed runtime) and the node is published to `epmd` on the
@@ -549,10 +569,12 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// The arena's allocation failure when the value does not fit. That is an honest
-    /// error, never a dangling term.
+    /// The arena's allocation failure when the value does not fit, translated to the
+    /// emulator's documented `error:system_limit` — an honest error, never a dangling term
+    /// (see [`crate::error::enforce_term_heap_limit`]).
     pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
         beam_message::copy_struct_simple(term, &mut self.eval_heap)
+            .map_err(error::enforce_term_heap_limit)
     }
     /// Ensures `heap_need` words are available in the arena.
     ///
