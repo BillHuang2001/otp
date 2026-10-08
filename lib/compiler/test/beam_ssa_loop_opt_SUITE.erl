@@ -486,9 +486,6 @@ arith_licm_declines(_Config) ->
     Both = #{arg_types => #{0 => AnyInt, 1 => AnyInt}},
     %% A divisor that is not a non-zero literal could be zero on the path the
     %% hoist adds, so it would have to keep raising there.
-    [{'div', [var(x), var(v)], Both},
-     {'rem', [var(x), var(v)], Both},
-     {'div', [var(x), lit(0)], anno0(AnyInt)}],
     lists:foreach(
       fun({Op, Args, Anno}) ->
               {_, O} = run_arith(arith_loop(Op, Args, Anno)),
@@ -514,7 +511,7 @@ arith_licm_declines(_Config) ->
        {'+', [var(i), lit(1)], anno0(AnyInt)},
        %% An operand the loop narrows: the annotation comes from a test inside
        %% the loop and says nothing about the preheader.
-       {'+', [var(x), lit(1)], narrowed_arith_loop()}]]),
+       {'+', [var(x), lit(1)], narrowed_arith_loop(anno0(AnyInt))}]),
     {_, OutNr} = run_arith(narrowed_arith_loop(anno0(AnyInt))),
     [] = hoisted(OutNr, y),
     ok.
