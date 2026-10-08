@@ -322,7 +322,7 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `send_control(dop, terms, atoms)` / `send_message(from, to, msg, atoms)` / `send_tick()` — encode +
   envelope into the output buffer.
 - `state()` / `negotiated()` / `client_flags()` / `server_flags()` / `peer_name()` / `peer_creation()` /
-  `handshake()` / `ticks_answered()` / `is_eof()`.
+  `peer_visibility() -> Option<PeerVisibility>` / `handshake()` / `ticks_answered()` / `is_eof()`.
 - Runtime drive loop: `read → feed → loop{step until WouldBlock} → take_output → write → while
   next_message{ handle }`; `Closed`/`Failed` mean drop the link.
 
