@@ -599,11 +599,11 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
   reload policy is consulted (only the *entry* validation).
 
 ## Known gaps (honest, never a wrong result)
-- **`enif_alloc_env` answers `NULL` when the host does not implement `alloc_env`** (the trait's
-  default), or when no `NifEnv` is live. `beam_rt`'s `NifHostImpl` does not implement the hook today,
-  so in the real runtime `enif_alloc_env()` returns `NULL` — honest, never a wrong term; the seam is
-  in place for a `beam_rt` owner to fill in. A crate-owned env is not an option (its atoms would be
-  unusable ⇒ a *wrong term*).
+- **`enif_alloc_env` answers `NULL` only when the current host leaves `alloc_env` at the trait
+  default, or when no `NifEnv` is live (outside a NIF call).** `beam_rt`'s `NifHostImpl` implements
+  `alloc_env`/`free_env`/`make_copy` (`beam_rt/src/nif.rs`), so the real runtime's message-env idiom
+  works: every message env is built over the one shared pooled BIF heap, making `make_copy` the
+  identity. A crate-owned env is not an option (its atoms would be unusable ⇒ a *wrong term*).
 - **No scheduler threads.** `enif_thread_type` can only report `ERL_NIF_THR_UNDEFINED` (a foreign
   thread) or `ERL_NIF_THR_OTHER` (a thread created through `sync::thread_create`) — never a
   scheduler/dirty-scheduler type. An **unnamed** handle's `*_name` accessor returns `NULL` where the
