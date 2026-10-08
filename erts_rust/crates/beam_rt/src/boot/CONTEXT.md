@@ -92,8 +92,9 @@ these eight directives, the full modelled set:
   source of truth for the set and its order.
 - Additive only: `PRELOADED_MODULE_NAMES`, `CORE_ATOMS`, `seed_core_atoms` and `Runtime::preloaded()`
   keep their existing semantics/return types; `boot()` stays idempotent and returns `Result<()>`.
-- `bootscript.rs` is ~540 production lines + its oracle test module (the crate's documented long-file
-  precedent); `#![deny(unsafe_code)]`; no `unwrap()` on runtime data.
+- `bootscript.rs` is ~590 production lines + its oracle test module (the crate's documented long-file
+  precedent); the bounded scheduler drives its two process directives use are the sibling `./drive.rs`;
+  `#![deny(unsafe_code)]`; no `unwrap()` on runtime data.
 
 ## Test Strategy
 - `boot/preloaded.rs`: `boot_loads_every_preloaded_module_into_the_cache` (all 22 cached; `erlang`/`init`/
@@ -101,25 +102,29 @@ these eight directives, the full modelled set:
   `a_missing_preloaded_module_is_a_typed_error_not_a_silent_skip` (empty code path ⇒ `error::undef`, nothing
   cached). System-install tests **skip loudly** (clear `eprintln!` + early `return`) when no Erlang is
   installed — never silently pass.
-- `boot/bootscript.rs` (5 tests): `reads_the_real_start_boot_into_the_oracle_instruction_sequence` (parses
+- `boot/bootscript.rs` (6 tests): `reads_the_real_start_boot_into_the_oracle_instruction_sequence` (parses
   the committed `bootstrap/bin/start.boot`; pins `{"Erlang/OTP","30"}`, 22 instructions, and the
   instruction list — the huge kernel/stdlib `primLoad` batches by length + first/last name, the
   `application_controller` and `application:load/1` args by shape); the bounded prefix test
   `the_real_start_boot_prefix_loads_its_prim_load_batches` (executes 0..first-`apply` and asserts the
   named modules loaded); `the_real_start_boot_stops_honestly_at_the_first_unbootable_directive` (executes
-  instruction-by-instruction, asserts a typed `BeamError::Raise` at index ≥ 12 — it is 16 — and that the
-  `primLoad` batches loaded); `a_synthetic_script_executes_end_to_end` (compiles a fixture with `erlc`,
-  writes a synthetic `.boot` with `erl`, and asserts the `apply` step really ran — observable through the
-  process dictionary); `a_malformed_boot_script_is_a_typed_error` (empty / random bytes / a valid-ETF
-  wrong-shape term / a truncated real script). Every test reads the committed script via
-  `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../bootstrap/bin/start.boot")`; system-install tests **skip
-  loudly** when `erl`/`erlc` or the file are absent.
+  instruction-by-instruction, asserts the stop is a typed `BeamError::Raise` on an
+  `Instruction::Apply { .. }` at index ≥ 16 — it is 16 — and that the `primLoad` modules loaded);
+  `a_synthetic_script_executes_end_to_end` (compiles a fixture with `erlc`, writes a synthetic `.boot`
+  with `erl`, and asserts the `apply` step really ran — observable through the process dictionary);
+  `a_boot_spawned_process_answers_a_blocked_apply` (pins the `./drive.rs` behaviour: a `{kernelProcess, …}`
+  burst and a later `{apply, …}` that blocks on the spawned process, resumed by a scheduler drive, its
+  dictionary side effect read back through `runtime.eval`); `a_malformed_boot_script_is_a_typed_error`
+  (empty / random bytes / a valid-ETF wrong-shape term / a truncated real script). Every test reads the
+  committed script via `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../bootstrap/bin/start.boot")`;
+  system-install tests **skip loudly** when `erl`/`erlc` or the file are absent.
 - `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry.
 
 ## Routing Table
-- `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript`)
+- `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
 - `./preloaded.rs` → the real preloaded `.beam` loading (`load_preloaded`/`load_names`)
 - `./bootscript.rs` → the OTP boot-script reader (`read`/`BootScript`/`Instruction`/`Mfa`/`Value`) + executor (`execute`)
+- `./drive.rs` → the bounded scheduler-drive helpers (`drive_scheduler`/`apply_boot_call`, plus their `DRIVE_DEADLINE`/`KERNEL_BURST_*`/`APPLY_BLOCK_SLICES` budgets) the two process directives use
 - `../runtime.rs` → `Runtime::boot` / `boot_if_needed` / `preloaded_loaded` / `is_preloaded_loaded`, and the boot-script glue `boot_from_script` / `load_code_module` / `add_code_path` / `register_boot_process`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
