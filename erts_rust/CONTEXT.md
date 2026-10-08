@@ -127,7 +127,7 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   ETS concurrency; `put_record/6`'s create form; several structured-raise-reason degradations; depth of
   live distribution interop. All return typed errors, never wrong results.
 
-## Not yet started (future workstreams)
+## Future workstreams
 - **Stage 2 (compiler):** loop opts → operation fusion → FBIP on the existing BEAM-SSA IR
   (`../lib/compiler`), per Part II §E/§H. Language-agnostic (Erlang/Elixir/LFE). Not part of the Rust
   runtime rewrite; the Rust runtime must ultimately run the compiler (contract A.9, self-hosted build)
