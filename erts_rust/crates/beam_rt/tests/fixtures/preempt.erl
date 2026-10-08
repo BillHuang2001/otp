@@ -13,7 +13,7 @@
 %%% `alloc_loop/2` is an ALLOCATING tail-recursive loop: every iteration builds one
 %%% cons cell (`[N | Acc]`), so the compiler emits a `test_heap` before that
 %%% allocation. That is the one per-instruction seam the runtime's reduction budget
-%%% is charged at (`beam_rt/src/runner.rs`), so a call with an `N` far above the
+%%% is charged at (`beam_rt/src/runner/`), so a call with an `N` far above the
 %%% 4000-reduction slice budget is pre-empted (yielded) part-way through and only
 %%% finishes over several slices. A loop with **no** allocation has no admission
 %%% point and is not pre-empted (an honest, documented Milestone-1 limit).

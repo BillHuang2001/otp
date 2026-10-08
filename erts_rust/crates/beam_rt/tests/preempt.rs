@@ -4,7 +4,7 @@
 //! ([`beam_process::DEFAULT_REDUCTIONS_PER_SLICE`] = 4000) and expects it to return
 //! [`beam_process::RunOutcome::Yield`] once the budget is spent; the scheduler then requeues
 //! the process at the **tail** of the run queue, so the next slice goes to whatever was queued
-//! behind it ([`beam_process::Scheduler::run_slice`], `beam_rt/src/runner.rs`).
+//! behind it ([`beam_process::Scheduler::run_slice`], `beam_rt/src/runner/`).
 //!
 //! Pre-emption is **cooperative**: a runner that ignored its budget would run the whole
 //! CPU-bound process inside the one `run` call the scheduler makes and only then return, so a

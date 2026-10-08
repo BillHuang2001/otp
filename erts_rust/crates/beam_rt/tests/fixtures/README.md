@@ -26,7 +26,7 @@ also the differential oracle.
   (`beam_lib:chunks/2`), so the reason atom `function_clause` can only come from the
   runtime's boot seed — which is exactly the property the test pins.
 * `recv_after.beam` is the **finite `receive … after T`** image (the receive-deadline tests in
-  `src/runtime.rs` and `src/runner.rs`): `after20/0` and `after2000/0` park on an empty mailbox
+  `src/runtime.rs` and `src/runner/`): `after20/0` and `after2000/0` park on an empty mailbox
   and time out, `afterzero/0` (`after 0`) never suspends, `self_send/0` matches the message
   already queued and never arms a deadline, and `wait_forever/0` (`after infinity`) parks. It
   pins the five opcode shapes the runtime deadline path is read from (`wait_timeout` +
@@ -215,13 +215,13 @@ re-derive them from the system `erl`, do **not** guess.
 
 `recv_after`'s exports pin the finite-`after` shapes: `after20/0`/`after2000/0` compile to a
 `wait_timeout` carrying the literal `{integer,T}` followed by `timeout` (the shape
-`src/runner.rs::parked_receive_timeout` recovers the deadline from), `afterzero/0` folds the
+`src/runner/reason.rs::parked_receive_timeout` recovers the deadline from), `afterzero/0` folds the
 `after 0` away so an empty mailbox falls straight to `timeout`, `self_send/0` matches the
 queued message and never arms a deadline, and `wait_forever/0` (`after infinity`) is a bare
 `wait`. Only the two literal-timeout exports are read here; a **variable** `after T` compiles
 to the same `wait_timeout` with a Y-register operand, which the runner cannot read today (see
 `CONTEXT.md`'s Known Issues). The fixture is driven by the receive-deadline tests in
-`src/runtime.rs` (the scheduler path) and `src/runner.rs` (the parked-timeout bookkeeping).
+`src/runtime.rs` (the scheduler path) and `src/runner/` (the parked-timeout bookkeeping).
 
 `marked/0`-style exports that would drive the `recv_marker_*` prologue are deliberately
 **not** in either fixture: the prologue is emitted for a receive that matches on a

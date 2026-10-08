@@ -1,0 +1,181 @@
+//! The **reduction budget** of one scheduler slice and the slice context that charges it.
+//!
+//! [`BudgetProbe`] counts the reduction units a slice spends at the machine's
+//! heap-admission points; [`BudgetContext`] is the wrapper [`ExecutionContext`] that
+//! redirects an [`ensure_heap`](ExecutionContext::ensure_heap) on the slice's own machine
+//! into that probe. See [`RuntimeRunner::run`](crate::runner::RuntimeRunner) for how the
+//! probe's exhaustion becomes a pre-emption.
+
+use beam_common::Result;
+use beam_engine::ExecutionContext;
+use beam_term::Eterm;
+
+use crate::context::RuntimeContext;
+
+/// The reduction budget of **one scheduler slice**, charged as the machine runs.
+///
+/// The [`ProcessRunner`](beam_process::ProcessRunner) contract puts the reduction count in
+/// the runner's hands (the scheduler never inspects or resets `Process::reductions`), and
+/// `beam_engine` exposes no mid-run reduction/step counter, so the count is derived from
+/// the one per-instruction seam the executing machine reaches on its own:
+/// [`ExecutionContext::ensure_heap`], called by `test_heap`/`allocate_heap` — the
+/// instructions the compiler emits once per loop iteration that allocates (the ordinary
+/// Erlang shape).
+///
+/// One charge is one reduction-like unit. When the budget runs out, `charge` reports the
+/// exhaustion through a typed error; the runner recognises it (the sticky [`exhausted`] flag
+/// is set) and turns it into [`RunOutcome::Yield`](beam_process::RunOutcome::Yield) at the
+/// machine's recorded address rather than a process failure.
+///
+/// An exhausted probe is **sticky**: it keeps refusing so a single exhaustion yields exactly
+/// once (the first refusal propagates out of the run, so no second charge can occur — the
+/// stickiness is what makes the runner's classification unambiguous).
+///
+/// [`exhausted`]: BudgetProbe::is_exhausted
+pub(super) struct BudgetProbe {
+    /// The reduction units left in this slice. Never zero: a degenerate `budget` of 0 still
+    /// gets one unit, so a slice always makes progress and the scheduler's run-queue loop
+    /// cannot spin forever on an immediately-yielding process.
+    remaining: u32,
+    /// The reduction units charged so far (what the process's counter is set to).
+    used: u32,
+    /// Whether the budget ran out during this slice.
+    exhausted: bool,
+}
+
+impl BudgetProbe {
+    /// A probe with `budget` reduction units (at least one).
+    pub(super) fn new(budget: u32) -> BudgetProbe {
+        BudgetProbe {
+            remaining: budget.max(1),
+            used: 0,
+            exhausted: false,
+        }
+    }
+
+    /// The reduction units this slice charged.
+    pub(super) fn used(&self) -> u32 {
+        self.used
+    }
+
+    /// Whether the budget ran out during this slice.
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Charges one reduction unit, or reports the exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// A typed `unsupported`-prefixed error once the budget is spent — the runner's signal
+    /// that the slice must end in [`RunOutcome::Yield`](beam_process::RunOutcome::Yield). It
+    /// is **never** a process failure: the runner intercepts it and parks the machine
+    /// instead of recording an exit.
+    pub(super) fn charge(&mut self) -> Result<()> {
+        if self.remaining == 0 {
+            self.exhausted = true;
+            return Err(crate::error::unsupported(
+                "preemption: the reduction budget for this scheduler slice is spent",
+            ));
+        }
+        self.remaining -= 1;
+        self.used += 1;
+        Ok(())
+    }
+}
+
+/// The **slice's** context: the [`RuntimeContext`] the executing machine runs on, with the
+/// slice's reduction budget charged at its heap-admission points.
+///
+/// This wrapper exists because `beam_rt` may not change `beam_engine` or its own
+/// `src/context/**`: it is handed to the machine the runner drives, and every context the
+/// engine builds *inside* that run — an external module call
+/// ([`RuntimeContext::run_export`]) or a fun application — is a plain `RuntimeContext`, so
+/// the wrapper's [`ensure_heap`](ExecutionContext::ensure_heap) is reached by the slice's own
+/// machine **only**. That is what makes the recorded resume address exact and keeps a nested
+/// run from being mistaken for the pre-empted one.
+///
+/// Everything else is forwarded unchanged; the redirect is purely mechanical.
+pub(super) struct BudgetContext<'c, 'a> {
+    /// The slice's real context.
+    pub(super) inner: &'c mut RuntimeContext<'a>,
+    /// The slice's budget.
+    pub(super) probe: &'c mut BudgetProbe,
+}
+
+impl ExecutionContext for BudgetContext<'_, '_> {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        ExecutionContext::call_bif(self.inner, module, function, arity, args)
+    }
+
+    /// Charge one reduction, then serve the request by delegating (the runtime's arena is
+    /// unbounded, so the delegation itself never fails on Milestone 1).
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.probe.charge()?;
+        ExecutionContext::ensure_heap(self.inner, heap_need, live, x_regs, stack)
+    }
+
+    fn heap_available(&self) -> usize {
+        ExecutionContext::heap_available(&*self.inner)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        ExecutionContext::alloc_words(self.inner, n)
+    }
+
+    fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
+        ExecutionContext::apply(self.inner, module, function, arity, args)
+    }
+
+    fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        ExecutionContext::apply_fun(self.inner, fun, args)
+    }
+
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        ExecutionContext::send_message(self.inner, to, message)
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        ExecutionContext::receive_next(self.inner)
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        ExecutionContext::receive_skip(self.inner)
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        ExecutionContext::receive_remove(self.inner)
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        ExecutionContext::receive_reset(self.inner)
+    }
+
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        ExecutionContext::receive_marker_reserve(self.inner)
+    }
+
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_bind(self.inner, marker, reference)
+    }
+
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_use(self.inner, reference)
+    }
+
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_clear(self.inner, reference)
+    }
+}
