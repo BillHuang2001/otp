@@ -124,6 +124,30 @@ impl<const N: usize> From<[(Label, (u32, u32)); N]> for LabelMap {
     }
 }
 
+// A test-only counter of `build_label_map` calls on the current thread.
+//
+// A run must build the module-wide label index **exactly once** (it used to build
+// it twice — once to resolve the entry label and once inside the dispatch loop),
+// and a focused unit test asserts that. Compiled only under `cfg(test)`, so it is
+// absent from production builds and from the `tests/` integration suites (which
+// link the non-test library) and cannot perturb their timing.
+#[cfg(test)]
+thread_local! {
+    static LABEL_MAP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: reset the current thread's [`build_label_map`] call counter.
+#[cfg(test)]
+pub(crate) fn reset_label_map_builds() {
+    LABEL_MAP_BUILDS.with(|c| c.set(0));
+}
+
+/// Test-only: the current thread's [`build_label_map`] call count.
+#[cfg(test)]
+pub(crate) fn label_map_builds() -> usize {
+    LABEL_MAP_BUILDS.with(|c| c.get())
+}
+
 /// Build the module-wide [`LabelMap`].
 ///
 /// Labels are module-unique code addresses, so a call/fail target may live in a
@@ -131,6 +155,8 @@ impl<const N: usize> From<[(Label, (u32, u32)); N]> for LabelMap {
 /// `fib/1` tail-calls into `fib/3`). Every function's [`beam_loader::Function::labels`]
 /// contributes to the one index.
 pub(crate) fn build_label_map(module: &Module) -> LabelMap {
+    #[cfg(test)]
+    LABEL_MAP_BUILDS.with(|c| c.set(c.get() + 1));
     // One pass to size the index: a real `.beam` numbers its labels `1..=count`,
     // so `max + 1 == count + 1` and the dense table is exactly as large as the
     // label set (verified across the installed OTP: density is exactly 1.0).
@@ -193,6 +219,21 @@ fn import_target(module: &Module, target: ImportRef) -> Result<(&str, &str, u32)
     Ok((module_name, function_name, import.arity))
 }
 
+/// The argument count up to which a BIF/`call_ext` marshals its arguments through
+/// a **stack array** instead of a heap `Vec`.
+///
+/// `gc_bif`/`bif`/`call_ext` used to build a fresh `Vec` (one heap allocation and
+/// free) for **every** BIF call, which a micro-benchmark showed to be the single
+/// largest per-instruction cost of the interpreter. arities in `0..=STACK_ARGS`
+/// (every arity the compiler actually emits for arithmetic/guard BIFs) now fill a
+/// fixed stack array; a larger arity still works through the `Vec` fallback, so
+/// the observable behaviour and the `ctx.call_bif(.., &[Eterm])` signature are
+/// unchanged.
+const STACK_ARGS: usize = 8;
+
+/// A stack array sized for the common BIF/`call_ext` arities ([`STACK_ARGS`]).
+const EMPTY_ARGS: [Eterm; STACK_ARGS] = [NIL; STACK_ARGS];
+
 impl Machine {
     /// The direct-threaded dispatch loop over the Milestone-1 opcode subset.
     ///
@@ -204,8 +245,9 @@ impl Machine {
     /// found them).
     ///
     /// It does **not** reset the machine: it only (re)binds the running module's
-    /// literal area and builds the label map, so [`Machine::resume_outcome`] can
-    /// re-enter a suspended process through it unchanged.
+    /// literal area, records the run's entry call and builds the label map (see
+    /// [`Machine::enter_run`]), so [`Machine::resume_outcome`] can re-enter a
+    /// suspended process through it unchanged.
     pub(crate) fn run_loop(
         &mut self,
         module: &Module,
@@ -213,23 +255,30 @@ impl Machine {
         pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<RunOutcome> {
-        // Bind the running module's literal area so the operand seam can resolve
-        // `Operand::Literal(idx)` (the module is fixed for the whole run; see the
-        // `Machine::literals` field docs). `reset()` cleared any previous binding.
+        self.enter_run(module, func);
+        let labels = build_label_map(module);
+        self.run_loop_with_map(module, &labels, func, pc, ctx)
+    }
+
+    /// The per-run prologue shared by [`Machine::run_loop`] and
+    /// [`Machine::run_label_outcome`]: bind the running module's literal area so
+    /// the operand seam can resolve `Operand::Literal(idx)`, and record the run's
+    /// entry `(func, arity)` — **once** per run.
+    ///
+    /// Both effects are idempotent in the way a resume needs: the module is fixed
+    /// for the whole run (see the `Machine::literals` field docs), and an entry
+    /// call is recorded only when this run has none yet (a `resume_outcome`
+    /// re-enters the same run without resetting, so the process's initial call
+    /// stays the one it entered at). A `func` outside the module records nothing
+    /// rather than a bogus entry.
+    pub(crate) fn enter_run(&mut self, module: &Module, func: u32) {
+        // `reset()` cleared any previous literal binding.
         self.set_literals(module.literals.clone());
-        // Record the run's entry function — the engine's analogue of ERTS's
-        // `$initial_call` — **once** per run: `reset` cleared it for a fresh run,
-        // and `resume_outcome` re-enters the same run through this entry without
-        // resetting, so an existing recording is never overwritten (the process's
-        // initial call is fixed for the life of the run). A `func` outside the
-        // module records nothing rather than a bogus entry.
         if self.entry_call.is_none() {
             if let Some(function) = module.functions.get(func as usize) {
                 self.entry_call = Some((func, function.arity));
             }
         }
-        let labels = build_label_map(module);
-        self.run_loop_with_map(module, &labels, func, pc, ctx)
     }
 
     /// Execute **exactly one** instruction at `(func, pc)` and report where control
@@ -387,71 +436,25 @@ impl Machine {
                 args,
                 dst,
                 ..
-            } => {
-                let (module_name, function_name, arity) = import_target(module, *bif)?;
-                let mut arg_terms = Vec::with_capacity(args.len());
-                for arg in args {
-                    arg_terms.push(read_operand(self, ctx, arg)?);
-                }
-                match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
-                    Ok(value) => {
-                        write_operand(self, dst, value)?;
-                        Ok(Step::Next)
-                    }
-                    // No fail label ⇒ a *raise*: land in a live catch frame
-                    // (C falls through to `find_func_info`/`handle_error`) or
-                    // propagate the typed error.
-                    Err(e) if *fail == NO_FAIL => self.raise_bif_error(module, e),
-                    // Guard failure: jump to the fail label.
-                    Err(_) => {
-                        let (func, pc) = resolve(labels, *fail)?;
-                        Ok(Step::Goto { func, pc })
-                    }
-                }
-            }
+            } => self.exec_bif(module, labels, *bif, args, *fail, dst, ctx),
             Instr::Bif0 { bif, dst } => {
                 // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
                 // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
                 // is no fail label, so any error is a raise; C routes the call
                 // through `call_light_bif`, whose error path is catch-aware.
-                let (module_name, function_name, arity) = import_target(module, *bif)?;
-                match ctx.call_bif(module_name, function_name, arity, &[]) {
-                    Ok(value) => {
-                        write_operand(self, dst, value)?;
-                        Ok(Step::Next)
-                    }
-                    Err(e) => self.raise_bif_error(module, e),
-                }
+                self.exec_bif(module, labels, *bif, &[], NO_FAIL, dst, ctx)
             }
+            // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
+            // Like the `GcBif` arm minus the heap/live check: on failure, jump
+            // to `fail` if it is live (guard failure), else raise (landing in a
+            // live catch frame when there is one).
             Instr::Bif {
                 bif,
                 fail,
                 args,
                 dst,
                 ..
-            } => {
-                // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
-                // Like the `GcBif` arm minus the heap/live check: on failure,
-                // jump to `fail` if it is live (guard failure), else raise
-                // (landing in a live catch frame when there is one).
-                let (module_name, function_name, arity) = import_target(module, *bif)?;
-                let mut arg_terms = Vec::with_capacity(args.len());
-                for arg in args {
-                    arg_terms.push(read_operand(self, ctx, arg)?);
-                }
-                match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
-                    Ok(value) => {
-                        write_operand(self, dst, value)?;
-                        Ok(Step::Next)
-                    }
-                    Err(e) if *fail == NO_FAIL => self.raise_bif_error(module, e),
-                    // Guard failure: jump to the fail label.
-                    Err(_) => {
-                        let (func, pc) = resolve(labels, *fail)?;
-                        Ok(Step::Goto { func, pc })
-                    }
-                }
-            }
+            } => self.exec_bif(module, labels, *bif, args, *fail, dst, ctx),
             Instr::Call { target, .. } => {
                 // Store the continuation in the *current* frame's CP slot.
                 self.set_continuation(Continuation::Address { func, pc: pc + 1 })?;
@@ -623,7 +626,71 @@ impl Machine {
         }
     }
 
+    /// Read a `gc_bif`/`bif`/`bif0`'s **operand** arguments, call the BIF through
+    /// [`ExecutionContext::call_bif`] and fold the outcome into the control-flow
+    /// [`Step`] the dispatch loop expects.
+    ///
+    /// The arguments are marshalled into a **stack array** for the common arities
+    /// ([`STACK_ARGS`]) and into a heap `Vec` only beyond it, so the heap
+    /// allocation the old code paid on **every** BIF call is gone; `call_bif` keeps
+    /// its `&[Eterm]` shape either way.
+    ///
+    /// The control flow is unchanged, and the distinction matters: an error while
+    /// *marshalling* the call (a bad import reference or a bad operand) propagates
+    /// as the typed error the instruction already returned (the original `?`),
+    /// **never** as a guard failure — only a **BIF** error raises
+    /// ([`Machine::raise_bif_error`], which is the whole story when `fail == NO_FAIL`,
+    /// i.e. for every `bif0`) or branches to `fail`.
+    fn exec_bif(
+        &mut self,
+        module: &Module,
+        labels: &LabelMap,
+        bif: ImportRef,
+        args: &[Operand],
+        fail: Label,
+        dst: &Operand,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Step> {
+        let (module_name, function_name, arity) = import_target(module, bif)?;
+        let mut buf = EMPTY_ARGS;
+        let mut heap: Vec<Eterm> = Vec::new();
+        let arg_terms: &[Eterm] = if args.len() <= STACK_ARGS {
+            for (slot, arg) in buf.iter_mut().zip(args) {
+                *slot = read_operand(self, ctx, arg)?;
+            }
+            &buf[..args.len()]
+        } else {
+            heap.reserve_exact(args.len());
+            for arg in args {
+                heap.push(read_operand(self, ctx, arg)?);
+            }
+            &heap
+        };
+        match ctx.call_bif(module_name, function_name, arity, arg_terms) {
+            Ok(value) => {
+                write_operand(self, dst, value)?;
+                Ok(Step::Next)
+            }
+            // No fail label ⇒ a *raise*: land in a live catch frame (C falls
+            // through to `find_func_info`/`handle_error`) or propagate the typed
+            // error.
+            Err(e) if fail == NO_FAIL => self.raise_bif_error(module, e),
+            // Guard failure: jump to the fail label.
+            Err(_) => {
+                let (func, pc) = resolve(labels, fail)?;
+                Ok(Step::Goto { func, pc })
+            }
+        }
+    }
+
     /// Call an imported BIF with the `arity` register arguments `x(0..arity)`.
+    ///
+    /// Like [`Machine::exec_bif`] the arguments are marshalled through a stack
+    /// array for the common arities and a `Vec` only beyond it, so a `call_ext`
+    /// pays no heap allocation in the common case. A marshalling error (a bad
+    /// import or an out-of-range register) propagates as the typed error the
+    /// instruction already returned; the BIF's own result is handed back for the
+    /// caller's raise/fail decision.
     fn call_import(
         &self,
         module: &Module,
@@ -632,11 +699,26 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
         let (module_name, function_name, bif_arity) = import_target(module, target)?;
-        let mut args = Vec::with_capacity(arity as usize);
-        for i in 0..arity {
-            args.push(self.x(i).ok_or_else(|| error::bad_register(i))?);
+        if arity as usize <= STACK_ARGS {
+            let mut buf = EMPTY_ARGS;
+            for (i, slot) in buf.iter_mut().enumerate().take(arity as usize) {
+                *slot = self
+                    .x(i as u32)
+                    .ok_or_else(|| error::bad_register(i as u32))?;
+            }
+            ctx.call_bif(
+                module_name,
+                function_name,
+                bif_arity,
+                &buf[..arity as usize],
+            )
+        } else {
+            let mut buf = Vec::with_capacity(arity as usize);
+            for i in 0..arity {
+                buf.push(self.x(i).ok_or_else(|| error::bad_register(i))?);
+            }
+            ctx.call_bif(module_name, function_name, bif_arity, &buf)
         }
-        ctx.call_bif(module_name, function_name, bif_arity, &args)
     }
 
     /// Raise a BIF/`call_ext` error on the **no-fail-label** path, landing it in a
@@ -1019,7 +1101,143 @@ mod tests {
             LabelMap::default().resolve(Label(4)),
             Err(BeamError::BadArg)
         ));
-    }    #[test]
+    }
+
+    // ---- the argument-marshalling / fail-branch contract -------------------
+
+    /// A one-function module whose body is `[Label(2), gc_bif, Label(3), return]`,
+    /// the `gc_bif` calling `erlang:f/<args.len()>` with the given `fail` label.
+    fn gc_bif_module(fail: Label, args: Vec<Operand>) -> Module {
+        let arity = args.len() as u32;
+        let (mut module, _) = module_with_function(
+            vec![
+                Instr::Label(Label(2)),
+                Instr::GcBif {
+                    arity: arity as u8,
+                    bif: ImportRef(0),
+                    fail,
+                    live: arity,
+                    args,
+                    dst: Operand::X(arity),
+                },
+                Instr::Label(Label(3)),
+                Instr::Return,
+            ],
+            Vec::new(),
+        );
+        let erlang = module.atom_table.intern("erlang");
+        let name = module.atom_table.intern("f");
+        module.imports.push(Import {
+            module: erlang,
+            function: name,
+            arity,
+        });
+        module
+    }
+
+    /// A *marshalling* failure (a bad import reference, or a bad operand) must
+    /// propagate the typed error **even with a live fail label**: it is not a guard
+    /// failure, and branching to `fail` would silently continue down a wrong path.
+    #[test]
+    fn gc_bif_marshalling_errors_propagate_instead_of_branching() {
+        // (a) The import reference is out of range (no imports declared) while the
+        // instruction has a *live* fail label, which must not be used.
+        let (module, _) = module_with_function(
+            vec![
+                Instr::Label(Label(2)),
+                Instr::GcBif {
+                    arity: 1,
+                    bif: ImportRef(0),
+                    fail: Label(3),
+                    live: 1,
+                    args: vec![Operand::X(0)],
+                    dst: Operand::X(0),
+                },
+                Instr::Label(Label(3)),
+                Instr::Return,
+            ],
+            Vec::new(),
+        );
+        let labels = build_label_map(&module);
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let err = machine
+            .step_instruction(&module, &labels, 0, 1, &mut ctx)
+            .unwrap_err();
+        match err {
+            BeamError::Raise(raise) => assert_eq!(
+                raise.reason.as_atom(),
+                Some("unsupported_opcode: call: import out of range")
+            ),
+            other => panic!("expected the typed import error, got {other:?}"),
+        }
+
+        // (b) The operand is beyond the register file: a typed `BadArg`.
+        let module = gc_bif_module(Label(3), vec![Operand::X(crate::machine::MAX_REGISTER)]);
+        let labels = build_label_map(&module);
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        assert!(matches!(
+            machine.step_instruction(&module, &labels, 0, 1, &mut ctx),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// A genuine **BIF** error *is* a guard failure: it branches to the live fail
+    /// label, or raises when there is none. (`MinimalContext::new()` rejects every
+    /// BIF; `Label(3)` is code offset 2 of the only function.)
+    #[test]
+    fn gc_bif_bif_error_follows_the_fail_label_or_raises() {
+        let module = gc_bif_module(Label(3), vec![Operand::X(0)]);
+        let labels = build_label_map(&module);
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        assert_eq!(
+            machine
+                .step_instruction(&module, &labels, 0, 1, &mut ctx)
+                .unwrap(),
+            Step::Goto { func: 0, pc: 2 }
+        );
+
+        let module = gc_bif_module(NO_FAIL, vec![Operand::X(0)]);
+        let labels = build_label_map(&module);
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        assert!(machine
+            .step_instruction(&module, &labels, 0, 1, &mut ctx)
+            .is_err());
+    }
+
+    /// An arity above [`STACK_ARGS`] takes the heap fallback; every operand must
+    /// still arrive, in order.
+    #[test]
+    fn gc_bif_beyond_stack_args_uses_the_vec_fallback() {
+        const N: usize = STACK_ARGS + 1;
+        let module = gc_bif_module(NO_FAIL, (0..N as u32).map(Operand::X).collect());
+        let labels = build_label_map(&module);
+        let mut machine = Machine::new();
+        for i in 0..N as u32 {
+            machine.set_x(i, make_small(100 + i as i64)).unwrap();
+        }
+        let mut ctx = MinimalContext::with_bif_hook(Box::new(|m, f, a, args| {
+            assert_eq!((m, f, a), ("erlang", "f", N as u32));
+            assert_eq!(args.len(), N);
+            for (i, arg) in args.iter().enumerate() {
+                assert_eq!(beam_term::signed_value(*arg), 100 + i as i64);
+            }
+            Ok(args[N - 1])
+        }));
+
+        assert_eq!(
+            machine
+                .step_instruction(&module, &labels, 0, 1, &mut ctx)
+                .unwrap(),
+            Step::Next
+        );
+        assert_eq!(machine.x(N as u32), Some(make_small(100 + N as i64 - 1)));
+    }
+
+    #[test]
     fn resolve_label_of_a_missing_label_is_a_typed_error() {
         let (module, _) = module_with_function(vec![Instr::Return], Vec::new());
         assert!(resolve_label(&module, Label(99)).is_err());
