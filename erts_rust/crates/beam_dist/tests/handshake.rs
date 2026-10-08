@@ -14,7 +14,7 @@ use beam_dist::flags::{
 };
 use beam_dist::handshake::{
     check_mandatory, preferred_flags, verify_digest, Challenge, ChallengeAck, ChallengeDigest,
-    ChallengeReply, Complement, Name, Status, CHALLENGE_ACK_TAG, CHALLENGE_REPLY_TAG,
+    ChallengeReply, Complement, Name, Status, StatusKind, CHALLENGE_ACK_TAG, CHALLENGE_REPLY_TAG,
     CHALLENGE_TAG, COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
 };
 use beam_dist::transport::Write;
@@ -261,6 +261,80 @@ fn status_error_roundtrip() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// StatusKind classification.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_kind_classifies_every_documented_code() -> Result<()> {
+    // The status codes the OTP distribution guide defines
+    // (`erts/doc/guides/erl_dist_protocol.md:533-575`), each with the text a real
+    // node sends (`lib/kernel/src/dist_util.erl` `send_status` calls).
+    assert_eq!(Status::Ok.kind(), StatusKind::Ok);
+    assert_eq!(Status::Simultaneous.kind(), StatusKind::Simultaneous);
+    assert_eq!(
+        Status::Named { name: b"gurka@localhost".to_vec(), creation: 3 }.kind(),
+        StatusKind::Named
+    );
+    assert_eq!(Status::Error(b"nok".to_vec()).kind(), StatusKind::Nok);
+    assert_eq!(Status::Error(b"not_allowed".to_vec()).kind(), StatusKind::NotAllowed);
+    assert_eq!(Status::Error(b"alive".to_vec()).kind(), StatusKind::Alive);
+    // The step-3B `"true"`/`"false"` replies, an unknown code, and the empty text
+    // all classify as `Other` — including `no_creation`/`system_limit`, which this
+    // OTP release never sends as a status (`dist_util.erl:593` raises the latter
+    // locally).
+    assert_eq!(Status::Error(b"true".to_vec()).kind(), StatusKind::Other);
+    assert_eq!(Status::Error(b"false".to_vec()).kind(), StatusKind::Other);
+    assert_eq!(Status::Error(b"system_limit".to_vec()).kind(), StatusKind::Other);
+    assert_eq!(Status::Error(Vec::new()).kind(), StatusKind::Other);
+
+    // The classification is chosen by the wire text, so it survives a
+    // decode round-trip for every dedicated variant.
+    let cases = [
+        (Status::Ok, StatusKind::Ok),
+        (Status::Simultaneous, StatusKind::Simultaneous),
+        (
+            Status::Named { name: b"n@h".to_vec(), creation: 9 },
+            StatusKind::Named,
+        ),
+        (Status::Error(b"nok".to_vec()), StatusKind::Nok),
+        (Status::Error(b"not_allowed".to_vec()), StatusKind::NotAllowed),
+        (Status::Error(b"alive".to_vec()), StatusKind::Alive),
+        (Status::Error(b"alive?".to_vec()), StatusKind::Other),
+    ];
+    for (status, kind) in cases {
+        let bytes = body(|w| status.encode(w));
+        assert_eq!(Status::decode(&bytes)?.kind(), kind, "decoded {status:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn error_kind_is_none_only_for_the_continuing_statuses() {
+    // `dist_util.erl:1081-1082` continues the handshake after each of these.
+    assert_eq!(Status::Ok.error_kind(), None);
+    assert_eq!(Status::Simultaneous.error_kind(), None);
+    assert_eq!(Status::Named { name: Vec::new(), creation: 0 }.error_kind(), None);
+
+    assert_eq!(Status::Error(b"nok".to_vec()).error_kind(), Some(StatusKind::Nok));
+    assert_eq!(
+        Status::Error(b"not_allowed".to_vec()).error_kind(),
+        Some(StatusKind::NotAllowed)
+    );
+    assert_eq!(Status::Error(b"alive".to_vec()).error_kind(), Some(StatusKind::Alive));
+    assert_eq!(Status::Error(b"bogus".to_vec()).error_kind(), Some(StatusKind::Other));
+}
+
+#[test]
+fn refusal_constructors_match_the_reference_texts() -> Result<()> {
+    // The two refusal texts a real accepting node sends (`dist_util.erl:286`/`:343`).
+    assert_eq!(body(|w| Status::nok().encode(w)), b"snok");
+    assert_eq!(body(|w| Status::not_allowed().encode(w)), b"snot_allowed");
+    assert_eq!(Status::nok().kind(), StatusKind::Nok);
+    assert_eq!(Status::not_allowed().kind(), StatusKind::NotAllowed);
+    assert_eq!(Status::decode(b"snot_allowed")?, Status::not_allowed());
+    Ok(())
+}
 // ---------------------------------------------------------------------------
 // Negatives: wrong tag, truncation, empty body.
 // ---------------------------------------------------------------------------

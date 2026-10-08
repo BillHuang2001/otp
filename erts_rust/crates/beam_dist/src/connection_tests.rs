@@ -271,6 +271,123 @@ fn server_rejects_a_bad_reply_digest() {
     ));
 }
 
+#[test]
+fn server_refuses_bad_flags_and_tells_the_peer() {
+    // Both a totally empty flag word and one that is missing just the OTP-23+
+    // handshake marker (`DFLAG_HANDSHAKE_23`, the v6 version gate inside
+    // `DFLAG_DIST_MANDATORY`) fail `check_mandatory`.
+    let bad_flag_words = [
+        DistFlags::EMPTY,
+        DistFlags::from_bits(crate::flags::DFLAG_DIST_MANDATORY & !crate::flags::DFLAG_HANDSHAKE_23),
+    ];
+    for flags in bad_flag_words {
+        let mut input = framed(
+            &encoded(|w| Name { flags, creation: 3, name: CLIENT.to_vec() }.encode(w)),
+            HANDSHAKE_FRAMING,
+        );
+        // A pipelined `ChallengeReply` must never be read: the server stops after
+        // the `Name` it refused.
+        input.extend(framed(
+            &encoded(|w| ChallengeReply { challenge: 1, digest: [0u8; 16] }.encode(w)),
+            HANDSHAKE_FRAMING,
+        ));
+
+        let mut transport = MemoryTransport::with_input(input);
+        let err = accept_server_with(&mut transport, SERVER, COOKIE, 1, 42).unwrap_err();
+        assert!(
+            matches!(err, BeamError::BadArg),
+            "the refusal is the mandatory-flag error for {flags:?}: {err:?}"
+        );
+
+        // The peer is notified *before* the function returns: exactly one frame, the
+        // `not_allowed` status a real accepting node sends (`dist_util.erl:286`).
+        let mut output = MemoryTransport::with_input(transport.into_written());
+        let frame = read_handshake_frame(&mut output);
+        assert_eq!(frame, b"snot_allowed", "for flags {flags:?}");
+        let decoded = Status::decode(&frame).unwrap();
+        assert_eq!(decoded, Status::not_allowed());
+        assert_eq!(decoded.kind(), StatusKind::NotAllowed);
+        assert_eq!(decoded.error_kind(), Some(StatusKind::NotAllowed));
+        assert_eq!(output.input_remaining(), 0, "the refusal is the only frame written");
+    }
+}
+
+#[test]
+fn server_does_not_notify_the_peer_on_a_bad_digest() {
+    // Ground truth: `recv_challenge_reply` on a bad cookie shuts the link down
+    // *without* a status (`dist_util.erl:1006`), so the acceptor must not invent
+    // one either — the only refusal it announces is the flag-gate one.
+    let mut input = framed(
+        &encoded(|w| {
+            Name { flags: preferred_flags(), creation: 9, name: CLIENT.to_vec() }.encode(w)
+        }),
+        HANDSHAKE_FRAMING,
+    );
+    input.extend(framed(
+        &encoded(|w| ChallengeReply { challenge: 3, digest: [0xffu8; 16] }.encode(w)),
+        HANDSHAKE_FRAMING,
+    ));
+    let mut transport = MemoryTransport::with_input(input);
+    assert!(accept_server_with(&mut transport, SERVER, COOKIE, 1, 42).is_err());
+    // `Status::Ok` + `Challenge` were written first; a third frame would be a status.
+    let mut output = MemoryTransport::with_input(transport.into_written());
+    assert_eq!(Status::decode(&read_handshake_frame(&mut output)).unwrap(), Status::Ok);
+    assert!(Challenge::decode(&read_handshake_frame(&mut output)).is_ok());
+    assert_eq!(output.input_remaining(), 0, "no status is sent after a bad digest");
+}
+
+#[test]
+fn server_rejects_a_non_name_first_frame_without_a_status() {
+    // A first frame whose tag is not `'N'` is dropped silently, matching
+    // `dist_util.erl:749-750` (`recv_name` → `?shutdown2({no_node, Socket}, …)`).
+    let mut transport =
+        MemoryTransport::with_input(framed(&[b'Z', 1, 2, 3, 4, 5, 6, 7, 8], HANDSHAKE_FRAMING));
+    assert!(matches!(
+        accept_server_with(&mut transport, SERVER, COOKIE, 1, 42),
+        Err(BeamError::BadArg)
+    ));
+    assert!(transport.into_written().is_empty(), "nothing is written for a bogus tag");
+}
+
+#[test]
+fn client_maps_every_status_kind_to_a_typed_error() {
+    let cases: [(Status, std::io::ErrorKind, &str); 6] = [
+        (Status::nok(), std::io::ErrorKind::ConnectionRefused, "nok"),
+        (Status::not_allowed(), std::io::ErrorKind::PermissionDenied, "not_allowed"),
+        (Status::Error(b"alive".to_vec()), std::io::ErrorKind::ConnectionAborted, "alive"),
+        (
+            Status::Named { name: SERVER.to_vec(), creation: 7 },
+            std::io::ErrorKind::AlreadyExists,
+            "named",
+        ),
+        (Status::Simultaneous, std::io::ErrorKind::ConnectionAborted, "ok_simultaneous"),
+        (Status::Error(b"what_is_this".to_vec()), std::io::ErrorKind::InvalidData, "what_is_this"),
+    ];
+    for (status, kind, needle) in cases {
+        let input = framed(&encoded(|w| status.encode(w)), HANDSHAKE_FRAMING);
+        let mut transport = MemoryTransport::with_input(input);
+        match connect_client_with(&mut transport, CLIENT, COOKIE, 1).unwrap_err() {
+            BeamError::Io(io) => {
+                assert_eq!(io.kind(), kind, "wrong io kind for {status:?}");
+                assert!(
+                    io.to_string().contains(needle),
+                    "the message must name the status ({needle}): {io}"
+                );
+            }
+            other => panic!("expected Io for {status:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn client_rejects_a_bogus_status_tag() {
+    // A status frame whose tag is not `'s'` is protocol garbage: `BadArg`, promptly.
+    let mut transport = MemoryTransport::with_input(framed(&[b'Z', b'o', b'k'], HANDSHAKE_FRAMING));
+    assert!(matches!(
+        connect_client_with(&mut transport, CLIENT, COOKIE, 1),
+        Err(BeamError::BadArg)
+    ));
+}
 // -----------------------------------------------------------------------
 // Established-connection framing: header, pass-through, tick, fragments.
 // -----------------------------------------------------------------------

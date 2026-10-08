@@ -15,17 +15,23 @@
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use beam_alloc::Heap;
 use beam_codec::{AtomEncoding, ATOM_CACHE_REF_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT};
 use beam_common::BeamError;
-use beam_dist::connection::{Connection, TcpListener as DistListener, TcpTransport};
+use beam_dist::connection::{
+    accept_server, connect_to_node, Connection, TcpListener as DistListener, TcpTransport,
+};
 use beam_dist::dist_header::{DistHeader, DIST_FRAG_HEADER, DIST_HEADER};
-use beam_dist::flags::Dop;
+use beam_dist::flags::{DistFlags, Dop};
 use beam_dist::fragment::DIST_FRAGMENT_SIZE;
-use beam_dist::transport::{Read, Write};
-use beam_dist::{check_mandatory, preferred_flags};
+use beam_dist::handshake::{Name, Status, StatusKind};
+use beam_dist::transport::{MemoryTransport, Read, Write};
+use beam_dist::{
+    check_mandatory, preferred_flags, read_packet, write_packet, EpmdClient, PacketHeaderSize,
+    Port2Resp,
+};
 use beam_term::prelude::{atom_val, make_atom, make_small, Eterm, NIL};
 use beam_term::AtomTable;
 
@@ -674,4 +680,150 @@ fn the_typed_send_helpers_round_trip_over_the_listener() {
     let got = server.recv(&mut server_heap, &mut atoms).expect("recv DOP_DEMONITOR_P");
     assert_eq!(got.dop, Dop::DemonitorP);
     assert_eq!(got.terms, vec![from, to, reference]);
+}
+
+// ---------------------------------------------------------------------------
+// (i) The handshake's ERROR paths, over a real loopback socket.
+//
+// A refusing acceptor must *tell the peer* before dropping the link, otherwise
+// the connecting node blocks forever waiting for a status frame that never comes
+// (`dist_util.erl:286` replies `not_allowed`). The client's finite read timeout
+// ([`TEST_TIMEOUT`]) turns a missing notification into a failed assertion rather
+// than a hung suite.
+// ---------------------------------------------------------------------------
+
+/// Sends a raw 2-byte-framed handshake message body to `transport` and flushes.
+fn send_handshake_body(transport: &mut TcpTransport, body: &[u8]) {
+    write_packet(transport, PacketHeaderSize::Two, body).expect("write the handshake frame");
+    transport.flush().expect("flush the handshake frame");
+}
+
+/// Encodes a handshake message body through its own codec.
+fn encode_body<F>(encode: F) -> Vec<u8>
+where
+    F: FnOnce(&mut MemoryTransport) -> beam_common::Result<()>,
+{
+    let mut sink = MemoryTransport::new();
+    encode(&mut sink).expect("encode a valid handshake body");
+    sink.into_written()
+}
+
+#[test]
+fn a_refusing_acceptor_notifies_the_peer_instead_of_hanging_it() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+
+    // The acceptor: a `Name` whose flag word is empty fails the mandatory check
+    // (the v6 version gate), so it must reply `not_allowed` and then error.
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().map_err(BeamError::Io)?;
+        let mut transport = TcpTransport::from_stream(stream);
+        transport.set_read_timeout(Some(TEST_TIMEOUT))?;
+        accept_server(&mut transport, SERVER_NAME, COOKIE, SERVER_CREATION)
+    });
+
+    let mut client = TcpTransport::connect(&addr.to_string()).expect("connect to server");
+    client.set_read_timeout(Some(TEST_TIMEOUT)).expect("read timeout");
+    send_handshake_body(
+        &mut client,
+        &encode_body(|w| {
+            Name { flags: DistFlags::EMPTY, creation: 0, name: CLIENT_NAME.to_vec() }.encode(w)
+        }),
+    );
+
+    // The notification must arrive promptly — a timeout here is the regression.
+    let frame = read_packet(&mut client, PacketHeaderSize::Two)
+        .expect("the refused peer must receive a status frame, not block");
+    assert_eq!(frame, b"snot_allowed");
+    let status = Status::decode(&frame).expect("decode the refusal status");
+    assert_eq!(status.kind(), StatusKind::NotAllowed);
+    assert_eq!(status.error_kind(), Some(StatusKind::NotAllowed));
+
+    let outcome = server.join().expect("server thread");
+    assert!(
+        matches!(outcome, Err(BeamError::BadArg)),
+        "the acceptor must refuse the empty flag word with BadArg"
+    );
+}
+
+#[test]
+fn a_bogus_handshake_tag_is_rejected_without_a_hang() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().map_err(BeamError::Io)?;
+        let mut transport = TcpTransport::from_stream(stream);
+        transport.set_read_timeout(Some(TEST_TIMEOUT))?;
+        accept_server(&mut transport, SERVER_NAME, COOKIE, SERVER_CREATION)
+    });
+
+    let mut client = TcpTransport::connect(&addr.to_string()).expect("connect to server");
+    client.set_read_timeout(Some(TEST_TIMEOUT)).expect("read timeout");
+    // A first frame that is not a `Name`: the acceptor drops the link, matching
+    // `dist_util.erl:749-750` (`?shutdown2({no_node, Socket}, …)`).
+    send_handshake_body(&mut client, b"not-a-name");
+
+    let outcome = server.join().expect("server thread");
+    assert!(
+        matches!(outcome, Err(BeamError::BadArg)),
+        "a bogus tag must be a typed error, not a hang"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (j) `epmd not_registered`: `connect_to_node` surfaces the lookup failure.
+// ---------------------------------------------------------------------------
+
+/// A node name that cannot be registered with `epmd` in this run (unique per
+/// process and per attempt), so the `not_registered` path is exercised.
+fn unregistered_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("t2a1185-nobody-{}-{nanos}", std::process::id())
+}
+
+#[test]
+fn connect_to_a_node_not_registered_with_epmd_reports_not_found() {
+    let name = unregistered_name();
+
+    // The `epmd` client is owned by `src/epmd.rs`; what this crate's connect path
+    // relies on is that `lookup_port` maps a `PORT2_RESP` error result to
+    // `Io(NotFound)` — never a panic and never a silent port `0`.
+    match beam_dist::epmd::lookup_port(name.as_bytes()) {
+        Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // No reachable `epmd` in this sandbox: skip loudly, never a faked pass.
+        Err(BeamError::Io(err)) => {
+            eprintln!("skipping: no reachable epmd ({err}); not_registered untested");
+            return;
+        }
+        Ok(port) => panic!("the freshly generated name {name:?} must not be registered ({port})"),
+        Err(other) => panic!("unexpected lookup error: {other:?}"),
+    }
+
+    // `connect_to_node` returns that very error, before opening any socket.
+    match connect_to_node("127.0.0.1", name.as_bytes(), CLIENT_NAME, COOKIE) {
+        Err(BeamError::Io(err)) => assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "connect_to_node must surface the epmd not_registered mapping"
+        ),
+        Ok(_) => panic!("a node that is not registered must not connect"),
+        Err(other) => panic!("unexpected connect error: {other:?}"),
+    }
+}
+
+#[test]
+fn an_epmd_error_reply_decodes_to_the_not_registered_path() {
+    // Hermetic companion to the live test above: `epmd` answers an unknown name
+    // with a `PORT2_RESP` carrying a non-zero result byte, which the codec decodes
+    // to `Port2Resp::Error` — the exact value `epmd::lookup_port` (and therefore
+    // `connect_to_node`) turns into `Io(NotFound)`. The reply bytes come from the
+    // `epmd` codec itself, so no live `epmd` is needed.
+    let mut sink = MemoryTransport::new();
+    Port2Resp::Error.encode(&mut sink).expect("encode the failure reply");
+    let mut client = EpmdClient::new(MemoryTransport::with_input(sink.into_written()));
+    assert_eq!(client.port_please(b"nobody").expect("decode the reply"), Port2Resp::Error);
 }
