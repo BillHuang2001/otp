@@ -42,6 +42,7 @@ MODULES= \
 	beam_ssa_fbip_SUITE \
 	beam_ssa_fus_SUITE \
 	beam_ssa_loop_opt_SUITE \
+	beam_ssa_opt_equiv_SUITE \
 	ssa_opt_budget_SUITE \
 	beam_type_SUITE \
 	beam_types_SUITE \

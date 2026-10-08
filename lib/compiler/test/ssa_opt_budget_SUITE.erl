@@ -215,16 +215,36 @@ real_module_budget_equivalence(Config) ->
     check_behaviour(Builds),
     ok.
 
-%% The path of this suite's source, valid both when running under Common
-%% Test (cwd = this directory) and when the callbacks are driven from a
-%% driver started in the repository root.
+%% The path of this suite's source.
+%%
+%% It cannot rely on the current working directory: Common Test runs a test
+%% case with the cwd set to its log directory, and `?FILE' is only usable if
+%% the suite happened to be compiled with a path that is still valid there.
+%% The primary candidate is therefore derived from the loaded module itself:
+%% `code:which(?MODULE)' is the compiled suite's `.beam' (the harness
+%% compiles the suites into the test directory, next to their sources), so
+%% the source is the same basename with an `.erl' extension in the beam's
+%% directory. If the beam is not a regular file (preloaded or a stale beam)
+%% the compile-time and repo-root-relative forms are tried as fallbacks,
+%% which is what makes this work when the callbacks are driven directly from
+%% a driver started in the repository root.
 suite_source() ->
-    Candidates = [?FILE, "test/" ++ filename:basename(?FILE),
-                  "lib/compiler/test/" ++ filename:basename(?FILE)],
+    Candidates = suite_source_candidates(),
     case [F || F <- Candidates, filelib:is_regular(F)] of
         [F|_] -> F;
         [] -> ct:fail({no_suite_source, Candidates})
     end.
+
+suite_source_candidates() ->
+    Base = atom_to_list(?MODULE) ++ ".erl",
+    FromBeam =
+        case code:which(?MODULE) of
+            Beam when is_list(Beam) ->
+                [filename:join(filename:dirname(Beam), Base)];
+            _ ->
+                []
+        end,
+    FromBeam ++ [?FILE, "test/" ++ Base, "lib/compiler/test/" ++ Base].
 
 %%============================================================================
 %% Checking helpers
