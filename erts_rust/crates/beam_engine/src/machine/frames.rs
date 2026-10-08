@@ -48,6 +48,7 @@ pub(crate) struct Frame {
 impl Machine {
     /// Read Y slot `k` of the **current** frame, or `None` if there is no frame or
     /// `k` is outside the frame's Y slots.
+    #[inline]
     pub(crate) fn y(&self, k: u32) -> Option<Eterm> {
         let frame = self.frames.last()?;
         if k >= frame.y_count {
@@ -60,6 +61,7 @@ impl Machine {
     ///
     /// Returns [`crate::error::bad_register`] if there is no frame or `k` is
     /// outside the frame's Y slots.
+    #[inline]
     pub(crate) fn set_y(&mut self, k: u32, v: Eterm) -> Result<()> {
         let (y_base, y_count) = match self.frames.last() {
             Some(frame) => (frame.y_base, frame.y_count),
@@ -78,16 +80,19 @@ impl Machine {
     }
 
     /// The number of call frames currently on the frame stack.
+    #[inline]
     pub fn frame_depth(&self) -> usize {
         self.frames.len()
     }
 
     /// The number of words currently on the Erlang stack.
+    #[inline]
     pub fn stack_depth(&self) -> usize {
         self.stack.len()
     }
 
     /// The current frame's continuation.
+    #[inline]
     pub(crate) fn continuation(&self) -> Result<Continuation> {
         match self.frames.last() {
             Some(frame) => Ok(frame.continuation),
@@ -96,6 +101,7 @@ impl Machine {
     }
 
     /// Overwrite the current frame's continuation-pointer slot.
+    #[inline]
     pub(crate) fn set_continuation(&mut self, continuation: Continuation) -> Result<()> {
         match self.frames.last_mut() {
             Some(frame) => {
@@ -107,15 +113,23 @@ impl Machine {
     }
 
     /// The halted frame's result: `x(0)`.
+    #[inline]
     pub(crate) fn finish(&self) -> Result<Eterm> {
         self.x(0).ok_or_else(|| error::bad_register(0))
     }
 
     /// Push a frame reserving `y_count` Y slots (above the continuation-pointer slot).
+    ///
+    /// A zero-Y frame (the bottom frame `[`Machine::run_label_outcome`] pushes, and
+    /// every frame-less function entry) skips the stack `resize` entirely: the
+    /// stack length is already the frame's `y_base`, so there is nothing to write.
+    #[inline]
     pub(crate) fn push_frame(&mut self, y_count: u32) -> Result<()> {
         let y_base = self.stack.len();
-        self.stack
-            .resize(y_base + y_count as usize, Eterm::default());
+        if y_count != 0 {
+            self.stack
+                .resize(y_base + y_count as usize, Eterm::default());
+        }
         self.frames.push(Frame {
             continuation: Continuation::Halt,
             y_base,
@@ -125,6 +139,7 @@ impl Machine {
     }
 
     /// Pop the innermost frame (and its Y slots).
+    #[inline]
     pub(crate) fn pop_frame(&mut self) -> Result<()> {
         match self.frames.pop() {
             Some(frame) => {
@@ -139,6 +154,7 @@ impl Machine {
     ///
     /// Used by `deallocate`/`call_last`/`call_ext_last`; a mismatched size is a
     /// typed error, never a silent stack corruption.
+    #[inline]
     pub(crate) fn pop_frame_checked(&mut self, n: u32) -> Result<()> {
         let y_count = match self.frames.last() {
             Some(frame) => frame.y_count,
@@ -161,6 +177,7 @@ impl Machine {
     ///
     /// The frame keeps `y_count - N` slots and its `y_base` is unchanged; only the
     /// innermost frame's slots (the tail of the stack) are affected.
+    #[inline]
     pub(crate) fn trim(&mut self, n: u32) -> Result<()> {
         let n_usize = n as usize;
         let (y_base, y_count) = match self.frames.last() {
@@ -190,6 +207,7 @@ impl Machine {
     /// Ensure `heap_need` heap words are available, handing the context the exact
     /// root set (`x[0..live)` plus the whole stack) so a Stage-4 collector can move
     /// terms in place.
+    #[inline]
     pub(crate) fn ensure_heap(
         &mut self,
         heap_need: u32,

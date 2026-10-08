@@ -25,6 +25,12 @@ use crate::terms;
 /// (`make_atom`), `Nil` (`NIL`) and `Literal(idx)` (the running module's decoded
 /// static literal via [`Machine::literal`]). `Label`/`List`/`Allocation` are the
 /// documented Milestone-1 gaps and return a typed error.
+///
+/// `#[inline]`-marked: it is called several times per interpreted instruction and
+/// the crate is built in many codegen units, so the hint is what lets the register
+/// arms collapse into the dispatch loop's own unit (a register read/write then
+/// costs a bounds check, not a call).
+#[inline]
 pub(crate) fn read_operand(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
@@ -55,6 +61,7 @@ pub(crate) fn read_operand(
 /// Supported for `X(n)`/`Y(n)`/`Typed{reg,..}`/`FloatReg(n)`; anything else is a
 /// typed error. A `Literal` is never a valid destination: it names a term in the
 /// module's immutable literal area, which has no addressable slot.
+#[inline]
 pub(crate) fn write_operand(machine: &mut Machine, operand: &Operand, value: Eterm) -> Result<()> {
     match operand {
         Operand::X(n) => machine.set_x(*n, value),
@@ -67,6 +74,7 @@ pub(crate) fn write_operand(machine: &mut Machine, operand: &Operand, value: Ete
 }
 
 /// Read the term in register `reg` (the shared `X`/`Y`/`Typed` body).
+#[inline]
 fn read_register(machine: &Machine, reg: Reg) -> Result<Eterm> {
     match reg {
         Reg::X(n) => machine.x(n).ok_or_else(|| error::bad_register(n)),
@@ -75,6 +83,7 @@ fn read_register(machine: &Machine, reg: Reg) -> Result<Eterm> {
 }
 
 /// Write `value` into register `reg` (the shared `X`/`Y`/`Typed` body).
+#[inline]
 fn write_register(machine: &mut Machine, reg: Reg, value: Eterm) -> Result<()> {
     match reg {
         Reg::X(n) => machine.set_x(n, value),

@@ -197,6 +197,7 @@ impl Machine {
     /// module's `LitT` table. Delegates to
     /// [`beam_loader::LiteralArea::get`] — the single source of truth for a
     /// literal index.
+    #[inline]
     pub fn literal(&self, index: u32) -> Option<Eterm> {
         self.literals.as_ref()?.get(index)
     }
