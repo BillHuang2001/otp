@@ -357,6 +357,16 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   `driver_queues.rs` (+`driver_queues.c`), `driver_pdl.rs` (+`driver_pdl.c`), `driver_threads.rs`
   (+`driver_threads.c`), `driver_binary_refc.rs` (+`driver_binary_refc.c` — the dual `driver_init`/
   `nif_init` fixture shared with the oracle run, below).
+- **`tests/abi_conformance.rs` — the mechanical gap guard (the frozen C-ABI surface).** At test time
+  it parses the real headers (`erl_nif_api_funcs.h`'s `ERL_NIF_API_FUNC_DECL` list; `erl_driver.h`'s
+  `EXTERN` declarations) applying the headers' own gating (the four `#if SIZEOF_LONG != 8` `enif_*64`
+  entries do not exist on LP64; the `erl_drv_steal_main_thread*` pair is `__DARWIN__`-only), and
+  asserts **set equality** against the crate's `#[no_mangle]` definitions plus `csrc/nif_variadic.c`.
+  It further asserts that the `ErlNifApi`/`ErlDrvApi` **field order and counts equal the header
+  declaration order** (a transposed slot is an ABI break) and that **every word of
+  `enif_api_table()`/`driver_api_table()` is populated**. A new header declaration with no crate
+  definition FAILS the test; `KNOWN_UNIMPLEMENTED` is an explicit (currently empty) allowlist so a
+  deferral must be named with a reason, never silently accepted.
 - **Oracle cross-checks that really run** (they skip loudly if `erl`/`erlc`/`cc` are absent):
   `nif_threads.rs` loads the *same* fixture `.so` from the system Erlang and compares the printed
   tuple (excluding `thread_type/0`, the documented scheduler deviation); `nif_mapiter.rs`'s
