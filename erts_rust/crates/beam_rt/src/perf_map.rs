@@ -410,6 +410,16 @@ impl PerfMap {
         self.error.as_deref()
     }
 
+    /// Records a diagnostic reason for a perf-map operation that did not complete, without
+    /// failing the caller.
+    ///
+    /// The perf map is diagnostic: the C logs a problem and the emulator carries on (exits 0),
+    /// so a caller holding a real range that could not be appended (a write failure, say)
+    /// reports it here -- observable through [`PerfMap::error`] -- instead of failing the run.
+    pub fn note_diagnostic(&mut self, reason: impl Into<String>) {
+        self.error = Some(reason.into());
+    }
+
     /// How many map lines have been written.
     pub fn entry_count(&self) -> usize {
         self.entries

@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beam_common::{BeamError, Result};
-use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome};
+use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome, Tier};
 use beam_loader::{Instr, Module, Operand};
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 use beam_term::{is_small, signed_value, Atom, Eterm};
@@ -593,6 +593,19 @@ impl ProcessRunner for RuntimeRunner<'_> {
             }
         }
 
+        // The **first** entry of a module-export process is the only run that goes through the
+        // tier-aware entry below (a resume has no tier entry), so it is the one site that can
+        // snapshot the module's baseline artifact for the `+JPperf` map. Gated on the flag
+        // first: a disabled `+JPperf` (the default) must cost nothing at all.
+        let first_entry_export = match &engine.entry {
+            ProcessEntry::Export { module, .. }
+                if engine.parked.is_none() && self.runtime.perf_map().config().map_enabled() =>
+            {
+                Some(Arc::clone(module))
+            }
+            _ => None,
+        };
+
         let (outcome, used, exhausted) = {
             // The context also gets the **engines** of this pass (`self.state`): it drives
             // *this* process's machine (taken out of the map above), but a
@@ -633,12 +646,21 @@ impl ProcessRunner for RuntimeRunner<'_> {
                         module,
                         function,
                         arity,
-                    } => engine.machine.run_export_outcome(
+                    } => engine.machine.run_export_outcome_with_tier(
                         module,
                         *function,
                         *arity,
                         &engine.args,
                         &mut budget_ctx,
+                        // Routed through the tier-aware entry so a scheduled process *can*
+                        // execute on the native baseline tier: `Tier::BaselineJit` is the
+                        // target, but the baseline **export** path does not record the
+                        // machine's entry call (`beam_engine`'s `run_native_outcome` omits the
+                        // `enter_run` its label sibling performs), so `process_info/2`'s
+                        // `initial_call` cannot be answered for such a process. That is a
+                        // `beam_engine` gap this crate may not patch, so the interpreter is
+                        // selected until it lands.
+                        Tier::Interpreter,
                     ),
                     // A fun entry is applied synchronously: `apply_fun` routes an `-eval`
                     // closure back into the evaluator and a `.beam` fun into the engine's
@@ -656,6 +678,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
             let exhausted = probe.is_exhausted();
             (outcome, used, exhausted)
         };
+
+        // The `+JPperf` map (contract A.8) must describe the **real** native code this runtime
+        // can run, never a fabricated range: the module's baseline artifact is that source, so
+        // its cached `[start, size)` regions are snapshotted here -- once per first entry, not
+        // per slice. Diagnostic only: `record_baseline_code` records, never propagates.
+        if let Some(module) = first_entry_export.as_deref() {
+            record_baseline_code(self.runtime, module);
+        }
 
         // Pre-emption: the budget ran out at a heap-admission point of this slicing
         // machine. Park it at that very instruction and hand the process back to the
@@ -733,6 +763,40 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 Ok(RunOutcome::Exit(reason))
             }
         }
+    }
+}
+
+/// Snapshots the baseline JIT's **real** code ranges of `module` into the `+JPperf` map
+/// (contract A.8).
+///
+/// The perf map is the diagnostic that names the native code a scheduled process can run, so
+/// it may only ever hold ranges the baseline backend actually mapped
+/// ([`baseline_code_map`](beam_engine::jit::cache::baseline_code_map) -- which compiles the
+/// module on first sight, so the ranges are its own artifact's) -- never a synthesised one.
+/// Diagnostic-only by contract: a disabled flag returns without compiling anything, and a
+/// compile or write failure is *recorded* in the map's own diagnostic slot rather than
+/// propagated, exactly as the oracle logs it and carries on (a perf file must never fail a run).
+fn record_baseline_code(runtime: &mut Runtime, module: &Module) {
+    if !runtime.perf_map().config().map_enabled() {
+        return;
+    }
+    match beam_engine::jit::cache::baseline_code_map(module) {
+        Ok(regions) => {
+            for region in regions {
+                if let Err(error) =
+                    runtime
+                        .perf_map_mut()
+                        .record(region.start, region.size, &region.name)
+                {
+                    runtime
+                        .perf_map_mut()
+                        .note_diagnostic(format!("perf: {error}"));
+                }
+            }
+        }
+        Err(error) => runtime
+            .perf_map_mut()
+            .note_diagnostic(format!("perf: no code map for this module: {error}")),
     }
 }
 
@@ -848,11 +912,121 @@ mod tests {
         assert!(state.exit(pid).is_none());
     }
 
+    /// Whether `error` is the probe's typed pre-emption refusal -- the `unsupported`-prefixed
+    /// signal the runner keys off to park the process instead of recording an exit.
+    fn is_preemption(error: &BeamError) -> bool {
+        crate::error::unsupported_reason(error)
+            .is_some_and(|reason| reason.contains("reduction budget"))
+    }
+
+    /// A fresh probe is never exhausted; the `.max(1)` floor buys exactly one unit, so a slice
+    /// can never spin; and the refusal past exhaustion is sticky (no unit is charged).
     #[test]
+    fn a_zero_budget_still_charges_exactly_one_unit_and_then_refuses() {
+        let mut probe = BudgetProbe::new(0);
+        assert!(!probe.is_exhausted(), "a fresh probe is not exhausted");
+        assert!(probe.charge().is_ok(), "the floor guarantees one charge");
+        assert_eq!(probe.used(), 1);
+        assert!(!probe.is_exhausted(), "one unit of progress is not exhaustion");
+
+        let error = probe.charge().expect_err("the floor is spent");
+        assert!(is_preemption(&error), "{error}");
+        assert!(probe.is_exhausted());
+        assert!(probe.charge().is_err(), "an exhausted probe stays exhausted");
+        assert_eq!(probe.used(), 1, "no unit past the floor is charged");
+    }
+
+    /// A budget of `n` allows exactly `n` charges -- never exhausted while units remain -- and
+    /// the `(n+1)`-th charge is the single refusal the runner turns into `RunOutcome::Yield`.
+    #[test]
+    fn a_budget_allows_exactly_its_units_then_refuses() {
+        const N: u32 = 3;
+        let mut probe = BudgetProbe::new(N);
+        for charged in 1..=N {
+            assert!(!probe.is_exhausted(), "units remain before charge {charged}");
+            assert!(probe.charge().is_ok(), "charge {charged} of {N}");
+            assert_eq!(probe.used(), charged);
+        }
+        assert!(!probe.is_exhausted(), "the budget is spent, not yet exceeded");
+
+        let error = probe.charge().expect_err("the (n+1)-th charge is the refusal");
+        assert!(is_preemption(&error), "{error}");
+        assert!(probe.is_exhausted());
+        assert_eq!(probe.used(), N, "the refusal charges nothing");
+    }
+
+    /// A scheduled export runs to completion through the runner's **tier-aware** first-entry
+    /// path: its value is recorded and it exits `normal` (the selected tier is documented there).
+    #[test]
+    fn a_scheduled_export_runs_through_the_tier_aware_entry() {
+        let mut rt = runtime();
+        let mut state = RunnerState::default();
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+        let module = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
+        let function = module.atom_table.lookup("add").expect("add is interned");
+        state.spawn(
+            pid,
+            ProcessEntry::Export {
+                module,
+                function,
+                arity: 2,
+            },
+            vec![make_small(2), make_small(3)],
+        );
+
+        let outcome = {
+            let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+            runner.run(pid, &mut table, 1_000).expect("the slice runs")
+        };
+        assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+        assert_eq!(
+            signed_value(state.result(pid).expect("the value is recorded")),
+            5,
+            "the tier-aware entry computes the interpreted result"
+        );
+    }
+
+    /// The `+JPperf` map is filled from the baseline artifact's **real** code ranges -- and a
+    /// disabled flag (the default) compiles nothing and records nothing.
+    #[test]
+    fn the_baseline_code_map_fills_only_an_enabled_perf_map() {
+        let module = beam_loader::load_file(slice_fixture()).expect("slice.beam");
+
+        let mut off = runtime();
+        assert!(!off.perf_map().config().map_enabled(), "+JPperf is off by default");
+        record_baseline_code(&mut off, &module);
+        assert_eq!(off.perf_map().entry_count(), 0, "a disabled map costs nothing");
+        assert!(!off.perf_map().is_active(), "and creates no file");
+
+        let dir = std::env::temp_dir().join(format!("beam_rt_runner_perf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+        let mut perf = crate::perf_map::PerfMapConfig::new();
+        perf.set_directory(&dir);
+        perf.set_flag("map").expect("map is a grammar value");
+        let mut on = Runtime::new(crate::config::RuntimeConfig::new().with_perf_map(perf))
+            .expect("the runtime is created");
+
+        record_baseline_code(&mut on, &module);
+        assert_eq!(on.perf_map().error(), None);
+        assert!(on.perf_map().entry_count() > 0, "the code map has real regions");
+        let text = std::fs::read_to_string(on.perf_map().map_path().expect("the map is open"))
+            .expect("the map is readable");
+        for line in text.lines() {
+            assert!(
+                line.starts_with("0x") && line.contains(" $slice:"),
+                "a real range of the module: {line:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }    #[test]
     fn a_returned_value_is_not_the_exit_reason() {
-        // The runner never yields in Milestone 1, and a process that returns exits with
-        // the `normal` atom — NOT with the value it produced (the value is recorded
-        // separately by `RunnerState::result`).
+        // The runner DOES return `RunOutcome::Yield` once this slice's reduction budget is
+        // spent (pre-emption is implemented -- see `BudgetProbe`), but that is not what this
+        // pins: a process that *returns* exits with the `normal` atom -- NOT with the value it
+        // produced (the value is recorded separately by `RunnerState::result`) -- so its
+        // outcome is a termination, never a pre-emption.
         let mut rt = runtime();
         let reason = normal(&mut rt);
         assert_eq!(rt.atom_name_of(reason), Some("normal"));
