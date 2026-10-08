@@ -90,87 +90,41 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 ### `table/mod.rs` — the `Table` handle + ops
 - `pub struct TableId(u64)`: `new(u64)`, `raw(self) -> u64`, `next() -> TableId` (process-global
   monotonic), `Display`. `pub struct OwnerId(u64)`: `new(u64)`, `raw(self) -> u64`.
-- `pub struct Table`: metadata + table-owned `TermStore` + one interior.
-```rust
-impl Table {
-    pub fn new(id: TableId, opts: TableOptions) -> Result<Table>;
-    pub fn with_allocator(id: TableId, opts: TableOptions, alloc: AllocRef) -> Result<Table>;
-    pub fn with_set_interior(id: TableId, opts: TableOptions, interior: SetInterior) -> Result<Table>; // opt-in `set` interior
-    pub fn set_interior(&self) -> SetInterior;   // the selected `set` interior (Champ by default)
-    pub fn with_ordered_interior(id: TableId, opts: TableOptions, interior: OrderedInterior) -> Result<Table>; // opt-in `ordered_set` interior
-    pub fn ordered_interior(&self) -> OrderedInterior; // the selected `ordered_set` interior (BPlusTree by default)
-
-    // metadata
-    pub fn id(&self) -> TableId;
-    pub fn kind(&self) -> TableKind;
-    pub fn name(&self) -> Option<Atom>;      // Some iff a name was recorded (independent of named_table)
-    pub fn keypos(&self) -> usize;           // 1-based
-    pub fn access(&self) -> Access;
-    pub fn owner(&self) -> Option<OwnerId>;
-    pub fn set_owner(&mut self, owner: Option<OwnerId>);
-    pub fn give_away(&mut self, caller: Option<OwnerId>, new_owner: Option<OwnerId>) -> Result<()>;
-    pub fn heir(&self) -> Option<Heir>;
-    pub fn set_heir(&mut self, heir: Option<Heir>);
-    pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()>;
-    pub fn owner_died<F: FnOnce(OwnerId) -> bool>(&mut self, dead: OwnerId, is_alive: F) -> OwnerDeath;
-    pub fn info(&self) -> TableInfo;
-
-    // writes (object = the whole tuple; key derived from keypos)
-    pub fn insert(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()>;
-    pub fn insert_new(&mut self, object: Eterm, atoms: &AtomTable) -> Result<bool>; // false if key exists
-    pub fn insert_list(&mut self, objects: &[Eterm], atoms: &AtomTable) -> Result<()>; // ATOMIC: validates the whole list first
-    pub fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> Result<()>;          // ets:delete/2 (by key)
-    pub fn delete_object(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()>;
-    pub fn delete_all_objects(&mut self);
-
-    // reads
-    pub fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm>;              // 0/1 for set/ordered_set
-    pub fn member(&self, key: Eterm, atoms: &AtomTable) -> bool;
-    pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm>; // scalar; `unsupported` raise for bag/duplicate_bag
-    pub fn lookup_element_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Eterm>; // scalar; absent key ⇒ default, `unsupported` raise for multi kinds
-    pub fn lookup_element_all(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Vec<Eterm>>; // the Pos-th element of EVERY object under key (the multi kinds' list result)
-    pub fn lookup_element_all_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Option<Vec<Eterm>>>; // Ok(None) ⇒ caller yields `default`
-    pub fn memory(&self) -> usize;                                                  // store words + interior words
-    pub fn size(&self) -> usize;                                                    // objects (not keys) for bag/dup_bag
-    pub fn is_empty(&self) -> bool;
-    pub fn tab2list(&self) -> Vec<Eterm>;                                           // ordered for ordered_set
-
-    // element updates
-    pub fn update_counter(&mut self, key: Eterm, update_op: Eterm, atoms: &AtomTable, heap: &mut beam_alloc::Heap) -> Result<Eterm>;
-    pub fn update_counter_with(&mut self, key: Eterm, update_op: Eterm, default: Eterm, atoms: &AtomTable, heap: &mut beam_alloc::Heap) -> Result<Eterm>;
-    pub fn update_element(&mut self, key: Eterm, updates: &[(usize, Eterm)], atoms: &AtomTable, heap: &mut beam_alloc::Heap) -> Result<bool>;
-
-    // navigation (None == '$end_of_table')
-    pub fn first(&self, atoms: &AtomTable) -> Option<Eterm>;
-    pub fn last(&self, atoms: &AtomTable) -> Option<Eterm>;
-    pub fn next(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>>;
-    pub fn prev(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>>;
-    pub fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>>; // copies out + reclaims the stored originals
-
-    // access control
-    pub fn check_read(&self, requester: Option<OwnerId>) -> Result<()>;
-    pub fn check_write(&self, requester: Option<OwnerId>) -> Result<()>;
-    pub fn as_requester(&mut self, requester: Option<OwnerId>) -> TableAccess<'_>;
-
-    // select family (see select/exec.rs; see also the predicate primitive)
-    pub fn select_all(&self, pred: &mut SelectPredicate<'_>) -> Vec<Eterm>;
-    pub fn select(&self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
-    pub fn select_delete(&mut self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
-    pub fn select_count(&self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
-    pub fn match_object(&self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
-    pub fn match_(&self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
-    pub fn match_delete(&mut self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
-    pub fn select_replace(&mut self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
-
-    // limit + continuation forms (see continuation.rs; `Option::None` ⇒ '$end_of_table')
-    pub fn select_limit(&self, spec: &MatchSpec, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn select_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn match_limit(&self, pattern_term: Eterm, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn match_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn match_object_limit(&self, pattern_term: Eterm, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn match_object_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-}
-```
+- `pub struct Table`: metadata + table-owned `TermStore` + one interior. Constructors `new(id, opts)`,
+  `with_allocator(id, opts, alloc)`, `with_set_interior(id, opts, SetInterior)`,
+  `with_ordered_interior(id, opts, OrderedInterior)`; the selected interiors are reported by
+  `set_interior()` (default `Champ`) / `ordered_interior()` (default `BPlusTree`). Full signatures are
+  in `src/table/{mod,read,access,element,ownership,lifecycle}.rs`.
+- **Shape conventions.** Every fallible op returns `beam_common::Result<_>`; `first`/`last`/`next`/`prev`
+  return `Option` (`None` = `'$end_of_table'`). Unless noted an op takes `atoms: &AtomTable` (shared
+  compare/hash); the select/match family and the element updates additionally take `heap: &mut Heap`
+  (scratch space).
+- **Metadata:** `id`, `kind`, `name() -> Option<Atom>` (Some iff a name was recorded — independent of
+  `named_table`), `keypos() -> usize` (1-based), `access`, `owner()/set_owner()`, `heir()/set_heir()`,
+  `give_away(caller, new_owner)`, `setopts(caller, SetOpt)`, `owner_died(dead, is_alive) -> OwnerDeath`,
+  `info() -> TableInfo`.
+- **Writes** (object = the whole tuple; key derived from `keypos`): `insert(object)` (upsert),
+  `insert_new(object) -> bool` (`false` if the key exists), `insert_list(&[object])` (**ATOMIC** —
+  validates the whole list first), `delete(key)`, `delete_object(object)`, `delete_all_objects()`.
+- **Reads:** `lookup(key) -> Vec<Eterm>` (0/1 for set/ordered_set), `member(key) -> bool`,
+  `lookup_element(key, pos)` / `lookup_element_or(key, pos, default)` (scalar; `unsupported` raise for
+  the multi kinds), `lookup_element_all(key, pos) -> Vec<Eterm>` / `lookup_element_all_or(..) ->
+  Option<Vec<Eterm>>` (the multi kinds' list result), `memory() -> usize` (store + interior words),
+  `size() -> usize` (objects, not keys, for bag/dup_bag), `is_empty()`, `tab2list() -> Vec<Eterm>`
+  (ordered for ordered_set).
+- **Element updates:** `update_counter(key, op)`, `update_counter_with(key, op, default)`,
+  `update_element(key, &[(pos, term)]) -> bool`.
+- **Navigation:** `first()`, `last()`, `next(key)`, `prev(key)`, `take(key) -> Vec<Eterm>` (copies out +
+  reclaims the stored originals).
+- **Access control:** `check_read(requester)` / `check_write(requester)` / `as_requester(requester) ->
+  TableAccess<'_>`.
+- **Select family** (see `select/exec.rs`; also the `select_all(pred)` predicate primitive):
+  `select(spec)`, `select_delete(spec) -> usize`, `select_count(spec) -> usize`,
+  `match_object(pattern_term)`, `match_(pattern_term)`, `match_delete(pattern_term) -> usize`,
+  `select_replace(spec) -> usize`.
+- **Limit + continuation forms** (see `continuation.rs`; `Option::None` ⇒ `'$end_of_table'`):
+  `select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/
+  `match_object_continue`, each `-> (Vec<Eterm>, Option<MatchContinuation>)`.
 - `pub struct Heir { pub owner: OwnerId, pub data: Eterm }` and `pub enum OwnerDeath { NotOwner, Deleted, Transferred(Heir) }` (from `lifecycle.rs`) — the owner-death transition (see `table/lifecycle.rs`). `Table::owner_died` takes the process layer's liveness oracle (`FnOnce(OwnerId) -> bool`) because this crate has no process-liveness concept; `Transferred` obliges the runtime to deliver `{'ETS-TRANSFER', Tid, FromPid, data}` and `Deleted` to drop the table — neither is an effect of this crate.
 - `pub fn match_spec_run(list: Eterm, spec: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>` (from `run.rs`) — the table-independent `ets:match_spec_run/2` runner.
 - `pub(crate) trait Interior` — the internal dispatch seam implemented by the two interiors
