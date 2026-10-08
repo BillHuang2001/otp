@@ -380,12 +380,13 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `erl_bif_*.c`, `bif.tab`, `atom.names`). **Read it; never modify it.**
 - The system Erlang toolchain (OTP 29 / erts-17.1) is on `PATH` — `erlc`/`erl`/`escript` are usable
   for producing `.beam` fixtures and as the differential oracle.
-- **Differential-corpus coverage gap (for the `tools/differential` owner):** no case directly exercises the
-  native-record opcode family; none exercises the `func_info` clause-failure path, the structured raise
-  reasons (`case_clause`/`{badkey,_}`/`{badmap,_}`/`{bad_generator,_}`/`{badrecord,_}`/`{badfield,_}`) or
-  bare-atom `undef`; and none pins the port divergences (`port_info`/`port_command`/`open_port`). All are
-  covered only by crate-level tests, so the gate's `mismatch=0` is consistent with them but does not pin
-  them.
+- **Differential-corpus coverage:** the gate pins the native-record opcode family (`records` group), the
+  `func_info` clause-failure path and bare-atom `undef` (`errors` group), the structured raise reasons
+  (`{case_clause,_}`/`{badmap,_}`/`{badkey,_}`/`{bad_generator,_}`/`{try_clause,_}`/`{badrecord,_}`) and
+  the port paths (`driver/open_port_*`, `port_info`, `port_command`). The two remaining shallow contracts
+  are A.5 (the `wire` group covers the ETF codec only — a live handshake / `DOP_*` loopback needs two
+  connected nodes and is not expressible through a single CLI process) and A.9 (boot/version
+  observability only — no self-hosted build).
 
 ## See Also
 - `../CONTEXT.md` → workspace root: the binding cross-crate contracts and routing table.
