@@ -38,6 +38,17 @@
 //! typed [`crate::error::blocked`] — the mailbox only decides *whether* the scan
 //! blocks, never what a blocking run reports.
 //!
+//! ## The execution-trace seam
+//!
+//! The engine reports the `call`/`return_from`/`return_to` event family (contract
+//! A.8) through two **defaulted** methods: [`ExecutionContext::trace_enabled`] (a
+//! cheap gate, `false` out of the box — one predictable branch per call/return
+//! instruction) and [`ExecutionContext::trace_event`] (a no-op out of the box).
+//! The events are the raw ones the engine's own instruction stream produces,
+//! borrowed straight from the running module so a traced run allocates nothing on
+//! the engine's side; the host decides *matching*, exactly as the oracle arms
+//! individual functions with `erlang:trace_pattern/3`.
+//!
 //! [`alloc_words`]: ExecutionContext::alloc_words
 //! [`apply`]: ExecutionContext::apply
 //! [`apply_fun`]: ExecutionContext::apply_fun
@@ -86,6 +97,75 @@ pub trait Mailbox {
 
     /// `recv_marker_clear`: release `reference`'s marker.
     fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()>;
+}
+
+/// One execution-trace event the engine reports to its host (contract A.8).
+///
+/// The engine observes exactly three event shapes from its own instruction
+/// stream — the oracle's
+/// `{trace, Pid, call, {M, F, Args}}`,
+/// `{trace, Pid, return_from, {M, F, A}, Ret}` and
+/// `{trace, Pid, return_to, {M, F, Arity}}` — and hands each one to the host
+/// through [`ExecutionContext::trace_event`] **verbatim**: the host decides
+/// *matching* (which `{M,F,A}` it cares about) and builds the message.
+///
+/// Every name is **borrowed** ([`Module::atom_name`](beam_loader::Module::atom_name)
+/// of the running module, or the per-run import table for a `call_ext*`), and
+/// `args` is a borrowed slice of the callee's `x(0..arity)` registers, so the
+/// engine allocates nothing while reporting and the whole hook stays off the hot
+/// path when [`ExecutionContext::trace_enabled`] is `false`.
+#[derive(Clone, Copy, Debug)]
+pub enum TraceEvent<'a> {
+    /// (a) a function was entered (`call`).
+    ///
+    /// Oracle shape: `{trace, Pid, call, {M, F, Args}}`. The oracle's third tuple
+    /// element is the **argument list** (the `arity` trace flag switches it to the
+    /// bare arity), so the host builds it from `args`; an arity-0 call carries an
+    /// empty `args`.
+    Call {
+        /// The entered module's name.
+        module: &'a str,
+        /// The entered function's name.
+        function: &'a str,
+        /// The entered function's arity (`args.len()`).
+        arity: u32,
+        /// The call's arguments (`x(0..arity)`), in order.
+        args: &'a [Eterm],
+    },
+    /// (b) a call returned to its caller (`return_from`) — the **returning**
+    /// function.
+    ///
+    /// Oracle shape: `{trace, Pid, return_from, {M, F, A}, Ret}`. Note that
+    /// `return_from` is **not** a settable `erlang:trace/3` flag in the oracle: it
+    /// is armed per function by a `{return_trace}` match-spec action, so whether
+    /// this event means anything for a given function is the host's matching
+    /// decision.
+    ReturnFrom {
+        /// The module of the function that returned.
+        module: &'a str,
+        /// The name of the function that returned.
+        function: &'a str,
+        /// Its arity.
+        arity: u32,
+        /// The returned value (`x(0)` at the `return`).
+        value: Eterm,
+    },
+    /// (c) a return to the caller (`return_to`) — the function control returns
+    /// **to**.
+    ///
+    /// Oracle shape: `{trace, Pid, return_to, {M, F, Arity}}` — always the MFA of
+    /// the function at the return address (i.e. the caller), never any arguments.
+    /// A return whose caller is outside the running module (the oracle's
+    /// `return_to undefined`) is **not** reported: the engine can only name a
+    /// module-local caller.
+    ReturnTo {
+        /// The module of the function control returns to.
+        module: &'a str,
+        /// The name of the function control returns to.
+        function: &'a str,
+        /// Its arity.
+        arity: u32,
+    },
 }
 
 /// Everything the engine needs from the runtime (BIF dispatch, heap/GC, limits).
@@ -255,6 +335,46 @@ pub trait ExecutionContext {
     fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
         let _ = reference;
         Err(crate::error::unsupported("receive_marker_clear"))
+    }
+
+    /// Cheap tracing gate: does the host want `call`/`return_from`/`return_to`
+    /// execution-trace events reported for the process currently running?
+    ///
+    /// Consulted **once per run** — the driver that executes instructions latches the
+    /// answer into the `Machine::trace_on` flag and the call/return arms then
+    /// read that plain `bool`, so an untraced run pays one `bool` load per call/return
+    /// instruction rather than a vtable call, and the default `false` builds no event
+    /// data. A run is one entry plus its `resume`s: a host that flips the answer
+    /// **mid-run** sees it take effect at the process's next run entry/resume, not at
+    /// the next instruction. This is the engine's side of the oracle's function-trace
+    /// breakpoints (contract A.8): a host that turns tracing on arms its own
+    /// per-`{M,F,A}` patterns and decides matching in
+    /// [`trace_event`](ExecutionContext::trace_event).
+    ///
+    /// The gate is **not** the oracle's `erlang:trace(Pid, …, [call, return_to])`
+    /// flag set itself — it is the single cheap bit the engine consults before it
+    /// reports anything, so a production context can answer it from a per-process
+    /// trace state without the engine having to know about trace flags.
+    #[inline]
+    fn trace_enabled(&self) -> bool {
+        false
+    }
+
+    /// Report one execution-trace event (contract A.8).
+    ///
+    /// Only called when [`trace_enabled`](ExecutionContext::trace_enabled) returned
+    /// `true`. The host decides **matching** (e.g. a `{M,F,A}` pattern table, the
+    /// way the oracle arms a function with `erlang:trace_pattern/3`) and emits
+    /// nothing for an unmatched function; the engine reports **every** event it
+    /// sees while tracing is on. The default body is a **no-op** — deliberately not
+    /// a typed error: a host that does not trace simply ignores the hook.
+    ///
+    /// Reporting never changes a run's observable behaviour. An event whose names
+    /// cannot be resolved against the running module is **skipped**, never raised,
+    /// and the caller's registers are only read, so a traced run produces the same
+    /// result, raise or suspension as an untraced one.
+    fn trace_event(&mut self, event: TraceEvent<'_>) {
+        let _ = event;
     }
 }
 
@@ -593,8 +713,180 @@ mod tests {
         assert_eq!(ctx.apply("lists", "map", 2, &[]).unwrap(), Eterm::nil());
     }
 
-    // ---- the mailbox / receive seam ---------------------------------------
+    // ---- the execution-trace seam (contract A.8) ---------------------------
 
+    /// A logged [`TraceEvent`] in owned, comparable form (the real event borrows
+    /// the running module and a register slice).
+    #[derive(Debug, PartialEq, Eq)]
+    enum Owned {
+        Call(String, String, u32, usize),
+        ReturnFrom(String, String, u32),
+        ReturnTo(String, String, u32),
+    }
+
+    /// A context overriding only the two trace hooks, so the gate/report split is
+    /// observable without any heap or mailbox machinery.
+    struct TraceHost {
+        enabled: bool,
+        events: std::rc::Rc<std::cell::RefCell<Vec<Owned>>>,
+    }
+
+    impl ExecutionContext for TraceHost {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Err(beam_common::BeamError::BadArg)
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn trace_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn trace_event(&mut self, event: TraceEvent<'_>) {
+            // The test double honours its own gate: a host whose `trace_enabled` is
+            // off records nothing even though it implements the report hook. The engine
+            // also gates (it latches the flag once per run), so a real host is only
+            // asked to report while tracing is on; this guard pins that contract on the
+            // host side too, which is what `trace_gate_is_independent_of_reporting`
+            // asserts.
+            if !self.enabled {
+                return;
+            }
+            self.events.borrow_mut().push(match event {
+                TraceEvent::Call {
+                    module,
+                    function,
+                    arity,
+                    args,
+                } => Owned::Call(module.into(), function.into(), arity, args.len()),
+                TraceEvent::ReturnFrom {
+                    module,
+                    function,
+                    arity,
+                    ..
+                } => Owned::ReturnFrom(module.into(), function.into(), arity),
+                TraceEvent::ReturnTo {
+                    module,
+                    function,
+                    arity,
+                } => Owned::ReturnTo(module.into(), function.into(), arity),
+            });
+        }
+    }
+
+    /// Compiles only because [`TraceEvent`] is `Copy` — the engine hands the host a
+    /// value and keeps reporting, so the event must never be moved out of the
+    /// reporter.
+    fn event_is_copy(event: TraceEvent<'_>) -> (TraceEvent<'_>, TraceEvent<'_>) {
+        (event, event)
+    }
+
+    #[test]
+    fn trace_is_off_and_a_noop_by_default() {
+        let mut ctx = MinimalContext::new();
+        assert!(!ctx.trace_enabled(), "tracing is off by default");
+        // The default `trace_event` is a no-op: it accepts every event and never
+        // panics or raises.
+        let args = [Eterm::nil()];
+        ctx.trace_event(TraceEvent::Call {
+            module: "m",
+            function: "f",
+            arity: 1,
+            args: &args,
+        });
+        ctx.trace_event(TraceEvent::ReturnFrom {
+            module: "m",
+            function: "f",
+            arity: 1,
+            value: Eterm::nil(),
+        });
+        ctx.trace_event(TraceEvent::ReturnTo {
+            module: "m",
+            function: "f",
+            arity: 1,
+        });
+        // A context implementing only the two required methods inherits the same
+        // defaults, so no existing host pays for the hook.
+        assert!(!OnlyRequired.trace_enabled());
+    }
+
+    #[test]
+    fn trace_event_carries_the_borrowed_names_arity_and_args() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut ctx = TraceHost {
+            enabled: true,
+            events: events.clone(),
+        };
+        assert!(ctx.trace_enabled());
+        let args = [Eterm::nil(), Eterm::nil()];
+        // The borrowed names, the arity and the argument count all survive the
+        // hand-off (the host, not the engine, decides matching).
+        let (first, second) = event_is_copy(TraceEvent::Call {
+            module: "lists",
+            function: "reverse",
+            arity: 2,
+            args: &args,
+        });
+        ctx.trace_event(first);
+        ctx.trace_event(second);
+        ctx.trace_event(TraceEvent::ReturnFrom {
+            module: "lists",
+            function: "reverse",
+            arity: 2,
+            value: Eterm::nil(),
+        });
+        ctx.trace_event(TraceEvent::ReturnTo {
+            module: "lists",
+            function: "map",
+            arity: 3,
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                Owned::Call("lists".into(), "reverse".into(), 2, 2),
+                Owned::Call("lists".into(), "reverse".into(), 2, 2),
+                Owned::ReturnFrom("lists".into(), "reverse".into(), 2),
+                Owned::ReturnTo("lists".into(), "map".into(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn trace_gate_is_independent_of_reporting() {
+        // The gate alone decides whether the host is told anything: with it off the
+        // host records nothing even though it implements `trace_event`.
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut ctx = TraceHost {
+            enabled: false,
+            events: events.clone(),
+        };
+        assert!(!ctx.trace_enabled());
+        ctx.trace_event(TraceEvent::ReturnTo {
+            module: "m",
+            function: "f",
+            arity: 0,
+        });
+        assert!(
+            events.borrow().is_empty(),
+            "the gate, not the report, is what an untraced run relies on"
+        );
+    }
+
+    // ---- the mailbox / receive seam ---------------------------------------
     /// The shared call log of a [`LoggingMailbox`].
     type Log = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
 

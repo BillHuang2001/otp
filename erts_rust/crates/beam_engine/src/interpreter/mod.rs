@@ -30,6 +30,7 @@ use crate::error;
 mod bif;
 mod dispatch;
 mod test;
+mod trace;
 #[cfg(test)]
 mod tests;
 

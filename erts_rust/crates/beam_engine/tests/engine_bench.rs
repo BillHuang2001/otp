@@ -58,6 +58,8 @@
 //! | [`bench_ctrl`] | `allocate;jump;` *R*&times;`call;return;` `deallocate;return` | call/return frame discipline |
 //! | [`bench_branch_loop`] | a counted loop: `test` guard + `jump` back-edge | a taken branch (the `test` fail arm) |
 //! | [`bench_tail_loop`] | a tail-recursive loop: `test` guard + `call_only` | tail-call back-edge |
+//! | [`bench_gate_call_return`] | the same `call;return` chain, tracing OFF | the A.8 call/return gate (its disabled path) |
+//! | [`bench_gate_call_only`] | the same `call_only` tail loop, tracing OFF | the A.8 `call_only` gate (its disabled path) |
 //! | [`bench_real_even`] | the committed `tailcall.beam`'s `even/1` | a real `erlc`-compiled recursion |
 //!
 //! Every body is designed so its executed instruction count is known **by
@@ -391,17 +393,21 @@ fn bench_gcbif() -> Report {
     report
 }
 
-/// A **control-flow chain**: `allocate; jump;` then `ROUNDS` &times;
-/// `call(Lsub); label(Lsub); return`, then `deallocate; return`.
+/// The number of `call`/`return` rounds in the chain built by [`ctrl_module`],
+/// shared by [`bench_ctrl`] and its gate-isolation twin [`bench_gate_call_return`].
+const CTRL_ROUNDS: usize = 680;
+
+/// The **`call`/`return` chain body** shared by [`bench_ctrl`] and
+/// [`bench_gate_call_return`]: `allocate; jump Ltop; label Ltop;` then
+/// [`CTRL_ROUNDS`] `call Lsub`, then `deallocate; return; label Lsub; return`.
 ///
-/// A non-tail `call` writes its continuation into the current frame and jumps;
-/// the callee's `return` reads it back — so each round costs `call`, `label`,
-/// `return`, and the whole body is exactly `3 * ROUNDS + 6` instructions. The
-/// `allocate` guarantees the `call` writes *its own* frame's continuation slot
-/// rather than the bottom frame's `Halt`, so the trailing `deallocate; return`
-/// reaches `Halt` and finishes.
-fn bench_ctrl() -> Report {
-    const ROUNDS: usize = 680;
+/// A non-tail `call` writes its continuation into the current frame and jumps; the
+/// callee's `return` reads it back — so each round costs `call`, `label`, `return`,
+/// and the whole body is exactly `3 * ROUNDS + 6` instructions. The `allocate`
+/// guarantees the `call` writes *its own* frame's continuation slot rather than the
+/// bottom frame's `Halt`, so the trailing `deallocate; return` reaches `Halt` and
+/// finishes.
+fn ctrl_body() -> Vec<Instr> {
     let ltop = Label(2);
     let lsub = Label(3);
     let mut body = vec![
@@ -412,7 +418,7 @@ fn bench_ctrl() -> Report {
         Instr::Jump { target: ltop },
         Instr::Label(ltop),
     ];
-    for _ in 0..ROUNDS {
+    for _ in 0..CTRL_ROUNDS {
         body.push(Instr::Call {
             arity: 0,
             target: lsub,
@@ -422,13 +428,54 @@ fn bench_ctrl() -> Report {
     body.push(Instr::Return);
     body.push(Instr::Label(lsub));
     body.push(Instr::Return);
+    body
+}
 
-    let (module, function) = finish_module(Module::default(), "bench_ctrl", 2, body);
+/// A one-function module exported as `name/2` whose body is [`ctrl_body`]; returns
+/// the module, its function atom and the exact per-run instruction count.
+fn ctrl_module(name: &str) -> (Module, Atom, usize) {
+    let (module, function) = finish_module(Module::default(), name, 2, ctrl_body());
+    (module, function, 3 * CTRL_ROUNDS + 6)
+}
+
+/// A **control-flow chain**: `allocate; jump;` then `ROUNDS` &times;
+/// `call(Lsub); label(Lsub); return`, then `deallocate; return`.
+///
+/// A non-tail `call` writes its continuation into the current frame and jumps;
+/// the callee's `return` reads it back — so each round costs `call`, `label`,
+/// `return`, and the whole body is exactly `3 * ROUNDS + 6` instructions. The
+/// `allocate` guarantees the `call` writes *its own* frame's continuation slot
+/// rather than the bottom frame's `Halt`, so the trailing `deallocate; return`
+/// reaches `Halt` and finishes.
+fn bench_ctrl() -> Report {
+    let (module, function, instructions) = ctrl_module("bench_ctrl");
     let args = [make_small(1), make_small(0)];
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
-    let instructions = 3 * ROUNDS + 6;
     let report = measure("ctrl/2 (call/return chain)", instructions, 800, || {
+        machine.run_export(&module, function, 2, &args, &mut ctx)
+    });
+    assert_eq!(report.result, make_small(1));
+    report
+}
+
+/// **Gate-isolation row (A.8): the `call`/`return` chain with the tracing gate OFF.**
+///
+/// By construction this is [`bench_ctrl`]'s body — the densest local
+/// `call`+`return` chain the frame discipline allows (one `call` and one `return`
+/// per three instructions) — so every instruction it dispatches that carries the
+/// per-run tracing gate is exercised `680` times per run. It is measured with the
+/// default untraced [`MinimalContext`], i.e. on the gate's **disabled** path (the
+/// path the per-run `Machine::trace_on` cache exists to make free): the untraced
+/// `trace_enabled()` answer is latched once per run and each call/return then reads
+/// a plain `bool`, so this row's `ns/instruction` must match [`bench_ctrl`]'s — and
+/// the pre-change `ctrl/2` figure — rather than pay a vtable call per instruction.
+fn bench_gate_call_return() -> Report {
+    let (module, function, instructions) = ctrl_module("bench_gate_ctrl");
+    let args = [make_small(1), make_small(0)];
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let report = measure("gate/call+return", instructions, 800, || {
         machine.run_export(&module, function, 2, &args, &mut ctx)
     });
     assert_eq!(report.result, make_small(1));
@@ -514,9 +561,13 @@ fn bench_branch_loop() -> Report {
     report
 }
 
-/// A **tail-recursive loop** in the exact shape `tailcall.beam`'s `loop/2` uses:
-/// a `test` guard whose fail arm is the recursive arm, and a `call_only` back to
-/// the entry label.
+/// The number of recursive passes in the `call_only` tail loop built by
+/// [`tail_loop_module`], shared by [`bench_tail_loop`] and its gate-isolation twin
+/// [`bench_gate_call_only`]. Must be non-negative (it is the guard argument).
+const TAIL_LOOP_N: i64 = 409;
+
+/// A one-function **`call_only` tail-recursive loop** module exported as `name/2`,
+/// shared by [`bench_tail_loop`] and [`bench_gate_call_only`].
 ///
 /// ```text
 ///   label(E)
@@ -531,8 +582,7 @@ fn bench_branch_loop() -> Report {
 /// Per recursive pass: `label`, `test`, `label`, `gc_bif`, `call_only` (5); the
 /// base pass is `label`, `test`, `move`, `return` (4). Total `5 * N + 4`, and the
 /// result is the second argument carried through untouched.
-fn bench_tail_loop() -> Report {
-    const N: i64 = 409;
+fn tail_loop_module(name: &str) -> (Module, Atom) {
     let entry = Label(1);
     let lbody = Label(2);
     let mut module = Module::default();
@@ -562,8 +612,15 @@ fn bench_tail_loop() -> Report {
             target: entry,
         },
     ];
-    let (module, function) = finish_module(module, "bench_tail_loop", 2, body);
-    let args = [make_small(N), make_small(7)];
+    finish_module(module, name, 2, body)
+}
+
+/// A **tail-recursive loop** in the exact shape `tailcall.beam`'s `loop/2` uses:
+/// a `test` guard whose fail arm is the recursive arm, and a `call_only` back to
+/// the entry label (see [`tail_loop_module`]).
+fn bench_tail_loop() -> Report {
+    let (module, function) = tail_loop_module("bench_tail_loop");
+    let args = [make_small(TAIL_LOOP_N), make_small(7)];
     let mut machine = Machine::new();
     let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
     let (rec, base) = tail_loop_shape(&module.functions[0]).expect("the tail loop shape");
@@ -572,7 +629,7 @@ fn bench_tail_loop() -> Report {
         (5, 4),
         "the synthetic tail loop's per-pass counts are known by construction"
     );
-    let instructions = N as usize * rec + base;
+    let instructions = TAIL_LOOP_N as usize * rec + base;
     let report = measure("tail-loop/2 (test + call_only)", instructions, 800, || {
         machine.run_export(&module, function, 2, &args, &mut ctx)
     });
@@ -580,6 +637,38 @@ fn bench_tail_loop() -> Report {
         report.result,
         make_small(7),
         "the tail loop returns the untouched accumulator"
+    );
+    report
+}
+
+/// **Gate-isolation row (A.8): the `call_only` tail loop with the tracing gate OFF.**
+///
+/// By construction this is [`bench_tail_loop`]'s body, whose one `call_only`
+/// back-edge per recursive pass carries the per-run tracing gate `409` times per
+/// run. It is measured with the default untraced [`MinimalContext`], i.e. on the
+/// gate's **disabled** path: the untraced `trace_enabled()` answer is latched once
+/// per run and each `call_only` then reads a plain `bool`, so this row's
+/// `ns/instruction` must match [`bench_tail_loop`]'s — and the pre-change
+/// `tail-loop/2` figure — rather than pay a vtable call per instruction.
+fn bench_gate_call_only() -> Report {
+    let (module, function) = tail_loop_module("bench_gate_tail_loop");
+    let args = [make_small(TAIL_LOOP_N), make_small(7)];
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let (rec, base) = tail_loop_shape(&module.functions[0]).expect("the tail loop shape");
+    assert_eq!(
+        (rec, base),
+        (5, 4),
+        "the gate probe must have the same per-pass shape as the tail loop"
+    );
+    let instructions = TAIL_LOOP_N as usize * rec + base;
+    let report = measure("gate/call_only", instructions, 800, || {
+        machine.run_export(&module, function, 2, &args, &mut ctx)
+    });
+    assert_eq!(
+        report.result,
+        make_small(7),
+        "the gate probe returns the untouched accumulator"
     );
     report
 }
@@ -973,8 +1062,10 @@ fn report_attribution(reports: &[Report]) {
         ("test/2", "test predicate evaluation (no branch)"),
         ("gc_bif", "per-BIF argument marshalling through the context"),
         ("ctrl/2", "call/return frame discipline (mixed)"),
+        ("gate/call+return", "A.8 call/return gate, tracing OFF (mixed)"),
         ("branch-loop/2", "taken test branch + jump back-edge (mixed)"),
         ("tail-loop/2", "tail-call back-edge (mixed)"),
+        ("gate/call_only", "A.8 call_only gate, tracing OFF (mixed)"),
         ("real", "a real erlc-compiled recursion (mixed)"),
     ] {
         if let Some(report) = by_label(needle) {
@@ -1036,8 +1127,10 @@ fn interpreter_reports_ns_per_instruction() {
         bench_test_nobranch(),
         bench_gcbif(),
         bench_ctrl(),
+        bench_gate_call_return(),
         bench_branch_loop(),
         bench_tail_loop(),
+        bench_gate_call_only(),
     ];
     match bench_real_even() {
         Some(report) => reports.push(report),
@@ -1053,7 +1146,7 @@ fn interpreter_reports_ns_per_instruction() {
     // Structural invariants only — never a performance threshold (that would be
     // flaky in a shared sandbox; the printed numbers are the deliverable).
     assert!(
-        reports.len() >= 9,
+        reports.len() >= 11,
         "every synthetic workload must have been measured"
     );
     for report in &reports {

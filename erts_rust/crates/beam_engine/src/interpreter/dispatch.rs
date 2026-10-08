@@ -242,8 +242,17 @@ impl Machine {
             Instr::Call { target, .. } => {
                 // Store the continuation in the *current* frame's CP slot.
                 self.set_continuation(Continuation::Address { func, pc: pc + 1 })?;
-                let (func, pc) = resolve(labels, *target)?;
-                Ok(Step::Goto { func, pc })
+                let (callee, callee_pc) = resolve(labels, *target)?;
+                // Contract A.8: report the callee's `call` event (the oracle's
+                // breakpoint fires on entry to the callee). Gated, so an untraced
+                // run pays one predictable branch and builds no event.
+                if self.trace_on {
+                    self.trace_call_local(module, callee, ctx);
+                }
+                Ok(Step::Goto {
+                    func: callee,
+                    pc: callee_pc,
+                })
             }
             Instr::CallLast {
                 target, deallocate, ..
@@ -254,18 +263,40 @@ impl Machine {
                 // **first** so a bad label cannot leave a popped frame behind —
                 // the jump itself is the only step that depends on the popped
                 // frame, and by then nothing may fail.
-                let (func, pc) = resolve(labels, *target)?;
+                let (callee, callee_pc) = resolve(labels, *target)?;
                 self.pop_frame_checked(*deallocate)?;
-                Ok(Step::Goto { func, pc })
+                // The `call` event names the tail-callee; the frame that remains is
+                // the original caller's, so the callee's eventual `return` reports
+                // *that* caller (`return_to`), never the tail-called-into function.
+                if self.trace_on {
+                    self.trace_call_local(module, callee, ctx);
+                }
+                Ok(Step::Goto {
+                    func: callee,
+                    pc: callee_pc,
+                })
             }
             Instr::CallOnly { target, .. } => {
-                let (func, pc) = resolve(labels, *target)?;
-                Ok(Step::Goto { func, pc })
+                let (callee, callee_pc) = resolve(labels, *target)?;
+                if self.trace_on {
+                    self.trace_call_local(module, callee, ctx);
+                }
+                Ok(Step::Goto {
+                    func: callee,
+                    pc: callee_pc,
+                })
             }
             Instr::CallExt { target, arity } => {
                 // An ext call carries no fail label: a failure is a raise (C's
                 // `i_call_ext`/`call_light_bif` end in `handle_error`, so a live
                 // catch frame catches it).
+                //
+                // Only the callee's *entry* is traced: the oracle emits no
+                // `return_to` for a BIF/cross-module completion, so reporting a
+                // return here would invent an event (see `super::trace`).
+                if self.trace_on {
+                    self.trace_call_import(module, labels, *target, ctx);
+                }
                 match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
@@ -275,6 +306,9 @@ impl Machine {
                 }
             }
             Instr::CallExtOnly { target, arity } => {
+                if self.trace_on {
+                    self.trace_call_import(module, labels, *target, ctx);
+                }
                 match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
@@ -291,7 +325,6 @@ impl Machine {
                 arity,
                 deallocate,
             } => {
-                // `call_ext_last` deallocates **after** the callee, never before.
                 // C expands it to `call_light_bif Bif Bif | deallocate_return D`
                 // (`emu/ops.tab:964`), and `call_light_bif`
                 // (`emu/bif_instrs.tab:262`) asserts `E == c_p->stop` across the
@@ -312,6 +345,9 @@ impl Machine {
                 //   never-returning `call_ext_last` (e.g. `erlang:error/1`) is then
                 //   dead code C never applies — the shape that produced the bogus
                 //   `deallocate: frame size mismatch` reason instead of the BIF's.
+                if self.trace_on {
+                    self.trace_call_import(module, labels, *target, ctx);
+                }
                 match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
@@ -364,7 +400,22 @@ impl Machine {
             }
             Instr::Return => match self.continuation()? {
                 Continuation::Halt => Ok(Step::Done),
-                Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),
+                Continuation::Address {
+                    func: caller,
+                    pc: caller_pc,
+                } => {
+                    // Contract A.8: the returning function and the function control
+                    // returns *to*. The frame is already the caller's (the compiler's
+                    // `deallocate` has popped the returning function's own frame), so
+                    // a tail-called function's `return` names the ORIGINAL caller.
+                    if self.trace_on {
+                        self.trace_return(module, func, caller, ctx);
+                    }
+                    Ok(Step::Goto {
+                        func: caller,
+                        pc: caller_pc,
+                    })
+                }
             },
             // An opcode the loader has no typed IR variant for: a residual
             // [`crate::generic`] opcode is reported as the documented
@@ -389,6 +440,14 @@ impl Machine {
     /// `(func, pc)`, finishing the run with `x(0)` on [`Step::Done`] and reporting a
     /// suspension as [`RunOutcome::Wait`] on [`Step::Wait`] (leaving the machine
     /// untouched so the host can re-enter at the reported address).
+    ///
+    /// The A.8 tracing gate is latched here — **once per run** (and thus once per
+    /// [`Machine::resume_outcome`], so a process that is traced while blocked picks
+    /// the change up on resume): the per-instruction call/return arms read the plain
+    /// `Machine::trace_on` `bool` instead of making a `trace_enabled()` vtable call
+    /// per instruction, so an untraced run pays a single `bool` load and no event is
+    /// ever built. See the `Machine::trace_on` field docs for the mid-run
+    /// semantics.
     pub(crate) fn run_loop_with_map(
         &mut self,
         module: &Module,
@@ -397,6 +456,7 @@ impl Machine {
         mut pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<RunOutcome> {
+        self.trace_on = ctx.trace_enabled();
         loop {
             match self.step_instruction(module, labels, func, pc, ctx)? {
                 Step::Next => pc += 1,

@@ -620,6 +620,14 @@ pub(crate) fn run_native_label_outcome(
 }
 
 /// The shared driver loop over an already-prepared machine and entry address.
+///
+/// The A.8 tracing gate is latched here — **once per run** — so the driver's own
+/// per-instruction interpreter step
+/// ([`Machine::step_instruction`](crate::Machine)) sees the same cached
+/// `Machine::trace_on` flag the interpreter's dispatch loop would have
+/// latched, without the per-instruction `trace_enabled()` vtable call. Both native
+/// tiers enter here (`run_native_outcome` and `run_native_label_outcome`, the latter
+/// shared with the Cranelift tier), so the flag is set for either.
 fn drive(
     machine: &mut Machine,
     module: &Module,
@@ -629,6 +637,10 @@ fn drive(
     ctx: &mut dyn ExecutionContext,
     code: &dyn NativeCode,
 ) -> Result<RunOutcome> {
+    // Latch the per-run tracing gate (see the `Machine::trace_on` field docs): the
+    // deopt path's `step_instruction` reads the plain `bool`, so this single call
+    // replaces a vtable call per call/return instruction.
+    machine.trace_on = ctx.trace_enabled();
     // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.
