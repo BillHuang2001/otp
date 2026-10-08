@@ -349,7 +349,7 @@ from the Nix store; `$HOME` read-only. `--full` sample counts: `baseline` startu
 | workload | runtime | headline (`--full`) |
 |---|---|---|
 | `baseline` | sys | startup p50 **118.31 ms** / p99 145.39 ms; compute loop 190.48 ms p50 ⇒ **5.46 M ops/s**; `erlang:memory(total)` 55.3 MB; peak RSS 124.5 MiB |
-| `baseline` | rust | startup p50 **150.86 ms** / p99 172.29 ms (≈ 1.28× sys); compute loop **not run** (5/5 attempts exit `1`, `beam_rt: allocation failure: heap (16 bytes)`), no metric, `peak_memory_bytes` null |
+| `baseline` | rust | startup p50 **150.86 ms** / p99 172.29 ms (≈ 1.28× sys). The **archived M1** report's compute row is "not run"; the harness now measures the compute loop on both runtimes and only the `erlang:memory/1` probe is a capability gap — see `RESULTS.md` §3.2 |
 | `erlc_compiler` | sys | **9.45 files/s** (7 327 loc/s), 60 files, peak RSS 128.6 MiB |
 | `elixir_compiler` | sys | **4.86 files/s** (2 438 loc/s), 105 attempted → 223 `.beam` via the per-file fallback, peak RSS 202.5 MiB |
 | `cowboy` | sys | **218 788 req/s**, latency p50 0.063 ms / p99 0.387 ms, 0 errors in 1 094 402 req, peak RSS 153.4 MiB |
