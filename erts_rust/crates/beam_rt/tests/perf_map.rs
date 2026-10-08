@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+// The shared helper module is compiled into every integration-test binary, so a binary that
+// does not call all of its entry points would otherwise warn on the unused ones.
+#[allow(dead_code)]
 mod support;
 
 /// How often a running probe's exit is polled.
