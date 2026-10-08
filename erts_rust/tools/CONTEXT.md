@@ -45,9 +45,10 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `unsafe` is forbidden in both crates.
 
 ## Status
-- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=723 agree=715
-  mismatch=0 unsupported=8 skipped=0` (per-contract counts under "Gate coverage" in Notes for Agents).
-  `wire/new_fun_ext_encode` is unclosable by design; the other seven are the `wire_ids` node-identity family.
+- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=737 agree=735
+  mismatch=0 unsupported=2 skipped=0` (per-contract counts under "Gate coverage" in Notes for Agents).
+  `wire/new_fun_ext_encode` is unclosable by design; the other is the A.9 boot-chain `blocked` seam
+  (`boot/proc_lib_start_link_blocks_the_boot_path`).
 - **`beam_rt` gap signalling is honoured:** cases the runtime cannot run classify as `unsupported`,
   never `mismatch`.
 - **Benchmarks:** current numbers and their measurement caveats live in `bench/RESULTS.md` (its
