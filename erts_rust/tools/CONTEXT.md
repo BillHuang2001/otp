@@ -52,7 +52,18 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
 - Oracle is the system Erlang on `PATH` (OTP 29.1.1 / erts-17.1). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
 - **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
-- **Gate coverage depth (verified against code):** all nine contracts A.1–A.9 have corpus cases. Two remain shallow — A.5 (distribution) only through the *ETF wire codec* (no live handshake / `DOP_*` framing), and A.9 (build) only through *boot/version observability* (no actual self-hosted build). A.4 (driver C ABI) is now covered end to end by `differential`'s `driver_c` group (a real C driver `.so` driven through the port lifecycle and the `port_command` echo round trip), alongside the built-in spawn-driver `driver/` cases and the structural C-ABI check (`tests/abi.rs`). The genuine end-to-end agreement core is the module-run groups (`modules`/`mexec`/`nif_so`/`nif_res`/`driver_c`/`records`).
+- **Gate coverage (verified against code):** `differential suite` reports `summary: total=667 agree=666
+  mismatch=0 unsupported=1 skipped=0`. All nine contracts A.1–A.9 have corpus cases — A.1 154/154 ·
+  A.2 176/176 · A.3 34/34 · A.4 64/64 · A.5 63/64 (+1 unsupported) · A.6 37/37 · A.7 246/246 · A.8 49/49
+  · A.9 52/52. A.4 (driver C ABI) is covered end to end by the `driver_c` group (a real C driver `.so`
+  driven through the port lifecycle and the `port_command` echo round trip), alongside the built-in
+  spawn-driver `driver/` cases and the structural C-ABI check (`tests/abi.rs`). The genuine end-to-end
+  agreement core is the module-run groups (`modules`/`mexec`/`nif_so`/`nif_res`/`driver_c`/`records`).
+  Two contracts stay shallow: A.5 (the `wire` group covers the *ETF wire codec* only — a live handshake /
+  `DOP_*` loopback needs two connected nodes and is not expressible through a single CLI process) and A.9
+  (build) through *boot/version observability* only (no self-hosted build). The single `unsupported` is
+  `wire/new_fun_ext_encode` — an `erl_eval` lambda's closure identity is unclosable without porting
+  `erl_eval`/`erl_scan`/`erl_parse`.
 - **`bench` target gaps in this sandbox:** `plb` (Benchmarks-Game, needs `dotnet`) and `emqx` (no root `rebar.config` — it is a `make`/`mix` project) are wired but report honest `skipped(<reason>)`; `khepri` needs `rebar3`, available only via the opt-in `$BENCH_TRY_NIX`.
 
 ## See Also
