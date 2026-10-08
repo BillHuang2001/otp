@@ -1387,8 +1387,10 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// host implementation — a wrong result — so the answer is deliberately conservative:
     ///
     /// * a name in a namespace the floor serves ([`native::FLOOR_MODULES`]) → `Ok(None)`;
-    /// * a NIF-backed name ([`Runtime::nifs`]), a registered `beam_bifs` name
-    ///   ([`Runtime::registry`]) or the `erlang` BIF namespace → `Ok(None)`;
+    /// * a NIF-backed name ([`Runtime::nifs`]) — and, because the interception is module-wide
+    ///   at dispatch, the *whole* module carrying a loaded NIF was excluded below —, a
+    ///   registered `beam_bifs` name ([`Runtime::registry`]) or the `erlang` BIF namespace →
+    ///   `Ok(None)`;
     /// * a module that is **not already loaded** → `Ok(None)`: no load-on-demand here, so the
     ///   first call keeps the synchronous [`Self::call_bif`] path (which loads the module) and
     ///   every later call is in-machine;
@@ -1419,9 +1421,26 @@ impl ExecutionContext for RuntimeContext<'_> {
         if crate::native::FLOOR_MODULES.contains(&module) {
             return Ok(None);
         }
-        // A loaded NIF replaces the Erlang stub of the same name (the BEAM's dispatch order):
-        // it must keep reaching `try_call_nif` through `call_bif`.
-        if self.runtime.nifs.borrow().lookup(module, function, arity) {
+        // A module with a loaded NIF library is **never** entered here, for two reasons.
+        //
+        // * A NIF replaces the Erlang stub of the same `{module, function, arity}` at dispatch
+        //   (the BEAM's order), so a NIF-backed name must keep reaching `try_call_nif` through
+        //   `call_bif`. [`NifRegistry::lookup`] alone would answer that for the NIF's own
+        //   names, but *not* for the module's ordinary Erlang functions.
+        // * The interception is module-wide at **dispatch**, and the runtime's dispatch keys
+        //   the module off [`Self::current_module`] — which an in-machine callee does **not**
+        //   update (the engine's module-context switch never re-enters this context). Entering
+        //   a NIF module's body would therefore run its calls under the *caller's* identity: a
+        //   `erlang:load_nif/2` inside the body would target the caller module (the observed
+        //   `bad_lib` on a reload), not itself.
+        //
+        // Excluding the whole module keeps such a call byte-for-byte on the synchronous
+        // [`Self::call_bif`] path (which loads the module, sets the module identity and runs
+        // it with a machine whose own admission point is unarmed) — exactly its behaviour
+        // before this seam existed.
+        //
+        // [`NifRegistry::lookup`]: crate::nif::NifRegistry
+        if self.runtime.nifs.borrow().is_loaded(module) {
             return Ok(None);
         }
         // A registered `beam_bifs` BIF (the `bif.tab` surface, including the stdlib fast
