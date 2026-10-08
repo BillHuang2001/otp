@@ -96,6 +96,12 @@ impl RuntimeContext<'_> {
             ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
+            // `process_info/1,2` stay on the floor: they answer from *this* runtime's
+            // process tables through the shared `crate::native::memory` implementation
+            // (which the `ProcessHook` bridge also calls), and they serve the
+            // `{dictionary, Key}` item form the `beam_bifs` seam cannot express.
+            ("erlang", "process_info", 2) => Some(self.process_info_2(args)),
+            ("erlang", "process_info", 1) => Some(self.process_info_1(args)),
             ("init", "get_argument", 1) => Some(self.get_argument(args)),
             ("init", "get_plain_arguments", 0) => Some(self.get_plain_arguments()),
             ("init", "get_arguments", 0) => Some(self.get_arguments()),
