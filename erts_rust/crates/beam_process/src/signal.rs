@@ -36,10 +36,12 @@ pub struct SignalAtoms {
     normal: Atom,
     kill: Atom,
     killed: Atom,
+    noproc: Atom,
 }
 
 impl SignalAtoms {
-    /// Interns `'EXIT'`, `'DOWN'`, `process`, `port`, `normal`, `kill` and `killed` in `t`.
+    /// Interns `'EXIT'`, `'DOWN'`, `process`, `port`, `normal`, `kill`, `killed` and
+    /// `noproc` in `t`.
     pub fn from_table(t: &mut AtomTable) -> SignalAtoms {
         SignalAtoms {
             exit: t.intern("EXIT"),
@@ -49,6 +51,7 @@ impl SignalAtoms {
             normal: t.intern("normal"),
             kill: t.intern("kill"),
             killed: t.intern("killed"),
+            noproc: t.intern("noproc"),
         }
     }
 
@@ -85,6 +88,12 @@ impl SignalAtoms {
         self.killed
     }
 
+    /// The `noproc` atom — the reason of the immediate `{'DOWN', …}` a monitor on a
+    /// dead/unknown target yields.
+    pub fn noproc(&self) -> Atom {
+        self.noproc
+    }
+
     /// The `normal` atom as a term.
     pub fn normal_term(&self) -> Eterm {
         make_atom(self.normal)
@@ -98,6 +107,11 @@ impl SignalAtoms {
     /// The `killed` atom as a term.
     pub fn killed_term(&self) -> Eterm {
         make_atom(self.killed)
+    }
+
+    /// The `noproc` atom as a term.
+    pub fn noproc_term(&self) -> Eterm {
+        make_atom(self.noproc)
     }
 
     /// Classifies an exit reason against the well-known atoms.
@@ -306,6 +320,14 @@ mod tests {
         assert_eq!(f.table.name(f.atoms.normal()), Some("normal"));
         assert_eq!(f.table.name(f.atoms.kill()), Some("kill"));
         assert_eq!(f.table.name(f.atoms.killed()), Some("killed"));
+        assert_eq!(f.table.name(f.atoms.noproc()), Some("noproc"));
+    }
+
+    #[test]
+    fn noproc_term_is_the_noproc_atom() {
+        let f = fixture();
+        assert_eq!(f.atoms.noproc_term(), make_atom(f.atoms.noproc()));
+        assert_ne!(f.atoms.noproc_term(), f.atoms.normal_term());
     }
 
     #[test]

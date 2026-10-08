@@ -20,7 +20,10 @@
 
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_term::prelude::{make_boxed, make_header, make_small, Eterm, REF_SUBTAG};
+use beam_term::prelude::{
+    boxed_val, header_subtag, is_boxed_term, is_tuple, make_atom, make_boxed, make_header,
+    make_small, signed_value, tuple_element, tuple_size, Atom, Eterm, REF_SUBTAG,
+};
 
 use crate::pid::ProcessId;
 
@@ -60,6 +63,49 @@ impl MonitorRef {
             *p.add(3) = make_small(self.id as i64);
         }
         Ok(make_boxed(p as *const Eterm))
+    }
+}
+
+/// Whether `payload` is the `{'DOWN', Reference, _, _, _}` message for `reference`.
+///
+/// A `demonitor(Ref, [flush])` helper: it recognises the monitor-DOWN message a
+/// [`MonitorRef`] produced, so the caller can drop it out of a mailbox.
+///
+/// # Encoding
+///
+/// Word 3 of a ref thing is the id: [`MonitorRef::to_eterm`] builds the frozen
+/// `[make_header(3, REF_SUBTAG), node, serial, id]`, so its **last payload word** holds
+/// `make_small(reference.id())` (`monitor_ref_to_eterm_builds_the_frozen_thing` pins exactly
+/// that layout). The identity test is therefore `signed_value(word[3]) == reference.id() as i64`.
+///
+/// # Robustness
+///
+/// Every read is guarded: a non-tuple payload, a payload that is not a 5-tuple, a head element
+/// that is not `down_atom`, and an element 1 that is not a boxed ref thing are all `false`
+/// without reading a word the guards have not first proven to exist. It never panics.
+pub fn payload_is_down_for(payload: Eterm, reference: MonitorRef, down_atom: Atom) -> bool {
+    // SAFETY: the guards form a chain. `is_tuple` first rejects everything that is not a live
+    // boxed term whose header word is a valid arity value, so `tuple_size`/`tuple_element` only
+    // ever read a live tuple; the arity test bounds every element read to `0..5`; and element 1
+    // is only dereferenced after `is_boxed_term` proved it a dereferenceable boxed term and
+    // `header_subtag` proved its header carries the 3-payload-word `REF_SUBTAG`, so word 3 is in
+    // bounds. No path reads a word it has not first proven to exist.
+    unsafe {
+        if !is_tuple(payload) || tuple_size(payload) != 5 {
+            return false;
+        }
+        if tuple_element(payload, 0) != make_atom(down_atom) {
+            return false;
+        }
+        let reference_term = tuple_element(payload, 1);
+        if !is_boxed_term(reference_term) {
+            return false;
+        }
+        let words = boxed_val(reference_term);
+        if header_subtag(*words) != REF_SUBTAG as u32 {
+            return false;
+        }
+        signed_value(*words.add(3)) == reference.id() as i64
     }
 }
 
@@ -279,5 +325,70 @@ mod tests {
             reference.to_eterm(&mut heap),
             Err(BeamError::Alloc(_))
         ));
+    }
+
+    #[test]
+    fn payload_is_down_for_matches_only_its_own_reference_and_shape() {
+        use beam_term::prelude::{make_atom, AtomTable};
+
+        let mut table = AtomTable::new();
+        let down = table.intern("DOWN");
+        let exit = table.intern("EXIT");
+        let process = table.intern("process");
+
+        let mut refs = RefAllocator::new();
+        let reference = refs.next();
+        let other = refs.next();
+
+        let mut heap = Heap::new(32).expect("test heap");
+        let mut ref_heap = Heap::new(8).expect("test heap");
+        let reference_term = reference.to_eterm(&mut ref_heap).expect("the ref fits");
+
+        // The exact shape the signal builders produce.
+        let message = heap
+            .tuple(&[
+                make_atom(down),
+                reference_term,
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("the test arena holds the tuple");
+        assert!(payload_is_down_for(message, reference, down));
+        // A different reference is not this message's DOWN ...
+        assert!(!payload_is_down_for(message, other, down));
+        // ... and a different head atom is not a DOWN at all.
+        assert!(!payload_is_down_for(message, reference, exit));
+
+        // A 4-tuple with the right head is not a 5-tuple DOWN.
+        let short = heap
+            .tuple(&[
+                make_atom(down),
+                reference_term,
+                make_atom(process),
+                pid(1).to_eterm(),
+            ])
+            .expect("fits");
+        assert!(!payload_is_down_for(short, reference, down));
+
+        // Element 1 that is not a boxed ref thing (here: a pid immediate).
+        let not_ref = heap
+            .tuple(&[
+                make_atom(down),
+                pid(2).to_eterm(),
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("fits");
+        assert!(!payload_is_down_for(not_ref, reference, down));
+
+        // Non-tuple payloads must never be dereferenced.
+        assert!(!payload_is_down_for(make_small(7), reference, down));
+        assert!(!payload_is_down_for(make_atom(down), reference, down));
+        let not_a_down = heap
+            .tuple(&[make_atom(process), make_small(1)])
+            .expect("fits");
+        assert!(!payload_is_down_for(not_a_down, reference, down));
     }
 }
