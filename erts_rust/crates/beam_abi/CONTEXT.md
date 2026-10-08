@@ -374,7 +374,10 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   declaration order** (a transposed slot is an ABI break) and that **every word of
   `enif_api_table()`/`driver_api_table()` is populated**. A new header declaration with no crate
   definition FAILS the test; `KNOWN_UNIMPLEMENTED` is an explicit (currently empty) allowlist so a
-  deferral must be named with a reason, never silently accepted.
+  deferral must be named with a reason, never silently accepted. It resolves those headers from the
+  **in-tree legacy** `erts/emulator/beam/` (`beam_dir()` = `CARGO_MANIFEST_DIR/../../../erts/emulator/
+  beam`) and prints a loud `SKIP` (a vacuous pass, never a silent pass) when they are absent — so
+  deleting the legacy headers would silently disable this mechanical freeze guard.
 - **Oracle cross-checks that really run** (they skip loudly if `erl`/`erlc`/`cc` are absent):
   `nif_threads.rs` loads the *same* fixture `.so` from the system Erlang and compares the printed
   tuple (excluding `thread_type/0`, the documented scheduler deviation); `nif_mapiter.rs`'s
