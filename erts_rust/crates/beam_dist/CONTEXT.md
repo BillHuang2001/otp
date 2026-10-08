@@ -310,8 +310,8 @@ Turns a decoded [`ControlMessage`] into its **semantic** delivery and routes it 
 `struct ConnectionDriver` + `enum DriverState { Handshaking, Established, Closed, Failed }` +
 `enum StepOutcome { WouldBlock, Handshaking, Established, Progress, Closed, Failed }`. **Byte-fed**: the
 runtime owns the socket and does the syscalls; the driver only parses/serializes.
-- `client(our_name, cookie, creation)` / `server(our_name, cookie, creation)` (+ `*_with_challenge`),
-  `is_client`.
+- `client(our_name, cookie, creation)` / `server(our_name, cookie, creation)` (+ `*_with_challenge` and
+  the `*_with_flags(…, flags)` flag overrides), `is_client`.
 - `feed(&[u8])` / `feed_eof()` — appends socket bytes / signals a clean EOF.
 - `step() -> Result<StepOutcome>` — makes all possible progress (incremental 2-byte handshake, then
   4-byte-framed established frames, tick replies, `'E'`/`'F'` reassembly); returns `WouldBlock` when
