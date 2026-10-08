@@ -381,16 +381,22 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
     (whole-buffer **and** byte-at-a-time), negotiated flags/peer names, an atom-cache round trip
     (`New` then `Cached`), the exact empty header `131,68,0`, a >`DIST_FRAGMENT_SIZE` message both ways
     (`'E'` verified), a tick answered, and malformed/truncated/EOF/send-before-established errors.
-  - `tests/live_interop.rs` (blocking) + `tests/live_driver.rs` (non-blocking) — **live interop with a
-    real `erl` node.** Each starts `erl -sname <uniq> -setcookie <c> -kernel inet_dist_listen_min P
-    inet_dist_listen_max P` (P a free loopback port), resolves P through **`epmd::lookup_port`**
-    (falling back to P if epmd is unreachable), and completes the handshake. `live_interop.rs` then
-    sends a `DOP_REG_SEND` (the node prints `GOT {hello,42}`), receives the node's `DOP_SEND_SENDER`
-    reply, sends a `DOP_SEND` to the node pid the node echoed back (the node prints `GOT {direct,99}`),
-    and completes a monitor round-trip (`DOP_MONITOR_P` decoded → `DOP_MONITOR_P_EXIT` → the node prints
-    `DOWN … noproc`). `live_driver.rs` drives the `ConnectionDriver` over a genuine non-blocking
-    `TcpStream`. The shared spawn/harness lives in `tests/common/mod.rs`. Both skip honestly (clear
-    `eprintln`) only when `erl` is absent on `PATH`; never fake a pass.
+  - `tests/live_interop.rs` (blocking) + `tests/live_driver.rs` (non-blocking) + `tests/live_accept.rs`
+    (server side) — **live interop with a real `erl` node.** Each starts `erl -sname <uniq> -setcookie
+    <c> -kernel inet_dist_listen_min P inet_dist_listen_max P` (P a free loopback port), resolves P
+    through **`epmd::lookup_port`** (falling back to P if epmd is unreachable), and completes the
+    handshake. `live_interop.rs` sends a `DOP_REG_SEND` (the node prints `GOT {hello,42}`), receives
+    the node's `DOP_SEND_SENDER` reply, sends a `DOP_SEND` to the node pid the node echoed back (the
+    node prints `GOT {direct,99}`), completes a monitor round-trip (`DOP_MONITOR_P` decoded →
+    `DOP_MONITOR_P_EXIT` → the node prints `DOWN … noproc`), proves a **client-originated
+    `DOP_MONITOR_P`** is accepted (`DOP_PAYLOAD_MONITOR_P_EXIT` with reason `boom`), `DOP_EXIT2`,
+    `DOP_UNLINK_ID`→`DOP_UNLINK_ID_ACK`, and **fragmented >`DIST_FRAGMENT_SIZE` messages both ways**.
+    `live_accept.rs` completes the handshake as **server** and does the Rust->node->Rust round trip (the
+    full `node@host` name + epmd-assigned creation) plus published-vs-hidden peer visibility.
+    `live_driver.rs` drives the `ConnectionDriver` over a genuine non-blocking `TcpStream`. The shared
+    spawn/harness lives in `tests/common/mod.rs`. All skip honestly (clear `eprintln`) only when `erl`
+    is absent on `PATH`; never fake a pass. Opcodes/paths that cannot be exercised against a live peer
+    are pinned by **byte-exact golden vectors** instead (labelled as such).
 
 ## Design Decisions
 - **MD5 is implemented in-tree, not via a dependency.** The digest is one 16-byte hash; `md-5` would
