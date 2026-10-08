@@ -37,7 +37,7 @@ The registry is hand-written (a `BifFn` is a `fn` pointer, so a BIF cannot be ta
 | `hbif` | 7 | 7 |
 | **total** | **556** | **556** |
 
-`registry = 637` = 556 declared + 81 non-table keys. **missing = 0** — every declared `bif.tab` entry is registered. The 145 keys closed in the runtime-family pass are all seam-backed (see `## The runtime-coupled BIF families`): with no runtime hook installed each answers the typed `unsupported_bif` capability gap, never a fabricated value and never `undef`.
+`registry = 637` = 556 declared + 81 non-table keys. **missing = 0** — every declared `bif.tab` entry is registered. The 224 keys closed in the runtime-family pass are all seam-backed (see `## The runtime-coupled BIF families`): with no runtime hook installed each answers the typed `unsupported_bif` capability gap, never a fabricated value and never `undef`.
 
 ## The runtime-coupled BIF families (`src/runtime/`, the `runtime_bif!` macro)
 The 145 BIFs whose implementation needs the *running* runtime are registered here and bridge through the single `RuntimeHooks` seam (`erlang:memory/0,1` through `MemoryHook`). Ground truth: the corresponding C in `../../erts/emulator/beam/` (`erl_bif_*.c`, `bif.c`, `erl_time_sup.c`, `erl_db_*.c`), `string:misc`/`global` semantics for the tools' surfaces.
