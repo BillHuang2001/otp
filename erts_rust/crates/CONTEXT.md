@@ -290,7 +290,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   payload convention is the **live reason term as a `beam_term::Eterm`**. `ExitReason` is unchanged
   (`ExitReason::Structured` stays a unit variant, so `as_atom()` is still `None`; the slot is invisible to
   `Debug`/`PartialEq`). `beam_engine` populates it on **every** raise (`Machine::throw_with_trace` attaches
-  the term on an uncaught raise; `Machine::raise_bif_error` now lands a BIF raise that carries a term in a
+  the term on an uncaught raise; `Machine::raise_bif_error` lands a BIF raise that carries a term in a
   live catch frame, matching C's `handle_error` → `next_catch`). `beam_bifs` attaches the true reason term
   instead of collapsing to a bare `badarg`: `{badmap,M}`, `{badkey,K}`, `{case_clause,V}`,
   `{badrecord,T}`, `{badfield,{{M,N},K}}`, and any **non-atom** `erlang:error/1,2`/`exit/1`/`throw/1`/
