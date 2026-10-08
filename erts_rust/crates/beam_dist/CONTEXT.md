@@ -557,10 +557,11 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `src/driver.rs` → the non-blocking `ConnectionDriver` poll/step state machine (`feed`/`step`/
   `take_output`/`next_message`/`next_delivery`/`dispatch_inbound`/`send_control`/`peer_visibility`) +
   `DriverState`/`StepOutcome`
-- `src/epmd.rs` → `epmd` request/response codecs, `EpmdClient` over `Transport`, and the real TCP client
-  (`connect`/`lookup`/`lookup_port`, `EPMD_DEFAULT_ADDR`)
-- `tests/{constants,auth,handshake,framing,control,epmd,fragment,atom_cache,connection,driver}.rs` →
-  seams
+- `src/epmd.rs` → `epmd` request/response codecs (incl. the `DUMP`/`KILL`/`STOP` admin set +
+  `MAX_DUMP_RESP_BODY`), `EpmdClient` over `Transport` (`publish`/`port_please`/`names`/`dump`/`kill`/
+  `stop`), and the real TCP client (`connect`/`lookup`/`lookup_port`, `EPMD_DEFAULT_ADDR`)
+- `tests/{constants,auth,handshake,framing,control,delivery,dop_roundtrip,epmd,fragment,atom_cache,connection,driver}.rs`
+  → seams
 - `tests/common/mod.rs` → the shared real-`erl` spawn/harness (`ErlangNode`, `erl_hostname`, `free_port`,
   `resolve_listen_port`) used by the live tests
 - `tests/live_interop.rs` → real-`erl` blocking handshake + `DOP_REG_SEND`/`DOP_SEND`/monitor exchange
