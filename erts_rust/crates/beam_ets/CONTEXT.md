@@ -209,9 +209,11 @@ impl Table {
   `insert_new`, `delete`, `delete_object`, `delete_all_objects`, `take -> Result<Vec<Eterm>>`,
   `update_counter`, `update_counter_with`, `update_element`, `select_delete`, `match_delete`; and
   read-checked `lookup -> Result<Vec<Eterm>>`, `member -> Result<bool>`, `lookup_element`,
-  `lookup_element_or`, `lookup_element_all`, `lookup_element_all_or`, `select`, `select_count`, `match_object`, `match_`, `first`/`last`/`next`/`prev
+  `lookup_element_or`, `lookup_element_all`, `lookup_element_all_or`, `select`, `select_count`, `match_object`, `match_`, `set_fixation` (`ets:safe_fixtable/2`, which the oracle gates as a
+  READ), `first`/`last`/`next`/`prev
   -> Result<Option<Eterm>>`, `tab2list -> Result<Vec<Eterm>>`, `size -> Result<usize>`,
-  `is_empty -> Result<bool>`. `first`/`last`/`next`/`prev` are table-level, so the same read-checked
+  `is_empty -> Result<bool>`. `ets:info/1,2` is deliberately **not** here — the oracle leaves it
+  ungated (a non-owner may `info` a `private` table). `first`/`last`/`next`/`prev` are table-level, so the same read-checked
   wrappers cover every kind (`ordered_set`'s interior overrides the underlying `first_key`/`last_key`/
   `next_key`/`prev_key` with exact B+-tree searches, but the access layer sits above the `Table`).
   The two ownership wrappers are requester-implicit: `give_away(&mut self, new_owner: Option<OwnerId>)
