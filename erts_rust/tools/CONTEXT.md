@@ -44,6 +44,15 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - Keep default runs fast (`--quick`); full suites are milestone-only (Part I §C; root §6).
 - `unsafe` is forbidden in both crates.
 
+## Status
+- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=667 agree=666
+  mismatch=0 unsupported=1 skipped=0` (per-contract counts under "Gate coverage" in Notes for Agents).
+  The one `unsupported`, `wire/new_fun_ext_encode`, is unclosable by design.
+- **`beam_rt` gap signalling is honoured:** cases the runtime cannot run classify as `unsupported`,
+  never `mismatch`.
+- **Benchmarks:** current numbers and their measurement caveats live in `bench/RESULTS.md` (its
+  Milestone-1 archive is explicitly marked there); the driver is read-only against the external repos.
+
 ## Routing Table
 - `differential/` → differential-test compatibility gate: `Eval` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (stdout, exit status, stderr, `term_to_binary`, exception class+reason, `system_info`), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus, JSON reports
 - `bench/` → benchmark driver: pluggable workload plugins (Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX), system-ERTS baseline, result store + `compare`
