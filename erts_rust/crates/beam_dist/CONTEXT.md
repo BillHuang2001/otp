@@ -555,7 +555,8 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `src/connection_tests.rs` → the `connection` module's in-module unit tests (path-included via
   `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
 - `src/driver.rs` → the non-blocking `ConnectionDriver` poll/step state machine (`feed`/`step`/
-  `take_output`/`next_message`/`send_control`) + `DriverState`/`StepOutcome`
+  `take_output`/`next_message`/`next_delivery`/`dispatch_inbound`/`send_control`/`peer_visibility`) +
+  `DriverState`/`StepOutcome`
 - `src/epmd.rs` → `epmd` request/response codecs, `EpmdClient` over `Transport`, and the real TCP client
   (`connect`/`lookup`/`lookup_port`, `EPMD_DEFAULT_ADDR`)
 - `tests/{constants,auth,handshake,framing,control,epmd,fragment,atom_cache,connection,driver}.rs` →
