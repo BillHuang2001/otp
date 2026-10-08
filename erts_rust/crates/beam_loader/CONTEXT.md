@@ -222,9 +222,11 @@ chunk entry * :  u8[4] chunk_id | u32 size | size bytes | (4 - size%4)%4 zero pa
 `"BEAM"` is the form type, **there is no `BEAM` chunk**. Chunks parse until EOF; unknown ids skipped;
 duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` (atoms), `Code`
 (instructions), `StrT`, `ImpT`, `ExpT`, `LocT` (JIT-only locals), `FunT`, `LitT`, `Attr`, `CInf`,
-`Line`, `Type`, `Meta`, `DbgB` (legacy debug), `Dbgi` (compiler debug info), `Recs`, obsolete `Atom`.
-`DbgB`/`Dbgi` are *recognized* ids whose payloads are deliberately left unparsed (debug info is
-tooling-only).
+`Line`, `Type`, `Meta`, `DbgB` (legacy debug), `Dbgi` (compiler debug info), `Docs` (ExDoc),
+`Recs`, obsolete `Atom`. The ids the installed corpus actually uses are classified in
+`src/chunk/classify.rs` (`ChunkClass`) and enforced by `tests/chunks.rs`: each is parsed+exposed,
+parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term), `DbgB`/`Dbgi`
+(debug info) and the obsolete `Atom` chunk are the tooling-only ids.
 ### Per-chunk layouts (`src/chunk/`)
 - **`AtU8`** — `i32 count` (negative ⇒ "long" varint lengths, real count = `-count`); then per atom a
   length (varint if long, else `u8`) + UTF-8 bytes. **UTF-8, not Latin-1** (`beam_file.c:291`).
