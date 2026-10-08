@@ -10,11 +10,12 @@ use crate::boxed::{boxed_val, is_big, make_header};
 use crate::eterm::Eterm;
 use crate::immediate::{is_immediate, is_small};
 use crate::tag::{
-    ARITYVAL_SUBTAG, BIN_REF_SUBTAG, EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG,
+    is_term_word, ARITYVAL_SUBTAG, BIN_REF_SUBTAG, EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG,
     EXTERNAL_REF_SUBTAG, FLOAT_SUBTAG, FUN_SUBTAG, HEAP_BITS_SUBTAG, MAP_SUBTAG, NEG_BIG_SUBTAG,
     POS_BIG_SUBTAG, RECORD_SUBTAG, REF_SUBTAG, SUB_BITS_SUBTAG, TAG_HEADER_MASK, TAG_IMMED1_MASK,
     TAG_IMMED1_PID, TAG_IMMED1_PORT, TAG_IMMED1_SMALL, TAG_IMMED2_ATOM, TAG_IMMED2_MASK,
-    TAG_IMMED2_NIL, TAG_PRIMARY_BOXED, TAG_PRIMARY_IMMED1, TAG_PRIMARY_LIST, TAG_PRIMARY_MASK,
+    TAG_IMMED2_NIL, TAG_PRIMARY_BOXED, TAG_PRIMARY_HEADER, TAG_PRIMARY_IMMED1, TAG_PRIMARY_LIST,
+    TAG_PRIMARY_MASK,
 };
 use crate::tuple::tuple0;
 
@@ -57,6 +58,20 @@ pub enum TermClass {
     Small,
     /// An off-heap binary reference (not a "real" term).
     BinRef,
+    /// A word that is **not a term at all** — a bare header word, i.e. one whose
+    /// primary tag is `HEADER` (see [`crate::tag::is_term_word`]). This is the C
+    /// ABI's `THE_NON_VALUE` (`0`, or `make_header(0, FLOAT_SUBTAG)` in a debug
+    /// build) and any other stray header word.
+    ///
+    /// The C's `tag_val_def` has **no** answer for such a word: the switch falls
+    /// through to `erl_assert_error("tag_val_def error")`, which is a debug
+    /// assertion (a no-op that falls off the end of a non-`void` function —
+    /// undefined behaviour — in a release build). This variant is that missing
+    /// answer: classifying a non-term is a defined, documented result instead of a
+    /// panic, and every `is_*` test written against a class is `false` for it, so
+    /// no caller can mistake it for a real term. It sorts **after** every real
+    /// class in `class_rank` terms (see [`crate::compare`]).
+    NonValue,
 }
 
 /// `THE_NON_VALUE` — the magic non-value. Zero in release; a `FLOAT` header in
@@ -88,33 +103,58 @@ pub fn is_zero_sized(x: Eterm) -> bool {
 
 /// `is_integer(x)` — a small integer or a bignum.
 ///
+/// A word that is not a term at all (a bare header word, e.g. the ABI's
+/// `THE_NON_VALUE`) is `false`, never a dereference.
+///
 /// # Safety
 ///
-/// If `x` is boxed, its header word must be a live, aligned term word.
+/// If `x` is a boxed term, its header word must be a live, aligned term word.
 #[inline]
 pub unsafe fn is_integer(x: Eterm) -> bool {
+    if !is_term_word(x) {
+        return false;
+    }
     is_small(x) || unsafe { is_big(x) }
 }
 
 /// `is_number(x)` — an integer or a float.
 ///
+/// A word that is not a term at all (a bare header word, e.g. the ABI's
+/// `THE_NON_VALUE`) is `false`, never a dereference.
+///
 /// # Safety
 ///
-/// If `x` is boxed, its header word must be a live, aligned term word.
+/// If `x` is a boxed term, its header word must be a live, aligned term word.
 #[inline]
 pub unsafe fn is_number(x: Eterm) -> bool {
+    if !is_term_word(x) {
+        return false;
+    }
     unsafe { is_integer(x) || crate::boxed::is_float(x) }
 }
 
 /// `tag_val_def(x)` — classify a term word.
 ///
+/// A word that is not a term at all (a bare header word: the ABI's
+/// `THE_NON_VALUE` and friends, see [`crate::tag::is_term_word`]) classifies as
+/// [`TermClass::NonValue`] — never a panic and never a dereference. The C has no
+/// answer for such a word at all (`erl_assert_error` in debug, undefined
+/// behaviour in release), so this is a documented, panic-free extension.
+///
+/// The two remaining `panic!`s are unreachable without forged memory: they fire
+/// only when a **boxed term's own header word** carries an unknown subtag, and
+/// this crate writes every header it hands out. They mirror the C's
+/// `erl_assert_error` internal-consistency assertion rather than a runtime
+/// error.
+///
 /// # Safety
 ///
-/// If `x` is boxed, its header word must be a live, aligned term word of one of
-/// the known subtags.
+/// If `x` is a boxed term, its header word must be a live, aligned term word of
+/// one of the known subtags.
 #[inline]
 pub unsafe fn class(x: Eterm) -> TermClass {
     match x.raw() & TAG_PRIMARY_MASK {
+        TAG_PRIMARY_HEADER => TermClass::NonValue,
         TAG_PRIMARY_LIST => TermClass::List,
         TAG_PRIMARY_BOXED => {
             let hdr = unsafe { *boxed_val(x) };
@@ -144,7 +184,9 @@ pub unsafe fn class(x: Eterm) -> TermClass {
                 other => panic!("class: invalid immediate2 tag {other:#x}"),
             },
         },
-        other => panic!("class: invalid primary tag {other:#x}"),
+        // Unreachable: the primary tag is two bits, so the mask above always
+        // selects one of the four arms.
+        _ => TermClass::NonValue,
     }
 }
 
@@ -195,6 +237,43 @@ mod tests {
         assert!(!is_value(THE_NON_VALUE));
         assert!(is_value(make_small(0)));
         assert!(is_value(NIL));
+    }
+
+    #[test]
+    fn a_non_term_classifies_as_non_value() {
+        // Every word whose primary tag is `HEADER` is not a term: `class` answers
+        // `NonValue` (the C panics/UBs here) and no predicate comes near a
+        // dereference.
+        let mut bare_headers = vec![
+            THE_NON_VALUE,
+            make_header(0, FLOAT_SUBTAG),
+            crate::boxed::HEADER_FLONUM,
+            make_header(1, FUN_SUBTAG),
+        ];
+        // A few more raw header words, including the `HEADER`-tagged `0`.
+        bare_headers.push(Eterm::from_raw(0x3C));
+        for word in bare_headers {
+            assert!(crate::tag::is_header(word), "test word {word:?} is a header");
+            assert!(!is_term_word(word));
+            // SAFETY: `class` is total for a non-term word — that is the property
+            // under test (a valid term would carry its usual invariants).
+            assert_eq!(unsafe { class(word) }, TermClass::NonValue);
+            // SAFETY: as above.
+            assert!(!unsafe { is_integer(word) });
+            // SAFETY: as above.
+            assert!(!unsafe { is_number(word) });
+            assert!(!is_zero_sized(word));
+        }
+        // Every *valid* term is still a term word, and still classifies as before.
+        assert!(is_term_word(make_small(0)));
+        assert!(is_term_word(NIL));
+        assert!(is_term_word(tuple0()));
+        // SAFETY: all three are live terms.
+        unsafe {
+            assert_eq!(class(make_small(0)), TermClass::Small);
+            assert_eq!(class(NIL), TermClass::Nil);
+            assert_eq!(class(tuple0()), TermClass::Tuple);
+        }
     }
 
     #[test]

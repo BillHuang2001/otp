@@ -82,6 +82,9 @@ const TAG_MAP: u64 = 0x0d;
 const TAG_FUN_LOCAL: u64 = 0x0e;
 const TAG_FUN_IMPORTED: u64 = 0x0f;
 const TAG_FUN_EXTERNAL: u64 = 0x10;
+/// Discriminator for a word that is **not a term at all** (a bare header word such
+/// as the ABI's `THE_NON_VALUE`; see [`crate::tag::is_term_word`]).
+const TAG_NON_VALUE: u64 = 0x11;
 
 /// Mix a word into a running FNV-1a style hash.
 #[inline]
@@ -94,13 +97,21 @@ fn mix64(h: u64, word: u64) -> u64 {
 /// Consistent with [`crate::eq`] / [`crate::cmp`] (equal terms hash equal). See
 /// the module docs: the exact values are internal and not a compatibility
 /// contract.
+///
+/// Total and panic-free: a word that is not a term at all (a bare header word, e.g.
+/// the ABI's `THE_NON_VALUE`; see [`crate::tag::is_term_word`]) hashes from its raw
+/// word — mixed with a per-class discriminator, like every other class — and is
+/// never dereferenced. Since [`crate::eq`] calls two non-terms equal only when
+/// their words are identical, the `eq ⇒ equal hash` rule still holds.
 pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64 {
     hash_term(a, atoms, FNV_OFFSET)
 }
 
 /// Recursively hash a term into the running hash `h`.
 fn hash_term(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
-    // SAFETY: `class` only dereferences the header word of a live boxed term.
+    // SAFETY: `class` is total — it dereferences only the header word of a
+    // well-formed boxed term and answers `NonValue` (no dereference) for a word that
+    // is not a term.
     match unsafe { class(t) } {
         TermClass::Small => mix64(mix64(h, TAG_SMALL), signed_value(t) as u64),
         TermClass::Big => unsafe { hash_big(t, mix64(h, TAG_BIG)) },
@@ -119,6 +130,8 @@ fn hash_term(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
         TermClass::Map => hash_map(t, atoms, mix64(h, TAG_MAP)),
         // SAFETY: `t` is a live fun.
         TermClass::Fun => unsafe { hash_fun(t, atoms, h) },
+        // A word that is not a term at all: hash its raw word (never dereference it).
+        TermClass::NonValue => mix64(mix64(h, TAG_NON_VALUE), t.raw() as u64),
         // Refs plus every opaque class.
         _ => unsafe { hash_words(t, mix64(h, TAG_OPAQUE)) },
     }
@@ -343,14 +356,19 @@ unsafe fn hash_words(t: Eterm, mut h: u64) -> u64 {
 // so a Rust term must hash identically (Level-1 drop-in).
 //
 // Error handling: a well-formed term always hashes. The only *reachable* typed
-// failure is a [`FunKind::Local`] fun (a `make_fun3` closure), whose inlined
-// 2-word descriptor carries neither the module nor `old_uniq` that the C's
-// `ErlFunEntry` supplies — see [`crate::fun`]. That is reported as the dedicated
-// [`crate::error::TermError::FunIdentityUnavailable`] (the term is fine; the
-// identity is not carried), never as a substituted value. Every other `Err`
-// below is for a forged/unknown term layout (unreachable through the safe API)
-// and stays [`crate::error::TermError::BadFun`], whose meaning — "this is not a
-// well-formed fun" — is exactly right there.
+// failure for a well-formed term is a [`FunKind::Local`] fun (a `make_fun3`
+// closure), whose inlined 2-word descriptor carries neither the module nor
+// `old_uniq` that the C's `ErlFunEntry` supplies — see [`crate::fun`]. That is
+// reported as the dedicated [`crate::error::TermError::FunIdentityUnavailable`]
+// (the term is fine; the identity is not carried), never as a substituted value.
+// A word that is **not a term at all** — a bare header word, i.e. the C ABI's
+// `THE_NON_VALUE` (`0`, or a bare `FLOAT` header in a debug build) and friends;
+// see [`crate::tag::is_term_word`] — is reported as
+// [`crate::error::TermError::NotATerm`] rather than dereferenced (the C is
+// undefined behaviour there). Every other `Err` below is for a forged/unknown
+// term layout (unreachable through the safe API) and stays
+// [`crate::error::TermError::BadFun`], whose meaning — "this is not a well-formed
+// fun" — is exactly right there.
 //
 // The shared low-level primitives live in the [`common`] submodule; the two
 // ports are the [`make_hash2`](self::make_hash2) and

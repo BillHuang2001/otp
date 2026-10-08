@@ -53,6 +53,26 @@ pub const fn is_not_boxed(x: Eterm) -> bool {
     !is_boxed(x)
 }
 
+/// Whether `x` is a **dereferenceable boxed term** — [`is_boxed`] *and* a term
+/// word ([`crate::tag::is_term_word`]).
+///
+/// [`is_boxed`] mirrors the C bit trick `(x & (_TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0`
+/// verbatim, so it is also true for every word whose primary tag is `HEADER` —
+/// i.e. for the words that are **not terms at all**: the C ABI's `THE_NON_VALUE`
+/// (`0`, or `make_header(0, FLOAT_SUBTAG)` in a debug build) and any other bare
+/// header word.
+///
+/// The C's own boxed predicates dereference such a word (undefined behaviour).
+/// In this crate, **every guard whose `is_boxed` test was guarding a
+/// `*boxed_val(x)` read tests this predicate instead**, so a stray non-term (a NIF
+/// that returned `THE_NON_VALUE`, say) is classified as "not a boxed term" rather
+/// than dereferencing a garbage — in release, `NULL` — pointer. For every valid
+/// term it agrees with [`is_boxed`] exactly.
+#[inline]
+pub const fn is_boxed_term(x: Eterm) -> bool {
+    is_boxed(x) && crate::tag::is_term_word(x)
+}
+
 // ---------------------------------------------------------------------------
 // Header words
 // ---------------------------------------------------------------------------
@@ -326,12 +346,17 @@ macro_rules! boxed_predicate {
     ($name:ident, $header_test:ident, $doc:literal) => {
         #[doc = $doc]
         ///
+        /// A word that is not a term at all (a bare header word, e.g. the ABI's
+        /// `THE_NON_VALUE`) is `false`, never a dereference — see
+        /// [`is_boxed_term`].
+        ///
         /// # Safety
         ///
-        /// If `x` is boxed, its header word must be a live, aligned term word.
+        /// If `x` is a boxed term, its header word must be a live, aligned term
+        /// word.
         #[inline]
         pub unsafe fn $name(x: Eterm) -> bool {
-            if !is_boxed(x) {
+            if !is_boxed_term(x) {
                 return false;
             }
             unsafe { $header_test(*boxed_val(x)) }
@@ -392,12 +417,15 @@ boxed_predicate!(
 
 /// `is_float(x)` — a boxed term whose header is exactly `HEADER_FLONUM`.
 ///
+/// A word that is not a term at all (a bare header word, e.g. the ABI's
+/// `THE_NON_VALUE`) is `false`, never a dereference — see [`is_boxed_term`].
+///
 /// # Safety
 ///
-/// If `x` is boxed, its header word must be a live, aligned term word.
+/// If `x` is a boxed term, its header word must be a live, aligned term word.
 #[inline]
 pub unsafe fn is_float(x: Eterm) -> bool {
-    if !is_boxed(x) {
+    if !is_boxed_term(x) {
         return false;
     }
     unsafe { *boxed_val(x) == HEADER_FLONUM }
@@ -405,12 +433,15 @@ pub unsafe fn is_float(x: Eterm) -> bool {
 
 /// `is_bitstring(x)`.
 ///
+/// A word that is not a term at all (a bare header word, e.g. the ABI's
+/// `THE_NON_VALUE`) is `false`, never a dereference — see [`is_boxed_term`].
+///
 /// # Safety
 ///
-/// If `x` is boxed, its header word must be a live, aligned term word.
+/// If `x` is a boxed term, its header word must be a live, aligned term word.
 #[inline]
 pub unsafe fn is_bitstring(x: Eterm) -> bool {
-    if !is_boxed(x) {
+    if !is_boxed_term(x) {
         return false;
     }
     unsafe { is_bitstring_header(*boxed_val(x)) }
@@ -429,12 +460,15 @@ pub unsafe fn is_not_bitstring(x: Eterm) -> bool {
 
 /// `is_bin_ref(x)` — an off-heap binary reference (`HEADER_BIN_REF`).
 ///
+/// A word that is not a term at all (a bare header word, e.g. the ABI's
+/// `THE_NON_VALUE`) is `false`, never a dereference — see [`is_boxed_term`].
+///
 /// # Safety
 ///
-/// If `x` is boxed, its header word must be a live, aligned term word.
+/// If `x` is a boxed term, its header word must be a live, aligned term word.
 #[inline]
 pub unsafe fn is_bin_ref(x: Eterm) -> bool {
-    if !is_boxed(x) {
+    if !is_boxed_term(x) {
         return false;
     }
     unsafe { *boxed_val(x) == HEADER_BIN_REF }

@@ -69,7 +69,7 @@
 
 use crate::atom::AtomTable;
 use crate::boxed::{
-    boxed_val, is_arity_value, is_boxed, is_flatmap_header, is_map_header, make_arityval,
+    boxed_val, is_arity_value, is_boxed_term, is_flatmap_header, is_map_header, make_arityval,
     make_boxed, map_header_type, map_header_val,
 };
 use crate::compare::{cmp, cmp_flatmap_keys, eq};
@@ -410,7 +410,7 @@ fn collect_slots(node: *mut Eterm, out: &mut Vec<(Eterm, Eterm)>) -> TermResult<
 /// Every `(key, value)` pair of the map `t` (unordered).
 fn collect_pairs(t: Eterm) -> TermResult<Vec<(Eterm, Eterm)>> {
     // An immediate can never be a map; guard before dereferencing.
-    if !is_boxed(t) {
+    if !is_boxed_term(t) {
         return Err(TermError::BadMap);
     }
     let p = boxed_val(t);
@@ -471,7 +471,7 @@ pub(crate) fn map_pairs_flatmap_order(
 /// `erts_map_size` — the number of keys in the map `t`.
 pub fn map_size(t: Eterm, _atoms: &AtomTable) -> TermResult<usize> {
     // An immediate can never be a map; guard before dereferencing.
-    if !is_boxed(t) {
+    if !is_boxed_term(t) {
         return Err(TermError::BadMap);
     }
     let p = boxed_val(t);
@@ -497,7 +497,7 @@ pub fn map_size(t: Eterm, _atoms: &AtomTable) -> TermResult<usize> {
 /// scan of the collision node when the path ends in one.
 pub fn map_get(t: Eterm, key: Eterm, atoms: &AtomTable) -> TermResult<Option<Eterm>> {
     // An immediate can never be a map; guard before dereferencing.
-    if !is_boxed(t) {
+    if !is_boxed_term(t) {
         return Err(TermError::BadMap);
     }
     let p = boxed_val(t);

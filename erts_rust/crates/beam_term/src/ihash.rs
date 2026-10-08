@@ -63,7 +63,7 @@
 //! lists, flat maps, hash maps, and binaries/bitstrings) are bit-exact.
 
 use crate::bitstring::bit_count_to_bytes;
-use crate::boxed::{boxed_val, header_arity, header_subtag, is_boxed, map_header_val};
+use crate::boxed::{boxed_val, header_arity, header_subtag, is_boxed_term, map_header_val};
 use crate::eterm::Eterm;
 use crate::fun::{fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
 use crate::immediate::{is_byte, is_immediate, unsigned_value};
@@ -371,7 +371,7 @@ fn hash_boxed(
             // (`ErtsRecordDefinition.hash`, `erl_record.h:43-61`).
             // SAFETY: an instance's word 1 is a live boxed definition pointer.
             let def = unsafe { *bp.add(1) };
-            let def_hash = if is_boxed(def) {
+            let def_hash = if is_boxed_term(def) {
                 // SAFETY: `def` is boxed, so it points at a live `ErtsRecordDefinition`
                 // whose word 2 is the hash.
                 unsafe { *boxed_val(def).add(2) }

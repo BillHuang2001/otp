@@ -15,7 +15,7 @@ use crate::atom::AtomTable;
 use crate::bitstring::float_bits;
 use crate::boxed::{
     arityval, boxed_val, header_arity, header_subtag, internal_ref_numbers, is_arity_value,
-    is_boxed, make_header, map_header_val,
+    is_boxed_term, make_header, map_header_val,
 };
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
@@ -250,7 +250,7 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                                         stack.push(unsafe { *cons.add(1) });
                                         // SAFETY: word 0 of the cons is its CAR.
                                         stack.push(unsafe { *cons });
-                                    } else if is_boxed(slot) {
+                                    } else if is_boxed_term(slot) {
                                         // SAFETY: a map node slot is a term.
                                         let shdr = unsafe { *boxed_val(slot) };
                                         if is_arity_value(shdr) {
@@ -476,7 +476,7 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                 }
                 to_common = true;
             }
-            PrimaryTag::Header => return Err(TermError::BadFun),
+            PrimaryTag::Header => return Err(TermError::NotATerm),
         }
 
         if !to_common {

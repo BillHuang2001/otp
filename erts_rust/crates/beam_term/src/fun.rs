@@ -87,7 +87,7 @@
 //! *header word* — never a term — and so need no `unsafe` and no dereference.
 
 use crate::atom::Atom;
-use crate::boxed::{boxed_val, is_boxed, is_fun_header, make_boxed};
+use crate::boxed::{boxed_val, is_boxed_term, is_fun_header, make_boxed};
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::immediate::{atom_val, make_atom};
@@ -275,7 +275,7 @@ pub fn fun_block_words(t: Eterm) -> TermResult<usize> {
 /// live, initialised header word — exactly as [`crate::size::size_object`] and
 /// [`crate::compare::cmp`] do.
 fn fun_term_header(t: Eterm) -> TermResult<Eterm> {
-    if !is_boxed(t) {
+    if !is_boxed_term(t) {
         return Err(TermError::BadFun);
     }
     // SAFETY: `t` is a live boxed term, so `boxed_val(t)` points at its live,
