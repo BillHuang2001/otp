@@ -28,6 +28,8 @@
 //! | `+K true\|false` | kernel-poll switch |
 //! | `+sbt TYPE` | scheduler bind type (`u`/`db`/`s`/`ps`/`ts`/`tnnps`/`nnps`/`nnts`/`ns`) |
 //! | `-M*` / `+MM*` / `+MB*` | ERTS allocator flags (the `+M*` forms are validated; all preserved verbatim) |
+//! | `+JPperf VALUE` | perf support: `true`\|`false`\|`dump`\|`map`\|`fp`\|`no_fp` (contract A.8; see [`crate::perf_map`]) |
+//! | `+JPperfdirectory Dir` | where the perf files are written (default `/tmp`); `ERL_SYM_MAP_FILE` overrides the map's whole path |
 //! | `run File Mod:Func/Arity [Args…]` | load `File`, run the function and print the result |
 //!
 //! # `ERL_*FLAGS`
@@ -37,6 +39,11 @@
 //! `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]` — so a
 //! tokenized environment flag is indistinguishable from a command-line flag to
 //! `init:get_argument/1`. See [`parse_with_env`] and [`env`].
+//!
+//! A **second** environment family is read directly by the emulator instead of being merged:
+//! [`vars`] (`ERL_MAX_PORTS`, `ERL_CRASH_DUMP`, `ERL_INETRC`, `ERL_ROOTDIR`, …) plus the
+//! perf map's `ERL_SYM_MAP_FILE`. None of them is an init argument; the two with a modelled
+//! effect route into the configuration ([`parse_with_env`]).
 //!
 //! # Init arguments (`init:get_argument/1`), exactly as the oracle
 //!
@@ -96,6 +103,7 @@ use crate::config::{
     Action, ArgTerm, EmulatorConfig, HeapOptions, InitArgs, RuntimeConfig, DEFAULT_HEAP_WORDS,
 };
 use crate::error;
+use crate::perf_map::{self, PerfMapConfig};
 use crate::runtime::Runtime;
 
 mod env;
@@ -199,6 +207,15 @@ pub const EXIT_UNSUPPORTED: i32 = 3;
 /// the oracle, where `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both
 /// observe a `port_limit` of 4096.
 ///
+/// # `ERL_SYM_MAP_FILE`
+///
+/// `ERL_SYM_MAP_FILE` belongs to that family too — the emulator's perf-map writer reads it
+/// with `erts_sys_explicit_host_getenv` (`beam_jit_metadata.cpp`), so it is neither merged
+/// into the command line nor recorded as an `init` argument — but it *is* a modelled effect:
+/// it overrides the perf map's whole path, so it is folded into
+/// [`perf_map`](RuntimeConfig::perf_map) here (contract A.8). It selects no file of its own:
+/// like the C, it is consulted only where a `+JPperf map`/`true` file would be created.
+///
 /// [`parse`] itself never reads the process environment: the differential harness and the
 /// unit tests call it directly, and [`run`] calls this function with [`ProcessEnv`].
 ///
@@ -218,6 +235,13 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
             preserve_emulator_flag(&mut config.emulator, "+Q", &max_ports.to_string());
             config.max_ports = Some(max_ports);
         }
+    }
+    // `ERL_SYM_MAP_FILE` is the perf map's path override (contract A.8): the emulator reads
+    // it directly — outside the `ERL_*FLAGS` merge, and never as an `init` argument — and it
+    // applies only to the map file (`+JPperf map`/`true`). Like `ERL_MAX_PORTS` above it is
+    // folded into the configuration here, so the pure `parse` stays environment-free.
+    if let Some(path) = env.get(perf_map::SYM_MAP_FILE_VAR) {
+        config.perf_map.set_file(path);
     }
     config.env = env_vars;
     Ok(config)
@@ -248,6 +272,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         heap: HeapOptions::new(),
         max_ports: None,
         init_args: InitArgs::new(),
+        perf_map: PerfMapConfig::new(),
         action: Action::Boot,
     };
     let mut index = 0;
@@ -374,6 +399,23 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.set_max_heap_flag(argument, &value)?;
                 index += 2;
             }
+            // The perf-map / JIT-dump surface (contract A.8). The two switches are emulator
+            // flags: they are validated here, preserved verbatim in `extra_emulator_flags`
+            // and **never** an `init` argument (like `+Q`/`+K`/`+sbt`). `+JPperfdirectory`'s
+            // value is taken verbatim — an unusable directory surfaces as a failed file
+            // creation, not as a usage error (`PerfMap::error`), exactly as in the C.
+            "+JPperf" => {
+                let value = value_of(args, index, "+JPperf")?;
+                builder.perf_map.set_flag(&value)?;
+                builder.preserve("+JPperf", &value);
+                index += 2;
+            }
+            "+JPperfdirectory" => {
+                let value = value_of(args, index, "+JPperfdirectory")?;
+                builder.perf_map.set_directory(value.clone());
+                builder.preserve("+JPperfdirectory", &value);
+                index += 2;
+            }
             "-s" => index = builder.parse_apply(args, index, "-s")?,
             "-run" => index = builder.parse_apply(args, index, "-run")?,
             "run" => index = parse_run_file(args, index, &mut builder)?,
@@ -389,6 +431,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         heap: builder.heap,
         max_ports: builder.max_ports,
         init_args: builder.init_args,
+        perf_map: builder.perf_map,
         action: builder.action,
         // The environment family is read only by `parse_with_env`; the pure `parse` sees
         // an empty one (it must never read the process environment).
@@ -410,6 +453,9 @@ struct Builder {
     max_ports: Option<usize>,
     /// Every command-line flag, in order (the `init:get_argument/1` source).
     init_args: InitArgs,
+    /// The perf-map / JIT-dump surface (`+JPperf`/`+JPperfdirectory`) being assembled
+    /// (contract A.8).
+    perf_map: PerfMapConfig,
     /// The selected action.
     action: Action,
 }

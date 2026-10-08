@@ -54,6 +54,7 @@ use crate::format;
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
 use crate::nif::NifRegistry;
+use crate::perf_map::PerfMap;
 use crate::port::PortRegistry;
 use crate::runner::{ProcessEntry, RunnerState};
 use crate::timers::{TimerHandle, Timers};
@@ -271,6 +272,15 @@ pub struct Runtime {
     /// [`Runtime::dispatch_inbound`] entry never consults it (an explicit caller has
     /// already asked).
     inbound_delivery: bool,
+    /// The **perf-map / JIT-dump** files `+JPperf` selected (contract A.8).
+    ///
+    /// Created here — the runtime-construction step, the equivalent of the C's
+    /// `beamasm_metadata_early_init` at emulator start — and appended to the moment a native
+    /// code range becomes known ([`PerfMap::record`]). This runtime's baseline JIT exposes no
+    /// ranges, so the map is a well-formed **empty** file; an address is never fabricated. An
+    /// unopenable file is recorded on the [`PerfMap`] (never raised, never printed), exactly
+    /// as the oracle logs it and carries on. See [`crate::perf_map`].
+    perf_map: PerfMap,
 }
 
 impl Runtime {
@@ -320,6 +330,11 @@ impl Runtime {
             Some(name) => Some(DistNode::start(name, resolve_cookie(&config.init_args))?),
             None => None,
         };
+        // The perf files are created up front, like the C's `beamasm_metadata_early_init`:
+        // the map is then appended to as ranges become known. Nothing is created when the
+        // flag selected no file, and a failure to create one is recorded on the `PerfMap`
+        // (the oracle logs it and keeps running), never raised here.
+        let perf_map = PerfMap::new(config.perf_map.clone());
         Ok(Runtime {
             config,
             registry: Rc::new(BifRegistry::with_core_bifs()),
@@ -350,6 +365,7 @@ impl Runtime {
             timer_wakes: Vec::new(),
             dist,
             inbound_delivery: false,
+            perf_map,
         })
     }
 
@@ -399,6 +415,20 @@ impl Runtime {
     /// The configuration this runtime was created with.
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+    /// The **perf-map / JIT-dump** files `+JPperf` selected (contract A.8).
+    ///
+    /// Empty unless the flag enabled a file; see [`crate::perf_map`] for exactly what this
+    /// runtime writes (a well-formed map with the oracle's exact line grammar and **no**
+    /// fabricated addresses: this runtime exposes no JIT ranges) and why a file it could not
+    /// create is recorded rather than raised.
+    pub fn perf_map(&self) -> &PerfMap {
+        &self.perf_map
+    }
+    /// The mutable [`PerfMap`], so a caller that *does* know a native code range can append
+    /// it through [`PerfMap::record`].
+    pub fn perf_map_mut(&mut self) -> &mut PerfMap {
+        &mut self.perf_map
     }
 
     /// The parsed init arguments (the source of `init:get_argument/1`).
