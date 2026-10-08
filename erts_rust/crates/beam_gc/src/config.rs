@@ -99,6 +99,20 @@ impl GcConfig {
         }
     }
 
+    /// A configuration for **unbounded on-demand growth**: the automatic selection on top of
+    /// an unbounded-growth policy ([`HeapPolicy::unbounded`], i.e. `max_heap_words == 0`).
+    ///
+    /// Use this when the heap must grow as far as the live set requires with no upper bound,
+    /// and the caller drives that growth through
+    /// [`Collector::ensure_capacity`](crate::Collector::ensure_capacity) /
+    /// [`AnyCollector::ensure_capacity`](crate::AnyCollector::ensure_capacity) on heap
+    /// exhaustion. It resolves to the same (copying) strategy as
+    /// [`GcConfig::default`], because `max_heap_words == 0` is already the default policy's
+    /// growth dimension.
+    pub fn growable() -> GcConfig {
+        GcConfig::auto(HeapPolicy::unbounded())
+    }
+
     /// A configuration using `policy` with the **copying** mature generation **pinned**
     /// (an explicit override of the automatic rule).
     pub fn copying(policy: HeapPolicy) -> GcConfig {

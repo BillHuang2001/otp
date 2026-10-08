@@ -409,6 +409,29 @@ impl GenImmixCollector {
         Ok(stats)
     }
 
+    /// Grows the nursery **on demand** so that a `need_words`-word allocation can proceed —
+    /// the [`crate::Collector::ensure_capacity`] seam for the mark-region strategy.
+    ///
+    /// It collects once (a minor, escalated to a major when the promotion would not fit),
+    /// then grows the now-empty nursery to the smallest curated size that covers
+    /// `need_words` (via the shared [`crate::collector::grow_nursery`]). The returned
+    /// [`Collection`] is the one it ran; afterwards `young().available_words() >= need_words`
+    /// or the typed heap-exhaustion error is returned (never a half-forwarded heap, never an
+    /// unbounded loop).
+    pub fn ensure_capacity(
+        &mut self,
+        need_words: usize,
+        roots: &mut [Eterm],
+    ) -> Result<Collection> {
+        // Fail fast when the policy's ceiling makes the request unreachable: there is no
+        // point collecting, and the collector is left exactly as it was.
+        if self.policy.next_words(need_words, 0) < need_words {
+            return Err(heap_exhausted(need_words));
+        }
+        let collection = self.collect(roots)?;
+        crate::collector::grow_nursery(&mut self.young, &self.policy, need_words)?;
+        Ok(collection)
+    }
     /// Folds one collection's [`GcStats`] into the collector's accumulated counters.
     fn accumulate(&mut self, stats: &GcStats, kind: CollectionKind) {
         self.stats.words_copied += stats.words_copied;

@@ -64,6 +64,11 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>` — picks minor vs major (policy),
     escalating a would-not-fit minor to a major
   - `collect_minor(&mut self, roots) -> Result<GcStats>`; `collect_major(&mut self, roots) -> Result<GcStats>`
+    — each **pre-checks capacity**: a destination that cannot hold the live set returns the typed
+    `heap_exhausted` error *before* `Copier::run`, so a failed collection never leaves the from-space
+    half-forwarded (the escalation in `collect` is unchanged).
+  - `ensure_capacity(&mut self, need_words, roots) -> Result<Collection>` — the **on-demand growth seam**
+    (see Design Decisions §On-demand growth); mirrored on `GenImmixCollector`/`AnyCollector`.
   - `minor_gcs() -> u32` — minors since the last fullsweep (`GEN_GCS`); `impl HeapObservable` (see `heap_info.rs`)
   - After **every** collection the (now empty) nursery is re-sized from `HeapPolicy::young_after_collection`
     (the C minor-time young-heap resize, `erl_gc.c:1493`) and a fullsweep sizes the fresh mature space from
@@ -94,7 +99,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `should_collect(need_words) -> bool`; `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>`
     (reuses `Collection`/`CollectionKind`; no new variant) — plus `collect_minor`/`collect_major`
     (`-> Result<GcStats>`) to force a specific collection (a too-large `collect_minor` reports the typed
-    heap exhaustion before copying anything)
+    heap exhaustion before copying anything); `ensure_capacity(need_words, roots)` — the on-demand growth
+    seam (same semantics as `Collector`)
 
 ### `any_collector.rs` — the strategy-dispatching seam
 - `pub enum AnyCollector { Copying(Collector), Immix(GenImmixCollector) }`
@@ -103,13 +109,15 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     (the resolution is the caller's explicit pin, or, by default, the automatic rule)
   - `kind() -> MatureKind`; `mature_choice() -> MatureChoice` (the resolved decision, its source recovered
     by comparing the strategy with the rule's verdict — see `selection.rs`); `policy()`; `young()`;
-    `young_mut() -> &mut HeapSpace`; `stats() -> GcStats`; `collect(&mut self, roots) -> Result<Collection>`
+    `young_mut() -> &mut HeapSpace`; `stats() -> GcStats`; `collect(&mut self, roots) -> Result<Collection>`;
+    `ensure_capacity(need_words, roots) -> Result<Collection>`
   - thin forwarding only — lets a caller / test drive one corpus through either strategy.
 
 ### `config.rs` + `selection.rs` — the mature-generation decision
 - `pub struct GcConfig { pub policy: HeapPolicy, pub selection: MatureSelection }` — the heap-size policy
   plus **how** the mature strategy is chosen. `new`/`auto` (both = the automatic rule),
-  `copying(policy)`/`immix(policy)` (explicit pins), `with_selection`/`with_mature`, `policy()`,
+  `copying(policy)`/`immix(policy)` (explicit pins), `growable()` (= `auto(HeapPolicy::unbounded())`),
+  `with_selection`/`with_mature`, `policy()`,
   `selection()`, `mature() -> MatureKind` (the resolved strategy), `mature_choice() -> MatureChoice`;
   `Default` = `GcConfig::new(HeapPolicy::default())` = `Auto`, which resolves to `Copying` for the default
   (233-word) policy — i.e. today's collector exactly.
@@ -126,7 +134,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `pub struct HeapPolicy` — `min_heap_words`, `max_heap_words` (0 = unbounded), `fullsweep_after`
   (default 65535), `min_bin_vheap_words` (default 46422 = `next_heap_size(32768, 0)`, the C
   `BIN_VH_MIN_SIZE`), `initial_young_words` (233), `initial_mature_words`, `need_reserve_words`;
-  `default()`, `from_min_max(min, max)`, builder.
+  `default()`, `from_min_max(min, max)`, `unbounded()` (explicit `max_heap_words: 0`), builder.
   - `from_spawn_opts(min_heap_words, min_bin_vheap_words, fullsweep_after)` — the C `spawn_opt` rule
     (`erl_process.c:12321-12349`): each requested minimum is floored and then rounded through
     `erts_next_heap_size(x, 0)`, so a stored minimum is a growth-table fixed point.
@@ -259,6 +267,16 @@ A fragment is a bump-allocated `beam_alloc::Heap` region **outside** every proce
   `next_heap_size(stack + MAX(size_before, need), 0)` with `size_before` the **pre-collection usage**
   (`erl_gc.c:1493`), so a nursery a round left mostly empty **shrinks** — the rule the pressure tests
   depend on (a test that must keep a large nursery alive raises `min_heap_words`).
+- **On-demand growth is an explicit seam, not a collect side effect.** Growth of the young/mature space
+  normally happens *only* inside a collection (the resizes above); `ensure_capacity(need_words, roots)`
+  (on `Collector`/`GenImmixCollector`/`AnyCollector`) adds the caller-driven path a runtime needs when the
+  mutator demands room: it collects once to reclaim, then grows the now-empty nursery to the smallest
+  curated size covering `need_words` (`grow_nursery`, one bounded step — no loop), returning the
+  `Collection` it ran. It cannot "collect until it fits" because `young_after_collection` sizes the next
+  nursery from the *previous* round's usage — after a collection the nursery is empty, so further collects
+  would shrink it; the explicit grow is the only way to reach an arbitrary request. A `max_heap_words` cap
+  that cannot reach `need_words` yields a typed `heap_exhausted` before any copy.
+  `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap" (see Handoffs for the `beam_rt` adoption).
 - **Fragments are collector-side and additive — "materialize then collect".** A `HeapFragment` is a bump
   region outside every process space plus its own `OffHeap`. The collector cannot relocate a term it does
   not own, so `FragmentRoots::materialize` / `FragmentChain::copy_roots_into` first copy fragment-resident
@@ -275,28 +293,18 @@ copying re-copies **136 objects / 400 words** vs Immix **moves 8 objects / 128 w
 (384 words) — a real movement win, at a footprint cost (400 live words → 2176 resident line-words).
 
 `tests/immix_workloads.rs` generalises it to three shapes through both strategies (`-- --nocapture`):
-
-| workload (forced fullsweep) | strategy | objects moved | words moved | resident mature | pause (median) |
-|---|---|---|---|---|---|
-| long-lived shared subterm | Copying | 129 | 639 | 639 words | 8–10 µs |
-| | Immix | **0** (129 pinned) | **0** | 2304 line-words | 11–12 µs |
-| garbage-heavy small live set | Copying | 10 | **20** | **20 words** | 3–5 µs |
-| | Immix | 10 | 160 | 160 line-words | **2–3 µs** |
-| large heap + promotion pressure | Copying | 633 | 1824 | **1824 words** | **19–27 µs** |
-| | Immix | **121** | **288** | 10128 line-words | 47–55 µs |
-
-Both strategies find the **same** live set (`evacuated + pinned == copied`) and reclaim identical garbage.
+long-lived shared subterm (copying 129 obj / 639 w vs Immix **0** moved / 129 pinned), garbage-heavy small
+live set (10 obj; copying 20 w vs Immix 160 line-w, Immix faster), and large-heap promotion pressure
+(copying 633 obj / 1824 w vs Immix 121 obj / 288 w, 10128 resident line-w). Both strategies find the **same**
+live set (`evacuated + pinned == copied`) and reclaim identical garbage.
 
 **Decision — the copying space is the default; GenImmix is a large-live-set regime selected automatically.**
-GenImmix wins on the one axis it was designed for — copying work on long-lived data (0 moved vs 129; 5.2× fewer
-objects / 6.3× fewer words under large-heap promotion pressure) — but every win is paired with a loss:
-(a) **footprint** 3.6–8× (line-granular internal fragmentation: 20 live words occupy 160 line-words on the
-garbage-heavy shape); (b) **pause** worse wherever it saves work (2.4× on the large heap — the reclaim walks
-the whole root set and every line of the region, and the major walks the nursery twice: `scan_young` then
-promotion); (c) an outright loss on the common small-heap/high-churn shape (8× the moved volume for the same
-10 objects). Pause numbers are an in-process median over 5 forced fullsweeps — a direction-of-magnitude
-signal, not a benchmark; every *assertion* is on the deterministic counts. (Immix's own reclaim could be sped
-up by removing the double nursery walk and the whole-region scan.)
+GenImmix wins the copying work on long-lived data, but every win is paired with a loss: (a) **footprint**
+3.6–8× (line-granular internal fragmentation); (b) **pause** worse wherever it saves work (≈2.4× on the large
+heap — the reclaim walks the whole root set and every line, and the major walks the nursery twice:
+`scan_young` then promotion); (c) an outright loss on the common small-heap/high-churn shape (8× the moved
+volume for the same 10 objects). Pause is an in-process median over 5 forced fullsweeps — a signal, not a
+benchmark; every *assertion* is on the deterministic counts.
 
 ### The automatic rule (re-measured break-even, wired)
 `tests/immix_break_even.rs` re-measures the gate with a **single-variable sweep**: a purely long-lived corpus
@@ -311,29 +319,13 @@ Per point: `need_reserve_words 64`, `initial_young_words = live_line_words + 409
 `fullsweep_after 65535`, so the forced fullsweep lands in the mark-region space. Measured (counts are
 **exact**; pause and the derived ratio are **fastest-of-9**, shown as the min–max over three separate runs):
 
-`Shape::Line` (1.0× footprint by construction):
-
-| live set | moved words copying → immix | pinned | footprint c/i | pause immix/copying | words saved per extra µs |
-|---|---|---|---|---|---|
-| 0.25 block (64 w) | 64 → 64 | 0 | 1.0× | 1.97–1.99× | 0 |
-| 0.5 block (128 w) | 128 → 128 | 0 | 1.0× | 2.28–2.35× | 0 |
-| 1 block (256 w) | 256 → **0** | 16 | 1.0× | 1.16–1.23× | 264–370 |
-| 2 blocks (512 w) | 512 → **0** | 32 | 1.0× | 1.43–1.48× | 219–249 |
-| 8 blocks (2 048 w) | 2 048 → **0** | 128 | 1.0× | 2.27–2.29× | 265–274 |
-| 32 blocks (8 192 w) | 8 192 → **0** | 512 | 1.0× | 2.24–2.30× | 279–284 |
-| 64 blocks (16 384 w) | 16 384 → **0** | 1024 | 1.0× | 2.28–2.31× | 281–284 |
-
-`Shape::Small` (3 useful words per 16-word line → 0.19× footprint):
-
-| live set | moved words copying → immix | pinned | footprint c/i | pause immix/copying | words saved per extra µs |
-|---|---|---|---|---|---|
-| 0.25 block (12 useful w) | 12 → **64** | 0 | **0.19×** | 2.03–2.06× | **−190…−200** |
-| 0.5 block (24 useful w) | 24 → **128** | 0 | **0.19×** | 2.65–2.74× | **−174…−182** |
-| 1 block (48 useful w) | 48 → **0** | 16 | 0.19× | 2.36–2.38× | 69–72 |
-| 2 blocks (96 useful w) | 96 → **0** | 32 | 0.19× | 2.60–2.64× | 73–75 |
-| 8 blocks (384 useful w) | 384 → **0** | 128 | 0.19× | 1.69–1.76× | 80–90 |
-| 32 blocks (1 536 useful w) | 1 536 → **0** | 512 | 0.19× | 2.33–2.46× | 80–87 |
-| 64 blocks (3 072 useful w) | 3 072 → **0** | 1024 | 0.19× | 2.80–2.87× | 85–86 |
+Per point (moved words copying → immix; counts exact): below one whole block Immix is never fewer and is
+strictly more for the small-object shape — 0.25 blk `64 → 64` (Line) / `12 → 64` (Small), 0.5 blk
+`128 → 128` / `24 → 128`; from **one whole block up** Immix pins the whole live set and moves **0**
+(1/2/8/32/64 blocks → 16/32/128/512/1024 pinned) while copying re-copies the entire live set. Footprint
+c/i 1.0× (Line) / 0.19× (Small); pause (immix/copying) flat ≈2.2–2.3× in the selected regime; words saved
+per extra µs 0 below one block, then 69→85 (Small) / 264→281 (Line), plateauing at 8 blocks. The exact
+per-point tables are printed by `tests/immix_break_even.rs` (deterministic counts also asserted).
 
 **Derived rule — `select_mature` switches at 8 whole blocks (`IMMIX_BREAK_EVEN_WORDS = 2048`).** Reading the
 sweep: (1) **below one whole block Immix is never better and is strictly dominated for small objects** — it
@@ -503,17 +495,23 @@ still reproduces today's collector exactly.
   drive the SAME corpus through `AnyCollector::Copying` and `AnyCollector::Immix` behind the public API:
   identical collection-kind sequences, an intact relocated live graph, and — in `immix_parity.rs` over the
   full corpus (maps/funs/refc binaries) — one canonical structural walker that must agree for both.
-  `tests/immix_partial_block.rs` proves per-object reclamation and pinning (a `kept`-pinned object keeps
-  its address and a reference to it is left verbatim, not a spurious exhaustion). `tests/immix_measure.rs`
+  `tests/gen_immix_collector.rs` additionally drives a **multi-block object** (larger than one Immix block)
+  through `PromoteDest::reserve` and its pinning across a major (lone; mixed with small objects + garbage;
+  major-first; two runs of different length). `tests/immix_partial_block.rs` proves per-object reclamation
+  and pinning (a `kept`-pinned object keeps its address and a reference to it is left verbatim, not a
+  spurious exhaustion). `tests/immix_measure.rs`
   is the measured gate (table in Design Decisions §Measured). `from_config(&GcConfig::default())` must
   select the Copying path.
-- **`tests/immix_break_even.rs` — the re-measured break-even sweep.** A purely long-lived corpus at
-  `[4, 8, 16, 32, 128, 512, 1024]` objects (0.25 → 64 whole Immix blocks) in two shapes (`Line` =
-  one line per object; `Small` = 3-word objects, the line-rounding worst case), forced through a fullsweep
-  under both strategies, reporting moved objects/words, pinned objects, reclaimed words, resident footprint
-  and pause (fastest of 9, in ns). Every *assertion* is on the deterministic counts (moved words, pinned
-  objects, footprint words); timings are printed only. Two `#[test]`s (one per shape), serialized by a
-  `static SERIAL: Mutex<()>`; the table is in Design Decisions §The automatic rule.
+- **`tests/immix_break_even.rs` — the assertion-backed break-even sweep.** A purely long-lived corpus at
+  `[4, 8, 16, 32, 128, 512, 1024]` objects (0.25 → 64 whole Immix blocks) in three shapes (`Line` /
+  `Small` = 3-word objects / `Multi` = 17-word tuples spanning 2 lines), forced through a fullsweep under
+  both strategies. A `Law` predicts from corpus geometry exactly which live objects are pinned vs
+  evacuated and is asserted at every point: below one whole block the mark-region path pins nothing and
+  moves strictly more words than copying (line rounding); from one block up it pins the whole live set
+  (`moved_words == 0`) while copying pays the full set. `the_break_even_point_is_assertion_checked` pins
+  the constant's whole-block and full-pinning-at-8-blocks part (and NOT one line below). The *value* 8-vs-1
+  is timing-derived (the deterministic axes are flat across 1..64 blocks) and pause is printed only, never
+  asserted. Shared `static SERIAL: Mutex<()>`.
 - **`tests/mature_selection.rs` — the rule, its override, and cross-threshold correctness.**
   (1) `select_mature` selects `Copying` below `IMMIX_BREAK_EVEN_WORDS` and `Immix` at/above it, and
   `AnyCollector::from_config` follows the rule for a real collector (`GcConfig::default()` → Copying);
@@ -545,6 +543,19 @@ still reproduces today's collector exactly.
   documented rootset contract end-to-end (`materialize` → `gather_roots` → `collect` → `scatter_roots`).
 - **`tests/immix_workloads.rs` — the multi-workload measurement** (table in Design Decisions §Measured;
   deterministic counts asserted, pause times only printed).
+- **`tests/heap_growth.rs` — on-demand growth + half-forward evidence.** Sustained allocation grows the
+  nursery/mature past their initial size with every live term intact; a `max_heap_words` cap below the live
+  set makes `collect*` return a typed error with **nothing copied** (roots un-forwarded, counters unchanged,
+  a second attempt errors identically), while `ensure_capacity` grows the nursery to cover a request or
+  errors typed when capped — both strategies.
+- **`tests/memory_overhead.rs` — memory / no-leak evidence.** Per-object overhead vs the frozen layout for
+  cons/tuple/float/flat-map is asserted `< 1` word (measured **0**); a 140-cycle allocate/collect run asserts
+  the RSS (`/proc/self/statm`, skipped loudly off-Linux) and the word accounting plateau — no leak.
+- **`tests/stress_cross_generation.rs` — the cross-generation correctness gate.** One graph mixing cons
+  (shared + cyclic), nested tuples, flat + >32-key HAMT maps, on-heap binaries/bitstrings, refc binaries, an
+  off-heap MSO, Local/External/Imported funs and an external pid, through 6 minors + 2 majors under **both**
+  strategies; asserts structural equality after *each* collection, root relocation, single-copy sharing, a
+  closing cycle, dropped garbage, and untouched off-heap payloads.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
@@ -559,11 +570,12 @@ still reproduces today's collector exactly.
   consumes `GcConfig`/`AnyCollector` at all yet (`beam_process` owns a concrete `Collector`;
   `beam_rt`/`beam_bifs` use neither `AnyCollector` nor `HeapInfo`), so the rule runs only in this crate's
   tests — the runtime wiring is Stage-5 work.
-- **The Immix region is fixed-size and never grows.** `ImmixSpace` wraps a `beam_alloc::Heap` and, like
-  every semi-space here, grows by GC *replacement* rather than reallocation. A major reclaims in place,
-  but if the live nursery still does not fit afterwards the collector returns a typed heap exhaustion
-  rather than resizing the region (a `beam_rt`/policy decision, like the copying `Collector`'s fresh-space
-  sizing).
+- **The Immix region grows only by GC replacement, and only when the policy asks.** `ImmixSpace` wraps a
+  `beam_alloc::Heap`; it never reallocates in place. A major whose `HeapPolicy::mature_after_fullsweep`
+  target differs from the current capacity **relocates** the whole region into a fresh `ImmixSpace`
+  (`immix_collector.rs::relocate_major`), so the region *does* resize. Only when the policy keeps the same
+  capacity does an in-place major that still cannot hold the promoted nursery return a typed heap
+  exhaustion (no unbounded retry, no partial promotion).
 - **Promotion atomicity is guaranteed only on the *total* line budget.** A minor promotes only when
   `mature.free_lines() >= needed` (the exact line count of the live nursery graph), and a major checks the
   same after reclaiming. Line-granular allocation means an object needs a *contiguous* run of its lines,
@@ -602,6 +614,17 @@ still reproduces today's collector exactly.
   `x[0..live)`/the stack, `collect`, `scatter_roots`; `FragmentCounters` gives the no-leak check
   (`live() == 0`, `off_heap_bytes() == 0` once every fragment is dropped/transferred). Note `beam_message`
   is adding its own `HeapFragment` concurrently — reconcile with that type rather than duplicating it.
+- **The runtime should adopt the growth seam** (`beam_rt`): it currently hard-caps its term heap and
+  translates exhaustion to `error:system_limit`; give the engine context a `beam_gc` collector and call
+  `collector.ensure_capacity(heap_need, &mut roots)` from its `ensure_heap` (the root set —
+  `x_regs[0..live]` ++ stack — is already threaded there), keeping the `system_limit` translation for a
+  returned typed error. `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap".
+- **Test-id / MSO / `compare` caveats (cross-crate).** A pid is a heap term via
+  `beam_term::thing::write_external_pid` (4 words), but is **not** structurally `Equal` under
+  `beam_term::compare::eq` (raw-word fallback) — compare via `external_pid_parts`; `compare::eq` also
+  **recurses forever on a cycle**. An MSO has no on-heap reference *term*: the safe reference is the
+  `OffHeap::insert -> slot` index, never a raw pointer. Reach a refc binary's `BinRef` via the `ErlSubBits`
+  `orig` slot, not pointer adjacency. Covered by `tests/stress_cross_generation.rs`.
 - **The runtime should surface `HeapInfo`** (`beam_rt`): `HeapInfo::of(&collector)` (or
   `AnyCollector::heap_info()`) backs `erlang:process_info(Pid, garbage_collection)` and
   `system_info(garbage_collection)`; `GARBAGE_COLLECTION_KEYS` is the oracle's key order.
@@ -613,14 +636,14 @@ still reproduces today's collector exactly.
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `move_size`/`move_*`, `collect`
-- `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver, per-collection growth/shrink + `minor_gcs`
-- `src/config.rs` → GC-strategy seam: `GcConfig { policy, selection }`, `MatureKind::{Copying,Immix}` (the *strategy*; default `Copying`), `MatureSelection::{Auto,Explicit}` (the *how*; default `Auto` = the automatic rule). `mature()` is the resolved strategy, `mature_choice()` the observable decision
+- `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver, per-collection growth/shrink + `minor_gcs`, the capacity pre-check (no half-forward) and the `ensure_capacity` growth seam
+- `src/config.rs` → GC-strategy seam: `GcConfig { policy, selection }`, `MatureKind::{Copying,Immix}` (the *strategy*; default `Copying`), `MatureSelection::{Auto,Explicit}` (the *how*; default `Auto` = the automatic rule). `mature()` is the resolved strategy, `mature_choice()` the observable decision, `growable`
 - `src/selection.rs` → the **automatic rule**: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`, `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice` (`rule_kind`/`is_override`/`describe`). Safe Rust; depends only on `config`/`policy`/`immix`
 - `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, accounting views (`ImmixStats`/`ImmixCounters`)
 - `src/immix/collect.rs` → `ImmixSpace` mark/classify/evacuate/finalize phases + its `EvacDest` impl
-- `src/immix_collector.rs` → `GenImmixCollector` (copying nursery + mark-region mature), `PromoteDest`, `promote`, `scan_young`
-- `src/any_collector.rs` → `AnyCollector` strategy dispatch (`Copying`/`Immix`) over one API; `from_config` dispatches on the resolved `config.mature()`, `mature_choice()` reports the decision
-- `src/policy.rs` → `HeapPolicy` (min/max heap, `min_bin_vheap_words`, `fullsweep_after`), the curated `heap_sizes` table, `next_heap_size`, `from_spawn_opts`/`fullsweep_due`/`mature_after_fullsweep`/`young_after_collection`
+- `src/immix_collector.rs` → `GenImmixCollector` (copying nursery + mark-region mature), `PromoteDest`, `promote`, `scan_young`, `ensure_capacity`
+- `src/any_collector.rs` → `AnyCollector` strategy dispatch (`Copying`/`Immix`) over one API; `from_config` dispatches on the resolved `config.mature()`, `mature_choice()` reports the decision, `ensure_capacity` forwards
+- `src/policy.rs` → `HeapPolicy` (min/max heap, `min_bin_vheap_words`, `fullsweep_after`), the curated `heap_sizes` table, `next_heap_size`, `from_spawn_opts`/`fullsweep_due`/`mature_after_fullsweep`/`young_after_collection`, `unbounded`
 - `src/heap_info.rs` → the `garbage_collection` observables: `HeapInfo`, `HeapObservable`, `GARBAGE_COLLECTION_KEYS`
 - `src/fragment.rs` → heap fragments: `HeapFragment`, `FragmentChain`, `FragmentRoots`, `FragmentCounters` (the collector-side copy-in + rootset hook)
 - `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` — the slot-indexed off-heap list (`push`/`insert`/`get`/`iter`/`sweep`) over off-heap refcounted large objects **and** refc binaries
@@ -641,6 +664,9 @@ still reproduces today's collector exactly.
 - `tests/gc_pressure.rs` / `tests/gc_pressure_structures.rs` / `tests/gc_pressure_offheap.rs` → threshold pressure, HAMT promotion, shared/cyclic graphs, dead refc binaries, fun-env refc binaries (through both strategies)
 - `tests/fragments.rs` → fragment→heap copy-in (shared/cross-fragment graphs, off-heap transfer + no leak) and the rootset contract
 - `tests/immix_workloads.rs` → the multi-workload copying-vs-Immix measurement (Design Decisions §Measured)
+- `tests/heap_growth.rs` → sustained-growth (nursery/mature grow, live terms intact), the no-half-forward typing under a too-small cap, and the `ensure_capacity` seam
+- `tests/memory_overhead.rs` → per-object overhead vs the frozen layout + the RSS/word-accounting no-leak plateau
+- `tests/stress_cross_generation.rs` → the mixed-term cross-generation correctness gate (cons/tuples/maps/binaries/refc/MSO/funs/pids) through both strategies
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`/`adjust_after_fullsweep`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
 - `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`) (read-only)
