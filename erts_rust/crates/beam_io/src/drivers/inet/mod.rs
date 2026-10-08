@@ -48,6 +48,8 @@
 //! | `recv` | `TCP_REQ_RECV` (`:12268`) | — | `[1]` |
 //! | `shutdown` | `TCP_REQ_SHUTDOWN` (`:12339`) | `[how]` | `[1]` |
 //! | `close` | `INET_REQ_CLOSE` (`:12259`) | — | `[1]` |
+//! | `setopts` | `INET_REQ_SETOPTS` (`:11111`) | option records `[opt, val_be32]*` | `[1]`, or `[0] ++ "einval"` |
+//! | `getopts` | `INET_REQ_GETOPTS` (`:11046`) | option codes `[opt]*` | `[1] ++ [opt, val_be32]*`, or `[0] ++ "einval"` |
 //!
 //! A reply is the C's `ctl_reply` shape: a one-byte result tag ([`INET_REP_OK`] or
 //! [`INET_REP_ERROR`], `:869-871`) followed by a payload — `ctl_reply`/`ctl_reply_ok`/
@@ -65,6 +67,64 @@
 //! IPv4 address, or `[INET_AF_ANY | INET_AF_LOOPBACK, port_hi, port_lo]` (3 bytes) for
 //! `0.0.0.0`/`127.0.0.1` (`INET_AF_*`, `:756-763`). DNS resolution and IPv6/UDP are out of
 //! scope for this floor, so any other family tag is a `BadArg`.
+//!
+//! # The socket options
+//!
+//! `setopts`/`getopts` speak the C's option wire verbatim and are documented in full in
+//! [`self::opt`]: `setopts` takes `[opt, val_be32]` five-byte records and answers `[1]`;
+//! `getopts` takes one-byte option codes and answers `[1] ++ [opt, val_be32]*` in request
+//! order. Four codes are served — `keepalive` (`SO_KEEPALIVE`), `sndbuf` (`SO_SNDBUF`),
+//! `recbuf` (`SO_RCVBUF`) and `nodelay` (`TCP_NODELAY`) — each a direct
+//! `setsockopt(2)`/`getsockopt(2)`, so `recbuf`/`sndbuf` report **the kernel's own value**
+//! (on Linux a doubled request: 4096 reads back as 8192, exactly as the oracle reports it).
+//! Any other code is the C's `[0] ++ "einval"`, which is also where the absent framing,
+//! `{active, …}` and `send_timeout` options land — see the next section.
+//!
+//! # What the real `gen_tcp` still needs
+//!
+//! The verbs above are the whole of what this floor implements. Everything below is **absent
+//! by design** and answers a **clear error** (`[0]einval`, `BadArg`, or the C's own
+//! state error) rather than a wrong result; each names what it would require:
+//!
+//! * **The `{active, false|true|once|N}` modes** (`INET_LOPT_ACTIVE`, `:22`) — this driver
+//!   never delivers input on its own. Bytes land in the port input queue and the runtime
+//!   decides when to fetch them (the port-task round's [`crate::PortNotification`] seam).
+//!   Active mode is the C's `tcp_deliver`/`tcp_recv` loop driving the port's *output* side
+//!   itself, plus a delivery mode (`{deliver, port|term}`, `INET_LOPT_DELIVER`, `:25`) and the
+//!   `active_count` bookkeeping (`:6968`-`:7010`) — a driver-owned message path, deliberately
+//!   outside this crate's seam.
+//! * **The `{packet, N}`/`line`/`http`/`raw` header decoding** (`INET_LOPT_PACKET`, `:23`) —
+//!   the C's `htype` machinery (`tcp_parse_options` and its `PacketParseType` handlers,
+//!   `:2000`+): a per-packet header computed on the read path that re-frames the input queue
+//!   and interacts with `TCP_REQ_RECV`'s length argument and with `INET_LOPT_LINE_DELIM`
+//!   (`:40`). It is the largest single piece of the driver. Here the queue carries the raw
+//!   byte stream.
+//! * **Per-operation timeouts** — `TCP_REQ_RECV`'s 4-byte timeout (`:12277`) and
+//!   `send_timeout`/`send_timeout_close` (`INET_LOPT_TCP_SEND_TIMEOUT`(`:30`)/
+//!   `_CLOSE`(`:35`)). `send_timeout` is **not** bounded enough to add cleanly: the C arms a
+//!   driver multi-timer (`add_multi_timer(..., &tcp_inet_send_timeout)`, `:13789`) that fires
+//!   while output is queued and answers an **asynchronous** `inet_reply`-shaped
+//!   `{error, timeout}` (closing the socket under `send_timeout_close`, `:12458`-`:12482`).
+//!   This port owns exactly one `TIMEOUT` task and no async reply channel — the synchronous
+//!   `send` verb has already answered by the time a timeout could fire — so storing the
+//!   deadline without being able to act on it would be a wrong result, and both options stay
+//!   `[0]einval`.
+//! * **`controlling_process`** is **not** driver state: `inet:tcp_controlling_process/2`
+//!   (`lib/kernel/src/inet.erl:4848`) is `erlang:port_connect(S, NewOwner)` plus an Erlang-side
+//!   drain of already-buffered `{tcp, S, Data}`/`{inet_async, …}` messages. There is no
+//!   `INET_REQ_*` for it, and the [`crate::Driver`] seam has no notion of an owner — see the
+//!   handoff note in the crate `CONTEXT.md`.
+//! * **The async-op queue** — `INET_MAX_ASYNC = 1` (`:1069`), `enq_async`, and the
+//!   `[1] ++ async_id_be16` reply plus the later `{inet_async, Port, Ref, Result}` message. The
+//!   C's `connect`/`recv`/`accept` are asynchronous request/reply exchanges through it; this
+//!   floor's `recv` is a **synchronous** read-now verb (empty argument, `[1]` reply, bytes into
+//!   the port input queue) and its `accept`/`connect` transfer or complete in place. This is
+//!   also why `recv` rejects the C's 8-byte `Timeout(4), Length(4)` payload with `BadArg`
+//!   rather than accepting arguments it cannot honor.
+//! * **IPv6, UDP, SCTP and Unix-domain sockets, and DNS resolution** — `open` accepts only
+//!   `AF_INET`/`SOCK_STREAM` (`:11961`-`:11990`) and `bind`/`connect` only the packed
+//!   IPv4/`INADDR_ANY`/`INADDR_LOOPBACK` forms (`:4795`); any other family tag is `BadArg`.
+//! * **Multi-accept** — see the accept divergence below.
 //!
 //! # Readiness and flow control
 //!
@@ -103,17 +163,17 @@
 //! becomes the port's socket (registered [`Interest::READABLE`]) and the reply carries the
 //! **new descriptor** (`[1] ++ fd_be32`) where the C carries the async id. The driver keeps
 //! ownership of that descriptor; it is reported for correlation only. Multi-accept (one
-//! listener serving many connections) is therefore deferred, as are the C's async-op
-//! machinery (`INET_MAX_ASYNC = 1`, `:1069`) and its timeout handling.
+//! listener serving many connections) is therefore deferred — it needs the async-op queue and
+//! the port-creation capability listed in the section above.
 //!
 //! # Ownership
 //!
 //! The driver **owns** its descriptors: [`TcpInetDriver::from_socket`] adopts a caller's
 //! socket, `open`/`accept` create their own, and every one of them is closed on `stop`, on the
 //! `close` verb and on `Drop`; nothing else may close them. All raw socket syscalls
-//! (`socket`/`bind`/`listen`/`accept`/`connect`/`getsockname`/`getsockopt`/`read`/`send`/
-//! `shutdown`/`close`) live in this module, and every `unsafe` block carries a `// SAFETY:`
-//! rationale.
+//! (`socket`/`bind`/`listen`/`accept`/`connect`/`getsockname`/`getsockopt`/`setsockopt`/`read`/
+//! `send`/`shutdown`/`close`) live in the private `sys` submodule, and every `unsafe` block
+//! carries a `// SAFETY:` rationale.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/drivers/common/inet_drv.c` and the
 //! Erlang half `erts/preloaded/src/prim_inet.erl` (the magic number and the packed argument
@@ -128,6 +188,7 @@ use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
 
+mod opt;
 mod sys;
 mod wire;
 
@@ -139,6 +200,11 @@ pub use self::wire::{
     INET_REP_ERROR, INET_REP_OK, INET_TYPE_STREAM, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 use self::wire::{ctl_error, ctl_ok, ctl_xerror, errno_name, parse_address};
+
+// The `INET_REQ_SETOPTS`/`INET_REQ_GETOPTS` option vocabulary (`keepalive`/`sndbuf`/`recbuf`/
+// `nodelay`) lives in the private `opt` submodule; its codes are re-exported the same way.
+pub use self::opt::{INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, TCP_OPT_NODELAY};
+use self::opt::{get_options, set_options};
 
 // The raw `libc` socket wrappers (`socket`/`accept`/`bind`/`listen`/`getsockopt`/`shutdown`/
 // `close`) live in the private `sys` submodule, so every `unsafe` block of the driver sits in
@@ -853,12 +919,18 @@ impl TcpInetDriver {
     /// too, and the bytes that read collected stay in the port input queue for the runtime to
     /// deliver.
     ///
+    /// This is a **synchronous** read-now verb, not the C's asynchronous `TCP_REQ_RECV`: that
+    /// one takes a `Timeout(4), Length(4)` payload, requires a passive socket and a raw header
+    /// type, and answers `[1] ++ async_id_be16` (`inet_drv.c:12268`-`:12322`), with the data
+    /// arriving later as an `{inet_async, …}` message. This floor has no async-op queue (see
+    /// the module docs), so it accepts **no** argument and answers the plain `[1]`; a non-empty
+    /// argument is a `BadArg` rather than a silently-ignored timeout/length.
+    ///
     /// # Errors
     ///
     /// `BeamError::BadArg` for a non-empty argument (the C's `TCP_REQ_RECV` carries a timeout
-    /// and a length this floor does not honor, so accepting them would silently ignore
-    /// them — see the module docs), or the read failure [`TcpInetDriver::read_available`]
-    /// reports.
+    /// and a length this floor does not honor, so accepting them would silently ignore them),
+    /// or the read failure [`TcpInetDriver::read_available`] reports.
     fn verb_recv(&mut self, ctx: &mut DriverContext<'_>, arg: &[u8]) -> Result<Vec<u8>> {
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
@@ -919,6 +991,39 @@ impl TcpInetDriver {
         self.release_socket(ctx)?;
         Ok(ctl_ok())
     }
+
+    /// The `setopts` verb: applies the C's `INET_REQ_SETOPTS` option records.
+    ///
+    /// The payload is a sequence of five-byte `[opt, val_be32]` records (the C's
+    /// `inet_set_opts`); a partial trailing record is ignored. See [`self::opt`] for the served
+    /// codes and the mirrored `propagate = 0` semantics: the reply is the C's `[1]` unless a
+    /// code is unserved, which is `[0] ++ "einval"`.
+    ///
+    /// Like the C (`inet_drv.c:11111`, which has no `IS_OPEN` guard), a port that has no socket
+    /// yet still validates the codes and answers `[1]` — a `setopts` before `open` is a no-op,
+    /// not an error, exactly as the oracle behaves.
+    ///
+    /// # Errors
+    ///
+    /// Never for a served option (a rejected `setsockopt(2)` is not propagated, as in the C).
+    fn verb_setopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
+        set_options(self.socket, arg)
+    }
+
+    /// The `getopts` verb: reads the C's `INET_REQ_GETOPTS` options back.
+    ///
+    /// The payload is a sequence of one-byte option codes; the reply is the C's `[1]` followed
+    /// by an `[opt, val_be32]` record per code, in request order. A code this floor does not
+    /// serve is `[0] ++ "einval"`, which is where `{packet, N}`/`{active, …}`/`send_timeout`
+    /// land (see the module docs) — a clear "not available", never a fabricated value.
+    ///
+    /// # Errors
+    ///
+    /// `BeamError::Io` when a served option's `getsockopt(2)` fails on a live socket (the C
+    /// silently drops that record instead; see [`self::opt`]).
+    fn verb_getopts(&mut self, arg: &[u8]) -> Result<Vec<u8>> {
+        get_options(self.socket, arg)
+    }
 }
 
 impl Default for TcpInetDriver {
@@ -978,6 +1083,8 @@ impl Driver for TcpInetDriver {
             "recv" => self.verb_recv(ctx, arg),
             "shutdown" => self.verb_shutdown(ctx, arg),
             "close" => self.verb_close(ctx),
+            "setopts" => self.verb_setopts(arg),
+            "getopts" => self.verb_getopts(arg),
             _ => Err(error::badarg()),
         }
     }
