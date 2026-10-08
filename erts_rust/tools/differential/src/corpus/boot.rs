@@ -22,7 +22,14 @@
 //! a pid, the mailbox carries a real `spawn` + `!` + `receive` round trip (including a
 //! non-zero `after` timeout), and `erlang:processes/0` is a list. The **process dictionary**
 //! (`put/2`, `get/1`, `erase/1`) and `init:get_status/0` are part of the booted system's
-//! observable surface; every case below `agree`s.
+//! observable surface.
+//!
+//! The boot-path **prerequisite primitives** (the `erlang:pre_loaded/0` set, the boot script's
+//! `which_applications/0`/`loaded_applications/0`, the preloaded `init`, kernel's
+//! `error_logger`/`vsn` entries, the `register/2` + `whereis/1` and group-leader-inheritance
+//! kernel-process primitives, the `-boot` init argument and the boot chain's
+//! `proc_lib:start_link/4` **blocked-seam** capability case) live in the sibling `boot_prereq`
+//! group; this group keeps the boot/version observability surface.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.9 cases: boot/version observability, asserted by shape.

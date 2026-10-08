@@ -45,36 +45,38 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `unsafe` is forbidden in both crates.
 
 ## Status
-- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=723 agree=715
+- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=780 agree=772
   mismatch=0 unsupported=8 skipped=0` (per-contract counts under "Gate coverage" in Notes for Agents).
-  `wire/new_fun_ext_encode` is unclosable by design; the other seven are the `wire_ids` node-identity family.
+  `wire/new_fun_ext_encode` is unclosable by design; the other seven are the five `erlang:statistics/1`
+  counters the runtime does not serve and the two `erlang:monitor/2,3` gap shapes.
 - **`beam_rt` gap signalling is honoured:** cases the runtime cannot run classify as `unsupported`,
   never `mismatch`.
 - **Benchmarks:** current numbers and their measurement caveats live in `bench/RESULTS.md` (its
   Milestone-1 archive is explicitly marked there); the driver is read-only against the external repos.
 
 ## Routing Table
-- `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 723 cases), JSON reports
+- `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 780 cases), JSON reports
 - `bench/` → benchmark driver: pluggable workload plugins (Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX), system-ERTS baseline, result store + `compare`
 
 ## Notes for Agents
 - Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
 - Oracle is the system Erlang on `PATH` (OTP 29.1.1 / erts-17.1). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
 - **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
-- **Gate coverage (verified against code):** `differential suite` reports `summary: total=723 agree=715
+- **Gate coverage (verified against code):** `differential suite` reports `summary: total=780 agree=772
   mismatch=0 unsupported=8 skipped=0` (a case may declare several contracts, so the per-contract totals
   below exceed `summary.total`). All nine contracts A.1–A.9 have corpus cases — A.1 154/154 · A.2 176/176
-  · A.3 34/34 · A.4 64/64 · A.5 79 (71 agree + 8 unsupported) · A.6 44/44 · A.7 265/265 · A.8 64/64 ·
-  A.9 52/52. A.4 (driver C ABI) is covered end to end by the `driver_c` group (a real C driver `.so`
-  driven through the port lifecycle and the `port_command` echo round trip), alongside the built-in
-  spawn-driver `driver/` cases and the structural C-ABI check (`tests/abi.rs`). The genuine end-to-end
-  agreement core is the module-run groups (`modules`/`mexec`/`nif_so`/`nif_res`/`driver_c`/`records`).
+  · A.3 34/34 · A.4 64/64 · A.5 79 (78 agree + 1 unsupported) · A.6 44/44 · A.7 322 (315 agree + 7
+  unsupported) · A.8 64/64 · A.9 52/52. A.4 (driver C ABI) is covered end to end by the `driver_c` group
+  (a real C driver `.so` driven through the port lifecycle and the `port_command` echo round trip),
+  alongside the built-in spawn-driver `driver/` cases and the structural C-ABI check (`tests/abi.rs`). The
+  genuine end-to-end agreement core is the module-run groups (`modules`/`mexec`/`nif_so`/`nif_res`/`driver_c`/`records`).
   Two contracts stay shallow: A.5 (the `wire` group covers the *ETF wire codec* only — a live handshake /
   `DOP_*` loopback needs two connected nodes and is not expressible through a single CLI process) and A.9
   (build) through *boot/version observability* only (no self-hosted build). The 8 `unsupported` are
   `wire/new_fun_ext_encode` (an `erl_eval` lambda's closure identity, unclosable without porting
-  `erl_eval`/`erl_scan`/`erl_parse`) plus the seven `wire_ids/*` node-identity cases (`nodes/0,1`,
-  `set_cookie/2`).
+  `erl_eval`/`erl_scan`/`erl_parse`), the five `erlang:statistics/1` counters the runtime does not serve
+  (`proc_signals/statistics_*_unsupported`) and the two `erlang:monitor/2,3` gap shapes
+  (`proc_signals/monitor_3_tag_option_unsupported`, `proc_signals/monitor_port_unsupported`).
 - **No CI wiring (verified):** `.github/` contains no `cargo`/`erts_rust`/`differential` reference, so
   `differential/gate.sh` and `bench` are manual/opt-in commands — nothing enforces the gate automatically.
 - **Other oracle-backed harnesses live outside this node** (each spawns the system `erl` directly, not

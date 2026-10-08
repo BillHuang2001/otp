@@ -112,14 +112,15 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
   outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate (`tools/differential`):** per `tools/differential/CONTEXT.md`, `summary: total=723
-  agree=708 mismatch=0 unsupported=15 skipped=0` (`gate.sh` → exit `3`) — per contract A.1 154/154 · A.2
-  176/176 · A.3 34/34 · A.4 64/64 · A.5 79/71 (+8 unsupported) · A.6 44/44 · A.7 265/263 (+2) · A.8
-  64/59 (+5) · A.9 52/52. **No case disagrees.** The 15 `unsupported` are honest capability gaps, never
+- **Compatibility gate (`tools/differential`):** per `tools/differential/CONTEXT.md`, `summary: total=780
+  agree=772 mismatch=0 unsupported=8 skipped=0` (`gate.sh` → exit `3`) — per contract A.1 154/154 · A.2
+  176/176 · A.3 34/34 · A.4 64/64 · A.5 79 (78 agree + 1 unsupported) · A.6 44/44 · A.7 322 (315 + 7) · A.8
+  64/64 · A.9 52/52. **No case disagrees.** The 8 `unsupported` are honest capability gaps, never
   `mismatch`: `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
-  `erl_eval`/`erl_scan`/`erl_parse`), the 7 `wire_ids` node-identity cases (`nodes/0,1`, `set_cookie/2`),
-  the 5 `erlang:memory/0,1` cases, and `start_timer/3` + `function_exported/3`. (Sibling docs cite older
-  totals; re-run `gate.sh` for the exact current split.)
+  `erl_eval`/`erl_scan`/`erl_parse`), the five `erlang:statistics/1` counters the runtime does not serve
+  (`proc_signals/statistics_*_unsupported`), and the two `erlang:monitor/2,3` gap shapes
+  (`proc_signals/monitor_3_tag_option_unsupported`, `proc_signals/monitor_port_unsupported`). (Sibling
+  docs cite older totals; re-run `gate.sh` for the exact current split.)
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 637
   keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through two
   defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`). Registered-but-unadopted BIFs return a
