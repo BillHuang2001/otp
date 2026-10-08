@@ -182,6 +182,20 @@ fn created_threads() -> MutexGuard<'static, HashMap<usize, Option<Vec<u8>>>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Register a created thread's debug name under `key`, **without** replacing an existing entry.
+///
+/// The name is registered twice for the same tid: by [`thread_create`] on the new thread's behalf
+/// (before it publishes the tid, so a caller's `thread_name(tid)` is correct as soon as the call
+/// returns) and by [`thread_start`] from inside the new thread. Those two registrations race — the
+/// new thread can reach its entry point before the creator's `pthread_create` returns — so this
+/// keeps **whichever lands first** and makes the loser a no-op. Plainly inserting in both places
+/// would instead *replace* (and free) the winning `Vec<u8>`, dangling a pointer that a concurrent
+/// [`thread_name`] caller — or the new thread's own entry point — already holds; the buffer is
+/// documented to stay valid until the thread is joined.
+fn register_thread_name(key: usize, name: Option<Vec<u8>>) {
+    created_threads().entry(key).or_insert(name);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Mutex (`enif_mutex_*` / `erl_drv_mutex_*`)
 // ---------------------------------------------------------------------------------------------
@@ -678,7 +692,7 @@ extern "C" fn thread_start(payload: *mut c_void) -> *mut c_void {
     // fields out of the box. Freeing it before running `func` also means a `thread_exit` from
     // `func` cannot leak it.
     let Start { func, arg, name } = *unsafe { Box::from_raw(payload as *mut Start) };
-    created_threads().insert(tid_key(thread_self_tid()), name);
+    register_thread_name(tid_key(thread_self_tid()), name);
     func(arg)
 }
 
@@ -755,8 +769,9 @@ pub unsafe fn thread_create(
     // `out_tid` below) always observes an entry that exists, and so the creator's own
     // `thread_name(tid)` is correct as soon as this call returns. The new thread registers the same
     // name at its entry (`thread_start`), which makes its own `thread_type`/`thread_name` correct
-    // without waiting for this thread to resume.
-    created_threads().insert(tid_key(tid_from_pthread(tid)), name);
+    // without waiting for this thread to resume; that registration races this one, so both go
+    // through `register_thread_name`, which keeps the first entry and never replaces it.
+    register_thread_name(tid_key(tid_from_pthread(tid)), name);
     // SAFETY: `out_tid` is a valid writable tid slot (checked non-null above and guaranteed by the
     // caller).
     unsafe { *out_tid = tid_from_pthread(tid) };
