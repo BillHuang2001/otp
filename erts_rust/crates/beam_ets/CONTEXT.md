@@ -171,6 +171,7 @@ impl Table {
     pub fn match_object_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
 }
 ```
+- `pub struct Heir { pub owner: OwnerId, pub data: Eterm }` and `pub enum OwnerDeath { NotOwner, Deleted, Transferred(Heir) }` (from `lifecycle.rs`) — the owner-death transition (see `table/lifecycle.rs`). `Table::owner_died` takes the process layer's liveness oracle (`FnOnce(OwnerId) -> bool`) because this crate has no process-liveness concept; `Transferred` obliges the runtime to deliver `{'ETS-TRANSFER', Tid, FromPid, data}` and `Deleted` to drop the table — neither is an effect of this crate.
 - `pub fn match_spec_run(list: Eterm, spec: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>` (from `run.rs`) — the table-independent `ets:match_spec_run/2` runner.
 - `pub(crate) trait Interior` — the internal dispatch seam implemented by the two interiors
   (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/
