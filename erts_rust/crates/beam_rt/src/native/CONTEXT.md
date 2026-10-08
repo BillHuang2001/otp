@@ -276,7 +276,8 @@ form (`:47`) for an errno outside the table.
   `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`, `make_link/2`,
   `make_symlink/2`, `altname/1`
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7)
-- `process.rs` / `port.rs` → the process/registry/reference and port-write surfaces (contracts A.4/A.8)
+- `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/registry/reference, monitor/demonitor and exit-signalling surfaces, and the port-write surface (contracts A.4/A.8)
+- `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`) + its unit tests
 - `test_support.rs` → the shared fixtures
 - `../context/mod.rs` → `RuntimeContext::call_bif` / `try_native`'s caller and the host seams
 - `../context/bridges.rs` → `module_md5` (the `.beam` MD5 digest `beamfile_module_md5/1` serves, re-exported `pub(crate)` by `../context/mod.rs` so the floor reuses it instead of re-deriving the chunk parse)
