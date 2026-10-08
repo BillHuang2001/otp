@@ -73,7 +73,8 @@ impl<'g> TableWrite<'g> {
         self.guard.owner()
     }
 
-    /// The installed heir, if any.
+    /// The installed heir, if any. Its [`data`](Heir::data) is `Some(term)` for an
+    /// arity-3 `{heir, Pid, Data}` and `None` for an arity-2 `{heir, Pid}`.
     pub fn heir(&self) -> Option<Heir> {
         self.guard.heir()
     }
@@ -271,6 +272,12 @@ impl<'g> TableWrite<'g> {
     }
 
     /// Set (or clear) the heir directly (owner-level primitive).
+    ///
+    /// The outgoing heir's table-owned gift copy is reclaimed by the same shared
+    /// path the raw table uses, so a view mixing this with `set_heir` does not leak
+    /// (see [`Table::set_heir`]). The new heir's [`data`](Heir::data) is stored
+    /// verbatim — `Some(term)` for `{heir, Pid, Data}`, `None` for the arity-2
+    /// `{heir, Pid}` — and is **not** copied into table storage.
     pub fn set_heir(&mut self, heir: Option<Heir>) {
         self.guard.set_heir(heir)
     }

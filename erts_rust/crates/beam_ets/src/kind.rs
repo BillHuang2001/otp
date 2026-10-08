@@ -245,9 +245,11 @@ pub struct TableOptions {
     /// Whether `read_concurrency` was requested. The **effective** value is
     /// [`TableOptions::read_concurrency`] (a `private` table forces it off).
     read_concurrency: bool,
-    /// The **creation-time** heir (`{heir, Pid, Data}`), if one was given. The
-    /// value is adopted by [`Table::build`](crate::Table) as the table's initial
-    /// heir; `ets:setopts(T, {heir, …})` replaces it later.
+    /// The **creation-time** heir (`{heir, Pid}` / `{heir, Pid, Data}`), if one was
+    /// given. The value is adopted by [`Table::build`](crate::Table) as the table's
+    /// initial heir; `ets:setopts(T, {heir, …})` replaces it later. Its
+    /// [`data`](Heir::data) records the option's arity (`Some` for arity 3, `None`
+    /// for arity 2).
     heir: Option<Heir>,
     /// The explicit `{decentralized_counters, Bool}` creation option, if given.
     /// `None` means "not requested", i.e. the kind's default (see
@@ -329,7 +331,8 @@ impl TableOptions {
         self
     }
 
-    /// Install the **creation-time** heir (`{heir, Pid, Data}` / `{heir, none}`).
+    /// Install the **creation-time** heir (`{heir, Pid}` / `{heir, Pid, Data}` /
+    /// `{heir, none}`).
     ///
     /// `Some(heir)` records the heir a freshly built table starts with —
     /// [`Table::build`](crate::Table) adopts it — and `None` clears it (what
@@ -337,8 +340,16 @@ impl TableOptions {
     /// there is no malformed value to reject here, so the `badarg` for a
     /// non-pid/`none` heir belongs to the `beam_bifs` option parser.
     ///
-    /// The gift data of a *creation-time* heir is the `beam_bifs` parser's
-    /// concern: `{heir, Pid}` (arity 2) has no `Data` term.
+    /// The option's **arity** is carried in [`Heir::data`]: `Some(term)` is
+    /// `{heir, Pid, Data}` (arity 3, whose `term` the oracle delivers verbatim —
+    /// `undefined` included) and `None` is `{heir, Pid}` (arity 2, no gift data, so
+    /// the oracle sends **no** `{'ETS-TRANSFER', …}` message on owner death). That
+    /// distinction is the parser's to get right, just like the `none`/pid check.
+    ///
+    /// The creation-time heir is stored **verbatim** (no copy into table storage):
+    /// a non-immediate `data` term must be one the caller keeps alive for the table's
+    /// lifetime — use [`Table::install_heir`](crate::Table::install_heir) when the
+    /// data lives on a process heap.
     pub fn set_heir(&mut self, heir: Option<Heir>) -> &mut Self {
         self.heir = heir;
         self
@@ -418,7 +429,8 @@ impl TableOptions {
         self.access == Access::Private
     }
 
-    /// The creation-time heir, if one was requested.
+    /// The creation-time heir, if one was requested. Its [`data`](Heir::data) is
+    /// `Some(term)` for `{heir, Pid, Data}` and `None` for `{heir, Pid}`.
     pub fn heir(&self) -> Option<Heir> {
         self.heir
     }
@@ -705,7 +717,8 @@ mod tests {
     }
 
     /// The creation-time heir is stored verbatim (gift data included) and can be
-    /// cleared, exactly like `{heir, Pid, Data}` / `{heir, none}` at creation.
+    /// cleared, exactly like `{heir, Pid, Data}` / `{heir, none}` at creation. The
+    /// arity-2 `{heir, Pid}` form is the `data: None` heir.
     #[test]
     fn creation_time_heir_is_stored_and_cleared() {
         let mut opts = TableOptions::new();
@@ -713,11 +726,20 @@ mod tests {
 
         let heir = Heir {
             owner: OwnerId::new(4),
-            data: make_small(11),
+            data: Some(make_small(11)),
         };
         opts.set_heir(Some(heir));
         assert_eq!(opts.heir(), Some(heir));
-        assert_eq!(opts.heir().map(|h| h.data), Some(make_small(11)));
+        assert_eq!(opts.heir().and_then(|h| h.data), Some(make_small(11)));
+
+        // The arity-2 form: an heir with no gift data at all.
+        let arity_two = Heir {
+            owner: OwnerId::new(4),
+            data: None,
+        };
+        opts.set_heir(Some(arity_two));
+        assert_eq!(opts.heir(), Some(arity_two));
+        assert_eq!(opts.heir().and_then(|h| h.data), None);
 
         opts.set_heir(None);
         assert_eq!(opts.heir(), None);

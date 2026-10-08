@@ -644,7 +644,7 @@ fn write_view_exposes_the_ownership_operations() {
             write.set_owner(Some(first));
             write.set_heir(Some(Heir {
                 owner: second,
-                data: make_small(7),
+                data: Some(make_small(7)),
             }))
         })
         .expect("no poisoned lock");
@@ -655,7 +655,7 @@ fn write_view_exposes_the_ownership_operations() {
     let heir_owner = shared
         .with_write(|write| {
             let heir = write.heir().expect("the heir is installed");
-            assert!(eq(heir.data, make_small(7), &AtomTable::new()));
+            assert_eq!(heir.data, Some(make_small(7)));
             assert!(write.give_away(Some(first), Some(second)).is_ok());
             heir.owner
         })

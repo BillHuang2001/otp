@@ -208,20 +208,24 @@ fn creation_time_heir_is_adopted() {
     );
 
     let mut atoms = AtomTable::new();
-    let heir = Heir {
+    // `{heir, Pid}` (arity 2) carries **no** `Data` term at all: `data: None`.
+    let arity_two = Heir {
         owner: OwnerId::new(9),
-        // `{heir, Pid}` (arity 2) has no `Data` term; the parser resolves it to
-        // the `undefined` atom (see the crate `CONTEXT.md`).
-        data: interned_atom(&mut atoms, "undefined"),
+        data: None,
     };
 
     // (a) `{heir, Pid}`.
     let mut opts = TableOptions::new();
-    opts.set_heir(Some(heir));
-    assert_eq!(opts.heir(), Some(heir));
+    opts.set_heir(Some(arity_two));
+    assert_eq!(opts.heir(), Some(arity_two));
     let arity2 = Table::new(TableId::next(), opts).expect("a fresh table");
-    assert_eq!(arity2.info().heir, Some(heir.owner), "the heir is adopted");
-    assert_eq!(arity2.heir(), Some(heir));
+    assert_eq!(arity2.info().heir, Some(arity_two.owner), "the heir is adopted");
+    assert_eq!(arity2.heir(), Some(arity_two));
+    assert_eq!(
+        arity2.heir_data(),
+        None,
+        "an arity-2 heir has no gift data at all, so no transfer message is sent"
+    );
     assert_eq!(
         arity2.info().heir,
         Some(OwnerId::new(9)),
@@ -236,13 +240,33 @@ fn creation_time_heir_is_adopted() {
 
     // (b) `{heir, Pid, Data}` — the gift data is stored verbatim on `Heir`.
     let mut opts = TableOptions::new();
-    opts.set_heir(Some(Heir {
+    let gift = Heir {
         owner: OwnerId::new(4),
-        data: make_small(7),
-    }));
+        data: Some(make_small(7)),
+    };
+    opts.set_heir(Some(gift));
     let arity3 = Table::new(TableId::next(), opts).expect("a fresh table");
     assert_eq!(arity3.info().heir, Some(OwnerId::new(4)));
-    assert_eq!(arity3.heir().map(|h| h.data), Some(make_small(7)));
+    assert_eq!(arity3.heir().and_then(|h| h.data), Some(make_small(7)));
+
+    // (b') `{heir, Pid, undefined}` is **arity 3**: it carries the atom `undefined`
+    // as its gift data, so on owner death the oracle *does* deliver
+    // `{'ETS-TRANSFER', …, undefined}` — unlike the arity-2 form above, which
+    // delivers nothing. The two are distinguishable in the model.
+    let mut opts = TableOptions::new();
+    let undefined_gift = Heir {
+        owner: OwnerId::new(4),
+        data: Some(interned_atom(&mut atoms, "undefined")),
+    };
+    opts.set_heir(Some(undefined_gift));
+    let arity3_undefined = Table::new(TableId::next(), opts).expect("a fresh table");
+    assert_eq!(arity3_undefined.heir_data(), undefined_gift.data);
+    assert_eq!(arity3_undefined.heir(), Some(undefined_gift));
+    assert_ne!(
+        arity3_undefined.heir(),
+        arity2.heir(),
+        "the arity-2 and arity-3 (undefined) heirs differ"
+    );
 
     // (c) `{heir, none}` and an omitted option both leave the heir unset (the
     // oracle's rendered `none`).
@@ -284,7 +308,7 @@ fn option_accessors_cover_the_ets_new_surface() {
         .set_read_concurrency(true)
         .set_heir(Some(Heir {
             owner: OwnerId::new(3),
-            data: make_small(5),
+            data: Some(make_small(5)),
         }))
         .set_decentralized_counters(Some(true));
 

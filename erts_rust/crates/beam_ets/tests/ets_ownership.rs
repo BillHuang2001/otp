@@ -123,7 +123,7 @@ fn setopts_installs_and_clears_the_heir() {
 
     let gift = Heir {
         owner: heir_pid,
-        data: make_small(7),
+        data: Some(make_small(7)),
     };
     t.setopts(Some(owner), SetOpt::Heir(gift))
         .expect("the owner may set the heir");
@@ -151,7 +151,7 @@ fn setopts_requires_the_owner() {
     let mut t = table_with_owner(owner);
     let gift = Heir {
         owner: OwnerId::new(9),
-        data: make_small(7),
+        data: Some(make_small(7)),
     };
 
     assert!(matches!(
@@ -195,7 +195,7 @@ fn info_renders_the_heir_field() {
         Some(owner),
         SetOpt::Heir(Heir {
             owner: OwnerId::new(6),
-            data: make_small(0),
+            data: Some(make_small(0)),
         }),
     )
     .unwrap();
@@ -222,7 +222,7 @@ fn table_info_snapshot_includes_owner_and_heir() {
     t.set_owner(Some(owner));
     t.set_heir(Some(Heir {
         owner: heir,
-        data: make_small(0),
+        data: Some(make_small(0)),
     }));
 
     let memory = t.memory();
@@ -272,7 +272,7 @@ fn table_access_routes_ownership() {
     // `setopts` is likewise owner-gated through the view.
     let gift = Heir {
         owner: OwnerId::new(9),
-        data: make_small(3),
+        data: Some(make_small(3)),
     };
     assert!(matches!(
         t.as_requester(Some(owner)).setopts(SetOpt::Heir(gift)),
@@ -298,7 +298,7 @@ fn owner_died_transfers_to_a_live_heir_and_keeps_it_installed() {
     let owner = OwnerId::new(1);
     let heir = Heir {
         owner: OwnerId::new(9),
-        data: make_small(7),
+        data: Some(make_small(7)),
     };
     let mut t = table_with_owner(owner);
     t.set_heir(Some(heir));
@@ -326,7 +326,7 @@ fn owner_died_for_a_non_owner_is_a_no_op() {
     let owner = OwnerId::new(1);
     let heir = Heir {
         owner: OwnerId::new(9),
-        data: make_small(7),
+        data: Some(make_small(7)),
     };
     let mut t = table_with_owner(owner);
     t.set_heir(Some(heir));
@@ -364,7 +364,7 @@ fn owner_died_with_a_self_heir_deletes_the_table() {
     let mut t = table_with_owner(owner);
     t.set_heir(Some(Heir {
         owner,
-        data: make_small(7),
+        data: Some(make_small(7)),
     }));
 
     assert_eq!(
@@ -381,7 +381,7 @@ fn owner_died_with_a_dead_heir_deletes_the_table() {
     let mut t = table_with_owner(owner);
     t.set_heir(Some(Heir {
         owner: OwnerId::new(9),
-        data: make_small(7),
+        data: Some(make_small(7)),
     }));
 
     let mut liveness_calls = 0;
@@ -409,7 +409,7 @@ fn install_heir_copies_the_gift_data_into_table_owned_storage() {
     let mut source = Heap::new(64);
     let source_root = int_tuple(&mut source, &[1, 2, 3]);
 
-    t.install_heir(heir_pid, source_root)
+    t.install_heir(heir_pid, Some(source_root))
         .expect("a plain tuple is copyable");
 
     let installed = t
@@ -424,7 +424,7 @@ fn install_heir_copies_the_gift_data_into_table_owned_storage() {
         t.heir(),
         Some(Heir {
             owner: heir_pid,
-            data: installed,
+            data: Some(installed),
         })
     );
 
@@ -447,19 +447,19 @@ fn install_heir_stores_an_immediate_by_value() {
     let mut t = new_table(TableKind::Set);
     let heir_pid = OwnerId::new(4);
 
-    t.install_heir(heir_pid, make_small(42))
+    t.install_heir(heir_pid, Some(make_small(42)))
         .expect("an immediate needs no storage");
     assert_eq!(t.heir_data(), Some(make_small(42)));
     assert_eq!(
         t.heir(),
         Some(Heir {
             owner: heir_pid,
-            data: make_small(42),
+            data: Some(make_small(42)),
         })
     );
 
     // An atom gift term behaves the same way (also an immediate).
-    t.install_heir(heir_pid, NIL).expect("an immediate needs no storage");
+    t.install_heir(heir_pid, Some(NIL)).expect("an immediate needs no storage");
     assert_eq!(t.heir_data(), Some(NIL));
 }
 
@@ -472,12 +472,12 @@ fn install_heir_replacing_reclaims_the_previous_copy() {
     let mut heap = Heap::new(64);
 
     let first = int_tuple(&mut heap, &[1, 2, 3]);
-    t.install_heir(heir_pid, first).expect("a tuple is copyable");
+    t.install_heir(heir_pid, Some(first)).expect("a tuple is copyable");
     let live = t.memory();
     assert!(live > 0, "the gift copy owns table-owned words");
 
     let second = int_tuple(&mut heap, &[4, 5, 6]);
-    t.install_heir(heir_pid, second).expect("a tuple is copyable");
+    t.install_heir(heir_pid, Some(second)).expect("a tuple is copyable");
     assert_eq!(
         t.memory(),
         live,
@@ -502,7 +502,7 @@ fn heir_data_tracks_the_installed_heir() {
         Some(owner),
         SetOpt::Heir(Heir {
             owner: OwnerId::new(2),
-            data: make_small(5),
+            data: Some(make_small(5)),
         }),
     )
     .unwrap();
@@ -512,6 +512,130 @@ fn heir_data_tracks_the_installed_heir() {
     assert_eq!(t.heir_data(), None);
 }
 
+// ---------------------------------------------------------------------------
+// The reclaim path: every overwrite site frees the outgoing gift copy
+// ---------------------------------------------------------------------------
+
+/// The three overwrite sites that are **not** [`Table::install_heir`] — the raw
+/// [`Table::set_heir`], [`Table::setopts`]'s `SetOpt::Heir(_)` and its
+/// `SetOpt::ClearHeir` — all reclaim the outgoing heir's table-owned gift copy (the
+/// C `free_heir_data`, `erl_db.c:5367`), so a host mixing them with `install_heir`
+/// leaks nothing until `delete_all_objects`/drop.
+#[test]
+fn every_raw_overwrite_site_reclaims_the_previous_gift_copy() {
+    let owner = OwnerId::new(1);
+    let heir_pid = OwnerId::new(9);
+    let mut heap = Heap::new(64);
+
+    // The table's own footprint with no heir gift data installed.
+    let mut t = table_with_owner(owner);
+    let baseline = t.memory();
+
+    // (a) `set_heir` replacing a copied gift with an immediate one.
+    let gift = int_tuple(&mut heap, &[1, 2, 3]);
+    t.install_heir(heir_pid, Some(gift))
+        .expect("a tuple is copyable");
+    assert!(t.memory() > baseline, "the gift copy owns table-owned words");
+    t.set_heir(Some(Heir {
+        owner: heir_pid,
+        data: Some(make_small(7)),
+    }));
+    assert_eq!(t.memory(), baseline, "set_heir reclaimed the previous copy");
+
+    // …and `set_heir(None)` clearing a copied gift.
+    let gift = int_tuple(&mut heap, &[4, 5, 6]);
+    t.install_heir(heir_pid, Some(gift))
+        .expect("a tuple is copyable");
+    assert!(t.memory() > baseline);
+    t.set_heir(None);
+    assert_eq!(
+        t.memory(),
+        baseline,
+        "set_heir(None) reclaimed the previous copy"
+    );
+
+    // (b) `setopts(SetOpt::Heir(_))` replacing a copied gift.
+    let gift = int_tuple(&mut heap, &[7, 8, 9]);
+    t.install_heir(heir_pid, Some(gift))
+        .expect("a tuple is copyable");
+    assert!(t.memory() > baseline);
+    t.setopts(
+        Some(owner),
+        SetOpt::Heir(Heir {
+            owner: heir_pid,
+            data: Some(make_small(1)),
+        }),
+    )
+    .expect("the owner may replace the heir");
+    assert_eq!(
+        t.memory(),
+        baseline,
+        "setopts(Heir) reclaimed the previous copy"
+    );
+
+    // (c) `setopts(SetOpt::ClearHeir)` clearing a copied gift.
+    let gift = int_tuple(&mut heap, &[10, 11, 12]);
+    t.install_heir(heir_pid, Some(gift))
+        .expect("a tuple is copyable");
+    assert!(t.memory() > baseline);
+    t.setopts(Some(owner), SetOpt::ClearHeir)
+        .expect("the owner may clear the heir");
+    assert_eq!(
+        t.memory(),
+        baseline,
+        "setopts(ClearHeir) reclaimed the previous copy"
+    );
+
+    // (d) `install_heir(_, None)` — an arity-2 heir — reclaims as well.
+    let gift = int_tuple(&mut heap, &[13, 14, 15]);
+    t.install_heir(heir_pid, Some(gift))
+        .expect("a tuple is copyable");
+    assert!(t.memory() > baseline);
+    t.install_heir(OwnerId::new(4), None)
+        .expect("an absent gift data owns no storage");
+    assert_eq!(
+        t.memory(),
+        baseline,
+        "install_heir(_, None) reclaimed the previous copy"
+    );
+    assert_eq!(
+        t.heir(),
+        Some(Heir {
+            owner: OwnerId::new(4),
+            data: None,
+        })
+    );
+}
+
+/// Re-installing the heir that is already installed does **not** reclaim the very
+/// root the incoming heir names — that would leave the table holding a dangling
+/// term. (This can only happen through the raw primitives, which install the
+/// caller's term verbatim.)
+#[test]
+fn reinstalling_the_installed_heir_keeps_its_gift_copy_alive() {
+    let heir_pid = OwnerId::new(9);
+    let mut t = new_table(TableKind::Set);
+    let mut heap = Heap::new(64);
+    let gift = int_tuple(&mut heap, &[1, 2, 3]);
+    t.install_heir(heir_pid, Some(gift))
+        .expect("a tuple is copyable");
+
+    let installed = t.heir().expect("the heir is installed");
+    let words = t.memory();
+
+    t.set_heir(Some(installed));
+    assert_eq!(t.memory(), words, "the live gift copy is not reclaimed");
+    assert_eq!(t.heir(), Some(installed), "the heir is unchanged");
+
+    // …and the term still reads back intact: nothing was freed out from under it.
+    let mut reference = Heap::new(64);
+    let expected = int_tuple(&mut reference, &[1, 2, 3]);
+    assert!(eq(
+        t.heir_data().expect("the gift data is installed"),
+        expected,
+        &AtomTable::new()
+    ));
+}
 // ---------------------------------------------------------------------------
 // Live-oracle cross-check of the owner-death observations
 // ---------------------------------------------------------------------------
@@ -625,4 +749,163 @@ fn owner_death_observations_match_the_live_oracle() {
         ],
         "the oracle's owner-death observations changed — the transition model is stale"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Live-oracle cross-check of the heir's two forms (arity 2 vs arity 3)
+// ---------------------------------------------------------------------------
+
+/// The embedded oracle program (an `escript`) for the two `{heir, …}` forms. It
+/// installs the heir both ways the oracle allows — `ets:setopts/2` and the
+/// creation-time `{heir, …}` option — kills the owner, and reports, per form, the
+/// `Data` the heir received in `{'ETS-TRANSFER', …}` (or `no_message`), whether the
+/// heir actually inherited the table, and whether the table survived.
+///
+/// The heir blocks on `keep_alive/0` for the whole observation, so nothing races the
+/// heir's own death. It prints one canonical line per group; the Rust assertions
+/// below pin the exact output — `{heir, Pid}` inherits **silently**, `{heir, Pid,
+/// undefined}` gets a message carrying `undefined`.
+const HEIR_FORM_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+
+main(_) ->
+    Parent = self(),
+    io:format("setopts ~p~n", [observe_forms(Parent, setopts_forms())]),
+    io:format("creation ~p~n", [observe_forms(Parent, creation_forms())]),
+    ok.
+
+%% One entry per heir form: a label plus a fun that builds the table with that form
+%% already installed.
+setopts_forms() ->
+    [{setopts_arity2, fun(H) ->
+        T = ets:new(setopts_a2, [public]),
+        _ = ets:setopts(T, {heir, H}),
+        T
+     end},
+     {setopts_arity3u, fun(H) ->
+        T = ets:new(setopts_a3u, [public]),
+        _ = ets:setopts(T, {heir, H, undefined}),
+        T
+     end},
+     {setopts_arity3d, fun(H) ->
+        T = ets:new(setopts_a3d, [public]),
+        _ = ets:setopts(T, {heir, H, {gift, 42}}),
+        T
+     end}].
+
+creation_forms() ->
+    [{creation_arity2, fun(H) -> ets:new(creation_a2, [public, {heir, H}]) end},
+     {creation_arity3u, fun(H) -> ets:new(creation_a3u, [public, {heir, H, undefined}]) end},
+     {creation_arity3d, fun(H) -> ets:new(creation_a3d, [public, {heir, H, {gift, 42}}]) end}].
+
+observe_forms(Parent, Forms) ->
+    [observe(Parent, Label, Make) || {Label, Make} <- Forms].
+
+observe(Parent, Label, Make) ->
+    Heir = spawn(fun() -> receive M -> Parent ! {Label, M}, keep_alive() end end),
+    Owner = spawn(fun() ->
+        T = Make(Heir),
+        Parent ! {tid, Label, T},
+        receive stop -> ok end
+    end),
+    T = receive {tid, Label, X} -> X end,
+    timer:sleep(150),
+    exit(Owner, kill),
+    timer:sleep(200),
+    %% The inheritance happens whether or not the heir is told about it.
+    OwnerIsHeir = ets:info(T, owner) =:= Heir,
+    Alive = ets:info(T) =/= undefined,
+    Payload = receive {Label, Y} -> summarize(Y) after 2000 -> no_message end,
+    Heir ! go,
+    {Label, Payload, OwnerIsHeir, Alive}.
+
+summarize({'ETS-TRANSFER', _Tid, _From, Data}) -> Data;
+summarize(Other) -> Other.
+
+keep_alive() -> receive go -> ok end.
+"#;
+
+/// The two heir forms, cross-checked against the live oracle: an arity-2
+/// `{heir, Pid}` heir inherits the table **silently**, while an arity-3
+/// `{heir, Pid, undefined}` heir receives `{'ETS-TRANSFER', …, undefined}` —
+/// `undefined` is a *value*, the C's `THE_NON_VALUE` is not. Both forms install the
+/// heir and move ownership; only the message differs. Skips loudly without an
+/// oracle; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure.
+#[test]
+fn heir_forms_match_the_live_oracle() {
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "heir_forms_match_the_live_oracle",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable `erl`/`escript` on $PATH)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(
+        &escript,
+        HEIR_FORM_ORACLE_PROGRAM,
+        &[],
+        "heir_forms",
+        ORACLE_TIMEOUT,
+    );
+    let lines: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .expect("the oracle prints UTF-8")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let expected = "setopts [{setopts_arity2,no_message,true,true},\
+                    {setopts_arity3u,undefined,true,true},\
+                    {setopts_arity3d,{gift,42},true,true}]";
+    let expected_creation = "creation [{creation_arity2,no_message,true,true},\
+                             {creation_arity3u,undefined,true,true},\
+                             {creation_arity3d,{gift,42},true,true}]";
+    // The oracle's `~p` wraps a long term across lines (indenting the continuation,
+    // which the `trim` above removes), so glue the lines back together — the
+    // rendering itself is deterministic.
+    assert_eq!(
+        lines.join(""),
+        format!("{expected}{expected_creation}"),
+        "the oracle's heir-form observations changed — the model is stale:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // The model reproduces the same facts. The gift-data shapes the oracle reports.
+    let owner = OwnerId::new(1);
+    let heir_pid = OwnerId::new(9);
+    let mut atoms = AtomTable::new();
+    let undefined_gift = interned_atom(&mut atoms, "undefined");
+    let gift_atom = interned_atom(&mut atoms, "gift");
+    let mut heap = Heap::new(64);
+    let gift_tuple = tuple_of(&mut heap, &[gift_atom, make_small(42)]);
+
+    for (label, gift) in [
+        ("arity2", None),
+        ("arity3u", Some(undefined_gift)),
+        ("arity3d", Some(gift_tuple)),
+    ] {
+        let mut t = table_with_owner(owner);
+        t.install_heir(heir_pid, gift)
+            .unwrap_or_else(|error| panic!("{label}: a copyable gift data: {error}"));
+
+        let OwnerDeath::Transferred(transferred) = t.owner_died(owner, |_| true) else {
+            panic!("{label}: a live heir inherits")
+        };
+        assert_eq!(transferred.owner, heir_pid, "{label}: the heir inherits");
+        assert_eq!(t.owner(), Some(heir_pid), "{label}: the owner IS the heir");
+        assert_eq!(
+            t.info().heir,
+            Some(heir_pid),
+            "{label}: the heir stays installed"
+        );
+        match (transferred.data, gift) {
+            (None, None) => {}
+            (Some(delivered), Some(want)) => assert!(
+                eq(delivered, want, &atoms),
+                "{label}: the delivered payload is the installed gift data"
+            ),
+            (delivered, want) => panic!(
+                "{label}: the payload's presence must match the option's arity: \
+                 delivered={delivered:?}, expected={want:?}"
+            ),
+        }
+    }
 }

@@ -9,25 +9,32 @@
 //!
 //! # Oracle evidence (probed against the live system `erl`, OTP 29 / erts-17.1)
 //!
-//! * **owner dies with a live heir** — the heir receives
-//!   `{'ETS-TRANSFER', Tid, FromPid, Data}` and afterwards `ets:info(T, owner)` is
-//!   the heir while `ets:info(T, heir)` is **still** the heir (it is *not* reset to
-//!   `none`). So the transition moves the owner and leaves the heir installed.
+//! * **owner dies with a live heir** — the heir inherits the table (`ets:info(T,
+//!   owner)` becomes the heir) and afterwards `ets:info(T, heir)` is **still** the
+//!   heir (it is *not* reset to `none`). So the transition moves the owner and
+//!   leaves the heir installed.
+//! * **owner dies with a live heir installed by `{heir, Pid}` (arity 2)** — the
+//!   inheritance still happens, but the heir receives **no**
+//!   `{'ETS-TRANSFER', …}` message at all (the C `THE_NON_VALUE` gift data); an
+//!   arity-3 `{heir, Pid, undefined}` heir *does* get one carrying the atom
+//!   `undefined`. See [`super::ownership`] and [`Heir::data`].
 //! * **owner dies with no heir** — the table disappears (`ets:info/1` →
 //!   `undefined`).
 //! * **owner dies after the heir already died** — the table disappears.
 //! * **a self-heir** (`ets:setopts(T, {heir, self(), Data})`, i.e. the owner is its
 //!   own heir) — the table disappears; the owner cannot inherit from itself.
 //! * the option *parsing* is the BIF layer's, not this module's: the oracle accepts
-//!   both `{heir, Pid}` (arity 2) and `{heir, Pid, Data}` (arity 3), accepts a
-//!   **dead** pid as a heir (normalising it to no heir), and rejects
+//!   `{heir, Pid}`, `{heir, Pid, Data}` and `{heir, none}`, accepts a **dead** pid
+//!   as a heir (normalising it to no heir), and rejects
 //!   `{heir, none, Data}` with `badarg`. None of that is modelled here.
 //!
 //! The legacy C mirrors this: the death path in `erl_db.c` only calls
 //! `give_away_to_heir/2` when `tb->common.heir != am_none && tb->common.heir != pid`
 //! (so a self-heir short-circuits, exactly as below) and falls through to deleting
 //! the table when the heir cannot take it (`to_proc == NULL` ⇒ "heir not alive,
-//! table still mine").
+//! table still mine"). Whether the transfer message is sent is a *separate* test —
+//! `if (is_value(heir_data))` at `:4925`, false for the arity-2 `THE_NON_VALUE` —
+//! which is why inheriting and being notified are two independent facts.
 //!
 //! # The pid gap (a documented modelling limit)
 //!
@@ -49,9 +56,11 @@ pub enum OwnerDeath {
     /// The owner died and no heir took the table: the runtime must **drop** it (the
     /// oracle reports `ets:info(T)` → `undefined` afterwards).
     Deleted,
-    /// The owner died and the table passed to the heir: the runtime must deliver
-    /// `{'ETS-TRANSFER', Tid, FromPid, heir.data}` to `heir.owner` (the table is
-    /// now owned by `heir.owner`).
+    /// The owner died and the table passed to the heir: the runtime delivers
+    /// `{'ETS-TRANSFER', Tid, FromPid, data}` to `heir.owner` **only when
+    /// [`heir.data`] is `Some(data)`** — an arity-2 `{heir, Pid}` heir inherits in
+    /// silence (the oracle's `THE_NON_VALUE` gift data; see
+    /// [`Heir::data`]). The table is now owned by `heir.owner`.
     Transferred(Heir),
 }
 
@@ -74,9 +83,11 @@ impl Table {
     /// self-heir short-circuits before it (the owner cannot inherit from itself).
     ///
     /// The returned [`OwnerDeath`] is an *obligation*, not a side effect: this crate
-    /// has no message or process machinery, so the runtime must deliver the
-    /// `{'ETS-TRANSFER', …}` message for [`Transferred`](OwnerDeath::Transferred) and
-    /// drop the table for [`Deleted`](OwnerDeath::Deleted).
+    /// has no message or process machinery, so the runtime must drop the table for
+    /// [`Deleted`](OwnerDeath::Deleted) and, for
+    /// [`Transferred`](OwnerDeath::Transferred), deliver the
+    /// `{'ETS-TRANSFER', …}` message **iff** [`Heir::data`] is `Some` (an arity-2
+    /// heir inherits without a message).
     #[must_use = "the runtime must act on the outcome: deliver {'ETS-TRANSFER', …} or drop the table"]
     pub fn owner_died<F>(&mut self, dead: OwnerId, is_alive: F) -> OwnerDeath
     where
@@ -118,7 +129,7 @@ mod tests {
     fn heir_of(pid: u64, data: i64) -> Heir {
         Heir {
             owner: OwnerId::new(pid),
-            data: make_small(data),
+            data: Some(make_small(data)),
         }
     }
 
@@ -196,6 +207,31 @@ mod tests {
         assert_eq!(t.heir(), Some(heir), "the heir is NOT cleared");
         assert_eq!(t.info().owner, Some(OwnerId::new(9)));
         assert_eq!(t.info().heir, Some(OwnerId::new(9)));
+    }
+
+    /// An arity-2 heir inherits the table but carries **no** gift data, so the
+    /// runtime must deliver no `{'ETS-TRANSFER', …}` message (the oracle's
+    /// `THE_NON_VALUE`).
+    #[test]
+    fn an_arity_two_heir_inherits_without_gift_data() {
+        let owner = OwnerId::new(1);
+        let heir = Heir {
+            owner: OwnerId::new(9),
+            data: None,
+        };
+        let (outcome, calls, t) = run_death(Some(owner), Some(heir), owner, true);
+
+        assert_eq!(outcome, OwnerDeath::Transferred(heir));
+        let OwnerDeath::Transferred(transferred) = outcome else {
+            unreachable!("the assertion above just proved the variant")
+        };
+        assert_eq!(
+            transferred.data, None,
+            "an arity-2 heir means no ETS-TRANSFER message"
+        );
+        assert_eq!(calls, 1, "liveness is consulted exactly once");
+        assert_eq!(t.owner(), Some(OwnerId::new(9)), "the heir is the new owner");
+        assert_eq!(t.heir(), Some(heir), "the heir is NOT cleared");
     }
 
     /// An owner cannot inherit from itself: a self-heir means the table is dropped,
