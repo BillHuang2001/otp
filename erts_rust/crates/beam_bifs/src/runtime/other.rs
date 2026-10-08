@@ -32,20 +32,10 @@ use crate::registry::BifRegistry;
 
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
-    // `ets` -- the C interior surface (the C-only lookups, the reverse scan,
-    // the unmodelled `rename` name setter and the raw match-spec run).
-    crate::runtime::runtime_bif!(reg, "ets", first_lookup, 1);
-    crate::runtime::runtime_bif!(reg, "ets", internal_delete_all, 2);
+    // `ets` -- the C-only `slot/2` interior walk and the scheduler fan-in
+    // `internal_request_all/0`; every other `ets:*` key the C interior used to
+    // stand in for now has a real implementation in `src/ets/`.
     crate::runtime::runtime_bif!(reg, "ets", internal_request_all, 0);
-    crate::runtime::runtime_bif!(reg, "ets", internal_select_delete, 2);
-    crate::runtime::runtime_bif!(reg, "ets", last_lookup, 1);
-    crate::runtime::runtime_bif!(reg, "ets", match_spec_run_r, 3);
-    crate::runtime::runtime_bif!(reg, "ets", next_lookup, 2);
-    crate::runtime::runtime_bif!(reg, "ets", prev_lookup, 2);
-    crate::runtime::runtime_bif!(reg, "ets", rename, 2);
-    crate::runtime::runtime_bif!(reg, "ets", select_reverse, 1);
-    crate::runtime::runtime_bif!(reg, "ets", select_reverse, 2);
-    crate::runtime::runtime_bif!(reg, "ets", select_reverse, 3);
     crate::runtime::runtime_bif!(reg, "ets", slot, 2);
 
     // `erl_debugger` -- the interpreter-level debugger tools.
@@ -139,7 +129,7 @@ mod tests {
         super::register(&mut reg);
         assert!(reg.contains("re", "run", 3));
         assert!(reg.contains("atomics", "get", 2));
-        assert!(reg.contains("ets", "rename", 2));
+        assert!(reg.contains("ets", "slot", 2));
 
         let mut heap = Heap::new(8).expect("test heap");
         let atoms = AtomTable::new();

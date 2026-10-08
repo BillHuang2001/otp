@@ -71,7 +71,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use beam_common::Result;
-use beam_ets::{compile, Table};
+use beam_ets::compile;
 use beam_term::Eterm;
 
 use crate::access::{make_ref_thing, ref_thing_id};
@@ -291,10 +291,10 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::{atom_val, signed_value, AtomTable};
 
-    use crate::access::{is_atom, is_list, is_tuple, ref_thing_id, tuple_element, tuple_size};
+    use crate::access::{is_atom, is_nil, is_tuple, ref_thing_id, tuple_element, tuple_size};
     use crate::print::proper_list;
 
-    use super::super::{insert_2, new_2, select_3, TableRegistry};
+    use super::super::{insert_2, new_2, TableRegistry};
 
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
@@ -419,7 +419,7 @@ mod tests {
         let handle = new_table(&mut ctx, "mytab", "ordered_set");
         let spec = key_spec(&mut ctx);
         let empty = select_reverse_2(&mut ctx, &[handle, spec]).expect("select_reverse/2");
-        assert!(is_list(empty));
+        assert!(is_nil(empty), "an empty result is the empty list");
         assert_eq!(ints(empty), Vec::<i64>::new());
 
         // …and `/3` on the empty table is the bare atom.

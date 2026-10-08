@@ -477,11 +477,8 @@ mod tests {
         // in the registry.
         let after = first_lookup_1(&mut ctx, &[handle]).expect("still live");
         assert!(beam_term::compare::eq(live, after, ctx.atoms()));
-        assert_eq!(
-            ctx.atoms()
-                .name(atom_val(delete_1(&mut ctx, &[handle]).expect("delete"))),
-            Some("true")
-        );
+        let deleted = delete_1(&mut ctx, &[handle]).expect("delete");
+        assert_eq!(ctx.atoms().name(atom_val(deleted)), Some("true"));
         assert!(matches!(
             first_lookup_1(&mut ctx, &[handle]),
             Err(BeamError::BadArg)

@@ -46,7 +46,7 @@
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 22 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 222 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 209 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -100,7 +100,7 @@
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
 //! | `RuntimeContext::uses_persistent_term` | [`needs_persistent_term`] |
-//! | `RuntimeContext::uses_runtime_hooks` (a 10-key subset today) | [`needs_runtime_hooks`] (the whole 222-key seam) |
+//! | `RuntimeContext::uses_runtime_hooks` (a 10-key subset today) | [`needs_runtime_hooks`] (the whole 209-key seam) |
 //! | — (the port hook is installed unconditionally today) | [`needs_port_hook`] |
 //! | — (the fun caller is gated by `reentrancy_capable(args)` today) | [`needs_fun_caller`] |
 //! | — (the local node is installed unconditionally today) | [`needs_local_node`] |
@@ -322,7 +322,7 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 ///
 /// The union of the four `runtime_bif!` family modules: `runtime/erlang.rs` (77),
 /// `runtime/erts_internal.rs` (62), `runtime/erts_debug.rs` (18) and
-/// `runtime/other.rs` (65) = **222** keys. The `erlang:memory/0,1` pair in
+/// `runtime/other.rs` (52) = **209** keys. The `erlang:memory/0,1` pair in
 /// `runtime/memory.rs` is registered against the separate [`MEMORY_HOOK_BIFS`] seam
 /// and is **not** here.
 ///
@@ -527,18 +527,7 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_literal_area_collector", "send_copy_request", 3),
     ("erts_trace_cleaner", "check", 0),
     ("erts_trace_cleaner", "send_trace_clean_signal", 1),
-    ("ets", "first_lookup", 1),
-    ("ets", "internal_delete_all", 2),
     ("ets", "internal_request_all", 0),
-    ("ets", "internal_select_delete", 2),
-    ("ets", "last_lookup", 1),
-    ("ets", "match_spec_run_r", 3),
-    ("ets", "next_lookup", 2),
-    ("ets", "prev_lookup", 2),
-    ("ets", "rename", 2),
-    ("ets", "select_reverse", 1),
-    ("ets", "select_reverse", 2),
-    ("ets", "select_reverse", 3),
     ("ets", "slot", 2),
     ("net_kernel", "dflag_unicode_io", 1),
     ("os", "set_signal", 2),
@@ -1027,7 +1016,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 220);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 209);
     }
 
     /// Near misses (wrong arity / wrong module / a different BIF) answer `false`.
