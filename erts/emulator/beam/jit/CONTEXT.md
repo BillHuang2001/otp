@@ -9,7 +9,7 @@ This directory is the source for BOTH backends plus the arch-independent glue; `
 ## API Surface
 The rest of the emulator interacts with BeamAsm through two contracts:
 
-- **C interface (`beam_asm.h`, guarded by `#if defined(BEAMASM)`)** — the only entry points called from the flat/generic emulator code (mostly `asm_load.c`, `beam_load.c`):
+- **C interface (`beam_asm.h`, guarded by `#if defined(BEAMASM)`)** — the only entry points called from `../beam_load.c` (via the JIT loader backend `asm_load.c` here) and the generic emulator code:
   `beamasm_init`, `beamasm_new_assembler`, `beamasm_emit`, `beamasm_emit_coverage`, `beamasm_codegen`, `beamasm_register_metadata`/`beamasm_unregister_metadata`, `beamasm_delete_assembler`, `beamasm_get_code`/`_lambda`/`_rodata`/`_header`/`_base`/`_offset`/`_on_load`, `beamasm_embed_rodata`/`_bss`, `beamasm_patch_catches`/`_import`/`_literal`/`_lambda`/`_strings`, `beamasm_emit_call_nif`, `beamasm_seal_module`/`beamasm_unseal_module`, `beamasm_flush_icache`, `beamasm_purge_module`, `beamasm_is_line_breakpoint_trampoline`.
   `beam_asm.h` also defines the inlined breakpoint-trampoline helpers (`erts_asm_bp_get_flags`/`_enable`/`_disable`/`_set_flag`/`_unset_flag`) and the per-arch prologue constants `BEAM_ASM_FUNC_PROLOGUE_SIZE` / `BEAM_ASM_NFUNC_SIZE`; all are arch-conditional (`__aarch64__`).
 - **Process-main entry point `process_main(ErtsSchedulerData *)`** (defined in `beam_jit_main.cpp`) — the JIT-flavor replacement for the interpreter's scheduler loop.
