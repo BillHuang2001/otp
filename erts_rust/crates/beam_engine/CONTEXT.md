@@ -180,11 +180,11 @@ Measured at this node's HEAD with `erts_rust/scripts/cargo.sh test --manifest-pa
 - `gc_bif` `'+'/2` **~17.5 ns/instr** -- the most expensive instruction, dominated by marshalling the arguments into `ExecutionContext::call_bif`. **The context's own BIF dispatch is now the dominant remaining per-call cost** (`beam_rt`'s `call_bif` does string-keyed NIF/native/registry lookups before every call); it is measured from outside this crate -- see Handoff #9.
 
 ## Measured (JIT micro-benchmark)
-`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test jit_bench -- --nocapture` (add `--features jit-cranelift` for the feature-ON roster). Wall-clock ns/op -- noisy; the tiers are **mechanisms, not optimisers**. Timed compile-once/run-many (`JitBackend::run_compiled`); one-time `compile` excluded.
+`... -p beam_engine --test jit_bench -- --nocapture` (add `--features jit-cranelift` for the feature-ON roster). Wall-clock ns/op -- noisy; the tiers are **mechanisms, not optimisers** (compile-once/run-many; one-time `compile` excluded).
 - **Feature OFF** -- interpreter -> baseline-jit speed-up: `fib/1(20)` 2.4x; `kernel/2` 13.6x; `wide/2` 13.9x; `aggr/2` 11.8x; `cmp/2` 14.9x.
-- **Feature ON** -- interpreter -> baseline-jit -> Cranelift: `fib` 2.0x; `kernel` 11.1x; `wide` 13.0x; `aggr` 6.2x; `cmp` 11.0x (Cranelift is not yet a win over the baseline tier here).
+- **Feature ON** -- interpreter -> baseline-jit -> Cranelift: `fib` 2.0x; `kernel` 11.1x; `wide` 13.0x; `aggr` 6.2x; `cmp` 11.0x (not yet a win over the baseline).
 - **Local tail-call linking (`call_last`/`call_only`)** removes one driver round-trip per local tail call: `slice:fib/1(20)` baseline-jit **665.6 -> 580.4 ns/op** (paired means over 6 runs).
-- **Not done (honest):** `call_ext_last` (a BIF/ext call) still round-trips through the driver; `PutTuple2`/`BsTestTail` deopt; no rematerialization / intra-block eviction (residency is block-fixed).
+- **Not done (honest):** `call_ext_last` still round-trips through the driver; `PutTuple2`/`BsTestTail` deopt; residency is block-fixed.
 - **The engine's own per-instruction hot path is O(1) and, since the scratch-buffer change, per-BIF allocation-free** (dense `LabelMap` instruction fetch, Vec-index register/operand access; `step_instruction` only records `current_code`; a wide BIF/`call_ext` reuses a per-`Machine` `args_scratch`, pinned allocation-free by `tests/bif_alloc.rs`). The measured multi-microsecond **per-iteration** cost of `beam_rt run ...` is a HOST `ExecutionContext` cost, not the engine's: `beam_rt`'s `RuntimeContext::call_registered` deep-clones the whole shared `AtomTable` on every registered BIF call, plus per-BIF `String`/`PathBuf`/`Vec` allocations (`beam_rt`, `beam_bifs`). See `../beam_rt/CONTEXT.md` and `../beam_bifs/CONTEXT.md` "Performance Notes".
 
 ## Design Decisions
