@@ -60,6 +60,7 @@
 //! | [`bench_tail_loop`] | a tail-recursive loop: `test` guard + `call_only` | tail-call back-edge |
 //! | [`bench_gate_call_return`] | the same `call;return` chain, tracing OFF | the A.8 call/return gate (its disabled path) |
 //! | [`bench_gate_call_only`] | the same `call_only` tail loop, tracing OFF | the A.8 `call_only` gate (its disabled path) |
+//! | [`bench_list_walk`] | the body-recursive `sum([H\|T]) -> H + sum(T)` over a 1,000,000-element list | the per-call/per-return frame discipline on a BIF-free walk |
 //! | [`bench_real_even`] | the committed `tailcall.beam`'s `even/1` | a real `erlc`-compiled recursion |
 //!
 //! Every body is designed so its executed instruction count is known **by
@@ -102,7 +103,7 @@ use beam_engine::{ExecutionContext, Machine, MinimalContext};
 use beam_loader::{
     Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand, TestKind, NO_FAIL,
 };
-use beam_term::{is_small, make_small, signed_value, Atom, Eterm};
+use beam_term::{is_small, make_small, signed_value, Atom, Eterm, NIL};
 
 use support::ModuleHost;
 
@@ -673,6 +674,155 @@ fn bench_gate_call_only() -> Report {
     report
 }
 
+/// The element count of the list the **BIF-free list-walk** workload traverses
+/// once per run.
+const LIST_WALK_N: usize = 1_000_000;
+
+/// Build a `[CAR, CDR]` list of `LIST_WALK_N` small integers (`1` each) in a
+/// **term arena** and hand back the arena plus the list term.
+///
+/// The arena is [`beam_term::Heap`], the fixed-capacity bump term arena: the list
+/// is built once, before the timing loop, and stays alive as long as the caller
+/// holds the returned `Heap`. The engine reads a list through its tagged
+/// cons-cell pointer, so the traversal reads this arena directly and the workload
+/// measures the walk, not term construction.
+fn list_walk_input(n: usize) -> (beam_term::Heap, Eterm) {
+    let mut heap = beam_term::Heap::new(2 * n);
+    let mut list = NIL;
+    for _ in 0..n {
+        list = heap
+            .cons(make_small(1), list)
+            .expect("the arena is sized for the whole list");
+    }
+    (heap, list)
+}
+
+/// The **body-recursive list walk** `sum([H|T]) -> H + sum(T); sum([]) -> 0.` in
+/// the shape the compiler emits for it, exported as `name/1`:
+///
+/// ```text
+///   label(E)                             ; entry == callable entry label
+///   test is_nonempty_list -> Lbase [x0]  ; the head-clause guard
+///   allocate 1, 1                        ; one Y slot, one live x register
+///   get_list x0 -> y0, x0                ; head into y0, tail into x0
+///   call 1, E                            ; the recursive call (NOT a tail call)
+///   gc_bif '+' 2 [y0, x0] -> x0          ; H + sum(T)
+///   deallocate 1
+///   return
+/// label(Lbase)
+///   test is_nil -> Lexit [x0]            ; `{f,1}` in the real module (func_info)
+///   move 0 -> x0
+///   return
+/// label(Lexit)                           ; unreachable for a well-formed walk
+///   return
+/// ```
+///
+/// The walk is **BIF-free apart from one small-int `'+'/2` per element**: no
+/// `test_heap`/`allocate_heap`, no term is built, and every other instruction is
+/// the frame/call machinery itself. The base-case `is_nil` guard's fail label is a
+/// bare `return` (the real module's `{f,1}` jumps to `func_info` and raises
+/// `function_clause`; this module has no `func_info`, so a malformed walk is made
+/// to *terminate with a wrong value* — which the result assertion below catches —
+/// rather than to recurse forever).
+fn list_walk_module(name: &str) -> (Module, Atom) {
+    let entry = Label(1);
+    let lbase = Label(3);
+    let lexit = Label(4);
+    let mut module = Module::default();
+    let plus = intern_arith_import(&mut module, "+");
+    let body = vec![
+        Instr::Test {
+            kind: TestKind::IsNonemptyList,
+            fail: lbase,
+            args: vec![Operand::X(0)],
+        },
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(1),
+            live: 1,
+        },
+        Instr::GetList {
+            source: Operand::X(0),
+            head: Operand::Y(0),
+            tail: Operand::X(0),
+        },
+        Instr::Call {
+            arity: 1,
+            target: entry,
+        },
+        Instr::GcBif {
+            arity: 2,
+            bif: plus,
+            fail: NO_FAIL,
+            live: 1,
+            args: vec![
+                Operand::Y(0),
+                Operand::Typed {
+                    reg: beam_loader::Reg::X(0),
+                    ty: beam_loader::TypeIndex(0),
+                },
+            ],
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+        Instr::Label(lbase),
+        Instr::Test {
+            kind: TestKind::IsNil,
+            fail: lexit,
+            args: vec![Operand::X(0)],
+        },
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(lexit),
+        Instr::Return,
+    ];
+    finish_module(module, name, 1, body)
+}
+
+/// The **per-iteration instruction count** of [`list_walk_module`]'s walk, by
+/// construction.
+///
+/// Per element the walk **descends** `label(E)`, `test`, `allocate`, `get_list`,
+/// `call` (5 instructions) and, on the way back out, runs `gc_bif '+'`,
+/// `deallocate`, `return` (3) — `8 * N`; the single base case adds `label(E)`,
+/// `test`, `label(Lbase)`, `test`, `move`, `return` (6).
+fn list_walk_instructions(n: usize) -> usize {
+    8 * n + 6
+}
+
+/// **The BIF-free recursive list walk**: `sum/1` over a 1,000,000-element list,
+/// one element per iteration of `test`/`allocate`/`get_list`/`call` going down
+/// and `gc_bif`/`deallocate`/`return` coming back up.
+///
+/// The body is deliberately the cheapest recursive shape the compiler emits: the
+/// only work per element other than the frame/call machinery is one small-int
+/// `'+'/2`, and the traversal **builds no term and requests no heap**, so what
+/// this row measures is dominated by the per-call/per-return engine path rather
+/// than by dispatch, BIF marshalling or allocation. It is the interpreter's
+/// counterpart to the tail-call rows: 680 `call`/`return` rounds in
+/// [`bench_ctrl`] there, one million here.
+fn bench_list_walk() -> Report {
+    // The arena must outlive every timed run; it is never touched by the walk.
+    let (_arena, list) = list_walk_input(LIST_WALK_N);
+    let (module, function) = list_walk_module("bench_list_walk");
+    let args = [list];
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let instructions = list_walk_instructions(LIST_WALK_N);
+    let report = measure("list-walk/1 (recursive)", instructions, 1, || {
+        machine.run_export(&module, function, 1, &args, &mut ctx)
+    });
+    assert_eq!(
+        report.result,
+        make_small(LIST_WALK_N as i64),
+        "the walk must add exactly one per element"
+    );
+    report
+}
+
 /// A [`ModuleHost`] wrapper that **counts every BIF call it serves**, so the real
 /// workload's instruction divisor is measured by the engine instead of assumed.
 ///
@@ -1066,6 +1216,7 @@ fn report_attribution(reports: &[Report]) {
         ("branch-loop/2", "taken test branch + jump back-edge (mixed)"),
         ("tail-loop/2", "tail-call back-edge (mixed)"),
         ("gate/call_only", "A.8 call_only gate, tracing OFF (mixed)"),
+        ("list-walk/1", "recursive list walk: per-call/per-return frame discipline (mixed)"),
         ("real", "a real erlc-compiled recursion (mixed)"),
     ] {
         if let Some(report) = by_label(needle) {
@@ -1131,6 +1282,7 @@ fn interpreter_reports_ns_per_instruction() {
         bench_branch_loop(),
         bench_tail_loop(),
         bench_gate_call_only(),
+        bench_list_walk(),
     ];
     match bench_real_even() {
         Some(report) => reports.push(report),
@@ -1146,7 +1298,7 @@ fn interpreter_reports_ns_per_instruction() {
     // Structural invariants only — never a performance threshold (that would be
     // flaky in a shared sandbox; the printed numbers are the deliverable).
     assert!(
-        reports.len() >= 11,
+        reports.len() >= 12,
         "every synthetic workload must have been measured"
     );
     for report in &reports {
