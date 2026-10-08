@@ -357,17 +357,11 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   (same arena + atom table) implementing `DriverHost`, recording every output/term/select/timer/async
   call with accessors for assertions. `host_seam.rs` also compiles a trivial `erl_nif.h`-including
   probe `.so`, proving the include-directory resolution and the `cc -shared -fPIC` invocation work.
-- **Per-family end-to-end tests**, each a real C fixture compiled at test time with the system `cc`
-  against the system OTP headers, `dlopen`ed (`RTLD_NOW`) through the crate's own loader so a single
-  unresolved `enif_*`/`driver_*` import would fail the load:
-  `tests/nif_end_to_end.rs` (+`fixtures/test_nif.c`), `nif_process.rs` (+`nif_process.c`),
-  `nif_resource.rs` (+`nif_resource.c`), `nif_env.rs` (+`nif_env.c`), `nif_ioq.rs` (+`nif_ioq.c`),
-  `nif_mapiter.rs` (+`nif_mapiter.c`), `nif_threads.rs` (+`nif_threads.c`),
-  `nif_variadic.rs` (+`nif_variadic.c`, gated on `cfg(beam_abi_variadic_shim)`),
-  `driver_end_to_end.rs` (+`test_driver.c`), `driver_lifecycle.rs` (+`driver_lifecycle.c`),
-  `driver_queues.rs` (+`driver_queues.c`), `driver_pdl.rs` (+`driver_pdl.c`), `driver_threads.rs`
-  (+`driver_threads.c`), `driver_binary_refc.rs` (+`driver_binary_refc.c` — the dual `driver_init`/
-  `nif_init` fixture shared with the oracle run, below).
+- **Per-family end-to-end tests** (the `tests/nif_*.rs` / `driver_*.rs` files in the Routing Table),
+  each a real C fixture compiled at test time with the system `cc` against the system OTP headers and
+  `dlopen`ed (`RTLD_NOW`) through the crate's own loader, so a single unresolved `enif_*`/`driver_*`
+  import fails the load. `nif_variadic.rs` is gated on `cfg(beam_abi_variadic_shim)`;
+  `driver_binary_refc.rs` uses a dual-`driver_init`/`nif_init` fixture shared with the oracle run.
 - **`tests/abi_conformance.rs` — the mechanical gap guard (the frozen C-ABI surface).** At test time
   it parses the real headers (`erl_nif_api_funcs.h`'s `ERL_NIF_API_FUNC_DECL` list; `erl_driver.h`'s
   `EXTERN` declarations) applying the headers' own gating (the four `#if SIZEOF_LONG != 8` `enif_*64`
