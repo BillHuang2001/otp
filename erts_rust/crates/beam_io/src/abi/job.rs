@@ -45,11 +45,39 @@
 //! thread decide (it is where the driver entry is reachable), so `async_free` runs on the port
 //! thread instead. Documented deviation, never a leak (the callback runs exactly once).
 //!
+//! # Who releases `async_data`, and exactly once
+//!
+//! A driver's `async_data` must be released whether or not its port is still alive when the job
+//! finishes. The C covers this inside `call_async_ready`: either the port lookup fails and
+//! `async_free` runs, or the port is found and `async_ready`'s `need_free` answer decides
+//! (`erl_async.c:324-338`). This floor reaches the same guarantee **structurally**, by making the
+//! release obligation a value: [`AsyncCompletion`] owns `async_data`, runs `async_free` if the
+//! release is still owed when the value is dropped, and is *disarmed* when the data is handed to
+//! `ready_async` (which then owns it — the C's `need_free = 0`). There is therefore exactly one
+//! owner of the release along every path:
+//!
+//! * **delivered** — [`super::port::DriverPort::poll_async`] runs `ready_async` (disarming the
+//!   completion) or discharges the release itself;
+//! * **completed but never drained** — [`AsyncJobs`]'s `Drop` drains the channel, dropping each
+//!   completion and so releasing its data (the port is going away: the C's `!p` branch);
+//! * **still running when the port drops** — the worker's `send` fails, the completion the failed
+//!   send hands back is dropped and releases the data (again the C's `!p` branch);
+//! * **no worker / fire-and-forget** — the caller releases immediately (see [`AsyncJobs::schedule`]).
+//!
+//! # The driver stays loaded until its last job is released
+//!
+//! `async_invoke`/`async_free` are code inside the driver's loaded object, so that object must stay
+//! mapped until every job is released — the C's `DE_Handle` reference
+//! (`erts_ddll_dereference_driver`, `erl_async.c:343-344`). The port installs a type-erased
+//! [`KeepAlive`] here and every job clones it, so the `dlclose` a dropped port would otherwise run
+//! is deferred to the release. Without it a job that outlives its port would call unmapped code.
+//!
 //! # `unsafe`
 //!
 //! [`AsyncData`] carries a raw driver-owned pointer across the worker boundary. It is the only
 //! `unsafe` in this file (one `unsafe impl Send`, with its rationale) — the rest is safe Rust.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -79,19 +107,85 @@ pub(crate) struct AsyncData(pub(crate) *mut c_void);
 unsafe impl Send for AsyncData {}
 
 /// A finished async job awaiting its `ready_async` (or `async_free`) callback.
+///
+/// It **owns the release obligation** for the driver's `async_data`: unless it is disarmed by handing
+/// the data to `ready_async`, dropping it runs the driver's `async_free` exactly once — see the
+/// module docs.
 pub(crate) struct AsyncCompletion {
     /// The queue position `driver_async` returned (the C's `async_id`).
-    pub(crate) id: u64,
+    id: u64,
     /// The driver's `async_data`.
-    pub(crate) data: AsyncData,
+    data: AsyncData,
     /// The driver's `async_free`, for the entry-without-`ready_async` case (see the module docs).
-    pub(crate) free: Option<unsafe extern "C" fn(*mut c_void)>,
+    free: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// Whether the release obligation is discharged: either `async_free` already ran, or the data was
+    /// handed to the driver's `ready_async`, which owns it from there.
+    discharged: bool,
+    /// Keeps the driver's loaded object mapped until the release has run (see [`KeepAlive`]).
+    keepalive: Option<KeepAlive>,
 }
+
+impl AsyncCompletion {
+    /// The queue position `driver_async` returned (the ordering key `poll_async` sorts by).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The driver's `async_data` pointer (`ready_async`'s `ErlDrvThreadData` operand).
+    pub(crate) fn data(&self) -> *mut c_void {
+        self.data.0
+    }
+
+    /// Marks the data as handed to the driver's `ready_async`, which owns and frees it itself.
+    ///
+    /// This is the C's `need_free = 0` (`io.c:5399-5400`): once `ready_async` has run, the emulator
+    /// calls no `async_free` for the job.
+    pub(crate) fn handed_to_ready_async(&mut self) {
+        self.discharged = true;
+    }
+
+    /// Releases the driver's `async_data` through its own `async_free`, exactly once.
+    ///
+    /// This is the C's `need_free` path (an entry with no `ready_async`, `io.c:5406` +
+    /// `erl_async.c:332-338`) and its port-gone path (`call_async_ready`'s `!p` branch,
+    /// `erl_async.c:324-330`).
+    pub(crate) fn release(&mut self) {
+        if self.discharged {
+            return;
+        }
+        self.discharged = true;
+        if let Some(free) = self.free {
+            // SAFETY: `free` is the driver's own `async_free` (`void (*)(void*)`) and `self.data.0`
+            // is the `async_data` pointer it handed to `driver_async`; the driver contract is that
+            // `free` releases precisely that pointer. `self.keepalive` still holds the driver's
+            // loaded object open (its `Arc` drops only after this method returns), so the callback's
+            // code is mapped.
+            unsafe { free(self.data.0) };
+        }
+    }
+}
+
+impl Drop for AsyncCompletion {
+    /// The last owner of an undisarmed completion releases the driver's data — the structural form of
+    /// the C's `need_free`/port-gone `async_free` (see the module docs).
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// A type-erased handle that keeps a driver's loaded object mapped while its async jobs exist.
+///
+/// The C holds a `DE_Handle` reference for an outstanding async job and dereferences the driver from
+/// the worker thread (`erl_async.c:565`, `:343-344`). This is the same hold-down: the port installs
+/// an `Arc` to its loaded library ([`AsyncJobs::set_keepalive`]) and every job clones it, so a job
+/// that outlives its port still runs mapped code. It is type-erased (`dyn Any`) so this module never
+/// has to name the loader's concrete library type.
+pub(crate) type KeepAlive = Arc<dyn Any + Send + Sync>;
 
 /// One queued job: the driver callback, its data and the channel to report through.
 ///
 /// `Send` falls out for free: [`AsyncData`] is the only `unsafe impl Send` in this file and the
-/// rest (`u64`, `mpsc::Sender`, `fn` pointers) are already `Send`.
+/// rest (`u64`, `mpsc::Sender`, `fn` pointers, [`KeepAlive`]) are already `Send`.
 struct Job {
     /// The queue position `driver_async` returned.
     id: u64,
@@ -103,6 +197,8 @@ struct Job {
     free: Option<unsafe extern "C" fn(*mut c_void)>,
     /// Where the worker reports completion — the owning [`AsyncJobs`]'s channel.
     tx: mpsc::Sender<AsyncCompletion>,
+    /// Keeps the driver's loaded object mapped until this job's release has run (see [`KeepAlive`]).
+    keepalive: Option<KeepAlive>,
 }
 
 /// The shared, lazily initialised worker pool: one job queue, one condvar, N worker threads.
@@ -160,17 +256,34 @@ fn worker(pool: &Pool) {
                 None => continue,
             }
         };
-        // SAFETY: `job.invoke` is the driver's own `void(void*)` async callback and `job.data.0` is
-        // the pointer the driver handed to `driver_async`; the driver contract is that both stay
-        // valid on the async thread until the callback returns.
-        unsafe { (job.invoke)(job.data.0) };
-        // A send failure means the owning port is gone; the driver's data is then released by the
-        // caller path (documented in the module docs) — never silently dropped here.
-        let _ = job.tx.send(AsyncCompletion {
-            id: job.id,
-            data: job.data,
-            free: job.free,
-        });
+        let Job {
+            id,
+            invoke,
+            data,
+            free,
+            tx,
+            keepalive,
+        } = job;
+        // SAFETY: `invoke` is the driver's own `void(void*)` async callback and `data.0` is the
+        // pointer the driver handed to `driver_async`; the driver contract is that both stay valid
+        // on the async thread until the callback returns. `keepalive` pins the driver's loaded object
+        // for the whole of this job, so that code is mapped.
+        unsafe { invoke(data.0) };
+        let completion = AsyncCompletion {
+            id,
+            data,
+            free,
+            discharged: false,
+            keepalive,
+        };
+        if let Err(err) = tx.send(completion) {
+            // A send failure means the owning port is gone — its receiver was dropped — so the
+            // release obligation is the worker's now. Dropping the completion the failed send handed
+            // back runs the driver's `async_free` exactly once (the C's port-gone branch,
+            // `erl_async.c:324-330`); the completion's keep-alive handle pins the driver's code until
+            // then, which is why the completion is not simply discarded here.
+            drop(err.0);
+        }
     }
 }
 
@@ -196,6 +309,9 @@ pub struct AsyncJobs {
     next_id: u64,
     /// Jobs scheduled but not yet drained (running or completed-and-undelivered).
     in_flight: usize,
+    /// The handle that keeps the driver's loaded object mapped while its jobs exist; `None` until the
+    /// port installs one (see [`KeepAlive`] and [`AsyncJobs::set_keepalive`]).
+    keepalive: Option<KeepAlive>,
 }
 
 impl AsyncJobs {
@@ -207,7 +323,17 @@ impl AsyncJobs {
             rx,
             next_id: 1,
             in_flight: 0,
+            keepalive: None,
         }
+    }
+
+    /// Installs the handle that keeps the driver's loaded object mapped while its async jobs exist.
+    ///
+    /// The port calls this once, with an `Arc` to its loaded library, so a job (or a completion) that
+    /// outlives the port still calls mapped code — the C's `DE_Handle` reference for an outstanding
+    /// async job (`erl_async.c:343-344`). See [`KeepAlive`].
+    pub(crate) fn set_keepalive(&mut self, keepalive: KeepAlive) {
+        self.keepalive = Some(keepalive);
     }
 
     /// The number of jobs scheduled but not yet drained by [`AsyncJobs::drain`].
@@ -218,9 +344,12 @@ impl AsyncJobs {
     /// Schedule `invoke(data)` on the shared worker pool.
     ///
     /// Returns the job's queue position (the value `driver_async` returns). A `None` `invoke` is the
-    /// **fire-and-forget** form: the C would fault calling a null `invoke` (`erl_async.c:604`,
-    /// `(*a->async_invoke)(a->async_data)`), so this floor schedules no work and records no
-    /// completion — it still returns a valid queue position, as the C's return contract requires.
+    /// **fire-and-forget** form: the C dereferences the null `invoke` and faults
+    /// (`erl_async.c:604`, `(*a->async_invoke)(a->async_data)`), so there is no C behaviour to
+    /// mirror; this floor instead schedules no work and **releases `data` through the driver's
+    /// `async_free`** (its documented "release async_data" job, `erl_driver.h:603-607`). That is a
+    /// deliberate deviation from the C's crash — the point being that refusing to crash must not leak.
+    /// A valid queue position is still returned, as the C's return contract requires.
     ///
     /// # Errors
     ///
@@ -236,7 +365,13 @@ impl AsyncJobs {
     ) -> Result<u64, ()> {
         let id = self.take_id();
         let Some(invoke) = invoke else {
-            // Fire-and-forget: no work, no completion (see the method docs).
+            // Fire-and-forget: no `invoke` runs, so no `ready_async` will ever run either — the data
+            // is released right here through the driver's own `async_free` (see the method docs).
+            if let Some(free) = free {
+                // SAFETY: `free` is the driver's own `async_free` and `data` is the pointer it handed
+                // to `driver_async`; releasing that exact pointer is what the callback is for.
+                unsafe { free(data) };
+            }
             return Ok(id);
         };
         let pool = pool();
@@ -251,6 +386,7 @@ impl AsyncJobs {
             data: AsyncData(data),
             free,
             tx: self.tx.clone(),
+            keepalive: self.keepalive.clone(),
         };
         lock(&pool.queue).push_back(job);
         pool.ready.notify_one();
@@ -271,6 +407,21 @@ impl AsyncJobs {
         // Wrap to 1, never 0: the C skips 0 (`erl_async.c:575-581`).
         self.next_id = self.next_id.wrapping_add(1).max(1);
         id
+    }
+}
+
+impl Drop for AsyncJobs {
+    /// Discharges every completion the port never drained.
+    ///
+    /// Draining the receiving half first releases the completions that were already queued; dropping
+    /// it then disconnects any worker still in flight, whose `send` fails and which releases its own
+    /// data in [`worker`]. Either way each job's `async_free` runs exactly once — the C's `!p` branch
+    /// of `call_async_ready` (`erl_async.c:324-330`). This is the leak the M1 floor used to have: a
+    /// completion discarded by a dropped channel never ran the driver's `free`.
+    fn drop(&mut self) {
+        while let Ok(completion) = self.rx.try_recv() {
+            drop(completion);
+        }
     }
 }
 

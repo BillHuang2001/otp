@@ -134,6 +134,7 @@
 //! callback slot of a foreign object and reads the driver's reply buffer. Each `unsafe` block
 //! carries a `// SAFETY:` rationale.
 
+use std::any::Any;
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -160,6 +161,23 @@ use crate::error;
 /// few kilobytes; this is that buffer. A driver that ignores `rlen` and writes more is a bug in
 /// native code the runtime loaded — see the trust-boundary note on [`Driver::control`].
 const CONTROL_REPLY_CAPACITY: usize = 4096;
+
+/// Pins a driver's loaded object (`Arc<DriverLibrary>`) for as long as one of its `driver_async` jobs
+/// (or an undelivered completion) still exists.
+///
+/// The port installs one of these in its [`AsyncJobs`](crate::abi::AsyncJobs) so the `dlclose` a
+/// dropped port would otherwise run is deferred until the last job's `async_free` has run — mirroring
+/// the C's `DE_Handle` reference for an outstanding async job (`erl_async.c:343-344`). Without it, a
+/// job that outlives its port would run unmapped code.
+struct LibraryKeepAlive(#[allow(dead_code)] Arc<DriverLibrary>);
+
+// SAFETY: the wrapped `Arc<DriverLibrary>` is only ever held as a reference count and is never
+// dereferenced by `beam_io`. The driver's code and static data are used from the async worker thread
+// by the driver contract itself (the C likewise hands its worker the driver's `DE_Handle`), so moving
+// or sharing the handle cannot violate Rust aliasing — the only shared state is the atomic refcount
+// inside the `Arc`.
+unsafe impl Send for LibraryKeepAlive {}
+unsafe impl Sync for LibraryKeepAlive {}
 
 /// A loaded C driver, presented as a [`Driver`](crate::driver::Driver).
 pub struct DriverPort {
@@ -240,6 +258,15 @@ impl DriverPort {
     ) -> Result<DriverPort> {
         let name = library.name();
         let mut abi = Box::new(AbiHost::for_driver(port_host, name.clone(), true)?);
+        // Every `driver_async` job this port schedules — and every completion it never drained —
+        // clones this handle, so the driver's loaded object stays mapped until the last job has been
+        // released. That is the C's `DE_Handle` reference for an outstanding async job
+        // (`erts_ddll_dereference_driver`, `erl_async.c:343-344`): without it, the `dlclose` a
+        // dropped port runs would unmap the very code (`async_invoke`/`async_free`) a job that
+        // outlives its port still has to execute.
+        abi.state_mut()
+            .jobs
+            .set_keepalive(Arc::new(LibraryKeepAlive(Arc::clone(&library))));
         // The `ErlDrvPort` a driver sees is `DriverEnv::as_port()`'s pointer, so the env must point
         // at an allocation that never moves. `abi` is boxed here (stable address) and both boxes are
         // moved into `DriverPort`, which owns them for the port's whole life — so the raw pointer the
@@ -351,7 +378,10 @@ impl DriverPort {
     /// and can only run the callback (the registration then dies with the poller).
     fn release_selects_on_teardown(&mut self, mut ctx: Option<&mut DriverContext<'_>>) {
         let selects = self.abi.state_mut().take_all_selected();
-        let mut events = Vec::new();
+        // A release a *deselect* queued and that no `call`/`poll_async` has drained yet is owed
+        // too: teardown is the last moment at which it can be delivered, so the queued events ride
+        // along with the still-selected ones (queued first, their deselect happened earlier).
+        let mut events = self.abi.state_mut().take_queued_stop_select();
         for (fd, token, owes_stop_select) in selects {
             if let Some(ctx) = ctx.as_mut() {
                 let _ = ctx.deregister(fd, token);
@@ -385,31 +415,31 @@ impl DriverPort {
         // The C runs a port's async completions in queue order; the channel delivers in completion
         // order, so sorting by the `driver_async` queue position reproduces the queue order exactly
         // (and makes the callback order deterministic under concurrency).
-        jobs.sort_by_key(|job| job.id);
+        jobs.sort_by_key(|job| job.id());
         let mut processed = 0usize;
-        for job in jobs {
+        for mut job in jobs {
             if self.lib.entry().ready_async.is_some() {
-                let thread_data = job.data.0 as ErlDrvThreadData;
+                let thread_data = job.data() as ErlDrvThreadData;
                 self.call(&mut *ctx, |port, _port_handle| {
                     let _ = port.lib.ready_async(port.data, thread_data);
                 });
-            } else if let Some(free) = job.free {
-                // SAFETY: `free` is the driver's own `async_free` (`void (*)(void*)`) and
-                // `job.data.0` is the `async_data` pointer it handed to `driver_async`. The C's
-                // contract is that exactly one of `ready_async`/`async_free` runs for a completed
-                // job, and the `ready_async`-present case was handled above — so this must run
-                // here, and `beam_io` itself never dereferences the pointer.
-                //
-                // `async_free` carries no port, so it is one of the driver entry points that does
-                // not go through `DriverPort::call`; the host is published here for the same reason
-                // `call` publishes it — a driver may call the no-port registry slots
+                // `ready_async` owns `async_data` from here (the C's `need_free = 0`,
+                // `io.c:5399-5400`), so this completion must not release it: disarming it *before*
+                // it drops is what keeps the release exactly-once.
+                job.handed_to_ready_async();
+            } else {
+                // No `ready_async` on the entry: the release is this port's (the C's `need_free`
+                // path, `io.c:5406`). `async_free` carries no port, so it is one of the driver entry
+                // points that does not go through `DriverPort::call`; the host is published here for
+                // the same reason `call` publishes it — a driver may call the no-port registry slots
                 // (`add_driver_entry`/`remove_driver_entry`) from any of its callbacks.
                 let abi_ptr: *mut AbiHost = &mut *self.abi;
                 // SAFETY: see `DriverPort::call` — the published `&mut` reaches only the
                 // `AbiHost`'s interior-mutable state and is retired before this iteration's borrow
-                // ends; the closure touches neither `self` nor the host.
+                // ends; the closure touches only the completion (`job`), which is disjoint from the
+                // host.
                 let host: &mut dyn DriverHost = unsafe { &mut *abi_ptr };
-                beam_abi::with_current_host(host, || unsafe { free(job.data.0) });
+                beam_abi::with_current_host(host, || job.release());
             }
             processed += 1;
         }
@@ -737,7 +767,8 @@ impl Driver for DriverPort {
     }
 }
 
-/// A port's last chance to release its `driver_select` registrations.
+/// A port's last chance to release its `driver_select` registrations and its undelivered
+/// `driver_async` completions.
 ///
 /// The ordinary teardown is [`Driver::stop`], which has a [`DriverContext`] and so can also
 /// withdraw the poller registrations. This catches a [`DriverPort`] dropped **without** `stop`
@@ -747,6 +778,14 @@ impl Driver for DriverPort {
 /// context here, so only the callback runs (the poller registration dies with the poller).
 impl Drop for DriverPort {
     fn drop(&mut self) {
+        // Release the `driver_async` jobs the port never delivered **first**, and inside this
+        // `drop` rather than after it: each completion's `async_free` is a driver callback, so it
+        // must run while the loaded library is still mapped (this struct's `lib` field, dropped
+        // after `drop` returns) — and before the teardown below, keeping the drop order a
+        // `stop_select`-observing test pins. A completion still queued is released here; a job
+        // whose worker is still running sees the channel close and releases its own data, the C's
+        // port-gone branch (`erl_async.c:324-330`). Either way each `async_free` runs exactly once.
+        drop(self.abi.state_mut().jobs.drain());
         self.release_selects_on_teardown(None);
     }
 }
