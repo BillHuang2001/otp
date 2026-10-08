@@ -315,3 +315,346 @@ impl ProcessHook for ProcessBridge<'_> {
         Ok(self.self_pid)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Direct unit tests for the [`ProcessBridge`] over a real [`Runtime`].
+    //!
+    //! The bridge is the concrete [`ProcessHook`] the BIF layer dispatches to, so these
+    //! tests drive the trait **methods** (not the BIFs) against the runtime's own process
+    //! table, port registry and shared atom table. The end-to-end path through the
+    //! registered BIFs lives in `tests/proc_seams.rs`; here the aim is the bridge's own
+    //! contract — which failures are `false` (the oracle's `badarg`), which are the typed
+    //! capability gap, and how `process_flag/2` reports an *unchanged* flag.
+    //!
+    //! Oracle ground truth (OTP 29.1.1 / erts-17.1), pinned by the probes quoted at each
+    //! test: `whereis(init)` is a pid, `whereis(<absent>)` is `undefined`,
+    //! `process_flag(trap_exit, true)` returns the previous `false`,
+    //! `process_flag(priority, high)` the previous `normal`, and `process_flag/2` of an
+    //! unknown flag or a non-boolean `trap_exit` value raises `badarg`.
+
+    use super::*;
+    use beam_term::make_small;
+
+    /// A runtime with the root `init` process registered (the default runtime).
+    fn runtime() -> Runtime {
+        Runtime::with_defaults().expect("the default runtime")
+    }
+
+    /// A small heap for the `process_flag`/`process_info` builders (they ignore it, but the
+    /// trait takes one).
+    fn heap() -> Heap {
+        Heap::new(64).expect("a test heap")
+    }
+
+    /// The atom `name`, interned in the runtime's shared table.
+    fn atom(rt: &mut Runtime, name: &str) -> Atom {
+        rt.code_server_atoms_mut().intern(name)
+    }
+
+    /// The previous-value atom a `process_flag` reply names, as a string.
+    fn previous(atoms: &AtomTable, result: Result<Option<Eterm>>) -> String {
+        let value = result
+            .expect("process_flag/2 does not fail at the bridge level")
+            .expect("a known flag with a legal value has a previous value");
+        atom_name(atoms, value).expect("the previous value is an atom")
+    }
+
+    #[test]
+    fn whereis_resolves_the_root_and_reports_an_absent_name_as_none() {
+        let mut rt = runtime();
+        let init = atom(&mut rt, "init");
+        let absent = atom(&mut rt, "zz_bridge_absent_name");
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        // The runtime registers its root process as `init` (the oracle's `<0.0.0>`).
+        assert_eq!(bridge.whereis(init).unwrap(), Some(self_pid.to_eterm()));
+        // An unregistered name is `None` (the BIF layer renders the atom `undefined`).
+        assert_eq!(bridge.whereis(absent).unwrap(), None);
+    }
+
+    #[test]
+    fn register_and_unregister_round_trip_with_the_false_failures() {
+        let mut rt = runtime();
+        let name = atom(&mut rt, "zz_bridge_registered_name");
+        let taken = atom(&mut rt, "init");
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        assert!(bridge.register(name, self_pid.to_eterm()).unwrap());
+        assert_eq!(bridge.whereis(name).unwrap(), Some(self_pid.to_eterm()));
+        // A name that is already registered is the oracle's `badarg` — `false` here.
+        assert!(!bridge.register(taken, self_pid.to_eterm()).unwrap());
+        // `unregister` of a registered name succeeds; of an unregistered one is `false`.
+        assert!(bridge.unregister(name).unwrap());
+        assert_eq!(bridge.whereis(name).unwrap(), None);
+        assert!(!bridge.unregister(name).unwrap());
+    }
+
+    #[test]
+    fn register_of_a_port_id_is_the_typed_capability_gap() {
+        let mut rt = runtime();
+        let name = atom(&mut rt, "zz_bridge_port_name");
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        // The oracle's registry holds a port id as well as a pid; this runtime's holds pids
+        // only, so registering a port is the honest typed gap — never a fabricated
+        // `true`/`false` (see the module docs).
+        let error = bridge
+            .register(name, PortId::new(7).to_eterm())
+            .expect_err("a port id is not registrable");
+        assert!(
+            crate::error::unsupported_reason(&error).is_some(),
+            "expected a typed capability gap, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn registered_lists_the_root_init_name() {
+        let mut rt = runtime();
+        let init = atom(&mut rt, "init");
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        let names = bridge.registered().unwrap();
+        assert!(names.contains(&init), "`init` is registered: {names:?}");
+    }
+
+    #[test]
+    fn is_process_alive_reports_table_membership() {
+        let mut rt = runtime();
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        assert!(bridge.is_process_alive(self_pid).unwrap());
+        // A pid the table never allocated names no live process.
+        assert!(!bridge.is_process_alive(ProcessId::new(999_999, 0)).unwrap());
+    }
+
+    #[test]
+    fn processes_lists_the_live_pids() {
+        let mut rt = runtime();
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        let pids = bridge.processes().unwrap();
+        assert!(pids.contains(&self_pid), "the root is live: {pids:?}");
+    }
+
+    #[test]
+    fn ports_come_from_the_shared_registry_and_a_held_borrow_is_the_typed_gap() {
+        let mut rt = runtime();
+        let ports = Rc::clone(&rt.ports);
+        let handle = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        // A fresh runtime has opened no ports.
+        assert_eq!(bridge.ports().unwrap(), Vec::<PortId>::new());
+        // With the registry already mutably borrowed the bridge reports the typed
+        // capability gap (`try_borrow`, never `borrow`), never a panic or a fabricated list.
+        let _guard = handle.borrow_mut();
+        let error = bridge.ports().expect_err("the registry is already borrowed");
+        assert!(
+            crate::error::unsupported_reason(&error).is_some(),
+            "expected a typed capability gap, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn group_leader_is_the_running_process() {
+        let mut rt = runtime();
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+
+        assert_eq!(bridge.group_leader().unwrap(), self_pid);
+    }
+
+    #[test]
+    fn process_flag_reports_the_previous_value_of_every_flavour() {
+        let mut rt = runtime();
+        let trap = atom(&mut rt, "trap_exit");
+        let sensitive = atom(&mut rt, "sensitive");
+        let priority = atom(&mut rt, "priority");
+        let save_calls = atom(&mut rt, "save_calls");
+        let unknown = atom(&mut rt, "zz_bridge_frobnicate");
+        let high = atom(&mut rt, "high");
+        let frobnicate = atom(&mut rt, "zz_bridge_not_a_priority");
+        let not_a_bool = atom(&mut rt, "zz_bridge_not_a_bool");
+        let v_true = atom(&mut rt, "true");
+        let v_false = atom(&mut rt, "false");
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+        let mut heap = heap();
+
+        // `trap_exit`: a fresh process is `false`, so the first set returns `false` and the
+        // reset returns the `true` it replaced.
+        assert_eq!(
+            previous(
+                &atoms,
+                bridge.process_flag(&mut heap, &atoms, trap, make_atom(v_true))
+            ),
+            "false"
+        );
+        assert_eq!(
+            previous(
+                &atoms,
+                bridge.process_flag(&mut heap, &atoms, trap, make_atom(v_false))
+            ),
+            "true"
+        );
+        // `sensitive`: the default is `false`.
+        assert_eq!(
+            previous(
+                &atoms,
+                bridge.process_flag(&mut heap, &atoms, sensitive, make_atom(v_true))
+            ),
+            "false"
+        );
+        // `priority`: the default is the atom `normal`.
+        assert_eq!(
+            previous(
+                &atoms,
+                bridge.process_flag(&mut heap, &atoms, priority, make_atom(high))
+            ),
+            "normal"
+        );
+        // `save_calls`: the default is `0`, and the previous value comes back as a small int.
+        let first = bridge
+            .process_flag(&mut heap, &atoms, save_calls, make_small(100))
+            .unwrap()
+            .expect("a legal save_calls value");
+        assert!(is_small(first));
+        assert_eq!(signed_value(first), 0);
+        let second = bridge
+            .process_flag(&mut heap, &atoms, save_calls, make_small(7))
+            .unwrap()
+            .expect("a legal save_calls value");
+        assert_eq!(signed_value(second), 100);
+
+        // An unknown flag is the oracle's `badarg` (the hook's `Ok(None)` contract) ...
+        assert!(bridge
+            .process_flag(&mut heap, &atoms, unknown, make_small(1))
+            .unwrap()
+            .is_none());
+        // ... as is `trap_exit` with a non-boolean value ...
+        assert!(bridge
+            .process_flag(&mut heap, &atoms, trap, make_atom(not_a_bool))
+            .unwrap()
+            .is_none());
+        // ... an out-of-range `save_calls` ...
+        assert!(bridge
+            .process_flag(&mut heap, &atoms, save_calls, make_small(-1))
+            .unwrap()
+            .is_none());
+        assert!(bridge
+            .process_flag(&mut heap, &atoms, save_calls, make_small(10_001))
+            .unwrap()
+            .is_none());
+        // ... and a non-priority atom for `priority`.
+        assert!(bridge
+            .process_flag(&mut heap, &atoms, priority, make_atom(frobnicate))
+            .unwrap()
+            .is_none());
+    }
+
+    /// **Documented divergence** (reported, not hidden): the oracle raises `badarg` for a
+    /// non-integer `save_calls` value (`goto error`, `../../erts/emulator/beam/bif.c:1911`,
+    /// for any non-small value; probed `process_flag(save_calls, true)` ⇒ `badarg` on OTP
+    /// 29.1.1). This bridge instead treats `true`/`false` as `1`/`0` and leaves the flag
+    /// untouched for any other non-boolean, returning the **previous value**. The test pins
+    /// the current behaviour so the branch is covered and the divergence is visible; fixing
+    /// it (returning `Ok(None)` for a non-small value) would make this test fail.
+    #[test]
+    fn save_calls_with_a_non_integer_returns_the_previous_value_a_documented_divergence() {
+        let mut rt = runtime();
+        let save_calls = atom(&mut rt, "save_calls");
+        let v_true = atom(&mut rt, "true");
+        let not_a_number = atom(&mut rt, "zz_bridge_not_a_number");
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+        let mut heap = heap();
+
+        // A fresh process reports `0` for both shapes (the oracle would raise `badarg`).
+        let boolean = bridge
+            .process_flag(&mut heap, &atoms, save_calls, make_atom(v_true))
+            .unwrap()
+            .expect("the bridge answers rather than raising");
+        assert_eq!(signed_value(boolean), 0);
+        let other = bridge
+            .process_flag(&mut heap, &atoms, save_calls, make_atom(not_a_number))
+            .unwrap()
+            .expect("the bridge leaves the flag untouched");
+        // `true` set the counter to `1`, so the following call reports that `1` back.
+        assert_eq!(signed_value(other), 1);
+    }
+
+    #[test]
+    fn process_info_keys_and_items_read_the_runtime_state() {
+        let mut rt = runtime();
+        // The key list resolves each item name through the shared table; in production the
+        // caller's module has interned them, so the test interns the very same vocabulary
+        // (the single source of truth, `native::memory::PI_1_KEYS`) up front.
+        for name in crate::native::memory::PI_1_KEYS {
+            atom(&mut rt, name);
+        }
+        let item = atom(&mut rt, "message_queue_len");
+        let unknown = atom(&mut rt, "zz_bridge_not_an_item");
+        let atoms = rt.code_server.atoms_handle();
+        let ports = Rc::clone(&rt.ports);
+        let self_pid = rt.self_pid();
+        let mut bridge = ProcessBridge::new(&mut rt, None, ports, None, self_pid);
+        let mut heap = heap();
+
+        // The key list of a live process names a real item, and is `None` for a dead pid
+        // (the BIF layer renders the oracle's `undefined`).
+        let keys = bridge
+            .process_info_keys(self_pid)
+            .unwrap()
+            .expect("the root is live");
+        assert!(keys.contains(&item), "the item list names it: {keys:?}");
+        assert!(bridge
+            .process_info_keys(ProcessId::new(999_999, 0))
+            .unwrap()
+            .is_none());
+
+        // A known item's value is built into the reply, an unknown item is `Unknown` (the
+        // oracle's `badarg`, decided before the process is inspected) and a known item on a
+        // pid that names no live process is `Dead` (the oracle's `undefined`).
+        let value = bridge
+            .process_info_item(&mut heap, &atoms, self_pid, item)
+            .unwrap();
+        match value {
+            ProcessInfoItem::Value(term) => {
+                assert!(is_small(term), "an empty mailbox: {term:?}");
+                assert_eq!(signed_value(term), 0);
+            }
+            other => panic!("expected the item's value, got {other:?}"),
+        }
+        assert_eq!(
+            bridge
+                .process_info_item(&mut heap, &atoms, self_pid, unknown)
+                .unwrap(),
+            ProcessInfoItem::Unknown
+        );
+        assert_eq!(
+            bridge
+                .process_info_item(&mut heap, &atoms, ProcessId::new(999_999, 0), item)
+                .unwrap(),
+            ProcessInfoItem::Dead
+        );
+    }
+}

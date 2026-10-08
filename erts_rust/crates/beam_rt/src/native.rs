@@ -55,7 +55,7 @@ mod application;
 mod code;
 mod erts_internal;
 mod init;
-mod memory;
+pub(crate) mod memory;
 mod port;
 mod prim;
 mod process;

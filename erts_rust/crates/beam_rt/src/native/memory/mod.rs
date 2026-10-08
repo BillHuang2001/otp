@@ -158,7 +158,12 @@ use crate::config::MaxHeapFlags;
 /// The C's `pi_1_keys[]` (`erl_bif_info.c:1008-1026`), in order — the item set *and* order
 /// `erlang:process_info/1` answers. `registered_name` is skipped when the process is
 /// unregistered (the C's `nil` skip), which is why the oracle emits 16 items.
-const PI_1_KEYS: &[&str] = &[
+///
+/// `pub(crate)` (inside a `pub(crate)` module) so the [`ProcessBridge`]'s unit tests can
+/// intern the very same vocabulary into the shared table instead of duplicating the list.
+///
+/// [`ProcessBridge`]: crate::context::process_bridge::ProcessBridge
+pub(crate) const PI_1_KEYS: &[&str] = &[
     "registered_name",
     "current_function",
     "initial_call",
