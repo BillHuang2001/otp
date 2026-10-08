@@ -112,11 +112,14 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
   outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=667 agree=666 mismatch=0 unsupported=1
-  skipped=0` — per contract A.1 154/154 · A.2 176/176 · A.3 34/34 · A.4 64/64 · A.5 63/64 (+1
-  unsupported) · A.6 37/37 · A.7 246/246 · A.8 49/49 · A.9 52/52. **No case disagrees.** The single
-  `unsupported` is `wire/new_fun_ext_encode` (A.5): an `erl_eval` lambda's closure identity cannot be
-  reproduced without porting `erl_eval`/`erl_scan`/`erl_parse`, so it is **unclosable by design**.
+- **Compatibility gate (`tools/differential`):** per `tools/differential/CONTEXT.md`, `summary: total=723
+  agree=708 mismatch=0 unsupported=15 skipped=0` (`gate.sh` → exit `3`) — per contract A.1 154/154 · A.2
+  176/176 · A.3 34/34 · A.4 64/64 · A.5 79/71 (+8 unsupported) · A.6 44/44 · A.7 265/263 (+2) · A.8
+  64/59 (+5) · A.9 52/52. **No case disagrees.** The 15 `unsupported` are honest capability gaps, never
+  `mismatch`: `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
+  `erl_eval`/`erl_scan`/`erl_parse`), the 7 `wire_ids` node-identity cases (`nodes/0,1`, `set_cookie/2`),
+  the 5 `erlang:memory/0,1` cases, and `start_timer/3` + `function_exported/3`. (Sibling docs cite older
+  totals; re-run `gate.sh` for the exact current split.)
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 637
   keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through two
   defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`). Registered-but-unadopted BIFs return a
