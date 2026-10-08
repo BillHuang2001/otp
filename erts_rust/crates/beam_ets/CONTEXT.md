@@ -668,9 +668,9 @@ impl Table {
   reproduces the same 15-field order.
 - **Ownership modelling has no pid/liveness concept.** `ets:give_away/3` treats a `None` new owner as
   the oracle's non-pid/dead-pid target (both `badarg`); an *unknown table id* is the registry/BIF
-  layer's concern, not this crate's. The `{'ETS-TRANSFER', Tab, FromPid, GiftData}` message the new
-  owner receives, and the heir hand-off when an owner dies, are the BIF/runtime layer's job — this
-  crate models only the ownership/heir *state*.
+  layer's concern, not this crate's. The `{'ETS-TRANSFER', Tab, FromPid, GiftData}` *delivery* and the
+  actual dropping of the table stay the runtime's job: `Table::owner_died` decides the transition and
+  returns `OwnerDeath` (see `table/lifecycle.rs`), but has no caller yet.
 - **`ets:setopts/2` is modelled only for `{heir, ...}`.** The other `setopts/2` options
   (`{heir, Pid}` arity-2, `{heir, Pid, Data}` duplication-checking, `safe_fixtable`, `{write_concurrency, _}`,
   …) are out of M1 scope; the crate exposes the `{heir, Pid, Data}` / `{heir, none}` subset via
