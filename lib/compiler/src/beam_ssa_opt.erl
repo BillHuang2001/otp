@@ -373,7 +373,17 @@ repeated_passes(Opts) ->
                           fun(St) -> beam_ssa_loop_opt:opt(St) end}];
               false -> Ps
           end,
-    passes_1(Ps1, Opts).
+    Ps2 = case lists:member(loop_arith_licm, Opts) of
+              true ->
+                  %% Opt-in loop-invariant code motion of arithmetic, a
+                  %% separate pass so that passes_1/2 derives its own kill
+                  %% switch no_ssa_opt_loop_arith_licm. `loop_opt' alone
+                  %% never enables it.
+                  Ps1 ++ [{ssa_opt_loop_arith_licm,
+                           fun(St) -> beam_ssa_loop_opt:opt_arith(St) end}];
+              false -> Ps1
+          end,
+    passes_1(Ps2, Opts).
 
 epilogue_module_passes(Opts) ->
     Ps0 = [{ssa_opt_alias,
@@ -448,6 +458,8 @@ wrap_fun(func, Name, Fun) ->
 %% pass to change anything, so the driver may skip the pass when it is false.
 %% `undefined' means "always run".
 gate(ssa_opt_loop_opt) ->
+    fun beam_ssa_loop_opt:eligible/1;
+gate(ssa_opt_loop_arith_licm) ->
     fun beam_ssa_loop_opt:eligible/1;
 gate(ssa_opt_fus) ->
     fun beam_ssa_fus:eligible/1;
