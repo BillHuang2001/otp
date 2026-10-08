@@ -18,15 +18,19 @@
 //
 // %CopyrightEnd%
 
-//! The remaining runtime-coupled families (the ETS C interior, `re`, `erl_ddll`, distribution, ...).
+//! The remaining runtime-coupled families (`erl_debugger`, `re`, `erl_ddll`, `code`, ...).
 //!
 //! Every key here is a declared `bif.tab` entry whose implementation needs host
-//! machinery this crate does not own: PCRE (`re`), a driver loader (`erl_ddll`),
-//! the code-coverage bookkeeping (`code`), the ETS C interior (`ets`) and the
-//! tracing/literal-area distribution internals. Each is registered through the
-//! single [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so a call answers
-//! the typed `unsupported_bif` capability gap until the runtime installs a hook
-//! -- never `undef`, never a fabricated value.
+//! machinery this crate does not own: the interpreter-level debugger tools
+//! (`erl_debugger`), PCRE (`re`), the live driver registry (`erl_ddll`), the
+//! code-coverage bookkeeping (`code`), the `ets` scheduler fan-in
+//! (`internal_request_all/0`) and C-interior slot walk (`slot/2`), the
+//! tracing-state cleanup and literal-area copy protocols, and the `prim_file` NFC
+//! normalizer, `os` signal handling, `net_kernel` distribution flag and
+//! `error_logger` category map. Each is registered through the single
+//! [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so a call answers the typed
+//! `unsupported_bif` capability gap until the runtime installs a hook -- never
+//! `undef`, never a fabricated value.
 
 use crate::registry::BifRegistry;
 
