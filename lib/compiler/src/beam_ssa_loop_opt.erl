@@ -74,34 +74,29 @@
 %%%    literal power of two, `X div 0' (which must keep raising), `rem' by a
 %%%    power of two with a possibly negative dividend, and every operation
 %%%    with an operand whose integrality/non-negativity cannot be proved.
-%%%
-%%%    The reducer needs no loop at all: every rewrite is local and proved at
-%%%    the rewritten instruction, so it is applied to the WHOLE FUNCTION, not
-%%%    just to the loop region. Only induction-variable recognition is
-%%%    loop-scoped.
+%%%    The reducer is applied to the WHOLE FUNCTION -- every rewrite is local
+%%%    and proved at the instruction -- and only IV recognition is loop-scoped.
 %%%
 %%% INTEGRALITY AND NON-NEGATIVITY PROOF (shared by items 3-4 and by LICM)
 %%%
 %%% Two independent sources, either of which is enough:
 %%%
 %%% * the *structural* facts (`value_kinds/2' + `def_kind/4'): an integer
-%%%   literal; a canonical induction variable (an integer entry value and
-%%%   integer steps, non-negative as well when the entry value and every step
-%%%   are non-negative -- an induction over the iterations); a phi whose
-%%%   incoming values are all integers (non-negative integers); a `{bif,Op}'
-%%%   with Op in ?INT_BIFS (?NAT_BIFS) whose operands are all integers
-%%%   (non-negative integers). A fact about a value defined outside a loop
-%%%   holds on every path into the loop, because the definitions it rests on
-%%%   dominate the uses -- this is what makes the structural facts usable at
-%%%   a hoist point.
+%%%   literal; a canonical induction variable (integer entry value and steps,
+%%%   non-negative as well when the entry value and every step are non-negative
+%%%   -- an induction over the iterations); a phi whose incoming values are all
+%%%   integers (non-negative integers); a `{bif,Op}' with Op in ?INT_BIFS
+%%%   (?NAT_BIFS) whose operands are all integers (non-negative integers). A
+%%%   fact about a value defined outside a loop holds on every path into the
+%%%   loop, because the definitions it rests on dominate the uses -- which is
+%%%   what makes the structural facts usable at a hoist point.
 %%% * the *type annotations* `beam_ssa_type' leaves on an instruction
 %%%   (`anno = #{arg_types := #{Index => #type{}}}', the type of the operand
-%%%   at the 0-based Index). `#t_integer{}' proves integrality and
-%%%   `#t_integer{elements={Lo,_}}' with `Lo >= 0' proves non-negativity.
-%%%   They are PATH-DEPENDENT: the type analysis refines a variable along the
-%%%   edges it flows down, so the type of a variable at one use says nothing
-%%%   about its type at another. They are used in place by `operand_kind/4'
-%%%   and for hoisting by `pre_kind/5'.
+%%%   at the 0-based Index): `#t_integer{}' proves integrality and a lower
+%%%   element bound >= 0 proves non-negativity. They are PATH-DEPENDENT: the
+%%%   analysis refines a variable along the edges it flows down, so the type at
+%%%   one use says nothing about another. Used in place by `operand_kind/4'
+%%%   and, for hoisting, through the extra rule of `pre_kind/5'.
 %%%
 %%% CORRECTNESS RULES
 %%%
@@ -109,39 +104,24 @@
 %%%   calls and side-effecting instructions are never touched.
 %%% * The strength reducer replaces an operation only by one that either
 %%%   succeeds and computes the same value or fails on exactly the same
-%%%   operands. Since every rewrite requires a proof that the operands are
-%%%   integers (or, for `div' -> `bsr', non-negative integers), the operand
-%%%   set on which the new instruction fails is empty, so no exception is
-%%%   added. The divisor is a literal power of two, so no division by zero is
-%%%   created and an existing one is never removed.
-%%% * LICM moves an instruction from a block inside the loop into the
-%%%   preheader, which dominates that block. The operands are loop-invariant,
-%%%   so they hold at the preheader exactly the values they held at the
-%%%   original location; what changes is that the instruction now also runs
-%%%   on paths that enter the loop and leave it before reaching the original
-%%%   block. It must therefore be proved not to raise for the operand values
-%%%   possible AT THE PREHEADER -- see the arithmetic LICM below.
+%%%   operands. Every rewrite proves the operands integral (non-negative for
+%%%   `div' -> `bsr' and `rem' -> `band'), so the operand set on which the new
+%%%   instruction fails is empty and no exception is added. The divisor stays a
+%%%   literal power of two, so no division by zero is created or removed.
 %%% * The whole transformation is wrapped so that any unexpected condition
-%%%   simply skips the optimization rather than failing the compilation.
+%%%   skips the optimization rather than failing the compilation.
 %%%
-%%% NOT IMPLEMENTED
+%%% NOT IMPLEMENTED: unrolling (needs an exact trip count); accumulator-based
+%%% strength reduction of `X * K' for a non-power-of-two K; `X * 2^n' for an X
+%%% that may be a float; a shift by a negative or non-literal count; any
+%%% divisor that could be 0.
 %%%
-%%% * Unrolling: needs an exact trip count and a decidable exit test.
-%%% * Accumulator-based strength reduction of `X * K' for a non-power-of-two
-%%%   K: it replaces a multiplication by an addition at the cost of a new
-%%%   phi, a new preheader computation and a rewritten use set, and it only
-%%%   pays off for a large number of iterations, which is not knowable here.
-%%% * `X * 2^n' with an X that may be a float, a shift by a negative or
-%%%   non-literal count, and any divisor that could be 0.
-%%%
-%%% REACH at this pipeline point (the pass runs after the SSA type analysis):
-%%% the CFG of an ordinary tail-recursive function contains no cycle
-%%% (self-recursion is still a tail `call') and a `receive' loop's header
-%%% carries no phis, so the loop and induction-variable parts find little to
-%%% do in typical Erlang code. The strength reducer, however, needs neither a
-%%% phi nor an induction variable -- only a proof that one operand of a
-%%% product or quotient is an integer, which the SSA type annotations
-%%% provide -- and is applied to the whole function.
+%%% REACH (the pass runs after the SSA type analysis): the CFG of an ordinary
+%%% tail-recursive function contains no cycle (self-recursion is still a tail
+%%% `call') and a `receive' loop's header carries no phis, so the loop and IV
+%%% parts find little to do in typical Erlang code. The strength reducer needs
+%%% neither a phi nor an IV, only a proof that an operand is an integer, which
+%%% the type annotations provide -- and it is applied to the whole function.
 -export([opt/1, opt_arith/1, eligible/1]).
 
 -include("beam_ssa.hrl").
@@ -152,47 +132,23 @@
 %% preheader on pathological input.
 -define(MAX_HOIST, 64).
 
-%% Operations that are side-effect free and that can never raise, for any
-%% operand values. Everything not listed here is left in the loop.
-%%
-%% Purity and non-raising are necessary but NOT sufficient: an instruction
-%% that is moved into the preheader leaves its original block, so it must
-%% also have a code generation rule that is valid *anywhere*. This excludes
-%% the fused type tests `is_tagged_tuple'/3 and `is_nonempty_list'/1
-%% (produced by `ssa_opt_record'/1 and by the list pattern builder), because
-%% `beam_ssa_codegen' only implements them as block-local tests that must be
-%% the last instruction of a block and be consumed immediately by that
-%% block's terminator (the `cg_block/3' clauses for is_tagged_tuple and
-%% is_nonempty_list). There is no standalone `cg_instr/3' clause for either,
-%% so hoisting one into a preheader makes code generation fail
-%% (`function_clause' in `cg_instr/3'), and the is_nonempty_list fallback
-%% additionally asserts the `was_bif_is_list' annotation that such an
-%% instruction does not have. Constructors, on the other hand, are ordinary
-%% value instructions (`cg_instr(put_list, ...)' / `cg_instr(put_tuple, ...)')
-%% and are safe to move.
+%% Operations that are side-effect free, can never raise for any operand
+%% values, and have a block-independent code generation rule. Purity and
+%% non-raising are necessary but NOT sufficient: the fused type tests
+%% `is_tagged_tuple'/3 and `is_nonempty_list'/1 exist only as block-local tests
+%% consumed by the block terminator (`cg_block/3') with no standalone
+%% `cg_instr/3' clause, so hoisting one breaks code generation. Constructors are
+%% ordinary value instructions and are safe to move.
 -define(SAFE_OPS, [put_list, put_tuple]).
 
 %% `{bif,Name}' value instructions that are additionally hoisted, listed as
-%% {Name,Arity} pairs. These are the Erlang tag tests. Each one is a plain
-%% tag comparison that is pure and cannot fail for any argument (see the
-%% `is_*_1'/1 functions in `erts/emulator/beam/erl_bif_op.c'), and each is
-%% declared as `ubif' in `erts/emulator/beam/bif.tab', so
-%% `{bif,Name,{f,0},Args,Dst}' is a valid *standalone* instruction
-%% (`beam_ssa_codegen:cg_block/3', fallback clause) as well as a block-local
-%% test. They are therefore movable into a preheader.
-%%
-%% The arity is part of the key, because the arity decides whether the
-%% instruction can raise:
-%%
-%% * `is_function/2' shares the name `is_function' with the safe
-%%   `is_function/1', but raises `badarg' unless the second argument is a
-%%   non-negative integer (`erl_is_function/3' in erl_bif_op.c); v3_core
-%%   even forces a call to it in a guard to be protected for that reason.
-%% * `is_record/2' and `is_record/3' (i.e. `{bif,is_record}' with two or
-%%   three operands) raise `badarg' unless the tag operand is an atom
-%%   (`is_record_2/3' in erl_bif_op.c).
-%%
-%% None of the raising arities are listed, so they stay in the loop.
+%% `{bif,Name}' value instructions that are additionally hoisted, listed as
+%% {Name,Arity} pairs. These are the Erlang tag tests: each is a plain tag
+%% comparison, pure and non-raising for any argument (see the `is_*_1'/1
+%% functions in `erts/emulator/beam/erl_bif_op.c'), and each is a `ubif' in
+%% bif.tab, so `{bif,Name,{f,0},Args,Dst}' is a valid standalone instruction as
+%% well as a block-local test. The arity is part of the key: `is_function/2'
+%% and `is_record/2,3' raise `badarg' and are deliberately absent.
 -define(SAFE_BIFS, [{is_atom,1}, {is_binary,1}, {is_bitstring,1},
                     {is_boolean,1}, {is_float,1}, {is_function,1},
                     {is_integer,1}, {is_list,1}, {is_map,1}, {is_number,1},
@@ -200,22 +156,14 @@
                     {is_tuple,1}]).
 
 %% Arithmetic BIFs whose result is an integer whenever all their operands are
-%% integers. Some of them can raise (`div'/`rem' on a zero divisor, `bsl'/
-%% `bsr' on a negative shift count or a non-integer operand), which is
-%% irrelevant: what is claimed below is only "if this instruction produces a
-%% value, that value is an integer", and the operand facts are themselves
-%% only claimed for values that were produced. `+'/`-'/'*' also accept
-%% floats, but their operands are integers whenever the rule is applied.
-%% `trunc'/`round' produce an integer from any number and raise for every
-%% other operand, so their result is an integer whenever it exists.
+%% integers (the operand facts are only claimed for values that were produced,
+%% so what `trunc'/`round' do with a non-number does not matter).
 -define(INT_BIFS, ['+','-','*','div','rem','band','bor','bxor','bsl','bsr',
                    'abs','trunc','round']).
 
 %% The subset of ?INT_BIFS that also preserves non-negativity: the result is
-%% >= 0 whenever every operand is >= 0. Subtraction is deliberately absent (it
-%% can go negative); so are all float-producing operations (`trunc'/`round'
-%% produce an integer, but a negative one for a negative operand, so they only
-%% belong to ?INT_BIFS). `abs' of a non-negative integer is that integer.
+%% >= 0 whenever every operand is >= 0. Subtraction is absent (it can go
+%% negative), as are float-producing operations.
 -define(NAT_BIFS, ['+','*','div','rem','band','bor','bxor','bsl','bsr','abs']).
 
 %% The subset of ?INT_BIFS that the `loop_arith_licm' pass may hoist out of a
@@ -223,12 +171,10 @@
 %% prove them non-raising first; see `arith_non_raising/5'.
 -define(ARITH_BIFS, ['+','-','*','div','rem','band','bor','bxor','bsl','bsr']).
 
-%% `{bif,Name}' operations that the SSA type analysis can use to narrow the
-%% type of one of their arguments (the `infer_type'/4 clauses in
-%% `beam_ssa_type' and the relation operators it infers with
-%% `infer_relop'/3). A variable tested by one of these inside a loop has a
-%% loop-dependent type at its uses, so an annotation of it must not be
-%% trusted at the loop's preheader; see `narrowed_vars/3'.
+%% `{bif,Name}' operations through which the SSA type analysis can narrow one
+%% of their arguments (`infer_type'/4 and `infer_relop'/3' in
+%% `beam_ssa_type'). A variable tested by one of these inside a loop has a
+%% loop-dependent type at its uses; see `narrowed_vars/3'.
 -define(NARROW_BIFS, [is_atom, is_binary, is_bitstring, is_boolean, is_float,
                       is_function, is_integer, is_list, is_map, is_number,
                       is_pid, is_port, is_reference, is_tuple, is_record,
@@ -237,9 +183,7 @@
 %% The largest literal shift count the arithmetic LICM accepts. `bsl' raises
 %% `system_limit', not `badarith', when the result would exceed the bignum
 %% arity bound (`erl_arith.c': `if (ires-8 > BIG_ARITY_MAX)'), so a count that
-%% is merely proven non-negative does not make the instruction non-raising. A
-%% count of at most one machine digit cannot push a representable operand over
-%% that bound.
+%% is merely proven non-negative does not make the instruction non-raising.
 -define(MAX_LITERAL_SHIFT, 64).
 
 -spec opt({#opt_st{}, term()}) -> {#opt_st{}, term()}.
@@ -618,31 +562,17 @@ invariant_arg(_, _) ->
 %%% Loop-invariant code motion of arithmetic (`loop_arith_licm')
 %%% ------------------------------------------------------------------
 %%%
-%%% Arithmetic is not hoisted by `licm/5': `+'/`-'/'*' raise `badarith' for a
-%%% non-number operand, `div'/`rem' for a zero divisor as well, `band'/
-%%% `bor'/`bxor' for a non-integer operand and `bsl'/`bsr' for a non-integer
-%%% operand, a negative count or a count so large that the result would
-%%% overflow the bignum arity bound. Hoisting one of them into the preheader
-%%% therefore needs a proof that it cannot raise *for the operand values
-%%% reachable at the preheader*, which is where this pass differs from the
-%%% whole-function strength reduction.
+%%% `+/'-/*' raise `badarith' for a non-number operand, `div'/`rem' for a zero
+%%% divisor too, `band'/`bor'/`bxor' for a non-integer, and `bsl'/`bsr' for a
+%%% non-integer, a negative count or a `system_limit' overflow, so hoisting one
+%%% needs a proof that it cannot raise AT THE PREHEADER (see below).
 %%%
-%%% The preheader dominates every block scanned here and every operand is
-%%% required to be loop-invariant, i.e. defined outside the loop region. The
-%%% operands therefore have the same values at the preheader as they have at
-%%% the original instruction, and the only executions the hoist *adds* are
-%%% those of paths that enter the loop and leave it before reaching the
-%%% original block. The proof must hold on those paths too, i.e. at the
-%%% preheader:
-%%%
-%%% * a structural fact is valid there. It is derived from the operand's
-%%%   definition, which dominates the preheader, and from the definitions that
-%%%   one rests on (`pre_kind/5').
-%%% * a type annotation is NOT: the SSA type analysis refines a variable along
-%%%   the edges it flows down, so a variable that the loop narrows with a type
-%%%   test or a comparison is an integer at that use but need not be one at
-%%%   the preheader. An annotation is therefore trusted only for an operand
-%%%   that the loop does not narrow (`narrowed_vars/3').
+%%% A structural fact is valid there: it rests on definitions that dominate the
+%%% preheader. A type annotation is NOT: the type analysis refines a variable
+%%% along the edges it flows down, so a variable that the loop narrows with a
+%%% test or a comparison can be an integer at that use but need not be one at
+%%% the preheader. An annotation is therefore trusted only for an operand that
+%%% the loop does not narrow (`narrowed_vars/3').
 
 arith_licm(Region, Order0, Pre, Blocks0) ->
     RegionSet = ordsets:from_list(Region),
@@ -802,55 +732,28 @@ add_var(_Arg, Acc) -> Acc.
 %%% Induction-variable canonicalization and strength reduction
 %%% ------------------------------------------------------------------
 %%%
-%%% The pass derives two facts over the SSA of a function. Both are stated
-%%% for a *value* (a variable or a literal) and are only ever claimed for a
-%%% value that the instruction actually produces:
+%%% Two facts are derived over the SSA of a function, both stated for a value
+%%% and only ever claimed for a value that the instruction actually produces:
 %%%
-%%%   integer(V)     -- whenever the use of V is reached, V is an integer
-%%%   non_negative(V)-- whenever the use of V is reached, V is an integer >= 0
+%%%   integer(V)      -- whenever a use of V is reached, V is an integer
+%%%   non_negative(V) -- whenever a use of V is reached, V is an integer >= 0
 %%%
-%%% non_negative(V) implies integer(V). The facts are computed by a monotone
-%%% fixed point that starts from "unknown" everywhere (so it is sound: a fact
-%%% is only derived when every rule that derives it has been established) and
-%%% that treats each recognised induction variable as its own case.
+%%% non_negative(V) implies integer(V). They are computed by a monotone fixed
+%%% point that starts from "unknown" everywhere, so a fact is only derived when
+%%% every rule that derives it has been established; the rules are exactly the
+%%% ones listed in the INTEGRALITY section of the moduledoc above.
 %%%
-%%% The only rules are:
-%%%
-%%%   * an integer literal (non-negative for the stronger fact);
-%%%   * a canonical induction variable (see canonical_ivs/5): the entry value
-%%%     and every step are integers, so the variable is an integer on every
-%%%     iteration; if additionally the entry value is non-negative and every
-%%%     step is non-negative, it is non-negative on every iteration. This is
-%%%     an induction over the iterations, not a fixed-point claim: the loop
-%%%     hypothesis is the fact for the variable itself, the base case is the
-%%%     entry value and the step argument is that a non-negative integer
-%%%     plus a non-negative integer step stays non-negative;
-%%%   * a phi whose incoming values are all integers (respectively all
-%%%     non-negative integers) -- a join of a case or an if;
-%%%   * `{bif,Op}' with Op in ?INT_BIFS (?NAT_BIFS) and all operands
-%%%     integers (non-negative integers). An operand is classified at that
-%%%     instruction by `operand_kind/4', which prefers the `arg_types' type
-%%%     annotation of the instruction and falls back to this fixed point.%%%
-%%% Nothing else is accepted, and a variable defined outside the loop by an
-%%% instruction this analysis cannot classify is simply "unknown" -- which
-%%% only loses the rewrite. The *type* annotations described above cover
-%%% exactly that gap, but only at the instruction that uses the value.
-%%%
-%%% TRAP: a function argument, a message lifted out of the mailbox or any
-%%% other value with no definition in the function is unknown to this
-%%% structural analysis. It must NOT be guessed to be an integer because it
-%%% often is one at run time: doing so would turn `X * 8' into `X bsl 3' and
-%%% break the float and non-number cases. The type annotation of the
-%%% instruction that uses the value is the only admissible source for such a
-%%% value, and it is consulted directly at that instruction.
-%% The reducer is applied to EVERY block of the function, not only to the
-%% loop region: a rewrite is proved for the operands at the instruction being
-%% rewritten and nothing is moved or duplicated, so widening the application
-%% set can only optimize more. Only the induction variables, which licence the
-%% `div' -> `bsr' and `rem' -> `band' rules, are loop-scoped; a value that is
-%% an induction variable of a loop is defined by (and used only in blocks
-%% dominated by) that loop's header, so its fact never reaches a block the
-%% loop does not cover.
+%%% TRAP: a function argument, a value lifted out of the mailbox or any other
+%%% value with no definition in the function is unknown to this structural
+%%% analysis and must NOT be guessed to be an integer because it often is one
+%%% at run time; only the type annotation at the using instruction is
+%%% admissible for such a value, and it is consulted directly at that
+%%% instruction.
+%% The reducer is applied to EVERY block of the function (a rewrite is proved
+%% at the instruction being rewritten and nothing is moved or duplicated);
+%% only the induction variables, which licence `div' -> `bsr' and `rem' ->
+%% `band', are loop-scoped -- an IV is defined by, and used only in blocks
+%% dominated by, its header, so its fact never reaches a block outside.
 strength_reduce(Loops, Blocks0) ->
     Defs = defs_map(Blocks0),
     %% The induction variables are recognised using only the facts that hold
