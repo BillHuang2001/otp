@@ -68,6 +68,24 @@ fn the_pending_interner_predicts_append_only_indices_and_dedups() {
 }
 
 #[test]
+fn the_pending_interner_reports_emptiness_so_the_commit_can_be_skipped() {
+    // `is_empty` is the guard `call_registered`/`try_call_nif` use to skip the
+    // `Rc::make_mut` commit (`atoms_mut`) on a call that interned nothing -- otherwise the
+    // whole shared `AtomTable` is deep-cloned on every registered BIF call. It must be
+    // true before any name is recorded and false once one is.
+    let mut interner = PendingInterner::new(0);
+    assert!(interner.is_empty(), "a fresh interner has recorded nothing");
+    interner.intern("first");
+    assert!(!interner.is_empty(), "a recorded name is not empty");
+    let mut atoms = AtomTable::new();
+    interner.commit(&mut atoms);
+    assert!(
+        interner.is_empty(),
+        "commit drains the recorded names, so the interner is empty again"
+    );
+}
+
+#[test]
 fn a_bif_interns_a_new_atom_into_the_shared_table() {
     let mut rt = runtime();
     let name = "a_fresh_atom_zzz";
