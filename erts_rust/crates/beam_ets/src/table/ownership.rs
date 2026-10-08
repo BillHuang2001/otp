@@ -28,10 +28,29 @@
 //! the atom `undefined` (no pid term), never the pid. The observable facts this
 //! crate **does** match are `{heir, none}` when unset and the `true`/`badarg`
 //! returns.
+//!
+//! # The gift-data lifetime: install it, don't alias it
+//!
+//! [`Table::setopts`]/[`Table::set_heir`] store the caller's `Eterm` **as-is**. A
+//! host that hands them a term living on a process heap therefore leaves the table
+//! holding a term that dies with that heap — the same aliasing hazard the insert
+//! path already closes with the [`TermStore`](crate::store::TermStore) copy
+//! boundary, and which the oracle closes too: the C `set_heir` deep-copies a boxed
+//! gift term into a table-owned `DbTerm` (`../../erts/emulator/beam/erl_db.c`
+//! `set_heir`:5344-5364) and reclaims it with `free_heir_data` (`:5367`) when the
+//! heir is replaced.
+//!
+//! [`Table::install_heir`] is the host-facing entry point that reproduces this: it
+//! deep-copies the gift data into the table's own store (immediates are stored by
+//! value) and frees the previous copy, so the
+//! [`OwnerDeath::Transferred`](super::OwnerDeath) payload carries a term that stays
+//! valid for as long as the table does — exactly what the runtime needs to build the
+//! `{'ETS-TRANSFER', Tid, FromPid, Data}` message.
 
+use beam_common::Result;
 use beam_term::prelude::*;
 
-use super::OwnerId;
+use super::{OwnerId, Table};
 
 /// A table heir: the process that inherits the table when its owner dies, plus
 /// the gift data delivered in the `{'ETS-TRANSFER', Tab, FromPid, GiftData}`
@@ -52,6 +71,51 @@ pub enum SetOpt {
     Heir(Heir),
     /// `{heir, none}` — clear the heir.
     ClearHeir,
+}
+
+impl Table {
+    /// Install `owner` as the heir with `data` as the gift data, **deep-copying
+    /// `data` into table-owned storage** (the A.1 copy boundary).
+    ///
+    /// This is the host-facing heir entry point and the counterpart of the C
+    /// `set_heir` (`../../erts/emulator/beam/erl_db.c:5324`), which copies a boxed
+    /// gift term into a table-owned `DbTerm`. The installed term therefore stays
+    /// valid for as long as the table does, whatever happens to the calling
+    /// process's heap — which is what lets the runtime build the
+    /// `{'ETS-TRANSFER', Tid, FromPid, Data}` message from the
+    /// [`OwnerDeath::Transferred`](super::OwnerDeath) payload. The raw
+    /// [`setopts`](Table::setopts)/[`set_heir`](Table::set_heir) primitives do **not**
+    /// copy, so they must only ever be given a term the caller keeps alive for the
+    /// table's lifetime.
+    ///
+    /// Immediates (`data` needs no storage) are stored by value. The previously
+    /// installed gift data — if it was a copy this table's store owns — is reclaimed
+    /// first, exactly as the C `free_heir_data` (`:5367`) does; a `data` outside the
+    /// store's copyable subset (a fun, an off-heap bin ref, …) returns the typed
+    /// `badarg` and leaves the current heir untouched.
+    pub fn install_heir(&mut self, owner: OwnerId, data: Eterm) -> Result<()> {
+        let stored = self.store.copy(data)?;
+        if let Some(previous) = self.heir {
+            // A no-op unless the previous data really was a store-owned copy (see
+            // `TermStore::free`), so this is safe whichever primitive installed it.
+            self.store.free(previous.data);
+        }
+        self.heir = Some(Heir {
+            owner,
+            data: stored,
+        });
+        Ok(())
+    }
+
+    /// The installed heir's gift data — the term
+    /// [`install_heir`](Table::install_heir) copied into table-owned storage — or
+    /// `None` when no heir is installed.
+    ///
+    /// This is the `Data` a host places in `{'ETS-TRANSFER', Tid, FromPid, Data}`; it
+    /// is table-owned, so it stays valid for as long as the table does.
+    pub fn heir_data(&self) -> Option<Eterm> {
+        self.heir.map(|heir| heir.data)
+    }
 }
 
 #[cfg(test)]

@@ -6,14 +6,32 @@
 //! `true` and requires the owner; `give_away/3` is `true` only for a different
 //! live target and `badarg` (`cause => owner`) otherwise; `ets:info(T, holder)`
 //! is `badarg` (no such item).
+//!
+//! The second half covers the **owner-death transition** a host acts on: the live
+//! oracle's facts (probed, and pinned by
+//! [`owner_death_observations_match_the_live_oracle`]) are that a live heir inherits —
+//! receiving an arity-4 `{'ETS-TRANSFER', Tid, FromPid, Data}` whose `Tid` is the
+//! table's id, whose `FromPid` is the dead owner and whose `Data` is the gift — while
+//! the heir **stays installed**; no heir, a self-heir and a dead heir each leave the
+//! table gone. [`Table::owner_died`] hands that to the runtime as
+//! [`OwnerDeath::Transferred`]/[`OwnerDeath::Deleted`]/[`OwnerDeath::NotOwner`].
+//!
+//! Finally, the **gift-data lifetime**: [`Table::install_heir`] deep-copies the gift
+//! data into table-owned storage (the C `set_heir` does the same), so the term the
+//! runtime puts in the transfer message cannot dangle when the installing process's
+//! heap dies — the raw `setopts`/`set_heir` primitives alias instead.
 
 mod common;
 
+use std::time::Duration;
+
 use beam_common::BeamError;
 use beam_ets::{
-    Access, Heir, OwnerId, SetOpt, Table, TableId, TableInfo, TableKind, TableOptions,
+    Access, Heir, OwnerDeath, OwnerId, SetOpt, Table, TableId, TableInfo, TableKind,
+    TableOptions,
 };
 use beam_term::prelude::*;
+use common::oracle;
 use common::*;
 
 fn table_with_owner(owner: OwnerId) -> Table {
@@ -264,4 +282,346 @@ fn table_access_routes_ownership() {
         .expect("the (new) owner may set the heir");
     assert_eq!(t.heir(), Some(gift));
     assert_eq!(t.as_requester(Some(other)).requester(), Some(other));
+}
+
+// ---------------------------------------------------------------------------
+// The owner-death transition: what a host gets to build `{'ETS-TRANSFER', …}`
+// ---------------------------------------------------------------------------
+
+/// The transition a host acts on when a table's owner dies: it must hand back the
+/// **intact** heir (its pid *and* its gift data) and — exactly like the oracle —
+/// leave the heir **installed** (the oracle still reports it from
+/// `ets:info(T, heir)` after the transfer).
+#[test]
+fn owner_died_transfers_to_a_live_heir_and_keeps_it_installed() {
+    let owner = OwnerId::new(1);
+    let heir = Heir {
+        owner: OwnerId::new(9),
+        data: make_small(7),
+    };
+    let mut t = table_with_owner(owner);
+    t.set_heir(Some(heir));
+
+    let outcome = t.owner_died(owner, |_| true);
+    assert_eq!(
+        outcome,
+        OwnerDeath::Transferred(heir),
+        "the runtime gets the intact heir (owner + gift data) for the ETS-TRANSFER message"
+    );
+    assert_eq!(t.owner(), Some(OwnerId::new(9)), "the heir is the new owner");
+    assert_eq!(
+        t.heir(),
+        Some(heir),
+        "the heir is NOT cleared (the oracle still reports it)"
+    );
+    assert_eq!(t.info().owner, Some(OwnerId::new(9)));
+    assert_eq!(t.info().heir, Some(OwnerId::new(9)));
+}
+
+/// A death that does not concern this table is a complete no-op: the runtime has
+/// nothing to deliver and nothing to drop.
+#[test]
+fn owner_died_for_a_non_owner_is_a_no_op() {
+    let owner = OwnerId::new(1);
+    let heir = Heir {
+        owner: OwnerId::new(9),
+        data: make_small(7),
+    };
+    let mut t = table_with_owner(owner);
+    t.set_heir(Some(heir));
+
+    assert_eq!(
+        t.owner_died(OwnerId::new(2), |_| panic!(
+            "a non-owner death needs no liveness check"
+        )),
+        OwnerDeath::NotOwner
+    );
+    assert_eq!(t.owner(), Some(owner), "owner unchanged");
+    assert_eq!(t.heir(), Some(heir), "heir unchanged");
+}
+
+/// The owner died with no heir: the runtime must drop the table (the oracle
+/// reports `ets:info(T)` → `undefined`).
+#[test]
+fn owner_died_without_a_heir_deletes_the_table() {
+    let owner = OwnerId::new(1);
+    let mut t = table_with_owner(owner);
+    assert_eq!(t.heir(), None, "a fresh table has no heir");
+
+    assert_eq!(
+        t.owner_died(owner, |_| panic!("no heir: no liveness check")),
+        OwnerDeath::Deleted
+    );
+    assert_eq!(t.heir(), None);
+}
+
+/// A self-heir can never inherit: the table is dropped, and the liveness oracle is
+/// not even consulted (the owner cannot outlive itself).
+#[test]
+fn owner_died_with_a_self_heir_deletes_the_table() {
+    let owner = OwnerId::new(1);
+    let mut t = table_with_owner(owner);
+    t.set_heir(Some(Heir {
+        owner,
+        data: make_small(7),
+    }));
+
+    assert_eq!(
+        t.owner_died(owner, |_| panic!("self-heir: no liveness check")),
+        OwnerDeath::Deleted
+    );
+}
+
+/// The heir died before the owner: the table is dropped (the liveness oracle is
+/// consulted exactly once).
+#[test]
+fn owner_died_with_a_dead_heir_deletes_the_table() {
+    let owner = OwnerId::new(1);
+    let mut t = table_with_owner(owner);
+    t.set_heir(Some(Heir {
+        owner: OwnerId::new(9),
+        data: make_small(7),
+    }));
+
+    let mut liveness_calls = 0;
+    let outcome = t.owner_died(owner, |_| {
+        liveness_calls += 1;
+        false
+    });
+    assert_eq!(outcome, OwnerDeath::Deleted);
+    assert_eq!(liveness_calls, 1, "liveness is consulted exactly once");
+}
+
+// ---------------------------------------------------------------------------
+// The gift-data lifetime: `install_heir` copies, the raw primitives alias
+// ---------------------------------------------------------------------------
+
+/// [`Table::install_heir`] deep-copies the gift data into **table-owned** storage
+/// (the A.1 copy boundary), so the table never holds a pointer into the calling
+/// process's heap — the C `set_heir` (`erl_db.c:5344-5364`) copies the same way.
+#[test]
+fn install_heir_copies_the_gift_data_into_table_owned_storage() {
+    let mut t = new_table(TableKind::Set);
+    let heir_pid = OwnerId::new(9);
+
+    // A boxed gift term on a caller-owned (process-like) heap.
+    let mut source = Heap::new(64);
+    let source_root = int_tuple(&mut source, &[1, 2, 3]);
+
+    t.install_heir(heir_pid, source_root)
+        .expect("a plain tuple is copyable");
+
+    let installed = t
+        .heir_data()
+        .expect("the heir (and its gift data) is installed");
+    assert_ne!(
+        installed.raw(),
+        source_root.raw(),
+        "the gift data is deep-copied, never aliased into the caller's heap"
+    );
+    assert_eq!(
+        t.heir(),
+        Some(Heir {
+            owner: heir_pid,
+            data: installed,
+        })
+    );
+
+    // The caller's heap dies here. The installed term is table-owned, so it still
+    // reads back intact — the whole point of the copy.
+    drop(source);
+    let mut reference = Heap::new(64);
+    let expected = int_tuple(&mut reference, &[1, 2, 3]);
+    let atoms = AtomTable::new();
+    assert!(
+        eq(installed, expected, &atoms),
+        "the table-owned gift copy survives the caller's heap"
+    );
+}
+
+/// An immediate gift term is stored by value (it owns no storage), and the installed
+/// data is exactly the term that was passed in.
+#[test]
+fn install_heir_stores_an_immediate_by_value() {
+    let mut t = new_table(TableKind::Set);
+    let heir_pid = OwnerId::new(4);
+
+    t.install_heir(heir_pid, make_small(42))
+        .expect("an immediate needs no storage");
+    assert_eq!(t.heir_data(), Some(make_small(42)));
+    assert_eq!(
+        t.heir(),
+        Some(Heir {
+            owner: heir_pid,
+            data: make_small(42),
+        })
+    );
+
+    // An atom gift term behaves the same way (also an immediate).
+    t.install_heir(heir_pid, NIL).expect("an immediate needs no storage");
+    assert_eq!(t.heir_data(), Some(NIL));
+}
+
+/// Replacing the heir reclaims the previous copy's words (the C `free_heir_data`,
+/// `erl_db.c:5367`), so repeated installs do not leak table-owned storage.
+#[test]
+fn install_heir_replacing_reclaims_the_previous_copy() {
+    let mut t = new_table(TableKind::Set);
+    let heir_pid = OwnerId::new(9);
+    let mut heap = Heap::new(64);
+
+    let first = int_tuple(&mut heap, &[1, 2, 3]);
+    t.install_heir(heir_pid, first).expect("a tuple is copyable");
+    let live = t.memory();
+    assert!(live > 0, "the gift copy owns table-owned words");
+
+    let second = int_tuple(&mut heap, &[4, 5, 6]);
+    t.install_heir(heir_pid, second).expect("a tuple is copyable");
+    assert_eq!(
+        t.memory(),
+        live,
+        "the previous gift copy's words were reclaimed, not leaked"
+    );
+
+    let mut reference = Heap::new(64);
+    let expected = int_tuple(&mut reference, &[4, 5, 6]);
+    let atoms = AtomTable::new();
+    assert!(eq(t.heir_data().unwrap(), expected, &atoms));
+}
+
+/// [`Table::heir_data`] is `None` while no heir is installed, and follows `set_heir`
+/// (the raw, non-copying primitive) as well as `install_heir`.
+#[test]
+fn heir_data_tracks_the_installed_heir() {
+    let owner = OwnerId::new(1);
+    let mut t = table_with_owner(owner);
+    assert_eq!(t.heir_data(), None, "a fresh table has no heir data");
+
+    t.setopts(
+        Some(owner),
+        SetOpt::Heir(Heir {
+            owner: OwnerId::new(2),
+            data: make_small(5),
+        }),
+    )
+    .unwrap();
+    assert_eq!(t.heir_data(), Some(make_small(5)));
+
+    t.setopts(Some(owner), SetOpt::ClearHeir).unwrap();
+    assert_eq!(t.heir_data(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Live-oracle cross-check of the owner-death observations
+// ---------------------------------------------------------------------------
+
+/// Wall-clock bound for the oracle child, so a wedged oracle fails instead of hanging.
+const ORACLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The embedded oracle program (an `escript`). It observes the four owner-death
+/// outcomes the transition models, against the real `ets`:
+///
+/// * a live heir inherits and receives an arity-4 `{'ETS-TRANSFER', Tid, From,
+///   Data}` whose `Tid` is the table's id, whose `From` is the dead owner, and whose
+///   `Data` is the gift; the heir **stays installed** and the new owner (here a third
+///   party, since the table is `public`) can insert/lookup;
+/// * no heir, a self-heir and a (normalised-away) dead heir each leave the table gone
+///   (`ets:info(T)` → `undefined`).
+///
+/// It prints one canonical line per group; the Rust assertions below pin the exact
+/// observations.
+const ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+main(_) ->
+    Parent = self(),
+    Tag = list_to_atom("ETS-TRANSFER"),
+
+    %% A live heir: the owner dies, the heir inherits.
+    Heir = spawn(fun() -> receive M -> Parent ! {got, M} end,
+                            receive stop -> ok end end),
+    Owner = spawn(fun() ->
+        T = ets:new(owned, [public, {heir, Heir, {gift, 42}}]),
+        ets:insert(T, {a, 1}),
+        Parent ! {tid, T},
+        receive stop -> ok end
+    end),
+    T = receive {tid, X} -> X end,
+    exit(Owner, kill),
+    M = receive {got, Y} -> Y after 5000 -> timeout end,
+    case is_tuple(M) andalso tuple_size(M) =:= 4 of
+        true ->
+            Ins = ets:insert(T, {b, 2}),
+            Lk = ets:lookup(T, a),
+            io:format("transfer ~p ~p ~p ~p ~p ~p ~p ~p ~p~n",
+                      [element(1, M) =:= Tag, tuple_size(M), element(2, M) =:= T,
+                       element(3, M) =:= Owner, element(4, M),
+                       ets:info(T, heir) =:= Heir, ets:info(T, owner) =:= Heir,
+                       Ins, Lk]);
+        false ->
+            io:format("transfer timeout~n", [])
+    end,
+
+    %% No heir: the table is dropped.
+    Owner2 = spawn(fun() -> T2 = ets:new(noheir, [public]),
+                             Parent ! {tid2, T2}, receive stop -> ok end end),
+    T2 = receive {tid2, X2} -> X2 end,
+    exit(Owner2, kill),
+    timer:sleep(500),
+
+    %% A self-heir: the table is dropped.
+    Owner3 = spawn(fun() -> T3 = ets:new(selfheir, [public]),
+                             _ = ets:setopts(T3, {heir, self(), d}),
+                             Parent ! {tid3, T3}, receive stop -> ok end end),
+    T3 = receive {tid3, X3} -> X3 end,
+    SelfInstalled = ets:info(T3, heir) =:= ets:info(T3, owner),
+    exit(Owner3, kill),
+    timer:sleep(500),
+
+    %% A dead heir: normalised to none at option-parse time, then the table is dropped.
+    Dead = spawn(fun() -> ok end),
+    timer:sleep(500),
+    Owner4 = spawn(fun() -> T4 = ets:new(deadheir, [public]),
+                             _ = ets:setopts(T4, {heir, Dead, d}),
+                             Parent ! {tid4, T4}, receive stop -> ok end end),
+    T4 = receive {tid4, X4} -> X4 end,
+    DeadHeirNone = ets:info(T4, heir) =:= none,
+    exit(Owner4, kill),
+    timer:sleep(500),
+
+    io:format("deaths no_heir_gone=~p self_installed=~p self_heir_gone=~p "
+              "dead_heir_none=~p dead_heir_gone=~p~n",
+              [ets:info(T2) =:= undefined, SelfInstalled, ets:info(T3) =:= undefined,
+               DeadHeirNone, ets:info(T4) =:= undefined]),
+    ok.
+"#;
+
+/// The owner-death observations the crate's [`Table::owner_died`] models must match
+/// the live oracle: a live heir inherits (receiving the arity-4 transfer message with
+/// the table id, the dead owner and the gift data) and the heir stays installed; no
+/// heir / a self-heir / a dead heir each drop the table. Skips loudly without an
+/// oracle; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure.
+#[test]
+fn owner_death_observations_match_the_live_oracle() {
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "owner_death_observations_match_the_live_oracle",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable `erl`/`escript` on $PATH)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(&escript, ORACLE_PROGRAM, &[], "ownership", ORACLE_TIMEOUT);
+    let lines: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .expect("the oracle prints UTF-8")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "transfer true 4 true true {gift,42} true true true [{a,1}]",
+            "deaths no_heir_gone=true self_installed=true self_heir_gone=true \
+             dead_heir_none=true dead_heir_gone=true",
+        ],
+        "the oracle's owner-death observations changed — the transition model is stale"
+    );
 }
