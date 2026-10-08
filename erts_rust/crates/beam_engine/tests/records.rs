@@ -40,7 +40,9 @@ use std::collections::BTreeMap;
 
 use beam_common::{BeamError, ExceptionClass};
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
-use beam_loader::{load_file, Function, Instr, Label, Module, Operand, NO_FAIL};
+use beam_loader::{
+    load_file, Function, Instr, Label, Module, Operand, PutRecordArgs, UpdateRecordArgs, NO_FAIL,
+};
 use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 /// The committed records fixture (`erlc records.erl`).
@@ -334,13 +336,13 @@ fn update_record_fn(
 ) -> Vec<Instr> {
     vec![
         Instr::Label(Label(1)),
-        Instr::UpdateRecord {
+        Instr::UpdateRecord(Box::new(UpdateRecordArgs {
             hint: Operand::Atom(hint),
             size,
             src,
             dst,
             updates,
-        },
+        })),
         Instr::Return,
     ]
 }
@@ -385,7 +387,7 @@ fn update_record_applies_multiple_updates() {
         1,
         vec![
             Instr::Label(Label(1)),
-            Instr::UpdateRecord {
+            Instr::UpdateRecord(Box::new(UpdateRecordArgs {
                 hint: Operand::Atom(copy),
                 size: 4,
                 src: Operand::X(0),
@@ -394,7 +396,7 @@ fn update_record_applies_multiple_updates() {
                     (Operand::Integer(1), Operand::Atom(Atom::from_raw(0))),
                     (Operand::Integer(3), Operand::Integer(7)),
                 ],
-            },
+            })),
             Instr::Move {
                 src: Operand::X(1),
                 dst: Operand::X(0),
@@ -661,14 +663,14 @@ fn append_create(
     let fail = if branch.is_some() { Label(base + 1) } else { NO_FAIL };
     let mut code = vec![
         Instr::Label(entry),
-        Instr::PutRecord {
+        Instr::PutRecord(Box::new(PutRecordArgs {
             fail,
             id,
             src: Operand::Nil,
             dst,
             live: 0,
             updates,
-        },
+        })),
         Instr::Return,
     ];
     if let Some(marker) = branch {

@@ -110,8 +110,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use beam_common::Result;
 use beam_engine::{Machine, MinimalContext};
 use beam_loader::{
-    load_file, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Opcode, Operand,
-    TestKind,
+    load_file, BsGetArgs, Function, GetRecordFieldArgs, HeapNeed, Import, ImportRef, Instr, Label,
+    MapWriteArgs, Module, Opcode, Operand, PutRecordArgs, TestKind, UpdateRecordArgs,
+    UpdateRecordIdArgs,
 };
 use beam_term::{Atom, Eterm};
 use support::{all_otp_beams, skip_reason};
@@ -917,27 +918,27 @@ fn all_instr_variants() -> Vec<Instr> {
             source: x0(),
             keys: vec![Operand::Integer(1)],
         },
-        Instr::PutMapAssoc {
+        Instr::PutMapAssoc(Box::new(MapWriteArgs {
             fail,
             source: x0(),
             dst: x1(),
             live: 0,
             pairs: vec![(Operand::Integer(1), Operand::Integer(2))],
-        },
-        Instr::PutMapExact {
+        })),
+        Instr::PutMapExact(Box::new(MapWriteArgs {
             fail,
             source: x0(),
             dst: x1(),
             live: 0,
             pairs: vec![(Operand::Integer(1), Operand::Integer(2))],
-        },
-        Instr::UpdateRecord {
+        })),
+        Instr::UpdateRecord(Box::new(UpdateRecordArgs {
             hint: nil(),
             size: 1,
             src: x0(),
             dst: x1(),
             updates: vec![(Operand::Integer(1), Operand::Integer(2))],
-        },
+        })),
         Instr::IsAnyNativeRecord { fail, src: x0() },
         Instr::IsNativeRecord {
             fail,
@@ -950,33 +951,33 @@ fn all_instr_variants() -> Vec<Instr> {
             src: x0(),
             fields: vec![(nil(), x1())],
         },
-        Instr::PutRecord {
+        Instr::PutRecord(Box::new(PutRecordArgs {
             fail,
             id: nil(),
             src: nil(),
             dst: x0(),
             live: 0,
             updates: vec![(nil(), Operand::Integer(1))],
-        },
+        })),
         Instr::IsRecordAccessible {
             fail,
             src: x0(),
             scope: nil(),
         },
-        Instr::GetRecordField {
+        Instr::GetRecordField(Box::new(GetRecordFieldArgs {
             fail,
             src: x0(),
             id: nil(),
             field: nil(),
             dst: x1(),
-        },
+        })),
         Instr::GetRecordElementsId {
             fail,
             id: nil(),
             src: x0(),
             fields: vec![(nil(), x1())],
         },
-        Instr::UpdateRecordId {
+        Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
             fail,
             hint: nil(),
             id: nil(),
@@ -984,7 +985,7 @@ fn all_instr_variants() -> Vec<Instr> {
             dst: x1(),
             live: 0,
             updates: vec![(nil(), Operand::Integer(1))],
-        },
+        })),
         Instr::Badmatch { value: x0() },
         Instr::CaseEnd { value: x0() },
         Instr::IfEnd,
@@ -1098,7 +1099,7 @@ fn all_instr_variants() -> Vec<Instr> {
             ctx: x0(),
             pos: x1(),
         },
-        Instr::BsGetInteger2 {
+        Instr::BsGetInteger2(Box::new(BsGetArgs {
             fail,
             ctx: x0(),
             live: 0,
@@ -1106,8 +1107,8 @@ fn all_instr_variants() -> Vec<Instr> {
             unit: 1,
             flags: 0,
             dst: x1(),
-        },
-        Instr::BsGetFloat2 {
+        })),
+        Instr::BsGetFloat2(Box::new(BsGetArgs {
             fail,
             ctx: x0(),
             live: 0,
@@ -1115,8 +1116,8 @@ fn all_instr_variants() -> Vec<Instr> {
             unit: 1,
             flags: 0,
             dst: x1(),
-        },
-        Instr::BsGetBinary2 {
+        })),
+        Instr::BsGetBinary2(Box::new(BsGetArgs {
             fail,
             ctx: x0(),
             live: 0,
@@ -1124,7 +1125,7 @@ fn all_instr_variants() -> Vec<Instr> {
             unit: 1,
             flags: 0,
             dst: x1(),
-        },
+        })),
         Instr::BsSkipBits2 {
             fail,
             ctx: x0(),

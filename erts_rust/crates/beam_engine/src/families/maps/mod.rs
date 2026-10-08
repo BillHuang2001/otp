@@ -114,7 +114,7 @@ mod write;
 use crate::interpreter::LabelMap;
 
 use beam_common::{ExceptionClass, Result};
-use beam_loader::{Instr, Label, Module, NO_FAIL};
+use beam_loader::{Instr, Label, MapWriteArgs, Module, NO_FAIL};
 use beam_term::{cmp, make_atom, AtomTable, Eterm};
 
 use crate::context::ExecutionContext;
@@ -148,27 +148,29 @@ pub(crate) fn exec(
             read::has_map_fields(machine, module, labels, ctx, *fail, source, keys).map(Some)
         }
 
-        Instr::PutMapAssoc {
-            fail,
-            source,
-            dst,
-            live,
-            pairs,
-        } => write::put_map_assoc(
-            machine, module, labels, ctx, *fail, source, dst, *live, pairs,
-        )
-        .map(Some),
+        Instr::PutMapAssoc(b) => {
+            let MapWriteArgs {
+                fail,
+                source,
+                dst,
+                live,
+                pairs,
+            } = &**b;
+            write::put_map_assoc(machine, module, labels, ctx, *fail, source, dst, *live, pairs)
+                .map(Some)
+        }
 
-        Instr::PutMapExact {
-            fail,
-            source,
-            dst,
-            live,
-            pairs,
-        } => write::put_map_exact(
-            machine, module, labels, ctx, *fail, source, dst, *live, pairs,
-        )
-        .map(Some),
+        Instr::PutMapExact(b) => {
+            let MapWriteArgs {
+                fail,
+                source,
+                dst,
+                live,
+                pairs,
+            } = &**b;
+            write::put_map_exact(machine, module, labels, ctx, *fail, source, dst, *live, pairs)
+                .map(Some)
+        }
 
         // Not this family's variant.
         _ => Ok(None),

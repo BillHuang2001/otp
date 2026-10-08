@@ -164,11 +164,11 @@ fn census(module: &Module) -> Census {
                 Instr::IsAnyNativeRecord { .. }
                 | Instr::IsNativeRecord { .. }
                 | Instr::GetRecordElements { .. }
-                | Instr::PutRecord { .. }
+                | Instr::PutRecord(_)
                 | Instr::IsRecordAccessible { .. }
-                | Instr::GetRecordField { .. }
+                | Instr::GetRecordField(_)
                 | Instr::GetRecordElementsId { .. }
-                | Instr::UpdateRecordId { .. } => census.typed += 1,
+                | Instr::UpdateRecordId(_) => census.typed += 1,
                 Instr::Generic { op, .. } if FAMILY.contains(op) => census.generic += 1,
                 _ => {}
             }
@@ -186,11 +186,11 @@ fn variant_names(module: &Module) -> Vec<String> {
                 Instr::IsAnyNativeRecord { .. } => "IsAnyNativeRecord",
                 Instr::IsNativeRecord { .. } => "IsNativeRecord",
                 Instr::GetRecordElements { .. } => "GetRecordElements",
-                Instr::PutRecord { .. } => "PutRecord",
+                Instr::PutRecord(_) => "PutRecord",
                 Instr::IsRecordAccessible { .. } => "IsRecordAccessible",
-                Instr::GetRecordField { .. } => "GetRecordField",
+                Instr::GetRecordField(_) => "GetRecordField",
                 Instr::GetRecordElementsId { .. } => "GetRecordElementsId",
-                Instr::UpdateRecordId { .. } => "UpdateRecordId",
+                Instr::UpdateRecordId(_) => "UpdateRecordId",
                 _ => continue,
             };
             names.push(name.to_string());

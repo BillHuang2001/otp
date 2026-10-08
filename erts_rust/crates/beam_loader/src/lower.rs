@@ -413,7 +413,9 @@ mod tests {
     use super::instr::lower_instr;
     use super::*;
     use crate::chunk::table::{RawExport, RawFun};
-    use crate::ir::{CodeVersion, ImportRef, Instr, TypeTable};
+    use crate::ir::{
+        BsGetArgs, CodeVersion, ImportRef, Instr, MapWriteArgs, TypeTable, UpdateRecordArgs,
+    };
     use crate::opcode::Opcode;
     use crate::operand::{Operand, NO_FAIL};
     use beam_codec::term::{flatmap_parts, tuple_arity, tuple_element};
@@ -1043,23 +1045,23 @@ mod tests {
         };
         assert_eq!(
             lower(Opcode::put_map_assoc, operands(NO_FAIL, 2)),
-            Instr::PutMapAssoc {
+            Instr::PutMapAssoc(Box::new(MapWriteArgs {
                 fail: NO_FAIL,
                 source: Operand::X(0),
                 dst: Operand::X(1),
                 live: 2,
                 pairs: vec![(Operand::Atom(key), Operand::Atom(value))],
-            }
+            }))
         );
         assert_eq!(
             lower(Opcode::put_map_exact, operands(Label(5), 3)),
-            Instr::PutMapExact {
+            Instr::PutMapExact(Box::new(MapWriteArgs {
                 fail: Label(5),
                 source: Operand::X(0),
                 dst: Operand::X(1),
                 live: 3,
                 pairs: vec![(Operand::Atom(key), Operand::Atom(value))],
-            }
+            }))
         );
     }
 
@@ -1082,7 +1084,7 @@ mod tests {
                     ]),
                 ],
             ),
-            Instr::UpdateRecord {
+            Instr::UpdateRecord(Box::new(UpdateRecordArgs {
                 hint: Operand::Atom(hint),
                 size: 4,
                 src: Operand::X(0),
@@ -1091,7 +1093,7 @@ mod tests {
                     (Operand::Integer(2), Operand::X(2)),
                     (Operand::Integer(3), Operand::Y(0)),
                 ],
-            }
+            }))
         );
     }
 
@@ -1208,7 +1210,7 @@ mod tests {
                     Operand::X(2),
                 ],
             ),
-            Instr::BsGetInteger2 {
+            Instr::BsGetInteger2(Box::new(BsGetArgs {
                 fail: Label(1),
                 ctx: Operand::X(0),
                 live: 2,
@@ -1216,7 +1218,7 @@ mod tests {
                 unit: 8,
                 flags: 0,
                 dst: Operand::X(2),
-            }
+            }))
         );
         assert_eq!(
             lower(
@@ -1231,7 +1233,7 @@ mod tests {
                     Operand::X(2),
                 ],
             ),
-            Instr::BsGetBinary2 {
+            Instr::BsGetBinary2(Box::new(BsGetArgs {
                 fail: NO_FAIL,
                 ctx: Operand::X(0),
                 live: 1,
@@ -1239,7 +1241,7 @@ mod tests {
                 unit: 8,
                 flags: 0,
                 dst: Operand::X(2),
-            }
+            }))
         );
         assert_eq!(
             lower(
@@ -1254,7 +1256,7 @@ mod tests {
                     Operand::FloatReg(0),
                 ],
             ),
-            Instr::BsGetFloat2 {
+            Instr::BsGetFloat2(Box::new(BsGetArgs {
                 fail: NO_FAIL,
                 ctx: Operand::X(0),
                 live: 1,
@@ -1262,7 +1264,7 @@ mod tests {
                 unit: 1,
                 flags: 0,
                 dst: Operand::FloatReg(0),
-            }
+            }))
         );
         assert_eq!(
             lower(

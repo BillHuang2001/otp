@@ -38,7 +38,10 @@ use beam_term::Atom;
 
 use crate::decode::RawInstr;
 use crate::error::bad_file;
-use crate::ir::{ImportRef, Instr, TestKind};
+use crate::ir::{
+    BsGetArgs, GetRecordFieldArgs, ImportRef, Instr, MapWriteArgs, PutRecordArgs, TestKind,
+    UpdateRecordArgs, UpdateRecordIdArgs,
+};
 use crate::opcode::Opcode;
 use crate::operand::{HeapNeed, Label, Operand};
 
@@ -1101,7 +1104,7 @@ mod tests {
                 ],
             ))
             .unwrap(),
-            Instr::PutRecord {
+            Instr::PutRecord(Box::new(PutRecordArgs {
                 fail: crate::operand::NO_FAIL,
                 id: Operand::Atom(rec),
                 src: Operand::Nil,
@@ -1111,7 +1114,7 @@ mod tests {
                     (Operand::Atom(fa), Operand::Integer(1)),
                     (Operand::Atom(fb), Operand::Integer(2)),
                 ],
-            }
+            }))
         );
 
         // `is_record_accessible Fail Src Scope` (`ops.tab:1672-1678`): the scope atom
@@ -1147,13 +1150,13 @@ mod tests {
                 ],
             ))
             .unwrap(),
-            Instr::GetRecordField {
+            Instr::GetRecordField(Box::new(GetRecordFieldArgs {
                 fail: crate::operand::NO_FAIL,
                 src: Operand::X(0),
                 id: Operand::Literal(1),
                 field: Operand::Atom(fa),
                 dst: Operand::X(0),
-            }
+            }))
         );
 
         // `get_record_elements_id Fail Id Src Elements` (opcode 192, OTP 30).
@@ -1191,7 +1194,7 @@ mod tests {
                 ],
             ))
             .unwrap(),
-            Instr::UpdateRecordId {
+            Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
                 fail: crate::operand::NO_FAIL,
                 hint: Operand::Atom(copy),
                 id: Operand::Literal(2),
@@ -1199,7 +1202,7 @@ mod tests {
                 dst: Operand::X(0),
                 live: 2,
                 updates: vec![(Operand::Atom(fa), Operand::Integer(7))],
-            }
+            }))
         );
     }
 

@@ -35,8 +35,8 @@
 //! avoided: the loader's public API is the only surface touched here.
 use beam_codec::term::{flatmap_parts, tuple_arity, tuple_element};
 use beam_loader::{
-    load, load_file, AllocKind, Atom, HeapNeed, ImportRef, Instr, Label, Module, Operand, Reg,
-    TestKind, TypeIndex, NO_FAIL,
+    load, load_file, AllocKind, Atom, HeapNeed, ImportRef, Instr, Label, MapWriteArgs, Module,
+    Operand, Reg, TestKind, TypeIndex, NO_FAIL,
 };
 use beam_term::prelude::atom_val;
 
@@ -341,16 +341,17 @@ fn lowers_the_map_opcodes_to_typed_variants() {
     let module = load_coverage();
 
     // `put_map_assoc {f,0},{literal,#{a=>1,b=>2}},{x,2},2,{list,[{atom,c},{x,1}]}`.
-    match find(&module, |i| matches!(i, Instr::PutMapAssoc { .. }))
+    match find(&module, |i| matches!(i, Instr::PutMapAssoc(_)))
         .expect("a `put_map_assoc` lowers to Instr::PutMapAssoc")
     {
-        Instr::PutMapAssoc {
-            fail,
-            source,
-            dst,
-            live,
-            pairs,
-        } => {
+        Instr::PutMapAssoc(b) => {
+            let MapWriteArgs {
+                fail,
+                source,
+                dst,
+                live,
+                pairs,
+            } = &**b;
             assert_eq!(*fail, NO_FAIL);
             assert_eq!(*source, Operand::Literal(2));
             assert_eq!(*dst, Operand::X(2));
@@ -361,16 +362,17 @@ fn lowers_the_map_opcodes_to_typed_variants() {
     }
 
     // `put_map_exact {f,0},{x,2},{x,1},3,{list,[{atom,a},{x,1}]}`.
-    match find(&module, |i| matches!(i, Instr::PutMapExact { .. }))
+    match find(&module, |i| matches!(i, Instr::PutMapExact(_)))
         .expect("a `put_map_exact` lowers to Instr::PutMapExact")
     {
-        Instr::PutMapExact {
-            fail,
-            source,
-            dst,
-            live,
-            pairs,
-        } => {
+        Instr::PutMapExact(b) => {
+            let MapWriteArgs {
+                fail,
+                source,
+                dst,
+                live,
+                pairs,
+            } = &**b;
             assert_eq!(*fail, NO_FAIL);
             assert_eq!(*source, Operand::X(2));
             assert_eq!(*dst, Operand::X(1));

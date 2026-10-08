@@ -36,7 +36,9 @@ use std::collections::BTreeMap;
 
 use beam_common::BeamError;
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
-use beam_loader::{Function, Instr, Label, Module, Operand, TestKind, NO_FAIL};
+use beam_loader::{
+    Function, Instr, Label, MapWriteArgs, Module, Operand, PutRecordArgs, TestKind, NO_FAIL,
+};
 use beam_term::{make_small, Atom, Eterm};
 
 // ---------------------------------------------------------------------------
@@ -277,13 +279,13 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         let a = f.atom("a");
         let assoc = vec![
             Instr::Label(Label(1)),
-            Instr::PutMapAssoc {
+            Instr::PutMapAssoc(Box::new(MapWriteArgs {
                 fail: NO_FAIL,
                 source: Operand::X(0),
                 dst: Operand::X(0),
                 live: 1,
                 pairs: vec![(Operand::Atom(a), Operand::Integer(1))],
-            },
+            })),
             Instr::Return,
         ];
         let entry = f.add_function("f", 1, assoc);
@@ -299,13 +301,13 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         let a = f.atom("a");
         let exact = vec![
             Instr::Label(Label(1)),
-            Instr::PutMapExact {
+            Instr::PutMapExact(Box::new(MapWriteArgs {
                 fail: NO_FAIL,
                 source: Operand::X(0),
                 dst: Operand::X(0),
                 live: 1,
                 pairs: vec![(Operand::Atom(a), Operand::Integer(1))],
-            },
+            })),
             Instr::Return,
         ];
         let entry = f.add_function("f", 1, exact);
@@ -370,14 +372,14 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
                 dst: Operand::X(0),
                 elements: vec![Operand::X(0), Operand::X(1)],
             },
-            Instr::PutRecord {
+            Instr::PutRecord(Box::new(PutRecordArgs {
                 fail: NO_FAIL,
                 id: Operand::X(0),
                 src: Operand::Nil,
                 dst: Operand::X(2),
                 live: 0,
                 updates: vec![],
-            },
+            })),
             Instr::Return,
         ];
         let entry = f.add_function("f", 0, code);
@@ -394,14 +396,14 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         let rec = f.atom("rec");
         let code = vec![
             Instr::Label(Label(1)),
-            Instr::PutRecord {
+            Instr::PutRecord(Box::new(PutRecordArgs {
                 fail: NO_FAIL,
                 id: Operand::Atom(rec),
                 src: Operand::X(0),
                 dst: Operand::X(0),
                 live: 1,
                 updates: vec![],
-            },
+            })),
             Instr::Return,
         ];
         let entry = f.add_function("f", 1, code);

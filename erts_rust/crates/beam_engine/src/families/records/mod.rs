@@ -165,7 +165,10 @@ mod tests;
 use crate::interpreter::LabelMap;
 
 use beam_common::{ExceptionClass, Result};
-use beam_loader::{Instr, Label, Module, Operand, RecordDefinition, NO_FAIL};
+use beam_loader::{
+    GetRecordFieldArgs, Instr, Label, Module, Operand, PutRecordArgs, RecordDefinition,
+    UpdateRecordArgs, UpdateRecordIdArgs, NO_FAIL,
+};
 use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 use crate::context::ExecutionContext;
@@ -195,15 +198,16 @@ pub(crate) fn exec(
         // ---------------------------------------------------------------------
         // Tagged tuples (OTP 26)
         // ---------------------------------------------------------------------
-        Instr::UpdateRecord {
-            // The reuse hint is intentionally ignored: M1 never updates in place
-            // (see the module docs).
-            hint: _,
-            size,
-            src,
-            dst,
-            updates,
-        } => {
+        Instr::UpdateRecord(b) => {
+            let UpdateRecordArgs {
+                // The reuse hint is intentionally ignored: M1 never updates in place
+                // (see the module docs).
+                hint: _,
+                size,
+                src,
+                dst,
+                updates,
+            } = &**b;
             let source = read_operand(machine, ctx, src)?;
             let arity = terms::tuple_arity(source)
                 .map_err(|_| error::unsupported("update_record: non-tuple source"))?;
@@ -305,14 +309,15 @@ pub(crate) fn exec(
         // atom `Id` the compiler's local `put_record Fail Name=a nil …` →
         // `create_local_record` transform), any other `Src` is the *update* form
         // (`i_update_native_record`, `Id` discarded).
-        Instr::PutRecord {
-            fail,
-            id,
-            src,
-            dst,
-            live: _,
-            updates,
-        } => {
+        Instr::PutRecord(b) => {
+            let PutRecordArgs {
+                fail,
+                id,
+                src,
+                dst,
+                live: _,
+                updates,
+            } = &**b;
             if matches!(src, Operand::Nil) {
                 return Ok(Some(create_native_record(
                     machine,
@@ -362,48 +367,54 @@ pub(crate) fn exec(
         // `i_get_local_record_field(Fail, Src, Id, Field, Dst)` (`Id` an atom) or
         // `i_get_record_field(Fail, Src, Id, Field, Dst)` (`Id` a `{Module,Name}`
         // pair) (`emu/ops.tab:1680-1694`).
-        Instr::GetRecordField {
-            fail,
-            src,
-            id,
-            field,
-            dst,
-        } => Ok(Some(get_record_field(
-            machine,
-            labels,
-            module,
-            "get_record_field",
-            *fail,
-            src,
-            id,
-            field,
-            dst,
-            ctx,
-        )?)),
+        Instr::GetRecordField(b) => {
+            let GetRecordFieldArgs {
+                fail,
+                src,
+                id,
+                field,
+                dst,
+            } = &**b;
+            Ok(Some(get_record_field(
+                machine,
+                labels,
+                module,
+                "get_record_field",
+                *fail,
+                src,
+                id,
+                field,
+                dst,
+                ctx,
+            )?))
+        }
 
         // `update_record_id Fail _Hint _Id Src Dst Live Size Updates=* =>
         //      i_update_native_record Fail Src Dst Live Size Updates`
         // (`emu/ops.tab:1689`): the same update path as `put_record`, with the
         // reuse `Hint` and the record `Id` discarded. M1 never updates in place, so
         // the result is always a fresh copy.
-        Instr::UpdateRecordId {
-            fail,
-            hint: _,
-            id: _,
-            src,
-            dst,
-            live: _,
-            updates,
-        } => Ok(Some(update_native_record(
-            machine,
-            labels,
-            "update_record_id",
-            *fail,
-            src,
-            dst,
-            updates,
-            ctx,
-        )?)),
+        Instr::UpdateRecordId(b) => {
+            let UpdateRecordIdArgs {
+                fail,
+                hint: _,
+                id: _,
+                src,
+                dst,
+                live: _,
+                updates,
+            } = &**b;
+            Ok(Some(update_native_record(
+                machine,
+                labels,
+                "update_record_id",
+                *fail,
+                src,
+                dst,
+                updates,
+                ctx,
+            )?))
+        }
 
         _ => Ok(None),
     }

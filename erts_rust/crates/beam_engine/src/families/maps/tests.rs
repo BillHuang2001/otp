@@ -31,7 +31,7 @@
 use super::*;
 use crate::context::MinimalContext;
 use beam_common::BeamError;
-use beam_loader::{Atom, Function, Operand};
+use beam_loader::{Atom, Function, MapWriteArgs, Operand};
 use beam_term::make_small;
 use std::collections::BTreeMap;
 
@@ -440,13 +440,13 @@ fn has_map_fields_non_map_jumps_to_fail() {
 fn assoc_function(fixture: &mut Fixture, pairs: Vec<(Operand, Operand)>) -> (Label, Atom) {
     let code = vec![
         Instr::Label(Label(1)),
-        Instr::PutMapAssoc {
+        Instr::PutMapAssoc(Box::new(MapWriteArgs {
             fail: NO_FAIL,
             source: Operand::X(0),
             dst: Operand::X(0),
             live: 1,
             pairs,
-        },
+        })),
         Instr::Return,
     ];
     let entry = fixture.add_function("f", 1, code);
@@ -505,13 +505,13 @@ fn put_map_assoc_non_map_raises_badmap() {
     let mut fixture = Fixture::new(&["a", "badmap", "error"]);
     let a = fixture.atom("a");
     let badmap = fixture.atom("badmap");
-    let code = with_catch(vec![Instr::PutMapAssoc {
+    let code = with_catch(vec![Instr::PutMapAssoc(Box::new(MapWriteArgs {
         fail: NO_FAIL,
         source: Operand::X(0),
         dst: Operand::X(0),
         live: 1,
         pairs: vec![(Operand::Atom(a), Operand::Integer(1))],
-    }]);
+    }))]);
     let entry = fixture.add_function("f", 1, code);
     let module = fixture.finish();
 
@@ -645,20 +645,20 @@ fn put_map_assoc_growing_past_the_limit_enumerates_exactly_the_inserted_pairs() 
     // `f/1`: assoc 16 keys, then assoc 24 more (40 total ⇒ hashmap), return x(0).
     let code = vec![
         Instr::Label(Label(1)),
-        Instr::PutMapAssoc {
+        Instr::PutMapAssoc(Box::new(MapWriteArgs {
             fail: NO_FAIL,
             source: Operand::X(0),
             dst: Operand::X(0),
             live: 1,
             pairs: first,
-        },
-        Instr::PutMapAssoc {
+        })),
+        Instr::PutMapAssoc(Box::new(MapWriteArgs {
             fail: NO_FAIL,
             source: Operand::X(0),
             dst: Operand::X(0),
             live: 1,
             pairs: second,
-        },
+        })),
         Instr::Return,
     ];
     let entry = fixture.add_function("f", 1, code);
@@ -693,13 +693,13 @@ fn put_map_exact_updates_an_existing_key() {
     let (a, b) = (fixture.atom("a"), fixture.atom("b"));
     let code = vec![
         Instr::Label(Label(1)),
-        Instr::PutMapExact {
+        Instr::PutMapExact(Box::new(MapWriteArgs {
             fail: NO_FAIL,
             source: Operand::X(0),
             dst: Operand::X(0),
             live: 1,
             pairs: vec![(Operand::Atom(a), Operand::Integer(42))],
-        },
+        })),
         Instr::Return,
     ];
     let entry = fixture.add_function("f", 1, code);
@@ -729,13 +729,13 @@ fn put_map_exact_missing_key_jumps_to_fail() {
     let mut fixture = Fixture::new(&["a", "b"]);
     let (a, b) = (fixture.atom("a"), fixture.atom("b"));
     let code = with_fail_body(
-        vec![Instr::PutMapExact {
+        vec![Instr::PutMapExact(Box::new(MapWriteArgs {
             fail: Label(2),
             source: Operand::X(0),
             dst: Operand::X(0),
             live: 1,
             pairs: vec![(Operand::Atom(b), Operand::Integer(2))],
-        }],
+        }))],
         Label(2),
     );
     let entry = fixture.add_function("f", 1, code);
@@ -753,13 +753,13 @@ fn put_map_exact_missing_key_without_fail_raises_badkey() {
     let mut fixture = Fixture::new(&["a", "b", "badkey", "error"]);
     let (a, b) = (fixture.atom("a"), fixture.atom("b"));
     let badkey = fixture.atom("badkey");
-    let code = with_catch(vec![Instr::PutMapExact {
+    let code = with_catch(vec![Instr::PutMapExact(Box::new(MapWriteArgs {
         fail: NO_FAIL,
         source: Operand::X(0),
         dst: Operand::X(0),
         live: 1,
         pairs: vec![(Operand::Atom(b), Operand::Integer(2))],
-    }]);
+    }))]);
     let entry = fixture.add_function("f", 1, code);
     let module = fixture.finish();
 
@@ -780,13 +780,13 @@ fn put_map_exact_empty_map_without_fail_raises_badkey() {
     // and the *first* new key as `fvalue`.
     let mut fixture = Fixture::new(&["a", "badkey", "error"]);
     let (a, badkey) = (fixture.atom("a"), fixture.atom("badkey"));
-    let code = with_catch(vec![Instr::PutMapExact {
+    let code = with_catch(vec![Instr::PutMapExact(Box::new(MapWriteArgs {
         fail: NO_FAIL,
         source: Operand::X(0),
         dst: Operand::X(0),
         live: 1,
         pairs: vec![(Operand::Atom(a), Operand::Integer(1))],
-    }]);
+    }))]);
     let entry = fixture.add_function("f", 1, code);
     let module = fixture.finish();
 
