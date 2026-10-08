@@ -78,7 +78,12 @@
 //! **clean EOF** (the peer closed the connection) is reported as
 //! [`BeamError::BadArg`], matching [`crate::transport::MemoryTransport`]'s
 //! "short read" semantics. A refused handshake carries the peer's status text in
-//! `Io(ErrorKind::ConnectionRefused)`.
+//! `Io` under the [`StatusKind`]-selected [`std::io::ErrorKind`] (see the
+//! `status_error` mapping): `ConnectionRefused` for `"nok"`, `PermissionDenied`
+//! for `"not_allowed"`, `ConnectionAborted` for `"alive"`/`"ok_simultaneous"`,
+//! `AlreadyExists` for `"named:…"` and `InvalidData` for an unknown status. A
+//! refused **acceptor** also writes the `"not_allowed"` status to the peer first
+//! (see [`accept_server`]), so neither side can hang.
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
 use std::time::Duration;
@@ -100,6 +105,7 @@ use crate::framing::{
 };
 use crate::handshake::{
     check_mandatory, preferred_flags, Challenge, ChallengeAck, ChallengeReply, Name, Status,
+    StatusKind,
 };
 use crate::transport::{Read, Transport, Write};
 
@@ -310,6 +316,17 @@ fn send_handshake<T: Transport>(transport: &mut T, body: &[u8]) -> Result<()> {
     transport.flush()
 }
 
+/// Writes one 2-byte-framed refusal [`Status`] and flushes it.
+///
+/// Used by the accepting side to notify a peer it is about to drop (a real node
+/// replies `"not_allowed"` here, `dist_util.erl:286`), so the peer never blocks
+/// waiting for a status frame. A transport failure is propagated — the link is
+/// broken either way, and a silent success would be a lie.
+fn send_refusal<T: Transport>(transport: &mut T, status: Status) -> Result<()> {
+    let body = encode_handshake(|w| status.encode(w))?;
+    send_handshake(transport, &body)
+}
+
 /// Encodes a handshake message body through its own codec.
 fn encode_handshake<F>(encode: F) -> Result<Vec<u8>>
 where
@@ -322,22 +339,51 @@ where
     Ok(sink.into_written())
 }
 
-/// Builds the error for a handshake the peer refused (`"nok…"` / `"snamed:"` /
-/// `"sok_simultaneous"`), carrying the status text.
+/// Maps a peer's non-`Ok` [`Status`] (and the two statuses a real node sends that
+/// this crate cannot continue) onto a typed [`BeamError`].
+///
+/// The [`StatusKind`] classification selects the `io::ErrorKind`, so a caller can
+/// still tell the cases apart (both by the kind and by the message, which names
+/// the status text). The mapping is:
+///
+/// | status ([`StatusKind`]) | wire text (ground truth) | `io::ErrorKind` |
+/// |---|---|---|
+/// | `Nok` | `"nok"` (`dist_util.erl:343`) | `ConnectionRefused` |
+/// | `NotAllowed` | `"not_allowed"` (`dist_util.erl:286`) | `PermissionDenied` |
+/// | `Alive` | `"alive"` (`dist_util.erl:386`) | `ConnectionAborted` |
+/// | `Named` | `"named:…"` (`dist_util.erl:333`) | `AlreadyExists` |
+/// | `Simultaneous` | `"ok_simultaneous"` (`dist_util.erl:338`) | `ConnectionAborted` |
+/// | `Ok` / `Other` | `"ok"` / unknown | `InvalidData` |
+///
+/// `"ok"`/`"ok_simultaneous"`/`"named:"` all mean *the handshake continues* to a
+/// real node, but this crate's client can continue none of them: it has no
+/// dynamic-node-name support (`"named:"` assigns one) and no connection registry
+/// with which to resolve a simultaneous-connect race. Returning a typed error is
+/// the honest outcome — never a wrong result and never a hang. `Ok`/`Other` here
+/// are unreachable in practice (the caller only reports a non-`Ok` status).
 fn status_error(status: &Status) -> BeamError {
-    match status {
-        Status::Error(text) => BeamError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            format!(
-                "distribution handshake refused by peer: {}",
-                String::from_utf8_lossy(text)
-            ),
-        )),
-        other => BeamError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("distribution handshake: unexpected status {other:?}"),
-        )),
-    }
+    let kind = status.kind();
+    let io_kind = match kind {
+        StatusKind::Nok => std::io::ErrorKind::ConnectionRefused,
+        StatusKind::NotAllowed => std::io::ErrorKind::PermissionDenied,
+        StatusKind::Alive => std::io::ErrorKind::ConnectionAborted,
+        StatusKind::Named => std::io::ErrorKind::AlreadyExists,
+        StatusKind::Simultaneous => std::io::ErrorKind::ConnectionAborted,
+        StatusKind::Ok | StatusKind::Other => std::io::ErrorKind::InvalidData,
+    };
+    let detail = match status {
+        Status::Named { name, creation } => format!(
+            "peer reports node name '{}' (creation {creation}) as already assigned (named)",
+            String::from_utf8_lossy(name)
+        ),
+        Status::Simultaneous => "peer sent status 'ok_simultaneous'".to_string(),
+        Status::Ok => "peer sent status 'ok'".to_string(),
+        Status::Error(text) => format!("peer sent status '{}'", String::from_utf8_lossy(text)),
+    };
+    BeamError::Io(std::io::Error::new(
+        io_kind,
+        format!("distribution handshake ({kind:?}): {detail}"),
+    ))
 }
 
 /// Drives the **client** side of the connect/challenge handshake.
@@ -394,9 +440,13 @@ fn connect_client_core<T: Transport>(
     })?;
     send_handshake(t, &body)?;
 
-    // 2. Status (`"ok"` proceeds).
+    // 2. Status. Only `"ok"` lets this client proceed; every other documented
+    //    code is surfaced as a typed error (see `status_error`): a peer refusal
+    //    (`"nok"`/`"not_allowed"`), an already-active link (`"alive"`), or the two
+    //    statuses a real node continues on but this client cannot
+    //    (`"ok_simultaneous"`/`"named:"`).
     let status = Status::decode(&read_packet(t, HANDSHAKE_FRAMING)?)?;
-    if status != Status::Ok {
+    if status.kind() != StatusKind::Ok {
         return Err(status_error(&status));
     }
 
@@ -443,6 +493,13 @@ fn connect_client_core<T: Transport>(
 /// The server advertises [`preferred_flags`] and no `Complement` (that message
 /// answers only the legacy `'n'` name, which this crate does not speak).
 ///
+/// **A peer whose `Name` cannot be accepted is told so.** When the client's flags
+/// fail the mandatory check (the v6 version gate), the server writes a
+/// 2-byte-framed `"not_allowed"` [`Status`] and flushes it *before* returning the
+/// error, exactly as a real accepting node does (`dist_util.erl:286`:
+/// `send_status(HSData, not_allowed)`). A rejected peer therefore reads a status
+/// frame and fails immediately instead of blocking on a frame that never arrives.
+///
 /// **`our_name` must be this node's full `node@host` name.** OTP's connecting side
 /// compares the name inside the server's `'N'` challenge with the node it dialled
 /// (`lib/kernel/src/dist_util.erl:recv_challenge_new/2`) and aborts the socket
@@ -471,7 +528,20 @@ fn accept_server_with<T: Transport>(
 
     // 1. Name: the client's flags, creation and name.
     let name = Name::decode(&read_packet(t, HANDSHAKE_FRAMING)?)?;
-    let negotiated = check_mandatory(name.flags)?;
+    // A peer whose flags fail the mandatory check (the v6 version gate) is
+    // refused. A real accepting node *tells the peer* before dropping the link
+    // (`dist_util.erl:286`, `check_dflags` → `send_status(HSData, not_allowed)`);
+    // returning without sending anything would leave the connecting node waiting
+    // forever for a status frame that never comes. (A frame that is not even a
+    // `Name` never reaches here — `Name::decode` fails first and the link is
+    // simply dropped, matching `dist_util.erl:750`'s `?shutdown2`.)
+    let negotiated = match check_mandatory(name.flags) {
+        Ok(negotiated) => negotiated,
+        Err(refusal) => {
+            send_refusal(t, Status::not_allowed())?;
+            return Err(refusal);
+        }
+    };
 
     // 2. Status::Ok.
     let body = encode_handshake(|w| Status::Ok.encode(w))?;
@@ -526,6 +596,16 @@ fn accept_server_with<T: Transport>(
 /// node name (`name@host` is *not* accepted here: `epmd` is queried with the bare
 /// name, exactly as `PORT2_REQ` requires). `our_name`/`cookie` are this node's name
 /// and the shared cookie.
+///
+/// **`epmd not_registered`.** When the peer is not registered with `epmd`,
+/// [`crate::epmd::lookup_port`] maps `epmd`'s `PORT2_RESP` error result to
+/// `Io(NotFound)` (never a panic and never a silent port `0`), and this function
+/// returns that error *before* any TCP connect is attempted. The `epmd` client
+/// itself (the request/reply codecs) is owned by [`crate::epmd`]; only this
+/// connect-level behaviour belongs to this module. The reply's `high_vsn`/
+/// `low_vsn` version pair is **not** consulted here — the protocol version gate
+/// this crate enforces is the in-band `DFLAG_*` mandatory check
+/// ([`check_mandatory`], see its docs).
 ///
 /// The client advertises [`CLIENT_CREATION`] as its own creation; use
 /// [`connect_to_node_with_creation`] to advertise an explicit one.
