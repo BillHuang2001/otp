@@ -764,7 +764,9 @@ maybe_fuse_4(LA, LSucc, LFinal, LFail2, D1, B2, Type, Blocks) ->
     %% fuse in that case.
     andalso not has_phi(LSucc, Blocks)
     andalso not has_phi(LFinal, Blocks)
-    andalso not has_phi(LFail2, Blocks).%% The type of the first argument of the instruction, as recorded by
+    andalso not has_phi(LFail2, Blocks).
+
+%% The type of the first argument of the instruction, as recorded by
 %% beam_ssa_type. `false` when unknown.
 -spec anno_arg_type(beam_ssa:b_set()) -> false | term().
 anno_arg_type(#b_set{anno=Anno}) ->
