@@ -2,21 +2,21 @@
 //! system `erl` oracle.
 //!
 //! `src/native/process.rs::module_loaded_1` answers `true` when the name is in the runtime's
-//! preloaded set ([`beam_rt::boot::PRELOADED_MODULE_NAMES`] — the oracle's exact 22-module
+//! preloaded set ([`beam_rt::boot::PRELOADED_MODULE_NAMES`], the oracle's exact 22-module
 //! `erlang:pre_loaded/0` list) **or** the shared code server already holds the module
 //! (`CodeServer::is_loaded`, which `CodeServer::load` memoizes into). This suite pins that
-//! answer — both what it agrees with the oracle on and the one place it differs by
-//! construction — running the **same** `-eval` program under the built `beam_rt` binary and
+//! answer - both what it agrees with the oracle on and the one place it differs by
+//! construction - running the **same** `-eval` program under the built `beam_rt` binary and
 //! under the oracle.
 //!
 //! # What agrees, and why
 //!
-//! * **The preloaded set.** Every name in [`PRELOADED_MODULE_NAMES`] is `true` in both
+//! * **The preloaded set.** Every name in `PRELOADED_MODULE_NAMES` is `true` in both
 //!   runtimes (it is literally the oracle's `erlang:pre_loaded/0` list).
 //! * **A name that is loaded now becomes `true`.** `CodeServer::load` memoizes into the same
-//!   map `is_loaded` consults, so a module the runtime genuinely loads — via
+//!   map `is_loaded` consults, so a module the runtime genuinely loads - via
 //!   `code:ensure_loaded/1` or because a real external call the runtime-load path
-//!   (`src/context/mod.rs:1289`) reaches it — flips the answer from `false` to `true`, exactly
+//!   (`src/context/mod.rs:1289`) reaches it - flips the answer from `false` to `true`, exactly
 //!   as in the oracle.
 //! * **An unknown / not-yet-loaded name is `false`.** `stdlib`, `xmerl_scan` and a made-up
 //!   `nonexistent_xyz` answer `false` in both.
@@ -35,12 +35,12 @@
 //!
 //! The hard constraint this suite guards: the answer must **never** come from a
 //! `find_file(...).is_some()` ("is on the code path") shortcut, which would wrongly answer
-//! `true` for `xmerl_scan`/`dialyzer` — [`an_absent_or_unloaded_name_is_false_in_both`] is the
-//! guard.
+//! `true` for `xmerl_scan`/`dialyzer` -
+//! [`an_absent_or_unloaded_name_is_false_in_both`] is the guard.
 //!
 //! # A `lists:reverse` gotcha worth naming
 //!
-//! The obvious probe — `lists:reverse([1,2,3]), erlang:module_loaded(lists)` — does **not**
+//! The obvious probe - `lists:reverse([1,2,3]), erlang:module_loaded(lists)` - does **not**
 //! force `lists` to load here: `lists:reverse/1` is one of `beam_bifs`'s registry fast paths
 //! (`beam_bifs/src/lists.rs`), so the call never reaches the code server and `lists` genuinely
 //! stays unloaded. That is not a load path escaping the cache; it is a served-fast-path call.
@@ -51,12 +51,12 @@
 //!
 //! The `beam_rt`-side assertions run with no toolchain; only the oracle comparison needs
 //! `erl`, and every test skips **loudly** without it (`tests/support/mod.rs`). No fixture is
-//! handed to the oracle as an `-pa` — that is what keeps this suite clear of the
+//! handed to the oracle as an `-pa` - that is what keeps this suite clear of the
 //! `tests/fixtures/lists.beam` shadowing trap.
 
 // The shared harness is compiled in whole, but this suite uses only its toolchain discovery
 // and probe bound (the probes need the exit code, which `support::oracle_eval` folds away),
-// so the unused remainder is expected here — the same shape `tests/monitor.rs` uses.
+// so the unused remainder is expected here - the same shape `tests/monitor.rs` uses.
 #[allow(dead_code)]
 mod support;
 
@@ -151,7 +151,7 @@ erlang:module_loaded(init), erlang:module_loaded(erl_prim_loader)}]), halt(0).";
 const PRELOADED_EXPECTED: &str = "{true,true,true,true,true}";
 
 /// Names that are neither preloaded nor loaded in either runtime: a stdlib module the app
-/// never touches, a library outside the boot set, and a made-up name. All `false` — the
+/// never touches, a library outside the boot set, and a made-up name. All `false` - the
 /// guard against a "is on the code path" shortcut.
 const EXPR_ABSENT: &str = "\
 io:format(\"~p~n\", [{erlang:module_loaded(stdlib), erlang:module_loaded(xmerl_scan), \
@@ -159,7 +159,7 @@ erlang:module_loaded(nonexistent_xyz)}]), halt(0).";
 const ABSENT_EXPECTED: &str = "{false,false,false}";
 
 /// A module becomes loaded on demand through `code:ensure_loaded/1`: `false` before, `true`
-/// after — the reflection of the code server's own cache, in both runtimes (`digraph` is not
+/// after - the reflection of the code server's own cache, in both runtimes (`digraph` is not
 /// in the boot set of either).
 const EXPR_ENSURE_LOADED: &str = "\
 Before = erlang:module_loaded(digraph), \
@@ -187,11 +187,11 @@ const LOAD_FLOWS: [(&str, &str, &str); 2] = [
 /// runtime's 22-module preloaded boot, so the two runtimes answer differently.
 const EXPR_LISTS: &str = "io:format(\"~p~n\", [erlang:module_loaded(lists)]), halt(0).";
 
-/// This runtime's own answer for [`EXPR_LISTS`] — the 22-module preloaded boot loads no
+/// This runtime's own answer for `EXPR_LISTS` - the 22-module preloaded boot loads no
 /// `lists.beam`.
 const LISTS_OURS: &str = "false";
 
-/// `lists` becomes `true` here too once it is genuinely loaded — proof that [`LISTS_OURS`] is
+/// `lists` becomes `true` here too once it is genuinely loaded - proof that `LISTS_OURS` is
 /// the truthful "not loaded yet", not a missing lookup.
 const EXPR_LISTS_AFTER_LOAD: &str = "\
 code:ensure_loaded(lists), \
@@ -230,7 +230,7 @@ fn the_preloaded_set_agrees_with_the_live_oracle() {
     );
 }
 
-/// An absent or not-yet-loaded name is `false` in both — never a "is on the code path"
+/// An absent or not-yet-loaded name is `false` in both - never a "is on the code path"
 /// shortcut that would wrongly answer `true` for `xmerl_scan`.
 #[test]
 fn an_absent_or_unloaded_name_is_false_in_both() {
@@ -256,8 +256,8 @@ fn an_absent_or_unloaded_name_is_false_in_both() {
     );
 }
 
-/// A module that the runtime genuinely loads — through `code:ensure_loaded/1` or a real
-/// external call — flips from `false` to `true`, exactly as in the oracle. This is the
+/// A module that the runtime genuinely loads - through `code:ensure_loaded/1` or a real
+/// external call - flips from `false` to `true`, exactly as in the oracle. This is the
 /// on-demand reflection of the code server's cache.
 #[test]
 fn a_module_becomes_loaded_on_demand_in_both() {
@@ -290,7 +290,7 @@ fn a_module_becomes_loaded_on_demand_in_both() {
 
 /// The **boot-set divergence**, documented honestly. This runtime's own value is asserted
 /// (`false`); the oracle's differing value is **recorded**, not pinned, because the whole
-/// point is that the two runtimes start from different loaded sets — a future OTP whose boot
+/// point is that the two runtimes start from different loaded sets - a future OTP whose boot
 /// set changes must not fail this suite.
 #[test]
 fn the_boot_set_divergence_is_this_runtimes_own_truthful_loaded_set() {
@@ -314,7 +314,7 @@ fn the_boot_set_divergence_is_this_runtimes_own_truthful_loaded_set() {
     };
     let theirs = oracle_eval(&oracle, EXPR_LISTS);
     assert_eq!(theirs.code, 0, "the oracle failed: stderr {}", theirs.err);
-    // RECORDED, NOT ASSERTED — the oracle's boot script loads ~109 modules, so it answers
+    // RECORDED, NOT ASSERTED - the oracle's boot script loads ~109 modules, so it answers
     // `true` here where this runtime answers `false`. The divergence is by construction
     // (this runtime's loaded set is its own), so its exact value is recorded rather than
     // pinned.

@@ -19,9 +19,21 @@ use crate::runtime::Runtime;
 use super::super::tests::SLICE_BEAM;
 use super::*;
 
-/// The default runtime the scheduler tests run against.
+/// The default runtime the scheduler tests run against, **booted up front**.
+///
+/// [`Runtime`]'s boot is lazy: the first scheduler pass calls `boot_if_needed`, which adds
+/// the system code path and loads the 22 preloaded modules. That first pass therefore pays a
+/// one-time cost: with `$ERTS_STDLIB_DIR` unset it spawns the system `erl` once per OS process
+/// (memoized in a `OnceLock`, `codeserver.rs::resolve_system_ebins`). Several tests below
+/// bound a timed window with that **first** pass inside it (`< 200 ms`,
+/// [`a_bounded_step_does_not_wait_for_a_pending_deadline`], and `< 1000 ms`,
+/// [`a_message_already_in_the_mailbox_is_taken_before_the_timeout`]), so the spawn could land
+/// inside the window and flake the suite. Warming the boot here moves the cost before every
+/// window; the spawn is memoized for the whole test binary, so only the first call pays it.
 fn runtime() -> Runtime {
-    Runtime::with_defaults().expect("the default runtime")
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.boot().expect("the runtime boots");
+    rt
 }
 
 // -- scheduler count & multi-process progress -----------------------------
