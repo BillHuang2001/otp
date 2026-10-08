@@ -631,7 +631,10 @@ impl Table {
   plus `match_spec_run` (bindings, repeated vars, multi-clause, empty/`badarg`, body `EXIT`),
   `select_replace` (small-int rewrite, arity-1 result, `bag`/changed-key `badarg`, identity) and the
   limit/continuation chains (`select`/`match`/`match_object` `/3`+`/1`, `limit 0` `badarg`, empty
-  table). `KNOWN_DIVERGENCES` is empty. Without `erl` the live-oracle test skips;
+  table). The `access_control` case is widened *inside itself* to pin the whole gate matrix — each op
+  on its own fresh owner-seeded table, for the 3 protections × {owner, non-owner}: the read-gated
+  reads + `safe_fixtable/2`, the deliberately **ungated** `info/1,2`, and the write-gated writes. The
+  case total stays 102. `KNOWN_DIVERGENCES` is empty. Without `erl` the live-oracle test skips;
   `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure (use it in CI).
 - **Gates (GREEN required):**
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` and
