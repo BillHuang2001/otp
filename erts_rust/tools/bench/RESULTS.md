@@ -173,7 +173,7 @@ All four cases ran under both runtimes (`4 ok, 0 unsupported`) and produced the 
 **This is the execution-bound result.** Startup is comparable (§3.1) while the *per-call* cost of a real foreign function is ~54×–72× higher under `beam_rt`.
 The gap is a **real runtime cost, not a harness artifact**: the startup-cancelled marginal is stable and reproduces with a plain shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>`.
 It is a `beam_rt` per-call host-context cost, not interpreter dispatch.
-Startup latency and peak RSS are the trustworthy cross-runtime comparisons; the four rust `ns/call` rows are snapshots, so re-run the commands in §2 rather than adjusting these numbers.
+Startup latency is the trustworthy cross-runtime comparison (and `foreign` peak RSS is *not* — see §6.7); the four rust `ns/call` rows are snapshots, so re-run the commands in §2 rather than adjusting these numbers.
 
 ## 4. System-ERTS target-project results (sys-only workloads)
 

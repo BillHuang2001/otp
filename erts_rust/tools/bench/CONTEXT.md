@@ -411,8 +411,7 @@ startup-cancelled metric `(mean wall@N − mean wall@0)/N` reproduces with a pla
 per-call GC are all ruled out. It is a `beam_rt` host-context cost: `beam_engine`'s interpreter dispatch
 is itself O(1) and allocation-free per instruction.
 
-Consequence for reading results: startup latency and peak RSS are the trustworthy cross-runtime
-comparisons today. The four `foreign` rust `ns_per_call` rows — and therefore their `wall_ms` rows —
+Consequence for reading results: startup latency is the trustworthy cross-runtime comparison today (and, on `slice`, peak RSS; `foreign` peak RSS is not — see the Known Issue). The four `foreign` rust `ns_per_call` rows — and therefore their `wall_ms` rows —
 are snapshots of this per-call cost; re-run the Runbook commands rather than adjusting the numbers.
 
 ## Known Issue — rust `foreign` peak RSS scales with the loop count `N`
