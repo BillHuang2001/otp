@@ -97,8 +97,11 @@ setup() {
 
     echo "=== building common_test ==="
     [ -f "$ERL_TOP/lib/common_test/priv/x86_64-pc-linux-gnu/Makefile" ] || \
-        (cd "$ERL_TOP/lib/common_test" && ./configure)
-    make -j"$JOBS" -C "$ERL_TOP/lib/common_test"
+        (cd "$ERL_TOP/lib/common_test" && PATH="$BIN:$PATH" ./configure)
+    # Prefix PATH with $BIN (as for the apps above): else the ambient `erlc'
+    # (e.g. a system OTP built for a different runtime) is used and the build
+    # fails with "BEAM file was compiled for a later version of the runtime".
+    PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/common_test"
     echo "=== setup done ==="
 }
 
