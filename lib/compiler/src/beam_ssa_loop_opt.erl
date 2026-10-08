@@ -114,7 +114,55 @@
 %%% NOT IMPLEMENTED: unrolling (needs an exact trip count); accumulator-based
 %%% strength reduction of `X * K' for a non-power-of-two K; `X * 2^n' for an X
 %%% that may be a float; a shift by a negative or non-literal count; any
-%%% divisor that could be 0.
+%%% divisor that could be 0. A precise reason for the two whole-loop
+%%% transformations that were considered and rejected follows.
+%%%
+%%% NOT IMPLEMENTED AND WHY: LOOP UNROLLING (sub-flag `loop_unroll', pass
+%%% `ssa_opt_loop_unroll'). Unrolling needs an EXACT trip count and a body that
+%%% may be duplicated; neither exists here.
+%%% * The only CFG cycles that reach this pass are the `receive' loops built by
+%%%   `beam_ssa_recv' -- `beam_ssa:is_loop_header/1' recognizes a header only
+%%%   by `peek_message'/`wait_timeout', and an ordinary tail-recursive function
+%%%   is emitted as a `call_only'/`call_last' tail call with NO cycle, so it
+%%%   has no loop to unroll and no induction variable. A `receive' loop has no
+%%%   trip count at all: its iteration count is the number of matching
+%%%   messages, which is not a compile-time quantity.
+%%% * Duplicating a `receive' body is not even semantics-preserving: it would
+%%%   run two `peek_message'/`wait_timeout'/`remove_message' rounds before
+%%%   re-entering the loop, reordering the mailbox and making the `after'
+%%%   timeout apply once per unrolled pair instead of once per message.
+%%% A sound unroller therefore could never fire on any Erlang program compiled
+%%% through this pipeline, and the counted-loop shape it would need is not
+%%% produced by `beam_core_to_ssa'. It was rejected rather than written as
+%%% unreachable, unverifiable code. If the pipeline ever grows real counted
+%%% loops, the transform belongs in `beam_ssa_opt:repeated_passes/1' mirroring
+%%% the `loop_arith_licm' block, as
+%%%   Ps3 = case lists:member(loop_unroll, Opts) of
+%%%             true -> Ps2 ++ [{ssa_opt_loop_unroll,
+%%%                              fun(St) -> beam_ssa_loop_opt:opt_unroll(St) end}];
+%%%             false -> Ps2
+%%%         end,
+%%% with a sound `gate(ssa_opt_loop_unroll)' that accepts both a back edge and
+%%% the countable-loop shape.
+%%%
+%%% NOT IMPLEMENTED AND WHY: LOOP-INDEX NARROWING (sub-flag
+%%% `loop_index_narrowing', pass `ssa_opt_loop_index_narrowing'). Narrowing an
+%%% index has no meaning on this IR: an Erlang integer is a single
+%%% arbitrary-precision type and the BEAM instruction set has no narrow or
+%%% wrapping integer form, so there is no cheaper operation to rewrite an index
+%%% into. The two rewrites that could pass for it are already done, or belong
+%%% elsewhere:
+%%% * `X rem 2^n' -> `X band (2^n - 1)' -- the only index "narrowing" that maps
+%%%   to a cheaper BEAM instruction -- is already the `rem' rule of
+%%%   `strength_reduce/2' below (and needs a non-negative dividend).
+%%% * A range-proven index (the JIT's machine-integer win) is produced by the
+%%%   SSA TYPE analysis: `beam_ssa_type' already narrows `#t_integer' by lower
+%%%   and upper element bounds along the loop edges, and a second, loop-pass
+%%%   range inference could only duplicate or contradict it.
+%%% And, as for unrolling, the only loops that exist here are `receive' loops,
+%%% which have no index to narrow. Rejected for the same reason; the
+%%% registration would mirror the block quoted above with the pass name
+%%% `ssa_opt_loop_index_narrowing' and the option `loop_index_narrowing'.
 %%%
 %%% REACH (the pass runs after the SSA type analysis): the CFG of an ordinary
 %%% tail-recursive function contains no cycle (self-recursion is still a tail
