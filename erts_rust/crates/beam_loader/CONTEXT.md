@@ -480,6 +480,21 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - **`tests/generic_census.rs`:** the residual `Instr::Generic` census over every installed
   stdlib/kernel/compiler `.beam` — asserts the unmodelled-opcode set equals the documented baseline, so a
   newly-emitted unmodelled opcode fails the test; loud skip when `erl`/OTP is absent.
+- **`tests/line_info.rs`:** `linecov.beam` carries a typed `Instr::ExecutableLine` and `dbgline.beam` a
+  typed `Instr::DebugLine` (neither on `Generic`); asserts the `Line` table and every function's
+  `Instr::FuncInfo` are preserved (the runtime needs `current_location`/stack traces).
+- **`tests/bs_test_tail.rs`:** `bstail.beam` carries a typed `Instr::BsTestTail2` (not `Generic`), with the
+  fail label inside `f/1`.
+- **`tests/chunks.rs`:** walks the whole installed corpus asserting every chunk id is classified
+  (`chunk::classify`) and every module loads (unknown id ⇒ failure naming it); positive controls require
+  all 15 corpus ids to appear so the pass cannot be vacuous; pins key ids' classes row-by-row and
+  cross-checks the decoded `Attr` against the runtime `module_info(attributes)` on `gen_server`/`kernel`.
+- **`tests/literals.rs`:** both `LitT` framings decode to identically-encoded terms; structural assertions
+  for every literal kind; plus a whole-corpus sweep re-encoding every decoded literal byte-exactly and
+  comparing semantically against `literals_oracle.escript` for map literals whose key order is non-canonical.
+- **`tests/load_cost.rs`:** the committed, dependency-free module-load-cost measurement (Design Decisions):
+  a deterministic 200-module sample reporting ns/instruction and bytes/second, with per-stage and
+  per-module breakdown; loud skip without OTP.
 - Unit tests live in-module (`#[cfg(test)]`) in every `src/` file.
 - **Gate (GREEN required):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_loader`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
