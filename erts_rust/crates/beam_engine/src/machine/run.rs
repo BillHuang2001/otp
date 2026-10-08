@@ -190,6 +190,11 @@ impl Machine {
     /// instead of the folded `x(0)`: the machine is reset, `x[0..arity)` is seeded
     /// from `args`, the bottom frame is pushed, and the dispatch loop runs from the
     /// label's `(func, pc)`.
+    ///
+    /// The module-wide label index is built **exactly once per run**: the entry
+    /// label is resolved against one [`interpreter::build_label_map`] and the very
+    /// same map is handed to the dispatch loop, instead of resolving the label with
+    /// one build and then rebuilding the identical map inside [`Machine::run_loop`].
     pub fn run_label_outcome(
         &mut self,
         module: &Module,
@@ -204,8 +209,10 @@ impl Machine {
             self.set_x(i as u32, *arg)?;
         }
         self.push_frame(0)?;
-        let (func, pc) = interpreter::resolve_label(module, label)?;
-        self.run_loop(module, func, pc, ctx)
+        let labels = interpreter::build_label_map(module);
+        let (func, pc) = interpreter::resolve(&labels, label)?;
+        self.enter_run(module, func);
+        self.run_loop_with_map(module, &labels, func, pc, ctx)
     }
 }
 
@@ -379,6 +386,71 @@ mod tests {
                 .run_export_outcome(&module, name, 0, &[], &mut ctx)
                 .unwrap(),
             RunOutcome::Returned(make_small(5))
+        );
+    }
+
+    /// Change 2: a run must build the module-wide label index **exactly once**.
+    ///
+    /// `run_label_outcome` used to resolve the entry label with one
+    /// `build_label_map` and then rebuild the identical map inside `run_loop` — two
+    /// `O(labels)` passes per run. The `cfg(test)` counter ([`crate::interpreter`])
+    /// makes the count observable here.
+    #[test]
+    fn run_export_builds_the_label_map_exactly_once() {
+        let (module, name) = module_with_code(
+            "f",
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Label(Label(2)),
+                Instr::Move {
+                    src: Operand::Integer(5),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        );
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        crate::interpreter::reset_label_map_builds();
+        assert_eq!(
+            machine.run_export(&module, name, 0, &[], &mut ctx).unwrap(),
+            make_small(5)
+        );
+        assert_eq!(
+            crate::interpreter::label_map_builds(),
+            1,
+            "run_export must build the module label index exactly once per run"
+        );
+    }
+
+    /// The `resume_outcome` path builds its own (single) label index: a suspension
+    /// is re-entered by a fresh run, so it builds the map once when resumed.
+    #[test]
+    fn resume_outcome_builds_the_label_map_exactly_once() {
+        let (module, name) = receive_module();
+        let mut machine = Machine::new();
+        let mut empty = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+            messages: VecDeque::new(),
+        }));
+        assert_eq!(
+            machine
+                .run_export_outcome(&module, name, 0, &[], &mut empty)
+                .unwrap(),
+            RunOutcome::Wait { func: 0, pc: 7 }
+        );
+
+        let mut ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+            messages: VecDeque::from([make_small(42)]),
+        }));
+        crate::interpreter::reset_label_map_builds();
+        assert_eq!(
+            machine.resume_outcome(&module, 0, 7, &mut ctx).unwrap(),
+            RunOutcome::Returned(make_small(42))
+        );
+        assert_eq!(
+            crate::interpreter::label_map_builds(),
+            1,
+            "resume_outcome must build the module label index exactly once"
         );
     }
 
