@@ -569,6 +569,19 @@ still reproduces today's collector exactly.
   documented rootset contract end-to-end (`materialize` → `gather_roots` → `collect` → `scatter_roots`).
 - **`tests/immix_workloads.rs` — the multi-workload measurement** (table in Design Decisions §Measured;
   deterministic counts asserted, pause times only printed).
+- **`tests/heap_growth.rs` — on-demand growth + half-forward evidence.** Sustained allocation grows the
+  nursery/mature past their initial size with every live term intact; a `max_heap_words` cap below the live
+  set makes `collect*` return a typed error with **nothing copied** (roots un-forwarded, counters unchanged,
+  a second attempt errors identically), while `ensure_capacity` grows the nursery to cover a request or
+  errors typed when capped — both strategies.
+- **`tests/memory_overhead.rs` — memory / no-leak evidence.** Per-object overhead vs the frozen layout for
+  cons/tuple/float/flat-map is asserted `< 1` word (measured **0**); a 140-cycle allocate/collect run asserts
+  the RSS (`/proc/self/statm`, skipped loudly off-Linux) and the word accounting plateau — no leak.
+- **`tests/stress_cross_generation.rs` — the cross-generation correctness gate.** One graph mixing cons
+  (shared + cyclic), nested tuples, flat + >32-key HAMT maps, on-heap binaries/bitstrings, refc binaries, an
+  off-heap MSO, Local/External/Imported funs and an external pid, through 6 minors + 2 majors under **both**
+  strategies; asserts structural equality after *each* collection, root relocation, single-copy sharing, a
+  closing cycle, dropped garbage, and untouched off-heap payloads.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
