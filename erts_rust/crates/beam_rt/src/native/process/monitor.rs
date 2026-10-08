@@ -234,7 +234,10 @@ impl RuntimeContext<'_> {
     /// [`Runtime::local_node`](crate::Runtime::local_node) — the `node@host` string the
     /// node identity was interned from (`nonode@nohost` when the runtime is not a
     /// distributed node), never a guessed name.
-    fn is_local_node(&self, node: Eterm) -> bool {
+    ///
+    /// `pub(super)` so the sibling spawn family in [`super`] resolves the `Node` argument
+    /// of `erlang:spawn_monitor/2,4` through the *same* definition (reuse, not duplicate).
+    pub(super) fn is_local_node(&self, node: Eterm) -> bool {
         let Some(name) = self.atom_name(node) else {
             return false;
         };

@@ -211,6 +211,61 @@ impl RuntimeContext<'_> {
         self.apply_spawn_options(child, &options)
     }
 
+    // -- erlang:spawn_monitor/1,2,3,4 -----------------------------------------
+
+    /// `erlang:spawn_monitor(Fun)`: `spawn/1` under an **atomic** monitor; answers
+    /// `{Pid, Ref}`.
+    ///
+    /// The oracle's `spawn_monitor/1` is `erlang.erl`'s
+    /// `erlang:spawn_opt(erlang, apply, [F, []], [monitor])` behind the guard
+    /// `is_function(F, 0)` (`erlang.erl:10736`), so a non-fun **or a fun of arity other
+    /// than 0** is its `badarg` — unlike `spawn/1`, whose C BIF accepts any arity and lets
+    /// the child fail with `badarity`.
+    pub(super) fn spawn_monitor_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fun = *args.first().ok_or(BeamError::BadArg)?;
+        self.spawn_monitor_fun_child(fun)
+    }
+
+    /// `erlang:spawn_monitor(Node, Fun)`: `spawn_monitor/1` for the node `Node`.
+    ///
+    /// `erlang.erl:10755` guards `is_atom(Node)` **and** `is_function(F, 0)` — a non-atom
+    /// node or a wrong-arity fun is the oracle's `badarg`. A `Node` other than this
+    /// runtime's own is a typed capability gap (the oracle routes it through a distributed
+    /// `erlang:spawn_request/5`; contract A.5).
+    pub(super) fn spawn_monitor_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let node = *args.first().ok_or(BeamError::BadArg)?;
+        self.require_local_node(node, 2)?;
+        let fun = *args.get(1).ok_or(BeamError::BadArg)?;
+        self.spawn_monitor_fun_child(fun)
+    }
+
+    /// `erlang:spawn_monitor(Module, Function, Args)`: `spawn/3` under an **atomic**
+    /// monitor; answers `{Pid, Ref}`.
+    ///
+    /// `erlang.erl:10775` guards `is_atom(M)`, `is_atom(F)` **and** `is_list(A)` (each a
+    /// `badarg` when violated) and then runs `erlang:spawn_opt(M, F, A, [monitor])`, so the
+    /// `Module`/`Function` resolution is `spawn/3`'s own — this body only adds the monitor.
+    pub(super) fn spawn_monitor_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let (module, function) = self.export_target(args)?;
+        let call_args = self.argument_list(*args.get(2).ok_or(BeamError::BadArg)?)?;
+        let child = self.spawn_export_child(&module, &function, call_args)?;
+        self.attach_monitor(child)
+    }
+
+    /// `erlang:spawn_monitor(Node, Module, Function, Args)`.
+    ///
+    /// `erlang.erl:10943`'s first clause is `N =:= erlang:node()` (with the `M`/`F`/`A`
+    /// guards), and that clause simply runs `spawn_monitor/3`; any other atom node falls to
+    /// the distributed `spawn_request` clause (the typed capability gap here), and a
+    /// non-atom `Node`/`Module`/`Function` or a non-list `Args` is the oracle's `badarg`
+    /// (`erlang.erl:10980`, the guard-failing clause).
+    pub(super) fn spawn_monitor_4(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let node = *args.first().ok_or(BeamError::BadArg)?;
+        self.require_local_node(node, 4)?;
+        let rest = args.get(1..).ok_or(BeamError::BadArg)?;
+        self.spawn_monitor_3(rest)
+    }
+
     // -- the spawn family's helpers -------------------------------------------
 
     /// The `(Module, Function)` atoms a `spawn/2,3`-shaped call names, as names.
@@ -474,13 +529,79 @@ impl RuntimeContext<'_> {
             .find(|priority| priority.name() == name)
     }
 
+    /// [`Self::spawn_monitor_1`]/[`Self::spawn_monitor_2`]'s shared body: a **0-arity**
+    /// `fun` child under an atomic monitor.
+    ///
+    /// The arity check is the oracle's `is_function(F, 0)` guard (`erlang.erl:10736`); a
+    /// non-fun is the same `badarg` (`terms::fun_arity` rejects it).
+    fn spawn_monitor_fun_child(&mut self, fun: Eterm) -> Result<Eterm> {
+        match terms::fun_arity(fun) {
+            Ok(0) => {}
+            _ => return Err(BeamError::BadArg),
+        }
+        let child = self.spawn_fun_child(fun, Vec::new())?;
+        self.attach_monitor(child)
+    }
+
+    /// Validates a `spawn_monitor/2,4` `Node` argument: it must be an **atom** naming
+    /// **this** runtime's own node.
+    ///
+    /// A non-atom is the oracle's `badarg` (`erlang.erl`'s guard-failing clause). A node
+    /// other than this one needs a distributed spawn, which the oracle performs with
+    /// `erlang:spawn_request/5`; this runtime has no distribution send path for a spawn, so
+    /// it is the typed capability gap rather than a locally fabricated child. `arity` only
+    /// names the call in the reported gap.
+    fn require_local_node(&self, node: Eterm, arity: u32) -> Result<()> {
+        if !is_atom(node) {
+            return Err(BeamError::BadArg);
+        }
+        if self.is_local_node(node) {
+            return Ok(());
+        }
+        Err(error::unsupported(&format!(
+            "erlang:spawn_monitor/{arity} on a node other than this one"
+        )))
+    }
+
+    /// Installs a monitor from the calling process on the freshly spawned `child_term` and
+    /// answers the oracle's `{Pid, Ref}` (`spawn_monitor/1,3` and `spawn_opt(…, [monitor])`).
+    ///
+    /// **Atomicity.** The child is created by [`Self::spawn_fun_child`] /
+    /// [`Self::spawn_export_child`] — outside a scheduler pass that means a run-queue entry,
+    /// inside one a [`PendingSpawn`](crate::runtime::PendingSpawn) the pass turns into a
+    /// run-queue entry before its next round — and can therefore only begin to run at the
+    /// next scheduler round, never between its creation and this call: the runtime is
+    /// single-threaded and the whole `spawn_monitor` BIF is one uninterrupted invocation.
+    /// The monitor is thus on record *before* the child's first schedulable moment, so a
+    /// child that exits immediately still delivers its `{'DOWN', …}`, which `beam_process`
+    /// builds from the recorded incoming monitor half.
+    fn attach_monitor(&mut self, child_term: Eterm) -> Result<Eterm> {
+        let child = ProcessId::from_eterm(child_term)?;
+        let parent = self.pid();
+        let reference = self
+            .process_table_mut()
+            .monitor(parent, child, MonitorKind::Process)?;
+        let ref_term = {
+            let mut heap = self.runtime.take_bif_heap()?;
+            let term = reference.to_eterm(&mut heap);
+            self.runtime.put_bif_heap(heap);
+            term?
+        };
+        // Recorded so `erlang:demonitor/1` recognises the reference (the same term →
+        // monitor map the native `erlang:monitor/2` fills).
+        self.runtime.references.insert(ref_term, Some(reference));
+        terms::make_tuple(self, &[child_term, ref_term])
+    }
+
     /// Applies the parsed options to the freshly spawned `child` and answers what
     /// `spawn_opt` returns: the bare pid, or `{Pid, Ref}` when `monitor` was asked for.
     ///
     /// Only the caller-visible bookkeeping is left here. The **heap options** and the
     /// **priority** are not applied after the fact: they are the policy (and the priority)
     /// the child was created with, so the process table never holds a half-configured
-    /// process a BIF or the scheduler could already observe.
+    /// process a BIF or the scheduler could already observe. The `monitor` option shares
+    /// [`Self::attach_monitor`] with `spawn_monitor/1,3`, so the `{Pid, Ref}` shape and its
+    /// record keeping cannot drift between the two.
     fn apply_spawn_options(&mut self, child_term: Eterm, options: &SpawnOptions) -> Result<Eterm> {
         let child = ProcessId::from_eterm(child_term)?;
         let parent = self.pid();
@@ -493,19 +614,7 @@ impl RuntimeContext<'_> {
             self.process_table_mut().link(parent, child)?;
         }
         if options.monitor {
-            let reference = self
-                .process_table_mut()
-                .monitor(parent, child, MonitorKind::Process)?;
-            let ref_term = {
-                let mut heap = self.runtime.take_bif_heap()?;
-                let term = reference.to_eterm(&mut heap);
-                self.runtime.put_bif_heap(heap);
-                term?
-            };
-            // Recorded so `erlang:demonitor/1` recognises the reference (the same term →
-            // monitor map the native `erlang:monitor/2` fills).
-            self.runtime.references.insert(ref_term, Some(reference));
-            return terms::make_tuple(self, &[child_term, ref_term]);
+            return self.attach_monitor(child_term);
         }
         Ok(child_term)
     }

@@ -154,6 +154,14 @@ impl RuntimeContext<'_> {
             ("erlang", "spawn_opt", 2) => Some(self.spawn_opt_2(args)),
             ("erlang", "spawn_opt", 3) => Some(self.spawn_opt_3(args)),
             ("erlang", "spawn_opt", 4) => Some(self.spawn_opt_4(args)),
+            // `spawn_monitor/1,2,3,4` are `erlang.erl` wrappers (not `bif.tab` BIFs) over
+            // `spawn_opt(…, [monitor])`: the whole family is served here so `proc_lib`'s
+            // `spawn_mon/3` — hence `gen_server` start-up — resolves. See
+            // [`process`](crate::native::process) for the atomic monitor and the node form.
+            ("erlang", "spawn_monitor", 1) => Some(self.spawn_monitor_1(args)),
+            ("erlang", "spawn_monitor", 2) => Some(self.spawn_monitor_2(args)),
+            ("erlang", "spawn_monitor", 3) => Some(self.spawn_monitor_3(args)),
+            ("erlang", "spawn_monitor", 4) => Some(self.spawn_monitor_4(args)),
             ("erlang", "monitor", 2) => Some(self.monitor_2(args)),
             ("erlang", "monitor", 3) => Some(self.monitor_3(args)),
             ("erlang", "demonitor", 1) => Some(self.demonitor_1(args)),
