@@ -345,8 +345,14 @@ impl Machine {
             Instr::CallLast {
                 target, deallocate, ..
             } => {
-                self.pop_frame_checked(*deallocate)?;
+                // `i_call_last(CallDest, Deallocate)` is `$deallocate(D);
+                // $DISPATCH_REL(Dest)` (`emu/instrs.tab:163`): the frame is popped
+                // as part of *entering* the tail-callee. Resolve the target
+                // **first** so a bad label cannot leave a popped frame behind —
+                // the jump itself is the only step that depends on the popped
+                // frame, and by then nothing may fail.
                 let (func, pc) = resolve(labels, *target)?;
+                self.pop_frame_checked(*deallocate)?;
                 Ok(Step::Goto { func, pc })
             }
             Instr::CallOnly { target, .. } => {
@@ -382,10 +388,31 @@ impl Machine {
                 arity,
                 deallocate,
             } => {
-                self.pop_frame_checked(*deallocate)?;
+                // `call_ext_last` deallocates **after** the callee, never before.
+                // C expands it to `call_light_bif Bif Bif | deallocate_return D`
+                // (`emu/ops.tab:964`), and `call_light_bif`
+                // (`emu/bif_instrs.tab:262`) asserts `E == c_p->stop` across the
+                // call — the frame pointer is untouched while the BIF runs — so a
+                // raising callee unwinds from the *live* frame and `handle_error` →
+                // `next_catch` reports the callee's own reason (`:312`). The pop
+                // belongs to the callee's success path only:
+                //
+                // * **success** — pop the frame and follow the (now current)
+                //   caller frame's continuation, exactly like `deallocate_return D`
+                //   followed by `$RETURN()`.
+                // * **raise** — nothing is popped; the frame discipline at the
+                //   raise point is C's, so the unwinder (and a live `try`/`catch`)
+                //   sees the right frames. Popping first would both corrupt that
+                //   unwind and reject a `Deallocate` operand the compiler
+                //   legitimately left **stale**: `trim N` (`emu/instrs.tab:593`,
+                //   `E += N`) shrinks a frame, and the operand of a following
+                //   never-returning `call_ext_last` (e.g. `erlang:error/1`) is then
+                //   dead code C never applies — the shape that produced the bogus
+                //   `deallocate: frame size mismatch` reason instead of the BIF's.
                 match self.call_import(module, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
+                        self.pop_frame_checked(*deallocate)?;
                         match self.continuation()? {
                             Continuation::Halt => Ok(Step::Done),
                             Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),

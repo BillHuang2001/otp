@@ -50,6 +50,12 @@ struct SpawnOptions {
     /// `{priority, P}` — the child's scheduling priority.
     priority: Option<Priority>,
 }
+// The process/name/port query entry points (`ports_0`, `processes_0`, `group_leader_0`,
+// `whereis_1`, `register_2`, `unregister_1`) are retained as the documented reference
+// implementation; the BIFs themselves are now served through the `beam_bifs` `ProcessHook`
+// seam (`crate::context::process_bridge`), so the runtime-native floor no longer duplicates
+// them.
+#[allow(dead_code)]
 impl RuntimeContext<'_> {
     // -- erlang:make_ref/0 ----------------------------------------------------
 

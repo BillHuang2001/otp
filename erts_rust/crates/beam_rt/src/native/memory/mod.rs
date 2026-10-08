@@ -150,7 +150,7 @@ use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_gc::{HeapInfo, HeapObservable};
 use beam_process::{MonitorKind, ProcessId, ProcessState};
-use beam_term::{make_small, Eterm, NIL};
+use beam_term::{make_small, Atom, Eterm, NIL};
 
 use super::RuntimeContext;
 use crate::config::MaxHeapFlags;
@@ -158,7 +158,12 @@ use crate::config::MaxHeapFlags;
 /// The C's `pi_1_keys[]` (`erl_bif_info.c:1008-1026`), in order — the item set *and* order
 /// `erlang:process_info/1` answers. `registered_name` is skipped when the process is
 /// unregistered (the C's `nil` skip), which is why the oracle emits 16 items.
-const PI_1_KEYS: &[&str] = &[
+///
+/// `pub(crate)` (inside a `pub(crate)` module) so the [`ProcessBridge`]'s unit tests can
+/// intern the very same vocabulary into the shared table instead of duplicating the list.
+///
+/// [`ProcessBridge`]: crate::context::process_bridge::ProcessBridge
+pub(crate) const PI_1_KEYS: &[&str] = &[
     "registered_name",
     "current_function",
     "initial_call",
@@ -321,6 +326,11 @@ fn bool_atom(value: bool) -> &'static str {
     }
 }
 
+// The argument-taking entry points (`process_info_1`/`process_info_2`) are retained as the
+// shared, documented implementation of the item vocabulary: `erlang:process_info/1,2` are
+// served through the `beam_bifs` `ProcessHook` seam (see `crate::context::process_bridge`),
+// which calls the `*_pid` helpers below — the ones this impl block exposes to it.
+#[allow(dead_code)]
 impl RuntimeContext<'_> {
     /// `erlang:process_info(Pid)`.
     ///
@@ -723,6 +733,69 @@ impl RuntimeContext<'_> {
             }
         }
         Err(BeamError::BadArg)
+    }
+    /// Whether `name` is an item this runtime reports at all — the `valid` half of the
+    /// oracle's `pi_arg2ix` split (`IMPLEMENTED_ITEMS` ∪ `UNSUPPORTED_ITEMS`).
+    ///
+    /// The `ProcessHook` `process_info/2` bridge validates the item through this **before**
+    /// it inspects the process, exactly as the C does, so an unknown item is `badarg` even
+    /// for a dead pid.
+    pub(crate) fn is_known_process_info_item(&self, name: &str) -> bool {
+        IMPLEMENTED_ITEMS.contains(&name) || UNSUPPORTED_ITEMS.contains(&name)
+    }
+
+    /// The typed capability gap for a valid item this runtime cannot answer.
+    pub(crate) fn unsupported_process_info_item(&self, name: &str) -> BeamError {
+        self.unsupported_item(&Item::Atom(name.to_string()))
+    }
+
+    /// The item **names** `erlang:process_info/1` reports for `pid`, in [`PI_1_KEYS`] order,
+    /// or `None` when `pid` names no live process (the oracle's `undefined`).
+    ///
+    /// This is the same walk [`Self::process_info_1`] performs: an unregistered
+    /// `registered_name` is skipped (the C's `nil` skip) and an execution-position item this
+    /// runtime holds no position for is omitted, so the hook can never be handed an item it
+    /// could not then resolve.
+    pub(crate) fn process_info_keys_pid(&mut self, pid: ProcessId) -> Result<Option<Vec<Atom>>> {
+        let Some(snapshot) = self.snapshot(pid) else {
+            return Ok(None);
+        };
+        let mut keys = Vec::with_capacity(PI_1_KEYS.len());
+        for name in PI_1_KEYS {
+            if *name == "registered_name" && snapshot.registered_name.is_none() {
+                continue;
+            }
+            if POSITION_ITEMS.contains(name) && self.position_value(name, pid)?.is_none() {
+                continue;
+            }
+            let atom = self
+                .runtime
+                .code_server
+                .atoms()
+                .lookup(name)
+                .ok_or(BeamError::TermNotFound)?;
+            keys.push(atom);
+        }
+        Ok(Some(keys))
+    }
+
+    /// The value of one known `erlang:process_info/2` item for `pid`, or `None` when the
+    /// item is one this runtime cannot answer (a typed capability gap — the caller raises).
+    ///
+    /// `name` must already have passed [`Self::is_known_process_info_item`], and `pid` must
+    /// be live.
+    pub(crate) fn process_info_item_value(
+        &mut self,
+        pid: ProcessId,
+        name: &str,
+    ) -> Result<Option<Eterm>> {
+        let Some(snapshot) = self.snapshot(pid) else {
+            return Ok(None);
+        };
+        if name == "registered_name" {
+            return self.registered_name_value(&snapshot).map(Some);
+        }
+        self.raw_value(&Item::Atom(name.to_string()), &snapshot)
     }
 }
 

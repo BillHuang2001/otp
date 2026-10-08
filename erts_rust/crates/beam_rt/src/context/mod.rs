@@ -56,6 +56,9 @@
 
 mod bridges;
 mod fun_identity;
+mod module_info;
+mod persistent_term;
+mod process_bridge;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -81,11 +84,15 @@ use crate::runner::RunnerState;
 use crate::runtime::Runtime;
 
 pub(crate) use self::bridges::{module_md5, PendingInterner};
+pub(crate) use self::persistent_term::PersistentTermStore;
 use self::bridges::{
     descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge,
     SharedSink,
 };
 use self::fun_identity::FunIdentityBridge;
+use self::module_info::ModuleInfoBridge;
+use self::persistent_term::PersistentTermBridge;
+use self::process_bridge::ProcessBridge;
 
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
 /// output sink that run writes to.
@@ -550,6 +557,10 @@ impl<'a> RuntimeContext<'a> {
         // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
         // cannot co-exist (see the method docs).
         let uses_dict = Self::uses_dict(module, function, arity);
+        // Whether this is one of the eleven process/name/global-state BIFs, which need the
+        // process-table/port-registry bridge (a `&mut ProcessTable` borrow, like the dict
+        // arm — see [`ProcessBridge`]).
+        let uses_process_hook = Self::uses_process_hook(module, function, arity);
         // Whether this is `erlang:load_nif/2`, which needs the NIF-loading bridge (also a
         // `&mut Runtime` borrow, and therefore a third mutually exclusive arm).
         let uses_nif_loader = Self::uses_nif_loader(module, function, arity);
@@ -560,6 +571,12 @@ impl<'a> RuntimeContext<'a> {
         // bridge (a fifth arm: it borrows the whole `Runtime` like the fun-caller bridge, and
         // the two cannot co-exist — see [`SendBridge`]).
         let uses_send_hook = Self::uses_send_hook(module, function, arity);
+        // Whether this is `erlang:get_module_info/1,2`, which needs the module-info bridge
+        // (a `&CodeServer` borrow, and therefore its own mutually exclusive arm).
+        let uses_module_info = Self::uses_module_info(module, function, arity);
+        // Whether this is one of the seven `persistent_term:*` BIFs, which need the
+        // node-global store bridge (a cheap `Rc` clone: no runtime borrow at all).
+        let uses_persistent_term = Self::uses_persistent_term(module, function, arity);
         // The local-node identity: `nonode@nohost` with creation 0 (the M1 runtime has no
         // distribution), read from the shared table *before* it is borrowed by the context.
         // Both fields are `Copy`, so this hook needs no runtime borrow at all and every arm
@@ -613,7 +630,7 @@ impl<'a> RuntimeContext<'a> {
             // shared `Rc` port registry and a clone of the shared atom-table handle, so
             // `erlang:open_port/2` really starts an OS process and `erlang:port_info/1,2`
             // answers from the runtime's own port table (see `crate::port`).
-            let mut ports = RuntimePorts::new(ports_handle, Rc::clone(&atoms), self_pid);
+            let mut ports = RuntimePorts::new(Rc::clone(&ports_handle), Rc::clone(&atoms), self_pid);
             if uses_dict {
                 // The running process's directory: resolve the table the same way the
                 // mailbox/`self` seam does — the caller-supplied table (a scheduler pass)
@@ -631,6 +648,32 @@ impl<'a> RuntimeContext<'a> {
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
                     .with_dict_hook(&mut dict)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
+            } else if uses_process_hook {
+                // The eleven process/name/global-state BIFs: the bridge borrows the process
+                // table (the caller-supplied pass table when there is one, else the
+                // runtime's own) *and* the runtime (for the `process_info` arena), exactly
+                // like the dict arm, so it is its own mutually exclusive arm. None of them
+                // applies a fun argument or touches the dictionary.
+                let mut bridge = ProcessBridge::new(
+                    runtime,
+                    mailbox_table.as_deref_mut(),
+                    Rc::clone(&ports_handle),
+                    *engines,
+                    self_pid,
+                );
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_process_hook(&mut bridge)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
                     .with_local_fun_identity(&mut fun_identity);
@@ -716,6 +759,49 @@ impl<'a> RuntimeContext<'a> {
                     context = context.with_tables(tables);
                 }
                 registry.call(module, function, arity, &mut context, args)
+            } else if uses_module_info {
+                // `erlang:get_module_info/1,2`: answers from the loaded module's IR — a
+                // `&CodeServer` borrow, its own mutually exclusive arm. It applies no fun
+                // argument.
+                let mut source = ModuleInfoBridge {
+                    code_server: &runtime.code_server,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_module_info(&mut source)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
+            } else if uses_persistent_term {
+                // The seven `persistent_term:*` BIFs: a cheap `Rc` clone of the
+                // node-global store, plus a clone of the shared atom-table handle so the
+                // store can compare keys/values **structurally** (`beam_term::eq`) — two
+                // structurally equal boxed terms are distinct heap words. No runtime
+                // borrow is held (it can coexist with everything).
+                let mut store = PersistentTermBridge::new(
+                    Rc::clone(&runtime.persistent_terms),
+                    Rc::clone(&atoms),
+                );
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_persistent_term(&mut store)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
             } else {
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
                 // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
@@ -768,6 +854,28 @@ impl<'a> RuntimeContext<'a> {
                 | ("erlang", "erase", 1)
                 | ("erlang", "get_keys", 0)
                 | ("erlang", "get_keys", 1)
+                | ("erlang", "get", 0)
+                | ("erlang", "erase", 0)
+        )
+    }
+
+    /// Whether `(module, function, arity)` is one of the eleven process/name/global-state
+    /// BIFs that run against the [`ProcessBridge`] (the process-table and port-registry
+    /// seam), so the runtime-native floor no longer serves them and no BIF is duplicated.
+    fn uses_process_hook(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("erlang", "whereis", 1)
+                | ("erlang", "register", 2)
+                | ("erlang", "unregister", 1)
+                | ("erlang", "registered", 0)
+                | ("erlang", "is_process_alive", 1)
+                | ("erlang", "processes", 0)
+                | ("erlang", "ports", 0)
+                | ("erlang", "process_info", 1)
+                | ("erlang", "process_info", 2)
+                | ("erlang", "process_flag", 2)
+                | ("erlang", "group_leader", 0)
         )
     }
 
@@ -826,6 +934,37 @@ impl<'a> RuntimeContext<'a> {
         matches!((module, function, arity), ("erlang", "send", 2) | ("erlang", "!", 2))
     }
 
+    /// Whether `(module, function, arity)` is `erlang:get_module_info/1,2`, which must run
+    /// against the [`ModuleInfoBridge`] (the loaded-module-information seam).
+    ///
+    /// The bridge borrows the code server's module map (`&Runtime`), so it cannot co-exist
+    /// with [`FunBridge`]'s `&mut Runtime` or [`SendBridge`]'s `&mut Runtime` borrow —
+    /// [`Self::call_registered`] installs exactly one of them. `get_module_info/1,2` takes
+    /// no fun argument and touches no dictionary, so nothing is lost.
+    fn uses_module_info(module: &str, function: &str, arity: u32) -> bool {
+        matches!((module, function, arity), ("erlang", "get_module_info", 1) | ("erlang", "get_module_info", 2))
+    }
+
+    /// Whether `(module, function, arity)` is one of the seven `persistent_term:*` BIFs,
+    /// which must run against the [`PersistentTermBridge`] (the node-global store seam).
+    ///
+    /// The bridge holds a cheap clone of the runtime's shared store (`Rc<RefCell<…>>`), so
+    /// it borrows **no** part of the runtime and can coexist with every other arm; it is an
+    /// own `else if` arm only for symmetry and clarity. None of the seven takes a fun
+    /// argument or a dictionary, so nothing is lost.
+    fn uses_persistent_term(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("persistent_term", "get", 0)
+                | ("persistent_term", "get", 1)
+                | ("persistent_term", "get", 2)
+                | ("persistent_term", "put", 2)
+                | ("persistent_term", "put_new", 2)
+                | ("persistent_term", "erase", 1)
+                | ("persistent_term", "info", 0)
+        )
+    }
+
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
     ///
     /// A perfect no-op on a miss (`Ok(None)`), so it is safe to try before *every* BIF: only a
@@ -842,8 +981,10 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// A NIF that records a pending exception (`enif_raise_exception`, `enif_make_badarg`)
     /// raises that reason as a live reason term ([`crate::error::nif_raised`]) — never swallowed
-    /// and never replaced by a placeholder. An unexported `{name, arity}` (impossible here, the
-    /// lookup already confirmed it) is the bare [`crate::error::undef`].
+    /// and never replaced by a placeholder. A NIF that hands back a **non-term** (the ABI's
+    /// `THE_NON_VALUE`, a bare header word) is that broken NIF's diagnostic, never a crash and
+    /// never a fabricated value. An unexported `{name, arity}` (impossible here, the lookup
+    /// already confirmed it) is the bare [`crate::error::undef`].
     fn try_call_nif(
         &mut self,
         module: &str,
@@ -870,7 +1011,14 @@ impl<'a> RuntimeContext<'a> {
         self.runtime.put_bif_heap(host.into_heap());
         interner.commit(self.runtime.code_server.atoms_mut());
         match outcome {
-            Ok(term) => Ok(Some(term)),
+            // A NIF must hand back a **term** (or record an exception, which `NifLibrary::call`
+            // turns into `Raised`). The ABI's `THE_NON_VALUE` (a bare header word) is not one: the
+            // boxed-term predicates accept its primary tag, so letting it reach the engine would
+            // dereference a null boxed pointer and abort. Report the broken NIF instead — a NIF
+            // returning `enif_make_copy`'s "no value" word (or any other non-term) never crashes
+            // the runtime and never becomes a fabricated value.
+            Ok(term) if crate::nif::is_nif_value(term) => Ok(Some(term)),
+            Ok(_) => Err(error::message("NIF returned a non-value term")),
             Err(NifCallError::Raised(reason)) => Err(error::nif_raised(reason)),
             // Defensive: `lookup` above already confirmed the export, so this cannot happen —
             // but a library raced out from under us would be `undef`, never a fabricated value.

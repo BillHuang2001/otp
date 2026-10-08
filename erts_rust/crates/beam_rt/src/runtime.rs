@@ -46,7 +46,7 @@ use crate::boot::bootscript::{self, BootScript};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
-use crate::context::RuntimeContext;
+use crate::context::{PersistentTermStore, RuntimeContext};
 use crate::dist::{resolve_cookie, DistNode};
 use crate::error;
 use crate::eval::FunBody;
@@ -166,6 +166,19 @@ pub struct Runtime {
     /// registry is `!Send` (it owns `dlopen` handles), which is fine — the runtime is
     /// single-threaded (see [`crate::nif`]).
     pub(crate) nifs: Rc<RefCell<NifRegistry>>,
+    /// The node-global **persistent-term** store behind the seven `persistent_term:*`
+    /// BIFs.
+    ///
+    /// Shared through an [`Rc`]`<`[`RefCell`]`>` for the same reason as
+    /// [`Runtime::tables`]/[`Runtime::ports`]/[`Runtime::nifs`]: the BIF call holds the
+    /// store for the duration of its call without borrowing the runtime, so its arm in
+    /// [`RuntimeContext::call_registered`](crate::context::RuntimeContext::call_registered)
+    /// can coexist with every other bridge. A **nested** borrow (a persistent-term
+    /// operation re-entered from inside one) is reported as a typed capability gap rather
+    /// than panicking. The store keeps raw `Eterm` words, which is safe because Milestone-1
+    /// has no GC and every heap is pointer-stable (see
+    /// [`PersistentTermStore`](crate::context::PersistentTermStore)).
+    pub(crate) persistent_terms: Rc<RefCell<PersistentTermStore>>,
     /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
     /// Whether [`Runtime::boot`] has run.
@@ -305,6 +318,7 @@ impl Runtime {
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ports: Rc::new(RefCell::new(PortRegistry::new()?)),
             nifs: Rc::new(RefCell::new(NifRegistry::new())),
+            persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
             booted: false,
             halt: None,

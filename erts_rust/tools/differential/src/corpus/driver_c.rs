@@ -50,21 +50,21 @@
 //! * selector `8`, **`driver_c/driver_lock_driver_answers_the_ports_driver`** — a fixture whose
 //!   `output` callback answers `driver_lock_driver(port)` as one byte (`'1'` for the C's `0`).
 //!   The oracle answers `0` (the port's driver has a `dlopen` handle) and the port opens; the
-//!   Rust runtime's `lock_driver` hook is not implemented, so it answers the trait default `-1`
-//!   and the module raises `unsupported_driver_lock_driver` ⇒ exit `3` — an honest
-//!   **capability gap**, never a mismatch.
+//!   Rust runtime implements the `lock_driver` hook and answers `0` too, so both report `'1'` —
+//!   the case **agrees**.
 //! * selector `9`, **`driver_c/add_then_remove_driver_entry_reports_removed`** — a fixture whose
 //!   `output` callback runs `add_driver_entry(&e)` then `remove_driver_entry(&e)` and answers the
 //!   removal's value as one byte (`'1'` for the C's `1`). The oracle answers `1` (the entry is
-//!   not a dynamic driver, so it may be removed) and the port opens; the Rust entry-list slots
-//!   reach no published host from a `beam_rt` callback, so `remove` answers `0` and the module
-//!   raises `unsupported_add_remove_driver_entry` ⇒ exit `3`.
+//!   not a dynamic driver, so it may be removed) and the port opens; the Rust runtime implements
+//!   the entry-list hooks and answers the same, so the case **agrees**.
 //!
 //! Selectors `8` and `9` carry the answer over the **proven `driver_output` channel** rather
 //! than refusing the port: a driver that refuses its port is an *uncatchable* runtime error on
 //! the Rust side (the CLI exits `1`), so a refused port could only ever be a mismatch. The byte
-//! channel is observable on both runtimes (it is what selector `6` pins) and stays correct if
-//! the runtime later implements the hooks — the answer becomes `'1'` and the case `agree`s.
+//! channel is observable on both runtimes (it is what selector `6` pins); a runtime that did not
+//! implement the hooks would answer something other than `'1'`, so the module would raise the
+//! documented `unsupported_*` gap (exit `3`, never a mismatch) and a runtime that does answers
+//! `'1'` and the case `agree`s.
 //!
 //! (The family's `driver_create_port` observable has no case for the blocking reason above.)
 //!

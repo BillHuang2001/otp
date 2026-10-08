@@ -55,7 +55,7 @@ mod application;
 mod code;
 mod erts_internal;
 mod init;
-mod memory;
+pub(crate) mod memory;
 mod port;
 mod prim;
 mod process;
@@ -96,6 +96,10 @@ impl RuntimeContext<'_> {
             ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
             ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
+            // `process_info/1,2` stay on the floor: they answer from *this* runtime's
+            // process tables through the shared `crate::native::memory` implementation
+            // (which the `ProcessHook` bridge also calls), and they serve the
+            // `{dictionary, Key}` item form the `beam_bifs` seam cannot express.
             ("erlang", "process_info", 2) => Some(self.process_info_2(args)),
             ("erlang", "process_info", 1) => Some(self.process_info_1(args)),
             ("init", "get_argument", 1) => Some(self.get_argument(args)),
@@ -146,13 +150,7 @@ impl RuntimeContext<'_> {
             ("erlang", "monitor", 2) => Some(self.monitor_2(args)),
             ("erlang", "demonitor", 1) => Some(self.demonitor_1(args)),
             ("erlang", "demonitor", 2) => Some(self.demonitor_2(args)),
-            ("erlang", "ports", 0) => Some(self.ports_0()),
-            ("erlang", "processes", 0) => Some(self.processes_0()),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
-            ("erlang", "group_leader", 0) => Some(self.group_leader_0()),
-            ("erlang", "whereis", 1) => Some(self.whereis_1(args)),
-            ("erlang", "register", 2) => Some(self.register_2(args)),
-            ("erlang", "unregister", 1) => Some(self.unregister_1(args)),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
             // The `erts_internal` internal-BIF floor (contract A.7). One arm; the
             // per-function dispatch lives in [`erts_internal`], which answers `None`
