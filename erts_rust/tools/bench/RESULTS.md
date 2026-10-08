@@ -136,6 +136,12 @@ are now independent.
 A genuine probe failure (anything other than the `undef`/`unsupported` capability-gap signals) is
 still surfaced verbatim, and no probe failure aborts the workload.
 
+**Caveat — read this loop as the native floor, not interpreter throughput.** It is dominated by the
+natively-served `lists:seq/2` + `lists:sum/1` (a hand probe on the same runtime: `lists:seq(1,N)`
+costs ~10 µs/element, versus ~80–190 µs for an *interpreted* `-`-per-iteration loop). So a rust
+`compute_ops_per_sec` near the sys one says the native list floor is fast; it is not a measure of
+interpreter dispatch or the per-BIF overhead that `foreign` (§3.4) exposes.
+
 ### 3.3 `slice` — the same nine compiled programs under both runtimes (n = 25/case)
 
 Every case printed the **same** stdout under both runtimes (report note:
