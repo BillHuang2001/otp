@@ -4,7 +4,9 @@
 //! The representation is deliberately flat and arena-backed: nodes live in a slot
 //! table addressed by [`NodeId`], so a rebalance never relocates a node and the
 //! left-to-right leaf chain can be plain [`NodeId`] links. Term order is never
-//! re-implemented here — node search delegates to `beam_term::compare::cmp`.
+//! re-implemented here — node search delegates to `beam_term::compare::cmp_arith`
+//! (the **arithmetic key order** ERTS `ordered_set` uses, where `1` and `1.0` are
+//! the same key).
 //!
 //! Every accessor that could fail only fails on an *internal* invariant (a
 //! `NodeId` or an index the tree itself derived): those carry a documented
@@ -44,8 +46,9 @@ pub(crate) struct Entry {
     pub(crate) obj: Eterm,
 }
 
-/// A leaf: entries sorted by `beam_term::compare::cmp` plus the left-to-right
-/// leaf link that makes ordered iteration a pointer walk.
+/// A leaf: entries sorted by `beam_term::compare::cmp_arith` (arithmetic key
+/// order) plus the left-to-right leaf link that makes ordered iteration a pointer
+/// walk.
 pub(crate) struct LeafNode {
     /// The sorted entries (`1..=ORDER` of them).
     pub(crate) entries: Vec<Entry>,
@@ -55,7 +58,8 @@ pub(crate) struct LeafNode {
 
 /// A branch: `keys[i]` is the exact greatest key of `children[i]`'s subtree.
 pub(crate) struct BranchNode {
-    /// The separators, strictly ascending.
+    /// The separators, strictly ascending in arithmetic key order
+    /// (`beam_term::compare::cmp_arith`).
     pub(crate) keys: Vec<Eterm>,
     /// The children (`keys.len() == children.len()`, `1..=ORDER` of them).
     pub(crate) children: Vec<NodeId>,
@@ -346,25 +350,25 @@ impl NodeStore {
     }
 }
 
-/// The position of `key` among the sorted `entries`: `(pos, true)` on an exact
-/// (`cmp`-equal) hit, `(pos, false)` with the ascending insertion point on a
-/// miss. Ordering is `beam_term::compare::cmp` (the one authority on Erlang term
-/// order), so `1` and `1.0` remain distinct keys.
+/// The position of `key` among the sorted `entries`: `(pos, true)` on a hit,
+/// `(pos, false)` with the ascending insertion point on a miss. Ordering is the
+/// **arithmetic** key order (`beam_term::compare::cmp_arith`, the one authority on
+/// the order ERTS `ordered_set` uses), so `1` and `1.0` are the *same* key.
 pub(crate) fn search_entries(entries: &[Entry], key: Eterm, atoms: &AtomTable) -> (usize, bool) {
-    match entries.binary_search_by(|entry| cmp(entry.key, key, atoms)) {
+    match entries.binary_search_by(|entry| cmp_arith(entry.key, key, atoms)) {
         Ok(pos) => (pos, true),
         Err(pos) => (pos, false),
     }
 }
 
 /// The child of `branch` to descend into for `key`: its first child whose subtree
-/// maximum is `>= key` (every later child holds strictly greater keys), or its
-/// last child when `key` exceeds all separators.
+/// maximum is `>= key` in **arithmetic** key order (every later child holds
+/// strictly greater keys), or its last child when `key` exceeds all separators.
 ///
 /// Infallible: a branch always has at least one child.
 pub(crate) fn child_index(branch: &BranchNode, key: Eterm, atoms: &AtomTable) -> usize {
     for idx in 0..branch.keys.len() {
-        if cmp(branch.separator(idx), key, atoms) != Ordering::Less {
+        if cmp_arith(branch.separator(idx), key, atoms) != Ordering::Less {
             return idx;
         }
     }

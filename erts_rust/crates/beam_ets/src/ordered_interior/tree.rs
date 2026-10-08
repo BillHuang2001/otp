@@ -15,7 +15,7 @@
 //! # Invariants (asserted by [`Tree::check_invariants`] in the test suite)
 //!
 //! 1. `keys.len() == children.len()` on a branch, and both arrays are strictly
-//!    ascending in `beam_term::compare::cmp` order.
+//!    ascending in arithmetic key order (`beam_term::compare::cmp_arith`).
 //! 2. `separator[i] == max(children[i])` for every child.
 //! 3. Every node except the root holds at least [`MIN_OCCUPANCY`]
 //!    entries/children; the root leaf may be empty (that is the empty tree) and a
@@ -33,8 +33,10 @@
 //! `ORDER`), so every node stays within `[MIN_OCCUPANCY, ORDER]` and the height
 //! only changes at the root.
 //!
-//! Term order is never re-implemented: every comparison goes through
-//! `beam_term::compare::cmp`/`eq`, so `1` and `1.0` remain distinct keys.
+//! Term order is never re-implemented: every **key** comparison goes through the
+//! arithmetic key order `beam_term::compare::cmp_arith`, so `1` and `1.0` are the
+//! *same* key; the whole-object identity check [`Tree::delete_object`] is the sole
+//! exception and keeps the exact `beam_term::compare::eq`.
 
 use beam_term::prelude::*;
 
@@ -652,7 +654,7 @@ impl Tree {
             for entry in &self.store.leaf(id).entries {
                 if let Some(prev) = previous {
                     assert_eq!(
-                        cmp(prev, entry.key, atoms),
+                        cmp_arith(prev, entry.key, atoms),
                         core::cmp::Ordering::Less,
                         "the leaf chain ascends"
                     );
@@ -687,7 +689,7 @@ impl Tree {
                 }
                 for pair in leaf.entries.windows(2) {
                     assert_eq!(
-                        cmp(pair[0].key, pair[1].key, atoms),
+                        cmp_arith(pair[0].key, pair[1].key, atoms),
                         core::cmp::Ordering::Less,
                         "leaf entries ascend strictly"
                     );
@@ -724,13 +726,13 @@ impl Tree {
                         self.check_subtree(child, false, seen, leaves, atoms);
                     let max = max.expect("a reachable subtree has a maximum");
                     assert_eq!(
-                        cmp(branch.separator(idx), max, atoms),
+                        cmp_arith(branch.separator(idx), max, atoms),
                         core::cmp::Ordering::Equal,
                         "separator {idx} is exactly its child's (subtree) maximum"
                     );
                     if let Some(previous) = subtree_max {
                         assert_eq!(
-                            cmp(previous, max, atoms),
+                            cmp_arith(previous, max, atoms),
                             core::cmp::Ordering::Less,
                             "child subtrees ascend strictly"
                         );

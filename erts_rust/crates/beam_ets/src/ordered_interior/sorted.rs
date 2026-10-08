@@ -8,17 +8,19 @@
 //!
 //! The representation is deliberately the simplest correct one: one
 //! `(key, object)` entry per key, kept in a plain `Vec` sorted by
-//! `beam_term::compare::cmp`. Membership/order/iteration are therefore:
+//! `beam_term::compare::cmp_arith` (the arithmetic key order `ordered_set` uses).
+//! Membership/order/iteration are therefore:
 //!
-//! * **lookup** — a `binary_search_by(cmp)` walk, `O(log n)`;
+//! * **lookup** — a `binary_search_by(cmp_arith)` walk, `O(log n)`;
 //! * **insert** / **delete** — the binary search plus a `Vec::insert`/`Vec::remove`
 //!   shift of the tail, `O(n)`;
 //! * **ordered iteration** — a straight slice walk in ascending key order,
 //!   `O(n)`.
 //!
-//! Term order is never re-implemented: every comparison goes through
-//! `beam_term::compare::cmp`/`eq`, so `1` and `1.0` remain distinct keys exactly
-//! as in the B+-tree.
+//! Term order is never re-implemented: every **key** comparison goes through
+//! `beam_term::compare::cmp_arith`, so `1` and `1.0` are the *same* key exactly as
+//! in the B+-tree; the whole-object identity check ([`Self::delete_object`]) is the
+//! sole exception and keeps the exact `beam_term::compare::eq`.
 //!
 //! Public for testing and reuse, but **not** the cross-crate seam: dependents go
 //! through [`crate::Table`].
@@ -34,10 +36,12 @@ use crate::table::Interior;
 /// The sorted-`Vec`-backed interior for `ordered_set`.
 ///
 /// One object per key: an insert on an equal key replaces the object,
-/// `insert_new` refuses an existing key, and every read/iteration is in `cmp`
-/// order — the same observable rules as the B+-tree, only a different shape.
+/// `insert_new` refuses an existing key, and every read/iteration is in arithmetic
+/// key order (`cmp_arith`) — the same observable rules as the B+-tree, only a
+/// different shape.
 pub struct SortedOrderedInterior {
-    /// The entries, kept sorted by `beam_term::compare::cmp` (one object per key).
+    /// The entries, kept sorted by `beam_term::compare::cmp_arith` (one object per
+    /// key).
     entries: Vec<Entry>,
 }
 
@@ -67,9 +71,9 @@ impl SortedOrderedInterior {
         self.entries.capacity() * words_of::<Entry>()
     }
 
-    /// The position of `key` among the sorted entries: `(pos, true)` on an exact
-    /// (`cmp`-equal) hit, `(pos, false)` with the ascending insertion point on a
-    /// miss. Delegates to the same search the B+-tree leaves use.
+    /// The position of `key` among the sorted entries: `(pos, true)` on a hit,
+    /// `(pos, false)` with the ascending insertion point on a miss. Delegates to the
+    /// same search the B+-tree leaves use (arithmetic key order, `cmp_arith`).
     fn position(&self, key: Eterm, atoms: &AtomTable) -> (usize, bool) {
         search_entries(&self.entries, key, atoms)
     }
@@ -239,7 +243,7 @@ impl Interior for SortedOrderedInterior {
     }
 
     fn keys(&self) -> Vec<Eterm> {
-        // Ascending `cmp` order is the vector order itself.
+        // Ascending arithmetic key order is the vector order itself.
         self.entries.iter().map(|entry| entry.key).collect()
     }
 
@@ -330,11 +334,11 @@ mod tests {
         assert!(t.delete_object(make_small(3), o3, &atoms));
         assert_eq!(t.len(), 18);
 
-        // The remaining objects stay in ascending `cmp` order.
+        // The remaining objects stay in ascending arithmetic key order.
         let keys: Vec<Eterm> = Interior::keys(&t);
         assert!(!keys.is_empty());
         for pair in keys.windows(2) {
-            assert_eq!(cmp(pair[0], pair[1], &atoms), core::cmp::Ordering::Less);
+            assert_eq!(cmp_arith(pair[0], pair[1], &atoms), core::cmp::Ordering::Less);
         }
     }
 

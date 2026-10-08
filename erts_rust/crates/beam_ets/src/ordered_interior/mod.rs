@@ -1,10 +1,12 @@
 //! Ordered interior for `ordered_set`: a K-ary B+-tree.
 //!
 //! `ordered_set` is the one ETS kind whose observable behaviour depends on *term
-//! order*: `lookup`/`member`/`delete` must find a key by `=:=` order and
-//! `tab2list`/iteration must run in ascending term order. Both are exactly
-//! `beam_term::compare::cmp`/`eq` (the single authority on Erlang term order —
-//! never re-implemented here), so `1` and `1.0` are distinct keys.
+//! order*: `lookup`/`member`/`delete` must find a key by **arithmetic** key order
+//! and `tab2list`/iteration must run in ascending arithmetic key order. Both are
+//! exactly `beam_term::compare::cmp_arith` (the single authority on the order ERTS
+//! `ordered_set` uses — never re-implemented here), so `1` and `1.0` are the *same*
+//! key. The one exception is `delete_object/2`, which compares the whole *object*
+//! exactly with `beam_term::compare::eq`.
 //!
 //! The index is a real B+-tree of order 32 rather than a sorted `Vec`, so exact
 //! lookup, insertion and deletion are `O(log n)` instead of `O(n)`:
@@ -50,7 +52,8 @@ pub use self::sorted::SortedOrderedInterior;
 /// The B+-tree-backed interior used by `ordered_set`.
 ///
 /// One object per key: an insert on an equal key replaces the object, `insert_new`
-/// refuses an existing key, and every read/iteration is in `cmp` order.
+/// refuses an existing key, and every read/iteration is in arithmetic key order
+/// (`cmp_arith`, so `1` and `1.0` are the same key).
 pub struct OrderedSetInterior {
     /// The index itself; membership, ordering and iteration all live there.
     tree: Tree,
@@ -172,8 +175,8 @@ impl Interior for OrderedSetInterior {
     }
 
     fn keys(&self) -> Vec<Eterm> {
-        // Ascending `cmp` order: the leaf chain of the B+-tree *is* the sorted key
-        // run, so this is the interior's own iteration order.
+        // Ascending arithmetic key order: the leaf chain of the B+-tree *is* the
+        // sorted key run, so this is the interior's own iteration order.
         self.tree.iter().map(|entry| entry.key).collect()
     }
 
@@ -236,14 +239,14 @@ mod tests {
     }
 
     /// Every stored key, asserting on the way that the iteration order really is
-    /// ascending `cmp` order.
+    /// ascending arithmetic key order (`cmp_arith`).
     fn ordered_keys(t: &OrderedSetInterior, atoms: &AtomTable) -> Vec<Eterm> {
         let keys: Vec<Eterm> = t.tree.iter().map(|entry| entry.key).collect();
         for pair in keys.windows(2) {
             assert_eq!(
-                cmp(pair[0], pair[1], atoms),
+                cmp_arith(pair[0], pair[1], atoms),
                 Ordering::Less,
-                "iteration ascends in cmp order"
+                "iteration ascends in arithmetic key order"
             );
         }
         keys
@@ -321,17 +324,17 @@ mod tests {
         assert!(!t.member(make_small(3), &atoms));
         assert_eq!(t.size(), 18);
 
-        // The remaining objects stay in ascending `cmp` order.
+        // The remaining objects stay in ascending arithmetic key order.
         let objs: Vec<Eterm> = t.iter_objects().collect();
         assert_eq!(objs.len(), 18);
         for w in objs.windows(2) {
-            assert_eq!(cmp(w[0], w[1], &atoms), Ordering::Less);
+            assert_eq!(cmp_arith(w[0], w[1], &atoms), Ordering::Less);
         }
         t.tree.check_invariants(&atoms);
     }
 
     #[test]
-    fn iterates_in_ascending_term_order_across_classes() {
+    fn iterates_in_ascending_arithmetic_key_order_across_classes() {
         let mut atoms = AtomTable::new();
         let atom = make_atom(atoms.intern("a"));
         let mut heap = Heap::new(64);
@@ -340,11 +343,13 @@ mod tests {
         let float = float_term(1.0);
         let small = make_small(5);
 
-        // Ascending term order: small int < float < atom < tuple < nil < list.
-        let ascending = [small, float, atom, tuple, NIL, list];
+        // Ascending arithmetic key order: numbers order by *value* across
+        // representations, so the float `1.0` sorts *below* the integer `5`; then
+        // atom < tuple < nil < list.
+        let ascending = [float, small, atom, tuple, NIL, list];
 
         let mut t = OrderedSetInterior::new();
-        // Insert in reverse term order; the tree sorts them.
+        // Insert in reverse key order; the tree sorts them.
         for k in ascending.iter().rev() {
             t.insert(*k, *k, &atoms).unwrap();
         }
@@ -353,44 +358,45 @@ mod tests {
         let iterated: Vec<Eterm> = t.iter_objects().collect();
         assert_eq!(iterated, ascending.to_vec());
         for w in iterated.windows(2) {
-            assert_eq!(cmp(w[0], w[1], &atoms), Ordering::Less);
+            assert_eq!(cmp_arith(w[0], w[1], &atoms), Ordering::Less);
         }
 
         // The navigation agrees with the order.
-        assert_eq!(t.first(&atoms), Some(small));
+        assert_eq!(t.first(&atoms), Some(float));
         assert_eq!(t.last(&atoms), Some(list));
-        assert_eq!(t.next(small, &atoms), Some(float));
+        assert_eq!(t.next(float, &atoms), Some(small));
         assert_eq!(t.prev(list, &atoms), Some(NIL));
         t.tree.check_invariants(&atoms);
     }
 
     /// Drive one interior through a **mixed-class** key set and assert that both
     /// its ordered iteration and its navigation (`first`/`last`/`next`/`prev`) run
-    /// in exactly [`cmp`] order. The key classes here are numbers (integers,
-    /// including a negative and zero, plus a float), an atom, a tuple, the empty
-    /// list, a non-empty list and a binary — every class whose relative rank is
-    /// pinned by Erlang term order. This does **not** consult the live oracle
-    /// (the differential harness owns that); it pins the interior against
-    /// `beam_term::compare`, the single authority on term order.
+    /// in exactly `cmp_arith` (arithmetic key) order. The key classes here are
+    /// numbers (integers, including a negative and zero, plus a float), an atom, a
+    /// tuple, the empty list, a non-empty list and a binary — every class whose
+    /// relative rank is pinned by Erlang term order. This does **not** consult the
+    /// live oracle (the differential harness owns that); it pins the interior
+    /// against `beam_term::compare::cmp_arith`, the single authority on the
+    /// `ordered_set` key order.
     fn check_mixed_keys(interior: &mut dyn Interior, keys: &[Eterm], atoms: &AtomTable) {
-        // Insert in reverse, so a correct interior must restore `cmp` order itself.
+        // Insert in reverse, so a correct interior must restore the key order itself.
         for key in keys.iter().rev() {
             interior.insert(*key, *key, atoms).unwrap();
         }
         assert_eq!(interior.size(), keys.len());
 
-        // The expected order is *defined* as the `cmp` sort of the key set.
+        // The expected order is *defined* as the `cmp_arith` sort of the key set.
         let mut expected = keys.to_vec();
-        expected.sort_by(|a, b| cmp(*a, *b, atoms));
+        expected.sort_by(|a, b| cmp_arith(*a, *b, atoms));
         assert_eq!(expected.len(), keys.len(), "the mixed keys are distinct");
 
         // Ordered iteration (both the object walk and the key run) is ascending.
         let iterated: Vec<Eterm> = interior.iter_objects().collect();
-        assert_eq!(iterated, expected, "iter_objects is in cmp order");
-        assert_eq!(interior.keys(), expected, "keys is in cmp order");
+        assert_eq!(iterated, expected, "iter_objects is in arithmetic key order");
+        assert_eq!(interior.keys(), expected, "keys is in arithmetic key order");
         for pair in expected.windows(2) {
             assert_eq!(
-                cmp(pair[0], pair[1], atoms),
+                cmp_arith(pair[0], pair[1], atoms),
                 Ordering::Less,
                 "consecutive keys are strictly ascending"
             );
@@ -434,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_key_classes_iterate_and_navigate_in_cmp_order() {
+    fn mixed_key_classes_iterate_and_navigate_in_arithmetic_key_order() {
         use beam_term::bitstring::{heap_bits_size_words, write_binary};
 
         let mut atoms = AtomTable::new();
@@ -481,25 +487,73 @@ mod tests {
     }
 
     #[test]
-    fn one_and_one_point_zero_are_distinct_keys() {
+    fn one_and_one_point_zero_are_the_same_key() {
         let atoms = AtomTable::new();
         let mut t = OrderedSetInterior::new();
         let one = make_small(1);
         let one_float = float_term(1.0);
 
+        // `1` and `1.0` are the *same* key in the arithmetic order `ordered_set`
+        // uses, so the second insert replaces the first object and only one key is
+        // stored.
         t.insert(one, one, &atoms).unwrap();
         t.insert(one_float, one_float, &atoms).unwrap();
-        assert_eq!(t.size(), 2);
+        assert_eq!(cmp_arith(one, one_float, &atoms), Ordering::Equal);
+        assert_eq!(t.size(), 1);
         assert!(t.member(one, &atoms));
         assert!(t.member(one_float, &atoms));
-        assert_eq!(t.lookup(one, &atoms), vec![one]);
+        // Either representation reads back the surviving (last-inserted) object.
+        assert_eq!(t.lookup(one, &atoms), vec![one_float]);
         assert_eq!(t.lookup(one_float, &atoms), vec![one_float]);
+        // The stored *key* term is the one inserted first; only its object changed.
+        assert_eq!(ordered_keys(&t, &atoms), vec![one]);
+        // A single shared key has no neighbours in either representation.
+        assert_eq!(t.next(one, &atoms), None);
+        assert_eq!(t.prev(one_float, &atoms), None);
+        // `delete` through either representation removes the one shared key.
+        t.delete(one_float, &atoms).unwrap();
+        assert_eq!(t.size(), 0);
+        assert!(!t.member(one, &atoms));
+    }
 
-        // The integer sorts before the float (exact mode orders by class), and the
-        // float is the integer's successor.
-        assert_eq!(cmp(one, one_float, &atoms), Ordering::Less);
-        assert_eq!(t.next(one, &atoms), Some(one_float));
-        assert_eq!(t.prev(one_float, &atoms), Some(one));
+    #[test]
+    fn numeric_keys_collapse_and_iterate_in_value_order() {
+        let atoms = AtomTable::new();
+        let mut t = OrderedSetInterior::new();
+
+        let neg_three = make_small(-3);
+        let neg_two_five = float_term(-2.5);
+        let zero = make_small(0);
+        let one_int = make_small(1);
+        let one_f = float_term(1.0);
+        let one_five = float_term(1.5);
+        let five = make_small(5);
+
+        // Integers and floats are ordered by *value*, so the numeric keys interleave
+        // across representations; `1` and `1.0` are the same key, so the later
+        // insert's object survives under it.
+        for k in [five, neg_three, zero, one_five, neg_two_five, one_int, one_f] {
+            t.insert(k, k, &atoms).unwrap();
+        }
+        assert_eq!(t.size(), 6);
+        let iterated: Vec<Eterm> = t.iter_objects().collect();
+        assert_eq!(
+            iterated,
+            vec![neg_three, neg_two_five, zero, one_f, one_five, five],
+            "numbers iterate by value, not by representation"
+        );
+
+        // `-0.0` and `0.0` are the same key too.
+        let zero_f = float_term(0.0);
+        let neg_zero_f = float_term(-0.0);
+        let mut z = OrderedSetInterior::new();
+        z.insert(zero_f, make_small(1), &atoms).unwrap();
+        z.insert(neg_zero_f, make_small(2), &atoms).unwrap();
+        assert_eq!(z.size(), 1);
+        assert_eq!(z.lookup(zero_f, &atoms), vec![make_small(2)]);
+
+        t.tree.check_invariants(&atoms);
+        z.tree.check_invariants(&atoms);
     }
 
     #[test]
