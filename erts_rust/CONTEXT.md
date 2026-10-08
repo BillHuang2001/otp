@@ -86,7 +86,8 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   manifest. lld linker in a bare container, mold in the Nix devShell; `opt-level=1` dev, deps at
   `opt-level=2`.
 - **Read-only `$HOME` in this sandbox:** cargo's default `CARGO_HOME` (`$HOME/.cargo`) is unwritable, so
-  builds MUST set a writable one. Use the committed wrapper: `scripts/cargo.sh build --workspace`
+  builds MUST set a writable one. Use the committed wrapper:
+  `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`
   (it selects `$HOME/.cache/cargo-home`, falling back to `$TMPDIR/cargo-home`), or export
   `CARGO_HOME=/home/bill/.cache/cargo-home` before invoking `cargo`. The cache is shared across worktrees.
 - Do **not** run full external suites on every change — reserve them for milestones.
