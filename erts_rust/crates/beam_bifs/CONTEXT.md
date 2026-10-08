@@ -187,8 +187,8 @@ Every gap below is a typed `BeamError`, never a silently wrong result.
 
 ## Routing Table
 - `src/lib.rs` -> crate docs, module wiring, root re-exports, `prelude`, `#![deny(unsafe_code)]`
-- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (the 413-key roster), `default_registry`
-- `src/runtime/` (`mod.rs` + `memory.rs`/`erlang.rs`/`erts_internal.rs`/`erts_debug.rs`/`other.rs`) -> the **runtime-coupled BIF families** (`MemoryHook` behind `erlang:memory/0,1`; `RuntimeHooks` behind process control, timers, code loading, system/nodes introspection, `atomics`/`counters`, the ETS C interior, `erts_debug`/`erl_debugger`, `re`, `erl_ddll` and distribution) + the `runtime_bif!` registration macro. **Scaffolding only — no BIF is registered yet** (the roster stays 413); each family's `register` is a no-op until the follow-up tasks land
+- `src/registry.rs` -> `BifFn`, `BifRegistry`, `with_core_bifs` (the 637-key roster), `default_registry`
+- `src/runtime/` (`mod.rs` + `memory.rs`/`erlang.rs`/`erts_internal.rs`/`erts_debug.rs`/`other.rs`) -> the **runtime-coupled BIF families** (`MemoryHook` behind `erlang:memory/0,1`; `RuntimeHooks` behind process control, timers, code loading, system/nodes introspection, `atomics`/`counters`, the ETS C interior, `erts_debug`/`erl_debugger`, `re`, `erl_ddll` and distribution) + the `runtime_bif!` registration macro. The **145** seam-backed keys are registered here (per-family counts in `## The runtime-coupled BIF families`); with no hook each answers the typed `unsupported_bif`
 - `src/bif_tab.rs` -> the `bif.tab` parser (`BifTab`/`BifTabEntry`/`BifKind`/`BifTabError`, `bif_tab_path`/`read_real_bif_tab`) + the coverage `Census`; validation only, no dispatch path
 - `src/context.rs` -> `BifContext`, the fifteen seams, `NifLoadError`/`RecordDefinitionView`/`RecordFieldView`/`ProcessInfoItem`, `current_module`, the sink impls
 - `src/error.rs` -> the `pub(crate)` failure constructors, the `raise_*` builders, `raise_term`/`raise_error_term`/`structured_error`
