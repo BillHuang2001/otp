@@ -4,7 +4,7 @@
 //! each. The selection rule needs a different axis: **how does each strategy scale with the
 //! size of a long-lived mature generation?** This file answers exactly that by driving the
 //! *same* long-lived corpus at several size points — from a quarter of an Immix block up to
-//! 64 whole blocks of live data — through both strategies
+//! many whole blocks of live data — through both strategies
 //! ([`AnyCollector::Copying`] and [`AnyCollector::Immix`], selected through
 //! [`GcConfig`]/[`MatureKind`]) and reporting, per size point and per strategy, the three
 //! quantities the rule is derived from:
@@ -24,23 +24,80 @@
 //! garbage at the measured collection, so the two strategies differ only in what they do
 //! with the mature generation.
 //!
-//! Objects are **one whole 16-word line** each ([`Shape::Line`]), which is the shape the
-//! mark-region space is designed for: its line granularity wastes nothing, so its resident
-//! footprint equals the copying path's and the only difference is *how much it moves*. The
-//! same sweep is also run over [`Shape::Small`] (3-word tuples, 3 useful words per 16-word
-//! line ⇒ 5.3× line-rounding waste) — the mark-region space's worst case, and the shape that
-//! pins the rule's threshold (its benefit/cost ratio is the one that plateaus at 8 blocks).
+//! Three shapes are swept, so that the mark-region space's **line** granularity is exercised
+//! both without waste and at its worst:
 //!
-//! # Determinism, and honesty about the timing column
+//! * [`Shape::Line`] — a 16-word tuple, i.e. **exactly one 16-word line** per object: the
+//!   shape the mark-region space is designed for. Its line granularity wastes nothing, so
+//!   its resident footprint equals the copying path's and the only difference is *how much
+//!   it moves*;
+//! * [`Shape::Small`] — a 3-word tuple: 3 useful words per 16-word line (5.3× resident
+//!   overhead). The mark-region space's **worst case**, and the shape whose benefit/cost
+//!   ratio pins the rule's threshold;
+//! * [`Shape::Multi`] — a 17-word tuple: **two** lines for 17 useful words (1.9×). The
+//!   multi-line analogue of the worst case, which checks that the whole-block law below
+//!   also holds, and is strictly dominated below one block, for objects that span more than
+//!   one line.
 //!
-//! Every *assertion* is on an exact or relational count: both strategies must find the same
-//! live set (the reachable graphs are compared with the crate's own `beam_term::compare`),
-//! the copying fullsweep's copy is pinned to the corpus's exact word count, and the
-//! mark-region path must either pin the whole live set (whole blocks) or evacuate it
-//! line-rounded (sub-block live sets). Nothing is asserted about the pause times — they are
-//! printed only, as the *fastest* of [`REPS`] runs (measurement noise can only add time, so
-//! the minimum is the cleanest estimate for a deterministic corpus); absolute µs numbers are
-//! meaningless, only the copying-vs-mark-region ratio at one size point carries information.
+//! # The measured shape of the trade (printed for orientation, counts asserted)
+//!
+//! Running the sweep prints, per shape and size point, the moved words, the pinned objects,
+//! the resident footprint and the pause. The *Counts* below are exact; *pauses* are the
+//! fastest of [`REPS`] runs and carry information only as a within-point ratio:
+//!
+//! * [`Shape::Line`] (no line waste) — at `1/4` and `1/2` block the mark-region path moves
+//!   exactly as much as the copying path (64 → 64, 128 → 128 words) at a 1.0× footprint and
+//!   ≈ 2× the pause, i.e. it is *never better* below one block; from one whole block up it
+//!   moves **0** words (the whole live set is pinned) while the copying path pays the whole
+//!   live set (256 words at one block, 16 384 at 64), at a 1.0× footprint.
+//! * [`Shape::Small`] (5.3× line waste) — below one whole block it pins nothing and moves
+//!   **5.3× more** words (64 vs 12, 128 vs 24) in 5.3× the footprint, i.e. it is *strictly
+//!   dominated*; from one block up it pins the whole live set at a 0.19× footprint. Its
+//!   avoided-copy-words-per-extra-µs ratio climbs ≈55 → ≈63 at 1 → 2 blocks and ≈73 at 8
+//!   blocks, then settles at ≈80–85 out to 64 blocks — the plateau the constant's *value* is
+//!   read from.
+//! * [`Shape::Multi`] (1.9× line waste, objects spanning two lines) — the same qualitative
+//!   picture with the rounding factor of two: below one block it moves 1.9× more words
+//!   (128 vs 68) in 1.9× the footprint; from one block up it moves 0 words at a 0.53×
+//!   footprint, with the ratio ≈198 → ≈263 at 1 → 2 blocks and ≈274–292 from 8 blocks up.
+//!
+//! # What is assertion-backed, and what is not
+//!
+//! The rule has two halves, and this file treats them differently on purpose.
+//!
+//! **Assertion-backed (deterministic counts).** Every measured size point asserts the exact
+//! counts the corpus forces ([`assert_size_point`], built on the whole-block law
+//! [`Law::of`]):
+//!
+//! * the copying fullsweep re-copies the whole live set — `objects_copied == objects` and
+//!   `words_copied == objects × object words` — and pins nothing;
+//! * the mark-region fullsweep promotes nothing (the nursery holds only garbage at the
+//!   measured collection, so `words_copied == 0`) and accounts for every live object exactly
+//!   once (`objects_evacuated + objects_pinned == objects`);
+//! * a live line set of `lines` lines (contiguous from the start of the region) is pinned
+//!   exactly where it fills **whole blocks**: `objects_pinned == objects-per-block × whole
+//!   blocks covered` and `moved words == (lines % LINES_PER_BLOCK) × LINE_WORDS`;
+//! * therefore **below one whole block nothing can be pinned** — the mark-region path
+//!   evacuates the whole live set, line-rounded: never fewer words than the copying path,
+//!   and *strictly* more for any shape whose objects do not fill their last line. That is
+//!   the deterministic justification for the rule's floor of one whole block;
+//! * and **from one whole block up the live set is pinned whole** at every measured
+//!   whole-block size point (`moved words == 0`) while the copying path pays a full copy.
+//!
+//! [`assert_rule_against_the_sweep`] couples those facts to the constant's *units* (a whole
+//! number of blocks, at least one) and [`the_break_even_point_is_assertion_checked`] checks
+//! the constant at exactly its own size: at the threshold the mark-region path is inside the
+//! full-pinning regime (0 words moved against a break-even-sized copy), and one line below it
+//! it is not (its trailing partial block must be evacuated).
+//!
+//! **Timing-derived (not assertable).** The constant's *value* — 8 blocks rather than 1 —
+//! comes from the avoided-copy-work per extra µs of pause, which plateaus at 8 blocks (see
+//! `src/selection.rs`). Pause times are noisy by construction (machine, allocator, thread
+//! scheduling) and every *deterministic* axis is flat across the band `[1, 64]` blocks, so
+//! the exact block count cannot be pinned by a count. Pauses are printed only, as the
+//! *fastest* of [`REPS`] runs (measurement noise can only add time, so the minimum is the
+//! cleanest estimate for a deterministic corpus); absolute µs numbers are meaningless, only
+//! the copying-vs-mark-region ratio at one size point carries information.
 //!
 //! `unsafe` below only dereferences pointers this test allocated and wrote itself (or that a
 //! collection just wrote); every block carries a `// SAFETY:` rationale.
@@ -49,8 +106,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use beam_gc::prelude::{
-    AnyCollector, GcConfig, GcStats, HeapPolicy, ImmixStats, MatureKind, LINES_PER_BLOCK,
-    LINE_WORDS,
+    lines_for, AnyCollector, GcConfig, GcStats, HeapPolicy, ImmixStats, MatureKind, BLOCK_WORDS,
+    IMMIX_BREAK_EVEN_BLOCKS, IMMIX_BREAK_EVEN_WORDS, LINES_PER_BLOCK, LINE_WORDS,
 };
 use beam_term::compare::eq as term_eq;
 use beam_term::prelude::{make_small, AtomTable, Eterm};
@@ -59,8 +116,9 @@ use beam_term::prelude::{make_small, AtomTable, Eterm};
 /// is reported.
 const REPS: usize = 9;
 
-/// The size points, as object counts. `LINES_PER_BLOCK` (16) objects fill one whole Immix
-/// block, so the points are 1/4, 1/2, 1, 2, 8, 32 and 64 blocks.
+/// The size points, as object counts. One object occupies [`Shape::lines`] lines, so the
+/// points span `1/4 → 64` whole Immix blocks for the single-line shapes and `1/2 → 128` for
+/// the two-line one; every shape therefore has sub-block, one-block and many-block points.
 const OBJECT_POINTS: [usize; 7] = [4, 8, 16, 32, 128, 512, 1024];
 
 /// Serialises the measurements: the harness runs test functions in parallel threads, and an
@@ -79,29 +137,104 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 enum Shape {
     /// A 3-word tuple: one line for 3 useful words (5.3× resident overhead).
     Small,
+    /// A 17-word tuple: two lines for 17 useful words (1.9× resident overhead).
+    Multi,
     /// A 16-word tuple: exactly one line (no resident overhead).
     Line,
 }
 
 impl Shape {
-    /// Useful words per object (a tuple is `1 + arity`).
-    fn words(self) -> usize {
+    /// Every shape the sweep covers.
+    const ALL: [Shape; 3] = [Shape::Small, Shape::Multi, Shape::Line];
+
+    /// The tuple arity, so the object is `arity + 1` words.
+    fn arity(self) -> usize {
         match self {
-            Shape::Small => 3,
-            Shape::Line => LINE_WORDS,
+            Shape::Small => 2,
+            Shape::Multi => LINE_WORDS,
+            Shape::Line => LINE_WORDS - 1,
         }
+    }
+
+    /// The object's exact size in words (a tuple is `1 + arity`): what a word-granular copy
+    /// pays for it.
+    fn words(self) -> usize {
+        self.arity() + 1
+    }
+
+    /// The Immix lines the object occupies (`lines_for`, i.e. rounded up).
+    fn lines(self) -> usize {
+        lines_for(self.words())
+    }
+
+    /// Words wasted by line rounding — `0` exactly when the object fills its last line.
+    fn line_waste(self) -> usize {
+        self.lines() * LINE_WORDS - self.words()
     }
 }
 
-/// The heap policy both strategies share at `objects` long-lived objects: the fullsweep
-/// cadence disabled (every collection measured is one this file explicitly asked for), a
-/// nursery that holds the whole corpus, and a mature capacity `2 × (live + reserve)` — the
-/// fixed point of [`HeapPolicy::mature_after_fullsweep`] that keeps the mark-region fullsweep
-/// **in place** (neither `should_grow` nor `should_shrink` fires), so the pinning (or
-/// partial-block evacuation) regime is what is measured, never a relocating fullsweep.
-fn policy(objects: usize) -> HeapPolicy {
+/// The **whole-block law** of a size point: the live line set of this corpus is contiguous
+/// from the start of the region, so it covers `lines / LINES_PER_BLOCK` **whole** blocks plus
+/// one trailing partial block. The mark-region path pins a whole block and evacuates a
+/// partial block's objects, which fixes every count [`assert_size_point`] asserts.
+struct Law {
+    /// Live lines (`objects × shape.lines()`).
+    lines: usize,
+    /// Whole blocks entirely covered by live lines.
+    full_blocks: usize,
+    /// Lines in the trailing partial block (`lines % LINES_PER_BLOCK`).
+    remainder_lines: usize,
+    /// Live objects the whole blocks pin.
+    pinned_objects: usize,
+    /// Live objects the trailing partial block must evacuate.
+    evacuated_objects: usize,
+}
+
+impl Law {
+    /// The law's prediction for `objects` objects of `shape`.
+    fn of(shape: Shape, objects: usize) -> Law {
+        // One object starts at a line boundary (line-granular allocation), and the shapes
+        // are chosen so that a whole number of them fills one block: the packing is exact.
+        assert_eq!(
+            LINES_PER_BLOCK % shape.lines(),
+            0,
+            "{shape:?}: a whole number of objects fills one block"
+        );
+        let lines = objects * shape.lines();
+        let full_blocks = lines / LINES_PER_BLOCK;
+        let remainder_lines = lines % LINES_PER_BLOCK;
+        let objects_per_block = LINES_PER_BLOCK / shape.lines();
+        let pinned_objects = full_blocks * objects_per_block;
+        Law {
+            lines,
+            full_blocks,
+            remainder_lines,
+            pinned_objects,
+            evacuated_objects: objects - pinned_objects,
+        }
+    }
+
+    /// The words the trailing partial block's evacuation moves (whole lines).
+    fn moved_words(&self) -> usize {
+        self.remainder_lines * LINE_WORDS
+    }
+
+    /// The mark-region path's resident footprint: whole lines.
+    fn footprint_words(&self) -> usize {
+        self.lines * LINE_WORDS
+    }
+}
+
+/// The heap policy both strategies share at `objects` long-lived objects of `shape`: the
+/// fullsweep cadence disabled (every collection measured is one this file explicitly asked
+/// for), a nursery that holds the whole corpus, and a mature capacity `2 × (live lines +
+/// reserve)` — the fixed point of [`HeapPolicy::mature_after_fullsweep`] that keeps the
+/// mark-region fullsweep **in place** (neither `should_grow` nor `should_shrink` fires), so
+/// the pinning (or partial-block evacuation) regime is what is measured, never a relocating
+/// fullsweep.
+fn policy(shape: Shape, objects: usize) -> HeapPolicy {
     let need_reserve_words = 64;
-    let live_line_words = objects * LINE_WORDS;
+    let live_line_words = objects * shape.lines() * LINE_WORDS;
     HeapPolicy {
         fullsweep_after: 65535,
         initial_young_words: live_line_words + 4096,
@@ -112,8 +245,8 @@ fn policy(objects: usize) -> HeapPolicy {
 }
 
 /// A collector for `kind`, selected through [`GcConfig`] exactly as a caller would.
-fn collector(objects: usize, kind: MatureKind) -> AnyCollector {
-    let config = GcConfig::copying(policy(objects)).with_mature(kind);
+fn collector(shape: Shape, objects: usize, kind: MatureKind) -> AnyCollector {
+    let config = GcConfig::copying(policy(shape, objects)).with_mature(kind);
     AnyCollector::from_config(&config).expect("collector")
 }
 
@@ -153,26 +286,21 @@ fn count_signature(r: &Run) -> (MatureKind, GcStats, Option<ImmixStats>, usize, 
     (r.kind, r.stats, r.immix, r.footprint_words, r.footprint_lines)
 }
 
-/// Builds an `objects`-object long-lived corpus, promotes it, offers the nursery only
-/// garbage, and measures one forced fullsweep.
+/// Builds an `objects`-object long-lived corpus of `shape`, promotes it, offers the nursery
+/// only garbage, and measures one forced fullsweep.
 fn run_once(shape: Shape, objects: usize, kind: MatureKind) -> Run {
-    let mut c = collector(objects, kind);
+    let mut c = collector(shape, objects, kind);
     let mut roots: Vec<Eterm> = Vec::with_capacity(objects);
 
     // ---- phase 1: the long-lived live set -----------------------------------------------
     {
         let heap = c.young_mut().heap_mut();
         for i in 0..objects as i64 {
-            let obj = match shape {
-                Shape::Small => heap.tuple(&[make_small(i), make_small(2 * i)]),
-                Shape::Line => {
-                    let elems: Vec<Eterm> = (0..(LINE_WORDS as i64 - 1))
-                        .map(|k| make_small(i * 100 + k))
-                        .collect();
-                    heap.tuple(&elems)
-                }
-            };
-            roots.push(obj.expect("a long-lived object"));
+            let elems: Vec<Eterm> = (0..shape.arity())
+                .map(|k| make_small(i * 100 + k as i64))
+                .collect();
+            let obj = heap.tuple(&elems).expect("a long-lived object");
+            roots.push(obj);
         }
     }
     assert_eq!(roots.len(), objects, "the corpus holds {objects} objects");
@@ -283,6 +411,152 @@ fn assert_same_graph(copying: &Run, immix: &Run, atoms: &AtomTable) {
     }
 }
 
+/// The **deterministic law** a size point must satisfy, for a corpus whose every object
+/// occupies a whole number of Immix lines (see [`Law`] for the derivation). Every assertion
+/// here is on an exact count; nothing is derived from a timing.
+fn assert_size_point(shape: Shape, objects: usize, copying: &Run, immix: &Run) {
+    let law = Law::of(shape, objects);
+    let label = format!("{shape:?} {objects} objects ({} lines)", law.lines);
+
+    // -- the copying path re-copies the whole live set, word for word ---------------------
+    assert_eq!(copying.kind, MatureKind::Copying, "{label}");
+    assert_eq!(
+        copying.moved_objects,
+        objects,
+        "{label}: the copying path copies every live object"
+    );
+    assert_eq!(
+        copying.moved_words,
+        objects * shape.words(),
+        "{label}: the copying path copies the exact live word count"
+    );
+    assert_eq!(copying.pinned_objects, 0, "{label}: copying pins nothing");
+    assert_eq!(
+        copying.footprint_words,
+        objects * shape.words(),
+        "{label}: the copying footprint is the exact live word count"
+    );
+    assert_eq!(copying.footprint_lines, None, "{label}: not a line-granular space");
+
+    // -- the mark-region path promotes nothing: the nursery holds only garbage -----------
+    assert_eq!(immix.kind, MatureKind::Immix, "{label}");
+    assert_eq!(
+        immix.stats.objects_copied, 0,
+        "{label}: the nursery held only garbage"
+    );
+    assert_eq!(immix.stats.words_copied, 0, "{label}: nothing was promoted");
+    let stats = immix
+        .immix
+        .unwrap_or_else(|| panic!("{label}: the fullsweep must reclaim in place"));
+
+    // -- every live object is accounted for exactly once, by the whole-block law ---------
+    assert_eq!(
+        stats.objects_pinned, law.pinned_objects,
+        "{label}: whole blocks are pinned"
+    );
+    assert_eq!(
+        stats.objects_evacuated, law.evacuated_objects,
+        "{label}: the trailing partial block is evacuated"
+    );
+    assert_eq!(
+        stats.objects_pinned + stats.objects_evacuated,
+        objects,
+        "{label}: every live object is accounted for exactly once"
+    );
+    assert_eq!(
+        stats.lines_pinned,
+        law.full_blocks * LINES_PER_BLOCK,
+        "{label}: pinned lines"
+    );
+    assert_eq!(
+        stats.lines_evacuated, law.remainder_lines,
+        "{label}: evacuated lines"
+    );
+    assert_eq!(
+        stats.words_pinned,
+        law.pinned_objects * shape.words(),
+        "{label}: pinned words are the exact object sizes"
+    );
+    assert_eq!(stats.blocks_reclaimed, 0, "{label}: the live set is a root");
+    assert_eq!(
+        stats.words_reclaimed, 0,
+        "{label}: nothing in the mature generation is garbage"
+    );
+    assert_eq!(
+        immix.moved_objects,
+        law.evacuated_objects,
+        "{label}: only the evacuated objects move"
+    );
+    assert_eq!(
+        immix.moved_words,
+        law.moved_words(),
+        "{label}: moved words are line-rounded"
+    );
+    // The line-granular footprint is exactly one line per live line.
+    assert_eq!(
+        immix.footprint_lines,
+        Some(law.lines),
+        "{label}: resident lines"
+    );
+    assert_eq!(
+        immix.footprint_words,
+        law.footprint_words(),
+        "{label}: resident line-words"
+    );
+
+    if law.full_blocks == 0 {
+        // -- below one whole block nothing can be pinned ----------------------------------
+        assert_eq!(law.pinned_objects, 0, "{label}: no whole block, nothing to pin");
+        if shape.line_waste() > 0 {
+            // Line rounding makes the mark-region path strictly dominated, not merely equal.
+            assert!(
+                immix.moved_words > copying.moved_words,
+                "{label}: {} > {} required (line rounding)",
+                immix.moved_words,
+                copying.moved_words
+            );
+            assert!(
+                immix.footprint_words > copying.footprint_words,
+                "{label}: the line-rounded footprint must be strictly larger"
+            );
+        } else {
+            assert_eq!(
+                immix.moved_words, copying.moved_words,
+                "{label}: whole-line objects are copied either way"
+            );
+        }
+    } else if law.remainder_lines == 0 {
+        // -- the live set is a whole number of blocks: it is pinned whole ----------------
+        assert_eq!(
+            law.pinned_objects, objects,
+            "{label}: the whole live set is pinned"
+        );
+        assert_eq!(
+            immix.moved_words, 0,
+            "{label}: a fully live block is never moved"
+        );
+        assert!(
+            copying.moved_words > 0,
+            "{label}: the copying path still pays a full copy"
+        );
+    } else {
+        // -- a whole block plus a trailing partial block: both halves are exercised -------
+        assert!(
+            law.pinned_objects > 0 && law.evacuated_objects > 0,
+            "{label}: both halves must be non-empty"
+        );
+    }
+}
+
+/// Measures one size point through both strategies and asserts the deterministic law.
+fn measure_point(shape: Shape, objects: usize) -> (Run, Run) {
+    let copying = measure(shape, objects, MatureKind::Copying);
+    let immix = measure(shape, objects, MatureKind::Immix);
+    assert_same_graph(&copying, &immix, &AtomTable::new());
+    assert_size_point(shape, objects, &copying, &immix);
+    (copying, immix)
+}
+
 /// One report line for a single (size point, strategy) run.
 fn report_line(r: &Run) -> String {
     let footprint = match r.footprint_lines {
@@ -302,22 +576,93 @@ fn report_line(r: &Run) -> String {
     )
 }
 
-/// Measures one shape at every size point and prints the table, returning the pairs.
-fn sweep(shape: Shape) -> Vec<(Run, Run)> {
-    let mut pairs = Vec::new();
-    println!("\n=== break-even sweep: shape {shape:?} ({} words/object) ===", shape.words());
+/// Asserts the sweep's deterministic facts against the rule's constant.
+fn assert_rule_against_the_sweep(shape: Shape, points: &[(usize, Run, Run)]) {
+    // The constant is expressed in the space's own allocation unit and is at least one whole
+    // block — the regime below which `assert_size_point` proves the mark-region path can pin
+    // nothing, so selecting it there would be a pure loss.
+    assert_eq!(
+        IMMIX_BREAK_EVEN_WORDS % BLOCK_WORDS,
+        0,
+        "the break-even is a whole number of Immix blocks"
+    );
+    assert_eq!(
+        IMMIX_BREAK_EVEN_BLOCKS * BLOCK_WORDS,
+        IMMIX_BREAK_EVEN_WORDS,
+        "the two constants agree"
+    );
+    assert!(
+        IMMIX_BREAK_EVEN_BLOCKS >= 1,
+        "never select Immix below one whole block"
+    );
+
+    let mut whole_block_points = 0usize;
+    for (objects, copying, immix) in points {
+        let law = Law::of(shape, *objects);
+        if law.lines < LINES_PER_BLOCK {
+            // Every sub-block point is strictly below the rule's threshold, so the rule's
+            // floor keeps the copying path exactly where the sweep says it must.
+            assert!(
+                law.lines * LINE_WORDS < IMMIX_BREAK_EVEN_WORDS,
+                "{shape:?} {objects}: a sub-block point must be below the break-even"
+            );
+            assert_eq!(law.pinned_objects, 0, "{shape:?} {objects}: nothing is pinned");
+        } else if law.remainder_lines == 0 {
+            whole_block_points += 1;
+            // The whole-block points carry the rule's positive half: the mark-region path
+            // moves *nothing* while the copying path pays the whole live set.
+            assert_eq!(immix.moved_words, 0, "{shape:?} {objects}: pinned whole");
+            assert!(
+                copying.moved_words > 0,
+                "{shape:?} {objects}: the copying path pays"
+            );
+        }
+    }
+    // There is at least a point at one block and one at 64, so the "from one block up" claim
+    // is checked at more than a single size.
+    assert!(
+        whole_block_points >= 2,
+        "{shape:?}: the sweep must cover several whole-block points"
+    );
+    println!(
+        "  (asserted) {shape:?}: below one whole block nothing is pinned (line-rounded \
+         evacuation, never fewer words than copying); at every whole-block point from 1 to 64 \
+         blocks the live set is pinned whole (0 words moved). The constant's *value* \
+         ({IMMIX_BREAK_EVEN_BLOCKS} blocks / {IMMIX_BREAK_EVEN_WORDS} words) is the \
+         timing-derived ratio plateau, not an asserted count."
+    );
+}
+
+/// Measures one shape at every size point, prints the table, and asserts both the per-point
+/// deterministic law and the rule's assertion-backed bounds.
+fn sweep(shape: Shape) -> Vec<(usize, Run, Run)> {
+    let mut points = Vec::new();
+    println!(
+        "\n=== break-even sweep: shape {shape:?} ({} words/object, {} lines/object) ===",
+        shape.words(),
+        shape.lines()
+    );
     for &objects in &OBJECT_POINTS {
-        let copying = measure(shape, objects, MatureKind::Copying);
-        let immix = measure(shape, objects, MatureKind::Immix);
-        assert_same_graph(&copying, &immix, &AtomTable::new());
+        let (copying, immix) = measure_point(shape, objects);
+        let law = Law::of(shape, objects);
         println!(
-            "-- {objects} objects ({} block-equivalents; {} line-words live, {} useful words) --",
-            objects as f64 / LINES_PER_BLOCK as f64,
-            objects * LINE_WORDS,
+            "-- {objects} objects ({:.2} block-equivalents; {} line-words live, {} useful \
+             words) --",
+            law.lines as f64 / LINES_PER_BLOCK as f64,
+            law.lines * LINE_WORDS,
             objects * shape.words()
         );
         println!("{}", report_line(&copying));
         println!("{}", report_line(&immix));
+        println!(
+            "  law (asserted): pinned {:>4} obj / {:>3} lines | evacuated {:>4} obj / {:>3} \
+             lines | moved {:>5} words",
+            law.pinned_objects,
+            law.full_blocks * LINES_PER_BLOCK,
+            law.evacuated_objects,
+            law.remainder_lines,
+            law.moved_words()
+        );
         println!(
             "  ratio: moved words copying/immix = {:.2}× | footprint copying/immix = {:.2}× | \
              pause immix/copying = {:.2}× | words saved per extra µs = {:.0}",
@@ -327,9 +672,10 @@ fn sweep(shape: Shape) -> Vec<(Run, Run)> {
             (copying.moved_words as f64 - immix.moved_words as f64)
                 / ((immix.pause_ns as f64 - copying.pause_ns as f64) / 1000.0).max(0.001),
         );
-        pairs.push((copying, immix));
+        points.push((objects, copying, immix));
     }
-    pairs
+    assert_rule_against_the_sweep(shape, &points);
+    points
 }
 
 #[test]
@@ -342,4 +688,89 @@ fn break_even_table_line_objects() {
 fn break_even_table_small_objects() {
     let _serial = serial();
     sweep(Shape::Small);
+}
+
+#[test]
+fn break_even_table_multi_line_objects() {
+    let _serial = serial();
+    sweep(Shape::Multi);
+}
+
+/// The constant checked at **its own size**, in the sweep's own units: at the threshold the
+/// mark-region path is inside its full-pinning regime (0 words moved while the copying path
+/// pays a break-even-sized copy), and one line below it it is not (the trailing partial block
+/// must be evacuated).
+///
+/// This is the only part of the constant's *value* that a count can pin. Its exact size — 8
+/// blocks rather than 1 — comes from the timing-derived plateau of avoided copy work per
+/// extra µs of pause (see the module docs), which is deliberately never asserted.
+#[test]
+fn the_break_even_point_is_assertion_checked() {
+    let _serial = serial();
+
+    // A whole line of live data is `LINE_WORDS` words, so the rule's word threshold is this
+    // many whole lines — exactly `IMMIX_BREAK_EVEN_BLOCKS` whole blocks.
+    let break_even_lines = IMMIX_BREAK_EVEN_WORDS / LINE_WORDS;
+    assert_eq!(
+        break_even_lines,
+        IMMIX_BREAK_EVEN_BLOCKS * LINES_PER_BLOCK,
+        "the word threshold is a whole number of lines and blocks"
+    );
+
+    for shape in Shape::ALL {
+        let objects = break_even_lines / shape.lines();
+        assert_eq!(
+            objects * shape.lines(),
+            break_even_lines,
+            "{shape:?}: the threshold is an exact size point"
+        );
+
+        let (at_copying, at_immix) = measure_point(shape, objects);
+        println!(
+            "break-even point {shape:?}: {objects} objects = {break_even_lines} lines = \
+             {IMMIX_BREAK_EVEN_BLOCKS} blocks -> copying moves {} words, immix {} words \
+             ({} pinned)",
+            at_copying.moved_words, at_immix.moved_words, at_immix.pinned_objects
+        );
+        assert!(
+            at_copying.moved_words > 0,
+            "{shape:?}: the copying path pays for the whole live set"
+        );
+        assert_eq!(
+            at_immix.moved_words, 0,
+            "{shape:?}: at the threshold the whole live set is pinned"
+        );
+        assert_eq!(
+            at_immix.pinned_objects, objects,
+            "{shape:?}: every live object is pinned at the threshold"
+        );
+
+        // One line below the threshold the live set no longer fills whole blocks: the
+        // trailing partial block must be evacuated, so the rule's switch point is the point
+        // at which the mark-region path reaches its best regime, not one line past it.
+        let (below_copying, below_immix) = measure_point(shape, objects - 1);
+        println!(
+            "  one line below: {} objects -> copying {} words, immix {} words ({} pinned)",
+            objects - 1,
+            below_copying.moved_words,
+            below_immix.moved_words,
+            below_immix.pinned_objects
+        );
+        assert!(
+            below_immix.moved_words > 0,
+            "{shape:?}: below the threshold the partial block is evacuated"
+        );
+        assert!(
+            below_immix.pinned_objects < below_copying.moved_objects,
+            "{shape:?}: below the threshold not every object is pinned"
+        );
+    }
+
+    // For the one-line shape the threshold is also the copy the rule avoids, word for word.
+    let (copying, immix) = measure_point(Shape::Line, break_even_lines);
+    assert_eq!(
+        copying.moved_words, IMMIX_BREAK_EVEN_WORDS,
+        "the copying path pays exactly the break-even size"
+    );
+    assert_eq!(immix.moved_words, 0);
 }
