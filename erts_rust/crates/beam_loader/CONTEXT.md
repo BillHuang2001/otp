@@ -554,7 +554,8 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
 - `src/instr.rs` → the typed instruction vocabulary: `Instr` (~120 variants) + `TestKind`
 - `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `RecordDefinition`/`RecordField`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
-- `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap
+- `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap (+ the shared `decode_terms`/`decode_terms_at_capacity` retry path)
+- `src/attributes.rs` → `AttributeTable` / `SharedAttributeTable`: the decoded `Attr` chunk term (`Module::attributes_term`/`attribute_by_name`) for `module_info(attributes)`
 - `src/lower.rs` → `build_module` + module assembly (re-exports the `group` helpers)
 - `src/lower/group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks`
 - `src/lower/instr.rs` → `lower_instr` (one `RawInstr` → one `Instr`)
