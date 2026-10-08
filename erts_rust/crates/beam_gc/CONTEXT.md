@@ -116,7 +116,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 ### `config.rs` + `selection.rs` — the mature-generation decision
 - `pub struct GcConfig { pub policy: HeapPolicy, pub selection: MatureSelection }` — the heap-size policy
   plus **how** the mature strategy is chosen. `new`/`auto` (both = the automatic rule),
-  `copying(policy)`/`immix(policy)` (explicit pins), `with_selection`/`with_mature`, `policy()`,
+  `copying(policy)`/`immix(policy)` (explicit pins), `growable()` (= `auto(HeapPolicy::unbounded())`),
+  `with_selection`/`with_mature`, `policy()`,
   `selection()`, `mature() -> MatureKind` (the resolved strategy), `mature_choice() -> MatureChoice`;
   `Default` = `GcConfig::new(HeapPolicy::default())` = `Auto`, which resolves to `Copying` for the default
   (233-word) policy — i.e. today's collector exactly.
