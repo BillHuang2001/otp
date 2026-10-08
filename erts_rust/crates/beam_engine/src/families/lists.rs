@@ -40,6 +40,12 @@ use crate::Step;
 ///
 /// Returns `Ok(Some(step))` when `instr` is a list opcode this family executes,
 /// `Ok(None)` when `instr` is not this family's variant, and `Err` on a raise.
+///
+/// `#[inline]`-marked: the cons-cell instructions are the hottest *dispatched* ones
+/// (every list traversal), and the family router ([`super::dispatch`]) has already
+/// proved the variant, so inlining lets the optimizer collapse the redundant second
+/// `match` into the dispatcher's.
+#[inline]
 pub(crate) fn exec(
     machine: &mut Machine,
     module: &Module,

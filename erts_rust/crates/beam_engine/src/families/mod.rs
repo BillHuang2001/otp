@@ -3,18 +3,29 @@
 //! Each [`beam_loader::Instr`] variant that the Milestone-1 interpreter does not
 //! execute natively belongs to exactly **one** family submodule here. The
 //! interpreter's single catch-all arm (`crate::interpreter`) routes such an
-//! instruction to [`dispatch`], which tries every family in order and returns the
-//! first [`Step`] one claims; an instruction no family claims — including the
-//! families' own not-yet-implemented variants, which are stubs returning
-//! `Ok(None)` — yields the same documented `unsupported` error the interpreter
-//! emitted before this seam existed, with the unclaimed instruction's `ops.tab`
-//! spelling appended so the gap is diagnosable ([`instr_name`]).
+//! instruction to [`dispatch`], which **routes by the instruction's own variant**
+//! to the one family that owns it (family ownership is disjoint — see the list
+//! below); an instruction **no** family owns — including the families' own
+//! not-yet-implemented variants, which are stubs returning `Ok(None)` — yields the
+//! same documented `unsupported` error the interpreter emitted before this seam
+//! existed, with the unclaimed instruction's `ops.tab` spelling appended so the
+//! gap is diagnosable ([`instr_name`]).
+//!
+//! The routing `match` compiles to a jump table on the [`Instr`] discriminant, so
+//! a dispatched instruction hands control **straight** to its owning family. It
+//! replaced the original implementation, which *probed every family in order*
+//! (tuples → records → lists → …) and returned the first `Ok(Some(..))`: that was
+//! pure overhead on the hot path — the most frequent dispatched instruction,
+//! `get_list`, paid two *failing* family probes (`tuples::exec`, `records::exec`)
+//! before its real owner `lists::exec`. Disjoint ownership is what makes the
+//! re-route semantically identical: no instruction was ever claimed by a family
+//! other than the one the ordering below names for it.
 //!
 //! The point of the split is **edit locality**: a later agent implements a whole
 //! instruction family inside its own file (e.g. `tuples.rs`) and never has to
 //! touch the dispatcher (`interpreter.rs`) again. Every family exposes the same
-//! [`exec`](tuples::exec)-shaped signature, so adding a family is a one-line
-//! change here.
+//! [`exec`](tuples::exec)-shaped signature, so adding a family is one pattern arm
+//! here.
 //!
 //! Family ownership (per `../beam_loader/CONTEXT.md`, "The instruction
 //! vocabulary"):
@@ -29,7 +40,7 @@
 //! - [`receive`] — `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`/`RecvMarkerReserve`/`RecvMarkerBind`/`RecvMarkerUse`/`RecvMarkerClear`
 //!
 //! Variants owned by **no** family (`Bif0`/`Bif`, `Jump`, `InitYregs`,
-//! the debug-line opcodes) are not claimed by any submodule, so [`dispatch`]
+//! the debug-line opcodes) fall to the routing `match`'s last arm, so [`dispatch`]
 //! reports them as unsupported exactly as before — naming the instruction when
 //! [`instr_name`] knows its `ops.tab` spelling.
 //! (`NifStart`/`OnLoad` never reach [`dispatch`]: the interpreter executes them
@@ -62,16 +73,25 @@ mod receive;
 mod records;
 mod tuples;
 
-/// Dispatch `instr` to the first instruction family that claims it.
+/// Route `instr` to the single instruction family that owns it.
 ///
-/// Families are tried in a fixed order (see the module docs). `Ok(step)` is the
-/// control-flow decision of the claiming family; `Err` is either a family failure
-/// (a raise) or — when **no** family claims the instruction — the documented
-/// `unsupported("<UNCLAIMED_PREFIX>: <name>")` error,
-/// whose prefix is byte-identical to the message the interpreter emitted before
-/// this seam existed and whose `<name>` is [`instr_name`]'s `ops.tab` spelling of
-/// the offending instruction (so the unresolvable variant is diagnosable from the
-/// error alone).
+/// Ownership is disjoint (see the module docs), so the routing `match` — a jump
+/// table on the [`Instr`] discriminant — names exactly one family per variant and
+/// the old "probe every family, first `Ok(Some)` wins" loop is gone.
+///
+/// `Ok(step)` is the owning family's control-flow decision; `Err` is either that
+/// family's failure (a raise) or — for a variant **no** family owns, or one a
+/// family owns but declines with `Ok(None)` — the documented
+/// `unsupported("<UNCLAIMED_PREFIX>: <name>")` error, whose prefix is byte-identical
+/// to the message the interpreter emitted before this seam existed and whose
+/// `<name>` is [`instr_name`]'s `ops.tab` spelling of the offending instruction (so
+/// the unresolvable variant is diagnosable from the error alone).
+///
+/// `#[inline]`-marked: the router is the single call site of every family, and the
+/// interpreter reaches it from its catch-all arm, so inlining it into the dispatch
+/// loop lets the optimizer fold the (now redundant) per-family `match` into the
+/// loop's own control flow instead of a second out-of-line dispatch.
+#[inline]
 pub(crate) fn dispatch(
     machine: &mut Machine,
     module: &Module,
@@ -81,37 +101,108 @@ pub(crate) fn dispatch(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
-    if let Some(step) = tuples::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
+    let claimed = match instr {
+        // tuples
+        Instr::PutTuple2 { .. } | Instr::GetTupleElement { .. } | Instr::SelectTupleArity { .. } => {
+            tuples::exec(machine, module, labels, instr, func, pc, ctx)
+        }
+        // records (tagged-tuple update + the native-record set)
+        Instr::UpdateRecord { .. }
+        | Instr::IsAnyNativeRecord { .. }
+        | Instr::IsNativeRecord { .. }
+        | Instr::GetRecordElements { .. }
+        | Instr::GetRecordElementsId { .. }
+        | Instr::PutRecord { .. }
+        | Instr::IsRecordAccessible { .. }
+        | Instr::GetRecordField { .. }
+        | Instr::UpdateRecordId { .. } => {
+            records::exec(machine, module, labels, instr, func, pc, ctx)
+        }
+        // lists
+        Instr::PutList { .. } | Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => {
+            lists::exec(machine, module, labels, instr, func, pc, ctx)
+        }
+        // funs
+        Instr::MakeFun3 { .. }
+        | Instr::CallFun { .. }
+        | Instr::CallFun2 { .. }
+        | Instr::Apply { .. }
+        | Instr::ApplyLast { .. } => funs::exec(machine, module, labels, instr, func, pc, ctx),
+        // exceptions
+        Instr::Try { .. }
+        | Instr::Catch { .. }
+        | Instr::Badmatch { .. }
+        | Instr::CaseEnd { .. }
+        | Instr::TryCaseEnd { .. }
+        | Instr::Badrecord { .. }
+        | Instr::IfEnd
+        | Instr::Raise { .. }
+        | Instr::TryCase { .. }
+        | Instr::TryEnd { .. }
+        | Instr::CatchEnd { .. }
+        | Instr::BuildStacktrace
+        | Instr::RawRaise => exceptions::exec(machine, module, labels, instr, func, pc, ctx),
+        // floats
+        Instr::Fmove { .. }
+        | Instr::Fconv { .. }
+        | Instr::Fadd { .. }
+        | Instr::Fsub { .. }
+        | Instr::Fmul { .. }
+        | Instr::Fdiv { .. }
+        | Instr::Fnegate { .. } => floats::exec(machine, module, labels, instr, func, pc, ctx),
+        // maps
+        Instr::GetMapElements { .. }
+        | Instr::HasMapFields { .. }
+        | Instr::PutMapAssoc { .. }
+        | Instr::PutMapExact { .. } => maps::exec(machine, module, labels, instr, func, pc, ctx),
+        // bitstrings (the whole `Bs*` family)
+        Instr::BsStartMatch3 { .. }
+        | Instr::BsStartMatch4 { .. }
+        | Instr::BsGetPosition { .. }
+        | Instr::BsSetPosition { .. }
+        | Instr::BsGetTail { .. }
+        | Instr::BsTestTail2 { .. }
+        | Instr::BsGetInteger2 { .. }
+        | Instr::BsGetBinary2 { .. }
+        | Instr::BsSkipBits2 { .. }
+        | Instr::BsMatch { .. }
+        | Instr::BsMatchString { .. }
+        | Instr::BsGetFloat2 { .. }
+        | Instr::BsGetUtf8 { .. }
+        | Instr::BsGetUtf16 { .. }
+        | Instr::BsGetUtf32 { .. }
+        | Instr::BsSkipUtf8 { .. }
+        | Instr::BsSkipUtf16 { .. }
+        | Instr::BsSkipUtf32 { .. }
+        | Instr::BsInitWritable
+        | Instr::BsCreateBin { .. } => {
+            bitstrings::exec(machine, module, labels, instr, func, pc, ctx)
+        }
+        // receive / message
+        Instr::Send
+        | Instr::LoopRec { .. }
+        | Instr::LoopRecEnd { .. }
+        | Instr::Wait { .. }
+        | Instr::WaitTimeout { .. }
+        | Instr::Timeout
+        | Instr::RemoveMessage
+        | Instr::RecvMarkerReserve { .. }
+        | Instr::RecvMarkerBind { .. }
+        | Instr::RecvMarkerUse { .. }
+        | Instr::RecvMarkerClear { .. } => {
+            receive::exec(machine, module, labels, instr, func, pc, ctx)
+        }
+        // A variant owned by no family (a core arm's instruction, or the metadata
+        // no-ops): fall through to the documented sentinel below.
+        _ => Ok(None),
+    };
+    match claimed? {
+        Some(step) => Ok(step),
+        None => Err(error::unsupported(&format!(
+            "{UNCLAIMED_PREFIX}: {}",
+            instr_name(instr)
+        ))),
     }
-    if let Some(step) = records::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
-    }
-    if let Some(step) = lists::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
-    }
-    if let Some(step) = funs::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
-    }
-    if let Some(step) = exceptions::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
-    }
-    if let Some(step) = floats::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
-    }
-    if let Some(step) = maps::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
-    }
-    if let Some(step) = bitstrings::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
-    }
-    if let Some(step) = receive::exec(machine, module, labels, instr, func, pc, ctx)? {
-        return Ok(step);
-    }
-    Err(error::unsupported(&format!(
-        "{UNCLAIMED_PREFIX}: {}",
-        instr_name(instr)
-    )))
 }
 
 /// The `ops.tab`/C spelling of the instruction [`dispatch`] could not claim.

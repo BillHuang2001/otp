@@ -71,6 +71,22 @@ pub enum TermError {
     /// garbage (in release, `NULL`) `boxed_val` pointer — the C is undefined
     /// behaviour there.
     NotATerm,
+    /// The term graph reachable from the word is **cyclic**: a compound object
+    /// (cons cell, tuple, fun, map node, …) is reachable from itself. A cyclic graph
+    /// has no flat size at all, and a naive `size_object` walk never terminates on
+    /// one — the only way to build it is forged memory (a NIF handing back a graph
+    /// that points into an ancestor), so it is an *invalid* graph rather than a
+    /// merely large one. Reported by [`crate::size::size_object_bounded`] instead of
+    /// looping.
+    ///
+    /// Deliberately distinct from [`TermError::TermGraphTooLarge`]: "cannot size, it
+    /// is cyclic" is a malformed input, "cannot size, it is over budget" is not.
+    TermGraphCyclic,
+    /// The term graph reachable from the word is well-formed (acyclic) but its flat
+    /// word count is larger than the budget the caller passed to
+    /// [`crate::size::size_object_bounded`]. The graph can be sized — just not within
+    /// that many words.
+    TermGraphTooLarge,
 }
 
 impl fmt::Display for TermError {
@@ -87,6 +103,8 @@ impl fmt::Display for TermError {
             TermError::FunIdentityUnavailable => "fun identity unavailable",
             TermError::BadRecord => "not a record",
             TermError::NotATerm => "not a term",
+            TermError::TermGraphCyclic => "term graph is cyclic",
+            TermError::TermGraphTooLarge => "term graph exceeds the size limit",
         };
         f.write_str(msg)
     }
@@ -113,6 +131,8 @@ impl core::error::Error for TermError {}
 /// | `FunIdentityUnavailable` | `BadArg` | `badarg` |
 /// | `BadRecord` | `BadArg` | `badarg` |
 /// | `NotATerm` | `BadArg` | `badarg` |
+/// | `TermGraphCyclic` | `BadArg` | `badarg` |
+/// | `TermGraphTooLarge` | `BadArg` | `badarg` |
 impl From<TermError> for BeamError {
     fn from(error: TermError) -> Self {
         match error {
@@ -146,6 +166,17 @@ impl From<TermError> for BeamError {
             // failure — the same `badarg` the engine would raise for a value it
             // cannot use.
             TermError::NotATerm => BeamError::BadArg,
+            // A cyclic term graph cannot be sized (there is no such size). It is not a
+            // BEAM-level failure the oracle ever raises — a term graph is cyclic only
+            // through forged memory — so it maps to the same `badarg` the engine
+            // raises for a value it cannot use. Kept distinct from
+            // `TermGraphTooLarge` so the caller can tell the two apart *before* the
+            // mapping loses the difference.
+            TermError::TermGraphCyclic => BeamError::BadArg,
+            // A well-formed graph beyond the caller's word budget is likewise an
+            // argument failure (an impossible request), not a BEAM error with an
+            // oracle reason.
+            TermError::TermGraphTooLarge => BeamError::BadArg,
         }
     }
 }
@@ -176,6 +207,14 @@ mod tests {
         );
         assert_eq!(TermError::BadRecord.to_string(), "not a record");
         assert_eq!(TermError::NotATerm.to_string(), "not a term");
+        assert_eq!(
+            TermError::TermGraphCyclic.to_string(),
+            "term graph is cyclic"
+        );
+        assert_eq!(
+            TermError::TermGraphTooLarge.to_string(),
+            "term graph exceeds the size limit"
+        );
     }
 
     #[test]
@@ -196,6 +235,16 @@ mod tests {
         // The whole point of the variant: a well-formed term the operation cannot
         // complete must be distinguishable from a malformed one.
         assert_ne!(TermError::FunIdentityUnavailable, TermError::BadFun);
+    }
+
+    #[test]
+    fn term_graph_errors_are_distinguishable() {
+        // The whole point of the two variants: "cannot size, it is cyclic" (a
+        // malformed graph) must be tellable from "cannot size, it is too big" (a
+        // well-formed graph over budget), even though both map to `badarg`.
+        assert_ne!(TermError::TermGraphCyclic, TermError::TermGraphTooLarge);
+        assert_ne!(TermError::TermGraphCyclic, TermError::NotATerm);
+        assert_ne!(TermError::TermGraphTooLarge, TermError::NotATerm);
     }
 
     #[test]
@@ -239,6 +288,14 @@ mod tests {
         ));
         assert!(matches!(
             BeamError::from(TermError::NotATerm),
+            BeamError::BadArg
+        ));
+        assert!(matches!(
+            BeamError::from(TermError::TermGraphCyclic),
+            BeamError::BadArg
+        ));
+        assert!(matches!(
+            BeamError::from(TermError::TermGraphTooLarge),
             BeamError::BadArg
         ));
     }

@@ -15,6 +15,13 @@ use crate::predicates;
 
 impl Machine {
     /// Evaluate one `is_*`/`test_arity` test; `true` means the test *succeeds*.
+    ///
+    /// `#[inline]`-marked: this is one of the interpreter's hottest out-of-line
+    /// helpers and returns a `Result<bool, BeamError>` whose `Err` variant is a
+    /// 72-byte `BeamError`; without the hint the `Ok` result round-trips through
+    /// memory on every `test` instruction. The hint lets the optimizer keep the
+    /// common arms in registers and see through the `?` in the dispatch arm.
+    #[inline]
     pub(super) fn eval_test(
         &self,
         module: &Module,
@@ -167,6 +174,12 @@ impl Machine {
     }
 
     /// Read test argument `i`, or a typed error if the instruction has too few.
+    ///
+    /// `#[inline(always)]`-marked: every `test` instruction reads one argument, and
+    /// with only `#[inline]` this stayed out of line (measured: a ~5% self-time
+    /// symbol on the BIF-free list walk), paying a call and a 72-byte
+    /// `Result<Eterm, BeamError>` round trip per `test`.
+    #[inline(always)]
     fn test_arg(
         &self,
         args: &[Operand],

@@ -54,11 +54,20 @@
 //!   environment; `External` sorts after any local kind. The `Local` kind has no
 //!   `module`/`old_uniq` in its M1 descriptor and mixed `Local`/`Imported` pairs
 //!   lead with the kind rank — see [`cmp_funs`] for both documented deviations.
-//! * **External pid/port/ref, records and on-heap bin refs** have a
-//!   *deterministic fallback*: they are ordered by class first (which is exact),
-//!   then by object arity, then by the raw term word (a stable proxy). This never
-//!   panics but is not a faithful reproduction of the C's structural comparison
-//!   for those specific classes; callers that need exact ordering for them must
+//! * **External pids/ports/refs and native records** are compared *structurally*
+//!   (see [`cmp_external_pids`], [`cmp_external_ports`], [`cmp_external_refs`] and
+//!   [`cmp_records`]), so a copy of such a term compares `=:=`/`Equal` to its
+//!   original. The field orders reproduce `erts_cmp_compound`: an external pid by
+//!   `serial`, then `number`, then the node (sysname atom, then `creation`); an
+//!   external port by the node, then `number`; an external reference by the node,
+//!   then its id words as one big integer (highest index most significant, the
+//!   longer slice's leading zero ids trimmed first); a native record by its
+//!   definition's `module`, `name` and `is_exported` (`false < true`), its field
+//!   count and keys, and finally its field values.
+//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
+//!   class first (which is exact), then by object arity, then by the raw term word
+//!   (a stable proxy). This never panics but is not a faithful reproduction of the
+//!   C's structural comparison; a caller that needs exact ordering for it must
 //!   extend this module.
 //!
 //! ## Non-term words (a documented robustness extension)
@@ -93,7 +102,12 @@ use crate::immediate::{
 use crate::list::{car, cdr, is_list};
 use crate::number::number_as_f64;
 use crate::ops::{class, TermClass};
+use crate::record::{
+    record_definition, record_definition_is_exported, record_definition_keys,
+    record_definition_module, record_definition_name, record_field_count, record_values,
+};
 use crate::tag::{is_term_word, BIG_SIGN_BIT};
+use crate::thing::{external_pid_parts, external_port_parts, external_ref_parts};
 use crate::tuple::{tuple_element, tuple_size};
 
 /// Ascending term-order rank of a [`TermClass`].
@@ -237,7 +251,15 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
         TermClass::Map => cmp_maps(a, b, atoms, exact),
         // SAFETY: both operands are live funs.
         TermClass::Fun => unsafe { cmp_funs(a, b, atoms, exact) },
-        // Documented deterministic fallback (see the module `Known Issues`).
+        // SAFETY: both operands are live external pids/ports/refs, or live native
+        // records — one class per arm, as established by `class_rank` above.
+        TermClass::ExternalPid => unsafe { cmp_external_pids(a, b, atoms, exact) },
+        TermClass::ExternalPort => unsafe { cmp_external_ports(a, b, atoms, exact) },
+        TermClass::ExternalRef => unsafe { cmp_external_refs(a, b, atoms, exact) },
+        TermClass::Record => unsafe { cmp_records(a, b, atoms, exact) },
+        // The on-heap bin ref still uses the documented deterministic fallback (see
+        // the module `Known Issues`); the catch-all keeps the match total for any
+        // class added later.
         _ => fallback_cmp(a, b),
     }
 }
@@ -535,6 +557,272 @@ unsafe fn cmp_refs(a: Eterm, b: Eterm) -> Ordering {
     Ordering::Equal
 }
 
+/// `CMP_NODES` (`erts/emulator/beam/utils.c:1715-1723`) for the M1 node
+/// representation: order two nodes by their sysname atom, then by `creation`.
+///
+/// The C short-circuits on node *pointer* identity and otherwise compares
+/// `(AN)->sysname` with `erts_cmp_atoms` followed by `(AN)->creation`. This tree has
+/// no node registry — the sysname atom and the creation live *inside* the term (the
+/// M1 substitution documented on [`crate::thing::write_external_pid`]) — so there is
+/// no pointer identity to short-circuit on and both fields are always compared, in
+/// that order.
+fn cmp_nodes(
+    node_a: Eterm,
+    creation_a: u32,
+    node_b: Eterm,
+    creation_b: u32,
+    atoms: &AtomTable,
+    exact: bool,
+) -> Ordering {
+    let ord = cmp_impl(node_a, node_b, atoms, exact);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    creation_a.cmp(&creation_b)
+}
+
+/// Compare two external pids — the `pid_common` block of `erts_cmp_compound`
+/// (`erts/emulator/beam/utils.c:1777-1811`).
+///
+/// Field order (`utils.c:1805-1809`): `serial`, then `number`, then the node
+/// (sysname atom, then `creation`). Both operands are external, so the C's
+/// internal/external mixed branches do not apply.
+///
+/// # Safety
+///
+/// `a` and `b` must be live external pid terms.
+unsafe fn cmp_external_pids(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    // SAFETY: the caller guarantees both operands are live external pids written by
+    // `crate::thing::write_external_pid`.
+    let (node_a, number_a, serial_a, creation_a) = unsafe { external_pid_parts(a) };
+    // SAFETY: as above.
+    let (node_b, number_b, serial_b, creation_b) = unsafe { external_pid_parts(b) };
+    serial_a
+        .cmp(&serial_b)
+        .then_with(|| number_a.cmp(&number_b))
+        .then_with(|| cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact))
+}
+
+/// Compare two external ports — the `_TAG_HEADER_EXTERNAL_PORT` arm of
+/// `erts_cmp_compound` (`erts/emulator/beam/utils.c:2219-2238`).
+///
+/// Field order: the node (sysname atom, then `creation`), then `number` (the 64-bit
+/// `V4_PORT_EXT` id, `external_port_number`).
+///
+/// # Safety
+///
+/// `a` and `b` must be live external port terms.
+unsafe fn cmp_external_ports(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    // SAFETY: the caller guarantees both operands are live external ports written by
+    // `crate::thing::write_external_port`.
+    let (node_a, number_a, creation_a) = unsafe { external_port_parts(a) };
+    // SAFETY: as above.
+    let (node_b, number_b, creation_b) = unsafe { external_port_parts(b) };
+    cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact)
+        .then_with(|| number_a.cmp(&number_b))
+}
+
+/// Compare two external references — the `_TAG_HEADER_EXTERNAL_REF` arm of
+/// `erts_cmp_compound` and its `ref_common` tail
+/// (`erts/emulator/beam/utils.c:2239-2308`).
+///
+/// Field order: the node (sysname atom, then `creation`, `utils.c:2263`), then the
+/// ids as one big integer (`utils.c:2265-2287`) — index `len - 1` is the most
+/// significant. When the two id slices differ in length, the longer one's leading
+/// (highest-index) **zero** ids are trimmed first; a non-zero leading id instead
+/// decides immediately (the longer slice is the greater one). The surviving ids are
+/// then compared from the highest index down.
+///
+/// # Safety
+///
+/// `a` and `b` must be live external reference terms.
+unsafe fn cmp_external_refs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    // SAFETY: the caller guarantees both operands are live external references
+    // written by `crate::thing::write_external_ref`.
+    let (node_a, ids_a, creation_a) = unsafe { external_ref_parts(a) };
+    // SAFETY: as above.
+    let (node_b, ids_b, creation_b) = unsafe { external_ref_parts(b) };
+    let ord = cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    // Trim the longer slice's leading zero ids — the C's `do { … } while (alen >
+    // blen)` loops reproduced literally, so no index can go out of bounds. The loops
+    // exit with equal lengths (`ASSERT(alen == blen)`, `utils.c:2283`).
+    let (mut la, mut lb) = (ids_a.len(), ids_b.len());
+    if la > lb {
+        loop {
+            if ids_a[la - 1] != 0 {
+                return Ordering::Greater;
+            }
+            la -= 1;
+            if la <= lb {
+                break;
+            }
+        }
+    } else if lb > la {
+        loop {
+            if ids_b[lb - 1] != 0 {
+                return Ordering::Less;
+            }
+            lb -= 1;
+            if la >= lb {
+                break;
+            }
+        }
+    }
+    debug_assert_eq!(la, lb);
+    // Compare the surviving ids from the most significant (highest index) down.
+    let mut i = la.min(lb);
+    while i > 0 {
+        i -= 1;
+        if ids_a[i] != ids_b[i] {
+            return ids_a[i].cmp(&ids_b[i]);
+        }
+    }
+    Ordering::Equal
+}
+
+/// The comparable words of a native-record **instance**, as read through the
+/// [`crate::record`] accessors: the field count, the definition's
+/// `(module, name, is_exported)` words, and its *sorted-key-ordered* key and value
+/// slices.
+///
+/// `pub(crate)`, together with [`record_parts`] and [`exported_rank`], so
+/// [`crate::hashing`]'s structural `term_hash` iterates exactly these words in
+/// exactly this order — the hash and the comparison cannot drift apart.
+pub(crate) struct RecordParts<'a> {
+    pub(crate) field_count: usize,
+    pub(crate) module: Eterm,
+    pub(crate) name: Eterm,
+    pub(crate) is_exported: Eterm,
+    pub(crate) keys: &'a [Eterm],
+    pub(crate) values: &'a [Eterm],
+}
+
+/// Reads a native-record instance's comparable words.
+///
+/// `None` for a malformed record — only reachable if the term was forged outside
+/// this crate (a definition that is not a valid definition block, or one whose arity
+/// disagrees with the instance's own header, as [`crate::record::record_get`] also
+/// guards against).
+///
+/// # Safety
+///
+/// `t` must be a live native-record instance; its storage must stay live and
+/// unmoved for `'a`.
+pub(crate) unsafe fn record_parts<'a>(t: Eterm) -> Option<RecordParts<'a>> {
+    // SAFETY: the caller guarantees `t` is a live native record, so its definition
+    // block, its key array and its own value words are all live.
+    let (field_count, keys, values, module, name, is_exported) = unsafe {
+        let field_count = record_field_count(t).ok()?;
+        let def = record_definition(t).ok()?;
+        (
+            field_count,
+            record_definition_keys(def).ok()?,
+            record_values(t).ok()?,
+            record_definition_module(def).ok()?,
+            record_definition_name(def).ok()?,
+            record_definition_is_exported(def).ok()?,
+        )
+    };
+    if keys.len() != field_count || values.len() != field_count {
+        return None;
+    }
+    Some(RecordParts {
+        field_count,
+        module,
+        name,
+        is_exported,
+        keys,
+        values,
+    })
+}
+
+/// The `false < true` order of a record definition's `is_exported` word
+/// (`erts/emulator/beam/utils.c:1917-1921`, `ASSERT(false < true)`).
+///
+/// The C stores the flag as an `int` (`0`/`1`) and subtracts the two operands; this
+/// crate stores the atom `false`/`true` (`AM_FALSE`/`AM_TRUE`, atom indices 0/1, see
+/// [`crate::record`]), so the atom index is the comparable value. A word that is not
+/// an atom (only reachable for a forged record) ranks after both.
+///
+/// `pub(crate)` so [`crate::hashing`]'s structural record hash mixes the *same*
+/// comparable value [`cmp_records`] compares.
+pub(crate) fn exported_rank(is_exported: Eterm) -> u32 {
+    if is_atom(is_exported) {
+        atom_val(is_exported).raw()
+    } else {
+        u32::MAX
+    }
+}
+
+/// Compare two native records — the `_TAG_HEADER_RECORD` arm of `erts_cmp_compound`
+/// (`erts/emulator/beam/utils.c:1878-1954`).
+///
+/// The field order: the definition's `module` atom, `name` atom (both through
+/// [`cmp_impl`], which routes two atoms to the C's `erts_cmp_atoms`) and
+/// `is_exported` (`false < true`), then the instance's field
+/// count, then the field **keys**, and finally the field **values** (`utils.c:1941-1952`;
+/// the C pushes the value pairs in reverse so they pop — and are compared — in
+/// ascending order).
+///
+/// This crate stores the definition keys and the instance values in **sorted-key
+/// order** (`crate::record`), so keys and values are compared index-aligned, and the
+/// comparison is always structural. **Documented deviation from the C:** `def_a !=
+/// def_b` there is a *canonicalisation pointer short-circuit* for the common "same
+/// definition" case, and its key/value loops index through `order_a[i]`/`order_b[i]`
+/// (declaration order) with a `RECORD_VALUE_PAIR` work-stack permutation. For two
+/// records with the same definition the result is exactly the C's; for the exotic
+/// case of two records that declare the same fields in *different* orders the C
+/// pairs them by declared position while this comparison pairs them by sorted key,
+/// so it can differ. (The field-count check uses [`record_field_count`] where the C
+/// compares `record_header_arity` — the same value `+ 1`, so the order is identical.)
+///
+/// A malformed record (only reachable if the term was forged outside this crate)
+/// falls back to the deterministic [`fallback_cmp`] rather than panicking.
+///
+/// # Safety
+///
+/// `a` and `b` must be live native record terms.
+unsafe fn cmp_records(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    // SAFETY: the caller guarantees both operands are live native records.
+    let (parts_a, parts_b) = unsafe { (record_parts(a), record_parts(b)) };
+    let (Some(ra), Some(rb)) = (parts_a, parts_b) else {
+        return fallback_cmp(a, b);
+    };
+    // The definition content, in the C's order (`utils.c:1907-1938`).
+    let ord = cmp_impl(ra.module, rb.module, atoms, exact);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    let ord = cmp_impl(ra.name, rb.name, atoms, exact);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    let ord = exported_rank(ra.is_exported).cmp(&exported_rank(rb.is_exported));
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    let ord = ra.field_count.cmp(&rb.field_count);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    for i in 0..ra.field_count {
+        let ord = cmp_impl(ra.keys[i], rb.keys[i], atoms, exact);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    for i in 0..ra.field_count {
+        let ord = cmp_impl(ra.values[i], rb.values[i], atoms, exact);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 /// The ascending kind rank of a fun, used as the leading key when two funs are
 /// of different kinds.
 ///
@@ -701,485 +989,4 @@ fn fallback_cmp(a: Eterm, b: Eterm) -> Ordering {
     arity_a
         .cmp(&arity_b)
         .then_with(|| a.raw().cmp(&b.raw()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::boxed::{make_boxed, make_header, HEADER_FLONUM};
-    use crate::fun::{fun_words, write_fun_external, write_fun_imported, write_fun_local, FunPid};
-    use crate::heap::Heap;
-    use crate::immediate::{make_atom, make_internal_pid, make_internal_port, make_pid_data, make_port_data, make_small, NIL};
-    use crate::tag::{HAMT_SUBTAG_HEAD_FLATMAP, HEAP_BITS_SUBTAG, REF_SUBTAG};
-    use crate::Atom;
-
-    fn atoms() -> AtomTable {
-        let mut t = AtomTable::new();
-        t.seed(["a", "b", "c", "z"]);
-        t
-    }
-
-    /// Build a [`FunKind::Local`] fun with `env` as its free variables.
-    ///
-    /// # Safety
-    ///
-    /// `heap` must own the [`fun_words`]-sized block and stay alive (and unmoved)
-    /// for as long as the returned term is used.
-    unsafe fn local_fun(heap: &mut Heap, uniq: u64, index: u32, env: &[Eterm]) -> Eterm {
-        // SAFETY: the caller keeps the block alive; `write_fun_local` writes it all.
-        let hp = unsafe { heap.alloc_words(fun_words(FunKind::Local, env.len())).unwrap() };
-        // SAFETY: `hp` addresses exactly `fun_words(Local, env.len())` words.
-        unsafe { write_fun_local(hp, 0, uniq, index, env).unwrap() }
-    }
-
-    /// Build a [`FunKind::External`] fun.
-    ///
-    /// # Safety
-    ///
-    /// As [`local_fun`].
-    unsafe fn external_fun(heap: &mut Heap, module: Atom, function: Atom, arity: usize) -> Eterm {
-        // SAFETY: the caller keeps the block alive.
-        let hp = unsafe { heap.alloc_words(fun_words(FunKind::External, 0)).unwrap() };
-        // SAFETY: `hp` addresses exactly `fun_words(External, 0)` words.
-        unsafe { write_fun_external(hp, arity, module, function).unwrap() }
-    }
-
-    /// Build a [`FunKind::Imported`] fun with `env` as its free variables.
-    ///
-    /// # Safety
-    ///
-    /// As [`local_fun`].
-    unsafe fn imported_fun(
-        heap: &mut Heap,
-        module: Atom,
-        index: u32,
-        old_uniq: u32,
-        env: &[Eterm],
-    ) -> Eterm {
-        // SAFETY: the caller keeps the block alive.
-        let hp = unsafe { heap.alloc_words(fun_words(FunKind::Imported, env.len())).unwrap() };
-        // SAFETY: `hp` addresses exactly `fun_words(Imported, env.len())` words.
-        unsafe {
-            write_fun_imported(
-                hp,
-                0,
-                module,
-                &[0u8; 16],
-                index,
-                0,
-                old_uniq,
-                FunPid {
-                    node: module,
-                    number: 0,
-                    serial: 0,
-                    creation: 0,
-                },
-                env,
-            )
-            .unwrap()
-        }
-    }
-
-    /// Build `#{Atom => Value}` as a flatmap (see `erl_map.h`).
-    unsafe fn flatmap(heap: &mut Heap, key: Eterm, value: Eterm) -> Eterm {
-        let keys = heap.tuple(&[key]).unwrap();
-        // SAFETY: the 4 words are fully written before the map term escapes.
-        let p = unsafe { heap.alloc_words(4).unwrap() };
-        unsafe {
-            *p = make_header(0, HAMT_SUBTAG_HEAD_FLATMAP);
-            *p.add(1) = Eterm::from_raw(1); // flatmap size
-            *p.add(2) = keys;
-            *p.add(3) = value;
-        }
-        make_boxed(p)
-    }
-
-    /// Build an internal ordinary ref thing (`ErtsORefThing`).
-    unsafe fn internal_ref(heap: &mut Heap) -> Eterm {
-        let p = unsafe { heap.alloc_words(3).unwrap() };
-        unsafe {
-            *p = make_header(2, REF_SUBTAG);
-            *p.add(1) = Eterm::from_raw(0xffff_ffff_0000_0000);
-            *p.add(2) = Eterm::from_raw(0x0000_0002_0000_0001);
-        }
-        make_boxed(p)
-    }
-
-    /// Build a 16-bit (2-byte) heap binary from a `u16`.
-    unsafe fn heap_binary(heap: &mut Heap, value: u16) -> Eterm {
-        let p = unsafe { heap.alloc_words(3).unwrap() };
-        unsafe {
-            *p = make_header(2, HEAP_BITS_SUBTAG);
-            *p.add(1) = Eterm::from_raw(16); // bit size
-            *p.add(2) = Eterm::from_raw(value as usize);
-        }
-        make_boxed(p)
-    }
-
-    fn float_term(bits: f64) -> Eterm {
-        let words: Box<[Eterm; 2]> = Box::new([HEADER_FLONUM, Eterm::from_raw(bits.to_bits() as usize)]);
-        let leaked: &'static [Eterm; 2] = Box::leak(words);
-        make_boxed(leaked.as_ptr())
-    }
-
-    #[test]
-    fn ordering_matches_the_documented_class_order() {
-        let a = atoms();
-        let mut heap = Heap::new(64);
-        let atom = make_atom(a.lookup("a").unwrap());
-        // SAFETY: the heap owns every boxed word built here.
-        let (tup, map, list, bin, r, pid, port) = unsafe {
-            (
-                heap.tuple(&[make_small(1)]).unwrap(),
-                flatmap(&mut heap, make_small(1), make_small(2)),
-                heap.cons(make_small(1), NIL).unwrap(),
-                heap_binary(&mut heap, 0x0102),
-                internal_ref(&mut heap),
-                make_internal_pid(make_pid_data(0, 7)),
-                make_internal_port(make_port_data(7)),
-            )
-        };
-        let number = make_small(42);
-
-        // number < atom < ref < port < pid < tuple < map < nil < list < binary
-        let ascending = [
-            number, atom, r, port, pid, tup, map, NIL, list, bin,
-        ];
-        for i in 0..ascending.len() {
-            for j in 0..ascending.len() {
-                let ord = cmp(ascending[i], ascending[j], &a);
-                if i < j {
-                    assert_eq!(ord, Ordering::Less, "expected {i} < {j}: {ord:?}");
-                } else if i == j {
-                    assert_eq!(ord, Ordering::Equal, "expected {i} == {j}");
-                } else {
-                    assert_eq!(ord, Ordering::Greater, "expected {i} > {j}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn atoms_compare_by_name_not_index() {
-        let a = atoms();
-        let (ia, ib, iz) = (
-            make_atom(a.lookup("a").unwrap()),
-            make_atom(a.lookup("b").unwrap()),
-            make_atom(a.lookup("z").unwrap()),
-        );
-        assert_eq!(cmp(ia, ib, &a), Ordering::Less);
-        assert_eq!(cmp(ib, ia, &a), Ordering::Greater);
-        assert_eq!(cmp(ia, ia, &a), Ordering::Equal);
-        assert_eq!(cmp(iz, ia, &a), Ordering::Greater);
-        assert!(eq(ia, ia, &a));
-        assert!(!eq(ia, ib, &a));
-    }
-
-    #[test]
-    fn unknown_atom_name_falls_back_to_index() {
-        let empty = AtomTable::new();
-        let a0 = make_atom(crate::Atom::from_raw(0));
-        let a1 = make_atom(crate::Atom::from_raw(1));
-        // No names known: deterministic index comparison, never a panic.
-        assert_eq!(cmp(a0, a1, &empty), Ordering::Less);
-        assert_eq!(cmp(a1, a0, &empty), Ordering::Greater);
-        assert_eq!(cmp(a0, a0, &empty), Ordering::Equal);
-    }
-
-    #[test]
-    fn small_integers_compare_numerically() {
-        let a = atoms();
-        for (x, y) in [(-5i64, 5i64), (0, 1), (-100, -99), (1_000_000, -1_000_000)] {
-            assert_eq!(cmp(make_small(x), make_small(y), &a), x.cmp(&y));
-        }
-    }
-
-    #[test]
-    fn tuples_compare_elementwise_then_by_arity() {
-        let a = atoms();
-        let mut heap = Heap::new(64);
-        let t1 = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
-        let t2 = heap.tuple(&[make_small(1), make_small(3)]).unwrap();
-        let t3 = heap.tuple(&[make_small(1), make_small(2), make_small(0)]).unwrap();
-        let t4 = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
-        assert_eq!(cmp(t1, t2, &a), Ordering::Less); // second element
-        assert_eq!(cmp(t2, t1, &a), Ordering::Greater);
-        assert_eq!(cmp(t1, t4, &a), Ordering::Equal); // structurally equal
-        assert_eq!(cmp(t1, t3, &a), Ordering::Less); // shorter arity sorts first
-        assert!(eq(t1, t4, &a));
-    }
-
-    #[test]
-    fn lists_compare_elementwise_then_by_tail() {
-        let a = atoms();
-        let mut heap = Heap::new(64);
-        let nil_list = NIL;
-        let one = heap.cons(make_small(1), NIL).unwrap();
-        let two = heap.cons(make_small(2), NIL).unwrap();
-        let two_copy = heap.cons(make_small(2), NIL).unwrap();
-        let one_two = heap.cons(make_small(1), two_copy).unwrap();
-        let one_copy = heap.cons(make_small(1), NIL).unwrap();
-        assert_eq!(cmp(one, two, &a), Ordering::Less);
-        assert_eq!(cmp(one, one_copy, &a), Ordering::Equal);
-        // `[1]` is a prefix of `[1,2]` => shorter sorts first.
-        assert_eq!(cmp(one, one_two, &a), Ordering::Less);
-        assert_eq!(cmp(one_two, one, &a), Ordering::Greater);
-        // `[]` < `[..]`
-        assert_eq!(cmp(nil_list, one, &a), Ordering::Less);
-    }
-
-    #[test]
-    fn binaries_compare_bitwise_then_by_size() {
-        let a = atoms();
-        let mut heap = Heap::new(64);
-        // SAFETY: heap owns these binaries.
-        let (b1, b2, b3) = unsafe {
-            (
-                heap_binary(&mut heap, 0x0102),
-                heap_binary(&mut heap, 0x0103),
-                heap_binary(&mut heap, 0x0102),
-            )
-        };
-        assert_eq!(cmp(b1, b2, &a), Ordering::Less);
-        assert_eq!(cmp(b2, b1, &a), Ordering::Greater);
-        assert_eq!(cmp(b1, b3, &a), Ordering::Equal);
-    }
-
-    #[test]
-    fn internal_pids_and_ports_compare_by_payload() {
-        let a = atoms();
-        let p1 = make_internal_pid(make_pid_data(0, 1));
-        let p2 = make_internal_pid(make_pid_data(0, 2));
-        assert_eq!(cmp(p1, p2, &a), Ordering::Less);
-        let o1 = make_internal_port(make_port_data(10));
-        let o2 = make_internal_port(make_port_data(20));
-        assert_eq!(cmp(o1, o2, &a), Ordering::Less);
-        assert_eq!(cmp(o1, o1, &a), Ordering::Equal);
-    }
-
-    #[test]
-    fn floats_use_exact_total_order_in_exact_mode() {
-        let a = atoms();
-        let zero = float_term(0.0);
-        let neg_zero = float_term(-0.0);
-        let one = float_term(1.0);
-        // exact (`=:=`): -0.0 < +0.0
-        assert_eq!(cmp(neg_zero, zero, &a), Ordering::Less);
-        assert_eq!(cmp(one, zero, &a), Ordering::Greater);
-        assert!(!eq(neg_zero, zero, &a));
-        // arithmetic (`==`): -0.0 == +0.0
-        assert_eq!(cmp_arith(neg_zero, zero, &a), Ordering::Equal);
-        assert_eq!(cmp_arith(float_term(1.5), float_term(1.25), &a), Ordering::Greater);
-    }
-
-    #[test]
-    fn integer_float_exactness_matches_erts_cmp() {
-        let a = atoms();
-        let one = make_small(1);
-        let one_f = float_term(1.0);
-        // exact (`=:=`): different classes order by class rank => number < float,
-        // but small vs float is *not* numeric equality.
-        assert!(!eq(one, one_f, &a));
-        assert_eq!(cmp(one, one_f, &a), Ordering::Less);
-        // arithmetic (`==`): numeric comparison => equal.
-        assert_eq!(cmp_arith(one, one_f, &a), Ordering::Equal);
-    }
-
-    #[test]
-    fn local_funs_compare_by_uniq_then_index_then_env() {
-        let a = atoms();
-        let mut heap = Heap::new(128);
-        // SAFETY: the heap owns every block built here.
-        let (l1, l2, l3, l4, l5, l1_copy) = unsafe {
-            (
-                local_fun(&mut heap, 1, 2, &[]),
-                local_fun(&mut heap, 5, 2, &[]),
-                local_fun(&mut heap, 1, 9, &[]),
-                local_fun(&mut heap, 1, 2, &[make_small(0)]),
-                local_fun(&mut heap, 1, 2, &[make_small(1)]),
-                local_fun(&mut heap, 1, 2, &[]),
-            )
-        };
-        assert_eq!(cmp(l1, l2, &a), Ordering::Less, "uniq decides");
-        assert_eq!(cmp(l1, l3, &a), Ordering::Less, "index decides");
-        assert_eq!(cmp(l1, l4, &a), Ordering::Less, "fewer free vars first");
-        assert_eq!(cmp(l4, l5, &a), Ordering::Less, "environment element-wise");
-        assert_eq!(cmp(l1, l1_copy, &a), Ordering::Equal);
-        assert!(eq(l1, l1_copy, &a));
-    }
-
-    #[test]
-    fn external_funs_compare_by_mfa_and_sort_after_local_kinds() {
-        let a = atoms();
-        let mut heap = Heap::new(128);
-        let m = a.lookup("a").unwrap();
-        let n = a.lookup("b").unwrap();
-        // SAFETY: the heap owns every block built here.
-        let (e1, e2, e3, e1_copy, l, i) = unsafe {
-            (
-                external_fun(&mut heap, m, n, 2),
-                external_fun(&mut heap, n, m, 2),
-                external_fun(&mut heap, m, n, 3),
-                external_fun(&mut heap, m, n, 2),
-                local_fun(&mut heap, 0, 0, &[]),
-                imported_fun(&mut heap, m, 0, 0, &[]),
-            )
-        };
-        assert_eq!(cmp(e1, e2, &a), Ordering::Less, "module decides");
-        assert_eq!(cmp(e1, e3, &a), Ordering::Less, "arity decides");
-        assert_eq!(cmp(e1, e1_copy, &a), Ordering::Equal);
-        assert_eq!(cmp(l, e1, &a), Ordering::Less, "external sorts after any local");
-        assert_eq!(cmp(i, e1, &a), Ordering::Less);
-        assert_eq!(cmp(e1, l, &a), Ordering::Greater);
-    }
-
-    #[test]
-    fn imported_funs_compare_by_module_index_old_uniq_then_env() {
-        let a = atoms();
-        let mut heap = Heap::new(128);
-        let m = a.lookup("a").unwrap();
-        let n = a.lookup("b").unwrap();
-        // SAFETY: the heap owns every block built here.
-        let (i1, i2, i3, i4, i5) = unsafe {
-            (
-                imported_fun(&mut heap, m, 1, 0, &[]),
-                imported_fun(&mut heap, n, 1, 0, &[]),
-                imported_fun(&mut heap, m, 2, 0, &[]),
-                imported_fun(&mut heap, m, 1, 7, &[]),
-                imported_fun(&mut heap, m, 1, 0, &[make_small(0)]),
-            )
-        };
-        assert_eq!(cmp(i1, i2, &a), Ordering::Less, "module decides");
-        assert_eq!(cmp(i1, i3, &a), Ordering::Less, "index decides");
-        assert_eq!(cmp(i1, i4, &a), Ordering::Less, "old_uniq decides");
-        assert_eq!(cmp(i1, i5, &a), Ordering::Less, "num_free decides");
-        // The M1 local descriptor sorts before the imported one.
-        // SAFETY: the heap owns the block.
-        let l = unsafe { local_fun(&mut heap, 0, 0, &[]) };
-        assert_eq!(cmp(l, i1, &a), Ordering::Less);
-        assert_eq!(cmp(i1, l, &a), Ordering::Greater);
-    }
-
-    #[test]
-    fn fun_ordering_is_total_over_mixed_kinds() {
-        // Leading with the kind is what keeps the order transitive: ordering a
-        // mixed Local/Imported pair by `index` alone could cycle.
-        let a = atoms();
-        let mut heap = Heap::new(128);
-        // SAFETY: the heap owns every block built here.
-        let (l_hi, l_lo, imp) = unsafe {
-            (
-                local_fun(&mut heap, 9, 2, &[]),
-                local_fun(&mut heap, 1, 5, &[]),
-                imported_fun(&mut heap, a.lookup("a").unwrap(), 2, 0, &[]),
-            )
-        };
-        let mut sorted = [l_hi, imp, l_lo];
-        sorted.sort_by(|x, y| cmp(*x, *y, &a));
-        assert_eq!(sorted, [l_lo, l_hi, imp]);
-        // The relation is antisymmetric across the kind boundary too.
-        assert_eq!(cmp(l_hi, imp, &a), Ordering::Less);
-        assert_eq!(cmp(imp, l_hi, &a), Ordering::Greater);
-    }
-
-    /// A word that is not a term at all must never be dereferenced: it sorts after
-    /// every real term (so it never ties with one) and two non-terms order by their
-    /// raw word. See the module docs.
-    #[test]
-    fn a_non_term_is_never_dereferenced_and_sorts_after_every_term() {
-        let a = atoms();
-        let mut heap = Heap::new(64);
-        let samples = [
-            make_small(0),
-            make_small(-1),
-            make_atom(a.lookup("a").unwrap()),
-            NIL,
-            heap.tuple(&[make_small(1)]).unwrap(),
-            heap.cons(make_small(1), NIL).unwrap(),
-        ];
-        // The ABI's `THE_NON_VALUE`, a bare `FLOAT` header word (what a 1-word
-        // "flonum" header looks like) and an arbitrary other header word.
-        for nt in [
-            crate::ops::THE_NON_VALUE,
-            HEADER_FLONUM,
-            Eterm::from_raw(0x3c),
-        ] {
-            assert!(!crate::tag::is_term_word(nt));
-            // The identical word still compares equal (it *is* the same word)...
-            assert_eq!(cmp(nt, nt, &a), Ordering::Equal);
-            assert_eq!(cmp_arith(nt, nt, &a), Ordering::Equal);
-            assert!(eq(nt, nt, &a));
-            for t in &samples {
-                // ... but a non-term never ties with, and never equals, a real term.
-                assert_eq!(cmp(nt, *t, &a), Ordering::Greater, "{nt:?} vs {t:?}");
-                assert_eq!(cmp(*t, nt, &a), Ordering::Less, "{t:?} vs {nt:?}");
-                assert_eq!(cmp_arith(nt, *t, &a), Ordering::Greater);
-                assert_eq!(cmp_arith(*t, nt, &a), Ordering::Less);
-                assert!(!eq(nt, *t, &a));
-                assert!(!eq(*t, nt, &a));
-            }
-        }
-        // Two *different* non-term words order deterministically by their raw word
-        // (`THE_NON_VALUE` is `0` in release and `0x18` in a debug build; both are
-        // below the `0x58` bare flonum header).
-        let (lo, hi) = (crate::ops::THE_NON_VALUE, HEADER_FLONUM);
-        assert!(lo.raw() < hi.raw());
-        assert_eq!(cmp(lo, hi, &a), Ordering::Less);
-        assert_eq!(cmp(hi, lo, &a), Ordering::Greater);
-    }
-
-    /// The non-term guard must be a no-op for valid input: every well-formed term
-    /// still compares by the documented term order
-    /// (`number < atom < ... < tuple < ... < nil < list`).
-    #[test]
-    fn valid_terms_keep_their_documented_order() {
-        let a = atoms();
-        let mut heap = Heap::new(128);
-        let list = heap.cons(make_small(1), NIL).unwrap();
-        let ordered = [
-            make_small(0),
-            make_small(1),
-            make_atom(a.lookup("a").unwrap()),
-            heap.tuple(&[make_small(1)]).unwrap(),
-            NIL,
-            list,
-        ];
-        for (i, x) in ordered.iter().enumerate() {
-            for (j, y) in ordered.iter().enumerate() {
-                assert_eq!(cmp(*x, *y, &a), i.cmp(&j), "sample {i} vs {j}");
-                assert_eq!(eq(*x, *y, &a), i == j, "sample {i} vs {j}");
-            }
-        }
-    }
-
-    #[test]
-    fn comparison_is_antisymmetric_over_samples() {
-        let a = atoms();
-        let mut heap = Heap::new(128);
-        // SAFETY: the heap owns every block built here.
-        let (fun_local, fun_ext) = unsafe {
-            (
-                local_fun(&mut heap, 3, 1, &[make_small(0)]),
-                external_fun(&mut heap, a.lookup("a").unwrap(), a.lookup("b").unwrap(), 1),
-            )
-        };
-        let samples = vec![
-            make_small(0),
-            make_small(7),
-            make_atom(a.lookup("a").unwrap()),
-            NIL,
-            heap.tuple(&[make_small(1)]).unwrap(),
-            heap.cons(make_small(1), NIL).unwrap(),
-            fun_local,
-            fun_ext,
-        ];
-        for x in &samples {
-            for y in &samples {
-                let xy = cmp(*x, *y, &a);
-                let yx = cmp(*y, *x, &a);
-                assert_eq!(xy, yx.reverse(), "antisymmetry violated for {x:?} {y:?}");
-                assert_eq!(eq(*x, *y, &a), xy.is_eq());
-            }
-        }
-    }
 }

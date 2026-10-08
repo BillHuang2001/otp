@@ -18,6 +18,22 @@
 //! so `size_object(42) == 0`, `size_object([1]) == 2`,
 //! `size_object({1,2,3}) == 4`, and `size_object([1,2,3]) == 6`.
 //!
+//! # Bounded, cycle-safe sizing
+//!
+//! `size_object_x` walks the graph **unconditionally**: it recurses per occurrence
+//! and has no notion of a budget, so a *cyclic* graph — a compound object reachable
+//! from itself, which only forged memory (a NIF handing back a graph pointing into
+//! an ancestor) can produce — sends the C into infinite recursion. This crate's walk
+//! is an explicit-stack DFS that keeps the compound objects on the **current path**,
+//! so it stops at the back-edge instead of looping: [`size_object`] returns the words
+//! counted up to it (a defined answer, documented on the function), and
+//! [`size_object_bounded`] reports the typed
+//! [`TermError::TermGraphCyclic`]/[`TermError::TermGraphTooLarge`] distinction.
+//!
+//! Both entry points share **one** walk (`sizing_walk`), which is the single place
+//! that knows how many words each object contributes and which of its slots are
+//! children (`describe_object`).
+//!
 //! # Internal layouts
 //!
 //! Like the C, every navigable interior is walked:
@@ -37,20 +53,365 @@
 //! * **Native records** (`RECORD_SUBTAG`) are treated like tuples (their
 //!   field-table layout is not yet modelled).
 
+use std::collections::HashSet;
+
 use crate::bitstring::{heap_bits_size_words, sub_bits_parts};
 use crate::boxed::{
     boxed_val, header_arity, is_boxed_term, is_flatmap_header, map_header_val, thing_arityval,
     ERL_SUB_BITS_SIZE, HEADER_BIN_REF,
 };
+use crate::error::TermError;
 use crate::eterm::Eterm;
 use crate::fun::{fun_desc_words, fun_kind_of_header, fun_num_free, fun_words};
 use crate::immediate::is_immediate;
-use crate::list::{car, cdr, is_list};
+use crate::list::{is_list, list_val};
 use crate::refc::ERL_REFC_BITS_SIZE;
 use crate::tag::{
     is_term_word, ARITYVAL_SUBTAG, FUN_SUBTAG, MAP_SUBTAG, RECORD_SUBTAG, SUB_BITS_SUBTAG,
     TAG_HEADER_MASK,
 };
+
+/// Whether a word can contribute heap words, so the walk must enter it: a term word
+/// that is not an immediate.
+///
+/// A word that is **not a term** (a bare header word — the ABI's `THE_NON_VALUE` and
+/// friends, see [`crate::tag::is_term_word`]) and an immediate both contribute `0` to
+/// every count, so the walk never stacks them.
+#[inline]
+fn needs_visit(t: Eterm) -> bool {
+    is_term_word(t) && !is_immediate(t)
+}
+
+/// The navigable child slots of one compound object.
+enum Children {
+    /// A cons cell's two words: `[CAR, CDR]` (`copy.c:107-111`).
+    Cons { head: Eterm, tail: Eterm },
+    /// `count` consecutive term slots starting at `base`, a pointer *into* the
+    /// object's payload.
+    Slots { base: *mut Eterm, count: usize },
+    /// The object exposes no navigable child: a float, bignum, ref, pid, port,
+    /// external thing, heap bitstring, or an on-heap refc-binary pair (whose off-heap
+    /// payload the C never descends into).
+    None,
+}
+
+/// One compound object: the words it contributes, the address that identifies it on a
+/// DFS path, and its navigable child slots.
+struct Object {
+    /// The object's address — the identity a DFS back-edge must match.
+    addr: usize,
+    /// The flat words the object itself contributes.
+    words: usize,
+    /// Its navigable child slots.
+    children: Children,
+}
+
+/// One entry of the explicit DFS stack both walks use.
+enum Step {
+    /// Enter a word. It may or may not turn out to be a compound object.
+    Enter(Eterm),
+    /// Leave the compound object at this address: it is no longer on the DFS path.
+    Exit(usize),
+}
+
+/// Describes the compound object `t` — the **single** definition of an object's
+/// interior: the words it contributes, the address identifying it, and its
+/// navigable children — or `None` when `t` contributes no heap words and exposes no
+/// child.
+///
+/// `None` covers exactly the words `size_object_x` never descends into:
+///
+/// * an **immediate** (small int, atom, `nil`, internal pid/port, catch) — 0 words;
+/// * a word that is **not a term at all** (a bare header word: the ABI's
+///   `THE_NON_VALUE` and friends) — it is not a term graph, so it occupies no heap
+///   word; the C dereferences it (`*boxed_val(0)`), this is the documented hardening;
+/// * the shared **zero-arity tuple literal** (`tuple0()`), which the C also skips
+///   (its `arity == 0` guard).
+///
+/// # Safety
+///
+/// The caller must pass a live word: if it is a boxed term its header word must be a
+/// live term word, and every child slot it exposes must be readable. That is the
+/// same caller invariant [`crate::compare::cmp`] and every other materialization
+/// entry point in this crate documents; forged memory (a `HEADER`-tagged word is
+/// rejected, but a `BOXXED`/`LIST`-tagged word pointing outside any heap is not) is
+/// outside what a crate without a heap registry can detect.
+unsafe fn describe_object(t: Eterm) -> Option<Object> {
+    if !needs_visit(t) {
+        return None;
+    }
+    if is_list(t) {
+        // A cons cell is a header-less 2-word object.
+        let p = list_val(t);
+        // SAFETY: `t` is a live, non-`NIL` cons cell, so both words are readable.
+        let (head, tail) = unsafe { (*p, *p.add(1)) };
+        return Some(Object {
+            addr: p as usize,
+            words: 2,
+            children: Children::Cons { head, tail },
+        });
+    }
+    let p = boxed_val(t);
+    // SAFETY: `t` is a live boxed term, so `p` addresses its header word.
+    let header = unsafe { *p };
+    match header.raw() & TAG_HEADER_MASK {
+        ARITYVAL_SUBTAG | RECORD_SUBTAG => {
+            let arity = header_arity(header);
+            // The zero-arity tuple is the shared global literal: 0 words.
+            if arity == 0 {
+                return None;
+            }
+            Some(Object {
+                addr: p as usize,
+                words: arity + 1,
+                // SAFETY: element slot `0` is the first of the `arity` payload words.
+                children: Children::Slots {
+                    base: unsafe { p.add(1) },
+                    count: arity,
+                },
+            })
+        }
+        FUN_SUBTAG => {
+            // A fun block is `1 (header) + desc_words(kind) + num_free`
+            // (see `crate::fun`): the M1 inlined descriptor replaces the C
+            // `entry` pointer, so the env does **not** start at the C
+            // `ERL_FUN_SIZE`. `fun_words` is that same expression.
+            let kind = fun_kind_of_header(header);
+            let num_free = fun_num_free(header);
+            Some(Object {
+                addr: p as usize,
+                words: fun_words(kind, num_free),
+                // SAFETY: the environment starts at `1 + desc_words(kind)` and holds
+                // `num_free` slots within the block `fun_words` sized.
+                children: Children::Slots {
+                    base: unsafe { p.add(1 + fun_desc_words(kind)) },
+                    count: num_free,
+                },
+            })
+        }
+        MAP_SUBTAG => {
+            if is_flatmap_header(header) {
+                // flatmap_t = [thing_word, size, keys(tuple), V0..V(size-1)].
+                // SAFETY: word `1` is the flat map's `size` field.
+                let size = unsafe { *p.add(1) }.raw();
+                Some(Object {
+                    addr: p as usize,
+                    words: size + 3,
+                    // SAFETY: word `2` is the keys tuple, followed by the `size`
+                    // values.
+                    children: Children::Slots {
+                        base: unsafe { p.add(2) },
+                        count: size + 1,
+                    },
+                })
+            } else {
+                // Every other map header is a HAMT node: a head-array, a
+                // head-bitmap or an inner node-bitmap. `header_arity(header)`
+                // is `1` for the two head kinds (their extra `size` word) and
+                // `0` for an inner node, so the slots start at
+                // `1 + header_arity`. Mirrors `size_object_x`
+                // (`copy.c:192-214`): `sum += 1 + popcount(MAP_HEADER_VAL) +
+                // header_arity`, then traverses every slot so the whole trie
+                // (leaves, sub-nodes and collision tuples) is reached.
+                let arity = header_arity(header);
+                let nslots = map_header_val(header).count_ones() as usize;
+                Some(Object {
+                    addr: p as usize,
+                    words: 1 + nslots + arity,
+                    // SAFETY: the `nslots` slots follow the `arity` offset words.
+                    children: Children::Slots {
+                        base: unsafe { p.add(1 + arity) },
+                        count: nslots,
+                    },
+                })
+            }
+        }
+        SUB_BITS_SUBTAG => {
+            // `[HEADER_SUB_BITS, base_flags, start, end, orig]` (`copy.c:219-242`).
+            // SAFETY: `t` is a live `ErlSubBits` block.
+            let (_base_flags, start, end, orig) = unsafe { sub_bits_parts(t) };
+            let words = if is_boxed_term(orig) {
+                // SAFETY: `orig` is a boxed term; the C reads
+                // `*boxed_val(sb->orig)` unconditionally (`copy.c:222`).
+                let underlying = unsafe { *boxed_val(orig) };
+                if underlying == HEADER_BIN_REF {
+                    // A full refc binary: the on-heap representation is the
+                    // `[BinRef(3)][ErlSubBits(5)]` pair whose root is this
+                    // `ErlSubBits`; the C counts the whole pair in one go
+                    // (the `BinRef`'s own `val`/`next` are off-heap scalar
+                    // pointers contributing no heap words).
+                    ERL_REFC_BITS_SIZE
+                } else {
+                    // A match context over an on-heap bitstring: the copy
+                    // materialises a fresh heap-bits block for the window
+                    // (which is why the underlying thing is not traversed).
+                    heap_bits_size_words(end.raw().saturating_sub(start.raw()))
+                }
+            } else {
+                // Not a term the C accepts: `boxed_val(sb->orig)` would
+                // dereference a bogus pointer there. A standalone/malformed
+                // `ErlSubBits` reports its own thing size instead.
+                ERL_SUB_BITS_SIZE
+            };
+            Some(Object {
+                addr: p as usize,
+                words,
+                children: Children::None,
+            })
+        }
+        _ => Some(Object {
+            // Float, bignum, ref, bin ref, heap bits, external pid/port/ref:
+            // header + payload. None of these has navigable subterms.
+            addr: p as usize,
+            words: thing_arityval(header) + 1,
+            children: Children::None,
+        }),
+    }
+}
+
+/// Pushes every navigable child of `children` onto a DFS `stack`.
+fn push_children(children: &Children, stack: &mut Vec<Step>) {
+    match children {
+        Children::None => {}
+        Children::Cons { head, tail } => {
+            if needs_visit(*tail) {
+                stack.push(Step::Enter(*tail));
+            }
+            if needs_visit(*head) {
+                stack.push(Step::Enter(*head));
+            }
+        }
+        Children::Slots { base, count } => {
+            for i in 0..*count {
+                // SAFETY: `base` addresses `count` live term slots of the object the
+                // `Children::Slots` value was derived from.
+                let child = unsafe { *base.add(i) };
+                if needs_visit(child) {
+                    stack.push(Step::Enter(child));
+                }
+            }
+        }
+    }
+}
+
+/// Where [`sizing_walk`] stopped, and the words it had counted by then.
+enum Sizing {
+    /// The whole graph was walked: the count is the term's flat size. No limit was
+    /// exceeded and no cycle was found.
+    Complete(usize),
+    /// The running total passed the walk's `limit` before the graph was exhausted.
+    OverLimit(usize),
+    /// A compound object was reached while still on the DFS path: the graph is
+    /// **cyclic**, so it has no flat size. `usize` is the count accumulated up to the
+    /// back-edge, which is what makes [`size_object`] total on such a graph.
+    Cyclic(usize),
+}
+
+/// The cycle-safe, `limit`-bounded sizing walk shared by [`size_object`] and
+/// [`size_object_bounded`].
+///
+/// It is `size_object_x`'s walk (`copy.c:88-263`) turned into an explicit-stack DFS
+/// with a **path set**: `on_path` holds the addresses of the compound objects on the
+/// current DFS path, so reaching one of them again is a back-edge — a cycle — and the
+/// walk stops there instead of looping. Sharing an object between two *sibling*
+/// positions is not a cycle (the first subtree leaves the path before the second
+/// enters it), so a valid graph that shares a literal/boxed subterm is still sized
+/// once **per occurrence**, exactly as `size_object_x`/`copy_struct` count it. A
+/// global "already seen" set would under-count such a graph, which is why the set is
+/// path-based.
+///
+/// The `limit` bounds the work: [`Sizing::OverLimit`] is returned as soon as the
+/// running total passes it, so a huge (or cyclic) graph cannot make the walk run
+/// away. The total only ever counts objects actually entered, so on an **acyclic**
+/// graph `OverLimit` means the true flat size really does exceed `limit`.
+///
+/// The walk is iterative — a deep list cannot overflow the native stack — and uses
+/// `O(visited compound objects)` stack/`on_path` memory.
+fn sizing_walk(root: Eterm, limit: usize) -> Sizing {
+    let mut total = 0usize;
+    let mut on_path: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<Step> = vec![Step::Enter(root)];
+
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Exit(addr) => {
+                on_path.remove(&addr);
+            }
+            Step::Enter(t) => {
+                // SAFETY: the walk is entered with a live word and every child it
+                // exposes is a live word of the same graph.
+                let Some(object) = (unsafe { describe_object(t) }) else {
+                    // An immediate / non-term / shared empty tuple literal: 0 words.
+                    continue;
+                };
+                let has_children = !matches!(object.children, Children::None);
+                if has_children && !on_path.insert(object.addr) {
+                    // A back-edge: the object is one of its own ancestors.
+                    return Sizing::Cyclic(total);
+                }
+                total = total.saturating_add(object.words);
+                if total > limit {
+                    return Sizing::OverLimit(total);
+                }
+                if has_children {
+                    stack.push(Step::Exit(object.addr));
+                    push_children(&object.children, &mut stack);
+                }
+            }
+        }
+    }
+    Sizing::Complete(total)
+}
+
+/// Whether the term graph rooted at `root` is **acyclic**.
+///
+/// The same DFS and the same `describe_object` child enumeration as [`sizing_walk`],
+/// but it accounts no words and adds a `done` set, making it the classic three-colour
+/// cycle check: a revisit of an object on the path is a back-edge (a cycle), and an
+/// object already finished (`done`) needs no second look. That keeps it in
+/// `O(V + E)` work over the *distinct* objects with `O(V)` memory (where a path-based
+/// check would re-walk a shared subterm once per path).
+///
+/// It is only ever called on the **error** path of [`size_object_bounded`] — after the
+/// bounded walk has already shown the graph does not fit — so its sets are never paid
+/// on the happy path. It is what lets [`TermError::TermGraphCyclic`] win over
+/// [`TermError::TermGraphTooLarge`] even when the limit is hit before the cycle-closing
+/// edge is reached.
+fn is_acyclic(root: Eterm) -> bool {
+    let mut on_path: HashSet<usize> = HashSet::new();
+    let mut done: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<Step> = vec![Step::Enter(root)];
+
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Exit(addr) => {
+                on_path.remove(&addr);
+                done.insert(addr);
+            }
+            Step::Enter(t) => {
+                // SAFETY: as in `sizing_walk` — a live word and live children.
+                let Some(object) = (unsafe { describe_object(t) }) else {
+                    continue;
+                };
+                let has_children = !matches!(object.children, Children::None);
+                if has_children {
+                    if on_path.contains(&object.addr) {
+                        // A back-edge: the object is one of its own ancestors.
+                        return false;
+                    }
+                    if done.contains(&object.addr) {
+                        // Fully explored already, with no cycle below it: skip.
+                        continue;
+                    }
+                    on_path.insert(object.addr);
+                    stack.push(Step::Exit(object.addr));
+                }
+                push_children(&object.children, &mut stack);
+            }
+        }
+    }
+    true
+}
 
 /// The flat number of heap words the term graph `a` occupies.
 ///
@@ -62,141 +423,57 @@ use crate::tag::{
 /// a term graph at all, so no heap word belongs to it. The C dereferences such a
 /// word (`*boxed_val(0)`), so this is a documented, panic-free hardening — the
 /// size of every valid term is unchanged.
+///
+/// A **cyclic** graph is the one case where no flat size exists. Where
+/// `size_object_x` recurses forever, this walk stops at the back-edge and returns the
+/// words counted up to it — the part of the walk *before* the edge that closed the
+/// cycle (the cycle-closing object is not counted a second time). That number is
+/// deliberately **not** a meaningful size: it exists so this function is total and
+/// never hangs. Use [`size_object_bounded`] to learn that a graph is cyclic.
 pub fn size_object(a: Eterm) -> usize {
-    let mut total = 0usize;
-    // An explicit worklist linearises lists and avoids native-stack recursion.
-    let mut work: Vec<Eterm> = Vec::new();
-    let mut current = a;
-
-    loop {
-        if !is_term_word(current) {
-            // A non-term word: not a term graph, so it occupies no heap words (and
-            // must not be dereferenced as a boxed pointer).
-        } else if is_immediate(current) {
-            // Immediates occupy no heap words.
-        } else if is_list(current) {
-            // A cons cell is a header-less 2-word object.
-            total += 2;
-            // SAFETY: `current` is a live non-`NIL` cons cell.
-            let (head, tail) = unsafe { (car(current), cdr(current)) };
-            if !is_immediate(head) {
-                work.push(head);
-            }
-            // Linearise the list: continue with the tail.
-            current = tail;
-            continue;
-        } else {
-            // SAFETY: `current` is a live boxed term; its header word is valid.
-            let p = boxed_val(current);
-            let header = unsafe { *p };
-            match header.raw() & TAG_HEADER_MASK {
-                ARITYVAL_SUBTAG | RECORD_SUBTAG => {
-                    let arity = header_arity(header);
-                    // The zero-arity tuple is the shared global literal: 0 words.
-                    if arity > 0 {
-                        total += arity + 1;
-                        for i in 0..arity {
-                            // SAFETY: element `i` is within the payload.
-                            let elem = unsafe { *p.add(1 + i) };
-                            if !is_immediate(elem) {
-                                work.push(elem);
-                            }
-                        }
-                    }
-                }
-                FUN_SUBTAG => {
-                    // A fun block is `1 (header) + desc_words(kind) + num_free`
-                    // (see `crate::fun`): the M1 inlined descriptor replaces the C
-                    // `entry` pointer, so the env does **not** start at the C
-                    // `ERL_FUN_SIZE`. `fun_words` is that same expression.
-                    let kind = fun_kind_of_header(header);
-                    let num_free = fun_num_free(header);
-                    total += fun_words(kind, num_free);
-                    let env = 1 + fun_desc_words(kind);
-                    for i in 0..num_free {
-                        // SAFETY: environment word `i` is within the payload.
-                        let elem = unsafe { *p.add(env + i) };
-                        if !is_immediate(elem) {
-                            work.push(elem);
-                        }
-                    }
-                }
-                MAP_SUBTAG => {
-                    if is_flatmap_header(header) {
-                        // flatmap_t = [thing_word, size, keys(tuple), V0..V(size-1)].
-                        let size = unsafe { *p.add(1) }.raw();
-                        total += size + 3;
-                        for i in 0..=size {
-                            // SAFETY: word `2 + i` is within the payload.
-                            let elem = unsafe { *p.add(2 + i) };
-                            if !is_immediate(elem) {
-                                work.push(elem);
-                            }
-                        }
-                    } else {
-                        // Every other map header is a HAMT node: a head-array, a
-                        // head-bitmap or an inner node-bitmap. `header_arity(header)`
-                        // is `1` for the two head kinds (their extra `size` word) and
-                        // `0` for an inner node, so the slots start at
-                        // `1 + header_arity`. Mirrors `size_object_x`
-                        // (`copy.c:192-214`): `sum += 1 + popcount(MAP_HEADER_VAL) +
-                        // header_arity`, then pushes every slot so the whole trie
-                        // (leaves, sub-nodes and collision tuples) is reached.
-                        let arity = header_arity(header);
-                        let nslots = map_header_val(header).count_ones() as usize;
-                        total += 1 + nslots + arity;
-                        for i in 0..nslots {
-                            // SAFETY: slot `i` is within the node's payload.
-                            let slot = unsafe { *p.add(1 + arity + i) };
-                            if !is_immediate(slot) {
-                                work.push(slot);
-                            }
-                        }
-                    }
-                }
-                SUB_BITS_SUBTAG => {
-                    // `[HEADER_SUB_BITS, base_flags, start, end, orig]` (`copy.c:219-242`).
-                    let (_base_flags, start, end, orig) = unsafe { sub_bits_parts(current) };
-                    if is_boxed_term(orig) {
-                        // SAFETY: `orig` is a boxed term; the C reads
-                        // `*boxed_val(sb->orig)` unconditionally (`copy.c:222`).
-                        let underlying = unsafe { *boxed_val(orig) };
-                        if underlying == HEADER_BIN_REF {
-                            // A full refc binary: the on-heap representation is the
-                            // `[BinRef(3)][ErlSubBits(5)]` pair whose root is this
-                            // `ErlSubBits`; the C counts the whole pair in one go
-                            // (the `BinRef`'s own `val`/`next` are off-heap scalar
-                            // pointers contributing no heap words).
-                            total += ERL_REFC_BITS_SIZE;
-                        } else {
-                            // A match context over an on-heap bitstring: the copy
-                            // materialises a fresh heap-bits block for the window
-                            // (which is why the underlying thing is not traversed).
-                            total += heap_bits_size_words(end.raw().saturating_sub(start.raw()));
-                        }
-                    } else {
-                        // Not a term the C accepts: `boxed_val(sb->orig)` would
-                        // dereference a bogus pointer there. A standalone/malformed
-                        // `ErlSubBits` reports its own thing size instead.
-                        total += ERL_SUB_BITS_SIZE;
-                    }
-                }
-                _ => {
-                    // Float, bignum, ref, bin ref, heap bits, external
-                    // pid/port/ref: header + payload. None of these has navigable
-                    // subterms.
-                    total += thing_arityval(header) + 1;
-                }
-            }
-        }
-
-        match work.pop() {
-            Some(next) => current = next,
-            None => return total,
-        }
+    // The unbounded walk: only `Complete` and `Cyclic` can come back (the saturated
+    // total of a real graph is `<= usize::MAX == limit`).
+    match sizing_walk(a, usize::MAX) {
+        Sizing::Complete(words) | Sizing::OverLimit(words) | Sizing::Cyclic(words) => words,
     }
 }
 
+/// [`size_object`] with an explicit word budget, and with the reason a graph cannot
+/// be sized reported as a typed error instead of a count.
+///
+/// The precise invariant — for the whole graph reachable from `a`:
+///
+/// * **acyclic** and its flat word count `n` satisfies `n <= limit` → `Ok(n)`,
+///   identical to [`size_object`]`(a)`;
+/// * **acyclic** and `n > limit` → `Err(`[`TermError::TermGraphTooLarge`]`)`;
+/// * **cyclic** (a compound object reachable from itself) →
+///   `Err(`[`TermError::TermGraphCyclic`]`)`, which takes priority over
+///   `TermGraphTooLarge` even when the limit is hit before the cycle-closing edge is
+///   reached: the bounded walk stops at the budget, then a second, acyclicity-only
+///   pass (never paid on the happy path, see `is_acyclic`) tells the two apart;
+/// * a word that is **not a term** ([`crate::tag::is_term_word`] false — the ABI's
+///   `THE_NON_VALUE` and other bare header words) contributes `0` and is never
+///   dereferenced, as does a non-term slot inside an otherwise valid container.
+///
+/// The walk is iterative, so a deep list cannot overflow the native stack, and it
+/// terminates in `O(visited compound objects)` work with `O(visited)` memory — a
+/// forged cyclic graph is a typed error, never a hang. "Visited" counts
+/// *occurrences*, not distinct objects: like `size_object_x`, a subterm a valid graph
+/// shares between two sibling positions is sized once per occurrence.
+pub fn size_object_bounded(a: Eterm, limit: usize) -> Result<usize, TermError> {
+    match sizing_walk(a, limit) {
+        Sizing::Complete(words) => Ok(words),
+        // The back-edge was reached before the budget: unambiguously cyclic.
+        Sizing::Cyclic(_) => Err(TermError::TermGraphCyclic),
+        Sizing::OverLimit(_) => {
+            if is_acyclic(a) {
+                Err(TermError::TermGraphTooLarge)
+            } else {
+                Err(TermError::TermGraphCyclic)
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

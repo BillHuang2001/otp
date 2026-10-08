@@ -5,10 +5,15 @@ use super::emit::*;
 use super::runtime::{RUNTIME_MACHINE_DISP, RUNTIME_XREGS_DISP};
 use super::*;
 use crate::jit::emitter::Reg;
+use crate::jit::Tier;
 use crate::machine::MAX_REGISTER;
 use crate::MinimalContext;
-use beam_loader::{Import, ImportRef, Instr, Label, Operand, Reg as RegRef, NO_FAIL};
+use beam_loader::{
+    Block, Export, Function, Import, ImportRef, Instr, Label, Operand, Reg as RegRef, NO_FAIL,
+};
 use beam_term::{make_small, MAX_SMALL, MIN_SMALL, NIL};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 #[test]
 fn target_encoding_round_trips() {
@@ -303,4 +308,169 @@ fn allocation_caches_the_fast_path_operands_and_destination() {
         Operand::X(2),
     )];
     assert!(allocate_registers(&module, &code, 0, code.len()).slots.is_empty());
+}
+
+// -- the run-entry bookkeeping on the export path ------------------------
+
+/// A one-function module exercising the **export** entry: `func_label` 1, entry
+/// label 2, body `code`, exported as `name/0`, with the loader's label-delimited
+/// block decomposition (so the native tier compiles real blocks rather than none
+/// — see the same helper in `crate::machine::run`'s tests).
+fn exported_module(name: &str, code: Vec<Instr>) -> (Module, Atom) {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("entry_mod");
+    let function_name = module.atom_table.intern(name);
+    let labels: BTreeMap<Label, usize> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ins)| match ins {
+            Instr::Label(l) => Some((*l, i)),
+            _ => None,
+        })
+        .collect();
+    let code_len = code.len();
+    let mut starts: Vec<(usize, Label)> = labels.iter().map(|(l, at)| (*at, *l)).collect();
+    starts.sort_by_key(|(at, _)| *at);
+    starts.dedup_by_key(|(at, _)| *at);
+    let mut blocks = Vec::with_capacity(starts.len());
+    for (index, (start, label)) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).map_or(code_len, |(at, _)| *at);
+        if *start < end {
+            blocks.push(Block {
+                label: *label,
+                start: *start,
+                end,
+            });
+        }
+    }
+    module.functions = vec![Function {
+        func_label: Label(1),
+        entry_label: Label(2),
+        module: module.name,
+        name: function_name,
+        arity: 0,
+        code,
+        blocks,
+        labels,
+    }];
+    module.exports = vec![Export {
+        function: function_name,
+        arity: 0,
+        label: Label(2),
+    }];
+    (module, function_name)
+}
+
+/// The native baseline **export** entry must perform the same per-run bookkeeping
+/// as the interpreter: [`Machine::enter_run`] records the run's entry `(func,
+/// arity)` (`Machine::entry_call`), which backs `process_info/2`'s
+/// `initial_call`/`current_function`. `run_native_outcome` used to skip that call,
+/// so a process entered through the baseline export path reported a different
+/// run-entry position than the interpreter for the same module/export.
+#[test]
+fn the_export_entry_records_the_run_entry_call_like_the_interpreter() {
+    let (module, name) = exported_module(
+        "f",
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Integer(5),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+
+    // Both tiers run the same module/export and return the same value.
+    let mut interpreter = Machine::new();
+    let mut interpreter_ctx = MinimalContext::new();
+    assert_eq!(
+        interpreter
+            .run_export_outcome_with_tier(
+                &module,
+                name,
+                0,
+                &[],
+                &mut interpreter_ctx,
+                Tier::Interpreter,
+            )
+            .expect("interpreter run"),
+        RunOutcome::Returned(make_small(5))
+    );
+
+    let mut baseline = Machine::new();
+    let mut baseline_ctx = MinimalContext::new();
+    assert_eq!(
+        baseline
+            .run_export_outcome_with_tier(
+                &module,
+                name,
+                0,
+                &[],
+                &mut baseline_ctx,
+                Tier::BaselineJit,
+            )
+            .expect("baseline run"),
+        RunOutcome::Returned(make_small(5))
+    );
+
+    // The interpreter's own export entry records the entry function/arity; the
+    // baseline export entry must record exactly the same.
+    assert_eq!(
+        interpreter.entry_call(),
+        Some((0, 0)),
+        "the interpreter records the run's entry function/arity"
+    );
+    assert_eq!(
+        baseline.entry_call(),
+        interpreter.entry_call(),
+        "the baseline export entry must record the same entry call"
+    );
+
+    // Both the raw execution position and the derived `{M,F,A}` introspection
+    // agree across the two tiers for the same module/export.
+    assert_eq!(
+        baseline.current_code(),
+        interpreter.current_code(),
+        "the two tiers end at the same interpreted position"
+    );
+    assert_eq!(
+        baseline.frame_depth(),
+        interpreter.frame_depth(),
+        "the two tiers leave the same frame depth"
+    );
+    for (label, (interpreter_term, baseline_term)) in [
+        (
+            "initial_call",
+            (
+                interpreter.initial_call(&module, &mut MinimalContext::new()),
+                baseline.initial_call(&module, &mut MinimalContext::new()),
+            ),
+        ),
+        (
+            "current_function",
+            (
+                interpreter.current_function(&module, &mut MinimalContext::new()),
+                baseline.current_function(&module, &mut MinimalContext::new()),
+            ),
+        ),
+    ] {
+        let interpreter_term = interpreter_term.expect("interpreter introspection");
+        let baseline_term = baseline_term.expect("baseline introspection");
+        assert!(interpreter_term.is_some(), "{label}: a completed run");
+        assert!(
+            baseline_term.is_some(),
+            "{label}: the baseline export entry must report it too"
+        );
+        assert_eq!(
+            beam_term::cmp(
+                interpreter_term.unwrap(),
+                baseline_term.unwrap(),
+                &module.atom_table
+            ),
+            Ordering::Equal,
+            "{label} must agree across the interpreter and baseline tiers"
+        );
+    }
 }
