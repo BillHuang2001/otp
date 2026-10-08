@@ -38,9 +38,11 @@
 //!
 //! A `receive` that finds no message available **suspends** the process: the
 //! blocking-aware entries ([`Machine::run_export_outcome`]/
-//! [`Machine::resume_outcome`]) report it as [`RunOutcome::Wait`], while the plain
-//! [`Machine::run_export`]/[`Machine::run_label`] (and the native JIT tiers) fold
-//! it into the typed [`error::blocked`] error.
+//! [`Machine::resume_outcome`], and the tier-selecting
+//! [`Machine::run_export_outcome_with_tier`]/[`Machine::run_label_outcome_with_tier`])
+//! report it as [`RunOutcome::Wait`], while the plain
+//! [`Machine::run_export`]/[`Machine::run_label`] (and the native JIT tiers'
+//! non-blocking entries) fold it into the typed [`error::blocked`] error.
 //!
 //! ## Status
 //!
@@ -82,7 +84,7 @@ mod step;
 pub mod terms;
 pub use context::{ExecutionContext, Mailbox, MinimalContext};
 pub use error::{bad_register, blocked, unknown_label, unsupported};
-pub use jit::{available_tiers, JitBackend, Tier, TierPolicy};
+pub use jit::{available_tiers, CodeRegion, JitBackend, Tier, TierPolicy};
 pub use machine::{CatchFrame, Machine, RunOutcome, MAX_REGISTER};
 pub(crate) use step::Step;
 
