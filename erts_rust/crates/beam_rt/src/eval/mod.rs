@@ -2203,13 +2203,16 @@ mod tests {
 
     #[test]
     fn a_capability_gap_is_uncatchable() {
-        // `erlang:statistics/1` is a known-but-unimplemented BIF, so it raises the
-        // `unsupported` capability gap. A `try`/`catch` in the expression must NOT turn
-        // that into an apparent exception: it propagates out (classified by
+        // `erlang:statistics(scheduler_wall_time)` is a valid statistics key this runtime
+        // cannot measure (per-scheduler CPU time), so the `RuntimeHooks` bridge reports it
+        // as the `unsupported` capability gap. A `try`/`catch` in the expression must NOT
+        // turn that into an apparent exception: it propagates out (classified by
         // `unsupported_reason`) so the CLI exits 3 with `beam_rt: unsupported: …`.
+        // (`statistics(wall_clock)`/`statistics(run_queue)` are **served** now — they are
+        // cross-checked against the oracle by `tests/runtime_hooks.rs`.)
         for expr in [
-            "try erlang:statistics(wall_clock) catch _:_ -> 0 end",
-            "try (erlang:statistics(wall_clock)) of V -> V catch C:R -> ok end",
+            "try erlang:statistics(scheduler_wall_time) catch _:_ -> 0 end",
+            "try (erlang:statistics(scheduler_wall_time)) of V -> V catch C:R -> ok end",
         ] {
             let error = run(expr).expect_err("a capability gap propagates");
             assert!(
