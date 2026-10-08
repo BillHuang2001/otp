@@ -680,30 +680,17 @@ impl Table {
   there); the faithful form is `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the
   `beam_bifs` `ets:lookup_element` bridge must route the multi kinds through `lookup_element_all` and
   build the list.
-- **`tab2file`/`file2tab`/`tabfile_info`/`tab2file`-family are BLOCKED — not merely out of scope.**
-  Implementing them inside this crate is impossible without widening its dependency edges, because the
-  ETS table-file format is `{Header, Objects, Footer}` where **every** field is an External-Term-Format
-  term (`$TAB2FILE`-style magic, an `{version, …}`/`{info, …}` header, the objects, and a
-  `{hfile, Size, MD5}` footer). Rendering and parsing those terms needs a term codec, which lives in
-  `beam_codec` — a **new cross-crate dependency edge** (`beam_ets` is wave 1, `beam_codec` is wave 1,
-  and the layer DAG currently has no `beam_ets → beam_codec` edge). Writing/reading the file itself
-  needs a file descriptor / I-O, which lives in `beam_io`/`std::fs`; `beam_io` is wave 5, so that is a
-  second new edge **in the wrong direction** (a wave-1 crate may not depend upward). Both edges are
-  forbidden by the crate-layer contracts (`../CONTEXT.md` *No duplication across crates* / the wave
-  table) without explicit parent approval. `ets:tab2file/3` also has oracle behaviours beyond I-O
-  (`{extended_info, …}`, the `sync`/`sync_verbose` modes, the ~10 000-object chunking, and re-raising
-  the caller's `badarg` for a non-tuple object) that would need their own modelling. Verdict: **not
-  implemented**, blocked on (a) a `beam_codec` encode/decode edge for the table-file terms and (b) a
-  file-I/O edge — both are cross-crate decisions owned by `../` (the crate layer), not by this crate.
-  The same reasoning blocks `file2tab`/`tabfile_info`; `tab2list` + `first`/`next` remain the
-  supported enumeration path.
-- **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
+- **`tab2file`/`file2tab`/`tabfile_info` are BLOCKED, not merely out of scope.** The table-file format
+  is `{Header, Objects, Footer}` with **every** field an External-Term-Format term, so it needs a term
+  codec (`beam_codec`) *and* file I/O (`beam_io` is wave 5 — an edge pointing **upward**, forbidden for
+  a wave-1 crate). Both are cross-crate decisions owned by `../`. `tab2list` + `first`/`next` remain
+  the enumeration path. Full reasoning in `ETS_SURFACE.md` §5.
+- **Operations outside this crate's scope** (all present in OTP 29): `update_element/4`,
   `select_reverse/*`, `foldl`/`foldr`, `rename/2`, `whereis/1`, `table/1,2`, `slot/2`,
-  `tab2file*`/`file2tab*`. (`ets:clear/1`, `ets:size/1` and
-  `ets:match_spec_test/2,3` do **not** exist in OTP 29 — calling `match_spec_test` raises
-  `error:undef` — so their absence is correct; `ets:info(T, size)` is the supported spelling of the
-  size query.) The `/3` limited forms are implemented but their opaque **continuation terms** and the
-  bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's.
+  `tab2file*`/`file2tab*` — `ETS_SURFACE.md` §1–§5 names the owner (BIF layer / runtime / stdlib) and
+  the blocker for every one. (`ets:clear/1` and `ets:size/1` do **not** exist in OTP 29, so their
+  absence is correct.) The `/3` limited forms are implemented; their opaque **continuation terms** and
+  the bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's.
 - **`match_spec_run` accepts a RAW spec, unlike the oracle.** The oracle's `ets:match_spec_run/2`
   requires a spec already compiled by `ets:match_spec_compile/1` (a raw clause list is `badarg`);
   this crate has no compiled-spec *term*, so `run.rs` compiles the raw spec and the bridge must map
