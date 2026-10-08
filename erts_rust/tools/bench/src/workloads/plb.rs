@@ -12,12 +12,17 @@
 //! `$BENCH_TRY_NIX` switch) is shared with the other tool-driven workloads; see
 //! [`crate::workloads::tool`]. It too is validated with a bounded `--version` probe and,
 //! if it fails, the honest `dotnet-absent` skip is kept.
+//!
+//! A tool run that yields **no** result JSON is recorded `failed` (`plb-tool-failed` when
+//! `dotnet` exited non-zero, `plb-no-results` when it exited `0` while benching nothing) —
+//! never `ok`, because the only other number on such a row is the tool's own wall time,
+//! which is not a benchmark result.
 
 use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::metrics::{Category, Metric, Probe, Runtimes};
+use crate::metrics::{Category, Metric, Probe, Runtimes, Status};
 use crate::proc;
 use crate::report::WorkloadResult;
 use crate::scratch::{self, ScratchDir};
@@ -158,6 +163,12 @@ impl Workload for Plb {
         // Read the result JSON from the *scratch* copy, never the (read-only) source repo.
         let (times, mems) = read_results(&bench_dir.join("build/_results"));
         if times.is_empty() {
+            // No measurement was produced, so the `wall_ms` recorded above is the *tool's*
+            // own runtime and not a benchmark result: the row must never read as `ok`.
+            // A non-zero exit is the tool failing; a zero exit with no results means it
+            // benched nothing (a silent no-op), which is just as honest a failure.
+            result.status = Status::Failed;
+            result.reason = Some(no_results_reason(out.success).to_string());
             result.notes.push(format!(
                 "no result JSON found (dotnet exit {:?})",
                 out.exit_code
@@ -181,6 +192,19 @@ impl Workload for Plb {
             }
         }
         result
+    }
+}
+
+/// The honest failure reason when the tool produced **no** benchmark results.
+///
+/// A non-zero exit is the tool failing outright; a zero exit that still yields no result
+/// JSON is a silent no-op (e.g. a `dotnet` build that "succeeded" without benching
+/// anything). Either way there is no measurement, so the row is `failed` — never `ok`.
+fn no_results_reason(success: bool) -> &'static str {
+    if success {
+        "plb-no-results"
+    } else {
+        "plb-tool-failed"
     }
 }
 
@@ -262,5 +286,16 @@ mod tests {
     fn read_results_handles_missing_dir() {
         let (t, m) = read_results(std::path::Path::new("/nonexistent/xyzzy"));
         assert!(t.is_empty() && m.is_empty());
+    }
+
+    /// A run that produced no result JSON is a **failure** — the recorded `wall_ms` is the
+    /// tool's own runtime, so it must never be reported as an `ok` benchmark row. The
+    /// reason distinguishes "the tool exited non-zero" from "it exited 0 and benched
+    /// nothing".
+    #[test]
+    fn a_run_without_results_is_a_failed_row_not_an_ok_one() {
+        assert_eq!(no_results_reason(false), "plb-tool-failed");
+        assert_eq!(no_results_reason(true), "plb-no-results");
+        assert_ne!(no_results_reason(true), no_results_reason(false));
     }
 }
