@@ -626,6 +626,16 @@ impl Runtime {
         &self.processes
     }
 
+    /// The per-pid engine state (the machine and its entry point), for the crash-dump
+    /// writer's per-process register rendering.
+    ///
+    /// `crash_dump` (a sibling module of this crate) reaches a scheduled process's engine
+    /// through this accessor; the same read-only [`RunnerState::engine_at`] seam backs
+    /// `process_info/2`'s execution-position items.
+    pub(crate) fn runner_state(&self) -> &RunnerState {
+        &self.runner_state
+    }
+
     /// The pid the runtime runs as.
     pub fn self_pid(&self) -> ProcessId {
         self.self_pid

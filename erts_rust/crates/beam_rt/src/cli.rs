@@ -102,6 +102,7 @@ use crate::boot;
 use crate::config::{
     Action, ArgTerm, EmulatorConfig, HeapOptions, InitArgs, RuntimeConfig, DEFAULT_HEAP_WORDS,
 };
+use crate::crash_dump;
 use crate::error;
 use crate::perf_map::{self, PerfMapConfig};
 use crate::runtime::Runtime;
@@ -886,6 +887,13 @@ fn split_top_level<'a>(token: &'a str, inner: &'a str) -> Result<Vec<&'a str>> {
 /// capability gap — on which a single `beam_rt: unsupported: <reason>` line is printed
 /// and no usage text. A **halt** the program requested wins over all of them: the
 /// runtime exits with that status, printing nothing.
+///
+/// Every **abnormal** exit — a halt that asks for a crash dump (`halt("Slogan")`), an
+/// `abort`, and any other runtime failure — writes the environment-named crash dump
+/// first (see [`write_crash_dump`]), so the CLI reproduces the oracle's dump-before-exit
+/// order (`erts_exit_vv`, `erl_init.c:2751-2755`). A capability gap and a plain status
+/// halt write no dump, exactly as the oracle's `ERTS_ERROR_EXIT`/`ERTS_DUMP_EXIT` rules
+/// leave them alone.
 pub fn run(args: Vec<String>) -> i32 {
     let config = match parse_with_env(&args, &ProcessEnv) {
         Ok(config) => config,
@@ -898,19 +906,71 @@ pub fn run(args: Vec<String>) -> i32 {
             return EXIT_USAGE;
         }
     };
-    match drive(config) {
+    // `drive` consumes the configuration, but the crash-dump path needs the `ERL_*`
+    // environment (`ERL_CRASH_DUMP` / `ERL_CRASH_DUMP_SECONDS`), so keep a copy.
+    let env = config.env.clone();
+    let mut source = None;
+    match drive(config, &mut source) {
         Ok(()) => EXIT_OK,
         Err(error) => {
             if let Some(status) = error::halt_status(&error) {
-                // The program asked to terminate with this status: no diagnostic.
+                // The program asked to terminate with this status: no diagnostic, no dump.
                 return status;
             }
             if let Some(reason) = error::unsupported_reason(&error) {
+                // A documented Milestone-1 capability gap is not a crash: no dump.
                 return report_unsupported(&reason);
+            }
+            if let Some(slogan) = error::dump_slogan(&error) {
+                // `erlang:halt("Slogan")` — the oracle's `ERTS_DUMP_EXIT` (`bif.c:4393`):
+                // print the slogan, write the dump, exit 1. The tail is the emulator's own
+                // announcement (`erl_crash_dump.c:509`), rendered with the file's name.
+                write_crash_dump(source.as_ref(), &env, slogan);
+                let path = crash_dump::crash_dump_path(&env)
+                    .unwrap_or_else(|| std::path::PathBuf::from("erl_crash.dump"));
+                eprint!(
+                    "{slogan}\r\n\r\nCrash dump is being written to: {}...done\r\n",
+                    path.display()
+                );
+                return EXIT_RUNTIME;
+            }
+            // Every other failure is an abnormal exit: the dump comes first, then the
+            // termination (`halt(abort)` ends in `abort()`, i.e. SIGABRT — `erl_init.c:2774`).
+            write_crash_dump(source.as_ref(), &env, "");
+            if error::is_abort(&error) {
+                std::process::abort();
             }
             eprintln!("beam_rt: {error}");
             EXIT_RUNTIME
         }
+    }
+}
+
+/// Writes the environment-named crash dump for an abnormal exit, if dumping is enabled.
+///
+/// [`crash_dump::crash_dump_path`] decides **whether** a dump is written
+/// (`ERL_CRASH_DUMP_SECONDS=0` disables it outright) and **where** it goes
+/// (`ERL_CRASH_DUMP`, else `erl_crash.dump` in the current directory) — the oracle's own
+/// rule (`erl_crash_dump.c:451-507`). `source` is the runtime the action built: `None`
+/// (`-version`, or a runtime that could not even be constructed) means there is nothing to
+/// snapshot and the dump is skipped.
+///
+/// A dump that cannot be produced is reported on stderr and otherwise **ignored**: an
+/// unwritable file must not change the exit code or the classification of the original
+/// error.
+fn write_crash_dump(source: Option<&Runtime>, env: &ErlEnv, slogan: &str) {
+    let (Some(runtime), Some(path)) = (source, crash_dump::crash_dump_path(env)) else {
+        return;
+    };
+    let dump = match crash_dump::snapshot(runtime, slogan, env.crash_dump_seconds) {
+        Ok(dump) => dump,
+        Err(error) => {
+            eprintln!("beam_rt: no crash dump: {error}");
+            return;
+        }
+    };
+    if let Err(error) = crash_dump::write_dump(&path, &dump) {
+        eprintln!("beam_rt: no crash dump: {error}");
     }
 }
 
@@ -924,7 +984,12 @@ fn report_unsupported(reason: &str) -> i32 {
 }
 
 /// Dispatches the parsed action against a fresh runtime.
-fn drive(config: RuntimeConfig) -> Result<()> {
+///
+/// The runtime the action built is handed back through `snapshot` — [`run`] needs it to
+/// write a crash dump when the action fails abnormally. `Action::Version` builds none
+/// (there is nothing to snapshot), and neither does a runtime that could not even be
+/// constructed, so the slot stays empty and the dump is skipped.
+fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
     let action = config.action.clone();
     match action {
         Action::Version => {
@@ -933,15 +998,20 @@ fn drive(config: RuntimeConfig) -> Result<()> {
         }
         Action::Boot => {
             let mut runtime = Runtime::new(config)?;
-            runtime.boot()
+            let result = runtime.boot();
+            *snapshot = Some(runtime);
+            result
         }
         Action::Eval(expr) => {
             let mut runtime = Runtime::new(config)?;
-            runtime.boot()?;
             // Real `erl -eval '2+3'` prints nothing and exits 0: the expression is
             // evaluated for its effect only (`halt`, a start script, …).
-            let _value = runtime.eval(&expr)?;
-            Ok(())
+            let result = match runtime.boot() {
+                Ok(()) => runtime.eval(&expr).map(|_| ()),
+                Err(error) => Err(error),
+            };
+            *snapshot = Some(runtime);
+            result
         }
         Action::Apply {
             module,
@@ -953,7 +1023,9 @@ fn drive(config: RuntimeConfig) -> Result<()> {
             for name in &args {
                 terms.push(runtime.intern(name));
             }
-            apply(&mut runtime, &module, &function, &terms)
+            let result = apply(&mut runtime, &module, &function, &terms);
+            *snapshot = Some(runtime);
+            result
         }
         Action::Run {
             module,
@@ -962,8 +1034,12 @@ fn drive(config: RuntimeConfig) -> Result<()> {
         } => {
             let mut runtime = Runtime::new(config)?;
             let parsed: Vec<ArgTerm> = args.into_iter().map(ArgTerm::Str).collect();
-            let terms = runtime.materialize_args(&parsed)?;
-            apply(&mut runtime, &module, &function, &terms)
+            let result = match runtime.materialize_args(&parsed) {
+                Ok(terms) => apply(&mut runtime, &module, &function, &terms),
+                Err(error) => Err(error),
+            };
+            *snapshot = Some(runtime);
+            result
         }
         Action::RunFile {
             file,
@@ -973,7 +1049,9 @@ fn drive(config: RuntimeConfig) -> Result<()> {
             args,
         } => {
             let mut runtime = Runtime::new(config)?;
-            run_file(&mut runtime, &file, &module, &function, arity, &args)
+            let result = run_file(&mut runtime, &file, &module, &function, arity, &args);
+            *snapshot = Some(runtime);
+            result
         }
     }
 }

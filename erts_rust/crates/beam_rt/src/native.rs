@@ -7,7 +7,7 @@
 //!
 //! | Call | Why it is runtime-native |
 //! |---|---|
-//! | `erlang:halt/0,1` | terminates the runtime: it must travel out of the running code as a raise and become the process exit status |
+//! | `erlang:halt/0,1,2` | terminates the runtime: it must travel out of the running code as a raise and become the process exit status |
 //! | `erlang:display/1` | writes to the *process's* output sink |
 //! | `io:put_chars/1,2` | writes to the process's output sink (the device argument is accepted and ignored) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
@@ -38,10 +38,18 @@
 //!
 //! # The `halt` convention
 //!
-//! `halt` does not return a value: it raises an `exit`-class exception whose reason atom
-//! is `beam_rt_halt:<status>` (see [`crate::error::halt`]). The runtime also records the
-//! status ([`Runtime::halt_status`](crate::Runtime::halt_status)) so a host that catches
-//! the raise can still observe it, and the CLI turns it into the process exit code.
+//! `halt` does not return a value; it raises an `exit`-class exception that terminates the
+//! runtime, and the shape of the raise encodes *how*:
+//!
+//! | Call | Reason atom | CLI action |
+//! |---|---|---|
+//! | `halt(Status)` / `halt(Status, Options)` | `beam_rt_halt:<status>` (see [`crate::error::halt`]) | exit with `<status>` |
+//! | `halt(abort)` / `halt(abort, Options)` | `beam_rt_abort` ([`crate::error::abort`]) | write the crash dump, then `SIGABRT` |
+//! | `halt("Slogan")` / `halt([], Options)` | `beam_rt_dump:<slogan>` ([`crate::error::dump`]) | print the slogan, write the crash dump, exit 1 |
+//!
+//! The runtime also records the status ([`Runtime::halt_status`](crate::Runtime::halt_status))
+//! so a host that catches the raise can still observe it, and the CLI turns it into the
+//! process exit code (or the signal).
 //!
 //! # Module layout
 //!
@@ -90,6 +98,7 @@ impl RuntimeContext<'_> {
         match (module, function, arity) {
             ("erlang", "halt", 0) => Some(Err(self.record_halt(0))),
             ("erlang", "halt", 1) => Some(self.halt_1(args)),
+            ("erlang", "halt", 2) => Some(self.halt_2(args)),
             ("erlang", "display", 1) => Some(self.display(args)),
             ("io", "put_chars", 1) => Some(self.put_chars(args, 1)),
             ("io", "put_chars", 2) => Some(self.put_chars(args, 2)),
@@ -167,33 +176,114 @@ impl RuntimeContext<'_> {
         }
     }
 
-    // -- erlang:halt/0,1 ------------------------------------------------------
+    // -- erlang:halt/0,1,2 ----------------------------------------------------
 
-    /// `erlang:halt/1`: terminate with the given status.
+    /// `erlang:halt/1`: terminate with a status, `abort`, or a crash-dump slogan.
     ///
-    /// A small-integer argument is the status; a non-integer (an atom such as
-    /// `abort`) is reported as an abnormal termination with status `1`, exactly the
-    /// observable outcome a host can act on.
+    /// `halt/1` *is* the `/2` BIF with an **empty** option list (`erts/preloaded/src/erlang.erl`:
+    /// `halt(HaltType) -> erlang:halt(HaltType, [])`), so a list argument reaches the
+    /// crash-dump branch without any option validation — exactly what the C's `halt_2`
+    /// does for its own empty list (`bif.c:4316-4350`).
     fn halt_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let status = match args.first().copied() {
-            Some(argument) if is_small(argument) => {
-                let status = signed_value(argument);
-                let status = i32::try_from(status).map_err(|_| BeamError::BadArg)?;
-                status
+        let argument = *args.first().ok_or(BeamError::BadArg)?;
+        Err(self.halt_with(argument, HaltOptions::default()))
+    }
+
+    /// `erlang:halt/2`: `halt/1` plus the `{flush, _}` / `{flush_timeout, _}` options.
+    ///
+    /// The options are validated **before** the first argument is interpreted (the C's
+    /// parse loop runs first, `bif.c:4323-4350`), so `halt(-1, [{flush, maybe}])` reports
+    /// the bad option rather than the bad status.
+    fn halt_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let argument = *args.first().ok_or(BeamError::BadArg)?;
+        let options = *args.get(1).ok_or(BeamError::BadArg)?;
+        let options = self.halt_options(options)?;
+        Err(self.halt_with(argument, options))
+    }
+
+    /// The shared body of `halt/1` and `halt/2` (`bif.c:4356-4396`): interpret the first
+    /// argument and build the raise that terminates the runtime.
+    ///
+    /// * a non-negative integer (small **or** bignum) is the exit **status** — the C's
+    ///   `code & INT_MAX`;
+    /// * the atom `abort` aborts the runtime with `SIGABRT`;
+    /// * a list (including `[]`) is a crash-dump **slogan**;
+    /// * anything else (a negative integer, a float, an unknown atom, a tuple) is
+    ///   `badarg`.
+    fn halt_with(&mut self, argument: Eterm, options: HaltOptions) -> BeamError {
+        if let Ok(status) = halt_status_of(argument) {
+            // A `{flush_timeout, 0}` **with flushing enabled** interrupts the flush as it
+            // starts: the C arms the flush timer with a zero timeout and its callback
+            // `_exit`s with `ERTS_HALT_FLUSH_TIMEOUT_EXIT_CODE` (`erl_init.c:2805-2808`),
+            // so 255 wins over the requested status. With flushing disabled the timeout
+            // has no effect at all (`erlang.erl:3449-3450`), so the normal status stands.
+            let status = match (options.flush, options.flush_timeout) {
+                (true, Some(0)) => HALT_FLUSH_TIMEOUT_EXIT_CODE,
+                _ => status,
+            };
+            return self.record_halt(status);
+        }
+        if self.atom_name(argument).as_deref() == Some("abort") {
+            // `erts_exit(ERTS_ABORT_EXIT, "")` (`bif.c:4373-4378`): the host receives
+            // SIGABRT, which the CLI performs with `std::process::abort` (a shell observes
+            // exit code 134). The recorded status is 1: a host that intercepts the raise
+            // still observes an abnormal termination.
+            self.runtime.halt = Some(1);
+            return error::abort();
+        }
+        if beam_term::is_list(argument) || argument == NIL {
+            // `erts_exit(ERTS_DUMP_EXIT, "%s\n", halt_msg)` (`bif.c:4379-4394`): the slogan
+            // is printed, a crash dump is written and the runtime exits 1. The raise
+            // carries the slogan; the CLI writes the dump (see [`crate::crash_dump`]).
+            return match halt_slogan(argument) {
+                Ok(slogan) => error::dump(&slogan),
+                Err(error) => error,
+            };
+        }
+        BeamError::BadArg
+    }
+
+    /// Parses the `halt/2` option list (`bif.c:4323-4350`).
+    ///
+    /// Every element must be a **two-tuple** whose key is `flush` (with the value being
+    /// the atom `true` or `false`) or `flush_timeout` (with a non-negative integer value
+    /// below `2^32`). A non-list, an improper list, a non-tuple element, an unknown key
+    /// and an out-of-range value are all `badarg`, exactly as the C's `bad_options` path.
+    ///
+    /// The one deliberate divergence: `{flush, maybe}` is `badarg` here, where the oracle
+    /// swallows its `am_badopt` extended-info badarg and exits 1 writing a dump with **no
+    /// output at all** — an artefact of the C's exit paths, not a documented behaviour, so
+    /// the honest `badarg` is reported instead of reproducing it.
+    fn halt_options(&self, options: Eterm) -> Result<HaltOptions> {
+        let mut parsed = HaltOptions::default();
+        for option in terms::list_elements(options)? {
+            if terms::tuple_arity(option)? != 2 {
+                return Err(BeamError::BadArg);
             }
-            Some(argument) if is_atom(argument) => 1,
-            _ => return Err(BeamError::BadArg),
-        };
-        Err(self.record_halt(status))
+            let key = self.atom_name(terms::tuple_element(option, 0)?);
+            let value = terms::tuple_element(option, 1)?;
+            match key.as_deref() {
+                Some("flush") => {
+                    parsed.flush = match self.atom_name(value).as_deref() {
+                        Some("true") => true,
+                        Some("false") => false,
+                        _ => return Err(BeamError::BadArg),
+                    };
+                }
+                Some("flush_timeout") => {
+                    parsed.flush_timeout = Some(halt_timeout_of(value)?);
+                }
+                _ => return Err(BeamError::BadArg),
+            }
+        }
+        Ok(parsed)
     }
 
     /// Records `status` on the runtime and returns the matching halt raise.
     fn record_halt(&mut self, status: i32) -> BeamError {
         self.runtime.halt = Some(status);
         error::halt(status)
-    }
-
-    // -- erlang:display/1 and io:put_chars/1,2 --------------------------------
+    }    // -- erlang:display/1 and io:put_chars/1,2 --------------------------------
 
     /// `erlang:display/1`: print the term on the process's output (`~p` plus a
     /// newline, as the oracle does) and return `true`.
@@ -545,10 +635,125 @@ impl RuntimeContext<'_> {
     }
 }
 
+// -- the shared erlang:halt/1,2 helpers (the region above calls them) ---------
+
+/// The exit status a **fired** flush timeout produces
+/// (`ERTS_HALT_FLUSH_TIMEOUT_EXIT_CODE`, `erl_init.c:75`).
+const HALT_FLUSH_TIMEOUT_EXIT_CODE: i32 = 255;
+
+/// The status mask the C applies to a halt status (`code & INT_MAX`, `bif.c:4357`).
+const HALT_STATUS_MASK: u64 = 0x7fff_ffff;
+
+/// The `erlang:halt/2` option set (`bif.c:4318-4321`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HaltOptions {
+    /// `{flush, EnableFlushing}` — the C's `flush`, `true` by default.
+    flush: bool,
+    /// `{flush_timeout, Timeout}` in milliseconds — the C's `halt_flush_timeout`, whose
+    /// default `-1` means "infinity" (no timeout).
+    flush_timeout: Option<u32>,
+}
+
+impl Default for HaltOptions {
+    /// The C's initializers: flush on, no flush timeout.
+    fn default() -> Self {
+        HaltOptions {
+            flush: true,
+            flush_timeout: None,
+        }
+    }
+}
+
+/// The exit **status** an `erlang:halt/1,2` first argument asks for.
+///
+/// The C validates it with `term_to_Uint_mask` (`big.c:3544-3565`), which accepts a
+/// **non-negative** small integer or bignum and rejects everything else (a negative
+/// integer or bignum, a float, an atom, a list, a tuple), and then takes
+/// `code & INT_MAX` (`bif.c:4357`) — so `halt(300)` asks for 300, `halt(2**32 + 17)` for
+/// 17 and `halt(-1)` is `badarg`. A bignum contributes its **low limb** only: the C picks
+/// the first `ErtsDigit` and ignores the rest.
+fn halt_status_of(term: Eterm) -> Result<i32> {
+    if is_small(term) {
+        let value = signed_value(term);
+        if value < 0 {
+            return Err(BeamError::BadArg);
+        }
+        return Ok((value as u64 & HALT_STATUS_MASK) as i32);
+    }
+    match beam_codec::term::big_parts(term) {
+        // `(false, digits)` is a non-negative bignum; digits are least significant first,
+        // so the first one is exactly the `ErtsDigit` the C reads.
+        Ok((false, digits)) => {
+            let low = digits.first().copied().unwrap_or(0);
+            Ok((low & HALT_STATUS_MASK) as i32)
+        }
+        _ => Err(BeamError::BadArg),
+    }
+}
+
+/// The `{flush_timeout, Timeout}` value: a non-negative integer below `2^32`
+/// (`term_to_Uint32`, `bif.c:4342`).
+///
+/// A bignum can never qualify — this runtime's small integers already reach `2^59` — so
+/// every non-small term (the atom `infinity`, a negative integer, a float) is the C's
+/// `bad_options`.
+fn halt_timeout_of(term: Eterm) -> Result<u32> {
+    if !is_small(term) {
+        return Err(BeamError::BadArg);
+    }
+    u32::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)
+}
+
+/// The `halt("Slogan")` / `halt([], _)` argument as text, with every CR and LF removed.
+///
+/// The raise that carries the slogan out of the running code has a **single atom** as its
+/// reason, so the text may not contain a newline. The C's `erts_unicode_list_to_buf`
+/// (`bif.c:4384`) requires a **proper** list of code points — a list is *not* treated as
+/// iodata here — and truncates the message at `HALT_MSG_SIZE` (1023) characters, so an
+/// improper list or a non-character element is `badarg` and a longer string is truncated
+/// exactly as the oracle truncates it.
+fn halt_slogan(chars: Eterm) -> Result<String> {
+    let mut out = String::new();
+    for element in terms::list_elements(chars)?.into_iter().take(HALT_MSG_SIZE) {
+        if !is_small(element) {
+            return Err(BeamError::BadArg);
+        }
+        let code = u32::try_from(signed_value(element)).map_err(|_| BeamError::BadArg)?;
+        let character = char::from_u32(code).ok_or(BeamError::BadArg)?;
+        if character != '\r' && character != '\n' {
+            out.push(character);
+        }
+    }
+    Ok(out)
+}
+
+/// The C's `HALT_MSG_SIZE` — the slogans' character budget (`bif.c:4380`).
+const HALT_MSG_SIZE: usize = 1023;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native::test_support::{atom, call, chars, runtime, string_of};
+
+    /// A tuple built on the runtime's term arena (the `halt/2` argument shape).
+    fn tuple(runtime: &mut crate::runtime::Runtime, elements: &[Eterm]) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        terms::make_tuple(&mut context, elements).expect("a tuple")
+    }
+
+    /// A proper list built on the runtime's term arena.
+    fn list(runtime: &mut crate::runtime::Runtime, elements: &[Eterm]) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        terms::make_list(&mut context, elements).expect("a list")
+    }
+
+    /// A `{Key, Value}` option tuple with `Key` interned as an atom.
+    fn pair(runtime: &mut crate::runtime::Runtime, key: &str, value: Eterm) -> Eterm {
+        let key = atom(runtime, key);
+        tuple(runtime, &[key, value])
+    }
 
     #[test]
     fn halt_zero_raises_and_records_the_status() {
@@ -560,15 +765,143 @@ mod tests {
     }
 
     #[test]
-    fn halt_one_carries_the_status() {
+    fn halt_one_masks_the_status_like_the_c() {
         let mut runtime = runtime();
-        let error = call(&mut runtime, "erlang", "halt", &[make_small(7)])
-            .expect_err("halt/1 terminates");
+        // `code & INT_MAX` (`bif.c:4357`): 300 stays 300 (the OS truncates it to the low
+        // byte on exit, so the CLI observes 44) and `2**32 + 17` — a *small* integer for
+        // this runtime's 60-bit smalls — keeps only its low 31 bits.
+        for (argument, status) in [
+            (0i64, 0i32),
+            (17, 17),
+            (255, 255),
+            (300, 300),
+            ((1i64 << 32) + 17, 17),
+        ] {
+            let error = call(&mut runtime, "erlang", "halt", &[make_small(argument)])
+                .expect_err("halt/1 terminates");
+            assert_eq!(error::halt_status(&error), Some(status), "halt({argument})");
+            assert_eq!(runtime.halt_status(), Some(status));
+            assert_eq!(error::unsupported_reason(&error), None);
+        }
+    }
+
+    #[test]
+    fn halt_rejects_a_negative_or_non_integer_status() {
+        let mut runtime = runtime();
+        let x = atom(&mut runtime, "x");
+        for argument in [make_small(-1), x] {
+            let error =
+                call(&mut runtime, "erlang", "halt", &[argument]).expect_err("halt/1 badargs");
+            assert!(matches!(error, BeamError::BadArg), "{error}");
+            assert_eq!(runtime.halt_status(), None);
+        }
+    }
+
+    #[test]
+    fn halt_abort_is_an_abort_raise() {
+        let mut runtime = runtime();
+        let abort = atom(&mut runtime, "abort");
+        let error = call(&mut runtime, "erlang", "halt", &[abort]).expect_err("halt/1 terminates");
+        assert!(error::is_abort(&error), "{error}");
+        assert_eq!(error::halt_status(&error), None);
+        assert_eq!(error::dump_slogan(&error), None);
+        assert_eq!(runtime.halt_status(), Some(1));
+    }
+
+    #[test]
+    fn halt_with_a_slogan_is_a_dump_raise() {
+        let mut runtime = runtime();
+        let slogan = chars(&mut runtime, "probe");
+        let error = call(&mut runtime, "erlang", "halt", &[slogan]).expect_err("halt/1 terminates");
+        assert_eq!(error::dump_slogan(&error), Some("probe"));
+        assert!(!error::is_abort(&error));
+        assert_eq!(error::unsupported_reason(&error), None);
+        // The raise's reason is a single atom, so CR/LF never reach it.
+        let slogan = chars(&mut runtime, "a\r\nb");
+        let error = call(&mut runtime, "erlang", "halt", &[slogan]).expect_err("halt/1 terminates");
+        assert_eq!(error::dump_slogan(&error), Some("ab"));
+        // `halt([])` is the empty slogan.
+        let error = call(&mut runtime, "erlang", "halt", &[NIL]).expect_err("halt/1 terminates");
+        assert_eq!(error::dump_slogan(&error), Some(""));
+    }
+
+    #[test]
+    fn halt_rejects_every_other_argument_shape() {
+        let mut runtime = runtime();
+        let key = atom(&mut runtime, "crash_dump");
+        let value = chars(&mut runtime, "x");
+        let pair = tuple(&mut runtime, &[key, value]);
+        let single = tuple(&mut runtime, &[key]);
+        for argument in [pair, single] {
+            let error =
+                call(&mut runtime, "erlang", "halt", &[argument]).expect_err("halt/1 badargs");
+            assert!(matches!(error, BeamError::BadArg), "{error}");
+        }
+    }
+
+    #[test]
+    fn halt_two_accepts_the_documented_options() {
+        let mut runtime = runtime();
+        // `{flush, true}` keeps the requested status …
+        let true_atom = atom(&mut runtime, "true");
+        let flush_true = pair(&mut runtime, "flush", true_atom);
+        let options = list(&mut runtime, &[flush_true]);
+        let error = call(&mut runtime, "erlang", "halt", &[make_small(7), options])
+            .expect_err("halt/2 terminates");
         assert_eq!(error::halt_status(&error), Some(7));
-        assert_eq!(runtime.halt_status(), Some(7));
-        // A non-numeric status is an abnormal termination (status 1), never a value.
-        let error = call(&mut runtime, "erlang", "halt", &[make_small(1)]).expect_err("terminates");
-        assert_eq!(error::halt_status(&error), Some(1));
+        // … and `[]` is the `halt/1` form (an empty option list).
+        let error = call(&mut runtime, "erlang", "halt", &[make_small(7), NIL])
+            .expect_err("halt/2 terminates");
+        assert_eq!(error::halt_status(&error), Some(7));
+    }
+
+    #[test]
+    fn a_zero_flush_timeout_exits_255_unless_flushing_is_disabled() {
+        let mut runtime = runtime();
+        let timeout_zero = pair(&mut runtime, "flush_timeout", make_small(0));
+        // `{flush_timeout, 0}` with flushing on: the C's flush timer fires at once and
+        // `_exit`s with `ERTS_HALT_FLUSH_TIMEOUT_EXIT_CODE` = 255.
+        let options = list(&mut runtime, &[timeout_zero]);
+        let error = call(&mut runtime, "erlang", "halt", &[make_small(3), options])
+            .expect_err("halt/2 terminates");
+        assert_eq!(error::halt_status(&error), Some(255));
+        // With flushing disabled the timeout has no effect: the requested status stands.
+        let false_atom = atom(&mut runtime, "false");
+        let flush_false = pair(&mut runtime, "flush", false_atom);
+        let options = list(&mut runtime, &[flush_false, timeout_zero]);
+        let error = call(&mut runtime, "erlang", "halt", &[make_small(3), options])
+            .expect_err("halt/2 terminates");
+        assert_eq!(error::halt_status(&error), Some(3));
+    }
+
+    #[test]
+    fn halt_two_rejects_malformed_options() {
+        let mut runtime = runtime();
+        let maybe = atom(&mut runtime, "maybe");
+        let true_atom = atom(&mut runtime, "true");
+        let flush_maybe = pair(&mut runtime, "flush", maybe);
+        let unknown_key = pair(&mut runtime, "nope", true_atom);
+        let negative = pair(&mut runtime, "flush_timeout", make_small(-1));
+        let infinity_atom = atom(&mut runtime, "infinity");
+        let infinity = pair(&mut runtime, "flush_timeout", infinity_atom);
+        // `2**32` is a small integer here but does not fit the C's `Uint32`.
+        let too_big = pair(&mut runtime, "flush_timeout", make_small(1i64 << 32));
+        let bogus = atom(&mut runtime, "bogus");
+        let bad = [
+            atom(&mut runtime, "bogus_options"),
+            list(&mut runtime, &[bogus]),
+            list(&mut runtime, &[unknown_key]),
+            list(&mut runtime, &[flush_maybe]),
+            list(&mut runtime, &[negative]),
+            list(&mut runtime, &[infinity]),
+            list(&mut runtime, &[too_big]),
+        ];
+        for options in bad {
+            let error = call(&mut runtime, "erlang", "halt", &[make_small(1), options])
+                .expect_err("halt/2 badargs");
+            assert!(matches!(error, BeamError::BadArg), "{error}");
+            assert_eq!(runtime.halt_status(), None);
+        }
     }
 
     #[test]
