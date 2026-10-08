@@ -1135,3 +1135,379 @@ fn malformed_specs_are_badarg() {
         Err(BeamError::BadArg)
     ));
 }
+
+// ---------------------------------------------------------------------------
+// fun2ms-shaped table-level battery
+//
+// `ets:fun2ms/1` (the `ms_transform` parse transform) lowers a `fun` pattern into a
+// match spec of the exact shape `[{{Head}, [Guards], [Body]}]`, using `'_'` for a
+// wildcard, `'$N'` for a bound variable, `'$_'` for the whole object and `'$$'` for
+// every binding. Each spec below is quoted verbatim from the oracle's own transform
+// output and each expectation is the oracle's `erl` result (OTP 29 / erts-17.1),
+// `ets:select/2` and friends run on the same `{K,V,W}` table. An `ordered_set`'s
+// vector is asserted in order; a `set`'s navigation order is unspecified, so its
+// results are compared as a sorted value set.
+// ---------------------------------------------------------------------------
+
+/// Assert a select-style result equals `want` element-by-element. `Eterm`'s
+/// `PartialEq` is bitwise (it does not compare boxed tuples/lists), so boxed
+/// results are compared with the crate's structural `eq`.
+fn assert_terms(got: &[Eterm], want: &[Eterm], atoms: &AtomTable, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: result length");
+    for (index, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(eq(*g, *w, atoms), "{what}: element {index}");
+    }
+}
+
+/// The 60-bit small integers of `terms`, ascending (a `set`'s order is
+/// unspecified, so its results are compared as a sorted value set).
+fn small_ints(terms: &[Eterm]) -> Vec<i64> {
+    let mut values: Vec<i64> = terms.iter().map(|term| signed_value(*term)).collect();
+    values.sort_unstable();
+    values
+}
+
+/// The battery's shared `ordered_set` holding `{1,a,10}`, `{2,b,20}`, `{3,a,30}`.
+fn fun2ms_table(atoms: &AtomTable, heap: &mut Heap) -> Table {
+    let mut table = new_table(TableKind::OrderedSet);
+    for (key, value, third) in [(1i64, "a", 10i64), (2, "b", 20), (3, "a", 30)] {
+        let object = object(heap, key, at(atoms, value), third);
+        table.insert(object, atoms).unwrap();
+    }
+    table
+}
+
+/// The same three `{K,V,W}` objects, ascending by key.
+fn fun2ms_objects(heap: &mut Heap, atoms: &AtomTable) -> Vec<Eterm> {
+    vec![
+        object(heap, 1, at(atoms, "a"), 10),
+        object(heap, 2, at(atoms, "b"), 20),
+        object(heap, 3, at(atoms, "a"), 30),
+    ]
+}
+
+#[test]
+fn fun2ms_guard_on_the_key_returning_the_key() {
+    // `ets:fun2ms(fun({K,_V,_W}) when K < 3 -> K end)`
+    //   == [{{'$1','$2','$3'},[{'<','$1',3}],['$1']}]
+    // erl: on [{1,a,10},{2,b,20},{3,a,30}] -> [1,2] (`K < 3` keeps keys 1 and 2).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = fun2ms_table(&atoms, &mut heap);
+
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, "<"), at(&atoms, "$1"), make_small(3)],
+    );
+    let spec = compile(
+        spec1(&mut heap, head, &[guard], &[at(&atoms, "$1")]),
+        &atoms,
+    )
+    .unwrap();
+    assert_eq!(
+        table.select(&spec, &atoms, &mut heap).unwrap(),
+        vec![make_small(1), make_small(2)]
+    );
+
+    // The same spec on a `set` — the order is unspecified, so compare the value set.
+    let mut set = new_table(TableKind::Set);
+    for object in fun2ms_objects(&mut heap, &atoms) {
+        set.insert(object, &atoms).unwrap();
+    }
+    let got = set.select(&spec, &atoms, &mut heap).unwrap();
+    assert_eq!(small_ints(&got), vec![1, 2]);
+}
+
+#[test]
+fn fun2ms_nested_tuple_head_with_a_reordering_body() {
+    // `ets:fun2ms(fun({_P,{Q,R},_}) -> {R,Q} end)`
+    //   == [{{'$1',{'$2','$3'},'_'},[],[{{'$3','$2'}}]}]
+    // erl: on {1,{10,20},100} -> [{20,10}] (the body reorders the bound elements).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+
+    let inner = tup(&mut heap, &[make_small(10), make_small(20)]);
+    let object = tup(&mut heap, &[make_small(1), inner, make_small(100)]);
+    table.insert(object, &atoms).unwrap();
+
+    let nested = tup(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$3")]);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), nested, at(&atoms, "_")]);
+    let swapped = tup(&mut heap, &[at(&atoms, "$3"), at(&atoms, "$2")]);
+    let body = tup(&mut heap, &[swapped]);
+    let spec = compile(spec1(&mut heap, head, &[], &[body]), &atoms).unwrap();
+
+    let want = tup(&mut heap, &[make_small(20), make_small(10)]);
+    let got = table.select(&spec, &atoms, &mut heap).unwrap();
+    assert_terms(&got, &[want], &atoms, "nested-tuple head reorder");
+}
+
+#[test]
+fn fun2ms_list_element_pattern_in_the_head() {
+    // `ets:fun2ms(fun({_P,[Q,R],_}) -> [Q,R] end)`
+    //   == [{{'$1',['$2','$3'],'_'},[],[['$2','$3']]}]
+    // erl: on {1,[10,20],100} -> [[10,20]] (a list element in the head binds `'$2'`
+    //      and `'$3'` element-wise).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+
+    let elements = list(&mut heap, &[make_small(10), make_small(20)]);
+    let object = tup(&mut heap, &[make_small(1), elements, make_small(100)]);
+    table.insert(object, &atoms).unwrap();
+
+    let pattern = list(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$3")]);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), pattern, at(&atoms, "_")]);
+    let result = list(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$3")]);
+    let spec = compile(spec1(&mut heap, head, &[], &[result]), &atoms).unwrap();
+
+    let want = list(&mut heap, &[make_small(10), make_small(20)]);
+    let got = table.select(&spec, &atoms, &mut heap).unwrap();
+    assert_terms(&got, &[want], &atoms, "list-element pattern");
+}
+
+#[test]
+fn fun2ms_dollar_dollar_body_yields_every_binding() {
+    // In a *body* `'$$'` is the list of every bound head variable, ascending.
+    // erl: `ets:select(T, [{{'$1','$2','$3'},[],['$$']}])`
+    //        -> [[1,a,10],[2,b,20],[3,a,30]]
+    //      `ets:select(T, [{{'_','_','_'},[],['$$']}])` -> [[],[],[]].
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = fun2ms_table(&atoms, &mut heap);
+
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let spec = compile(spec1(&mut heap, head, &[], &[at(&atoms, "$$")]), &atoms).unwrap();
+    let got = table.select(&spec, &atoms, &mut heap).unwrap();
+
+    let first = list(&mut heap, &[make_small(1), at(&atoms, "a"), make_small(10)]);
+    let second = list(&mut heap, &[make_small(2), at(&atoms, "b"), make_small(20)]);
+    let third = list(&mut heap, &[make_small(3), at(&atoms, "a"), make_small(30)]);
+    assert_terms(&got, &[first, second, third], &atoms, "'$$' body");
+
+    // With no head variables there is nothing to collect: `'$$'` is `[]`.
+    let wildcard = tup(
+        &mut heap,
+        &[at(&atoms, "_"), at(&atoms, "_"), at(&atoms, "_")],
+    );
+    let spec = compile(spec1(&mut heap, wildcard, &[], &[at(&atoms, "$$")]), &atoms).unwrap();
+    let got = table.select(&spec, &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 3);
+    for term in got {
+        assert!(
+            is_nil(term),
+            "an unbound head yields the empty binding list"
+        );
+    }
+}
+
+#[test]
+fn fun2ms_dollar_underscore_body_yields_the_whole_object() {
+    // `'$_'` is the whole matched object.
+    // erl: `ets:select(T, [{{'$1','$2','$3'},[],['$_']}])`
+    //        -> [{1,a,10},{2,b,20},{3,a,30}].
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = fun2ms_table(&atoms, &mut heap);
+
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let spec = compile(spec1(&mut heap, head, &[], &[at(&atoms, "$_")]), &atoms).unwrap();
+    let got = table.select(&spec, &atoms, &mut heap).unwrap();
+    let want = fun2ms_objects(&mut heap, &atoms);
+    assert_terms(&got, &want, &atoms, "'$_' body");
+}
+
+#[test]
+fn fun2ms_guard_conjunctions_comma_and_andalso() {
+    // A comma in the source guard becomes two guard-*list* elements (a
+    // conjunction); an `andalso` stays nested inside one clause guard.
+    // `ets:fun2ms(fun({K,V,_W}) when V =:= a, K > 1 -> K end)`
+    //   == [{{'$1','$2','$3'},[{'=:=','$2',a},{'>','$1',1}],['$1']}]
+    // `ets:fun2ms(fun({K,V,_W}) when V =:= a andalso K > 1 -> K end)`
+    //   == [{{'$1','$2','$3'},[{'andalso',{'=:=','$2',a},{'>','$1',1}}],['$1']}]
+    // erl: both select -> [3] (`V` is `a` for keys 1 and 3, but only key 3 is > 1,
+    //      so the comma is a conjunction, not an `orelse`).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = fun2ms_table(&atoms, &mut heap);
+
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let is_a = tup(
+        &mut heap,
+        &[at(&atoms, "=:="), at(&atoms, "$2"), at(&atoms, "a")],
+    );
+    let over_one = tup(
+        &mut heap,
+        &[at(&atoms, ">"), at(&atoms, "$1"), make_small(1)],
+    );
+    let body = [at(&atoms, "$1")];
+
+    // Comma: two guard-list elements.
+    let comma = compile(spec1(&mut heap, head, &[is_a, over_one], &body), &atoms).unwrap();
+    assert_eq!(
+        table.select(&comma, &atoms, &mut heap).unwrap(),
+        vec![make_small(3)]
+    );
+
+    // `andalso`: one nested guard element.
+    let andalso = tup(&mut heap, &[at(&atoms, "andalso"), is_a, over_one]);
+    let spec = compile(spec1(&mut heap, head, &[andalso], &body), &atoms).unwrap();
+    assert_eq!(
+        table.select(&spec, &atoms, &mut heap).unwrap(),
+        vec![make_small(3)]
+    );
+}
+
+#[test]
+fn fun2ms_multi_clause_spec_is_first_match_wins() {
+    // `ets:fun2ms(fun({K,V,W}) when V =:= a -> {K,V,W};
+    //                ({_K,_V,W2}) -> W2 end)`
+    //   == [{{'$1','$2','$3'},[{'=:=','$2',a}],[{{'$1','$2','$3'}}]},
+    //       {{'$1','$2','$3'},[],['$3']}]
+    // erl: on [{1,a,10},{2,b,20},{3,a,30}] -> [{1,a,10},20,{3,a,30}]: objects 1 and 3
+    //      take the first clause (body = the rebuilt object); object 2's guard fails
+    //      and falls through to the fallback clause (body = `'$3'` = 20).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = fun2ms_table(&atoms, &mut heap);
+
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, "=:="), at(&atoms, "$2"), at(&atoms, "a")],
+    );
+    let whole = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let wrapped = tup(&mut heap, &[whole]);
+    let guards = list(&mut heap, &[guard]);
+    let first_body = list(&mut heap, &[wrapped]);
+    let clause_one = tup(&mut heap, &[head, guards, first_body]);
+    let fallback_body = list(&mut heap, &[at(&atoms, "$3")]);
+    let clause_two = tup(&mut heap, &[head, NIL, fallback_body]);
+    let spec = compile(list(&mut heap, &[clause_one, clause_two]), &atoms).unwrap();
+
+    let got = table.select(&spec, &atoms, &mut heap).unwrap();
+    let first = object(&mut heap, 1, at(&atoms, "a"), 10);
+    let third = object(&mut heap, 3, at(&atoms, "a"), 30);
+    assert_terms(
+        &got,
+        &[first, make_small(20), third],
+        &atoms,
+        "first clause wins",
+    );
+}
+
+#[test]
+fn fun2ms_filter_spec_select_count_counts_only_true() {
+    // `ets:fun2ms(fun({_K,V,_W}) when V =:= a -> true end)`
+    //   == [{{'$1','$2','$3'},[{'=:=','$2',a}],[true]}]
+    // erl: `ets:select_count(T, ...)` -> 2. `ets:select_count/2` counts only the
+    //      objects whose *body* evaluates to `true`, so the same spec with the body
+    //      `'$_'` selects 2 objects yet counts 0.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = fun2ms_table(&atoms, &mut heap);
+
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, "=:="), at(&atoms, "$2"), at(&atoms, "a")],
+    );
+
+    let filter = compile(
+        spec1(&mut heap, head, &[guard], &[at(&atoms, "true")]),
+        &atoms,
+    )
+    .unwrap();
+    assert_eq!(table.select_count(&filter, &atoms, &mut heap).unwrap(), 2);
+
+    let projected = compile(
+        spec1(&mut heap, head, &[guard], &[at(&atoms, "$_")]),
+        &atoms,
+    )
+    .unwrap();
+    assert_eq!(
+        table.select_count(&projected, &atoms, &mut heap).unwrap(),
+        0
+    );
+    assert_eq!(
+        table.select(&projected, &atoms, &mut heap).unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn fun2ms_shaped_match_object_with_a_wildcard_first_element() {
+    // `ets:match_object(T, {'_','$1'})` is the bare-pattern shorthand
+    // `[{{'_','$1'},[],['$_']}]`. erl: on [{1,a},{2,b},{3,a}]
+    //   -> [{1,a},{2,b},{3,a}] (`'_'` matches any first element; the 2-tuple
+    //      pattern matches only 2-tuples).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    for (key, value) in [(1, "a"), (2, "b"), (3, "a")] {
+        let object = tup(&mut heap, &[make_small(key), at(&atoms, value)]);
+        table.insert(object, &atoms).unwrap();
+    }
+
+    let pattern = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "$1")]);
+    let got = table.match_object(pattern, &atoms, &mut heap).unwrap();
+    let want = vec![
+        tup(&mut heap, &[make_small(1), at(&atoms, "a")]),
+        tup(&mut heap, &[make_small(2), at(&atoms, "b")]),
+        tup(&mut heap, &[make_small(3), at(&atoms, "a")]),
+    ];
+    assert_terms(&got, &want, &atoms, "match_object {'_','$1'}");
+}
+
+#[test]
+fn fun2ms_filter_spec_drives_select_delete() {
+    // `ets:fun2ms(fun({_K,V,_W}) when V =:= a -> true end)`
+    //   == [{{'$1','$2','$3'},[{'=:=','$2',a}],[true]}]
+    // erl: `ets:select_delete(T, ...)` on [{1,a,10},{2,b,20},{3,a,30}] -> 2,
+    //      leaving [{2,b,20}].
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = fun2ms_table(&atoms, &mut heap);
+
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, "=:="), at(&atoms, "$2"), at(&atoms, "a")],
+    );
+    let spec = compile(
+        spec1(&mut heap, head, &[guard], &[at(&atoms, "true")]),
+        &atoms,
+    )
+    .unwrap();
+
+    assert_eq!(table.select_delete(&spec, &atoms, &mut heap).unwrap(), 2);
+    assert_eq!(table.size(), 1);
+    let remaining = table.tab2list();
+    let want = object(&mut heap, 2, at(&atoms, "b"), 20);
+    assert_terms(&remaining, &[want], &atoms, "the surviving object");
+}
