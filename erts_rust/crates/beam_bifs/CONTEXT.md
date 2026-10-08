@@ -31,12 +31,19 @@ The registry is hand-written (a `BifFn` is a `fn` pointer, so a BIF cannot be ta
 
 | kind | declared | implemented |
 |---|---|---|
-| `bif` | 476 | 257 |
+| `bif` | 476 | 476 |
 | `ubif` | 73 | 73 |
-| `hbif` | 7 | 4 |
-| **total** | **556** | **334** |
+| `hbif` | 7 | 7 |
+| **total** | **556** | **556** |
 
-`registry = 413` = 334 declared + **79 stdlib fast paths**. **missing = 222**. The **222 declared-but-missing** per module (enumerated by the pinned test, never fabricated): `erlang` 77, `erts_internal` 62, `erts_debug` 18, `ets` 15, `erl_debugger` 13, `re` 8, `atomics` 7, `code` 7, `erl_ddll` 7, `erts_literal_area_collector` 2, `erts_trace_cleaner` 2, `error_logger`/`net_kernel`/`os`/`prim_file` 1 each.
+`registry = 637` = 556 declared + 81 non-table keys. **missing = 0** — every declared `bif.tab` entry is registered. The 145 keys closed in the runtime-family pass are all seam-backed (see `## The runtime-coupled BIF families`): with no runtime hook installed each answers the typed `unsupported_bif` capability gap, never a fabricated value and never `undef`.
+
+## The runtime-coupled BIF families (`src/runtime/`, the `runtime_bif!` macro)
+The 145 BIFs whose implementation needs the *running* runtime are registered here and bridge through the single `RuntimeHooks` seam (`erlang:memory/0,1` through `MemoryHook`). Ground truth: the corresponding C in `../../erts/emulator/beam/` (`erl_bif_*.c`, `bif.c`, `erl_time_sup.c`, `erl_db_*.c`), `string:misc`/`global` semantics for the tools' surfaces.
+- Files: `runtime/mod.rs` (module wiring + `runtime_bif!` + the `register` order), `runtime/memory.rs` (`memory/0,1`), `runtime/erlang.rs` (77: process control, timers, code loading, system/nodes introspection), `runtime/erts_internal.rs` (62: the `counters_*`/`atomics_new`, port/trace/suspend machinery, `term_to_string`, the trace sessions), `runtime/erts_debug.rs` (18: `interpreter_size`/`disassemble`/`lcnt_*`/`set_internal_state`/…), `runtime/other.rs` (65: `ets` 15 C-interior, `erl_debugger` 13, `re` 8, `erl_ddll` 7, `code` 7 coverage, `atomics` 7, `erts_trace_cleaner` 2, `erts_literal_area_collector` 2, `prim_file`/`os`/`net_kernel`/`error_logger` 1 each).
+- `runtime_bif!(reg, "module", function, arity)` defines a block-scoped `fn` forwarding to `BifContext::call_runtime_bif(module, function, args)`, so one `register` body holds any number of keys (one source line per BIF); no `BifFn` per key in a table.
+- **With no hook every key answers the typed `unsupported_bif`** — no key is special-cased to a constant return, no fabricated value, no `undef`. `RuntimeHooks::call` is a single dispatcher: a partial adopter matches the keys it implements and returns `unsupported_bif` for the rest. (Empirically, all 145 currently raise under `beam_rt`, which has no such hook: 89 `error:undef` / 49 `error:undefined` today; registering them can only turn exit 1 into the honest exit 3, never shadow a working result — `beam_rt`'s native floor is dispatched *before* the registry.)
+- `erlang:memory/0,1` (`runtime/memory.rs`) is the one family implemented against a real seam: `memory/0` renders the hook's `Vec<(&'static str, u64)>` as `{Key, Value}` in the hook's (oracle) key order — `total, processes, processes_used, system, atom, atom_used, binary, code, ets`; `memory/1` gives a plain integer for a single atom key, a `{K,V}` list in **requested** order for an atom list, and `badarg` for an unknown key or a malformed argument.
 
 ## The `records` module (native records, `records.rs`)
 OTP 29 native records (`-record` as a first-class value); their frozen interior `ErtsRecordDefinition`/`ErtsRecordInstance` is `beam_term::record` (the term-layout LCA), these 8 BIFs its surface. Ground truth `erl_record.c` (`create_4`, `update_4`, `get_2`, `get_module_1`/`get_name_1`/`get_field_names_1`, `is_exported_1`, `get_definition_2`).
