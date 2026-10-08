@@ -365,7 +365,8 @@ impl TableAccess<'_> {
     //
     // The `/3` forms and their `/1` resumptions are all **reads**: they scan the
     // table and build results, they never mutate it. They are therefore
-    // read-checked, like `select`/`match`.
+    // read-checked, like `select`/`match`. The same holds for the
+    // `select_reverse` family below (the reverse-direction `select`).
 
     /// `ets:select/3`, requiring read access. `Ok(None)` ⇒ `'$end_of_table'`.
     pub fn select_limit(
@@ -388,6 +389,43 @@ impl TableAccess<'_> {
     ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
         self.table.check_read(self.requester)?;
         self.table.select_continue(cont, atoms, heap)
+    }
+
+    /// `ets:select_reverse/2`, requiring read access.
+    ///
+    /// The reverse-direction analogue of [`Self::select`]: it only scans and
+    /// builds results, so it is gated as a **read**, exactly like `select`.
+    pub fn select_reverse(
+        &self,
+        spec: &MatchSpec,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<Vec<Eterm>> {
+        self.table.check_read(self.requester)?;
+        self.table.select_reverse(spec, atoms, heap)
+    }
+
+    /// `ets:select_reverse/3`, requiring read access. `Ok(None)` ⇒ `'$end_of_table'`.
+    pub fn select_reverse_limit(
+        &self,
+        spec: &MatchSpec,
+        limit: usize,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.select_reverse_limit(spec, limit, atoms, heap)
+    }
+
+    /// `ets:select_reverse/1`, requiring read access.
+    pub fn select_reverse_continue(
+        &self,
+        cont: &MatchContinuation,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.select_reverse_continue(cont, atoms, heap)
     }
 
     /// `ets:match/3`, requiring read access.

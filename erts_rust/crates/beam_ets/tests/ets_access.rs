@@ -33,7 +33,8 @@ use std::time::Duration;
 
 use beam_common::BeamError;
 use beam_ets::{
-    compile, Access, Heir, MatchSpec, OwnerId, RenameOutcome, SetOpt, Table, TableId, TableOptions,
+    compile, Access, Heir, MatchSpec, OwnerId, RenameOutcome, SetOpt, Table, TableId, TableKind,
+    TableOptions,
 };
 use beam_term::prelude::*;
 use common::*;
@@ -99,6 +100,18 @@ fn every_object_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
     let underscore = interned_atom(atoms, "_");
     let head = heap.tuple(&[underscore, underscore]).expect("test heap has room");
     let body = proper_list(heap, &[interned_atom(atoms, "true")]);
+    let clause = heap.tuple(&[head, NIL, body]).expect("test heap has room");
+    let spec = proper_list(heap, &[clause]);
+    compile(spec, atoms).expect("a valid match spec")
+}
+
+/// A compiled match-spec selecting every 2-tuple object with body `['$_']`
+/// (the whole object), the shape that shows the traversal *order* of a result.
+fn whole_object_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
+    let underscore = interned_atom(atoms, "_");
+    let whole = interned_atom(atoms, "$_");
+    let head = heap.tuple(&[underscore, underscore]).expect("test heap has room");
+    let body = proper_list(heap, &[whole]);
     let clause = heap.tuple(&[head, NIL, body]).expect("test heap has room");
     let spec = proper_list(heap, &[clause]);
     compile(spec, atoms).expect("a valid match spec")
@@ -751,6 +764,142 @@ fn the_limited_and_continuation_forms_follow_the_read_gate() {
             }
         }
     }
+}
+
+/// The `ets:select_reverse` family is **read**-gated, exactly like the forward
+/// `select` family: it only scans the table and builds results, so it must not be
+/// mistaken for a write. A non-owner may call all three forms on a `protected` or
+/// `public` table but is denied (`badarg`) on a `private` one; the owner is always
+/// allowed. The continuation used here is produced by an always-permitted (owner)
+/// view of the same table, so the requester under test can fail *only* on the gate.
+#[test]
+fn the_reverse_select_family_follows_the_read_gate() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let mut atoms = AtomTable::new();
+            let mut heap = Heap::new(2048);
+            let mut t = seeded_table(access, owner, &mut heap, &atoms);
+            let spec = every_object_spec(&mut heap, &mut atoms);
+            let (read_ok, _) = expected(access, owner, requester);
+            let tag = format!("{access:?}/{who}");
+
+            let continuation = t
+                .as_requester(Some(owner))
+                .select_reverse_limit(&spec, 2, &atoms, &mut rebuild_heap())
+                .unwrap()
+                .1
+                .expect("six objects with limit 2 yield a continuation");
+
+            // The select family builds its results on a `beam_alloc::Heap` (the
+            // caller's heap), distinct from the `beam_term` test arena above.
+            let mut out = rebuild_heap();
+            let view = t.as_requester(requester);
+            assert_gate(
+                view.select_reverse(&spec, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} select_reverse"),
+            );
+            assert_gate(
+                view.select_reverse_limit(&spec, 2, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} select_reverse_limit"),
+            );
+            assert_gate(
+                view.select_reverse_continue(&continuation, &atoms, &mut out),
+                read_ok,
+                &format!("{tag} select_reverse_continue"),
+            );
+
+            if read_ok {
+                let (chunk, next) =
+                    view.select_reverse_limit(&spec, 2, &atoms, &mut out).unwrap();
+                assert_eq!(chunk.len(), 2, "{tag}: an exact limit-sized chunk");
+                assert!(next.is_some(), "{tag}: a full chunk carries a continuation");
+            } else {
+                // A denial is `badarg` — not merely "not `Ok`".
+                assert!(matches!(
+                    view.select_reverse(&spec, &atoms, &mut out),
+                    Err(BeamError::BadArg)
+                ));
+                assert!(matches!(
+                    view.select_reverse_continue(&continuation, &atoms, &mut out),
+                    Err(BeamError::BadArg)
+                ));
+            }
+        }
+    }
+}
+
+/// The reverse wrappers route to the reverse traversal, not merely to the forward
+/// one: on an `ordered_set` the requester sees descending key order
+/// (`ets:select_reverse/2`), the exact reverse of the forward `select`, and the
+/// limited form chunks from the top down.
+#[test]
+fn select_reverse_routes_to_the_descending_scan() {
+    let mut atoms = AtomTable::new();
+    let mut heap = Heap::new(1024);
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+
+    let mut opts = TableOptions::new();
+    opts.set_kind(TableKind::OrderedSet);
+    opts.set_access(Access::Protected);
+    let mut t = Table::new(TableId::next(), opts).unwrap();
+    t.set_owner(Some(owner));
+    {
+        let mut as_owner = t.as_requester(Some(owner));
+        for k in 1..=3i64 {
+            as_owner.insert(object(&mut heap, k, k), &atoms).unwrap();
+        }
+    }
+
+    let spec = whole_object_spec(&mut heap, &mut atoms);
+    let ascending = [1i64, 2, 3];
+    let mut out = rebuild_heap();
+    // A non-owner reads the `protected` table — the reverse family is read-gated.
+    let view = t.as_requester(Some(other));
+
+    let forward = view.select(&spec, &atoms, &mut out).unwrap();
+    assert_eq!(forward.len(), 3, "three objects selected");
+    for (i, k) in ascending.iter().enumerate() {
+        assert!(
+            eq(forward[i], object(&mut heap, *k, *k), &atoms),
+            "forward select[{i}] must be {{{k},{k}}}"
+        );
+    }
+
+    let reverse = view.select_reverse(&spec, &atoms, &mut out).unwrap();
+    assert_eq!(reverse.len(), 3, "three objects selected in reverse");
+    for (i, k) in ascending.iter().rev().enumerate() {
+        assert!(
+            eq(reverse[i], object(&mut heap, *k, *k), &atoms),
+            "reverse select[{i}] must be {{{k},{k}}}"
+        );
+    }
+
+    // The limited form starts at the top of the order and resumes downwards.
+    let (chunk, next) = view.select_reverse_limit(&spec, 2, &atoms, &mut out).unwrap();
+    assert_eq!(chunk.len(), 2, "an exact limit-sized chunk");
+    assert!(
+        eq(chunk[0], object(&mut heap, 3, 3), &atoms),
+        "the first reverse chunk starts at the top"
+    );
+    assert!(
+        eq(chunk[1], object(&mut heap, 2, 2), &atoms),
+        "…and walks down"
+    );
+    let next = next.expect("a full chunk carries a continuation");
+    let (chunk2, next2) = view.select_reverse_continue(&next, &atoms, &mut out).unwrap();
+    assert_eq!(chunk2.len(), 1, "the tail holds the last object");
+    assert!(
+        eq(chunk2[0], object(&mut heap, 1, 1), &atoms),
+        "the tail resumes at the bottom"
+    );
+    assert!(next2.is_none(), "a partial final chunk ends the traversal");
 }
 
 // --------------------- The remaining families' gates + the live oracle ---------------------
