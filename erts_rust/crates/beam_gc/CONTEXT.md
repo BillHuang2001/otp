@@ -329,29 +329,13 @@ Per point: `need_reserve_words 64`, `initial_young_words = live_line_words + 409
 `fullsweep_after 65535`, so the forced fullsweep lands in the mark-region space. Measured (counts are
 **exact**; pause and the derived ratio are **fastest-of-9**, shown as the min–max over three separate runs):
 
-`Shape::Line` (1.0× footprint by construction):
-
-| live set | moved words copying → immix | pinned | footprint c/i | pause immix/copying | words saved per extra µs |
-|---|---|---|---|---|---|
-| 0.25 block (64 w) | 64 → 64 | 0 | 1.0× | 1.97–1.99× | 0 |
-| 0.5 block (128 w) | 128 → 128 | 0 | 1.0× | 2.28–2.35× | 0 |
-| 1 block (256 w) | 256 → **0** | 16 | 1.0× | 1.16–1.23× | 264–370 |
-| 2 blocks (512 w) | 512 → **0** | 32 | 1.0× | 1.43–1.48× | 219–249 |
-| 8 blocks (2 048 w) | 2 048 → **0** | 128 | 1.0× | 2.27–2.29× | 265–274 |
-| 32 blocks (8 192 w) | 8 192 → **0** | 512 | 1.0× | 2.24–2.30× | 279–284 |
-| 64 blocks (16 384 w) | 16 384 → **0** | 1024 | 1.0× | 2.28–2.31× | 281–284 |
-
-`Shape::Small` (3 useful words per 16-word line → 0.19× footprint):
-
-| live set | moved words copying → immix | pinned | footprint c/i | pause immix/copying | words saved per extra µs |
-|---|---|---|---|---|---|
-| 0.25 block (12 useful w) | 12 → **64** | 0 | **0.19×** | 2.03–2.06× | **−190…−200** |
-| 0.5 block (24 useful w) | 24 → **128** | 0 | **0.19×** | 2.65–2.74× | **−174…−182** |
-| 1 block (48 useful w) | 48 → **0** | 16 | 0.19× | 2.36–2.38× | 69–72 |
-| 2 blocks (96 useful w) | 96 → **0** | 32 | 0.19× | 2.60–2.64× | 73–75 |
-| 8 blocks (384 useful w) | 384 → **0** | 128 | 0.19× | 1.69–1.76× | 80–90 |
-| 32 blocks (1 536 useful w) | 1 536 → **0** | 512 | 0.19× | 2.33–2.46× | 80–87 |
-| 64 blocks (3 072 useful w) | 3 072 → **0** | 1024 | 0.19× | 2.80–2.87× | 85–86 |
+Per point (moved words copying → immix; counts exact): below one whole block Immix is never fewer and is
+strictly more for the small-object shape — 0.25 blk `64 → 64` (Line) / `12 → 64` (Small), 0.5 blk
+`128 → 128` / `24 → 128`; from **one whole block up** Immix pins the whole live set and moves **0**
+(1/2/8/32/64 blocks → 16/32/128/512/1024 pinned) while copying re-copies the entire live set. Footprint
+c/i 1.0× (Line) / 0.19× (Small); pause (immix/copying) flat ≈2.2–2.3× in the selected regime; words saved
+per extra µs 0 below one block, then 69→85 (Small) / 264→281 (Line), plateauing at 8 blocks. The exact
+per-point tables are printed by `tests/immix_break_even.rs` (deterministic counts also asserted).
 
 **Derived rule — `select_mature` switches at 8 whole blocks (`IMMIX_BREAK_EVEN_WORDS = 2048`).** Reading the
 sweep: (1) **below one whole block Immix is never better and is strictly dominated for small objects** — it
