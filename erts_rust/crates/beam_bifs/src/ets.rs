@@ -49,8 +49,18 @@
 //! ref thing [`crate::access::make_ref_thing`] built for this table, so
 //! `ets:info(T, id) =:= T` and `is_reference(ets:info(T, id))` both hold, exactly as
 //! in the oracle (`TableInfo::id` is the raw numeric id, which is only the
-//! registry key here). `ets:info(T, Item)` raises `badarg` for an unknown `Item` —
-//! the verified system `erl` behaviour (it does **not** return `undefined`).
+//! registry key here). `ets:info(T, Item)` raises `badarg` for an unknown `Item` of
+//! a **live** table — the verified system `erl` behaviour (it does **not** return
+//! `undefined`).
+//!
+//! A *well-formed* table argument that names no live table is the other way round:
+//! both arities answer the bare atom `undefined` (verified on erts-17.1) — an unknown
+//! atom, an atom naming a table that was *not* created with `named_table`, and a
+//! deleted table's handle (`ets:info(T)` / `ets:info(T, name)` after `ets:delete(T)`)
+//! are all `undefined`, and that resolution happens **before** the `Item` is looked
+//! at, so `ets:info(bogus, 42)` is `undefined` while `ets:info(T, 42)` on a live `T`
+//! is `badarg`. A term that is neither an atom nor a reference (`42`, `{T, Node}`,
+//! `[]`, a pid) stays `badarg` for both.
 //!
 //! # The match family (see [`matches`] for the BIFs)
 //!
@@ -74,7 +84,10 @@
 //! with the `named_table` option — its **name atom** (the oracle's
 //! `db_get_table_aux` accepts exactly those two shapes; a `{Name, Node}` 2-tuple is
 //! **not** a table argument in OTP 29). `ets:new(Name, [named_table])` returns the
-//! **name atom**; every other table the handle reference.
+//! **name atom**; every other table the handle reference. The two `ets:info/1,2`
+//! BIFs resolve through [`resolve::resolve_handle_opt`] instead, which additionally
+//! reports `undefined` for a well-formed argument that names no live table (see the
+//! `ets:info/1,2` section above).
 //!
 //! `ets:new/2` records the calling process as the table owner
 //! ([`resolve::caller_owner`]) and the installed heir, and each BIF enforces the
@@ -557,12 +570,19 @@ fn delete_all_objects_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eter
     ctx.boolean(true)
 }
 
-/// `ets:info(Tab)` — the table's introspection proplist.
+/// `ets:info(Tab)` — the table's introspection proplist, or the bare atom
+/// `undefined` when `Tab` is a well-formed table argument that names no live table
+/// (an unknown atom, the name of a table not created with `named_table`, or a
+/// deleted table's handle). A `Tab` that is neither an atom nor a handle reference
+/// is still `badarg`.
 ///
 /// Never access-gated (the oracle lets a non-owner `info` a `private` table), so
 /// the table is taken **without** an access check.
 fn info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let handle = match resolve::resolve_handle_opt(ctx, args[0])? {
+        Some(handle) => handle,
+        None => return ctx.intern_atom("undefined"),
+    };
     let table = take_table(ctx, handle)?;
     let info = table.info();
     restore_table(ctx, handle, table)?;
@@ -580,12 +600,20 @@ fn info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.list(&pairs)
 }
 
-/// `ets:info(Tab, Item)` — one introspection field (an unknown `Item` is
-/// `badarg`, matching the system `erl`).
+/// `ets:info(Tab, Item)` — one introspection field of a live table (an unknown
+/// `Item` of a **live** table is `badarg`, matching the system `erl`).
+///
+/// The table is resolved **first**, so a `Tab` that names no live table answers the
+/// bare atom `undefined` whatever `Item` is — including a non-atom one
+/// (`ets:info(bogus, 42)` ⇒ `undefined`, while `ets:info(T, 42)` on a live `T` ⇒
+/// `badarg`).
 ///
 /// Never access-gated, like [`info_1`].
 fn info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let handle = match resolve::resolve_handle_opt(ctx, args[0])? {
+        Some(handle) => handle,
+        None => return ctx.intern_atom("undefined"),
+    };
     let item = args[1];
     if !is_atom(item) {
         return Err(badarg());
@@ -1327,6 +1355,10 @@ mod tests {
         atoms.name(atom_val(term)) == Some("false")
     }
 
+    /// Whether `term` is the atom `undefined`.
+    fn is_undefined(atoms: &AtomTable, term: Eterm) -> bool {
+        atoms.name(atom_val(term)) == Some("undefined")
+    }
     #[test]
     fn insert_get_and_remove_round_trip() {
         let mut reg = TableRegistry::new();
@@ -1770,6 +1802,116 @@ mod tests {
         ));
     }
 
+    /// `ets:info/1,2` on a *well-formed* table argument that names no live table is
+    /// the atom `undefined` — an unknown atom, an atom naming a table that is not a
+    /// `named_table`, and a deleted table's handle alike — for **both** arities and
+    /// whatever the `Item`. A term of any other shape is `badarg`, and a *live* table
+    /// with an unknown/non-atom item is `badarg` too. (The whole matrix was probed
+    /// live on erts-17.1; the only deviation is the bare-`make_ref()` case noted in
+    /// `resolve::resolve_handle_opt`.)
+    #[test]
+    fn info_of_a_table_that_names_nothing_is_undefined() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+
+        // A table created *without* `named_table`: the name atom is only its internal
+        // `name` field, so `ets:info(mytab)` is `undefined` in the oracle while the
+        // handle reference resolves.
+        let handle = new_table(&mut ctx, "mytab");
+        let unnamed = ctx.atom("mytab").expect("seeded");
+        // A name no table has ever used.
+        let unknown = ctx.atom("z").expect("seeded");
+        let name_item = ctx.atom("name").expect("seeded");
+        let one = ctx.int(1).expect("fits");
+
+        // The live table is unaffected.
+        let full = info_1(&mut ctx, &[handle]).expect("info/1 of a live table");
+        assert_eq!(proper_list(full).expect("15 fields").len(), INFO_ITEMS.len());
+
+        for (tab, item) in [
+            (unknown, name_item),
+            (unknown, one),
+            (unnamed, name_item),
+            (unnamed, one),
+        ] {
+            let full = info_1(&mut ctx, &[tab]).expect("info/1 names no table");
+            assert!(is_undefined(&atoms, full), "info/1 of a table-less name");
+            let single = info_2(&mut ctx, &[tab, item]).expect("info/2 names no table");
+            assert!(is_undefined(&atoms, single), "info/2 of a table-less name");
+        }
+
+        // A deleted table. `ets:new(Name, [named_table])` returns the name atom, so
+        // the handle *is* that atom; a non-`named_table` handle is a reference.
+        let named = {
+            let name = ctx.atom("b").expect("seeded");
+            let kind = ctx.atom("set").expect("seeded");
+            let named_table = ctx.atom("named_table").expect("seeded");
+            let opts = ctx.list(&[kind, named_table]).expect("fits");
+            new_2(&mut ctx, &[name, opts]).expect("ets:new(named_table)")
+        };
+        let live_named = info_1(&mut ctx, &[named]).expect("info/1 of a live named table");
+        assert_eq!(proper_list(live_named).expect("15 fields").len(), INFO_ITEMS.len());
+        let ref_handle = new_table(&mut ctx, "c");
+        assert!(is_true(&atoms, delete_1(&mut ctx, &[named]).expect("delete named")));
+        assert!(is_true(&atoms, delete_1(&mut ctx, &[ref_handle]).expect("delete ref")));
+        for (tab, item) in [
+            (named, name_item),
+            (named, one),
+            (ref_handle, name_item),
+            (ref_handle, one),
+        ] {
+            let full = info_1(&mut ctx, &[tab]).expect("info/1 of a deleted table");
+            assert!(is_undefined(&atoms, full), "info/1 of a deleted table");
+            let single = info_2(&mut ctx, &[tab, item]).expect("info/2 of a deleted table");
+            assert!(is_undefined(&atoms, single), "info/2 of a deleted table");
+        }
+
+        // A hand-built ref thing whose id is in no registry: the M1 deviation (a bare
+        // `make_ref()` is `badarg` in the oracle, which can tell a tid reference from
+        // an ordinary one; the M1 handle cannot).
+        let stray = make_ref_thing(ctx.heap(), 4242).expect("fits");
+        assert!(is_undefined(
+            &atoms,
+            info_1(&mut ctx, &[stray]).expect("info/1 stray ref")
+        ));
+        assert!(is_undefined(
+            &atoms,
+            info_2(&mut ctx, &[stray, name_item]).expect("info/2 stray ref")
+        ));
+
+        // Everything else is `badarg` for both arities: a small int, a tuple, `[]`
+        // and a pid (`ets:info(42)` / `ets:info({t,Node})` / `ets:info([])` /
+        // `ets:info(self())` all raise `badarg` in the oracle).
+        let key = ctx.atom("mytab").expect("seeded");
+        let tuple = ctx.tuple(&[key, one]).expect("fits");
+        let pid = ProcessId::new(1, 0).to_eterm();
+        for tab in [one, tuple, NIL, pid] {
+            assert!(
+                matches!(info_1(&mut ctx, &[tab]), Err(BeamError::BadArg)),
+                "info/1 of a wrongly-typed table argument"
+            );
+            assert!(
+                matches!(info_2(&mut ctx, &[tab, name_item]), Err(BeamError::BadArg)),
+                "info/2 of a wrongly-typed table argument"
+            );
+            assert!(
+                matches!(info_2(&mut ctx, &[tab, one]), Err(BeamError::BadArg)),
+                "info/2 of a wrongly-typed table argument"
+            );
+        }
+
+        // A *live* table with an unknown or non-atom item stays `badarg`.
+        let live = new_table(&mut ctx, "mytab");
+        assert!(matches!(
+            info_2(&mut ctx, &[live, unknown]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            info_2(&mut ctx, &[live, one]),
+            Err(BeamError::BadArg)
+        ));
+    }
     #[test]
     fn update_counter_deposits_and_adds() {
         let (mut heap, atoms, mut reg) = parts();
