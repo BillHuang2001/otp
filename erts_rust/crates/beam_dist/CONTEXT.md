@@ -351,7 +351,15 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   - `tests/handshake.rs`/`framing.rs`/`control.rs`/`epmd.rs` — round-trips + byte-exact vectors +
     negatives; `control.rs` pins the wire tuple bytes (`DOP_SEND` args `[1,2]` ⇒ `[104,3,97,2,97,1,97,2]`)
     and proves `encode_control_cached` is byte-identical to `encode_control` with no cache and writes
-    `[82, index]` with one.
+    `[82, index]` with one; `handshake.rs` covers `Status::kind`/`error_kind`/`status_error` and the
+    `not_allowed` wire bytes; `epmd.rs` covers the admin (`DUMP`/`KILL`/`STOP`) codecs + the typed
+    conflict accessors.
+  - `tests/dop_roundtrip.rs` — the **exhaustive 30/30 opcode round-trip** (encode → decode →
+    byte-identical re-encode, arg table a wildcard-free `match`) + the 30 byte-exact golden vectors
+    cross-checked against the system `erl` oracle (`term_to_binary/1`, `VERSION_MAGIC` stripped).
+  - `tests/delivery.rs` — `Delivery::classify` over every opcode (arg-order pins; the
+    `SpawnRequest`/`SpawnReply`/`AltactSigSend` flag decoding incl. the out-of-range `BadArg` negative;
+    `DOP_UNLINK` ⇒ `Other`).
   - `tests/fragment.rs` — byte-exact `'E'`/`'F'` prefixes, split/reassemble round-trips, negatives.
   - `tests/atom_cache.rs` — segment addressing, `New`/`Cached` classification, header apply, ref
     resolution through `beam_codec`, and `encode_control_cached` driven by a real `OutboundAtomCache`
