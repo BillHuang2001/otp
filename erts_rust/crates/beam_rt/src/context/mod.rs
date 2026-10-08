@@ -859,7 +859,17 @@ impl<'a> RuntimeContext<'a> {
         // names interned during the call: each lands at the index the interner predicted,
         // keeping the BIF's/NIF's atom terms (and every printer/comparison that resolves them)
         // consistent.
-        pending.commit(self.runtime.code_server.atoms_mut());
+        //
+        // The emptiness guard is load-bearing for performance, not semantics: an empty commit
+        // is a no-op, but `atoms_mut()` goes through `Rc::make_mut`, and the port-registry /
+        // persistent-term / NIF handles plus this call's own `atoms` binding keep the shared
+        // table's strong count at 2 or more -- so touching it would deep-clone the whole
+        // `AtomTable` on *every* registered BIF call. Only a call that actually interns a name
+        // (`binary_to_term`/`list_to_atom`/`binary_to_atom`/`load_nif`, all rare) pays the
+        // commit, and then it still lands the names at their predicted indices.
+        if !pending.is_empty() {
+            pending.commit(self.runtime.code_server.atoms_mut());
+        }
         self.runtime.put_bif_heap(heap);
         // A registered BIF that ran its heap dry is the emulator's documented hard limit,
         // not a host-level allocation abort (see `error::enforce_term_heap_limit`).
@@ -1036,7 +1046,13 @@ impl<'a> RuntimeContext<'a> {
             nifs.call(module, function, arity, &mut env, args)
         };
         self.runtime.put_bif_heap(host.into_heap());
-        interner.commit(self.runtime.code_server.atoms_mut());
+        // Same load-bearing emptiness guard as `call_registered`: `atoms_mut()` is
+        // `Rc::make_mut`, and the live host/NIF-registry handles keep the shared table's
+        // strong count above 1, so an unconditional commit would deep-clone the whole
+        // `AtomTable` on every NIF call. Only commit when the NIF actually interned a name.
+        if !interner.is_empty() {
+            interner.commit(self.runtime.code_server.atoms_mut());
+        }
         match outcome {
             // A NIF must hand back a **term** (or record an exception, which `NifLibrary::call`
             // turns into `Raised`). The ABI's `THE_NON_VALUE` (a bare header word) is not one: the
