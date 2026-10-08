@@ -604,10 +604,20 @@ arith_licm_kill_switches(Config) ->
         true -> ok;
         false -> ct:fail(arith_subflag_kill_switch_ineffective)
     end,
-    %% ... and `no_ssa_opt' kills both passes at once.
-    case D([loop_opt, loop_arith_licm, no_ssa_opt]) =:= Base of
+    %% ... while `no_ssa_opt' disables the whole `beam_ssa_opt' pass, not just
+    %% the opt-in loop sub-passes, so both become inert together: the loop
+    %% flags add nothing to a build that already has all SSA optimization off.
+    case D([loop_opt, loop_arith_licm, no_ssa_opt]) =:= D([no_ssa_opt]) of
         true -> ok;
         false -> ct:fail(no_ssa_opt_ineffective)
+    end,
+    %% The two auto-derived per-pass kill switches together, on the other
+    %% hand, do restore the default output: the loop passes are the only
+    %% difference from a default build.
+    case D([loop_opt, loop_arith_licm,
+            no_ssa_opt_loop_opt, no_ssa_opt_loop_arith_licm]) =:= Base of
+        true -> ok;
+        false -> ct:fail(loop_kill_switches_ineffective)
     end,
     %% The sub-flag on its own, and each of its two kill switches.
     case D([loop_arith_licm]) =:= Base of
@@ -618,7 +628,7 @@ arith_licm_kill_switches(Config) ->
         true -> ok;
         false -> ct:fail(arith_kill_switch_ineffective)
     end,
-    case D([loop_arith_licm, no_ssa_opt]) =:= Base of
+    case D([loop_arith_licm, no_ssa_opt]) =:= D([no_ssa_opt]) of
         true -> ok;
         false -> ct:fail(arith_no_ssa_opt_ineffective)
     end,
