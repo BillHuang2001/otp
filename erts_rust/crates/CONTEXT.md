@@ -232,7 +232,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   fallback returns a typed error, never a wrong result).
 - **Receive/message execution path WORKS end-to-end.** `beam_engine` executes the whole receive family
   (`send`/`loop_rec`/`loop_rec_end`/`wait`/`wait_timeout`/`timeout`/`remove_message`/`recv_marker_*`)
-  over the new `Mailbox` seam (the compiled `TestKind` machinery still does the matching); `beam_process`
+  over the `Mailbox` seam (the compiled `TestKind` machinery does the matching); `beam_process`
   scheduling wakes a receiver blocked in `receive` on send; `beam_rt` runs a real `.beam` fixture with
   `send`/`receive` through the real runtime glue and a single-threaded scheduler (`self() ! X, receive
   Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). **The port subsystem is consolidated onto `beam_io`:** `beam_rt` owns one long-lived `beam_io::Poller`
