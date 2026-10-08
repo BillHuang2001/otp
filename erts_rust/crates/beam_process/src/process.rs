@@ -21,7 +21,7 @@ use beam_term::prelude::Eterm;
 use crate::dict::Dict;
 use crate::fragments::SavedArgs;
 use crate::link::Links;
-use crate::monitor::{MonitoredBy, Monitors};
+use crate::monitor::{MonitoredBy, Monitors, PortWatch};
 use crate::pid::ProcessId;
 use crate::registers::Registers;
 use crate::run_queue::Priority;
@@ -246,6 +246,13 @@ pub struct Process {
     links: Links,
     /// Outgoing monitors.
     monitors: Monitors,
+    /// Outgoing **port** monitors: the ports this process watches
+    /// (`erlang:monitor(port, Port)`).
+    ///
+    /// A [`PortWatch`] holds only plain values (a reference and a port number), **not** heap
+    /// terms, so this set is **not** a GC root and adds nothing to
+    /// [`Process::collect`]'s root set.
+    port_monitors: Vec<PortWatch>,
     /// Incoming monitors (who monitors this process).
     monitored_by: Vec<MonitoredBy>,
     /// The termination reason, once the process has exited.
@@ -313,6 +320,7 @@ impl Process {
             reductions: 0,
             links: Links::new(),
             monitors: Monitors::new(),
+            port_monitors: Vec::new(),
             monitored_by: Vec::new(),
             exit_reason: None,
         })
@@ -559,6 +567,22 @@ impl Process {
         &self.monitored_by
     }
 
+    /// The outgoing **port** monitors: the ports this process watches
+    /// (`erlang:monitor(port, Port)`).
+    ///
+    /// This is the outgoing half a port monitor needs for `erlang:demonitor/1` and for
+    /// `erlang:process_info(P, monitors)`; the incoming half lives in the
+    /// [`PortTable`](crate::port::PortTable). A [`PortWatch`] is a pair of plain values, so
+    /// the set is not part of [`Process::collect`]'s root set.
+    pub fn port_monitors(&self) -> &[PortWatch] {
+        &self.port_monitors
+    }
+
+    /// The outgoing port monitors, mutably.
+    pub fn port_monitors_mut(&mut self) -> &mut Vec<PortWatch> {
+        &mut self.port_monitors
+    }
+
     /// The monitors watching this process, mutably.
     pub fn monitored_by_mut(&mut self) -> &mut Vec<MonitoredBy> {
         &mut self.monitored_by
@@ -682,6 +706,10 @@ impl Process {
     /// dict, the saved args and the pending signals scattered back) in the SAME order it was
     /// gathered.
     ///
+    /// The outgoing port-monitor set ([`Process::port_monitors`]) is deliberately **not**
+    /// gathered: a [`PortWatch`] holds a reference and a port number, both plain values
+    /// rather than heap terms, so it cannot be relocated and needs no root.
+    ///
     /// # Errors
     ///
     /// Propagates the collector's and the rebuilding allocations' `BeamError`s.
@@ -789,6 +817,7 @@ mod tests {
 
     use super::*;
     use crate::monitor::{Monitor, MonitorKind, RefAllocator};
+    use crate::pid::PortId;
     use crate::signal::SignalAtoms;
 
     fn pid(number: u64) -> ProcessId {
@@ -997,6 +1026,18 @@ mod tests {
         });
         assert_eq!(process.monitored_by().len(), 1);
         assert_eq!(process.monitored_by()[0].watcher, pid(5));
+
+        // The outgoing port-monitor set is reachable too, and starts empty.
+        assert!(process.port_monitors().is_empty());
+        let port_reference = RefAllocator::new().next();
+        let port = PortId::new(11);
+        process.port_monitors_mut().push(PortWatch {
+            reference: port_reference,
+            port,
+        });
+        assert_eq!(process.port_monitors().len(), 1);
+        assert_eq!(process.port_monitors()[0].reference, port_reference);
+        assert_eq!(process.port_monitors()[0].port, port);
     }
 
     #[test]

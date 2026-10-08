@@ -6,6 +6,17 @@
 //! termination sends `A` a `{'DOWN', Ref, process, B, Reason}` message carrying that same
 //! reference.
 //!
+//! # Process monitors vs port monitors
+//!
+//! [`MonitorKind`] names the two monitor types the oracle supports (`process` and `port`), and
+//! [`MonitorKind::from_type_name`]/[`MonitorKind::type_name`] are the type-dispatch seam the
+//! `erlang:monitor/2` BIF layer resolves its first argument through (`time_offset` and every
+//! other atom are not a monitor type). A **port** monitor's target is a
+//! [`PortId`](crate::pid::PortId) rather than a [`ProcessId`], so its outgoing half is a
+//! [`PortWatch`] (stored on the watcher by
+//! [`ProcessTable::monitor_port`](crate::ptab::ProcessTable::monitor_port)) and its incoming
+//! half lives in the [`PortTable`](crate::port::PortTable).
+//!
 //! # Monitor references
 //!
 //! `beam_term` has no `make_ref` in Milestone-1, so a reference is represented as the
@@ -25,7 +36,7 @@ use beam_term::prelude::{
     make_small, signed_value, tuple_element, tuple_size, Atom, Eterm, REF_SUBTAG,
 };
 
-use crate::pid::ProcessId;
+use crate::pid::{PortId, ProcessId};
 
 /// The number of payload words of the ref thing: `node`, `serial` and `id`.
 const REF_PAYLOAD_WORDS: usize = 3;
@@ -112,10 +123,67 @@ pub fn payload_is_down_for(payload: Eterm, reference: MonitorRef, down_atom: Ato
 /// What a monitor targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MonitorKind {
-    /// A process monitor.
+    /// A process monitor (`erlang:monitor(process, Target)`).
     Process,
-    /// A port monitor.
+    /// A port monitor (`erlang:monitor(port, Target)`).
     Port,
+}
+
+impl MonitorKind {
+    /// The `erlang:monitor/2` **type name** this kind is spelled with: `"process"` or
+    /// `"port"`.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            MonitorKind::Process => "process",
+            MonitorKind::Port => "port",
+        }
+    }
+
+    /// Maps an `erlang:monitor/2` **type name** to a monitor kind, or `None` when the name
+    /// is not a supported monitor type.
+    ///
+    /// This is the type-dispatch seam the BIF layer resolves `erlang:monitor/2`'s first
+    /// argument through; a `None` is the oracle's `badarg`. `time_offset` — the monitor type
+    /// OTP removed in OTP 26 — and every other atom are `None`, so this crate has **no**
+    /// `time_offset` (or any other unsupported-type) path capable of returning a wrong
+    /// result: there is no such variant to select.
+    ///
+    /// Note that only the *type name* is resolved here; the target still has to match the
+    /// kind (`erlang:monitor(port, NotAPort)` is `badarg` — see
+    /// [`ProcessTable::monitor_port_term`](crate::ptab::ProcessTable::monitor_port_term)).
+    pub fn from_type_name(name: &str) -> Option<MonitorKind> {
+        match name {
+            "process" => Some(MonitorKind::Process),
+            "port" => Some(MonitorKind::Port),
+            _ => None,
+        }
+    }
+}
+
+/// An outgoing **port** monitor: [`Process`](crate::process::Process) `watcher` watches `port`.
+///
+/// A port monitor is one-directional exactly like a process monitor, but its target is a
+/// [`PortId`] rather than a [`ProcessId`]:
+/// [`ProcessTable::monitor_port`](crate::ptab::ProcessTable::monitor_port) records this
+/// outgoing half on the watcher and the incoming
+/// [`PortMonitor`](crate::port::PortMonitor) on the port, and
+/// [`ProcessTable::port_closed`](crate::ptab::ProcessTable::port_closed) resolves the pair with
+/// `{'DOWN', Ref, port, Port, Reason}`.
+///
+/// # Not a GC root
+///
+/// `reference` and `port` are both plain values (a `u64`-backed handle), **not** heap terms,
+/// so a port-watch set adds no root to the collector:
+/// [`Process::collect`](crate::process::Process::collect) gathers only the
+/// registers/stack, the mailbox payloads, the dictionary, the saved args and the
+/// pending-signal queue. (A port monitor therefore also never affects `beam_message`'s copy
+/// sizing, which only walks a crossed term's own object graph.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortWatch {
+    /// The reference the `{'DOWN', …}` message will carry.
+    pub reference: MonitorRef,
+    /// The watched port.
+    pub port: PortId,
 }
 
 /// An outgoing monitor: this process watches `target`.
@@ -248,6 +316,29 @@ mod tests {
         assert!(b.id() < c.id());
         assert_ne!(a, b);
         assert_ne!(b, c);
+    }
+
+    #[test]
+    fn monitor_kind_type_names_round_trip_and_reject_time_offset() {
+        // Pins objective item 6: `erlang:monitor/2`'s type dispatch. Only `process` and
+        // `port` are monitor types; `time_offset` (removed in OTP 26) and anything else is
+        // `None`, which the BIF layer renders as the oracle's `badarg`.
+        assert_eq!(MonitorKind::Process.type_name(), "process");
+        assert_eq!(MonitorKind::Port.type_name(), "port");
+        assert_eq!(
+            MonitorKind::from_type_name("process"),
+            Some(MonitorKind::Process)
+        );
+        assert_eq!(MonitorKind::from_type_name("port"), Some(MonitorKind::Port));
+        assert_eq!(MonitorKind::from_type_name("time_offset"), None);
+        assert_eq!(MonitorKind::from_type_name("no_such_type"), None);
+        assert_eq!(MonitorKind::from_type_name(""), None);
+        // Case matters: the oracle's atom is the exact lowercase `time_offset`/`process`.
+        assert_eq!(MonitorKind::from_type_name("Process"), None);
+        // Every kind round-trips through its own name.
+        for kind in [MonitorKind::Process, MonitorKind::Port] {
+            assert_eq!(MonitorKind::from_type_name(kind.type_name()), Some(kind));
+        }
     }
 
     #[test]

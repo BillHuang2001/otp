@@ -12,6 +12,8 @@
 //!   ([`bad_pid`]) ⇒ `badarg`, matching `erlang:register/2`/`erlang:unregister/1` (both raise
 //!   `badarg`; an unregister of an unregistered name is `badarg`, **not** `TermNotFound`),
 //! * pid/port number-space exhaustion ⇒ [`system_limit`] (`SystemLimit`),
+//! * a named **port** monitor (`erlang:monitor(port, Name)`, whose name the local
+//!   process-only registry cannot resolve) ⇒ [`named_port_monitor`],
 //! * a genuinely unimplemented capability ⇒ [`unsupported`] (a BEAM `error` raise), so a caller
 //!   never receives a wrong result in place of a typed diagnostic.
 //!
@@ -51,4 +53,16 @@ pub(crate) fn system_limit() -> BeamError {
 /// single place the `unsupported:` prefix is spelled.
 pub(crate) fn unsupported(what: &str) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(format!("unsupported: {what}"))))
+}
+
+/// The typed diagnostic for an `erlang:monitor(port, Name)` on a **registered name**
+/// (a named port monitor).
+///
+/// The oracle resolves a name to a process *or* a port, but the local registry
+/// (`ProcessTable`'s `names`) holds [`ProcessId`](crate::pid::ProcessId)s only, so a named
+/// **port** monitor cannot be resolved faithfully — treating the name as a *process* name
+/// (or as an unregistered name) would deliver a wrong `{'DOWN', …}`. Both spellings
+/// (`ProcessTable::monitor_term` and `ProcessTable::monitor_named`) share this one reason.
+pub(crate) fn named_port_monitor() -> BeamError {
+    unsupported("monitor/2: named port monitor (the local name registry holds processes only)")
 }
