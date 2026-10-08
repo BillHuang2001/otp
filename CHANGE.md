@@ -8,6 +8,145 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-08 — Milestone 3: complete BIF surface, hot-path flattening, ordered-set B+-tree, on-demand heap growth, full ABI freeze
+
+Scope: the runtime gains the **complete declared BIF surface**, a **flattened interpreter hot path**,
+a **250–400× reduction in per-BIF-call overhead**, the planned **B+-tree `ordered_set` interior**, an
+**on-demand heap-growth seam**, a **fully populated and mechanically checked C-ABI**, and a much wider
+differential corpus. Verified: `cargo build --workspace --all-targets` warning-free, `cargo test
+--workspace --no-fail-fast` **5924 tests / 0 failures**, and the differential gate **`total=723
+agree=715 mismatch=0 unsupported=8 skipped=0`** (the 8 `unsupported` are honest, typed capability gaps;
+one is the documented unclosable `erl_eval`-lambda encoding).
+
+- **Area:** `beam_bifs` (Stage 3 — BIF surface)
+- **Change:** The registry now implements **every entry of the real `erts/emulator/beam/bif.tab`** —
+  **556 declared BIFs** (`bif` 476 + `ubif` 73 + `hbif` 7), up from 334 (222 missing). The 145 newly
+  registered runtime-coupled keys (process control, timers, code loading, the ETS C interior,
+  `erts_debug`/`erl_debugger`, `re`, `erl_ddll`, distribution) plus the 77 `erlang` keys and
+  `erlang:memory/0,1` all bridge through two new **defaulted** `BifContext` seams — `RuntimeHooks::call`
+  (one `(module, function, arity)` dispatcher) and `MemoryHook::memory()` — whose default is the typed
+  `unsupported_bif` capability gap. Registration is data-driven per family through a `runtime_bif!`
+  macro. With no host hook installed a call now raises the honest `unsupported` (CLI exit 3) instead of
+  the bare `error:undef` (exit 1), so the gate can distinguish "not capable" from "not a BIF".
+- **Why:** Contract A.7 pins the BIF surface to the real table; a partial roster made every unregistered
+  key indistinguishable from a typo and masked genuine gaps.
+- **Area:** `beam_rt` (Stage 5 — performance)
+- **Change (algorithmic):** eliminated a **whole-`AtomTable` deep clone on every BIF call**.
+  `RuntimeContext::call_registered` committed the names interned during a call through
+  `CodeServer::atoms_mut()` (an `Rc::make_mut`) unconditionally; the table's strong count is always ≥ 2
+  during a call, so the copy-on-write path always fired and deep-cloned the entire table (`Vec<String>`
+  + `HashMap<String, Atom>`, thousands of entries after boot) even when nothing was interned. The commit
+  is now skipped when the per-call interner recorded nothing, in both `call_registered` and
+  `try_call_nif`. Measured marginal cost of one registered BIF call: **~89–102 µs → ~0.2–0.4 µs**
+  (≈250–400×): a 200 000-iteration Erlang loop fell from 17.9 s to 0.225 s; a 1 000 000-iteration
+  two-BIF-per-iteration loop from 201 s to 0.72 s. Behaviour is byte-identical (an empty commit was
+  already a no-op).
+- **Area:** `beam_engine` (Stage 1 — execution engine)
+- **Change (algorithmic):** the per-instruction path no longer probes ordered maps. The
+  `Label -> (function, code)` table became a dense `Vec<Option<(u32, u32)>>` (`LabelMap`, with a sparse
+  fallback) built once per run instead of a `BTreeMap` re-probed per jump; each import's `call_bif`
+  target is resolved once per run into a per-run `ImportTable` cached in the `LabelMap`. BIF arguments
+  marshal through a fixed inline stack array and a reusable per-`Machine` `args_scratch` buffer, so the
+  >8-arity path that used to mint a `Vec` per call is now **allocation-free** (pinned by a
+  counting-allocator test). `Machine::reset` refills the register files in 128-byte chunks. Measured
+  (`tests/engine_bench.rs`, ns per interpreted instruction): `gc_bif '+'/2` **30.7 → 16.3**, a real
+  `erlc` recursion **14.9 → 7.3**, a label-heavy loop **167.7 → 8.6**, per-run setup floor
+  **~431 → ~242 ns**. Reference semantics remain exactly `Machine::step_instruction`.
+- **Area:** `beam_engine` (Stage 1 — JIT)
+- **Change:** the baseline (BeamAsm-style) tier now **links local tail calls natively** — `call_last`/
+  `call_only` to a labelled compiled block `jmp`s to that block's entry instead of round-tripping the
+  driver, resolving the target before popping the frame and preserving the mandatory x-register spill;
+  any target without a compiled block deopts to `jit_step_one`. Added additive outcome-aware tier
+  entries (`run_export_outcome_with_tier` / `run_label_outcome_with_tier`) that propagate `RunOutcome`
+  (including `Wait`) out of a tier run, carrying a suspend across the block ABI as a wait bit, and a
+  `CodeRegion`/`code_map()` API exposing the real generated code ranges to the host (for the perf map).
+  Tier equivalence is pinned by 736 oracle-checked comparisons over real OTP modules
+  (`tests/jit_real_module.rs`) plus a feature-gated Cranelift suite with an empirical deopt proof.
+- **Area:** `beam_gc` (Stage 4 — memory model)
+- **Change (algorithmic):** added an **on-demand heap-growth seam** (`Collector::ensure_capacity`,
+  mirrored on `GenImmixCollector`/`AnyCollector`, with `HeapPolicy::unbounded()` and
+  `GcConfig::growable()`): one collection to reclaim, then growth of the empty nursery to the smallest
+  curated size covering the request. A copying `collect_major` that could not fit its destination used
+  to fail **mid-copy**, leaving the from-space half-forwarded; collections now pre-check capacity and
+  return a typed `heap_exhausted` **before** copying, so a failed collection is a no-op on the
+  from-space. The immix break-even rule `IMMIX_BREAK_EVEN_WORDS = 8 * BLOCK_WORDS = 2048` is now
+  assertion-backed. Per-object overhead measured at **0 words** for cons cells, 2-tuples, floats and
+  flat maps; 140 allocate/collect cycles plateau at a 1.000× RSS factor.
+- **Area:** `beam_ets` (Stage 3 — data structures)
+- **Change (data structure refactoring):** `ordered_set` is now backed by the planned **K-ary B+-tree**
+  (`ORDER = 32`, `MIN_OCCUPANCY = 16`): arena-allocated non-relocating `NodeId` nodes, a leaf chain for
+  in-order iteration, borrow-or-merge rebalancing, and the separator invariant `keys[i] == max(child[i])`.
+  At 10^5 keys the sorted-`Vec` interior it replaces is 3.9–6.3× slower on insert and 3.1–34.6× slower
+  on delete (O(n) memmove). The sorted interior is retained as a selectable alternative and both produce
+  identical observable traces. `ordered_set` keys are compared by the **arithmetic** order
+  `erts_cmp(a, b, 0, 0)` (so `1` and `1.0` are the same key, matching `erl_db_tree.c`'s `cmp_key_eq`),
+  and a same-arithmetic-key insert now also updates the stored key term (the key follows the object),
+  matching the oracle's `first`/`last`/`next`. Per-object reclamation gained per-object free lists in a
+  never-relocating arena; access-control enforcement and the 15-field `info/1` order are pinned.
+- **Area:** `beam_dist` (Stage 5 — distribution, contract A.5)
+- **Change:** the DOP codec is complete — **all 30 `Dop` variants** round-trip byte-identically, with 30
+  golden vectors cross-checked against the real `erl` oracle, plus the full `DFLAG_*` visibility matrix
+  (`publish_flag`/`publish_type`/`PeerVisibility`). Delivery classification covers the 16
+  message-carrying opcodes with typed spawn/altact/payload-exit flags. A refusing acceptor now *notifies*
+  the peer with the exact `not_allowed` frame before erroring (`dist_util.erl`), typed handshake status
+  codes are shared between the connection and driver state machines (and the driver's handshake errors
+  are terminal), and `epmd` gained `DUMP`/`KILL`/`STOP` with ground-truth-corrected replies (`STOPPED`,
+  EOF-terminated dumps). Fragment reassembly/assembly is proven **live** in both directions above 64 KiB,
+  as are the `'N'` handshake, `DOP_REG_SEND`, `DOP_SEND_SENDER`, a client-originated `DOP_MONITOR_P`
+  answered with `DOP_PAYLOAD_MONITOR_P_EXIT`, `DOP_EXIT2` and `DOP_UNLINK_ID`/`_ACK`.
+- **Area:** `beam_abi` (Stage 0 — C ABI, contracts A.3/A.4)
+- **Change:** the driver API reached **111/111** LP64 symbols (the NIF API was already 176/176) by the
+  three `driver_binary_*_refc` functions, which required a **hidden refcount word** allocated *before*
+  the public `ErlDrvBinary` (so the frozen public layout and the C's `ERTS_CHK_BIN_ALIGNMENT` are
+  preserved) — the C's `Binary2ErlDrvBinary` trick. The static layout freeze was extended to every public
+  type in both headers (including the `ErlNifMapIterator` union interior) and to the full
+  enum-discriminant/flag-bit/versioned-constant surface, and a **mechanical conformance test** now parses
+  the real headers at test time and asserts symbol set equality, API-table field order, and a
+  fully-populated table (proven non-vacuous by fault injection). A real compiled `.so` exporting both
+  `driver_init` and `nif_init` is driven under the system ERTS and under this crate and the refcount
+  sequences are asserted identical. A use-after-free in the process-global created-thread name registry
+  (two inserters racing to own one name buffer) was fixed with first-wins registration.
+- **Area:** `beam_io` (Stage 5 — I/O, contract A.4)
+- **Change:** `driver_async` moved from one-thread-per-job to a **bounded process-global worker pool**
+  (4 threads, handoff by channel, so the `!Send` `Runtime` never crosses a thread), and the registry now
+  drives async completions itself so `driver_async` completes with no runtime change. Port streams gained
+  `StreamOptions` (`stderr_to_stdout` via an exact `dup2(1,2)`, `eof` surfaced by a polling query rather
+  than a new notification variant), `ERL_DRV_USE`/`stop_select` is honoured on deselect and teardown, and
+  `tcp_inet` latches peer close to the C's `TCP_ADDF_DELAYED_CLOSE_RECV/_SEND` semantics. The two
+  `open_port` divergences were closed: a `spawn_executable` directory now opens the port via a faithful
+  fork/execve with the child reporting its errno (`{exit_status, 13}`), and an empty name is `badarg`.
+- **Area:** `beam_process` (Stage 5 — processes)
+- **Change:** the run queue became **four physically distinct per-priority FIFOs** with highest-first
+  selection (a process born at `max` is dequeued ahead of normals), process-dictionary keys/values are
+  compared **structurally** rather than by raw `Eterm` word, and the process-control surface was filled
+  in: dead-pid monitors mint a reference and deliver an immediate `noproc` DOWN, port monitors and named
+  monitors gained their own side tables, `demonitor(Ref, [flush])` removes a queued DOWN, and
+  `register/2`/`unregister/1` follow the oracle's `badarg` rules. Reduction-quantum fairness is proven
+  (2 processes share 10 slices as `[5,5]`; 4 as `[3,3,2,2]`, budget-invariant).
+- **Area:** `beam_rt` (Stage 5 — observability, contract A.8)
+- **Change:** adopted the new `MemoryHook`/`RuntimeHooks` seams. `erlang:memory/0,1` now return **real**
+  runtime-measured figures (process heaps, atom table, live binary bytes, loaded `.beam` sizes, ETS)
+  in the oracle's exact key order, and `start_timer/3,4`, `send_after/4`, `cancel_timer/2`,
+  `function_exported/3`, `link/1` and `unlink/1` are real BIFs. The tracing subsystem emits the `send`
+  and `receive` events (gated on sender/receiver respectively) plus the seq-trace event, and implements
+  the probed **tracer-equals-tracee discard** rule. `erlang:halt/0,1,2` with a crash-dump writer and the
+  `ERL_CRASH_DUMP` path, and a `+JPperf` perf-map writer, were added. The term-heap default rose to
+  128 MiB (`1 << 24` words) with exhaustion translated to **`error:system_limit`** instead of a host
+  `allocation failure`.
+- **Area:** `beam_term` (Stage 0 — terms)
+- **Change:** totality/fallibility split hardened — a non-term word is never dereferenced. Fallible APIs
+  return `TermError::NotATerm`; total APIs give a defined answer (`class` ⇒ `NonValue`, `size_object`
+  ⇒ 0, `number_as_f64` ⇒ `NaN`, `term_hash` ⇒ a tagged raw-word hash) and comparison orders a non-term
+  after every valid term. The frozen layout is untouched.
+- **Area:** `tools/differential`, `tools/bench`
+- **Change:** the corpus grew from 667 to **723 cases** (708 → 715 agreeing), adding pinned cases for
+  `erlang:memory/0,1` shape/key order, the newly registered BIF families, node identity, the
+  `ordered_set` arithmetic-key rule, and the `+hmax`/`+hms` switch family — classified deliberately as
+  agree or as an honest typed `unsupported`, never as a mismatch. The benchmark harness now separates
+  the compute loop from the memory probe so an unimplemented capability degrades to an explicit
+  `not-run (unsupported: …)` note instead of aborting a row, and the Rust-vs-oracle per-call gap was
+  reproduced by hand and root-caused (above).
+
 ## 2026-10-07 — Milestone 2: real OTP boot, full C-ABI symbol surface, CHAMP/GenImmix, live distribution, Stage-2 passes
 
 Scope: the Rust ERTS core advances from "vertical slice" to a runtime with a real boot sequence,
