@@ -250,7 +250,7 @@ fn raising_tail_call_reports_the_bifs_own_reason() {
     // `Deallocate` operand of 1 (stale after the trim). The BIF raises; the reason
     // the caller observes must be the BIF's own, never a frame-discipline artifact.
     let module = module();
-    let (result, machine, ctx) = run(&module, "gap", &[make_small(6)]);
+    let (result, machine, _) = run(&module, "gap", &[make_small(6)]);
 
     let error = result.expect_err("gap(6) must raise");
     let reason = live_reason(&error).expect("the raise must carry the live reason term");
@@ -315,10 +315,18 @@ fn non_raising_tail_call_returns_the_value_with_no_extra_frame() {
     assert_eq!(machine.frame_depth(), 1, "only the bottom frame remains");
     assert_eq!(machine.stack_depth(), 0, "no stack words remain");
 
-    // A second run over the same module gives the identical value and the identical
-    // frame discipline (nothing accumulates across runs).
+    // A second run over the same module gives the structurally identical value and
+    // the identical frame discipline (nothing accumulates across runs). The
+    // comparison must be structural (`list_elements`), never `Eterm` word equality:
+    // each run materialises fresh cons cells in the arena, so two runs that produce
+    // the *same* list from different allocations sit at different addresses and
+    // their raw term words differ.
     let (again, machine2) = run_with(&module, "tailrev", &[input], &mut ctx);
-    assert_eq!(again.unwrap(), value);
+    let again = again.expect("the second tailrev/1 run must not raise");
+    let again_outer = list(again);
+    assert_eq!(again_outer.len(), 1, "the second run returns a one-element list");
+    let again_inner: Vec<i64> = list(again_outer[0]).into_iter().map(small).collect();
+    assert_eq!(again_inner, inner, "the second run returns the same value");
     assert_eq!(machine2.frame_depth(), 1);
     assert_eq!(machine2.stack_depth(), 0);
 
