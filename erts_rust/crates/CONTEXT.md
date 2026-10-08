@@ -240,15 +240,16 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   main loop, and turns the resulting `PortNotification`s into `{Port,{data,Data}}`/`{Port,{exit_status,…}}`
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
-  `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches** on the
-  supported module-run subset — measured at this node's HEAD as
-  **`total=600 agree=599 mismatch=0 unsupported=1 skipped=0`**; **no case disagrees**. The one
-  `unsupported` is `wire/new_fun_ext_encode` (A.5): its `-eval` `fun() -> ok end` is an `erl_eval`
-  *template* closure (the arity-selected `-expr/6-fun-7-` slot) whose single free variable is erl_eval's
-  internal `Info` tuple holding the clause in `erl_parse` abstract format — an identity/env no fun-identity
-  seam can derive faithfully (only a full `erl_eval`/`erl_parse` port would; fabricating erl_eval internals
-  is forbidden). **Compiled-module** local (`make_fun3`) funs DO now encode byte-faithfully through the
-  `beam_bifs`/`beam_rt` `LocalFunIdentity` seam (`term_to_binary/1` of such a closure).
+  `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
+  `summary: total=667 agree=666 mismatch=0 unsupported=1 skipped=0`, and no case disagrees. Per contract
+  A.1 154/154 · A.2 176/176 · A.3 34/34 · A.4 64/64 · A.5 63/64 (+1 unsupported) · A.6 37/37 ·
+  A.7 246/246 · A.8 49/49 · A.9 52/52. The one `unsupported` is `wire/new_fun_ext_encode` (A.5): its
+  `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`
+  slot) whose single free variable is erl_eval's internal `Info` tuple holding the clause in `erl_parse`
+  abstract format — an identity/env no fun-identity seam can derive faithfully (only a full
+  `erl_eval`/`erl_parse` port would; fabricating erl_eval internals is forbidden), so it is
+  **unclosable by design**. A compiled module's local (`make_fun3`) funs encode byte-faithfully through
+  the `beam_bifs`/`beam_rt` `LocalFunIdentity` seam (`term_to_binary/1` of such a closure).
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
   bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 245 tests, `beam_alloc` 263,
   `beam_gc` ~141 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
