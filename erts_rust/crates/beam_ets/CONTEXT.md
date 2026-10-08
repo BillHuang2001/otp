@@ -193,6 +193,15 @@ impl Table {
   an unknown table id is the registry/BIF layer's concern, and a set heir renders as `undefined`
   (no pid term).
 
+### `table/lifecycle.rs` — the owner-death transition
+- `pub enum OwnerDeath { NotOwner, Deleted, Transferred(Heir) }` + `Table::owner_died(dead, is_alive)`
+  — what happens to a table when a process that (may) own it dies. `NotOwner` (the dying process is
+  not this table's owner) is a complete no-op; `Deleted` (no heir, a self-heir, or a heir the
+  liveness oracle rejects) obliges the runtime to drop the table; `Transferred(heir)` sets the owner
+  to `heir.owner` and **keeps the heir installed** (the oracle does not reset it) and obliges the
+  runtime to deliver `{'ETS-TRANSFER', Tid, FromPid, heir.data}`. The oracle facts are pinned in the
+  module docs; the BIF/runtime hooks that would call this are recorded in `ETS_SURFACE.md` §7.
+
 ### `table/access.rs` — the access-enforcing view
 - `pub struct TableAccess<'a>` (from `Table::as_requester`) — rechecks `can_read`/`can_write` on
   every op and raises `BeamError::BadArg` on a violation, exactly like `ets`. It wraps the **whole**
