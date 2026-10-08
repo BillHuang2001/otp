@@ -25,7 +25,12 @@
 //!   `register/2`, `unregister/1`, `registered/0`, `is_process_alive/1`,
 //!   `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2` and
 //!   `group_leader/0`), a [`PersistentTerm`] (the node-global persistent-term store
-//!   behind the seven `persistent_term:*` BIFs).
+//!   behind the seven `persistent_term:*` BIFs), a [`MemoryHook`] (the node's memory
+//!   accounting behind `erlang:memory/0,1`) and a [`RuntimeHooks`] (the single
+//!   dispatcher behind every `bif.tab` entry that only the *running* runtime can
+//!   answer — process control, timers, code loading, system/nodes introspection,
+//!   the `atomics`/`counters` stores, the ETS C interior, `erts_debug`/
+//!   `erl_debugger`, `re`, `erl_ddll` and distribution).
 //!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
 //!   concrete implementations; an unset seam means `io:format` writes to stdout
 //!   and the `send`/`ets`/`call_fun`/port/dict/nif/process BIFs report
@@ -707,6 +712,69 @@ pub trait ProcessHook {
     fn group_leader(&mut self) -> Result<ProcessId>;
 }
 
+/// The node's memory accounting for `erlang:memory/0,1`.
+///
+/// `memory/0` reports the runtime's memory usage as `{Key, Bytes}` pairs and
+/// `memory/1` reports one or more named keys. The key set and the byte figures are
+/// pure runtime accounting (allocator carriers, the atom table, the code area, ETS)
+/// that no BIF can derive, so they are injected through this hook; the runtime
+/// supplies the concrete implementation. With no hook installed — or with the
+/// defaulted method — both BIFs report the typed `unsupported_bif` capability gap,
+/// never an invented key set or a fabricated byte total (workspace `CONTEXT.md` §3).
+pub trait MemoryHook {
+    /// Every `{Key, Bytes}` pair the runtime reports, in the runtime's own order
+    /// (the order of `erlang:memory/0`), or the typed `unsupported_bif` gap.
+    ///
+    /// # Errors
+    ///
+    /// Defaults to the typed `unsupported_bif` capability gap.
+    fn memory(&mut self) -> Result<Vec<(&'static str, u64)>> {
+        Err(crate::error::unsupported_bif())
+    }
+}
+
+/// The runtime-coupled BIF escape hatch (the Stage-5 machine).
+///
+/// A large part of the `bif.tab` surface can only be answered by the *running*
+/// runtime: process control (`spawn/3`, `link/1`, `monitor/2`, ...), the timer wheel
+/// (`start_timer/3`, `send_after/3`, ...), code loading (`function_exported/3`,
+/// `module_loaded/1`, ...), node/system introspection (`system_info/1`, `nodes/0`,
+/// ...), the resource-object stores (`atomics:*`, `counters_*`), the ETS C-interior
+/// entries, the `erts_debug`/`erl_debugger` tools, the `re`/PCRE engine, the
+/// `erl_ddll` driver loader and the distribution machinery (`dist_ctrl_*`, `dt_*`,
+/// ...). None of that is reachable from a BIF, so every such BIF resolves through
+/// this single defaulted method; the runtime supplies the concrete dispatcher.
+///
+/// With no hook installed — or with the defaulted method — every BIF behind it
+/// reports the typed `unsupported_bif` capability gap, never a fabricated value and
+/// never a plain `undef` (the function *is* a declared BIF; only its runtime provider
+/// is missing). The `(module, function, arity)` identity is passed through verbatim
+/// (arity is `args.len()`) so the runtime dispatches on exactly the `bif.tab` key.
+///
+/// This is deliberately **one** method rather than one trait per subsystem: the
+/// signature is identical for every runtime-coupled BIF and the adopter's natural
+/// implementation is a single `(module, function, arity)` dispatch — the same shape
+/// ERTS itself uses. Per-family traits would only duplicate this signature.
+pub trait RuntimeHooks {
+    /// Executes the runtime-coupled BIF `module:function/args.len()` with `args`,
+    /// building its result on `heap` (with `atoms` for interning).
+    ///
+    /// # Errors
+    ///
+    /// Defaults to the typed `unsupported_bif` capability gap; a provider propagates
+    /// the BIF's own failure (`badarg`, a raise, ...).
+    fn call(
+        &mut self,
+        _heap: &mut Heap,
+        _atoms: &AtomTable,
+        _module: &str,
+        _function: &str,
+        _args: &[Eterm],
+    ) -> Result<Eterm> {
+        Err(crate::error::unsupported_bif())
+    }
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
@@ -727,6 +795,8 @@ pub struct BifContext<'a> {
     fun_identity: Option<&'a mut dyn LocalFunIdentity>,
     module_info: Option<&'a mut dyn ModuleInfo>,
     process: Option<&'a mut dyn ProcessHook>,
+    memory: Option<&'a mut dyn MemoryHook>,
+    runtime: Option<&'a mut dyn RuntimeHooks>,
 }
 
 impl<'a> BifContext<'a> {
@@ -752,6 +822,8 @@ impl<'a> BifContext<'a> {
             fun_identity: None,
             module_info: None,
             process: None,
+            memory: None,
+            runtime: None,
         }
     }
 
@@ -844,6 +916,22 @@ impl<'a> BifContext<'a> {
         self.process = Some(hook);
         self
     }
+
+    /// Installs the memory-accounting hook used by `erlang:memory/0,1`.
+    pub fn with_memory_hook(mut self, hook: &'a mut dyn MemoryHook) -> Self {
+        self.memory = Some(hook);
+        self
+    }
+
+    /// Installs the runtime-coupled BIF dispatcher used by the Stage-5 BIF families
+    /// (process control, timers, code loading, system/introspection,
+    /// atomics/counters, the ETS interior, `erts_debug`/`erl_debugger`, `re`,
+    /// `erl_ddll` and distribution).
+    pub fn with_runtime_hooks(mut self, hooks: &'a mut dyn RuntimeHooks) -> Self {
+        self.runtime = Some(hooks);
+        self
+    }
+
     /// Sets the name of the module whose code is executing — the call site of a BIF
     /// (the oracle derives `erlang:load_nif/2`'s module from its call instruction).
     pub fn with_current_module(mut self, module: &'a str) -> Self {
@@ -1383,6 +1471,39 @@ impl<'a> BifContext<'a> {
     pub fn persistent_term_info(&mut self) -> Result<(u64, u64)> {
         match self.persistent_term.as_deref_mut() {
             Some(hook) => hook.info(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The runtime's memory accounting, in the runtime's own key order — the seam
+    /// behind `erlang:memory/0,1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no [`MemoryHook`];
+    /// otherwise propagates the hook's own failure.
+    pub fn memory(&mut self) -> Result<Vec<(&'static str, u64)>> {
+        match self.memory.as_deref_mut() {
+            Some(hook) => hook.memory(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Executes the runtime-coupled BIF `module:function/args.len()` through the
+    /// installed [`RuntimeHooks`] dispatcher.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no [`RuntimeHooks`];
+    /// otherwise propagates the dispatcher's own failure.
+    pub fn call_runtime_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        match self.runtime.as_deref_mut() {
+            Some(hooks) => hooks.call(self.heap, self.atoms, module, function, args),
             None => Err(crate::error::unsupported_bif()),
         }
     }

@@ -74,6 +74,7 @@ mod proc_reg;
 mod reason;
 mod records;
 mod registry;
+mod runtime;
 mod string;
 mod term_conv;
 mod term_ops;
@@ -83,9 +84,9 @@ mod unicode;
 
 pub use crate::context::{
     AtomInterner, BifContext, BytesSink, DictHook, FunCaller, LocalFunIdentity, LocalNode,
-    ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PersistentTerm, PortHook,
-    ProcessHook, ProcessInfoItem, RecordDefinitionView, RecordFieldView, RecordSource, SendHook,
-    StdoutSink,
+    MemoryHook, ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PersistentTerm,
+    PortHook, ProcessHook, ProcessInfoItem, RecordDefinitionView, RecordFieldView, RecordSource,
+    RuntimeHooks, SendHook, StdoutSink,
 };
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
@@ -101,8 +102,9 @@ pub mod prelude {
     pub use crate::{
         default_registry, exit_reason_from_term, raise_error, raise_exit, raise_throw,
         reason_term_from_exit_reason, AtomInterner, BifContext, BifFn, BifRegistry, BytesSink,
-        DictHook, FunCaller, LocalFunIdentity, LocalNode, ModuleInfo, NifLoadError, NifLoader,
-        NullSink, OutputSink, PersistentTerm, PortHook, ProcessHook, ProcessInfoItem,
-        RecordDefinitionView, RecordFieldView, RecordSource, SendHook, StdoutSink, TableRegistry,
+        DictHook, FunCaller, LocalFunIdentity, LocalNode, MemoryHook, ModuleInfo, NifLoadError,
+        NifLoader, NullSink, OutputSink, PersistentTerm, PortHook, ProcessHook, ProcessInfoItem,
+        RecordDefinitionView, RecordFieldView, RecordSource, RuntimeHooks, SendHook, StdoutSink,
+        TableRegistry,
     };
 }

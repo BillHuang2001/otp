@@ -255,18 +255,20 @@ fn the_registry_registers_all_ten_keys() {
         );
     }
 
-    // The whole `erts_internal`/`erts_debug` namespace this crate's registry exposes
-    // is exactly **eleven** keys: the ten registered by `src/erts_internal.rs` above
-    // plus `erts_internal:cmp_term/2`, which the sibling `src/compare.rs` owns and
-    // registers (the term-order primitive the `<`/`=<` family and `cmp_term/2` route
-    // through). Pinning the namespace count — rather than only checking each key with
-    // `contains` — catches a stray duplicate registration.
+    // The whole `erts_internal`/`erts_debug` namespace this crate's registry exposes is
+    // exactly **91** keys: the eleven core keys above (ten registered by
+    // `src/erts_internal.rs` + `erts_internal:cmp_term/2`, owned by the sibling
+    // `src/compare.rs` — the term-order primitive the `<`/`=<` family routes through),
+    // plus the 80 seam-backed runtime-family keys (`src/runtime/erts_internal.rs` 62 +
+    // `src/runtime/erts_debug.rs` 18), each of which answers the typed `unsupported_bif`
+    // with no runtime hook installed. Pinning the namespace count — rather than only
+    // checking each key with `contains` — catches a stray duplicate registration.
     let erts_keys: Vec<_> = reg
         .names()
         .into_iter()
         .filter(|(m, _, _)| m == "erts_internal" || m == "erts_debug")
         .collect();
-    assert_eq!(erts_keys.len(), 11, "got {erts_keys:?}");
+    assert_eq!(erts_keys.len(), 91, "got {erts_keys:?}");
     assert!(
         erts_keys.contains(&("erts_internal".to_string(), "cmp_term".to_string(), 2)),
         "erts_internal:cmp_term/2 (owned by compare.rs) must be the eleventh key"
