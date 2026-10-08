@@ -103,11 +103,16 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   --no-fail-fast`. The `beam_rt` failures once caused by `beam_bifs` registering the FULL declared
   `bif.tab` surface (556 keys; registry 637) shadowing `beam_rt`'s curated
   `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list are resolved: `beam_rt::is_known_unimplemented_bif` now
-  intersects the live registry (`beam_rt/src/error.rs`), with drift-guard tests. Re-run the suite to
-  read the current pass count.
-- **No CI runs the Rust workspace or the differential gate.** `.github/` has zero references to
-  `erts_rust`/`cargo`/`differential`; every Rust test and the compatibility gate run only locally
-  (`scripts/cargo.sh`, `tools/differential/gate.sh`). Parity claims therefore rest on manual runs.
+  intersects the live registry (`beam_rt/src/error.rs`), with drift-guard tests. `cargo test --workspace
+  --no-fail-fast` currently reports 6123 passed / 1 failed / 2 ignored; the one failure is `beam_gc`'s
+  `an_external_pid_compares_through_its_parts` (`crates/beam_gc/tests/stress_cross_generation.rs`) — a
+  stale assertion that two equal-parts external pids are NOT structurally `Equal` under
+  `beam_term::compare::eq` (they now are) — the test must be updated, not the code. Deterministic, not flaky.
+- **CI runs the Rust workspace and the differential gate** via `.github/workflows/erts_rust.yml`
+  (path-triggered on `erts_rust/**` + its own file): a blocking `cargo build --workspace --all-targets` and
+  `cargo test --workspace --no-fail-fast`, a **non-blocking** `cargo clippy`, and the gate
+  (`tools/differential/gate.sh`, exit 3 = non-blocking warning). The `main.yaml` C/Erlang reusables still
+  ignore `erts_rust/**`. The current single test failure therefore reds every `erts_rust.yml` run.
 - **Vertical slice WORKS:** `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam` (produced by
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
