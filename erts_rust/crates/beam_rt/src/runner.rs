@@ -646,22 +646,31 @@ impl ProcessRunner for RuntimeRunner<'_> {
                         module,
                         function,
                         arity,
-                    } => engine.machine.run_export_outcome_with_tier(
-                        module,
-                        *function,
-                        *arity,
-                        &engine.args,
-                        &mut budget_ctx,
-                        // Routed through the tier-aware entry so a scheduled process *can*
-                        // execute on the native baseline tier: `Tier::BaselineJit` is the
-                        // target, but the baseline **export** path does not record the
-                        // machine's entry call (`beam_engine`'s `run_native_outcome` omits the
-                        // `enter_run` its label sibling performs), so `process_info/2`'s
-                        // `initial_call` cannot be answered for such a process. That is a
-                        // `beam_engine` gap this crate may not patch, so the interpreter is
-                        // selected until it lands.
-                        Tier::Interpreter,
-                    ),
+                    } => match module.export(*function, *arity) {
+                        // Entered at the export's own label on the **baseline** tier. The
+                        // label entry is the equivalence-preserving route to it: the export
+                        // path only resolves this same label and calls the label path, but
+                        // the baseline *export* driver (`beam_engine`'s `run_native_outcome`)
+                        // never calls `Machine::enter_run`, so the run's `entry_call` stays
+                        // unset and `process_info/2`'s `initial_call`/`current_function` could
+                        // not be answered, whereas the baseline *label* driver records it.
+                        // That is a `beam_engine` gap this crate may not patch (workaround).
+                        Some(label) => engine.machine.run_label_outcome_with_tier(
+                            module,
+                            label,
+                            *arity,
+                            &engine.args,
+                            &mut budget_ctx,
+                            Tier::BaselineJit,
+                        ),
+                        // An export the module does not define stays the engine's own typed
+                        // error, byte for byte (`Machine::run_export_outcome`'s). Unreachable
+                        // for a spawned entry (`Runtime::spawn_process` resolves the export
+                        // first), and never a fabricated result.
+                        None => Err(crate::error::unsupported(
+                            "run_export: export not found",
+                        )),
+                    },
                     // A fun entry is applied synchronously: `apply_fun` routes an `-eval`
                     // closure back into the evaluator and a `.beam` fun into the engine's
                     // label entry — the evaluator is never re-implemented here. A returned
