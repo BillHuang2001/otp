@@ -31,7 +31,8 @@ use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::Step;
 
-/// The module-wide `Label -> (function index, code index)` index.
+/// The module-wide `Label -> (function index, code index)` index, plus the
+/// per-run import cache.
 ///
 /// A `.beam` module numbers its labels contiguously from `1` (`beam_asm`
 /// renumbers them; `0` is the `NO_FAIL` sentinel), so a label id is a dense
@@ -42,9 +43,52 @@ use crate::Step;
 /// A module whose ids are *not* dense (a hand-crafted or corrupt file, where one
 /// `label 4000000000` would otherwise reserve tens of gigabytes) uses the sorted
 /// fallback instead; both forms answer identically.
+///
+/// The same index also carries the **pre-resolved import table** (`imports`), so
+/// the per-run table is threaded to the dispatch loop as the map the loop already
+/// takes, with no extra parameter and no lifetime on the map (see
+/// [`ImportTarget`]). A map that was *not* built by [`build_label_map`]
+/// ([`LabelMap::new`], `From`, a hand-built test map) carries an empty table and a
+/// zero `imports_owner`, so every import lookup falls back to [`import_target`] —
+/// the same answer, exactly the same typed errors.
 pub(crate) struct LabelMap {
     slots: Slots,
+    /// `imports[ImportRef.0]`: the resolved `(module, function, arity)` of each
+    /// `Module::imports` entry (see [`ImportTarget`] and [`resolve_imports`]).
+    imports: ImportTable,
+    /// The address of the [`Module`] `imports` was resolved from; `0` (an address
+    /// no live `Module` can occupy) marks the table as unusable, so the lookup
+    /// falls back to the per-call [`import_target`] and can never feed a name from
+    /// a different module.
+    imports_owner: usize,
 }
+
+/// One `Module::imports` entry, resolved **once per run** into the
+/// `(module name, function name, arity)` triple
+/// [`ExecutionContext::call_bif`](crate::ExecutionContext::call_bif) takes.
+///
+/// Resolving one import costs two atom-table lookups, and the interpreter used to
+/// repeat them for *every* `gc_bif`/`bif`/`call_ext*` — the hottest instruction
+/// class (measured: ~5 ns per BIF call, against ~0.5 ns for a cache hit). The two
+/// names are stored **owned** rather than borrowed from the running [`Module`]:
+/// the map is also reached through a raw pointer inside the baseline JIT's
+/// [`JitRuntime`](crate::jit::baseline), which is a non-generic `#[repr(C)]` type,
+/// so the map cannot carry the module's lifetime. Copying the two names once per
+/// run is the whole price of the cache.
+struct ImportTarget {
+    /// The imported module's name (the string `call_bif` dispatches on).
+    module: Box<str>,
+    /// The imported function's name.
+    function: Box<str>,
+    /// The import's declared arity (what `call_bif` is called with).
+    arity: u32,
+}
+
+/// The per-run import table: `table[ImportRef.0]` is the resolved target, or the
+/// reason string of the typed error that resolving that import produced (an atom
+/// the module's atom table does not hold — see [`import_target`]). An index past
+/// the end is the typed `call: import out of range`, exactly as before.
+type ImportTable = Vec<std::result::Result<ImportTarget, &'static str>>;
 
 /// The two backing representations of a [`LabelMap`].
 enum Slots {
@@ -56,13 +100,15 @@ enum Slots {
 }
 
 impl LabelMap {
-    /// An empty index: every lookup is the typed [`crate::error::unknown_label`].
+    /// An empty index: every lookup is the typed [`crate::error::unknown_label`],
+    /// and every import falls back to the uncached [`import_target`].
     pub(crate) fn new() -> LabelMap {
         LabelMap {
             slots: Slots::Dense(Vec::new()),
+            imports: Vec::new(),
+            imports_owner: 0,
         }
     }
-
     /// Record `label -> (function index, code index)`, an existing entry for the
     /// same label being replaced (labels are module-unique, so this only matters
     /// for a malformed/duplicate table — and it matches the previous last-wins
@@ -106,8 +152,40 @@ impl LabelMap {
             }
         }
     }
-}
 
+    /// Resolve an import reference to `(module name, function name, arity)`.
+    ///
+    /// The hot path of every `gc_bif`/`bif`/`call_ext*`: a **cache hit** is one
+    /// address check, one bounds check and three loads from the per-run import
+    /// table ([`ImportTarget`]) instead of the two atom-table lookups
+    /// [`import_target`] performs per call.
+    ///
+    /// Nothing about the *semantics* changes: the table only answers when it was
+    /// built from **this** module (`imports_owner`), and a table miss — an index
+    /// past the end (`call: import out of range`), or an import whose module /
+    /// function atom is not in the module's table (`call: import module atom` /
+    /// `call: import function atom`) — is the exact typed error
+    /// [`import_target`] produces for the same import. A map this cache does not
+    /// cover (not built from this module: [`LabelMap::new`], `From`, ...) falls
+    /// straight through to [`import_target`], so the two can never disagree.
+    #[inline]
+    fn import_target<'a>(
+        &'a self,
+        module: &'a Module,
+        target: ImportRef,
+    ) -> Result<(&'a str, &'a str, u32)> {
+        if self.imports_owner == module as *const Module as usize {
+            match self.imports.get(target.0 as usize) {
+                Some(Ok(entry)) => {
+                    return Ok((&entry.module, &entry.function, entry.arity));
+                }
+                Some(Err(reason)) => return Err(error::unsupported(reason)),
+                None => return Err(error::unsupported("call: import out of range")),
+            }
+        }
+        import_target(module, target)
+    }
+}
 impl Default for LabelMap {
     fn default() -> LabelMap {
         LabelMap::new()
@@ -154,6 +232,12 @@ pub(crate) fn label_map_builds() -> usize {
 /// different function than the instruction that references it (the slice's
 /// `fib/1` tail-calls into `fib/3`). Every function's [`beam_loader::Function::labels`]
 /// contributes to the one index.
+///
+/// The same call also resolves the module's **import table** once
+/// ([`resolve_imports`]) and binds the map to `module`, so the map is the run's
+/// complete name-resolution side table: `resolve` answers labels and
+/// [`LabelMap::import_target`] answers BIF/`call_ext` targets without touching the
+/// atom table per call. One build per run, exactly as before.
 pub(crate) fn build_label_map(module: &Module) -> LabelMap {
     #[cfg(test)]
     LABEL_MAP_BUILDS.with(|c| c.set(c.get() + 1));
@@ -179,6 +263,8 @@ pub(crate) fn build_label_map(module: &Module) -> LabelMap {
         }
         LabelMap {
             slots: Slots::Dense(slots),
+            imports: resolve_imports(module),
+            imports_owner: module as *const Module as usize,
         }
     } else {
         let mut entries: Vec<(u32, (u32, u32))> = Vec::with_capacity(count);
@@ -190,8 +276,37 @@ pub(crate) fn build_label_map(module: &Module) -> LabelMap {
         entries.sort_unstable_by_key(|(id, _)| *id);
         LabelMap {
             slots: Slots::Sparse(entries),
+            imports: resolve_imports(module),
+            imports_owner: module as *const Module as usize,
         }
     }
+}
+
+/// Resolve **every** import of `module` once, producing the per-run import table
+/// [`LabelMap::import_target`] looks up.
+///
+/// Each entry is either the resolved [`ImportTarget`] or the reason string of the
+/// typed error resolution produced, so the cached path reproduces
+/// [`import_target`]'s errors exactly (a missing module/function atom is
+/// remembered per import, never substituted by a different name).
+fn resolve_imports(module: &Module) -> ImportTable {
+    module
+        .imports
+        .iter()
+        .map(|import| {
+            let module_name = module
+                .atom_name(import.module)
+                .ok_or("call: import module atom")?;
+            let function_name = module
+                .atom_name(import.function)
+                .ok_or("call: import function atom")?;
+            Ok(ImportTarget {
+                module: module_name.into(),
+                function: function_name.into(),
+                arity: import.arity,
+            })
+        })
+        .collect()
 }
 
 /// Resolve a label against an already-built index; a missing label is a typed error.
@@ -204,7 +319,15 @@ pub(crate) fn resolve_label(module: &Module, label: Label) -> Result<(u32, u32)>
     build_label_map(module).resolve(label)
 }
 
-/// Resolve an import reference to `(module name, function name, arity)`.
+/// Resolve an import reference to `(module name, function name, arity)` — **the
+/// uncached fallback**.
+///
+/// This is the per-call resolution the interpreter used to run for every
+/// `gc_bif`/`bif`/`call_ext*` (two atom-table lookups and the `Vec` bounds check).
+/// [`LabelMap::import_target`] answers from the per-run cache instead; this
+/// function stays the definition of the import semantics and the path taken when
+/// the cache cannot answer (a map not built from this module), so both agree
+/// exactly — including on the three typed errors below.
 fn import_target(module: &Module, target: ImportRef) -> Result<(&str, &str, u32)> {
     let import = module
         .imports
@@ -218,7 +341,6 @@ fn import_target(module: &Module, target: ImportRef) -> Result<(&str, &str, u32)
         .ok_or_else(|| error::unsupported("call: import function atom"))?;
     Ok((module_name, function_name, import.arity))
 }
-
 /// The argument count up to which a BIF/`call_ext` marshals its arguments through
 /// a **stack array** instead of a heap `Vec`.
 ///
@@ -245,8 +367,9 @@ impl Machine {
     /// found them).
     ///
     /// It does **not** reset the machine: it only (re)binds the running module's
-    /// literal area, records the run's entry call and builds the label map (see
-    /// [`Machine::enter_run`]), so [`Machine::resume_outcome`] can re-enter a
+    /// literal area, records the run's entry call and builds the per-run name
+    /// index ([`Machine::enter_run`], [`build_label_map`] — labels *and* the
+    /// resolved import table), so [`Machine::resume_outcome`] can re-enter a
     /// suspended process through it unchanged.
     pub(crate) fn run_loop(
         &mut self,
@@ -482,7 +605,7 @@ impl Machine {
                 // An ext call carries no fail label: a failure is a raise (C's
                 // `i_call_ext`/`call_light_bif` end in `handle_error`, so a live
                 // catch frame catches it).
-                match self.call_import(module, *target, *arity, ctx) {
+                match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
                         Ok(Step::Next)
@@ -491,7 +614,7 @@ impl Machine {
                 }
             }
             Instr::CallExtOnly { target, arity } => {
-                match self.call_import(module, *target, *arity, ctx) {
+                match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
                         match self.continuation()? {
@@ -528,7 +651,7 @@ impl Machine {
                 //   never-returning `call_ext_last` (e.g. `erlang:error/1`) is then
                 //   dead code C never applies — the shape that produced the bogus
                 //   `deallocate: frame size mismatch` reason instead of the BIF's.
-                match self.call_import(module, *target, *arity, ctx) {
+                match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
                         self.pop_frame_checked(*deallocate)?;
@@ -633,7 +756,10 @@ impl Machine {
     /// The arguments are marshalled into a **stack array** for the common arities
     /// ([`STACK_ARGS`]) and into a heap `Vec` only beyond it, so the heap
     /// allocation the old code paid on **every** BIF call is gone; `call_bif` keeps
-    /// its `&[Eterm]` shape either way.
+    /// its `&[Eterm]` shape either way. The BIF's `(module, function, arity)`
+    /// target comes from the per-run import cache ([`LabelMap::import_target`]),
+    /// which replaced the two per-call atom-table lookups the interpreter used to
+    /// pay here (measured: ~5 ns of the ~20 ns a small-int `gc_bif '+'/2` costs).
     ///
     /// The control flow is unchanged, and the distinction matters: an error while
     /// *marshalling* the call (a bad import reference or a bad operand) propagates
@@ -651,7 +777,7 @@ impl Machine {
         dst: &Operand,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Step> {
-        let (module_name, function_name, arity) = import_target(module, bif)?;
+        let (module_name, function_name, arity) = labels.import_target(module, bif)?;
         let mut buf = EMPTY_ARGS;
         let mut heap: Vec<Eterm> = Vec::new();
         let arg_terms: &[Eterm] = if args.len() <= STACK_ARGS {
@@ -687,18 +813,20 @@ impl Machine {
     ///
     /// Like [`Machine::exec_bif`] the arguments are marshalled through a stack
     /// array for the common arities and a `Vec` only beyond it, so a `call_ext`
-    /// pays no heap allocation in the common case. A marshalling error (a bad
-    /// import or an out-of-range register) propagates as the typed error the
-    /// instruction already returned; the BIF's own result is handed back for the
-    /// caller's raise/fail decision.
+    /// pays no heap allocation in the common case, and the import target comes from
+    /// the same per-run cache ([`LabelMap::import_target`], `labels`). A
+    /// marshalling error (a bad import or an out-of-range register) propagates as
+    /// the typed error the instruction already returned; the BIF's own result is
+    /// handed back for the caller's raise/fail decision.
     fn call_import(
         &self,
         module: &Module,
+        labels: &LabelMap,
         target: ImportRef,
         arity: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
-        let (module_name, function_name, bif_arity) = import_target(module, target)?;
+        let (module_name, function_name, bif_arity) = labels.import_target(module, target)?;
         if arity as usize <= STACK_ARGS {
             let mut buf = EMPTY_ARGS;
             for (i, slot) in buf.iter_mut().enumerate().take(arity as usize) {
@@ -1318,5 +1446,113 @@ mod tests {
         assert!(machine
             .step_instruction(&module, &labels, 99, 0, &mut ctx)
             .is_err());
+    }
+
+    /// A module whose `n` imports are `erlang:f0/2` .. `erlang:f<n-1>/2`,
+    /// interned into its own atom table.
+    fn module_with_imports(n: u32) -> Module {
+        let (mut module, _) =
+            module_with_function(vec![Instr::Label(Label(1)), Instr::Return], Vec::new());
+        let m = module.atom_table.intern("erlang");
+        for i in 0..n {
+            let f = module.atom_table.intern(&format!("f{i}"));
+            module.imports.push(Import {
+                module: m,
+                function: f,
+                arity: 2,
+            });
+        }
+        module
+    }
+
+    /// The per-run cache answers exactly what the uncached resolution would, for
+    /// every in-range import.
+    #[test]
+    fn import_cache_matches_the_uncached_resolution() {
+        let module = module_with_imports(64);
+        let labels = build_label_map(&module);
+        for i in 0..64u32 {
+            let cached = labels.import_target(&module, ImportRef(i)).unwrap();
+            let direct = import_target(&module, ImportRef(i)).unwrap();
+            assert_eq!(cached, direct);
+            assert_eq!(cached.0, "erlang");
+            assert_eq!(cached.1, format!("f{i}").as_str());
+            assert_eq!(cached.2, 2);
+        }
+    }
+
+    /// An out-of-range `ImportRef` is the same typed error as before, cached or
+    /// not.
+    #[test]
+    fn import_cache_out_of_range_is_the_same_typed_error() {
+        let module = module_with_imports(3);
+        let labels = build_label_map(&module);
+        for i in [3u32, 4, u32::MAX] {
+            let cached = labels.import_target(&module, ImportRef(i)).unwrap_err();
+            let direct = import_target(&module, ImportRef(i)).unwrap_err();
+            assert_eq!(format!("{cached:?}"), format!("{direct:?}"));
+            assert!(format!("{cached:?}").contains("call: import out of range"));
+        }
+    }
+
+    /// An import whose module/function atom is absent from the table yields the
+    /// same typed error from the cache and the fallback (never a substituted
+    /// name).
+    #[test]
+    fn import_cache_missing_atoms_are_the_same_typed_error() {
+        let (mut module, _) =
+            module_with_function(vec![Instr::Label(Label(1)), Instr::Return], Vec::new());
+        let good = module.atom_table.intern("erlang");
+        let missing = Atom::from_raw(1_000_000);
+        module.imports.push(Import {
+            module: missing,
+            function: good,
+            arity: 1,
+        });
+        module.imports.push(Import {
+            module: good,
+            function: missing,
+            arity: 1,
+        });
+        let labels = build_label_map(&module);
+        for i in 0..2u32 {
+            let cached = labels.import_target(&module, ImportRef(i)).unwrap_err();
+            let direct = import_target(&module, ImportRef(i)).unwrap_err();
+            assert_eq!(format!("{cached:?}"), format!("{direct:?}"));
+            assert!(format!("{cached:?}").contains("call: import"));
+        }
+    }
+
+    /// A `LabelMap` built from one module never answers for another: the owner
+    /// check falls back to resolving against the module actually running, so a
+    /// foreign name can never be substituted and a longer import table is never
+    /// truncated to the cached length.
+    #[test]
+    fn import_cache_never_answers_for_a_foreign_module() {
+        let a = module_with_imports(2);
+        let b = module_with_imports(5);
+        let labels_a = build_label_map(&a);
+
+        let cached = labels_a.import_target(&b, ImportRef(1)).unwrap();
+        assert_eq!(cached, import_target(&b, ImportRef(1)).unwrap());
+        assert_eq!(cached.1, "f1");
+        assert_eq!(cached.2, 2);
+        // `b` has five imports, so index 4 resolves through the fallback even
+        // though `a`'s cache only holds two.
+        assert_eq!(labels_a.import_target(&b, ImportRef(4)).unwrap().1, "f4");
+        // And `a`'s own cache still answers for `a`.
+        assert_eq!(labels_a.import_target(&a, ImportRef(0)).unwrap().1, "f0");
+    }
+
+    /// A `LabelMap` that was not built from any module (`new`/`from`) carries no
+    /// cache and still resolves through the fallback.
+    #[test]
+    fn import_cache_is_absent_on_a_hand_built_label_map() {
+        let module = module_with_imports(2);
+        let map = LabelMap::new();
+        assert_eq!(
+            map.import_target(&module, ImportRef(1)).unwrap(),
+            import_target(&module, ImportRef(1)).unwrap()
+        );
     }
 }
