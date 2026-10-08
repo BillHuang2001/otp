@@ -407,9 +407,13 @@ fuse_const_mul_chain(Config) ->
     Fusion = code(fusion, Builds),
     Plain = code(plain, Builds),
     %% With the pass enabled the two multiplications have been folded into one,
-    %% and the three of the longer chain into one as well.
+    %% and the three of the longer chain into one as well - and the single
+    %% remaining multiplication is by the *product* of the constants of the
+    %% chain (2*3 and 2*3*4), not by just one of them.
     ?assertEqual(1, count_instr(Fusion, chain2, '*')),
     ?assertEqual(1, count_instr(Fusion, chain3, '*')),
+    ?assertEqual(6, mul_constant(Fusion, chain2)),
+    ?assertEqual(24, mul_constant(Fusion, chain3)),
 
     %% Without the pass - including with it explicitly turned off - both (all
     %% three) multiplications are still there and nothing has been folded.
@@ -442,13 +446,28 @@ no_fusion_const_mul_chain(Config) ->
     check_calls(Builds, no_chain, [{[X],{ok,X * 2 + 3}} || X <- [0,1,-7]]),
     check_calls(Builds, add_const, [{[X],{ok,X + 1 + 2}} || X <- [0,1,-7]]),
 
-    %% The code is unaffected by the pass, and the multiplications are still
-    %% there.
-    ?assertEqual(shape(code(plain, Builds)), shape(code(fusion, Builds))),
+    %% The pass is an exact no-op for this probe: with it enabled the
+    %% disassembly is identical to the default build, operands included.
+    %% Comparing the complete code (rather than only the instruction shape)
+    %% also catches a rewrite that changed an operand without changing the
+    %% instruction sequence.
+    Plain = code(plain, Builds),
     Fusion = code(fusion, Builds),
-    ?assertEqual(2, count_instr(Fusion, unguarded, '*')),
-    ?assertEqual(2, count_instr(Fusion, float_operand, '*')),
-    ?assertEqual(1, count_instr(Fusion, no_chain, '*')),
+    ?assertEqual(Plain, Fusion),
+
+    %% The chains are really there, so the check above is not vacuous.
+    %% `count_mul/2' counts both the `*' BIF emitted for an integer operand and
+    %% the `fmul' instruction emitted for a float operand - a float
+    %% multiplication is not a generic `*' - so the source-level number of
+    %% multiplications can be pinned without hard-coding which instruction a
+    %% given operand type happens to produce. The pass must leave that number
+    %% unchanged.
+    lists:foreach(fun({Fun, Expected}) ->
+                          ?assertEqual({Fun, Expected},
+                                       {Fun, count_mul(Fusion, Fun)}),
+                          ?assertEqual({Fun, Expected},
+                                       {Fun, count_mul(Plain, Fun)})
+                  end, [{unguarded, 2}, {float_operand, 2}, {no_chain, 1}]),
     ok.
 
 %%============================================================================
@@ -736,6 +755,38 @@ count_instr(Code, Fun, Name) ->
         [Is] -> length([I || I <- Is, instr_name(I) =:= Name]);
         Other -> ct:fail({missing_function, Fun, Other})
     end.
+
+%% The number of multiplication instructions in the function `Fun'. A
+%% multiplication by a constant is emitted as the `*' BIF for an integer
+%% operand but as the dedicated `fmul' instruction for a float operand, so both
+%% spellings must be counted; counting only `'*'' would miss a float chain
+%% entirely.
+count_mul(Code, Fun) ->
+    count_instr(Code, Fun, '*') + count_instr(Code, Fun, fmul).
+
+%% The integer constant of the multiplication by a constant in `Fun'. Fails
+%% unless `Fun' contains exactly one `*' instruction with an integer literal
+%% operand; used to check that a chain was folded into a single multiplication
+%% by the *product* of the chain's constants.
+mul_constant(Code, Fun) ->
+    Is = case [Is0 || {function,N,_,_,Is0} <- Code, N =:= Fun] of
+             [Is1] -> Is1;
+             Other -> ct:fail({missing_function, Fun, Other})
+         end,
+    case [K || I <- Is, {integer,K} <- mul_args(I)] of
+        [K] -> K;
+        Constants -> ct:fail({unexpected_multiplication, Fun, Constants})
+    end.
+
+%% The operands of a multiplication instruction, and [] for every other
+%% instruction. Both the `bif' and the `gc_bif' spelling are recognized so that
+%% the constant can be read regardless of how the multiplication was emitted.
+mul_args({bif,'*',_Fail,Args,_Dst}) ->
+    Args;
+mul_args({gc_bif,'*',_Fail,_Live,Args,_Dst}) ->
+    Args;
+mul_args(_) ->
+    [].
 
 %% A compact description of the code - the instruction names in order - used%% to compare builds without dumping complete instruction lists on failure.
 shape(Code) ->
