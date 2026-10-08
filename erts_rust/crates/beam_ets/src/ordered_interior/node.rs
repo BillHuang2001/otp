@@ -174,26 +174,6 @@ impl Node {
         }
     }
 
-    /// The greatest key in this node's own arrays (`entries.last()` / `keys.last()`).
-    ///
-    /// Infallible: the tree never stores an empty node — a node is created either
-    /// as a one-entry root leaf or as half of an over-full node — so the `expect`s
-    /// guard an internal invariant, never runtime input.
-    pub(crate) fn max_key(&self) -> Eterm {
-        match self {
-            Node::Leaf(leaf) => leaf
-                .entries
-                .last()
-                .map(|entry| entry.key)
-                .expect("a leaf is never empty"),
-            Node::Branch(branch) => branch
-                .keys
-                .last()
-                .copied()
-                .expect("a branch is never childless"),
-        }
-    }
-
     /// Whether the node holds more than [`ORDER`] entries/children (so it must
     /// split).
     pub(crate) fn is_overfull(&self) -> bool {
@@ -283,6 +263,40 @@ impl NodeStore {
         match self.slot_mut(id) {
             Node::Branch(branch) => branch,
             Node::Leaf(_) => unreachable!("a branch id from the tree names a branch"),
+        }
+    }
+
+    /// The greatest key of the subtree rooted at `id`, as a **live** term: the
+    /// rightmost leaf's last entry key.
+    ///
+    /// Every separator materialised by the tree must go through this, never through
+    /// a branch's stored `keys.last()`: a separator is the maximum of a child
+    /// subtree, and the *stored* separator aliases the key element of the object
+    /// that established that maximum. Replacing that object (`ets:insert` upsert)
+    /// reclaims its table-owned storage, so the stored separator term would then read
+    /// a later, reused word as a different key and misroute the search. A leaf entry
+    /// key always aliases the live table-owned object it sits in, so descending to
+    /// the rightmost leaf yields a term that cannot go stale. Cost is the tree depth.
+    pub(crate) fn subtree_max_key(&self, id: NodeId) -> Eterm {
+        let mut cursor = id;
+        loop {
+            match self.node(cursor) {
+                Node::Leaf(leaf) => {
+                    return leaf
+                        .entries
+                        .last()
+                        .map(|entry| entry.key)
+                        .expect("a leaf is never empty");
+                }
+                Node::Branch(branch) => {
+                    // A branch always has at least one child (invariant 1).
+                    cursor = branch
+                        .children
+                        .last()
+                        .copied()
+                        .expect("a branch is never childless");
+                }
+            }
         }
     }
 

@@ -241,7 +241,12 @@ impl Table {
         set_interior: SetInterior,
         ordered_interior: OrderedInterior,
     ) -> Result<Table> {
-        let interior = build_interior(opts.kind(), set_interior, ordered_interior);
+        let interior = build_interior(
+            opts.kind(),
+            set_interior,
+            ordered_interior,
+            opts.keypos(),
+        );
         // A creation-time `{heir, Pid, Data}` option (if any) is the table's
         // initial heir; `ets:setopts/2` replaces it later. Its gift data is
         // deep-copied into the table's own store through the same helper as
@@ -549,7 +554,12 @@ impl Table {
             // live and is never handed out again) and the index is rebuilt empty.
             let objects: Vec<Eterm> = self.interior.iter_objects().collect();
             self.deferred_frees.extend(objects);
-            self.interior = build_interior(self.opts.kind(), self.set_interior, self.ordered_interior);
+            self.interior = build_interior(
+                self.opts.kind(),
+                self.set_interior,
+                self.ordered_interior,
+                self.opts.keypos(),
+            );
             return;
         }
         // Not fixed: `reset` releases every block the store owns (so the per-object
@@ -557,7 +567,12 @@ impl Table {
         // usable again; a fresh interior of the same kind and `set` shape is then
         // empty.
         self.store.reset();
-        self.interior = build_interior(self.opts.kind(), self.set_interior, self.ordered_interior);
+        self.interior = build_interior(
+            self.opts.kind(),
+            self.set_interior,
+            self.ordered_interior,
+            self.opts.keypos(),
+        );
     }
 
     /// `ets:safe_fixtable/2`: set (or clear) the table's *fix* flag.
