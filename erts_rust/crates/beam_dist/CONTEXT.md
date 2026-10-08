@@ -336,7 +336,9 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - **No new external dependencies** (the in-tree MD5 replaces the `md-5` crate).
 - **Bounded allocation**: validate advertised lengths/buffered fragments against a ceiling before
   allocating; oversize ⇒ `SystemLimit`.
-- Files target ~1000 lines; split by responsibility. Licensing: Apache-2.0.
+- Files target ~1000 lines; split by responsibility. Licensing: Apache-2.0. Three files run slightly
+  over (`epmd.rs` ~1210, `connection.rs` ~1040, `driver.rs` ~1030) and carry top-of-module justification;
+  `connection.rs` already path-includes its unit tests from `connection_tests.rs`.
 
 ## Test Strategy
 - In-module `#[cfg(test)]` unit tests per module + `tests/` integration tests for cross-module seams.
