@@ -216,8 +216,7 @@ wrap(#opt_st{ssa=Linear0}=St, FuncDb, Fun) ->
 
 %% Eligibility precondition used by the opt-in per-pass budget/watchdog
 %% driver (`beam_ssa_opt_budget', wired in `beam_ssa_opt:gate/1'): true when
-%% the function's CFG contains a cycle, i.e. when there can be a loop to
-%% optimize.
+%% the pass can change anything at all.
 %%
 %% This is only a NECESSARY condition, a cheap filter that lets the driver
 %% skip the pass for the majority of functions; whether a specific loop can
@@ -230,9 +229,18 @@ wrap(#opt_st{ssa=Linear0}=St, FuncDb, Fun) ->
 %% later than the block itself" is therefore a sound over-approximation of
 %% "this function has a loop", and it costs O(V+E) with no dominator
 %% computation.
+%%
+%% A loop is NOT the only thing the `loop_opt' driver rewrites: it also runs a
+%% WHOLE-FUNCTION strength reduction (`strength_reduce/2') that rewrites
+%% `X * 2^n', `X div 2^n' and `X rem 2^n' in place and canonicalises `C + V' /
+%% `C * V' into `V + C' / `V * C', none of which needs a back edge. The gate
+%% must therefore also accept those shapes, or enabling the gates
+%% (`ssa_opt_gates') would silently drop those rewrites and change the
+%% generated code. The candidate test below over-approximates the pass's own
+%% test (a false positive only means "do not skip").
 -spec eligible({#opt_st{}, term()}) -> boolean().
 eligible({#opt_st{ssa=Linear}, _FuncDb}) when is_list(Linear) ->
-    has_back_edge(Linear);
+    has_back_edge(Linear) orelse has_reduce_candidate(Linear);
 eligible(_) ->
     %% The SSA is in block-map form, where opt/1 is a no-op.
     false.
@@ -260,6 +268,30 @@ has_back_succ([S|Ss], I, Index) ->
         _ -> has_back_succ(Ss, I, Index)
     end;
 has_back_succ([], _I, _Index) ->
+    false.
+
+%% The whole-function strength-reduction part of the driver rewrites an
+%% instruction of one of the shapes tested here, whatever the surrounding
+%% control flow. Each clause mirrors a clause of `reduce_instr/2': a `*', `div'
+%% or `rem' can become a shift or a mask, and a `+' or `*' written with its
+%% literal operand on the left is canonicalised into the variable-first form.
+%% The literality/integrality facts that decide whether the rewrite actually
+%% happens are left to the pass, so this is deliberately wider than the pass.
+has_reduce_candidate([{_L, #b_blk{is=Is}} | Blocks]) ->
+    case lists:any(fun reduce_candidate/1, Is) of
+        true -> true;
+        false -> has_reduce_candidate(Blocks)
+    end;
+has_reduce_candidate([]) ->
+    false.
+
+reduce_candidate(#b_set{op={bif,Op}, args=[_, _]})
+  when Op =:= '*'; Op =:= 'div'; Op =:= 'rem' ->
+    true;
+reduce_candidate(#b_set{op={bif,Op}, args=[#b_literal{}, #b_var{}]})
+  when Op =:= '+'; Op =:= '*' ->
+    true;
+reduce_candidate(_I) ->
     false.
 
 %%% ------------------------------------------------------------------
@@ -581,17 +613,18 @@ arith_licm(Region, Order0, Pre, Blocks0) ->
     Kinds = value_kinds(Defs, #{}),
     Narrowed = narrowed_vars(Region, Blocks0, Defs),
     Marker = marker_args(Blocks0),
+    Uses = use_counts(Blocks0),
     Order = [L || L <- Order0, ordsets:is_element(L, RegionSet)],
     lists:foldl(fun(L, B) ->
                         arith_hoist_block(L, Pre, InRegion, Kinds, Narrowed,
-                                          Marker, B)
+                                          Marker, Uses, B)
                 end, Blocks0, Order).
 
 %% Variables consumed by a `{succeeded,_}' receive marker. The marker has to
 %% stay in the same block, immediately after the instruction whose result it
 %% guards (`beam_ssa_codegen:cg_block/3' matches the pair), so an instruction
-%% that produces such a variable is never moved: hoisting it would leave the
-%% marker behind and make code generation fail.
+%% that produces such a variable can only be moved when the marker over it is
+%% dropped at the same time; see `droppable_markers/2'.
 marker_args(Blocks) ->
     maps:fold(
       fun(_L, #b_blk{is=Is}, Acc) ->
@@ -603,48 +636,135 @@ marker_args(Blocks) ->
                 end, Acc, Is)
       end, ordsets:new(), Blocks).
 
-arith_hoist_block(L, Pre, InRegion, Kinds, Narrowed, Marker, Blocks0) ->
+%% The `{succeeded,_}' markers of the block that may be dropped along with a
+%% hoist, keyed by the variable they guard (the result bool they define is the
+%% value). A marker may be dropped when the checked operation is proven
+%% non-raising -- which is exactly the condition under which the hoist is
+%% performed -- and when its result bool is used nowhere but as the block's
+%% branch condition, so that dropping it can replace that condition by the
+%% constant `true'. This is the same reduction `beam_ssa_type:simplify/6'
+%% performs for an operation it can prove always succeeds, and it is what lets
+%% a marker-guarded instruction be hoisted without leaving the marker behind
+%% in a block whose code generation it would then corrupt.
+droppable_markers(#b_blk{is=Is, last=Last}, Uses) ->
+    lists:foldl(
+      fun(#b_set{op={succeeded, _}, args=[#b_var{}=V], dst=#b_var{}=B}, Acc) ->
+              case droppable_bool(B, Last, Uses) of
+                  true -> Acc#{V => B};
+                  false -> Acc
+              end;
+         (_I, Acc) ->
+              Acc
+      end, #{}, Is).
+
+droppable_bool(B, #b_br{bool=#b_var{}=B}, Uses) ->
+    maps:get(B, Uses, 0) =:= 1;
+droppable_bool(_B, _Last, _Uses) ->
+    false.
+
+arith_hoist_block(L, Pre, InRegion, Kinds, Narrowed, Marker, Uses, Blocks0) ->
     Blk0 = maps:get(L, Blocks0),
-    {Keep, Hoist} =
-        arith_split(Blk0#b_blk.is, InRegion, Kinds, Narrowed, Marker, 0, [], []),
+    Drop = droppable_markers(Blk0, Uses),
+    {Keep0, Hoist} =
+        arith_split(Blk0#b_blk.is, InRegion, Kinds, Narrowed, Marker, Drop,
+                    0, [], []),
     case Hoist of
         [] ->
             Blocks0;
         [_ | _] ->
-            Blocks1 = Blocks0#{L := Blk0#b_blk{is=Keep}},
+            %% Each hoisted instruction that was guarded by a marker takes the
+            %% marker (and its branch condition) with it.
+            Drop1 = maps:with([V || #b_set{dst=#b_var{}=V} <- Hoist], Drop),
+            Keep = drop_markers(Keep0, Drop1),
+            Last = drop_marker_branch(Blk0#b_blk.last, Drop1),
+            Blocks1 = Blocks0#{L := Blk0#b_blk{is=Keep, last=Last}},
             PreBlk0 = maps:get(Pre, Blocks1),
             PreBlk = PreBlk0#b_blk{is=PreBlk0#b_blk.is ++ Hoist},
             Blocks1#{Pre := PreBlk}
     end.
 
+%% Remove the markers of the hoisted instructions, keyed by the variable they
+%% guard.
+drop_markers([#b_set{op={succeeded, _}, args=[#b_var{}=V]}=I | Is], Drop) ->
+    case is_map_key(V, Drop) of
+        true -> drop_markers(Is, Drop);
+        false -> [I | drop_markers(Is, Drop)]
+    end;
+drop_markers([I | Is], Drop) ->
+    [I | drop_markers(Is, Drop)];
+drop_markers([], _Drop) ->
+    [].
+
+%% Make a `br' whose condition was a dropped marker's bool unconditional.
+drop_marker_branch(#b_br{bool=#b_var{}=B}=Br, Drop) ->
+    case lists:member(B, maps:values(Drop)) of
+        true -> Br#b_br{bool=#b_literal{val=true}};
+        false -> Br
+    end;
+drop_marker_branch(Last, _Drop) ->
+    Last.
+
+%% How many times each variable of the function is used. A `{succeeded,_}'
+%% marker's result bool may only be dropped when it is used exactly once, as
+%% the branch condition the marker was created for.
+use_counts(Blocks) ->
+    maps:fold(
+      fun(_L, #b_blk{is=Is, last=Last}, Acc0) ->
+              Acc1 = lists:foldl(fun(#b_set{args=Args}, A) ->
+                                         count_uses(Args, A)
+                                 end, Acc0, Is),
+              count_uses(terminator_args(Last), Acc1)
+      end, #{}, Blocks).
+
+count_uses([#b_var{}=V | T], Acc) ->
+    count_uses(T, Acc#{V => maps:get(V, Acc, 0) + 1});
+count_uses([_ | T], Acc) ->
+    count_uses(T, Acc);
+count_uses([], Acc) ->
+    Acc.
+
+terminator_args(#b_br{bool=#b_var{}=B}) -> [B];
+terminator_args(#b_switch{arg=#b_var{}=A}) -> [A];
+terminator_args(#b_ret{arg=#b_var{}=A}) -> [A];
+terminator_args(_Last) -> [].
+
 %% The region's definition set is never shrunk: an instruction hoisted earlier
 %% in this pass has a definition inside the region, and classifying it would
 %% rest on annotations that the loop may narrow. Chains of hoisted arithmetic
 %% are therefore left in the loop.
-arith_split([], _InRegion, _Kinds, _Narrowed, _Marker, _Cnt, Keep, Hoist) ->
+arith_split([], _InRegion, _Kinds, _Narrowed, _Marker, _Drop, _Cnt, Keep,
+            Hoist) ->
     {lists:reverse(Keep), lists:reverse(Hoist)};
-arith_split([S | Rest], InRegion, Kinds, Narrowed, Marker, Cnt, Keep, Hoist) ->
+arith_split([S | Rest], InRegion, Kinds, Narrowed, Marker, Drop, Cnt, Keep,
+            Hoist) ->
     case Cnt < ?MAX_HOIST andalso
-        arith_hoistable(S, InRegion, Kinds, Narrowed, Marker) of
+        arith_hoistable(S, InRegion, Kinds, Narrowed, Marker, Drop) of
         true ->
-            arith_split(Rest, InRegion, Kinds, Narrowed, Marker, Cnt + 1,
+            arith_split(Rest, InRegion, Kinds, Narrowed, Marker, Drop, Cnt + 1,
                         Keep, [S | Hoist]);
         false ->
-            arith_split(Rest, InRegion, Kinds, Narrowed, Marker, Cnt,
+            arith_split(Rest, InRegion, Kinds, Narrowed, Marker, Drop, Cnt,
                         [S | Keep], Hoist)
     end.
 
 arith_hoistable(#b_set{op={bif,Op}, args=[A, B], dst=Dst}=I, InRegion, Kinds,
-                Narrowed, Marker) ->
-    not ordsets:is_element(Dst, Marker) andalso
+                Narrowed, Marker, Drop) ->
+    marker_ok(Dst, Marker, Drop) andalso
         lists:member(Op, ?ARITH_BIFS) andalso
         invariant_arith_arg(A, InRegion) andalso
         invariant_arith_arg(B, InRegion) andalso
         is_integer_kind(pre_kind(I, 0, A, Narrowed, Kinds)) andalso
         is_integer_kind(pre_kind(I, 1, B, Narrowed, Kinds)) andalso
         second_operand_ok(Op, B);
-arith_hoistable(_I, _InRegion, _Kinds, _Narrowed, _Marker) ->
+arith_hoistable(_I, _InRegion, _Kinds, _Narrowed, _Marker, _Drop) ->
     false.
+
+%% A `{succeeded,_}' marker over the result of an instruction normally pins it
+%% to its block. The instruction may still be hoisted when the marker itself
+%% is dropped along with it: the operation is proven non-raising, so the
+%% marker is unconditionally true and the branch on it is made unconditional.
+marker_ok(Dst, Marker, Drop) ->
+    not ordsets:is_element(Dst, Marker) orelse is_map_key(Dst, Drop).
 
 invariant_arith_arg(#b_literal{}, _InRegion) ->
     true;
