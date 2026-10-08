@@ -36,8 +36,9 @@
 //! re-exports, the request/response codecs, the self-delimiting reply readers and
 //! the [`EpmdClient`] methods — so the wire is reviewable in a single place. (No
 //! sub-module is declared here: the crate's module tree in `lib.rs` is owned by
-//! another part of the tree.)use beam_common::{BeamError, Result};
+//! another part of the tree.)
 
+use beam_common::{BeamError, Result};
 use crate::connection::TcpTransport;
 use crate::flags::{DIST_VER_HIGH, DIST_VER_LOW};
 use crate::framing::{write_packet, PacketHeaderSize};
@@ -48,9 +49,9 @@ pub use crate::flags::{
     EPMD_NAMES_REQ, EPMD_NODE_HIDDEN, EPMD_NODE_NORMAL, EPMD_PORT2_REQ, EPMD_PORT2_RESP,
     EPMD_PORT_PLEASE2_REQ, EPMD_STOP_REQ,
 };
+
 /// `EI_MYPROTO`: the protocol field of an `ALIVE2_REQ` (`0` = tcp/ip).
 pub const EPMD_PROTO_TCP: u8 = 0;
-
 /// The highest distribution version advertised to `epmd` (`EI_DIST_HIGH`).
 pub const EPMD_DIST_HIGH: u16 = DIST_VER_HIGH;
 
