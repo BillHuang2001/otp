@@ -73,13 +73,42 @@
 %%         in-place update returns the same now-private object), or
 %%       - a `phi` all of whose incoming values are themselves fresh.
 %%
-%% In addition the definition of the source must either be in the same
-%% basic block as the update or in the unique predecessor block of the
-%% update's block. This guarantees that the update can never be executed
-%% more than once per allocation of the source, and in particular
-%% prevents an update inside a loop from mutating a value that was
-%% created before the loop (which would corrupt values already handed
-%% out in earlier iterations).
+%% In addition the position of the definition of the source relative to the
+%% update must satisfy the *position rule*. Let D be the block that defines
+%% the source and U the block containing the update. The transform is
+%% allowed iff
+%%
+%%   * D == U (the definition and the update are in the same block), or
+%%   * both of the following:
+%%       (1) **D dominates U** - every path from a CFG root to U passes
+%%           through D, and
+%%       (2) **every cycle through U also passes through D** -
+%%           equivalently, in the CFG with D removed, U is not reachable
+%%           from any successor of U.
+%%%% (1) guarantees that the value read by the update really is the object
+%% allocated at D. (2) guarantees that each execution of U is preceded by
+%% the execution of D that allocated the object it writes, i.e. that U is
+%% executed at most once per allocation of the source. Condition (2) is
+%% *not* implied by (1): a value defined before a loop but updated inside
+%% the loop would be mutated once per iteration, corrupting the values that
+%% earlier iterations already handed out. In ordinary Erlang source this is
+%% hard to reach - a loop can only refer to a value defined before it by
+%% threading that value through the loop, which is a second use and is
+%% therefore already rejected by the single-use rule - so (2) is a
+%% defensive guard. It is implemented and unit tested anyway.
+%%
+%% The rule strictly generalizes the narrower "same block, or unique
+%% predecessor block" rule it replaces: D == U satisfies both conditions
+%% trivially, and when D is the unique predecessor of U then every path
+%% into U arrives from D (so D dominates U) and every cycle through U
+%% contains D. It is what lets the pass handle a value that is defined
+%% before, and updated after, an intervening branch/join:
+%%
+%%     join(X, C) ->
+%%         R0 = mk(X),                    % D (freshness rule)
+%%         Y = case C of true -> 1; false -> 2 end,
+%%         R0#r{b=Y}.                     % U, whose unique predecessor is
+%%                                        % the join block, not D
 %%
 %% == Soundness ==
 %%
@@ -88,16 +117,26 @@
 %% binary, or a call to a fresh returning function). The single-use rule
 %% proves that no other reference to that term exists: it is not stored
 %% in another term, not sent, not captured by a fun, not passed as a
-%% call argument, not fed to a phi and not otherwise observable. The
-%% position rule above proves that each execution of the update sees a
-%% freshly allocated object that is used only there, so its reference
-%% count is 1 and writing it in place is indistinguishable from building
-%% a copy. When freshness cannot be proven the hint is left untouched
-%% and the code falls back to copying, so the transform never weakens a
-%% `copy`/`reuse` that was required for safety.
+%% call argument, not fed to a phi and not otherwise observable. Given the
+%% single-use rule, SSA guarantees that the update reads the object
+%% allocated at D, and the position rule proves that no other execution of
+%% U can run between the execution of D and the update. That object is
+%% therefore still private (reference count 1) when it is written, so
+%% writing it in place is indistinguishable from building a copy. When
+%% freshness or the position rule cannot be proven the hint is left
+%% untouched and the code falls back to copying, so the transform never
+%% weakens a `copy`/`reuse` that was required for safety.
+%%
+%% == Known limitation: lists and maps ==
+%%
+%% In-place reuse of *lists* and *maps* is not implemented, and it cannot
+%% be implemented as a compiler-only change: no list- or map-update
+%% instruction carries a `copy`/`reuse`/`inplace` hint, and the emulator
+%% always allocates a fresh map for an update. `update_record` is the only
+%% update instruction that can write in place, so it is the only one this
+%% pass ever rewrites.
 
--module(beam_ssa_fbip).
--moduledoc false.
+-module(beam_ssa_fbip).-moduledoc false.
 
 -export([opt/2, eligible/1]).
 
@@ -118,20 +157,21 @@
 %% instruction (or `ambiguous` if it is defined more than once), `uses`
 %% maps a variable to the number of times it is used, `blocks` maps a
 %% variable to the label of the block containing its definition (or
-%% `ambiguous`), `preds` maps a block label to the list of its
-%% predecessor blocks, `args` is the list of the function's arguments
-%% and `fresh` is the set of local functions known to return a fresh
-%% value.
+%% `ambiguous`), `succs` maps a block label to the list of its successor
+%% blocks, `roots` is the list of blocks without predecessors (the entry
+%% block 0, plus - harmlessly - any unreachable block as well as the pseudo
+%% block `?EXCEPTION_BLOCK`, whose terminator has no successors), `args` is
+%% the list of the function's arguments and `fresh` is the set of local
+%% functions known to return a fresh value.
 -record #fbip_ctx{
    defs = #{} :: #{beam_ssa:var_name() => beam_ssa:b_set() | ambiguous},
    uses = #{} :: #{beam_ssa:var_name() => pos_integer()},
    blocks = #{} :: #{beam_ssa:var_name() => beam_ssa:label() | ambiguous},
-   preds = #{} :: #{beam_ssa:label() => [beam_ssa:label()]},
+   succs = #{} :: #{beam_ssa:label() => [beam_ssa:label()]},
+   roots = [] :: [beam_ssa:label()],
    args = [] :: [beam_ssa:b_var()],
    fresh = #{} :: #{beam_ssa:b_local() => true}
-}.
-
--spec opt(st_map(), func_info_db()) -> {st_map(), func_info_db()}.
+}.-spec opt(st_map(), func_info_db()) -> {st_map(), func_info_db()}.
 opt(StMap, FuncDb) ->
     StMap1 = iterate(StMap, ?MAX_ITERATIONS),
     {StMap1, FuncDb}.
@@ -255,8 +295,8 @@ rewrite_is([#b_set{op=update_record,
                    args=[#b_literal{val=Hint},Size,Src|Updates]}=I0|Is],
            Lbl, Ctx) ->
     I = case Hint =/= inplace andalso
-             sound_position(Ctx, Lbl, Src) andalso
-             is_fresh(Ctx, Src, sets:new()) of
+             is_fresh(Ctx, Src, sets:new()) andalso
+             sound_position(Ctx, Lbl, Src) of
             true ->
                 I0#b_set{args=[#b_literal{val=inplace},Size,Src|Updates]};
             false ->
@@ -270,8 +310,7 @@ rewrite_is([], _Lbl, _Ctx) ->
 
 %%
 %% Freshness test.
-%%
-is_fresh(Ctx, #b_var{}=V, Visiting) ->
+%%is_fresh(Ctx, #b_var{}=V, Visiting) ->
     case sets:is_element(V, Visiting) of
         true ->
             false;
@@ -326,9 +365,14 @@ is_fresh_def(Ctx, #b_set{op=Op,args=Args}, Visiting) ->
     end.
 
 %%
-%% Verify that the update can be executed at most once per allocation of
-%% the source: either the source is defined in the same block as the
-%% update, or in the unique predecessor block of the update's block.
+%% Position rule: verify that the update can be executed at most once per
+%% allocation of the source. Either the source is defined in the same block
+%% as the update, or both of the following hold:
+%%
+%%   1. the definition block D dominates the update block U, so the object
+%%      the update reads is the one allocated at D, and
+%%   2. no cycle through U avoids D, so U can run at most once per
+%%      execution of D.
 %%
 sound_position(Ctx, UpdLbl, #b_var{}=V) ->
     case maps:get(V, Ctx#fbip_ctx.blocks, undefined) of
@@ -339,23 +383,70 @@ sound_position(Ctx, UpdLbl, #b_var{}=V) ->
         DefLbl when DefLbl =:= UpdLbl ->
             true;
         DefLbl ->
-            maps:get(UpdLbl, Ctx#fbip_ctx.preds, []) =:= [DefLbl]
+            dominates(Ctx, DefLbl, UpdLbl) andalso
+                not cycles_through(Ctx, DefLbl, UpdLbl)
     end;
 sound_position(_Ctx, _UpdLbl, _Value) ->
     false.
 
 %%
-%% Construct the analysis context by scanning a linearized function.
+%% Condition (1): D dominates U iff every path from a CFG root to U passes
+%% through D. Equivalently: with D removed from the CFG, U is not reachable
+%% from any root. Using every predecessor-less block as a root is
+%% conservative (a block that is only reachable through D would be a
+%% harmless extra root) and keeps the check independent of the order in
+%% which the blocks happen to be numbered.
 %%
-make_ctx(Linear, Args, Fresh) ->
+dominates(Ctx, D, U) ->
+    not reachable(Ctx, D, Ctx#fbip_ctx.roots, U).
+
+%%
+%% Condition (2): does some cycle through U avoid D? Equivalently: with D
+%% removed from the CFG, is U reachable from one of U's own successors?
+%%
+cycles_through(Ctx, D, U) ->
+    reachable(Ctx, D, maps:get(U, Ctx#fbip_ctx.succs, []), U).
+
+%%
+%% Is `Target' reachable from any block in `From' in the CFG where the
+%% block `Removed' (and thus its outgoing edges) has been deleted?
+%%
+reachable(Ctx, Removed, From, Target) ->
+    reachable_1(From, Removed, Target, sets:new(), Ctx).
+
+reachable_1([L|Ls], Removed, Target, Seen0, Ctx) ->
+    if
+        L =:= Removed ->
+            %% Do not traverse the removed block (nor consider it as the
+            %% target: the two are never equal, D =/= U is guaranteed).
+            reachable_1(Ls, Removed, Target, Seen0, Ctx);
+        L =:= Target ->
+            true;
+        true ->
+            case sets:is_element(L, Seen0) of
+                true ->
+                    reachable_1(Ls, Removed, Target, Seen0, Ctx);
+                false ->
+                    Seen = sets:add_element(L, Seen0),
+                    Succs = maps:get(L, Ctx#fbip_ctx.succs, []),
+                    reachable_1(Succs ++ Ls, Removed, Target, Seen, Ctx)
+            end
+    end;
+reachable_1([], _Removed, _Target, _Seen, _Ctx) ->
+    false.
+
+%%
+%% Construct the analysis context by scanning a linearized function.
+%%make_ctx(Linear, Args, Fresh) ->
     {Defs,Uses,Blocks} = scan(Linear),
+    Succs = succs(Linear),
     Preds = preds(Linear),
-    #fbip_ctx{defs=Defs,uses=Uses,blocks=Blocks,preds=Preds,
-              args=Args,fresh=Fresh}.
+    Roots = [Lbl || Lbl <- maps:keys(Succs), not is_map_key(Lbl, Preds)],
+    #fbip_ctx{defs=Defs,uses=Uses,blocks=Blocks,succs=Succs,
+              roots=Roots,args=Args,fresh=Fresh}.
 
 scan(Linear) ->
     scan_blks(Linear, #{}, #{}, #{}).
-
 scan_blks([{Lbl,#b_blk{is=Is,last=Last}}|Rest], Defs0, Uses0, Blocks0) ->
     {Defs,Uses,Blocks} = scan_is(Is, Lbl, Defs0, Uses0, Blocks0),
     Uses1 = count_uses(term_uses(Last), Uses),
@@ -400,13 +491,28 @@ preds(Linear) ->
                                     end, Acc0, term_targets(Last))
                 end, #{}, Linear).
 
+%% Compute the successor blocks of every block. The dual of preds/1, and
+%% built from the same over-approximating term_targets/1 so that both views
+%% of the CFG agree (see the comment on term_targets/1).
+succs(Linear) ->
+    maps:from_list([{Lbl, term_targets(Last)} ||
+                       {Lbl,#b_blk{last=Last}} <- Linear]).
+
+%% The successor labels of a block terminator.
+%%%% This is a deliberate over-approximation: a `#b_br{}' whose condition is a
+%% literal contributes both labels even though only one of the two edges is
+%% live. That is conservative for both CFG queries this pass makes: extra
+%% predecessors make condition (1) (dominance) harder to prove, and extra
+%% successors make condition (2) (a cycle avoiding the definition block)
+%% easier to find. Neither query can therefore become unsoundly optimistic.
+%% A successor that is not part of the linearized function simply has no
+%% outgoing edges (see succs/1), so it cannot make a query succeed either.
 term_targets(#b_ret{}) ->
     [];
 term_targets(#b_br{succ=Succ,fail=Fail}) ->
     [Succ,Fail];
 term_targets(#b_switch{fail=Fail,list=List}) ->
     [Fail|[Lbl || {_,Lbl} <- List]].
-
 %% Collect the variables used by an instruction.
 set_uses(#b_set{args=Args}) ->
     args_uses(Args).
