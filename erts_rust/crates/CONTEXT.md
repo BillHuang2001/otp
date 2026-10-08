@@ -100,8 +100,8 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_gc` | generational Cheney copying + immix mature generation (measurement-gated) + MSO refcount |
 | `beam_message` | `copy_struct` + send/receive envelope + the `QueueCursor` scan position |
 | `beam_process` | `Process`, run queue, scheduler loop, resume-on-send, signals/links/monitors |
-| `beam_bifs` | `BifRegistry` + core `erlang` BIFs (arith, comparison, type tests, term ops) + `io` floor |
-| `beam_ets` | `set` + `ordered_set` core ops (`new/insert/lookup/delete/select`) |
+| `beam_bifs` | `BifRegistry` + the whole declared `bif.tab` surface (556 BIFs; registry 637 keys) + the host seams |
+| `beam_ets` | `set` (CHAMP) + `ordered_set` (K-ary B+-tree) + `bag`/`duplicate_bag` (chained) over `new/insert/lookup/delete/select` |
 | `beam_io` | `mio` poller/reactor + `Port`/`PortRegistry` + port-task scheduling + built-in `fd`/`efile` **and OS-child `spawn`** drivers |
 | `beam_rt` | boot/CLI/`system_info` + the executor runner (send/receive) + the `PortHook` provider + end-to-end vertical-slice integration test |
 
