@@ -84,6 +84,9 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   (`ERL_TOP="$PWD" escript scripts/license-header.es scan --path erts_rust`). Add the block to every
   new Rust source file (`//`-comment prefix, blank lines as bare `//`, one blank line before the
   code). External deps must be Apache-2.0/MIT only.
+  `scan --path erts_rust` still reports the workspace's *non-`.rs`* files (the `CONTEXT.md` docs, other
+  `.md`, `Cargo.toml`/`Cargo.lock`, `.erl`/`.c` test fixtures, generated `out/`/benchmark results) as
+  header-less; only the `*.rs` sources are in scope for this requirement.
 
 ## Notes for Agents
 - Iterate with `scripts/cargo.sh build|test --manifest-path erts_rust/Cargo.toml --workspace`
@@ -181,14 +184,14 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - `crates/beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `crates/beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`) + layout-frozen structs
 - `crates/beam_loader/` → `.beam` file parsing, loader, `ops.tab` transforms, superinstructions
-- `crates/beam_engine/` → typed block IR seam + interpreter + JIT backends (BeamAsm baseline, Cranelift); see also `TEST_NOTES.md`, `HANDOFF_bs_init_writable.md`
+- `crates/beam_engine/` → typed block IR seam + interpreter + JIT backends (BeamAsm baseline, Cranelift); see also `TEST_NOTES.md`, `MEASURED.md`, `HANDOFF_bs_init_writable.md`
 - `crates/beam_gc/` → per-process generational copying GC, MSO sweep, heap sizing (Stage 4)
-- `crates/beam_process/` → processes, scheduler, run queues, thread progress, message queue, signals
+- `crates/beam_process/` → processes, scheduler, run queues, thread progress, message queue, signals; see also `DESIGN_DECISIONS.md`
 - `crates/beam_message/` → copy engine (`copy_struct`) + messaging (send/receive, fragments)
 - `crates/beam_bifs/` → BIF registry (`bif.tab` surface) + implementations
 - `crates/beam_ets/` → ETS tables (set/ordered_set/hash family), B-tree/CHAMP interiors; see also `ETS_SURFACE.md`
 - `crates/beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, built-in drivers
-- `crates/beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue
+- `crates/beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue; see also `TRACE_AND_PERF.md`, `M1_GAPS.md`
 - `tools/differential/` → differential-test harness vs real ERTS (the compatibility gate)
 - `tools/bench/` → benchmark driver for the external target projects + system-ERTS baseline; measured numbers in `RESULTS.md`
 
