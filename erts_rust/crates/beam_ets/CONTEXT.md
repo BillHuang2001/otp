@@ -530,6 +530,12 @@ impl Table {
   interior) rather than `reset()`ing the arena; unfixing flushes the deferred frees. So
   `ets:info(T, memory)` is held while fixed and *falls* at unfix, matching the oracle. `deferred_frees`
   is deliberately **not** counted in `memory()` (table-owned, not live objects).
+- **Subterm sharing (the copy-boundary trim).** `TermStore::copy_term` shares exactly the one literal
+  whose liveness the crate can prove — the global empty tuple (`tuple0()`; C `copy.c:130-140`).
+  `beam_term::literal::LiteralArea` literals are **deep-copied** (the area can be dropped and the
+  crate holds no handle, so the C's `in_literal_purge_area` guard cannot be honoured). `{keypos, N}`
+  keys live inside the stored tuple (no separate key copy); `compressed` is parsed/reported with no
+  storage effect (honest gap, see Known Issues).
 - **Access enforcement covers the newer ops.** `TableAccess` (`src/table/access.rs`) gates
   `select_replace` as a *write*, every `/3` + `/1` limited/continuation form as a *read*
   (`select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/
