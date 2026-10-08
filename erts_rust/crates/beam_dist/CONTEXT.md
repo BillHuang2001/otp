@@ -543,7 +543,10 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `src/atom_cache.rs` → `SegmentCache`/`ReceiveAtomCache`/`OutboundAtomCache`, `apply_header`, and the
   `beam_codec::AtomCacheWriter` impl on `OutboundAtomCache` (the outbound `intern` hook)
 - `src/control.rs` → the `DOP_*` control-message tuple codec (`encode_control`/`encode_control_cached`)
-- `src/delivery.rs` → inbound `DOP_*` delivery: `Delivery` (classify a `ControlMessage`), the defaulted `InboundSink` seam + `UnsupportedSink` (routing lives in `beam_rt`)
+  + `carries_message` (the 16 message-carrying opcodes)
+- `src/delivery.rs` → inbound `DOP_*` delivery: `Delivery` (classify a `ControlMessage` — all 30
+  opcodes, incl. `SpawnRequest`/`SpawnReply`/`AltactSigSend`/`PayloadExit*`), `DeliveryOutcome`/
+  `Dispatched`, the defaulted `InboundSink` seam + `UnsupportedSink` (routing lives in `beam_rt`)
 - `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation),
   `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache) with
   `send_control`/`send_message`/`send_tick`/`recv` + the typed `send_reg_send`/`send_link`/`send_exit`/
