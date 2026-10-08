@@ -98,13 +98,16 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 ## Status
 - **Crate tree complete:** all 15 crates + 2 tools are architected (each with its own `CONTEXT.md`),
   implemented, and tested.
-- **Build/test:** `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets`
-  is warning-free (one pre-existing `unused import: Mailbox` warning in `beam_rt`'s `tests/trace.rs` is
-  being fixed separately). `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
-  --no-fail-fast` reports **5762 passed / 3 failed / 1 ignored**; the 3 failures are all in `beam_rt`
-  and stem from `beam_bifs` registering the FULL declared `bif.tab` surface (556 keys; registry 637),
-  which shadows `beam_rt`'s curated `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list — a `beam_rt` fix is in
-  flight and 0 failures are expected once it lands.
+- **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
+  --all-targets`; test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
+  --no-fail-fast`. The `beam_rt` failures once caused by `beam_bifs` registering the FULL declared
+  `bif.tab` surface (556 keys; registry 637) shadowing `beam_rt`'s curated
+  `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list are resolved: `beam_rt::is_known_unimplemented_bif` now
+  intersects the live registry (`beam_rt/src/error.rs`), with drift-guard tests. Re-run the suite to
+  read the current pass count.
+- **No CI runs the Rust workspace or the differential gate.** `.github/` has zero references to
+  `erts_rust`/`cargo`/`differential`; every Rust test and the compatibility gate run only locally
+  (`scripts/cargo.sh`, `tools/differential/gate.sh`). Parity claims therefore rest on manual runs.
 - **Vertical slice WORKS:** `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam` (produced by
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
