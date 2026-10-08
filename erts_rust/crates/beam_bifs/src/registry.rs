@@ -77,6 +77,7 @@ impl BifRegistry {
         crate::packet::register(&mut reg);
         crate::proc_reg::register(&mut reg);
         crate::persistent_term::register(&mut reg);
+        crate::runtime::register(&mut reg);
         reg
     }
 
