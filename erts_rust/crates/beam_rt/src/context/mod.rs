@@ -768,6 +768,8 @@ impl<'a> RuntimeContext<'a> {
                 | ("erlang", "erase", 1)
                 | ("erlang", "get_keys", 0)
                 | ("erlang", "get_keys", 1)
+                | ("erlang", "get", 0)
+                | ("erlang", "erase", 0)
         )
     }
 

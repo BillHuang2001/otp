@@ -198,6 +198,14 @@ impl DictHook for DictBridge<'_> {
     fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>> {
         Ok(self.process_mut()?.dict().get_keys_for_value(value))
     }
+
+    fn get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        Ok(self.process_mut()?.dict().entries().collect())
+    }
+
+    fn erase_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        Ok(self.process_mut()?.dict_mut().erase_all())
+    }
 }
 
 /// The `beam_bifs` message-delivery seam: `erlang:send/2` and `erlang:'!'/2`.
