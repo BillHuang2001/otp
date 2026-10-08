@@ -783,6 +783,7 @@ impl Table {
 - `../../erts/emulator/beam/erl_db.h` / `erl_db_hash.h` / `erl_db_tree.h` → flags/fields (read-only)
 
 ## See Also
+- `ETS_SURFACE.md` → coverage census: every `ets:*` operation mapped to this crate / `beam_bifs` / missing, the oracle-probed semantic facts, and the runtime-level gaps with the exact API each needs.
 - `../CONTEXT.md` → crate-layer contracts, the `Table` seam, dependency waves, milestone scope.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1/A.8, §2 frozen term layout, §3 error strategy, §7).
 - `../beam_term/CONTEXT.md` → the frozen term API + the shared `compare`/`hashing` utilities.
