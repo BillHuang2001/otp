@@ -93,7 +93,9 @@ constants, and `ERL_NIF_SELECT_*` / `ErlNifSelectFlags` selector bits.
 
 ### Per-family implementation status (MEASURED at this node's HEAD — `Some`/total slots)
 `ErlNifApi` — **176/176** populated (the seven C-variadic slots only when `build.rs` compiled the
-`csrc/nif_variadic.c` shim — cfg `beam_abi_variadic_shim`). `ErlDrvApi` — **108/111** populated.
+`csrc/nif_variadic.c` shim — cfg `beam_abi_variadic_shim`). `ErlDrvApi` — **111/111** populated: every
+LP64 slot, no `None` remaining. A mechanical test (`tests/abi_conformance.rs`) re-derives both
+counts from the headers and fails if a header declaration ever lacks a crate definition.
 
 **NIF families** (`src/nif/enif/*.rs`):
 | family file | slots it owns | `Some`/total |
