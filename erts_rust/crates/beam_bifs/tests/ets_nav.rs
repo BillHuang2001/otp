@@ -533,13 +533,15 @@ fn match_spec_run_r_3_is_reachable() {
 // -------------------------------------------------------- select_reverse/2,3
 
 /// `ets:select_reverse/2` and `/3` reach their real implementations: `/2` is the
-/// full reverse-ordered result list, `/3` the `{Results, Continuation}` chunk.
+/// full reverse-ordered result list, `/3` the `{Results, Continuation}` chunk, and
+/// `/1` resumes that continuation.
 ///
 /// Oracle probe (erts-17.1): an `ordered_set` holding `{1,10},{2,20},{3,30},{4,40}`
-/// and `[{{'$1','$2'},[],['$1']}]` — `ets:select_reverse(T, S)` ⇒ `[4,3,2,1]`, and
-/// `element(1, ets:select_reverse(T, S, 2))` ⇒ `[3,2]`.
+/// and `[{{'$1','$2'},[],['$1']}]` — `ets:select_reverse(T, S)` ⇒ `[4,3,2,1]`,
+/// `element(1, ets:select_reverse(T, S, 2))` ⇒ `[3,2]`, and resuming that
+/// continuation ⇒ `[2,1]`.
 #[test]
-fn select_reverse_2_and_3_are_reachable() {
+fn select_reverse_1_2_and_3_are_reachable() {
     let bifs = default_registry();
     let mut heap = Heap::new(1 << 16).expect("test heap");
     let atoms = seeded_atoms();
@@ -581,6 +583,17 @@ fn select_reverse_2_and_3_are_reachable() {
         atom_is(&atoms, is_ref, "true"),
         "a full chunk yields a continuation reference"
     );
+
+    // `ets:select_reverse/1` resumes the continuation: the next chunk `{[2,1], _}`
+    // (oracle: `element(1, ets:select_reverse(C1))` ⇒ `[2,1]`).
+    let resumed =
+        call(&bifs, &mut ctx, "ets", "select_reverse", 1, &[cont]).expect("ets:select_reverse/1");
+    let size = call(&bifs, &mut ctx, "erlang", "tuple_size", 1, &[resumed]).expect("tuple_size");
+    assert_eq!(as_int(size), 2, "a resumed chunk is a 2-tuple");
+    let results =
+        call(&bifs, &mut ctx, "erlang", "element", 2, &[one_pos, resumed]).expect("element");
+    let expected = int_list(&mut ctx, &[2, 1]);
+    assert_same(&atoms, results, expected);
 }
 
 // ------------------------------------------------------- live oracle check
