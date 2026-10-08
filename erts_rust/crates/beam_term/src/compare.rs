@@ -687,13 +687,17 @@ unsafe fn cmp_external_refs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) 
 /// [`crate::record`] accessors: the field count, the definition's
 /// `(module, name, is_exported)` words, and its *sorted-key-ordered* key and value
 /// slices.
-struct RecordParts<'a> {
-    field_count: usize,
-    module: Eterm,
-    name: Eterm,
-    is_exported: Eterm,
-    keys: &'a [Eterm],
-    values: &'a [Eterm],
+///
+/// `pub(crate)`, together with [`record_parts`] and [`exported_rank`], so
+/// [`crate::hashing`]'s structural `term_hash` iterates exactly these words in
+/// exactly this order — the hash and the comparison cannot drift apart.
+pub(crate) struct RecordParts<'a> {
+    pub(crate) field_count: usize,
+    pub(crate) module: Eterm,
+    pub(crate) name: Eterm,
+    pub(crate) is_exported: Eterm,
+    pub(crate) keys: &'a [Eterm],
+    pub(crate) values: &'a [Eterm],
 }
 
 /// Reads a native-record instance's comparable words.
@@ -707,7 +711,7 @@ struct RecordParts<'a> {
 ///
 /// `t` must be a live native-record instance; its storage must stay live and
 /// unmoved for `'a`.
-unsafe fn record_parts<'a>(t: Eterm) -> Option<RecordParts<'a>> {
+pub(crate) unsafe fn record_parts<'a>(t: Eterm) -> Option<RecordParts<'a>> {
     // SAFETY: the caller guarantees `t` is a live native record, so its definition
     // block, its key array and its own value words are all live.
     let (field_count, keys, values, module, name, is_exported) = unsafe {
@@ -742,7 +746,10 @@ unsafe fn record_parts<'a>(t: Eterm) -> Option<RecordParts<'a>> {
 /// crate stores the atom `false`/`true` (`AM_FALSE`/`AM_TRUE`, atom indices 0/1, see
 /// [`crate::record`]), so the atom index is the comparable value. A word that is not
 /// an atom (only reachable for a forged record) ranks after both.
-fn exported_rank(is_exported: Eterm) -> u32 {
+///
+/// `pub(crate)` so [`crate::hashing`]'s structural record hash mixes the *same*
+/// comparable value [`cmp_records`] compares.
+pub(crate) fn exported_rank(is_exported: Eterm) -> u32 {
     if is_atom(is_exported) {
         atom_val(is_exported).raw()
     } else {

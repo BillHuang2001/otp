@@ -21,15 +21,27 @@
 //!
 //! * The hash covers the structural classes the rewrite needs today
 //!   (`small`/`big`/`float`, atoms by name, tuples, lists, binaries/bitstrings,
-//!   `nil`, internal pids/ports/refs, funs).
+//!   `nil`, internal pids/ports/refs, funs, maps, native records).
+//! * **Maps** hash over their pairs in the canonical flat-map key order
+//!   ([`crate::map::map_pairs_flatmap_order`]) — see [`hash_map`].
 //! * **Funs** hash over exactly the fields [`crate::compare`] compares — see
 //!   [`hash_fun`] — so `eq` implies equal hashes for every fun kind.
-//! * Classes without a faithful layout-aware representation (maps, records,
-//!   external pid/port/ref, on-heap bin refs) use an **opaque object
-//!   fallback**: the object's raw words are mixed in. This is deterministic for
-//!   a given runtime image but, because a map node's words are pointers, the
-//!   hash of such a term is not stable across processes/images.
-//!   It is only ever used as an *internal* hash, never compared against the C.
+//! * **Native records** hash over exactly the fields [`crate::compare`] compares —
+//!   see [`hash_record`] — so two structurally equal records hash equal whatever
+//!   their addresses. (The instance's *definition pointer* is deliberately never
+//!   mixed in: it is an address.)
+//! * **External pids/ports/refs** hash their *content* words (header, node atom,
+//!   `creation`, number/serial/ids), which hold no pointers. The value is therefore
+//!   stable across processes/images and already agrees with the structural
+//!   comparison of [`crate::compare`]: two externals that compare `=:=` differ only
+//!   in fields those words carry.
+//! * The remaining classes without a faithful layout-aware representation —
+//!   internal references and on-heap bin refs — use an **opaque object fallback**:
+//!   the object's raw words are mixed in. This is deterministic for a given runtime
+//!   image but, because such an object's words include a pointer (a ref's payload
+//!   word, a bin ref's payload/`orig` word), the hash of such a term is not stable
+//!   across processes/images. It is only ever used as an *internal* hash, never
+//!   compared against the C.
 //!
 //! # Layout
 //!
@@ -47,6 +59,7 @@ pub use make_hash2::{compute_record_definition_hash, make_hash2};
 use crate::atom::AtomTable;
 use crate::bitstring::{bitstring_parts, float_bits};
 use crate::boxed::{boxed_val, header_arity, thing_arityval};
+use crate::compare::{exported_rank, record_parts};
 use crate::eterm::Eterm;
 use crate::fun::{fun_arity, fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
 use crate::immediate::{atom_val, internal_pid_data, internal_port_data, signed_value};
@@ -85,6 +98,9 @@ const TAG_FUN_EXTERNAL: u64 = 0x10;
 /// Discriminator for a word that is **not a term at all** (a bare header word such
 /// as the ABI's `THE_NON_VALUE`; see [`crate::tag::is_term_word`]).
 const TAG_NON_VALUE: u64 = 0x11;
+/// Native-record discriminator (structural, over exactly the words
+/// [`crate::compare::cmp`] compares — see [`hash_record`]).
+const TAG_RECORD: u64 = 0x12;
 
 /// Mix a word into a running FNV-1a style hash.
 #[inline]
@@ -130,9 +146,15 @@ fn hash_term(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
         TermClass::Map => hash_map(t, atoms, mix64(h, TAG_MAP)),
         // SAFETY: `t` is a live fun.
         TermClass::Fun => unsafe { hash_fun(t, atoms, h) },
+        // Native records are hashed structurally, over exactly the fields
+        // `crate::compare::cmp` compares (see [`hash_record`]).
+        TermClass::Record => hash_record(t, atoms, mix64(h, TAG_RECORD)),
         // A word that is not a term at all: hash its raw word (never dereference it).
         TermClass::NonValue => mix64(mix64(h, TAG_NON_VALUE), t.raw() as u64),
-        // Refs plus every opaque class.
+        // Internal refs and on-heap bin refs (the opaque raw-word fallback) plus the
+        // external pid/port/ref classes, whose words are content-only and therefore
+        // hash consistently with `crate::compare`'s structural arms — see the module
+        // `Known Issues`.
         _ => unsafe { hash_words(t, mix64(h, TAG_OPAQUE)) },
     }
 }
@@ -221,6 +243,48 @@ fn hash_map(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
     h = mix64(h, pairs.len() as u64);
     for (key, value) in pairs {
         h = hash_term(key, atoms, h);
+        h = hash_term(value, atoms, h);
+    }
+    h
+}
+
+/// Hash a native record structurally, over exactly the fields
+/// [`crate::compare::cmp`] compares, in the same order (see
+/// [`crate::compare::cmp_records`]): the definition's `module` atom, its `name`
+/// atom, `is_exported` (`false < true`), the field count, the field **keys** (in the
+/// crate's sorted-key storage order) and finally the field **values** (each through
+/// [`hash_term`]).
+///
+/// The instance's word 1 — a *boxed pointer* to the definition block — is
+/// deliberately never mixed in: it is an address, so two structurally equal records
+/// at different addresses would otherwise hash differently, breaking the
+/// `eq ⇒ equal hash` rule.
+///
+/// The comparable words come from [`crate::compare::record_parts`], the same
+/// validated reader [`crate::compare::cmp_records`] uses, so the hash and the
+/// comparison cannot drift apart. A malformed record — only reachable if the term
+/// was forged outside this crate (a definition that is not a valid definition block,
+/// or one whose arity disagrees with the instance's own header) — makes that reader
+/// answer `None` and falls back to the opaque raw-word hash rather than panicking or
+/// dereferencing garbage.
+fn hash_record(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
+    // SAFETY: `hash_term` dispatched here on `TermClass::Record`, so `t` is a live
+    // native-record instance whose definition block, key array and value words are all
+    // live (and stay live while this call reads them).
+    let Some(rec) = (unsafe { record_parts(t) }) else {
+        // SAFETY: the dispatch guarantees `t` is a live boxed term, which is all the
+        // raw-word fallback dereferences.
+        return unsafe { hash_words(t, h) };
+    };
+    // `cmp_records`' field order, exactly.
+    h = hash_term(rec.module, atoms, h);
+    h = hash_term(rec.name, atoms, h);
+    h = mix64(h, exported_rank(rec.is_exported) as u64);
+    h = mix64(h, rec.field_count as u64);
+    for &key in rec.keys {
+        h = hash_term(key, atoms, h);
+    }
+    for &value in rec.values {
         h = hash_term(value, atoms, h);
     }
     h
@@ -380,11 +444,17 @@ unsafe fn hash_words(t: Eterm, mut h: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boxed::{make_boxed, make_header, HEADER_FLONUM};
+    use crate::boxed::{make_arityval, make_boxed, make_header, make_record_header, HEADER_FLONUM};
     use crate::fun::{fun_words, write_fun_external, write_fun_imported, write_fun_local, FunPid};
     use crate::heap::Heap;
     use crate::immediate::{make_atom, make_small, NIL};
+    use crate::ops::TermClass;
+    use crate::record::{record_block_words, write_record};
     use crate::tag::HEAP_BITS_SUBTAG;
+    use crate::thing::{
+        external_pid_size_words, external_port_size_words, external_ref_size_words,
+        write_external_pid, write_external_port, write_external_ref,
+    };
     use crate::Atom;
 
     /// Build a [`FunKind::Local`] fun.
@@ -471,6 +541,71 @@ mod tests {
         make_boxed(leaked.as_ptr())
     }
 
+    /// Build an external pid (`number`, `serial`, `creation` on node atom `node`).
+    ///
+    /// # Safety
+    ///
+    /// `heap` must own the [`external_pid_size_words`]-sized block and outlive the
+    /// returned term.
+    unsafe fn external_pid(
+        heap: &mut Heap,
+        node: Atom,
+        number: u32,
+        serial: u32,
+        creation: u32,
+    ) -> Eterm {
+        // SAFETY: the caller keeps the block alive; the writer fills all of it.
+        let hp = unsafe { heap.alloc_words(external_pid_size_words()).unwrap() };
+        // SAFETY: `hp` addresses exactly `external_pid_size_words()` words.
+        unsafe { write_external_pid(hp, make_atom(node), number, serial, creation) }
+    }
+
+    /// Build an external port (`number`, `creation` on node atom `node`).
+    ///
+    /// # Safety
+    ///
+    /// As [`external_pid`], with [`external_port_size_words`].
+    unsafe fn external_port(heap: &mut Heap, node: Atom, number: u64, creation: u32) -> Eterm {
+        // SAFETY: the caller keeps the block alive; the writer fills all of it.
+        let hp = unsafe { heap.alloc_words(external_port_size_words()).unwrap() };
+        // SAFETY: `hp` addresses exactly `external_port_size_words()` words.
+        unsafe { write_external_port(hp, make_atom(node), number, creation) }
+    }
+
+    /// Build an external reference (`ids`, `creation` on node atom `node`).
+    ///
+    /// # Safety
+    ///
+    /// As [`external_pid`], with [`external_ref_size_words`]`(ids.len())`;
+    /// `ids` must be non-empty and at most `MAX_REF_IDS` long.
+    unsafe fn external_ref(heap: &mut Heap, node: Atom, ids: &[u32], creation: u32) -> Eterm {
+        // SAFETY: the caller keeps the block alive; the writer fills all of it.
+        let hp = unsafe { heap.alloc_words(external_ref_size_words(ids.len())).unwrap() };
+        // SAFETY: `hp` addresses exactly `external_ref_size_words(ids.len())` words.
+        unsafe { write_external_ref(hp, make_atom(node), ids, creation) }
+    }
+
+    /// Build a native record (`module`/`name`/`is_exported` + the `(key, value)`
+    /// fields, in declaration order) on a fresh block of `heap`.
+    ///
+    /// # Safety
+    ///
+    /// `heap` must own the [`record_block_words`]-sized block and outlive the term.
+    unsafe fn record(
+        heap: &mut Heap,
+        module: Atom,
+        name: Atom,
+        is_exported: bool,
+        fields: &[(Eterm, Eterm)],
+    ) -> Eterm {
+        // SAFETY: the caller keeps the block alive; the writer fills all of it. The
+        // `definition_hash` word is not part of the hash ([`hash_record`] hashes
+        // exactly the fields `cmp_records` compares, and the cached hash is not one of
+        // them), so the placeholder is fine here.
+        let hp = unsafe { heap.alloc_words(record_block_words(fields.len())).unwrap() };
+        // SAFETY: `hp` addresses exactly `record_block_words(fields.len())` words.
+        unsafe { write_record(hp, module, name, is_exported, fields, make_small(0)).unwrap() }
+    }
     #[test]
     fn equal_terms_hash_equal_across_heaps() {
         let a = atoms();
@@ -653,5 +788,176 @@ mod tests {
         // `eq` => equal hashes.
         assert!(crate::eq(t, t2, &a));
         assert_eq!(term_hash(t, &a), term_hash(t2, &a));
+    }
+
+    /// The consistency rule for a second, field-identical copy of an external
+    /// pid/port/ref and of a native record — each copy living at a **different**
+    /// address (its own [`Heap`]), which is exactly what breaks a raw-word hash.
+    #[test]
+    fn copies_of_externals_and_records_hash_equal() {
+        let mut t = AtomTable::new();
+        t.seed(["m", "r", "node", "a", "b"]);
+        let m = t.lookup("m").unwrap();
+        let r = t.lookup("r").unwrap();
+        let node = t.lookup("node").unwrap();
+        let ka = make_atom(t.lookup("a").unwrap());
+        let kb = make_atom(t.lookup("b").unwrap());
+
+        let mut h1 = Heap::new(128);
+        let mut h2 = Heap::new(128);
+        // SAFETY: each heap owns its own blocks and outlives every term built here.
+        let (pid1, pid2, port1, port2, ref1, ref2, rec1, rec2) = unsafe {
+            (
+                external_pid(&mut h1, node, 1, 2, 3),
+                external_pid(&mut h2, node, 1, 2, 3),
+                external_port(&mut h1, node, 7, 3),
+                external_port(&mut h2, node, 7, 3),
+                external_ref(&mut h1, node, &[1, 2, 3], 3),
+                external_ref(&mut h2, node, &[1, 2, 3], 3),
+                record(
+                    &mut h1,
+                    m,
+                    r,
+                    true,
+                    &[(ka, make_small(1)), (kb, make_small(2))],
+                ),
+                record(
+                    &mut h2,
+                    m,
+                    r,
+                    true,
+                    &[(ka, make_small(1)), (kb, make_small(2))],
+                ),
+            )
+        };
+        for (x, y, what) in [
+            (pid1, pid2, "external pid"),
+            (port1, port2, "external port"),
+            (ref1, ref2, "external ref"),
+            (rec1, rec2, "record"),
+        ] {
+            // The test is only meaningful if the two copies really are separately
+            // allocated (a record's word 1 is a definition *pointer*).
+            assert_ne!(
+                x.raw(),
+                y.raw(),
+                "{what}: the two copies must live at different words"
+            );
+            assert!(crate::eq(x, y, &t), "{what}: the copies must compare equal");
+            assert_eq!(
+                term_hash(x, &t),
+                term_hash(y, &t),
+                "{what}: eq terms must hash equal"
+            );
+        }
+    }
+
+    /// Two records differing in exactly one compared field hash differently.
+    #[test]
+    fn distinct_records_hash_differently() {
+        let mut t = AtomTable::new();
+        t.seed(["m", "m2", "r", "r2", "a", "b", "c"]);
+        let m = t.lookup("m").unwrap();
+        let m2 = t.lookup("m2").unwrap();
+        let r = t.lookup("r").unwrap();
+        let r2 = t.lookup("r2").unwrap();
+        let ka = make_atom(t.lookup("a").unwrap());
+        let kb = make_atom(t.lookup("b").unwrap());
+        let kc = make_atom(t.lookup("c").unwrap());
+
+        let mut heap = Heap::new(512);
+        // SAFETY: `heap` owns every block built here and outlives them all.
+        let hashes = unsafe {
+            [
+                // base
+                term_hash(
+                    record(&mut heap, m, r, false, &[(ka, make_small(1)), (kb, make_small(2))]),
+                    &t,
+                ),
+                // module differs
+                term_hash(
+                    record(&mut heap, m2, r, false, &[(ka, make_small(1)), (kb, make_small(2))]),
+                    &t,
+                ),
+                // name differs
+                term_hash(
+                    record(&mut heap, m, r2, false, &[(ka, make_small(1)), (kb, make_small(2))]),
+                    &t,
+                ),
+                // is_exported differs
+                term_hash(
+                    record(&mut heap, m, r, true, &[(ka, make_small(1)), (kb, make_small(2))]),
+                    &t,
+                ),
+                // field count differs
+                term_hash(record(&mut heap, m, r, false, &[(ka, make_small(1))]), &t),
+                // a key differs (same field count)
+                term_hash(
+                    record(&mut heap, m, r, false, &[(ka, make_small(1)), (kc, make_small(2))]),
+                    &t,
+                ),
+                // a value differs (same keys)
+                term_hash(
+                    record(&mut heap, m, r, false, &[(ka, make_small(1)), (kb, make_small(9))]),
+                    &t,
+                ),
+            ]
+        };
+        let n = hashes.len();
+        let mut sorted = hashes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), n, "expected distinct hashes: {hashes:?}");
+    }
+
+    /// A forged `RECORD_SUBTAG` term is never guessed at, never panics and always
+    /// takes the deterministic raw-word fallback.
+    #[test]
+    fn malformed_record_takes_the_opaque_fallback() {
+        let a = atoms();
+
+        // (1) A `RECORD_SUBTAG` instance whose *definition* word is not a boxed
+        // pointer: `class` still reports a record, but `record_parts` answers `None`.
+        let words = [make_record_header(2), NIL, make_small(0)];
+        let forged = make_boxed(words.as_ptr());
+        // SAFETY: `forged` is a live 3-word box on this frame.
+        assert_eq!(unsafe { crate::ops::class(forged) }, TermClass::Record);
+        // SAFETY: `forged` is a live boxed term, so the fallback may read its words.
+        // The fallback reuses the already-mixed hash (the `TAG_RECORD` discriminator —
+        // exactly as [`hash_map`] falls back with `TAG_MAP` mixed in).
+        assert_eq!(
+            term_hash(forged, &a),
+            unsafe { hash_words(forged, mix64(FNV_OFFSET, TAG_RECORD)) }
+        );
+        // ... and the fallback is deterministic (the same term, the same value).
+        assert_eq!(term_hash(forged, &a), term_hash(forged, &a));
+
+        // (2) A record whose definition arity disagrees with the instance's own field
+        // count: `is_arity_value`-shaped definition, so only the lengths catch it.
+        let module = make_atom(a.lookup("a").unwrap());
+        let name = make_atom(a.lookup("b").unwrap());
+        let def_words = [
+            make_arityval(7), // a definition arity => 2 keys
+            NIL,              // field_order (not read by the hash)
+            make_small(0),    // cached hash
+            module,
+            name,
+            name, // is_exported (never an atom in a real record)
+            module,
+            name, // key 0, key 1
+        ];
+        let inst_words = [
+            make_record_header(2), // arity 2 => 1 field, so the lengths disagree
+            make_boxed(def_words.as_ptr()),
+            make_small(1),
+        ];
+        let forged2 = make_boxed(inst_words.as_ptr());
+        // SAFETY: `forged2` and the definition block it points at are live on this frame.
+        assert_eq!(unsafe { crate::ops::class(forged2) }, TermClass::Record);
+        // SAFETY: `forged2` is a live boxed term.
+        assert_eq!(
+            term_hash(forged2, &a),
+            unsafe { hash_words(forged2, mix64(FNV_OFFSET, TAG_RECORD)) }
+        );
     }
 }
