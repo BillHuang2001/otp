@@ -1152,7 +1152,24 @@ impl Runtime {
 
     /// Records a process created by an `erlang:spawn*` **from inside a scheduler slice** for
     /// the pass to register and enqueue (see [`Runtime::pending_spawns`]).
-    pub(crate) fn note_pending_spawn(&mut self, spawn: PendingSpawn) {
+    pub(crate) fn note_pending_spawn(&mut self, mut spawn: PendingSpawn) {
+        // The entry point and the arguments are read **later**, by the pass that registers and
+        // enqueues the child ([`Runtime::absorb_pending_spawns`]) — and the spawning process
+        // may be collected in between, which moves or drops the heap these terms were built
+        // on. Copy them onto the pointer-stable arena first (see
+        // [`Runtime::stabilize_escaped`]); this is also what makes the copies
+        // [`RunnerState::spawn`] then stores safe.
+        spawn.entry = match spawn.entry {
+            ProcessEntry::Fun { fun } => ProcessEntry::Fun {
+                fun: self.stabilize_escaped(fun),
+            },
+            export => export,
+        };
+        spawn.args = spawn
+            .args
+            .into_iter()
+            .map(|arg| self.stabilize_escaped(arg))
+            .collect();
         self.pending_spawns.push(spawn);
     }
 

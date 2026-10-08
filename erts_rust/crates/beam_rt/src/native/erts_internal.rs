@@ -870,6 +870,20 @@ impl RuntimeContext<'_> {
             pattern.count_matches(modules)
         };
 
+        // The match spec is read **later**, by the tracer that emits the events — after the
+        // process that installed the pattern may have been collected. Copy its functions onto
+        // the pointer-stable arena first (see `Runtime::stabilize_escaped`).
+        let match_spec = match match_spec {
+            Some(crate::trace::MatchSpec::Functions(functions)) => {
+                let functions = functions
+                    .into_iter()
+                    .map(|function| self.runtime.stabilize_escaped(function))
+                    .collect();
+                Some(crate::trace::MatchSpec::Functions(functions))
+            }
+            other => other,
+        };
+
         let table = self.runtime.trace_mut().patterns_mut();
         match match_spec {
             Some(match_spec) => table.install(pattern, match_spec, flags),

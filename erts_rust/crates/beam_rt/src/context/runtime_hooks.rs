@@ -421,6 +421,12 @@ impl<'a> RuntimeHooksBridge<'a> {
         heap: &mut Heap,
     ) -> Result<Eterm> {
         let _ = heap;
+        // The message is delivered **later**, by the scheduler loop: copy it onto the
+        // pointer-stable arena now (see [`Runtime::stabilize_escaped`]) so it survives the
+        // scheduling process's own collection. `from` needs no copy (a pid term is a
+        // heap-free immediate) and `reference` must not be copied (it is the caller's own
+        // handle and the `Timers::refs` lookup key).
+        let message = self.runtime.stabilize_escaped(message);
         let from = self.self_pid.to_eterm();
         self.runtime
             .timers_mut()

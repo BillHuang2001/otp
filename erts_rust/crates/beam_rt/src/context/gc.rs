@@ -360,7 +360,10 @@ mod tests {
         unsafe {
             assert_eq!(*block.add(1), NIL);
             assert_eq!(*block.add(8), NIL);
-            assert!(is_small(*block.add(8)));
+            // `NIL` is the atom `[]`, an immediate the collector never relocates — it is
+            // neither a heap reference (`is_boxed`) nor a cons cell (`is_list`).
+            assert!(!beam_term::prelude::is_boxed(*block.add(8)));
+            assert!(!beam_term::prelude::is_list(*block.add(8)));
         }
     }
 
