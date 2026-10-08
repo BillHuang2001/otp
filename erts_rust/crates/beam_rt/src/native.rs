@@ -71,17 +71,14 @@ mod process;
 mod test_support;
 
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext};
-use beam_process::ProcessId;
 use beam_term::{atom_val, is_atom, is_small, make_atom, make_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::format;
-use crate::timers::TimerTarget;
 
 impl RuntimeContext<'_> {
     /// The runtime-native BIF floor, consulted **before** the `beam_bifs` registry.
@@ -382,8 +379,8 @@ impl RuntimeContext<'_> {
     ///   therefore *accepted* and its message simply finds no process when it fires);
     /// * a delivery to a pid that has since died is dropped, not an error.
     pub(super) fn send_after_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let delay = self.timer_delay(*args.first().ok_or(BeamError::BadArg)?)?;
-        let target = self.timer_target(*args.get(1).ok_or(BeamError::BadArg)?)?;
+        let delay = crate::timers::timer_delay(*args.first().ok_or(BeamError::BadArg)?)?;
+        let target = crate::timers::timer_target(*args.get(1).ok_or(BeamError::BadArg)?)?;
         let message = *args.get(2).ok_or(BeamError::BadArg)?;
         let reference = self.mint_timer_ref()?;
         let from = self.pid().to_eterm();
@@ -423,35 +420,10 @@ impl RuntimeContext<'_> {
         }
     }
 
-    /// The delay of a timer BIF: a non-negative integer of milliseconds that a monotonic
-    /// deadline can actually represent (the oracle's `parse_timeout_pos` validation).
-    fn timer_delay(&self, term: Eterm) -> Result<Duration> {
-        if !is_small(term) {
-            return Err(BeamError::BadArg);
-        }
-        let millis = u64::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)?;
-        let delay = Duration::from_millis(millis);
-        // An unrepresentable deadline is the oracle's `badarg` (its time validation fails
-        // too), never a silently saturated one that would fire at the wrong moment.
-        if Instant::now().checked_add(delay).is_none() {
-            return Err(BeamError::BadArg);
-        }
-        Ok(delay)
-    }
-
-    /// The destination of a timer: a pid (pinned now) or a registered name (resolved when
-    /// the timer fires).
-    fn timer_target(&self, term: Eterm) -> Result<TimerTarget> {
-        if let Ok(pid) = ProcessId::from_eterm(term) {
-            return Ok(TimerTarget::Pid(pid));
-        }
-        if is_atom(term) {
-            return Ok(TimerTarget::Name(atom_val(term)));
-        }
-        // A port, a tuple (`{Name, Node}` included) or any other term: the C's
-        // `is_not_internal_pid(rcvr) && is_not_atom(rcvr)` check answers `badarg`.
-        Err(BeamError::BadArg)
-    }
+    // The delay/destination validation of a timer BIF lives in `crate::timers`
+    // (`timer_delay`/`timer_target`) — shared with the `RuntimeHooks` timer family
+    // (`erlang:start_timer/*`, `send_after/4`, `cancel_timer/2`) so the validation can
+    // never drift between the two entry points.
 
     /// A fresh `#Ref<>` for a timer, from the runtime's one reference id space.
     ///
@@ -1133,28 +1105,65 @@ mod tests {
         }
     }
 
-    /// The timer BIFs are no longer capability gaps: `send_after/3` and `cancel_timer/1`
-    /// are served by this floor, so only the remaining arities stay listed.
+    /// The timer BIFs are no longer capability gaps: `send_after/3` and `cancel_timer/1` are
+    /// served by this floor (which runs *before* the registry), and `beam_bifs` registers
+    /// **every** declared `bif.tab` key, so the remaining arities resolve through its
+    /// `RuntimeHooks` seam — served by [`crate::context::RuntimeHooksBridge`] for the keys it
+    /// claims, and the typed `unsupported_bif` gap (exit 3) for the rest. None of them is a
+    /// curated gap.
     #[test]
     fn the_timer_bifs_are_no_longer_reported_as_gaps() {
-        let runtime = runtime();
-        for (function, arity) in [("send_after", 3), ("cancel_timer", 1)] {
-            assert!(
-                !error::is_known_unimplemented_bif(&runtime.registry, function, arity),
-                "{function}/{arity} is served by the floor"
-            );
-        }
+        let mut runtime = runtime();
         for (function, arity) in [
+            ("send_after", 3),
+            ("cancel_timer", 1),
             ("send_after", 4),
             ("cancel_timer", 2),
             ("start_timer", 3),
             ("start_timer", 4),
         ] {
             assert!(
-                error::is_known_unimplemented_bif(&runtime.registry, function, arity),
-                "{function}/{arity} is still a Milestone-1 gap"
+                runtime.registry.contains("erlang", function, arity),
+                "erlang:{function}/{arity} is registry-owned"
+            );
+            assert!(
+                !error::is_known_unimplemented_bif(&runtime.registry, function, arity),
+                "erlang:{function}/{arity} must not be classified as a curated gap"
             );
         }
+        // `send_after/4` is served by the `RuntimeHooksBridge`: a valid option list
+        // schedules and answers the timer reference, which the runtime's own
+        // `cancel_timer/1` (this floor) then accepts — so the reference is real.
+        let me = runtime.self_pid().to_eterm();
+        let msg = runtime.intern("hi");
+        let reference = call(
+            &mut runtime,
+            "erlang",
+            "send_after",
+            &[make_small(60_000), me, msg, NIL],
+        )
+        .expect("erlang:send_after/4 with the default option list");
+        let remaining = call(&mut runtime, "erlang", "cancel_timer", &[reference])
+            .expect("erlang:cancel_timer/1");
+        assert!(
+            is_small(remaining),
+            "cancel_timer/1 answers the remaining milliseconds for a pending timer"
+        );
+        // An unclaimed key of the same family still resolves through the `RuntimeHooks`
+        // seam as the typed capability gap (exit 3), not the bare `undef` the
+        // `erlang`-namespace fallback raises for an unknown name.
+        let error = call(
+            &mut runtime,
+            "erlang",
+            "read_timer",
+            &[make_small(0)],
+        )
+        .expect_err("read_timer/1 has no host hook installed");
+        assert_eq!(
+            error::unsupported_reason(&error).as_deref(),
+            Some("bif"),
+            "read_timer/1 is the registry's typed unsupported_bif gap: {error}"
+        );
     }
 
     // -- os:cmd/1 -------------------------------------------------------------

@@ -21,8 +21,16 @@
 //!   and its verb integers are the `INET_REQ_*`/`TCP_REQ_*` constants, so this pins the
 //!   *shape* (`[1]`, `[1] ++ port_be16`, `[0] ++ errno_name`) against the implementation
 //!   being replaced. If `erl` is absent the check **skips loudly**, never fails.
+//!
+//! The peer-close family covers the other half of the driver's contract: a connection whose
+//! peer has gone must stop behaving like a live one. `a_recv_after_the_peer_closes_answers_the_c_closed_shape`
+//! pins the reply sequence (`closed` once per direction, `enotconn` after that, the oracle's
+//! `R,R,S,S`), `a_reactor_observed_peer_close_releases_the_registration_and_reports_closed`
+//! pins the reactor side (the dead socket stops producing readiness) and
+//! `the_peer_close_replies_agree_with_the_erl_oracle` cross-checks the two reply bytes against
+//! a real `gen_tcp` connection in the system Erlang.
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -145,6 +153,39 @@ fn read_into_queue(
     got
 }
 
+/// The C's `ctl_xerror(name)` reply: the `[INET_REP_ERROR]` tag followed by the lowercase name
+/// (`inet_drv.c:2307`).
+fn ctl_xerror(name: &str) -> Vec<u8> {
+    let mut reply = vec![INET_REP_ERROR];
+    reply.extend_from_slice(name.as_bytes());
+    reply
+}
+
+/// Runs the `recv` verb until it answers something other than `ok` — i.e. until the read is
+/// what observes the peer's end-of-file — and returns that reply.
+fn recv_until_not_ok(poller: &mut Poller, ports: &mut PortRegistry, id: PortId) -> Vec<u8> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let reply = control(ports, poller, id, "recv", b"");
+        if reply != vec![INET_REP_OK] {
+            return reply;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the peer's close was never observed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Answers whether the `Vec<u8>` is the given reply, for the `assert_eq!` messages.
+fn reply_name(reply: &[u8]) -> String {
+    match reply.split_first() {
+        Some((&INET_REP_ERROR, rest)) => String::from_utf8_lossy(rest).into_owned(),
+        Some((&INET_REP_OK, _)) => "ok".to_string(),
+        _ => format!("{reply:?}"),
+    }
+}
 #[test]
 fn a_tcp_port_round_trips_bytes_over_loopback() {
     let mut poller = poller();
@@ -248,6 +289,107 @@ fn a_stalled_write_arms_write_readiness_and_an_unknown_verb_is_bad_arg() {
             .control(&mut poller, "frobnicate", b""),
         Err(BeamError::BadArg)
     ));
+    ports.close(&mut poller, id).expect("closes the port");
+}
+
+// ---------------------------------------------------------------------------
+// The peer's close
+// ---------------------------------------------------------------------------
+
+/// **The connection follows the socket.** When the peer shuts its end down, the driver latches
+/// the close: the `recv` that observes it answers the C's `[0] ++ "closed"`, every later one
+/// `[0] ++ "enotconn"`, and `send` reports the close once too — the oracle's `R,R,S,S ->
+/// closed, enotconn, closed, enotconn` sequence. No operation reads `0` forever or writes into
+/// a socket the peer has left.
+///
+/// The fresh-connection happy path is asserted first, so the test also pins that a live
+/// connection is unaffected by the new bookkeeping.
+#[test]
+fn a_recv_after_the_peer_closes_answers_the_c_closed_shape() {
+    let mut poller = poller();
+    let (mut ports, id) = tcp_port(&mut poller);
+    let port = listen_on_loopback(&mut poller, &mut ports, id);
+    let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+    accept(&mut poller, &mut ports, id);
+
+    // The happy path: the established connection still round-trips both ways.
+    assert_eq!(
+        control(&mut ports, &mut poller, id, "send", b"up"),
+        vec![INET_REP_OK]
+    );
+    let mut echo = [0u8; 2];
+    client.read_exact(&mut echo).expect("the peer reads");
+    assert_eq!(&echo, b"up");
+    client.write_all(b"ok").expect("the peer writes");
+    assert_eq!(read_into_queue(&mut poller, &mut ports, id, 2), b"ok");
+
+    // The peer goes away. The first `recv` that observes the end-of-file is the one that
+    // reports `closed`; the one after that is the operational `enotconn`.
+    client.shutdown(Shutdown::Both).expect("the peer shuts down");
+    assert_eq!(
+        recv_until_not_ok(&mut poller, &mut ports, id),
+        ctl_xerror("closed")
+    );
+    assert_eq!(
+        control(&mut ports, &mut poller, id, "recv", b""),
+        ctl_xerror("enotconn")
+    );
+
+    // `send` keeps its **own** one-shot `closed` (the C's separate
+    // `TCP_ADDF_DELAYED_CLOSE_SEND`), so a caller that only ever sends still learns about the
+    // close — and never queues bytes into the dead socket.
+    assert_eq!(
+        control(&mut ports, &mut poller, id, "send", b"x"),
+        ctl_xerror("closed")
+    );
+    assert_eq!(ports.get(id).expect("live").output_len(), 0);
+    assert_eq!(
+        control(&mut ports, &mut poller, id, "send", b"x"),
+        ctl_xerror("enotconn")
+    );
+    ports.close(&mut poller, id).expect("closes the port");
+}
+
+/// The reactor's read-ready path latches the close too, and — like the built-in `FdDriver` at
+/// end-of-file — releases the socket's poller registration, so a dead descriptor cannot keep
+/// producing readiness (the vector for a busy loop). The next `recv` then reports the close.
+#[test]
+fn a_reactor_observed_peer_close_releases_the_registration_and_reports_closed() {
+    let mut poller = poller();
+    let (mut ports, id) = tcp_port(&mut poller);
+    let port = listen_on_loopback(&mut poller, &mut ports, id);
+    let client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+    accept(&mut poller, &mut ports, id);
+    assert_eq!(poller.len(), 1, "the accepted socket is registered");
+
+    // The peer goes away; the read-ready event makes `ready_input` read the end-of-file and
+    // latch the close, which de-registers the dead socket.
+    client.shutdown(Shutdown::Both).expect("the peer shuts down");
+    let deadline = Instant::now() + WAIT;
+    while !poller.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the peer's close was never observed by the reactor"
+        );
+        let events = match poller.poll(Some(Duration::from_millis(100))) {
+            Ok(events) => events,
+            Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => panic!("poll failed: {err:?}"),
+        };
+        ports
+            .handle_events(&mut poller, &events)
+            .expect("dispatch the ready events");
+    }
+
+    // The close was latched by the reactor, so the verbs report it without touching the socket.
+    assert_eq!(
+        control(&mut ports, &mut poller, id, "recv", b""),
+        ctl_xerror("closed")
+    );
+    assert_eq!(
+        control(&mut ports, &mut poller, id, "recv", b""),
+        ctl_xerror("enotconn")
+    );
     ports.close(&mut poller, id).expect("closes the port");
 }
 
@@ -393,4 +535,64 @@ fn the_covered_control_replies_agree_with_the_erl_oracle() {
     assert_eq!(shutdown, enotconn);
     assert_eq!(recv, oracle[4], "TCP_REQ_RECV on an unconnected port agrees");
     assert_eq!(recv, enotconn);
+}
+
+/// The Erlang side of the peer-close cross-check: it opens a real `gen_tcp` pair over loopback,
+/// closes the peer, reads the connection twice and prints the two reason atoms separated by
+/// `|` (`closed|enotconn`).
+///
+/// A `gen_tcp` connection is used rather than a raw `open_port({spawn_driver, "tcp_inet"})` one
+/// because the driver's `INET_REQ_ACCEPT` makes a *second* port for the accepted socket
+/// (`inet_drv.c:12236`), which the Erlang side hides behind `gen_tcp` — the observable
+/// `{error, closed}`/`{error, enotconn}` reasons are what this floor's `[0] ++ name` replies
+/// encode.
+fn oracle_peer_close_expression() -> String {
+    "{ok, L} = gen_tcp:listen(0, [{ip, {127,0,0,1}}, binary, {active, false}]), \
+     {ok, P} = inet:port(L), \
+     {ok, C} = gen_tcp:connect({127,0,0,1}, P, [binary, {active, false}]), \
+     {ok, S} = gen_tcp:accept(L), \
+     gen_tcp:close(C), \
+     R1 = gen_tcp:recv(S, 0), \
+     R2 = gen_tcp:recv(S, 0), \
+     N = fun({error, A}) -> atom_to_list(A); (ok) -> \"ok\" end, \
+     io:format(\"~s|~s~n\", [N(R1), N(R2)])"
+        .to_string()
+}
+
+/// The peer-close half of the compatibility gate: the reply this floor answers once the peer is
+/// gone must be the reason the real system ERTS reports for the same sequence — `closed` first,
+/// then `enotconn`.
+#[test]
+fn the_peer_close_replies_agree_with_the_erl_oracle() {
+    let Some(stdout) = erl_stdout(&oracle_peer_close_expression()) else {
+        return; // the oracle is unavailable; the check skipped loudly above
+    };
+    let Some(line) = stdout.lines().find(|line| line.contains('|')) else {
+        panic!("could not parse the oracle reply dump: {stdout:?}");
+    };
+    let reasons: Vec<&str> = line.trim().split('|').collect();
+    eprintln!("oracle peer-close reasons: {reasons:?}");
+    assert_eq!(reasons, vec!["closed", "enotconn"], "the oracle's own sequence");
+
+    // The Rust side runs the same sequence: peer closes, `recv` observes it.
+    let mut poller = poller();
+    let (mut ports, id) = tcp_port(&mut poller);
+    let port = listen_on_loopback(&mut poller, &mut ports, id);
+    let client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+    accept(&mut poller, &mut ports, id);
+    client.shutdown(Shutdown::Both).expect("the peer shuts down");
+
+    let first = recv_until_not_ok(&mut poller, &mut ports, id);
+    let second = control(&mut ports, &mut poller, id, "recv", b"");
+    eprintln!(
+        "rust peer-close reasons: [{}, {}]",
+        reply_name(&first),
+        reply_name(&second)
+    );
+
+    // The reply **bytes** are the C's `ctl_xerror(reason)`, so they encode the oracle's own
+    // reason atoms.
+    assert_eq!(first, ctl_xerror(reasons[0]), "the first close reply");
+    assert_eq!(second, ctl_xerror(reasons[1]), "the later close reply");
+    ports.close(&mut poller, id).expect("closes the port");
 }

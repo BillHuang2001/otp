@@ -471,6 +471,16 @@ impl Port {
         result
     }
 
+    /// Whether the driver has asynchronous work pending (a `driver_async` completion not yet handed
+    /// over).
+    ///
+    /// This is the probe [`PortRegistry::execute_port_tasks`](crate::PortRegistry::execute_port_tasks)
+    /// consults to decide whether the port needs a [`Port::drive_async`] point this round. It never
+    /// touches the driver context, so it is safe to call while iterating the registry.
+    pub fn has_pending_async(&self) -> bool {
+        self.driver.has_pending_async()
+    }
+
     /// Drives the driver's asynchronous completions, returning how many were processed.
     ///
     /// The port-task round has **no task kind** for `driver_async` completion in Milestone-1 (the
@@ -510,6 +520,21 @@ impl Port {
     /// Returns whatever the driver's `take_exit_status` returns.
     pub fn take_exit_status(&mut self) -> Result<Option<i32>> {
         self.driver.take_exit_status()
+    }
+
+    /// Takes the port's end-of-file notification, once.
+    ///
+    /// Forwards to the driver's [`Driver::take_eof`]: `Ok(true)` means the port's input stream
+    /// reached end-of-file and the port asked for the `eof` option — the signal a runtime turns
+    /// into the bare `eof` message the oracle delivers. `Ok(false)` means "nothing to report"
+    /// (no `eof` option, no end-of-file yet, or already reported); a port whose driver never
+    /// streams input always answers `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the driver's `take_eof` returns.
+    pub fn take_eof(&mut self) -> Result<bool> {
+        self.driver.take_eof()
     }
 
     /// Tells the driver this port is exiting, **at most once**.

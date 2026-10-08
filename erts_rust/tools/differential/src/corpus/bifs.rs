@@ -423,5 +423,204 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // ---------------------------------------------------------------------------------
+        // Newly-registered BIF families: the timer family, process control, code loading,
+        // and the `erts_internal` / `erts_debug` introspection modules. Every expression
+        // below was probed under BOTH runtimes before pinning, and every golden is the
+        // oracle's exact (single-line) answer.
+        //
+        // A Rust side that exits `3` with `beam_rt: unsupported: ...` is an honest
+        // capability gap (`unsupported`), never a mismatch: `bifs/start_timer_returns_ref`
+        // and `bifs/function_exported_lists_member` are pinned that way (the timer family
+        // and `function_exported/3` are not registered in `beam_rt` yet). They flip to
+        // `agree` automatically once the BIFs land, because the golden is the oracle's.
+        //
+        // Deliberately NOT pinned: `erlang:module_loaded(lists)` -- the oracle answers
+        // `true` while `beam_rt` answers `false` (a plain differing value, i.e. a genuine
+        // mismatch), and `code:module_loaded/1` does not exist in the oracle at all
+        // (`error:undef`). And no volatile rendering is asserted: the timer `Ref`s are
+        // observed only through `is_reference/1`, and `registered()`/`processes()` only
+        // through their shape (`is_list/1`, `lists:member/2`), never the per-VM atom/pid
+        // list (`boot/processes_is_list` / `boot/processes_contains_self` already cover
+        // the process-list shape).
+        // ---------------------------------------------------------------------------------
+        Case {
+            id: "bifs/start_timer_returns_ref",
+            description: "erlang:start_timer/3 answers a reference (identity is per-VM)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The `Ref` itself is per-VM-start, so only its *type* is observed.
+                expr: "is_reference(erlang:start_timer(1000,self(),ok))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/send_after_returns_ref",
+            description: "erlang:send_after/3 answers a reference (identity is per-VM)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "is_reference(erlang:send_after(1000,self(),ok))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/cancel_timer_of_fresh_ref_is_false",
+            description: "erlang:cancel_timer/1 is false for a timer that never existed",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:cancel_timer(make_ref())",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/is_process_alive_self",
+            description: "erlang:is_process_alive/1 is true for the calling process",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:is_process_alive(self())",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/whereis_init_is_pid",
+            description: "erlang:whereis/1 finds the `init` process as a pid",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "is_pid(whereis(init))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/registered_is_list",
+            description: "erlang:registered/0 answers a list (contents are per-VM)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Only the shape is asserted: the atom list is per-VM and must never be
+                // pinned by exact value.
+                expr: "is_list(erlang:registered())",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/registered_contains_init",
+            description: "erlang:registered/0 contains the boot `init` process name",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:member(init, erlang:registered())",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/processes_has_at_least_one",
+            description: "erlang:processes/0 lists at least the calling process",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The pid list is per-VM (and `boot/processes_is_list` /
+                // `boot/processes_contains_self` already pin its shape), so assert only
+                // that it is non-empty.
+                expr: "length(erlang:processes()) >= 1",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/function_exported_lists_member",
+            description: "erlang:function_exported/3 sees the loaded lists:member/2",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "erlang:function_exported(lists,member,2)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/module_loaded_lists_shape",
+            description: "code:is_loaded/1 answers the `{file, Path}` shape for lists",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The path is machine-specific, so only the `file` tag is asserted (the
+                // `flatten`/`preloaded`/`false` shapes are the other possibilities).
+                expr: "element(1, code:is_loaded(lists))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok file"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/erts_debug_size_of_tuple",
+            description: "erts_debug:size/1 counts the words of a small tuple",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // A 2-tuple is a header word plus two payload words: 3 words.
+                expr: "erts_debug:size({a,1})",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 3"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/erts_internal_cmp_term",
+            description: "erts_internal:cmp_term/2 returns the term-order integer",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // 1 < 2 in term order, so the comparison integer is -1.
+                expr: "erts_internal:cmp_term(1,2)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok -1"),
+                exit_code: 0,
+            },
+        },
     ]
 }

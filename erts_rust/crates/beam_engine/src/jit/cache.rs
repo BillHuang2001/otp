@@ -63,12 +63,13 @@ use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
 use beam_common::Result;
-use beam_loader::{Atom, Module};
+use beam_loader::{Atom, Label, Module};
 use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
 use crate::jit::baseline::{self, CompiledModule};
-use crate::machine::Machine;
+use crate::jit::CodeRegion;
+use crate::machine::{Machine, RunOutcome};
 
 /// A `fmt::Write` sink that feeds every written byte into a [`Hasher`].
 ///
@@ -263,6 +264,56 @@ impl CodeCache {
         let compiled = self.get_or_compile(module)?;
         baseline::run_compiled(compiled, machine, module, function, arity, args, ctx)
     }
+
+    /// Run exported `function/arity` against `module`'s cached artifact and report
+    /// whether the run returned or blocked in a `receive`.
+    ///
+    /// Exactly [`CodeCache::run_export`] with the outcome-aware driver: the artifact
+    /// is the cached one (no recompile on a hit) and a `receive` that finds no message
+    /// is reported as [`RunOutcome::Wait`] with the interpreter's resume address
+    /// rather than folded into the typed `blocked` error.
+    pub fn run_export_outcome(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<RunOutcome> {
+        let compiled = self.get_or_compile(module)?;
+        baseline::run_compiled_outcome(compiled, machine, module, function, arity, args, ctx)
+    }
+
+    /// Run the raw entry `label` against `module`'s cached artifact and report
+    /// whether the run returned or blocked in a `receive`.
+    ///
+    /// The label-addressed counterpart of [`CodeCache::run_export_outcome`]: the
+    /// label is resolved against the module-wide label map, so it may live in any
+    /// function. A missing public/uncached artifact compiles once; a hit reuses it.
+    pub fn run_label_outcome(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        label: Label,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<RunOutcome> {
+        let compiled = self.get_or_compile(module)?;
+        baseline::run_compiled_label_outcome(compiled, machine, module, label, arity, args, ctx)
+    }
+
+    /// The **real** generated code regions of `module`'s cached artifact, compiling
+    /// it on first sight.
+    ///
+    /// See [`CompiledModule::code_map`]: the ranges are the actual addresses of the
+    /// compiled basic blocks, never synthesised. Handy for a host that runs the
+    /// cached path and then wants to describe the code it ran (the `+JPperf` map).
+    pub fn code_map(&mut self, module: &Module) -> Result<Vec<CodeRegion>> {
+        let compiled = self.get_or_compile(module)?;
+        Ok(compiled.code_map(module))
+    }
 }
 
 impl Default for CodeCache {
@@ -311,6 +362,99 @@ pub(crate) fn run_baseline_cached(
         };
         let compiled = cache.get_or_compile(module)?;
         baseline::run_compiled(compiled, machine, module, function, arity, args, ctx)
+    })
+}
+
+/// Run exported `function/arity` on the baseline tier and report whether the run
+/// returned or blocked, reusing the **per-thread** cache.
+///
+/// This is what
+/// [`Machine::run_export_outcome_with_tier`](crate::Machine::run_export_outcome_with_tier)
+/// runs for [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit) — the outcome-aware
+/// twin of [`run_baseline_cached`]: a module compiled once is reused, and a `receive`
+/// that finds no message arrives as [`RunOutcome::Wait`] (with the exact resume
+/// address the interpreter would report) instead of the folded typed `blocked` error.
+///
+/// A **re-entrant** call (a BIF or fun application that itself runs a baseline export
+/// on this thread while the cache is already borrowed) does not panic: it compiles
+/// its module uncached and runs it, exactly as the plain one-shot entry would.
+pub(crate) fn run_baseline_cached_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    CODE_CACHE.with(|cell| {
+        let mut cache = match cell.try_borrow_mut() {
+            Ok(cache) => cache,
+            Err(_) => {
+                let compiled = baseline::compile_module(module)?;
+                return baseline::run_compiled_outcome(
+                    &compiled, machine, module, function, arity, args, ctx,
+                );
+            }
+        };
+        let compiled = cache.get_or_compile(module)?;
+        baseline::run_compiled_outcome(compiled, machine, module, function, arity, args, ctx)
+    })
+}
+
+/// Run the raw entry `label` on the baseline tier and report whether the run
+/// returned or blocked, reusing the **per-thread** cache.
+///
+/// The label-addressed counterpart of [`run_baseline_cached_outcome`], backing
+/// [`Machine::run_label_outcome_with_tier`](crate::Machine::run_label_outcome_with_tier)
+/// for [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit). A re-entrant call behaves
+/// as in [`run_baseline_cached_outcome`].
+pub(crate) fn run_baseline_cached_label_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    label: Label,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    CODE_CACHE.with(|cell| {
+        let mut cache = match cell.try_borrow_mut() {
+            Ok(cache) => cache,
+            Err(_) => {
+                let compiled = baseline::compile_module(module)?;
+                return baseline::run_compiled_label_outcome(
+                    &compiled, machine, module, label, arity, args, ctx,
+                );
+            }
+        };
+        let compiled = cache.get_or_compile(module)?;
+        baseline::run_compiled_label_outcome(compiled, machine, module, label, arity, args, ctx)
+    })
+}
+
+/// The **real** generated code regions of `module` on the baseline tier.
+///
+/// The host-facing entry to [`CompiledModule::code_map`] over the per-thread cached
+/// path: the module is compiled into the thread's cache on first sight (so a host
+/// that has already run it pays only a key probe) and the compiled blocks' actual
+/// `[start, size)` ranges are returned in ascending address order, each named
+/// `<module>:<function>/<pc>`.
+///
+/// Every range is a live address inside the cached artifact's sealed executable
+/// mapping, which the cache **owns** — the regions describe code that stays mapped
+/// as long as the entry does (until [`clear_baseline_cache`]). An artifact that
+/// compiled no block yields an empty map; a compile failure is the typed
+/// [`BeamError`](beam_common::BeamError) the baseline backend returns.
+pub fn baseline_code_map(module: &Module) -> Result<Vec<CodeRegion>> {
+    CODE_CACHE.with(|cell| {
+        let mut cache = match cell.try_borrow_mut() {
+            Ok(cache) => cache,
+            Err(_) => {
+                let compiled = baseline::compile_module(module)?;
+                return Ok(compiled.code_map(module));
+            }
+        };
+        let compiled = cache.get_or_compile(module)?;
+        Ok(compiled.code_map(module))
     })
 }
 

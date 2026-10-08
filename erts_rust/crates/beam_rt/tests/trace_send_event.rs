@@ -14,18 +14,50 @@
 //! serial — is pinned below.
 use beam_bifs::NullSink;
 use beam_engine::{terms, ExecutionContext};
+use beam_process::{ProcessId, ProcessTable, SignalAtoms};
 use beam_rt::{Runtime, RuntimeContext};
+use beam_term::prelude::AtomTable;
 use beam_term::{is_small, signed_value, Eterm};
 
 fn runtime() -> Runtime {
     Runtime::with_defaults().expect("the default runtime")
 }
 
-/// Every message in the calling process's mailbox, in order, drained.
+/// A **sender** and a distinct **tracer** process in a caller-owned table.
+///
+/// ERTS discards an event whose tracer IS the tracee
+/// (`erts/emulator/nifs/common/erl_tracer_nif.c:143-146`), so the two must differ for any event
+/// to be delivered at all. `erts_internal:trace/3` always installs the **calling** process as
+/// the tracer, so the tracer half of the pair is the context that calls `erlang:trace/3` and the
+/// sender half is the context that sends.
+fn two_processes(rt: &mut Runtime) -> (ProcessTable, ProcessId, ProcessId) {
+    let _ = rt;
+    let mut atoms = AtomTable::new();
+    let mut table = ProcessTable::new(SignalAtoms::from_table(&mut atoms));
+    let sender = table.spawn_default().expect("spawn the sender");
+    let tracer = table.spawn_default().expect("spawn the tracer");
+    (table, sender, tracer)
+}
+
+/// Every message in `pid`'s mailbox, in order, drained.
 ///
 /// The scan position is reset first and the loop removes each message it reads, so the order is
-/// the queue's own regardless of where an earlier `loop_rec_end` left the scan.
-fn drain(ctx: &mut RuntimeContext<'_>) -> Vec<Eterm> {
+/// the queue's own regardless of where an earlier `loop_rec_end` left the scan. `pid` runs
+/// against the caller-owned table `RuntimeContext::for_process` is built for.
+fn drain(rt: &mut Runtime, table: &mut ProcessTable, pid: ProcessId) -> Vec<Eterm> {
+    let mut ctx = RuntimeContext::for_process(rt, table, pid);
+    ctx.receive_reset().expect("timeout");
+    let mut messages = Vec::new();
+    while let Some(term) = ctx.receive_next().expect("receive_next") {
+        messages.push(term);
+        ctx.receive_remove().expect("remove_message");
+        assert!(messages.len() < 16, "the mailbox keeps draining: {messages:?}");
+    }
+    messages
+}
+
+/// Every message in the mailbox of a context that runs against the runtime's **own** table.
+fn drain_self(ctx: &mut RuntimeContext<'_>) -> Vec<Eterm> {
     ctx.receive_reset().expect("timeout");
     let mut messages = Vec::new();
     while let Some(term) = ctx.receive_next().expect("receive_next") {
@@ -42,11 +74,11 @@ fn element(term: Eterm, index: usize) -> Eterm {
 }
 
 /// A `[send]`-traced process's `send` delivers the payload and then `{trace, Sender, send, Msg,
-/// To}` — with `Sender`/`To` the sending process (a self-send) and `Msg` the message.
+/// To}` to its tracer — `Sender` the sending process, `To` the destination the send carried and
+/// `Msg` the message.
 #[test]
 fn a_send_traced_sender_emits_the_trace_send_event() {
     let mut rt = runtime();
-    let pid = rt.self_pid().to_eterm();
     let how_true = rt.intern("true");
     let send_flags = rt.eval("[send]").expect("[send]");
     let message = rt.intern("hello");
@@ -54,35 +86,44 @@ fn a_send_traced_sender_emits_the_trace_send_event() {
     let send = rt.intern("send");
 
     let mut sink = NullSink;
-    let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
+    let (mut table, sender, tracer) = two_processes(&mut rt);
+    let sender_term = sender.to_eterm();
 
-    // `erlang:trace(self(), true, [send])` -> 1 tracee.
-    let count = ctx
-        .call_bif("erlang", "trace", 3, &[pid, how_true, send_flags])
-        .expect("trace/3");
-    assert_eq!(signed_value(count), 1, "the calling process became the tracee");
+    // The **tracer** traces the sender: `erlang:trace(Sender, true, [send])` from the tracer's
+    // own context installs the tracer as the tracee's reporter.
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, tracer);
+        let count = ctx
+            .call_bif("erlang", "trace", 3, &[sender_term, how_true, send_flags])
+            .expect("trace/3");
+        assert_eq!(signed_value(count), 1, "the sender became the tracee");
+    }
+    // The sender sends to itself: the payload lands in its mailbox, the event goes to the tracer.
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, sender);
+        ctx.send_message(sender_term, message).expect("send");
+        let _ = &mut sink;
+    }
 
-    ctx.send_message(pid, message).expect("send");
+    // The sender's mailbox holds the payload alone.
+    assert_eq!(drain(&mut rt, &mut table, sender), vec![message]);
 
-    let messages = drain(&mut ctx);
-    assert_eq!(messages.len(), 2, "the payload and the event: {messages:?}");
-    // The payload is delivered first, untouched.
-    assert_eq!(messages[0], message);
-    // Then the event: `{trace, Sender, send, Msg, To}`.
-    let event = messages[1];
+    // The tracer's mailbox holds the event: `{trace, Sender, send, Msg, To}`.
+    let messages = drain(&mut rt, &mut table, tracer);
+    assert_eq!(messages.len(), 1, "the event: {messages:?}");
+    let event = messages[0];
     assert_eq!(terms::tuple_arity(event).expect("a tuple"), 5);
     assert_eq!(element(event, 0), trace);
-    assert_eq!(element(event, 1), pid, "the *sending* process");
+    assert_eq!(element(event, 1), sender_term, "the *sending* process");
     assert_eq!(element(event, 2), send);
     assert_eq!(element(event, 3), message);
-    assert_eq!(element(event, 4), pid, "the destination, as the send carried it");
+    assert_eq!(element(event, 4), sender_term, "the destination, as the send carried it");
 }
 
 /// The `timestamp` flag makes the tag `trace_ts` and appends `{MegaSecs, Secs, MicroSecs}`.
 #[test]
 fn the_timestamp_flag_yields_a_trace_ts_with_a_trailing_triple() {
     let mut rt = runtime();
-    let pid = rt.self_pid().to_eterm();
     let how_true = rt.intern("true");
     let flags = rt.eval("[send, timestamp]").expect("[send, timestamp]");
     let message = rt.intern("hello");
@@ -90,24 +131,31 @@ fn the_timestamp_flag_yields_a_trace_ts_with_a_trailing_triple() {
     let send = rt.intern("send");
 
     let mut sink = NullSink;
-    let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
+    let (mut table, sender, tracer) = two_processes(&mut rt);
+    let sender_term = sender.to_eterm();
 
-    let count = ctx
-        .call_bif("erlang", "trace", 3, &[pid, how_true, flags])
-        .expect("trace/3");
-    assert_eq!(signed_value(count), 1);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, tracer);
+        let count = ctx
+            .call_bif("erlang", "trace", 3, &[sender_term, how_true, flags])
+            .expect("trace/3");
+        assert_eq!(signed_value(count), 1);
+    }
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, sender);
+        ctx.send_message(sender_term, message).expect("send");
+        let _ = &mut sink;
+    }
 
-    ctx.send_message(pid, message).expect("send");
-
-    let messages = drain(&mut ctx);
-    assert_eq!(messages.len(), 2, "{messages:?}");
-    let event = messages[1];
+    let messages = drain(&mut rt, &mut table, tracer);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    let event = messages[0];
     assert_eq!(terms::tuple_arity(event).expect("a tuple"), 6, "the stamp is appended");
     assert_eq!(element(event, 0), trace_ts, "a time-stamped event is a trace_ts");
-    assert_eq!(element(event, 1), pid);
+    assert_eq!(element(event, 1), sender_term);
     assert_eq!(element(event, 2), send);
     assert_eq!(element(event, 3), message);
-    assert_eq!(element(event, 4), pid);
+    assert_eq!(element(event, 4), sender_term);
 
     // The trailing element is the wall-clock `erlang:timestamp/0` triple.
     let stamp = element(event, 5);
@@ -121,6 +169,43 @@ fn the_timestamp_flag_yields_a_trace_ts_with_a_trailing_triple() {
     assert!(signed_value(mega) > 0, "a wall clock after the epoch");
     assert!(signed_value(secs) < 1_000_000, "the split's remainder");
     assert!(signed_value(micro) < 1_000_000, "microseconds");
+}
+
+/// A process that traces **itself** (`erlang:trace(self(), true, [send])`, whose default tracer
+/// is the calling process) observes **no** event of its own: ERTS discards an event whose tracer
+/// IS the tracee (`erl_tracer_nif.c:143-146`). Oracle probe (OTP 29.1.1 / erts-17.1):
+/// `erlang:trace(self(), true, [send]), self() ! hello` leaves only `hello` in the mailbox.
+#[test]
+fn a_self_traced_process_observes_no_event_of_its_own() {
+    let mut rt = runtime();
+    let pid = rt.self_pid().to_eterm();
+    let how_true = rt.intern("true");
+    let send_flags = rt.eval("[send]").expect("[send]");
+    let message = rt.intern("hello");
+
+    let mut sink = NullSink;
+    let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
+
+    let count = ctx
+        .call_bif("erlang", "trace", 3, &[pid, how_true, send_flags])
+        .expect("trace/3");
+    assert_eq!(signed_value(count), 1, "the calling process became the tracee");
+
+    ctx.send_message(pid, message).expect("send");
+    assert_eq!(
+        {
+            ctx.receive_reset().expect("timeout");
+            let mut messages = Vec::new();
+            while let Some(term) = ctx.receive_next().expect("receive_next") {
+                messages.push(term);
+                ctx.receive_remove().expect("remove_message");
+                assert!(messages.len() < 8, "the mailbox keeps draining: {messages:?}");
+            }
+            messages
+        },
+        vec![message],
+        "no `{{trace, …}}` event is delivered to the tracee itself"
+    );
 }
 
 /// An **untraced** sender emits nothing, and neither does one traced with a flag set that does
@@ -137,7 +222,7 @@ fn an_untraced_sender_emits_nothing() {
     let mut sink = NullSink;
     let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
     ctx.send_message(pid, message).expect("send");
-    assert_eq!(drain(&mut ctx), vec![message], "only the payload");
+    assert_eq!(drain_self(&mut ctx), vec![message], "only the payload");
 
     // `[call]` — a real tracee, but the `send` bit is not set (the flag lives on the *sending*
     // process, and here it is set without `send`).
@@ -146,7 +231,7 @@ fn an_untraced_sender_emits_nothing() {
         .expect("trace/3");
     assert_eq!(signed_value(count), 1);
     ctx.send_message(pid, message).expect("send");
-    assert_eq!(drain(&mut ctx), vec![message], "no event for a `[call]` tracee");
+    assert_eq!(drain_self(&mut ctx), vec![message], "no event for a `[call]` tracee");
 }
 
 /// A `send`-flagged sequential-trace token on the sender: the send **stamps** the token's serial
@@ -180,7 +265,7 @@ fn a_seq_trace_send_token_stamps_the_serial_and_emits_no_message_without_a_trace
 
     ctx.send_message(pid, message).expect("send");
     assert_eq!(
-        drain(&mut ctx),
+        drain_self(&mut ctx),
         vec![message],
         "no system tracer is configured, so no seq_trace event is delivered"
     );

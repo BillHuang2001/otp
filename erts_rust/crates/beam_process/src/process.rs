@@ -21,7 +21,7 @@ use beam_term::prelude::Eterm;
 use crate::dict::Dict;
 use crate::fragments::SavedArgs;
 use crate::link::Links;
-use crate::monitor::{MonitoredBy, Monitors};
+use crate::monitor::{MonitoredBy, Monitors, PortWatch};
 use crate::pid::ProcessId;
 use crate::registers::Registers;
 use crate::run_queue::Priority;
@@ -42,6 +42,31 @@ pub enum ProcessState {
     Exiting,
     /// Fully terminated; the PCB is waiting to be reclaimed.
     Terminated,
+}
+
+impl ProcessState {
+    /// The atom `erlang:process_info(P, status)` reports for this state.
+    ///
+    /// This is the oracle's status set (`OTP 29.1.1` / `erts-17.1`): a process blocked in
+    /// `receive` reports `waiting`, a freshly spawned process that has not run yet reports
+    /// `runnable`, and a running process reports `running`. A **terminated** process has no
+    /// status at all — the oracle's whole `process_info` call returns `undefined` for a dead
+    /// pid — so [`ProcessState::Terminated`] maps to `None` and the BIF layer renders
+    /// `undefined`.
+    ///
+    /// The transient `garbage_collecting` status is deliberately **not** produced here: it
+    /// overrides the state *while a process is being collected*, so it is layered on top by
+    /// [`Process::status`].
+    pub fn status_atom(&self) -> Option<&'static str> {
+        match self {
+            ProcessState::Running => Some("running"),
+            ProcessState::Runnable => Some("runnable"),
+            ProcessState::Waiting => Some("waiting"),
+            ProcessState::Suspended => Some("suspended"),
+            ProcessState::Exiting => Some("exiting"),
+            ProcessState::Terminated => None,
+        }
+    }
 }
 
 /// What a successful [`Process::deliver`] did with the recipient.
@@ -221,6 +246,13 @@ pub struct Process {
     links: Links,
     /// Outgoing monitors.
     monitors: Monitors,
+    /// Outgoing **port** monitors: the ports this process watches
+    /// (`erlang:monitor(port, Port)`).
+    ///
+    /// A [`PortWatch`] holds only plain values (a reference and a port number), **not** heap
+    /// terms, so this set is **not** a GC root and adds nothing to
+    /// [`Process::collect`]'s root set.
+    port_monitors: Vec<PortWatch>,
     /// Incoming monitors (who monitors this process).
     monitored_by: Vec<MonitoredBy>,
     /// The termination reason, once the process has exited.
@@ -239,10 +271,35 @@ impl Process {
 
     /// A new process with pid `pid` and an explicit heap-size `policy`.
     ///
+    /// Spawns at the default [`Priority::Normal`] priority; use
+    /// [`Process::with_policy_and_priority`] to be born at a non-normal priority.
+    ///
     /// # Errors
     ///
     /// Propagates heap-allocation failure when the initial spaces cannot be allocated.
     pub fn with_policy(pid: ProcessId, policy: HeapPolicy) -> Result<Process> {
+        Process::with_policy_and_priority(pid, policy, Priority::Normal)
+    }
+
+    /// A new process with pid `pid`, an explicit heap-size `policy` and an initial scheduling
+    /// `priority`.
+    ///
+    /// This is how a runtime spawns a process that is **born** at a non-normal priority without
+    /// a race: compose `table.alloc_pid()` + `Process::with_policy_and_priority(pid, policy,
+    /// priority)` + `table.insert(process)` and then enqueue the pid at `priority`. The pid is
+    /// not visible to any scheduler until `insert`, so the process is never requeued — nothing
+    /// observes it at the wrong level. ([`crate::ptab::ProcessTable::spawn`] hard-sets
+    /// [`Priority::Normal`]; a `spawn_opt(..., [{priority, P}])` therefore allocates the pid and
+    /// inserts the PCB itself.)
+    ///
+    /// # Errors
+    ///
+    /// Propagates heap-allocation failure when the initial spaces cannot be allocated.
+    pub fn with_policy_and_priority(
+        pid: ProcessId,
+        policy: HeapPolicy,
+        priority: Priority,
+    ) -> Result<Process> {
         // A freshly spawned process is runnable and schedulable: mark the `active` flag so
         // the rest of the runtime can tell a live PCB from a recycled slot.
         let mut flags = ProcessFlags::new();
@@ -251,7 +308,7 @@ impl Process {
             pid,
             state: ProcessState::Runnable,
             flags,
-            priority: Priority::Normal,
+            priority,
             save_calls: 0,
             collector: Collector::new(policy)?,
             off_heap: OffHeapTable::new(),
@@ -263,6 +320,7 @@ impl Process {
             reductions: 0,
             links: Links::new(),
             monitors: Monitors::new(),
+            port_monitors: Vec::new(),
             monitored_by: Vec::new(),
             exit_reason: None,
         })
@@ -281,6 +339,33 @@ impl Process {
     /// Sets the scheduler-visible state.
     pub fn set_state(&mut self, state: ProcessState) {
         self.state = state;
+    }
+
+    /// The atom `erlang:process_info(P, status)` reports for this process, or `None` when the
+    /// process is gone (the BIF renders `undefined`).
+    ///
+    /// The mapping layers the transient `garbage_collecting` status over the scheduler state:
+    ///
+    /// * a **[`ProcessState::Terminated`]** process has no status at all -> `None`, matching the
+    ///   oracle, whose entire `process_info` call returns `undefined` for a dead pid;
+    /// * while the `garbage_collecting` flag is set the process is in GC, and ERTS reports
+    ///   `garbage_collecting` **instead of** `running` — the flag is only meaningfully set while
+    ///   the process is executing, so it is layered on top of the state;
+    /// * otherwise the state's own atom ([`ProcessState::status_atom`]).
+    ///
+    /// Honest note on the oracle: the `garbage_collecting` window is transient and we could not
+    /// force `erl` to expose it from a busy poll (only `runnable`/`running` were observed), so
+    /// this mapping is defined from ERTS's documented status set plus this crate's
+    /// `garbage_collecting` flag rather than from a captured oracle sample. The other five atoms
+    /// are the oracle's own.
+    pub fn status(&self) -> Option<&'static str> {
+        if self.state == ProcessState::Terminated {
+            return None;
+        }
+        if self.flags.garbage_collecting() {
+            return Some("garbage_collecting");
+        }
+        self.state.status_atom()
     }
 
     /// Makes this process runnable if it is currently blocked.
@@ -482,6 +567,22 @@ impl Process {
         &self.monitored_by
     }
 
+    /// The outgoing **port** monitors: the ports this process watches
+    /// (`erlang:monitor(port, Port)`).
+    ///
+    /// This is the outgoing half a port monitor needs for `erlang:demonitor/1` and for
+    /// `erlang:process_info(P, monitors)`; the incoming half lives in the
+    /// [`PortTable`](crate::port::PortTable). A [`PortWatch`] is a pair of plain values, so
+    /// the set is not part of [`Process::collect`]'s root set.
+    pub fn port_monitors(&self) -> &[PortWatch] {
+        &self.port_monitors
+    }
+
+    /// The outgoing port monitors, mutably.
+    pub fn port_monitors_mut(&mut self) -> &mut Vec<PortWatch> {
+        &mut self.port_monitors
+    }
+
     /// The monitors watching this process, mutably.
     pub fn monitored_by_mut(&mut self) -> &mut Vec<MonitoredBy> {
         &mut self.monitored_by
@@ -605,6 +706,10 @@ impl Process {
     /// dict, the saved args and the pending signals scattered back) in the SAME order it was
     /// gathered.
     ///
+    /// The outgoing port-monitor set ([`Process::port_monitors`]) is deliberately **not**
+    /// gathered: a [`PortWatch`] holds a reference and a port number, both plain values
+    /// rather than heap terms, so it cannot be relocated and needs no root.
+    ///
     /// # Errors
     ///
     /// Propagates the collector's and the rebuilding allocations' `BeamError`s.
@@ -712,6 +817,7 @@ mod tests {
 
     use super::*;
     use crate::monitor::{Monitor, MonitorKind, RefAllocator};
+    use crate::pid::PortId;
     use crate::signal::SignalAtoms;
 
     fn pid(number: u64) -> ProcessId {
@@ -768,6 +874,76 @@ mod tests {
         assert_eq!(process.priority(), Priority::Max);
         process.set_priority(Priority::Low);
         assert_eq!(process.priority(), Priority::Low);
+    }
+
+    #[test]
+    fn every_process_state_maps_to_its_oracle_status_atom() {
+        assert_eq!(ProcessState::Running.status_atom(), Some("running"));
+        assert_eq!(ProcessState::Runnable.status_atom(), Some("runnable"));
+        assert_eq!(ProcessState::Waiting.status_atom(), Some("waiting"));
+        assert_eq!(ProcessState::Suspended.status_atom(), Some("suspended"));
+        assert_eq!(ProcessState::Exiting.status_atom(), Some("exiting"));
+        assert_eq!(
+            ProcessState::Terminated.status_atom(),
+            None,
+            "a dead process has no status"
+        );
+    }
+
+    #[test]
+    fn status_layers_garbage_collecting_over_the_state() {
+        let mut process = Process::new(pid(20)).expect("the default heap allocates");
+
+        // A fresh process is runnable.
+        assert_eq!(process.status(), Some("runnable"));
+
+        // The `garbage_collecting` flag overrides the state while it is set (the flag is only
+        // meaningfully set while the process is executing).
+        process.set_state(ProcessState::Running);
+        assert_eq!(process.status(), Some("running"));
+        process.flags_mut().set_garbage_collecting(true);
+        assert_eq!(process.status(), Some("garbage_collecting"));
+        process.flags_mut().set_garbage_collecting(false);
+        assert_eq!(process.status(), Some("running"));
+
+        // Every non-terminated state still reports its own atom with the flag cleared.
+        for state in [
+            ProcessState::Runnable,
+            ProcessState::Waiting,
+            ProcessState::Suspended,
+            ProcessState::Exiting,
+        ] {
+            process.set_state(state);
+            assert_eq!(process.status(), state.status_atom());
+        }
+
+        // A terminated process reports `None` — even with the flag (stale) set.
+        process.set_state(ProcessState::Terminated);
+        assert_eq!(process.status(), None);
+        process.flags_mut().set_garbage_collecting(true);
+        assert_eq!(
+            process.status(),
+            None,
+            "a terminated process has no status at all"
+        );
+    }
+
+    #[test]
+    fn with_policy_and_priority_births_at_the_given_priority() {
+        // The default constructor and `with_policy` both spawn at normal ...
+        let default = Process::new(pid(21)).expect("the default heap allocates");
+        assert_eq!(default.priority(), Priority::Normal);
+        let policy = Process::with_policy(pid(22), HeapPolicy::default())
+            .expect("the default heap allocates");
+        assert_eq!(policy.priority(), Priority::Normal);
+
+        // ... while `with_policy_and_priority` births the process at the requested level.
+        let high = Process::with_policy_and_priority(pid(23), HeapPolicy::default(), Priority::High)
+            .expect("the default heap allocates");
+        assert_eq!(high.priority(), Priority::High);
+        assert_eq!(high.state(), ProcessState::Runnable);
+        assert!(high.flags().active(), "a spawned process is active");
+        assert_eq!(high.pid(), pid(23));
     }
 
     #[test]
@@ -850,6 +1026,18 @@ mod tests {
         });
         assert_eq!(process.monitored_by().len(), 1);
         assert_eq!(process.monitored_by()[0].watcher, pid(5));
+
+        // The outgoing port-monitor set is reachable too, and starts empty.
+        assert!(process.port_monitors().is_empty());
+        let port_reference = RefAllocator::new().next();
+        let port = PortId::new(11);
+        process.port_monitors_mut().push(PortWatch {
+            reference: port_reference,
+            port,
+        });
+        assert_eq!(process.port_monitors().len(), 1);
+        assert_eq!(process.port_monitors()[0].reference, port_reference);
+        assert_eq!(process.port_monitors()[0].port, port);
     }
 
     #[test]

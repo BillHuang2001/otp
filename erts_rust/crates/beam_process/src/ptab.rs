@@ -43,10 +43,12 @@ use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_gc::HeapPolicy;
 use beam_message::{Message, MsoHandle, OffHeapTable};
-use beam_term::prelude::{Atom, Eterm};
+use beam_term::prelude::{atom_val, is_atom, make_atom, Atom, Eterm};
 
 use crate::error;
-use crate::monitor::{Monitor, MonitorKind, MonitorRef, MonitoredBy, RefAllocator};
+use crate::monitor::{
+    payload_is_down_for, Monitor, MonitorKind, MonitorRef, MonitoredBy, PortWatch, RefAllocator,
+};
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::port::PortTable;
 use crate::process::{DeliverOutcome, Process, ProcessState};
@@ -76,6 +78,23 @@ pub enum ExitEffect {
 struct Slot {
     serial: u64,
     process: Option<Process>,
+}
+
+/// The target descriptor of a **named** monitor (`erlang:monitor(process, Name)`).
+///
+/// `Monitor`/`MonitoredBy` carry a [`ProcessId`] target only, and their shape is frozen (it is
+/// constructed by struct literal downstream), so the `{Name, LocalNode}` target a named monitor
+/// reports in its `{'DOWN', …}` is kept beside them, keyed by the monitor reference, in
+/// [`ProcessTable::named_monitors`].
+///
+/// Both fields are **atoms — immediates** — so this record introduces no GC rootset and never
+/// holds a term that could be relocated by a collection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct NamedTarget {
+    /// The registered name that was monitored.
+    name: Atom,
+    /// The node the name was resolved on (the local node, spelled into the DOWN target).
+    node: Atom,
 }
 
 /// Borrows the live process named by `pid`, verifying the slot serial first.
@@ -203,6 +222,14 @@ pub struct ProcessTable {
     remote_links: HashMap<ProcessId, Vec<RemotePid>>,
     /// Per local process: its outgoing monitors on remote processes/ports.
     remote_monitors: HashMap<ProcessId, Vec<RemoteMonitor>>,
+    /// The target descriptor of every **named** monitor (`erlang:monitor(process, Name)`), keyed
+    /// by its reference (see [`NamedTarget`]). An entry dies with its monitor: `demonitor`, the
+    /// dying holder's outgoing-monitor sweep and a delivered DOWN all remove it.
+    named_monitors: HashMap<MonitorRef, NamedTarget>,
+    /// The atom naming the **local node**, used to spell the `{Name, LocalNode}` target of a
+    /// named monitor. `None` until [`ProcessTable::set_local_node`] installs it; a named monitor
+    /// requested without it is a typed [`error::unsupported`] rather than a wrong target.
+    local_node: Option<Atom>,
     /// The distribution seam (see [`DistSignalRouter`]); `None` means **record-only** — the
     /// local relationship is still tracked, only the wire signal is dropped (a node with no
     /// distribution configured).
@@ -221,6 +248,8 @@ impl ProcessTable {
             ready: Vec::new(),
             remote_links: HashMap::new(),
             remote_monitors: HashMap::new(),
+            named_monitors: HashMap::new(),
+            local_node: None,
             router: None,
         }
     }    // --- allocation / lookup -------------------------------------------------
@@ -332,6 +361,29 @@ impl ProcessTable {
     /// Whether `pid` names a live process.
     pub fn contains(&self, pid: ProcessId) -> bool {
         lookup(&self.slots, pid).is_some()
+    }
+
+    /// Whether `pid` names a live process (`erlang:is_process_alive/1`).
+    ///
+    /// The liveness test for the `spawn*`/`monitor`/`send` BIFs; it is exactly
+    /// [`ProcessTable::contains`], named for the observable it answers.
+    pub fn is_process_alive(&self, pid: ProcessId) -> bool {
+        self.contains(pid)
+    }
+
+    /// The termination reason recorded on `pid`'s PCB, if it has one.
+    ///
+    /// `Ok(None)` means the process is live and has not terminated yet. This is the source for
+    /// `erlang:process_info/2`'s exit-reason item and for the reason a linked/monitoring peer is
+    /// told.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `pid` is unknown (or stale).
+    pub fn exit_reason(&self, pid: ProcessId) -> Result<Option<Eterm>> {
+        self.get(pid)
+            .map(Process::exit_reason)
+            .ok_or_else(error::unknown_process)
     }
 
     /// The number of live processes.
@@ -534,19 +586,34 @@ impl ProcessTable {
 
     /// Installs a monitor from `watcher` on `target` and returns its reference.
     ///
+    /// A **live** `target` records both halves of the monitor (an outgoing [`Monitor`] on the
+    /// watcher, an incoming [`MonitoredBy`] on the target). A `target` that is not a live local
+    /// process — a dead pid, or a pid that never existed — is **not** an error: the reference is
+    /// still allocated and the watcher immediately receives the
+    /// `{'DOWN', Ref, process, Target, noproc}` the oracle delivers, and **no** monitor entry is
+    /// recorded (there is nothing left to watch).
+    ///
     /// # Errors
     ///
-    /// Returns `BeamError::TermNotFound` when either pid is unknown.
+    /// Returns `BeamError::TermNotFound` when the **watcher** is unknown; propagates the message
+    /// builder's `BeamError::Alloc` when the immediate DOWN does not fit the watcher's heap.
     pub fn monitor(
         &mut self,
         watcher: ProcessId,
         target: ProcessId,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
-        if !self.contains(watcher) || !self.contains(target) {
+        if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
         let reference = self.refs.next();
+        if !self.contains(target) {
+            // Nothing to watch: the monitor is born down (`noproc`), and the watcher is told so
+            // right away. No entry is recorded, so a later `demonitor` finds no local half — it
+            // reports `false`, exactly like a monitor that is already gone.
+            self.deliver_noproc_down(watcher, reference, target.to_eterm())?;
+            return Ok(reference);
+        }
         if let Some(process) = self.get_mut(watcher) {
             process.monitors_mut().push(Monitor {
                 reference,
@@ -562,6 +629,289 @@ impl ProcessTable {
             });
         }
         Ok(reference)
+    }
+
+    /// Enqueues the immediate `{'DOWN', Ref, process, Target, noproc}` of a monitor on a
+    /// non-live target into `watcher`'s mailbox — built on the watcher's own heap — and wakes a
+    /// blocked watcher.
+    ///
+    /// Mirrors [`ProcessTable::enqueue_port_down_message`]: the build goes through
+    /// [`build_signal_term`] (so a full heap is a collection and a retry, never fatal) and the
+    /// wake is recorded on the wake list. `target` must be an immediate (a pid term or a
+    /// `{Name, Node}` pair the closure materialises itself); the `noproc` reason is an atom
+    /// immediate, so nothing relocates. An unknown watcher is a no-op (the caller has already
+    /// checked it, so only a mid-call death can reach this).
+    fn deliver_noproc_down(
+        &mut self,
+        watcher: ProcessId,
+        reference: MonitorRef,
+        target: Eterm,
+    ) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let reason = atoms.noproc_term();
+            let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
+                return Ok(());
+            };
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
+                let reference_term = reference.to_eterm(heap)?;
+                let term = build_down_message_term(
+                    heap,
+                    atoms,
+                    reference_term,
+                    atoms.process(),
+                    target,
+                    reason,
+                )?;
+                Ok((term, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, target).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(watcher);
+        }
+        Ok(())
+    }
+
+    /// Enqueues the immediate `{'DOWN', Ref, process, {Name, Node}, noproc}` of a **named**
+    /// monitor on an unregistered name into `watcher`'s mailbox, and wakes a blocked watcher.
+    ///
+    /// The `{Name, Node}` target is materialised on the watcher's own heap *inside* the
+    /// [`build_signal_term`] closure, so a collect-and-retry never leaves a stale word behind.
+    fn deliver_named_noproc_down(
+        &mut self,
+        watcher: ProcessId,
+        reference: MonitorRef,
+        name: Atom,
+        node: Atom,
+    ) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let reason = atoms.noproc_term();
+            let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
+                return Ok(());
+            };
+            let (term, target, off_heap) = build_signal_term(recipient, |heap| {
+                let reference_term = reference.to_eterm(heap)?;
+                let target = heap.tuple(&[make_atom(name), make_atom(node)])?;
+                let term = build_down_message_term(
+                    heap,
+                    atoms,
+                    reference_term,
+                    atoms.process(),
+                    target,
+                    reason,
+                )?;
+                Ok((term, target, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, target).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(watcher);
+        }
+        Ok(())
+    }
+
+    // --- named monitors ------------------------------------------------------
+
+    /// Installs the atom that names the **local node** (e.g. `nonode@nohost`).
+    ///
+    /// A named monitor spells its DOWN target as `{Name, <this atom>}`, so the runtime (which
+    /// owns the node's identity) must install it. Until then a named monitor is a typed
+    /// [`error::unsupported`], never a guessed target.
+    pub fn set_local_node(&mut self, node: Atom) {
+        self.local_node = Some(node);
+    }
+
+    /// The atom naming the local node, once [`ProcessTable::set_local_node`] installed it.
+    pub fn local_node(&self) -> Option<Atom> {
+        self.local_node
+    }
+
+    /// Installs a monitor from `watcher` on the **registered name** `name`, resolving the target
+    /// on the node `node` (`erlang:monitor(process, Name)`).
+    ///
+    /// A **live** registered name resolves to its process and records the ordinary monitor halves
+    /// (an outgoing [`Monitor`] on the watcher, an incoming [`MonitoredBy`] on the target); the
+    /// `{Name, node}` descriptor is recorded beside them, so the eventual `{'DOWN', …}` carries
+    /// the **name** rather than the pid — exactly what the oracle does. An **unregistered** name
+    /// (or one whose process has died) yields the immediate
+    /// `{'DOWN', Ref, process, {Name, node}, noproc}` and records nothing.
+    ///
+    /// A [`MonitorKind::Port`] is rejected with the typed [`error::named_port_monitor`]: this
+    /// registry resolves names to processes, so a **named port** monitor
+    /// (`erlang:monitor(port, Name)`) has no faithful resolution here (see
+    /// [`ProcessTable::monitor_port_term`] for the port-term form).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when the watcher is unknown; propagates the message
+    /// builder's `BeamError::Alloc` when the immediate DOWN does not fit the watcher's heap.
+    pub fn monitor_named(
+        &mut self,
+        watcher: ProcessId,
+        name: Atom,
+        node: Atom,
+        kind: MonitorKind,
+    ) -> Result<MonitorRef> {
+        if !self.contains(watcher) {
+            return Err(error::unknown_process());
+        }
+        if kind == MonitorKind::Port {
+            // `erlang:monitor(port, Name)`: this registry resolves names to **processes**, so a
+            // named port monitor has no faithful resolution here. Recording the process the
+            // name resolves to would be a wrong (process) monitor; the typed diagnostic is the
+            // honest answer.
+            return Err(error::named_port_monitor());
+        }
+        let reference = self.refs.next();
+        // `whereis` already resolves "registered but its process is gone" to `None`.
+        let Some(target) = self.whereis(name) else {
+            self.deliver_named_noproc_down(watcher, reference, name, node)?;
+            return Ok(reference);
+        };
+        if let Some(process) = self.get_mut(watcher) {
+            process.monitors_mut().push(Monitor {
+                reference,
+                target,
+                kind,
+            });
+        }
+        if let Some(process) = self.get_mut(target) {
+            process.monitored_by_mut().push(MonitoredBy {
+                reference,
+                watcher,
+                kind,
+            });
+        }
+        self.named_monitors
+            .insert(reference, NamedTarget { name, node });
+        Ok(reference)
+    }
+
+    // --- port monitors -------------------------------------------------------
+
+    /// Installs a **port** monitor from `watcher` on `port` and returns its reference
+    /// (`erlang:monitor(port, Port)`).
+    ///
+    /// Both halves are recorded: the watcher keeps the outgoing [`PortWatch`] — so
+    /// [`ProcessTable::demonitor_port`] and `erlang:process_info(P, monitors)` can see it —
+    /// and the port keeps the incoming [`PortMonitor`](crate::port::PortMonitor), so
+    /// [`ProcessTable::port_closed`] resolves the pair with
+    /// `{'DOWN', Ref, port, Port, Reason}`.
+    ///
+    /// A `port` that is **not** currently allocated is *not* an error: like
+    /// [`ProcessTable::monitor`] on a dead pid, the monitor is born down and the watcher
+    /// immediately receives `{'DOWN', Ref, port, Port, noproc}`, while no entry is recorded on
+    /// either side (so a later [`ProcessTable::demonitor_port`] reports `false`). This is the
+    /// oracle's behaviour (`erlang:monitor(port, ClosedPort)` answers a reference and fires a
+    /// `noproc` DOWN).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when the **watcher** is unknown; propagates the
+    /// message builder's `BeamError::Alloc` when the immediate DOWN does not fit the watcher's
+    /// heap.
+    pub fn monitor_port(
+        &mut self,
+        watcher: ProcessId,
+        port: PortId,
+        ports: &mut PortTable,
+    ) -> Result<MonitorRef> {
+        if !self.contains(watcher) {
+            return Err(error::unknown_process());
+        }
+        let reference = self.refs.next();
+        if !ports.contains(port) {
+            // Nothing to watch: the port is already gone. Tell the watcher right away and
+            // record nothing, exactly as the pid path does for a dead pid.
+            let reason = self.atoms.noproc_term();
+            self.enqueue_port_down_message(watcher, reference, port, reason)?;
+            return Ok(reference);
+        }
+        ports.monitor(port, watcher, reference)?;
+        if let Some(process) = self.get_mut(watcher) {
+            process
+                .port_monitors_mut()
+                .push(PortWatch { reference, port });
+        }
+        Ok(reference)
+    }
+
+    /// `erlang:monitor(port, Target)` against a term: the typed port-monitor entry point.
+    ///
+    /// `Target` must be a live-or-closed **port** term; a registered **name** is rejected with
+    /// the typed [`error::named_port_monitor`] (the local registry holds processes only), so
+    /// this never records a process monitor for a port-typed request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `target` is not a port — the oracle's `badarg` for
+    /// `erlang:monitor(port, NotAPort)`; otherwise propagates [`ProcessTable::monitor_port`].
+    pub fn monitor_port_term(
+        &mut self,
+        watcher: ProcessId,
+        target: Eterm,
+        ports: &mut PortTable,
+    ) -> Result<MonitorRef> {
+        if is_atom(target) {
+            return Err(error::named_port_monitor());
+        }
+        let port = PortId::from_eterm(target)?;
+        self.monitor_port(watcher, port, ports)
+    }
+
+    /// Removes the **port** monitor `watcher` holds under `reference`, reporting whether it
+    /// existed.
+    ///
+    /// This is the port counterpart of [`ProcessTable::demonitor`], which has no handle on a
+    /// [`PortTable`]. The `erlang:demonitor/1` BIF layer must therefore try this **first** and
+    /// fall back to [`ProcessTable::demonitor`] (then to
+    /// [`ProcessTable::demonitor_flush`] for the `[flush]` option) when it reports `false`:
+    ///
+    /// ```text
+    /// if !table.demonitor_port(watcher, reference, ports)? {
+    ///     table.demonitor(watcher, reference)?;
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when the **watcher** is unknown. A port that has
+    /// already closed is **not** an error: [`ProcessTable::port_closed`] has already resolved
+    /// and dropped the monitor, so this reports `false` (like `demonitor` of a monitor that is
+    /// already gone).
+    pub fn demonitor_port(
+        &mut self,
+        watcher: ProcessId,
+        reference: MonitorRef,
+        ports: &mut PortTable,
+    ) -> Result<bool> {
+        if !self.contains(watcher) {
+            return Err(error::unknown_process());
+        }
+        let watch = self.get_mut(watcher).and_then(|process| {
+            let entries = process.port_monitors_mut();
+            let index = entries
+                .iter()
+                .position(|watch| watch.reference == reference)?;
+            Some(entries.remove(index))
+        });
+        let Some(watch) = watch else {
+            return Ok(false);
+        };
+        // The incoming half lives on the port; a port that closed earlier has already drained
+        // it, so an unallocated id here is expected rather than an error.
+        if ports.contains(watch.port) {
+            ports.demonitor(watch.port, reference)?;
+        }
+        Ok(true)
     }
 
     /// Removes the outgoing monitor `watcher` holds under `reference`, reporting whether it
@@ -592,7 +942,62 @@ impl ProcessTable {
                 .monitored_by_mut()
                 .retain(|entry| entry.reference != reference);
         }
+        // A named monitor's `{Name, node}` descriptor dies with it.
+        self.named_monitors.remove(&reference);
         Ok(true)
+    }
+
+    /// `erlang:demonitor(Ref, [flush])`: [`ProcessTable::demonitor`] **and** the removal of any
+    /// already-queued `{'DOWN', Ref, …}` from `watcher`'s mailbox.
+    ///
+    /// The monitor halves are dropped first (so the usual local/remote routing still happens),
+    /// then the mailbox is scanned with the queue cursor API and every message recognised by
+    /// [`payload_is_down_for`] as *this* reference's DOWN is removed. A fresh cursor is derived
+    /// after each removal because a removal shifts every later message down by one.
+    ///
+    /// # Return value
+    ///
+    /// `true` when the monitor existed **or** a queued DOWN was removed; the BIF layer renders
+    /// `erlang:demonitor/2` as unconditional `true` (the oracle's result), so this `bool` means
+    /// "something was removed here", exactly like [`ProcessTable::demonitor`]'s.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `watcher` is unknown; propagates the router's
+    /// transport errors for a remote monitor.
+    pub fn demonitor_flush(
+        &mut self,
+        watcher: ProcessId,
+        reference: MonitorRef,
+    ) -> Result<bool> {
+        if !self.contains(watcher) {
+            return Err(error::unknown_process());
+        }
+        let existed = self.demonitor(watcher, reference)?;
+        let down = self.atoms.down();
+        let removed = {
+            let Some(process) = self.get_mut(watcher) else {
+                return Ok(existed);
+            };
+            let mailbox = process.mailbox_mut();
+            let mut removed = false;
+            let mut cursor = mailbox.cursor();
+            loop {
+                let position = mailbox.position(cursor);
+                match mailbox.message_at(cursor).map(|message| message.payload()) {
+                    Some(payload) if payload_is_down_for(payload, reference, down) => {
+                        mailbox.remove_at(cursor);
+                        removed = true;
+                        // Positions shifted down by one: re-derive a cursor at the same index.
+                        cursor = mailbox.cursor_at(position);
+                    }
+                    Some(_) => mailbox.advance(&mut cursor),
+                    None => break,
+                }
+            }
+            removed
+        };
+        Ok(existed || removed)
     }
 
     /// Removes the outgoing **remote** monitor `watcher` holds under `reference`, reporting
@@ -716,13 +1121,17 @@ impl ProcessTable {
             receivers.push(watcher.watcher);
         }
 
-        // 3. The dying process's own outgoing monitors vanish with it.
-        for monitor in outgoing {
+        // 3. The dying process's own outgoing monitors vanish with it — and so does the
+        //    `{Name, node}` descriptor of any named monitor among them (nothing will ever
+        //    report it down).
+        for monitor in &outgoing {
+            let reference = monitor.reference;
             if let Some(target) = self.get_mut(monitor.target) {
                 target
                     .monitored_by_mut()
-                    .retain(|entry| entry.reference != monitor.reference);
+                    .retain(|entry| entry.reference != reference);
             }
+            self.named_monitors.remove(&reference);
         }
 
         // 4. Remote links and monitors: a dying process leaves the node's records, and every
@@ -952,6 +1361,10 @@ impl ProcessTable {
 
     /// Builds `{'DOWN', Ref, Tag, Target, reason}` on `pid`'s heap — `reason` already resident
     /// in that heap — and enqueues it as a message.
+    ///
+    /// A **named** monitor's DOWN carries the `{Name, node}` pair it was created with rather than
+    /// the pid the name resolved to (the oracle's behaviour); an ordinary monitor carries the
+    /// pid. The named descriptor is consumed here: the DOWN is its last use.
     fn build_and_enqueue_down(
         &mut self,
         pid: ProcessId,
@@ -961,6 +1374,7 @@ impl ProcessTable {
         reason: Eterm,
     ) -> Result<()> {
         let atoms = &self.atoms;
+        let named = self.named_monitors.get(&reference).copied();
         let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
             return Ok(());
         };
@@ -969,17 +1383,24 @@ impl ProcessTable {
             MonitorKind::Port => atoms.port(),
         };
         let reference_term = reference.to_eterm(recipient.heap_mut())?;
+        let target_term = match named {
+            Some(nt) => recipient
+                .heap_mut()
+                .tuple(&[make_atom(nt.name), make_atom(nt.node)])?,
+            None => target.to_eterm(),
+        };
         let term = build_down_message_term(
             recipient.heap_mut(),
             atoms,
             reference_term,
             tag,
-            target.to_eterm(),
+            target_term,
             reason,
         )?;
         recipient
             .mailbox_mut()
-            .enqueue(Message::new(term, target.to_eterm()));
+            .enqueue(Message::new(term, target_term));
+        self.named_monitors.remove(&reference);
         Ok(())
     }
 
@@ -1141,22 +1562,56 @@ impl ProcessTable {
         }
     }
 
-    /// `erlang:monitor/2` against an arbitrary pid term: a local pid monitors through
-    /// [`ProcessTable::monitor`], an external pid is recorded as an outgoing remote monitor and
-    /// routed as a `DOP_MONITOR_P` control signal.
+    /// `erlang:monitor/2` against an arbitrary pid, port **or name** term: a local pid monitors
+    /// through [`ProcessTable::monitor`], an external pid is recorded as an outgoing remote
+    /// monitor and routed as a `DOP_MONITOR_P` control signal, and an **atom** is a registered
+    /// name resolved through [`ProcessTable::monitor_named`] on the local node.
+    ///
+    /// A **port** target cannot be monitored here: a port monitor's incoming half lives in a
+    /// [`PortTable`], which this entry point has no handle on. The faithful entry points are
+    /// [`ProcessTable::monitor_port`]/[`ProcessTable::monitor_port_term`], so a port target with
+    /// [`MonitorKind::Port`] is a typed [`error::unsupported`] rather than a wrong result (and,
+    /// as the oracle requires, a port target with [`MonitorKind::Process`] is `badarg`).
     ///
     /// # Errors
     ///
-    /// Returns [`beam_common::BeamError::BadArg`] when `target` is not a pid; for a local
-    /// `target`, propagates [`ProcessTable::monitor`]'s `BeamError::TermNotFound`; for a remote
-    /// `target`, `BeamError::TermNotFound` when `watcher` is unknown; and the router's transport
-    /// errors.
+    /// Returns [`beam_common::BeamError::BadArg`] when `target` is not a pid, port or atom, and
+    /// for a port target with [`MonitorKind::Process`]; the typed [`error::unsupported`] when
+    /// `target` is an atom but no local node has been installed
+    /// ([`ProcessTable::set_local_node`]), when the atom names a **port** monitor
+    /// ([`error::named_port_monitor`]), or for a port target with [`MonitorKind::Port`]; for a
+    /// local `target`, propagates [`ProcessTable::monitor`]'s `BeamError::TermNotFound`; for a
+    /// remote `target`, `BeamError::TermNotFound` when `watcher` is unknown; and the router's
+    /// transport errors.
     pub fn monitor_term(
         &mut self,
         watcher: ProcessId,
         target: Eterm,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
+        if PortId::is_port(target) {
+            return match kind {
+                MonitorKind::Port => Err(error::unsupported(
+                    "monitor/2: port target requires the port table (use monitor_port)",
+                )),
+                // `erlang:monitor(process, Port)` is `badarg` in the oracle.
+                MonitorKind::Process => Err(error::bad_pid()),
+            };
+        }
+        if is_atom(target) {
+            if kind == MonitorKind::Port {
+                return Err(error::named_port_monitor());
+            }
+            // `monitor(process, Name)` names a locally-registered process; the `{Name, LocalNode}`
+            // target needs the node's atom, which only the runtime can install. Guessing one would
+            // be a wrong result, so its absence is a typed diagnostic.
+            let Some(node) = self.local_node else {
+                return Err(error::unsupported(
+                    "monitor/2: name target requires the local node (set_local_node)",
+                ));
+            };
+            return self.monitor_named(watcher, atom_val(target), node, kind);
+        }
         match PidTarget::from_eterm(target)? {
             PidTarget::Local(pid) => self.monitor(watcher, pid, kind),
             PidTarget::Remote(remote) => {
@@ -1371,28 +1826,34 @@ impl ProcessTable {
 
     // --- name registry -------------------------------------------------------
 
-    /// Registers `pid` under `name`.
+    /// Registers `pid` under `name` (`erlang:register/2`).
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::BadArg` when the name is already taken.
+    /// Returns `BeamError::BadArg` when the name is already taken **or** when `pid` is not a live
+    /// local process — `erlang:register/2` raises `badarg` for a dead/foreign pid, and a name
+    /// must never be bound to a process that can never run.
     pub fn register(&mut self, name: Atom, pid: ProcessId) -> Result<()> {
         if self.names.contains_key(&name) {
             return Err(error::name_taken());
+        }
+        if !self.contains(pid) {
+            return Err(error::bad_pid());
         }
         self.names.insert(name, pid);
         Ok(())
     }
 
-    /// Removes `name` from the registry.
+    /// Removes `name` from the registry (`erlang:unregister/1`).
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::TermNotFound` when the name is not registered.
+    /// Returns `BeamError::BadArg` when the name is not registered — `erlang:unregister/1`
+    /// raises `badarg`, not `TermNotFound`.
     pub fn unregister(&mut self, name: Atom) -> Result<()> {
         match self.names.remove(&name) {
             Some(_) => Ok(()),
-            None => Err(error::unknown_process()),
+            None => Err(error::bad_pid()),
         }
     }
 
@@ -1413,6 +1874,21 @@ impl ProcessTable {
             .iter()
             .filter(|(_, pid)| self.contains(**pid))
             .map(|(name, pid)| (*name, *pid))
+    }
+
+    /// The name `pid` is registered under (`erlang:process_info(Pid, registered_name)`).
+    ///
+    /// `None` for an unregistered process **and** for a pid that is not live: a stale
+    /// registration left behind by a dead process reports nothing, the same rule
+    /// [`ProcessTable::whereis`] applies in the other direction.
+    pub fn name_of(&self, pid: ProcessId) -> Option<Atom> {
+        if !self.contains(pid) {
+            return None;
+        }
+        self.names
+            .iter()
+            .find(|(_, registered)| **registered == pid)
+            .map(|(name, _)| *name)
     }
 
     // --- message builders ----------------------------------------------------
@@ -1441,6 +1917,10 @@ impl ProcessTable {
     /// [`PortTable::close`]) and an `{'EXIT', Port, Reason}` signal to every process linked
     /// to it.
     ///
+    /// A monitoring watcher's outgoing [`PortWatch`] is removed here too — the port's death
+    /// resolves the monitor on both sides, exactly as [`ProcessTable::terminate`] resolves a
+    /// process monitor — so `erlang:process_info(Watcher, monitors)` stops listing it.
+    ///
     /// A linked process follows [`exit_policy`]: a trapping peer receives the `{'EXIT', …}`
     /// message, a non-trapping one terminates with `reason` (cascading through its own links
     /// and monitors), and a `normal` reason is ignored. A peer that already died is skipped.
@@ -1453,8 +1933,14 @@ impl ProcessTable {
     pub fn port_closed(&mut self, ports: &mut PortTable, port: PortId, reason: Eterm) -> Result<()> {
         let closed = ports.close(port)?;
 
-        // 1. Monitors: every watcher is told the port is down.
+        // 1. Monitors: the port's death resolves the incoming half here (drained by `close`)
+        //    and the watcher's outgoing half below; then the watcher is told the port is down.
         for monitor in closed.monitors {
+            if let Some(watcher) = self.get_mut(monitor.watcher) {
+                watcher
+                    .port_monitors_mut()
+                    .retain(|watch| watch.reference != monitor.reference);
+            }
             self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, reason)?;
         }
 
@@ -1540,7 +2026,7 @@ mod tests {
     //! ownership/link/monitor surface by `crate::port` and `tests/ports.rs`.
 
     use beam_term::prelude::{
-        make_atom, make_small, tuple_element, tuple_size, AtomTable,
+        is_tuple, make_atom, make_small, tuple_element, tuple_size, AtomTable,
     };
 
     use super::*;
@@ -1884,7 +2370,7 @@ mod tests {
 
     #[test]
     fn monitor_and_demonitor_keep_both_halves_in_sync() {
-        let mut table = table();
+        let (mut table, names) = table_and_names();
         let watcher = table.spawn_default().expect("watcher");
         let target = table.spawn_default().expect("target");
 
@@ -1907,14 +2393,50 @@ mod tests {
         assert!(table.get(target).expect("target").monitored_by().is_empty());
         assert!(!table.demonitor(watcher, reference).expect("watcher live"));
 
-        assert!(matches!(
-            table.monitor(watcher, ProcessId::new(999, 0), MonitorKind::Process),
-            Err(BeamError::TermNotFound)
-        ));
+        // An unknown *watcher* is still an error.
         assert!(matches!(
             table.demonitor(ProcessId::new(999, 0), reference),
             Err(BeamError::TermNotFound)
         ));
+
+        // A pid that is not a live local process is NOT an error: the monitor is born down, its
+        // `{'DOWN', Ref, process, Target, noproc}` is delivered immediately, and no half of the
+        // monitor is recorded (there is nothing left to watch).
+        let dead = ProcessId::new(999, 0);
+        let down_atom = table.atoms.down();
+        let mailbox_before = table.get(watcher).expect("watcher").mailbox().len();
+        let dead_ref = table
+            .monitor(watcher, dead, MonitorKind::Process)
+            .expect("a non-live target is not an error");
+        assert_ne!(dead_ref, reference);
+        assert!(table.get(dead).is_none(), "the target stays non-live");
+        let watcher_process = table.get(watcher).expect("watcher");
+        assert_eq!(
+            watcher_process.mailbox().len(),
+            mailbox_before + 1,
+            "the immediate noproc DOWN landed in the watcher's mailbox"
+        );
+        assert!(
+            watcher_process.monitors().find(dead_ref).is_none(),
+            "a non-live target records no outgoing monitor"
+        );
+        let payload = watcher_process
+            .mailbox()
+            .peek()
+            .expect("the DOWN is queued")
+            .payload();
+        assert!(
+            payload_is_down_for(payload, dead_ref, down_atom),
+            "a 5-tuple `{{'DOWN', Ref, ..}}` for the fresh reference"
+        );
+        // SAFETY: the payload is the live 5-tuple the DOWN builder wrote.
+        unsafe {
+            assert_eq!(tuple_size(payload), 5);
+            assert_eq!(tuple_element(payload, 0), named(&names, "DOWN"));
+            assert_eq!(tuple_element(payload, 2), named(&names, "process"));
+            assert_eq!(tuple_element(payload, 3), dead.to_eterm());
+            assert_eq!(tuple_element(payload, 4), named(&names, "noproc"));
+        }
     }
 
     #[test]
@@ -1928,6 +2450,223 @@ mod tests {
         table.remove(target);
         assert!(table.demonitor(watcher, reference).expect("watcher live"));
         assert!(table.get(watcher).expect("watcher").monitors().is_empty());
+    }
+
+    #[test]
+    fn demonitor_flush_removes_only_the_matching_down() {
+        let mut table = table();
+        let watcher = table.spawn_default().expect("watcher");
+
+        // Two monitors on two non-live pids: each queues its own immediate noproc DOWN.
+        let first = table
+            .monitor(watcher, ProcessId::new(999, 0), MonitorKind::Process)
+            .expect("a non-live target is not an error");
+        let second = table
+            .monitor(watcher, ProcessId::new(998, 0), MonitorKind::Process)
+            .expect("a non-live target is not an error");
+        assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 2);
+
+        // A reference the table never handed out flushes nothing (and is not an error).
+        let bogus = table.refs.next();
+        assert!(!table.demonitor(watcher, bogus).expect("watcher live"));
+        assert!(!table.demonitor_flush(watcher, bogus).expect("watcher live"));
+        assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 2);
+
+        // Flushing the second reference removes exactly its own DOWN.
+        assert!(table
+            .demonitor_flush(watcher, second)
+            .expect("watcher live"));
+        assert_eq!(
+            table.get(watcher).expect("watcher").mailbox().len(),
+            1,
+            "only the second DOWN was flushed"
+        );
+        let remaining = table
+            .get(watcher)
+            .expect("watcher")
+            .mailbox()
+            .peek()
+            .expect("one message")
+            .payload();
+        assert!(
+            payload_is_down_for(remaining, first, table.atoms.down()),
+            "the surviving DOWN is the first monitor's"
+        );
+
+        // The first DOWN goes too; re-flushing changes nothing.
+        assert!(table.demonitor_flush(watcher, first).expect("watcher live"));
+        assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 0);
+        assert!(!table.demonitor_flush(watcher, first).expect("watcher live"));
+
+        // An unknown watcher is still an error.
+        assert!(matches!(
+            table.demonitor_flush(ProcessId::new(999, 0), first),
+            Err(BeamError::TermNotFound)
+        ));
+    }
+
+    #[test]
+    fn plain_demonitor_leaves_a_queued_down_while_flush_removes_it() {
+        let mut table = table();
+        let watcher = table.spawn_default().expect("watcher");
+        let target = table.spawn_default().expect("target");
+
+        let reference = table
+            .monitor(watcher, target, MonitorKind::Process)
+            .expect("both live");
+        table.terminate(target, make_small(5)).expect("live");
+        assert_eq!(
+            table.get(watcher).expect("watcher").mailbox().len(),
+            1,
+            "the eagerly applied DOWN is queued"
+        );
+
+        // `demonitor/1` (no flush) drops the monitor half but leaves the DOWN queued.
+        table.demonitor(watcher, reference).expect("watcher live");
+        assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 1);
+
+        // `demonitor/2` with `[flush]` removes it.
+        assert!(table
+            .demonitor_flush(watcher, reference)
+            .expect("watcher live"));
+        assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 0);
+    }
+
+    #[test]
+    fn monitor_named_reports_the_name_node_target_on_death() {
+        let (mut table, names) = table_and_names();
+        let mut atoms_table = AtomTable::new();
+        let name = atoms_table.intern("server");
+        let node = atoms_table.intern("nonode@nohost");
+        let watcher = table.spawn_default().expect("watcher");
+        let target = table.spawn_default().expect("target");
+        table.register(name, target).expect("the name is free");
+
+        let reference = table
+            .monitor_named(watcher, name, node, MonitorKind::Process)
+            .expect("the name resolves to a live process");
+        // The monitor halves are the ordinary ones: the name resolved to a pid.
+        assert_eq!(
+            table
+                .get(watcher)
+                .expect("watcher")
+                .monitors()
+                .find(reference)
+                .map(|m| m.target),
+            Some(target)
+        );
+        assert_eq!(table.get(target).expect("target").monitored_by().len(), 1);
+
+        table.terminate(target, make_small(7)).expect("target live");
+        let payload = table
+            .get(watcher)
+            .expect("watcher")
+            .mailbox()
+            .peek()
+            .expect("the DOWN is queued")
+            .payload();
+        // SAFETY: the payload is the live 5-tuple the DOWN builder wrote.
+        unsafe {
+            assert_eq!(tuple_size(payload), 5);
+            assert_eq!(tuple_element(payload, 0), named(&names, "DOWN"));
+            assert_eq!(tuple_element(payload, 2), named(&names, "process"));
+            let target_term = tuple_element(payload, 3);
+            assert!(is_tuple(target_term), "the target is the `{{Name, Node}}` pair");
+            assert_eq!(tuple_size(target_term), 2);
+            assert_eq!(tuple_element(target_term, 0), make_atom(name));
+            assert_eq!(tuple_element(target_term, 1), make_atom(node));
+            assert_eq!(tuple_element(payload, 4), make_small(7), "the death reason");
+        }
+        // The descriptor is consumed by the DOWN it produced.
+        assert!(table.named_monitors.is_empty());
+    }
+
+    #[test]
+    fn monitor_named_of_an_unregistered_name_is_born_down() {
+        let (mut table, names) = table_and_names();
+        let mut atoms_table = AtomTable::new();
+        let name = atoms_table.intern("nobody");
+        let node = atoms_table.intern("nonode@nohost");
+        let watcher = table.spawn_default().expect("watcher");
+        let down_atom = table.atoms.down();
+
+        assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 0);
+        let reference = table
+            .monitor_named(watcher, name, node, MonitorKind::Process)
+            .expect("an unregistered name is not an error");
+        let watcher_process = table.get(watcher).expect("watcher");
+        assert_eq!(
+            watcher_process.mailbox().len(),
+            1,
+            "the immediate noproc DOWN landed"
+        );
+        assert!(
+            watcher_process.monitors().is_empty(),
+            "an unregistered name records no monitor"
+        );
+        assert!(table.named_monitors.is_empty());
+        let payload = watcher_process
+            .mailbox()
+            .peek()
+            .expect("the DOWN is queued")
+            .payload();
+        assert!(payload_is_down_for(payload, reference, down_atom));
+        // SAFETY: the payload is the live 5-tuple the DOWN builder wrote.
+        unsafe {
+            assert_eq!(tuple_size(payload), 5);
+            assert_eq!(tuple_element(payload, 0), named(&names, "DOWN"));
+            assert_eq!(tuple_element(payload, 2), named(&names, "process"));
+            let target_term = tuple_element(payload, 3);
+            assert_eq!(tuple_size(target_term), 2);
+            assert_eq!(tuple_element(target_term, 0), make_atom(name));
+            assert_eq!(tuple_element(target_term, 1), make_atom(node));
+            assert_eq!(tuple_element(payload, 4), named(&names, "noproc"));
+        }
+    }
+
+    #[test]
+    fn monitor_term_routes_an_atom_target_to_the_named_path() {
+        let (mut table, _names) = table_and_names();
+        let mut atoms_table = AtomTable::new();
+        let name = atoms_table.intern("server");
+        let node = atoms_table.intern("nonode@nohost");
+        let watcher = table.spawn_default().expect("watcher");
+        let target = table.spawn_default().expect("target");
+        table.register(name, target).expect("the name is free");
+
+        // Without a local node installed, a name target is a typed unsupported — never a guessed
+        // target, and never a recorded monitor.
+        match table.monitor_term(watcher, make_atom(name), MonitorKind::Process) {
+            Err(BeamError::Raise(raise)) => assert_eq!(
+                raise.reason.as_atom(),
+                Some("unsupported: monitor/2: name target requires the local node (set_local_node)")
+            ),
+            other => panic!("expected a typed unsupported raise, got {other:?}"),
+        }
+        assert!(table.get(watcher).expect("watcher").mailbox().is_empty());
+
+        // With the node installed it routes to `monitor_named`.
+        assert_eq!(table.local_node(), None);
+        table.set_local_node(node);
+        assert_eq!(table.local_node(), Some(node));
+        let reference = table
+            .monitor_term(watcher, make_atom(name), MonitorKind::Process)
+            .expect("the name resolves");
+        assert_eq!(
+            table
+                .get(watcher)
+                .expect("watcher")
+                .monitors()
+                .find(reference)
+                .map(|m| m.target),
+            Some(target)
+        );
+
+        // A non-pid, non-atom term is still `badarg`.
+        assert!(matches!(
+            table.monitor_term(watcher, make_small(1), MonitorKind::Process),
+            Err(BeamError::BadArg)
+        ));
     }
 
     #[test]
@@ -1968,6 +2707,11 @@ mod tests {
 
         table.register(name, pid).expect("the name is free");
         assert!(matches!(table.register(name, pid2), Err(BeamError::BadArg)));
+        // `erlang:register/2` of a pid that is not a live local process is `badarg`.
+        assert!(matches!(
+            table.register(other, ProcessId::new(999, 0)),
+            Err(BeamError::BadArg)
+        ));
         assert_eq!(table.whereis(name), Some(pid));
         assert_eq!(table.whereis(other), None);
 
@@ -1975,13 +2719,78 @@ mod tests {
         assert_eq!(registered, vec![(name, pid)]);
 
         table.unregister(name).expect("it was registered");
-        assert!(matches!(
-            table.unregister(name),
-            Err(BeamError::TermNotFound)
-        ));
+        // `erlang:unregister/1` of an unregistered name is `badarg`, not `TermNotFound`.
+        assert!(matches!(table.unregister(name), Err(BeamError::BadArg)));
         // A name registered to a dead process is not reported.
         table.register(name, pid2).expect("free again");
         table.remove(pid2);
         assert_eq!(table.registered().count(), 0);
+    }
+
+    #[test]
+    fn register_rejects_a_dead_pid_and_name_of_reports_liveness() {
+        let mut table = table();
+        let mut atoms_table = AtomTable::new();
+        let name = atoms_table.intern("server");
+        let pid = table.spawn_default().expect("server");
+
+        assert_eq!(table.name_of(pid), None, "not registered yet");
+        table.register(name, pid).expect("the pid is live");
+        assert_eq!(table.name_of(pid), Some(name));
+
+        // A dead pid cannot be registered (nor keep a registration).
+        let dead = {
+            let dying = table.spawn_default().expect("dying");
+            table.remove(dying);
+            dying
+        };
+        assert!(matches!(
+            table.register(atoms_table.intern("dead"), dead),
+            Err(BeamError::BadArg)
+        ));
+
+        table.unregister(name).expect("it was registered");
+        assert_eq!(table.name_of(pid), None, "an unregistered pid names nothing");
+
+        // A stale registration left by a dead process reports nothing.
+        table.register(name, pid).expect("free again");
+        table.remove(pid);
+        assert_eq!(
+            table.name_of(pid),
+            None,
+            "a dead pid reports no name even if a registration lingers"
+        );
+    }
+
+    #[test]
+    fn is_process_alive_tracks_contains_and_exit_reason_reports_a_recorded_reason() {
+        let mut table = table();
+        let pid = table.spawn_default().expect("a");
+        assert!(table.is_process_alive(pid));
+        assert!(!table.is_process_alive(ProcessId::new(999, 0)));
+
+        // A live process has no exit reason yet.
+        assert_eq!(table.exit_reason(pid).expect("live"), None);
+        table
+            .get_mut(pid)
+            .expect("live")
+            .set_exit_reason(make_small(17));
+        assert_eq!(
+            table.exit_reason(pid).expect("live"),
+            Some(make_small(17)),
+            "the recorded reason is reported verbatim"
+        );
+
+        // Once the process is gone, the pid is unknown to the table.
+        table.terminate(pid, make_small(17)).expect("live");
+        assert!(!table.is_process_alive(pid));
+        assert!(matches!(
+            table.exit_reason(pid),
+            Err(BeamError::TermNotFound)
+        ));
+        assert!(matches!(
+            table.exit_reason(ProcessId::new(999, 0)),
+            Err(BeamError::TermNotFound)
+        ));
     }
 }

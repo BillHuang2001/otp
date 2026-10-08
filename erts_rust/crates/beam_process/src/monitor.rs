@@ -6,6 +6,17 @@
 //! termination sends `A` a `{'DOWN', Ref, process, B, Reason}` message carrying that same
 //! reference.
 //!
+//! # Process monitors vs port monitors
+//!
+//! [`MonitorKind`] names the two monitor types the oracle supports (`process` and `port`), and
+//! [`MonitorKind::from_type_name`]/[`MonitorKind::type_name`] are the type-dispatch seam the
+//! `erlang:monitor/2` BIF layer resolves its first argument through (`time_offset` and every
+//! other atom are not a monitor type). A **port** monitor's target is a
+//! [`PortId`](crate::pid::PortId) rather than a [`ProcessId`], so its outgoing half is a
+//! [`PortWatch`] (stored on the watcher by
+//! [`ProcessTable::monitor_port`](crate::ptab::ProcessTable::monitor_port)) and its incoming
+//! half lives in the [`PortTable`](crate::port::PortTable).
+//!
 //! # Monitor references
 //!
 //! `beam_term` has no `make_ref` in Milestone-1, so a reference is represented as the
@@ -20,9 +31,12 @@
 
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_term::prelude::{make_boxed, make_header, make_small, Eterm, REF_SUBTAG};
+use beam_term::prelude::{
+    boxed_val, header_subtag, is_boxed_term, is_tuple, make_atom, make_boxed, make_header,
+    make_small, signed_value, tuple_element, tuple_size, Atom, Eterm, REF_SUBTAG,
+};
 
-use crate::pid::ProcessId;
+use crate::pid::{PortId, ProcessId};
 
 /// The number of payload words of the ref thing: `node`, `serial` and `id`.
 const REF_PAYLOAD_WORDS: usize = 3;
@@ -63,13 +77,113 @@ impl MonitorRef {
     }
 }
 
+/// Whether `payload` is the `{'DOWN', Reference, _, _, _}` message for `reference`.
+///
+/// A `demonitor(Ref, [flush])` helper: it recognises the monitor-DOWN message a
+/// [`MonitorRef`] produced, so the caller can drop it out of a mailbox.
+///
+/// # Encoding
+///
+/// Word 3 of a ref thing is the id: [`MonitorRef::to_eterm`] builds the frozen
+/// `[make_header(3, REF_SUBTAG), node, serial, id]`, so its **last payload word** holds
+/// `make_small(reference.id())` (`monitor_ref_to_eterm_builds_the_frozen_thing` pins exactly
+/// that layout). The identity test is therefore `signed_value(word[3]) == reference.id() as i64`.
+///
+/// # Robustness
+///
+/// Every read is guarded: a non-tuple payload, a payload that is not a 5-tuple, a head element
+/// that is not `down_atom`, and an element 1 that is not a boxed ref thing are all `false`
+/// without reading a word the guards have not first proven to exist. It never panics.
+pub fn payload_is_down_for(payload: Eterm, reference: MonitorRef, down_atom: Atom) -> bool {
+    // SAFETY: the guards form a chain. `is_tuple` first rejects everything that is not a live
+    // boxed term whose header word is a valid arity value, so `tuple_size`/`tuple_element` only
+    // ever read a live tuple; the arity test bounds every element read to `0..5`; and element 1
+    // is only dereferenced after `is_boxed_term` proved it a dereferenceable boxed term and
+    // `header_subtag` proved its header carries the 3-payload-word `REF_SUBTAG`, so word 3 is in
+    // bounds. No path reads a word it has not first proven to exist.
+    unsafe {
+        if !is_tuple(payload) || tuple_size(payload) != 5 {
+            return false;
+        }
+        if tuple_element(payload, 0) != make_atom(down_atom) {
+            return false;
+        }
+        let reference_term = tuple_element(payload, 1);
+        if !is_boxed_term(reference_term) {
+            return false;
+        }
+        let words = boxed_val(reference_term);
+        if header_subtag(*words) != REF_SUBTAG as u32 {
+            return false;
+        }
+        signed_value(*words.add(3)) == reference.id() as i64
+    }
+}
+
 /// What a monitor targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MonitorKind {
-    /// A process monitor.
+    /// A process monitor (`erlang:monitor(process, Target)`).
     Process,
-    /// A port monitor.
+    /// A port monitor (`erlang:monitor(port, Target)`).
     Port,
+}
+
+impl MonitorKind {
+    /// The `erlang:monitor/2` **type name** this kind is spelled with: `"process"` or
+    /// `"port"`.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            MonitorKind::Process => "process",
+            MonitorKind::Port => "port",
+        }
+    }
+
+    /// Maps an `erlang:monitor/2` **type name** to a monitor kind, or `None` when the name
+    /// is not a supported monitor type.
+    ///
+    /// This is the type-dispatch seam the BIF layer resolves `erlang:monitor/2`'s first
+    /// argument through; a `None` is the oracle's `badarg`. `time_offset` — the monitor type
+    /// OTP removed in OTP 26 — and every other atom are `None`, so this crate has **no**
+    /// `time_offset` (or any other unsupported-type) path capable of returning a wrong
+    /// result: there is no such variant to select.
+    ///
+    /// Note that only the *type name* is resolved here; the target still has to match the
+    /// kind (`erlang:monitor(port, NotAPort)` is `badarg` — see
+    /// [`ProcessTable::monitor_port_term`](crate::ptab::ProcessTable::monitor_port_term)).
+    pub fn from_type_name(name: &str) -> Option<MonitorKind> {
+        match name {
+            "process" => Some(MonitorKind::Process),
+            "port" => Some(MonitorKind::Port),
+            _ => None,
+        }
+    }
+}
+
+/// An outgoing **port** monitor: [`Process`](crate::process::Process) `watcher` watches `port`.
+///
+/// A port monitor is one-directional exactly like a process monitor, but its target is a
+/// [`PortId`] rather than a [`ProcessId`]:
+/// [`ProcessTable::monitor_port`](crate::ptab::ProcessTable::monitor_port) records this
+/// outgoing half on the watcher and the incoming
+/// [`PortMonitor`](crate::port::PortMonitor) on the port, and
+/// [`ProcessTable::port_closed`](crate::ptab::ProcessTable::port_closed) resolves the pair with
+/// `{'DOWN', Ref, port, Port, Reason}`.
+///
+/// # Not a GC root
+///
+/// `reference` and `port` are both plain values (a `u64`-backed handle), **not** heap terms,
+/// so a port-watch set adds no root to the collector:
+/// [`Process::collect`](crate::process::Process::collect) gathers only the
+/// registers/stack, the mailbox payloads, the dictionary, the saved args and the
+/// pending-signal queue. (A port monitor therefore also never affects `beam_message`'s copy
+/// sizing, which only walks a crossed term's own object graph.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortWatch {
+    /// The reference the `{'DOWN', …}` message will carry.
+    pub reference: MonitorRef,
+    /// The watched port.
+    pub port: PortId,
 }
 
 /// An outgoing monitor: this process watches `target`.
@@ -205,6 +319,29 @@ mod tests {
     }
 
     #[test]
+    fn monitor_kind_type_names_round_trip_and_reject_time_offset() {
+        // Pins objective item 6: `erlang:monitor/2`'s type dispatch. Only `process` and
+        // `port` are monitor types; `time_offset` (removed in OTP 26) and anything else is
+        // `None`, which the BIF layer renders as the oracle's `badarg`.
+        assert_eq!(MonitorKind::Process.type_name(), "process");
+        assert_eq!(MonitorKind::Port.type_name(), "port");
+        assert_eq!(
+            MonitorKind::from_type_name("process"),
+            Some(MonitorKind::Process)
+        );
+        assert_eq!(MonitorKind::from_type_name("port"), Some(MonitorKind::Port));
+        assert_eq!(MonitorKind::from_type_name("time_offset"), None);
+        assert_eq!(MonitorKind::from_type_name("no_such_type"), None);
+        assert_eq!(MonitorKind::from_type_name(""), None);
+        // Case matters: the oracle's atom is the exact lowercase `time_offset`/`process`.
+        assert_eq!(MonitorKind::from_type_name("Process"), None);
+        // Every kind round-trips through its own name.
+        for kind in [MonitorKind::Process, MonitorKind::Port] {
+            assert_eq!(MonitorKind::from_type_name(kind.type_name()), Some(kind));
+        }
+    }
+
+    #[test]
     fn monitors_push_find_remove_and_drain() {
         let mut refs = RefAllocator::new();
         let r1 = refs.next();
@@ -279,5 +416,70 @@ mod tests {
             reference.to_eterm(&mut heap),
             Err(BeamError::Alloc(_))
         ));
+    }
+
+    #[test]
+    fn payload_is_down_for_matches_only_its_own_reference_and_shape() {
+        use beam_term::prelude::{make_atom, AtomTable};
+
+        let mut table = AtomTable::new();
+        let down = table.intern("DOWN");
+        let exit = table.intern("EXIT");
+        let process = table.intern("process");
+
+        let mut refs = RefAllocator::new();
+        let reference = refs.next();
+        let other = refs.next();
+
+        let mut heap = Heap::new(32).expect("test heap");
+        let mut ref_heap = Heap::new(8).expect("test heap");
+        let reference_term = reference.to_eterm(&mut ref_heap).expect("the ref fits");
+
+        // The exact shape the signal builders produce.
+        let message = heap
+            .tuple(&[
+                make_atom(down),
+                reference_term,
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("the test arena holds the tuple");
+        assert!(payload_is_down_for(message, reference, down));
+        // A different reference is not this message's DOWN ...
+        assert!(!payload_is_down_for(message, other, down));
+        // ... and a different head atom is not a DOWN at all.
+        assert!(!payload_is_down_for(message, reference, exit));
+
+        // A 4-tuple with the right head is not a 5-tuple DOWN.
+        let short = heap
+            .tuple(&[
+                make_atom(down),
+                reference_term,
+                make_atom(process),
+                pid(1).to_eterm(),
+            ])
+            .expect("fits");
+        assert!(!payload_is_down_for(short, reference, down));
+
+        // Element 1 that is not a boxed ref thing (here: a pid immediate).
+        let not_ref = heap
+            .tuple(&[
+                make_atom(down),
+                pid(2).to_eterm(),
+                make_atom(process),
+                pid(1).to_eterm(),
+                make_small(0),
+            ])
+            .expect("fits");
+        assert!(!payload_is_down_for(not_ref, reference, down));
+
+        // Non-tuple payloads must never be dereferenced.
+        assert!(!payload_is_down_for(make_small(7), reference, down));
+        assert!(!payload_is_down_for(make_atom(down), reference, down));
+        let not_a_down = heap
+            .tuple(&[make_atom(process), make_small(1)])
+            .expect("fits");
+        assert!(!payload_is_down_for(not_a_down, reference, down));
     }
 }

@@ -24,13 +24,15 @@
 //!   `{trace_delivered, Tracee, Ref}` and returned;
 //! * `erts_internal:trace/3` (the body `erlang:trace/2,3` calls) for the process targets
 //!   `Pid | all | existing | existing_processes | processes`;
-//! * the **`send` event** of the ordinary trace surface: [`RuntimeContext::trace_send_events`]
-//!   is called by the send seam (the `RuntimeContext::send_message` the engine's `send`
-//!   instruction reaches) after the payload has been delivered and emits `{trace, Sender, send,
-//!   Msg, To}` — or `{trace_ts, …}` with the `timestamp` family's trailing element — to the
-//!   **sending**
-//!   process's tracer, plus the `{seq_trace, Label, {send, …}}` event when the sender's
-//!   sequential-trace token has the `send` flag set;
+//! * the **`send` and `'receive'` events** of the ordinary trace surface:
+//!   [`RuntimeContext::trace_send_events`] and [`RuntimeContext::trace_receive_events`] are
+//!   called by the send seam (the `RuntimeContext::send_message` the engine's `send`
+//!   instruction reaches). The first, after the payload has been delivered, emits `{trace,
+//!   Sender, send, Msg, To}` — or `{trace_ts, …}` with the `timestamp` family's trailing
+//!   element — to the **sending** process's tracer, plus the `{seq_trace, Label, {send, …}}`
+//!   event when the sender's sequential-trace token has the `send` flag set; the second emits
+//!   `{trace, Receiver, 'receive', Msg}` to the **receiving** process's tracer when that
+//!   process's `'receive'` flag is set, on **enqueue**;
 //! * `erts_internal:trace_pattern/3` (the body `erlang:trace_pattern/2,3` calls) — the
 //!   **function** trace patterns. [`TraceState`] owns a [`PatternTable`]: one entry per
 //!   installed `{M,F,A}` pattern (wildcard-aware — [`MfaPattern::matches`]) holding its
@@ -40,18 +42,21 @@
 //!
 //! # Deliberately out of scope (a later stage)
 //!
-//! * **The other event families.** Only the `send` event is emitted
-//!   ([`RuntimeContext::trace_send_events`]); the `'receive'`, `spawn`, `exit` and
-//!   `call`/`return_to`/`return_from` events have no producer — nothing is wired into the
-//!   engine's receive or call paths, so those flags are state only. [`PatternTable::matches`]
-//!   is the predicate a future `beam_engine` per-call hook calls to decide whether a
-//!   `call`/`return_from`/`return_to` event should be emitted; until that hook exists it is
-//!   only a query. Nor does a **match spec** filter the `send` event (none is compiled — see
-//!   below).
+//! * **The remaining event families.** Two events are emitted, both from the send seam: the
+//!   `send` event ([`RuntimeContext::trace_send_events`]) and the delivered-message
+//!   `{trace, Receiver, 'receive', Msg}` event ([`RuntimeContext::trace_receive_events`],
+//!   emitted on **enqueue** and gated on the *receiver's* flag). The `spawn`, `exit`,
+//!   `register`/`unregister`, `in`/`out` and `call`/`return_to`/`return_from` events have no
+//!   producer — nothing is wired into the engine's spawn/exit or call paths, so those flags
+//!   are state only (deliberately unemitted rather than emitted with an unpinned shape).
+//!   [`PatternTable::matches`] is the predicate a future `beam_engine` per-call hook calls to
+//!   decide whether a `call`/`return_from`/`return_to` event should be emitted; until that hook
+//!   exists it is only a query. Nor does a **match spec** filter the emitted events (none is
+//!   compiled — see below).
 //! * **Carrying the sequential-trace token with a message.** The `{send, …}` event is emitted,
 //!   but the token is *not* attached to the message the send delivers, so a receiver cannot
 //!   inherit it (that needs a per-message slot in `beam_message`) and no `{'receive', …}`
-//!   event can follow.
+//!   sequential-trace event can follow.
 //! * **Match-spec compilation.** A `[match_spec()]` argument is shape-checked and stored
 //!   verbatim ([`MatchSpec::Functions`]); it is never compiled and never applied, so it
 //!   cannot filter an event (there are none to filter). `trace_info`'s `match_spec` item is a
@@ -813,10 +818,10 @@ impl RuntimeContext<'_> {
     ///   if any; the tag is then `trace_ts` ([`TraceTimestamp::tag`]).
     ///
     /// Nothing is emitted when `traced` has no trace entry, when its entry records no tracer,
-    /// or when its `silent` flag is set — a `silent` tracee is the flag that suppresses its
-    /// events, and `erts_internal:trace/3` here records a tracer even for it.
-    ///
-    /// # Errors
+    /// when its `silent` flag is set — a `silent` tracee is the flag that suppresses its
+    /// events, and `erts_internal:trace/3` here records a tracer even for it — or when the
+    /// tracer **is** the tracee (ERTS's `discard` rule, see below).
+    ///    /// # Errors
     ///
     /// Whatever the term writers report (a full heap). A tracer the process table no longer
     /// holds is **not** an error: the event is dropped, exactly as the oracle drops an
@@ -838,6 +843,15 @@ impl RuntimeContext<'_> {
         let Some(tracer) = entry.tracer else {
             return Ok(());
         };
+        // ERTS never delivers an event to a process **about itself**: the built-in tracer
+        // answers `discard` when the tracer state *is* the tracee
+        // (`erts/emulator/nifs/common/erl_tracer_nif.c:143-146`, "Only generate trace for
+        // when tracer != tracee"). A process that traces itself — `erlang:trace(self(), true,
+        // [send])` makes the calling process its own default tracer — therefore observes no
+        // events of its own; the oracle delivers nothing there.
+        if tracer == traced {
+            return Ok(());
+        }
         let timestamp = TraceTimestamp::select(entry.flags);
         let tag = self.atom(timestamp.map_or("trace", TraceTimestamp::tag))?;
         let event = self.atom(event)?;
@@ -936,6 +950,39 @@ impl RuntimeContext<'_> {
                     delivered => delivered?,
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Emits the `{trace, Receiver, 'receive', Msg}` event a **delivered** message produces for
+    /// the receiving process — contract A.8, item 1.
+    ///
+    /// The event is gated on the **receiver's** `receive` trace flag: the flag lives on the
+    /// process the message arrives at, so a `receive`-traced receiver gets one event per message
+    /// enqueued into its mailbox and a *sender* with the flag gets nothing.
+    /// [`RuntimeContext::emit_trace_event`] does the rest (the tracer lookup, the `silent` flag,
+    /// the tracer-is-the-tracee discard and the time-stamp flavour).
+    ///
+    /// The send seam ([`RuntimeContext::send_message`](crate::context::RuntimeContext::send_message))
+    /// calls this once per delivered message, immediately after the `send` event, which is where
+    /// the C emits it (`erl_proc_sig_queue.c:8626-8630`, `handle_message_enqueued_tracing`): the
+    /// event fires on **enqueue**, not on matching, so a message a traced process never matches
+    /// still produces one, and the event carries only the message (no sender). The event is
+    /// emitted through [`RuntimeContext::deliver_message`] — the same bypass the `send` event
+    /// uses — so delivering a trace event can never itself produce a `receive` event.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the term writers report (a full heap); an undeliverable event is not an error
+    /// (see [`RuntimeContext::emit_trace_event`]).
+    pub(crate) fn trace_receive_events(&mut self, receiver: ProcessId, message: Eterm) -> Result<()> {
+        let receive_traced = self
+            .runtime
+            .trace()
+            .get(receiver)
+            .is_some_and(|entry| entry.flags.0 & RECEIVE != 0);
+        if receive_traced {
+            self.emit_trace_event(receiver, "receive", &[message])?;
         }
         Ok(())
     }
@@ -1165,59 +1212,96 @@ mod tests {
         assert!(next_unique_monotonic() > unique);
     }
 
-    #[test]
-    fn a_fresh_runtime_process_emits_the_send_event_and_the_seq_trace_event() {
-        use beam_bifs::NullSink;
-
-        let mut rt = crate::Runtime::with_defaults().expect("the default runtime");
-        let pid = rt.self_pid();
-        let label = rt.intern("a-label");
-        let message = rt.intern("payload");
-        let send = rt.intern("send");
-        let trace = rt.intern("trace");
-        let seq_trace = rt.intern("seq_trace");
-        // The sender is `[send]`-traced and reports to itself, and its sequential-trace token
-        // has the `send` flag with a system tracer configured (both unreachable from outside
-        // the crate, which is why this case lives here).
-        rt.trace_mut().set(
-            pid,
-            flags_from_atoms(&["send"]).expect("send"),
-            Some(pid),
-        );
-        rt.seq_trace_mut()
-            .set_flag(pid, pid.to_eterm(), crate::seq_trace::FLAG_SEND, true);
-        rt.seq_trace_mut().set_label(pid, pid.to_eterm(), label);
-        rt.seq_trace_mut().set_tracer(Some(pid));
-
-        let mut sink = NullSink;
-        let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
-        ctx.send_message(pid.to_eterm(), message).expect("send");
-
-        // The mailbox holds exactly three messages, in order: the payload, the ordinary
-        // `{trace, …}` event, then the sequential-trace `{seq_trace, …}` event.
+    /// Every message in `pid`'s mailbox, in mailbox order, removed as it is read.
+    ///
+    /// `pid` runs against a caller-owned [`beam_process::ProcessTable`] (what
+    /// [`RuntimeContext::for_process`] is built for), so the table is handed back on each read.
+    fn drain(
+        rt: &mut crate::Runtime,
+        table: &mut beam_process::ProcessTable,
+        pid: ProcessId,
+    ) -> Vec<Eterm> {
+        let mut ctx = RuntimeContext::for_process(rt, table, pid);
         ctx.receive_reset().expect("timeout");
         let mut messages = Vec::new();
         while let Some(term) = ctx.receive_next().expect("receive_next") {
             messages.push(term);
             ctx.receive_remove().expect("remove_message");
-            assert!(messages.len() < 8, "the mailbox keeps draining: {messages:?}");
+            assert!(messages.len() < 16, "the mailbox keeps draining: {messages:?}");
         }
-        assert_eq!(messages.len(), 3, "the payload and the two events");
+        messages
+    }
 
-        // 1. the payload itself.
-        assert_eq!(messages[0], message);
+    /// A two-process runtime: `(sender, tracer)` live in a caller-owned table so the tracer can
+    /// be a **different** process from the tracee (ERTS discards an event whose tracer is the
+    /// tracee itself, so a self-traced process observes nothing).
+    fn two_processes() -> (
+        crate::Runtime,
+        beam_process::ProcessTable,
+        ProcessId,
+        ProcessId,
+    ) {
+        let rt = crate::Runtime::with_defaults().expect("the default runtime");
+        let mut atoms = beam_term::prelude::AtomTable::new();
+        let mut table =
+            beam_process::ProcessTable::new(beam_process::SignalAtoms::from_table(&mut atoms));
+        let sender = table.spawn_default().expect("spawn the sender");
+        let tracer = table.spawn_default().expect("spawn the tracer");
+        (rt, table, sender, tracer)
+    }
 
-        // 2. `{trace, Sender, send, Msg, To}`.
-        let event = messages[1];
+    #[test]
+    fn a_send_traced_sender_emits_the_send_event_and_the_seq_trace_event() {
+        let (mut rt, mut table, sender, tracer) = two_processes();
+        let label = rt.intern("a-label");
+        let message = rt.intern("payload");
+        let send = rt.intern("send");
+        let trace = rt.intern("trace");
+        let seq_trace = rt.intern("seq_trace");
+        // The sender is `[send]`-traced and reports to the **other** process, and its
+        // sequential-trace token has the `send` flag with a system tracer configured (both
+        // unreachable from outside the crate, which is why this case lives here).
+        rt.trace_mut().set(
+            sender,
+            flags_from_atoms(&["send"]).expect("send"),
+            Some(tracer),
+        );
+        rt.seq_trace_mut()
+            .set_flag(sender, sender.to_eterm(), crate::seq_trace::FLAG_SEND, true);
+        rt.seq_trace_mut().set_label(sender, sender.to_eterm(), label);
+        rt.seq_trace_mut().set_tracer(Some(tracer));
+
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, sender);
+            ctx.send_message(sender.to_eterm(), message).expect("send");
+        }
+
+        // The **sender's** mailbox holds only the payload: the events go to the tracer.
+        assert_eq!(
+            drain(&mut rt, &mut table, sender),
+            vec![message],
+            "only the payload reaches the sender"
+        );
+
+        // The tracer's mailbox holds exactly the two events, in order: the ordinary
+        // `{trace, …}` event, then the sequential-trace `{seq_trace, …}` event.
+        let messages = drain(&mut rt, &mut table, tracer);
+        assert_eq!(messages.len(), 2, "the two events: {messages:?}");
+
+        // 1. `{trace, Sender, send, Msg, To}`.
+        let event = messages[0];
         assert_eq!(terms::tuple_arity(event).expect("a tuple"), 5);
         assert_eq!(terms::tuple_element(event, 0).expect("the tag"), trace);
-        assert_eq!(terms::tuple_element(event, 1).expect("the tracee"), pid.to_eterm());
+        assert_eq!(terms::tuple_element(event, 1).expect("the tracee"), sender.to_eterm());
         assert_eq!(terms::tuple_element(event, 2).expect("the event"), send);
         assert_eq!(terms::tuple_element(event, 3).expect("the message"), message);
-        assert_eq!(terms::tuple_element(event, 4).expect("the destination"), pid.to_eterm());
+        assert_eq!(
+            terms::tuple_element(event, 4).expect("the destination"),
+            sender.to_eterm()
+        );
 
-        // 3. `{seq_trace, Label, {send, {Previous, Current}, From, To, Msg}}`.
-        let event = messages[2];
+        // 2. `{seq_trace, Label, {send, {Previous, Current}, From, To, Msg}}`.
+        let event = messages[1];
         assert_eq!(terms::tuple_arity(event).expect("a tuple"), 3);
         assert_eq!(terms::tuple_element(event, 0).expect("the tag"), seq_trace);
         assert_eq!(terms::tuple_element(event, 1).expect("the label"), label);
@@ -1229,12 +1313,122 @@ mod tests {
         // current counter is 1 (`seq_trace.erl:88-90`).
         assert_eq!(terms::tuple_element(counters, 0).expect("previous"), make_small(0));
         assert_eq!(terms::tuple_element(counters, 1).expect("current"), make_small(1));
-        assert_eq!(terms::tuple_element(payload, 2).expect("from"), pid.to_eterm());
-        assert_eq!(terms::tuple_element(payload, 3).expect("to"), pid.to_eterm());
+        assert_eq!(terms::tuple_element(payload, 2).expect("from"), sender.to_eterm());
+        assert_eq!(terms::tuple_element(payload, 3).expect("to"), sender.to_eterm());
         assert_eq!(terms::tuple_element(payload, 4).expect("the message"), message);
     }
 
-    // The trace-pattern model ---------------------------------------------------------------
+    /// ERTS discards a trace event whose tracer **is** the tracee
+    /// (`erts/emulator/nifs/common/erl_tracer_nif.c:143-146`, "Only generate trace for when
+    /// tracer != tracee"), so a self-traced process observes no events of its own — the oracle
+    /// answers `timeout` for the `receive` after a `erlang:trace(self(), true, [send])` self-send.
+    #[test]
+    fn a_self_traced_process_emits_no_event_to_itself() {
+        let mut rt = crate::Runtime::with_defaults().expect("the default runtime");
+        let pid = rt.self_pid();
+        let message = rt.intern("payload");
+        // The sender traces *itself*: tracer == tracee, so the `send` event is discarded.
+        rt.trace_mut().set(
+            pid,
+            flags_from_atoms(&["send"]).expect("send"),
+            Some(pid),
+        );
+
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
+        ctx.send_message(pid.to_eterm(), message).expect("send");
+
+        // The mailbox holds the payload and **nothing else** — no `{trace, …}` event.
+        ctx.receive_reset().expect("timeout");
+        let mut messages = Vec::new();
+        while let Some(term) = ctx.receive_next().expect("receive_next") {
+            messages.push(term);
+            ctx.receive_remove().expect("remove_message");
+            assert!(messages.len() < 8, "the mailbox keeps draining: {messages:?}");
+        }
+        assert_eq!(messages, vec![message], "the discard rule suppressed the event");
+    }
+
+    /// A **`['receive']`-traced** receiver gets `{trace, Receiver, 'receive', Msg}` when a
+    /// message is delivered to it — and the flag lives on the receiver, so a `[send]`-traced
+    /// *sender* does not produce it for an untraced receiver. Probe (OTP 29.1.1 / erts-17.1):
+    /// tracing `Q` with `['receive']` and sending `Q` a message the process never matches still
+    /// yields `{trace, Q, 'receive', never_matched}` (the event fires on enqueue).
+    #[test]
+    fn a_receive_traced_receiver_emits_the_receive_event() {
+        let (mut rt, mut table, sender, tracer) = two_processes();
+        let message = rt.intern("payload");
+        let receive = rt.intern("receive");
+        let trace = rt.intern("trace");
+        // The **tracer** is traced with `['receive']` and reports to the sender (a third party,
+        // distinct from the tracee): the tracer receives `{trace, tracer, 'receive', Msg}` in
+        // its own mailbox when the *sender* delivers to it.
+        rt.trace_mut().set(
+            tracer,
+            flags_from_atoms(&["receive"]).expect("receive"),
+            Some(sender),
+        );
+
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, sender);
+            ctx.send_message(tracer.to_eterm(), message).expect("send");
+        }
+
+        // The receive-traced **receiver's** mailbox holds only the payload: its event reports to
+        // the tracer, not to itself.
+        assert_eq!(
+            drain(&mut rt, &mut table, tracer),
+            vec![message],
+            "only the payload reaches the receiver"
+        );
+
+        // The tracer's mailbox holds the `receive` event, about the receiver.
+        let events = drain(&mut rt, &mut table, sender);
+        assert_eq!(events.len(), 1, "the receive event: {events:?}");
+        let event = events[0];
+        assert_eq!(terms::tuple_arity(event).expect("a tuple"), 4);
+        assert_eq!(terms::tuple_element(event, 0).expect("the tag"), trace);
+        assert_eq!(
+            terms::tuple_element(event, 1).expect("the tracee"),
+            tracer.to_eterm(),
+            "the event is about the *receiver*"
+        );
+        assert_eq!(terms::tuple_element(event, 2).expect("the event"), receive);
+        assert_eq!(terms::tuple_element(event, 3).expect("the message"), message);
+    }
+
+    /// A `[send]`-traced sender delivering to an **untraced** receiver emits only the `send`
+    /// event: the `receive` flag on the sender produces nothing for the receiver.
+    #[test]
+    fn the_receive_event_is_gated_on_the_receiver_not_the_sender() {
+        let (mut rt, mut table, sender, receiver) = two_processes();
+        let message = rt.intern("payload");
+        let send = rt.intern("send");
+        // The *sender* carries both flags and reports to the receiver; the receiver is untraced,
+        // so it must contribute no `receive` event of its own.
+        rt.trace_mut().set(
+            sender,
+            flags_from_atoms(&["send", "receive"]).expect("send+receive"),
+            Some(receiver),
+        );
+
+        {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, sender);
+            ctx.send_message(receiver.to_eterm(), message).expect("send");
+        }
+
+        // The untraced receiver's mailbox holds the payload and the one `send` event for the
+        // *sending* process, and nothing else; the sender's own mailbox is empty.
+        let received = drain(&mut rt, &mut table, receiver);
+        assert_eq!(received.len(), 2, "the payload and the send event: {received:?}");
+        assert_eq!(received[0], message);
+        assert_eq!(terms::tuple_element(received[1], 2).expect("the event"), send);
+        assert_eq!(
+            drain(&mut rt, &mut table, sender),
+            Vec::new(),
+            "a `receive` flag on the sender produces no event for the receiver"
+        );
+    }    // The trace-pattern model ---------------------------------------------------------------
 
     /// A pattern from its three selectors (`None` = the `'_'` wildcard).
     fn pattern(module: Option<&str>, function: Option<&str>, arity: Option<u32>) -> MfaPattern {

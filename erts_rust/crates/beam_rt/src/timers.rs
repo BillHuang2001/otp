@@ -31,7 +31,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 use beam_process::ProcessId;
-use beam_term::prelude::{Atom, Eterm};
+use beam_term::prelude::{is_atom, is_small, signed_value, atom_val, Atom, Eterm};
 
 /// Fallback offset (~68 years) used when `now + delay` would overflow an [`Instant`].
 ///
@@ -52,6 +52,58 @@ pub(crate) enum TimerTarget {
     Pid(ProcessId),
     /// Deliver to whatever process holds this registered name at fire time.
     Name(Atom),
+}
+
+/// The delay of a timer BIF: a non-negative integer of milliseconds that a monotonic
+/// deadline can actually represent (the oracle's `parse_timeout_pos` validation,
+/// `erl_hl_timer.c:2567`).
+///
+/// Shared by **every** timer entry point — the runtime-native
+/// `erlang:send_after/3`/[`cancel_timer/1`](crate::native) and the [`RuntimeHooks`] timer
+/// family (`erlang:start_timer/3,4`, `send_after/4`, `cancel_timer/2`) — so the validation
+/// of the time argument can never drift between them.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for a non-integer, a negative integer, or an integer whose
+/// deadline would overflow the runtime's monotonic clock — the oracle's `badarg` (its
+/// time validation fails too) rather than a silently saturated deadline that would fire at
+/// the wrong moment.
+///
+/// [`RuntimeHooks`]: beam_bifs::RuntimeHooks
+pub(crate) fn timer_delay(term: Eterm) -> beam_common::Result<Duration> {
+    if !is_small(term) {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    let millis = u64::try_from(signed_value(term))
+        .map_err(|_| beam_common::BeamError::BadArg)?;
+    let delay = Duration::from_millis(millis);
+    if Instant::now().checked_add(delay).is_none() {
+        return Err(beam_common::BeamError::BadArg);
+    }
+    Ok(delay)
+}
+
+/// The destination of a timer: a pid (pinned now) or a registered name (resolved when the
+/// timer fires).
+///
+/// Shared with the [`RuntimeHooks`] timer family for the same reason as [`timer_delay`].
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for anything but a pid or an atom — a port, a `{Name, Node}` tuple
+/// (the C's `is_not_internal_pid(rcvr) && is_not_atom(rcvr)` check, `erl_hl_timer.c:1799`),
+/// or any other term.
+///
+/// [`RuntimeHooks`]: beam_bifs::RuntimeHooks
+pub(crate) fn timer_target(term: Eterm) -> beam_common::Result<TimerTarget> {
+    if let Ok(pid) = ProcessId::from_eterm(term) {
+        return Ok(TimerTarget::Pid(pid));
+    }
+    if is_atom(term) {
+        return Ok(TimerTarget::Name(atom_val(term)));
+    }
+    Err(beam_common::BeamError::BadArg)
 }
 
 /// What a timer does when its deadline passes.

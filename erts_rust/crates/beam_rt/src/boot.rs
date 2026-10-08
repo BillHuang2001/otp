@@ -188,6 +188,11 @@ pub const CORE_ATOMS: &[&str] = &[
     "compile",
     "md5",
     "module",
+    // The tag atom the `RuntimeHooks` timer family emits
+    // (`erlang:start_timer/3,4` builds `{timeout, TRef, Msg}`). The bridge may not intern
+    // — the shared table is borrowed immutably for the whole BIF call — so the name must
+    // be seeded. Appended after every existing group, as the append-only rule requires.
+    "timeout",
 ];
 
 /// The preloaded-module registry skeleton (contract A.7).
@@ -458,6 +463,7 @@ mod tests {
             "compile",
             "md5",
             "module",
+            "timeout",
         ];
         let mut atoms = AtomTable::new();
         seed_core_atoms(&mut atoms);

@@ -20,6 +20,7 @@
 //! | [`Driver::stop`] | `stop` | absent slot ⇒ no-op |
 //! | [`Driver::next_timeout`] | the `driver_set_timer` deadline | see [`crate::AbiHost`] |
 //! | [`DriverPort::poll_async`] | `ready_async` / `async_free` | drained from the `driver_async` job set |
+//! | — | `stop_select` | the `ERL_DRV_USE` release callback; runs outside the `Driver` trait, on deselect and at teardown |
 //!
 //! # The port handle is stable, and the host outlives every callback
 //!
@@ -49,9 +50,25 @@
 //!
 //! * [`DriverPort::call`] — around **every** callback it routes (`start`/`output`/`ready_input`/
 //!   `ready_output`/`control`/`timeout`/`port_exit`/`stop`), including the `ready_async` branch of
-//!   [`DriverPort::poll_async`]; and
+//!   [`DriverPort::poll_async`], and around the `stop_select` callbacks `DriverPort` fires on a
+//!   released `ERL_DRV_USE` selection; and
 //! * the `async_free` branch of [`DriverPort::poll_async`], which bypasses `call` (the C's
 //!   `async_free` is `void (*)(void*)`, with no port and no `ready_async`).
+//!
+//! # `ERL_DRV_USE` — the `stop_select` release callback
+//!
+//! A `driver_select` whose `mode` carries `ERL_DRV_USE` (`ERL_NIF_SELECT_STOP`) tells the runtime
+//! the driver wants `stop_select(event, NULL)` when the selection is really gone — the last moment
+//! at which it may close or recycle the handle (`ERL_DRV_USE_NO_CALLBACK`, i.e. `ERL_DRV_USE |
+//! ERL_DRV_USE << 1`, keeps the bookkeeping but declines the callback). [`AbiHost::select`] records
+//! the two bits with the registration; this adapter fires the callback from three places, all of
+//! them **after** the driver call that produced the release has returned, as in the C:
+//!
+//! * a deselect (`driver_select(..., 0)`) — when the `call` that ran it returns
+//!   (`erl_check_io.c:1210-1216`), with the event the *deselecting* call was given;
+//! * port teardown ([`Driver::stop`]) — for every registration the driver left selected, with the
+//!   fd cast to an `ErlDrvEvent` (`erl_check_io.c:2232-2238`); and
+//! * [`Drop`] — the same teardown release for a port that never ran `stop`.
 //!
 //! The remaining `Driver` methods ([`Driver::drive_async`] = `poll_async`, [`Driver::next_timeout`],
 //! [`Driver::take_exit_status`]) run no driver code, so they publish nothing. A driver that calls
@@ -252,7 +269,78 @@ impl DriverPort {
         // SAFETY: `abi_ptr` is the address of the boxed `AbiHost` field (see above), live for the
         // whole of this call.
         let host: &mut dyn DriverHost = unsafe { &mut *abi_ptr };
-        beam_abi::with_current_host(host, || f(self, port))
+        let result = beam_abi::with_current_host(host, || f(self, port));
+        // A `driver_select(..., 0)` the driver just made queued its `ERL_DRV_USE` release (see
+        // `AbiHost::select`); the callback runs now, after the driver's own call has returned.
+        self.drain_queued_stop_select();
+        result
+    }
+
+    /// Fires the driver's `stop_select` callback for each `ErlDrvEvent` in `events`.
+    ///
+    /// `stop_select` is the frozen `ERL_DRV_USE` release callback: a driver that selected a handle
+    /// with `ERL_DRV_USE` (`ERL_NIF_SELECT_STOP`) is told when the selection is really gone, so it
+    /// may close or recycle the handle. The C invokes it with the event the *deselecting*
+    /// `driver_select` was given (`erl_check_io.c:1215`) or, at port teardown, with the fd cast to
+    /// an `ErlDrvEvent` (`erl_check_io.c:2235`). Its signature is `void(ErlDrvEvent, void*)`, with
+    /// no port and no failure channel, so an entry without the slot is simply nothing to do (the
+    /// C's `no_stop_select_callback`, `io.c:7546-7553`).
+    ///
+    /// The host is published for the same reason [`DriverPort::call`] publishes it around every
+    /// other callback: a driver may reach the two no-port registry slots from `stop_select` too.
+    fn fire_stop_select(&mut self, events: Vec<ErlDrvEvent>) {
+        if events.is_empty() || self.lib.entry().stop_select.is_none() {
+            return;
+        }
+        let abi_ptr: *mut AbiHost = &mut *self.abi;
+        let lib = &self.lib;
+        // SAFETY: `abi_ptr` is the address of the boxed `AbiHost` field (see `DriverPort::call`),
+        // live for the whole of this call; the closure below reads only `self.lib` (a disjoint
+        // field), so nothing re-borrows `*abi_ptr` through it, and the pointer is retired when
+        // `with_current_host` returns.
+        let host: &mut dyn DriverHost = unsafe { &mut *abi_ptr };
+        beam_abi::with_current_host(host, || {
+            for event in events {
+                // Each `event` is a value the driver itself handed to `driver_select` (or its fd),
+                // so it is exactly the operand the C hands back. The `Result` is only the absent-
+                // slot report, already excluded above.
+                let _ = lib.stop_select(event, core::ptr::null_mut());
+            }
+        });
+    }
+
+    /// Fires the `stop_select` callbacks queued by a `driver_select(..., 0)` during the driver
+    /// callback that just returned.
+    ///
+    /// The C likewise calls `stop_select` after releasing the fd lock (`erl_check_io.c:1210-1216`),
+    /// never re-entrantly into the driver's own `driver_select`.
+    fn drain_queued_stop_select(&mut self) {
+        let queued = self.abi.state_mut().take_queued_stop_select();
+        self.fire_stop_select(queued);
+    }
+
+    /// Releases every `driver_select` registration still in force when the port goes away.
+    ///
+    /// A `ERL_DRV_USE` registration still selected at teardown owes its owner the same
+    /// `stop_select` callback the deselect path fires; the C passes `(ErlDrvEvent) fd` there
+    /// (`erl_check_io.c:2232-2238`), the fd cast to a pointer rather than the operand the driver
+    /// originally selected with (they coincide for the fd-cast convention every driver uses).
+    ///
+    /// The poller registration is withdrawn too when a [`DriverContext`] is at hand — the ordinary
+    /// [`Driver::stop`] path — so a closed port leaves the reactor clean; [`Drop`] has no context
+    /// and can only run the callback (the registration then dies with the poller).
+    fn release_selects_on_teardown(&mut self, mut ctx: Option<&mut DriverContext<'_>>) {
+        let selects = self.abi.state_mut().take_all_selected();
+        let mut events = Vec::new();
+        for (fd, token, owes_stop_select) in selects {
+            if let Some(ctx) = ctx.as_mut() {
+                let _ = ctx.deregister(fd, token);
+            }
+            if owes_stop_select {
+                events.push(fd as usize as ErlDrvEvent);
+            }
+        }
+        self.fire_stop_select(events);
     }
 
     /// Runs the driver's `ready_async` for each finished `driver_async` job, or its `async_free`
@@ -305,6 +393,9 @@ impl DriverPort {
             }
             processed += 1;
         }
+        // An `async_free` runs outside `call`, so a `driver_select(..., 0)` it made queued its
+        // release without a `call` to drain it (see `DriverPort::fire_stop_select`).
+        self.drain_queued_stop_select();
         Ok(processed)
     }
 }
@@ -553,6 +644,15 @@ impl Driver for DriverPort {
         self.poll_async(ctx)
     }
 
+    /// Whether the driver has an outstanding `driver_async` job.
+    ///
+    /// Delegates to [`AbiHost::has_pending_async`]: `true` while a job is running or has completed
+    /// but not yet had its `ready_async`/`async_free` run, so the port-task round knows this port
+    /// needs its [`Driver::drive_async`] = [`DriverPort::poll_async`] point.
+    fn has_pending_async(&self) -> bool {
+        self.abi.has_pending_async()
+    }
+
     /// The `driver_set_timer` deadline, as the port's next `TIMEOUT`.
     fn next_timeout(&self) -> Option<Instant> {
         self.abi.state().deadline()
@@ -604,11 +704,30 @@ impl Driver for DriverPort {
     /// An absent `stop` slot is the C's silent no-op (`if (drv->stop) …`). The library itself is
     /// unloaded only when the [`DriverPort`] drops (its `finish` callback then runs), matching the
     /// C's split between closing a port and unloading a driver.
+    ///
+    /// A `driver_select`ion the driver did **not** de-select is released here, exactly as the C's
+    /// port teardown releases it (`erl_check_io.c:2232-2238`): the poller registration is withdrawn
+    /// and an `ERL_DRV_USE` one owes its owner a final `stop_select`.
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         self.call(ctx, |port, _handle| {
             let _ = port.lib.stop(port.data);
         });
+        self.release_selects_on_teardown(Some(ctx));
         Ok(())
+    }
+}
+
+/// A port's last chance to release its `driver_select` registrations.
+///
+/// The ordinary teardown is [`Driver::stop`], which has a [`DriverContext`] and so can also
+/// withdraw the poller registrations. This catches a [`DriverPort`] dropped **without** `stop`
+/// running — a port whose `start` failed, or a whole [`PortRegistry`](crate::PortRegistry) dropped
+/// while ports are still live — and fires the `stop_select` callbacks such a port still owes, so a
+/// driver is never left believing it still owns a handle the runtime has discarded. There is no
+/// context here, so only the callback runs (the poller registration dies with the poller).
+impl Drop for DriverPort {
+    fn drop(&mut self) {
+        self.release_selects_on_teardown(None);
     }
 }
 

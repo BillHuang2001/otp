@@ -176,14 +176,78 @@ fn a_child_that_floods_stderr_does_not_block_the_port() {
     let mut poller = poller();
     let mut registry = PortRegistry::new();
 
-    // The child writes far more than a pipe buffer (200 KiB ≫ the 64 KiB default) to
-    // **stderr** and only afterwards writes its stdout. A piped-but-undrained stderr would
-    // fill, block the child on its `write(2)`, and hang it before `echo done` ever runs —
-    // the port would then never deliver its stdout. Discarding stderr (`Stdio::null`) means
-    // there is no pipe to fill, so the flood cannot block the child.
-    let driver = SpawnDriver::new(
+    // The child writes far more than a pipe buffer (200000 bytes >> the default 64 KiB) to
+    // **stderr** and only afterwards writes its stdout. With `stderr_to_stdout` that stream is
+    // a pipe the *driver* owns (the oracle hands the child its stdout pipe as stderr as well,
+    // `stderrfd = ifd[1]`, `sys_drivers.c:500`), so an undrained stderr would fill, block the
+    // child on its `write(2)`, and hang it before `echo done` ever runs; the flood is then
+    // delivered back as port data, so the test can require **every** byte rather than merely
+    // observing that the child did not hang.
+    //
+    // (The default — the child's stderr inherited from this process — is covered by
+    // `the_childs_stderr_is_inherited_and_is_not_port_data_by_default`. It deliberately does
+    // not flood: there is no driver-side pipe to fill, and a 200 KiB flood would only be
+    // written to this test runner's own stderr.)
+    const FLOOD: usize = 200000;
+    let driver = SpawnDriver::with_stream_options(
         &shell("head -c 200000 /dev/zero 1>&2; echo done"),
-        &SpawnOptions::default(),
+        &SpawnOptions {
+            stream: SpawnStream::Binary,
+            ..SpawnOptions::default()
+        },
+        StreamOptions {
+            stderr_to_stdout: true,
+            eof: false,
+        },
+    )
+    .expect("the shell starts");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+
+    let received = pump_input(&mut poller, &mut registry, id, FLOOD + 5);
+    assert!(
+        received.len() >= FLOOD + 5,
+        "the whole flood arrives (got {} of {})",
+        received.len(),
+        FLOOD + 5
+    );
+    assert!(
+        received[..FLOOD].iter().all(|byte| *byte == 0),
+        "the flooded stderr bytes are the child's own, none were dropped"
+    );
+    assert_eq!(
+        &received[FLOOD..FLOOD + 5],
+        b"done\n",
+        "the child reached its stdout write after the flood: it never blocked"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+#[test]
+fn stderr_to_stdout_merges_the_childs_stderr_into_the_port_data() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    // `echo O` writes stdout, `echo E 1>&2` writes stderr. With the `stderr_to_stdout` option
+    // the child's descriptor 2 is an exact duplicate of its descriptor 1, so both land in the
+    // port's input stream in true write order — the oracle's own behaviour
+    // (`stderrfd = opts->redir_stderr ? ifd[1] : dup(2)`, `sys_drivers.c:500`), cross-checked
+    // byte-for-byte below against the real `erl`.
+    let options = SpawnOptions {
+        args: vec!["-c".to_string(), "echo O; echo E 1>&2".to_string()],
+        ..SpawnOptions::default()
+    };
+    let driver = SpawnDriver::with_stream_options(
+        &SpawnSpec::SpawnExecutable {
+            path: "/bin/sh".to_string(),
+        },
+        &options,
+        StreamOptions {
+            stderr_to_stdout: true,
+            eof: false,
+        },
     )
     .expect("the shell starts");
     let id = registry
@@ -191,12 +255,185 @@ fn a_child_that_floods_stderr_does_not_block_the_port() {
         .expect("the port opens");
 
     assert_eq!(
-        pump_input(&mut poller, &mut registry, id, 5),
-        b"done\n",
-        "a child that floods stderr still delivers its stdout"
+        pump_input(&mut poller, &mut registry, id, 4),
+        b"O\nE\n",
+        "stdout and stderr are one merged stream, in write order"
+    );
+    // The merged stream ends: nothing else is delivered, and the end-of-file deregisters it.
+    assert!(pump_until(&mut poller, &mut registry, |_, poller| poller
+        .is_empty()));
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+#[test]
+fn the_childs_stderr_is_inherited_and_is_not_port_data_by_default() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    // Without `stderr_to_stdout` the child's stderr is the emulator's (the oracle's `dup(2)`),
+    // so nothing written to it is port data. The child writes to stderr *before* its stdout, so
+    // a driver that merged the two (or that delivered stderr at all) would show it here. The
+    // line is inherited by this test process's stderr, so it is worded to explain itself rather
+    // than look like a stray failure.
+    let driver = SpawnDriver::new(
+        &shell("echo '[beam_io] child stderr inherited (expected, not port data)' 1>&2; echo O"),
+        &SpawnOptions::default(),
+    )
+    .expect("the shell starts");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+
+    assert!(
+        pump_until(&mut poller, &mut registry, |_, poller| poller.is_empty()),
+        "the child's end-of-file deregisters its stdout"
+    );
+    assert_eq!(
+        registry.get_mut(id).expect("live").drain_input(),
+        b"O\n",
+        "only stdout is port data; the child's stderr was inherited instead"
     );
 
     registry.close(&mut poller, id).expect("the port closes");
+}
+
+#[test]
+fn a_child_that_writes_more_than_one_read_chunk_is_drained_in_full() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    // One `READ_CHUNK` is 64 KiB and the reactor is edge-triggered, so a `ready_input` that
+    // read once per readiness would stall at 64 KiB and never deliver the tail (a further
+    // edge would only arrive if more data were written). The write path must loop to `EAGAIN`.
+    const PAYLOAD: usize = 256 * 1024;
+    let driver = SpawnDriver::new(
+        &shell("head -c 262144 /dev/zero; echo done"),
+        &SpawnOptions {
+            stream: SpawnStream::Binary,
+            ..SpawnOptions::default()
+        },
+    )
+    .expect("the shell starts");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+
+    let received = pump_input(&mut poller, &mut registry, id, PAYLOAD + 5);
+    assert!(
+        received.len() >= PAYLOAD + 5,
+        "every byte arrives (got {} of {})",
+        received.len(),
+        PAYLOAD + 5
+    );
+    assert_eq!(
+        &received[PAYLOAD..PAYLOAD + 5],
+        b"done\n",
+        "the tail of a multi-chunk write is delivered, not stranded"
+    );
+    assert!(
+        received[..PAYLOAD].iter().all(|byte| *byte == 0),
+        "the delivered bytes are the child's own"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+#[test]
+fn a_port_that_asked_for_eof_reports_it_once() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    let driver = SpawnDriver::with_stream_options(
+        &shell("echo hi"),
+        &SpawnOptions::default(),
+        StreamOptions {
+            stderr_to_stdout: false,
+            eof: true,
+        },
+    )
+    .expect("the shell starts");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+
+    // Nothing has been read yet, so there is no end-of-file to report.
+    assert!(
+        !registry.take_eof(id).expect("the check succeeds"),
+        "an end-of-file that has not happened yet is not reported"
+    );
+    assert!(
+        pump_until(&mut poller, &mut registry, |_, poller| poller.is_empty()),
+        "the child's end-of-file deregisters its stdout"
+    );
+    assert_eq!(
+        registry.get_mut(id).expect("live").drain_input(),
+        b"hi\n",
+        "the data before the end of the stream still arrives"
+    );
+    assert!(
+        registry.take_eof(id).expect("the check succeeds"),
+        "the port's end-of-file is reported"
+    );
+    assert!(
+        !registry.take_eof(id).expect("the check succeeds"),
+        "and exactly once"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+#[test]
+fn a_port_without_the_eof_option_never_reports_one() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    let driver = SpawnDriver::new(&shell("echo hi"), &SpawnOptions::default())
+        .expect("the shell starts");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+
+    assert!(pump_until(&mut poller, &mut registry, |_, poller| poller
+        .is_empty()));
+    assert!(
+        !registry.take_eof(id).expect("the check succeeds"),
+        "without the `eof` option the end of the stream is not reported"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+#[test]
+fn an_unknown_port_has_no_eof() {
+    let mut registry = PortRegistry::new();
+    assert!(matches!(
+        registry.take_eof(PortId::new(4242)),
+        Err(BeamError::BadArg)
+    ));
+}
+
+#[test]
+fn an_empty_name_is_rejected_as_badarg_like_the_oracle() {
+    // `open_port({spawn,""},[])` and `open_port({spawn_executable,""},[])` are both
+    // `error:badarg` (verified against erts-17.1) while `{spawn," "}` is accepted.
+    assert!(matches!(
+        SpawnDriver::new(&shell(""), &SpawnOptions::default())
+            .map(|_| ())
+            .err(),
+        Some(BeamError::BadArg)
+    ));
+    assert!(matches!(
+        SpawnDriver::new(
+            &SpawnSpec::SpawnExecutable {
+                path: String::new()
+            },
+            &SpawnOptions::default(),
+        )
+        .map(|_| ())
+        .err(),
+        Some(BeamError::BadArg)
+    ));
 }
 #[test]
 fn the_argv_form_runs_the_program_directly() {
@@ -734,16 +971,27 @@ enum OracleOutcome {
 /// system Erlang. A *spawned* `erl` that exits non-zero is a bug in the embedded expression,
 /// so that is asserted rather than skipped.
 fn erl_stdout(expr: &str, path: &str) -> Option<String> {
+    erl_run(expr, Some(path))
+}
+
+/// [`erl_stdout`] for an expression that needs no environment of its own.
+fn erl_stdout_plain(expr: &str) -> Option<String> {
+    erl_run(expr, None)
+}
+
+/// The shared body of the two helpers: runs a `-eval` snippet under the system `erl`, with
+/// `BEAM_IO_ORACLE_PATH` set when `path` is given.
+fn erl_run(expr: &str, path: Option<&str>) -> Option<String> {
     let code = format!("{expr}, halt(0).");
     let (tx, rx) = std::sync::mpsc::channel();
-    let path = path.to_string();
+    let path = path.map(str::to_string);
     std::thread::spawn(move || {
-        let out = std::process::Command::new("erl")
-            .arg("-noshell")
-            .arg("-eval")
-            .arg(&code)
-            .env("BEAM_IO_ORACLE_PATH", &path)
-            .output();
+        let mut command = std::process::Command::new("erl");
+        command.arg("-noshell").arg("-eval").arg(&code);
+        if let Some(path) = &path {
+            command.env("BEAM_IO_ORACLE_PATH", path);
+        }
+        let out = command.output();
         // The receiver may have timed out and gone away; that is fine.
         let _ = tx.send(out);
     });
@@ -846,4 +1094,283 @@ fn a_failed_spawn_matches_the_oracle_errno_atom() {
     // The parent directory's write/search bits are enough to unlink the mode-0 file.
     let _ = std::fs::set_permissions(&no_perm, std::fs::Permissions::from_mode(0o600));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Oracle cross-check: a *deferred* `exec` failure
+// ---------------------------------------------------------------------------
+
+/// The oracle's observation of `open_port({spawn_executable, Path}, [binary, exit_status, eof])`.
+enum OraclePort {
+    /// The oracle opened the port, reporting these `{exit_status, N}` values and whether it
+    /// also reported `eof`.
+    Opened {
+        /// Every `{exit_status, N}` value the port sent.
+        statuses: Vec<i32>,
+        /// Whether the port also sent `eof`.
+        eof: bool,
+    },
+    /// The oracle raised `error:Reason` instead of opening the port.
+    Raised(String),
+}
+
+/// Runs the oracle's `open_port/2` on `path` and collects what it reports, or `None` when the
+/// system `erl` is unavailable.
+///
+/// The path travels through the environment (`BEAM_IO_ORACLE_PATH`), so it never has to be
+/// escaped into the `-eval` source.
+fn oracle_port(path: &str) -> Option<OraclePort> {
+    let expr = r#"P = case os:getenv("BEAM_IO_ORACLE_PATH") of false -> ""; V -> V end,
+                  try erlang:open_port({spawn_executable, P}, [binary, exit_status, eof]) of
+                      Port ->
+                          F = fun Loop(Acc) ->
+                                  receive {Port, M} -> Loop([M|Acc]) after 400 -> lists:reverse(Acc) end
+                              end,
+                          Msgs = F([]),
+                          io:format("ok ~w ~w~n",
+                                    [[S || {exit_status, S} <- Msgs], lists:member(eof, Msgs)])
+                  catch error:Reason -> io:format("error ~w~n", [Reason]) end"#;
+    let out = erl_stdout(expr, path)?;
+    let line = out.trim();
+    match line.strip_prefix("ok ") {
+        Some(rest) => {
+            let (statuses, eof) = rest.split_once(' ').expect("the two reported terms");
+            let statuses = statuses
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.parse().expect("an integer exit status"))
+                .collect();
+            Some(OraclePort::Opened {
+                statuses,
+                eof: eof.trim() == "true",
+            })
+        }
+        None => Some(OraclePort::Raised(
+            line.strip_prefix("error ").unwrap_or(line).to_string(),
+        )),
+    }
+}
+
+#[test]
+fn a_deferred_exec_failure_opens_the_port_and_reports_the_errno_as_the_exit_status() {
+    // The reference checks `access(Path, X_OK)` in the **emulator** (`spawn_start`,
+    // `sys_drivers.c:521`) and only then hands the name to its forked child, which `execve`s it
+    // and, on failure, calls `_exit(errno)` (`erl_child_setup.c:361-369`). So a path the check
+    // *accepts* but the `exec` rejects is not an `open_port/2` error: the port opens and the
+    // child's exit status is the failing errno. Two such paths:
+    //
+    // * a **searchable directory** — `execve` fails `EACCES` (13);
+    // * a file carrying its execute bit with no recognizable executable **format** —
+    //   `execve` fails `ENOEXEC` (8).
+    //
+    // Both are exactly the cases the standard library's `Command::spawn` reports synchronously,
+    // so this driver forks its own child for them. The expectation is taken live from the
+    // oracle, so the test pins the *reason* the port opens rather than a hard-coded status.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("beam_io_spawn_deferred_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+        .expect("the directory is searchable");
+    let no_format = dir.join("no-executable-format");
+    std::fs::write(&no_format, b"plain text, not an executable format\n").expect("the file");
+    std::fs::set_permissions(&no_format, std::fs::Permissions::from_mode(0o755))
+        .expect("the execute bit is set");
+
+    let cases = [
+        ("a searchable directory", dir.to_string_lossy().into_owned()),
+        (
+            "a file with no executable format",
+            no_format.to_string_lossy().into_owned(),
+        ),
+    ];
+
+    for (label, path) in cases {
+        let (expected_status, expected_eof) = match oracle_port(&path) {
+            Some(OraclePort::Opened { statuses, eof }) => {
+                assert_eq!(
+                    statuses.len(),
+                    1,
+                    "the oracle reports one exit status for {path}"
+                );
+                assert!(eof, "the oracle reports end of file for {path}");
+                (statuses[0], eof)
+            }
+            Some(OraclePort::Raised(reason)) => panic!(
+                "the oracle must open the port for {label} ({path}), but raised error:{reason}"
+            ),
+            None => {
+                eprintln!("skipping deferred-exec oracle check: the system `erl` is unavailable");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let driver = SpawnDriver::with_stream_options(
+            &SpawnSpec::SpawnExecutable { path: path.clone() },
+            &SpawnOptions {
+                exit_status: true,
+                ..SpawnOptions::default()
+            },
+            StreamOptions {
+                stderr_to_stdout: false,
+                eof: true,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{label} ({path}) must open a port, not raise: {error:?}"));
+        assert!(
+            driver.os_pid().is_some(),
+            "{label}: a real child process backs the port"
+        );
+        let id = registry
+            .open(&mut poller, Box::new(driver))
+            .expect("the port opens");
+        assert_eq!(registry.get(id).expect("live").driver_name(), "spawn");
+
+        // Take the exit status as the reactor reports the child's end of stream.
+        let mut status = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while status.is_none() && Instant::now() < deadline {
+            let events = poll_events(&mut poller, Duration::from_millis(50));
+            registry
+                .handle_events(&mut poller, &events)
+                .expect("events dispatch");
+            status = registry.take_exit_status(id).expect("the wait succeeds");
+        }
+        assert_eq!(
+            status,
+            Some(expected_status),
+            "{label}: the failing errno is the child's exit status"
+        );
+        assert_eq!(
+            registry.take_exit_status(id).expect("the wait succeeds"),
+            None,
+            "{label}: the status is reported exactly once"
+        );
+
+        // The child failed before it could write, so its stdout is an empty stream that reaches
+        // end of file and is deregistered.
+        assert!(
+            pump_until(&mut poller, &mut registry, |_, poller| poller.is_empty()),
+            "{label}: the child's empty stdout deregisters at end of file"
+        );
+        assert_eq!(
+            registry.get_mut(id).expect("live").drain_input(),
+            b"",
+            "{label}: the child wrote nothing"
+        );
+        assert_eq!(
+            registry.take_eof(id).expect("the check succeeds"),
+            expected_eof,
+            "{label}: the end of the stream is reported"
+        );
+        assert!(
+            !registry.take_eof(id).expect("the check succeeds"),
+            "{label}: and exactly once"
+        );
+
+        registry.close(&mut poller, id).expect("the port closes");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Oracle cross-check: the stderr stream option
+// ---------------------------------------------------------------------------
+
+/// The hex-encoded bytes the *oracle* delivers as port data for the given shell command, with
+/// `stderr_to_stdout` either on or off, or `None` when `erl` is unavailable.
+///
+/// The oracle opens `{spawn_executable, "/bin/sh"}` with `{args, ["-c", Command]}` and
+/// concatenates every `{Port, {data, Bin}}` chunk it receives before the port's stream ends
+/// (the command and its flags are literals of this test, so nothing has to be escaped into the
+/// `-eval` source).
+fn oracle_port_data_hex(command: &str, stderr_to_stdout: bool) -> Option<String> {
+    let extra = if stderr_to_stdout {
+        "stderr_to_stdout, "
+    } else {
+        ""
+    };
+    let expr = format!(
+        r#"try erlang:open_port({{spawn_executable, "/bin/sh"}},
+                              [binary, {extra}{{args, ["-c", "{command}"]}}]) of
+             P -> F = fun Loop(Acc) ->
+                         receive {{P, {{data, B}}}} -> Loop(<<Acc/binary, B/binary>>)
+                         after 300 -> Acc end end,
+                  io:format("~s~n", [binary:encode_hex(F(<<>>), lowercase)])
+           catch error:R -> io:format("error:~p~n", [R]) end"#
+    );
+    let out = erl_stdout_plain(&expr)?;
+    Some(out.trim().to_string())
+}
+
+/// The hex encoding of `bytes`, the form the oracle cross-check compares in.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn the_stderr_stream_option_matches_the_oracle() {
+    // The same child, run with and without `stderr_to_stdout`: the merged stream must contain
+    // the stderr line and the default stream must not. Both expectations are taken live from
+    // the oracle, so the test pins the *reason* the option exists rather than a hard-coded
+    // value. Without the option the child's stderr is inherited by this test process, so that
+    // one line is worded to explain itself rather than look like a stray failure.
+    const COMMAND: &str = "echo O; echo '[spawn] stderr inherited (expected, not port data)' 1>&2";
+
+    let options = SpawnOptions {
+        args: vec!["-c".to_string(), COMMAND.to_string()],
+        ..SpawnOptions::default()
+    };
+    let spec = SpawnSpec::SpawnExecutable {
+        path: "/bin/sh".to_string(),
+    };
+
+    for stderr_to_stdout in [true, false] {
+        let oracle = match oracle_port_data_hex(COMMAND, stderr_to_stdout) {
+            Some(hex) => hex,
+            None => {
+                eprintln!("skipping stderr oracle check: the system `erl` is unavailable");
+                return;
+            }
+        };
+        assert!(!oracle.starts_with("error:"), "the oracle opened a port");
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let driver = SpawnDriver::with_stream_options(
+            &spec,
+            &options,
+            StreamOptions {
+                stderr_to_stdout,
+                eof: false,
+            },
+        )
+        .expect("the shell starts");
+        let id = registry
+            .open(&mut poller, Box::new(driver))
+            .expect("the port opens");
+
+        // Collect everything up to (and including) the end of the stream, so a driver that
+        // delivered *extra* bytes could not slip past the comparison.
+        assert!(
+            pump_until(&mut poller, &mut registry, |_, poller| poller.is_empty()),
+            "the child's end-of-file deregisters its stdout"
+        );
+        let data = registry.get_mut(id).expect("live").drain_input();
+        assert_eq!(
+            hex(&data),
+            oracle,
+            "the port data matches the oracle with stderr_to_stdout={stderr_to_stdout}"
+        );
+
+        registry.close(&mut poller, id).expect("the port closes");
+    }
 }

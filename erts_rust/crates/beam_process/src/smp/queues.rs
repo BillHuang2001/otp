@@ -79,6 +79,29 @@ impl Queues {
         }
     }
 
+    /// Moves `pid` from whatever level holds it to the tail of `priority`'s FIFO **iff** it is
+    /// currently queued at a different level, reporting whether it was moved.
+    ///
+    /// The shared injector and every local queue are searched in turn, taking **one queue lock
+    /// at a time** and never holding two (see the module-level locking discipline). A pid that is
+    /// not queued anywhere — it is in flight (being executed by a scheduler), waiting, suspended
+    /// or terminated — is left untouched, so this never inserts a pid that was not already
+    /// queued. The cost is one queue-lock acquisition per queue, i.e. `O(schedulers)`.
+    pub(crate) fn reprioritize(&self, pid: ProcessId, priority: Priority) -> bool {
+        {
+            let mut injector = self.injector.lock();
+            if injector.reprioritize(pid, priority) {
+                return true;
+            }
+        }
+        for local in &self.locals {
+            let mut queue = local.lock();
+            if queue.reprioritize(pid, priority) {
+                return true;
+            }
+        }
+        false
+    }
     /// Tries to acquire one pid: own local queue → injector → steal from a peer.
     ///
     /// A pid obtained from the local queue or the injector has the in-flight count incremented
@@ -294,5 +317,51 @@ mod tests {
         assert!(queues.has_takeable_work(0), "the injector counts");
         queues.enqueue_local_batch(0, &[(pid(1), Priority::High)]);
         assert!(queues.has_takeable_work(0), "own local queue counts");
+    }
+
+    #[test]
+    fn reprioritize_moves_a_queued_pid_between_levels() {
+        let queues = Queues::new(2);
+        // pid(1) at LOW and pid(2) at NORMAL, both on scheduler 0's local queue.
+        queues.enqueue_local_batch(0, &[(pid(1), Priority::Low), (pid(2), Priority::Normal)]);
+        assert_eq!(queues.local_len(0), 2);
+
+        // Promote pid(1) to MAX: it must now be served before pid(2), and the total is unchanged.
+        assert!(queues.reprioritize(pid(1), Priority::Max));
+        assert_eq!(queues.total_len(), 2, "the pid moved, it was not duplicated");
+        match queues.acquire(0) {
+            Acquired::Pid(p) => assert_eq!(p, pid(1), "the promoted pid is served first"),
+            _ => panic!("work was available"),
+        }
+        queues.finish_slice();
+        match queues.acquire(0) {
+            Acquired::Pid(p) => assert_eq!(p, pid(2)),
+            _ => panic!("work was available"),
+        }
+        queues.finish_slice();
+
+        // A pid that is not queued anywhere is never inserted.
+        assert!(!queues.reprioritize(pid(9), Priority::High));
+        assert_eq!(queues.total_len(), 0);
+    }
+
+    #[test]
+    fn reprioritize_searches_the_injector_and_every_local_queue() {
+        let queues = Queues::new(2);
+        queues.enqueue_injector(pid(1), Priority::Low);
+        queues.enqueue_local_batch(1, &[(pid(2), Priority::Low)]);
+
+        // Already at the requested level: nothing moves.
+        assert!(!queues.reprioritize(pid(1), Priority::Low));
+
+        // The injector pid is found and moved (its queue length is unchanged).
+        assert!(queues.reprioritize(pid(1), Priority::High));
+        assert_eq!(queues.injector_len(), 1);
+        assert_eq!(queues.total_len(), 2);
+
+        // A peer (scheduler 1) local pid is found and moved too.
+        assert!(queues.reprioritize(pid(2), Priority::Max));
+        assert_eq!(queues.local_len(1), 1);
+        assert_eq!(queues.total_len(), 2);
     }
 }

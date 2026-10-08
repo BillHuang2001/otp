@@ -5,11 +5,17 @@
 //! and receives `{'EXIT', A, Reason}`; and `A` monitoring `B` means `B`'s termination queues
 //! `{'DOWN', Ref, process, B, Reason}` on `A`.
 //!
-//! The last five tests pin **reason ownership**: a *structured* (non-immediate) exit reason
+//! The **reason-ownership** tests below pin that a *structured* (non-immediate) exit reason
 //! built in one process's heap must be copied into every recipient's own heap, so it survives
 //! both the death of its original owner (link cascade, monitor down-message) and a later
 //! safepoint collection of the recipient. A raw word pointing into a dropped heap would segfault
 //! or compare unequal here.
+//!
+//! The `kill`/`normal` tests at the end pin the two reason-class special cases of
+//! [`exit_policy`]: `kill` is **untrappable** and always terminates with the rewritten `killed`,
+//! while a `normal` link exit is silently ignored by a non-trapping peer and delivered as
+//! `{'EXIT', From, normal}` only to a trapping one. Each asserts the value the system `erl`
+//! (OTP 29.1.1) was probed to produce before asserting it (the probes are cited on the tests).
 
 use beam_process::prelude::*;
 use beam_term::compare;
@@ -343,4 +349,243 @@ fn a_self_signal_to_a_non_trapping_process_terminates_it() {
         ExitEffect::Terminated
     );
     assert!(!table.contains(a), "the non-trapping process terminated");
+}
+
+#[test]
+fn kill_terminates_the_target_with_reason_killed() {
+    // Oracle probe (OTP 29.1.1): the exit reason `kill` is rewritten to `killed`
+    //   P = spawn(fun() -> receive never -> ok end end),
+    //   M = erlang:monitor(process, P),
+    //   exit(P, kill),
+    //   receive {'DOWN', M, process, P, R} -> R end   => `killed`
+    let (mut table, mut names) = table_with_names();
+    let killer = table.spawn_default().expect("killer");
+    let victim = table.spawn_default().expect("victim");
+    let watcher = table.spawn_default().expect("watcher");
+    let reference = table
+        .monitor(watcher, victim, MonitorKind::Process)
+        .expect("both pids are live");
+
+    let down = make_atom(names.intern("DOWN"));
+    let process = make_atom(names.intern("process"));
+    let kill = make_atom(names.intern("kill"));
+    let killed = make_atom(names.intern("killed"));
+
+    table
+        .send_exit(killer, victim, kill)
+        .expect("the victim is live");
+
+    assert!(!table.contains(victim), "`kill` terminates the victim");
+    assert!(table.contains(watcher), "the watcher is not linked to the victim");
+    assert!(table.contains(killer), "the killer is not linked to the victim");
+
+    let payload = sole_payload(&table, watcher);
+    // SAFETY: `payload` is the live `{'DOWN', Ref, process, Victim, killed}` tuple the table
+    // built on the watcher's heap; the five element slots are in bounds.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(tuple_element(payload, 0), down);
+        assert_eq!(tuple_element(payload, 2), process);
+        assert_eq!(tuple_element(payload, 3), victim.to_eterm());
+        assert_eq!(
+            tuple_element(payload, 4),
+            killed,
+            "the DOWN reason is `killed`, not the sent `kill`"
+        );
+        assert_ne!(tuple_element(payload, 4), kill);
+        // The DOWN carries the reference the monitor handed out.
+        let words = boxed_val(tuple_element(payload, 1));
+        assert_eq!(signed_value(*words.add(3)), reference.id() as i64);
+    }
+}
+
+#[test]
+fn kill_is_untrappable() {
+    // Oracle probes (OTP 29.1.1):
+    //   (a) a *trapping* target killed anyway is gone and its DOWN reason is `killed`:
+    //       P = spawn(fun() -> process_flag(trap_exit, true), receive never -> ok end end),
+    //       M = erlang:monitor(process, P), exit(P, kill),
+    //       receive {'DOWN', M, process, P, R} -> R end => `killed`; is_process_alive(P) => false
+    //   (b) the mechanism `kill` bypasses: an ordinary reason IS trapped, leaving the process
+    //       alive with `{'EXIT', Signaller, boom}` queued => `trapped_boom`.
+    let (mut table, mut names) = table_with_names();
+    let killer = table.spawn_default().expect("killer");
+    let kill = make_atom(names.intern("kill"));
+    let killed = make_atom(names.intern("killed"));
+    let down = make_atom(names.intern("DOWN"));
+    let process = make_atom(names.intern("process"));
+
+    // (a) `kill` on a trapping target.
+    let victim = table.spawn_default().expect("victim");
+    table
+        .get_mut(victim)
+        .expect("the victim is live")
+        .set_trap_exit(true);
+    let watcher = table.spawn_default().expect("watcher");
+    table
+        .monitor(watcher, victim, MonitorKind::Process)
+        .expect("both pids are live");
+
+    assert_eq!(
+        table
+            .apply_exit_signal(victim, ExitSignal { from: killer, reason: kill })
+            .expect("the victim is live"),
+        ExitEffect::Terminated,
+        "`kill` terminates even a trapping target"
+    );
+    // A trapped `{'EXIT', _, kill}` would have kept the victim alive; instead it is gone, and its
+    // mailbox (which held no EXIT message) went with it. The watcher's sole message is the DOWN.
+    assert!(
+        !table.contains(victim),
+        "the trapping victim is still terminated; no `{{'EXIT', _, kill}}` was trapped"
+    );
+    let payload = sole_payload(&table, watcher);
+    // SAFETY: the live 5-tuple the table built on the watcher's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 5);
+        assert_eq!(tuple_element(payload, 0), down);
+        assert_eq!(tuple_element(payload, 2), process);
+        assert_eq!(tuple_element(payload, 3), victim.to_eterm());
+        assert_eq!(tuple_element(payload, 4), killed);
+    }
+
+    // (b) Contrast: the same shape with a trappable reason survives with the EXIT queued.
+    let survivor = table.spawn_default().expect("survivor");
+    table
+        .get_mut(survivor)
+        .expect("the survivor is live")
+        .set_trap_exit(true);
+    let boom = make_atom(names.intern("boom"));
+    let exit_atom = make_atom(names.intern("EXIT"));
+    assert_eq!(
+        table
+            .apply_exit_signal(survivor, ExitSignal { from: killer, reason: boom })
+            .expect("the survivor is live"),
+        ExitEffect::Trapped
+    );
+    assert!(table.contains(survivor), "a trappable reason is trapped");
+    let payload = sole_payload(&table, survivor);
+    // SAFETY: the live `{'EXIT', Killer, boom}` tuple the table built on the survivor's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 3);
+        assert_eq!(tuple_element(payload, 0), exit_atom);
+        assert_eq!(tuple_element(payload, 1), killer.to_eterm());
+        assert_eq!(tuple_element(payload, 2), boom);
+    }
+}
+
+#[test]
+fn a_normal_link_exit_is_ignored_by_an_untrapping_peer_and_trapped_by_a_trapping_one() {
+    // Oracle probes (OTP 29.1.1), each run in its own process:
+    //   trapping:   process_flag(trap_exit, true), P = spawn_link(fun() -> receive go -> ok end end),
+    //               P ! go, receive {'EXIT', From, R} -> {From =:= P, R} end   => `{true,normal}`
+    //   untrapping: process_flag(trap_exit, false), P = spawn_link(...), P ! go,
+    //               receive X -> {unexpected, X} after 500 -> survived end   => `survived`
+    let (mut table, mut names) = table_with_names();
+    let normal = make_atom(names.intern("normal"));
+    let exit_atom = make_atom(names.intern("EXIT"));
+
+    // 1. Untrapping peer: a linked normal exit is ignored — the peer survives with an empty
+    //    mailbox and the dropped back-link.
+    let origin = table.spawn_default().expect("origin");
+    let peer = table.spawn_default().expect("peer");
+    table.link(origin, peer).expect("both pids are live");
+
+    table.terminate(origin, normal).expect("the origin is live");
+
+    assert!(!table.contains(origin), "the origin exited");
+    assert!(
+        table.contains(peer),
+        "an untrapping peer survives a linked normal exit"
+    );
+    {
+        let survivor = table.get(peer).expect("the peer survives");
+        assert!(
+            survivor.mailbox().is_empty(),
+            "a normal reason queues no message on an untrapping peer"
+        );
+        assert!(
+            !survivor.links().contains(origin),
+            "the terminating origin's back-link is dropped"
+        );
+    }
+
+    // 2. Trapping peer: the same normal exit is delivered as `{'EXIT', Origin, normal}`.
+    let origin2 = table.spawn_default().expect("origin2");
+    let trapper = table.spawn_default().expect("trapper");
+    table
+        .get_mut(trapper)
+        .expect("the trapper is live")
+        .set_trap_exit(true);
+    table.link(origin2, trapper).expect("both pids are live");
+
+    table.terminate(origin2, normal).expect("origin2 is live");
+
+    assert!(table.contains(trapper), "the trapping peer survives");
+    let payload = sole_payload(&table, trapper);
+    // SAFETY: the live `{'EXIT', Origin2, normal}` tuple the table built on the trapper's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 3);
+        assert_eq!(tuple_element(payload, 0), exit_atom);
+        assert_eq!(tuple_element(payload, 1), origin2.to_eterm());
+        assert_eq!(tuple_element(payload, 2), normal);
+    }
+}
+
+#[test]
+fn a_cascaded_link_exit_reaches_a_trapping_head_from_the_relay() {
+    // Oracle probe (OTP 29.1.1): a chain head—relay—origin, where the head traps, the relay does
+    // not, and the origin dies abnormally:
+    //   process_flag(trap_exit, true),
+    //   B = spawn(fun() -> C = spawn_link(fun() -> receive never -> ok end end),
+    //                       Self ! {c, C}, receive never -> ok end end),
+    //   link(B), C = receive {c, Cp} -> Cp end, exit(C, {bad, 1}),
+    //   receive {'EXIT', From, Reason} -> {From =:= B, Reason} end   => `{true,{bad,1}}`
+    let (mut table, mut names) = table_with_names();
+    let head = table.spawn_default().expect("head");
+    let relay = table.spawn_default().expect("relay");
+    let origin = table.spawn_default().expect("origin");
+    let holder = table.spawn_default().expect("holder");
+
+    table
+        .get_mut(head)
+        .expect("the head is live")
+        .set_trap_exit(true);
+    table.link(head, relay).expect("both pids are live");
+    table.link(relay, origin).expect("both pids are live");
+
+    // The origin's abnormal reason is a *structured* term in its own heap; `holder` keeps an
+    // equal term built from the same atom table so the delivered copy can be compared.
+    let bad = make_atom(names.intern("bad"));
+    let reason = tuple_in(&mut table, origin, &[bad, make_small(1)]);
+    let expected = tuple_in(&mut table, holder, &[bad, make_small(1)]);
+    let exit_atom = make_atom(names.intern("EXIT"));
+
+    table.terminate(origin, reason).expect("the origin is live");
+
+    assert!(!table.contains(origin), "the origin died");
+    assert!(
+        !table.contains(relay),
+        "the non-trapping relay followed the origin"
+    );
+    assert!(table.contains(head), "the trapping head survived");
+
+    let payload = sole_payload(&table, head);
+    // SAFETY: the live `{'EXIT', Relay, Reason}` tuple the table built on the head's heap; the
+    // three element slots are in bounds.
+    unsafe {
+        assert_eq!(tuple_size(payload), 3);
+        assert_eq!(tuple_element(payload, 0), exit_atom);
+        assert_eq!(
+            tuple_element(payload, 1),
+            relay.to_eterm(),
+            "the relay is the signaller the head sees"
+        );
+        let delivered = tuple_element(payload, 2);
+        assert!(
+            !is_immediate(delivered),
+            "the cascaded reason was delivered as a copy of the relay's reason"
+        );
+        assert!(compare::eq(delivered, expected, &names));
+    }
 }

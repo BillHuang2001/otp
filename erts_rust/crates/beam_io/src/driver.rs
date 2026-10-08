@@ -340,6 +340,23 @@ pub trait Driver {
         Ok(0)
     }
 
+    /// Whether the driver has asynchronous work that a [`Driver::drive_async`] call would process.
+    ///
+    /// This is the **cheap probe** the port-task round uses to decide whether a port needs an async
+    /// drive point at all: the runtime calls [`Driver::drive_async`] for every port whose driver
+    /// answers `true`, and skips the rest. Returning `false` must therefore never hide pending
+    /// work — a driver with async jobs must report `true` until its last completion has been
+    /// handed over.
+    ///
+    /// The default (`false`) is correct for a driver that never schedules async work, so the
+    /// built-in drivers are unaffected. The C-ABI bridge
+    /// ([`crate::abi::DriverPort`]) overrides it with
+    /// [`AbiHost::has_pending_async`](crate::AbiHost::has_pending_async), which reports whether
+    /// the port's `driver_async` job set is non-empty.
+    fn has_pending_async(&self) -> bool {
+        false
+    }
+
     /// Takes the reaped exit status of the OS child this port owns, **once**.
     ///
     /// A driver that starts no child — the built-in [`crate::drivers::FdDriver`] and
@@ -354,6 +371,26 @@ pub trait Driver {
     /// Returns a `beam_common::BeamError` when the underlying wait fails.
     fn take_exit_status(&mut self) -> Result<Option<i32>> {
         Ok(None)
+    }
+
+    /// Takes the port's **end-of-file** notification, **once**, when the port asked for it.
+    ///
+    /// A port opened with the `eof` option is told its input stream ended: the oracle delivers a
+    /// bare `eof` message (not a `{Port, {data, …}}`) once the child's stdout reaches end of
+    /// file. `Ok(true)` means "the stream reached end-of-file and this is the first time it is
+    /// reported"; `Ok(false)` means "nothing to report yet" — because the option was not asked
+    /// for, because end-of-file has not been observed, or because it was already reported.
+    ///
+    /// A driver that never streams input — the built-in [`crate::drivers::FdDriver`] and
+    /// [`crate::drivers::EfileDriver`] — inherits the default (`Ok(false)`), so this capability
+    /// is purely additive; it is the input-side counterpart of
+    /// [`Driver::take_exit_status`] (surfaced as [`crate::PortRegistry::take_eof`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `beam_common::BeamError` when the check fails.
+    fn take_eof(&mut self) -> Result<bool> {
+        Ok(false)
     }
 
     /// Tells the driver its port is exiting, **before** [`Driver::stop`] tears it down.

@@ -7,7 +7,7 @@
 //! nothing here waits for a trace event.
 use beam_bifs::NullSink;
 use beam_common::BeamError;
-use beam_engine::{terms, ExecutionContext, Mailbox};
+use beam_engine::{terms, ExecutionContext};
 use beam_process::ProcessId;
 use beam_rt::{Runtime, RuntimeContext};
 use beam_term::{signed_value, Eterm, NIL};

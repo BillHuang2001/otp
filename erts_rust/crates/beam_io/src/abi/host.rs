@@ -23,9 +23,13 @@
 //! # What lives in the host
 //!
 //! The port's *persistent* C-ABI state is [`DriverState`]: the `driver_select` registration map
-//! (fd → token + interest, a `BTreeMap` so `ready_input`/`ready_output` pick a stable fd), the
-//! `driver_set_timer` deadline, and the `driver_async` job set. It survives individual callbacks,
-//! exactly as the C's per-port `ErlDrvEvent` list and port timer do.
+//! (fd → token + interest + the two `ERL_DRV_USE` release bits, a `BTreeMap` so
+//! `ready_input`/`ready_output` pick a stable fd), the `driver_set_timer` deadline, and the
+//! `driver_async` job set. It survives individual callbacks, exactly as the C's per-port
+//! `ErlDrvEvent` list and port timer do. A released `ERL_DRV_USE` registration leaves its event in
+//! the state's [`DriverState::queued_stop_select`] queue, which the
+//! [`DriverPort`](super::port::DriverPort) drains into the driver's `stop_select` callback after
+//! the callback that made the `driver_select` has returned.
 //!
 //! A host may additionally carry its port's **registered driver identity** (the driver name and
 //! whether the port was built from a `dlopen`ed object). It is what `driver_lock_driver` needs:
@@ -58,7 +62,7 @@ use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use beam_abi::driver::host::DriverHost;
 use beam_abi::driver::types::{
     ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT,
-    ERL_DRV_READ, ERL_DRV_WRITE,
+    ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
 use beam_alloc::Heap;
 use beam_common::Result;
@@ -172,11 +176,31 @@ impl PortHost for LocalAtomPortHost {
 /// The `interest` is re-read when the port needs to name the fd a `ready_input`/`ready_output`
 /// callback should receive (see [`DriverState::fd_armed`]), so a `driver_select` that flips
 /// direction updates it in place rather than adding an entry.
+///
+/// The two `ERL_DRV_USE` bits are the driver's *release* contract for this registration (see
+/// [`SelectedFd::wants_stop_select`]); they live here, next to the fd, because the fd is what the
+/// release callback names.
 pub(crate) struct SelectedFd {
     /// The poller token `DriverContext::register` returned.
     pub(crate) token: Token,
     /// The interest the registration currently expresses.
     pub(crate) interest: Interest,
+    /// The select asked for `ERL_DRV_USE` (`ERL_NIF_SELECT_STOP`): the driver is entitled to a
+    /// `stop_select` callback once this registration is released.
+    pub(crate) use_stop: bool,
+    /// The select was `ERL_DRV_USE_NO_CALLBACK` (`ERL_DRV_USE | ERL_DRV_USE << 1`): the driver
+    /// keeps the `ERL_DRV_USE` bookkeeping but explicitly declined the callback.
+    pub(crate) use_no_callback: bool,
+}
+
+impl SelectedFd {
+    /// Whether releasing this registration owes the driver a `stop_select` callback.
+    ///
+    /// The C fires it exactly for `ERL_DRV_USE` without the `_NO_CALLBACK` bit
+    /// (`(mode & ERL_DRV_USE_NO_CALLBACK) == ERL_DRV_USE`, `erl_check_io.c:1033`, `erl_check_io.c:1179`).
+    pub(crate) fn wants_stop_select(&self) -> bool {
+        self.use_stop && !self.use_no_callback
+    }
 }
 
 /// The port's persistent C-ABI state, mutated by [`AbiHost`].
@@ -194,6 +218,16 @@ pub struct DriverState {
     pub(crate) deadline: Option<Instant>,
     /// The `driver_async` jobs scheduled but not yet handed to `ready_async`/`async_free`.
     pub(crate) jobs: AsyncJobs,
+    /// The `ErlDrvEvent` values whose `ERL_DRV_USE` registration a `driver_select(..., 0)` released
+    /// and whose owner is therefore owed a `stop_select` callback.
+    ///
+    /// The callback cannot run from `AbiHost::select` itself — it is the loaded driver's own
+    /// `stop_select`, which the host does not own — so the events are queued here and fired by
+    /// [`DriverPort`](super::port::DriverPort) once the driver callback that made the
+    /// `driver_select` has returned. That is also the C's ordering: `stop_select` runs after the
+    /// fd lock is released (`erl_check_io.c:1210-1216`), never re-entrantly inside the driver's
+    /// own `driver_select`.
+    pub(crate) queued_stop_select: Vec<ErlDrvEvent>,
 }
 
 impl DriverState {
@@ -203,6 +237,7 @@ impl DriverState {
             selected: BTreeMap::new(),
             deadline: None,
             jobs: AsyncJobs::new(),
+            queued_stop_select: Vec::new(),
         }
     }
 
@@ -242,6 +277,28 @@ impl DriverState {
                 }
             })
             .map(|(fd, _)| *fd)
+    }
+
+    /// Takes the `stop_select` events a `driver_select(..., 0)` queued (see
+    /// [`DriverState::queued_stop_select`]), leaving the queue empty.
+    pub(crate) fn take_queued_stop_select(&mut self) -> Vec<ErlDrvEvent> {
+        core::mem::take(&mut self.queued_stop_select)
+    }
+
+    /// Takes **every** `driver_select` registration still in force, as
+    /// `(fd, token, owes stop_select)`, leaving none.
+    ///
+    /// This is the port-teardown walk: each entry's poller registration must be withdrawn (the
+    /// caller does that through its [`DriverContext`](crate::driver::DriverContext)) and each
+    /// `ERL_DRV_USE` registration still owes its owner a release callback. The C's equivalent is
+    /// `erts_check_io_cleanup`/`deselect`, which fires `(*stop_select)((ErlDrvEvent) fd, NULL)`
+    /// before the fd is closed (`erl_check_io.c:2232-2238`) — the **fd cast to a pointer**, not
+    /// necessarily the operand the driver originally selected with.
+    pub(crate) fn take_all_selected(&mut self) -> Vec<(RawFd, Token, bool)> {
+        core::mem::take(&mut self.selected)
+            .into_iter()
+            .map(|(fd, selected)| (fd, selected.token, selected.wants_stop_select()))
+            .collect()
     }
 }
 
@@ -344,6 +401,17 @@ impl AbiHost {
         &self.state
     }
 
+    /// Whether the port's `driver_async` job set has outstanding jobs.
+    ///
+    /// `true` while jobs are running or completed-but-undelivered, i.e. exactly when a
+    /// [`Driver::drive_async`](crate::driver::Driver::drive_async) call would run at least one
+    /// `ready_async`/`async_free`. This is the probe the port-task round uses to decide whether the
+    /// port needs an async drive point (see
+    /// [`crate::PortRegistry::execute_port_tasks`](crate::PortRegistry::execute_port_tasks)).
+    pub fn has_pending_async(&self) -> bool {
+        self.state.jobs.in_flight() > 0
+    }
+
     /// The port's persistent state, mutably.
     pub(crate) fn state_mut(&mut self) -> &mut DriverState {
         &mut self.state
@@ -367,9 +435,10 @@ impl AbiHost {
 
 /// The interest mask an `int mode` argument to `driver_select` expresses.
 ///
-/// `mode` is a bitwise or of [`ERL_DRV_READ`] and [`ERL_DRV_WRITE`] (plus `ERL_DRV_USE`, which only
-/// asks for the `stop_select` callback and is not modelled — see
-/// `beam_abi::driver::drv::driver_select`). Neither direction set is mapped to
+/// `mode` is a bitwise or of [`ERL_DRV_READ`] and [`ERL_DRV_WRITE`], optionally with
+/// `ERL_DRV_USE`/`ERL_DRV_USE_NO_CALLBACK` — the two release bits, which ask for (or decline) the
+/// driver's `stop_select` callback and are recorded on the [`SelectedFd`] instead of being mapped
+/// to an interest (see `AbiHost::select`). Neither direction set is mapped to
 /// [`Interest::READABLE`] rather than to "not registered": the fd must still be watched so the
 /// platform reports its close/error state (the C's `driver_select` always registers the event).
 pub(crate) fn interest_from_mode(mode: c_int) -> Interest {
@@ -419,15 +488,31 @@ impl DriverHost for AbiHost {
     /// same fd with a new `mode` **re-registers** (the interest is updated), matching the C's
     /// one-registration-per-event model; de-selecting an fd that was never selected succeeds (the
     /// C's `driver_select` is idempotent).
+    ///
+    /// The two `ERL_DRV_USE` bits are recorded with the registration
+    /// ([`SelectedFd::wants_stop_select`]) rather than folded into the interest: they only ask for
+    /// the driver's `stop_select` release callback, and `interest_from_mode` therefore leaves them
+    /// out (a `mode` of `ERL_DRV_USE` alone still registers `READABLE`, the "watch it for
+    /// close/error" fallback). A release queues the event the *deselecting* call was given, which
+    /// is the operand the C's `stop_select` receives (`erl_check_io.c:1215`).
     fn select(&mut self, _port: ErlDrvPort, event: ErlDrvEvent, mode: c_int, on: c_int) -> c_int {
         let fd = event as usize as RawFd;
         let interest = interest_from_mode(mode);
+        let use_stop = mode & ERL_DRV_USE != 0;
+        let use_no_callback = use_stop && (mode & ERL_DRV_USE_NO_CALLBACK) != ERL_DRV_USE;
 
         if on == 0 {
             let Some(selected) = self.state.selected.remove(&fd) else {
                 return 0; // De-selecting an unknown fd is a no-op, not a failure.
             };
-            return match self.with_ctx(|ctx| ctx.deregister(fd, selected.token)) {
+            let owes_stop_select = selected.wants_stop_select();
+            let result = self.with_ctx(|ctx| ctx.deregister(fd, selected.token));
+            if owes_stop_select {
+                // Queued *after* the context borrow ends; the port fires it once this callback has
+                // returned (see `DriverState::queued_stop_select`).
+                self.state.queued_stop_select.push(event);
+            }
+            return match result {
                 Some(Ok(())) => 0,
                 _ => -1,
             };
@@ -440,7 +525,15 @@ impl DriverHost for AbiHost {
         });
         match result {
             Some(Ok(token)) => {
-                self.state.selected.insert(fd, SelectedFd { token, interest });
+                self.state.selected.insert(
+                    fd,
+                    SelectedFd {
+                        token,
+                        interest,
+                        use_stop,
+                        use_no_callback,
+                    },
+                );
                 0
             }
             _ => -1,
@@ -605,7 +698,7 @@ mod tests {
     use beam_abi::driver::host::DriverHost;
     use beam_abi::driver::types::{
         ErlDrvEntry, ErlDrvEvent, ErlDrvEvent_, ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ,
-        ERL_DRV_WRITE,
+        ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
     };
     use beam_process::PortId;
     use beam_term::prelude::{is_atom, make_atom, AtomTable};
@@ -777,6 +870,79 @@ mod tests {
         }
 
         assert!(poller.is_empty(), "the poll set holds no registration");
+    }
+
+    /// The two `ERL_DRV_USE` bits are recorded with the registration (never folded into the
+    /// interest), and a released `ERL_DRV_USE` registration queues its event for the port's
+    /// `stop_select` (see `DriverState::queued_stop_select`).
+    #[test]
+    fn select_records_the_use_release_bits_and_queues_the_release() {
+        let mut host = new_host();
+        let (mut poller, mut input, mut output, mut arms) = new_context_parts();
+        let (_peer, local) = UnixStream::pair().expect("socketpair(2) succeeds");
+        let fd = local.as_raw_fd();
+        let event = event_for(fd);
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut poller,
+            &mut input,
+            &mut output,
+            &mut arms,
+        );
+        host.install(&mut ctx);
+
+        // `ERL_DRV_READ | ERL_DRV_USE`: the release bit is not an interest, so the registration is
+        // still read-only, and nothing is queued while the selection is live.
+        assert_eq!(
+            DriverHost::select(
+                &mut host,
+                core::ptr::null_mut(),
+                event,
+                ERL_DRV_READ | ERL_DRV_USE,
+                1
+            ),
+            0
+        );
+        assert_eq!(host.state().fd_armed(true), Some(fd));
+        assert_eq!(host.state().fd_armed(false), None);
+        assert!(host.state_mut().take_queued_stop_select().is_empty());
+
+        // De-selecting queues the event the deselecting call was handed (the C's operand).
+        assert_eq!(
+            DriverHost::select(&mut host, core::ptr::null_mut(), event, ERL_DRV_READ, 0),
+            0
+        );
+        assert_eq!(host.state_mut().take_queued_stop_select(), vec![event]);
+        assert!(
+            host.state_mut().take_queued_stop_select().is_empty(),
+            "taking the queue empties it"
+        );
+
+        // The release obligation each `mode` records: only `ERL_DRV_USE` without `_NO_CALLBACK`.
+        for (mode, owes) in [
+            (ERL_DRV_READ, false),
+            (ERL_DRV_USE, true),
+            (ERL_DRV_READ | ERL_DRV_USE, true),
+            (ERL_DRV_WRITE | ERL_DRV_USE, true),
+            (ERL_DRV_USE_NO_CALLBACK, false),
+            (ERL_DRV_READ | ERL_DRV_USE_NO_CALLBACK, false),
+        ] {
+            assert_eq!(
+                DriverHost::select(&mut host, core::ptr::null_mut(), event, mode, 1),
+                0,
+                "the selection registers"
+            );
+            let mut selected = host.state_mut().take_all_selected();
+            assert_eq!(selected.len(), 1, "exactly one registration was live ({mode})");
+            let (taken_fd, token, taken_owes) = selected.pop().expect("one entry was taken");
+            assert_eq!(taken_fd, fd);
+            assert_eq!(taken_owes, owes, "the release obligation recorded for mode {mode}");
+            ctx.deregister(fd, token)
+                .expect("the poller registration is withdrawn");
+        }
+
+        host.clear();
+        assert!(poller.is_empty(), "every registration was released");
     }
 
     #[test]

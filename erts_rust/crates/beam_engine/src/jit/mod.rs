@@ -59,11 +59,11 @@
 //! mid-run. Wiring a real per-function counter and promotion is later work.
 
 use beam_common::Result;
-use beam_loader::{Atom, Module};
+use beam_loader::{Atom, Label, Module};
 use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
-use crate::Machine;
+use crate::{Machine, RunOutcome};
 
 pub mod baseline;
 pub mod cache;
@@ -74,6 +74,31 @@ pub mod tiering;
 
 pub use cache::CodeCache;
 pub use tiering::{TierPolicy, DEFAULT_BASELINE_THRESHOLD, DEFAULT_HOT_THRESHOLD};
+
+/// One contiguous region of **generated** machine code produced by a tier.
+///
+/// This is the queryable code-range surface a host needs to describe the native code
+/// the engine is running — most concretely the `+JPperf` perf-map file `beam_rt`
+/// writes, which is empty without it. Every range is the **real** address of a
+/// compiled basic block (a [`baseline::CompiledModule::entry`]), never a synthesised
+/// or rounded one; an artifact that compiled no block reports no region.
+///
+/// Produced by [`baseline::CompiledModule::code_map`] (a caller holding its own
+/// artifact) and by [`cache::baseline_code_map`] (a host running the shared cached
+/// path), both of which return the regions in ascending address order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeRegion {
+    /// The address of the region's first byte: a compiled block's entry point.
+    pub start: usize,
+    /// The region's size in bytes (always `> 0`).
+    ///
+    /// The region runs from [`CodeRegion::start`] to the next region's `start`, or to
+    /// the end of the artifact's executable mapping for the last block.
+    pub size: usize,
+    /// A human-readable origin of the region, e.g. `"slice:fib/0"` for the block at
+    /// code offset `0` of `slice:fib/0`. Never empty.
+    pub name: String,
+}
 
 /// An execution tier of the typed IR.
 ///
@@ -309,6 +334,71 @@ pub(crate) fn run_cranelift(
     _args: &[Eterm],
     _ctx: &mut dyn ExecutionContext,
 ) -> Result<Eterm> {
+    Err(crate::error::unsupported("jit-cranelift tier not built"))
+}
+
+/// Execute `function/arity` on the Cranelift hot tier, reporting whether the run
+/// returned or blocked in a `receive`.
+///
+/// The outcome-aware counterpart of [`run_cranelift`]: identical compilation and
+/// execution, except that a `receive` that finds no message arrives as
+/// [`RunOutcome::Wait`] instead of the folded typed [`crate::error::blocked`]. With
+/// the **`jit-cranelift`** feature off the tier has no backend, so this is the same
+/// typed `unsupported` error (never a panic, never a silent fallback).
+#[cfg(feature = "jit-cranelift")]
+pub(crate) fn run_cranelift_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    cranelift::run_outcome(machine, module, function, arity, args, ctx)
+}
+
+/// Execute `function/arity` on the Cranelift hot tier, reporting its outcome
+/// (backend not compiled in).
+#[cfg(not(feature = "jit-cranelift"))]
+pub(crate) fn run_cranelift_outcome(
+    _machine: &mut Machine,
+    _module: &Module,
+    _function: Atom,
+    _arity: u32,
+    _args: &[Eterm],
+    _ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    Err(crate::error::unsupported("jit-cranelift tier not built"))
+}
+
+/// Execute the raw entry `label` on the Cranelift hot tier, reporting whether the
+/// run returned or blocked in a `receive`.
+///
+/// The label-addressed counterpart of [`run_cranelift_outcome`]; see it for the
+/// contract. With the feature off this is the same typed `unsupported` error.
+#[cfg(feature = "jit-cranelift")]
+pub(crate) fn run_cranelift_label_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    label: Label,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    cranelift::run_label_outcome(machine, module, label, arity, args, ctx)
+}
+
+/// Execute the raw entry `label` on the Cranelift hot tier, reporting its outcome
+/// (backend not compiled in).
+#[cfg(not(feature = "jit-cranelift"))]
+pub(crate) fn run_cranelift_label_outcome(
+    _machine: &mut Machine,
+    _module: &Module,
+    _label: Label,
+    _arity: u32,
+    _args: &[Eterm],
+    _ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
     Err(crate::error::unsupported("jit-cranelift tier not built"))
 }
 

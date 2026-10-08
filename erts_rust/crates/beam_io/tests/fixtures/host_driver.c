@@ -54,9 +54,30 @@
  *   7  `driver_select(port, (ErlDrvEvent) fd, ERL_DRV_READ, 0)` — deselect; return the host's code
  *      (or -1 when no fd was configured).
  *   8  `driver_read_timer(port, &ms)`; return `ms` when a timer is pending, else -1.
+ *   9  `driver_select(port, (ErlDrvEvent) fd, ERL_DRV_READ | ERL_DRV_USE, 1)` — select for the
+ *      `stop_select` release callback; return the host's code.
+ *  10  `driver_select(port, (ErlDrvEvent) fd, ERL_DRV_READ | ERL_DRV_USE_NO_CALLBACK, 1)` — the
+ *      same, declining `stop_select`; return the host's code.
+ *  11  `driver_select(port, (ErlDrvEvent) fd, ERL_DRV_READ, 1)` — a plain select, no
+ *      `ERL_DRV_USE`; return the host's code.
+ *  12  `driver_select(port, (ErlDrvEvent) fd, ERL_DRV_READ, 0)` — deselect the configured fd
+ *      (the same release verbs 7 and 4/9/10/11 pair with); return the host's code.
+ *  13  answer a fixed reply (`"host-reply"`) by pointing `*rbuf` at the driver's own static
+ *      buffer; return the byte count.
+ *
+ * Any other command returns `-1`, the C's negative `cres` (`port_control/3` answers `badarg`,
+ * `io.c:4074`).
  *
  * A fired timer (`timeout`) and readable input (`ready_input`) are each turned into
  * `driver_output` traffic so a hosted port can observe them.
+ *
+ * ## `stop_select`
+ *
+ * The driver implements `stop_select`, the `ERL_DRV_USE` release callback, as `host_stop_select`.
+ * Its signature (`void(ErlDrvEvent, void*)`) carries neither `ErlDrvData` nor the port, so it
+ * cannot reach the per-port `log=` path from its arguments; the fixture keeps the most recently
+ * started port's path in the file-scope `g_stop_select_log` instead, and appends `"stop_select"`
+ * to it. A test therefore drives one port at a time.
  */
 #include <erl_driver.h>
 
@@ -76,6 +97,10 @@ typedef struct {
     char mode[16];     /* the mode token from the command string ("" when none) */
     char log[512];     /* path every callback appends an event line to ("" when none) */
 } host_state;
+
+/* The `log=` path `stop_select` logs to. `stop_select` gets no `ErlDrvData` (see the file
+ * header), so the path is published process-wide by the most recent `start` instead. */
+static char g_stop_select_log[512] = "";
 
 /* Append `what` as one line to the per-port log file, if the command asked for one. */
 static void log_event(const host_state *st, const char *what) {
@@ -152,6 +177,8 @@ static ErlDrvData host_start(ErlDrvPort port, char *command) {
     st->mode[0] = '\0';
     st->log[0] = '\0';
     parse_command(st, command);
+    /* Publish this port's log path for `stop_select`, which receives no `ErlDrvData`. */
+    copy_token(g_stop_select_log, sizeof(g_stop_select_log), st->log, strlen(st->log));
     log_event(st, "start");
     return (ErlDrvData) st;
 }
@@ -162,6 +189,23 @@ static void host_stop(ErlDrvData drv_data) {
         return;
     log_event(st, "stop");
     driver_free(drv_data);
+}
+
+/* The `ERL_DRV_USE` release callback (`stop_select`): the driver is told a `driver_select`ed
+ * handle is really gone, so it may close or recycle it. The callback receives neither
+ * `ErlDrvData` nor the port, so it logs through the path the most recent `start` published (see
+ * `g_stop_select_log` and the file header). */
+static void host_stop_select(ErlDrvEvent event, void *reserved) {
+    FILE *f;
+    (void) event;
+    (void) reserved;
+    if (g_stop_select_log[0] == '\0')
+        return;
+    f = fopen(g_stop_select_log, "a");
+    if (f == NULL)
+        return;
+    fprintf(f, "stop_select\n");
+    fclose(f);
 }
 
 /* Echo whatever Erlang sends to the port back to its owner. `output` receives no port argument,
@@ -268,8 +312,37 @@ static ErlDrvSSizeT host_control(ErlDrvData drv_data, unsigned int command,
             return (ErlDrvSSizeT) -1;
         return (ErlDrvSSizeT) ms;
     }
+    case 9:
+        if (st->fd < 0)
+            return (ErlDrvSSizeT) -1;
+        return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                                            ERL_DRV_READ | ERL_DRV_USE, 1);
+    case 10:
+        if (st->fd < 0)
+            return (ErlDrvSSizeT) -1;
+        return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                                            ERL_DRV_READ | ERL_DRV_USE_NO_CALLBACK, 1);
+    case 11:
+        if (st->fd < 0)
+            return (ErlDrvSSizeT) -1;
+        return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                                            ERL_DRV_READ, 1);
+    case 12:
+        if (st->fd < 0)
+            return (ErlDrvSSizeT) -1;
+        return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                                            ERL_DRV_READ, 0);
+    case 13: {
+        /* Answer a fixed reply by pointing `*rbuf` at the driver's own memory (the C contract:
+         * the driver may keep the pointer valid until the next `control` call). */
+        static const char reply[] = "host-reply";
+        if (rbuf != NULL)
+            *rbuf = (char *) (intptr_t) reply;
+        return (ErlDrvSSizeT) (sizeof(reply) - 1);
+    }
     default:
-        return 0;
+        /* An unrecognised request: a negative `cres`, which `port_control/3` reports as `badarg`. */
+        return (ErlDrvSSizeT) -1;
     }
 }
 
@@ -296,7 +369,7 @@ static ErlDrvEntry host_driver_entry = {
     .driver_flags = 0,
     .handle2 = NULL,
     .process_exit = NULL,
-    .stop_select = NULL,
+    .stop_select = host_stop_select,
     .emergency_close = NULL,
 };
 

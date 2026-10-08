@@ -239,6 +239,27 @@ impl PortRegistry {
 
         let (ran, reds_used) = self.run_scheduled_tasks(poller, reds_budget)?;
 
+        // Drive async completions **after** the scheduled tasks and **before** harvesting input.
+        // `driver_async` has no port-task kind in M1, so a finished job only reaches the driver's
+        // `ready_async`/`async_free` at a drive point; doing it here (rather than leaving it to an
+        // explicit `PortRegistry::drive_async` call) lets a `ready_async` that calls `driver_output`
+        // surface its bytes as a `Data` notification in this same round — the property the runtime
+        // needs to make `driver_async` work end-to-end. The probe is `Driver::has_pending_async`, so
+        // a port with no outstanding job pays nothing. Keys are snapshotted first so the drive does
+        // not borrow the port map while it is being mutated.
+        for key in self.sorted_keys() {
+            let pending = self
+                .ports
+                .get(&key)
+                .is_some_and(crate::port::Port::has_pending_async);
+            if !pending {
+                continue;
+            }
+            if let Some(port) = self.ports.get_mut(&key) {
+                port.drive_async(poller)?;
+            }
+        }
+
         // Harvest the data the INPUT tasks read: a port task never hands bytes up itself,
         // so the round reports them for the runtime to turn into `{Port, {data, Data}}`.
         let keys = self.sorted_keys();
@@ -356,6 +377,24 @@ impl PortRegistry {
     pub fn take_exit_status(&mut self, id: PortId) -> Result<Option<i32>> {
         match self.ports.get_mut(&id.number()) {
             Some(port) => port.take_exit_status(),
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// Takes port `id`'s end-of-file notification, once.
+    ///
+    /// This is the seam a runtime uses to synthesize the bare `eof` message of a port opened
+    /// with the `eof` option: `Ok(true)` is reported exactly once, when the port's input stream
+    /// reached end of file; `Ok(false)` means "not asked for", "not reached yet" or "already
+    /// reported" (see [`crate::drivers::SpawnDriver`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the port's driver
+    /// returns.
+    pub fn take_eof(&mut self, id: PortId) -> Result<bool> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => port.take_eof(),
             None => Err(error::badarg()),
         }
     }

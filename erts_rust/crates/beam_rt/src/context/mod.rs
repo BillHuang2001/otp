@@ -56,9 +56,11 @@
 
 mod bridges;
 mod fun_identity;
+mod memory_hook;
 mod module_info;
 mod persistent_term;
 mod process_bridge;
+mod runtime_hooks;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -90,9 +92,11 @@ use self::bridges::{
     SharedSink,
 };
 use self::fun_identity::FunIdentityBridge;
+use self::memory_hook::RuntimeMemory;
 use self::module_info::ModuleInfoBridge;
 use self::persistent_term::PersistentTermBridge;
 use self::process_bridge::ProcessBridge;
+use self::runtime_hooks::RuntimeHooksBridge;
 
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
 /// output sink that run writes to.
@@ -602,6 +606,12 @@ impl<'a> RuntimeContext<'a> {
         // Whether this is one of the seven `persistent_term:*` BIFs, which need the
         // node-global store bridge (a cheap `Rc` clone: no runtime borrow at all).
         let uses_persistent_term = Self::uses_persistent_term(module, function, arity);
+        // Whether this is one of the runtime-coupled BIF families (the timers, the loaded
+        // export check, the link set) that only the running runtime can answer, and which
+        // need the timer heap / reference space / process table (`&mut Runtime` plus a
+        // `&mut ProcessTable`, like the dict arm — and therefore its own mutually exclusive
+        // arm; see [`RuntimeHooksBridge`]).
+        let uses_runtime_hooks = Self::uses_runtime_hooks(module, function, arity);
         // The local-node identity: `nonode@nohost` with creation 0 (the M1 runtime has no
         // distribution), read from the shared table *before* it is borrowed by the context.
         // Both fields are `Copy`, so this hook needs no runtime borrow at all and every arm
@@ -624,6 +634,20 @@ impl<'a> RuntimeContext<'a> {
             &self.runtime.code_server,
             caller_module.as_deref(),
             local_node.node,
+        );
+        // The node's memory accounting behind `erlang:memory/0,1`: a cheap snapshot holding
+        // the shared atom table plus the figures reachable only *before* the call (the
+        // process table, the code server, the ETS registry) — it needs **no** `&mut Runtime`
+        // borrow, so every arm below can install it. It is built before the ETS `RefCell` is
+        // borrowed for the call, which is why its ETS figure is captured (see
+        // [`RuntimeMemory`]).
+        let mut memory = RuntimeMemory::new(
+            Rc::clone(&atoms),
+            self.mailbox_table
+                .as_deref()
+                .unwrap_or(&self.runtime.processes),
+            &self.runtime.code_server,
+            &tables_handle,
         );
         let result = {
             let RuntimeContext {
@@ -675,7 +699,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_dict_hook(&mut dict)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -701,7 +726,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_process_hook(&mut bridge)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -727,7 +753,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_current_module(caller_module.as_deref().unwrap_or(""))
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -748,7 +775,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_record_source(&mut source)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -776,7 +804,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_sender(&mut bridge)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -796,7 +825,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_module_info(&mut source)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -819,7 +849,35 @@ impl<'a> RuntimeContext<'a> {
                     .with_persistent_term(&mut store)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
+            } else if uses_runtime_hooks {
+                // The runtime-coupled BIF families (`RuntimeHooksBridge`): the timer heap and
+                // reference space (`&mut Runtime`) plus the caller's process table
+                // (`&mut ProcessTable`) — the same pair the dict arm resolves, so it is its
+                // own mutually exclusive arm. None of these keys applies a fun argument or
+                // touches the dictionary, so the fun-caller/dict seams are never needed for
+                // one, and every key this bridge does not serve answers the typed capability
+                // gap the defaulted `RuntimeHooks` seam reports (workspace `CONTEXT.md` §3).
+                let mut bridge = RuntimeHooksBridge {
+                    runtime,
+                    table: mailbox_table.as_deref_mut(),
+                    self_pid,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_runtime_hooks(&mut bridge)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -845,7 +903,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_fun_caller(&mut bridge)
                     .with_port_hook(&mut ports)
                     .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity);
+                    .with_local_fun_identity(&mut fun_identity)
+                    .with_memory_hook(&mut memory);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -859,7 +918,17 @@ impl<'a> RuntimeContext<'a> {
         // names interned during the call: each lands at the index the interner predicted,
         // keeping the BIF's/NIF's atom terms (and every printer/comparison that resolves them)
         // consistent.
-        pending.commit(self.runtime.code_server.atoms_mut());
+        //
+        // The emptiness guard is load-bearing for performance, not semantics: an empty commit
+        // is a no-op, but `atoms_mut()` goes through `Rc::make_mut`, and the port-registry /
+        // persistent-term / NIF handles plus this call's own `atoms` binding keep the shared
+        // table's strong count at 2 or more -- so touching it would deep-clone the whole
+        // `AtomTable` on *every* registered BIF call. Only a call that actually interns a name
+        // (`binary_to_term`/`list_to_atom`/`binary_to_atom`/`load_nif`, all rare) pays the
+        // commit, and then it still lands the names at their predicted indices.
+        if !pending.is_empty() {
+            pending.commit(self.runtime.code_server.atoms_mut());
+        }
         self.runtime.put_bif_heap(heap);
         // A registered BIF that ran its heap dry is the emulator's documented hard limit,
         // not a host-level allocation abort (see `error::enforce_term_heap_limit`).
@@ -992,6 +1061,30 @@ impl<'a> RuntimeContext<'a> {
         )
     }
 
+    /// Whether `(module, function, arity)` is one of the runtime-coupled BIF families the
+    /// [`RuntimeHooksBridge`] serves: the timer family (`erlang:start_timer/3,4`,
+    /// `erlang:send_after/4`, `erlang:cancel_timer/2`), the loaded-export check
+    /// (`erlang:function_exported/3`) and the link set (`erlang:link/1`, `erlang:unlink/1`).
+    ///
+    /// These keys resolve through the **single** `beam_bifs` [`RuntimeHooks`] seam, whose
+    /// default is the typed `unsupported_bif` capability gap. The bridge needs `&mut Runtime`
+    /// (the timer heap, the reference space, the code server) **and** a `&mut ProcessTable`
+    /// (the link set) — the same pair [`DictBridge`]/[`ProcessBridge`] resolve — so it cannot
+    /// co-exist with the fun-caller bridge or the dict/process arms.
+    ///
+    /// [`RuntimeHooks`]: beam_bifs::RuntimeHooks
+    fn uses_runtime_hooks(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("erlang", "start_timer", 3)
+                | ("erlang", "start_timer", 4)
+                | ("erlang", "send_after", 4)
+                | ("erlang", "cancel_timer", 2)
+                | ("erlang", "function_exported", 3)
+                | ("erlang", "link", 1)
+                | ("erlang", "unlink", 1)
+        )
+    }
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
     ///
     /// A perfect no-op on a miss (`Ok(None)`), so it is safe to try before *every* BIF: only a
@@ -1036,7 +1129,13 @@ impl<'a> RuntimeContext<'a> {
             nifs.call(module, function, arity, &mut env, args)
         };
         self.runtime.put_bif_heap(host.into_heap());
-        interner.commit(self.runtime.code_server.atoms_mut());
+        // Same load-bearing emptiness guard as `call_registered`: `atoms_mut()` is
+        // `Rc::make_mut`, and the live host/NIF-registry handles keep the shared table's
+        // strong count above 1, so an unconditional commit would deep-clone the whole
+        // `AtomTable` on every NIF call. Only commit when the NIF actually interned a name.
+        if !interner.is_empty() {
+            interner.commit(self.runtime.code_server.atoms_mut());
+        }
         match outcome {
             // A NIF must hand back a **term** (or record an exception, which `NifLibrary::call`
             // turns into `Raised`). The ABI's `THE_NON_VALUE` (a bare header word) is not one: the
@@ -1211,18 +1310,25 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// which is how the real system delivers a large message at all. Any other failure is
     /// propagated untouched, and the ordinary (small-payload) path is unchanged.
     ///
-    /// A completed send also produces two **events** (contract A.8, item 1): the ordinary
+    /// A completed send also produces **events** (contract A.8, item 1): the ordinary
     /// `{trace, Sender, send, Msg, To}` — when the *sending* process is `[send]`-traced — and
     /// the sequential-trace `{seq_trace, Label, {send, …}}` when its token has the `send`
     /// flag. Both are delivered to the relevant tracer as messages of their own, after the
-    /// payload ([`Self::trace_send_events`]).
+    /// payload ([`Self::trace_send_events`]). A third event follows when the **receiver** is
+    /// `['receive']`-traced: `{trace, Receiver, 'receive', Msg}`, emitted here (never from the
+    /// internal delivery bypass, which would recurse) by [`Self::trace_receive_events`].
     ///
     /// [`DeliverOutcome::Woke`]: beam_process::DeliverOutcome::Woke
     fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
         let target = ProcessId::from_eterm(to)?;
         let from = self.mailbox_pid.to_eterm();
         self.deliver_message(target, from, message)?;
-        self.trace_send_events(to, message)
+        self.trace_send_events(to, message)?;
+        // The delivered message is also a `receive` event for the **receiver** — gated on the
+        // receiver's own `receive` flag, emitted after the `send` event, and emitted here (the
+        // public send seam) rather than in `deliver_message`, which is the bypass every trace
+        // event itself is delivered through: emitting there would recurse forever.
+        self.trace_receive_events(target, message)
     }
 
     /// `loop_rec`: the candidate at the current mailbox scan position, `Ok(None)` when

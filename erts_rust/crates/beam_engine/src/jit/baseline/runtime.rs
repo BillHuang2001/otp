@@ -1,12 +1,14 @@
 //! The baseline JIT's block ABI and its per-instruction helper.
 //!
-//! The `HALT`/`ERROR` sentinels and the `(func, pc)` control-word codec, the
-//! `#[repr(C)]` runtime block a compiled block receives, and the two helpers a block
-//! calls: [`jit_step_one`] — the per-instruction deopt for the first instruction the
-//! block could not lower natively — and [`jit_tail_call`], the checked frame pop a
-//! **linked local tail call** uses (see [`super::emit::link`]). See `super` for the
-//! block ABI as a whole, the emitter that produces blocks and the driver that decodes
-//! the words these items produce.
+//! The `HALT`/`ERROR`/`WAIT` return words and the `(func, pc)` control-word codec,
+//! the `#[repr(C)]` runtime block a compiled block receives, and the two helpers a
+//! block calls: [`jit_step_one`] — the per-instruction deopt for the first
+//! instruction the block could not lower natively (a suspending `receive` is handed
+//! back to the driver through [`WAIT_BIT`], so a blocking-aware driver can report it
+//! as a suspension) — and [`jit_tail_call`], the checked frame pop a **linked local
+//! tail call** uses (see [`super::emit::link`]). See `super` for the block ABI as a
+//! whole, the emitter that produces blocks and the driver that decodes the words
+//! these items produce.
 #![allow(unsafe_code)]
 
 use crate::interpreter::LabelMap;
@@ -52,6 +54,38 @@ pub const fn decode_target(word: i64) -> Option<(u32, u32)> {
         return None;
     }
     Some(((word >> 32) as u32, (word & 0xFFFF_FFFF) as u32))
+}
+
+/// The sign bit of a [`Step::Wait`] block-return word: the marker a suspending
+/// `receive` sets on its encoded resume address (see [`encode_wait`]).
+///
+/// A [`Step::Wait`] fits neither existing word shape: [`HALT`]/[`ERROR`] carry no
+/// address, and the plain non-negative [`encode_target`] word is a normal
+/// continuation the driver would *follow* — for a `wait`'s target that is usually
+/// the very `loop_rec` that just found the mailbox empty, so following it would
+/// spin instead of reporting the suspension. It is therefore the resume address
+/// encoded exactly as [`encode_target`] with the **sign bit** set, which no other
+/// word uses ([`HALT`]/[`ERROR`] are compared first, and every real target is
+/// non-negative because `func < 2^31`).
+///
+/// A **non-blocking** driver folds the decoded address back into the typed
+/// [`crate::error::blocked`] error; a blocking-aware driver turns it into
+/// [`crate::RunOutcome::Wait`].
+pub const WAIT_BIT: i64 = i64::MIN;
+
+/// Encodes a [`Step::Wait`] resume address as the block-return word (see
+/// [`WAIT_BIT`]).
+pub const fn encode_wait(func: u32, pc: u32) -> i64 {
+    WAIT_BIT | encode_target(func, pc)
+}
+
+/// Decodes a [`Step::Wait`] block-return word into its `(func, pc)` resume address,
+/// or `None` for every other word (a real continuation, [`HALT`] or [`ERROR`]).
+pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
+    if word >= 0 || word == HALT || word == ERROR {
+        return None;
+    }
+    decode_target(word & !WAIT_BIT)
 }
 
 /// The one argument a compiled block receives.
@@ -128,9 +162,11 @@ pub(crate) const RUNTIME_XREGS_DISP: i32 =
 ///
 /// * [`Step::Next`] → `encode_target(func, pc + 1)`,
 /// * [`Step::Goto { func, pc }`] → `encode_target(func, pc)`,
-/// * [`Step::Wait { .. }`] → the typed [`crate::error::blocked`] error is stored in
-///   `rt.error` and [`ERROR`] is returned (the native tiers are **non-blocking**
-///   entries: a `receive` that finds no message cannot suspend them),
+/// * [`Step::Wait { func, pc }`] → [`encode_wait`]: the resume address is handed to
+///   the driver instead of being folded here, so a blocking-aware driver can report
+///   it as [`crate::RunOutcome::Wait`] and a **non-blocking** one folds it into the
+///   typed [`crate::error::blocked`] error (a `receive` that finds no message cannot
+///   suspend such an entry),
 /// * [`Step::Done`] → [`HALT`],
 /// * `Err(error)` → the error is stored in `rt.error` and [`ERROR`] is returned.
 pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
@@ -156,14 +192,11 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
     match machine.step_instruction(module, labels, func, pc, ctx) {
         Ok(Step::Next) => encode_target(func, pc + 1),
         Ok(Step::Goto { func, pc }) => encode_target(func, pc),
-        // The native tiers are non-blocking entries: a `receive` with no message
-        // available cannot suspend them, so the suspension surfaces as the same
-        // typed error the interpreter-only `run_export` reports (never a wrong
-        // result and never a silent continue).
-        Ok(Step::Wait { .. }) => {
-            runtime.error = Some(crate::error::blocked());
-            ERROR
-        }
+        // Hand the resume address to the driver (see `WAIT_BIT`): a blocking-aware
+        // driver reports it as `RunOutcome::Wait`, a non-blocking one folds it into
+        // the typed `blocked` error (never a wrong result and never a silent
+        // continue at the `wait`'s own re-examination label).
+        Ok(Step::Wait { func, pc }) => encode_wait(func, pc),
         Ok(Step::Done) => HALT,
         Err(err) => {
             runtime.error = Some(err);

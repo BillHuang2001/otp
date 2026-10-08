@@ -7,9 +7,16 @@
 //!   `driver_pdl_get_refc`, `driver_pdl_inc_refc`, `driver_pdl_dec_refc`
 //! * monitors — `driver_monitor_process`, `driver_demonitor_process`,
 //!   `driver_get_monitored_process`, `driver_compare_monitors`
-//! * binary refcounts — `driver_binary_get_refc`, `driver_binary_inc_refc`,
-//!   `driver_binary_dec_refc` — **left `None` on purpose**, see *The binary refcount trio* below
 //! * deprecated — `driver_get_now` (`ERL_DRV_DEPRECATED_FUNC`)
+//!
+//! # The binary refcount trio lives in `mem`
+//!
+//! `driver_binary_get_refc`/`inc_refc`/`dec_refc` (`io.c:6537-6558`) are **owned by
+//! [`super::mem`]**, not by this file: they operate on the emulator's **private** `Binary` header
+//! (`ErlDrvBinary2Binary(dbp)` → `bp->intern.refc`), which sits *immediately before* the frozen
+//! `ErlDrvBinary`, so they belong next to the allocator that now places that header —
+//! [`super::mem::driver_alloc_binary`]. See that file's *Driver binaries* section for the block
+//! layout, the alignment argument and the measured oracle values.
 //!
 //! # The port data lock
 //!
@@ -54,18 +61,6 @@
 //! `ErlDrvNowData` epoch is documented as arbitrary (`erl_driver.md`: *"three values measured from
 //! some arbitrary point in the past"*), so the split — `megasecs = secs / 1_000_000`,
 //! `secs = secs % 1_000_000`, `microsecs = nsec / 1000` — carries no epoch promise.
-//!
-//! # The binary refcount trio stays `None`
-//!
-//! `driver_binary_get_refc`/`inc_refc`/`dec_refc` (`io.c:6537-6558`) operate on the emulator's
-//! **private** `Binary` header (`ErlDrvBinary2Binary(dbp)` → `bp->intern.refc`), which sits
-//! *immediately before* the frozen `ErlDrvBinary` and is not part of this ABI. The frozen
-//! [`ErlDrvBinary`](crate::driver::types::ErlDrvBinary) layout is exactly
-//! `{ orig_size, orig_bytes }` (16 bytes, asserted in [`crate::driver::types`]) — there is no
-//! refcount word — and this crate's `driver_alloc_binary` allocates
-//! `offset_of!(orig_bytes) + size` bytes, leaving no room for one. **Wiring them would have to
-//! fabricate a refcount**, which this crate must not do; they stay `None`, so a driver reaching one
-//! gets the C's failure behaviour (the slot is absent) rather than a made-up number.
 //!
 //! # Deviations from the oracle
 //!
@@ -527,7 +522,7 @@ pub unsafe extern "C" fn driver_get_now(now_data: *mut ErlDrvNowData) -> c_int {
 // ---------------------------------------------------------------------------------------------
 
 /// Populate this family's slots of the frozen [`ErlDrvApi`] (the `populate` chain in [`super`]
-/// calls this). The binary refcount trio is deliberately absent — see the module docs.
+/// calls this). The binary refcount trio belongs to [`super::mem`] — see the module docs.
 pub(super) const fn populate(mut api: ErlDrvApi) -> ErlDrvApi {
     api.driver_pdl_create = Some(driver_pdl_create);
     api.driver_pdl_lock = Some(driver_pdl_lock);
@@ -988,9 +983,10 @@ mod tests {
         ] {
             assert!(populated, "{name} must be populated");
         }
-        // The binary refcount trio stays `None`: the frozen `ErlDrvBinary` has no refcount word.
-        assert!(table.driver_binary_get_refc.is_none());
-        assert!(table.driver_binary_inc_refc.is_none());
-        assert!(table.driver_binary_dec_refc.is_none());
+        // The binary refcount trio is owned by `mem`, which populates it from the same frozen
+        // table; assert it here too, so this family's test notices if the chain ever drops it.
+        assert!(table.driver_binary_get_refc.is_some());
+        assert!(table.driver_binary_inc_refc.is_some());
+        assert!(table.driver_binary_dec_refc.is_some());
     }
 }

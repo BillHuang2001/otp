@@ -68,6 +68,24 @@ fn the_pending_interner_predicts_append_only_indices_and_dedups() {
 }
 
 #[test]
+fn the_pending_interner_reports_emptiness_so_the_commit_can_be_skipped() {
+    // `is_empty` is the guard `call_registered`/`try_call_nif` use to skip the
+    // `Rc::make_mut` commit (`atoms_mut`) on a call that interned nothing -- otherwise the
+    // whole shared `AtomTable` is deep-cloned on every registered BIF call. It must be
+    // true before any name is recorded and false once one is.
+    let mut interner = PendingInterner::new(0);
+    assert!(interner.is_empty(), "a fresh interner has recorded nothing");
+    interner.intern("first");
+    assert!(!interner.is_empty(), "a recorded name is not empty");
+    let mut atoms = AtomTable::new();
+    interner.commit(&mut atoms);
+    assert!(
+        interner.is_empty(),
+        "commit drains the recorded names, so the interner is empty again"
+    );
+}
+
+#[test]
 fn a_bif_interns_a_new_atom_into_the_shared_table() {
     let mut rt = runtime();
     let name = "a_fresh_atom_zzz";
@@ -636,4 +654,138 @@ fn the_local_fun_identity_hook_is_a_clean_miss_when_the_answer_is_unknown() {
             "a non-local-fun term must be a clean no-op"
         );
     }
+}
+
+#[test]
+fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
+    // The `RuntimeHooksBridge` arm is one of the mutually exclusive bridges installed per
+    // call, so its predicate must claim exactly the keys the bridge serves — the timer
+    // family, the loaded-export check and the link set — and no others.
+    for (module, function, arity) in [
+        ("erlang", "start_timer", 3),
+        ("erlang", "start_timer", 4),
+        ("erlang", "send_after", 4),
+        ("erlang", "cancel_timer", 2),
+        ("erlang", "function_exported", 3),
+        ("erlang", "link", 1),
+        ("erlang", "unlink", 1),
+    ] {
+        assert!(
+            RuntimeContext::uses_runtime_hooks(module, function, arity),
+            "{module}:{function}/{arity}"
+        );
+    }
+    // Near misses: a sibling arity of a served key, a BIF another arm owns, an unrelated
+    // module's function of the same name.
+    for (module, function, arity) in [
+        ("erlang", "start_timer", 2),
+        ("erlang", "send_after", 3),
+        ("erlang", "cancel_timer", 1),
+        ("erlang", "function_exported", 2),
+        ("erlang", "link", 2),
+        ("erlang", "unlink", 0),
+        ("timer", "send_after", 4),
+        ("erlang", "send", 2),
+        ("erlang", "get", 1),
+        ("erlang", "load_nif", 2),
+        ("records", "get_definition", 2),
+        ("persistent_term", "get", 1),
+        ("erlang", "get_module_info", 1),
+    ] {
+        assert!(
+            !RuntimeContext::uses_runtime_hooks(module, function, arity),
+            "{module}:{function}/{arity}"
+        );
+    }
+    // Pairwise disjoint with every other mutually exclusive arm: each served key needs
+    // `&mut Runtime` plus a `&mut ProcessTable`, so none of the other bridges may claim it.
+    for (function, arity) in [
+        ("start_timer", 3),
+        ("start_timer", 4),
+        ("send_after", 4),
+        ("cancel_timer", 2),
+        ("function_exported", 3),
+        ("link", 1),
+        ("unlink", 1),
+    ] {
+        assert!(!RuntimeContext::uses_dict("erlang", function, arity));
+        assert!(!RuntimeContext::uses_process_hook("erlang", function, arity));
+        assert!(!RuntimeContext::uses_nif_loader("erlang", function, arity));
+        assert!(!RuntimeContext::uses_record_source("erlang", function, arity));
+        assert!(!RuntimeContext::uses_send_hook("erlang", function, arity));
+        assert!(!RuntimeContext::uses_module_info("erlang", function, arity));
+        assert!(!RuntimeContext::uses_persistent_term(
+            "erlang", function, arity
+        ));
+    }
+    // And symmetrically: none of the other arms' keys is claimed by this predicate.
+    for (module, function, arity) in [
+        ("erlang", "send", 2),
+        ("erlang", "get", 1),
+        ("erlang", "load_nif", 2),
+        ("erlang", "get_module_info", 1),
+        ("erlang", "whereis", 1),
+        ("records", "get_definition", 2),
+        ("persistent_term", "get", 1),
+    ] {
+        assert!(
+            !RuntimeContext::uses_runtime_hooks(module, function, arity),
+            "{module}:{function}/{arity}"
+        );
+    }
+}
+
+#[test]
+fn the_runtime_hooks_bridge_serves_the_timer_and_export_families() {
+    // End to end through the real dispatch: `erlang:start_timer/3` schedules on the
+    // runtime's timer heap and answers the timer reference (the oracle's bare `#Ref<>`,
+    // not `{ok, Ref}`), and `erlang:cancel_timer/2` accepts that same reference — so the
+    // reference really indexes the runtime's timer heap rather than being fabricated.
+    let mut rt = runtime();
+    let me = rt.self_pid().to_eterm();
+    let hi = rt.intern("hi");
+    let ok = rt.intern("ok");
+    let erlang = rt.intern("erlang");
+    let start_timer = rt.intern("start_timer");
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    let mut ctx = RuntimeContext::new(&mut rt);
+    let reference = ctx
+        .call_bif("erlang", "start_timer", 3, &[make_small(60_000), me, hi])
+        .expect("erlang:start_timer/3");
+    let cancelled = ctx
+        .call_bif("erlang", "cancel_timer", 2, &[reference, NIL])
+        .expect("erlang:cancel_timer/2");
+    assert_eq!(cancelled, ok, "the default option list answers `ok`");
+    // `erlang:function_exported/3` answers from this runtime's real registry (the
+    // arity-shifted variant is not exported, so it answers `false`).
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[erlang, start_timer, make_small(3)]
+        )
+        .expect("function_exported/3"),
+        true_atom
+    );
+    assert_eq!(
+        ctx.call_bif(
+            "erlang",
+            "function_exported",
+            3,
+            &[erlang, start_timer, make_small(5)]
+        )
+        .expect("function_exported/3"),
+        false_atom
+    );
+    // A key this bridge does **not** claim still answers the typed capability gap the
+    // defaulted `RuntimeHooks` seam reports — never a fabricated value.
+    let error = ctx
+        .call_bif("erlang", "read_timer", 1, &[reference])
+        .expect_err("read_timer/1 is not served by this bridge");
+    assert_eq!(
+        crate::error::unsupported_reason(&error).as_deref(),
+        Some("bif")
+    );
 }

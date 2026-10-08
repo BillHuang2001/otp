@@ -1,0 +1,648 @@
+//! In-module tests for the [`tcp_inet` driver](super): the wire/reply vocabulary, the argument
+//! decoding, the lifecycle and the verb round trips over **real loopback sockets**, and the
+//! peer-close state machine the driver latches when its peer goes away.
+//!
+//! Split out of `mod.rs` only because that file had grown past the ~1000-line target together
+//! with this suite; the tests are still the driver's own in-module suite (`super` is the
+//! `inet` module).
+use super::wire::InetAddr;
+use super::{
+    ctl_error, ctl_ok, ctl_xerror, errno_name, make_tcp_inet, parse_address, socket_fd, InetState,
+    PeerClose, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK,
+    INET_PROTO_DEFAULT, INET_REP_OK, INET_TYPE_STREAM, TCP_SHUT_RDWR, TCP_SHUT_WR,
+};
+use crate::driver::{Driver, DriverContext, DriverFlags, PortArms};
+use crate::poller::Poller;
+use crate::port::{PortRegistry, PortState};
+use crate::port_task::{PortTaskKind, Readiness};
+use crate::queue::ByteQueue;
+use beam_common::BeamError;
+use beam_process::PortId;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::time::{Duration, Instant};
+
+/// How long a helper waits for the kernel or the peer before failing the test.
+const WAIT: Duration = Duration::from_secs(5);
+
+fn poller() -> Poller {
+    Poller::new().expect("a poll set")
+}
+
+/// A loopback listener the test owns (the driver is given its own copy of the fd).
+fn loopback_listener() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0").expect("a loopback listener")
+}
+
+/// The packed `open` argument: `[AF_INET, SOCK_STREAM, default protocol]`.
+fn open_arg() -> [u8; 3] {
+    [INET_AF_INET, INET_TYPE_STREAM, INET_PROTO_DEFAULT]
+}
+
+/// The packed `bind`/`connect` argument naming `127.0.0.1:port`.
+fn loopback_arg(port: u16) -> Vec<u8> {
+    let [hi, lo] = port.to_be_bytes();
+    vec![INET_AF_LOOPBACK, hi, lo]
+}
+
+/// A copy of `fd` (`dup(2)`), so the driver and the test each own a descriptor.
+fn duplicate(fd: RawFd) -> RawFd {
+    // SAFETY: `fd` is an open descriptor owned by the caller and `dup(2)` takes no pointer
+    // arguments; it hands back a second descriptor for the same open file description.
+    let dup = unsafe { libc::dup(fd) };
+    assert!(dup >= 0, "dup(2) succeeded");
+    dup
+}
+
+/// Opens a port over `driver`.
+fn open_port(poller: &mut Poller, driver: Box<dyn Driver>) -> (PortRegistry, PortId) {
+    let mut registry = PortRegistry::new();
+    let id = registry.open(poller, driver).expect("the port opens");
+    (registry, id)
+}
+
+/// Runs one control verb on port `id`, panicking on the Rust error kind.
+fn control(
+    registry: &mut PortRegistry,
+    poller: &mut Poller,
+    id: PortId,
+    command: &str,
+    arg: &[u8],
+) -> Vec<u8> {
+    registry
+        .get_mut(id)
+        .expect("the port is live")
+        .control(poller, command, arg)
+        .unwrap_or_else(|err| panic!("the `{command}` verb failed: {err:?}"))
+}
+
+/// The `open`/`bind`/`listen` sequence over a loopback ephemeral port; returns the port
+/// the kernel assigned.
+fn listen_on_loopback(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> u16 {
+    assert_eq!(control(registry, poller, id, "open", &open_arg()), ctl_ok());
+    let bound = control(registry, poller, id, "bind", &loopback_arg(0));
+    assert_eq!(bound[0], INET_REP_OK);
+    assert_eq!(bound.len(), 3, "`bind` replies [1, port_hi, port_lo]");
+    let port = u16::from_be_bytes([bound[1], bound[2]]);
+    assert_ne!(port, 0, "the kernel assigned a port");
+    assert_eq!(control(registry, poller, id, "listen", &[0, 5]), ctl_ok());
+    port
+}
+
+/// Accepts the connection queued for the listening port, retrying until it arrives;
+/// returns the descriptor the reply carried.
+fn accept(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> RawFd {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let reply = control(registry, poller, id, "accept", b"");
+        assert_eq!(reply[0], INET_REP_OK);
+        if reply.len() == 5 {
+            return i32::from_be_bytes([reply[1], reply[2], reply[3], reply[4]]);
+        }
+        assert_eq!(reply.len(), 1, "an `accept` reply is [1] or [1] ++ fd_be32");
+        assert!(Instant::now() < deadline, "no connection was accepted");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Drives the reactor until port `id`'s input queue holds at least `want` bytes,
+/// returning everything it read.
+fn read_into_queue(
+    poller: &mut Poller,
+    registry: &mut PortRegistry,
+    id: PortId,
+    want: usize,
+) -> Vec<u8> {
+    let deadline = Instant::now() + WAIT;
+    let mut got = Vec::new();
+    while got.len() < want {
+        assert!(Instant::now() < deadline, "no input arrived");
+        let events = poller
+            .poll(Some(Duration::from_millis(100)))
+            .expect("poll");
+        registry
+            .handle_events(poller, &events)
+            .expect("dispatch the ready events");
+        got.extend(registry.get_mut(id).expect("live").drain_input());
+    }
+    got
+}
+
+// -----------------------------------------------------------------------
+// Names, reply shapes and argument decoding
+// -----------------------------------------------------------------------
+
+#[test]
+fn the_driver_registers_under_the_oracle_name() {
+    assert_eq!(DRIVER_NAME, "tcp_inet");
+    let driver = make_tcp_inet().expect("the factory builds a driver");
+    assert_eq!(driver.name(), "tcp_inet");
+    assert!(driver.flags() == DriverFlags::empty());
+}
+
+#[test]
+fn the_reply_shape_helpers_match_the_c() {
+    assert_eq!(ctl_ok(), vec![INET_REP_OK]);
+    assert_eq!(ctl_xerror("exbadport"), b"\x00exbadport".to_vec());
+    assert_eq!(
+        ctl_error(std::io::Error::from_raw_os_error(libc::ENOTCONN)),
+        b"\x00enotconn".to_vec()
+    );
+    assert_eq!(
+        ctl_error(std::io::Error::from_raw_os_error(libc::ECONNREFUSED)),
+        b"\x00econnrefused".to_vec()
+    );
+    assert_eq!(
+        ctl_error(std::io::Error::from_raw_os_error(libc::EISCONN)),
+        b"\x00eisconn".to_vec()
+    );
+    assert_eq!(
+        ctl_error(std::io::Error::from_raw_os_error(libc::EINVAL)),
+        b"\x00einval".to_vec()
+    );
+    // An unknown code keeps the C's `errno_<N>` fallback format.
+    assert_eq!(ctl_xerror(&errno_name(-1)), b"\x00errno_-1".to_vec());
+    assert_eq!(errno_name(0), "errno_0");
+    assert_eq!(errno_name(libc::EAGAIN), "eagain");
+    assert_eq!(errno_name(libc::EINPROGRESS), "einprogress");
+}
+
+#[test]
+fn the_packed_address_decodes_the_three_served_forms() {
+    assert_eq!(
+        parse_address(&[INET_AF_INET, 0x1f, 0x90, 10, 0, 0, 7]).expect("an IPv4 address"),
+        InetAddr {
+            port: 8080,
+            addr: [10, 0, 0, 7]
+        }
+    );
+    assert_eq!(
+        parse_address(&[INET_AF_ANY, 0, 5]).expect("INADDR_ANY"),
+        InetAddr {
+            port: 5,
+            addr: [0, 0, 0, 0]
+        }
+    );
+    assert_eq!(
+        parse_address(&[INET_AF_LOOPBACK, 0xff, 0xff]).expect("INADDR_LOOPBACK"),
+        InetAddr {
+            port: 0xffff,
+            addr: [127, 0, 0, 1]
+        }
+    );
+}
+
+#[test]
+fn a_malformed_or_unsupported_address_is_bad_arg() {
+    assert!(parse_address(&[]).is_err(), "an empty argument");
+    assert!(
+        parse_address(&[INET_AF_INET, 0, 1, 127]).is_err(),
+        "truncated"
+    );
+    assert!(parse_address(&[INET_AF_ANY]).is_err(), "truncated");
+    assert!(
+        parse_address(&[2, 0, 1, 0, 0, 0, 0, 0, 0]).is_err(),
+        "INET_AF_INET6 (out of scope)"
+    );
+    assert!(
+        parse_address(&[5, 2, b'x']).is_err(),
+        "INET_AF_LOCAL (out of scope)"
+    );
+    // The error is the crate's argument fault.
+    assert!(matches!(parse_address(&[]), Err(BeamError::BadArg)));
+}
+
+#[test]
+fn the_sockaddr_in_of_an_endpoint_is_network_byte_order() {
+    let sa = InetAddr {
+        port: 0x1234,
+        addr: [192, 168, 1, 2],
+    }
+    .sockaddr_in();
+    assert_eq!(sa.sin_family as i32, libc::AF_INET);
+    assert_eq!(sa.sin_port, 0x1234u16.to_be());
+    assert_eq!(sa.sin_addr.s_addr, u32::from_be_bytes([192, 168, 1, 2]).to_be());
+}
+
+// -----------------------------------------------------------------------
+// Lifecycle
+// -----------------------------------------------------------------------
+
+#[test]
+fn a_fresh_driver_has_no_socket() {
+    let driver = TcpInetDriver::new();
+    assert_eq!(driver.state(), InetState::Closed);
+    assert_eq!(driver.socket(), None);
+    assert!(!driver.eof());
+    assert!(!driver.peer_closed(), "nothing has closed yet");
+    assert_eq!(driver.connect_error(), None);
+    assert_eq!(TcpInetDriver::default().state(), InetState::Closed);
+}
+
+/// The peer-close state machine: once the close has been observed the **first** `recv` and the
+/// **first** `send` answer `closed`, every later one `enotconn` — the C's
+/// `TCP_ADDF_DELAYED_CLOSE_RECV`/`TCP_ADDF_DELAYED_CLOSE_SEND` bookkeeping
+/// (`inet_drv.c:12798`-`:12819`, `:13662`-`:13684`), which the `erl` oracle reproduces as
+/// `R,R,S,S -> closed, enotconn, closed, enotconn` and `S,S,R,R,R -> ok, closed, closed,
+/// enotconn, enotconn`.
+#[test]
+fn the_peer_close_answers_once_per_direction() {
+    // While the connection is usable neither direction owes a reply.
+    let mut close = PeerClose::default();
+    assert_eq!(close.recv_reply(), None);
+    assert_eq!(close.send_reply(), None);
+
+    // The close is observed: each direction reports it exactly once, then `enotconn` forever.
+    close.observe();
+    assert_eq!(close.recv_reply(), Some("closed"));
+    assert_eq!(close.send_reply(), Some("closed"));
+    assert_eq!(close.recv_reply(), Some("enotconn"));
+    assert_eq!(close.send_reply(), Some("enotconn"));
+    assert_eq!(close.recv_reply(), Some("enotconn"));
+
+    // The two directions are independent: a `send` that is what discovered the close does not
+    // consume the receive direction's one-shot `closed` (the C's `tcp_send_error` ->
+    // `tcp_recv_closed` path, which is how a caller that ignores its send errors still learns
+    // about the close from its next receive).
+    let mut close = PeerClose::default();
+    close.observe();
+    assert_eq!(close.send_reply(), Some("closed"));
+    assert_eq!(close.recv_reply(), Some("closed"));
+    assert_eq!(close.send_reply(), Some("enotconn"));
+    assert_eq!(close.recv_reply(), Some("enotconn"));
+}
+
+/// Once the peer's end goes away the driver **latches** the close: the
+/// [`TcpInetDriver::peer_closed`] accessor the runtime reads becomes true, the socket's poller
+/// registration is released (a dead descriptor must not keep reporting readiness), and the
+/// connection's [`InetState`] is deliberately **unchanged** — only the read half is gone, so
+/// answering `closed` the way the oracle does stays the verb layer's job.
+#[test]
+fn a_peer_close_is_observable_through_the_accessor() {
+    let listener = loopback_listener();
+    let address = listener.local_addr().expect("an address");
+    let client = TcpStream::connect(address).expect("connects");
+    let (server, _peer) = listener.accept().expect("accepts");
+
+    let mut poller = poller();
+    let mut driver = TcpInetDriver::from_socket(duplicate(server.as_raw_fd())).expect("adopts");
+    assert!(!driver.peer_closed());
+    let mut input = ByteQueue::new();
+    let mut output = ByteQueue::new();
+    let mut arms = PortArms::default();
+    let mut ctx = DriverContext::new(
+        PortId::new(0),
+        &mut poller,
+        &mut input,
+        &mut output,
+        &mut arms,
+    );
+    driver.start(&mut ctx).expect("registers the socket");
+
+    // The peer goes away; the read that observes the end-of-file is the one that answers
+    // `closed` and latches the close.
+    client.shutdown(Shutdown::Both).expect("shuts the peer down");
+    let deadline = Instant::now() + WAIT;
+    let reply = loop {
+        let reply = driver.control(&mut ctx, "recv", b"").expect("the recv verb");
+        if reply != ctl_ok() {
+            break reply;
+        }
+        assert!(Instant::now() < deadline, "the close was never observed");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(reply, ctl_xerror("closed"));
+    assert!(driver.peer_closed(), "the accessor the runtime reads");
+    assert!(driver.eof());
+    assert_eq!(
+        driver.state(),
+        InetState::Connected,
+        "only the read half is gone, so the state is unchanged"
+    );
+    assert_eq!(
+        driver.control(&mut ctx, "recv", b"").expect("the recv verb"),
+        ctl_xerror("enotconn")
+    );
+    assert_eq!(
+        driver.control(&mut ctx, "send", b"x").expect("the send verb"),
+        ctl_xerror("closed"),
+        "the send direction still owes its one-shot `closed`"
+    );
+    assert_eq!(
+        driver.control(&mut ctx, "send", b"x").expect("the send verb"),
+        ctl_xerror("enotconn")
+    );
+}
+#[test]
+fn from_socket_reads_the_state_from_the_kernel() {
+    // A listening socket (`SO_ACCEPTCONN`).
+    let listener = loopback_listener();
+    let driver = TcpInetDriver::from_socket(duplicate(listener.as_raw_fd())).expect("adopts");
+    assert_eq!(driver.state(), InetState::Listening);
+    drop(driver); // closes only the duplicate, not the test's listener
+
+    // A connected socket (has a peer).
+    let address = listener.local_addr().expect("an address");
+    let client = TcpStream::connect(address).expect("connects");
+    let (server, _peer) = listener.accept().expect("accepts");
+    let fd = duplicate(server.as_raw_fd());
+    let driver = TcpInetDriver::from_socket(fd).expect("adopts");
+    assert_eq!(driver.state(), InetState::Connected);
+    assert_eq!(driver.socket(), Some(fd));
+    drop(driver);
+    let _ = client;
+
+    // An opened but unconnected socket.
+    let fd = socket_fd().expect("a fresh socket");
+    let driver = TcpInetDriver::from_socket(fd).expect("adopts");
+    assert_eq!(driver.state(), InetState::Open);
+
+    // A descriptor that is not a socket is rejected, never dereferenced blindly.
+    assert!(TcpInetDriver::from_socket(-1).is_err());
+}
+
+#[test]
+fn commands_before_open_report_the_c_operational_errors() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+
+    // No socket yet: the state errors the C answers with a `ctl_xerror` reply.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "bind", &loopback_arg(0)),
+        b"\x00exbadport".to_vec()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "listen", &[0, 5]),
+        b"\x00exbadport".to_vec()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "connect", &loopback_arg(1)),
+        b"\x00exbadport".to_vec()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "recv", b""),
+        b"\x00enotconn".to_vec()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "send", b"x"),
+        b"\x00enotconn".to_vec()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "shutdown", &[0]),
+        b"\x00enotconn".to_vec()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "accept", b""),
+        b"\x00einval".to_vec(),
+        "`accept` on a non-listener"
+    );
+    // `close` is unconditional in the C (`ctl_reply_ok`, `inet_drv.c:12259`).
+    assert_eq!(control(&mut registry, &mut poller, id, "close", b""), ctl_ok());
+    registry.close(&mut poller, id).expect("closes");
+}
+
+#[test]
+fn unknown_verbs_and_malformed_arguments_are_bad_arg() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+    assert_eq!(registry.get(id).expect("live").driver_name(), "tcp_inet");
+    assert_eq!(registry.get(id).expect("live").state(), PortState::Open);
+
+    let mut verb = |command: &str, arg: &[u8]| {
+        registry
+            .get_mut(id)
+            .expect("live")
+            .control(&mut poller, command, arg)
+    };
+    assert!(matches!(verb("frobnicate", b""), Err(BeamError::BadArg)));
+    // `open` needs its three-byte record ...
+    assert!(matches!(
+        verb("open", &[INET_AF_INET, 1]),
+        Err(BeamError::BadArg)
+    ));
+    // ... whose second byte must be SOCK_STREAM ...
+    assert!(matches!(
+        verb("open", &[INET_AF_INET, 2, INET_PROTO_DEFAULT]),
+        Err(BeamError::BadArg)
+    ));
+    // ... and whose protocol byte must be the default or TCP.
+    assert!(matches!(
+        verb("open", &[INET_AF_INET, INET_TYPE_STREAM, 9]),
+        Err(BeamError::BadArg)
+    ));
+    // None of those failures created a socket.
+    assert_eq!(verb("recv", b"").expect("a reply"), b"\x00enotconn".to_vec());
+
+    // A valid `open` creates the socket ...
+    assert_eq!(verb("open", &open_arg()).expect("opens"), ctl_ok());
+    // ... after which the argument faults of the remaining verbs surface as `BadArg`
+    // (the state guards that answer `exbadport`/`enotconn` come first, as in the C).
+    assert!(matches!(verb("listen", &[9]), Err(BeamError::BadArg)));
+    assert!(matches!(verb("bind", &[]), Err(BeamError::BadArg)));
+    assert!(matches!(verb("connect", b""), Err(BeamError::BadArg)));
+    // A second `open` is the operational `einval` (the C would leak the first socket
+    // here, so this floor refuses instead).
+    assert_eq!(
+        verb("open", &open_arg()).expect("a reply"),
+        b"\x00einval".to_vec()
+    );
+    registry.close(&mut poller, id).expect("closes");
+}
+
+// -----------------------------------------------------------------------
+// The verb round trips (real loopback sockets)
+// -----------------------------------------------------------------------
+
+#[test]
+fn the_open_bind_listen_accept_send_and_recv_verbs_round_trip() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+    let port = listen_on_loopback(&mut poller, &mut registry, id);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).expect("the client connects");
+    let accepted_fd = accept(&mut poller, &mut registry, id);
+    assert!(accepted_fd >= 0, "the reply carried a real descriptor");
+
+    // Peer -> port: the reactor reads the bytes into the port's input queue.
+    client.write_all(b"ping").expect("the client writes");
+    assert_eq!(
+        read_into_queue(&mut poller, &mut registry, id, 4),
+        b"ping",
+        "the connection's bytes reach the port input queue"
+    );
+
+    // Port -> peer: the `send` verb drains the socket.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "send", b"pong"),
+        ctl_ok()
+    );
+    assert_eq!(registry.get(id).expect("live").output_len(), 0);
+    let mut reply = [0u8; 4];
+    client.read_exact(&mut reply).expect("the client reads");
+    assert_eq!(&reply, b"pong");
+
+    // `shutdown` then `close`, and a second `close` is idempotent.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "shutdown", &[TCP_SHUT_WR]),
+        ctl_ok()
+    );
+    assert_eq!(control(&mut registry, &mut poller, id, "close", b""), ctl_ok());
+    assert_eq!(control(&mut registry, &mut poller, id, "close", b""), ctl_ok());
+    registry.close(&mut poller, id).expect("closes the port");
+}
+
+#[test]
+fn an_accept_with_nothing_pending_answers_ok() {
+    let listener = loopback_listener();
+    let mut poller = poller();
+    let (mut registry, id) = open_port(
+        &mut poller,
+        Box::new(TcpInetDriver::from_socket(duplicate(listener.as_raw_fd())).expect("adopts")),
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "accept", b""),
+        ctl_ok(),
+        "EAGAIN is `ok` with no descriptor (retry when the port reports readability)"
+    );
+    registry.close(&mut poller, id).expect("closes");
+}
+
+#[test]
+fn the_recv_and_send_verbs_work_on_an_adopted_connected_socket() {
+    let listener = loopback_listener();
+    let address = listener.local_addr().expect("an address");
+    let mut client = TcpStream::connect(address).expect("connects");
+    let (server, _peer) = listener.accept().expect("accepts");
+
+    let mut poller = poller();
+    let (mut registry, id) = open_port(
+        &mut poller,
+        Box::new(TcpInetDriver::from_socket(duplicate(server.as_raw_fd())).expect("adopts")),
+    );
+
+    // `recv` drives the read path directly (no poller needed): retry until the bytes the
+    // client sent have arrived.
+    client.write_all(b"hello").expect("the client writes");
+    let deadline = Instant::now() + WAIT;
+    let mut got = Vec::new();
+    while got.len() < 5 {
+        assert!(Instant::now() < deadline, "`recv` read nothing");
+        assert_eq!(control(&mut registry, &mut poller, id, "recv", b""), ctl_ok());
+        got.extend(registry.get_mut(id).expect("live").drain_input());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(got, b"hello");
+
+    // ... and `send` writes back to the peer.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "send", b"world"),
+        ctl_ok()
+    );
+    let mut reply = [0u8; 5];
+    client.read_exact(&mut reply).expect("the client reads");
+    assert_eq!(&reply, b"world");
+
+    // `recv` with an argument is a `BadArg`: the C's timeout/length are not honored, so
+    // accepting them would silently ignore them.
+    assert!(matches!(
+        registry
+            .get_mut(id)
+            .expect("live")
+            .control(&mut poller, "recv", &[0, 0, 0, 0]),
+        Err(BeamError::BadArg)
+    ));
+    registry.close(&mut poller, id).expect("closes");
+}
+
+// -----------------------------------------------------------------------
+// Flow control: readiness arming and short writes
+// -----------------------------------------------------------------------
+
+#[test]
+fn a_write_ready_event_is_ignored_until_write_readiness_is_armed() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+    listen_on_loopback(&mut poller, &mut registry, id);
+
+    // A listening socket arms only readability, so a write-ready event schedules nothing
+    // (`PortArms`), while a read-ready one does.
+    assert!(registry.schedule_readiness(
+        id.number(),
+        Readiness {
+            writable: true,
+            ..Readiness::default()
+        }
+    ));
+    assert!(!registry
+        .get(id)
+        .expect("live")
+        .has_pending_task(PortTaskKind::Output));
+    assert!(registry.schedule_readiness(
+        id.number(),
+        Readiness {
+            readable: true,
+            ..Readiness::default()
+        }
+    ));
+    assert!(registry
+        .get(id)
+        .expect("live")
+        .has_pending_task(PortTaskKind::Input));
+    registry.close(&mut poller, id).expect("closes");
+}
+
+#[test]
+fn a_stalled_write_arms_write_readiness_and_defers_a_shutdown() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+    let port = listen_on_loopback(&mut poller, &mut registry, id);
+    // The peer connects but never reads, so the kernel's buffers fill and stay full.
+    let _client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+    accept(&mut poller, &mut registry, id);
+
+    // A small write is taken by the kernel straight away.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "send", b"tiny"),
+        ctl_ok()
+    );
+    assert_eq!(registry.get(id).expect("live").output_len(), 0);
+
+    // Keep offering bytes until the kernel stops taking them: the remainder stays in the
+    // port output queue and write readiness is armed.
+    let chunk = vec![b'x'; 256 * 1024];
+    let deadline = Instant::now() + WAIT;
+    while registry.get(id).expect("live").output_len() == 0 {
+        assert!(Instant::now() < deadline, "the kernel accepted every byte");
+        assert_eq!(
+            control(&mut registry, &mut poller, id, "send", &chunk),
+            ctl_ok()
+        );
+    }
+
+    // The evidence that write readiness is armed: a write-ready event now schedules an
+    // OUTPUT task (which the port-task round would run when the kernel drains).
+    assert!(registry.schedule_readiness(
+        id.number(),
+        Readiness {
+            writable: true,
+            ..Readiness::default()
+        }
+    ));
+    assert!(registry
+        .get(id)
+        .expect("live")
+        .has_pending_task(PortTaskKind::Output));
+
+    // A `SHUT_WR`/`SHUT_RDWR` with output still queued is deferred, never dropped.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "shutdown", &[TCP_SHUT_RDWR]),
+        ctl_ok()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "shutdown", &[TCP_SHUT_WR]),
+        ctl_ok()
+    );
+    assert!(registry.get(id).expect("live").output_len() > 0);
+    registry.close(&mut poller, id).expect("closes");
+}

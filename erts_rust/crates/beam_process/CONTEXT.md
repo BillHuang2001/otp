@@ -22,23 +22,18 @@ and `erl_nfunc_sched.c` (the NIF→dirty-scheduler trampoline).
 ## Milestone-1 scope
 The crate has **two scheduler fronts**: the single-threaded `Scheduler` loop (whose slice semantics are
 frozen) and the SMP `SchedulerPool` that runs `N` scheduler threads over one shared table. Both execute
-the **same** slice logic — `scheduler::{slice_begin, slice_end}` (with `run_one` = both halves around
-one full-budget runner call) plus `drain_woken_into`, so the SMP front adds *concurrency* (and a
-bounded lock hold), not a second scheduler implementation. "Correct" means the pid
-table, the **four-level** run-queue scheduling order (max/high/normal/low), message delivery, the
-**decoupled per-process signal queue** (exit signals + monitor-DOWNs, applied at schedule-in or eagerly
-for a non-running receiver), the process dictionary and saved-argument sub-rootsets, the **port
-ownership/link/monitor** surface, **remote (distributed) links/monitors** routed through the
-`DistSignalRouter` seam, and a safepoint GC over the process root set all behave per the C semantics
-for the common cases, and are covered by tests.
-Still **not** modelled: lock-free/threaded run queues, scheduler balancing, `+S`/`+SDcpu`/`+SDio` flag
-parsing, and per-process **parallel** execution — the pool's table lock is held for one reduction
-**quantum** (`SchedulerConfig::set_lock_quantum`, default `DEFAULT_LOCK_QUANTUM = 256`), not for a
-whole slice, so an independent process / cross-thread send / timer / dirty completion is serviced
-*inside* another process's slice, but exactly one process still **executes** at a time across all
-schedulers. Also not modelled: dirty-job term plumbing (a `DirtyJob` carries no live heap data) and
-heap-resident timer messages (a timer message must be thread-valid — an immediate or a literal-area
-term).
+the **same** slice logic — `scheduler::{slice_begin, slice_end}` (with `run_one` = both halves around one
+full-budget runner call) plus `drain_woken_into` — so the SMP front adds *concurrency* (and a bounded
+lock hold), not a second scheduler implementation. The pool's table lock is held for one reduction
+**quantum** (`SchedulerConfig::set_lock_quantum`, default `DEFAULT_LOCK_QUANTUM = 256`), not a whole
+slice, so an independent process / cross-thread send / timer / dirty completion is serviced *inside*
+another process's slice — but exactly one process still **executes** at a time across all schedulers.
+"Correct" means the pid table, the **four-level** run-queue order, message delivery, the **decoupled
+per-process signal queue**, the monitor/registration surface, the process dictionary and saved-argument
+sub-rootsets, the **port ownership/link/monitor** surface, **remote links/monitors** through the
+`DistSignalRouter` seam, and a safepoint GC over the process root set all behave per the C/oracle
+semantics for the common cases, and are covered by tests. What is deliberately *not* modelled is listed
+under Known Issues.
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_process::prelude::*`. Each module's **full** method list
 lives in its `src/*.rs` top-of-file `//!` rustdoc; this section names the frozen seam types and the
@@ -69,14 +64,22 @@ liveness maps.
   `collector: beam_gc::Collector` (young + mature heap spaces), `off_heap: beam_message::OffHeapTable`
   (MSO handles), `mailbox: beam_message::Queue`, `regs: Registers`, `dict: Dict`, `saved_args:
   SavedArgs`, `signals: SignalQueue`, `reductions: u64`, `links: Links`, `monitors: Monitors`
-  (outgoing), `monitored_by: Vec<MonitoredBy>` (incoming), `exit_reason: Option<Eterm>`.
-  - `new(pid) -> Result<Process>` / `with_policy(pid, policy)`.
+  (outgoing process monitors), `monitored_by: Vec<MonitoredBy>` (incoming),
+  `port_monitors: Vec<PortWatch>` (outgoing port watches), `exit_reason: Option<Eterm>`.
+  - `new(pid) -> Result<Process>` / `with_policy(pid, policy)` /
+    `with_policy_and_priority(pid, policy, Priority)` — the **spawn-at-priority** constructor (a runtime
+    composes `alloc_pid` + it + `ProcessTable::insert`, so a child is born at its level, not Normal).
+  - **`status`:** `ProcessState::status_atom(&self) -> Option<&'static str>` and `Process::status()` map
+    the state — with the `garbage_collecting` flag layered over it — to the oracle's
+    `process_info(P, status)` atoms (`"running"`/`"runnable"`/`"waiting"`/`"suspended"`/`"exiting"`);
+    `None` for `Terminated` (a dead pid answers `undefined` — the BIF layer supplies that).
   - `wake(&mut self) -> bool` — `Waiting`/`Suspended` ⇒ `Runnable` + `true` (the blocked-recipient
     wake used by resume-on-send).
   - `heap()/heap_mut()` (the **young** mutator heap, `collector.young_mut().heap_mut()`); the
     `priority`/`save_calls`/`sensitive`/`trap_exit` accessors; `mailbox(_mut)`, `registers(_mut)`,
     `dict(_mut)`, `saved_args(_mut)`, `signals(_mut)`/`pending_signals()`, `off_heap(_mut)`,
-    `links(_mut)`, `monitors(_mut)`, `monitored_by(_mut)`, `exit_reason`/`set_exit_reason`.
+    `links(_mut)`, `monitors(_mut)`, `monitored_by(_mut)`, `port_monitors(_mut)`,
+    `exit_reason`/`set_exit_reason`.
   - **message delivery:** `deliver(from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) ->
     Result<DeliverOutcome>` — copies `term` into the young heap (collect-and-retry once on
     `AllocKind::Heap`/`Message` exhaustion), enqueues the `Message`, then `wake()`s;
@@ -114,7 +117,9 @@ liveness maps.
 - `RunQueue` — **four per-priority FIFOs**; `dequeue` serves the highest-priority non-empty level, FIFO
   within a level. `enqueue(pid)` ⇒ **normal**; `enqueue_with_priority(pid, Priority)`;
   `dequeue`/`dequeue_with_priority`; `len`/`len_at`; `contains`/`priority_of`/`remove`;
-  `iter`/`iter_at`; `clear`.
+  `iter`/`iter_at`; `clear`; `reprioritize(pid, Priority) -> bool` — move an already-queued pid to the
+  tail of the new level (never double-enqueues, never inserts a non-queued pid): the run-queue half of
+  `Scheduler::set_priority`.
   - `split_off_half(&mut self) -> Vec<ProcessId>` — removes up to half the queue's pids (highest
     priority first, in `dequeue` order) so a work-stealing victim keeps at least half (0/1 pids ⇒
     empty). The victim half of the SMP steal.
@@ -141,10 +146,16 @@ liveness maps.
     `beam_rt` calls after a send made **outside** a slice.
   - `run_ready<R>(&mut self, table, runner, max_slices: Option<u64>) -> Result<u64>` — run until the
     ready queue is empty or `max_slices` slices ran.
+  - `set_priority(&mut self, table, pid, priority) -> Result<()>` — update the PCB priority and, **iff**
+    the pid is already queued at a different level, move it to the new level's tail; the C
+    `erts_set_process_priority` requeue. `TermNotFound` for an unknown pid leaves the queue untouched.
 - **Reduction accounting is delegated to the runner.** `DEFAULT_REDUCTIONS_PER_SLICE` is handed to
   `ProcessRunner::run` as its `budget` argument; the scheduler never reads or resets
   `Process::reductions` (`process.rs:367-379` — the accessors are exercised only by tests). The runner
-  owns the reds count and decides when to return `RunOutcome::Yield`.
+  owns the reds count and decides when to return `RunOutcome::Yield`. **Pre-emption is therefore
+  cooperative**: `tests/preemption.rs` proves a budget-respecting runner interleaves several CPU-bound
+  processes round-robin with no starvation, but the M1 `beam_rt::RuntimeRunner` ignores its `budget` and
+  never yields, so it is a delivered-but-unconsumed seam (see Known Issues).
 - **Shared slice helpers (the SMP reuse seam).** `pub(crate) slice_begin(pid, table) -> Result<bool>`
   (mark executing + apply the queued signals) and `pub(crate) slice_end<F>(pid, table, outcome,
   enqueue)` are the frozen schedule-in/schedule-out halves; `pub(crate) run_one<R, F>(pid, table,
@@ -167,12 +178,17 @@ Crate-root re-exports: `beam_process::{SchedulerPool, SchedulerConfig, Scheduler
 SharedProcessTable}`. Full API surface, the **BINDING locking discipline** (three lock families, the
 buffer-requeues rule), the **bounded-quantum lock** rule (`run_locked_quanta`, `set_lock_quantum`) and
 the `unsafe impl Send/Sync` handoff live in **`src/smp/CONTEXT.md`** — read it before changing
-anything here.
+anything here. `SchedulerPool::set_priority(pid, priority)` implements the same requeue as the
+single-threaded `Scheduler` (PCB update under the table lock, then an `O(schedulers)` search of the
+injector + every local queue, one queue lock at a time).
 ### `timer.rs` — the high-level timer service
-- `TimerService` — one background thread over a deadline min-heap (the `erlang:send_after/3`,
-  `start_timer/3` and `receive ... after T` plumbing): `new()`, `start(Arc<dyn TimerSink>)`
+- `TimerService` — one background thread over a deadline min-heap: `new()`, `start(Arc<dyn TimerSink>)`
   (idempotent), `send_after(Duration, ProcessId, Eterm) -> TimerRef`, `cancel(TimerRef) -> bool`,
   `pending()`, `next_deadline() -> Option<Instant>`, `is_running()`, `shutdown()` (terminal), `join()`.
+  This is the delivery **mechanism** only: it schedules one message to one `ProcessId` after a delay.
+  The `erlang:send_after/3`, `start_timer/3` (`{timeout,Ref,Msg}` needs `make_ref`), `cancel_timer/1,2`,
+  `read_timer/1`, `start_timer/4` and `receive ... after T` timeout-label semantics are BIF/engine-side
+  (owned by `beam_bifs`/`beam_rt`); `read_timer` and a hibernate state are absent here.
 - `TimerRef { id, generation }` (`Copy`) with `id()`/`generation()`.
 - `TimerSink: Send + Sync { fn timer_fired(&self, target: ProcessId, message: Eterm); }` — the seam
   the pool implements.
@@ -200,10 +216,10 @@ anything here.
   current generation), `is_active()`/`set_active(bool)` (an inactive/parked thread is already at a
   safepoint and is excluded from the wait), `id()`.
 ### `signal.rs` — exit signals, reasons and signal-message builders
-- `SignalAtoms { exit, down, process, port, normal, kill, killed }` — the well-known atom indices used
-  to build signal messages; `from_table(&mut AtomTable)` interns `'EXIT'`/`'DOWN'`/`process`/`port`/
-  `normal`/`kill`/`killed`; accessors incl. `port()`, `normal_term()/kill_term()/killed_term() ->
-  Eterm`.
+- `SignalAtoms { exit, down, process, port, normal, kill, killed, noproc }` — the well-known atom
+  indices used to build signal messages; `from_table(&mut AtomTable)` interns `'EXIT'`/`'DOWN'`/
+  `process`/`port`/`normal`/`kill`/`killed`/`noproc`; accessors incl. `port()`, `noproc()`/`noproc_term()`,
+  `normal_term()/kill_term()/killed_term() -> Eterm`.
 - `ReasonClass { Normal, Kill, Other }` + `SignalAtoms::classify(reason) -> ReasonClass`.
 - `ExitSignal { from: ProcessId, reason: Eterm }` (`Copy`).
 - `ExitPolicy { Terminate(Eterm), Trap, Ignore }` — `Trap` = deliver `{'EXIT', From, Reason}` as a
@@ -238,21 +254,29 @@ sub-rootset.
 ### `monitor.rs` — monitors and monitor references
 - `MonitorRef { id: u64 }` (`Copy + Eq + Hash`) — `id()`, `to_eterm(self, heap) -> Result<Eterm>`
   (builds the on-heap `Ref` thing, see Design Decisions).
-- `MonitorKind { Process, Port }`.
+- `MonitorKind { Process, Port }` — `type_name() -> &'static str` (`"process"`/`"port"`) and
+  `from_type_name(&str) -> Option<MonitorKind>` back the `erlang:monitor/2` type dispatch (any other
+  type name ⇒ `None` ⇒ the caller's `badarg`, matching the oracle).
+- `PortWatch { reference: MonitorRef, port: PortId }` (new, `Copy`) — the **outgoing** half of a port
+  monitor, held in `Process::port_monitors`. Plain values only (see Design Decisions: not a GC root).
 - `Monitor { reference, target: ProcessId, kind }` (outgoing) / `MonitoredBy { reference, watcher:
   ProcessId, kind }` (incoming).
 - `Monitors { entries: Vec<Monitor> }` — `push`, `remove(reference) -> Option<Monitor>`,
   `find(reference)`, `iter`, `drain`.
+- `payload_is_down_for(payload: Eterm, reference: MonitorRef, down_atom: Atom) -> bool` — the guarded
+  `{'DOWN', Ref, _, _, _}` shape test `demonitor_flush` scans mailboxes with (one `unsafe` block, no
+  out-of-bounds read).
 - `RefAllocator { next: u64 }` — `next() -> MonitorRef` (monotonic, never reuses an id). Owned by
   `ProcessTable`.
 ### `ptab.rs` — the process/port table + name registry + signal/link/monitor hub
 The single place that mutates ≥2 processes (mirrors the C ptab lock domain); M1 single-threaded, so it
 holds `Process` values directly. (`PortTable` lives in `port.rs`.)
 - `ProcessTable { slots, free, names: HashMap<Atom, ProcessId>, refs: RefAllocator, atoms: SignalAtoms,
-  ready: Vec<ProcessId>, remote_links, remote_monitors, router: Option<Box<dyn DistSignalRouter>> }`
-  (`Slot { serial: u64, process: Option<Process> }`). `ready` is the **wake list** (a delivery/signal
-  pushes a woken pid; `drain_woken` returns **and** clears it); `router` is the distribution seam
-  (`None` ⇒ record-only).
+  ready: Vec<ProcessId>, remote_links, remote_monitors, named_monitors: HashMap<MonitorRef,
+  NamedTarget>, local_node: Option<Atom>, router: Option<Box<dyn DistSignalRouter>> }`
+  (`Slot { serial: u64, process: Option<Process> }`; `NamedTarget { name: Atom, node: Atom }`). `ready`
+  is the **wake list** (a delivery/signal pushes a woken pid; `drain_woken` returns **and** clears it);
+  `router` is the distribution seam (`None` ⇒ record-only).
   - **allocation / lookup:** `new(atoms)`, `alloc_pid() -> Result<ProcessId>` (reuses a free slot,
     bumping its serial; `SystemLimit` on exhaustion), `spawn(policy)`/`spawn_default()`,
     `insert(Process)`, `get(pid)`/`get_mut(pid)`, `take(pid)` (bumps the slot serial **and drops the
@@ -264,8 +288,21 @@ holds `Process` values directly. (`PortTable` lives in `port.rs`.)
     Vec<ProcessId>`, `woken() -> &[ProcessId]`.
   - **signals / links / monitors (local pids):** `apply_exit_signal(target, ExitSignal) ->
     Result<ExitEffect>`, `link(a, b)`, `unlink(a, b)`, `send_exit(from, to, reason)` (the `exit/2` op),
-    `monitor(watcher, target, kind) -> Result<MonitorRef>`, `demonitor(watcher, reference) ->
-    Result<bool>`, `terminate(pid, reason)`.
+    `terminate(pid, reason)`.
+  - **monitors:** `monitor(watcher, target: ProcessId, kind) -> Result<MonitorRef>` — a **non-live**
+    target with a live watcher yields `Ok(ref)` plus an immediate
+    `{'DOWN', Ref, process, Target, noproc}` in the watcher's mailbox (the oracle's `noproc`);
+    `demonitor(watcher, reference) -> Result<bool>`; `demonitor_flush(watcher, reference) ->
+    Result<bool>` (also removes a queued `{'DOWN', …}` for that reference —
+    `erlang:demonitor(Ref,[flush])`); `monitor_named(watcher, name: Atom, node: Atom, kind)` plus
+    `set_local_node(Atom)`/`local_node()` (`erlang:monitor(process, Name)`: the DOWN target is the
+    2-tuple `{Name, node}`; with no local node installed ⇒ typed `unsupported`);
+    `monitor_port(watcher, port: PortId, &mut PortTable)`, `monitor_port_term(watcher, target: Eterm,
+    &mut PortTable)`, `demonitor_port(watcher, reference, &mut PortTable)` (`erlang:monitor(port, Port)`).
+    `monitor_term` dispatches a pid → `monitor`, an atom name → `monitor_named`, an external pid → the
+    remote record + route; a **port term** with `MonitorKind::Process` ⇒ `BadArg` (oracle) and with
+    `MonitorKind::Port` ⇒ typed `unsupported` (that entry point has no `&mut PortTable` — use
+    `monitor_port_term`); anything else ⇒ `BadArg`.
   - **decoupled signal servicing:** `service_signals(pid) -> Result<()>` — drains + applies the pid's
     pending-signal queue in FIFO order, cascading to any process those signals affect (the scheduler
     calls it at schedule-in); `pending_signals(pid)`, `signals(pid) -> Result<&SignalQueue>`.
@@ -279,8 +316,12 @@ holds `Process` values directly. (`PortTable` lives in `port.rs`.)
     relationship with `node` (a `{'DOWN', …}` per monitor, a trapped/fatal `{'EXIT', …}` per link);
     `port_closed(&mut PortTable, port, reason)` — drains the port's owner/links/monitors and delivers
     the `{'DOWN', Ref, port, Port, Reason}` / `{'EXIT', Port, Reason}` shapes.
-  - **name registry:** `register(name, pid)`, `unregister(name)`, `whereis(name) -> Option<ProcessId>`,
-    `registered()`.
+  - **name registry:** `register(name, pid) -> Result<()>` (`BadArg` for a taken name **or a non-live
+    pid**), `unregister(name) -> Result<()>` (`BadArg` for an unknown name), `whereis(name) ->
+    Option<ProcessId>`, `registered()`, `name_of(pid) -> Option<Atom>` (the reverse lookup a
+    `process_info(P, registered_name)` BIF needs; live-only).
+  - **liveness / reason:** `is_process_alive(pid) -> bool` (table membership), `exit_reason(pid) ->
+    Result<Option<Eterm>>` (live-only).
 - `ExitEffect { Terminated, Trapped, Ignored }` — the outcome of `apply_exit_signal` (whether the
   target was terminated, got a `{'EXIT'}` message, or ignored the signal).
 - **Eager-vs-queued rule (the signal ordering contract).** A signalling operation **enqueues** a
@@ -373,16 +414,19 @@ re-export keeps `beam_process::PortTable` resolving here.
   (alloc/reuse + relationship round-trips), `progress` (generation bump), `ptab` (alloc/remove/reuse +
   serial bump, name registry, stale-pid rejection, `deliver` wake list, `take` clearing a pending wake,
   the trap/link-`EXIT`/`{'DOWN'}` paths waking a blocked recipient).
-- **`tests/` — the integration evidence pinning the M1 guarantees.** 16 files, one topic each; the
+- **`tests/` — the integration evidence pinning the M1 guarantees.** **21 files**, one topic each; the
   authoritative per-file list lives in **`tests/CONTEXT.md`**. In short: `scheduler`/`messaging`/
   `signals`/`gc`/`priority`/`pending_signals`/`dict`/`dict_oracle`/`fragments` cover the single-threaded
   scheduler, the mailbox, signals, PCB state and the dictionary (including its `erl`-cross-checked
   structural key/value equality); `ports`/`remote` the port table and distributed links/monitors;
-  `smp`/`lock_scope`/`timers`/`dirty`/`progress` the SMP pool. `tests/lock_scope.rs` is the
-  bounded-quantum-lock evidence (a slice = `ceil(budget/quantum)` runner invocations under one slice;
-  a cross-thread send and a peer run *inside* another process's slice — both assertions fail under a
-  whole-slice lock) plus the 1-vs-4-scheduler determinism check on per-sender message + `{'EXIT', …}`
-  order.
+  `smp`/`lock_scope`/`timers`/`dirty`/`progress` the SMP pool; `registry_monitors` the
+  monitor/registration semantics (incl. `noproc`/flush/name targets and an `erl` cross-check);
+  `preemption` the measured round-robin fairness; and `capability_inventory`/`process_info_source`/
+  `spawn_options` the typed-error inventory, the `process_info` item→accessor map and the spawn-option
+  composition. `tests/lock_scope.rs` is the bounded-quantum-lock evidence (a slice =
+  `ceil(budget/quantum)` runner invocations under one slice; a cross-thread send and a peer run *inside*
+  another process's slice — both assertions fail under a whole-slice lock) plus the 1-vs-4-scheduler
+  determinism check.
 - **Anti-flakiness (the SMP/lock-scope/timer/dirty/progress suites).** Every assertion is forced by
   **synchronization**, never `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion
   signals, `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))`
@@ -393,155 +437,112 @@ re-export keeps `beam_process::PortTable` resolving here.
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **240 tests, 0 failures** (136 in-module unit + 103 across the 16 `tests/` files + 1
-  doctest), warning-free. Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`,
-  never touch `../../tools/`.
+  Current total: **312 passed / 0 failed / 1 ignored** (157 in-module unit + 154 integration across the
+  21 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
+  in `preemption.rs`), warning-free. Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
+  never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
   not here.
 ## Design Decisions
 - **A decoupled, ordered per-process signal queue.** A signal is **enqueued** on the receiver's own
   `SignalQueue` at generation time — never applied inline — and applied later, at the target's
-  **schedule-in** (`Scheduler::run_slice` calls `ProcessTable::service_signals(pid)` before
-  `runner.run`; the scheduler returns early if servicing terminated the pid) or **eagerly at the end of
-  the sending operation** when the target is *not* the currently `Running` process (ERTS's early signal
-  handling). The reason is **copied into the receiver's own heap at enqueue time**, so the queued signal
-  outlives the signaller's heap and its off-heap objects; `exit_policy` is evaluated at **service**
-  time, against the receiver's `trap_exit` flag *then*. **Ordering guarantee:** a total FIFO order per
-  receiver (a single FIFO), which subsumes ERTS's per-`(sender, receiver)` order; it is **not**
-  cross-ordered with the mailbox — a `{'EXIT', …}`/`{'DOWN', …}` becomes a mailbox message only when it
-  is *applied* (see `signal_queue.rs` and Known Issues). The queue is an **in-heap sub-rootset**:
-  `Process::collect` gathers/scatters it (after the saved args).
-- **Resume-on-send: a wake list on the table + absorption by the scheduler.** A delivery (or a signal
-  message) to a blocked process must make it runnable, and the single-threaded scheduler must not exit
-  `run_ready` while a freshly-woken process is still pending. Rather than have every caller re-enqueue
-  (which would double-enqueue a process the `Yield` branch already requeued), the wake is *recorded* on
-  the `ProcessTable` (`ready: Vec<ProcessId>`): `Process::deliver` returns `DeliverOutcome::Woke`, the
-  table-level `deliver`/signal builders push the pid onto `ready`, and `Scheduler::run_slice` drains it
-  via `resume_woken` at the end of **every** slice (and on the empty-queue early return). `resume_woken`
-  skips a pid that is no longer live, is not `Runnable`, or is already `in_run_queue` — the last guard
-  is what prevents the running process (requeued by `Yield`) from being enqueued twice when it also
-  appears on the wake list. A send made **outside** a slice has no slice end to absorb it, so `beam_rt`
-  calls `resume_woken` itself (the documented contract above). Both `Waiting` and `Suspended` are woken
-  by `Process::wake`: `Waiting` is the ordinary empty-receive case, and waking a `Suspended` process
-  keeps the two blocked states symmetric (the message must still be seen; the suspension is lifted
-  separately) rather than guessing the historical C nuance — the C's `SUSPENDED`-vs-`suspend`-counter
-  distinction is a follow-up.
-- **`ProcessRunner` is the engine seam — `beam_engine` is not a dependency.** The scheduler must not
-  know how a process executes. `beam_rt`/`beam_engine` implement `ProcessRunner` over the engine's
-  `ExecutionContext`, so this crate stays at Stage-5 and the DAG stays acyclic (`beam_engine` →
-  `beam_loader` only; `beam_process` → wave-0/1/2 foundations).
-- **The `ProcessTable` is the ≥2-process mutation hub.** Links/monitors/signal delivery inherently touch
-  two PCBs; holding two `&mut Process` from a `HashMap` is a borrow-checker impossibility, so all such
-  operations live on `ProcessTable` and use a **collect-then-apply worklist** (gather the link targets /
-  watchers, then mutate each target transiently). `Process` itself holds only its own sets.
-- **A signalled reason is COPIED into the receiver's heap at ENQUEUE time.** An exit/link/monitor reason
-  that lives in the source process's heap (e.g. a tuple like `{badmatch, X}`) must not be embedded by
-  reference into a receiver: the source heap is dropped when it terminates, which would leave a dangling
-  pointer in the receiver's queued signal (and a safepoint GC would then corrupt/crash).
-  `copy_reason_onto` therefore `copy_struct`s the reason into the receiver's heap **when the signal is
-  enqueued** (`enqueue_exit_signal`/`enqueue_down_signal`), registering every referenced off-heap object
-  in the receiver's own table, so a queued reason always outlives the signaller. `terminate_into` copies
-  the dying process's reason into every peer **before** `drop`ping its PCB; a self-signal (`source ==
-  recipient`) is already in the receiver's heap and is not copied. Immediates and literal-area terms are
-  shared by `copy_struct`, so the common reasons pay nothing. This mirrors `Process::deliver`'s
-  copy-then-enqueue pattern and is what makes `{'EXIT', …}`/`{'DOWN', …}` survive the receiver's next
-  collection.
-- **GC root set = registers + mailbox payloads + dictionary + saved args + pending signals, gathered
-  into a flat `&mut [Eterm]`.** `beam_gc`'s collector takes a flat root slice (`x_reg_array[0..Live)` +
-  stack, no frame maps). The mailbox, the process dictionary (`Dict`), the saved BIF/NIF arguments
-  (`SavedArgs`) and the pending-signal queue (`SignalQueue`) all hold terms *in this process's heap*, so
-  each is a sub-rootset (`beam_gc` explicitly delegates on-heap message queues to `beam_process`).
-  `Process::collect` gathers them in a fixed order — registers/stack, mailbox payloads, dictionary,
-  saved args, pending signals — runs the collector, then writes each region back in the same order:
-  since `beam_message::Message` has no payload setter the queue is **drained** (`Queue::dequeue`), each
-  payload appended to the root buffer, and each `Message` **rebuilt** from its relocated payload (via
-  the public `Message::new(..).with_token(..).with_off_heap(..)` builder); the dict/saved-args/signal
-  regions are scattered back through their own `scatter_roots`. MSO handles are off-heap and do not
-  move. This uses only `beam_message`'s public API — no sibling crate is modified.
-- **The process dictionary compares keys — and, for `get_keys/1`, values — with `beam_term::compare::eq`
-  (the C's `EQ`, `erl_utils.h:113`).** `Dict` carries the atom table as a cheap `Rc<AtomTable>` handle
-  (`Dict::new()` ⇒ an empty table, whose unknown-name fallback is the raw atom index, i.e. exactly the C's
-  `EQ` for two immediates; `Dict::with_atoms(Rc<AtomTable>)` ⇒ the owner's shared table, so names resolve).
-  Raw `Eterm` word equality would report a *boxed* key absent whenever the looked-up term is a distinct
-  but equal heap word (`put({a},1), get({a})` ⇒ `undefined` instead of `1`); the C's `EQ` is a raw-word
-  fast path for immediates **plus** a structural walk for boxed terms, which `compare::eq` reproduces. The
-  `Rc` (not `&AtomTable`) keeps the method signatures unchanged and matches `beam_rt`'s `CodeServer`/
-  persistent-term convention — no dependency edge, no cross-crate churn. The BIF layer supplies/copies
-  values in and maps the `None` (absent) result to the `undefined` atom.
-- **The dictionary's iteration order is a documented deviation.** `Dict` keeps its pairs in insertion
-  order, so `get_keys`/`entries`/`erase_all` are insertion-ordered; the C walks its hash array
-  (`pd_hash_get_all`, `erl_process_dict.c:579-626`), whose order is a slot-layout artifact, not LIFO
-  (`put(a,1), put(b,2), get()` ⇒ `[{b,2},{a,1}]` on OTP 29.1.1). Reproducing it means porting the hash
-  array — the O(1)-lookup optimization this module deliberately defers. Orthogonal to the equality fix and
-  unchanged by it; the *value* semantics (`put` replaces in place / last put wins / returns the replaced
-  value, `erase` returns the erased value) are pinned by tests.
+  **schedule-in** (`run_slice` calls `service_signals` before `runner.run`, returning early if servicing
+  terminated the pid) or **eagerly at the end of the sending operation** when the target is *not* the
+  currently `Running` process. The reason is **copied into the receiver's heap at enqueue time**, so a
+  queued signal outlives the signaller's heap; `exit_policy` is evaluated at **service** time against the
+  receiver's `trap_exit` *then*. **Ordering:** a total FIFO order per receiver, subsuming ERTS's
+  per-`(sender, receiver)` order; it is **not** cross-ordered with the mailbox.
+- **Resume-on-send: a wake list on the table + absorption by the scheduler.** The wake is *recorded* on
+  the `ProcessTable` (`ready: Vec<ProcessId>`) rather than re-enqueued by every caller (which would
+  double-enqueue a pid the `Yield` branch already requeued): `Process::deliver` returns
+  `DeliverOutcome::Woke`, the table-level deliver/signal builders push onto `ready`, and `run_slice`
+  drains it via `resume_woken` at the end of **every** slice (and on the empty-queue early return).
+  `resume_woken` skips a pid that is dead, not `Runnable`, or already `in_run_queue` — the last guard is
+  what prevents the double enqueue. A send **outside** a slice has no slice end, so `beam_rt` calls
+  `resume_woken` itself. Both `Waiting` and `Suspended` are woken (the C's `SUSPENDED`-vs-suspend-counter
+  nuance is a follow-up).
+- **`ProcessRunner` is the engine seam — `beam_engine` is not a dependency.** The scheduler must not know
+  how a process executes; `beam_rt`/`beam_engine` implement `ProcessRunner` over the engine's
+  `ExecutionContext`, keeping the DAG acyclic (`beam_engine` → `beam_loader` only).
+- **The `ProcessTable` is the ≥2-process mutation hub.** Links/monitors/signal delivery touch two PCBs;
+  two `&mut Process` from a `HashMap` is a borrow-checker impossibility, so these live on `ProcessTable`
+  and use a **collect-then-apply worklist**. `Process` holds only its own sets.
+- **A signalled reason is COPIED into the receiver's heap at ENQUEUE time.** The source heap is dropped
+  when it terminates, so embedding a reason by reference would dangle (and a safepoint GC would corrupt).
+  `copy_reason_onto` `copy_struct`s it at enqueue (`enqueue_exit_signal`/`enqueue_down_signal`),
+  registering referenced off-heap objects in the receiver's table; `terminate_into` copies the dying
+  process's reason into every peer **before** `drop`ping its PCB; a self-signal is already in the
+  receiver's heap. Immediates/literals are shared by `copy_struct`, so the common reasons pay nothing.
+- **GC root set = registers + mailbox payloads + dictionary + saved args + pending signals**, gathered
+  into a flat `&mut [Eterm]` (the collector takes a flat slice; `beam_gc` delegates on-heap message
+  queues to `beam_process`). `Process::collect` gathers in a fixed order — registers/stack, mailbox
+  payloads, dictionary, saved args, pending signals — runs the collector, then writes each region back in
+  the same order: since `beam_message::Message` has no payload setter, the queue is **drained**, each
+  payload appended to the root buffer, and each `Message` **rebuilt** from its relocated payload via the
+  public builder; dict/saved-args/signal regions scatter back through their own `scatter_roots`. MSO
+  handles are off-heap and do not move. `Process::port_monitors` is **not** a root — a `PortWatch` holds
+  plain values only.
+- **The dictionary compares keys — and `get_keys/1` values — with `beam_term::compare::eq` (the C's
+  `EQ`).** `Dict` carries the atom table as an `Rc<AtomTable>` handle (`new()` ⇒ an empty table, whose
+  unknown-name fallback is the raw atom index — the C's `EQ` for two immediates). Raw word equality would
+  report a *boxed* key absent when the looked-up term is a distinct-but-equal heap word
+  (`put({a},1), get({a})` ⇒ `undefined` instead of `1`). The `Rc` (not `&AtomTable`) keeps signatures
+  unchanged and matches `beam_rt`'s `CodeServer` convention — no dependency edge.
+- **The dictionary's iteration order is a documented deviation.** `Dict` keeps insertion order; the C
+  walks its hash array (`pd_hash_get_all`), a slot-layout artifact (`put(a,1), put(b,2), get()` ⇒
+  `[{b,2},{a,1}]` on OTP 29.1.1). Porting the hash array is the deferred O(1)-lookup optimization. The
+  *value* semantics (replace in place / last put wins / returns the replaced value, `erase` returns the
+  erased value) are pinned by tests.
 - **Monitor references are on-heap `Ref` things built locally (`monitor.rs`).** `beam_term` has no
-  `make_ref` in M1, so a monitor reference is represented as the frozen 4-word ref thing
-  `[make_header(3, REF_SUBTAG), node(0), serial, id]` built with `beam_term`'s public `make_header`;
-  `beam_message::layout::object_words` copies a ref thing verbatim (`thing_arityval+1` = 4 words, no
-  navigable children) and `beam_term::compare` compares internal refs by raw payload words, so a
-  `{'DOWN', Ref, …}` message round-trips and matches. When `beam_term` gains a proper `make_ref`, only
-  `MonitorRef::to_eterm` changes. This is a documented, contained substitution — flagged to `../`.
-- **`Links` may hold the link partner more than once in the C (a link is refcounted); M1 keeps a set.**
-  Re-linking an already-linked pair is a no-op (`add` returns `false`) and unlinking removes once, which
-  matches the observable `erlang:link/1` / `erlang:unlink/1` semantics for the common cases; the C's
-  per-link refcount (for `erlang:monitor` on links and distributed links) is a follow-up.
-- **`trap_exit` is a flag on the PCB, not a separate queue.** `exit_policy` reads it — at *service*
-  time, when a queued signal is applied — and decides `Terminate`/`Trap`/`Ignore`; the `Trap` case
-  builds `{'EXIT', From, Reason}` into the mailbox. This is exactly the observable
-  `process_flag(trap_exit, true)` behaviour.
-- **`Process` owns a `beam_gc::Collector`, not raw `Heap`s.** The young space is the mutator heap
-  (`heap_mut()`), the mature space is a GC target; `should_collect`/`collect` delegate policy to
-  `beam_gc::HeapPolicy`. No heap logic is reimplemented here.
-- **`parking_lot` is the synchronisation primitive; `libc` remains unused.** The SMP pool, the timer
-  service and the dirty pools use `parking_lot::{Mutex, Condvar}` (plus std atomics), and `progress.rs`
-  uses `parking_lot::{Mutex, Condvar}` for the barrier. `libc` is declared but unused in the core; it
-  stays the documented dependency of the deferred OS-level threading work.
-- **The SMP pool reuses the frozen slice (`slice_begin`/`slice_end`/`drain_woken_into`).** Concurrency is
-  added *around* the slice, never inside it: `Worker::run` calls the same `pub(crate)` helpers (via
-  `run_locked_quanta`) the single-threaded `Scheduler` uses (`run_one` = `slice_begin` + one full-budget
-  runner call + `slice_end`), so a process executes identically under either front. The only difference
-  is the requeue closure the worker passes — it **buffers** requeues into a local `Vec` instead of
-  touching a queue (see the locking discipline).
-- **The bounded-quantum table lock + the locking discipline (BINDING).** The pool keeps one
-  `Mutex<ProcessTable>` (`SharedProcessTable`) and a worker holds it for at most **one reduction
-  quantum**, never a whole slice: `worker::run_locked_quanta` runs a slice as
-  `ceil(reductions_per_slice / lock_quantum)` locked quanta (default `lock_quantum =
-  scheduler::DEFAULT_LOCK_QUANTUM = 256`), releasing the lock between them — so an independent
-  process / cross-thread send / timer / dirty completion is serviced *inside* another process's slice.
-  Slice semantics are unchanged (one `slice_begin`, one total budget, one requeue, one in-flight
-  decrement) and `lock_quantum >= reductions_per_slice` reproduces the old one-lock-hold-per-slice
-  behaviour exactly. Exactly one process still **executes** at a time (no intra-process parallelism
-  yet): the process keeps its whole budget and stays in-flight (out of every run queue) for the entire
-  slice, so no other scheduler can pick it up; between quanta a peer may **terminate** it (link exit /
-  `exit/2`), so each quantum re-checks `table.contains(pid)`. Three lock families coexist (queue locks,
-  the table lock, the signals mutex) under the order documented in `src/smp/CONTEXT.md`: **never hold a
-  queue lock while taking the table lock and vice-versa**; requeues produced while the table guard is
-  held are buffered in `buf` and flushed to the local queue **only after** the guard drops; the only
-  nested acquisition is *signals mutex → queue lock* inside `PoolSignals::park`/`wait_for_idle` (the
-  reverse never happens).
-- **`SharedProcessTable`'s `unsafe impl Send/Sync` is a contained handoff.** `ProcessTable` is `!Send`.
-  The two `unsafe impl`s assert that confining every access to the inner `parking_lot::Mutex` makes
-  moving and sharing the wrapper sound; they are the crate's only `unsafe` in the SMP layer. Measured
-  `!Send` causes (compile-verified at HEAD): `beam_alloc::Heap`'s `base: *mut Eterm`
-  (`beam_alloc/src/heap.rs`, reaching `Process` through `beam_gc::HeapSpace`/`beam_gc::Collector`),
-  `beam_gc::MsoHandle`'s `ptr: NonNull<Mso>` (reaching `Process` through
-  `MsoHandle → beam_gc::OffHeap → beam_message::OffHeapTable`), and **this crate's own**
-  `Option<Box<dyn DistSignalRouter>>` (`ptab.rs` — the trait object has no `Send` bound, fixable here
-  by adding `: Send`, but insufficient alone). `beam_alloc::RefcBinary` already carries `unsafe impl
-  Send`. The durable fix belongs upstream (`beam_gc`/`beam_alloc`) — hence a handoff, not a redesign;
-  do not widen this `unsafe`.
-- **Non-flaky `wait_idle` via an in-flight counter.** The pool reports idle only when every queue is
-  empty **and** the shared `InFlight` count is zero. A pop increments `InFlight` *inside* the same
-  critical section that dequeues the pid (so an idle observer cannot slip into the gap), and a worker
-  flushes its local `buf` batch **before** calling `finish_slice` (which decrements the counter) — the
-  order is load-bearing: flushing after would leave a window where the queues are empty and the count is
-  zero while a yielded pid still sits only in `buf`.
-- **Loss-free park/notify.** A worker re-checks the queue predicate **under the signals mutex**
-  immediately before `Condvar::wait`, and every notifier takes the same mutex before signalling, so a
-  wake-up cannot be lost between the "nothing to do" decision and the sleep. The mutex→queue-lock order
-  is consistent everywhere (a notifier releases its queue lock before signalling), so the hierarchy
-  cannot deadlock.
+  `make_ref` in M1, so a reference is the frozen 4-word thing
+  `[make_header(3, REF_SUBTAG), node(0), serial, id]` built with `make_header`;
+  `beam_message::layout::object_words` copies it verbatim (no navigable children) and `compare` compares
+  internal refs by raw payload words, so a `{'DOWN', Ref, …}` round-trips. When `beam_term` gains a
+  proper `make_ref`, only `MonitorRef::to_eterm` changes.
+- **Named monitors use a side table, not a `Monitor` field.** `erlang:monitor(process, Name)` must make
+  the DOWN target the 2-tuple `{Name, node}` rather than a pid, but `Monitor`/`MonitoredBy` are built by
+  struct literal in `src/process.rs` and carry only `ProcessId`s. `ProcessTable` therefore keeps
+  `named_monitors: HashMap<MonitorRef, NamedTarget>` (two atoms — no heap term, no rootset) plus
+  `local_node: Option<Atom>`, and the DOWN builder branches on it. A *named port* monitor is a typed
+  `unsupported` (the registry resolves names to processes only). The `noproc` DOWN is delivered eagerly
+  for the reason in Known Issues.
+- **`Links` is a set in M1.** Re-linking is a no-op and unlinking removes once, matching the observable
+  `erlang:link/1`/`unlink/1` semantics; the C's per-link refcount (for `monitor` on links and distributed
+  links) is a follow-up.
+- **`trap_exit` is a PCB flag, not a queue.** `exit_policy` reads it at *service* time and decides
+  `Terminate`/`Trap`/`Ignore`; `Trap` builds `{'EXIT', From, Reason}` into the mailbox — exactly the
+  observable `process_flag(trap_exit, true)` behaviour.
+- **`Process` owns a `beam_gc::Collector`, not raw `Heap`s.** The young space is the mutator heap; policy
+  (`should_collect`/`collect`) is `beam_gc::HeapPolicy`'s. No heap logic is reimplemented here.
+- **`parking_lot` is the synchronisation primitive; `libc` remains unused** (declared; reserved for the
+  deferred OS-level threading work).
+- **The SMP pool reuses the frozen slice and bounds the table lock.** `Worker::run` calls the same
+  `pub(crate)` helpers via `run_locked_quanta`, so a process executes identically under either front —
+  the only difference is the worker's requeue closure, which **buffers** requeues locally. The pool holds
+  one `Mutex<ProcessTable>` for at most **one reduction quantum** (`ceil(reductions_per_slice /
+  lock_quantum)`, default 256), releasing it between quanta, so an independent process / cross-thread
+  send / timer / dirty completion is serviced *inside* another process's slice; `lock_quantum >=
+  reductions_per_slice` reproduces the old one-lock-hold behaviour exactly. Exactly one process
+  **executes** at a time: it keeps its whole budget and stays in-flight (out of every run queue), and each
+  quantum re-checks `table.contains(pid)` since a peer may terminate it between quanta. **Locking
+  discipline (BINDING):** three families (queue locks, the table lock, the signals mutex) under the order
+  in `src/smp/CONTEXT.md` — **never hold a queue lock while taking the table lock and vice-versa**;
+  requeues produced while the table guard is held are buffered and flushed **only after** the guard drops;
+  the only nested acquisition is *signals mutex → queue lock*.
+- **`SharedProcessTable`'s `unsafe impl Send/Sync` is a contained handoff.** `ProcessTable` is `!Send`;
+  the two impls assert that confining every access to the inner `parking_lot::Mutex` makes the wrapper
+  sound. Measured `!Send` causes: `beam_alloc::Heap`'s `base: *mut Eterm` (via
+  `beam_gc::HeapSpace`/`Collector`), `beam_gc::MsoHandle`'s `ptr: NonNull<Mso>` (via
+  `beam_message::OffHeapTable`), and this crate's own `Option<Box<dyn DistSignalRouter>>` (fixable here
+  with `: Send`, but insufficient alone). `beam_alloc::RefcBinary` is already `Send`. The durable fix
+  belongs upstream — do not widen this `unsafe`.
+- **Non-flaky `wait_idle` and loss-free park/notify.** The pool reports idle only when every queue is
+  empty **and** `InFlight` is zero; a pop increments `InFlight` in the same critical section that
+  dequeues, and a worker flushes its local `buf` **before** `finish_slice` decrements (flushing after
+  would leave the queues empty and the count zero while a yielded pid sits only in `buf`). A worker
+  re-checks the queue predicate **under the signals mutex** immediately before `Condvar::wait` and every
+  notifier takes that mutex before signalling, so a wake-up cannot be lost; the mutex→queue-lock order is
+  consistent everywhere.
 ## Known Issues (intentionally NOT covered in Milestone-1)
 - **Multi-scheduler / SMP (remaining gaps)**: lock-free/threaded run queues, scheduler **balancing**, and
   the `+S`/`+SDcpu`/`+SDio` flag parsing are not modelled. The table lock is narrower (one reduction
@@ -555,13 +556,23 @@ re-export keeps `beam_process::PortTable` resolving here.
   mailbox can be seen before it; remote (external-pid) and port signals bypass the queue entirely
   (materialised straight into the mailbox). The C's per-*sender* signal-queue granularity and the
   signal-vs-message ordering barrier remain follow-ups.
+- **The `noproc` DOWN is delivered eagerly (documented deviation).** `monitor/2` on a non-live target
+  materialises `{'DOWN', Ref, process, Target, noproc}` straight into the watcher's mailbox, so
+  `process_info(self(), message_queue_len)` reports 1 immediately after the call where the oracle reports
+  0 (it defers the DOWN as a signal and reveals it at the next `receive`). Deferring here would be
+  *wrong* until the runtime services pending signals when entering `receive`, so eagerness is
+  deliberate: the receive-visible result and the relative order against later DOWNs both match the
+  oracle. Servicing `service_signals` at the receive point is what would make it exact.
 - **Priority run queues**: port tasks, and the C's shared NORMAL/LOW physical queue
   `schedule_count`/`RESCHEDULE_LOW` fairness deferral (this crate uses four physically distinct FIFOs —
-  see `run_queue.rs`), are follow-ups; moving a process that is *currently sitting in a run queue*
-  between levels (the C `erts_set_process_priority` requeue) is also one — a `set_priority` made during
-  a slice takes effect at that process's next requeue. The `save_calls` *effect* (actually saving the
-  last `N` calls for `seq_trace`/`dbg`) is not modelled — only the `process_flag(save_calls, N)` value
-  contract.
+  see `run_queue.rs`), are follow-ups. `Scheduler::set_priority`/`SchedulerPool::set_priority` DO
+  requeue an already-queued process. The `save_calls` *effect* (actually saving the last `N` calls for
+  `seq_trace`/`dbg`) is not modelled — only the `process_flag(save_calls, N)` value contract.
+- **Pre-emption has no producer in Milestone 1.** `ProcessRunner::run` receives a `budget` and the
+  scheduler requeues on `RunOutcome::Yield`, and `tests/preemption.rs` proves a budget-respecting runner
+  interleaves CPU-bound processes round-robin with no starvation — but the production runner
+  (`beam_rt::RuntimeRunner`) ignores its `budget` and never yields, so a non-yielding process is not
+  pre-empted. Making `RuntimeRunner` honour the budget is the adoption `beam_rt` owes.
 - **Process-dictionary interior and heap fragments.** The dictionary is modelled as a flat key/value
   list (no hash-array interior), and `erlang:process_info/1`'s view of it is still absent. A real
   in-heap `ErlHeapFragment` (a `beam_gc`/`beam_message`-owned type, still absent) is not modelled: saved
@@ -579,28 +590,44 @@ re-export keeps `beam_process::PortTable` resolving here.
 - **Exact exit-reason term from `beam_common::ExitReason`**: signal reasons are carried as live `Eterm`
   terms (the deliverable form), not the term-independent `beam_common::ExitReason`; the mapping between
   them belongs to the raising BIF layer (`beam_bifs`).
+- **`process_info` source data.** Every item this crate can answer is now backed by a public accessor
+  (`tests/process_info_source.rs` pins the mapping): `status` → `Process::status()`,
+  `registered_name` → `ProcessTable::name_of(pid)`, `message_queue_len` → `Process::mailbox().len()`,
+  `links` → `Process::links().iter()`, `monitors` → `Process::monitors().iter()` (+
+  `port_monitors()` for the `{port, Port}` entries), `monitored_by` → `Process::monitored_by()`,
+  `trap_exit` → `Process::is_trapping_exit()`, `priority` → `Process::priority()`, `reductions` →
+  `Process::reductions()`. Still absent: `current_function`/`current_location` (nothing tracks the
+  running MFA) and the `erlang:process_info/1` whole-dictionary view.
+- **Monitor semantics not modelled.** `MonitorKind` has no `TimeOffset` variant
+  (`erlang:monitor(time_offset, _)` is the oracle's `badarg`, which the BIF layer raises);
+  `erlang:monitor_node/2,3` is **out of this crate's scope** — it is node-level distribution needing a
+  local node identity plus an inbound `DOP_*` path, neither of which this crate owns; and a **named**
+  port monitor (`monitor(port, Name)`) is a typed `unsupported` (the local name registry resolves names
+  to processes only, so answering with a process monitor would be a wrong result). The noproc DOWN is
+  delivered **eagerly** into the watcher's mailbox whereas the oracle defers it as a signal (see the
+  bullet above).
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
 - `src/registers.rs` → `XRegs`, `Stack`, `Registers` (the root-set containers); `MAX_REG`/`MAX_ARG`
-- `src/process.rs` → `Process` (PCB), `ProcessState`, `ProcessFlags` (incl. `sensitive`), `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
+- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority` and the `port_monitors` watch set; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
 - `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter; keys and `get_keys/1` values compare structurally via `beam_term::compare::eq` through an `Rc<AtomTable>` handle)
 - `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
-- `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing)
-- `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam), `enqueue_with_priority`, `resume_woken` (wake absorption), the shared `pub(crate)` slice helpers `slice_begin`/`slice_end`/`run_one`/`drain_woken_into`, and `DEFAULT_REDUCTIONS_PER_SLICE`/`DEFAULT_LOCK_QUANTUM`
-- `src/smp/` → the SMP pool (`SchedulerConfig` incl. `lock_quantum`, `SharedProcessTable`, `Queues`, `Worker`/`run_locked_quanta`, `SchedulerPool`, `SchedulerStats`/`SchedulerStat`, `PoolSignals`) — per-file detail, the locking discipline and the bounded-quantum rule in `src/smp/CONTEXT.md`
+- `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing + `reprioritize`)
+- `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam), `enqueue_with_priority`, `set_priority` (the queued-process requeue), `resume_woken`, the shared `pub(crate)` slice helpers `slice_begin`/`slice_end`/`run_one`/`drain_woken_into`, and `DEFAULT_REDUCTIONS_PER_SLICE`/`DEFAULT_LOCK_QUANTUM`
+- `src/smp/` → the SMP pool (`SchedulerConfig` incl. `lock_quantum`, `SharedProcessTable`, `Queues`/`reprioritize`, `Worker`/`run_locked_quanta`, `SchedulerPool` incl. `set_priority`, `SchedulerStats`/`SchedulerStat`, `PoolSignals`) — per-file detail, the locking discipline and the bounded-quantum rule in `src/smp/CONTEXT.md`
 - `src/timer.rs` → `TimerService` (one thread over a deadline min-heap), `TimerRef`, `TimerSink` (the high-level `send_after`/`cancel` service)
 - `src/dirty.rs` → `DirtyPool`, `DirtyKind`, `DirtyOutcome`, `DirtyJob`, `DirtyCompletionSink` (the dirty-CPU + dirty-IO worker pools)
 - `src/progress.rs` → `ThreadProgress` (the cross-scheduler barrier), `ManagedThread` (the per-thread progress slot)
-- `src/signal.rs` → `SignalAtoms` (incl. `port`), `ExitSignal`, `ReasonClass`, `ExitPolicy`/`exit_policy`, the signal-message builders (exit + `process`/`port`/remote `DOWN`)
+- `src/signal.rs` → `SignalAtoms` (incl. `port`/`noproc`), `ExitSignal`, `ReasonClass`, `ExitPolicy`/`exit_policy`, the signal-message builders (exit + `process`/`port`/remote `DOWN`)
 - `src/signal_queue.rs` → `SignalQueue` + `PendingSignal`/`PendingSignalKind` (the decoupled pending-signal queue + its GC gather/scatter)
 - `src/link.rs` → `Links` (bidirectional link set)
-- `src/monitor.rs` → `MonitorRef`, `MonitorKind`, `Monitor`, `MonitoredBy`, `Monitors`, `RefAllocator`
+- `src/monitor.rs` → `MonitorRef`, `MonitorKind` (+ `type_name`/`from_type_name`), `PortWatch`, `Monitor`, `MonitoredBy`, `Monitors`, `RefAllocator`, `payload_is_down_for`
 - `src/remote.rs` → `RemotePid`, `PidTarget`, `RemoteMonitor`, `DistSignal`, `DistSignalRouter` (the distribution seam)
-- `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface), `PortMonitor`, `PortClose`
-- `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry + signal/link/monitor hub + the decoupled signal servicing + the wake list + the remote records + the distribution seam), `ExitEffect`
-- `src/error.rs` → `pub(crate)` error constructors (no new error type)
-- `tests/*.rs` (16 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `dict_oracle.rs` = the `erl`-cross-checked process-dictionary equality/iteration-order evidence)
+- `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface, the incoming half of a port monitor), `PortMonitor`, `PortClose`
+- `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`) + signal/link hub + decoupled signal servicing + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
+- `src/error.rs` → `pub(crate)` error constructors incl. the typed-`unsupported` raise constructors (no new error type)
+- `tests/*.rs` (21 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `dict_oracle.rs`/`registry_monitors.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory)
 - `tests/CONTEXT.md` → per-file topic list, the anti-flakiness constraint, the gate command
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)
@@ -635,7 +662,22 @@ re-export keeps `beam_process::PortTable` resolving here.
 - The collector moves live terms, so **every** in-heap reference must be a root. `Process::collect`
   scans registers/stack, mailbox payloads, the process dictionary (`Dict`), the saved args (`SavedArgs`)
   and the pending-signal queue (`SignalQueue`) — add any NEW in-heap sub-rootset to its gather/scatter,
-  in the same order, in the same change.
+  in the same order, in the same change. `Process::port_monitors` is deliberately **not** a root: a
+  `PortWatch` holds only plain values (a `MonitorRef` and a `PortId`).
+- **Pre-emption is the RUNNER's obligation.** A `ProcessRunner` must count its own reductions and return
+  `RunOutcome::Yield` at its `budget`; the scheduler then requeues at the PCB's current priority. A
+  runner that never yields is not pre-empted. `tests/preemption.rs` pins the scheduler half.
+- **Oracle-probed semantics live in the tests, not this file.** Before changing monitor/registration/
+  signal behaviour, run the relevant probe: `erl -noshell -eval '<expr>, halt(0).'` — the oracle is OTP
+  29.1.1 / erts-17.1. The `erl`-cross-checked suites (`tests/dict_oracle.rs`, `registry_monitors.rs`)
+  skip loudly when `erl` is absent.
+- **Adoption owed by `beam_rt`/`beam_bifs`** (do NOT edit them from here): (1) `RuntimeRunner::run` must
+  honour `budget` and return `Yield`; (2) use `ProcessState::status_atom`/`Process::status` instead of
+  its own status mapping; (3) `erlang:demonitor/2 [flush]` → `demonitor_flush`; (4) `erlang:monitor/2`
+  type dispatch via `MonitorKind::from_type_name` + `monitor_port_term`/`monitor_named`, and install
+  `set_local_node` at boot for name targets; (5) `process_info(P, registered_name)` → `name_of`;
+  `process_info(P, monitors)` must surface `Process::port_monitors()` as `{port, Port}`;
+  (6) `spawn_opt` heap knobs → `beam_gc::HeapPolicy::from_spawn_opts` + `with_policy_and_priority`.
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, the seam types and the wave-3 dependency position.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1 process semantics, §3 error strategy, §5 GC/memory model, §6 test gate).
