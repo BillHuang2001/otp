@@ -124,16 +124,16 @@ result).
 **Driver families** (`src/driver/drv/*.rs`):
 | family file | slots it owns | `Some`/total |
 |---|---|---|
-| `mem` | host-free alloc/time/`dl*`/errno/`driver_mk_term_nil` | 20/20 |
+| `mem` | host-free alloc/time/`dl*`/errno/`driver_mk_term_nil` + the driver-binary family (incl. the refcount trio) | 23/23 |
 | `port` | output, term-data, port queries, select/timer/async | 17/17 |
 | `queues` | the port-queue family | 11/11 |
 | `threads` | the `erl_drv_*` thread/synchronisation family (over `crate::sync`) | 33/33 |
-| `pdl` | port data lock + driver monitors + `driver_get_now` | 11/14 |
-| `lifecycle` | failures/exit/attributes/asynchronous init | 12/16 |
+| `pdl` | port data lock + driver monitors + `driver_get_now` | 11/11 |
+| `lifecycle` | failures/exit/attributes/asynchronous init | 12/12 |
 | `registry` | the driver-registry slots (`add_driver_entry`/`remove_driver_entry`/`driver_lock_driver`/`driver_create_port`) | 4/4 |
 
-Three `None` driver slots remain: the binary-refcount trio (`driver_binary_get_refc`,
-`driver_binary_inc_refc`, `driver_binary_dec_refc`).
+Every LP64 `driver_*`/`erl_drv_*` slot is populated. The three `driver_binary_*_refc` slots read a
+**hidden per-block refcount header** (see Design Decisions).
 
 ### Module layout
 - `src/nif/enif/` and `src/driver/drv/` are **directory modules split one file per family**.
