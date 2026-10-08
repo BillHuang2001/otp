@@ -84,12 +84,12 @@ Determined by the Cargo workspace DAG; a crate may only use crates in earlier wa
 `beam_common` + `beam_term` (Stage-0 foundations) are the frozen dependency sinks — **consume, do
 not redesign**.
 
-## Milestone-1 scope (what "implemented" means for *this* pass)
+## Implemented core (per-crate scope)
 Full ERTS is a multi-year effort; every crate delivers a **real, tested, honestly-scoped core**, not
 a full port. Coverage subsets are stated in each crate `CONTEXT.md`. Priority: the **vertical slice**
 (`beam_loader` + `beam_engine` + `beam_rt` load and run a real `.beam`) is the key evidence and is
 built first-class; other crates deliver their Stage-scoped core in parallel.
-| Crate | Milestone-1 deliverable |
+| Crate | Delivered core |
 |---|---|
 | `beam_alloc` | carrier allocator + size classes + process-heap bump allocator |
 | `beam_abi` | layout-frozen NIF/driver struct + fn-table types, static size/offset asserts, transmute; the working `enif_*` host API (`NifHost` seam) + the `dlopen`-based NIF loader |
