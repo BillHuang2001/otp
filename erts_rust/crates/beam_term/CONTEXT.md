@@ -143,6 +143,15 @@ operators) and `<`/`>` between same-typed terms.
   only for floats and mixed integer/float pairs). A mixed integer/float pair is converted with
   [`number::number_as_f64`](#numberrs--safe-numeric--f64-conversion) (single definition; the
   former crate-private helper was removed).
+- **Same-class structural arms.** Besides the scalar/compound classes, `cmp`/`eq` compare the
+  *content* of external pids, external ports, external references and native records field-by-field
+  in the C's `erts_cmp` order, so a **copy of such a term is `=:=` its original** (the copy boundary's
+  identity check): pid `serial → number → node(sysname, creation)` (`utils.c:1777-1811`); port
+  `node(sysname, creation) → number` (`2219-2238`); reference `node → ids` as a bignum with the
+  highest-index zero words trimmed (`2239-2308`); record
+  `module → name → is_exported(false<true) → field count → keys → values` (`1878-1954`). Records are
+  always compared structurally (the C's definition-pointer canonicalisation short-circuit has no
+  counterpart here).
 - The bit/float payload helpers live in [`bitstring.rs`](#bitstringrs--bit-level-payloads); this
   module forwards to them so each layout has a single definition.
 ### `hashing/` — hashing: the compatibility-pinned `phash2`/`phash` + the internal structural hash
@@ -392,6 +401,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 ### `error.rs` — crate error types
 - `pub enum TermError` / `pub type TermResult<T>` — this crate's error types, reconciled into
   `beam_common::BeamError` by an owned `From` impl.
+- `TermError::TermGraphCyclic` / `TermError::TermGraphTooLarge` — returned by
+  [`size_object_bounded`](#sizers--object-word-size) for a cyclic vs an over-limit term graph (both
+  map to `BeamError::BadArg`).
 - `TermError::FunIdentityUnavailable` — `make_hash`/`make_hash2` return this for a `make_fun3`
   `Local` fun, whose inlined descriptor carries no `module`/`old_uniq` (a documented capability gap).
   Maps to `BeamError::BadArg` (never a wrong hash value).
@@ -490,13 +502,24 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - Behavioural tests: atom interning/lookup/name round-trip + `atom.names` parser on an embedded
   snippet (order + `CName='printname'` + quoted names), heap cons/tuple construction + car/cdr +
   exhaustion, literal-graph tagging walk (`set_literal_tag` on a nested tuple/list).
-- `src/compare.rs`, `src/hashing/` (the structural-hash suite + the `make_hash2`/`make_hash`
-  oracle-vector suites + `common`'s `block_hash` pin), `src/size.rs` carry their own in-module
-  `#[cfg(test)]` suites:
-  ordering across every class pair (number < atom < ref < port < pid < tuple < map < nil < list <
-  binary), atom name ordering, tuple/list elementwise + size tie-break, numeric int/float ordering,
-  structural-hash equality for equal terms (and inequality for different terms), and `size_object`
-  for immediates / cons / tuple / boxed. Prefer property-style boundary loops.
+- `src/hashing/` carries its own in-module `#[cfg(test)]` suite (the structural-hash suite + the
+  `make_hash2`/`make_hash` oracle-vector suites + `common`'s `block_hash` pin).
+- `tests/compare_terms.rs` — the term-ordering suite (relocated out of `src/compare.rs` to keep that
+  file under the size guideline; public-API only): ordering across every class pair (number < atom <
+  ref < port < pid < tuple < record < map < nil < list < binary), atom name ordering, tuple/list
+  elementwise + size tie-break, numeric int/float ordering. Prefer property-style boundary loops.
+- `tests/compare_external.rs` — the external-thing / record comparison suite: a copy is `=:=` its
+  original for external pid/port/ref and native records; the field-order rules (pid `serial → number →
+  node`, port `node → number`, ref node-then-ids, record `module → name → is_exported → keys →
+  values`); antisymmetry; malformed-record no-panic; plus a **live-`erl` oracle cross-check** that
+  decodes hand-written ETF (`NEW_PID_EXT`/`V4_PORT_EXT`/`NEWER_REFERENCE_EXT`) with `binary_to_term/1`
+  and builds records with `records:create/4` (23 pairs / 69 boolean answers). Skips loudly when `erl`
+  is absent.
+- `tests/size_bounded.rs` — the bounded-sizing suite: a genuine cyclic cons (`L = [1|L]`), cycles
+  through cons/tuple/local-fun/HAMT head-bitmap nodes, a cycle behind a long prefix (cyclic beats
+  over-limit), budget inclusivity, non-terms (`THE_NON_VALUE`, `HEADER_FLONUM`, forged HEADER-tagged
+  words) ⇒ `Ok(0)`, a 100 000-element list (no stack overflow), flat and 33-key HAMT maps sized
+  exactly, and shared-subterm per-occurrence counting.
 - `src/thing.rs` carries its own `#[cfg(test)]` suite pinning each block's raw words against the
   legacy headers (float `[HEADER_FLONUM, bits]`; bignum header arity `n`, the digit count, + LS-first
   `u64` digits and the sign bit; flatmap `[arityval(n), k.., MAP_HEADER_FLATMAP, raw size, keys-tuple, v..]` plus
@@ -560,13 +583,13 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/heap.rs` → minimal bump term arena (the representation's allocation interface)
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
-- `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port + fallbacks
+- `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port: full-class structural arms (incl. external pid/port/ref and native records) + the residual deterministic fallbacks
 - `src/hashing/mod.rs` → module root: docs + the internal structural hash `term_hash` (+ tests); re-exports the public ERTS-hash API
 - `src/hashing/common.rs` → primitives shared by the two ERTS hash ports (`HCONST*`/`FN*`, `mix32`/`mix3`, `uint32_hash*`/`sint32_hash`/`uint32_hash_step`, `le32`, `block_hash`, `bitstring_parts_any`, `base_bits`, work-stack item types; `pub(super)`)
 - `src/hashing/make_hash2.rs` → the **bit-exact** ERTS `make_hash2` (`erlang:phash2/1,2`) + `compute_record_definition_hash` (fetch this value for a native record's `hash` word)
 - `src/hashing/make_hash.rs` → the **bit-exact** ERTS `make_hash` (`erlang:phash/2`) + `hash_binary_bytes`
 - `src/ihash.rs` → the **bit-exact** `erts_map_hash` / `make_internal_hash` port (`erl_term_hashing.c`): `erts_map_hash`/`erts_internal_hash`/`erts_internal_salted_hash`/`ihash_mix64`, plus the map-trie helpers `swizzle_map_hash` (nibble reversal) and `hashmap_nibble` (level-`L` LSB nibble)
-- `src/size.rs` → object word size (`size_object`), the `size_object_x` port
+- `src/size.rs` → object word size (`size_object`, total/panic-free) + the bounded, cycle-safe `size_object_bounded`, sharing one `size_object_x`-faithful walk
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
 - `src/fun.rs` → the on-heap fun/export layout: `FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_arity`/`fun_num_free`/`fun_words`/`fun_block_words`, the `write_fun_{local,external,imported}` writers and the `fun_*` accessors (`erl_term.h`/`erl_fun.h`/`external.c` ground truth)
 - `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`, keyed by `ihash::erts_map_hash`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`/`map_pairs_storage_order`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
@@ -574,9 +597,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/number.rs` → safe numeric → `f64`: `big_to_f64` (faithful `big_to_double`) + `number_as_f64`
 - `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
-- `src/error.rs` → local `TermError`/`TermResult` (incl. `FunIdentityUnavailable`, returned by `make_hash`/`make_hash2` for a `make_fun3` `Local` fun) + the `From<TermError> for beam_common::BeamError`
+- `src/error.rs` → local `TermError`/`TermResult` (incl. `FunIdentityUnavailable`; `TermGraphCyclic`/`TermGraphTooLarge` from bounded sizing) + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
-- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs` and `number_oracle.rs`)
+- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, term-ordering `compare_terms.rs`, external/record comparison `compare_external.rs`, bounded sizing `size_bounded.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs` and `number_oracle.rs`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
 - **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed
@@ -593,31 +616,40 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `make_hash2(TUPLE(module,name,is_exported,keys-in-declaration-order))`, `erl_record.c:1041-1046`)
   instead of the `make_small(0)` placeholder they currently cache; `write_record` still takes that
   word as a caller-supplied argument.
-  `compare`/`hashing`/`size` still treat records with their generic fallbacks (class-rank / opaque /
-  tuple-like); now that the interior is readable they can be made structural later.
+  `compare` and `hashing` now treat native records structurally; `size` still sizes a record like a
+  tuple (its field-table layout is not modelled).
+- **`beam_message` may delegate its bounded walk to `size_object_bounded`.** `beam_message/src/copy.rs`
+  re-implements a bounded, cycle-safe sizing walk (`bounded_words`, `is_acyclic`, `preflight_words`) to
+  guard the messaging copy boundary; `size::size_object_bounded` now provides exactly that machinery, so
+  the duplicate can collapse onto it. Owner: `beam_message` (outside this node).
 
 ## Known Issues
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
   `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings, maps
   (flat *and* hash — size first, then the `(key,value)` sequence in flat-map key order) and
-  internal pids/ports. Funs are ordered structurally (`cmp_funs`, `src/fun.rs`): `Local` by
+  internal pids/ports; and — structurally, field by field in the C's order — external pids/ports/
+  references and native records (so a copy of such a term equals its original). Funs are ordered
+  structurally (`cmp_funs`, `src/fun.rs`): `Local` by
   `(uniq, index)` then `num_free` then env element-wise; `External` by `(module, function, arity)`
   and after any local kind; `Imported` by `(module, index, old_uniq)` then `num_free` then env; a
   mixed `Local`/`Imported` pair leads with a kind rank (because the `Local` descriptor carries no
   module — a documented deviation from the C, which leads with the entry's `module`/`old_uniq`).
-  The following classes use a **deterministic, panic-free fallback** rather than
-  a structural comparison and must be extended if exact ordering is needed: external
-  pid/port/ref, records and on-heap bin refs (ordered by class rank, then object
-  arity, then raw term word); internal references (compared by raw payload words, not the decoded
-  `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
+  The following classes still use a **deterministic, panic-free fallback** rather than
+  a structural comparison and must be extended if exact ordering is needed: on-heap bin refs
+  (ordered by class rank, then object arity, then raw term word); internal references (compared by raw
+  payload words, not the decoded `num[]`); atoms whose name is absent from the passed `AtomTable`
+  (fall back to the raw atom index).
   Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
 - **`term_hash` is internal, not compatibility-pinned (`src/hashing/mod.rs`).** It guarantees only
   the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
   exact bit values are not part of any contract. Maps hash structurally (their sorted pairs); funs hash
   over exactly the fields `compare` compares (so `eq ⇒ equal hash`, with the same `External`-last /
-  kind-rank rules). Classes lacking a layout-aware representation (records, external pid/port/ref, bin
-  refs) use an opaque raw-word fallback, so their hash is not stable across processes/images.
+  kind-rank rules); native records hash over exactly the fields `cmp_records` compares (their content —
+  the definition address is never mixed, so a record equals its copy hash-wise and `beam_ets`'s CHAMP
+  invariant holds). External pid/port/ref carry no pointer in their words, so their raw-word hash is
+  already content-stable; on-heap bin refs use an opaque raw-word fallback, so their hash is not stable
+  across processes/images.
 - **Object-size approximation (`src/size.rs`).** Native records are treated like tuples (their
   field-table layout is not modelled).
 - **The HAMT is `erts_map_hash`-driven (`src/map.rs` + `src/ihash.rs`).** The map trie is placed by
