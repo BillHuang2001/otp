@@ -7,6 +7,13 @@ profile**. Raw machine-readable artifacts are archived under `results/` next to 
 Everything below is **measured**, not modelled. A workload that could not run is reported with a
 *verified* reason and **no number** — never an estimate.
 
+> **Currency.** These are the **Milestone-1** numbers, measured at commit `e7d90a7` on
+> 2026-10-07/08 on the host in §1, and archived verbatim under `results/`. Two harness changes
+> post-date them and are marked **[superseded]** where they appear: the `plb`
+> failure-classification change (§5) and the **baseline compute-loop split** (§3.2) — the archived
+> JSON still shows the old `baseline` *rust* compute row ("not run"). Every other row is a snapshot
+> of that one run, not a claim about today's tree: re-run the exact commands in §2 before quoting.
+
 ---
 
 ## 1. Environment (recorded with the run)
@@ -18,7 +25,7 @@ Everything below is **measured**, not modelled. A workload that could not run is
 | Distribution | NixOS 26.11 (`26.11.20261003.a7868a7`) |
 | CPU | Intel(R) Core(TM) Ultra 7 356H — `nproc` = **14** |
 | RAM | `MemTotal` = 65 317 432 kB ≈ **62.3 GiB** |
-| Repository state | `e7d90a7` (measurement runs), plus one follow-up change to `workloads/plb.rs` that only alters how a **failed** `plb` row is reported (see §5); every `plb` row in the archived full-run reports is `skipped`, so those reports are unaffected |
+| Repository state | `e7d90a7` (measurement runs), plus two follow-ups: `workloads/plb.rs` (only alters how a **failed** `plb` row is reported — §5; every `plb` row in the archived reports is `skipped`, so they are unaffected) and `workloads/baseline.rs` (splits the compute loop from the `erlang:memory` probe — §3.2; the archived reports predate it) |
 | Toolchain | `rustc 1.98.1`, `cargo 1.98.0` |
 | Oracle (`sys`) | system `erl`, **OTP 29.1.1 / erts-17.1** (`erlang:system_info(otp_release)` = `"29"`, `version` = `"17.1"`) |
 | Rust runtime (`rust`) | `erts_rust/target/release/beam_rt` (release), `erlang:system_info(otp_release)` = `"30"` |
@@ -96,7 +103,14 @@ process (see §6).
 
 ### 3.2 Fixed compute loop — `baseline` (n = 5)
 
-| metric | sys | rust |
+> **[superseded]** The archived M1 run (below) used one `-eval` expression that bundled the compute
+> sum with `erlang:memory(total)`. Because the Rust runtime does not implement that BIF, the whole
+> compute row was **not run** on rust. The harness now runs the two as separate probes, so the
+> compute loop is measured on **both** runtimes; only the memory probe remains a Rust gap.
+
+Archived M1 run:
+
+| metric | sys | rust (archived) |
 |---|---|---|
 | `compute_loop_ms` p50 (sum of 1..1 000 000) | 190.48 | **not run** |
 | `compute_loop_ms` mean | 183.24 | **not run** |
@@ -104,9 +118,29 @@ process (see §6).
 | `vm_memory_total_bytes` (`erlang:memory(total)`) | 55 294 449.6 | **not measured** |
 | peak RSS (`VmHWM`) | 130 551 808 B (124.5 MiB) | `null` |
 
-The Rust compute loop is **unimplemented for this expression**: all 5 attempts exited `1` with
-`beam_rt: allocation failure: heap (16 bytes)`. The harness records that verbatim as a note and emits
-**no** timing and **no** peak memory — there is no Rust number here to compare.
+In the M1 run all 5 rust attempts exited `1` with `beam_rt: allocation failure: heap (16 bytes)`,
+so no rust number existed to compare.
+
+**Current behaviour (verified by running the harness):** the compute loop and the VM-memory probe
+are now independent.
+
+* `compute_loop_ms` / `compute_ops_per_sec` come from
+  `-eval 'S = lists:sum(lists:seq(1,1000000)), io:format("~p~n",[S]), halt().'`, which runs under
+  **both** `sys` and `rust`.
+* `vm_memory_total_bytes` comes from the standalone probe
+  `-eval 'M = erlang:memory(total), io:format("~p~n",[M]), halt().'`: `sys` records the bytes,
+  `rust` records **no metric** and the explicit note
+  `vm_memory_total_bytes: not-run (unsupported: erlang:memory/1)` — a capability gap, never a crash
+  and never a fabricated number.
+
+A genuine probe failure (anything other than the `undef`/`unsupported` capability-gap signals) is
+still surfaced verbatim, and no probe failure aborts the workload.
+
+**Caveat — read this loop as the native floor, not interpreter throughput.** It is dominated by the
+natively-served `lists:seq/2` + `lists:sum/1` (a hand probe on the same runtime: `lists:seq(1,N)`
+costs ~10 µs/element, versus ~80–190 µs for an *interpreted* `-`-per-iteration loop). So a rust
+`compute_ops_per_sec` near the sys one says the native list floor is fast; it is not a measure of
+interpreter dispatch or the per-BIF overhead that `foreign` (§3.4) exposes.
 
 ### 3.3 `slice` — the same nine compiled programs under both runtimes (n = 25/case)
 
@@ -158,8 +192,29 @@ All 4 cases ran under both runtimes (`4 ok, 0 unsupported`) and produced the sam
 emqx_base62_decode=4400000`; `rust`: `60000 / 45000 / 4000 / 1650` = `N × per_call`).
 
 **This is the headline execution-bound result**: startup is comparable (§3.1) while the *per-call*
-cost of a real foreign function is three to four orders of magnitude higher under `beam_rt` —
-because the Rust runtime interprets, and the oracle JIT-compiles (`:jit:ns`).
+cost of a real foreign function is three to four orders of magnitude higher under `beam_rt`.
+
+**The gap is real, not a harness artifact — and it is localized.** The measurement is sound: the
+startup-cancelled marginal reproduces with a plain shell loop, `(mean wall@N − mean wall@0)/N`
+(rust `cowboy_bstr:to_lower` 515 ms/2 000 ≈ 258 µs/call vs the harness's 265 µs/call; oracle
+~360 ns), so it is a genuine runtime cost, not CLI re-entry, a per-iteration reload, or a
+per-call GC. But the dominant term is **not** "interpretation vs JIT" in the abstract — it is a
+specific per-BIF overhead: `beam_rt` deep-clones its entire `AtomTable` on **every** BIF call
+(`RuntimeContext::call_registered` commits via `Rc::make_mut` while a handle is still alive), so
+each per-iteration BIF (`-`, `byte_size`, …) costs tens of µs. Hand-built probe drivers confirm
+this directly (measured on the same runtime, `run` action):
+
+| loop (one iteration) | BIFs/iter | marginal per iteration |
+|---|---|---|
+| `drain([_\|T],A) -> drain(T,A)` (list walk, no BIF) | 0 | ≈ 0 (within the ~±0.1 s startup noise) |
+| `empty(N,A) -> empty(N-1,A)` | 1 (`-`) | ~80–165 µs |
+| `add(N,A) -> add(N-1,A+1)` | 2 (`-`,`+`) | ~170–350 µs |
+| `lists:seq(1,N)` (natively served) | — | ~10 µs/element |
+
+So a **BIF-free** interpreted loop is cheap and the cost scales with the *number of BIF calls per
+iteration*, not with instruction dispatch. That per-BIF `AtomTable` clone is a known defect owned by
+`beam_rt` (not by this harness and not by `beam_engine`, whose dispatch is O(1)); the JIT tiers
+(Stage 1) plus fixing that clone are what close the gap.
 
 ## 4. System-ERTS target-project results (sys-only workloads)
 
@@ -227,9 +282,11 @@ which is not a benchmark result.
   `bench compare results/bench-full-runtimes-all.json`.
 - **Startup latency is comparable** between the two runtimes (rust ≈ 1.28× sys, p50 150.9 vs
   118.3 ms), and the Rust runtime's **peak RSS is 1.8–2.5× lower** on the same programs.
-- **Execution-bound work is not comparable yet.** For real foreign functions the Rust runtime costs
-  **703×–9 891×** more per call than the JITed oracle. That is the expected shape of a tree-walking
-  interpreter versus BeamAsm, and it is the gap the JIT tiers (Stage 1) exist to close.
+- **Execution-bound work is not comparable yet, and the gap is real.** For real foreign functions
+  the Rust runtime costs **703×–9 891×** more per call than the JITed oracle. That is a genuine
+  runtime cost (hand-reproduced; §3.4), dominated by a per-BIF-call `AtomTable` clone in `beam_rt`
+  rather than by the interpreter's intrinsic dispatch — the JIT tiers (Stage 1) plus that fix are
+  what close it.
 - The nine `slice` programs and the four `foreign` cases agree with the oracle on **observable
   output** under both runtimes.
 
@@ -243,8 +300,10 @@ which is not a benchmark result.
   measurement.
 - **Not milestone/absolute figures.** Single host, `--full` but finite sample counts, machine under
   normal container load. Reproduce on your host before quoting.
-- **Not complete coverage.** `compute_loop_ms` under Rust does not exist (the expression is
-  unimplemented); `plb`, `emqx` and the Rust side of all repo/tool workloads have no numbers.
+- **Not complete coverage.** In the archived run `compute_loop_ms` under Rust did not exist; the
+  harness now measures it on both runtimes, the only remaining Rust compute-section gap being the
+  `erlang:memory(total)` probe (`not-run (unsupported: erlang:memory/1)`). `plb`, `emqx` and the
+  Rust side of all repo/tool workloads still have no numbers.
 - **Not fabricated anywhere.** Every skipped/failed row carries a reason and no metric; the
   `plb` row is `failed` rather than `ok` precisely so its wall time cannot be misread as a result.
 
