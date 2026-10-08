@@ -327,12 +327,11 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
                     Some("none") => heir = None,
                     _ => {
                         // The C stores `THE_NON_VALUE` as the gift data for the
-                        // 2-tuple form; the term is inert here (it rides the
-                        // `{'ETS-TRANSFER', …}` message a dead owner's table
-                        // sends) so a fixed term stands in for it.
+                        // 2-tuple form => `None`, i.e. the heir inherits with no
+                        // `{'ETS-TRANSFER', …}` message.
                         heir = Some(Heir {
                             owner: owner_of(pid_arg(value)?),
-                            data: beam_term::NIL,
+                            data: None,
                         });
                     }
                 }
@@ -345,7 +344,7 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
                 let data = tuple_element(elem, 2);
                 heir = Some(Heir {
                     owner: owner_of(pid_arg(pid)?),
-                    data,
+                    data: Some(data),
                 });
             }
             ("decentralized_counters", 2) => {

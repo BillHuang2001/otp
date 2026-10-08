@@ -142,7 +142,7 @@
 use beam_common::Result;
 use beam_ets::{Heir, SetOpt, Table};
 use beam_process::ProcessId;
-use beam_term::{atom_val, is_internal_pid, make_atom, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, is_internal_pid, make_atom, AtomTable, Eterm};
 
 use crate::access::{
     is_atom, is_list, is_nil, is_tuple, make_ref_thing, tuple_element, tuple_size,
@@ -195,7 +195,14 @@ enum HeirOpt {
     /// `{heir, none}` — clear the heir.
     Clear,
     /// `{heir, Pid}` / `{heir, Pid, Data}` — install the heir.
-    Install { pid: ProcessId, data: Eterm },
+    ///
+    /// `data` is `None` for the 2-tuple form (`{heir, Pid}`), which the C stores
+    /// as `THE_NON_VALUE`: the heir inherits silently, with no
+    /// `{'ETS-TRANSFER', …}` message. The 3-tuple form carries `Some(data)`.
+    Install {
+        pid: ProcessId,
+        data: Option<Eterm>,
+    },
 }
 
 /// `ets:setopts(Tab, Options)` — installs or clears the table's heir and returns
@@ -288,10 +295,10 @@ fn parse_setopts(atoms: &AtomTable, options: Eterm) -> Result<(Option<HeirOpt>, 
                     heir = Some(HeirOpt::Clear);
                 } else if is_internal_pid(target) {
                     let pid = ProcessId::from_eterm(target).map_err(|_| badarg())?;
-                    // `{heir, Pid}` carries no data in the C (`THE_NON_VALUE`, not
-                    // a term); `[]` is this crate's stand-in, observable only in the
-                    // (runtime-owned) `ETS-TRANSFER` message.
-                    let data = if arity == 3 { tuple_element(elem, 2) } else { NIL };
+                    // `{heir, Pid}` carries no data in the C (`THE_NON_VALUE`, not a
+                    // term) => `None`, observable as the absent `{'ETS-TRANSFER', …}`
+                    // message; the 3-tuple form carries `Some(data)`.
+                    let data = (arity == 3).then(|| tuple_element(elem, 2));
                     heir = Some(HeirOpt::Install { pid, data });
                 } else {
                     return Err(badarg());
@@ -459,6 +466,7 @@ mod tests {
 
     use beam_alloc::Heap;
     use beam_common::BeamError;
+    use beam_term::NIL;
 
     use crate::context::BifContext;
     use crate::registry::BifRegistry;
@@ -491,7 +499,7 @@ mod tests {
         let bogus = ctx.atom("bogus").expect("seeded");
         let pid = ProcessId::new(3, 0).to_eterm();
 
-        // `{heir, none}` clears, `{heir, Pid}` installs with the `[]` data.
+        // `{heir, none}` clears; `{heir, Pid}` installs with no gift data.
         let list = heir_list(&mut ctx, &[heir, none]);
         let (opt, prot) = parse_setopts(ctx.atoms(), list).expect("{heir, none}");
         assert!(matches!(opt, Some(HeirOpt::Clear)));
@@ -502,7 +510,7 @@ mod tests {
         match opt {
             Some(HeirOpt::Install { pid: parsed, data }) => {
                 assert_eq!(parsed, ProcessId::new(3, 0));
-                assert_eq!(data, NIL);
+                assert_eq!(data, None);
             }
             _ => panic!("expected an installed heir"),
         }
@@ -511,7 +519,7 @@ mod tests {
         let list = heir_list(&mut ctx, &[heir, pid, data]);
         let (opt, _) = parse_setopts(ctx.atoms(), list).expect("{heir, Pid, Data}");
         match opt {
-            Some(HeirOpt::Install { data: parsed, .. }) => assert_eq!(parsed, data),
+            Some(HeirOpt::Install { data: parsed, .. }) => assert_eq!(parsed, Some(data)),
             _ => panic!("expected an installed heir"),
         }
 
