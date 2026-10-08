@@ -134,6 +134,26 @@ impl AnyCollector {
             AnyCollector::Immix(c) => c.collect_major(roots),
         }
     }
+
+    /// Grows the nursery **on demand** so that a `need_words`-word allocation can proceed,
+    /// forwarded to whichever strategy is selected (both expose the identical seam):
+    /// [`Collector::ensure_capacity`] / [`GenImmixCollector::ensure_capacity`].
+    ///
+    /// After it returns, `young().available_words() >= need_words`; if the policy's
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) makes the request unreachable it
+    /// returns the typed heap-exhaustion error instead. This is the seam a runtime calls on
+    /// heap exhaustion, and it is strategy-agnostic — the caller does not need to know which
+    /// mature generation is in use.
+    pub fn ensure_capacity(
+        &mut self,
+        need_words: usize,
+        roots: &mut [Eterm],
+    ) -> Result<Collection> {
+        match self {
+            AnyCollector::Copying(c) => c.ensure_capacity(need_words, roots),
+            AnyCollector::Immix(c) => c.ensure_capacity(need_words, roots),
+        }
+    }
 }
 
 impl HeapObservable for AnyCollector {

@@ -13,6 +13,7 @@ use beam_common::Result;
 use beam_term::prelude::Eterm;
 
 use crate::copy::Copier;
+use crate::error::heap_exhausted;
 use crate::heap_info::HeapObservable;
 use crate::policy::HeapPolicy;
 use crate::space::{FromSet, HeapSpace};
@@ -117,11 +118,19 @@ impl Collector {
     }
 
     /// Runs a minor collection: evacuate the nursery's live terms into the mature space.
+    ///
+    /// The destination must fit the whole nursery up front (immediate promotion, no
+    /// partial-copy rollback). [`collect`](Self::collect) escalates to a major when it would
+    /// not; a **direct** call instead reports the typed heap exhaustion *before* a single
+    /// word is copied, so a too-small mature space can never leave the nursery
+    /// half-forwarded.
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
+        let needed = self.young.used_words();
+        if self.mature.available_words() < needed {
+            return Err(heap_exhausted(needed));
+        }
         let mut from = FromSet::new();
         from.add(&self.young);
-        // The destination must fit the whole nursery up front (immediate promotion, no
-        // partial-copy rollback); `collect` escalates to a major when it would not.
         let stats = Copier::new(&from, &mut self.mature).run(roots)?;
         let used = self.young.used_words();
         self.young.reset();
@@ -137,6 +146,12 @@ impl Collector {
     }
 
     /// Runs a major (fullsweep) collection: evacuate young and mature into a fresh space.
+    ///
+    /// The fresh space is sized up front from the heap policy, so the copy always fits and
+    /// the two from-spaces are never left half-forwarded. Should
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) clamp that size below the live set,
+    /// the typed heap exhaustion is returned *before* a single word is copied rather than
+    /// mid-copy.
     pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
         let mut from = FromSet::new();
         from.add(&self.young);
@@ -153,6 +168,12 @@ impl Collector {
         // Sized up front so the copy always fits — a collection never leaves the
         // from-space half-forwarded.
         let mut fresh = HeapSpace::with_allocator(alloc, size)?;
+        // `max_heap_words` can clamp `size` below the live set: report the typed heap
+        // exhaustion before copying anything, so a doomed fullsweep leaves both from-spaces
+        // untouched (a mid-copy failure would half-forward them).
+        if fresh.available_words() < live {
+            return Err(heap_exhausted(live));
+        }
         let stats = Copier::new(&from, &mut fresh).run(roots)?;
         self.mature = fresh; // drops the old mature space
         self.young.reset();
@@ -163,6 +184,38 @@ impl Collector {
         self.stats.major_collections += 1;
         self.resize_nursery(used)?;
         Ok(stats)
+    }
+
+    /// Grows the nursery **on demand** so that a `need_words`-word allocation can proceed —
+    /// the seam a runtime calls when [`should_collect`](Self::should_collect) reports the
+    /// nursery is full.
+    ///
+    /// It collects once (a minor, escalating to a major when a minor cannot make room), then
+    /// grows the now-empty nursery to the smallest curated size that covers `need_words`.
+    /// The growth is *explicit* because a collection sizes the nursery from what the previous
+    /// round happened to use, not from what the caller is about to allocate — without this
+    /// step a request larger than the nursery could never be met by collecting alone. The
+    /// returned [`Collection`] is the one it ran.
+    ///
+    /// Afterwards `young().available_words() >= need_words`. If
+    /// [`max_heap_words`](HeapPolicy::max_heap_words) (or the growth table's ceiling) makes
+    /// the request unreachable, the typed heap-exhaustion
+    /// [`BeamError`](beam_common::BeamError) is returned instead — the collector is left
+    /// consistent (never a half-forwarded heap) and, for an unreachable request, untouched.
+    /// The work is bounded, so this never loops forever.
+    pub fn ensure_capacity(
+        &mut self,
+        need_words: usize,
+        roots: &mut [Eterm],
+    ) -> Result<Collection> {
+        // Fail fast when the policy's ceiling makes the request unreachable: there is no
+        // point collecting, and the collector is left exactly as it was.
+        if self.policy.next_words(need_words, 0) < need_words {
+            return Err(heap_exhausted(need_words));
+        }
+        let collection = self.collect(roots)?;
+        grow_nursery(&mut self.young, &self.policy, need_words)?;
+        Ok(collection)
     }
 
     /// Sizes the (now empty) nursery for the next round from the heap-size policy — the
@@ -179,6 +232,36 @@ impl Collector {
         }
         Ok(())
     }
+}
+
+/// Grows an **empty** nursery to the smallest size the policy allows that covers
+/// `need_words`, or returns the typed heap exhaustion when no such size exists.
+///
+/// Shared by both mature-generation strategies (the copying [`Collector`] and
+/// [`crate::GenImmixCollector`]) so the growth arithmetic lives in exactly one place. The
+/// caller has just collected, so `nursery` is empty: this only ever *replaces* it with a
+/// larger space, never moving a live term. Each step targets
+/// `policy.next_words(need_words, 0)` (the smallest curated size that covers the request,
+/// floored by [`min_heap_words`](HeapPolicy::min_heap_words) and clamped by
+/// [`max_heap_words`](HeapPolicy::max_heap_words)); the loop is bounded because it stops as
+/// soon as the target no longer exceeds the current capacity.
+pub(crate) fn grow_nursery(
+    nursery: &mut HeapSpace,
+    policy: &HeapPolicy,
+    need_words: usize,
+) -> Result<()> {
+    while nursery.available_words() < need_words {
+        let capacity = nursery.capacity_words();
+        let target = policy.next_words(need_words, 0);
+        if target <= capacity {
+            // The policy's ceiling (or the growth table's) leaves no room to grow, so
+            // `need_words` is unreachable under this policy.
+            return Err(heap_exhausted(need_words));
+        }
+        let alloc = nursery.allocator().clone();
+        *nursery = HeapSpace::with_allocator(alloc, target)?;
+    }
+    Ok(())
 }
 
 impl HeapObservable for Collector {
