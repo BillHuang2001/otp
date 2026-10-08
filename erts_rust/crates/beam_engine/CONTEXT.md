@@ -20,6 +20,14 @@ pub trait ExecutionContext {
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm>;
     fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
     fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm>;
+    /// Contract A.8 execution-trace seam: a cheap gate + a defaulted no-op reporter.
+    fn trace_enabled(&self) -> bool { false }
+    fn trace_event(&mut self, event: TraceEvent<'_>) { let _ = event; }
+}
+pub enum TraceEvent<'a> {
+    Call { module: &'a str, function: &'a str, arity: u32, args: &'a [Eterm] },
+    ReturnFrom { module: &'a str, function: &'a str, arity: u32, value: Eterm },
+    ReturnTo { module: &'a str, function: &'a str, arity: u32 },
 }
 ```
 - `call_bif` dispatches `module:function/arity`; failure is a return-based `Err(BeamError)` (`BadArith`/`BadArg`/`Raise`/...) the engine turns into a guard branch or a raise, never a panic.
