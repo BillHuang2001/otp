@@ -99,7 +99,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `should_collect(need_words) -> bool`; `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>`
     (reuses `Collection`/`CollectionKind`; no new variant) — plus `collect_minor`/`collect_major`
     (`-> Result<GcStats>`) to force a specific collection (a too-large `collect_minor` reports the typed
-    heap exhaustion before copying anything)
+    heap exhaustion before copying anything); `ensure_capacity(need_words, roots)` — the on-demand growth
+    seam (same semantics as `Collector`)
 
 ### `any_collector.rs` — the strategy-dispatching seam
 - `pub enum AnyCollector { Copying(Collector), Immix(GenImmixCollector) }`
