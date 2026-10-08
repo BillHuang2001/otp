@@ -43,7 +43,7 @@ use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_gc::HeapPolicy;
 use beam_message::{Message, MsoHandle, OffHeapTable};
-use beam_term::prelude::{atom_val, is_atom, make_atom, Atom, Eterm};
+use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm};
 
 use crate::error;
 use crate::monitor::{
@@ -82,9 +82,9 @@ struct Slot {
 
 /// The target descriptor of a **named** monitor (`erlang:monitor(process, Name)`).
 ///
-/// `Monitor`/`MonitoredBy` carry a [`ProcessId`] target only, and their shape is frozen (it is
-/// constructed by struct literal downstream), so the `{Name, LocalNode}` target a named monitor
-/// reports in its `{'DOWN', …}` is kept beside them, keyed by the monitor reference, in
+/// `Monitor`/`MonitoredBy` carry a [`ProcessId`] target only, and their shape is fixed (built
+/// by struct literal), so the `{Name, LocalNode}` target a named monitor reports in its
+/// `{'DOWN', …}` is kept beside them, keyed by the monitor reference, in
 /// [`ProcessTable::named_monitors`].
 ///
 /// Both fields are **atoms — immediates** — so this record introduces no GC rootset and never
@@ -157,6 +157,20 @@ fn copy_reason_onto(
             process.copy_into_heap(reason, src)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Validates an `erlang:monitor/3` `{tag, Tag}` user tag.
+///
+/// `None` (no option) and an **immediate** tag pass through unchanged; anything else — a term
+/// resident in a per-process heap, which a monitor record (a plain value the collector never
+/// scans) could not keep valid across a collection — is refused with the typed
+/// [`error::unsupported_tag`], so the caller never gets a dangling tag in a `{'DOWN', …}`.
+fn check_tag(tag: Option<Eterm>) -> Result<Option<Eterm>> {
+    match tag {
+        None => Ok(None),
+        Some(term) if is_immediate(term) => Ok(Some(term)),
+        Some(_) => Err(error::unsupported_tag()),
     }
 }
 
@@ -593,6 +607,10 @@ impl ProcessTable {
     /// `{'DOWN', Ref, process, Target, noproc}` the oracle delivers, and **no** monitor entry is
     /// recorded (there is nothing left to watch).
     ///
+    /// This is the `erlang:monitor/2` form (no `{tag, Tag}` option); it delegates to
+    /// [`ProcessTable::monitor_with_tag`] with `tag = None`, so the notification carries the
+    /// default `'DOWN'` head atom.
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::TermNotFound` when the **watcher** is unknown; propagates the message
@@ -603,15 +621,37 @@ impl ProcessTable {
         target: ProcessId,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
+        self.monitor_with_tag(watcher, target, kind, None)
+    }
+
+    /// [`ProcessTable::monitor`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: the
+    /// eventual `{'DOWN', Ref, Kind, Target, Reason}` becomes `{Tag, Ref, Kind, Target, Reason}`.
+    ///
+    /// `tag = None` reproduces [`ProcessTable::monitor`] byte-for-byte. A tag that is not a
+    /// heap-independent immediate (see `monitor.rs`'s user-tag contract) is refused with the
+    /// typed [`error::unsupported_tag`] rather than stored as a word a collection could
+    /// invalidate.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor`], plus [`error::unsupported_tag`] for a non-immediate tag.
+    pub fn monitor_with_tag(
+        &mut self,
+        watcher: ProcessId,
+        target: ProcessId,
+        kind: MonitorKind,
+        tag: Option<Eterm>,
+    ) -> Result<MonitorRef> {
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
+        let tag = check_tag(tag)?;
         let reference = self.refs.next();
         if !self.contains(target) {
             // Nothing to watch: the monitor is born down (`noproc`), and the watcher is told so
             // right away. No entry is recorded, so a later `demonitor` finds no local half — it
             // reports `false`, exactly like a monitor that is already gone.
-            self.deliver_noproc_down(watcher, reference, target.to_eterm())?;
+            self.deliver_noproc_down(watcher, reference, target.to_eterm(), tag)?;
             return Ok(reference);
         }
         if let Some(process) = self.get_mut(watcher) {
@@ -619,6 +659,7 @@ impl ProcessTable {
                 reference,
                 target,
                 kind,
+                tag,
             });
         }
         if let Some(process) = self.get_mut(target) {
@@ -626,6 +667,7 @@ impl ProcessTable {
                 reference,
                 watcher,
                 kind,
+                tag,
             });
         }
         Ok(reference)
@@ -635,7 +677,9 @@ impl ProcessTable {
     /// non-live target into `watcher`'s mailbox — built on the watcher's own heap — and wakes a
     /// blocked watcher.
     ///
-    /// Mirrors [`ProcessTable::enqueue_port_down_message`]: the build goes through
+    /// When `tag` is `Some`, the head atom is the caller's user tag instead of `'DOWN'`
+    /// (the `erlang:monitor/3` form). Mirrors
+    /// [`ProcessTable::enqueue_port_down_message`]: the build goes through
     /// [`build_signal_term`] (so a full heap is a collection and a retry, never fatal) and the
     /// wake is recorded on the wake list. `target` must be an immediate (a pid term or a
     /// `{Name, Node}` pair the closure materialises itself); the `noproc` reason is an atom
@@ -646,6 +690,7 @@ impl ProcessTable {
         watcher: ProcessId,
         reference: MonitorRef,
         target: Eterm,
+        tag: Option<Eterm>,
     ) -> Result<()> {
         let woke = {
             let atoms = &self.atoms;
@@ -658,6 +703,7 @@ impl ProcessTable {
                 let term = build_down_message_term(
                     heap,
                     atoms,
+                    tag,
                     reference_term,
                     atoms.process(),
                     target,
@@ -679,6 +725,7 @@ impl ProcessTable {
     /// Enqueues the immediate `{'DOWN', Ref, process, {Name, Node}, noproc}` of a **named**
     /// monitor on an unregistered name into `watcher`'s mailbox, and wakes a blocked watcher.
     ///
+    /// When `tag` is `Some`, the head atom is the caller's user tag instead of `'DOWN'`.
     /// The `{Name, Node}` target is materialised on the watcher's own heap *inside* the
     /// [`build_signal_term`] closure, so a collect-and-retry never leaves a stale word behind.
     fn deliver_named_noproc_down(
@@ -687,6 +734,7 @@ impl ProcessTable {
         reference: MonitorRef,
         name: Atom,
         node: Atom,
+        tag: Option<Eterm>,
     ) -> Result<()> {
         let woke = {
             let atoms = &self.atoms;
@@ -700,6 +748,7 @@ impl ProcessTable {
                 let term = build_down_message_term(
                     heap,
                     atoms,
+                    tag,
                     reference_term,
                     atoms.process(),
                     target,
@@ -760,6 +809,26 @@ impl ProcessTable {
         node: Atom,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
+        self.monitor_named_with_tag(watcher, name, node, kind, None)
+    }
+
+    /// [`ProcessTable::monitor_named`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**.
+    ///
+    /// `tag = None` reproduces [`ProcessTable::monitor_named`] byte-for-byte; a non-immediate
+    /// tag is the typed [`error::unsupported_tag`] (see `monitor.rs`'s user-tag contract).
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor_named`], plus [`error::unsupported_tag`] for a non-immediate
+    /// tag.
+    pub fn monitor_named_with_tag(
+        &mut self,
+        watcher: ProcessId,
+        name: Atom,
+        node: Atom,
+        kind: MonitorKind,
+        tag: Option<Eterm>,
+    ) -> Result<MonitorRef> {
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
@@ -770,10 +839,11 @@ impl ProcessTable {
             // honest answer.
             return Err(error::named_port_monitor());
         }
+        let tag = check_tag(tag)?;
         let reference = self.refs.next();
         // `whereis` already resolves "registered but its process is gone" to `None`.
         let Some(target) = self.whereis(name) else {
-            self.deliver_named_noproc_down(watcher, reference, name, node)?;
+            self.deliver_named_noproc_down(watcher, reference, name, node, tag)?;
             return Ok(reference);
         };
         if let Some(process) = self.get_mut(watcher) {
@@ -781,6 +851,7 @@ impl ProcessTable {
                 reference,
                 target,
                 kind,
+                tag,
             });
         }
         if let Some(process) = self.get_mut(target) {
@@ -788,6 +859,7 @@ impl ProcessTable {
                 reference,
                 watcher,
                 kind,
+                tag,
             });
         }
         self.named_monitors
@@ -824,22 +896,43 @@ impl ProcessTable {
         port: PortId,
         ports: &mut PortTable,
     ) -> Result<MonitorRef> {
+        self.monitor_port_with_tag(watcher, port, ports, None)
+    }
+
+    /// [`ProcessTable::monitor_port`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: the
+    /// eventual `{'DOWN', Ref, port, Port, Reason}` becomes `{Tag, Ref, port, Port, Reason}`.
+    ///
+    /// `tag = None` reproduces [`ProcessTable::monitor_port`] byte-for-byte; a non-immediate tag
+    /// is the typed [`error::unsupported_tag`] (see `monitor.rs`'s user-tag contract).
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor_port`], plus [`error::unsupported_tag`] for a non-immediate
+    /// tag.
+    pub fn monitor_port_with_tag(
+        &mut self,
+        watcher: ProcessId,
+        port: PortId,
+        ports: &mut PortTable,
+        tag: Option<Eterm>,
+    ) -> Result<MonitorRef> {
         if !self.contains(watcher) {
             return Err(error::unknown_process());
         }
+        let tag = check_tag(tag)?;
         let reference = self.refs.next();
         if !ports.contains(port) {
             // Nothing to watch: the port is already gone. Tell the watcher right away and
             // record nothing, exactly as the pid path does for a dead pid.
             let reason = self.atoms.noproc_term();
-            self.enqueue_port_down_message(watcher, reference, port, reason)?;
+            self.enqueue_port_down_message(watcher, reference, port, tag, reason)?;
             return Ok(reference);
         }
         ports.monitor(port, watcher, reference)?;
         if let Some(process) = self.get_mut(watcher) {
             process
                 .port_monitors_mut()
-                .push(PortWatch { reference, port });
+                .push(PortWatch { reference, port, tag });
         }
         Ok(reference)
     }
@@ -849,6 +942,8 @@ impl ProcessTable {
     /// `Target` must be a live-or-closed **port** term; a registered **name** is rejected with
     /// the typed [`error::named_port_monitor`] (the local registry holds processes only), so
     /// this never records a process monitor for a port-typed request.
+    ///
+    /// This is the `erlang:monitor/2` form (no `{tag, Tag}` option).
     ///
     /// # Errors
     ///
@@ -860,11 +955,27 @@ impl ProcessTable {
         target: Eterm,
         ports: &mut PortTable,
     ) -> Result<MonitorRef> {
+        self.monitor_port_term_with_tag(watcher, target, ports, None)
+    }
+
+    /// [`ProcessTable::monitor_port_term`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor_port_term`], plus [`error::unsupported_tag`] for a
+    /// non-immediate tag.
+    pub fn monitor_port_term_with_tag(
+        &mut self,
+        watcher: ProcessId,
+        target: Eterm,
+        ports: &mut PortTable,
+        tag: Option<Eterm>,
+    ) -> Result<MonitorRef> {
         if is_atom(target) {
             return Err(error::named_port_monitor());
         }
         let port = PortId::from_eterm(target)?;
-        self.monitor_port(watcher, port, ports)
+        self.monitor_port_with_tag(watcher, port, ports, tag)
     }
 
     /// Removes the **port** monitor `watcher` holds under `reference`, reporting whether it
@@ -1115,6 +1226,7 @@ impl ProcessTable {
                 watcher.reference,
                 pid,
                 watcher.kind,
+                watcher.tag,
                 reason,
                 Some(process.off_heap()),
             )?;
@@ -1233,9 +1345,10 @@ impl ProcessTable {
                 reference,
                 target,
                 kind,
+                tag,
                 ..
             } => {
-                self.deliver_down_message(pid, reference, target, kind)?;
+                self.deliver_down_message(pid, reference, target, kind, tag)?;
                 Ok(true)
             }
         }
@@ -1331,16 +1444,18 @@ impl ProcessTable {
         })
     }
 
-    /// Delivers the head (monitor-DOWN) signal of `pid` as a `{'DOWN', …}` message.
+    /// Delivers the head (monitor-DOWN) signal of `pid` as a `{'DOWN', …}` message — or
+    /// `{Tag, …}` when the queued signal carried an `erlang:monitor/3` user tag.
     fn deliver_down_message(
         &mut self,
         pid: ProcessId,
         reference: MonitorRef,
         target: ProcessId,
         kind: MonitorKind,
+        tag: Option<Eterm>,
     ) -> Result<()> {
         self.deliver_head_signal(pid, |this, reason| {
-            this.build_and_enqueue_down(pid, reference, target, kind, reason)
+            this.build_and_enqueue_down(pid, reference, target, kind, tag, reason)
         })
     }
 
@@ -1359,8 +1474,9 @@ impl ProcessTable {
         enqueue_exit_on(recipient, atoms, from, reason)
     }
 
-    /// Builds `{'DOWN', Ref, Tag, Target, reason}` on `pid`'s heap — `reason` already resident
-    /// in that heap — and enqueues it as a message.
+    /// Builds `{'DOWN', Ref, Kind, Target, reason}` on `pid`'s heap — `reason` already resident
+    /// in that heap — and enqueues it as a message. When `tag` is `Some`, the head atom is the
+    /// caller's `erlang:monitor/3` user tag instead of `'DOWN'`.
     ///
     /// A **named** monitor's DOWN carries the `{Name, node}` pair it was created with rather than
     /// the pid the name resolved to (the oracle's behaviour); an ordinary monitor carries the
@@ -1371,6 +1487,7 @@ impl ProcessTable {
         reference: MonitorRef,
         target: ProcessId,
         kind: MonitorKind,
+        tag: Option<Eterm>,
         reason: Eterm,
     ) -> Result<()> {
         let atoms = &self.atoms;
@@ -1378,7 +1495,7 @@ impl ProcessTable {
         let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
             return Ok(());
         };
-        let tag = match kind {
+        let kind_atom = match kind {
             MonitorKind::Process => atoms.process(),
             MonitorKind::Port => atoms.port(),
         };
@@ -1392,8 +1509,9 @@ impl ProcessTable {
         let term = build_down_message_term(
             recipient.heap_mut(),
             atoms,
-            reference_term,
             tag,
+            reference_term,
+            kind_atom,
             target_term,
             reason,
         )?;
@@ -1428,13 +1546,15 @@ impl ProcessTable {
     }
 
     /// Enqueues a monitor-DOWN signal on `to`'s signal queue, copying `reason` out of the heap
-    /// described by `src` (see [`ProcessTable::enqueue_exit_signal`]).
+    /// described by `src` (see [`ProcessTable::enqueue_exit_signal`]); `tag` is the monitor's
+    /// `erlang:monitor/3` user tag (a heap-independent immediate, carried verbatim).
     fn enqueue_down_signal(
         &mut self,
         to: ProcessId,
         reference: MonitorRef,
         target: ProcessId,
         kind: MonitorKind,
+        tag: Option<Eterm>,
         reason: Eterm,
         src: Option<&OffHeapTable>,
     ) -> Result<()> {
@@ -1444,7 +1564,7 @@ impl ProcessTable {
         let reason = copy_reason_onto(recipient, reason, src)?;
         recipient
             .signals_mut()
-            .push(PendingSignal::down(reference, target, kind, reason));
+            .push(PendingSignal::down(reference, target, kind, tag, reason));
         Ok(())
     }
 
@@ -1589,6 +1709,30 @@ impl ProcessTable {
         target: Eterm,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
+        self.monitor_term_with_tag(watcher, target, kind, None)
+    }
+
+    /// [`ProcessTable::monitor_term`] with an `erlang:monitor/3` `{tag, Tag}` **user tag**: a
+    /// local pid dispatches to [`ProcessTable::monitor_with_tag`] and an atom name to
+    /// [`ProcessTable::monitor_named_with_tag`].
+    ///
+    /// A **remote** (external-pid) target with a tag is the typed [`error::unsupported`]: the
+    /// monitor signal on the wire (`DistSignal::Monitor` → `DOP_MONITOR_P`) has no tag field, so
+    /// the tag could not be carried to the node that will eventually build the `{Tag, …}` DOWN —
+    /// a typed diagnostic rather than a silently untagged notification.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::monitor_term`], plus [`error::unsupported_tag`] for a non-immediate
+    /// tag and [`error::unsupported`] for a tag on a remote target.
+    pub fn monitor_term_with_tag(
+        &mut self,
+        watcher: ProcessId,
+        target: Eterm,
+        kind: MonitorKind,
+        tag: Option<Eterm>,
+    ) -> Result<MonitorRef> {
+        let tag = check_tag(tag)?;
         if PortId::is_port(target) {
             return match kind {
                 MonitorKind::Port => Err(error::unsupported(
@@ -1610,11 +1754,17 @@ impl ProcessTable {
                     "monitor/2: name target requires the local node (set_local_node)",
                 ));
             };
-            return self.monitor_named(watcher, atom_val(target), node, kind);
+            return self.monitor_named_with_tag(watcher, atom_val(target), node, kind, tag);
         }
         match PidTarget::from_eterm(target)? {
-            PidTarget::Local(pid) => self.monitor(watcher, pid, kind),
+            PidTarget::Local(pid) => self.monitor_with_tag(watcher, pid, kind, tag),
             PidTarget::Remote(remote) => {
+                if tag.is_some() {
+                    // The wire monitor signal has no tag field (see the method docs).
+                    return Err(error::unsupported(
+                        "monitor/3: tag on a remote target (DOP_MONITOR_P carries no tag)",
+                    ));
+                }
                 if !self.contains(watcher) {
                     return Err(error::unknown_process());
                 }
@@ -1778,8 +1928,16 @@ impl ProcessTable {
             let (term, from, off_heap) = build_signal_term(recipient, |heap| {
                 let reference_term = reference.to_eterm(heap)?;
                 let from = remote.to_eterm(heap)?;
-                let term =
-                    build_down_message_remote(heap, atoms, reference_term, remote, reason)?;
+                // A remote monitor carries no user tag (see `monitor_term_with_tag`), so the
+                // DOWN keeps the default `'DOWN'` head atom.
+                let term = build_down_message_remote(
+                    heap,
+                    atoms,
+                    None,
+                    reference_term,
+                    remote,
+                    reason,
+                )?;
                 Ok((term, from, Vec::<MsoHandle>::new()))
             })?;
             recipient
@@ -1935,13 +2093,19 @@ impl ProcessTable {
 
         // 1. Monitors: the port's death resolves the incoming half here (drained by `close`)
         //    and the watcher's outgoing half below; then the watcher is told the port is down.
+        //    The outgoing half carries the `erlang:monitor/3` user tag, so it is read (and the
+        //    half dropped) before the DOWN is built.
         for monitor in closed.monitors {
-            if let Some(watcher) = self.get_mut(monitor.watcher) {
-                watcher
-                    .port_monitors_mut()
-                    .retain(|watch| watch.reference != monitor.reference);
-            }
-            self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, reason)?;
+            let tag = self.get_mut(monitor.watcher).and_then(|watcher| {
+                let entries = watcher.port_monitors_mut();
+                let tag = entries
+                    .iter()
+                    .find(|watch| watch.reference == monitor.reference)
+                    .and_then(|watch| watch.tag);
+                entries.retain(|watch| watch.reference != monitor.reference);
+                tag
+            });
+            self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, tag, reason)?;
         }
 
         // 2. Links: each linked process either traps the exit or follows it.
@@ -1961,7 +2125,8 @@ impl ProcessTable {
     }
 
     /// Enqueues `{'DOWN', Ref, port, Port, Reason}` into `to`'s mailbox — built on `to`'s own
-    /// heap — and wakes `to` when it was blocked.
+    /// heap — and wakes `to` when it was blocked. With `tag = Some`, the head atom is the
+    /// monitor's `erlang:monitor/3` user tag (`{Tag, Ref, port, Port, Reason}`).
     ///
     /// An unknown `to` is skipped (the watcher died earlier).
     fn enqueue_port_down_message(
@@ -1969,6 +2134,7 @@ impl ProcessTable {
         to: ProcessId,
         reference: MonitorRef,
         port: PortId,
+        tag: Option<Eterm>,
         reason: Eterm,
     ) -> Result<()> {
         let woke = {
@@ -1979,7 +2145,8 @@ impl ProcessTable {
             let from = port.to_eterm();
             let (term, off_heap) = build_signal_term(recipient, |heap| {
                 let reference_term = reference.to_eterm(heap)?;
-                let term = build_down_message_port(heap, atoms, reference_term, port, reason)?;
+                let term =
+                    build_down_message_port(heap, atoms, tag, reference_term, port, reason)?;
                 Ok((term, Vec::<MsoHandle>::new()))
             })?;
             recipient

@@ -581,7 +581,7 @@ fn a_live_port_monitor_records_both_halves_and_demonitor_removes_them() {
 
     assert_eq!(
         f.table.get(watcher).expect("watcher").port_monitors(),
-        &[PortWatch { reference, port }],
+        &[PortWatch { reference, port, tag: None }],
         "the outgoing half is recorded on the watcher"
     );
     assert_eq!(
@@ -708,7 +708,7 @@ fn the_outgoing_port_watch_set_is_not_a_collector_root() {
     // The out-of-heap port watch is untouched by the collection ...
     assert_eq!(
         f.table.get(watcher).expect("watcher").port_monitors(),
-        &[PortWatch { reference, port }],
+        &[PortWatch { reference, port, tag: None }],
         "a port watch is not a term and is never gathered/scattered"
     );
     // ... the incoming half is still on the port ...
@@ -847,7 +847,7 @@ fn oracle_a_live_port_monitor_appears_in_process_info_monitors() {
         .expect("a live port monitors");
     assert_eq!(
         f.table.get(watcher).expect("watcher").port_monitors(),
-        &[PortWatch { reference, port }],
+        &[PortWatch { reference, port, tag: None }],
         "one entry, exactly as the oracle's single port-tagged tuple"
     );
     assert!(f

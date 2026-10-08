@@ -1016,6 +1016,7 @@ mod tests {
             reference,
             target: pid(4),
             kind: MonitorKind::Process,
+            tag: None,
         });
         assert_eq!(process.monitors().find(reference).map(|m| m.target), Some(pid(4)));
 
@@ -1023,6 +1024,7 @@ mod tests {
             reference,
             watcher: pid(5),
             kind: MonitorKind::Process,
+            tag: None,
         });
         assert_eq!(process.monitored_by().len(), 1);
         assert_eq!(process.monitored_by()[0].watcher, pid(5));
@@ -1034,6 +1036,7 @@ mod tests {
         process.port_monitors_mut().push(PortWatch {
             reference: port_reference,
             port,
+            tag: None,
         });
         assert_eq!(process.port_monitors().len(), 1);
         assert_eq!(process.port_monitors()[0].reference, port_reference);
