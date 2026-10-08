@@ -547,10 +547,11 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `src/delivery.rs` → inbound `DOP_*` delivery: `Delivery` (classify a `ControlMessage` — all 30
   opcodes, incl. `SpawnRequest`/`SpawnReply`/`AltactSigSend`/`PayloadExit*`), `DeliveryOutcome`/
   `Dispatched`, the defaulted `InboundSink` seam + `UnsupportedSink` (routing lives in `beam_rt`)
-- `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation),
+- `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation,
+  plus the `connect_client_with_flags`/`accept_server_with_flags` overrides),
   `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache) with
-  `send_control`/`send_message`/`send_tick`/`recv` + the typed `send_reg_send`/`send_link`/`send_exit`/
-  `send_monitor_p`/`send_demonitor_p` helpers
+  `send_control`/`send_message`/`send_tick`/`recv`/`recv_delivery`/`dispatch_inbound` + the typed
+  `send_reg_send`/`send_link`/`send_exit`/`send_monitor_p`/`send_demonitor_p` helpers
 - `src/connection_tests.rs` → the `connection` module's in-module unit tests (path-included via
   `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
 - `src/driver.rs` → the non-blocking `ConnectionDriver` poll/step state machine (`feed`/`step`/
