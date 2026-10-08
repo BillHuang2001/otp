@@ -92,6 +92,16 @@ SMP pool:
     immediately when already there, and invoking the waker), inactive-thread exclusion (reactivation
     re-includes), concurrent `bump`s each happen once, `block`/`unblock` nest, `safepoint` never
     blocks on the caller's own slot, a clone shares the registry/generation/blocking state.
+22. `monitor_tag.rs` (8 tests) — the `erlang:monitor/3` **user tag** cross-checked against the real
+    `erl` (skips loudly when absent): a tagged live/exit/`noproc` process monitor delivers
+    `{Tag, Ref, process, Target, Reason}`, the untagged `monitor/2` DOWN is unchanged, a tagged named
+    monitor reports the `{Name, Node}` target, a tagged port monitor delivers `{Tag, Ref, port, Port,
+    Reason}`, and a non-immediate tag is this crate's typed `unsupported` (the oracle accepts any term).
+23. `split_borrow.rs` (2 tests) — the `Process::heap_and_off_heap_mut` split borrow: one call hands out
+    the process's OWN young heap + off-heap table (identity pinned with `core::ptr::eq` against
+    `heap_mut()`/`off_heap_mut()`), and a `beam_message::Fragments` chain is moved onto that heap with
+    `move_into(heap, off_heap)` (the heap grows by exactly the copied cons-cell count) — the fragmented
+    payload's one-step move-in.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -102,24 +112,26 @@ SMP pool:
 - `lock_scope.rs` is the **only** file with wall-clock bounds; they are deliberately loose and
   two-sided (a cross-thread send must be serviced far below the slice's duration, and the slice must
   last far above that bound — the anti-vacuity guard).
-- The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, and the `erl` cross-checks in
-  `capability_inventory.rs`) **skip loudly** when `erl` is absent, and must never spawn a child
+- The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, and the `erl`
+  cross-checks in `capability_inventory.rs`) **skip loudly** when `erl` is absent, and must never spawn a child
   process that inherits `erl`'s stderr (a captured-stderr pipe blocks until the child dies — the
   probes are written child-free).
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **312 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **330 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs` → the single-threaded scheduler, mailbox, signals, GC
   roots, PCB state and pre-emption/fairness
-- `registry_monitors.rs`, `capability_inventory.rs`, `process_info_source.rs`, `spawn_options.rs` →
-  the process-control surface: name registry + monitors, the typed-error/capability inventory, the
-  `process_info` item→accessor mapping, and the spawn-option composition
-- `dict_oracle.rs`, `registry_monitors.rs` (oracle tests) → `erl`-cross-checked process-dictionary and
-  process-control evidence (loud skip when `erl` is absent)
+- `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
+  `spawn_options.rs` → the process-control surface: name registry + monitors (incl. the `monitor/3` user
+  tag), the typed-error/capability inventory, the `process_info` item→accessor mapping, and the
+  spawn-option composition
+- `split_borrow.rs` → the `Process::heap_and_off_heap_mut` split borrow + `Fragments::move_into`
+- `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs` (oracle tests) → `erl`-cross-checked
+  process-dictionary and process-control evidence (loud skip when `erl` is absent)
 - `ports.rs`, `remote.rs` → the port table and distributed links/monitors
 - `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
   `../src/smp/CONTEXT.md`)
