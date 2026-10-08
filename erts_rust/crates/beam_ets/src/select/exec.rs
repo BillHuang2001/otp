@@ -230,8 +230,8 @@ impl Table {
     /// `[{5,5},{4,4},{3,3},{2,2},{1,1}]`. For the hash kinds (`set`/`bag`/
     /// `duplicate_bag`) the forward order is deliberately unspecified, so the
     /// reverse is a complete permutation of the same result multiset (the oracle
-    /// walks its bowels backwards; this crate walks the reverse of its own forward
-    /// order — the same "hash-kind order is unspecified" freedom documented
+    /// walks its internal index backwards; this crate walks the reverse of its own
+    /// forward order — the same "hash-kind order is unspecified" freedom documented
     /// elsewhere).
     ///
     /// Otherwise identical to [`Self::select`]: fresh tuples/lists are built on
