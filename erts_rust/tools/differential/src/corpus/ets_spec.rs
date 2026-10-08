@@ -345,5 +345,124 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the `ordered_set` arithmetic-key rule (A.7) ---
+        //
+        // Inside an `ordered_set`, integer and float keys that compare equal (`1` and `1.0`) are
+        // the *same* key: the second insert replaces the first object (it is not a second object,
+        // and it does not raise), and a lookup by *either* the integer or the float term finds it.
+        // The stored key term -- and therefore the term `first/1`/`next/2` reports -- is the one of
+        // the *inserted* term, so a key inserted as `1.0` stays a float `1.0` (never normalised to
+        // the integer `1`). The hash-based table types do not share this rule (they hash the key
+        // term), which is why these cases are `ordered_set`-specific.
+        Case {
+            id: "ets_spec/ordered_set_int_float_same_key",
+            description: "an ordered_set treats 1 and 1.0 as one key, so the second insert replaces",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(t_os_arith,[ordered_set]), ets:insert(T,{1.0,a}), ets:insert(T,{1,b}), ets:lookup(T,1) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{1,b}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets_spec/ordered_set_int_float_lookup_same_key",
+            description: "the same ordered_set object is also found by the float spelling of the key",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(t_os_arith_f,[ordered_set]), ets:insert(T,{1.0,a}), ets:insert(T,{1,b}), ets:lookup(T,1.0) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{1,b}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets_spec/ordered_set_int_float_size_one",
+            description: "the colliding int/float keys leave the ordered_set with a single object",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(t_os_size,[ordered_set]), ets:insert(T,{1.0,a}), ets:insert(T,{1,b}), ets:info(T,size) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets_spec/ordered_set_first_reports_inserted_key",
+            description: "first/1 reports the inserted key term (1.0 stays a float, not the integer 1)",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // The key is inserted as the float `1.0`, so `first/1` reports `1.0` (a float),
+                // not the integer `1` -- the arithmetic-equality rule selects the slot, it does
+                // not rewrite the stored key term.
+                expr: "begin T = ets:new(t_os_first,[ordered_set]), ets:insert(T,{1.0,x}), ets:first(T) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1.0"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets_spec/ordered_set_next_reports_inserted_key",
+            description: "next/2 reports the next inserted key term (2.0 stays a float) after a colliding search key",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                // Keys `1.0` and `2.0` are distinct objects here; `next/2` searched with the
+                // *integer* `1` (which arithmetic-collides with the stored float `1.0`) reports
+                // the following key as the *inserted* float term `2.0`.
+                expr: "begin T = ets:new(t_os_next,[ordered_set]), ets:insert(T,{1.0,a}), ets:insert(T,{2.0,b}), ets:next(T,1) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2.0"),
+                exit_code: 0,
+            },
+        },
+        // --- the `info/1,2` field set on an ordered_set ---
+        //
+        // The 15 item *names* of `ets:info/1` -- and their order -- are table-type-independent, so
+        // the `ets/info_15_fields` case above already pins the order; it is deliberately not
+        // duplicated for `ordered_set` here. What *is* type-specific is the value of the `type`
+        // item, pinned below alongside `keypos` (the same default position for every table type).
+        Case {
+            id: "ets_spec/ordered_set_info_type",
+            description: "info(T, type) reports the ordered_set table type",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(t_os_it,[ordered_set]), ets:info(T,type) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok ordered_set"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "ets_spec/ordered_set_info_keypos",
+            description: "info(T, keypos) reports the default key position 1",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin T = ets:new(t_os_ik,[ordered_set]), ets:info(T,keypos) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1"),
+                exit_code: 0,
+            },
+        },
     ]
 }
