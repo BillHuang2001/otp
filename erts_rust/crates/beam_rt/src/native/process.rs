@@ -379,10 +379,16 @@ impl RuntimeContext<'_> {
         entry: ProcessEntry,
         args: Vec<Eterm>,
     ) -> Result<Eterm> {
+        let parent = self.pid();
         let pid = self.process_table_mut().spawn(policy)?;
         if let Some(priority) = priority {
             self.process_table_mut().set_priority(pid, priority)?;
         }
+        // The child inherits the spawning process's group leader
+        // (`erl_process.c:12654-12663`): an explicit `erlang:group_leader(GL, Parent)` is
+        // observed by everything `Parent` later spawns. The store lives on the `Runtime`, so
+        // it is reachable from inside a scheduler slice too.
+        self.runtime.inherit_group_leader(parent, pid);
         self.runtime.note_pending_spawn(PendingSpawn { pid, entry, args });
         Ok(pid.to_eterm())
     }

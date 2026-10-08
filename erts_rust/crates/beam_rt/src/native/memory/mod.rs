@@ -712,7 +712,7 @@ impl RuntimeContext<'_> {
             dictionary: process.dict().entries().collect(),
             trap_exit: process.is_trapping_exit(),
             priority: process.priority().name(),
-            group_leader: self.runtime.self_pid().to_eterm(),
+            group_leader: self.runtime.group_leader_of(pid).to_eterm(),
             heap_size: process.collector().heap_size_words(),
             total_heap_size: process.collector().total_heap_size_words(),
             stack_size: process.registers().stack().len(),

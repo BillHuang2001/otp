@@ -778,6 +778,48 @@ impl Runtime {
         self.self_pid
     }
 
+    /// The **group leader** of `pid` (`erlang:group_leader/0,2`).
+    ///
+    /// A pid with no explicit entry has the runtime's own root pid as its leader — the
+    /// process OTP's `init` stands in for here (see [`Runtime::group_leaders`]). This is the
+    /// **one** source of truth every reader shares — the runtime-native
+    /// [`erlang:group_leader/0,2`](crate::native::group_leader) floor, the
+    /// `ProcessHook::group_leader` bridge ([`crate::context::process_bridge`]) and
+    /// `erlang:process_info/2`'s `group_leader` item — so they can never disagree about the
+    /// same process.
+    ///
+    /// The answer is a real, live pid (or a pid that *was* one when set — the oracle accepts a
+    /// dead leader), never an invented term.
+    pub(crate) fn group_leader_of(&self, pid: ProcessId) -> ProcessId {
+        self.group_leaders.get(&pid).copied().unwrap_or(self.self_pid)
+    }
+
+    /// Sets `pid`'s group leader (`erlang:group_leader/2` and
+    /// `erts_internal:group_leader/2`).
+    ///
+    /// The leader is recorded as given and is **not** required to be live: the C's
+    /// `erts_internal_group_leader_2` only checks the first argument is a pid
+    /// (`bif.c:4912-4947`), so a dead leader is accepted (probed against the oracle:
+    /// `erlang:group_leader(<dead pid>, self())` ⇒ `true`).
+    pub(crate) fn set_group_leader(&mut self, pid: ProcessId, leader: ProcessId) {
+        self.group_leaders.insert(pid, leader);
+    }
+
+    /// Gives a freshly spawned `child` the group leader its `parent` has
+    /// (`erl_process.c:12654-12663`).
+    ///
+    /// A child with no explicit `spawn_opt` leader inherits its parent's, so an explicit
+    /// `erlang:group_leader(GL, Parent)` is observed by everything `Parent` later spawns (and
+    /// `group_leader/2` reported `ProcessInfo` for the child). A parent whose leader is the
+    /// root **default** leaves the child with no entry at all — [`Runtime::group_leader_of`]
+    /// then answers the same pid, so the map stays as small as the explicit sets.
+    pub(crate) fn inherit_group_leader(&mut self, parent: ProcessId, child: ProcessId) {
+        let leader = self.group_leader_of(parent);
+        if leader != self.self_pid {
+            self.group_leaders.insert(child, leader);
+        }
+    }
+
     /// Loads `path` into the code server and returns the cached module.
     ///
     /// A module loaded twice replaces the cached one (mirroring a code reload).
@@ -1020,6 +1062,10 @@ impl Runtime {
         if let Some(priority) = priority {
             self.processes.set_priority(pid, priority)?;
         }
+        // The child inherits the caller's group leader (`erl_process.c:12654-12663`). This
+        // path only runs over the runtime's own table — i.e. as the runtime's root process —
+        // so the parent is `self_pid` (see `RuntimeContext::owns_process_table`).
+        self.inherit_group_leader(self.self_pid, pid);
         self.runner_state.spawn(pid, entry, args);
         self.enqueue_process(pid)?;
         Ok(pid)
@@ -1121,6 +1167,8 @@ impl Runtime {
         if let Some(priority) = priority {
             self.processes.set_priority(pid, priority)?;
         }
+        // As `spawn_process_with_policy`: the child inherits the root process's group leader.
+        self.inherit_group_leader(self.self_pid, pid);
         self.runner_state.spawn_fun(pid, fun, args);
         self.enqueue_process(pid)?;
         Ok(pid)

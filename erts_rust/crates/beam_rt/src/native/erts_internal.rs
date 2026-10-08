@@ -232,6 +232,13 @@ impl RuntimeContext<'_> {
             ("perf_counter_unit", 0) => Some(self.erts_perf_counter_unit()),
             ("get_creation", 0) => Some(self.erts_get_creation()),
             ("is_process_alive", 1) => Some(self.erts_is_process_alive(args)),
+            // The per-process group leader (`bif.tab:79-80`, `bif.c:4949-5021`): the two
+            // counterparts of `erlang:group_leader/2` (which `erlang.erl:3328-3341` wraps).
+            // The floor runs before the registry, so it preempts the defaulted
+            // `RuntimeHooks` entries `beam_bifs` registers for these two names. See
+            // [`super::group_leader`].
+            ("group_leader", 2) => Some(self.erts_group_leader_2(args)),
+            ("group_leader", 3) => Some(self.erts_group_leader_3(args)),
             ("no_aux_work_threads", 0) => Some(self.erts_no_aux_work_threads()),
             ("processes_next", 1) => Some(self.erts_processes_next(args)),
             ("term_to_string", 1) => Some(self.erts_term_to_string(args, false)),

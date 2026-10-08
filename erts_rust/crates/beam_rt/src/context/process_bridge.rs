@@ -316,7 +316,10 @@ impl ProcessHook for ProcessBridge<'_> {
     }
 
     fn group_leader(&mut self) -> Result<ProcessId> {
-        Ok(self.self_pid)
+        // The one store every reader shares: `group_leader/0` reports whatever
+        // `erlang:group_leader/2` last set for the running process, and the runtime's root
+        // pid when nothing has been set (see [`Runtime::group_leader_of`]).
+        Ok(self.runtime.group_leader_of(self.self_pid))
     }
 }
 

@@ -62,6 +62,7 @@
 mod application;
 mod code;
 mod erts_internal;
+mod group_leader;
 mod init;
 pub(crate) mod memory;
 mod node;
@@ -170,6 +171,13 @@ impl RuntimeContext<'_> {
             ("erlang", "exit", 3) => Some(self.exit_3(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
+            // The per-process **group leader** (contract A.9): `erlang:group_leader/2` is the
+            // `erlang.erl` wrapper over `erts_internal:group_leader/2,3`, and the leader is
+            // runtime state `beam_process` does not model — the store lives on
+            // [`Runtime`](crate::Runtime) and every reader shares it. `application_master:init/3`
+            // (the boot script's `application:start_boot(kernel, permanent)`) is what needs it.
+            // See [`group_leader`].
+            ("erlang", "group_leader", 2) => Some(self.group_leader_2(args)),
             // The distribution identity surface (contract A.5): this node's name, its cookie
             // and the (always empty) set of connected nodes. One arm per name; every answer
             // reads the runtime's own node table, so the per-function bodies -- including the
@@ -427,9 +435,7 @@ impl RuntimeContext<'_> {
         let term = *args.first().ok_or(BeamError::BadArg)?;
         // A timer reference, or a reference this runtime minted for something else
         // (`make_ref/0`/`monitor/2`) — anything else is not a reference and is `badarg`.
-        if !self.runtime.timers.is_timer_ref(term)
-            && !self.runtime.references.contains_key(&term)
-        {
+        if !self.is_runtime_reference(term) {
             return Err(BeamError::BadArg);
         }
         match self.runtime.timers_mut().cancel(term) {
@@ -440,6 +446,20 @@ impl RuntimeContext<'_> {
             }
             None => self.atom("false"),
         }
+    }
+
+    /// Whether `term` is a reference **this runtime minted**: a pending timer's reference or
+    /// one `make_ref/0`/`monitor/2` registered (`Runtime::references`).
+    ///
+    /// This is the argument test `erlang:cancel_timer/1` and `erts_internal:group_leader/3`
+    /// share. The C only checks the *shape* (`is_not_internal_ref`), because it can read the
+    /// thing's payload; reading one here would need `beam_term::boxed_val`, which is `unsafe`
+    /// (and this crate is `#![deny(unsafe_code)]`), so the term-keyed registries — the only
+    /// safe way to recognise a reference — are the test. The comparison is by raw term word,
+    /// which is exact for a reference: two distinct references are distinct terms, and an
+    /// equal term word denotes the same reference.
+    pub(super) fn is_runtime_reference(&self, term: Eterm) -> bool {
+        self.runtime.timers.is_timer_ref(term) || self.runtime.references.contains_key(&term)
     }
 
     // The delay/destination validation of a timer BIF lives in `crate::timers`
