@@ -76,6 +76,16 @@ setup() {
     echo "=== building erl_interface, emulator, bootstrap wrappers ==="
     make -j"$JOBS" erl_interface
     make -j"$JOBS" emulator bootstrap_setup
+    # parsetools provides `yecc'/`leex', which the primary bootstrap does NOT
+    # ship. Without `yecc' the bootstrap `erlc' cannot generate stdlib's
+    # erl_parse.erl from erl_parse.yrl (error:undef in yecc:compile/1), which
+    # makes the stdlib step below fail. Build parsetools first, then put the
+    # in-tree lib/ on the bootstrap code path via ERL_LIBS so the `erlc' used
+    # below finds `yecc'/`leex'. Build outputs are git-ignored, so neither step
+    # dirties the tree.
+    echo "=== building parsetools (yecc/leex) with the primary bootstrap ==="
+    PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/parsetools" opt
+    export ERL_LIBS="$ERL_TOP/lib"
     # Build kernel, stdlib and compiler in-tree with the primary bootstrap
     # compiler (which now runs on the freshly built OTP-30 emulator). The
     # `primary_bootstrap' target is deliberately NOT used: it also rewrites
