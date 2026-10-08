@@ -56,14 +56,30 @@ these eight directives, the full modelled set:
   `unsupported: boot-script argument term outside the supported literal set` — never a fabricated term.
 - **`execute` boots first** (`Runtime::boot`, idempotent) so `$ROOT` expansion and module loads work on
   a fresh runtime. It **stops at the first directive that cannot run** and returns that typed error.
-- **Never hangs.** It drives the engine's own entry points directly (never `run_scheduler`), so a
-  blocking `receive` folds into the engine's typed `error::blocked()` and an unsupported opcode into a
-  typed `unsupported` — both returned, never awaited. A capability gap is an `error::unsupported` raise.
+- **The two process directives drive the scheduler — bounded, and it never hangs.** A
+  `{kernelProcess, …}` spawns+registers and then runs a **bounded burst** (see below) so a long-lived
+  server reaches its `receive`; an `{apply, …}` runs the export through the engine's blocking-aware
+  entries and drives the scheduler whenever the call suspends, resuming it once a boot-spawned process
+  answers. Both drives go through `drive_scheduler` over the crate-internal `Runtime::pump_scheduler`,
+  with small per-call slice budgets (`KERNEL_BURST_SLICES` 64, `APPLY_BLOCK_SLICES` 256) between
+  deadline checks and **one** wall-clock `DRIVE_DEADLINE` (10 s) shared by the whole `execute` pass,
+  plus a 1 s `KERNEL_BURST_DEADLINE` cap per burst. An exhausted deadline is a typed `error::message`;
+  a blocked apply whose drive ran nothing is the engine's typed `error::blocked()`; a drive stops as
+  soon as a `pump_scheduler` call reports `0`. A capability gap stays an `error::unsupported` raise.
+  A `{kernelProcess, …}` burst deliberately does **not** surface the spawned process's own crash —
+  the directive's contract is spawn+register, so the failure surfaces at the next dependent directive.
 - **Honest M1 stop.** The full real `start.boot` loads every `primLoad` batch (instructions 0–15 all
-  succeed, incl. the three `kernelProcess` spawns) and stops at **instruction 16**,
-  `{apply,{application,load,[{application,stdlib,Props}]}}`, with the runtime's existing preloaded
-  `application:load/*` raise (`BeamError::Raise`, rendered `exit <structured reason>`) — the honest
-  capability gap for `application_controller`, not a wrong value or a hang.
+  succeed, incl. the three `kernelProcess` spawns and their bursts) and stops at **instruction 16**,
+  `{apply,{application,load,[{application,stdlib,Props}]}}`, with a `BeamError::Raise` rendered
+  **`exit noproc`**: its `application_controller:load_application/1` → `gen_server:call/2` finds the
+  controller's registration gone because the controller **died during its burst**, its `proc_lib`
+  start hitting the scheduler-boundary refusal `unsupported: erlang:spawn from inside a scheduler
+  slice` (`../native/process.rs::check_spawnable`). Not a wrong value and not a hang. The chain that
+  would advance it: (1) the `check_spawnable` refusal → so `application_controller` can `proc_lib`-spawn
+  while scheduled; (2) a `gen_server` round trip that survives the process-dictionary divergence —
+  `beam_process::Dict` keys by raw `Eterm` word, so a structurally-equal `$ancestors` key misses; (3)
+  a live `application_controller`/`application:load/*` capable of the remaining `application` startup;
+  (4) `application:start_boot/2` and `c:erlangrc/0`, the script's two later `apply` directives.
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
