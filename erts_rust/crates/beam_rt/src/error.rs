@@ -563,7 +563,47 @@ mod tests {
         assert_eq!(unsupported_reason(&BeamError::BadArg), None);
         assert_eq!(unsupported_reason(&BeamError::SystemLimit), None);
     }
+
     #[test]
+    fn an_abort_round_trips_and_matches_nothing_else() {
+        let abort = abort();
+        assert!(is_abort(&abort));
+        // An abort is terminal but is neither a halt status nor a capability gap …
+        assert_eq!(halt_status(&abort), None);
+        assert_eq!(unsupported_reason(&abort), None);
+        assert_eq!(dump_slogan(&abort), None);
+        // … and only the bare `beam_rt_abort` atom is an abort.
+        assert!(!is_abort(&halt(1)));
+        assert!(!is_abort(&dump("slogan")));
+        assert!(!is_abort(&BeamError::BadArg));
+        assert!(!is_abort(&BeamError::SystemLimit));
+        assert!(!is_abort(&message("boom")));
+        let padded = BeamError::Raise(Raise::exit(ExitReason::atom(String::from(
+            "beam_rt_abort_now",
+        ))));
+        assert!(!is_abort(&padded));
+    }
+
+    #[test]
+    fn a_dump_slogan_round_trips_and_matches_nothing_else() {
+        assert_eq!(dump_slogan(&dump("Probe 1")), Some("Probe 1"));
+        // The empty slogan (`halt([])`) survives the round trip too.
+        assert_eq!(dump_slogan(&dump("")), Some(""));
+        // A slogan is neither a halt status, an abort nor a capability gap.
+        assert_eq!(halt_status(&dump("s")), None);
+        assert!(!is_abort(&dump("s")));
+        assert_eq!(unsupported_reason(&dump("s")), None);
+        // Anything that is not a dump raise is `None` — never a substituted slogan.
+        for other in [halt(1), abort(), BeamError::BadArg, message("boom")] {
+            assert_eq!(dump_slogan(&other), None, "{other}");
+        }
+        // The convention is exact: a reason that merely *starts* with the prefix is not a
+        // dump raise.
+        let padded = BeamError::Raise(Raise::exit(ExitReason::atom(String::from(
+            "beam_rt_dumps",
+        ))));
+        assert_eq!(dump_slogan(&padded), None);
+    }    #[test]
     fn unknown_info_key_is_bare_badarg() {
         assert!(matches!(unknown_info_key("nonsense"), BeamError::BadArg));
         assert_eq!(unknown_info_key("nonsense").as_atom(), Some("badarg"));

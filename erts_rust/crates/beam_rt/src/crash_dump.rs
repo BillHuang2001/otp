@@ -660,7 +660,10 @@ mod tests {
 
     #[test]
     fn immediates_and_boxed_terms_render_in_hex() {
-        assert_eq!(render_term(beam_term::make_small(7)), "=I7");
+        // An immediate is rendered as its **tagged word** in hex (module docs): the small
+        // integer 7 is `(7 << 4) | TAG_IMMED1_SMALL` = 0x7f.
+        assert_eq!(render_term(beam_term::make_small(7)), "=I7f");
+        assert_eq!(render_term(beam_term::make_small(0)), "=If");
         assert!(render_term(beam_term::NIL).starts_with("=I"));
     }
 
