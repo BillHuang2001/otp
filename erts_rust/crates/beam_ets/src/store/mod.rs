@@ -157,25 +157,47 @@ pub struct TermStore {
     tracked: HashMap<Eterm, Vec<AllocSlice>>,
 }
 
-// SAFETY: a `TermStore` is a self-contained owner of term storage. Its blocks are
-// allocated through the `AllocRef` it holds, and `beam_alloc::Allocator` is
-// `Send + Sync + 'static` (see `allocator/trait.rs`), so the same store may be
-// moved to another thread (`Send`) and its blocks may be freed from one. The
-// `NonNull<Eterm>` block bases and the `tracked` map are plain data — no
-// thread-affine resource (no TLS handle, no file descriptor, no `Rc`) — so a move
-// simply reinterprets the same addresses on the destination thread.
+// `unsafe impl`, not derived, because `StoreBlock` holds a `NonNull<Eterm>`: the
+// compiler cannot know the arena is an owned allocation rather than an alias of
+// thread-local or aliased state.
+//
+// SAFETY: a `TermStore` is a self-contained *owner* of term storage, so moving one
+// across threads is a plain address reinterpretation with no thread-affine state
+// to rebind or invalidate. Every field is plain data — `StoreBlock { base:
+// NonNull<Eterm>, capacity, used }`, the block `Vec`, the `live_words` counter and
+// `free_runs`/`pending`/`tracked` (plain `Vec`s/maps of `AllocSlice`/`Eterm`) — and
+// none of them is thread-affine: no TLS handle, no file descriptor, no `Rc`, no
+// `Cell`. `base` points into a block allocated through the store's own
+// `AllocRef = Arc<dyn Allocator>`, and `beam_alloc::Allocator` is declared
+// `Send + Sync + 'static` (`beam_alloc/src/allocator.rs`), so the `Arc` may itself
+// be moved to — and its blocks freed on — the destination thread.
 unsafe impl Send for TermStore {}
 
-// SAFETY: every `&self` method of `TermStore` (`words`/`blocks`/`memory`) only
-// *reads* the block vector's length/base/capacity bookkeeping; none of them
-// writes a word through a block pointer, and none has interior mutability. Every
-// method that hands out or writes storage (`copy`/`free`/`relinquish`/`reset`)
-// takes `&mut self`, so the borrow checker already serialises them. A shared
-// `&TermStore` therefore performs no data race, which is exactly `Sync`. The
-// term-layout writers that *do* write raw heap words (`term`, `copy`) live
-// elsewhere and are likewise confined to `&mut self` entry points.
+// SAFETY: `TermStore` has **no interior mutability**. Every operation that hands
+// out or writes storage — `copy`/`free`/`relinquish`/`reset`, i.e. everything that
+// dereferences a block's `base` — takes `&mut self`, so the borrow checker already
+// serialises it; the only `&self` methods (`words`/`blocks`/`memory`) merely read
+// the block vector's length/base/capacity bookkeeping, never a word through a block
+// pointer and never a field that another thread could be mutating. Sharing the
+// store is only ever reached through `Table`, and `Table` hands out shared access
+// exclusively through `SharedTable`'s `Arc<RwLock<Table>>`: a reader must hold the
+// read guard to obtain the `&Table` (hence `&TermStore`), and a writer takes the
+// same lock exclusively, so no `&TermStore` can overlap a `&mut TermStore` across
+// threads. A shared `&TermStore` therefore performs no data race — which is exactly
+// `Sync`. (The term-layout writers that write raw words through these pointers,
+// `run_addr`/`copy_term` below, are `&mut self` entry points reached from `copy`.)
 unsafe impl Sync for TermStore {}
 
+// Compile-time proof that the two hand-written `unsafe impl`s above stay *sound*:
+// if `TermStore` — or the `AllocRef` block owner it hands blocks to — ever stopped
+// being `Send + Sync`, type-checking this (never-called) closure fails the build,
+// instead of the unsound `unsafe impl` silently surviving. The same assertion is
+// instantiated for `Table`/`SharedTable`/`TermStore` in `tests/ets_shared.rs`.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<TermStore>();
+    assert_send_sync::<AllocRef>();
+};
 impl TermStore {
     /// A store allocating through `alloc`.
     pub fn new(alloc: AllocRef) -> TermStore {
