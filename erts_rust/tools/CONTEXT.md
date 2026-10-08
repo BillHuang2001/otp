@@ -74,8 +74,9 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
   `DOP_*` loopback needs two connected nodes and is not expressible through a single CLI process) and A.9
   (build) through *boot/version observability* only (no self-hosted build). The 8 `unsupported` are
   `wire/new_fun_ext_encode` (an `erl_eval` lambda's closure identity, unclosable without porting
-  `erl_eval`/`erl_scan`/`erl_parse`) plus the seven `wire_ids/*` node-identity cases (`nodes/0,1`,
-  `set_cookie/2`).
+  `erl_eval`/`erl_scan`/`erl_parse`), the five `erlang:statistics/1` counters the runtime does not serve
+  (`proc_signals/statistics_*_unsupported`) and the two `erlang:monitor/2,3` gap shapes
+  (`proc_signals/monitor_3_tag_option_unsupported`, `proc_signals/monitor_port_unsupported`).
 - **No CI wiring (verified):** `.github/` contains no `cargo`/`erts_rust`/`differential` reference, so
   `differential/gate.sh` and `bench` are manual/opt-in commands — nothing enforces the gate automatically.
 - **Other oracle-backed harnesses live outside this node** (each spawns the system `erl` directly, not
