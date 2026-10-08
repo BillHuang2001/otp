@@ -594,6 +594,12 @@ pub(crate) fn run_native_outcome(
 
     let labels = enter_machine(machine, module, arity, args)?;
     let (func, pc) = interpreter::resolve_label(module, entry)?;
+    // Record the run's entry call, exactly as every other run entry does
+    // (`Machine::run_label_outcome`, `run_native_label_outcome`): without it the
+    // export path would leave `Machine::entry_call` unset — the introspection
+    // backing `process_info/2`'s `initial_call`/`current_function` — and report a
+    // different run-entry position than the interpreter for the same module/export.
+    machine.enter_run(module, func);
     drive(machine, module, labels, func, pc, ctx, code)
 }
 
