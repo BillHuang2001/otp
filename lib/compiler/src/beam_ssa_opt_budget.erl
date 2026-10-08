@@ -19,28 +19,39 @@
 %%
 %% %CopyrightEnd%
 %%
-%% Per-SSA-pass time budget, watchdog and eligibility hook.
+%% Per-SSA-pass time budget, watchdog, eligibility hook and per-function
+%% effort model.
 %%
-%% This module provides the framework that bounds how much time the SSA
-%% optimization phases of `beam_ssa_opt' may spend, and that lets a pass
-%% declare a cheap precondition which the driver checks before running it.
-%% Everything here works on OPAQUE state: the state term and the pass fun
-%% are taken and returned unchanged, so this module knows nothing about
-%% `#opt_st{}', block maps or the function database.
+%% This module is the SINGLE decision point for how much time and effort the
+%% SSA optimization phases of `beam_ssa_opt' may spend, at three levels: the
+%% whole compilation (a cumulative budget), a single pass (a watchdog) and a
+%% single function (an effort level plus a wall-clock allowance).
+%% It is also the hook through which a pass declares a cheap precondition.
+%% Everything here works on OPAQUE state except for reading the function id
+%% and the SSA size out of it; the state term and the pass fun are otherwise
+%% taken and returned unchanged.
 %%
 %% == Opt-in, default off ==
 %%
 %% Nothing in this module changes the behaviour of the compiler unless one
 %% of the new compile options is given, and when no option is given
-%% `wrap_fun/4' returns the original pass fun unchanged, so the default
-%% compilation path is `Fun(State)' by construction:
+%% `init/1' erases the state and `wrap_fun/4' returns the original pass fun
+%% unchanged, so the default compilation path is `Fun(State)' by
+%% construction and its output is byte-for-byte identical:
 %%
 %%   {ssa_opt_budget, Millis} / ssa_opt_budget
 %%     Cumulative time budget for the SSA optimization phases. Once the
-%%     budget is exhausted the watchdog driver stops running skippable
-%%     passes and `beam_ssa_opt' stops the fixpoint iteration. This is
-%%     equivalent to lowering `?MAX_REPETITIONS' to zero and to disabling
-%%     every skippable optimization pass: less optimized, equally correct.
+%%     budget is exhausted the driver stops running skippable passes and
+%%     `beam_ssa_opt' stops the fixpoint iteration. This is equivalent to
+%%     lowering `?MAX_REPETITIONS' to zero and to disabling every skippable
+%%     optimization pass: less optimized, equally correct.
+%%     Also enables per-function skipping (see below).
+%%
+%%   {ssa_opt_fn_budget, Millis} / ssa_opt_fn_budget
+%%     Per-function allowance, overriding the size-derived one for every
+%%     function. Enables per-function skipping. `Millis' = 0 exhausts every
+%%     function's allowance immediately, so every skippable pass is skipped
+%%     from the start, which is the "optimizer off from here on" shape.
 %%
 %%   {ssa_opt_watchdog, Millis} / ssa_opt_watchdog
 %%     Upper bound on the wall-clock time of a SINGLE pass. The pass is run
@@ -51,7 +62,46 @@
 %%
 %%   ssa_opt_gates
 %%     Enable the eligibility gates and the statistics without setting a
-%%     budget or a watchdog (useful to check that the gates are sound).
+%%     budget, a per-function allowance or a watchdog (useful to check that
+%%     the gates are sound).
+%%
+%% == Per-function effort model ==
+%%
+%% The effort level of a function is derived from its SSA size alone, where
+%% the size is the number of instructions (the `#b_blk.is' entries of all
+%% blocks of the function, see `function_size/0'): `full' for at most
+%% ?FN_FULL_MAX (500) instructions, `reduced' for at most ?FN_REDUCED_MAX
+%% (5000) instructions and `minimal' above that.
+%% The rationale is that the optimization passes are super-linear in the
+%% size of the function they are handed, so the point of diminishing returns
+%% is reached much earlier for a huge function than for a small one.
+%% A pass that consults `effort/0' can therefore drop its most expensive
+%% transformation for a `reduced' or `minimal' function while still doing
+%% the cheap and the local ones, which is what bounds a huge function.
+%% The number of blocks is reported to `classify/2' but does NOT influence
+%% the thresholds or the allowance, which are computed from the number of
+%% instructions alone.
+%%
+%% == Per-function allowance ==
+%%
+%% Each function also gets a wall-clock allowance of
+%% `max(?FN_MIN_MS, ?FN_BASE_MS - Size div ?FN_INSTRS_PER_MS)' milliseconds,
+%% i.e. of 50 ms at the least and of 500, 475, ... 50 ms as the size grows
+%% (?FN_BASE_MS = 500, ?FN_MIN_MS = 50, ?FN_INSTRS_PER_MS = 20).
+%% A tiny function therefore gets the full 500 ms and a 9000-instruction
+%% function or larger hits the 50 ms floor.
+%% The allowance thus shrinks with the size of the function and is floored,
+%% so a huge function cannot blow up compile time: the bigger the function,
+%% the less time it gets.
+%% The allowance is fixed the first time the framework sees a function, when
+%% the deadline `now + allowance' is recorded in the process dictionary
+%% together with the size and the level; the deadline never moves forward,
+%% so the set of passes a function still *gets* may shrink but can never
+%% grow, for the life of the compilation, across phases and fixpoint
+%% repetitions.
+%% `{ssa_opt_fn_budget,Millis}' replaces the size-derived allowance with
+%% `Millis' for every function; it accepts only a non-negative integer and
+%% any other value falls back to the size-derived allowance.
 %%
 %% == Which passes may be skipped ==
 %%
@@ -77,6 +127,22 @@
 %%     lists the passes that are never part of such a suffix because
 %%     skipping them leaves the state inconsistent even then.
 %%
+%%   * The per-function allowance removes a SUFFIX of the skippable passes
+%%     of that *function*, for the same reason: its deadline is monotone as
+%%     well, so a function that runs out of its allowance simply stops being
+%%     further optimized, exactly as if `no_ssa_opt' had been given for it.
+%%     Functions are optimized independently of each other (each one owns
+%%     its own state in the state map and no pass requires two functions to
+%%     be equally optimized), so one function's suffix going unrun cannot
+%%     make another function's state inconsistent. The per-function bound is
+%%     only consulted when per-function skipping is enabled, i.e. when a
+%%     cumulative budget or an explicit per-function allowance was given;
+%%     with `ssa_opt_gates' alone the output is unchanged, and the per-pass
+%%     `no_<pass>' kill switches remain the way to turn single passes off.
+%%     A pass that is not marked skippable is NEVER skipped, and a skipped
+%%     pass is always skipped together with the rest of the suffix; no
+%%     middle pass of a function is ever dropped on its own.
+%%
 %%   * The eligibility gates only skip a pass whose own cheap precondition
 %%     proves that it could not have changed anything, which is exactly "the
 %%     pass did nothing".
@@ -93,23 +159,76 @@
 %% The per-compilation state lives in the process dictionary of the process
 %% that runs `beam_ssa_opt:module/2' (the compiler process, unless
 %% `no_spawn_compiler_process' is given, see `compile:file/2'). It is
-%% initialized by `init/1' and observed with `get_stats/0'. A watchdog child
-%% starts with a copy of the parent's process dictionary, so a pass that
-%% reads process-dictionary state (for example the FBIP flag `$fbip_opt' set
-%% by `beam_ssa_opt:late_epilogue_passes/1') sees exactly what it would have
-%% seen when run in the parent.
-
+%% initialized by `init/1', updated by `run/5' and observed with
+%% `get_stats/0' and the `function_size/0' / `function_budget/0' /
+%% `function_over_budget/0' / `effort/0' / `remaining/0' queries. A watchdog
+%% child starts with a copy of the parent's process dictionary, so a pass
+%% that reads process-dictionary state (for example the FBIP flag
+%% `$fbip_opt' set by `beam_ssa_opt:late_epilogue_passes/1') sees exactly
+%% what it would have seen when run in the parent.
+%%
+%% == Query surface for the opt-in passes ==
+%%
+%% The passes this framework exists for are the opt-in `beam_ssa_loop_opt'
+%% (`loop_opt'), `beam_ssa_fus' (`fusion_opt') and `beam_ssa_fbip'
+%% (`fbip_opt'); they should use the framework like this:
+%%
+%%   * Call `effort/0' once at entry. It is `undefined' when the machinery
+%%     is off, which means "do everything as before"; `none' means that the
+%%     global budget is exhausted and the pass should do nothing at all;
+%%     `full' means "do everything"; for `reduced' or `minimal' the pass
+%%     should skip its expensive transformation (for example a whole-
+%%     function analysis or a multi-key rewrite) and keep only the cheap,
+%%     local rewrites. `function_over_budget/0' tells whether it is the
+%%     current function's own allowance (rather than the compilation's
+%%     budget) that is exhausted.
+%%   * Use `over_budget/0' / `remaining/0' to bail out early from a pass
+%%     that is already running on a huge function instead of running an
+%%     O(n^2) analysis to completion.
+%%   * Use `function_size/0' and `function_budget/0' when a pass wants to
+%%     report or budget against the size of the function it is handed
+%%     instead of using the fixed effort levels.
+%%   * `classify/2' is pure and exported so that the model can be exercised
+%%     directly; passes do not need it.
+%%   * A pass invoked from inside another pass (the FBIP pass, run by
+%%     `beam_ssa_destructive_update:opt/2') goes through `run/5' like any
+%%     other pass and is therefore bounded and skipped in the same way.
+%%
+%% == Statistics ==
+%%
+%% `get_stats/0' reports the counters of the most recent compilation:
+%% `ran', `gated', `over_budget' (skipped because the cumulative budget was
+%% exhausted), `function_over_budget' (skipped because the current
+%% function's own allowance was exhausted), `timed_out', `effort' (how many
+%% distinct functions were first classified at each level) and `passes' (the
+%% same counters per pass). The counters are only collected when the
+%% machinery is enabled.
 -module(beam_ssa_opt_budget).
 -moduledoc false.
 
--export([init/1, enabled/0, wrap_fun/4, run/5, over_budget/0, get_stats/0]).
+-export([init/1, enabled/0, wrap_fun/4, run/5, over_budget/0, get_stats/0,
+         remaining/0, function_size/0, function_budget/0,
+         function_over_budget/0, effort/0, classify/2]).
 
--export_type([stats/0, gate/0]).
+-export_type([stats/0, gate/0, effort/0]).
+
+-include("beam_ssa.hrl").
+-import_record(beam_ssa_opt, [opt_st]).
 
 %% Default cumulative budget and per-pass watchdog, in milliseconds, used
 %% when the option is given without an explicit value.
 -define(DEFAULT_BUDGET_MS, 5000).
 -define(DEFAULT_WATCHDOG_MS, 1000).
+
+%% Size thresholds of the per-function effort model, in instructions.
+-define(FN_FULL_MAX, 500).
+-define(FN_REDUCED_MAX, 5000).
+
+%% Per-function time allowance: `max(?FN_MIN_MS,
+%% ?FN_BASE_MS - Size div ?FN_INSTRS_PER_MS)' milliseconds.
+-define(FN_BASE_MS, 500).
+-define(FN_MIN_MS, 50).
+-define(FN_INSTRS_PER_MS, 20).
 
 %% Process-dictionary key holding the per-compilation state.
 -define(KEY, '$ssa_opt_budget').
@@ -120,19 +239,32 @@
 %% declares no precondition and is always run.
 -type gate() :: undefined | fun((state()) -> boolean()).
 
+%% The effort a function is allowed. `none' means "do nothing at all".
+-type effort() :: full | reduced | minimal | none.
+
+%% The SSA size of a function: number of blocks and total number of
+%% instructions.
+-type size() :: {Blocks :: non_neg_integer(),
+                 Instructions :: non_neg_integer()}.
+
 -type pass_stats() :: #{ran := non_neg_integer(),
                         gated := non_neg_integer(),
                         over_budget := non_neg_integer(),
+                        function_over_budget := non_neg_integer(),
                         timed_out := non_neg_integer()}.
 
 -type stats() :: #{ran := non_neg_integer(),
                    gated := non_neg_integer(),
                    over_budget := non_neg_integer(),
+                   function_over_budget := non_neg_integer(),
                    timed_out := non_neg_integer(),
+                   effort := #{full := non_neg_integer(),
+                               reduced := non_neg_integer(),
+                               minimal := non_neg_integer()},
                    passes := #{atom() => pass_stats()}}.
 
--define(ZERO_PASS_STATS, #{ran => 0, gated => 0,
-                           over_budget => 0, timed_out => 0}).
+-define(ZERO_PASS_STATS, #{ran => 0, gated => 0, over_budget => 0,
+                           function_over_budget => 0, timed_out => 0}).
 
 %%============================================================================
 %% Setup
@@ -145,25 +277,35 @@
 init(Opts) ->
     Budget = opt_ms(ssa_opt_budget, ?DEFAULT_BUDGET_MS, Opts),
     Watchdog = opt_ms(ssa_opt_watchdog, ?DEFAULT_WATCHDOG_MS, Opts),
+    FnBudget = opt_ms(ssa_opt_fn_budget, ?FN_BASE_MS, Opts),
     Gates = lists:member(ssa_opt_gates, Opts),
-    case {Budget, Watchdog, Gates} of
-        {infinity, infinity, false} ->
+    case {Budget, Watchdog, FnBudget, Gates} of
+        {infinity, infinity, infinity, false} ->
             erase(?KEY),
             ok;
         _ ->
             Deadline = case Budget of
                            infinity -> infinity;
-                           Ms -> erlang:monotonic_time(millisecond) + Ms
+                           Ms -> now_ms() + Ms
                        end,
+            %% Per-function skipping is only enabled by an explicit bound:
+            %% either the cumulative budget or the per-function allowance.
+            %% With the gates alone (or the watchdog alone) the per-function
+            %% deadlines are recorded and reported, but never acted upon.
+            FnSkip = Budget =/= infinity orelse FnBudget =/= infinity,
             put(?KEY, #{deadline => Deadline,
                         watchdog => Watchdog,
+                        fn_budget => FnBudget,
+                        fn_skip => FnSkip,
+                        fns => #{},
+                        current => undefined,
                         stats => new_stats()}),
             ok
     end.
 
 %% Read a millisecond option. `Key' means "enabled with the default value",
 %% `{Key,Millis}' sets an explicit value, and an absent option means
-%% `infinity' (disabled).
+%% `infinity' (disabled). An unusable value falls back to the default.
 opt_ms(Key, Default, Opts) ->
     case proplists:get_value(Key, Opts, undefined) of
         undefined -> infinity;
@@ -180,13 +322,24 @@ enabled() ->
 %% True once the cumulative budget has been exhausted.
 -spec over_budget() -> boolean().
 over_budget() ->
+    case global_deadline() of
+        infinity -> false;
+        Deadline -> now_ms() >= Deadline
+    end.
+
+%% Milliseconds left in the cumulative budget, or `infinity' when there is
+%% no cumulative budget.
+-spec remaining() -> infinity | non_neg_integer().
+remaining() ->
+    case global_deadline() of
+        infinity -> infinity;
+        Deadline -> max(0, Deadline - now_ms())
+    end.
+
+global_deadline() ->
     case get(?KEY) of
-        #{deadline := infinity} ->
-            false;
-        #{deadline := Deadline} ->
-            erlang:monotonic_time(millisecond) >= Deadline;
-        _ ->
-            false
+        #{deadline := Deadline} -> Deadline;
+        _ -> infinity
     end.
 
 %% Return the statistics of the most recent compilation that had the
@@ -200,12 +353,169 @@ get_stats() ->
     end.
 
 %%============================================================================
+%% Per-function effort model
+%%============================================================================
+
+%% Classify a function by its SSA size and return the effort level it is
+%% allowed together with the time allowance (in milliseconds) that level
+%% implies. The number of blocks is part of the size description, but both
+%% the thresholds and the allowance are computed from the number of
+%% instructions alone (see the module comment). Pure: the function does not
+%% read any state, so it can be exercised directly.
+-spec classify(Blocks :: non_neg_integer(), Instructions :: non_neg_integer()) ->
+          {full | reduced | minimal, non_neg_integer()}.
+classify(_Blocks, Instructions) when is_integer(Instructions) ->
+    Size = max(0, Instructions),
+    Level = if
+                Size =< ?FN_FULL_MAX -> full;
+                Size =< ?FN_REDUCED_MAX -> reduced;
+                true -> minimal
+            end,
+    {Level, max(?FN_MIN_MS, ?FN_BASE_MS - Size div ?FN_INSTRS_PER_MS)}.
+
+%% The size of the function the framework most recently saw, or `undefined'
+%% when the machinery is disabled or no function has been seen yet.
+-spec function_size() -> size() | undefined.
+function_size() ->
+    case get(?KEY) of
+        #{current := {_Id, Size}} -> Size;
+        _ -> undefined
+    end.
+
+%% The time allowance (milliseconds) of the current function, or
+%% `undefined' when the machinery is disabled or no function has been seen.
+-spec function_budget() -> non_neg_integer() | undefined.
+function_budget() ->
+    case fn_entry() of
+        #{allowance := Ms} -> Ms;
+        _ -> undefined
+    end.
+
+%% True when the current function's own allowance is exhausted. Never true
+%% while the machinery is disabled or before the first function is seen.
+-spec function_over_budget() -> boolean().
+function_over_budget() ->
+    case fn_entry() of
+        #{deadline := Deadline} -> now_ms() >= Deadline;
+        _ -> false
+    end.
+
+%% The effort allowed for the current function. `undefined' when the
+%% machinery is disabled or no function has been seen yet, `none' when the
+%% cumulative budget is exhausted (nothing is allowed any more), otherwise
+%% the level the current function was classified at.
+-spec effort() -> effort() | undefined.
+effort() ->
+    case get(?KEY) of
+        #{} ->
+            case over_budget() of
+                true -> none;
+                false ->
+                    case fn_entry() of
+                        #{level := Level} -> Level;
+                        _ -> undefined
+                    end
+            end;
+        _ ->
+            undefined
+    end.
+
+%% The per-function bookkeeping of the current function, or `undefined'.
+fn_entry() ->
+    case get(?KEY) of
+        #{current := {Id, _Size}, fns := Fns} -> maps:get(Id, Fns, undefined);
+        _ -> undefined
+    end.
+
+fn_skipping_active() ->
+    case get(?KEY) of
+        #{fn_skip := Skip} -> Skip;
+        _ -> false
+    end.
+
+%% Take note of the function the pass fun was handed: extract its id and its
+%% SSA size, classify it when it is seen for the first time, and remember
+%% the size as "the size of the most recently seen function". Robust by
+%% construction: an unexpected state shape yields the id `undefined' and the
+%% size `{0,0}' instead of an exception.
+observe(State) ->
+    case get(?KEY) of
+        undefined ->
+            ok;
+        BudgetState ->
+            {Id, Size} = fn_info(State),
+            put(?KEY, observe_1(Id, Size, BudgetState))
+    end.
+
+observe_1(Id, Size, #{fns := Fns} = State) ->
+    case is_map_key(Id, Fns) of
+        true ->
+            State#{current := {Id, Size}};
+        false ->
+            Fn = new_fn(Size, State),
+            Stats = bump_effort(Fn, maps:get(stats, State)),
+            State#{fns := Fns#{Id => Fn},
+                   current := {Id, Size},
+                   stats := Stats}
+    end.
+
+%% The per-function entry recorded the first time a function is seen. The
+%% deadline is fixed here and never revised, which is what makes the skipped
+%% set a monotone suffix of the function's passes.
+new_fn(Size, State) ->
+    {Blocks, Instructions} = Size,
+    {Level, Default} = classify(Blocks, Instructions),
+    Allowance = case maps:get(fn_budget, State) of
+                    infinity -> Default;
+                    Ms -> Ms
+                end,
+    #{deadline => now_ms() + Allowance,
+      allowance => Allowance,
+      size => Size,
+      level => Level}.
+
+bump_effort(#{level := Level}, Stats) ->
+    Effort0 = maps:get(effort, Stats),
+    Effort = Effort0#{Level => maps:get(Level, Effort0) + 1},
+    Stats#{effort := Effort}.
+
+%% The function id and the SSA size carried by the pass state. Only the
+%% function-level state `{#opt_st{},FuncDb}' carries them; anything else
+%% yields `{undefined,{0,0}}'.
+fn_info(State) ->
+    try
+        {#opt_st{ssa=Ssa, anno=Anno}, _FuncDb} = State,
+        %% `Anno' is the function's anno map; `func_info' is the entry
+        %% `beam_ssa_opt:get_func_id/1' reads. (`beam_ssa:get_anno/2' takes
+        %% a construct, not a bare anno map.)
+        {maps:get(func_info, Anno, undefined), ssa_size(Ssa)}
+    catch
+        _:_ -> {undefined, {0, 0}}
+    end.
+
+%% The number of blocks and the total number of instructions of a
+%% function's SSA, which is either a linear block list or a block map.
+ssa_size(Ssa) when is_map(Ssa) ->
+    maps:fold(fun(_Label, Blk, Acc) -> size_add(Blk, Acc) end, {0, 0}, Ssa);
+ssa_size(Ssa) when is_list(Ssa) ->
+    lists:foldl(fun({_Label, Blk}, Acc) -> size_add(Blk, Acc) end, {0, 0}, Ssa);
+ssa_size(_Ssa) ->
+    {0, 0}.
+
+size_add(Blk, {Blocks, Instructions}) ->
+    {Blocks + 1, Instructions + blk_size(Blk)}.
+
+blk_size(#b_blk{is=Is}) when is_list(Is) -> length(Is);
+blk_size(_Blk) -> 0.
+
+%%============================================================================
 %% Wrapping a pass
 %%============================================================================
 
-%% Wrap a pass fun so that the eligibility gate, the cumulative budget and
-%% the per-pass watchdog are honoured. When the machinery is disabled the
-%% original fun is returned, so the default path is untouched.
+%% Wrap a pass fun so that the eligibility gate, the cumulative budget, the
+%% per-function allowance and the per-pass watchdog are honoured. When the
+%% machinery is disabled the original fun is returned, so the default path
+%% is untouched.
 %%
 %% `Skippable' is false for passes that must always run.
 -spec wrap_fun(atom(), fun((state()) -> state()), gate(), boolean()) ->
@@ -218,9 +528,10 @@ wrap_fun(Name, Fun, Gate, Skippable) ->
             fun(State) -> run(Name, Fun, Gate, Skippable, State) end
     end.
 
-%% Run one pass under the eligibility gate, the cumulative budget and the
-%% watchdog. Also used directly by passes that are invoked from another pass
-%% rather than from a phase pass list (the opt-in FBIP pass).
+%% Run one pass under the eligibility gate, the cumulative budget, the
+%% per-function allowance and the watchdog. Also used directly by passes that
+%% are invoked from another pass rather than from a phase pass list (the
+%% opt-in FBIP pass).
 -spec run(atom(), fun((state()) -> state()), gate(), boolean(), state()) ->
           state().
 run(Name, Fun, Gate, Skippable, State) ->
@@ -228,19 +539,41 @@ run(Name, Fun, Gate, Skippable, State) ->
         undefined ->
             Fun(State);
         _ ->
+            observe(State),
             case gate_ok(Gate, Name, State) of
                 true ->
-                    case Skippable andalso over_budget() of
-                        true ->
+                    case skip_reason(Skippable) of
+                        none ->
+                            timed_run(Name, Fun, Skippable, State);
+                        global ->
                             bump(over_budget, Name),
                             State;
-                        false ->
-                            timed_run(Name, Fun, Skippable, State)
+                        function ->
+                            bump(function_over_budget, Name),
+                            State
                     end;
                 false ->
                     %% The pass cannot fire for this state; skipping it is
                     %% equivalent to running it.
                     State
+            end
+    end.
+
+%% Why a pass is skipped, if it may be skipped at all. A pass that is not
+%% skippable is never skipped, whatever the bounds say (see the module
+%% comment). The cumulative budget is checked first, so a skip caused by the
+%% compilation's budget is counted as such even when the function's own
+%% allowance happens to be exhausted as well.
+skip_reason(false) ->
+    none;
+skip_reason(true) ->
+    case over_budget() of
+        true ->
+            global;
+        false ->
+            case fn_skipping_active() andalso function_over_budget() of
+                true -> function;
+                false -> none
             end
     end.
 
@@ -336,7 +669,10 @@ child(Parent, Ref, Env, Fun, State) ->
 %%============================================================================
 
 new_stats() ->
-    #{ran => 0, gated => 0, over_budget => 0, timed_out => 0, passes => #{}}.
+    #{ran => 0, gated => 0, over_budget => 0, function_over_budget => 0,
+      timed_out => 0,
+      effort => #{full => 0, reduced => 0, minimal => 0},
+      passes => #{}}.
 
 bump(Key, Name) ->
     case get(?KEY) of
@@ -353,3 +689,10 @@ bump_1(Key, Name, State) ->
     Passes = Passes0#{Name => Pass0#{Key => maps:get(Key, Pass0) + 1}},
     Stats = Stats0#{Key => maps:get(Key, Stats0) + 1, passes => Passes},
     State#{stats := Stats}.
+
+%%============================================================================
+%% Time
+%%============================================================================
+
+now_ms() ->
+    erlang:monotonic_time(millisecond).
