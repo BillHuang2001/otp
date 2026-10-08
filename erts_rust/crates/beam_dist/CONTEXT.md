@@ -170,6 +170,16 @@ Crate constants: `DIST_VERSION: u16 = 6`, `DIST_VERSION_5: u16 = 5`, `EPMD_PORT:
 - The authentication seam: `trait ChallengeDigest { fn digest(&self, cookie, challenge) -> [u8;16] }`,
   `trait ChallengeSource { fn next_challenge(&self) -> u32 }`, `verify_digest(got, our_challenge,
   cookie, d)`. The concrete MD5 provider is [`crate::auth::Md5Digest`].
+- Status classification (a *value* type, not a new error enum): `enum StatusKind { Ok, Simultaneous,
+  Named, Nok, NotAllowed, Alive, Other }`, `Status::kind()`,
+  `Status::error_kind() -> Option<StatusKind>` (the error kinds only), `Status::not_allowed()`/
+  `Status::nok()`, and the single shared `status_error(&Status) -> BeamError` mapping (used by both
+  `connection.rs` and `driver.rs`).
+- Node visibility: `enum PeerVisibility { Normal, Hidden }`, `publish_type(flags: DistFlags) ->
+  PeerVisibility` (reads `DFLAG_PUBLISHED`), `publish_flag(hidden: bool, published: bool) -> DistFlags`,
+  `enum PublishKind { Normal, Hidden }` + `PublishKind::publish_flag(published) -> DistFlags`.
+  `preferred_flags()` stays `DFLAG_DIST_DEFAULT` (the per-connection `publish_flag` piece is the
+  override). `struct Handshake { …, peer_visibility: PeerVisibility }`.
 
 ### `src/auth.rs` — MD5 challenge/response authentication (safe, no external dep)
 - `pub fn md5(data: &[u8]) -> [u8; 16]` — self-contained RFC 1321.
