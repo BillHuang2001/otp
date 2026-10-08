@@ -28,38 +28,52 @@ pub const MAX_REGISTER: u32 = 1024;
 /// to `0..=1023` (`../../erts/emulator/beam/jit/x86/beam_asm.hpp`).
 pub const MAX_FLOAT_REGISTER: u32 = 1024;
 
-/// The all-[`NIL`](beam_term::NIL) template the register files are refilled from.
+/// The all-[`NIL`](beam_term::NIL) template the register files are refilled from,
+/// and the word count that [`fill_nil`] copies at a time.
 ///
 /// [`Machine::reset`] rewrites the whole x-register file (`max_register` words) and
 /// the whole FR file ([`MAX_FLOAT_REGISTER`] words) on **every** run, so the refill
-/// is on the per-run critical path: `memcpy` out of this static — which is small
-/// enough to stay resident in L1 and is copied by the platform's optimized
-/// `memcpy` — is measurably (≈2.5x) faster than a same-shaped `fill`/store loop
-/// compiled at the crate's own optimization level, and it is exactly as safe: the
-/// destination is overwritten word-for-word with [`beam_term::NIL`], the very value
-/// `fill` would have stored.
+/// is on the per-run critical path. 16 words is 128 bytes — the widest
+/// `copy_from_slice` the optimizer still expands *inline* into wide moves, and it is
+/// read repeatedly, so it stays resident in L1.
 ///
 /// It is deliberately **not** a `Machine` field: a per-machine buffer would double
 /// the memory traffic (one copy into the buffer, one out of it) and would have to be
 /// allocated, whereas a shared read-only table is cached once and read forever.
-static NIL_FILE: [Eterm; MAX_REGISTER as usize] = [Eterm::nil(); MAX_REGISTER as usize];
+const NIL_CHUNK_WORDS: usize = 16;
+
+/// The template itself; see [`NIL_CHUNK_WORDS`].
+static NIL_CHUNK: [Eterm; NIL_CHUNK_WORDS] = [Eterm::nil(); NIL_CHUNK_WORDS];
 
 /// Overwrite every slot of `slots` with [`beam_term::NIL`].
 ///
-/// A `memcpy` from [`NIL_FILE`], chunked so any slice length (in particular a
-/// register file made larger than [`MAX_REGISTER`] by
-/// [`Machine::with_max_register`]) is handled without panicking; the common case —
-/// a file no larger than [`MAX_REGISTER`] — is a single `memcpy`.
+/// The shape is the whole point (the alternative formulations were measured
+/// interleaved in one process, refilling the two 1024-word files):
+///
+/// * a plain `fill` (or `clear` + `resize`) store loop is up to ~1.9x **slower** —
+///   the optimizer emits narrow stores for it;
+/// * one `memcpy` per file (or a chunk wider than 128 bytes) is **bimodal**: the
+///   optimizer turns it into a call to the platform `memcpy`, which is 2.5x faster
+///   in some processes and ~1.15x *slower* in others (98 ns vs 375 ns for the two
+///   files) depending on the run's code path / address layout — a per-run floor
+///   that varies with `memcpy` is not something the interpreter should pay;
+/// * this 128-byte chunked copy is the fastest *and* the most stable of the three
+///   (177-188 ns vs 279-346 ns for the two files, in every measured run): the copy
+///   is expanded inline into wide moves, with no `memcpy` call and no dependence on
+///   where the destination happened to be allocated.
+///
+/// The remainder path (a register file smaller than one chunk, i.e. any
+/// `Machine::with_max_register(n)` with `n < NIL_CHUNK_WORDS`) makes the function
+/// total: it handles any slice length without panicking.
 #[inline]
 fn fill_nil(slots: &mut [Eterm]) {
-    let mut rest = slots;
-    while !rest.is_empty() {
-        let take = rest.len().min(NIL_FILE.len());
-        let (head, tail) = rest.split_at_mut(take);
-        head.copy_from_slice(&NIL_FILE[..take]);
-        rest = tail;
+    let mut chunks = slots.chunks_exact_mut(NIL_CHUNK_WORDS);
+    for chunk in &mut chunks {
+        chunk.copy_from_slice(&NIL_CHUNK);
     }
+    chunks.into_remainder().fill(Eterm::default());
 }
+
 impl Machine {
     /// Read X register `n`, or `None` if it is outside the register file.
     ///
@@ -118,9 +132,10 @@ impl Machine {
     /// it is written as the cheapest *correct* full reset:
     ///
     /// * the register/FR files are **refilled in one pass** by [`fill_nil`] (a
-    ///   `memcpy` of [`NIL_FILE`]); a `clear()` followed by a `resize()` writes the
-    ///   very same words but through a store loop rather than the platform's
-    ///   optimized `memcpy` (measured ≈2.5x slower for the two files together);
+    ///   128-byte chunked copy of [`NIL_CHUNK`]), which is 1.7-2x faster than the
+    ///   `clear()` + `resize()` store loop it replaced (measured 150-175 ns vs
+    ///   252-345 ns for the two files, interleaved in one process) — see
+    ///   [`fill_nil`] for why the shape is what it is;
     /// * a capacity that is already correct is **never reallocated** — the vectors
     ///   are only resized when their length differs from the target (which happens
     ///   once, for the first reset after `Machine::with_max_register`, and never
