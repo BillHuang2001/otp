@@ -290,9 +290,13 @@ Turns a decoded [`ControlMessage`] into its **semantic** delivery and routes it 
 - `enum Delivery { Send{from,to,message,token}, RegSend{from,cookie,name,message,token},
   AliasSend{..}, Link{..}, Exit{..}, Exit2{..}, UnlinkId{id,from,to}, UnlinkIdAck{..},
   Monitor{watcher,watched,reference}, Demonitor{..}, MonitorExit{..}, GroupLeader{from,to},
-  Other(Dop) }` + `Delivery::dop()` and `Delivery::classify(&ControlMessage) -> Result<Delivery>`
-  (argument order from `dist.c`; a recognised-but-unclassified opcode — spawn/payload-exit/
-  altact-sig/`DOP_UNLINK` — is `Other(dop)`, never a substituted send).
+  PayloadExit{..}, PayloadExit2{..}, PayloadMonitorExit{..}, SpawnRequest{..}, SpawnReply{..},
+  AltactSigSend{..}, Other(Dop) }` + `Delivery::dop()` and `Delivery::classify(&ControlMessage) ->
+  Result<Delivery>` (argument order from `dist.c`; **all 30 opcodes are classified** — the only
+  `Other(dop)` is `DOP_UNLINK`, which the C itself *rejects* (`dist.c:2277-2282`), never a substituted
+  send). The `SpawnRequest`/`SpawnReply`/`AltactSigSend` variants carry the typed
+  `DistSpawnFlags`/`AltactSigFlags`; an out-of-range flag (`>= 1 << 27`) or a non-small/negative altact
+  flag is an honest `BadArg`.
 - `enum DeliveryOutcome { Delivered, NoSuchProcess, Unsupported, Dropped }`,
   `struct Dispatched { delivery, outcome }`.
 - `trait InboundSink { fn deliver(&mut self, &Delivery) -> Result<DeliveryOutcome> }` — **defaulted**
