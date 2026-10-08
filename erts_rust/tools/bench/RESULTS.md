@@ -260,7 +260,7 @@ Caveats an honest reading requires:
 6. **`foreign` `wall_ms` is not comparable across runtimes** — each side runs a different `N`. Compare `ns/call` and `startup_ms`.
 7. **`foreign` peak RSS is not a like-for-like memory comparison.** `beam_rt` does not yet drive a garbage collector, so a looping program accumulates garbage in proportion to its loop count `N`, and the rust `foreign` rows run at large `N` — giving a rust per-case peak RSS of **78 708 736–109 623 296 B (75.1–104.5 MiB)** that is *higher* than the sys figures on the same cases (69 287 936–69 953 536 B). Same-`N` memory is unchanged; the row moves with the calibration. Use `slice` (§3.3, one call per process) as the comparable per-process memory metric: rust 18.2–36.9 MiB vs sys 66.0–66.7 MiB.
 
-### Archived artifacts
+## Archived artifacts
 
 | file | contents |
 |---|---|
