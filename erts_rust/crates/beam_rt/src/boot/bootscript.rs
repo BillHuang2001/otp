@@ -37,22 +37,47 @@
 //!
 //! [`execute`] walks the instructions in order and returns the first error it meets —
 //! loading a module that is not on the code path, spawning a process whose function is not
-//! exported, or applying an MFA the runtime cannot run. This is the honest M1 behaviour for
+//! exported, or applying an MFA the runtime cannot run. This is the honest behaviour for
 //! a real `start.boot`: it loads every `primLoad` batch and then stops at the first
-//! directive that needs machinery M1 does not have (`application:load/1`, say).
+//! directive that needs machinery this runtime does not have.
 //!
-//! It **never hangs**: it drives the engine's own entry points directly
-//! (never [`Runtime::run_scheduler`](crate::runtime::Runtime::run_scheduler)), so a
-//! blocking `receive` is folded into the engine's typed `error::blocked()` and an
-//! unsupported opcode into a typed `unsupported` — both returned, never awaited.
-
+//! # The directives that run processes advance the scheduler
+//!
+//! The two directives that involve a process — [`Instruction::KernelProcess`] and
+//! [`Instruction::Apply`] — are what make `init`'s sequence more than a list of loads, and
+//! this executor really drives the runtime's **scheduler**
+//! ([`Runtime::pump_scheduler`](crate::runtime::Runtime::pump_scheduler)) for them:
+//!
+//! * a `{kernelProcess, …}` spawns **and registers** its process and then drives a
+//!   **bounded burst** of scheduler slices, so a long-lived kernel server
+//!   (`heart`, `logger_server`, `application_controller`) can take its first steps —
+//!   typically reaching its `receive` — before a later directive talks to it. The
+//!   directive's contract is spawn+register, so a process that crashes during the burst is
+//!   **not** this directive's error: the failure surfaces at the next directive that
+//!   depends on it;
+//! * an `{apply, {M,F,A}}` runs `M:F(A...)` **as this runtime's own process** (the identity
+//!   [`Runtime::eval`](crate::runtime::Runtime::eval) uses, so its process-dictionary side
+//!   effects stay observable), but through the engine's blocking-aware entries: when the
+//!   call suspends in a `receive` waiting for a boot-spawned process, the scheduler is
+//!   driven and the call is resumed, exactly as
+//!   [`Runtime::run_scheduled`](crate::runtime::Runtime::run_scheduled) resumes a blocked
+//!   workload. A call the runtime's own non-blocking dispatch chain serves — a NIF, the
+//!   runtime-native floor, a registered `beam_bifs` BIF — is *not* a module export and is
+//!   dispatched there instead (see [`apply_boot_call`]).
+//!
+//! Every drive is **bounded**: a per-`pump_scheduler` slice budget between deadline checks
+//! and one wall-clock [`DRIVE_DEADLINE`] per [`execute`], so the boot can never hang. When
+//! the deadline expires the drive reports a typed [`error::message`] rather than waiting
+//! forever; when a blocked apply has nothing left that could wake it, the engine's own
+//! typed [`beam_engine::blocked`] is reported.
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
-use beam_engine::{terms, ExecutionContext};
+use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
 use beam_term::{
     atom_val, is_atom, is_list, is_nil, is_small, make_small, signed_value, AtomTable, Eterm,
 };
@@ -61,6 +86,36 @@ use crate::context::RuntimeContext;
 use crate::error;
 use crate::runtime::Runtime;
 
+/// How long one scheduler drive the boot script performs may run before the boot gives up.
+///
+/// This is the executor's [`RUN_DEADLINE`](crate::runtime::Runtime) counterpart — one
+/// wall-clock bound for the whole [`execute`] pass, shared by every `{kernelProcess, …}`
+/// burst and every `{apply, …}` block wait it performs — so a boot script can never hang the
+/// runtime, however long a scheduler-driven process stays runnable. The bound is a safety
+/// net, not the normal path: a drive ends as soon as a `pump_scheduler` call reports that
+/// nothing ran (see [`drive_scheduler`]).
+const DRIVE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long the **bounded burst** after a `{kernelProcess, …}` spawn may run.
+///
+/// A kernel process is a long-lived server: `heart`, `logger_server` and
+/// `application_controller` all start with `proc_lib` and then settle into a `receive`, so
+/// the burst only needs to carry each one that far. It therefore stops early (usually after
+/// a handful of slices, when the run queue drains) and is capped by this short deadline as
+/// well as by the boot's overall [`DRIVE_DEADLINE`].
+const KERNEL_BURST_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The per-`pump_scheduler`-call slice budget of a `{kernelProcess, …}` burst.
+///
+/// The budget is deliberately small so the burst's deadline is always reachable and each
+/// directive's burst stays a *burst* rather than a scheduler pass of its own.
+const KERNEL_BURST_SLICES: u64 = 64;
+
+/// The per-`pump_scheduler`-call slice budget of an `{apply, …}` block wait.
+///
+/// The apply is waiting for a boot-spawned process to *answer* it, so a step has to be long
+/// enough to carry a `gen_server` round trip; the deadline is checked between steps.
+const APPLY_BLOCK_SLICES: u64 = 256;
 /// A parsed boot script: its `{Name, Vsn}` header and its ordered instructions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootScript {
@@ -173,8 +228,12 @@ pub fn read(path: &Path) -> Result<BootScript> {
 /// * a [`Value::Other`] argument is a typed capability gap (it cannot be rebuilt faithfully);
 /// * [`Instruction::Progress`]/[`Instruction::KernelLoadCompleted`] are informational and
 ///   never fail;
-/// * a `{apply, ...}` that blocks, or whose code needs an opcode M1 does not execute,
-///   returns the engine's typed error instead of hanging.
+/// * a `{kernelProcess, …}` spawns and registers its process and then drives a bounded
+///   scheduler burst; a `{apply, …}` runs `M:F(A...)` as this runtime's own process and
+///   drives the scheduler whenever it suspends in a `receive`;
+/// * both drives are bounded by one wall-clock [`DRIVE_DEADLINE`] for the whole pass, so the
+///   boot never hangs — an exhausted deadline is a typed [`error::message`], and a blocked
+///   apply with nothing left to wake it is the engine's typed [`beam_engine::blocked`].
 ///
 /// # Errors
 ///
@@ -184,14 +243,24 @@ pub fn execute(runtime: &mut Runtime, script: &BootScript) -> Result<()> {
     // so the runtime is booted first (idempotent): a caller may hand `execute` a fresh
     // runtime, exactly as `Runtime::boot_from_script` does.
     runtime.boot()?;
+    // One deadline for the whole pass: every scheduler drive below shares it, so the boot's
+    // wall-clock bound does not multiply by the number of process directives.
+    let deadline = Instant::now() + DRIVE_DEADLINE;
     for instruction in &script.instructions {
-        execute_instruction(runtime, instruction)?;
+        execute_instruction(runtime, instruction, deadline)?;
     }
     Ok(())
 }
 
 /// Executes one directive (the [`execute`] loop body).
-fn execute_instruction(runtime: &mut Runtime, instruction: &Instruction) -> Result<()> {
+///
+/// `deadline` is the [`execute`] pass's shared scheduler-drive deadline (see
+/// [`drive_scheduler`]).
+fn execute_instruction(
+    runtime: &mut Runtime,
+    instruction: &Instruction,
+    deadline: Instant,
+) -> Result<()> {
     match instruction {
         // `preLoaded` names are already in the cache after `Runtime::boot`; loading again
         // is a memoized no-op. A name the runtime does not ship is still a typed error.
@@ -214,15 +283,153 @@ fn execute_instruction(runtime: &mut Runtime, instruction: &Instruction) -> Resu
         Instruction::KernelProcess { name, mfa } => {
             let args = boot_args(runtime, &mfa.args)?;
             let pid = runtime.spawn_process(&mfa.module, &mfa.function, args)?;
-            runtime.register_boot_process(name, pid)
+            runtime.register_boot_process(name, pid)?;
+            // The directive's contract ends at spawn+register, so the spawned process's own
+            // crash is deliberately **not** this directive's error — it surfaces at the next
+            // directive that depends on the process. The burst exists so a long-lived server
+            // can reach its `receive` (and register whatever it registers) first; it is
+            // bounded both by the boot's deadline and by the short burst deadline, and it
+            // normally stops as soon as the run queue drains.
+            let burst = deadline.min(Instant::now() + KERNEL_BURST_DEADLINE);
+            drive_scheduler(runtime, burst, KERNEL_BURST_SLICES).map(|_| ())
         }
         Instruction::Apply { mfa } => {
             let args = boot_args(runtime, &mfa.args)?;
-            let mut context = RuntimeContext::new(runtime);
-            let _ = context.call_bif(&mfa.module, &mfa.function, args.len() as u32, &args)?;
-            Ok(())
+            apply_boot_call(runtime, mfa, &args, deadline)
         }
     }
+}
+
+/// Runs one scheduler drive: repeated bounded [`Runtime::pump_scheduler`] steps until the
+/// scheduler reports that nothing ran, returning the total slices + port deliveries.
+///
+/// This is the executor's [`Runtime::run_scheduled`](crate::runtime::Runtime::run_scheduled)
+/// counterpart — the same "bounded step between deadline checks" shape, with its own local
+/// constants ([`DRIVE_DEADLINE`], and the caller's per-`pump_scheduler` budget `slices`) so
+/// the boot can never hand control to the scheduler for good.
+///
+/// The two stop conditions are the point:
+///
+/// * a step that reports **`0`** — no slice ran and no port message was delivered — means the
+///   scheduler has nothing it can advance *now* (every process is blocked or gone), so the
+///   drive stops and reports what it ran; the caller decides what that means (a
+///   `{kernelProcess, …}` burst simply continues, a blocked `{apply, …}` reports the engine's
+///   [`beam_engine::blocked`] when the total is `0`);
+/// * `now >= deadline` — the boot's one wall-clock bound is spent, reported as a typed
+///   [`error::message`], never awaited.
+///
+/// # Errors
+///
+/// Whatever the scheduler pass itself reports (a process-table failure, a port/poller
+/// failure, …), plus the typed deadline diagnostic above.
+fn drive_scheduler(runtime: &mut Runtime, deadline: Instant, slices: u64) -> Result<u64> {
+    let mut total = 0u64;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(error::message(format!(
+                "boot script: the scheduler was still runnable after {} ms",
+                DRIVE_DEADLINE.as_millis()
+            )));
+        }
+        let ran = runtime.pump_scheduler(slices)?;
+        total += ran;
+        if ran == 0 {
+            return Ok(total);
+        }
+    }
+}
+
+/// Runs a boot script's `{apply, {M,F,A}}` **as this runtime's own process**.
+///
+/// `init`'s `apply` directive is an ordinary Erlang function application, so the call is
+/// resolved the way the runtime resolves any external call, with the one difference that it
+/// is **blocking-aware**: the module's export is run through the engine's
+/// [`Machine::run_export_outcome`]/[`Machine::resume_outcome`], so a `gen_server:call`
+/// inside it that suspends in a `receive` waiting for a boot-spawned process is resumed by
+/// [`drive_scheduler`] instead of being folded into a typed error.
+///
+/// The call runs on a [`RuntimeContext::new`] context, i.e. as the **same process**
+/// [`Runtime::eval`](crate::runtime::Runtime::eval) runs as, so a process-dictionary side
+/// effect the applied function produces stays observable through the runtime.
+///
+/// The runtime's non-blocking dispatch chain (a loaded NIF, the runtime-native floor, a
+/// registered `beam_bifs` BIF) serves an MFA the module does not export — those can never
+/// suspend in a `receive` — so `M:F/A` is first resolved against the module's own **export**
+/// and only a miss falls back to [`ExecutionContext::call_bif`]. A module this runtime has
+/// not loaded is that same fallback, exactly as it is for any other external call.
+///
+/// # Errors
+///
+/// The call's own error, passed through [`error::name_atom_raise`] exactly as
+/// [`RuntimeContext::run_export`](crate::context::RuntimeContext) passes it, so an uncaught
+/// reason the engine can only carry as a term (a failed function head's bare
+/// `function_clause`, say) keeps its atom name; the engine's typed [`beam_engine::blocked`]
+/// when a suspended call has nothing left that could wake it; and [`drive_scheduler`]'s
+/// errors.
+fn apply_boot_call(
+    runtime: &mut Runtime,
+    mfa: &Mfa,
+    args: &[Eterm],
+    deadline: Instant,
+) -> Result<()> {
+    let arity = args.len() as u32;
+    let resolved = runtime
+        .code_server()
+        .module_handle(&mfa.module)
+        .and_then(|module| {
+            let function = module.atom_table.lookup(&mfa.function)?;
+            module.export(function, arity).map(|_| (module, function))
+        });
+    let Some((module, function)) = resolved else {
+        return call_bif(runtime, mfa, args);
+    };
+    let mut machine = Machine::new();
+    // The first entry: the engine's blocking-aware export entry, run on this runtime's own
+    // process. `enter_module` records the call site a BIF (in particular `load_nif/2`, the
+    // `records` source) resolves its owner from, exactly as `RuntimeContext::run_export`
+    // does for the single-pass path.
+    let entered = {
+        let mut context = RuntimeContext::new(runtime);
+        context.enter_module(&module);
+        machine.run_export_outcome(&module, function, arity, args, &mut context)
+    };
+    let mut outcome = entered.map_err(|err| error::name_atom_raise(err, runtime.atoms()))?;
+    loop {
+        match outcome {
+            // `init` discards an `apply` directive's value, exactly as it discards `-s`'s.
+            RunOutcome::Returned(_) => return Ok(()),
+            RunOutcome::Wait { func, pc } => {
+                // The process suspended in a `receive`: let the scheduler advance (the
+                // boot-spawned process that must answer it is on the run queue), then resume
+                // the same machine at the reported address.
+                let ran = drive_scheduler(runtime, deadline, APPLY_BLOCK_SLICES)?;
+                if ran == 0 {
+                    // Nothing left that could wake the receiver: report it exactly as the
+                    // engine's non-blocking entries do, rather than spinning out the deadline.
+                    return Err(beam_engine::blocked());
+                }
+                let resumed = {
+                    let mut context = RuntimeContext::new(runtime);
+                    context.enter_module(&module);
+                    machine.resume_outcome(&module, func, pc, &mut context)
+                };
+                outcome =
+                    resumed.map_err(|err| error::name_atom_raise(err, runtime.atoms()))?;
+            }
+        }
+    }
+}
+
+/// Dispatches one boot-script `{apply, …}` through the runtime's non-blocking BIF chain.
+///
+/// This is [`ExecutionContext::call_bif`] reached exactly as the engine reaches it for any
+/// external call (a loaded NIF, the runtime-native floor, a registered `beam_bifs` BIF, or —
+/// for a module the runtime has not loaded, or an export it does not have — a load-on-demand
+/// external module call). The value is discarded because `init` discards it.
+fn call_bif(runtime: &mut Runtime, mfa: &Mfa, args: &[Eterm]) -> Result<()> {
+    let mut context = RuntimeContext::new(runtime);
+    let _ = context.call_bif(&mfa.module, &mfa.function, args.len() as u32, args)?;
+    Ok(())
 }
 
 /// Expands a leading `$ROOT` in a `{path, ...}` entry to the runtime's Erlang root.
@@ -882,11 +1089,11 @@ mod tests {
 
     #[test]
     fn the_real_start_boot_stops_honestly_at_the_first_unbootable_directive() {
-        // The full script loads every `primLoad` batch and then stops with a typed error at
-        // the first directive M1 cannot run. It **must not** panic or hang: `execute` drives
-        // the engine directly, so a blocking receive is the engine's typed `error::blocked()`.
-        // The test is bounded by construction: it executes the instructions one at a time and
-        // stops at the first failure, so a hang would have to be in a single `Machine` run.
+        // The full script loads every `primLoad` batch, spawns (and drives) the three kernel
+        // processes, and then stops with a typed error at the first directive the runtime
+        // cannot run. It **must not** panic or hang: every scheduler drive `execute` performs
+        // is bounded by its own deadline, and the test executes the instructions one at a
+        // time and stops at the first failure.
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -916,9 +1123,17 @@ mod tests {
             "instruction {index} ({:?}) must fail with a typed BeamError: {error}",
             script.instructions[index]
         );
+        // Every `primLoad` batch and every `kernelProcess` before the first `apply` now
+        // succeeds, so the stop is at (or, once the kernel processes can do more, after) the
+        // first directive that needs one of them to *answer* — `application:load/1`.
         assert!(
-            index >= 12,
-            "the stop must be after the primLoad batches, found instruction {index}"
+            matches!(script.instructions[index], Instruction::Apply { .. }),
+            "the stop must be an `apply` directive, found instruction {index}: {:?}",
+            script.instructions[index]
+        );
+        assert!(
+            index >= 16,
+            "the stop must be at or after the application:load/1 apply, found instruction {index}"
         );
         // The `primLoad` batches really loaded before the stop.
         for module in ["lists", "gen_server", "application_starter", "argparse", "zstd"] {
@@ -962,57 +1177,58 @@ marked() -> erlang:get(bootscript_mark).
         }
     }
 
-    /// Compiles the fixture and writes the synthetic `.boot`, or `None` when the toolchain
-    /// is unavailable (the caller returns early — loudly).
-    fn build_synthetic(label: &str) -> Option<Fixture> {
+    /// Compiles `sources` into a fresh scratch directory and writes the `.boot` image
+    /// `program` builds there, or `None` — **loudly** — when the toolchain is unavailable.
+    ///
+    /// `sources` are `(file name, Erlang source)` pairs (each compiled with `erlc`); every
+    /// listed module must produce a `.beam`, or the fixture is refused rather than used
+    /// half-built. `program` is handed the scratch directory and the `.boot` path and
+    /// returns the `erl` `-eval` expression that writes the script — exactly the shape the
+    /// real `init` reads.
+    fn build_fixture(
+        label: &str,
+        sources: &[(&str, &str)],
+        program: impl FnOnce(&Path, &Path) -> String,
+    ) -> Option<Fixture> {
         let name = format!("beam_rt_bootscript_{label}_{}", std::process::id());
         let dir = std::env::temp_dir().join(name);
         if let Err(error) = std::fs::create_dir_all(&dir) {
             eprintln!("SKIP bootscript: cannot create {}: {error}", dir.display());
             return None;
         }
-        let source = dir.join("bootscript_fixture.erl");
-        if let Err(error) = std::fs::write(&source, FIXTURE_ERL) {
-            eprintln!("SKIP bootscript: cannot write {}: {error}", source.display());
-            return None;
-        }
-        let output = match Command::new("erlc").arg("-o").arg(&dir).arg(&source).output() {
-            Ok(output) => output,
-            Err(error) => {
-                eprintln!("SKIP bootscript: cannot run `erlc`: {error}");
+        for (file, text) in sources {
+            let source = dir.join(file);
+            if let Err(error) = std::fs::write(&source, *text) {
+                eprintln!("SKIP bootscript: cannot write {}: {error}", source.display());
                 return None;
             }
-        };
-        if !output.status.success() {
-            eprintln!(
-                "SKIP bootscript: `erlc` exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return None;
+            let output = match Command::new("erlc").arg("-o").arg(&dir).arg(&source).output() {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("SKIP bootscript: cannot run `erlc`: {error}");
+                    return None;
+                }
+            };
+            if !output.status.success() {
+                eprintln!(
+                    "SKIP bootscript: `erlc` exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return None;
+            }
+            let beam = source.with_extension("beam");
+            if !beam.is_file() {
+                eprintln!("SKIP bootscript: `erlc` produced no {}", beam.display());
+                return None;
+            }
         }
-        let beam = dir.join("bootscript_fixture.beam");
-        if !beam.is_file() {
-            eprintln!("SKIP bootscript: `erlc` produced no {}", beam.display());
-            return None;
-        }
-        // The synthetic script: the preloaded set, a code-path entry, one module load and
-        // the observed `apply`, in the exact shape the real `init` reads.
         let boot = dir.join("synthetic.boot");
-        let dir_text = dir.display();
-        let program = format!(
-            "ok = file:write_file(\"{boot}\", term_to_binary({{script,{{\"t\",\"1\"}},[\
-             {{preLoaded,[erlang]}},\
-             {{progress,preloaded}},\
-             {{path,[\"{dir_text}\"]}},\
-             {{module,lists}},\
-             {{apply,{{bootscript_fixture,mark,[]}}}}]}})), halt(0).",
-            boot = boot.display(),
-        );
+        let expression = program(&dir, &boot);
         let output = match Command::new("erl")
             .arg("-noshell")
             .arg("-eval")
-            .arg(&program)
+            .arg(&expression)
             .output()
         {
             Ok(output) => output,
@@ -1029,14 +1245,29 @@ marked() -> erlang:get(bootscript_mark).
             );
             return None;
         }
-        let boot_path = dir.join("synthetic.boot");
-        if !boot_path.is_file() {
-            eprintln!("SKIP bootscript: `erl` produced no {}", boot_path.display());
+        if !boot.is_file() {
+            eprintln!("SKIP bootscript: `erl` produced no {}", boot.display());
             return None;
         }
         Some(Fixture { dir })
     }
 
+    /// The synthetic script of [`a_synthetic_script_executes_end_to_end`]: the preloaded
+    /// set, a code-path entry, one module load and the observed `apply`.
+    fn build_synthetic(label: &str) -> Option<Fixture> {
+        build_fixture(label, &[("bootscript_fixture.erl", FIXTURE_ERL)], |dir, boot| {
+            format!(
+                "ok = file:write_file(\"{boot}\", term_to_binary({{script,{{\"t\",\"1\"}},[\
+                 {{preLoaded,[erlang]}},\
+                 {{progress,preloaded}},\
+                 {{path,[\"{dir}\"]}},\
+                 {{module,lists}},\
+                 {{apply,{{bootscript_fixture,mark,[]}}}}]}})), halt(0).",
+                boot = boot.display(),
+                dir = dir.display(),
+            )
+        })
+    }
     #[test]
     fn a_synthetic_script_executes_end_to_end() {
         let Some(fixture) = build_synthetic("e2e") else {
@@ -1083,6 +1314,90 @@ marked() -> erlang:get(bootscript_mark).
             runtime.atom_name_of(marked),
             Some("seen"),
             "the apply step's side effect must be observable"
+        );
+        fixture.cleanup();
+    }
+
+    // -----------------------------------------------------------------------
+    // A boot-spawned process answering a blocked `apply`
+    // -----------------------------------------------------------------------
+
+    /// The fixture module of [`a_boot_spawned_process_answers_a_blocked_apply`].
+    const WAITER_ERL: &str = r#"%% Generated by `beam_rt/src/boot/bootscript.rs` (never committed).
+-module(bootscript_waiter).
+-export([responder/0, ask/0, seen/0]).
+%% The `{kernelProcess, …}` entry: answer one ping, then settle back into the `receive`
+%% so the process stays alive — and registered under the directive's name — afterwards.
+responder() ->
+    receive {ping, From} -> From ! {pong, hello} end.
+%% The `{apply, …}` entry: ping the registered kernel process and block until it answers,
+%% recording the reply in the dictionary of the process the script runs as.
+ask() ->
+    Pid = erlang:whereis(bootscript_kernel),
+    Pid ! {ping, self()},
+    receive {pong, Value} -> erlang:put(bootscript_seen, Value) end.
+%% Reads the recorded reply back.
+seen() -> erlang:get(bootscript_seen).
+"#;
+
+    /// The two process directives really **drive the scheduler**: a `{kernelProcess, …}`
+    /// burst runs the spawned process up to its `receive`, and a later `{apply, …}` that
+    /// blocks on it is resumed by a scheduler drive and completes.
+    ///
+    /// This is the behaviour those two directives exist for. The script spawns+registers
+    /// `bootscript_kernel` (whose entry settles into a `receive`), then applies `ask/0`,
+    /// which sends that process a ping and blocks in `receive` until it answers. The apply
+    /// can only observe the reply if the burst ran the kernel process *and* the apply's own
+    /// `receive` was resumed after a scheduler drive — with a single-pass apply the send
+    /// would have no one to answer it and the engine would report its typed `blocked`.
+    #[test]
+    fn a_boot_spawned_process_answers_a_blocked_apply() {
+        let Some(fixture) = build_fixture(
+            "wait",
+            &[("bootscript_waiter.erl", WAITER_ERL)],
+            |dir, boot| {
+                format!(
+                    "ok = file:write_file(\"{boot}\", term_to_binary({{script,{{\"t\",\"1\"}},[\
+                     {{preLoaded,[erlang]}},\
+                     {{progress,preloaded}},\
+                     {{path,[\"{dir}\"]}},\
+                     {{module,lists}},\
+                     {{kernelProcess,bootscript_kernel,{{bootscript_waiter,responder,[]}}}},\
+                     {{apply,{{bootscript_waiter,ask,[]}}}}]}})), halt(0).",
+                    boot = boot.display(),
+                    dir = dir.display(),
+                )
+            },
+        ) else {
+            return;
+        };
+        let boot = fixture.dir.join("synthetic.boot");
+        let script = read(&boot).expect("the synthetic script parses");
+        assert!(
+            matches!(script.instructions[4], Instruction::KernelProcess { .. }),
+            "instruction 4 must be the kernelProcess: {:?}",
+            script.instructions[4]
+        );
+        assert!(
+            matches!(script.instructions[5], Instruction::Apply { .. }),
+            "instruction 5 must be the apply: {:?}",
+            script.instructions[5]
+        );
+
+        let mut config = RuntimeConfig::default();
+        config.code_paths.push(fixture.dir.clone());
+        let mut runtime = Runtime::new(config).expect("the default runtime");
+        runtime
+            .boot_from_script(&boot)
+            .expect("the boot-spawned process answers the blocked apply");
+
+        let seen = runtime
+            .eval("bootscript_waiter:seen()")
+            .expect("bootscript_waiter:seen/0");
+        assert_eq!(
+            runtime.atom_name_of(seen),
+            Some("hello"),
+            "the apply must have been resumed by the kernel process's reply"
         );
         fixture.cleanup();
     }
