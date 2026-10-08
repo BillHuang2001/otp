@@ -21,6 +21,16 @@
 //! `total_heap_size`, `stack_size`, `memory`, `creation`, `logical_processors` and the
 //! `dirty_*` scheduler counts all differ from the oracle's by construction (this runtime's
 //! own tables are smaller) or vary per VM start — they are handoffs, not cases.
+//!
+//! # `erlang:memory/0,1` and the tracing surface (still contract A.8)
+//!
+//! `erlang:memory/0,1` is registered but its hook is **not wired** in the Rust runtime: any
+//! call currently raises the documented capability gap (`beam_rt: unsupported: bif`, exit 3),
+//! so the harness classifies every `memory_*` case `unsupported` (honest, never a mismatch).
+//! Its goldens are the oracle's real values (the exact 9-key order, the list length, the
+//! selected-key order), so they flip to `agree` as soon as the hook lands; the volatile byte
+//! totals are never pinned. The tracing/`seq_trace` observability and the `halt` argument
+//! check below **agree** on both sides today and pin the shared surface.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -347,5 +357,124 @@ pub(crate) fn group() -> Vec<Case> {
             "element(1, erlang:process_info(self(), memory))",
             "ok memory",
         ),
+        // --- erlang:memory/0,1: the key set/order, never the volatile byte totals ----------
+        // The Rust runtime's `memory` hook is not wired yet, so these five are classified
+        // `unsupported` (its documented capability gap), never a mismatch. Each golden is the
+        // oracle's own output, so the case flips to `agree` once the hook is implemented.
+        case(
+            "system_info/memory_keys_order",
+            "erlang:memory/0 reports the 9 documented keys in their exact order",
+            "[K || {K,_} <- erlang:memory()]",
+            "ok [total,processes,processes_used,system,atom,atom_used,binary,code,ets]",
+        ),
+        case(
+            "system_info/memory_length_is_nine",
+            "erlang:memory/0 reports exactly nine keys",
+            "length(erlang:memory())",
+            "ok 9",
+        ),
+        case(
+            "system_info/memory_total_is_integer",
+            "erlang:memory(total) is an integer (the exact byte count is volatile)",
+            "is_integer(erlang:memory(total))",
+            "ok true",
+        ),
+        case(
+            "system_info/memory_selected_keys",
+            "erlang:memory/1 keeps the requested key order (the byte values are volatile)",
+            "[K || {K,_} <- erlang:memory([atom,total])]",
+            "ok [atom,total]",
+        ),
+        Case {
+            id: "system_info/memory_unknown_key_is_badarg",
+            description: "erlang:memory/1 with an unknown key raises error:badarg",
+            contracts: &[Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:memory(no_such_key)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        // --- the tracing / seq_trace observability surface: AGREE on both runtimes ----------
+        case(
+            "system_info/dynamic_trace_is_none",
+            "erlang:system_info(dynamic_trace) is none in a non-instrumented runtime",
+            "erlang:system_info(dynamic_trace)",
+            "ok none",
+        ),
+        case(
+            "system_info/trace_control_word_is_zero",
+            "erlang:system_info(trace_control_word) is 0 with tracing off",
+            "erlang:system_info(trace_control_word)",
+            "ok 0",
+        ),
+        case(
+            "system_info/trace_all_flag_accepted",
+            "erlang:trace(self(), true, [all]) returns the number of matched processes (1)",
+            "erlang:trace(self(),true,[all])",
+            "ok 1",
+        ),
+        case(
+            "system_info/trace_call_flag_accepted",
+            "erlang:trace(self(), true, [call]) returns the number of matched processes (1)",
+            "erlang:trace(self(),true,[call])",
+            "ok 1",
+        ),
+        Case {
+            id: "system_info/trace_bad_option_is_badarg",
+            description: "erlang:trace/3 with a malformed option raises error:badarg",
+            contracts: &[Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:trace(self(),true,[{bad_option}])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        case(
+            "system_info/trace_info_flags",
+            "trace_info(self(), flags) is the empty flag list for an untraced process",
+            "erlang:trace_info(self(),flags)",
+            "ok {flags,[]}",
+        ),
+        case(
+            "system_info/trace_info_tracer",
+            "trace_info(self(), tracer) is the empty tracer list for an untraced process",
+            "erlang:trace_info(self(),tracer)",
+            "ok {tracer,[]}",
+        ),
+        case(
+            "system_info/seq_trace_get_token_is_empty",
+            "seq_trace:get_token/0 is the empty list when no sequential trace is set",
+            "seq_trace:get_token()",
+            "ok []",
+        ),
+        case(
+            "system_info/seq_trace_set_label_token",
+            "seq_trace:set_token(label, 1) succeeds and returns 0",
+            "seq_trace:set_token(label,1)",
+            "ok 0",
+        ),
+        Case {
+            id: "system_info/halt_bad_arg_is_badarg",
+            description: "erlang:halt/1 with a malformed argument raises error:badarg",
+            contracts: &[Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "erlang:halt({bad})",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
     ]
 }
