@@ -15,14 +15,14 @@ use std::time::{Duration, Instant};
 
 use beam_alloc::Heap;
 use beam_common::BeamError;
-use beam_dist::connection::{connect_to_node, Connection, TcpListener as DistListener};
-use beam_dist::epmd::{
-    lookup, lookup_port, Alive2Req, Alive2Resp, EpmdClient, NamesResp, Port2Req, Port2Resp,
+use beam_dist::connection::{connect_to_node, Connection, TcpListener as DistListener, TcpTransport};use beam_dist::epmd::{
+    lookup, lookup_port, Alive2Req, Alive2Resp, DumpLine, DumpNodeKind, DumpReq, DumpResp,
+    EpmdClient, KillReq, KillResp, NamesResp, Port2Req, Port2Resp, StopReq, StopResp,
     EPMD_ALIVE2_REQ, EPMD_ALIVE2_RESP, EPMD_ALIVE2_X_RESP, EPMD_DEFAULT_ADDR, EPMD_DIST_HIGH,
-    EPMD_DIST_LOW, EPMD_NAMES_REQ, EPMD_NODE_HIDDEN, EPMD_NODE_NORMAL, EPMD_PORT2_REQ,
-    EPMD_PORT2_RESP, EPMD_PROTO_TCP,
-};
-use beam_dist::flags::Dop;
+    EPMD_DIST_LOW, EPMD_DUMP_REQ, EPMD_KILL_REQ, EPMD_NAMES_REQ, EPMD_NODE_HIDDEN,
+    EPMD_NODE_NORMAL, EPMD_PORT2_REQ, EPMD_PORT2_RESP, EPMD_PORT_PLEASE2_REQ, EPMD_PROTO_TCP,
+    EPMD_STOP_REQ, MAX_DUMP_RESP_BODY,
+};use beam_dist::flags::Dop;
 use beam_dist::framing::{write_packet, PacketHeaderSize};
 use beam_dist::transport::{MemoryTransport, Read, Write};
 use beam_term::prelude::make_atom;
@@ -781,4 +781,572 @@ fn live_connect_to_node_resolves_the_port_via_epmd_then_handshakes() {
     assert_eq!(got.terms, vec![from, to]);
 
     drop(publisher);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive `epmd` requests: `DUMP_REQ` ('d'), `KILL_REQ` ('k'), `STOP_REQ`
+// ('s')
+//
+// Ground truth: `erts/epmd/src/epmd.h` (tag bytes) + `epmd_cli.c` (the request
+// bodies and the reply lengths the CLI reads) + `epmd_srv.c` `do_request` (the
+// reply bytes) + the OTP suite `erts/epmd/test/epmd_SUITE.erl`
+// (`unregister_others_name_1/2`, `no_live_killing`).
+//
+// `DUMP_REQ` is read-only. `KILL_REQ` (terminates the daemon) and `STOP_REQ`
+// (unregisters a node) are **destructive**, so they are covered by codec
+// round-trips only and are never sent to a real `epmd` by this suite.
+// ---------------------------------------------------------------------------
+
+/// The three interactive tag bytes are pinned from `epmd.h` (and the OTP suite's
+/// own `-define`s: `$d`, `$k`, `$s`); `PORT_PLEASE2_REQ` is the historical
+/// spelling of the existing `PORT2_REQ` (`122 = 'z'`), a documented alias rather
+/// than a second tag.
+#[test]
+fn interactive_epmd_tag_values_are_pinned() {
+    assert_eq!(EPMD_DUMP_REQ, 100);
+    assert_eq!(EPMD_DUMP_REQ, b'd');
+    assert_eq!(EPMD_KILL_REQ, 107);
+    assert_eq!(EPMD_KILL_REQ, b'k');
+    assert_eq!(EPMD_STOP_REQ, 115);
+    assert_eq!(EPMD_STOP_REQ, b's');
+
+    assert_eq!(EPMD_PORT_PLEASE2_REQ, EPMD_PORT2_REQ);
+    assert_eq!(EPMD_PORT_PLEASE2_REQ, 122);
+    assert_eq!(EPMD_PORT_PLEASE2_REQ, b'z');
+
+    // ... and the already-established registration/lookup/names tags, so the
+    // whole `epmd` vocabulary is pinned in one place.
+    assert_eq!(EPMD_ALIVE2_REQ, b'x');
+    assert_eq!(EPMD_ALIVE2_RESP, b'y');
+    assert_eq!(EPMD_ALIVE2_X_RESP, b'v');
+    assert_eq!(EPMD_PORT2_REQ, b'z');
+    assert_eq!(EPMD_PORT2_RESP, b'w');
+    assert_eq!(EPMD_NAMES_REQ, b'n');
+}
+
+// ---------------------------------------------------------------------------
+// DUMP_REQ / DUMP_RESP
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dump_req_roundtrip_and_negatives() {
+    // The CLI frames a one-byte body for `-dump` (`epmd_cli.c::epmd_call`
+    // `put_int16(1,buf); buf[2] = what;`).
+    assert_eq!(body!(&DumpReq), vec![b'd']);
+    assert_eq!(body!(&DumpReq), vec![100]);
+    assert_eq!(DumpReq::decode(&[b'd']).expect("decode"), DumpReq);
+
+    // Wrong / short / trailing bytes are all rejected, never guessed.
+    assert!(matches!(DumpReq::decode(&[]), Err(BeamError::BadArg)));
+    assert!(matches!(DumpReq::decode(&[b'k']), Err(BeamError::BadArg)));
+    assert!(matches!(DumpReq::decode(&[b'd', 0x00]), Err(BeamError::BadArg)));
+    assert!(matches!(DumpReq::decode(&[b'\0']), Err(BeamError::BadArg)));
+}
+
+#[test]
+fn dump_resp_roundtrip_is_byte_exact() {
+    let resp = DumpResp {
+        port: 4369,
+        lines: vec![
+            DumpLine {
+                kind: DumpNodeKind::Active,
+                name: b"genesis".to_vec(),
+                port: 9000,
+                fd: 5,
+            },
+            DumpLine {
+                kind: DumpNodeKind::OldUnused,
+                name: b"beamrth2461".to_vec(),
+                port: 41703,
+                fd: 6,
+            },
+        ],
+    };
+
+    // The exact server bytes (`epmd_srv.c` `case EPMD_DUMP_REQ`): the big-endian
+    // epmd port, then `active name     <NAME> at port N, fd = N\n` and
+    // `old/unused name <NAME>, port = N, fd = N \n` — each followed by the NUL
+    // `erts_snprintf` leaves in the reply buffer (`len += r + 1`). The five spaces
+    // in the active prefix and the space before the old line's newline are
+    // wire-frozen.
+    let mut expected = 4369u32.to_be_bytes().to_vec();
+    expected.extend_from_slice(b"active name     <genesis> at port 9000, fd = 5\n\x00");
+    expected.extend_from_slice(b"old/unused name <beamrth2461>, port = 41703, fd = 6 \n\x00");
+    assert_eq!(body!(&resp), expected);
+
+    assert_eq!(DumpResp::decode(&expected).expect("decode"), resp);
+}
+
+#[test]
+fn dump_resp_decodes_a_handbuilt_server_reply() {
+    // The real reply shape observed on a live `epmd` (a registered node plus two
+    // remembered names), byte for byte.
+    let mut raw = 4369u32.to_be_bytes().to_vec();
+    raw.extend_from_slice(b"active name     <genesis> at port 9000, fd = 5\n\x00");
+    raw.extend_from_slice(b"old/unused name <beamrtn433>, port = 41703, fd = 6 \n\x00");
+    raw.extend_from_slice(b"old/unused name <beamrtp433>, port = 41961, fd = 9 \n\x00");
+
+    let dump = DumpResp::decode(&raw).expect("decode");
+    assert_eq!(dump.port, 4369);
+    assert_eq!(dump.lines.len(), 3);
+    assert_eq!(
+        dump.lines[0],
+        DumpLine { kind: DumpNodeKind::Active, name: b"genesis".to_vec(), port: 9000, fd: 5 }
+    );
+    assert_eq!(
+        dump.lines[1],
+        DumpLine {
+            kind: DumpNodeKind::OldUnused,
+            name: b"beamrtn433".to_vec(),
+            port: 41703,
+            fd: 6,
+        }
+    );
+    assert!(dump.lines[0].is_active());
+    assert!(!dump.lines[1].is_active());
+    assert_eq!(dump.active().count(), 1);
+    assert_eq!(dump.active().next().map(|l| l.name.clone()), Some(b"genesis".to_vec()));
+}
+
+#[test]
+fn dump_resp_decodes_an_empty_table_and_tolerates_a_missing_nul() {
+    // No nodes at all: just the epmd port.
+    assert_eq!(
+        DumpResp::decode(&4369u32.to_be_bytes()).expect("decode"),
+        DumpResp { port: 4369, lines: Vec::new() }
+    );
+
+    // The NUL after a line is a reply-buffer artefact, not a field: a body that
+    // omits it still parses.
+    let mut raw = 4369u32.to_be_bytes().to_vec();
+    raw.extend_from_slice(b"active name     <genesis> at port 9000, fd = 5\n");
+    let dump = DumpResp::decode(&raw).expect("decode without the NUL");
+    assert_eq!(dump.lines.len(), 1);
+    assert_eq!(dump.lines[0].name, b"genesis");
+
+    // A UTF-8 node name (epmd enforces UTF-8 names) round-trips.
+    let mut raw = 4369u32.to_be_bytes().to_vec();
+    raw.extend_from_slice("active name     <\u{1f608}> at port 4711, fd = 7\n".as_bytes());
+    let dump = DumpResp::decode(&raw).expect("decode a unicode name");
+    assert_eq!(dump.lines[0].name, "\u{1f608}".as_bytes());
+}
+
+#[test]
+fn dump_resp_rejects_malformed_bodies() {
+    // Shorter than the 4-byte epmd port.
+    assert!(matches!(DumpResp::decode(&[]), Err(BeamError::BadArg)));
+    assert!(matches!(DumpResp::decode(&[0x00, 0x00, 0x11]), Err(BeamError::BadArg)));
+
+    let port = 4369u32.to_be_bytes();
+    let with_tail = |tail: &[u8]| {
+        let mut raw = port.to_vec();
+        raw.extend_from_slice(tail);
+        raw
+    };
+
+    // A line without its terminating newline.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"active name     <genesis> at port 9000, fd = 5")),
+        Err(BeamError::BadArg)
+    ));
+    // An unrecognised line shape.
+    assert!(matches!(DumpResp::decode(&with_tail(b"bogus line\n")), Err(BeamError::BadArg)));
+    // A bare newline (empty line).
+    assert!(matches!(DumpResp::decode(&with_tail(b"\n")), Err(BeamError::BadArg)));
+    // A NUL with no line at all.
+    assert!(matches!(DumpResp::decode(&with_tail(b"\x00")), Err(BeamError::BadArg)));
+    // Active line: missing the `>` separator.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"active name     <genesis at port 9000, fd = 5\n")),
+        Err(BeamError::BadArg)
+    ));
+    // Active line: missing the ` at port ` separator.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"active name     <genesis> port 9000, fd = 5\n")),
+        Err(BeamError::BadArg)
+    ));
+    // Active line: missing the `, fd = ` separator.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"active name     <genesis> at port 9000 fd = 5\n")),
+        Err(BeamError::BadArg)
+    ));
+    // Active line: a non-numeric port.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"active name     <genesis> at port x, fd = 5\n")),
+        Err(BeamError::BadArg)
+    ));
+    // Active line: an empty fd.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"active name     <genesis> at port 9000, fd = \n")),
+        Err(BeamError::BadArg)
+    ));
+    // A port that overflows a u16.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"active name     <genesis> at port 70000, fd = 5\n")),
+        Err(BeamError::BadArg)
+    ));
+    // Old/unused line: missing the `, port = ` separator.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"old/unused name <genesis> at port 9000, fd = 5 \n")),
+        Err(BeamError::BadArg)
+    ));
+    // Old/unused line: a non-numeric fd.
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"old/unused name <genesis>, port = 9000, fd = z \n")),
+        Err(BeamError::BadArg)
+    ));
+    // Invalid UTF-8 on a line (epmd names are valid UTF-8).
+    assert!(matches!(DumpResp::decode(&with_tail(b"active name     <\xff\xfe> at port 1, fd = 1\n")), Err(BeamError::BadArg)));
+    // The `active name` prefix must match exactly (`old/unused` and `active`
+    // differ, and a shorter prefix is not the five-space server shape).
+    assert!(matches!(
+        DumpResp::decode(&with_tail(b"active name <genesis> at port 1, fd = 1\n")),
+        Err(BeamError::BadArg)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// KILL_REQ / KILL_RESP
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kill_req_roundtrip_and_negatives() {
+    // `epmd_cli.c::kill_epmd` frames a one-byte body.
+    assert_eq!(body!(&KillReq), vec![b'k']);
+    assert_eq!(body!(&KillReq), vec![107]);
+    assert_eq!(KillReq::decode(&[b'k']).expect("decode"), KillReq);
+
+    assert!(matches!(KillReq::decode(&[]), Err(BeamError::BadArg)));
+    assert!(matches!(KillReq::decode(&[b'd']), Err(BeamError::BadArg)));
+    assert!(matches!(KillReq::decode(&[b'k', 0x00]), Err(BeamError::BadArg)));
+}
+
+#[test]
+fn kill_resp_roundtrip_and_negatives() {
+    // The literal two bytes (`epmd_srv.c` `case EPMD_KILL_REQ`; the CLI reads
+    // exactly two, `epmd_cli.c::kill_epmd`).
+    assert_eq!(body!(&KillResp::Ok), b"OK".to_vec());
+    assert_eq!(body!(&KillResp::Refused), b"NO".to_vec());
+    assert_eq!(KillResp::decode(b"OK").expect("decode"), KillResp::Ok);
+    assert_eq!(KillResp::decode(b"NO").expect("decode"), KillResp::Refused);
+    assert!(KillResp::Ok.is_ok());
+    assert!(!KillResp::Refused.is_ok());
+
+    assert!(matches!(KillResp::decode(b""), Err(BeamError::BadArg)));
+    assert!(matches!(KillResp::decode(b"O"), Err(BeamError::BadArg)));
+    assert!(matches!(KillResp::decode(b"OK!"), Err(BeamError::BadArg)));
+    assert!(matches!(KillResp::decode(b"NO!"), Err(BeamError::BadArg)));
+    // Case-sensitive: the server writes uppercase literals only.
+    assert!(matches!(KillResp::decode(b"ok"), Err(BeamError::BadArg)));
+    assert!(matches!(KillResp::decode(b"yes"), Err(BeamError::BadArg)));
+}
+
+// ---------------------------------------------------------------------------
+// STOP_REQ / STOP_RESP
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stop_req_roundtrip_and_negatives() {
+    // `epmd_cli.c::stop_cli` frames `strlen(name) + 1` bytes: the tag plus the
+    // name, which is the packet remainder with no length field of its own.
+    let req = StopReq { name: b"gurka".to_vec() };
+    let raw = body!(&req);
+    assert_eq!(raw[0], EPMD_STOP_REQ);
+    assert_eq!(raw[0], 115);
+    assert_eq!(&raw[1..], b"gurka");
+    assert_eq!(raw, vec![b's', b'g', b'u', b'r', b'k', b'a']);
+    assert_eq!(StopReq::decode(&raw).expect("decode"), req);
+
+    // A name may contain any bytes (`epmd` handles the UTF-8/255-char rules).
+    let req = StopReq { name: b"\x00\xff".to_vec() };
+    assert_eq!(StopReq::decode(&body!(&req)).expect("decode"), req);
+
+    // A `STOP_REQ` carrying only its tag is not a legal request: the server
+    // requires `bsize > 1` (`epmd_srv.c` "packet too small for request
+    // EPMD_STOP_REQ"), so an empty name is rejected.
+    assert!(matches!(StopReq::decode(&[b's']), Err(BeamError::BadArg)));
+    assert!(matches!(StopReq::decode(&[]), Err(BeamError::BadArg)));
+    assert!(matches!(StopReq::decode(&[b'k', b'x']), Err(BeamError::BadArg)));
+    assert!(matches!(StopReq::decode(&[b'z']), Err(BeamError::BadArg)));
+}
+
+#[test]
+fn stop_resp_roundtrip_and_negatives() {
+    // `epmd_srv.c` `case EPMD_STOP_REQ` answers `"STOPPED"` / `"NOEXIST"` (7 bytes
+    // each; the CLI reads exactly seven). Both are pinned by the OTP suite
+    // (`epmd_SUITE.erl::unregister_others_name_1/2`). NOTE: the success reply is
+    // `"STOPPED"`, *not* the 2-byte `"OK"` — that is `KILL_RESP`.
+    assert_eq!(body!(&StopResp::Stopped), b"STOPPED".to_vec());
+    assert_eq!(body!(&StopResp::NoExist), b"NOEXIST".to_vec());
+    // The "declined without answering" outcome encodes to nothing, because the
+    // server sends nothing.
+    assert_eq!(body!(&StopResp::NoReply), Vec::<u8>::new());
+
+    assert_eq!(StopResp::decode(b"STOPPED").expect("decode"), StopResp::Stopped);
+    assert_eq!(StopResp::decode(b"NOEXIST").expect("decode"), StopResp::NoExist);
+    assert_eq!(StopResp::decode(b"").expect("decode"), StopResp::NoReply);
+    assert!(StopResp::Stopped.is_stopped());
+    assert!(!StopResp::NoExist.is_stopped());
+    assert!(!StopResp::NoReply.is_stopped());
+
+    assert!(matches!(StopResp::decode(b"OK"), Err(BeamError::BadArg)));
+    assert!(matches!(StopResp::decode(b"STOP"), Err(BeamError::BadArg)));
+    assert!(matches!(StopResp::decode(b"STOPPED!"), Err(BeamError::BadArg)));
+    assert!(matches!(StopResp::decode(b"NOEXIST "), Err(BeamError::BadArg)));
+    assert!(matches!(StopResp::decode(b"stopped"), Err(BeamError::BadArg)));
+    assert!(matches!(StopResp::decode(b"\x00"), Err(BeamError::BadArg)));
+}
+
+// ---------------------------------------------------------------------------
+// EpmdClient: the three interactive exchanges over `MemoryTransport`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn epmd_client_dump_frames_request_and_decodes_reply() {
+    let resp = DumpResp {
+        port: 4369,
+        lines: vec![DumpLine {
+            kind: DumpNodeKind::Active,
+            name: b"gurka".to_vec(),
+            port: 9000,
+            fd: 5,
+        }],
+    };
+    let (client_t, probe) = SharedTransport::new(MemoryTransport::with_input(body!(&resp)));
+    let mut client = EpmdClient::new(client_t);
+
+    assert_eq!(client.dump().expect("dump"), resp);
+    // The request is the single byte `'d'`, 2-byte framed.
+    assert_eq!(probe.written(), vec![0x00, 0x01, EPMD_DUMP_REQ]);
+    assert_eq!(probe.written(), vec![0x00, 0x01, b'd']);
+}
+
+#[test]
+fn epmd_client_kill_frames_request_and_decodes_reply() {
+    let (client_t, probe) = SharedTransport::new(MemoryTransport::with_input(b"NO".to_vec()));
+    let mut client = EpmdClient::new(client_t);
+    assert_eq!(client.kill().expect("kill"), KillResp::Refused);
+    assert_eq!(probe.written(), vec![0x00, 0x01, EPMD_KILL_REQ]);
+    assert_eq!(probe.written(), vec![0x00, 0x01, b'k']);
+
+    let (client_t, probe) = SharedTransport::new(MemoryTransport::with_input(b"OK".to_vec()));
+    let mut client = EpmdClient::new(client_t);
+    assert_eq!(client.kill().expect("kill"), KillResp::Ok);
+    assert_eq!(probe.written(), vec![0x00, 0x01, b'k']);
+}
+
+#[test]
+fn epmd_client_stop_frames_request_and_decodes_each_reply() {
+    // `"STOPPED"`: the frame length is `1 + name.len()` (the tag plus "gurka").
+    let (client_t, probe) = SharedTransport::new(MemoryTransport::with_input(b"STOPPED".to_vec()));
+    let mut client = EpmdClient::new(client_t);
+    assert_eq!(client.stop(b"gurka").expect("stop"), StopResp::Stopped);
+    assert_eq!(probe.written(), vec![0x00, 0x06, b's', b'g', b'u', b'r', b'k', b'a']);
+
+    // `"NOEXIST"`.
+    let (client_t, probe) = SharedTransport::new(MemoryTransport::with_input(b"NOEXIST".to_vec()));
+    let mut client = EpmdClient::new(client_t);
+    assert_eq!(client.stop(b"nope").expect("stop"), StopResp::NoExist);
+    assert_eq!(probe.written(), vec![0x00, 0x05, b's', b'n', b'o', b'p', b'e']);
+
+    // No reply at all (the daemon declined without answering): an empty transport
+    // is the `NoReply` outcome, never a hang and never a wrong verdict.
+    let (client_t, probe) = SharedTransport::new(MemoryTransport::new());
+    let mut client = EpmdClient::new(client_t);
+    assert_eq!(client.stop(b"gurka").expect("stop"), StopResp::NoReply);
+    assert_eq!(probe.written(), vec![0x00, 0x06, b's', b'g', b'u', b'r', b'k', b'a']);}
+
+#[test]
+fn epmd_client_interactive_truncated_replies_are_badarg() {
+    // KILL: only one of the two literal bytes arrives.
+    let (client_t, _probe) = SharedTransport::new(MemoryTransport::with_input(vec![b'O']));
+    let mut client = EpmdClient::new(client_t);
+    assert!(matches!(client.kill(), Err(BeamError::BadArg)));
+
+    // STOP: `"STOP"` — the first byte arrives, the remaining six do not. (A
+    // reply cut off *after* the first byte is a truncated 7-byte reply, not the
+    // "no reply" outcome.)
+    let (client_t, _probe) = SharedTransport::new(MemoryTransport::with_input(b"STOP".to_vec()));
+    let mut client = EpmdClient::new(client_t);
+    assert!(matches!(client.stop(b"gurka"), Err(BeamError::BadArg)));
+
+    // DUMP: no port at all.
+    let (client_t, _probe) = SharedTransport::new(MemoryTransport::new());
+    let mut client = EpmdClient::new(client_t);
+    assert!(matches!(client.dump(), Err(BeamError::BadArg)));
+}
+
+#[test]
+fn epmd_client_dump_read_is_bounded() {
+    // A wedged/hostile peer that streams an endless body must not drive unbounded
+    // allocation: the read stops at the ceiling with a typed `SystemLimit`.
+    let flood = vec![b'x'; MAX_DUMP_RESP_BODY + 16];
+    let (client_t, _probe) = SharedTransport::new(MemoryTransport::with_input(flood));
+    let mut client = EpmdClient::new(client_t);
+    assert!(matches!(client.dump(), Err(BeamError::SystemLimit)));
+}
+
+// ---------------------------------------------------------------------------
+// Typed failure classification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn alive2_resp_distinguishes_acceptance_from_an_alive_conflict() {
+    let accepted = Alive2Resp::Extended { ok: true, creation: 0xDEAD_BEEF };
+    assert!(accepted.is_accepted());
+    assert!(!accepted.is_rejected());
+    assert!(!accepted.is_alive_conflict());
+    assert_eq!(accepted.creation(), 0xDEAD_BEEF);
+
+    // A non-zero result byte (`epmd_srv.c` `wbuf[1] = node ? 0 : 1`) is a refusal:
+    // in practice the name is already registered ("node name already occupied").
+    let conflict = Alive2Resp::Legacy { ok: false, creation: 0 };
+    assert!(conflict.is_rejected());
+    assert!(conflict.is_alive_conflict());
+    assert!(!conflict.is_accepted());
+    assert_eq!(conflict.creation(), 0);
+
+    // The same, decoded from the wire in both creation widths.
+    let decoded = Alive2Resp::decode(&[b'y', 0x01, 0x00, 0x00]).expect("decode");
+    assert!(decoded.is_alive_conflict());
+    assert_eq!(decoded.creation(), 0);
+    let decoded = Alive2Resp::decode(&[b'y', 0x00, 0x12, 0x34]).expect("decode");
+    assert!(decoded.is_accepted());
+    assert_eq!(decoded.creation(), 0x1234);
+    let decoded = Alive2Resp::decode(&[b'v', 0x00, 0xDE, 0xAD, 0xBE, 0xEF]).expect("decode");
+    assert!(decoded.is_accepted());
+    assert_eq!(decoded.creation(), 0xDEAD_BEEF);
+}
+
+#[test]
+fn port2_resp_distinguishes_registered_from_not_registered() {
+    let found = Port2Resp::Ok {
+        port: 9000,
+        node_type: EPMD_NODE_NORMAL,
+        protocol: EPMD_PROTO_TCP,
+        high_vsn: 6,
+        low_vsn: 6,
+        name: b"gurka".to_vec(),
+        extra: Vec::new(),
+    };
+    assert!(found.is_registered());
+    assert!(!found.is_not_registered());
+
+    // The `'w' + result(1)` "not registered" reply (result byte != 0).
+    for body in [&[b'w', 0x01][..], &[b'w', 0x02][..]] {
+        let resp = Port2Resp::decode(body).expect("decode");
+        assert!(resp.is_not_registered());
+        assert!(!resp.is_registered());
+        assert_eq!(resp, Port2Resp::Error);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LIVE `epmd` DUMP (read-only; `KILL`/`STOP` are never sent to a real daemon)
+// ---------------------------------------------------------------------------
+
+/// `DUMP_REQ` is the only interactive code that is **read-only**, so it is the
+/// only one exercised against the machine's real `epmd` (which requires only a
+/// loopback peer). `KILL_REQ`/`STOP_REQ` would shut the daemon down or
+/// de-register a node and are therefore codec-covered only.
+///
+/// The test registers its own uniquely named node first, so the assertion does
+/// not depend on whatever else happens to be registered on the host. It skips
+/// loudly when no `epmd` is reachable.
+#[test]
+fn live_epmd_dump_lists_a_node_we_just_registered() {
+    // `epmd` closes the connection right after answering a DUMP (only ALIVE2 sets
+    // `keep`), so the body ends at EOF; a short read timeout still bounds the test
+    // against a peer that holds the socket open.
+    let mut transport = match TcpTransport::connect(EPMD_DEFAULT_ADDR) {        Ok(transport) => transport,
+        Err(err) => {
+            eprintln!(
+                "live_epmd: SKIP — no epmd reachable at {EPMD_DEFAULT_ADDR} ({err:?}); \
+                 the codec tests above still cover the wire hermetically"
+            );
+            return;
+        }
+    };
+    transport.set_read_timeout(Some(Duration::from_secs(2))).expect("set_read_timeout");
+
+    let Some(mut publisher) = live_epmd_client() else {
+        return;
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    let port = listener.local_addr().expect("local_addr").port();
+    let name = live_node_name();
+
+    let req = Alive2Req {
+        port,
+        node_type: EPMD_NODE_NORMAL,
+        protocol: EPMD_PROTO_TCP,
+        high_vsn: EPMD_DIST_HIGH,
+        low_vsn: EPMD_DIST_LOW,
+        name: name.clone().into_bytes(),
+        extra: Vec::new(),
+    };
+    let resp = match publisher.publish(&req) {
+        Ok(resp) => resp,
+        Err(err) => {
+            eprintln!(
+                "live_epmd: SKIP — {EPMD_DEFAULT_ADDR} accepted the connection but not an \
+                 ALIVE2_REQ ({err:?}); the codec tests above still cover the wire hermetically"
+            );
+            return;
+        }
+    };
+    // The typed acceptance accessor replaces the previous `ok`-field match.
+    assert!(resp.is_accepted(), "epmd refused to register {name} on port {port}: {resp:?}");
+
+    // The dump is read over a *second* connection, read-only.
+    let mut client = EpmdClient::new(transport);
+    let dump = match client.dump() {
+        Ok(dump) => dump,
+        Err(err) => {
+            eprintln!("live_epmd: SKIP — the real epmd did not answer DUMP_REQ ({err:?})");
+            return;
+        }
+    };
+
+    // The dump starts with epmd's own port.
+    assert_eq!(dump.port, u32::from(beam_dist::EPMD_PORT), "the dump reports epmd's own port");
+    eprintln!(
+        "live_epmd: dump parsed {} node lines (epmd port {}), first = {:?}",
+        dump.lines.len(),
+        dump.port,
+        dump.lines.first()
+    );
+
+    // Every line decoded into a typed record, and our freshly registered node is
+    // listed as active on the port we registered.
+    let ours = dump
+        .lines
+        .iter()
+        .find(|line| line.name == name.as_bytes())
+        .unwrap_or_else(|| {
+            panic!(
+                "the dump must list {name}; it reported: {:?}",
+                dump.lines
+                    .iter()
+                    .map(|l| String::from_utf8_lossy(&l.name).into_owned())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(ours.is_active(), "{name} must be an active node: {ours:?}");
+    assert_eq!(ours.port, port, "the dump must report the registered port");
+    assert!(ours.fd > 0, "an active node has a live descriptor: {ours:?}");
+    assert!(dump.active().any(|line| line.name == name.as_bytes()));
+    assert!(
+        dump.active().count() <= dump.lines.len(),
+        "the active view is a subset of all lines"
+    );
+
+    // Closing the ALIVE2 socket de-registers the node again, so the test leaves
+    // no trace in the host's port mapper.
+    drop(publisher);
+    assert!(
+        wait_until_unregistered(name.as_bytes(), Duration::from_secs(5)),
+        "epmd still knows {name} after its ALIVE2 socket closed"
+    );
+    eprintln!("live_epmd: {name} de-registered after the DUMP test");
 }

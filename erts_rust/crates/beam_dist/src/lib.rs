@@ -43,30 +43,34 @@ pub mod handshake;
 pub mod prelude;
 pub mod transport;
 
-pub use crate::control::{decode_control, encode_control, encode_control_cached, ControlMessage};
+pub use crate::control::{
+    carries_message, decode_control, encode_control, encode_control_cached, ControlMessage,
+};
 pub use crate::delivery::{Delivery, DeliveryOutcome, Dispatched, InboundSink, UnsupportedSink};
 pub use crate::dist_header::{AtomCacheRef, DistFragment, DistHeader};
 pub use crate::driver::{ConnectionDriver, DriverState, StepOutcome};
 pub use crate::epmd::{
-    connect, lookup, lookup_port, Alive2Req, Alive2Resp, EpmdClient, NamesResp, Port2Req,
-    Port2Resp, EPMD_DEFAULT_ADDR,
+    connect, lookup, lookup_port, Alive2Req, Alive2Resp, DumpLine, DumpNodeKind, DumpReq, DumpResp,
+    EpmdClient, KillReq, KillResp, NamesResp, Port2Req, Port2Resp, StopReq, StopResp,
+    EPMD_DEFAULT_ADDR, MAX_DUMP_RESP_BODY,
 };
 pub use crate::flags::{AltactSigFlags, DistFlags, DistSpawnFlags, Dop};
 pub use crate::framing::{
     is_tick, read_length, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
 };
 pub use crate::handshake::{
-    check_mandatory, preferred_flags, verify_digest, Challenge, ChallengeAck, ChallengeDigest,
-    ChallengeReply, ChallengeSource, Complement, Name, Status,
+    check_mandatory, preferred_flags, publish_flag, publish_type, status_error, verify_digest,
+    Challenge, ChallengeAck, ChallengeDigest, ChallengeReply, ChallengeSource, Complement, Name,
+    PeerVisibility, PublishKind, Status, StatusKind,
 };
 pub use crate::transport::{MemoryTransport, Transport};
 
 pub use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache, SegmentCache};
 pub use crate::auth::{gen_challenge, gen_digest, md5, Md5Digest, SystemChallengeSource};
 pub use crate::connection::{
-    accept_server, connect_client, connect_client_with_creation, connect_to_node,
-    connect_to_node_with_creation, Connection, Handshake, TcpListener, TcpTransport,
-    CLIENT_CREATION, DEFAULT_READ_TIMEOUT,
+    accept_server, accept_server_with_flags, connect_client, connect_client_with_creation,
+    connect_client_with_flags, connect_to_node, connect_to_node_with_creation, Connection,
+    Handshake, TcpListener, TcpTransport, CLIENT_CREATION, DEFAULT_READ_TIMEOUT,
 };
 pub use crate::fragment::{
     Assembly, FragmentAssembler, FragmentCont, FragmentHeader, DIST_FRAGMENT_SIZE,

@@ -20,11 +20,18 @@
 //!     if n == 0 { driver.feed_eof(); }         // peer closed
 //!     else      { driver.feed(&buf[..n]); }
 //!
-//!     loop {
-//!         if driver.step()? == StepOutcome::WouldBlock { break; }
-//!     }
+//!     let step_result = loop {
+//!         match driver.step() {
+//!             Ok(StepOutcome::WouldBlock) => break Ok(()),
+//!             Ok(_) => {}
+//!             Err(e) => break Err(e),
+//!         }
+//!     };
+//!     // A refusing acceptor buffers its `not_allowed` status *before* returning
+//!     // the error, so drain (and write) the output even on error.
 //!     let out = driver.take_output();
 //!     if !out.is_empty() { write(socket, &out)?; }
+//!     step_result?;
 //!
 //!     while let Some(msg) = driver.next_message(&mut heap, &mut atoms)? {
 //!         /* handle the DOP_* message */
@@ -70,7 +77,19 @@
 //! unknown wire data is [`BeamError::BadArg`]; the decoder never `unwrap()`s on
 //! wire data and never panics. A protocol error is **fatal** for the link: the
 //! driver moves to [`DriverState::Failed`] and further calls to `step` report
-//! [`StepOutcome::Failed`].
+//! [`StepOutcome::Failed`] instead of resuming, so a handshake error can never
+//! hang the caller. A peer's non-`Ok` [`Status`] refusal is classified through the
+//! single mapping shared with the blocking API
+//! ([`crate::handshake::status_error`]) — a `"nok"`/`"not_allowed"` refusal, an
+//! `"alive"` peer and a `"named:"` name collision each surface the same typed `Io`
+//! error (and `io::ErrorKind`) [`crate::connection`] would return.
+//!
+//! Conversely, a driver playing the **accepting** role that must refuse a peer
+//! (a `Name` whose flags fail the mandatory check) writes the `"not_allowed"`
+//! status into its output **before** returning the error: the framed bytes are
+//! buffered, so [`ConnectionDriver::take_output`] still yields them after `step`
+//! returned `Err` — the driver notifies the peer exactly as
+//! [`crate::connection::accept_server`] does, so the rejected peer cannot block.
 
 use std::collections::VecDeque;
 
@@ -91,7 +110,8 @@ use crate::framing::{
     is_tick, read_length, read_packet, write_packet, write_tick, PacketHeaderSize,
 };
 use crate::handshake::{
-    check_mandatory, preferred_flags, Challenge, ChallengeAck, ChallengeReply, Name, Status,
+    check_mandatory, preferred_flags, publish_type, status_error, Challenge, ChallengeAck,
+    ChallengeReply, Name, PeerVisibility, Status,
 };
 use crate::transport::{MemoryTransport, Read, Write};
 
@@ -281,6 +301,30 @@ impl ConnectionDriver {
             cookie,
             creation,
             our_challenge,
+            preferred_flags(),
+        )
+    }
+
+    /// [`ConnectionDriver::client`] advertising an explicit **capability flag set**.
+    ///
+    /// The opt-in seam for a *published* node (default: [`preferred_flags`], which
+    /// omits `DFLAG_PUBLISHED`, `dist.h:30`/`dist.h:118-129`). See
+    /// [`crate::connection::connect_client_with_flags`] and
+    /// [`crate::handshake::publish_flag`].
+    pub fn client_with_flags(
+        our_name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+    ) -> ConnectionDriver {
+        ConnectionDriver::new(
+            Role::Client,
+            HandshakePhase::ClientSendName,
+            our_name,
+            cookie,
+            creation,
+            gen_challenge(),
+            flags,
         )
     }
 
@@ -317,10 +361,34 @@ impl ConnectionDriver {
             cookie,
             creation,
             our_challenge,
+            preferred_flags(),
         )
     }
 
-    /// The shared constructor.
+    /// [`ConnectionDriver::server`] advertising an explicit **capability flag set**.
+    ///
+    /// The opt-in seam for a *published* acceptor (default: [`preferred_flags`], a
+    /// **hidden** node). See [`crate::connection::accept_server_with_flags`].
+    pub fn server_with_flags(
+        our_name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+    ) -> ConnectionDriver {
+        ConnectionDriver::new(
+            Role::Server,
+            HandshakePhase::ServerAwaitName,
+            our_name,
+            cookie,
+            creation,
+            gen_challenge(),
+            flags,
+        )
+    }
+
+    /// The shared constructor (`our_flags` is the capability set this node
+    /// advertises — [`preferred_flags`] unless a `*_with_flags` constructor
+    /// overrides it).
     fn new(
         role: Role,
         phase: HandshakePhase,
@@ -328,6 +396,7 @@ impl ConnectionDriver {
         cookie: &[u8],
         creation: u32,
         our_challenge: u32,
+        our_flags: DistFlags,
     ) -> ConnectionDriver {
         ConnectionDriver {
             role,
@@ -336,7 +405,7 @@ impl ConnectionDriver {
             our_name: our_name.to_vec(),
             cookie: cookie.to_vec(),
             creation,
-            our_flags: preferred_flags(),
+            our_flags,
             our_challenge,
             handshake: None,
             hs_client_flags: DistFlags::EMPTY,
@@ -612,6 +681,12 @@ impl ConnectionDriver {
         self.handshake.as_ref().map_or(0, |h| h.peer_creation)
     }
 
+    /// How the peer's own flags classify it (`dist_util.erl:publish_type/1` — see
+    /// [`Handshake::peer_visibility`]), or `None` before the handshake completes.
+    pub fn peer_visibility(&self) -> Option<PeerVisibility> {
+        self.handshake.as_ref().map(|h| h.peer_visibility)
+    }
+
     /// The full handshake outcome, once established.
     pub fn handshake(&self) -> Option<&Handshake> {
         self.handshake.as_ref()
@@ -651,6 +726,13 @@ impl ConnectionDriver {
                     None => return self.stall_hs(),
                 };
                 let status = Status::decode(&body)?;
+                // Anything other than `"ok"` aborts, classified by the single
+                // status -> error mapping shared with the blocking client
+                // ([`crate::handshake::status_error`]): `"nok"`/`"not_allowed"`
+                // refusals, an `"alive"` peer, and the two statuses a real node
+                // continues on but this client cannot (`"ok_simultaneous"`/
+                // `"named:"`) all become the same typed `Io` error (and the same
+                // `io::ErrorKind`) the blocking API produces.
                 if status != Status::Ok {
                     return Err(status_error(&status));
                 }
@@ -696,7 +778,25 @@ impl ConnectionDriver {
                     None => return self.stall_hs(),
                 };
                 let name = Name::decode(&body)?;
-                self.hs_negotiated = check_mandatory(name.flags)?;
+                // A peer whose flags fail the mandatory check (the v6 version gate)
+                // is refused. A real accepting node *tells the peer* before dropping
+                // the link (`dist_util.erl:286`: `check_dflags` ->
+                // `send_status(HSData, not_allowed)`); the framed `"not_allowed"`
+                // status is buffered into `output` here (drained by
+                // [`take_output`](Self::take_output) — the bytes survive even though
+                // this returns `Err`) so the rejecting driver emits the same wire
+                // bytes the blocking acceptor does (`crate::connection`'s
+                // `send_refusal`), and the rejected peer reads a status frame
+                // instead of blocking for one that never comes.
+                let negotiated = match check_mandatory(name.flags) {
+                    Ok(negotiated) => negotiated,
+                    Err(refusal) => {
+                        let status = encode_handshake_body(|w| Status::not_allowed().encode(w))?;
+                        self.frame(HANDSHAKE_FRAMING, &status)?;
+                        return Err(refusal);
+                    }
+                };
+                self.hs_negotiated = negotiated;
                 self.hs_client_flags = name.flags;
                 self.hs_server_flags = self.our_flags;
                 self.hs_peer_creation = name.creation;
@@ -735,12 +835,21 @@ impl ConnectionDriver {
 
     /// Finalises the handshake: builds the [`Handshake`] outcome.
     fn establish(&mut self) {
+        // The peer's own flags: the client's `Challenge` carries the server's set
+        // and the server's `Name` carries the client's — exactly the split
+        // `dist_util.erl` uses to classify `other_flags` (`publish_type/1`).
+        let peer_flags = if self.role == Role::Client {
+            self.hs_server_flags
+        } else {
+            self.hs_client_flags
+        };
         self.handshake = Some(Handshake {
             client_flags: self.hs_client_flags,
             server_flags: self.hs_server_flags,
             negotiated: self.hs_negotiated,
             peer_creation: self.hs_peer_creation,
             peer_name: std::mem::take(&mut self.hs_peer_name),
+            peer_visibility: publish_type(peer_flags),
             buffered: None,
         });
     }
@@ -819,24 +928,6 @@ impl ConnectionDriver {
     /// Queues a tick reply into the output buffer.
     fn queue_tick(&mut self) -> Result<()> {
         write_tick(&mut VecSink(&mut self.output), ESTABLISHED_FRAMING)
-    }
-}
-
-/// The `BeamError` for a handshake the peer refused (`"nok…"` / `"snamed:"` /
-/// `"sok_simultaneous"`), carrying the status text.
-fn status_error(status: &Status) -> BeamError {
-    match status {
-        Status::Error(text) => BeamError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            format!(
-                "distribution handshake refused by peer: {}",
-                String::from_utf8_lossy(text)
-            ),
-        )),
-        other => BeamError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("distribution handshake: unexpected status {other:?}"),
-        )),
     }
 }
 

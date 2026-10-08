@@ -10,12 +10,13 @@ use beam_common::{BeamError, Result};
 
 use beam_dist::flags::{
     DistFlags, DFLAG_DIST_DEFAULT, DFLAG_DIST_MANDATORY, DFLAG_DIST_MANDATORY_25,
-    DFLAG_DIST_MANDATORY_26, DFLAG_MANDATORY_25_DIGEST, DFLAG_MAP_TAG,
+    DFLAG_DIST_MANDATORY_26, DFLAG_MANDATORY_25_DIGEST, DFLAG_MAP_TAG, DFLAG_PUBLISHED,
 };
 use beam_dist::handshake::{
-    check_mandatory, preferred_flags, verify_digest, Challenge, ChallengeAck, ChallengeDigest,
-    ChallengeReply, Complement, Name, Status, CHALLENGE_ACK_TAG, CHALLENGE_REPLY_TAG,
-    CHALLENGE_TAG, COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
+    check_mandatory, preferred_flags, publish_flag, publish_type, status_error, verify_digest,
+    Challenge, ChallengeAck, ChallengeDigest, ChallengeReply, Complement, Name, PeerVisibility,
+    PublishKind, Status, StatusKind, CHALLENGE_ACK_TAG, CHALLENGE_REPLY_TAG, CHALLENGE_TAG,
+    COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
 };
 use beam_dist::transport::Write;
 
@@ -262,6 +263,80 @@ fn status_error_roundtrip() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// StatusKind classification.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_kind_classifies_every_documented_code() -> Result<()> {
+    // The status codes the OTP distribution guide defines
+    // (`erts/doc/guides/erl_dist_protocol.md:533-575`), each with the text a real
+    // node sends (`lib/kernel/src/dist_util.erl` `send_status` calls).
+    assert_eq!(Status::Ok.kind(), StatusKind::Ok);
+    assert_eq!(Status::Simultaneous.kind(), StatusKind::Simultaneous);
+    assert_eq!(
+        Status::Named { name: b"gurka@localhost".to_vec(), creation: 3 }.kind(),
+        StatusKind::Named
+    );
+    assert_eq!(Status::Error(b"nok".to_vec()).kind(), StatusKind::Nok);
+    assert_eq!(Status::Error(b"not_allowed".to_vec()).kind(), StatusKind::NotAllowed);
+    assert_eq!(Status::Error(b"alive".to_vec()).kind(), StatusKind::Alive);
+    // The step-3B `"true"`/`"false"` replies, an unknown code, and the empty text
+    // all classify as `Other` — including `no_creation`/`system_limit`, which this
+    // OTP release never sends as a status (`dist_util.erl:593` raises the latter
+    // locally).
+    assert_eq!(Status::Error(b"true".to_vec()).kind(), StatusKind::Other);
+    assert_eq!(Status::Error(b"false".to_vec()).kind(), StatusKind::Other);
+    assert_eq!(Status::Error(b"system_limit".to_vec()).kind(), StatusKind::Other);
+    assert_eq!(Status::Error(Vec::new()).kind(), StatusKind::Other);
+
+    // The classification is chosen by the wire text, so it survives a
+    // decode round-trip for every dedicated variant.
+    let cases = [
+        (Status::Ok, StatusKind::Ok),
+        (Status::Simultaneous, StatusKind::Simultaneous),
+        (
+            Status::Named { name: b"n@h".to_vec(), creation: 9 },
+            StatusKind::Named,
+        ),
+        (Status::Error(b"nok".to_vec()), StatusKind::Nok),
+        (Status::Error(b"not_allowed".to_vec()), StatusKind::NotAllowed),
+        (Status::Error(b"alive".to_vec()), StatusKind::Alive),
+        (Status::Error(b"alive?".to_vec()), StatusKind::Other),
+    ];
+    for (status, kind) in cases {
+        let bytes = body(|w| status.encode(w));
+        assert_eq!(Status::decode(&bytes)?.kind(), kind, "decoded {status:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn error_kind_is_none_only_for_the_continuing_statuses() {
+    // `dist_util.erl:1081-1082` continues the handshake after each of these.
+    assert_eq!(Status::Ok.error_kind(), None);
+    assert_eq!(Status::Simultaneous.error_kind(), None);
+    assert_eq!(Status::Named { name: Vec::new(), creation: 0 }.error_kind(), None);
+
+    assert_eq!(Status::Error(b"nok".to_vec()).error_kind(), Some(StatusKind::Nok));
+    assert_eq!(
+        Status::Error(b"not_allowed".to_vec()).error_kind(),
+        Some(StatusKind::NotAllowed)
+    );
+    assert_eq!(Status::Error(b"alive".to_vec()).error_kind(), Some(StatusKind::Alive));
+    assert_eq!(Status::Error(b"bogus".to_vec()).error_kind(), Some(StatusKind::Other));
+}
+
+#[test]
+fn refusal_constructors_match_the_reference_texts() -> Result<()> {
+    // The two refusal texts a real accepting node sends (`dist_util.erl:286`/`:343`).
+    assert_eq!(body(|w| Status::nok().encode(w)), b"snok");
+    assert_eq!(body(|w| Status::not_allowed().encode(w)), b"snot_allowed");
+    assert_eq!(Status::nok().kind(), StatusKind::Nok);
+    assert_eq!(Status::not_allowed().kind(), StatusKind::NotAllowed);
+    assert_eq!(Status::decode(b"snot_allowed")?, Status::not_allowed());
+    Ok(())
+}
+// ---------------------------------------------------------------------------
 // Negatives: wrong tag, truncation, empty body.
 // ---------------------------------------------------------------------------
 
@@ -361,6 +436,61 @@ fn preferred_flags_covers_the_mandatory_set() {
     assert!(preferred_flags().contains(DistFlags::from_bits(DFLAG_MANDATORY_25_DIGEST)));
 }
 
+// ---------------------------------------------------------------------------
+// Node visibility (DFLAG_PUBLISHED): `publish_flag/3` / `publish_type/1`.
+// ---------------------------------------------------------------------------
+
+/// GOLDEN-VECTOR: [`publish_flag`] mirrors `dist_util.erl:publish_flag/3`
+/// (`dist_util.erl:150-160`) — `DFLAG_PUBLISHED` exactly for a normal connection
+/// to a peer we publish to, and nothing otherwise.
+#[test]
+fn publish_flag_mirrors_the_ground_truth() {
+    let none = DistFlags::EMPTY;
+    let published = DistFlags::from_bits(DFLAG_PUBLISHED);
+
+    // publish_flag(_, _, OtherNode) -> publish_on_node(OtherNode): true -> set.
+    assert_eq!(publish_flag(false, true), published);
+    // ...false -> 0.
+    assert_eq!(publish_flag(false, false), none);
+    // publish_flag(hidden, _, _) -> 0, regardless of publish_on_node.
+    assert_eq!(publish_flag(true, true), none);
+    assert_eq!(publish_flag(true, false), none);
+
+    // The typed form is exactly the boolean form.
+    assert_eq!(PublishKind::Normal.publish_flag(true), publish_flag(false, true));
+    assert_eq!(PublishKind::Normal.publish_flag(false), publish_flag(false, false));
+    assert_eq!(PublishKind::Hidden.publish_flag(true), publish_flag(true, true));
+    assert_eq!(PublishKind::Hidden.publish_flag(false), publish_flag(true, false));
+
+    // Exactly one bit is ever produced, and it is DFLAG_PUBLISHED (`0x01`).
+    assert_eq!(publish_flag(false, true).bits(), DFLAG_PUBLISHED);
+    assert_eq!(DFLAG_PUBLISHED, 0x01);
+}
+
+/// GOLDEN-VECTOR: [`publish_type`] mirrors `dist_util.erl:publish_type/1`
+/// (`dist_util.erl:917-923`) — keyed **only** on the peer's `DFLAG_PUBLISHED`.
+#[test]
+fn publish_type_classifies_the_peer_by_dflag_published() {
+    // The default set omits the bit (the emulator's `erts_dflags.default`,
+    // `dist.h:118-129`), so a peer offering it is classified hidden.
+    assert!(!preferred_flags().contains(DistFlags::from_bits(DFLAG_PUBLISHED)));
+    assert_eq!(publish_type(preferred_flags()), PeerVisibility::Hidden);
+    assert_eq!(publish_type(DistFlags::EMPTY), PeerVisibility::Hidden);
+
+    // A peer that ORs the bit in is normal.
+    let published = preferred_flags() | DistFlags::from_bits(DFLAG_PUBLISHED);
+    assert_eq!(publish_type(published), PeerVisibility::Normal);
+
+    // Only DFLAG_PUBLISHED matters: every other capability bit is ignored.
+    let others = DistFlags::from_bits(DFLAG_DIST_DEFAULT & !DFLAG_PUBLISHED);
+    assert_eq!(others.bits(), DFLAG_DIST_DEFAULT);
+    assert_eq!(publish_type(others), PeerVisibility::Hidden);
+
+    // Round-trip: the flag `publish_flag` produces is exactly what flips the
+    // classification from hidden to normal.
+    assert_eq!(preferred_flags() | publish_flag(false, true), published);
+}
+
 #[test]
 fn check_mandatory_accepts_a_full_mandatory_word() -> Result<()> {
     let flags = DistFlags::from_bits(DFLAG_DIST_MANDATORY);
@@ -435,4 +565,78 @@ fn verify_digest_matches_and_rejects() {
     assert!(!verify_digest(&tampered, challenge, cookie, &d));
     // The all-zero digest is only accepted when it really is the derived one.
     assert!(!verify_digest(&[0u8; 16], challenge, cookie, &d));
+}
+
+// ---------------------------------------------------------------------------
+// The single status -> BeamError mapping.
+//
+// `status_error` is the one implementation shared by the blocking `connection`
+// API and the non-blocking `driver`; these cases pin its `io::ErrorKind`
+// selection and that it never loses the peer's reported text / name.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_error_selects_the_io_kind_for_every_refusal() {
+    use std::io::ErrorKind;
+
+    let cases = [
+        (Status::nok(), ErrorKind::ConnectionRefused),
+        (Status::not_allowed(), ErrorKind::PermissionDenied),
+        (Status::Error(b"alive".to_vec()), ErrorKind::ConnectionAborted),
+        (
+            Status::Named { name: b"gurka@localhost".to_vec(), creation: 3 },
+            ErrorKind::AlreadyExists,
+        ),
+        (Status::Simultaneous, ErrorKind::ConnectionAborted),
+        // A status that is neither a refusal nor a continuing code, and the
+        // (unreachable-in-practice) `Ok`, both fall through to `InvalidData`.
+        (Status::Error(b"weird".to_vec()), ErrorKind::InvalidData),
+        (Status::Error(b"true".to_vec()), ErrorKind::InvalidData),
+        (Status::Ok, ErrorKind::InvalidData),
+    ];
+
+    for (status, expected) in cases {
+        match status_error(&status) {
+            BeamError::Io(io) => {
+                assert_eq!(io.kind(), expected, "status {status:?}");
+                assert!(
+                    io.to_string().contains("distribution handshake"),
+                    "the message names the context: {io}"
+                );
+            }
+            other => panic!("expected an Io error for {status:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn status_error_keeps_the_peer_text_name_and_creation() {
+    match status_error(&Status::Error(b"nok_cookie".to_vec())) {
+        BeamError::Io(io) => {
+            let msg = io.to_string();
+            assert!(msg.contains("nok_cookie"), "carries the peer's status text: {msg}");
+            // `nok_cookie` is not the exact `"nok"` code, so it classifies `Other`.
+            assert!(msg.contains("Other"), "names the kind: {msg}");
+        }
+        other => panic!("expected Io, got {other:?}"),
+    }
+
+    match status_error(&Status::nok()) {
+        BeamError::Io(io) => {
+            let msg = io.to_string();
+            assert!(msg.contains("nok"), "carries the peer's status text: {msg}");
+            assert!(msg.contains("Nok"), "names the kind: {msg}");
+        }
+        other => panic!("expected Io, got {other:?}"),
+    }
+
+    match status_error(&Status::Named { name: b"gurka@localhost".to_vec(), creation: 7 }) {
+        BeamError::Io(io) => {
+            let msg = io.to_string();
+            assert!(msg.contains("gurka@localhost"), "names the already-assigned node: {msg}");
+            assert!(msg.contains('7'), "names its creation: {msg}");
+            assert!(msg.contains("Named"), "names the kind: {msg}");
+        }
+        other => panic!("expected Io, got {other:?}"),
+    }
 }

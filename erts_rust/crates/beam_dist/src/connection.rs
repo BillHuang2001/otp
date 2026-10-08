@@ -78,7 +78,13 @@
 //! **clean EOF** (the peer closed the connection) is reported as
 //! [`BeamError::BadArg`], matching [`crate::transport::MemoryTransport`]'s
 //! "short read" semantics. A refused handshake carries the peer's status text in
-//! `Io(ErrorKind::ConnectionRefused)`.
+//! `Io` under the [`StatusKind`]-selected [`std::io::ErrorKind`] (the single
+//! mapping lives in [`crate::handshake::status_error`], shared with
+//! [`crate::driver`]): `ConnectionRefused` for `"nok"`, `PermissionDenied`
+//! for `"not_allowed"`, `ConnectionAborted` for `"alive"`/`"ok_simultaneous"`,
+//! `AlreadyExists` for `"named:…"` and `InvalidData` for an unknown status. A
+//! refused **acceptor** also writes the `"not_allowed"` status to the peer first
+//! (see [`accept_server`]), so neither side can hang.
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
 use std::time::Duration;
@@ -99,7 +105,8 @@ use crate::framing::{
     is_tick, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
 };
 use crate::handshake::{
-    check_mandatory, preferred_flags, Challenge, ChallengeAck, ChallengeReply, Name, Status,
+    check_mandatory, preferred_flags, publish_type, status_error, Challenge, ChallengeAck,
+    ChallengeReply, Name, PeerVisibility, Status, StatusKind,
 };
 use crate::transport::{Read, Transport, Write};
 
@@ -287,6 +294,13 @@ pub struct Handshake {
     pub peer_creation: u32,
     /// The peer's node name.
     pub peer_name: Vec<u8>,
+    /// How the peer's own flags classify it — the `dist_util.erl:publish_type/1`
+    /// equivalent, derived from the peer's `DFLAG_PUBLISHED` (`dist.h:30`,
+    /// `dist_util.erl:917-923`): the bit set means [`PeerVisibility::Normal`],
+    /// absent means [`PeerVisibility::Hidden`]. Computed from the peer's `'N'`
+    /// challenge flags on the client path and its `'N'` name flags on the server
+    /// path.
+    pub peer_visibility: PeerVisibility,
     /// A post-handshake packet body read while draining the handshake, if any.
     ///
     /// Always `None` for the OTP-23 `'N'` handshake (no `Complement` is
@@ -310,6 +324,17 @@ fn send_handshake<T: Transport>(transport: &mut T, body: &[u8]) -> Result<()> {
     transport.flush()
 }
 
+/// Writes one 2-byte-framed refusal [`Status`] and flushes it.
+///
+/// Used by the accepting side to notify a peer it is about to drop (a real node
+/// replies `"not_allowed"` here, `dist_util.erl:286`), so the peer never blocks
+/// waiting for a status frame. A transport failure is propagated — the link is
+/// broken either way, and a silent success would be a lie.
+fn send_refusal<T: Transport>(transport: &mut T, status: Status) -> Result<()> {
+    let body = encode_handshake(|w| status.encode(w))?;
+    send_handshake(transport, &body)
+}
+
 /// Encodes a handshake message body through its own codec.
 fn encode_handshake<F>(encode: F) -> Result<Vec<u8>>
 where
@@ -320,24 +345,6 @@ where
     let mut sink = crate::transport::MemoryTransport::new();
     encode(&mut sink)?;
     Ok(sink.into_written())
-}
-
-/// Builds the error for a handshake the peer refused (`"nok…"` / `"snamed:"` /
-/// `"sok_simultaneous"`), carrying the status text.
-fn status_error(status: &Status) -> BeamError {
-    match status {
-        Status::Error(text) => BeamError::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            format!(
-                "distribution handshake refused by peer: {}",
-                String::from_utf8_lossy(text)
-            ),
-        )),
-        other => BeamError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("distribution handshake: unexpected status {other:?}"),
-        )),
-    }
 }
 
 /// Drives the **client** side of the connect/challenge handshake.
@@ -364,7 +371,24 @@ pub fn connect_client_with_creation<T: Transport>(
     cookie: &[u8],
     creation: u32,
 ) -> Result<Handshake> {
-    connect_client_core(t, our_name, cookie, gen_challenge(), creation)
+    connect_client_core(t, our_name, cookie, gen_challenge(), creation, preferred_flags())
+}
+
+/// [`connect_client_with_creation`] advertising an explicit **capability flag set**.
+///
+/// The opt-in seam a *published* node needs: the default constructors advertise
+/// exactly [`preferred_flags`], which — like the emulator's `erts_dflags.default`
+/// (`dist.h:118-129`) — omits `DFLAG_PUBLISHED` (`0x01`, `dist.h:30`); a real node
+/// ORs that bit in per peer ([`crate::handshake::publish_flag`],
+/// `dist_util.erl:199-200`). [`Handshake::peer_visibility`] classifies the *peer*.
+pub fn connect_client_with_flags<T: Transport>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+    flags: DistFlags,
+) -> Result<Handshake> {
+    connect_client_core(t, our_name, cookie, gen_challenge(), creation, flags)
 }
 
 /// [`connect_client`] with an explicit challenge nonce (the testable core).
@@ -374,29 +398,33 @@ fn connect_client_with<T: Transport>(
     cookie: &[u8],
     our_challenge: u32,
 ) -> Result<Handshake> {
-    connect_client_core(t, our_name, cookie, our_challenge, CLIENT_CREATION)
+    connect_client_core(t, our_name, cookie, our_challenge, CLIENT_CREATION, preferred_flags())
 }
 
-/// The connect/challenge client handshake with both knobs explicit: the challenge
-/// nonce (`our_challenge`) and the advertised creation (`creation`).
+/// The connect/challenge client handshake with every knob explicit: the challenge
+/// nonce (`our_challenge`), the advertised creation (`creation`) and the advertised
+/// capability flag set (`our_flags`).
 fn connect_client_core<T: Transport>(
     t: &mut T,
     our_name: &[u8],
     cookie: &[u8],
     our_challenge: u32,
     creation: u32,
+    our_flags: DistFlags,
 ) -> Result<Handshake> {
-    let our_flags = preferred_flags();
-
     // 1. Name.
     let body = encode_handshake(|w| {
         Name { flags: our_flags, creation, name: our_name.to_vec() }.encode(w)
     })?;
     send_handshake(t, &body)?;
 
-    // 2. Status (`"ok"` proceeds).
+    // 2. Status. Only `"ok"` lets this client proceed; every other documented
+    //    code is surfaced as a typed error (see `crate::handshake::status_error`):
+    //    a peer refusal (`"nok"`/`"not_allowed"`), an already-active link
+    //    (`"alive"`), or the two statuses a real node continues on but this client
+    //    cannot (`"ok_simultaneous"`/`"named:"`).
     let status = Status::decode(&read_packet(t, HANDSHAKE_FRAMING)?)?;
-    if status != Status::Ok {
+    if status.kind() != StatusKind::Ok {
         return Err(status_error(&status));
     }
 
@@ -433,6 +461,7 @@ fn connect_client_core<T: Transport>(
         negotiated,
         peer_creation: challenge.creation,
         peer_name: challenge.name,
+        peer_visibility: publish_type(challenge.flags),
         buffered: None,
     })
 }
@@ -442,6 +471,13 @@ fn connect_client_core<T: Transport>(
 /// `our_name`/`creation` identify this node and `cookie` is the shared secret.
 /// The server advertises [`preferred_flags`] and no `Complement` (that message
 /// answers only the legacy `'n'` name, which this crate does not speak).
+///
+/// **A peer whose `Name` cannot be accepted is told so.** When the client's flags
+/// fail the mandatory check (the v6 version gate), the server writes a
+/// 2-byte-framed `"not_allowed"` [`Status`] and flushes it *before* returning the
+/// error, exactly as a real accepting node does (`dist_util.erl:286`:
+/// `send_status(HSData, not_allowed)`). A rejected peer therefore reads a status
+/// frame and fails immediately instead of blocking on a frame that never arrives.
 ///
 /// **`our_name` must be this node's full `node@host` name.** OTP's connecting side
 /// compares the name inside the server's `'N'` challenge with the node it dialled
@@ -459,6 +495,26 @@ pub fn accept_server<T: Transport>(
     accept_server_with(t, our_name, cookie, creation, gen_challenge())
 }
 
+/// [`accept_server`] advertising an explicit **capability flag set**.
+///
+/// The opt-in seam for a *published* acceptor: pass
+/// `preferred_flags() | publish_flag(false, true)` (or any other set) to advertise
+/// `DFLAG_PUBLISHED` (`0x01`, `dist.h:30`) — the emulator's default set omits it
+/// (`dist.h:118-129`; a real node ORs it in per peer, `dist_util.erl:199-200`). A
+/// peer that receives the bit classifies this node as `normal`
+/// (`dist_util.erl:publish_type/1`) and lists it in its `nodes()`; without it the
+/// peer sees a **hidden** node. The advertised set is reported in
+/// [`Handshake::server_flags`].
+pub fn accept_server_with_flags<T: Transport>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+    flags: DistFlags,
+) -> Result<Handshake> {
+    accept_server_core(t, our_name, cookie, creation, gen_challenge(), flags)
+}
+
 /// [`accept_server`] with an explicit challenge nonce (the testable core).
 fn accept_server_with<T: Transport>(
     t: &mut T,
@@ -467,11 +523,35 @@ fn accept_server_with<T: Transport>(
     creation: u32,
     our_challenge: u32,
 ) -> Result<Handshake> {
-    let our_flags = preferred_flags();
+    accept_server_core(t, our_name, cookie, creation, our_challenge, preferred_flags())
+}
 
+/// The accept handshake with every knob explicit: the challenge nonce
+/// (`our_challenge`) and the advertised capability flag set (`our_flags`).
+fn accept_server_core<T: Transport>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+    our_challenge: u32,
+    our_flags: DistFlags,
+) -> Result<Handshake> {
     // 1. Name: the client's flags, creation and name.
     let name = Name::decode(&read_packet(t, HANDSHAKE_FRAMING)?)?;
-    let negotiated = check_mandatory(name.flags)?;
+    // A peer whose flags fail the mandatory check (the v6 version gate) is
+    // refused. A real accepting node *tells the peer* before dropping the link
+    // (`dist_util.erl:286`, `check_dflags` → `send_status(HSData, not_allowed)`);
+    // returning without sending anything would leave the connecting node waiting
+    // forever for a status frame that never comes. (A frame that is not even a
+    // `Name` never reaches here — `Name::decode` fails first and the link is
+    // simply dropped, matching `dist_util.erl:750`'s `?shutdown2`.)
+    let negotiated = match check_mandatory(name.flags) {
+        Ok(negotiated) => negotiated,
+        Err(refusal) => {
+            send_refusal(t, Status::not_allowed())?;
+            return Err(refusal);
+        }
+    };
 
     // 2. Status::Ok.
     let body = encode_handshake(|w| Status::Ok.encode(w))?;
@@ -509,6 +589,7 @@ fn accept_server_with<T: Transport>(
         negotiated,
         peer_creation: name.creation,
         peer_name: name.name,
+        peer_visibility: publish_type(name.flags),
         buffered: None,
     })
 }
@@ -526,6 +607,16 @@ fn accept_server_with<T: Transport>(
 /// node name (`name@host` is *not* accepted here: `epmd` is queried with the bare
 /// name, exactly as `PORT2_REQ` requires). `our_name`/`cookie` are this node's name
 /// and the shared cookie.
+///
+/// **`epmd not_registered`.** When the peer is not registered with `epmd`,
+/// [`crate::epmd::lookup_port`] maps `epmd`'s `PORT2_RESP` error result to
+/// `Io(NotFound)` (never a panic and never a silent port `0`), and this function
+/// returns that error *before* any TCP connect is attempted. The `epmd` client
+/// itself (the request/reply codecs) is owned by [`crate::epmd`]; only this
+/// connect-level behaviour belongs to this module. The reply's `high_vsn`/
+/// `low_vsn` version pair is **not** consulted here — the protocol version gate
+/// this crate enforces is the in-band `DFLAG_*` mandatory check
+/// ([`check_mandatory`], see its docs).
 ///
 /// The client advertises [`CLIENT_CREATION`] as its own creation; use
 /// [`connect_to_node_with_creation`] to advertise an explicit one.
@@ -621,6 +712,39 @@ impl<T: Transport> Connection<T> {
         Ok(Connection::from_handshake(transport, handshake))
     }
 
+    /// [`Connection::client`] advertising an explicit **capability flag set**.
+    ///
+    /// The opt-in seam for a *published* node — see [`connect_client_with_flags`].
+    /// The default constructors advertise exactly [`preferred_flags`].
+    pub fn client_with_flags(
+        transport: T,
+        name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+    ) -> Result<Connection<T>> {
+        let mut transport = transport;
+        let handshake = connect_client_with_flags(&mut transport, name, cookie, creation, flags)?;
+        Ok(Connection::from_handshake(transport, handshake))
+    }
+
+    /// [`Connection::server`] advertising an explicit **capability flag set**.
+    ///
+    /// The opt-in seam for a *published* acceptor — see
+    /// [`accept_server_with_flags`]. The default `server` advertises exactly
+    /// [`preferred_flags`] (a **hidden** node).
+    pub fn server_with_flags(
+        transport: T,
+        name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+    ) -> Result<Connection<T>> {
+        let mut transport = transport;
+        let handshake = accept_server_with_flags(&mut transport, name, cookie, creation, flags)?;
+        Ok(Connection::from_handshake(transport, handshake))
+    }
+
     /// Builds a connection over a finished handshake.
     fn from_handshake(transport: T, mut handshake: Handshake) -> Connection<T> {
         let pending = handshake.buffered.take();
@@ -660,6 +784,12 @@ impl<T: Transport> Connection<T> {
     /// The peer's node creation.
     pub fn peer_creation(&self) -> u32 {
         self.handshake.peer_creation
+    }
+
+    /// How the peer's own flags classify it (`dist_util.erl:publish_type/1` —
+    /// see [`Handshake::peer_visibility`]).
+    pub fn peer_visibility(&self) -> PeerVisibility {
+        self.handshake.peer_visibility
     }
 
     /// The full handshake outcome.

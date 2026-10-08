@@ -755,8 +755,27 @@ pub const EPMD_ALIVE2_X_RESP: u8 = b'v';
 pub const EPMD_PORT2_REQ: u8 = b'z';
 /// `EPMD_PORT2_RESP`: the `'w'` port-lookup response.
 pub const EPMD_PORT2_RESP: u8 = b'w';
+/// `EPMD_PORT_PLEASE2_REQ`: the historical (pre-rename) spelling of the `'z'`
+/// port-lookup request.
+///
+/// It is the **same wire byte** as [`EPMD_PORT2_REQ`] (`122 = 'z'`): the OTP
+/// sources renamed `n_REQ` to `PORT2_REQ` and prefixed the tags `EPMD_` (see
+/// `erts/doc/notes.md`), so this is a documented alias rather than a second
+/// tag. The value is *not* repeated literally — it is [`EPMD_PORT2_REQ`].
+pub const EPMD_PORT_PLEASE2_REQ: u8 = EPMD_PORT2_REQ;
 /// `EPMD_NAMES_REQ`: the `'n'` "list names" request.
 pub const EPMD_NAMES_REQ: u8 = b'n';
+/// `EPMD_DUMP_REQ`: the `'d'` interactive "dump the node table" request
+/// (`epmd.h`; used by the `epmd -dump` CLI, `epmd_cli.c::epmd_call`).
+pub const EPMD_DUMP_REQ: u8 = b'd';
+/// `EPMD_KILL_REQ`: the `'k'` interactive "kill the daemon" request
+/// (`epmd.h`; used by the `epmd -kill` CLI, `epmd_cli.c::kill_epmd`).
+pub const EPMD_KILL_REQ: u8 = b'k';
+/// `EPMD_STOP_REQ`: the `'s'` interactive "unregister a node" request
+/// (`epmd.h`; also `EI_EPMD_STOP_REQ` in `ei_epmd.h`, used by the `epmd -stop
+/// Name` CLI, `epmd_cli.c::stop_cli`). The body is the tag followed by the node
+/// name.
+pub const EPMD_STOP_REQ: u8 = b's';
 /// `EPMD_NODE_NORMAL`: a normal Erlang node (`77`, `'M'`).
 pub const EPMD_NODE_NORMAL: u8 = b'M';
 /// `EPMD_NODE_HIDDEN`: a hidden node / C-node (`72`, `'H'`).
