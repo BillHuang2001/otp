@@ -32,6 +32,7 @@
 
 use crate::registry::BifRegistry;
 
+mod atomics;
 mod erlang;
 mod erts_debug;
 mod erts_internal;
@@ -70,6 +71,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     erts_internal::register(reg);
     erts_debug::register(reg);
     other::register(reg);
+    // The real `atomics`/`counters` resource objects register LAST so they override
+    // the seam-backed `runtime_bif!` registrations above.
+    atomics::register(reg);
 }
 
 #[cfg(test)]
