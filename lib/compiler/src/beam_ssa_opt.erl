@@ -327,16 +327,7 @@ prologue_passes(Opts) ->
           ?PASS(ssa_opt_update_tuple),
           ?PASS(ssa_opt_cse),                   % Helps the first type pass.
           ?PASS(ssa_opt_live)],                 % ...
-    Ps = case lists:member(loop_opt, Opts) of
-             true ->
-                 %% Opt-in loop optimizations. The pass is appended so that
-                 %% passes_1/2 derives its no_ssa_opt_loop_opt kill switch.
-                 Ps0 ++ [{ssa_opt_loop_opt,
-                          fun(St) -> beam_ssa_loop_opt:opt(St) end}];
-             false ->
-                 Ps0
-         end,
-    passes_1(Ps, Opts).
+    passes_1(Ps0, Opts).
 
 module_passes(Opts) ->
     Ps0 = [{ssa_opt_bc_size,
@@ -372,7 +363,17 @@ repeated_passes(Opts) ->
                  Ps0 ++ [{ssa_opt_fus, fun beam_ssa_fus:ssa_opt_fus/1}];
              false -> Ps0
          end,
-    passes_1(Ps, Opts).
+    Ps1 = case lists:member(loop_opt, Opts) of
+              true ->
+                  %% Opt-in loop optimizations. Placed after the type
+                  %% analysis (which runs at the head of the fixpoint) so
+                  %% that the SSA type annotations are available. Appending
+                  %% it lets passes_1/2 derive no_ssa_opt_loop_opt.
+                  Ps ++ [{ssa_opt_loop_opt,
+                          fun(St) -> beam_ssa_loop_opt:opt(St) end}];
+              false -> Ps
+          end,
+    passes_1(Ps1, Opts).
 
 epilogue_module_passes(Opts) ->
     Ps0 = [{ssa_opt_alias,
