@@ -74,7 +74,10 @@ MODULES =  \
 	beam_ssa_fbip \
 	beam_ssa_fus \
 	beam_ssa_lint \
+	beam_ssa_loop_arith \
+	beam_ssa_loop_cfg \
 	beam_ssa_loop_opt \
+	beam_ssa_loop_reduce \
 	beam_ssa_opt \
 	beam_ssa_opt_budget \
 	beam_ssa_pp \
