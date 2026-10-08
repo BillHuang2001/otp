@@ -64,6 +64,11 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>` — picks minor vs major (policy),
     escalating a would-not-fit minor to a major
   - `collect_minor(&mut self, roots) -> Result<GcStats>`; `collect_major(&mut self, roots) -> Result<GcStats>`
+    — each **pre-checks capacity**: a destination that cannot hold the live set returns the typed
+    `heap_exhausted` error *before* `Copier::run`, so a failed collection never leaves the from-space
+    half-forwarded (the escalation in `collect` is unchanged).
+  - `ensure_capacity(&mut self, need_words, roots) -> Result<Collection>` — the **on-demand growth seam**
+    (see Design Decisions §On-demand growth); mirrored on `GenImmixCollector`/`AnyCollector`.
   - `minor_gcs() -> u32` — minors since the last fullsweep (`GEN_GCS`); `impl HeapObservable` (see `heap_info.rs`)
   - After **every** collection the (now empty) nursery is re-sized from `HeapPolicy::young_after_collection`
     (the C minor-time young-heap resize, `erl_gc.c:1493`) and a fullsweep sizes the fresh mature space from
