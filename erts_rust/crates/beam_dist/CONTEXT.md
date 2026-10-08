@@ -372,9 +372,11 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
     non-blocking `accept` → `WouldBlock`), and the typed `send_reg_send`/`send_link`/`send_exit`/
     `send_monitor_p` helpers round-trip.
   - `tests/epmd.rs` — the epmd codecs plus **live epmd**: `publish` an `ALIVE2_REQ` on one connection,
-    `port_please`/`lookup_port` it over a second, observe de-registration on close, and `connect_to_node`
-    end-to-end; the `PORT2_REQ` framing pin (frame length = `1 + name.len()`, the name is the packet
-    remainder). Skips loudly when epmd is unreachable.
+    `port_please`/`lookup_port` it over a second, observe de-registration on close, `connect_to_node`
+    end-to-end, and a live `DUMP_REQ` (asserting the published node's own `Active` line); the
+    `PORT2_REQ` framing pin (frame length = `1 + name.len()`, the name is the packet remainder) and the
+    `not_registered` → `Io(NotFound)` typed error. `KILL`/`STOP` are codec-only (destructive). Skips
+    loudly when epmd is unreachable.
   - `tests/driver.rs` — the `ConnectionDriver`, hermetic: two drivers shuttling `take_output()` bytes
     (whole-buffer **and** byte-at-a-time), negotiated flags/peer names, an atom-cache round trip
     (`New` then `Cached`), the exact empty header `131,68,0`, a >`DIST_FRAGMENT_SIZE` message both ways
