@@ -102,15 +102,26 @@ index on the payload and teaches/re-uses those refs in the header; an atom-free 
 `131, 68, 0` header.
 
 **`epmd` over real TCP works** (an earlier "blocked in this sandbox" note was a misdiagnosis — see
-Design Decisions): `EpmdClient::connect` / `epmd::lookup_port` / `epmd::lookup` talk to a live `epmd`;
-a live test publishes a node (`ALIVE2_REQ`), looks its port up over a *second* connection, and observes
-de-registration. `connect_to_node(host, node, our_name, cookie)` chains epmd lookup → TCP connect →
-handshake.
+Design Decisions), covering the complete request set: `ALIVE2_REQ`/`ALIVE2_RESP`/`ALIVE2_X_RESP`,
+`PORT2_REQ`/`PORT2_RESP` (`PORT_PLEASE2_REQ`, the same wire byte `122`/`'z'`, an alias), `NAMES_REQ`,
+and the interactive `DUMP_REQ`/`KILL_REQ`/`STOP_REQ`. `EpmdClient::connect` / `epmd::lookup_port` /
+`epmd::lookup` talk to a live `epmd`; a live test publishes a node (`ALIVE2_REQ`), looks its port up
+over a *second* connection, observes de-registration, and reads the real `DUMP_RESP` node table
+(asserting its own `Active` line). `connect_to_node(host, node, our_name, cookie)` chains epmd lookup ->
+TCP connect -> handshake.
 
-The `DOP_*` **flag vocabularies** are complete: `DIST_SPAWN_FLAG_LINK`/`_MONITOR` and
+The `DOP_*` **in-term flag vocabularies** are complete: `DIST_SPAWN_FLAG_LINK`/`_MONITOR` and
 `DOP_ALTACT_SIG_FLG_PRIO`/`_TOKEN`/`_ALIAS`/`_NAME`/`_EXIT` (plus the `DistSpawnFlags`/`AltactSigFlags`
-typed helpers), value-pinned from `dist.h:185-192`. End-to-end spawn/altact handling remains out of
-scope (see Known Issues).
+typed helpers), value-pinned from `dist.h:185-192`, and decoded by the `SpawnRequest`/`SpawnReply`/
+`AltactSigSend` deliveries. The handshake **error path is typed**: `Status::kind()` classifies the peer
+status text into `StatusKind { Ok, Simultaneous, Named, Nok, NotAllowed, Alive, Other }` and the single
+shared `handshake::status_error(&Status) -> BeamError` maps it (`Nok` -> `ConnectionRefused`,
+`NotAllowed` -> `PermissionDenied`, `Alive` -> `ConnectionAborted`, `Named` -> `AlreadyExists`,
+`Simultaneous` -> `ConnectionAborted`, unknown -> `InvalidData`); `no_creation`/`system_limit` are not
+status texts in this release (`Other`). A **refusing acceptor tells the peer** — both acceptors
+frame+flush `Status::not_allowed()` (the exact 14 bytes `snot_allowed`) before returning the error
+(`dist_util.erl:286`) — and driver handshake errors are terminal. `epmd` `not_registered` ->
+`BeamError::Io(NotFound)`, never a silent port `0`.
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_dist::prelude::*` (see `src/lib.rs`/`src/prelude.rs`).
