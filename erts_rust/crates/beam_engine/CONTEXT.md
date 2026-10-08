@@ -173,11 +173,11 @@ Measured by `tests/census.rs` (an executable census **and** regression gate over
 - **The exception reason atoms are seeded by the test host** (`tests/support/mod.rs::SEED_ATOMS`, append-only so atom indices never shift) because a compiled module does not carry ERTS's globally interned `error_atom` table -- production `beam_rt` must do the same (Handoffs #2).
 
 ## Measured (interpreter ns/instruction -- `tests/engine_bench.rs`)
-Measured at this node's HEAD with `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test engine_bench -- --nocapture` (median of 5 samples, best row over 3 runs; load average ~5 on 14 cores):
-- per-run **setup floor** (`Machine::reset` + run entry for a 2-instruction run): **~242 ns/run**.
-- `dispatch/noop` (shared-label no-op loop): **2.7-4.3 ns/instr** (the noisiest row).
-- `move/2` **5.3** ns/instr - `test/2` (no branch) **7.7** - `ctrl/2` (call/return chain) **4.5** - `branch-loop/2` (taken test + jump) **9.0** - `tail-loop/2` (test + `call_only`) **7.8** - real `erlc` `tailcall:even/1` **7.3** - `dispatch/many-labels` **8.6**.
-- `gc_bif` `'+'/2` **16.3 ns/instr** -- the most expensive instruction, dominated by marshalling the arguments into `ExecutionContext::call_bif`. **The context's own BIF dispatch is now the dominant remaining per-call cost** (`beam_rt`'s `call_bif` does string-keyed NIF/native/registry lookups before every call); it is measured from outside this crate -- see Handoff #9.
+Measured at this node's HEAD with `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test engine_bench -- --nocapture` (median of 5 samples per run; the sandbox is noisy -- read 3-run ranges, never a single sample):
+- per-run **setup floor** (`Machine::reset` + run entry for a 2-instruction run): **~234-260 ns/run**.
+- `dispatch/noop` (shared-label no-op loop, the noisiest row): **3.2-4.6 ns/instr**; `dispatch/many-labels` **9.5-13.5**.
+- `move/2` **6.2-6.5** ns/instr - `test/2` (no branch) **9.4-9.9** - `ctrl/2` (call/return chain) **5.4** - `branch-loop/2` (taken test + jump) **10.1-10.6** - `tail-loop/2` (test + `call_only`) **8.7-9.0** - real `erlc` `tailcall:even/1` **8.5-8.8**.
+- `gc_bif` `'+'/2` **~17.5 ns/instr** -- the most expensive instruction, dominated by marshalling the arguments into `ExecutionContext::call_bif`. **The context's own BIF dispatch is now the dominant remaining per-call cost** (`beam_rt`'s `call_bif` does string-keyed NIF/native/registry lookups before every call); it is measured from outside this crate -- see Handoff #9.
 
 ## Measured (JIT micro-benchmark)
 `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test jit_bench -- --nocapture` (add `--features jit-cranelift` for the feature-ON roster). Wall-clock ns/op -- noisy (interpreter variance up to ~2x); the tiers are **mechanisms, not optimisers**. Timed compile-once/run-many (`JitBackend::run_compiled`, `N=5000`; `aggr`/`cmp` `N=2500`); one-time `compile` excluded.
