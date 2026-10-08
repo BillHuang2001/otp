@@ -1,8 +1,8 @@
 Dead-source checker report for erts/emulator/**/*.{c,h,cpp,hpp,cc}
-candidates checked: 747   referenced: 721   exempt (retained by rule): 25   deletable: 1
+candidates checked: 746   referenced: 721   exempt (retained by rule): 25   deletable: 0
 
 DELETABLE (no build ref, no #include, no symbol use):
-  erts/emulator/drivers/unix/bin_drv.c
+  (none)
 
 EXEMPT (mechanically unreferenced but retained):
   erts/emulator/asmjit/arm/a64assembler.cpp  <- vendored 3PP (asmjit), see Makefile.in ASMJIT_CPP
