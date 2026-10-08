@@ -17,6 +17,8 @@
 //! | `erlang:cancel_timer/2` | [`crate::timers`] — the `/1` answers under the option list |
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer) + the BIF registry |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set |
+//! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
+//! | `erlang:statistics/1` | `run_queue` from [`Runtime::run_queue_len`]; `wall_clock` from the process clock |
 //!
 //! Every **other** `(module, function, arity)` answers the same typed capability gap the
 //! defaulted seam does (see [`RuntimeHooksBridge::call`]), so installing this bridge never
@@ -30,6 +32,11 @@
 //!   (`beam_bifs/src/time.rs`'s process-global `OnceLock<Instant>`), which no safe API
 //!   exposes — so the absolute form is reported as the typed capability gap rather than
 //!   approximated by a millisecond-off estimate. `{abs, false}` (the default) IS served.
+//! * `statistics/1` serves **only** the keys this runtime can measure for real
+//!   (`run_queue`, `wall_clock`, see [`RuntimeHooksBridge::statistics`]); every other key
+//!   the oracle accepts is a valid statistics key this runtime cannot answer honestly, so
+//!   it reports the typed capability gap. A name that is not a statistics key at all is
+//!   the oracle's `badarg`.
 //!
 //! # Destination semantics (the C `erts_hl_timer`, read-only reference)
 //!
@@ -45,6 +52,9 @@ use beam_engine::terms;
 use beam_process::{PidTarget, ProcessId, ProcessTable};
 use beam_term::prelude::{atom_val, is_atom, is_small, make_small, signed_value};
 use beam_term::{AtomTable, Eterm};
+
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 use crate::error;
 use crate::runtime::Runtime;
@@ -269,6 +279,112 @@ impl<'a> RuntimeHooksBridge<'a> {
         }
     }
 
+    /// `erlang:dt_spread_tag/1` — the dynamic-tracing tag spreader, a **boolean check**.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): the argument must be the atom `true` **or** the
+    /// atom `false` — anything else is `badarg` — and the answer is the atom `true`. With
+    /// dynamic tracing compiled out (the oracle's own build, and this runtime's only mode)
+    /// the C's `dt_spread_tag_1` does exactly that and nothing else
+    /// (`erts/emulator/beam/bif.c:6080-6112`): it validates the boolean and answers `true`;
+    /// only under `USE_VM_PROBES` would it instead answer the previous `{Flags, Tag}` pair.
+    /// `lib/kernel/src/file.erl`'s `call/2` brackets every file-server round trip with
+    /// `dt_spread_tag(true)` / `dt_restore_tag(X)`, so serving this pair is what lets the
+    /// `file:` / `code:where_is_file` / `.app`-read boot path run at all.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for anything but the atoms `true`/`false`.
+    fn dt_spread_tag(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let tag = *args.first().ok_or(BeamError::BadArg)?;
+        // Both booleans are accepted; the validation is the whole body (see above).
+        let _ = boolean_value(atoms, tag)?;
+        atom_term(atoms, "true")
+    }
+
+    /// `erlang:dt_restore_tag/1` — the dynamic-tracing tag restorer, a **`true` check**.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): the argument must be the atom `true` —
+    /// anything else, `false` **included**, is `badarg` — and the answer is the atom
+    /// `true`. That is `dt_restore_tag_1`'s no-`USE_VM_PROBES` body
+    /// (`erts/emulator/beam/bif.c:6162-6167`); under `USE_VM_PROBES` the argument is
+    /// instead the `{Flags, Tag}` tuple [`Self::dt_spread_tag`] returned, which this build
+    /// never produces. The two are always called in that pairing by
+    /// `file:call/2`.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for anything but the atom `true`.
+    fn dt_restore_tag(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let tag = *args.first().ok_or(BeamError::BadArg)?;
+        // `boolean_value` reads `true` as `true` and `false` as `false`; only the former is
+        // accepted, so `false` is the oracle's `badarg`.
+        if !boolean_value(atoms, tag)? {
+            return Err(BeamError::BadArg);
+        }
+        atom_term(atoms, "true")
+    }
+
+    /// `erlang:statistics/1` — the counters this runtime can answer **honestly** from its
+    /// own real state.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`). The two keys served, and why each figure is a
+    /// real measurement rather than a placeholder:
+    ///
+    /// * `run_queue` → the total length of the runnable queues, as a small integer. This is
+    ///   [`Runtime::run_queue_len`], the length of the runtime's **one** real run queue
+    ///   (`beam_process`'s `Scheduler`). The oracle sums every scheduler's queue
+    ///   (`erts_run_queues_len(...)`); this runtime is single-threaded, so it is the same
+    ///   quantity over the same kind of queue — both answer `0` once the node is idle.
+    /// * `wall_clock` → `{TotalMilliseconds, MillisecondsSinceLastCall}`, read from the
+    ///   process monotonic clock ([`std::time::Instant`]). The oracle's relationship holds
+    ///   exactly: the first read answers the same value for both elements, and every later
+    ///   read answers the delta since the previous one. This is what `c:uptime/0` reads.
+    ///
+    /// **Documented divergence (the epoch, never the clock).** The oracle's `wall_clock`
+    /// total is measured from emulator start; this runtime anchors it at the **first**
+    /// `statistics(wall_clock)` read, because no earlier anchor is reachable from this seam
+    /// — the runtime's other monotonic origin lives inside `beam_bifs` (`src/time.rs`) and
+    /// exposes no reader. The numbers are therefore real elapsed time with a different
+    /// zero, exactly the class of divergence as `erlang:processes/0` ("an answer that reads
+    /// *this* runtime's own state").
+    ///
+    /// Every **other** key the oracle accepts is a genuine statistics key this runtime
+    /// cannot measure — `reductions`/`exact_reductions` need a node-global **cumulative**
+    /// reduction counter (this runtime's counters are per-process and reset by every
+    /// scheduler slice, so summing them would be a made-up total), `runtime` needs CPU time,
+    /// `context_switches` a context-switch counter, `garbage_collection` a collector,
+    /// `scheduler_wall_time`/`scheduler_wall_time_all` per-scheduler CPU time,
+    /// `microstate_accounting` the MSACC machinery, `io` I/O byte counters and `run_queues`
+    /// / `active_tasks*` / `*_run_queue_lengths*` the per-scheduler queue lists — so each
+    /// answers the typed capability gap rather than a fabricated number (workspace
+    /// `CONTEXT.md` §3). A name that is **not** a statistics key at all is the oracle's
+    /// `badarg` (`erl_bif_info.c:4333`), which is reproduced rather than reported as a gap.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom or an unknown key; the typed capability gap for a valid key
+    /// this runtime cannot measure.
+    fn statistics(&self, heap: &mut Heap, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let key = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(key) {
+            return Err(BeamError::BadArg);
+        }
+        // A name the shared table does not hold cannot name a statistics key, so it is the
+        // oracle's `badarg` (never a substituted key).
+        let name = atoms.name(atom_val(key)).ok_or(BeamError::BadArg)?;
+        match name {
+            "run_queue" => Ok(make_small(self.runtime.run_queue_len() as i64)),
+            "wall_clock" => {
+                let (total, since) = wall_clock_millis();
+                heap.tuple(&[make_small(total), make_small(since)])
+            }
+            other if STATISTICS_KEYS.contains(&other) => Err(error::unsupported(&format!(
+                "erlang:statistics/1: the `{other}` counter is not implemented"
+            ))),
+            _ => Err(BeamError::BadArg),
+        }
+    }
+
     /// Schedules `message` for `target` at `delay` from now under the reference `reference`,
     /// and answers `reference`.
     ///
@@ -384,6 +500,9 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             ("erlang", "function_exported", 3) => self.function_exported(heap, atoms, args),
             ("erlang", "link", 1) => self.link(args, false),
             ("erlang", "unlink", 1) => self.link(args, true),
+            ("erlang", "dt_spread_tag", 1) => self.dt_spread_tag(atoms, args),
+            ("erlang", "dt_restore_tag", 1) => self.dt_restore_tag(atoms, args),
+            ("erlang", "statistics", 1) => self.statistics(heap, atoms, args),
             // Unreachable: `RuntimeContext::uses_runtime_hooks` gates this bridge to exactly
             // the keys above. Reporting the same typed capability gap the defaulted seam
             // reports keeps an ungated key honest rather than fabricated (workspace
@@ -394,6 +513,71 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             ))),
         }
     }
+}
+
+/// Every key the oracle's `erlang:statistics/1` accepts beyond the two this runtime serves
+/// (`erts/emulator/beam/erl_bif_info.c:4169-4332`, plus the `ERTS_ENABLE_MSACC`-gated
+/// `microstate_accounting`).
+///
+/// The list exists to tell a **valid** key this runtime cannot measure (the honest typed
+/// capability gap, [`RuntimeHooksBridge::statistics`]) from a name that is not a statistics
+/// key at all (the oracle's `badarg`) — the only two answers, since a fabricated figure is
+/// never acceptable (workspace `CONTEXT.md` §3).
+const STATISTICS_KEYS: &[&str] = &[
+    "scheduler_wall_time",
+    "scheduler_wall_time_all",
+    "total_active_tasks",
+    "total_run_queue_lengths",
+    "total_active_tasks_all",
+    "total_run_queue_lengths_all",
+    "active_tasks",
+    "run_queue_lengths",
+    "active_tasks_all",
+    "run_queue_lengths_all",
+    "microstate_accounting",
+    "context_switches",
+    "garbage_collection",
+    "reductions",
+    "exact_reductions",
+    "runtime",
+    "io",
+    "run_queues",
+];
+
+thread_local! {
+    /// The wall-clock anchor and the previous `statistics(wall_clock)` read, in one slot.
+    ///
+    /// A `thread_local` (rather than a `Runtime` field) because this seam may not touch the
+    /// runtime's layout, and it is sound because the runtime is single-threaded (`!Send`,
+    /// the same rationale `src/context/trace.rs`'s slot uses). The `None` state is the
+    /// first read: the anchor is then *now*, which is the runtime's documented wall-clock
+    /// epoch (see [`RuntimeHooksBridge::statistics`]).
+    static WALL_CLOCK: Cell<Option<(Instant, Instant)>> = const { Cell::new(None) };
+}
+
+/// The wall clock in whole milliseconds: `(since the anchor, since the previous read)`.
+///
+/// `Instant` is the platform's monotonic clock, so the figures are real elapsed time and
+/// never go backwards. The first read returns `(0, 0)` — the oracle's first read returns
+/// the same value for both elements too, only measured from emulator start rather than from
+/// this anchor (see [`RuntimeHooksBridge::statistics`]).
+fn wall_clock_millis() -> (i64, i64) {
+    let now = Instant::now();
+    WALL_CLOCK.with(|slot| {
+        // An unanchored slot is its own anchor and its own "previous read".
+        let (base, last) = slot.get().unwrap_or((now, now));
+        slot.set(Some((base, now)));
+        (
+            whole_millis(now.saturating_duration_since(base)),
+            whole_millis(now.saturating_duration_since(last)),
+        )
+    })
+}
+
+/// `duration` in whole milliseconds, saturated at `i64::MAX` (a `Duration` can exceed an
+/// `i64` of milliseconds only after ~292 million years, but the conversion must not trap).
+fn whole_millis(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// A `{Key, Value}` option tuple, or `badarg` for anything else.

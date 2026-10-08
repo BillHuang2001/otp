@@ -718,7 +718,8 @@ fn the_local_fun_identity_hook_is_a_clean_miss_when_the_answer_is_unknown() {
 fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
     // The `RuntimeHooksBridge` arm is one of the mutually exclusive bridges installed per
     // call, so its predicate must claim exactly the keys the bridge serves — the timer
-    // family, the loaded-export check and the link set — and no others.
+    // family, the loaded-export check, the link set, the dynamic-tracing tag pair and
+    // `erlang:statistics/1` — and no others.
     for (module, function, arity) in [
         ("erlang", "start_timer", 3),
         ("erlang", "start_timer", 4),
@@ -727,6 +728,9 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
         ("erlang", "function_exported", 3),
         ("erlang", "link", 1),
         ("erlang", "unlink", 1),
+        ("erlang", "dt_spread_tag", 1),
+        ("erlang", "dt_restore_tag", 1),
+        ("erlang", "statistics", 1),
     ] {
         assert!(
             RuntimeContext::uses_runtime_hooks(module, function, arity),
@@ -742,6 +746,10 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
         ("erlang", "function_exported", 2),
         ("erlang", "link", 2),
         ("erlang", "unlink", 0),
+        ("erlang", "dt_spread_tag", 2),
+        ("erlang", "dt_restore_tag", 0),
+        ("erlang", "statistics", 0),
+        ("erlang", "statistics", 2),
         ("timer", "send_after", 4),
         ("erlang", "send", 2),
         ("erlang", "get", 1),
@@ -765,6 +773,9 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
         ("function_exported", 3),
         ("link", 1),
         ("unlink", 1),
+        ("dt_spread_tag", 1),
+        ("dt_restore_tag", 1),
+        ("statistics", 1),
     ] {
         assert!(!RuntimeContext::uses_dict("erlang", function, arity));
         assert!(!RuntimeContext::uses_process_hook("erlang", function, arity));
@@ -846,4 +857,103 @@ fn the_runtime_hooks_bridge_serves_the_timer_and_export_families() {
         crate::error::unsupported_reason(&error).as_deref(),
         Some("bif")
     );
+}
+
+#[test]
+fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
+    // The dynamic-tracing tag pair `file:call/2` brackets every file-server round trip with
+    // (`lib/kernel/src/file.erl:3040-3043`). With dynamic tracing compiled out the oracle's
+    // two BIFs are pure argument checks (`erts/emulator/beam/bif.c:6080-6112` / `6162-6167`):
+    // `dt_spread_tag/1` accepts `true` and `false` and answers `true`, while
+    // `dt_restore_tag/1` accepts **only** `true`. Both are cross-checked against the live
+    // oracle by `tests/runtime_hooks.rs`.
+    let mut rt = runtime();
+    let true_atom = rt.intern("true");
+    let false_atom = rt.intern("false");
+    let run_queue = rt.intern("run_queue");
+    let wall_clock = rt.intern("wall_clock");
+    let reductions = rt.intern("reductions");
+    let atom_count = rt.intern("atom_count");
+    // Captured before the context takes its `&mut Runtime` borrow: a fresh runtime queues
+    // nothing, so this is the run-queue figure `statistics(run_queue)` must reproduce.
+    let queued = rt.run_queue_len();
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(queued, 0, "a fresh runtime queues no process");
+    for tag in [true_atom, false_atom] {
+        assert_eq!(
+            ctx.call_bif("erlang", "dt_spread_tag", 1, &[tag])
+                .expect("dt_spread_tag/1"),
+            true_atom,
+            "dt_spread_tag/1 accepts both booleans and answers `true`"
+        );
+    }
+    assert_eq!(
+        ctx.call_bif("erlang", "dt_restore_tag", 1, &[true_atom])
+            .expect("dt_restore_tag(true)"),
+        true_atom
+    );
+    // A non-boolean is `badarg` for the spreader; for the restorer `false` is one too.
+    for (function, argument) in [
+        ("dt_spread_tag", make_small(42)),
+        ("dt_spread_tag", NIL),
+        ("dt_restore_tag", false_atom),
+        ("dt_restore_tag", make_small(42)),
+    ] {
+        let error = ctx
+            .call_bif("erlang", function, 1, &[argument])
+            .expect_err("a rejected tag is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{function}: {error}");
+    }
+
+    // `statistics(run_queue)` reads this runtime's **real** run queue, so it reproduces the
+    // accessor's own figure rather than a constant.
+    assert_eq!(
+        ctx.call_bif("erlang", "statistics", 1, &[run_queue])
+            .expect("statistics(run_queue)"),
+        make_small(queued as i64)
+    );
+
+    // `statistics(wall_clock)` is a real monotonic clock: `{Total, SinceLastRead}`, both
+    // whole milliseconds. Sleeping between two reads must advance the total and make the
+    // delta positive — a fabricated or frozen counter would fail this.
+    let wall_clock_pair = |ctx: &mut RuntimeContext<'_>| {
+        let value = ctx
+            .call_bif("erlang", "statistics", 1, &[wall_clock])
+            .expect("statistics(wall_clock)");
+        assert_eq!(terms::tuple_arity(value).expect("a 2-tuple"), 2);
+        let total = terms::tuple_element(value, 0).expect("the total");
+        let since = terms::tuple_element(value, 1).expect("the delta");
+        assert!(is_small(total) && is_small(since), "two small integers");
+        (signed_value(total), signed_value(since))
+    };
+    let (first_total, first_since) = wall_clock_pair(&mut ctx);
+    assert!(first_total >= 0 && first_since >= 0);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let (second_total, second_since) = wall_clock_pair(&mut ctx);
+    assert!(
+        second_total > first_total,
+        "the wall clock advanced: {second_total} > {first_total}"
+    );
+    assert!(
+        second_since > 0,
+        "the delta since the previous read is real: {second_since}"
+    );
+
+    // A valid statistics key this runtime cannot measure is the typed capability gap (never
+    // a fabricated number); a name that is not a statistics key at all is the oracle's
+    // `badarg`.
+    let error = ctx
+        .call_bif("erlang", "statistics", 1, &[reductions])
+        .expect_err("reductions is an honest gap");
+    assert_eq!(
+        crate::error::unsupported_reason(&error).as_deref(),
+        Some("erlang:statistics/1: the `reductions` counter is not implemented")
+    );
+    for key in [atom_count, make_small(1)] {
+        let error = ctx
+            .call_bif("erlang", "statistics", 1, &[key])
+            .expect_err("an unknown statistics key is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
 }

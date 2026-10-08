@@ -1134,7 +1134,9 @@ impl<'a> RuntimeContext<'a> {
     /// Whether `(module, function, arity)` is one of the runtime-coupled BIF families the
     /// [`RuntimeHooksBridge`] serves: the timer family (`erlang:start_timer/3,4`,
     /// `erlang:send_after/4`, `erlang:cancel_timer/2`), the loaded-export check
-    /// (`erlang:function_exported/3`) and the link set (`erlang:link/1`, `erlang:unlink/1`).
+    /// (`erlang:function_exported/3`), the link set (`erlang:link/1`, `erlang:unlink/1`),
+    /// the dynamic-tracing tag pair (`erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1`)
+    /// and the counters of `erlang:statistics/1`.
     ///
     /// These keys resolve through the **single** `beam_bifs` [`RuntimeHooks`] seam, whose
     /// default is the typed `unsupported_bif` capability gap. The bridge needs `&mut Runtime`
@@ -1153,6 +1155,9 @@ impl<'a> RuntimeContext<'a> {
                 | ("erlang", "function_exported", 3)
                 | ("erlang", "link", 1)
                 | ("erlang", "unlink", 1)
+                | ("erlang", "dt_spread_tag", 1)
+                | ("erlang", "dt_restore_tag", 1)
+                | ("erlang", "statistics", 1)
         )
     }
 
