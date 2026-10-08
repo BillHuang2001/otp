@@ -134,7 +134,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `pub struct HeapPolicy` — `min_heap_words`, `max_heap_words` (0 = unbounded), `fullsweep_after`
   (default 65535), `min_bin_vheap_words` (default 46422 = `next_heap_size(32768, 0)`, the C
   `BIN_VH_MIN_SIZE`), `initial_young_words` (233), `initial_mature_words`, `need_reserve_words`;
-  `default()`, `from_min_max(min, max)`, builder.
+  `default()`, `from_min_max(min, max)`, `unbounded()` (explicit `max_heap_words: 0`), builder.
   - `from_spawn_opts(min_heap_words, min_bin_vheap_words, fullsweep_after)` — the C `spawn_opt` rule
     (`erl_process.c:12321-12349`): each requested minimum is floored and then rounded through
     `erts_next_heap_size(x, 0)`, so a stored minimum is a growth-table fixed point.
