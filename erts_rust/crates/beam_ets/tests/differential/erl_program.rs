@@ -55,6 +55,15 @@ cap(F) ->
           error:E -> "error:" ++ atom_to_list(E)
     end.
 
+%% Outcome of a possibly-failing call whose result the caller has *already*
+%% reduced to the canonical rendering — the access matrix's per-operation probes,
+%% where a read whose iteration order is not part of the contract is rendered
+%% sorted (`srt/1`) before it reaches `cap/1`'s shape.
+cap_str(F) ->
+    try "ok:" ++ F()
+    catch error:badarg -> "badarg";
+          error:E -> "error:" ++ atom_to_list(E)
+    end.
 new(Kind) -> ets:new(diff, [Kind, public]).
 new(Kind, Keypos) -> ets:new(diff, [Kind, public, {keypos, Keypos}]).
 tsize(T) -> ets:info(T, size).
@@ -868,32 +877,70 @@ ownership_heir() ->
 %% --------------------- access control: protection matrix ---------------------
 
 %% The `Db_READ`/`Db_WRITE` protection matrix of `db_get_table_aux`
-%% (`erl_db.c`). Each table is created (and therefore owned) by a spawned child,
-%% so the battery process is a *non-owner*: `protected` admits a non-owner reader
-%% but not a writer, `private` admits only the owner, `public` admits anyone, and
-%% every denial is `badarg`.
+%% (`erl_db.c`), asserted for the *whole* observable operation set: the
+%% read-gated operations (`lookup`/`tab2list`/`first`/`next`/`select`/
+%% `match_object`, plus `safe_fixtable/2`), the write-gated ones
+%% (`insert`/`insert_new`/`delete`/`delete_object`/`delete_all_objects`/`take`/
+%% `select_delete`), and the **ungated** introspection (`ets:info/1` and
+%% `ets:info/2` succeed even for a non-owner of a `private` table).
+%%
+%% Each operation runs on its *own* freshly created, owner-seeded `ordered_set` —
+%% created and owned by a spawned child, so the battery process is a *non-owner* —
+%% so a mutation can never perturb a later operation's observable. The
+%% `ordered_set` kind makes `first`/`next` deterministic (a `set`'s navigation
+%% order is unspecified).
 access_control() ->
     t([access_case(protected), access_case(private), access_case(public)]).
 
 access_case(Prot) ->
+    Ops = access_ops(),
+    t([t([access_probe(Prot, owner, Op) || Op <- Ops]),
+       t([access_probe(Prot, non_owner, Op) || Op <- Ops])]).
+
+%% The operation order both sides must share: the reads (incl. the read-gated
+%% `safe_fixtable/2` and the ungated `ets:info/1,2`) first, then the writes.
+access_ops() ->
+    [fun(T) -> r(ets:lookup(T, 1)) end,
+     fun(T) -> srt(ets:tab2list(T)) end,
+     fun(T) -> r(ets:first(T)) end,
+     fun(T) -> r(ets:next(T, 1)) end,
+     fun(T) -> srt(ets:select(T, [{{'_', '_'}, [], ['$_']}])) end,
+     fun(T) -> srt(ets:match_object(T, {'_', '_'})) end,
+     fun(T) -> r(ets:safe_fixtable(T, true)) end,
+     fun(T) -> srt([K || {K, _} <- ets:info(T)]) end,
+     fun(T) -> r(ets:info(T, size)) end,
+     fun(T) -> r(ets:insert(T, {3, 30})) end,
+     fun(T) -> r(ets:insert_new(T, {1, 99})) end,
+     fun(T) -> r(ets:delete(T, 1)) end,
+     fun(T) -> r(ets:delete_object(T, {1, 10})) end,
+     fun(T) -> r(ets:delete_all_objects(T)) end,
+     fun(T) -> r(ets:take(T, 1)) end,
+     fun(T) -> r(ets:select_delete(T, [{{'_', '_'}, [], [true]}])) end].
+
+%% Run `Op` on a fresh, owner-seeded `ordered_set` as `Who`: `owner` runs it in
+%% the owning child process, `non_owner` in the battery process. A `badarg` (or
+%% any other raise) is rendered by `cap_str/1`.
+access_probe(Prot, Who, Op) ->
     Parent = self(),
     spawn(fun() ->
-        T = ets:new(diff, [set, Prot]),
+        T = ets:new(diff, [ordered_set, Prot]),
         ets:insert(T, {1, 10}),
-        OwnRead = cap(fun() -> ets:lookup(T, 1) end),
-        OwnWrite = cap(fun() -> ets:insert(T, {2, 20}) end),
-        OwnDel = cap(fun() -> ets:delete(T, 2) end),
-        Parent ! {self(), T, [OwnRead, OwnWrite, OwnDel]},
+        ets:insert(T, {2, 20}),
+        Own = case Who of
+                  owner -> cap_str(fun() -> Op(T) end);
+                  non_owner -> none
+              end,
+        Parent ! {self(), T, Own},
         receive stop -> ok end
     end),
-    receive {Child, T, OwnerCaps} ->
-        NonRead = cap(fun() -> ets:lookup(T, 1) end),
-        NonWrite = cap(fun() -> ets:insert(T, {3, 30}) end),
-        NonDel = cap(fun() -> ets:delete(T, 1) end),
+    receive {Child, T, Own} ->
+        R = case Who of
+                owner -> Own;
+                non_owner -> cap_str(fun() -> Op(T) end)
+            end,
         Child ! stop,
-        t(OwnerCaps ++ [NonRead, NonWrite, NonDel])
+        R
     end.
-
 %% --------------------- setopts/2 surface ---------------------
 
 %% `ets:setopts/2` accepts only `{heir, Pid, Data}` / `{heir, none}` on OTP 29:
