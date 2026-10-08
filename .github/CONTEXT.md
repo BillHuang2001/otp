@@ -37,6 +37,7 @@ Changed-path detection is generated at run time: `scripts/path-filters.sh` and `
 - **All runners are GitHub-hosted** (`ubuntu-latest`, `windows-2025`, `macos-15`/`macos-15-intel`); BSD/Solaris jobs run inside QEMU VMs (`vmactions/*-vm`) on `ubuntu-latest`, and no self-hosted runner infrastructure exists.
 
 ## Known Issues
+- **No CI coverage for the `erts_rust` Rust rewrite.** No file under `.github/` references `erts_rust`, `cargo`, `rust` or `rustup`, and no job installs a Rust toolchain. `path-filters.sh` / `c-code-path-filters.sh` enumerate only `erts/*` and every `lib/*/doc` app, so `erts_rust/**` changes match no filter and never gate a job; `reusable-build-otp.yaml` builds only the C/Erlang tree. The cargo workspace's unit tests (incl. `beam_io`), the `erts_rust/tools/differential` compatibility gate and the benchmark tools run only manually, never in CI.
 - The Solaris job in `main.yaml` is permanently disabled (`if: ... && false`, broken VM image), so `reusable-solaris.yaml` is currently unreachable.
 - `osv-scanner-scheduled.yml` also triggers on `pull_request`, but every job is gated to `schedule`, so PR runs are no-ops.
 - `reusable-vex-attest.yml` has no in-repo caller (dispatch-only) and, like `reusable-vendor-vulnerability-scanner.yml`, depends on repo-scoped variables/secrets that do not exist in forks.
