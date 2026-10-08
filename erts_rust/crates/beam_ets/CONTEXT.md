@@ -644,8 +644,8 @@ impl Table {
 
 ## Known Issues (honest gaps — not full parity)
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
-  there is no fine-grained per-bucket locking; the only real synchronisation is [`SharedTable`]'s
-  coarse `Arc<RwLock<Table>>` (a `{}` table hands out shared access through nothing else).
+  there is no fine-grained per-bucket locking; the only synchronisation is `SharedTable`'s coarse
+  `Arc<RwLock<Table>>`.
 - **`SharedTable`'s read results must not outlive the read guard.** `Table` reads return terms that
   alias table-owned storage (the A.1 copy boundary is on the *insert* side only; see *Design
   Decisions*). A result kept after the `RwLock` read guard is dropped can be reclaimed by a
