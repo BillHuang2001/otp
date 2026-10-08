@@ -596,3 +596,287 @@ stream `09 19` is one `TAG_i` item with line `25`. The loader prepends the impli
 ### `Type`
 `version 4`, `count 1`; the single entry is the "any" entry `{raw: 0x1FFF}`. A one-entry
 table is *not* the fallback `TypeTable` (`fallback == false`).
+
+## `nr_def.beam` / `nr_use.beam` — the OTP-29 native-record family (186-191)
+
+The positive control for the OTP-29 **native-record** opcode family
+(`tests/native_record.rs`). The pair is compiled *together* by the system `erlc`
+(the consumer uses `-import_record(nr_def, [rec])`), and together they exercise every
+family member the installed OTP-29 compiler can emit: `is_any_native_record` (186),
+`is_native_record` (187), `get_record_elements` (188), `put_record` (189),
+`is_record_accessible` (190) and `get_record_field` (191). Opcodes **192/193**
+(`get_record_elements_id`, `update_record_id`) were added in OTP 30 and are absent
+from the installed OTP-29 `beam_opcodes` table, so no system `erlc` can emit them.
+
+`nr_def` *defines* an exported native record; `nr_use` imports it, defines its own
+local one, and reads/updates/builds both.
+
+### Regeneration
+
+```sh
+SCRATCH="$TMPDIR/neuter_native_records"
+mkdir -p "$SCRATCH/gen"
+cp nr_def.erl nr_use.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic nr_def.erl nr_use.erl )
+cp "$SCRATCH/gen/nr_def.beam" nr_def.beam   # writes nr_def.beam (576 bytes)
+cp "$SCRATCH/gen/nr_use.beam" nr_use.beam   # writes nr_use.beam (940 bytes)
+```
+
+`nr_def.erl`:
+
+```erlang
+-module(nr_def).
+-export([mk/0]).
+-export_record([rec]).
+-record #rec{a, b}.
+mk() -> #rec{a = 1, b = 2}.
+```
+
+`nr_use.erl`:
+
+```erlang
+-module(nr_use).
+-export([local_mk/0, local_peek/1, local_fld/1, def_mk/0, def_upd/1, def_fld/1]).
+-import_record(nr_def, [rec]).
+-record #local{a, b}.
+local_mk() -> #local{a = 1, b = 2}.
+local_peek(R) -> #local{a = A, b = B} = R, {A, B}.
+local_fld(R) -> R#local.a.
+def_mk() -> #recdef:rec{a = 1, b = 2}.
+def_upd(R) -> R#recdef:rec{a = 7}.
+def_fld(R) -> R#recdef:rec.a.
+```
+
+### Wire summary (verified against the oracle, `beam_disasm` + byte decode)
+
+`nr_def.beam`: **576 bytes**, `FOR1` form length **568**; chunks in file order
+(id · payload size):
+
+| # | id | size | parsed |
+|---|----|------|--------|
+| 1 | `AtU8` | 62 | atom names |
+| 2 | `Code` | 79 | `Code` header + instruction stream |
+| 3 | `StrT` | 0 | empty string table |
+| 4 | `ImpT` | 28 | 2 imports (`get_module_info/1,2`) |
+| 5 | `ExpT` | 40 | 3 exports (`mk/0` plus `module_info/0,1`) |
+| 6 | `Meta` | 45 | skipped |
+| 7 | `Recs` | 21 | the `#rec` native-record definition |
+| 8 | `LocT` | 4 | parsed (JIT-only local-function table) |
+| 9 | `Attr` | 39 | raw attributes |
+| 10 | `CInf` | 27 | raw compile info (path-free) |
+| 11 | `Dbgi` | 66 | recognized id, payload unparsed (debug info) |
+| 12 | `Line` | 21 | line table |
+| 13 | `Type` | 10 | type table |
+
+`Code` header: `head_size = 16`, `format_number = 0`, **`max_opcode = 189`**,
+`label_count = 7`, `function_count = 3` (functions `mk/0`, `module_info/0`,
+`module_info/1`). Atoms (wire indices 1..=9): `nr_def, mk, rec, a, b, module_info,
+erlang, get_module_info, true`. Imports: `{erlang, get_module_info, 1}` and
+`{erlang, get_module_info, 2}`. `Line`: `version 0`, `flags 0`, `instr_count 3`,
+`item_count 1`, `name_count 0` (⇒ `files == ["nr_def.erl"]`).
+
+Opcodes emitted (`beam_disasm` names; family names normalized):
+`call_ext_only`, `func_info`, `line`, `move`, **`put_record`**.
+
+`nr_def`'s `Recs` payload (21 bytes):
+
+```
+00 00 00 00   version = 0
+00 00 00 01   record_count = 1
+00 00 00 02   total_field_count = 2
+05 32 92 17 40 42 00 52 00   the single record entry
+```
+
+One `call_last`-shaped entry: `05` = `call_last`; `32` = atom 3 = `rec` (the record
+name); `92` = atom 9 = `true` (the export flag, from `-export_record([rec])`);
+`17` = `z,1`; `40` = `u` count `4`; then the two `(name, default)` pairs `42 00` =
+`{a, u,0}` / `52 00` = `{b, u,0}` — both defaults are the `u,0` **absent** sentinel
+(⇒ `RecordField.default == None`).
+
+`nr_use.beam`: **940 bytes**, `FOR1` form length **932**; chunks in file order:
+
+| # | id | size | parsed |
+|---|----|------|--------|
+| 1 | `AtU8` | 135 | atom names |
+| 2 | `Code` | 224 | `Code` header + instruction stream |
+| 3 | `StrT` | 0 | empty string table |
+| 4 | `ImpT` | 28 | 2 imports (`get_module_info/1,2`) |
+| 5 | `ExpT` | 100 | 8 exports (the 6 user functions plus `module_info/0,1`) |
+| 6 | `LitT` | 28 | literal pool (the `{recdef, rec}` record-identity literals) |
+| 7 | `Meta` | 45 | skipped |
+| 8 | `Recs` | 22 | the `#local` native-record definition |
+| 9 | `LocT` | 4 | parsed (JIT-only local-function table) |
+| 10 | `Attr` | 83 | raw attributes (incl. `-import_record`) |
+| 11 | `CInf` | 27 | raw compile info (path-free) |
+| 12 | `Dbgi` | 66 | recognized id, payload unparsed (debug info) |
+| 13 | `Line` | 32 | line table |
+| 14 | `Type` | 12 | type table |
+
+`Code` header: `head_size = 16`, `format_number = 0`, **`max_opcode = 191`**,
+`label_count = 19`, `function_count = 8` (the six exported functions plus
+`module_info/0,1`). Atoms (wire indices 1..=17): `nr_use, local_mk, local, a, b,
+local_peek, local_fld, def_mk, def_upd, recdef, rec, external, def_fld, module_info,
+erlang, get_module_info, false`. `Line`: `version 0`, `flags 0`, `instr_count 8`,
+`item_count 6`, `name_count 0` (⇒ `files == ["nr_use.erl"]`).
+
+Opcodes emitted (`beam_disasm` names; the family's `beam_disasm` renames undone):
+
+```
+is_any_native_record      (beam_disasm: {test,is_record,F,Src})
+is_native_record          (beam_disasm: {test,is_record,F,Src,Mod,Name})
+get_record_elements
+put_record
+is_record_accessible      (beam_disasm: {test,is_record_accessible,...})
+get_record_field          (beam_disasm: {test,get_record_field,...})
+```
+
+plus the supporting `badmatch`, `badrecord`, `call_ext_only`, `func_info`, `line`,
+`move`, `put_tuple2`, `test_heap`. The two `{recdef, rec}` identity operands are the
+`put_record`/`get_record_field` `Id` literals for the cross-module `#recdef:rec`
+accesses (a `z,4` `LitT` reference).
+
+`nr_use`'s `Recs` payload (22 bytes):
+
+```
+00 00 00 00   version = 0
+00 00 00 01   record_count = 1
+00 00 00 02   total_field_count = 2
+05 32 0a 11 17 40 42 00 52 00   the single record entry
+```
+
+`05` = `call_last`; `32` = atom 3 = `local` (record name); `0a 11` = atom 17 =
+`false` (the export flag — `#local` is **not** exported); `17 40` = a `z,1` list of
+length 4; then `42 00` = `{a, absent}` and `52 00` = `{b, absent}`.
+
+## `linecov.beam` — `executable_line` (183)
+
+Compiled with `+line_coverage`, so the compiler emits one `executable_line/2` per
+executable source line (`tests/line_info.rs`).
+
+### Regeneration
+
+```sh
+SCRATCH="$TMPDIR/neuter_linecov"
+mkdir -p "$SCRATCH/gen"
+cp linecov.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic +line_coverage linecov.erl )
+cp "$SCRATCH/gen/linecov.beam" linecov.beam   # writes linecov.beam (596 bytes)
+```
+
+`linecov.erl`:
+
+```erlang
+-module(linecov).
+-export([f/1, g/0]).
+
+f(X) when X > 0 -> X;
+f(_) -> 0.
+
+g() ->
+    A = 1,
+    B = 2,
+    A + B.
+```
+
+### Wire summary
+
+**596 bytes**, `FOR1` form length **588**; chunks in file order (id · size):
+`AtU8` 51 · `Code` 106 · `StrT` 0 · `ImpT` 28 · `ExpT` 52 · `Meta` 45 · `LocT` 4 ·
+`Attr` 39 · `CInf` 27 · `Dbgi` 81 · `Line` 29 · `Type` 10. `Code` header:
+`format_number 0`, `max_opcode 183`, `label_count 10`, `function_count 4`. Atoms
+(1..=6): `linecov, f, g, module_info, erlang, get_module_info`. `Line`: `version 0`,
+**`flags 1`** (bit 0 = the line-coverage flag), `instr_count 9`, `item_count 6`,
+`name_count 0` (⇒ `files == ["linecov.erl"]`). Opcodes: `executable_line` plus
+`call_ext_only`, `func_info`, `line`, `move` and the `is_lt` test (`f/1`'s guard).
+
+## `dbgline.beam` — `debug_line` (184)
+
+Compiled with `+beam_debug_info`, so the compiler emits `debug_line/4` breakpoint
+markers (`tests/line_info.rs`).
+
+### Regeneration
+
+```sh
+SCRATCH="$TMPDIR/neuter_dbgline"
+mkdir -p "$SCRATCH/gen"
+cp dbgline.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic +beam_debug_info dbgline.erl )
+cp "$SCRATCH/gen/dbgline.beam" dbgline.beam   # writes dbgline.beam (740 bytes)
+```
+
+`dbgline.erl`:
+
+```erlang
+-module(dbgline).
+-export([f/1]).
+
+f(X) ->
+    Y = X + 1,
+    Y * 2.
+```
+
+### Wire summary
+
+**740 bytes**, `FOR1` form length **732**; chunks in file order (id · size):
+`AtU8` 64 · `Code` 100 · `StrT` 0 · `ImpT` 52 · `ExpT` 40 · `LitT` 30 · `Meta` 45 ·
+`DbgB` 41 · `LocT` 4 · `Attr` 39 · `CInf` 27 · `Dbgi` 126 · `Line` 23 · `Type` 10.
+`+beam_debug_info` adds both the legacy `DbgB` chunk (recognized, payload unparsed)
+and the modern `Dbgi` chunk. `Code` header: `format_number 0`, `max_opcode 184`,
+`label_count 7`, `function_count 3`. Atoms (1..=9): `dbgline, f, entry, line, erlang,
+'+', '*', module_info, get_module_info` (the `entry`/`line` atoms are the `debug_line`
+`Kind` operand). `Line`: `version 0`, `flags 0`, `instr_count 8`, `item_count 3`,
+`name_count 0` (⇒ `files == ["dbgline.erl"]`). Opcodes: `debug_line` plus
+`call_ext_only`, `func_info`, `gc_bif`, `line`, `move`.
+
+## `bstail.beam` — `bs_test_tail2` (121)
+
+The only committed fixture that carries the standalone `bs_test_tail2/3` generic
+opcode (`tests/bs_test_tail.rs`). By default `beam_ssa_opt`'s `ssa_opt_bs_ensure`
+pass annotates every binary-matching block, and `beam_ssa_codegen`'s `bs_translate/1`
+then folds each `bs_test_tail` into a `bs_match` `test_tail`/`ensure_exactly` command —
+so the generic opcode is never emitted. Compiling with **`+no_ssa_opt`** disables that
+pass (`beam_ssa_codegen.erl`'s `NoBsMatch` path), leaving the standalone instruction in
+the `.beam`.
+
+### Regeneration
+
+```sh
+SCRATCH="$TMPDIR/neuter_bstail"
+mkdir -p "$SCRATCH/gen"
+cp bstail.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic +no_ssa_opt bstail.erl )
+cp "$SCRATCH/gen/bstail.beam" bstail.beam   # writes bstail.beam (564 bytes)
+```
+
+`bstail.erl`:
+
+```erlang
+-module(bstail).
+-export([f/1]).
+
+f(<<X:8>>) -> X.
+```
+
+### Wire summary
+
+**564 bytes**, `FOR1` form length **556**; chunks in file order (id · size):
+`AtU8` 48 · `Code` 102 · `StrT` 0 · `ImpT` 28 · `ExpT` 40 · `Meta` 45 · `LocT` 4 ·
+`Attr` 39 · `CInf` 27 · `Dbgi` 78 · `Line` 22 · `Type` 10. `Code` header:
+`format_number 0`, `max_opcode 181`, `label_count 8`, `function_count 3`. Atoms
+(1..=5): `bstail, f, module_info, erlang, get_module_info`. `Line`: `version 0`,
+`flags 0`, `instr_count 3`, `item_count 1`, `name_count 0` (⇒ `files ==
+["bstail.erl"]`). Opcodes: **`bs_test_tail2`** plus `bs_start_match3`,
+`bs_get_position`, `bs_get_integer2`, `bs_set_position`, `bs_get_tail`, `jump`,
+`call_ext_only`, `func_info`, `line`, `move`. In `f/1` the stream is
+
+```
+{test,bs_start_match3,{f,1},1,[{x,0}],{x,1}}
+{bs_get_position,{x,1},{x,0},2}
+{test,bs_get_integer2,{f,3},2,[{x,1},{integer,8},1,{field_flags,[]}],{x,2}}
+{test,bs_test_tail2,{f,3},[{x,1},0]}      % fail label 3, ctx X(1), bits 0
+{move,{x,2},{x,0}}
+return
+```
+
+i.e. the loader lowers it to `Instr::BsTestTail2 { fail: Label(3), ctx: X(1),
+bits: 0 }` — the `<<X:8>>` pattern requires exactly 0 bits to remain after the byte.
