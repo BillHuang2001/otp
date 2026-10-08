@@ -142,8 +142,8 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 | A.4 | 64 | 64 | 0 | 0 | 0 |
 | A.5 | 79 | 71 | 0 | 8 | 0 |
 | A.6 | 44 | 44 | 0 | 0 | 0 |
-| A.7 | 265 | 263 | 0 | 2 | 0 |
-| A.8 | 64 | 59 | 0 | 5 | 0 |
+| A.7 | 265 | 265 | 0 | 0 | 0 |
+| A.8 | 64 | 64 | 0 | 0 | 0 |
 | A.9 | 52 | 52 | 0 | 0 | 0 |
 
 - **The 15 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so each flips to `agree` automatically once its gap closes:
