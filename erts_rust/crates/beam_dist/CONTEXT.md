@@ -564,7 +564,10 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   → seams
 - `tests/common/mod.rs` → the shared real-`erl` spawn/harness (`ErlangNode`, `erl_hostname`, `free_port`,
   `resolve_listen_port`) used by the live tests
-- `tests/live_interop.rs` → real-`erl` blocking handshake + `DOP_REG_SEND`/`DOP_SEND`/monitor exchange
+- `tests/live_interop.rs` → real-`erl` blocking handshake + `DOP_REG_SEND`/`DOP_SEND`/monitor exchange,
+  `DOP_EXIT2`, `DOP_UNLINK_ID`, client-originated `DOP_MONITOR_P`, fragmented >`DIST_FRAGMENT_SIZE` both ways
+- `tests/live_accept.rs` → real-`erl` server-side `'N'` handshake + Rust→node→Rust `DOP_REG_SEND` round
+  trip (full `node@host` + epmd creation) + published-vs-hidden peer visibility
 - `tests/live_driver.rs` → real-`erl` non-blocking `ConnectionDriver` handshake + send
 - `../../../erts/emulator/beam/dist.h` · `dist.c` · `external.c` · `external.h` · `packet_parser.c` →
   authoritative flags/opcodes/header/framing/fragmentation (read-only)
