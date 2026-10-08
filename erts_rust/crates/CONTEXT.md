@@ -153,7 +153,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   to the oracle). Only its private `write_large_flatmap` (an oversized *flat*-map writer with no LCA producer,
   since `map::write_map` switches to a HAMT past 32 pairs) and the `binary.rs` shim stay crate-local.
 - `beam_engine` / `beam_bifs`: `maps:*` on large maps via `map::{map_get,map_size,map_pairs,map_put,map_remove}`.
-- `beam_bifs`: its `ets:info/1` bridge (`src/ets.rs`) now emits the oracle's full 15-field order
+- `beam_bifs`: its `ets:info/1` bridge (`src/ets.rs`) emits the oracle's full 15-field order
   (hand-reproduced from public `beam_ets::TableInfo` fields — `TableInfo::entries` needs `&mut AtomTable`,
   which a BIF context lacks); `owner` is still rendered as `undefined` (no pid term yet).
 - `beam_process`: register off-heap refc binaries (`RefcBinary`) in `beam_gc::OffHeap` and supply the `sweep`
