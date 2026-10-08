@@ -33,6 +33,7 @@ use beam_term::{atom_val, is_atom, Eterm};
 use crate::context::RuntimeContext;
 use crate::error;
 
+mod exit;
 mod monitor;
 
 /// The `spawn_opt/2,3,4` options the runtime honours.

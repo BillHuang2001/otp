@@ -158,6 +158,8 @@ impl RuntimeContext<'_> {
             ("erlang", "monitor", 3) => Some(self.monitor_3(args)),
             ("erlang", "demonitor", 1) => Some(self.demonitor_1(args)),
             ("erlang", "demonitor", 2) => Some(self.demonitor_2(args)),
+            ("erlang", "exit", 2) => Some(self.exit_2(args)),
+            ("erlang", "exit", 3) => Some(self.exit_3(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
             // The distribution identity surface (contract A.5): this node's name, its cookie
