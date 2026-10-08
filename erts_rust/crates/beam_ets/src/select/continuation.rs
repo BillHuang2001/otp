@@ -19,7 +19,8 @@
 // %CopyrightEnd%
 
 //! Limit + continuation forms of the select family: `ets:select/3`+`select/1`,
-//! `ets:match/3`+`match/1` and `ets:match_object/3`+`match_object/1`.
+//! `ets:select_reverse/3`+`select_reverse/1`, `ets:match/3`+`match/1` and
+//! `ets:match_object/3`+`match_object/1`.
 //!
 //! # What these forms do
 //!
@@ -30,6 +31,12 @@
 //! [`MatchContinuation`] is returned that can resume where it left off. When the
 //! scan reaches the end of the table with fewer than `limit` results, no
 //! continuation is produced.
+//!
+//! `ets:select_reverse/3`+`select_reverse/1` are the **reverse-direction**
+//! analogues: they scan the reverse of [`Table::tab2list`] order (descending key
+//! order for an `ordered_set`, the reverse of the unspecified forward order for the
+//! hash kinds) and follow every rule below unchanged. The direction is carried by
+//! the [`MatchContinuation`], so a `/1` resume stays in the originating direction.
 //!
 //! The chunking rule reproduced from the oracle (verified against OTP 29 /
 //! erts-17.1, `erl -noshell -eval`):
@@ -54,7 +61,9 @@
 //! `[{'$1',[],['$1']}]` and `limit = 2` the chunks are
 //! `[{1,a},{2,b}]`+cont · `[{3,c},{4,d}]`+cont · `([{5,e}], None)`; on a 4-object
 //! table limit 2 gives `2`+cont · `2`+cont · `([], None)` (the oracle renders that
-//! last one as the *bare* atom `'$end_of_table'`).
+//! last one as the *bare* atom `'$end_of_table'`). `ets:select_reverse/3` with the
+//! same `limit` chunks the same table as `[{5,e},{4,d}]`+cont ·
+//! `[{3,c},{2,b}]`+cont · `([{1,a}], None)` (verified against the system `erl`).
 //!
 //! # Rendering handoff (the BIF's job, not this crate's)
 //!
@@ -89,8 +98,10 @@ use crate::table::{Table, TableId};
 ///
 /// Constructed only by the `/3` methods; its fields are private so a caller can
 /// never fabricate one. It carries the identity of the table it belongs to, the
-/// compiled spec it is running, the limit to reuse on resume, and the index into
-/// the table's iteration order at which the next resume continues.
+/// compiled spec it is running, the limit to reuse on resume, the direction of the
+/// traversal (forward for `ets:select/3`, reverse for `ets:select_reverse/3`) and
+/// the index into the table's (forward or reverse) iteration order at which the
+/// next resume continues.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchContinuation {
     /// The id of the table the traversal belongs to (`Table::id`). A continuation
@@ -102,8 +113,15 @@ pub struct MatchContinuation {
     spec: MatchSpec,
     /// The limit the originating `/3` call used (reused by `/1`).
     limit: usize,
-    /// The index into the table's `tab2list()` order to resume at.
+    /// The index into the table's (forward or reverse, per `reverse`) `tab2list()`
+    /// order to resume at.
     position: usize,
+    /// Whether the traversal walks the table's objects in **reverse**
+    /// [`Table::tab2list`] order (`ets:select_reverse/3`, `true`) or forward
+    /// (`ets:select/3`, `false`). A forward and a reverse traversal of the same
+    /// table have different `position` spaces, so the direction must survive a
+    /// `/1` resume alongside the index.
+    reverse: bool,
 }
 
 impl Table {
@@ -111,6 +129,13 @@ impl Table {
     /// scan from `start`, produce at most `limit` results, and report either the
     /// index to resume at (the oracle returns a continuation whenever exactly
     /// `limit` results were produced) or `None` when the scan reached the end.
+    ///
+    /// `reverse` selects the traversal direction: `false` walks [`Table::tab2list`]
+    /// order (`ets:select/3`), `true` walks its **reverse** (`ets:select_reverse/3`)
+    /// — `start` and the returned resume index are positions in that same directed
+    /// order, so a continuation resumes where the previous chunk stopped. This is
+    /// the exact reverse of the forward order, i.e. descending key order for an
+    /// `ordered_set`.
     ///
     /// `limit` must be non-zero (the `/3` entry points reject `0` with `badarg`);
     /// the `/1` entry points always carry a limit their originating `/3` already
@@ -120,10 +145,14 @@ impl Table {
         spec: &MatchSpec,
         limit: usize,
         start: usize,
+        reverse: bool,
         atoms: &AtomTable,
         heap: &mut Heap,
     ) -> Result<(Vec<Eterm>, Option<usize>)> {
-        let objects = self.tab2list();
+        let mut objects = self.tab2list();
+        if reverse {
+            objects.reverse();
+        }
         let mut results = Vec::new();
         let mut index = start;
         while index < objects.len() && results.len() < limit {
@@ -143,8 +172,8 @@ impl Table {
     }
 
     /// Resume a continuation: recheck the table, rerun the carried spec from the
-    /// carried position with the carried limit, and rebuild the continuation when
-    /// another full chunk is produced.
+    /// carried position with the carried limit (and direction), and rebuild the
+    /// continuation when another full chunk is produced.
     fn resume(
         &self,
         cont: &MatchContinuation,
@@ -154,8 +183,14 @@ impl Table {
         if cont.table_id != self.id() {
             return Err(badarg());
         }
-        let (results, resume) =
-            self.traverse(&cont.spec, cont.limit, cont.position, atoms, heap)?;
+        let (results, resume) = self.traverse(
+            &cont.spec,
+            cont.limit,
+            cont.position,
+            cont.reverse,
+            atoms,
+            heap,
+        )?;
         Ok((results, resume.map(|position| cont.at(position))))
     }
 
@@ -173,18 +208,66 @@ impl Table {
         if limit == 0 {
             return Err(badarg());
         }
-        let (results, resume) = self.traverse(spec, limit, 0, atoms, heap)?;
+        let (results, resume) = self.traverse(spec, limit, 0, false, atoms, heap)?;
         let continuation = resume.map(|position| MatchContinuation {
             table_id: self.id(),
             spec: spec.clone(),
             limit,
             position,
+            reverse: false,
         });
         Ok((results, continuation))
     }
 
     /// `ets:select/1` — resume an `ets:select/3` traversal.
     pub fn select_continue(
+        &self,
+        cont: &MatchContinuation,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.resume(cont, atoms, heap)
+    }
+
+    /// `ets:select_reverse/3` — the reverse-ordered analogue of
+    /// [`Self::select_limit`]: scan the table in the reverse of [`Table::tab2list`]
+    /// order (descending key order for an `ordered_set`, the reverse of the
+    /// unspecified forward order for the hash kinds), producing at most `limit`
+    /// results and a continuation when the limit is reached.
+    ///
+    /// The chunking rules are exactly [`Self::select_limit`]'s (`limit == 0` ⇒
+    /// `badarg`; a full chunk — even one landing on the last object ⇒ a
+    /// continuation; a partial final chunk ⇒ `None`). The returned continuation
+    /// carries the reverse direction, so its [`Self::select_reverse_continue`]
+    /// resumptions stay in reverse order.
+    ///
+    /// Verified against the system `erl` (OTP 29 / erts-17.1): on the `ordered_set`
+    /// `{1,a}..{5,e}` with `limit = 2` the chunks are `[{5,e},{4,d}]`+cont ·
+    /// `[{3,c},{2,b}]`+cont · `([{1,a}], None)`.
+    pub fn select_reverse_limit(
+        &self,
+        spec: &MatchSpec,
+        limit: usize,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        if limit == 0 {
+            return Err(badarg());
+        }
+        let (results, resume) = self.traverse(spec, limit, 0, true, atoms, heap)?;
+        let continuation = resume.map(|position| MatchContinuation {
+            table_id: self.id(),
+            spec: spec.clone(),
+            limit,
+            position,
+            reverse: true,
+        });
+        Ok((results, continuation))
+    }
+
+    /// `ets:select_reverse/1` — resume an `ets:select_reverse/3` traversal,
+    /// continuing in the same reverse order.
+    pub fn select_reverse_continue(
         &self,
         cont: &MatchContinuation,
         atoms: &AtomTable,
@@ -245,13 +328,15 @@ impl Table {
 }
 
 impl MatchContinuation {
-    /// A copy of `self` resuming at `position` (same table, spec and limit).
+    /// A copy of `self` resuming at `position` (same table, spec, limit and
+    /// traversal direction).
     fn at(&self, position: usize) -> MatchContinuation {
         MatchContinuation {
             table_id: self.table_id,
             spec: self.spec.clone(),
             limit: self.limit,
             position,
+            reverse: self.reverse,
         }
     }
 }

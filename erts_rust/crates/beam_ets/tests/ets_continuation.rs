@@ -472,6 +472,130 @@ fn a_continuation_from_another_table_is_badarg() {
 }
 
 // ---------------------------------------------------------------------------
+// Reverse-traversal variants: `ets:select_reverse/3`+`select_reverse/1`
+// ---------------------------------------------------------------------------
+
+/// Reverse chunking on the `ordered_set {1,a}..{5,e}`, spec `[{'$1',[],['$1']}]`,
+/// limit 2 — the oracle's `[{5,e},{4,d}]`+cont · `[{3,c},{2,b}]`+cont ·
+/// `([{1,a}], None)` (the exact reverse of `ets:select/3`).
+#[test]
+fn select_reverse_limit_chunks_a_five_object_ordered_set() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = ordered_table(
+        &mut heap,
+        &atoms,
+        &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")],
+    );
+    let spec = whole_object_spec(&mut heap, &atoms);
+    let mut out = Heap::new(4096).expect("out heap");
+
+    let want1 = [
+        object(&mut heap, 5, at(&atoms, "e")),
+        object(&mut heap, 4, at(&atoms, "d")),
+    ];
+    let want2 = [
+        object(&mut heap, 3, at(&atoms, "c")),
+        object(&mut heap, 2, at(&atoms, "b")),
+    ];
+    let want3 = [object(&mut heap, 1, at(&atoms, "a"))];
+
+    let (r1, c1) = table
+        .select_reverse_limit(&spec, 2, &atoms, &mut out)
+        .unwrap();
+    assert_results(&r1, &want1, &atoms);
+    let c1 = c1.expect("a full reverse chunk yields a continuation");
+
+    let (r2, c2) = table.select_reverse_continue(&c1, &atoms, &mut out).unwrap();
+    assert_results(&r2, &want2, &atoms);
+    let c2 = c2.expect("another full reverse chunk yields a continuation");
+
+    let (r3, c3) = table
+        .select_reverse_continue(&c2, &atoms, &mut out)
+        .unwrap();
+    assert_results(&r3, &want3, &atoms);
+    assert!(c3.is_none(), "the partial final reverse chunk carries no continuation");
+}
+
+/// The reverse-limit edges and the carried direction, quoted from the oracle:
+/// the 4-object table's chunks end with the bare `'$end_of_table'`; `limit == size`
+/// still continues (its resume is empty) while `limit > size` completes in one
+/// chunk; `limit == 0` is `badarg`; an empty table and a guarded spec's partial
+/// final chunk each yield no continuation; and the **direction travels with the
+/// continuation** across both `/1` entry points (a reverse continuation stays
+/// reverse via `ets:select/1` too).
+#[test]
+fn select_reverse_limit_edges_and_carried_direction() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let table = ordered_table(
+        &mut heap,
+        &atoms,
+        &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")],
+    );
+    let spec = whole_object_spec(&mut heap, &atoms);
+    let mut out = Heap::new(4096).expect("out heap");
+
+    // limit == size: a continuation is still returned; its resume yields nothing.
+    let (r, c) = table.select_reverse_limit(&spec, 5, &atoms, &mut out).unwrap();
+    assert_eq!(r.len(), 5);
+    let c = c.expect("landing exactly on the last object still continues");
+    let (left, end) = table.select_reverse_continue(&c, &atoms, &mut out).unwrap();
+    assert!(left.is_empty() && end.is_none());
+
+    // limit > size: one chunk, no continuation.
+    let (r, c) = table.select_reverse_limit(&spec, 10, &atoms, &mut out).unwrap();
+    assert_eq!(r.len(), 5);
+    assert!(c.is_none());
+
+    // limit == 0 is badarg; an empty table yields ([], None).
+    assert!(matches!(
+        table.select_reverse_limit(&spec, 0, &atoms, &mut out),
+        Err(BeamError::BadArg)
+    ));
+    let empty = ordered_table(&mut heap, &atoms, &[]);
+    let (r, c) = empty.select_reverse_limit(&spec, 2, &atoms, &mut out).unwrap();
+    assert!(r.is_empty() && c.is_none());
+
+    // The 4-object table's limit-2 chunks (the final resume is the bare end).
+    let four = ordered_table(&mut heap, &atoms, &[(1, "a"), (2, "b"), (3, "c"), (4, "d")]);
+    let (_, c) = four.select_reverse_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let (_, c) = four
+        .select_reverse_continue(&c.expect("chunk 1"), &atoms, &mut out)
+        .unwrap();
+    let (r, c) = four
+        .select_reverse_continue(&c.expect("chunk 2"), &atoms, &mut out)
+        .unwrap();
+    assert!(r.is_empty() && c.is_none(), "renders as the bare '$end_of_table'");
+
+    // A guarded spec (keys 1..3): the partial final chunk carries no continuation.
+    let guard = below_four_spec(&mut heap, &atoms);
+    let (r, c) = table.select_reverse_limit(&guard, 2, &atoms, &mut out).unwrap();
+    assert_results(&r, &[make_small(3), make_small(2)], &atoms);
+    let (r, c) = table
+        .select_reverse_continue(&c.expect("full chunk"), &atoms, &mut out)
+        .unwrap();
+    assert_results(&r, &[make_small(1)], &atoms);
+    assert!(c.is_none());
+
+    // The direction is carried: a reverse continuation stays reverse through both.
+    let reverse_step = [
+        object(&mut heap, 3, at(&atoms, "c")),
+        object(&mut heap, 2, at(&atoms, "b")),
+    ];
+    let (_, rev) = table
+        .select_reverse_limit(&spec, 2, &atoms, &mut out)
+        .unwrap();
+    let rev = rev.expect("a continuation");
+    let (r, _) = table
+        .select_reverse_continue(&rev, &atoms, &mut out)
+        .unwrap();
+    assert_results(&r, &reverse_step, &atoms);
+    let (r, _) = table.select_continue(&rev, &atoms, &mut out).unwrap();
+    assert_results(&r, &reverse_step, &atoms);
+}
+
+// ---------------------------------------------------------------------------
 // Live-oracle cross-check
 // ---------------------------------------------------------------------------
 
@@ -514,6 +638,13 @@ main(_) ->
     {O2, P2} = ets:match_object(P1),
     line("match_object_2", chunk(O2, P2)),
     line("match_object_3", tail(ets:match_object(P2))),
+    {W1, Y1} = ets:select_reverse(T, S, 2),
+    line("rev5_1", chunk(W1, Y1)),
+    {W2, Y2} = ets:select_reverse(Y1),
+    line("rev5_2", chunk(W2, Y2)),
+    line("rev5_3", tail(ets:select_reverse(Y2))),
+    line("rev_zero", try ets:select_reverse(T, S, 0) of _ -> ok catch _:_ -> badarg end),
+    line("rev_empty", tail(ets:select_reverse(E, S, 2))),
     ok.
 
 chunk(Results, _Cont) -> "{" ++ rlist(Results) ++ ",cont}".
@@ -682,6 +813,33 @@ fn rust_battery() -> BTreeMap<String, String> {
         .match_object_continue(&c2.unwrap(), &atoms, &mut out)
         .unwrap();
     cases.insert("match_object_3".into(), render_chunk(&r3, c3.as_ref(), &atoms));
+
+    let (r1, c1) = five
+        .select_reverse_limit(&spec, 2, &atoms, &mut out)
+        .unwrap();
+    cases.insert("rev5_1".into(), render_chunk(&r1, c1.as_ref(), &atoms));
+    let (r2, c2) = five
+        .select_reverse_continue(&c1.unwrap(), &atoms, &mut out)
+        .unwrap();
+    cases.insert("rev5_2".into(), render_chunk(&r2, c2.as_ref(), &atoms));
+    let (r3, c3) = five
+        .select_reverse_continue(&c2.unwrap(), &atoms, &mut out)
+        .unwrap();
+    cases.insert("rev5_3".into(), render_chunk(&r3, c3.as_ref(), &atoms));
+
+    let zero = five.select_reverse_limit(&spec, 0, &atoms, &mut out);
+    cases.insert(
+        "rev_zero".into(),
+        match zero {
+            Err(BeamError::BadArg) => "badarg".to_string(),
+            other => panic!("reverse limit 0 should be badarg, got {other:?}"),
+        },
+    );
+
+    let (r, c) = empty
+        .select_reverse_limit(&spec, 2, &atoms, &mut out)
+        .unwrap();
+    cases.insert("rev_empty".into(), render_chunk(&r, c.as_ref(), &atoms));
 
     cases
 }
