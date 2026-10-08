@@ -430,6 +430,16 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   and the pending-signal queue (`SignalQueue`) — add any NEW in-heap sub-rootset to its gather/scatter,
   in the same order, in the same change. `Process::port_monitors` is deliberately **not** a root: a
   `PortWatch` holds only plain values (a `MonitorRef` and a `PortId`).
+- **Where the PCB and its heap live (address stability).** A `Process` is stored **inline** in
+  `ProcessTable`'s `slots: Vec<Slot>` (`Slot.process: Option<Process>`, `src/ptab.rs`), so growing the
+  table (`alloc_pid`/`insert`) can reallocate the `Vec` and **move** the PCB — and with it its embedded
+  `Collector`/`HeapSpace`/`Heap` struct — to a new address.
+  The heap *words* are unaffected by that move: `beam_alloc::Heap` owns a separate allocator block
+  (`Heap::base: *mut Eterm`, `beam_alloc/src/heap.rs`), so terms obtained via `get_mut(pid).heap_mut()`
+  stay valid across a table growth (Rust's borrow rules forbid holding the `&mut` across the growth
+  anyway). The `&mut Heap` **identity** is *not* stable across a collection, though: a fullsweep
+  replaces the mature space (`Collector::collect_major`) and `resize_nursery`/`grow_nursery` replace the
+  nursery, so re-obtain `heap_mut()` after any `collect()` — never cache a heap pointer across one.
 - **Pre-emption is the RUNNER's obligation.** A `ProcessRunner` must count its own reductions and return
   `RunOutcome::Yield` at its `budget`; the scheduler then requeues at the PCB's current priority. A
   runner that never yields is not pre-empted. `tests/preemption.rs` pins the scheduler half.
