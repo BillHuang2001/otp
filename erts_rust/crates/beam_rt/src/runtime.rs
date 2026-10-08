@@ -541,7 +541,19 @@ impl Runtime {
     /// `erlang:trace_delivered/1` mutate.
     pub(crate) fn trace_mut(&mut self) -> &mut TraceState {
         &mut self.trace
-    }    /// Heap words still available to the running code (unbounded in Milestone-1).
+    }
+
+    /// The installed **function trace patterns** — the `erlang:trace_pattern/2,3` state
+    /// (contract A.8, item 1), read-only.
+    ///
+    /// No BIF reports this table back (`erlang:trace_info/2`'s `match_spec` is a *process*
+    /// match spec), so the accessor exists for the suites that pin an install or a removal and
+    /// for a future `beam_engine` per-call hook — see [`crate::trace::PatternTable`].
+    pub fn trace_patterns(&self) -> &crate::trace::PatternTable {
+        self.trace.patterns()
+    }
+
+    /// Heap words still available to the running code (unbounded in Milestone-1).
     pub fn arena_available(&self) -> usize {
         self.arena.heap_available()
     }
