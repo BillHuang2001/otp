@@ -41,9 +41,11 @@
  * When `log=<path>` is given, `start`, `output` and `stop` each append one line (`"start"`,
  * `"output"`, `"stop"`) to that file, in the order they ran. That is the observable evidence
  * a port created from the process-global driver table really ran the driver's `start`/`stop`
- * callbacks, in order, around its data path. `ready_async` and `async_free` append
- * `"ready_async"`/`"async_free"` through the same path, so the async completion's arm is
- * observable too.
+ * callbacks, in order, around its data path. `async_invoke` (the worker-thread job body),
+ * `ready_async` and `async_free` append `"async_invoke"`/`"ready_async …"`/`"async_free"` through
+ * the same path, so both the job's completion on its worker and the arm its completion was handed
+ * to are observable too. (An `async_invoke`/`async_free` line is written from the async worker
+ * thread; every append opens, writes and closes the file, so the lines never interleave.)
  *
  * ## The control vocabulary (integer commands, `port_control/3`)
  *
@@ -115,6 +117,12 @@
  * `host_driver_no_ready_async.c`, the `NULL`-slot build the host's `async_free` arm is exercised
  * with).
  */
+
+/* The fixture uses the POSIX `nanosleep` (the slow async job) and `read`/`close`, which a strict
+ * `-std=c99` compilation does not expose without a feature-test macro; ask for POSIX.1-2008
+ * before any header is read so the fixture builds under `-std=c99` as well as the default mode. */
+#define _POSIX_C_SOURCE 200809L
+
 #include <erl_driver.h>
 
 #include <errno.h>
@@ -126,9 +134,14 @@
 #include <unistd.h>
 
 /* The entry's `ready_async` slot: `host_ready_async` normally, `NULL` in the variant build
- * (`host_driver_no_ready_async.c`) that exists to exercise the host's other async arm. */
-#ifndef HOST_DRIVER_READY_ASYNC_SLOT
+ * (`host_driver_no_ready_async.c`) that exists to exercise the host's other async arm. A variant
+ * defines `HOST_DRIVER_READY_ASYNC_SLOT` before including this file; that also tells us the
+ * `ready_async` *function* is unwanted there, so it is omitted (never an unused-function warning). */
+#ifdef HOST_DRIVER_READY_ASYNC_SLOT
+/* Defined by a variant — respect its choice. */
+#else
 #define HOST_DRIVER_READY_ASYNC_SLOT host_ready_async
+#define HOST_DRIVER_HAS_READY_ASYNC 1
 #endif
 
 /* Private per-port state, allocated in `start` and freed in `stop`. */
@@ -330,31 +343,37 @@ static void host_timeout(ErlDrvData drv_data) {
     }
 }
 
-/* The async job (runs on a worker thread): emit a marker through the port handle. */
+/* The async job (runs on a worker thread): log the fact that the job body itself finished — the
+ * completion is only drained on the port thread, so this line is how a host observes that a fast
+ * job has completed — then emit a marker through the port handle. The `driver_output` reaches
+ * nothing (no port context is installed on a worker thread; the crate's driver-ABI note), which is
+ * fine: the log line is the observable. */
 static void host_async_invoke(void *data) {
     host_state *st = (host_state *) data;
-    if (st != NULL)
-        (void) driver_output(st->port, "A", 1);
+    if (st == NULL)
+        return;
+    log_event(st, "async_invoke");
+    (void) driver_output(st->port, "A", 1);
 }
 
 /* A slow async job (runs on a worker thread): it sleeps so a host can drop the port while the job
- * is in flight, then emits its marker. It touches neither the port handle nor the driver state
- * after the sleep — a job that outlives its port must not call `driver_*` (the port's context is
- * gone; see the crate's driver-ABI note) and its `async_free` is what releases it. */
+ * is in flight. It touches neither the port handle nor the driver state (neither before nor after
+ * the sleep) — a job that outlives its port must not call `driver_*` (the port's context is gone;
+ * see the crate's driver-ABI note) nor read the freed port state, and it is the host's `async_free`
+ * that releases the job's `async_data`. */
 static void host_async_slow_invoke(void *data) {
     struct timespec ts;
-    host_state *st = (host_state *) data;
+    (void) data;
     ts.tv_sec = 0;
     ts.tv_nsec = 500 * 1000 * 1000;
     nanosleep(&ts, NULL);
-    if (st != NULL)
-        (void) driver_output(st->port, "S", 1);
 }
 
 /* The completion callback: the host runs it when the entry has a `ready_async` (the fixture's
  * default build does). The `drv_data` the host stored at `start` must be the same pointer the job
  * was handed as `thread_data`, so the port handle stashed behind either is the same value — the
  * `h=same` marker, which is what the `ErlDrvPort`-stability test asserts. */
+#ifdef HOST_DRIVER_HAS_READY_ASYNC
 static void host_ready_async(ErlDrvData drv_data, ErlDrvThreadData thread_data) {
     host_state *st = (host_state *) drv_data;
     host_state *tr = (host_state *) thread_data;
@@ -363,6 +382,7 @@ static void host_ready_async(ErlDrvData drv_data, ErlDrvThreadData thread_data) 
     log_event(st, (tr != NULL && tr->port == st->port) ? "ready_async h=same" : "ready_async h=diff");
     (void) driver_output(st->port, "H", 1);
 }
+#endif
 
 /* The driver's `async_free`: releases `async_data` (this port's state) when no `ready_async` will
  * run for the job — the port-gone path and the no-`ready_async` entry. It logs through the async
@@ -450,6 +470,38 @@ static ErlDrvSSizeT host_control(ErlDrvData drv_data, unsigned int command,
             *rbuf = (char *) (intptr_t) reply;
         return (ErlDrvSSizeT) (sizeof(reply) - 1);
     }
+    case 14:
+        /* A job WITH an `async_free`: on the default build the entry has a `ready_async`, so the
+         * completion goes there and the free never runs; on a build whose entry leaves
+         * `ready_async` `NULL` (`host_driver_no_ready_async.c`) the host runs the free instead. */
+        return (ErlDrvSSizeT) driver_async(st->port, NULL, host_async_invoke,
+                                           async_data(st), host_async_free);
+    case 15:
+        /* The fire-and-forget form: a `NULL` invoke, so no `ready_async` can ever run and the host
+         * must release the data through the `async_free` right away. */
+        return (ErlDrvSSizeT) driver_async(st->port, NULL, NULL, async_data(st), host_async_free);
+    case 16:
+        /* A slow job, so a host can drop the port while the job is in flight. */
+        return (ErlDrvSSizeT) driver_async(st->port, NULL, host_async_slow_invoke,
+                                           async_data(st), host_async_free);
+    case 17:
+        /* Re-selection that omits `ERL_DRV_USE`: it must not clear the release obligation the
+         * first select took on. Returns the second select's host code. */
+        if (st->fd < 0)
+            return (ErlDrvSSizeT) -1;
+        (void) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                             ERL_DRV_READ | ERL_DRV_USE, 1);
+        return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                                            ERL_DRV_READ, 1);
+    case 18:
+        /* Re-selection that declines the callback (`ERL_DRV_USE_NO_CALLBACK`): it clears the
+         * obligation the first select took on. Returns the second select's host code. */
+        if (st->fd < 0)
+            return (ErlDrvSSizeT) -1;
+        (void) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                             ERL_DRV_READ | ERL_DRV_USE, 1);
+        return (ErlDrvSSizeT) driver_select(st->port, (ErlDrvEvent) (intptr_t) st->fd,
+                                            ERL_DRV_READ | ERL_DRV_USE_NO_CALLBACK, 1);
     default:
         /* An unrecognised request: a negative `cres`, which `port_control/3` reports as `badarg`. */
         return (ErlDrvSSizeT) -1;
@@ -469,7 +521,7 @@ static ErlDrvEntry host_driver_entry = {
     .control = host_control,
     .timeout = host_timeout,
     .outputv = NULL,
-    .ready_async = NULL,
+    .ready_async = HOST_DRIVER_READY_ASYNC_SLOT,
     .flush = NULL,
     .call = NULL,
     .unused_event_callback = NULL,

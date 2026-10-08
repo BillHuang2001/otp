@@ -54,6 +54,12 @@ fn fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver.c")
 }
 
+/// The committed `ready_async`-less variant fixture (`#include`s `host_driver.c` with the entry's
+/// `ready_async` slot forced to `NULL`), used to exercise the host's `async_free` arm.
+fn variant_fixture_source() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver_no_ready_async.c")
+}
+
 /// Force the `#[no_mangle]` `driver_*` host symbols into this test binary's **dynamic** symbol
 /// table (see `tests/abi_driver.rs`, which carries the long explanation).
 ///
@@ -64,10 +70,11 @@ fn force_driver_symbols_link() {
     let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
 }
 
-/// Compile the driver fixture and load it: the produced `.so` must report the driver name
-/// `host_driver`.
-#[test]
-fn host_driver_fixture_builds_and_loads() {
+/// Compile `src` (stem `stem`) into a scratch `.so` and load it with the crate-level loader: the
+/// produced object must be a real driver reporting the name `host_driver`. Skips **loudly** when no
+/// C compiler or OTP include directory is present; a build or load failure with the toolchain
+/// present is a hard failure (never a skip).
+fn build_and_load(src: PathBuf, stem: &str) {
     let Some(include) = erl_include_dir() else {
         skip("host_driver: no OTP include directory (erl_driver.h) found");
         return;
@@ -77,19 +84,18 @@ fn host_driver_fixture_builds_and_loads() {
         return;
     }
 
-    let src = fixture_source();
     assert!(
         src.is_file(),
         "the committed fixture is missing: {}",
         src.display()
     );
 
-    let dir = scratch_dir("host-driver");
-    let so = dir.join("host_driver.so");
+    let dir = scratch_dir(stem);
+    let so = dir.join(format!("{stem}.so"));
     let compiled = compile_so(&src, &so, &include);
     assert!(
         compiled && so.is_file(),
-        "the host_driver fixture must compile into a shared object at {}",
+        "the {stem} fixture must compile into a shared object at {}",
         so.display()
     );
 
@@ -105,7 +111,7 @@ fn host_driver_fixture_builds_and_loads() {
             "a loaded driver must report the name its `driver_init` entry carries"
         ),
         Err(err) => panic!(
-            "the host_driver fixture could not be loaded with dlopen(RTLD_NOW): {err}\n\
+            "the {stem} fixture could not be loaded with dlopen(RTLD_NOW): {err}\n\
              an `undefined symbol: driver_*` here means the driver_* host symbols are not in this \
              test binary's dynamic symbol table — check build.rs's -Wl,--export-dynamic and the \
              driver_api_table() reference in force_driver_symbols_link()."
@@ -113,6 +119,19 @@ fn host_driver_fixture_builds_and_loads() {
     }
 }
 
+/// Compile the driver fixture and load it: the produced `.so` must report the driver name
+/// `host_driver`.
+#[test]
+fn host_driver_fixture_builds_and_loads() {
+    build_and_load(fixture_source(), "host_driver");
+}
+
+/// The same for the variant fixture (`ready_async` forced to `NULL`): it must stay buildable and
+/// loadable too, so `tests/abi_async.rs`'s `async_free`-arm test can rely on it.
+#[test]
+fn host_driver_no_ready_async_variant_builds_and_loads() {
+    build_and_load(variant_fixture_source(), "host_driver_no_ready_async");
+}
 /// The include-directory helper must return a directory that really holds the driver header (the
 /// contract the fixture build relies on).
 #[test]
