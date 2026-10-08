@@ -294,6 +294,15 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   `typedef ErlDrvSysInfo ErlNifSysInfo;`), preventing duplication.
 - **`SysIOVec` aliases `libc::iovec`** on Unix (the header uses `struct iovec` from `<sys/uio.h>`),
   guaranteeing `writev`/`readv` compatibility; a layout assert pins size 16 / offsets 0, 8.
+- **A driver binary carries a hidden refcount header, exactly as ERTS does.** The frozen
+  `ErlDrvBinary` is only `{ orig_size, orig_bytes }`, but real ERTS reaches the count through an
+  emulator-internal `Binary` header *preceding* it (`Binary2ErlDrvBinary`/`ErlDrvBinary2Binary`,
+  `erl_binary.h:173-176`). `driver_alloc_binary` therefore allocates a whole 8-byte `AtomicI64`
+  refcount word before the public struct (`DRIVER_BINARY_PREFIX == 16`), keeping the returned pointer
+  on `orig_size`, `orig_bytes` 8-aligned (the C's `ERTS_CHK_BIN_ALIGNMENT`) and the frozen layout
+  untouched. Alloc refc = 1; `inc`/`dec` return the NEW value and `dec` never frees (only
+  `driver_free_binary` releases, at zero) — all pinned against the oracle by
+  `tests/driver_binary_refc.rs`.
 - **Target = LP64 only.** Windows-specific layout branches (`TWinDynNifCallbacks`, `ERL_SYS_DRV`
   `start` signature, `WinDynNifCallbacks`) are intentionally not modelled; the layout asserts make
   this explicit (they would fail on a non-LP64 target).
