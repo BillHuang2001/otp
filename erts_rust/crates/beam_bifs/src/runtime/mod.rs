@@ -32,7 +32,7 @@
 
 use crate::registry::BifRegistry;
 
-mod atomics;
+pub(crate) mod atomics;
 mod erlang;
 mod erts_debug;
 mod erts_internal;
