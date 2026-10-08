@@ -456,7 +456,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - **`tests/negative.rs`:** truncated header, bad `"FOR1"` magic, bad form type, `format_number != 0`,
   a chunk size that overruns the file, an unknown/out-of-range opcode byte, an out-of-range atom/label
   index, a truncated operand varint, a `z` sub-tag `0`/unknown, a structurally wrong `HeapNeed` operand
-  and a compressed `LitT` ⇒ each a typed `BeamError` (no panic).
+  and a truncated/malformed compressed `LitT` ⇒ each a typed `BeamError` (no panic).
 - **`tests/real_modules.rs`:** the broad real-OTP LOAD sweep. The `lib` root is discovered
   generically — `$ERTS_LIB_DIR` when set, else `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'`
   (no hardcoded app names) — then every `.beam` under it is collected recursively (each versioned app
