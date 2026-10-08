@@ -6,6 +6,7 @@ CI/CD definition for Erlang/OTP.
 The `reusable-*.y*ml` files in this directory are not standalone entry points — they are `workflow_call` targets consumed by `main.yaml` (and, for the vendor scanner, by `workflow_dispatch`).
 The remaining files are independently triggered security / maintenance / publishing jobs.
 Everything lives in this one flat directory (no subdirectories), so this CONTEXT.md is the complete node — there is no per-workflow child context.
+`erts_rust.yml` sits apart from both groups: it is a self-contained, path-triggered workflow that builds, tests and compatibility-gates the `../erts_rust/` Rust workspace — it does not build OTP and `main.yaml` does not call it.
 
 ## API Surface
 
@@ -67,6 +68,13 @@ Everything lives in this one flat directory (no subdirectories), so this CONTEXT
 - `sigstore-updater.yml` (`release: [edited]`) — re-attests an edited release's assets against `bom.spdx.json` and re-uploads the `.sigstore` files.
 - `renovate-vendored-deps.yaml` (`pull_request` on `**/vendor.info`) — only for `renovate-bot` PRs whose title contains "update dependency"; checks out the PR head *with* credentials (needs them to push) and runs `.github/scripts/renovate-vendored-deps.sh`; on failure posts a truncated log as a PR comment.
 
+### Rust ERTS rewrite (standalone)
+- `erts_rust.yml` — the only CI for the `../erts_rust/` Cargo workspace. Triggers: `push` and `pull_request` filtered to `erts_rust/**` and `.github/workflows/erts_rust.yml`, plus `workflow_dispatch`. `permissions: contents: read`; same `concurrency` group/cancel-in-progress expression as `main.yaml`.
+  - One job, `rust-erts`, `runs-on: ubuntu-latest`, `timeout-minutes: 60`, job-level `env.CARGO_HOME: ${{ github.workspace }}/.cargo-home` (one cacheable CARGO_HOME shared by the plain `cargo` steps and the gate's internal `erts_rust/scripts/cargo.sh`).
+  - Steps: checkout (`persist-credentials: false`); **pinned-toolchain install via `rustup`** — reads `channel` from `erts_rust/rust-toolchain.toml`, runs `rustup toolchain install "$toolchain" --profile default --component rustfmt --component clippy` + `rustup default`; `actions/cache` over `$CARGO_HOME/{registry,git}` + `erts_rust/target` keyed on `hashFiles('erts_rust/Cargo.lock')` (restore-key `${{ runner.os }}-cargo-`); **OTP oracle** via `erlef/setup-beam` (`otp-version: '28'`); `cargo build --workspace --all-targets`; `cargo test --workspace --no-fail-fast`; a **non-blocking** `cargo clippy --workspace --all-targets` (`continue-on-error: true` — the workspace is not clippy-clean); and the differential compatibility gate.
+  - Gate step runs `erts_rust/tools/differential/gate.sh` (no args) from the repo root and honours its exit-code contract: `0` = all executed cases agreed → pass; `1` = real behavioral mismatch → fail; `2` = usage/environment error → fail; `3` = no mismatch but ≥1 unsupported/skipped capability gap (the steady state of the rewrite) → `::warning`, step exits 0 (non-blocking); any other code → fail. If `erl`/`erlc` are absent from `PATH` the step prints a message + `::warning` and exits 0 instead of running the gate.
+  - All cargo invocations run from the repo root with `--manifest-path erts_rust/Cargo.toml`, so cargo never reads `erts_rust/.cargo/config.toml` (config discovery is cwd-based); no linker/lld `rustflags` are in play.
+
 ## Constraints
 - Every workflow file starts with the `%CopyrightBegin%` / `SPDX-License-Identifier: Apache-2.0` header block; `license-scanner.yaml` + `scripts/license-header.es` enforce it.
 - Every third-party `uses:` is pinned to a full commit SHA with a trailing `# ratchet:<owner>/<repo>@<tag>` comment; never replace a pin with a moving tag (`github-actions-checker.yaml` fails the build).
@@ -95,8 +103,8 @@ Everything lives in this one flat directory (no subdirectories), so this CONTEXT
 - In `reusable-pack.yaml` the cache-restore step derives `NO_CACHE`/`DELETED` from `dorny/paths-filter` counts (`deleted_count > 20`); the thresholds and the `full_build_and_check` fallback are intentional.
 - `reusable-build-windows.yaml` computes `cache-hit` manually because `actions/cache` on Windows sometimes does not set it.
 - The SPDX header comment prefix is **not** consistent: standalone/security workflows (`main.yaml`, `pr-comment.yaml`, `license-scanner.yaml`, `renovate-vendored-deps.yaml`, `upload-windows-zip.yaml`, …) and a few reusables (`reusable-build-otp.yaml`, `reusable-check-files.yaml`, `reusable-setup.yaml`) start with `## %CopyrightBegin%`, while most `reusable-*.yaml` (pack/macos/windows/test/sbom/release/…) use a single `# %CopyrightBegin%`. Both pass `license-header.es ci`; `upload-windows-zip.yaml` additionally brackets the whole block in bare `##` lines before/after. Copy a sibling file's exact style.
-- No workflow sets `timeout-minutes` (jobs run to default limits); the only env-level timeout is `CTRUN_TIMEOUT=90` passed into the test container. The only **trigger-level** `paths:` filter in the whole directory is `renovate-vendored-deps.yaml` (`**/vendor.info`); `main.yaml` has no `paths:` — all path-based change detection is the runtime `dorny/paths-filter` setup inside `reusable-pack.yaml`.
-- No workflow references Rust/`cargo`/`rustc`/`rustup`, `erts_rust`, `beam_*` or the differential harness, and none installs a Rust toolchain — see `.github/CONTEXT.md` (Known Issues).
+- `main.yaml` and every job it fans out to leave `timeout-minutes` unset (jobs run to default limits); the only job-level timeout is `erts_rust.yml`'s `rust-erts` (60 min), and the only env-level timeout is `CTRUN_TIMEOUT=90` passed into the test container. Two workflows carry a **trigger-level** `paths:` filter — `renovate-vendored-deps.yaml` (`**/vendor.info`) and `erts_rust.yml` (`erts_rust/**` + its own file); `main.yaml` has none, so all its path-based change detection is the runtime `dorny/paths-filter` setup inside `reusable-pack.yaml`.
+- `erts_rust.yml` is the **only** workflow that references the `../erts_rust/` Rust workspace (it installs a Rust toolchain, builds/tests the Cargo workspace and runs the differential gate). `main.yaml` and its reusables still build only the C/Erlang tree, and `.github/scripts/path-filters.sh` / `.github/scripts/c-code-path-filters.sh` have no `erts_rust` entry, so an `erts_rust`-only change still gates nothing in `main.yaml` — it only triggers this separate workflow.
 
 ## Known Issues
 - The `solaris` job in `main.yaml` is permanently skipped via `if: ... && false` (comment: the VM image is broken); `reusable-solaris.yaml` is kept buildable but unreachable.
@@ -110,6 +118,7 @@ Everything lives in this one flat directory (no subdirectories), so this CONTEXT
 - Registries/images: `ghcr.io/<owner>/otp/{debian-base,ubuntu-base,i386-debian-base}`, `ghcr.io/oss-review-toolkit/ort[-minimal]`.
 - Repo variables/secrets referenced: `TRIGGER_ERLANG_ORG_BUILD`, `ERLANG_BOT_APP_ID` (var), `ERLANG_BOT_PRIVATE_KEY`, `ERLANG_VENDOR_SCANNER_APP_ID`, `ERLANG_VENDOR_SCANNER_BOT_PRIVATE_KEY`.
 - Python requirements for `sync-github-releases.yaml` come from `.github/requirements/mdformat.txt` (hashed).
+- `erts_rust.yml` needs a Rust toolchain on the runner: the channel pinned in `../erts_rust/rust-toolchain.toml` (`1.98.1`), installed with the preinstalled `rustup` plus the `rustfmt`/`clippy` components; its OTP oracle comes from `erlef/setup-beam`.
 - Renovate keeps action pins fresh from the repo-root `renovate.json5` (github-actions manager scoped to `.github/workflows/*.y{a,}ml` and `.github/actions/*/*.y{a,}ml`, with upload/download-artifact grouped in lockstep) and from `**/vendor.info` files.
 
 ## See Also
@@ -121,6 +130,7 @@ Everything lives in this one flat directory (no subdirectories), so this CONTEXT
 - `./otp_build` and `./make/` — configure/boot/release/install driver and make targets (`emulator`, `<app>_test`, `system_test`, `release_docs`, `format-check`, `install-docs`) that the workflows shell out to.
 - `./renovate.json5` — config governing action-SHA and vendored-dependency update PRs.
 - `./HOWTO/` and `./system/` — build/test documentation referenced by the CI steps.
+- `../erts_rust/` — the Rust ERTS rewrite Cargo workspace (crate set + `beam_rt` + `tools/differential` + `tools/bench`) built, tested and gated by `erts_rust.yml`.
 - Read-only siblings: `.github/ISSUE_TEMPLATE/`, `.github/requirements/` — read-only from this node; escalate changes to `.github/`.
 
 ## Routing Table
@@ -145,3 +155,4 @@ Everything lives in this one flat directory (no subdirectories), so this CONTEXT
 - Release & publishing (standalone): `sync-github-releases.yaml`, `upload-windows-zip.yaml`, `sigstore-updater.yml`, `openvex-sync.yml`.
 - PR feedback (standalone): `pr-comment.yaml`.
 - Maintenance (standalone): `update-base.yaml` (base docker images), `renovate-vendored-deps.yaml` (vendored dependency refresh).
+- Rust ERTS rewrite (standalone): `erts_rust.yml` → pinned-toolchain build/test of the `../erts_rust/` Cargo workspace + the differential compatibility gate (path-triggered on `erts_rust/**`).
