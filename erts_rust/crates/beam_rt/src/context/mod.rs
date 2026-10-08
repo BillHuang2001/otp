@@ -623,32 +623,48 @@ impl<'a> RuntimeContext<'a> {
         // the `BifContext` borrow below (the context stores `&str`, but a local `String` is
         // the owner), and it is forwarded to both the NIF bridge and the nested fun bridge.
         let caller_module = self.current_module.clone();
-        // The local-fun identity: `term_to_binary/1` of a compiled module's `make_fun3`
-        // closure needs the `NEW_FUN_EXT` fields the term does not carry (module atom, module
-        // MD5, `old_index`/`old_uniq`, creator pid), which only the *loaded module* knows.
-        // Like `local_node` this hook needs **no** runtime borrow — it snapshots the caller
-        // module, its `.beam` path and the node atom — so every arm below installs it. With
-        // no calling module (the `-eval` evaluator) it answers `Ok(None)`, preserving the
-        // codec's typed `unsupported_local_fun` (see [`FunIdentityBridge`]).
-        let mut fun_identity = FunIdentityBridge::new(
-            &self.runtime.code_server,
-            caller_module.as_deref(),
-            local_node.node,
-        );
-        // The node's memory accounting behind `erlang:memory/0,1`: a cheap snapshot holding
+        // The local-fun identity: `term_to_binary/1,2` (and `external_size/1,2`, which sizes
+        // the same image) of a compiled module's `make_fun3` closure needs the `NEW_FUN_EXT`
+        // fields the term does not carry (module atom, module MD5, `old_index`/`old_uniq`,
+        // creator pid), which only the *loaded module* knows. Like `local_node` this hook
+        // needs **no** runtime borrow — it snapshots the caller module, its `.beam` path and
+        // the node atom — but building that snapshot is not free (an `Arc` clone plus a
+        // `PathBuf` allocation), so it is built **only** for the four BIFs that consult this
+        // seam (see [`Self::uses_fun_identity`]). For every other registered call it stays
+        // `None` and no hook is installed — indistinguishable from the hook itself, because
+        // no other BIF ever calls `local_fun_identity`. With no calling module (the `-eval`
+        // evaluator) the hook answers `Ok(None)`, preserving the codec's typed
+        // `unsupported_local_fun` (see [`FunIdentityBridge`]).
+        let mut fun_identity = if Self::uses_fun_identity(module, function, arity) {
+            Some(FunIdentityBridge::new(
+                &self.runtime.code_server,
+                caller_module.as_deref(),
+                local_node.node,
+            ))
+        } else {
+            None
+        };
+        // The node's memory accounting behind `erlang:memory/0,1`: an owned snapshot holding
         // the shared atom table plus the figures reachable only *before* the call (the
         // process table, the code server, the ETS registry) — it needs **no** `&mut Runtime`
-        // borrow, so every arm below can install it. It is built before the ETS `RefCell` is
-        // borrowed for the call, which is why its ETS figure is captured (see
-        // [`RuntimeMemory`]).
-        let mut memory = RuntimeMemory::new(
-            Rc::clone(&atoms),
-            self.mailbox_table
-                .as_deref()
-                .unwrap_or(&self.runtime.processes),
-            &self.runtime.code_server,
-            &tables_handle,
-        );
+        // borrow and is built before the ETS `RefCell` is borrowed for the call, which is why
+        // its ETS figure is captured (see [`RuntimeMemory`]). It is built **only** for
+        // `erlang:memory/0,1` (see [`Self::uses_memory_hook`]): its `code` figure stats every
+        // loaded module's `.beam` (one `stat` syscall per module, ~23 after boot), so building
+        // it on *every* registered BIF call would add ~10 us to each arithmetic operation. No
+        // other BIF consults the [`MemoryHook`] seam.
+        let mut memory = if Self::uses_memory_hook(module, function, arity) {
+            Some(RuntimeMemory::new(
+                Rc::clone(&atoms),
+                self.mailbox_table
+                    .as_deref()
+                    .unwrap_or(&self.runtime.processes),
+                &self.runtime.code_server,
+                &tables_handle,
+            ))
+        } else {
+            None
+        };
         let result = {
             let RuntimeContext {
                 runtime,
@@ -698,9 +714,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_dict_hook(&mut dict)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -725,9 +745,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_process_hook(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -752,9 +776,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_nif_loader(&mut bridge)
                     .with_current_module(caller_module.as_deref().unwrap_or(""))
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -774,9 +802,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_record_source(&mut source)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -803,9 +835,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_sender(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -824,9 +860,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_module_info(&mut source)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -848,9 +888,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_persistent_term(&mut store)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -875,9 +919,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_runtime_hooks(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -902,9 +950,13 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_fun_caller(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node)
-                    .with_local_fun_identity(&mut fun_identity)
-                    .with_memory_hook(&mut memory);
+                    .with_local_node(&mut local_node);
+                if let Some(fun_identity) = fun_identity.as_mut() {
+                    context = context.with_local_fun_identity(fun_identity);
+                }
+                if let Some(memory) = memory.as_mut() {
+                    context = context.with_memory_hook(memory);
+                }
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -1085,6 +1137,43 @@ impl<'a> RuntimeContext<'a> {
                 | ("erlang", "unlink", 1)
         )
     }
+
+    /// Whether `(module, function, arity)` is one of the two `erlang:memory/0,1` BIFs —
+    /// the **only** consumers of the [`MemoryHook`](beam_bifs::MemoryHook) seam.
+    ///
+    /// These are not a bridge arm (the seam coexists with every arm) but a *build* gate:
+    /// [`RuntimeMemory::new`] eagerly folds every loaded module's `.beam` image size, which
+    /// is one `stat` syscall per loaded module, so building it on every registered call costs
+    /// ~10 us per arithmetic BIF (see [`Self::call_registered`]). With no hook installed
+    /// `beam_bifs`' `ctx.memory()` is the typed `unsupported_bif` capability gap, so the gate
+    /// must cover **exactly** the keys that read the seam (workspace `CONTEXT.md` §3).
+    fn uses_memory_hook(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("erlang", "memory", 0) | ("erlang", "memory", 1)
+        )
+    }
+
+    /// Whether `(module, function, arity)` is one of the BIFs that consult the
+    /// [`LocalFunIdentity`](beam_bifs::LocalFunIdentity) seam — the **only** consumers of it.
+    ///
+    /// `beam_bifs`' `term_to_binary/1,2` and `external_size/1,2` both build the external-term
+    /// image through `binconv::encode_body`, whose first read is
+    /// `ctx.local_fun_identity(term)` (`beam_bifs/src/binconv.rs`); the `NEW_FUN_EXT`
+    /// (`112`) identity of a compiled module's local (`make_fun3`) fun is the only thing that
+    /// read produces. Building the bridge eagerly for *every* registered call copies the
+    /// caller module's `Arc` and allocates its `.beam` path, so it is built only here — the
+    /// hook's absence is otherwise indistinguishable, since no other BIF calls the accessor.
+    fn uses_fun_identity(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("erlang", "term_to_binary", 1)
+                | ("erlang", "term_to_binary", 2)
+                | ("erlang", "external_size", 1)
+                | ("erlang", "external_size", 2)
+        )
+    }
+
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
     ///
     /// A perfect no-op on a miss (`Ok(None)`), so it is safe to try before *every* BIF: only a
