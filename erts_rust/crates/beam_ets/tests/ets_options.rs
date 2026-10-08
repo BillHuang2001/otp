@@ -1,7 +1,8 @@
 //! The `ets:new/2` **creation options**: the creation-time heir
-//! (`{heir, Pid}` / `{heir, Pid, Data}` / `{heir, none}`), the explicit
-//! `{decentralized_counters, Bool}` option and the accessors a host option parser
-//! needs — with live-oracle cross-checks of the values the oracle reports.
+//! (`{heir, Pid}` / `{heir, Pid, Data}` / `{heir, none}`), the
+//! `{write_concurrency, Bool | auto | {debug_hash_fixed_number_of_locks, N}}`
+//! mode and the explicit `{decentralized_counters, Bool}` option — with
+//! live-oracle cross-checks of the values the oracle reports.
 //!
 //! The oracle is the system `erl` (`$ERTS_ORACLE` or `erl` on `$PATH`, OTP 29 /
 //! erts-17.1). Every check that shells out is a **loud skip** when no Erlang is
@@ -11,7 +12,7 @@ mod common;
 
 use std::time::Duration;
 
-use beam_ets::{Access, Heir, OwnerId, Table, TableId, TableKind, TableOptions};
+use beam_ets::{Access, Heir, OwnerId, Table, TableId, TableKind, TableOptions, WriteConcurrency};
 use beam_term::prelude::*;
 use common::*;
 
@@ -26,41 +27,66 @@ const ORACLE_TIMEOUT: Duration = Duration::from_secs(60);
 struct Case {
     kind: TableKind,
     access: Access,
-    write_concurrency: bool,
+    write_concurrency: WriteConcurrency,
     decentralized_counters: Option<bool>,
 }
 
 impl Case {
     /// The oracle's argument encoding: `<kind>:<access>:<wc>:<dc>` with `wc` ∈
-    /// `{0,1}` and `dc` ∈ `{-1 (omitted), 0 (false), 1 (true)}`.
+    /// `{false, true, auto, locks<N>}` and `dc` ∈
+    /// `{-1 (omitted), 0 (false), 1 (true)}`.
     fn oracle_arg(&self) -> String {
         let dc = match self.decentralized_counters {
             None => -1,
             Some(false) => 0,
             Some(true) => 1,
         };
+        let wc = match self.write_concurrency {
+            WriteConcurrency::Off => "false".to_string(),
+            WriteConcurrency::On => "true".to_string(),
+            WriteConcurrency::Auto => "auto".to_string(),
+            WriteConcurrency::FixedLocks(locks) => format!("locks{locks}"),
+        };
         format!(
             "{}:{}:{}:{}",
             self.kind.as_atom_name(),
             self.access.as_atom_name(),
-            u8::from(self.write_concurrency),
+            wc,
             dc
         )
     }
 
     /// The same case as parsed options.
+    ///
+    /// The two boolean forms go through the boolean
+    /// [`set_write_concurrency`](TableOptions::set_write_concurrency) API and the
+    /// richer forms through
+    /// [`set_write_concurrency_mode`](TableOptions::set_write_concurrency_mode), so
+    /// the matrix exercises both and the boolean path stays the pinned one for the
+    /// `true`/`false` cases.
     fn options(&self) -> TableOptions {
         let mut opts = TableOptions::new();
-        opts.set_kind(self.kind)
-            .set_access(self.access)
-            .set_write_concurrency(self.write_concurrency)
-            .set_decentralized_counters(self.decentralized_counters);
+        opts.set_kind(self.kind).set_access(self.access);
+        match self.write_concurrency {
+            WriteConcurrency::Off => {
+                opts.set_write_concurrency(false);
+            }
+            WriteConcurrency::On => {
+                opts.set_write_concurrency(true);
+            }
+            mode => {
+                opts.set_write_concurrency_mode(mode);
+            }
+        }
+        opts.set_decentralized_counters(self.decentralized_counters);
         opts
     }
 }
 
 /// The option combinations cross-checked against the oracle: every kind with the
-/// option omitted, with `{write_concurrency, true}`, with an explicit
+/// option omitted, with `{write_concurrency, true}`, with `{write_concurrency,
+/// auto}`, with `{write_concurrency, {debug_hash_fixed_number_of_locks, N}}` (the
+/// hash kinds only — the form is `badarg` for an `ordered_set`), with an explicit
 /// `{decentralized_counters, Bool}` (alone and combined), and the `private`
 /// normalization.
 fn counter_cases() -> Vec<Case> {
@@ -73,7 +99,7 @@ fn counter_cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for kind in kinds {
         for decentralized_counters in [None, Some(false), Some(true)] {
-            for write_concurrency in [false, true] {
+            for write_concurrency in [WriteConcurrency::Off, WriteConcurrency::On] {
                 cases.push(Case {
                     kind,
                     access: Access::Protected,
@@ -83,28 +109,74 @@ fn counter_cases() -> Vec<Case> {
             }
         }
     }
-    // The `private` normalization: a private table never gets the fine-locked
-    // flag, so `decentralized_counters` is `false` however it was requested.
-    for kind in [TableKind::Set, TableKind::OrderedSet] {
-        for decentralized_counters in [None, Some(true)] {
+    // `{write_concurrency, auto}` is accepted for every kind, and derives the
+    // counters flag (`is_decentralized_counters = true`) whatever the kind — the
+    // explicit `{decentralized_counters, _}` still overrides it either way.
+    for kind in kinds {
+        for decentralized_counters in [None, Some(false), Some(true)] {
             cases.push(Case {
                 kind,
-                access: Access::Private,
-                write_concurrency: true,
+                access: Access::Protected,
+                write_concurrency: WriteConcurrency::Auto,
                 decentralized_counters,
             });
         }
     }
-    // `read_concurrency` must not affect it.
+    // The explicit lock granularity: the hash kinds only. For an `ordered_set` the
+    // C rejects the form (`erl_db.c:2727-2732`), which the option parser reports as
+    // `badarg`, so there is no table to introspect.
+    for kind in [TableKind::Set, TableKind::Bag, TableKind::DuplicateBag] {
+        for decentralized_counters in [None, Some(false), Some(true)] {
+            cases.push(Case {
+                kind,
+                access: Access::Protected,
+                write_concurrency: WriteConcurrency::FixedLocks(4),
+                decentralized_counters,
+            });
+        }
+    }
+    // The `private` normalization: a private table never gets the fine-locked
+    // flag, so `write_concurrency` reports `false` — and `decentralized_counters`
+    // with it — however the mode was requested.
+    for (kind, modes) in [
+        (
+            TableKind::Set,
+            &[
+                WriteConcurrency::Off,
+                WriteConcurrency::On,
+                WriteConcurrency::Auto,
+                WriteConcurrency::FixedLocks(8),
+            ][..],
+        ),
+        (
+            TableKind::OrderedSet,
+            &[
+                WriteConcurrency::Off,
+                WriteConcurrency::On,
+                WriteConcurrency::Auto,
+            ][..],
+        ),
+    ] {
+        for decentralized_counters in [None, Some(true)] {
+            for &write_concurrency in modes {
+                cases.push(Case {
+                    kind,
+                    access: Access::Private,
+                    write_concurrency,
+                    decentralized_counters,
+                });
+            }
+        }
+    }
+    // `read_concurrency` must not affect either field.
     cases.push(Case {
         kind: TableKind::OrderedSet,
         access: Access::Public,
-        write_concurrency: true,
+        write_concurrency: WriteConcurrency::On,
         decentralized_counters: None,
     });
     cases
 }
-
 /// The **`decentralized_counters` rule**, end to end: for each case the oracle's
 /// `ets:info(T, decentralized_counters)` is compared with the crate's
 /// [`TableOptions::decentralized_counters`] *and* with what `Table::info` /
@@ -172,6 +244,93 @@ fn decentralized_counters_agrees_with_the_live_oracle() {
     );
 }
 
+/// The **`write_concurrency` projection**, end to end: for each case the oracle's
+/// `ets:info(T, write_concurrency)` is compared with the crate's
+/// [`WriteConcurrency`] mode and its `On`/`Off` projection.
+///
+/// The oracle's rendering is `table_info` (`../../erts/emulator/beam/erl_db.c`
+/// :5492-5506): the atoms `false`/`true`/`auto`, and the tuple
+/// `{debug_hash_fixed_number_of_locks, Nlocks}` for the explicit lock granularity.
+/// `Nlocks` is the **requested** count normalized at table creation (rounded down
+/// to a power of two, then clamped up to 64), so this cross-check compares only the
+/// tuple's *tag* for that form — the normalization is the option parser's job, not
+/// this model's (the model keeps the requested count).
+#[test]
+fn write_concurrency_projection_agrees_with_the_live_oracle() {
+    let cases = counter_cases();
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "write_concurrency_projection_agrees_with_the_live_oracle",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable `erl`/`escript` on $PATH)",
+        );
+        return;
+    };
+    let args: Vec<String> = cases.iter().map(Case::oracle_arg).collect();
+    let output = oracle::run_escript(
+        &escript,
+        COUNTERS_ORACLE_PROGRAM,
+        &args,
+        "options_write_concurrency",
+        ORACLE_TIMEOUT,
+    );
+    let oracle_values = parse_indexed_write_concurrency(&output.stdout);
+
+    assert_eq!(
+        oracle_values.len(),
+        cases.len(),
+        "the oracle answered {} of {} cases:\n{}",
+        oracle_values.len(),
+        cases.len(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    for (index, case) in cases.iter().enumerate() {
+        let rendered = &oracle_values[index];
+        // The fine-locked flag: every form except the atom `false` sets it.
+        let fine_locked = rendered != "false";
+        let opts = case.options();
+        let mode = opts.write_concurrency_mode();
+        assert_eq!(
+            opts.write_concurrency(),
+            fine_locked,
+            "TableOptions::write_concurrency for {case:?} (oracle `{rendered}`)"
+        );
+        match mode.as_atom_name() {
+            Some(atom) => assert_eq!(
+                atom, rendered,
+                "the rendered atom for {case:?} (mode {mode:?})"
+            ),
+            None => assert!(
+                rendered.starts_with("{debug_hash_fixed_number_of_locks,"),
+                "the fixed-lock form for {case:?} renders as a tuple, got `{rendered}`"
+            ),
+        }
+        // The requested count survives on the effective mode — except for a
+        // `private` table, whose mode is normalized to `Off` first. The oracle
+        // reports its own normalized count either way.
+        if let Some(requested) = case.write_concurrency.fixed_locks() {
+            if case.access == Access::Private {
+                assert_eq!(mode, WriteConcurrency::Off, "{case:?} is normalized off");
+            } else {
+                assert_eq!(
+                    mode.fixed_locks(),
+                    Some(requested),
+                    "the requested lock count for {case:?}"
+                );
+            }
+        }
+        let table = Table::new(TableId::next(), opts).expect("a fresh table");
+        assert_eq!(
+            table.info().write_concurrency,
+            fine_locked,
+            "Table::info for {case:?} (oracle `{rendered}`)"
+        );
+    }
+    println!(
+        "[options] write_concurrency: {} cases agree with the live oracle",
+        cases.len()
+    );
+}
 /// A **creation-time** heir is adopted by the table: `ets:new/2` with
 /// `{heir, Pid}` / `{heir, Pid, Data}` installs the heir and `{heir, none}` (or
 /// no option) leaves it unset.
@@ -450,10 +609,13 @@ fn parse_indexed_bools(stdout: &[u8]) -> Vec<bool> {
     lines.into_iter().map(|(_, value)| value).collect()
 }
 
-/// The oracle program for [`decentralized_counters_agrees_with_the_live_oracle`]:
-/// one argument per case, `<kind>:<access>:<wc>:<dc>` with `wc` ∈ `{0,1}` and `dc`
-/// ∈ `{-1 omitted, 0 false, 1 true}`; it builds the equivalent `ets:new/2` option
-/// list, prints `"<index> -> <decentralized_counters>"` and deletes the table.
+/// The oracle program for [`decentralized_counters_agrees_with_the_live_oracle`]
+/// and [`write_concurrency_projection_agrees_with_the_live_oracle`]: one argument
+/// per case, `<kind>:<access>:<wc>:<dc>` with `wc` ∈
+/// `{false, true, auto, locks<N>}` and `dc` ∈ `{-1 omitted, 0 false, 1 true}`; it
+/// builds the equivalent `ets:new/2` option list and prints, per case,
+/// `"<index> -> <decentralized_counters>"` (read by `parse_indexed_bools`) and
+/// `"wc <index> -> <write_concurrency>"`, then deletes the table.
 const COUNTERS_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
 
 main(Args) ->
@@ -461,6 +623,7 @@ main(Args) ->
         fun(Arg, {Index, _}) ->
             Tab = ets:new(diff, options(Arg)),
             io:format("~w -> ~w~n", [Index, ets:info(Tab, decentralized_counters)]),
+            io:format("wc ~w -> ~w~n", [Index, ets:info(Tab, write_concurrency)]),
             ets:delete(Tab),
             {Index + 1, ok}
         end,
@@ -472,8 +635,12 @@ options(Arg) ->
     [KindS, AccessS, WcS, DcS] = string:tokens(Arg, ":"),
     Base = [list_to_atom(KindS), list_to_atom(AccessS)],
     WithWc = case WcS of
-                 "1" -> Base ++ [{write_concurrency, true}];
-                 "0" -> Base
+                 "false" -> Base;
+                 "true" -> Base ++ [{write_concurrency, true}];
+                 "auto" -> Base ++ [{write_concurrency, auto}];
+                 "locks" ++ NS ->
+                     Base ++ [{write_concurrency,
+                               {debug_hash_fixed_number_of_locks, list_to_integer(NS)}}]
              end,
     case DcS of
         "-1" -> WithWc;
@@ -481,9 +648,34 @@ options(Arg) ->
         "1" -> WithWc ++ [{decentralized_counters, true}]
     end.
 "#;
+/// The `ets:info(T, write_concurrency)` renderings the oracle printed, in index
+/// order — the `"wc <index> -> <value>"` lines of [`COUNTERS_ORACLE_PROGRAM`],
+/// which `parse_indexed_bools` deliberately ignores.
+fn parse_indexed_write_concurrency(stdout: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("wc ") else {
+            continue;
+        };
+        let Some((index, value)) = rest.split_once(" -> ") else {
+            continue;
+        };
+        let Ok(index) = index.trim().parse::<usize>() else {
+            continue;
+        };
+        lines.push((index, value.trim().to_string()));
+    }
+    lines.sort_by_key(|(index, _)| *index);
+    assert_eq!(
+        lines.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        (1..=lines.len()).collect::<Vec<_>>(),
+        "the oracle's write_concurrency answers are indexed 1..n:\n{text}"
+    );
+    lines.into_iter().map(|(_, value)| value).collect()
+}
 
-/// The oracle program for [`creation_time_heir_is_adopted`]: one argument per
-/// case (`none` / `arity2` / `arity3` / `absent`); it prints
+/// The oracle program for [`creation_time_heir_is_adopted`]: one argument per/// case (`none` / `arity2` / `arity3` / `absent`); it prints
 /// `"<index> -> <ets:info(T, heir) =/= none>"`.
 const HEIR_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
 
