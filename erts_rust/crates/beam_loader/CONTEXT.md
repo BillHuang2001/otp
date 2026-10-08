@@ -118,7 +118,7 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `pub type SharedLiteralArea = Arc<LiteralArea>;` — the type of `Module.literals`.
   `LiteralArea` is **not `Send`/`Sync`** (it owns a raw-pointer `Heap`), and therefore neither is a loaded `Module`.
 ### The instruction vocabulary (`src/instr.rs`, re-exported by `ir.rs`)
-- `pub enum Instr` — ~120 named, typed variants covering the opcode families the compiler emits, plus
+- `pub enum Instr` — **106** named, typed variants covering the opcode families the compiler emits, plus
   the lossless fallback `Generic { op: Opcode, operands: Vec<Operand>, offset: u32 }`.
   Every variant's field order is the **file's** operand order (`emu/ops.tab`). The families:
   - **module/function framing** — `Label(Label)`, `Line(LineRef)`,
@@ -331,7 +331,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   by `(module, function, arity)` following the real `bif.tab` naming — the loader does **not** know and
   must **not** encode `bif.tab` numbering. `Module.imports` is the single source of BIF identity.
 - **`Instr` and `TestKind` live in `src/instr.rs`, re-exported from `ir.rs`.** The instruction
-  vocabulary is one large flat enum (~120 variants); an enum cannot be spread across submodules and
+  vocabulary is one large flat enum (106 variants); an enum cannot be spread across submodules and
   splitting the *variants* would destroy the single-name surface the engine matches on, so it is kept in
   one dedicated module while `ir.rs` (the data types) does `pub use crate::instr::*;` so `crate::ir::Instr`,
   `crate::Instr` and `prelude::*` are unchanged. This keeps `ir.rs` focused on the module/function/table
@@ -574,7 +574,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`)
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
-- `src/instr.rs` → the typed instruction vocabulary: `Instr` (~120 variants) + `TestKind`
+- `src/instr.rs` → the typed instruction vocabulary: `Instr` (106 variants) + `TestKind`
 - `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `RecordDefinition`/`RecordField`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
 - `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap (+ the shared `decode_terms`/`decode_terms_at_capacity` retry path)
 - `src/attributes.rs` → `AttributeTable` / `SharedAttributeTable`: the decoded `Attr` chunk term (`Module::attributes_term`/`attribute_by_name`) for `module_info(attributes)`
