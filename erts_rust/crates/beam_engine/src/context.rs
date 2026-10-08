@@ -53,7 +53,10 @@
 //! [`apply`]: ExecutionContext::apply
 //! [`apply_fun`]: ExecutionContext::apply_fun
 
+use std::sync::Arc;
+
 use beam_common::Result;
+use beam_loader::{Label, Module};
 use beam_term::Eterm;
 
 /// The mailbox/message-receive seam: the receive opcode family's host interface.
@@ -337,6 +340,46 @@ pub trait ExecutionContext {
         Err(crate::error::unsupported("receive_marker_clear"))
     }
 
+    /// Resolve a cross-module call into a module + entry the **same machine** can
+    /// execute (the cross-module call seam).
+    ///
+    /// A `call_ext*` is otherwise dispatched **synchronously**: the engine hands
+    /// `module:function/arity` to [`call_bif`](ExecutionContext::call_bif), and a
+    /// host that runs the callee on a *fresh* machine cannot let a `receive`/`wait`
+    /// inside that callee suspend the calling process — the block surfaces as the
+    /// typed [`crate::error::blocked`] at the call site.
+    ///
+    /// A host that wants a cross-module callee to run **in the calling machine**
+    /// (so its `receive` suspends *this* process and its `return`/raise flows back
+    /// into the caller's frames) overrides this method and returns
+    /// `Some((callee_module, entry_label))`:
+    ///
+    /// * `callee_module` is the host-owned handle of the module to enter. It is
+    ///   kept alive by the engine for as long as a suspended frame can return into
+    ///   it, so the host must hand over a **shared** handle (an
+    ///   `Arc<Module>` it already owns) — the same `Arc` it loaded the module with.
+    /// * `entry_label` is the **export's entry label** — the label *after*
+    ///   `func_info`, i.e. `callee_module.export(function, arity)`'s `Label`, the
+    ///   exact label [`Machine::run_export`](crate::Machine::run_export) enters a
+    ///   called export at. The engine resolves it against the callee's own label
+    ///   map and enters it with `x(0..arity)` = the call arguments (they are
+    ///   already there: a `call_ext` reads its arguments from `x(0..arity)`).
+    ///
+    /// The default body returns `Ok(None)` — "I cannot run this callee in your
+    /// machine" — which keeps the existing synchronous [`call_bif`] path as the
+    /// fallback, so every existing host is unchanged.
+    ///
+    /// [`call_bif`]: ExecutionContext::call_bif
+    fn resolve_external_call(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        let _ = (module, function, arity);
+        Ok(None)
+    }
+
     /// Cheap tracing gate: does the host want `call`/`return_from`/`return_to`
     /// execution-trace events reported for the process currently running?
     ///
@@ -390,6 +433,16 @@ pub type BifHook = Box<dyn FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm>>;
 /// `unsupported`.
 pub type ApplyHook = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Eterm>>;
 
+/// An external-call resolver: the pluggable body of
+/// [`ExecutionContext::resolve_external_call`].
+///
+/// Maps `(module, function, arity)` of a `call_ext*` to the callee module handle
+/// plus its export entry [`Label`], or `None` to keep the synchronous
+/// [`call_bif`](ExecutionContext::call_bif) path. [`MinimalContext::new`] leaves it
+/// unset, so `resolve_external_call` stays the trait's `Ok(None)` default.
+pub type ExternalResolver =
+    Box<dyn FnMut(&str, &str, u32) -> Result<Option<(Arc<Module>, Label)>>>;
+
 /// Minimal context: an unbounded heap plus a pluggable BIF hook.
 ///
 /// Used by tests and embeddings. [`MinimalContext::ensure_heap`] is a no-op (the
@@ -411,6 +464,9 @@ pub struct MinimalContext {
     hook: BifHook,
     /// An optional fun-application hook (the [`ExecutionContext::apply_fun`] body).
     apply_hook: Option<ApplyHook>,
+    /// An optional cross-module-call resolver (the
+    /// [`ExecutionContext::resolve_external_call`] body).
+    external_resolver: Option<ExternalResolver>,
     /// An optional mailbox (the body of the nine receive-seam methods).
     mailbox: Option<Box<dyn Mailbox>>,
     /// A pointer-stable arena backing [`ExecutionContext::alloc_words`].
@@ -439,6 +495,7 @@ impl MinimalContext {
         MinimalContext {
             hook,
             apply_hook: None,
+            external_resolver: None,
             mailbox: None,
             arena: Vec::new(),
         }
@@ -471,6 +528,21 @@ impl MinimalContext {
     /// Install (or replace) the fun-application hook.
     pub fn set_apply_hook(&mut self, hook: ApplyHook) {
         self.apply_hook = Some(hook);
+    }
+
+    /// A context with the given cross-module-call resolver and the default
+    /// (rejecting) BIF hook.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_external_resolver(resolver: ExternalResolver) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.external_resolver = Some(resolver);
+        ctx
+    }
+
+    /// Install (or replace) the cross-module-call resolver.
+    pub fn set_external_resolver(&mut self, resolver: ExternalResolver) {
+        self.external_resolver = Some(resolver);
     }
 
     /// Install (or replace) the mailbox.
@@ -559,6 +631,23 @@ impl ExecutionContext for MinimalContext {
 
     fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
         self.mailbox_call("send_message", |mailbox| mailbox.send_message(to, message))
+    }
+
+    fn resolve_external_call(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+    ) -> Result<Option<(Arc<Module>, Label)>> {
+        // Without an installed resolver there is no module registry, so the
+        // synchronous `call_bif` path stays the dispatch route.
+        match self.external_resolver.as_mut() {
+            Some(resolver) => resolver(module, function, arity),
+            None => {
+                let _ = (module, function, arity);
+                Ok(None)
+            }
+        }
     }
 
     fn receive_next(&mut self) -> Result<Option<Eterm>> {

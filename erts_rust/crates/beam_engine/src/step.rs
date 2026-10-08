@@ -41,6 +41,29 @@ pub(crate) enum Step {
         /// The code offset within that function to resume at.
         pc: u32,
     },
+    /// Switch the machine's **module context** and continue at `(func, pc)` in that
+    /// module.
+    ///
+    /// Produced by the two places where control crosses a module boundary *inside*
+    /// one machine: the `call_ext*` arms, when the host resolved the cross-module
+    /// call through
+    /// [`ExecutionContext::resolve_external_call`](crate::ExecutionContext::resolve_external_call),
+    /// and a `return` (or an exception landing) whose target frame/continuation
+    /// belongs to a module other than the one executing.
+    ///
+    /// `context` is a [`Machine`](crate::Machine)-owned module-context id: `0` is
+    /// the module the run was entered in, `n > 0` indexes the seam-registered
+    /// contexts. Unlike [`Step::Goto`] (a jump **within** the current context),
+    /// this makes the driver rebind the module, its label map and the machine's
+    /// literal area before executing `(func, pc)`.
+    Enter {
+        /// The module context to switch to (see [`Step::Enter`]).
+        context: u32,
+        /// The function index within that context's module.
+        func: u32,
+        /// The code offset within that function.
+        pc: u32,
+    },
     /// Finish the run, yielding `x(0)`.
     Done,
 }

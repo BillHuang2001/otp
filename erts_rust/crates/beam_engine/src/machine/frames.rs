@@ -23,12 +23,26 @@ use super::Machine;
 /// of a raw stack word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Continuation {
-    /// Return to code offset `pc` in the function at index `func`.
+    /// Return to code offset `pc` in the function at index `func` **of module
+    /// context `context`**.
+    ///
+    /// The context is recorded with the address because a continuation is written
+    /// by the *function being suspended*, not by the frame that holds it: a
+    /// cross-module `call_ext` stores `{func, pc + 1, context}` into the live frame,
+    /// and a frame-less function's non-tail call stores its own module's context
+    /// into the caller's frame. On `return` the machine therefore follows *this*
+    /// context, which is what lets control come back into the caller's module. A
+    /// context equal to the machine's current one is an ordinary intra-module
+    /// [`Step::Goto`](crate::Step).
     Address {
-        /// The function index (into [`Module::functions`](beam_loader::Module::functions)).
+        /// The function index (into [`Module::functions`](beam_loader::Module::functions)
+        /// of the context's module).
         func: u32,
         /// The code offset within that function.
         pc: u32,
+        /// The module context the address belongs to (`0` = the run's entry
+        /// module, otherwise a [`ModuleContext`](super::ModuleContext) id).
+        context: u32,
     },
     /// The bottom frame: returning halts execution and yields `x(0)`.
     Halt,
@@ -240,13 +254,18 @@ impl Machine {
     /// and supplies itself (see `crate::families::exceptions`).
     ///
     /// Read-only introspection (no state is changed); the caller is the
-    /// Milestone-1 stacktrace builder.
+    /// Milestone-1 stacktrace builder. Only the module-local part of each
+    /// continuation is reported: a caller frame reached through a cross-module
+    /// `call_ext` carries a `(func, pc)` in *another* module context, so it is
+    /// reported here without that context and must not be resolved against the
+    /// running module (a documented Milestone-1 limit of the symbolic trace, see
+    /// [`crate::machine`]).
     pub fn resumption_addresses(&self) -> Vec<(u32, u32)> {
         self.frames
             .iter()
             .rev()
             .filter_map(|frame| match frame.continuation {
-                Continuation::Address { func, pc } => Some((func, pc)),
+                Continuation::Address { func, pc, .. } => Some((func, pc)),
                 Continuation::Halt => None,
             })
             .collect()
@@ -376,7 +395,7 @@ mod tests {
         // F (frame 1) called G: F resumes at (7, 3) once G returns.
         machine.push_frame(0).unwrap();
         machine
-            .set_continuation(Continuation::Address { func: 7, pc: 3 })
+            .set_continuation(Continuation::Address { func: 7, pc: 3, context: 0 })
             .unwrap();
         assert_eq!(machine.resumption_addresses(), vec![(7, 3)]);
 
@@ -388,7 +407,7 @@ mod tests {
         // G then called H: the caller chain is now H's caller (G at (9, 1)) then
         // G's caller (F at (7, 3)) — innermost first.
         machine
-            .set_continuation(Continuation::Address { func: 9, pc: 1 })
+            .set_continuation(Continuation::Address { func: 9, pc: 1, context: 0 })
             .unwrap();
         assert_eq!(machine.resumption_addresses(), vec![(9, 1), (7, 3)]);
 

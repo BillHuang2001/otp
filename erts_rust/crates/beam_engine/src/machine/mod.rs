@@ -20,6 +20,10 @@
 //!
 //! * `registers` — the x-register and float-register (FR) files, their bounds
 //!   ([`MAX_REGISTER`]/[`MAX_FLOAT_REGISTER`]) and [`Machine::reset`].
+//! * `context` — the **module context** registry ([`ModuleContext`]/[`Contexts`]):
+//!   the callee modules a `call_ext*` entered in *this* machine.
+//! * `drive` — the module-context-aware dispatch driver
+//!   ([`Machine::drive`]), shared by the interpreter entries and a resume.
 //! * `frames` — [`Continuation`]/[`Frame`], the Y-slot and call-frame primitives,
 //!   the heap request seam ([`Machine::ensure_heap`]) and the caller-chain
 //!   introspection ([`Machine::resumption_addresses`]).
@@ -36,10 +40,11 @@
 //! * `tests` — this module's unit tests, which exercise every part together.
 
 use beam_common::{ExceptionClass, Result};
-use beam_loader::SharedLiteralArea;
+use beam_loader::{Module, SharedLiteralArea};
 use beam_term::Eterm;
 
 pub use self::catch::CatchFrame;
+pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
 pub use self::run::RunOutcome;
@@ -47,6 +52,8 @@ pub use self::run::RunOutcome;
 use self::catch::UNRESOLVED_CLASS_ATOMS;
 
 mod catch;
+mod context;
+mod drive;
 mod frames;
 mod location;
 mod registers;
@@ -90,27 +97,52 @@ pub struct Machine {
     class_atoms: [Eterm; 3],
     /// The register-file size (a configurable bound, default [`MAX_REGISTER`]).
     pub(crate) max_register: u32,
-    /// The static-literal area of the **module currently being executed**.
+    /// The static-literal area of the module currently being executed.
     ///
-    /// Bound at the start of every run ([`Machine::run_loop`] clones the `Arc`
-    /// out of the `&Module` being executed) and cleared by [`Machine::reset`].
-    /// It lets the shared operand seam ([`crate::operand::read_operand`]) resolve
+    /// Bound at the start of every run ([`Machine::drive`] clones the `Arc` out of
+    /// the module context being entered) and cleared by [`Machine::reset`]. It lets
+    /// the shared operand seam ([`crate::operand::read_operand`]) resolve
     /// `Operand::Literal(idx)` through [`Machine::literal`] without threading
     /// `&Module` through every call site.
     ///
-    /// **Why the binding cannot go stale mid-run.** Within one
-    /// [`Machine::run_export`]/[`Machine::run_label`] the executing module is
-    /// fixed: labels are module-local and a cross-module call leaves the dispatch
-    /// loop through `CallExt` into the host [`ExecutionContext`](crate::context::ExecutionContext),
-    /// which never re-enters the engine with a different `&Module` on the same
-    /// run. A fresh `run_*` calls [`Machine::reset`] (clearing this) and re-binds
-    /// it, so the area always matches the module being interpreted.
+    /// **The binding follows the module context.** A `call_ext*` the host resolved
+    /// through
+    /// [`ExecutionContext::resolve_external_call`](crate::ExecutionContext::resolve_external_call)
+    /// runs the callee *in this machine*, so the executing module changes
+    /// mid-run: [`Machine::switch_context`] re-binds this field to the entered
+    /// context's area (and back to [`Machine::entry_literals`] on the way out), so
+    /// the area always matches the module whose instructions are being interpreted.
     ///
     /// A literal [`Eterm`] points into the area's **own** heap (never a process
     /// heap). At Milestone 1 there is no GC, so reading/comparing/copying a
     /// literal is safe; once the Stage-4 collector lands a literal must be treated
     /// as permanent (never scanned/copied as a process-heap term).
     literals: Option<SharedLiteralArea>,
+    /// The literal area of the **entry** module (module context `0`).
+    ///
+    /// Context `0` is the module the run was entered in, which the machine never
+    /// owns (the drive loop borrows it), so its literal area cannot be recovered
+    /// from [`Machine::contexts`] the way a registered context's can. Recording it
+    /// here is what lets [`Machine::switch_context`] restore context `0`'s binding
+    /// when a cross-module callee returns into the caller. Set by
+    /// [`Machine::enter_run`], cleared by [`Machine::reset`].
+    pub(crate) entry_literals: Option<SharedLiteralArea>,
+    /// The registered module contexts (`> 0`) entered through the cross-module
+    /// call seam — see [`ModuleContext`] / [`Contexts`].
+    ///
+    /// Context `0` is implicit (the drive loop's entry module) and has no entry
+    /// here. **Cleared by [`Machine::reset`] but not by a resume**: a suspended
+    /// cross-module frame must still be able to name its module when the host
+    /// resumes the process ([`Machine::resume_outcome`]).
+    pub(crate) contexts: Contexts,
+    /// The module context currently executing: `0` for the run's entry module,
+    /// otherwise a [`Contexts`] id.
+    ///
+    /// The driver keeps it in step with [`Machine::literals`] (via
+    /// [`Machine::switch_context`]) and a suspension leaves it at the context the
+    /// process blocked in, which is how a resume recovers the module identity of
+    /// the reported `(func, pc)`.
+    pub(crate) context: u32,
     /// The **off-heap ref-counted binary payloads** this machine has built.
     ///
     /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
@@ -207,6 +239,9 @@ impl Machine {
             class_atoms: UNRESOLVED_CLASS_ATOMS,
             max_register,
             literals: None,
+            entry_literals: None,
+            contexts: Contexts::new(),
+            context: 0,
             refc_binaries: Vec::new(),
             args_scratch: Vec::new(),
             trace_on: false,
@@ -217,13 +252,58 @@ impl Machine {
         machine
     }
 
-    /// Bind the literal area of the module about to be executed.
+    /// Bind the literal area of the module context about to be executed.
     ///
-    /// Called once per run by the dispatch loop ([`crate::interpreter`]) with the
-    /// `Arc` cloned out of the `&Module` being executed; see the field docs for
-    /// why the binding is sound for the whole run.
+    /// Called by the dispatch loop ([`crate::interpreter`]) with the `Arc` cloned
+    /// out of the module being executed — the entry module at a run entry, and an
+    /// entered callee's module at a context switch; see the field docs for why the
+    /// binding is sound for as long as that context executes.
     pub(crate) fn set_literals(&mut self, literals: SharedLiteralArea) {
         self.literals = Some(literals);
+    }
+
+    /// The module context currently executing (`0` = the run's entry module).
+    pub(crate) fn current_context(&self) -> u32 {
+        self.context
+    }
+
+    /// Register `module` as an enterable module context and return its id (`>= 1`).
+    ///
+    /// Idempotent by the `Arc`'s allocation identity (see [`Contexts::register`]),
+    /// so a repeated or recursive cross-module call reuses one context.
+    pub(crate) fn register_context(&mut self, module: &std::sync::Arc<Module>) -> u32 {
+        self.contexts.register(module)
+    }
+
+    /// Land the machine in module context `id`, re-binding [`Machine::literals`].
+    ///
+    /// A no-op when `id` is already the current context (so the hot path pays one
+    /// integer compare). Otherwise the literal area of the context's module is
+    /// bound: context `0` restores [`Machine::entry_literals`], a registered
+    /// context its own module's area. An unregistered id (or a context `0` whose
+    /// entry area was never bound) is the typed
+    /// [`unsupported`](crate::error::unsupported) error — never a stale area, which
+    /// would resolve an `Operand::Literal` against the wrong module.
+    pub(crate) fn switch_context(&mut self, id: u32) -> Result<()> {
+        if id == self.context {
+            return Ok(());
+        }
+        let literals = match id {
+            0 => self.entry_literals.clone(),
+            _ => self.contexts.handle(id).map(|entry| entry.module.literals.clone()),
+        };
+        let Some(literals) = literals else {
+            return Err(crate::error::unsupported("run: unknown module context"));
+        };
+        self.set_literals(literals);
+        self.context = id;
+        Ok(())
+    }
+
+    /// The handle of registered module context `id`, or `None` for the entry
+    /// context `0` / an id never registered.
+    pub(crate) fn module_context(&self, id: u32) -> Option<std::sync::Arc<ModuleContext>> {
+        self.contexts.handle(id)
     }
 
     /// The static literal at `index` of the module currently being executed (an

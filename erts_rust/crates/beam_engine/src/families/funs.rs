@@ -36,9 +36,16 @@
 //!   [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif).
 //! - `ApplyLast { arity, deallocate }` — as `Apply`, but the frame is popped first
 //!   (`i_apply_last`: `$deallocate($Deallocate)`), then control follows the
-//!   machine's continuation (`Continuation::Halt` ⇒ `Step::Done`,
-//!   `Continuation::Address{func,pc}` ⇒ `Step::Goto`) — the same shape the core
-//!   `CallExtLast` arm uses.
+//!   machine's continuation **context-aware** via
+//!   [`Machine::continuation_step`](crate::machine::Machine::continuation_step):
+//!   `Continuation::Halt` ⇒ `Step::Done`, an address in the **current** module
+//!   context ⇒ `Step::Goto`, and an address in **another** context ⇒
+//!   `Step::Enter { context, .. }` so the driver re-binds the module before
+//!   executing the return address. This matters because the current function may
+//!   have been entered through the cross-module
+//!   [`resolve_external_call`](crate::ExecutionContext::resolve_external_call)
+//!   seam: its tail `apply` must land back in the **caller's** module, never in the
+//!   callee's. The shape is the same the core `CallExtLast` arm uses.
 //!
 //! Fun application (the `call_fun`/`call_fun2` path) reaches the host through
 //! [`ExecutionContext::apply_fun`](crate::context::ExecutionContext::apply_fun)
@@ -62,7 +69,7 @@ use beam_term::{atom_val, is_atom, make_atom, Eterm};
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::machine::{Continuation, Machine};
+use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
 use crate::terms;
 use crate::Step;
@@ -154,10 +161,14 @@ pub(crate) fn exec(
             match apply_target(machine, module, *arity, ctx)? {
                 ApplyTarget::Called(result) => {
                     machine.set_x(0, result)?;
-                    match machine.continuation()? {
-                        Continuation::Halt => Ok(Some(Step::Done)),
-                        Continuation::Address { func, pc } => Ok(Some(Step::Goto { func, pc })),
-                    }
+                    // Follow the frame's continuation **context-aware**: this
+                    // function may have been entered through the cross-module
+                    // `resolve_external_call` seam, so its return address can name a
+                    // *different* module. `continuation_step` is the one place that
+                    // distinguishes a `Halt`, an intra-context `Goto` and a
+                    // cross-context `Enter` (the discipline the `call_ext*`
+                    // synchronous fallbacks in the interpreter already follow).
+                    Ok(Some(machine.continuation_step()?))
                 }
                 ApplyTarget::Raised(step) => Ok(Some(step)),
             }
@@ -279,9 +290,10 @@ mod tests {
     use beam_loader::{FunDescriptor, Function, Label};
     use beam_term::{make_small, signed_value, Atom};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use crate::context::MinimalContext;
-    use crate::machine::CatchFrame;
+    use crate::machine::{CatchFrame, Continuation};
 
     /// A one-function synthetic module with an owned atom table.
     struct Fixture {
@@ -840,6 +852,66 @@ mod tests {
             .expect("apply_last");
         assert_eq!(result, make_small(5));
         assert_eq!(machine.frame_depth(), 1, "the tail call popped its frame");
+    }
+
+    #[test]
+    fn apply_last_reports_a_context_switch_when_the_continuation_is_in_another_module() {
+        // A tail `apply_last` whose frame's continuation names a DIFFERENT module
+        // context must be reported as `Step::Enter` so the driver re-binds that
+        // module before executing `(func, pc)`. Reporting a bare `Step::Goto` would
+        // make the driver resolve those indices in the module currently executing —
+        // the shape reached when the function was entered through the cross-module
+        // `resolve_external_call` seam, whose return address belongs to the caller's
+        // module.
+        let mut fixture = Fixture::new();
+        let erlang = fixture.atom("erlang");
+        let self_atom = fixture.atom("self");
+        let module = fixture.finish();
+
+        let mut machine = Machine::new();
+        // The CALLER's frame: its continuation is an address in module context `0`.
+        machine.push_frame(0).unwrap();
+        machine
+            .set_continuation(Continuation::Address {
+                func: 7,
+                pc: 3,
+                context: 0,
+            })
+            .unwrap();
+        // The `apply_last`'s own frame — popped by the instruction.
+        machine.push_frame(0).unwrap();
+        // Execute in a registered callee context (id `1`), so the current context
+        // differs from the continuation's `0`.
+        let callee = Arc::new(Module::default());
+        let id = machine.register_context(&callee);
+        assert_eq!(id, 1, "the first registered context is id 1");
+        machine.switch_context(id).unwrap();
+        // `apply_last 0` reads x(0) = module, x(1) = function.
+        machine.set_x(0, make_atom(erlang)).unwrap();
+        machine.set_x(1, make_atom(self_atom)).unwrap();
+
+        let mut ctx = MinimalContext::with_bif_hook(Box::new(|m, f, a, args| {
+            assert_eq!((m, f, a, args.len()), ("erlang", "self", 0, 0));
+            Ok(make_small(9))
+        }));
+        let instr = Instr::ApplyLast {
+            arity: 0,
+            deallocate: 0,
+        };
+        let labels = LabelMap::new();
+        let step =
+            exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).expect("apply_last runs");
+        assert_eq!(
+            step,
+            Some(Step::Enter {
+                context: 0,
+                func: 7,
+                pc: 3,
+            }),
+            "the continuation lives in context 0, not the callee's context 1"
+        );
+        assert_eq!(machine.x(0), Some(make_small(9)));
+        assert_eq!(machine.frame_depth(), 1, "the `apply_last` frame is popped");
     }
 
     #[test]

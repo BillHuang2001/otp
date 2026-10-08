@@ -51,7 +51,11 @@ fn build_stacktrace_derives_the_live_callers_innermost_first() {
     machine.push_frame(0).unwrap();
     machine.push_frame(0).unwrap();
     machine
-        .set_continuation(crate::machine::Continuation::Address { func: 1, pc: 1 })
+        .set_continuation(crate::machine::Continuation::Address {
+            func: 1,
+            pc: 1,
+            context: 0,
+        })
         .unwrap();
     // x(0) must hold a non-NIL raw stacktrace for the instruction to cook one.
     machine.set_x(0, make_small(1)).unwrap();

@@ -1,11 +1,13 @@
 //! The `impl Machine` dispatch loop.
 //!
 //! `step_instruction` executes exactly one IR instruction (the body of one
-//! dispatch-loop iteration); `run_loop`/`run_loop_with_map` drive it and
+//! dispatch-loop iteration); `run_loop`/`run_loop_with_map` are the thin run
+//! entries that hand the module-context-aware driver
+//! ([`Machine::drive`](crate::machine::Machine)) its starting position, and
 //! `enter_run` is the shared per-run prologue.
 
 use beam_common::{ExceptionClass, Result};
-use beam_loader::{Instr, Module, NO_FAIL};
+use beam_loader::{ImportRef, Instr, Module, NO_FAIL};
 use beam_term::{cmp, make_atom, NIL};
 
 use crate::context::ExecutionContext;
@@ -15,23 +17,22 @@ use crate::machine::{Continuation, Machine, RunOutcome};
 use crate::operand::{read_operand, write_operand};
 use crate::Step;
 
-use super::{build_label_map, resolve, LabelMap};
+use super::{resolve, LabelMap};
 
 impl Machine {
-    /// The direct-threaded dispatch loop over the Milestone-1 opcode subset.
+    /// The run entry over the current module context: bind the entry module's
+    /// literal area and record the run's entry call ([`Machine::enter_run`]), then
+    /// drive the dispatch loop ([`Machine::drive`]).
     ///
-    /// Entry point: function index `func` (into [`Module::functions`]) and code
-    /// offset `pc`; runs until the function's `return` (yielding `x(0)` as
-    /// [`RunOutcome::Returned`]) or until a `receive` suspends the process on an
-    /// empty mailbox (yielding [`RunOutcome::Wait`], with the registers, the
-    /// Erlang stack and every call frame left exactly as the `wait` instruction
-    /// found them).
+    /// `module` is the run's **entry** module (module context `0`); when the machine
+    /// is being resumed it is already positioned in the context the process blocked
+    /// in, and that context's module — not this one — is what `func`/`pc` index (see
+    /// [`Machine::drive`]).
     ///
-    /// It does **not** reset the machine: it only (re)binds the running module's
-    /// literal area, records the run's entry call and builds the per-run name
-    /// index ([`Machine::enter_run`], [`build_label_map`] — labels *and* the
-    /// resolved import table), so [`Machine::resume_outcome`] can re-enter a
-    /// suspended process through it unchanged.
+    /// It does **not** reset the machine: it only (re)binds the entry module's
+    /// literal area and records the run's entry call, so
+    /// [`Machine::resume_outcome`] can re-enter a suspended process through it
+    /// unchanged.
     pub(crate) fn run_loop(
         &mut self,
         module: &Module,
@@ -40,8 +41,7 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<RunOutcome> {
         self.enter_run(module, func);
-        let labels = build_label_map(module);
-        self.run_loop_with_map(module, &labels, func, pc, ctx)
+        self.drive(module, None, func, pc, ctx)
     }
 
     /// The per-run prologue shared by [`Machine::run_loop`] and
@@ -49,15 +49,19 @@ impl Machine {
     /// the operand seam can resolve `Operand::Literal(idx)`, and record the run's
     /// entry `(func, arity)` — **once** per run.
     ///
-    /// Both effects are idempotent in the way a resume needs: the module is fixed
-    /// for the whole run (see the `Machine::literals` field docs), and an entry
-    /// call is recorded only when this run has none yet (a `resume_outcome`
-    /// re-enters the same run without resetting, so the process's initial call
-    /// stays the one it entered at). A `func` outside the module records nothing
-    /// rather than a bogus entry.
+    /// Both effects are idempotent in the way a resume needs: the module named here is
+    /// always the run's entry module (context `0`, see [`Machine::drive`]), and an
+    /// entry call is recorded only when this run has none yet (a `resume_outcome`
+    /// re-enters the same run without resetting, so the process's initial call stays
+    /// the one it entered at). A `func` outside the module records nothing rather
+    /// than a bogus entry.
     pub(crate) fn enter_run(&mut self, module: &Module, func: u32) {
         // `reset()` cleared any previous literal binding.
         self.set_literals(module.literals.clone());
+        // Context `0` is the entry module; the machine never owns it (the drive loop
+        // borrows it), so its area is recorded here for `switch_context` to restore
+        // when a cross-module callee returns into it.
+        self.entry_literals = Some(module.literals.clone());
         if self.entry_call.is_none() {
             if let Some(function) = module.functions.get(func as usize) {
                 self.entry_call = Some((func, function.arity));
@@ -241,8 +245,13 @@ impl Machine {
                 ..
             } => self.exec_bif(module, labels, *bif, args, *fail, dst, ctx),
             Instr::Call { target, .. } => {
-                // Store the continuation in the *current* frame's CP slot.
-                self.set_continuation(Continuation::Address { func, pc: pc + 1 })?;
+                // Store the continuation in the *current* frame's CP slot, tagged
+                // with the module context it points into (the one executing now).
+                self.set_continuation(Continuation::Address {
+                    func,
+                    pc: pc + 1,
+                    context: self.current_context(),
+                })?;
                 let (callee, callee_pc) = resolve(labels, *target)?;
                 // Contract A.8: report the callee's `call` event (the oracle's
                 // breakpoint fires on entry to the callee). Gated, so an untraced
@@ -298,6 +307,24 @@ impl Machine {
                 if self.trace_on {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
+                // A host that can run the callee **in this machine** suspends and
+                // resumes *this* process through it: enter the callee's code with the
+                // caller's return address stored in the live frame, exactly like the
+                // local `Instr::Call` (the callee's `return` reads it back).
+                if let Some((context, callee, callee_pc)) =
+                    self.resolve_external_entry(module, labels, *target, ctx)?
+                {
+                    self.set_continuation(Continuation::Address {
+                        func,
+                        pc: pc + 1,
+                        context: self.current_context(),
+                    })?;
+                    return Ok(Step::Enter {
+                        context,
+                        func: callee,
+                        pc: callee_pc,
+                    });
+                }
                 match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
@@ -310,13 +337,22 @@ impl Machine {
                 if self.trace_on {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
+                // A tail call: the caller's frame is reused, so nothing is stored —
+                // the callee's `return` follows the frame's *existing* continuation
+                // (exactly like the local `Instr::CallOnly`).
+                if let Some((context, callee, callee_pc)) =
+                    self.resolve_external_entry(module, labels, *target, ctx)?
+                {
+                    return Ok(Step::Enter {
+                        context,
+                        func: callee,
+                        pc: callee_pc,
+                    });
+                }
                 match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
-                        match self.continuation()? {
-                            Continuation::Halt => Ok(Step::Done),
-                            Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),
-                        }
+                        self.continuation_step()
                     }
                     Err(e) => self.raise_bif_error(module, e),
                 }
@@ -349,14 +385,26 @@ impl Machine {
                 if self.trace_on {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
+                // The seam target is resolved **before** the pop, so a label/context
+                // the callee's module does not define cannot leave a popped frame
+                // behind (the local `Instr::CallLast` discipline); once it is
+                // resolved, entering the callee is the only step that depends on the
+                // popped frame and nothing may fail after it.
+                if let Some((context, callee, callee_pc)) =
+                    self.resolve_external_entry(module, labels, *target, ctx)?
+                {
+                    self.pop_frame_checked(*deallocate)?;
+                    return Ok(Step::Enter {
+                        context,
+                        func: callee,
+                        pc: callee_pc,
+                    });
+                }
                 match self.call_import(module, labels, *target, *arity, ctx) {
                     Ok(value) => {
                         self.set_x(0, value)?;
                         self.pop_frame_checked(*deallocate)?;
-                        match self.continuation()? {
-                            Continuation::Halt => Ok(Step::Done),
-                            Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),
-                        }
+                        self.continuation_step()
                     }
                     Err(e) => self.raise_bif_error(module, e),
                 }
@@ -404,18 +452,35 @@ impl Machine {
                 Continuation::Address {
                     func: caller,
                     pc: caller_pc,
+                    context,
                 } => {
                     // Contract A.8: the returning function and the function control
                     // returns *to*. The frame is already the caller's (the compiler's
                     // `deallocate` has popped the returning function's own frame), so
-                    // a tail-called function's `return` names the ORIGINAL caller.
-                    if self.trace_on {
+                    // a tail-called function's `return` names the ORIGINAL caller —
+                    // and the continuation names the *caller's* module context, which
+                    // is what brings a cross-module `call_ext` back home.
+                    //
+                    // The event is only reported for an intra-module return: the
+                    // oracle's `return_to` names a function in the frame the trace
+                    // would have to resolve, and `module` here is the *callee's*
+                    // module, so a cross-context caller's index is not a nameable
+                    // function of it (reporting one would invent an event).
+                    if self.trace_on && context == self.current_context() {
                         self.trace_return(module, func, caller, ctx);
                     }
-                    Ok(Step::Goto {
-                        func: caller,
-                        pc: caller_pc,
-                    })
+                    if context == self.current_context() {
+                        Ok(Step::Goto {
+                            func: caller,
+                            pc: caller_pc,
+                        })
+                    } else {
+                        Ok(Step::Enter {
+                            context,
+                            func: caller,
+                            pc: caller_pc,
+                        })
+                    }
                 }
             },
             // An opcode the loader has no typed IR variant for: a residual
@@ -433,41 +498,62 @@ impl Machine {
         }
     }
 
-    /// The dispatch loop over a pre-built label map (shared by
-    /// [`Machine::run_loop`] and [`Machine::resume_outcome`]).
+    /// The run entry over an **already-built** label map (shared by
+    /// [`Machine::run_label_outcome`], which resolved its entry label against this
+    /// very map, and [`Machine::resume_outcome`]).
     ///
-    /// A thin driver over [`Machine::step_instruction`]: it executes one
-    /// instruction at a time and folds the returned [`Step`] into the running
-    /// `(func, pc)`, finishing the run with `x(0)` on [`Step::Done`] and reporting a
-    /// suspension as [`RunOutcome::Wait`] on [`Step::Wait`] (leaving the machine
-    /// untouched so the host can re-enter at the reported address).
-    ///
-    /// The A.8 tracing gate is latched here — **once per run** (and thus once per
-    /// [`Machine::resume_outcome`], so a process that is traced while blocked picks
-    /// the change up on resume): the per-instruction call/return arms read the plain
-    /// `Machine::trace_on` `bool` instead of making a `trace_enabled()` vtable call
-    /// per instruction, so an untraced run pays a single `bool` load and no event is
-    /// ever built. See the `Machine::trace_on` field docs for the mid-run
-    /// semantics.
+    /// A thin wrapper over the module-context-aware driver
+    /// ([`Machine::drive`](crate::machine::Machine)): the loop itself — including
+    /// the re-binding of the module and its literal area when a `call_ext*` the
+    /// host resolved runs a callee in this machine — lives there.
     pub(crate) fn run_loop_with_map(
         &mut self,
         module: &Module,
         labels: &LabelMap,
-        mut func: u32,
-        mut pc: u32,
+        func: u32,
+        pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<RunOutcome> {
-        self.trace_on = ctx.trace_enabled();
-        loop {
-            match self.step_instruction(module, labels, func, pc, ctx)? {
-                Step::Next => pc += 1,
-                Step::Goto { func: f, pc: p } => {
-                    func = f;
-                    pc = p;
-                }
-                Step::Wait { func: f, pc: p } => return Ok(RunOutcome::Wait { func: f, pc: p }),
-                Step::Done => return self.finish().map(RunOutcome::Returned),
-            }
-        }
+        self.drive(module, Some(labels), func, pc, ctx)
+    }
+
+    /// Resolve a `call_ext*`'s target through the host's cross-module-call seam
+    /// ([`ExecutionContext::resolve_external_call`]) into an address **this machine**
+    /// can enter.
+    ///
+    /// `Ok(None)` means the host cannot run the callee here (the seam's `Ok(None)`
+    /// default): the caller keeps the synchronous `call_bif` path unchanged.
+    /// `Ok(Some((context, func, pc)))` means the callee's module is registered as
+    /// module context `context` and `(func, pc)` is its export entry — the caller's
+    /// `CallExt*` arm applies its own frame discipline and returns
+    /// [`Step::Enter`].
+    ///
+    /// The `(module name, function name, arity)` triple handed to the host is the
+    /// **same** one [`Machine::call_import`] would pass to `call_bif` (the import
+    /// table's, resolved through the per-run cache), so a host can answer the seam
+    /// however it answers the BIF dispatch. The returned entry `Label` is resolved
+    /// against the **callee's own** label index; an unknown label is the typed
+    /// [`crate::error::unknown_label`], never a jump into the wrong module.
+    fn resolve_external_entry(
+        &mut self,
+        module: &Module,
+        labels: &LabelMap,
+        target: ImportRef,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Option<(u32, u32, u32)>> {
+        let (module_name, function_name, arity) = labels.import_target(module, target)?;
+        let Some((callee, label)) = ctx.resolve_external_call(module_name, function_name, arity)?
+        else {
+            return Ok(None);
+        };
+        // Registering is idempotent by the handle's allocation identity, so a
+        // recursive or repeated cross-module call reuses one context (and its
+        // already-built label index).
+        let context = self.register_context(&callee);
+        let handle = self
+            .module_context(context)
+            .ok_or_else(|| error::unsupported("run: unknown module context"))?;
+        let (func, pc) = handle.labels.resolve(label)?;
+        Ok(Some((context, func, pc)))
     }
 }

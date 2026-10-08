@@ -716,6 +716,14 @@ fn drive(
                     pc: wait_pc,
                 })
             }
+            // A module-context switch is the interpreter driver's job (see
+            // `jit_step_one`): the blocks, the label map and the literal area of this
+            // driver are all bound for the entry module.
+            Step::Enter { .. } => {
+                return Err(error::unsupported(
+                    "jit: module context switch outside the interpreter driver",
+                ))
+            }
             Step::Done => {
                 // SAFETY: `machine_ptr` points at the live driver-owned `Machine`.
                 return unsafe { (*machine_ptr).finish() }.map(RunOutcome::Returned);
