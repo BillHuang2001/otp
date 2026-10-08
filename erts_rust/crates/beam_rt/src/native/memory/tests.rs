@@ -283,6 +283,67 @@ fn the_reachable_items_have_their_oracle_shapes() {
     );
 }
 
+/// The `monitors` item carries **both** monitor families, each entry as `{process, Pid}` or
+/// `{port, Port}` — the oracle's shape (verified against OTP 29.1.1 / erts-17.1:
+/// `monitors => [{port,#Port<0.3>},{process,<0.84.0>}]`).
+///
+/// Process monitors live in `Process::monitors` and port monitors in
+/// `Process::port_monitors`, which only `ProcessTable::monitor_port` populates — and
+/// `beam_rt` holds no `beam_process::PortTable`, so `erlang:monitor(port, _)` is a typed
+/// capability gap and the port family is empty at runtime. The rendering is pinned here by
+/// populating both sets directly on a `Process` and inserting it into the runtime's table.
+#[test]
+fn monitors_carries_the_port_monitors_alongside_the_process_monitors() {
+    use beam_process::{Monitor, MonitorKind, PortId, PortWatch, Process, RefAllocator};
+
+    let mut runtime = runtime();
+    let pid = ProcessId::new(4242, 0);
+    let watched = ProcessId::new(4243, 0);
+    let port = PortId::new(7);
+
+    let mut process = Process::new(pid).expect("a fresh process");
+    let mut refs = RefAllocator::new();
+    // One outgoing process monitor ...
+    process.monitors_mut().push(Monitor {
+        reference: refs.next(),
+        target: watched,
+        kind: MonitorKind::Process,
+    });
+    // ... and one outgoing port monitor.
+    process.port_monitors_mut().push(PortWatch {
+        reference: refs.next(),
+        port,
+    });
+    {
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+        context
+            .process_table_mut()
+            .insert(process)
+            .expect("the process table accepts the pid");
+    }
+
+    let reply = info(&mut runtime, pid.to_eterm(), "monitors").expect("process_info/2 monitors");
+    let (key, value) = pair(reply);
+    assert_eq!(runtime.atom_name_of(key), Some("monitors"));
+    let entries = terms::list_elements(value).expect("a list");
+    assert_eq!(entries.len(), 2, "both families are reported: {entries:?}");
+
+    // The process monitor first ...
+    let (kind, target) = pair(entries[0]);
+    assert_eq!(runtime.atom_name_of(kind), Some("process"));
+    assert_eq!(target, watched.to_eterm());
+
+    // ... then the port monitor, as `{port, Port}` with the port's own id.
+    let (kind, target) = pair(entries[1]);
+    assert_eq!(runtime.atom_name_of(kind), Some("port"));
+    assert_eq!(target, port.to_eterm());
+    assert!(
+        PortId::from_eterm(target).is_ok(),
+        "the port entry's target is a real port id"
+    );
+}
+
 #[test]
 fn every_unsupported_item_raises_the_typed_capability_gap() {
     let mut runtime = runtime();

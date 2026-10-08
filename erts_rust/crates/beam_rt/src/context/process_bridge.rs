@@ -270,8 +270,12 @@ impl ProcessHook for ProcessBridge<'_> {
                 else {
                     return Ok(None);
                 };
+                // The previous priority is read off the PCB we already hold, then the change
+                // is applied through the table's own setter (the table-level entry point),
+                // rather than the PCB directly. The borrow ends at the read, so the table can
+                // be re-borrowed here.
                 let previous = process.priority();
-                process.set_priority(priority);
+                self.table_mut().set_priority(pid, priority)?;
                 let atom = atoms.lookup(previous.name()).ok_or(BeamError::TermNotFound)?;
                 Ok(Some(make_atom(atom)))
             }
