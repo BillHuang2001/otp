@@ -201,7 +201,15 @@ itself documented non-portable across VM instances.
 ### `size.rs` — object word size
 - `pub fn size_object(a: Eterm) -> usize` — the *flat* number of heap words the term graph
   occupies, reproducing `size_object_x(obj, NULL)` (`copy.c`): `0` for immediates, `2` per cons
-  cell, `arity + 1` per boxed object (header + payload), plus the sizes of nested terms.
+  cell, `arity + 1` per boxed object (header + payload), plus the sizes of nested terms. Total and
+  **bounded**: a cyclic or forged graph returns a defined partial count instead of looping.
+- `pub fn size_object_bounded(a: Eterm, limit: usize) -> Result<usize, TermError>` — the bounded,
+  cycle-safe companion. `Ok(n)` iff the graph is **acyclic** and its flat size is `n <= limit`
+  (there identical to `size_object`); `Err(TermGraphTooLarge)` for an acyclic graph over `limit`;
+  `Err(TermGraphCyclic)` for a cycle, which takes priority over the size limit. Both entry points
+  share ONE iterative walk; cycle detection is **path-based** (`on_path`), so a shared-but-acyclic
+  subterm is still counted once per occurrence — matching `size_object_x`/`copy_struct`. A non-term
+  word contributes `0` and is never dereferenced.
 
 ### `thing.rs` — off-heap term materialization (heap-agnostic)
 Frozen-layout **writers and readers for the boxed "thing" families whose interior layout this
