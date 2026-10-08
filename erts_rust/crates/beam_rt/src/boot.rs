@@ -166,6 +166,28 @@ pub const CORE_ATOMS: &[&str] = &[
     "nonode@nohost",
     "bm",
     "ac",
+    // The `get_module_info/1,2` item vocabulary and the compiler keys an `Attr`/`CInf`
+    // chunk's decoded term carries (`vsn`, `version`, `options`, `source`, …). The module
+    // seam resolves every atom **by name** into this table (it may not intern), so a name
+    // absent here would make a legitimately renderable item an honest capability gap.
+    // Appended last, like every group below the first three.
+    "vsn",
+    "version",
+    "options",
+    "source",
+    "count",
+    "memory",
+    "module_info",
+    "nifs",
+    "native",
+    "native_addresses",
+    "records",
+    "exports",
+    "functions",
+    "attributes",
+    "compile",
+    "md5",
+    "module",
 ];
 
 /// The preloaded-module registry skeleton (contract A.7).
@@ -417,6 +439,25 @@ mod tests {
             "nonode@nohost",
             "bm",
             "ac",
+            // The `get_module_info/1,2` item names and the compiler keys an `Attr`/`CInf`
+            // chunk carries, appended after the reason/class group (see `CORE_ATOMS`).
+            "vsn",
+            "version",
+            "options",
+            "source",
+            "count",
+            "memory",
+            "module_info",
+            "nifs",
+            "native",
+            "native_addresses",
+            "records",
+            "exports",
+            "functions",
+            "attributes",
+            "compile",
+            "md5",
+            "module",
         ];
         let mut atoms = AtomTable::new();
         seed_core_atoms(&mut atoms);
