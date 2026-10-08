@@ -398,7 +398,11 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
-  not here; the full gate stays `mismatch=0`.
+  not here; the full gate stays `mismatch=0`. This crate's own tests are **all self-checks**
+  (structural `compare::eq`, word-count arithmetic, refcounts) — no test in `src/` or `tests/`
+  invokes `erl`/`erlc`.
+- The workspace `cargo test` gate is **local only**: `.github/` contains no `erts_rust`/cargo workflow
+  (only the repo's own C build/test workflows), so these tests never run in CI.
 ## Performance (measured)
 `tests/perf.rs` (dependency-free `std::time::Instant`, `--nocapture`; dev/`opt-level=1` profile,
 20 000 iters, HAMT 5 000). Repro: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message --test perf -- --nocapture`.
@@ -441,14 +445,23 @@ dominates the small shapes.)
   workspace, so [`NodeEntry`] keys `(node atom, creation)` and its count is per-table structural
   bookkeeping (see Design Decisions); a real registry would replace the atom with an `ErlNode *` and
   make the count global across processes.
+- **`copy_struct_shared` preflights the *flat* word count.** It is a safe upper bound, so a caller sizes
+  the destination heap as for `copy_struct`; the memory saving is in the words written, not in the
+  accepted capacity.
+- **The fragment model is adopted only by `beam_rt`, and untested.** `beam_process::deliver` still calls
+  `send` (a payload over its heap ⇒ `AllocKind::Message`); `beam_rt`'s `deliver_message`
+  (`src/context/mod.rs`) catches that, composes `HeapFragment`/`copy_root`/`Fragments` itself (its own
+  `Runtime::send_fragmented_message`) and enqueues a message owning the chain — it does **not** call
+  `beam_message::send_fragmented` because `beam_process::Process` exposes `heap_mut`/`mailbox_mut` as two
+  disjoint `&mut self` borrows with no split. No `beam_rt/tests/*` nor differential case exercises
+  fragmentation, and a received message's `Fragments` are never `move_into`'d.
 - **A fragment holds the whole payload; there is no automatic multi-fragment split.** The C streams an
   oversized message across a chain of `new_message_buffer` fragments; here one fragment is sized to the
   whole payload (`fragment_capacity_words.max(size_object(term))`) and the chain is built by the caller
   (`Fragments::push`). A size-bounded split is `beam_process`'s heap-management concern.
-- **The fragment model is not yet wired into a runtime.** `HeapFragment`/`Fragments`/`send_fragmented`
-  exist and support a no-partial-write oversized-message retry, and `beam_rt::context::deliver_message`
-  already retries on `AllocKind::Message` via `send_fragmented_message`; but `beam_rt`/`beam_process`
-  do not yet hold a received message's `Fragments` as its message-buffer model nor call
+- **`beam_process` has no fragment-aware message-buffer model.** `HeapFragment`/`Fragments`/
+  `send_fragmented` support a no-partial-write oversized-message retry; but `beam_rt`/`beam_process` do
+  not yet hold a received message's `Fragments` as its message-buffer model nor call
   `Fragments::move_into` to move a payload onto the process heap — a host must.
 - **Sibling adoption needed (reported to the parent, `beam_rt` NOT edited here).** `beam_rt::error::enforce_term_heap_limit`
   (beam_rt/src/error.rs) translates only `AllocKind::Heap` → `SystemLimit`, so `Runtime::stabilize_term`'s

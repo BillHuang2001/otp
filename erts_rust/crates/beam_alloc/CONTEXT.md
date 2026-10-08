@@ -310,10 +310,12 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - `../beam_gc/`, `../beam_message/`, `../beam_ets/`, `../beam_process/` → primary dependents.
 
 ## Handoffs (owned by other nodes — NOT adopted here)
-- **`beam_rt` `system_info` wiring:** `system_info(alloc_util_allocators)`,
-  `system_info({allocator,A})` and `erts_alloc:info/0` can consume
-  `registry::alloc_util_allocators()` + `AllocatorInfo::from_stats(...)`/`push_policy(...)`/
-  `push_type(...)` — the shapes are in place but not yet wired in `beam_rt`.
+- **`beam_rt` `system_info` wiring (partially adopted):** `beam_rt`'s `info.rs`/`info/memory.rs`
+  already answer `system_info(alloc_util_allocators)` and `system_info({allocator,A})` from
+  `registry::alloc_util_allocators()` + `AllocatorInfo::from_stats(...)` — the `{allocator,A}` rows
+  are flat (the oracle wraps them in one `{instance,N,…}` entry per allocator instance, a documented
+  divergence in `beam_rt`'s `info/CONTEXT.md`). `AllocatorInfo::push_policy(...)`/`push_type(...)`
+  and `erts_alloc:info/0` are **not** wired yet.
 - **`../../CHANGE.md` entries owed to the repo-root owner:** the type-table inventory, the mseg layer,
   the typed allocator surface, the stats layer, the MBC/coalescing wiring, and the `policy.rs` thresholds.
 - **`beam_gc`:** expected to replace its own `RefCount` with `pub use beam_alloc::RefCount;`.

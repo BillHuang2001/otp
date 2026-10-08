@@ -98,22 +98,28 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 ## Status
 - **Crate tree complete:** all 15 crates + 2 tools are architected (each with its own `CONTEXT.md`),
   implemented, and tested.
-- **Build/test:** `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace --all-targets`
-  is warning-free (one pre-existing `unused import: Mailbox` warning in `beam_rt`'s `tests/trace.rs` is
-  being fixed separately). `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
-  --no-fail-fast` reports **5762 passed / 3 failed / 1 ignored**; the 3 failures are all in `beam_rt`
-  and stem from `beam_bifs` registering the FULL declared `bif.tab` surface (556 keys; registry 637),
-  which shadows `beam_rt`'s curated `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list — a `beam_rt` fix is in
-  flight and 0 failures are expected once it lands.
+- **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
+  --all-targets`; test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
+  --no-fail-fast`. The `beam_rt` failures once caused by `beam_bifs` registering the FULL declared
+  `bif.tab` surface (556 keys; registry 637) shadowing `beam_rt`'s curated
+  `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list are resolved: `beam_rt::is_known_unimplemented_bif` now
+  intersects the live registry (`beam_rt/src/error.rs`), with drift-guard tests. Re-run the suite to
+  read the current pass count.
+- **No CI runs the Rust workspace or the differential gate.** `.github/` has zero references to
+  `erts_rust`/`cargo`/`differential`; every Rust test and the compatibility gate run only locally
+  (`scripts/cargo.sh`, `tools/differential/gate.sh`). Parity claims therefore rest on manual runs.
 - **Vertical slice WORKS:** `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam` (produced by
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
   outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=667 agree=666 mismatch=0 unsupported=1
-  skipped=0` — per contract A.1 154/154 · A.2 176/176 · A.3 34/34 · A.4 64/64 · A.5 63/64 (+1
-  unsupported) · A.6 37/37 · A.7 246/246 · A.8 49/49 · A.9 52/52. **No case disagrees.** The single
-  `unsupported` is `wire/new_fun_ext_encode` (A.5): an `erl_eval` lambda's closure identity cannot be
-  reproduced without porting `erl_eval`/`erl_scan`/`erl_parse`, so it is **unclosable by design**.
+- **Compatibility gate (`tools/differential`):** per `tools/differential/CONTEXT.md`, `summary: total=723
+  agree=708 mismatch=0 unsupported=15 skipped=0` (`gate.sh` → exit `3`) — per contract A.1 154/154 · A.2
+  176/176 · A.3 34/34 · A.4 64/64 · A.5 79/71 (+8 unsupported) · A.6 44/44 · A.7 265/263 (+2) · A.8
+  64/59 (+5) · A.9 52/52. **No case disagrees.** The 15 `unsupported` are honest capability gaps, never
+  `mismatch`: `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
+  `erl_eval`/`erl_scan`/`erl_parse`), the 7 `wire_ids` node-identity cases (`nodes/0,1`, `set_cookie/2`),
+  the 5 `erlang:memory/0,1` cases, and `start_timer/3` + `function_exported/3`. (Sibling docs cite older
+  totals; re-run `gate.sh` for the exact current split.)
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 637
   keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through two
   defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`). Registered-but-unadopted BIFs return a
@@ -122,7 +128,9 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   Milestone-1 archive is explicitly marked there). The known hot-path defect is `beam_rt`'s
   `RuntimeContext::call_registered` deep-cloning the shared `AtomTable` on **every** registered BIF
   call — ~99% of the marginal per-iteration cost of `beam_rt run …`, and the reason per-call costs on
-  real Cowboy/EMQX functions measure 700×–9 000× the oracle. Root cause verified; fix in flight.
+  real Cowboy/EMQX functions measure 700×–9 000× the oracle. That defect is resolved — the whole-table
+  clone in `beam_rt`'s `call_registered` is now skipped when there is nothing to commit — so the
+  `RESULTS.md` figures predate the fix and need re-measuring.
 - **Honest coverage gaps** (per-crate `Known Issues`): the engine tiers and the Cranelift hot tier
   (`jit-cranelift`, default-OFF) are not yet on `beam_rt`'s execution path; full match-spec compiler;
   ETS concurrency; `put_record/6`'s create form; several structured-raise-reason degradations; depth of

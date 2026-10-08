@@ -19,6 +19,15 @@ queues), `erl_proc_sig_queue.c` (signal queue), `erl_monitor_link.c` (links/moni
 `erl_ptab.{c,h}` (process/port table + name registry), `erl_process_dict.c`, `erl_vm.h`
 (`MAX_REG`/`MAX_ARG`), `erl_thr_progress.c` (thread-progress barrier), `erl_hl_timer.c` (timer wheel)
 and `erl_nfunc_sched.c` (the NIF→dirty-scheduler trampoline).
+**Not this crate's ground truth** (a C-deletion record must not attribute them here): the allocators
+(`erl_alloc*.c`, `erl_alloc_util.c`, `erl_goodfit/bestfit/afit/ao_firstfit_alloc.c` → `beam_alloc`);
+the message copy engine (`erl_message.c`/`copy.c` → `beam_message`); crash dumping
+(`erl_process_dump.c`/`erl_crash_dump.c` → `beam_rt`'s `crash_dump.rs`); microstate accounting
+(`erl_msacc.c`) and flexible counters (`erl_flxctr.c`) are **not modelled by any crate** (`beam_rt`
+lists the `mc_*`/`scheduler_wall_time` BIFs as a native gap); `erl_thr_queue.c`,
+`erl_sched_spec_pre_alloc.c` and `erl_process_lock.c` are **not modelled**; and `time.c`/`erl_time_sup.c`
+(low-level time + Erlang time services) are served by `beam_bifs`'s time BIFs / `beam_rt`, not here
+(this crate's `timer.rs` is the `erl_hl_timer.c` analogue).
 ## Milestone-1 scope
 The crate has **two scheduler fronts**: the single-threaded `Scheduler` loop (whose slice semantics are
 frozen) and the SMP `SchedulerPool` that runs `N` scheduler threads over one shared table. Both execute

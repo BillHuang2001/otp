@@ -37,13 +37,16 @@ Changed-path detection is generated at run time: `scripts/path-filters.sh` and `
 - **All runners are GitHub-hosted** (`ubuntu-latest`, `windows-2025`, `macos-15`/`macos-15-intel`); BSD/Solaris jobs run inside QEMU VMs (`vmactions/*-vm`) on `ubuntu-latest`, and no self-hosted runner infrastructure exists.
 
 ## Known Issues
+- **No CI coverage for the `erts_rust` Rust rewrite.** No file under `.github/` references `erts_rust`, `cargo`, `rust` or `rustup`, and no job installs a Rust toolchain. `path-filters.sh` / `c-code-path-filters.sh` enumerate only `erts/*` and every `lib/*/doc` app, so `erts_rust/**` changes match no filter and never gate a job; `reusable-build-otp.yaml` builds only the C/Erlang tree. The cargo workspace's unit tests (incl. `beam_io`), the `erts_rust/tools/differential` compatibility gate and the benchmark tools run only manually, never in CI.
 - The Solaris job in `main.yaml` is permanently disabled (`if: ... && false`, broken VM image), so `reusable-solaris.yaml` is currently unreachable.
 - `osv-scanner-scheduled.yml` also triggers on `pull_request`, but every job is gated to `schedule`, so PR runs are no-ops.
 - `reusable-vex-attest.yml` has no in-repo caller (dispatch-only) and, like `reusable-vendor-vulnerability-scanner.yml`, depends on repo-scoped variables/secrets that do not exist in forks.
 - Workflow file extensions are inconsistent (27 files use `.yaml`, 6 use `.yml`); ratchet/Renovate globs cover both.
+- **No CI coverage of the `erts_rust/` Rust rewrite**: no workflow, composite action, Dockerfile or CI script references `erts_rust`, `cargo`/`rustc`/`rustup`, `beam_abi`, the `differential` harness, `--export-dynamic` or `.rs` files. Every build/test job targets the legacy C/C++ ERTS tree (word-boundary search for `rust`/`cargo`/`rustc`/`differential` under `.github/` is empty of matches). The rewrite's `cargo build/test --workspace` + differential harness are run out-of-band, not by this CI.
 
 ## Notes for Agents
 - Read only the file you need: workflows are self-describing YAML with license headers; the per-directory CONTEXT.md files below carry the contracts, so avoid re-deriving them.
+- **The Rust ERTS rewrite (`../erts_rust/`) is not built, tested or linted by CI.** No workflow, composite action, `dockerfiles/*` or `.github/scripts/*` file mentions `erts_rust`, `cargo`, `beam_engine`, `beam_rt` or `../erts_rust/scripts/cargo.sh` (the crate/workspace entry point lives there, not here); no CI image installs a Rust toolchain; and `scripts/path-filters.sh` / `scripts/c-code-path-filters.sh` have no `erts_rust` entry, so an `erts_rust`-only change sets no build flags in `reusable-pack.yaml`. The only CI job that even reads those files is the repo-wide license scan (`license-scanner.yaml` → `../scripts/license-header.es ci`, which enumerates every git-tracked file via `git ls-tree -r`), and no file under `erts_rust/` carries the `%CopyrightBegin%` block that scanner requires.
 - Debugging CI changes locally is limited — most steps assume a GitHub Actions environment (`$GITHUB_OUTPUT`, artifacts, ghcr.io login). `.github/scripts/path-filters.sh`, `c-code-path-filters.sh`, `get-*-versions.sh` and the escripts can be run locally.
 - When adding a new platform or job, wire it in `main.yaml` and add it to `ruleset-checker.needs`, otherwise it is invisible to branch protection.
 - CI is the authoritative integration test for OTP (`make test`/`make system_test`), separate from per-application test suites; use `HOWTO/TESTING.md` for local equivalents.
@@ -58,6 +61,7 @@ Changed-path detection is generated at run time: `scripts/path-filters.sh` and `
 - `../CONTEXT.md` — repository root: build system (`configure`, `otp_build`, `Makefile`), `OTP_VERSION`.
 - `../scripts/` — repo-root helpers invoked directly by workflows (`build-otp-tar`, `run-dialyzer`, `license-header.es`).
 - `../make/` and `../otp_build` — the build targets CI drives.
+- `../erts_rust/` — Rust ERTS rewrite workspace (`Cargo.toml`, `rust-toolchain.toml`, `scripts/cargo.sh`, `tools/differential/`, `tools/bench/`); built/tested only by hand, never by any workflow here.
 - `../renovate.json5` — dependency/action-pin update configuration.
 - `../HOWTO/` — INSTALL/TESTING/DEVELOPMENT docs that mirror what CI enforces.
 
