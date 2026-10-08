@@ -552,6 +552,23 @@ impl Table {
   there); the faithful form is `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the
   `beam_bifs` `ets:lookup_element` bridge must route the multi kinds through `lookup_element_all` and
   build the list.
+- **`tab2file`/`file2tab`/`tabfile_info`/`tab2file`-family are BLOCKED — not merely out of scope.**
+  Implementing them inside this crate is impossible without widening its dependency edges, because the
+  ETS table-file format is `{Header, Objects, Footer}` where **every** field is an External-Term-Format
+  term (`$TAB2FILE`-style magic, an `{version, …}`/`{info, …}` header, the objects, and a
+  `{hfile, Size, MD5}` footer). Rendering and parsing those terms needs a term codec, which lives in
+  `beam_codec` — a **new cross-crate dependency edge** (`beam_ets` is wave 1, `beam_codec` is wave 1,
+  and the layer DAG currently has no `beam_ets → beam_codec` edge). Writing/reading the file itself
+  needs a file descriptor / I-O, which lives in `beam_io`/`std::fs`; `beam_io` is wave 5, so that is a
+  second new edge **in the wrong direction** (a wave-1 crate may not depend upward). Both edges are
+  forbidden by the crate-layer contracts (`../CONTEXT.md` *No duplication across crates* / the wave
+  table) without explicit parent approval. `ets:tab2file/3` also has oracle behaviours beyond I-O
+  (`{extended_info, …}`, the `sync`/`sync_verbose` modes, the ~10 000-object chunking, and re-raising
+  the caller's `badarg` for a non-tuple object) that would need their own modelling. Verdict: **not
+  implemented**, blocked on (a) a `beam_codec` encode/decode edge for the table-file terms and (b) a
+  file-I/O edge — both are cross-crate decisions owned by `../` (the crate layer), not by this crate.
+  The same reasoning blocks `file2tab`/`tabfile_info`; `tab2list` + `first`/`next` remain the
+  supported enumeration path.
 - **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
   `select_reverse/*`, `foldl`/`foldr`, `rename/2`, `whereis/1`, `table/1,2`, `slot/2`,
   `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1`, `ets:size/1` and
