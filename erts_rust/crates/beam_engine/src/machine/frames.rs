@@ -61,7 +61,12 @@ impl Machine {
     ///
     /// Returns [`crate::error::bad_register`] if there is no frame or `k` is
     /// outside the frame's Y slots.
-    #[inline]
+    ///
+    /// `#[inline(always)]`-marked: it is the store half of `write_operand` (itself
+    /// always-inlined) and, with only `#[inline]`, stayed out of line (measured: it
+    /// was a ~2.8% self-time symbol on the BIF-free list walk, which stores one Y
+    /// slot per element).
+    #[inline(always)]
     pub(crate) fn set_y(&mut self, k: u32, v: Eterm) -> Result<()> {
         let (y_base, y_count) = match self.frames.last() {
             Some(frame) => (frame.y_base, frame.y_count),

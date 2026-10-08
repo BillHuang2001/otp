@@ -174,7 +174,12 @@ impl Machine {
     }
 
     /// Read test argument `i`, or a typed error if the instruction has too few.
-    #[inline]
+    ///
+    /// `#[inline(always)]`-marked: every `test` instruction reads one argument, and
+    /// with only `#[inline]` this stayed out of line (measured: a ~5% self-time
+    /// symbol on the BIF-free list walk), paying a call and a 72-byte
+    /// `Result<Eterm, BeamError>` round trip per `test`.
+    #[inline(always)]
     fn test_arg(
         &self,
         args: &[Operand],
