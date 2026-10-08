@@ -26,11 +26,18 @@ use crate::terms;
 /// static literal via [`Machine::literal`]). `Label`/`List`/`Allocation` are the
 /// documented Milestone-1 gaps and return a typed error.
 ///
-/// `#[inline]`-marked: it is called several times per interpreted instruction and
-/// the crate is built in many codegen units, so the hint is what lets the register
-/// arms collapse into the dispatch loop's own unit (a register read/write then
-/// costs a bounds check, not a call).
-#[inline]
+/// The arms are ordered **hottest first** — the register/immediate kinds the
+/// compiler emits for every real instruction — and the kinds it never emits as a
+/// source fall through one `other` arm to a single typed error, so the common
+/// operand is a bounds check and a load with no branch into the rare ones.
+///
+/// `#[inline(always)]`-marked: it is called several times per interpreted
+/// instruction and the crate is built in many codegen units, so the hint is what
+/// lets the register arms collapse into the dispatch loop's own unit — and, just
+/// as importantly, what lets the optimizer see through the 72-byte
+/// `Result<Eterm, BeamError>` return and keep the `Ok` value in a register on the
+/// hot path (an out-of-line call pays that return through memory).
+#[inline(always)]
 pub(crate) fn read_operand(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
@@ -38,12 +45,12 @@ pub(crate) fn read_operand(
 ) -> Result<Eterm> {
     match operand {
         Operand::X(n) => machine.x(*n).ok_or_else(|| error::bad_register(*n)),
+        Operand::Integer(i) => terms::make_integer(ctx, *i),
+        Operand::Nil => Ok(NIL),
         Operand::Y(n) => machine.y(*n).ok_or_else(|| error::bad_register(*n)),
+        Operand::Atom(a) => Ok(make_atom(*a)),
         Operand::FloatReg(n) => machine.get_fr(*n).ok_or_else(|| error::bad_register(*n)),
         Operand::Typed { reg, .. } => read_register(machine, *reg),
-        Operand::Integer(i) => terms::make_integer(ctx, *i),
-        Operand::Atom(a) => Ok(make_atom(*a)),
-        Operand::Nil => Ok(NIL),
         Operand::Character(c) => terms::make_integer(ctx, i64::from(*c)),
         // The module's decoded `LitT` literal at `idx`, bound to the machine for
         // the duration of the run. A missing/out-of-range index is a structural
@@ -60,7 +67,8 @@ pub(crate) fn read_operand(
 ///
 /// Supported for `X(n)`/`Y(n)`/`Typed{reg,..}`/`FloatReg(n)`; anything else is a
 /// typed error. A `Literal` is never a valid destination: it names a term in the
-/// module's immutable literal area, which has no addressable slot.
+/// module's immutable literal area, which has no addressable slot. Hottest arm
+/// first, like [`read_operand`].
 #[inline]
 pub(crate) fn write_operand(machine: &mut Machine, operand: &Operand, value: Eterm) -> Result<()> {
     match operand {
@@ -90,7 +98,6 @@ fn write_register(machine: &mut Machine, reg: Reg, value: Eterm) -> Result<()> {
         Reg::Y(n) => machine.set_y(n, value),
     }
 }
-
 /// A stable label for an unsupported operand kind (used in the error reason).
 fn operand_kind(operand: &Operand) -> &'static str {
     match operand {
