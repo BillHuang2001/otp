@@ -112,6 +112,7 @@ impl Table {
     pub fn heir(&self) -> Option<Heir>;
     pub fn set_heir(&mut self, heir: Option<Heir>);
     pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()>;
+    pub fn owner_died<F: FnOnce(OwnerId) -> bool>(&mut self, dead: OwnerId, is_alive: F) -> OwnerDeath;
     pub fn info(&self) -> TableInfo;
 
     // writes (object = the whole tuple; key derived from keypos)
