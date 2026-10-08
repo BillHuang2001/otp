@@ -514,38 +514,48 @@ mod tests {
     #[test]
     fn a_non_owner_cannot_walk_a_private_table() {
         let (mut heap, atoms, mut reg) = parts();
-        let mut ctx =
-            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
-        let name = ctx.atom("mytab").expect("seeded");
-        let kind = ctx.atom("ordered_set").expect("seeded");
-        let private = ctx.atom("private").expect("seeded");
-        let opts = ctx.list(&[kind, private]).expect("fits");
-        let handle = new_2(&mut ctx, &[name, opts]).expect("ets:new");
-        insert_all(&mut ctx, handle, &[1]);
+        let handle;
+        {
+            let mut ctx =
+                BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            let name = ctx.atom("mytab").expect("seeded");
+            let kind = ctx.atom("ordered_set").expect("seeded");
+            let private = ctx.atom("private").expect("seeded");
+            let opts = ctx.list(&[kind, private]).expect("fits");
+            handle = new_2(&mut ctx, &[name, opts]).expect("ets:new");
+            insert_all(&mut ctx, handle, &[1]);
 
-        // The owner reads it.
-        assert_eq!(
-            rows(first_lookup_1(&mut ctx, &[handle]).expect("owner")),
-            (1, vec![(1, 10)])
-        );
+            // The owner reads it.
+            assert_eq!(
+                rows(first_lookup_1(&mut ctx, &[handle]).expect("owner")),
+                (1, vec![(1, 10)])
+            );
+        }
 
         // A different process is denied, and the table remains.
-        {
+        let one = {
             let mut other =
                 BifContext::new(&mut heap, &atoms, ProcessId::new(2, 0)).with_tables(&mut reg);
+            let one = other.int(1).expect("fits");
             assert!(matches!(
                 first_lookup_1(&mut other, &[handle]),
                 Err(BeamError::BadArg)
             ));
             assert!(matches!(
-                next_lookup_2(&mut other, &[handle, ctx.int(1).unwrap()]),
+                next_lookup_2(&mut other, &[handle, one]),
                 Err(BeamError::BadArg)
             ));
+            one
+        };
+        let _ = one;
+        {
+            let mut ctx =
+                BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            assert_eq!(
+                rows(first_lookup_1(&mut ctx, &[handle]).expect("owner again")),
+                (1, vec![(1, 10)])
+            );
         }
-        assert_eq!(
-            rows(first_lookup_1(&mut ctx, &[handle]).expect("owner again")),
-            (1, vec![(1, 10)])
-        );
     }
 
     /// The live-oracle cross-check. The golden block below is what the system
