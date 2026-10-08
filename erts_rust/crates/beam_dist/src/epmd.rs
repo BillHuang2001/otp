@@ -31,7 +31,12 @@
 //! ([`KillReq`]) and `STOP_REQ` ([`StopReq`]), which are **destructive**
 //! (they terminate the daemon / unregister a node) and are therefore covered only
 //! by codec round-trips in the test suite.
-use beam_common::{BeamError, Result};
+//!
+//! The whole port-mapper protocol lives in this one module — the tag
+//! re-exports, the request/response codecs, the self-delimiting reply readers and
+//! the [`EpmdClient`] methods — so the wire is reviewable in a single place. (No
+//! sub-module is declared here: the crate's module tree in `lib.rs` is owned by
+//! another part of the tree.)use beam_common::{BeamError, Result};
 
 use crate::connection::TcpTransport;
 use crate::flags::{DIST_VER_HIGH, DIST_VER_LOW};
@@ -361,8 +366,8 @@ impl Alive2Resp {
         }
     }
 }
-/// The `PORT2_REQ` (`'z'`) port-lookup request.
-///
+
+/// The `PORT2_REQ` (`'z'`) port-lookup request.///
 /// Layout: `'z' + name`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Port2Req {
@@ -436,8 +441,8 @@ impl Port2Resp {
     }
 }
 
-impl Port2Resp {    /// Encodes the response body (tag + fields, no length prefix).
-    ///
+impl Port2Resp {
+    /// Encodes the response body (tag + fields, no length prefix).    ///
     /// `Error` is the minimal `'w' + result(1)` with `result != 0`; `Ok` carries
     /// the node fields exactly as `epmd_srv.c` lays them out.
     pub fn encode<W: Write>(&self, w: &mut W) -> Result<()> {
