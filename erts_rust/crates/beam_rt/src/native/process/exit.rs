@@ -5,27 +5,38 @@
 //! the runtime-native floor (consulted **before** the `beam_bifs` registry) rather than in a
 //! BIF module that has no access to the host state. The signalling machinery is
 //! `beam_process`'s; this module only decodes the BIF's terms onto it (call down, never
-//! duplicate):
+//! duplicate).
 //!
+//! # The target taxonomy — the oracle's own (`bif.c:1721-1870`, `send_exit_signal_bif`)
+//!
+//! * the **options** are validated first (`[]` or any number of bare `priority` atoms;
+//!   anything else, including the `{priority, P}` tuple and a non-list, is `badarg`);
 //! * a **local pid** other than the caller goes through
 //!   [`ProcessTable::send_exit`](beam_process::ProcessTable::send_exit), which — via
-//!   `apply_exit_signal` — delivers `{'EXIT', From, Reason}` to a trapping target and
-//!   terminates a non-trapping one, ignoring `normal` towards a non-trapping one. That is
-//!   exactly the signal path the oracle's own `exit/2` uses;
+//!   `apply_exit_signal` — delivers `{'EXIT', From, Reason}` to a trapping target,
+//!   terminates a non-trapping one and ignores `normal` towards one. That is exactly the
+//!   signal path the oracle's own `exit/2` uses, `kill` included (the table maps it onto the
+//!   untrappable `killed`);
 //! * the **caller itself** is the one case that must *not* go through that path: the
 //!   scheduler defers a self-directed signal while the pid is `Running` (which it is, inside
 //!   a slice), so `exit(self(), Reason)` is served by the ordinary exception mechanism
 //!   instead — a trapping caller gets the `{'EXIT', Caller, Reason}` message in its own
 //!   mailbox ([`RuntimeContext::deliver_message`]) and answers `true`, and every other caller
-//!   is terminated by a raise (`beam_common::Raise`), with `kill` always raising the
-//!   untrappable `killed`;
-//! * an **atom** target is a registered name ([`ProcessTable::whereis`](beam_process::ProcessTable::whereis));
-//!   an unknown name is the oracle's `badarg`;
-//! * a **port** or a **reference** target accepts only the reason `normal` and then answers
-//!   `true`: a signal has nowhere to go, and the oracle accepts the sentinel target for
-//!   exactly that reason while rejecting every other reason with `badarg`.
+//!   is terminated by a raise (`beam_common::Raise`) with the reason it named, `kill`
+//!   included (as `killed`). This mirrors the C's "terminate ourselves even though the exit
+//!   reason is normal (unless we trap exit), and terminate ourselves before `exit/2`
+//!   returns" (`bif.c:1750-1772`);
+//! * an **internal port** and a **reference** answer `true` for **any** reason: the C routes
+//!   the first through `erts_port_exit` and the second through the very same signal send as a
+//!   pid (a reference matches no process), and neither can fail. A reference is *not* a
+//!   process, so nothing is signalled;
+//! * a **pid on another node** answers `true` without a delivery (the signal is contract
+//!   A.5's, and an unconnected node is `ERTS_DSIG_PREP_NOT_CONNECTED`);
+//! * **everything else** — an atom (registered or not), an integer, a float, a tuple, a
+//!   binary — is `badarg`. The C has no atom/name case at all: `exit(RegisteredName, Reason)`
+//!   is `badarg` even when the name is registered (verified against OTP 29/erts-17.1).
 //!
-//! # Reference targets are classified from the runtime's own registries
+//! # Reference (and external-port) classification
 //!
 //! Reading a boxed reference thing's header needs `unsafe`, and this crate is
 //! `#![deny(unsafe_code)]`; the safe `beam_term`/`beam_bifs` reference predicates are
@@ -33,12 +44,22 @@
 //! it in** — [`Runtime::references`](crate::Runtime::references) (`make_ref/0`, `monitor/2`)
 //! plus the timer heap's reference ids. Every reference this runtime can mint is covered; one
 //! that arrived from elsewhere (decoded from ETF, or an ETS table id) is not, so
-//! `exit(<such a ref>, normal)` is `badarg` here where the oracle answers `true`.
+//! `exit(<such a ref>, Reason)` is `badarg` here where the oracle answers `true`. The same
+//! limit applies to an **external** port (the oracle answers `true` for one of this node's
+//! former incarnations).
+//!
+//! # Known side-effect gap
+//!
+//! The C's internal-port case really does send the port an exit signal
+//! (`erts_port_exit`), so `exit(Port, bye)` closes it in the oracle. This runtime answers the
+//! oracle's `true` but leaves the port alone: the port's exit path belongs to the
+//! `beam_io`-backed registry this floor does not own, and fabricating one would be a wrong
+//! result rather than an honest gap.
 
 use beam_common::{BeamError, ExceptionClass, ExitReason, LiveReason, Raise, Result};
 use beam_engine::terms;
 use beam_process::{PidTarget, PortId, Process, ProcessId};
-use beam_term::{atom_val, is_atom, Eterm};
+use beam_term::Eterm;
 
 use crate::context::RuntimeContext;
 
@@ -47,10 +68,10 @@ impl RuntimeContext<'_> {
 
     /// `erlang:exit(Target, Reason)`: signal `Reason` at `Target`.
     ///
-    /// `Target` is a pid (local or remote), a registered name, or a port/reference
-    /// sentinel; anything else is the oracle's `badarg`. A signal that has nowhere to go —
-    /// an unknown pid, a pid on another node, a port, a reference — still answers `true`,
-    /// exactly as the oracle does.
+    /// `Target` is a pid (local or remote), a port or a reference; every other term — an
+    /// atom included, registered or not — is the oracle's `badarg`. A signal that has nowhere
+    /// to go (a port, a reference, an unknown pid, a pid on another node) is not an error:
+    /// the answer is `true`.
     pub(in crate::native) fn exit_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let target = *args.first().ok_or(BeamError::BadArg)?;
         let reason = *args.get(1).ok_or(BeamError::BadArg)?;
@@ -98,16 +119,12 @@ impl RuntimeContext<'_> {
             Ok(PidTarget::Remote(_remote)) => return self.atom("true"),
             Err(_) => {}
         }
-        if is_atom(target) {
-            let Some(pid) = self.process_table().whereis(atom_val(target)) else {
-                // An unregistered name is the oracle's `badarg` (the name *is* the target
-                // here, so a name nothing answers to cannot be silently ignored).
-                return Err(BeamError::BadArg);
-            };
-            return self.exit_local(pid, reason);
-        }
+        // A port or a reference: the signal has nowhere to go (a reference matches no
+        // process, and the port's exit path is not this floor's), so the oracle's answer is
+        // the bare `true` for **any** reason. Everything else — an atom, registered or not,
+        // an integer, a tuple — is the oracle's `badarg`.
         if PortId::from_eterm(target).is_ok() || self.is_minted_reference(target) {
-            return self.exit_sentinel(reason);
+            return self.atom("true");
         }
         Err(BeamError::BadArg)
     }
@@ -152,17 +169,6 @@ impl RuntimeContext<'_> {
             return self.atom("true");
         }
         Err(self.exit_raise(reason))
-    }
-
-    /// `exit(Target, Reason)` for a target that holds no signal: a port or a reference.
-    ///
-    /// Only the reason `normal` is accepted (the oracle's sentinel form); every other reason
-    /// is `badarg`.
-    fn exit_sentinel(&mut self, reason: Eterm) -> Result<Eterm> {
-        if self.atom_name(reason).as_deref() != Some("normal") {
-            return Err(BeamError::BadArg);
-        }
-        self.atom("true")
     }
 
     /// Whether `term` is a reference this runtime minted (see the module docs).
@@ -231,12 +237,17 @@ mod tests {
     }
 
     #[test]
-    fn a_non_pid_non_name_target_is_badarg() {
+    fn a_non_pid_port_or_reference_target_is_badarg() {
         let mut runtime = runtime();
         let normal = atom(&mut runtime, "normal");
         let tuple = make_tuple(&mut runtime, &[normal, normal]);
+        let float = {
+            let mut sink = NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            terms::make_float(&mut context, 1.5).expect("a float")
+        };
 
-        for argument in [make_small(42), NIL, tuple] {
+        for argument in [make_small(42), NIL, tuple, float] {
             assert!(
                 matches!(
                     call(&mut runtime, "erlang", "exit", &[argument, normal]),
@@ -245,20 +256,26 @@ mod tests {
                 "exit({argument:?}, normal) is badarg"
             );
         }
-        // A float is not a pid either.
-        assert!(matches!(
-            call(&mut runtime, "erlang", "exit", &[normal, normal]),
-            Err(BeamError::BadArg)
-        ));
     }
 
     #[test]
-    fn an_unregistered_name_target_is_badarg() {
+    fn an_atom_target_is_badarg_even_when_the_name_is_registered() {
         let mut runtime = runtime();
         let missing = atom(&mut runtime, "no_such_registered_name");
         let normal = atom(&mut runtime, "normal");
         assert!(matches!(
             call(&mut runtime, "erlang", "exit", &[missing, normal]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A **registered** name is `badarg` too: the oracle's own `exit/2`
+        // (`bif.c:1750-1867`) has no name case at all, and a registered name must not be
+        // turned into a signal — verified against OTP 29/erts-17.1.
+        let registered = atom(&mut runtime, "exit_probe_registered");
+        let pid = runtime.self_pid().to_eterm();
+        call(&mut runtime, "erlang", "register", &[registered, pid]).expect("register/2");
+        assert!(matches!(
+            call(&mut runtime, "erlang", "exit", &[registered, normal]),
             Err(BeamError::BadArg)
         ));
     }
@@ -276,30 +293,22 @@ mod tests {
     }
 
     #[test]
-    fn a_port_or_reference_target_accepts_only_the_normal_reason() {
+    fn a_port_or_reference_target_answers_true_for_any_reason() {
         let mut runtime = runtime();
         let normal = atom(&mut runtime, "normal");
         let bye = atom(&mut runtime, "bye");
         let port = PortId::new(7).to_eterm();
         let reference = call(&mut runtime, "erlang", "make_ref", &[]).expect("make_ref/0");
 
+        // Neither target holds a signal, so the oracle answers `true` whatever the reason
+        // is — `normal`, another atom, or a structured term.
         for target in [port, reference] {
-            let answer = call(&mut runtime, "erlang", "exit", &[target, normal])
-                .expect("exit(port_or_ref, normal)");
-            assert_eq!(atom_name(&runtime, answer), Some("true"));
-            assert!(
-                matches!(
-                    call(&mut runtime, "erlang", "exit", &[target, bye]),
-                    Err(BeamError::BadArg)
-                ),
-                "a non-normal reason towards a port/reference is badarg"
-            );
-            // A *structured* reason is rejected the same way (only `normal` is accepted).
-            let structured = make_small(1);
-            assert!(matches!(
-                call(&mut runtime, "erlang", "exit", &[target, structured]),
-                Err(BeamError::BadArg)
-            ));
+            for reason in [normal, bye, make_small(1)] {
+                let answer = call(&mut runtime, "erlang", "exit", &[target, reason]).unwrap_or_else(
+                    |error| panic!("exit({target:?}, {reason:?}) is badarg: {error}"),
+                );
+                assert_eq!(atom_name(&runtime, answer), Some("true"));
+            }
         }
     }
 
