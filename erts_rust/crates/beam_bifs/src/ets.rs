@@ -92,13 +92,17 @@ use beam_ets::{
 use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
 
 use crate::access::{
-    is_atom, is_list, is_nil, is_small, is_tuple, make_ref_thing, ref_thing_id, tuple_element,
-    tuple_size,
+    is_atom, is_list, is_nil, is_small, is_tuple, make_ref_thing, tuple_element, tuple_size,
 };
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
+
+use self::resolve::{
+    caller_owner, owner_pid, parse_options, resolve_handle, Gate, TableProfile,
+    WriteConcurrencyInfo,
+};
 
 /// The `ets:match`/`match_object` families and the count/delete BIFs.
 ///
@@ -119,6 +123,12 @@ mod specs;
 /// (declared here, not in `src/lib.rs`). The verbs that stay unregistered, and
 /// why, are documented there.
 mod extra;
+/// The single shared **table-argument resolver**, the process/owner bridge, the
+/// creation-time [`resolve::TableProfile`] and the `ets:new/2` option parser.
+///
+/// It is a child of `ets` (declared here, not in `src/lib.rs`) and is used by
+/// *every* table-taking `ets:*` BIF, so its logic is never duplicated.
+mod resolve;
 /// The navigation terminator (`ets:first/1` … `ets:prev/2` at the end of the
 /// iteration order). The atom's *name* is `$end_of_table` (the printname of
 /// `atom.names`' `EOT='$end_of_table'`).
