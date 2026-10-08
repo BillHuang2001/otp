@@ -59,19 +59,21 @@
 //! * **`ets:setopts(T, {protection, P})`** — the C also accepts the
 //!   `{protection, private|protected|public}` option (`am_protection` arm of
 //!   `ets_setopts_2`) and changes `ets:info(T, protection)`. `beam_ets::Table`
-//!   exposes `access()` but **no setter**, so this one sub-option is the typed
+//!   exposes `access()` but **no post-creation setter** (`TableOptions::set_access`
+//!   only affects *creation*), so this one sub-option is the typed
 //!   `unsupported_bif` gap (the whole option list is validated first, so a
-//!   `{protection, _}` call leaves the table untouched). Missing API:
-//!   `beam_ets::Table::set_access(Access)` (or a `SetOpt::Protection(Access)`
-//!   variant).
-//! * **`ets:rename/2`** (a `bif.tab` BIF) — the oracle answers the table's tid
-//!   (the new **name atom** for a `named_table`, otherwise the handle it was
-//!   given, i.e. **not** `true`) and rewrites the table's own name field
-//!   (`ets:info(T, name)` reports the new name afterwards; for a `named_table` the
-//!   atom is *removed* from the meta name table, so `whereis(Old)` is `undefined`
-//!   and `whereis(New)` is a fresh tid). `beam_ets::Table` has `name()` but no
-//!   setter. Missing API: `beam_ets::Table::set_name(Option<Atom>)` (the
-//!   `named_table` flag itself stays in `TableOptions`).
+//!   `{protection, _}` call leaves the table untouched). The missing API is
+//!   `beam_ets::Table::set_access(&mut self, Access)` — or a `SetOpt::Access(Access)`
+//!   variant handled by `Table::setopts` — carrying the same **owner write gate**
+//!   `Table::setopts` already applies (the caller must be the table's owner; the C
+//!   is `ets_setopts_2`'s `DB_WRITE` acquisition plus its owner test). Until such a
+//!   setter exists there is no way to change the protection without fabricating it.
+//! * **`ets:rename/2`** — implemented in [`super::extra`] over
+//!   [`beam_ets::Table::rename`]; note that `crate::runtime::register` runs **after**
+//!   `ets::register` in [`BifRegistry::with_core_bifs`](crate::registry::BifRegistry::with_core_bifs)
+//!   and still registers a `RuntimeHooks` stub for this key, which therefore shadows
+//!   it in the default registry (dropping that stub is the follow-up; the same holds
+//!   for `ets:internal_delete_all/2` and `ets:internal_select_delete/2`).
 //! * **`ets:select_reverse/1,2,3`** (a `bif.tab` BIF) — a genuine *descending*
 //!   traversal (verified on an `ordered_set`; `ets:select/1` can resume the
 //!   reverse continuation). `beam_ets`'s `select_limit`/`select_continue` and its
@@ -118,11 +120,10 @@
 //!   `ets:foldr/3` above reach the same objects through the registered
 //!   `ets:first/1`+`ets:next/2`+`ets:lookup/2` primitives instead, which is why
 //!   they *are* servable.)
-//! * **`ets:internal_request_all/0`**, **`internal_delete_all/2`**,
-//!   **`internal_select_delete/2`** — underscore-internal C helpers: the first
-//!   answers this scheduler's *fan-in reference* (`#Ref<…>`), and the other two
-//!   hand out table internals (`internal_delete_all/2` returns the tiny count the
-//!   C uses for reds accounting). Implementation-specific, not the documented API.
+//! * **`ets:internal_request_all/0`** — an underscore-internal C helper: it answers
+//!   this scheduler's *fan-in reference* (`#Ref<…>`), an implementation-specific
+//!   value, not part of the documented API. (`internal_delete_all/2` and
+//!   `internal_select_delete/2` are implemented in [`super::extra`].)
 //!
 //! # Runtime handoffs (not this crate's to do)
 //!
