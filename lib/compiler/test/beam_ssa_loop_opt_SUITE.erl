@@ -323,23 +323,25 @@ type_driven_ssa(_Config) ->
 %%=========================================================================
 
 type_driven_probe(Config) ->
-    Src = receive_probe_src(),
-    Plain = rcv_bifs(disasm(Config, lp_rcv_plain, Src, [])),
-    Opt = rcv_bifs(disasm(Config, lp_rcv_opt, Src, [loop_opt])),
+    Plain = rcv_bifs(Config, lp_rcv_plain, []),
+    Opt = rcv_bifs(Config, lp_rcv_opt, [loop_opt]),
     %% Without the option, `X * 8' and `X div 4' are `*' and `div'.
-    [{'*', [8]}, {div, [4]}, {'+', []}] = Plain,
+    [{'*', [8]}, {'div', [4]}, {'+', []}] = Plain,
     %% With it, they are reduced in place to `bsl 3' and `bsr 2'. Nothing is
     %% added or removed: only the operation and the literal changes.
-    [{'bsl', [3]}, {bsr, [2]}, {'+', []}] = Opt,
+    [{'bsl', [3]}, {'bsr', [2]}, {'+', []}] = Opt,
     %% The kill switches turn the reduction off again.
-    NoLoop = rcv_bifs(disasm(Config, lp_rcv_noloop, Src,
-                             [loop_opt, no_ssa_opt_loop_opt])),
-    NoSsa = rcv_bifs(disasm(Config, lp_rcv_nossa, Src,
-                            [loop_opt, no_ssa_opt])),
-    [{'*', [8]}, {div, [4]}, {'+', []}] = NoLoop,
-    [{'*', [8]}, {div, [4]}, {'+', []}] = NoSsa,
+    NoLoop = rcv_bifs(Config, lp_rcv_noloop, [loop_opt, no_ssa_opt_loop_opt]),
+    NoSsa = rcv_bifs(Config, lp_rcv_nossa, [loop_opt, no_ssa_opt]),
+    [{'*', [8]}, {'div', [4]}, {'+', []}] = NoLoop,
+    [{'*', [8]}, {'div', [4]}, {'+', []}] = NoSsa,
     ok.
 
+%% Compile the objective's receive probe under `Opts' and return the
+%% arithmetic BIFs of its `rcv/1' function.
+rcv_bifs(Config, Name, Opts) ->
+    Code = disasm(Config, Name, receive_probe_src(atom_to_list(Name)), Opts),
+    fn_bifs(Code, rcv, 1).
 %%=========================================================================
 %% Functional equivalence of the type-driven reduction: the module is
 %% compiled with and without `loop_opt' and both are run over a sweep of
@@ -347,9 +349,19 @@ type_driven_probe(Config) ->
 %%=========================================================================
 
 type_driven_equivalence(Config) ->
-    Src = receive_probe_src2(),
-    Plain = load(Config, eq_plain, Src, []),
-    Opt = load(Config, eq_opt, Src, [loop_opt]),
+    Plain = load(Config, eq_plain, drive_probe_src("eq_plain"), []),
+    Opt = load(Config, eq_opt, drive_probe_src("eq_opt"), [loop_opt]),
+    %% The rewrite really did happen in the `loop_opt' build, so this is not
+    %% a comparison of a module with itself.
+    OBifs = fn_bifs(disasm(Config, eq_disasm, drive_probe_src("eq_disasm"),
+                           [loop_opt]), loop, 0),
+    lists:foreach(fun(B) ->
+                          case lists:member(B, OBifs) of
+                              true -> ok;
+                              false -> ct:fail({reduction_missing, B, OBifs})
+                          end
+                  end, [{'bsl', [3]}, {'bsr', [2]}, {'bsl', [4]}, {'bsr', [3]},
+                        {'+', []}]),
     Vals = [-1000001, -1000, -9, -3, -2, -1, 0, 1, 2, 3, 7, 8, 9, 255, 256,
             1000000, 123456789012345678901234567890, 1 bsl 200,
             2.5, -2.5, 0.0, 1.0e300, foo, [a, b], <<1, 2:3>>, {}],
@@ -371,14 +383,16 @@ type_driven_equivalence(Config) ->
     %% `X + X' there and the sweep above covers a float and two non-numbers
     %% raising `badarith'.
     ok.
+
 %% `loop_opt', `loop_opt,no_ssa_opt_loop_opt' and `loop_opt,no_ssa_opt' must
 %% agree -- both on the results and on the generated code.
 type_driven_kill_switches(Config) ->
-    Src = receive_probe_src2(),
-    Plain = run_sweep(load(Config, ks_plain, Src, [])),
-    Opt = run_sweep(load(Config, ks_opt, Src, [loop_opt])),
-    NoLoop = run_sweep(load(Config, ks_noloop, Src, [loop_opt, no_ssa_opt_loop_opt])),
-    NoSsa = run_sweep(load(Config, ks_nossa, Src, [loop_opt, no_ssa_opt])),
+    Plain = run_sweep(load(Config, ks_plain, drive_probe_src("ks_plain"), [])),
+    Opt = run_sweep(load(Config, ks_opt, drive_probe_src("ks_opt"), [loop_opt])),
+    NoLoop = run_sweep(load(Config, ks_noloop, drive_probe_src("ks_noloop"),
+                            [loop_opt, no_ssa_opt_loop_opt])),
+    NoSsa = run_sweep(load(Config, ks_nossa, drive_probe_src("ks_nossa"),
+                           [loop_opt, no_ssa_opt])),
     case {Plain, Opt, NoLoop, NoSsa} of
         {R, R, R, R} -> ok;
         Other -> ct:fail({kill_switch_mismatch, Other})
@@ -391,6 +405,7 @@ run_sweep(Mod) ->
 
 call(Mod, Msg) ->
     try {ok, Mod:one(Msg)} catch C:R -> {C, R} end.
+
 run(Config, Name, Src, Opts) ->
     Mod = load(Config, Name, Src, Opts),
     Mod:sample().
