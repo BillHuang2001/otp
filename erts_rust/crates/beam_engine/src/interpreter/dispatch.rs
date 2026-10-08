@@ -87,6 +87,7 @@ impl Machine {
     /// A raise (or any other typed error — an out-of-range `pc`/function index, an
     /// unsupported opcode/operand) stays an `Err(beam_common::BeamError)`; it is
     /// never a panic and never a wrong result.
+    #[inline]
     pub(crate) fn step_instruction(
         &mut self,
         module: &Module,
