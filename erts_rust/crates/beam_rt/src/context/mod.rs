@@ -421,11 +421,11 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// `true` for a context over the runtime's own table ([`RuntimeContext::new`],
     /// [`RuntimeContext::with_output`]) and `false` for one built by
-    /// [`RuntimeContext::for_process`], whose table is owned by the scheduler pass. A
-    /// native `erlang:spawn/*` can only *append* to the runtime's own table (there is no
-    /// way to hand a spawned child to a pass that is already running), so a spawn from
-    /// inside a scheduler slice is the typed capability gap rather than a child that is
-    /// silently lost (see [`crate::native::process`]).
+    /// [`RuntimeContext::for_process`], whose table is owned by the scheduler pass. A native
+    /// `erlang:spawn/*` reads it to pick **which** table the child goes in: outside a pass it
+    /// appends to the runtime's own table (`Runtime::spawn_process`), and inside one it creates
+    /// the child in the pass table and records it for the pass to register and enqueue, so the
+    /// child is scheduled either way (see [`crate::native::process`]).
     pub(crate) fn owns_process_table(&self) -> bool {
         self.mailbox_table.is_none()
     }

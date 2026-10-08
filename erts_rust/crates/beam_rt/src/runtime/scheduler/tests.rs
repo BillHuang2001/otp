@@ -9,12 +9,12 @@
 use std::time::{Duration, Instant};
 
 use beam_engine::ExecutionContext;
-use beam_process::{ProcessId, ProcessState};
+use beam_process::{Priority, ProcessId, ProcessState};
 use beam_term::{make_atom, make_small, signed_value, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::info::InfoValue;
-use crate::runtime::Runtime;
+use crate::runtime::{PendingSpawn, Runtime};
 
 use super::super::tests::SLICE_BEAM;
 use super::*;
@@ -430,4 +430,81 @@ fn run_scheduled_rejects_an_arity_mismatch() {
         .run_scheduled(SLICE_BEAM, "add", 3, &[make_small(1), make_small(2)])
         .expect_err("two arguments for add/3");
     assert!(error.to_string().contains("given 2 argument(s)"), "{error}");
+}
+
+// -- a spawn made from inside a slice is registered and enqueued ----------
+
+/// Creates a process in the runtime's own table for `slice:fib/1` and records it as a
+/// **pending spawn** — exactly what `src/native/process.rs`'s `spawn_in_pass` leaves behind
+/// when an `erlang:spawn*` runs *inside* a scheduler slice.
+///
+/// The test writes the record directly instead of driving a BIF so the pass-side contract
+/// ([`Runtime::absorb_pending_spawns`]) is pinned on its own, without a compiled fixture; the
+/// BIF half is proved end to end by `tests/spawn_from_slice.rs`.
+fn record_pending_fib(rt: &mut Runtime, n: i64, priority: Priority) -> ProcessId {
+    let policy = rt.default_spawn_policy();
+    let pid = rt.processes.spawn(policy).expect("a child in the process table");
+    rt.processes
+        .set_priority(pid, priority)
+        .expect("the child's priority");
+    let entry = rt
+        .resolve_export_entry("slice", "fib", 1)
+        .expect("slice:fib/1 resolves");
+    rt.pending_spawns.push(PendingSpawn {
+        pid,
+        entry,
+        args: vec![make_small(n)],
+    });
+    pid
+}
+
+/// A process recorded for the pass is **registered and run**: the pass installs its engine
+/// entry in its runner state, puts it on its run queue, and the very next round carries it to
+/// its `return` — the child is scheduled, not lost.
+#[test]
+fn a_recorded_spawn_is_registered_and_run_by_the_pass() {
+    let mut rt = runtime();
+    rt.load_module(SLICE_BEAM).expect("load slice.beam");
+    let pid = record_pending_fib(&mut rt, 10, Priority::Normal);
+
+    let ran = rt.run_scheduler().expect("a pass");
+    assert_eq!(ran, 1, "the recorded child was the only runnable process");
+    assert_eq!(
+        signed_value(rt.process_result(pid).expect("the child ran to its return")),
+        fib(10),
+        "the child ran its own entry point"
+    );
+    assert!(rt.processes().get(pid).is_none(), "it terminated normally");
+    assert_eq!(rt.run_queue_len(), 0, "the run queue drained");
+}
+
+/// The recorded child is enqueued **at its own priority**: with the slice's budget spent by
+/// the process that was already runnable, the drain still runs (so the child is never left
+/// unqueued) and the child waits where its PCB says it belongs.
+#[test]
+fn a_recorded_spawn_is_enqueued_at_its_own_priority() {
+    let mut rt = runtime();
+    rt.load_module(SLICE_BEAM).expect("load slice.beam");
+    // A runnable process that consumes the single slice's budget.
+    let busy = rt
+        .spawn_process("slice", "fib", vec![make_small(10)])
+        .expect("slice:fib/1 is exported");
+    let child = record_pending_fib(&mut rt, 5, Priority::Low);
+
+    let ran = rt.run_slices(1).expect("one bounded slice");
+    assert_eq!(ran, 1, "the bounded pass ran exactly its budget");
+    assert!(rt.process_result(busy).is_some(), "the queued process ran");
+
+    // The child is on the run queue, in the **low** level, and not run yet.
+    assert_eq!(
+        rt.scheduler.run_queue().len_at(Priority::Low),
+        1,
+        "the recorded child was enqueued at its own priority"
+    );
+
+    assert_eq!(rt.run_scheduler().expect("the rest of the pass"), 1);
+    assert_eq!(
+        signed_value(rt.process_result(child).expect("the child ran")),
+        fib(5)
+    );
 }

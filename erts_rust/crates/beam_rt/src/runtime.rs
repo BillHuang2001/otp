@@ -96,6 +96,21 @@ fn term_heap_words(config: &RuntimeConfig) -> usize {
     }
 }
 
+/// A process an `erlang:spawn*` created **from inside a scheduler slice**, waiting for the
+/// pass to register and enqueue it.
+///
+/// See [`Runtime::pending_spawns`]: the child's pid is already installed in the pass's
+/// process table (with its heap policy and priority) when this record is made; the entry and
+/// the arguments are what the pass still has to install into its runner state.
+pub(crate) struct PendingSpawn {
+    /// The child's pid, already installed in the pass's process table.
+    pub(crate) pid: ProcessId,
+    /// What the child runs: the resolved module export, or the fun value.
+    pub(crate) entry: ProcessEntry,
+    /// The arguments seeded into the child's `x(0..arity)` on its first run.
+    pub(crate) args: Vec<Eterm>,
+}
+
 /// The Rust ERTS runtime.
 pub struct Runtime {
     /// The configuration this runtime was created with.
@@ -274,6 +289,19 @@ pub struct Runtime {
     /// parked process runnable, and [`Runtime::absorb_timer_wakes`] turns it into a run-queue
     /// entry at the same points the other wake sources are absorbed.
     timer_wakes: Vec<ProcessId>,
+    /// The processes an `erlang:spawn*` created **from inside a scheduler slice**, waiting for
+    /// the pass to register and enqueue them.
+    ///
+    /// A slice executes against the pass's [`ProcessTable`] (the runtime's own is an empty
+    /// placeholder for the duration, see [`Runtime::take_processes`]) but can reach neither the
+    /// pass's runner state nor its run queue, so the native spawn
+    /// ([`crate::native::process`]) allocates the child's pid in that table — with the child's
+    /// heap policy and priority — and records the rest here
+    /// ([`Runtime::note_pending_spawn`]). [`Runtime::absorb_pending_spawns`] is where the record
+    /// becomes a real schedulable process: its engine entry lands in the pass's runner state and
+    /// the pid goes on the pass's run queue, so the child really runs instead of being silently
+    /// lost. Drained at the same point as the other wake sources.
+    pending_spawns: Vec<PendingSpawn>,
     /// The **distributed node** (contract A.5, Phase 1), when `-name`/`-sname` was given.
     ///
     /// `None` for a runtime with no node name — the default, and what every
@@ -417,6 +445,7 @@ impl Runtime {
             timers: Timers::new(),
             timer_resumes: HashMap::new(),
             timer_wakes: Vec::new(),
+            pending_spawns: Vec::new(),
             dist,
             cookie,
             local_node,
@@ -971,6 +1000,38 @@ impl Runtime {
         policy: HeapPolicy,
         priority: Option<Priority>,
     ) -> Result<ProcessId> {
+        let entry = self.resolve_export_entry(module, function, args.len() as u32)?;
+        let pid = self.processes.spawn(policy)?;
+        if let Some(priority) = priority {
+            self.processes.set_priority(pid, priority)?;
+        }
+        self.runner_state.spawn(pid, entry, args);
+        self.enqueue_process(pid)?;
+        Ok(pid)
+    }
+
+    /// Resolves `module:function/arity` to the [`ProcessEntry`] a spawned child starts at.
+    ///
+    /// The module is resolved through the code path exactly as an external call is (`-pa`/
+    /// `-pz` directories first, then the system library `ebin`s), so it is loaded on demand
+    /// and cached in the one shared atom table. This is the module resolution
+    /// [`Runtime::spawn_process_with_policy`] performs — the code-path search, the load and
+    /// the export check — factored out so a spawn made from **inside a scheduler slice**
+    /// resolves its entry point exactly as a direct one does (see
+    /// [`RuntimeContext::spawn_in_pass`](crate::context::RuntimeContext); the caller owns the
+    /// child's pid allocation).
+    ///
+    /// # Errors
+    ///
+    /// * the code server's not-found/malformed diagnostic for `module`;
+    /// * [`crate::error::undef`] (class `error`, bare reason atom `undef`) when
+    ///   `function/arity` is not exported by it.
+    pub(crate) fn resolve_export_entry(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+    ) -> Result<ProcessEntry> {
         self.boot_if_needed()?;
         // A module the code server already holds (loaded explicitly by
         // [`Runtime::load_module`], say) needs no code-path search — which also avoids
@@ -980,7 +1041,6 @@ impl Runtime {
             let _ = self.find_module_file(module);
         }
         let loaded = self.code_server.load(module)?;
-        let arity = args.len() as u32;
         let function_atom = loaded
             .atom_table
             .lookup(function)
@@ -988,21 +1048,17 @@ impl Runtime {
         if loaded.export(function_atom, arity).is_none() {
             return Err(error::undef());
         }
-        let pid = self.processes.spawn(policy)?;
-        if let Some(priority) = priority {
-            self.processes.set_priority(pid, priority)?;
-        }
-        self.runner_state.spawn(
-            pid,
-            ProcessEntry::Export {
-                module: loaded,
-                function: function_atom,
-                arity,
-            },
-            args,
-        );
-        self.enqueue_process(pid)?;
-        Ok(pid)
+        Ok(ProcessEntry::Export {
+            module: loaded,
+            function: function_atom,
+            arity,
+        })
+    }
+
+    /// Records a process created by an `erlang:spawn*` **from inside a scheduler slice** for
+    /// the pass to register and enqueue (see [`Runtime::pending_spawns`]).
+    pub(crate) fn note_pending_spawn(&mut self, spawn: PendingSpawn) {
+        self.pending_spawns.push(spawn);
     }
 
     /// Spawns a process whose entry point is the **fun** `fun`, applied to `args`.

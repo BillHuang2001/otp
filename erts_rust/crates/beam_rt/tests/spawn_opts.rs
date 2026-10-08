@@ -8,10 +8,10 @@
 //!
 //! # Why `-eval` and not a compiled fixture
 //!
-//! `beam_rt run <file>` executes the fixture *inside* a scheduler slice, where
-//! `erlang:spawn` is the honest capability gap ("erlang:spawn from inside a scheduler
-//! slice") because the pass has moved the process table out. The `-eval` process owns the
-//! table and can `spawn_opt`, exactly as `tests/monitor.rs` documents.
+//! These flows read the *spawned child's* `process_info/2` heap items, so the `-eval` process
+//! — which owns the process table and spawns into it directly — is the shortest path to them,
+//! exactly as `tests/monitor.rs` documents. (`beam_rt run <file>` spawns correctly too; see
+//! `tests/spawn_from_slice.rs`.)
 //!
 //! # Oracle ground truth (system `erl`, OTP 29 / `erts-17.1`) — re-probed, not guessed
 //!

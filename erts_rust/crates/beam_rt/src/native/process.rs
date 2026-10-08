@@ -33,6 +33,8 @@ use beam_term::{atom_val, is_atom, is_small, signed_value, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::error;
+use crate::runtime::PendingSpawn;
+use crate::runner::ProcessEntry;
 
 mod exit;
 mod monitor;
@@ -229,9 +231,10 @@ impl RuntimeContext<'_> {
 
     /// Spawns a fun-bodied child and answers its pid term.
     ///
-    /// The child is created in the runtime's **own** process table, so a spawn from inside
-    /// a scheduler slice — whose pass owns that table — is refused as a typed capability
-    /// gap rather than silently lost (see [`Self::check_spawnable`]).
+    /// The child is created in the process table this context resolves against: the runtime's
+    /// **own** outside a scheduler pass, and the pass's when the spawn is made from **inside**
+    /// a scheduler slice — where the pass registers and enqueues it on its very next round
+    /// ([`Self::spawn_in_pass`]), so the child really runs either way.
     fn spawn_fun_child(&mut self, fun: Eterm, args: Vec<Eterm>) -> Result<Eterm> {
         let policy = self.runtime.default_spawn_policy();
         self.spawn_fun_child_with_policy(fun, args, policy, None)
@@ -246,7 +249,12 @@ impl RuntimeContext<'_> {
         policy: HeapPolicy,
         priority: Option<Priority>,
     ) -> Result<Eterm> {
-        self.check_spawnable()?;
+        if !terms::is_fun(fun) {
+            return Err(BeamError::BadArg);
+        }
+        if !self.owns_process_table() {
+            return self.spawn_in_pass(policy, priority, ProcessEntry::Fun { fun }, args);
+        }
         Ok(self
             .runtime
             .spawn_fun_process_with_policy(fun, args, policy, priority)?
@@ -278,29 +286,56 @@ impl RuntimeContext<'_> {
         policy: HeapPolicy,
         priority: Option<Priority>,
     ) -> Result<Eterm> {
-        self.check_spawnable()?;
+        if !self.owns_process_table() {
+            let entry = self
+                .runtime
+                .resolve_export_entry(module, function, args.len() as u32)?;
+            return self.spawn_in_pass(policy, priority, entry, args);
+        }
         Ok(self
             .runtime
             .spawn_process_with_policy(module, function, args, policy, priority)?
             .to_eterm())
     }
 
-    /// Refuses a spawn made from inside a scheduler slice.
+    /// Creates a child in the **pass's** process table and records it for the pass to
+    /// register and enqueue — the spawn path from **inside a scheduler slice**.
     ///
-    /// A context built by [`RuntimeContext::for_process`] runs *inside* a scheduler pass,
-    /// which has moved the runtime's process table and runner state out for the duration —
-    /// a child appended to the runtime's own table would never be run (and would be
-    /// overwritten when the pass puts its table back), so it is reported honestly.
-    fn check_spawnable(&self) -> Result<()> {
-        if !self.owns_process_table() {
-            return Err(error::unsupported(
-                "erlang:spawn from inside a scheduler slice",
-            ));
+    /// [`RuntimeContext::for_process`] runs inside a scheduler pass, which has moved the
+    /// runtime's own process table and runner state out for the duration
+    /// ([`Runtime::take_processes`](crate::runtime::Runtime)): the pass table
+    /// ([`RuntimeContext::process_table_mut`]) is the one holding the live processes, and only
+    /// the pass can put a child on its own run queue. So the pid is allocated **there**, with
+    /// the child's heap policy and priority exactly as `Runtime::spawn_process_with_policy`
+    /// does it, and [`Runtime::note_pending_spawn`](crate::runtime::Runtime::note_pending_spawn)
+    /// records what to run; the pass turns that into a real run-queue entry before its next
+    /// round ([`Runtime::absorb_pending_spawns`](crate::runtime::Runtime)), so the child is
+    /// **scheduled** rather than silently lost.
+    ///
+    /// The caller has already resolved the [`ProcessEntry`] — the fun's `is_fun` check, or the
+    /// export's module resolution and export check
+    /// ([`Runtime::resolve_export_entry`](crate::runtime::Runtime)) — so a rejected argument
+    /// never leaves a stray process behind. No boot step is needed here: the pass booted
+    /// before its first slice.
+    fn spawn_in_pass(
+        &mut self,
+        policy: HeapPolicy,
+        priority: Option<Priority>,
+        entry: ProcessEntry,
+        args: Vec<Eterm>,
+    ) -> Result<Eterm> {
+        let pid = self.process_table_mut().spawn(policy)?;
+        if let Some(priority) = priority {
+            self.process_table_mut().set_priority(pid, priority)?;
         }
-        Ok(())
+        self.runtime.note_pending_spawn(PendingSpawn { pid, entry, args });
+        Ok(pid.to_eterm())
     }
 
     /// Links the calling process to the child `pid_term` stands for (`spawn_link/*`).
+    ///
+    /// The link is made on the table the child was created in — the pass's table inside a
+    /// scheduler slice, the runtime's own otherwise (see [`Self::spawn_in_pass`]).
     fn link_to_child(&mut self, pid_term: Eterm) -> Result<Eterm> {
         let child = ProcessId::from_eterm(pid_term)?;
         let parent = self.pid();

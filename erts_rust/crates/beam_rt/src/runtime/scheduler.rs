@@ -36,7 +36,7 @@ use beam_term::Eterm;
 use crate::dist::{LocalDeliverySink, NONODE_NAME};
 use crate::error;
 use crate::runtime::Runtime;
-use crate::runner::RuntimeRunner;
+use crate::runner::{RunnerState, RuntimeRunner};
 use crate::timers::{TimerAction, TimerTarget};
 
 /// The longest [`Runtime::pump_scheduler`] (the `-eval` receive pump) may sleep waiting for
@@ -355,6 +355,53 @@ impl Runtime {
         resumed
     }
 
+    /// Registers and enqueues every child an `erlang:spawn*` created during the slices just
+    /// run, returning how many became run-queue entries — the **spawn** counterpart of
+    /// [`Runtime::absorb_fragment_wakes`].
+    ///
+    /// A slice executes against the **pass's** process table (the runtime's own is a
+    /// placeholder for the duration, see [`Runtime::take_processes`]) but can reach neither the
+    /// pass's runner state nor its run queue, so the native spawn allocates the child's pid in
+    /// that table and records what is left here ([`Runtime::note_pending_spawn`]). This is
+    /// where the record becomes a schedulable process:
+    ///
+    /// 1. the child's engine entry lands in the **pass's** runner state, so the next round has
+    ///    something to run it with;
+    /// 2. the pid goes on the **pass's** run queue at its own priority, exactly as
+    ///    [`Runtime::enqueue_process`] does for a child spawned outside a pass.
+    ///
+    /// A pid whose process is no longer in the table, or one already queued, is skipped: the
+    /// child is never run twice and no engine is fabricated for a slot that is gone.
+    fn absorb_pending_spawns(
+        &mut self,
+        table: &mut ProcessTable,
+        state: &mut RunnerState,
+        scheduler: &mut Scheduler,
+    ) -> usize {
+        let pending = std::mem::take(&mut self.pending_spawns);
+        let mut enqueued = 0;
+        for spawn in pending {
+            // The child is looked up **first**: a pid whose slot is gone (it cannot have run,
+            // but nothing here assumes it) gets no engine entry and no run-queue slot.
+            let Some(process) = table.get_mut(spawn.pid) else {
+                continue;
+            };
+            if process.flags().in_run_queue() {
+                continue;
+            }
+            // Exactly `Runtime::enqueue_process`'s bookkeeping, against the pass's table: the
+            // flag is what makes a second enqueue a no-op, and the state is what
+            // `Scheduler::resume_woken` tests before it would enqueue the child again.
+            process.flags_mut().set_in_run_queue(true);
+            process.set_state(ProcessState::Runnable);
+            let priority = process.priority();
+            state.spawn(spawn.pid, spawn.entry, spawn.args);
+            scheduler.enqueue_with_priority(spawn.pid, priority);
+            enqueued += 1;
+        }
+        enqueued
+    }
+
     /// Runs a scheduler pass: the shared dance every `run_*` entry performs.
     ///
     /// The **process table** and the **runner state** are moved out of the runtime, so the
@@ -457,6 +504,11 @@ impl Runtime {
             match slices {
                 Ok(executed) => ran += executed,
                 Err(err) => break Err(err),
+            }
+            // A child an `erlang:spawn*` created *during* the slices just run is registered
+            // and enqueued here, so the next round runs it (see `absorb_pending_spawns`).
+            if self.absorb_pending_spawns(&mut table, &mut state, &mut scheduler) > 0 {
+                continue;
             }
             // A heap-fragment delivery made *inside* the slices just run woke its receiver;
             // `run_slice` absorbs the table's own wake list, and this is the fragment

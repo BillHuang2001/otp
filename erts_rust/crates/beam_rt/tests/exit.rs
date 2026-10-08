@@ -7,12 +7,10 @@
 //!
 //! # Why `-eval` and not a compiled fixture
 //!
-//! `beam_rt run <file>` executes the fixture *inside* a scheduler slice, where
-//! `erlang:spawn` is the honest capability gap ("erlang:spawn from inside a scheduler
-//! slice") because the pass has moved the process table out; the `-eval` process, by
-//! contrast, owns the table and can spawn. Every flow below is therefore an `-eval` program
-//! that spawns a helper, exits it and prints the observed facts — the same program both
-//! runtimes are given (the same argument as `tests/monitor.rs`).
+//! Every flow below is an `-eval` program that spawns a helper, exits it and prints the
+//! observed facts — the same program both runtimes are given, with no fixture to compile
+//! (the same argument as `tests/monitor.rs`; the scheduler-slice spawn path has its own
+//! end-to-end proof in `tests/spawn_from_slice.rs`).
 //!
 //! # Oracle ground truth (system `erl`, OTP 29 / `erts-17.1`)
 //!
