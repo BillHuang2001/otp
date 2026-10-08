@@ -751,6 +751,7 @@ impl Table {
 - `src/table/read.rs` → the read/navigation `impl Table` (lookup/member/lookup_element*/first/last/next/prev/take/size/is_empty/tab2list/memory)
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
 - `src/table/ownership.rs` → `Heir`/`SetOpt` + the `ets:give_away/3` / `{heir, ...}` `setopts/2` semantics + the pid-gap docs
+- `src/table/lifecycle.rs` → `OwnerDeath` + `Table::owner_died` (the owner-death transition: delete vs. heir transfer)
 - `src/table/element.rs` → the table-level `ets:update_counter/3,4` + `ets:update_element/3` operations
 - `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors and `element.rs`)
 - `src/champ_interior.rs` → `ChampInterior` (CHAMP open-addressing index) — the **default `set`** interior
