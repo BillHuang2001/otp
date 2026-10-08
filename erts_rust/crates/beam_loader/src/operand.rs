@@ -76,45 +76,7 @@ pub struct Label(pub u32);
 /// The `f,0` failure sentinel: `0` means *raise*, not *jump to label 0*.
 pub const NO_FAIL: Label = Label(0);
 
-/// The decode-time payload of [`Operand::BigInteger`].
-///
-/// A wide `i`-tagged integer field (see [`Operand::BigInteger`]) is the one decoded
-/// operand that carries a variable-length byte payload. It is boxed — and this is
-/// the *only* reason it is a separate type — so that `Operand` stays a two-word
-/// value: the payload never reaches a loaded [`Module`](crate::ir::Module)
-/// ([`crate::lower`] rewrites it to a synthesized [`Operand::Literal`]), so keeping
-/// it inline would inflate every operand of every instruction on the hot path.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct BigInt {
-    /// Whether the packed field is negative (the top bit of its most significant
-    /// byte, `beam_file.c:2174`).
-    pub negative: bool,
-    /// The **big-endian** magnitude, normalized exactly like the C (at most one
-    /// leading zero byte is removed; two would be a corrupt field,
-    /// `beam_file.c:2186-2203`). Never empty.
-    pub magnitude: Vec<u8>,
-}
-
 /// A typed `.beam` operand (the decoded form of one operand field).
-///
-/// # Layout
-///
-/// `Operand` sits inside every [`Instr`](crate::ir::Instr) operand field and is
-/// therefore size-sensitive: the interpreter's per-instruction `match` and the code
-/// array's density both scale with it. The three *decode-time-only* variants
-/// ([`Operand::BigInteger`], [`Operand::List`], [`Operand::Allocation`]) are the only
-/// ones whose payload holds a `Vec`, and each is boxed so the enum is two words
-/// instead of four. **None of the three survives lowering** — a loaded
-/// [`Module`](crate::ir::Module)'s operands are only the leaf forms — so their
-/// boxed payload is a load-time concern, never a runtime indirection.
-///
-/// The boxed variants have no public tuple/struct payload, so they are built through
-/// [`Operand::big_integer`], [`Operand::list`] and [`Operand::alloc`]; match them as
-/// `Operand::List(items)` with `items: &Box<Vec<Operand>>` (use `.as_slice()`).
-///
-/// The payloads are `Box<Vec<_>>` rather than `Box<[_]>` deliberately: a boxed
-/// *slice* is a fat pointer (two words), which would put the largest variant payload
-/// at 16 bytes and re-inflate the enum to three words.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Operand {
     /// An untagged/signed integer operand (`u`/`i` tags) that fits a BEAM small int.
@@ -160,37 +122,21 @@ pub enum Operand {
     /// loaded [`Module`](crate::ir::Module) therefore never carries this variant —
     /// the engine resolves the synthesized literal through
     /// [`Module::literal`](crate::ir::Module::literal) like any other literal, so no
-    /// engine change is needed. Build it with [`Operand::big_integer`].
-    BigInteger(Box<BigInt>),
+    /// engine change is needed.
+    BigInteger {
+        /// Whether the packed field is negative (the top bit of its most significant
+        /// byte, `beam_file.c:2174`).
+        negative: bool,
+        /// The **big-endian** magnitude, normalized exactly like the C (at most one
+        /// leading zero byte is removed; two would be a corrupt field,
+        /// `beam_file.c:2186-2203`). Never empty.
+        magnitude: Vec<u8>,
+    },
     /// An argument list (`z,1`): the sub-operands of a `gc_bif*`/`call_*`/… argument
-    /// vector, in order. Build it with [`Operand::list`].
-    List(Box<Vec<Operand>>),
-    /// An allocation list (`z,3`): the decoded `{kind, number}` entries. Build it
-    /// with [`Operand::alloc`].
-    Allocation(Box<Vec<AllocKind>>),
-}
-
-impl Operand {
-    /// Builds the decode-time wide-integer operand from its sign and magnitude.
-    ///
-    /// The arguments are exactly [`BigInt`]'s fields; the payload is boxed so
-    /// `Operand` stays two words (see the type's "Layout" section).
-    pub fn big_integer(negative: bool, magnitude: Vec<u8>) -> Operand {
-        Operand::BigInteger(Box::new(BigInt {
-            negative,
-            magnitude,
-        }))
-    }
-
-    /// Builds a `z,1` argument-list operand from its sub-operands.
-    pub fn list(items: Vec<Operand>) -> Operand {
-        Operand::List(Box::new(items))
-    }
-
-    /// Builds a `z,3` allocation-list operand from its decoded entries.
-    pub fn alloc(entries: Vec<AllocKind>) -> Operand {
-        Operand::Allocation(Box::new(entries))
-    }
+    /// vector, in order.
+    List(Vec<Operand>),
+    /// An allocation list (`z,3`): the decoded `{kind, number}` entries.
+    Allocation(Vec<AllocKind>),
 }
 
 /// The heap/stack-need operand of `test_heap`/`allocate`/`allocate_heap`.
@@ -245,7 +191,7 @@ impl HeapNeed {
             Operand::Integer(value) if *value >= 0 && *value <= i64::from(u32::MAX) => {
                 Ok(HeapNeed::Words(*value as u32))
             }
-            Operand::Allocation(entries) => Ok(HeapNeed::Alloc(entries.to_vec())),
+            Operand::Allocation(entries) => Ok(HeapNeed::Alloc(entries.clone())),
             _ => Err(BeamError::BadArg),
         }
     }

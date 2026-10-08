@@ -255,7 +255,7 @@ fn rewrite_wide_integers(
 /// The number of wide-integer operands in `operand`, including an argument list's.
 fn count_wide_integers(operand: &Operand) -> usize {
     match operand {
-        Operand::BigInteger(_) => 1,
+        Operand::BigInteger { .. } => 1,
         Operand::List(items) => items.iter().map(count_wide_integers).sum(),
         _ => 0,
     }
@@ -265,13 +265,16 @@ fn count_wide_integers(operand: &Operand) -> usize {
 /// [`Operand::Literal`] reference, appending its ETF payload to `synthesized`.
 fn rewrite_wide_integer(operand: &mut Operand, next: &mut u32, synthesized: &mut Vec<Vec<u8>>) {
     match operand {
-        Operand::BigInteger(payload) => {
-            synthesized.push(big_integer_payload(payload.negative, &payload.magnitude));
+        Operand::BigInteger {
+            negative,
+            magnitude,
+        } => {
+            synthesized.push(big_integer_payload(*negative, magnitude));
             *operand = Operand::Literal(*next);
             *next += 1;
         }
         Operand::List(items) => {
-            for item in items.iter_mut() {
+            for item in items {
                 rewrite_wide_integer(item, next, synthesized);
             }
         }
@@ -524,7 +527,7 @@ mod tests {
         assert_eq!(
             lower(
                 Opcode::init_yregs,
-                vec![Operand::list(vec![Operand::Y(0), Operand::Y(1)])]
+                vec![Operand::List(vec![Operand::Y(0), Operand::Y(1)])]
             ),
             Instr::InitYregs {
                 registers: vec![Operand::Y(0), Operand::Y(1)]
@@ -535,7 +538,7 @@ mod tests {
                 Opcode::put_tuple2,
                 vec![
                     Operand::X(0),
-                    Operand::list(vec![Operand::X(1), Operand::Integer(2)]),
+                    Operand::List(vec![Operand::X(1), Operand::Integer(2)]),
                 ]
             ),
             Instr::PutTuple2 {
@@ -564,7 +567,7 @@ mod tests {
                 vec![
                     Operand::X(0),
                     Operand::Label(NO_FAIL),
-                    Operand::list(vec![
+                    Operand::List(vec![
                         Operand::Integer(2),
                         Operand::Label(Label(3)),
                         Operand::Integer(3),
@@ -588,7 +591,7 @@ mod tests {
                 vec![
                     Operand::X(0),
                     Operand::Label(Label(1)),
-                    Operand::list(vec![Operand::Integer(2)]),
+                    Operand::List(vec![Operand::Integer(2)]),
                 ],
             ))
             .unwrap_err(),
@@ -689,7 +692,7 @@ mod tests {
                 vec![
                     Operand::Integer(5),
                     Operand::X(0),
-                    Operand::list(vec![Operand::Y(0), Operand::Y(1)]),
+                    Operand::List(vec![Operand::Y(0), Operand::Y(1)]),
                 ],
             ),
             Instr::MakeFun3 {
@@ -990,7 +993,7 @@ mod tests {
                 vec![
                     Operand::Label(Label(1)),
                     Operand::X(0),
-                    Operand::list(vec![Operand::Atom(key), Operand::Integer(1)]),
+                    Operand::List(vec![Operand::Atom(key), Operand::Integer(1)]),
                 ],
             ),
             Instr::HasMapFields {
@@ -1005,7 +1008,7 @@ mod tests {
                 vec![
                     Operand::Label(Label(2)),
                     Operand::X(0),
-                    Operand::list(vec![Operand::Atom(key), Operand::X(1)]),
+                    Operand::List(vec![Operand::Atom(key), Operand::X(1)]),
                 ],
             ),
             Instr::GetMapElements {
@@ -1021,7 +1024,7 @@ mod tests {
                 vec![
                     Operand::Label(Label(2)),
                     Operand::X(0),
-                    Operand::list(vec![Operand::Atom(key)]),
+                    Operand::List(vec![Operand::Atom(key)]),
                 ],
             ))
             .unwrap_err(),
@@ -1038,7 +1041,7 @@ mod tests {
                 Operand::X(0),
                 Operand::X(1),
                 Operand::Integer(i64::from(live)),
-                Operand::list(vec![Operand::Atom(key), Operand::Atom(value)]),
+                Operand::List(vec![Operand::Atom(key), Operand::Atom(value)]),
             ]
         };
         assert_eq!(
@@ -1074,7 +1077,7 @@ mod tests {
                     Operand::Integer(4),
                     Operand::X(0),
                     Operand::X(1),
-                    Operand::list(vec![
+                    Operand::List(vec![
                         Operand::Integer(2),
                         Operand::X(2),
                         Operand::Integer(3),
@@ -1139,7 +1142,7 @@ mod tests {
                 vec![
                     Operand::Label(NO_FAIL),
                     Operand::X(0),
-                    Operand::list(vec![Operand::Integer(1), Operand::Integer(2)]),
+                    Operand::List(vec![Operand::Integer(1), Operand::Integer(2)]),
                 ],
             ),
             Instr::BsMatch {
@@ -1419,7 +1422,7 @@ mod tests {
                     Operand::Integer(1),
                     Operand::Integer(8),
                     Operand::X(0),
-                    Operand::list(vec![Operand::Atom(Atom::MAX), Operand::Integer(0)]),
+                    Operand::List(vec![Operand::Atom(Atom::MAX), Operand::Integer(0)]),
                 ],
             ),
             Instr::BsCreateBin {
@@ -1447,7 +1450,7 @@ mod tests {
                 Opcode::bs_create_bin,
                 vec![
                     Operand::Label(NO_FAIL),
-                    Operand::alloc(vec![
+                    Operand::Allocation(vec![
                         crate::operand::AllocKind {
                             kind: 0,
                             number: 4,
@@ -1467,7 +1470,7 @@ mod tests {
                     Operand::Integer(2),
                     Operand::Integer(8),
                     Operand::X(2),
-                    Operand::list(vec![Operand::Atom(Atom::MAX), Operand::Integer(1)]),
+                    Operand::List(vec![Operand::Atom(Atom::MAX), Operand::Integer(1)]),
                 ],
             ),
             Instr::BsCreateBin {
@@ -1497,7 +1500,7 @@ mod tests {
                     Operand::Integer(1),
                     Operand::Integer(8),
                     Operand::X(0),
-                    Operand::list(vec![]),
+                    Operand::List(vec![]),
                 ],
             ))
             .unwrap_err(),
@@ -1810,7 +1813,10 @@ mod tests {
         // exactly like the C's `marshal_integer` → `beamfile_add_literal`.
         let instrs = vec![raw(
             Opcode::is_eq_exact,
-            vec![Operand::big_integer(false, vec![0xFF; 8])],
+            vec![Operand::BigInteger {
+                negative: false,
+                magnitude: vec![0xFF; 8],
+            }],
         )];
         let mut synthesized = Vec::new();
         let rewritten = rewrite_wide_integers(&instrs, 4, &mut synthesized)
@@ -1846,7 +1852,10 @@ mod tests {
             label(2),
             raw(
                 Opcode::allocate_zero,
-                vec![Operand::big_integer(false, vec![0xFF; 8])],
+                vec![Operand::BigInteger {
+                    negative: false,
+                    magnitude: vec![0xFF; 8],
+                }],
             ),
             raw(Opcode::r#return, vec![]),
         ];
@@ -1888,9 +1897,12 @@ mod tests {
     fn a_wide_integer_inside_an_argument_list_is_rewritten() {
         let instrs = vec![raw(
             Opcode::gc_bif2,
-            vec![Operand::list(vec![
+            vec![Operand::List(vec![
                 Operand::Integer(1),
-                Operand::big_integer(true, vec![0xFF; 9]),
+                Operand::BigInteger {
+                    negative: true,
+                    magnitude: vec![0xFF; 9],
+                },
             ])],
         )];
         let mut synthesized = Vec::new();
@@ -1899,7 +1911,7 @@ mod tests {
             .expect("rewrite");
         assert_eq!(
             rewritten[0].operands,
-            vec![Operand::list(vec![Operand::Integer(1), Operand::Literal(0)])]
+            vec![Operand::List(vec![Operand::Integer(1), Operand::Literal(0)])]
         );
         // `SMALL_BIG_EXT`, a 9-byte magnitude, sign 1 (`negative`), all `FF`.
         assert_eq!(

@@ -366,29 +366,29 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
             source: op(ops, 1)?,
             keys: list(operand(ops, 2)?)?.to_vec(),
         }),
-        Opcode::put_map_assoc => Ok(Instr::PutMapAssoc(Box::new(MapWriteArgs {
+        Opcode::put_map_assoc => Ok(Instr::PutMapAssoc {
             fail: as_label(operand(ops, 0)?)?,
             source: op(ops, 1)?,
             dst: op(ops, 2)?,
             live: as_u32(operand(ops, 3)?)?,
             pairs: key_value_pairs(operand(ops, 4)?)?,
-        }))),
-        Opcode::put_map_exact => Ok(Instr::PutMapExact(Box::new(MapWriteArgs {
+        }),
+        Opcode::put_map_exact => Ok(Instr::PutMapExact {
             fail: as_label(operand(ops, 0)?)?,
             source: op(ops, 1)?,
             dst: op(ops, 2)?,
             live: as_u32(operand(ops, 3)?)?,
             pairs: key_value_pairs(operand(ops, 4)?)?,
-        }))),
+        }),
         // `update_record Hint Size Src Dst {Index,Value}*` — `Hint` is the atom
         // `copy`/`reuse`, `Size` the arity of the tuple being copied.
-        Opcode::update_record => Ok(Instr::UpdateRecord(Box::new(UpdateRecordArgs {
+        Opcode::update_record => Ok(Instr::UpdateRecord {
             hint: op(ops, 0)?,
             size: as_u32(operand(ops, 1)?)?,
             src: op(ops, 2)?,
             dst: op(ops, 3)?,
             updates: key_value_pairs(operand(ops, 4)?)?,
-        }))),
+        }),
         // ---- native records (OTP 29, generic opcodes 186-193) ------------------
         // One source opcode lowers to one typed variant carrying the file's raw
         // decoded operands (`erts/emulator/beam/emu/ops.tab`), like the `bs_*`
@@ -412,14 +412,14 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
             fields: key_value_pairs(operand(ops, 2)?)?,
         }),
         // `put_record Fail Id Src Dst Live {FieldName,Value}*` (`ops.tab:1648-1654`).
-        Opcode::put_record => Ok(Instr::PutRecord(Box::new(PutRecordArgs {
+        Opcode::put_record => Ok(Instr::PutRecord {
             fail: as_label(operand(ops, 0)?)?,
             id: op(ops, 1)?,
             src: op(ops, 2)?,
             dst: op(ops, 3)?,
             live: as_u32(operand(ops, 4)?)?,
             updates: key_value_pairs(operand(ops, 5)?)?,
-        }))),
+        }),
         // `is_record_accessible Fail Src Scope` (`ops.tab:1672-1678`).
         Opcode::is_record_accessible => Ok(Instr::IsRecordAccessible {
             fail: as_label(operand(ops, 0)?)?,
@@ -427,13 +427,13 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
             scope: op(ops, 2)?,
         }),
         // `get_record_field Fail Src Id Field Dst` (`ops.tab:1680-1686`).
-        Opcode::get_record_field => Ok(Instr::GetRecordField(Box::new(GetRecordFieldArgs {
+        Opcode::get_record_field => Ok(Instr::GetRecordField {
             fail: as_label(operand(ops, 0)?)?,
             src: op(ops, 1)?,
             id: op(ops, 2)?,
             field: op(ops, 3)?,
             dst: op(ops, 4)?,
-        }))),
+        }),
         // `get_record_elements_id Fail Id Src {FieldName,Register}*` (OTP 30;
         // `beam_disasm.erl:1424`).
         Opcode::get_record_elements_id => Ok(Instr::GetRecordElementsId {
@@ -444,7 +444,7 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
         }),
         // `update_record_id Fail Hint Id Src Dst Live {FieldName,Value}*` (OTP 30;
         // `beam_disasm.erl:1428`).
-        Opcode::update_record_id => Ok(Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
+        Opcode::update_record_id => Ok(Instr::UpdateRecordId {
             fail: as_label(operand(ops, 0)?)?,
             hint: op(ops, 1)?,
             id: op(ops, 2)?,
@@ -452,7 +452,7 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
             dst: op(ops, 4)?,
             live: as_u32(operand(ops, 5)?)?,
             updates: key_value_pairs(operand(ops, 6)?)?,
-        }))),
+        }),
 
         // ---- binary syntax ----------------------------------------------------
         Opcode::bs_start_match3 => Ok(Instr::BsStartMatch3 {
@@ -499,19 +499,41 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
         // `bs_get_{integer,float,binary}2 Fail Ctx Live Size Unit Flags Dst` — three
         // opcodes, one operand layout.
         Opcode::bs_get_integer2 | Opcode::bs_get_float2 | Opcode::bs_get_binary2 => {
-            let args = Box::new(BsGetArgs {
-                fail: as_label(operand(ops, 0)?)?,
-                ctx: op(ops, 1)?,
-                live: as_u32(operand(ops, 2)?)?,
-                size: op(ops, 3)?,
-                unit: as_u32(operand(ops, 4)?)?,
-                flags: as_u32(operand(ops, 5)?)?,
-                dst: op(ops, 6)?,
-            });
+            let fail = as_label(operand(ops, 0)?)?;
+            let ctx = op(ops, 1)?;
+            let live = as_u32(operand(ops, 2)?)?;
+            let size = op(ops, 3)?;
+            let unit = as_u32(operand(ops, 4)?)?;
+            let flags = as_u32(operand(ops, 5)?)?;
+            let dst = op(ops, 6)?;
             Ok(match raw.opcode {
-                Opcode::bs_get_integer2 => Instr::BsGetInteger2(args),
-                Opcode::bs_get_float2 => Instr::BsGetFloat2(args),
-                _ => Instr::BsGetBinary2(args),
+                Opcode::bs_get_integer2 => Instr::BsGetInteger2 {
+                    fail,
+                    ctx,
+                    live,
+                    size,
+                    unit,
+                    flags,
+                    dst,
+                },
+                Opcode::bs_get_float2 => Instr::BsGetFloat2 {
+                    fail,
+                    ctx,
+                    live,
+                    size,
+                    unit,
+                    flags,
+                    dst,
+                },
+                _ => Instr::BsGetBinary2 {
+                    fail,
+                    ctx,
+                    live,
+                    size,
+                    unit,
+                    flags,
+                    dst,
+                },
             })
         }
         Opcode::bs_skip_bits2 => Ok(Instr::BsSkipBits2 {
@@ -687,7 +709,7 @@ fn op(ops: &[Operand], index: usize) -> Result<Operand> {
 /// caller needs; a non-list operand is a structural mismatch.
 fn list(operand: &Operand) -> Result<&[Operand]> {
     match operand {
-        Operand::List(items) => Ok(items.as_slice()),
+        Operand::List(items) => Ok(items),
         _ => Err(bad_file("expected an argument-list operand")),
     }
 }
@@ -775,7 +797,7 @@ mod tests {
         assert_eq!(
             lower_instr(&raw(
                 Opcode::test_heap,
-                vec![Operand::alloc(entries.clone()), Operand::Integer(1)],
+                vec![Operand::Allocation(entries.clone()), Operand::Integer(1)],
             ))
             .unwrap(),
             Instr::TestHeap {
@@ -804,7 +826,7 @@ mod tests {
         assert_eq!(
             lower_instr(&raw(
                 Opcode::allocate,
-                vec![Operand::alloc(ns.clone()), Operand::Integer(2)],
+                vec![Operand::Allocation(ns.clone()), Operand::Integer(2)],
             ))
             .unwrap(),
             Instr::Allocate {
@@ -836,7 +858,7 @@ mod tests {
             lower_instr(&raw(
                 Opcode::allocate_heap,
                 vec![
-                    Operand::alloc(ns.clone()),
+                    Operand::Allocation(ns.clone()),
                     Operand::Integer(6),
                     Operand::Integer(3),
                 ],
@@ -875,7 +897,7 @@ mod tests {
         ));
         // An argument list (`z,1`) is not an allocation list (`z,3`).
         assert!(matches!(
-            HeapNeed::from_operand(&Operand::list(vec![Operand::Integer(1)])),
+            HeapNeed::from_operand(&Operand::List(vec![Operand::Integer(1)])),
             Err(BeamError::BadArg)
         ));
         // A negative integer is not a word count.
@@ -1062,7 +1084,7 @@ mod tests {
                 vec![
                     Operand::Label(Label(3)),
                     Operand::X(0),
-                    Operand::list(vec![
+                    Operand::List(vec![
                         Operand::Atom(fb),
                         Operand::X(2),
                         Operand::Atom(fa),
@@ -1092,7 +1114,7 @@ mod tests {
                     Operand::Nil,
                     Operand::X(0),
                     Operand::Integer(1),
-                    Operand::list(vec![
+                    Operand::List(vec![
                         Operand::Atom(fa),
                         Operand::Integer(1),
                         Operand::Atom(fb),
@@ -1164,7 +1186,7 @@ mod tests {
                     Operand::Label(Label(4)),
                     Operand::Atom(rec),
                     Operand::Y(1),
-                    Operand::list(vec![Operand::Atom(fa), Operand::X(1)]),
+                    Operand::List(vec![Operand::Atom(fa), Operand::X(1)]),
                 ],
             ))
             .unwrap(),
@@ -1187,7 +1209,7 @@ mod tests {
                     Operand::X(0),
                     Operand::X(0),
                     Operand::Integer(2),
-                    Operand::list(vec![Operand::Atom(fa), Operand::Integer(7)]),
+                    Operand::List(vec![Operand::Atom(fa), Operand::Integer(7)]),
                 ],
             ))
             .unwrap(),
@@ -1228,7 +1250,7 @@ mod tests {
                 vec![
                     Operand::Label(Label(1)),
                     Operand::X(0),
-                    Operand::list(vec![Operand::Atom(fa), Operand::X(1), Operand::Atom(fa)]),
+                    Operand::List(vec![Operand::Atom(fa), Operand::X(1), Operand::Atom(fa)]),
                 ],
             )),
             Err(BeamError::BadArg)
@@ -1243,7 +1265,7 @@ mod tests {
                     Operand::Nil,
                     Operand::X(0),
                     Operand::X(0),
-                    Operand::list(vec![Operand::Atom(fa), Operand::Integer(1)]),
+                    Operand::List(vec![Operand::Atom(fa), Operand::Integer(1)]),
                 ],
             )),
             Err(BeamError::BadArg)

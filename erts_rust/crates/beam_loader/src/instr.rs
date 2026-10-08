@@ -46,29 +46,6 @@
 //! `Instr` is a single flat data enum (like [`crate::opcode`]) rather than
 //! split across submodules: an enum cannot be spread over modules, and splitting
 //! the *variants* would destroy the one-name surface downstream matches on.
-//!
-//! # Size budget
-//!
-//! Every instruction of a loaded module lives in the code array the interpreter
-//! walks, so `size_of::<Instr>()` is a dispatch-cost constant: the per-instruction
-//! `match` reads the discriminant and the taken variant's fields out of the same
-//! cache line(s), and a larger enum means a sparser array. The enums are therefore
-//! size-pinned by the `const` guards at the bottom of this file — `Instr` at 64
-//! bytes (one cache line) and `Operand` at 16 (two words).
-//!
-//! Three rules keep them there, and all three are load-time-only costs:
-//!
-//! * **Hot variants stay inline and small.** The control/register/BIF set the
-//!   interpreter runs constantly — `Move`/`Swap`/`Test`/`SelectVal`/`Jump`, the
-//!   `GcBif`/`Bif`/`Bif0`/`Call*`/`Allocate*`/`Return` families and the whole
-//!   receive family — is never boxed.
-//! * **Operand-heavy cold variants are boxed.** A variant with three or more
-//!   operands *and* an update list (the native-record family, `update_record`, the
-//!   map writes, the `bs_get_*2` segment readers) carries them in a boxed bundle
-//!   (`MapWriteArgs`, `PutRecordArgs`, `BsGetArgs`, …) instead of inline.
-//! * **`Operand` carries no inline `Vec`.** Its three decode-time-only variants
-//!   (`BigInteger`/`List`/`Allocation`) hold boxed payloads; the leaf forms — the
-//!   only ones a loaded [`Module`](crate::ir::Module) contains — are two words.
 use crate::ir::{Atom, ImportRef, LineRef};
 use crate::opcode::Opcode;
 use crate::operand::{HeapNeed, Label, Operand};
@@ -506,24 +483,51 @@ pub enum Instr {
         keys: Vec<Operand>,
     },
     /// `put_map_assoc Fail Src Dst Live {Key,Value}*` — update/build a map.
-    ///
-    /// The operands live in a boxed [`MapWriteArgs`]; both map writes share the type
-    /// because their operand shape is identical.
-    PutMapAssoc(Box<MapWriteArgs>),
+    PutMapAssoc {
+        /// The failure label ([`crate::operand::NO_FAIL`] means "raise on failure").
+        fail: Label,
+        /// The source map operand.
+        source: Operand,
+        /// The destination operand.
+        dst: Operand,
+        /// The number of live X registers at the update.
+        live: u32,
+        /// The `(key, value)` pairs to associate, in file order.
+        pairs: Vec<(Operand, Operand)>,
+    },
     /// `put_map_exact Fail Src Dst Live {Key,Value}*` — update a map, failing on
     /// a key the source map does not have.
-    ///
-    /// The operands live in a boxed [`MapWriteArgs`] (see [`Instr::PutMapAssoc`]).
-    PutMapExact(Box<MapWriteArgs>),
+    PutMapExact {
+        /// The failure label ([`crate::operand::NO_FAIL`] means "raise on failure").
+        fail: Label,
+        /// The source map operand.
+        source: Operand,
+        /// The destination operand.
+        dst: Operand,
+        /// The number of live X registers at the update.
+        live: u32,
+        /// The `(key, value)` pairs to update, in file order.
+        pairs: Vec<(Operand, Operand)>,
+    },
 
     // ---- records -----------------------------------------------------------
     /// `update_record Hint Size Src Dst {Index,Value}*` — copy a tuple with
     /// elements replaced.
     ///
     /// `hint` is the compiler's reuse hint (`copy`/`reuse`); `size` is the arity
-    /// of the tuple being copied. The operands live in a boxed
-    /// [`UpdateRecordArgs`].
-    UpdateRecord(Box<UpdateRecordArgs>),
+    /// of the tuple being copied.
+    UpdateRecord {
+        /// The compiler's reuse hint (`copy`/`reuse`).
+        hint: Operand,
+        /// The arity of the tuple being copied.
+        size: u32,
+        /// The source tuple operand.
+        src: Operand,
+        /// The destination operand.
+        dst: Operand,
+        /// The `(index, value)` replacements, in file order.
+        updates: Vec<(Operand, Operand)>,
+    },
     /// `is_any_native_record Fail Src` — the `erlang:is_record/1` guard (generic
     /// opcode 186).
     ///
@@ -578,9 +582,20 @@ pub enum Instr {
     /// `emu/instrs.tab:1373,1418`; `Fail Id Src Dst Live Updates=*` in
     /// `emu/ops.tab:1648-1654`). `Id` is the record's compile-time identity (an atom,
     /// or a `{Module,Name}` literal for a foreign record); failure branches to `Fail`.
-    ///
-    /// The operands live in a boxed [`PutRecordArgs`].
-    PutRecord(Box<PutRecordArgs>),
+    PutRecord {
+        /// The failure label.
+        fail: Label,
+        /// The record identity (atom, `{Module,Name}` literal, or register).
+        id: Operand,
+        /// `nil` to create a fresh record, or the register holding the record to update.
+        src: Operand,
+        /// The destination register.
+        dst: Operand,
+        /// The number of live x registers at the instruction.
+        live: u32,
+        /// The `(field name, value)` pairs to set, in file order.
+        updates: Vec<(Operand, Operand)>,
+    },
     /// `is_record_accessible Fail Src Scope` — test whether the fields of the native
     /// record in `Src` are accessible from the executing module (generic opcode 190;
     /// `erl_is_record_accessible`/`erl_is_wildcard_record_accessible`,
@@ -600,9 +615,18 @@ pub enum Instr {
     /// `Fail Src Id Field Dst` in `emu/ops.tab:1680-1686`). Branches to `Fail` if the
     /// field cannot be extracted; `Id` is the record identity (atom or `{Module,Name}`
     /// literal).
-    ///
-    /// The operands live in a boxed [`GetRecordFieldArgs`].
-    GetRecordField(Box<GetRecordFieldArgs>),
+    GetRecordField {
+        /// The failure label.
+        fail: Label,
+        /// The source x/y register holding the record.
+        src: Operand,
+        /// The record identity (atom, `{Module,Name}` literal, or register).
+        id: Operand,
+        /// The field name to read.
+        field: Operand,
+        /// The destination register.
+        dst: Operand,
+    },
     /// `get_record_elements_id Fail Id Src {FieldName,Register}*` — like
     /// [`Instr::GetRecordElements`] but carrying the record identity `Id` so field
     /// positions can be bound at load time (generic opcode 192, OTP 30; operand shape
@@ -622,9 +646,22 @@ pub enum Instr {
     /// native record, carrying the record identity `Id` and the reuse `Hint` like
     /// [`Instr::UpdateRecord`] (generic opcode 193, OTP 30; operand shape
     /// `Fail Hint Id Src Dst Live Updates` per `lib/compiler/src/beam_disasm.erl:1428`).
-    ///
-    /// The operands live in a boxed [`UpdateRecordIdArgs`].
-    UpdateRecordId(Box<UpdateRecordIdArgs>),
+    UpdateRecordId {
+        /// The failure label.
+        fail: Label,
+        /// The compiler's reuse hint (`copy`/`reuse`/`inplace`).
+        hint: Operand,
+        /// The record identity (atom, `{Module,Name}` literal, or `[]`).
+        id: Operand,
+        /// The source x/y register holding the record.
+        src: Operand,
+        /// The destination register.
+        dst: Operand,
+        /// The number of live x registers at the instruction.
+        live: u32,
+        /// The `(field name, value)` pairs to set, in file order.
+        updates: Vec<(Operand, Operand)>,
+    },
 
     // ---- exceptions --------------------------------------------------------
     /// `badmatch Value` — raise a `{badmatch,Value}` error.
@@ -889,18 +926,56 @@ pub enum Instr {
         pos: Operand,
     },
     /// `bs_get_integer2 Fail Ctx Live Size Unit Flags Dst` — match an integer.
-    ///
-    /// The operands live in a boxed [`BsGetArgs`], shared with
-    /// [`Instr::BsGetFloat2`]/[`Instr::BsGetBinary2`] (identical operand shape).
-    BsGetInteger2(Box<BsGetArgs>),
+    BsGetInteger2 {
+        /// The failure label ([`crate::operand::NO_FAIL`] means "raise on failure").
+        fail: Label,
+        /// The match context operand.
+        ctx: Operand,
+        /// The number of live X registers.
+        live: u32,
+        /// The segment size (a register or an integer).
+        size: Operand,
+        /// The segment unit (bits per element).
+        unit: u32,
+        /// The segment flag bits (little/signed/native).
+        flags: u32,
+        /// The destination operand.
+        dst: Operand,
+    },
     /// `bs_get_float2 Fail Ctx Live Size Unit Flags Dst` — match a float.
-    ///
-    /// The operands live in a boxed [`BsGetArgs`] (see [`Instr::BsGetInteger2`]).
-    BsGetFloat2(Box<BsGetArgs>),
+    BsGetFloat2 {
+        /// The failure label ([`crate::operand::NO_FAIL`] means "raise on failure").
+        fail: Label,
+        /// The match context operand.
+        ctx: Operand,
+        /// The number of live X registers.
+        live: u32,
+        /// The segment size (a register or an integer).
+        size: Operand,
+        /// The segment unit (bits per element).
+        unit: u32,
+        /// The segment flag bits (little/signed/native).
+        flags: u32,
+        /// The destination operand.
+        dst: Operand,
+    },
     /// `bs_get_binary2 Fail Ctx Live Size Unit Flags Dst` — match a binary.
-    ///
-    /// The operands live in a boxed [`BsGetArgs`] (see [`Instr::BsGetInteger2`]).
-    BsGetBinary2(Box<BsGetArgs>),
+    BsGetBinary2 {
+        /// The failure label ([`crate::operand::NO_FAIL`] means "raise on failure").
+        fail: Label,
+        /// The match context operand.
+        ctx: Operand,
+        /// The number of live X registers.
+        live: u32,
+        /// The segment size (a register or an integer).
+        size: Operand,
+        /// The segment unit (bits per element).
+        unit: u32,
+        /// The segment flag bits (little/signed/native).
+        flags: u32,
+        /// The destination operand.
+        dst: Operand,
+    },
     /// `bs_skip_bits2 Fail Ctx Size Unit Flags` — skip bits of a match context.
     BsSkipBits2 {
         /// The failure label ([`crate::operand::NO_FAIL`] means "raise on failure").
@@ -1064,125 +1139,3 @@ pub enum Instr {
         offset: u32,
     },
 }
-
-// ---- boxed operand bundles ------------------------------------------------
-//
-// The operand-heavy, non-hot instructions below carry their operands in a boxed
-// bundle instead of inline. `Operand` is two words and a `Vec` is three, so a
-// variant with three operands plus an update list would otherwise be ~80 bytes —
-// large enough to set the size of the *whole* enum, which would inflate every
-// instruction in the code array and widen the interpreter's dispatch match. Boxed
-// variants pay one pointer chase when they execute; the hot control/register/BIF
-// variants stay inline (see the `# Size budget` section in the module docs).
-
-/// The operands of [`Instr::PutMapAssoc`]/[`Instr::PutMapExact`].
-#[derive(Clone, PartialEq, Debug)]
-pub struct MapWriteArgs {
-    /// The failure label ([`crate::operand::NO_FAIL`] means "raise on failure").
-    pub fail: Label,
-    /// The source map operand.
-    pub source: Operand,
-    /// The destination operand.
-    pub dst: Operand,
-    /// The number of live X registers at the update.
-    pub live: u32,
-    /// The `(key, value)` pairs, in file order.
-    pub pairs: Vec<(Operand, Operand)>,
-}
-
-/// The operands of [`Instr::UpdateRecord`].
-#[derive(Clone, PartialEq, Debug)]
-pub struct UpdateRecordArgs {
-    /// The compiler's reuse hint (`copy`/`reuse`).
-    pub hint: Operand,
-    /// The arity of the tuple being copied.
-    pub size: u32,
-    /// The source tuple operand.
-    pub src: Operand,
-    /// The destination operand.
-    pub dst: Operand,
-    /// The `(index, value)` replacements, in file order.
-    pub updates: Vec<(Operand, Operand)>,
-}
-
-/// The operands of [`Instr::PutRecord`].
-#[derive(Clone, PartialEq, Debug)]
-pub struct PutRecordArgs {
-    /// The failure label.
-    pub fail: Label,
-    /// The record identity (atom, `{Module,Name}` literal, or register).
-    pub id: Operand,
-    /// `nil` to create a fresh record, or the register holding the record to update.
-    pub src: Operand,
-    /// The destination register.
-    pub dst: Operand,
-    /// The number of live x registers at the instruction.
-    pub live: u32,
-    /// The `(field name, value)` pairs to set, in file order.
-    pub updates: Vec<(Operand, Operand)>,
-}
-
-/// The operands of [`Instr::UpdateRecordId`].
-#[derive(Clone, PartialEq, Debug)]
-pub struct UpdateRecordIdArgs {
-    /// The failure label.
-    pub fail: Label,
-    /// The compiler's reuse hint (`copy`/`reuse`/`inplace`).
-    pub hint: Operand,
-    /// The record identity (atom, `{Module,Name}` literal, or `[]`).
-    pub id: Operand,
-    /// The source x/y register holding the record.
-    pub src: Operand,
-    /// The destination register.
-    pub dst: Operand,
-    /// The number of live x registers at the instruction.
-    pub live: u32,
-    /// The `(field name, value)` pairs to set, in file order.
-    pub updates: Vec<(Operand, Operand)>,
-}
-
-/// The operands of [`Instr::GetRecordField`].
-#[derive(Clone, PartialEq, Debug)]
-pub struct GetRecordFieldArgs {
-    /// The failure label.
-    pub fail: Label,
-    /// The source x/y register holding the record.
-    pub src: Operand,
-    /// The record identity (atom, `{Module,Name}` literal, or register).
-    pub id: Operand,
-    /// The field name to read.
-    pub field: Operand,
-    /// The destination register.
-    pub dst: Operand,
-}
-
-/// The operands of [`Instr::BsGetInteger2`]/[`Instr::BsGetFloat2`]/
-/// [`Instr::BsGetBinary2`] — the three share one operand shape.
-#[derive(Clone, PartialEq, Debug)]
-pub struct BsGetArgs {
-    /// The failure label ([`crate::operand::NO_FAIL`] means "raise on failure").
-    pub fail: Label,
-    /// The match context operand.
-    pub ctx: Operand,
-    /// The number of live X registers.
-    pub live: u32,
-    /// The segment size (a register or an integer).
-    pub size: Operand,
-    /// The segment unit (bits per element).
-    pub unit: u32,
-    /// The segment flag bits (little/signed/native).
-    pub flags: u32,
-    /// The destination operand.
-    pub dst: Operand,
-}
-
-// ---- size guards ----------------------------------------------------------
-//
-// Compile-time pins on the size budget the interpreter's dispatch depends on (see
-// the module docs). They are `<=` (not `==`) so a *smaller* layout is never an
-// error, but any change that re-inflates the enums — a new inline `Vec` payload or
-// a fourth `Operand` field on a variant — fails the build here instead of silently
-// costing cache lines. Raising a bound is a deliberate, reviewable act.
-const _: () = assert!(core::mem::size_of::<Instr>() <= 64);
-const _: () = assert!(core::mem::size_of::<Operand>() <= 16);
-const _: () = assert!(core::mem::size_of::<HeapNeed>() <= 24);

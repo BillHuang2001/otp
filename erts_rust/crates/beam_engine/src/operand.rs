@@ -213,8 +213,8 @@ mod tests {
         let mut ctx = MinimalContext::new();
         assert!(read_operand(&machine, &mut ctx, &Operand::Literal(0)).is_err());
         assert!(read_operand(&machine, &mut ctx, &Operand::Label(Label(1))).is_err());
-        assert!(read_operand(&machine, &mut ctx, &Operand::list(vec![])).is_err());
-        assert!(read_operand(&machine, &mut ctx, &Operand::alloc(vec![])).is_err());
+        assert!(read_operand(&machine, &mut ctx, &Operand::List(vec![])).is_err());
+        assert!(read_operand(&machine, &mut ctx, &Operand::Allocation(vec![])).is_err());
     }
 
     #[test]
