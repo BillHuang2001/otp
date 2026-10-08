@@ -97,7 +97,7 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_dist` | `DFLAG_*`/`DOP_*` constants, handshake + control-message framing, `epmd` client |
 | `beam_loader` | chunk parse + BEAM disassembly + lowering to the typed block IR |
 | `beam_engine` | IR + direct-threaded interpreter + the native baseline JIT tier (default-OFF Cranelift hot tier) + `ExecutionContext` + the receive/message family over a `Mailbox` seam |
-| `beam_gc` | generational semi-space Cheney copy + MSO refcount |
+| `beam_gc` | generational Cheney copying + immix mature generation (measurement-gated) + MSO refcount |
 | `beam_message` | `copy_struct` + send/receive envelope + the `QueueCursor` scan position |
 | `beam_process` | `Process`, run queue, scheduler loop, resume-on-send, signals/links/monitors |
 | `beam_bifs` | `BifRegistry` + core `erlang` BIFs (arith, comparison, type tests, term ops) + `io` floor |
