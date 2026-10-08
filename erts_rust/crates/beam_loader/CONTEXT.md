@@ -568,7 +568,14 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/records.rs` → `Recs`-chunk integration tests: declaration order, every default encoding, name/atom lookups, the pinned-`ORACLE` ↔ live-`erl` `records:get_definition/2` cross-check (bounded), and malformed-image rejection through `load` beside a well-formed control image
 - `tests/generic_census.rs` → the residual `Instr::Generic` census over the installed OTP (asserts the unmodelled-opcode set equals the documented baseline)
 - `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep over the whole `lib` root (all 34 apps / 1366 modules recursively; every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
-- `tests/native_record.rs` → real-module structural check of the OTP-29 native-record family (186-193): the `erl_eval` `is_any_native_record` positive control, a stdlib/kernel/compiler sweep asserting **no** family member lowers to `Instr::Generic`, and a system-`erlc`-compiled native-record module proving 186-191 lower typed; loud skip when `erl`/`erlc`/OTP is absent
+- `tests/native_record.rs` → the OTP-29 native-record family (186-191) over the committed `nr_def`/`nr_use` fixtures + the `erl_eval` `is_any_native_record` positive control + a stdlib/kernel/compiler sweep asserting no family member lowers to `Instr::Generic`
+- `tests/line_info.rs` → typed `executable_line`/`debug_line` (the `linecov`/`dbgline` fixtures) + line-table/`func_info` preservation
+- `tests/bs_test_tail.rs` → typed `bs_test_tail2` over the `bstail` fixture
+- `tests/chunks.rs` → the whole-corpus chunk-id classification checker + the `Attr` oracle cross-check
+- `tests/literals.rs` → the two `LitT` framings + the whole-corpus literal round-trip/oracle sweep
+- `tests/load_cost.rs` → the committed module-load-cost measurement (ns/instruction, bytes/second)
+- `tests/fixtures/{nr_def,nr_use,linecov,dbgline,bstail}.{erl,beam}` → native-record / line / test-tail oracle fixtures
+- `tests/fixtures/literals_fixture.erl` + `literals_{verbatim,compressed}.beam` + `literals_oracle.escript` → the `LitT` framing fixtures + the Erlang-side literal oracle
 - `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
 - `../../lib/compiler/src/genop.tab` → the authoritative opcode roster (read-only)
