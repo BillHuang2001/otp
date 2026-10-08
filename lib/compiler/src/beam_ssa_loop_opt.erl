@@ -89,6 +89,27 @@
 %%%    must keep raising) and every operation with an operand whose
 %%%    integrality/non-negativity cannot be proved.
 %%%
+%%%    Integrality is proved from two independent sources, and either one is
+%%%    enough:
+%%%
+%%%    * the *structural* facts of item 3, i.e. integer literals, integer
+%%%      induction variables and the integer-valued operations built from
+%%%      them (the fixed point in `value_kinds/2');
+%%%    * the *type annotations* that `beam_ssa_type' leaves on each
+%%%      instruction (`anno = #{arg_types := #{Index => #type{}}}', the type
+%%%      of the operand at the 0-based `Index'). An operand annotated
+%%%      `#t_integer{}' is an integer, and an operand annotated
+%%%      `#t_integer{elements={Lo,_}}' with `Lo >= 0' is non-negative. This
+%%%      is what makes the pass fire on real code, where the interesting
+%%%      operands are function arguments and values extracted from a message
+%%%      or a term -- values that have no defining instruction the structural
+%%%      analysis could classify.
+%%%
+%%%    A type annotation is only ever trusted for the instruction it is
+%%%    attached to, because `beam_ssa_type' refines a variable along the
+%%%    edges it flows down: the type of a variable at one use says nothing
+%%%    about its type at another. The annotation is therefore consulted where
+%%%    the operand is used, and the structural facts are the fallback.%%%
 %%% CORRECTNESS RULES (conservative by design -- when in doubt, do nothing)
 %%%
 %%% * Only `#b_set{}' value instructions are considered; phis, terminators,
@@ -109,13 +130,11 @@
 %%%   a loop-invariant test reliably shows up in the CFG at this point (see
 %%%   below). The tests are constant-tag comparisons, so hoisting one out of
 %%%   the loop removes it from the hot path without changing any result.
-%%% * Consequently arithmetic is NOT hoisted here: without type information
-%%%   (this pass runs before the SSA type pass) an operation such as `+'
-%%%   cannot be proven non-raising, and moving it would execute it on paths
-%%%   where it was not executed before. Arithmetic is instead
+%%% * Consequently arithmetic is NOT hoisted here: an operation such as `+'
+%%%   or `*' can raise, and moving it into the preheader would execute it on
+%%%   paths where it was not executed before. Arithmetic is instead
 %%%   *strength-reduced in place* (item 4 above), which never moves an
-%%%   instruction to a path that did not have the original.
-%%% * The strength reducer only ever replaces an operation by one that
+%%%   instruction to a path that did not have the original.%%% * The strength reducer only ever replaces an operation by one that
 %%%   either succeeds and computes the same value, or fails on exactly the
 %%%   same operands. Since every rewrite requires a proof that the operands
 %%%   are integers (or, for `div' -> `bsr', non-negative integers), the
@@ -134,22 +153,27 @@
 %%%
 %%% NOT IMPLEMENTED (see the report / CONTEXT.md)
 %%%
-%%% REACH LIMITATION (measured): at this pipeline point the CFG of ordinary
-%%% Erlang code contains no optimizable loop -- a self-recursive function is
-%%% still a tail `call' (no back edge) and a `receive' loop's header carries
-%%% no phis. The pass therefore rewrites nothing on real modules: compiling
-%%% `lib/stdlib/src' with and without `+loop_opt' yields byte-identical
-%%% generated code, only the `compile_info' chunk records the option. The
-%%% loop/IV/strength-reduction transforms above are consequently validated on
-%%% hand-built SSA driven directly through `beam_ssa_loop_opt:opt/1'.
+%%% REACH: at this pipeline point the CFG of an ordinary tail-recursive
+%%% function contains no cycle (self-recursion is still a tail `call'), and a
+%%% `receive' loop's header carries no phis, so the loop/IV parts of the pass
+%%% find nothing to do in typical Erlang code. The strength reducer, however,
+%%% needs neither a phi nor an induction variable: it only needs a proof that
+%%% one operand of a product or quotient is an integer, which the SSA type
+%%% annotations provide -- a guarded `receive' clause such as
+%%% `{n,X} when is_integer(X), X >= 0 -> X * 8 + X div 4' is reduced. The
+%%% reducer is applied to the loop body *and* to every block dominated by the
+%%% loop header, because the body of a natural loop is defined by reaching
+%%% the back edge and a receive clause that returns to its caller (or raises)
+%%% does not; see `loop_region/3'.
 %%%
-%%% * Unrolling. A sound unroller needs an exact trip count. The pass runs in
-%%%   the prologue phase, i.e. before the SSA type analysis, so neither
-%%%   `#t_integer{elements=...}' nor `beam_bounds' information is available;
-%%%   a trip count could only be derived from a syntactic comparison against
-%%%   literals, which is not enough to make unrolling worthwhile (or safe) in
-%%%   the common case. Unrolling is therefore deferred rather than guessed.
-%%% * Accumulator-based strength reduction of a product by a constant that is
+%%% * Unrolling. A sound unroller needs an exact trip count, i.e. the bounds
+%%%   of a loop-carried variable and a decidable exit test. The pass runs
+%%%   after the SSA type analysis, so `#t_integer{elements={Lo,Hi}}' is
+%%%   available for the type of a variable *at a use*; deriving a trip count
+%%%   from that and rewriting the loop as a counted one is a much larger
+%%%   transformation (it needs the exit test to be the loop's only exit and
+%%%   the bounds to be loop-invariant). Unrolling is therefore deferred
+%%%   rather than guessed.%%% * Accumulator-based strength reduction of a product by a constant that is
 %%%   not a power of two (`X * 3' turned into a second loop-carried variable
 %%%   incremented by the step times 3). It replaces one multiplication by one
 %%%   addition, at the price of a new phi, a new entry computation in the
@@ -164,13 +188,14 @@
 %%%   is added on a path that did not have the original operation.
 %%% * Only a hit of the split `div' -> `bsr' rule needs the dividend to be
 %%%   non-negative; the non-negativity proof is the induction-variable one
-%%%   (non-negative entry value and non-negative step) or a value built from
+%%%   (non-negative entry value and non-negative step), a value built from
 %%%   non-negative values by `+', `*', `div', `rem', `band', `bor', `bxor',
-%%%   `bsl' or `bsr'. Nothing else is accepted.
-
+%%%   `bsl' or `bsr', or a type annotation with a non-negative lower bound.
+%%%   Nothing else is accepted.
 -export([opt/1, eligible/1]).
 
 -include("beam_ssa.hrl").
+-include("beam_types.hrl").
 -import_record(beam_ssa_opt, [opt_st]).
 
 %% Maximum number of instructions hoisted per loop. Bounds the growth of the
@@ -311,7 +336,7 @@ opt_linear(Linear0) ->
         [] ->
             Linear0;
         [_ | _] ->
-            Loops = find_loops(Order0, Blocks0),
+            {Loops, Doms} = find_loops(Order0, Blocks0),
             case Loops of
                 [] ->
                     Linear0;
@@ -319,7 +344,7 @@ opt_linear(Linear0) ->
                     Next = lists:max([0 | Order0]) + 1,
                     {Blocks, _} =
                         lists:foldl(fun(Loop, {B, N}) ->
-                                            opt_loop(Loop, Order0, B, N)
+                                            opt_loop(Loop, Order0, Doms, B, N)
                                     end, {Blocks0, Next}, Loops),
                     order_linear(Order0, Blocks)
             end
@@ -353,8 +378,7 @@ find_loops(Labels, Blocks) ->
                                                {H, ordsets:union(Body0, Body)})
                       end
               end, [], Edges),
-    [{H, ordsets:to_list(Body)} || {H, Body} <- Loops].
-
+    {[{H, ordsets:to_list(Body)} || {H, Body} <- Loops], Doms}.
 %% The natural loop of the back edge H->P: H plus every block that can reach
 %% P without passing through H.
 natural_loop(H, P, Preds) ->
@@ -437,7 +461,7 @@ dom_fix(Labels, Preds, Doms) ->
 %%% Per-loop transformation
 %%% ------------------------------------------------------------------
 
-opt_loop({H, Body}, Order0, Blocks0, NextLabel) ->
+opt_loop({H, Body}, Order0, Doms, Blocks0, NextLabel) ->
     BodySet = ordsets:from_list(Body),
     Preds = preds(maps:keys(Blocks0), Blocks0),
     Outside = [P || P <- maps:get(H, Preds, []),
@@ -446,12 +470,30 @@ opt_loop({H, Body}, Order0, Blocks0, NextLabel) ->
         [Pre] when Pre =/= H, is_map_key(Pre, Blocks0) ->
             {Blocks1, Pre1, Next1} = ensure_preheader(Pre, H, Blocks0, NextLabel),
             Blocks2 = licm(H, Body, Order0, Pre1, Blocks1),
-            Blocks3 = strength_reduce(H, Body, Blocks2),
+            Blocks3 = strength_reduce(H, Body, loop_region(H, Order0, Doms),
+                                      Blocks2),
             {Blocks3, Next1};
         _ ->
             {Blocks0, NextLabel}
     end.
 
+%% The blocks the strength reducer is allowed to rewrite: the body of the
+%% natural loop plus every block the loop header dominates.
+%%
+%% The natural-loop body is defined as "the blocks that can reach the back
+%% edge without passing through the header", which is too narrow here: in a
+%% `receive' loop the block that computes the value of a matching clause ends
+%% in `ret' (or branches to the raise block), so it cannot reach the back
+%% edge and is not part of any natural loop -- yet it runs once per matching
+%% message and is exactly where the arithmetic of the clause lives. A block
+%% dominated by the header is inside the iteration region: control only gets
+%% there through the header, so it is executed at most once per iteration.
+%%
+%% Adding blocks is safe for the reducer, whose every rewrite is proved for
+%% the operands *at the instruction being rewritten* and never moves or
+%% duplicates an instruction; the set only decides how much is optimized.
+loop_region(H, Order0, Doms) ->
+    [L || L <- Order0, lists:member(H, maps:get(L, Doms, []))].
 %% Make sure `Pre' is a dedicated preheader of `H'. If `Pre' has no other
 %% successor than `H' it already is one. Otherwise insert a fresh block on the
 %% Pre->H edge and redirect the header's phi arguments coming from `Pre'.
@@ -597,19 +639,22 @@ invariant_arg(_, _) ->
 %%%   * a phi whose incoming values are all integers (respectively all
 %%%     non-negative integers) -- a join of a case or an if;
 %%%   * `{bif,Op}' with Op in ?INT_BIFS (?NAT_BIFS) and all operands
-%%%     integers (non-negative integers).
-%%%
+%%%     integers (non-negative integers). An operand is classified at that
+%%%     instruction by `operand_kind/4', which prefers the `arg_types' type
+%%%     annotation of the instruction and falls back to this fixed point.%%%
 %%% Nothing else is accepted, and a variable defined outside the loop by an
 %%% instruction this analysis cannot classify is simply "unknown" -- which
-%%% only loses the rewrite.
+%%% only loses the rewrite. The *type* annotations described above cover
+%%% exactly that gap, but only at the instruction that uses the value.
 %%%
 %%% TRAP: a function argument, a message lifted out of the mailbox or any
-%%% other value with no definition in the function is unknown, even though it
-%%% is very often an integer at run time. The pass runs before the SSA type
-%%% analysis, so nothing here can prove it; guessing would turn `X * 8' into
-%%% `X bsl 3' and break the float and non-number cases.
-
-strength_reduce(H, Body, Blocks0) ->
+%%% other value with no definition in the function is unknown to this
+%%% structural analysis. It must NOT be guessed to be an integer because it
+%%% often is one at run time: doing so would turn `X * 8' into `X bsl 3' and
+%%% break the float and non-number cases. The type annotation of the
+%%% instruction that uses the value is the only admissible source for such a
+%%% value, and it is consulted directly at that instruction.
+strength_reduce(H, Body, Region, Blocks0) ->
     BodySet = ordsets:from_list(Body),
     Defs = defs_map(Blocks0),
     %% The induction variables are recognised using only the facts that hold
@@ -621,8 +666,7 @@ strength_reduce(H, Body, Blocks0) ->
     Kinds = value_kinds(Defs, Ivs),
     lists:foldl(fun(L, B) ->
                         reduce_block(L, Kinds, B)
-                end, Blocks0, Body).
-
+                end, Blocks0, Region).
 %% The definition of every variable of the function, used to classify the
 %% operands of the instructions inside the loop.
 defs_map(Blocks) ->
@@ -664,8 +708,13 @@ def_kind(V, Defs, Ivs, Kinds) ->
 
 def_kind_1(#b_set{op=phi, args=Args}, Kinds) ->
     join_kinds([value_kind(V, Kinds) || {V, _L} <- Args]);
-def_kind_1(#b_set{op={bif,Op}, args=Args}, Kinds) ->
-    Ks = [value_kind(A, Kinds) || A <- Args],
+def_kind_1(#b_set{op={bif,Op}, args=Args}=Def, Kinds) ->
+    %% The operands are classified at their use, so the type annotations on
+    %% this defining instruction count as well. That is what makes a value
+    %% computed from a function argument or from a value extracted out of a
+    %% term -- neither of which has a defining instruction of its own -- a
+    %% proven integer.
+    Ks = operand_kinds(Def, Args, 0, Kinds),
     case lists:member(Op, ?NAT_BIFS) andalso all_nat(Ks) of
         true -> nat;
         false ->
@@ -676,7 +725,6 @@ def_kind_1(#b_set{op={bif,Op}, args=Args}, Kinds) ->
     end;
 def_kind_1(_Def, _Kinds) ->
     unknown.
-
 %% The fact for a canonical induction variable: an integer entry value and
 %% integer steps make it an integer, and a non-negative entry value with
 %% non-negative steps makes it non-negative. A decreasing induction variable
@@ -698,6 +746,49 @@ value_kind(#b_var{}=V, Kinds) ->
 value_kind(_Value, _Kinds) ->
     unknown.
 
+%% The fact an SSA type annotation proves, if any.
+%%
+%% Only an integer type proves integrality: `any', a float, a number (which
+%% may be a float), a union with a non-integer member, a tuple, ... prove
+%% nothing and yield `unknown'. A range whose lower bound is a non-integer
+%% (`'-inf'') or a negative number proves integrality but not
+%% non-negativity, so it yields `int'.
+kind_of_type(#t_integer{elements=any}) ->
+    int;
+kind_of_type(#t_integer{elements={Lo, _}}) when is_integer(Lo), Lo >= 0 ->
+    nat;
+kind_of_type(#t_integer{}) ->
+    int;
+kind_of_type(_Type) ->
+    unknown.
+
+%% The kind of the operand at the 0-based `Index' of instruction `I'.
+%%
+%% The type annotation on `I' is authoritative: it is the type the SSA type
+%% analysis proved for that operand *at this instruction*. It is consulted
+%% first, and the structural fixed point (`value_kinds/2') is the fallback
+%% for operands the analysis left unannotated, and for the synthetic SSA the
+%% whitebox tests drive the pass with.
+%%
+%% A variable's type must not be taken from an annotation on a *different*
+%% instruction: the type analysis refines a variable along the edges it
+%% flows down, so it can be an integer at one use and a float at another.
+operand_kind(#b_set{anno=Anno}, Index, Arg, Kinds) ->
+    case Anno of
+        #{arg_types := #{Index := Type}} ->
+            case kind_of_type(Type) of
+                unknown -> value_kind(Arg, Kinds);
+                Kind -> Kind
+            end;
+        #{} ->
+            value_kind(Arg, Kinds)
+    end.
+
+%% The kinds of all operands of `I', in order.
+operand_kinds(#b_set{}=I, [Arg | Args], Index, Kinds) ->
+    [operand_kind(I, Index, Arg, Kinds) | operand_kinds(I, Args, Index + 1, Kinds)];
+operand_kinds(_I, [], _Index, _Kinds) ->
+    [].
 all_int([]) -> false;
 all_int(Ks) -> lists:all(fun(K) -> K =:= int orelse K =:= nat end, Ks).
 
@@ -824,33 +915,48 @@ reduce_block(L, Kinds, Blocks0) ->
 %% not depend on the operand order) and fail on exactly the same non-number
 %% operands, so no value and no exception changes. This is what lets the step
 %% `1 + V' be recognised as the same iteration step as `V + 1'.
-reduce_instr(#b_set{op={bif,Op}, args=[#b_literal{}=A, #b_var{}=B]}=I, Kinds)
+reduce_instr(#b_set{op={bif,Op}, args=[#b_literal{}=A, #b_var{}=B], anno=Anno}=I,
+             Kinds)
   when Op =:= '+'; Op =:= '*' ->
-    reduce_instr(I#b_set{args=[B, A]}, Kinds);
+    reduce_instr(I#b_set{args=[B, A], anno=swap_arg_types(Anno)}, Kinds);
 reduce_instr(#b_set{op={bif,'*'}, args=[A, B]}=I, Kinds) ->
-    case strength_mul(A, B, Kinds) of
+    case strength_mul(A, B, I, Kinds) of
         no -> I;
         {Op, Args} -> I#b_set{op={bif,Op}, args=Args}
     end;
 reduce_instr(#b_set{op={bif,'div'}, args=[A, B]}=I, Kinds) ->
-    case strength_div(A, B, Kinds) of
+    case strength_div(A, B, I, Kinds) of
         no -> I;
         {Op, Args} -> I#b_set{op={bif,Op}, args=Args}
     end;
 reduce_instr(I, _Kinds) ->
     I.
 
-strength_mul(#b_literal{val=K}, X, Kinds) when is_integer(K) ->
-    strength_mul_1(K, X, Kinds);
-strength_mul(X, #b_literal{val=K}, Kinds) when is_integer(K) ->
-    strength_mul_1(K, X, Kinds);
-strength_mul(_A, _B, _Kinds) ->
+%% `arg_types' is indexed by operand position, so canonicalising `C Op V' into
+%% `V Op C' has to move the annotation of the variable with it. Only variable
+%% operands are ever annotated (`beam_ssa_type:opt_anno_types/2' skips every
+%% other operand), so only the entry of the variable operand can be present.
+swap_arg_types(#{arg_types := AT}=Anno) ->
+    case AT of
+        #{0 := T0, 1 := T1} -> Anno#{arg_types => #{0 => T1, 1 => T0}};
+        #{1 := T1} -> Anno#{arg_types => #{0 => T1}};
+        #{0 := T0} -> Anno#{arg_types => #{1 => T0}};
+        _ -> Anno
+    end;
+swap_arg_types(Anno) ->
+    Anno.
+
+strength_mul(#b_literal{val=K}, X, I, Kinds) when is_integer(K) ->
+    strength_mul_1(K, X, operand_kind(I, 1, X, Kinds));
+strength_mul(X, #b_literal{val=K}, I, Kinds) when is_integer(K) ->
+    strength_mul_1(K, X, operand_kind(I, 0, X, Kinds));
+strength_mul(_A, _B, _I, _Kinds) ->
     no.
 
-strength_mul_1(K, X, Kinds) when K > 1 ->
+strength_mul_1(K, X, Kind) when K > 1 ->
     case power_of_two(K) of
         {ok, N} ->
-            case value_kind(X, Kinds) of
+            case Kind of
                 nat ->
                     {'bsl', [X, #b_literal{val=N}]};
                 int ->
@@ -866,15 +972,15 @@ strength_mul_1(K, X, Kinds) when K > 1 ->
         no ->
             no
     end;
-strength_mul_1(_K, _X, _Kinds) ->
+strength_mul_1(_K, _X, _Kind) ->
     %% A literal factor of 0 or 1 is not a shift and `X * 0'/'X * 1' still
     %% raise for a non-number, so those are left alone.
     no.
 
-strength_div(X, #b_literal{val=K}, Kinds) when is_integer(K), K > 1 ->
+strength_div(X, #b_literal{val=K}, I, Kinds) when is_integer(K), K > 1 ->
     case power_of_two(K) of
         {ok, N} ->
-            case value_kind(X, Kinds) of
+            case operand_kind(I, 0, X, Kinds) of
                 nat ->
                     %% `div' truncates toward zero, `bsr' floors; they agree
                     %% exactly for a non-negative dividend, and K >= 2 means
@@ -886,12 +992,11 @@ strength_div(X, #b_literal{val=K}, Kinds) when is_integer(K), K > 1 ->
         no ->
             no
     end;
-strength_div(_X, _Y, _Kinds) ->
+strength_div(_X, _Y, _I, _Kinds) ->
     %% A divisor that is not a literal power of two >= 2 is left alone: a
     %% divisor of 0 must keep raising, 1 is not a shift, and the rest has no
     %% exact shift form.
     no.
-
 %% {ok, N} when K =:= 1 bsl N and K > 0.
 power_of_two(K) when K > 0, K band (K - 1) =:= 0 ->
     {ok, pow2_shift(K, 0)};

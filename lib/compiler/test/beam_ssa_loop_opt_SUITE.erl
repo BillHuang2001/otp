@@ -22,36 +22,45 @@
 -module(beam_ssa_loop_opt_SUITE).
 -include_lib("common_test/include/ct.hrl").
 -include("beam_ssa.hrl").
+-include("beam_types.hrl").
 -import_record(beam_ssa_opt, [opt_st]).
 -export([all/0, suite/0]).
 -export([init_per_suite/1, end_per_suite/1]).
 -export([strength_reduction/1, induction_variable_canonicalisation/1,
          strength_reduction_declines/1, strength_reduction_equivalence/1,
          loop_opt_preserves_result/1, kill_switches/1,
-         off_by_default/1, non_trivial_loops_unchanged/1]).
+         off_by_default/1, non_trivial_loops_unchanged/1,
+         type_driven_ssa/1, type_driven_probe/1,
+         type_driven_equivalence/1, type_driven_kill_switches/1]).
 
 suite() -> [{ct_hooks,[ts_install_cth]}, {timetrap,{minutes,5}}].
 all() -> [strength_reduction, induction_variable_canonicalisation,
           strength_reduction_declines, strength_reduction_equivalence,
           loop_opt_preserves_result, kill_switches,
-          off_by_default, non_trivial_loops_unchanged].
+          off_by_default, non_trivial_loops_unchanged,
+          type_driven_ssa, type_driven_probe,
+          type_driven_equivalence, type_driven_kill_switches].
 init_per_suite(Config) -> Config.
 end_per_suite(_Config) -> ok.
 
 %%=========================================================================
 %% Synthetic-SSA tests.
 %%
-%% The pass runs in the prologue phase, i.e. before the SSA type analysis,
-%% and at that point the CFG of a real Erlang function contains no
-%% optimizable loop (a self-recursive function is still a tail *call*, not a
-%% CFG cycle, and the cycle that a `receive' does create has no canonical
-%% induction variable). The rewrites are therefore driven directly on
-%% hand-built linear SSA: `beam_ssa_loop_opt:opt/1' is called with the same
-%% `#opt_st{}' the pipeline uses, and the result is inspected as a
-%% `dssaopt' listing would show it. The *input* block list is what the same
-%% function looks like without `loop_opt' (where the pass is not run at
-%% all), so "with the pass" is the output and "without the pass" is the
-%% input.
+%% The pass runs last in the repeated (fixpoint) phase, i.e. after the SSA
+%% type analysis. At that point the CFG of a real tail-recursive function
+%% still contains no optimizable loop (self-recursion is a tail *call*, not a
+%% CFG cycle) and a `receive' loop's header carries no phi, so the loop and
+%% induction-variable rewrites are driven here directly on hand-built linear
+%% SSA: `beam_ssa_loop_opt:opt/1' is called with the same `#opt_st{}' the
+%% pipeline uses, and the result is inspected as a `dssaopt' listing would
+%% show it. The *input* block list is what the same function looks like
+%% without `loop_opt' (where the pass is not run at all), so "with the pass"
+%% is the output and "without the pass" is the input.
+%%
+%% The type-driven part of the strength reducer -- the facts taken from the
+%% `arg_types' annotation -- is exercised here too, by annotating the
+%% synthetic instructions, and end-to-end on a real module in the
+%% `type_driven_*' tests below.
 %%=========================================================================
 
 strength_reduction(_Config) ->
@@ -228,23 +237,168 @@ non_trivial_loops_unchanged(Config) ->
         Other -> ct:fail({raising_mismatch, Other})
     end.
 
+%%=========================================================================
+%% Type-driven strength reduction, on hand-built SSA.
+%%
+%% `x' has no defining instruction (it stands for a function argument or a
+%% value extracted out of a term), so the structural analysis cannot classify
+%% it; only the `arg_types' annotation of the instruction that uses it can.
+%%=========================================================================
+
+type_driven_ssa(_Config) ->
+    NonNeg = #t_integer{elements={0,'+inf'}},
+    AnyInt = #t_integer{},
+    Negative = #t_integer{elements={'-inf',10}},
+    Number = #t_number{elements={0,'+inf'}},
+
+    %% A non-negative integer annotation licences both rules.
+    {_, OutNN} = run_pass(ann_loop(NonNeg, NonNeg)),
+    #b_set{op={bif,'bsl'}, args=[#b_var{name=x}, #b_literal{val=3}]} =
+        instr(OutNN, m),
+    #b_set{op={bif,'bsr'}, args=[#b_var{name=x}, #b_literal{val=2}]} =
+        instr(OutNN, d),
+
+    %% A plain integer annotation licences `*' -> `bsl' but not `div' ->
+    %% `bsr', which needs non-negativity.
+    {_, OutInt} = run_pass(ann_loop(AnyInt, AnyInt)),
+    {bif,'bsl'} = op(OutInt, m),
+    {bif,'div'} = op(OutInt, d),
+
+    %% A range that reaches below zero proves integrality only.
+    {_, OutNeg} = run_pass(ann_loop(Negative, Negative)),
+    {bif,'bsl'} = op(OutNeg, m),
+    {bif,'div'} = op(OutNeg, d),
+
+    %% `number' covers floats, so it proves nothing; neither does a union
+    %% with a non-integer member, nor a float.
+    {_, OutNum} = run_pass(ann_loop(Number, Number)),
+    {bif,'*'} = op(OutNum, m),
+    {bif,'div'} = op(OutNum, d),
+    {_, OutUni} = run_pass(ann_loop(#t_union{number=AnyInt}, #t_union{})),
+    {bif,'*'} = op(OutUni, m),
+    {bif,'div'} = op(OutUni, d),
+    {_, OutFlt} = run_pass(ann_loop(#t_float{}, #t_float{})),
+    {bif,'*'} = op(OutFlt, m),
+    {bif,'div'} = op(OutFlt, d),
+
+    %% Without an annotation the operand stays unknown, so nothing is
+    %% rewritten: the annotation, not the loop, is what licences the rewrite.
+    {_, OutNone} = run_pass(ann_loop(no_anno, no_anno)),
+    {bif,'*'} = op(OutNone, m),
+    {bif,'div'} = op(OutNone, d),
+
+    %% A literal factor is never enough on its own: `x * 2' falls back to
+    %% `x + x' (exact for a float too), and a bigger power of two is left
+    %% alone.
+    {_, OutUnknown} = run_pass(ann_mul2_loop()),
+    #b_set{op={bif,'+'}, args=[#b_var{name=x}, #b_var{name=x}]} =
+        instr(OutUnknown, m2),
+    {bif,'*'} = op(OutUnknown, m8),
+
+    %% The annotation of a *defining* instruction is used as well: `y = x + 1'
+    %% is a non-negative integer because `x' is annotated as one, and that
+    %% makes `y * 8' reducible even though the product itself carries no
+    %% annotation.
+    {_, OutDer} = run_pass(ann_derived_loop(NonNeg)),
+    #b_set{op={bif,'bsl'}, args=[#b_var{name=y}, #b_literal{val=3}]} =
+        instr(OutDer, ym),
+    {_, OutDerNo} = run_pass(ann_derived_loop(no_anno)),
+    {bif,'*'} = op(OutDerNo, ym),
+
+    %% Canonicalising `8 * x' into `x * 8' must move the annotation of the
+    %% variable operand with it, otherwise the reduction loses its proof.
+    {_, OutLhs} = run_pass(ann_lhs_mul_loop(NonNeg)),
+    #b_set{op={bif,'bsl'}, args=[#b_var{name=x}, #b_literal{val=3}]} =
+        instr(OutLhs, m),
+    {_, OutLhsNo} = run_pass(ann_lhs_mul_loop(no_anno)),
+    {bif,'*'} = op(OutLhsNo, m),
+    ok.
+
+%%=========================================================================
+%% The same, end to end on a real module.
+%%
+%% A `receive' loop is the only real CFG loop at this pipeline point, and a
+%% guarded `receive' clause is exactly the shape in which the type analysis
+%% proves an operand integral: this is the case the pass used to miss.
+%%=========================================================================
+
+type_driven_probe(Config) ->
+    Src = receive_probe_src(),
+    Plain = rcv_bifs(disasm(Config, lp_rcv_plain, Src, [])),
+    Opt = rcv_bifs(disasm(Config, lp_rcv_opt, Src, [loop_opt])),
+    %% Without the option, `X * 8' and `X div 4' are `*' and `div'.
+    [{'*', [8]}, {div, [4]}, {'+', []}] = Plain,
+    %% With it, they are reduced in place to `bsl 3' and `bsr 2'. Nothing is
+    %% added or removed: only the operation and the literal changes.
+    [{'bsl', [3]}, {bsr, [2]}, {'+', []}] = Opt,
+    %% The kill switches turn the reduction off again.
+    NoLoop = rcv_bifs(disasm(Config, lp_rcv_noloop, Src,
+                             [loop_opt, no_ssa_opt_loop_opt])),
+    NoSsa = rcv_bifs(disasm(Config, lp_rcv_nossa, Src,
+                            [loop_opt, no_ssa_opt])),
+    [{'*', [8]}, {div, [4]}, {'+', []}] = NoLoop,
+    [{'*', [8]}, {div, [4]}, {'+', []}] = NoSsa,
+    ok.
+
+%%=========================================================================
+%% Functional equivalence of the type-driven reduction: the module is
+%% compiled with and without `loop_opt' and both are run over a sweep of
+%% values, comparing results *and* exceptions.
+%%=========================================================================
+
+type_driven_equivalence(Config) ->
+    Src = receive_probe_src2(),
+    Plain = load(Config, eq_plain, Src, []),
+    Opt = load(Config, eq_opt, Src, [loop_opt]),
+    Vals = [-1000001, -1000, -9, -3, -2, -1, 0, 1, 2, 3, 7, 8, 9, 255, 256,
+            1000000, 123456789012345678901234567890, 1 bsl 200,
+            2.5, -2.5, 0.0, 1.0e300, foo, [a, b], <<1, 2:3>>, {}],
+    Tags = [n, i, d, m],
+    lists:foreach(
+      fun(Tag) ->
+              lists:foreach(
+                fun(V) ->
+                        Msg = {Tag, V},
+                        A = call(Plain, Msg),
+                        B = call(Opt, Msg),
+                        case A =:= B of
+                            true -> ok;
+                            false -> ct:fail({result_mismatch, Msg, A, B})
+                        end
+                end, Vals)
+      end, Tags),
+    %% `{m, _}' takes an unguarded operand, so `X * 2' is rewritten to
+    %% `X + X' there and the sweep above covers a float and two non-numbers
+    %% raising `badarith'.
+    ok.
+%% `loop_opt', `loop_opt,no_ssa_opt_loop_opt' and `loop_opt,no_ssa_opt' must
+%% agree -- both on the results and on the generated code.
+type_driven_kill_switches(Config) ->
+    Src = receive_probe_src2(),
+    Plain = run_sweep(load(Config, ks_plain, Src, [])),
+    Opt = run_sweep(load(Config, ks_opt, Src, [loop_opt])),
+    NoLoop = run_sweep(load(Config, ks_noloop, Src, [loop_opt, no_ssa_opt_loop_opt])),
+    NoSsa = run_sweep(load(Config, ks_nossa, Src, [loop_opt, no_ssa_opt])),
+    case {Plain, Opt, NoLoop, NoSsa} of
+        {R, R, R, R} -> ok;
+        Other -> ct:fail({kill_switch_mismatch, Other})
+    end.
+
+run_sweep(Mod) ->
+    [{Tag, V, call(Mod, {Tag, V})}
+     || Tag <- [n, i, d, m],
+        V <- [-9, -1, 0, 1, 8, 2.5, foo]].
+
+call(Mod, Msg) ->
+    try {ok, Mod:one(Msg)} catch C:R -> {C, R} end.
 run(Config, Name, Src, Opts) ->
     Mod = load(Config, Name, Src, Opts),
     Mod:sample().
 
 %% Compile `Src' with `Opts', load the resulting module and return its name.
 load(Config, Name, Src, Opts) ->
-    Priv = ?config(priv_dir, Config),
-    Dir = filename:join(Priv, atom_to_list(Name)),
-    ok = filelib:ensure_dir(filename:join(Dir, "x")),
-    File = filename:join(Dir, atom_to_list(Name) ++ ".erl"),
-    ok = file:write_file(File, Src),
-    Res = compile:file(File, [binary, return_errors, return_warnings | Opts]),
-    {Mod, Bin} = case Res of
-                     {ok, M0, B0} -> {M0, B0};
-                     {ok, M0, B0, _Ws} -> {M0, B0};
-                     _ -> ct:fail({compile_failed, Name, Res})
-                 end,
+    File = src_filename(Config, Name),
+    {Mod, Bin} = compile_bin(Config, Name, Src, Opts),
     {module, Mod} = code:load_binary(Mod, File, Bin),
     Mod.
 
@@ -402,3 +556,154 @@ noncanon_loop() ->
                        set(np2, {bif,'+'}, [var(n), lit(1)])],
                 last=bri(2)}},
      {4, #b_blk{is=[], last=#b_ret{arg=var(m)}}}].
+
+%%=========================================================================
+%% Type-annotated SSA builders.
+%%
+%% `no_anno' means "no `arg_types' annotation at all", i.e. what an operand
+%% whose type the analysis could not narrow looks like. Otherwise the value
+%% is the type recorded for operand 0 of that instruction.
+%%=========================================================================
+
+%% x is a value with no defining instruction; m = x * 8 and d = x div 4.
+ann_loop(MulType, DivType) ->
+    [{1, #b_blk{is=[], last=bri(2)}},
+     {2, #b_blk{is=[set_anno(m, {bif,'*'}, [var(x), lit(8)], anno0(MulType)),
+                        set_anno(d, {bif,'div'}, [var(x), lit(4)],
+                                 anno0(DivType))],
+                last=#b_br{bool=var(c), succ=3, fail=4}}},
+     {3, #b_blk{is=[], last=bri(2)}},
+     {4, #b_blk{is=[], last=#b_ret{arg=var(m)}}}].
+
+%% m2 = x * 2 and m8 = x * 8, with `x' untyped.
+ann_mul2_loop() ->
+    [{1, #b_blk{is=[], last=bri(2)}},
+     {2, #b_blk{is=[set(m2, {bif,'*'}, [var(x), lit(2)]),
+                        set(m8, {bif,'*'}, [var(x), lit(8)])],
+                last=#b_br{bool=var(c), succ=3, fail=4}}},
+     {3, #b_blk{is=[], last=bri(2)}},
+     {4, #b_blk{is=[], last=#b_ret{arg=var(m8)}}}].
+
+%% y = x + 1, and then ym = y * 8 with no annotation of its own: only the
+%% annotation of the `+' that defines `y' can prove it.
+ann_derived_loop(XType) ->
+    [{1, #b_blk{is=[], last=bri(2)}},
+     {2, #b_blk{is=[set_anno(y, {bif,'+'}, [var(x), lit(1)], anno0(XType)),
+                        set(ym, {bif,'*'}, [var(y), lit(8)])],
+                last=#b_br{bool=var(c), succ=3, fail=4}}},
+     {3, #b_blk{is=[], last=bri(2)}},
+     {4, #b_blk{is=[], last=#b_ret{arg=var(ym)}}}].
+
+%% m = 8 * x, i.e. the literal on the left, with the annotation of the
+%% variable operand at index 1.
+ann_lhs_mul_loop(XType) ->
+    [{1, #b_blk{is=[], last=bri(2)}},
+     {2, #b_blk{is=[set_anno(m, {bif,'*'}, [lit(8), var(x)], anno1(XType))],
+                last=#b_br{bool=var(c), succ=3, fail=4}}},
+     {3, #b_blk{is=[], last=bri(2)}},
+     {4, #b_blk{is=[], last=#b_ret{arg=var(m)}}}].
+
+set_anno(V, Op, Args, Anno) -> (set(V, Op, Args))#b_set{anno=Anno}.
+
+anno0(no_anno) -> #{};
+anno0(Type) -> #{arg_types => #{0 => Type}}.
+
+anno1(no_anno) -> #{};
+anno1(Type) -> #{arg_types => #{1 => Type}}.
+
+%%=========================================================================
+%% Real-module probes.
+%%=========================================================================
+
+%% The `receive' loop of the objective: a guarded clause over a value that
+%% the type analysis can prove a non-negative integer.
+receive_probe_src(Mod) ->
+    io_lib:format(
+      "-module(~s).\n-export([rcv/1]).\n"
+      "rcv(T) ->\n"
+      "    receive\n"
+      "        {n, X} when is_integer(X), X >= 0 -> X * 8 + X div 4;\n"
+      "        stop -> 0\n"
+      "    after T -> -1\n"
+      "    end.\n", [Mod]).
+
+%% The same loop, with one clause per reduction rule (including the
+%% unguarded `X * 2' -> `X + X' fallback), driven one message at a time so
+%% that the test can sweep values through it. `flush/0' keeps the mailbox
+%% clean whether or not the message matched.
+drive_probe_src(Mod) ->
+    io_lib:format(
+      "-module(~s).\n-export([one/1]).\n"
+      "one(Msg) ->\n"
+      "    flush(),\n"
+      "    self() ! Msg,\n"
+      "    R = loop(),\n"
+      "    flush(),\n"
+      "    R.\n"
+      "loop() ->\n"
+      "    receive\n"
+      "        {n, X} when is_integer(X), X >= 0 -> X * 8 + X div 4;\n"
+      "        {i, X} when is_integer(X) -> X * 16;\n"
+      "        {d, X} when is_integer(X), X >= 0 -> X div 8;\n"
+      "        {m, X} -> X * 2;\n"
+      "        stop -> 0\n"
+      "    after 0 -> -1\n"
+      "    end.\n"
+      "flush() ->\n"
+      "    receive _ -> flush()\n"
+      "    after 0 -> ok\n"
+      "    end.\n", [Mod]).
+
+%%=========================================================================
+%% Compiling, disassembling and running a probe under a set of options.
+%%=========================================================================
+
+%% Compile `Src' for `Name' and return the disassembled code chunks.
+disasm(Config, Name, Src, Opts) ->
+    {_Mod, Bin} = compile_bin(Config, Name, Src, Opts),
+    Beam = beam_filename(Config, Name),
+    ok = file:write_file(Beam, Bin),
+    case beam_disasm:file(Beam) of
+        {beam_file, _M, _Es, _As, _CI, Code} -> Code;
+        Other -> ct:fail({disasm_failed, Name, Other})
+    end.
+
+%% The `{Operation, [LiteralOperands]}' pairs of every arithmetic BIF of the
+%% `Name/Arity' function, in code order.
+fn_bifs(Code, Name, Arity) ->
+    case [Is || {function,N,A,_,Is} <- Code, N =:= Name, A =:= Arity] of
+        [Is] -> lists:filtermap(fun bif_op/1, Is);
+        [] -> ct:fail({no_such_function, Name, Arity})
+    end.
+
+bif_op({gc_bif,Op,_,_,Args,_}) -> {true, {Op, lits(Args)}};
+bif_op({bif,Op,_,Args,_}) -> {true, {Op, lits(Args)}};
+bif_op(_) -> false.
+
+lits(Args) -> [V || {integer,V} <- Args].
+
+%% Write `Src' next to the other test artifacts and compile it.
+compile_bin(Config, Name, Src, Opts) ->
+    File = source_filename(Config, Name, Src),
+    Res = compile:file(File, [binary, return_errors, return_warnings | Opts]),
+    case Res of
+        {ok, Mod, Bin} -> {Mod, Bin};
+        {ok, Mod, Bin, _Ws} -> {Mod, Bin};
+        _ -> ct:fail({compile_failed, Name, Res})
+    end.
+
+source_filename(Config, Name, Src) ->
+    File = src_filename(Config, Name),
+    ok = file:write_file(File, Src),
+    File.
+
+src_filename(Config, Name) ->
+    Priv = ?config(priv_dir, Config),
+    Dir = filename:join(Priv, atom_to_list(Name)),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    filename:join(Dir, atom_to_list(Name) ++ ".erl").
+
+beam_filename(Config, Name) ->
+    Priv = ?config(priv_dir, Config),
+    Dir = filename:join(Priv, atom_to_list(Name)),
+    filename:join(Dir, atom_to_list(Name) ++ ".beam").
