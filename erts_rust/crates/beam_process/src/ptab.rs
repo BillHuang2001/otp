@@ -47,7 +47,7 @@ use beam_term::prelude::{atom_val, is_atom, make_atom, Atom, Eterm};
 
 use crate::error;
 use crate::monitor::{
-    payload_is_down_for, Monitor, MonitorKind, MonitorRef, MonitoredBy, RefAllocator,
+    payload_is_down_for, Monitor, MonitorKind, MonitorRef, MonitoredBy, PortWatch, RefAllocator,
 };
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::port::PortTable;
@@ -744,6 +744,11 @@ impl ProcessTable {
     /// (or one whose process has died) yields the immediate
     /// `{'DOWN', Ref, process, {Name, node}, noproc}` and records nothing.
     ///
+    /// A [`MonitorKind::Port`] is rejected with the typed [`error::named_port_monitor`]: this
+    /// registry resolves names to processes, so a **named port** monitor
+    /// (`erlang:monitor(port, Name)`) has no faithful resolution here (see
+    /// [`ProcessTable::monitor_port_term`] for the port-term form).
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::TermNotFound` when the watcher is unknown; propagates the message
@@ -757,6 +762,13 @@ impl ProcessTable {
     ) -> Result<MonitorRef> {
         if !self.contains(watcher) {
             return Err(error::unknown_process());
+        }
+        if kind == MonitorKind::Port {
+            // `erlang:monitor(port, Name)`: this registry resolves names to **processes**, so a
+            // named port monitor has no faithful resolution here. Recording the process the
+            // name resolves to would be a wrong (process) monitor; the typed diagnostic is the
+            // honest answer.
+            return Err(error::named_port_monitor());
         }
         let reference = self.refs.next();
         // `whereis` already resolves "registered but its process is gone" to `None`.
@@ -781,6 +793,125 @@ impl ProcessTable {
         self.named_monitors
             .insert(reference, NamedTarget { name, node });
         Ok(reference)
+    }
+
+    // --- port monitors -------------------------------------------------------
+
+    /// Installs a **port** monitor from `watcher` on `port` and returns its reference
+    /// (`erlang:monitor(port, Port)`).
+    ///
+    /// Both halves are recorded: the watcher keeps the outgoing [`PortWatch`] — so
+    /// [`ProcessTable::demonitor_port`] and `erlang:process_info(P, monitors)` can see it —
+    /// and the port keeps the incoming [`PortMonitor`](crate::port::PortMonitor), so
+    /// [`ProcessTable::port_closed`] resolves the pair with
+    /// `{'DOWN', Ref, port, Port, Reason}`.
+    ///
+    /// A `port` that is **not** currently allocated is *not* an error: like
+    /// [`ProcessTable::monitor`] on a dead pid, the monitor is born down and the watcher
+    /// immediately receives `{'DOWN', Ref, port, Port, noproc}`, while no entry is recorded on
+    /// either side (so a later [`ProcessTable::demonitor_port`] reports `false`). This is the
+    /// oracle's behaviour (`erlang:monitor(port, ClosedPort)` answers a reference and fires a
+    /// `noproc` DOWN).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when the **watcher** is unknown; propagates the
+    /// message builder's `BeamError::Alloc` when the immediate DOWN does not fit the watcher's
+    /// heap.
+    pub fn monitor_port(
+        &mut self,
+        watcher: ProcessId,
+        port: PortId,
+        ports: &mut PortTable,
+    ) -> Result<MonitorRef> {
+        if !self.contains(watcher) {
+            return Err(error::unknown_process());
+        }
+        let reference = self.refs.next();
+        if !ports.contains(port) {
+            // Nothing to watch: the port is already gone. Tell the watcher right away and
+            // record nothing, exactly as the pid path does for a dead pid.
+            let reason = self.atoms.noproc_term();
+            self.enqueue_port_down_message(watcher, reference, port, reason)?;
+            return Ok(reference);
+        }
+        ports.monitor(port, watcher, reference)?;
+        if let Some(process) = self.get_mut(watcher) {
+            process
+                .port_monitors_mut()
+                .push(PortWatch { reference, port });
+        }
+        Ok(reference)
+    }
+
+    /// `erlang:monitor(port, Target)` against a term: the typed port-monitor entry point.
+    ///
+    /// `Target` must be a live-or-closed **port** term; a registered **name** is rejected with
+    /// the typed [`error::named_port_monitor`] (the local registry holds processes only), so
+    /// this never records a process monitor for a port-typed request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `target` is not a port — the oracle's `badarg` for
+    /// `erlang:monitor(port, NotAPort)`; otherwise propagates [`ProcessTable::monitor_port`].
+    pub fn monitor_port_term(
+        &mut self,
+        watcher: ProcessId,
+        target: Eterm,
+        ports: &mut PortTable,
+    ) -> Result<MonitorRef> {
+        if is_atom(target) {
+            return Err(error::named_port_monitor());
+        }
+        let port = PortId::from_eterm(target)?;
+        self.monitor_port(watcher, port, ports)
+    }
+
+    /// Removes the **port** monitor `watcher` holds under `reference`, reporting whether it
+    /// existed.
+    ///
+    /// This is the port counterpart of [`ProcessTable::demonitor`], which has no handle on a
+    /// [`PortTable`]. The `erlang:demonitor/1` BIF layer must therefore try this **first** and
+    /// fall back to [`ProcessTable::demonitor`] (then to
+    /// [`ProcessTable::demonitor_flush`] for the `[flush]` option) when it reports `false`:
+    ///
+    /// ```text
+    /// if !table.demonitor_port(watcher, reference, ports)? {
+    ///     table.demonitor(watcher, reference)?;
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when the **watcher** is unknown. A port that has
+    /// already closed is **not** an error: [`ProcessTable::port_closed`] has already resolved
+    /// and dropped the monitor, so this reports `false` (like `demonitor` of a monitor that is
+    /// already gone).
+    pub fn demonitor_port(
+        &mut self,
+        watcher: ProcessId,
+        reference: MonitorRef,
+        ports: &mut PortTable,
+    ) -> Result<bool> {
+        if !self.contains(watcher) {
+            return Err(error::unknown_process());
+        }
+        let watch = self.get_mut(watcher).and_then(|process| {
+            let entries = process.port_monitors_mut();
+            let index = entries
+                .iter()
+                .position(|watch| watch.reference == reference)?;
+            Some(entries.remove(index))
+        });
+        let Some(watch) = watch else {
+            return Ok(false);
+        };
+        // The incoming half lives on the port; a port that closed earlier has already drained
+        // it, so an unallocated id here is expected rather than an error.
+        if ports.contains(watch.port) {
+            ports.demonitor(watch.port, reference)?;
+        }
+        Ok(true)
     }
 
     /// Removes the outgoing monitor `watcher` holds under `reference`, reporting whether it
@@ -1431,25 +1562,46 @@ impl ProcessTable {
         }
     }
 
-    /// `erlang:monitor/2` against an arbitrary pid **or name** term: a local pid monitors through
-    /// [`ProcessTable::monitor`], an external pid is recorded as an outgoing remote monitor and
-    /// routed as a `DOP_MONITOR_P` control signal, and an **atom** is a registered name resolved
-    /// through [`ProcessTable::monitor_named`] on the local node.
+    /// `erlang:monitor/2` against an arbitrary pid, port **or name** term: a local pid monitors
+    /// through [`ProcessTable::monitor`], an external pid is recorded as an outgoing remote
+    /// monitor and routed as a `DOP_MONITOR_P` control signal, and an **atom** is a registered
+    /// name resolved through [`ProcessTable::monitor_named`] on the local node.
+    ///
+    /// A **port** target cannot be monitored here: a port monitor's incoming half lives in a
+    /// [`PortTable`], which this entry point has no handle on. The faithful entry points are
+    /// [`ProcessTable::monitor_port`]/[`ProcessTable::monitor_port_term`], so a port target with
+    /// [`MonitorKind::Port`] is a typed [`error::unsupported`] rather than a wrong result (and,
+    /// as the oracle requires, a port target with [`MonitorKind::Process`] is `badarg`).
     ///
     /// # Errors
     ///
-    /// Returns [`beam_common::BeamError::BadArg`] when `target` is not a pid or an atom; the typed
-    /// [`error::unsupported`] when `target` is an atom but no local node has been installed
-    /// ([`ProcessTable::set_local_node`]); for a local `target`, propagates
-    /// [`ProcessTable::monitor`]'s `BeamError::TermNotFound`; for a remote `target`,
-    /// `BeamError::TermNotFound` when `watcher` is unknown; and the router's transport errors.
+    /// Returns [`beam_common::BeamError::BadArg`] when `target` is not a pid, port or atom, and
+    /// for a port target with [`MonitorKind::Process`]; the typed [`error::unsupported`] when
+    /// `target` is an atom but no local node has been installed
+    /// ([`ProcessTable::set_local_node`]), when the atom names a **port** monitor
+    /// ([`error::named_port_monitor`]), or for a port target with [`MonitorKind::Port`]; for a
+    /// local `target`, propagates [`ProcessTable::monitor`]'s `BeamError::TermNotFound`; for a
+    /// remote `target`, `BeamError::TermNotFound` when `watcher` is unknown; and the router's
+    /// transport errors.
     pub fn monitor_term(
         &mut self,
         watcher: ProcessId,
         target: Eterm,
         kind: MonitorKind,
     ) -> Result<MonitorRef> {
+        if PortId::is_port(target) {
+            return match kind {
+                MonitorKind::Port => Err(error::unsupported(
+                    "monitor/2: port target requires the port table (use monitor_port)",
+                )),
+                // `erlang:monitor(process, Port)` is `badarg` in the oracle.
+                MonitorKind::Process => Err(error::bad_pid()),
+            };
+        }
         if is_atom(target) {
+            if kind == MonitorKind::Port {
+                return Err(error::named_port_monitor());
+            }
             // `monitor(process, Name)` names a locally-registered process; the `{Name, LocalNode}`
             // target needs the node's atom, which only the runtime can install. Guessing one would
             // be a wrong result, so its absence is a typed diagnostic.
@@ -1765,6 +1917,10 @@ impl ProcessTable {
     /// [`PortTable::close`]) and an `{'EXIT', Port, Reason}` signal to every process linked
     /// to it.
     ///
+    /// A monitoring watcher's outgoing [`PortWatch`] is removed here too — the port's death
+    /// resolves the monitor on both sides, exactly as [`ProcessTable::terminate`] resolves a
+    /// process monitor — so `erlang:process_info(Watcher, monitors)` stops listing it.
+    ///
     /// A linked process follows [`exit_policy`]: a trapping peer receives the `{'EXIT', …}`
     /// message, a non-trapping one terminates with `reason` (cascading through its own links
     /// and monitors), and a `normal` reason is ignored. A peer that already died is skipped.
@@ -1777,8 +1933,14 @@ impl ProcessTable {
     pub fn port_closed(&mut self, ports: &mut PortTable, port: PortId, reason: Eterm) -> Result<()> {
         let closed = ports.close(port)?;
 
-        // 1. Monitors: every watcher is told the port is down.
+        // 1. Monitors: the port's death resolves the incoming half here (drained by `close`)
+        //    and the watcher's outgoing half below; then the watcher is told the port is down.
         for monitor in closed.monitors {
+            if let Some(watcher) = self.get_mut(monitor.watcher) {
+                watcher
+                    .port_monitors_mut()
+                    .retain(|watch| watch.reference != monitor.reference);
+            }
             self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, reason)?;
         }
 
