@@ -521,8 +521,11 @@ still reproduces today's collector exactly.
   drive the SAME corpus through `AnyCollector::Copying` and `AnyCollector::Immix` behind the public API:
   identical collection-kind sequences, an intact relocated live graph, and — in `immix_parity.rs` over the
   full corpus (maps/funs/refc binaries) — one canonical structural walker that must agree for both.
-  `tests/immix_partial_block.rs` proves per-object reclamation and pinning (a `kept`-pinned object keeps
-  its address and a reference to it is left verbatim, not a spurious exhaustion). `tests/immix_measure.rs`
+  `tests/gen_immix_collector.rs` additionally drives a **multi-block object** (larger than one Immix block)
+  through `PromoteDest::reserve` and its pinning across a major (lone; mixed with small objects + garbage;
+  major-first; two runs of different length). `tests/immix_partial_block.rs` proves per-object reclamation
+  and pinning (a `kept`-pinned object keeps its address and a reference to it is left verbatim, not a
+  spurious exhaustion). `tests/immix_measure.rs`
   is the measured gate (table in Design Decisions §Measured). `from_config(&GcConfig::default())` must
   select the Copying path.
 - **`tests/immix_break_even.rs` — the re-measured break-even sweep.** A purely long-lived corpus at
