@@ -1198,6 +1198,7 @@ mod tests {
     use super::*;
     use beam_alloc::Heap;
     use beam_common::BeamError;
+    use beam_ets::TableOptions;
     use beam_process::ProcessId;
     use beam_term::NIL;
 
