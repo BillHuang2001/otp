@@ -600,7 +600,7 @@ impl Battery {
 
     /// The compiled spec is what the caller needs; this is the shared
     /// compile-and-run step of the simple select cases.
-    fn select(&mut self, table: &Table, spec_term: Eterm) -> Vec<Eterm> {
+    pub(super) fn select(&mut self, table: &Table, spec_term: Eterm) -> Vec<Eterm> {
         let spec = compile(spec_term, &self.atoms).expect("the spec compiles");
         table
             .select(&spec, &self.atoms, &mut self.out)

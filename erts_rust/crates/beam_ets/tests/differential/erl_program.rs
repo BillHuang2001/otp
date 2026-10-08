@@ -102,6 +102,40 @@ battery() ->
     emit("ordered_float_key_order", ordered_float_key_order()),
     emit("ordered_replaced_key_term", ordered_replaced_key_term()),
 
+    %% The multi-object + ordered discrimination group (`battery/multikind.rs`).
+    emit("set_insert_new_key_exists", insert_new_key_exists(set)),
+    emit("ordered_set_insert_new_key_exists", insert_new_key_exists(ordered_set)),
+    emit("bag_insert_new_key_exists", insert_new_key_exists(bag)),
+    emit("duplicate_bag_insert_new_key_exists", insert_new_key_exists(duplicate_bag)),
+    emit("bag_duplicate_object_multiplicity", duplicate_object_multiplicity(bag)),
+    emit("duplicate_bag_duplicate_object_multiplicity", duplicate_object_multiplicity(duplicate_bag)),
+    emit("bag_delete_object_all_occurrences", delete_object_all_occurrences(bag)),
+    emit("duplicate_bag_delete_object_all_occurrences", delete_object_all_occurrences(duplicate_bag)),
+    emit("bag_size_counts_objects", size_counts_objects(bag)),
+    emit("duplicate_bag_size_counts_objects", size_counts_objects(duplicate_bag)),
+    emit("bag_take_and_delete_key", take_and_delete_key(bag)),
+    emit("duplicate_bag_take_and_delete_key", take_and_delete_key(duplicate_bag)),
+    emit("bag_update_counter_badarg", update_counter_badarg(bag)),
+    emit("duplicate_bag_update_counter_badarg", update_counter_badarg(duplicate_bag)),
+    emit("bag_update_element_badarg", update_element_badarg(bag)),
+    emit("duplicate_bag_update_element_badarg", update_element_badarg(duplicate_bag)),
+    emit("duplicate_bag_select_replace", duplicate_bag_select_replace()),
+    emit("duplicate_bag_select_replace_identity", duplicate_bag_select_replace_identity()),
+    emit("multi_lookup_element_or", multi_lookup_element_or()),
+    emit("multi_lookup_element", multi_lookup_element()),
+    emit("bag_match_delete", multi_match_delete(bag)),
+    emit("bag_select_delete", multi_select_delete(bag)),
+    emit("bag_keypos2", multi_kind_keypos2(bag)),
+    emit("duplicate_bag_match_delete", multi_match_delete(duplicate_bag)),
+    emit("duplicate_bag_select_delete", multi_select_delete(duplicate_bag)),
+    emit("duplicate_bag_keypos2", multi_kind_keypos2(duplicate_bag)),
+    emit("duplicate_bag_select_replace_changed_key", duplicate_bag_select_replace_changed_key()),
+    emit("ordered_set_delete_object_exact_eq", ordered_set_delete_object_exact_eq()),
+    emit("ordered_set_keypos2", ordered_set_keypos2()),
+    emit("ordered_set_update_element", ordered_set_update_element()),
+    emit("ordered_set_update_counter_default", ordered_set_update_counter_default()),
+    emit("hash_nav_absent", hash_nav_absent()),
+    emit("hash_key_walk", hash_key_walk()),
     emit("update_counter_3_variants", update_counter_3_variants()),
     emit("update_counter_3_absent", update_counter_3_absent()),
     emit("update_counter_3_threshold", update_counter_3_threshold()),
@@ -360,6 +394,198 @@ walk_prev_idx(_T, '$end_of_table', _In, Acc) -> lists:reverse(Acc);
 walk_prev_idx(T, K, In, Acc) ->
     {K, Idx} = lists:keyfind(K, 1, In),
     walk_prev_idx(T, ets:prev(T, K), In, [Idx | Acc]).
+
+%% ------------------- multi-object + ordered discrimination -------------------
+%% (the Rust counterpart is `battery/multikind.rs`)
+
+%% `insert_new/2` refuses whenever the KEY exists — for every kind, including
+%% `duplicate_bag`, and even for an object identical to a stored one.
+insert_new_key_exists(Kind) ->
+    T = new(Kind),
+    B1 = ets:insert_new(T, {1, 10}),
+    B2 = ets:insert_new(T, {1, 20}),
+    B3 = ets:insert_new(T, {1, 10}),
+    B4 = ets:insert_new(T, {2, 20}),
+    t([r(B1), r(B2), r(B3), r(B4), r(tsize(T)),
+       srt(ets:lookup(T, 1)), srt(ets:lookup(T, 2))]).
+
+%% A `bag` keeps distinct objects (an exact duplicate is a no-op); a
+%% `duplicate_bag` keeps every insert. The multiplicity shows through size,
+%% lookup, select/match_object bodies, the match result count and select_count.
+duplicate_object_multiplicity(Kind) ->
+    T = new(Kind),
+    ets:insert(T, {1, 10}), ets:insert(T, {1, 10}), ets:insert(T, {1, 20}),
+    t([r(tsize(T)), srt(ets:lookup(T, 1)),
+       srt(ets:select(T, [{{'_', '_'}, [], ['$_']}])),
+       srt(ets:match_object(T, {'_', '_'})),
+       r(length(ets:match(T, {'$1', '$2'}))),
+       r(ets:select_count(T, [{{'_', '_'}, [], [true]}]))]).
+
+%% `delete_object/2` removes EVERY stored object equal to it.
+delete_object_all_occurrences(Kind) ->
+    T = new(Kind),
+    ets:insert(T, {1, 10}), ets:insert(T, {1, 10}), ets:insert(T, {1, 20}),
+    ets:delete_object(T, {1, 10}),
+    t([r(tsize(T)), srt(ets:lookup(T, 1)), srt(ets:tab2list(T))]).
+
+%% `size` counts OBJECTS, not keys (three objects under key 1, two under key 2).
+size_counts_objects(Kind) ->
+    T = new(Kind),
+    [ets:insert(T, {1, V}) || V <- [10, 20, 30]],
+    [ets:insert(T, {2, V}) || V <- [40, 50]],
+    t([r(tsize(T)), r(length(ets:tab2list(T))),
+       r(length(ets:select(T, [{{'_', '_'}, [], ['$_']}]))),
+       r(ets:select_count(T, [{{'_', '_'}, [], [true]}]))]).
+
+%% `take/2` removes the whole key; a following `delete/2` empties the table.
+take_and_delete_key(Kind) ->
+    T = new(Kind),
+    [ets:insert(T, {1, V}) || V <- [10, 20, 30]],
+    ets:insert(T, {2, 40}),
+    Taken = ets:take(T, 1),
+    S1 = r(tsize(T)),
+    ets:delete(T, 2),
+    t([srt(Taken), S1, r(tsize(T)), r(ets:member(T, 1)), r(ets:member(T, 2))]).
+
+%% `update_counter/3,4` is `badarg` on the multi kinds (only set/ordered_set have
+%% counters), with and without a default object.
+update_counter_badarg(Kind) ->
+    T = new(Kind),
+    ets:insert(T, {1, 10}),
+    t([cap(fun() -> ets:update_counter(T, 1, 1) end),
+       cap(fun() -> ets:update_counter(T, 1, 1, {1, 0}) end)]).
+
+%% `update_element/3` is `badarg` on the multi kinds and writes nothing.
+update_element_badarg(Kind) ->
+    T = new(Kind),
+    ets:insert(T, {1, 10, 20}),
+    t([cap(fun() -> ets:update_element(T, 1, {3, 99}) end), srt(ets:lookup(T, 1))]).
+
+%% `select_replace/2` works on a `duplicate_bag` (only `bag` is refused).
+duplicate_bag_select_replace() ->
+    T = new(duplicate_bag),
+    ets:insert(T, {1, 10}), ets:insert(T, {1, 20}),
+    S = [{{'$1', '$2'}, [], [{{'$1', {'*', '$2', 2}}}]}],
+    C = cap(fun() -> ets:select_replace(T, S) end),
+    t([C, srt(ets:tab2list(T))]).
+
+%% The identity `'$_'` body counts both copies as replaced and keeps the dup.
+duplicate_bag_select_replace_identity() ->
+    T = new(duplicate_bag),
+    ets:insert(T, {1, 10}), ets:insert(T, {1, 10}),
+    C = cap(fun() -> ets:select_replace(T, [{{'_', '_'}, [], ['$_']}]) end),
+    t([C, srt(ets:tab2list(T))]).
+
+%% `lookup_element/4` on a multi kind: a present key yields the element LIST, an
+%% absent key the default, and a too-short object is `badarg`.
+multi_lookup_element_or() ->
+    T = new(bag),
+    ets:insert(T, {1, 10, 100}), ets:insert(T, {1, 20, 200}),
+    t([r(ets:lookup_element(T, 1, 2, dflt)),
+       r(ets:lookup_element(T, 99, 2, dflt)),
+       cap(fun() -> ets:lookup_element(T, 1, 4, dflt) end)]).
+
+%% `ordered_set` `delete_object/2` uses the exact `=:=` object identity: an
+%% inserted `{1, a}` survives a `delete_object/{1.0, a}`.
+ordered_set_delete_object_exact_eq() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, a}),
+    ets:delete_object(T, {1.0, a}),
+    D1 = r(tsize(T)),
+    ets:delete_object(T, {1, a}),
+    t([D1, r(tsize(T))]).
+
+%% A `{keypos, 2}` `ordered_set` orders and navigates by the second element.
+ordered_set_keypos2() ->
+    T = new(ordered_set, 2),
+    ets:insert(T, {a, 3}), ets:insert(T, {b, 1}), ets:insert(T, {c, 2}),
+    t([r(tsize(T)),
+       inorder([element(1, O) || O <- ets:tab2list(T)]),
+       r(ets:first(T)), r(ets:last(T)),
+       inorder([element(1, O) || O <- ets:lookup(T, 2)])]).
+
+%% `ordered_set` `update_counter/3` and `update_element/3` both work.
+ordered_set_update_element() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10, 20}),
+    V = ets:update_counter(T, 1, 5),
+    U = ets:update_element(T, 1, {3, 99}),
+    t([r(V), r(U), inorder(ets:lookup(T, 1))]).
+
+%% `ordered_set` `update_counter/4` deposits the default object for an absent key.
+ordered_set_update_counter_default() ->
+    T = new(ordered_set),
+    V = ets:update_counter(T, 1, 5, {1, 0}),
+    t([r(V), inorder(ets:lookup(T, 1))]).
+
+%% Hash-kind navigation: the empty-table first/last are '$end_of_table' and an
+%% absent anchor is `badarg` (unlike an `ordered_set`'s range bound).
+hash_nav_absent() ->
+    l([begin
+           T = new(Kind),
+           E1 = r(ets:first(T)), E2 = r(ets:last(T)),
+           NF = cap(fun() -> ets:next(T, 5) end),
+           PF = cap(fun() -> ets:prev(T, 5) end),
+           ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+           NA = cap(fun() -> ets:next(T, 99) end),
+           PA = cap(fun() -> ets:prev(T, 99) end),
+           t([E1, E2, NF, PF, NA, PA])
+       end || Kind <- [set, bag, duplicate_bag]]).
+
+%% A hash-kind first+next walk visits each key once (order not contract → sorted).
+hash_key_walk() ->
+    l([begin
+           T = new(Kind),
+           ets:insert(T, {1, 10}), ets:insert(T, {1, 20}), ets:insert(T, {2, 20}),
+           Keys = walk_next(T, ets:first(T), []),
+           t([srt(Keys), r(length(Keys))])
+       end || Kind <- [set, bag, duplicate_bag]]).
+
+%% `lookup_element/3` on a multi kind: a present key yields the element LIST,
+%% while an absent key (no default) and a too-short object are both `badarg`.
+multi_lookup_element() ->
+    T = new(bag),
+    ets:insert(T, {1, 10}), ets:insert(T, {1, 20}), ets:insert(T, {2, 5}),
+    t([srt(ets:lookup_element(T, 1, 2)),
+       cap(fun() -> ets:lookup_element(T, 99, 2) end),
+       cap(fun() -> ets:lookup_element(T, 2, 3) end)]).
+
+%% `match_delete/2` on a multi kind removes EVERY matching object — a
+%% duplicate_bag loses both copies in one call — and answers `true`.
+multi_match_delete(Kind) ->
+    T = new(Kind),
+    ets:insert(T, {1, 10}), ets:insert(T, {1, 10}), ets:insert(T, {1, 20}),
+    ets:insert(T, {2, 30}),
+    Before = tsize(T),
+    C = cap(fun() -> ets:match_delete(T, {1, '_'}) end),
+    t([C, r(Before), r(tsize(T)), srt(ets:tab2list(T))]).
+
+%% `select_delete/2` on a multi kind reports the number of OBJECTS removed, so a
+%% duplicate_bag's duplicate copies each count.
+multi_select_delete(Kind) ->
+    T = new(Kind),
+    ets:insert(T, {1, 10}), ets:insert(T, {1, 10}), ets:insert(T, {1, 20}),
+    ets:insert(T, {2, 30}),
+    C = cap(fun() -> ets:select_delete(T, [{{1, '_'}, [], [true]}]) end),
+    t([C, srt(ets:tab2list(T)), r(tsize(T))]).
+
+%% A duplicate_bag select_replace whose body changes the key is `badarg` and
+%% leaves the table unchanged.
+duplicate_bag_select_replace_changed_key() ->
+    T = new(duplicate_bag),
+    ets:insert(T, {1, 10}), ets:insert(T, {1, 20}),
+    C = cap(fun() -> ets:select_replace(T, [{{'$1', '$2'}, [], [{{2, '$2'}}]}]) end),
+    t([C, srt(ets:tab2list(T))]).
+
+%% A {keypos, 2} multi kind indexes by the second element: a bag still rejects
+%% an identical object, a duplicate_bag keeps it.
+multi_kind_keypos2(Kind) ->
+    T = new(Kind, 2),
+    ets:insert(T, {a, 1}), ets:insert(T, {b, 1}), ets:insert(T, {c, 2}),
+    S0 = tsize(T),
+    ets:insert(T, {a, 1}),
+    t([r(S0), srt(ets:lookup(T, 1)), srt(ets:lookup(T, 2)),
+       r(ets:member(T, 1)), r(tsize(T))]).
 %% ------------------------------ update_counter ------------------------------
 
 update_counter_3_variants() ->

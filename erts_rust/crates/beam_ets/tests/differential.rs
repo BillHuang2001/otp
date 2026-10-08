@@ -269,7 +269,84 @@ const EXPECTED: &[(&str, &str)] = &[
         "ordered_replaced_key_term",
         "{{1,true,true,$end_of_table},{1,false,false,$end_of_table},{2,true,false,2}}",
     ),
-    ("update_counter_3_variants", "{15,12,25,[13,26],[{1,13,26}]}"),
+    (
+        "set_insert_new_key_exists",
+        "{true,false,false,true,2,[{1,10}],[{2,20}]}",
+    ),
+    (
+        "ordered_set_insert_new_key_exists",
+        "{true,false,false,true,2,[{1,10}],[{2,20}]}",
+    ),
+    (
+        "bag_insert_new_key_exists",
+        "{true,false,false,true,2,[{1,10}],[{2,20}]}",
+    ),
+    (
+        "duplicate_bag_insert_new_key_exists",
+        "{true,false,false,true,2,[{1,10}],[{2,20}]}",
+    ),
+    (
+        "bag_duplicate_object_multiplicity",
+        "{2,[{1,10},{1,20}],[{1,10},{1,20}],[{1,10},{1,20}],2,2}",
+    ),
+    (
+        "duplicate_bag_duplicate_object_multiplicity",
+        "{3,[{1,10},{1,10},{1,20}],[{1,10},{1,10},{1,20}],[{1,10},{1,10},{1,20}],3,3}",
+    ),
+    (
+        "bag_delete_object_all_occurrences",
+        "{1,[{1,20}],[{1,20}]}",
+    ),
+    (
+        "duplicate_bag_delete_object_all_occurrences",
+        "{1,[{1,20}],[{1,20}]}",
+    ),
+    ("bag_size_counts_objects", "{5,5,5,5}"),
+    ("duplicate_bag_size_counts_objects", "{5,5,5,5}"),
+    (
+        "bag_take_and_delete_key",
+        "{[{1,10},{1,20},{1,30}],1,0,false,false}",
+    ),
+    (
+        "duplicate_bag_take_and_delete_key",
+        "{[{1,10},{1,20},{1,30}],1,0,false,false}",
+    ),
+    ("bag_update_counter_badarg", "{badarg,badarg}"),
+    ("duplicate_bag_update_counter_badarg", "{badarg,badarg}"),
+    ("bag_update_element_badarg", "{badarg,[{1,10,20}]}"),
+    ("duplicate_bag_update_element_badarg", "{badarg,[{1,10,20}]}"),
+    (
+        "duplicate_bag_select_replace",
+        "{ok:2,[{1,20},{1,40}]}",
+    ),
+    (
+        "duplicate_bag_select_replace_identity",
+        "{ok:2,[{1,10},{1,10}]}",
+    ),
+    ("multi_lookup_element_or", "{[10,20],dflt,badarg}"),
+    ("multi_lookup_element", "{[10,20],badarg,badarg}"),
+    ("bag_match_delete", "{ok:true,3,1,[{2,30}]}"),
+    ("bag_select_delete", "{ok:2,[{2,30}],1}"),
+    ("bag_keypos2", "{3,[{a,1},{b,1}],[{c,2}],true,3}"),
+    ("duplicate_bag_match_delete", "{ok:true,4,1,[{2,30}]}"),
+    ("duplicate_bag_select_delete", "{ok:3,[{2,30}],1}"),
+    (
+        "duplicate_bag_keypos2",
+        "{3,[{a,1},{a,1},{b,1}],[{c,2}],true,4}",
+    ),
+    (
+        "duplicate_bag_select_replace_changed_key",
+        "{badarg,[{1,10},{1,20}]}",
+    ),
+    ("ordered_set_delete_object_exact_eq", "{1,0}"),
+    ("ordered_set_keypos2", "{3,[b,c,a],1,3,[c]}"),
+    ("ordered_set_update_element", "{15,true,[{1,15,99}]}"),
+    ("ordered_set_update_counter_default", "{5,[{1,5}]}"),
+    (
+        "hash_nav_absent",
+        "[{$end_of_table,$end_of_table,badarg,badarg,badarg,badarg},{$end_of_table,$end_of_table,badarg,badarg,badarg,badarg},{$end_of_table,$end_of_table,badarg,badarg,badarg,badarg}]",
+    ),
+    ("hash_key_walk", "[{[1,2],2},{[1,2],2},{[1,2],2}]"),    ("update_counter_3_variants", "{15,12,25,[13,26],[{1,13,26}]}"),
     ("update_counter_3_absent", "{badarg,badarg,0}"),
     ("update_counter_3_threshold", "[ok:100,ok:100]"),
     (
