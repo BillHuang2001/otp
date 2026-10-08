@@ -122,6 +122,10 @@ pub(crate) struct AsyncCompletion {
     /// handed to the driver's `ready_async`, which owns it from there.
     discharged: bool,
     /// Keeps the driver's loaded object mapped until the release has run (see [`KeepAlive`]).
+    ///
+    /// Never read: it is purely a hold-down, dropped with the completion — after [`AsyncCompletion::release`]
+    /// has run its `async_free` inside the still-mapped code.
+    #[allow(dead_code)]
     keepalive: Option<KeepAlive>,
 }
 

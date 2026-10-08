@@ -28,6 +28,11 @@
  *     so a host can observe the *order* in which the driver's callbacks ran; when absent no
  *     file is ever touched (the pre-existing tests are unaffected);
  *   * `upper`     — a mode token: `output` upper-cases the bytes it echoes back.
+ *   * `hdl`       — a mode token: every callback that runs while it is set additionally appends
+ *     `handle=<%p>` (the `ErlDrvPort` the driver stashed at `start`), so a host can assert the
+ *     handle is the *same value* the whole port's life;
+ *   * `hdr=<n>`   — the async data a `driver_async` verb hands over (`0`, the default, is this
+ *     port's own state pointer; `1` is `NULL`, the "no async data" case).
  *
  * Anything else is ignored. The parsed state is stored in the per-port `host_state`.
  *
@@ -36,7 +41,9 @@
  * When `log=<path>` is given, `start`, `output` and `stop` each append one line (`"start"`,
  * `"output"`, `"stop"`) to that file, in the order they ran. That is the observable evidence
  * a port created from the process-global driver table really ran the driver's `start`/`stop`
- * callbacks, in order, around its data path.
+ * callbacks, in order, around its data path. `ready_async` and `async_free` append
+ * `"ready_async"`/`"async_free"` through the same path, so the async completion's arm is
+ * observable too.
  *
  * ## The control vocabulary (integer commands, `port_control/3`)
  *
@@ -64,6 +71,23 @@
  *      (the same release verbs 7 and 4/9/10/11 pair with); return the host's code.
  *  13  answer a fixed reply (`"host-reply"`) by pointing `*rbuf` at the driver's own static
  *      buffer; return the byte count.
+ *  14  `driver_async(port, NULL, host_async_invoke, data, host_async_free)` — the same job as verb
+ *      6 but with an `async_free`; with `ready_async` present the completion goes there (the free
+ *      never runs), and on a build whose entry leaves `ready_async` `NULL` the host must run the
+ *      `async_free` instead; return the host's code.
+ *  15  `driver_async(port, NULL, NULL, data, host_async_free)` — the **fire-and-forget** form: the
+ *      `invoke` callback is `NULL`, so no `ready_async` can ever run and the host must release the
+ *      data through the `async_free` right away; return the host's code.
+ *  16  `driver_async(port, NULL, host_async_slow_invoke, data, host_async_free)` — the same as 14
+ *      with an invoke that sleeps ~500 ms, so a host can drop the port **while the job runs**;
+ *      return the host's code.
+ *  17  `driver_select(port, fd, ERL_DRV_READ | ERL_DRV_USE, 1)` followed by
+ *      `driver_select(port, fd, ERL_DRV_READ, 1)` — a re-selection that omits `ERL_DRV_USE`, which
+ *      must **not** clear the release obligation the first select took on; return the second
+ *      host's code.
+ *  18  `driver_select(port, fd, ERL_DRV_READ | ERL_DRV_USE, 1)` followed by
+ *      `driver_select(port, fd, ERL_DRV_READ | ERL_DRV_USE_NO_CALLBACK, 1)` — a re-selection that
+ *      **declines** the callback, which must clear the obligation; return the second host's code.
  *
  * Any other command returns `-1`, the C's negative `cres` (`port_control/3` answers `badarg`,
  * `io.c:4074`).
@@ -71,13 +95,25 @@
  * A fired timer (`timeout`) and readable input (`ready_input`) are each turned into
  * `driver_output` traffic so a hosted port can observe them.
  *
- * ## `stop_select`
+ * ## `stop_select` and `async_free`
  *
  * The driver implements `stop_select`, the `ERL_DRV_USE` release callback, as `host_stop_select`.
  * Its signature (`void(ErlDrvEvent, void*)`) carries neither `ErlDrvData` nor the port, so it
  * cannot reach the per-port `log=` path from its arguments; the fixture keeps the most recently
  * started port's path in the file-scope `g_stop_select_log` instead, and appends `"stop_select"`
  * to it. A test therefore drives one port at a time.
+ *
+ * `host_async_free(void *data)` *is* handed the `driver_async` `async_data` (this port's state),
+ * so it logs through that state's own path. It therefore requires the port's `stop` **not** to
+ * have run — the release tests drop the port instead of closing it (a closed port has freed the
+ * state, and the release still has to be delivered).
+ *
+ * ## The two builds
+ *
+ * `host_driver.c` builds an entry whose `ready_async` is `host_ready_async`, so this file must
+ * define `HOST_DRIVER_READY_ASYNC_SLOT` before its entry if it is included by a variant (see
+ * `host_driver_no_ready_async.c`, the `NULL`-slot build the host's `async_free` arm is exercised
+ * with).
  */
 #include <erl_driver.h>
 
@@ -86,7 +122,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+/* The entry's `ready_async` slot: `host_ready_async` normally, `NULL` in the variant build
+ * (`host_driver_no_ready_async.c`) that exists to exercise the host's other async arm. */
+#ifndef HOST_DRIVER_READY_ASYNC_SLOT
+#define HOST_DRIVER_READY_ASYNC_SLOT host_ready_async
+#endif
 
 /* Private per-port state, allocated in `start` and freed in `stop`. */
 typedef struct {
@@ -94,6 +137,8 @@ typedef struct {
     int fd;            /* the descriptor `driver_select` is armed on, or -1 when none given */
     int timeouts;      /* how many times `timeout` fired */
     int reads;         /* how many times `ready_input` fired */
+    int log_handle;    /* the `hdl` token: log the stashed `ErlDrvPort` from every callback */
+    int async_null;    /* the `hdr=1` token: hand the async verbs a NULL async_data */
     char mode[16];     /* the mode token from the command string ("" when none) */
     char log[512];     /* path every callback appends an event line to ("" when none) */
 } host_state;
@@ -114,6 +159,20 @@ static void log_event(const host_state *st, const char *what) {
     fclose(f);
 }
 
+/* Append `handle=<%p>` for the handle the driver stashed at `start`, when the `hdl` token asked
+ * for it. A host asserts every such line carries the same value, the pointer-identity half of the
+ * "the `ErlDrvPort` a driver sees never moves" contract (the other half being that the runtime
+ * still accepts that pointer later, which the data paths prove). */
+static void log_handle(const host_state *st) {
+    FILE *f;
+    if (st == NULL || st->log[0] == '\0' || !st->log_handle)
+        return;
+    f = fopen(st->log, "a");
+    if (f == NULL)
+        return;
+    fprintf(f, "handle=%p\n", (void *) st->port);
+    fclose(f);
+}
 /* Copy at most `cap` bytes of `src` into `dst`, NUL-terminating: a tiny, dependency-free `strncpy`. */
 static void copy_token(char *dst, size_t cap, const char *src, size_t n) {
     size_t i;
@@ -124,13 +183,15 @@ static void copy_token(char *dst, size_t cap, const char *src, size_t n) {
     dst[i] = '\0';
 }
 
-/* Parse `fd=<n>`, `log=<path>` and a bare mode token out of the whitespace/comma separated
- * command string. */
+/* Parse `fd=<n>`, `log=<path>`, `hdr=<0|1>`, and the `hdl`/bare mode tokens out of the
+ * whitespace/comma separated command string. */
 static void parse_command(host_state *st, const char *command) {
     const char *p = command;
     st->fd = -1;
     st->mode[0] = '\0';
     st->log[0] = '\0';
+    st->log_handle = 0;
+    st->async_null = 0;
     if (p == NULL)
         return;
     while (*p != '\0') {
@@ -146,12 +207,16 @@ static void parse_command(host_state *st, const char *command) {
             while (s[n] != '\0' && s[n] != ' ' && s[n] != '\t' && s[n] != ',')
                 n++;
             copy_token(st->log, sizeof(st->log), s, n);
+        } else if (strncmp(p, "hdr=", 4) == 0) {
+            st->async_null = strtol(p + 4, NULL, 10) != 0;
         } else {
             const char *s = p;
             size_t n = 0;
             while (s[n] != '\0' && s[n] != ' ' && s[n] != '\t' && s[n] != ',')
                 n++;
             copy_token(st->mode, sizeof(st->mode), s, n);
+            if (strcmp(st->mode, "hdl") == 0)
+                st->log_handle = 1;
         }
         while (*p != '\0' && *p != ' ' && *p != '\t' && *p != ',')
             p++;
@@ -180,6 +245,7 @@ static ErlDrvData host_start(ErlDrvPort port, char *command) {
     /* Publish this port's log path for `stop_select`, which receives no `ErlDrvData`. */
     copy_token(g_stop_select_log, sizeof(g_stop_select_log), st->log, strlen(st->log));
     log_event(st, "start");
+    log_handle(st);
     return (ErlDrvData) st;
 }
 
@@ -216,6 +282,7 @@ static void host_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     if (st == NULL)
         return;
     log_event(st, "output");
+    log_handle(st);
     if (strcmp(st->mode, "upper") == 0 && buf != NULL) {
         ErlDrvSizeT i;
         for (i = 0; i < len; i++)
@@ -270,6 +337,49 @@ static void host_async_invoke(void *data) {
         (void) driver_output(st->port, "A", 1);
 }
 
+/* A slow async job (runs on a worker thread): it sleeps so a host can drop the port while the job
+ * is in flight, then emits its marker. It touches neither the port handle nor the driver state
+ * after the sleep — a job that outlives its port must not call `driver_*` (the port's context is
+ * gone; see the crate's driver-ABI note) and its `async_free` is what releases it. */
+static void host_async_slow_invoke(void *data) {
+    struct timespec ts;
+    host_state *st = (host_state *) data;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 500 * 1000 * 1000;
+    nanosleep(&ts, NULL);
+    if (st != NULL)
+        (void) driver_output(st->port, "S", 1);
+}
+
+/* The completion callback: the host runs it when the entry has a `ready_async` (the fixture's
+ * default build does). The `drv_data` the host stored at `start` must be the same pointer the job
+ * was handed as `thread_data`, so the port handle stashed behind either is the same value — the
+ * `h=same` marker, which is what the `ErlDrvPort`-stability test asserts. */
+static void host_ready_async(ErlDrvData drv_data, ErlDrvThreadData thread_data) {
+    host_state *st = (host_state *) drv_data;
+    host_state *tr = (host_state *) thread_data;
+    if (st == NULL)
+        return;
+    log_event(st, (tr != NULL && tr->port == st->port) ? "ready_async h=same" : "ready_async h=diff");
+    (void) driver_output(st->port, "H", 1);
+}
+
+/* The driver's `async_free`: releases `async_data` (this port's state) when no `ready_async` will
+ * run for the job — the port-gone path and the no-`ready_async` entry. It logs through the async
+ * data's own path, which is why the tests that observe it drop the port instead of closing it (a
+ * closed port has already freed the state, and the release still has to be delivered). */
+static void host_async_free(void *data) {
+    host_state *st = (host_state *) data;
+    if (st == NULL)
+        return;
+    log_event(st, "async_free");
+}
+
+/* The async data a verb hands over: `hdr=1` makes it `NULL` (no per-port state to log through),
+ * so those tests observe the release through `g_stop_select_log` instead. */
+static void *async_data(const host_state *st) {
+    return st->async_null ? NULL : (void *) st;
+}
 /* The driver "ioctl" behind `port_control/3` (see the command vocabulary in the file header). */
 static ErlDrvSSizeT host_control(ErlDrvData drv_data, unsigned int command,
                                  char *buf, ErlDrvSizeT len,

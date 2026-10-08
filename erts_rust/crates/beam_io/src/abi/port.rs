@@ -134,7 +134,6 @@
 //! callback slot of a foreign object and reads the driver's reply buffer. Each `unsafe` block
 //! carries a `// SAFETY:` rationale.
 
-use std::any::Any;
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
