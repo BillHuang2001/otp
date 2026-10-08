@@ -29,12 +29,14 @@ use crate::store::TermStore;
 mod access;
 mod element;
 mod interior;
+mod lifecycle;
 mod ownership;
 mod read;
 mod shared;
 mod update;
 
 pub use access::TableAccess;
+pub use lifecycle::OwnerDeath;
 pub use ownership::{Heir, SetOpt};
 pub use shared::SharedTable;
 pub(crate) use interior::Interior;
