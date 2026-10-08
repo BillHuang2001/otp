@@ -528,16 +528,16 @@ still reproduces today's collector exactly.
   spurious exhaustion). `tests/immix_measure.rs`
   is the measured gate (table in Design Decisions §Measured). `from_config(&GcConfig::default())` must
   select the Copying path.
-- **`tests/immix_break_even.rs` — the re-measured break-even sweep.** A purely long-lived corpus at
-  `[4, 8, 16, 32, 128, 512, 1024]` objects (0.25 → 64 whole Immix blocks) in two shapes (`Line` =
-  one line per object; `Small` = 3-word objects, the line-rounding worst case), forced through a fullsweep
-  under both strategies, reporting moved objects/words, pinned objects, reclaimed words, resident footprint
-  and pause (fastest of 9, in ns). Its *only* assertions are per-repetition count reproducibility
-  (`count_signature` equal across the 9 reps) and cross-strategy graph equality (`assert_same_graph`); the
-  moved/pinned/footprint magnitudes and the pause are printed only, never pinned to expected values — the
-  break-even is a human reading of the printed table, not enforced by an assertion. (Contrast
-  `tests/immix_measure.rs`/`tests/immix_workloads.rs`, which DO assert exact counts.) Two `#[test]`s (one per
-  shape), serialized by a `static SERIAL: Mutex<()>`; the table is in Design Decisions §The automatic rule.
+- **`tests/immix_break_even.rs` — the assertion-backed break-even sweep.** A purely long-lived corpus at
+  `[4, 8, 16, 32, 128, 512, 1024]` objects (0.25 → 64 whole Immix blocks) in three shapes (`Line` /
+  `Small` = 3-word objects / `Multi` = 17-word tuples spanning 2 lines), forced through a fullsweep under
+  both strategies. A `Law` predicts from corpus geometry exactly which live objects are pinned vs
+  evacuated and is asserted at every point: below one whole block the mark-region path pins nothing and
+  moves strictly more words than copying (line rounding); from one block up it pins the whole live set
+  (`moved_words == 0`) while copying pays the full set. `the_break_even_point_is_assertion_checked` pins
+  the constant's whole-block and full-pinning-at-8-blocks part (and NOT one line below). The *value* 8-vs-1
+  is timing-derived (the deterministic axes are flat across 1..64 blocks) and pause is printed only, never
+  asserted. Shared `static SERIAL: Mutex<()>`.
 - **`tests/mature_selection.rs` — the rule, its override, and cross-threshold correctness.**
   (1) `select_mature` selects `Copying` below `IMMIX_BREAK_EVEN_WORDS` and `Immix` at/above it, and
   `AnyCollector::from_config` follows the rule for a real collector (`GcConfig::default()` → Copying);
