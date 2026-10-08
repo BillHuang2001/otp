@@ -46,6 +46,7 @@ use beam_message::{Message, MsoHandle, OffHeapTable};
 use beam_term::prelude::{atom_val, is_atom, is_immediate, make_atom, Atom, Eterm};
 
 use crate::error;
+use crate::exit_observer::{ProcessExit, ProcessExitObserver};
 use crate::monitor::{
     payload_is_down_for, Monitor, MonitorKind, MonitorRef, MonitoredBy, PortWatch, RefAllocator,
 };
@@ -275,6 +276,10 @@ pub struct ProcessTable {
     /// local relationship is still tracked, only the wire signal is dropped (a node with no
     /// distribution configured).
     router: Option<Box<dyn DistSignalRouter>>,
+    /// The process-death observer seam (see [`ProcessExitObserver`]); `None` means no observer is
+    /// installed and termination behaves exactly as before the seam existed. Invoked **exactly
+    /// once per death** by [`ProcessTable::terminate_into`], before the dying heap is released.
+    exit_observer: Option<Box<dyn ProcessExitObserver>>,
 }
 
 impl ProcessTable {
@@ -293,6 +298,7 @@ impl ProcessTable {
             tags: HashMap::new(),
             local_node: None,
             router: None,
+            exit_observer: None,
         }
     }    // --- allocation / lookup -------------------------------------------------
 
@@ -568,7 +574,11 @@ impl ProcessTable {
         // is deferred to its next schedule-in.
         let mut pending = VecDeque::new();
         self.schedule_service(target, &mut pending);
-        self.drain_signals(&mut pending)?;
+        // No port table here: a cascade that terminates a process drains its outgoing port
+        // monitors but cannot remove the incoming entries (a caller holding the table should
+        // terminate through `terminate_with_ports`/`service_signals_with_ports`).
+        let mut ports: Option<&mut PortTable> = None;
+        self.drain_signals(&mut ports, &mut pending)?;
         Ok(effect)
     }
 
@@ -1183,27 +1193,78 @@ impl ProcessTable {
     /// a receiver that is not the currently executing process is serviced eagerly, so the
     /// observable end state matches a synchronous propagation.
     ///
+    /// This form has **no** [`PortTable`] handle, so the dying process's outgoing **port
+    /// monitors** are drained but the matching *incoming* entries cannot be removed from the
+    /// port table. A caller that has the port table should use
+    /// [`ProcessTable::terminate_with_ports`] so a port-watcher's death also cleans the port
+    /// side; this method is the `None`-ports delegation of it (today's behaviour).
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::TermNotFound` when the pid is unknown; propagates the
     /// propagation's allocation and signalling errors.
     pub fn terminate(&mut self, pid: ProcessId, reason: Eterm) -> Result<()> {
+        let mut ports: Option<&mut PortTable> = None;
+        self.terminate_and_cascade(&mut ports, pid, reason)
+    }
+
+    /// [`ProcessTable::terminate`] with the [`PortTable`] in hand, so a dying process's outgoing
+    /// **port monitors** (`erlang:monitor(port, Port)`) also remove their matching *incoming*
+    /// entries from `ports` — the outgoing [`PortWatch`] set is drained on death, and without
+    /// this the port would keep a dangling monitor for a watcher that no longer exists
+    /// (`erlang:port_info(Port, monitors)` would still list the dead pid).
+    ///
+    /// A link cascade reached from here (a peer that also dies) is cleaned too: the port table
+    /// is threaded through the private cascade, exactly as the schedule-in path is through
+    /// [`ProcessTable::service_signals_with_ports`].
+    ///
+    /// `ProcessTable` and `PortTable` are distinct types passed in separately, so `&mut self`
+    /// and `&mut ports` are disjoint borrows (the same shape [`ProcessTable::port_closed`] uses).
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::terminate`].
+    pub fn terminate_with_ports(
+        &mut self,
+        ports: &mut PortTable,
+        pid: ProcessId,
+        reason: Eterm,
+    ) -> Result<()> {
+        let mut ports: Option<&mut PortTable> = Some(ports);
+        self.terminate_and_cascade(&mut ports, pid, reason)
+    }
+
+    /// The shared body of [`ProcessTable::terminate`] and
+    /// [`ProcessTable::terminate_with_ports`]: verifies `pid` is live, runs the signal-generation
+    /// half ([`ProcessTable::terminate_into`]) and then drains the cascade.
+    fn terminate_and_cascade(
+        &mut self,
+        ports: &mut Option<&mut PortTable>,
+        pid: ProcessId,
+        reason: Eterm,
+    ) -> Result<()> {
         if !self.contains(pid) {
             return Err(error::unknown_process());
         }
         let mut pending = VecDeque::new();
-        self.terminate_into(pid, reason, &mut pending)?;
-        self.drain_signals(&mut pending)
+        self.terminate_into(ports, pid, reason, &mut pending)?;
+        self.drain_signals(ports, &mut pending)
     }
 
-    /// The signal-generation half of [`ProcessTable::terminate`]: reclaims `pid` and **queues**
-    /// the signals its death implies on the affected receivers, pushing each receiver onto the
-    /// `pending` worklist. It never recurses, so a cyclic link cascade is bounded.
+    /// The signal-generation half of termination: reclaims `pid` and **queues** the signals its
+    /// death implies on the affected receivers, pushing each receiver onto the `pending`
+    /// worklist. It never recurses, so a cyclic link cascade is bounded.
     ///
     /// `reason` may live in `pid`'s own heap (a terminated exit reason queued for it); it is
     /// copied into every receiver's heap before `pid`'s heap is released.
+    ///
+    /// `ports` is `Some` when the caller holds the [`PortTable`]: the dying process's drained
+    /// outgoing [`PortWatch`]es then remove their incoming [`PortMonitor`](crate::port::PortMonitor)
+    /// entries. The **process-death observer** (see [`ProcessExitObserver`]) is notified exactly
+    /// once, here, after the death has been propagated and before `drop(process)`.
     fn terminate_into(
         &mut self,
+        ports: &mut Option<&mut PortTable>,
         pid: ProcessId,
         reason: Eterm,
         pending: &mut VecDeque<ProcessId>,
@@ -1214,13 +1275,25 @@ impl ProcessTable {
             return Ok(());
         };
 
+        // The registered name, captured before the registry entry is dropped below and before
+        // the dying heap is released: the exit observer needs it (see `ProcessExit::name`).
+        let name = self
+            .names
+            .iter()
+            .find(|(_, registered)| **registered == pid)
+            .map(|(name, _)| *name);
+
         // A dying process keeps no name registration.
         self.names.retain(|_, registered| *registered != pid);
-
         // Snapshot every relationship before the PCB is recycled.
         let links = process.links_mut().drain();
         let watchers: Vec<MonitoredBy> = core::mem::take(process.monitored_by_mut());
         let outgoing = process.monitors_mut().drain();
+        // The outgoing **port** monitors are drained here too (they cannot outlive the watcher):
+        // their matching incoming entries are removed from the port table below, and the exit
+        // observer is shown which ports the dying process was watching. `PortWatch` is a pair of
+        // plain values, so this snapshot is heap-independent.
+        let port_monitors = core::mem::take(process.port_monitors_mut());
         process.set_exit_reason(reason);
         process.set_state(ProcessState::Terminated);
         // `process` stays alive until the end of this body: `reason` lives in its heap, so
@@ -1299,6 +1372,26 @@ impl ProcessTable {
         // never see a `DOP_DEMONITOR_P`, which mirrors the local case above.
         self.remote_monitors.remove(&pid);
 
+        // 5. Notify the process-death observer exactly once, now that the death has been
+        //    propagated and *before* `drop(process)`: `reason` may live in the dying heap, so the
+        //    payload is only valid up to the drop below. The observer is isolated (a panic is
+        //    caught and logged, never propagated — see `ProcessExitObserver`).
+        self.notify_process_exit(pid, reason, name, &port_monitors);
+
+        // 6. Port monitors: the dying process was watching every `port_monitors` entry, so its
+        //    matching *incoming* `PortMonitor` must be removed from the port table — otherwise a
+        //    port would keep a dangling monitor for a watcher that no longer exists
+        //    (`erlang:port_info(Port, monitors)` would still list the dead pid). With no port
+        //    table in hand this is skipped (the observer still saw the watches). A port that has
+        //    already closed has drained its side, so an unallocated id is not an error.
+        if let Some(ports) = ports.as_deref_mut() {
+            for watch in &port_monitors {
+                if ports.contains(watch.port) {
+                    ports.demonitor(watch.port, watch.reference)?;
+                }
+            }
+        }
+
         // Every copy that read `reason` from the dying heap is done — release it.
         drop(process);
 
@@ -1317,17 +1410,50 @@ impl ProcessTable {
     /// before running it, so a process signalled while it was blocked sees the signal before
     /// its next reduction. A pid that is no longer live has nothing to apply, so it is a no-op.
     ///
+    /// This form has **no** [`PortTable`] handle: a cascade that *terminates* a process drains
+    /// its outgoing port monitors but cannot remove the matching incoming entries from the port
+    /// table. A caller holding the port table should use
+    /// [`ProcessTable::service_signals_with_ports`]; this method is its `None`-ports delegation
+    /// (today's behaviour).
+    ///
     /// # Errors
     ///
     /// Propagates the message builders' `BeamError::Alloc` (after a collection) and the
     /// cascading termination's errors.
     pub fn service_signals(&mut self, pid: ProcessId) -> Result<()> {
+        let mut ports: Option<&mut PortTable> = None;
+        self.service_signals_and_cascade(&mut ports, pid)
+    }
+
+    /// [`ProcessTable::service_signals`] with the [`PortTable`] in hand, so a schedule-in cascade
+    /// that terminates a process also removes that process's incoming port monitors (see
+    /// [`ProcessTable::terminate_with_ports`], whose port-cleaning this reuses).
+    ///
+    /// # Errors
+    ///
+    /// As [`ProcessTable::service_signals`].
+    pub fn service_signals_with_ports(
+        &mut self,
+        ports: &mut PortTable,
+        pid: ProcessId,
+    ) -> Result<()> {
+        let mut ports: Option<&mut PortTable> = Some(ports);
+        self.service_signals_and_cascade(&mut ports, pid)
+    }
+
+    /// The shared body of [`ProcessTable::service_signals`] and
+    /// [`ProcessTable::service_signals_with_ports`].
+    fn service_signals_and_cascade(
+        &mut self,
+        ports: &mut Option<&mut PortTable>,
+        pid: ProcessId,
+    ) -> Result<()> {
         if !self.contains(pid) {
             return Ok(());
         }
         let mut pending = VecDeque::new();
         pending.push_back(pid);
-        self.drain_signals(&mut pending)
+        self.drain_signals(ports, &mut pending)
     }
 
     /// Drains the signal queues of every pid in `pending`, and of any process the servicing
@@ -1335,9 +1461,16 @@ impl ProcessTable {
     ///
     /// Iterative — the `pending` worklist is the only recursion the cascade has, so a link
     /// cycle (A↔B) terminates in a bounded number of steps.
-    fn drain_signals(&mut self, pending: &mut VecDeque<ProcessId>) -> Result<()> {
+    ///
+    /// `ports` is threaded through so a cascade that terminates a process can clean its incoming
+    /// port monitors (see [`ProcessTable::terminate_with_ports`]).
+    fn drain_signals(
+        &mut self,
+        ports: &mut Option<&mut PortTable>,
+        pending: &mut VecDeque<ProcessId>,
+    ) -> Result<()> {
         while let Some(pid) = pending.pop_front() {
-            while self.apply_head_signal(pid, pending)? {}
+            while self.apply_head_signal(ports, pid, pending)? {}
         }
         Ok(())
     }
@@ -1350,6 +1483,7 @@ impl ProcessTable {
     /// [`ProcessTable::terminate_into`]) rather than recurring.
     fn apply_head_signal(
         &mut self,
+        ports: &mut Option<&mut PortTable>,
         pid: ProcessId,
         pending: &mut VecDeque<ProcessId>,
     ) -> Result<bool> {
@@ -1375,7 +1509,7 @@ impl ProcessTable {
                     ExitPolicy::Terminate(reason) => {
                         // `reason` still lives in `pid`'s heap, which `terminate_into`
                         // reclaims last, so it can be copied to the peers first.
-                        self.terminate_into(pid, reason, pending)?;
+                        self.terminate_into(ports, pid, reason, pending)?;
                         Ok(false)
                     }
                 }
@@ -1665,6 +1799,63 @@ impl ProcessTable {
         }
     }
 
+    // --- process-death observer ----------------------------------------------
+
+    /// Installs the process-death observer seam the table calls once per death.
+    ///
+    /// The observer is invoked from `ProcessTable::terminate_into` after a dying process's
+    /// links/monitors have been signalled and before its heap is released — the one place the
+    /// runtime can release the resources it allocated on the pid's behalf (the ETS tables the
+    /// pid owns are the motivating case). Without an observer termination is unchanged
+    /// (see [`ProcessExitObserver`]).
+    pub fn set_process_exit_observer(&mut self, observer: Box<dyn ProcessExitObserver>) {
+        self.exit_observer = Some(observer);
+    }
+
+    /// Takes the process-death observer out of the table, returning it to the caller.
+    pub fn take_process_exit_observer(&mut self) -> Option<Box<dyn ProcessExitObserver>> {
+        self.exit_observer.take()
+    }
+
+    /// Whether a process-death observer is installed.
+    pub fn has_process_exit_observer(&self) -> bool {
+        self.exit_observer.is_some()
+    }
+
+    /// Notifies the installed process-death observer that `pid` died with `reason`, exactly once
+    /// per death.
+    ///
+    /// Called by [`ProcessTable::terminate_into`] after the death has been propagated and before
+    /// the dying heap is released (so `reason`, which may live there, is still valid). A
+    /// **panicking** observer is contained — the panic is caught, reported through
+    /// [`beam_common`]'s logging and swallowed — so it can never abort or corrupt termination
+    /// (see [`ProcessExitObserver`]'s failure policy). With no observer installed this is a
+    /// no-op.
+    fn notify_process_exit(
+        &mut self,
+        pid: ProcessId,
+        reason: Eterm,
+        name: Option<Atom>,
+        port_monitors: &[PortWatch],
+    ) {
+        let Some(observer) = self.exit_observer.as_mut() else {
+            return;
+        };
+        let exit = ProcessExit::new(pid, reason, name, port_monitors);
+        // SAFETY (unwind): the observer receives only an immutable payload and holds no
+        // reference to the table, so a panic inside it cannot leave the table half-updated —
+        // see `ProcessExitObserver`'s failure policy. The panic is reported and contained so
+        // termination still completes.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.process_exited(&exit);
+        }));
+        if outcome.is_err() {
+            beam_common::beam_error!(
+                "beam_process: process-exit observer panicked for pid {:?}; termination continues",
+                pid
+            );
+        }
+    }
     /// `erlang:link/1` against an arbitrary pid term: a local pid links through
     /// [`ProcessTable::link`], an external pid is recorded as a remote link and routed as a
     /// `DOP_LINK` control signal.
@@ -2156,7 +2347,7 @@ impl ProcessTable {
             match exit_policy(reason, trapping, &self.atoms) {
                 ExitPolicy::Ignore => {}
                 ExitPolicy::Trap => self.enqueue_port_exit_message(pid, port, reason)?,
-                ExitPolicy::Terminate(peer_reason) => self.terminate(pid, peer_reason)?,
+                ExitPolicy::Terminate(peer_reason) => self.terminate_with_ports(ports, pid, peer_reason)?,
             }
         }
         Ok(())

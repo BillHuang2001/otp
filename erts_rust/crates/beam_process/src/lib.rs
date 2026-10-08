@@ -55,6 +55,7 @@
 
 pub mod dict;
 pub mod dirty;
+pub mod exit_observer;
 pub mod fragments;
 pub mod link;
 pub mod monitor;
@@ -76,6 +77,7 @@ mod error; // pub(crate) constructors only — NOT public
 
 pub use crate::dict::*;
 pub use crate::dirty::*;
+pub use crate::exit_observer::*;
 pub use crate::fragments::*;
 pub use crate::link::*;
 pub use crate::monitor::*;
@@ -97,6 +99,7 @@ pub use crate::timer::*;
 pub mod prelude {
     pub use crate::dict::*;
     pub use crate::dirty::*;
+    pub use crate::exit_observer::*;
     pub use crate::fragments::*;
     pub use crate::link::*;
     pub use crate::monitor::*;
