@@ -10,6 +10,33 @@
 //! [`BifFn`] is a plain `fn` pointer, not a boxed closure: the registry is built
 //! once at boot and looked up per BIF call, and every piece of BIF state flows
 //! through [`BifContext`] (see the crate `CONTEXT.md`, Design Decisions).
+//!
+//! # Why the lookup is allocation-free
+//!
+//! [`BifRegistry::lookup`] and [`BifRegistry::contains`] run on **every** registered
+//! BIF dispatch (a real dispatch does `contains` and then `call` → `lookup`), so they
+//! must not touch the heap. A flat `HashMap<(String, String, u32), BifFn>` cannot do
+//! that: a `(String, String, u32)` key has to be *owned*, so each lookup built two
+//! `String`s (`module.to_string()` + `function.to_string()`) before it could hash —
+//! four allocations per dispatch.
+//!
+//! The internals are therefore **nested maps shadowed by borrows**:
+//!
+//! ```text
+//! module: String ─▶ function: String ─▶ [(arity, BifFn), …]
+//! ```
+//!
+//! `HashMap<String, _>::get` accepts a `&str` argument through `Borrow<str>`, and
+//! `String`'s `Hash`/`Eq` delegate to `str`'s, so hashing a borrowed `&str` is
+//! equivalent to hashing the owned key — **no key is ever built**. The innermost
+//! level is a small `Vec` scanned linearly: a BIF function has one arity in almost
+//! every case (`erlang:error/1..3` is the widest in the roster), so the scan touches
+//! one or two elements, needs no hashing, and — being keyed only by `u32` — needs no
+//! allocation either. A miss stops at the first `get` that returns `None`.
+//!
+//! Registration is boot-time only, so it may allocate (it interns the module/function
+//! names once). `names()`/`entries()`/`len()` keep their exact semantics; `len()` is a
+//! cached counter so it stays O(1).
 
 use std::collections::HashMap;
 
@@ -25,10 +52,29 @@ use crate::error;
 /// invoking it.
 pub type BifFn = fn(&mut BifContext<'_>, &[Eterm]) -> Result<Eterm>;
 
+/// One function's `(arity, impl)` pairs, in registration order.
+///
+/// A linear scan over this `Vec` replaces a `HashMap<u32, BifFn>`: the vectors are
+/// tiny (one element for nearly every function), so the scan wins on both cache
+/// locality and allocation, and a keyed-by-`u32` map would add nothing.
+type ArityTable = Vec<(u32, BifFn)>;
+
+/// `function → arities`.
+type FunctionTable = HashMap<String, ArityTable>;
+
+/// `module → functions`.
+type ModuleTable = HashMap<String, FunctionTable>;
+
 /// Maps `(module, function, arity)` to a [`BifFn`].
+///
+/// The nested shape makes `lookup`/`contains` allocation-free (see the module docs).
 #[derive(Default)]
 pub struct BifRegistry {
-    map: HashMap<(String, String, u32), BifFn>,
+    /// `module → function → [(arity, impl)]`.
+    map: ModuleTable,
+    /// The number of registered `(module, function, arity)` keys, cached so `len()`
+    /// is O(1) without walking the nested maps.
+    len: usize,
 }
 
 impl BifRegistry {
@@ -36,6 +82,7 @@ impl BifRegistry {
     pub fn new() -> BifRegistry {
         BifRegistry {
             map: HashMap::new(),
+            len: 0,
         }
     }
 
@@ -83,6 +130,9 @@ impl BifRegistry {
 
     /// Registers `f` under `(module, function, arity)`, returning the previous
     /// implementation if that key was already present.
+    ///
+    /// Boot-time only: this is the one operation that allocates (it interns the
+    /// module/function names on first sight).
     pub fn register(
         &mut self,
         module: &str,
@@ -90,21 +140,35 @@ impl BifRegistry {
         arity: u32,
         f: BifFn,
     ) -> Option<BifFn> {
-        self.map
-            .insert((module.to_string(), function.to_string(), arity), f)
+        let functions = self.map.entry(module.to_string()).or_default();
+        let arities = functions.entry(function.to_string()).or_default();
+        if let Some(slot) = arities.iter_mut().find(|(a, _)| *a == arity) {
+            return Some(std::mem::replace(&mut slot.1, f));
+        }
+        arities.push((arity, f));
+        self.len += 1;
+        None
     }
 
     /// The implementation registered under `(module, function, arity)`, if any.
+    ///
+    /// Allocation-free on both a hit and a miss: `module`/`function` are hashed as
+    /// borrowed `&str`s and the arity is matched by a linear scan of a tiny `Vec`.
     pub fn lookup(&self, module: &str, function: &str, arity: u32) -> Option<BifFn> {
         self.map
-            .get(&(module.to_string(), function.to_string(), arity))
-            .copied()
+            .get(module)?
+            .get(function)?
+            .iter()
+            .find(|(a, _)| *a == arity)
+            .map(|(_, f)| *f)
     }
 
     /// Whether `(module, function, arity)` is registered.
+    ///
+    /// Allocation-free (it is [`lookup`](Self::lookup) with the implementation
+    /// discarded).
     pub fn contains(&self, module: &str, function: &str, arity: u32) -> bool {
-        self.map
-            .contains_key(&(module.to_string(), function.to_string(), arity))
+        self.lookup(module, function, arity).is_some()
     }
 
     /// Looks up `(module, function, arity)`, checks the argument count and invokes
@@ -136,26 +200,37 @@ impl BifRegistry {
 
     /// The number of registered BIFs.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.len
     }
 
     /// Whether the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len == 0
     }
 
     /// Every registered `(module, function, arity)` key, sorted.
     pub fn names(&self) -> Vec<(String, String, u32)> {
-        let mut names: Vec<(String, String, u32)> = self.map.keys().cloned().collect();
+        let mut names: Vec<(String, String, u32)> = Vec::with_capacity(self.len);
+        for (module, functions) in &self.map {
+            for (function, arities) in functions {
+                for &(arity, _) in arities {
+                    names.push((module.clone(), function.clone(), arity));
+                }
+            }
+        }
         names.sort();
         names
     }
 
     /// Every registered entry as `(module, function, arity, impl)`.
     pub fn entries(&self) -> impl Iterator<Item = (String, String, u32, BifFn)> + '_ {
-        self.map
-            .iter()
-            .map(|((module, function, arity), f)| (module.clone(), function.clone(), *arity, *f))
+        self.map.iter().flat_map(|(module, functions)| {
+            functions.iter().flat_map(move |(function, arities)| {
+                arities
+                    .iter()
+                    .map(move |&(arity, f)| (module.clone(), function.clone(), arity, f))
+            })
+        })
     }
 }
 
@@ -175,6 +250,11 @@ mod tests {
     /// A trivial BIF returning the small integer `7`.
     fn seven(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
         Ok(make_small(7))
+    }
+
+    /// A trivial BIF returning the small integer `8` (a distinguishable duplicate).
+    fn eight(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+        Ok(make_small(8))
     }
 
     fn context<'a>(heap: &'a mut Heap, atoms: &'a AtomTable) -> BifContext<'a> {
@@ -203,6 +283,69 @@ mod tests {
         assert!(reg.register("m", "f", 1, seven).is_none());
         assert!(reg.register("m", "f", 1, seven).is_some());
         assert_eq!(reg.len(), 1, "the second registration replaces the first");
+    }
+
+    #[test]
+    fn arities_of_one_function_are_independent() {
+        let mut reg = BifRegistry::new();
+        assert!(reg.register("m", "f", 0, seven).is_none());
+        assert!(reg.register("m", "f", 1, eight).is_none());
+        assert_eq!(reg.len(), 2, "two arities are two keys");
+        assert!(reg.lookup("m", "f", 0).is_some());
+        assert!(reg.lookup("m", "f", 1).is_some());
+
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = AtomTable::new();
+        let mut ctx = context(&mut heap, &atoms);
+        assert_eq!(reg.call("m", "f", 0, &mut ctx, &[]).expect("f/0"), make_small(7));
+        assert_eq!(
+            reg.call("m", "f", 1, &mut ctx, &[make_small(0)]).expect("f/1"),
+            make_small(8)
+        );
+
+        // Re-registering *one* arity leaves the other untouched.
+        assert!(reg.register("m", "f", 0, eight).is_some());
+        assert_eq!(reg.len(), 2);
+        assert_eq!(
+            reg.call("m", "f", 0, &mut ctx, &[]).expect("f/0 replaced"),
+            make_small(8)
+        );
+        assert_eq!(
+            reg.call("m", "f", 1, &mut ctx, &[make_small(0)]).expect("f/1 untouched"),
+            make_small(8)
+        );
+
+        // An unregistered arity of a registered function is a miss.
+        assert!(reg.lookup("m", "f", 2).is_none());
+        assert!(!reg.contains("m", "f", 2));
+    }
+
+    #[test]
+    fn same_function_name_in_different_modules_is_independent() {
+        let mut reg = BifRegistry::new();
+        reg.register("a", "f", 0, seven);
+        reg.register("b", "f", 0, eight);
+        assert_eq!(reg.len(), 2);
+
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = AtomTable::new();
+        let mut ctx = context(&mut heap, &atoms);
+        assert_eq!(reg.call("a", "f", 0, &mut ctx, &[]).expect("a:f/0"), make_small(7));
+        assert_eq!(reg.call("b", "f", 0, &mut ctx, &[]).expect("b:f/0"), make_small(8));
+        assert!(reg.lookup("c", "f", 0).is_none());
+    }
+
+    #[test]
+    fn contains_always_agrees_with_lookup() {
+        let reg = default_registry();
+        for (module, function, arity) in reg.names().iter().take(40) {
+            assert!(reg.contains(module, function, *arity));
+            assert!(reg.lookup(module, function, *arity).is_some());
+        }
+        assert_eq!(
+            reg.contains("erlang", "no_such_bif", 3),
+            reg.lookup("erlang", "no_such_bif", 3).is_some()
+        );
     }
 
     #[test]
@@ -251,6 +394,24 @@ mod tests {
     }
 
     #[test]
+    fn entries_yields_exactly_the_registered_keys() {
+        let mut reg = BifRegistry::new();
+        reg.register("z", "f", 3, seven);
+        reg.register("a", "g", 1, eight);
+        reg.register("a", "f", 2, seven);
+        reg.register("z", "f", 1, eight);
+
+        let mut from_entries: Vec<(String, String, u32)> = reg
+            .entries()
+            .map(|(module, function, arity, _)| (module, function, arity))
+            .collect();
+        from_entries.sort();
+        assert_eq!(from_entries, reg.names());
+        assert_eq!(reg.len(), 4);
+        assert_eq!(reg.entries().count(), reg.len());
+    }
+
+    #[test]
     fn default_registry_is_sorted_and_matches_with_core_bifs() {
         let dflt = default_registry();
         assert_eq!(dflt.len(), BifRegistry::with_core_bifs().len());
@@ -259,5 +420,8 @@ mod tests {
         // `names()` is sorted by (module, function, arity).
         let names = dflt.names();
         assert!(names.windows(2).all(|w| w[0] <= w[1]));
+        // The nested map agrees with the cached key count.
+        assert_eq!(names.len(), dflt.len());
+        assert_eq!(dflt.entries().count(), dflt.len());
     }
 }

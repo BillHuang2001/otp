@@ -6,11 +6,12 @@
 //!
 //! 1. **Allocations (the primary, deterministic evidence).** A counting
 //!    `#[global_allocator]` wraps `std::alloc::System` with two `AtomicUsize`
-//!    counters. The registry is built *before* the measurement window (its owned
-//!    `String` keys allocate at boot), then a few thousand hit/miss `lookup` and
-//!    `contains` calls and a hit `call` are made inside the window; the delta must be
-//!    **exactly 0**. This is host-load independent: an allocation either happens or it
-//!    does not.
+//!    counters, armed per-thread so the test harness and the sibling timing test can
+//!    never perturb a measurement. The registry is built *before* the measurement
+//!    window (its owned `String` keys allocate at boot), then a few thousand hit/miss
+//!    `lookup` and `contains` calls and a hit `call` are made inside the window; the
+//!    delta must be **exactly 0**. This is host-load independent: an allocation either
+//!    happens or it does not.
 //! 2. **Cost (the regression tripwire).** `lookup`, `contains` and a hit `call` are
 //!    timed over `>=100k` iterations, repeated `>=15` times; the median and p99 ns/call
 //!    are printed to stderr (visible with `--nocapture`). Only a very loose sanity
@@ -20,8 +21,9 @@
 //! but this file is its own crate root (the `#[global_allocator]` needs `unsafe impl`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -34,23 +36,42 @@ use beam_term::{make_atom, AtomTable};
 // The counting allocator
 // ---------------------------------------------------------------------------
 
-/// Number of `alloc`/`realloc` calls made while [`COUNTING`] is set.
+/// Number of `alloc`/`realloc` calls made on an armed thread.
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-/// Number of bytes requested while [`COUNTING`] is set.
+/// Number of bytes requested on an armed thread.
 static BYTES: AtomicUsize = AtomicUsize::new(0);
-/// Whether the counters are armed. Off outside a measurement window so the registry
-/// build and the test harness are never counted.
-static COUNTING: AtomicBool = AtomicBool::new(false);
 
-/// `System` plus optional counting.
+thread_local! {
+    /// Set only on the thread that is currently measuring.
+    ///
+    /// The counters are process-global, but the *arming* is per-thread, so the test
+    /// harness and the sibling timing test (which allocate while formatting output)
+    /// can never perturb a measurement. That is what makes the allocation evidence
+    /// deterministic rather than merely usually-zero.
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Records one allocation of `bytes` on the current thread while it is armed.
+///
+/// `try_with` tolerates a thread whose TLS is being torn down; with a `const`-init
+/// `Cell` there is no lazy allocation and no destructor to run, so this is safe to
+/// call from inside the allocator.
+#[inline]
+fn record(bytes: usize) {
+    let _ = ARMED.try_with(|armed| {
+        if armed.get() {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(bytes, Ordering::Relaxed);
+        }
+    });
+}
+
+/// `System` plus per-thread opt-in counting.
 struct CountingAllocator;
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
+        record(layout.size());
         unsafe { System.alloc(layout) }
     }
 
@@ -59,19 +80,13 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
+        record(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            // Count only the growth (a shrink is not an allocation event).
-            BYTES.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
-        }
+        // Count only the growth (a shrink is not an allocation event).
+        record(new_size.saturating_sub(layout.size()));
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -83,20 +98,20 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 // Measurement scaffolding
 // ---------------------------------------------------------------------------
 
-/// Serializes the tests in this binary.
-///
-/// `libtest` runs the test functions of one binary on parallel threads and the
-/// allocation counters are process-global, so the timing test (which allocates while
-/// formatting its output) must never overlap the allocation test's arming window.
+/// Serializes the tests in this binary so the timing test is not perturbed by the
+/// allocation test running on another core.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Runs `body` with the counters armed and returns `(allocations, bytes, result)`.
+/// Runs `body` with the counters armed on this thread and returns
+/// `(allocations, bytes, result)`.
 fn allocations_in<T>(body: impl FnOnce() -> T) -> (usize, usize, T) {
+    // Force the TLS to initialize *before* the window opens.
+    ARMED.with(|armed| armed.set(false));
     let before_allocations = ALLOCATIONS.load(Ordering::Relaxed);
     let before_bytes = BYTES.load(Ordering::Relaxed);
-    COUNTING.store(true, Ordering::SeqCst);
+    ARMED.with(|armed| armed.set(true));
     let result = body();
-    COUNTING.store(false, Ordering::SeqCst);
+    ARMED.with(|armed| armed.set(false));
     let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before_allocations;
     let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
     (allocations, bytes, result)
