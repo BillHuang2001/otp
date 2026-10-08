@@ -69,7 +69,15 @@ pub(crate) fn read_operand(
 /// typed error. A `Literal` is never a valid destination: it names a term in the
 /// module's immutable literal area, which has no addressable slot. Hottest arm
 /// first, like [`read_operand`].
-#[inline]
+///
+/// `#[inline(always)]`-marked for the same reason as [`read_operand`]: it is
+/// called several times per interpreted instruction (every `move`/`get_*`/`gc_bif`
+/// destination) and, with only `#[inline]`, the much-larger-than-the-caller-type
+/// `Result<(), BeamError>` return kept it out of line in the many-codegen-unit
+/// build (measured: it was the single largest *out-of-line* self-time entry in the
+/// interpreter profile). Inlining it into the dispatch loop lets the optimizer fold
+/// the register store into the instruction arm.
+#[inline(always)]
 pub(crate) fn write_operand(machine: &mut Machine, operand: &Operand, value: Eterm) -> Result<()> {
     match operand {
         Operand::X(n) => machine.set_x(*n, value),
