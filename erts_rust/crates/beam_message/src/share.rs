@@ -21,7 +21,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use crate::copy::{identity, is_shared, shallow, CopyContext, Fixup};
+use crate::copy::{identity, is_shared, preflight_words, shallow, CopyContext, Fixup};
 use crate::error;
 
 /// Copies `term`'s graph into `to`, returning the copied root, **sharing repeated subterms**.
@@ -37,8 +37,9 @@ use crate::error;
 pub fn copy_struct_shared(term: Eterm, to: &mut Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm> {
     // The flat word count is a safe upper bound on the shared copy's size, so the same preflight
     // as `copy_struct` applies: the common exhaustion is attributed to the message heap
-    // (`AllocKind::Message`) up front rather than surfacing mid-copy as a bare heap failure.
-    let needed = beam_term::size_object(term);
+    // (`AllocKind::Message`) up front rather than surfacing mid-copy as a bare heap failure — and a
+    // forged cyclic graph is a typed error (via `preflight_words`), never an unbounded walk.
+    let needed = preflight_words(term, to.available())?;
     if to.available() < needed {
         return Err(error::heap_exhausted(needed));
     }

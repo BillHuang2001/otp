@@ -1,9 +1,15 @@
 //! Integration tests for the data-level messaging primitives ([`send`](beam_message::send) /
 //! [`receive`](beam_message::receive) / [`receive_ref`](beam_message::receive_ref)).
+//!
+//! Also pins the **atomicity** of `send`: a rejected send (a payload that does not fit the receiver
+//! heap) must be a total no-op: the receiver heap, the destination off-heap table and the queue are
+//! all left exactly as they were, so a host can safely retry through
+//! [`send_fragmented`](beam_message::send_fragmented).
 
 use beam_alloc::Heap;
+use beam_common::{AllocKind, BeamError};
 use beam_message::off_heap::OffHeapTable;
-use beam_message::{receive, receive_ref, send, CopyContext, Queue, QueueCursor};
+use beam_message::{receive, receive_ref, send, CopyContext, MsoHandle, Queue, QueueCursor};
 use beam_term::prelude::*;
 use beam_term::compare;
 
@@ -14,6 +20,18 @@ fn build_list(heap: &mut Heap, elems: &[Eterm]) -> Eterm {
         acc = heap.cons(elem, acc).expect("the list fits the source heap");
     }
     acc
+}
+
+/// Builds the off-heap reference container `[HEADER_BIN_REF, slot, 0]` on `heap`.
+fn bin_ref(heap: &mut Heap, slot: usize) -> Eterm {
+    // SAFETY: the heap owns these three words.
+    unsafe {
+        let p = heap.alloc_words(3).expect("the container fits");
+        *p = HEADER_BIN_REF;
+        *p.add(1) = Eterm::from_raw(slot);
+        *p.add(2) = Eterm::from_raw(0);
+        make_boxed(p as *const Eterm)
+    }
 }
 
 /// The first element of a copied payload list.
@@ -207,4 +225,45 @@ fn cursor_scans_candidates_and_removes_the_match() {
     assert!(queue.message_at(empty).is_none());
     assert!(queue.remove_at(empty).is_none());
     assert!(queue.is_empty());
+}
+
+#[test]
+fn a_rejected_send_is_a_total_no_op() {
+    // The payload's graph references an off-heap MSO object AND is far larger than the receiver heap
+    // (so the copier's up-front capacity preflight rejects it before it writes a word).
+    let mut src_off_heap = OffHeapTable::new();
+    assert_eq!(src_off_heap.push(beam_gc::Mso::new(0x1234u32, 8)), 0);
+
+    let mut src = Heap::new(64).expect("source heap");
+    let container = bin_ref(&mut src, 0);
+    let nested = src
+        .tuple(&[container, make_small(1), make_small(2)])
+        .expect("the tuple fits the source heap");
+    let term = build_list(&mut src, &[nested, make_small(9), make_small(10)]);
+
+    let mut to_heap = Heap::new(2).expect("a receiver heap far too small");
+    let mut queue = Queue::new();
+    let mut dst_off_heap = OffHeapTable::new();
+    {
+        let mut ctx = CopyContext::new(&src_off_heap, &mut dst_off_heap);
+        match send(make_small(0), term, &mut to_heap, &mut queue, &mut ctx) {
+            Err(BeamError::Alloc(failure)) => assert_eq!(failure.kind, AllocKind::Message),
+            other => panic!("expected a message allocation failure, got {other:?}"),
+        }
+    }
+
+    // Nothing changed anywhere: the receiver heap never grew, the destination off-heap table holds
+    // neither the MSO object nor a binary/node, the queue is still empty, and the source's
+    // off-heap object was not refcounted.
+    assert_eq!(to_heap.used(), 0, "the rejected copy wrote no word");
+    assert_eq!(to_heap.available(), to_heap.capacity(), "the whole receiver heap is still free");
+    assert!(dst_off_heap.is_empty(), "no MSO object was registered");
+    assert!(dst_off_heap.binaries().is_empty(), "no refc binary was registered");
+    assert!(dst_off_heap.nodes().is_empty(), "no node was registered");
+    assert!(queue.is_empty(), "nothing was enqueued");
+    assert_eq!(
+        src_off_heap.get(0).map(MsoHandle::refcount),
+        Some(1),
+        "the source's off-heap object was not refcounted"
+    );
 }

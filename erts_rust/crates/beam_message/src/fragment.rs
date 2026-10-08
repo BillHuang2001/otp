@@ -36,6 +36,30 @@
 //!
 //! `unsafe` does not appear here: the fragment is built from the safe [`Heap`] bump allocator, the
 //! copier and the [`OffHeapTable`] API.
+//!
+//! # The fragment contract (what a host relies on)
+//!
+//! The oversized-message model is a small, explicit contract a runtime (a host such as `beam_rt`)
+//! builds its send/receive path on:
+//!
+//! * **A fragment is sized to the whole payload and never reallocates.** [`HeapFragment::new`]
+//!   takes the region's capacity, and [`send_fragmented`](crate::send_fragmented) sizes it to at
+//!   least `size_object(term)`, so **one** fragment holds a whole payload. The backing [`Heap`]
+//!   never reallocates, so a root pointer returned by [`HeapFragment::copy_root`] stays valid for
+//!   the fragment's lifetime, including after the fragment (and the [`Fragments`] chain holding it)
+//!   is moved: the pointer-stability invariant [`crate::Message::payload`] depends on. Splitting
+//!   one payload across a chain is **not** done here: a caller that wants a size-bounded split
+//!   builds the chain itself ([`Fragments::push`]).
+//! * **A fragmented message's off-heap objects live in the fragment.** While the message is queued
+//!   the fragment's own off-heap table owns the payload's MSO handles and refc-binary handles (and
+//!   node entries), so the [`Message`](crate::Message)'s `off_heap`/`binaries`/`nodes` lists are
+//!   empty for it (see [`crate::send_fragmented`]).
+//! * **[`Fragments::move_into`] is the receiver's move-back, and it is one-shot and
+//!   net-refcount-preserving.** It copies each root onto the receiver's heap (fresh off-heap slots)
+//!   and then releases the fragment's own references: the net refcount of every moved off-heap
+//!   object is unchanged (one increment from the copy, one decrement from the release), exactly as
+//!   the C relink leaves it. Ownership is given up only after the **whole** chain has moved, so a
+//!   mid-move failure never leaves the chain half-stripped.
 
 use beam_alloc::{AllocRef, Heap};
 use beam_common::Result;
@@ -232,10 +256,18 @@ impl Fragments {
     /// objects move as handles**: the payload is shared (same [`RefcBinary::data_ptr`]), never
     /// deep-copied.
     ///
-    /// The move is **one-shot**, as in C: after it, the fragments' off-heap references have been
-    /// given up, so a second `move_into` would find the roots' off-heap slots unresolved. An
-    /// allocation failure while copying one root leaves the earlier roots moved and the failed
-    /// fragment intact and yields the typed [`BeamError`](beam_common::BeamError).
+    /// Ownership is given up only after **every** root in the chain has been copied: the fragment
+    /// tables are released in a second pass once the whole move has succeeded. A mid-move failure
+    /// (destination heap exhaustion, or a root whose off-heap slot does not resolve) therefore
+    /// yields the typed [`BeamError`](beam_common::BeamError) with **no** fragment stripped: the
+    /// chain still owns every off-heap reference it started with. The words the failed attempt
+    /// already wrote into `dst`, and the destination-table references it registered for the roots it
+    /// did copy, are the caller's to discard on that path; a retry needs a larger `dst` and a fresh
+    /// `dst_off_heap`.
+    ///
+    /// The move is **one-shot**, as in C: a second `move_into` of a payload that carried off-heap
+    /// references finds the roots' slots unresolved (a typed `BadArg`), because the fragment tables
+    /// are now empty; a payload with no off-heap references would simply be copied again.
     ///
     /// [`RefcBinary::data_ptr`]: beam_alloc::RefcBinary::data_ptr
     pub fn move_into(
@@ -250,10 +282,12 @@ impl Fragments {
                 let mut ctx = CopyContext::new(off_heap, dst_off_heap);
                 moved.push(copy_struct(root, dst, &mut ctx)?);
             }
-            // Ownership transfer: `dst_off_heap` now owns a clone of every off-heap object the
-            // copied payload references; the fragment gives up its own references (its `Drop`
-            // releases any node entries it held).
-            release_off_heap(off_heap);
+        }
+        // Ownership transfer, only once the whole chain has moved: `dst_off_heap` now owns a clone
+        // of every off-heap object the copied payloads reference, so each fragment gives up its own
+        // references (its `Drop` releases any node entries it held).
+        for fragment in self.fragments.iter_mut() {
+            release_off_heap(&mut fragment.off_heap);
         }
         Ok(moved)
     }

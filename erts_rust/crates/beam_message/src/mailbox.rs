@@ -6,6 +6,33 @@
 //! copies the payload into a [`HeapFragment`] instead (the C `erts_try_alloc_message_on_heap`
 //! sender); [`receive`] is the selective-receive skeleton over a [`Queue`] (waiting, `after`
 //! timeouts, the save queue and signal ordering are `beam_process`'s).
+//!
+//! # The host-facing contract (what a runtime relies on)
+//!
+//! A host (such as `beam_rt`) drives the oversized-message retry through this module; the contract
+//! is:
+//!
+//! * **`send` is atomic.** A rejected `send` performs **no partial write**: the copier preflights
+//!   the destination capacity against the whole graph's flat word count *before* writing a word, so
+//!   the failure leaves the receiver heap, the destination off-heap table and the queue exactly as
+//!   they were.
+//! * **The oversized-message retry is signalled by exactly
+//!   [`BeamError::Alloc`]`(`[`AllocKind::Message`]`)`.** Any other failure is not a "too big for the
+//!   heap" signal. [`send_fragmented`] encodes that rule: it tries [`send`] first and falls back to
+//!   a fragment **only** on that one error kind, propagating every other failure unchanged (the
+//!   receiver heap, and the destination table since the failed attempt wrote nothing, stay untouched).
+//! * **One fragment holds the whole payload.** [`send_fragmented`] sizes its fragment to at least
+//!   `size_object(term)` (honouring a larger `fragment_capacity_words` hint) and never splits a
+//!   payload across a chain; a size-bounded split is not done here, so a caller that wants one builds
+//!   the [`Fragments`] chain itself. The fragment's backing heap never reallocates, so the enqueued
+//!   [`Message`]'s [`payload`](Message::payload) pointer, which points *into* the fragment, stays
+//!   valid for the message's lifetime.
+//! * **The fragment owns the payload's off-heap objects** until the receiver's
+//!   [`Fragments::move_into`] hands them to the receiver's table; the enqueued message's own
+//!   `off_heap`/`binaries`/`nodes` lists are empty on the fragment path.
+//! * **[`Fragments::move_into`] is one-shot and net-refcount-preserving**: it copies each root onto
+//!   the receiver's heap (fresh off-heap slots) and releases the fragment's own references only
+//!   after the whole chain has moved (see its docs).
 
 use beam_alloc::Heap;
 use beam_common::{AllocKind, BeamError, Result};
@@ -26,9 +53,10 @@ use crate::message::{Message, Queue};
 /// table would attach its pre-existing objects to this message.
 ///
 /// A payload that does **not** fit `to_heap` fails with
-/// [`BeamError::Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) and leaves both
-/// `to_heap` and the destination table untouched (the copier preflights capacity); use
-/// [`send_fragmented`] to fall back to a heap fragment.
+/// [`BeamError::Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) and performs **no
+/// partial write**: the copier preflights capacity before writing a word, so `to_heap`, the
+/// destination table and `to_queue` are left exactly as they were. Use [`send_fragmented`] to fall
+/// back to a heap fragment.
 pub fn send(
     from: Eterm,
     term: Eterm,
@@ -48,8 +76,9 @@ pub fn send(
 /// It first tries the ordinary receiver-heap copy; **only** a
 /// [`BeamError::Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) triggers the fragment
 /// path (any other failure is propagated unchanged, and `to_heap` is left untouched). The fragment
-/// is sized to hold the whole payload (at least `fragment_capacity_words` words, at least
-/// `size_object(term)`): `term` is copied into the fragment's heap with a fresh [`CopyContext`]
+/// is **one** fragment sized to hold the whole payload (at least `fragment_capacity_words` words, at
+/// least `size_object(term)`), and a size-bounded split across a chain is not done here: that is the
+/// caller's concern. `term` is copied into the fragment's heap with a fresh [`CopyContext`]
 /// whose source is `ctx`'s off-heap table and whose destination is the **fragment's** off-heap
 /// table, so the fragment owns the payload's off-heap objects. The enqueued [`Message`]'s
 /// [`payload`](Message::payload) points into the fragment and it owns the [`Fragments`].

@@ -13,6 +13,19 @@
 //! `unsafe` is confined to `copy.rs` (the raw word read/write of the copy loop) and the narrow
 //! `layout.rs` accessors; `share.rs`, `fragment.rs`, `message.rs`, `mailbox.rs`, `off_heap.rs`,
 //! `node.rs` and `error.rs` are safe Rust.
+//!
+//! # Allocation-failure classification
+//!
+//! A copy into a **destination heap** that cannot hold the copied term fails with
+//! [`BeamError::Alloc`](beam_common::BeamError::Alloc) whose
+//! [`AllocFailure::kind`](beam_common::AllocFailure) is
+//! [`AllocKind::Message`](beam_common::AllocKind) and whose requested byte count is
+//! `words * size_of::<Eterm>()`. This is a **soft, recoverable** signal: a host may collect and
+//! grow the destination heap and retry, or -- at its configured hard limit (the emulator's
+//! `+hmax` / `max_heap_size`) -- raise the emulator's documented **`error:system_limit`** (class
+//! `error`, reason atom `system_limit`). Classify it with the public predicate
+//! [`is_message_heap_exhaustion`] rather than matching the [`AllocKind`](beam_common::AllocKind)
+//! at each call site.
 
 pub mod copy;
 mod error; // pub(crate) copy-failure constructors — NOT public
@@ -25,6 +38,7 @@ pub mod off_heap;
 mod share;
 
 pub use crate::copy::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
+pub use crate::error::is_message_heap_exhaustion;
 pub use crate::fragment::{Fragments, HeapFragment};
 pub use crate::mailbox::{receive, receive_ref, send, send_fragmented};
 pub use crate::message::{Message, Queue, QueueCursor};
@@ -35,6 +49,7 @@ pub use crate::share::copy_struct_shared;
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
     pub use crate::copy::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
+    pub use crate::error::is_message_heap_exhaustion;
     pub use crate::fragment::{Fragments, HeapFragment};
     pub use crate::mailbox::{receive, receive_ref, send, send_fragmented};
     pub use crate::message::{Message, Queue, QueueCursor};
