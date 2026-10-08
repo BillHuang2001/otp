@@ -50,6 +50,12 @@ use crate::run_queue::{Priority, RunQueue};
 
 /// The number of reductions a process runs before being pre-empted (the C
 /// `CONTEXT_REDS`).
+///
+/// This value is handed to [`ProcessRunner::run`] as its `budget`. The **runner** owns the
+/// reduction count — the scheduler never counts reductions itself — and pre-emption is
+/// **cooperative** in Milestone 1: a runner that ignores `budget` and never returns
+/// [`RunOutcome::Yield`] is never pre-empted by the scheduler. See [`ProcessRunner::run`] for
+/// the full contract a runner must honor.
 pub const DEFAULT_REDUCTIONS_PER_SLICE: u32 = 4000;
 
 /// The default maximum number of reductions a parked-table scheduler runs **while holding the
@@ -91,6 +97,21 @@ pub enum RunOutcome {
 ///
 /// Implemented by `beam_rt`/`beam_engine` over the engine's `ExecutionContext`; the
 /// scheduler itself depends only on this trait.
+///
+/// # The runner contract (BINDING)
+///
+/// The runner **accounts reductions itself** — the scheduler never inspects or resets
+/// `Process::reductions` — and must report the slice's outcome through [`RunOutcome`]:
+///
+/// * [`RunOutcome::Yield`] once it has spent (or is about to spend) its `budget`, so the
+///   scheduler requeues the process at its own current priority;
+/// * [`RunOutcome::Wait`]/[`RunOutcome::Suspend`] when the process blocks (the runner sets the
+///   PCB state itself before returning — the scheduler deliberately does not guess it);
+/// * [`RunOutcome::Exit`]`(reason)` when the process terminates.
+///
+/// `budget` is an **upper bound the runner is expected to honor**; it is not enforced. Pre-emption
+/// is **cooperative** in Milestone 1: a runner that never returns `Yield` runs forever inside the
+/// single runner call the scheduler makes, because the scheduler cannot interrupt it.
 pub trait ProcessRunner {
     /// Runs process `pid` for up to `budget` reductions, mutating it — and, when needed,
     /// other processes through `table` — and reports what happened.
@@ -152,6 +173,39 @@ impl Scheduler {
     pub fn enqueue_with_priority(&mut self, pid: ProcessId, priority: Priority) {
         self.run_queue.enqueue_with_priority(pid, priority);
     }
+
+    /// Changes `pid`'s scheduling priority **and** moves it to the matching run-queue level if
+    /// it is currently queued at a different one.
+    ///
+    /// This is the "a priority change reaches the run queue" path that `process_flag(priority,
+    /// P)` and `spawn_opt(..., [{priority, P}])` need. The PCB priority alone only takes effect
+    /// at the process's **next** requeue, so a priority change made on a process that is
+    /// *sitting in a run queue* (e.g. a promotion by another process) would otherwise be
+    /// deferred by up to a full slice. The order is deliberate:
+    ///
+    /// 1. Update the PCB through [`ProcessTable::set_priority`]. An **unknown** pid (the process
+    ///    died) is a `TermNotFound` error, and the run queue is left **untouched** — nothing is
+    ///    enqueued or moved before the PCB accepts the change.
+    /// 2. If `pid` is queued at a level other than `priority`, remove it from that level and
+    ///    append it to the **tail** of `priority`'s FIFO ([`RunQueue::reprioritize`]). A pid
+    ///    that is not queued at all (it is running, in flight, waiting, suspended or already
+    ///    terminated) or is already at `priority` is not touched: never double-enqueue, never
+    ///    insert a pid that is not in the queue.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ProcessTable::set_priority`]'s `TermNotFound` for an unknown pid.
+    pub fn set_priority(
+        &mut self,
+        table: &mut ProcessTable,
+        pid: ProcessId,
+        priority: Priority,
+    ) -> Result<()> {
+        table.set_priority(pid, priority)?;
+        self.run_queue.reprioritize(pid, priority);
+        Ok(())
+    }
+
     /// The thread-progress tracker.
     pub fn progress(&self) -> &ThreadProgress {
         &self.progress
@@ -330,6 +384,9 @@ pub(crate) fn slice_begin(pid: ProcessId, table: &mut ProcessTable) -> Result<bo
 /// honored). A `Wait`/`Suspend` outcome leaves the queue (the runner owns the state transition)
 /// and an `Exit` terminates the process, propagating to its links and monitors.
 ///
+/// The scheduler does **not** count reductions here or anywhere: the runner owns the reduction
+/// count and decides when to yield (see [`ProcessRunner`] — pre-emption is cooperative).
+///
 /// # Errors
 ///
 /// Propagates the termination errors.
@@ -341,10 +398,10 @@ pub(crate) fn slice_end<F: FnMut(ProcessId, Priority)>(
 ) -> Result<()> {
     match outcome {
         RunOutcome::Yield => {
-            // Still runnable: back to the tail of its own priority's queue. The priority
-            // is read *after* the slice, so a `process_flag(priority, …)` demotion the
-            // runner just performed is honored at this requeue (defaulting to normal when
-            // the process is gone).
+            // Still runnable: back to the tail of its own priority's queue. The priority is
+            // read *after* the slice, honoring a `process_flag(priority, …)` the runner just
+            // performed (defaulting to normal when the process is gone). The scheduler does not
+            // touch the reduction counter — the runner owns it.
             let priority = table
                 .get_mut(pid)
                 .map(|process| {
@@ -406,11 +463,14 @@ pub(crate) fn drain_woken_into<F: FnMut(ProcessId, Priority)>(
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the constructor defaults, the queue accessors and the
-    //! `max_slices`/empty-queue edge cases of [`Scheduler::run_ready`].
+    //! Unit tests for the constructor defaults, the queue accessors, the
+    //! `max_slices`/empty-queue edge cases of [`Scheduler::run_ready`], the priority-change
+    //! path ([`Scheduler::set_priority`]) and spawning at a non-normal priority.
+
+    use beam_gc::HeapPolicy;
 
     use super::*;
-
+    use crate::process::Process;
     /// A runner that always yields, so a scheduler keeps cycling.
     struct YieldRunner {
         slices: u32,
@@ -499,5 +559,108 @@ mod tests {
                 .expect("the runner never fails"),
             3
         );
+    }
+
+    #[test]
+    fn set_priority_moves_a_queued_process_to_the_new_level() {
+        let mut scheduler = Scheduler::new();
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+
+        scheduler.enqueue(pid);
+        assert_eq!(
+            scheduler.run_queue().priority_of(pid),
+            Some(Priority::Normal)
+        );
+        let len_before = scheduler.run_queue().len();
+
+        // A promotion moves the pid to the HIGH level without duplicating it.
+        scheduler
+            .set_priority(&mut table, pid, Priority::High)
+            .expect("a live pid is reprioritized");
+        assert_eq!(
+            table.get(pid).expect("the process is live").priority(),
+            Priority::High
+        );
+        assert_eq!(scheduler.run_queue().priority_of(pid), Some(Priority::High));
+        assert_eq!(
+            scheduler.run_queue().len(),
+            len_before,
+            "the pid moved, it was not duplicated"
+        );
+
+        // Setting the same priority again is a no-op (still exactly one entry).
+        scheduler
+            .set_priority(&mut table, pid, Priority::High)
+            .expect("a live pid is reprioritized");
+        assert_eq!(scheduler.run_queue().priority_of(pid), Some(Priority::High));
+        assert_eq!(scheduler.run_queue().len(), len_before);
+
+        // A demotion moves as well.
+        scheduler
+            .set_priority(&mut table, pid, Priority::Low)
+            .expect("a live pid is reprioritized");
+        assert_eq!(scheduler.run_queue().priority_of(pid), Some(Priority::Low));
+        assert_eq!(scheduler.run_queue().len(), 1);
+    }
+
+    #[test]
+    fn set_priority_on_an_unqueued_pid_only_updates_the_pcb() {
+        let mut scheduler = Scheduler::new();
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+        // Not enqueued (it is running, or has not been made runnable yet).
+        assert_eq!(scheduler.run_queue().priority_of(pid), None);
+
+        scheduler
+            .set_priority(&mut table, pid, Priority::Max)
+            .expect("a live pid is reprioritized");
+        assert_eq!(
+            table.get(pid).expect("the process is live").priority(),
+            Priority::Max
+        );
+        assert_eq!(
+            scheduler.run_queue().priority_of(pid),
+            None,
+            "a non-queued pid is never inserted"
+        );
+        assert_eq!(scheduler.run_queue().len(), 0);
+    }
+
+    #[test]
+    fn set_priority_on_an_unknown_pid_errors_without_enqueuing() {
+        let mut scheduler = Scheduler::new();
+        let mut table = table();
+        let unknown = ProcessId::new(4242, 0);
+
+        let outcome = scheduler.set_priority(&mut table, unknown, Priority::High);
+        assert!(
+            matches!(outcome, Err(beam_common::BeamError::TermNotFound)),
+            "an unknown pid must be TermNotFound"
+        );
+        assert_eq!(scheduler.run_queue().len(), 0, "nothing was enqueued");
+        assert_eq!(scheduler.run_queue().priority_of(unknown), None);
+    }
+
+    #[test]
+    fn a_process_born_at_high_priority_is_served_before_a_normal_one() {
+        let mut scheduler = Scheduler::new();
+        let mut table = table();
+
+        // A process born at the default (NORMAL) priority, enqueued first.
+        let normal = table.spawn_default().expect("a fresh process");
+        scheduler.enqueue(normal);
+
+        // A process born at HIGH via `with_policy_and_priority`, inserted and enqueued after.
+        let high = ProcessId::new(1, 0);
+        let process =
+            Process::with_policy_and_priority(high, HeapPolicy::default(), Priority::High)
+                .expect("the default heap allocates");
+        table.insert(process).expect("the pid is in range");
+        scheduler.enqueue_with_priority(high, Priority::High);
+
+        // The HIGH process is served first even though it was enqueued second.
+        assert_eq!(scheduler.run_queue_mut().dequeue(), Some(high));
+        assert_eq!(scheduler.run_queue_mut().dequeue(), Some(normal));
     }
 }

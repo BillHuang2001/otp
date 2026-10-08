@@ -248,6 +248,31 @@ impl<R: ProcessRunner + Send + 'static> SchedulerPool<R> {
         self.signals.notify_work();
     }
 
+    /// Changes `pid`'s scheduling priority and, if it is sitting in a run queue, moves it to the
+    /// matching level.
+    ///
+    /// The PCB is updated under the table lock, which is **released before** the queue search:
+    /// the locking discipline forbids holding the table lock while taking a queue lock (see the
+    /// module-level locking discipline). The search then costs one queue-lock acquisition per
+    /// queue — the shared injector plus every local queue — so it is `O(schedulers)`.
+    ///
+    /// A pid that is currently **in flight** (being executed by a scheduler) is in no queue, so
+    /// only the PCB update applies and its next requeue reads the new priority. A pid that is
+    /// waiting/suspended/terminated is likewise not in a queue, and an **unknown** pid is
+    /// reported as an error with every queue left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ProcessTable::set_priority`]'s `TermNotFound` for an unknown pid; the queues
+    /// are left untouched in that case.
+    pub fn set_priority(&self, pid: ProcessId, priority: Priority) -> Result<()> {
+        {
+            let mut table = self.table.lock();
+            table.set_priority(pid, priority)?;
+        }
+        self.queues.reprioritize(pid, priority);
+        Ok(())
+    }
     /// Delivers `term` to `to` from `from`, waking a blocked receiver through the injector.
     ///
     /// A send from outside a scheduler slice has no slice end to absorb the wake, so the pool
@@ -600,6 +625,48 @@ mod tests {
         // Every scheduler is parked; the registered waker must still let the safepoint complete.
         let generation = pool.safepoint();
         assert!(generation >= 1, "the safepoint advanced the generation");
+
+        pool.shutdown();
+        pool.join();
+    }
+
+    #[test]
+    fn set_priority_updates_the_pcb_and_never_queues_a_non_queued_pid() {
+        let counter = StdArc::new(AtomicUsize::new(0));
+        let pool = SchedulerPool::start(
+            SchedulerConfig::with_schedulers(1),
+            table(),
+            wait_runner(&counter),
+        )
+        .expect("a fresh pool starts");
+
+        // A spawned pid is inserted but not enqueued, so it is in no queue.
+        let pid = pool.spawn_default().expect("a fresh process");
+        assert_eq!(pool.run_queue_len(), 0);
+
+        pool.set_priority(pid, Priority::High)
+            .expect("a live pid is reprioritized");
+        assert_eq!(
+            pool.table()
+                .lock()
+                .get(pid)
+                .expect("the process is live")
+                .priority(),
+            Priority::High
+        );
+        assert_eq!(
+            pool.run_queue_len(),
+            0,
+            "a non-queued pid is not inserted into any queue"
+        );
+
+        // An unknown pid is TermNotFound and changes nothing.
+        let unknown = ProcessId::new(9999, 0);
+        assert!(matches!(
+            pool.set_priority(unknown, Priority::Max),
+            Err(BeamError::TermNotFound)
+        ));
+        assert_eq!(pool.run_queue_len(), 0);
 
         pool.shutdown();
         pool.join();
