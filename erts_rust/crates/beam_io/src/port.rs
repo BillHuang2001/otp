@@ -471,6 +471,16 @@ impl Port {
         result
     }
 
+    /// Whether the driver has asynchronous work pending (a `driver_async` completion not yet handed
+    /// over).
+    ///
+    /// This is the probe [`PortRegistry::execute_port_tasks`](crate::PortRegistry::execute_port_tasks)
+    /// consults to decide whether the port needs a [`Port::drive_async`] point this round. It never
+    /// touches the driver context, so it is safe to call while iterating the registry.
+    pub fn has_pending_async(&self) -> bool {
+        self.driver.has_pending_async()
+    }
+
     /// Drives the driver's asynchronous completions, returning how many were processed.
     ///
     /// The port-task round has **no task kind** for `driver_async` completion in Milestone-1 (the

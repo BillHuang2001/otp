@@ -239,6 +239,27 @@ impl PortRegistry {
 
         let (ran, reds_used) = self.run_scheduled_tasks(poller, reds_budget)?;
 
+        // Drive async completions **after** the scheduled tasks and **before** harvesting input.
+        // `driver_async` has no port-task kind in M1, so a finished job only reaches the driver's
+        // `ready_async`/`async_free` at a drive point; doing it here (rather than leaving it to an
+        // explicit `PortRegistry::drive_async` call) lets a `ready_async` that calls `driver_output`
+        // surface its bytes as a `Data` notification in this same round — the property the runtime
+        // needs to make `driver_async` work end-to-end. The probe is `Driver::has_pending_async`, so
+        // a port with no outstanding job pays nothing. Keys are snapshotted first so the drive does
+        // not borrow the port map while it is being mutated.
+        for key in self.sorted_keys() {
+            let pending = self
+                .ports
+                .get(&key)
+                .is_some_and(crate::port::Port::has_pending_async);
+            if !pending {
+                continue;
+            }
+            if let Some(port) = self.ports.get_mut(&key) {
+                port.drive_async(poller)?;
+            }
+        }
+
         // Harvest the data the INPUT tasks read: a port task never hands bytes up itself,
         // so the round reports them for the runtime to turn into `{Port, {data, Data}}`.
         let keys = self.sorted_keys();

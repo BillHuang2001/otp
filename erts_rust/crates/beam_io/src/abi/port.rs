@@ -553,6 +553,15 @@ impl Driver for DriverPort {
         self.poll_async(ctx)
     }
 
+    /// Whether the driver has an outstanding `driver_async` job.
+    ///
+    /// Delegates to [`AbiHost::has_pending_async`]: `true` while a job is running or has completed
+    /// but not yet had its `ready_async`/`async_free` run, so the port-task round knows this port
+    /// needs its [`Driver::drive_async`] = [`DriverPort::poll_async`] point.
+    fn has_pending_async(&self) -> bool {
+        self.abi.has_pending_async()
+    }
+
     /// The `driver_set_timer` deadline, as the port's next `TIMEOUT`.
     fn next_timeout(&self) -> Option<Instant> {
         self.abi.state().deadline()

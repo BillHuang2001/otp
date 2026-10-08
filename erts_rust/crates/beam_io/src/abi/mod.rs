@@ -18,8 +18,11 @@
 //!   persistent C-ABI state (the `driver_select` registration map, the `driver_set_timer` deadline
 //!   and the `driver_async` job set) and reaches the live port through the
 //!   [`DriverContext`](crate::driver::DriverContext) installed for the duration of one callback.
-//! * [`job`] — [`AsyncJobs`], the `driver_async` bookkeeping (one worker thread per job, a queue
-//!   position, and the completion channel [`DriverPort::poll_async`] drains to run `ready_async`).
+//! * [`job`] — [`AsyncJobs`], the `driver_async` bookkeeping (a bounded, process-global worker
+//!   pool shared by every port, a queue position per job, and the per-port completion channel
+//!   [`DriverPort::poll_async`] drains to run `ready_async`). A port with outstanding jobs is driven
+//!   from the port-task round (see [`crate::PortRegistry::execute_port_tasks`]), so a completion's
+//!   `driver_output` surfaces in the same round.
 //! * [`port`] — [`DriverPort`], the adapter that implements [`Driver`](crate::driver::Driver) over a
 //!   loaded [`DriverLibrary`](beam_abi::driver::loader::DriverLibrary): it maps `start`/`output`/
 //!   `ready_input`/`ready_output`/`timeout`/`control`/`stop` onto the driver's callbacks, installs

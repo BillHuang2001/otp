@@ -344,6 +344,17 @@ impl AbiHost {
         &self.state
     }
 
+    /// Whether the port's `driver_async` job set has outstanding jobs.
+    ///
+    /// `true` while jobs are running or completed-but-undelivered, i.e. exactly when a
+    /// [`Driver::drive_async`](crate::driver::Driver::drive_async) call would run at least one
+    /// `ready_async`/`async_free`. This is the probe the port-task round uses to decide whether the
+    /// port needs an async drive point (see
+    /// [`crate::PortRegistry::execute_port_tasks`](crate::PortRegistry::execute_port_tasks)).
+    pub fn has_pending_async(&self) -> bool {
+        self.state.jobs.in_flight() > 0
+    }
+
     /// The port's persistent state, mutably.
     pub(crate) fn state_mut(&mut self) -> &mut DriverState {
         &mut self.state
