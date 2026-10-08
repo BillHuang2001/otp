@@ -45,7 +45,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
-use beam_engine::{Machine, Mailbox, MinimalContext, RunOutcome};
+use beam_engine::{Machine, Mailbox, MinimalContext, RunOutcome, Tier};
 use beam_loader::{load_file, Module};
 use beam_term::{is_small, make_atom, make_small, Atom, Eterm};
 
@@ -524,9 +524,79 @@ fn a_suspended_receive_resumes_when_a_message_arrives() {
 }
 
 // ---------------------------------------------------------------------------
-// the `recv_marker_*` prologue
+// the outcome-aware tier entries
 // ---------------------------------------------------------------------------
 
+#[test]
+fn the_baseline_tier_reports_the_same_block_as_the_interpreter() {
+    // The tier-selecting, blocking-aware entry over the committed real fixture: the
+    // native baseline tier must report the interpreter's exact suspension (the `wait`
+    // instruction is not one the emitter inlines, so it deopts to the shared
+    // interpreter-backed helper, whose `WAIT` word the driver decodes back into a
+    // `RunOutcome::Wait` with the interpreter's resume address).
+    let (module, undefined) = load();
+    let wait = name(&module, "wait");
+
+    let mut interpreter = Machine::new();
+    let mut ctx = context(&module, TestMailbox::new(make_atom(undefined)));
+    let expected = interpreter
+        .run_export_outcome_with_tier(&module, wait, 0, &[], &mut ctx, Tier::Interpreter)
+        .expect("interpreter run of wait/0");
+    assert!(matches!(expected, RunOutcome::Wait { .. }));
+
+    let mailbox = TestMailbox::new(make_atom(undefined));
+    let mut ctx = context(&module, mailbox.clone());
+    let mut machine = Machine::new();
+    let outcome = machine
+        .run_export_outcome_with_tier(&module, wait, 0, &[], &mut ctx, Tier::BaselineJit)
+        .expect("baseline run of wait/0");
+    assert_eq!(
+        outcome, expected,
+        "the native tier must report the interpreter's exact suspension"
+    );
+
+    // The suspension left the machine resumable: a message arrives and the same
+    // machine continues to a value.
+    let (func, pc) = match outcome {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        other => panic!("expected a wait, got {other:?}"),
+    };
+    mailbox.push(make_small(42));
+    assert_eq!(
+        machine
+            .resume_outcome(&module, func, pc, &mut ctx)
+            .expect("resume the JIT suspension"),
+        RunOutcome::Returned(make_small(42))
+    );
+}
+
+#[test]
+fn the_label_entry_reports_the_same_block_on_both_tiers() {
+    // The label-addressed tier entry, over the same fixture: the export's entry label
+    // is resolved by both tiers to the same address, so the suspension agrees too.
+    let (module, undefined) = load();
+    let label = module
+        .export(name(&module, "wait"), 0)
+        .expect("the fixture exports wait/0");
+
+    let mut interpreter = Machine::new();
+    let mut ctx = context(&module, TestMailbox::new(make_atom(undefined)));
+    let expected = interpreter
+        .run_label_outcome_with_tier(&module, label, 0, &[], &mut ctx, Tier::Interpreter)
+        .expect("interpreter run");
+
+    let mut baseline = Machine::new();
+    let mut ctx = context(&module, TestMailbox::new(make_atom(undefined)));
+    let outcome = baseline
+        .run_label_outcome_with_tier(&module, label, 0, &[], &mut ctx, Tier::BaselineJit)
+        .expect("baseline run");
+
+    assert_eq!(outcome, expected);
+}
+
+// ---------------------------------------------------------------------------
+// the `recv_marker_*` prologue
+// ---------------------------------------------------------------------------
 #[test]
 fn marked_runs_the_recv_marker_prologue() {
     // Oracle: `recv:marked()` → 7.

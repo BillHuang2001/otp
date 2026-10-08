@@ -139,15 +139,15 @@ use crate::interpreter::LabelMap;
 use std::mem;
 
 use beam_common::Result;
-use beam_loader::{Atom, Module};
+use beam_loader::{Atom, Label, Module};
 use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter;
 use crate::jit::emitter::CodeBuffer;
-use crate::jit::JitBackend;
-use crate::machine::Machine;
+use crate::jit::{CodeRegion, JitBackend};
+use crate::machine::{Machine, RunOutcome};
 use crate::Step;
 
 mod emit;
@@ -159,7 +159,7 @@ mod tests;
 // The block ABI lives in `runtime`; re-export its names here so every item path
 // outside this module (`crate::jit::baseline::…`) stays exactly what it was.
 pub(crate) use emit::compile_module;
-pub use runtime::{decode_target, encode_target, ERROR, HALT};
+pub use runtime::{decode_target, decode_wait, encode_target, encode_wait, ERROR, HALT, WAIT_BIT};
 pub(crate) use runtime::{jit_step_one, JitRuntime};
 
 use runtime::NativeBlock;
@@ -324,6 +324,74 @@ impl CompiledModule {
         let start = self.buffer.code_ptr() as usize;
         (start, start + self.buffer.len())
     }
+
+    /// The **real** generated code regions of this artifact, one per compiled basic
+    /// block, in ascending address order.
+    ///
+    /// This is the queryable counterpart of the sealed [`CodeBuffer`] mapping a host
+    /// needs to describe the code it is running (e.g. the `+JPperf` perf-map file
+    /// `beam_rt` writes): every [`CodeRegion::start`] is the **actual** address
+    /// [`CompiledModule::entry`] returns for that block — never a synthesised or
+    /// rounded one — and its [`CodeRegion::size`] runs to the next block's entry, or
+    /// to the end of [`CompiledModule::code_address_range`] for the last block.
+    ///
+    /// `module` supplies the names: each [`CodeRegion::name`] is
+    /// `<module>:<function>/<arity>/<pc>`, the block's origin in the IR. Because the entries
+    /// are distinct points of one buffer ordered by emission, the returned regions
+    /// are **disjoint and cover no gap larger than the block padding they measure**;
+    /// an artifact that compiled no block yields an empty map.
+    pub fn code_map(&self, module: &Module) -> Vec<CodeRegion> {
+        // `(address, func, pc)` for every compiled block entry.
+        let mut blocks: Vec<(usize, u32, u32)> = Vec::new();
+        for (func, row) in self.entries.iter().enumerate() {
+            for (pc, slot) in row.iter().enumerate() {
+                if let Some(entry) = slot {
+                    blocks.push((*entry as usize, func as u32, pc as u32));
+                }
+            }
+        }
+        // Emission order is already ascending, but sort so the public contract does
+        // not depend on the emitter's block ordering.
+        blocks.sort_by_key(|(address, _, _)| *address);
+
+        let (_, end) = self.code_address_range();
+        let module_name = module.atom_name(module.name).unwrap_or_default().to_owned();
+
+        let mut regions = Vec::with_capacity(blocks.len());
+        let mut index = 0;
+        while index < blocks.len() {
+            let (start, func, pc) = blocks[index];
+            // Skip any further entry that shares this address: two entries at one
+            // address describe the same code, and measuring them separately would
+            // emit a zero-size region.
+            let mut next = index + 1;
+            while next < blocks.len() && blocks[next].0 == start {
+                next += 1;
+            }
+            let region_end = blocks.get(next).map_or(end, |(address, _, _)| *address);
+            // A BEAM module may define several functions under one name (different
+            // arities, e.g. `fib/1` and `fib/3`), so the name carries the arity too:
+            // `<module>:<function>/<arity>/<pc>` identifies the block's IR origin
+            // unambiguously.
+            let (function_name, arity) = module
+                .functions
+                .get(func as usize)
+                .map(|function| {
+                    (
+                        module.atom_name(function.name).unwrap_or_default(),
+                        function.arity,
+                    )
+                })
+                .unwrap_or_default();
+            regions.push(CodeRegion {
+                start,
+                size: region_end - start,
+                name: format!("{module_name}:{function_name}/{arity}/{pc}"),
+            });
+            index = next;
+        }
+        regions
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,19 +412,67 @@ pub(crate) fn run_compiled(
     args: &[Eterm],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Eterm> {
-    // A block loads its cached x-registers out of `machine.x` — and addresses the
-    // registers beyond the cache budget there directly — without a bounds check, so
-    // a machine whose register file is shorter than the highest natively-touched
-    // index cannot enter native code; such a run stays on the interpreter step.
+    let code = block_entries(compiled, machine);
+    run_native(machine, module, function, arity, args, ctx, &code)
+}
+
+/// Run exported `function/arity` through the compiled blocks, reporting whether the
+/// run returned or blocked in a `receive`.
+///
+/// The outcome-aware counterpart of [`run_compiled`]: identical setup and semantics,
+/// except that a `receive` that finds no message arrives as
+/// [`RunOutcome::Wait`](crate::RunOutcome::Wait) instead of the folded typed
+/// [`crate::error::blocked`]. See [`run_native_outcome`].
+pub(crate) fn run_compiled_outcome(
+    compiled: &CompiledModule,
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    let code = block_entries(compiled, machine);
+    run_native_outcome(machine, module, function, arity, args, ctx, &code)
+}
+
+/// Run a raw entry `label` through the compiled blocks, reporting whether the run
+/// returned or blocked.
+///
+/// The label-addressed counterpart of [`run_compiled_outcome`]: the machine is
+/// reset and seeded exactly as [`Machine::run_label`](crate::Machine) does (the label
+/// is resolved against the module-wide label map, so it may live in any function),
+/// then the shared driver loop runs. A label the module does not define is the
+/// interpreter's own typed `unknown_label` error.
+pub(crate) fn run_compiled_label_outcome(
+    compiled: &CompiledModule,
+    machine: &mut Machine,
+    module: &Module,
+    label: Label,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    let code = block_entries(compiled, machine);
+    run_native_label_outcome(machine, module, label, arity, args, ctx, &code)
+}
+
+/// The baseline tier's [`NativeCode`] lookup for `compiled`, carrying whether the
+/// running machine's register file is wide enough to enter native code.
+///
+/// A block loads its cached x-registers out of `machine.x` — and addresses the
+/// registers beyond the cache budget there directly — without a bounds check, so a
+/// machine whose register file is shorter than the highest natively-touched index
+/// cannot enter native code; such a run stays on the interpreter step.
+fn block_entries<'a>(compiled: &'a CompiledModule, machine: &Machine) -> BlockEntries<'a> {
     let native_ok = match compiled.highest_native_register {
         Some(highest) => machine.x.len() > highest as usize,
         None => true,
     };
-    let code = BlockEntries {
+    BlockEntries {
         compiled,
         native_ok,
-    };
-    run_native(machine, module, function, arity, args, ctx, &code)
+    }
 }
 
 /// The baseline tier's [`NativeCode`]: any compiled basic block may be entered.
@@ -385,6 +501,25 @@ impl NativeCode for BlockEntries<'_> {
     }
 }
 
+/// Reset `machine`, seed `x[0..arity)` from `args`, push the bottom frame, bind the
+/// module's literal area and build the module-wide label map — the setup both driver
+/// entry points share (it mirrors [`Machine::run_label`](crate::Machine)).
+fn enter_machine(
+    machine: &mut Machine,
+    module: &Module,
+    arity: u32,
+    args: &[Eterm],
+) -> Result<interpreter::LabelMap> {
+    machine.reset();
+    let n = arity.min(args.len() as u32);
+    for (i, arg) in args.iter().take(n as usize).enumerate() {
+        machine.set_x(i as u32, *arg)?;
+    }
+    machine.push_frame(0)?;
+    machine.set_literals(module.literals.clone());
+    Ok(interpreter::build_label_map(module))
+}
+
 /// The driver loop both native tiers run on.
 ///
 /// Mirrors [`Machine::run_label`](crate::Machine)'s setup (reset, seed
@@ -404,6 +539,12 @@ impl NativeCode for BlockEntries<'_> {
 /// per-instruction deopt, and it is also what happens for every address the tier
 /// compiled no entry point for (and, for the baseline tier, when the running
 /// machine's register file is too small — see [`run_compiled`]).
+///
+/// This is the **non-blocking** form: a run that suspends in a `receive` (whether
+/// the suspension came from the driver's own interpreter step or from a block's
+/// [`jit_step_one`] deopt) is folded into the typed [`crate::error::blocked`] error,
+/// exactly as the interpreter's own non-blocking entry is. Use
+/// [`run_native_outcome`] to see the suspension instead.
 pub(crate) fn run_native(
     machine: &mut Machine,
     module: &Module,
@@ -413,20 +554,81 @@ pub(crate) fn run_native(
     ctx: &mut dyn ExecutionContext,
     code: &dyn NativeCode,
 ) -> Result<Eterm> {
+    match run_native_outcome(machine, module, function, arity, args, ctx, code)? {
+        RunOutcome::Returned(value) => Ok(value),
+        RunOutcome::Wait { .. } => Err(crate::error::blocked()),
+    }
+}
+
+/// The outcome-aware driver loop both native tiers run on.
+///
+/// The exact body of [`run_native`] with a [`RunOutcome`] result instead of the
+/// folded `x(0)`: the machine is reset, `x[0..arity)` is seeded from `args`, the
+/// bottom frame is pushed, the export label is resolved and the driver loop runs.
+///
+/// Every way a suspension can reach the driver is reported as
+/// [`RunOutcome::Wait`](crate::RunOutcome::Wait) with the exact resume address the
+/// interpreter would report:
+///
+/// * a compiled block that deopts to [`jit_step_one`] for a `wait`/`wait_timeout`
+///   returns the [`encode_wait`] word, which is decoded here (the block is left
+///   with its registers spilled, so `machine` is ready to be resumed);
+/// * the driver's own interpreter step returns [`Step::Wait`](crate::Step::Wait)
+///   directly.
+///
+/// A [`HALT`] word finishes the run with `x(0)` and an [`ERROR`] word propagates
+/// `rt.error`; every other word is a `(func, pc)` continuation. Nothing is
+/// silently continued and nothing is invented.
+pub(crate) fn run_native_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+    code: &dyn NativeCode,
+) -> Result<RunOutcome> {
     let entry = module
         .export(function, arity)
         .ok_or_else(|| error::unsupported("jit: export not found"))?;
 
-    machine.reset();
-    let n = arity.min(args.len() as u32);
-    for (i, arg) in args.iter().take(n as usize).enumerate() {
-        machine.set_x(i as u32, *arg)?;
-    }
-    machine.push_frame(0)?;
-    machine.set_literals(module.literals.clone());
-    let labels = interpreter::build_label_map(module);
-    let (mut func, mut pc) = interpreter::resolve_label(module, entry)?;
+    let labels = enter_machine(machine, module, arity, args)?;
+    let (func, pc) = interpreter::resolve_label(module, entry)?;
+    drive(machine, module, labels, func, pc, ctx, code)
+}
 
+/// The label-addressed outcome-aware driver loop.
+///
+/// [`run_native_outcome`] with a raw entry `label` instead of an export: the label
+/// is resolved against the module-wide label map (so it may live in any function)
+/// and the run's entry call is recorded, exactly as
+/// [`Machine::run_label_outcome`](crate::Machine) does. A label the module does not
+/// define is the interpreter's own typed `unknown_label` error.
+pub(crate) fn run_native_label_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    label: Label,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+    code: &dyn NativeCode,
+) -> Result<RunOutcome> {
+    let labels = enter_machine(machine, module, arity, args)?;
+    let (func, pc) = interpreter::resolve(&labels, label)?;
+    machine.enter_run(module, func);
+    drive(machine, module, labels, func, pc, ctx, code)
+}
+
+/// The shared driver loop over an already-prepared machine and entry address.
+fn drive(
+    machine: &mut Machine,
+    module: &Module,
+    labels: interpreter::LabelMap,
+    mut func: u32,
+    mut pc: u32,
+    ctx: &mut dyn ExecutionContext,
+    code: &dyn NativeCode,
+) -> Result<RunOutcome> {
     // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.
@@ -447,13 +649,22 @@ pub(crate) fn run_native(
             if word == HALT {
                 // SAFETY: `machine_ptr` points at the live driver-owned `Machine`;
                 // no native code is running here.
-                return unsafe { (*machine_ptr).finish() };
+                return unsafe { (*machine_ptr).finish() }.map(RunOutcome::Returned);
             }
             if word == ERROR {
                 return Err(rt
                     .error
                     .take()
                     .unwrap_or_else(|| error::unsupported("jit: helper error")));
+            }
+            if let Some((wait_func, wait_pc)) = decode_wait(word) {
+                // A block deopted at a `wait`/`wait_timeout`: its exit already spilled
+                // the cached registers, so the machine is exactly as the interpreter's
+                // own suspension leaves it and the host can resume at this address.
+                return Ok(RunOutcome::Wait {
+                    func: wait_func,
+                    pc: wait_pc,
+                });
             }
             match decode_target(word) {
                 Some((next_func, next_pc)) => {
@@ -478,15 +689,18 @@ pub(crate) fn run_native(
                 func = next_func;
                 pc = next_pc;
             }
-            // A native tier is a **non-blocking** entry: it cannot suspend the
-            // process, so a `receive` that finds no message is reported as the same
-            // typed error the interpreter's `run_export` reports for that outcome
-            // (`run_export` folds `RunOutcome::Wait` the same way) — never a wrong
-            // result and never a silent continue.
-            Step::Wait { .. } => return Err(crate::error::blocked()),
+            Step::Wait {
+                func: wait_func,
+                pc: wait_pc,
+            } => {
+                return Ok(RunOutcome::Wait {
+                    func: wait_func,
+                    pc: wait_pc,
+                })
+            }
             Step::Done => {
                 // SAFETY: `machine_ptr` points at the live driver-owned `Machine`.
-                return unsafe { (*machine_ptr).finish() };
+                return unsafe { (*machine_ptr).finish() }.map(RunOutcome::Returned);
             }
         }
     }

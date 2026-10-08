@@ -162,6 +162,76 @@ impl Machine {
         }
     }
 
+    /// Run the exported `function/arity` on a selected execution tier and report
+    /// whether it **returned or blocked** in a `receive`.
+    ///
+    /// The tier-selecting, blocking-aware entry point: [`Machine::run_with_tier`]
+    /// with a [`RunOutcome`] result, so a `receive` that finds no message available
+    /// arrives as [`RunOutcome::Wait`] with the address to resume at instead of the
+    /// folded typed [`crate::error::blocked`] error. That is what lets a host run a
+    /// real module on a native tier and still drive its `receive` through
+    /// [`Machine::resume_outcome`].
+    ///
+    /// Every tier reports the **same** suspension: the address is the one the
+    /// interpreter would report, whether the block came from the interpreter's own
+    /// dispatch loop or from a compiled block that deopted to the shared
+    /// interpreter-backed helper.
+    ///
+    /// * [`Tier::Interpreter`] — delegates to [`Machine::run_export_outcome`]
+    ///   (unchanged; this method is a dispatcher, not a replacement).
+    /// * [`Tier::BaselineJit`] — the native baseline backend over the per-thread
+    ///   cross-run cache ([`crate::jit::cache`]).
+    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier; with the
+    ///   `jit-cranelift` feature off this is a typed
+    ///   [`unsupported`](crate::error::unsupported) error, never a panic and never a
+    ///   silent fallback to another tier.
+    pub fn run_export_outcome_with_tier(
+        &mut self,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+        tier: Tier,
+    ) -> Result<RunOutcome> {
+        match tier {
+            Tier::Interpreter => self.run_export_outcome(module, function, arity, args, ctx),
+            Tier::BaselineJit => crate::jit::cache::run_baseline_cached_outcome(
+                self, module, function, arity, args, ctx,
+            ),
+            Tier::Cranelift => {
+                crate::jit::run_cranelift_outcome(self, module, function, arity, args, ctx)
+            }
+        }
+    }
+
+    /// Run a raw entry label on a selected execution tier and report whether it
+    /// **returned or blocked** in a `receive`.
+    ///
+    /// The label-addressed counterpart of [`Machine::run_export_outcome_with_tier`]:
+    /// the same tier selection and the same suspension reporting, entering at a raw
+    /// [`Label`] (which may live in any function of the module) rather than at an
+    /// export. A label the module does not define is a typed error, never a panic.
+    pub fn run_label_outcome_with_tier(
+        &mut self,
+        module: &Module,
+        label: Label,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+        tier: Tier,
+    ) -> Result<RunOutcome> {
+        match tier {
+            Tier::Interpreter => self.run_label_outcome(module, label, arity, args, ctx),
+            Tier::BaselineJit => crate::jit::cache::run_baseline_cached_label_outcome(
+                self, module, label, arity, args, ctx,
+            ),
+            Tier::Cranelift => {
+                crate::jit::run_cranelift_label_outcome(self, module, label, arity, args, ctx)
+            }
+        }
+    }
+
     /// Run a raw entry label (used by [`Machine::run_export`]).
     ///
     /// Resets the machine, seeds `x[0..arity)` from `args` (the remaining
@@ -220,12 +290,13 @@ impl Machine {
 mod tests {
     use super::{Machine, RunOutcome};
     use beam_common::{BeamError, Result};
-    use beam_loader::{Atom, Export, Function, Instr, Label, Module, Operand};
+    use beam_loader::{Atom, Block, Export, Function, Instr, Label, Module, Operand};
     use beam_term::{make_small, Eterm, NIL};
     use std::collections::VecDeque;
 
     use crate::context::{Mailbox, MinimalContext};
     use crate::error;
+    use crate::jit::Tier;
 
     #[test]
     fn run_export_of_missing_export_is_a_typed_error() {
@@ -519,8 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_outcome_does_not_reset_the_suspended_machine() {
-        // A resumed machine keeps the x-registers written before the suspension:
+    fn resume_outcome_does_not_reset_the_suspended_machine() {        // A resumed machine keeps the x-registers written before the suspension:
         // `resume_outcome` must not reset (a reset would also drop the bottom frame
         // the trailing `return` needs).
         let (module, name) = receive_module();
@@ -545,5 +615,155 @@ mod tests {
             RunOutcome::Returned(make_small(7))
         );
         assert_eq!(machine.x(9), Some(make_small(0x5A)));
+    }
+
+    // ---- the outcome-aware tier entries -----------------------------------
+
+    /// Give every function of `module` the loader's label-delimited block
+    /// decomposition, which the synthetic fixture above omits.
+    ///
+    /// The interpreter does not need it (`step_instruction` walks the code through
+    /// the label map), but the native baseline emitter lowers exactly
+    /// `Function::blocks`; a fixture without blocks compiles no code at all, so it
+    /// would never exercise the native tier's `Step::Wait` path.
+    fn with_blocks((mut module, name): (Module, Atom)) -> (Module, Atom) {
+        for function in &mut module.functions {
+            let code_len = function.code.len();
+            let mut starts: Vec<(usize, Label)> = function
+                .labels
+                .iter()
+                .map(|(label, at)| (*at, *label))
+                .collect();
+            starts.sort_by_key(|(at, _)| *at);
+            starts.dedup_by_key(|(at, _)| *at);
+            let mut blocks = Vec::with_capacity(starts.len());
+            for (index, (start, label)) in starts.iter().enumerate() {
+                let end = starts.get(index + 1).map_or(code_len, |(at, _)| *at);
+                if *start < end {
+                    blocks.push(Block {
+                        label: *label,
+                        start: *start,
+                        end,
+                    });
+                }
+            }
+            function.blocks = blocks;
+        }
+        (module, name)
+    }
+
+    /// A mailbox with nothing queued: every `receive` suspends.
+    fn empty_mailbox() -> MinimalContext {
+        MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+            messages: VecDeque::new(),
+        }))
+    }
+
+    #[test]
+    fn the_receive_family_reports_the_same_wait_on_the_interpreter_and_baseline_tiers() {
+        // The receive fixture with a real block decomposition, so the baseline tier
+        // actually compiles and enters native code — the suspension then travels
+        // through a compiled block's `jit_step_one` deopt (the `wait` instruction is
+        // not one the emitter inlines) and back to the driver as a `Wait`.
+        let (module, name) = with_blocks(receive_module());
+
+        let mut interpreter = Machine::new();
+        let expected = interpreter
+            .run_export_outcome_with_tier(&module, name, 0, &[], &mut empty_mailbox(), Tier::Interpreter)
+            .expect("interpreter run");
+        assert_eq!(expected, RunOutcome::Wait { func: 0, pc: 7 });
+
+        let mut baseline = Machine::new();
+        let got = baseline
+            .run_export_outcome_with_tier(&module, name, 0, &[], &mut empty_mailbox(), Tier::BaselineJit)
+            .expect("baseline run");
+        assert_eq!(
+            got, expected,
+            "the native tier must report the interpreter's exact suspension"
+        );
+    }
+
+    #[test]
+    fn a_baseline_tier_wait_resumes_to_returned_once_a_message_arrives() {
+        let (module, name) = with_blocks(receive_module());
+        let mut machine = Machine::new();
+        assert_eq!(
+            machine
+                .run_export_outcome_with_tier(
+                    &module,
+                    name,
+                    0,
+                    &[],
+                    &mut empty_mailbox(),
+                    Tier::BaselineJit,
+                )
+                .expect("baseline run"),
+            RunOutcome::Wait { func: 0, pc: 7 }
+        );
+        // The compiled block spills its cached registers on the deopt exit, so the
+        // machine is left exactly as an interpreter suspension leaves it and the
+        // bottom frame is still there to resume against.
+        assert_eq!(machine.frame_depth(), 1, "the JIT suspension kept the frame");
+
+        let mut ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+            messages: VecDeque::from([make_small(42)]),
+        }));
+        assert_eq!(
+            machine.resume_outcome(&module, 0, 7, &mut ctx).unwrap(),
+            RunOutcome::Returned(make_small(42))
+        );
+    }
+
+    #[test]
+    fn the_label_entry_reports_the_same_wait_on_the_interpreter_and_baseline_tiers() {
+        let (module, name) = with_blocks(receive_module());
+        let label = module
+            .export(name, 0)
+            .expect("the fixture exports its function at arity 0");
+
+        let mut interpreter = Machine::new();
+        let expected = interpreter
+            .run_label_outcome_with_tier(
+                &module,
+                label,
+                0,
+                &[],
+                &mut empty_mailbox(),
+                Tier::Interpreter,
+            )
+            .expect("interpreter run");
+        assert_eq!(expected, RunOutcome::Wait { func: 0, pc: 7 });
+
+        let mut baseline = Machine::new();
+        let got = baseline
+            .run_label_outcome_with_tier(
+                &module,
+                label,
+                0,
+                &[],
+                &mut empty_mailbox(),
+                Tier::BaselineJit,
+            )
+            .expect("baseline run");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_non_blocking_tier_entry_still_folds_a_wait_into_the_typed_blocked_error() {
+        // The plain tier entries stay non-blocking: the same fixture through
+        // `run_with_tier` must report the typed `blocked` error, not a suspension and
+        // certainly not a wrong result.
+        let (module, name) = with_blocks(receive_module());
+        let mut machine = Machine::new();
+        let err = machine
+            .run_with_tier(&module, name, 0, &[], &mut empty_mailbox(), Tier::BaselineJit)
+            .expect_err("a non-blocking entry cannot suspend");
+        match err {
+            BeamError::Raise(raise) => assert_eq!(
+                raise.reason.as_atom(),
+                Some("unsupported_opcode: run: process blocked (no message available)")
+            ),
+            other => panic!("expected the typed blocked error, got {other:?}"),
+        }
     }
 }

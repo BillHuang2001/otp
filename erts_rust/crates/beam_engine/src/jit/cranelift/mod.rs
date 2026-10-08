@@ -120,7 +120,7 @@ use std::collections::HashMap;
 use std::mem;
 
 use beam_common::Result;
-use beam_loader::{Atom, Module, TestKind};
+use beam_loader::{Atom, Label, Module, TestKind};
 use beam_term::Eterm;
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::JITModule;
@@ -128,9 +128,11 @@ use cranelift_module::ModuleError;
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::jit::baseline::{run_native, JitRuntime, NativeCode};
+use crate::jit::baseline::{
+    run_native, run_native_label_outcome, run_native_outcome, JitRuntime, NativeCode,
+};
 use crate::jit::JitBackend;
-use crate::machine::Machine;
+use crate::machine::{Machine, RunOutcome};
 
 mod codegen;
 mod compare;
@@ -213,6 +215,57 @@ impl JitBackend for CraneliftJit {
         run_native(machine, module, function, arity, args, ctx, &code)
     }
 }
+
+/// Compile `module` and run exported `function/arity`, reporting whether the run
+/// returned or blocked in a `receive`.
+///
+/// The outcome-aware sibling of [`JitBackend::run_export`]: the artifact is compiled
+/// and immediately run through the shared outcome-aware driver
+/// ([`run_native_outcome`](crate::jit::baseline::run_native_outcome)), so a `receive`
+/// that finds no message arrives as [`RunOutcome::Wait`] with the interpreter's own
+/// resume address instead of the folded typed `blocked` error. Everything else is
+/// identical, including the per-instruction deopt to the shared interpreter helper.
+pub(crate) fn run_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    let mut backend = CraneliftJit::new();
+    let compiled = backend.compile(module)?;
+    let code = CompiledEntries {
+        compiled: &compiled,
+    };
+    run_native_outcome(machine, module, function, arity, args, ctx, &code)
+}
+
+/// Compile `module` and run the raw entry `label`, reporting whether the run
+/// returned or blocked in a `receive`.
+///
+/// The label-addressed counterpart of [`run_outcome`]: the shared outcome-aware
+/// label driver ([`run_native_label_outcome`](crate::jit::baseline::run_native_label_outcome))
+/// resolves `label` against the module-wide label map and enters the compiled code
+/// wherever a function's entry `pc` matches. A label that is not a compiled
+/// function's entry simply stays on the driver's interpreter step — the documented
+/// per-instruction deopt, never a wrong result.
+pub(crate) fn run_label_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    label: Label,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    let mut backend = CraneliftJit::new();
+    let compiled = backend.compile(module)?;
+    let code = CompiledEntries {
+        compiled: &compiled,
+    };
+    run_native_label_outcome(machine, module, label, arity, args, ctx, &code)
+}
+
 /// The artifact [`CraneliftJit::compile`] produces: the Cranelift [`JITModule`]
 /// that owns the executable mapping plus the per-function native entries.
 ///
