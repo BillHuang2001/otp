@@ -86,6 +86,12 @@ mod tuples;
 /// to the message the interpreter emitted before this seam existed and whose
 /// `<name>` is [`instr_name`]'s `ops.tab` spelling of the offending instruction (so
 /// the unresolvable variant is diagnosable from the error alone).
+///
+/// `#[inline]`-marked: the router is the single call site of every family, and the
+/// interpreter reaches it from its catch-all arm, so inlining it into the dispatch
+/// loop lets the optimizer fold the (now redundant) per-family `match` into the
+/// loop's own control flow instead of a second out-of-line dispatch.
+#[inline]
 pub(crate) fn dispatch(
     machine: &mut Machine,
     module: &Module,
