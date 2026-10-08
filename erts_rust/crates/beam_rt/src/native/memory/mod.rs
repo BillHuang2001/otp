@@ -69,6 +69,7 @@
 //! | `max_heap_size` | the process flag **map** |
 //! | `message_queue_data` | `on_heap` (an unchanging runtime default — see below) |
 //! | `trace` | `0` (no tracing subsystem in M1 — an unchanging default) |
+//! | `sequential_trace_token` | the process's sequential-trace token tuple, or the bare `[]` while tracing is inactive for it (see [`crate::seq_trace`]) |
 //! | `suspending` | `[]` (no `suspend_process` in M1) |
 //! | `last_calls` | `false` (no tracing subsystem in M1) |
 //! | `memory` | this process's real bytes (heap + stack + off-heap) |
@@ -82,7 +83,6 @@
 //! | item | why / what is needed |
 //! |---|---|
 //! | `catchlevel` | the runtime has no catch-frame store reachable from here |
-//! | `sequential_trace_token`, `trace`-token family | no `seq_trace` subsystem |
 //! | `backtrace` | no binary backtrace (see `current_stacktrace`) |
 //! | `magic_ref`, `parent`, `label` | no such PCB fields in M1 |
 //! | `async_dist`, `priority_messages` | no such process flags in M1 |
@@ -212,6 +212,7 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
     "fullsweep_after",
     "message_queue_data",
     "trace",
+    "sequential_trace_token",
     "suspending",
     "last_calls",
     "memory",
@@ -221,7 +222,6 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
 /// capability gap rather than a fabricated value or a false `badarg` (see the module docs).
 const UNSUPPORTED_ITEMS: &[&str] = &[
     "catchlevel",
-    "sequential_trace_token",
     "backtrace",
     "magic_ref",
     "parent",
@@ -567,6 +567,14 @@ impl RuntimeContext<'_> {
             "message_queue_data" => self.atom("on_heap")?,
             // An unchanging M1 default: no tracing subsystem exists.
             "trace" => make_small(0),
+            // The sequential-trace token (contract A.8): the C copies the process's token
+            // tuple verbatim, which is the bare `[]` while that process's tracing is inactive
+            // (`erl_bif_info.c:2162-2166`). Read out of [`Runtime`](crate::Runtime)'s
+            // sequential-tracing state through [`crate::seq_trace`].
+            "sequential_trace_token" => match self.runtime.seq_trace().token(snapshot.pid) {
+                Some(token) => self.sequential_trace_token(token)?,
+                None => NIL,
+            },
             // An unchanging M1 default: no `suspend_process`.
             "suspending" => NIL,
             // An unchanging M1 default: no tracing subsystem exists.

@@ -54,9 +54,12 @@ use crate::format;
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
 use crate::nif::NifRegistry;
+use crate::perf_map::PerfMap;
 use crate::port::PortRegistry;
 use crate::runner::{ProcessEntry, RunnerState};
+use crate::seq_trace::SeqTrace;
 use crate::timers::{TimerHandle, Timers};
+use crate::trace::TraceState;
 
 mod scheduler;
 
@@ -125,6 +128,14 @@ pub struct Runtime {
     /// recorded here; [`Runtime::scheduler_pass`] absorbs it into the real run queue at the
     /// same points it absorbs the table's own wake list.
     fragment_wakes: Vec<ProcessId>,
+    /// The **process-tracing** state (contract A.8, item 1): one trace entry (flags + tracer)
+    /// per traced pid, plus the monotonic delivery counter behind `erlang:trace_delivered/1`.
+    ///
+    /// It lives on the runtime rather than in a process because it is keyed **by** pid and
+    /// outlives every single-`run_*` call: `erlang:trace/3` in one call must be visible to
+    /// `erlang:trace_info/2` in the next. See [`crate::trace`] for the model and exactly what is
+    /// deferred (event emission and `trace_pattern`).
+    trace: TraceState,
     /// The preloaded-module registry skeleton (contract A.7).
     preloaded: PreloadedModules,
     /// The heaps BIF calls allocate on, used as a stack: a call takes one out, runs, and
@@ -205,6 +216,15 @@ pub struct Runtime {
     booted: bool,
     /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
     pub(crate) halt: Option<i32>,
+    /// The **sequential-tracing** state (contract A.8): the per-process trace tokens
+    /// `erlang:seq_trace/2` maintains, the node-global serial clock a token's `Serial` is
+    /// stamped from, and the system tracer a `print` event would be handed to.
+    ///
+    /// It lives on the runtime rather than in a process because it is keyed **by** pid and
+    /// outlives every single-`run_*` call: `seq_trace:set_token/2` in one call must be visible
+    /// to `seq_trace:get_token/0` in the next, and `reset_seq_trace` clears it for *all*
+    /// processes. See [`crate::seq_trace`] for the model and exactly what is deferred.
+    seq_trace: SeqTrace,
     /// The reference id space every `erlang:make_ref/0` and `erlang:monitor/2` draws from.
     ///
     /// One space for both, so a bare reference and a monitor reference can never collide
@@ -271,6 +291,15 @@ pub struct Runtime {
     /// [`Runtime::dispatch_inbound`] entry never consults it (an explicit caller has
     /// already asked).
     inbound_delivery: bool,
+    /// The **perf-map / JIT-dump** files `+JPperf` selected (contract A.8).
+    ///
+    /// Created here — the runtime-construction step, the equivalent of the C's
+    /// `beamasm_metadata_early_init` at emulator start — and appended to the moment a native
+    /// code range becomes known ([`PerfMap::record`]). This runtime's baseline JIT exposes no
+    /// ranges, so the map is a well-formed **empty** file; an address is never fabricated. An
+    /// unopenable file is recorded on the [`PerfMap`] (never raised, never printed), exactly
+    /// as the oracle logs it and carries on. See [`crate::perf_map`].
+    perf_map: PerfMap,
 }
 
 impl Runtime {
@@ -320,6 +349,11 @@ impl Runtime {
             Some(name) => Some(DistNode::start(name, resolve_cookie(&config.init_args))?),
             None => None,
         };
+        // The perf files are created up front, like the C's `beamasm_metadata_early_init`:
+        // the map is then appended to as ranges become known. Nothing is created when the
+        // flag selected no file, and a failure to create one is recorded on the `PerfMap`
+        // (the oracle logs it and keeps running), never raised here.
+        let perf_map = PerfMap::new(config.perf_map.clone());
         Ok(Runtime {
             config,
             registry: Rc::new(BifRegistry::with_core_bifs()),
@@ -327,6 +361,7 @@ impl Runtime {
             processes,
             mailboxes: HashMap::new(),
             fragment_wakes: Vec::new(),
+            trace: TraceState::new(),
             preloaded: PreloadedModules::standard(),
             bif_heaps: vec![Heap::new(heap_words)?],
             bif_heap_words: heap_words,
@@ -342,6 +377,7 @@ impl Runtime {
             self_pid,
             booted: false,
             halt: None,
+            seq_trace: SeqTrace::new(),
             refs: RefAllocator::new(),
             references: HashMap::new(),
             eval_closures: Vec::new(),
@@ -350,6 +386,7 @@ impl Runtime {
             timer_wakes: Vec::new(),
             dist,
             inbound_delivery: false,
+            perf_map,
         })
     }
 
@@ -399,6 +436,20 @@ impl Runtime {
     /// The configuration this runtime was created with.
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+    /// The **perf-map / JIT-dump** files `+JPperf` selected (contract A.8).
+    ///
+    /// Empty unless the flag enabled a file; see [`crate::perf_map`] for exactly what this
+    /// runtime writes (a well-formed map with the oracle's exact line grammar and **no**
+    /// fabricated addresses: this runtime exposes no JIT ranges) and why a file it could not
+    /// create is recorded rather than raised.
+    pub fn perf_map(&self) -> &PerfMap {
+        &self.perf_map
+    }
+    /// The mutable [`PerfMap`], so a caller that *does* know a native code range can append
+    /// it through [`PerfMap::record`].
+    pub fn perf_map_mut(&mut self) -> &mut PerfMap {
+        &mut self.perf_map
     }
 
     /// The parsed init arguments (the source of `init:get_argument/1`).
@@ -463,6 +514,43 @@ impl Runtime {
     /// The exit status recorded by a native `erlang:halt/1`, if one ran.
     pub fn halt_status(&self) -> Option<i32> {
         self.halt
+    }
+
+    /// The runtime's **sequential-tracing** state (contract A.8) — the per-process trace
+    /// tokens, the serial clock and the system tracer (see [`crate::seq_trace`]).
+    ///
+    /// Read-only, for the introspection surface: `erlang:seq_trace_info/1` and
+    /// `process_info(Pid, sequential_trace_token)` both answer from it.
+    pub(crate) fn seq_trace(&self) -> &SeqTrace {
+        &self.seq_trace
+    }
+
+    /// The mutable sequential-tracing state — what `erlang:seq_trace/2`,
+    /// `erlang:seq_trace_print/1,2` and `erlang:system_flag(reset_seq_trace, _)` mutate.
+    pub(crate) fn seq_trace_mut(&mut self) -> &mut SeqTrace {
+        &mut self.seq_trace
+    }
+
+    /// The **process-tracing** state (contract A.8, item 1) — the trace flags and tracers
+    /// `erlang:trace/3` maintains, read by `erlang:trace_info/2` (see [`crate::trace`]).
+    pub(crate) fn trace(&self) -> &TraceState {
+        &self.trace
+    }
+
+    /// The mutable process-tracing state — what `erts_internal:trace/3` and
+    /// `erlang:trace_delivered/1` mutate.
+    pub(crate) fn trace_mut(&mut self) -> &mut TraceState {
+        &mut self.trace
+    }
+
+    /// The installed **function trace patterns** — the `erlang:trace_pattern/2,3` state
+    /// (contract A.8, item 1), read-only.
+    ///
+    /// No BIF reports this table back (`erlang:trace_info/2`'s `match_spec` is a *process*
+    /// match spec), so the accessor exists for the suites that pin an install or a removal and
+    /// for a future `beam_engine` per-call hook — see [`crate::trace::PatternTable`].
+    pub fn trace_patterns(&self) -> &crate::trace::PatternTable {
+        self.trace.patterns()
     }
 
     /// Heap words still available to the running code (unbounded in Milestone-1).
@@ -594,6 +682,16 @@ impl Runtime {
     /// The process table (Milestone-1: one process — the runtime itself).
     pub fn processes(&self) -> &ProcessTable {
         &self.processes
+    }
+
+    /// The per-pid engine state (the machine and its entry point), for the crash-dump
+    /// writer's per-process register rendering.
+    ///
+    /// `crash_dump` (a sibling module of this crate) reaches a scheduled process's engine
+    /// through this accessor; the same read-only [`RunnerState::engine_at`] seam backs
+    /// `process_info/2`'s execution-position items.
+    pub(crate) fn runner_state(&self) -> &RunnerState {
+        &self.runner_state
     }
 
     /// The pid the runtime runs as.

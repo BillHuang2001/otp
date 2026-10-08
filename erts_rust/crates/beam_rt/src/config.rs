@@ -13,6 +13,7 @@ use beam_gc::{next_heap_size, HeapPolicy, DEFAULT_MIN_HEAP_WORDS};
 
 use crate::cli::ErlEnv;
 use crate::config::Action::{Boot, Version};
+use crate::perf_map::PerfMapConfig;
 
 /// The emulator start-up surface — `beam_common`'s A.6 configuration skeleton.
 ///
@@ -352,6 +353,15 @@ pub struct RuntimeConfig {
     pub init_args: InitArgs,
     /// The action to perform.
     pub action: Action,
+    /// The **perf-map / JIT-dump** surface `+JPperf` selects (contract A.8).
+    ///
+    /// The emulator switches accumulate here in command-line order (`+JPperf map` after
+    /// `+JPperf false` re-enables the map, exactly as the C's bit accumulator does), and the
+    /// **environment override** `ERL_SYM_MAP_FILE` — which the emulator reads directly,
+    /// outside the `ERL_*FLAGS` merge, and which is not an `init` argument — is folded in by
+    /// [`crate::cli::parse_with_env`]. [`Runtime::new`](crate::Runtime::new) turns the result
+    /// into the live files ([`crate::perf_map::PerfMap`]).
+    pub perf_map: PerfMapConfig,
     /// The `ERL_*` environment variables read **outside** the `ERL_*FLAGS` merge chain
     /// (contract A.6): `ERL_INETRC`, `ERL_MAX_PORTS`, `ERL_CRASH_DUMP`,
     /// `ERL_CRASH_DUMP_SECONDS`, `ERL_ROOTDIR`, `ERL_MAX_ETS_TABLES` and
@@ -377,6 +387,7 @@ impl Default for RuntimeConfig {
             max_ports: None,
             init_args: InitArgs::default(),
             action: Boot,
+            perf_map: PerfMapConfig::new(),
             env: ErlEnv::default(),
         }
     }
@@ -454,6 +465,11 @@ impl RuntimeConfig {
         self
     }
 
+    /// Replaces the perf-map / JIT-dump surface (`+JPperf`/`+JPperfdirectory`).
+    pub fn with_perf_map(mut self, perf_map: PerfMapConfig) -> Self {
+        self.perf_map = perf_map;
+        self
+    }
     /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) of this invocation.
     pub fn heap_options(&self) -> &HeapOptions {
         &self.heap

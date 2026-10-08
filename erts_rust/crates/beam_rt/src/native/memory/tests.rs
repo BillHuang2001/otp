@@ -260,6 +260,27 @@ fn the_reachable_items_have_their_oracle_shapes() {
     // The group leader is a live pid.
     let (_, group_leader) = pair(info(&mut runtime, pid, "group_leader").expect("group leader"));
     assert!(ProcessId::from_eterm(group_leader).is_ok());
+
+    // The sequential-trace token is the **bare** `[]` while tracing is inactive for the
+    // process (`erl_bif_info.c:2162-2166` copies the token verbatim) ...
+    let (key, value) = pair(
+        info(&mut runtime, pid, "sequential_trace_token").expect("token item"),
+    );
+    assert_eq!(runtime.atom_name_of(key), Some("sequential_trace_token"));
+    assert_eq!(value, NIL);
+    // ... and the 5-tuple `{Flags,Label,Serial,From,Lastcnt}` once the process has one.
+    let internal = ProcessId::from_eterm(pid).expect("an internal pid");
+    runtime
+        .seq_trace_mut()
+        .set_label(internal, internal.to_eterm(), make_small(7));
+    let (_, value) = pair(
+        info(&mut runtime, pid, "sequential_trace_token").expect("token item"),
+    );
+    assert_eq!(terms::tuple_arity(value).expect("a tuple"), 5);
+    assert_eq!(
+        terms::tuple_element(value, 1).expect("label"),
+        make_small(7)
+    );
 }
 
 #[test]
@@ -268,7 +289,6 @@ fn every_unsupported_item_raises_the_typed_capability_gap() {
     let pid = root_pid(&mut runtime);
     for name in [
         "catchlevel",
-        "sequential_trace_token",
         "backtrace",
         "magic_ref",
         "parent",

@@ -85,6 +85,51 @@ pub(crate) fn halt_status(error: &BeamError) -> Option<i32> {
     reason.strip_prefix(HALT_PREFIX)?.strip_prefix(':')?.parse().ok()
 }
 
+/// The prefix of the reason atom an **abort** raises (`beam_rt_abort`).
+///
+/// `erlang:halt(abort)` and `erlang:halt(abort, Options)` terminate the runtime with
+/// `SIGABRT` in the oracle (`erts_exit(ERTS_ABORT_EXIT, "")` -> `abort()`,
+/// `erts/emulator/beam/erl_init.c:2774-2775`), which a shell observes as exit code `134`.
+/// Like [`halt`] the abort travels out of the executing code as an `exit`-class raise; the
+/// CLI recognises it with [`is_abort`] and calls [`std::process::abort`], so the host really
+/// receives the signal instead of a plain status.
+pub(crate) const ABORT_PREFIX: &str = "beam_rt_abort";
+
+/// The `erlang:halt(abort)` raise: class `exit`, reason atom `beam_rt_abort`.
+pub(crate) fn abort() -> BeamError {
+    BeamError::Raise(Raise::exit(ExitReason::atom(ABORT_PREFIX)))
+}
+
+/// Whether `error` is a runtime **abort** raise (the classifier of [`ABORT_PREFIX`]).
+pub(crate) fn is_abort(error: &BeamError) -> bool {
+    raise_reason(error) == Some(ABORT_PREFIX)
+}
+
+/// The prefix of the reason atom a **crash-dump slogan** halt raises
+/// (`beam_rt_dump:<slogan>`).
+///
+/// `erlang:halt("Slogan")` (a string or `[]`) terminates with `ERTS_DUMP_EXIT`
+/// (`erts/emulator/beam/bif.c:4393`): the slogan is printed on stderr, a crash dump is
+/// written and the process exits `1`. The slogan may be arbitrary and multi-line, but the
+/// raise reason is a single atom, so the caller strips CR/LF before constructing it (see
+/// [`crate::native`]).
+pub(crate) const DUMP_PREFIX: &str = "beam_rt_dump";
+
+/// The `erlang:halt("Slogan")` raise: class `exit`, reason atom `beam_rt_dump:<slogan>`.
+pub(crate) fn dump(slogan: &str) -> BeamError {
+    BeamError::Raise(Raise::exit(ExitReason::atom(format!(
+        "{DUMP_PREFIX}:{slogan}"
+    ))))
+}
+
+/// The dump slogan carried by a dump-slogan raise, if `error` is one (the classifier of
+/// [`DUMP_PREFIX`]). `Some("")` for `halt([])`.
+pub(crate) fn dump_slogan(error: &BeamError) -> Option<&str> {
+    raise_reason(error)?
+        .strip_prefix(DUMP_PREFIX)?
+        .strip_prefix(':')
+}
+
 /// A message-carrying `error`-class raise — the runtime's general diagnostic.
 pub(crate) fn message(text: impl Into<String>) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(text.into())))
@@ -359,10 +404,6 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("garbage_collect", 0),
     ("garbage_collect", 1),
     ("garbage_collect", 2),
-    ("trace", 3),
-    ("trace_pattern", 5),
-    ("seq_trace", 1),
-    ("seq_trace", 2),
     ("get", 0),
     ("erase", 0),
     ("apply", 1),
@@ -518,6 +559,48 @@ mod tests {
         assert_eq!(unsupported_reason(&BeamError::BadArg), None);
         assert_eq!(unsupported_reason(&BeamError::SystemLimit), None);
     }
+
+    #[test]
+    fn an_abort_round_trips_and_matches_nothing_else() {
+        let abort = abort();
+        assert!(is_abort(&abort));
+        // An abort is terminal but is neither a halt status nor a capability gap …
+        assert_eq!(halt_status(&abort), None);
+        assert_eq!(unsupported_reason(&abort), None);
+        assert_eq!(dump_slogan(&abort), None);
+        // … and only the bare `beam_rt_abort` atom is an abort.
+        assert!(!is_abort(&halt(1)));
+        assert!(!is_abort(&dump("slogan")));
+        assert!(!is_abort(&BeamError::BadArg));
+        assert!(!is_abort(&BeamError::SystemLimit));
+        assert!(!is_abort(&message("boom")));
+        let padded = BeamError::Raise(Raise::exit(ExitReason::atom(String::from(
+            "beam_rt_abort_now",
+        ))));
+        assert!(!is_abort(&padded));
+    }
+
+    #[test]
+    fn a_dump_slogan_round_trips_and_matches_nothing_else() {
+        assert_eq!(dump_slogan(&dump("Probe 1")), Some("Probe 1"));
+        // The empty slogan (`halt([])`) survives the round trip too.
+        assert_eq!(dump_slogan(&dump("")), Some(""));
+        // A slogan is neither a halt status, an abort nor a capability gap.
+        assert_eq!(halt_status(&dump("s")), None);
+        assert!(!is_abort(&dump("s")));
+        assert_eq!(unsupported_reason(&dump("s")), None);
+        // Anything that is not a dump raise is `None` — never a substituted slogan.
+        for other in [halt(1), abort(), BeamError::BadArg, message("boom")] {
+            assert_eq!(dump_slogan(&other), None, "{other}");
+        }
+        // The convention is exact: a reason that merely *starts* with the prefix is not a
+        // dump raise.
+        let padded = BeamError::Raise(Raise::exit(ExitReason::atom(String::from(
+            "beam_rt_dumps",
+        ))));
+        assert_eq!(dump_slogan(&padded), None);
+    }
+
     #[test]
     fn unknown_info_key_is_bare_badarg() {
         assert!(matches!(unknown_info_key("nonsense"), BeamError::BadArg));
