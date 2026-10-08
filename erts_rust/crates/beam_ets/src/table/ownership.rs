@@ -72,6 +72,15 @@
 //! valid for as long as the table does — exactly what the runtime needs to build the
 //! `{'ETS-TRANSFER', Tid, FromPid, Data}` message.
 //!
+//! A **creation-time** `{heir, Pid, Data}` option is copied the same way, at build
+//! time: [`TableOptions::set_heir`](crate::TableOptions::set_heir) records the raw
+//! term on the options (an option builder has no store), and
+//! [`Table::build_with`](super::Table) deep-copies it into the table's store through
+//! the **same** [`Table::copy_heir`] helper as `install_heir`, so a creation-time
+//! heir and one installed through `install_heir` behave identically downstream: the
+//! data is table-owned, survives the caller's heap, and its copy is reclaimed when
+//! the heir is replaced or cleared.
+//!
 //! # One reclaim path, whatever overwrites the heir
 //!
 //! Every overwrite site — [`Table::set_heir`], [`Table::setopts`]'s `{heir, …}` and
@@ -83,6 +92,8 @@
 
 use beam_common::Result;
 use beam_term::prelude::*;
+
+use crate::store::TermStore;
 
 use super::{OwnerId, Table};
 
@@ -116,6 +127,29 @@ pub enum SetOpt {
 }
 
 impl Table {
+    /// Deep-copy a **raw** heir's gift data into `store` (the A.1 copy boundary),
+    /// returning the [`Heir`] the table should hold.
+    ///
+    /// This is the **one** place the `{heir, …}` arity is interpreted for storage:
+    /// the arity-2 `None` form copies nothing and owns no storage, while the
+    /// arity-3 `Some(term)` form stores a table-owned copy of `term` (an immediate
+    /// is stored by value, and a `data` outside the store's copyable subset — a fun,
+    /// an off-heap bin ref, … — is the typed `badarg`). Both the **creation-time**
+    /// option ([`Table::build_with`](super::Table)) and [`Table::install_heir`] go
+    /// through it, so the two paths cannot drift.
+    pub(super) fn copy_heir(store: &mut TermStore, heir: Option<Heir>) -> Result<Option<Heir>> {
+        match heir {
+            Some(Heir { owner, data }) => {
+                let data = match data {
+                    Some(term) => Some(store.copy(term)?),
+                    None => None,
+                };
+                Ok(Some(Heir { owner, data }))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Install `owner` as the heir with `data` as the gift data, **deep-copying
     /// `data` into table-owned storage** (the A.1 copy boundary) when it is present.
     ///
@@ -141,14 +175,8 @@ impl Table {
     /// a `data` outside the store's copyable subset (a fun, an off-heap bin ref, …)
     /// returns the typed `badarg` and leaves the current heir untouched.
     pub fn install_heir(&mut self, owner: OwnerId, data: Option<Eterm>) -> Result<()> {
-        let stored = match data {
-            Some(term) => Some(self.store.copy(term)?),
-            None => None,
-        };
-        self.replace_heir(Some(Heir {
-            owner,
-            data: stored,
-        }));
+        let heir = Table::copy_heir(&mut self.store, Some(Heir { owner, data }))?;
+        self.replace_heir(heir);
         Ok(())
     }
 

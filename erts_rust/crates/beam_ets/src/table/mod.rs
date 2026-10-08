@@ -199,6 +199,10 @@ impl Table {
 
     /// The shared constructor: assemble the metadata, the store and the interior
     /// for `opts`, with the default `set` and `ordered_set` interiors.
+    ///
+    /// A creation-time `{heir, Pid, Data}` option installs the initial heir, whose
+    /// gift data is deep-copied into the table's store (see
+    /// [`build_with`](Table::build_with)).
     fn build(id: TableId, opts: TableOptions, store: TermStore) -> Result<Table> {
         Table::build_with(
             id,
@@ -213,14 +217,17 @@ impl Table {
     fn build_with(
         id: TableId,
         opts: TableOptions,
-        store: TermStore,
+        mut store: TermStore,
         set_interior: SetInterior,
         ordered_interior: OrderedInterior,
     ) -> Result<Table> {
         let interior = build_interior(opts.kind(), set_interior, ordered_interior);
         // A creation-time `{heir, Pid, Data}` option (if any) is the table's
-        // initial heir; `ets:setopts/2` replaces it later.
-        let heir = opts.heir();
+        // initial heir; `ets:setopts/2` replaces it later. Its gift data is
+        // deep-copied into the table's own store through the same helper as
+        // `install_heir`, so it is table-owned (it survives the caller's heap being
+        // dropped) and its copy is reclaimed when the heir is replaced or cleared.
+        let heir = Table::copy_heir(&mut store, opts.heir())?;
         Ok(Table {
             id,
             opts,

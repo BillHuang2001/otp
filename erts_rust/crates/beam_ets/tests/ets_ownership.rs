@@ -40,6 +40,14 @@ fn table_with_owner(owner: OwnerId) -> Table {
     t
 }
 
+/// A table built with a **creation-time** `{heir, Pid, Data}` option (the `data`
+/// is the caller's raw term; `Table::build` deep-copies it into table storage).
+fn table_with_creation_heir(kind: TableKind, owner: OwnerId, data: Option<Eterm>) -> Table {
+    let mut opts = TableOptions::new();
+    opts.set_kind(kind).set_heir(Some(Heir { owner, data }));
+    Table::new(TableId::next(), opts).expect("a fresh table is constructible")
+}
+
 /// A successful `give_away/3` moves ownership to the (different) target; the
 /// former owner no longer owns the table.
 #[test]
@@ -635,6 +643,128 @@ fn reinstalling_the_installed_heir_keeps_its_gift_copy_alive() {
         expected,
         &AtomTable::new()
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Creation-time heir: the gift data is copied at build time
+// ---------------------------------------------------------------------------
+
+/// A **creation-time** `{heir, Pid, Data}` gift term is deep-copied into
+/// table-owned storage by [`Table::build`] — exactly as [`Table::install_heir`]
+/// does for a later `setopts/2` — so the table never holds a pointer into the
+/// calling process's heap (the C `ets_new` → `insert_heir` copies the same way:
+/// `erl_db.c` `insert_heir`:5286-5296 + `erts_db_alloc(ERTS_ALC_T_DB_HEIR_DATA, …)`).
+#[test]
+fn creation_time_heir_copies_the_gift_data_into_table_owned_storage() {
+    // A boxed gift term on a caller-owned (process-like) heap.
+    let mut source = Heap::new(64);
+    let source_root = int_tuple(&mut source, &[1, 2, 3]);
+
+    let t = table_with_creation_heir(TableKind::Set, OwnerId::new(9), Some(source_root));
+
+    let installed = t
+        .heir_data()
+        .expect("the creation-time heir (and its gift data) is installed");
+    assert_ne!(
+        installed.raw(),
+        source_root.raw(),
+        "the creation-time gift data is deep-copied, never aliased into the caller's heap"
+    );
+    assert_eq!(
+        t.heir(),
+        Some(Heir {
+            owner: OwnerId::new(9),
+            data: Some(installed),
+        })
+    );
+
+    // The caller's heap dies here. The installed term is table-owned, so it still
+    // reads back intact — the whole point of the copy.
+    drop(source);
+    let mut reference = Heap::new(64);
+    let expected = int_tuple(&mut reference, &[1, 2, 3]);
+    assert!(
+        eq(installed, expected, &AtomTable::new()),
+        "the table-owned creation-time gift copy survives the caller's heap"
+    );
+}
+
+/// A creation-time **immediate** gift term is stored by value (it owns no storage),
+/// so the table's heir data is exactly the term the option carried.
+#[test]
+fn creation_time_heir_stores_an_immediate_by_value() {
+    let t = table_with_creation_heir(TableKind::Set, OwnerId::new(4), Some(make_small(42)));
+    assert_eq!(
+        t.heir_data().map(|term| term.raw()),
+        Some(make_small(42).raw()),
+        "an immediate is stored by value, not copied"
+    );
+    assert_eq!(
+        t.heir(),
+        Some(Heir {
+            owner: OwnerId::new(4),
+            data: Some(make_small(42)),
+        })
+    );
+}
+
+/// Clearing or replacing a **creation-time** heir reclaims the copy's words — the
+/// same reclaim path as a later `install_heir` — so the creation-time gift no longer
+/// leaks and `Table::memory()` returns to the pre-heir baseline.
+#[test]
+fn clearing_or_replacing_a_creation_time_heir_reclaims_the_copy() {
+    // The footprint of the same table with no heir at all.
+    let baseline = new_table(TableKind::Set).memory();
+
+    // (a) clearing the creation-time boxed gift via the raw `set_heir(None)`.
+    let mut heap = Heap::new(64);
+    let gift = int_tuple(&mut heap, &[1, 2, 3]);
+    let mut t = table_with_creation_heir(TableKind::Set, OwnerId::new(9), Some(gift));
+    assert!(
+        t.memory() > baseline,
+        "the creation-time gift copy owns table-owned words"
+    );
+    t.set_heir(None);
+    assert_eq!(
+        t.memory(),
+        baseline,
+        "set_heir(None) reclaimed the creation-time copy"
+    );
+    assert_eq!(t.heir_data(), None);
+
+    // (b) replacing it with an arity-2 heir via `install_heir(_, None)`.
+    let mut heap = Heap::new(64);
+    let gift = int_tuple(&mut heap, &[4, 5, 6]);
+    let mut t = table_with_creation_heir(TableKind::Set, OwnerId::new(9), Some(gift));
+    assert!(t.memory() > baseline);
+    t.install_heir(OwnerId::new(4), None)
+        .expect("an absent gift data owns no storage");
+    assert_eq!(
+        t.memory(),
+        baseline,
+        "install_heir(_, None) reclaimed the creation-time copy"
+    );
+    assert_eq!(
+        t.heir(),
+        Some(Heir {
+            owner: OwnerId::new(4),
+            data: None,
+        })
+    );
+
+    // (c) replacing it with an immediate gift via `install_heir` (also reclaims).
+    let mut heap = Heap::new(64);
+    let gift = int_tuple(&mut heap, &[7, 8, 9]);
+    let mut t = table_with_creation_heir(TableKind::Set, OwnerId::new(9), Some(gift));
+    assert!(t.memory() > baseline);
+    t.install_heir(OwnerId::new(4), Some(make_small(1)))
+        .expect("an immediate needs no storage");
+    assert_eq!(
+        t.memory(),
+        baseline,
+        "install_heir(_, immediate) reclaimed the creation-time copy"
+    );
+    assert_eq!(t.heir_data(), Some(make_small(1)));
 }
 // ---------------------------------------------------------------------------
 // Live-oracle cross-check of the owner-death observations

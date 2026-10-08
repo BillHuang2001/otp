@@ -238,7 +238,9 @@ fn creation_time_heir_is_adopted() {
         "a set heir renders as `undefined` (no pid term)"
     );
 
-    // (b) `{heir, Pid, Data}` — the gift data is stored verbatim on `Heir`.
+    // (b) `{heir, Pid, Data}` — the gift data is carried on the table's heir (here
+    // an immediate, which `Table::build` stores by value). The copy-into-table-
+    // storage behaviour is pinned in `ets_ownership.rs`.
     let mut opts = TableOptions::new();
     let gift = Heir {
         owner: OwnerId::new(4),

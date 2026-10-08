@@ -247,9 +247,11 @@ pub struct TableOptions {
     read_concurrency: bool,
     /// The **creation-time** heir (`{heir, Pid}` / `{heir, Pid, Data}`), if one was
     /// given. The value is adopted by [`Table::build`](crate::Table) as the table's
-    /// initial heir; `ets:setopts(T, {heir, …})` replaces it later. Its
-    /// [`data`](Heir::data) records the option's arity (`Some` for arity 3, `None`
-    /// for arity 2).
+    /// initial heir, which **deep-copies** its gift data into table-owned storage
+    /// (so the stored term does not alias the caller's heap); `ets:setopts(T,
+    /// {heir, …})` replaces it later. Its [`data`](Heir::data) records the option's
+    /// arity (`Some` for arity 3, `None` for arity 2) and holds the caller's raw
+    /// term here — the copy happens when the table is built, not in this builder.
     heir: Option<Heir>,
     /// The explicit `{decentralized_counters, Bool}` creation option, if given.
     /// `None` means "not requested", i.e. the kind's default (see
@@ -346,10 +348,12 @@ impl TableOptions {
     /// the oracle sends **no** `{'ETS-TRANSFER', …}` message on owner death). That
     /// distinction is the parser's to get right, just like the `none`/pid check.
     ///
-    /// The creation-time heir is stored **verbatim** (no copy into table storage):
-    /// a non-immediate `data` term must be one the caller keeps alive for the table's
-    /// lifetime — use [`Table::install_heir`](crate::Table::install_heir) when the
-    /// data lives on a process heap.
+    /// This builder records the gift data **as given** (it has no store of its own);
+    /// [`Table::build`](crate::Table) then **deep-copies** it into the table's
+    /// table-owned storage, exactly as [`Table::install_heir`](crate::Table::install_heir)
+    /// does for a later `setopts/2`, so the resulting creation-time heir does not
+    /// alias the caller's heap and its copy is reclaimed when the heir is replaced
+    /// or cleared.
     pub fn set_heir(&mut self, heir: Option<Heir>) -> &mut Self {
         self.heir = heir;
         self
@@ -431,6 +435,10 @@ impl TableOptions {
 
     /// The creation-time heir, if one was requested. Its [`data`](Heir::data) is
     /// `Some(term)` for `{heir, Pid, Data}` and `None` for `{heir, Pid}`.
+    ///
+    /// This is the **raw** option: a non-immediate `data` is the caller's term,
+    /// recorded as given. [`Table::build`](crate::Table) deep-copies it into
+    /// table-owned storage when the table is constructed.
     pub fn heir(&self) -> Option<Heir> {
         self.heir
     }
@@ -716,9 +724,11 @@ mod tests {
         assert!(!ordered.decentralized_counters());
     }
 
-    /// The creation-time heir is stored verbatim (gift data included) and can be
-    /// cleared, exactly like `{heir, Pid, Data}` / `{heir, none}` at creation. The
-    /// arity-2 `{heir, Pid}` form is the `data: None` heir.
+    /// The creation-time heir is stored on the options **as given** (gift data
+    /// included — the copy into table storage happens later, in
+    /// [`Table::build`](crate::Table)) and can be cleared, exactly like
+    /// `{heir, Pid, Data}` / `{heir, none}` at creation. The arity-2
+    /// `{heir, Pid}` form is the `data: None` heir.
     #[test]
     fn creation_time_heir_is_stored_and_cleared() {
         let mut opts = TableOptions::new();
