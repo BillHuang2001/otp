@@ -348,30 +348,35 @@ pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
     unsupported(&format!("receive: process {pid:?} has no mailbox"))
 }
 
-/// The `erlang` BIFs that are **known** (they are part of the OTP `erlang` surface) but
-/// deliberately not implemented by Milestone-1.
-///
-/// A call to one of these must never be reported as the *plain* `erlang:X/Y is not a BIF`
-/// diagnostic a **genuinely unknown** `erlang` name gets (such a name now raises the bare
-/// [`undef`] the oracle does): that would present a documented capability gap as a genuine
-/// runtime error. It is classified as *unsupported* instead
-/// (exit code [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED)) — see
-/// [`known_unimplemented_bif`].
+/// The `erlang`-namespace calls classified as **known** capability gaps rather than the
+/// *plain* `erlang:X/Y is not a BIF` diagnostic a **genuinely unknown** `erlang` name
+/// gets (such a name now raises the bare [`undef`] the oracle does): that would present a
+/// documented capability gap as a genuine runtime error. A listed call is classified as
+/// *unsupported* instead (exit code [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED)) —
+/// see [`known_unimplemented_bif`].
 ///
 /// This list is the **candidate** set, not the answer: [`is_known_unimplemented_bif`]
 /// intersects it with the live `beam_bifs` registry at use time, so a name the registry
 /// has since grown is never shadowed and the two can never drift apart (see the
 /// [`is_known_unimplemented_bif`] docs). A name in `beam_bifs`' `erlang` registry is
 /// therefore dead weight here — remove it when you notice it — but it is *harmless*.
-/// The list is curated rather than generated: a name is added when the runtime answers it
-/// with a plain `not a BIF` diagnostic and it is in fact an OTP BIF.
+///
+/// `beam_bifs` now registers **every** declared `bif.tab` entry, routing each through its
+/// `RuntimeHooks` seam (the typed `unsupported_bif` capability gap until the runtime
+/// installs a hook). A name the registry owns is therefore reached by `call_bif` *before*
+/// this fallback and must never be listed here; what remains is the residue of
+/// `erlang`-namespace calls that carry **no** declared `bif.tab` entry under the `erlang`
+/// module — the OTP `erlang` functions whose implementation is an `erts_internal:*` BIF
+/// (`port_control/3`, `process_flag/3`, `suspend_process/1`, `system_monitor/1`,
+/// `garbage_collect/1`, ...) or an `erlang.erl` wrapper, which the registry cannot own.
+/// The list is curated rather than generated: a name is added as it is noticed reaching
+/// the fallback with a plain `not a BIF` diagnostic.
 pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
-    ("nodes", 0),
-    ("node", 1),
+    // The distribution/node surface the release carries without an `erlang`-module
+    // `bif.tab` entry.
     ("set_cookie", 2),
     ("disconnect_node", 1),
-    ("monitor_node", 2),
-    ("monitor_node", 3),
+    // Ports: declared as `erts_internal:port_*`.
     ("port_connect", 2),
     ("port_control", 3),
     ("port_call", 3),
@@ -379,54 +384,30 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("spawn_request", 3),
     ("spawn_request", 4),
     ("spawn_request", 5),
-    ("exit", 2),
-    ("link", 1),
-    ("unlink", 1),
-    ("is_process_alive", 1),
-    ("process_flag", 2),
+    // Process control: `process_flag/3`, `suspend_process/1` and `process_display/2` are
+    // declared as `erts_internal:` BIFs.
     ("process_flag", 3),
-    ("process_info", 1),
     ("process_display", 2),
     ("suspend_process", 1),
-    ("resume_process", 1),
     ("register", 3),
-    ("registered", 0),
     ("system_monitor", 0),
     ("system_monitor", 1),
     ("system_monitor", 2),
-    ("system_profile", 0),
     ("system_profile", 1),
-    ("system_profile", 2),
-    ("start_timer", 3),
-    ("start_timer", 4),
-    ("cancel_timer", 2),
-    ("send_after", 4),
+    // Garbage collection: `erts_internal:garbage_collect/1` hosts the collector entry.
     ("garbage_collect", 0),
     ("garbage_collect", 1),
     ("garbage_collect", 2),
-    ("get", 0),
-    ("erase", 0),
+    // Code loading and application.
     ("apply", 1),
     ("function_exported", 2),
-    ("function_exported", 3),
     ("load_module", 2),
     ("load_module", 3),
-    ("md5", 1),
-    ("md5_init", 0),
-    ("md5_update", 2),
-    ("md5_final", 1),
+    // The system/time surface.
     ("system_info", 2),
-    ("localtime", 0),
-    ("universaltime", 0),
     ("localtime_to_universaltime", 1),
-    ("localtime_to_universaltime", 2),
-    ("universaltime_to_localtime", 1),
     ("statistics", 0),
-    ("statistics", 1),
-    ("crc32", 2),
-    ("error", 3),
-    ("insert_element", 3),
-    ("delete_element", 2),
+    // The removed term-manipulation BIFs.
     ("map_get", 3),
     ("concatenate", 2),
 ];
@@ -781,20 +762,37 @@ mod tests {
     #[test]
     fn known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry() {
         let registry = beam_bifs::default_registry();
-        // A curated entry is a documented capability gap, classified by the same
-        // convention as every other `unsupported*` raise (so the CLI exits 3), not the
-        // plain `is not a BIF` diagnostic a typo gets.
-        assert!(listed_as_unimplemented("nodes", 0));
-        assert!(is_known_unimplemented_bif(&registry, "nodes", 0));
-        assert!(unsupported_reason(&known_unimplemented_bif("nodes", 0)).is_some());
+        // The curated list is the **candidate** set of `erlang`-namespace calls this runtime
+        // reaches with the plain `not a BIF` diagnostic. Derive the invariant from the live
+        // registry rather than hardcoding names: a curated entry must never be a name the
+        // registry already owns (the registry is consulted first, so such an entry is dead
+        // weight and would mis-describe a served BIF as a capability gap).
         assert!(
-            unsupported_reason(&known_unimplemented_bif("nodes", 0))
-                .expect("a capability gap")
-                .contains("erlang:nodes/0")
+            !KNOWN_UNIMPLEMENTED_ERLANG_BIFS.is_empty(),
+            "the list carries the `erlang` gaps the registry does not own"
         );
-        // An arity that is not curated is not a known gap.
-        assert!(!listed_as_unimplemented("nodes", 1));
-        assert!(!is_known_unimplemented_bif(&registry, "nodes", 1));
+        for &(function, arity) in KNOWN_UNIMPLEMENTED_ERLANG_BIFS {
+            assert!(
+                !registry.contains("erlang", function, arity),
+                "erlang:{function}/{arity} is registry-owned and must not be curated"
+            );
+            assert!(
+                is_known_unimplemented_bif(&registry, function, arity),
+                "erlang:{function}/{arity} is curated and unregistered: an effective gap"
+            );
+            // A curated entry is a documented capability gap, classified by the same
+            // convention as every other `unsupported*` raise (so the CLI exits 3), not the
+            // plain `is not a BIF` diagnostic a typo gets.
+            let reason = unsupported_reason(&known_unimplemented_bif(function, arity))
+                .expect("a curated gap is a capability gap");
+            assert!(
+                reason.contains(&format!("erlang:{function}/{arity}")),
+                "the gap diagnostic names erlang:{function}/{arity}: {reason:?}"
+            );
+        }
+        // A name that is neither curated nor registered is not a known gap: it gets the bare
+        // `undef` a typo gets.
+        assert!(!listed_as_unimplemented("nope", 1));
         assert!(!is_known_unimplemented_bif(&registry, "nope", 1));
     }
 
@@ -837,36 +835,36 @@ mod tests {
     #[test]
     fn the_effective_gap_set_never_shadows_the_registry() {
         // The **effective** gap set — the curated list intersected with what the live
-        // registry does *not* own — must be disjoint from the registry. That is the
-        // drift guard: a `beam_bifs` change that registers a name the static list still
-        // carries can never turn a served BIF into an `unsupported` capability gap,
-        // because the intersection drops it.
+        // registry does *not* own — must be disjoint from the registry. That is the drift
+        // guard: a `beam_bifs` change that registers a name the static list still carries can
+        // never turn a served BIF into an `unsupported` capability gap, because the
+        // intersection drops it. Derive the check from the live registry rather than
+        // hardcoding names.
         let registry = beam_bifs::default_registry();
+        let mut registered_erlang = 0usize;
         for (module, function, arity) in registry.names() {
+            if module != "erlang" {
+                continue;
+            }
+            registered_erlang += 1;
             assert!(
-                !(module == "erlang" && is_known_unimplemented_bif(&registry, &function, arity)),
+                !is_known_unimplemented_bif(&registry, &function, arity),
                 "erlang:{function}/{arity} is a registered BIF and must not be classified as an unimplemented gap"
             );
         }
-        // The guard is not vacuous: a name the registry does *not* own that is on the list
-        // still classifies as a gap …
-        assert!(!registry.contains("erlang", "nodes", 0));
-        assert!(is_known_unimplemented_bif(&registry, "nodes", 0));
-        // … and a listed name the registry *has* since grown (the drift this intersection
-        // exists to absorb) is a registered BIF, never a gap.
-        for grown in [("phash", 2), ("phash2", 1), ("phash2", 2)] {
-            assert!(
-                registry.contains("erlang", grown.0, grown.1),
-                "erlang:{}/{} must be registered",
-                grown.0,
-                grown.1
-            );
-            assert!(
-                !is_known_unimplemented_bif(&registry, grown.0, grown.1),
-                "erlang:{}/{} is registered and must not be a gap",
-                grown.0,
-                grown.1
-            );
-        }
+        // The guard is not vacuous: the registry really does own `erlang` keys (so the loop
+        // above exercises the drift this intersection absorbs) …
+        assert!(
+            registered_erlang > 0,
+            "the registry owns `erlang` BIFs for the drift guard to exercise"
+        );
+        // … and a curated name the registry does *not* own still classifies as a gap.
+        let (function, arity) = KNOWN_UNIMPLEMENTED_ERLANG_BIFS
+            .iter()
+            .find(|&&(function, arity)| !registry.contains("erlang", function, arity))
+            .copied()
+            .expect("a curated name the registry does not own");
+        assert!(!registry.contains("erlang", function, arity));
+        assert!(is_known_unimplemented_bif(&registry, function, arity));
     }
 }

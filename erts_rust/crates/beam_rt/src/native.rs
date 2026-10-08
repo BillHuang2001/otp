@@ -1133,28 +1133,45 @@ mod tests {
         }
     }
 
-    /// The timer BIFs are no longer capability gaps: `send_after/3` and `cancel_timer/1`
-    /// are served by this floor, so only the remaining arities stay listed.
+    /// The timer BIFs are no longer capability gaps: `send_after/3` and `cancel_timer/1` are
+    /// served by this floor (which runs *before* the registry), and `beam_bifs` now registers
+    /// **every** declared `bif.tab` key, so the remaining arities resolve through its
+    /// `RuntimeHooks` seam — the typed `unsupported_bif` gap until the runtime adopts a hook —
+    /// instead of through the `erlang`-namespace fallback. None of them is a curated gap.
     #[test]
     fn the_timer_bifs_are_no_longer_reported_as_gaps() {
-        let runtime = runtime();
-        for (function, arity) in [("send_after", 3), ("cancel_timer", 1)] {
-            assert!(
-                !error::is_known_unimplemented_bif(&runtime.registry, function, arity),
-                "{function}/{arity} is served by the floor"
-            );
-        }
+        let mut runtime = runtime();
         for (function, arity) in [
+            ("send_after", 3),
+            ("cancel_timer", 1),
             ("send_after", 4),
             ("cancel_timer", 2),
             ("start_timer", 3),
             ("start_timer", 4),
         ] {
             assert!(
-                error::is_known_unimplemented_bif(&runtime.registry, function, arity),
-                "{function}/{arity} is still a Milestone-1 gap"
+                runtime.registry.contains("erlang", function, arity),
+                "erlang:{function}/{arity} is registry-owned"
+            );
+            assert!(
+                !error::is_known_unimplemented_bif(&runtime.registry, function, arity),
+                "erlang:{function}/{arity} must not be classified as a curated gap"
             );
         }
+        // The behaviour behind that ownership is the typed capability gap (exit 3), not the
+        // bare `undef` the `erlang`-namespace fallback raises for an unknown name.
+        let error = call(
+            &mut runtime,
+            "erlang",
+            "send_after",
+            &[make_small(10), make_small(1), make_small(2), make_small(3)],
+        )
+        .expect_err("send_after/4 has no host hook installed");
+        assert_eq!(
+            error::unsupported_reason(&error).as_deref(),
+            Some("bif"),
+            "send_after/4 is the registry's typed unsupported_bif gap: {error}"
+        );
     }
 
     // -- os:cmd/1 -------------------------------------------------------------
