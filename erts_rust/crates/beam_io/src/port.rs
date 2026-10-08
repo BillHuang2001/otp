@@ -522,6 +522,21 @@ impl Port {
         self.driver.take_exit_status()
     }
 
+    /// Takes the port's end-of-file notification, once.
+    ///
+    /// Forwards to the driver's [`Driver::take_eof`]: `Ok(true)` means the port's input stream
+    /// reached end-of-file and the port asked for the `eof` option — the signal a runtime turns
+    /// into the bare `eof` message the oracle delivers. `Ok(false)` means "nothing to report"
+    /// (no `eof` option, no end-of-file yet, or already reported); a port whose driver never
+    /// streams input always answers `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the driver's `take_eof` returns.
+    pub fn take_eof(&mut self) -> Result<bool> {
+        self.driver.take_eof()
+    }
+
     /// Tells the driver this port is exiting, **at most once**.
     ///
     /// Forwards `reason` to [`Driver::port_exit`] — the driver's advisory exit-notification

@@ -373,6 +373,26 @@ pub trait Driver {
         Ok(None)
     }
 
+    /// Takes the port's **end-of-file** notification, **once**, when the port asked for it.
+    ///
+    /// A port opened with the `eof` option is told its input stream ended: the oracle delivers a
+    /// bare `eof` message (not a `{Port, {data, …}}`) once the child's stdout reaches end of
+    /// file. `Ok(true)` means "the stream reached end-of-file and this is the first time it is
+    /// reported"; `Ok(false)` means "nothing to report yet" — because the option was not asked
+    /// for, because end-of-file has not been observed, or because it was already reported.
+    ///
+    /// A driver that never streams input — the built-in [`crate::drivers::FdDriver`] and
+    /// [`crate::drivers::EfileDriver`] — inherits the default (`Ok(false)`), so this capability
+    /// is purely additive; it is the input-side counterpart of
+    /// [`Driver::take_exit_status`] (surfaced as [`crate::PortRegistry::take_eof`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `beam_common::BeamError` when the check fails.
+    fn take_eof(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Tells the driver its port is exiting, **before** [`Driver::stop`] tears it down.
     ///
     /// This is the driver-facing **port-exit notification channel**: on its port-exit path

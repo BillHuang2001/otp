@@ -381,6 +381,24 @@ impl PortRegistry {
         }
     }
 
+    /// Takes port `id`'s end-of-file notification, once.
+    ///
+    /// This is the seam a runtime uses to synthesize the bare `eof` message of a port opened
+    /// with the `eof` option: `Ok(true)` is reported exactly once, when the port's input stream
+    /// reached end of file; `Ok(false)` means "not asked for", "not reached yet" or "already
+    /// reported" (see [`crate::drivers::SpawnDriver`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the port's driver
+    /// returns.
+    pub fn take_eof(&mut self, id: PortId) -> Result<bool> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => port.take_eof(),
+            None => Err(error::badarg()),
+        }
+    }
+
     /// Arms port `id`'s `TIMEOUT` task at `deadline`, replacing any deadline already armed.
     ///
     /// This is the runtime's explicit timer entry point and the driver-facing timer seam's
