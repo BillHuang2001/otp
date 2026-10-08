@@ -1310,18 +1310,25 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// which is how the real system delivers a large message at all. Any other failure is
     /// propagated untouched, and the ordinary (small-payload) path is unchanged.
     ///
-    /// A completed send also produces two **events** (contract A.8, item 1): the ordinary
+    /// A completed send also produces **events** (contract A.8, item 1): the ordinary
     /// `{trace, Sender, send, Msg, To}` — when the *sending* process is `[send]`-traced — and
     /// the sequential-trace `{seq_trace, Label, {send, …}}` when its token has the `send`
     /// flag. Both are delivered to the relevant tracer as messages of their own, after the
-    /// payload ([`Self::trace_send_events`]).
+    /// payload ([`Self::trace_send_events`]). A third event follows when the **receiver** is
+    /// `['receive']`-traced: `{trace, Receiver, 'receive', Msg}`, emitted here (never from the
+    /// internal delivery bypass, which would recurse) by [`Self::trace_receive_events`].
     ///
     /// [`DeliverOutcome::Woke`]: beam_process::DeliverOutcome::Woke
     fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
         let target = ProcessId::from_eterm(to)?;
         let from = self.mailbox_pid.to_eterm();
         self.deliver_message(target, from, message)?;
-        self.trace_send_events(to, message)
+        self.trace_send_events(to, message)?;
+        // The delivered message is also a `receive` event for the **receiver** — gated on the
+        // receiver's own `receive` flag, emitted after the `send` event, and emitted here (the
+        // public send seam) rather than in `deliver_message`, which is the bypass every trace
+        // event itself is delivered through: emitting there would recurse forever.
+        self.trace_receive_events(target, message)
     }
 
     /// `loop_rec`: the candidate at the current mailbox scan position, `Ok(None)` when
