@@ -88,7 +88,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 ### Built-in workloads
 | id | category | target repo / tool | today | skip reason(s) |
 |---|---|---|---|---|
-| `baseline` | startup | oracle `erl` | **runs** (sys+rust) | `beam_rt` compute loop unimplemented (noted on the rust row, not skipped) |
+| `baseline` | startup | oracle `erl` | **runs** (sys+rust) | `beam_rt` `erlang:memory/0,1` probe unsupported ⇒ an explicit `not-run` note on the rust memory probe (the compute loop itself runs on both) |
 | `erlc_compiler` | compiler | `erlc` over OTP stdlib **+** Elixir `lib/elixir/src` `.erl` sources | **runs** (quick+full) | `erlc-absent`, `corpus-missing` |
 | `elixir_compiler` | compiler | system `elixirc` over a staged `.ex` corpus from the Elixir checkout | **runs** (quick+full) | `elixirc-absent`, `corpus-missing`, `repo-missing` |
 | `plb` | compute | `/home/bill/Source/Programming-Language-Benchmarks` (`dotnet` driver) | skipped / `failed` | `dotnet-absent`, `repo-missing`, `plb-tool-failed`, `plb-no-results` |
