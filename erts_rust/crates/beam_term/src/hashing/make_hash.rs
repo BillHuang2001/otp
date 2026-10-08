@@ -122,7 +122,7 @@ fn hash_tag_def(t: Eterm) -> TermResult<HOp> {
             m if m == TAG_IMMED1_SMALL => Ok(HOp::Small),
             _ => Err(TermError::BadFun),
         },
-        PrimaryTag::Header => Err(TermError::BadFun),
+        PrimaryTag::Header => Err(TermError::NotATerm),
     }
 }
 

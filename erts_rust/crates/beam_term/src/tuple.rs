@@ -6,7 +6,7 @@
 use std::sync::LazyLock;
 
 use crate::boxed::{
-    arityval, boxed_val, is_arity_value, is_boxed, make_arityval_unchecked, make_boxed,
+    arityval, boxed_val, is_arity_value, is_boxed_term, make_arityval_unchecked, make_boxed,
 };
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
@@ -33,7 +33,7 @@ pub const fn tuple_val(x: Eterm) -> *mut Eterm {
 /// If `x` is boxed, its header word must be a live, aligned term word.
 #[inline]
 pub unsafe fn is_tuple(x: Eterm) -> bool {
-    if !is_boxed(x) {
+    if !is_boxed_term(x) {
         return false;
     }
     unsafe { is_arity_value(*boxed_val(x)) }
@@ -57,7 +57,7 @@ pub unsafe fn is_not_tuple(x: Eterm) -> bool {
 /// If `x` is boxed, its header word must be a live, aligned term word.
 #[inline]
 pub unsafe fn is_tuple_arity(x: Eterm, arity: usize) -> bool {
-    if !is_boxed(x) {
+    if !is_boxed_term(x) {
         return false;
     }
     unsafe { *boxed_val(x) == make_arityval_unchecked(arity) }

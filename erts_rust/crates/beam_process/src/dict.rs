@@ -27,39 +27,93 @@
 //! and the BIF layer maps it to the `undefined` atom. Storing an `undefined` atom inside the
 //! [`Dict`] would be a layout assumption this crate must not make, so it never does.
 //!
-//! # Key equality (documented Milestone-1 limitation)
+//! # Key equality — the C's `EQ`
 //!
-//! Keys are compared by **raw `Eterm` word equality**. That is exact for every immediate —
-//! small integers, atoms, local pids/ports, `NIL` — which is what process dictionaries hold
-//! in practice, and for the *same* boxed object. Structural equality of two distinct but
-//! equal *boxed* terms (e.g. two separately built `{a,b}` tuples) needs
-//! [`beam_term::compare::eq`], which takes an [`beam_term::AtomTable`]; this crate keeps
-//! [`Dict`] term-agnostic and atom-table-free by contract, so that case is a documented
-//! follow-up rather than a hidden dependency.
+//! Keys — and, for `get_keys/1`, **values** — are compared with
+//! [`beam_term::compare::eq`], the structural `=:=` comparator that the C's `EQ` macro
+//! implements (`erts/emulator/beam/erl_utils.h:113`: `EQ(x,y) = ((x) == (y)) ||
+//! (is_not_both_immed(x,y) && eq(x,y))` — a raw-word fast path for immediates, a structural
+//! walk for boxed terms).
+//! `erlang:put({a},1), erlang:get({a})` therefore returns `1` even though the two `{a}`
+//! tuples are two *distinct* heap words: `erl_process_dict.c` uses `EQ` for the key
+//! (`:400`, `:410`, `:478`, `:482`) and for the value (`:559`, `:566`), never raw word
+//! equality alone.
+//!
+//! [`Dict`] carries the [`AtomTable`] the comparator resolves atom *names* through, as a
+//! cheap [`Rc`] handle — the same convention `beam_rt`'s `CodeServer` (one shared table
+//! for every loaded module) and its persistent-term store use. [`Dict::new`] starts with
+//! an **empty** table: an unknown name falls back to the raw atom index, which is exactly
+//! what the C does for two immediates and is exact while the runtime keeps one append-only
+//! atom-index space (it does — `CodeServer` interns every module into one table). An owner
+//! holding that shared table hands it over with [`Dict::with_atoms`], so the comparator
+//! resolves names instead of relying on the fallback.
+//!
+//! # Iteration order (documented deviation, unchanged by the equality fix)
+//!
+//! `erlang:get/0`, `erlang:get_keys/0` and `erlang:erase/0` report the pairs in
+//! **insertion order** here. The C instead walks its hash array (`pd_hash_get_all`,
+//! `erl_process_dict.c:579-626`) and prepends each entry to the result, so the oracle's
+//! order is an artifact of its hash slots and of the array's grow/shrink history: on OTP
+//! 29.1.1 `put(a,1), put(b,2), get()` reports `[{b,2},{a,1}]` while
+//! `put(1,1), put(2,2), put(3,3), get()` reports `[{3,3},{2,2},{1,1}]`. Reproducing that
+//! means porting the hash array — the O(1)-lookup optimization this module deliberately
+//! defers (see the top of the module). The **value** semantics are unaffected and are
+//! pinned by tests: `put` replaces in place, returns the replaced value (last put wins),
+//! `get` returns the last `put`'s value and `erase` returns the erased value.
 
-use beam_term::prelude::Eterm;
+use std::rc::Rc;
+
+use beam_term::compare;
+use beam_term::prelude::{AtomTable, Eterm};
 
 /// The per-process dictionary: an ordered set of `(Key, Value)` pairs.
 ///
 /// The pairs are kept in **insertion order**, with `put` on an existing key replacing the
-/// value in place (last put wins) so the order is stable across overwrites — matching the C,
-/// which reuses the slot of an existing key. See the module docs for the semantics and the
-/// term-ownership contract.
+/// value in place (last put wins) so the order is stable across overwrites. See the module
+/// docs for the semantics, the term-ownership contract, the [`beam_term::compare::eq`] key
+/// equality and the documented iteration-order deviation.
 pub struct Dict {
     entries: Vec<(Eterm, Eterm)>,
+    /// The atom table the structural comparison resolves atom names through (see the module
+    /// docs). A cheap [`Rc`] handle, shared with every other holder of the table.
+    atoms: Rc<AtomTable>,
 }
 
 impl Dict {
     /// An empty dictionary.
+    ///
+    /// Its comparisons run against an **empty** atom table, so an atom's name is unknown and
+    /// the comparator falls back to the raw atom index — exactly the C's `EQ` behaviour for
+    /// two immediates, and exact while the runtime keeps one append-only atom-index space.
+    /// Use [`Dict::with_atoms`] to compare through a real (shared) table.
     pub fn new() -> Dict {
         Dict {
             entries: Vec::new(),
+            atoms: Rc::new(AtomTable::new()),
         }
     }
 
-    /// The index of the pair whose key raw-equals `key`, if any.
+    /// An empty dictionary comparing terms through `atoms`.
+    ///
+    /// The owner that holds the runtime's one shared atom table (the table every loaded module
+    /// and every BIF interns into) passes a handle to it here, so the structural comparison
+    /// resolves atom *names* rather than raw indices.
+    pub fn with_atoms(atoms: Rc<AtomTable>) -> Dict {
+        Dict {
+            entries: Vec::new(),
+            atoms,
+        }
+    }
+
+    /// The C's `EQ` (`erts/emulator/beam/erl_utils.h:113`): whether `a` and `b` are *the same
+    /// term* (`=:=`), structural for boxed terms, through the dictionary's atom table.
+    fn eq(&self, a: Eterm, b: Eterm) -> bool {
+        compare::eq(a, b, &self.atoms)
+    }
+
+    /// The index of the pair whose key equals `key`, if any.
     fn find(&self, key: Eterm) -> Option<usize> {
-        self.entries.iter().position(|&(stored, _)| stored == key)
+        self.entries.iter().position(|&(stored, _)| self.eq(stored, key))
     }
 
     /// Stores `value` under `key`, returning the **replaced** value.
@@ -101,11 +155,11 @@ impl Dict {
         self.entries.iter().map(|&(key, _)| key).collect()
     }
 
-    /// Every key whose value raw-equals `value`, in insertion order (`erlang:get_keys/1`).
+    /// Every key whose value equals `value`, in insertion order (`erlang:get_keys/1`).
     pub fn get_keys_for_value(&self, value: Eterm) -> Vec<Eterm> {
         self.entries
             .iter()
-            .filter(|&&(_, stored)| stored == value)
+            .filter(|&&(_, stored)| self.eq(stored, value))
             .map(|&(key, _)| key)
             .collect()
     }
@@ -171,7 +225,114 @@ mod tests {
     //! `gather_roots`/`scatter_roots` round-trip.
 
     use super::*;
-    use beam_term::prelude::make_small;
+    use beam_term::prelude::{make_atom, make_small, AtomTable, Heap, NIL};
+    use std::rc::Rc;
+
+    #[test]
+    fn a_boxed_key_matches_a_distinct_but_equal_term() {
+        // `erlang:put({a},1), erlang:get({a})` -> `1`: the two `{a}` tuples are two distinct
+        // heap words, so a raw-word key comparison would report the key as absent.
+        let mut atoms = AtomTable::new();
+        let a = make_atom(atoms.intern("a"));
+        let mut heap = Heap::new(64);
+        let stored = heap.tuple(&[a]).expect("the key fits");
+        let looked_up = heap.tuple(&[a]).expect("the second key fits");
+        assert_ne!(stored, looked_up, "the two tuples are distinct heap words");
+
+        let mut dict = Dict::with_atoms(Rc::new(atoms));
+        assert_eq!(dict.put(stored, make_small(1)), None);
+        assert_eq!(dict.get(looked_up), Some(make_small(1)));
+        assert_eq!(dict.len(), 1);
+
+        // Erasing by the *other* equal term removes the pair.
+        assert_eq!(dict.erase(looked_up), Some(make_small(1)));
+        assert!(dict.is_empty());
+    }
+
+    #[test]
+    fn a_nested_boxed_key_matches() {
+        // A key whose value is a composite: `{[1], {a, 2}}`.
+        let mut atoms = AtomTable::new();
+        let a = make_atom(atoms.intern("a"));
+        let mut heap = Heap::new(64);
+        let build = |heap: &mut Heap| {
+            let list = heap.cons(make_small(1), NIL).expect("the list fits");
+            let inner = heap.tuple(&[a, make_small(2)]).expect("the inner tuple fits");
+            heap.tuple(&[list, inner]).expect("the outer tuple fits")
+        };
+        let stored = build(&mut heap);
+        let looked_up = build(&mut heap);
+        assert_ne!(stored, looked_up);
+
+        let mut dict = Dict::new();
+        dict.put(stored, make_small(9));
+        assert_eq!(dict.get(looked_up), Some(make_small(9)));
+    }
+
+    #[test]
+    fn a_different_boxed_term_is_not_the_same_key() {
+        let mut atoms = AtomTable::new();
+        let a = make_atom(atoms.intern("a"));
+        let mut heap = Heap::new(64);
+        let one = heap.tuple(&[a, make_small(1)]).expect("the key fits");
+        let two = heap.tuple(&[a, make_small(2)]).expect("the other key fits");
+        let other_name = {
+            let b = make_atom(atoms.intern("b"));
+            heap.tuple(&[b, make_small(1)]).expect("the third key fits")
+        };
+
+        let mut dict = Dict::new();
+        dict.put(one, make_small(10));
+        assert_eq!(dict.get(two), None, "a different element is a different key");
+        assert_eq!(dict.get(other_name), None, "a different atom differs");
+        // Both distinct keys coexist: the failed lookups did not append anything.
+        assert_eq!(dict.len(), 1);
+    }
+
+    #[test]
+    fn a_boxed_value_is_found_by_get_keys_for_value() {
+        // `erlang:get_keys({v})` matches by *term*, not by word: the stored and the searched
+        // `{v}` tuples are distinct heap words.
+        let mut atoms = AtomTable::new();
+        let v = make_atom(atoms.intern("v"));
+        let mut heap = Heap::new(64);
+        let stored = heap.tuple(&[v]).expect("the value fits");
+        let searched = heap.tuple(&[v]).expect("the search value fits");
+        assert_ne!(stored, searched);
+
+        let mut dict = Dict::new();
+        dict.put(make_small(1), stored);
+        dict.put(make_small(2), stored);
+        dict.put(make_small(3), make_small(0));
+        assert_eq!(
+            dict.get_keys_for_value(searched),
+            vec![make_small(1), make_small(2)]
+        );
+        assert_eq!(dict.get_keys_for_value(make_small(0)), vec![make_small(3)]);
+        assert!(dict.get_keys_for_value(make_small(7)).is_empty());
+    }
+
+    #[test]
+    fn atom_keys_agree_whether_or_not_a_table_is_supplied() {
+        // The runtime interns every module and every BIF-built term into ONE append-only atom
+        // table, so two atoms with the same name are the same word. Comparing through the
+        // shared table (which resolves the name) and through an empty one (which falls back to
+        // the raw index — the C's `EQ` for two immediates) therefore agree, and neither ever
+        // matches a *different* atom.
+        let mut atoms = AtomTable::new();
+        let a = make_atom(atoms.intern("a"));
+        let b = make_atom(atoms.intern("b"));
+        let mut heap = Heap::new(64);
+        let key = heap.tuple(&[a]).expect("the key fits");
+        let equal_key = heap.tuple(&[a]).expect("the equal key fits");
+        let other_key = heap.tuple(&[b]).expect("the other key fits");
+
+        for mut dict in [Dict::new(), Dict::with_atoms(Rc::new(atoms.clone()))] {
+            dict.put(key, make_small(1));
+            assert_eq!(dict.get(equal_key), Some(make_small(1)), "same atom index");
+            assert_eq!(dict.get(other_key), None, "a different atom is a different key");
+        }
+    }
 
     #[test]
     fn put_get_erase_round_trip() {

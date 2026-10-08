@@ -55,7 +55,7 @@
 
 use crate::bitstring::{sub_bits_parts, ERL_SUB_BITS_FLAG_MASK};
 use crate::boxed::{
-    boxed_val, is_bin_ref, is_boxed, make_boxed, ERL_BIN_REF_SIZE, ERL_SUB_BITS_SIZE,
+    boxed_val, is_bin_ref, is_boxed_term, make_boxed, ERL_BIN_REF_SIZE, ERL_SUB_BITS_SIZE,
     HEADER_BIN_REF, HEADER_SUB_BITS,
 };
 use crate::eterm::Eterm;
@@ -202,7 +202,7 @@ pub unsafe fn write_refc_binary(
 /// If `t` is a boxed term, its header word must be a live, aligned term word and — if
 /// it is an `ErlSubBits` — its `orig` slot must be a live term.
 pub unsafe fn is_refc_binary(t: Eterm) -> bool {
-    if !is_boxed(t) {
+    if !is_boxed_term(t) {
         return false;
     }
     let p = boxed_val(t);

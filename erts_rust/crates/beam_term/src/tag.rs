@@ -255,6 +255,32 @@ pub const fn is_header(x: Eterm) -> bool {
     (x.raw() & TAG_PRIMARY_MASK) == TAG_PRIMARY_HEADER
 }
 
+/// Whether `x` is a **term word** at all — i.e. not a bare header word.
+///
+/// A word whose primary tag is `HEADER` is not a term: the C ABI's
+/// `THE_NON_VALUE` (`0` in release, `make_header(0, FLOAT_SUBTAG)` in a debug
+/// build — the word a NIF/`enif_*` callback hands back to mean "no term") and
+/// every other bare header word. **No valid term** has the `HEADER` primary tag:
+/// a cons cell is `LIST`, a boxed pointer is `BOXED`, every immediate is
+/// `IMMED1`. So this is the crate's single "is this a term?" test, and it is the
+/// guard every path that is about to read `*boxed_val(x)` must apply.
+///
+/// It is needed *because* [`crate::boxed::is_boxed`] mirrors the C bit trick
+/// `(x & (_TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0`, which is **also true**
+/// for the `HEADER` words: a guard written as `if is_boxed(x)` alone lets a
+/// stray non-term through and dereferences a garbage (in release, `NULL`)
+/// `boxed_val` pointer. Use [`crate::boxed::is_boxed_term`] where both the
+/// "boxed" and the "is a term" conditions are wanted.
+///
+/// Note the near-identical name: [`crate::ops::is_value`] is a **different**
+/// predicate (`x != THE_NON_VALUE`), which is true for every valid term *and*
+/// for a bare header word other than the debug `THE_NON_VALUE`. This one is the
+/// broader "this word is a term" test.
+#[inline]
+pub const fn is_term_word(x: Eterm) -> bool {
+    !is_header(x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

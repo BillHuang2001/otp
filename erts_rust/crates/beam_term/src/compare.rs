@@ -60,6 +60,25 @@
 //!   panics but is not a faithful reproduction of the C's structural comparison
 //!   for those specific classes; callers that need exact ordering for them must
 //!   extend this module.
+//!
+//! ## Non-term words (a documented robustness extension)
+//!
+//! The C `erts_cmp`/`erts_cmp_compound` assume both operands are **terms**. A
+//! word that is not a term at all — one whose primary tag is `HEADER`, i.e. the C
+//! ABI's `THE_NON_VALUE` (`0`, or a bare `FLOAT` header in a debug build) and any
+//! other stray header word (a NIF returning `enif_make_copy`'s "no value", say) —
+//! makes the C dereference a garbage (in release, `NULL`) `boxed_val` pointer:
+//! undefined behaviour. [`cmp_impl`] instead guards on
+//! [`crate::tag::is_term_word`] *before* any classification or dereference:
+//!
+//! * a non-term sorts **after** every well-formed term, so it never compares
+//!   `Equal` to one;
+//! * two non-terms order by their raw word (so the relation stays a total order
+//!   and `Equal` means "the identical word", preserving `eq ⇒ equal hash`).
+//!
+//! This is a documented **hardening**, not a behavioural change for valid input:
+//! no valid term has the `HEADER` primary tag, so every comparison of terms is
+//! bit-for-bit what it was.
 
 use core::cmp::Ordering;
 
@@ -74,7 +93,7 @@ use crate::immediate::{
 use crate::list::{car, cdr, is_list};
 use crate::number::number_as_f64;
 use crate::ops::{class, TermClass};
-use crate::tag::BIG_SIGN_BIT;
+use crate::tag::{is_term_word, BIG_SIGN_BIT};
 use crate::tuple::{tuple_element, tuple_size};
 
 /// Ascending term-order rank of a [`TermClass`].
@@ -100,6 +119,10 @@ fn class_rank(class: TermClass) -> u8 {
         TermClass::List => 15,
         TermClass::Bitstring => 16,
         TermClass::BinRef => 17,
+        // A word that is not a term at all (a bare header word — the ABI's
+        // `THE_NON_VALUE` and friends): documented as sorting **after** every real
+        // term, so it can never compare `Equal` to one. See [`cmp_impl`].
+        TermClass::NonValue => 18,
     }
 }
 
@@ -115,11 +138,18 @@ const fn is_number_class(class: TermClass) -> bool {
 ///
 /// `atoms` supplies the atom names needed for [`cmp_atoms`]-style comparison; a
 /// name that is not interned falls back to the raw atom index.
+///
+/// A word that is **not a term** (a bare header word — the ABI's `THE_NON_VALUE`
+/// and friends) is not dereferenced: it sorts after every real term, and two such
+/// words order by their raw word. See the module docs and [`cmp_impl`].
 pub fn cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> Ordering {
     cmp_impl(a, b, atoms, true)
 }
 
 /// `=:=` — whether two terms are exactly equal (`cmp(a, b).is_eq()`).
+///
+/// A non-term word is exactly equal only to the identical word (never to a real
+/// term) — see [`cmp`].
 pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool {
     cmp(a, b, atoms).is_eq()
 }
@@ -129,7 +159,8 @@ pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool {
 /// Differs from [`cmp`] only where `==` and `=:=` diverge: floats use IEEE
 /// comparison (so `-0.0 == +0.0`), and a mixed integer/float pair compares
 /// numerically (`1 == 1.0`). Bignum-to-float conversion is a documented
-/// approximation (see the module `Known Issues`).
+/// approximation (see the module `Known Issues`). A non-term word is handled
+/// exactly as in [`cmp`].
 pub fn cmp_arith(a: Eterm, b: Eterm, atoms: &AtomTable) -> Ordering {
     cmp_impl(a, b, atoms, false)
 }
@@ -140,14 +171,44 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
     if a.raw() == b.raw() {
         return Ordering::Equal;
     }
+    // A word that is not a term at all — a bare header word, i.e. the C ABI's
+    // `THE_NON_VALUE` (`0`, or a bare `FLOAT` header word in a debug build) or any
+    // other word whose primary tag is `HEADER` (see `tag::is_term_word`) — must be
+    // filtered out *here*, before the classification and the `is_float` /
+    // `boxed_val` dereference below. `is_boxed` mirrors the C bit trick and is
+    // true for those words, so without this guard `is_float` would read through a
+    // garbage (in release, NULL) `boxed_val` pointer — a crash, not a comparison.
+    // The C has no non-term behaviour here at all (it dereferences too), so this
+    // is a documented, panic-free hardening of the crate's own contract: **never
+    // a wrong result for a valid input, never a dereference for a non-term**.
+    //
+    // Documented ordering for a non-term:
+    // * against a well-formed term it sorts **after** every term (so it never
+    //   compares `Equal` to one — a caller cannot mistake it for a real term);
+    // * against another non-term it orders by the raw word, which keeps the
+    //   relation a total order and makes `Equal` mean "identical word" (the fast
+    //   path above), so the `eq ⇒ equal hash` consistency rule still holds.
+    // Both `cmp` (exact) and `cmp_arith` (arithmetic) share this rule, so a stray
+    // non-term is treated identically by `=:=` and `==`.
+    let (a_term, b_term) = (is_term_word(a), is_term_word(b));
+    if !(a_term && b_term) {
+        return if a_term {
+            Ordering::Less
+        } else if b_term {
+            Ordering::Greater
+        } else {
+            a.raw().cmp(&b.raw())
+        };
+    }
     if is_atom(a) && is_atom(b) {
         return cmp_atoms(a, b, atoms);
     }
     if is_small(a) && is_small(b) {
         return signed_value(a).cmp(&signed_value(b));
     }
-    // SAFETY: `is_float` and `class` only dereference the header word of a live
-    // boxed term; every term here was produced by this crate.
+    // SAFETY: the guard above established that both words are terms, so `is_float`
+    // and `class` only dereference the header word of a live boxed term; every term
+    // here was produced by this crate.
     let (a_float, b_float) = unsafe { (is_float(a), is_float(b)) };
     if a_float && b_float {
         // SAFETY: as above.
@@ -1019,6 +1080,76 @@ mod tests {
         // The relation is antisymmetric across the kind boundary too.
         assert_eq!(cmp(l_hi, imp, &a), Ordering::Less);
         assert_eq!(cmp(imp, l_hi, &a), Ordering::Greater);
+    }
+
+    /// A word that is not a term at all must never be dereferenced: it sorts after
+    /// every real term (so it never ties with one) and two non-terms order by their
+    /// raw word. See the module docs.
+    #[test]
+    fn a_non_term_is_never_dereferenced_and_sorts_after_every_term() {
+        let a = atoms();
+        let mut heap = Heap::new(64);
+        let samples = [
+            make_small(0),
+            make_small(-1),
+            make_atom(a.lookup("a").unwrap()),
+            NIL,
+            heap.tuple(&[make_small(1)]).unwrap(),
+            heap.cons(make_small(1), NIL).unwrap(),
+        ];
+        // The ABI's `THE_NON_VALUE`, a bare `FLOAT` header word (what a 1-word
+        // "flonum" header looks like) and an arbitrary other header word.
+        for nt in [
+            crate::ops::THE_NON_VALUE,
+            HEADER_FLONUM,
+            Eterm::from_raw(0x3c),
+        ] {
+            assert!(!crate::tag::is_term_word(nt));
+            // The identical word still compares equal (it *is* the same word)...
+            assert_eq!(cmp(nt, nt, &a), Ordering::Equal);
+            assert_eq!(cmp_arith(nt, nt, &a), Ordering::Equal);
+            assert!(eq(nt, nt, &a));
+            for t in &samples {
+                // ... but a non-term never ties with, and never equals, a real term.
+                assert_eq!(cmp(nt, *t, &a), Ordering::Greater, "{nt:?} vs {t:?}");
+                assert_eq!(cmp(*t, nt, &a), Ordering::Less, "{t:?} vs {nt:?}");
+                assert_eq!(cmp_arith(nt, *t, &a), Ordering::Greater);
+                assert_eq!(cmp_arith(*t, nt, &a), Ordering::Less);
+                assert!(!eq(nt, *t, &a));
+                assert!(!eq(*t, nt, &a));
+            }
+        }
+        // Two *different* non-term words order deterministically by their raw word
+        // (`THE_NON_VALUE` is `0` in release and `0x18` in a debug build; both are
+        // below the `0x58` bare flonum header).
+        let (lo, hi) = (crate::ops::THE_NON_VALUE, HEADER_FLONUM);
+        assert!(lo.raw() < hi.raw());
+        assert_eq!(cmp(lo, hi, &a), Ordering::Less);
+        assert_eq!(cmp(hi, lo, &a), Ordering::Greater);
+    }
+
+    /// The non-term guard must be a no-op for valid input: every well-formed term
+    /// still compares by the documented term order
+    /// (`number < atom < ... < tuple < ... < nil < list`).
+    #[test]
+    fn valid_terms_keep_their_documented_order() {
+        let a = atoms();
+        let mut heap = Heap::new(128);
+        let list = heap.cons(make_small(1), NIL).unwrap();
+        let ordered = [
+            make_small(0),
+            make_small(1),
+            make_atom(a.lookup("a").unwrap()),
+            heap.tuple(&[make_small(1)]).unwrap(),
+            NIL,
+            list,
+        ];
+        for (i, x) in ordered.iter().enumerate() {
+            for (j, y) in ordered.iter().enumerate() {
+                assert_eq!(cmp(*x, *y, &a), i.cmp(&j), "sample {i} vs {j}");
+                assert_eq!(eq(*x, *y, &a), i == j, "sample {i} vs {j}");
+            }
+        }
     }
 
     #[test]

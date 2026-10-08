@@ -51,16 +51,18 @@ const D_EXP: usize = 64;
 /// This is the faithful port of `big_to_double` (`big.c:2412-2529`). It returns:
 /// * `Some(d)` — `x` is a bignum whose value is representable as a **finite**
 ///   double; `d` is the nearest such double (ties to even);
-/// * `None` — `x` is not a bignum, or its magnitude is too large for a finite
+/// * `None` — `x` is not a bignum (including a word that is not a term at all — a
+///   bare header word such as the ABI's `THE_NON_VALUE`; see
+///   [`crate::tag::is_term_word`]), or its magnitude is too large for a finite
 ///   double (`bitlen > 1024`, or a result that rounds up to `2^1024`).
 ///
 /// A `None` result is exactly the C's `int < 0` return, which `i_fconv`
 /// (`emu/float_instrs.tab:44`) turns into a `badarith` exception. The result is
 /// never a silently wrong value.
 pub fn big_to_f64(x: Eterm) -> Option<f64> {
-    // SAFETY: `x` is a valid term; `is_big` only dereferences the header word of a
-    // boxed term (and returns `false` for any non-boxed word), which is live for
-    // any valid boxed `Eterm`.
+    // SAFETY: `is_big` now tests "is a dereferenceable boxed term" first, so `x` is
+    // either a live boxed term (whose header word is valid) or reported `false`
+    // without a dereference — including for a word that is not a term at all.
     if !unsafe { is_big(x) } {
         return None;
     }
@@ -188,22 +190,25 @@ fn pow2(e: i32) -> f64 {
 
 /// Best-effort `f64` value of a numeric term (`number_as_f64`).
 ///
-/// Total and panic-free over any valid [`Eterm`]:
+/// Total and panic-free over **any** word:
 /// * a small integer → its value;
 /// * a float → its value;
 /// * a bignum → [`big_to_f64`] when the value is representable, else
 ///   `±f64::INFINITY` (the sign taken from the bignum) — the same best-effort
 ///   behaviour as before, but now with the faithful nearest-double rounding for
 ///   every representable bignum;
-/// * any non-number (atom, list, tuple, …) → `f64::NAN`.
+/// * any non-number (atom, list, tuple, …) → `f64::NAN`;
+/// * a word that is not a term at all (a bare header word, e.g. the ABI's
+///   `THE_NON_VALUE`; see [`crate::tag::is_term_word`]) → `f64::NAN`, via
+///   [`TermClass::NonValue`] and without any dereference.
 ///
 /// This is what `compare`'s arithmetic-mode mixed integer/float comparison uses;
 /// a `NaN` therefore only ever arises from a non-number operand.
 pub fn number_as_f64(x: Eterm) -> f64 {
-    // SAFETY: an `Eterm` is a valid term by construction; `class`, `float_value`
-    // and `big_parts` only dereference the header/payload of a boxed term, which is
-    // live for any valid boxed term (the same invariant `compare::cmp` and
-    // `size_object` rely on).
+    // SAFETY: `class` is total: it classifies an immediate by its tag bits, derefs
+    // the header of a well-formed boxed term, and answers `NonValue` (no deref) for
+    // a word that is not a term at all. `float_value`/`big_parts` are only reached
+    // for the classes that establish a live float/bignum block.
     match unsafe { class(x) } {
         TermClass::Small => signed_value(x) as f64,
         TermClass::Float => unsafe { float_value(x) },

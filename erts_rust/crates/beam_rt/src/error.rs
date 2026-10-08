@@ -30,8 +30,32 @@
 //! (which every message here is).
 
 use beam_bifs::BifRegistry;
-use beam_common::{BeamError, ExitReason, LiveReason, Raise};
+use beam_common::{AllocKind, BeamError, ExitReason, LiveReason, Raise};
 use beam_term::{atom_val, is_atom, AtomTable, Eterm};
+
+/// Turns a **term-heap exhaustion** into the emulator's documented hard limit.
+///
+/// `beam_alloc`'s contract is that [`BeamError::Alloc`] with [`AllocKind::Heap`] means
+/// *collect and retry*, **not** a fatal host-level OOM (see the `beam_alloc` crate
+/// `CONTEXT.md`, Design Decisions). Milestone 1 has no collector, so the retry cannot
+/// happen: the honest answer is the emulator's own `error:system_limit` raise — the reason
+/// the C raises when a process exceeds its configured `max_heap_size` (`+hmax`) — which
+/// [`crate::cli`] reports as `beam_rt: system_limit` with
+/// [`EXIT_RUNTIME`](crate::cli::EXIT_RUNTIME).
+///
+/// Reporting the raw [`BeamError::Alloc`] instead would print the host-level
+/// `allocation failure: heap (N bytes)` diagnostic, which describes the *internal
+/// allocator* state of this implementation, not a BEAM error a program (or the differential
+/// harness) can reason about.
+///
+/// Every other error is returned unchanged, so this is a pure translation — nothing is
+/// swallowed.
+pub(crate) fn enforce_term_heap_limit(error: BeamError) -> BeamError {
+    match error {
+        BeamError::Alloc(failure) if failure.kind == AllocKind::Heap => BeamError::SystemLimit,
+        other => other,
+    }
+}
 /// The prefix every capability-gap reason atom starts with (see the module docs).
 pub(crate) const UNSUPPORTED_PREFIX: &str = "unsupported";
 

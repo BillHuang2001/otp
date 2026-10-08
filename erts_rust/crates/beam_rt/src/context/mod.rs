@@ -836,7 +836,9 @@ impl<'a> RuntimeContext<'a> {
         // consistent.
         pending.commit(self.runtime.code_server.atoms_mut());
         self.runtime.put_bif_heap(heap);
-        result
+        // A registered BIF that ran its heap dry is the emulator's documented hard limit,
+        // not a host-level allocation abort (see `error::enforce_term_heap_limit`).
+        result.map_err(error::enforce_term_heap_limit)
     }
 
     /// Whether `(module, function, arity)` is one of the five process-dictionary BIFs that
@@ -1048,7 +1050,9 @@ impl ExecutionContext for RuntimeContext<'_> {
             return Ok(term);
         }
         if let Some(result) = self.try_native(module, function, arity, args) {
-            return result;
+            // The floor builds its terms on the same pooled BIF heap, so an exhaustion
+            // there is the same documented limit (see `error::enforce_term_heap_limit`).
+            return result.map_err(error::enforce_term_heap_limit);
         }
         if self.runtime.registry.contains(module, function, arity) {
             return self.call_registered(module, function, arity, args);

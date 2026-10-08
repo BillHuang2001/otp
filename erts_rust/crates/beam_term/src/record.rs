@@ -109,7 +109,7 @@
 
 use crate::atom::{Atom, AtomTable};
 use crate::boxed::{
-    boxed_val, header_arity, is_arity_value, is_boxed, is_record_header, make_arityval, make_boxed,
+    boxed_val, header_arity, is_arity_value, is_boxed_term, is_record_header, make_arityval, make_boxed,
     make_record_header,
 };
 use crate::compare::eq;
@@ -191,7 +191,7 @@ const fn definition_offset(field_count: usize) -> usize {
 /// Validates `t` as a live native-record **instance** and returns its header-word
 /// pointer together with its field count.
 unsafe fn instance_parts(t: Eterm) -> TermResult<(*mut Eterm, usize)> {
-    if !is_boxed(t) {
+    if !is_boxed_term(t) {
         return Err(TermError::BadRecord);
     }
     let p = boxed_val(t);
@@ -219,7 +219,7 @@ unsafe fn instance_parts(t: Eterm) -> TermResult<(*mut Eterm, usize)> {
 /// definition by its header alone — callers must only pass a value obtained from
 /// [`record_definition`].
 unsafe fn definition_parts(def: Eterm) -> TermResult<(*mut Eterm, usize)> {
-    if !is_boxed(def) {
+    if !is_boxed_term(def) {
         return Err(TermError::BadRecord);
     }
     let p = boxed_val(def);
@@ -367,7 +367,7 @@ pub unsafe fn record_definition(t: Eterm) -> TermResult<Eterm> {
     let (p, _) = unsafe { instance_parts(t)? };
     // SAFETY: `p` is a validated instance header; word 1 is its definition pointer.
     let def = unsafe { *p.add(1) };
-    if !is_boxed(def) {
+    if !is_boxed_term(def) {
         return Err(TermError::BadRecord);
     }
     Ok(def)
@@ -574,7 +574,7 @@ pub unsafe fn record_definition_field_order<'a>(def: Eterm) -> TermResult<&'a [E
     // SAFETY: a validated definition block has the boxed `field_order` pointer at
     // word 1.
     let order = unsafe { *p.add(1) };
-    if !is_boxed(order) {
+    if !is_boxed_term(order) {
         return Err(TermError::BadRecord);
     }
     let op = boxed_val(order);

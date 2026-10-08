@@ -39,7 +39,7 @@
 
 use crate::bitstring::{heap_bits_size_words, sub_bits_parts};
 use crate::boxed::{
-    boxed_val, header_arity, is_boxed, is_flatmap_header, map_header_val, thing_arityval,
+    boxed_val, header_arity, is_boxed_term, is_flatmap_header, map_header_val, thing_arityval,
     ERL_SUB_BITS_SIZE, HEADER_BIN_REF,
 };
 use crate::eterm::Eterm;
@@ -48,13 +48,20 @@ use crate::immediate::is_immediate;
 use crate::list::{car, cdr, is_list};
 use crate::refc::ERL_REFC_BITS_SIZE;
 use crate::tag::{
-    ARITYVAL_SUBTAG, FUN_SUBTAG, MAP_SUBTAG, RECORD_SUBTAG, SUB_BITS_SUBTAG, TAG_HEADER_MASK,
+    is_term_word, ARITYVAL_SUBTAG, FUN_SUBTAG, MAP_SUBTAG, RECORD_SUBTAG, SUB_BITS_SUBTAG,
+    TAG_HEADER_MASK,
 };
 
 /// The flat number of heap words the term graph `a` occupies.
 ///
 /// Reproduces `size_object(a)` == `size_object_x(a, NULL)`. See the module docs
 /// for the convention and the documented approximations.
+///
+/// A word that is **not a term** (a bare header word — the ABI's `THE_NON_VALUE`
+/// and friends; see [`crate::tag::is_term_word`]) contributes `0` words: it is not
+/// a term graph at all, so no heap word belongs to it. The C dereferences such a
+/// word (`*boxed_val(0)`), so this is a documented, panic-free hardening — the
+/// size of every valid term is unchanged.
 pub fn size_object(a: Eterm) -> usize {
     let mut total = 0usize;
     // An explicit worklist linearises lists and avoids native-stack recursion.
@@ -62,7 +69,10 @@ pub fn size_object(a: Eterm) -> usize {
     let mut current = a;
 
     loop {
-        if is_immediate(current) {
+        if !is_term_word(current) {
+            // A non-term word: not a term graph, so it occupies no heap words (and
+            // must not be dereferenced as a boxed pointer).
+        } else if is_immediate(current) {
             // Immediates occupy no heap words.
         } else if is_list(current) {
             // A cons cell is a header-less 2-word object.
@@ -147,7 +157,7 @@ pub fn size_object(a: Eterm) -> usize {
                 SUB_BITS_SUBTAG => {
                     // `[HEADER_SUB_BITS, base_flags, start, end, orig]` (`copy.c:219-242`).
                     let (_base_flags, start, end, orig) = unsafe { sub_bits_parts(current) };
-                    if is_boxed(orig) {
+                    if is_boxed_term(orig) {
                         // SAFETY: `orig` is a boxed term; the C reads
                         // `*boxed_val(sb->orig)` unconditionally (`copy.c:222`).
                         let underlying = unsafe { *boxed_val(orig) };

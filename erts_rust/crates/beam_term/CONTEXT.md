@@ -399,6 +399,19 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `record`, `compare`, `hashing`, `ihash`, `bitstring`, `refc`, `number` (raw pointer deref). Every `unsafe fn` documents a
   `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
+- **A word that is not a term is never dereferenced.** The C ABI's `THE_NON_VALUE` (`0` in release,
+  `make_header(0, FLOAT_SUBTAG)` in debug — the word a `enif_*` callback returns for "no term") has
+  primary tag `HEADER`, which the C `is_boxed` bit trick *accepts*, so a `is_boxed`-guarded
+  `*boxed_val(x)` dereferenced a garbage (release: NULL) pointer and aborted the process. The crate
+  answers instead of crashing: `tag::is_term_word(x) = !is_header(x)` and
+  `boxed::is_boxed_term(x) = is_boxed(x) && is_term_word(x)` are the guards — **every deref/classification
+  site must test one of them first** (never bare `is_boxed`). Policy for a non-term: fallible APIs
+  return the typed `TermError::NotATerm` (`make_hash`/`make_hash2`); total APIs give a defined answer
+  (`ops::class` ⇒ `TermClass::NonValue`; `size_object` ⇒ `0`; `number_as_f64` ⇒ `NaN`; `term_hash` ⇒ a
+  tagged raw-word hash). `compare::cmp`/`eq`/`cmp_arith` order a non-term **after every valid term**
+  (never `Equal` to one; two non-terms by raw word), so `eq ⇒ equal hash` still holds. No valid term
+  changes behaviour. The `pub unsafe fn *_parts` raw readers and `heap.rs` keep their documented
+  "caller passes a live thing of this kind" contract — they are not fed by `THE_NON_VALUE`.
 - **Pure tag math is `const fn`** where the body allows (`raw`, `from_raw`, `primary_tag`, tag tests,
   `make_small`, `signed_value`, `make_atom`, `atom_val`, `make_arityval`, `arityval`, …) — these are
   hot in the engine.

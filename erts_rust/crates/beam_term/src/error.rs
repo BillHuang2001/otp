@@ -59,6 +59,18 @@ pub enum TermError {
     /// a duplicate/non-atom field key or a field count beyond `MAX_ARITYVAL` (see
     /// [`crate::record`]).
     BadRecord,
+    /// The word handed to the operation is **not a term at all** — a bare header
+    /// word, i.e. one whose primary tag is `HEADER` (see
+    /// [`crate::tag::is_term_word`]): the C ABI's `THE_NON_VALUE` (`0`, or
+    /// `make_header(0, FLOAT_SUBTAG)` in a debug build) and every other stray
+    /// header word, such as a NIF handing back `enif_make_copy`'s "no value".
+    ///
+    /// Distinct from [`TermError::BadFun`]/[`TermError::BadMap`]/… on purpose: those
+    /// say "this is a term, but not one of the right shape", whereas this says
+    /// "this is not a term". The operation refuses rather than dereferencing a
+    /// garbage (in release, `NULL`) `boxed_val` pointer — the C is undefined
+    /// behaviour there.
+    NotATerm,
 }
 
 impl fmt::Display for TermError {
@@ -74,6 +86,7 @@ impl fmt::Display for TermError {
             TermError::BadFun => "not a fun",
             TermError::FunIdentityUnavailable => "fun identity unavailable",
             TermError::BadRecord => "not a record",
+            TermError::NotATerm => "not a term",
         };
         f.write_str(msg)
     }
@@ -99,6 +112,7 @@ impl core::error::Error for TermError {}
 /// | `BadFun` | `BadArg` | `badarg` |
 /// | `FunIdentityUnavailable` | `BadArg` | `badarg` |
 /// | `BadRecord` | `BadArg` | `badarg` |
+/// | `NotATerm` | `BadArg` | `badarg` |
 impl From<TermError> for BeamError {
     fn from(error: TermError) -> Self {
         match error {
@@ -128,6 +142,10 @@ impl From<TermError> for BeamError {
             // A malformed native record reached a record layout helper, or a
             // record-construction argument was invalid: an argument failure.
             TermError::BadRecord => BeamError::BadArg,
+            // The word is not a term at all (a bare header word): an argument
+            // failure — the same `badarg` the engine would raise for a value it
+            // cannot use.
+            TermError::NotATerm => BeamError::BadArg,
         }
     }
 }
@@ -157,6 +175,7 @@ mod tests {
             "fun identity unavailable"
         );
         assert_eq!(TermError::BadRecord.to_string(), "not a record");
+        assert_eq!(TermError::NotATerm.to_string(), "not a term");
     }
 
     #[test]
@@ -216,6 +235,10 @@ mod tests {
         ));
         assert!(matches!(
             BeamError::from(TermError::BadRecord),
+            BeamError::BadArg
+        ));
+        assert!(matches!(
+            BeamError::from(TermError::NotATerm),
             BeamError::BadArg
         ));
     }
