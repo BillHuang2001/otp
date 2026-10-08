@@ -250,10 +250,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `erl_eval`/`erl_parse` port would; fabricating erl_eval internals is forbidden), so it is
   **unclosable by design**. A compiled module's local (`make_fun3`) funs encode byte-faithfully through
   the `beam_bifs`/`beam_rt` `LocalFunIdentity` seam (`term_to_binary/1` of such a closure).
-- **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
-  bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 245 tests, `beam_alloc` 263,
-  `beam_gc` ~141 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
-  copy-correctness evidence for HAMT maps + refc binaries (`beam_gc/tests/{map_copy,refc_binary_copy}.rs`).
+- **Term/heap foundation complete** (see the section above): HAMT/CHAMP map builder, public
+  bitstring/heap-bits APIs, off-heap refc binaries — with an `erl` oracle cross-check
+  (`beam_term/tests/oracle.rs`) and GC copy-correctness evidence for HAMT maps + refc binaries
+  (`beam_gc/tests/{map_copy,refc_binary_copy}.rs`).
 - **Additive `beam_term` foundation extensions** (the term-layout LCA; no frozen constant/ABI
   changed): `From<TermError> for BeamError` (error interop); `compare`/`hashing`/`size` utilities
   (term ordering, structural hash, `size_object`); `thing` — heap-agnostic off-heap term
