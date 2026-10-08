@@ -66,6 +66,14 @@
 %% It is therefore not exercised by a probe here; see the `cycle' comment in
 %% beam_ssa_fbip for the argument.
 %%
+%% The roots of the dominance half are the function's entry block plus every
+%% block without predecessors (roots/3 in beam_ssa_fbip). The entry is what
+%% keeps condition (1) non-vacuous if the entry block itself is on a cycle -
+%% a body that starts with a `receive' leads the entry straight into the
+%% peek/skip cycle - and adding it can only ever reject more rewrites. The
+%% `entry_recv/1' probe pins that CFG shape and asserts that the stricter
+%% root set does not reject an update that is genuinely dominated.
+%%
 %% The tests operate on a small probe module that is compiled twice under
 %% the option sets in opt_sets/0 and disassembled with beam_disasm: see
 %% `update_record' hint assertions below.
@@ -88,6 +96,7 @@
          init_per_group/2,end_per_group/2]).
 -export([safe_hint_rewritten/1,
          join_hint_rewritten/1,
+         entry_hint_rewritten/1,
          join_hints_unchanged/1,
          unsafe_hints_unchanged/1,
          literal_sources_not_rewritten/1,
@@ -104,6 +113,7 @@ groups() ->
     [{p,[parallel],
       [safe_hint_rewritten,
        join_hint_rewritten,
+       entry_hint_rewritten,
        join_hints_unchanged,
        unsafe_hints_unchanged,
        literal_sources_not_rewritten,
@@ -148,6 +158,26 @@ join_hint_rewritten(Config) ->
 
     ?assertEqual({atom,copy}, hint(plain, Builds, join, 1)),
     ?assertEqual({atom,inplace}, hint(fbip, Builds, join, 1)),
+    ok.
+
+%% The root set of the dominance test is "the function's entry block plus
+%% every predecessor-less block", not just the predecessor-less blocks (see
+%% roots/3 in beam_ssa_fbip). This probe pins the CFG shape that motivated
+%% the entry: its body *starts* with a `receive', so the compiler-generated
+%% peek/skip loop is entered directly from the function's entry block, and
+%% the entry block leads straight into a cycle of the CFG.
+%%
+%% The stricter root set may only ever reject more rewrites, so this shape
+%% must still be accepted: the fresh source `R0' is defined after the
+%% receive and updated after an intervening branch/join, so the definition
+%% block dominates the update block (and no cycle through the update block
+%% avoids it). The update must therefore be rewritten to `inplace' with the
+%% option and stay `copy' without it.
+entry_hint_rewritten(Config) ->
+    {_Mod, Builds} = build_probe(Config, "beam_ssa_fbip_entry"),
+
+    ?assertEqual({atom,copy}, hint(plain, Builds, entry_recv, 1)),
+    ?assertEqual({atom,inplace}, hint(fbip, Builds, entry_recv, 1)),
     ok.
 
 %% The widened position rule on its own must never rewrite an update whose
@@ -240,7 +270,7 @@ probe_source(Mod) ->
     ["-module(", Mod, ").\n",
      "-export([mk/1,safe/1,sent/1,captured/1,used_twice/1,arg_src/1,\n",
      "         join/1,join_used_twice/1,join_arg/1,join_extracted/1,\n",
-     "         recv_after/1,\n",
+     "         recv_after/1,entry_recv/1,\n",
      "         lit_inline/1,lit_var/1,lit_case/1]).\n",
      "\n",
      "%% The literal-source probes below update a known-at-compile-time\n",
@@ -305,6 +335,25 @@ probe_source(Mod) ->
      "    V = receive {msg, Ref} -> 1 after 0 -> 2 end,\n",
      "    R0 = mk(X),\n",
      "    R0#r{b=V}.\n",
+     "\n",
+     "%% SAFE: the body *starts* with a `receive', so the compiler-generated\n",
+     "%% peek/skip loop is entered directly from the function's entry block,\n",
+     "%% which leads straight into a cycle of the CFG - the shape the pass's\n",
+     "%% dominance roots (the entry block on top of the predecessor-less\n",
+     "%% blocks) have to cope with. The source is defined after the receive\n",
+     "%% and updated after an intervening branch/join, so the definition block\n",
+     "%% dominates the update block and the update must still be rewritten to\n",
+     "%% an in-place one.\n",
+     "%%\n",
+     "%% Like `recv_after/1', the pattern can never match a message in the\n",
+     "%% caller's mailbox: `Ref' is a fresh ref that the caller (see cases/0)\n",
+     "%% created and never sent. `after 0' therefore always runs, so the\n",
+     "%% function is deterministic and does not block.\n",
+     "entry_recv(Ref) ->\n",
+     "    V = receive {msg, Ref} -> 1 after 0 -> 2 end,\n",
+     "    R0 = mk(Ref),\n",
+     "    Y = case Ref of true -> 1; _ -> 2 end,\n",
+     "    R0#r{b=V, c=Y}.\n",
      "\n",
      "%% UNSAFE: the value is handed to another process before the update, so\n",
      "%% the update must copy.\n",
@@ -447,6 +496,10 @@ cases() ->
      {lit_inline, [0, ignored]},
      {lit_var,    [0, ignored]},
      {recv_after, [0, 42, x, [1,2], {a,b}]},
+     %% `entry_recv/1' is called with a fresh ref (never sent anywhere), so
+     %% that its leading `receive' can never match and its `after 0' branch
+     %% always runs.
+     {entry_recv, [make_ref(), make_ref()]},
      {lit_case,   [1, 2, other, 0]}].
 
 %% Call `Fun(Arg)' in every build and check that both builds return exactly
@@ -476,6 +529,7 @@ expected(join_arg, Other) -> {error,{badrecord,Other}};
 expected(join_extracted, {{r,A,_B,C},_}) -> {ok,{r,A,2,C}};
 expected(join_extracted, _Other) -> {error,badarg};
 expected(recv_after, X) -> {ok,{r,X,2,undefined}};
+expected(entry_recv, Ref) -> {ok,{r,Ref,2,2}};
 expected(sent, X) -> {ok,{r,X,1,undefined}};
 expected(captured, X) ->
     {ok,{{r,X,1,undefined},{r,X,undefined,undefined}}};

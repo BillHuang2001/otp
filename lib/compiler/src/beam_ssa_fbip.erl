@@ -81,7 +81,8 @@
 %%   * D == U (the definition and the update are in the same block), or
 %%   * both of the following:
 %%       (1) **D dominates U** - every path from a CFG root to U passes
-%%           through D, and
+%%           through D, where the roots are the function's entry block and
+%%           every block without predecessors (see roots/3), and
 %%       (2) **every cycle through U also passes through D** -
 %%           equivalently, in the CFG with D removed, U is not reachable
 %%           from any successor of U.
@@ -166,11 +167,12 @@
 %% maps a variable to the number of times it is used, `blocks` maps a
 %% variable to the label of the block containing its definition (or
 %% `ambiguous`), `succs` maps a block label to the list of its successor
-%% blocks, `roots` is the list of blocks without predecessors (the entry
-%% block 0, plus - harmlessly - any unreachable block as well as the pseudo
-%% block `?EXCEPTION_BLOCK`, whose terminator has no successors), `args` is
-%% the list of the function's arguments and `fresh` is the set of local
-%% functions known to return a fresh value.
+%% blocks, `roots` is the root set of the dominance query (see roots/3): the
+%% function's entry block plus every block without predecessors - which
+%% additionally and harmlessly covers any unreachable block as well as the
+%% pseudo block `?EXCEPTION_BLOCK`, whose terminator has no successors -
+%% `args` is the list of the function's arguments and `fresh` is the set of
+%% local functions known to return a fresh value.
 -record #fbip_ctx{
    defs = #{} :: #{beam_ssa:var_name() => beam_ssa:b_set() | ambiguous},
    uses = #{} :: #{beam_ssa:var_name() => pos_integer()},
@@ -402,10 +404,13 @@ sound_position(_Ctx, _UpdLbl, _Value) ->
 %%
 %% Condition (1): D dominates U iff every path from a CFG root to U passes
 %% through D. Equivalently: with D removed from the CFG, U is not reachable
-%% from any root. Using every predecessor-less block as a root is
-%% conservative (a block that is only reachable through D would be a
-%% harmless extra root) and keeps the check independent of the order in
-%% which the blocks happen to be numbered.
+%% from any root. The root set is built by roots/3: the function's entry
+%% block plus every predecessor-less block. Using every predecessor-less
+%% block as a root is conservative (a block that is only reachable through D
+%% would be a harmless extra root) and keeps the check independent of the
+%% order in which the blocks happen to be numbered; using the entry block as
+%% well is what keeps the query meaningful if the entry block itself is on a
+%% cycle, and it can only make the query stricter (see roots/3).
 %%
 dominates(Ctx, D, U) ->
     not reachable(Ctx, D, Ctx#fbip_ctx.roots, U).
@@ -452,9 +457,49 @@ make_ctx(Linear, Args, Fresh) ->
     {Defs,Uses,Blocks} = scan(Linear),
     Succs = succs(Linear),
     Preds = preds(Linear),
-    Roots = [Lbl || Lbl <- maps:keys(Succs), not is_map_key(Lbl, Preds)],
+    Roots = roots(Linear, Succs, Preds),
     #fbip_ctx{defs=Defs,uses=Uses,blocks=Blocks,succs=Succs,
               roots=Roots,args=Args,fresh=Fresh}.
+
+%% The root set of the dominance query behind condition (1) (see
+%% dominates/3): the function's entry block *plus* every block without
+%% predecessors.
+%%
+%% The entry block is the first block of the linearized function:
+%% beam_ssa:linearize/1 and beam_ssa:linearize_only/1 both start their
+%% traversal at the entry block 0, so the first element of `Linear' is the
+%% entry.
+%%
+%% The predecessor-less blocks alone are only a correct root set as long as
+%% the entry block really has no predecessor. That holds for the current SSA
+%% - every function gets its own entry block, and the compiler-generated
+%% peek/skip loop of a `receive' (the only construct that creates an
+%% intra-function back edge here, see beam_ssa:is_loop_header/1) is entered
+%% by a jump from the entry block and has at least two predecessors, so it
+%% is never merged into the entry, not even when the function body *starts*
+%% with a `receive' - but nothing in the CFG guarantees it: a block on a
+%% cycle has a predecessor, so if the entry block were a loop header the
+%% root set would degenerate to the pseudo block `?EXCEPTION_BLOCK' (whose
+%% terminator has no successors) or to nothing, reachable/4 would never
+%% reach the update block, and condition (1) would silently become
+%% vacuously true instead of being checked. Taking the entry from the
+%% linearized block list makes condition (1) genuinely enforced whenever the
+%% block list is non-empty.
+%%
+%% Adding the entry is safe by construction, it cannot make the transform
+%% unsound: reachable/4 grows monotonically with its root set (it is a plain
+%% graph search from the given roots), so a larger root set can only make
+%% dominates/3 return `false' more often - i.e. reject more rewrites. Any
+%% real path from the entry block to the update block that avoids the
+%% definition block is a fortiori a path in the same, over-approximated (see
+%% term_targets/1) graph, so with the entry in the root set such a path can
+%% no longer be missed.
+%%
+roots([{Entry,_}|_], Succs, Preds) ->
+    Rest = [Lbl || Lbl <- maps:keys(Succs), not is_map_key(Lbl, Preds)],
+    [Entry|lists:delete(Entry, Rest)];
+roots([], _Succs, _Preds) ->
+    [].
 
 scan(Linear) ->
     scan_blks(Linear, #{}, #{}, #{}).
