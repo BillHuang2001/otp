@@ -781,9 +781,14 @@ impl<'a> RuntimeContext<'a> {
                 registry.call(module, function, arity, &mut context, args)
             } else if uses_persistent_term {
                 // The seven `persistent_term:*` BIFs: a cheap `Rc` clone of the
-                // node-global store, so no runtime borrow is held (it can coexist with
-                // everything).
-                let mut store = PersistentTermBridge::new(Rc::clone(&runtime.persistent_terms));
+                // node-global store, plus a clone of the shared atom-table handle so the
+                // store can compare keys/values **structurally** (`beam_term::eq`) — two
+                // structurally equal boxed terms are distinct heap words. No runtime
+                // borrow is held (it can coexist with everything).
+                let mut store = PersistentTermBridge::new(
+                    Rc::clone(&runtime.persistent_terms),
+                    Rc::clone(&atoms),
+                );
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
                     .with_persistent_term(&mut store)

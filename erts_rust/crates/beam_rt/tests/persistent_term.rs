@@ -236,10 +236,103 @@ fn any_term_can_be_a_key() {
         "five distinct keys"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Boxed keys: structural, not word, identity
+// ---------------------------------------------------------------------------------------
+
+/// A **boxed** key must resolve through a structurally equal term built *independently*.
+///
+/// The oracle's `lookup` compares a bucket with `EQ(key, …)` — the exact (`=:=`) term
+/// comparison (`erl_bif_persistent.c:1015`) — and `put_common`'s value no-op check uses the
+/// same `EQ` (`:726`). Word identity is *not* enough: two equal boxed terms are two
+/// distinct heap words, so a raw-word comparison makes `get/1` report the oracle's `badarg`
+/// and `erase/1` its `false`.
+///
+/// This is the regression the immediate-key tests missed: `rt.eval` of the same literal
+/// twice yields structurally equal but **distinct** heap words (asserted below), whereas
+/// equal atoms/integers are the *same* immediate word.
+#[test]
+fn boxed_keys_match_an_equal_but_distinct_term() {
+    let mut rt = runtime();
+    let ok_atom = rt.intern("ok");
+    let true_term = rt.intern("true");
+    let value = rt.intern("stored");
+
+    for literal in ["{k,1}", "[1,2,3]", "#{a => 1}", "<<1,2,3>>"] {
+        let key = rt
+            .eval(literal)
+            .unwrap_or_else(|e| panic!("{literal}: {e:?}"));
+        let equal = rt
+            .eval(literal)
+            .unwrap_or_else(|e| panic!("{literal} again: {e:?}"));
+        assert_ne!(
+            key, equal,
+            "`{literal}` evaluated twice must be two distinct heap words \
+             (otherwise this test proves nothing)"
+        );
+
+        assert_eq!(
+            call(&mut rt, "put", 2, &[key, value]).expect("put(Key, Value)"),
+            ok_atom,
+            "put/2 of a fresh {literal} key"
+        );
+        assert_eq!(
+            call(&mut rt, "get", 1, &[equal]).expect("get(Equal)"),
+            value,
+            "get/1 through a structurally equal {literal} key"
+        );
+        let all = call(&mut rt, "get", 0, &[]).expect("get()");
+        assert_eq!(
+            terms::list_elements(all).expect("a proper list").len(),
+            1,
+            "the equal {literal} key must not append a second entry"
+        );
+        assert_eq!(
+            call(&mut rt, "erase", 1, &[equal]).expect("erase(Equal)"),
+            true_term,
+            "erase/1 through a structurally equal {literal} key"
+        );
+        assert_badarg(call(&mut rt, "get", 1, &[equal]).expect_err("the erased entry is gone"));
+    }
+}
+
+/// `put_new/2`'s no-op `ok` compares the stored **value** structurally too: a structurally
+/// equal but distinct value is `ok`, a different one the oracle's `badarg`
+/// (`put_common:726-733`).
+#[test]
+fn put_new_matches_a_boxed_value_structurally() {
+    let mut rt = runtime();
+    let ok_atom = rt.intern("ok");
+    let key = rt.eval("{the_key}").expect("a boxed key literal");
+    let value = rt.eval("{1,2}").expect("a boxed value literal");
+    // The same literals, built again: equal-but-distinct heap words.
+    let equal_key = rt.eval("{the_key}").expect("the key again");
+    let equal_value = rt.eval("{1,2}").expect("the value again");
+    let other = rt.eval("{1,3}").expect("a different value");
+    assert_ne!(value, equal_value, "the second value is a distinct word");
+
+    assert_eq!(
+        call(&mut rt, "put", 2, &[key, value]).expect("put(Key, Value)"),
+        ok_atom
+    );
+    assert_eq!(
+        call(&mut rt, "put_new", 2, &[equal_key, equal_value])
+            .expect("put_new onto a structurally equal value"),
+        ok_atom,
+        "an equal-but-distinct value is the no-op ok, not badarg"
+    );
+    assert_badarg(call(&mut rt, "put_new", 2, &[equal_key, other]).expect_err("a different value"));
+    assert_eq!(
+        call(&mut rt, "get", 1, &[equal_key]).expect("get(EqualKey)"),
+        value,
+        "the rejected put_new left the stored value untouched"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // The live-oracle cross-check
 // ---------------------------------------------------------------------------------------
-
 /// The golden sequence compared **value for value** against the live oracle (the recorded
 /// probe in the module docs). Skips loudly without a toolchain.
 #[test]
@@ -331,10 +424,114 @@ halt(0).";
     assert_eq!(erase2, false_term);
     assert_eq!(put_new_same, ok_atom);
 }
+
+/// The **boxed**-key round trip compared **value for value** against the live oracle.
+///
+/// The oracle builds each key *fresh* (`list_to_tuple/1`, `list_to_binary/1`,
+/// `maps:from_list/1`, `lists:seq/2`), so its `lookup` genuinely compares equal-but-distinct
+/// terms; our side evaluates the same literal twice (two distinct heap words). Both sides
+/// must agree on every `put`/`get`/`erase`/`erase` outcome — word identity would make each
+/// `get`/`erase` fail here. Skips loudly without a toolchain.
+#[test]
+fn boxed_keys_match_the_live_oracle() {
+    let Some(oracle) = support::require_oracle("persistent_term") else {
+        return;
+    };
+
+    let expr = "\
+T1 = list_to_tuple([pterm_key,1]),
+T2 = list_to_tuple([pterm_key,1]),
+T3 = list_to_tuple([pterm_key,1]),
+PT = persistent_term:put(T1, tuple_val),
+GT = persistent_term:get(T2),
+ET1 = persistent_term:erase(T3),
+ET2 = persistent_term:erase(T2),
+B1 = list_to_binary([1,2,3]),
+B2 = list_to_binary([1,2,3]),
+B3 = list_to_binary([1,2,3]),
+PB = persistent_term:put(B1, bin_val),
+GB = persistent_term:get(B2),
+EB1 = persistent_term:erase(B3),
+EB2 = persistent_term:erase(B2),
+M1 = maps:from_list([{a,1}]),
+M2 = maps:from_list([{a,1}]),
+M3 = maps:from_list([{a,1}]),
+PM = persistent_term:put(M1, map_val),
+GM = persistent_term:get(M2),
+EM1 = persistent_term:erase(M3),
+EM2 = persistent_term:erase(M2),
+L1 = lists:seq(1,3),
+L2 = lists:seq(1,3),
+L3 = lists:seq(1,3),
+PL = persistent_term:put(L1, list_val),
+GL = persistent_term:get(L2),
+EL1 = persistent_term:erase(L3),
+EL2 = persistent_term:erase(L2),
+io:format(\"~p ~p ~p ~p ~p ~p ~p ~p ~p ~p ~p ~p ~p ~p ~p ~p~n\",
+          [PT,GT,ET1,ET2, PB,GB,EB1,EB2, PM,GM,EM1,EM2, PL,GL,EL1,EL2]),
+halt(0).";
+    let Some(rendered) = support::oracle_eval(&oracle, None, expr) else {
+        eprintln!("SKIP the live-oracle boxed-key comparison: the erl probe could not answer");
+        return;
+    };
+    let oracle_line = rendered.trim().to_string();
+
+    let mut rt = runtime();
+    let ok_atom = rt.intern("ok");
+    let true_term = rt.intern("true");
+    let false_term = rt.intern("false");
+
+    // One `(literal, value atom)` per shape the oracle probe builds, in probe order.
+    let cases = [
+        ("{pterm_key,1}", "tuple_val"),
+        ("<<1,2,3>>", "bin_val"),
+        ("#{a => 1}", "map_val"),
+        ("[1,2,3]", "list_val"),
+    ];
+    let mut tokens: Vec<String> = Vec::new();
+    for (literal, value_name) in cases {
+        let key = rt
+            .eval(literal)
+            .unwrap_or_else(|e| panic!("{literal}: {e:?}"));
+        let equal = rt
+            .eval(literal)
+            .unwrap_or_else(|e| panic!("{literal} again: {e:?}"));
+        let value = rt.intern(value_name);
+        assert_ne!(
+            key, equal,
+            "`{literal}` twice must be two distinct heap words"
+        );
+
+        let put = call(&mut rt, "put", 2, &[key, value]).expect("put(Key, Value)");
+        let got = call(&mut rt, "get", 1, &[equal]).expect("get(Equal)");
+        let erased = call(&mut rt, "erase", 1, &[equal]).expect("erase(Equal)");
+        let erased_again = call(&mut rt, "erase", 1, &[equal]).expect("erase(Equal) again");
+
+        assert_eq!(put, ok_atom, "put/2 of a {literal} key is ok");
+        assert_eq!(got, value, "get/1 through an equal {literal} key");
+        assert_eq!(erased, true_term, "erase/1 through an equal {literal} key");
+        assert_eq!(erased_again, false_term, "the {literal} key is gone");
+
+        tokens.push(scalar(&rt, put));
+        tokens.push(scalar(&rt, got));
+        tokens.push(scalar(&rt, erased));
+        tokens.push(scalar(&rt, erased_again));
+    }
+    let ours = tokens.join(" ");
+    assert_eq!(
+        ours, oracle_line,
+        "the boxed-key persistent_term goldens must match the live oracle"
+    );
+    assert_eq!(
+        oracle_line,
+        "ok tuple_val true false ok bin_val true false ok map_val true false ok list_val true false",
+        "the recorded oracle answer for the boxed-key probe changed"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Term builders + readers
 // ---------------------------------------------------------------------------------------
-
 /// The value stored under `key` in the flat map `map`, or `None` when the key is absent.
 fn map_value(rt: &Runtime, map: Eterm, key: &str) -> Option<Eterm> {
     terms::map_entries(map)
