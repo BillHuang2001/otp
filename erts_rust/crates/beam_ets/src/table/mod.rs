@@ -32,6 +32,7 @@ mod interior;
 mod lifecycle;
 mod ownership;
 mod read;
+mod rename;
 mod shared;
 mod update;
 mod view;
@@ -39,6 +40,7 @@ mod view;
 pub use access::TableAccess;
 pub use lifecycle::OwnerDeath;
 pub use ownership::{Heir, SetOpt};
+pub use rename::RenameOutcome;
 pub use shared::SharedTable;
 pub use view::{TableRead, TableTerm, TableWrite};
 pub(crate) use interior::Interior;
@@ -214,11 +216,14 @@ impl Table {
         ordered_interior: OrderedInterior,
     ) -> Result<Table> {
         let interior = build_interior(opts.kind(), set_interior, ordered_interior);
+        // A creation-time `{heir, Pid, Data}` option (if any) is the table's
+        // initial heir; `ets:setopts/2` replaces it later.
+        let heir = opts.heir();
         Ok(Table {
             id,
             opts,
             owner: None,
-            heir: None,
+            heir,
             store,
             set_interior,
             ordered_interior,
@@ -344,6 +349,7 @@ impl Table {
             compressed: self.opts.is_compressed(),
             write_concurrency: self.opts.write_concurrency(),
             read_concurrency: self.opts.read_concurrency(),
+            decentralized_counters: self.opts.decentralized_counters(),
         }
     }
 
