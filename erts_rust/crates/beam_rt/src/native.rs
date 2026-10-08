@@ -64,6 +64,7 @@ mod code;
 mod erts_internal;
 mod init;
 pub(crate) mod memory;
+mod node;
 mod port;
 mod prim;
 mod process;
@@ -158,6 +159,16 @@ impl RuntimeContext<'_> {
             ("erlang", "demonitor", 2) => Some(self.demonitor_2(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
+            // The distribution identity surface (contract A.5): this node's name, its cookie
+            // and the (always empty) set of connected nodes. One arm per name; every answer
+            // reads the runtime's own node table, so the per-function bodies -- including the
+            // `set_cookie/2` raise shapes the differential corpus pins
+            // (`wire_ids/node_identity_cases`) -- live in [`node`].
+            ("erlang", "is_alive", 0) => Some(self.is_alive_0()),
+            ("erlang", "get_cookie", 0) => Some(self.get_cookie_0()),
+            ("erlang", "set_cookie", 2) => Some(self.set_cookie_2(args)),
+            ("erlang", "nodes", 0) => Some(self.nodes_0()),
+            ("erlang", "nodes", 1) => Some(self.nodes_1(args)),
             // Sequential tracing (contract A.8, item 2) — exactly the four BIFs
             // `bif.tab:220-223` declares, served by [`crate::seq_trace`], which also owns the
             // token model. `system_flag/2` is claimed **only** for the `reset_seq_trace` arm
