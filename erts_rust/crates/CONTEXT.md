@@ -149,7 +149,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `Encoder::with_fun_identity`; without it the encode returns the typed `error::unsupported_local_fun`
   (the inlined descriptor carries no module/MD5). The remaining owner is `beam_rt`, which must supply the
   identity from the running module.
-- `beam_codec`: HAMT (>32-key) maps now encode via `beam_term::map::map_pairs_storage_order` (byte-identical
+- `beam_codec`: HAMT (>32-key) maps encode via `beam_term::map::map_pairs_storage_order` (byte-identical
   to the oracle). Only its private `write_large_flatmap` (an oversized *flat*-map writer with no LCA producer,
   since `map::write_map` switches to a HAMT past 32 pairs) and the `binary.rs` shim stay crate-local.
 - `beam_engine` / `beam_bifs`: `maps:*` on large maps via `map::{map_get,map_size,map_pairs,map_put,map_remove}`.
