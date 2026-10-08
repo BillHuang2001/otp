@@ -52,7 +52,13 @@ its module docs, the guarantee it pins and how it is made non-flaky.
     immediately when already there, and invoking the waker), inactive-thread exclusion (reactivation
     re-includes), concurrent `bump`s each happen once, `block`/`unblock` nest, `safepoint` never
     blocks on the caller's own slot, a clone shares the registry/generation/blocking state.
-
+16. `dict_oracle.rs` (12 tests) — the process dictionary **cross-checked against the real `erl`**
+    (OTP 29.1.1 on `PATH`; the suite **skips loudly** when it is absent): the boxed-key reproducer
+    (`put({a},1), get({a})` ⇒ `1`) plus tuple/list/map/binary/atom/integer/float keys, `erase` by a
+    structurally equal key, repeated puts replacing in place, `get_keys_for_value` with a boxed value,
+    a nested composite key, similar-but-unequal keys staying distinct, and `get_keys` key-set
+    agreement. Each assertion is the oracle's own answer (a tiny text protocol over `erl -noshell
+    -eval`), so it pins the C's `EQ` key/value equality, not just internal consistency.
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
   `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion signals,
@@ -69,5 +75,5 @@ its module docs, the guarantee it pins and how it is made non-flaky.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`, `dict.rs`, `fragments.rs` → the single-threaded scheduler, mailbox, signals, GC roots and PCB state
-- `ports.rs`, `remote.rs` → the port table and distributed links/monitors
+- `dict_oracle.rs` → the process-dictionary equality/iteration evidence, cross-checked against the real `erl` (loud skip when absent)- `ports.rs`, `remote.rs` → the port table and distributed links/monitors
 - `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see `../src/smp/CONTEXT.md`)

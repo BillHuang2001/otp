@@ -88,12 +88,20 @@ liveness maps.
 ### `dict.rs` — the per-process dictionary
 - `Dict` (`Default`) backing `erlang:put/2`/`get/1`/`erase/1`: `put(Key, Val) -> Option<Eterm>` (last
   put wins, returns the replaced value), `get`, `erase`, `erase_all`, `get_keys`,
-  `get_keys_for_value`, `entries()`.
+  `get_keys_for_value`, `entries()`; `new()` (empty) / `with_atoms(Rc<AtomTable>)`.
   - **GC pair:** `gather_roots(out) -> usize` (appends each entry's key then value) /
     `scatter_roots(roots, start)` (never-panic).
   - **Semantics:** `None` is the C `THE_NON_VALUE` (absent; the BIF layer maps it to `undefined`).
-    Term-agnostic (no `AtomTable`): keys compare by raw `Eterm` word equality. Holds terms resident in
-    THIS process's young heap (a `Process::collect` sub-rootset).
+    Keys — and, for `get_keys_for_value`, **values** — compare with `beam_term::compare::eq`, i.e. the
+    C's `EQ` (`erl_utils.h:113`): structural (`=:=`), so a *boxed* key matches a distinct-but-equal
+    term (`put({a},1), get({a})` ⇒ `1`). The comparator resolves atom names through the `Rc<AtomTable>`
+    handle the `Dict` carries (`new()` ⇒ an empty table, whose unknown-name fallback is the raw atom
+    index — the C's `EQ` for two immediates). Holds terms resident in THIS process's young heap (a
+    `Process::collect` sub-rootset).
+  - **Iteration order (documented deviation):** the pairs are kept in insertion order, so
+    `get_keys`/`entries` are insertion-ordered. The C walks its hash array (`pd_hash_get_all`) and its
+    order is a hash-layout artifact (`put(a,1), put(b,2), get()` ⇒ `[{b,2},{a,1}]` on OTP 29.1.1);
+    reproducing it means porting the hash array — the O(1)-lookup optimization this module defers.
 ### `fragments.rs` — saved BIF/NIF arguments
 - `SavedArgs` (`Default`) — the saved BIF/NIF argument root list (the C `ErlSaveCallArgs`):
   `push`/`pop`, `as_slice`/`as_mut_slice`, `len`/`clear`, plus the GC pair `gather_roots`/`scatter_roots`
@@ -365,10 +373,11 @@ re-export keeps `beam_process::PortTable` resolving here.
   (alloc/reuse + relationship round-trips), `progress` (generation bump), `ptab` (alloc/remove/reuse +
   serial bump, name registry, stale-pid rejection, `deliver` wake list, `take` clearing a pending wake,
   the trap/link-`EXIT`/`{'DOWN'}` paths waking a blocked recipient).
-- **`tests/` — the integration evidence pinning the M1 guarantees.** 15 files, one topic each; the
+- **`tests/` — the integration evidence pinning the M1 guarantees.** 16 files, one topic each; the
   authoritative per-file list lives in **`tests/CONTEXT.md`**. In short: `scheduler`/`messaging`/
-  `signals`/`gc`/`priority`/`pending_signals`/`dict`/`fragments` cover the single-threaded scheduler,
-  the mailbox, signals and PCB state; `ports`/`remote` the port table and distributed links/monitors;
+  `signals`/`gc`/`priority`/`pending_signals`/`dict`/`dict_oracle`/`fragments` cover the single-threaded
+  scheduler, the mailbox, signals, PCB state and the dictionary (including its `erl`-cross-checked
+  structural key/value equality); `ports`/`remote` the port table and distributed links/monitors;
   `smp`/`lock_scope`/`timers`/`dirty`/`progress` the SMP pool. `tests/lock_scope.rs` is the
   bounded-quantum-lock evidence (a slice = `ceil(budget/quantum)` runner invocations under one slice;
   a cross-thread send and a peer run *inside* another process's slice — both assertions fail under a
@@ -384,7 +393,7 @@ re-export keeps `beam_process::PortTable` resolving here.
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **223 tests, 0 failures** (131 in-module unit + 91 across the 15 `tests/` files + 1
+  Current total: **240 tests, 0 failures** (136 in-module unit + 103 across the 16 `tests/` files + 1
   doctest), warning-free. Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`,
   never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
@@ -449,11 +458,23 @@ re-export keeps `beam_process::PortTable` resolving here.
   the public `Message::new(..).with_token(..).with_off_heap(..)` builder); the dict/saved-args/signal
   regions are scattered back through their own `scatter_roots`. MSO handles are off-heap and do not
   move. This uses only `beam_message`'s public API — no sibling crate is modified.
-- **The process dictionary compares keys by raw `Eterm` word equality.** `Dict` is term-agnostic and has
-  no `AtomTable`, so exact equality holds for immediates and the same boxed object; structural equality
-  of two distinct-but-equal boxed keys (e.g. two separately built 2-tuples) needs `beam_term::compare::eq`
-  and is deliberately not a `Dict` dependency. The BIF layer supplies/copies values in and maps the
-  `None` (absent) result to the `undefined` atom.
+- **The process dictionary compares keys — and, for `get_keys/1`, values — with `beam_term::compare::eq`
+  (the C's `EQ`, `erl_utils.h:113`).** `Dict` carries the atom table as a cheap `Rc<AtomTable>` handle
+  (`Dict::new()` ⇒ an empty table, whose unknown-name fallback is the raw atom index, i.e. exactly the C's
+  `EQ` for two immediates; `Dict::with_atoms(Rc<AtomTable>)` ⇒ the owner's shared table, so names resolve).
+  Raw `Eterm` word equality would report a *boxed* key absent whenever the looked-up term is a distinct
+  but equal heap word (`put({a},1), get({a})` ⇒ `undefined` instead of `1`); the C's `EQ` is a raw-word
+  fast path for immediates **plus** a structural walk for boxed terms, which `compare::eq` reproduces. The
+  `Rc` (not `&AtomTable`) keeps the method signatures unchanged and matches `beam_rt`'s `CodeServer`/
+  persistent-term convention — no dependency edge, no cross-crate churn. The BIF layer supplies/copies
+  values in and maps the `None` (absent) result to the `undefined` atom.
+- **The dictionary's iteration order is a documented deviation.** `Dict` keeps its pairs in insertion
+  order, so `get_keys`/`entries`/`erase_all` are insertion-ordered; the C walks its hash array
+  (`pd_hash_get_all`, `erl_process_dict.c:579-626`), whose order is a slot-layout artifact, not LIFO
+  (`put(a,1), put(b,2), get()` ⇒ `[{b,2},{a,1}]` on OTP 29.1.1). Reproducing it means porting the hash
+  array — the O(1)-lookup optimization this module deliberately defers. Orthogonal to the equality fix and
+  unchanged by it; the *value* semantics (`put` replaces in place / last put wins / returns the replaced
+  value, `erase` returns the erased value) are pinned by tests.
 - **Monitor references are on-heap `Ref` things built locally (`monitor.rs`).** `beam_term` has no
   `make_ref` in M1, so a monitor reference is represented as the frozen 4-word ref thing
   `[make_header(3, REF_SUBTAG), node(0), serial, id]` built with `beam_term`'s public `make_header`;
@@ -563,7 +584,7 @@ re-export keeps `beam_process::PortTable` resolving here.
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
 - `src/registers.rs` → `XRegs`, `Stack`, `Registers` (the root-set containers); `MAX_REG`/`MAX_ARG`
 - `src/process.rs` → `Process` (PCB), `ProcessState`, `ProcessFlags` (incl. `sensitive`), `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
-- `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter)
+- `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter; keys and `get_keys/1` values compare structurally via `beam_term::compare::eq` through an `Rc<AtomTable>` handle)
 - `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
 - `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing)
 - `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam), `enqueue_with_priority`, `resume_woken` (wake absorption), the shared `pub(crate)` slice helpers `slice_begin`/`slice_end`/`run_one`/`drain_woken_into`, and `DEFAULT_REDUCTIONS_PER_SLICE`/`DEFAULT_LOCK_QUANTUM`
@@ -579,7 +600,7 @@ re-export keeps `beam_process::PortTable` resolving here.
 - `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface), `PortMonitor`, `PortClose`
 - `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry + signal/link/monitor hub + the decoupled signal servicing + the wake list + the remote records + the distribution seam), `ExitEffect`
 - `src/error.rs` → `pub(crate)` error constructors (no new error type)
-- `tests/*.rs` (15 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence)
+- `tests/*.rs` (16 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `dict_oracle.rs` = the `erl`-cross-checked process-dictionary equality/iteration-order evidence)
 - `tests/CONTEXT.md` → per-file topic list, the anti-flakiness constraint, the gate command
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)
