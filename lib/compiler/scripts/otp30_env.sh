@@ -76,14 +76,25 @@ setup() {
     echo "=== building erl_interface, emulator, bootstrap wrappers ==="
     make -j"$JOBS" erl_interface
     make -j"$JOBS" emulator bootstrap_setup
+    # The primary bootstrap ships kernel, stdlib and compiler only -- not
+    # parsetools. The freshly built bootstrap `erlc' therefore has no `yecc'
+    # or `leex', and cannot turn the committed grammar sources (stdlib's
+    # `erl_parse.yrl' and `erl_scan.xrl', compiler's `core_parse.yrl') into
+    # Erlang sources. Build parsetools first with the bootstrap compiler and
+    # then put all of `lib/' on the code path of the in-tree builds below, so
+    # that bootstrap `erlc' finds `yecc' and `leex' there.
+    echo "=== building parsetools with the primary bootstrap ==="
+    PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/parsetools" opt
     # Build kernel, stdlib and compiler in-tree with the primary bootstrap
     # compiler (which now runs on the freshly built OTP-30 emulator). The
     # `primary_bootstrap' target is deliberately NOT used: it also rewrites
     # the version-controlled files under bootstrap/, which must stay pristine.
+    # ERL_LIBS is scoped to these steps only, because the ambient `erlc' used
+    # for common_test below is an older OTP and must not load OTP-30 beams.
     echo "=== building kernel, stdlib, compiler with the primary bootstrap ==="
-    PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/kernel" opt
-    PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/stdlib" opt
-    PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/compiler" opt
+    ERL_LIBS="$ERL_TOP/lib" PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/kernel" opt
+    ERL_LIBS="$ERL_TOP/lib" PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/stdlib" opt
+    ERL_LIBS="$ERL_TOP/lib" PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/compiler" opt
 
     echo "=== building common_test ==="
     [ -f "$ERL_TOP/lib/common_test/priv/x86_64-pc-linux-gnu/Makefile" ] || \
