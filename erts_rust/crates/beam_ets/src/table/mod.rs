@@ -22,7 +22,7 @@ use beam_term::prelude::*;
 use crate::error::badarg;
 use crate::info::TableInfo;
 use crate::key::{key_of, object_elements};
-use crate::kind::{can_read, can_write, Access, SetInterior, TableKind, TableOptions};
+use crate::kind::{can_read, can_write, Access, OrderedInterior, SetInterior, TableKind, TableOptions};
 use crate::select::SelectPredicate;
 use crate::store::TermStore;
 
@@ -115,6 +115,9 @@ pub struct Table {
     /// [`delete_all_objects`](Table::delete_all_objects) rebuilds the *same*
     /// interior the table started with.
     set_interior: SetInterior,
+    /// Which `ordered_set` index this table uses (ignored by the other kinds).
+    /// Recorded for the same rebuild reason as [`Table::set_interior`].
+    ordered_interior: OrderedInterior,
     /// The interior index dispatching the table ops.
     interior: Box<dyn Interior>,
     /// Whether the table is fixed for safe traversal
@@ -147,31 +150,66 @@ impl Table {
     /// A new table whose **`set`** interior is chosen explicitly.
     ///
     /// The selection only affects [`TableKind::Set`]; the other kinds keep their
-    /// own index. It exists so the two `set` interiors can be measured and
-    /// cross-checked against each other; production callers use [`Table::new`],
-    /// which selects [`SetInterior::default`].
+    /// own index (the `ordered_set` index is chosen by
+    /// [`Table::with_ordered_interior`]). It exists so the two `set` interiors can
+    /// be measured and cross-checked against each other; production callers use
+    /// [`Table::new`], which selects [`SetInterior::default`].
     pub fn with_set_interior(
         id: TableId,
         opts: TableOptions,
         interior: SetInterior,
     ) -> Result<Table> {
-        Table::build_with(id, opts, TermStore::with_default_allocator(), interior)
+        Table::build_with(
+            id,
+            opts,
+            TermStore::with_default_allocator(),
+            interior,
+            OrderedInterior::default(),
+        )
+    }
+
+    /// A new table whose **`ordered_set`** interior is chosen explicitly.
+    ///
+    /// The selection only affects [`TableKind::OrderedSet`]; the other kinds keep
+    /// their own index (the `set` index is chosen by [`Table::with_set_interior`]).
+    /// It exists so the two ordered interiors can be measured and cross-checked
+    /// against each other; production callers use [`Table::new`], which selects
+    /// [`OrderedInterior::default`].
+    pub fn with_ordered_interior(
+        id: TableId,
+        opts: TableOptions,
+        interior: OrderedInterior,
+    ) -> Result<Table> {
+        Table::build_with(
+            id,
+            opts,
+            TermStore::with_default_allocator(),
+            SetInterior::default(),
+            interior,
+        )
     }
 
     /// The shared constructor: assemble the metadata, the store and the interior
-    /// for `opts`, with the default `set` interior.
+    /// for `opts`, with the default `set` and `ordered_set` interiors.
     fn build(id: TableId, opts: TableOptions, store: TermStore) -> Result<Table> {
-        Table::build_with(id, opts, store, SetInterior::default())
+        Table::build_with(
+            id,
+            opts,
+            store,
+            SetInterior::default(),
+            OrderedInterior::default(),
+        )
     }
 
-    /// The shared constructor with an explicit `set`-interior selection.
+    /// The shared constructor with explicit interior selections.
     fn build_with(
         id: TableId,
         opts: TableOptions,
         store: TermStore,
         set_interior: SetInterior,
+        ordered_interior: OrderedInterior,
     ) -> Result<Table> {
-        let interior = build_interior(opts.kind(), set_interior);
+        let interior = build_interior(opts.kind(), set_interior, ordered_interior);
         Ok(Table {
             id,
             opts,
@@ -179,6 +217,7 @@ impl Table {
             heir: None,
             store,
             set_interior,
+            ordered_interior,
             interior,
             fixed: false,
             deferred_frees: Vec::new(),
@@ -189,6 +228,12 @@ impl Table {
     /// which have a single index each).
     pub fn set_interior(&self) -> SetInterior {
         self.set_interior
+    }
+
+    /// The `ordered_set` interior this table was built with (ignored by the other
+    /// kinds, which have a single index each).
+    pub fn ordered_interior(&self) -> OrderedInterior {
+        self.ordered_interior
     }
     /// The table identifier.
     pub fn id(&self) -> TableId {
@@ -446,7 +491,7 @@ impl Table {
             // live and is never handed out again) and the index is rebuilt empty.
             let objects: Vec<Eterm> = self.interior.iter_objects().collect();
             self.deferred_frees.extend(objects);
-            self.interior = build_interior(self.opts.kind(), self.set_interior);
+            self.interior = build_interior(self.opts.kind(), self.set_interior, self.ordered_interior);
             return;
         }
         // Not fixed: `reset` releases every block the store owns (so the per-object
@@ -454,7 +499,7 @@ impl Table {
         // usable again; a fresh interior of the same kind and `set` shape is then
         // empty.
         self.store.reset();
-        self.interior = build_interior(self.opts.kind(), self.set_interior);
+        self.interior = build_interior(self.opts.kind(), self.set_interior, self.ordered_interior);
     }
 
     /// `ets:safe_fixtable/2`: set (or clear) the table's *fix* flag.

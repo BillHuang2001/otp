@@ -72,8 +72,8 @@ impl TableKind {
 /// is the crate-internal selection knob for the one kind that has two competing
 /// interiors ([`crate::HashInterior`], the chained index shared with
 /// `bag`/`duplicate_bag`, and [`crate::ChampInterior`], the open-addressing
-/// CHAMP). The multi-object kinds and `ordered_set` ignore it — they always use
-/// the chained index and the B+-tree respectively.
+/// CHAMP). The multi-object kinds ignore it (they always use the chained index)
+/// and `ordered_set` ignores it too (its index is chosen by [`OrderedInterior`]).
 ///
 /// Constructor: [`Table::with_set_interior`](crate::Table::with_set_interior).
 /// The [`Default`] is the measured winner (see `docs/interior_selection.md` and
@@ -96,6 +96,39 @@ impl SetInterior {
         match self {
             SetInterior::Chained => "chained",
             SetInterior::Champ => "champ",
+        }
+    }
+}
+
+/// The index shape backing an **`ordered_set`** table.
+///
+/// The interior shape is not externally pinned (workspace `CONTEXT.md` §2): this
+/// is the crate-internal selection knob for the one *ordered* kind, which has two
+/// competing interiors — the key-sorted B+-tree
+/// ([`OrderedSetInterior`](crate::OrderedSetInterior), the default) and the plain
+/// sorted `Vec` ([`SortedOrderedInterior`](crate::SortedOrderedInterior)). Every
+/// other kind has a single index and ignores it.
+///
+/// Constructor: [`Table::with_ordered_interior`](crate::Table::with_ordered_interior).
+/// The [`Default`] is the measured winner (see the crate benchmark
+/// `src/interior_bench.rs`); `Test Strategy` in the crate `CONTEXT.md` pins it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum OrderedInterior {
+    /// The K-ary B+-tree index (`OrderedSetInterior`): arena-backed nodes over
+    /// ascending `beam_term` key order, `O(log n)` lookup/insert/delete.
+    #[default]
+    BPlusTree,
+    /// The sorted-`Vec` index (`SortedOrderedInterior`): one sorted entry per key,
+    /// `O(log n)` binary-search lookup with `O(n)` insert/delete.
+    Sorted,
+}
+
+impl OrderedInterior {
+    /// A short name for diagnostics and docs (`"bplus_tree"` / `"sorted"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OrderedInterior::BPlusTree => "bplus_tree",
+            OrderedInterior::Sorted => "sorted",
         }
     }
 }

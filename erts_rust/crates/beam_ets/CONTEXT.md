@@ -42,7 +42,15 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `pub enum SetInterior { Chained, #[default] Champ }` (default **`Champ`**) — the crate-internal
   selection of the `set` interior (`as_str() -> "chained"`/`"champ"`); `Table::with_set_interior`
   installs it, `Table::set_interior` reports it. Not a `TableOptions` field (no BIF surface) and not
-  consulted by `bag`/`duplicate_bag`/`ordered_set`.- `pub struct TableOptions` (builder; defaults: `Set`, keypos 1, `Protected`, unnamed, uncompressed,
+  consulted by `bag`/`duplicate_bag`/`ordered_set`.
+- `pub enum OrderedInterior { #[default] BPlusTree, Sorted }` (default **`BPlusTree`**) — the
+  crate-internal selection of the `ordered_set` interior (`as_str() -> "bplus_tree"`/`"sorted"`);
+  `Table::with_ordered_interior` installs it, `Table::ordered_interior` reports it. Not a
+  `TableOptions` field and not consulted by `set`/`bag`/`duplicate_bag`. `Sorted` selects
+  `SortedOrderedInterior` (a sorted `Vec`, `O(log n)` binary-search lookup with `O(n)`
+  insert/delete) so the two ordered interiors can be cross-checked and measured; the B+-tree stays
+  the default (Design Decisions).
+- `pub struct TableOptions` (builder; defaults: `Set`, keypos 1, `Protected`, unnamed, uncompressed,
   no concurrency): `new()`, `set_kind`, `set_keypos(usize) -> Result<&mut Self>` (rejects 0),
   `set_access`, `set_named(bool)`, `set_name(Atom)`, `set_compressed(bool)`,
   `set_write_concurrency(bool)`, `set_read_concurrency(bool)`; getters `kind()/keypos()/access()/
@@ -89,6 +97,8 @@ impl Table {
     pub fn with_allocator(id: TableId, opts: TableOptions, alloc: AllocRef) -> Result<Table>;
     pub fn with_set_interior(id: TableId, opts: TableOptions, interior: SetInterior) -> Result<Table>; // opt-in `set` interior
     pub fn set_interior(&self) -> SetInterior;   // the selected `set` interior (Champ by default)
+    pub fn with_ordered_interior(id: TableId, opts: TableOptions, interior: OrderedInterior) -> Result<Table>; // opt-in `ordered_set` interior
+    pub fn ordered_interior(&self) -> OrderedInterior; // the selected `ordered_set` interior (BPlusTree by default)
 
     // metadata
     pub fn id(&self) -> TableId;
@@ -225,9 +235,11 @@ impl Table {
   provably wrong — a sub-node is indexed by the *next* 5 hash bits, so it must not be probed with the
   parent's bits; only single-entry inlining preserves routing. `node_insert` needs no
   canonicalization (an insert only adds entries).
-- Selection: [`SetInterior`] (`kind.rs`) — `Champ` (default) or `Chained`; `build_interior` routes
-  `TableKind::Set` accordingly. `bag`/`duplicate_bag` stay on `HashInterior`, `ordered_set` on the
-  B+-tree. Constructor: `Table::with_set_interior`; `Table::set_interior` reports the selection.
+- Selection: [`SetInterior`] (`kind.rs`) — `Champ` (default) or `Chained`; `build_interior(kind,
+  set_interior, ordered_interior)` routes `TableKind::Set` accordingly (and `TableKind::OrderedSet`
+  through [`OrderedInterior`]). `bag`/`duplicate_bag` stay on `HashInterior`; `ordered_set` is the
+  B+-tree (default) or the sorted `Vec`. Constructor: `Table::with_set_interior`;
+  `Table::set_interior` reports the selection.
 
 ### `hash_interior.rs` — chained hash-index interior (`bag`/`duplicate_bag`; opt-in `set`)
 - `pub struct HashInterior`: buckets `Vec<Vec<Entry>>` (`Entry { key, objs: Vec<Eterm> }`), lookup by
@@ -241,14 +253,20 @@ impl Table {
   It implements `keys()` (bucket-scan order) but **not** `first_key`/`last_key`/`next_key`/`prev_key`,
   so the trait defaults supply them (see Design Decisions, hash-kind navigation order).
 
-### `ordered_interior/` — the K-ary B+-tree interior (`ordered_set`)
+### `ordered_interior/` — the ordered `ordered_set` interiors (B+-tree + sorted `Vec`)
 - `mod.rs` — `pub struct OrderedSetInterior` (key-ordered B+-tree, see Design Decisions): `new()`,
   `first`/`last`, `first_key`/`last_key`, `next`/`prev`, `next_from(bound, inclusive)`/
   `prev_from(bound, inclusive)` (the partial-bound range searches) — all via `beam_term::compare::cmp`.
   Plus its `Interior` impl (which overrides `first_key`/`last_key`/`next_key`/`prev_key` and
   `memory`). Interior storage (the node arena) **is** counted by `memory()`.
+- `sorted.rs` — `pub struct SortedOrderedInterior`: the alternative `ordered_set` interior
+  ([`OrderedInterior::Sorted`]), the **same** observable semantics over one `Vec<Entry>` kept sorted
+  by `beam_term::compare::cmp` (`O(log n)` binary-search lookup via the shared `node::search_entries`,
+  `O(n)` `Vec::insert`/`Vec::remove`), with the same inherent navigation and a capacity-based
+  `memory()`. Crate-internal `iter()` yields the shared `node::Entry` record.
 - `node.rs` — the arena node layout + `ORDER`/`MIN_OCCUPANCY` constants and the `NodeStore`
-  (`NodeId` slots + free list; nodes never relocate).
+  (`NodeId` slots + free list; nodes never relocate); also the shared `Entry` record,
+  `search_entries` (used by both interiors) and `words_of`.
 - `tree.rs` — insert/lookup/delete with split + borrow-or-merge rebalance and the separator invariant
   `keys[i] == max(child[i])`.
 - `iter.rs` — the leaf-chain ordered iterator.
@@ -329,13 +347,15 @@ impl Table {
 - **Licensing** Apache-2.0; no new external deps (only `beam_common`/`beam_term`/`beam_alloc`/`libc`).
 
 ## Design Decisions
-- **`ordered_set` is a K-ary B+-tree** (`ORDER = 32`, `MIN_OCCUPANCY = ORDER/2 = 16`), replacing the
-  earlier sorted-`Vec` placeholder. Nodes live in an arena-backed `NodeStore` addressed by `NodeId`
-  (with a free list), so **nodes never relocate** and no interior pointer is ever invalidated —
-  matching `erl_db_tree.c`'s shape and giving O(log n) insert/lookup/delete and O(log n) ordered
-  iteration via a leaf chain plus the separator invariant `keys[i] == max(child[i])`. Rebalancing is
-  borrow-or-merge on underflow. All key comparisons go through `beam_term::compare::cmp` (so `1` and
-  `1.0` are distinct keys). Recorded as a structural change for `../../CHANGE.md` (repo-root owned).
+- **`ordered_set` defaults to a K-ary B+-tree** (`ORDER = 32`, `MIN_OCCUPANCY = ORDER/2 = 16`),
+  replacing the earlier sorted-`Vec` placeholder as the *only* interior (a fresh sorted-`Vec`
+  interior is retained as the selectable comparison index, see the next-next bullet). Nodes live in
+  an arena-backed `NodeStore` addressed by `NodeId` (with a free list), so **nodes never relocate**
+  and no interior pointer is ever invalidated — matching `erl_db_tree.c`'s shape and giving O(log n)
+  insert/lookup/delete and O(log n) ordered iteration via a leaf chain plus the separator invariant
+  `keys[i] == max(child[i])`. Rebalancing is borrow-or-merge on underflow. All key comparisons go
+  through `beam_term::compare::cmp` (so `1` and `1.0` are distinct keys). Recorded as a structural
+  change for `../../CHANGE.md` (repo-root owned).
 - **`set` defaults to a CHAMP open-addressing interior; `bag`/`duplicate_bag` stay chained.** Adopted
   on measurement, not faith: `src/interior_bench.rs` compares `HashInterior` (chained) against
   `ChampInterior` per operation across 4 key shapes × 4 sizes (1e1/1e3/1e5/1e6), timing the *index*
@@ -350,6 +370,22 @@ impl Table {
   for `set` via `SetInterior::Chained` (`Table::with_set_interior`) and is still the index for
   `bag`/`duplicate_bag`. The interior shape is unpinned (workspace §2), and the parity tests prove no
   observable `ets:*` behaviour changes. (Recorded as a structural change for `../../CHANGE.md`.)
+- **`ordered_set` keeps the B+-tree as the default; the sorted `Vec` stays selectable.** Adopted on
+  measurement, not faith: `src/interior_bench.rs`'s `ordered_interior_microbenchmark` compares
+  `OrderedSetInterior` (B+-tree) against `SortedOrderedInterior` (sorted `Vec`) per operation across 4
+  key shapes × the sizes `10`/`1e3`/`1e5`, driving the keys in a **shuffled** order (mounting them in
+  ascending order would flatter the sorted `Vec`'s O(1)-append fast path and its shift-the-tail delete
+  worst case). `sorted/tree` ratios (sorted ÷ B+-tree) at `n = 1e5`: **insert 3.9–6.3× slower** and
+  **delete 3.1–34.6× slower** — the `O(n)` `Vec::insert`/`Vec::remove` tail shift grows with `n`
+  (already 1.5–9.8× / 1.7–4.1× at `n = 1e4`), against **lookup-hit 0.66–1.05×** (parity),
+  **lookup-miss 0.32–0.76×**, **ordered-iterate ≈0.1–0.45×** and **memory 0.73×** (27% fewer
+  bytes/entry — 21 vs 29 B). The sorted interior's *read* wins are bounded constants, while its
+  *mutating* loss is `O(n)` and unbounded, so it can never be the default for a table whose defining
+  operations are insert/lookup/delete; the B+-tree's `O(log n)` mutation is why ETS uses a tree. Hence
+  `OrderedInterior::default() == BPlusTree`; the sorted `Vec` remains selectable for comparison via
+  `OrderedInterior::Sorted` (`Table::with_ordered_interior`). The interior shape is unpinned (workspace
+  §2), and `src/interior_parity.rs` proves the two ordered interiors produce identical observable
+  traces — including the exact ascending order. (Recorded as a structural change for `../../CHANGE.md`.)
 - **Interiors are a private `Interior` trait, not a pinned layout.** The workspace §2 rule says the
   interior is open; the trait lets the shape change without touching `Table` or any dependent. It
   carries **generic defaults** (rebuild-on-heap) with **hash overrides** (in-place destructive
@@ -479,21 +515,35 @@ impl Table {
   `relinquish` (check-out), `Table`-level insert/take store-word accounting, hash-interior ops
   (incl. the `insert`-retained-bool), CHAMP ops (round-trip, `delete_object` non-match, 2000-key
   churn, collision-node fallback, index-collision descend, canonicalization-by-inlining, `memory`
-  monotonicity), B+-tree invariants (incl. 10 000-key churn), select compile/execute, info.
-  **112 lib unit tests.**
-- **Cross-interior equivalence + the selection default** (`src/interior_parity.rs`, `#[cfg(test)]`):
-  `champ_is_the_documented_default_set_interior` pins `SetInterior::default() == Champ`; and the
-  chained/CHAMP interiors are driven through a shared LCG-generated operation script (insert /
-  `insert_new` / `lookup` / `member` / `lookup_element` / `update_counter` / `update_element` /
-  `delete` / `delete_object` / `take` / iteration) and must produce **identical** traces for `size`
-  (hence `ets:info(T,size)`), membership, element reads, and `select`/`match` iteration *content*
-  (order-insensitive, since `set` navigation order is unspecified), at `keypos` 1 and 2.
-- **Interior microbenchmark** (`src/interior_bench.rs`, `#[cfg(test)]`): chained vs CHAMP with
-  in-line `size`/hit/miss/iteration count assertions (so a wrong result can never be timed as a fast
-  one). Run with
+  monotonicity), B+-tree invariants (incl. 10 000-key churn), the sorted-`Vec`-interior ops
+  (round-trip, replace/delete, navigation of present/absent keys, `lookup_element` bounds,
+  `memory` monotonicity), the B+-tree **mixed-class** order test (`navigates`/iteration over
+  integers incl. negative and zero, an atom, a tuple, `[]`, a list and a binary in exactly
+  `beam_term::compare::cmp` order, checked for both ordered interiors — never against the live
+  oracle), select compile/execute, info. **123 lib unit tests.**
+- **Cross-interior equivalence + the selection defaults** (`src/interior_parity.rs`, `#[cfg(test)]`):
+  `champ_is_the_documented_default_set_interior` pins `SetInterior::default() == Champ` and
+  `bplus_tree_is_the_documented_default_ordered_interior` pins
+  `OrderedInterior::default() == BPlusTree`; the chained/CHAMP interiors are driven through a shared
+  LCG-generated operation script (insert / `insert_new` / `lookup` / `member` / `lookup_element` /
+  `update_counter` / `update_element` / `delete` / `delete_object` / `take` / iteration) and must
+  produce **identical** traces for `size` (hence `ets:info(T,size)`), membership, element reads, and
+  `select`/`match` iteration *content* (order-insensitive, since `set` navigation order is
+  unspecified), at `keypos` 1 and 2. The two **ordered** interiors run the *same* script but with an
+  **order-sensitive** tail (`tab2list`, the `first`/`next`-chain walk, the `prev`-chain, `last` and
+  `match_object`, all rendered in order) so any ordering divergence is caught, at `keypos` 1 and 2;
+  `the_ordered_trace_pins_the_ascending_order` proves that tail really carries order (a reversed run
+  would differ).
+- **Interior microbenchmarks** (`src/interior_bench.rs`, `#[cfg(test)]`): chained vs CHAMP
+  (`interior_microbenchmark`) and B+-tree vs sorted `Vec` (`ordered_interior_microbenchmark`), both
+  with in-line `size`/hit/miss/iteration count assertions (so a wrong result can never be timed as a
+  fast one). The ordered one drives its keys in a deterministic shuffled order (ascending order would
+  flatter the sorted `Vec`). Run with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets --lib
-  interior_microbenchmark -- --nocapture`; sizes default to `10,1000,100000` and are overridden via
-  the `BEAM_ETS_BENCH_SIZES` (comma list) and `BEAM_ETS_BENCH_SHAPES` env vars.
+  interior_microbenchmark -- --nocapture` (or `ordered_interior_microbenchmark`); sizes default to
+  `10,1000,100000` and are overridden via the `BEAM_ETS_BENCH_SIZES` (comma list) and
+  `BEAM_ETS_BENCH_SHAPES` env vars. The ordered benchmark is the crate's slow one (the sorted `Vec`
+  is `O(n)` per mutation) — pass `BEAM_ETS_BENCH_SIZES=10,1000,10000` when iterating.
 - Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`
   (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs` (incl.
@@ -583,23 +633,26 @@ impl Table {
   tests in `tests/ets_replace.rs`). Wherever the oracle accepts, the results agree.
 - **`ets:slot`-style iteration and `tab2file`/`file2tab` are not implemented** (out of scope for this
   pass); `tab2list` plus `first`/`next` cover enumeration.
-- **The two-hash-interior split is deliberate, and the `lib.rs`/`Cargo.toml` docs state it.** `set`
+- **The interior splits are deliberate, and the `lib.rs`/`Cargo.toml` docs state them.** `set`
   defaults to the CHAMP index (`src/champ_interior.rs`); `bag`/`duplicate_bag` use the chained index
   (`src/hash_interior.rs`: `Vec<Vec<Entry>>`, 8 buckets doubling past a 3/4 load factor); the chained
   index stays selectable for `set` (`SetInterior::Chained`). CHAMP is a measurement-driven choice, not
   a like-for-like win: it loses 1.6–2.8× on `delete` and (on small-int keys) up to ~2.1× on lookup
   *misses* — see the Design Decisions bullet and `src/interior_bench.rs` for the numbers. `beam_term::map`'s
-  HAMT is a separate layout (for map *terms*, not ETS). The interior shape is unpinned (crate-layer §2),
-  so no contract is affected.
+  HAMT is a separate layout (for map *terms*, not ETS). `ordered_set` likewise defaults to the B+-tree
+  (`src/ordered_interior/mod.rs`) with the sorted `Vec` (`src/ordered_interior/sorted.rs`) selectable
+  via `OrderedInterior::Sorted`; there the sorted interior *wins* lookup/iterate/memory but loses
+  `O(n)` on insert/delete, so the B+-tree is the default (Design Decisions). The interior shapes are
+  unpinned (crate-layer §2), so no contract is affected.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `src/kind.rs` → `TableKind`, `SetInterior` (the `set`-interior selector), `Access`, `Concurrency`, `TableOptions`, `can_read`/`can_write`
+- `src/kind.rs` → `TableKind`, `SetInterior` + `OrderedInterior` (the interior selectors), `Access`, `Concurrency`, `TableOptions`, `can_read`/`can_write`
 - `src/key.rs` → object/key validation (`key_of`, `is_valid_object`, `object_elements`)
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
-- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors (`new`/`with_allocator`/`with_set_interior`/`set_interior`), metadata/ownership accessors, write ops (insert/delete), access checks, `select_all`, module wiring
-- `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior(kind, set_interior)`
+- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors (`new`/`with_allocator`/`with_set_interior`/`set_interior`/`with_ordered_interior`/`ordered_interior`), metadata/ownership accessors, write ops (insert/delete), access checks, `select_all`, module wiring
+- `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior(kind, set_interior, ordered_interior)`
 - `src/table/read.rs` → the read/navigation `impl Table` (lookup/member/lookup_element*/first/last/next/prev/take/size/is_empty/tab2list/memory)
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
 - `src/table/ownership.rs` → `Heir`/`SetOpt` + the `ets:give_away/3` / `{heir, ...}` `setopts/2` semantics + the pid-gap docs
@@ -607,10 +660,11 @@ impl Table {
 - `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors and `element.rs`)
 - `src/champ_interior.rs` → `ChampInterior` (CHAMP open-addressing index) — the **default `set`** interior
 - `src/hash_interior.rs` → `HashInterior` (chained bucket index) for `bag`/`duplicate_bag` (and opt-in `set` via `SetInterior::Chained`)
-- `src/interior_parity.rs` → cross-interior equivalence tests + the default-selection test (`#[cfg(test)]`)
-- `src/interior_bench.rs` → the chained-vs-CHAMP interior microbenchmark (`#[cfg(test)]`)
+- `src/interior_parity.rs` → cross-interior equivalence tests (set + ordered) + the default-selection tests (`#[cfg(test)]`)
+- `src/interior_bench.rs` → the chained-vs-CHAMP and B+-tree-vs-sorted-`Vec` interior microbenchmarks (`#[cfg(test)]`)
 - `src/ordered_interior/mod.rs` → `OrderedSetInterior` (B+-tree) for `ordered_set` + its `Interior` impl
-- `src/ordered_interior/node.rs` → node layout, `ORDER`/`MIN_OCCUPANCY`, `NodeStore` arena
+- `src/ordered_interior/sorted.rs` → `SortedOrderedInterior` (sorted-`Vec` interior, opt-in via `OrderedInterior::Sorted`) + its `Interior` impl
+- `src/ordered_interior/node.rs` → node layout, `ORDER`/`MIN_OCCUPANCY`, `NodeStore` arena, the shared `Entry`/`search_entries`/`words_of`
 - `src/ordered_interior/tree.rs` → B+-tree insert/lookup/delete + rebalance
 - `src/ordered_interior/iter.rs` → leaf-chain ordered iterator
 - `src/select/mod.rs` → `MatchSpec`/`MatchClause`/`SelectPredicate` + `compile`

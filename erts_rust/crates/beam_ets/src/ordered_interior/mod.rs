@@ -17,6 +17,11 @@
 //!   range bounds). Its module docs state the invariants the test suite asserts.
 //! * [`iter`] — the left-to-right leaf-chain walk that makes ordered iteration a
 //!   pointer chase.
+//! * [`sorted`] — the alternative [`SortedOrderedInterior`]: the *same* observable
+//!   semantics over a plain sorted `Vec` (`O(log n)` binary-search lookup, `O(n)`
+//!   insert/delete). It is selectable with
+//!   [`OrderedInterior::Sorted`](crate::OrderedInterior::Sorted) so the two ordered
+//!   interiors can be cross-checked and measured; the B+-tree above is the default.
 //!
 //! [`OrderedSetInterior`] is the public face: it owns one [`Tree`] and adapts it
 //! to the crate-private [`Interior`] seam. The inherent navigation methods
@@ -29,6 +34,7 @@
 
 mod iter;
 mod node;
+mod sorted;
 mod tree;
 
 use beam_common::Result;
@@ -38,6 +44,8 @@ use self::tree::Tree;
 use crate::error::badarg;
 use crate::key::key_of;
 use crate::table::Interior;
+
+pub use self::sorted::SortedOrderedInterior;
 
 /// The B+-tree-backed interior used by `ordered_set`.
 ///
@@ -354,6 +362,122 @@ mod tests {
         assert_eq!(t.next(small, &atoms), Some(float));
         assert_eq!(t.prev(list, &atoms), Some(NIL));
         t.tree.check_invariants(&atoms);
+    }
+
+    /// Drive one interior through a **mixed-class** key set and assert that both
+    /// its ordered iteration and its navigation (`first`/`last`/`next`/`prev`) run
+    /// in exactly [`cmp`] order. The key classes here are numbers (integers,
+    /// including a negative and zero, plus a float), an atom, a tuple, the empty
+    /// list, a non-empty list and a binary — every class whose relative rank is
+    /// pinned by Erlang term order. This does **not** consult the live oracle
+    /// (the differential harness owns that); it pins the interior against
+    /// `beam_term::compare`, the single authority on term order.
+    fn check_mixed_keys(interior: &mut dyn Interior, keys: &[Eterm], atoms: &AtomTable) {
+        // Insert in reverse, so a correct interior must restore `cmp` order itself.
+        for key in keys.iter().rev() {
+            interior.insert(*key, *key, atoms).unwrap();
+        }
+        assert_eq!(interior.size(), keys.len());
+
+        // The expected order is *defined* as the `cmp` sort of the key set.
+        let mut expected = keys.to_vec();
+        expected.sort_by(|a, b| cmp(*a, *b, atoms));
+        assert_eq!(expected.len(), keys.len(), "the mixed keys are distinct");
+
+        // Ordered iteration (both the object walk and the key run) is ascending.
+        let iterated: Vec<Eterm> = interior.iter_objects().collect();
+        assert_eq!(iterated, expected, "iter_objects is in cmp order");
+        assert_eq!(interior.keys(), expected, "keys is in cmp order");
+        for pair in expected.windows(2) {
+            assert_eq!(
+                cmp(pair[0], pair[1], atoms),
+                Ordering::Less,
+                "consecutive keys are strictly ascending"
+            );
+        }
+
+        // `first`/`last` are the extremes; each present key's neighbours are the
+        // adjacent keys of the expected run.
+        assert_eq!(interior.first_key(atoms), Some(expected[0]));
+        assert_eq!(interior.last_key(atoms), expected.last().copied());
+        for (i, key) in expected.iter().enumerate() {
+            assert_eq!(
+                interior.next_key(*key, atoms),
+                expected.get(i + 1).copied(),
+                "next_key at index {i}"
+            );
+            assert_eq!(
+                interior.prev_key(*key, atoms),
+                i.checked_sub(1).map(|before| expected[before]),
+                "prev_key at index {i}"
+            );
+        }
+
+        // Walking forward from `first` with `next_key` visits every key in order …
+        let mut forward = Vec::new();
+        let mut cursor = interior.first_key(atoms);
+        while let Some(key) = cursor {
+            forward.push(key);
+            cursor = interior.next_key(key, atoms);
+        }
+        assert_eq!(forward, expected, "the next-chain is the ascending run");
+
+        // … and walking backward from `last` with `prev_key` is its mirror.
+        let mut backward = Vec::new();
+        let mut cursor = interior.last_key(atoms);
+        while let Some(key) = cursor {
+            backward.push(key);
+            cursor = interior.prev_key(key, atoms);
+        }
+        backward.reverse();
+        assert_eq!(backward, expected, "the prev-chain is the ascending run");
+    }
+
+    #[test]
+    fn mixed_key_classes_iterate_and_navigate_in_cmp_order() {
+        use beam_term::bitstring::{heap_bits_size_words, write_binary};
+
+        let mut atoms = AtomTable::new();
+        let atom = make_atom(atoms.intern("alpha"));
+        let mut heap = Heap::new(1 << 12);
+
+        // A 24-bit binary `<<0,1,2>>` in the heap arena.
+        let binary = {
+            let per = heap_bits_size_words(24);
+            // SAFETY: `per` words are reserved for a 24-bit (3-byte) binary and the
+            // payload is exactly 3 bytes.
+            unsafe {
+                let hp = heap.alloc_words(per).expect("the arena is sized");
+                write_binary(hp, &[0u8, 1, 2]).expect("3 bytes is a 24-bit binary")
+            }
+        };
+
+        let tuple = heap.tuple(&[make_small(1)]).unwrap();
+        let list = heap.cons(make_small(1), NIL).unwrap();
+
+        // Every class whose relative rank Erlang term order pins: numbers (a
+        // negative int, zero, a positive int, and a float), an atom, a tuple, the
+        // empty list, a non-empty list and a binary.
+        let keys = vec![
+            make_small(-5),
+            make_small(0),
+            make_small(7),
+            float_term(1.0),
+            atom,
+            tuple,
+            NIL,
+            list,
+            binary,
+        ];
+
+        // The B+-tree interior, plus its structural invariants after the inserts.
+        let mut tree = OrderedSetInterior::new();
+        check_mixed_keys(&mut tree, &keys, &atoms);
+        tree.tree.check_invariants(&atoms);
+
+        // The sorted-`Vec` interior must agree on order and navigation exactly.
+        let mut sorted = SortedOrderedInterior::new();
+        check_mixed_keys(&mut sorted, &keys, &atoms);
     }
 
     #[test]

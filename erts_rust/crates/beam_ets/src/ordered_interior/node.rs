@@ -376,6 +376,6 @@ pub(crate) fn child_index(branch: &BranchNode, key: Eterm, atoms: &AtomTable) ->
 }
 
 /// The number of `Eterm`-sized words a value of type `T` occupies (rounded up).
-fn words_of<T>() -> usize {
+pub(crate) fn words_of<T>() -> usize {
     size_of::<T>().div_ceil(size_of::<Eterm>())
 }
