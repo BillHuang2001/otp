@@ -61,6 +61,7 @@
          fn_budget_takes_effect/1,
          fn_budget_equivalence/1,
          fn_budget_ample_does_not_change_output/1,
+         fn_budget_option_registered/1,
          default_path_unchanged/1]).
 
 suite() ->
@@ -85,6 +86,7 @@ groups() ->
        fn_budget_takes_effect,
        fn_budget_equivalence,
        fn_budget_ample_does_not_change_output,
+       fn_budget_option_registered,
        default_path_unchanged]}].
 
 init_per_suite(Config) ->
@@ -341,6 +343,81 @@ fn_budget_ample_does_not_change_output(Config) ->
     Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
     ?assertEqual(code_of(key(plain, Builds)), code_of(key(fn_ample, Builds))),
     ok.
+
+%% `{ssa_opt_fn_budget,Millis}' is a first-class compiler option: `compile.erl'
+%% accepts and expands it (so it is not reported as an unknown option),
+%% `compile:options/0' advertises it in the help text, and driving it through
+%% `compile:file/2' with an exhausted allowance activates per-function
+%% skipping, which is observable in the statistics.
+fn_budget_option_registered(Config) ->
+    Sets = [{fn_tight, [binary,no_spawn_compiler_process,
+                        {ssa_opt_fn_budget,0}]}],
+    _ = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    St = stats(),
+    ?assert(is_map(St)),
+    ?assert(maps:get(function_over_budget, St) > 0),
+    %% Accepted directly by compile:file/2 as well.
+    Dir = tmp_dir(Config),
+    File = write_probe(Dir, "ssa_opt_budget_opts", flat_probe()),
+    ?assertMatch({ok,_,_},
+                 compile:file(File, [binary,return_errors,
+                                     {ssa_opt_fn_budget,0}])),
+    %% ... and advertised in the `compile:options/0' help text.
+    Help = capture_options(),
+    ?assert(string:find(Help, "ssa_opt_fn_budget") =/= nomatch),
+    ok.
+
+%% Capture the text `compile:options/0' writes by running it with a collecting
+%% process as the group leader. `compile:options/0' only uses `io:fwrite', i.e.
+%% sends `put_chars' io requests, so a minimal io server is enough.
+-spec capture_options() -> string().
+capture_options() ->
+    Self = self(),
+    Ref = make_ref(),
+    Collector = spawn_link(fun() -> options_collector(Self, Ref, []) end),
+    OldLeader = group_leader(),
+    true = group_leader(Collector, Self),
+    Result =
+        try
+            compile:options()
+        after
+            group_leader(OldLeader, Self)
+        end,
+    ok = Result,
+    Collector ! {text, Self, Ref},
+    receive
+        {Ref, Text} -> Text
+    after 10000 ->
+            ct:fail(options_capture_timeout)
+    end.
+
+-spec options_collector(pid(), reference(), [unicode:chardata()]) -> ok.
+options_collector(Parent, Ref, Acc) ->
+    receive
+        {io_request, From, ReplyAs, Request} ->
+            case Request of
+                {put_chars, Chars} ->
+                    From ! {io_reply, ReplyAs, ok},
+                    options_collector(Parent, Ref, [Chars|Acc]);
+                {put_chars, _Enc, Chars} ->
+                    From ! {io_reply, ReplyAs, ok},
+                    options_collector(Parent, Ref, [Chars|Acc]);
+                {put_chars, Mod, Fun, Args} ->
+                    From ! {io_reply, ReplyAs, ok},
+                    options_collector(Parent, Ref,
+                                      [apply(Mod, Fun, Args)|Acc]);
+                {put_chars, _Enc, Mod, Fun, Args} ->
+                    From ! {io_reply, ReplyAs, ok},
+                    options_collector(Parent, Ref,
+                                      [apply(Mod, Fun, Args)|Acc]);
+                _Other ->
+                    From ! {io_reply, ReplyAs, {error, enotsup}},
+                    options_collector(Parent, Ref, Acc)
+            end;
+        {text, Parent, Ref} ->
+            Parent ! {Ref, lists:flatten(lists:reverse(Acc))},
+            ok
+    end.
 
 %% The explicit check that the default path is untouched: compiling this
 %% suite's own source with no option, with the gates and with a no-op
