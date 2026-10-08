@@ -38,7 +38,7 @@ use beam_engine::jit::baseline::{BaselineJit, CompiledModule};
 use beam_engine::jit::JitBackend;
 use beam_engine::{Machine, MinimalContext, Tier, MAX_REGISTER};
 use beam_loader::{
-    load_file, Export, Function, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
+    load_file, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
 };
 use beam_term::{is_small, make_atom, make_small, signed_value, Atom, Eterm, Heap, NIL};
 
@@ -640,6 +640,16 @@ fn a_shape_the_tier_may_not_lower_still_deopts_with_interpreter_semantics() {
         "an undefined label is the interpreter's typed `unknown_label`, got {jitted:?}"
     );
 
+    // The same for a *tail* call to an undefined label: the tier may only resolve a
+    // target it can link, so the interpreter's own `call_last` runs and reports the
+    // exact `unknown_label`.
+    let module = unresolved_tail_module();
+    let jitted = agree(&module, "f", 0, &[], arith_hook);
+    assert!(
+        matches!(jitted, Err(BeamError::BadArg)),
+        "an undefined tail-call label is the interpreter's typed `unknown_label`, got {jitted:?}"
+    );
+
     // A `NO_FAIL` arity switch on a non-tuple: the raise (with its reason term) is
     // identical on both tiers.
     let module = no_fail_arity_switch_module();
@@ -660,5 +670,313 @@ fn a_shape_the_tier_may_not_lower_still_deopts_with_interpreter_semantics() {
     assert_eq!(
         agree(&module, "classify", 1, &[pair], arith_hook).expect("classify/1"),
         make_small(2)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Local tail calls: `call_last` (pop the frame, then jump) and `call_only` (jump)
+// ---------------------------------------------------------------------------
+
+/// `f/0` tail-calls `g/0` **after popping its own frame** — the shape OTP emits as
+/// `call_last` (a local tail call from a function that owns Y slots):
+///
+/// ```text
+///   f() ->  allocate 1          ; a real frame with one Y slot
+///           x0 = 7
+///           call_last 0 -> g 1  ; pop the frame, then transfer control
+///   g() ->  return              ; the bottom frame's `Halt` finishes with x0
+/// ```
+///
+/// `g/0`'s entry really is a compiled block (its only label starts one), so the tail
+/// call is linkable: the leaving block must pop the frame through the interpreter's own
+/// checked pop and then `jmp` straight to `g`'s entry instead of round-tripping through
+/// the driver.
+fn tail_call_module() -> Module {
+    let mut fixture = Fixture::new("linking_tail_call");
+    let entry = fixture.add_function(
+        "f",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 0,
+            },
+            Instr::Move {
+                src: Operand::Integer(7),
+                dst: Operand::X(0),
+            },
+            Instr::CallLast {
+                arity: 0,
+                target: Label(2),
+                deallocate: 1,
+            },
+            // Dead code after the tail call: the block ends at the transfer.
+            Instr::Return,
+        ],
+    );
+    fixture.add_function("g", 0, vec![Instr::Label(Label(2)), Instr::Return]);
+    fixture.export("f", 0, entry);
+    fixture.finish()
+}
+
+/// The same fixture with a `Deallocate` operand that no longer matches the live frame
+/// (`1` Y slot, operand `5`) — the stale-operand shape a `trim` leaves behind, which
+/// only a checked pop can catch.
+fn tail_call_mismatch_module() -> Module {
+    let mut fixture = Fixture::new("linking_tail_call_mismatch");
+    let entry = fixture.add_function(
+        "f",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 0,
+            },
+            Instr::CallLast {
+                arity: 0,
+                target: Label(2),
+                deallocate: 5,
+            },
+            Instr::Return,
+        ],
+    );
+    fixture.add_function("g", 0, vec![Instr::Label(Label(2)), Instr::Return]);
+    fixture.export("f", 0, entry);
+    fixture.finish()
+}
+
+/// `f/0` tail-calls `g/0` through `call_only` — a local tail call with **no** frame to
+/// pop (`$DISPATCH_REL(Dest)`), the shape the compiler emits for a frame-less tail call
+/// (e.g. `slice.beam`'s `fib/1 -> fib/3`, `tailcall.beam`'s `loop/2`).
+fn tail_only_module() -> Module {
+    let mut fixture = Fixture::new("linking_tail_only");
+    let entry = fixture.add_function(
+        "f",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Move {
+                src: Operand::Integer(9),
+                dst: Operand::X(0),
+            },
+            Instr::CallOnly {
+                arity: 0,
+                target: Label(2),
+            },
+        ],
+    );
+    fixture.add_function("g", 0, vec![Instr::Label(Label(2)), Instr::Return]);
+    fixture.export("f", 0, entry);
+    fixture.finish()
+}
+
+/// `f/0`: a `call_last` whose target label the module does not define — neither tier
+/// may invent a target, so the tier hands the instruction to the interpreter step.
+fn unresolved_tail_module() -> Module {
+    let mut fixture = Fixture::new("linking_tail_unresolved");
+    let entry = fixture.add_function(
+        "f",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 0,
+            },
+            Instr::CallLast {
+                arity: 0,
+                target: Label(99),
+                deallocate: 1,
+            },
+            Instr::Return,
+        ],
+    );
+    fixture.export("f", 0, entry);
+    fixture.finish()
+}
+
+/// The exact `[start, end)` byte range of the block compiled at `(func, pc)`.
+///
+/// Blocks are emitted in `(function, block)` order, so a block's machine code runs from
+/// its own entry to the next compiled entry — derived here from the artifact's own entry
+/// table rather than from an offset the test would have to guess.
+fn block_range(compiled: &CompiledModule, module: &Module, func: u32, pc: u32) -> (usize, usize) {
+    let start = compiled
+        .entry(func, pc)
+        .expect("the block must have been compiled") as usize;
+    let mut next = compiled.code_address_range().1;
+    for (f, function) in module.functions.iter().enumerate() {
+        for block in &function.blocks {
+            if let Some(entry) = compiled.entry(f as u32, block.start as u32) {
+                let address = entry as usize;
+                if address > start && address < next {
+                    next = address;
+                }
+            }
+        }
+    }
+    (start, next)
+}
+
+/// Assert the leaving block's code contains a `jmp` landing **exactly** on the
+/// successor's compiled entry — the evidence that the tail call was linked rather than
+/// returned to the driver as an `encode_target` word.
+fn assert_linked_tail_call(compiled: &CompiledModule, module: &Module, func: u32, pc: u32, to: usize) {
+    let (lo, hi) = block_range(compiled, module, func, pc);
+    assert!(hi > lo, "the leaving block must have emitted code");
+    let code = code_bytes(compiled, lo, hi);
+    assert!(
+        direct_jump_to(&code, lo, to).is_some(),
+        "the block at ({func}, {pc}) must `jmp` directly to the successor's compiled \
+         entry {to:#x}; its {} bytes at [{lo:#x}, {hi:#x}) contain no such jump",
+        code.len()
+    );
+}
+
+#[test]
+fn a_linked_local_tail_call_pops_the_frame_then_jumps_to_the_successors_entry() {
+    let module = tail_call_module();
+    let compiled = BaselineJit::new()
+        .compile(&module)
+        .expect("compile the tail-call fixture");
+    let to = compiled
+        .entry(1, 0)
+        .expect("g/0's block is compiled") as usize;
+    assert_linked_tail_call(&compiled, &module, 0, 0, to);
+}
+
+#[test]
+fn a_linked_local_tail_call_pops_the_frame_exactly_like_the_interpreter() {
+    // The strongest evidence that the frame pop really happened: the machine is left in
+    // the *same* state as the interpreter's. A skipped (or mis-sized) pop would leave
+    // f/0's frame and its Y slot on the stack, because the successor returns through the
+    // bottom frame — so `frame_depth`/`stack_depth` would differ.
+    let module = tail_call_module();
+    let function = atom(&module, "f");
+
+    let mut interpreted_machine = Machine::new();
+    let mut interpreted_ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let interpreted = interpreted_machine
+        .run_with_tier(
+            &module,
+            function,
+            0,
+            &[],
+            &mut interpreted_ctx,
+            Tier::Interpreter,
+        )
+        .expect("the interpreter must run the tail-call fixture");
+
+    let mut jitted_machine = Machine::new();
+    let mut jitted_ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let jitted = jitted_machine
+        .run_with_tier(
+            &module,
+            function,
+            0,
+            &[],
+            &mut jitted_ctx,
+            Tier::BaselineJit,
+        )
+        .expect("the baseline tier must run the tail-call fixture");
+
+    assert_eq!(jitted, interpreted, "the tiers disagree on the result");
+    assert_eq!(jitted, make_small(7), "g/0 returns what f/0 left in x0");
+    assert_eq!(
+        jitted_machine.frame_depth(),
+        interpreted_machine.frame_depth(),
+        "the linked tail call must leave the interpreter's frame stack"
+    );
+    assert_eq!(
+        jitted_machine.stack_depth(),
+        interpreted_machine.stack_depth(),
+        "the linked tail call must leave the interpreter's Erlang stack"
+    );
+    assert_eq!(
+        jitted_machine.frame_depth(),
+        1,
+        "only the run entry's bottom frame remains"
+    );
+    assert_eq!(jitted_machine.stack_depth(), 0, "f/0's Y slot is gone");
+}
+
+#[test]
+fn a_linked_tail_call_with_a_stale_deallocate_keeps_the_interpreters_typed_error() {
+    // The link is by *target*, so this fixture is linked and its checked pop fails. The
+    // block must return that failure to the driver as `ERROR` (with `rt.error` set), so
+    // the tiers report the same typed error — never a silently popped frame.
+    let module = tail_call_mismatch_module();
+    let jitted = agree(&module, "f", 0, &[], arith_hook);
+    assert!(
+        matches!(jitted, Err(BeamError::Raise(_))),
+        "a stale `Deallocate` must be the interpreter's typed frame error, got {jitted:?}"
+    );
+}
+
+#[test]
+fn a_linked_local_tail_call_without_a_frame_is_linked_like_a_jump() {
+    // `call_only` has no frame to pop, so its exit is `jump`'s linked exit verbatim —
+    // but it must still be *linked*, not returned to the driver.
+    let module = tail_only_module();
+    let compiled = BaselineJit::new()
+        .compile(&module)
+        .expect("compile the `call_only` fixture");
+    let to = compiled
+        .entry(1, 0)
+        .expect("g/0's block is compiled") as usize;
+    assert_linked_tail_call(&compiled, &module, 0, 0, to);
+
+    assert_eq!(
+        agree(&module, "f", 0, &[], arith_hook).expect("f/0"),
+        make_small(9)
+    );
+}
+
+#[test]
+fn the_slice_fixtures_local_tail_calls_are_linked() {
+    // The real compiler's shape: `fib/1` ends in `call_only slice:fib/3` and `fib/3`
+    // loops with `call_only slice:fib/3` (OTP emits `call_only` for a local tail call
+    // with no frame to pop). Every local tail call in the fixture whose target is a
+    // compiled block's entry must leave its block by a direct jump.
+    let module = slice_module();
+    let compiled = BaselineJit::new()
+        .compile(&module)
+        .expect("compile slice.beam");
+
+    let mut linked = 0usize;
+    for (func, function) in module.functions.iter().enumerate() {
+        for block in &function.blocks {
+            let end = block.end.min(function.code.len());
+            if block.start >= end {
+                continue;
+            }
+            let target = function.code[block.start..end].iter().find_map(|instr| match instr {
+                Instr::CallLast { target, .. } | Instr::CallOnly { target, .. } => Some(*target),
+                _ => None,
+            });
+            let Some(target) = target else { continue };
+            // A module-local label lives in exactly one function's label map.
+            let landing = module.functions.iter().enumerate().find_map(|(f, other)| {
+                other
+                    .labels
+                    .get(&target)
+                    .map(|&pc| (f as u32, pc as u32))
+            });
+            let Some((target_func, target_pc)) = landing else {
+                continue;
+            };
+            let to = compiled
+                .entry(target_func, target_pc)
+                .expect("the fixture's tail-call targets are all block starts")
+                as usize;
+            assert_linked_tail_call(&compiled, &module, func as u32, block.start as u32, to);
+            linked += 1;
+        }
+    }
+    assert!(
+        linked >= 2,
+        "slice.beam's fib/1 and fib/3 both end in a local tail call (found {linked})"
     );
 }

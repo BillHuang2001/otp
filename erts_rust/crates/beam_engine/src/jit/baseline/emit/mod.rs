@@ -44,6 +44,15 @@
 //! documented deopt: spill, materialise the `encode_target` word in `rax`, and jump
 //! to the block epilogue for the driver to decode.
 //!
+//! The **local tail calls** are linked the same way. `call_only` is a plain jump
+//! (`$DISPATCH_REL(Dest)`), so it lowers exactly like `jump`; `call_last` additionally
+//! pops the current frame *before* the transfer, which the tier does through the
+//! `jit_tail_call` helper — the interpreter's own `Machine::pop_frame_checked` — with
+//! the module-local target already resolved at compile time, i.e. in the interpreter's
+//! `resolve`-then-`pop`-then-transfer order ([`Linker::emit_tail_exit`]). A tail-call
+//! target that is not a compiled block's entry, and every `call_ext_*` (which enters
+//! code outside this module's blocks), keep the documented deopt.
+//!
 //! The emitter is split by responsibility across this directory: this file owns the
 //! compiled-block shape (the register-file constants, the allocation artifact,
 //! [`emit_block`], the deopt-and-continue sequence and [`compile_module`]);
@@ -596,6 +605,45 @@ fn emit_block(
                 }
                 // An undefined label keeps the interpreter's exact `unknown_label`
                 // error: hand the jump to the helper rather than inventing one.
+                Err(_) => emit_step_and_continue(buffer, done, allocation, func, pc)?,
+            },
+            // A **local tail call** (`call_last Arity Label Deallocate`) transfers
+            // control to another block — usually of another function — after popping
+            // the current frame. The label is module-local, so it is resolved here, at
+            // compile time; when the successor is a compiled block's entry the frame is
+            // popped by the interpreter's own checked pop (`jit_tail_call`, in the
+            // interpreter's resolve-then-pop order) and control jumps straight to the
+            // successor's native entry (see [`link`]). A label the module does not
+            // define, or a successor this compilation emitted no block for, keeps the
+            // documented deopt: the helper runs the interpreter's own `call_last` and so
+            // reports its exact `unknown_label`/frame error. Like `jump`, the
+            // instruction always transfers control, so the block ends here either way.
+            Instr::CallLast {
+                target, deallocate, ..
+            } => match labels.resolve(*target) {
+                Ok((target_func, target_pc)) if linker.is_compiled(target_func, target_pc) => {
+                    linker.emit_tail_exit(
+                        buffer,
+                        allocation,
+                        done,
+                        target_func,
+                        target_pc,
+                        *deallocate,
+                    )?;
+                    terminated = true;
+                    break;
+                }
+                _ => emit_step_and_continue(buffer, done, allocation, func, pc)?,
+            },
+            // A local tail call **without** a frame to pop (`call_only Arity Label`):
+            // `i_call_only(CallDest)` is `$DISPATCH_REL(Dest)`, so it lowers exactly
+            // like the `jump` arm above — resolve at compile time, then link or deopt.
+            Instr::CallOnly { target, .. } => match labels.resolve(*target) {
+                Ok((target_func, target_pc)) => {
+                    linker.emit_exit(buffer, allocation, done, target_func, target_pc)?;
+                    terminated = true;
+                    break;
+                }
                 Err(_) => emit_step_and_continue(buffer, done, allocation, func, pc)?,
             },
             // The word-level `test` subset (see the section below): a native

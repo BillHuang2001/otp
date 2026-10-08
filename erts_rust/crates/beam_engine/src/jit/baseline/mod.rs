@@ -91,6 +91,12 @@
 //!   slot);
 //! * `jump Label` whose target resolves in the module-wide label map — the
 //!   `(func, pc)` pair is known at compile time, so it is a constant return word;
+//! * the **local tail calls** `call_only Arity Label` (a plain jump:
+//!   `$DISPATCH_REL(Dest)`) and `call_last Arity Label Deallocate` (the same jump
+//!   after the current frame is popped by `jit_tail_call`, the interpreter's own
+//!   checked pop, in the interpreter's `resolve`-then-`pop` order) whose target is a
+//!   compiled block's entry — see `emit/link`. A target that is not a compiled
+//!   block's entry, and every `call_ext_*`, keep the per-instruction deopt below;
 //! * the **guarded small-int arithmetic fast path** for `gc_bif` of
 //!   `erlang:'+'/2` and `erlang:'-'/2`: the tagged-word arithmetic is emitted
 //!   natively behind a small-int guard + overflow + range check, and *any* case

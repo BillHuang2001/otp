@@ -1,10 +1,12 @@
 //! The baseline JIT's block ABI and its per-instruction helper.
 //!
 //! The `HALT`/`ERROR` sentinels and the `(func, pc)` control-word codec, the
-//! `#[repr(C)]` runtime block a compiled block receives, and [`jit_step_one`] —
-//! the helper a block calls for the first instruction it could not lower
-//! natively. See `super` for the block ABI as a whole, the emitter that produces
-//! blocks and the driver that decodes the words these items produce.
+//! `#[repr(C)]` runtime block a compiled block receives, and the two helpers a block
+//! calls: [`jit_step_one`] — the per-instruction deopt for the first instruction the
+//! block could not lower natively — and [`jit_tail_call`], the checked frame pop a
+//! **linked local tail call** uses (see [`super::emit::link`]). See `super` for the
+//! block ABI as a whole, the emitter that produces blocks and the driver that decodes
+//! the words these items produce.
 #![allow(unsafe_code)]
 
 use crate::interpreter::LabelMap;
@@ -98,6 +100,10 @@ pub(crate) type NativeBlock = for<'a> extern "C" fn(*mut JitRuntime<'a>) -> i64;
 /// instruction address).
 pub(crate) type StepHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32) -> i64;
 
+/// The `jit_tail_call` helper's native signature (the block ABI plus the resolved
+/// successor word and the frame size a local `call_last` pops).
+pub(crate) type TailHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, u32) -> i64;
+
 /// The byte offset of [`JitRuntime::machine`] — the field the helper scaffolding is
 /// handed; generated code reads [`JitRuntime::x_regs`] instead.
 pub(crate) const RUNTIME_MACHINE_DISP: i32 = 0;
@@ -159,6 +165,53 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
             ERROR
         }
         Ok(Step::Done) => HALT,
+        Err(err) => {
+            runtime.error = Some(err);
+            ERROR
+        }
+    }
+}
+
+/// The **local tail-call** helper: pop the current frame with the interpreter's
+/// exact `call_last` semantics and hand the already-resolved successor back to the
+/// block.
+///
+/// A linked tail call ([`super::emit::link`]) does not round-trip through the
+/// driver, so it cannot let the interpreter run the instruction. The one piece of
+/// `call_last` a block cannot do itself is the frame pop: the call-frame stack and
+/// the Erlang stack are Rust-side `Machine` state with no fixed layout a block could
+/// address. The label is *not* an issue — a module-local label is a constant, so the
+/// block resolves it at **compile** time and passes the resulting word in.
+///
+/// This is [`Machine::pop_frame_checked`](crate::Machine) — literally the call the
+/// interpreter's `Instr::CallLast` arm makes — so the frame discipline is identical
+/// by construction:
+///
+/// * the target is resolved *before* anything is popped (at compile time; a label the
+///   module does not define is not linked at all, so the block deopts to
+///   [`jit_step_one`] for the interpreter's exact `unknown_label`);
+/// * the pop is the interpreter's own **checked** pop, so a `Deallocate` operand that
+///   no longer matches the live frame (a `trim`ed frame, or a tail call reaching past
+///   the bottom frame) is the same typed error it produces, reported from the live
+///   frame.
+///
+/// On success the resolved `target` word is returned so the block can compare it with
+/// the constant it compiled in and jump straight to the successor's entry; on failure
+/// the error is stored in `rt.error` and [`ERROR`] is returned, exactly as
+/// [`jit_step_one`] reports a raise.
+pub(crate) extern "C" fn jit_tail_call(rt: *mut JitRuntime<'_>, target: i64, deallocate: u32) -> i64 {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; every pointer
+    // it holds points at an object the driver owns and keeps alive for the whole
+    // loop (`machine`, `module`), or at a local (`labels`) that outlives the loop.
+    let runtime = unsafe { &mut *rt };
+    // SAFETY: `runtime.machine` is a non-null pointer to the driver's live `Machine`;
+    // no other `&mut Machine` exists while the helper runs (the driver is blocked in
+    // the block call that reached us).
+    let machine = unsafe { &mut *runtime.machine };
+
+    match machine.pop_frame_checked(deallocate) {
+        Ok(()) => target,
         Err(err) => {
             runtime.error = Some(err);
             ERROR

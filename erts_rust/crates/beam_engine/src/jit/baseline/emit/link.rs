@@ -36,6 +36,45 @@
 //! for the word the driver eventually sees, exactly as if the driver had decoded
 //! the branch target and called the successor itself.
 //!
+//! # The local tail call (`call_last`)
+//!
+//! [`Linker::emit_tail_exit`] links a **local tail call** the same way, with the one
+//! extra piece `call_last` owns: the current frame must be popped *before* control is
+//! transferred (`i_call_last` is `$deallocate(D); $DISPATCH_REL(Dest)`,
+//! `emu/instrs.tab:163`). The call-frame stack is Rust-side [`Machine`] state a block
+//! cannot address, so the pop goes through [`jit_tail_call`] — literally
+//! `Machine::pop_frame_checked`, the call the interpreter's own `Instr::CallLast` arm
+//! makes — while the target is a compile-time constant (a module-local label) and is
+//! therefore resolved **before** anything is popped, exactly like the interpreter's
+//! `resolve`-then-`pop` order:
+//!
+//! ```text
+//!   spill                        ; the root-set contract (see above)
+//!   mov rdi, [rsp+RUNTIME_SLOT_DISP]  ; `rt`, the helper's first argument
+//!   mov rsi, <resolved successor word>
+//!   mov rdx, <deallocate>
+//!   call <jit_tail_call>         ; the interpreter's checked frame pop; returns the
+//!                                ; successor word, or `ERROR` (rt.error set)
+//!   cmp rax, <resolved successor word>
+//!   jne <done>                   ; a failed pop: back to the driver with `ERROR`
+//!   mov rdi, [rsp+RUNTIME_SLOT_DISP]  ; …and `rt` again for the successor's prologue
+//!   lea rsp, [rsp+24] ; pop rbx … pop r15   ; leave the frame
+//!   jmp <successor entry>        ; the successor's prologue rebuilds its own frame
+//! ```
+//!
+//! A failed pop (a `Deallocate` operand that does not match the live frame — a
+//! `trim`ed frame, or a tail call reaching past the bottom frame) takes the `jne` to
+//! the shared epilogue, whose `ERROR` word makes the driver propagate the exact typed
+//! error the interpreter produces. A successor that is **not** this compilation's
+//! block (an undefined label, a block that is empty, an address inside a block) is not
+//! linked at all: the caller keeps the documented deopt, so the interpreter's own
+//! `call_last` — and therefore its exact `unknown_label`/frame error — surfaces.
+//!
+//! `call_only` (a local tail call with **no** frame to pop) needs no helper: it is
+//! `$DISPATCH_REL(Dest)`, i.e. [`Linker::emit_exit`] exactly as `jump` uses it.
+//! `call_ext_last` is *not* linked: it enters code outside this module's compiled
+//! blocks, so it keeps its own deopt.
+//!
 //! # What is *not* linked
 //!
 //! `(func, pc)` is linked only when it is the start of a block this compilation
@@ -60,9 +99,9 @@ use std::collections::BTreeMap;
 
 use beam_common::Result;
 
-use crate::jit::emitter::{CodeBuffer, Label as CodeLabel, Reg};
+use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 
-use super::super::runtime::encode_target;
+use super::super::runtime::{encode_target, jit_tail_call, TailHelper};
 use super::{spill, Allocation, RUNTIME_SLOT_DISP, SAVED_REGISTERS};
 
 /// The compiled blocks a branch may jump to directly, keyed by `(func, block
@@ -83,6 +122,15 @@ impl<'a> Linker<'a> {
         Linker { entries }
     }
 
+    /// Is `(func, pc)` the entry of a block this compilation emitted?
+    ///
+    /// The one question a *tail* call has to ask before it may be linked: unlike a
+    /// `jump`/`fail` target, a tail call can be emitted by a block that would
+    /// otherwise continue, so the lowering has to choose between the linked exit and
+    /// the documented deopt **before** it emits anything.
+    pub(super) fn is_compiled(&self, func: u32, pc: u32) -> bool {
+        self.entries.contains_key(&(func, pc))
+    }
     /// Emit the block exit that transfers control to `(func, pc)`.
     ///
     /// A **linked** successor (`(func, pc)` is a compiled block's entry) is reached
@@ -120,6 +168,63 @@ impl<'a> Linker<'a> {
                 buffer.jmp(done)
             }
         }
+    }
+
+    /// Emit the exit of a **linkable local tail call** (`call_last`): pop the current
+    /// frame with the interpreter's exact semantics, then jump straight to the
+    /// successor block's entry.
+    ///
+    /// `(func, pc)` must be a compiled block's entry — the caller checks with
+    /// [`Linker::is_compiled`]; a typed error is returned otherwise rather than a
+    /// panic, because a block that named a target it has no landing address for could
+    /// only produce a wrong result.
+    ///
+    /// This is [`Linker::emit_exit`]'s linked path with the frame pop inserted in front
+    /// of the transfer, in the interpreter's own order (`resolve` then
+    /// `pop_frame_checked` then transfer — the resolution being a compile-time constant
+    /// here): the pop happens **while this block's frame is still live**, so a
+    /// frame-size mismatch raises exactly as it does on the interpreter path, and the
+    /// spill (the tier's root-set contract, see [`super::spill`]) happens before the
+    /// successor's prologue reloads `machine.x`.
+    pub(super) fn emit_tail_exit(
+        &self,
+        buffer: &mut CodeBuffer,
+        allocation: &Allocation,
+        done: CodeLabel,
+        func: u32,
+        pc: u32,
+        deallocate: u32,
+    ) -> Result<()> {
+        let &target = self.entries.get(&(func, pc)).ok_or_else(|| {
+            crate::error::unsupported("jit: tail-call target has no compiled block")
+        })?;
+        let word = encode_target(func, pc);
+
+        // The root set first: the successor's prologue loads `machine.x`, and a failed
+        // pop returns to a driver that owns the same root set. `jit_tail_call` reads no
+        // x-register, so the spill order relative to the call is free — this one keeps
+        // the exit shaped like every other exit in the tier.
+        spill(buffer, allocation)?;
+        // `rt` (the helper's first argument), the already-resolved successor and the
+        // frame size the pop must match.
+        buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+        buffer.mov_ri(Reg::Rsi, word)?;
+        buffer.mov_ri(Reg::Rdx, i64::from(deallocate))?;
+        let helper: TailHelper = jit_tail_call;
+        buffer.mov_ri(Reg::R11, helper as *const () as i64)?;
+        buffer.call_r(Reg::R11)?;
+        // `rax` is the successor word on success and `ERROR` (with `rt.error` set)
+        // otherwise; the compiled-in word is the constant to compare against, so any
+        // other outcome goes to the epilogue and the driver reports it.
+        buffer.mov_ri(Reg::R11, word)?;
+        buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+        buffer.jcc(Cond::Ne, done)?;
+        // The frame is popped. Leave this block's native frame and jump into the
+        // successor, which is entered by a `jmp` and so gets no `call` to set the `rdi`
+        // its prologue stores as its `rt` (see the module docs).
+        buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)?;
+        emit_frame_teardown(buffer)?;
+        buffer.jmp(target)
     }
 }
 
@@ -414,5 +519,102 @@ mod tests {
             // And the exit is exactly the spill, the middle, the teardown and the jump.
             assert_eq!(exit.len(), rest + 5, "{what} exit length");
         }
+    }
+
+    #[test]
+    fn a_tail_exit_spills_pops_the_frame_and_then_jumps_to_the_successor() {
+        // The tail exit is the linked exit with the interpreter's *checked frame pop*
+        // in front of the transfer: the spill (the root set) first, then the helper's
+        // arguments — the already-resolved successor and the frame size — then the
+        // compare against the constant, the frame teardown and the direct jump.
+        let mut buffer = CodeBuffer::new().unwrap();
+        let target = buffer.label();
+        let done = buffer.label();
+        let mut entries = BTreeMap::new();
+        entries.insert((0u32, 7u32), target);
+        let linker = Linker::new(&entries);
+        assert!(linker.is_compiled(0, 7) && !linker.is_compiled(0, 8));
+        let allocation = Allocation {
+            slots: vec![(0u32, Reg::R12)],
+        };
+
+        linker
+            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3)
+            .unwrap();
+        let exit_len = buffer.len();
+        // A filler byte between the exit and the successor's entry, so the jump's
+        // displacement is non-trivial.
+        buffer.ret().unwrap();
+        let target_at = buffer.len();
+        buffer.bind(target).unwrap();
+        buffer.bind(done).unwrap();
+        buffer.seal().unwrap();
+
+        let exit = &emitted(&buffer)[..exit_len];
+        // The spill comes first, byte for byte: the pop helper must not run before the
+        // cached x-registers are back in `machine.x`.
+        let spill = spill_bytes(&allocation);
+        assert_eq!(&exit[..spill.len()], &spill[..], "the spill comes first");
+
+        // The helper's two value arguments, in the order the block passes them: the
+        // resolved successor word, then the frame size the pop must match.
+        let word = encoded(|buffer| buffer.mov_ri(Reg::Rsi, encode_target(0, 7)).unwrap());
+        let deallocate = encoded(|buffer| buffer.mov_ri(Reg::Rdx, 3).unwrap());
+        let word_at = exit
+            .windows(word.len())
+            .position(|window| window == word.as_slice())
+            .expect("the resolved successor is passed to the pop helper");
+        let deallocate_at = exit
+            .windows(deallocate.len())
+            .position(|window| window == deallocate.as_slice())
+            .expect("the frame size is passed to the pop helper");
+        assert!(word_at < deallocate_at, "successor word, then frame size");
+
+        // The transfer comes *after* the pop: the frame teardown (and the jump) follow
+        // the helper's arguments.
+        let teardown = teardown_bytes();
+        let teardown_at = exit
+            .windows(teardown.len())
+            .position(|window| window == teardown.as_slice())
+            .expect("the tail exit must tear its frame down");
+        assert!(
+            deallocate_at < teardown_at,
+            "the frame is popped before the frame is left"
+        );
+
+        // … and the jump lands exactly on the successor's compiled entry.
+        let (site, rel) = trailing_jump(exit);
+        assert_eq!(
+            (site + 5) as i64 + i64::from(rel),
+            target_at as i64,
+            "the direct jump must land on the successor's entry"
+        );
+
+        // A tail exit never fabricates a return word in `rax`: `rax` carries the pop
+        // helper's answer (the successor word, or `ERROR`), which is what the compare
+        // against the compiled-in constant reads.
+        assert!(
+            !exit.windows(2).any(|w| w == [0x48, 0xB8]),
+            "the tail exit must not materialise a word in rax"
+        );
+    }
+
+    #[test]
+    fn a_tail_exit_without_a_compiled_successor_is_a_typed_error() {
+        // The caller resolves the target and checks `is_compiled` first; a link that
+        // named a target with no landing address could only produce a wrong result, so
+        // it must be a typed error rather than a panic.
+        let mut buffer = CodeBuffer::new().unwrap();
+        let done = buffer.label();
+        let entries = BTreeMap::new();
+        let linker = Linker::new(&entries);
+        let allocation = Allocation::default();
+        let err = linker
+            .emit_tail_exit(&mut buffer, &allocation, done, 0, 7, 3)
+            .expect_err("an unlinkable tail target is the documented typed error");
+        assert!(
+            format!("{err:?}").contains("no compiled block"),
+            "the error must name the missing block, got {err:?}"
+        );
     }
 }
