@@ -85,6 +85,51 @@ pub(crate) fn halt_status(error: &BeamError) -> Option<i32> {
     reason.strip_prefix(HALT_PREFIX)?.strip_prefix(':')?.parse().ok()
 }
 
+/// The prefix of the reason atom an **abort** raises (`beam_rt_abort`).
+///
+/// `erlang:halt(abort)` and `erlang:halt(abort, Options)` terminate the runtime with
+/// `SIGABRT` in the oracle (`erts_exit(ERTS_ABORT_EXIT, "")` -> `abort()`,
+/// `erts/emulator/beam/erl_init.c:2774-2775`), which a shell observes as exit code `134`.
+/// Like [`halt`] the abort travels out of the executing code as an `exit`-class raise; the
+/// CLI recognises it with [`is_abort`] and calls [`std::process::abort`], so the host really
+/// receives the signal instead of a plain status.
+pub(crate) const ABORT_PREFIX: &str = "beam_rt_abort";
+
+/// The `erlang:halt(abort)` raise: class `exit`, reason atom `beam_rt_abort`.
+pub(crate) fn abort() -> BeamError {
+    BeamError::Raise(Raise::exit(ExitReason::atom(ABORT_PREFIX)))
+}
+
+/// Whether `error` is a runtime **abort** raise (the classifier of [`ABORT_PREFIX`]).
+pub(crate) fn is_abort(error: &BeamError) -> bool {
+    raise_reason(error) == Some(ABORT_PREFIX)
+}
+
+/// The prefix of the reason atom a **crash-dump slogan** halt raises
+/// (`beam_rt_dump:<slogan>`).
+///
+/// `erlang:halt("Slogan")` (a string or `[]`) terminates with `ERTS_DUMP_EXIT`
+/// (`erts/emulator/beam/bif.c:4393`): the slogan is printed on stderr, a crash dump is
+/// written and the process exits `1`. The slogan may be arbitrary and multi-line, but the
+/// raise reason is a single atom, so the caller strips CR/LF before constructing it (see
+/// [`crate::native`]).
+pub(crate) const DUMP_PREFIX: &str = "beam_rt_dump";
+
+/// The `erlang:halt("Slogan")` raise: class `exit`, reason atom `beam_rt_dump:<slogan>`.
+pub(crate) fn dump(slogan: &str) -> BeamError {
+    BeamError::Raise(Raise::exit(ExitReason::atom(format!(
+        "{DUMP_PREFIX}:{slogan}"
+    ))))
+}
+
+/// The dump slogan carried by a dump-slogan raise, if `error` is one (the classifier of
+/// [`DUMP_PREFIX`]). `Some("")` for `halt([])`.
+pub(crate) fn dump_slogan(error: &BeamError) -> Option<&str> {
+    raise_reason(error)?
+        .strip_prefix(DUMP_PREFIX)?
+        .strip_prefix(':')
+}
+
 /// A message-carrying `error`-class raise — the runtime's general diagnostic.
 pub(crate) fn message(text: impl Into<String>) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(text.into())))
