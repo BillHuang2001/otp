@@ -128,11 +128,29 @@
 //!
 //! The verbs that stay **unregistered** are the honest typed gaps documented in
 //! [`adopt`] and [`extra`], each with the exact `beam_ets` API that would close it:
-//! `ets:rename/2` (needs a name setter) and `ets:select_reverse/1,2,3` (needs a
-//! reverse scan), `ets:slot/2`, the `ets:first_lookup/1`/`last_lookup/1`/
-//! `next_lookup/2`/`prev_lookup/2` interior family, `ets:match_spec_run_r/3`, the
-//! underscore-internal C helpers, and the `ets:setopts/2` `{protection, _}`
-//! sub-option.
+//! `ets:rename/2` (needs a name setter), `ets:slot/2`,
+//! `ets:match_spec_run_r/3`, the underscore-internal C helpers, and the
+//! `ets:setopts/2` `{protection, _}` sub-option.
+//!
+//! # The `*_lookup` family (see [`nav`] for the BIFs)
+//!
+//! `ets:first_lookup/1`, `ets:last_lookup/1`, `ets:next_lookup/2` and
+//! `ets:prev_lookup/2` — a navigation step paired with the objects of the key it
+//! landed on — live in the child module [`nav`]. For a **hash** kind
+//! (`set`/`bag`/`duplicate_bag`) the oracle aliases `last_lookup` to `first` and
+//! `prev_lookup` to `next` (a hash interior has no backward walk), while an
+//! `ordered_set` walks its real order in both directions.
+//!
+//! # The reverse select family (see [`reverse`] for the BIFs)
+//!
+//! `ets:select_reverse/1,2,3` lives in the child module [`reverse`]: for an
+//! `ordered_set` results come in **descending** key order, for the hash kinds the
+//! oracle ignores the reverse flag and the order is `select`'s (unspecified). Its
+//! continuations are private to that module, because a
+//! [`beam_ets::MatchContinuation`] cannot express a backward position; they carry
+//! a ref id from a distinct namespace, and `ets:select/1` and
+//! `ets:select_reverse/1` share one dispatcher so resuming follows the *stored*
+//! direction, as the oracle does.
 
 use std::collections::HashMap;
 
@@ -178,6 +196,22 @@ mod extra;
 /// [`resolve`], so they are a child of `ets` (declared here, not in `src/lib.rs`).
 /// Every gap is documented there with the exact `beam_ets` API it needs.
 mod adopt;
+/// The key/navigation `*_lookup` family (`ets:first_lookup/1`, `last_lookup/1`,
+/// `next_lookup/2`, `prev_lookup/2`).
+///
+/// They pair a navigation step with the objects of the key it landed on, so they
+/// share this module's handle contract, its helpers (`take_table_gated`/
+/// `restore_table`/`copy_out`/`copy_out_list`/`key_or_end`) and the shared
+/// resolver [`resolve`] — a child of `ets` (declared here, not in `src/lib.rs`).
+mod nav;
+/// The reverse select family (`ets:select_reverse/1,2,3`).
+///
+/// It shares this module's handle contract, its helpers
+/// (`take_table_gated`/`restore_table`/`copy_out_list`) and the shared resolver
+/// [`resolve`]; its continuation registry is private to the child module, because
+/// a `beam_ets::MatchContinuation` cannot express a backward position — a child
+/// of `ets` (declared here, not in `src/lib.rs`).
+mod reverse;
 /// The shared table-argument resolver, the process/owner bridge, the
 /// creation-time [`resolve::TableProfile`] and the `ets:new/2` option parser.
 ///
@@ -189,7 +223,7 @@ mod resolve;
 /// The navigation terminator (`ets:first/1` … `ets:prev/2` at the end of the
 /// iteration order). The atom's *name* is `$end_of_table` (the printname of
 /// `atom.names`' `EOT='$end_of_table'`).
-const END_OF_TABLE: &str = "$end_of_table";
+pub(super) const END_OF_TABLE: &str = "$end_of_table";
 
 /// The `ets:info/1` field names, in the oracle's order (the reverse of the C
 /// `fields[]` array in `erl_db.c`, reproduced by [`TableInfo::entries`]).
@@ -545,6 +579,10 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     // ownership verbs (`setopts/2`, `give_away/3`) and the two fun-folds
     // (`foldl/3`, `foldr/3`).
     adopt::register(reg);
+    // The key/navigation `*_lookup` family (child module `nav`).
+    nav::register(reg);
+    // The reverse select family (child module `reverse`).
+    reverse::register(reg);
 }
 
 // --------------------------------------------------------------- creation
@@ -813,19 +851,46 @@ fn lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:lookup_element(Tab, Key, Pos)` — element `Pos` (1-based) of the object
 /// stored under `Key`.
+///
+/// The answer's *shape* depends on the table kind (verified against the system
+/// `erl`, OTP 29 / erts-17.1): `set`/`ordered_set` store at most one object per
+/// key, so the element is a **scalar**; `bag`/`duplicate_bag` hold several
+/// objects under one key and the oracle answers a **list** of their `Pos`-th
+/// elements (`ets:lookup_element(Bag, 1, 2)` ⇒ `[a, b]`), which is exactly what
+/// [`Table::lookup_element_all`] returns. The multi kinds therefore route through
+/// the list-returning primitive instead of the scalar one (which raises the typed
+/// `unsupported` for a *present* key on a multi kind — a scalar answer would be a
+/// wrong result).
+///
+/// The oracle's `badarg`s are preserved by both routes: `Pos == 0`, an absent
+/// `Key`, and a *present* key whose object is shorter than `Pos` (for a multi kind
+/// one short object makes the **whole** call `badarg`).
 fn lookup_element_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let pos = element_pos(args[2])?;
 
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let outcome = table.lookup_element(key, pos, ctx.atoms());
-    restore_table(ctx, handle, table)?;
-    copy_out(outcome?, ctx)
+    if table.kind().is_multi() {
+        let outcome = table.lookup_element_all(key, pos, ctx.atoms());
+        restore_table(ctx, handle, table)?;
+        copy_out_list(outcome?, ctx)
+    } else {
+        let outcome = table.lookup_element(key, pos, ctx.atoms());
+        restore_table(ctx, handle, table)?;
+        copy_out(outcome?, ctx)
+    }
 }
 
 /// `ets:lookup_element(Tab, Key, Pos, Default)` — as
 /// [`lookup_element_3`](lookup_element_3), but an absent `Key` yields `Default`.
+///
+/// Independent of the kind, `Pos == 0` is `badarg` **before** the key is looked
+/// at and an absent key yields `Default` whatever `Pos` is (even `Pos` beyond the
+/// object's arity). A *present* key keeps
+/// [`lookup_element_3`](lookup_element_3)'s failures and its kind-dependent shape:
+/// the scalar `set`/`ordered_set` answer, or the `bag`/`duplicate_bag` element
+/// **list**.
 fn lookup_element_4(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
@@ -833,15 +898,26 @@ fn lookup_element_4(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let default = args[3];
 
     let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let outcome = table.lookup_element_or(key, pos, default, ctx.atoms());
-    restore_table(ctx, handle, table)?;
-    let value = outcome?;
-    if value == default {
-        // An absent key returns `default` verbatim (the caller's own term), so
-        // there is nothing to copy out of table storage.
-        Ok(default)
+    if table.kind().is_multi() {
+        let outcome = table.lookup_element_all_or(key, pos, default, ctx.atoms());
+        restore_table(ctx, handle, table)?;
+        match outcome? {
+            // An absent key returns `default` verbatim (the caller's own term), so
+            // there is nothing to copy out of table storage.
+            None => Ok(default),
+            Some(elements) => copy_out_list(elements, ctx),
+        }
     } else {
-        copy_out(value, ctx)
+        let outcome = table.lookup_element_or(key, pos, default, ctx.atoms());
+        restore_table(ctx, handle, table)?;
+        let value = outcome?;
+        if value == default {
+            // An absent key returns `default` verbatim (the caller's own term), so
+            // there is nothing to copy out of table storage.
+            Ok(default)
+        } else {
+            copy_out(value, ctx)
+        }
     }
 }
 
@@ -1066,12 +1142,34 @@ fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     finish_chunk(ctx, handle, results, cont)
 }
 
-/// `ets:select(Continuation)` — resumes an [`select_3`] traversal.
+/// `ets:select(Continuation)` — resumes a [`select_3`] (or `select_reverse/3`)
+/// traversal.
 ///
-/// The argument is a continuation ref thing returned by an earlier `select/3`
-/// (or `select/1`); an unknown one is `badarg`.
+/// The argument is a continuation ref thing returned by an earlier traversal (or
+/// a resume); an unknown one is `badarg`.
+///
+/// The oracle treats `ets:select/1` and `ets:select_reverse/1` as **one** BIF that
+/// follows the direction *stored in the continuation* (verified: resuming a
+/// reverse continuation with `ets:select/1` walks backward, and resuming a forward
+/// continuation with `ets:select_reverse/1` walks forward). Both entry points
+/// therefore dispatch through [`dispatch_continuation`].
 fn select_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    resume_continuation(ctx, args[0], Table::select_continue)
+    dispatch_continuation(ctx, args[0])
+}
+
+/// The shared `ets:select/1` / `ets:select_reverse/1` dispatcher: a continuation
+/// minted by `select_reverse/3` resumes on the reverse path
+/// ([`reverse::try_resume`]), every other (a forward `select/3` continuation)
+/// through [`resume_continuation`]. An argument that is no continuation at all is
+/// `badarg`, exactly as before.
+pub(super) fn dispatch_continuation(
+    ctx: &mut BifContext<'_>,
+    cont_term: Eterm,
+) -> Result<Eterm> {
+    if let Some(result) = reverse::try_resume(ctx, cont_term)? {
+        return Ok(result);
+    }
+    resume_continuation(ctx, cont_term, Table::select_continue)
 }
 
 /// Resumes the continuation named by `cont_term` with `resume` and renders the
@@ -1198,7 +1296,7 @@ pub(super) fn restore_table(ctx: &mut BifContext<'_>, handle: u64, table: Table)
 }
 
 /// Copies `term` — which may alias table-owned storage — onto the caller's heap.
-fn copy_out(term: Eterm, ctx: &mut BifContext<'_>) -> Result<Eterm> {
+pub(super) fn copy_out(term: Eterm, ctx: &mut BifContext<'_>) -> Result<Eterm> {
     beam_message::copy_struct_simple(term, ctx.heap())
 }
 
@@ -1214,7 +1312,7 @@ pub(super) fn copy_out_list(objects: Vec<Eterm>, ctx: &mut BifContext<'_>) -> Re
 
 /// The `ets:first/1`/`last/1`/`next/2`/`prev/2` result: the key, or the
 /// `'$end_of_table'` atom when the navigation is exhausted.
-fn key_or_end(ctx: &mut BifContext<'_>, key: Option<Eterm>) -> Result<Eterm> {
+pub(super) fn key_or_end(ctx: &mut BifContext<'_>, key: Option<Eterm>) -> Result<Eterm> {
     match key {
         Some(key) => copy_out(key, ctx),
         None => ctx.intern_atom(END_OF_TABLE),
@@ -1271,13 +1369,13 @@ fn info_field(
         // than returned as a small int.
         "id" => make_ref_thing(ctx.heap(), info.id.raw()),
         // The effective `write_concurrency`/`decentralized_counters` values are the
-        // ones `ets:new/2` computed (they are not recoverable from `TableInfo`);
-        // only a directly-inserted table falls back to the `TableInfo`-derived
-        // values. The `TableInfo` fallback for decentralized counters is the CATREE
-        // rule: an `ordered_set` whose normalized `write_concurrency` flag is on.
+        // ones `ets:new/2` computed (they are not fully recoverable from
+        // `TableInfo`: `{write_concurrency, auto}` sets the counters flag even for
+        // a `set`, which `TableInfo` does not record); only a directly-inserted
+        // table falls back to the value `beam_ets` resolved on the snapshot.
         "decentralized_counters" => match profile {
             Some(profile) => ctx.boolean(profile.decentralized_counters),
-            None => ctx.boolean(info.kind.is_ordered() && info.write_concurrency),
+            None => ctx.boolean(info.decentralized_counters),
         },
         "read_concurrency" => ctx.boolean(info.read_concurrency),
         "write_concurrency" => match profile {
@@ -1329,6 +1427,39 @@ fn write_concurrency_term(
             let tag = ctx.intern_atom("debug_hash_fixed_number_of_locks")?;
             let count = ctx.int(n as i64)?;
             ctx.tuple(&[tag, count])
+        }
+    }
+}
+
+/// Runs one `-eval` statement under the system `erl` and returns its stdout with
+/// the trailing newlines trimmed — the oracle cross-check the child modules'
+/// tests share (`nav`/`reverse` call `super::super::oracle`).
+///
+/// `None` means "no oracle here" (no `erl` on `PATH`, or the oracle itself
+/// failed); the calling test then **skips loudly** (the `tests/match_spec.rs`
+/// pattern), so the golden it pins is never silently unchecked.
+#[cfg(test)]
+pub(super) fn oracle(statement: &str) -> Option<String> {
+    let output = std::process::Command::new("erl")
+        .args(["-noshell", "-eval", statement, "-s", "init", "stop"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => Some(
+            String::from_utf8_lossy(&out.stdout)
+                .trim_end_matches(['\n', '\r'])
+                .to_string(),
+        ),
+        Ok(out) => {
+            eprintln!(
+                "SKIP: the oracle `erl` failed ({}); stderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!("SKIP: no `erl` oracle on PATH ({err})");
+            None
         }
     }
 }
@@ -1957,7 +2088,286 @@ mod tests {
         assert!(is_true(&atoms, dc), "decentralized_counters");
     }
 
-    /// The bare `set`/`protected` atoms are **no-ops**: they never override an
+    /// `ets:lookup_element/3,4` over the four kinds, pinned against the live oracle
+    /// (`erts-17.1`).
+    ///
+    /// The matrix (objects `{a,b}` then `{a,c}` inserted): `set`/`ordered_set` keep
+    /// only the last object, so element 2 is the **scalar** `c`; `bag`/
+    /// `duplicate_bag` hold both, so element 2 is the **list** `[b,c]`. An absent
+    /// key with a default returns that default **verbatim** for every kind, and
+    /// `Pos == 0`, an absent key without a default and a present object shorter
+    /// than `Pos` are `badarg` everywhere (measured: the same `{error,badarg}` for
+    /// all four kinds).
+    #[test]
+    fn lookup_element_matrix_matches_the_live_oracle() {
+        let script = concat!(
+            "S = ets:new(s,[set]), B = ets:new(b,[bag]), ",
+            "D = ets:new(d,[duplicate_bag]), O = ets:new(o,[ordered_set]), ",
+            "[ets:insert(T,{a,X}) || T <- [S,B,D,O], X <- [b,c]], ",
+            "io:format(\"~p~n~p~n\", ",
+            "[[ets:lookup_element(T,a,2) || T <- [S,B,D,O]], ",
+            "[[ets:lookup_element(T,z,2,def2), ets:lookup_element(T,z,9,def9)] ",
+            "|| T <- [S,B,D,O]]])"
+        );
+        let golden = concat!(
+            "[c,[b,c],[b,c],c]\n",
+            "[[def2,def9],[def2,def9],[def2,def9],[def2,def9]]"
+        );
+        if let Some(actual) = oracle(script) {
+            assert_eq!(actual, golden, "the system `erl` no longer matches the goldens");
+        }
+
+        for (kind, multi) in [
+            ("set", false),
+            ("ordered_set", false),
+            ("bag", true),
+            ("duplicate_bag", true),
+        ] {
+            let (mut heap, atoms, mut reg) = parts();
+            let mut ctx =
+                BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            let name = ctx.atom("mytab").expect("seeded");
+            let kind_atom = ctx.atom(kind).expect("seeded");
+            let opts = ctx.list(&[kind_atom]).expect("fits");
+            let handle = new_2(&mut ctx, &[name, opts]).expect("ets:new");
+
+            let a = ctx.atom("a").expect("seeded");
+            let b = ctx.atom("b").expect("seeded");
+            let c = ctx.atom("c").expect("seeded");
+            let obj_b = ctx.tuple(&[a, b]).expect("fits");
+            let obj_c = ctx.tuple(&[a, c]).expect("fits");
+            insert_2(&mut ctx, &[handle, obj_b]).expect("insert");
+            insert_2(&mut ctx, &[handle, obj_c]).expect("insert");
+
+            let two = ctx.int(2).expect("fits");
+            let got = lookup_element_3(&mut ctx, &[handle, a, two]).expect("lookup_element/3");
+            if multi {
+                let elems = proper_list(got).expect("a multi kind answers a list");
+                assert_eq!(elems.len(), 2, "{kind}: both objects");
+                assert!(elems.contains(&b) && elems.contains(&c), "{kind}: {{b, c}}");
+            } else {
+                assert!(is_atom(got), "{kind}: a single object answers a scalar");
+                assert_eq!(got, c, "{kind}: the last object wins");
+            }
+
+            // `Pos == 0`, an absent key without a default, and a present object
+            // shorter than `Pos` are all `badarg` — for every kind.
+            let zero = ctx.int(0).expect("fits");
+            assert!(matches!(
+                lookup_element_3(&mut ctx, &[handle, a, zero]),
+                Err(BeamError::BadArg)
+            ));
+            let z = ctx.atom("z").expect("seeded");
+            assert!(matches!(
+                lookup_element_3(&mut ctx, &[handle, z, two]),
+                Err(BeamError::BadArg)
+            ));
+            let four = ctx.int(4).expect("fits");
+            assert!(matches!(
+                lookup_element_3(&mut ctx, &[handle, a, four]),
+                Err(BeamError::BadArg)
+            ));
+
+            // `/4`: an absent key returns the caller's default **verbatim**, at any
+            // position — including one past the object's arity.
+            let def = ctx.tuple(&[a, obj_b]).expect("fits");
+            for pos in [two, ctx.int(9).expect("fits")] {
+                let absent =
+                    lookup_element_4(&mut ctx, &[handle, z, pos, def]).expect("lookup_element/4");
+                assert!(beam_term::compare::eq(absent, def, &atoms), "{kind}: the default");
+            }
+            // …while `Pos == 0` is `badarg` even with a default, and a *present*
+            // short object keeps `lookup_element/3`'s failure.
+            assert!(matches!(
+                lookup_element_4(&mut ctx, &[handle, z, zero, def]),
+                Err(BeamError::BadArg)
+            ));
+            assert!(matches!(
+                lookup_element_4(&mut ctx, &[handle, a, four, def]),
+                Err(BeamError::BadArg)
+            ));
+        }
+
+        // Mixed arities under one key: a `bag` holding `{a,b}` and `{a,c,d}` is
+        // `badarg` at `Pos == 3` (one object is shorter), while a `set` — which
+        // keeps only `{a,c,d}` — answers `d` (measured: `[d,{error,badarg}]`).
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let a = ctx.atom("a").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let c = ctx.atom("c").expect("seeded");
+        let three = ctx.int(3).expect("fits");
+        for (kind, expected) in [("set", Some(c)), ("bag", None)] {
+            let name = ctx.atom("mytab").expect("seeded");
+            let kind_atom = ctx.atom(kind).expect("seeded");
+            let opts = ctx.list(&[kind_atom]).expect("fits");
+            let handle = new_2(&mut ctx, &[name, opts]).expect("ets:new");
+            let short = ctx.tuple(&[a, b]).expect("fits");
+            let long = ctx.tuple(&[a, b, c]).expect("fits");
+            insert_2(&mut ctx, &[handle, short]).expect("insert");
+            insert_2(&mut ctx, &[handle, long]).expect("insert");
+            match expected {
+                Some(value) => {
+                    let got = lookup_element_3(&mut ctx, &[handle, a, three]).expect("pos 3");
+                    assert_eq!(got, value, "{kind}: element 3 of the surviving object");
+                }
+                None => assert!(
+                    matches!(
+                        lookup_element_3(&mut ctx, &[handle, a, three]),
+                        Err(BeamError::BadArg)
+                    ),
+                    "{kind}: one short object makes the whole call badarg"
+                ),
+            }
+            delete_1(&mut ctx, &[handle]).expect("delete");
+        }
+    }
+
+    /// `ets:info(T, decentralized_counters)` — the field is the value `beam_ets`
+    /// resolved at creation (`TableOptions::decentralized_counters`), not a
+    /// re-derivation from `type`/`write_concurrency`: `{write_concurrency, auto}`
+    /// on a `set` reports `true` while `type` is `set` (the oracle's rule).
+    ///
+    /// Each case is re-probed against the live oracle, so the golden cannot rot.
+    #[test]
+    fn decentralized_counters_matches_the_live_oracle() {
+        // (option list source, expected value) — measured on OTP 29.1.1 / erts-17.1.
+        let cases: [(&str, bool); 9] = [
+            ("[set]", false),
+            ("[set,{write_concurrency,true}]", false),
+            ("[ordered_set,{write_concurrency,true}]", true),
+            ("[set,{write_concurrency,auto}]", true),
+            ("[ordered_set]", false),
+            ("[set,{decentralized_counters,true},{write_concurrency,true}]", true),
+            ("[set,{write_concurrency,false}]", false),
+            ("[private,set,{write_concurrency,true}]", false),
+            ("[ordered_set,{decentralized_counters,false},{write_concurrency,true}]", false),
+        ];
+        for (options, expected) in cases {
+            let script = format!(
+                "T = ets:new(t, {options}), \
+                 io:format(\"~p~n\",[ets:info(T, decentralized_counters)])"
+            );
+            if let Some(actual) = oracle(&script) {
+                assert_eq!(
+                    actual,
+                    if expected { "true" } else { "false" },
+                    "the oracle disagrees for {options}"
+                );
+            }
+        }
+
+        // The same nine option lists through this crate's `ets:new/2` + `ets:info/2`.
+        for (options, expected) in cases {
+            let (mut heap, atoms, mut reg) = parts();
+            let mut ctx =
+                BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            let name = ctx.atom("mytab").expect("seeded");
+            let opts = option_list(&mut ctx, options);
+            let handle = new_2(&mut ctx, &[name, opts]).expect("ets:new");
+            let item = ctx.atom("decentralized_counters").expect("seeded");
+            let dc = info_2(&mut ctx, &[handle, item]).expect("info/2");
+            if expected {
+                assert!(is_true(&atoms, dc), "{options}: expected true");
+            } else {
+                assert!(is_false(&atoms, dc), "{options}: expected false");
+            }
+        }
+
+        // A table inserted **without** a creation-time profile falls back to the
+        // value `beam_ets` resolved on the snapshot (`type`/`write_concurrency`
+        // cannot express `auto`, which is why `new/2` records the profile).
+        let mut reg = TableRegistry::new();
+        let mut opts = TableOptions::new();
+        opts.set_kind(beam_ets::TableKind::OrderedSet)
+            .set_write_concurrency(true);
+        let mut table = Table::new(TableId::new(99), opts).expect("test table");
+        table.set_owner(None);
+        reg.insert(99, table);
+        let (mut heap, atoms) = (Heap::new(4096).expect("test heap"), seeded_atoms());
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = make_ref_thing(ctx.heap(), 99).expect("handle");
+        let item = ctx.atom("decentralized_counters").expect("seeded");
+        let dc = info_2(&mut ctx, &[handle, item]).expect("info/2 of a profile-less table");
+        assert!(
+            is_true(&atoms, dc),
+            "a fine-locked ordered_set snapshot reports the resolved field"
+        );
+    }
+
+    /// Builds the [`Eterm`] option list for a small source list such as
+    /// `[private,set,{write_concurrency,true}]` (the `ets:new/2` shapes the
+    /// `decentralized_counters` matrix pins; commas inside `{...}` do not split).
+    fn option_list(ctx: &mut BifContext<'_>, source: &str) -> Eterm {
+        let inner = source.trim_start_matches('[').trim_end_matches(']');
+        let mut parts: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        for ch in inner.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if depth == 0 => parts.push(std::mem::take(&mut current)),
+                _ => current.push(ch),
+            }
+        }
+        if !current.is_empty() {
+            parts.push(current);
+        }
+
+        let mut elems = Vec::new();
+        for part in parts {
+            let part = part.trim();
+            if let Some(tuple) = part.strip_prefix('{') {
+                let tuple = tuple.trim_end_matches('}');
+                let (key, value) = tuple.split_once(',').expect("{key,value}");
+                let key = ctx.atom(key.trim()).expect("seeded");
+                let value = match value.trim() {
+                    "true" => ctx.atom("true").expect("seeded"),
+                    "false" => ctx.atom("false").expect("seeded"),
+                    "auto" => ctx.atom("auto").expect("seeded"),
+                    other => ctx.int(other.parse().expect("an integer")).expect("fits"),
+                };
+                elems.push(ctx.tuple(&[key, value]).expect("fits"));
+            } else if !part.is_empty() {
+                elems.push(ctx.atom(part).expect("seeded"));
+            }
+        }
+        ctx.list(&elems).expect("fits")
+    }
+
+    /// The `option_list` builder produces the shapes the oracle probes use.
+    #[test]
+    fn option_list_builds_the_oracle_option_shapes() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let cases: [(&str, usize); 7] = [
+            ("[set]", 1),
+            ("[set,{write_concurrency,true}]", 2),
+            ("[ordered_set]", 1),
+            ("[set,{write_concurrency,auto}]", 2),
+            ("[set,{decentralized_counters,true},{write_concurrency,true}]", 3),
+            ("[set,{write_concurrency,false}]", 2),
+            ("[private,set,{write_concurrency,true}]", 3),
+        ];
+        for (source, element_count) in cases {
+            let list = option_list(&mut ctx, source);
+            assert_eq!(
+                proper_list(list).expect("a proper list").len(),
+                element_count,
+                "{source}"
+            );
+        }
+    }    /// The bare `set`/`protected` atoms are **no-ops**: they never override an
     /// earlier kind/access (the C `else if (val == am_set || val == am_protected) ;`,
     /// `erl_db.c:2710`), unlike every other bare atom.
     #[test]
