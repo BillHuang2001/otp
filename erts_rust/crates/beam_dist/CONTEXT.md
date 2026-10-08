@@ -503,9 +503,15 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - **`DOP_UNLINK` never routes to a side effect.** The C *rejects* the bare `DOP_UNLINK` opcode
   (`dist.c:2277-2282`), so `classify` leaves it `Other(DOP_UNLINK)` — encodable/decodable, but carrying
   no semantic `Delivery`.
-- **Not yet consumed by `beam_rt`**: node startup (`-name`/`-sname`) does not yet wire this crate into
-  the runtime binary (nor does the Rust node advertise `DFLAG_PUBLISHED`/visibility at startup). This
-  crate is the value/connection layer only.
+- **Consumed by `beam_rt` for the ACCEPTING half only.** `beam_rt/src/dist.rs` (`DistNode`, driven from
+  `runtime/scheduler.rs::pump_dist`) derives the node name from `-name`/`-sname` (`NodeName`), registers
+  with `epmd` (`ALIVE2_REQ`), binds a listener and completes the `'N'` handshake as **server** via this
+  crate's `ConnectionDriver`, then routes the inbound **send family** into local mailboxes through the
+  `InboundSink` impl (`LocalDeliverySink`, `beam_rt/src/runtime/scheduler.rs`). What is still missing:
+  the **connector half** and the `net_kernel` `{setup,…}`/`{nodeup,…}` protocol; every non-send delivery
+  is `DeliveryOutcome::Unsupported`; and the node does **not** advertise `DFLAG_PUBLISHED`/visibility at
+  startup (no `publish_flag` caller). The value/connection layer plus this accept-only wiring is the
+  whole of the current distribution support.
 
 ## Notes for Agents
 - **`LOCAL_EXT` (`121`) now exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
