@@ -160,8 +160,9 @@ fn caller_module(callee_function: &str) -> (Module, Atom) {
 }
 
 /// The callee module `c`: `noop/0` (function index `0`), `recv/0` (index `1`,
-/// suspended on an empty mailbox) and `raise/0` (index `2`, raises `erlang:error/1`
-/// from a live frame with a stale `deallocate`).
+/// suspended on an empty mailbox), `raise/0` (index `2`, raises `erlang:error/1`
+/// from a live frame with a stale `deallocate`) and `tailapply/0` (index `3`, a
+/// tail `apply_last` whose return address is the caller's).
 fn callee_module() -> Arc<Module> {
     let mut f = Fixture::new("c");
 
@@ -207,6 +208,41 @@ fn callee_module() -> Arc<Module> {
         ],
     );
     f.add_export("raise", 0, raise);
+
+    // `tailapply/0` (function index `3`) — a callee whose body ends with a tail
+    // `apply_last erlang:length/1`. Its `allocate` frame is popped by the
+    // `apply_last`, so the continuation control then follows is the **caller's**
+    // (written by the `call_ext`), i.e. an address in module context `0` (`m`).
+    let erlang = f.atom("erlang");
+    let length = f.atom("length");
+    let tailapply = f.add_function(
+        "tailapply",
+        0,
+        vec![
+            Instr::Label(Label(30)),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(0),
+                live: 3,
+            },
+            Instr::Move {
+                src: Operand::Integer(1),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::Atom(erlang),
+                dst: Operand::X(1),
+            },
+            Instr::Move {
+                src: Operand::Atom(length),
+                dst: Operand::X(2),
+            },
+            Instr::ApplyLast {
+                arity: 1,
+                deallocate: 0,
+            },
+        ],
+    );
+    f.add_export("tailapply", 0, tailapply);
 
     Arc::new(f.finish())
 }
@@ -448,6 +484,51 @@ fn a_cross_module_callee_raise_reports_the_callees_own_reason() {
         }
         other => panic!("expected the callee's raise, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// (c2) a tail `apply_last` in the callee returns into the CALLER's module context
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_tail_apply_inside_a_cross_module_callee_returns_to_the_callers_module() {
+    // `m:run/0` `call_ext`s `c:tailapply/0`, whose body ends with a tail
+    // `apply_last erlang:length/1`. The `apply_last` pops its own frame, leaving the
+    // CALLER's frame whose continuation the `call_ext` wrote — an address in module
+    // context `0` (`m`), i.e. a DIFFERENT module than the callee currently running
+    // in. The `ApplyLast` arm must therefore report the context change
+    // (`Step::Enter { context: 0, .. }`) so the driver re-binds `m` before executing
+    // the return address. Dropping the context and reporting a bare `Step::Goto`
+    // would make the driver follow `(func, pc)` in the **callee's** module `c` — its
+    // function `0` (`noop/0`) has no instruction at that `pc`, so the run would fail
+    // with a typed `run: pc out of range` instead of returning the applied value.
+    let (caller, run) = caller_module("tailapply");
+    let mut ctx = SeamCtx::new(
+        callee(),
+        Box::new(|module, function, arity, args| {
+            if module == "erlang"
+                && function == "length"
+                && arity == 1
+                && args.len() == 1
+                && args[0] == make_small(1)
+            {
+                return Ok(make_small(41));
+            }
+            Err(beam_engine::unsupported(&format!("bif {module}:{function}")))
+        }),
+    );
+    let mut machine = Machine::new();
+
+    let outcome = machine
+        .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+        .expect("the tail apply must return into the caller's module, not the callee's");
+
+    assert_eq!(
+        outcome,
+        RunOutcome::Returned(make_small(41)),
+        "the applied value, returned through the CALLER's `deallocate`/`return`"
+    );
+    assert_eq!(machine.frame_depth(), 1, "the caller's frame was deallocated");
 }
 
 // ---------------------------------------------------------------------------
