@@ -233,6 +233,7 @@ The mandate is to delete it **module by module as Rust parity is proven** — ne
 - Adding/removing a BIF means editing `bif.tab` (and `erl_dirty_bif.tab` for dirty BIFs), not the generated tables.
 - Most files are large on purpose (e.g. `dist.c`, `erl_alloc_util.c`, `bif.c`, `erl_process.c`); navigate by section comments rather than expecting small modules.
 - Building only this directory requires a configured tree and the generated headers; without `erts/$(TARGET)/config.h` and `$(TTF_DIR)` most files cannot even be parsed.
+- Before proposing to delete any file here, run `python3 erts/emulator/beam/check_dead_sources.py` and read `## Legacy C removal plan (parity-gated)` in this file — it states the mechanical proof a deletion needs and the per-module Rust-parity gate.
 
 ## Dependencies
 - `erts/$(TARGET)/config.h` (from `../../configure`) and many `HAVE_*` macros; `#ifdef HAVE_CONFIG_H` + `#include "config.h"` is standard here.
