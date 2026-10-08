@@ -217,6 +217,7 @@ The API Surface section above owns the detail; each entry here is the module's o
 * `src/runtime.rs` + `src/runtime/scheduler.rs` (+ `scheduler/tests.rs`) → `Runtime` (boot wiring, code server + module cache, the slice, spawn API, timer/distribution accessors, `stabilize_term`/`materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`) and the scheduler pass family.
 * `src/main.rs` → the thin executable shim over `cli::run`.
 * `tests/` → the suites listed under Test Strategy + the shared `tests/support/mod.rs`; `tests/fixtures/*.{erl,beam}` + the test-time-compiled `{event_driver,env_nif,reg}.{c,erl}` (recipe + oracle table in `fixtures/README.md`).
+* `examples/perf_bif.rs` → the per-call overhead regression harness (marginal ns/call for `pc:add/2` + `pc:loop/2`, N-subtracted); see Test Strategy for the run command.
 * Read-only cross-repo: `../beam_engine/src/context.rs` (the seam implemented here), `../beam_bifs/`, `../beam_abi/{nif,driver}` (the anchored codegen units), `../beam_loader/tests/fixtures/slice.beam`; the legacy C ground truth for A.3/A.4/A.6/A.7/A.8 under `../../erts/` (per-file map in `../../erts/emulator/beam/CONTEXT.md`), `../bootstrap/bin/*.boot`.
 
 ## Handoffs (owned by OTHER nodes)
