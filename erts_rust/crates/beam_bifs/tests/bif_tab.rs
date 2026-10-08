@@ -42,9 +42,9 @@ const DECLARED_HBIF: usize = 7;
 /// keys, which are real BIFs the table does not declare.
 const IMPLEMENTED_DECLARED: usize = 556;
 const MISSING_DECLARED: usize = 0;
-const FAST_PATHS: usize = 81;
+const FAST_PATHS: usize = 84;
 /// The registry size (declared-and-implemented + fast paths).
-const REGISTRY_SIZE: usize = 637;
+const REGISTRY_SIZE: usize = 640;
 
 #[test]
 fn the_committed_table_has_a_pinned_shape() {
@@ -209,6 +209,9 @@ fn stdlib_fast_paths_are_the_documented_ones() {
         ("lists", "sort", 1),
         ("maps", "new", 0),
         ("ets", "tab2list", 1),
+        ("ets", "all", 0),
+        ("ets", "foldl", 3),
+        ("ets", "foldr", 3),
         ("io", "format", 2),
     ] {
         assert!(is_fast_path(key.0, key.1, key.2), "{key:?} should be a fast path");

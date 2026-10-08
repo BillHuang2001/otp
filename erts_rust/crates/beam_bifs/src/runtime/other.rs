@@ -12,10 +12,9 @@ use crate::registry::BifRegistry;
 
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
-    // `ets` -- the C interior surface (the C-only lookups, continuations,
-    // table identity/options hooks and the raw match-spec run).
+    // `ets` -- the C interior surface (the C-only lookups, the reverse scan,
+    // the unmodelled `rename` name setter and the raw match-spec run).
     crate::runtime::runtime_bif!(reg, "ets", first_lookup, 1);
-    crate::runtime::runtime_bif!(reg, "ets", give_away, 3);
     crate::runtime::runtime_bif!(reg, "ets", internal_delete_all, 2);
     crate::runtime::runtime_bif!(reg, "ets", internal_request_all, 0);
     crate::runtime::runtime_bif!(reg, "ets", internal_select_delete, 2);
@@ -27,7 +26,6 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "ets", select_reverse, 1);
     crate::runtime::runtime_bif!(reg, "ets", select_reverse, 2);
     crate::runtime::runtime_bif!(reg, "ets", select_reverse, 3);
-    crate::runtime::runtime_bif!(reg, "ets", setopts, 2);
     crate::runtime::runtime_bif!(reg, "ets", slot, 2);
 
     // `erl_debugger` -- the interpreter-level debugger tools.

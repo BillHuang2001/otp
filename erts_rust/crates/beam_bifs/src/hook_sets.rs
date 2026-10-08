@@ -508,7 +508,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_trace_cleaner", "check", 0),
     ("erts_trace_cleaner", "send_trace_clean_signal", 1),
     ("ets", "first_lookup", 1),
-    ("ets", "give_away", 3),
     ("ets", "internal_delete_all", 2),
     ("ets", "internal_request_all", 0),
     ("ets", "internal_select_delete", 2),
@@ -520,7 +519,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("ets", "select_reverse", 1),
     ("ets", "select_reverse", 2),
     ("ets", "select_reverse", 3),
-    ("ets", "setopts", 2),
     ("ets", "slot", 2),
     ("net_kernel", "dflag_unicode_io", 1),
     ("os", "set_signal", 2),
@@ -1009,7 +1007,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 222);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 220);
     }
 
     /// Near misses (wrong arity / wrong module / a different BIF) answer `false`.

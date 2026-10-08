@@ -1128,6 +1128,16 @@ impl<'a> BifContext<'a> {
     ///
     /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
     /// propagates the hook's own failure.
+    /// Whether a [`ProcessHook`] is installed.
+    ///
+    /// The liveness/registry seam. `ets:give_away/3` and `ets:setopts/2` must ask
+    /// whether a pid is *alive* (the C's `erts_pid2proc`/`erts_proc_lookup` in
+    /// `erl_db.c`), and with no hook that question cannot be answered at all — so
+    /// a caller can tell "the hook answered `false`" from "nothing can answer".
+    pub fn has_process_hook(&self) -> bool {
+        self.process.is_some()
+    }
+
     pub fn proc_is_alive(&mut self, pid: ProcessId) -> Result<bool> {
         match self.process.as_deref_mut() {
             Some(hook) => hook.is_process_alive(pid),

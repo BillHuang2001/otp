@@ -131,6 +131,15 @@ mod specs;
 /// (declared here, not in `src/lib.rs`). The verbs that stay unregistered, and
 /// why, are documented there.
 mod extra;
+/// The adopted `ets:*` verbs (`ets:all/0`, `ets:setopts/2`, `ets:give_away/3`,
+/// `ets:foldl/3`, `ets:foldr/3`) plus the honest typed gaps for the verbs that
+/// cannot be served over the frozen `beam_ets::Table` API.
+///
+/// They share this module's handle contract, [`TableRegistry`] and helpers
+/// (`take_table_gated`/`restore_table`/`copy_out`) and the shared resolver
+/// [`resolve`], so they are a child of `ets` (declared here, not in `src/lib.rs`).
+/// Every gap is documented there with the exact `beam_ets` API it needs.
+mod adopt;
 /// The shared table-argument resolver, the process/owner bridge, the
 /// creation-time [`resolve::TableProfile`] and the `ets:new/2` option parser.
 ///
@@ -394,6 +403,27 @@ impl TableRegistry {
     pub fn contains_spec(&self, handle: u64) -> bool {
         self.specs.contains_key(&handle)
     }
+
+    /// Every live table as `(handle, named_table name)`, ascending by handle —
+    /// the `ets:all/0` roster.
+    ///
+    /// The name is `Some` only for a table created with the `named_table` option
+    /// (exactly the name registry's membership), which is the oracle's rule for
+    /// rendering a tid as its name atom rather than its handle reference.
+    pub(super) fn all_tids(&self) -> Vec<(u64, Option<Atom>)> {
+        let mut ids: Vec<u64> = self.tables.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .map(|id| {
+                let name = self
+                    .names
+                    .iter()
+                    .find(|(_, handle)| **handle == id)
+                    .map(|(name, _)| *name);
+                (id, name)
+            })
+            .collect()
+    }
 }
 
 /// Registers the implemented `ets:*` BIFs (see the module docs for the scope).
@@ -437,6 +467,10 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     // The remaining faithful verbs (child module `extra`): the fix flag, the
     // name registry (`whereis`), `update_element/4` and `is_compiled_ms/1`.
     extra::register(reg);
+    // The adopted verbs (child module `adopt`): the roster (`all/0`), the
+    // ownership verbs (`setopts/2`, `give_away/3`) and the two fun-folds
+    // (`foldl/3`, `foldr/3`).
+    adopt::register(reg);
 }
 
 // --------------------------------------------------------------- creation
