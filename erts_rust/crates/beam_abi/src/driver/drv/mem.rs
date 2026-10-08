@@ -11,6 +11,8 @@
 //! [`driver_term_nil`](super::driver_term_nil) data symbol, the module docs and the populated table
 //! live in [`super`].
 
+use core::sync::atomic::{AtomicI64, Ordering};
+
 use libc::{c_char, c_int, c_void, size_t};
 
 use crate::common::ERTS_NAPI_TIME_ERROR;
@@ -64,36 +66,133 @@ pub unsafe extern "C" fn driver_realloc(ptr: *mut c_void, size: ErlDrvSizeT) -> 
     unsafe { libc::realloc(ptr, size) }
 }
 
-/// The bytes a driver binary of `size` payload bytes needs: the `orig_size` word plus the flexible
-/// `orig_bytes` array (`offset_of!(ErlDrvBinary, orig_bytes) == 8` on LP64).
-#[inline]
-const fn driver_binary_block_size(size: ErlDrvSizeT) -> ErlDrvSizeT {
-    core::mem::offset_of!(ErlDrvBinary, orig_bytes) + size
+// ---------------------------------------------------------------------------------------------
+// Driver binaries: the hidden reference-count header
+// ---------------------------------------------------------------------------------------------
+
+/// The reference count a freshly allocated driver binary starts with —
+/// `erts_refc_init(&res->intern.refc, 1)` (`erts/emulator/beam/erl_binary.h:278`). Pinned against
+/// the real ERTS (OTP 29.1.1 / erts-17.1) by `tests/driver_binary_refc.rs`, which observes
+/// `driver_binary_get_refc(driver_alloc_binary(8)) == 1`.
+const INITIAL_REFC: i64 = 1;
+
+/// The value this seam answers for a **null** binary operand, where the C would dereference it.
+///
+/// `driver_binary_get_refc`/`inc_refc`/`dec_refc` (`io.c:6536-6558`) convert their operand with
+/// `ErlDrvBinary2Binary` and dereference the result unconditionally, so `NULL` is a crash on the
+/// real ERTS (it cannot be probed — it would take the emulator down). This crate's policy is
+/// "refuse rather than fault, never a wrong result" (`CONTEXT.md` §3), so a null operand is
+/// answered with the same `-1` refusal the rest of the `driver_*` layer uses
+/// (`driver_enq`/`driver_pushq`/…). It is a deliberate, documented divergence: `-1` is also a
+/// value a real `dec_refc` can return, so no driver can mistake the refusal for a live count —
+/// it can only *not* be told apart from an over-decremented binary, which is already undefined
+/// behaviour in the C.
+const REFC_REFUSED: ErlDrvSInt = -1;
+
+/// The hidden, **non-public** reference-count header that precedes the public [`ErlDrvBinary`] in
+/// every block [`driver_alloc_binary`] hands out — this crate's analogue of the emulator's private
+/// `Binary` header.
+///
+/// The C keeps the count in an emulator-internal `Binary` *allocated before* the pointer a driver
+/// ever sees, and converts between the two by pointer arithmetic
+/// (`Binary2ErlDrvBinary(B) = &((ErtsBinary *) B)->driver.binary`,
+/// `ErlDrvBinary2Binary(D) = (Binary *) ((char *) D - offsetof(ErtsBinary, driver.binary))`;
+/// `erts/emulator/beam/erl_binary.h:173-176`). This type is the minimum such a header needs: the
+/// C's `flags`/`apparent_size` words are internals no driver can observe through this ABI.
+///
+/// Layout of one allocated block (the header first, then the public struct verbatim):
+///
+/// ```text
+/// +0   refc: AtomicI64        <- BinaryHeader (8 bytes, 8-aligned)
+/// +8   orig_size: ErlDrvSInt  <- ErlDrvBinary.orig_size  == the pointer that is returned
+/// +16  orig_bytes[0..size]    <- ErlDrvBinary.orig_bytes
+/// ```
+///
+/// `malloc` returns 16-byte-aligned storage, so `orig_size` (offset 8) and `orig_bytes`
+/// (offset 16) are both 8-byte aligned. The first is what the frozen [`ErlDrvBinary`] layout
+/// requires; the second is the C's own `ERTS_CHK_BIN_ALIGNMENT` invariant (*"Address of
+/// orig_bytes[0] of a Binary should always be 8-byte aligned"*, `erl_binary.h:216`). Keeping the
+/// payload 8-aligned is why the header is a whole word rather than a byte.
+///
+/// The count is atomic because the C's is an `erts_atomic_t` (`sys.h:964`) and the trio is
+/// documented for use from driver threads. Like the C's, the count never releases the block:
+/// only [`driver_free_binary`] does (`erts_bin_release` -> `erts_bin_free`,
+/// `erl_binary.h:399-405`).
+#[repr(C)]
+struct BinaryHeader {
+    /// The reference count; [`INITIAL_REFC`] on allocation.
+    refc: AtomicI64,
 }
 
-/// `ErlDrvBinary *driver_alloc_binary(ErlDrvSizeT size);` — allocate a driver binary: an `orig_size`
-/// header followed by a `size`-byte `orig_bytes` payload. A zero `size` still yields a valid
-/// (payload-less) block.
+/// The block prefix a driver binary needs before its payload: the hidden header plus the public
+/// `orig_size` word. `offset_of!(ErlDrvBinary, orig_bytes) == 8` on LP64, so this is 16 bytes — the
+/// exact distance ERTS's `Binary2ErlDrvBinary`/`ErlDrvBinary2Binary` pair implies.
+const DRIVER_BINARY_PREFIX: ErlDrvSizeT =
+    core::mem::size_of::<BinaryHeader>() + core::mem::offset_of!(ErlDrvBinary, orig_bytes);
+
+/// The bytes a driver binary of `size` payload bytes needs: the hidden header, the `orig_size`
+/// word and the `size`-byte `orig_bytes` array.
+///
+/// `None` when the total would overflow `ErlDrvSizeT`, mirroring the C's `IS_BINARY_SIZE_OK` guard
+/// (`erl_binary.h:244`) which refuses an unstorable size with `NULL` instead of truncating it.
+#[inline]
+const fn driver_binary_block_size(size: ErlDrvSizeT) -> Option<ErlDrvSizeT> {
+    size.checked_add(DRIVER_BINARY_PREFIX)
+}
+
+/// The block base behind a public `ErlDrvBinary *` — `ErlDrvBinary2Binary`'s pointer arithmetic.
+///
+/// # Safety
+///
+/// `bin` must be a non-null pointer returned by [`driver_alloc_binary`]/[`driver_realloc_binary`]
+/// (every caller checks for null first, since the subtraction itself requires a real block).
+unsafe fn binary_header(bin: *mut ErlDrvBinary) -> *mut BinaryHeader {
+    // SAFETY: the caller's contract above; the header sits `size_of::<BinaryHeader>()` bytes before
+    // the public struct in the same allocation.
+    unsafe { (bin as *mut u8).sub(core::mem::size_of::<BinaryHeader>()) as *mut BinaryHeader }
+}
+
+/// `ErlDrvBinary *driver_alloc_binary(ErlDrvSizeT size);` — allocate a driver binary: a hidden
+/// reference-count header, then the public `orig_size` word and a `size`-byte `orig_bytes` payload.
+/// A zero `size` still yields a valid (payload-less) block; an unstorable size yields `NULL`.
+///
+/// The returned pointer is the public [`ErlDrvBinary`] (i.e. its `orig_size` field), so the frozen
+/// struct layout, [`super::binary_payload`] and every existing caller are unaffected by the header.
 ///
 /// # Safety
 ///
 /// Release the result with [`driver_free_binary`]/[`driver_realloc_binary`].
 #[no_mangle]
 pub unsafe extern "C" fn driver_alloc_binary(size: ErlDrvSizeT) -> *mut ErlDrvBinary {
+    let Some(total) = driver_binary_block_size(size) else {
+        return core::ptr::null_mut();
+    };
     // SAFETY: `malloc` is unconditional; the block is always large enough for the header (>= 8).
-    let mem = unsafe { libc::malloc(driver_binary_block_size(size)) } as *mut ErlDrvBinary;
-    if mem.is_null() {
+    let base = unsafe { libc::malloc(total) } as *mut u8;
+    if base.is_null() {
         return core::ptr::null_mut();
     }
-    // SAFETY: `mem` heads a live block of at least `offset_of!(orig_bytes)` bytes, so the
-    // `orig_size` field (offset 0) is in bounds and aligned by `malloc`.
-    unsafe { (*mem).orig_size = size as ErlDrvSInt };
-    mem
+    // SAFETY: `base` heads a live `total`-byte block whose first word is the header; `ptr::write`
+    // initialises that word without reading the (uninitialised) bytes it replaces. `base + 8` is
+    // the public head, in bounds because `total >= 16`, and 8-byte aligned because `malloc` is
+    // 16-byte aligned.
+    unsafe {
+        core::ptr::write(
+            base as *mut BinaryHeader,
+            BinaryHeader {
+                refc: AtomicI64::new(INITIAL_REFC),
+            },
+        );
+        let bin = base.add(core::mem::size_of::<BinaryHeader>()) as *mut ErlDrvBinary;
+        (*bin).orig_size = size as ErlDrvSInt;
+        bin
+    }
 }
 
 /// `ErlDrvBinary *driver_realloc_binary(ErlDrvBinary *bin, ErlDrvSizeT size);` — resize a driver
 /// binary, updating `orig_size`. The first `min(old, new)` payload bytes are preserved (`realloc`
-/// semantics); a null `bin` is a fresh allocation, as in the C.
+/// semantics) and the hidden reference count is carried across the move (it is the first word of
+/// the block, which `realloc` always preserves); a null `bin` is a fresh allocation, as in the C.
 ///
 /// # Safety
 ///
@@ -104,29 +203,119 @@ pub unsafe extern "C" fn driver_realloc_binary(
     size: ErlDrvSizeT,
 ) -> *mut ErlDrvBinary {
     if bin.is_null() {
-        // SAFETY: `driver_alloc_binary` only needs a size.
+        // SAFETY: `driver_alloc_binary` only needs a size (the C does the same, `io.c:6583`).
         return unsafe { driver_alloc_binary(size) };
     }
+    let Some(total) = driver_binary_block_size(size) else {
+        return core::ptr::null_mut();
+    };
     // SAFETY: the caller contract above.
-    let mem = unsafe { libc::realloc(bin as *mut c_void, driver_binary_block_size(size)) }
-        as *mut ErlDrvBinary;
-    if mem.is_null() {
+    let base = unsafe { binary_header(bin) };
+    // SAFETY: `base` is the block base of a live driver binary of `total` requested bytes; the
+    // header's reference count is at offset 0, so `realloc`'s "first min(old,new) bytes survive"
+    // rule carries it over unchanged.
+    let moved = unsafe { libc::realloc(base as *mut c_void, total) } as *mut u8;
+    if moved.is_null() {
         return core::ptr::null_mut();
     }
-    // SAFETY: `mem` heads a live block of at least `offset_of!(orig_bytes)` bytes.
-    unsafe { (*mem).orig_size = size as ErlDrvSInt };
-    mem
+    // SAFETY: `moved` heads a live block of `total >= 16` bytes.
+    unsafe {
+        let newbin = moved.add(core::mem::size_of::<BinaryHeader>()) as *mut ErlDrvBinary;
+        (*newbin).orig_size = size as ErlDrvSInt;
+        newbin
+    }
 }
 
-/// `void driver_free_binary(ErlDrvBinary *bin);` — free a driver binary.
+/// `void driver_free_binary(ErlDrvBinary *bin);` — release one reference to a driver binary.
+///
+/// This is the C's `erts_bin_release` (`io.c:6595`): decrement the hidden count, and free the whole
+/// block **only** when that decrement reaches zero. A null `bin` is a no-op (the C's
+/// `if (!dbin) return;`, `io.c:6598`).
 ///
 /// # Safety
 ///
-/// `bin` must be null or a live block from [`driver_alloc_binary`]/[`driver_realloc_binary`].
+/// `bin` must be null or a live block from [`driver_alloc_binary`]/[`driver_realloc_binary`] whose
+/// final reference this call releases.
 #[no_mangle]
 pub unsafe extern "C" fn driver_free_binary(bin: *mut ErlDrvBinary) {
-    // SAFETY: the caller contract above; `free(null)` is a no-op.
-    unsafe { libc::free(bin as *mut c_void) };
+    if bin.is_null() {
+        return;
+    }
+    // SAFETY: `bin` is non-null, so it is a live block from the allocator above; `binary_header`
+    // recovers the header word that `driver_alloc_binary` wrote.
+    let header = unsafe { binary_header(bin) };
+    // SAFETY: `header` is the live header of a binary this crate allocated. `fetch_sub` returns the
+    // *previous* count, so `prev == 1` is exactly the C's `erts_refc_dectest(&bp->intern.refc, 0)
+    // == 0` (the count is now 0).
+    let prev = unsafe { (*header).refc.fetch_sub(1, Ordering::AcqRel) };
+    if prev == 1 {
+        // SAFETY: the count reached zero, so this was the last reference and nothing can observe
+        // the block afterwards (`AcqRel` orders that against every earlier reader).
+        unsafe { libc::free(header as *mut c_void) };
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The binary reference-count trio
+// ---------------------------------------------------------------------------------------------
+
+/// `ErlDrvSInt driver_binary_get_refc(ErlDrvBinary *dbp);` — read a driver binary's reference
+/// count (`io.c:6536`, `erts_refc_read`).
+///
+/// A null `dbp` is refused with [`REFC_REFUSED`] (`-1`) instead of faulting, as documented on that
+/// constant.
+///
+/// # Safety
+///
+/// `dbp` must be null or a live pointer from [`driver_alloc_binary`]/[`driver_realloc_binary`].
+#[no_mangle]
+pub unsafe extern "C" fn driver_binary_get_refc(dbp: *mut ErlDrvBinary) -> ErlDrvSInt {
+    if dbp.is_null() {
+        return REFC_REFUSED;
+    }
+    // SAFETY: `dbp` is non-null, so it is a live driver binary; `Acquire` makes the count (and,
+    // through it, the payload a writer published before releasing) visible on this thread.
+    unsafe { (*binary_header(dbp)).refc.load(Ordering::Acquire) as ErlDrvSInt }
+}
+
+/// `ErlDrvSInt driver_binary_inc_refc(ErlDrvBinary *dbp);` — take one more reference. Returns the
+/// count **after** the increment (`io.c:6545`, `erts_refc_inctest` -> `erts_atomic_inc_read_nob`).
+///
+/// A null `dbp` is refused with [`REFC_REFUSED`] (`-1`) instead of faulting.
+///
+/// # Safety
+///
+/// `dbp` must be null or a live pointer from [`driver_alloc_binary`]/[`driver_realloc_binary`].
+#[no_mangle]
+pub unsafe extern "C" fn driver_binary_inc_refc(dbp: *mut ErlDrvBinary) -> ErlDrvSInt {
+    if dbp.is_null() {
+        return REFC_REFUSED;
+    }
+    // SAFETY: `dbp` is non-null, so it is a live driver binary.
+    unsafe { (*binary_header(dbp)).refc.fetch_add(1, Ordering::AcqRel) + 1 }
+}
+
+/// `ErlDrvSInt driver_binary_dec_refc(ErlDrvBinary *dbp);` — drop one reference **without**
+/// releasing the block, even when the count reaches zero. Returns the count **after** the
+/// decrement (`io.c:6553`, `erts_refc_dectest`).
+///
+/// This is the C's own contract: `erl_driver.md` is explicit that
+/// *"`driver_binary_dec_refc` does _not_ free the binary if the reference count reaches zero"* —
+/// only [`driver_free_binary`] does. Both facts are pinned against the real ERTS by
+/// `tests/driver_binary_refc.rs`.
+///
+/// A null `dbp` is refused with [`REFC_REFUSED`] (`-1`) instead of faulting.
+///
+/// # Safety
+///
+/// `dbp` must be null or a live pointer from [`driver_alloc_binary`]/[`driver_realloc_binary`].
+#[no_mangle]
+pub unsafe extern "C" fn driver_binary_dec_refc(dbp: *mut ErlDrvBinary) -> ErlDrvSInt {
+    if dbp.is_null() {
+        return REFC_REFUSED;
+    }
+    // SAFETY: `dbp` is non-null, so it is a live driver binary.
+    unsafe { (*binary_header(dbp)).refc.fetch_sub(1, Ordering::AcqRel) - 1 }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -467,8 +656,9 @@ pub unsafe extern "C" fn driver_mk_term_nil() -> ErlDrvTermData {
 /// chain folds at compile time.
 ///
 /// Implements: `driver_alloc`/`driver_free`/`driver_realloc`,
-/// `driver_alloc_binary`/`driver_realloc_binary`/`driver_free_binary`, `driver_system_info`,
-/// `null_func`, `erl_errno_id`, `erl_drv_consume_timeslice`, the time trio
+/// `driver_alloc_binary`/`driver_realloc_binary`/`driver_free_binary`, the binary reference-count
+/// trio (`driver_binary_get_refc`/`driver_binary_inc_refc`/`driver_binary_dec_refc`),
+/// `driver_system_info`, `null_func`, `erl_errno_id`, `erl_drv_consume_timeslice`, the time trio
 /// (`erl_drv_monotonic_time`/`erl_drv_time_offset`/`erl_drv_convert_time_unit`), the
 /// `driver_dl_open`/`driver_dl_sym`/`driver_dl_close`/`driver_dl_error` quartet,
 /// `erl_drv_putenv`/`erl_drv_getenv` and `driver_mk_term_nil`.
@@ -479,6 +669,9 @@ pub(super) const fn populate(mut api: ErlDrvApi) -> ErlDrvApi {
     api.driver_alloc_binary = Some(driver_alloc_binary);
     api.driver_realloc_binary = Some(driver_realloc_binary);
     api.driver_free_binary = Some(driver_free_binary);
+    api.driver_binary_get_refc = Some(driver_binary_get_refc);
+    api.driver_binary_inc_refc = Some(driver_binary_inc_refc);
+    api.driver_binary_dec_refc = Some(driver_binary_dec_refc);
     api.driver_system_info = Some(driver_system_info);
     api.null_func = Some(null_func);
     api.erl_errno_id = Some(erl_errno_id);
@@ -562,6 +755,127 @@ mod tests {
         unsafe {
             assert_eq!((*fresh).orig_size, 3);
             driver_free_binary(fresh);
+        }
+    }
+
+    /// The sequence the real system ERTS (OTP 29.1.1 / erts-17.1) reports, measured through
+    /// `driver_binary_refc()`'s shared C path by `tests/driver_binary_refc.rs`:
+    ///
+    /// ```text
+    /// get=1 inc=2 get=2 inc=3 dec=2 get=2 dec=1 get=1
+    /// ```
+    #[test]
+    fn driver_binary_refc_trio_matches_the_measured_oracle_sequence() {
+        // SAFETY: the allocator/refcount calls below are balanced: the block is allocated once and
+        // released exactly once, at the single reference the driver owns.
+        unsafe {
+            let bin = driver_alloc_binary(8);
+            assert!(!bin.is_null());
+            assert_eq!(
+                driver_binary_get_refc(bin),
+                1,
+                "a fresh driver binary starts at one reference"
+            );
+            assert_eq!(
+                driver_binary_inc_refc(bin),
+                2,
+                "inc_refc returns the NEW value (the oracle reports 2)"
+            );
+            assert_eq!(driver_binary_get_refc(bin), 2);
+            assert_eq!(driver_binary_inc_refc(bin), 3);
+            assert_eq!(
+                driver_binary_dec_refc(bin),
+                2,
+                "dec_refc returns the NEW value (the oracle reports 2)"
+            );
+            assert_eq!(driver_binary_get_refc(bin), 2);
+            assert_eq!(driver_binary_dec_refc(bin), 1);
+            assert_eq!(driver_binary_get_refc(bin), 1);
+            // Back at the driver's own single reference: this releases the block.
+            driver_free_binary(bin);
+        }
+    }
+
+    /// The oracle's `size_before=4 get=1 inc=2 size_after=64 refc_after=2 dec=1` and
+    /// `get=1 dec=0 get=0 dec=-1`: a move preserves the count, and the trio never frees at zero.
+    #[test]
+    fn driver_binary_refc_survives_realloc_and_never_frees_at_zero() {
+        // SAFETY: `bin` is allocated once. `grown` *is* `bin` (moved), so only `grown` is ever
+        // released; the second block is deliberately left with a count of -1 (the oracle's own
+        // behaviour for `driver_free_binary` after the count reached zero) and leaks.
+        unsafe {
+            let bin = driver_alloc_binary(4);
+            assert!(!bin.is_null());
+            assert_eq!(driver_binary_get_refc(bin), 1);
+            let grown = driver_realloc_binary(bin, 64);
+            assert!(!grown.is_null());
+            assert_eq!((*grown).orig_size, 64);
+            assert_eq!(
+                driver_binary_get_refc(grown),
+                1,
+                "driver_realloc_binary carries the count across the move"
+            );
+            // The C's `erts_refc_dectest` only decrements; `erl_driver.md` says so explicitly.
+            assert_eq!(driver_binary_dec_refc(grown), 0);
+            assert_eq!(
+                driver_binary_get_refc(grown),
+                0,
+                "dec_refc reaching zero must not free the block"
+            );
+            assert_eq!(driver_binary_dec_refc(grown), -1);
+            driver_free_binary(grown); // -1 -> -2: no release, by design (a one-block leak)
+        }
+    }
+
+    /// A null operand is refused, never dereferenced (the C would fault; see [`REFC_REFUSED`]).
+    #[test]
+    fn driver_binary_refc_refuses_a_null_operand() {
+        // SAFETY: every call below passes null, which each function checks before dereferencing.
+        unsafe {
+            assert_eq!(driver_binary_get_refc(core::ptr::null_mut()), REFC_REFUSED);
+            assert_eq!(driver_binary_inc_refc(core::ptr::null_mut()), REFC_REFUSED);
+            assert_eq!(driver_binary_dec_refc(core::ptr::null_mut()), REFC_REFUSED);
+        }
+    }
+
+    /// The hidden header must not disturb the frozen public struct: the payload stays 8-byte
+    /// aligned (the C's `ERTS_CHK_BIN_ALIGNMENT` invariant), the whole payload is writable, and
+    /// writing it cannot touch the reference count that precedes it.
+    #[test]
+    fn driver_binary_payload_stays_8_byte_aligned_and_clear_of_the_header() {
+        let size = 24usize;
+        // SAFETY: `bin` heads a live block of `size` payload bytes; the payload writes stay inside
+        // it, and `bin` is released exactly once at the end.
+        unsafe {
+            let bin = driver_alloc_binary(size);
+            assert!(!bin.is_null());
+            let payload_addr = bin as usize + offset_of!(ErlDrvBinary, orig_bytes);
+            assert_eq!(
+                payload_addr % 8,
+                0,
+                "orig_bytes must stay 8-byte aligned (the header is a whole word for this reason)"
+            );
+            for (i, byte) in binary_payload(bin, size).iter_mut().enumerate() {
+                *byte = 0xA5 ^ i as u8;
+            }
+            assert_eq!(
+                driver_binary_get_refc(bin),
+                INITIAL_REFC,
+                "writing the payload must not clobber the header"
+            );
+            assert_eq!((*bin).orig_size, size as ErlDrvSInt);
+            driver_free_binary(bin);
+        }
+    }
+
+    /// An unstorable size is refused with `NULL` (the C's `IS_BINARY_SIZE_OK` guard), never
+    /// truncated into a short allocation.
+    #[test]
+    fn driver_alloc_binary_refuses_an_unstorable_size() {
+        // SAFETY: a refused size returns null without allocating, so nothing is leaked here.
+        unsafe {
+            assert!(driver_alloc_binary(ErlDrvSizeT::MAX).is_null());
+            assert!(driver_alloc_binary(ErlDrvSizeT::MAX - 8).is_null());
         }
     }
 
