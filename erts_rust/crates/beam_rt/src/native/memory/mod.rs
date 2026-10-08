@@ -304,6 +304,13 @@ struct Snapshot {
     reductions: u64,
     /// Minor collections run so far.
     minor_gcs: u32,
+    /// The **target process's own** heap policy — what `spawn_opt`'s `min_heap_size` /
+    /// `min_bin_vheap_size` / `fullsweep_after` / `max_heap_size` options set for a child,
+    /// and the emulator's default policy for every other process
+    /// ([`Runtime::default_spawn_policy`](crate::Runtime::default_spawn_policy)). The heap
+    /// items are answered from here, so `process_info(Child, min_heap_size)` is the
+    /// *child's* figure, never the emulator's.
+    policy: beam_gc::HeapPolicy,
     /// The off-heap (MSO + refc binary) overhead, in bytes.
     off_heap_bytes: usize,
 }
@@ -542,15 +549,11 @@ impl RuntimeContext<'_> {
             "stack_size" => make_small(snapshot.stack_size as i64),
             "reductions" => make_small(snapshot.reductions as i64),
             "garbage_collection" => self.garbage_collection(snapshot)?,
-            "min_heap_size" => make_small(crate::info::effective_policy(self.runtime).min_heap_words as i64),
-            "min_bin_vheap_size" => make_small(
-                crate::info::effective_policy(self.runtime).min_bin_vheap_words as i64,
-            ),
-            "fullsweep_after" => {
-                make_small(i64::from(crate::info::effective_policy(self.runtime).fullsweep_after))
-            }
+            "min_heap_size" => make_small(snapshot.policy.min_heap_words as i64),
+            "min_bin_vheap_size" => make_small(snapshot.policy.min_bin_vheap_words as i64),
+            "fullsweep_after" => make_small(i64::from(snapshot.policy.fullsweep_after)),
             "max_heap_size" => {
-                let size = crate::info::effective_policy(self.runtime).max_heap_words;
+                let size = snapshot.policy.max_heap_words;
                 let flags = self.runtime.config().heap_options().max_heap_flags();
                 self.max_heap_size_map(size, flags)?
             }
@@ -602,9 +605,9 @@ impl RuntimeContext<'_> {
     /// The `garbage_collection` value: the oracle's five `{Key, Value}` pairs, in
     /// [`beam_gc::GARBAGE_COLLECTION_KEYS`] order.
     fn garbage_collection(&mut self, snapshot: &Snapshot) -> Result<Eterm> {
-        let policy = crate::info::effective_policy(self.runtime);
+        let policy = &snapshot.policy;
         let info = HeapInfo::new(
-            &policy,
+            policy,
             snapshot.minor_gcs,
             snapshot.heap_size,
             snapshot.total_heap_size,
@@ -715,6 +718,7 @@ impl RuntimeContext<'_> {
             stack_size: process.registers().stack().len(),
             reductions: process.reductions(),
             minor_gcs: process.collector().minor_gcs(),
+            policy: process.collector().policy().clone(),
             off_heap_bytes: process.off_heap().overhead_bytes(),
         })
     }

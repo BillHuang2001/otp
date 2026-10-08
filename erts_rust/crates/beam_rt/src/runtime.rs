@@ -36,9 +36,11 @@ use beam_alloc::Heap;
 use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, MinimalContext};
+use beam_gc::HeapPolicy;
 use beam_loader::Module;
 use beam_process::{
-    MonitorRef, ProcessId, ProcessState, ProcessTable, RefAllocator, Scheduler, SignalAtoms,
+    MonitorRef, Priority, ProcessId, ProcessState, ProcessTable, RefAllocator, Scheduler,
+    SignalAtoms,
 };
 use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm};
 
@@ -339,7 +341,10 @@ impl Runtime {
         }
         let signals = SignalAtoms::from_table(code_server.atoms_mut());
         let mut processes = ProcessTable::new(signals);
-        let self_pid = processes.spawn_default()?;
+        // The runtime's own root process carries the emulator's default heap policy — the
+        // same one `erlang:spawn` gives a child — so `process_info(Pid, min_heap_size | …)`
+        // reports the oracle's figures for it too (see [`Runtime::default_spawn_policy`]).
+        let self_pid = processes.spawn(config.heap.policy().clone())?;
         // The runtime's own root process stands in for OTP's `init`: it is the process the
         // runtime boots and runs the start action as, and the one `erlang:group_leader/0`
         // already reports (`src/native/process.rs`). Registering the name is what makes
@@ -929,6 +934,43 @@ impl Runtime {
         function: &str,
         args: Vec<Eterm>,
     ) -> Result<ProcessId> {
+        let policy = self.default_spawn_policy();
+        self.spawn_process_with_policy(module, function, args, policy, None)
+    }
+
+    /// The heap policy a process created **without** `spawn_opt` heap options gets: the
+    /// emulator's own policy, with `+hms`/`+hmbs`/`+hmax` already applied
+    /// ([`RuntimeConfig::heap_options`]).
+    ///
+    /// This is the C's single global default — the `n` / `BIN_Vn` / `H_MAX_SIZE` a process
+    /// is created with when `spawn_opt` supplied no heap option
+    /// (`erl_process.c:12242-12248`, `12567-12572`) — so both the runtime's root process
+    /// and every plain `spawn*` child report the `min_heap_size` /
+    /// `min_bin_vheap_size` / `fullsweep_after` / `max_heap_size` the oracle does.
+    pub(crate) fn default_spawn_policy(&self) -> HeapPolicy {
+        self.config.heap.policy().clone()
+    }
+
+    /// [`Runtime::spawn_process`] under an explicit heap policy and priority — the
+    /// `spawn_opt` path.
+    ///
+    /// Both extras are honoured by **creating** the child with them: `policy` is the
+    /// [`ProcessTable::spawn`] policy (the child's own `beam_gc` policy, which
+    /// `process_info(Pid, …)` then reports for *that* process) and `priority` is set before
+    /// the child is queued, so the scheduler can never observe a half-configured process.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::spawn_process`], plus the process table's diagnostic when a just-spawned
+    /// pid cannot take `priority`.
+    pub(crate) fn spawn_process_with_policy(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: Vec<Eterm>,
+        policy: HeapPolicy,
+        priority: Option<Priority>,
+    ) -> Result<ProcessId> {
         self.boot_if_needed()?;
         // A module the code server already holds (loaded explicitly by
         // [`Runtime::load_module`], say) needs no code-path search — which also avoids
@@ -946,7 +988,10 @@ impl Runtime {
         if loaded.export(function_atom, arity).is_none() {
             return Err(error::undef());
         }
-        let pid = self.processes.spawn_default()?;
+        let pid = self.processes.spawn(policy)?;
+        if let Some(priority) = priority {
+            self.processes.set_priority(pid, priority)?;
+        }
         self.runner_state.spawn(
             pid,
             ProcessEntry::Export {
@@ -979,11 +1024,32 @@ impl Runtime {
     /// non-fun here is a programming error and never a wrong process), plus the process
     /// table's allocation failure.
     pub fn spawn_fun_process(&mut self, fun: Eterm, args: Vec<Eterm>) -> Result<ProcessId> {
+        let policy = self.default_spawn_policy();
+        self.spawn_fun_process_with_policy(fun, args, policy, None)
+    }
+
+    /// [`Runtime::spawn_fun_process`] under an explicit heap policy and priority — the
+    /// `spawn_opt/2` path (see [`Runtime::spawn_process_with_policy`]).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when `fun` is not a fun term, plus the process table's
+    /// allocation/priority diagnostics.
+    pub(crate) fn spawn_fun_process_with_policy(
+        &mut self,
+        fun: Eterm,
+        args: Vec<Eterm>,
+        policy: HeapPolicy,
+        priority: Option<Priority>,
+    ) -> Result<ProcessId> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
         }
         self.boot_if_needed()?;
-        let pid = self.processes.spawn_default()?;
+        let pid = self.processes.spawn(policy)?;
+        if let Some(priority) = priority {
+            self.processes.set_priority(pid, priority)?;
+        }
         self.runner_state.spawn_fun(pid, fun, args);
         self.enqueue_process(pid)?;
         Ok(pid)

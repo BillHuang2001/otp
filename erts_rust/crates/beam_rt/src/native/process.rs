@@ -27,8 +27,9 @@ use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
+use beam_gc::HeapPolicy;
 use beam_process::{MonitorKind, MonitorRef, Priority, ProcessId};
-use beam_term::{atom_val, is_atom, Eterm};
+use beam_term::{atom_val, is_atom, is_small, signed_value, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::error;
@@ -39,7 +40,9 @@ mod monitor;
 /// The `spawn_opt/2,3,4` options the runtime honours.
 ///
 /// The option list is parsed once, before the child is created, so an unsupported or
-/// malformed option is reported **without** spawning a process the caller did not ask for.
+/// malformed option is reported **without** spawning a process the caller did not ask for
+/// — the same order the C uses, where `erts_parse_spawn_opts` walks the whole list first and
+/// `erl_create_process` runs only for a clean one (`erl_process.c:12253-12433`).
 #[derive(Default)]
 struct SpawnOptions {
     /// `link` — link the child to the caller.
@@ -48,6 +51,43 @@ struct SpawnOptions {
     monitor: bool,
     /// `{priority, P}` — the child's scheduling priority.
     priority: Option<Priority>,
+    /// `{min_heap_size, N}` — the child's minimum heap size, in words.
+    min_heap_words: Option<usize>,
+    /// `{min_bin_vheap_size, N}` — the child's minimum binary virtual heap size, in words.
+    min_bin_vheap_words: Option<usize>,
+    /// `{fullsweep_after, N}` — the child's fullsweep cadence, in minor collections.
+    fullsweep_after: Option<u32>,
+    /// `{max_heap_size, Size | Map}` — the child's maximum heap size, in words.
+    max_heap_words: Option<usize>,
+    /// `{message_queue_data, on_heap | off_heap}` — parsed and **accepted** (the oracle
+    /// takes both), but with no representation here: this runtime's message queue is always
+    /// heap-resident, which is the `on_heap` the `message_queue_data` `process_info` item
+    /// reports (`src/native/memory/mod.rs`).
+    message_queue_data: bool,
+}
+
+impl SpawnOptions {
+    /// The heap policy the parsed options select for the child.
+    ///
+    /// [`HeapPolicy::from_spawn_opts`] applies the C's rounding rules to the three rounding
+    /// options — a request below the minimum is replaced by it, anything else is rounded
+    /// through the growth table so the stored value is a fixed point of it
+    /// (`erl_process.c:12321-12360`) — and the process-default `fullsweep_after` when the
+    /// option was absent (the C stores the global `erts_max_gen_gcs`). `max_heap_size` is
+    /// applied on top; `0` is the `HeapPolicy` encoding of the C's `H_MAX_SIZE` ("no upper
+    /// bound").
+    fn policy(&self) -> HeapPolicy {
+        let mut policy = HeapPolicy::from_spawn_opts(
+            self.min_heap_words.unwrap_or(0),
+            self.min_bin_vheap_words.unwrap_or(0),
+            self.fullsweep_after
+                .unwrap_or_else(|| HeapPolicy::default().fullsweep_after),
+        );
+        if let Some(max) = self.max_heap_words {
+            policy.max_heap_words = max;
+        }
+        policy
+    }
 }
 // The process/name/port query entry points (`ports_0`, `processes_0`, `group_leader_0`,
 // `whereis_1`, `register_2`, `unregister_1`) are retained as the documented reference
@@ -121,13 +161,22 @@ impl RuntimeContext<'_> {
     }
 
     /// `erlang:spawn_opt(Fun, Options)`.
+    ///
+    /// Every option is parsed and validated **before** the child exists, so a rejected
+    /// option never leaves a stray process behind, and the parsed heap options are applied
+    /// to the child by being *the policy it is created with* (never patched on afterwards).
     pub(super) fn spawn_opt_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let fun = *args.first().ok_or(BeamError::BadArg)?;
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
         }
         let options = self.spawn_options(*args.get(1).ok_or(BeamError::BadArg)?, 2)?;
-        let child = self.spawn_fun_child(fun, Vec::new())?;
+        let child = self.spawn_fun_child_with_policy(
+            fun,
+            Vec::new(),
+            options.policy(),
+            options.priority,
+        )?;
         self.apply_spawn_options(child, &options)
     }
 
@@ -135,7 +184,13 @@ impl RuntimeContext<'_> {
     pub(super) fn spawn_opt_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let (module, function) = self.export_target(args)?;
         let options = self.spawn_options(*args.get(2).ok_or(BeamError::BadArg)?, 3)?;
-        let child = self.spawn_export_child(&module, &function, Vec::new())?;
+        let child = self.spawn_export_child_with_policy(
+            &module,
+            &function,
+            Vec::new(),
+            options.policy(),
+            options.priority,
+        )?;
         self.apply_spawn_options(child, &options)
     }
 
@@ -144,7 +199,13 @@ impl RuntimeContext<'_> {
         let (module, function) = self.export_target(args)?;
         let call_args = self.argument_list(*args.get(2).ok_or(BeamError::BadArg)?)?;
         let options = self.spawn_options(*args.get(3).ok_or(BeamError::BadArg)?, 4)?;
-        let child = self.spawn_export_child(&module, &function, call_args)?;
+        let child = self.spawn_export_child_with_policy(
+            &module,
+            &function,
+            call_args,
+            options.policy(),
+            options.priority,
+        )?;
         self.apply_spawn_options(child, &options)
     }
 
@@ -172,8 +233,24 @@ impl RuntimeContext<'_> {
     /// a scheduler slice — whose pass owns that table — is refused as a typed capability
     /// gap rather than silently lost (see [`Self::check_spawnable`]).
     fn spawn_fun_child(&mut self, fun: Eterm, args: Vec<Eterm>) -> Result<Eterm> {
+        let policy = self.runtime.default_spawn_policy();
+        self.spawn_fun_child_with_policy(fun, args, policy, None)
+    }
+
+    /// [`Self::spawn_fun_child`] under an explicit heap policy and priority — the
+    /// `spawn_opt` path, where the options *are* the child's policy.
+    fn spawn_fun_child_with_policy(
+        &mut self,
+        fun: Eterm,
+        args: Vec<Eterm>,
+        policy: HeapPolicy,
+        priority: Option<Priority>,
+    ) -> Result<Eterm> {
         self.check_spawnable()?;
-        Ok(self.runtime.spawn_fun_process(fun, args)?.to_eterm())
+        Ok(self
+            .runtime
+            .spawn_fun_process_with_policy(fun, args, policy, priority)?
+            .to_eterm())
     }
 
     /// Spawns an `Module:Function(Args…)` child and answers its pid term.
@@ -187,8 +264,25 @@ impl RuntimeContext<'_> {
         function: &str,
         args: Vec<Eterm>,
     ) -> Result<Eterm> {
+        let policy = self.runtime.default_spawn_policy();
+        self.spawn_export_child_with_policy(module, function, args, policy, None)
+    }
+
+    /// [`Self::spawn_export_child`] under an explicit heap policy and priority — the
+    /// `spawn_opt` path, where the options *are* the child's policy.
+    fn spawn_export_child_with_policy(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: Vec<Eterm>,
+        policy: HeapPolicy,
+        priority: Option<Priority>,
+    ) -> Result<Eterm> {
         self.check_spawnable()?;
-        Ok(self.runtime.spawn_process(module, function, args)?.to_eterm())
+        Ok(self
+            .runtime
+            .spawn_process_with_policy(module, function, args, policy, priority)?
+            .to_eterm())
     }
 
     /// Refuses a spawn made from inside a scheduler slice.
@@ -217,6 +311,13 @@ impl RuntimeContext<'_> {
     /// The parsed `spawn_opt/2,3,4` option list.
     ///
     /// `arity` only names the call in a reported gap.
+    ///
+    /// The walk mirrors `erts_parse_spawn_opts` (`erl_process.c:12253-12433`): a bare
+    /// `link`/`monitor` atom, or a **2-tuple** naming a known option — anything else is the
+    /// reason the oracle itself raises. An option the oracle *rejects* is therefore
+    /// [`BeamError::BadArg`] (the oracle's `badarg`, carrying `badopt` as extended info),
+    /// and the typed capability gap is reserved for an option the oracle **accepts** that
+    /// this runtime genuinely cannot honour (`{scheduler, N}`, `{async_dist, B}`).
     fn spawn_options(&mut self, term: Eterm, arity: u32) -> Result<SpawnOptions> {
         let options = self.argument_list(term)?;
         let mut parsed = SpawnOptions::default();
@@ -225,38 +326,110 @@ impl RuntimeContext<'_> {
                 match name.as_str() {
                     "link" => parsed.link = true,
                     "monitor" => parsed.monitor = true,
-                    // A *named* option the runtime does not honour is reported, never
-                    // silently ignored: the caller asked for a guarantee it would not get.
-                    _ => {
-                        return Err(error::unsupported(&format!(
-                            "erlang:spawn_opt/{arity} option {name}"
-                        )))
-                    }
+                    // Not a `spawn_opt` option atom at all — the oracle's `badarg`.
+                    _ => return Err(BeamError::BadArg),
                 }
                 continue;
             }
-            if terms::tuple_arity(option).is_ok() {
-                match self.atom_name(terms::tuple_element(option, 0)?).as_deref() {
-                    Some("priority") => {
-                        let name = self
-                            .atom_name(terms::tuple_element(option, 1)?)
-                            .ok_or(BeamError::BadArg)?;
-                        parsed.priority =
-                            Some(self.spawn_priority(&name).ok_or(BeamError::BadArg)?);
-                    }
-                    Some(other) => {
-                        return Err(error::unsupported(&format!(
-                            "erlang:spawn_opt/{arity} option {{{other}, _}}"
-                        )))
-                    }
-                    None => return Err(BeamError::BadArg),
-                }
-                continue;
+            // Every option *tuple* is a 2-tuple; the C rejects any other arity (and, with
+            // the same `badarg`, a term that is neither an option atom nor a tuple).
+            match terms::tuple_arity(option) {
+                Ok(2) => {}
+                _ => return Err(BeamError::BadArg),
             }
-            // Junk that is neither an option atom nor an option tuple.
-            return Err(BeamError::BadArg);
+            let key = terms::tuple_element(option, 0)?;
+            let value = terms::tuple_element(option, 1)?;
+            match self.atom_name(key).as_deref() {
+                Some("priority") => {
+                    let name = self.atom_name(value).ok_or(BeamError::BadArg)?;
+                    parsed.priority = Some(self.spawn_priority(&name).ok_or(BeamError::BadArg)?);
+                }
+                Some("min_heap_size") => parsed.min_heap_words = Some(self.spawn_words(value)?),
+                Some("min_bin_vheap_size") => {
+                    parsed.min_bin_vheap_words = Some(self.spawn_words(value)?)
+                }
+                Some("fullsweep_after") => {
+                    // The C stores the value in its `Uint16 max_gen_gcs` field
+                    // (`erl_process.c:12359`), so an out-of-range request is truncated
+                    // exactly as it is there; only a negative value is rejected.
+                    parsed.fullsweep_after = Some(self.spawn_words(value)? as u16 as u32);
+                }
+                Some("max_heap_size") => {
+                    parsed.max_heap_words = Some(self.spawn_max_heap_size(value)?)
+                }
+                Some("message_queue_data") => match self.atom_name(value).as_deref() {
+                    Some("off_heap") | Some("on_heap") => parsed.message_queue_data = true,
+                    _ => return Err(BeamError::BadArg),
+                },
+                // An option the oracle **accepts** and this runtime cannot honour: a
+                // scheduler binding (this runtime is single-threaded) or the async-dist
+                // flag (no distribution send path). Reported, never silently ignored.
+                Some("scheduler") | Some("async_dist") => {
+                    return Err(error::unsupported(&format!(
+                        "erlang:spawn_opt/{arity} option {{{}, _}}",
+                        self.atom_name(key).unwrap_or_default()
+                    )))
+                }
+                // An unknown option tuple, or a tuple whose key is not an atom.
+                Some(_) | None => return Err(BeamError::BadArg),
+            }
         }
         Ok(parsed)
+    }
+
+    /// The non-negative integer `value` is required to be, in words.
+    ///
+    /// The C's `spawn_opt` heap consumers are all `is_small(val)`-guarded and all reject a
+    /// negative value (`erl_process.c:12321-12360`); everything else is the `badarg` the
+    /// oracle raises.
+    fn spawn_words(&self, value: Eterm) -> Result<usize> {
+        if !is_small(value) {
+            return Err(BeamError::BadArg);
+        }
+        let words = signed_value(value);
+        if words < 0 {
+            return Err(BeamError::BadArg);
+        }
+        Ok(words as usize)
+    }
+
+    /// The word bound a `{max_heap_size, …}` option names — `erts_max_heap_size`
+    /// (`erl_gc.c:3825-3873`): a non-negative integer, or a **map** whose `size` entry is
+    /// one.
+    ///
+    /// The map's `kill`/`error_logger`/`include_shared_binaries` entries are validated (the
+    /// C rejects a non-boolean, and with the same `badarg`) but only `size` is stored: this
+    /// runtime carries **one** flag word per emulator (`+hmaxk`/`+hmaxel`/`+hmaxib`), the
+    /// shape `+hmax` already uses, and `process_info(Pid, max_heap_size)` reports it.
+    fn spawn_max_heap_size(&mut self, value: Eterm) -> Result<usize> {
+        if is_small(value) {
+            return self.spawn_words(value);
+        }
+        // The map form: `size` is mandatory. The keys are interned first (interning is a
+        // write to the shared table) so the read-only handle below is the only borrow of it.
+        let size_key = self.atom("size")?;
+        let flag_keys = [
+            self.atom("kill")?,
+            self.atom("error_logger")?,
+            self.atom("include_shared_binaries")?,
+        ];
+        let atoms = self.runtime.code_server.atoms_handle();
+        let size = beam_term::map::map_get(value, size_key, &atoms)
+            .map_err(|_| BeamError::BadArg)?
+            .ok_or(BeamError::BadArg)?;
+        let size = self.spawn_words(size)?;
+        for key in flag_keys {
+            // A flag that is absent is a default; one that is present must be a boolean.
+            if let Some(flag) = beam_term::map::map_get(value, key, &atoms)
+                .map_err(|_| BeamError::BadArg)?
+            {
+                match self.atom_name(flag).as_deref() {
+                    Some("true") | Some("false") => {}
+                    _ => return Err(BeamError::BadArg),
+                }
+            }
+        }
+        Ok(size)
     }
 
     /// The [`Priority`] the `max|high|normal|low` atom `name` names.
@@ -268,14 +441,21 @@ impl RuntimeContext<'_> {
 
     /// Applies the parsed options to the freshly spawned `child` and answers what
     /// `spawn_opt` returns: the bare pid, or `{Pid, Ref}` when `monitor` was asked for.
+    ///
+    /// Only the caller-visible bookkeeping is left here. The **heap options** and the
+    /// **priority** are not applied after the fact: they are the policy (and the priority)
+    /// the child was created with, so the process table never holds a half-configured
+    /// process a BIF or the scheduler could already observe.
     fn apply_spawn_options(&mut self, child_term: Eterm, options: &SpawnOptions) -> Result<Eterm> {
         let child = ProcessId::from_eterm(child_term)?;
         let parent = self.pid();
+        // `{message_queue_data, on_heap | off_heap}` is parsed and accepted, and needs no
+        // application: this runtime's mailbox is always heap-resident, which is exactly the
+        // `on_heap` its `message_queue_data` item reports. The parsed flag is read here so
+        // the accepted option is never left silently unexamined.
+        let _accepted_queue_placement = options.message_queue_data;
         if options.link {
             self.process_table_mut().link(parent, child)?;
-        }
-        if let Some(priority) = options.priority {
-            self.process_table_mut().set_priority(child, priority)?;
         }
         if options.monitor {
             let reference = self
