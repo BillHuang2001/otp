@@ -516,8 +516,10 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 `unsafe { core::mem::zeroed() }` (the const-evaluable all-`None` base; `ErlDrvApi::empty()` is a plain
 `fn` and cannot initialise a `static`) — every pointer field is null-optimized, so the all-zero struct
 **is** the all-`None` table (a test pins that equality). By family:
-- **`mem`** (host-free) — `driver_alloc`/`driver_free`/`driver_realloc`, `driver_alloc_binary`/
-  `driver_realloc_binary`/`driver_free_binary`, `driver_system_info`, `null_func`, `erl_errno_id`,
+- **`mem`** (host-free) — `driver_alloc`/`driver_free`/`driver_realloc`, the driver-binary family
+  (`driver_alloc_binary`/`driver_realloc_binary`/`driver_free_binary` + the refcount trio
+  `driver_binary_get_refc`/`inc_refc`/`dec_refc`) over a **hidden 16-byte per-block refcount prefix**
+  (see Design Decisions), `driver_system_info`, `null_func`, `erl_errno_id`,
   `erl_drv_consume_timeslice`, `erl_drv_monotonic_time`/`erl_drv_time_offset`/
   `erl_drv_convert_time_unit`, `driver_dl_open`/`driver_dl_sym`/`driver_dl_close`/`driver_dl_error`,
   `erl_drv_putenv`/`erl_drv_getenv`, `driver_mk_term_nil` (plus the `driver_term_nil` data symbol).
