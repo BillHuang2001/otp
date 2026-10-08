@@ -45,9 +45,10 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `unsafe` is forbidden in both crates.
 
 ## Status
-- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=723 agree=715
+- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=780 agree=772
   mismatch=0 unsupported=8 skipped=0` (per-contract counts under "Gate coverage" in Notes for Agents).
-  `wire/new_fun_ext_encode` is unclosable by design; the other seven are the `wire_ids` node-identity family.
+  `wire/new_fun_ext_encode` is unclosable by design; the other seven are the five `erlang:statistics/1`
+  counters the runtime does not serve and the two `erlang:monitor/2,3` gap shapes.
 - **`beam_rt` gap signalling is honoured:** cases the runtime cannot run classify as `unsupported`,
   never `mismatch`.
 - **Benchmarks:** current numbers and their measurement caveats live in `bench/RESULTS.md` (its
