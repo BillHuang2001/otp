@@ -62,8 +62,10 @@ This is the frozen public-API shape dependents design against; keep it stable.
 - `beam_process` → `Process`/`ProcessId`, `Scheduler`/run queue/`ProcessRunner`, signals/links/monitors;
   **resume-on-send** (`Process::deliver -> DeliverOutcome` + `ProcessTable::drain_woken` /
   `Scheduler::resume_woken`) wakes a receiver blocked in `receive`.
-- `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface, plus the
-  optional host seams `FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`.
+- `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface, plus
+  **fifteen** optional defaulted host seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/
+  `PortHook`/`DictHook`/`PersistentTerm`/`NifLoader`/`RecordSource`/`LocalNode`/`LocalFunIdentity`/
+  `ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`).
 - `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam).
 - `beam_rt` → the runtime **binary**: boot sequence, CLI flags, `system_info`, and the concrete
   `ExecutionContext` wiring engine + bifs + process — including the `Mailbox` receive seam over the
@@ -140,18 +142,20 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   (`utils.c:2149-2210`).
 
 ## Handoffs (owned by other nodes — NOT yet adopted)
-- **Fun literals materialize but cannot be *called*, and a runtime-made `Local` closure has no ETF
-  image.** `beam_codec` decodes `EXPORT_EXT`/`NEW_FUN_EXT` into carriable terms readable through
-  `fun_kind_term`/`fun_module`/`fun_function`/`fun_arity_term`/`fun_env`, but fun application goes
-  through `beam_engine::ExecutionContext::apply_fun`, whose concrete implementation is `beam_rt`'s
-  (outside this node). `beam_codec` encodes a `Local` (`make_fun3`) fun only when the caller supplies a
-  `FunIdentity` (module / 16-byte `uniq` / old_index / old_uniq / creator) via
-  `Encoder::with_fun_identity`; without it the encode returns the typed `error::unsupported_local_fun`
-  (the inlined descriptor carries no module/MD5). The remaining owner is `beam_rt`, which must supply the
-  identity from the running module.
+- **Fun literals materialize and are callable; a compiled-module `Local` closure's ETF image is
+  wired.** `beam_codec` decodes `EXPORT_EXT`/`NEW_FUN_EXT` into carriable terms readable through
+  `fun_kind_term`/`fun_module`/`fun_function`/`fun_arity_term`/`fun_env`; fun application is
+  `beam_engine::ExecutionContext::apply_fun`, implemented by `beam_rt` (`context::FunBridge`).
+  `beam_codec` encodes a `Local` (`make_fun3`) fun only when the caller supplies a `FunIdentity`
+  (module / 16-byte `uniq` / old_index / old_uniq / creator) via `Encoder::with_fun_identity`; without
+  it the encode returns the typed `error::unsupported_local_fun` (the inlined descriptor carries no
+  module/MD5). `beam_rt` installs the `beam_bifs` `LocalFunIdentity` seam, so a **compiled module's**
+  local fun encodes byte-faithfully; only the `-eval` `erl_eval` template closure stays unclosable
+  (see Known Structural Debt).
 - `beam_codec`: HAMT (>32-key) maps encode via `beam_term::map::map_pairs_storage_order` (byte-identical
-  to the oracle). Only its private `write_large_flatmap` (an oversized *flat*-map writer with no LCA producer,
-  since `map::write_map` switches to a HAMT past 32 pairs) and the `binary.rs` shim stay crate-local.
+  to the oracle) and `src/term/{binary,record}.rs` are thin forwarders over `beam_term`. Only its private
+  `write_large_flatmap` (an oversized *flat*-map writer with no LCA producer, since `map::write_map`
+  switches to a HAMT past 32 pairs) stays crate-local.
 - `beam_engine` / `beam_bifs`: `maps:*` on large maps via `map::{map_get,map_size,map_pairs,map_put,map_remove}`.
 - `beam_bifs`: its `ets:info/1` bridge (`src/ets.rs`) emits the oracle's full 15-field order
   (hand-reproduced from public `beam_ets::TableInfo` fields — `TableInfo::entries` needs `&mut AtomTable`,
@@ -189,32 +193,31 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 ## Routing Table
 - `beam_common/` → foundation: `BeamError`/`Result`, version constants, config/feature flags, logging, `unsafe` convention (frozen, Stage 0)
 - `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc`, `fun` (local/export/imported fun interior) (frozen, Stage 0)
-- `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary)
+- `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary); `tests/` (the allocator integration suite)
 - `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs; the **working host API** (`nif/enif.rs` — the `enif_*` function implementations over the `NifHost` seam), the **dynamic loader** (`nif/loader.rs` — `dlopen`/`dlsym` of a NIF shared object + `ErlNifEntry` validation + `NifLibrary::call`), and `nif/host.rs` (`NifHost`/`NifEnv`)
 - `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
-- `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` + `Mailbox` (receive/message) seams, the block/suspend outcome
+- `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` + `Mailbox` (receive/message) seams, the block/suspend outcome; companion docs `TEST_NOTES.md` (measurement discipline) and `HANDOFF_bs_init_writable.md`
 - `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4); copies fun blocks by the `beam_term::fun` descriptor layout
 - `beam_message/` → copy engine (`copy_struct`) + messaging (`Message`/`Queue` + the `QueueCursor` scan position)
-- `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`)
-- `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the host seams (`FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`/`DictHook`)
-- `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag): `set` defaults to a CHAMP interior, `ordered_set` to a K-ary B+-tree, `bag`/`duplicate_bag` to a chained bucket index
+- `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`); sub-nodes `src/smp/` and `tests/`
+- `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the fifteen host seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/`PortHook`/`DictHook`/`PersistentTerm`/`NifLoader`/`RecordSource`/`LocalNode`/`LocalFunIdentity`/`ModuleInfo`/`ProcessHook`/`MemoryHook`/`RuntimeHooks`)
+- `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag): `set` defaults to a CHAMP interior, `ordered_set` to a K-ary B+-tree, `bag`/`duplicate_bag` to a chained bucket index; `ETS_SURFACE.md` (the ETS API-surface reference)
 - `beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, port-task scheduling, built-in drivers (`fd`/`efile` + the OS-child `spawn` driver)
-- `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), the port subsystem (drives `beam_io::PortRegistry` + delivers port data to the owning process), and the `PortHook` provider
+- `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), the port subsystem (drives `beam_io::PortRegistry` + delivers port data to the owning process), and the `PortHook` provider; sub-nodes `src/boot/`, `src/cli/`, `src/info/`, `src/native/`, `src/port/`
 - `../tools/differential/` → differential-test harness vs real ERTS (sibling — read-only, escalate writes to `..`)
 - `../tools/bench/` → benchmark driver for external targets + system-ERTS baseline (sibling — read-only, escalate writes to `..`)
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
 
 ## Status
 - **All 15 crates architected, implemented and tested.** `scripts/cargo.sh build --manifest-path
-  erts_rust/Cargo.toml --workspace --all-targets` is warning-free (one pre-existing `unused import:
-  Mailbox` warning in `beam_rt`'s `tests/trace.rs` is being fixed separately). `scripts/cargo.sh test
-  --manifest-path erts_rust/Cargo.toml --workspace --no-fail-fast` reports **5762 passed / 3 failed /
-  1 ignored**; the 3 failures are confined to `beam_rt` and stem from `beam_bifs` registering the full
-  declared `bif.tab` surface (556 keys; registry 637), which shadows `beam_rt`'s curated
-  `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list — a `beam_rt` fix is in flight and 0 failures are expected
-  once it lands.
+  erts_rust/Cargo.toml --workspace --all-targets` is warning-free and `scripts/cargo.sh test
+  --manifest-path erts_rust/Cargo.toml --workspace --no-fail-fast` is green (**~6180 passed / 0
+  failed**; the exact count moves as tests are added — re-run the command for the current figure).
+  **CI exists:** `.github/workflows/erts_rust.yml` (triggered on any `erts_rust/**` change or PR)
+  builds the workspace, runs this test command, runs a non-blocking clippy, and runs the differential
+  gate — whose exit-3 "capability gaps, no mismatch" verdict is treated as non-blocking.
 - **Real-module LOAD coverage is complete for the ENTIRE installed OTP:** `beam_loader`'s
   `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` discover the lib root generically
   (`code:lib_dir()`, no hardcoded app names) and assert that **all 1366 `.beam` across 34 application
@@ -241,9 +244,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
   `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
-  `summary: total=667 agree=666 mismatch=0 unsupported=1 skipped=0`, and no case disagrees. Per contract
-  A.1 154/154 · A.2 176/176 · A.3 34/34 · A.4 64/64 · A.5 63/64 (+1 unsupported) · A.6 37/37 ·
-  A.7 246/246 · A.8 49/49 · A.9 52/52. The one `unsupported` is `wire/new_fun_ext_encode` (A.5): its
+  `summary: total=723 agree=722 mismatch=0 unsupported=1 skipped=0` (`../tools/differential/gate.sh` →
+  exit 3); re-run `gate.sh` for the live per-contract split. The one `unsupported` is
+  `wire/new_fun_ext_encode` (A.5): its
   `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`
   slot) whose single free variable is erl_eval's internal `Info` tuple holding the clause in `erl_parse`
   abstract format — an identity/env no fun-identity seam can derive faithfully (only a full
@@ -259,7 +262,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   (term ordering, structural hash, `size_object`); `thing` — heap-agnostic off-heap term
   materialization (float/big/flatmap/external pid/port/ref), which `beam_codec::term` forwards
   to (de-duplication). Writers take a caller-provided `*mut Eterm`; allocation stays in `beam_alloc`.
-- **Stage-1 execution tiers shipped (`beam_engine`).** The typed-IR seam carries a direct-threaded interpreter plus a real native baseline tier (`src/jit/`): `src/jit/baseline/` lowers each IR basic block to an x86-64 `extern "C"` function (block ABI returns `(func<<32|pc)`, `HALT=-1`, `ERROR=-2`; `rbx` = x-register array base) with a driver loop that deopts to the interpreter's own `step_instruction` for anything it does not inline. A cross-run compiled-block cache (`src/jit/cache.rs`) and a block linker (`src/jit/baseline/emit/link.rs`) reuse and chain compiled blocks, and a local tail call (`call_last`/`call_only`) is linked natively. `tests/jit_real_module.rs` is the real-`erlc`-module tier-equivalence gate — **736/736** oracle-checked comparisons agree with zero divergences. An optional Cranelift hot tier (`src/jit/cranelift/`) sits behind the default-OFF `jit-cranelift` feature. Correctness (interpreter-identical results) is the deliverable; the tiers are not on `beam_rt`'s execution path yet (the tier entries are non-blocking, so adoption needs an outcome-aware `RunOutcome::Wait` entry) and deeper inlining is later work.
+- **Stage-1 execution tiers shipped (`beam_engine`).** The typed-IR seam carries a direct-threaded interpreter plus a real native baseline tier (`src/jit/`): `src/jit/baseline/` lowers each IR basic block to an x86-64 `extern "C"` function (block ABI returns `(func<<32|pc)`, `HALT=-1`, `ERROR=-2`; `rbx` = x-register array base) with a driver loop that deopts to the interpreter's own `step_instruction` for anything it does not inline. A cross-run compiled-block cache (`src/jit/cache.rs`) and a block linker (`src/jit/baseline/emit/link.rs`) reuse and chain compiled blocks, and a local tail call (`call_last`/`call_only`) is linked natively. `tests/jit_real_module.rs` is the real-`erlc`-module tier-equivalence gate — **736/736** oracle-checked comparisons agree with zero divergences. An optional Cranelift hot tier (`src/jit/cranelift/`) sits behind the default-OFF `jit-cranelift` feature. Correctness (interpreter-identical results) is the deliverable; the tiers are not on `beam_rt`'s execution path yet — the engine's outcome-aware `run_export_outcome_with_tier`/`run_label_outcome_with_tier` entries are landed, so `beam_rt` adopts a tier by routing a process through them (`beam_engine/CONTEXT.md` Handoff #9) — and deeper inlining is later work.
 - **BIF surface complete (`beam_bifs`).** The registry covers the whole declared `bif.tab` surface —
   **556 declared BIFs (registry 637 keys = 556 declared + 81 non-table keys: 79 stdlib fast paths +
   `erlang:memory/0,1`)** — via two defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`).
@@ -278,8 +281,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   (`src/trace.rs`/`src/seq_trace.rs`/`src/crash_dump.rs`/`src/perf_map.rs` — only `send` trace events are
   emitted and the perf map is empty because no code ranges cross the crate boundary yet); inbound
   distribution is gated by `allow_inbound_delivery` (default OFF); `DEFAULT_HEAP_WORDS = 1<<24`, with
-  heap exhaustion translated to `error:system_limit`; the known hot-path defect is
-  `RuntimeContext::call_registered` deep-cloning the shared `AtomTable` on every registered BIF call.
+  heap exhaustion translated to `error:system_limit`. The registered-BIF dispatch hot path is
+  allocation-free (the shared `AtomTable` is only committed when a call actually interns a name);
+  dispatch/throughput figures and their measurement caveats live in `../tools/bench/RESULTS.md`.
 - **Dependency edges beyond the scaffold:** `beam_message → beam_gc`, `beam_dist → beam_alloc`,
   **`beam_engine → beam_alloc`** (wave 0 → wave 4, directionally legal — for the off-heap refc binaries
   `bs_init_writable`/`append` hold); `RefCount` moved down into `beam_alloc` (the LCA) and re-exported
@@ -343,33 +347,42 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   stable Rust cannot define a C-variadic `fn` (rust-lang/rust#44930); the `_from_array` variants cover
   tuple/list building. `term_to_binary`/`binary_to_term`/`make_ref` remain defaulted `None` in `NifHostImpl`.
 
+## Contract A.9 (build/bootstrapping) — status
+A.9 is the shallowest contract: its only differential coverage is boot/version **observability** — there
+is **no self-hosted build** (the Rust runtime does not compile and run itself).
+- **Boot path stopping point.** `beam_rt`'s boot (`src/boot/`, the boot node: `beam_rt/src/boot/CONTEXT.md`)
+  reads and executes the real `bootstrap/bin/start.boot` (OTP 30 / erts-17.1, 22 instructions). It runs
+  instructions 0–15 (every `primLoad` batch and the three `kernelProcess` directives, each driven to its
+  process's own registration) and **stops at instruction 16**, `{apply,{application,load,[{application,
+  stdlib,…}]}}`, with the typed `exit noproc` — no live registered `application_controller`.
+- **Outstanding blocker chain** (owner per link):
+  1. `application_controller:init/1` dies at `ets:new(ac_tab, [set,public,named_table,{read_concurrency,true}])`
+     — `beam_bifs`'s `src/ets.rs::parse_options` rejects every 2-tuple option except `{keypos,N}` ⇒ `badarg`
+     (**owner: `beam_bifs`**).
+  2. `add_env/2`'s `ets:insert(ac_tab, …)` fails because `beam_bifs`'s table-taking BIFs decode the table
+     argument with `ref_thing_id` only, so an **atom** `named_table` name is unreachable, and `ets:new`
+     returns a ref where the oracle returns the name atom (**owner: `beam_bifs`**).
+  3. instruction 13's `logger` cannot start: `logger_server:start_link/0` → `gen_server:start_link` →
+     `proc_lib:sync_start/2`'s `receive` sits in a **cross-module callee**, and the engine's synchronous
+     `Instr::CallExt` arm folds the callee's suspend into `beam_engine::blocked()` instead of suspending the
+     process (**owner: `beam_engine`**; seam pinned by `beam_rt/tests/proc_lib_start.rs`).
+  The boot-script reader/executor itself is complete; instructions 17–21 are unreached (instruction 12's
+  `heart` is benign — `heart:start/0` returns `ignore`).
+
 ## Known Structural Debt (candidates for the next pass)
-- The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
-  `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
-  oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
+- The map/bitstring/refc handoffs above are only partly adopted: `beam_codec` forwards to `beam_term`
+  (`src/term/{binary,record}.rs`) but keeps a crate-local oversized-*flat*-map writer, and no process
+  yet registers refc binaries in `beam_gc::OffHeap` (liveness is the caller's predicate).
 - `wire/new_fun_ext_encode` remains `unsupported` *in the gate*: its `-eval` lambda is an `erl_eval`
   template closure whose identity/`num_free`/`env` are erl_eval internals no seam can derive faithfully.
   `beam_rt` installs `LocalFunIdentity`, so a **compiled module's** local fun encodes byte-exactly.
-- `beam_message` `src/layout.rs` sizes/walks fun blocks with the legacy C `ERL_FUN_SIZE` convention (2-word
-  prefix, env at offset 2) instead of the frozen `beam_term::fun` layout (env at `1 + desc_words(kind)`), so
-  `copy_struct` mis-sizes/mis-fixes a fun crossing a copy boundary (e.g. a `make_fun3` closure in a message);
-  untested. Fix: route funs through `beam_term::fun::{fun_env_offset_header, fun_block_words_header}`.
-- `open_port` residual divergences (a nonexistent path raises `error:enoent`, matching the oracle):
-  `{spawn_executable,<dir>}` ⇒ `eacces` vs oracle `ok`; empty `{spawn,""}`/`{spawn_executable,""}` ⇒ `enoent`
-  vs oracle `badarg`.
-- Repo-root owned (outside this node): owed `../../CHANGE.md` entries for the `beam_term` foundation
-  extensions (`map`/`bitstring`/`refc`), the `RefCount` move into `beam_alloc` + the `RefcBinary`
-  off-heap seam, `beam_gc::OffHeap` owning refc binaries, the `beam_abi` frozen-header seam work, the
-  fun/export literal work (`beam_term::fun` layout; `beam_codec` `EXPORT_EXT`/`NEW_FUN_EXT`
-  decode+encode with the `size`-field and env-order rules and the `Local`-fun encode gap; `beam_gc` fun
-  block sizing), the receive/message execution path (`beam_engine` receive family +
-  `Mailbox`/block-outcome seams; `beam_message::QueueCursor`; `beam_process` resume-on-send; the
-  `beam_rt` executor runner + `PortHook` provider), the runtime parity work
-  (`func_info`→`function_clause`, `DictHook`/process dictionary, `{minor_version}` adoption, port
-  parity, sorted `-eval` map literals), and the NIF host layer (the `enif_*` implementations, the
-  `dlopen`-based loader, the `NifHost` seam, the `beam_abi → beam_alloc` dependency edge, and the
-  `-Wl,--export-dynamic` link-arg mechanism that lets a NIF `.so` resolve `enif_*` against the host
-  process).
+- Repo-root owned (outside this node): `../../CHANGE.md` documents most of the above (Milestones 1–3
+  cover the frozen term layout, `copy_struct`, the fun/export literal layout + the `beam_message` fun
+  sizing, the receive/message execution path, the NIF/driver symbol tables, and the `AtomTable`-clone
+  fix). Entries still owed there by the repo root: the `beam_term` `map`/`bitstring`/`refc` foundation,
+  the `RefCount` move into `beam_alloc` + the `RefcBinary` off-heap seam + `beam_gc::OffHeap` owning
+  refc binaries, and the runtime parity work (`func_info`→`function_clause`, the `DictHook` process
+  dictionary, the `{minor_version}` `term_to_binary/2` adoption, sorted `-eval` map literals).
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`
@@ -404,7 +417,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   the port paths (`driver/open_port_*`, `port_info`, `port_command`). The two remaining shallow contracts
   are A.5 (the `wire` group covers the ETF codec only — a live handshake / `DOP_*` loopback needs two
   connected nodes and is not expressible through a single CLI process) and A.9 (boot/version
-  observability only — no self-hosted build).
+  observability only — see the A.9 status above).
 
 ## See Also
 - `../CONTEXT.md` → workspace root: the binding cross-crate contracts and routing table.

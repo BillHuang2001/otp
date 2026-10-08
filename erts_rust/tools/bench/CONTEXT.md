@@ -88,13 +88,13 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 ### Built-in workloads
 | id | category | target repo / tool | today | skip reason(s) |
 |---|---|---|---|---|
-| `baseline` | startup | oracle `erl` | **runs** (sys+rust) | — (both runtimes report `erlang:memory(total)`; a capability gap still degrades, see below) |
+| `baseline` | startup | oracle `erl` | **runs** (sys+rust) | `runtime-unsupported` (both runtimes report `erlang:memory(total)`; a capability gap still degrades, see below) |
 | `erlc_compiler` | compiler | `erlc` over OTP stdlib **+** Elixir `lib/elixir/src` `.erl` sources | **runs** (quick+full) | `erlc-absent`, `corpus-missing` |
 | `elixir_compiler` | compiler | system `elixirc` over a staged `.ex` corpus from the Elixir checkout | **runs** (quick+full) | `elixirc-absent`, `corpus-missing`, `repo-missing` |
-| `plb` | compute | `/home/bill/Source/Programming-Language-Benchmarks` (`dotnet` driver) | skipped / `failed` | `dotnet-absent`, `repo-missing`, `plb-tool-failed`, `plb-no-results` |
+| `plb` | compute | `/home/bill/Source/Programming-Language-Benchmarks` (`dotnet` driver) | skipped(dotnet-absent) / failed(plb-tool-failed) | `dotnet-absent`, `repo-missing`, `plb-tool-failed`, `plb-no-results` |
 | `cowboy` | io | `/home/bill/Source/cowboy` hello_world built in a scratch copy, driven by the in-process loader | **runs** | `repo-missing`, `make-absent`, `deps-unavailable` |
 | `khepri` | gc | `/home/bill/Source/khepri` (`rebar3 eunit`, in a scratch copy) | **runs** (with `rebar3` on `PATH`) | `rebar3-absent`, `repo-missing` |
-| `emqx` | messaging | `/home/bill/Source/emqx` (`rebar3 compile`, in a scratch copy) | skipped | `rebar3-absent`, `not-a-rebar3-project`, `repo-missing` |
+| `emqx` | messaging | `/home/bill/Source/emqx` (`rebar3 compile`, in a scratch copy) | skipped(not-a-rebar3-project) | `rebar3-absent`, `not-a-rebar3-project`, `repo-missing` |
 | `slice` | compute | committed `slice.beam` fixture + 6 `erlc`-compiled stdlib wrappers, run under **each scheduled runtime** | **runs** (sys+rust) | `erlc-absent`, `fixture-missing`, `runtime-unsupported` |
 | `foreign` | compute | **real Cowboy + EMQX modules** (`cowboy_bstr.erl`, `emqx_base62.erl`) compiled with the system `erlc`, run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `sources-missing`, `runtime-unsupported` |
 
@@ -105,7 +105,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   (never conflated with the OS `peak_memory_bytes`, which is the compute runs' RSS). `--quick` uses 10
   startup runs / 5 compute runs; `--full` 50 / 5. **Both runtimes produce all three metrics:**
   `beam_rt` implements `erlang:memory/0,1` through the `MemoryHook` seam, so the rust memory probe
-  records a real figure (e.g. 801 294 B). **Capability gaps degrade, they never abort:** if a runtime does not implement
+  records a real figure (see `RESULTS.md` §3.2). **Capability gaps degrade, they never abort:** if a runtime does not implement
   a probed BIF, the probe records **no** metric plus an explicit `… : not-run (unsupported: …)` note,
   while the compute loop, the startup summary and every other metric are still produced. A genuine
   (non-capability-gap) probe failure is surfaced verbatim, never fabricated. Note: the loop is
@@ -120,7 +120,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   peak memory. Tries one batch `elixirc`; on failure/short-output falls back to per-file compilation
   (robust to the checkout↔installed version skew) and notes which mode ran.
 - `cowboy`: `copy_tree`s the checkout into a `ScratchDir`, `make`s `examples/hello_world` (erlang.mk
-  git-fetches cowlib/ranch), starts `_rel/hello_world_example/bin/hello_world_example foreground` on port
+  git-fetches cowlib/ranch; a scratch-copy relx build), starts `_rel/hello_world_example/bin/hello_world_example foreground` on port
   8080, drives it with `http_load::drive` (in-process keep-alive HTTP/1.1), records build/latency/throughput
   and the server's peak RSS, then stops it. Build/dep failure ⇒ `skipped(deps-unavailable)`; compile error ⇒ `failed`.
 - `plb`/`khepri`/`emqx`: staged into a `ScratchDir` and built/run there (`dotnet` / `rebar3`); tooling
@@ -153,7 +153,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   code. Sources are read-only; all `.beam` output lives in the self-cleaning scratch dir.
   Measurement is **startup-corrected per call**: each case declares a per-runtime loop count `N`
   (calibrated so a run costs a few hundred ms on Rust and gives an oracle marginal well above the
-  ~±30 ms startup noise) and the program is run twice per sample — at `N` and at `0` iterations — giving
+  startup noise) and the program is run twice per sample — at `N` and at `0` iterations — giving
   `case_<name>_wall_ms`, `case_<name>_startup_ms`, `case_<name>_peak_rss_bytes`, and the throughput
   metric `case_<name>_ns_per_call = (mean(wall@N) − mean(wall@0)) / N × 1e6`, emitted only when positive
   (else an honest note). Every runtime's stdout must equal `N × per_call` (the driver's accumulator is
@@ -263,21 +263,29 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - **`$BENCH_TRY_NIX`** (opt-in, default off): when set, `khepri`/`emqx`/`plb` may resolve `rebar3`/`dotnet`
   via `nix shell nixpkgs#<attr> --command …` instead of a PATH lookup. Without it, PATH-only ⇒ honest
   `skipped(<tool>-absent)` unless the store `bin` dir is on `PATH` (see the toolchain bullet above).
-- **Cowboy** builds a relx release in the scratch copy (~40–65 s, network fetch of cowlib+ranch); the release
+- **Cowboy** builds a relx release in the scratch copy (network fetch of cowlib+ranch); the release
   start script `foreground` **`exec`s** `erlexec`, so killing the spawned child stops the VM and its pid
   is the Erlang VM (so `VmHWM` polling works).
-- **The benchmark host is shared and usually loaded.** `/proc/loadavg` on this host has ranged from ~4.8
-  (the quiet primary full run) to ~37 (the focused `xrun` set). Consequence: absolute latencies/throughputs
-  move several-fold with load, because the oracle `erl` (a 14-scheduler SMP VM) loses much more to CPU
-  contention than `beam_rt` — the rust `baseline` startup p50 alone spans 148–386 ms across the four
-  recorded runs, while the sys side stays within ~1.1×. Prefer the **quiet** primary run and ratios over
-  absolute values, always record `/proc/loadavg` with the numbers, and never quote a single contended run
-  as a constant.
+- **The benchmark host is shared and usually loaded.** Absolute latencies/throughputs move several-fold
+  with load, because the oracle `erl` (a 14-scheduler SMP VM) loses much more to CPU contention than
+  `beam_rt`. Prefer the **quiet** primary run and ratios over absolute values, always record
+  `/proc/loadavg` with the numbers, and never quote a single contended run as a constant (the recorded
+  loads are in `RESULTS.md` §1/§6).
 - **Elixir**: the in-repo checkout (`/home/bill/Source/elixir`, `1.21.0-dev`) is unbuilt; the workload
   measures the installed system `elixirc` (1.20.4). Compiling the checkout's stdlib in one `elixirc` batch
   fails on version skew, hence the per-file fallback.
 - The external-repo CONTEXT.md files (added read-only, no source changes) record each repo's build/bench
   entry points; consult them via `--repo` overrides.
+- **No self-hosted build exists in this crate.** Contract **A.9** is *declared* on `erlc_compiler`
+  (`erlc_compiler.rs` `contracts() -> &["A.9"]`) and `elixir_compiler` (`["A.1","A.9"]`), but **both run
+  only the system oracle** (`runtimes() -> Runtimes::SysOnly`): `erlc_compiler` shells out to the system
+  `erlc` (`erlc_program()`/`proc::which("erlc")`), `elixir_compiler` to the installed `elixirc`. Nothing
+  in the driver runs `compile:file/*`, `erlc`, `rebar3`, or any compiler **under `beam_rt`** — so the
+  crate exercises no compiler *under the Rust runtime* and no genuine self-hosted build. (The
+  `erlc_compiler.rs` module doc line "wall time for both runtimes (oracle and `beam_rt`)" is stale/wrong
+  w.r.t. the `SysOnly` gate.) Genuine end-to-end `beam_rt` execution is confined to `baseline`, `slice`,
+  and `foreign`; the full target apps (Cowboy release, EMQX, Khepri, Elixir) are all `SysOnly` and report
+  `skipped(runtime-unsupported)` under `rust`.
 - `out/` is gitignored by `../../.gitignore` (`/tools/bench/out/`); the standard artifact is
   `out/target-bench.json` (via `--out-file`). Durable, reviewable results go to the **tracked**
   `results/` directory (see `RESULTS.md`), which is for committed milestone numbers only — scratch
@@ -335,11 +343,10 @@ erts_rust/target/release/bench compare erts_rust/tools/bench/out/xrun-full.json 
 report shows a genuine sys-vs-rust row only for `baseline`, `slice`, and `foreign`. Read the numbers as
 *reproducible on this host*, not milestone results (single host, finite sample counts).
 
-> **Always measure on a quiet host.** The benchmark host is shared: `/proc/loadavg` on this host ranged
-> from **4.77 → 11.59** during the quiet primary run up to **~22–37** during the focused `xrun` set, and
-> the absolute latencies move several-fold between them (the rust `baseline` startup p50 alone spans
-> 148–386 ms). The quiet primary run is the headline; the `xrun` runs are the error bar. Check
-> `/proc/loadavg` before and after a run and record it in `RESULTS.md`.
+> **Always measure on a quiet host.** The benchmark host is shared and the absolute latencies move
+> several-fold with its load: the quiet primary run is the headline and the contended `xrun` runs are the
+> error bar. Check `/proc/loadavg` before and after a run and record it in `RESULTS.md` (which pins the
+> observed loads).
 
 **Skip reasons, re-verified on this host (2026):**
 - `plb` → `skipped(dotnet-absent)` with a bare `PATH`; **`failed(plb-tool-failed)`** once a `dotnet` is on
@@ -362,40 +369,26 @@ cross-runtime Rust coverage cannot silently disappear. `foreign.rs`'s unit tests
 (sources present, calibrated `N`, `N_sys > N_rust`), the per-side argv, and the startup-cancelling
 per-call math.
 
-## Measured — the current verification run
+## Measured — where the numbers live
 
-The current numbers live in **`RESULTS.md`** (one table per workload category) and are archived as
-raw harness JSON under **`results/`** as `m4-*`: `m4-bench-full-runtimes-all.json` = the **primary full
-run**; `m4-bench-xrun-baseline-slice-foreign.json` (+ `-run2`, `-run3`) = the **focused cross-runtime
-set**; `m4-bench-full-compilers-sys.json` (+ `-run2`), `m4-bench-full-cowboy-sys.json`,
-`m4-bench-full-khepri-emqx.json` = the focused sys-only runs; `m4-bench-quick-plb-net9-attempt.json` = the
-PLB attempt; plus three `bench compare` diffs. `RESULTS.md` also carries the full environment record, the
-exact commands, the `/proc/loadavg` record, the stability bounds and a "what these numbers do and do not
-mean" section.
+**`RESULTS.md` is the authoritative source for every measured number** (one table per workload category,
+the environment record, the exact reproduction commands, the `/proc/loadavg` record, the stability bounds
+and a "what these numbers do and do not mean" section).
+The raw harness JSON behind it is committed under `results/` as `m4-*`: the **primary full run**
+(`m4-bench-full-runtimes-all.json`), the three focused cross-runtime runs, the compiler/cowboy/khepri
+sys-only runs, the PLB attempt, and the three `bench compare` diffs.
+This file deliberately restates none of those numbers — read them there, and regenerate with the Runbook
+above rather than quoting a stale copy.
 
-Reference host: NixOS 26.11, `x86_64`, 14 CPUs (Intel Core Ultra 7 356H), 62.3 GiB RAM;
-oracle = system `erl` **OTP 29.1.1 / erts-17.1**, rust = `erts_rust/target/release/beam_rt`
-(`otp_release` = `30`) — both resolve and pass the self-check. `elixirc` = Elixir 1.20.4;
-`rebar3` = 3.27.1 and `dotnet` = 9.0.318 (both built in the Nix store, reached via a `PATH` prefix);
-`$HOME` read-only. `--full` sample counts: `baseline` startup n=50 / compute n=5; `slice` n=25 per case;
-`foreign` n=10 per case; `cowboy` 16 connections × 5 s (20 000 latency samples).
-
-| workload | runtime | headline (quiet primary run) |
-|---|---|---|
-| `baseline` | sys | startup p50 **117.73 ms** / p99 137.64 ms; compute loop 198.06 ms p50 ⇒ **4.89 M ops/s**; `erlang:memory(total)` 36.2 MB; peak RSS 128.6 MiB |
-| `baseline` | rust | startup p50 **148.12 ms** / p99 169.79 ms (**1.26×** sys); compute loop p50 197.03 ms ⇒ **5.04 M ops/s** (≈parity); `erlang:memory(total)` **801 294 B** (real, via the `MemoryHook` seam); peak RSS 33.4 MiB |
-| `erlc_compiler` | sys | **9.53 files/s** (7 385 loc/s), 60 files, peak RSS 128.2 MiB |
-| `elixir_compiler` | sys | **4.86 files/s** (2 442 loc/s), 105 attempted → 223 `.beam` via the per-file fallback, peak RSS 195.5 MiB |
-| `cowboy` | sys | **224 103 req/s**, latency p50 0.061 ms / p99 0.175 ms, 0 errors in 1 120 867 req, peak RSS 165.7 MiB |
-| `khepri` | sys | `rebar3 eunit` **76.5 s**, peak RSS 336.1 MiB (store `rebar3` on `PATH`) |
-| `slice` | sys vs rust | 9/9 identical stdout; wall **~parity** (1.10–1.26×) because every case is startup-dominated; peak RSS 68.7 vs **37.3 MiB** |
-| `foreign` | sys vs rust | per-call cost **54×–72×** higher under rust; startup ~1.06–1.21×; peak RSS 68.1 vs **104.7 MiB** (rust scales with `N`; see the Known Issue below) |
-| `plb`, `emqx` | sys | not run — verified reasons in `RESULTS.md` §5 |
-
-**The execution-bound result is the `foreign` per-call gap, not the `slice` wall times**: `slice` cases
-are single-call programs whose wall time is dominated by the fixed startup cost below.
-Each runtime's `foreign` peak RSS is scaled by its own loop count `N`, so `foreign` peak RSS is not a
-like-for-like memory comparison — `slice` is the comparable per-process memory metric.
+Structural facts that are not numbers (and so belong here):
+- `--runtime all` yields a genuine sys-vs-rust row only for the three `Runtimes::Both` workloads
+  (`baseline`, `slice`, `foreign`); every other workload is `SysOnly` (see the table above).
+- `baseline`'s compute loop is dominated by the natively-served `lists:seq/2` + `lists:sum/1`, so its
+  near-parity result reads as the **native floor**, not interpreter throughput.
+- `slice` runs one call per process and `foreign` many calls per process at a per-runtime loop count `N`,
+  so peak RSS is like-for-like only for `slice`.
+- The execution-bound signal is `foreign`'s per-call cost, not `slice`'s wall times (every `slice` case is a
+  single-call program dominated by fixed startup).
 
 > **`ERTS_STDLIB_DIR` note (a real `beam_rt` behavior):** the Rust runtime resolves its system code path
 > by spawning `erl` once per OS process unless `ERTS_STDLIB_DIR` is pre-set, so that spawn is inside the
@@ -405,24 +398,26 @@ like-for-like memory comparison — `slice` is the comparable per-process memory
 
 ## Reading the current sys-vs-rust per-call gap (verified)
 
-The `foreign` per-call gap (**54×–72×**) is a **real runtime cost, not a harness artifact**. The
-startup-cancelled metric `(mean wall@N − mean wall@0)/N` reproduces with a plain shell loop calling
-`beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI re-entry, per-call module reloads and
-per-call GC are all ruled out. It is a `beam_rt` host-context cost: `beam_engine`'s interpreter dispatch
-is itself O(1) and allocation-free per instruction.
+The `foreign` per-call gap (its current value is in `RESULTS.md` §3.4) is a **real runtime cost, not a
+harness artifact**. The startup-cancelled metric `(mean wall@N − mean wall@0)/N` reproduces with a plain
+shell loop calling `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>` — so CLI re-entry, per-call module
+reloads and per-call GC are all ruled out. It is a `beam_rt` host-context cost: `beam_engine`'s interpreter
+dispatch is itself O(1) and allocation-free per instruction, and the runtime-side dispatch costs behind it
+are `beam_rt` measurements owned by `../../crates/beam_rt/CONTEXT.md` (measured via that crate's
+`examples/perf_bif.rs`), not `bench` output.
 
-Consequence for reading results: startup latency is the trustworthy cross-runtime comparison today (and, on `slice`, peak RSS; `foreign` peak RSS is not — see the Known Issue). The four `foreign` rust `ns_per_call` rows — and therefore their `wall_ms` rows —
-are snapshots of this per-call cost; re-run the Runbook commands rather than adjusting the numbers.
+Consequence for reading results: startup latency is the trustworthy cross-runtime comparison today (and, on
+`slice`, peak RSS; `foreign` peak RSS is not — see the Known Issue). The `foreign` rust `ns_per_call` rows — and therefore their `wall_ms` rows — are snapshots of
+this per-call cost; re-run the Runbook commands rather than adjusting the numbers.
 
 ## Known Issue — rust `foreign` peak RSS scales with the loop count `N`
 
 `beam_rt` does not yet drive a garbage collector, so a looping program accumulates garbage in proportion
-to its iteration count. Because the `foreign` rust cases run at large `N` (15 000–25 000) this drives the
-rust per-case `case_<name>_peak_rss_bytes` **above** the sys figures on the same cases
-(rust 78 708 736–109 623 296 B vs sys 69 287 936–69 953 536 B; whole-workload 109 768 704 B vs
-71 446 528 B). Same-`N` memory is unchanged; the row moves with the calibration. `foreign` peak RSS is
+to its iteration count. Because the `foreign` rust cases run at large `N`, this drives the rust per-case
+`case_<name>_peak_rss_bytes` **above** the sys figures on the same cases and the row moves with the
+calibration (same-`N` memory is unchanged; the figures are in `RESULTS.md`). `foreign` peak RSS is
 therefore **not** a like-for-like memory comparison — `slice` (one call per process, `N`=1) is the
-comparable per-process memory metric (rust 18.2–36.9 MiB vs sys 66.0–66.7 MiB).
+comparable per-process memory metric.
 
 ## See Also
 - `RESULTS.md` → the current results summary (one table per workload category, exact reproduction

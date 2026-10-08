@@ -401,8 +401,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   not here; the full gate stays `mismatch=0`. This crate's own tests are **all self-checks**
   (structural `compare::eq`, word-count arithmetic, refcounts) — no test in `src/` or `tests/`
   invokes `erl`/`erlc`.
-- The workspace `cargo test` gate is **local only**: `.github/` contains no `erts_rust`/cargo workflow
-  (only the repo's own C build/test workflows), so these tests never run in CI.
+- The workspace `cargo test` gate **runs in CI**: `.github/workflows/erts_rust.yml` (path-triggered on
+  any `erts_rust/**` change or PR) builds the workspace (`cargo build --workspace --all-targets`) and
+  runs `cargo test --workspace --no-fail-fast`, a non-blocking clippy, and the differential gate
+  (`erts_rust/tools/differential/gate.sh`).
 ## Performance (measured)
 `tests/perf.rs` (dependency-free `std::time::Instant`, `--nocapture`; dev/`opt-level=1` profile,
 20 000 iters, HAMT 5 000). Repro: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message --test perf -- --nocapture`.

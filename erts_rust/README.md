@@ -67,4 +67,14 @@ Reproducible environment:
 nix develop                      # toolchain + mold + erlang/elixir/rebar3 (oracle + targets)
 ```
 
+CI: [`.github/workflows/erts_rust.yml`](../.github/workflows/erts_rust.yml) is path-triggered on
+`erts_rust/**` and builds the workspace, runs the workspace tests, runs a non-blocking clippy, and runs
+the differential gate ([`tools/differential/gate.sh`](./tools/differential/gate.sh)) against an
+Erlang/OTP oracle. Current workspace health and gate numbers live in [`CONTEXT.md`](./CONTEXT.md).
+
 Everything is Apache-2.0, matching upstream OTP. Third-party dependencies are Apache-2.0/MIT.
+
+Every Rust source file carries the OTP Apache-2.0 `%CopyrightBegin%`/`%CopyrightEnd%` header block,
+enforced byte-exactly by [`../scripts/license-header.es`](../scripts/license-header.es)
+(`ERL_TOP="$PWD" escript scripts/license-header.es scan --path erts_rust`). Add it to every new `.rs`
+file — the required text is in [`CONTEXT.md`](./CONTEXT.md) §Constraints.

@@ -78,7 +78,15 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - **Never hand-edit generated artifacts.** `ops.tab`-style transforms and the `bif.tab` surface are
   source data; regenerate, don't patch output.
 - Files target ~1000 lines; split by responsibility before growing past it.
-- Licensing: Apache-2.0 (matches OTP); deps Apache-2.0/MIT only.
+- **Licensing: Apache-2.0** (matches OTP; `license = "Apache-2.0"` in every `Cargo.toml`). Every
+  `*.rs` file under `erts_rust/` carries the OTP `// %CopyrightBegin% … // %CopyrightEnd%`
+  Apache-2.0 header block; the repo scanner enforces it byte-exactly
+  (`ERL_TOP="$PWD" escript scripts/license-header.es scan --path erts_rust`). Add the block to every
+  new Rust source file (`//`-comment prefix, blank lines as bare `//`, one blank line before the
+  code). External deps must be Apache-2.0/MIT only.
+  `scan --path erts_rust` still reports the workspace's *non-`.rs`* files (the `CONTEXT.md` docs, other
+  `.md`, `Cargo.toml`/`Cargo.lock`, `.erl`/`.c` test fixtures, generated `out/`/benchmark results) as
+  header-less; only the `*.rs` sources are in scope for this requirement.
 
 ## Notes for Agents
 - Iterate with `scripts/cargo.sh build|test --manifest-path erts_rust/Cargo.toml --workspace`
@@ -90,52 +98,73 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`
   (it selects `$HOME/.cache/cargo-home`, falling back to `$TMPDIR/cargo-home`), or export
   `CARGO_HOME=/home/bill/.cache/cargo-home` before invoking `cargo`. The cache is shared across worktrees.
+- **CI:** `.github/workflows/erts_rust.yml` is the only CI that touches this workspace (path-triggered;
+  `main.yaml` never builds OTP or Rust together). Every Rust test and the compatibility gate therefore
+  also run there on any `erts_rust/**` change; run them locally too before claiming parity.
 - Do **not** run full external suites on every change — reserve them for milestones.
 - The oracle runtime is the system Erlang (`ERTS_ORACLE` in the flake; `erl` on `PATH`, OTP 29/erts-17.1).
 - Benchmark/test targets are the configured foreign repos: Cowboy, Khepri, EMQX, Elixir,
   Programming-Language-Benchmarks. Investigate them read-only; write through the task's tracked worktrees.
 
 ## Status
-- **Crate tree complete:** all 15 crates + 2 tools are architected (each with its own `CONTEXT.md`),
-  implemented, and tested.
+- **Crate tree complete:** 15 crates under `crates/` + 2 tooling crates under `tools/`, each with its
+  own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
-  --all-targets`; test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace
-  --no-fail-fast`. The `beam_rt` failures once caused by `beam_bifs` registering the FULL declared
-  `bif.tab` surface (556 keys; registry 637) shadowing `beam_rt`'s curated
-  `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list are resolved: `beam_rt::is_known_unimplemented_bif` now
-  intersects the live registry (`beam_rt/src/error.rs`), with drift-guard tests. Re-run the suite to
-  read the current pass count.
-- **No CI runs the Rust workspace or the differential gate.** `.github/` has zero references to
-  `erts_rust`/`cargo`/`differential`; every Rust test and the compatibility gate run only locally
-  (`scripts/cargo.sh`, `tools/differential/gate.sh`). Parity claims therefore rest on manual runs.
+  --all-targets` (warning-free); test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
+  --workspace --no-fail-fast`. The suite is green (~6180 passing / 0 failing).
+- **CI runs the workspace and the gate:** `.github/workflows/erts_rust.yml` (path-triggered on
+  `erts_rust/**` and on the workflow file itself, plus `workflow_dispatch`) installs the pinned
+  toolchain (`rust-toolchain.toml`), then runs `cargo build --workspace --all-targets`,
+  `cargo test --workspace --no-fail-fast`, a **non-blocking** `cargo clippy`, and the differential gate
+  `tools/differential/gate.sh` against an OTP oracle (`erlef/setup-beam`); with no `erl`/`erlc` on
+  `PATH` the gate step warns and skips. `gate.sh`'s exit-code policy: `0` all agreed → pass; `1` a real
+  `mismatch` → fails the job; `2` env/usage error → fails the job; `3` no mismatch but
+  `unsupported`/`skipped` capability gaps remain → **non-blocking** warning. Parity claims are therefore
+  CI-checked, not manual-only.
 - **Vertical slice WORKS:** `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam` (produced by
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
   outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate (`tools/differential`):** per `tools/differential/CONTEXT.md`, `summary: total=780
-  agree=772 mismatch=0 unsupported=8 skipped=0` (`gate.sh` → exit `3`) — per contract A.1 154/154 · A.2
+- **Compatibility gate (`tools/differential`):** per `tools/differential/CONTEXT.md`, `summary: total=794
+  agree=785 mismatch=0 unsupported=9 skipped=0` (`gate.sh` → exit `3`) — per contract A.1 154/154 · A.2
   176/176 · A.3 34/34 · A.4 64/64 · A.5 79 (78 agree + 1 unsupported) · A.6 44/44 · A.7 322 (315 + 7) · A.8
-  64/64 · A.9 52/52. **No case disagrees.** The 8 `unsupported` are honest capability gaps, never
+  64/64 · A.9 66 (65 + 1). **No case disagrees.** The 9 `unsupported` are honest capability gaps, never
   `mismatch`: `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
   `erl_eval`/`erl_scan`/`erl_parse`), the five `erlang:statistics/1` counters the runtime does not serve
-  (`proc_signals/statistics_*_unsupported`), and the two `erlang:monitor/2,3` gap shapes
-  (`proc_signals/monitor_3_tag_option_unsupported`, `proc_signals/monitor_port_unsupported`). (Sibling
-  docs cite older totals; re-run `gate.sh` for the exact current split.)
+  (`proc_signals/statistics_*_unsupported`), the two `erlang:monitor/2,3` gap shapes
+  (`proc_signals/monitor_3_tag_option_unsupported`, `proc_signals/monitor_port_unsupported`), and the
+  A.9 boot seam (`boot/proc_lib_start_link_blocks_the_boot_path`). `gate.sh` is authoritative — re-run it
+  for the live split.
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 637
-  keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through two
-  defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`). Registered-but-unadopted BIFs return a
+  keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through defaulted
+  host seams (`RuntimeHooks::call`, `MemoryHook::memory`, …). Registered-but-unadopted BIFs return a
   typed `unsupported` until a host hook is installed.
-- **Benchmarks:** current numbers and their measurement caveats live in `tools/bench/RESULTS.md` (its
-  Milestone-1 archive is explicitly marked there). The known hot-path defect is `beam_rt`'s
-  `RuntimeContext::call_registered` deep-cloning the shared `AtomTable` on **every** registered BIF
-  call — ~99% of the marginal per-iteration cost of `beam_rt run …`, and the reason per-call costs on
-  real Cowboy/EMQX functions measure 700×–9 000× the oracle. That defect is resolved — the whole-table
-  clone in `beam_rt`'s `call_registered` is now skipped when there is nothing to commit — so the
-  `RESULTS.md` figures predate the fix and need re-measuring.
-- **Honest coverage gaps** (per-crate `Known Issues`): the engine tiers and the Cranelift hot tier
-  (`jit-cranelift`, default-OFF) are not yet on `beam_rt`'s execution path; full match-spec compiler;
-  ETS concurrency; `put_record/6`'s create form; several structured-raise-reason degradations; depth of
-  live distribution interop. All return typed errors, never wrong results.
+- **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
+  in `tools/bench/results/`) — read it there rather than duplicating numbers. Headlines since M1: the
+  registered-BIF dispatch hot path fell from ~10.6 µs to ~116 ns/call and the registry lookup is now
+  allocation-free; the `foreign` per-call gap vs the system runtime is ~54×–72× (was 703×–9891× at M1).
+- **Contract A.9 (build/bootstrapping) — no self-hosted build; boot stops early.** `beam_rt` loads the 22
+  preloaded modules on startup. Its boot-script executor (a public path the CLI does **not** drive)
+  runs `bootstrap/bin/start.boot` instructions 0–15 and stops at instruction 16,
+  `{apply,{application,load,[{application,stdlib,…}]}}`, with a typed `exit noproc` (no live
+  `application_controller`); instructions 17+ are unreached. The outstanding blocker chain, owner per
+  link:
+  1. **`beam_bifs`** — `ets:new/2`'s option grammar rejects every 2-tuple option except `{keypos,N}`
+     (so `application_controller:init/1` dies on `{read_concurrency,true}`), and the table-taking `ets`
+     BIFs decode a table by internal `Ref` only, so a `named_table` name is unreachable.
+  2. **`beam_engine`** — a cross-module callee that blocks in `receive` cannot suspend the process (the
+     synchronous `CallExt` path folds `RunOutcome::Wait` into an error), so `proc_lib:sync_start/2`-class
+     startup fails; the engine also binds one module per run.
+  3. **`beam_rt`** — no live `code_server`/`application_controller`/`logger` process (a runtime-native
+     `code:*`/`init:*` floor stands in).
+  `beam_gc`'s collector is implemented but not driven by `beam_rt` yet. A.9's differential coverage is
+  boot/version observability only. Per-crate detail: `crates/CONTEXT.md` (A.9 status) and
+  `crates/beam_rt/src/boot/CONTEXT.md`.
+- **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
+  default-OFF, not on `beam_rt`'s path — the baseline JIT tier is wired for the first module entry);
+  full match-spec compiler; ETS concurrency; `put_record/6`'s create form; several
+  structured-raise-reason degradations; depth of live distribution interop. All return typed errors,
+  never wrong results.
 
 ## Future workstreams
 - **Stage 2 (compiler):** loop opts → operation fusion → FBIP on the existing BEAM-SSA IR
@@ -158,16 +187,16 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - `crates/beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `crates/beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`) + layout-frozen structs
 - `crates/beam_loader/` → `.beam` file parsing, loader, `ops.tab` transforms, superinstructions
-- `crates/beam_engine/` → typed block IR seam + interpreter + JIT backends (BeamAsm, Cranelift)
+- `crates/beam_engine/` → typed block IR seam + interpreter + JIT backends (BeamAsm baseline, Cranelift); see also `TEST_NOTES.md`, `MEASURED.md`, `HANDOFF_bs_init_writable.md`
 - `crates/beam_gc/` → per-process generational copying GC, MSO sweep, heap sizing (Stage 4)
-- `crates/beam_process/` → processes, scheduler, run queues, thread progress, message queue, signals
+- `crates/beam_process/` → processes, scheduler, run queues, thread progress, message queue, signals; see also `DESIGN_DECISIONS.md`
 - `crates/beam_message/` → copy engine (`copy_struct`) + messaging (send/receive, fragments)
 - `crates/beam_bifs/` → BIF registry (`bif.tab` surface) + implementations
-- `crates/beam_ets/` → ETS tables (set/ordered_set/hash family), B-tree/CHAMP interiors
+- `crates/beam_ets/` → ETS tables (set/ordered_set/hash family), B-tree/CHAMP interiors; see also `ETS_SURFACE.md`
 - `crates/beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, built-in drivers
-- `crates/beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue
+- `crates/beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue; see also `TRACE_AND_PERF.md`, `M1_GAPS.md`
 - `tools/differential/` → differential-test harness vs real ERTS (the compatibility gate)
-- `tools/bench/` → benchmark driver for the external target projects + system-ERTS baseline
+- `tools/bench/` → benchmark driver for the external target projects + system-ERTS baseline; measured numbers in `RESULTS.md`
 
 ## See Also
 - `../CHANGE.md` → log of major structural/data-structure/algorithmic changes.
