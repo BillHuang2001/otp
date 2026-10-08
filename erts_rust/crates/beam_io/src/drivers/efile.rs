@@ -342,13 +342,7 @@ impl EfileDriver {
         // returns a fresh descriptor owned by this driver on success. `O_NONBLOCK`
         // (always set, see `OpenFlags::to_oflags`) matters for FIFOs, whose `open` would
         // otherwise block until a writer appears.
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr().cast(),
-                parsed.flags.to_oflags(),
-                FILE_MODE,
-            )
-        };
+        let fd = unsafe { libc::open(c_path.as_ptr().cast(), parsed.flags.to_oflags(), FILE_MODE) };
         if fd < 0 {
             return Err(error::io(std::io::Error::last_os_error()));
         }
