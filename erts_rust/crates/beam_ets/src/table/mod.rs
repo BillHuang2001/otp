@@ -214,11 +214,14 @@ impl Table {
         ordered_interior: OrderedInterior,
     ) -> Result<Table> {
         let interior = build_interior(opts.kind(), set_interior, ordered_interior);
+        // A creation-time `{heir, Pid, Data}` option (if any) is the table's
+        // initial heir; `ets:setopts/2` replaces it later.
+        let heir = opts.heir();
         Ok(Table {
             id,
             opts,
             owner: None,
-            heir: None,
+            heir,
             store,
             set_interior,
             ordered_interior,
@@ -344,6 +347,7 @@ impl Table {
             compressed: self.opts.is_compressed(),
             write_concurrency: self.opts.write_concurrency(),
             read_concurrency: self.opts.read_concurrency(),
+            decentralized_counters: self.opts.decentralized_counters(),
         }
     }
 

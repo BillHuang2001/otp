@@ -224,6 +224,7 @@ fn table_info_snapshot_includes_owner_and_heir() {
             compressed: false,
             write_concurrency: false,
             read_concurrency: false,
+            decentralized_counters: false,
         }
     );
     // A fresh table has no heir in the structured field.
