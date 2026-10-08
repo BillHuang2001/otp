@@ -78,7 +78,7 @@ Live drivers:
 
 ## Routing Table
 - `common/` → platform-independent drivers: `inet_drv.c` (15879 lines; `inet`/`tcp_inet`/`udp_inet`/`sctp_inet`), `ram_file_drv.c` (534 lines; `ram_file_drv`)
-- `unix/` → unix-specific driver source: `bin_drv.c` (228 lines, legacy, not in `DRV_OBJS` — nothing to debug in the live VM here)
+- `unix/` → unix-specific driver sources (currently none: the three legacy sources that lived here were unbuilt and are deleted)
 - `win32/` → win32-specific driver: `registry_drv.c` (~556 lines; `registry__drv__`), used by `lib/stdlib` `win32reg`
 - `vxworks/` → stale portability leftovers, never compiled; do not invest analysis here
 - `../nifs/` → NIF counterparts and the newer `socket`/`prim_file`/`zlib` implementations (sibling — read-only, escalate writes to `../`)
