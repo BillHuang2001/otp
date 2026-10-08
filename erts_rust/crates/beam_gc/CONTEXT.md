@@ -690,6 +690,9 @@ still reproduces today's collector exactly.
 - `tests/gc_pressure.rs` / `tests/gc_pressure_structures.rs` / `tests/gc_pressure_offheap.rs` → threshold pressure, HAMT promotion, shared/cyclic graphs, dead refc binaries, fun-env refc binaries (through both strategies)
 - `tests/fragments.rs` → fragment→heap copy-in (shared/cross-fragment graphs, off-heap transfer + no leak) and the rootset contract
 - `tests/immix_workloads.rs` → the multi-workload copying-vs-Immix measurement (Design Decisions §Measured)
+- `tests/heap_growth.rs` → sustained-growth (nursery/mature grow, live terms intact), the no-half-forward typing under a too-small cap, and the `ensure_capacity` seam
+- `tests/memory_overhead.rs` → per-object overhead vs the frozen layout + the RSS/word-accounting no-leak plateau
+- `tests/stress_cross_generation.rs` → the mixed-term cross-generation correctness gate (cons/tuples/maps/binaries/refc/MSO/funs/pids) through both strategies
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`/`adjust_after_fullsweep`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
 - `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`) (read-only)
