@@ -570,8 +570,9 @@ impl Table {
   `beam_term::compare::cmp_arith` order, checked for both ordered interiors — never against the live
   oracle), the shared **replace-updates-the-key-term** helper (`check_replace_updates_the_key_term`,
   driven over both ordered interiors with the int-first and float-first orders, then over a 40-key run
-  that forces B+-tree splits above the replaced key), select compile/execute, info. **129 lib unit
-  tests.**
+  that forces B+-tree splits above the replaced key), select compile/execute, info, and the
+  owner-death transition (`owner_died` × {not-owner, no heir, live heir, self-heir, dead heir}).
+  **137 lib unit tests.**
 - **Cross-interior equivalence + the selection defaults** (`src/interior_parity.rs`, `#[cfg(test)]`):
   `champ_is_the_documented_default_set_interior` pins `SetInterior::default() == Champ` and
   `bplus_tree_is_the_documented_default_ordered_interior` pins
