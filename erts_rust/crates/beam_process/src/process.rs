@@ -542,6 +542,29 @@ impl Process {
         &mut self.off_heap
     }
 
+    /// The process's young (mutator) heap **and** its off-heap (MSO) table, as two disjoint
+    /// mutable borrows.
+    ///
+    /// [`Process::heap_mut`] and [`Process::off_heap_mut`] each take a whole `&mut self`, so a
+    /// single caller cannot hold the two at once. This accessor exists precisely so such a caller
+    /// can drive operations that need *both* simultaneously in one borrow — the motivating one is
+    /// [`beam_message::Fragments::move_into`], which copies a fragmented message payload onto the
+    /// destination heap while registering the copied payload's off-heap references in the
+    /// destination table (`move_into(dst_heap, dst_off_heap)`), so a host can move a fragmented
+    /// message onto a process's heap in one step.
+    ///
+    /// `self` is destructured internally, so the compiler proves the two references are disjoint
+    /// borrows of distinct fields of `Collector`/`Process`. Safe Rust only — no raw pointers and
+    /// no `unsafe`.
+    pub fn heap_and_off_heap_mut(&mut self) -> (&mut Heap, &mut OffHeapTable) {
+        let Process {
+            collector,
+            off_heap,
+            ..
+        } = self;
+        (collector.young_mut().heap_mut(), off_heap)
+    }
+
     /// The outgoing links.
     pub fn links(&self) -> &Links {
         &self.links
