@@ -55,7 +55,7 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
   Milestone-1 archive is explicitly marked there); the driver is read-only against the external repos.
 
 ## Routing Table
-- `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 723 cases), JSON reports
+- `differential/` → differential-test compatibility gate: `Eval`/`EvalEnv` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled, optional `cc`-built NIF/driver `.so`), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (**stdout bytes + exit status always; stderr classified for `Eval` cases only** — the `term_to_binary` / exception-class+reason / `system_info` observables are encoded into stdout by the probe wrapper, not separate diff fields), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus (embedded Rust registry, 737 cases), JSON reports
 - `bench/` → benchmark driver: pluggable workload plugins (Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX), system-ERTS baseline, result store + `compare`
 
 ## Notes for Agents
