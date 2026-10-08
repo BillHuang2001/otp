@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beam_common::{BeamError, Result};
-use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome};
+use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome, Tier};
 use beam_loader::{Instr, Module, Operand};
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 use beam_term::{is_small, signed_value, Atom, Eterm};
@@ -241,6 +241,172 @@ impl<'a> RuntimeRunner<'a> {
     }
 }
 
+/// The reduction budget of **one scheduler slice**, charged as the machine runs.
+///
+/// The [`ProcessRunner`] contract puts the reduction count in the runner's hands (the
+/// scheduler never inspects or resets `Process::reductions`), and `beam_engine` exposes no
+/// mid-run reduction/step counter, so the count is derived from the one per-instruction
+/// seam the executing machine reaches on its own: [`ExecutionContext::ensure_heap`], called
+/// by `test_heap`/`allocate_heap` — the instructions the compiler emits once per loop
+/// iteration that allocates (the ordinary Erlang shape).
+///
+/// One charge is one reduction-like unit. When the budget runs out, `charge` reports the
+/// exhaustion through a typed error; the runner recognises it (the sticky [`exhausted`] flag
+/// is set) and turns it into [`RunOutcome::Yield`] at the machine's recorded address rather
+/// than a process failure.
+///
+/// An exhausted probe is **sticky**: it keeps refusing so a single exhaustion yields exactly
+/// once (the first refusal propagates out of the run, so no second charge can occur — the
+/// stickiness is what makes the runner's classification unambiguous).
+///
+/// [`exhausted`]: BudgetProbe::is_exhausted
+struct BudgetProbe {
+    /// The reduction units left in this slice. Never zero: a degenerate `budget` of 0 still
+    /// gets one unit, so a slice always makes progress and the scheduler's run-queue loop
+    /// cannot spin forever on an immediately-yielding process.
+    remaining: u32,
+    /// The reduction units charged so far (what the process's counter is set to).
+    used: u32,
+    /// Whether the budget ran out during this slice.
+    exhausted: bool,
+}
+
+impl BudgetProbe {
+    /// A probe with `budget` reduction units (at least one).
+    fn new(budget: u32) -> BudgetProbe {
+        BudgetProbe {
+            remaining: budget.max(1),
+            used: 0,
+            exhausted: false,
+        }
+    }
+
+    /// The reduction units this slice charged.
+    fn used(&self) -> u32 {
+        self.used
+    }
+
+    /// Whether the budget ran out during this slice.
+    fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Charges one reduction unit, or reports the exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// A typed `unsupported`-prefixed error once the budget is spent — the runner's signal
+    /// that the slice must end in [`RunOutcome::Yield`]. It is **never** a process failure:
+    /// the runner intercepts it and parks the machine instead of recording an exit.
+    fn charge(&mut self) -> Result<()> {
+        if self.remaining == 0 {
+            self.exhausted = true;
+            return Err(crate::error::unsupported(
+                "preemption: the reduction budget for this scheduler slice is spent",
+            ));
+        }
+        self.remaining -= 1;
+        self.used += 1;
+        Ok(())
+    }
+}
+
+/// The **slice's** context: the [`RuntimeContext`] the executing machine runs on, with the
+/// slice's reduction budget charged at its heap-admission points.
+///
+/// This wrapper exists because `beam_rt` may not change `beam_engine` or its own
+/// `src/context/**`: it is handed to the machine the runner drives, and every context the
+/// engine builds *inside* that run — an external module call
+/// ([`RuntimeContext::run_export`]) or a fun application — is a plain `RuntimeContext`, so
+/// the wrapper's [`ensure_heap`](ExecutionContext::ensure_heap) is reached by the slice's own
+/// machine **only**. That is what makes the recorded resume address exact and keeps a nested
+/// run from being mistaken for the pre-empted one.
+///
+/// Everything else is forwarded unchanged; the redirect is purely mechanical.
+struct BudgetContext<'c, 'a> {
+    /// The slice's real context.
+    inner: &'c mut RuntimeContext<'a>,
+    /// The slice's budget.
+    probe: &'c mut BudgetProbe,
+}
+
+impl ExecutionContext for BudgetContext<'_, '_> {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        ExecutionContext::call_bif(self.inner, module, function, arity, args)
+    }
+
+    /// Charge one reduction, then serve the request by delegating (the runtime's arena is
+    /// unbounded, so the delegation itself never fails on Milestone 1).
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.probe.charge()?;
+        ExecutionContext::ensure_heap(self.inner, heap_need, live, x_regs, stack)
+    }
+
+    fn heap_available(&self) -> usize {
+        ExecutionContext::heap_available(&*self.inner)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        ExecutionContext::alloc_words(self.inner, n)
+    }
+
+    fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
+        ExecutionContext::apply(self.inner, module, function, arity, args)
+    }
+
+    fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        ExecutionContext::apply_fun(self.inner, fun, args)
+    }
+
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        ExecutionContext::send_message(self.inner, to, message)
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        ExecutionContext::receive_next(self.inner)
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        ExecutionContext::receive_skip(self.inner)
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        ExecutionContext::receive_remove(self.inner)
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        ExecutionContext::receive_reset(self.inner)
+    }
+
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        ExecutionContext::receive_marker_reserve(self.inner)
+    }
+
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_bind(self.inner, marker, reference)
+    }
+
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_use(self.inner, reference)
+    }
+
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_clear(self.inner, reference)
+    }
+}
+
 /// The `normal` exit-reason term (the reason a process that returns exits with).
 fn normal(runtime: &mut Runtime) -> Eterm {
     runtime.intern("normal")
@@ -361,10 +527,31 @@ impl ProcessRunner for RuntimeRunner<'_> {
     /// Runs one slice of process `pid`: its first entry, or the resume of the `receive`
     /// that suspended it.
     ///
-    /// The `budget` is accepted for the seam's sake but not enforced: the engine's
-    /// blocking-aware entries run to the next `return`/`wait`, so Milestone 1 has no
-    /// reduction pre-emption and a runner never reports
-    /// [`Yield`](beam_process::RunOutcome::Yield) (see the crate `CONTEXT.md`).
+    /// # Reduction accounting and pre-emption
+    ///
+    /// `budget` is the slice's **reduction budget** (the C `CONTEXT_REDS`); the runner owns
+    /// the reduction count (the scheduler never counts — see the [`ProcessRunner`]
+    /// contract). It is charged by [`BudgetProbe`] at the machine's heap-admission points
+    /// — every `test_heap`/`allocate_heap` instruction the executing machine runs reaches
+    /// [`ExecutionContext::ensure_heap`] once — and the slice **ends in
+    /// [`Yield`](beam_process::RunOutcome::Yield)** once the budget is spent, so a
+    /// CPU-bound process is pre-empted and the scheduler requeues it instead of letting it
+    /// monopolize the run queue.
+    ///
+    /// The yield is **resumption-exact**: the machine is parked at
+    /// [`Machine::current_code`] — the very instruction whose `ensure_heap` ran out (the
+    /// engine records it as the first statement of `step_instruction`, and re-running
+    /// `ensure_heap` from outside is a no-op) — so the next slice resumes *at* that
+    /// instruction with the registers, the stack and the frames intact, exactly as a
+    /// `receive` resume does. No result is fabricated and no work is repeated.
+    ///
+    /// The budget is only charged from the **slice's own** machine: the wrapper is the
+    /// context of that machine alone, and every machine a BIF reaches (an external module
+    /// call, a fun apply) is built inside `RuntimeContext` with the plain context, so a
+    /// nested run can never consume the budget nor be mistaken for the resumable machine.
+    /// A loop the compiler emits **without** a heap test (`spin/1`-style: no allocation, so
+    /// no `test_heap`) has no admission point and therefore runs to its next
+    /// `return`/`wait` without being pre-empted — the honest limit, reported as such.
     ///
     /// # Errors
     ///
@@ -375,7 +562,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
     /// A *raise inside the process* is **not** an error here: it becomes
     /// [`RunOutcome::Exit`] carrying the raised reason, exactly as the BEAM terminates a
     /// process with the reason it raised.
-    fn run(&mut self, pid: ProcessId, table: &mut ProcessTable, _budget: u32) -> Result<RunOutcome> {
+    fn run(&mut self, pid: ProcessId, table: &mut ProcessTable, budget: u32) -> Result<RunOutcome> {
         // Take the engine out of the map: it is borrowed mutably for the whole slice while
         // `self.runtime` is borrowed by the context, and a `HashMap` cannot hand out a
         // `&mut` value while its own container is still reachable. It goes back in below
@@ -406,7 +593,20 @@ impl ProcessRunner for RuntimeRunner<'_> {
             }
         }
 
-        let outcome = {
+        // The **first** entry of a module-export process is the only run that goes through the
+        // tier-aware entry below (a resume has no tier entry), so it is the one site that can
+        // snapshot the module's baseline artifact for the `+JPperf` map. Gated on the flag
+        // first: a disabled `+JPperf` (the default) must cost nothing at all.
+        let first_entry_export = match &engine.entry {
+            ProcessEntry::Export { module, .. }
+                if engine.parked.is_none() && self.runtime.perf_map().config().map_enabled() =>
+            {
+                Some(Arc::clone(module))
+            }
+            _ => None,
+        };
+
+        let (outcome, used, exhausted) = {
             // The context also gets the **engines** of this pass (`self.state`): it drives
             // *this* process's machine (taken out of the map above), but a
             // `process_info/2` execution-position item must be able to read every *other*
@@ -420,7 +620,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
             if let ProcessEntry::Export { module, .. } = &engine.entry {
                 ctx.enter_module(module);
             }
-            match engine.parked {
+            // The slice's reduction budget, charged at the machine's heap-admission points
+            // (see the `run` docs).
+            let mut probe = BudgetProbe::new(budget);
+            let mut budget_ctx = BudgetContext {
+                inner: &mut ctx,
+                probe: &mut probe,
+            };
+            let outcome = match engine.parked {
                 // A resume continues the SAME machine: the registers, the Erlang stack and
                 // the frames of the suspended `receive` must survive, so this deliberately
                 // does not reset (see `Machine::resume_outcome`). Only a module-export
@@ -428,7 +635,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // as a typed capability gap rather than run as a wrong (or empty) function.
                 Some((func, pc)) => match &engine.entry {
                     ProcessEntry::Export { module, .. } => {
-                        engine.machine.resume_outcome(module, func, pc, &mut ctx)
+                        engine.machine.resume_outcome(module, func, pc, &mut budget_ctx)
                     }
                     ProcessEntry::Fun { .. } => Err(crate::error::unsupported(
                         "resume of a fun-bodied process (a fun entry never suspends)",
@@ -439,23 +646,84 @@ impl ProcessRunner for RuntimeRunner<'_> {
                         module,
                         function,
                         arity,
-                    } => engine.machine.run_export_outcome(
-                        module,
-                        *function,
-                        *arity,
-                        &engine.args,
-                        &mut ctx,
-                    ),
+                    } => match module.export(*function, *arity) {
+                        // Entered at the export's own label on the **baseline** tier. The
+                        // label entry is the equivalence-preserving route to it: the export
+                        // path only resolves this same label and calls the label path, but
+                        // the baseline *export* driver (`beam_engine`'s `run_native_outcome`)
+                        // never calls `Machine::enter_run`, so the run's `entry_call` stays
+                        // unset and `process_info/2`'s `initial_call`/`current_function` could
+                        // not be answered, whereas the baseline *label* driver records it.
+                        // That is a `beam_engine` gap this crate may not patch (workaround).
+                        Some(label) => engine.machine.run_label_outcome_with_tier(
+                            module,
+                            label,
+                            *arity,
+                            &engine.args,
+                            &mut budget_ctx,
+                            Tier::BaselineJit,
+                        ),
+                        // An export the module does not define stays the engine's own typed
+                        // error, byte for byte (`Machine::run_export_outcome`'s). Unreachable
+                        // for a spawned entry (`Runtime::spawn_process` resolves the export
+                        // first), and never a fabricated result.
+                        None => Err(crate::error::unsupported(
+                            "run_export: export not found",
+                        )),
+                    },
                     // A fun entry is applied synchronously: `apply_fun` routes an `-eval`
                     // closure back into the evaluator and a `.beam` fun into the engine's
                     // label entry — the evaluator is never re-implemented here. A returned
                     // value is the fun's result, so it records exactly like an export's.
-                    ProcessEntry::Fun { fun } => ctx
+                    ProcessEntry::Fun { fun } => budget_ctx
                         .apply_fun(*fun, &engine.args)
                         .map(EngineRunOutcome::Returned),
                 },
-            }
+            };
+            // The wrapper's borrow of the probe ends here (the machine is no longer
+            // running), so the slice's accounting is readable.
+            drop(budget_ctx);
+            let used = probe.used();
+            let exhausted = probe.is_exhausted();
+            (outcome, used, exhausted)
         };
+
+        // The `+JPperf` map (contract A.8) must describe the **real** native code this runtime
+        // can run, never a fabricated range: the module's baseline artifact is that source, so
+        // its cached `[start, size)` regions are snapshotted here -- once per first entry, not
+        // per slice. Diagnostic only: `record_baseline_code` records, never propagates.
+        if let Some(module) = first_entry_export.as_deref() {
+            record_baseline_code(self.runtime, module);
+        }
+
+        // Pre-emption: the budget ran out at a heap-admission point of this slicing
+        // machine. Park it at that very instruction and hand the process back to the
+        // scheduler, which requeues it (`slice_end`'s `Yield` arm) so a second runnable
+        // process gets the next slice. Nothing is recorded as a result/exit and the
+        // process stays `Runnable` — it has neither returned nor blocked.
+        if exhausted {
+            let Some(address) = engine.machine.current_code() else {
+                // Unreachable: only `ensure_heap` (reached from `test_heap`/
+                // `allocate_heap`, which record their address first) charges the budget.
+                // Reported as a typed error rather than parked at a guessed address — no
+                // wrong result, no hang.
+                return Err(crate::error::unsupported(
+                    "preemption: the exhausted machine has no resumable instruction address",
+                ));
+            };
+            if let Some(process) = table.get_mut(pid) {
+                // The runner owns the reduction count: record what this slice spent so
+                // `process_info(_, reductions)` reports real work.
+                process.reset_reductions();
+                process.bump_reductions(u64::from(used));
+            }
+            engine.parked = Some(address);
+            // A parked receive's deadline was settled above; a yield has no deadline of its
+            // own, so nothing is left armed here (a stale one would fire mid-run later).
+            engine.parked_timeout = None;
+            self.state.engines.insert(pid, engine);
+            return Ok(RunOutcome::Yield);
+        }
 
         match outcome {
             Ok(EngineRunOutcome::Returned(value)) => {
@@ -504,6 +772,40 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 Ok(RunOutcome::Exit(reason))
             }
         }
+    }
+}
+
+/// Snapshots the baseline JIT's **real** code ranges of `module` into the `+JPperf` map
+/// (contract A.8).
+///
+/// The perf map is the diagnostic that names the native code a scheduled process can run, so
+/// it may only ever hold ranges the baseline backend actually mapped
+/// ([`baseline_code_map`](beam_engine::jit::cache::baseline_code_map) -- which compiles the
+/// module on first sight, so the ranges are its own artifact's) -- never a synthesised one.
+/// Diagnostic-only by contract: a disabled flag returns without compiling anything, and a
+/// compile or write failure is *recorded* in the map's own diagnostic slot rather than
+/// propagated, exactly as the oracle logs it and carries on (a perf file must never fail a run).
+fn record_baseline_code(runtime: &mut Runtime, module: &Module) {
+    if !runtime.perf_map().config().map_enabled() {
+        return;
+    }
+    match beam_engine::jit::cache::baseline_code_map(module) {
+        Ok(regions) => {
+            for region in regions {
+                if let Err(error) =
+                    runtime
+                        .perf_map_mut()
+                        .record(region.start, region.size, &region.name)
+                {
+                    runtime
+                        .perf_map_mut()
+                        .note_diagnostic(format!("perf: {error}"));
+                }
+            }
+        }
+        Err(error) => runtime
+            .perf_map_mut()
+            .note_diagnostic(format!("perf: no code map for this module: {error}")),
     }
 }
 
@@ -619,11 +921,121 @@ mod tests {
         assert!(state.exit(pid).is_none());
     }
 
+    /// Whether `error` is the probe's typed pre-emption refusal -- the `unsupported`-prefixed
+    /// signal the runner keys off to park the process instead of recording an exit.
+    fn is_preemption(error: &BeamError) -> bool {
+        crate::error::unsupported_reason(error)
+            .is_some_and(|reason| reason.contains("reduction budget"))
+    }
+
+    /// A fresh probe is never exhausted; the `.max(1)` floor buys exactly one unit, so a slice
+    /// can never spin; and the refusal past exhaustion is sticky (no unit is charged).
     #[test]
+    fn a_zero_budget_still_charges_exactly_one_unit_and_then_refuses() {
+        let mut probe = BudgetProbe::new(0);
+        assert!(!probe.is_exhausted(), "a fresh probe is not exhausted");
+        assert!(probe.charge().is_ok(), "the floor guarantees one charge");
+        assert_eq!(probe.used(), 1);
+        assert!(!probe.is_exhausted(), "one unit of progress is not exhaustion");
+
+        let error = probe.charge().expect_err("the floor is spent");
+        assert!(is_preemption(&error), "{error}");
+        assert!(probe.is_exhausted());
+        assert!(probe.charge().is_err(), "an exhausted probe stays exhausted");
+        assert_eq!(probe.used(), 1, "no unit past the floor is charged");
+    }
+
+    /// A budget of `n` allows exactly `n` charges -- never exhausted while units remain -- and
+    /// the `(n+1)`-th charge is the single refusal the runner turns into `RunOutcome::Yield`.
+    #[test]
+    fn a_budget_allows_exactly_its_units_then_refuses() {
+        const N: u32 = 3;
+        let mut probe = BudgetProbe::new(N);
+        for charged in 1..=N {
+            assert!(!probe.is_exhausted(), "units remain before charge {charged}");
+            assert!(probe.charge().is_ok(), "charge {charged} of {N}");
+            assert_eq!(probe.used(), charged);
+        }
+        assert!(!probe.is_exhausted(), "the budget is spent, not yet exceeded");
+
+        let error = probe.charge().expect_err("the (n+1)-th charge is the refusal");
+        assert!(is_preemption(&error), "{error}");
+        assert!(probe.is_exhausted());
+        assert_eq!(probe.used(), N, "the refusal charges nothing");
+    }
+
+    /// A scheduled export runs to completion through the runner's **tier-aware** first-entry
+    /// path: its value is recorded and it exits `normal` (the selected tier is documented there).
+    #[test]
+    fn a_scheduled_export_runs_through_the_tier_aware_entry() {
+        let mut rt = runtime();
+        let mut state = RunnerState::default();
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+        let module = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
+        let function = module.atom_table.lookup("add").expect("add is interned");
+        state.spawn(
+            pid,
+            ProcessEntry::Export {
+                module,
+                function,
+                arity: 2,
+            },
+            vec![make_small(2), make_small(3)],
+        );
+
+        let outcome = {
+            let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+            runner.run(pid, &mut table, 1_000).expect("the slice runs")
+        };
+        assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+        assert_eq!(
+            signed_value(state.result(pid).expect("the value is recorded")),
+            5,
+            "the tier-aware entry computes the interpreted result"
+        );
+    }
+
+    /// The `+JPperf` map is filled from the baseline artifact's **real** code ranges -- and a
+    /// disabled flag (the default) compiles nothing and records nothing.
+    #[test]
+    fn the_baseline_code_map_fills_only_an_enabled_perf_map() {
+        let module = beam_loader::load_file(slice_fixture()).expect("slice.beam");
+
+        let mut off = runtime();
+        assert!(!off.perf_map().config().map_enabled(), "+JPperf is off by default");
+        record_baseline_code(&mut off, &module);
+        assert_eq!(off.perf_map().entry_count(), 0, "a disabled map costs nothing");
+        assert!(!off.perf_map().is_active(), "and creates no file");
+
+        let dir = std::env::temp_dir().join(format!("beam_rt_runner_perf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+        let mut perf = crate::perf_map::PerfMapConfig::new();
+        perf.set_directory(&dir);
+        perf.set_flag("map").expect("map is a grammar value");
+        let mut on = Runtime::new(crate::config::RuntimeConfig::new().with_perf_map(perf))
+            .expect("the runtime is created");
+
+        record_baseline_code(&mut on, &module);
+        assert_eq!(on.perf_map().error(), None);
+        assert!(on.perf_map().entry_count() > 0, "the code map has real regions");
+        let text = std::fs::read_to_string(on.perf_map().map_path().expect("the map is open"))
+            .expect("the map is readable");
+        for line in text.lines() {
+            assert!(
+                line.starts_with("0x") && line.contains(" $slice:"),
+                "a real range of the module: {line:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }    #[test]
     fn a_returned_value_is_not_the_exit_reason() {
-        // The runner never yields in Milestone 1, and a process that returns exits with
-        // the `normal` atom — NOT with the value it produced (the value is recorded
-        // separately by `RunnerState::result`).
+        // The runner DOES return `RunOutcome::Yield` once this slice's reduction budget is
+        // spent (pre-emption is implemented -- see `BudgetProbe`), but that is not what this
+        // pins: a process that *returns* exits with the `normal` atom -- NOT with the value it
+        // produced (the value is recorded separately by `RunnerState::result`) -- so its
+        // outcome is a termination, never a pre-emption.
         let mut rt = runtime();
         let reason = normal(&mut rt);
         assert_eq!(rt.atom_name_of(reason), Some("normal"));

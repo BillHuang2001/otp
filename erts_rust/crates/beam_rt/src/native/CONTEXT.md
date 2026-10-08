@@ -29,13 +29,16 @@ per-function bodies. Files:
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), the `erlang` core (`halt/0,1`, `display/1`, `io:put_chars/1,2`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `os:cmd/1`), the binary-surface and scheduler-model test modules |
 | `init.rs` | `init:get_argument/1`, `get_arguments/0`, `get_plain_arguments/0`, `get_status/0` |
 | `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1`, `root_dir/0` |
-| `process.rs` | `erlang:make_ref/0`, `monitor/2`, `demonitor/1,2`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1` |
+| `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4` (incl. the heap-size options → `beam_gc::HeapPolicy`), `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`, `exit/2,3` in `process/exit.rs` |
+| `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
 | `prim.rs` | the `prim_file` floor (11 entries) — see below |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
+
+**The process-control families route through the sibling `beam_process` machinery.** `monitor/2,3` and `demonitor/1,2` use `ProcessTable::{monitor, monitor_named, demonitor, demonitor_flush}`: `[flush]` removes a queued `'DOWN'` from the caller's mailbox and `[info]` answers the **real** "was a monitor on record and got removed" boolean (a second `demonitor(Ref, [info])` is `false`; the reference stays on record so it is never `badarg`). `exit/2,3` signals another process through `ProcessTable::send_exit`, but a **self**-directed exit is raised directly (non-trapping caller, or the untrappable `kill`) or delivered as `{'EXIT', self(), R}` via `RuntimeContext::deliver_message` (trapping caller and `Reason != kill`) — because the sibling scheduler defers a self-directed signal that arrives while the pid is `Running`, which it is inside a slice. `exit/3` accepts ONLY the bare atom `priority` as an option (`[{priority, high}]` is `badarg`). `is_alive/0`/`get_cookie/0`/`set_cookie/2`/`nodes/0,1` read the runtime's `DistNode`/cookie/local-node state (`../runtime.rs`; `get_cookie/0` is the atom `nocookie` while the node is not alive, and `set_cookie/2` RAISES `badarg`/`distribution_not_started`, matching the oracle). `spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the policy-aware `Runtime::spawn_*_with_policy`.
 
 ### `erlang:process_info/1,2` (contract A.8) — `memory/mod.rs` (+ `memory/tests.rs`)
 A **runtime** operation: the answer is read out of this runtime's own `beam_process` table
@@ -273,7 +276,8 @@ form (`:47`) for an errno outside the table.
   `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`, `make_link/2`,
   `make_symlink/2`, `altname/1`
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7)
-- `process.rs` / `port.rs` → the process/registry/reference and port-write surfaces (contracts A.4/A.8)
+- `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/registry/reference, monitor/demonitor and exit-signalling surfaces, and the port-write surface (contracts A.4/A.8)
+- `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`) + its unit tests
 - `test_support.rs` → the shared fixtures
 - `../context/mod.rs` → `RuntimeContext::call_bif` / `try_native`'s caller and the host seams
 - `../context/bridges.rs` → `module_md5` (the `.beam` MD5 digest `beamfile_module_md5/1` serves, re-exported `pub(crate)` by `../context/mod.rs` so the floor reuses it instead of re-deriving the chunk parse)

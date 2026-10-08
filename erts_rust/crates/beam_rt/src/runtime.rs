@@ -36,18 +36,20 @@ use beam_alloc::Heap;
 use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, MinimalContext};
+use beam_gc::HeapPolicy;
 use beam_loader::Module;
 use beam_process::{
-    MonitorRef, ProcessId, ProcessState, ProcessTable, RefAllocator, Scheduler, SignalAtoms,
+    MonitorRef, Priority, ProcessId, ProcessState, ProcessTable, RefAllocator, Scheduler,
+    SignalAtoms,
 };
-use beam_term::{atom_val, is_atom, make_atom, make_small, AtomTable, Eterm};
+use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm};
 
 use crate::boot::bootscript::{self, BootScript};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
 use crate::context::{PersistentTermStore, RuntimeContext};
-use crate::dist::{resolve_cookie, DistNode};
+use crate::dist::{resolve_cookie, DistNode, NONODE_NAME};
 use crate::error;
 use crate::eval::FunBody;
 use crate::format;
@@ -280,6 +282,22 @@ pub struct Runtime {
     /// [`Runtime::pump_dist`] from the scheduler pass, next to the port half. See
     /// [`crate::dist`] for exactly how little of distribution this implements.
     dist: Option<DistNode>,
+    /// The distribution **cookie** the handshake digests use, resolved once at construction
+    /// from `-setcookie`, else `$HOME/.erlang.cookie`, else the documented default (see
+    /// [`crate::dist::resolve_cookie`]).
+    ///
+    /// Kept on the runtime (not only inside [`DistNode`]) so it is observable and mutable
+    /// without a live node: [`Runtime::cookie`]/[`Runtime::set_cookie_bytes`] are the runtime
+    /// side of `erlang:set_cookie/2`.
+    cookie: Vec<u8>,
+    /// The atom naming this runtime's **local node**: the configured `node@host` when
+    /// `-name`/`-sname` made it a node, else the fixed `nonode@nohost` identity
+    /// ([`crate::dist::NONODE_NAME`]) the node bridge also hands `beam_codec`.
+    ///
+    /// Installed on the process table (see [`Runtime::new`]) so a named monitor can spell its
+    /// `{Name, <node>}` `{'DOWN', …}` target, and exposed as
+    /// [`Runtime::local_node`]/[`Runtime::local_node_term`].
+    local_node: Atom,
     /// Whether a scheduler pass **routes** inbound distribution control messages into
     /// local mailboxes ([`Runtime::dispatch_dist_inbound`]).
     ///
@@ -323,7 +341,10 @@ impl Runtime {
         }
         let signals = SignalAtoms::from_table(code_server.atoms_mut());
         let mut processes = ProcessTable::new(signals);
-        let self_pid = processes.spawn_default()?;
+        // The runtime's own root process carries the emulator's default heap policy — the
+        // same one `erlang:spawn` gives a child — so `process_info(Pid, min_heap_size | …)`
+        // reports the oracle's figures for it too (see [`Runtime::default_spawn_policy`]).
+        let self_pid = processes.spawn(config.heap.policy().clone())?;
         // The runtime's own root process stands in for OTP's `init`: it is the process the
         // runtime boots and runs the start action as, and the one `erlang:group_leader/0`
         // already reports (`src/native/process.rs`). Registering the name is what makes
@@ -344,11 +365,23 @@ impl Runtime {
         // A configured node name (`-name`/`-sname`) makes this a **distributed node**:
         // the listener is bound here (a bind failure is a genuine start-up error, never
         // a silently un-distributed runtime) and the node is published to `epmd` on the
-        // first scheduler pass. The cookie comes from `-setcookie`/`$HOME/.erlang.cookie`.
+        // first scheduler pass. The cookie comes from `-setcookie`/`$HOME/.erlang.cookie`,
+        // resolved **once** so the runtime's own `cookie` field and the node agree.
+        let cookie = resolve_cookie(&config.init_args);
         let dist = match config.emulator.node_name.as_deref() {
-            Some(name) => Some(DistNode::start(name, resolve_cookie(&config.init_args))?),
+            Some(name) => Some(DistNode::start(name, cookie.clone())?),
             None => None,
         };
+        // The local-node identity: the configured node's full `node@host` name when this is a
+        // node, else the fixed `nonode@nohost` (the same one the node bridge gives
+        // `beam_codec`). Installing it on the process table is what lets a **named** monitor
+        // spell its `{'DOWN', …}` target as `{Name, <node>}` instead of the typed gap.
+        let local_node_name = match dist.as_ref() {
+            Some(node) => node.node_name(),
+            None => NONODE_NAME,
+        };
+        let local_node = code_server.atoms_mut().intern(local_node_name);
+        processes.set_local_node(local_node);
         // The perf files are created up front, like the C's `beamasm_metadata_early_init`:
         // the map is then appended to as ranges become known. Nothing is created when the
         // flag selected no file, and a failure to create one is recorded on the `PerfMap`
@@ -385,6 +418,8 @@ impl Runtime {
             timer_resumes: HashMap::new(),
             timer_wakes: Vec::new(),
             dist,
+            cookie,
+            local_node,
             inbound_delivery: false,
             perf_map,
         })
@@ -899,6 +934,43 @@ impl Runtime {
         function: &str,
         args: Vec<Eterm>,
     ) -> Result<ProcessId> {
+        let policy = self.default_spawn_policy();
+        self.spawn_process_with_policy(module, function, args, policy, None)
+    }
+
+    /// The heap policy a process created **without** `spawn_opt` heap options gets: the
+    /// emulator's own policy, with `+hms`/`+hmbs`/`+hmax` already applied
+    /// ([`RuntimeConfig::heap_options`]).
+    ///
+    /// This is the C's single global default — the `n` / `BIN_Vn` / `H_MAX_SIZE` a process
+    /// is created with when `spawn_opt` supplied no heap option
+    /// (`erl_process.c:12242-12248`, `12567-12572`) — so both the runtime's root process
+    /// and every plain `spawn*` child report the `min_heap_size` /
+    /// `min_bin_vheap_size` / `fullsweep_after` / `max_heap_size` the oracle does.
+    pub(crate) fn default_spawn_policy(&self) -> HeapPolicy {
+        self.config.heap.policy().clone()
+    }
+
+    /// [`Runtime::spawn_process`] under an explicit heap policy and priority — the
+    /// `spawn_opt` path.
+    ///
+    /// Both extras are honoured by **creating** the child with them: `policy` is the
+    /// [`ProcessTable::spawn`] policy (the child's own `beam_gc` policy, which
+    /// `process_info(Pid, …)` then reports for *that* process) and `priority` is set before
+    /// the child is queued, so the scheduler can never observe a half-configured process.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::spawn_process`], plus the process table's diagnostic when a just-spawned
+    /// pid cannot take `priority`.
+    pub(crate) fn spawn_process_with_policy(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: Vec<Eterm>,
+        policy: HeapPolicy,
+        priority: Option<Priority>,
+    ) -> Result<ProcessId> {
         self.boot_if_needed()?;
         // A module the code server already holds (loaded explicitly by
         // [`Runtime::load_module`], say) needs no code-path search — which also avoids
@@ -916,7 +988,10 @@ impl Runtime {
         if loaded.export(function_atom, arity).is_none() {
             return Err(error::undef());
         }
-        let pid = self.processes.spawn_default()?;
+        let pid = self.processes.spawn(policy)?;
+        if let Some(priority) = priority {
+            self.processes.set_priority(pid, priority)?;
+        }
         self.runner_state.spawn(
             pid,
             ProcessEntry::Export {
@@ -949,11 +1024,32 @@ impl Runtime {
     /// non-fun here is a programming error and never a wrong process), plus the process
     /// table's allocation failure.
     pub fn spawn_fun_process(&mut self, fun: Eterm, args: Vec<Eterm>) -> Result<ProcessId> {
+        let policy = self.default_spawn_policy();
+        self.spawn_fun_process_with_policy(fun, args, policy, None)
+    }
+
+    /// [`Runtime::spawn_fun_process`] under an explicit heap policy and priority — the
+    /// `spawn_opt/2` path (see [`Runtime::spawn_process_with_policy`]).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when `fun` is not a fun term, plus the process table's
+    /// allocation/priority diagnostics.
+    pub(crate) fn spawn_fun_process_with_policy(
+        &mut self,
+        fun: Eterm,
+        args: Vec<Eterm>,
+        policy: HeapPolicy,
+        priority: Option<Priority>,
+    ) -> Result<ProcessId> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
         }
         self.boot_if_needed()?;
-        let pid = self.processes.spawn_default()?;
+        let pid = self.processes.spawn(policy)?;
+        if let Some(priority) = priority {
+            self.processes.set_priority(pid, priority)?;
+        }
         self.runner_state.spawn_fun(pid, fun, args);
         self.enqueue_process(pid)?;
         Ok(pid)
@@ -1022,6 +1118,41 @@ impl Runtime {
     /// The node's full name (`node@host`), when this runtime is a distributed node.
     pub fn node_name(&self) -> Option<&str> {
         self.dist.as_ref().map(|node| node.node_name())
+    }
+
+    /// The distribution **cookie** this runtime's handshake digests use.
+    ///
+    /// Resolved once at construction from `-setcookie`, else `$HOME/.erlang.cookie`, else the
+    /// documented default (see [`crate::dist::resolve_cookie`]); independent of whether a node
+    /// was configured. [`Runtime::set_cookie_bytes`] replaces it.
+    pub fn cookie(&self) -> &[u8] {
+        &self.cookie
+    }
+
+    /// Replaces the distribution cookie (the runtime side of `erlang:set_cookie/2`).
+    pub fn set_cookie_bytes(&mut self, cookie: Vec<u8>) {
+        self.cookie = cookie;
+    }
+
+    /// The atom naming this runtime's local node: the configured `node@host` when
+    /// `-name`/`-sname` made it a node, else the fixed `nonode@nohost` identity.
+    pub fn local_node(&self) -> Atom {
+        self.local_node
+    }
+
+    /// [`Runtime::local_node`] as the atom **term** the engine compares against.
+    pub fn local_node_term(&self) -> Eterm {
+        make_atom(self.local_node)
+    }
+
+    /// Whether this runtime is a **live** distributed node: bound and registered with `epmd`,
+    /// so a remote node can reach it.
+    ///
+    /// `false` for a runtime with no `-name`/`-sname`, and for a node `epmd` refused or has not
+    /// yet registered (a registration failure is recorded, never raised — see
+    /// [`crate::dist`]).
+    pub fn is_alive(&self) -> bool {
+        self.dist.as_ref().is_some_and(DistNode::is_alive)
     }
 
     /// Turns routing of **inbound** distribution control messages into local mailboxes
@@ -1245,6 +1376,38 @@ mod tests {
             rt.system_info_value("process_count").expect("count"),
             InfoValue::Int(1)
         );
+    }
+
+    #[test]
+    fn a_runtime_without_a_node_is_not_alive_and_names_nonode() {
+        let rt = runtime();
+        // No `-name`/`-sname`: no node, so not alive.
+        assert!(!rt.is_alive());
+        assert!(rt.dist_node().is_none());
+        // The local node is the fixed `nonode@nohost` identity (seeded at boot), and the
+        // process table was told the same atom (named monitors spell their target with it).
+        let nonode = rt
+            .atoms()
+            .lookup("nonode@nohost")
+            .expect("seeded at boot");
+        assert_eq!(rt.local_node(), nonode);
+        assert_eq!(rt.local_node_term(), make_atom(nonode));
+        assert_eq!(rt.processes().local_node(), Some(nonode));
+    }
+
+    #[test]
+    fn the_cookie_comes_from_the_init_arguments() {
+        // `-setcookie secret` is the one path that resolves deterministically (a cookie file
+        // would change the answer), so assert exactly that.
+        let mut config = RuntimeConfig::default();
+        config
+            .init_args
+            .record("setcookie", vec!["secret".to_string()]);
+        let mut rt = Runtime::new(config).expect("the runtime");
+        assert_eq!(rt.cookie(), b"secret");
+        // And it is mutable without a live node.
+        rt.set_cookie_bytes(b"other".to_vec());
+        assert_eq!(rt.cookie(), b"other");
     }
 
     #[test]

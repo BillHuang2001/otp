@@ -33,9 +33,13 @@ use crate::runtime::Runtime;
 /// `erlang:system_info(context_reductions)` is `make_small(CONTEXT_REDS)`
 /// (`erl_bif_info.c:3363-3364`), i.e. a **compile-time constant of the ERTS interface**,
 /// like `atom_limit`/`ets_limit` — not a measured property of a particular run. The
-/// oracle reports `4000` for every invocation (verified against OTP 29.1.1 / erts-17.1).
-/// This runtime's scheduler does not pre-empt on reductions yet (a documented M1 gap,
-/// `beam_rt/CONTEXT.md`), so the number is reported as the interface constant it is.
+/// oracle reports `4000` for every invocation (verified against OTP 29.1.1 / erts-17.1),
+/// so the number is reported as the interface constant it is.
+///
+/// The runtime does **honour** a per-slice reduction budget of the same size: the runner
+/// pre-empts (yields) a CPU-bound process once
+/// `beam_process::DEFAULT_REDUCTIONS_PER_SLICE` (4000, charged at the machine's
+/// heap-admission points) is spent, so this constant is also the runtime's own slice budget.
 const CONTEXT_REDS: i64 = 4000;
 
 /// The `system_info/1` value of a `schedulers`-family key, or `None` when `key` is not
