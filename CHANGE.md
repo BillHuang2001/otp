@@ -8,6 +8,78 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
+## 2026-10-08 — Milestone 4: runtime dispatch fixed (per-BIF cost ~90×), real pre-emption, copy-boundary hardening, legacy-C removal gate
+Scope: the runtime's **registered-BIF dispatch** — the single largest measured overhead — is
+root-caused and fixed (**~10.6 µs → ~116 ns per call**), the runner gains **real pre-emption**
+(`RunOutcome::Yield` on budget exhaustion) and runs scheduled entries on the **baseline JIT**, the
+message **copy boundary** is hardened against three real bugs, the loader's chunk/attribute
+understanding is completed, and the **legacy-C tree gains a mechanical, parity-gated removal process**.
+Verified: `cargo build --workspace --all-targets` warning-free, `cargo test --workspace --no-fail-fast`
+**all green / 0 failures**, and the differential gate **`total=723 agree=722 mismatch=0 unsupported=1
+skipped=0`** (the single remaining `unsupported` is the by-design unclosable `erl_eval` template-closure
+encoding, contract A.5 `wire/new_fun_ext_encode`).
+- **Area:** `beam_rt` (Stage 5 — runtime dispatch; the headline perf fix)
+- **Change:** the ~10.6 µs per-registered-BIF-call cost was a **per-call full `AtomTable` deep clone**
+  plus, once that was gated, `RuntimeMemory::new` eagerly computing `code_bytes` by cloning and sorting
+  every loaded module name *and* issuing one `std::fs::metadata` **per loaded module per call** — a
+  structure evaluated even when nothing consumes it. The atom-interner clone is now skipped when the
+  pending-interning set is empty, and the memory/fun-identity handles are built **lazily** behind
+  `uses_memory_hook` / `uses_fun_identity` predicates derived from the loaded program's imports. Net:
+  registered-BIF dispatch **~10.6 µs → ~116 ns/call**; `erlang:'-'/2` in a tail loop now runs natively at
+  ~2.45 ns/iter. The engine-side share of a BIF call is ~11–12 ns (≤0.15 %), so the cost is host-side
+  dispatch, not the IR seam. Added a two-point-slope perf harness (`examples/perf_bif.rs`,
+  `tests/perf_bif.rs`) that subtracts the per-run setup floor so the number is a per-call slope, not a
+  loop-average.
+- **Area:** `beam_rt` (Stage 5 — scheduling, process control)
+- **Change:** the runner now honours its reduction budget and returns **`RunOutcome::Yield`** — real
+  pre-emption instead of run-to-completion — and a **scheduled-export entry executes on
+  `Tier::BaselineJit`** (the block JIT is now on the runner's path, with `+JPperf` fed from
+  `baseline_code_map`). Adopted `monitor/2,3`, `demonitor/1,2` (incl. `demonitor_flush`), `exit/2,3`,
+  the full `process_info` item set, `is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`,
+  `module_loaded/1`, `spawn_opt` heap-size knobs and priorities.
+- **Area:** `beam_engine` (Stage 1 — execution, contract A.8)
+- **Change:** the **execution-trace seam** landed behind `ExecutionContext::{trace_enabled, trace_event}`
+  over a borrowed-name `TraceEvent { Call, ReturnFrom, ReturnTo }`; the gate is latched once per run into
+  `Machine::trace_on`, so an untraced run pays ~0 ns and the engine never stringifies on the hot path.
+  `tests/trace.rs` cross-checks the event stream against the live `erl` oracle on real fixtures. Also
+  added `tests/bif_cost.rs` for the engine-side per-BIF-call attribution.
+- **Area:** `beam_message` (Stage 0/5 — the copy boundary)
+- **Change:** three real bugs fixed. (1) `is_shared` classified **every bare `HEADER` word** as a shared
+  literal — now it requires a genuine term word, so a header word is copied rather than aliased.
+  (2) A forged/cyclic term graph made the sizing walk **unbounded** (hang) — the copier now preflights
+  through a **cycle-safe, bounded** `preflight_words` (`is_acyclic`), and the failure is a typed
+  `Alloc(Message)`. (3) `Fragments::move_into` **half-stripped the chain** when a move failed part-way
+  (some fragments released, the term's payload half-moved) — the chain is now released only after the
+  whole chain copies. Added the public `is_message_heap_exhaustion(&BeamError) -> bool` classifier so a
+  host can translate the copy engine's exhaustion without matching on `AllocKind`.
+- **Area:** `beam_loader` (Stage 1 — module loading)
+- **Change:** completed the loader's chunk/attribute understanding: a new `src/chunk/classify.rs`
+  classifies 15 chunk ids with a whole-corpus checker, and `src/attributes.rs` decodes the `Attr` chunk
+  **byte-identically to the oracle**. Corrected a stale claim — the on-PATH OTP-29 `erlc` *does* emit the
+  native-record opcodes 186–191 and can be made to emit `executable_line`/`debug_line` and
+  `bs_test_tail2`; 192/193 are OTP-30-only. Both framings of `LitT` were verified across 42 959
+  literals. Load cost was measured (175.9 ns/instruction; 106 MB/s over 200 modules) and improved
+  ~5–6 % with an **O(1) opcode-arity table** and a capped, pre-sized instruction vector.
+- **Area:** `beam_abi` (Stage 0 — NIF/driver ABI), `beam_io` (Stage 5 — I/O)
+- **Change:** the driver API reached **111/111** with the hidden refcount word modelled and a mechanical
+  conformance test; a mis-modelled `ErlDrvBinary` public layout was corrected so a real `.so` compiled
+  against the system headers keeps `ERTS_CHK_BIN_ALIGNMENT`. `driver_async` moved from
+  thread-per-job to a **bounded process-global worker pool**; port streams gained `StreamOptions`;
+  `stop_select` is honoured on deselect/teardown; `tcp_inet` latches peer close. A use-after-free in the
+  process-global created-thread name registry — two inserters racing to own one name buffer — was fixed
+  with first-wins registration.
+- **Area:** `erts/emulator` (legacy C/C++ removal process)
+- **Change:** the legacy-C tree now has a **mechanical, parity-gated removal process** instead of ad-hoc
+  deletion: `erts/emulator/beam/check_dead_sources.py` (+ its committed `dead_source_report.txt`) proves
+  a source file unreferenced (**746 checked / 721 referenced / 25 exempt / 0 deletable**), and
+  `erts/emulator/beam/CONTEXT.md` records the **11-group parity matrix** (C module group → Rust owner →
+  evidence → verdict) plus the revision rule a deletion needs (reference proof **and** a live
+  zero-mismatch gate **and** no self-declared `unsupported` on the covering contract **and** a value
+  oracle — a reference proof is *not* a build proof). One further file was deleted this pass
+  (`erts/emulator/drivers/unix/bin_drv.c`, 227 lines, proven absent from `DRV_OBJS`), bringing the total
+  to four (`multi_drv.c`, `sig_drv.c`, `vxworks_resolv.c`, `bin_drv.c`). The file's deep C-internals
+  reference material was extracted into the `.agents/skills/beam-c-internals-reference.md` skill to keep
+  the CONTEXT.md under the read limit.
 ## 2026-10-08 — Milestone 3: complete BIF surface, hot-path flattening, ordered-set B+-tree, on-demand heap growth, full ABI freeze
 
 Scope: the runtime gains the **complete declared BIF surface**, a **flattened interpreter hot path**,
