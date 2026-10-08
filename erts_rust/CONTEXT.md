@@ -128,7 +128,9 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   Milestone-1 archive is explicitly marked there). The known hot-path defect is `beam_rt`'s
   `RuntimeContext::call_registered` deep-cloning the shared `AtomTable` on **every** registered BIF
   call — ~99% of the marginal per-iteration cost of `beam_rt run …`, and the reason per-call costs on
-  real Cowboy/EMQX functions measure 700×–9 000× the oracle. Root cause verified; fix in flight.
+  real Cowboy/EMQX functions measure 700×–9 000× the oracle. That defect is resolved — the whole-table
+  clone in `beam_rt`'s `call_registered` is now skipped when there is nothing to commit — so the
+  `RESULTS.md` figures predate the fix and need re-measuring.
 - **Honest coverage gaps** (per-crate `Known Issues`): the engine tiers and the Cranelift hot tier
   (`jit-cranelift`, default-OFF) are not yet on `beam_rt`'s execution path; full match-spec compiler;
   ETS concurrency; `put_record/6`'s create form; several structured-raise-reason degradations; depth of
