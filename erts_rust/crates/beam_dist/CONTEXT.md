@@ -47,9 +47,23 @@ All byte values, tag bytes and field orders are **wire-frozen** (A.5): reproduce
 **Implemented and live-verified.** `DFLAG_*`/`DOP_*` vocabulary, the abstract transport seam, 2-/4-byte
 framing, handshake message codecs + MD5 authentication, the byte-exact distribution header, message
 fragmentation/reassembly, the **outbound and inbound distribution atom cache**, the control-message
-codec, the `epmd` client (with real TCP lookup), a blocking `Connection` API, and a **non-blocking
-`ConnectionDriver`** (the poll/step state machine). `cargo test -p beam_dist` is green (266 tests + 1
-doc-test) and warning-free; the crate is safe Rust (`#![deny(unsafe_code)]`).
+codec (all 30 `Dop` variants), inbound `DOP_*` delivery classification, the `epmd` client (real TCP
+lookup + the full request set), a blocking `Connection` API, and a **non-blocking `ConnectionDriver`**
+(the poll/step state machine). `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
+beam_dist` is green (**337 tests + 1 doc-test**) and the workspace builds warning-free; the crate is
+safe Rust (`#![deny(unsafe_code)]`).
+
+**All 30 `Dop` opcodes round-trip exhaustively.** `tests/dop_roundtrip.rs` drives every variant through
+`encode` -> `decode` -> byte-identical re-encode (the arg table is a wildcard-free `match`, so a new
+variant is a compile error) and pins a **byte-exact golden vector per opcode**, all 30 cross-checked
+against the system `erl` oracle (`term_to_binary/1` of the equivalent tuple, `VERSION_MAGIC` stripped,
+hex-compared). Honest wire facts pinned by the suite: there is **no** `DOP_NODEUP`/`DOP_NODEDOWN` in v6
+(node up/down are *local* emulator events, `dist.c:6931` `send_nodes_mon_msgs`), and
+`DOP_DEMONITOR_ID`/`DOP_UNLINK_MONITOR_ID`/`DOP_DEMONITOR_MONITOR_ID` **do not exist**; `Dop::from_u8`
+rejects `0, 5, 9-11, 14-15, 17, >= 38` and accepts exactly 30. `control::carries_message` (now `pub`)
+classifies the 16 opcodes carrying a trailing **Message** term (the 9 send family + 5 payload-exit +
+`SPAWN_REQUEST`/`SPAWN_REQUEST_TT`); `SPAWN_REPLY`/`_TT` are excluded (`dist.c:1897` sets
+`ctx->msg = THE_NON_VALUE`).
 
 **Live interop (blocking `Connection`, `tests/live_interop.rs`).** Against a real `erl -sname` node
 whose port is resolved through **`epmd`** (`epmd::lookup_port`, fallback to the pinned port): the OTP-23
