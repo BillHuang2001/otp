@@ -19,6 +19,42 @@
 //! The concurrency test in `tests/ets_shared.rs` proves it: `N` threads each insert
 //! `M` distinct keys and the finished table reports exactly `N × M` objects.
 //!
+//! # Terms may not outlive the guard (the aliasing hazard)
+//!
+//! The A.1 copy boundary is on the **insert** side only: an inserted object is
+//! deep-copied into the table-owned [`TermStore`](crate::store::TermStore) arena,
+//! but a *read* hands back `Eterm`s that **alias** those table-owned words. The
+//! arena never relocates, but it *reuses* words: a `delete` returns an object's
+//! runs to the store's per-size free lists and a later insert of an object of the
+//! same word size is handed exactly those words back. A term read under one guard
+//! and used after that guard is dropped therefore silently re-reads as a
+//! **different, well-formed object** — a wrong result, never a loud error.
+//!
+//! This handle does not hand the raw guard out. [`SharedTable::read`] and
+//! [`SharedTable::write`] return the guard-scoped views
+//! [`TableRead`]/[`TableWrite`], and *those* are the only source of terms, tagged
+//! with the lifetime of the borrow of the view (see the `view` module). A term
+//! that outlives its closure or its `read()` scope is a **compile error**:
+//!
+//! ```compile_fail
+//! use beam_ets::{Access, SharedTable, Table, TableId, TableKind, TableOptions};
+//! use beam_term::prelude::*;
+//!
+//! let mut opts = TableOptions::new();
+//! opts.set_kind(TableKind::Set);
+//! opts.set_access(Access::Public);
+//! let shared = SharedTable::new(Table::new(TableId::next(), opts).unwrap());
+//! let atoms = AtomTable::new();
+//!
+//! // Does not compile: the terms alias table storage and borrow the closure-local
+//! // view (which owns the read guard), so they cannot escape the closure.
+//! let leaked = shared.with_read(|view| view.lookup(make_small(1), &atoms)).unwrap();
+//! let _ = leaked.len();
+//! ```
+//!
+//! A caller that needs an *owned* term says so explicitly, with the allocating
+//! copy-out [`TableTerm::copy_into`](crate::table::TableTerm::copy_into).
+//!
 //! # Poisoning is reported, never swallowed
 //!
 //! A thread that panics while holding the lock poisons it. Because a panic mid
@@ -34,12 +70,18 @@
 //! per-bucket concurrency of `{write_concurrency, true}` (whose *observable* effects
 //! are only throughput, not results). A later pass may shard the lock; the
 //! observable `ets:*` semantics this crate owns are unaffected either way.
+//!
+//! The views are `!Send`: a [`TableRead`] carries a lazily-allocated scratch
+//! [`Heap`](beam_alloc::Heap) for the copy-out select family, and a bare
+//! `beam_alloc::Heap` is deliberately not `Send`. Moving a view — and with it terms
+//! aliasing the table — to another thread is exactly what must not happen, so this
+//! is a feature, not a limitation.
 
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock};
 
 use beam_common::Result;
 
-use super::{Table, TableId};
+use super::{Table, TableId, TableRead, TableWrite};
 
 /// The typed raise a poisoned table lock produces (never a silent `None`).
 const POISONED: &str = "table lock poisoned";
@@ -87,36 +129,54 @@ impl SharedTable {
 
     /// Take the table for reading (many readers may hold this at once).
     ///
+    /// Returns a [`TableRead`] rather than the raw `RwLockReadGuard`: the view owns
+    /// the guard, and the terms it hands out are lifetime-tagged to the view's
+    /// borrow, so a read result cannot outlive the guard (see the [module
+    /// docs](self) and the `view` module).
+    ///
     /// Reports the typed `unsupported_ets: table lock poisoned` raise when a writer
     /// panicked, rather than handing out a table whose invariants may be broken.
-    pub fn read(&self) -> Result<RwLockReadGuard<'_, Table>> {
-        self.inner
-            .read()
-            .map_err(|_| crate::error::unsupported(POISONED))
+    pub fn read(&self) -> Result<TableRead<'_>> {
+        Ok(TableRead::new(
+            self.inner
+                .read()
+                .map_err(|_| crate::error::unsupported(POISONED))?,
+        ))
     }
 
     /// Take the table for writing (exclusive).
     ///
+    /// Returns a [`TableWrite`] (see [`read`](SharedTable::read)).
+    ///
     /// Reports the typed `unsupported_ets: table lock poisoned` raise when a writer
     /// panicked.
-    pub fn write(&self) -> Result<RwLockWriteGuard<'_, Table>> {
-        self.inner
-            .write()
-            .map_err(|_| crate::error::unsupported(POISONED))
+    pub fn write(&self) -> Result<TableWrite<'_>> {
+        Ok(TableWrite::new(
+            self.inner
+                .write()
+                .map_err(|_| crate::error::unsupported(POISONED))?,
+        ))
     }
 
     /// Run `f` against the table under a read lock and return its result.
-    pub fn with_read<T>(&self, f: impl FnOnce(&Table) -> T) -> Result<T> {
-        let table = self.read()?;
-        Ok(f(&table))
+    ///
+    /// The closure receives `&mut TableRead<'_>`, so it can extract owned data
+    /// (`size`, `info`, …) or copy terms out with
+    /// [`copy_into`](crate::table::TableTerm::copy_into) — but it **cannot** return
+    /// a term that aliases table storage, because the term's lifetime is tied to the
+    /// closure-local view and `T` cannot name that lifetime. That is the whole point
+    /// (see the [module docs](self)).
+    pub fn with_read<T>(&self, f: impl FnOnce(&mut TableRead<'_>) -> T) -> Result<T> {
+        let mut view = self.read()?;
+        Ok(f(&mut view))
     }
 
     /// Run `f` against the table under an exclusive write lock and return its
     /// result. The whole closure runs inside the one guard, so a check-then-act
     /// sequence is atomic with respect to other threads.
-    pub fn with_write<T>(&self, f: impl FnOnce(&mut Table) -> T) -> Result<T> {
-        let mut table = self.write()?;
-        Ok(f(&mut table))
+    pub fn with_write<T>(&self, f: impl FnOnce(&mut TableWrite<'_>) -> T) -> Result<T> {
+        let mut view = self.write()?;
+        Ok(f(&mut view))
     }
 
     /// Consume this handle and return the table, when it is the **only** handle.
@@ -190,5 +250,23 @@ mod tests {
         drop(clone);
         let owned = shared.try_into_inner().unwrap();
         assert!(owned.is_some());
+    }
+
+    /// A poisoned lock raises the crate's typed error instead of handing out a
+    /// possibly-inconsistent table.
+    #[test]
+    fn a_poisoned_lock_is_reported_not_swallowed() {
+        let shared = SharedTable::new(table());
+        let poisoner = shared.clone();
+        let panicked = std::thread::spawn(move || {
+            let _ = poisoner.with_write(|_| panic!("poison the lock"));
+        })
+        .join();
+        assert!(panicked.is_err(), "the writer thread must have panicked");
+        assert!(shared.read().is_err(), "a poisoned read must raise");
+        assert!(shared.write().is_err(), "a poisoned write must raise");
+        // `id` is not part of the mutable state a panicking writer could have
+        // half-written, so it still answers (documented in `SharedTable::id`).
+        assert_eq!(shared.id(), shared.id());
     }
 }
