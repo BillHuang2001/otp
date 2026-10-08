@@ -23,6 +23,45 @@
 //! `is_not_tuple`/`is_not_small(tuple[1])` gate, the per-opcode `tuple_arity`
 //! checks and the `/* {DOP_SEND, From, To} -- Message */` trailing term),
 //! `erts/emulator/beam/external.c` and `dist.h` (`enum dop`).
+//!
+//! # The trailing term (`carries_message`)
+//!
+//! `erts_dist_command` does not read every opcode's payload out of the control
+//! tuple: several opcodes carry **one further term after the tuple**. The sender
+//! side makes this explicit by setting `ctx->msg` before `erts_dsig_send`
+//! (`dist.c:3194-3199`), and it happens for three opcode families:
+//!
+//! * the **send** family — `DOP_SEND`, `DOP_SEND_TT`, `DOP_SEND_SENDER`,
+//!   `DOP_SEND_SENDER_TT`, `DOP_REG_SEND`, `DOP_REG_SEND_TT`, `DOP_ALIAS_SEND`,
+//!   `DOP_ALIAS_SEND_TT` (`ctx->msg = message`) and `DOP_ALTACT_SIG_SEND`
+//!   (`ctx->msg = reason`, `dist.c:1822-1824`);
+//! * the **payload-exit** family used under `DFLAG_EXIT_PAYLOAD` — `DOP_PAYLOAD_EXIT`,
+//!   `DOP_PAYLOAD_EXIT_TT` (`dist.c:1744-1745`), `DOP_PAYLOAD_EXIT2`,
+//!   `DOP_PAYLOAD_EXIT2_TT` (`dist.c:1795-1798`) and `DOP_PAYLOAD_MONITOR_P_EXIT`
+//!   (`dist.c:1511-1514`) — where `ctx->msg = reason` carries the exit reason as a
+//!   payload because it is too large to inline;
+//! * the **spawn-request** family — `DOP_SPAWN_REQUEST` / `DOP_SPAWN_REQUEST_TT`
+//!   (`ctx->msg = alist`, `dist.c:1877`), where the trailing term is the argument
+//!   list.
+//!
+//! `DOP_SPAWN_REPLY` / `DOP_SPAWN_REPLY_TT` deliberately do **not** carry one
+//! (`ctx->msg = THE_NON_VALUE`, `dist.c:1897`), and neither do the signal opcodes
+//! built through `dsig_send_ctl` (which sets `ctx->msg = THE_NON_VALUE`,
+//! `dist.c:3201-3211`).
+//!
+//! # What is *not* in v6
+//!
+//! `enum dop` (`dist.h:140-183`) holds exactly the 30 opcodes modelled by
+//! [`Dop`]. In particular there is **no `DOP_NODEUP`/`DOP_NODEDOWN`**: node
+//! up/down are *local emulator events* delivered by `send_nodes_mon_msgs`
+//! (`dist.c:6931`), called from the connection-teardown path (`dist.c:864`) and
+//! the `nodeup` path (`dist.c:5063`, `dist.c:5475`) — never a control opcode — and
+//! `net_kernel:monitor_nodes/1,2` is served by the local emulator. There is also
+//! **no `DOP_DEMONITOR_ID` / `DOP_UNLINK_MONITOR_ID` / `DOP_DEMONITOR_MONITOR_ID`**.
+//! `DOP_UNLINK` (`4`) still exists in the enum but is *never sent* (the new link
+//! protocol has been mandatory since OTP 26 — `dist.c:2277-2282`), and the byte
+//! `5` is the pre-OTP ancient `DOP_NODE_LINK`, explicitly reusable
+//! (`dist.h:147`). [`Dop::from_u8`] rejects every byte that is not one of the 30.
 
 use beam_alloc::Heap;
 use beam_codec::{
@@ -32,7 +71,7 @@ use beam_common::{BeamError, Result};
 use beam_term::prelude::{is_small, make_small, signed_value};
 use beam_term::{AtomTable, Eterm};
 
-use crate::flags::Dop;
+use crate::flags::{Dop, DOP_ALTACT_SIG_FLG_TOKEN};
 
 /// A decoded distribution control message: the opcode plus its term arguments.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -44,12 +83,23 @@ pub struct ControlMessage {
     pub terms: Vec<Eterm>,
 }
 
-/// Whether a control opcode's message carries the message term after the control
-/// tuple (`dist.c`: `/* {DOP_SEND, From, To} -- Message */`; `DOP_REG_SEND`,
-/// `DOP_ALIAS_SEND` and `DOP_ALTACT_SIG_SEND` likewise).
-fn carries_message(dop: Dop) -> bool {
+/// Whether a control opcode carries **one further term after the control tuple**
+/// (`dist.c`: `/* {DOP_SEND, From, To} -- Message */`).
+///
+/// This is the complete v6 set — the send family, the `DFLAG_EXIT_PAYLOAD`
+/// payload-exit family and the spawn-request family — derived from the sender
+/// paths that set `ctx->msg` before `erts_dsig_send` (see the module docs for the
+/// `dist.c` citations). It is **not** limited to the `/* -- Message */` opcodes:
+/// a payload exit carries its (payload) *reason* and a spawn request its *argument
+/// list* in exactly the same position.
+///
+/// The [`ControlMessage`] shape is *flattened*: the [`Dop::arity`] control
+/// arguments, followed — for a `carries_message` opcode — by that single trailing
+/// term last.
+pub fn carries_message(dop: Dop) -> bool {
     matches!(
         dop,
+        // The send family.
         Dop::Send
             | Dop::SendTt
             | Dop::SendSender
@@ -59,7 +109,44 @@ fn carries_message(dop: Dop) -> bool {
             | Dop::AliasSend
             | Dop::AliasSendTt
             | Dop::AltactSigSend
+            // The `DFLAG_EXIT_PAYLOAD` payload-exit family.
+            | Dop::PayloadExit
+            | Dop::PayloadExitTt
+            | Dop::PayloadExit2
+            | Dop::PayloadExit2Tt
+            | Dop::PayloadMonitorPExit
+            // The spawn-request family (`ctx->msg = alist`; `dist.c:1877`).
+            | Dop::SpawnRequest
+            | Dop::SpawnRequestTt
     )
+}
+
+/// The number of **control arguments** (tuple elements after the opcode) an
+/// opcode's control tuple carries, given the flattened `terms`.
+///
+/// For every opcode but `DOP_ALTACT_SIG_SEND` this is exactly [`Dop::arity`]. That
+/// one is *variable arity*: the tuple is `{DOP_ALTACT_SIG_SEND, Flags, SenderPid,
+/// To}` or `{DOP_ALTACT_SIG_SEND, Flags, SenderPid, To, Token}` — the extra token
+/// element is present **iff** `Flags` has `ERTS_DOP_ALTACT_SIG_FLG_TOKEN` set
+/// (`dist.c:2651-2658`). Reading the flag is what keeps the trailing message on
+/// the *right side* of the tuple.
+fn control_arg_count(dop: Dop, terms: &[Eterm]) -> usize {
+    if dop == Dop::AltactSigSend {
+        let token = terms.first().copied().is_some_and(altact_flags_has_token);
+        return if token { 4 } else { 3 };
+    }
+    dop.arity()
+}
+
+/// `(Flags & ERTS_DOP_ALTACT_SIG_FLG_TOKEN) != 0` for an `AltactSigSend` `Flags`
+/// term (`dist.c:2628-2658`).
+///
+/// The C accepts a small integer or a bignum and reads the low byte. Only the
+/// low five bits are defined, so a small integer is sufficient here: a non-small
+/// `Flags` (a bignum) is treated as token-less by the caller, which never
+/// mis-places a message the caller did not ask for.
+fn altact_flags_has_token(flags: Eterm) -> bool {
+    is_small(flags) && (signed_value(flags) & i64::from(DOP_ALTACT_SIG_FLG_TOKEN)) != 0
 }
 
 /// Encodes a control message into its on-wire **tuple form**: the ETF tuple
@@ -76,11 +163,16 @@ pub fn encode_control(dop: Dop, terms: &[Eterm], atoms: &AtomTable) -> Result<Ve
 /// every atom through an outbound distribution atom cache.
 ///
 /// `terms` is the *flattened* shape [`ControlMessage`] carries: the [`Dop::arity`]
-/// control arguments and, when the opcode carries a message, the single trailing
-/// message term. The message is split off only when the count is exactly
-/// `arity + 1`; otherwise every element is a control argument, which keeps the
-/// variable-arity tolerance of `DOP_ALTACT_SIG_SEND` (`dist.c:2625`:
-/// `tuple_arity >= 4`).
+/// control arguments and, when the opcode [`carries_message`], the single trailing
+/// term. The trailing term is split off only when the count is exactly one more
+/// than the opcode's control-argument count; otherwise every element is a control
+/// argument, which keeps the variable-arity tolerance of `DOP_ALTACT_SIG_SEND`
+/// (`dist.c:2625`: `tuple_arity >= 4`).
+///
+/// The control-argument count is [`Dop::arity`] for every opcode but
+/// `DOP_ALTACT_SIG_SEND`, whose token element is present iff its `Flags` term has
+/// `ERTS_DOP_ALTACT_SIG_FLG_TOKEN` set (`dist.c:2651-2658`) — so a token-carrying
+/// altact tuple is `{op, Flags, Sender, To, Token} -- Message`, not a 6-tuple.
 ///
 /// The opcode is a real small-integer term (`external.c:6680-6685`:
 /// `ep[0] == SMALL_TUPLE_EXT && ep[1] == arity && ep[2] == SMALL_INTEGER_EXT &&
@@ -105,9 +197,10 @@ pub fn encode_control_cached(
     atoms: &AtomTable,
     cache: Option<&mut dyn beam_codec::AtomCacheWriter>,
 ) -> Result<Vec<u8>> {
-    let has_message = carries_message(dop) && terms.len() == dop.arity() + 1;
+    let nargs = control_arg_count(dop, terms);
+    let has_message = carries_message(dop) && terms.len() == nargs + 1;
     let (control_terms, message) = if has_message {
-        (&terms[..dop.arity()], Some(terms[dop.arity()]))
+        (&terms[..nargs], Some(terms[nargs]))
     } else {
         (terms, None)
     };
@@ -142,14 +235,15 @@ pub fn encode_control_cached(
 }
 
 /// Decodes a control message from its on-wire tuple form: the ETF tuple
-/// `{DOP_*, …}` plus, for a message-carrying opcode, the trailing message term.
+/// `{DOP_*, …}` plus, for an opcode that [`carries_message`], the trailing term.
 ///
 /// The tuple's arity is authoritative (`dist.c:2205`), so exactly that many
 /// elements are decoded — the first is the opcode (which must be a
-/// `SMALL_INTEGER_EXT` small integer), the rest are the control arguments. A
-/// message-carrying opcode then contributes one more term (the message). The
-/// result is the *flattened* [`ControlMessage`] shape: the control arguments
-/// followed, for a `send` opcode, by the message term last.
+/// `SMALL_INTEGER_EXT` small integer), the rest are the control arguments. An
+/// opcode that [`carries_message`] then contributes one more term (the trailing
+/// message / payload / argument list). The result is the *flattened*
+/// [`ControlMessage`] shape: the control arguments followed, for such an opcode,
+/// by the trailing term last.
 ///
 /// The arity rule mirrors `erts_dist_command`: the control arguments must number
 /// exactly [`Dop::arity`], except the variable-arity `DOP_ALTACT_SIG_SEND`, which
