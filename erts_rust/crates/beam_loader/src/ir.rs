@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::attributes::{AttributeTable, SharedAttributeTable};
 use crate::literal::LiteralArea;
 use crate::operand::Label;
 
@@ -289,9 +290,21 @@ pub struct Module {
     /// The `StrT` string table bytes.
     pub strings: Vec<u8>,
     /// The raw `Attr` chunk bytes, if present.
+    ///
+    /// Kept alongside [`Module::attribute_table`] (the decoded term) — the raw bytes
+    /// are what feeds the module checksum, the decoded term what
+    /// `module_info(attributes)` serves.
     pub attributes: Option<Vec<u8>>,
+    /// The decoded `Attr` chunk: the module's attributes as an Erlang term.
+    ///
+    /// Shared behind an [`Arc`] (the table owns a heap), so a `Module` clone stays
+    /// cheap. Reachable through [`Module::attributes_term`] /
+    /// [`Module::attribute_by_name`].
+    pub attribute_table: SharedAttributeTable,
     /// The raw `CInf` chunk bytes, if present.
     pub compile_info: Option<Vec<u8>>,
+    /// The raw `Meta` chunk bytes, if present (tooling-only, part of the checksum).
+    pub meta: Option<Vec<u8>>,
 }
 
 impl Default for Module {
@@ -313,7 +326,9 @@ impl Default for Module {
             literals: Arc::new(LiteralArea::default()),
             strings: Vec::new(),
             attributes: None,
+            attribute_table: Arc::new(AttributeTable::default()),
             compile_info: None,
+            meta: None,
         }
     }
 }
@@ -385,5 +400,26 @@ impl Module {
     pub fn record_by_name(&self, name: &str) -> Option<&RecordDefinition> {
         let atom = self.atom_table.lookup(name)?;
         self.record(atom)
+    }
+
+    /// The module's attributes as a decoded Erlang term (the `Attr` chunk), or `None`
+    /// when the chunk is absent/empty.
+    ///
+    /// This is exactly what the oracle's `Module:module_info(attributes)` returns: a
+    /// `[{Key, Value}]` property list. The terms point into the module's own atom table
+    /// and attribute heap, so they stay valid for as long as this module.
+    pub fn attributes_term(&self) -> Option<Eterm> {
+        self.attribute_table.term()
+    }
+
+    /// The value of the attribute named `name` (e.g. `"vsn"`), or `None` when the
+    /// module declares no such attribute.
+    ///
+    /// The name is resolved through this module's atom table first (like
+    /// [`Module::record_by_name`]), so the lookup works with the module-local atoms the
+    /// decoded attribute list carries.
+    pub fn attribute_by_name(&self, name: &str) -> Option<Eterm> {
+        let atom = self.atom_table.lookup(name)?;
+        self.attribute_table.lookup(beam_term::make_atom(atom))
     }
 }
