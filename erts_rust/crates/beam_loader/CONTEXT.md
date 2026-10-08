@@ -511,6 +511,16 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   compiler emits none of the 60, so the observed residual census over the installed stdlib/kernel/compiler
   modules is **empty** (`tests/generic_census.rs` pins it); it is a deliberate, lossless gap — never a
   wrong result.
+- **Previously-unexercised variants are now fixture-proven reachable (not merely claimed).** The on-PATH
+  OTP-29 `erlc` DOES emit the native-record family: the committed `nr_def`/`nr_use` pair lowers 186-191
+  typed. `executable_line` (183) / `debug_line` (184) are reachable via `+line_coverage` /`+beam_debug_info`
+  and `bs_test_tail2` (121) via `+no_ssa_opt`; each has a committed fixture and a typed-lowering test.
+  Opcodes 192/193 stay unreachable (OTP-30 additions to `genop.tab` this `erlc` cannot emit) — their typed
+  lowering is covered by `src/lower/instr.rs` unit tests only. None of these falls back to `Generic`. Their
+  *execution* is oracle-checked one level up at the `../tools/differential` gate (its `records.rs` `nr_native`
+  module, run under both runtimes through `beam_rt`); `beam_engine`'s own suite covers them structurally
+  only, and `put_record/6`'s cross-module create form is a typed `unsupported` there (see
+  `../../crates/CONTEXT.md`).
 - **Lowering is strictly 1:1 — no `ops.tab` transform / superinstruction combining.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`; it does not expand multi-instruction sequences nor build the C loader's superinstructions (the C does that from `emu/ops.tab` in `beam_load.c`). A `.beam` file carries only generic opcodes, so this is an engine-side optimization the interpreter does not need — never a correctness gap.
 - **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
 - **Contract A.2 divergences from the C loader (`beam_load.c`/`beam_file.c`), both currently unenforced:**
