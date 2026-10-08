@@ -45,6 +45,7 @@ mod keypos;
 mod large;
 mod lookup;
 mod matchspec;
+mod multikind;
 mod navigation;
 mod reclamation;
 mod replace;
@@ -522,6 +523,7 @@ pub fn rust_battery() -> Vec<(String, String)> {
     cases.extend(large::large_cases(&mut battery));
     cases.extend(reclamation::reclamation_cases(&mut battery));
     cases.extend(access::access_cases(&mut battery));
+    cases.extend(multikind::multikind_cases(&mut battery));
 
     cases
 }

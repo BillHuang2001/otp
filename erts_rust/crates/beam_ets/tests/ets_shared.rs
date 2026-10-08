@@ -51,7 +51,7 @@ use std::thread;
 use std::time::Duration;
 
 use beam_alloc::Heap as RebuildHeap;
-use beam_ets::{Access, SharedTable, Table, TableId, TableKind, TableOptions, TermStore};
+use beam_ets::{Access, SharedTable, Table, TableId, TableKind, TableOptions, TableTerm, TermStore};
 use beam_term::prelude::*;
 
 use common::oracle;
@@ -121,21 +121,30 @@ fn worker_heap() -> Heap {
 ///
 /// This is the torn-entry detector of the reader tests: a half-written object (a
 /// missing/duplicated element, a stale pointer, an out-of-band word) fails here.
-fn as_pair(object: Eterm) -> (i64, i64) {
-    // SAFETY: `object` is a live, table-owned term just read back through the public
-    // API, so inspecting its tag/header word is well defined.
-    assert!(
-        unsafe { is_tuple_arity(object, 2) },
+///
+/// `object` is read through the view's lifetime-tagged [`TableTerm`], so every
+/// element access stays inside the read guard the term was read under; the returned
+/// pair is owned, so it — and only it — may outlive that guard.
+fn as_pair(object: &TableTerm<'_>) -> (i64, i64) {
+    assert_eq!(
+        object.tuple_arity(),
+        Some(2),
         "every stored object is a 2-tuple"
     );
-    // SAFETY: `is_tuple_arity` established a live 2-tuple, so both element words are
-    // in bounds and well-formed.
-    let (key, value) = unsafe { (tuple_element(object, 0), tuple_element(object, 1)) };
-    assert!(
-        is_small(key) && is_small(value),
-        "every stored element is a small integer"
-    );
-    (signed_value(key), signed_value(value))
+    // Extract the two elements as *owned* small integers: reading them yields further
+    // tagged terms, which must not escape the guard, and the tests only ever compare
+    // their numeric values.
+    let key = object
+        .tuple_element(0)
+        .expect("a 2-tuple has a key element")
+        .as_small_int()
+        .expect("every stored element is a small integer");
+    let value = object
+        .tuple_element(1)
+        .expect("a 2-tuple has a value element")
+        .as_small_int()
+        .expect("every stored element is a small integer");
+    (key, value)
 }
 
 /// A shared `set` holding exactly the counter object `{COUNTER_KEY, 0}`.
@@ -205,14 +214,15 @@ fn drive_counter_increments(
     );
     let total = shared
         .with_read(|table| {
-            // Read the counter into an owned integer *inside* the guard: the `Eterm`
-            // a read returns aliases table-owned storage, which a later writer could
-            // reclaim and reuse.
+            // Read the counter into an owned integer *inside* the guard: the term a
+            // read returns is tagged to the closure-local view (and aliases
+            // table-owned storage), so a later writer could reclaim and reuse it.
             let counter = table
                 .lookup_element(make_small(COUNTER_KEY), 2, atoms)
                 .expect("the counter object is present");
-            assert!(is_small(counter), "the counter stays a small integer");
-            signed_value(counter)
+            counter
+                .as_small_int()
+                .expect("the counter stays a small integer")
         })
         .expect("an unpoisoned table lock");
     (total, returned_sum.load(Ordering::Relaxed))
@@ -591,22 +601,22 @@ fn two_interleaved_accessors_yield_the_serial_result() {
 
     let (size, listed_len, a_pairs, b_pairs, counter) = shared
         .with_read(|table| {
-            // Every check below runs *inside* the read guard: the `Eterm`s a read
-            // returns alias table-owned storage, so a result is only valid while the
-            // guard is still held (a later writer may remove the object and have its
-            // words reclaimed and reused). The owned `(i64, i64)` pairs are what
-            // outlives the guard.
+            // Every check below runs *inside* the read guard: a term a read returns is
+            // tagged to the closure-local view and aliases table-owned storage, so a
+            // result is only valid while the guard is still held (a later writer may
+            // remove the object and have its words reclaimed and reused). The owned
+            // `(i64, i64)` pairs are what outlives the guard.
             let a_pairs: Vec<Option<(i64, i64)>> = (0..SCRIPT_KEYS as i64)
-                .map(|key| single(table.lookup(make_small(key), &atoms)))
+                .map(|key| single(&table.lookup(make_small(key), &atoms)))
                 .collect();
             let b_pairs: Vec<Option<(i64, i64)>> = (0..SCRIPT_KEYS as i64)
-                .map(|i| single(table.lookup(make_small(B_KEY_BASE + i), &atoms)))
+                .map(|i| single(&table.lookup(make_small(B_KEY_BASE + i), &atoms)))
                 .collect();
-            let counter = signed_value(
-                table
-                    .lookup_element(make_small(SHARED_COUNTER_KEY), 2, &atoms)
-                    .expect("the shared counter is present"),
-            );
+            let counter = table
+                .lookup_element(make_small(SHARED_COUNTER_KEY), 2, &atoms)
+                .expect("the shared counter is present")
+                .as_small_int()
+                .expect("the shared counter is a small integer");
             (table.size(), table.tab2list().len(), a_pairs, b_pairs, counter)
         })
         .expect("an unpoisoned table lock");
@@ -652,7 +662,7 @@ fn two_interleaved_accessors_yield_the_serial_result() {
     // Every stored object is well-formed: no torn entry survived the interleaving.
     shared
         .with_read(|table| {
-            for &object in &table.tab2list() {
+            for object in &table.tab2list() {
                 as_pair(object);
             }
         })
@@ -661,10 +671,11 @@ fn two_interleaved_accessors_yield_the_serial_result() {
 
 /// Validate a `lookup` result — a `set` keeps at most one object per key — and
 /// return it as owned integers. **Must** be called while the table's read guard is
-/// held (see the aliasing note in the reader-churn test).
-fn single(hits: Vec<Eterm>) -> Option<(i64, i64)> {
+/// held (see the aliasing note in the reader-churn test); the returned pair is owned,
+/// so it may outlive the guard.
+fn single(hits: &[TableTerm<'_>]) -> Option<(i64, i64)> {
     assert!(hits.len() <= 1, "a `set` keeps at most one object per key");
-    hits.first().map(|&object| as_pair(object))
+    hits.first().map(|object| as_pair(object))
 }
 
 // ---------------------------------------------------------------------------
@@ -779,7 +790,7 @@ fn readers_see_only_consistent_states_under_writer_churn() {
                             // Every enumerated object is a well-formed
                             // `{Key, Key|Key+1}` — the two objects the writer stores.
                             let mut listed_keys = Vec::with_capacity(listed.len());
-                            for &object in &listed {
+                            for object in &listed {
                                 let (key, value) = as_pair(object);
                                 assert!(
                                     (0..CHURN_KEYS).contains(&key),
@@ -804,7 +815,7 @@ fn readers_see_only_consistent_states_under_writer_churn() {
                                     "a set keeps at most one object per key, found {}",
                                     hits.len()
                                 );
-                                for &object in &hits {
+                                for object in &hits {
                                     let (key, value) = as_pair(object);
                                     assert_eq!(
                                         key, probe,
@@ -847,7 +858,7 @@ fn readers_see_only_consistent_states_under_writer_churn() {
         .with_read(|table| {
             let listed = table.tab2list();
             assert_eq!(table.size(), listed.len());
-            for &object in &listed {
+            for object in &listed {
                 let (key, value) = as_pair(object);
                 assert!(value == key || value == key + 1);
             }

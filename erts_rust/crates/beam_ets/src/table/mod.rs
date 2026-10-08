@@ -32,13 +32,17 @@ mod interior;
 mod lifecycle;
 mod ownership;
 mod read;
+mod rename;
 mod shared;
 mod update;
+mod view;
 
 pub use access::TableAccess;
 pub use lifecycle::OwnerDeath;
 pub use ownership::{Heir, SetOpt};
+pub use rename::RenameOutcome;
 pub use shared::SharedTable;
+pub use view::{TableRead, TableTerm, TableWrite};
 pub(crate) use interior::Interior;
 use interior::build_interior;
 pub(crate) use update::{add_counters, counter_slot, replace_elements};
@@ -109,7 +113,9 @@ pub struct Table {
     opts: TableOptions,
     /// The owning process, if known.
     owner: Option<OwnerId>,
-    /// The heir installed with `ets:setopts/2` (`{heir, Pid, Data}`), if any.
+    /// The heir installed with `ets:setopts/2` / the creation-time `{heir, …}`
+    /// option, if any. Its gift data is `Some(term)` for `{heir, Pid, Data}`
+    /// (arity 3) and `None` for `{heir, Pid}` (arity 2) — see [`Heir::data`].
     heir: Option<Heir>,
     /// The table-owned term storage (the copy boundary).
     store: TermStore,
@@ -193,6 +199,10 @@ impl Table {
 
     /// The shared constructor: assemble the metadata, the store and the interior
     /// for `opts`, with the default `set` and `ordered_set` interiors.
+    ///
+    /// A creation-time `{heir, Pid, Data}` option installs the initial heir, whose
+    /// gift data is deep-copied into the table's store (see
+    /// [`build_with`](Table::build_with)).
     fn build(id: TableId, opts: TableOptions, store: TermStore) -> Result<Table> {
         Table::build_with(
             id,
@@ -207,16 +217,22 @@ impl Table {
     fn build_with(
         id: TableId,
         opts: TableOptions,
-        store: TermStore,
+        mut store: TermStore,
         set_interior: SetInterior,
         ordered_interior: OrderedInterior,
     ) -> Result<Table> {
         let interior = build_interior(opts.kind(), set_interior, ordered_interior);
+        // A creation-time `{heir, Pid, Data}` option (if any) is the table's
+        // initial heir; `ets:setopts/2` replaces it later. Its gift data is
+        // deep-copied into the table's own store through the same helper as
+        // `install_heir`, so it is table-owned (it survives the caller's heap being
+        // dropped) and its copy is reclaimed when the heir is replaced or cleared.
+        let heir = Table::copy_heir(&mut store, opts.heir())?;
         Ok(Table {
             id,
             opts,
             owner: None,
-            heir: None,
+            heir,
             store,
             set_interior,
             ordered_interior,
@@ -303,25 +319,44 @@ impl Table {
         Ok(())
     }
 
-    /// The table's current heir, if any.
+    /// The table's current heir, if any. Its `data` field distinguishes the
+    /// oracle's two `{heir, …}` forms: `Some(term)` for `{heir, Pid, Data}`
+    /// (arity 3), `None` for `{heir, Pid}` (arity 2, no gift data — and therefore
+    /// no `{'ETS-TRANSFER', …}` message on owner death).
     pub fn heir(&self) -> Option<Heir> {
         self.heir
     }
 
     /// Set (or clear) the heir directly (owner-level primitive; no access check).
+    ///
+    /// Reclaiming the outgoing heir's table-owned gift copy is **not** the caller's
+    /// job: the primitive funnels through the same
+    /// [`replace_heir`](Table::replace_heir) reclaim path as
+    /// [`install_heir`](Table::install_heir) and [`setopts`](Table::setopts), so no
+    /// overwrite site leaks the copy (the C `free_heir_data`,
+    /// `../../erts/emulator/beam/erl_db.c:5367`).
+    ///
+    /// Unlike [`install_heir`](Table::install_heir) it does **not** copy the gift
+    /// data, so a non-immediate `heir.data` must be a term the caller keeps alive
+    /// for the table's lifetime.
     pub fn set_heir(&mut self, heir: Option<Heir>) {
-        self.heir = heir;
+        self.replace_heir(heir);
     }
 
     /// `ets:setopts/2` for the `{heir, ...}` option: requires `caller` to be the
     /// current owner (`badarg` otherwise), then installs/clears the heir.
+    ///
+    /// `SetOpt::Heir` carries the option's arity in [`Heir::data`]: `Some(term)` for
+    /// `{heir, Pid, Data}` and `None` for `{heir, Pid}`. Like the primitive it
+    /// reclaims the outgoing heir's copy, and like the primitive it does **not** copy
+    /// the incoming gift data (prefer [`install_heir`](Table::install_heir)).
     pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()> {
         if caller != self.owner {
             return Err(badarg());
         }
         match opt {
-            SetOpt::Heir(heir) => self.heir = Some(heir),
-            SetOpt::ClearHeir => self.heir = None,
+            SetOpt::Heir(heir) => self.replace_heir(Some(heir)),
+            SetOpt::ClearHeir => self.replace_heir(None),
         }
         Ok(())
     }
@@ -342,6 +377,7 @@ impl Table {
             compressed: self.opts.is_compressed(),
             write_concurrency: self.opts.write_concurrency(),
             read_concurrency: self.opts.read_concurrency(),
+            decentralized_counters: self.opts.decentralized_counters(),
         }
     }
 

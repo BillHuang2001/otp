@@ -3,11 +3,12 @@
 //! Mirrors the option surface of the legacy `ets:new/2` (`db_new` in
 //! `../../erts/emulator/beam/erl_db.c`): the `type` (table kind), `keypos`, the
 //! `protection` (access mode), `named_table`, `compressed`,
-//! `{write_concurrency, Bool}` and `{read_concurrency, Bool}` options. Parsing
-//! the raw option list happens in `beam_bifs`; this module owns the **parsed**
-//! representation ([`TableOptions`]) and its defaults.
+//! `{write_concurrency, Bool}`, `{read_concurrency, Bool}`,
+//! `{heir, Pid}`/`{heir, Pid, Data}` and `{decentralized_counters, Bool}`
+//! options. Parsing the raw option list happens in `beam_bifs`; this module owns
+//! the **parsed** representation ([`TableOptions`]) and its defaults.
 
-use crate::table::OwnerId;
+use crate::table::{Heir, OwnerId};
 use beam_common::Result;
 use beam_term::prelude::*;
 
@@ -220,7 +221,8 @@ impl Concurrency {
 ///
 /// Built with the fluent builder ([`TableOptions::new`] plus the `set_*`
 /// methods) and read through the getters. Defaults: [`TableKind::Set`],
-/// `keypos` 1, [`Access::Protected`], not named, not compressed, no concurrency.
+/// `keypos` 1, [`Access::Protected`], not named, no name, not compressed, no
+/// concurrency, no heir and no explicit `decentralized_counters` option.
 #[derive(Debug, Clone)]
 pub struct TableOptions {
     /// The table kind.
@@ -243,6 +245,18 @@ pub struct TableOptions {
     /// Whether `read_concurrency` was requested. The **effective** value is
     /// [`TableOptions::read_concurrency`] (a `private` table forces it off).
     read_concurrency: bool,
+    /// The **creation-time** heir (`{heir, Pid}` / `{heir, Pid, Data}`), if one was
+    /// given. The value is adopted by [`Table::build`](crate::Table) as the table's
+    /// initial heir, which **deep-copies** its gift data into table-owned storage
+    /// (so the stored term does not alias the caller's heap); `ets:setopts(T,
+    /// {heir, …})` replaces it later. Its [`data`](Heir::data) records the option's
+    /// arity (`Some` for arity 3, `None` for arity 2) and holds the caller's raw
+    /// term here — the copy happens when the table is built, not in this builder.
+    heir: Option<Heir>,
+    /// The explicit `{decentralized_counters, Bool}` creation option, if given.
+    /// `None` means "not requested", i.e. the kind's default (see
+    /// [`TableOptions::decentralized_counters`]).
+    decentralized_counters: Option<bool>,
 }
 
 impl TableOptions {
@@ -257,6 +271,8 @@ impl TableOptions {
             compressed: false,
             write_concurrency: false,
             read_concurrency: false,
+            heir: None,
+            decentralized_counters: None,
         }
     }
 
@@ -314,6 +330,44 @@ impl TableOptions {
     /// Set whether concurrent readers are allowed (`read_concurrency`).
     pub fn set_read_concurrency(&mut self, read: bool) -> &mut Self {
         self.read_concurrency = read;
+        self
+    }
+
+    /// Install the **creation-time** heir (`{heir, Pid}` / `{heir, Pid, Data}` /
+    /// `{heir, none}`).
+    ///
+    /// `Some(heir)` records the heir a freshly built table starts with —
+    /// [`Table::build`](crate::Table) adopts it — and `None` clears it (what
+    /// `{heir, none}` means at creation). Infallible: unlike the raw option term
+    /// there is no malformed value to reject here, so the `badarg` for a
+    /// non-pid/`none` heir belongs to the `beam_bifs` option parser.
+    ///
+    /// The option's **arity** is carried in [`Heir::data`]: `Some(term)` is
+    /// `{heir, Pid, Data}` (arity 3, whose `term` the oracle delivers verbatim —
+    /// `undefined` included) and `None` is `{heir, Pid}` (arity 2, no gift data, so
+    /// the oracle sends **no** `{'ETS-TRANSFER', …}` message on owner death). That
+    /// distinction is the parser's to get right, just like the `none`/pid check.
+    ///
+    /// This builder records the gift data **as given** (it has no store of its own);
+    /// [`Table::build`](crate::Table) then **deep-copies** it into the table's
+    /// table-owned storage, exactly as [`Table::install_heir`](crate::Table::install_heir)
+    /// does for a later `setopts/2`, so the resulting creation-time heir does not
+    /// alias the caller's heap and its copy is reclaimed when the heir is replaced
+    /// or cleared.
+    pub fn set_heir(&mut self, heir: Option<Heir>) -> &mut Self {
+        self.heir = heir;
+        self
+    }
+
+    /// Set the explicit `{decentralized_counters, Bool}` creation option.
+    ///
+    /// `Some(value)` records the explicit option — which **wins** over the kind's
+    /// default whatever its value (the C `decentralized_counters_option`
+    /// override) — and `None` clears it, restoring the default. Infallible: the
+    /// `badarg` for a non-boolean `{decentralized_counters, _}` belongs to the
+    /// `beam_bifs` option parser.
+    pub fn set_decentralized_counters(&mut self, explicit: Option<bool>) -> &mut Self {
+        self.decentralized_counters = explicit;
         self
     }
 
@@ -377,6 +431,56 @@ impl TableOptions {
     /// out of the normalization.
     fn is_private(&self) -> bool {
         self.access == Access::Private
+    }
+
+    /// The creation-time heir, if one was requested. Its [`data`](Heir::data) is
+    /// `Some(term)` for `{heir, Pid, Data}` and `None` for `{heir, Pid}`.
+    ///
+    /// This is the **raw** option: a non-immediate `data` is the caller's term,
+    /// recorded as given. [`Table::build`](crate::Table) deep-copies it into
+    /// table-owned storage when the table is constructed.
+    pub fn heir(&self) -> Option<Heir> {
+        self.heir
+    }
+
+    /// The **explicit** `{decentralized_counters, Bool}` option exactly as given,
+    /// or `None` when the option was not requested.
+    ///
+    /// This is the raw parsed option; [`decentralized_counters`](Self::decentralized_counters)
+    /// is the value the oracle actually reports.
+    pub fn decentralized_counters_option(&self) -> Option<bool> {
+        self.decentralized_counters
+    }
+
+    /// The `decentralized_counters` value the oracle reports for a table built
+    /// from this option set — the value `ets:info(T, decentralized_counters)`
+    /// returns.
+    ///
+    /// Measured against the system `erl` (OTP 29.1.1 / erts-17.1) and matching the
+    /// legacy C `db_new` (`../../erts/emulator/beam/erl_db.c`), the observable
+    /// value is `DB_FINE_LOCKED && is_decentralized_counters`, where
+    /// `is_decentralized_counters` is the **explicit** option when given and
+    /// otherwise `true` only for an `ordered_set` (the `am_ordered_set` list
+    /// element sets it). Concretely:
+    ///
+    /// * `ordered_set` with `{write_concurrency, true}` ⇒ `true` (the CATREE
+    ///   path), and an explicit `{decentralized_counters, false}` overrides it
+    ///   back to `false`;
+    /// * `set`/`bag`/`duplicate_bag` with `{write_concurrency, true}` ⇒ `false`,
+    ///   but `{decentralized_counters, true}` **together with**
+    ///   `{write_concurrency, true}` ⇒ `true`;
+    /// * the explicit option **alone** (no effective `write_concurrency`) ⇒
+    ///   `false` — the fine-locked flag gates it, and a `private` table never gets
+    ///   that flag (hence the normalized
+    ///   [`write_concurrency`](TableOptions::write_concurrency) here).
+    pub fn decentralized_counters(&self) -> bool {
+        // `DB_FINE_LOCKED` (the normalized concurrency flag) gates the counters
+        // flag, which is the explicit option when given and the kind's default
+        // (`true` only for `ordered_set`) otherwise.
+        let counters_flag = self
+            .decentralized_counters
+            .unwrap_or(self.kind.is_ordered());
+        self.write_concurrency() && counters_flag
     }
 
     /// The concurrency mode in effect, derived from the normalized
@@ -488,6 +592,9 @@ mod tests {
         assert!(!opts.is_compressed());
         assert!(!opts.write_concurrency());
         assert!(!opts.read_concurrency());
+        assert_eq!(opts.heir(), None);
+        assert_eq!(opts.decentralized_counters_option(), None);
+        assert!(!opts.decentralized_counters());
     }
 
     #[test]
@@ -532,6 +639,120 @@ mod tests {
         assert!(opts.write_concurrency());
         assert!(opts.read_concurrency());
         assert!(opts.is_named());
+    }
+
+    /// The measured `ets:info(T, decentralized_counters)` rule, row by row.
+    ///
+    /// Every row is a live-oracle observation (system `erl`, OTP 29.1.1 /
+    /// erts-17.1) of `ets:new/2` followed by `ets:info(T, decentralized_counters)`
+    /// and reproduces the C `db_new`: the observable value is
+    /// `DB_FINE_LOCKED && is_decentralized_counters`, the explicit option
+    /// overrides the kind's default (which is `true` only for `ordered_set`), and
+    /// `DB_FINE_LOCKED` needs an effective `write_concurrency`.
+    #[test]
+    fn decentralized_counters_follows_the_measured_oracle_rule() {
+        // (kind, access, write_concurrency, explicit option, oracle value)
+        let rows: &[(TableKind, Access, bool, Option<bool>, bool)] = &[
+            // (a) option omitted: only `ordered_set` + effective `write_concurrency`.
+            (TableKind::Set, Access::Protected, false, None, false),
+            (TableKind::OrderedSet, Access::Protected, false, None, false),
+            (TableKind::Bag, Access::Protected, false, None, false),
+            (TableKind::DuplicateBag, Access::Protected, false, None, false),
+            (TableKind::Set, Access::Protected, true, None, false),
+            (TableKind::OrderedSet, Access::Protected, true, None, true),
+            (TableKind::Bag, Access::Protected, true, None, false),
+            (TableKind::DuplicateBag, Access::Protected, true, None, false),
+            // (b) an explicit option alone is gated on the fine-locked flag.
+            (TableKind::Set, Access::Protected, false, Some(true), false),
+            (TableKind::OrderedSet, Access::Protected, false, Some(true), false),
+            (TableKind::Bag, Access::Protected, false, Some(true), false),
+            // (c) the explicit option wins for a non-`ordered_set` kind.
+            (TableKind::Set, Access::Protected, true, Some(true), true),
+            (TableKind::Bag, Access::Protected, true, Some(true), true),
+            (TableKind::DuplicateBag, Access::Protected, true, Some(true), true),
+            // ... and it overrides `ordered_set`'s default both ways.
+            (TableKind::OrderedSet, Access::Protected, true, Some(true), true),
+            (TableKind::OrderedSet, Access::Protected, true, Some(false), false),
+            (TableKind::OrderedSet, Access::Protected, false, Some(false), false),
+            (TableKind::Set, Access::Protected, true, Some(false), false),
+            // A `private` table never gets the fine-locked flag.
+            (TableKind::OrderedSet, Access::Private, true, None, false),
+            (TableKind::Set, Access::Private, true, Some(true), false),
+            // `read_concurrency` does not affect it.
+            (TableKind::OrderedSet, Access::Public, true, None, true),
+        ];
+
+        for &(kind, access, write_concurrency, explicit, expected) in rows {
+            let mut opts = TableOptions::new();
+            opts.set_kind(kind)
+                .set_access(access)
+                .set_write_concurrency(write_concurrency)
+                .set_read_concurrency(write_concurrency)
+                .set_decentralized_counters(explicit);
+            assert_eq!(
+                opts.decentralized_counters(),
+                expected,
+                "{kind:?} {access:?} write_concurrency={write_concurrency} \
+                 explicit={explicit:?}"
+            );
+            assert_eq!(opts.decentralized_counters_option(), explicit);
+        }
+    }
+
+    /// Clearing the explicit option restores the kind's default; `TableOptions`
+    /// never hides the raw option.
+    #[test]
+    fn decentralized_counters_option_round_trips_and_resets() {
+        let mut opts = TableOptions::new();
+        opts.set_kind(TableKind::Set).set_write_concurrency(true);
+        assert!(!opts.decentralized_counters());
+
+        opts.set_decentralized_counters(Some(true));
+        assert_eq!(opts.decentralized_counters_option(), Some(true));
+        assert!(opts.decentralized_counters());
+
+        opts.set_decentralized_counters(None);
+        assert_eq!(opts.decentralized_counters_option(), None);
+        assert!(!opts.decentralized_counters());
+
+        // `{decentralized_counters,false}` on an `ordered_set` sticks.
+        let mut ordered = TableOptions::new();
+        ordered
+            .set_kind(TableKind::OrderedSet)
+            .set_write_concurrency(true)
+            .set_decentralized_counters(Some(false));
+        assert!(!ordered.decentralized_counters());
+    }
+
+    /// The creation-time heir is stored on the options **as given** (gift data
+    /// included — the copy into table storage happens later, in
+    /// [`Table::build`](crate::Table)) and can be cleared, exactly like
+    /// `{heir, Pid, Data}` / `{heir, none}` at creation. The arity-2
+    /// `{heir, Pid}` form is the `data: None` heir.
+    #[test]
+    fn creation_time_heir_is_stored_and_cleared() {
+        let mut opts = TableOptions::new();
+        assert_eq!(opts.heir(), None);
+
+        let heir = Heir {
+            owner: OwnerId::new(4),
+            data: Some(make_small(11)),
+        };
+        opts.set_heir(Some(heir));
+        assert_eq!(opts.heir(), Some(heir));
+        assert_eq!(opts.heir().and_then(|h| h.data), Some(make_small(11)));
+
+        // The arity-2 form: an heir with no gift data at all.
+        let arity_two = Heir {
+            owner: OwnerId::new(4),
+            data: None,
+        };
+        opts.set_heir(Some(arity_two));
+        assert_eq!(opts.heir(), Some(arity_two));
+        assert_eq!(opts.heir().and_then(|h| h.data), None);
+
+        opts.set_heir(None);
+        assert_eq!(opts.heir(), None);
     }
 
     #[test]

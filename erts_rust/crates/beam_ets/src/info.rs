@@ -18,10 +18,12 @@
 //!   heir *pid*, which this stage cannot represent — see [`TableInfo::heir`]);
 //! * `node` is always the atom `nonode@nohost` (the runtime is never
 //!   distributed, matching the oracle's `erl -noshell` with no `-sname`);
-//! * `decentralized_counters` is `true` iff the table is an `ordered_set`
-//!   **and** `write_concurrency` is on (the CATREE path the oracle reports),
-//!   otherwise `false`. The explicit `{decentralized_counters, Bool}` creation
-//!   option is not supported by this crate.
+//! * `decentralized_counters` is the value the oracle derives at creation time —
+//!   [`TableOptions::decentralized_counters`](crate::TableOptions::decentralized_counters)
+//!   owns the measured rule (the explicit `{decentralized_counters, Bool}`
+//!   option wins over the kind's default, and the effective flag is gated on
+//!   `write_concurrency`). [`TableInfo`] carries the resolved value, so nothing
+//!   is recomputed here.
 //!
 //! `owner` is a **documented gap**: the oracle reports the owner *pid*, which
 //! this stage cannot represent, so it is rendered as the atom `undefined`.
@@ -65,6 +67,17 @@ pub struct TableInfo {
     pub write_concurrency: bool,
     /// Whether concurrent readers are enabled.
     pub read_concurrency: bool,
+    /// The `decentralized_counters` value the oracle reports for the table.
+    ///
+    /// Resolved once, at creation time, by
+    /// [`TableOptions::decentralized_counters`](crate::TableOptions::decentralized_counters)
+    /// (the measured `db_new` rule: the explicit `{decentralized_counters, Bool}`
+    /// option wins over the kind's default — `true` only for `ordered_set` — and
+    /// the result is gated on the effective `write_concurrency`). It is carried
+    /// here rather than derived from [`kind`](Self::kind)/
+    /// [`write_concurrency`](Self::write_concurrency) because the explicit option
+    /// is not recoverable from those two.
+    pub decentralized_counters: bool,
 }
 
 /// A `(field-atom, value)` pair, with the field name interned in `atoms`.
@@ -90,9 +103,10 @@ impl TableInfo {
     ///
     /// `heir` is the atom `none` when unset and `undefined` when an heir is
     /// installed (the documented pid gap — see [`owner`](Self::owner) and
-    /// [`heir`](Self::heir)); `decentralized_counters` is `true` iff this is an
-    /// `ordered_set` with `write_concurrency` on (see the module docs); `owner`
-    /// is the atom `undefined` (the documented pid gap).
+    /// [`heir`](Self::heir)); `decentralized_counters` is the value resolved by
+    /// [`TableOptions::decentralized_counters`](crate::TableOptions::decentralized_counters)
+    /// at creation time (carried on this snapshot, not recomputed); `owner` is
+    /// the atom `undefined` (the documented pid gap).
     ///
     /// Heap-free: [`atoms`](AtomTable) is used only to intern the field-name
     /// atoms; values are returned as `(Atom, Eterm)` pairs.
@@ -110,10 +124,10 @@ impl TableInfo {
         let write_concurrency = bool_term(atoms, self.write_concurrency);
         let read_concurrency = bool_term(atoms, self.read_concurrency);
         let named_table = bool_term(atoms, self.named_table);
-        // The CATREE path: the oracle reports decentralized counters only for an
-        // `ordered_set` whose normalized `write_concurrency` flag is on.
-        let decentralized_counters =
-            bool_term(atoms, self.kind.is_ordered() && self.write_concurrency);
+        // The oracle reports `tb->common.counters.is_decentralized`, resolved by
+        // `db_new` from the fine-locked flag and the decentralized-counters flag
+        // (the explicit option wins over the kind's default).
+        let decentralized_counters = bool_term(atoms, self.decentralized_counters);
         // A fresh table's heir is the atom `none`; an installed heir is a pid term
         // this stage cannot represent (the documented gap), so it is `undefined`.
         let heir = match self.heir {

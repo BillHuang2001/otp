@@ -242,7 +242,7 @@ impl Battery {
             Some(owner),
             SetOpt::Heir(Heir {
                 owner: heir_pid,
-                data: gift,
+                data: Some(gift),
             }),
         ));
         let s2 = cap_unit(table.setopts(Some(owner), SetOpt::ClearHeir));
