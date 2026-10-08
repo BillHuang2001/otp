@@ -60,9 +60,18 @@
 //! remainder queued and **arms** write readiness) and while an asynchronous `connect` is
 //! completing. A fully drained queue drops writability again so the port cannot spin.
 //!
-//! `read(2) == 0` is end-of-file: EOF is latched ([`TcpInetDriver::eof`]) and no further reads
-//! are attempted. Writes use `send(2)` with `MSG_NOSIGNAL`, so a peer that went away is a typed
-//! [`beam_common::BeamError::Io`] rather than a process-killing `SIGPIPE`.
+//! `read(2) == 0` is end-of-file, and a connection reset (`ECONNRESET`/`ECONNABORTED` on a
+//! read, `ECONNRESET`/`EPIPE` on a write) is the same event: the peer's close is **latched**
+//! ([`TcpInetDriver::peer_closed`]), the socket's poller registration is released so a dead
+//! descriptor cannot keep producing readiness, and the socket is not touched again. Every
+//! later `recv`/`send` then answers the C's `[0] ++ "closed"` **once** and `[0] ++ "enotconn"`
+//! after that — the C's `TCP_ADDF_DELAYED_CLOSE_RECV`/`TCP_ADDF_DELAYED_CLOSE_SEND`
+//! bookkeeping (`inet_drv.c:855`-`:856`, `:12279`, `:12682`), which is how a caller that
+//! ignores its send errors still learns about the close from its next receive — instead of
+//! reading `0` repeatedly or writing into a socket the peer has gone from. Output still queued
+//! when the close is latched can never be delivered, so it is dropped (the C's
+//! `tcp_clear_output`, `inet_drv.c:12786`). Writes use `send(2)` with `MSG_NOSIGNAL`, so a
+//! vanished peer is never a process-killing `SIGPIPE`.
 //!
 //! # One socket, one port (the `accept` divergence)
 //!
@@ -99,6 +108,7 @@ use crate::drivers::fd::set_nonblocking;
 use crate::error;
 use crate::poller::{Interest, Token};
 
+mod sys;
 mod wire;
 
 // The wire vocabulary (control codes, packed-address codec, errno renderer) lives in the
@@ -109,6 +119,14 @@ pub use self::wire::{
     INET_REP_ERROR, INET_REP_OK, INET_TYPE_STREAM, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 use self::wire::{ctl_error, ctl_ok, ctl_xerror, errno_name, parse_address};
+
+// The raw `libc` socket wrappers (`socket`/`accept`/`bind`/`listen`/`getsockopt`/`shutdown`/
+// `close`) live in the private `sys` submodule, so every `unsafe` block of the driver sits in
+// one place.
+use self::sys::{
+    accept_socket, close_fd, has_peer, is_listening, local_port, shutdown_socket, socket_error,
+    socket_fd,
+};
 
 /// The driver's registered name — the C `tcp_inet` entry (`inet_drv.c:1348`), which is also
 /// what the oracle reports from `port_info(Port, name)` for a TCP port.
@@ -148,6 +166,58 @@ impl InetState {
     }
 }
 
+/// The peer-close bookkeeping the C keeps in `TCP_ADDF_DELAYED_CLOSE_RECV`/
+/// `TCP_ADDF_DELAYED_CLOSE_SEND` (`inet_drv.c:855`-`:856`).
+///
+/// Once the peer's close (end-of-file, or a connection reset) has been observed the socket is
+/// unusable, but the C does **not** reply `closed` forever: the *first* `recv` and the *first*
+/// `send` after the close report `closed`, and every later one reports `enotconn`. That is what
+/// lets a caller which ignores its send errors still learn about the close from its next
+/// receive (`inet_drv.c:12798`-`:12819`, `:13662`-`:13684`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct PeerClose {
+    /// The peer's end-of-file (or a connection reset) has been observed.
+    seen: bool,
+    /// Whether a `recv` has already reported the close.
+    recv_reported: bool,
+    /// Whether a `send` has already reported the close.
+    send_reported: bool,
+}
+
+impl PeerClose {
+    /// Records that the peer's close has just been observed, arming the one-shot `closed`
+    /// answer for **both** directions.
+    fn observe(&mut self) {
+        self.seen = true;
+        self.recv_reported = false;
+        self.send_reported = false;
+    }
+
+    /// The reply the next `recv` owes, or `None` while the connection is still usable.
+    fn recv_reply(&mut self) -> Option<&'static str> {
+        if !self.seen {
+            return None;
+        }
+        if self.recv_reported {
+            return Some("enotconn");
+        }
+        self.recv_reported = true;
+        Some("closed")
+    }
+
+    /// The reply the next `send` owes, or `None` while the connection is still usable.
+    fn send_reply(&mut self) -> Option<&'static str> {
+        if !self.seen {
+            return None;
+        }
+        if self.send_reported {
+            return Some("enotconn");
+        }
+        self.send_reported = true;
+        Some("closed")
+    }
+}
+
 /// The TCP socket driver: one listening or connected socket behind one port.
 ///
 /// Constructed either socket-less ([`TcpInetDriver::new`], the [`crate::DriverRegistry`]
@@ -165,6 +235,8 @@ pub struct TcpInetDriver {
     state: InetState,
     /// Set once the socket reported end-of-file, so no further reads are attempted.
     read_eof: bool,
+    /// How far the peer's close has been observed and reported ([`PeerClose`]).
+    peer_close: PeerClose,
     /// A `shutdown` deferred because the output queue was not empty yet (the C's
     /// `TCP_ADDF_PENDING_SHUT_WR`/`TCP_ADDF_PENDING_SHUT_RDWR`, `inet_drv.c:12362`) — applied
     /// as soon as the queue drains.
@@ -187,6 +259,7 @@ impl TcpInetDriver {
             interest: Interest::READABLE,
             state: InetState::Closed,
             read_eof: false,
+            peer_close: PeerClose::default(),
             pending_shutdown: None,
             connect_error: None,
         }
@@ -199,6 +272,9 @@ impl TcpInetDriver {
     /// starts in [`InetState::Listening`], a socket that has a peer (`getpeername(2)`) in
     /// [`InetState::Connected`], and anything else in [`InetState::Open`]. `fd` is put into
     /// non-blocking mode by [`Driver::start`].
+    ///
+    /// A socket whose peer has already closed is adopted as connected; the close is discovered
+    /// by the first read (which answers [`TcpInetDriver::peer_closed`]).
     ///
     /// # Errors
     ///
@@ -217,6 +293,7 @@ impl TcpInetDriver {
             interest: Interest::READABLE,
             state,
             read_eof: false,
+            peer_close: PeerClose::default(),
             pending_shutdown: None,
             connect_error: None,
         })
@@ -235,6 +312,19 @@ impl TcpInetDriver {
     /// Whether the socket reported end-of-file.
     pub fn eof(&self) -> bool {
         self.read_eof
+    }
+
+    /// Whether the peer's close has been observed — a read end-of-file, or a connection reset
+    /// seen by a read or a write.
+    ///
+    /// Once this is true the connection is gone: the socket is not touched again, output still
+    /// queued was dropped, and the driver's `recv`/`send` answer the C's `[0] ++ "closed"`
+    /// (once) and then `[0] ++ "enotconn"` (see [`PeerClose`]). The runtime reads it to emit
+    /// its `{tcp_closed, Port}` notification and to fail a command the driver could not
+    /// deliver with `{error, closed}` — it is the **only** new accessor the runtime needs; no
+    /// [`crate::PortNotification`] variant is involved.
+    pub fn peer_closed(&self) -> bool {
+        self.peer_close.seen
     }
 
     /// The lowercase errno name of an asynchronous `connect` that failed after the control
@@ -274,6 +364,7 @@ impl TcpInetDriver {
                 self.token = Some(token);
                 self.interest = Interest::READABLE;
                 self.read_eof = false;
+                self.peer_close = PeerClose::default();
                 self.connect_error = None;
                 Ok(())
             }
@@ -284,6 +375,15 @@ impl TcpInetDriver {
         }
     }
 
+    /// Marks the socket as a fresh, usable connection.
+    ///
+    /// A `connect`/`accept` that succeeded replaces whatever the previous socket was doing, so
+    /// the peer-close bookkeeping starts over too.
+    fn mark_connected(&mut self) {
+        self.state = InetState::Connected;
+        self.read_eof = false;
+        self.peer_close = PeerClose::default();
+    }
     /// Changes the socket's registered interest mask (registering it the first time).
     ///
     /// # Errors
@@ -320,6 +420,7 @@ impl TcpInetDriver {
             close_fd(fd);
         }
         self.read_eof = false;
+        self.peer_close = PeerClose::default();
         self.pending_shutdown = None;
         self.state = InetState::Closed;
     }
@@ -339,16 +440,18 @@ impl TcpInetDriver {
     /// Reads the socket into the port input queue, draining to `EAGAIN`.
     ///
     /// A no-op unless the socket is connected (a listening socket is read through `accept`,
-    /// not `read(2)`) or end-of-file has already been seen.
+    /// not `read(2)`) and the peer's close has not already been observed. Returns the number of
+    /// bytes read.
     ///
     /// # Errors
     ///
     /// Returns `BeamError::Io` when the read fails irrecoverably.
-    fn read_available(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
-        if !self.state.is_connected() || self.read_eof {
-            return Ok(());
+    fn read_available(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        if !self.state.is_connected() || self.peer_close.seen {
+            return Ok(0);
         }
         let fd = self.connected_socket()?;
+        let mut read = 0usize;
         let mut buf = [0u8; READ_CHUNK];
         loop {
             // SAFETY: `fd` is an open, non-blocking socket owned by this driver and `buf` is
@@ -356,22 +459,53 @@ impl TcpInetDriver {
             // bytes into it.
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), READ_CHUNK) };
             if n > 0 {
-                ctx.input().push(&buf[..n as usize]);
+                let n = n as usize;
+                ctx.input().push(&buf[..n]);
+                read += n;
                 // Edge-triggered readiness: keep reading until the socket is empty.
                 continue;
             }
             if n == 0 {
-                // The peer closed its end: latch EOF so no further reads are attempted.
+                // The peer closed its end: latch the close so this `recv` answers `closed`
+                // and no further read is ever attempted.
                 self.read_eof = true;
-                return Ok(());
+                self.latch_peer_close(ctx)?;
+                return Ok(read);
             }
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
-                Some(libc::EAGAIN) => return Ok(()),
+                Some(libc::EAGAIN) => return Ok(read),
+                // A reset (or an aborted connection) is the peer's close, not a read failure:
+                // the C's `tcp_recv` routes `ECONNRESET` to `tcp_recv_closed`
+                // (`inet_drv.c:13202`).
+                Some(libc::ECONNRESET) | Some(libc::ECONNABORTED) => {
+                    self.read_eof = true;
+                    self.latch_peer_close(ctx)?;
+                    return Ok(read);
+                }
                 _ => return Err(error::io(err)),
             }
         }
+    }
+
+    /// Latches the peer's close and drops the output that can no longer be delivered.
+    ///
+    /// This is the C's close path (`tcp_recv_closed`/`tcp_send_error`): the socket is
+    /// de-registered from the poller (a dead descriptor must not keep reporting readiness, the
+    /// rule `crate::drivers::FdDriver` follows at end-of-file) and its queued output is
+    /// discarded (`tcp_clear_output`, `inet_drv.c:12786`), because nothing can ever reach the
+    /// peer again. The **next** `recv`/`send` answers `closed` and every later one `enotconn`
+    /// (see [`PeerClose`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::Io` when the poller rejects the de-registration.
+    fn latch_peer_close(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        self.peer_close.observe();
+        self.pending_shutdown = None;
+        ctx.output().clear();
+        self.deregister(ctx)
     }
 
     /// Drains the port's output queue to the socket, returning the number of bytes written.
@@ -381,11 +515,20 @@ impl TcpInetDriver {
     /// `shutdown` that was deferred because the queue was not empty (the C's
     /// `TCP_ADDF_PENDING_SHUT_*`).
     ///
+    /// A write that fails because the peer is gone (`ECONNRESET`/`EPIPE`) is **not** an I/O
+    /// error: it latches the peer's close (see [`TcpInetDriver::peer_closed`]), exactly as the
+    /// C's `tcp_send_error` routes to `tcp_recv_closed` (`inet_drv.c:13440`).
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::BadArg` when the socket is not connected, or
     /// `BeamError::Io` when the write fails irrecoverably.
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
+        if self.peer_close.seen {
+            // The peer is gone: the queued output was dropped when the close was latched and
+            // the socket must not be touched again.
+            return Ok(0);
+        }
         let fd = self.connected_socket()?;
         let mut written = 0usize;
         let mut stalled = false;
@@ -422,6 +565,13 @@ impl TcpInetDriver {
                     stalled = true;
                     break;
                 }
+                // The peer vanished: a reset, or a write once its close was known. That is the
+                // connection ending, so it is latched (and reported by the caller's reply)
+                // rather than surfaced as a bare I/O error.
+                Some(libc::ECONNRESET) | Some(libc::EPIPE) => {
+                    self.latch_peer_close(ctx)?;
+                    return Ok(written);
+                }
                 _ => return Err(error::io(err)),
             }
         }
@@ -454,7 +604,7 @@ impl TcpInetDriver {
         let fd = self.socket.ok_or_else(error::badarg)?;
         let err = socket_error(fd)?;
         if err == 0 {
-            self.state = InetState::Connected;
+            self.mark_connected();
             self.set_interest(ctx, Interest::READABLE)
         } else {
             self.release_socket(ctx)?;
@@ -582,7 +732,7 @@ impl TcpInetDriver {
             self.close_socket();
             return Err(err);
         }
-        self.state = InetState::Connected;
+        self.mark_connected();
         let mut reply = ctl_ok();
         reply.extend_from_slice(&(accepted as i32).to_be_bytes());
         Ok(reply)
@@ -619,7 +769,7 @@ impl TcpInetDriver {
             )
         };
         if rc == 0 {
-            self.state = InetState::Connected;
+            self.mark_connected();
             self.set_interest(ctx, Interest::READABLE)?;
             return Ok(ctl_ok());
         }
@@ -633,7 +783,7 @@ impl TcpInetDriver {
             // `EISCONN` and `EALREADY` are the racy spellings of "it is already connected or
             // connecting"; report them as the C does rather than failing the control call.
             Some(libc::EISCONN) => {
-                self.state = InetState::Connected;
+                self.mark_connected();
                 self.set_interest(ctx, Interest::READABLE)?;
                 Ok(ctl_ok())
             }
@@ -647,6 +797,11 @@ impl TcpInetDriver {
     /// callback in the C; the remainder stays queued (with write readiness armed) exactly as
     /// a short `write(2)` leaves it.
     ///
+    /// Once the peer's close is known the verb answers `[0] ++ "closed"` **once** and
+    /// `[0] ++ "enotconn"` after that (the C's `tcp_inet_commandv` plus its
+    /// `TCP_ADDF_DELAYED_CLOSE_SEND` flag, `inet_drv.c:12682`); a `send` whose write is what
+    /// discovers the close answers `closed` too.
+    ///
     /// # Errors
     ///
     /// `BeamError::BadArg` when the socket is not connected, or the write failure
@@ -655,12 +810,28 @@ impl TcpInetDriver {
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
         }
+        if let Some(name) = self.peer_close.send_reply() {
+            return Ok(ctl_xerror(name));
+        }
         ctx.output().push(arg);
         let _written = self.write_pending(ctx)?;
+        if self.peer_close.seen {
+            // This write is what found the peer gone, so it answers `closed` itself; the C
+            // does the same (`inet_reply_error_am(…, am_closed)`, `inet_drv.c:13672`) and
+            // arms the next receive for `closed` as well.
+            self.peer_close.send_reported = true;
+            return Ok(ctl_xerror("closed"));
+        }
         Ok(ctl_ok())
     }
 
     /// The `recv` verb: reads everything available into the port input queue.
+    ///
+    /// Once the peer's close is known the verb answers `[0] ++ "closed"` **once** and
+    /// `[0] ++ "enotconn"` after that (the C's `TCP_ADDF_DELAYED_CLOSE_RECV`,
+    /// `inet_drv.c:12279`); a `recv` whose read is what discovers the close answers `closed`
+    /// too, and the bytes that read collected stay in the port input queue for the runtime to
+    /// deliver.
     ///
     /// # Errors
     ///
@@ -672,10 +843,18 @@ impl TcpInetDriver {
         if !self.state.is_connected() {
             return Ok(ctl_xerror("enotconn"));
         }
+        if let Some(name) = self.peer_close.recv_reply() {
+            return Ok(ctl_xerror(name));
+        }
         if !arg.is_empty() {
             return Err(error::badarg());
         }
-        self.read_available(ctx)?;
+        let read = self.read_available(ctx)?;
+        if read == 0 && self.peer_close.seen {
+            // This read is what found the peer gone, so it answers `closed` itself.
+            self.peer_close.recv_reported = true;
+            return Ok(ctl_xerror("closed"));
+        }
         Ok(ctl_ok())
     }
 
@@ -752,7 +931,7 @@ impl Driver for TcpInetDriver {
     fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         // A listening socket becomes readable when a connection is pending; accepting is
         // command-driven (`accept`), so there is nothing to read here.
-        self.read_available(ctx)
+        self.read_available(ctx).map(|_read| ())
     }
 
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
@@ -806,735 +985,5 @@ pub fn make_tcp_inet() -> Result<Box<dyn Driver>> {
     Ok(Box::new(TcpInetDriver::new()))
 }
 
-// ---------------------------------------------------------------------------
-// Raw socket syscalls
-// ---------------------------------------------------------------------------
-
-/// Creates a non-blocking IPv4 TCP socket.
-///
-/// # Errors
-///
-/// `BeamError::Io` when `socket(2)` or the non-blocking `fcntl(2)` fails.
-fn socket_fd() -> Result<RawFd> {
-    // SAFETY: `socket(2)` takes three integers and needs no pointer arguments.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(error::io(std::io::Error::last_os_error()));
-    }
-    match set_nonblocking(fd) {
-        Ok(()) => Ok(fd),
-        Err(err) => {
-            close_fd(fd);
-            Err(err)
-        }
-    }
-}
-
-/// Accepts one pending connection on `fd`.
-///
-/// The accepted descriptor is **not** put in non-blocking mode here (Linux does not inherit
-/// `O_NONBLOCK`); [`TcpInetDriver::adopt`] does that.
-///
-/// # Errors
-///
-/// The raw `accept(2)` failure, including `EAGAIN` when nothing is pending.
-fn accept_socket(fd: RawFd) -> std::io::Result<RawFd> {
-    // SAFETY: an all-zero `sockaddr_storage` is a valid value of that type and is exactly the
-    // out-parameter `accept(2)` expects; `len` starts as its size and the kernel only ever
-    // shrinks it.
-    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    // SAFETY: `fd` is an open socket owned by this driver, and `addr`/`len` are a valid
-    // address buffer and its length, so the kernel writes at most `len` bytes into `addr`.
-    let accepted = unsafe { libc::accept(fd, std::ptr::addr_of_mut!(addr).cast(), &mut len) };
-    if accepted < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(accepted)
-    }
-}
-
-/// Whether `fd` has a peer, i.e. is a connected socket (`getpeername(2)`).
-///
-/// This is the C's `sock_peer` check of `inet_ctl_fdopen` (`inet_drv.c:5254`): a stream
-/// socket that answers `getpeername(2)` is a connection, so an adopted descriptor can start
-/// out [`InetState::Connected`] instead of merely open.
-///
-/// # Errors
-///
-/// `BeamError::Io` when `getpeername(2)` fails for a reason other than "not connected"
-/// (`ENOTCONN`), which is the ordinary "no peer yet" answer.
-fn has_peer(fd: RawFd) -> Result<bool> {
-    // SAFETY: an all-zero `sockaddr_storage` is a valid value of that type and is exactly the
-    // out-parameter `getpeername(2)` expects; `len` starts as its size and the kernel only
-    // ever shrinks it.
-    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    // SAFETY: `fd` is an open socket owned by this driver, and `addr`/`len` are a valid
-    // address buffer and its length, so the kernel writes at most `len` bytes into `addr`.
-    if unsafe { libc::getpeername(fd, std::ptr::addr_of_mut!(addr).cast(), &mut len) } == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        // Not connected (and `ENOTCONN`'s `EINVAL` spelling for a listening socket): no peer.
-        Some(libc::ENOTCONN) | Some(libc::EINVAL) => Ok(false),
-        _ => Err(error::io(err)),
-    }
-}
-
-/// The local port `fd` is bound to (`getsockname(2)`).
-///
-/// # Errors
-///
-/// `BeamError::Io` when `getsockname(2)` fails.
-fn local_port(fd: RawFd) -> Result<u16> {
-    // SAFETY: an all-zero `sockaddr_storage` is a valid value of that type and is exactly the
-    // out-parameter `getsockname(2)` expects; `len` starts as its size and may be shrunk.
-    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    // SAFETY: `fd` is an open socket owned by this driver, and `addr`/`len` are a valid
-    // address buffer and its length, so the kernel writes at most `len` bytes into `addr`.
-    if unsafe { libc::getsockname(fd, std::ptr::addr_of_mut!(addr).cast(), &mut len) } != 0 {
-        return Err(error::io(std::io::Error::last_os_error()));
-    }
-    // The socket was created AF_INET, so the buffer holds a `sockaddr_in`.
-    let sin: libc::sockaddr_in = unsafe { std::ptr::read(addr_ptr_as_sockaddr_in(&addr)) };
-    Ok(u16::from_be(sin.sin_port))
-}
-
-/// Whether `fd` is a listening socket (`SO_ACCEPTCONN`).
-///
-/// # Errors
-///
-/// `BeamError::Io` when `fd` is not a usable socket.
-fn is_listening(fd: RawFd) -> Result<bool> {
-    // SAFETY: `option` is a writable `c_int` and `len` its valid size, which is exactly the
-    // out-parameter pair `getsockopt(2)` expects for a `c_int` option.
-    let mut option: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: `fd` is the caller's socket, and `option`/`len` are a valid buffer and size for
-    // a `c_int`-valued socket option.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ACCEPTCONN,
-            std::ptr::addr_of_mut!(option).cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(error::io(std::io::Error::last_os_error()));
-    }
-    Ok(option != 0)
-}
-
-/// Takes the pending socket error of `fd` (`getsockopt(SO_ERROR)`), which also clears it.
-///
-/// # Errors
-///
-/// `BeamError::Io` when `getsockopt(2)` fails.
-fn socket_error(fd: RawFd) -> Result<i32> {
-    // SAFETY: `err` is a writable `c_int` and `len` its valid size, which is exactly the
-    // out-parameter pair `getsockopt(2)` expects for `SO_ERROR`.
-    let mut err: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: `fd` is an open socket owned by this driver, and `err`/`len` are a valid buffer
-    // and size for `SO_ERROR`.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ERROR,
-            std::ptr::addr_of_mut!(err).cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(error::io(std::io::Error::last_os_error()));
-    }
-    Ok(err)
-}
-
-/// Shuts `fd` down in the direction `how` names (`SHUT_*`).
-///
-/// # Errors
-///
-/// The raw `shutdown(2)` failure (an out-of-range `how` is the kernel's `EINVAL`).
-fn shutdown_socket(fd: RawFd, how: u8) -> std::io::Result<()> {
-    // SAFETY: `fd` is an open socket owned by this driver and `shutdown(2)` takes no pointer
-    // arguments.
-    if unsafe { libc::shutdown(fd, how.into()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Closes `fd`, discarding the outcome.
-///
-/// There is no recovery from a failed `close(2)` and the only alternative — leaking the
-/// descriptor — is worse, so the result is dropped deliberately. The caller `take()`s the
-/// field it closes, so no descriptor is closed twice.
-fn close_fd(fd: RawFd) {
-    // SAFETY: `fd` is a socket this driver created (`socket(2)`/`accept(2)`) or adopted
-    // (`from_socket`), and it is closed exactly once by the ownership rules above.
-    let _ = unsafe { libc::close(fd) };
-}
-
-/// Views the start of `addr` as the `sockaddr_in` it holds.
-///
-/// A `sockaddr_storage` is at least as large and at least as aligned as a `sockaddr_in`, and
-/// the socket is AF_INET, so the kernel filled in exactly that structure.
-fn addr_ptr_as_sockaddr_in(addr: &libc::sockaddr_storage) -> *const libc::sockaddr_in {
-    std::ptr::from_ref(addr).cast()
-}
-
 #[cfg(test)]
-mod tests {
-    use super::wire::InetAddr;
-    use super::{
-        ctl_error, ctl_ok, ctl_xerror, errno_name, make_tcp_inet, parse_address, socket_fd,
-        InetState, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK,
-        INET_PROTO_DEFAULT, INET_REP_OK, INET_TYPE_STREAM, TCP_SHUT_RDWR, TCP_SHUT_WR,
-    };
-    use crate::driver::{Driver, DriverFlags};
-    use crate::poller::Poller;
-    use crate::port::{PortRegistry, PortState};
-    use crate::port_task::{PortTaskKind, Readiness};
-    use beam_common::BeamError;
-    use beam_process::PortId;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::os::unix::io::{AsRawFd, RawFd};
-    use std::time::{Duration, Instant};
-
-    /// How long a helper waits for the kernel or the peer before failing the test.
-    const WAIT: Duration = Duration::from_secs(5);
-
-    fn poller() -> Poller {
-        Poller::new().expect("a poll set")
-    }
-
-    /// A loopback listener the test owns (the driver is given its own copy of the fd).
-    fn loopback_listener() -> TcpListener {
-        TcpListener::bind("127.0.0.1:0").expect("a loopback listener")
-    }
-
-    /// The packed `open` argument: `[AF_INET, SOCK_STREAM, default protocol]`.
-    fn open_arg() -> [u8; 3] {
-        [INET_AF_INET, INET_TYPE_STREAM, INET_PROTO_DEFAULT]
-    }
-
-    /// The packed `bind`/`connect` argument naming `127.0.0.1:port`.
-    fn loopback_arg(port: u16) -> Vec<u8> {
-        let [hi, lo] = port.to_be_bytes();
-        vec![INET_AF_LOOPBACK, hi, lo]
-    }
-
-    /// A copy of `fd` (`dup(2)`), so the driver and the test each own a descriptor.
-    fn duplicate(fd: RawFd) -> RawFd {
-        // SAFETY: `fd` is an open descriptor owned by the caller and `dup(2)` takes no pointer
-        // arguments; it hands back a second descriptor for the same open file description.
-        let dup = unsafe { libc::dup(fd) };
-        assert!(dup >= 0, "dup(2) succeeded");
-        dup
-    }
-
-    /// Opens a port over `driver`.
-    fn open_port(poller: &mut Poller, driver: Box<dyn Driver>) -> (PortRegistry, PortId) {
-        let mut registry = PortRegistry::new();
-        let id = registry.open(poller, driver).expect("the port opens");
-        (registry, id)
-    }
-
-    /// Runs one control verb on port `id`, panicking on the Rust error kind.
-    fn control(
-        registry: &mut PortRegistry,
-        poller: &mut Poller,
-        id: PortId,
-        command: &str,
-        arg: &[u8],
-    ) -> Vec<u8> {
-        registry
-            .get_mut(id)
-            .expect("the port is live")
-            .control(poller, command, arg)
-            .unwrap_or_else(|err| panic!("the `{command}` verb failed: {err:?}"))
-    }
-
-    /// The `open`/`bind`/`listen` sequence over a loopback ephemeral port; returns the port
-    /// the kernel assigned.
-    fn listen_on_loopback(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> u16 {
-        assert_eq!(control(registry, poller, id, "open", &open_arg()), ctl_ok());
-        let bound = control(registry, poller, id, "bind", &loopback_arg(0));
-        assert_eq!(bound[0], INET_REP_OK);
-        assert_eq!(bound.len(), 3, "`bind` replies [1, port_hi, port_lo]");
-        let port = u16::from_be_bytes([bound[1], bound[2]]);
-        assert_ne!(port, 0, "the kernel assigned a port");
-        assert_eq!(control(registry, poller, id, "listen", &[0, 5]), ctl_ok());
-        port
-    }
-
-    /// Accepts the connection queued for the listening port, retrying until it arrives;
-    /// returns the descriptor the reply carried.
-    fn accept(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> RawFd {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            let reply = control(registry, poller, id, "accept", b"");
-            assert_eq!(reply[0], INET_REP_OK);
-            if reply.len() == 5 {
-                return i32::from_be_bytes([reply[1], reply[2], reply[3], reply[4]]);
-            }
-            assert_eq!(reply.len(), 1, "an `accept` reply is [1] or [1] ++ fd_be32");
-            assert!(Instant::now() < deadline, "no connection was accepted");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Drives the reactor until port `id`'s input queue holds at least `want` bytes,
-    /// returning everything it read.
-    fn read_into_queue(
-        poller: &mut Poller,
-        registry: &mut PortRegistry,
-        id: PortId,
-        want: usize,
-    ) -> Vec<u8> {
-        let deadline = Instant::now() + WAIT;
-        let mut got = Vec::new();
-        while got.len() < want {
-            assert!(Instant::now() < deadline, "no input arrived");
-            let events = poller
-                .poll(Some(Duration::from_millis(100)))
-                .expect("poll");
-            registry
-                .handle_events(poller, &events)
-                .expect("dispatch the ready events");
-            got.extend(registry.get_mut(id).expect("live").drain_input());
-        }
-        got
-    }
-
-    // -----------------------------------------------------------------------
-    // Names, reply shapes and argument decoding
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn the_driver_registers_under_the_oracle_name() {
-        assert_eq!(DRIVER_NAME, "tcp_inet");
-        let driver = make_tcp_inet().expect("the factory builds a driver");
-        assert_eq!(driver.name(), "tcp_inet");
-        assert!(driver.flags() == DriverFlags::empty());
-    }
-
-    #[test]
-    fn the_reply_shape_helpers_match_the_c() {
-        assert_eq!(ctl_ok(), vec![INET_REP_OK]);
-        assert_eq!(ctl_xerror("exbadport"), b"\x00exbadport".to_vec());
-        assert_eq!(
-            ctl_error(std::io::Error::from_raw_os_error(libc::ENOTCONN)),
-            b"\x00enotconn".to_vec()
-        );
-        assert_eq!(
-            ctl_error(std::io::Error::from_raw_os_error(libc::ECONNREFUSED)),
-            b"\x00econnrefused".to_vec()
-        );
-        assert_eq!(
-            ctl_error(std::io::Error::from_raw_os_error(libc::EISCONN)),
-            b"\x00eisconn".to_vec()
-        );
-        assert_eq!(
-            ctl_error(std::io::Error::from_raw_os_error(libc::EINVAL)),
-            b"\x00einval".to_vec()
-        );
-        // An unknown code keeps the C's `errno_<N>` fallback format.
-        assert_eq!(ctl_xerror(&errno_name(-1)), b"\x00errno_-1".to_vec());
-        assert_eq!(errno_name(0), "errno_0");
-        assert_eq!(errno_name(libc::EAGAIN), "eagain");
-        assert_eq!(errno_name(libc::EINPROGRESS), "einprogress");
-    }
-
-    #[test]
-    fn the_packed_address_decodes_the_three_served_forms() {
-        assert_eq!(
-            parse_address(&[INET_AF_INET, 0x1f, 0x90, 10, 0, 0, 7]).expect("an IPv4 address"),
-            InetAddr {
-                port: 8080,
-                addr: [10, 0, 0, 7]
-            }
-        );
-        assert_eq!(
-            parse_address(&[INET_AF_ANY, 0, 5]).expect("INADDR_ANY"),
-            InetAddr {
-                port: 5,
-                addr: [0, 0, 0, 0]
-            }
-        );
-        assert_eq!(
-            parse_address(&[INET_AF_LOOPBACK, 0xff, 0xff]).expect("INADDR_LOOPBACK"),
-            InetAddr {
-                port: 0xffff,
-                addr: [127, 0, 0, 1]
-            }
-        );
-    }
-
-    #[test]
-    fn a_malformed_or_unsupported_address_is_bad_arg() {
-        assert!(parse_address(&[]).is_err(), "an empty argument");
-        assert!(
-            parse_address(&[INET_AF_INET, 0, 1, 127]).is_err(),
-            "truncated"
-        );
-        assert!(parse_address(&[INET_AF_ANY]).is_err(), "truncated");
-        assert!(
-            parse_address(&[2, 0, 1, 0, 0, 0, 0, 0, 0]).is_err(),
-            "INET_AF_INET6 (out of scope)"
-        );
-        assert!(
-            parse_address(&[5, 2, b'x']).is_err(),
-            "INET_AF_LOCAL (out of scope)"
-        );
-        // The error is the crate's argument fault.
-        assert!(matches!(parse_address(&[]), Err(BeamError::BadArg)));
-    }
-
-    #[test]
-    fn the_sockaddr_in_of_an_endpoint_is_network_byte_order() {
-        let sa = InetAddr {
-            port: 0x1234,
-            addr: [192, 168, 1, 2],
-        }
-        .sockaddr_in();
-        assert_eq!(sa.sin_family as i32, libc::AF_INET);
-        assert_eq!(sa.sin_port, 0x1234u16.to_be());
-        assert_eq!(sa.sin_addr.s_addr, u32::from_be_bytes([192, 168, 1, 2]).to_be());
-    }
-
-    // -----------------------------------------------------------------------
-    // Lifecycle
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn a_fresh_driver_has_no_socket() {
-        let driver = TcpInetDriver::new();
-        assert_eq!(driver.state(), InetState::Closed);
-        assert_eq!(driver.socket(), None);
-        assert!(!driver.eof());
-        assert_eq!(driver.connect_error(), None);
-        assert_eq!(TcpInetDriver::default().state(), InetState::Closed);
-    }
-
-    #[test]
-    fn from_socket_reads_the_state_from_the_kernel() {
-        // A listening socket (`SO_ACCEPTCONN`).
-        let listener = loopback_listener();
-        let driver = TcpInetDriver::from_socket(duplicate(listener.as_raw_fd())).expect("adopts");
-        assert_eq!(driver.state(), InetState::Listening);
-        drop(driver); // closes only the duplicate, not the test's listener
-
-        // A connected socket (has a peer).
-        let address = listener.local_addr().expect("an address");
-        let client = TcpStream::connect(address).expect("connects");
-        let (server, _peer) = listener.accept().expect("accepts");
-        let fd = duplicate(server.as_raw_fd());
-        let driver = TcpInetDriver::from_socket(fd).expect("adopts");
-        assert_eq!(driver.state(), InetState::Connected);
-        assert_eq!(driver.socket(), Some(fd));
-        drop(driver);
-        let _ = client;
-
-        // An opened but unconnected socket.
-        let fd = socket_fd().expect("a fresh socket");
-        let driver = TcpInetDriver::from_socket(fd).expect("adopts");
-        assert_eq!(driver.state(), InetState::Open);
-
-        // A descriptor that is not a socket is rejected, never dereferenced blindly.
-        assert!(TcpInetDriver::from_socket(-1).is_err());
-    }
-
-    #[test]
-    fn commands_before_open_report_the_c_operational_errors() {
-        let mut poller = poller();
-        let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
-
-        // No socket yet: the state errors the C answers with a `ctl_xerror` reply.
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "bind", &loopback_arg(0)),
-            b"\x00exbadport".to_vec()
-        );
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "listen", &[0, 5]),
-            b"\x00exbadport".to_vec()
-        );
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "connect", &loopback_arg(1)),
-            b"\x00exbadport".to_vec()
-        );
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "recv", b""),
-            b"\x00enotconn".to_vec()
-        );
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "send", b"x"),
-            b"\x00enotconn".to_vec()
-        );
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "shutdown", &[0]),
-            b"\x00enotconn".to_vec()
-        );
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "accept", b""),
-            b"\x00einval".to_vec(),
-            "`accept` on a non-listener"
-        );
-        // `close` is unconditional in the C (`ctl_reply_ok`, `inet_drv.c:12259`).
-        assert_eq!(control(&mut registry, &mut poller, id, "close", b""), ctl_ok());
-        registry.close(&mut poller, id).expect("closes");
-    }
-
-    #[test]
-    fn unknown_verbs_and_malformed_arguments_are_bad_arg() {
-        let mut poller = poller();
-        let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
-        assert_eq!(registry.get(id).expect("live").driver_name(), "tcp_inet");
-        assert_eq!(registry.get(id).expect("live").state(), PortState::Open);
-
-        let mut verb = |command: &str, arg: &[u8]| {
-            registry
-                .get_mut(id)
-                .expect("live")
-                .control(&mut poller, command, arg)
-        };
-        assert!(matches!(verb("frobnicate", b""), Err(BeamError::BadArg)));
-        // `open` needs its three-byte record ...
-        assert!(matches!(
-            verb("open", &[INET_AF_INET, 1]),
-            Err(BeamError::BadArg)
-        ));
-        // ... whose second byte must be SOCK_STREAM ...
-        assert!(matches!(
-            verb("open", &[INET_AF_INET, 2, INET_PROTO_DEFAULT]),
-            Err(BeamError::BadArg)
-        ));
-        // ... and whose protocol byte must be the default or TCP.
-        assert!(matches!(
-            verb("open", &[INET_AF_INET, INET_TYPE_STREAM, 9]),
-            Err(BeamError::BadArg)
-        ));
-        // None of those failures created a socket.
-        assert_eq!(verb("recv", b"").expect("a reply"), b"\x00enotconn".to_vec());
-
-        // A valid `open` creates the socket ...
-        assert_eq!(verb("open", &open_arg()).expect("opens"), ctl_ok());
-        // ... after which the argument faults of the remaining verbs surface as `BadArg`
-        // (the state guards that answer `exbadport`/`enotconn` come first, as in the C).
-        assert!(matches!(verb("listen", &[9]), Err(BeamError::BadArg)));
-        assert!(matches!(verb("bind", &[]), Err(BeamError::BadArg)));
-        assert!(matches!(verb("connect", b""), Err(BeamError::BadArg)));
-        // A second `open` is the operational `einval` (the C would leak the first socket
-        // here, so this floor refuses instead).
-        assert_eq!(
-            verb("open", &open_arg()).expect("a reply"),
-            b"\x00einval".to_vec()
-        );
-        registry.close(&mut poller, id).expect("closes");
-    }
-
-    // -----------------------------------------------------------------------
-    // The verb round trips (real loopback sockets)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn the_open_bind_listen_accept_send_and_recv_verbs_round_trip() {
-        let mut poller = poller();
-        let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
-        let port = listen_on_loopback(&mut poller, &mut registry, id);
-
-        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("the client connects");
-        let accepted_fd = accept(&mut poller, &mut registry, id);
-        assert!(accepted_fd >= 0, "the reply carried a real descriptor");
-
-        // Peer -> port: the reactor reads the bytes into the port's input queue.
-        client.write_all(b"ping").expect("the client writes");
-        assert_eq!(
-            read_into_queue(&mut poller, &mut registry, id, 4),
-            b"ping",
-            "the connection's bytes reach the port input queue"
-        );
-
-        // Port -> peer: the `send` verb drains the socket.
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "send", b"pong"),
-            ctl_ok()
-        );
-        assert_eq!(registry.get(id).expect("live").output_len(), 0);
-        let mut reply = [0u8; 4];
-        client.read_exact(&mut reply).expect("the client reads");
-        assert_eq!(&reply, b"pong");
-
-        // `shutdown` then `close`, and a second `close` is idempotent.
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "shutdown", &[TCP_SHUT_WR]),
-            ctl_ok()
-        );
-        assert_eq!(control(&mut registry, &mut poller, id, "close", b""), ctl_ok());
-        assert_eq!(control(&mut registry, &mut poller, id, "close", b""), ctl_ok());
-        registry.close(&mut poller, id).expect("closes the port");
-    }
-
-    #[test]
-    fn an_accept_with_nothing_pending_answers_ok() {
-        let listener = loopback_listener();
-        let mut poller = poller();
-        let (mut registry, id) = open_port(
-            &mut poller,
-            Box::new(TcpInetDriver::from_socket(duplicate(listener.as_raw_fd())).expect("adopts")),
-        );
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "accept", b""),
-            ctl_ok(),
-            "EAGAIN is `ok` with no descriptor (retry when the port reports readability)"
-        );
-        registry.close(&mut poller, id).expect("closes");
-    }
-
-    #[test]
-    fn the_recv_and_send_verbs_work_on_an_adopted_connected_socket() {
-        let listener = loopback_listener();
-        let address = listener.local_addr().expect("an address");
-        let mut client = TcpStream::connect(address).expect("connects");
-        let (server, _peer) = listener.accept().expect("accepts");
-
-        let mut poller = poller();
-        let (mut registry, id) = open_port(
-            &mut poller,
-            Box::new(TcpInetDriver::from_socket(duplicate(server.as_raw_fd())).expect("adopts")),
-        );
-
-        // `recv` drives the read path directly (no poller needed): retry until the bytes the
-        // client sent have arrived.
-        client.write_all(b"hello").expect("the client writes");
-        let deadline = Instant::now() + WAIT;
-        let mut got = Vec::new();
-        while got.len() < 5 {
-            assert!(Instant::now() < deadline, "`recv` read nothing");
-            assert_eq!(control(&mut registry, &mut poller, id, "recv", b""), ctl_ok());
-            got.extend(registry.get_mut(id).expect("live").drain_input());
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(got, b"hello");
-
-        // ... and `send` writes back to the peer.
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "send", b"world"),
-            ctl_ok()
-        );
-        let mut reply = [0u8; 5];
-        client.read_exact(&mut reply).expect("the client reads");
-        assert_eq!(&reply, b"world");
-
-        // `recv` with an argument is a `BadArg`: the C's timeout/length are not honored, so
-        // accepting them would silently ignore them.
-        assert!(matches!(
-            registry
-                .get_mut(id)
-                .expect("live")
-                .control(&mut poller, "recv", &[0, 0, 0, 0]),
-            Err(BeamError::BadArg)
-        ));
-        registry.close(&mut poller, id).expect("closes");
-    }
-
-    // -----------------------------------------------------------------------
-    // Flow control: readiness arming and short writes
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn a_write_ready_event_is_ignored_until_write_readiness_is_armed() {
-        let mut poller = poller();
-        let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
-        listen_on_loopback(&mut poller, &mut registry, id);
-
-        // A listening socket arms only readability, so a write-ready event schedules nothing
-        // (`PortArms`), while a read-ready one does.
-        assert!(registry.schedule_readiness(
-            id.number(),
-            Readiness {
-                writable: true,
-                ..Readiness::default()
-            }
-        ));
-        assert!(!registry
-            .get(id)
-            .expect("live")
-            .has_pending_task(PortTaskKind::Output));
-        assert!(registry.schedule_readiness(
-            id.number(),
-            Readiness {
-                readable: true,
-                ..Readiness::default()
-            }
-        ));
-        assert!(registry
-            .get(id)
-            .expect("live")
-            .has_pending_task(PortTaskKind::Input));
-        registry.close(&mut poller, id).expect("closes");
-    }
-
-    #[test]
-    fn a_stalled_write_arms_write_readiness_and_defers_a_shutdown() {
-        let mut poller = poller();
-        let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
-        let port = listen_on_loopback(&mut poller, &mut registry, id);
-        // The peer connects but never reads, so the kernel's buffers fill and stay full.
-        let _client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        accept(&mut poller, &mut registry, id);
-
-        // A small write is taken by the kernel straight away.
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "send", b"tiny"),
-            ctl_ok()
-        );
-        assert_eq!(registry.get(id).expect("live").output_len(), 0);
-
-        // Keep offering bytes until the kernel stops taking them: the remainder stays in the
-        // port output queue and write readiness is armed.
-        let chunk = vec![b'x'; 256 * 1024];
-        let deadline = Instant::now() + WAIT;
-        while registry.get(id).expect("live").output_len() == 0 {
-            assert!(Instant::now() < deadline, "the kernel accepted every byte");
-            assert_eq!(
-                control(&mut registry, &mut poller, id, "send", &chunk),
-                ctl_ok()
-            );
-        }
-
-        // The evidence that write readiness is armed: a write-ready event now schedules an
-        // OUTPUT task (which the port-task round would run when the kernel drains).
-        assert!(registry.schedule_readiness(
-            id.number(),
-            Readiness {
-                writable: true,
-                ..Readiness::default()
-            }
-        ));
-        assert!(registry
-            .get(id)
-            .expect("live")
-            .has_pending_task(PortTaskKind::Output));
-
-        // A `SHUT_WR`/`SHUT_RDWR` with output still queued is deferred, never dropped.
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "shutdown", &[TCP_SHUT_RDWR]),
-            ctl_ok()
-        );
-        assert_eq!(
-            control(&mut registry, &mut poller, id, "shutdown", &[TCP_SHUT_WR]),
-            ctl_ok()
-        );
-        assert!(registry.get(id).expect("live").output_len() > 0);
-        registry.close(&mut poller, id).expect("closes");
-    }
-}
+mod tests;
