@@ -69,7 +69,8 @@ use beam_dist::driver::{ConnectionDriver, DriverState, StepOutcome};
 use beam_dist::epmd::{
     Alive2Req, EpmdClient, EPMD_DIST_HIGH, EPMD_DIST_LOW, EPMD_NODE_NORMAL, EPMD_PROTO_TCP,
 };
-use beam_dist::flags::Dop;
+use beam_dist::flags::{Dop, DFLAG_PUBLISHED};
+use beam_dist::handshake::{preferred_flags, publish_flag, PeerVisibility};
 use beam_dist::{Delivery, DeliveryOutcome, InboundSink};
 use beam_term::prelude::{make_atom, make_small, Eterm};
 use beam_term::AtomTable;
@@ -434,7 +435,12 @@ fn is_pid(term: Eterm, atoms: &AtomTable) -> bool {
 /// `net_kernel:connect_node/1` (not `net_adm:ping/1`) is what reports success: it
 /// needs only the distribution link, not a message round-trip. The peer also
 /// prints which node the received pid named and whether its own kernel considers
-/// that node connected — the decisive evidence for the node-name spelling.
+/// that node connected — the decisive evidence for the node-name spelling — and,
+/// right after the connection is up, `PEER_VIS visible=<Bool> connected=<Bool>`:
+/// whether the target node is in the peer's `nodes()` (visible) and in
+/// `nodes(connected)`. That pair is the peer-side classification
+/// (`dist_util.erl:publish_type/1`) this test pins: a node that advertised
+/// `DFLAG_PUBLISHED` is *visible*, one that did not is only *connected* (hidden).
 fn spawn_peer(peer_short: &str, target: &str) -> Option<ErlangNode> {
     let eval = format!(
         "register({TARGET_NAME}, spawn(fun Loop() ->\n\
@@ -454,6 +460,9 @@ fn spawn_peer(peer_short: &str, target: &str) -> Option<ErlangNode> {
          R = net_kernel:connect_node('{target}'),\n\
          io:format(\"CONN=~p~n\", [R]),\n\
          io:format(\"PEER_NODES ~p~n\", [nodes()]),\n\
+         VisT = list_to_atom(\"{target}\"),\n\
+         io:format(\"PEER_VIS visible=~p connected=~p~n\",\n\
+                   [lists:member(VisT, nodes()), lists:member(VisT, nodes(connected))]),\n\
          timer:sleep(15000),\n\
          io:format(\"PEER_DONE~n\", []),\n\
          halt()."
@@ -491,13 +500,23 @@ fn real_erl_completes_the_n_handshake_against_the_rust_server() {
         return;
     };
 
-    // 3. Accept and drive the `'N'` handshake.
+    // 3. Accept and drive the `'N'` handshake, opting in to the **published** bit
+    //    exactly as a real published node does (`dist_util.erl:199-200`): the
+    //    emulator's default flag set plus `publish_flag/3`. The default
+    //    `ConnectionDriver::server` advertises only `preferred_flags()` (hidden) —
+    //    the hidden-negative test below pins that direction.
     let sock = accept_within(&listener, ACCEPT_TIMEOUT)
         .expect("the real erl peer must connect to the Rust listener");
     sock.set_read_timeout(Some(READ_SLICE)).expect("read timeout");
 
+    let published = preferred_flags() | publish_flag(false, true);
     let mut session = Session::new(
-        ConnectionDriver::server(advertised.as_bytes(), COOKIE.as_bytes(), creation),
+        ConnectionDriver::server_with_flags(
+            advertised.as_bytes(),
+            COOKIE.as_bytes(),
+            creation,
+            published,
+        ),
         sock,
     );
     let _ = session.pump(DRIVE_TIMEOUT, |s| s.driver.state() != DriverState::Handshaking);
@@ -510,6 +529,18 @@ fn real_erl_completes_the_n_handshake_against_the_rust_server() {
         Some(peer_full.as_bytes()),
         "the real erl peer must complete the Rust `'N'` handshake and advertise its \
          full `node@host` name; outbound transcript:\n{handshake_out_hex}",
+    );
+
+    // [LIVE] Each side classifies the *other* from the other's own
+    // `DFLAG_PUBLISHED` (`dist_util.erl:publish_type/1`). A real default `-sname`
+    // node *is* published to us (`net_kernel:publish_on_node/1` is true by
+    // default), so it advertises `DFLAG_PUBLISHED` and reads as normal; the Rust
+    // server opted in too, so both sides see each other as visible.
+    assert_eq!(
+        session.driver.peer_visibility(),
+        Some(PeerVisibility::Normal),
+        "a real default `-sname` node advertises DFLAG_PUBLISHED (publish_on_node is \
+         true by default), so it is a normal (visible) node",
     );
 
     // [BYTE] The outbound handshake is exactly `Status::Ok` then the `'N'`
@@ -531,6 +562,24 @@ fn real_erl_completes_the_n_handshake_against_the_rust_server() {
         "the `'N'` challenge must advertise the full `node@host` name",
     );
 
+    // [BYTE] The opt-in really reached the wire: `'N'` + flags(8, BE) at bytes
+    // 1..9 carries exactly the published flag set (`DFLAG_PUBLISHED = 0x01`,
+    // `dist.h:30`), and nothing about the default set moved.
+    let wire_flags = u64::from_be_bytes(
+        challenge[1..9].try_into().expect("the `'N'` challenge carries 8 flag bytes"),
+    );
+    assert_eq!(
+        wire_flags,
+        published.bits(),
+        "the `'N'` challenge must advertise exactly the opt-in flag set",
+    );
+    assert_ne!(wire_flags & DFLAG_PUBLISHED, 0, "DFLAG_PUBLISHED must be on the wire");
+    assert_eq!(
+        wire_flags & !DFLAG_PUBLISHED,
+        preferred_flags().bits(),
+        "the opt-in must add exactly DFLAG_PUBLISHED",
+    );
+
     // [LIVE] End-to-end: the peer's kernel considers the link established.
     let conn = peer
         .wait_for(|line| line.starts_with("CONN="), MESSAGE_TIMEOUT)
@@ -541,6 +590,23 @@ fn real_erl_completes_the_n_handshake_against_the_rust_server() {
             )
         });
     assert_eq!(conn, "CONN=true", "a real erl node connected to the Rust node");
+
+    // [LIVE] THE FIX: because the Rust `'N'` challenge carried DFLAG_PUBLISHED,
+    // the real peer classifies this node as `normal` (`dist_util.erl:publish_type/1`)
+    // and now lists its full `node@host` in `nodes()` — previously it printed
+    // `PEER_VIS visible=false` (a hidden node, only in `nodes(connected)`).
+    let peer_vis = peer
+        .wait_for(|line| line.starts_with("PEER_VIS"), MESSAGE_TIMEOUT)
+        .unwrap_or_else(|| {
+            format!(
+                "the peer never reported the node's visibility; stderr: {}",
+                peer.stderr_text()
+            )
+        });
+    assert_eq!(
+        peer_vis, "PEER_VIS visible=true connected=true",
+        "a node that advertised DFLAG_PUBLISHED must be visible to the real peer",
+    );
 
     // 4. The bidirectional round trip. The pid's **node** spelling is the only
     //    thing that can fail, so try the full `node@host` first (what the peer
@@ -618,17 +684,12 @@ fn real_erl_completes_the_n_handshake_against_the_rust_server() {
     // lines are the on-record evidence of what it received, which node it resolved
     // for the pid it was handed, and what it sent back.
     //
-    // NOTE (recorded, not asserted — an orthogonal `beam_dist` gap): the peer
-    // reports `CONNECTED false`, because it classifies this node as **hidden**.
-    // `dist_util.erl:publish_type/1` returns `normal` only when the peer's flags
-    // carry `DFLAG_PUBLISHED` (`0x01`); `beam_dist`'s `preferred_flags()` is
-    // exactly the C's `DFLAG_DIST_DEFAULT`, which — like `dist.h:118-129` — does
-    // **not** include it, and real ERTS adds it separately per peer
-    // (`dist_util.erl:publish_flag/3`, `DFLAG_PUBLISHED` when the node is
-    // published on that node). `ConnectionDriver` offers no flag override, so a
-    // Rust node registered in `epmd` is currently advertised hidden and drops out
-    // of the peer's `nodes()`. It does *not* affect the round trip: the dist entry
-    // the handshake installed is found and used either way.
+    // Because this node opted in to `DFLAG_PUBLISHED` (see the `server_with_flags`
+    // call above), the peer now classifies it as `normal`
+    // (`dist_util.erl:publish_type/1`) and its `nodes()` contains it — so the
+    // `PEER_PID_NODE ... CONNECTED true` line below agrees with the `PEER_VIS`
+    // assertion earlier. The *hidden* direction is pinned by
+    // `a_hidden_node_is_classified_hidden_by_the_real_peer`.
     let peer_got = peer.wait_for(|line| line.starts_with("PEER_GOT"), MESSAGE_TIMEOUT);
     let peer_pid_node = peer.wait_for(|line| line.starts_with("PEER_PID_NODE"), MESSAGE_TIMEOUT);
     let replied = peer.wait_for(|line| line.starts_with("PEER_REPLIED"), MESSAGE_TIMEOUT);
@@ -647,6 +708,19 @@ fn real_erl_completes_the_n_handshake_against_the_rust_server() {
         "the peer must have replied with `{{echo,{seq}}}` to the pid it received; stderr: {}",
         peer.stderr_text(),
     );
+
+    // [LIVE] The pid-addressed reply only resolves when the pid's node equals the
+    // node the peer interned from the handshake, which is the full `node@host`
+    // (attempt 0). In that case the peer's own view is `CONNECTED true` — it found
+    // the node in `nodes()`, the visible set.
+    if attempt == 0 {
+        let pid_node_line = peer_pid_node.as_deref().unwrap_or_default();
+        assert!(
+            pid_node_line.contains("CONNECTED true"),
+            "the peer must see this published node in `nodes()` for the pid node it \
+             resolved; peer line: {pid_node_line:?}",
+        );
+    }
 
     // [LIVE] The message is exactly the `{echo, Seq}` the peer sent back.
     assert_eq!(
@@ -779,6 +853,102 @@ fn a_bare_advertised_name_is_aborted_by_the_real_peer() {
         conn.as_deref(),
         Some("CONN=true"),
         "the peer must not report a successful connection",
+    );
+
+    drop(epmd);
+}
+
+/// The hidden negative of the visibility fix: with the **default**
+/// [`ConnectionDriver::server`] — i.e. exactly [`preferred_flags`], no
+/// `DFLAG_PUBLISHED` — a real `erl` peer still connects, but classifies the Rust
+/// node as **hidden**: it is absent from the peer's `nodes()` (only
+/// `nodes(connected)` lists it), exactly what `dist_util.erl:publish_type/1`
+/// prescribes for flags without `DFLAG_PUBLISHED` (`dist.h:30`). This pins the
+/// divergence in *both* directions against the positive test above.
+#[test]
+fn a_hidden_node_is_classified_hidden_by_the_real_peer() {
+    let Some(host) = erl_hostname() else {
+        eprintln!("SKIP: no usable `erl` on PATH");
+        return;
+    };
+    let id = run_id();
+    let short = format!("rusthid{id}");
+    let advertised = format!("{short}@{host}");
+    let peer_short = format!("hidprobe{id}");
+    let peer_full = format!("{peer_short}@{host}");
+
+    let (listener, _port, epmd, creation) = publish(&short);
+    let Some(peer) = spawn_peer(&peer_short, &advertised) else {
+        eprintln!("SKIP: could not spawn an `erl` peer");
+        return;
+    };
+    let Some(sock) = accept_within(&listener, ACCEPT_TIMEOUT) else {
+        eprintln!("SKIP: the peer never dialled the Rust listener");
+        drop(epmd);
+        return;
+    };
+    sock.set_read_timeout(Some(READ_SLICE)).expect("read timeout");
+
+    // The DEFAULT constructor advertises exactly `preferred_flags()` — no opt-in.
+    let mut session = Session::new(
+        ConnectionDriver::server(advertised.as_bytes(), COOKIE.as_bytes(), creation),
+        sock,
+    );
+    let _ = session.pump(DRIVE_TIMEOUT, |s| s.driver.state() != DriverState::Handshaking);
+
+    // [LIVE] The hidden node still completes the `'N'` handshake and is reachable.
+    assert_eq!(
+        session.established_peer.as_deref(),
+        Some(peer_full.as_bytes()),
+        "the hidden node still completes the `'N'` handshake and advertises a full name",
+    );
+    // The real `-sname` peer is itself published (see the positive test), so it
+    // reads as normal from our side; only *our* visibility was withheld.
+    assert_eq!(session.driver.peer_visibility(), Some(PeerVisibility::Normal));
+
+    // [BYTE] The `'N'` challenge flags are exactly the default set: the published
+    // bit is absent.
+    let handshake_out = session.transcript.out.clone();
+    let frames = split_frames(&handshake_out);
+    let challenge = frames.get(1).copied().expect("the `'N'` challenge frame");
+    assert_eq!(challenge.first(), Some(&b'N'), "the challenge tag");
+    let wire_flags = u64::from_be_bytes(
+        challenge[1..9].try_into().expect("the `'N'` challenge carries 8 flag bytes"),
+    );
+    assert_eq!(
+        wire_flags,
+        preferred_flags().bits(),
+        "the default server must advertise exactly `preferred_flags()`",
+    );
+    assert_eq!(wire_flags & DFLAG_PUBLISHED, 0, "no DFLAG_PUBLISHED may be on the wire");
+
+    // [LIVE] The link is up ...
+    let conn = peer.wait_for(|line| line.starts_with("CONN="), MESSAGE_TIMEOUT);
+    assert_eq!(
+        conn.as_deref(),
+        Some("CONN=true"),
+        "the hidden node is still connected (hidden only excludes it from `nodes()`)",
+    );
+
+    // ... but the peer classifies it hidden: `nodes()` does not list it (only
+    // `nodes(connected)` does). The exact line is the peer-side
+    // `dist_util.erl:publish_type/1` verdict.
+    let peer_vis = peer
+        .wait_for(|line| line.starts_with("PEER_VIS"), MESSAGE_TIMEOUT)
+        .unwrap_or_else(|| {
+            format!(
+                "the peer never reported the node's visibility; stderr: {}",
+                peer.stderr_text()
+            )
+        });
+    assert!(
+        peer_vis.contains("visible=false"),
+        "a node without DFLAG_PUBLISHED must be hidden (absent from `nodes()`); \
+         peer line: {peer_vis:?}",
+    );
+    assert_eq!(
+        peer_vis, "PEER_VIS visible=false connected=true",
+        "a hidden node is connected but not visible to the peer",
     );
 
     drop(epmd);

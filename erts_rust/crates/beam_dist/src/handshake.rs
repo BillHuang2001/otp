@@ -15,7 +15,7 @@ use beam_common::{BeamError, Result};
 
 use crate::flags::{
     DistFlags, DFLAG_DIST_DEFAULT, DFLAG_DIST_MANDATORY, DFLAG_DIST_MANDATORY_25,
-    DFLAG_MANDATORY_25_DIGEST,
+    DFLAG_MANDATORY_25_DIGEST, DFLAG_PUBLISHED,
 };
 use crate::transport::Write;
 
@@ -498,8 +498,103 @@ impl Complement {
 
 /// The `DFLAG_*` set this node offers in the connect handshake
 /// (`DFLAG_DIST_DEFAULT`).
+///
+/// This mirrors the emulator's `erts_dflags.default` (`dist.h:118-129`) **exactly**,
+/// which deliberately omits `DFLAG_PUBLISHED` (`0x01`, `dist.h:30`): a real node
+/// adds that bit separately, *per peer*, in its Erlang-level handshake driver
+/// (`dist_util.erl:199-200`). Use [`publish_flag`] to derive the per-connection
+/// published bit and the opt-in constructors (e.g.
+/// [`crate::driver::ConnectionDriver::server_with_flags`]) to advertise it.
 pub fn preferred_flags() -> DistFlags {
     DistFlags::from_bits(DFLAG_DIST_DEFAULT)
+}
+
+/// The node-visibility classification `dist_util.erl:publish_type/1` assigns from
+/// a **peer's** advertised flags.
+///
+/// Ground truth (`lib/kernel/src/dist_util.erl:917-923`):
+/// ```erlang
+/// publish_type(Flags) ->
+///     case Flags band ?DFLAG_PUBLISHED of
+///         0 -> hidden;
+///         _ -> normal
+///     end.
+/// ```
+/// `DFLAG_PUBLISHED` is `0x01` (`dist.h:30`). A **hidden** node stays reachable
+/// but is excluded from a peer's `nodes()`/`net_adm:nodes()` (only *normal*
+/// connections are reported there); `nodes(connected)` still lists it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PeerVisibility {
+    /// The peer advertised `DFLAG_PUBLISHED`: a **normal** (visible) node.
+    Normal,
+    /// The peer did not advertise `DFLAG_PUBLISHED`: a **hidden** node.
+    Hidden,
+}
+
+/// Classifies a peer's advertised flags as [`PeerVisibility::Normal`] or
+/// [`PeerVisibility::Hidden`] — the direct mirror of `dist_util.erl:publish_type/1`
+/// (`dist_util.erl:917-923`), keyed **only** on `DFLAG_PUBLISHED` (`dist.h:30`).
+pub fn publish_type(flags: DistFlags) -> PeerVisibility {
+    if flags.contains(DistFlags::from_bits(DFLAG_PUBLISHED)) {
+        PeerVisibility::Normal
+    } else {
+        PeerVisibility::Hidden
+    }
+}
+
+/// The distribution request type of a connection, mirroring the `hidden`/`normal`
+/// values `dist_util.erl` threads through `publish_flag/3`.
+///
+/// The `DFLAG_NAME_ME` branch of `publish_flag/3` (dynamic node names,
+/// `dist_util.erl:150-151`) is deliberately **not** modelled: this crate speaks
+/// only the static OTP-23 `'N'` name and has no dynamic-node-name support, so the
+/// `NameMeFlg` case is out of scope (modelling it would invent a capability the
+/// rest of the crate cannot honor).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PublishKind {
+    /// A normal (non-hidden) distribution connection.
+    Normal,
+    /// A `-hidden` distribution connection.
+    Hidden,
+}
+
+impl PublishKind {
+    /// The extra flag this node must OR into its advertised set for a connection of
+    /// this kind — the mirror of `dist_util.erl:publish_flag/3`
+    /// (`dist_util.erl:150-160`) with the `DFLAG_NAME_ME` branch omitted (see
+    /// [`PublishKind`]):
+    ///
+    /// ```erlang
+    /// publish_flag(hidden, _, _) -> 0;
+    /// publish_flag(_, _, OtherNode) ->
+    ///     case net_kernel:publish_on_node(OtherNode) of
+    ///         true -> ?DFLAG_PUBLISHED;
+    ///         _    -> 0
+    ///     end.
+    /// ```
+    ///
+    /// `published` is `net_kernel:publish_on_node(OtherNode)` for the peer
+    /// `OtherNode`: a **normal** connection to a peer we publish to yields
+    /// `DFLAG_PUBLISHED` (`0x01`, `dist.h:30`); a **hidden** connection — or a
+    /// normal one to a peer we do not publish to — yields no flag at all.
+    pub fn publish_flag(self, published: bool) -> DistFlags {
+        match self {
+            PublishKind::Hidden => DistFlags::EMPTY,
+            PublishKind::Normal if published => DistFlags::from_bits(DFLAG_PUBLISHED),
+            PublishKind::Normal => DistFlags::EMPTY,
+        }
+    }
+}
+
+/// [`PublishKind::publish_flag`] for a caller that only has the boolean form: the
+/// direct mirror of `dist_util.erl:publish_flag/3` with the `DFLAG_NAME_ME` branch
+/// omitted (see [`PublishKind`]).
+///
+/// `hidden` is the request type (`hidden`/`normal`) and `published` is
+/// `net_kernel:publish_on_node(OtherNode)` for the peer.
+pub fn publish_flag(hidden: bool, published: bool) -> DistFlags {
+    let kind = if hidden { PublishKind::Hidden } else { PublishKind::Normal };
+    kind.publish_flag(published)
 }
 
 /// Validates a peer's flags: applies the `MANDATORY_25_DIGEST ⇒ DIST_MANDATORY_25`

@@ -22,12 +22,12 @@ use beam_codec::{AtomEncoding, ATOM_CACHE_REF_EXT, SMALL_INTEGER_EXT, SMALL_TUPL
 use beam_common::BeamError;
 use beam_dist::connection::{
     accept_server, connect_client, connect_to_node, Connection, TcpListener as DistListener,
-    TcpTransport,
+    TcpTransport, CLIENT_CREATION,
 };
 use beam_dist::dist_header::{DistHeader, DIST_FRAG_HEADER, DIST_HEADER};
-use beam_dist::flags::{DistFlags, Dop};
+use beam_dist::flags::{DistFlags, Dop, DFLAG_PUBLISHED};
 use beam_dist::fragment::DIST_FRAGMENT_SIZE;
-use beam_dist::handshake::{Name, Status, StatusKind};
+use beam_dist::handshake::{publish_flag, Name, PeerVisibility, Status, StatusKind};
 use beam_dist::transport::{MemoryTransport, Read, Write};
 use beam_dist::{
     check_mandatory, preferred_flags, read_packet, write_packet, EpmdClient, PacketHeaderSize,
@@ -81,6 +81,36 @@ fn connect_pair() -> (Connection<TcpTransport>, ServerHandle) {
 /// Joins the server thread and unwraps its connection.
 fn joined(handle: ServerHandle) -> Connection<TcpTransport> {
     handle.join().expect("server thread").expect("server handshake")
+}
+
+/// Spawns the **server** advertising an explicit capability flag set.
+fn spawn_server_with(listener: TcpListener, flags: DistFlags) -> ServerHandle {
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().map_err(BeamError::Io)?;
+        let mut transport = TcpTransport::from_stream(stream);
+        transport.set_read_timeout(Some(TEST_TIMEOUT))?;
+        Connection::server_with_flags(transport, SERVER_NAME, COOKIE, SERVER_CREATION, flags)
+    })
+}
+
+/// Binds a loopback listener, starts the server advertising `server_flags` and
+/// connects a client advertising `client_flags` (both opt-in seams).
+fn connect_pair_with(
+    server_flags: DistFlags,
+    client_flags: DistFlags,
+) -> (Connection<TcpTransport>, ServerHandle) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+    let server = spawn_server_with(listener, server_flags);
+    let client = Connection::client_with_flags(
+        TcpTransport::connect(&addr.to_string()).expect("connect to server"),
+        CLIENT_NAME,
+        COOKIE,
+        CLIENT_CREATION,
+        client_flags,
+    )
+    .expect("client handshake");
+    (client, server)
 }
 
 /// The body-form external term image of `term` (no `VERSION_MAGIC`).
@@ -197,6 +227,62 @@ fn handshake_establishes_an_agreed_link() {
     // The link starts with no ticks exchanged.
     assert_eq!(client.ticks_answered(), 0);
     assert_eq!(server.ticks_answered(), 0);
+
+    // GOLDEN-VECTOR: no `DFLAG_PUBLISHED` is advertised by either default
+    // constructor (the emulator's `erts_dflags.default`, `dist.h:118-129`), so each
+    // side classifies the other as hidden.
+    assert_eq!(client.peer_visibility(), PeerVisibility::Hidden);
+    assert_eq!(server.peer_visibility(), PeerVisibility::Hidden);
+}
+
+// ---------------------------------------------------------------------------
+// (a2) The opt-in flag seam: a *published* node advertises DFLAG_PUBLISHED and the
+//      peer classifies it normal, while every default stays byte-identical.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn opt_in_flags_are_advertised_and_peers_are_classified() {
+    // A published acceptor: exactly `preferred_flags()` plus the published bit
+    // (`dist_util.erl:199-200` / `publish_flag/3`).
+    let published = preferred_flags() | publish_flag(false, true);
+    assert_eq!(published.bits(), preferred_flags().bits() | DFLAG_PUBLISHED);
+    assert_ne!(published, preferred_flags());
+
+    let (client, server) = connect_pair_with(published, preferred_flags());
+    let server = joined(server);
+
+    // The server advertised the opt-in set on both transcriptions; the client kept
+    // its default.
+    assert_eq!(client.server_flags(), published);
+    assert_eq!(server.server_flags(), published);
+    assert_eq!(client.client_flags(), preferred_flags());
+    assert_eq!(server.client_flags(), preferred_flags());
+
+    // Each side classifies the OTHER purely from the other's own DFLAG_PUBLISHED
+    // (`dist_util.erl:publish_type/1`): the published server reads as normal, the
+    // unpublished client as hidden.
+    assert_eq!(client.peer_visibility(), PeerVisibility::Normal);
+    assert_eq!(server.peer_visibility(), PeerVisibility::Hidden);
+    assert_eq!(client.handshake().peer_visibility, PeerVisibility::Normal);
+    assert_eq!(server.handshake().peer_visibility, PeerVisibility::Hidden);
+
+    // The flag is the ONLY difference: what the server advertised equals
+    // `preferred_flags()` with the published bit OR'd in, and nothing else moved.
+    assert!(published.contains(DistFlags::from_bits(DFLAG_PUBLISHED)));
+    assert_eq!(
+        published.bits() & !DFLAG_PUBLISHED,
+        preferred_flags().bits(),
+        "the opt-in must add exactly DFLAG_PUBLISHED and change nothing else",
+    );
+
+    // And the default pair (no opt-in) remains byte-identically hidden on both
+    // ends — the seam changes nothing when it is not used.
+    let (client, server) = connect_pair();
+    let server = joined(server);
+    assert_eq!(client.server_flags(), preferred_flags());
+    assert_eq!(client.client_flags(), preferred_flags());
+    assert_eq!(client.peer_visibility(), PeerVisibility::Hidden);
+    assert_eq!(server.peer_visibility(), PeerVisibility::Hidden);
 }
 
 // ---------------------------------------------------------------------------

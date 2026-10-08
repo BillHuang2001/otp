@@ -10,12 +10,13 @@ use beam_common::{BeamError, Result};
 
 use beam_dist::flags::{
     DistFlags, DFLAG_DIST_DEFAULT, DFLAG_DIST_MANDATORY, DFLAG_DIST_MANDATORY_25,
-    DFLAG_DIST_MANDATORY_26, DFLAG_MANDATORY_25_DIGEST, DFLAG_MAP_TAG,
+    DFLAG_DIST_MANDATORY_26, DFLAG_MANDATORY_25_DIGEST, DFLAG_MAP_TAG, DFLAG_PUBLISHED,
 };
 use beam_dist::handshake::{
-    check_mandatory, preferred_flags, status_error, verify_digest, Challenge, ChallengeAck,
-    ChallengeDigest, ChallengeReply, Complement, Name, Status, StatusKind, CHALLENGE_ACK_TAG,
-    CHALLENGE_REPLY_TAG, CHALLENGE_TAG, COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
+    check_mandatory, preferred_flags, publish_flag, publish_type, status_error, verify_digest,
+    Challenge, ChallengeAck, ChallengeDigest, ChallengeReply, Complement, Name, PeerVisibility,
+    PublishKind, Status, StatusKind, CHALLENGE_ACK_TAG, CHALLENGE_REPLY_TAG, CHALLENGE_TAG,
+    COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
 };
 use beam_dist::transport::Write;
 
@@ -433,6 +434,61 @@ fn preferred_flags_covers_the_mandatory_set() {
     assert_eq!(preferred_flags().bits(), DFLAG_DIST_DEFAULT);
     assert!(preferred_flags().contains(DistFlags::from_bits(DFLAG_DIST_MANDATORY)));
     assert!(preferred_flags().contains(DistFlags::from_bits(DFLAG_MANDATORY_25_DIGEST)));
+}
+
+// ---------------------------------------------------------------------------
+// Node visibility (DFLAG_PUBLISHED): `publish_flag/3` / `publish_type/1`.
+// ---------------------------------------------------------------------------
+
+/// GOLDEN-VECTOR: [`publish_flag`] mirrors `dist_util.erl:publish_flag/3`
+/// (`dist_util.erl:150-160`) — `DFLAG_PUBLISHED` exactly for a normal connection
+/// to a peer we publish to, and nothing otherwise.
+#[test]
+fn publish_flag_mirrors_the_ground_truth() {
+    let none = DistFlags::EMPTY;
+    let published = DistFlags::from_bits(DFLAG_PUBLISHED);
+
+    // publish_flag(_, _, OtherNode) -> publish_on_node(OtherNode): true -> set.
+    assert_eq!(publish_flag(false, true), published);
+    // ...false -> 0.
+    assert_eq!(publish_flag(false, false), none);
+    // publish_flag(hidden, _, _) -> 0, regardless of publish_on_node.
+    assert_eq!(publish_flag(true, true), none);
+    assert_eq!(publish_flag(true, false), none);
+
+    // The typed form is exactly the boolean form.
+    assert_eq!(PublishKind::Normal.publish_flag(true), publish_flag(false, true));
+    assert_eq!(PublishKind::Normal.publish_flag(false), publish_flag(false, false));
+    assert_eq!(PublishKind::Hidden.publish_flag(true), publish_flag(true, true));
+    assert_eq!(PublishKind::Hidden.publish_flag(false), publish_flag(true, false));
+
+    // Exactly one bit is ever produced, and it is DFLAG_PUBLISHED (`0x01`).
+    assert_eq!(publish_flag(false, true).bits(), DFLAG_PUBLISHED);
+    assert_eq!(DFLAG_PUBLISHED, 0x01);
+}
+
+/// GOLDEN-VECTOR: [`publish_type`] mirrors `dist_util.erl:publish_type/1`
+/// (`dist_util.erl:917-923`) — keyed **only** on the peer's `DFLAG_PUBLISHED`.
+#[test]
+fn publish_type_classifies_the_peer_by_dflag_published() {
+    // The default set omits the bit (the emulator's `erts_dflags.default`,
+    // `dist.h:118-129`), so a peer offering it is classified hidden.
+    assert!(!preferred_flags().contains(DistFlags::from_bits(DFLAG_PUBLISHED)));
+    assert_eq!(publish_type(preferred_flags()), PeerVisibility::Hidden);
+    assert_eq!(publish_type(DistFlags::EMPTY), PeerVisibility::Hidden);
+
+    // A peer that ORs the bit in is normal.
+    let published = preferred_flags() | DistFlags::from_bits(DFLAG_PUBLISHED);
+    assert_eq!(publish_type(published), PeerVisibility::Normal);
+
+    // Only DFLAG_PUBLISHED matters: every other capability bit is ignored.
+    let others = DistFlags::from_bits(DFLAG_DIST_DEFAULT & !DFLAG_PUBLISHED);
+    assert_eq!(others.bits(), DFLAG_DIST_DEFAULT);
+    assert_eq!(publish_type(others), PeerVisibility::Hidden);
+
+    // Round-trip: the flag `publish_flag` produces is exactly what flips the
+    // classification from hidden to normal.
+    assert_eq!(preferred_flags() | publish_flag(false, true), published);
 }
 
 #[test]

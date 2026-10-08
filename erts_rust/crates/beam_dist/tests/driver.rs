@@ -27,9 +27,9 @@ use beam_codec::AtomEncoding;
 use beam_common::BeamError;
 use beam_dist::dist_header::{AtomCacheRef, DistHeader, DIST_FRAG_HEADER, DIST_HEADER};
 use beam_dist::driver::{ConnectionDriver, DriverState, StepOutcome};
-use beam_dist::flags::{DistFlags, Dop, DFLAG_FRAGMENTS};
+use beam_dist::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_PUBLISHED};
 use beam_dist::fragment::DIST_FRAGMENT_SIZE;
-use beam_dist::handshake::status_error;
+use beam_dist::handshake::{publish_flag, status_error, PeerVisibility};
 use beam_dist::{
     check_mandatory, preferred_flags, write_packet, MemoryTransport, Name, PacketHeaderSize, Status,
     StatusKind,
@@ -58,10 +58,22 @@ enum Mode {
 }
 
 /// Drives a client and a server driver against each other until both are
-/// established.
+/// established, each advertising [`preferred_flags`].
 fn establish(mode: Mode) -> (ConnectionDriver, ConnectionDriver) {
-    let mut client = ConnectionDriver::client(CLIENT_NAME, COOKIE, CLIENT_CREATION);
-    let mut server = ConnectionDriver::server(SERVER_NAME, COOKIE, SERVER_CREATION);
+    establish_with(mode, preferred_flags(), preferred_flags())
+}
+
+/// [`establish`] with an explicit advertised capability set for each side (the
+/// opt-in `*_with_flags` constructors).
+fn establish_with(
+    mode: Mode,
+    client_flags: DistFlags,
+    server_flags: DistFlags,
+) -> (ConnectionDriver, ConnectionDriver) {
+    let mut client =
+        ConnectionDriver::client_with_flags(CLIENT_NAME, COOKIE, CLIENT_CREATION, client_flags);
+    let mut server =
+        ConnectionDriver::server_with_flags(SERVER_NAME, COOKIE, SERVER_CREATION, server_flags);
 
     for _ in 0..100_000 {
         let client_out = client.take_output();
@@ -164,6 +176,45 @@ fn handshake_establishes_and_reports_the_peer() {
 
     // The negotiated set governs outbound encoding.
     assert!(client.negotiated().contains(DistFlags::from_bits(DFLAG_FRAGMENTS)));
+
+    // GOLDEN-VECTOR: neither default constructor advertises `DFLAG_PUBLISHED`, so
+    // each side classifies the other as hidden (`dist_util.erl:publish_type/1`).
+    assert_eq!(client.peer_visibility(), Some(PeerVisibility::Hidden));
+    assert_eq!(server.peer_visibility(), Some(PeerVisibility::Hidden));
+}
+
+/// GOLDEN-VECTOR: the opt-in flag seam. A published acceptor advertises
+/// `DFLAG_PUBLISHED` and the connecting peer classifies it `normal`; a published
+/// client flips the server's view; the default stays hidden throughout.
+#[test]
+fn opt_in_flags_flip_the_peer_visibility_classification() {
+    let published = preferred_flags() | publish_flag(false, true);
+    assert_ne!(published, preferred_flags());
+
+    // A published server, a default client.
+    let (client, server) = establish_with(Mode::Whole, preferred_flags(), published);
+    assert_eq!(client.server_flags(), published);
+    assert_eq!(server.server_flags(), published);
+    assert_eq!(client.client_flags(), preferred_flags());
+    assert_eq!(server.client_flags(), preferred_flags());
+    assert_eq!(client.peer_visibility(), Some(PeerVisibility::Normal));
+    assert_eq!(server.peer_visibility(), Some(PeerVisibility::Hidden));
+    assert_eq!(
+        client.handshake().map(|h| h.peer_visibility),
+        Some(PeerVisibility::Normal)
+    );
+
+    // A published client, a default server (the mirror image).
+    let (client, server) = establish_with(Mode::Whole, published, preferred_flags());
+    assert_eq!(client.peer_visibility(), Some(PeerVisibility::Hidden));
+    assert_eq!(server.peer_visibility(), Some(PeerVisibility::Normal));
+
+    // Before establishment there is no peer to classify.
+    let fresh = ConnectionDriver::server(SERVER_NAME, COOKIE, SERVER_CREATION);
+    assert_eq!(fresh.peer_visibility(), None);
+
+    // The opt-in adds exactly the published bit and moves nothing else.
+    assert_eq!(published.bits() & !DFLAG_PUBLISHED, preferred_flags().bits());
 }
 
 #[test]

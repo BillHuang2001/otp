@@ -105,8 +105,8 @@ use crate::framing::{
     is_tick, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
 };
 use crate::handshake::{
-    check_mandatory, preferred_flags, status_error, Challenge, ChallengeAck, ChallengeReply, Name,
-    Status, StatusKind,
+    check_mandatory, preferred_flags, publish_type, status_error, Challenge, ChallengeAck,
+    ChallengeReply, Name, PeerVisibility, Status, StatusKind,
 };
 use crate::transport::{Read, Transport, Write};
 
@@ -294,6 +294,13 @@ pub struct Handshake {
     pub peer_creation: u32,
     /// The peer's node name.
     pub peer_name: Vec<u8>,
+    /// How the peer's own flags classify it — the `dist_util.erl:publish_type/1`
+    /// equivalent, derived from the peer's `DFLAG_PUBLISHED` (`dist.h:30`,
+    /// `dist_util.erl:917-923`): the bit set means [`PeerVisibility::Normal`],
+    /// absent means [`PeerVisibility::Hidden`]. Computed from the peer's `'N'`
+    /// challenge flags on the client path and its `'N'` name flags on the server
+    /// path.
+    pub peer_visibility: PeerVisibility,
     /// A post-handshake packet body read while draining the handshake, if any.
     ///
     /// Always `None` for the OTP-23 `'N'` handshake (no `Complement` is
@@ -364,7 +371,24 @@ pub fn connect_client_with_creation<T: Transport>(
     cookie: &[u8],
     creation: u32,
 ) -> Result<Handshake> {
-    connect_client_core(t, our_name, cookie, gen_challenge(), creation)
+    connect_client_core(t, our_name, cookie, gen_challenge(), creation, preferred_flags())
+}
+
+/// [`connect_client_with_creation`] advertising an explicit **capability flag set**.
+///
+/// The opt-in seam a *published* node needs: the default constructors advertise
+/// exactly [`preferred_flags`], which — like the emulator's `erts_dflags.default`
+/// (`dist.h:118-129`) — omits `DFLAG_PUBLISHED` (`0x01`, `dist.h:30`); a real node
+/// ORs that bit in per peer ([`crate::handshake::publish_flag`],
+/// `dist_util.erl:199-200`). [`Handshake::peer_visibility`] classifies the *peer*.
+pub fn connect_client_with_flags<T: Transport>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+    flags: DistFlags,
+) -> Result<Handshake> {
+    connect_client_core(t, our_name, cookie, gen_challenge(), creation, flags)
 }
 
 /// [`connect_client`] with an explicit challenge nonce (the testable core).
@@ -374,20 +398,20 @@ fn connect_client_with<T: Transport>(
     cookie: &[u8],
     our_challenge: u32,
 ) -> Result<Handshake> {
-    connect_client_core(t, our_name, cookie, our_challenge, CLIENT_CREATION)
+    connect_client_core(t, our_name, cookie, our_challenge, CLIENT_CREATION, preferred_flags())
 }
 
-/// The connect/challenge client handshake with both knobs explicit: the challenge
-/// nonce (`our_challenge`) and the advertised creation (`creation`).
+/// The connect/challenge client handshake with every knob explicit: the challenge
+/// nonce (`our_challenge`), the advertised creation (`creation`) and the advertised
+/// capability flag set (`our_flags`).
 fn connect_client_core<T: Transport>(
     t: &mut T,
     our_name: &[u8],
     cookie: &[u8],
     our_challenge: u32,
     creation: u32,
+    our_flags: DistFlags,
 ) -> Result<Handshake> {
-    let our_flags = preferred_flags();
-
     // 1. Name.
     let body = encode_handshake(|w| {
         Name { flags: our_flags, creation, name: our_name.to_vec() }.encode(w)
@@ -437,6 +461,7 @@ fn connect_client_core<T: Transport>(
         negotiated,
         peer_creation: challenge.creation,
         peer_name: challenge.name,
+        peer_visibility: publish_type(challenge.flags),
         buffered: None,
     })
 }
@@ -470,6 +495,26 @@ pub fn accept_server<T: Transport>(
     accept_server_with(t, our_name, cookie, creation, gen_challenge())
 }
 
+/// [`accept_server`] advertising an explicit **capability flag set**.
+///
+/// The opt-in seam for a *published* acceptor: pass
+/// `preferred_flags() | publish_flag(false, true)` (or any other set) to advertise
+/// `DFLAG_PUBLISHED` (`0x01`, `dist.h:30`) — the emulator's default set omits it
+/// (`dist.h:118-129`; a real node ORs it in per peer, `dist_util.erl:199-200`). A
+/// peer that receives the bit classifies this node as `normal`
+/// (`dist_util.erl:publish_type/1`) and lists it in its `nodes()`; without it the
+/// peer sees a **hidden** node. The advertised set is reported in
+/// [`Handshake::server_flags`].
+pub fn accept_server_with_flags<T: Transport>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+    flags: DistFlags,
+) -> Result<Handshake> {
+    accept_server_core(t, our_name, cookie, creation, gen_challenge(), flags)
+}
+
 /// [`accept_server`] with an explicit challenge nonce (the testable core).
 fn accept_server_with<T: Transport>(
     t: &mut T,
@@ -478,8 +523,19 @@ fn accept_server_with<T: Transport>(
     creation: u32,
     our_challenge: u32,
 ) -> Result<Handshake> {
-    let our_flags = preferred_flags();
+    accept_server_core(t, our_name, cookie, creation, our_challenge, preferred_flags())
+}
 
+/// The accept handshake with every knob explicit: the challenge nonce
+/// (`our_challenge`) and the advertised capability flag set (`our_flags`).
+fn accept_server_core<T: Transport>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+    our_challenge: u32,
+    our_flags: DistFlags,
+) -> Result<Handshake> {
     // 1. Name: the client's flags, creation and name.
     let name = Name::decode(&read_packet(t, HANDSHAKE_FRAMING)?)?;
     // A peer whose flags fail the mandatory check (the v6 version gate) is
@@ -533,6 +589,7 @@ fn accept_server_with<T: Transport>(
         negotiated,
         peer_creation: name.creation,
         peer_name: name.name,
+        peer_visibility: publish_type(name.flags),
         buffered: None,
     })
 }
@@ -655,6 +712,39 @@ impl<T: Transport> Connection<T> {
         Ok(Connection::from_handshake(transport, handshake))
     }
 
+    /// [`Connection::client`] advertising an explicit **capability flag set**.
+    ///
+    /// The opt-in seam for a *published* node — see [`connect_client_with_flags`].
+    /// The default constructors advertise exactly [`preferred_flags`].
+    pub fn client_with_flags(
+        transport: T,
+        name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+    ) -> Result<Connection<T>> {
+        let mut transport = transport;
+        let handshake = connect_client_with_flags(&mut transport, name, cookie, creation, flags)?;
+        Ok(Connection::from_handshake(transport, handshake))
+    }
+
+    /// [`Connection::server`] advertising an explicit **capability flag set**.
+    ///
+    /// The opt-in seam for a *published* acceptor — see
+    /// [`accept_server_with_flags`]. The default `server` advertises exactly
+    /// [`preferred_flags`] (a **hidden** node).
+    pub fn server_with_flags(
+        transport: T,
+        name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+    ) -> Result<Connection<T>> {
+        let mut transport = transport;
+        let handshake = accept_server_with_flags(&mut transport, name, cookie, creation, flags)?;
+        Ok(Connection::from_handshake(transport, handshake))
+    }
+
     /// Builds a connection over a finished handshake.
     fn from_handshake(transport: T, mut handshake: Handshake) -> Connection<T> {
         let pending = handshake.buffered.take();
@@ -694,6 +784,12 @@ impl<T: Transport> Connection<T> {
     /// The peer's node creation.
     pub fn peer_creation(&self) -> u32 {
         self.handshake.peer_creation
+    }
+
+    /// How the peer's own flags classify it (`dist_util.erl:publish_type/1` —
+    /// see [`Handshake::peer_visibility`]).
+    pub fn peer_visibility(&self) -> PeerVisibility {
+        self.handshake.peer_visibility
     }
 
     /// The full handshake outcome.

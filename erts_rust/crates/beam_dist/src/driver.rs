@@ -110,8 +110,8 @@ use crate::framing::{
     is_tick, read_length, read_packet, write_packet, write_tick, PacketHeaderSize,
 };
 use crate::handshake::{
-    check_mandatory, preferred_flags, status_error, Challenge, ChallengeAck, ChallengeReply, Name,
-    Status,
+    check_mandatory, preferred_flags, publish_type, status_error, Challenge, ChallengeAck,
+    ChallengeReply, Name, PeerVisibility, Status,
 };
 use crate::transport::{MemoryTransport, Read, Write};
 
@@ -301,6 +301,30 @@ impl ConnectionDriver {
             cookie,
             creation,
             our_challenge,
+            preferred_flags(),
+        )
+    }
+
+    /// [`ConnectionDriver::client`] advertising an explicit **capability flag set**.
+    ///
+    /// The opt-in seam for a *published* node (default: [`preferred_flags`], which
+    /// omits `DFLAG_PUBLISHED`, `dist.h:30`/`dist.h:118-129`). See
+    /// [`crate::connection::connect_client_with_flags`] and
+    /// [`crate::handshake::publish_flag`].
+    pub fn client_with_flags(
+        our_name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+    ) -> ConnectionDriver {
+        ConnectionDriver::new(
+            Role::Client,
+            HandshakePhase::ClientSendName,
+            our_name,
+            cookie,
+            creation,
+            gen_challenge(),
+            flags,
         )
     }
 
@@ -337,10 +361,34 @@ impl ConnectionDriver {
             cookie,
             creation,
             our_challenge,
+            preferred_flags(),
         )
     }
 
-    /// The shared constructor.
+    /// [`ConnectionDriver::server`] advertising an explicit **capability flag set**.
+    ///
+    /// The opt-in seam for a *published* acceptor (default: [`preferred_flags`], a
+    /// **hidden** node). See [`crate::connection::accept_server_with_flags`].
+    pub fn server_with_flags(
+        our_name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+        flags: DistFlags,
+    ) -> ConnectionDriver {
+        ConnectionDriver::new(
+            Role::Server,
+            HandshakePhase::ServerAwaitName,
+            our_name,
+            cookie,
+            creation,
+            gen_challenge(),
+            flags,
+        )
+    }
+
+    /// The shared constructor (`our_flags` is the capability set this node
+    /// advertises — [`preferred_flags`] unless a `*_with_flags` constructor
+    /// overrides it).
     fn new(
         role: Role,
         phase: HandshakePhase,
@@ -348,6 +396,7 @@ impl ConnectionDriver {
         cookie: &[u8],
         creation: u32,
         our_challenge: u32,
+        our_flags: DistFlags,
     ) -> ConnectionDriver {
         ConnectionDriver {
             role,
@@ -356,7 +405,7 @@ impl ConnectionDriver {
             our_name: our_name.to_vec(),
             cookie: cookie.to_vec(),
             creation,
-            our_flags: preferred_flags(),
+            our_flags,
             our_challenge,
             handshake: None,
             hs_client_flags: DistFlags::EMPTY,
@@ -632,6 +681,12 @@ impl ConnectionDriver {
         self.handshake.as_ref().map_or(0, |h| h.peer_creation)
     }
 
+    /// How the peer's own flags classify it (`dist_util.erl:publish_type/1` — see
+    /// [`Handshake::peer_visibility`]), or `None` before the handshake completes.
+    pub fn peer_visibility(&self) -> Option<PeerVisibility> {
+        self.handshake.as_ref().map(|h| h.peer_visibility)
+    }
+
     /// The full handshake outcome, once established.
     pub fn handshake(&self) -> Option<&Handshake> {
         self.handshake.as_ref()
@@ -780,12 +835,21 @@ impl ConnectionDriver {
 
     /// Finalises the handshake: builds the [`Handshake`] outcome.
     fn establish(&mut self) {
+        // The peer's own flags: the client's `Challenge` carries the server's set
+        // and the server's `Name` carries the client's — exactly the split
+        // `dist_util.erl` uses to classify `other_flags` (`publish_type/1`).
+        let peer_flags = if self.role == Role::Client {
+            self.hs_server_flags
+        } else {
+            self.hs_client_flags
+        };
         self.handshake = Some(Handshake {
             client_flags: self.hs_client_flags,
             server_flags: self.hs_server_flags,
             negotiated: self.hs_negotiated,
             peer_creation: self.hs_peer_creation,
             peer_name: std::mem::take(&mut self.hs_peer_name),
+            peer_visibility: publish_type(peer_flags),
             buffered: None,
         });
     }

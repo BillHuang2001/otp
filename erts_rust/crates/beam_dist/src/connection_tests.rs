@@ -404,6 +404,7 @@ fn connection(input: Vec<u8>) -> Connection<MemoryTransport> {
             negotiated: flags,
             peer_creation: 0,
             peer_name: Vec::new(),
+            peer_visibility: PeerVisibility::Hidden,
             buffered: None,
         },
     )
