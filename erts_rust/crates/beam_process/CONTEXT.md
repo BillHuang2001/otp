@@ -579,6 +579,22 @@ re-export keeps `beam_process::PortTable` resolving here.
 - **Exact exit-reason term from `beam_common::ExitReason`**: signal reasons are carried as live `Eterm`
   terms (the deliverable form), not the term-independent `beam_common::ExitReason`; the mapping between
   them belongs to the raising BIF layer (`beam_bifs`).
+- **`process_info` source data available today vs missing.** Readable per-process facts:
+  `Process::{pid,state,is_trapping_exit,priority,save_calls,reductions,mailbox().len(),links().iter(),
+  monitors().iter(),monitored_by(),dict().entries(),heap_used_words(),exit_reason}`. Missing: a `status`
+  atom mapping over `ProcessState` (the enum is `Runnable/Running/Waiting/Suspended/Exiting/Terminated`),
+  `current_function`/`current_location` (nothing tracks the running MFA), and a reverse name lookup
+  (`whereis`/`registered` are the only registry reads — no `name_of(pid)`).
+- **Monitor-related divergences (not modelled).** `register(name, pid)` does not reject a dead pid (real
+  `erlang:register/2` ⇒ `badarg`); `monitor/2` on an unknown pid returns `TermNotFound` instead of an
+  immediate `{'DOWN',Ref,process,Pid,noproc}`; there is no `demonitor(Ref,[flush])` (a queued DOWN is not
+  removed/flushed); `monitor_term` resolves only pid terms, not a registered-name atom; `MonitorKind` has
+  no `TimeOffset`; and a port monitor records only the incoming half in `PortTable` (the watcher's
+  outgoing `Monitor` is absent from `Process::monitors`). Also, a self-signal (`from == to`) goes through
+  `exit_policy` against `trap_exit`, so a trapping process *traps* its own signal
+  (`tests/signals.rs::a_self_signal_embeds_a_reason_already_in_the_recipients_heap`);
+  `erlang:exit/2` to self terminates unconditionally — whether the BIF layer special-cases this is outside
+  this crate.
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
