@@ -27,7 +27,7 @@ use super::{resolve, LabelMap};
 /// larger arity reuses [`Machine::args_scratch`], so **no** arity allocates per
 /// call. The observable behaviour and the `ctx.call_bif(.., &[Eterm])` signature
 /// are unchanged.
-pub(crate) const STACK_ARGS: usize = 8;
+pub(crate) const STACK_ARGS: usize = 2;
 
 /// A stack array sized for the common BIF/`call_ext` arities ([`STACK_ARGS`]).
 const EMPTY_ARGS: [Eterm; STACK_ARGS] = [NIL; STACK_ARGS];
