@@ -42,7 +42,38 @@
 //! Everything here is counters plus two small hash sets, deliberately: the runtime is
 //! single-threaded and these are read on the dispatch path, not the hot path (the GC point
 //! is only armed inside `runner::budget::BudgetContext::ensure_heap`).
-
+//!
+//! # Wiring (the remaining work — this module is not declared yet)
+//!
+//! This file is deliberately **not** in the module tree, so it is inert: it must be wired
+//! before it compiles. The steps, in order:
+//!
+//! 1. `src/runtime.rs`: `mod gc;`, `pub use self::gc::{GcState, GcStatsSnapshot};` (the
+//!    re-export is what lets the `pub fn gc_stats()` return a type from a private module),
+//!    a `gc: GcState` field on `Runtime` and `gc: GcState::new()` in `Runtime::new`.
+//! 2. `src/context/gc.rs` (new): `module_uses_floats(&Module) -> bool` (scan
+//!    `module.functions[*].code` for `Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`)
+//!    and `bump(&mut beam_alloc::Heap, n, &[Eterm]) -> Result<*mut Eterm>` — the safe
+//!    hand-bump (`beam_alloc::Heap::alloc_words` is `unsafe fn`, but `hp()` is safe and a
+//!    `&scratch[..n - 1]` `tuple()` write advances `used` by `n`, writing a valid header at
+//!    the block base and `NIL`s after it).
+//! 3. `src/context/mod.rs`: `mod gc;`, the `gc_armed: bool` latch and the `gc_safe:
+//!    Option<bool>` flag on `RuntimeContext`, the `ensure_heap`/`heap_available`/
+//!    `alloc_words` bodies moved into `context::gc` (deleting them from the
+//!    `impl ExecutionContext` block), and a `pub(crate) fn arm_gc(&mut self)`.
+//! 4. `src/runner/budget.rs`: `BudgetContext::ensure_heap` arms the latch **immediately
+//!    before** delegating, and `RuntimeContext::ensure_heap` clears it as its first
+//!    statement. This is what makes "the slice's own machine" exact: every nested context
+//!    (`run_export`'s new `Machine`, a fun applied by a BIF, the evaluator) is a plain
+//!    `RuntimeContext` whose `ensure_heap` can therefore never collect — see the deviation
+//!    note in the completion report.
+//! 5. `src/runner/run.rs`: after the slice, scan `machine.get_fr(i)` for
+//!    `i in 0..beam_engine::machine::MAX_FLOAT_REGISTER` and `pin_process(pid)` if any slot
+//!    is not `NIL`.
+//! 6. The escape stores (`timers`, `persistent_terms`, `trace`, `seq_trace`,
+//!    `RunnerState::{args,entry,exits}`, `pending_spawns`) go through
+//!    [`Runtime::stabilize_escaped`]; `Runtime::references` must **not** (its keys are
+//!    pointer-keyed and already minted on the never-reset pooled BIF heap).
 use std::collections::{HashMap, HashSet};
 
 use beam_loader::Module;
@@ -130,6 +161,10 @@ impl GcState {
     }
 }
 
+// The wiring step lands the call sites incrementally (the collection point first, then the
+// escape-store stabilization), so every helper here is legitimately unused until its caller
+// arrives. Replacing this with real use is what removes the attribute.
+#[allow(dead_code)]
 impl Runtime {
     /// The runtime's collection counters and safety state.
     pub fn gc_stats(&self) -> GcStatsSnapshot {
