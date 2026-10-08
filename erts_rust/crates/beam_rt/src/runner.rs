@@ -241,6 +241,172 @@ impl<'a> RuntimeRunner<'a> {
     }
 }
 
+/// The reduction budget of **one scheduler slice**, charged as the machine runs.
+///
+/// The [`ProcessRunner`] contract puts the reduction count in the runner's hands (the
+/// scheduler never inspects or resets `Process::reductions`), and `beam_engine` exposes no
+/// mid-run reduction/step counter, so the count is derived from the one per-instruction
+/// seam the executing machine reaches on its own: [`ExecutionContext::ensure_heap`], called
+/// by `test_heap`/`allocate_heap` — the instructions the compiler emits once per loop
+/// iteration that allocates (the ordinary Erlang shape).
+///
+/// One charge is one reduction-like unit. When the budget runs out, `charge` reports the
+/// exhaustion through a typed error; the runner recognises it (the sticky [`exhausted`] flag
+/// is set) and turns it into [`RunOutcome::Yield`] at the machine's recorded address rather
+/// than a process failure.
+///
+/// An exhausted probe is **sticky**: it keeps refusing so a single exhaustion yields exactly
+/// once (the first refusal propagates out of the run, so no second charge can occur — the
+/// stickiness is what makes the runner's classification unambiguous).
+///
+/// [`exhausted`]: BudgetProbe::is_exhausted
+struct BudgetProbe {
+    /// The reduction units left in this slice. Never zero: a degenerate `budget` of 0 still
+    /// gets one unit, so a slice always makes progress and the scheduler's run-queue loop
+    /// cannot spin forever on an immediately-yielding process.
+    remaining: u32,
+    /// The reduction units charged so far (what the process's counter is set to).
+    used: u32,
+    /// Whether the budget ran out during this slice.
+    exhausted: bool,
+}
+
+impl BudgetProbe {
+    /// A probe with `budget` reduction units (at least one).
+    fn new(budget: u32) -> BudgetProbe {
+        BudgetProbe {
+            remaining: budget.max(1),
+            used: 0,
+            exhausted: false,
+        }
+    }
+
+    /// The reduction units this slice charged.
+    fn used(&self) -> u32 {
+        self.used
+    }
+
+    /// Whether the budget ran out during this slice.
+    fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Charges one reduction unit, or reports the exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// A typed `unsupported`-prefixed error once the budget is spent — the runner's signal
+    /// that the slice must end in [`RunOutcome::Yield`]. It is **never** a process failure:
+    /// the runner intercepts it and parks the machine instead of recording an exit.
+    fn charge(&mut self) -> Result<()> {
+        if self.remaining == 0 {
+            self.exhausted = true;
+            return Err(crate::error::unsupported(
+                "preemption: the reduction budget for this scheduler slice is spent",
+            ));
+        }
+        self.remaining -= 1;
+        self.used += 1;
+        Ok(())
+    }
+}
+
+/// The **slice's** context: the [`RuntimeContext`] the executing machine runs on, with the
+/// slice's reduction budget charged at its heap-admission points.
+///
+/// This wrapper exists because `beam_rt` may not change `beam_engine` or its own
+/// `src/context/**`: it is handed to the machine the runner drives, and every context the
+/// engine builds *inside* that run — an external module call
+/// ([`RuntimeContext::run_export`]) or a fun application — is a plain `RuntimeContext`, so
+/// the wrapper's [`ensure_heap`](ExecutionContext::ensure_heap) is reached by the slice's own
+/// machine **only**. That is what makes the recorded resume address exact and keeps a nested
+/// run from being mistaken for the pre-empted one.
+///
+/// Everything else is forwarded unchanged; the redirect is purely mechanical.
+struct BudgetContext<'c, 'a> {
+    /// The slice's real context.
+    inner: &'c mut RuntimeContext<'a>,
+    /// The slice's budget.
+    probe: &'c mut BudgetProbe,
+}
+
+impl ExecutionContext for BudgetContext<'_, '_> {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        ExecutionContext::call_bif(self.inner, module, function, arity, args)
+    }
+
+    /// Charge one reduction, then serve the request by delegating (the runtime's arena is
+    /// unbounded, so the delegation itself never fails on Milestone 1).
+    fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.probe.charge()?;
+        ExecutionContext::ensure_heap(self.inner, heap_need, live, x_regs, stack)
+    }
+
+    fn heap_available(&self) -> usize {
+        ExecutionContext::heap_available(&*self.inner)
+    }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        ExecutionContext::alloc_words(self.inner, n)
+    }
+
+    fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
+        ExecutionContext::apply(self.inner, module, function, arity, args)
+    }
+
+    fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        ExecutionContext::apply_fun(self.inner, fun, args)
+    }
+
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        ExecutionContext::send_message(self.inner, to, message)
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        ExecutionContext::receive_next(self.inner)
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        ExecutionContext::receive_skip(self.inner)
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        ExecutionContext::receive_remove(self.inner)
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        ExecutionContext::receive_reset(self.inner)
+    }
+
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        ExecutionContext::receive_marker_reserve(self.inner)
+    }
+
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_bind(self.inner, marker, reference)
+    }
+
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_use(self.inner, reference)
+    }
+
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+        ExecutionContext::receive_marker_clear(self.inner, reference)
+    }
+}
+
 /// The `normal` exit-reason term (the reason a process that returns exits with).
 fn normal(runtime: &mut Runtime) -> Eterm {
     runtime.intern("normal")
@@ -361,10 +527,31 @@ impl ProcessRunner for RuntimeRunner<'_> {
     /// Runs one slice of process `pid`: its first entry, or the resume of the `receive`
     /// that suspended it.
     ///
-    /// The `budget` is accepted for the seam's sake but not enforced: the engine's
-    /// blocking-aware entries run to the next `return`/`wait`, so Milestone 1 has no
-    /// reduction pre-emption and a runner never reports
-    /// [`Yield`](beam_process::RunOutcome::Yield) (see the crate `CONTEXT.md`).
+    /// # Reduction accounting and pre-emption
+    ///
+    /// `budget` is the slice's **reduction budget** (the C `CONTEXT_REDS`); the runner owns
+    /// the reduction count (the scheduler never counts — see the [`ProcessRunner`]
+    /// contract). It is charged by [`BudgetProbe`] at the machine's heap-admission points
+    /// — every `test_heap`/`allocate_heap` instruction the executing machine runs reaches
+    /// [`ExecutionContext::ensure_heap`] once — and the slice **ends in
+    /// [`Yield`](beam_process::RunOutcome::Yield)** once the budget is spent, so a
+    /// CPU-bound process is pre-empted and the scheduler requeues it instead of letting it
+    /// monopolize the run queue.
+    ///
+    /// The yield is **resumption-exact**: the machine is parked at
+    /// [`Machine::current_code`] — the very instruction whose `ensure_heap` ran out (the
+    /// engine records it as the first statement of `step_instruction`, and re-running
+    /// `ensure_heap` from outside is a no-op) — so the next slice resumes *at* that
+    /// instruction with the registers, the stack and the frames intact, exactly as a
+    /// `receive` resume does. No result is fabricated and no work is repeated.
+    ///
+    /// The budget is only charged from the **slice's own** machine: the wrapper is the
+    /// context of that machine alone, and every machine a BIF reaches (an external module
+    /// call, a fun apply) is built inside `RuntimeContext` with the plain context, so a
+    /// nested run can never consume the budget nor be mistaken for the resumable machine.
+    /// A loop the compiler emits **without** a heap test (`spin/1`-style: no allocation, so
+    /// no `test_heap`) has no admission point and therefore runs to its next
+    /// `return`/`wait` without being pre-empted — the honest limit, reported as such.
     ///
     /// # Errors
     ///
@@ -375,7 +562,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
     /// A *raise inside the process* is **not** an error here: it becomes
     /// [`RunOutcome::Exit`] carrying the raised reason, exactly as the BEAM terminates a
     /// process with the reason it raised.
-    fn run(&mut self, pid: ProcessId, table: &mut ProcessTable, _budget: u32) -> Result<RunOutcome> {
+    fn run(&mut self, pid: ProcessId, table: &mut ProcessTable, budget: u32) -> Result<RunOutcome> {
         // Take the engine out of the map: it is borrowed mutably for the whole slice while
         // `self.runtime` is borrowed by the context, and a `HashMap` cannot hand out a
         // `&mut` value while its own container is still reachable. It goes back in below
@@ -406,7 +593,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
             }
         }
 
-        let outcome = {
+        let (outcome, used, exhausted) = {
             // The context also gets the **engines** of this pass (`self.state`): it drives
             // *this* process's machine (taken out of the map above), but a
             // `process_info/2` execution-position item must be able to read every *other*
@@ -420,7 +607,14 @@ impl ProcessRunner for RuntimeRunner<'_> {
             if let ProcessEntry::Export { module, .. } = &engine.entry {
                 ctx.enter_module(module);
             }
-            match engine.parked {
+            // The slice's reduction budget, charged at the machine's heap-admission points
+            // (see the `run` docs).
+            let mut probe = BudgetProbe::new(budget);
+            let mut budget_ctx = BudgetContext {
+                inner: &mut ctx,
+                probe: &mut probe,
+            };
+            let outcome = match engine.parked {
                 // A resume continues the SAME machine: the registers, the Erlang stack and
                 // the frames of the suspended `receive` must survive, so this deliberately
                 // does not reset (see `Machine::resume_outcome`). Only a module-export
@@ -428,7 +622,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // as a typed capability gap rather than run as a wrong (or empty) function.
                 Some((func, pc)) => match &engine.entry {
                     ProcessEntry::Export { module, .. } => {
-                        engine.machine.resume_outcome(module, func, pc, &mut ctx)
+                        engine.machine.resume_outcome(module, func, pc, &mut budget_ctx)
                     }
                     ProcessEntry::Fun { .. } => Err(crate::error::unsupported(
                         "resume of a fun-bodied process (a fun entry never suspends)",
@@ -444,18 +638,53 @@ impl ProcessRunner for RuntimeRunner<'_> {
                         *function,
                         *arity,
                         &engine.args,
-                        &mut ctx,
+                        &mut budget_ctx,
                     ),
                     // A fun entry is applied synchronously: `apply_fun` routes an `-eval`
                     // closure back into the evaluator and a `.beam` fun into the engine's
                     // label entry — the evaluator is never re-implemented here. A returned
                     // value is the fun's result, so it records exactly like an export's.
-                    ProcessEntry::Fun { fun } => ctx
+                    ProcessEntry::Fun { fun } => budget_ctx
                         .apply_fun(*fun, &engine.args)
                         .map(EngineRunOutcome::Returned),
                 },
-            }
+            };
+            // The wrapper's borrow of the probe ends here (the machine is no longer
+            // running), so the slice's accounting is readable.
+            drop(budget_ctx);
+            let used = probe.used();
+            let exhausted = probe.is_exhausted();
+            (outcome, used, exhausted)
         };
+
+        // Pre-emption: the budget ran out at a heap-admission point of this slicing
+        // machine. Park it at that very instruction and hand the process back to the
+        // scheduler, which requeues it (`slice_end`'s `Yield` arm) so a second runnable
+        // process gets the next slice. Nothing is recorded as a result/exit and the
+        // process stays `Runnable` — it has neither returned nor blocked.
+        if exhausted {
+            let Some(address) = engine.machine.current_code() else {
+                // Unreachable: only `ensure_heap` (reached from `test_heap`/
+                // `allocate_heap`, which record their address first) charges the budget.
+                // Reported as a typed error rather than parked at a guessed address — no
+                // wrong result, no hang.
+                return Err(crate::error::unsupported(
+                    "preemption: the exhausted machine has no resumable instruction address",
+                ));
+            };
+            if let Some(process) = table.get_mut(pid) {
+                // The runner owns the reduction count: record what this slice spent so
+                // `process_info(_, reductions)` reports real work.
+                process.reset_reductions();
+                process.bump_reductions(u64::from(used));
+            }
+            engine.parked = Some(address);
+            // A parked receive's deadline was settled above; a yield has no deadline of its
+            // own, so nothing is left armed here (a stale one would fire mid-run later).
+            engine.parked_timeout = None;
+            self.state.engines.insert(pid, engine);
+            return Ok(RunOutcome::Yield);
+        }
 
         match outcome {
             Ok(EngineRunOutcome::Returned(value)) => {
