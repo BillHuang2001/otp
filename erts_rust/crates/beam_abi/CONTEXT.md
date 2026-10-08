@@ -306,6 +306,17 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
 - **Target = LP64 only.** Windows-specific layout branches (`TWinDynNifCallbacks`, `ERL_SYS_DRV`
   `start` signature, `WinDynNifCallbacks`) are intentionally not modelled; the layout asserts make
   this explicit (they would fail on a non-LP64 target).
+- **There is no shared low-level `dlopen` wrapper — every dynamic-loading site calls `libc::dl*`
+  directly.** `nif::loader` and `driver::loader` each own a **private** `dl_last_error`/`dl_sym`/
+  `OpenHandle` trio (deliberate mirrors of one another, `fn` not `pub fn`, visible only inside their
+  own file — see the driver loader's module doc lines "deliberately mirror [`crate::nif::loader`]'s").
+  The frozen ABI slots forward straight to `libc` too: `driver_dl_open`/`_sym`/`_close`/`_error`
+  (`driver/drv/mem.rs`, the host-free A.4 surface, re-exported by `driver/drv/mod.rs`) and
+  `enif_dlopen`/`enif_dlsym` (`nif/enif/time.rs`, whose private `dlsym_checked`/`last_dl_error` mirror
+  the loaders' helpers). There is **no** `ffi`/`sys`/dynlib module and no *public* Rust `dlopen`
+  helper. The safe loaders are consumed only by `beam_rt` (`port::driver::load_driver` over
+  `driver::loader::load`; the `NifBridge` over `nif::loader::load`). A future `erl_ddll`-style
+  facility would have to introduce the single shared wrapper.
 - **`NifEnv` / `DriverEnv` erase their host borrow's lifetime at construction.** `NifEnv::new(&mut dyn
   NifHost)` (and `DriverEnv::new(&mut dyn DriverHost)`) must keep the spec's signature, but the
   C-facing env has no lifetime parameter — and a raw pointer to a trait object is invariant and
