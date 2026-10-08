@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub mod oracle;
+
 use beam_ets::{Table, TableId, TableKind, TableOptions};
 use beam_term::prelude::*;
 
@@ -55,7 +57,15 @@ pub fn info_entry(entries: &[(Atom, Eterm)], atoms: &AtomTable, field: &str) -> 
 /// `beam_alloc::Heap`, distinct from the `beam_term::heap::Heap` test arena the
 /// *source* terms are built in).
 pub fn rebuild_heap() -> beam_alloc::Heap {
-    beam_alloc::Heap::new(1024).expect("a test heap is allocatable")
+    rebuild_heap_words(1024)
+}
+
+/// A rebuild heap with room for `words` term words — use it when a test performs
+/// many `ets:update_*` calls: the interiors' default rebuild-on-heap path allocates
+/// a fresh object (3 words for a `{Key, Value}` tuple) per call and the heap never
+/// reallocates, so the default 1024 words is not enough for thousands of updates.
+pub fn rebuild_heap_words(words: usize) -> beam_alloc::Heap {
+    beam_alloc::Heap::new(words).expect("a test heap is allocatable")
 }
 
 /// A tuple object on `heap` built from `elements`.

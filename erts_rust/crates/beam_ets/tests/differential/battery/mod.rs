@@ -213,6 +213,31 @@ pub fn cap_terms(result: BeamResult<Vec<Eterm>>, atoms: &AtomTable) -> String {
     }
 }
 
+/// The oracle's `cap/1` for a term-*list* result whose iteration order is **not**
+/// part of the contract: the rendered terms **sorted** (the oracle's
+/// `cap_str/1` over `srt/1`).
+pub fn cap_srt(result: BeamResult<Vec<Eterm>>, atoms: &AtomTable) -> String {
+    match result {
+        Ok(terms) => {
+            let mut parts = rendered(&terms, atoms);
+            parts.sort();
+            format!("ok:{}", list_of(&parts))
+        }
+        Err(error) => cap_error(&error),
+    }
+}
+
+/// The oracle's `cap/1` for a navigation result (`ets:first`/`ets:next`, the
+/// crate's `Option<Eterm>`): the rendered key, `$end_of_table` for `None`, or the
+/// error class.
+pub fn cap_opt(result: BeamResult<Option<Eterm>>, atoms: &AtomTable) -> String {
+    match result {
+        Ok(Some(term)) => format!("ok:{}", render(term, atoms)),
+        Ok(None) => "ok:$end_of_table".to_string(),
+        Err(error) => cap_error(&error),
+    }
+}
+
 /// The rendered forms of `terms` in order — the shared body of the oracle's
 /// `r/1` (over a list), `srt/1` and `inorder/1`.
 pub fn rendered(terms: &[Eterm], atoms: &AtomTable) -> Vec<String> {

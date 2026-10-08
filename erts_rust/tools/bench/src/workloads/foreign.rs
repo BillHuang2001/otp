@@ -159,8 +159,8 @@ static CASES: &[Case] = &[
         default_root: COWBOY_ROOT,
         sources: &["src/cowboy_bstr.erl"],
         per_call: 30,
-        n_rust: 2_000,
-        n_sys: 200_000,
+        n_rust: 20_000,
+        n_sys: 1_500_000,
     },
     Case {
         name: "bstr_capitalize_token",
@@ -169,8 +169,8 @@ static CASES: &[Case] = &[
         default_root: COWBOY_ROOT,
         sources: &["src/cowboy_bstr.erl"],
         per_call: 30,
-        n_rust: 1_500,
-        n_sys: 200_000,
+        n_rust: 15_000,
+        n_sys: 1_500_000,
     },
     Case {
         name: "emqx_base62_encode",
@@ -179,8 +179,8 @@ static CASES: &[Case] = &[
         default_root: EMQX_ROOT,
         sources: &["apps/emqx/src/emqx_base62.erl"],
         per_call: 16,
-        n_rust: 250,
-        n_sys: 200_000,
+        n_rust: 25_000,
+        n_sys: 3_000_000,
     },
     Case {
         name: "emqx_base62_decode",
@@ -189,9 +189,9 @@ static CASES: &[Case] = &[
         default_root: EMQX_ROOT,
         sources: &["apps/emqx/src/emqx_base62.erl"],
         per_call: 11,
-        n_rust: 150,
+        n_rust: 15_000,
         // The oracle's marginal is the smallest of the four, so it needs the largest loop.
-        n_sys: 400_000,
+        n_sys: 3_000_000,
     },
 ];
 

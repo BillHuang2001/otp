@@ -1,0 +1,131 @@
+## %CopyrightBegin%
+##
+## SPDX-License-Identifier: Apache-2.0
+##
+## Copyright Ericsson AB 2024-2026. All Rights Reserved.
+##
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+##
+##     http://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+##
+## %CopyrightEnd%
+##
+## Build, test and differentially gate the Rust ERTS rewrite in erts_rust/.
+## This is a self-contained, path-triggered workflow: main.yaml and the OTP
+## build do not build the Rust workspace, and this workflow does not build OTP.
+##
+name: Rust ERTS
+on:
+  push:
+    paths:
+      - 'erts_rust/**'
+      - '.github/workflows/erts_rust.yml'
+  pull_request:
+    paths:
+      - 'erts_rust/**'
+      - '.github/workflows/erts_rust.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+jobs:
+  rust-erts:
+    name: Build, test and gate erts_rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    ## A single, cacheable CARGO_HOME is used both by the plain `cargo` steps and
+    ## by the gate's internal scripts/cargo.sh wrapper (which otherwise picks a
+    ## temp dir). The cargo steps run from the repo root, so cargo does not read
+    ## erts_rust/.cargo/config.toml — no lld/rustflags are in play here.
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.cargo-home
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' erts_rust/rust-toolchain.toml)
+          if [ -z "$toolchain" ]; then
+            echo "::error::could not read the pinned channel from erts_rust/rust-toolchain.toml"
+            exit 1
+          fi
+          echo "Installing pinned Rust toolchain: $toolchain"
+          rustup toolchain install "$toolchain" --profile default --component rustfmt --component clippy
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+      - name: Cache cargo and build output
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # ratchet:actions/cache@v5.0.3
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry
+            ${{ env.CARGO_HOME }}/git
+            erts_rust/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('erts_rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Install Erlang/OTP oracle
+        uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # ratchet:erlef/setup-beam@v1.20.4
+        with:
+          otp-version: '28'
+      - name: Build workspace
+        run: cargo build --workspace --all-targets --manifest-path erts_rust/Cargo.toml
+      - name: Test workspace
+        run: cargo test --workspace --no-fail-fast --manifest-path erts_rust/Cargo.toml
+      - name: Clippy (non-blocking)
+        ## `!cancelled()` (not `always()`): still produce a clippy report when an
+        ## earlier step failed, but do not start new work after a cancellation.
+        if: ${{ !cancelled() }}
+        ## The workspace is not clippy-clean; this step is informational only.
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --manifest-path erts_rust/Cargo.toml
+      - name: Differential compatibility gate
+        ## `!cancelled()` (not `always()`): the gate must still emit a verdict when
+        ## a preceding step failed, but must not start after a cancellation.
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! command -v erl >/dev/null 2>&1 || ! command -v erlc >/dev/null 2>&1; then
+            echo "skipping gate — no Erlang/OTP oracle (erl/erlc) on PATH"
+            echo "::warning::differential gate skipped — no Erlang/OTP oracle on PATH"
+            exit 0
+          fi
+          rc=0
+          erts_rust/tools/differential/gate.sh || rc=$?
+          case "$rc" in
+            0)
+              echo "::notice::differential gate passed — every executed case agreed (exit 0)"
+              exit 0
+              ;;
+            1)
+              echo "::error::differential gate FAILED — a real behavioral mismatch was found (exit 1)"
+              exit 1
+              ;;
+            2)
+              echo "::error::differential gate environment/usage error — missing oracle, build failure or no report (exit 2)"
+              exit 1
+              ;;
+            3)
+              echo "::warning::differential gate: no mismatch, but unsupported/skipped capability gaps remain (exit 3) — non-blocking"
+              exit 0
+              ;;
+            *)
+              echo "::error::differential gate exited with unexpected status $rc"
+              exit 1
+              ;;
+          esac

@@ -27,6 +27,27 @@
 //! round-trips and matches; when `beam_term` gains a proper `make_ref`, only
 //! [`MonitorRef::to_eterm`] changes.
 //!
+//! # User tags (`erlang:monitor/3` `{tag, Tag}`)
+//!
+//! The `erlang:monitor/3` `{tag, Tag}` option replaces the `'DOWN'` head atom of the
+//! notification: `None` reproduces the ordinary `{'DOWN', Ref, Kind, Target, Reason}`, and
+//! `Some(tag)` produces the oracle's `{Tag, Ref, Kind, Target, Reason}`.
+//!
+//! The tag is deliberately **not** a field of the records below: [`Monitor`],
+//! [`MonitoredBy`] and [`PortWatch`] are built by struct literal from other crates (e.g.
+//! `beam_rt`), so their shape is fixed and adding a field would break them. It is kept
+//! instead in a **side table** on [`ProcessTable`](crate::ptab::ProcessTable), keyed by the
+//! monitor reference — exactly like the `{Name, node}` descriptor of a named monitor (see
+//! `ptab.rs`, Design Decisions). An entry is created only when a tag is supplied and is
+//! removed the moment its monitor dies.
+//!
+//! A tag must be **heap-independent**: an immediate (an atom, small integer, local
+//! pid/port, `nil`) or a literal-area term. The side table holds only plain values — the
+//! crate's collector never scans it — so a term resident in a *per-process* heap could not
+//! be relocated and would dangle after a collection; a literal-area term, by contrast, is
+//! shared and never moves. A tag that is not an immediate is therefore rejected by the
+//! `ptab.rs` entry points with a typed `unsupported`, so a caller never gets a wrong result.
+//!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_monitor_link.c`.
 
 use beam_alloc::Heap;
@@ -168,16 +189,19 @@ impl MonitorKind {
 /// outgoing half on the watcher and the incoming
 /// [`PortMonitor`](crate::port::PortMonitor) on the port, and
 /// [`ProcessTable::port_closed`](crate::ptab::ProcessTable::port_closed) resolves the pair with
-/// `{'DOWN', Ref, port, Port, Reason}`.
+/// `{'DOWN', Ref, port, Port, Reason}` (or `{Tag, Ref, port, Port, Reason}` when the monitor
+/// carried an `erlang:monitor/3` user tag).
 ///
 /// # Not a GC root
 ///
-/// `reference` and `port` are both plain values (a `u64`-backed handle), **not** heap terms,
-/// so a port-watch set adds no root to the collector:
+/// `reference` and `port` are plain values (a `u64`-backed handle), so a port-watch set adds
+/// no root to the collector:
 /// [`Process::collect`](crate::process::Process::collect) gathers only the
 /// registers/stack, the mailbox payloads, the dictionary, the saved args and the
 /// pending-signal queue. (A port monitor therefore also never affects `beam_message`'s copy
-/// sizing, which only walks a crossed term's own object graph.)
+/// sizing, which only walks a crossed term's own object graph.) A monitor's
+/// `erlang:monitor/3` user tag lives in `ProcessTable`'s side table, not here (see the module
+/// docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortWatch {
     /// The reference the `{'DOWN', …}` message will carry.

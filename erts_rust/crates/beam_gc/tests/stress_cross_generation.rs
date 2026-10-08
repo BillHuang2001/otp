@@ -14,8 +14,9 @@
 //! * (a) the reachable graph is structurally unchanged -- the canonical form (below) equals the
 //!   form captured *before* the collection, the round-0 subgraph equals a persistent,
 //!   never-collected **canonical baseline** built in a private heap, and every baseline root
-//!   compares `Equal` under [`compare::eq`] (or, for the shapes `compare` cannot order
-//!   structurally -- the external pid and the cyclic graph -- through their own accessors);
+//!   compares `Equal` under [`compare::eq`] (structural for these shapes, including the
+//!   external pid; the hand-made cyclic graph instead goes through its own accessor because
+//!   `compare::eq` would recurse forever on a cycle);
 //! * (b) every root is *relocated* -- out of the nursery and inside the mature generation;
 //! * (c) the shared subterm is a **single** object after every collection and the two-cell
 //!   cycle closes on the *copies*; a dedicated test pins the exact
@@ -114,10 +115,9 @@ impl MsoPayload {
 // The corpus
 
 /// Which post-collection check a root needs. `compare::eq` is *structural* for tuples,
-/// lists, maps, funs, bitstrings and the primitives, but the crate documents a raw-word
-/// fallback for shapes it cannot order (external pids), and a cyclic graph would make it
-/// recurse forever -- those two get their own accessors, and the canonical walker (which is
-/// cycle-safe) covers everything.
+/// lists, maps, funs, bitstrings, the primitives **and external pids** (ordered through
+/// their parts), but a hand-made cyclic graph would make it recurse forever -- that one gets
+/// its own accessor, and the canonical walker (which is cycle-safe) covers everything.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RootKind {
     /// Compare structurally with `compare::eq` against the same-index baseline root.
@@ -128,7 +128,7 @@ enum RootKind {
     Cycle,
     /// A tuple whose first element is the off-heap MSO's slot index.
     MsoHolder,
-    /// An external pid: `compare` cannot order it, so compare its parts directly.
+    /// An external pid: `compare` orders it structurally, but this checks its parts directly too.
     Pid,
     /// A root with no baseline (added after round 0): only the canonical pre/post check.
     Extra,
@@ -259,13 +259,14 @@ fn write_cycle(heap: &mut Heap) -> Eterm {
     }
 }
 
-/// Writes an external pid into `heap` (the only public pid-heap-term constructor).
-fn write_pid(heap: &mut Heap, node: Atom) -> Eterm {
+/// Writes an external pid with chosen `(number, serial, creation)` into `heap` (the only public
+/// pid-heap-term constructor).
+fn write_pid(heap: &mut Heap, node: Atom, number: u32, serial: u32, creation: u32) -> Eterm {
     // SAFETY: `external_pid_size_words()` (4) exclusively-owned words are reserved and all of
     // them are written by `write_external_pid`; the `node` slot holds a live atom term.
     unsafe {
         let hp = heap.alloc_words(external_pid_size_words()).expect("reserve pid");
-        write_external_pid(hp, make_atom(node), 7, 8, 9)
+        write_external_pid(hp, make_atom(node), number, serial, creation)
     }
 }
 
@@ -344,7 +345,7 @@ fn build_round0(heap: &mut Heap, ctx: &Ctx) -> Round0 {
     kinds.push(RootKind::Eq);
 
     // (10) an external pid (the shape no other test exercises).
-    roots.push(write_pid(heap, ctx.node));
+    roots.push(write_pid(heap, ctx.node, 7, 8, 9));
     kinds.push(RootKind::Pid);
 
     // (11) the MSO holder: the on-heap reference word is the off-heap slot index (the
@@ -573,7 +574,7 @@ fn canonical(roots: &[Eterm], atoms: &AtomTable) -> String {
     out
 }
 
-// Per-root structural checks (shapes `compare::eq` cannot order)
+// Per-root structural checks (including the cyclic graph `compare::eq` cannot order)
 
 /// Asserts the two tuples still share **one** subterm object (the copied-once evidence) and
 /// that the path values are intact.
@@ -754,8 +755,8 @@ fn observe(kind: MatureKind) -> Observation {
             );
         }
 
-        // (a)/(c) per-root structural checks against the baseline (and the shapes
-        // `compare::eq` cannot order).
+        // (a)/(c) per-root structural checks against the baseline (including the cyclic
+        // graph `compare::eq` cannot order).
         for i in 0..baseline_len {
             match root_kinds[i] {
                 RootKind::Eq => assert!(
@@ -998,20 +999,40 @@ fn an_off_heap_mso_is_untouched_by_every_collection() {
     }
 }
 
-/// `compare::eq` on an external pid falls back to the raw word (a documented limitation), so
-/// the pid is compared through its own accessors; this pins that the two are equivalent for
-/// equal parts and different for different parts.
+/// `compare::eq` orders an external pid **structurally through its parts** (the C `erts_cmp`
+/// field order: node, then number/serial/creation), so a pid is genuinely compared through
+/// its parts and a copy compares `=:=` its original. This pins equality for identical parts,
+/// inequality for a differing number or node, and that the parts stay readable through the
+/// `external_pid_parts` accessor.
 #[test]
 fn an_external_pid_compares_through_its_parts() {
     let mut table = AtomTable::new();
-    table.seed(["node"]);
+    table.seed(["node", "other_node"]);
     let node = table.intern("node");
+    let other_node = table.intern("other_node");
 
     let mut heap = Heap::new(64).expect("heap");
-    let p1 = write_pid(&mut heap, node);
-    let p2 = write_pid(&mut heap, node);
+    let p1 = write_pid(&mut heap, node, 7, 8, 9);
+    let p2 = write_pid(&mut heap, node, 7, 8, 9);
     assert!(is_boxed(p1) && is_boxed(p2));
-    assert!(!compare::eq(p1, p2, &table), "compare falls back to the raw word");
+    assert!(
+        compare::eq(p1, p2, &table),
+        "two pids with identical parts compare structurally equal"
+    );
     assert_pid(p1, node);
     assert_pid(p2, node);
+
+    // A different `number` (every other part equal) compares unequal.
+    let other_number = write_pid(&mut heap, node, 42, 8, 9);
+    assert!(
+        !compare::eq(p1, other_number, &table),
+        "a pid with a different number must compare unequal"
+    );
+
+    // A different `node` (every other part equal) compares unequal.
+    let other_node_pid = write_pid(&mut heap, other_node, 7, 8, 9);
+    assert!(
+        !compare::eq(p1, other_node_pid, &table),
+        "a pid with a different node must compare unequal"
+    );
 }

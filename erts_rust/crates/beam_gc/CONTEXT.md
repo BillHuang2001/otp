@@ -620,11 +620,12 @@ still reproduces today's collector exactly.
   `x_regs[0..live]` ++ stack — is already threaded there), keeping the `system_limit` translation for a
   returned typed error. `HeapPolicy::unbounded()`/`GcConfig::growable()` express "no cap".
 - **Test-id / MSO / `compare` caveats (cross-crate).** A pid is a heap term via
-  `beam_term::thing::write_external_pid` (4 words), but is **not** structurally `Equal` under
-  `beam_term::compare::eq` (raw-word fallback) — compare via `external_pid_parts`; `compare::eq` also
-  **recurses forever on a cycle**. An MSO has no on-heap reference *term*: the safe reference is the
-  `OffHeap::insert -> slot` index, never a raw pointer. Reach a refc binary's `BinRef` via the `ErlSubBits`
-  `orig` slot, not pointer adjacency. Covered by `tests/stress_cross_generation.rs`.
+  `beam_term::thing::write_external_pid` (4 words) **and** `beam_term::compare::eq` orders it
+  **structurally through its parts** (field order per the C `erts_cmp`), with `external_pid_parts`
+  available to read the parts directly; `compare::eq` still **recurses forever on a cycle**. An MSO
+  has no on-heap reference *term*: the safe reference is the `OffHeap::insert -> slot` index, never a
+  raw pointer. Reach a refc binary's `BinRef` via the `ErlSubBits` `orig` slot, not pointer adjacency.
+  Covered by `tests/stress_cross_generation.rs`.
 - **The runtime should surface `HeapInfo`** (`beam_rt`): `HeapInfo::of(&collector)` (or
   `AnyCollector::heap_info()`) backs `erlang:process_info(Pid, garbage_collection)` and
   `system_info(garbage_collection)`; `GARBAGE_COLLECTION_KEYS` is the oracle's key order.

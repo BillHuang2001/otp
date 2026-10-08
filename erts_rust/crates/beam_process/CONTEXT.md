@@ -89,6 +89,12 @@ liveness maps.
     `dict(_mut)`, `saved_args(_mut)`, `signals(_mut)`/`pending_signals()`, `off_heap(_mut)`,
     `links(_mut)`, `monitors(_mut)`, `monitored_by(_mut)`, `port_monitors(_mut)`,
     `exit_reason`/`set_exit_reason`.
+  - `heap_and_off_heap_mut(&mut self) -> (&mut Heap, &mut OffHeapTable)` — the **split borrow** accessor
+    handing out the young heap and the off-heap table together (destructures `self`; safe Rust, no raw
+    pointer), so a caller can drive `beam_message::Fragments::move_into(dst, dst_off_heap)` in one
+    borrow — the only way to move a **fragmented** message payload onto the process's heap. The other
+    `*_mut` pairs were audited: the sole other pair with a real caller need is `(heap, mailbox)` (for
+    `beam_message::send_fragmented`), which is **not** split (see the note in Notes for Agents).
   - **message delivery:** `deliver(from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) ->
     Result<DeliverOutcome>` — copies `term` into the young heap (collect-and-retry once on
     `AllocKind::Heap`/`Message` exhaustion), enqueues the `Message`, then `wake()`s;
@@ -239,18 +245,22 @@ injector + every local queue, one queue lock at a time).
 - **Signal-message builders** (each allocates on the *receiving* process's heap): `build_exit_message
   (heap, atoms, from: ProcessId, reason)` (`{'EXIT', From, Reason}`); `build_exit_message_term(heap,
   atoms, from: Eterm, reason)` (the general form, whose `from` may be an external pid term);
-  `build_down_message(heap, atoms, ref, pid, reason)` (`{'DOWN', Ref, process, Pid, Reason}`);
-  `build_down_message_port(...)` (the `port`-tagged form); `build_down_message_remote(...)`
+  `build_down_message(heap, atoms, user_tag: Option<Eterm>, reference, pid, reason)`
+  (`{'DOWN', Ref, process, Pid, Reason}`, or `{Tag, Ref, process, Pid, Reason}` when `user_tag` is
+  `Some`); `build_down_message_port(...)` (the `port`-**kind** form); `build_down_message_remote(...)`
   (materialises the external-pid target on the same heap); and the fully general
-  `build_down_message_term(heap, atoms, ref, tag: Atom, target: Eterm, reason)`.
+  `build_down_message_term(heap, atoms, user_tag: Option<Eterm>, reference, kind: Atom, target: Eterm,
+  reason)`. `kind` is the `{'DOWN', …}` 3rd-element **kind** atom (`process`/`port`), distinct from the
+  caller's `user_tag` (which replaces the message's head atom).
 ### `signal_queue.rs` — the decoupled per-process pending-signal queue
 A signal is *queued* on the receiver and applied later (see the eager-vs-queued rule under `ptab.rs`);
 its `reason` is copied into the receiver's own heap at enqueue time, so the queue is an in-heap
 sub-rootset.
 - `PendingSignalKind { Exit, Down }`.
 - `PendingSignal { Exit { from, reason }, Down { reference: MonitorRef, target: ProcessId, kind:
-  MonitorKind, reason } }` (`Copy`) — the queued signal; `exit(..)`/`down(..)` constructors, `kind()`,
-  `reason()`.
+  MonitorKind, tag: Option<Eterm>, reason } }` (`Copy`) — the queued signal; `exit(..)`/`down(..)`
+  constructors, `kind()`, `tag()`/`reason()`. The `tag` is the caller's `monitor/3` user tag, carried so
+  the deferred `{'DOWN', …}` materialises with the right head atom.
 - `SignalQueue { entries: VecDeque<PendingSignal> }` (`Default`) — the per-process FIFO:
   `push`/`pop`/`peek`/`drain`/`clear`/`iter` (application order), plus the GC pair
   `gather_roots(out) -> usize` (one word per queued signal's `reason`) / `scatter_roots(roots, start)`
@@ -266,10 +276,12 @@ sub-rootset.
 - `MonitorKind { Process, Port }` — `type_name() -> &'static str` (`"process"`/`"port"`) and
   `from_type_name(&str) -> Option<MonitorKind>` back the `erlang:monitor/2` type dispatch (any other
   type name ⇒ `None` ⇒ the caller's `badarg`, matching the oracle).
-- `PortWatch { reference: MonitorRef, port: PortId }` (new, `Copy`) — the **outgoing** half of a port
+- `PortWatch { reference: MonitorRef, port: PortId }` (`Copy`) — the **outgoing** half of a port
   monitor, held in `Process::port_monitors`. Plain values only (see Design Decisions: not a GC root).
 - `Monitor { reference, target: ProcessId, kind }` (outgoing) / `MonitoredBy { reference, watcher:
-  ProcessId, kind }` (incoming).
+  ProcessId, kind }` (incoming). These three structs' field sets are **frozen** — they are constructed
+  by struct literal from `beam_rt`, so no field may be added; the `monitor/3` user **tag** therefore
+  lives in a `ProcessTable` side table, not here (see Design Decisions).
 - `Monitors { entries: Vec<Monitor> }` — `push`, `remove(reference) -> Option<Monitor>`,
   `find(reference)`, `iter`, `drain`.
 - `payload_is_down_for(payload: Eterm, reference: MonitorRef, down_atom: Atom) -> bool` — the guarded
@@ -312,6 +324,15 @@ holds `Process` values directly. (`PortTable` lives in `port.rs`.)
     remote record + route; a **port term** with `MonitorKind::Process` ⇒ `BadArg` (oracle) and with
     `MonitorKind::Port` ⇒ typed `unsupported` (that entry point has no `&mut PortTable` — use
     `monitor_port_term`); anything else ⇒ `BadArg`.
+  - **`erlang:monitor/3` user tag (additive):** the parallel entry points `monitor_with_tag`,
+    `monitor_named_with_tag`, `monitor_port_with_tag`, `monitor_port_term_with_tag` and
+    `monitor_term_with_tag` take a trailing `tag: Option<Eterm>` (the existing no-tag methods delegate
+    with `None`). A `Some(tag)` makes the delivered message `{Tag, Ref, Kind, Target, Reason}` instead
+    of `{'DOWN', Ref, Kind, Target, Reason}` — the tag replaces the head atom only. The tag is stored in
+    the private `tags: HashMap<MonitorRef, Eterm>` side table (`remember_tag`/`forget_tag`, cleaned up at
+    `demonitor`/`demonitor_port`/termination/port close) — **never** in the frozen `Monitor`/`MonitoredBy`/
+    `PortWatch` structs. The tag must be a heap-independent **immediate**; a non-immediate tag (or any tag
+    on a **remote** external-pid target — `DOP_MONITOR_P` carries no tag) is a typed `unsupported`.
   - **decoupled signal servicing:** `service_signals(pid) -> Result<()>` — drains + applies the pid's
     pending-signal queue in FIFO order, cascading to any process those signals affect (the scheduler
     calls it at schedule-in); `pending_signals(pid)`, `signals(pid) -> Result<&SignalQueue>`.
@@ -423,19 +444,20 @@ re-export keeps `beam_process::PortTable` resolving here.
   (alloc/reuse + relationship round-trips), `progress` (generation bump), `ptab` (alloc/remove/reuse +
   serial bump, name registry, stale-pid rejection, `deliver` wake list, `take` clearing a pending wake,
   the trap/link-`EXIT`/`{'DOWN'}` paths waking a blocked recipient).
-- **`tests/` — the integration evidence pinning the M1 guarantees.** **21 files**, one topic each; the
+- **`tests/` — the integration evidence pinning the M1 guarantees.** **23 files**, one topic each; the
   authoritative per-file list lives in **`tests/CONTEXT.md`**. In short: `scheduler`/`messaging`/
   `signals`/`gc`/`priority`/`pending_signals`/`dict`/`dict_oracle`/`fragments` cover the single-threaded
   scheduler, the mailbox, signals, PCB state and the dictionary (including its `erl`-cross-checked
   structural key/value equality); `ports`/`remote` the port table and distributed links/monitors;
-  `smp`/`lock_scope`/`timers`/`dirty`/`progress` the SMP pool; `registry_monitors` the
-  monitor/registration semantics (incl. `noproc`/flush/name targets and an `erl` cross-check);
-  `preemption` the measured round-robin fairness; and `capability_inventory`/`process_info_source`/
-  `spawn_options` the typed-error inventory, the `process_info` item→accessor map and the spawn-option
-  composition. `tests/lock_scope.rs` is the bounded-quantum-lock evidence (a slice =
-  `ceil(budget/quantum)` runner invocations under one slice; a cross-thread send and a peer run *inside*
-  another process's slice — both assertions fail under a whole-slice lock) plus the 1-vs-4-scheduler
-  determinism check.
+  `smp`/`lock_scope`/`timers`/`dirty`/`progress` the SMP pool; `registry_monitors`/`monitor_tag` the
+  monitor/registration semantics (incl. `noproc`/flush/name targets, the `monitor/3` user tag, and `erl`
+  cross-checks); `preemption` the measured round-robin fairness; `split_borrow` the
+  `heap_and_off_heap_mut` storage identity + `Fragments::move_into`; and
+  `capability_inventory`/`process_info_source`/`spawn_options` the typed-error inventory, the
+  `process_info` item→accessor map and the spawn-option composition. `tests/lock_scope.rs` is the
+  bounded-quantum-lock evidence (a slice = `ceil(budget/quantum)` runner invocations under one slice; a
+  cross-thread send and a peer run *inside* another process's slice — both assertions fail under a
+  whole-slice lock) plus the 1-vs-4-scheduler determinism check.
 - **Anti-flakiness (the SMP/lock-scope/timer/dirty/progress suites).** Every assertion is forced by
   **synchronization**, never `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the completion
   signals, `std::sync::Barrier`/gates coordinate concurrency, and `SchedulerPool::wait_idle(Some(timeout))`
@@ -446,8 +468,8 @@ re-export keeps `beam_process::PortTable` resolving here.
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **312 passed / 0 failed / 1 ignored** (157 in-module unit + 154 integration across the
-  21 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
+  Current total: **330 passed / 0 failed / 1 ignored** (160 in-module unit + 169 integration across the
+  23 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
   in `preemption.rs`), warning-free. Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
   never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
@@ -515,6 +537,16 @@ re-export keeps `beam_process::PortTable` resolving here.
   `local_node: Option<Atom>`, and the DOWN builder branches on it. A *named port* monitor is a typed
   `unsupported` (the registry resolves names to processes only). The `noproc` DOWN is delivered eagerly
   for the reason in Known Issues.
+- **The `monitor/3` user tag lives in a side table too, NOT a `Monitor` field.** `Monitor`, `MonitoredBy`
+  and `PortWatch` are constructed by struct literal from `beam_rt`, so adding a field would break that
+  crate's compile (the workspace must stay green) — their field sets are **frozen**. `ProcessTable`
+  therefore keeps `tags: HashMap<MonitorRef, Eterm>` with `remember_tag`/`forget_tag` (`forget_tag` at
+  `demonitor`/`demonitor_port`/termination/port close so it cannot leak). The tag is validated to be a
+  heap-independent **immediate** before any state changes (`check_tag`), because the side table is not a
+  collector rootset — a heap word stored there would dangle after a GC (the oracle accepts any term as a
+  tag; this crate returns the typed `unsupported` rather than a wrong result). The DOWN builders read the
+  tag from the table at build time (`tags.get(&reference).copied()`, `None` ⇒ the `'DOWN'` atom), and the
+  internal `PendingSignal::Down` carries it to the deferred materialisation point.
 - **`Links` is a set in M1.** Re-linking is a no-op and unlinking removes once, matching the observable
   `erlang:link/1`/`unlink/1` semantics; the C's per-link refcount (for `monitor` on links and distributed
   links) is a follow-up.
@@ -614,12 +646,13 @@ re-export keeps `beam_process::PortTable` resolving here.
   port monitor (`monitor(port, Name)`) is a typed `unsupported` (the local name registry resolves names
   to processes only, so answering with a process monitor would be a wrong result). The noproc DOWN is
   delivered **eagerly** into the watcher's mailbox whereas the oracle defers it as a signal (see the
-  bullet above).
+  bullet above). `erlang:monitor/3`'s `{tag, T}` form accepts only an **immediate** `T` (a non-immediate
+  or a remote-target tag is a typed `unsupported`); the tag-less `monitor/2` form is complete.
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
 - `src/registers.rs` → `XRegs`, `Stack`, `Registers` (the root-set containers); `MAX_REG`/`MAX_ARG`
-- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority` and the `port_monitors` watch set; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
+- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority` and the `port_monitors` watch set; the `heap_and_off_heap_mut` split borrow; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
 - `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter; keys and `get_keys/1` values compare structurally via `beam_term::compare::eq` through an `Rc<AtomTable>` handle)
 - `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
 - `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing + `reprioritize`)
@@ -631,12 +664,12 @@ re-export keeps `beam_process::PortTable` resolving here.
 - `src/signal.rs` → `SignalAtoms` (incl. `port`/`noproc`), `ExitSignal`, `ReasonClass`, `ExitPolicy`/`exit_policy`, the signal-message builders (exit + `process`/`port`/remote `DOWN`)
 - `src/signal_queue.rs` → `SignalQueue` + `PendingSignal`/`PendingSignalKind` (the decoupled pending-signal queue + its GC gather/scatter)
 - `src/link.rs` → `Links` (bidirectional link set)
-- `src/monitor.rs` → `MonitorRef`, `MonitorKind` (+ `type_name`/`from_type_name`), `PortWatch`, `Monitor`, `MonitoredBy`, `Monitors`, `RefAllocator`, `payload_is_down_for`
+- `src/monitor.rs` → `MonitorRef`, `MonitorKind` (+ `type_name`/`from_type_name`), `PortWatch`, `Monitor`, `MonitoredBy` (field sets frozen — no `tag` field), `Monitors`, `RefAllocator`, `payload_is_down_for`
 - `src/remote.rs` → `RemotePid`, `PidTarget`, `RemoteMonitor`, `DistSignal`, `DistSignalRouter` (the distribution seam)
 - `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface, the incoming half of a port monitor), `PortMonitor`, `PortClose`
-- `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`) + signal/link hub + decoupled signal servicing + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
+- `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`, and the `*_with_tag` variants over their `tags` side table) + signal/link hub + decoupled signal servicing + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
 - `src/error.rs` → `pub(crate)` error constructors incl. the typed-`unsupported` raise constructors (no new error type)
-- `tests/*.rs` (21 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `dict_oracle.rs`/`registry_monitors.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory)
+- `tests/*.rs` (23 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the `heap_and_off_heap_mut` storage-identity + `Fragments::move_into` evidence)
 - `tests/CONTEXT.md` → per-file topic list, the anti-flakiness constraint, the gate command
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)
@@ -664,8 +697,11 @@ re-export keeps `beam_process::PortTable` resolving here.
 - Build/test with the manifest path: `erts_rust/scripts/cargo.sh test --manifest-path
   erts_rust/Cargo.toml -p beam_process` (sandbox `$HOME` is read-only — always the wrapper). Never
   `cd`; never touch `../../tools/`.
-- `Process::heap_mut()` returning two disjoint `&mut` fields (heap + mailbox) requires destructuring
-  `self` when calling `beam_message::send` — do not add a combined raw-pointer accessor.
+- `heap_and_off_heap_mut()` is the ONE split borrow a caller needs for
+  `beam_message::Fragments::move_into` (heap + off-heap table): it destructures `self`, returning two
+  disjoint `&mut` fields in safe Rust (no raw pointer). The `(heap, mailbox)` pair for
+  `beam_message::send_fragmented` still requires the caller to destructure `self` (no split accessor yet
+  — a follow-up if a downstream caller needs it); do not add a combined raw-pointer accessor for either.
 - `beam_alloc::Heap` exhaustion (`AllocKind::Heap`) from the young heap means **collect and retry** (see
   `beam_alloc`/`beam_gc` Design Decisions), not fatal OOM — `Process::deliver` implements that retry.
 - The collector moves live terms, so **every** in-heap reference must be a root. `Process::collect`
@@ -686,7 +722,12 @@ re-export keeps `beam_process::PortTable` resolving here.
   type dispatch via `MonitorKind::from_type_name` + `monitor_port_term`/`monitor_named`, and install
   `set_local_node` at boot for name targets; (5) `process_info(P, registered_name)` → `name_of`;
   `process_info(P, monitors)` must surface `Process::port_monitors()` as `{port, Port}`;
-  (6) `spawn_opt` heap knobs → `beam_gc::HeapPolicy::from_spawn_opts` + `with_policy_and_priority`.
+  (6) `spawn_opt` heap knobs → `beam_gc::HeapPolicy::from_spawn_opts` + `with_policy_and_priority`;
+  (7) `erlang:monitor/3`'s `{tag, T}` option → the `monitor_*_with_tag` entry points (the tag is a
+  `ProcessTable` side table, never a `Monitor` field — no `Monitor`/`MonitoredBy` shape change); (8) a
+  **fragmented** message payload is moved onto the receiver's heap with
+  `Process::heap_and_off_heap_mut()` + `beam_message::Fragments::move_into` (heap growth is still needed
+  — `Collector::ensure_capacity` — for a payload larger than the M1 heap).
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, the seam types and the wave-3 dependency position.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1 process semantics, §3 error strategy, §5 GC/memory model, §6 test gate).

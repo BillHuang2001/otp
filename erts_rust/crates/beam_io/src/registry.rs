@@ -544,6 +544,61 @@ impl PortRegistry {
     pub fn is_empty(&self) -> bool {
         self.ports.is_empty()
     }
+
+    /// The registry's port-number table, mutably.
+    ///
+    /// This is the **same** [`PortTable`] instance [`PortRegistry::open`] allocates from and
+    /// [`PortRegistry::close`] releases through, so a relationship recorded on it (an owner, a
+    /// link, a monitor) is the one the registry's own operations observe, and vice versa.
+    ///
+    /// It is the seam a host uses to drive the [`beam_process::ProcessTable`] port-monitor API —
+    /// [`monitor_port`](beam_process::ProcessTable::monitor_port) /
+    /// [`monitor_port_term`](beam_process::ProcessTable::monitor_port_term) /
+    /// [`demonitor_port`](beam_process::ProcessTable::demonitor_port) — for `erlang:monitor/2`
+    /// on a **port** target. Those take a `&mut PortTable` alongside the process table's
+    /// `&mut self`, and the ports they touch are the registry's live ports, so the table they
+    /// mutate must be this one.
+    ///
+    /// # Borrowing rule
+    ///
+    /// The returned `&mut PortTable` **borrows the registry**. A host that holds the registry
+    /// behind a `RefCell` (as `beam_rt` does: `Rc<RefCell<PortRegistry>>`, reached through
+    /// `RuntimePorts::registry_mut` → `try_borrow_mut`) must **scope this borrow so it is
+    /// dropped before any nested borrow of the same registry**: acquire the registry's
+    /// `RefMut`, take the `&mut PortTable`, run the single monitor/demonitor call, and drop the
+    /// whole chain in the same statement block:
+    ///
+    /// ```text
+    /// let mut registry = runtime_ports.registry_mut()?;   // borrow the RefCell once
+    /// let ports = registry.port_table_mut();              // borrow the registry
+    /// let reference = table.monitor_port(watcher, port, ports)?;   // the one call
+    /// // `ports` and `registry` are both dropped here, before the next statement.
+    /// ```
+    ///
+    /// Never hold the `&mut PortTable` across a call that **re-enters** the registry (a
+    /// `ports/0`, `port_info/1`, `port_command/3`, `ets:*`, … driven through the same shared
+    /// cell): that is a nested `RefCell` borrow, rejected by `beam_rt`'s `registry_mut` as a
+    /// typed capability gap — `error::unsupported("the port table is already in use")` — or, for
+    /// a bare `borrow_mut()`, a panic.
+    ///
+    /// The `&mut ProcessTable` side of `monitor_port`/`demonitor_port` carries the **same** rule,
+    /// because the process table is likewise shared behind a cell. When one monitor or demonitor
+    /// needs **both** tables, take both borrows together, run the call, and release both together
+    /// so nothing re-enters either cell mid-call.
+    pub fn port_table_mut(&mut self) -> &mut PortTable {
+        &mut self.ids
+    }
+
+    /// The registry's port-number table, by shared reference — the same instance
+    /// [`PortRegistry::port_table_mut`] hands out.
+    ///
+    /// A `&PortTable` needs only a shared borrow of the registry, so a caller holding the
+    /// registry behind a `RefCell` can reach it through an ordinary `borrow()`. All the
+    /// borrowing rules documented on [`PortRegistry::port_table_mut`] still apply to any
+    /// **nested** registry access made while the shared borrow is live.
+    pub fn port_table(&self) -> &PortTable {
+        &self.ids
+    }
 }
 
 #[cfg(test)]
@@ -558,7 +613,8 @@ mod tests {
         PortNotification, PortTaskKind, Readiness, PORT_REDS_INPUT, PORT_REDS_TIMEOUT,
     };
     use beam_common::{BeamError, Result};
-    use beam_process::PortId;
+    use beam_process::{PortId, PortWatch, ProcessTable, SignalAtoms};
+    use beam_term::prelude::AtomTable;
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::time::Instant;
@@ -1134,5 +1190,69 @@ mod tests {
             0,
             "the number the failed port held is handed out again"
         );
+    }
+
+    // --- port table accessors + the port-monitor seam ------------------------
+
+    /// `port_table`/`port_table_mut` hand out the registry's **own** id table — the same one
+    /// `open`/`close` allocate and release through — and the `beam_process` port-monitor API is
+    /// drivable through it.
+    #[test]
+    fn the_port_table_accessors_reach_the_registrys_own_table_and_drive_port_monitors() {
+        let mut poller = poller();
+        let (mut registry, id) = registry_with_pipe(&mut poller);
+
+        // The accessor sees exactly what the registry's own operations see: while the port is
+        // live, both agree it is allocated.
+        assert!(registry.contains(id));
+        assert!(registry.port_table().contains(id));
+        assert!(registry.port_table().monitors(id).is_empty());
+
+        // A real process table (with its own heap + signal atoms) supplies the watcher.
+        let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+        let watcher = table.spawn_default().expect("a watcher process");
+
+        // Monitor the port through the accessor: the returned reference is recorded on BOTH
+        // halves — the incoming one on the port (the registry's own table) ...
+        let reference = table
+            .monitor_port(watcher, id, registry.port_table_mut())
+            .expect("a live port is watchable");
+        let incoming = registry.port_table().monitors(id);
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].reference, reference);
+        assert_eq!(incoming[0].watcher, watcher);
+
+        // ... and the outgoing one on the watcher.
+        assert_eq!(
+            table
+                .get(watcher)
+                .expect("the watcher is live")
+                .port_monitors(),
+            &[PortWatch {
+                reference,
+                port: id
+            }]
+        );
+
+        // Demonitor through the accessor: it reports the monitor existed and drops both halves.
+        assert!(table
+            .demonitor_port(watcher, reference, registry.port_table_mut())
+            .expect("the watcher is live"));
+        assert!(registry.port_table().monitors(id).is_empty());
+        assert!(table
+            .get(watcher)
+            .expect("the watcher is live")
+            .port_monitors()
+            .is_empty());
+        // A second demonitor of the same reference reports `false` (it is already gone).
+        assert!(!table
+            .demonitor_port(watcher, reference, registry.port_table_mut())
+            .expect("the watcher is live"));
+
+        // Closing through the registry still drives the SAME table, so the accessor agrees
+        // the number is released.
+        registry.close(&mut poller, id).expect("closes");
+        assert!(!registry.contains(id));
+        assert!(!registry.port_table().contains(id));
     }
 }

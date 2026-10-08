@@ -1,35 +1,26 @@
 # Archived benchmark results (`erts_rust/tools/bench/results`)
 ## Intent
 Durable, reviewable copies of the raw `bench` `Report` JSON (and the `bench compare` diffs) behind
-`../RESULTS.md`. `out/` is gitignored, so a measurement would otherwise vanish with the worktree;
-anything committed here is a number someone may quote, so **only real harness output belongs here** —
-never a hand-written or estimated figure.
-The `m3-*` files are the **current** run; the `m1-*` files are the **superseded** Milestone-1 snapshot,
-kept verbatim for reference. The prefix is the milestone the run belongs to.
+`../RESULTS.md`.
+`out/` is gitignored, so a measurement would otherwise vanish with the worktree; anything committed here is a number someone may quote, so **only real harness output belongs here** — never a hand-written or estimated figure.
+The `m4-` prefix is the measurement session the files belong to; all files here are the same shared-host session on 2026-10-08.
 ## API Surface (what each file is)
-### Current run (`m3-*`)
-- `m3-bench-xrun-baseline-slice-foreign.json` — **the primary cross-runtime report**:
-  `run --full --runtime all --workloads baseline,slice,foreign`. Both sides see the same machine
-  conditions, so this is the source of every sys-vs-rust table in `../RESULTS.md` §3.
-- `m3-bench-xrun-baseline-slice-foreign-run2.json` — an identical repetition; the source of the
-  cross-runtime stability figures in `../RESULTS.md` §7.
-- `m3-bench-full-runtimes-all.json` — **the primary full report**: `run --full --runtime all`, all 9
-  workloads × both runtimes. Source of the sys-only tables (`../RESULTS.md` §4).
-- `m3-bench-full-runtimes-all-run2.json` — a second full run, taken under different host load; it is
-  the evidence for the contention spread in `../RESULTS.md` §7.
-- `m3-bench-quick-runtimes-all.json` — `run --quick --runtime all`, all 9 workloads (the fast sweep).
-- `m3-bench-full-nix-khepri-emqx.json` — `BENCH_TRY_NIX=1 … run --full --runtime sys
-  --workloads khepri,emqx`: the `khepri` wall time and EMQX's verified `skipped(not-a-rebar3-project)`.
-- `m3-bench-quick-nix-plb-attempt.json` — the bounded PLB attempt; `failed(plb-tool-failed)` with the
-  `dotnet` build error in its notes (the verified absence of a PLB number).
-- `m3-compare-cross-runtime.txt` — `bench compare` of the primary cross-runtime report (sys vs rust).
-- `m3-compare-xrun-run1-vs-run2.txt` — `bench compare` of the two cross-runtime runs (76 rows).
-- `m3-compare-full-runB-vs-runA.txt` — `bench compare` of the two full runs (the noise bound).
-### Superseded snapshot (`m1-*`)
-The Milestone-1 report, its repetition, the nix/`plb` runs and the two M1 compare diffs, under the
-original filenames with an `m1-` prefix. **Do not quote them** — the `beam_rt` per-BIF-call defect they
-measure has since been fixed, so their `foreign` per-call rows (703×–9 891×) and their "not run"
-`erlang:memory` row for Rust are both obsolete. See `../RESULTS.md` §3 for the current values.
+### `m4-` benchmark reports
+- `m4-bench-full-runtimes-all.json` — **the primary full report**: `run --full --runtime all`, all 9 workloads × both runtimes.
+  The source of every headline number in `../RESULTS.md` §3 and §4.
+- `m4-bench-xrun-baseline-slice-foreign.json` — focused cross-runtime run 1: `run --full --runtime all --workloads baseline,slice,foreign`.
+- `m4-bench-xrun-baseline-slice-foreign-run2.json` — focused run 2.
+- `m4-bench-xrun-baseline-slice-foreign-run3.json` — focused run 3.
+  Runs 1–3 were taken under heavy contention and are the reproducibility **error bar** in `../RESULTS.md` §6.
+- `m4-bench-full-compilers-sys.json` — `erlc_compiler` + `elixir_compiler`, `run --full --runtime sys`.
+- `m4-bench-full-compilers-sys-run2.json` — the compiler repetition (the §4.1 brackets).
+- `m4-bench-full-cowboy-sys.json` — `cowboy`, `run --full --runtime sys`, taken in a quiet window (the §4.2 brackets).
+- `m4-bench-full-khepri-emqx.json` — `khepri` + `emqx`, `run --full --runtime sys` with the store `rebar3` on `PATH`: the `khepri` wall time and EMQX's verified `skipped(not-a-rebar3-project)`.
+- `m4-bench-quick-plb-net9-attempt.json` — the bounded PLB attempt with the .NET 9 SDK on `PATH`; `failed(plb-tool-failed)` with the tool's `DirectoryNotFoundException` in its notes (the verified absence of a PLB number).
+### `m4-` compare diffs
+- `m4-compare-cross-runtime.txt` — `bench compare` of the primary full report (sys vs rust inside one report).
+- `m4-compare-xrun-run1-vs-run2.txt` — `bench compare` of focused runs 1 and 2 (76 rows).
+- `m4-compare-xrun-run2-vs-run3.txt` — `bench compare` of focused runs 2 and 3 (76 rows).
 ## Constraints
 - **Never edit a metric value.** The one permitted normalisation is replacing the run-host worktree
   prefix in `runtimes[].program` with `erts_rust/target/release/beam_rt`, so the artifact carries no
@@ -42,9 +33,10 @@ measure has since been fixed, so their `foreign` per-call rows (703×–9 891×)
   `bench compare <a.json> <b.json>`.
 - JSON schema is `Report` / `WorkloadResult` (`SCHEMA_VERSION = 1`); a row is `ok` (has metrics),
   `skipped` (has a `reason`, no metrics) or `failed` (has a `reason`).
-- Absolute performance depends on the host **and on its current load**: the archived full runs differ by
-  up to 11× on `cowboy` throughput. The environment and the observed `/proc/loadavg` are pinned in
-  `../RESULTS.md` §1/§7; prefer the focused `m3-bench-xrun-*` pair for cross-runtime comparisons.
+- Absolute performance depends on the host **and on its current load**: the focused `m4-bench-xrun-*`
+  runs were taken under `/proc/loadavg` ~22–37 and their absolute values are inflated versus the quiet
+  primary run (`/proc/loadavg` 4.77 → 11.59). The environment and the observed load are pinned in
+  `../RESULTS.md` §1/§6; prefer the quiet primary run and ratios over absolute values.
 ## See Also
 - `../RESULTS.md` → the summary tables, exact commands and caveats.
 - `../CONTEXT.md` → the runbook and the workload definitions.

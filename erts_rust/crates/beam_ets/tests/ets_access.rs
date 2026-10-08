@@ -372,6 +372,56 @@ fn newly_wrapped_read_ops_follow_the_protection_matrix() {
     }
 }
 
+/// `ets:safe_fixtable/2` is **read**-gated, not write-gated: the owner may always
+/// fix the table, and so may any non-owner of a `protected` or `public` table —
+/// but a non-owner of a `private` table is `badarg`. A denied call must leave the
+/// table's fixation state untouched (verified against the system `erl`, OTP 29 /
+/// erts-17.1).
+#[test]
+fn set_fixation_follows_the_read_gate() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let atoms = AtomTable::new();
+            let mut heap = Heap::new(512);
+            let mut t = seeded_table(access, owner, &mut heap, &atoms);
+            let (read_ok, _) = expected(access, owner, requester);
+            let tag = format!("{access:?}/{who}");
+
+            // The gate follows the *read* column of the matrix, not the write one:
+            // a `protected` non-owner is admitted here even though every write is
+            // denied.
+            assert!(
+                !t.is_fixed(),
+                "{tag}: a freshly seeded table starts unfixed"
+            );
+            assert_gate(
+                t.as_requester(requester).set_fixation(true),
+                read_ok,
+                &format!("{tag} set_fixation(true)"),
+            );
+            // A denied call changed nothing; a permitted one fixed the table.
+            assert_eq!(
+                t.is_fixed(),
+                read_ok,
+                "{tag}: set_fixation(true) must only take effect when permitted"
+            );
+
+            // The clearing call obeys the same gate and is idempotent, so the
+            // table ends unfixed whatever the outcome.
+            assert_gate(
+                t.as_requester(requester).set_fixation(false),
+                read_ok,
+                &format!("{tag} set_fixation(false)"),
+            );
+            assert!(!t.is_fixed(), "{tag}: the table ends unfixed");
+        }
+    }
+}
+
 /// `ordered_set` navigation is table-level, so the read-checked wrappers cover it
 /// exactly like the hash kinds.
 #[test]

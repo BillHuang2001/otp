@@ -90,86 +90,42 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 ### `table/mod.rs` — the `Table` handle + ops
 - `pub struct TableId(u64)`: `new(u64)`, `raw(self) -> u64`, `next() -> TableId` (process-global
   monotonic), `Display`. `pub struct OwnerId(u64)`: `new(u64)`, `raw(self) -> u64`.
-- `pub struct Table`: metadata + table-owned `TermStore` + one interior.
-```rust
-impl Table {
-    pub fn new(id: TableId, opts: TableOptions) -> Result<Table>;
-    pub fn with_allocator(id: TableId, opts: TableOptions, alloc: AllocRef) -> Result<Table>;
-    pub fn with_set_interior(id: TableId, opts: TableOptions, interior: SetInterior) -> Result<Table>; // opt-in `set` interior
-    pub fn set_interior(&self) -> SetInterior;   // the selected `set` interior (Champ by default)
-    pub fn with_ordered_interior(id: TableId, opts: TableOptions, interior: OrderedInterior) -> Result<Table>; // opt-in `ordered_set` interior
-    pub fn ordered_interior(&self) -> OrderedInterior; // the selected `ordered_set` interior (BPlusTree by default)
-
-    // metadata
-    pub fn id(&self) -> TableId;
-    pub fn kind(&self) -> TableKind;
-    pub fn name(&self) -> Option<Atom>;      // Some iff a name was recorded (independent of named_table)
-    pub fn keypos(&self) -> usize;           // 1-based
-    pub fn access(&self) -> Access;
-    pub fn owner(&self) -> Option<OwnerId>;
-    pub fn set_owner(&mut self, owner: Option<OwnerId>);
-    pub fn give_away(&mut self, caller: Option<OwnerId>, new_owner: Option<OwnerId>) -> Result<()>;
-    pub fn heir(&self) -> Option<Heir>;
-    pub fn set_heir(&mut self, heir: Option<Heir>);
-    pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()>;
-    pub fn info(&self) -> TableInfo;
-
-    // writes (object = the whole tuple; key derived from keypos)
-    pub fn insert(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()>;
-    pub fn insert_new(&mut self, object: Eterm, atoms: &AtomTable) -> Result<bool>; // false if key exists
-    pub fn insert_list(&mut self, objects: &[Eterm], atoms: &AtomTable) -> Result<()>; // ATOMIC: validates the whole list first
-    pub fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> Result<()>;          // ets:delete/2 (by key)
-    pub fn delete_object(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()>;
-    pub fn delete_all_objects(&mut self);
-
-    // reads
-    pub fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm>;              // 0/1 for set/ordered_set
-    pub fn member(&self, key: Eterm, atoms: &AtomTable) -> bool;
-    pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm>; // scalar; `unsupported` raise for bag/duplicate_bag
-    pub fn lookup_element_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Eterm>; // scalar; absent key ⇒ default, `unsupported` raise for multi kinds
-    pub fn lookup_element_all(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Vec<Eterm>>; // the Pos-th element of EVERY object under key (the multi kinds' list result)
-    pub fn lookup_element_all_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Option<Vec<Eterm>>>; // Ok(None) ⇒ caller yields `default`
-    pub fn memory(&self) -> usize;                                                  // store words + interior words
-    pub fn size(&self) -> usize;                                                    // objects (not keys) for bag/dup_bag
-    pub fn is_empty(&self) -> bool;
-    pub fn tab2list(&self) -> Vec<Eterm>;                                           // ordered for ordered_set
-
-    // element updates
-    pub fn update_counter(&mut self, key: Eterm, update_op: Eterm, atoms: &AtomTable, heap: &mut beam_alloc::Heap) -> Result<Eterm>;
-    pub fn update_counter_with(&mut self, key: Eterm, update_op: Eterm, default: Eterm, atoms: &AtomTable, heap: &mut beam_alloc::Heap) -> Result<Eterm>;
-    pub fn update_element(&mut self, key: Eterm, updates: &[(usize, Eterm)], atoms: &AtomTable, heap: &mut beam_alloc::Heap) -> Result<bool>;
-
-    // navigation (None == '$end_of_table')
-    pub fn first(&self, atoms: &AtomTable) -> Option<Eterm>;
-    pub fn last(&self, atoms: &AtomTable) -> Option<Eterm>;
-    pub fn next(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>>;
-    pub fn prev(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>>;
-    pub fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>>; // copies out + reclaims the stored originals
-
-    // access control
-    pub fn check_read(&self, requester: Option<OwnerId>) -> Result<()>;
-    pub fn check_write(&self, requester: Option<OwnerId>) -> Result<()>;
-    pub fn as_requester(&mut self, requester: Option<OwnerId>) -> TableAccess<'_>;
-
-    // select family (see select/exec.rs; see also the predicate primitive)
-    pub fn select_all(&self, pred: &mut SelectPredicate<'_>) -> Vec<Eterm>;
-    pub fn select(&self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
-    pub fn select_delete(&mut self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
-    pub fn select_count(&self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
-    pub fn match_object(&self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
-    pub fn match_(&self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
-    pub fn match_delete(&mut self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
-    pub fn select_replace(&mut self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
-
-    // limit + continuation forms (see continuation.rs; `Option::None` ⇒ '$end_of_table')
-    pub fn select_limit(&self, spec: &MatchSpec, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn select_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn match_limit(&self, pattern_term: Eterm, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn match_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn match_object_limit(&self, pattern_term: Eterm, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-    pub fn match_object_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
-}
-```
+- `pub struct Table`: metadata + table-owned `TermStore` + one interior. Constructors `new(id, opts)`,
+  `with_allocator(id, opts, alloc)`, `with_set_interior(id, opts, SetInterior)`,
+  `with_ordered_interior(id, opts, OrderedInterior)`; the selected interiors are reported by
+  `set_interior()` (default `Champ`) / `ordered_interior()` (default `BPlusTree`). Full signatures are
+  in `src/table/{mod,read,access,element,ownership,lifecycle}.rs`.
+- **Shape conventions.** Every fallible op returns `beam_common::Result<_>`; `first`/`last`/`next`/`prev`
+  return `Option` (`None` = `'$end_of_table'`). Unless noted an op takes `atoms: &AtomTable` (shared
+  compare/hash); the select/match family and the element updates additionally take `heap: &mut Heap`
+  (scratch space).
+- **Metadata:** `id`, `kind`, `name() -> Option<Atom>` (Some iff a name was recorded — independent of
+  `named_table`), `keypos() -> usize` (1-based), `access`, `owner()/set_owner()`, `heir()/set_heir()`,
+  `give_away(caller, new_owner)`, `setopts(caller, SetOpt)`, `owner_died(dead, is_alive) -> OwnerDeath`,
+  `info() -> TableInfo`.
+- **Writes** (object = the whole tuple; key derived from `keypos`): `insert(object)` (upsert),
+  `insert_new(object) -> bool` (`false` if the key exists), `insert_list(&[object])` (**ATOMIC** —
+  validates the whole list first), `delete(key)`, `delete_object(object)`, `delete_all_objects()`.
+- **Reads:** `lookup(key) -> Vec<Eterm>` (0/1 for set/ordered_set), `member(key) -> bool`,
+  `lookup_element(key, pos)` / `lookup_element_or(key, pos, default)` (scalar; `unsupported` raise for
+  the multi kinds), `lookup_element_all(key, pos) -> Vec<Eterm>` / `lookup_element_all_or(..) ->
+  Option<Vec<Eterm>>` (the multi kinds' list result), `memory() -> usize` (store + interior words),
+  `size() -> usize` (objects, not keys, for bag/dup_bag), `is_empty()`, `tab2list() -> Vec<Eterm>`
+  (ordered for ordered_set).
+- **Element updates:** `update_counter(key, op)`, `update_counter_with(key, op, default)`,
+  `update_element(key, &[(pos, term)]) -> bool`.
+- **Navigation:** `first()`, `last()`, `next(key)`, `prev(key)`, `take(key) -> Vec<Eterm>` (copies out +
+  reclaims the stored originals).
+- **Access control:** `check_read(requester)` / `check_write(requester)` / `as_requester(requester) ->
+  TableAccess<'_>`.
+- **Select family** (see `select/exec.rs`; also the `select_all(pred)` predicate primitive):
+  `select(spec)`, `select_delete(spec) -> usize`, `select_count(spec) -> usize`,
+  `match_object(pattern_term)`, `match_(pattern_term)`, `match_delete(pattern_term) -> usize`,
+  `select_replace(spec) -> usize`.
+- **Limit + continuation forms** (see `continuation.rs`; `Option::None` ⇒ `'$end_of_table'`):
+  `select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/
+  `match_object_continue`, each `-> (Vec<Eterm>, Option<MatchContinuation>)`.
+- `pub struct Heir { pub owner: OwnerId, pub data: Eterm }` and `pub enum OwnerDeath { NotOwner, Deleted, Transferred(Heir) }` (from `lifecycle.rs`) — the owner-death transition (see `table/lifecycle.rs`). `Table::owner_died` takes the process layer's liveness oracle (`FnOnce(OwnerId) -> bool`) because this crate has no process-liveness concept; `Transferred` obliges the runtime to deliver `{'ETS-TRANSFER', Tid, FromPid, data}` and `Deleted` to drop the table — neither is an effect of this crate.
 - `pub fn match_spec_run(list: Eterm, spec: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>` (from `run.rs`) — the table-independent `ets:match_spec_run/2` runner.
 - `pub(crate) trait Interior` — the internal dispatch seam implemented by the two interiors
   (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/
@@ -191,6 +147,15 @@ impl Table {
   an unknown table id is the registry/BIF layer's concern, and a set heir renders as `undefined`
   (no pid term).
 
+### `table/lifecycle.rs` — the owner-death transition
+- `pub enum OwnerDeath { NotOwner, Deleted, Transferred(Heir) }` + `Table::owner_died(dead, is_alive)`
+  — what happens to a table when a process that (may) own it dies. `NotOwner` (the dying process is
+  not this table's owner) is a complete no-op; `Deleted` (no heir, a self-heir, or a heir the
+  liveness oracle rejects) obliges the runtime to drop the table; `Transferred(heir)` sets the owner
+  to `heir.owner` and **keeps the heir installed** (the oracle does not reset it) and obliges the
+  runtime to deliver `{'ETS-TRANSFER', Tid, FromPid, heir.data}`. The oracle facts are pinned in the
+  module docs; the BIF/runtime hooks that would call this are recorded in `ETS_SURFACE.md` §7.
+
 ### `table/access.rs` — the access-enforcing view
 - `pub struct TableAccess<'a>` (from `Table::as_requester`) — rechecks `can_read`/`can_write` on
   every op and raises `BeamError::BadArg` on a violation, exactly like `ets`. It wraps the **whole**
@@ -198,9 +163,11 @@ impl Table {
   `insert_new`, `delete`, `delete_object`, `delete_all_objects`, `take -> Result<Vec<Eterm>>`,
   `update_counter`, `update_counter_with`, `update_element`, `select_delete`, `match_delete`; and
   read-checked `lookup -> Result<Vec<Eterm>>`, `member -> Result<bool>`, `lookup_element`,
-  `lookup_element_or`, `lookup_element_all`, `lookup_element_all_or`, `select`, `select_count`, `match_object`, `match_`, `first`/`last`/`next`/`prev
+  `lookup_element_or`, `lookup_element_all`, `lookup_element_all_or`, `select`, `select_count`, `match_object`, `match_`, `set_fixation` (`ets:safe_fixtable/2`, which the oracle gates as a
+  READ), `first`/`last`/`next`/`prev
   -> Result<Option<Eterm>>`, `tab2list -> Result<Vec<Eterm>>`, `size -> Result<usize>`,
-  `is_empty -> Result<bool>`. `first`/`last`/`next`/`prev` are table-level, so the same read-checked
+  `is_empty -> Result<bool>`. `ets:info/1,2` is deliberately **not** here — the oracle leaves it
+  ungated (a non-owner may `info` a `private` table). `first`/`last`/`next`/`prev` are table-level, so the same read-checked
   wrappers cover every kind (`ordered_set`'s interior overrides the underlying `first_key`/`last_key`/
   `next_key`/`prev_key` with exact B+-tree searches, but the access layer sits above the `Table`).
   The two ownership wrappers are requester-implicit: `give_away(&mut self, new_owner: Option<OwnerId>)
@@ -217,28 +184,19 @@ impl Table {
 
 ### `champ_interior.rs` — CHAMP open-addressing interior (**default `set`**)
 - `pub struct ChampInterior` + `Default`/`new()`: a **compressed hash-array mapped prefix-tree**
-  (CHAMP). Each level consumes `WIDTH = 5` bits of the 64-bit `term_hash` (`index_bit`) and every node
-  keeps its children **compressed** into two bitmaps — `datamap` (inline slots) and `nodemap`
-  (sub-nodes) — so `data`/`nodes` hold only the set bits in ascending bit order (`slot_index` finds a
-  slot by popcount). A key whose full hash collides with another's lives in a `CollisionNode`
-  (popcount-free, key-compared with `eq`), so a pathological hash can never recurse past 64 bits.
-  `Interior` impl: `insert` is an upsert (returns `Ok(true)` — `set` always retains), and
-  `insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`size`/`iter_objects`/
-  `keys`/`memory` are all overridden. `lookup`/`lookup_element` probe with `slot_index` only (no
-  bucket scan). `iter_objects`/`keys` walk depth-first (`collect_into`) — the `set` navigation order
-  is unspecified, so `first_key`/`last_key`/`next_key`/`prev_key` and the `ets:update_*` element ops
-  use the `Interior` trait defaults. `memory()` counts the root inline plus every node/vector
-  (`heap_words`).
-- **Canonicalization (delete).** A removal calls `canonicalize` bottom-up: a sub-node holding exactly
-  one entry (`single_entry`) is **inlined** into its parent as an inline slot (`bit_at` locates the
-  parent's bit), collapsing single-entry chains. Promoting a *multi-entry* sub-node wholesale is
-  provably wrong — a sub-node is indexed by the *next* 5 hash bits, so it must not be probed with the
-  parent's bits; only single-entry inlining preserves routing. `node_insert` needs no
-  canonicalization (an insert only adds entries).
-- Selection: [`SetInterior`] (`kind.rs`) — `Champ` (default) or `Chained`; `build_interior(kind,
-  set_interior, ordered_interior)` routes `TableKind::Set` accordingly (and `TableKind::OrderedSet`
-  through [`OrderedInterior`]). `bag`/`duplicate_bag` stay on `HashInterior`; `ordered_set` is the
-  B+-tree (default) or the sorted `Vec`. Constructor: `Table::with_set_interior`;
+  (CHAMP). Each level consumes `WIDTH = 5` bits of the 64-bit `term_hash`; each node compresses its
+  children into a `datamap` (inline slots) + `nodemap` (sub-nodes) pair, so `data`/`nodes` hold only
+  the set bits in ascending bit order (`slot_index` probes by popcount). A full-hash collision lives
+  in a `CollisionNode` (key-compared with `eq`), so a pathological hash cannot recurse past 64 bits.
+  Every `Interior` method is overridden; `insert` is an upsert returning `Ok(true)` (`set` always
+  retains). `iter_objects`/`keys` walk depth-first — `set` navigation order is unspecified, so
+  `first_key`/`last_key`/`next_key`/`prev_key` use the trait defaults.
+- **Delete canonicalization.** A removal calls `canonicalize` bottom-up: a sub-node holding exactly
+  one entry is **inlined** into its parent as an inline slot, collapsing single-entry chains.
+  Promoting a *multi-entry* sub-node wholesale is provably wrong — a sub-node is indexed by the *next*
+  5 hash bits, so the parent's bits must not probe it; only single-entry inlining preserves routing.
+- Selection: `SetInterior` (`kind.rs`) — `Champ` (default) or `Chained`; `build_interior(kind,
+  set_interior, ordered_interior)` routes each kind. Constructor `Table::with_set_interior`;
   `Table::set_interior` reports the selection.
 
 ### `hash_interior.rs` — chained hash-index interior (`bag`/`duplicate_bag`; opt-in `set`)
@@ -509,29 +467,40 @@ impl Table {
   `unsupported_ets: table lock poisoned` error — never a panic, never a wrong result. Holding one
   `write()` guard across a check-then-act makes `insert_new`/`update_counter`/`select_replace` atomic,
   so concurrent writers lose no updates. (Fine-grained `{write_concurrency}` affects throughput only,
-  never observable results.)
+  never observable results.) **Read results alias table-owned storage**, so they are valid only while
+  the read guard is held — see Known Issues.
 - **`ets:safe_fixtable/2` fixation = deferred reclamation.** `Table::set_fixation(bool)` /
   `is_fixed()` / `deferred_objects()`: while fixed, every *removed* object's storage is pushed onto
   `deferred_frees` instead of being freed, and `delete_all_objects` defers each root (rebuilding the
   interior) rather than `reset()`ing the arena; unfixing flushes the deferred frees. So
   `ets:info(T, memory)` is held while fixed and *falls* at unfix, matching the oracle. `deferred_frees`
   is deliberately **not** counted in `memory()` (table-owned, not live objects).
-- **Access enforcement covers the newer ops.** `TableAccess` (`src/table/access.rs`) gates
-  `select_replace` as a *write* and every `/3` + `/1` limited/continuation form as a *read*
-  (`select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/
-  `match_object_continue`).
 - **Subterm sharing (the copy-boundary trim).** `TermStore::copy_term` shares exactly the one literal
   whose liveness the crate can prove — the global empty tuple (`tuple0()`; C `copy.c:130-140`).
   `beam_term::literal::LiteralArea` literals are **deep-copied** (the area can be dropped and the
   crate holds no handle, so the C's `in_literal_purge_area` guard cannot be honoured). `{keypos, N}`
   keys live inside the stored tuple (no separate key copy); `compressed` is parsed/reported with no
   storage effect (honest gap, see Known Issues).
-- **New evidence:** `tests/ets_shared.rs` (5 tests — `Send`/`Sync`, 8-writer no-lost-update, reader
-  consistency, owner-only writer under concurrency, cross-thread move), `tests/ets_fixtable.rs` (5 —
-  fix/unfix idempotence, storage held while fixed and released at unfix, `delete_all_objects` under
-  fixation, ordered walk-and-delete under fixation, hash anchor still required when fixed),
-  `tests/ets_access.rs` (+2 — the `select_replace`/limited-form gates), `src/store/tests.rs` (+1 — the
-  empty-tuple literal is shared, not copied).
+- **Access enforcement covers the newer ops.** `TableAccess` (`src/table/access.rs`) gates
+  `select_replace` as a *write*, every `/3` + `/1` limited/continuation form as a *read*
+  (`select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/
+  `match_object_continue`), and `set_fixation` (`ets:safe_fixtable/2`) as a *read*.
+- **Concurrency evidence (`tests/ets_shared.rs`, 9 tests).** Beyond `Send`/`Sync` (asserted for
+  `Table`, `SharedTable` **and** `TermStore` by a compile-time bound), the 8-writer no-lost-update
+  case, reader consistency, the owner-only writer under concurrency and the cross-thread move, the
+  suite adds `two_interleaved_accessors_yield_the_serial_result` (two handles, two threads, lock-step
+  behind a `Barrier`, exact serial outcome asserted), `concurrent_counter_increments_lose_no_updates`
+  (8×500 `update_counter`; the total **and** the multiset of returned values are exact) and
+  `readers_see_only_consistent_states_under_writer_churn`;
+  `concurrent_counter_total_agrees_with_the_live_oracle` runs the same workload under the real `ets`
+  and compares totals (shared plumbing in `tests/common/oracle.rs`). The `TermStore` `unsafe impl
+  Send`/`Sync` rationales now name the real invariant (no interior mutability; every
+  storage-reaching method takes `&mut self`).
+- **Further evidence:** `tests/ets_fixtable.rs` (5 — fix/unfix idempotence, storage held while fixed
+  and released at unfix, `delete_all_objects` under fixation, ordered walk-and-delete under fixation,
+  hash anchor still required when fixed), `tests/ets_access.rs` (the `select_replace`/limited-form
+  gates + `set_fixation_follows_the_read_gate`), `src/store/tests.rs` (+1 — the empty-tuple literal is
+  shared, not copied).
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
@@ -546,8 +515,9 @@ impl Table {
   `beam_term::compare::cmp_arith` order, checked for both ordered interiors — never against the live
   oracle), the shared **replace-updates-the-key-term** helper (`check_replace_updates_the_key_term`,
   driven over both ordered interiors with the int-first and float-first orders, then over a 40-key run
-  that forces B+-tree splits above the replaced key), select compile/execute, info. **129 lib unit
-  tests.**
+  that forces B+-tree splits above the replaced key), select compile/execute, info, and the
+  owner-death transition (`owner_died` × {not-owner, no heir, live heir, self-heir, dead heir}).
+  **137 lib unit tests.**
 - **Cross-interior equivalence + the selection defaults** (`src/interior_parity.rs`, `#[cfg(test)]`):
   `champ_is_the_documented_default_set_interior` pins `SetInterior::default() == Champ` and
   `bplus_tree_is_the_documented_default_ordered_interior` pins
@@ -592,7 +562,7 @@ impl Table {
   `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec compiler + arithmetic.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 102 cases
   (group files `tests/differential/battery/{kind,keypos,navigation,counter,lookup,matchspec,replace,
-  continuation,info,large}.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
+  continuation,info,large,access,reclamation}.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
   renderings line-by-line (atoms/small ints/tuples/proper lists; order-insensitive values sorted;
   table ids/`memory`/pids/floats/binaries never rendered). Coverage: all 4 kinds × 8 core ops,
@@ -606,7 +576,10 @@ impl Table {
   plus `match_spec_run` (bindings, repeated vars, multi-clause, empty/`badarg`, body `EXIT`),
   `select_replace` (small-int rewrite, arity-1 result, `bag`/changed-key `badarg`, identity) and the
   limit/continuation chains (`select`/`match`/`match_object` `/3`+`/1`, `limit 0` `badarg`, empty
-  table). `KNOWN_DIVERGENCES` is empty. Without `erl` the live-oracle test skips;
+  table). The `access_control` case is widened *inside itself* to pin the whole gate matrix — each op
+  on its own fresh owner-seeded table, for the 3 protections × {owner, non-owner}: the read-gated
+  reads + `safe_fixtable/2`, the deliberately **ungated** `info/1,2`, and the write-gated writes. The
+  case total stays 102. `KNOWN_DIVERGENCES` is empty. Without `erl` the live-oracle test skips;
   `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure (use it in CI).
 - **Gates (GREEN required):**
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` and
@@ -616,7 +589,21 @@ impl Table {
 
 ## Known Issues (honest gaps — not full parity)
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
-  there is no locking or per-reader table; a `Table` is single-threaded.
+  there is no fine-grained per-bucket locking; the only synchronisation is `SharedTable`'s coarse
+  `Arc<RwLock<Table>>`.
+- **`SharedTable`'s read results must not outlive the read guard.** `Table` reads return terms that
+  alias table-owned storage (the A.1 copy boundary is on the *insert* side only; see *Design
+  Decisions*). A result kept after the `RwLock` read guard is dropped can be reclaimed by a
+  concurrent writer's delete and its word runs reused by a later same-size insert — the same word
+  then silently re-reads as a *different, well-formed* object. This is a hazard of the
+  `with_read`/`with_write` bare-`T` forms and of any escaped guard-held term, not of the interior
+  (real `ets` has no such constraint because it copies into the calling process's heap). Hosts must
+  consume read results inside the guard, or a future pass must add a copy-out-on-read path / a
+  guard-scoped view type. Pinned by the churn test in `tests/ets_shared.rs`.
+- **The owner-death transition has no caller.** `Table::owner_died` models the transition, but nothing
+  in the runtime invokes it: `beam_bifs`'s `ets:new/2` never records an owner, its `TableRegistry` has
+  no owner index, and `beam_process` has no process-death hook at all. `ETS_SURFACE.md` §7 names the
+  exact API each of those needs.
 - **`ets:info/1` `owner`/`heir` are `undefined` and `id` is a small integer.** `TableInfo::entries` emits the
   oracle's full 15-field order, but `owner` — a pid in the oracle — has no term representation at this
   stage, so it renders as the atom `undefined`, and `id` renders as a small integer rather than a ref.
@@ -626,9 +613,9 @@ impl Table {
   reproduces the same 15-field order.
 - **Ownership modelling has no pid/liveness concept.** `ets:give_away/3` treats a `None` new owner as
   the oracle's non-pid/dead-pid target (both `badarg`); an *unknown table id* is the registry/BIF
-  layer's concern, not this crate's. The `{'ETS-TRANSFER', Tab, FromPid, GiftData}` message the new
-  owner receives, and the heir hand-off when an owner dies, are the BIF/runtime layer's job — this
-  crate models only the ownership/heir *state*.
+  layer's concern, not this crate's. The `{'ETS-TRANSFER', Tab, FromPid, GiftData}` *delivery* and the
+  actual dropping of the table stay the runtime's job: `Table::owner_died` decides the transition and
+  returns `OwnerDeath` (see `table/lifecycle.rs`), but has no caller yet.
 - **`ets:setopts/2` is modelled only for `{heir, ...}`.** The other `setopts/2` options
   (`{heir, Pid}` arity-2, `{heir, Pid, Data}` duplication-checking, `safe_fixtable`, `{write_concurrency, _}`,
   …) are out of M1 scope; the crate exposes the `{heir, Pid, Data}` / `{heir, none}` subset via
@@ -638,30 +625,17 @@ impl Table {
   there); the faithful form is `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the
   `beam_bifs` `ets:lookup_element` bridge must route the multi kinds through `lookup_element_all` and
   build the list.
-- **`tab2file`/`file2tab`/`tabfile_info`/`tab2file`-family are BLOCKED — not merely out of scope.**
-  Implementing them inside this crate is impossible without widening its dependency edges, because the
-  ETS table-file format is `{Header, Objects, Footer}` where **every** field is an External-Term-Format
-  term (`$TAB2FILE`-style magic, an `{version, …}`/`{info, …}` header, the objects, and a
-  `{hfile, Size, MD5}` footer). Rendering and parsing those terms needs a term codec, which lives in
-  `beam_codec` — a **new cross-crate dependency edge** (`beam_ets` is wave 1, `beam_codec` is wave 1,
-  and the layer DAG currently has no `beam_ets → beam_codec` edge). Writing/reading the file itself
-  needs a file descriptor / I-O, which lives in `beam_io`/`std::fs`; `beam_io` is wave 5, so that is a
-  second new edge **in the wrong direction** (a wave-1 crate may not depend upward). Both edges are
-  forbidden by the crate-layer contracts (`../CONTEXT.md` *No duplication across crates* / the wave
-  table) without explicit parent approval. `ets:tab2file/3` also has oracle behaviours beyond I-O
-  (`{extended_info, …}`, the `sync`/`sync_verbose` modes, the ~10 000-object chunking, and re-raising
-  the caller's `badarg` for a non-tuple object) that would need their own modelling. Verdict: **not
-  implemented**, blocked on (a) a `beam_codec` encode/decode edge for the table-file terms and (b) a
-  file-I/O edge — both are cross-crate decisions owned by `../` (the crate layer), not by this crate.
-  The same reasoning blocks `file2tab`/`tabfile_info`; `tab2list` + `first`/`next` remain the
-  supported enumeration path.
-- **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
+- **`tab2file`/`file2tab`/`tabfile_info` are BLOCKED, not merely out of scope.** The table-file format
+  is `{Header, Objects, Footer}` with **every** field an External-Term-Format term, so it needs a term
+  codec (`beam_codec`) *and* file I/O (`beam_io` is wave 5 — an edge pointing **upward**, forbidden for
+  a wave-1 crate). Both are cross-crate decisions owned by `../`. `tab2list` + `first`/`next` remain
+  the enumeration path. Full reasoning in `ETS_SURFACE.md` §5.
+- **Operations outside this crate's scope** (all present in OTP 29): `update_element/4`,
   `select_reverse/*`, `foldl`/`foldr`, `rename/2`, `whereis/1`, `table/1,2`, `slot/2`,
-  `tab2file*`/`file2tab*`. (`ets:clear/1`, `ets:size/1` and
-  `ets:match_spec_test/2,3` do **not** exist in OTP 29 — calling `match_spec_test` raises
-  `error:undef` — so their absence is correct; `ets:info(T, size)` is the supported spelling of the
-  size query.) The `/3` limited forms are implemented but their opaque **continuation terms** and the
-  bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's.
+  `tab2file*`/`file2tab*` — `ETS_SURFACE.md` §1–§5 names the owner (BIF layer / runtime / stdlib) and
+  the blocker for every one. (`ets:clear/1` and `ets:size/1` do **not** exist in OTP 29, so their
+  absence is correct.) The `/3` limited forms are implemented; their opaque **continuation terms** and
+  the bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's.
 - **`match_spec_run` accepts a RAW spec, unlike the oracle.** The oracle's `ets:match_spec_run/2`
   requires a spec already compiled by `ets:match_spec_compile/1` (a raw clause list is `badarg`);
   this crate has no compiled-spec *term*, so `run.rs` compiles the raw spec and the bridge must map
@@ -709,6 +683,7 @@ impl Table {
 - `src/table/read.rs` → the read/navigation `impl Table` (lookup/member/lookup_element*/first/last/next/prev/take/size/is_empty/tab2list/memory)
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
 - `src/table/ownership.rs` → `Heir`/`SetOpt` + the `ets:give_away/3` / `{heir, ...}` `setopts/2` semantics + the pid-gap docs
+- `src/table/lifecycle.rs` → `OwnerDeath` + `Table::owner_died` (the owner-death transition: delete vs. heir transfer)
 - `src/table/element.rs` → the table-level `ets:update_counter/3,4` + `ets:update_element/3` operations
 - `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors and `element.rs`)
 - `src/champ_interior.rs` → `ChampInterior` (CHAMP open-addressing index) — the **default `set`** interior
@@ -729,15 +704,18 @@ impl Table {
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs, oracle order)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors (no new error enum)
 - `tests/common/mod.rs` → shared integration-test helpers (one home, no duplication)
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation)
+- `tests/common/oracle.rs` → the shared live-`erl` oracle plumbing (`escript`/`erl` invocation, `$TMPDIR` scratch, loud skip / `BEAM_ETS_REQUIRE_ORACLE`) used by the concurrency tests
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation/ownership/fixtable/shared)
 - `tests/select.rs` → the match-spec compiler + arithmetic integration tests
 - `tests/match_spec_run.rs` → the table-independent `ets:match_spec_run/2` runner tests
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl`
+- `ETS_SURFACE.md` → the `ets:*` coverage census (this crate / `beam_bifs` / missing) + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `../../erts/emulator/beam/erl_db.c` → the API + trap-loop semantics being mirrored (read-only)
 - `../../erts/emulator/beam/erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` → the interiors + key/match handling being mirrored (read-only)
 - `../../erts/emulator/beam/erl_db.h` / `erl_db_hash.h` / `erl_db_tree.h` → flags/fields (read-only)
 
 ## See Also
+- `ETS_SURFACE.md` → coverage census: every `ets:*` operation mapped to this crate / `beam_bifs` / missing, the oracle-probed semantic facts, and the runtime-level gaps with the exact API each needs.
 - `../CONTEXT.md` → crate-layer contracts, the `Table` seam, dependency waves, milestone scope.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1/A.8, §2 frozen term layout, §3 error strategy, §7).
 - `../beam_term/CONTEXT.md` → the frozen term API + the shared `compare`/`hashing` utilities.
