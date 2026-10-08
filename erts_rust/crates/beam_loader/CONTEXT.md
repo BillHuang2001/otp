@@ -46,13 +46,17 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   pub exports: Vec<Export>, pub locals: Vec<Export>, pub imports: Vec<Import>, pub functions: Vec<Function>,
   pub funs: Vec<FunDescriptor>, pub records: Vec<RecordDefinition>, pub code_version: CodeVersion,
   pub types: TypeTable, pub line: LineTable, pub literals: Arc<LiteralArea>, pub strings: Vec<u8>,
-  pub attributes: Option<Vec<u8>>, pub compile_info: Option<Vec<u8>> }`
+  pub attributes: Option<Vec<u8>>, pub attribute_table: Arc<AttributeTable>, pub compile_info: Option<Vec<u8>>,
+  pub meta: Option<Vec<u8>> }`
   + `Module::atom_name(&self, Atom) -> Option<&str>`, `Module::export(&self, Atom, u32) -> Option<Label>`,
   `Module::function(&self, Atom, u32) -> Option<&Function>`, `Module::literal(&self, u32) -> Option<Eterm>`,
   `Module::literals(&self) -> &LiteralArea`, `Module::fun(&self, u32) -> Option<&FunDescriptor>`,
   `Module::funs(&self) -> &[FunDescriptor]`, `Module::records(&self) -> &[RecordDefinition]`,
   `Module::record(&self, Atom) -> Option<&RecordDefinition>`,
-  `Module::record_by_name(&self, &str) -> Option<&RecordDefinition>`.
+  `Module::record_by_name(&self, &str) -> Option<&RecordDefinition>`,
+  `Module::attributes_term(&self) -> Option<Eterm>` (the decoded `Attr` list) and
+  `Module::attribute_by_name(&self, &str) -> Option<Eterm>` (both `None` when the chunk is absent/malformed,
+  never a panic).
   `records` is the lowered `Recs` table (native-record definitions, declaration order); `record_by_name`
   resolves a *runtime* atom by looking its string up in the module's `atom_table` first (the lookup the
   `records:get_definition/2` BIF needs).
