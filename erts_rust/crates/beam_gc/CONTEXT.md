@@ -293,28 +293,18 @@ copying re-copies **136 objects / 400 words** vs Immix **moves 8 objects / 128 w
 (384 words) — a real movement win, at a footprint cost (400 live words → 2176 resident line-words).
 
 `tests/immix_workloads.rs` generalises it to three shapes through both strategies (`-- --nocapture`):
-
-| workload (forced fullsweep) | strategy | objects moved | words moved | resident mature | pause (median) |
-|---|---|---|---|---|---|
-| long-lived shared subterm | Copying | 129 | 639 | 639 words | 8–10 µs |
-| | Immix | **0** (129 pinned) | **0** | 2304 line-words | 11–12 µs |
-| garbage-heavy small live set | Copying | 10 | **20** | **20 words** | 3–5 µs |
-| | Immix | 10 | 160 | 160 line-words | **2–3 µs** |
-| large heap + promotion pressure | Copying | 633 | 1824 | **1824 words** | **19–27 µs** |
-| | Immix | **121** | **288** | 10128 line-words | 47–55 µs |
-
-Both strategies find the **same** live set (`evacuated + pinned == copied`) and reclaim identical garbage.
+long-lived shared subterm (copying 129 obj / 639 w vs Immix **0** moved / 129 pinned), garbage-heavy small
+live set (10 obj; copying 20 w vs Immix 160 line-w, Immix faster), and large-heap promotion pressure
+(copying 633 obj / 1824 w vs Immix 121 obj / 288 w, 10128 resident line-w). Both strategies find the **same**
+live set (`evacuated + pinned == copied`) and reclaim identical garbage.
 
 **Decision — the copying space is the default; GenImmix is a large-live-set regime selected automatically.**
-GenImmix wins on the one axis it was designed for — copying work on long-lived data (0 moved vs 129; 5.2× fewer
-objects / 6.3× fewer words under large-heap promotion pressure) — but every win is paired with a loss:
-(a) **footprint** 3.6–8× (line-granular internal fragmentation: 20 live words occupy 160 line-words on the
-garbage-heavy shape); (b) **pause** worse wherever it saves work (2.4× on the large heap — the reclaim walks
-the whole root set and every line of the region, and the major walks the nursery twice: `scan_young` then
-promotion); (c) an outright loss on the common small-heap/high-churn shape (8× the moved volume for the same
-10 objects). Pause numbers are an in-process median over 5 forced fullsweeps — a direction-of-magnitude
-signal, not a benchmark; every *assertion* is on the deterministic counts. (Immix's own reclaim could be sped
-up by removing the double nursery walk and the whole-region scan.)
+GenImmix wins the copying work on long-lived data, but every win is paired with a loss: (a) **footprint**
+3.6–8× (line-granular internal fragmentation); (b) **pause** worse wherever it saves work (≈2.4× on the large
+heap — the reclaim walks the whole root set and every line, and the major walks the nursery twice:
+`scan_young` then promotion); (c) an outright loss on the common small-heap/high-churn shape (8× the moved
+volume for the same 10 objects). Pause is an in-process median over 5 forced fullsweeps — a signal, not a
+benchmark; every *assertion* is on the deterministic counts.
 
 ### The automatic rule (re-measured break-even, wired)
 `tests/immix_break_even.rs` re-measures the gate with a **single-variable sweep**: a purely long-lived corpus
