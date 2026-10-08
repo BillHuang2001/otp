@@ -667,7 +667,7 @@ still reproduces today's collector exactly.
 - `src/selection.rs` → the **automatic rule**: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`, `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice` (`rule_kind`/`is_override`/`describe`). Safe Rust; depends only on `config`/`policy`/`immix`
 - `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, accounting views (`ImmixStats`/`ImmixCounters`)
 - `src/immix/collect.rs` → `ImmixSpace` mark/classify/evacuate/finalize phases + its `EvacDest` impl
-- `src/immix_collector.rs` → `GenImmixCollector` (copying nursery + mark-region mature), `PromoteDest`, `promote`, `scan_young`
+- `src/immix_collector.rs` → `GenImmixCollector` (copying nursery + mark-region mature), `PromoteDest`, `promote`, `scan_young`, `ensure_capacity`
 - `src/any_collector.rs` → `AnyCollector` strategy dispatch (`Copying`/`Immix`) over one API; `from_config` dispatches on the resolved `config.mature()`, `mature_choice()` reports the decision, `ensure_capacity` forwards
 - `src/policy.rs` → `HeapPolicy` (min/max heap, `min_bin_vheap_words`, `fullsweep_after`), the curated `heap_sizes` table, `next_heap_size`, `from_spawn_opts`/`fullsweep_due`/`mature_after_fullsweep`/`young_after_collection`
 - `src/heap_info.rs` → the `garbage_collection` observables: `HeapInfo`, `HeapObservable`, `GARBAGE_COLLECTION_KEYS`
