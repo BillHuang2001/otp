@@ -41,15 +41,23 @@
 //! `limit 0` is `badarg` (rejected by `beam_ets`' `select_limit`), as is a
 //! negative or non-integer limit ([`super::element_pos`]) and a non-continuation
 //! handed to a `/1` form.
+//!
+//! Every table argument is resolved through [`super::resolve::resolve_handle`] (the
+//! handle ref thing or a `named_table`'s name atom) and the operation is
+//! access-gated as the calling process like the `ets:select` family: the traversals
+//! (`match/2,3`, `match_object/2,3`, the `/1` continuations and `select_count/2`)
+//! require **read** access, the deleting/replacing verbs (`select_delete/2`,
+//! `select_replace/2`, `match_delete/2`) **write** access. A denied call is `badarg`
+//! and leaves the table — and an unconsumed continuation — in place.
 
 use beam_common::Result;
 use beam_ets::{compile, Table};
 use beam_term::Eterm;
 
 use super::{
-    copy_out_list, element_pos, finish_chunk, restore_table, resume_continuation, take_table,
+    copy_out_list, element_pos, finish_chunk, resolve, restore_table, resume_continuation,
+    take_table_gated,
 };
-use crate::access::ref_thing_id;
 use crate::context::BifContext;
 use crate::error::system_limit;
 use crate::registry::BifRegistry;
@@ -76,8 +84,8 @@ pub(super) fn register(reg: &mut BifRegistry) {
 /// The results are the oracle's **lists**, and the caller's iteration order is the
 /// table's (an unspecified order for the hash kinds — `ordered_set` is key order).
 fn match_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
-    let table = take_table(ctx, handle)?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     // `Table::match_` needs the atom table *and* the caller heap at once; the
     // context lends them through two conflicting borrows, so it is given a clone
     // of the atom table (identical indices, and the call only reads it — the same
@@ -94,9 +102,9 @@ fn match_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// A non-integer or negative `Limit` is `badarg` here; `0` is rejected by
 /// `beam_ets`' `select_limit` (matching the oracle).
 fn match_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let limit = element_pos(args[2])?;
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.match_limit(args[1], limit, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
@@ -118,8 +126,8 @@ fn match_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:match_object(Tab, Pattern)` — every matching object, whole.
 fn match_object_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
-    let table = take_table(ctx, handle)?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.match_object(args[1], &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
@@ -128,9 +136,9 @@ fn match_object_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:match_object(Tab, Pattern, Limit)` — as [`match_object_2`], limit-chunked.
 fn match_object_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let limit = element_pos(args[2])?;
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.match_object_limit(args[1], limit, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
@@ -149,11 +157,13 @@ fn match_object_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// as `true`, as a small integer.
 ///
 /// `MatchSpec` is a raw match-spec list compiled by [`compile`]; a spec outside the
-/// supported subset is `badarg`.
+/// supported subset is `badarg`. Like every other traversal it requires **read**
+/// access to the table (verified: it is `badarg` for a non-owner of a `private`
+/// table and allowed for a non-owner of a `protected` one).
 fn select_count_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.select_count(&spec, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
@@ -168,9 +178,9 @@ fn select_count_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// (`ets.erl:1865`) routes through `ets:internal_delete_all/2`, which returns the
 /// same count this traversal does.
 fn select_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.select_delete(&spec, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
@@ -188,9 +198,9 @@ fn select_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// (`beam_ets::Table::select_replace`); a replacement that does not keep the
 /// matched object's key makes the whole call `badarg` with the table unchanged.
 fn select_replace_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.select_replace(&spec, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
@@ -201,8 +211,8 @@ fn select_replace_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// returns the atom `true` (see the module docs: the oracle's stdlib wrapper
 /// discards the deleted count).
 fn match_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
-    let mut table = take_table(ctx, handle)?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.match_delete(args[1], &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;

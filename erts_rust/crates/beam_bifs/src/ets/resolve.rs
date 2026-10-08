@@ -307,7 +307,6 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
     }
 
     let access = options.access();
-    let kind = options.kind();
     // `DB_FINE_LOCKED`: the C only sets it for a fine-locked table that is not
     // `private` (`erl_db.c:2722`, `:2748`).
     let fine_locked = wc != WriteConcurrency::Off && access != Access::Private;

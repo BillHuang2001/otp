@@ -2,9 +2,8 @@
 //! `beam_ets::Table`s, plus the `ets:*` BIF entry points built on top of it.
 //!
 //! `beam_ets` owns the table semantics; this module owns the M1 runtime side — a
-//! map from a handle to a live table, the `ets:new/2` option parser
-//! (`set`/`ordered_set`/`bag`/`duplicate_bag`, `public`/`protected`/`private`,
-//! `named_table`, `{keypos, N}`) and the registered BIFs. The *whole-table* BIFs
+//! map from a handle to a live table, the `ets:new/2` option parser (the child
+//! module [`resolve`]) and the registered BIFs. The *whole-table* BIFs
 //! (`new`/`delete/1`/`delete_all_objects`/`info`/`tab2list`), the *mutation* BIFs
 //! (`insert`/`insert_new`/`delete/2`/`delete_object`/`take`/`update_counter/3,4`/
 //! `update_element/3`), the *lookup* BIFs (`lookup`/`lookup_element/3,4`/`member`)
@@ -68,11 +67,26 @@
 //! [`TableRegistry::insert_spec`]/[`TableRegistry::spec_raw`] registry entry that
 //! backs it.
 //!
+//! # The table argument, the owner and access gating (see [`resolve`])
+//!
+//! Every table-taking BIF resolves its first argument through
+//! [`resolve::resolve_handle`]: the M1 handle ref thing, or — for a table created
+//! with the `named_table` option — its **name atom** (the oracle's
+//! `db_get_table_aux` accepts exactly those two shapes; a `{Name, Node}` 2-tuple is
+//! **not** a table argument in OTP 29). `ets:new(Name, [named_table])` returns the
+//! **name atom**; every other table the handle reference.
+//!
+//! `ets:new/2` records the calling process as the table owner
+//! ([`resolve::caller_owner`]) and the installed heir, and each BIF enforces the
+//! oracle's access matrix as the *calling* process through [`resolve::Gate`]
+//! ([`take_table_gated`]): a read for `lookup`/`member`/`first`/`next`/`tab2list`/the
+//! match+select families/`safe_fixtable`, a write for `insert`/`delete`/`take`/
+//! `update_counter`/`update_element`/the delete+replace verbs, and no check at all
+//! for `ets:info/1,2`. A denial is `badarg` **and leaves the table in the registry**.
+//!
 //! # Deliberately not implemented (see the crate `CONTEXT.md`)
 //!
-//! `ets:foldl/3`/`foldr/3` need the `FunCaller` seam and are not wired up here; and
-//! access-control/ownership enforcement is a documented M1 simplification (the
-//! [`Table`] primitives are owner-level and do not consult the access mode). The
+//! `ets:foldl/3`/`foldr/3` need the `FunCaller` seam and are not wired up here. The
 //! verbs that cannot be made oracle-faithful over the frozen [`Table`] API —
 //! `ets:rename/2` (needs a name setter), `ets:select_reverse/1,2,3` (needs a
 //! reverse scan) and the pid-coupled ownership verbs `ets:give_away/3` /
@@ -86,9 +100,7 @@ use std::collections::HashMap;
 
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_ets::{
-    compile, key_of, Access, MatchContinuation, Table, TableId, TableInfo, TableKind, TableOptions,
-};
+use beam_ets::{compile, key_of, MatchContinuation, Table, TableId, TableInfo};
 use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
 
 use crate::access::{
@@ -119,6 +131,14 @@ mod specs;
 /// (declared here, not in `src/lib.rs`). The verbs that stay unregistered, and
 /// why, are documented there.
 mod extra;
+/// The shared table-argument resolver, the process/owner bridge, the
+/// creation-time [`resolve::TableProfile`] and the `ets:new/2` option parser.
+///
+/// Every table-taking `ets:*` BIF resolves its first argument through
+/// [`resolve::resolve_handle`] and gates the operation as the calling process
+/// through [`resolve::Gate`], so it is a child of `ets` (declared here, not in
+/// `src/lib.rs`).
+mod resolve;
 /// The navigation terminator (`ets:first/1` … `ets:prev/2` at the end of the
 /// iteration order). The atom's *name* is `$end_of_table` (the printname of
 /// `atom.names`' `EOT='$end_of_table'`).
@@ -200,6 +220,13 @@ pub struct TableRegistry {
     specs: HashMap<u64, Eterm>,
     /// The next compiled-spec id to hand out.
     next_spec: u64,
+    /// The creation-time [`resolve::TableProfile`] of each live table, keyed by its
+    /// handle. [`TableOptions`] records the `{write_concurrency, …}` flag as a bool
+    /// and has no `{decentralized_counters, _}` field, so the *effective*
+    /// `ets:info/1,2` rendering of those two fields is computed by the `ets:new/2`
+    /// option parser and carried here; [`TableRegistry::remove`] drops the entry
+    /// with the table.
+    profiles: HashMap<u64, resolve::TableProfile>,
 }
 
 impl TableRegistry {
@@ -212,6 +239,7 @@ impl TableRegistry {
             next_continuation: CONTINUATION_ID_BASE,
             specs: HashMap::new(),
             next_spec: SPEC_ID_BASE,
+            profiles: HashMap::new(),
         }
     }
 
@@ -244,7 +272,24 @@ impl TableRegistry {
     /// continuation that belonged to it.
     pub fn remove(&mut self, handle: u64) -> Option<Table> {
         self.continuations.retain(|_, cont| cont.table != handle);
+        self.profiles.remove(&handle);
         self.tables.remove(&handle)
+    }
+
+    /// Records `profile` as the creation-time [`resolve::TableProfile`] of the table
+    /// under `handle`.
+    ///
+    /// Private: only [`new_2`] records a profile and only [`info_field`] reads one.
+    fn insert_profile(&mut self, handle: u64, profile: resolve::TableProfile) {
+        self.profiles.insert(handle, profile);
+    }
+
+    /// The creation-time [`resolve::TableProfile`] of the table under `handle`, if
+    /// any — absent only for a table registered through [`TableRegistry::insert`]
+    /// without one (a direct registry insertion, as in a test), for which
+    /// [`info_field`] falls back to the value derived from [`TableInfo`].
+    fn profile(&self, handle: u64) -> Option<resolve::TableProfile> {
+        self.profiles.get(&handle).copied()
     }
 
     /// The number of live tables.
@@ -304,6 +349,16 @@ impl TableRegistry {
         self.continuations
             .remove(&handle)
             .map(|cont| (cont.table, cont.state))
+    }
+
+    /// The handle of the table a live continuation belongs to, if any.
+    ///
+    /// [`resume_continuation`] needs it *before* consuming the continuation: the
+    /// resuming call is access-gated as the calling process, and a denial must
+    /// leave the continuation resumable (verified: after a non-owner's denied
+    /// `ets:select(Cont)` on a `private` table, the owner can still resume it).
+    pub fn continuation_table(&self, handle: u64) -> Option<u64> {
+        self.continuations.get(&handle).map(|cont| cont.table)
     }
 
     /// Registers the spec term `raw` as a live compiled match spec, returning the
@@ -388,37 +443,54 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 
 /// `ets:new(Name, Options)` — creates a table and returns its handle.
 ///
-/// A `named_table` whose name is already registered is `badarg` (the oracle's
-/// `ets_new_2` fails when the meta name table already holds the name); every other
-/// table records its name field only and takes part in no registry, matching
-/// `ets:whereis/1`'s `undefined` for it.
+/// A `named_table` is created with the **name atom** as its handle (the oracle's
+/// `ets:new(Name, [named_table])` returns the atom); every other table is created
+/// with the handle ref thing. A `named_table` whose name is already registered is
+/// `badarg` (the oracle's `ets_new_2` fails when the meta name table already holds
+/// the name); every other table records its name field only and takes part in no
+/// registry, matching `ets:whereis/1`'s `undefined` for it.
+///
+/// The calling process is recorded as the table owner and the parsed `{heir, …}`
+/// option as the heir, and the parsed [`resolve::TableProfile`] is carried alongside
+/// the table for `ets:info/1,2`.
 fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let name = args[0];
     if !is_atom(name) {
         return Err(badarg());
     }
-    let mut options = TableOptions::new();
+    let resolve::ParsedOptions {
+        mut options,
+        profile,
+        heir,
+    } = resolve::parse_options(ctx.atoms(), args[1])?;
     options.set_name(atom_val(name));
-    parse_options(ctx.atoms(), args[1], &mut options)?;
     // Read the name metadata before the options move into the table.
     let named = options.is_named();
     let table_name = options.name();
 
     let id = TableId::next();
-    let table = Table::new(id, options)?;
+    let mut table = Table::new(id, options)?;
+    table.set_owner(Some(resolve::caller_owner(ctx)));
+    table.set_heir(heir);
     {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
         if named {
             // A `named_table` always carries the `Name` argument this call parsed
-            // (see `parse_options`), so a missing one is a malformed option set.
+            // (see [`resolve::parse_options`]), so a missing one is a malformed
+            // option set.
             let table_name = table_name.ok_or_else(badarg)?;
             if !tables.insert_name(table_name, id.raw()) {
                 return Err(badarg());
             }
         }
+        tables.insert_profile(id.raw(), profile);
         tables.insert(id.raw(), table);
     }
-    make_ref_thing(ctx.heap(), id.raw())
+    if named {
+        Ok(make_atom(atom_val(name)))
+    } else {
+        make_ref_thing(ctx.heap(), id.raw())
+    }
 }
 
 // ------------------------------------------------------------- whole-table
@@ -427,16 +499,12 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// A deleted `named_table` also leaves the name registry (the oracle's
 /// `remove_named_tab`), so its name becomes free and `ets:whereis/1` on it is
-/// `undefined` again.
+/// `undefined` again. The table is **write**-gated, and the gated take happens
+/// before anything is removed, so a caller without write access gets a `badarg`
+/// that leaves the table in place.
 fn delete_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
-    let removed = {
-        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-        tables.remove(handle)
-    };
-    let Some(table) = removed else {
-        return Err(badarg());
-    };
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     if table.info().named_table {
         if let Some(name) = table.name() {
             let tables = ctx.tables().ok_or_else(unsupported_bif)?;
@@ -448,24 +516,31 @@ fn delete_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:delete_all_objects(Tab)` — empties the table and returns `true`.
 fn delete_all_objects_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
-    let mut table = take_table(ctx, handle)?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     table.delete_all_objects();
     restore_table(ctx, handle, table)?;
     ctx.boolean(true)
 }
 
 /// `ets:info(Tab)` — the table's introspection proplist.
+///
+/// Never access-gated (the oracle lets a non-owner `info` a `private` table), so
+/// the table is taken **without** an access check.
 fn info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table(ctx, handle)?;
     let info = table.info();
     restore_table(ctx, handle, table)?;
+    let profile = {
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        tables.profile(handle)
+    };
 
     let mut pairs = Vec::with_capacity(INFO_ITEMS.len());
     for item in INFO_ITEMS {
         let key = ctx.intern_atom(item)?;
-        let value = info_field(ctx, &info, item)?;
+        let value = info_field(ctx, &info, profile, item)?;
         pairs.push(ctx.tuple(&[key, value])?);
     }
     ctx.list(&pairs)
@@ -473,8 +548,10 @@ fn info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:info(Tab, Item)` — one introspection field (an unknown `Item` is
 /// `badarg`, matching the system `erl`).
+///
+/// Never access-gated, like [`info_1`].
 fn info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let item = args[1];
     if !is_atom(item) {
         return Err(badarg());
@@ -490,13 +567,17 @@ fn info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let table = take_table(ctx, handle)?;
     let info = table.info();
     restore_table(ctx, handle, table)?;
-    info_field(ctx, &info, &name)
+    let profile = {
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        tables.profile(handle)
+    };
+    info_field(ctx, &info, profile, &name)
 }
 
 /// `ets:tab2list(Tab)` — every object of the table, in iteration order.
 fn tab2list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
-    let table = take_table(ctx, handle)?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let objects = table.tab2list();
     restore_table(ctx, handle, table)?;
     copy_out_list(objects, ctx)
@@ -521,10 +602,10 @@ fn selection_objects(selection: Eterm) -> Result<Vec<Eterm>> {
 /// `ets:insert(Tab, ObjectOrList)` — inserts one object, or every object of a
 /// proper list, and returns `true`.
 fn insert_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let objects = selection_objects(args[1])?;
 
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let mut failure = None;
     for object in objects {
         if let Err(err) = table.insert(object, ctx.atoms()) {
@@ -548,10 +629,10 @@ fn insert_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// duplicate keys *within* the list are allowed (the key is absent in the table
 /// when the call starts) and the later object wins.
 fn insert_new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let objects = selection_objects(args[1])?;
 
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let outcome = insert_new_into(&mut table, &objects, ctx.atoms());
     restore_table(ctx, handle, table)?;
     match outcome {
@@ -585,13 +666,13 @@ fn insert_new_into(table: &mut Table, objects: &[Eterm], atoms: &AtomTable) -> R
 /// `ets:lookup(Tab, Key)` — the objects stored under `Key`, copied to the
 /// caller's heap.
 fn lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
 
     // The returned handles alias the table's (never-relocating) term storage, so
     // they stay valid after the table is restored; the registry borrow is dropped
     // before the copy so `ctx.heap()` can be used.
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let objects = table.lookup(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
 
@@ -601,11 +682,11 @@ fn lookup_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `ets:lookup_element(Tab, Key, Pos)` — element `Pos` (1-based) of the object
 /// stored under `Key`.
 fn lookup_element_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let pos = element_pos(args[2])?;
 
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let outcome = table.lookup_element(key, pos, ctx.atoms());
     restore_table(ctx, handle, table)?;
     copy_out(outcome?, ctx)
@@ -614,12 +695,12 @@ fn lookup_element_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `ets:lookup_element(Tab, Key, Pos, Default)` — as
 /// [`lookup_element_3`](lookup_element_3), but an absent `Key` yields `Default`.
 fn lookup_element_4(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let pos = element_pos(args[2])?;
     let default = args[3];
 
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let outcome = table.lookup_element_or(key, pos, default, ctx.atoms());
     restore_table(ctx, handle, table)?;
     let value = outcome?;
@@ -634,9 +715,9 @@ fn lookup_element_4(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:member(Tab, Key)` — whether `Key` is present.
 fn member_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let present = table.member(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     ctx.boolean(present)
@@ -645,9 +726,9 @@ fn member_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `ets:take(Tab, Key)` — removes `Key`'s entry and returns its objects (an
 /// absent key yields the empty list, not an error).
 fn take_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let outcome = table.take(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     copy_out_list(outcome?, ctx)
@@ -658,9 +739,9 @@ fn take_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `ets:delete(Tab, Key)` — removes `Key`'s entry and returns `true` (an absent
 /// key is not an error).
 fn delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let outcome = table.delete(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     outcome?;
@@ -670,9 +751,9 @@ fn delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `ets:delete_object(Tab, Object)` — removes the one object equal to `Object`
 /// (an absent key is not an error; a non-tuple object is `badarg`).
 fn delete_object_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let object = args[1];
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let outcome = table.delete_object(object, ctx.atoms());
     restore_table(ctx, handle, table)?;
     outcome?;
@@ -683,8 +764,8 @@ fn delete_object_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:first(Tab)` — the first key in the table's iteration order.
 fn first_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
-    let table = take_table(ctx, handle)?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let key = table.first(ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, key)
@@ -692,8 +773,8 @@ fn first_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:last(Tab)` — the last key in the table's iteration order.
 fn last_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
-    let table = take_table(ctx, handle)?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let key = table.last(ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, key)
@@ -702,9 +783,9 @@ fn last_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `ets:next(Tab, Key)` — the key following `Key` (an `ordered_set` reads `Key`
 /// as a range bound; the hash kinds require it present, else `badarg`).
 fn next_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let outcome = table.next(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, outcome?)
@@ -712,9 +793,9 @@ fn next_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `ets:prev(Tab, Key)` — the key preceding `Key` (mirrors [`next_2`]).
 fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let outcome = table.prev(key, ctx.atoms());
     restore_table(ctx, handle, table)?;
     key_or_end(ctx, outcome?)
@@ -725,10 +806,10 @@ fn prev_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `ets:update_counter(Tab, Key, Incr|Spec|List)` — adds the increments and
 /// returns the new counter value(s).
 fn update_counter_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let update_op = args[2];
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     // `Table::update_counter` needs the atom table *and* the caller heap at once;
     // the context lends them through two conflicting borrows, so it is given a
     // clone of the atom table (identical indices, and the call only reads it —
@@ -743,11 +824,11 @@ fn update_counter_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// [`update_counter_3`], depositing `Default` (with its key replaced by `Key`)
 /// when the key is absent.
 fn update_counter_4(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
     let update_op = args[2];
     let default = args[3];
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.update_counter_with(key, update_op, default, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
@@ -761,9 +842,9 @@ fn update_counter_4(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// behaviour answers the key question before it inspects the spec — so the spec is
 /// only parsed once the key is known present.
 fn update_element_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let key = args[1];
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
     let outcome = if table.member(key, ctx.atoms()) {
         update_element_of(&mut table, key, args[2], ctx)
     } else {
@@ -818,10 +899,10 @@ fn parse_updates(spec: Eterm) -> Result<Vec<(usize, Eterm)>> {
 /// `MatchSpec` is a raw match-spec list compiled by [`beam_ets::compile`]; a spec
 /// outside the supported subset is `badarg`.
 fn select_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
 
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     // `Table::select` needs the atom table *and* the caller heap at once; the
     // context lends them through two conflicting borrows, so it is given a clone
     // of the atom table (identical indices, and the call only reads it — the same
@@ -839,13 +920,13 @@ fn select_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// that finishes first yields the results with no continuation. `Limit` is a
 /// non-negative integer and `0` is `badarg` (the oracle raises it).
 fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let handle = ref_thing_id(args[0])?;
+    let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
     // A non-integer or a negative limit is `badarg` here; `0` is rejected by
     // `select_limit` (matching the oracle).
     let limit = element_pos(args[2])?;
 
-    let table = take_table(ctx, handle)?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
     let atoms = ctx.atoms().clone();
     let outcome = table.select_limit(&spec, limit, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
@@ -869,12 +950,24 @@ fn select_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// continuation registry is table-scoped, and the originating `/3` call stored the
 /// compiled spec inside the state, so the resume needs nothing but the opaque
 /// continuation term. An unknown continuation is `badarg`.
+///
+/// The resume is **read**-gated as the calling process against the continuation's
+/// table (`erl_db.c`'s `ets_select_1` calls `db_get_table` with `DB_READ`), and the
+/// check runs *before* the continuation is consumed, so a denied resume gives the
+/// oracle's `badarg` and leaves the traversal resumable.
 pub(super) fn resume_continuation(
     ctx: &mut BifContext<'_>,
     cont_term: Eterm,
     resume: impl FnOnce(&Table, &MatchContinuation, &AtomTable, &mut Heap) -> Result<Traversal>,
 ) -> Result<Eterm> {
     let handle = ref_thing_id(cont_term)?;
+    let owner = Some(resolve::caller_owner(ctx));
+    {
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        let table_handle = tables.continuation_table(handle).ok_or_else(badarg)?;
+        let table = tables.get(table_handle).ok_or_else(badarg)?;
+        resolve::Gate::Read.check(table, owner)?;
+    }
     let (table_handle, cont) = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
         tables.take_continuation(handle).ok_or_else(badarg)?
@@ -929,8 +1022,31 @@ pub(super) type Traversal = (Vec<Eterm>, Option<MatchContinuation>);
 // ----------------------------------------------------------------- helpers
 
 /// Removes the table under `handle`, or `badarg` when it is unknown.
+///
+/// This is the **ungated** take: it performs no access check and exists only for
+/// `ets:info/1,2`, which the oracle never gates. Every other table-taking BIF uses
+/// [`take_table_gated`].
 pub(super) fn take_table(ctx: &mut BifContext<'_>, handle: u64) -> Result<Table> {
+    take_table_gated(ctx, handle, resolve::Gate::Ungated)
+}
+
+/// Removes the table under `handle` after enforcing `gate` for the **calling**
+/// process ([`resolve::caller_owner`]), or `badarg` when the table is unknown or
+/// the caller lacks the required access.
+///
+/// The gate is evaluated against the table while it is still in the registry, so a
+/// denial leaves the table where it is (the oracle's `badarg` never destroys it).
+pub(in crate::ets) fn take_table_gated(
+    ctx: &mut BifContext<'_>,
+    handle: u64,
+    gate: resolve::Gate,
+) -> Result<Table> {
+    let owner = Some(resolve::caller_owner(ctx));
     let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+    {
+        let table = tables.get(handle).ok_or_else(badarg)?;
+        gate.check(table, owner)?;
+    }
     tables.remove(handle).ok_or_else(badarg)
 }
 
@@ -986,38 +1102,61 @@ pub(super) fn element_pos(term: Eterm) -> Result<usize> {
 /// This reproduces [`TableInfo::entries`] field-for-field — [`entries`] cannot be
 /// called directly because it needs a `&mut AtomTable` while a BIF may only borrow
 /// the atom table immutably (`ctx.atoms()`), so the field-name and value atoms are
-/// instead interned through [`BifContext::intern_atom`]. Three fields are fixed by
-/// the M1 runtime shape rather than by the table: `owner` and a set `heir` are the
-/// atom `undefined` (there is no pid term yet), and `node` is always
-/// `nonode@nohost` (the runtime is never distributed). `id` deliberately differs
+/// instead interned through [`BifContext::intern_atom`]. `id` deliberately differs
 /// from [`TableInfo::entries`]' numeric id: it is the table's **tid reference** —
-/// the same [`crate::access::make_ref_thing`] handle `ets:new/2` returned, so
-/// `ets:info(T, id) =:= T` and `is_reference(ets:info(T, id))` hold exactly as in
-/// the oracle.
+/// the same [`crate::access::make_ref_thing`] handle `ets:new/2` hands out for an
+/// unnamed table, so `is_reference(ets:info(T, id))` holds exactly as in the
+/// oracle. `node` is always `nonode@nohost` (the runtime is never distributed).
+///
+/// `owner` and `heir` render the recorded pid terms ([`resolve::owner_pid`] of the
+/// table's [`TableInfo::owner`]/[`TableInfo::heir`]); an unset owner is the atom
+/// `undefined` and an unset heir (or one whose recorded owner bridges to no pid)
+/// is `none`. `write_concurrency` and `decentralized_counters` come from the
+/// creation-time `profile` [`resolve::parse_options`] recorded, falling back to the
+/// [`TableInfo`]-derived value only when no profile was recorded (a table inserted
+/// directly through [`TableRegistry::insert`]).
 ///
 /// [`entries`]: TableInfo::entries
-fn info_field(ctx: &mut BifContext<'_>, info: &TableInfo, item: &str) -> Result<Eterm> {
+fn info_field(
+    ctx: &mut BifContext<'_>,
+    info: &TableInfo,
+    profile: Option<resolve::TableProfile>,
+    item: &str,
+) -> Result<Eterm> {
     match item {
         // The oracle's `id` is the table's tid *reference* (`#Ref<…>`), and it is
-        // the very term `ets:new/2` handed out (verified: `ets:info(T, id) =:= T`
-        // ⇒ `true`). `TableInfo::id` is the raw numeric id (the registry key), so
-        // it is re-wrapped into the handle ref thing rather than returned as a
-        // small int.
+        // the very term `ets:new/2` hands out for an unnamed table (verified:
+        // `ets:info(T, id) =:= T` ⇒ `true`). `TableInfo::id` is the raw numeric id
+        // (the registry key), so it is re-wrapped into the handle ref thing rather
+        // than returned as a small int.
         "id" => make_ref_thing(ctx.heap(), info.id.raw()),
-        // The CATREE path: the oracle reports decentralized counters only for an
-        // `ordered_set` whose normalized `write_concurrency` flag is on.
-        "decentralized_counters" => ctx.boolean(info.kind.is_ordered() && info.write_concurrency),
+        // The effective `write_concurrency`/`decentralized_counters` values are the
+        // ones `ets:new/2` computed (they are not recoverable from `TableInfo`);
+        // only a directly-inserted table falls back to the `TableInfo`-derived
+        // values. The `TableInfo` fallback for decentralized counters is the CATREE
+        // rule: an `ordered_set` whose normalized `write_concurrency` flag is on.
+        "decentralized_counters" => match profile {
+            Some(profile) => ctx.boolean(profile.decentralized_counters),
+            None => ctx.boolean(info.kind.is_ordered() && info.write_concurrency),
+        },
         "read_concurrency" => ctx.boolean(info.read_concurrency),
-        "write_concurrency" => ctx.boolean(info.write_concurrency),
+        "write_concurrency" => match profile {
+            Some(profile) => write_concurrency_term(ctx, profile.write_concurrency),
+            None => ctx.boolean(info.write_concurrency),
+        },
         "compressed" => ctx.boolean(info.compressed),
         "memory" => ctx.int(info.memory as i64),
-        // M1 has no pid terms to report (the documented gap): the owner is always
-        // `undefined`, and an installed heir is likewise `undefined` (a fresh
-        // table's heir is the atom `none`).
-        "owner" => ctx.intern_atom("undefined"),
-        "heir" => match info.heir {
+        // The owner pid `ets:new/2` recorded (an ownerless table — one inserted
+        // directly through the registry — renders `undefined`).
+        "owner" => match info.owner.and_then(resolve::owner_pid) {
+            Some(pid) => Ok(pid),
+            None => ctx.intern_atom("undefined"),
+        },
+        // The installed heir pid, or the atom `none` when there is none (a fresh
+        // table's heir is `none`).
+        "heir" => match info.heir.and_then(resolve::owner_pid) {
+            Some(pid) => Ok(pid),
             None => ctx.intern_atom("none"),
-            Some(_) => ctx.intern_atom("undefined"),
         },
         "name" => match info.name {
             Some(atom) => Ok(make_atom(atom)),
@@ -1034,64 +1173,24 @@ fn info_field(ctx: &mut BifContext<'_>, info: &TableInfo, item: &str) -> Result<
     }
 }
 
-/// Parses the `ets:new/2` option list into `options`, rejecting unknown options
-/// with `badarg`.
-fn parse_options(atoms: &AtomTable, term: Eterm, options: &mut TableOptions) -> Result<()> {
-    let elems = proper_list(term).ok_or_else(badarg)?;
-    for elem in elems {
-        if is_atom(elem) {
-            let name = atoms.name(atom_val(elem)).ok_or_else(badarg)?;
-            match name {
-                "set" => {
-                    options.set_kind(TableKind::Set);
-                }
-                "ordered_set" => {
-                    options.set_kind(TableKind::OrderedSet);
-                }
-                "bag" => {
-                    options.set_kind(TableKind::Bag);
-                }
-                "duplicate_bag" => {
-                    options.set_kind(TableKind::DuplicateBag);
-                }
-                "public" => {
-                    options.set_access(Access::Public);
-                }
-                "protected" => {
-                    options.set_access(Access::Protected);
-                }
-                "private" => {
-                    options.set_access(Access::Private);
-                }
-                "named_table" => {
-                    options.set_named(true);
-                }
-                _ => return Err(badarg()),
-            }
-        } else if is_tuple(elem) && tuple_size(elem) == 2 {
-            let key = tuple_element(elem, 0);
-            let value = tuple_element(elem, 1);
-            if !is_atom(key) {
-                return Err(badarg());
-            }
-            match atoms.name(atom_val(key)).ok_or_else(badarg)? {
-                "keypos" => {
-                    if !is_small(value) {
-                        return Err(badarg());
-                    }
-                    let pos = signed_value(value);
-                    if pos < 0 {
-                        return Err(badarg());
-                    }
-                    options.set_keypos(pos as usize)?;
-                }
-                _ => return Err(badarg()),
-            }
-        } else {
-            return Err(badarg());
+/// The term of the effective `ets:info(T, write_concurrency)` value
+/// ([`resolve::WriteConcurrencyInfo`]): the atom `false`/`true`/`auto`, or the
+/// hidden lock-count tuple `{debug_hash_fixed_number_of_locks, N}` (whose count
+/// [`resolve::parse_options`] already normalized).
+fn write_concurrency_term(
+    ctx: &mut BifContext<'_>,
+    info: resolve::WriteConcurrencyInfo,
+) -> Result<Eterm> {
+    match info {
+        resolve::WriteConcurrencyInfo::Off => ctx.boolean(false),
+        resolve::WriteConcurrencyInfo::On => ctx.boolean(true),
+        resolve::WriteConcurrencyInfo::Auto => ctx.intern_atom("auto"),
+        resolve::WriteConcurrencyInfo::FixedLocks(n) => {
+            let tag = ctx.intern_atom("debug_hash_fixed_number_of_locks")?;
+            let count = ctx.int(n as i64)?;
+            ctx.tuple(&[tag, count])
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]

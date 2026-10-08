@@ -10,16 +10,24 @@
 //!
 //! The oracle accepts either a tid or, for a table created with `named_table`, its
 //! **name atom** as the table argument of every verb (`db_get_table` consults the
-//! meta name table for an atom). [`resolve_handle`] reproduces that: a handle ref
+//! meta name table for an atom). [`super::resolve::resolve_handle`] reproduces that
+//! for the verbs registered here *and* for the parent module's keys: a handle ref
 //! thing resolves through [`crate::access::ref_thing_id`], an atom through
 //! [`super::TableRegistry::lookup_name`], and anything else — including the atom
-//! *name field* of a table that was not created with `named_table` — is `badarg`
-//! (verified: `ets:safe_fixtable(justname, true)` is `badarg` for
-//! `ets:new(justname, [set])`, while it is `true` for a `named_table`).
+//! *name field* of a table that was not created with `named_table`, or the
+//! `{Name, Node}` 2-tuple of an older OTP — is `badarg` (verified:
+//! `ets:safe_fixtable(justname, true)` is `badarg` for `ets:new(justname, [set])`,
+//! while it is `true` for a `named_table`).
 //!
-//! [`resolve_handle`] is used by the verbs registered *here*; the pre-existing
-//! `ets:*` keys keep the handle-only convention they shipped with (a documented M1
-//! gap of those keys, not of this module).
+//! # Access gating
+//!
+//! `safe_fixtable/2` is a **read** and `update_element/4` a **write** (verified
+//! against the oracle: for the non-owner of a `private` table both are `badarg`;
+//! for the non-owner of a `protected` table `safe_fixtable/2` succeeds while
+//! `update_element/4` is `badarg`), so both take their table through
+//! [`super::take_table_gated`] as the calling process. `is_compiled_ms/1` names no
+//! table at all (its argument is a compiled spec), and `whereis/1` only maps a name
+//! to a tid — neither touches a table.
 //!
 //! # Deliberately not registered (honest gaps)
 //!
@@ -63,7 +71,8 @@ use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 use crate::registry::BifRegistry;
 
-use super::{parse_updates, restore_table, take_table};
+use super::resolve::{resolve_handle, Gate};
+use super::{parse_updates, restore_table, take_table_gated};
 
 /// Registers the remaining faithful `ets:*` verbs (see the module docs for the
 /// scope and for the deliberately unregistered list).
@@ -72,24 +81,6 @@ pub(super) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "whereis", 1, whereis_1);
     reg.register("ets", "update_element", 4, update_element_4);
     reg.register("ets", "is_compiled_ms", 1, is_compiled_ms_1);
-}
-
-// ----------------------------------------------------------- table resolution
-
-/// The registry handle a table argument names: a handle ref thing, or the name of
-/// a `named_table`.
-///
-/// An unknown atom (no `named_table` has that name), an atom naming a table that
-/// was not created with `named_table`, and any non-atom non-handle term are
-/// `badarg`, exactly as the oracle's `db_get_table` reports (`undefined` for
-/// `ets:whereis/1` is that predicate's own answer — see [`whereis_1`]).
-fn resolve_handle(ctx: &mut BifContext<'_>, term: Eterm) -> Result<u64> {
-    if !is_atom(term) {
-        return ref_thing_id(term);
-    }
-    let name = atom_val(term);
-    let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-    tables.lookup_name(name).ok_or_else(badarg)
 }
 
 /// The boolean argument of `ets:safe_fixtable/2`.
@@ -118,11 +109,12 @@ fn boolean_arg(ctx: &BifContext<'_>, term: Eterm) -> Result<bool> {
 /// observes reclaimed words ([`Table::set_fixation`] owns that machinery). The
 /// return value is the atom `true` for **both** booleans (verified), and a
 /// non-boolean second argument — or a table argument that names no table — is
-/// `badarg`.
+/// `badarg`. Read-gated as the calling process: only a `private` table denies a
+/// non-owner (verified — a `protected` table's non-owner may fix it).
 fn safe_fixtable_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve_handle(ctx, args[0])?;
     let fix = boolean_arg(ctx, args[1])?;
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, Gate::Read)?;
     table.set_fixation(fix);
     restore_table(ctx, handle, table)?;
     ctx.boolean(true)
@@ -140,9 +132,10 @@ fn safe_fixtable_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// The tid is the same handle ref thing the table's BIFs take and the same term
 /// `ets:info(T, id)` renders, so `ets:whereis(Name) =:= ets:info(T, id)` holds, as
-/// in the oracle. (The oracle's own `ets:new(Name, [named_table])` returns the
-/// *name atom* rather than the tid; the M1 runtime always hands out the handle ref
-/// thing — a pre-existing [`super::new_2`] substitution, unrelated to this BIF.)
+/// in the oracle (verified via `erl`). (The oracle's own
+/// `ets:new(Name, [named_table])` returns the *name atom* while this BIF answers
+/// its **tid** — exactly the oracle's asymmetry: there `new/2` returns the name
+/// atom too and `whereis/1` the tid reference.)
 fn whereis_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let term = args[0];
     if !is_atom(term) {
@@ -179,9 +172,12 @@ fn whereis_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// * a malformed `Spec` (a non-list, an improper list, a non-2-tuple entry, a
 ///   non-integer position), `Pos == keypos`, `Pos == 0` or `Pos` beyond the object's
 ///   arity leaves the table untouched and is `badarg`.
+///
+/// Write-gated as the calling process: a non-owner is denied by a `protected` or
+/// `private` table (verified).
 fn update_element_4(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve_handle(ctx, args[0])?;
-    let mut table = take_table(ctx, handle)?;
+    let mut table = take_table_gated(ctx, handle, Gate::Write)?;
     let outcome = update_element_with_default(&mut table, args[1], args[2], args[3], ctx);
     // The table is restored on the error path too (never lost).
     restore_table(ctx, handle, table)?;
