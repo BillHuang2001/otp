@@ -20,7 +20,7 @@ Live drivers:
   An in-memory file implemented inside a port; consumed by `lib/kernel/src/ram_file.erl` (`open_port({spawn, "ram_file_drv"}, ...)`) and special-cased by `lib/runtime_tools/src/instrument.erl` (driver-level binary instrumentation).
 - `win32/registry_drv.c` → symbol `registry_driver_entry`, driver name `"registry__drv__"` (win32 only).
   Consumed by `lib/stdlib/src/win32reg.erl`, which appends a `"r"`/`"w"` mode suffix to the port name.
-- `unix/bin_drv.c` (`bin_driver_entry`, name `"binary_filer"`): present in the tree but **not** in `DRV_OBJS`, so it is neither compiled nor registered; no Erlang code references its driver name.
+- `unix/` currently holds no sources: `bin_drv.c` was deleted as provably dead (not in `DRV_OBJS`, no `#include`, no symbol/name reference anywhere in the repo — see `../beam/check_dead_sources.py`).
 - `vxworks/vxworks_resolv.c`: not a driver at all and not compiled — it only defined `erl_gethostbyname`/`erl_gethostbyaddr` shims for the long-removed header `erl_resolv.h`.
 
 ## Constraints
