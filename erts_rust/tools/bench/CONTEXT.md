@@ -98,9 +98,16 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 | `slice` | compute | committed `slice.beam` fixture + 6 `erlc`-compiled stdlib wrappers, run under **each scheduled runtime** | **runs** (sys+rust) | `erlc-absent`, `fixture-missing`, `runtime-unsupported` |
 | `foreign` | compute | **real Cowboy + EMQX modules** (`cowboy_bstr.erl`, `emqx_base62.erl`) compiled with the system `erlc`, run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `sources-missing`, `runtime-unsupported` |
 
-- `baseline` (always-on): N runs of `<erl> -noshell -eval 'halt().'` ⇒ startup-latency `Summary`
-  (p50/p99), plus a fixed in-VM compute loop (`-eval` summing 1..1_000_000) ⇒ wall time + throughput, so
-  a baseline record always exists. `--quick` uses ~10 runs, `--full` ~50.
+- `baseline` (always-on): N runs of `<erl> -noshell -eval 'halt().'` ⇒ startup-latency `Summary` (p50/p99);
+  a fixed in-VM compute loop `-eval 'S = lists:sum(lists:seq(1,1000000)), io:format("~p~n",[S]), halt().'`
+  ⇒ `compute_loop_ms` + `compute_ops_per_sec`; and a **separate** VM-memory probe
+  `-eval 'M = erlang:memory(total), io:format("~p~n",[M]), halt().'` ⇒ the scalar `vm_memory_total_bytes`
+  (never conflated with the OS `peak_memory_bytes`, which is the compute runs' RSS). `--quick` uses 10
+  startup runs / 5 compute runs; `--full` 50 / 5. **Capability gaps degrade, they never abort:** `beam_rt`
+  does not implement `erlang:memory/0,1` (it reports a bare `beam_rt: error undef`, exit 1), so its memory
+  probe records **no** metric and the explicit note `vm_memory_total_bytes: not-run (unsupported:
+  erlang:memory/1)`; the compute loop, the startup summary and every other metric are still produced. A
+  genuine (non-capability-gap) probe failure is surfaced verbatim, never fabricated.
 - `erlc_compiler`: compiles a bounded deterministic slice (first 30 `.erl` of each corpus) of the in-repo
   OTP `lib/stdlib/src` **and** the Elixir checkout's `lib/elixir/src` (both read-only) with `erlc` into a
   `ScratchDir` ⇒ files/sec, LOC/sec, wall time, peak memory. Missing/failing Elixir corpus falls back to
