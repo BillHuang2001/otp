@@ -400,10 +400,7 @@ pub fn decode_operand(
 /// magnitude, which [`crate::lower`] materializes as a bignum static literal.
 fn big_integer_operand(bytes: &[u8]) -> Result<Operand> {
     let (negative, magnitude) = bignum_sign_magnitude(bytes)?;
-    Ok(Operand::BigInteger {
-        negative,
-        magnitude,
-    })
+    Ok(Operand::big_integer(negative, magnitude))
 }
 
 /// Extracts the sign and normalized little-endian magnitude of a wide `i`-tagged
@@ -484,7 +481,7 @@ fn decode_extended(
             for _ in 0..count {
                 args.push(decode_operand(r, atoms, types)?);
             }
-            Ok(Operand::List(args))
+            Ok(Operand::list(args))
         }
         // 2 — float register index (`beam_file.c:2388-2395`).
         2 => {
@@ -500,7 +497,7 @@ fn decode_extended(
                 let number = read_unsigned(r, "allocation count is not unsigned")?;
                 entries.push(allocation_entry(kind, number)?);
             }
-            Ok(Operand::Allocation(entries))
+            Ok(Operand::alloc(entries))
         }
         // 4 — static literal index into `Module.literals` (`beam_file.c:2400-2417`).
         4 => {
@@ -862,10 +859,7 @@ mod tests {
         let bytes = tagged_wide(1, &field);
         assert_eq!(
             decode_operand(&mut beam_codec::Reader::new(&bytes), &[], &fallback_types()).unwrap(),
-            Operand::BigInteger {
-                negative: true,
-                magnitude: vec![1, 0, 0, 0, 0, 0, 0, 0, 0],
-            }
+            Operand::big_integer(true, vec![1, 0, 0, 0, 0, 0, 0, 0, 0])
         );
 
         // A 9-byte positive field `00 FF … FF` is `2^64 - 1`; the single leading zero
@@ -875,10 +869,7 @@ mod tests {
         let bytes = tagged_wide(1, &field);
         assert_eq!(
             decode_operand(&mut beam_codec::Reader::new(&bytes), &[], &fallback_types()).unwrap(),
-            Operand::BigInteger {
-                negative: false,
-                magnitude: vec![0xFF; 8],
-            }
+            Operand::big_integer(false, vec![0xFF; 8])
         );
 
         // The raw field is reported as the overflow field, never unpacked into a word
@@ -985,14 +976,14 @@ mod tests {
         let bytes = stream(&[&tagged(7, 1), &tagged(0, 2), &tagged(3, 0), &tagged(4, 1)]);
         assert_eq!(
             decode_operand(&mut beam_codec::Reader::new(&bytes), &[], &fallback_types()).unwrap(),
-            Operand::List(vec![Operand::X(0), Operand::Y(1)])
+            Operand::list(vec![Operand::X(0), Operand::Y(1)])
         );
 
         // An empty list is legal framing-wise.
         let empty = stream(&[&tagged(7, 1), &tagged(0, 0)]);
         assert_eq!(
             decode_operand(&mut beam_codec::Reader::new(&empty), &[], &fallback_types()).unwrap(),
-            Operand::List(Vec::new())
+            Operand::list(Vec::new())
         );
     }
 
@@ -1036,7 +1027,7 @@ mod tests {
         ]);
         assert_eq!(
             decode_operand(&mut beam_codec::Reader::new(&bytes), &[], &fallback_types()).unwrap(),
-            Operand::Allocation(vec![
+            Operand::alloc(vec![
                 // kind 0: raw heap words.
                 AllocKind {
                     kind: 0,
