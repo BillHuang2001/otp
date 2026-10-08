@@ -354,7 +354,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   prefix, env at offset 2) instead of the frozen `beam_term::fun` layout (env at `1 + desc_words(kind)`), so
   `copy_struct` mis-sizes/mis-fixes a fun crossing a copy boundary (e.g. a `make_fun3` closure in a message);
   untested. Fix: route funs through `beam_term::fun::{fun_env_offset_header, fun_block_words_header}`.
-- `open_port` residual divergences (a nonexistent path now raises `error:enoent`, matching the oracle):
+- `open_port` residual divergences (a nonexistent path raises `error:enoent`, matching the oracle):
   `{spawn_executable,<dir>}` ⇒ `eacces` vs oracle `ok`; empty `{spawn,""}`/`{spawn_executable,""}` ⇒ `enoent`
   vs oracle `badarg`.
 - Repo-root owned (outside this node): owed `../../CHANGE.md` entries for the `beam_term` foundation
