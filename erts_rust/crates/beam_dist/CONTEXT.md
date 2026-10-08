@@ -229,6 +229,8 @@ trailing **Message** term follows the tuple in the same body. No leading `VERSIO
 distribution header carries it).
 - `struct ControlMessage { dop: Dop, terms: Vec<Eterm> }` (flattened: control args, then the trailing
   message when present).
+- `carries_message(dop) -> bool` — the 16 opcodes that carry a trailing **Message** term (the 9 send
+  family + 5 payload-exit + `SPAWN_REQUEST`/`SPAWN_REQUEST_TT`); `SPAWN_REPLY`/`_TT` are excluded.
 - `encode_control_cached(dop, terms, atoms, Option<&mut dyn beam_codec::AtomCacheWriter>) ->
   Result<Vec<u8>>`; `encode_control(dop, terms, atoms) -> Result<Vec<u8>>` (a thin wrapper over the
   cache-less case). The opcode + control args + trailing message are encoded through **one**
