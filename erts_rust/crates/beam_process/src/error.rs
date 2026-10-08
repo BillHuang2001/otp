@@ -14,6 +14,8 @@
 //! * pid/port number-space exhaustion ⇒ [`system_limit`] (`SystemLimit`),
 //! * a named **port** monitor (`erlang:monitor(port, Name)`, whose name the local
 //!   process-only registry cannot resolve) ⇒ [`named_port_monitor`],
+//! * an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is not a heap-independent immediate ⇒
+//!   [`unsupported_tag`],
 //! * a genuinely unimplemented capability ⇒ [`unsupported`] (a BEAM `error` raise), so a caller
 //!   never receives a wrong result in place of a typed diagnostic.
 //!
@@ -65,4 +67,16 @@ pub(crate) fn unsupported(what: &str) -> BeamError {
 /// (`ProcessTable::monitor_term` and `ProcessTable::monitor_named`) share this one reason.
 pub(crate) fn named_port_monitor() -> BeamError {
     unsupported("monitor/2: named port monitor (the local name registry holds processes only)")
+}
+
+/// The typed diagnostic for an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is **not** a
+/// heap-independent immediate.
+///
+/// A monitor record is a **plain value** the collector never scans (see `monitor.rs`), so a tag
+/// term resident in a per-process heap could not be relocated and would dangle after a
+/// collection. Only an immediate (an atom, small integer, local pid/port, `nil`) — or a
+/// literal-area term — is safe; every other term is refused here rather than silently stored as
+/// a word that a later collection invalidates.
+pub(crate) fn unsupported_tag() -> BeamError {
+    unsupported("monitor/3: tag must be an immediately-representable term (atom/integer/pid/port)")
 }

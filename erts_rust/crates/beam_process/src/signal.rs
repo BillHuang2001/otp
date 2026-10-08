@@ -13,6 +13,11 @@
 //! (through `beam_alloc::Heap`), so a built `{'EXIT', …}`/`{'DOWN', …}` term is already
 //! owned by its recipient.
 //!
+//! A `{'DOWN', …}` builder takes an optional **user tag** — the `erlang:monitor/3`
+//! `{tag, Tag}` option. `None` reproduces the default `'DOWN'` head atom (a byte-identical
+//! `{'DOWN', Reference, Kind, Target, Reason}`), `Some(tag)` puts `tag` there instead
+//! (`{Tag, Reference, Kind, Target, Reason}`), exactly as the oracle delivers it.
+//!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_monitor_link.c`,
 //! `erl_proc_sig_queue.c` and the `am_exit`/`am_down`/`am_kill`/`am_killed` atoms of
 //! `atom.names`.
@@ -208,11 +213,16 @@ pub fn build_exit_message(
     build_exit_message_term(heap, atoms, from.to_eterm(), reason)
 }
 
-/// Builds `{'DOWN', Reference, Tag, Target, Reason}` on `heap`, with an arbitrary monitor
-/// tag (`process`/`port`) and an arbitrary `target` term.
+/// Builds `{Tag, Reference, Kind, Target, Reason}` on `heap`, with an arbitrary monitor
+/// **kind** (`process`/`port`), an arbitrary `target` term and an optional **user tag**.
 ///
 /// The general form of [`build_down_message`]: a `{'DOWN', …}` about a **remote**
 /// process/port carries an external pid/port term in the target slot.
+///
+/// `user_tag` is the `erlang:monitor/3` `{tag, Tag}` option. `None` puts the default
+/// `'DOWN'` atom in the head position — the byte-identical
+/// `{'DOWN', Reference, Kind, Target, Reason}` shape — while `Some(tag)` puts `tag` there
+/// instead, the oracle's `{Tag, Reference, Kind, Target, Reason}`.
 ///
 /// # Errors
 ///
@@ -220,21 +230,22 @@ pub fn build_exit_message(
 pub fn build_down_message_term(
     heap: &mut Heap,
     atoms: &SignalAtoms,
+    user_tag: Option<Eterm>,
     reference: Eterm,
-    tag: Atom,
+    kind: Atom,
     target: Eterm,
     reason: Eterm,
 ) -> Result<Eterm> {
-    heap.tuple(&[
-        make_atom(atoms.down()),
-        reference,
-        make_atom(tag),
-        target,
-        reason,
-    ])
+    // The head is the user tag when one was supplied, the default `'DOWN'` atom otherwise.
+    let head = match user_tag {
+        Some(tag) => tag,
+        None => make_atom(atoms.down()),
+    };
+    heap.tuple(&[head, reference, make_atom(kind), target, reason])
 }
 
-/// Builds `{'DOWN', Reference, process, Pid, Reason}` on `heap`.
+/// Builds `{'DOWN', Reference, process, Pid, Reason}` on `heap` — or
+/// `{Tag, Reference, process, Pid, Reason}` when `user_tag` is supplied.
 ///
 /// # Errors
 ///
@@ -242,15 +253,25 @@ pub fn build_down_message_term(
 pub fn build_down_message(
     heap: &mut Heap,
     atoms: &SignalAtoms,
+    user_tag: Option<Eterm>,
     reference: Eterm,
     pid: ProcessId,
     reason: Eterm,
 ) -> Result<Eterm> {
-    build_down_message_term(heap, atoms, reference, atoms.process(), pid.to_eterm(), reason)
+    build_down_message_term(
+        heap,
+        atoms,
+        user_tag,
+        reference,
+        atoms.process(),
+        pid.to_eterm(),
+        reason,
+    )
 }
 
 /// Builds `{'DOWN', Reference, process, RemotePid, Reason}` on `heap`, materialising the
-/// remote target's external-pid term on that same heap.
+/// remote target's external-pid term on that same heap — or the `{Tag, …}` form when
+/// `user_tag` is supplied.
 ///
 /// This is what a dropped distribution connection queues on each of the dead node's
 /// monitors.
@@ -261,17 +282,19 @@ pub fn build_down_message(
 pub fn build_down_message_remote(
     heap: &mut Heap,
     atoms: &SignalAtoms,
+    user_tag: Option<Eterm>,
     reference: Eterm,
     remote: RemotePid,
     reason: Eterm,
 ) -> Result<Eterm> {
     let target = remote.to_eterm(heap)?;
-    build_down_message_term(heap, atoms, reference, atoms.process(), target, reason)
+    build_down_message_term(heap, atoms, user_tag, reference, atoms.process(), target, reason)
 }
 
-/// Builds `{'DOWN', Reference, port, Port, Reason}` on `heap`.
+/// Builds `{'DOWN', Reference, port, Port, Reason}` on `heap` — or
+/// `{Tag, Reference, port, Port, Reason}` when `user_tag` is supplied.
 ///
-/// The port analogue of [`build_down_message`]: the monitor tag slot carries the `port`
+/// The port analogue of [`build_down_message`]: the monitor **kind** slot carries the `port`
 /// atom rather than `process`, and the target is the port immediate (see
 /// `erts/emulator/beam/erl_monitor_link.c`).
 ///
@@ -281,11 +304,20 @@ pub fn build_down_message_remote(
 pub fn build_down_message_port(
     heap: &mut Heap,
     atoms: &SignalAtoms,
+    user_tag: Option<Eterm>,
     reference: Eterm,
     port: PortId,
     reason: Eterm,
 ) -> Result<Eterm> {
-    build_down_message_term(heap, atoms, reference, atoms.port(), port.to_eterm(), reason)
+    build_down_message_term(
+        heap,
+        atoms,
+        user_tag,
+        reference,
+        atoms.port(),
+        port.to_eterm(),
+        reason,
+    )
 }
 
 #[cfg(test)]
@@ -412,12 +444,42 @@ mod tests {
             .expect("the ref fits");
         let pid = ProcessId::new(7, 2);
         let reason = atoms.normal_term();
-        let message = build_down_message(&mut heap, atoms, reference, pid, reason).expect("fits");
+        let message =
+            build_down_message(&mut heap, atoms, None, reference, pid, reason).expect("fits");
 
         // SAFETY: `message` is a live tuple written by `Heap::tuple`.
         unsafe {
             assert_eq!(tuple_size(message), 5);
             assert_eq!(tuple_element(message, 0), make_atom(atoms.down()));
+            assert_eq!(tuple_element(message, 1), reference);
+            assert_eq!(tuple_element(message, 2), make_atom(atoms.process()));
+            assert_eq!(tuple_element(message, 3), pid.to_eterm());
+            assert_eq!(tuple_element(message, 4), reason);
+        }
+    }
+
+    #[test]
+    fn build_down_message_with_a_user_tag_replaces_the_head_atom() {
+        let mut f = fixture();
+        let tag = make_atom(f.table.intern("mytag"));
+        let atoms = &f.atoms;
+        let mut heap = Heap::new(16).expect("test heap");
+        let mut ref_heap = Heap::new(8).expect("test heap");
+        let reference = crate::monitor::RefAllocator::new()
+            .next()
+            .to_eterm(&mut ref_heap)
+            .expect("the ref fits");
+        let pid = ProcessId::new(7, 2);
+        let reason = atoms.normal_term();
+        let message = build_down_message(&mut heap, atoms, Some(tag), reference, pid, reason)
+            .expect("fits");
+
+        // SAFETY: `message` is a live tuple written by `Heap::tuple`.
+        unsafe {
+            assert_eq!(tuple_size(message), 5);
+            // The user tag sits where `'DOWN'` would be; `'DOWN'` itself is gone.
+            assert_eq!(tuple_element(message, 0), tag);
+            assert_ne!(tuple_element(message, 0), make_atom(atoms.down()));
             assert_eq!(tuple_element(message, 1), reference);
             assert_eq!(tuple_element(message, 2), make_atom(atoms.process()));
             assert_eq!(tuple_element(message, 3), pid.to_eterm());
@@ -437,8 +499,8 @@ mod tests {
             .expect("the ref fits");
         let port = PortId::new(42);
         let reason = atoms.normal_term();
-        let message =
-            build_down_message_port(&mut heap, atoms, reference, port, reason).expect("fits");
+        let message = build_down_message_port(&mut heap, atoms, None, reference, port, reason)
+            .expect("fits");
 
         // SAFETY: `message` is a live tuple written by `Heap::tuple`.
         unsafe {
@@ -452,13 +514,38 @@ mod tests {
     }
 
     #[test]
+    fn build_down_message_port_with_a_user_tag_replaces_the_head_atom() {
+        let mut f = fixture();
+        let tag = make_atom(f.table.intern("mytag"));
+        let atoms = &f.atoms;
+        let mut heap = Heap::new(16).expect("test heap");
+        let mut ref_heap = Heap::new(8).expect("test heap");
+        let reference = crate::monitor::RefAllocator::new()
+            .next()
+            .to_eterm(&mut ref_heap)
+            .expect("the ref fits");
+        let port = PortId::new(42);
+        let reason = atoms.normal_term();
+        let message = build_down_message_port(&mut heap, atoms, Some(tag), reference, port, reason)
+            .expect("fits");
+
+        // SAFETY: `message` is a live tuple written by `Heap::tuple`.
+        unsafe {
+            assert_eq!(tuple_size(message), 5);
+            assert_eq!(tuple_element(message, 0), tag);
+            assert_eq!(tuple_element(message, 1), reference);
+            assert_eq!(tuple_element(message, 2), make_atom(atoms.port()));
+            assert_eq!(tuple_element(message, 3), port.to_eterm());
+            assert_eq!(tuple_element(message, 4), reason);
+        }
+    }
+
+    #[test]
     fn builders_report_exhaustion() {
         let f = fixture();
         let atoms = &f.atoms;
         let mut tiny = Heap::new(1).expect("a one-word heap");
-        assert!(
-            build_exit_message(&mut tiny, atoms, ProcessId::new(1, 0), atoms.normal_term())
-                .is_err()
-        );
+        assert!(build_exit_message(&mut tiny, atoms, ProcessId::new(1, 0), atoms.normal_term())
+            .is_err());
     }
 }

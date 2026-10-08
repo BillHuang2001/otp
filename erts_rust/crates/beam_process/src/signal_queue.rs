@@ -11,12 +11,15 @@
 //! # What a queued signal is
 //!
 //! A signal is either an **exit signal** — `from: ProcessId`, `reason: Eterm` — or a
-//! **monitor-DOWN** notification — `reference`, `target`, `kind`, `reason` ([`PendingSignal`]).
-//! Both carry the exit/monitor `reason` as a live term: the reason is **copied into the
-//! receiving process's own heap when the signal is enqueued** (see below), so the queue is an
-//! in-heap sub-rootset exactly like the mailbox / the process dictionary / the saved BIF
-//! arguments. A remote (external-pid) or port signal is *not* queued: it is materialised
-//! straight into the mailbox, because it carries no `trap_exit` policy decision to defer.
+//! **monitor-DOWN** notification — `reference`, `target`, `kind`, an optional **user tag**,
+//! `reason` ([`PendingSignal`]). Both carry the exit/monitor `reason` as a live term: the
+//! reason is **copied into the receiving process's own heap when the signal is enqueued** (see
+//! below), so the queue is an in-heap sub-rootset exactly like the mailbox / the process
+//! dictionary / the saved BIF arguments. The DOWN's user tag is the `erlang:monitor/3`
+//! `{tag, Tag}` option (`None` ⇒ the `'DOWN'` atom) and is carried verbatim — it must be a
+//! heap-independent immediate (see `monitor.rs`). A remote (external-pid) or port signal is
+//! *not* queued: it is materialised straight into the mailbox, because it carries no
+//! `trap_exit` policy decision to defer.
 //!
 //! # Ordering guarantee
 //!
@@ -89,8 +92,10 @@ pub enum PendingSignal {
         reference: MonitorRef,
         /// The watched process (downgraded to a `{'DOWN', …}` payload at service time).
         target: ProcessId,
-        /// Whether a process or a port is watched (selects the `{'DOWN', …}` tag).
+        /// Whether a process or a port is watched (selects the `{'DOWN', …}` kind atom).
         kind: MonitorKind,
+        /// The `erlang:monitor/3` `{tag, Tag}` user tag; `None` ⇒ the `'DOWN'` atom.
+        tag: Option<Eterm>,
         /// The exit reason term (already owned by the receiver's heap).
         reason: Eterm,
     },
@@ -102,17 +107,20 @@ impl PendingSignal {
         PendingSignal::Exit { from, reason }
     }
 
-    /// A monitor-DOWN notification.
+    /// A monitor-DOWN notification, with the optional `erlang:monitor/3` user tag
+    /// (`None` ⇒ the `'DOWN'` atom).
     pub fn down(
         reference: MonitorRef,
         target: ProcessId,
         kind: MonitorKind,
+        tag: Option<Eterm>,
         reason: Eterm,
     ) -> PendingSignal {
         PendingSignal::Down {
             reference,
             target,
             kind,
+            tag,
             reason,
         }
     }
@@ -132,6 +140,14 @@ impl PendingSignal {
         }
     }
 
+    /// The monitor-DOWN's user tag, or `None` for an exit signal / a default-tag DOWN.
+    pub fn tag(&self) -> Option<Eterm> {
+        match self {
+            PendingSignal::Exit { .. } => None,
+            PendingSignal::Down { tag, .. } => *tag,
+        }
+    }
+
     /// Replaces the reason term (used by the GC `scatter` step to write the relocated word
     /// back).
     fn set_reason(&mut self, reason: Eterm) {
@@ -139,6 +155,13 @@ impl PendingSignal {
             PendingSignal::Exit { reason: slot, .. } | PendingSignal::Down { reason: slot, .. } => {
                 *slot = reason
             }
+        }
+    }
+
+    /// Replaces the DOWN's user tag (the GC `scatter` step, mirroring [`PendingSignal::set_reason`]).
+    fn set_tag(&mut self, tag: Eterm) {
+        if let PendingSignal::Down { tag: slot, .. } = self {
+            *slot = Some(tag);
         }
     }
 }
@@ -198,32 +221,47 @@ impl SignalQueue {
         self.entries.iter()
     }
 
-    /// Appends every queued signal's reason (in item order) to `out` and returns the **start
-    /// offset** — the index in `out` at which this container's words begin.
+    /// Appends every queued signal's reason (in item order) — plus each monitor-DOWN signal's
+    /// user tag when it has one — to `out` and returns the **start offset** — the index in
+    /// `out` at which this container's words begin.
     ///
-    /// One word per signal; pairing with [`SignalQueue::scatter_roots`] with the same `start`
-    /// makes the two a clean round-trip (mirroring [`crate::dict::Dict::gather_roots`]).
+    /// One word per signal, plus one more for a DOWN carrying a user tag; pairing with
+    /// [`SignalQueue::scatter_roots`] with the same `start` makes the two a clean round-trip
+    /// (mirroring [`crate::dict::Dict::gather_roots`]). The `Some`/`None` shape of every DOWN's
+    /// tag is identical at gather and scatter time (an immediate never gains or loses a tag), so
+    /// the positional pairing is exact.
     pub fn gather_roots(&self, out: &mut Vec<Eterm>) -> usize {
         let start = out.len();
         for signal in &self.entries {
             out.push(signal.reason());
+            if let Some(tag) = signal.tag() {
+                out.push(tag);
+            }
         }
         start
     }
 
-    /// Writes the (relocated) reason words back, starting at `start` — the offset returned by
-    /// [`SignalQueue::gather_roots`].
+    /// Writes the (relocated) reason and user-tag words back, starting at `start` — the offset
+    /// returned by [`SignalQueue::gather_roots`].
     ///
     /// Defensive and total: it never panics. A `roots` slice too short to cover the whole
     /// queue, or a `start` past its end, simply leaves the uncovered tail untouched.
     pub fn scatter_roots(&mut self, roots: &[Eterm], start: usize) {
-        let Some(available) = roots.len().checked_sub(start) else {
-            // `start` is past the end of the slice: nothing to write, no panic.
-            return;
-        };
-        let count = available.min(self.entries.len());
-        for (index, signal) in self.entries.iter_mut().take(count).enumerate() {
-            signal.set_reason(roots[start + index]);
+        let mut index = start;
+        for signal in self.entries.iter_mut() {
+            let Some(reason) = roots.get(index) else {
+                // `start` is past the end of the slice (or it ran out): nothing more to write.
+                return;
+            };
+            signal.set_reason(*reason);
+            index += 1;
+            if signal.tag().is_some() {
+                let Some(tag) = roots.get(index) else {
+                    return;
+                };
+                signal.set_tag(*tag);
+                index += 1;
+            }
         }
     }
 }
@@ -267,6 +305,7 @@ mod tests {
             reference(0),
             pid(3),
             MonitorKind::Process,
+            None,
             make_small(3),
         ));
         assert_eq!(queue.len(), 3);
@@ -312,9 +351,11 @@ mod tests {
         assert_eq!(exit.reason(), make_small(41));
 
         let reference = reference(2);
-        let down = PendingSignal::down(reference, pid(5), MonitorKind::Process, make_small(51));
+        let down = PendingSignal::down(reference, pid(5), MonitorKind::Process, None, make_small(51));
         assert_eq!(down.kind(), PendingSignalKind::Down);
         assert_eq!(down.reason(), make_small(51));
+        // No user tag ⇒ the default `'DOWN'` head.
+        assert_eq!(down.tag(), None);
         match down {
             PendingSignal::Down {
                 reference: got,
@@ -328,6 +369,13 @@ mod tests {
             }
             PendingSignal::Exit { .. } => panic!("a DOWN signal must be a Down"),
         }
+
+        // A user tag is carried verbatim by the signal.
+        let tagged = PendingSignal::down(reference, pid(6), MonitorKind::Port, Some(make_small(7)), make_small(52));
+        assert_eq!(tagged.tag(), Some(make_small(7)));
+        assert_eq!(tagged.reason(), make_small(52));
+        // An exit signal has no tag.
+        assert_eq!(PendingSignal::exit(pid(1), make_small(1)).tag(), None);
     }
 
     #[test]
@@ -355,6 +403,7 @@ mod tests {
             reference(0),
             pid(2),
             MonitorKind::Process,
+            None,
             make_small(2),
         ));
 
@@ -368,6 +417,41 @@ mod tests {
         queue.scatter_roots(&roots, start);
         assert_eq!(queue.pop().map(|s| s.reason()), Some(make_small(101)));
         assert_eq!(queue.pop().map(|s| s.reason()), Some(make_small(202)));
+    }
+
+    #[test]
+    fn gather_and_scatter_carry_a_down_user_tag() {
+        let mut queue = SignalQueue::new();
+        queue.push(PendingSignal::down(
+            reference(0),
+            pid(2),
+            MonitorKind::Process,
+            Some(make_small(7)),
+            make_small(2),
+        ));
+        // An untagged DOWN next to a tagged one: the tagged one contributes an extra word.
+        queue.push(PendingSignal::down(
+            reference(1),
+            pid(3),
+            MonitorKind::Port,
+            None,
+            make_small(3),
+        ));
+
+        let mut roots = Vec::new();
+        let start = queue.gather_roots(&mut roots);
+        assert_eq!(start, 0);
+        // [reason, tag, reason] — the untagged DOWN contributes only its reason.
+        assert_eq!(roots, vec![make_small(2), make_small(7), make_small(3)]);
+
+        // The collector relocates both the reason and the tag.
+        queue.scatter_roots(&[make_small(102), make_small(107), make_small(103)], start);
+        let first = queue.pop().expect("the tagged DOWN");
+        assert_eq!(first.reason(), make_small(102));
+        assert_eq!(first.tag(), Some(make_small(107)));
+        let second = queue.pop().expect("the untagged DOWN");
+        assert_eq!(second.reason(), make_small(103));
+        assert_eq!(second.tag(), None);
     }
 
     #[test]
