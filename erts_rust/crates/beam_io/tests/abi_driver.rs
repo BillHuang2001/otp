@@ -678,14 +678,30 @@ fn log_lines(path: &Path) -> Vec<String> {
     }
 }
 
-/// A fresh scratch log path (the directory is created so the fixture's append can succeed), the
-/// readable descriptor to select on, and the command string that wires both into the port.
+/// A socket-pair descriptor a driver has been told to `driver_select`, kept **alive** (both ends
+/// owned, not just their numbers) for the whole test that owns it.
 ///
 /// The read end of a socket pair stands in for the descriptor a driver would select on, and it is
 /// non-blocking for the same reason [`a_selected_descriptor_routes_input_through_ready_input`]
 /// needs it (the fixture's `ready_input` loops `read(2)` down to `EAGAIN` on an edge-triggered
-/// reactor). `_keep` must be held for the duration of the test: dropping it would close the peer.
-fn logged_port_command(stem: &str) -> (PathBuf, std::os::unix::net::UnixStream, String, i32) {
+/// reactor). Owning the participant whose fd is selected is the point: returning the bare `RawFd`
+/// would drop the `UnixStream` and let another thread's short-lived descriptor recycle that number
+/// while the driver calls `driver_select`/`select(2)` on it, which is `EBADF` under the parallel
+/// test runner. This value must be held for the duration of the test.
+struct LoggedPort {
+    /// The scratch log path the fixture's `log=<path>` argument points at.
+    log: PathBuf,
+    /// The `fd=<n> log=<path>` command string the port is started with.
+    command: String,
+    /// The participant whose descriptor is selected on — held so its number stays valid.
+    _read_end: std::os::unix::net::UnixStream,
+    /// Its peer, held so the pair stays fully open for the test's lifetime.
+    _write_end: std::os::unix::net::UnixStream,
+}
+
+/// A fresh scratch log path (the directory is created so the fixture's append can succeed) bundled
+/// with the command string and the still-open, non-blocking descriptor to select on.
+fn logged_port_command(stem: &str) -> LoggedPort {
     let dir = scratch_dir(stem);
     std::fs::create_dir_all(&dir).expect("a scratch dir is creatable");
     let log = dir.join("events.log");
@@ -695,7 +711,12 @@ fn logged_port_command(stem: &str) -> (PathBuf, std::os::unix::net::UnixStream, 
         .expect("the selected descriptor must be non-blocking");
     let fd = read_end.as_raw_fd();
     let command = format!("fd={fd} log={}", log.display());
-    (log, write_end, command, fd)
+    LoggedPort {
+        log,
+        command,
+        _read_end: read_end,
+        _write_end: write_end,
+    }
 }
 
 /// `stop_select` fires when an `ERL_DRV_USE` selection is de-selected, and it fires for the
@@ -705,9 +726,9 @@ fn stop_select_fires_when_a_use_selection_is_deselected() {
     let Some(so) = fixture_so() else {
         return;
     };
-    let (log, _peer, command, _fd) = logged_port_command("stop-select-deselect");
     let (host, _state) = TestPortHost::new();
-    let (mut poller, mut registry, id) = open_port(&so, &command, host);
+    let probe = logged_port_command("stop-select-deselect");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
 
     // Control verb 9 is `driver_select(port, fd, ERL_DRV_READ | ERL_DRV_USE, 1)`.
     assert_eq!(
@@ -719,7 +740,7 @@ fn stop_select_fires_when_a_use_selection_is_deselected() {
     );
     assert_eq!(poller.len(), 1, "the selection registered with the reactor");
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec!["start".to_string()],
         "a live ERL_DRV_USE selection owes nothing yet"
     );
@@ -730,14 +751,14 @@ fn stop_select_fires_when_a_use_selection_is_deselected() {
         .expect("control verb 12 de-selects");
     assert!(poller.is_empty(), "the de-select withdrew the registration");
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec!["start".to_string(), "stop_select".to_string()],
         "the ERL_DRV_USE release fired the driver's stop_select"
     );
 
     registry.close(&mut poller, id).expect("the port closes");
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec![
             "start".to_string(),
             "stop_select".to_string(),
@@ -754,9 +775,9 @@ fn stop_select_fires_on_port_stop_for_a_still_selected_use_fd() {
     let Some(so) = fixture_so() else {
         return;
     };
-    let (log, _peer, command, _fd) = logged_port_command("stop-select-teardown");
     let (host, _state) = TestPortHost::new();
-    let (mut poller, mut registry, id) = open_port(&so, &command, host);
+    let probe = logged_port_command("stop-select-teardown");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
 
     registry
         .port_control(&mut poller, id, "9", &[])
@@ -765,7 +786,7 @@ fn stop_select_fires_on_port_stop_for_a_still_selected_use_fd() {
 
     registry.close(&mut poller, id).expect("the port closes");
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec![
             "start".to_string(),
             "stop".to_string(),
@@ -786,9 +807,9 @@ fn stop_select_does_not_fire_for_a_plain_or_no_callback_selection() {
     let Some(so) = fixture_so() else {
         return;
     };
-    let (log, _peer, command, _fd) = logged_port_command("stop-select-none");
     let (host, _state) = TestPortHost::new();
-    let (mut poller, mut registry, id) = open_port(&so, &command, host);
+    let probe = logged_port_command("stop-select-none");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
 
     // Control verb 11 is a plain `driver_select(..., ERL_DRV_READ, 1)`.
     registry
@@ -798,7 +819,7 @@ fn stop_select_does_not_fire_for_a_plain_or_no_callback_selection() {
         .port_control(&mut poller, id, "12", &[])
         .expect("control verb 12 de-selects");
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec!["start".to_string()],
         "a plain select owes no release callback"
     );
@@ -811,7 +832,7 @@ fn stop_select_does_not_fire_for_a_plain_or_no_callback_selection() {
         .port_control(&mut poller, id, "12", &[])
         .expect("control verb 12 de-selects");
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec!["start".to_string()],
         "ERL_DRV_USE_NO_CALLBACK declines the release callback"
     );
@@ -822,7 +843,7 @@ fn stop_select_does_not_fire_for_a_plain_or_no_callback_selection() {
         .expect("control verb 10 selects READ|USE_NO_CALLBACK");
     registry.close(&mut poller, id).expect("the port closes");
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec!["start".to_string(), "stop".to_string()],
         "a `_NO_CALLBACK` registration still owes nothing when the port goes away"
     );
@@ -835,15 +856,15 @@ fn stop_select_fires_when_a_port_is_dropped_without_being_closed() {
     let Some(so) = fixture_so() else {
         return;
     };
-    let (log, _peer, command, _fd) = logged_port_command("stop-select-drop");
     let (host, _state) = TestPortHost::new();
-    let (mut poller, mut registry, id) = open_port(&so, &command, host);
+    let probe = logged_port_command("stop-select-drop");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
 
     registry
         .port_control(&mut poller, id, "9", &[])
         .expect("control verb 9 selects READ|USE");
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec!["start".to_string()],
         "nothing has been released yet"
     );
@@ -851,7 +872,7 @@ fn stop_select_fires_when_a_port_is_dropped_without_being_closed() {
     // Drop the whole registry: every live `Port` — and so every `DriverPort` — is dropped.
     drop(registry);
     assert_eq!(
-        log_lines(&log),
+        log_lines(&probe.log),
         vec!["start".to_string(), "stop_select".to_string()],
         "dropping a port without `stop` still releases the still-selected ERL_DRV_USE"
     );
