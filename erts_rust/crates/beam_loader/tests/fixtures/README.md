@@ -596,3 +596,81 @@ stream `09 19` is one `TAG_i` item with line `25`. The loader prepends the impli
 ### `Type`
 `version 4`, `count 1`; the single entry is the "any" entry `{raw: 0x1FFF}`. A one-entry
 table is *not* the fallback `TypeTable` (`fallback == false`).
+
+## `literals_verbatim.beam` / `literals_compressed.beam`
+
+The `LitT` literal-pool fixture pair used by `tests/literals.rs`. Both are the **same
+source** (`literals_fixture.erl`) compiled by the system Erlang toolchain, differing only
+in the `LitT` framing:
+
+* `literals_verbatim.beam` — plain `erlc` (OTP 28+ verbatim `LitT`:
+  `uncompressed_size == 0`, the record table follows the header).
+* `literals_compressed.beam` — `erlc +compressed_literals` (the OTP 27-and-earlier
+  framing: `uncompressed_size` is the pre-compression size and the rest of the chunk is a
+  zlib/RFC 1950 stream — see `beam_asm.erl:build_literal_chunk`).
+
+`literals_fixture.erl` returns one constant term per function, so the whole constant set
+lands in the module's literal pool (9 literals in both files):
+
+| idx | term | kind |
+|-----|------|------|
+| 0 | `{a,1,{b,2},[]}` | tuple (nested tuple, nil) |
+| 1 | `[1,2,[3,4],{ok,5},"abc"]` | list (nested list, tuple, string) |
+| 2 | `#{a => 1, {x,y} => [1,2], <<"k">> => 2.0}` | map (tuple key, binary key, float value) |
+| 3 | `[1.5,-2.25,1.0e300,0.0]` | floats |
+| 4 | `[123456789012345678901234567890,-99999999999999999999999999]` | bignums (positive + negative) |
+| 5 | `[<<1,2,3>>,<<"hello">>,<<1:3>>]` | binaries (incl. a non-byte-aligned bitstring) |
+| 6 | `[fun lists:reverse/1, fun maps:get/2]` | external (`EXPORT_EXT`) funs |
+| 7 | `{#{list => [a,b], float => 1.5, bin => <<7,8>>}, 10^25, [<<"x">>]}` | composite (map + bignum + list) |
+| 8 | `{ok,[1,2,3],{a,1.5},#{k => v}}` | composite (list + float tuple + small map) |
+
+### Regeneration
+
+Compile from a neutral scratch dir under `$TMPDIR` with `+deterministic`, exactly as for
+`slice.beam`, so the committed binaries embed **no** source path:
+
+```sh
+SCRATCH="$TMPDIR/neuter_fixtures"
+mkdir -p "$SCRATCH/verbatim" "$SCRATCH/compressed"
+cp literals_fixture.erl "$SCRATCH/"
+( cd "$SCRATCH" && erlc +deterministic -o verbatim literals_fixture.erl )
+( cd "$SCRATCH" && erlc +deterministic +compressed_literals -o compressed literals_fixture.erl )
+cp "$SCRATCH/verbatim/literals_fixture.beam"   literals_verbatim.beam    # 1228 bytes
+cp "$SCRATCH/compressed/literals_fixture.beam" literals_compressed.beam  # 1148 bytes
+```
+
+### Wire summary (verified against the oracle `beam_lib:all_chunks/1`)
+
+Both files carry the same chunks in the same order; only `LitT` differs.
+
+| id | verbatim | compressed |
+|----|----------|------------|
+| `AtU8` | 13 atoms: the module name, the nine function names, `module_info`, `erlang`, `get_module_info` | same |
+| `Code` | header `(format 0, max_opcode 181, 23 labels, 11 functions)` | same |
+| `StrT` | empty | same |
+| `ImpT` | 2 imports (`erlang:get_module_info/1,2`, used by the generated `module_info/0,1`) | same |
+| `ExpT` | 11 exports (the nine functions + `module_info/0,1`) | same |
+| **`LitT`** | 399 bytes: `00 00 00 00` + a 395-byte record table | 298 bytes: `00 00 01 8B` (= 395) + a 294-byte zlib stream (`78 9C…`) |
+| `Meta`/`LocT`/`Attr`/`CInf`/`Dbgi`/`Line`/`Type` | as the compiler emits them (`+deterministic`) | same |
+
+Both `LitT` payloads decode to the same nine literal records; the compressed one is the
+zlib stream of the verbatim record table (395 bytes -> 294 bytes). `tests/literals.rs`
+asserts the two pools carry byte-identical payloads and decode to identically re-encoded
+terms.
+
+## `literals_oracle.escript`
+
+The oracle for `tests/literals.rs`. It is **not** a fixture in the `.beam` sense: it is the
+Erlang-side half of the installed-literal sweep. Run as
+
+```sh
+escript literals_oracle.escript <otp-lib-root>
+```
+
+it walks every `*.beam` under the root and prints one TAB-separated line per `LitT`
+literal — `<path relative to the root> <TAB> <index> <TAB> <hex>` — where the hex is
+`term_to_binary(binary_to_term(Payload))` (OTP's own decode/encode round-trip). It parses
+the `LitT` chunks with `beam_lib`/`zlib`, i.e. an implementation independent of
+`beam_loader`'s framing, so a framing bug cannot validate itself. `binary_to_term/1`
+normalizes a flat map's key order to ERTS's canonical order, which is why the Rust test
+compares terms semantically (`beam_term::compare`) rather than byte-for-byte.

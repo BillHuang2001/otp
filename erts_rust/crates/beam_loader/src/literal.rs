@@ -298,6 +298,45 @@ mod tests {
     }
 
     #[test]
+    fn every_truncation_of_a_payload_is_a_typed_error() {
+        // The record framing may hand over any byte run; a run that stops inside the
+        // term must fail closed at the decoder (the last atom's byte count needs its
+        // full 16 bytes, so no strict prefix is a complete term).
+        let mut atoms = AtomTable::new();
+        for len in 0..ERROR_DIVISION_BY_ZERO.len() {
+            let err = LiteralArea::decode(&[ERROR_DIVISION_BY_ZERO[..len].to_vec()], &mut atoms)
+                .err()
+                .unwrap_or_else(|| panic!("a payload truncated to {len} bytes must be rejected"));
+            assert!(matches!(err, BeamError::BadArg), "len {len}: {err:?}");
+        }
+        // The untruncated payload still decodes, so the sweep above is not vacuous.
+        let area = LiteralArea::decode(&[ERROR_DIVISION_BY_ZERO.to_vec()], &mut atoms).unwrap();
+        assert_eq!(area.len(), 1);
+    }
+
+    #[test]
+    fn a_zlib_compressed_litt_chunk_round_trips_into_terms() {
+        // The compressed `LitT` framing must reach the same decoded terms as the
+        // verbatim one: build the record table, compress it, parse it through
+        // `chunk::literal` and decode the payloads into a literal area.
+        let payload: Vec<u8> = vec![131, 104, 2, 119, 2, 111, 107, 97, 17]; // `{ok,17}`
+        let mut table = 1u32.to_be_bytes().to_vec();
+        table.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        table.extend_from_slice(&payload);
+        let mut chunk = (table.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(&beam_codec::compress::compress(&table, 6).unwrap());
+
+        let raw = crate::chunk::literal::parse(&chunk).unwrap();
+        assert_eq!(raw, vec![payload]);
+
+        let mut atoms = AtomTable::new();
+        let area = LiteralArea::decode(&raw, &mut atoms).unwrap();
+        let term = area.get(0).expect("the single literal decodes");
+        assert_eq!(tuple_arity(term).unwrap(), 2);
+        assert_eq!(tuple_element(term, 0).unwrap(), make_atom(atoms.intern("ok")));
+        assert_eq!(signed_value(tuple_element(term, 1).unwrap()), 17);
+    }
+    #[test]
     fn an_exhausted_decode_is_retried_on_a_larger_heap() {
         let mut atoms = AtomTable::new();
         // A 100-element list needs ~200 words; a one-word first arena forces the
