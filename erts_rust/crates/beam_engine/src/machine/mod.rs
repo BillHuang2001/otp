@@ -126,6 +126,19 @@ pub struct Machine {
     /// a host may consume the returned `Eterm` afterwards), so a reset must not free
     /// a payload a caller can still read.
     pub(crate) refc_binaries: Vec<beam_alloc::RefcBinary>,
+    /// A **reusable argument scratch buffer** for the rare wide BIF call.
+    ///
+    /// The interpreter marshals the arguments of a `gc_bif`/`bif`/`bif0`/
+    /// `call_ext*` through a fixed stack array for every arity up to its
+    /// `STACK_ARGS` arity bound — the common case, which therefore allocates
+    /// nothing. A **wider** call (a `call_ext` to a many-argument function) reuses
+    /// this buffer instead of minting a fresh `Vec` per call: the capacity is
+    /// retained across calls, so the steady state allocates nothing either.
+    ///
+    /// The buffer is always **left empty** by the dispatcher (only its capacity
+    /// survives), so it never keeps a term alive and [`Machine::reset`] has nothing
+    /// to clear.
+    pub(crate) args_scratch: Vec<Eterm>,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
@@ -174,6 +187,7 @@ impl Machine {
             max_register,
             literals: None,
             refc_binaries: Vec::new(),
+            args_scratch: Vec::new(),
             current_code: None,
             entry_call: None,
         };

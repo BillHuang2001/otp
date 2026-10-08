@@ -17,15 +17,16 @@ use crate::Step;
 use super::{resolve, LabelMap};
 
 /// The argument count up to which a BIF/`call_ext` marshals its arguments through
-/// a **stack array** instead of a heap `Vec`.
+/// a **stack array** instead of the machine's reusable scratch buffer.
 ///
 /// `gc_bif`/`bif`/`call_ext` used to build a fresh `Vec` (one heap allocation and
 /// free) for **every** BIF call, which a micro-benchmark showed to be the single
 /// largest per-instruction cost of the interpreter. arities in `0..=STACK_ARGS`
 /// (every arity the compiler actually emits for arithmetic/guard BIFs) now fill a
-/// fixed stack array; a larger arity still works through the `Vec` fallback, so
-/// the observable behaviour and the `ctx.call_bif(.., &[Eterm])` signature are
-/// unchanged.
+/// fixed stack array — no `Vec` is even constructed, let alone allocated — and a
+/// larger arity reuses [`Machine::args_scratch`], so **no** arity allocates per
+/// call. The observable behaviour and the `ctx.call_bif(.., &[Eterm])` signature
+/// are unchanged.
 pub(crate) const STACK_ARGS: usize = 8;
 
 /// A stack array sized for the common BIF/`call_ext` arities ([`STACK_ARGS`]).
@@ -61,21 +62,33 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Step> {
         let (module_name, function_name, arity) = labels.import_target(module, bif)?;
-        let mut buf = EMPTY_ARGS;
-        let mut heap: Vec<Eterm> = Vec::new();
-        let arg_terms: &[Eterm] = if args.len() <= STACK_ARGS {
+        // The common arities marshal through a **stack array** (no `Vec`, no heap
+        // block); only a wider call touches the machine's reusable scratch buffer,
+        // and that one allocates nothing after the first such call.
+        let bif_result: Result<Eterm> = if args.len() <= STACK_ARGS {
+            let mut buf = EMPTY_ARGS;
             for (slot, arg) in buf.iter_mut().zip(args) {
                 *slot = read_operand(self, ctx, arg)?;
             }
-            &buf[..args.len()]
+            ctx.call_bif(module_name, function_name, arity, &buf[..args.len()])
         } else {
-            heap.reserve_exact(args.len());
-            for arg in args {
-                heap.push(read_operand(self, ctx, arg)?);
-            }
-            &heap
+            // `?` propagates a *marshalling* error (a bad operand) as the typed error
+            // the instruction already returned — never as a guard failure or a raise.
+            self.dispatch_wide(
+                module_name,
+                function_name,
+                arity,
+                args.len(),
+                ctx,
+                |machine, ctx, scratch| {
+                    for arg in args {
+                        scratch.push(read_operand(machine, ctx, arg)?);
+                    }
+                    Ok(())
+                },
+            )?
         };
-        match ctx.call_bif(module_name, function_name, arity, arg_terms) {
+        match bif_result {
             Ok(value) => {
                 write_operand(self, dst, value)?;
                 Ok(Step::Next)
@@ -92,17 +105,52 @@ impl Machine {
         }
     }
 
+    /// Marshal a **wide** argument list (more than [`STACK_ARGS`] arguments) into
+    /// the machine's reusable scratch buffer and dispatch it.
+    ///
+    /// The buffer is taken out of the machine (so the operand reader can borrow the
+    /// machine immutably while the terms are pushed), cleared, filled and given
+    /// back **empty** — only its capacity survives, which is exactly the point: a
+    /// call of any arity allocates nothing once the buffer has grown to fit it.
+    ///
+    /// The return shape mirrors the stack-array path exactly: the **outer**
+    /// [`Result`] is the *marshalling* outcome (a bad operand, propagated by the
+    /// caller's `?` and never folded into a guard/raise decision) and the **inner**
+    /// [`Result`] is the BIF's own outcome.
+    fn dispatch_wide(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        len: usize,
+        ctx: &mut dyn ExecutionContext,
+        fill: impl FnOnce(&mut Machine, &mut dyn ExecutionContext, &mut Vec<Eterm>) -> Result<()>,
+    ) -> Result<Result<Eterm>> {
+        let mut scratch = std::mem::take(&mut self.args_scratch);
+        scratch.clear();
+        scratch.reserve(len);
+        let marshalled = fill(self, &mut *ctx, &mut scratch);
+        let outcome = match marshalled {
+            Ok(()) => Ok(ctx.call_bif(module, function, arity, &scratch)),
+            Err(e) => Err(e),
+        };
+        // Give the (now empty) buffer back so the next wide call reuses it.
+        scratch.clear();
+        self.args_scratch = scratch;
+        outcome
+    }
+
     /// Call an imported BIF with the `arity` register arguments `x(0..arity)`.
     ///
     /// Like [`Machine::exec_bif`] the arguments are marshalled through a stack
-    /// array for the common arities and a `Vec` only beyond it, so a `call_ext`
-    /// pays no heap allocation in the common case, and the import target comes from
-    /// the same per-run cache ([`LabelMap::import_target`], `labels`). A
-    /// marshalling error (a bad import or an out-of-range register) propagates as
-    /// the typed error the instruction already returned; the BIF's own result is
-    /// handed back for the caller's raise/fail decision.
+    /// array for the common arities and through the machine's reusable scratch
+    /// buffer beyond it, so a `call_ext` pays no heap allocation in either case;
+    /// the import target comes from the same per-run cache
+    /// ([`LabelMap::import_target`], `labels`). A marshalling error (a bad import or
+    /// an out-of-range register) is handed back as an `Err` like a BIF failure —
+    /// which the caller raises, exactly as before this seam.
     pub(super) fn call_import(
-        &self,
+        &mut self,
         module: &Module,
         labels: &LabelMap,
         target: ImportRef,
@@ -124,11 +172,22 @@ impl Machine {
                 &buf[..arity as usize],
             )
         } else {
-            let mut buf = Vec::with_capacity(arity as usize);
-            for i in 0..arity {
-                buf.push(self.x(i).ok_or_else(|| error::bad_register(i))?);
-            }
-            ctx.call_bif(module_name, function_name, bif_arity, &buf)
+            // A marshalling error and a BIF failure are the same `Err` to this
+            // function's callers (both are raised), so the two are flattened.
+            self.dispatch_wide(
+                module_name,
+                function_name,
+                bif_arity,
+                arity as usize,
+                ctx,
+                |machine, _ctx, scratch| {
+                    for i in 0..arity {
+                        scratch.push(machine.x(i).ok_or_else(|| error::bad_register(i))?);
+                    }
+                    Ok(())
+                },
+            )
+            .and_then(|result| result)
         }
     }
 
