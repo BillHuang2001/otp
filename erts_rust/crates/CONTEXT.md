@@ -206,11 +206,15 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `../tools/bench/` → benchmark driver for external targets + system-ERTS baseline (sibling — read-only, escalate writes to `..`)
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
 
-## Status (Milestone 1)
-- **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
-  erts_rust/Cargo.toml --workspace` is warning-free. `cargo test --manifest-path
-  erts_rust/Cargo.toml --workspace --no-fail-fast` is fully green (4669 tests passing, 0 failures,
-  re-measured at this node's HEAD); `-p beam_loader -p beam_engine` alone is 1098 passed / 0 failed.
+## Status
+- **All 15 crates architected, implemented and tested.** `scripts/cargo.sh build --manifest-path
+  erts_rust/Cargo.toml --workspace --all-targets` is warning-free (one pre-existing `unused import:
+  Mailbox` warning in `beam_rt`'s `tests/trace.rs` is being fixed separately). `scripts/cargo.sh test
+  --manifest-path erts_rust/Cargo.toml --workspace --no-fail-fast` reports **5762 passed / 3 failed /
+  1 ignored**; the 3 failures are confined to `beam_rt` and stem from `beam_bifs` registering the full
+  declared `bif.tab` surface (556 keys; registry 637), which shadows `beam_rt`'s curated
+  `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` list — a `beam_rt` fix is in flight and 0 failures are expected
+  once it lands.
 - **Real-module LOAD coverage is complete for the ENTIRE installed OTP:** `beam_loader`'s
   `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` discover the lib root generically
   (`code:lib_dir()`, no hardcoded app names) and assert that **all 1366 `.beam` across 34 application
