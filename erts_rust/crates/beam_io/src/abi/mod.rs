@@ -15,8 +15,10 @@
 //! * [`host`] — [`PortHost`], the one runtime service this crate cannot supply (atom interning, so
 //!   that a term built by a driver lands in the *runtime's* atom table), and [`AbiHost`], the
 //!   [`DriverHost`](beam_abi::driver::host::DriverHost) implementation that owns the port's
-//!   persistent C-ABI state (the `driver_select` registration map, the `driver_set_timer` deadline
-//!   and the `driver_async` job set) and reaches the live port through the
+//!   persistent C-ABI state (the `driver_select` registration map — including the two
+//!   `ERL_DRV_USE` release bits `driver_select`'s `mode` may carry, and the queue of
+//!   `stop_select` callbacks a released selection still owes — the `driver_set_timer` deadline and
+//!   the `driver_async` job set) and reaches the live port through the
 //!   [`DriverContext`](crate::driver::DriverContext) installed for the duration of one callback.
 //! * [`job`] — [`AsyncJobs`], the `driver_async` bookkeeping (a bounded, process-global worker
 //!   pool shared by every port, a queue position per job, and the per-port completion channel
@@ -26,8 +28,9 @@
 //! * [`port`] — [`DriverPort`], the adapter that implements [`Driver`](crate::driver::Driver) over a
 //!   loaded [`DriverLibrary`](beam_abi::driver::loader::DriverLibrary): it maps `start`/`output`/
 //!   `ready_input`/`ready_output`/`timeout`/`control`/`stop` onto the driver's callbacks, installs
-//!   the port context around each call, and forwards the driver's own `driver_*` calls back into
-//!   [`AbiHost`].
+//!   the port context around each call, forwards the driver's own `driver_*` calls back into
+//!   [`AbiHost`], and runs the `stop_select` release callback of an `ERL_DRV_USE` selection — on
+//!   the de-selecting `driver_select`, at port teardown (`stop`) and on `Drop`.
 //! * [`table`] — [`DriverTable`], the **process-global** driver registry (the C's `driver_list`)
 //!   plus its port-creation service. It is where the [`AbiHost`] forwards the four `beam_abi`
 //!   `ErlDrvApi` slots that act on structure outside one port — `add_driver_entry`,
