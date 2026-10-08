@@ -1,0 +1,70 @@
+cross-runtime compare m4-bench-full-runtimes-all.json — 9 workload(s), 41 numeric row(s)
+workload           metric                   unit               sys           rust          delta      delta%  speedup
+--------------------------------------------------------------------------------------------------------------------
+baseline           compute_loop_ms          ms            204.5455       198.5325        -6.0130      -2.94%   1.0303
+baseline           compute_ops_per_sec      ops/s     4888888.7442   5036959.7043   +148070.9601      +3.03%   0.9706
+baseline           startup_ms               ms            118.9300       147.8224       +28.8924     +24.29%   0.8045
+baseline           vm_memory_total_bytes    bytes    36227736.0000    801294.0000 -35426442.0000     -97.79%  45.2115
+baseline           peak_memory_bytes        bytes   134799360.0000  35008512.0000 -99790848.0000     -74.03%   3.8505
+cowboy             -                        -                    -              - note=rust:skipped(runtime-unsupported)
+cowboy             build_ms                 ms          40261.2825              - note=only-sys
+cowboy             errors                   count           0.0000              - note=only-sys
+cowboy             latency_ms               ms              0.0685              - note=only-sys
+cowboy             requests                 count     1120867.0000              - note=only-sys
+cowboy             requests_per_sec         req/s      224103.0605              - note=only-sys
+cowboy             peak_memory_bytes        bytes   173789184.0000              - note=only-sys
+elixir_compiler    -                        -                    -              - note=rust:skipped(runtime-unsupported)
+elixir_compiler    compiler_startup_ms      ms            288.6683              - note=only-sys
+elixir_compiler    files_attempted          files         105.0000              - note=only-sys
+elixir_compiler    files_compiled           files         223.0000              - note=only-sys
+elixir_compiler    files_per_sec            files/s         4.8644              - note=only-sys
+elixir_compiler    loc_per_sec              loc/s        2442.3036              - note=only-sys
+elixir_compiler    wall_ms                  ms          45843.6043              - note=only-sys
+elixir_compiler    peak_memory_bytes        bytes   205041664.0000              - note=only-sys
+emqx               -                        -                    -              - note=sys:skipped(not-a-rebar3-project), rust:skipped(runtime-unsupported)
+erlc_compiler      -                        -                    -              - note=rust:skipped(runtime-unsupported)
+erlc_compiler      files_compiled           files          60.0000              - note=only-sys
+erlc_compiler      files_per_sec            files/s         9.5280              - note=only-sys
+erlc_compiler      loc_per_sec              loc/s        7384.6722              - note=only-sys
+erlc_compiler      wall_ms                  ms           6297.2328              - note=only-sys
+erlc_compiler      peak_memory_bytes        bytes   134451200.0000              - note=only-sys
+foreign            case_bstr_capitalize_token_ns_per_call ns            318.8297     22968.5696    +22649.7399   +7104.02%   0.0139
+foreign            case_bstr_capitalize_token_peak_rss_bytes bytes    69744640.0000 109614694.4000 +39870054.4000     +57.17%   0.6363
+foreign            case_bstr_capitalize_token_startup_ms ms            141.4414       145.7131        +4.2717      +3.02%   0.9707
+foreign            case_bstr_capitalize_token_wall_ms ms            619.6859       490.2416      -129.4443     -20.89%   1.2640
+foreign            case_bstr_to_lower_ns_per_call ns            350.3885     18845.9243    +18495.5358   +5278.58%   0.0186
+foreign            case_bstr_to_lower_peak_rss_bytes bytes    69704089.6000  99726131.2000 +30022041.6000     +43.07%   0.6990
+foreign            case_bstr_to_lower_startup_ms ms            131.3311       157.6186       +26.2875     +20.02%   0.8332
+foreign            case_bstr_to_lower_wall_ms ms            656.9139       534.5371      -122.3768     -18.63%   1.2289
+foreign            case_emqx_base62_decode_ns_per_call ns            305.2872     18973.6109    +18668.3236   +6115.00%   0.0161
+foreign            case_emqx_base62_decode_peak_rss_bytes bytes    69991628.8000  88714444.8000 +18722816.0000     +26.75%   0.7890
+foreign            case_emqx_base62_decode_startup_ms ms            137.5697       147.7007       +10.1311      +7.36%   0.9314
+foreign            case_emqx_base62_decode_wall_ms ms           1053.4314       432.3049      -621.1265     -58.96%   2.4368
+foreign            case_emqx_base62_encode_ns_per_call ns            211.9837     12471.2964    +12259.3126   +5783.14%   0.0170
+foreign            case_emqx_base62_encode_peak_rss_bytes bytes    69676646.4000  78734540.8000  +9057894.4000     +13.00%   0.8850
+foreign            case_emqx_base62_encode_startup_ms ms            134.3776       151.4607       +17.0831     +12.71%   0.8872
+foreign            case_emqx_base62_encode_wall_ms ms            770.3289       463.2431      -307.0857     -39.86%   1.6629
+foreign            peak_memory_bytes        bytes    71446528.0000 109768704.0000 +38322176.0000     +53.64%   0.6509
+khepri             -                        -                    -              - note=rust:skipped(runtime-unsupported)
+khepri             wall_ms                  ms          76503.1413              - note=only-sys
+khepri             peak_memory_bytes        bytes   352411648.0000              - note=only-sys
+plb                -                        -                    -              - note=sys:skipped(dotnet-absent), rust:skipped(runtime-unsupported)
+slice              case_add_peak_rss_bytes  bytes    69433098.2400  19057868.8000 -50375229.4400     -72.55%   3.6433
+slice              case_add_wall_ms         ms            135.7870       147.5790       +11.7920      +8.68%   0.9201
+slice              case_base64_encode_size_peak_rss_bytes bytes    69743247.3600  20933509.1200 -48809738.2400     -69.98%   3.3317
+slice              case_base64_encode_size_wall_ms ms            134.7071       149.7343       +15.0271     +11.16%   0.8996
+slice              case_calendar_last_day_peak_rss_bytes bytes    69662638.0800  20064174.0800 -49598464.0000     -71.20%   3.4720
+slice              case_calendar_last_day_wall_ms ms            137.7259       151.2925       +13.5666      +9.85%   0.9103
+slice              case_fib_peak_rss_bytes  bytes    69520588.8000  19012812.8000 -50507776.0000     -72.65%   3.6565
+slice              case_fib_wall_ms         ms            134.4660       145.7437       +11.2777      +8.39%   0.9226
+slice              case_gb_trees_size_peak_rss_bytes bytes    69225021.4400  19818414.0800 -49406607.3600     -71.37%   3.4930
+slice              case_gb_trees_size_wall_ms ms            131.7825       154.3049       +22.5224     +17.09%   0.8540
+slice              case_ordsets_from_size_peak_rss_bytes bytes    70025216.0000  19322798.0800 -50702417.9200     -72.41%   3.6240
+slice              case_ordsets_from_size_wall_ms ms            134.6306       149.8090       +15.1783     +11.27%   0.8987
+slice              case_pick_peak_rss_bytes bytes    69697372.1600  19131432.9600 -50565939.2000     -72.55%   3.6431
+slice              case_pick_wall_ms        ms            132.3806       147.5397       +15.1591     +11.45%   0.8973
+slice              case_queue_from_size_peak_rss_bytes bytes    69546639.3600  23638835.2000 -45907804.1600     -66.01%   2.9421
+slice              case_queue_from_size_wall_ms ms            133.1969       156.4185       +23.2216     +17.43%   0.8515
+slice              case_string_str_length_peak_rss_bytes bytes    69537464.3200  38734069.7600 -30803394.5600     -44.30%   1.7953
+slice              case_string_str_length_wall_ms ms            134.2792       165.0786       +30.7994     +22.94%   0.8134
+slice              peak_memory_bytes        bytes    72065024.0000  39096320.0000 -32968704.0000     -45.75%   1.8433

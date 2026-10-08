@@ -2,7 +2,7 @@
   "schema_version": 1,
   "tool": "bench",
   "tool_version": "0.1.0",
-  "generated_at_unix_ms": 1791462791464,
+  "generated_at_unix_ms": 1791481447713,
   "profile": "full",
   "runtimes": [
     {
@@ -18,24 +18,24 @@
       "workload": "khepri",
       "runtime": "sys",
       "category": "gc",
-      "description": "Khepri test suite (rebar3 eunit) \u2014 GC/data-structure bound",
+      "description": "Khepri test suite (rebar3 eunit) — GC/data-structure bound",
       "status": "ok",
       "reason": null,
       "metrics": [
         {
           "name": "wall_ms",
           "unit": "ms",
-          "value": 79625.801099
+          "value": 82155.651045
         }
       ],
-      "peak_memory_bytes": 378589184,
+      "peak_memory_bytes": 372711424,
       "notes": []
     },
     {
       "workload": "emqx",
       "runtime": "sys",
       "category": "messaging",
-      "description": "EMQX broker build (rebar3 compile) \u2014 messaging/copy bound",
+      "description": "EMQX broker build (rebar3 compile) — messaging/copy bound",
       "status": "skipped",
       "reason": "not-a-rebar3-project",
       "metrics": [],
