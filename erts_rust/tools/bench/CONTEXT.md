@@ -107,7 +107,9 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
   does not implement `erlang:memory/0,1` (it reports a bare `beam_rt: error undef`, exit 1), so its memory
   probe records **no** metric and the explicit note `vm_memory_total_bytes: not-run (unsupported:
   erlang:memory/1)`; the compute loop, the startup summary and every other metric are still produced. A
-  genuine (non-capability-gap) probe failure is surfaced verbatim, never fabricated.
+  genuine (non-capability-gap) probe failure is surfaced verbatim, never fabricated. Note: the loop is
+  dominated by the natively-served `lists:seq/2`+`lists:sum/1`, so a near-parity rust figure reflects the
+  native floor, **not** interpreter throughput (that is `foreign`).
 - `erlc_compiler`: compiles a bounded deterministic slice (first 30 `.erl` of each corpus) of the in-repo
   OTP `lib/stdlib/src` **and** the Elixir checkout's `lib/elixir/src` (both read-only) with `erlc` into a
   `ScratchDir` ⇒ files/sec, LOC/sec, wall time, peak memory. Missing/failing Elixir corpus falls back to
