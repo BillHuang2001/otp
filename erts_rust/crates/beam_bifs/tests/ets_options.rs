@@ -12,12 +12,11 @@
 //! (`.with_tables(&mut tables)`), so every call goes through a small helper over
 //! `&mut BifContext` ([`ets_new`]/[`ets_new_ok`]/[`ets_info1`]/[`ets_info2`]).
 //!
-//! # One known divergence
-//!
-//! `ets:info(Tab, write_concurrency)` and `ets:info(Tab, decentralized_counters)`
-//! are **KNOWN M1 GAPS** — see [`info_write_concurrency_is_a_known_m1_gap`],
-//! which quotes the oracle and pins what this runtime can observe today.
-
+//! Every option's *effective* `ets:info/2` rendering is pinned too, including the
+//! two fields `beam_ets::TableInfo` cannot express (`write_concurrency`,
+//! `decentralized_counters` — see
+//! [`info_reports_the_effective_write_concurrency_profile`]) and the bare
+//! `set`/`protected` no-op rule (see [`the_bare_set_and_protected_atoms_are_no_ops`]).
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, TableRegistry};
 use beam_common::BeamError;
@@ -443,8 +442,9 @@ fn rejects_the_documented_bad_option_forms() {
 ///
 /// (The bare `set` / `protected` atoms are a *separate* rule — the C treats both
 /// as no-ops, `../../erts/emulator/beam/erl_db.c:2710`, so `[ordered_set,set]`
-/// stays `ordered_set` — and the `{write_concurrency,_}` last-wins is not
-/// observable through `ets:info/2` here; see the known-gap test below.)
+/// stays `ordered_set` — pinned by [`the_bare_set_and_protected_atoms_are_no_ops`];
+/// the `{write_concurrency,_}` last-wins is pinned by
+/// [`info_reports_the_effective_write_concurrency_profile`].)
 #[test]
 fn repeated_options_are_accepted_and_the_last_one_wins() {
     let bifs = default_registry();
@@ -498,8 +498,74 @@ fn repeated_options_are_accepted_and_the_last_one_wins() {
     }
 }
 
-// ------------------------------------------------------------- info: the fields
+// ----------------------------------- the bare set/protected no-op rule
 
+/// The oracle:
+/// ```text
+/// 1> T = ets:new(t,[ordered_set,set]), ets:info(T,type).
+/// ordered_set
+/// 2> T = ets:new(t,[bag,set]), ets:info(T,type).
+/// bag
+/// 3> T = ets:new(t,[duplicate_bag,set]), ets:info(T,type).
+/// duplicate_bag
+/// 4> T = ets:new(t,[private,protected]), ets:info(T,protection).
+/// private
+/// 5> T = ets:new(t,[public,protected]), ets:info(T,protection).
+/// public
+/// 6> T = ets:new(t,[set]), ets:info(T,type).          ets:new(t,[protected]), ets:info(T,protection).
+/// set                                                 protected
+/// ```
+///
+/// The bare `set` and `protected` atoms are **no-ops**: the C `ets_new_2`'s
+/// `else if (val == am_set || val == am_protected) ;`
+/// (`../../erts/emulator/beam/erl_db.c:2710`) swallows both, so neither ever
+/// overrides an earlier kind/access — unlike every other bare atom, which follows
+/// the last-wins rule pinned by
+/// [`repeated_options_are_accepted_and_the_last_one_wins`]. `set`/`protected` are
+/// also the defaults, so a lone occurrence still yields a `set`/`protected` table
+/// (the last two probes).
+#[test]
+fn the_bare_set_and_protected_atoms_are_no_ops() {
+    let bifs = default_registry();
+    let (mut heap, atoms, mut tables) = parts();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+
+    let set = bare(&mut ctx, "set");
+    let ordered_set = bare(&mut ctx, "ordered_set");
+    let bag = bare(&mut ctx, "bag");
+    let duplicate_bag = bare(&mut ctx, "duplicate_bag");
+    let public = bare(&mut ctx, "public");
+    let protected = bare(&mut ctx, "protected");
+    let private = bare(&mut ctx, "private");
+
+    // (options, type, protection)
+    let cases: Vec<(Vec<Eterm>, &str, &str)> = vec![
+        (vec![ordered_set, set], "ordered_set", "protected"),
+        (vec![bag, set], "bag", "protected"),
+        (vec![duplicate_bag, set], "duplicate_bag", "protected"),
+        (vec![private, protected], "set", "private"),
+        (vec![public, protected], "set", "public"),
+        // A lone `set`/`protected` is still the default.
+        (vec![set], "set", "protected"),
+        (vec![protected], "set", "protected"),
+    ];
+    for (options, kind, protection) in &cases {
+        let handle = ets_new_ok(&bifs, &mut ctx, "t", options);
+        assert_eq!(
+            info_atom(&bifs, &mut ctx, handle, "type"),
+            *kind,
+            "{options:?} type"
+        );
+        assert_eq!(
+            info_atom(&bifs, &mut ctx, handle, "protection"),
+            *protection,
+            "{options:?} protection"
+        );
+    }
+}
+
+// ------------------------------------------------------------- info: the fields
 /// The oracle — the probe prints `{type, keypos, compressed, read_concurrency}`
 /// (with `ets:info(T, type | keypos | compressed | read_concurrency)`):
 /// ```text
@@ -605,114 +671,235 @@ fn info_reports_the_effective_type_keypos_compression_and_read_concurrency() {
     assert_eq!(info_atom(&bifs, &mut ctx, plain, "name"), "t");
 }
 
-// ---------------------------------------------------- info: the known M1 gap
+// ------------------------------------------------- info: the profile fields
 
-/// `ets:info(Tab, write_concurrency)` and `ets:info(Tab, decentralized_counters)`
-/// are **KNOWN M1 GAPS**.
-///
-/// The oracle reports the *effective* values the `ets:new/2` options set — probed:
+/// The rendered `{debug_hash_fixed_number_of_locks, L}` term for a normalized lock
+/// count `L` — the `ets:info(T, write_concurrency)` shape of the hidden
+/// `ets:new/2` option.
+fn locks_term(ctx: &mut BifContext<'_>, n: i64) -> Eterm {
+    let key = ctx
+        .atom("debug_hash_fixed_number_of_locks")
+        .expect("seeded");
+    let value = ctx.int(n).expect("fits");
+    ctx.tuple(&[key, value]).expect("fits")
+}
+
+/// The oracle — `{write_concurrency, decentralized_counters}` as
+/// `ets:info(T, write_concurrency)` / `ets:info(T, decentralized_counters)` report
+/// them, probed live against the system `erl` (OTP 29.1.1 / erts-17.1):
 /// ```text
-/// [{write_concurrency,false}]                              -> {false,false}
-/// [{write_concurrency,true}]                               -> {true,false}
-/// [{write_concurrency,auto}]                               -> {auto,true}
-/// [{write_concurrency,{debug_hash_fixed_number_of_locks,1}}]     -> {{debug_hash_fixed_number_of_locks,64},true}
-/// [{write_concurrency,{debug_hash_fixed_number_of_locks,64}}]    -> {{debug_hash_fixed_number_of_locks,64},true}
-/// [{write_concurrency,{debug_hash_fixed_number_of_locks,100}}]   -> {{debug_hash_fixed_number_of_locks,64},true}
-/// [{write_concurrency,{debug_hash_fixed_number_of_locks,32768}}] -> {{debug_hash_fixed_number_of_locks,32768},true}
-/// [{write_concurrency,true},private]                       -> {false,false}   % private tables are never fine-locked
-/// [ordered_set]                                            -> {false,false}
-/// [ordered_set,{write_concurrency,true}]                   -> {true,true}
-/// [{write_concurrency,true},{decentralized_counters,true}]  -> {true,true}
-/// [{write_concurrency,true},{decentralized_counters,false}] -> {true,false}
-/// [{decentralized_counters,true}]                          -> {false,false}   % no fine locks => none
+/// [set]                                                          -> {false,false}
+/// [set,{write_concurrency,true}]                                 -> {true,false}
+/// [set,{write_concurrency,false}]                                -> {false,false}
+/// [set,{write_concurrency,auto}]                                 -> {auto,true}
+/// [{write_concurrency,{debug_hash_fixed_number_of_locks,1}}]     -> {{…,64},true}
+/// [{write_concurrency,{debug_hash_fixed_number_of_locks,4}}]     -> {{…,64},true}
+/// [{write_concurrency,{debug_hash_fixed_number_of_locks,63}}]    -> {{…,64},true}
+/// [{write_concurrency,{debug_hash_fixed_number_of_locks,65}}]    -> {{…,64},true}
+/// [{write_concurrency,{debug_hash_fixed_number_of_locks,100}}]   -> {{…,64},true}
+/// [{write_concurrency,{debug_hash_fixed_number_of_locks,128}}]   -> {{…,128},true}
+/// [{write_concurrency,{debug_hash_fixed_number_of_locks,32767}}] -> {{…,16384},true}
+/// [{write_concurrency,{debug_hash_fixed_number_of_locks,32768}}] -> {{…,32768},true}
+/// [ordered_set,{write_concurrency,true}]                         -> {true,true}
+/// [ordered_set]                                                  -> {false,false}
+/// [bag,{write_concurrency,true}]                                 -> {true,false}
+/// [set,{read_concurrency,true}]                                  -> {false,false}   % read_concurrency = true
+/// [set,{decentralized_counters,true}]                            -> {false,false}
+/// [ordered_set,{decentralized_counters,true}]                    -> {false,false}
+/// [{write_concurrency,true},{decentralized_counters,true}]       -> {true,true}
+/// [{decentralized_counters,true},{write_concurrency,true}]       -> {true,true}
+/// [{write_concurrency,auto},{decentralized_counters,false}]      -> {auto,false}
+/// [set,{write_concurrency,true},private]                         -> {false,false}
 /// ```
-/// (`write_concurrency` is the raw option `db_hash_create` normalizes: the hidden
-/// lock count rounds **down** to a power of two and clamps up to `64`;
-/// `decentralized_counters` is the CATREE rule — true only for a fine-locked table,
-/// which is why the bare `{decentralized_counters,true}` alone is `false`.)
 ///
-/// The `{write_concurrency,false}` / default forms are the only ones whose oracle
-/// value is observable through this runtime's `ets:info/2`: the creation-time
-/// profile the `ets:new/2` parser computes is dropped when the `info` call takes
-/// the table out of the registry (`TableRegistry::remove` clears it and the
-/// restore does not put it back), so `info` always falls back to the `TableInfo`
-/// fields — and the parser never records `write_concurrency` on the table itself —
-/// so every form reports `false`. This test pins that gap; it must be updated when
-/// the profile survives the take/restore round-trip.
+/// `write_concurrency` is what `db_hash_create` derives from the raw option: the
+/// hidden lock count rounds **down** to a power of two and clamps up to `64`
+/// (`NLOCKS_WITH_ITEM_COUNTERS`). `decentralized_counters` is the CATREE rule —
+/// true only for a **fine-locked** table — so a bare `{decentralized_counters,true}`
+/// is not enough (there are no locks to decentralize) and a `private` table is
+/// never fine-locked at all.
+///
+/// These two fields are the ones `beam_ets::TableInfo` cannot express: their
+/// effective values are computed by the `ets:new/2` option parser
+/// (`TableRegistry::profiles`) and must **survive the take/restore round trip**
+/// every table-taking BIF performs, so each case below warms the table up with an
+/// `insert/2` + `lookup/2` before asking for `info` (a later `ets:delete/1` is the
+/// only permanent removal, and it drops the profile).
 #[test]
-fn info_write_concurrency_is_a_known_m1_gap() {
+fn info_reports_the_effective_write_concurrency_profile() {
     let bifs = default_registry();
     let (mut heap, atoms, mut tables) = parts();
     let mut ctx =
         BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
 
-    let one = ctx.int(1).expect("fits");
-    let sixty_four = ctx.int(64).expect("fits");
-    let hundred = ctx.int(100).expect("fits");
-    let n32k = ctx.int(32_768).expect("fits");
     let tf = ctx.atom("true").expect("seeded");
     let ff = ctx.atom("false").expect("seeded");
     let auto = ctx.atom("auto").expect("seeded");
+    let set = bare(&mut ctx, "set");
     let ordered_set = bare(&mut ctx, "ordered_set");
+    let bag = bare(&mut ctx, "bag");
     let private = bare(&mut ctx, "private");
 
     let wc_true = pair(&mut ctx, "write_concurrency", tf);
     let wc_false = pair(&mut ctx, "write_concurrency", ff);
     let wc_auto = pair(&mut ctx, "write_concurrency", auto);
+    let rc_true = pair(&mut ctx, "read_concurrency", tf);
     let dc_true = pair(&mut ctx, "decentralized_counters", tf);
     let dc_false = pair(&mut ctx, "decentralized_counters", ff);
+
     let mut locks = Vec::new();
-    for n in [one, sixty_four, hundred, n32k] {
-        let inner = pair(&mut ctx, "debug_hash_fixed_number_of_locks", n);
+    for n in [1i64, 4, 63, 65, 100, 128, 32_767, 32_768] {
+        let value = ctx.int(n).expect("fits");
+        let inner = pair(&mut ctx, "debug_hash_fixed_number_of_locks", value);
         locks.push(pair(&mut ctx, "write_concurrency", inner));
     }
+    let l64 = locks_term(&mut ctx, 64);
+    let l128 = locks_term(&mut ctx, 128);
+    let l16384 = locks_term(&mut ctx, 16_384);
+    let l32768 = locks_term(&mut ctx, 32_768);
 
-    // (label, options, oracle value for `write_concurrency`)
-    let cases: Vec<(&str, Vec<Eterm>, &str)> = vec![
-        ("default", vec![], "false (agrees)"),
-        ("[{write_concurrency,false}]", vec![wc_false], "false (agrees)"),
-        ("[{write_concurrency,true}]", vec![wc_true], "true"),
-        ("[{write_concurrency,auto}]", vec![wc_auto], "auto"),
-        ("[{locks,1}]", vec![locks[0]], "{locks,64}"),
-        ("[{locks,64}]", vec![locks[1]], "{locks,64}"),
-        ("[{locks,100}]", vec![locks[2]], "{locks,64}"),
-        ("[{locks,32768}]", vec![locks[3]], "{locks,32768}"),
-        ("[{write_concurrency,true},private]", vec![wc_true, private], "false (agrees)"),
-        ("[ordered_set]", vec![ordered_set], "false (agrees)"),
-        ("[ordered_set,{write_concurrency,true}]", vec![ordered_set, wc_true], "true"),
+    // (label, options, expected write_concurrency, expected decentralized_counters)
+    let cases: Vec<(&str, Vec<Eterm>, Eterm, bool)> = vec![
+        ("[set]", vec![set], ff, false),
+        ("[set,{write_concurrency,true}]", vec![set, wc_true], tf, false),
+        ("[set,{write_concurrency,false}]", vec![set, wc_false], ff, false),
+        (
+            "[set,{write_concurrency,auto}]",
+            vec![set, wc_auto],
+            auto,
+            true,
+        ),
+        ("[{locks,1}]", vec![locks[0]], l64, true),
+        ("[{locks,4}]", vec![locks[1]], l64, true),
+        ("[{locks,63}]", vec![locks[2]], l64, true),
+        ("[{locks,65}]", vec![locks[3]], l64, true),
+        ("[{locks,100}]", vec![locks[4]], l64, true),
+        ("[{locks,128}]", vec![locks[5]], l128, true),
+        ("[{locks,32767}]", vec![locks[6]], l16384, true),
+        ("[{locks,32768}]", vec![locks[7]], l32768, true),
+        (
+            "[ordered_set,{write_concurrency,true}]",
+            vec![ordered_set, wc_true],
+            tf,
+            true,
+        ),
+        ("[ordered_set]", vec![ordered_set], ff, false),
+        ("[bag,{write_concurrency,true}]", vec![bag, wc_true], tf, false),
+        ("[set,{read_concurrency,true}]", vec![set, rc_true], ff, false),
+        (
+            "[set,{decentralized_counters,true}]",
+            vec![set, dc_true],
+            ff,
+            false,
+        ),
+        (
+            "[ordered_set,{decentralized_counters,true}]",
+            vec![ordered_set, dc_true],
+            ff,
+            false,
+        ),
         (
             "[{write_concurrency,true},{decentralized_counters,true}]",
             vec![wc_true, dc_true],
-            "true",
+            tf,
+            true,
         ),
         (
-            "[{write_concurrency,true},{decentralized_counters,false}]",
-            vec![wc_true, dc_false],
-            "true",
+            "[{decentralized_counters,true},{write_concurrency,true}]",
+            vec![dc_true, wc_true],
+            tf,
+            true,
         ),
-        ("[{decentralized_counters,true}]", vec![dc_true], "false (agrees)"),
-        ("[{decentralized_counters,false}]", vec![dc_false], "false (agrees)"),
+        (
+            "[{write_concurrency,auto},{decentralized_counters,false}]",
+            vec![wc_auto, dc_false],
+            auto,
+            false,
+        ),
+        (
+            "[set,{write_concurrency,true},private]",
+            vec![set, wc_true, private],
+            ff,
+            false,
+        ),
     ];
-    for (label, options, oracle) in &cases {
+    for (label, options, expected_wc, expected_dc) in &cases {
         let handle = ets_new_ok(&bifs, &mut ctx, "t", options);
+        // Warm the table up through two table-taking BIFs before the `info`: the
+        // take/restore round trip must leave the creation-time profile in place.
+        let one = ctx.int(1).expect("fits");
+        let obj = ctx.tuple(&[one, one]).expect("fits");
+        bifs.call("ets", "insert", 2, &mut ctx, &[handle, obj])
+            .expect("insert");
+        bifs.call("ets", "lookup", 2, &mut ctx, &[handle, one])
+            .expect("lookup");
+
         let wc = ets_info2(&bifs, &mut ctx, handle, "write_concurrency").expect("info/2 wc");
         assert!(
-            is_false(&atoms, wc),
-            "{label} write_concurrency: oracle {oracle}, runtime {wc:?} \
-             (the option was accepted — this is the known profile-dropping gap)"
+            beam_term::compare::eq(wc, *expected_wc, &atoms),
+            "{label} write_concurrency: oracle {expected_wc:?}, runtime {wc:?}"
         );
-        // `decentralized_counters` is `false` for every form here too (its only
-        // true forms need a fine-locked table, which the fallback cannot see).
-        assert!(!info_bool(&bifs, &mut ctx, handle, "decentralized_counters"));
-        // The dangerous failure mode this pins away: a `badarg`/`unsupported`
-        // instead of the oracle's value. The option is a *valid* one.
-        assert!(
-            ets_info2(&bifs, &mut ctx, handle, "type").is_ok(),
-            "{label}: still a real table"
+        assert_eq!(
+            info_bool(&bifs, &mut ctx, handle, "decentralized_counters"),
+            *expected_dc,
+            "{label} decentralized_counters"
         );
     }
+
+    // `{read_concurrency, true}` is an independent flag: it turns
+    // `read_concurrency` on without making the table fine-locked.
+    let rc = ets_new_ok(&bifs, &mut ctx, "t", &[set, rc_true]);
+    assert!(info_bool(&bifs, &mut ctx, rc, "read_concurrency"));
+    assert!(!info_bool(&bifs, &mut ctx, rc, "write_concurrency"));
 }
 
+// --------------------------------------------- a deleted table leaves no profile
+
+/// The oracle:
+/// ```text
+/// 1> T = ets:new(t,[set,{write_concurrency,true}]), ets:info(T, write_concurrency).
+/// true
+/// 2> ets:delete(T).
+/// true
+/// 3> ets:info(T, write_concurrency).       % the tid's table is gone
+/// undefined
+/// ```
+///
+/// `ets:delete/1` is the only table-taking BIF that never restores its table, so
+/// it is the only one that drops the [`TableRegistry`] profile
+/// (`TableRegistry::forget_profile`): a deleted handle must leave nothing behind.
+#[test]
+fn a_deleted_table_leaves_no_profile_behind() {
+    let bifs = default_registry();
+    let (mut heap, atoms, mut tables) = parts();
+    let mut ctx =
+        BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut tables);
+
+    let tf = ctx.atom("true").expect("seeded");
+    let set = bare(&mut ctx, "set");
+    let wc_true = pair(&mut ctx, "write_concurrency", tf);
+
+    let handle = ets_new_ok(&bifs, &mut ctx, "t", &[set, wc_true]);
+    assert!(
+        info_bool(&bifs, &mut ctx, handle, "write_concurrency"),
+        "the profile is live before the delete"
+    );
+
+    let deleted = bifs
+        .call("ets", "delete", 1, &mut ctx, &[handle])
+        .expect("ets:delete/1");
+    assert!(is_true(&atoms, deleted), "delete/1 returns true");
+
+    // The handle no longer names a live table, so `ets:info/2` answers the bare
+    // atom `undefined` (the oracle) — never the stale profile.
+    let after = ets_info2(&bifs, &mut ctx, handle, "write_concurrency").expect("info/2");
+    assert!(
+        is_atom_named(&atoms, after, "undefined"),
+        "info of a deleted table: {after:?}"
+    );
+    let live = ctx.tables().expect("a registry is installed").len();
+    assert_eq!(live, 0, "the table is gone from the registry");
+}
 // ------------------------------------------------------------- return shape
 
 /// The oracle:

@@ -204,6 +204,14 @@ pub(super) struct ParsedOptions {
 /// has its own tag), a `{heir, none, Data}`, a non-pid heir, a malformed tuple —
 /// is `badarg`.
 ///
+/// One exception to last-wins: the bare atoms `set` and `protected` are
+/// **no-ops**. The C's `else if (val == am_set || val == am_protected) ;`
+/// (`erl_db.c:2710`) swallows both, so neither ever overrides an earlier
+/// kind/access (verified: `[ordered_set,set]` stays `ordered_set`, `[bag,set]`
+/// stays `bag`, `[private,protected]` stays `private`, `[public,protected]` stays
+/// `public`). Since `set`/`protected` are the defaults, a lone `set`/`protected`
+/// still yields a `set`/`protected` table.
+///
 /// Two combinations are rejected **after** the loop, exactly as the C does:
 /// an `ordered_set` whose final `{write_concurrency, …}` form is the explicit
 /// lock-count one (`erl_db.c:2727-2732`).
@@ -221,7 +229,10 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
         if is_atom(elem) {
             match atoms.name(atom_val(elem)).ok_or_else(badarg)? {
                 "set" => {
-                    options.set_kind(TableKind::Set);
+                    // No-op: the C `else if (val == am_set || val == am_protected) ;`
+                    // (`erl_db.c:2710`) treats the bare `set` atom as nothing at
+                    // all, so it never overrides an earlier kind. `set` is already
+                    // the default, so a lone `set` still yields `set`.
                 }
                 "ordered_set" => {
                     dc_derived = true;
@@ -237,7 +248,10 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
                     options.set_access(Access::Public);
                 }
                 "protected" => {
-                    options.set_access(Access::Protected);
+                    // No-op, like `set`: the C's `;` arm covers `am_protected` too,
+                    // so a bare `protected` never overrides an earlier access
+                    // (verified: `[private,protected]` stays `private`). `protected`
+                    // is the default, so a lone `protected` still yields it.
                 }
                 "private" => {
                     options.set_access(Access::Private);
@@ -450,5 +464,122 @@ impl Gate {
             Gate::Read => table.check_read(owner),
             Gate::Write => table.check_write(owner),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_term::heap::Heap;
+    use beam_term::{make_atom, NIL};
+
+    /// A heap big enough for the option lists these tests build.
+    fn heap() -> Heap {
+        Heap::new(2048)
+    }
+
+    /// The names the parser tests use as option keys, kinds, accesses and values.
+    ///
+    /// The **first** name is the harmless sentinel at atom index `0` (the C reads
+    /// the option value's raw word, and `atom_val` of a small integer aliases index
+    /// `0`), so a real name must never live there.
+    fn atoms() -> AtomTable {
+        let mut table = AtomTable::new();
+        table.seed([
+            "sentinel",
+            "true",
+            "false",
+            "auto",
+            "set",
+            "ordered_set",
+            "bag",
+            "duplicate_bag",
+            "public",
+            "protected",
+            "private",
+            "named_table",
+            "compressed",
+            "write_concurrency",
+            "read_concurrency",
+            "decentralized_counters",
+            "debug_hash_fixed_number_of_locks",
+        ]);
+        table
+    }
+
+    /// The atom `name` as a term (it must be seeded).
+    fn atom(atoms: &AtomTable, name: &str) -> Eterm {
+        make_atom(atoms.lookup(name).expect("seeded"))
+    }
+
+    /// The list term `elems` (in order), built on `heap`.
+    fn list(heap: &mut Heap, elems: &[Eterm]) -> Eterm {
+        let mut acc = NIL;
+        for &elem in elems.iter().rev() {
+            acc = heap.cons(elem, acc).expect("fits");
+        }
+        acc
+    }
+
+    /// Parses `names` as an `ets:new/2` option list.
+    fn parse(atoms: &AtomTable, heap: &mut Heap, names: &[&str]) -> Result<ParsedOptions> {
+        let elems: Vec<Eterm> = names.iter().map(|name| atom(atoms, name)).collect();
+        let term = list(heap, &elems);
+        parse_options(atoms, term)
+    }
+
+    /// The bare atoms `set` and `protected` are **no-ops**: the C
+    /// `else if (val == am_set || val == am_protected) ;` (`erl_db.c:2710`) swallows
+    /// both, so neither ever overrides an earlier kind/access. Oracle (probed):
+    /// `[ordered_set,set]` ⇒ `ordered_set`, `[bag,set]` ⇒ `bag`,
+    /// `[private,protected]` ⇒ `private`, `[public,protected]` ⇒ `public`. Since
+    /// `set`/`protected` are the defaults, a lone occurrence still yields them.
+    #[test]
+    fn bare_set_and_protected_are_no_ops() {
+        let atoms = atoms();
+        let mut heap = heap();
+
+        for (names, kind) in [
+            (&["ordered_set", "set"][..], TableKind::OrderedSet),
+            (&["bag", "set"][..], TableKind::Bag),
+            (&["duplicate_bag", "set"][..], TableKind::DuplicateBag),
+        ] {
+            let parsed = parse(&atoms, &mut heap, names).expect("accepted");
+            assert_eq!(parsed.options.kind(), kind, "{names:?}");
+        }
+        for (names, access) in [
+            (&["private", "protected"][..], Access::Private),
+            (&["public", "protected"][..], Access::Public),
+        ] {
+            let parsed = parse(&atoms, &mut heap, names).expect("accepted");
+            assert_eq!(parsed.options.access(), access, "{names:?}");
+        }
+
+        // ...and a lone `set`/`protected` is still the default.
+        let lone_set = parse(&atoms, &mut heap, &["set"]).expect("accepted");
+        assert_eq!(lone_set.options.kind(), TableKind::Set);
+        let lone_protected = parse(&atoms, &mut heap, &["protected"]).expect("accepted");
+        assert_eq!(lone_protected.options.access(), Access::Protected);
+    }
+
+    /// The contrast to [`bare_set_and_protected_are_no_ops`]: every *other* bare
+    /// atom keeps following the last-wins rule, and a later kind/access still
+    /// overrides an earlier one (verified: `[ordered_set,bag]` ⇒ `bag`,
+    /// `[set,ordered_set]` ⇒ `ordered_set`, `[public,private]` ⇒ `private`).
+    #[test]
+    fn every_other_bare_atom_still_wins_last() {
+        let atoms = atoms();
+        let mut heap = heap();
+
+        for (names, kind) in [
+            (&["ordered_set", "bag"][..], TableKind::Bag),
+            (&["set", "ordered_set"][..], TableKind::OrderedSet),
+            (&["bag", "duplicate_bag"][..], TableKind::DuplicateBag),
+        ] {
+            let parsed = parse(&atoms, &mut heap, names).expect("accepted");
+            assert_eq!(parsed.options.kind(), kind, "{names:?}");
+        }
+        let parsed = parse(&atoms, &mut heap, &["public", "private"]).expect("accepted");
+        assert_eq!(parsed.options.access(), Access::Private);
     }
 }

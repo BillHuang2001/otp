@@ -99,15 +99,20 @@
 //!
 //! # Deliberately not implemented (see the crate `CONTEXT.md`)
 //!
-//! `ets:foldl/3`/`foldr/3` need the `FunCaller` seam and are not wired up here. The
-//! verbs that cannot be made oracle-faithful over the frozen [`Table`] API —
-//! `ets:rename/2` (needs a name setter), `ets:select_reverse/1,2,3` (needs a
-//! reverse scan) and the pid-coupled ownership verbs `ets:give_away/3` /
-//! `ets:setopts/2` — stay unregistered in the child module [`extra`], which
-//! documents each gap.
+//! The faithful verbs live in the child modules: `ets:safe_fixtable/2`,
+//! `ets:whereis/1`, `ets:update_element/4` and `ets:is_compiled_ms/1` in [`extra`],
+//! and the adopted `ets:all/0`, `ets:setopts/2`, `ets:give_away/3`,
+//! `ets:foldl/3` and `ets:foldr/3` in [`adopt`]. (`ets:foldl/3`/`foldr/3` apply the
+//! fun through the `FunCaller` seam, so a non-empty fold is the typed
+//! `unsupported_bif` gap until a host installs it.)
 //!
-//! The verbs that *are* faithful live there too: `ets:safe_fixtable/2`,
-//! `ets:whereis/1`, `ets:update_element/4` and `ets:is_compiled_ms/1`.
+//! The verbs that stay **unregistered** are the honest typed gaps documented in
+//! [`adopt`] and [`extra`], each with the exact `beam_ets` API that would close it:
+//! `ets:rename/2` (needs a name setter) and `ets:select_reverse/1,2,3` (needs a
+//! reverse scan), `ets:slot/2`, the `ets:first_lookup/1`/`last_lookup/1`/
+//! `next_lookup/2`/`prev_lookup/2` interior family, `ets:match_spec_run_r/3`, the
+//! underscore-internal C helpers, and the `ets:setopts/2` `{protection, _}`
+//! sub-option.
 
 use std::collections::HashMap;
 
@@ -246,8 +251,14 @@ pub struct TableRegistry {
     /// handle. [`TableOptions`] records the `{write_concurrency, …}` flag as a bool
     /// and has no `{decentralized_counters, _}` field, so the *effective*
     /// `ets:info/1,2` rendering of those two fields is computed by the `ets:new/2`
-    /// option parser and carried here; [`TableRegistry::remove`] drops the entry
-    /// with the table.
+    /// option parser and carried here.
+    ///
+    /// The entry **outlives a take/restore round trip**: every table-taking BIF
+    /// takes its table through [`TableRegistry::take`] (which keeps the profile) and
+    /// puts it back with [`restore_table`], so a later `ets:info/1,2` still sees the
+    /// creation-time profile. Only a *permanent* removal drops the entry —
+    /// [`TableRegistry::remove`] (which drops it) and the explicit
+    /// [`TableRegistry::forget_profile`] `ets:delete/1` calls.
     profiles: HashMap<u64, resolve::TableProfile>,
 }
 
@@ -291,11 +302,41 @@ impl TableRegistry {
     }
 
     /// Removes and returns the table stored under `handle`, if any, dropping every
-    /// continuation that belonged to it.
+    /// continuation that belonged to it **and its [`resolve::TableProfile`]**.
+    ///
+    /// This is the *permanent* removal (a whole-table delete): the profile is gone
+    /// with the table. A caller that only borrows the table and puts it back must
+    /// use [`TableRegistry::take`] instead, which keeps the profile so a later
+    /// `ets:info/1,2` still reports the creation-time `write_concurrency` /
+    /// `decentralized_counters` values.
     pub fn remove(&mut self, handle: u64) -> Option<Table> {
         self.continuations.retain(|_, cont| cont.table != handle);
         self.profiles.remove(&handle);
         self.tables.remove(&handle)
+    }
+
+    /// Removes and returns the table stored under `handle`, if any, dropping every
+    /// continuation that belonged to it but keeping its
+    /// [`resolve::TableProfile`].
+    ///
+    /// This is the take half of every table-taking BIF's borrow-and-restore round
+    /// trip ([`take_table_gated`] → [`restore_table`]): the profile must survive so
+    /// the table's `ets:info/1,2` rendering is unchanged after e.g. an `insert/2`.
+    /// The profile is dropped only by [`TableRegistry::remove`] or an explicit
+    /// [`TableRegistry::forget_profile`] (the whole-table `ets:delete/1`).
+    pub fn take(&mut self, handle: u64) -> Option<Table> {
+        self.continuations.retain(|_, cont| cont.table != handle);
+        self.tables.remove(&handle)
+    }
+
+    /// Drops the [`resolve::TableProfile`] recorded for `handle`, if any, leaving the
+    /// table itself in place.
+    ///
+    /// `ets:delete/1` is the only permanent table removal that goes through the
+    /// borrow-and-restore path ([`take_table_gated`], which keeps the profile), so it
+    /// calls this to make sure a deleted handle leaves no lingering profile behind.
+    pub fn forget_profile(&mut self, handle: u64) {
+        self.profiles.remove(&handle);
     }
 
     /// Records `profile` as the creation-time [`resolve::TableProfile`] of the table
@@ -549,14 +590,23 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `undefined` again. The table is **write**-gated, and the gated take happens
 /// before anything is removed, so a caller without write access gets a `badarg`
 /// that leaves the table in place.
+///
+/// This is the only table-taking BIF that never restores its table, so it is also
+/// the only one that drops the creation-time [`resolve::TableProfile`]
+/// ([`TableRegistry::forget_profile`]): every other taker uses [`take_table_gated`],
+/// which keeps the profile for the restore.
 fn delete_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let table = take_table_gated(ctx, handle, resolve::Gate::Write)?;
-    if table.info().named_table {
-        if let Some(name) = table.name() {
-            let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-            tables.remove_name(name);
-        }
+    let name = if table.info().named_table {
+        table.name()
+    } else {
+        None
+    };
+    let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+    tables.forget_profile(handle);
+    if let Some(name) = name {
+        tables.remove_name(name);
     }
     ctx.boolean(true)
 }
@@ -1098,6 +1148,14 @@ pub(super) fn take_table(ctx: &mut BifContext<'_>, handle: u64) -> Result<Table>
 ///
 /// The gate is evaluated against the table while it is still in the registry, so a
 /// denial leaves the table where it is (the oracle's `badarg` never destroys it).
+///
+/// The take goes through [`TableRegistry::take`], **not**
+/// [`TableRegistry::remove`]: the table is only borrowed for the duration of the
+/// BIF and put back with [`restore_table`], so its creation-time
+/// [`resolve::TableProfile`] must survive the round trip (else `ets:info/1,2` would
+/// report `write_concurrency = false` / `decentralized_counters = false` for every
+/// table that had ever been touched). Only `ets:delete/1`, the one non-restoring
+/// caller, drops the profile explicitly ([`TableRegistry::forget_profile`]).
 pub(in crate::ets) fn take_table_gated(
     ctx: &mut BifContext<'_>,
     handle: u64,
@@ -1109,7 +1167,7 @@ pub(in crate::ets) fn take_table_gated(
         let table = tables.get(handle).ok_or_else(badarg)?;
         gate.check(table, owner)?;
     }
-    tables.remove(handle).ok_or_else(badarg)
+    tables.take(handle).ok_or_else(badarg)
 }
 
 /// Puts `table` back under `handle`.
@@ -1313,6 +1371,8 @@ mod tests {
             "p",
             "q",
             "z",
+            // The `{write_concurrency, auto}` option value.
+            "auto",
         ]);
         atoms
     }
@@ -1384,6 +1444,47 @@ mod tests {
         assert_eq!(reg.len(), 1);
     }
 
+    /// An `auto`/fine-locked profile, for the profile-lifetime tests.
+    fn auto_profile() -> resolve::TableProfile {
+        resolve::TableProfile {
+            write_concurrency: resolve::WriteConcurrencyInfo::Auto,
+            decentralized_counters: true,
+        }
+    }
+
+    /// A table take/**restore** round trip — what every table-taking BIF performs
+    /// ([`take_table_gated`] → [`restore_table`]) — keeps the creation-time profile;
+    /// only a *permanent* removal ([`TableRegistry::remove`]) drops it.
+    #[test]
+    fn the_profile_survives_a_take_but_not_a_remove() {
+        let mut reg = TableRegistry::new();
+        let profile = auto_profile();
+        reg.insert(3, table(3));
+        reg.insert_profile(3, profile);
+        assert_eq!(reg.profile(3), Some(profile));
+
+        // `take` is the borrow half: the profile stays, and the restore finds it.
+        let taken = reg.take(3).expect("the table");
+        assert_eq!(reg.profile(3), Some(profile), "take dropped the profile");
+        reg.insert(3, taken);
+        assert_eq!(reg.profile(3), Some(profile), "restore lost the profile");
+
+        // `remove` is the permanent removal: the profile goes with the table.
+        assert!(reg.remove(3).is_some());
+        assert_eq!(reg.profile(3), None, "remove kept the profile");
+    }
+
+    /// [`TableRegistry::forget_profile`] drops only the profile — the table itself
+    /// stays put (it is the `ets:delete/1` step that runs *after* the gated take).
+    #[test]
+    fn forget_profile_drops_only_the_profile() {
+        let mut reg = TableRegistry::new();
+        reg.insert(4, table(4));
+        reg.insert_profile(4, auto_profile());
+        reg.forget_profile(4);
+        assert_eq!(reg.profile(4), None);
+        assert!(reg.contains(4), "the table itself is untouched");
+    }
     #[test]
     fn default_is_empty() {
         assert!(TableRegistry::default().is_empty());
@@ -1802,6 +1903,79 @@ mod tests {
         ));
     }
 
+    /// The effective `write_concurrency` / `decentralized_counters` creation-time
+    /// profile survives the take/restore round trip every table-taking BIF performs,
+    /// so `ets:info/2` keeps reporting what `ets:new/2` computed even after an
+    /// `insert/2` + `lookup/2` (the oracle: `[set,{write_concurrency,auto}]` reports
+    /// `{auto,true}`).
+    #[test]
+    fn info_keeps_the_profile_across_table_taking_bifs() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+
+        let kind = ctx.atom("set").expect("seeded");
+        let wc_key = ctx.atom("write_concurrency").expect("seeded");
+        let auto = ctx.atom("auto").expect("seeded");
+        let wc_auto = ctx.tuple(&[wc_key, auto]).expect("fits");
+        let opts = ctx.list(&[kind, wc_auto]).expect("fits");
+        let name = ctx.atom("mytab").expect("seeded");
+        let handle = new_2(&mut ctx, &[name, opts]).expect("ets:new");
+
+        // Two table-taking BIFs in between — each takes the table out of the
+        // registry and puts it back.
+        let obj = pair(&mut ctx, "a", 1);
+        insert_2(&mut ctx, &[handle, obj]).expect("insert");
+        let key = ctx.atom("a").expect("seeded");
+        lookup_2(&mut ctx, &[handle, key]).expect("lookup");
+
+        let item = ctx.atom("write_concurrency").expect("seeded");
+        let wc = info_2(&mut ctx, &[handle, item]).expect("info/2 write_concurrency");
+        assert_eq!(ctx.atoms().name(atom_val(wc)), Some("auto"));
+        let dc_item = ctx.atom("decentralized_counters").expect("seeded");
+        let dc = info_2(&mut ctx, &[handle, dc_item]).expect("info/2 decentralized_counters");
+        assert!(is_true(&atoms, dc), "decentralized_counters");
+    }
+
+    /// The bare `set`/`protected` atoms are **no-ops**: they never override an
+    /// earlier kind/access (the C `else if (val == am_set || val == am_protected) ;`,
+    /// `erl_db.c:2710`), unlike every other bare atom.
+    #[test]
+    fn bare_set_and_protected_options_do_not_override() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+
+        // (options, expected type, expected protection)
+        let cases: [(&[&str], &str, &str); 6] = [
+            (&["ordered_set", "set"], "ordered_set", "protected"),
+            (&["bag", "set"], "bag", "protected"),
+            (&["private", "protected"], "set", "private"),
+            (&["public", "protected"], "set", "public"),
+            (&["set"], "set", "protected"),
+            (&["protected"], "set", "protected"),
+        ];
+        for (i, (options, kind, protection)) in cases.iter().enumerate() {
+            let mut elems = Vec::new();
+            for option in *options {
+                elems.push(ctx.atom(option).expect("seeded"));
+            }
+            let opts = ctx.list(&elems).expect("fits");
+            let name = ctx.atom("mytab").expect("seeded");
+            let handle = new_2(&mut ctx, &[name, opts]).expect("ets:new");
+
+            let type_item = ctx.atom("type").expect("seeded");
+            let got = info_2(&mut ctx, &[handle, type_item]).expect("info/2 type");
+            assert_eq!(ctx.atoms().name(atom_val(got)), Some(*kind), "case {i}");
+            let prot_item = ctx.atom("protection").expect("seeded");
+            let got = info_2(&mut ctx, &[handle, prot_item]).expect("info/2 protection");
+            assert_eq!(
+                ctx.atoms().name(atom_val(got)),
+                Some(*protection),
+                "case {i}"
+            );
+        }
+    }
     /// `ets:info/1,2` on a *well-formed* table argument that names no live table is
     /// the atom `undefined` — an unknown atom, an atom naming a table that is not a
     /// `named_table`, and a deleted table's handle alike — for **both** arities and
