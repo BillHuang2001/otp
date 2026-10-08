@@ -657,7 +657,7 @@ impl Table {
   supported enumeration path.
 - **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
   `select_reverse/*`, `foldl`/`foldr`, `rename/2`, `whereis/1`, `table/1,2`, `slot/2`,
-  `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1`, `ets:size/1` and
+  `tab2file*`/`file2tab*`. (`ets:clear/1`, `ets:size/1` and
   `ets:match_spec_test/2,3` do **not** exist in OTP 29 — calling `match_spec_test` raises
   `error:undef` — so their absence is correct; `ets:info(T, size)` is the supported spelling of the
   size query.) The `/3` limited forms are implemented but their opaque **continuation terms** and the

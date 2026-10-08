@@ -322,6 +322,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness, not here.
+  This crate's own tests are **all self-checks** (structural `compare::eq`, word-count arithmetic,
+  refcounts) — no test in `src/` or `tests/` invokes `erl`/`erlc`.
+- The workspace `cargo test` gate is **local only**: `.github/` contains no `erts_rust`/cargo workflow
+  (only the repo's own C build/test workflows), so these tests never run in CI.
 ## Known Issues / Intentional M1 gaps
 - **`beam_term::compare` has no structural arm for external pid/port/reference.** It falls through to
   the deterministic `fallback_cmp` (same class ⇒ order by object arity, then raw term word), so a copy
@@ -342,10 +346,13 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - **`copy_struct_shared` preflights the *flat* word count.** It is a safe upper bound, so a caller sizes
   the destination heap as for `copy_struct`; the memory saving is in the words written, not in the
   accepted capacity.
-- **The fragment model is not yet wired into a runtime.** `HeapFragment`/`Fragments`/`send_fragmented`
-  exist, but `beam_rt`/`beam_process` still call `send` (exhaustion ⇒ `AllocKind::Message`); a runtime
-  must adopt `send_fragmented`, hold a received message's `Fragments` as its message-buffer model and
-  later `move_into` the process heap.
+- **The fragment model is adopted only by `beam_rt`, and untested.** `beam_process::deliver` still calls
+  `send` (a payload over its heap ⇒ `AllocKind::Message`); `beam_rt`'s `deliver_message`
+  (`src/context/mod.rs`) catches that, composes `HeapFragment`/`copy_root`/`Fragments` itself and enqueues
+  a message owning the chain — it does **not** call `send_fragmented` because `beam_process::Process`
+  exposes `heap_mut`/`mailbox_mut` as two disjoint `&mut self` borrows with no split. No
+  `beam_rt/tests/*` nor differential case exercises fragmentation, and a received message's `Fragments`
+  are never `move_into`'d.
 - **A fragment holds the whole payload; there is no automatic multi-fragment split.** The C streams an
   oversized message across a chain of `new_message_buffer` fragments; here one fragment is sized to the
   whole payload (`fragment_capacity_words.max(size_object(term))`) and the chain is built by the caller

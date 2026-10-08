@@ -242,7 +242,7 @@ Codec entry points declared in `external.h`: `erts_encode_ext(Eterm,byte**)` / `
 
 ## Routing Table
 - `jit/` → JSV/JIT (BeamAsm): `beam/jit/` C++ + per-arch subdirs (`x86/`, `arm/`) with their own `ops.tab`/`predicates.tab`/`generators.tab`; child of this node, owns all `.cpp` in the emulator.
-- `emu/` → interpreter (`beam/emu/`): `ops.tab`, `beam_emu.c` (generated interpreter dispatch), `emu_load.c` and the `*_instrs.tab` sources.
+- `emu/` → interpreter (`beam/emu/`): hand-written dispatch loop `beam_emu.c` (there is no `beam_emu.h`), `emu_load.c` + `load.h` (emu flavor loader), `ops.tab` and the `*_instrs.tab` instruction bodies; only `beam_hot.h`/`beam_warm.h`/`beam_cold.h`/`beam_opcodes.*` are generated (into `$(TTF_DIR)`).
 - `../test/` → BEAM VM test suites (`*_SUITE.erl`, spec files); sibling subtree — read-only, escalate writes to `../` (erts/emulator).
 - `../utils/` → code generators invoked by `../Makefile.in` (`beam_makeops`, `make_tables`, `make_alloc_types`, `make_preload`, `make_driver_tab`, `beam_strip`, ...). Read-only from here.
 - `../internal_doc/` → design documents for the VM internals (GC, carriers, PTab, thread progress, port signals, code loading, tracing, beam_makeops).
