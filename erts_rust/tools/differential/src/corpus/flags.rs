@@ -30,6 +30,11 @@
 //! The `flags/plus_q_*` cases pin the `+Q N` → `port_limit` sizing (round up to the next
 //! power of two, capped at the hard ceiling), and `flags/erl_max_ports_sets_port_limit`
 //! pins the `ERL_MAX_PORTS` request through the same observable.
+//!
+//! The `flags/plus_hmax*`/`flags/plus_hms*`/`flags/plus_hmbs*` cases pin the emulator's
+//! `max_heap_size` / minimum-heap-size flags by **acceptance**: the switch is consumed from the
+//! argv before `init`, so it has no `init`/`system_info` observable, and the case asserts the
+//! runtime still boots and a tiny bounded allocation returns its value.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -474,6 +479,123 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- `+hmax` and the max-heap family: bounded-allocation acceptance ----------------
+        // `+hmax Size` (with its `+hmaxk`/`+hmaxel`/`+hmaxib` companions) and the `+hms`/`+hmbs`
+        // min-heap / min-binary-heap flags are a `max_heap_size` request the emulator consumes
+        // from the argv *before* `init` ever sees it, so -- exactly like `+P`/`+K`/`+sbt`/`+Q` --
+        // they are not observable through `init:get_argument/1`. The rewrite must therefore
+        // *accept* each one and keep running: the pinned observable is that a small, strictly
+        // bounded allocation (`length(lists:seq(1,1000))`, a few dozen KB at most) still yields
+        // the value both runtimes produce without the flag. Every allocation here is
+        // deliberately tiny so a runner started *with* a heap cap is never itself killed. Each
+        // golden is the live oracle's output (OTP 29.1.1 / erts-17.1).
+        //
+        // A `system_limit` *boundary* case (allocate past the cap under `+hmax <small>`) is
+        // deliberately **not** pinned: `+hmax` defaults to `kill => true`, so the oracle *kills*
+        // the process on overflow (verified: `erl +hmax 1048576 -noshell -eval
+        // 'io:format("~w~n",[length(lists:seq(1,1000000))]),halt(0).'` prints nothing and exits
+        // 1) while this runtime's evaluator raises a *catchable* `error:system_limit` that the
+        // probe reports (exit 1, one `exception error system_limit` line). That is a plain
+        // differing observable, never a capability gap, so only the `+hmax` *acceptance* cases
+        // above are carried instead of guessing at a boundary shape.
+        Case {
+            id: "flags/plus_hmax_bounded_allocation",
+            description: "the +hmax emulator flag is accepted and a bounded allocation still succeeds",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "length(lists:seq(1,1000))",
+                extra_argv: &["+hmax", "1048576"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_hmax_zero_is_unlimited",
+            description: "a +hmax 0 request (unlimited max heap size) leaves a bounded allocation succeeding",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "length(lists:seq(1,1000))",
+                extra_argv: &["+hmax", "0"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_hmaxk_kill_is_accepted",
+            description: "the +hmaxk max-heap kill switch is accepted and a bounded allocation still succeeds",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "length(lists:seq(1,1000))",
+                extra_argv: &["+hmaxk", "true"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_hmaxel_error_logger_is_accepted",
+            description: "the +hmaxel max-heap error-logger switch is accepted and a bounded allocation still succeeds",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "length(lists:seq(1,1000))",
+                extra_argv: &["+hmaxel", "true"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_hmaxib_binary_inclusion_is_accepted",
+            description: "the +hmaxib max-heap binary-inclusion switch is accepted and a bounded allocation still succeeds",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "length(lists:seq(1,1000))",
+                extra_argv: &["+hmaxib", "true"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_hms_min_heap_size_is_accepted",
+            description: "the +hms minimum heap-size flag is accepted and a bounded allocation still succeeds",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "length(lists:seq(1,1000))",
+                extra_argv: &["+hms", "233"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plus_hmbs_min_binary_heap_size_is_accepted",
+            description: "the +hmbs minimum binary-heap-size flag is accepted and a bounded allocation still succeeds",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "length(lists:seq(1,1000))",
+                extra_argv: &["+hmbs", "8192"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1000"),
+                exit_code: 0,
+            },
+        },
         // --- environment variables (`ERL_*FLAGS`): the merge, pinned end to end -----------
         // `erl` merges `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS]
         // [ERL_ZFLAGS]` into the argv *before* `init` ever sees it (erlexec.c
@@ -618,7 +740,10 @@ mod tests {
     /// `erlang:system_info/1`. Their goldens are therefore `ok <system_info value>`; the
     /// cases that assert the emulator did *not* leak them into `init` keep the
     /// `init:get_argument` shape. `-boot` is an ordinary recorded switch and keeps the
-    /// `{ok,[…]}` golden shape.
+    /// `{ok,[...]}` golden shape. The `+hmax`/`+hmaxk`/`+hmaxel`/`+hmaxib`/`+hms`/`+hmbs`
+    /// family is likewise consumed by the emulator *and* has no `system_info/1` observable,
+    /// so it is pinned by **acceptance**: the runtime boots and a tiny bounded allocation
+    /// still returns its value (`ok 1000`).
     #[test]
     fn every_case_is_a_cli_eval_case_with_an_init_or_system_info_probe() {
         for case in group() {
@@ -649,9 +774,11 @@ mod tests {
             assert!(
                 expr.starts_with("init:get_argument(")
                     || expr == "init:get_plain_arguments()"
-                    || expr.starts_with("erlang:system_info("),
-                "case {}: A.6 is observed through init:get_argument/1, get_plain_arguments/0 \
-                 or (for a +-flag) erlang:system_info/1, got {expr}",
+                    || expr.starts_with("erlang:system_info(")
+                    || expr == "length(lists:seq(1,1000))",
+                "case {}: A.6 is observed through init:get_argument/1, get_plain_arguments/0, \
+                 (for a +-flag) erlang:system_info/1, or (for an argv flag with no other \
+                 observable) the bounded-allocation acceptance probe, got {expr}",
                 case.id
             );
             // The golden is the valueless `-noshell` occurrence `[]`, the error atom, a
@@ -722,6 +849,53 @@ mod tests {
         assert_eq!(env.env(), &[("ERL_MAX_PORTS", "3000")]);
         assert_eq!(env.golden.stdout, Some("ok 4096"));
         assert!(env.extra_argv().is_empty(), "case {}: no argv flag", env.id);
+    }
+
+    /// The `+hmax` max-heap family is pinned by **acceptance**: each flag is a `max_heap_size`
+    /// (or minimum-heap-size) request the emulator consumes from the argv -- so `init` never
+    /// records it -- and each case asserts the runtime still boots and returns the same tiny
+    /// bounded-allocation value. The allocation is deliberately small so a `+hmax`-limited
+    /// runner is never itself killed. Every golden is the live oracle's output.
+    #[test]
+    fn plus_hmax_family_cases_pin_the_oracle_acceptance() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+        for (id, argv) in [
+            (
+                "flags/plus_hmax_bounded_allocation",
+                &["+hmax", "1048576"][..],
+            ),
+            ("flags/plus_hmax_zero_is_unlimited", &["+hmax", "0"][..]),
+            ("flags/plus_hmaxk_kill_is_accepted", &["+hmaxk", "true"][..]),
+            (
+                "flags/plus_hmaxel_error_logger_is_accepted",
+                &["+hmaxel", "true"][..],
+            ),
+            (
+                "flags/plus_hmaxib_binary_inclusion_is_accepted",
+                &["+hmaxib", "true"][..],
+            ),
+            (
+                "flags/plus_hms_min_heap_size_is_accepted",
+                &["+hms", "233"][..],
+            ),
+            (
+                "flags/plus_hmbs_min_binary_heap_size_is_accepted",
+                &["+hmbs", "8192"][..],
+            ),
+        ] {
+            let case = find(id);
+            assert_eq!(case.golden.stdout, Some("ok 1000"), "case {id}");
+            assert_eq!(case.extra_argv(), argv, "case {id}: the emulator flag");
+            assert_eq!(
+                case.expr(),
+                Some("length(lists:seq(1,1000))"),
+                "case {id}: the bounded-allocation acceptance probe"
+            );
+            assert!(
+                case.env().is_empty(),
+                "case {id}: the +hmax family is a command-line flag, not an env case"
+            );
+        }
     }
 
     /// The `ERL_*FLAGS` precedence chain is pinned by the environment-variable cases: the
