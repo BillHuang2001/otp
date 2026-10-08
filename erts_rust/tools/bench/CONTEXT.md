@@ -371,6 +371,26 @@ few percent except `foreign` rust `ns_per_call` (up to **+35 %**) and `slice` ru
 > driver/observer and never mutates the runtime's environment beyond argv — and the effect is confined
 > to the `_startup_ms` metric, which the per-call metric cancels.
 
+## Reading the sys-vs-rust per-call gap (verified)
+
+The headline `foreign` per-call gap in the M1 report (**703×–9 891×**) is a **real runtime cost, not a
+harness artifact**. The startup-cancelled metric `(mean wall@N − mean wall@0)/N` was cross-checked by
+hand: a plain shell loop calling the same release `beam_rt -pa <dir> run <mod.beam> <mod>:<fun>/1 <N>`
+gives 258 µs/call for `cowboy_bstr:to_lower` vs the harness's 265 µs/call, and ~360 ns for the oracle —
+so CLI re-entry, per-call module reloads and per-call GC are all ruled out.
+
+The cost is dominated by a **specific per-BIF-call overhead**, not by interpreter dispatch: `beam_rt`
+deep-clones its whole `AtomTable` on every BIF call (`RuntimeContext::call_registered` commits via
+`Rc::make_mut` while an `atoms` handle is still alive), so each per-iteration BIF (`-`, `byte_size`, …)
+adds tens of µs. Hand-built probe drivers (same `run` action) show: a **BIF-free** interpreted list walk
+≈ 0 marginal/iteration; a `-`-only loop ~80–165 µs/iteration; `-`+`+` ~170–350 µs; a natively served
+`lists:seq(1,N)` ~10 µs/element. `beam_engine`'s interpreter dispatch is itself O(1) and
+allocation-free per instruction, so this is a `beam_rt` host-context defect, not an engine one.
+
+Consequence for reading results: startup latency and peak RSS are the trustworthy cross-runtime
+comparisons today; the per-call `ns` figures measure this defect, so treat the exact multiplier as a
+snapshot (run-to-run noise on `foreign` rust `ns_per_call` reaches ±35 %), not a stable constant.
+
 ## See Also
 - `RESULTS.md` → the definitive `--full` results summary (one table per workload category, exact
   reproduction commands, verified skip reasons, stability, and "what these numbers do and do not mean").
