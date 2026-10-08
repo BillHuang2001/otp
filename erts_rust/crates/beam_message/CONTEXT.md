@@ -322,6 +322,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness, not here.
+  This crate's own tests are **all self-checks** (structural `compare::eq`, word-count arithmetic,
+  refcounts) — no test in `src/` or `tests/` invokes `erl`/`erlc`.
+- The workspace `cargo test` gate is **local only**: `.github/` contains no `erts_rust`/cargo workflow
+  (only the repo's own C build/test workflows), so these tests never run in CI.
 ## Known Issues / Intentional M1 gaps
 - **`beam_term::compare` has no structural arm for external pid/port/reference.** It falls through to
   the deterministic `fallback_cmp` (same class ⇒ order by object arity, then raw term word), so a copy
