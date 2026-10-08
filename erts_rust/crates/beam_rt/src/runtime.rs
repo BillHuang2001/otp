@@ -83,8 +83,11 @@ use crate::seq_trace::SeqTrace;
 use crate::timers::{TimerHandle, Timers};
 use crate::trace::TraceState;
 
+mod gc;
 mod scheduler;
 
+pub use self::gc::GcStatsSnapshot;
+pub(crate) use self::gc::GcState;
 pub use self::scheduler::RUN_DEADLINE;
 
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
@@ -199,6 +202,9 @@ pub struct Runtime {
     runner_state: RunnerState,
     /// The pointer-stable arena serving the engine's `alloc_words` seam.
     pub(crate) arena: MinimalContext,
+    /// The **process-heap collection** state: the per-module float guard, the pin/halt sets,
+    /// the global escape-store valve and the measured counters (see [`crate::runtime::gc`]).
+    gc: GcState,
     /// The scratch heap for `system_info`/`format_term`, reset per call.
     pub(crate) info_heap: Heap,
     /// The long-lived heap for terms the `-eval` evaluator must build on a
@@ -463,6 +469,7 @@ impl Runtime {
             scheduler: Scheduler::new(),
             runner_state: RunnerState::default(),
             arena: MinimalContext::new(),
+            gc: GcState::new(),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             eval_heap: Heap::new(heap_words)?,
             tables: Rc::new(RefCell::new(TableRegistry::new())),

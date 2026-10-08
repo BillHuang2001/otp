@@ -142,8 +142,14 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         ExecutionContext::call_bif(self.inner, module, function, arity, args)
     }
 
-    /// Charge one reduction, then serve the request by delegating (the runtime's arena is
-    /// unbounded, so the delegation itself never fails on Milestone 1).
+    /// Charge one reduction, then serve the request by delegating — **arming the GC latch**
+    /// for that one admission point first.
+    ///
+    /// This wrapper's [`ensure_heap`](ExecutionContext::ensure_heap) is reached by the
+    /// slice's **own** machine and by nothing else (see the type docs), which is exactly the
+    /// root set [`crate::context::gc::ensure_heap`] may collect against; the latch is what
+    /// tells it so, and it is cleared as the first statement there (see
+    /// [`RuntimeContext::arm_gc`]).
     fn ensure_heap(
         &mut self,
         heap_need: u32,
@@ -152,6 +158,7 @@ impl ExecutionContext for BudgetContext<'_, '_> {
         stack: &mut [Eterm],
     ) -> Result<()> {
         self.probe.charge()?;
+        self.inner.arm_gc();
         ExecutionContext::ensure_heap(self.inner, heap_need, live, x_regs, stack)
     }
 

@@ -65,17 +65,18 @@
 //! names into the shared table in the same order, so each lands at exactly the predicted
 //! index. A name seen twice in one call is deduplicated and gets the same index.
 //!
-//! # No collector yet
+//! # The process-heap collector
 //!
 //! [`ensure_heap`](ExecutionContext::ensure_heap) and
-//! [`alloc_words`](ExecutionContext::alloc_words) are served by the runtime's
-//! pointer-stable [`MinimalContext`](beam_engine::MinimalContext) arena. That arena
-//! treats the heap as unbounded, so `ensure_heap` never reports a short heap — there is
-//! no GC in the engine yet (`../beam_engine` Known Issues). The production collector is
-//! Stage 4 (`beam_gc`), which will run *here* and may move terms.
+//! [`alloc_words`](ExecutionContext::alloc_words) are served from the running **scheduled**
+//! process's own young heap, collected at the heap-admission point — see [`gc`] for the
+//! gate, the float guard and the root-set hand-off. Everything outside a scheduler slice
+//! still runs on the runtime's pointer-stable
+//! [`MinimalContext`](beam_engine::MinimalContext) arena, byte for byte as before.
 
 mod bridges;
 mod fun_identity;
+pub(crate) mod gc;
 mod memory_hook;
 mod module_info;
 mod persistent_term;
@@ -183,6 +184,19 @@ pub struct RuntimeContext<'a> {
     /// ([`Runtime::runner_state`](crate::runtime::Runtime)), which such a context reads
     /// directly.
     engines: Option<&'a RunnerState>,
+    /// The **per-call GC latch**: whether the next
+    /// [`ensure_heap`](ExecutionContext::ensure_heap) on this context may collect the running
+    /// process's heap.
+    ///
+    /// It is `true` for exactly one admission point — the slice's own machine, whose
+    /// [`BudgetContext::ensure_heap`](crate::runner) arms it **immediately before** delegating
+    /// — and is [`take`](std::mem::take)n as the first statement of
+    /// [`gc::ensure_heap`](crate::context::gc::ensure_heap), so it can never leak into a
+    /// *nested* run on the same context (an external module call's new machine, a fun a BIF
+    /// applied, the `-eval` evaluator), whose roots a collection driven from this context
+    /// would corrupt (see [`crate::context::gc`]). It is never set for a plain
+    /// [`RuntimeContext`].
+    gc_armed: bool,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -198,6 +212,7 @@ impl<'a> RuntimeContext<'a> {
             may_pump_scheduler: true,
             current_module: None,
             engines: None,
+            gc_armed: false,
         }
     }
 
@@ -212,6 +227,7 @@ impl<'a> RuntimeContext<'a> {
             may_pump_scheduler: true,
             current_module: None,
             engines: None,
+            gc_armed: false,
         }
     }
 
@@ -243,6 +259,7 @@ impl<'a> RuntimeContext<'a> {
             may_pump_scheduler: false,
             current_module: None,
             engines: None,
+            gc_armed: false,
         }
     }
 
@@ -286,7 +303,18 @@ impl<'a> RuntimeContext<'a> {
     pub(crate) fn may_pump_scheduler(&self) -> bool {
         self.may_pump_scheduler
     }
-    /// The process table a receive/send resolves against: the caller-supplied one when
+
+    /// Arms the **GC latch** for the admission point the caller is about to make.
+    ///
+    /// The only caller is the slice's own
+    /// [`BudgetContext::ensure_heap`](crate::runner), which arms it immediately before
+    /// delegating the admission point to this context's
+    /// [`ensure_heap`](ExecutionContext::ensure_heap); that method
+    /// [`take`](std::mem::take)s the latch as its first statement, so it covers **exactly**
+    /// that one admission point (see the [`gc_armed`](Self::gc_armed) field docs).
+    pub(crate) fn arm_gc(&mut self) {
+        self.gc_armed = true;
+    }    /// The process table a receive/send resolves against: the caller-supplied one when
     /// there is one, else the runtime's own.
     pub(crate) fn process_table_mut(&mut self) -> &mut ProcessTable {
         match self.mailbox_table {
@@ -482,10 +510,12 @@ impl<'a> RuntimeContext<'a> {
     }
     /// Heap words still available to the running code.
     ///
-    /// Milestone-1's arena is unbounded (no GC yet), so this reports
-    /// `usize::MAX` — see the module docs.
+    /// In a **scheduled slice** whose process may be collected over this is the running
+    /// process's own young free words — the heap the code really allocates from; every other
+    /// context reports the runtime's unbounded, never-reclaimed arena (see
+    /// [`crate::context::gc`]).
     pub fn heap_available(&self) -> usize {
-        self.runtime.arena_available()
+        gc::heap_available(self)
     }
 
     /// The runtime's long-lived `-eval` heap.
@@ -712,6 +742,7 @@ impl<'a> RuntimeContext<'a> {
                 may_pump_scheduler,
                 current_module: _,
                 engines,
+                gc_armed: _,
             } = self;
             // Re-entry happens only when the BIF *applies a fun argument* (the fun-taking
             // `lists:*`/`maps:*` BIFs): the applied fun can call back into the runtime and
@@ -1333,7 +1364,14 @@ impl ExecutionContext for RuntimeContext<'_> {
         self.run_export(&loaded, function, arity, args)
     }
 
-    /// Ensures `heap_need` words are available in the runtime's arena.
+    /// Ensures `heap_need` words are available for the running code, collecting the running
+    /// process's own young heap when it cannot serve them (see [`crate::context::gc`]).
+    ///
+    /// The [`gc_armed`](Self::gc_armed) latch is [`take`](std::mem::take)n as the **first
+    /// statement**, so only the admission point the slice's own
+    /// [`BudgetContext`](crate::runner) armed can collect: a nested machine built on this
+    /// same context (an external module call, a fun a BIF applied, the evaluator) finds the
+    /// latch clear and can never be collected over.
     fn ensure_heap(
         &mut self,
         heap_need: u32,
@@ -1341,18 +1379,20 @@ impl ExecutionContext for RuntimeContext<'_> {
         x_regs: &mut [Eterm],
         stack: &mut [Eterm],
     ) -> Result<()> {
-        self.runtime
-            .ensure_heap(heap_need, live, x_regs, stack)
+        let armed = std::mem::take(&mut self.gc_armed);
+        gc::ensure_heap(self, heap_need, live, x_regs, stack, armed)
     }
 
     /// Heap words still available (see [`RuntimeContext::heap_available`]).
     fn heap_available(&self) -> usize {
-        RuntimeContext::heap_available(self)
+        gc::heap_available(self)
     }
 
-    /// Allocates `n` raw heap words from the runtime's pointer-stable arena.
+    /// Allocates `n` raw heap words for the running code: the running process's own young
+    /// heap in a scheduled slice, the runtime's pointer-stable arena everywhere else (see
+    /// [`crate::context::gc`]).
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
-        self.runtime.alloc_words(n)
+        gc::alloc_words(self, n)
     }
 
     /// Applies a fun/closure value.

@@ -226,6 +226,21 @@ impl ProcessRunner for RuntimeRunner<'_> {
             (outcome, used, exhausted)
         };
 
+        // The **float-register safety valve**, checked while the machine is no longer
+        // running: `Machine::fr` holds *terms* at Milestone 1 and is not part of the root set
+        // `ensure_heap` hands out, so a heap move while a float register is live could
+        // silently corrupt float code. The module-level float guard
+        // (`context::gc::module_uses_floats`) already refuses to collect over a module that
+        // contains a float instruction; this catches the residual case — a float register
+        // left set by *another* module's code (a callee) while this process runs float-free
+        // code — by pinning the process permanently. This crate can neither read nor clear
+        // `Machine::fr` from the admission point, so pinning is the only safe reaction (see
+        // `runtime::gc`).
+        if (0..beam_engine::machine::MAX_FLOAT_REGISTER)
+            .any(|index| engine.machine.get_fr(index).is_some_and(|fr| fr != beam_term::NIL))
+        {
+            self.runtime.pin_process(pid);
+        }
         // The `+JPperf` map (contract A.8) must describe the **real** native code this runtime
         // can run, never a fabricated range: the module's baseline artifact is that source, so
         // its cached `[start, size)` regions are snapshotted here -- once per first entry, not
@@ -302,6 +317,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
             }
             Err(error) => {
                 let reason = exit_reason(self.runtime, &error);
+                // The reason may be a term the failing process built on **its own** heap,
+                // which the collector may move or drop the moment the process terminates:
+                // copy it onto the runtime's pointer-stable arena before it is recorded (see
+                // `Runtime::stabilize_escaped`).
+                let reason = self.runtime.stabilize_escaped(reason);
                 self.state.exits.insert(pid, reason);
                 // Keep the original error as well: the reason *term* above is what the exit
                 // propagates, but only the error carries the raise class and the

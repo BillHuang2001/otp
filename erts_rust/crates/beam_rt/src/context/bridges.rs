@@ -153,6 +153,9 @@ impl FunCaller for FunBridge<'_> {
             may_pump_scheduler: self.may_pump_scheduler,
             current_module: self.current_module.clone(),
             engines: self.engines,
+            // A **nested** run: it must never collect the process heap, because the root set
+            // the machine would hand out belongs to the outer machine (see `context::gc`).
+            gc_armed: false,
         };
         ctx.apply_fun(fun, args)
     }
@@ -329,6 +332,9 @@ impl SendHook for SendBridge<'_> {
             may_pump_scheduler: self.may_pump_scheduler,
             current_module: self.current_module.clone(),
             engines: self.engines,
+            // A **nested** run: the delivery itself allocates no roots to relocate, and the
+            // latch must never be inherited (see `context::gc`).
+            gc_armed: false,
         };
         match ctx.send_message(target, term) {
             // No process for the pid: the C drops the message and reports success

@@ -338,6 +338,9 @@ mod tests {
     }
 
     #[test]
+    // The crate is `#![deny(unsafe_code)]`; this is a test-only raw read of words the bump
+    // just handed out (the same exception the other crates' test modules take).
+    #[allow(unsafe_code)]
     fn the_bump_advances_the_heap_by_exactly_n_words_and_returns_the_block_base() {
         let mut heap = Heap::new(64).expect("a 64-word heap");
         let before = heap.used();
@@ -373,6 +376,9 @@ mod tests {
     }
 
     #[test]
+    // The crate is `#![deny(unsafe_code)]`; this is a test-only raw read of the placeholder
+    // words the bump just wrote.
+    #[allow(unsafe_code)]
     fn a_bump_writes_only_immediates_after_its_header_word() {
         // The placeholder fill is immediates only, so a block the engine has not written yet
         // is inert to the collector: its header word is the one written value, and every
