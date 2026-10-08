@@ -29,16 +29,23 @@
 //!
 //! # User tags (`erlang:monitor/3` `{tag, Tag}`)
 //!
-//! Every monitor record carries an optional **user tag** (`Option<Eterm>`): the
-//! `erlang:monitor/3` `{tag, Tag}` option, which replaces the `'DOWN'` head atom of the
-//! notification. `None` reproduces the ordinary `{'DOWN', Ref, Kind, Target, Reason}`;
+//! The `erlang:monitor/3` `{tag, Tag}` option replaces the `'DOWN'` head atom of the
+//! notification: `None` reproduces the ordinary `{'DOWN', Ref, Kind, Target, Reason}`, and
 //! `Some(tag)` produces the oracle's `{Tag, Ref, Kind, Target, Reason}`.
 //!
+//! The tag is deliberately **not** a field of the records below: [`Monitor`],
+//! [`MonitoredBy`] and [`PortWatch`] are built by struct literal from other crates (e.g.
+//! `beam_rt`), so their shape is fixed and adding a field would break them. It is kept
+//! instead in a **side table** on [`ProcessTable`](crate::ptab::ProcessTable), keyed by the
+//! monitor reference — exactly like the `{Name, node}` descriptor of a named monitor (see
+//! `ptab.rs`, Design Decisions). An entry is created only when a tag is supplied and is
+//! removed the moment its monitor dies.
+//!
 //! A tag must be **heap-independent**: an immediate (an atom, small integer, local
-//! pid/port, `nil`) or a literal-area term. The monitor records are plain values — the
-//! crate's collector never scans them — so a term resident in a *per-process* heap could
-//! not be relocated and would dangle after a collection; a literal-area term, by contrast,
-//! is shared and never moves. A tag that is not an immediate is therefore rejected by the
+//! pid/port, `nil`) or a literal-area term. The side table holds only plain values — the
+//! crate's collector never scans it — so a term resident in a *per-process* heap could not
+//! be relocated and would dangle after a collection; a literal-area term, by contrast, is
+//! shared and never moves. A tag that is not an immediate is therefore rejected by the
 //! `ptab.rs` entry points with a typed `unsupported`, so a caller never gets a wrong result.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_monitor_link.c`.
@@ -187,22 +194,20 @@ impl MonitorKind {
 ///
 /// # Not a GC root
 ///
-/// `reference` and `port` are plain values (a `u64`-backed handle), and `tag` is a
-/// heap-independent immediate (see the module docs on user tags), so a port-watch set adds no
-/// root to the collector:
+/// `reference` and `port` are plain values (a `u64`-backed handle), so a port-watch set adds
+/// no root to the collector:
 /// [`Process::collect`](crate::process::Process::collect) gathers only the
 /// registers/stack, the mailbox payloads, the dictionary, the saved args and the
 /// pending-signal queue. (A port monitor therefore also never affects `beam_message`'s copy
-/// sizing, which only walks a crossed term's own object graph.)
+/// sizing, which only walks a crossed term's own object graph.) A monitor's
+/// `erlang:monitor/3` user tag lives in `ProcessTable`'s side table, not here (see the module
+/// docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortWatch {
     /// The reference the `{'DOWN', …}` message will carry.
     pub reference: MonitorRef,
     /// The watched port.
     pub port: PortId,
-    /// The `erlang:monitor/3` `{tag, Tag}` user tag; `None` ⇒ the `'DOWN'` atom (see the
-    /// module docs).
-    pub tag: Option<Eterm>,
 }
 
 /// An outgoing monitor: this process watches `target`.
@@ -214,9 +219,6 @@ pub struct Monitor {
     pub target: ProcessId,
     /// Whether a process or a port is watched.
     pub kind: MonitorKind,
-    /// The `erlang:monitor/3` `{tag, Tag}` user tag; `None` ⇒ the `'DOWN'` atom (see the
-    /// module docs).
-    pub tag: Option<Eterm>,
 }
 
 /// An incoming monitor: `watcher` watches this process.
@@ -228,9 +230,6 @@ pub struct MonitoredBy {
     pub watcher: ProcessId,
     /// Whether a process or a port is watched.
     pub kind: MonitorKind,
-    /// The `erlang:monitor/3` `{tag, Tag}` user tag the watcher requested; `None` ⇒ the
-    /// `'DOWN'` atom (see the module docs).
-    pub tag: Option<Eterm>,
 }
 
 /// The outgoing-monitor set of one process.
@@ -381,20 +380,15 @@ mod tests {
             reference: r1,
             target: pid(1),
             kind: MonitorKind::Process,
-            tag: None,
         });
         monitors.push(Monitor {
             reference: r2,
             target: pid(2),
             kind: MonitorKind::Port,
-            tag: Some(make_small(42)),
         });
         assert_eq!(monitors.len(), 2);
         assert_eq!(monitors.find(r1).map(|m| m.target), Some(pid(1)));
         assert_eq!(monitors.find(r2).map(|m| m.kind), Some(MonitorKind::Port));
-        // The user tag (or its absence) is part of the recorded monitor.
-        assert_eq!(monitors.find(r1).and_then(|m| m.tag), None);
-        assert_eq!(monitors.find(r2).and_then(|m| m.tag), Some(make_small(42)));
         assert_eq!(
             monitors.iter().map(|m| m.reference).collect::<Vec<_>>(),
             vec![r1, r2]

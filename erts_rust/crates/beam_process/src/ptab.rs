@@ -174,6 +174,22 @@ fn check_tag(tag: Option<Eterm>) -> Result<Option<Eterm>> {
     }
 }
 
+/// Remembers `reference`'s `erlang:monitor/3` user tag, if it has one.
+///
+/// Only a supplied tag is stored — an untagged monitor leaves no entry, so a lookup answering
+/// `None` means the default `'DOWN'` head atom (see `monitor.rs`'s user-tag contract). The
+/// stored term is a validated immediate.
+fn remember_tag(tags: &mut HashMap<MonitorRef, Eterm>, reference: MonitorRef, tag: Option<Eterm>) {
+    if let Some(tag) = tag {
+        tags.insert(reference, tag);
+    }
+}
+
+/// Forgets `reference`'s user tag — its monitor is gone, so the entry must not linger.
+fn forget_tag(tags: &mut HashMap<MonitorRef, Eterm>, reference: MonitorRef) {
+    tags.remove(&reference);
+}
+
 /// A standalone copy of `src`'s off-heap handles (each cloned — the refcount is bumped), with
 /// the **same slot indices** so a term copied against the snapshot resolves exactly as it would
 /// against `src`.
@@ -240,6 +256,17 @@ pub struct ProcessTable {
     /// by its reference (see [`NamedTarget`]). An entry dies with its monitor: `demonitor`, the
     /// dying holder's outgoing-monitor sweep and a delivered DOWN all remove it.
     named_monitors: HashMap<MonitorRef, NamedTarget>,
+    /// The `erlang:monitor/3` `{tag, Tag}` **user tag** of every tagged monitor, keyed by its
+    /// reference.
+    ///
+    /// A tag cannot be a field of [`Monitor`]/[`MonitoredBy`]/[`PortWatch`] — those are built by
+    /// struct literal from other crates, so their shape is fixed — and it is kept here instead,
+    /// exactly like [`NamedTarget`] (see `monitor.rs`'s user-tag contract). An entry is created
+    /// only when a tag is supplied, holds a **heap-independent immediate** (so it is not a GC
+    /// root and never needs relocating), and is removed the moment its monitor dies —
+    /// `demonitor`/`demonitor_flush`, the terminated target's watcher sweep, `demonitor_port` and
+    /// `port_closed` — so it cannot leak.
+    tags: HashMap<MonitorRef, Eterm>,
     /// The atom naming the **local node**, used to spell the `{Name, LocalNode}` target of a
     /// named monitor. `None` until [`ProcessTable::set_local_node`] installs it; a named monitor
     /// requested without it is a typed [`error::unsupported`] rather than a wrong target.
@@ -263,6 +290,7 @@ impl ProcessTable {
             remote_links: HashMap::new(),
             remote_monitors: HashMap::new(),
             named_monitors: HashMap::new(),
+            tags: HashMap::new(),
             local_node: None,
             router: None,
         }
@@ -659,7 +687,6 @@ impl ProcessTable {
                 reference,
                 target,
                 kind,
-                tag,
             });
         }
         if let Some(process) = self.get_mut(target) {
@@ -667,9 +694,10 @@ impl ProcessTable {
                 reference,
                 watcher,
                 kind,
-                tag,
             });
         }
+        // The tag is kept in the side table, not in the records above (see the field docs).
+        remember_tag(&mut self.tags, reference, tag);
         Ok(reference)
     }
 
@@ -851,7 +879,6 @@ impl ProcessTable {
                 reference,
                 target,
                 kind,
-                tag,
             });
         }
         if let Some(process) = self.get_mut(target) {
@@ -859,11 +886,12 @@ impl ProcessTable {
                 reference,
                 watcher,
                 kind,
-                tag,
             });
         }
         self.named_monitors
             .insert(reference, NamedTarget { name, node });
+        // The tag is kept in the side table, not in the records above (see the field docs).
+        remember_tag(&mut self.tags, reference, tag);
         Ok(reference)
     }
 
@@ -932,8 +960,10 @@ impl ProcessTable {
         if let Some(process) = self.get_mut(watcher) {
             process
                 .port_monitors_mut()
-                .push(PortWatch { reference, port, tag });
+                .push(PortWatch { reference, port });
         }
+        // The tag is kept in the side table, not in the watch above (see the field docs).
+        remember_tag(&mut self.tags, reference, tag);
         Ok(reference)
     }
 
@@ -1022,6 +1052,8 @@ impl ProcessTable {
         if ports.contains(watch.port) {
             ports.demonitor(watch.port, reference)?;
         }
+        // The monitor is gone, so its user tag goes with it.
+        forget_tag(&mut self.tags, reference);
         Ok(true)
     }
 
@@ -1053,8 +1085,9 @@ impl ProcessTable {
                 .monitored_by_mut()
                 .retain(|entry| entry.reference != reference);
         }
-        // A named monitor's `{Name, node}` descriptor dies with it.
+        // A named monitor's `{Name, node}` descriptor dies with it — and so does its user tag.
         self.named_monitors.remove(&reference);
+        forget_tag(&mut self.tags, reference);
         Ok(true)
     }
 
@@ -1215,27 +1248,32 @@ impl ProcessTable {
             receivers.push(target);
         }
 
-        // 2. Monitors: every watcher is told the target is down.
+        // 2. Monitors: every watcher is told the target is down, carrying the monitor's
+        //    `erlang:monitor/3` user tag when it has one. The records hold no tag field, so it is
+        //    read from the side table; the DOWN that consumes it is its last use, so the entry is
+        //    dropped as soon as the signal is queued.
         for watcher in watchers {
             if !self.contains(watcher.watcher) {
                 // The watcher died earlier in this same propagation.
                 continue;
             }
+            let tag = self.tags.get(&watcher.reference).copied();
             self.enqueue_down_signal(
                 watcher.watcher,
                 watcher.reference,
                 pid,
                 watcher.kind,
-                watcher.tag,
+                tag,
                 reason,
                 Some(process.off_heap()),
             )?;
+            forget_tag(&mut self.tags, watcher.reference);
             receivers.push(watcher.watcher);
         }
 
-        // 3. The dying process's own outgoing monitors vanish with it — and so does the
-        //    `{Name, node}` descriptor of any named monitor among them (nothing will ever
-        //    report it down).
+        // 3. The dying process's own outgoing monitors vanish with it — and so do the
+        //    `{Name, node}` descriptor and the user tag of any named/tagged monitor among them
+        //    (nothing will ever report them down).
         for monitor in &outgoing {
             let reference = monitor.reference;
             if let Some(target) = self.get_mut(monitor.target) {
@@ -1244,6 +1282,7 @@ impl ProcessTable {
                     .retain(|entry| entry.reference != reference);
             }
             self.named_monitors.remove(&reference);
+            forget_tag(&mut self.tags, reference);
         }
 
         // 4. Remote links and monitors: a dying process leaves the node's records, and every
@@ -1546,8 +1585,9 @@ impl ProcessTable {
     }
 
     /// Enqueues a monitor-DOWN signal on `to`'s signal queue, copying `reason` out of the heap
-    /// described by `src` (see [`ProcessTable::enqueue_exit_signal`]); `tag` is the monitor's
-    /// `erlang:monitor/3` user tag (a heap-independent immediate, carried verbatim).
+    /// described by `src` (see [`ProcessTable::enqueue_exit_signal`]). `tag` is the monitor's
+    /// `erlang:monitor/3` user tag — read from the side table by the caller, since the records
+    /// carry none — and is a heap-independent immediate, carried verbatim.
     fn enqueue_down_signal(
         &mut self,
         to: ProcessId,
@@ -2093,18 +2133,16 @@ impl ProcessTable {
 
         // 1. Monitors: the port's death resolves the incoming half here (drained by `close`)
         //    and the watcher's outgoing half below; then the watcher is told the port is down.
-        //    The outgoing half carries the `erlang:monitor/3` user tag, so it is read (and the
-        //    half dropped) before the DOWN is built.
+        //    The records hold no tag field, so the monitor's `erlang:monitor/3` user tag is read
+        //    from the side table; the DOWN built below is its last use, so the entry is dropped.
         for monitor in closed.monitors {
-            let tag = self.get_mut(monitor.watcher).and_then(|watcher| {
-                let entries = watcher.port_monitors_mut();
-                let tag = entries
-                    .iter()
-                    .find(|watch| watch.reference == monitor.reference)
-                    .and_then(|watch| watch.tag);
-                entries.retain(|watch| watch.reference != monitor.reference);
-                tag
-            });
+            if let Some(watcher) = self.get_mut(monitor.watcher) {
+                watcher
+                    .port_monitors_mut()
+                    .retain(|watch| watch.reference != monitor.reference);
+            }
+            let tag = self.tags.get(&monitor.reference).copied();
+            forget_tag(&mut self.tags, monitor.reference);
             self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, tag, reason)?;
         }
 
