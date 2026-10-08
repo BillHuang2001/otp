@@ -54,11 +54,20 @@
 //!   environment; `External` sorts after any local kind. The `Local` kind has no
 //!   `module`/`old_uniq` in its M1 descriptor and mixed `Local`/`Imported` pairs
 //!   lead with the kind rank — see [`cmp_funs`] for both documented deviations.
-//! * **External pid/port/ref, records and on-heap bin refs** have a
-//!   *deterministic fallback*: they are ordered by class first (which is exact),
-//!   then by object arity, then by the raw term word (a stable proxy). This never
-//!   panics but is not a faithful reproduction of the C's structural comparison
-//!   for those specific classes; callers that need exact ordering for them must
+//! * **External pids/ports/refs and native records** are compared *structurally*
+//!   (see [`cmp_external_pids`], [`cmp_external_ports`], [`cmp_external_refs`] and
+//!   [`cmp_records`]), so a copy of such a term compares `=:=`/`Equal` to its
+//!   original. The field orders reproduce `erts_cmp_compound`: an external pid by
+//!   `serial`, then `number`, then the node (sysname atom, then `creation`); an
+//!   external port by the node, then `number`; an external reference by the node,
+//!   then its id words as one big integer (highest index most significant, the
+//!   longer slice's leading zero ids trimmed first); a native record by its
+//!   definition's `module`, `name` and `is_exported` (`false < true`), its field
+//!   count and keys, and finally its field values.
+//! * **On-heap bin refs** have a *deterministic fallback*: they are ordered by
+//!   class first (which is exact), then by object arity, then by the raw term word
+//!   (a stable proxy). This never panics but is not a faithful reproduction of the
+//!   C's structural comparison; a caller that needs exact ordering for it must
 //!   extend this module.
 //!
 //! ## Non-term words (a documented robustness extension)
@@ -93,7 +102,12 @@ use crate::immediate::{
 use crate::list::{car, cdr, is_list};
 use crate::number::number_as_f64;
 use crate::ops::{class, TermClass};
+use crate::record::{
+    record_definition, record_definition_is_exported, record_definition_keys,
+    record_definition_module, record_definition_name, record_field_count, record_values,
+};
 use crate::tag::{is_term_word, BIG_SIGN_BIT};
+use crate::thing::{external_pid_parts, external_port_parts, external_ref_parts};
 use crate::tuple::{tuple_element, tuple_size};
 
 /// Ascending term-order rank of a [`TermClass`].
@@ -237,7 +251,15 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
         TermClass::Map => cmp_maps(a, b, atoms, exact),
         // SAFETY: both operands are live funs.
         TermClass::Fun => unsafe { cmp_funs(a, b, atoms, exact) },
-        // Documented deterministic fallback (see the module `Known Issues`).
+        // SAFETY: both operands are live external pids/ports/refs, or live native
+        // records — one class per arm, as established by `class_rank` above.
+        TermClass::ExternalPid => unsafe { cmp_external_pids(a, b, atoms, exact) },
+        TermClass::ExternalPort => unsafe { cmp_external_ports(a, b, atoms, exact) },
+        TermClass::ExternalRef => unsafe { cmp_external_refs(a, b, atoms, exact) },
+        TermClass::Record => unsafe { cmp_records(a, b, atoms, exact) },
+        // The on-heap bin ref still uses the documented deterministic fallback (see
+        // the module `Known Issues`); the catch-all keeps the match total for any
+        // class added later.
         _ => fallback_cmp(a, b),
     }
 }
@@ -530,6 +552,265 @@ unsafe fn cmp_refs(a: Eterm, b: Eterm) -> Ordering {
         let (wa, wb) = unsafe { ((*pa.add(1 + i)).raw(), (*pb.add(1 + i)).raw()) };
         if wa != wb {
             return wa.cmp(&wb);
+        }
+    }
+    Ordering::Equal
+}
+
+/// `CMP_NODES` (`erts/emulator/beam/utils.c:1715-1723`) for the M1 node
+/// representation: order two nodes by their sysname atom, then by `creation`.
+///
+/// The C short-circuits on node *pointer* identity and otherwise compares
+/// `(AN)->sysname` with `erts_cmp_atoms` followed by `(AN)->creation`. This tree has
+/// no node registry — the sysname atom and the creation live *inside* the term (the
+/// M1 substitution documented on [`crate::thing::write_external_pid`]) — so there is
+/// no pointer identity to short-circuit on and both fields are always compared, in
+/// that order.
+fn cmp_nodes(
+    node_a: Eterm,
+    creation_a: u32,
+    node_b: Eterm,
+    creation_b: u32,
+    atoms: &AtomTable,
+    exact: bool,
+) -> Ordering {
+    let ord = cmp_impl(node_a, node_b, atoms, exact);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    creation_a.cmp(&creation_b)
+}
+
+/// Compare two external pids — the `pid_common` block of `erts_cmp_compound`
+/// (`erts/emulator/beam/utils.c:1777-1811`).
+///
+/// Field order (`utils.c:1805-1809`): `serial`, then `number`, then the node
+/// (sysname atom, then `creation`). Both operands are external, so the C's
+/// internal/external mixed branches do not apply.
+///
+/// # Safety
+///
+/// `a` and `b` must be live external pid terms.
+unsafe fn cmp_external_pids(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    // SAFETY: the caller guarantees both operands are live external pids written by
+    // `crate::thing::write_external_pid`.
+    let (node_a, number_a, serial_a, creation_a) = unsafe { external_pid_parts(a) };
+    // SAFETY: as above.
+    let (node_b, number_b, serial_b, creation_b) = unsafe { external_pid_parts(b) };
+    serial_a
+        .cmp(&serial_b)
+        .then_with(|| number_a.cmp(&number_b))
+        .then_with(|| cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact))
+}
+
+/// Compare two external ports — the `_TAG_HEADER_EXTERNAL_PORT` arm of
+/// `erts_cmp_compound` (`erts/emulator/beam/utils.c:2219-2238`).
+///
+/// Field order: the node (sysname atom, then `creation`), then `number` (the 64-bit
+/// `V4_PORT_EXT` id, `external_port_number`).
+///
+/// # Safety
+///
+/// `a` and `b` must be live external port terms.
+unsafe fn cmp_external_ports(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    // SAFETY: the caller guarantees both operands are live external ports written by
+    // `crate::thing::write_external_port`.
+    let (node_a, number_a, creation_a) = unsafe { external_port_parts(a) };
+    // SAFETY: as above.
+    let (node_b, number_b, creation_b) = unsafe { external_port_parts(b) };
+    cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact)
+        .then_with(|| number_a.cmp(&number_b))
+}
+
+/// Compare two external references — the `_TAG_HEADER_EXTERNAL_REF` arm of
+/// `erts_cmp_compound` and its `ref_common` tail
+/// (`erts/emulator/beam/utils.c:2239-2308`).
+///
+/// Field order: the node (sysname atom, then `creation`, `utils.c:2263`), then the
+/// ids as one big integer (`utils.c:2265-2287`) — index `len - 1` is the most
+/// significant. When the two id slices differ in length, the longer one's leading
+/// (highest-index) **zero** ids are trimmed first; a non-zero leading id instead
+/// decides immediately (the longer slice is the greater one). The surviving ids are
+/// then compared from the highest index down.
+///
+/// # Safety
+///
+/// `a` and `b` must be live external reference terms.
+unsafe fn cmp_external_refs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    // SAFETY: the caller guarantees both operands are live external references
+    // written by `crate::thing::write_external_ref`.
+    let (node_a, ids_a, creation_a) = unsafe { external_ref_parts(a) };
+    // SAFETY: as above.
+    let (node_b, ids_b, creation_b) = unsafe { external_ref_parts(b) };
+    let ord = cmp_nodes(node_a, creation_a, node_b, creation_b, atoms, exact);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    // Trim the longer slice's leading zero ids — the C's `do { … } while (alen >
+    // blen)` loops reproduced literally, so no index can go out of bounds. The loops
+    // exit with equal lengths (`ASSERT(alen == blen)`, `utils.c:2283`).
+    let (mut la, mut lb) = (ids_a.len(), ids_b.len());
+    if la > lb {
+        loop {
+            if ids_a[la - 1] != 0 {
+                return Ordering::Greater;
+            }
+            la -= 1;
+            if la <= lb {
+                break;
+            }
+        }
+    } else if lb > la {
+        loop {
+            if ids_b[lb - 1] != 0 {
+                return Ordering::Less;
+            }
+            lb -= 1;
+            if la >= lb {
+                break;
+            }
+        }
+    }
+    debug_assert_eq!(la, lb);
+    // Compare the surviving ids from the most significant (highest index) down.
+    let mut i = la.min(lb);
+    while i > 0 {
+        i -= 1;
+        if ids_a[i] != ids_b[i] {
+            return ids_a[i].cmp(&ids_b[i]);
+        }
+    }
+    Ordering::Equal
+}
+
+/// The comparable words of a native-record **instance**, as read through the
+/// [`crate::record`] accessors: the field count, the definition's
+/// `(module, name, is_exported)` words, and its *sorted-key-ordered* key and value
+/// slices.
+struct RecordParts<'a> {
+    field_count: usize,
+    module: Eterm,
+    name: Eterm,
+    is_exported: Eterm,
+    keys: &'a [Eterm],
+    values: &'a [Eterm],
+}
+
+/// Reads a native-record instance's comparable words.
+///
+/// `None` for a malformed record — only reachable if the term was forged outside
+/// this crate (a definition that is not a valid definition block, or one whose arity
+/// disagrees with the instance's own header, as [`crate::record::record_get`] also
+/// guards against).
+///
+/// # Safety
+///
+/// `t` must be a live native-record instance; its storage must stay live and
+/// unmoved for `'a`.
+unsafe fn record_parts<'a>(t: Eterm) -> Option<RecordParts<'a>> {
+    // SAFETY: the caller guarantees `t` is a live native record, so its definition
+    // block, its key array and its own value words are all live.
+    let (field_count, keys, values, module, name, is_exported) = unsafe {
+        let field_count = record_field_count(t).ok()?;
+        let def = record_definition(t).ok()?;
+        (
+            field_count,
+            record_definition_keys(def).ok()?,
+            record_values(t).ok()?,
+            record_definition_module(def).ok()?,
+            record_definition_name(def).ok()?,
+            record_definition_is_exported(def).ok()?,
+        )
+    };
+    if keys.len() != field_count || values.len() != field_count {
+        return None;
+    }
+    Some(RecordParts {
+        field_count,
+        module,
+        name,
+        is_exported,
+        keys,
+        values,
+    })
+}
+
+/// The `false < true` order of a record definition's `is_exported` word
+/// (`erts/emulator/beam/utils.c:1917-1921`, `ASSERT(false < true)`).
+///
+/// The C stores the flag as an `int` (`0`/`1`) and subtracts the two operands; this
+/// crate stores the atom `false`/`true` (`AM_FALSE`/`AM_TRUE`, atom indices 0/1, see
+/// [`crate::record`]), so the atom index is the comparable value. A word that is not
+/// an atom (only reachable for a forged record) ranks after both.
+fn exported_rank(is_exported: Eterm) -> u32 {
+    if is_atom(is_exported) {
+        atom_val(is_exported).raw()
+    } else {
+        u32::MAX
+    }
+}
+
+/// Compare two native records — the `_TAG_HEADER_RECORD` arm of `erts_cmp_compound`
+/// (`erts/emulator/beam/utils.c:1878-1954`).
+///
+/// The field order: the definition's `module` atom, `name` atom (both through
+/// [`cmp_impl`], which routes two atoms to the C's `erts_cmp_atoms`) and
+/// `is_exported` (`false < true`), then the instance's field
+/// count, then the field **keys**, and finally the field **values** (`utils.c:1941-1952`;
+/// the C pushes the value pairs in reverse so they pop — and are compared — in
+/// ascending order).
+///
+/// This crate stores the definition keys and the instance values in **sorted-key
+/// order** (`crate::record`), so keys and values are compared index-aligned, and the
+/// comparison is always structural. **Documented deviation from the C:** `def_a !=
+/// def_b` there is a *canonicalisation pointer short-circuit* for the common "same
+/// definition" case, and its key/value loops index through `order_a[i]`/`order_b[i]`
+/// (declaration order) with a `RECORD_VALUE_PAIR` work-stack permutation. For two
+/// records with the same definition the result is exactly the C's; for the exotic
+/// case of two records that declare the same fields in *different* orders the C
+/// pairs them by declared position while this comparison pairs them by sorted key,
+/// so it can differ. (The field-count check uses [`record_field_count`] where the C
+/// compares `record_header_arity` — the same value `+ 1`, so the order is identical.)
+///
+/// A malformed record (only reachable if the term was forged outside this crate)
+/// falls back to the deterministic [`fallback_cmp`] rather than panicking.
+///
+/// # Safety
+///
+/// `a` and `b` must be live native record terms.
+unsafe fn cmp_records(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    // SAFETY: the caller guarantees both operands are live native records.
+    let (parts_a, parts_b) = unsafe { (record_parts(a), record_parts(b)) };
+    let (Some(ra), Some(rb)) = (parts_a, parts_b) else {
+        return fallback_cmp(a, b);
+    };
+    // The definition content, in the C's order (`utils.c:1907-1938`).
+    let ord = cmp_impl(ra.module, rb.module, atoms, exact);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    let ord = cmp_impl(ra.name, rb.name, atoms, exact);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    let ord = exported_rank(ra.is_exported).cmp(&exported_rank(rb.is_exported));
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    let ord = ra.field_count.cmp(&rb.field_count);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    for i in 0..ra.field_count {
+        let ord = cmp_impl(ra.keys[i], rb.keys[i], atoms, exact);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    for i in 0..ra.field_count {
+        let ord = cmp_impl(ra.values[i], rb.values[i], atoms, exact);
+        if ord != Ordering::Equal {
+            return ord;
         }
     }
     Ordering::Equal
