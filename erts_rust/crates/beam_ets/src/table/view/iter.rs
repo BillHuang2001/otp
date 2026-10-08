@@ -265,7 +265,7 @@ impl<'g> TableRead<'g> {
     /// let leaked = shared.with_read(|view| view.iter_keys(&atoms)).unwrap();
     /// let _ = leaked.count();
     /// ```
-    pub fn iter_keys<'a>(&'a self, atoms: &'a AtomTable) -> KeyIter<'a> {
+    pub fn iter_keys<'a>(&'a self, atoms: &'a AtomTable) -> impl Iterator<Item = TableTerm<'a>> + 'a {
         KeyIter {
             walk: KeyWalk::new(self, atoms, Direction::Forward),
         }
@@ -295,7 +295,10 @@ impl<'g> TableRead<'g> {
     ///     .unwrap();
     /// let _ = leaked.is_some();
     /// ```
-    pub fn iter_keys_rev<'a>(&'a self, atoms: &'a AtomTable) -> KeyIterRev<'a> {
+    pub fn iter_keys_rev<'a>(
+        &'a self,
+        atoms: &'a AtomTable,
+    ) -> impl Iterator<Item = TableTerm<'a>> + 'a {
         KeyIterRev {
             walk: KeyWalk::new(self, atoms, Direction::Reverse),
         }
@@ -333,7 +336,10 @@ impl<'g> TableRead<'g> {
     ///     .unwrap();
     /// assert_eq!(total, 60);
     /// ```
-    pub fn iter_objects<'a>(&'a self, atoms: &'a AtomTable) -> ObjectIter<'a> {
+    pub fn iter_objects<'a>(
+        &'a self,
+        atoms: &'a AtomTable,
+    ) -> impl Iterator<Item = TableTerm<'a>> + 'a {
         ObjectIter {
             walk: KeyWalk::new(self, atoms, Direction::Forward),
             pending: Vec::new().into_iter(),
@@ -343,7 +349,10 @@ impl<'g> TableRead<'g> {
     /// Every stored **object** in reverse iteration order — the exact mirror of
     /// [`iter_objects`](Self::iter_objects): keys last-to-first, and each key's
     /// objects last-to-first.
-    pub fn iter_objects_rev<'a>(&'a self, atoms: &'a AtomTable) -> ObjectIterRev<'a> {
+    pub fn iter_objects_rev<'a>(
+        &'a self,
+        atoms: &'a AtomTable,
+    ) -> impl Iterator<Item = TableTerm<'a>> + 'a {
         ObjectIterRev {
             walk: KeyWalk::new(self, atoms, Direction::Reverse),
             pending: Vec::new().into_iter(),
