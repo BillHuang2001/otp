@@ -1,11 +1,37 @@
 //! Execution-trace emission (`impl Machine`, contract A.8).
 //!
 //! The engine reports the `call`/`return_from`/`return_to` event family to its host
-//! through [`ExecutionContext::trace_event`], gated by the single cheap
-//! [`ExecutionContext::trace_enabled`] check the dispatch loop performs per
-//! call/return instruction (`crate::interpreter::dispatch`). Everything in this
-//! module runs **only** while that gate is on, so an untraced run never builds an
+//! through [`ExecutionContext::trace_event`], gated by the per-run flag
+//! `Machine::trace_on` (`crate::interpreter::dispatch`). Everything in this
+//! module runs **only** while that flag is on, so an untraced run never builds an
 //! event.
+//!
+//! # The gate (why it is a `Machine` field, not a context call)
+//!
+//! The gate is latched **once per run** from
+//! [`ExecutionContext::trace_enabled`], at the driver that executes instructions
+//! ([`Machine::run_loop_with_map`](crate::Machine) on the interpreter — which also
+//! covers [`Machine::resume_outcome`](crate::Machine) and the label entry — and the
+//! shared native driver on the baseline/Cranelift tiers). The call/return
+//! instruction arms then read the plain `Machine::trace_on` `bool`, so an
+//! untraced run pays **one `bool` load** per call/return instruction instead of a
+//! `&mut dyn ExecutionContext` vtable call, and the single `trace_enabled()` call
+//! happens once per run.
+//!
+//! **Mid-run semantics.** Because the flag is latched at an entry, a host that
+//! changes its answer to `trace_enabled()` *while* a run is in progress sees the
+//! change take effect at the process's next run entry /
+//! [`Machine::resume_outcome`](crate::Machine) — not at the next instruction. This
+//! matches the granularity a host needs (it is asked once per run), and it is why a
+//! traced process resumed out of a blocking `receive` picks tracing up on resume.
+//! [`Machine::reset`](crate::Machine) clears the flag, so a run that never latches
+//! it cannot inherit a stale `true`.
+//!
+//! A **natively-executed baseline/Cranelift block does not trace**: only the
+//! per-instruction deopt path goes through
+//! [`Machine::step_instruction`](crate::Machine) (where the call/return arms live),
+//! so a call/return instruction that a tier inlined is not reported. That is the
+//! documented tier limitation, never a wrong result — the run itself is unchanged.
 //!
 //! # Emission points (the whole scope)
 //!

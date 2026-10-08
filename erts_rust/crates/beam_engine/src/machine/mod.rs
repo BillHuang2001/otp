@@ -139,6 +139,27 @@ pub struct Machine {
     /// survives), so it never keeps a term alive and [`Machine::reset`] has nothing
     /// to clear.
     pub(crate) args_scratch: Vec<Eterm>,
+    /// The **per-run tracing gate** (contract A.8): the cached answer of
+    /// [`ExecutionContext::trace_enabled`](crate::context::ExecutionContext::trace_enabled)
+    /// for the run currently executing.
+    ///
+    /// The dispatch loop's call/return arms consult this plain `bool` (one
+    /// predictable load) instead of making a `&mut dyn ExecutionContext` vtable call
+    /// **per call/return instruction**; the single `trace_enabled()` call happens
+    /// **once per run**, at the driver entry (`Machine::run_loop_with_map` on the
+    /// interpreter, the shared native driver on the baseline/Cranelift tiers).
+    ///
+    /// **Semantics.** The flag is latched at a run/resume entry, so a host that
+    /// turns tracing on or off **mid-run** sees the change take effect at the
+    /// process's *next* run entry or [`Machine::resume_outcome`] — not at the next
+    /// instruction. This is exactly the granularity a host needs (its
+    /// `trace_enabled()` is consulted once per run, not per instruction) and it keeps
+    /// the per-instruction hot path to a single `bool` load.
+    ///
+    /// [`Machine::reset`](crate::machine::Machine::reset) leaves it `false`, so a run
+    /// that never sets it (e.g. a direct `Machine::step_instruction` call in a test)
+    /// cannot leak a stale `true` from an earlier run.
+    pub(crate) trace_on: bool,
     /// The code address the machine is currently executing, or was most recently
     /// **suspended** at: `(function index, code offset)`.
     ///
@@ -188,6 +209,7 @@ impl Machine {
             literals: None,
             refc_binaries: Vec::new(),
             args_scratch: Vec::new(),
+            trace_on: false,
             current_code: None,
             entry_call: None,
         };

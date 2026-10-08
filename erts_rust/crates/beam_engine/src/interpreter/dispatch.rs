@@ -246,7 +246,7 @@ impl Machine {
                 // Contract A.8: report the callee's `call` event (the oracle's
                 // breakpoint fires on entry to the callee). Gated, so an untraced
                 // run pays one predictable branch and builds no event.
-                if ctx.trace_enabled() {
+                if self.trace_on {
                     self.trace_call_local(module, callee, ctx);
                 }
                 Ok(Step::Goto {
@@ -268,7 +268,7 @@ impl Machine {
                 // The `call` event names the tail-callee; the frame that remains is
                 // the original caller's, so the callee's eventual `return` reports
                 // *that* caller (`return_to`), never the tail-called-into function.
-                if ctx.trace_enabled() {
+                if self.trace_on {
                     self.trace_call_local(module, callee, ctx);
                 }
                 Ok(Step::Goto {
@@ -278,7 +278,7 @@ impl Machine {
             }
             Instr::CallOnly { target, .. } => {
                 let (callee, callee_pc) = resolve(labels, *target)?;
-                if ctx.trace_enabled() {
+                if self.trace_on {
                     self.trace_call_local(module, callee, ctx);
                 }
                 Ok(Step::Goto {
@@ -294,7 +294,7 @@ impl Machine {
                 // Only the callee's *entry* is traced: the oracle emits no
                 // `return_to` for a BIF/cross-module completion, so reporting a
                 // return here would invent an event (see `super::trace`).
-                if ctx.trace_enabled() {
+                if self.trace_on {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
                 match self.call_import(module, labels, *target, *arity, ctx) {
@@ -306,7 +306,7 @@ impl Machine {
                 }
             }
             Instr::CallExtOnly { target, arity } => {
-                if ctx.trace_enabled() {
+                if self.trace_on {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
                 match self.call_import(module, labels, *target, *arity, ctx) {
@@ -345,7 +345,7 @@ impl Machine {
                 //   never-returning `call_ext_last` (e.g. `erlang:error/1`) is then
                 //   dead code C never applies — the shape that produced the bogus
                 //   `deallocate: frame size mismatch` reason instead of the BIF's.
-                if ctx.trace_enabled() {
+                if self.trace_on {
                     self.trace_call_import(module, labels, *target, ctx);
                 }
                 match self.call_import(module, labels, *target, *arity, ctx) {
@@ -408,7 +408,7 @@ impl Machine {
                     // returns *to*. The frame is already the caller's (the compiler's
                     // `deallocate` has popped the returning function's own frame), so
                     // a tail-called function's `return` names the ORIGINAL caller.
-                    if ctx.trace_enabled() {
+                    if self.trace_on {
                         self.trace_return(module, func, caller, ctx);
                     }
                     Ok(Step::Goto {
@@ -440,6 +440,14 @@ impl Machine {
     /// `(func, pc)`, finishing the run with `x(0)` on [`Step::Done`] and reporting a
     /// suspension as [`RunOutcome::Wait`] on [`Step::Wait`] (leaving the machine
     /// untouched so the host can re-enter at the reported address).
+    ///
+    /// The A.8 tracing gate is latched here — **once per run** (and thus once per
+    /// [`Machine::resume_outcome`], so a process that is traced while blocked picks
+    /// the change up on resume): the per-instruction call/return arms read the plain
+    /// `Machine::trace_on` `bool` instead of making a `trace_enabled()` vtable call
+    /// per instruction, so an untraced run pays a single `bool` load and no event is
+    /// ever built. See the `Machine::trace_on` field docs for the mid-run
+    /// semantics.
     pub(crate) fn run_loop_with_map(
         &mut self,
         module: &Module,
@@ -448,6 +456,7 @@ impl Machine {
         mut pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<RunOutcome> {
+        self.trace_on = ctx.trace_enabled();
         loop {
             match self.step_instruction(module, labels, func, pc, ctx)? {
                 Step::Next => pc += 1,

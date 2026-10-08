@@ -177,6 +177,11 @@ impl Machine {
         // `entry_call` (the `$initial_call` analogue).
         self.current_code = None;
         self.entry_call = None;
+        // The A.8 tracing gate is re-latched from the context at every run entry
+        // (`run_loop_with_map` / the native driver). Clearing it here means a run
+        // that never latches it (a bare `step_instruction` in a test) cannot inherit
+        // a stale `true` from an earlier traced run.
+        self.trace_on = false;
     }
 }
 
