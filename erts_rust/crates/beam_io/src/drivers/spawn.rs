@@ -39,14 +39,18 @@
 //! `try_wait` and needs no kill), deregister every fd they registered and close the fds
 //! they own. Nothing else may close those fds.
 //!
-//! The failure is detected **synchronously** here, which is faithful for every spawn the
-//! `exec` itself rejects (a missing/unreadable/non-directory program path) but not for the
-//! cases the reference defers to the forked child: `{spawn_executable, "/etc"}` opens a port
-//! in the oracle (its `access(path, X_OK)` precheck passes for a searchable directory, and
-//! only the child's later `exec` fails), whereas this driver's `Command::spawn` reports the
-//! directory's `EACCES` up front. That divergence is architectural — a synchronous spawn
-//! cannot hand back a port whose child is about to fail — and is recorded in the crate
-//! `CONTEXT.md`.
+//! The reference splits a failed spawn in two, and so does this driver. `spawn_start` checks
+//! `access(Path, X_OK)` **in the emulator** (`sys_drivers.c:521`): a path that check cannot
+//! reach — a missing program, a file without its execute bit, a path through a non-directory —
+//! is an `open_port/2` **error** carrying the failing `errno`'s atom. A path the check
+//! *accepts* but the `exec` rejects (a searchable **directory**, a file with no recognizable
+//! executable format) instead **opens the port**: the `exec` happens in the forked child,
+//! which exits with the failing `errno` (`erl_child_setup.c:361-369`). So
+//! `{spawn_executable, "/etc"}` is a real port whose child reports `{exit_status, 13}`, while
+//! `{spawn_executable, "/etc/hosts"}` (no execute bit) is `error:eacces`. Because the standard
+//! library's `Command::spawn` reports a failing `exec` synchronously, those deferred cases are
+//! started by [`fork_exec_child`]'s own `fork`/`execve` — a real child that reproduces the
+//! reference exactly, never a stand-in.
 //!
 //! # Readiness model
 //!
@@ -137,6 +141,8 @@
 //! All raw syscalls (`read`/`write`/`close`) live here; every `unsafe` block carries a
 //! `// SAFETY:` rationale.
 
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -394,6 +400,211 @@ fn program_command(argv: &[String]) -> Result<Command> {
     Ok(command)
 }
 
+/// The reference's parent-side `access(Path, X_OK)` check for a `{spawn_executable, Path}`
+/// port (`spawn_start`, `sys_drivers.c:521`).
+///
+/// This check is what separates the oracle's two failure shapes: a path *it* rejects is an
+/// `open_port/2` **error** — `error:enoent` for a program that does not exist, `error:eacces`
+/// for a directory it cannot search or a file without its execute bit, `error:enotdir` for a
+/// path whose component is a file — while a path the check accepts but the later `exec`
+/// rejects (a searchable directory, a file with no recognizable executable format) **opens
+/// the port** and reports the failing `errno` as the child's exit status (see
+/// [`fork_exec_child`]).
+///
+/// The check runs in the *emulator's* working directory, exactly as the reference's does; a
+/// `{cd, Dir}` option is applied later, in the child.
+///
+/// # Errors
+///
+/// [`error::spawn_failure`] of the failing `access(2)` — the errno atom the oracle raises
+/// (`error:enoent`, `error:eacces`, `error:enotdir`, …) — and [`beam_common::BeamError::BadArg`]
+/// for a path containing an interior NUL byte.
+fn check_executable(path: &str) -> Result<()> {
+    let name = CString::new(path.as_bytes()).map_err(|_| error::badarg())?;
+    // SAFETY: `name` is a NUL-terminated C string that outlives the call; `X_OK` only asks
+    // whether the caller may execute/search the path. `access(2)` neither retains the pointer
+    // nor writes through it, and a failure only sets `errno`.
+    if unsafe { libc::access(name.as_ptr(), libc::X_OK) } == 0 {
+        return Ok(());
+    }
+    Err(error::spawn_failure(std::io::Error::last_os_error()))
+}
+
+/// Forks a child that runs `path` directly, reproducing the reference's **deferred** `exec`.
+///
+/// The reference never `exec`s a `{spawn_executable, Path}` program itself: it hands the name
+/// to its forked child, which `execve`s it and calls `_exit(errno)` when that fails
+/// (`erl_child_setup.c:361-369`). A `Command::spawn` cannot express that — it reports the
+/// failing `exec` synchronously — so this is used for the paths whose `access(Path, X_OK)`
+/// check passed ([`check_executable`]) but whose `exec` the standard library rejects. The
+/// result is a real child process whose exit status is the failing `errno` (13 for a directory)
+/// and whose stdout is an empty pipe that reaches end of file, exactly like the oracle's.
+///
+/// Everything that allocates — the program, its argv, the environment block and the `{cd, Dir}`
+/// path, as NUL-terminated C strings — is built **before** the fork, so the child only calls
+/// async-signal-safe operations (`dup2`/`close`/`chdir`/`signal`/`execve`/`_exit`) and never
+/// touches the allocator. The child's stderr is left alone unless the `stderr_to_stdout`
+/// option asked for it, matching the reference's `dup(2)`.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] for an argument or environment entry containing an
+/// interior NUL, and [`beam_common::BeamError::Io`] when a `pipe(2)`, `fork(2)` or the parent
+/// side's `fcntl(2)` fails (nothing is left registered or running in that case).
+fn fork_exec_child(
+    path: &str,
+    options: &SpawnOptions,
+    stream_options: StreamOptions,
+) -> Result<(ChildProc, Option<RawFd>, Option<RawFd>)> {
+    // The program and its argv: `argv[0]` is the path itself (the reference substitutes its
+    // default `argv[0]` with the command line), then the `{args, …}` entries.
+    let program = CString::new(path.as_bytes()).map_err(|_| error::badarg())?;
+    let mut argv = Vec::with_capacity(options.args.len() + 2);
+    argv.push(program.clone());
+    for arg in &options.args {
+        argv.push(CString::new(arg.as_bytes()).map_err(|_| error::badarg())?);
+    }
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|arg| arg.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+
+    // The environment: the emulator's own, with the `{env, …}` additions overlaid (a repeated
+    // name replaces the inherited entry, the same rule `Command::env` applies).
+    let mut envp = Vec::with_capacity(options.env.len());
+    for (key, value) in std::env::vars_os() {
+        let key_bytes = key.as_os_str().as_bytes();
+        if options
+            .env
+            .iter()
+            .any(|(name, _)| name.as_bytes() == key_bytes)
+        {
+            continue;
+        }
+        envp.push(env_entry(key_bytes, value.as_os_str().as_bytes())?);
+    }
+    for (key, value) in &options.env {
+        envp.push(env_entry(key.as_bytes(), value.as_bytes())?);
+    }
+    let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|entry| entry.as_ptr()).collect();
+    envp_ptrs.push(std::ptr::null());
+
+    let dir = match &options.cd {
+        Some(dir) => Some(CString::new(dir.as_bytes()).map_err(|_| error::badarg())?),
+        None => None,
+    };
+
+    let mut stdin_pipe = [0 as RawFd; 2];
+    let mut stdout_pipe = [0 as RawFd; 2];
+    // SAFETY: both arrays are valid, writable 2-element arrays, so `pipe(2)` writes two fresh
+    // descriptors into each. On the failure paths below the descriptors already created are
+    // closed before returning, so none leaks.
+    if unsafe { libc::pipe(stdin_pipe.as_mut_ptr()) } != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: as above, and the first pipe is closed if this one cannot be created.
+    if unsafe { libc::pipe(stdout_pipe.as_mut_ptr()) } != 0 {
+        let err = std::io::Error::last_os_error();
+        close_fd(stdin_pipe[0]);
+        close_fd(stdin_pipe[1]);
+        return Err(error::io(err));
+    }
+
+    // SAFETY: the child runs only async-signal-safe calls on buffers and descriptors that were
+    // fully built and opened above — nothing allocates or takes a lock between `fork` and
+    // `exec` — and every pointer it passes to `execve` is borrowed from a value that outlives
+    // the call (`argv`/`envp`/`dir`/`program` are dropped only after the fork has returned).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        for fd in [stdin_pipe[0], stdin_pipe[1], stdout_pipe[0], stdout_pipe[1]] {
+            close_fd(fd);
+        }
+        return Err(error::io(err));
+    }
+    if pid == 0 {
+        // The forked child. Only async-signal-safe operations from here on: a failure is
+        // reported the way the reference reports it, by exiting with the failing `errno`.
+        // SAFETY: every descriptor below is one this function just created and still owns, and
+        // every pointer is a live NUL-terminated C string owned by the frame above. `_exit(2)`
+        // never returns, so the child cannot touch the parent's state.
+        unsafe {
+            if libc::dup2(stdin_pipe[0], libc::STDIN_FILENO) < 0
+                || libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO) < 0
+                || (stream_options.stderr_to_stdout
+                    && libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO) < 0)
+            {
+                libc::_exit(current_errno());
+            }
+            // The pipe ends above descriptor 2 are the parent's now; leaving them open would
+            // keep the port's streams alive past the `exec`.
+            for fd in [stdin_pipe[0], stdin_pipe[1], stdout_pipe[0], stdout_pipe[1]] {
+                if fd > libc::STDERR_FILENO {
+                    libc::close(fd);
+                }
+            }
+            // The `{cd, Dir}` option is the child's, as in the reference (`chdir(wd)` before
+            // `exec`, `erl_child_setup.c:302`): a directory it cannot enter is the child's
+            // failure, reported as that errno by its exit status.
+            if let Some(dir) = &dir {
+                if libc::chdir(dir.as_ptr()) < 0 {
+                    libc::_exit(current_errno());
+                }
+            }
+            // The standard library ignores `SIGPIPE` in this process; a spawned child must not
+            // inherit that (its own `Command::spawn` resets it the same way).
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            libc::execve(program.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+            libc::_exit(current_errno());
+        }
+    }
+
+    // The parent: the child owns the two ends it was handed, so only the port's ends are kept.
+    close_fd(stdin_pipe[0]);
+    close_fd(stdout_pipe[1]);
+    let stdin_fd = stdin_pipe[1];
+    let stdout_fd = stdout_pipe[0];
+    // Non-blocking must be in place before either descriptor reaches the poller.
+    for fd in [stdin_fd, stdout_fd] {
+        if let Err(err) = set_nonblocking(fd) {
+            // The child is alive but unusable: reap it, then release the descriptors.
+            close_fd(stdin_fd);
+            close_fd(stdout_fd);
+            let mut child = ChildProc::Forked(ForkedChild::new(pid));
+            let _reap = child.kill_and_reap();
+            return Err(err);
+        }
+    }
+    Ok((
+        ChildProc::Forked(ForkedChild::new(pid)),
+        Some(stdin_fd),
+        Some(stdout_fd),
+    ))
+}
+
+/// The `NAME=VALUE` environment entry `name`/`value` describe, as a NUL-terminated C string.
+///
+/// # Errors
+///
+/// [`beam_common::BeamError::BadArg`] when the entry contains an interior NUL (which cannot be
+/// passed through a `char *`, and which the oracle would reject as a `badarg` too).
+fn env_entry(name: &[u8], value: &[u8]) -> Result<CString> {
+    let mut entry = Vec::with_capacity(name.len() + value.len() + 1);
+    entry.extend_from_slice(name);
+    entry.push(b'=');
+    entry.extend_from_slice(value);
+    CString::new(entry).map_err(|_| error::badarg())
+}
+
+/// The current `errno` without allocating — the one thing the forked child needs beyond the
+/// async-signal-safe syscalls themselves.
+///
+/// `std::io::Error::from_raw_os_error` only stores the code (formatting it, which allocates, is
+/// what the child must not do), so this is safe to call between `fork` and `_exit(2)`.
+fn current_errno() -> libc::c_int {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EINVAL)
+}
+
 /// The `spawn` driver: an OS child process (or an adopted descriptor) behind a port.
 ///
 /// Constructed directly from a [`SpawnSpec`]/[`SpawnOptions`] pair (see the module docs) and
@@ -407,7 +618,7 @@ pub struct SpawnDriver {
     /// The port "name" string (the shell command line, the argv join, or `fd:<N>`).
     command: String,
     /// The child process; `None` for a `{fd, N}` port.
-    child: Option<Child>,
+    child: Option<ChildProc>,
     /// The child's write end (the port's output stream), once created and put in
     /// non-blocking mode.
     stdin_fd: Option<RawFd>,
@@ -472,7 +683,11 @@ impl SpawnDriver {
     /// for an unreadable one, `error:enotdir` for a path through a non-directory, … The
     /// reference answers `erl_errno_id(errno)` (`erts_internal_open_port_2`,
     /// `erl_bif_port.c:84`) and the atom is the lowercase errno name (see the crate's `error`
-    /// module). An errno this crate does not recognise falls back to
+    /// module). For a `{spawn_executable, Path}` port that atom is the one
+    /// [`check_executable`]'s `access(Path, X_OK)` reports, exactly as `spawn_start` does it
+    /// (`sys_drivers.c:521`); a program the check accepts but the `exec` rejects is **not** an
+    /// error — the port opens and the child exits with that errno (see [`fork_exec_child`]).
+    /// An errno this crate does not recognise falls back to
     /// [`beam_common::BeamError::Io`], as does a failure putting a descriptor in non-blocking
     /// mode (or reaping a child a failed spawn left behind); [`beam_common::BeamError::BadArg`]
     /// for an `{fd, N}` spec with a negative descriptor, for an empty argv vector, or for the
@@ -511,18 +726,43 @@ impl SpawnDriver {
             });
         }
         // `build_command_with_stream` answers `None` only for the `{fd, N}` form, handled above.
+        // It runs first so the name validation it owns (an empty command/path is the oracle's
+        // `badarg`, done before any driver is reached) precedes the driver's own check below.
         let Some(mut built) = build_command_with_stream(spec, options, stream_options)? else {
             return Err(error::badarg());
         };
-        let mut child = built.spawn().map_err(error::spawn_failure)?;
+        // The reference checks the program in the *emulator* before forking a
+        // `{spawn_executable, Path}` port (`spawn_start`, `sys_drivers.c:521`), so a path it
+        // rejects is a constructor error; only a path the check accepts reaches the child.
+        let executable_path = match spec {
+            SpawnSpec::SpawnExecutable { path } => {
+                check_executable(path)?;
+                Some(path.as_str())
+            }
+            _ => None,
+        };
+        let (mut child, stdin_fd, stdout_fd) = match built.spawn() {
+            Ok(mut started) => {
+                // Take both ends out of the child so the driver owns them as plain descriptors
+                // (the same reason `FdDriver` owns its fds: the poller and the syscall wrappers
+                // work on raw descriptors). stderr is never a pipe here
+                // (`build_command_with_stream` inherits it, or makes it a duplicate of the
+                // stdout pipe), so the `Child` holds no stderr pipe to drain.
+                let stdin_fd = started.stdin.take().map(IntoRawFd::into_raw_fd);
+                let stdout_fd = started.stdout.take().map(IntoRawFd::into_raw_fd);
+                (ChildProc::Standard(started), stdin_fd, stdout_fd)
+            }
+            // The standard library reports a failing `exec` synchronously; the reference defers
+            // it to the child. Only a `{spawn_executable, Path}` port can name a path here — its
+            // `access(Path, X_OK)` check passed just above — so the failure is the `exec`
+            // itself, and [`fork_exec_child`] reproduces the oracle: a real child that exits
+            // with the failing errno.
+            Err(err) => match executable_path {
+                Some(path) => fork_exec_child(path, options, stream_options)?,
+                None => return Err(error::spawn_failure(err)),
+            },
+        };
         let os_pid = child.id();
-        // Take both ends out of the child so the driver owns them as plain descriptors (the
-        // same reason `FdDriver` owns its fds: the poller and the syscall wrappers work on
-        // raw descriptors). stderr is never a pipe here (`build_command_with_stream` inherits
-        // it, or makes it a duplicate of the stdout pipe), so the `Child` holds no stderr pipe
-        // to drain.
-        let stdin_fd = child.stdin.take().map(IntoRawFd::into_raw_fd);
-        let stdout_fd = child.stdout.take().map(IntoRawFd::into_raw_fd);
         // Non-blocking must be in place before either descriptor reaches the poller.
         let prepared = [stdin_fd, stdout_fd]
             .into_iter()
@@ -536,7 +776,7 @@ impl SpawnDriver {
             for fd in [stdin_fd, stdout_fd].into_iter().flatten() {
                 close_fd(fd);
             }
-            let _reap = kill_and_reap(&mut child);
+            let _reap = child.kill_and_reap();
             return Err(err);
         }
         Ok(SpawnDriver {
@@ -595,8 +835,7 @@ impl SpawnDriver {
         let Some(child) = self.child.as_mut() else {
             return Ok(None);
         };
-        let status = child.try_wait().map_err(error::io)?;
-        Ok(status.map(exit_status_code))
+        child.try_wait().map_err(error::io)
     }
 
     /// Takes the child's reaped exit status **once**, when the `exit_status` option asked for
@@ -615,13 +854,12 @@ impl SpawnDriver {
         let Some(child) = self.child.as_mut() else {
             return Ok(None);
         };
-        // `try_wait` caches the status it reaped, so a later teardown `try_wait` still
-        // answers `Some` and needs no kill.
-        let status = child.try_wait().map_err(error::io)?;
-        match status {
+        // The reaped status is cached by the child, so a later teardown still sees it and
+        // needs no kill.
+        match child.try_wait().map_err(error::io)? {
             Some(status) => {
                 self.exit_reported = true;
-                Ok(Some(exit_status_code(status)))
+                Ok(Some(status))
             }
             None => Ok(None),
         }
@@ -799,7 +1037,7 @@ impl SpawnDriver {
         let Some(mut child) = self.child.take() else {
             return Ok(());
         };
-        kill_and_reap(&mut child)
+        child.kill_and_reap()
     }
 }
 
@@ -911,26 +1149,187 @@ impl Drop for SpawnDriver {
     }
 }
 
-/// Kills `child` when it is still running and reaps it.
+/// The child process behind a spawn port.
 ///
-/// # Errors
+/// Two ways of getting one exist because the reference itself has two. The ordinary path is a
+/// [`std::process::Command`], which reports a failing `exec` to its parent; the
+/// `{spawn_executable, Path}` port whose `exec` the oracle *defers* is instead forked by
+/// [`fork_exec_child`], and has no [`Child`] handle — only a pid, which this driver reaps with
+/// `waitpid(2)`.
 ///
-/// [`beam_common::BeamError::Io`] when the kill or the wait fails; the wait is attempted
-/// either way so a dead child is never left as a zombie.
-fn kill_and_reap(child: &mut Child) -> Result<()> {
-    match child.try_wait().map_err(error::io)? {
-        // Already reaped (or already exited): no kill is needed and none is attempted.
-        Some(_status) => Ok(()),
-        None => {
-            let killed = child.kill();
-            // Reap whatever the kill outcome: a child that has died is a zombie until it is
-            // waited on.
-            let waited = child.wait();
-            match killed {
-                Err(err) => Err(error::io(err)),
-                Ok(()) => waited.map(|_status| ()).map_err(error::io),
+/// Both answer the same three questions (`id`, `try_wait`, `kill_and_reap`) in the same units:
+/// the `{Port, {exit_status, N}}` code, i.e. a child's own exit code, or `128 + signal` for one
+/// killed by a signal (the shell convention, and what the legacy `spawn` driver reports).
+enum ChildProc {
+    /// A child started through [`std::process::Command`]: the `{spawn, Cmd}`/argv forms, and a
+    /// `{spawn_executable, Path}` whose `exec` succeeds.
+    Standard(Child),
+    /// A child this driver forked itself, whose `execve` has already been attempted in the
+    /// child (see [`fork_exec_child`]).
+    Forked(ForkedChild),
+}
+
+impl ChildProc {
+    /// The child's OS process id (the value [`SpawnDriver::os_pid`] reports).
+    fn id(&self) -> u32 {
+        match self {
+            ChildProc::Standard(child) => child.id(),
+            ChildProc::Forked(child) => child.id(),
+        }
+    }
+
+    /// Reaps the child if it has already exited, answering its `{exit_status, N}` code.
+    ///
+    /// A status that has been reaped is remembered, so a later call — including the teardown's
+    /// — still answers `Some` and needs no kill.
+    fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+        match self {
+            ChildProc::Standard(child) => {
+                child.try_wait().map(|status| status.map(exit_status_code))
+            }
+            ChildProc::Forked(child) => child.try_wait(),
+        }
+    }
+
+    /// Kills the child when it is still running and reaps it.
+    ///
+    /// # Errors
+    ///
+    /// [`beam_common::BeamError::Io`] when the kill or the wait fails; the wait is attempted
+    /// either way so a dead child is never left as a zombie.
+    fn kill_and_reap(&mut self) -> Result<()> {
+        match self.try_wait().map_err(error::io)? {
+            // Already reaped (or already exited): no kill is needed and none is attempted.
+            Some(_status) => Ok(()),
+            None => {
+                let killed = match self {
+                    ChildProc::Standard(child) => child.kill(),
+                    ChildProc::Forked(child) => child.kill(),
+                };
+                // Reap whatever the kill outcome: a child that has died is a zombie until it is
+                // waited on.
+                let waited = match self {
+                    ChildProc::Standard(child) => child.wait().map(|_status| ()),
+                    ChildProc::Forked(child) => child.wait().map(|_status| ()),
+                };
+                match killed {
+                    Err(err) => Err(error::io(err)),
+                    Ok(()) => waited.map_err(error::io),
+                }
             }
         }
+    }
+}
+
+/// A child this driver forked itself, reaped with `waitpid(2)`.
+///
+/// [`fork_exec_child`] needs a child of its own because [`std::process::Child`] reports a
+/// failing `exec` to its parent, while the reference lets the *child* report it — by exiting
+/// with the failing `errno`. Nothing else about the child differs, so this mirrors the two
+/// things the driver asks of a `Child`: a non-blocking liveness probe and a kill-and-reap.
+struct ForkedChild {
+    /// The child's process id, as `fork(2)` returned it.
+    pid: libc::pid_t,
+    /// The `{exit_status, N}` code, once it has been reaped (so a later call still answers).
+    status: Option<i32>,
+}
+
+impl ForkedChild {
+    /// Wraps the pid `fork(2)` returned; nothing has been reaped yet.
+    fn new(pid: libc::pid_t) -> ForkedChild {
+        ForkedChild { pid, status: None }
+    }
+
+    /// The child's OS process id.
+    fn id(&self) -> u32 {
+        self.pid as u32
+    }
+
+    /// Reaps the child if it has already exited, without blocking.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] from a failing `waitpid(2)`.
+    fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
+        let mut raw: libc::c_int = 0;
+        // SAFETY: `raw` is a valid `c_int` for `waitpid(2)` to write the status into, and
+        // `self.pid` is the child this driver forked and has not reaped yet. `WNOHANG` keeps
+        // the call from blocking; it reaps (and thereby clears) the child when it has exited.
+        let reaped = unsafe { libc::waitpid(self.pid, &mut raw, libc::WNOHANG) };
+        if reaped == 0 {
+            return Ok(None);
+        }
+        if reaped < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let status = wait_status_code(raw);
+        self.status = Some(status);
+        Ok(Some(status))
+    }
+
+    /// Sends `SIGKILL` to the child.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] from a failing `kill(2)` (`ESRCH` when the child is already gone).
+    fn kill(&mut self) -> std::io::Result<()> {
+        // SAFETY: `self.pid` is the child this driver forked; `SIGKILL` needs no argument and
+        // `kill(2)` neither retains a pointer nor writes to the caller's memory.
+        if unsafe { libc::kill(self.pid, libc::SIGKILL) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Blocks until the child has exited, answering its `{exit_status, N}` code.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] from a failing `waitpid(2)`.
+    fn wait(&mut self) -> std::io::Result<i32> {
+        if let Some(status) = self.status {
+            return Ok(status);
+        }
+        let mut raw: libc::c_int = 0;
+        loop {
+            // SAFETY: as in `try_wait`; without `WNOHANG` the call blocks until the child this
+            // driver forked exits, and an `EINTR` (a signal delivered to the port's thread) is
+            // retried rather than reported as a failure.
+            let reaped = unsafe { libc::waitpid(self.pid, &mut raw, 0) };
+            if reaped == self.pid {
+                break;
+            }
+            if reaped < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+        let status = wait_status_code(raw);
+        self.status = Some(status);
+        Ok(status)
+    }
+}
+
+/// The `{Port, {exit_status, N}}` code a raw `waitpid(2)` status stands for.
+///
+/// A child that exited normally reports its own exit code; one **killed by a signal** reports
+/// `128 + signal`, the shell convention the legacy `spawn` driver's status carries.
+fn wait_status_code(raw: libc::c_int) -> i32 {
+    if libc::WIFEXITED(raw) {
+        libc::WEXITSTATUS(raw)
+    } else if libc::WIFSIGNALED(raw) {
+        128 + libc::WTERMSIG(raw)
+    } else {
+        // Neither an exit nor a signal (a stop or a continued child): no exit code exists, and
+        // `WNOHANG` without `WUNTRACED` never reports one, so this is unreachable in practice.
+        128
     }
 }
 
@@ -1157,6 +1556,142 @@ mod tests {
         // The oracle raises `error:enoent` for the same path, so the reason is the atom.
         assert_eq!(error.as_atom(), Some("enoent"));
         assert!(matches!(error, BeamError::Raise(_)));
+    }
+
+    #[test]
+    fn a_searchable_directory_opens_the_port_and_the_child_reports_the_eacces() {
+        // The reference checks `access(Path, X_OK)` **in the emulator** for a
+        // `{spawn_executable, Path}` port (`spawn_start`, `sys_drivers.c:521`). A directory is
+        // searchable, so the check passes: the port *opens*, and only the forked child's later
+        // `exec` fails — and a failing `exec` makes the child `_exit(errno)`
+        // (`erl_child_setup.c:361-369`), so the port reports `{exit_status, 13}` (EACCES)
+        // followed by `eof` (the child wrote nothing). The oracle agrees (probed against
+        // erts-17.1): `open_port({spawn_executable,"/etc"},[binary,exit_status,eof])` yields
+        // `[{exit_status,13}, eof]`.
+        let spec = SpawnSpec::SpawnExecutable {
+            path: "/etc".to_string(),
+        };
+        let options = SpawnOptions {
+            exit_status: true,
+            ..SpawnOptions::default()
+        };
+        let mut driver = SpawnDriver::with_stream_options(
+            &spec,
+            &options,
+            StreamOptions {
+                stderr_to_stdout: false,
+                eof: true,
+            },
+        )
+        .expect("the `access(Path, X_OK)` check passes for a searchable directory");
+        assert!(
+            driver.os_pid().is_some(),
+            "a real child process backs the port"
+        );
+        // The child's `exec` failed before it could write, so its stdout reaches end of file.
+        drive_to_eof(&mut driver);
+        assert!(
+            driver.take_eof().expect("the check succeeds"),
+            "the empty stdout reaches end of file"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut status = None;
+        while status.is_none() && Instant::now() < deadline {
+            status = driver.take_exit_status().expect("the wait succeeds");
+            if status.is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(
+            status,
+            Some(libc::EACCES),
+            "the child exits with the errno its `exec` failed with"
+        );
+        assert_eq!(
+            driver.take_exit_status().expect("the wait succeeds"),
+            None,
+            "the status is handed out exactly once"
+        );
+    }
+
+    #[test]
+    fn a_bad_cd_is_the_childs_failure_not_the_constructor() {
+        // The `{cd, Dir}` option is the **child's** (`chdir(wd)` before `exec`,
+        // `erl_child_setup.c:302`), so a directory the child cannot enter is reported by its
+        // exit status rather than as an `open_port/2` error — the oracle opens the port and
+        // answers `{exit_status, 2}` (ENOENT) here. Probed against erts-17.1.
+        let spec = SpawnSpec::SpawnExecutable {
+            path: "/bin/sh".to_string(),
+        };
+        let options = SpawnOptions {
+            cd: Some("/no/such/dir".to_string()),
+            exit_status: true,
+            ..SpawnOptions::default()
+        };
+        let mut driver = SpawnDriver::with_stream_options(
+            &spec,
+            &options,
+            StreamOptions {
+                stderr_to_stdout: false,
+                eof: true,
+            },
+        )
+        .expect("the port opens; only the child's `chdir` fails");
+        assert!(
+            driver.os_pid().is_some(),
+            "a real child process backs the port"
+        );
+        drive_to_eof(&mut driver);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut status = None;
+        while status.is_none() && Instant::now() < deadline {
+            status = driver.take_exit_status().expect("the wait succeeds");
+            if status.is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(status, Some(libc::ENOENT), "the child's `chdir` errno");
+    }
+
+    #[test]
+    fn a_file_with_no_executable_format_is_deferred_to_the_child_too() {
+        // `access(Path, X_OK)` passes (the file carries its execute bit) but the `exec` rejects
+        // the *format*, so the oracle opens the port and the child exits with `ENOEXEC` (8).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("beam_io_spawn_noexec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+        let file = dir.join("not-a-program");
+        std::fs::write(&file, b"plain text, not an executable format\n").expect("the file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+            .expect("the execute bit is set");
+
+        let spec = SpawnSpec::SpawnExecutable {
+            path: file.to_string_lossy().into_owned(),
+        };
+        let options = SpawnOptions {
+            exit_status: true,
+            ..SpawnOptions::default()
+        };
+        let mut driver = SpawnDriver::new(&spec, &options).expect("the port opens");
+        assert!(
+            driver.os_pid().is_some(),
+            "a real child process backs the port"
+        );
+        drive_to_eof(&mut driver);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut status = None;
+        while status.is_none() && Instant::now() < deadline {
+            status = driver.take_exit_status().expect("the wait succeeds");
+            if status.is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(status, Some(libc::ENOEXEC), "the child's `exec` errno");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

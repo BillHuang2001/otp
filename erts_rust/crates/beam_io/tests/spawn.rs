@@ -1097,6 +1097,191 @@ fn a_failed_spawn_matches_the_oracle_errno_atom() {
 }
 
 // ---------------------------------------------------------------------------
+// Oracle cross-check: a *deferred* `exec` failure
+// ---------------------------------------------------------------------------
+
+/// The oracle's observation of `open_port({spawn_executable, Path}, [binary, exit_status, eof])`.
+enum OraclePort {
+    /// The oracle opened the port, reporting these `{exit_status, N}` values and whether it
+    /// also reported `eof`.
+    Opened {
+        /// Every `{exit_status, N}` value the port sent.
+        statuses: Vec<i32>,
+        /// Whether the port also sent `eof`.
+        eof: bool,
+    },
+    /// The oracle raised `error:Reason` instead of opening the port.
+    Raised(String),
+}
+
+/// Runs the oracle's `open_port/2` on `path` and collects what it reports, or `None` when the
+/// system `erl` is unavailable.
+///
+/// The path travels through the environment (`BEAM_IO_ORACLE_PATH`), so it never has to be
+/// escaped into the `-eval` source.
+fn oracle_port(path: &str) -> Option<OraclePort> {
+    let expr = r#"P = case os:getenv("BEAM_IO_ORACLE_PATH") of false -> ""; V -> V end,
+                  try erlang:open_port({spawn_executable, P}, [binary, exit_status, eof]) of
+                      Port ->
+                          F = fun Loop(Acc) ->
+                                  receive {Port, M} -> Loop([M|Acc]) after 400 -> lists:reverse(Acc) end
+                              end,
+                          Msgs = F([]),
+                          io:format("ok ~w ~w~n",
+                                    [[S || {exit_status, S} <- Msgs], lists:member(eof, Msgs)])
+                  catch error:Reason -> io:format("error ~w~n", [Reason]) end"#;
+    let out = erl_stdout(expr, path)?;
+    let line = out.trim();
+    match line.strip_prefix("ok ") {
+        Some(rest) => {
+            let (statuses, eof) = rest.split_once(' ').expect("the two reported terms");
+            let statuses = statuses
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.parse().expect("an integer exit status"))
+                .collect();
+            Some(OraclePort::Opened {
+                statuses,
+                eof: eof.trim() == "true",
+            })
+        }
+        None => Some(OraclePort::Raised(
+            line.strip_prefix("error ").unwrap_or(line).to_string(),
+        )),
+    }
+}
+
+#[test]
+fn a_deferred_exec_failure_opens_the_port_and_reports_the_errno_as_the_exit_status() {
+    // The reference checks `access(Path, X_OK)` in the **emulator** (`spawn_start`,
+    // `sys_drivers.c:521`) and only then hands the name to its forked child, which `execve`s it
+    // and, on failure, calls `_exit(errno)` (`erl_child_setup.c:361-369`). So a path the check
+    // *accepts* but the `exec` rejects is not an `open_port/2` error: the port opens and the
+    // child's exit status is the failing errno. Two such paths:
+    //
+    // * a **searchable directory** — `execve` fails `EACCES` (13);
+    // * a file carrying its execute bit with no recognizable executable **format** —
+    //   `execve` fails `ENOEXEC` (8).
+    //
+    // Both are exactly the cases the standard library's `Command::spawn` reports synchronously,
+    // so this driver forks its own child for them. The expectation is taken live from the
+    // oracle, so the test pins the *reason* the port opens rather than a hard-coded status.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("beam_io_spawn_deferred_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+        .expect("the directory is searchable");
+    let no_format = dir.join("no-executable-format");
+    std::fs::write(&no_format, b"plain text, not an executable format\n").expect("the file");
+    std::fs::set_permissions(&no_format, std::fs::Permissions::from_mode(0o755))
+        .expect("the execute bit is set");
+
+    let cases = [
+        ("a searchable directory", dir.to_string_lossy().into_owned()),
+        (
+            "a file with no executable format",
+            no_format.to_string_lossy().into_owned(),
+        ),
+    ];
+
+    for (label, path) in cases {
+        let (expected_status, expected_eof) = match oracle_port(&path) {
+            Some(OraclePort::Opened { statuses, eof }) => {
+                assert_eq!(
+                    statuses.len(),
+                    1,
+                    "the oracle reports one exit status for {path}"
+                );
+                assert!(eof, "the oracle reports end of file for {path}");
+                (statuses[0], eof)
+            }
+            Some(OraclePort::Raised(reason)) => panic!(
+                "the oracle must open the port for {label} ({path}), but raised error:{reason}"
+            ),
+            None => {
+                eprintln!("skipping deferred-exec oracle check: the system `erl` is unavailable");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        };
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let driver = SpawnDriver::with_stream_options(
+            &SpawnSpec::SpawnExecutable { path: path.clone() },
+            &SpawnOptions {
+                exit_status: true,
+                ..SpawnOptions::default()
+            },
+            StreamOptions {
+                stderr_to_stdout: false,
+                eof: true,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{label} ({path}) must open a port, not raise: {error:?}"));
+        assert!(
+            driver.os_pid().is_some(),
+            "{label}: a real child process backs the port"
+        );
+        let id = registry
+            .open(&mut poller, Box::new(driver))
+            .expect("the port opens");
+        assert_eq!(registry.get(id).expect("live").driver_name(), "spawn");
+
+        // Take the exit status as the reactor reports the child's end of stream.
+        let mut status = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while status.is_none() && Instant::now() < deadline {
+            let events = poll_events(&mut poller, Duration::from_millis(50));
+            registry
+                .handle_events(&mut poller, &events)
+                .expect("events dispatch");
+            status = registry.take_exit_status(id).expect("the wait succeeds");
+        }
+        assert_eq!(
+            status,
+            Some(expected_status),
+            "{label}: the failing errno is the child's exit status"
+        );
+        assert_eq!(
+            registry.take_exit_status(id).expect("the wait succeeds"),
+            None,
+            "{label}: the status is reported exactly once"
+        );
+
+        // The child failed before it could write, so its stdout is an empty stream that reaches
+        // end of file and is deregistered.
+        assert!(
+            pump_until(&mut poller, &mut registry, |_, poller| poller.is_empty()),
+            "{label}: the child's empty stdout deregisters at end of file"
+        );
+        assert_eq!(
+            registry.get_mut(id).expect("live").drain_input(),
+            b"",
+            "{label}: the child wrote nothing"
+        );
+        assert_eq!(
+            registry.take_eof(id).expect("the check succeeds"),
+            expected_eof,
+            "{label}: the end of the stream is reported"
+        );
+        assert!(
+            !registry.take_eof(id).expect("the check succeeds"),
+            "{label}: and exactly once"
+        );
+
+        registry.close(&mut poller, id).expect("the port closes");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // Oracle cross-check: the stderr stream option
 // ---------------------------------------------------------------------------
 
