@@ -445,6 +445,32 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   here that "epmd over raw TCP is blocked in this sandbox" was a misdiagnosis: the old client wrongly
   re-read the reply through `read_packet`, so the first two reply bytes were parsed as a bogus ~30 KB
   length. Requests are unchanged; only the three response readers changed.
+- **There is ONE status→error mapping, shared.** `handshake::status_error(&Status)` is the single
+  source; `connection.rs` and `driver.rs` both delegate to it (their private duplicates were deleted).
+  It returns `BeamError` values backed by `std::io::ErrorKind` — no new `BeamError` variant and no
+  crate-local error enum; classification is a *value* type (`StatusKind`) on the decoded `Status`.
+- **A refusing acceptor notifies the peer; a refusing connecter does not.** `dist_util.erl:286` sends
+  `status(not_allowed)` only on the `other_started = true` branch, so both the blocking
+  `accept_server_with` and the driver's `ServerAwaitName` state frame+flush `Status::not_allowed()`
+  (the exact bytes `00 0C 73 6E 6F 74 5F 61 6C 6C 6F 77 65 64` = `snot_allowed`) before returning the
+  error; the connecting side just aborts without a status.
+- **Driver handshake errors are terminal.** Every error from `step` funnels through one arm that sets
+  `DriverState::Failed` and returns the error; a later `step()` returns `Ok(StepOutcome::Failed)`.
+  `WouldBlock` is returned only when more bytes are genuinely needed — never to paper over an error.
+- **Node visibility is the per-connection `publish_flag` piece, not a change to `preferred_flags()`.**
+  `preferred_flags()` stays `DFLAG_DIST_DEFAULT` (mirroring the emulator's `erts_dflags.default`); a
+  caller that wants to advertise `DFLAG_PUBLISHED` ORs in `publish_flag(hidden, published)` via the
+  opt-in `*_with_flags` seams. The dynamic-name branch (`DFLAG_NAME_ME`) is deliberately **not**
+  modelled — this crate speaks only the static OTP-23 `'N'` name.
+- **`epmd`'s interactive/admin replies differ from the node protocol.** `KILL_REQ` answers `"OK"` /
+  `"NO"` (`KillResp`), while `STOP_REQ` answers **`"STOPPED"`** / `"NOEXIST"` / no-reply (`StopResp`),
+  per `epmd_srv.c`. `DUMP`/`NAMES` replies end at **EOF**, not a read timeout (only a successful
+  `ALIVE2_REQ` sets epmd's `keep` flag); the dump body is bounded by `MAX_DUMP_RESP_BODY`.
+- **An accepted inbound pid must carry the verbatim handshake node name.** `dist.c:2358` requires
+  `external_pid_dist_entry(watcher) == dep`, keyed on **sysname only** (`erl_node_tables.c:286-292`),
+  and `dist_util.erl:590,:783-793` stores the verbatim `Name` string — i.e. the **full `node@host`** on
+  the wire (a bare short name fails). The creation comes from the `ALIVE2_RESP`
+  (`Alive2Resp::creation()`) and is *not* part of the check.
 - **`ConnectionDriver` is byte-fed and transport-agnostic; its header parse is deferred to
   `next_message`.** The runtime owns the socket; the driver only parses/serializes, which keeps this
   crate free of `mio` and lets `beam_rt` register the link with `beam_io`'s poller. `step` does a cheap
