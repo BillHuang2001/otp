@@ -161,6 +161,17 @@ impl RuntimeContext<'_> {
             ("erlang", "demonitor", 2) => Some(self.demonitor_2(args)),
             ("erlang", "pre_loaded", 0) => Some(self.pre_loaded_0()),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
+            // Sequential tracing (contract A.8, item 2) — exactly the four BIFs
+            // `bif.tab:220-223` declares, served by [`crate::seq_trace`], which also owns the
+            // token model. `system_flag/2` is claimed **only** for the `reset_seq_trace` arm
+            // `seq_trace:reset_trace/0` calls (every other flag is that module's typed
+            // capability gap); every other arity of those names is not a BIF at all and falls
+            // through to the honest `undef`.
+            ("erlang", "seq_trace", 2) => Some(self.seq_trace_2(args)),
+            ("erlang", "seq_trace_info", 1) => Some(self.seq_trace_info_1(args)),
+            ("erlang", "seq_trace_print", 1) => Some(self.seq_trace_print_1(args)),
+            ("erlang", "seq_trace_print", 2) => Some(self.seq_trace_print_2(args)),
+            ("erlang", "system_flag", 2) => Some(self.system_flag_2(args)),
             // The `erts_internal` internal-BIF floor (contract A.7). One arm; the
             // per-function dispatch lives in [`erts_internal`], which answers `None`
             // for anything it does not serve — so `erts_internal:cmp_term/2`, owned

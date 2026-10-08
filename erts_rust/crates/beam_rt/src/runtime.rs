@@ -57,6 +57,7 @@ use crate::nif::NifRegistry;
 use crate::perf_map::PerfMap;
 use crate::port::PortRegistry;
 use crate::runner::{ProcessEntry, RunnerState};
+use crate::seq_trace::SeqTrace;
 use crate::timers::{TimerHandle, Timers};
 
 mod scheduler;
@@ -206,6 +207,15 @@ pub struct Runtime {
     booted: bool,
     /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
     pub(crate) halt: Option<i32>,
+    /// The **sequential-tracing** state (contract A.8): the per-process trace tokens
+    /// `erlang:seq_trace/2` maintains, the node-global serial clock a token's `Serial` is
+    /// stamped from, and the system tracer a `print` event would be handed to.
+    ///
+    /// It lives on the runtime rather than in a process because it is keyed **by** pid and
+    /// outlives every single-`run_*` call: `seq_trace:set_token/2` in one call must be visible
+    /// to `seq_trace:get_token/0` in the next, and `reset_seq_trace` clears it for *all*
+    /// processes. See [`crate::seq_trace`] for the model and exactly what is deferred.
+    seq_trace: SeqTrace,
     /// The reference id space every `erlang:make_ref/0` and `erlang:monitor/2` draws from.
     ///
     /// One space for both, so a bare reference and a monitor reference can never collide
@@ -357,6 +367,7 @@ impl Runtime {
             self_pid,
             booted: false,
             halt: None,
+            seq_trace: SeqTrace::new(),
             refs: RefAllocator::new(),
             references: HashMap::new(),
             eval_closures: Vec::new(),
@@ -495,6 +506,20 @@ impl Runtime {
         self.halt
     }
 
+    /// The runtime's **sequential-tracing** state (contract A.8) — the per-process trace
+    /// tokens, the serial clock and the system tracer (see [`crate::seq_trace`]).
+    ///
+    /// Read-only, for the introspection surface: `erlang:seq_trace_info/1` and
+    /// `process_info(Pid, sequential_trace_token)` both answer from it.
+    pub(crate) fn seq_trace(&self) -> &SeqTrace {
+        &self.seq_trace
+    }
+
+    /// The mutable sequential-tracing state — what `erlang:seq_trace/2`,
+    /// `erlang:seq_trace_print/1,2` and `erlang:system_flag(reset_seq_trace, _)` mutate.
+    pub(crate) fn seq_trace_mut(&mut self) -> &mut SeqTrace {
+        &mut self.seq_trace
+    }
     /// Heap words still available to the running code (unbounded in Milestone-1).
     pub fn arena_available(&self) -> usize {
         self.arena.heap_available()
