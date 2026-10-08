@@ -46,7 +46,9 @@ mod large;
 mod lookup;
 mod matchspec;
 mod navigation;
+mod reclamation;
 mod replace;
+mod access;
 
 // ---------------------------------------------------------------------------
 // Canonical rendering (the port of the oracle's `r/1`, `t/1`, `l/1`, `srt/1`)
@@ -350,6 +352,32 @@ impl Battery {
         self.tuple(&[make_small(key), value])
     }
 
+    /// A float term on the arena (the `ordered_set` mixed-key case needs a key the
+    /// renderer cannot print, so the float is only ever a *key*, never rendered).
+    fn float(&mut self, value: f64) -> Eterm {
+        // SAFETY: `alloc_words` hands out exactly `FLOAT_SIZE_WORDS` writable words,
+        // and `write_float` fills both of them with the `[HEADER_FLONUM, bits]` block.
+        let hp = unsafe {
+            self.heap
+                .alloc_words(FLOAT_SIZE_WORDS)
+                .expect("the battery arena has room")
+        };
+        // SAFETY: `hp` addresses exactly `FLOAT_SIZE_WORDS` exclusively-owned words.
+        unsafe { write_float(hp, value) }
+    }
+
+    /// An on-heap binary term on the arena (again only ever used as a *key*).
+    fn binary(&mut self, bytes: &[u8]) -> Eterm {
+        // SAFETY: `alloc_words` hands out exactly `heap_bits_size_words(n_bits)`
+        // writable words for the `ErlHeapBits` block `write_binary` fills.
+        let hp = unsafe {
+            self.heap
+                .alloc_words(heap_bits_size_words(bytes.len() * 8))
+                .expect("the battery arena has room")
+        };
+        // SAFETY: `hp` addresses exactly `heap_bits_size_words(len * 8)` words.
+        unsafe { write_binary(hp, bytes).expect("the binary fits") }
+    }
     /// A fresh table of `kind` with the given 1-based `keypos`.
     fn table(&mut self, kind: TableKind, keypos: usize) -> Table {
         let mut options = TableOptions::new();
@@ -467,6 +495,8 @@ pub fn rust_battery() -> Vec<(String, String)> {
     cases.extend(continuation::continuation_cases(&mut battery));
     cases.extend(info::info_cases(&mut battery));
     cases.extend(large::large_cases(&mut battery));
+    cases.extend(reclamation::reclamation_cases(&mut battery));
+    cases.extend(access::access_cases(&mut battery));
 
     cases
 }

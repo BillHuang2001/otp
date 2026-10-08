@@ -1,17 +1,24 @@
-//! Test-only microbenchmark: the chained `set` interior vs CHAMP.
+//! Test-only microbenchmark: the two competing interiors of each selectable kind.
 //!
-//! Declared `#[cfg(test)]` in `lib.rs`. It times the operations ERTS optimizes a
-//! `set` index for — **insert**, **lookup hit**, **lookup miss**, **iteration**
-//! and **delete** — for the four key shapes a real table stores (small integers,
+//! Declared `#[cfg(test)]` in `lib.rs`. It times the operations ERTS optimizes an
+//! index for — **insert**, **lookup hit**, **lookup miss**, **iteration** and
+//! **delete** — for the four key shapes a real table stores (small integers,
 //! atoms, binaries, tuples), across the sizes `10`, `1e3`, `1e5` (and `1e6` on
 //! demand), and reports the interior's own **bytes per entry**
 //! ([`Interior::memory`], the index footprint only — key terms are shared by both
 //! interiors, so they cancel out).
 //!
-//! Run it with output:
+//! Two families are measured:
+//! * `interior_microbenchmark` — the `set` interiors, chained
+//!   ([`HashInterior`]) vs CHAMP ([`ChampInterior`]);
+//! * `ordered_interior_microbenchmark` — the `ordered_set` interiors, the B+-tree
+//!   ([`OrderedSetInterior`], the default) vs the sorted `Vec`
+//!   ([`SortedOrderedInterior`]).
+//!
+//! Run either with output:
 //! ```text
 //! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets \
-//!     --lib interior_bench -- --nocapture
+//!     --lib interior_microbenchmark -- --nocapture
 //! ```
 //! Scale it with `BEAM_ETS_BENCH_SIZES=10,1000,100000,1000000` and restrict the
 //! shapes with `BEAM_ETS_BENCH_SHAPES=smallint,binary,tuple`.
@@ -28,6 +35,7 @@ use beam_term::prelude::*;
 use crate::champ_interior::ChampInterior;
 use crate::hash_interior::HashInterior;
 use crate::kind::TableKind;
+use crate::ordered_interior::{OrderedSetInterior, SortedOrderedInterior};
 use crate::table::Interior;
 
 /// The measured key shapes.
@@ -286,11 +294,95 @@ fn interior_microbenchmark() {
     println!();
 }
 
-/// The CHAMP/chained ratio for one column (`< 1.0` favours CHAMP).
-fn ratio(champ: f64, chained: f64) -> f64 {
-    if chained == 0.0 {
+/// A deterministic pseudo-random permutation of `keys` (an LCG-driven
+/// Fisher-Yates shuffle, so no `rand` dependency), used only by the *ordered*
+/// benchmark.
+///
+/// The sorted-`Vec` interior's cost depends on the position it inserts/deletes at:
+/// appending keys in ascending order is its O(1) fast path, while deleting them in
+/// ascending order is its shift-the-whole-tail worst case. Measuring in that
+/// order would flatter it (and the hash interiors do not care), so the ordered
+/// benchmark drives a shuffled key order instead.
+fn shuffled(keys: &[Eterm], seed: u64) -> Vec<Eterm> {
+    let mut out = keys.to_vec();
+    let mut state = seed | 1;
+    for i in (1..out.len()).rev() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = ((state >> 33) as usize) % (i + 1);
+        out.swap(i, j);
+    }
+    out
+}
+
+/// The `ordered_set` benchmark: the B+-tree default vs the sorted `Vec`.
+///
+/// It uses the same sizes as the `set` benchmark (`10`, `1e3`, `1e5` by default).
+/// It is the crate's *slow* benchmark because the sorted-`Vec` interior shifts the
+/// whole tail on every insert/delete (`O(n)`); iterate with
+/// `BEAM_ETS_BENCH_SIZES=10,1000,10000` to keep it quick, or extend the list for a
+/// scale curve.
+#[test]
+fn ordered_interior_microbenchmark() {
+    let sizes = sizes();
+    let shapes = shapes();
+    let mut atoms = AtomTable::new();
+
+    println!();
+    println!("# beam_ets ordered_set-interior microbenchmark: B+-tree (OrderedSetInterior) vs sorted Vec (SortedOrderedInterior)");
+    println!("# keys are driven in a shuffled order (see `shuffled`); cells: ns per operation");
+    println!(
+        "{:<9} {:>9} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "shape", "n", "index", "insert", "hit", "miss", "iter", "delete", "B/entry"
+    );
+
+    for shape in shapes {
+        for &n in &sizes {
+            let present = build_keys(shape, n, &mut atoms, 0);
+            let missing = build_keys(shape, n, &mut atoms, n as u128);
+            let present_keys = shuffled(&present.keys, 0x9E37_79B9_7F4A_7C15);
+            let missing_keys = shuffled(&missing.keys, 0x2545_F491_4F6C_DD1D);
+
+            let tree = measure(
+                &mut OrderedSetInterior::new(),
+                &present_keys,
+                &missing_keys,
+                &atoms,
+            );
+            let sorted = measure(
+                &mut SortedOrderedInterior::new(),
+                &present_keys,
+                &missing_keys,
+                &atoms,
+            );
+
+            print_row(shape, "bplus", n, &tree);
+            print_row(shape, "sorted", n, &sorted);
+            println!(
+                "{:<9} {:>9} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+                shape.name(),
+                n,
+                "sorted/tree",
+                ratio(sorted.insert_ns, tree.insert_ns),
+                ratio(sorted.hit_ns, tree.hit_ns),
+                ratio(sorted.miss_ns, tree.miss_ns),
+                ratio(sorted.iter_ns, tree.iter_ns),
+                ratio(sorted.delete_ns, tree.delete_ns),
+                ratio(sorted.bytes_per_entry, tree.bytes_per_entry),
+            );
+        }
+    }
+    println!();
+}
+
+/// The `numerator`/`denominator` ratio for one column (`< 1.0` favours the
+/// numerator's interior — CHAMP for the `set` table, the B+-tree for the ordered
+/// table).
+fn ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator == 0.0 {
         f64::NAN
     } else {
-        champ / chained
+        numerator / denominator
     }
 }

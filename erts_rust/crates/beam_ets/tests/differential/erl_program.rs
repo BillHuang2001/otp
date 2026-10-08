@@ -89,6 +89,9 @@ battery() ->
     emit("ordered_iteration", ordered_iteration()),
     emit("ordered_absent_bounds", ordered_absent_bounds()),
     emit("ordered_empty_nav", ordered_empty_nav()),
+    emit("ordered_mixed_keys", ordered_mixed_keys()),
+    emit("ordered_float_key_order", ordered_float_key_order()),
+    emit("ordered_replaced_key_term", ordered_replaced_key_term()),
 
     emit("update_counter_3_variants", update_counter_3_variants()),
     emit("update_counter_3_absent", update_counter_3_absent()),
@@ -96,6 +99,7 @@ battery() ->
     emit("update_counter_4_default", update_counter_4_default()),
     emit("update_counter_4_list", update_counter_4_list()),
     emit("update_counter_4_threshold", update_counter_4_threshold()),
+    emit("update_counter_threshold_default", update_counter_threshold_default()),
     emit("update_counter_multi_kind", update_counter_multi_kind()),
     emit("update_element_variants", update_element_variants()),
 
@@ -129,6 +133,7 @@ battery() ->
     emit("match_spec_run_multi_clause", match_spec_run_multi_clause()),
     emit("match_spec_run_empty_and_badarg", match_spec_run_empty_and_badarg()),
     emit("body_error_exit", body_error_exit()),
+    emit("fun2ms_spec_family", fun2ms_spec_family()),
     emit("select_replace_small_int", select_replace_small_int()),
     emit("select_replace_arity1", select_replace_arity1()),
     emit("select_replace_bag_badarg", select_replace_bag_badarg()),
@@ -146,9 +151,12 @@ battery() ->
     emit("info_unknown_key", info_unknown_key()),
     emit("lookup_element_multi", lookup_element_multi()),
     emit("insert_list_atomic", insert_list_atomic()),
+    emit("reclamation_observable", reclamation_observable()),
 
     emit("ownership_give_away", ownership_give_away()),
     emit("ownership_heir", ownership_heir()),
+    emit("access_control", access_control()),
+    emit("setopts_surface", setopts_surface()),
 
     emit("set_large", set_large()),
     emit("ordered_large", ordered_large()),
@@ -268,6 +276,81 @@ ordered_empty_nav() ->
     t([r(ets:first(T)), r(ets:last(T)),
        r(ets:next(T, 5)), r(ets:prev(T, 5))]).
 
+%% The one observable `ordered_set` contract: the key *order* — pinned across
+%% mixed key types (integers incl. negative and zero, atoms, tuples, lists,
+%% binaries). Floats and binaries are not renderable, so each inserted object
+%% carries a small-integer tag as element 2 and the case renders the resulting
+%% *permutation of tags* (plus the tag of the first/last object and the
+%% `ets:next`/`ets:prev` chains), never a binary key.
+%%
+%% The order is the Erlang term order: number < atom < tuple < list < bitstring.
+%% (The integer/float interleaving is pinned separately by
+%% `ordered_float_key_order/0`.)
+ordered_mixed_keys() ->
+    In = [{5, i1}, {-3, i2}, {0, i3}, {abc, a1}, {xyz, a2},
+          {{1, 2}, t1}, {{a, b}, t2}, {[1, 2], l1}, {<<1, 2>>, b1}],
+    T = new(ordered_set),
+    [ets:insert(T, {K, Idx}) || {K, Idx} <- In],
+    Objs = ets:tab2list(T),
+    IdxOrder = inorder([element(2, O) || O <- Objs]),
+    First = r(element(2, hd(Objs))),
+    Last = r(element(2, lists:last(Objs))),
+    NextChain = inorder(walk_next_idx(T, ets:first(T), In, [])),
+    PrevChain = inorder(walk_prev_idx(T, ets:last(T), In, [])),
+    t([IdxOrder, First, Last, NextChain, PrevChain]).
+
+%% Erlang numbers order by *value* across representations: `-3 < -2.5 < 0 <
+%% 1.5 < 5`, so an `ordered_set` interleaves integers and floats. This is the
+%% arithmetic key order (`erl_db_tree.c` cmp_key_eq / CMP = erts_cmp(a,b,0,0)),
+%% which `beam_ets`'s `compare::cmp_arith` reproduces, so the case agrees.
+ordered_float_key_order() ->
+    In = [{5, i1}, {-3, i2}, {0, i3}, {1.5, f1}, {-2.5, f2}],
+    T = new(ordered_set),
+    [ets:insert(T, {K, Idx}) || {K, Idx} <- In],
+    Objs = ets:tab2list(T),
+    IdxOrder = inorder([element(2, O) || O <- Objs]),
+    First = r(element(2, hd(Objs))),
+    Last = r(element(2, lists:last(Objs))),
+    NextChain = inorder(walk_next_idx(T, ets:first(T), In, [])),
+    PrevChain = inorder(walk_prev_idx(T, ets:last(T), In, [])),
+    t([IdxOrder, First, Last, NextChain, PrevChain]).
+%% An insert whose key is ARITHMETICALLY EQUAL to a stored key but a DIFFERENT
+%% term (`{1,a}` then `{1.0,b}`) replaces the object *and* the stored key term,
+%% so `ets:first`/`ets:last`/`ets:next` report the last-inserted key term. Floats
+%% are not renderable, so the case renders `is_float/1` of the key terms (an atom)
+%% instead of the terms themselves.
+ordered_replaced_key_term() ->
+    IntThenFloat = replaced_key_terms(1, 1.0),
+    FloatThenInt = replaced_key_terms(1.0, 1),
+    Three = begin
+                T = new(ordered_set),
+                ets:insert(T, {1, a}),
+                ets:insert(T, {1.0, b}),
+                ets:insert(T, {2, c}),
+                t([r(tsize(T)), r(is_float(ets:first(T))),
+                   r(is_float(ets:last(T))), r(ets:next(T, ets:first(T)))])
+            end,
+    t([IntThenFloat, FloatThenInt, Three]).
+
+%% The 2-insert collapse: `{K1, a}` then `{K2, b}`, rendered as
+%% `{Size, is_float(First), is_float(Last), Next}`.
+replaced_key_terms(K1, K2) ->
+    T = new(ordered_set),
+    ets:insert(T, {K1, a}),
+    ets:insert(T, {K2, b}),
+    t([r(tsize(T)), r(is_float(ets:first(T))), r(is_float(ets:last(T))),
+       r(ets:next(T, ets:first(T)))]).
+%% The `ets:next`/`ets:prev` chain, rendering the tag of each visited key (the
+%% key -> tag lookup is `lists:keyfind/3` against the insert list).
+walk_next_idx(_T, '$end_of_table', _In, Acc) -> lists:reverse(Acc);
+walk_next_idx(T, K, In, Acc) ->
+    {K, Idx} = lists:keyfind(K, 1, In),
+    walk_next_idx(T, ets:next(T, K), In, [Idx | Acc]).
+
+walk_prev_idx(_T, '$end_of_table', _In, Acc) -> lists:reverse(Acc);
+walk_prev_idx(T, K, In, Acc) ->
+    {K, Idx} = lists:keyfind(K, 1, In),
+    walk_prev_idx(T, ets:prev(T, K), In, [Idx | Acc]).
 %% ------------------------------ update_counter ------------------------------
 
 update_counter_3_variants() ->
@@ -322,6 +405,23 @@ update_counter_4_threshold() ->
            t([r(V), srt(ets:lookup(T, 1))])
        end || Op <- Ops]).
 
+%% `{Pos, Incr, Threshold, SetValue}` combined with a `/4` default object for an
+%% absent key: a plain increment stays below the threshold, crossing it upward
+%% (`>=` for a positive increment) and downward (`=<` for a negative one) lands on
+%% `SetValue`, and a value exactly at the threshold is left alone.
+update_counter_threshold_default() ->
+    T = new(set),
+    V1 = ets:update_counter(T, 1, {2, 5, 100, 0}, {1, 10}),
+    L1 = srt(ets:lookup(T, 1)),
+    V2 = ets:update_counter(T, 1, {2, 95, 100, -1}),
+    L2 = srt(ets:lookup(T, 1)),
+    V3 = ets:update_counter(T, 1, {2, 1, 100, 999}),
+    L3 = srt(ets:lookup(T, 1)),
+    V4 = ets:update_counter(T, 2, {2, -20, 0, -5}, {2, 1}),
+    L4 = srt(ets:lookup(T, 2)),
+    V5 = ets:update_counter(T, 2, {2, -1, 0, 77}),
+    L5 = srt(ets:lookup(T, 2)),
+    t([r(V1), L1, r(V2), L2, r(V3), L3, r(V4), L4, r(V5), L5]).
 update_counter_multi_kind() ->
     l([begin
            T = new(Kind),
@@ -544,6 +644,25 @@ insert_list_atomic() ->
     L2 = srt(ets:tab2list(T2)),
     t([R1, L1, R2, L2]).
 
+%% Repeated insert/replace/delete churn and a `delete_all_objects/1` must leave
+%% only an *observable* trace — `size`, `member/2`, `lookup/2` and `tab2list/1`.
+%% `memory` and the table `id` are implementation-specific and are never rendered.
+reclamation_observable() ->
+    T = new(set),
+    lists:foreach(fun(_) ->
+        [ets:insert(T, {K, K}) || K <- lists:seq(1, 10)],
+        [ets:delete(T, K) || K <- lists:seq(1, 10, 2)]
+    end, lists:seq(1, 5)),
+    S1 = r(tsize(T)),
+    M = l([r(ets:member(T, K)) || K <- [1, 2, 10, 11]]),
+    L = srt(ets:lookup(T, 4)),
+    ets:delete_all_objects(T),
+    S2 = r(tsize(T)),
+    L2 = srt(ets:tab2list(T)),
+    ets:insert(T, {7, 70}),
+    S3 = r(tsize(T)),
+    L3 = srt(ets:lookup(T, 7)),
+    t([S1, M, L, S2, L2, S3, L3]).
 %% --------------------- match_spec_run / select_replace / continuation ---------------------
 
 %% `ets:match_spec_run/2` requires the spec already compiled by
@@ -686,6 +805,40 @@ body_error_exit() ->
     S = [{{'_', '_'}, [], [{hd, 5}]}],
     inorder(ets:select(T, S)).
 
+%% The whole `select` family over a hand-built `fun2ms`-shaped spec — the
+%% `[{{Head}, [Guards], [Body]}]` shape `ets:fun2ms/1` emits — exercising every
+%% special body form: a bound variable `'$N'`, the whole object `'$_'` and the
+%% all-bindings atom `'$$'` (built by `msr_all_bindings/0`, since a literal `'$$'`
+%% lexes to the one-character `'$'`). `select_count/2` counts only objects whose
+%% body evaluates to `true`, so it needs a `[true]` body (not the `'$1'` body the
+%% plain `select/2` uses). `select_replace/2` and `select_delete/2` are pinned on
+%% their own fresh tables because they mutate.
+fun2ms_spec_family() ->
+    T = new(ordered_set),
+    [ets:insert(T, {K, K, K * 10}) || K <- [1, 2, 3]],
+    Sel = [{{'$1', '$2', '$3'}, [{'>', '$3', 15}], ['$1']}],
+    R1 = inorder(ets:select(T, Sel)),
+    CountTrue = [{{'$1', '$2', '$3'}, [{'>', '$3', 15}], [true]}],
+    R2 = r(ets:select_count(T, CountTrue)),
+    MO = inorder(ets:match_object(T, {'$1', '_', '$3'})),
+    M = inorder(ets:match(T, {'$1', '_', '$3'})),
+    Whole = [{{'$1', '_', '$3'}, [], ['$_']}],
+    R3 = inorder(ets:select(T, Whole)),
+    All = [{{'$1', '$2', '$3'}, [], [msr_all_bindings()]}],
+    R4 = inorder(ets:select(T, All)),
+    R5 = inorder(ets:match_spec_run([{1, 2}, {3, 4}],
+                                    msc([{{'$1', '$2'}, [], ['$_']}]))),
+    Tr = new(ordered_set),
+    [ets:insert(Tr, {K, K * 10}) || K <- [1, 2, 3]],
+    Replace = [{{'$1', '$2'}, [{'>', '$2', 10}], [{{'$1', {'*', '$2', 2}}}]}],
+    RC = cap(fun() -> ets:select_replace(Tr, Replace) end),
+    RT = srt(ets:tab2list(Tr)),
+    Td = new(ordered_set),
+    [ets:insert(Td, {K, K * 10}) || K <- [1, 2, 3]],
+    Del = [{{'$1', '$2'}, [{'>', '$2', 10}], [true]}],
+    DC = r(ets:select_delete(Td, Del)),
+    DT = srt(ets:tab2list(Td)),
+    t([R1, R2, MO, M, R3, R4, R5, RC, RT, DC, DT]).
 %% --------------------- ownership: give_away / heir ---------------------
 
 ownership_give_away() ->
@@ -712,6 +865,56 @@ ownership_heir() ->
     Heir ! stop,
     t([H0, S1, S2, H1, Hold]).
 
+%% --------------------- access control: protection matrix ---------------------
+
+%% The `Db_READ`/`Db_WRITE` protection matrix of `db_get_table_aux`
+%% (`erl_db.c`). Each table is created (and therefore owned) by a spawned child,
+%% so the battery process is a *non-owner*: `protected` admits a non-owner reader
+%% but not a writer, `private` admits only the owner, `public` admits anyone, and
+%% every denial is `badarg`.
+access_control() ->
+    t([access_case(protected), access_case(private), access_case(public)]).
+
+access_case(Prot) ->
+    Parent = self(),
+    spawn(fun() ->
+        T = ets:new(diff, [set, Prot]),
+        ets:insert(T, {1, 10}),
+        OwnRead = cap(fun() -> ets:lookup(T, 1) end),
+        OwnWrite = cap(fun() -> ets:insert(T, {2, 20}) end),
+        OwnDel = cap(fun() -> ets:delete(T, 2) end),
+        Parent ! {self(), T, [OwnRead, OwnWrite, OwnDel]},
+        receive stop -> ok end
+    end),
+    receive {Child, T, OwnerCaps} ->
+        NonRead = cap(fun() -> ets:lookup(T, 1) end),
+        NonWrite = cap(fun() -> ets:insert(T, {3, 30}) end),
+        NonDel = cap(fun() -> ets:delete(T, 1) end),
+        Child ! stop,
+        t(OwnerCaps ++ [NonRead, NonWrite, NonDel])
+    end.
+
+%% --------------------- setopts/2 surface ---------------------
+
+%% `ets:setopts/2` accepts only `{heir, Pid, Data}` / `{heir, none}` on OTP 29:
+%% every concurrency option and any unknown option raises `badarg`, and a
+%% non-owner `setopts` raises `badarg`.
+setopts_surface() ->
+    Heir = spawn(fun() -> receive stop -> ok end end),
+    T = ets:new(diff, [set, public]),
+    S1 = cap(fun() -> ets:setopts(T, {heir, Heir, gift}) end),
+    S2 = cap(fun() -> ets:setopts(T, {heir, none}) end),
+    S3 = cap(fun() -> ets:setopts(T, {write_concurrency, true}) end),
+    S4 = cap(fun() -> ets:setopts(T, {read_concurrency, true}) end),
+    S5 = cap(fun() -> ets:setopts(T, {decentralized_counters, true}) end),
+    S6 = cap(fun() -> ets:setopts(T, {no_such_option, true}) end),
+    Parent = self(),
+    spawn(fun() ->
+        Parent ! {non_owner, cap(fun() -> ets:setopts(T, {heir, none}) end)}
+    end),
+    NonOwner = receive {non_owner, R} -> R end,
+    Heir ! stop,
+    t([S1, S2, S3, S4, S5, S6, NonOwner]).
 %% --------------------- update_counter with bignums ---------------------
 
 update_counter_bignum_overflow() ->

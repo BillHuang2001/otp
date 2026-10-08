@@ -9,7 +9,7 @@
 use super::node::{Entry, NodeId, NodeStore};
 
 /// A left-to-right walk over the coalesced leaves, yielding `(key, object)`
-/// entries in ascending `beam_term::compare::cmp` order.
+/// entries in ascending arithmetic key order (`beam_term::compare::cmp_arith`).
 pub(crate) struct LeafIter<'a> {
     /// The arena the leaves live in.
     store: &'a NodeStore,

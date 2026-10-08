@@ -865,3 +865,82 @@
         assert_eq!(store.words(), 3);
         assert_eq!(store.free(copied2), 3);
     }
+
+    /// A source object of a *varying* shape, so one churn cycle exercises several
+    /// free-run size buckets at once (an even index yields a tuple of a varying
+    /// arity, an odd index a proper list of a varying length).
+    fn churn_source(heap: &mut Heap, i: i64) -> Eterm {
+        if i % 2 == 0 {
+            let elements: Vec<Eterm> = (0..(i % 4) + 2)
+                .map(|j| make_small(i * 100 + j))
+                .collect();
+            heap.tuple(&elements).expect("heap room for the source tuple")
+        } else {
+            let mut acc = NIL;
+            for j in 0..(i % 5) + 2 {
+                acc = heap
+                    .cons(make_small(i * 100 + j), acc)
+                    .expect("heap room for the source cons");
+            }
+            acc
+        }
+    }
+
+    /// The **real-memory** proof of per-object reclamation: a long `copy` + `free`
+    /// churn loop must reach a stable **block chain**.
+    ///
+    /// [`TermStore::blocks`]/[`TermStore::memory`] report the allocation actually
+    /// held from the allocator (block *capacities*, which never shrink), so a store
+    /// that failed to reuse a reclaimed run would map a fresh block every cycle and
+    /// the figure would grow linearly with the cycle count — while
+    /// [`TermStore::words`] alone would still return to zero, because it counts live
+    /// words, not held memory. This is the test that a `words()`-only assertion
+    /// cannot substitute for.
+    #[test]
+    fn copy_free_churn_reaches_a_stable_block_chain() {
+        const NEAR_CYCLES: usize = 10;
+        const FAR_CYCLES: usize = 1000;
+        const OBJECTS: i64 = 64;
+
+        let mut heap = Heap::new(4096);
+        let sources: Vec<Eterm> = (0..OBJECTS).map(|i| churn_source(&mut heap, i)).collect();
+
+        let mut store = test_store();
+        let cycle = |store: &mut TermStore| {
+            let copies: Vec<Eterm> = sources
+                .iter()
+                .map(|&source| store.copy(source).expect("every churn object is copyable"))
+                .collect();
+            for copy in copies {
+                assert!(
+                    store.free(copy) > 0,
+                    "every churn object owns store storage"
+                );
+            }
+            assert_eq!(store.words(), 0, "the cycle reclaims all of its storage");
+        };
+
+        for _ in 0..NEAR_CYCLES {
+            cycle(&mut store);
+        }
+        let near_blocks = store.blocks();
+        let near_memory = store.memory();
+        assert!(near_blocks > 1, "the churn must span more than one block");
+        assert!(near_memory > 0);
+
+        for _ in 0..FAR_CYCLES {
+            cycle(&mut store);
+        }
+        assert_eq!(
+            store.blocks(),
+            near_blocks,
+            "a long churn must not map new blocks ({} cycles after {NEAR_CYCLES})",
+            NEAR_CYCLES + FAR_CYCLES
+        );
+        assert_eq!(
+            store.memory(),
+            near_memory,
+            "the held block memory must stabilize, not grow with the cycle count"
+        );
+        assert_eq!(store.words(), 0);
+    }

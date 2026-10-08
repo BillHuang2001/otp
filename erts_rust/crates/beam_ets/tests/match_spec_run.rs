@@ -21,7 +21,8 @@ use beam_term::prelude::*;
 fn atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
     for name in [
-        "_", "$_", "$$", "$1", "$2", "true", "false", "foo", "a", "b", "x", "y", "ok", ">",
+        "_", "$_", "$$", "$1", "$2", "$3", "true", "false", "foo", "a", "b", "c", "d", "x", "y",
+        "ok", ">", "<", "andalso", "is_integer",
     ] {
         atoms.intern(name);
     }
@@ -58,6 +59,38 @@ fn assert_terms_eq(got: &[Eterm], want: &[Eterm], atoms: &AtomTable) {
     for (index, (g, w)) in got.iter().zip(want).enumerate() {
         assert!(eq(*g, *w, atoms), "result {index} differs");
     }
+}
+
+/// `[{A,B}, …]` — a fun2ms input list of 2-tuples of small ints.
+///
+/// (A builder rather than an inline `list(&mut heap, &[tup(&mut heap, …), …])`,
+/// which cannot borrow the heap twice at once.)
+fn pair_list(heap: &mut Heap, values: &[(i64, i64)]) -> Eterm {
+    let mut elements = Vec::with_capacity(values.len());
+    for &(a, b) in values {
+        elements.push(tup(heap, &[make_small(a), make_small(b)]));
+    }
+    list(heap, &elements)
+}
+
+/// `[{A,{B,C}}, …]` — a fun2ms input list of nested-tuple elements.
+fn nested_pair_list(heap: &mut Heap, values: &[(i64, i64, i64)]) -> Eterm {
+    let mut elements = Vec::with_capacity(values.len());
+    for &(a, b, c) in values {
+        let inner = tup(heap, &[make_small(b), make_small(c)]);
+        elements.push(tup(heap, &[make_small(a), inner]));
+    }
+    list(heap, &elements)
+}
+
+/// `[{K,[V1,V2]}, …]` — a fun2ms input list whose element holds a 2-element list.
+fn list_pair_list(heap: &mut Heap, values: &[(i64, i64, i64)]) -> Eterm {
+    let mut elements = Vec::with_capacity(values.len());
+    for &(k, v1, v2) in values {
+        let tail = list(heap, &[make_small(v1), make_small(v2)]);
+        elements.push(tup(heap, &[make_small(k), tail]));
+    }
+    list(heap, &elements)
 }
 
 // ---------------------------------------------------------------------------
@@ -346,4 +379,286 @@ fn malformed_spec_is_badarg() {
         match_spec_run(input, bad_spec, &atoms, &mut heap),
         Err(BeamError::BadArg)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// `ets:fun2ms/1`-shaped specs
+// ---------------------------------------------------------------------------
+//
+// `ets:fun2ms/1` (the `ms_transform` parse transform) compiles a fun into a
+// one-clause match spec `[{Head, Guards, Body}]` whose head binds `'$1'`, `'$2'`, …
+// left to right and whose body is the fun's result expression. Every spec below is
+// the **verbatim** term the oracle emits for the fun quoted beside it — captured
+// from a compiled module (`-compile({parse_transform, ms_transform})`, see below),
+// because calling `ets:fun2ms/1` on a plain (untransformed) fun is `badarg`:
+//
+// ```erlang
+// -module(f2m).
+// -compile({parse_transform, ms_transform}).
+// -include_lib("stdlib/include/ms_transform.hrl").
+// main() -> io:format("~p~n", [ets:fun2ms(fun({M,N}) when M > 2, N < 9 -> {M,N} end)]).
+// ```
+//
+// This pins the exact *syntactic shapes* the transform produces — positional
+// `'$N'` bindings, a guard list, a `{{ … }}`/`[ … ]` body, `'_'` for an ignored
+// head position — which the hand-written specs elsewhere in this suite do not.
+
+#[test]
+fn fun2ms_guard_only_spec_returns_the_bound_variable() {
+    // erl: `ets:fun2ms(fun({M,N}) when M > 2 -> M end)`
+    //      -> `[{{'$1','$2'},[{'>','$1',2}],['$1']}]`;
+    //      run over `[{1,5},{3,4},{5,10},{4,8}]` -> `[3,5,4]`.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, ">"), at(&atoms, "$1"), make_small(2)],
+    );
+    let spec = spec1(&mut heap, head, &[guard], &[at(&atoms, "$1")]);
+
+    let input = pair_list(&mut heap, &[(1, 5), (3, 4), (5, 10), (4, 8)]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    assert_terms_eq(&got, &[make_small(3), make_small(5), make_small(4)], &atoms);
+}
+
+#[test]
+fn fun2ms_guard_conjunction_spec_returns_a_tuple_body() {
+    // erl: `ets:fun2ms(fun({M,N}) when M > 2, N < 9 -> {M,N} end)`
+    //      -> `[{{'$1','$2'},[{'>','$1',2},{'<','$2',9}],[{{'$1','$2'}}]}]`
+    //      (a guard *conjunction* is one guard list, in source order);
+    //      run over `[{1,5},{3,4},{5,10},{4,8}]` -> `[{3,4},{4,8}]`.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let greater = tup(
+        &mut heap,
+        &[at(&atoms, ">"), at(&atoms, "$1"), make_small(2)],
+    );
+    let less = tup(
+        &mut heap,
+        &[at(&atoms, "<"), at(&atoms, "$2"), make_small(9)],
+    );
+    // The body element is `{{'$1','$2'}}`: a 1-tuple whose element is the
+    // construction tuple (a bare `{'$1','$2'}` body element is a *call* → badarg).
+    let construction = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let body_element = tup(&mut heap, &[construction]);
+    let spec = spec1(&mut heap, head, &[greater, less], &[body_element]);
+
+    let input = pair_list(&mut heap, &[(1, 5), (3, 4), (5, 10), (4, 8)]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    let want = [
+        tup(&mut heap, &[make_small(3), make_small(4)]),
+        tup(&mut heap, &[make_small(4), make_small(8)]),
+    ];
+    assert_terms_eq(&got, &want, &atoms);
+}
+
+#[test]
+fn fun2ms_identity_spec_matches_any_element() {
+    // erl: `ets:fun2ms(fun(X) -> X end)` -> `[{'$1',[],['$1']}]` — the head is a
+    // bare `'$1'`, so it matches an element of *any* shape, not only a tuple.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let spec = spec1(&mut heap, at(&atoms, "$1"), &[], &[at(&atoms, "$1")]);
+    let mut elements = Vec::new();
+    elements.push(tup(&mut heap, &[make_small(1), make_small(5)]));
+    elements.push(at(&atoms, "foo"));
+    elements.push(make_small(7));
+    let input = list(&mut heap, &elements);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    let want = [
+        tup(&mut heap, &[make_small(1), make_small(5)]),
+        at(&atoms, "foo"),
+        make_small(7),
+    ];
+    assert_terms_eq(&got, &want, &atoms);
+}
+
+#[test]
+fn fun2ms_nested_tuple_head_and_tuple_body() {
+    // erl: `ets:fun2ms(fun({A,{B,C}}) -> {C,B,A} end)`
+    //      -> `[{{'$1',{'$2','$3'}},[],[{{'$3','$2','$1'}}]}]`;
+    //      run over `[{2,{5,6}},{5,{10,11}},{8,{15,16}}]`
+    //      -> `[{6,5,2},{11,10,5},{16,15,8}]`.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let inner_head = tup(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$3")]);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), inner_head]);
+    let inner_body = tup(
+        &mut heap,
+        &[at(&atoms, "$3"), at(&atoms, "$2"), at(&atoms, "$1")],
+    );
+    let body_element = tup(&mut heap, &[inner_body]);
+    let spec = spec1(&mut heap, head, &[], &[body_element]);
+
+    let input = nested_pair_list(&mut heap, &[(2, 5, 6), (5, 10, 11), (8, 15, 16)]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    let want = [
+        tup(&mut heap, &[make_small(6), make_small(5), make_small(2)]),
+        tup(&mut heap, &[make_small(11), make_small(10), make_small(5)]),
+        tup(&mut heap, &[make_small(16), make_small(15), make_small(8)]),
+    ];
+    assert_terms_eq(&got, &want, &atoms);
+}
+
+#[test]
+fn fun2ms_nested_wildcard_and_type_test_guard() {
+    // erl: `ets:fun2ms(fun({{_,X}}) when is_integer(X) -> X end)`
+    //      -> `[{{{'_','$1'}},[{is_integer,'$1'}],['$1']}]` — the ignored position
+    //      is `'_'`, the bound one `'$1'` (positional numbering skips nothing);
+    //      run over `[{{a,3}},{{b,c}},{{d,7}}]` -> `[3,7]` (the type test rejects
+    //      `{b,c}` by *not matching*, not by raising).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let inner_head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "$1")]);
+    let head = tup(&mut heap, &[inner_head]);
+    let guard = tup(&mut heap, &[at(&atoms, "is_integer"), at(&atoms, "$1")]);
+    let spec = spec1(&mut heap, head, &[guard], &[at(&atoms, "$1")]);
+
+    let nested_a = tup(&mut heap, &[at(&atoms, "a"), make_small(3)]);
+    let nested_b = tup(&mut heap, &[at(&atoms, "b"), at(&atoms, "c")]);
+    let nested_d = tup(&mut heap, &[at(&atoms, "d"), make_small(7)]);
+    let element_a = tup(&mut heap, &[nested_a]);
+    let element_b = tup(&mut heap, &[nested_b]);
+    let element_d = tup(&mut heap, &[nested_d]);
+    let input = list(&mut heap, &[element_a, element_b, element_d]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    assert_terms_eq(&got, &[make_small(3), make_small(7)], &atoms);
+}
+
+#[test]
+fn fun2ms_list_head_pattern_and_list_body() {
+    // erl: `ets:fun2ms(fun({K,[V1,V2]}) -> [K,V1] end)`
+    //      -> `[{{'$1',['$2','$3']},[],[['$1','$2']]}]` — the head's list is a
+    //      proper-list pattern of exactly two elements (so `{1,[2]}` cannot match),
+    //      and the body is a **list** construction;
+    //      run over `[{1,[2,3]},{2,[3,4]},{4,[5,6]}]` -> `[[1,2],[2,3],[4,5]]`.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let list_head = list(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$3")]);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), list_head]);
+    let body_element = list(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let spec = spec1(&mut heap, head, &[], &[body_element]);
+
+    let input = list_pair_list(&mut heap, &[(1, 2, 3), (2, 3, 4), (4, 5, 6)]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    let want = [
+        list(&mut heap, &[make_small(1), make_small(2)]),
+        list(&mut heap, &[make_small(2), make_small(3)]),
+        list(&mut heap, &[make_small(4), make_small(5)]),
+    ];
+    assert_terms_eq(&got, &want, &atoms);
+}
+
+#[test]
+fn fun2ms_multi_element_body_yields_its_last_value() {
+    // The transform can emit more than one body expression when the fun body is a
+    // match/block; the clause's value is the value of the **last** one. This is the
+    // shape `[{{'$1','$2'},[],[ok,'$2']}]`:
+    // erl: `ets:match_spec_run([{1,5},{3,4},{4,8},{5,10}], ets:match_spec_compile(
+    //      [{{'$1','$2'},[],[ok,'$2']}]))` -> `[5,4,8,10]`.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let spec = spec1(&mut heap, head, &[], &[at(&atoms, "ok"), at(&atoms, "$2")]);
+
+    let input = pair_list(&mut heap, &[(1, 5), (3, 4), (4, 8), (5, 10)]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    assert_terms_eq(
+        &got,
+        &[
+            make_small(5),
+            make_small(4),
+            make_small(8),
+            make_small(10),
+        ],
+        &atoms,
+    );
+}
+
+#[test]
+fn fun2ms_all_bindings_body_lists_every_head_variable() {
+    // The all-bindings body atom `'$$'` (built in Erlang with `list_to_atom([36,36])`
+    // — writing `'$$'` in source is the one-character atom `'$'`):
+    // erl: `ets:match_spec_run([{1,5},{3,4}], ets:match_spec_compile(
+    //      [{{'$1','$2'},[],[list_to_atom([36,36])]}]))` -> `[[1,5],[3,4]]`.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let spec = spec1(&mut heap, head, &[], &[at(&atoms, "$$")]);
+
+    let input = pair_list(&mut heap, &[(1, 5), (3, 4)]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    let want = [
+        list(&mut heap, &[make_small(1), make_small(5)]),
+        list(&mut heap, &[make_small(3), make_small(4)]),
+    ];
+    assert_terms_eq(&got, &want, &atoms);
+}
+
+#[test]
+fn fun2ms_andalso_guard_is_a_single_guard_expression() {
+    // A guard *conjunction* written with `andalso` is one nested guard term
+    // (`'andalso'` is the operator's own atom, not the Erlang `andalso` keyword):
+    // erl: `ets:match_spec_run([{1,5},{3,4},{4,8},{5,10}], ets:match_spec_compile(
+    //      [{{'$1','$2'},[{'andalso',{'>','$1',1},{'<','$2',10}}],['$1']}]))`
+    //      -> `[3,4]` (`{1,5}` fails `'>'`, `{5,10}` fails `'<'`).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let greater = tup(
+        &mut heap,
+        &[at(&atoms, ">"), at(&atoms, "$1"), make_small(1)],
+    );
+    let less = tup(
+        &mut heap,
+        &[at(&atoms, "<"), at(&atoms, "$2"), make_small(10)],
+    );
+    let guard = tup(&mut heap, &[at(&atoms, "andalso"), greater, less]);
+    let spec = spec1(&mut heap, head, &[guard], &[at(&atoms, "$1")]);
+
+    let input = pair_list(&mut heap, &[(1, 5), (3, 4), (4, 8), (5, 10)]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    assert_terms_eq(&got, &[make_small(3), make_small(4)], &atoms);
+}
+
+#[test]
+fn fun2ms_whole_object_body_returns_each_matching_element() {
+    // erl: `ets:match_spec_run([{1,5},{3,4},{4,8},{5,10}], ets:match_spec_compile(
+    //      [{{'$1','$2'},[],['$_']}]))` -> the same four elements, in order.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let spec = spec1(&mut heap, head, &[], &[at(&atoms, "$_")]);
+
+    let input = pair_list(&mut heap, &[(1, 5), (3, 4), (4, 8), (5, 10)]);
+
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    let want = [
+        tup(&mut heap, &[make_small(1), make_small(5)]),
+        tup(&mut heap, &[make_small(3), make_small(4)]),
+        tup(&mut heap, &[make_small(4), make_small(8)]),
+        tup(&mut heap, &[make_small(5), make_small(10)]),
+    ];
+    assert_terms_eq(&got, &want, &atoms);
 }
