@@ -280,7 +280,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   distribution is gated by `allow_inbound_delivery` (default OFF); `DEFAULT_HEAP_WORDS = 1<<24`, with
   heap exhaustion translated to `error:system_limit`; the known hot-path defect is
   `RuntimeContext::call_registered` deep-cloning the shared `AtomTable` on every registered BIF call.
-- **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`,
+- **Dependency edges beyond the scaffold:** `beam_message → beam_gc`, `beam_dist → beam_alloc`,
   **`beam_engine → beam_alloc`** (wave 0 → wave 4, directionally legal — for the off-heap refc binaries
   `bs_init_writable`/`append` hold); `RefCount` moved down into `beam_alloc` (the LCA) and re-exported
   by `beam_gc`.
