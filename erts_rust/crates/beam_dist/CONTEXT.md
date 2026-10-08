@@ -71,7 +71,23 @@ whose port is resolved through **`epmd`** (`epmd::lookup_port`, fallback to the 
 reply is decoded back over the same connection; the node echoes its own pid; the client sends a
 `DOP_SEND`/`DOP_SEND_SENDER` to that pid (the node prints `GOT {direct,99}`); and a **monitor
 round-trip** completes — the node's `DOP_MONITOR_P` is decoded, the client answers
-`DOP_MONITOR_P_EXIT`, and the node prints `DOWN … noproc`.
+`DOP_MONITOR_P_EXIT`, and the node prints `DOWN … noproc`. Also LIVE-proven: a **client-originated
+`DOP_MONITOR_P` is ACCEPTED** (the node kills the watched worker with `boom`, the client decodes
+`DOP_PAYLOAD_MONITOR_P_EXIT` with all four fields asserted, incl. the reason); `DOP_EXIT2` (the trapping
+process prints the reason); `DOP_UNLINK_ID` -> the node answers `DOP_UNLINK_ID_ACK`; and **fragmented
+messages > `DIST_FRAGMENT_SIZE` (200,000 bytes) in both directions**, with `'E'`/`'F'` frames recorded
+on the wire.
+
+**Live interop (server side, `tests/live_accept.rs`).** The crate also accepts an inbound link from a
+real node — a genuine Rust->node->Rust round trip: the Rust side completes the `'N'` handshake as
+**server**, sends a `DOP_REG_SEND` addressed to the peer's registered name with the Rust side's own
+external pid as `From`, the node replies `{echo,Seq}` to that pid, and the reply is decoded back as
+`Delivery::Send` (raw opcode `DOP_SEND_SENDER`). The working combination is: the pid's node name must be
+the **full `node@host`** (a bare short name is refused) and the creation is the **epmd-assigned**
+`Alive2Resp::creation()` (threaded into both the driver and the pid). Peer **visibility** is proven live
+in both directions: with `server_with_flags(..., preferred_flags() | publish_flag(false, true))` the
+peer prints `PEER_VIS visible=true` / `PEER_NODES [rustacc2@billmini]`; with the default (hidden) it
+prints `visible=false`.
 
 **Live interop (non-blocking `ConnectionDriver`, `tests/live_driver.rs`).** A genuine non-blocking
 `TcpStream` is driven manually (`feed`/`step`/`take_output`/`next_message`) against a real `erl` node:
