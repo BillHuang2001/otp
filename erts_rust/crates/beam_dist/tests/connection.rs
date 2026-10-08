@@ -21,7 +21,8 @@ use beam_alloc::Heap;
 use beam_codec::{AtomEncoding, ATOM_CACHE_REF_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT};
 use beam_common::BeamError;
 use beam_dist::connection::{
-    accept_server, connect_to_node, Connection, TcpListener as DistListener, TcpTransport,
+    accept_server, connect_client, connect_to_node, Connection, TcpListener as DistListener,
+    TcpTransport,
 };
 use beam_dist::dist_header::{DistHeader, DIST_FRAG_HEADER, DIST_HEADER};
 use beam_dist::flags::{DistFlags, Dop};
@@ -771,7 +772,52 @@ fn a_bogus_handshake_tag_is_rejected_without_a_hang() {
     );
 }
 
-// ---------------------------------------------------------------------------
+#[test]
+fn a_connecting_client_surfaces_a_peer_status_refusal() {
+    // The peer reads the client's `Name` then replies with a refusal status; the
+    // client's typed error must carry the shared mapping's `io::ErrorKind`
+    // (`beam_dist::handshake::status_error`), the same the non-blocking driver
+    // produces, and must not hang waiting for a further frame.
+    let cases = [
+        (Status::nok(), std::io::ErrorKind::ConnectionRefused),
+        (Status::not_allowed(), std::io::ErrorKind::PermissionDenied),
+        (Status::Error(b"alive".to_vec()), std::io::ErrorKind::ConnectionAborted),
+        (
+            Status::Named { name: b"taken@host".to_vec(), creation: 5 },
+            std::io::ErrorKind::AlreadyExists,
+        ),
+        (Status::Simultaneous, std::io::ErrorKind::ConnectionAborted),
+        (Status::Error(b"weird".to_vec()), std::io::ErrorKind::InvalidData),
+    ];
+
+    for (status, expected) in cases {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let status_for_peer = status.clone();
+
+        let peer = thread::spawn(move || -> beam_common::Result<()> {
+            let (stream, _) = listener.accept().map_err(BeamError::Io)?;
+            let mut transport = TcpTransport::from_stream(stream);
+            transport.set_read_timeout(Some(TEST_TIMEOUT))?;
+            // Consume the client's `Name`, then answer with the refusal status.
+            let _name = read_packet(&mut transport, PacketHeaderSize::Two)?;
+            let body = encode_body(|w| status_for_peer.encode(w));
+            send_handshake_body(&mut transport, &body);
+            Ok(())
+        });
+
+        let mut client = TcpTransport::connect(&addr.to_string()).expect("connect to server");
+        client.set_read_timeout(Some(TEST_TIMEOUT)).expect("read timeout");
+        let err = connect_client(&mut client, CLIENT_NAME, COOKIE)
+            .expect_err("a non-ok status must refuse the client");
+        match err {
+            BeamError::Io(io) => assert_eq!(io.kind(), expected, "refusal status {status:?}"),
+            other => panic!("expected an Io error for {status:?}, got {other:?}"),
+        }
+
+        peer.join().expect("peer thread").expect("the peer wrote its refusal");
+    }
+}// ---------------------------------------------------------------------------
 // (j) `epmd not_registered`: `connect_to_node` surfaces the lookup failure.
 // ---------------------------------------------------------------------------
 

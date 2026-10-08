@@ -78,8 +78,9 @@
 //! **clean EOF** (the peer closed the connection) is reported as
 //! [`BeamError::BadArg`], matching [`crate::transport::MemoryTransport`]'s
 //! "short read" semantics. A refused handshake carries the peer's status text in
-//! `Io` under the [`StatusKind`]-selected [`std::io::ErrorKind`] (see the
-//! `status_error` mapping): `ConnectionRefused` for `"nok"`, `PermissionDenied`
+//! `Io` under the [`StatusKind`]-selected [`std::io::ErrorKind`] (the single
+//! mapping lives in [`crate::handshake::status_error`], shared with
+//! [`crate::driver`]): `ConnectionRefused` for `"nok"`, `PermissionDenied`
 //! for `"not_allowed"`, `ConnectionAborted` for `"alive"`/`"ok_simultaneous"`,
 //! `AlreadyExists` for `"named:…"` and `InvalidData` for an unknown status. A
 //! refused **acceptor** also writes the `"not_allowed"` status to the peer first
@@ -104,8 +105,8 @@ use crate::framing::{
     is_tick, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
 };
 use crate::handshake::{
-    check_mandatory, preferred_flags, Challenge, ChallengeAck, ChallengeReply, Name, Status,
-    StatusKind,
+    check_mandatory, preferred_flags, status_error, Challenge, ChallengeAck, ChallengeReply, Name,
+    Status, StatusKind,
 };
 use crate::transport::{Read, Transport, Write};
 
@@ -339,53 +340,6 @@ where
     Ok(sink.into_written())
 }
 
-/// Maps a peer's non-`Ok` [`Status`] (and the two statuses a real node sends that
-/// this crate cannot continue) onto a typed [`BeamError`].
-///
-/// The [`StatusKind`] classification selects the `io::ErrorKind`, so a caller can
-/// still tell the cases apart (both by the kind and by the message, which names
-/// the status text). The mapping is:
-///
-/// | status ([`StatusKind`]) | wire text (ground truth) | `io::ErrorKind` |
-/// |---|---|---|
-/// | `Nok` | `"nok"` (`dist_util.erl:343`) | `ConnectionRefused` |
-/// | `NotAllowed` | `"not_allowed"` (`dist_util.erl:286`) | `PermissionDenied` |
-/// | `Alive` | `"alive"` (`dist_util.erl:386`) | `ConnectionAborted` |
-/// | `Named` | `"named:…"` (`dist_util.erl:333`) | `AlreadyExists` |
-/// | `Simultaneous` | `"ok_simultaneous"` (`dist_util.erl:338`) | `ConnectionAborted` |
-/// | `Ok` / `Other` | `"ok"` / unknown | `InvalidData` |
-///
-/// `"ok"`/`"ok_simultaneous"`/`"named:"` all mean *the handshake continues* to a
-/// real node, but this crate's client can continue none of them: it has no
-/// dynamic-node-name support (`"named:"` assigns one) and no connection registry
-/// with which to resolve a simultaneous-connect race. Returning a typed error is
-/// the honest outcome — never a wrong result and never a hang. `Ok`/`Other` here
-/// are unreachable in practice (the caller only reports a non-`Ok` status).
-fn status_error(status: &Status) -> BeamError {
-    let kind = status.kind();
-    let io_kind = match kind {
-        StatusKind::Nok => std::io::ErrorKind::ConnectionRefused,
-        StatusKind::NotAllowed => std::io::ErrorKind::PermissionDenied,
-        StatusKind::Alive => std::io::ErrorKind::ConnectionAborted,
-        StatusKind::Named => std::io::ErrorKind::AlreadyExists,
-        StatusKind::Simultaneous => std::io::ErrorKind::ConnectionAborted,
-        StatusKind::Ok | StatusKind::Other => std::io::ErrorKind::InvalidData,
-    };
-    let detail = match status {
-        Status::Named { name, creation } => format!(
-            "peer reports node name '{}' (creation {creation}) as already assigned (named)",
-            String::from_utf8_lossy(name)
-        ),
-        Status::Simultaneous => "peer sent status 'ok_simultaneous'".to_string(),
-        Status::Ok => "peer sent status 'ok'".to_string(),
-        Status::Error(text) => format!("peer sent status '{}'", String::from_utf8_lossy(text)),
-    };
-    BeamError::Io(std::io::Error::new(
-        io_kind,
-        format!("distribution handshake ({kind:?}): {detail}"),
-    ))
-}
-
 /// Drives the **client** side of the connect/challenge handshake.
 ///
 /// `our_name` and `cookie` are this node's name and its shared cookie;
@@ -441,10 +395,10 @@ fn connect_client_core<T: Transport>(
     send_handshake(t, &body)?;
 
     // 2. Status. Only `"ok"` lets this client proceed; every other documented
-    //    code is surfaced as a typed error (see `status_error`): a peer refusal
-    //    (`"nok"`/`"not_allowed"`), an already-active link (`"alive"`), or the two
-    //    statuses a real node continues on but this client cannot
-    //    (`"ok_simultaneous"`/`"named:"`).
+    //    code is surfaced as a typed error (see `crate::handshake::status_error`):
+    //    a peer refusal (`"nok"`/`"not_allowed"`), an already-active link
+    //    (`"alive"`), or the two statuses a real node continues on but this client
+    //    cannot (`"ok_simultaneous"`/`"named:"`).
     let status = Status::decode(&read_packet(t, HANDSHAKE_FRAMING)?)?;
     if status.kind() != StatusKind::Ok {
         return Err(status_error(&status));

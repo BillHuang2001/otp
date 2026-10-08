@@ -16,7 +16,11 @@
 //! * a message larger than [`DIST_FRAGMENT_SIZE`] round-trips both ways (`'E'`/`'F'`);
 //! * a tick is answered with a tick in `take_output`;
 //! * malformed input (garbage / truncated / empty frame) yields a typed `Err`, no
-//!   panic.
+//!   panic, and a terminal [`DriverState::Failed`];
+//! * the handshake **error** paths mirror the blocking API: a peer `Status`
+//!   refusal is classified through the shared mapping
+//!   ([`beam_dist::handshake::status_error`]), and a refusing **acceptor** buffers
+//!   the 2-byte-framed `"not_allowed"` status into `take_output` before failing.
 
 use beam_alloc::Heap;
 use beam_codec::AtomEncoding;
@@ -25,7 +29,11 @@ use beam_dist::dist_header::{AtomCacheRef, DistHeader, DIST_FRAG_HEADER, DIST_HE
 use beam_dist::driver::{ConnectionDriver, DriverState, StepOutcome};
 use beam_dist::flags::{DistFlags, Dop, DFLAG_FRAGMENTS};
 use beam_dist::fragment::DIST_FRAGMENT_SIZE;
-use beam_dist::{check_mandatory, preferred_flags};
+use beam_dist::handshake::status_error;
+use beam_dist::{
+    check_mandatory, preferred_flags, write_packet, MemoryTransport, Name, PacketHeaderSize, Status,
+    StatusKind,
+};
 use beam_term::prelude::{atom_val, make_atom, make_small, Eterm, NIL};
 use beam_term::AtomTable;
 
@@ -424,4 +432,121 @@ fn send_control_before_establishment_is_rejected() {
     let atoms = AtomTable::new();
     let err = client.send_control(Dop::Link, &[], &atoms).expect_err("not established");
     assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// (f) The handshake ERROR paths: a refusing acceptor notifies the peer and both
+//     refusal directions produce the same typed error as the blocking API.
+// ---------------------------------------------------------------------------
+
+/// Encodes a handshake message body through its own codec (a `MemoryTransport`
+/// scratch sink, exactly as the driver's own helper does).
+fn handshake_body<F>(encode: F) -> Vec<u8>
+where
+    F: FnOnce(&mut MemoryTransport) -> beam_common::Result<()>,
+{
+    let mut sink = MemoryTransport::new();
+    encode(&mut sink).expect("encode a valid handshake body");
+    sink.into_written()
+}
+
+/// Wraps a handshake message body in the 2-byte handshake framing.
+fn frame_handshake(body: &[u8]) -> Vec<u8> {
+    let mut sink = MemoryTransport::new();
+    write_packet(&mut sink, PacketHeaderSize::Two, body).expect("frame a handshake body");
+    sink.into_written()
+}
+
+/// A `Name` message body advertising `flags`.
+fn name_body(flags: DistFlags) -> Vec<u8> {
+    handshake_body(|w| Name { flags, creation: 0, name: CLIENT_NAME.to_vec() }.encode(w))
+}
+
+#[test]
+fn a_refusing_acceptor_driver_buffers_not_allowed_for_the_peer() {
+    let mut server = ConnectionDriver::server(SERVER_NAME, COOKIE, SERVER_CREATION);
+
+    // A `Name` whose flag word is empty fails the mandatory check (the v6 version
+    // gate); a real accepting node replies `not_allowed` and drops the link
+    // (`lib/kernel/src/dist_util.erl:286`: `check_dflags` ->
+    // `send_status(HSData, not_allowed)`).
+    server.feed(&frame_handshake(&name_body(DistFlags::EMPTY)));
+
+    let err = server.step().expect_err("an empty flag word must be refused");
+    assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+    assert_eq!(server.state(), DriverState::Failed);
+
+    // The refusal bytes were buffered *before* `step` returned the error, so they
+    // survive into `take_output`: a 2-byte-framed `Status::not_allowed`, i.e. the
+    // wire text `snot_allowed` (12 bytes) inside a 2-byte frame prefix.
+    let out = server.take_output();
+    assert_eq!(out.len(), 14, "2-byte length prefix + the 12-byte `snot_allowed` body");
+    assert_eq!(&out[..2], &[0, 12], "the status body is 12 bytes");
+    assert_eq!(&out[2..], b"snot_allowed", "the wire text of Status::not_allowed()");
+    let status = Status::decode(&out[2..]).expect("decode the buffered refusal");
+    assert_eq!(status, Status::not_allowed());
+    assert_eq!(status.kind(), StatusKind::NotAllowed);
+
+    // The rejected link is terminal: it stays failed and never resumes.
+    assert_eq!(server.step().expect("step after failure"), StepOutcome::Failed);
+    assert_eq!(server.state(), DriverState::Failed);
+}
+
+#[test]
+fn a_driver_client_classifies_a_peer_refusal_like_the_blocking_client() {
+    use std::io::ErrorKind;
+
+    let cases = [
+        (Status::nok(), ErrorKind::ConnectionRefused),
+        (Status::not_allowed(), ErrorKind::PermissionDenied),
+        (Status::Error(b"alive".to_vec()), ErrorKind::ConnectionAborted),
+        (
+            Status::Named { name: b"taken@host".to_vec(), creation: 5 },
+            ErrorKind::AlreadyExists,
+        ),
+        (Status::Simultaneous, ErrorKind::ConnectionAborted),
+        (Status::Error(b"weird".to_vec()), ErrorKind::InvalidData),
+    ];
+
+    for (status, expected) in cases {
+        // The driver's own classification must be exactly the shared mapping's.
+        match status_error(&status) {
+            BeamError::Io(io) => assert_eq!(io.kind(), expected, "shared mapping for {status:?}"),
+            other => panic!("the shared mapping must be an Io error, got {other:?}"),
+        }
+
+        let mut client = ConnectionDriver::client(CLIENT_NAME, COOKIE, CLIENT_CREATION);
+        // The client emits its `Name` frame first; drain it, then answer.
+        client.step().expect("client emits its Name");
+        client.take_output();
+        client.feed(&frame_handshake(&handshake_body(|w| status.encode(w))));
+
+        let err = client.step().expect_err("a non-ok status must fail the client");
+        match err {
+            BeamError::Io(io) => assert_eq!(io.kind(), expected, "driver refusal {status:?}"),
+            other => panic!("driver must return an Io error for {status:?}, got {other:?}"),
+        }
+        assert_eq!(client.state(), DriverState::Failed, "refusal is terminal ({status:?})");
+        assert_eq!(client.step().expect("step after failure"), StepOutcome::Failed);
+    }
+}
+
+#[test]
+fn a_driver_client_truncated_status_frame_ends_failed_at_eof_not_wouldblock() {
+    let mut client = ConnectionDriver::client(CLIENT_NAME, COOKIE, CLIENT_CREATION);
+    client.step().expect("client emits its Name");
+    client.take_output();
+
+    // A 2-byte frame advertising 5 body bytes, but only 2 arrive — so without EOF
+    // the driver honestly reports `WouldBlock` (it needs more input).
+    client.feed(&[0, 5, b's', b'n']);
+    assert_eq!(client.step().expect("needs more bytes"), StepOutcome::WouldBlock);
+    assert_eq!(client.state(), DriverState::Handshaking);
+
+    // At EOF the partial frame is a truncated message: a typed error, terminal.
+    client.feed_eof();
+    let err = client.step().expect_err("a truncated status frame must fail at EOF");
+    assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+    assert_eq!(client.state(), DriverState::Failed);
+    assert_eq!(client.step().expect("step after failure"), StepOutcome::Failed);
 }

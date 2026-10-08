@@ -319,6 +319,55 @@ impl Status {
     }
 }
 
+/// Maps a peer's non-`Ok` [`Status`] onto a typed [`BeamError`].
+///
+/// This is the **single** implementation of the status -> error mapping: the
+/// blocking [`crate::connection`] API and the non-blocking [`crate::driver`]
+/// both delegate here, so a caller observes exactly the same
+/// [`std::io::ErrorKind`] (and the same message shape) whichever API it used.
+///
+/// The [`Status::kind`] classification selects the `io::ErrorKind`:
+///
+/// | status ([`StatusKind`]) | wire text (ground truth) | `io::ErrorKind` |
+/// |---|---|---|
+/// | `Nok` | `"nok"` (`dist_util.erl:343`) | `ConnectionRefused` |
+/// | `NotAllowed` | `"not_allowed"` (`dist_util.erl:286`) | `PermissionDenied` |
+/// | `Alive` | `"alive"` (`dist_util.erl:386`) | `ConnectionAborted` |
+/// | `Named` | `"named:…"` (`dist_util.erl:333`) | `AlreadyExists` |
+/// | `Simultaneous` | `"ok_simultaneous"` (`dist_util.erl:338`) | `ConnectionAborted` |
+/// | `Ok` / `Other` | `"ok"` / unknown | `InvalidData` |
+///
+/// `"ok"`/`"ok_simultaneous"`/`"named:"` all mean *the handshake continues* to a
+/// real node, but this crate's client can continue none of them: it has no
+/// dynamic-node-name support (`"named:"` assigns one) and no connection registry
+/// with which to resolve a simultaneous-connect race. Returning a typed error is
+/// the honest outcome — never a wrong result and never a hang. `Ok`/`Other` here
+/// are unreachable in practice (the callers only report a non-`Ok` status).
+pub fn status_error(status: &Status) -> BeamError {
+    let kind = status.kind();
+    let io_kind = match kind {
+        StatusKind::Nok => std::io::ErrorKind::ConnectionRefused,
+        StatusKind::NotAllowed => std::io::ErrorKind::PermissionDenied,
+        StatusKind::Alive => std::io::ErrorKind::ConnectionAborted,
+        StatusKind::Named => std::io::ErrorKind::AlreadyExists,
+        StatusKind::Simultaneous => std::io::ErrorKind::ConnectionAborted,
+        StatusKind::Ok | StatusKind::Other => std::io::ErrorKind::InvalidData,
+    };
+    let detail = match status {
+        Status::Named { name, creation } => format!(
+            "peer reports node name '{}' (creation {creation}) as already assigned (named)",
+            String::from_utf8_lossy(name)
+        ),
+        Status::Simultaneous => "peer sent status 'ok_simultaneous'".to_string(),
+        Status::Ok => "peer sent status 'ok'".to_string(),
+        Status::Error(text) => format!("peer sent status '{}'", String::from_utf8_lossy(text)),
+    };
+    BeamError::Io(std::io::Error::new(
+        io_kind,
+        format!("distribution handshake ({kind:?}): {detail}"),
+    ))
+}
+
 /// The `'N'` challenge message.
 ///
 /// Layout: `'N' + flags(8) + challenge(4) + creation(4) + namelen(2) + name`.

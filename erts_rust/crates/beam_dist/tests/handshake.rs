@@ -13,9 +13,9 @@ use beam_dist::flags::{
     DFLAG_DIST_MANDATORY_26, DFLAG_MANDATORY_25_DIGEST, DFLAG_MAP_TAG,
 };
 use beam_dist::handshake::{
-    check_mandatory, preferred_flags, verify_digest, Challenge, ChallengeAck, ChallengeDigest,
-    ChallengeReply, Complement, Name, Status, StatusKind, CHALLENGE_ACK_TAG, CHALLENGE_REPLY_TAG,
-    CHALLENGE_TAG, COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
+    check_mandatory, preferred_flags, status_error, verify_digest, Challenge, ChallengeAck,
+    ChallengeDigest, ChallengeReply, Complement, Name, Status, StatusKind, CHALLENGE_ACK_TAG,
+    CHALLENGE_REPLY_TAG, CHALLENGE_TAG, COMPLEMENT_TAG, NAME_TAG, STATUS_TAG,
 };
 use beam_dist::transport::Write;
 
@@ -509,4 +509,78 @@ fn verify_digest_matches_and_rejects() {
     assert!(!verify_digest(&tampered, challenge, cookie, &d));
     // The all-zero digest is only accepted when it really is the derived one.
     assert!(!verify_digest(&[0u8; 16], challenge, cookie, &d));
+}
+
+// ---------------------------------------------------------------------------
+// The single status -> BeamError mapping.
+//
+// `status_error` is the one implementation shared by the blocking `connection`
+// API and the non-blocking `driver`; these cases pin its `io::ErrorKind`
+// selection and that it never loses the peer's reported text / name.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_error_selects_the_io_kind_for_every_refusal() {
+    use std::io::ErrorKind;
+
+    let cases = [
+        (Status::nok(), ErrorKind::ConnectionRefused),
+        (Status::not_allowed(), ErrorKind::PermissionDenied),
+        (Status::Error(b"alive".to_vec()), ErrorKind::ConnectionAborted),
+        (
+            Status::Named { name: b"gurka@localhost".to_vec(), creation: 3 },
+            ErrorKind::AlreadyExists,
+        ),
+        (Status::Simultaneous, ErrorKind::ConnectionAborted),
+        // A status that is neither a refusal nor a continuing code, and the
+        // (unreachable-in-practice) `Ok`, both fall through to `InvalidData`.
+        (Status::Error(b"weird".to_vec()), ErrorKind::InvalidData),
+        (Status::Error(b"true".to_vec()), ErrorKind::InvalidData),
+        (Status::Ok, ErrorKind::InvalidData),
+    ];
+
+    for (status, expected) in cases {
+        match status_error(&status) {
+            BeamError::Io(io) => {
+                assert_eq!(io.kind(), expected, "status {status:?}");
+                assert!(
+                    io.to_string().contains("distribution handshake"),
+                    "the message names the context: {io}"
+                );
+            }
+            other => panic!("expected an Io error for {status:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn status_error_keeps_the_peer_text_name_and_creation() {
+    match status_error(&Status::Error(b"nok_cookie".to_vec())) {
+        BeamError::Io(io) => {
+            let msg = io.to_string();
+            assert!(msg.contains("nok_cookie"), "carries the peer's status text: {msg}");
+            // `nok_cookie` is not the exact `"nok"` code, so it classifies `Other`.
+            assert!(msg.contains("Other"), "names the kind: {msg}");
+        }
+        other => panic!("expected Io, got {other:?}"),
+    }
+
+    match status_error(&Status::nok()) {
+        BeamError::Io(io) => {
+            let msg = io.to_string();
+            assert!(msg.contains("nok"), "carries the peer's status text: {msg}");
+            assert!(msg.contains("Nok"), "names the kind: {msg}");
+        }
+        other => panic!("expected Io, got {other:?}"),
+    }
+
+    match status_error(&Status::Named { name: b"gurka@localhost".to_vec(), creation: 7 }) {
+        BeamError::Io(io) => {
+            let msg = io.to_string();
+            assert!(msg.contains("gurka@localhost"), "names the already-assigned node: {msg}");
+            assert!(msg.contains('7'), "names its creation: {msg}");
+            assert!(msg.contains("Named"), "names the kind: {msg}");
+        }
+        other => panic!("expected Io, got {other:?}"),
+    }
 }
