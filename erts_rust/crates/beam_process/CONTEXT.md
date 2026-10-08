@@ -169,10 +169,13 @@ buffer-requeues rule), the **bounded-quantum lock** rule (`run_locked_quanta`, `
 the `unsafe impl Send/Sync` handoff live in **`src/smp/CONTEXT.md`** — read it before changing
 anything here.
 ### `timer.rs` — the high-level timer service
-- `TimerService` — one background thread over a deadline min-heap (the `erlang:send_after/3`,
-  `start_timer/3` and `receive ... after T` plumbing): `new()`, `start(Arc<dyn TimerSink>)`
+- `TimerService` — one background thread over a deadline min-heap: `new()`, `start(Arc<dyn TimerSink>)`
   (idempotent), `send_after(Duration, ProcessId, Eterm) -> TimerRef`, `cancel(TimerRef) -> bool`,
   `pending()`, `next_deadline() -> Option<Instant>`, `is_running()`, `shutdown()` (terminal), `join()`.
+  This is the delivery **mechanism** only: it schedules one message to one `ProcessId` after a delay.
+  The `erlang:send_after/3`, `start_timer/3` (`{timeout,Ref,Msg}` needs `make_ref`), `cancel_timer/1,2`,
+  `read_timer/1`, `start_timer/4` and `receive ... after T` timeout-label semantics are BIF/engine-side
+  (owned by `beam_bifs`/`beam_rt`); `read_timer` and a hibernate state are absent here.
 - `TimerRef { id, generation }` (`Copy`) with `id()`/`generation()`.
 - `TimerSink: Send + Sync { fn timer_fired(&self, target: ProcessId, message: Eterm); }` — the seam
   the pool implements.
