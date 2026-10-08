@@ -22,11 +22,11 @@
 //!
 //! Every key here is a declared `bif.tab` entry whose implementation needs host
 //! machinery this crate does not own: PCRE (`re`), a driver loader (`erl_ddll`),
-//! resource objects (`atomics`), the code-coverage bookkeeping (`code`), the ETS
-//! C interior (`ets`) and the tracing/literal-area distribution internals. Each is
-//! registered through the single [`RuntimeHooks`](crate::context::RuntimeHooks)
-//! seam, so a call answers the typed `unsupported_bif` capability gap until the
-//! runtime installs a hook -- never `undef`, never a fabricated value.
+//! the code-coverage bookkeeping (`code`), the ETS C interior (`ets`) and the
+//! tracing/literal-area distribution internals. Each is registered through the
+//! single [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so a call answers
+//! the typed `unsupported_bif` capability gap until the runtime installs a hook
+//! -- never `undef`, never a fabricated value.
 
 use crate::registry::BifRegistry;
 
@@ -81,15 +81,6 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "code", reset_coverage, 1);
     crate::runtime::runtime_bif!(reg, "code", set_coverage_mode, 1);
 
-    // `atomics` -- the fixed-width atomic resource objects.
-    crate::runtime::runtime_bif!(reg, "atomics", add, 3);
-    crate::runtime::runtime_bif!(reg, "atomics", add_get, 3);
-    crate::runtime::runtime_bif!(reg, "atomics", compare_exchange, 4);
-    crate::runtime::runtime_bif!(reg, "atomics", exchange, 3);
-    crate::runtime::runtime_bif!(reg, "atomics", get, 2);
-    crate::runtime::runtime_bif!(reg, "atomics", info, 1);
-    crate::runtime::runtime_bif!(reg, "atomics", put, 3);
-
     // `erts_trace_cleaner` -- the trace-state cleanup signal machinery.
     crate::runtime::runtime_bif!(reg, "erts_trace_cleaner", check, 0);
     crate::runtime::runtime_bif!(reg, "erts_trace_cleaner", send_trace_clean_signal, 1);
@@ -128,7 +119,6 @@ mod tests {
         let mut reg = BifRegistry::new();
         super::register(&mut reg);
         assert!(reg.contains("re", "run", 3));
-        assert!(reg.contains("atomics", "get", 2));
         assert!(reg.contains("ets", "slot", 2));
 
         let mut heap = Heap::new(8).expect("test heap");
