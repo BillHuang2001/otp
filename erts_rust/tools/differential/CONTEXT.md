@@ -131,8 +131,8 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - The driver echo round trip runs only once `beam_rt run` drives the full scheduler (`Runtime::run_scheduled`); a single engine pass never runs the scheduler's port half, so the receiver blocks and the CLI exits `3` with `beam_rt: unsupported: ... blocked` (a capability gap, never a mismatch, never a hang).
 
 ## Known Issues / Notes for Agents
-- **The Rust side is a partial runtime; today's gate is 0 mismatches** (723-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` group, the C-driver group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **723 total · 715 agree · 0 mismatch · 8 unsupported · 0 skipped** (`gate.sh` → exit `3`).
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (780-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` group, the C-driver group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
+  - Current rollup (**stable across repeated runs**): **780 total · 772 agree · 0 mismatch · 8 unsupported · 0 skipped** (`gate.sh` → exit `3`).
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
@@ -141,15 +141,16 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 | A.2 | 176 | 176 | 0 | 0 | 0 |
 | A.3 | 34 | 34 | 0 | 0 | 0 |
 | A.4 | 64 | 64 | 0 | 0 | 0 |
-| A.5 | 79 | 71 | 0 | 8 | 0 |
+| A.5 | 79 | 78 | 0 | 1 | 0 |
 | A.6 | 44 | 44 | 0 | 0 | 0 |
-| A.7 | 265 | 265 | 0 | 0 | 0 |
+| A.7 | 322 | 315 | 0 | 7 | 0 |
 | A.8 | 64 | 64 | 0 | 0 | 0 |
 | A.9 | 52 | 52 | 0 | 0 | 0 |
 
 - **The 8 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so each flips to `agree` automatically once its gap closes:
   - **`local_fun`:** `wire/new_fun_ext_encode` (A.5, `beam_rt: unsupported: local_fun`) — a lambda is an evaluator closure that the `beam_rt` `-eval` path cannot give a faithful `NEW_FUN_EXT` image. `beam_codec` has `Encoder::with_fun_identity`; the remaining blocker is runtime wiring (`beam_rt`).
-  - **The node-identity family (A.5):** `wire_ids/nodes_is_empty_list`, `wire_ids/nodes_this_is_the_local_node`, `wire_ids/set_cookie_local_node_is_badarg`, `wire_ids/set_cookie_bad_cookie_type`, `wire_ids/set_cookie_non_atom_node_badarg`, `wire_ids/set_cookie_other_node_bad_cookie_type`, `wire_ids/set_cookie_other_node_requires_distribution` (`beam_rt: unsupported: bif` for `nodes/0,1`; `unsupported: erlang:set_cookie/2 is a known BIF that is not implemented` for the `set_cookie/2` family).
+  - **`erlang:statistics/1` counters (A.7, `proc_signals/statistics_*_unsupported`):** `reductions`, `runtime`, `context_switches`, `io` and `scheduler_wall_time` — the runtime serves only `wall_clock` and raises `beam_rt: unsupported: erlang:statistics/1: the \`<key>\` counter is not implemented` (exit 3).
+  - **`erlang:monitor/2,3` targets (A.7):** `proc_signals/monitor_3_tag_option_unsupported` (`beam_rt: unsupported: erlang:monitor/3 option {tag, _}`) and `proc_signals/monitor_port_unsupported` (`beam_rt: unsupported: erlang:monitor/2 on a port`).
   The NIF cases also degrade to `skipped` (not a failure) when `cc`/`erl_nif.h` is absent, exactly like the `erlc`-less module cases.
 - **The A.4 driver-registry hooks answer.** `driver_c/driver_lock_driver_answers_the_ports_driver` and `driver_c/add_then_remove_driver_entry_reports_removed` (selectors `8`/`9`) `agree` (`1`): `lock_driver` -> `0` (the port's driver has a `dlopen` handle, matching the oracle's `prt->drv_ptr->handle == NULL`), `add_driver_entry`/`remove_driver_entry` -> `0`/`1` for a non-dynamic entry; both fixtures carry their answer over the `driver_output` byte channel.
 - **`--strict`** exits `1` while any `unsupported`/`skipped`/`mismatch` remains; `tests/cli.rs` pins that a lenient (`run`) invocation on an unsupported case stays exit `0`.
