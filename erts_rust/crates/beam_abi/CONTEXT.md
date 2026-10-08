@@ -604,9 +604,9 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
   today; until `beam_io` hands those to its host the hook returns the invalid-port sentinel. Likewise
   `lock_driver` must reflect the port's **own** loaded driver `handle` (C `io.c:7337`), not a
   global-table lookup by name.
-- **The binary-refcount trio stays `None`** (`driver_binary_get_refc`/`inc_refc`/`dec_refc`): the
-  frozen `ErlDrvBinary` is exactly `{ orig_size, orig_bytes }` with **no refcount word**, so there is
-  nothing to report or adjust.
+- **The `driver_binary_*_refc` trio refuses a NULL/foreign operand with `-1`** where the C would
+  recover a bogus `Binary*` and crash — the crate's "refuse rather than fault" policy (the count
+  itself is oracle-exact).
 - **`enif_ioq_is_empty` does not exist in this OTP tree** (the `enif_ioq_*` slots in `api.rs` are the
   eight in `ioq.rs` plus `enif_inspect_iovec`/`enif_free_iovec`).
 - `driver_select`/`driver_set_timer`/`driver_cancel_timer`/`driver_read_timer`/`driver_async` forward
