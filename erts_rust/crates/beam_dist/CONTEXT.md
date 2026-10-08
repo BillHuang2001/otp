@@ -482,27 +482,28 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   is exact.
 
 ## Known Issues / Remaining Gaps
-- **No inbound `DOP_*` has semantic dispatch.** `Connection::recv` and `ConnectionDriver::next_message`
-  decode *any* opcode into a [`ControlMessage`] and never act on it — the crate performs no link /
-  monitor / spawn / exit side effects, so a runtime must interpret the returned opcode. The only
-  opcode-selecting logic is the outbound `DFLAG_SEND_SENDER` → `DOP_SEND_SENDER` vs `DOP_SEND` choice;
-  typed send helpers exist for `Send(_Sender)`/`RegSend`/`Link`/`Exit`/`MonitorP`/`DemonitorP` only,
-  and every other opcode is reachable solely through the generic `send_control` (all 30 `Dop` variants
-  are encodable/decodable; encoding is opcode-agnostic).
-- **Stale in-source doc comment (no behavior impact).** `connection.rs::accept_server`'s doc says "an
-  outbound `Complement` is sent when `DFLAG_HANDSHAKE_23` was negotiated", but the code correctly sends
-  **none** (the module doc and `connect_client_core` are right: the `'c'` `Complement` exists only for
-  the legacy `'n'` name, which this crate does not speak).
-- **Spawn/payload/altact control opcodes are recognised but not executed.** The full `DOP_*`
-  vocabulary and the in-term bit vocabularies (`DistSpawnFlags`/`AltactSigFlags`) are present, and
-  `DOP_ALTACT_SIG_SEND`'s variable arity is tolerated at decode, but there is **no** end-to-end
-  spawn/altact/payload-exit handling here — that is `beam_process`/`beam_rt` work, and the
-  `ERTS_DIST_SPAWN_FLAG_*` / `ERTS_DOP_ALTACT_SIG_FLG_*` semantics (`dist.c:2590-2698`,
-  `dist.c:3090-3146`) are documented, not interpreted.
+- **The crate classifies inbound deliveries but performs no side effects.** `Connection::recv` /
+  `ConnectionDriver::next_message` decode any opcode into a [`ControlMessage`], and
+  `Delivery::classify` turns it into the full semantic `Delivery` — but nothing in this crate acts on
+  it (no link / monitor / spawn / exit bookkeeping). Routing is the caller's job via the `InboundSink`
+  seam (`Connection::recv_delivery`/`dispatch_inbound`, `ConnectionDriver::next_delivery`/
+  `dispatch_inbound`), whose **production impl over `beam_process`/`Mailbox` is still owed by
+  `beam_rt`** (the defaulted impl is `UnsupportedSink`, which never mis-delivers). Typed *outbound*
+  helpers exist for `Send(_Sender)`/`RegSend`/`Link`/`Exit`/`MonitorP`/`DemonitorP`; every other opcode
+  is sent through the generic `send_control`.
+- **Spawn/altact/payload-exit are classified, not executed.** The `Delivery` variants
+  (`SpawnRequest`/`SpawnReply`/`AltactSigSend`/`PayloadExit`/`PayloadExit2`/`PayloadMonitorExit`) and
+  the in-term bit vocabularies (`DistSpawnFlags`/`AltactSigFlags`) are fully decoded, but the semantics
+  (`dist.c:2590-2698`, `dist.c:3090-3146`) are interpreted by neither this crate nor `beam_process`
+  yet — that is `beam_process`/`beam_rt` work.
 - **`ConnectionDriver` advances the receive atom cache only in `next_message`**, not `step` (see Design
   Decisions): a runtime that never calls `next_message` will not make header/atom progress.
+- **`DOP_UNLINK` never routes to a side effect.** The C *rejects* the bare `DOP_UNLINK` opcode
+  (`dist.c:2277-2282`), so `classify` leaves it `Other(DOP_UNLINK)` — encodable/decodable, but carrying
+  no semantic `Delivery`.
 - **Not yet consumed by `beam_rt`**: node startup (`-name`/`-sname`) does not yet wire this crate into
-  the runtime binary. This crate is the value/connection layer only.
+  the runtime binary (nor does the Rust node advertise `DFLAG_PUBLISHED`/visibility at startup). This
+  crate is the value/connection layer only.
 
 ## Notes for Agents
 - **`LOCAL_EXT` (`121`) now exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
