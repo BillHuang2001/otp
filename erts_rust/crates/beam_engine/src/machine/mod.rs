@@ -252,11 +252,12 @@ impl Machine {
         machine
     }
 
-    /// Bind the literal area of the module about to be executed.
+    /// Bind the literal area of the module context about to be executed.
     ///
-    /// Called once per run by the dispatch loop ([`crate::interpreter`]) with the
-    /// `Arc` cloned out of the `&Module` being executed; see the field docs for
-    /// why the binding is sound for the whole run.
+    /// Called by the dispatch loop ([`crate::interpreter`]) with the `Arc` cloned
+    /// out of the module being executed — the entry module at a run entry, and an
+    /// entered callee's module at a context switch; see the field docs for why the
+    /// binding is sound for as long as that context executes.
     pub(crate) fn set_literals(&mut self, literals: SharedLiteralArea) {
         self.literals = Some(literals);
     }
