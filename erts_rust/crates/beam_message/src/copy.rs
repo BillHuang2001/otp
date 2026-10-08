@@ -72,15 +72,23 @@ impl<'a> CopyContext<'a> {
 pub(crate) type Fixup = (*mut Eterm, Eterm);
 
 /// Whether `term` is shared as-is rather than copied: an immediate, or a compound (boxed/list)
-/// word carrying the literal-area bit (`TAG_LITERAL_PTR`, tested only on compound words).
+/// term word carrying the literal-area bit (`TAG_LITERAL_PTR`, tested only on compound words).
 ///
 /// Ground truth: `copy.c`'s `copy_struct_x` shares `is_immediate` terms and, for compound words,
 /// `erts_is_literal` terms.
+///
+/// The compound test must be a **term word** as well as boxed: [`is_boxed`] mirrors the C bit trick
+/// `(x & (_TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0`, which is *also* true for every word whose
+/// primary tag is `HEADER` (see [`is_boxed_term`]). A bare header word is never a shared literal —
+/// testing only `is_boxed`/`is_list` would let a header word that happens to have bit 2 set (e.g.
+/// `HEADER_SUB_BITS`) be "shared" verbatim instead of reaching [`shallow`]'s
+/// [`PrimaryTag::Header`] arm, which is where a non-term is refused. Genuine boxed (`0b10`) and
+/// list (`0b01`) words are always term words, so this changes nothing for valid terms.
 pub(crate) fn is_shared(term: Eterm) -> bool {
     if is_immediate(term) {
         return true;
     }
-    if is_boxed(term) || is_list(term) {
+    if is_boxed_term(term) || (is_list(term) && is_term_word(term)) {
         return is_literal(term);
     }
     false
