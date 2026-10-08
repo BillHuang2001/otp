@@ -260,6 +260,26 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   materialization (float/big/flatmap/external pid/port/ref), which `beam_codec::term` now forwards
   to (de-duplication). Writers take a caller-provided `*mut Eterm`; allocation stays in `beam_alloc`.
 - **Stage-1 execution tiers shipped (`beam_engine`).** The typed-IR seam carries a direct-threaded interpreter plus a real native baseline tier (`src/jit/`): `src/jit/baseline/` lowers each IR basic block to an x86-64 `extern "C"` function (block ABI returns `(func<<32|pc)`, `HALT=-1`, `ERROR=-2`; `rbx` = x-register array base) with a driver loop that deopts to the interpreter's own `step_instruction` for anything it does not inline. A cross-run compiled-block cache (`src/jit/cache.rs`) and a block linker (`src/jit/baseline/emit/link.rs`) reuse and chain compiled blocks, and a local tail call (`call_last`/`call_only`) is linked natively. `tests/jit_real_module.rs` is the real-`erlc`-module tier-equivalence gate — **736/736** oracle-checked comparisons agree with zero divergences. An optional Cranelift hot tier (`src/jit/cranelift/`) sits behind the default-OFF `jit-cranelift` feature. Correctness (interpreter-identical results) is the deliverable; the tiers are not on `beam_rt`'s execution path yet (the tier entries are non-blocking, so adoption needs an outcome-aware `RunOutcome::Wait` entry) and deeper inlining is later work.
+- **BIF surface complete (`beam_bifs`).** The registry covers the whole declared `bif.tab` surface —
+  **556 declared BIFs (registry 637 keys = 556 declared + 81 non-table keys: 79 stdlib fast paths +
+  `erlang:memory/0,1`)** — via two defaulted seams (`RuntimeHooks::call`, `MemoryHook::memory`).
+  Registered-but-unadopted BIFs return the typed `unsupported_bif` until a host hook is installed, so
+  the runtime-coupled families are registered here while their behaviour remains a host gap.
+- **Data-structure and runtime defaults.** `beam_ets`: `set` → CHAMP, `ordered_set` → K-ary B+-tree
+  (sorted interior retained and selectable), `ordered_set` keys compared by arithmetic order
+  (`1 == 1.0`). `beam_gc`: generational Cheney copying + an immix mature generation, auto-selected at/
+  above `IMMIX_BREAK_EVEN_WORDS = 8 * BLOCK_WORDS = 2048` (assertion-backed), with an additive
+  on-demand growth seam (`Collector::ensure_capacity`, `HeapPolicy::unbounded()`, `GcConfig::growable()`).
+  `beam_dist`: all 30 `Dop` variants round-trip byte-exact (30 golden vectors cross-checked against the
+  oracle), with LIVE interop for the `'N'` handshake, `DOP_REG_SEND`, `DOP_SEND_SENDER`, client-originated
+  `DOP_MONITOR_P` → `DOP_PAYLOAD_MONITOR_P_EXIT`, `DOP_EXIT2`, `DOP_UNLINK_ID`/`_ACK` and fragmentation
+  both ways; `epmd` `DUMP`/`KILL`/`STOP` are implemented (node-up/down are not v6 opcodes). `beam_rt`:
+  boot/CLI/env, `system_info`/`process_info`, a native BIF floor, and its own observability modules
+  (`src/trace.rs`/`src/seq_trace.rs`/`src/crash_dump.rs`/`src/perf_map.rs` — only `send` trace events are
+  emitted and the perf map is empty because no code ranges cross the crate boundary yet); inbound
+  distribution is gated by `allow_inbound_delivery` (default OFF); `DEFAULT_HEAP_WORDS = 1<<24`, with
+  heap exhaustion translated to `error:system_limit`; the known hot-path defect is
+  `RuntimeContext::call_registered` deep-cloning the shared `AtomTable` on every registered BIF call.
 - **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`,
   **`beam_engine → beam_alloc`** (wave 0 → wave 4, directionally legal — for the off-heap refc binaries
   `bs_init_writable`/`append` hold); `RefCount` moved down into `beam_alloc` (the LCA) and re-exported
