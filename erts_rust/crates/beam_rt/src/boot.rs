@@ -20,6 +20,8 @@ use beam_common::{ERTS_VSN, ERTS_VERSION, OTP_VERSION};
 use beam_term::AtomTable;
 
 pub mod bootscript;
+/// The boot script's bounded scheduler drives (`drive_scheduler`/`apply_boot_call`).
+mod drive;
 mod preloaded;
 
 pub(crate) use preloaded::load_preloaded;
