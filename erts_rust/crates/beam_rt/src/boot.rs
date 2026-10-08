@@ -166,10 +166,6 @@ pub const CORE_ATOMS: &[&str] = &[
     "nonode@nohost",
     "bm",
     "ac",
-    // The `RuntimeHooks` timer family emits `{timeout, TRef, Msg}`, so
-    // `erlang:start_timer/3,4` resolves the tag atom from this seed — the bridge may not
-    // intern (the shared table is borrowed immutably for the whole BIF call).
-    "timeout",
     // The `get_module_info/1,2` item vocabulary and the compiler keys an `Attr`/`CInf`
     // chunk's decoded term carries (`vsn`, `version`, `options`, `source`, …). The module
     // seam resolves every atom **by name** into this table (it may not intern), so a name
@@ -192,6 +188,11 @@ pub const CORE_ATOMS: &[&str] = &[
     "compile",
     "md5",
     "module",
+    // The tag atom the `RuntimeHooks` timer family emits
+    // (`erlang:start_timer/3,4` builds `{timeout, TRef, Msg}`). The bridge may not intern
+    // — the shared table is borrowed immutably for the whole BIF call — so the name must
+    // be seeded. Appended after every existing group, as the append-only rule requires.
+    "timeout",
 ];
 
 /// The preloaded-module registry skeleton (contract A.7).
@@ -443,7 +444,6 @@ mod tests {
             "nonode@nohost",
             "bm",
             "ac",
-            "timeout",
             // The `get_module_info/1,2` item names and the compiler keys an `Attr`/`CInf`
             // chunk carries, appended after the reason/class group (see `CORE_ATOMS`).
             "vsn",
@@ -463,6 +463,7 @@ mod tests {
             "compile",
             "md5",
             "module",
+            "timeout",
         ];
         let mut atoms = AtomTable::new();
         seed_core_atoms(&mut atoms);
