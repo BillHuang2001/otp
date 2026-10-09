@@ -47,8 +47,8 @@ Split by responsibility: `runner/entry.rs` (`ProcessEntry`/`ProcessEngine`/`Runn
 * Integration (`../../tests/`): `port_wake.rs` (a port wake resumed through the scheduler), `proc_lib_start.rs` (the cross-module `receive` suspend seam), `position.rs`, `boot.rs`, and the `run`-action suites (`cli.rs`, `slice.rs`).
 
 ## Routing Table
-* `../runtime.rs` → the `Runtime` façade (boot wiring, code server + module cache, the slice, the spawn API, the timer/distribution accessors, `stabilize_term`/`materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`).
-* `scheduler.rs` (+ `scheduler/tests.rs`) → the scheduler-pass family (one pass = processes → ports → timers → distribution, in bounded steps).
+* `../runtime.rs` → the `Runtime` façade (boot wiring, code server + module cache, the slice, the spawn API, the timer/distribution accessors, `stabilize_term`/`materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`, and the `file_services` field).
+* `scheduler.rs` (+ `scheduler/tests.rs`) → the scheduler-pass family (one pass = processes → ports → timers → distribution, in bounded steps; the native-service step `service_file_requests` runs right after the run queue drains).
 * `gc.rs` → `GcState` + `gc_stats`/`GcStatsSnapshot` + the pin/halt/valve sets + `stabilize_escaped`.
 * `ets_owner.rs` → the `ProcessExitObserver` host (`OwnerIndex`/`EtsExitObserver`) + `Runtime::drain_ets_owner_exits`/`drain_port_monitor_exits`.
 * `../runner/` → the `ProcessRunner` (`mod.rs`/`entry.rs`/`run.rs`/`budget.rs`/`reason.rs`/`perf.rs`/`tests.rs`), re-exporting `crate::runner::{ProcessEntry, RunnerState, RuntimeRunner}`.
