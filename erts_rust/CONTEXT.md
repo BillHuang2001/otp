@@ -179,7 +179,10 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - **Stage 6 (Level-2 clean-room VM):** new ISA + full toolchain — research track with an explicit exit
   criterion (Part II §H).
 - **Legacy-C removal:** delete the corresponding C under `../erts/emulator/beam/` module-by-module as
-  each Rust crate reaches differential parity (it is retained only as oracle + `FLAVOR=emu` fallback).
+  each Rust crate reaches differential parity. The legacy tree is still the OTP build's DEFAULT runtime
+  (`FLAVOR=jit`), and nothing under `erts/emulator/beam/` is unreferenced by the build — the in-tree
+  `check_dead_sources.py` reports `deletable: 0` and every `.c` has an explicit object-list entry — so
+  removal is parity-gated, never build-reference-gated.
 
 ## Routing Table
 - `crates/beam_common/` → shared error/result types, config, logging, feature flags, version constants (lowest common ancestor)
