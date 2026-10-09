@@ -35,6 +35,7 @@ use beam_loader::Module;
 use beam_process::ProcessId;
 use beam_term::{Atom, Eterm};
 
+use crate::context::LocalFunTarget;
 use crate::timers::TimerHandle;
 
 /// The entry point of one runtime-scheduled process: what to run, with which arguments.
@@ -55,19 +56,51 @@ pub(crate) enum ProcessEntry {
     /// A fun value: apply the fun to the process's args.
     ///
     /// This is what `erlang:spawn/1` (and the fun head of `spawn_link/1`/`spawn_opt/2`)
-    /// creates: an `-eval` evaluator closure, or a `.beam` fun term. There is no engine
-    /// [`Machine`] for it — the fun is applied through
-    /// [`ExecutionContext::apply_fun`](beam_engine::ExecutionContext::apply_fun), which
-    /// routes an `-eval` closure back into the evaluator (`crate::eval::apply_eval_closure`)
-    /// instead of re-implementing the evaluator here.
+    /// creates: an `-eval` evaluator closure, or a `.beam` fun term.
+    ///
+    /// A **`.beam` local** (`make_fun3`) closure is *not* applied through
+    /// [`ExecutionContext::apply_fun`](beam_engine::ExecutionContext::apply_fun) — that
+    /// entry runs the closure on a fresh, non-blocking machine, so a `receive` inside it
+    /// could never suspend the process. It is instead resolved once
+    /// ([`crate::context::RuntimeContext::local_fun_target`], remembered in
+    /// [`ProcessEntry::Fun::target`]) and entered at its own label on **this** process's
+    /// [`ProcessEngine::machine`], exactly as an export entry is, so its `receive` parks
+    /// the process and a later message resumes it.
+    ///
+    /// The two fun kinds with no local label entry — an external `fun M:F/A` and the
+    /// `-eval` closure — keep the synchronous `apply_fun` path, which routes an `-eval`
+    /// closure back into the evaluator (`crate::eval::apply_eval_closure`) instead of
+    /// re-implementing the evaluator here.
     Fun {
         /// The fun term to apply, built on a heap that outlives the process (the
         /// runtime's arena or a pooled BIF heap — both are pointer-stable and never
         /// reset in Milestone 1).
         fun: Eterm,
+        /// The resolved launch target of a **local** fun, or `None`.
+        ///
+        /// Filled in by the first run of such a process (the runner is the only writer),
+        /// and re-read by every later slice — the `Wait` resume needs the module the
+        /// suspended `(func, pc)` belong to. It stays `None` for both other fun kinds,
+        /// which are applied synchronously and never park.
+        target: Option<LocalFunTarget>,
     },
 }
 
+impl ProcessEntry {
+    /// The module the process's **entry** code lives in, once that is known.
+    ///
+    /// This is the module a suspension's `(func, pc)` are resumed against
+    /// ([`Machine::resume_outcome`](beam_engine::Machine::resume_outcome) is handed it as
+    /// the run's *entry* module) and the module a parked receive's timeout is recovered
+    /// from (see `crate::runner::reason`). `None` for a fun entry that has no local label
+    /// to enter — such a process is applied synchronously and never parks.
+    pub(super) fn entry_module(&self) -> Option<&Arc<Module>> {
+        match self {
+            ProcessEntry::Export { module, .. } => Some(module),
+            ProcessEntry::Fun { target, .. } => target.as_ref().map(|target| &target.module),
+        }
+    }
+}
 /// The engine state of one runtime-scheduled process.
 pub(super) struct ProcessEngine {
     /// The process's engine machine. It outlives every single slice: a `receive` that
@@ -81,9 +114,12 @@ pub(super) struct ProcessEngine {
     pub(super) args: Vec<Eterm>,
     /// The `(func, pc)` a `receive` suspended at, until the process is woken.
     ///
-    /// Only an [`ProcessEntry::Export`] process can park: a fun entry is applied
-    /// synchronously (the evaluator never returns a resume address), so `parked` stays
-    /// `None` for it.
+    /// A [`ProcessEntry::Export`] process and a **`ProcessEntry::Fun`** process whose fun
+    /// resolved to a local label (see [`ProcessEntry::Fun::target`]) both park here: the
+    /// first run is entered on the process's own machine, so a `receive` inside it reports
+    /// [`RunOutcome::Wait`](beam_engine::RunOutcome::Wait) and the very same machine is
+    /// resumed later. A fun with no local label is applied synchronously (the evaluator
+    /// never returns a resume address), so `parked` stays `None` for it.
     pub(super) parked: Option<(u32, u32)>,
     /// The pending **finite receive timeout** of a parked process, if its `wait_timeout`
     /// carried a statically known positive delay.
@@ -140,9 +176,10 @@ impl RunnerState {
     ///
     /// This is the `erlang:spawn/1` (and `spawn_link/1`/`spawn_opt/2`) path: `fun` is an
     /// `-eval` closure or a `.beam` fun term and it is applied to `args` when the process
-    /// first runs (see [`ProcessEntry::Fun`]).
+    /// first runs (see [`ProcessEntry::Fun`]). The launch target of a `.beam` local fun is
+    /// resolved by that first run, not here.
     pub(crate) fn spawn_fun(&mut self, pid: ProcessId, fun: Eterm, args: Vec<Eterm>) {
-        self.spawn(pid, ProcessEntry::Fun { fun }, args);
+        self.spawn(pid, ProcessEntry::Fun { fun, target: None }, args);
     }
 
     /// Whether `pid` is a process this runtime spawned an engine for.
@@ -163,9 +200,10 @@ impl RunnerState {
     ///
     /// * a pid this runtime never spawned an engine for (the root `-eval` process, a
     ///   foreign pid);
-    /// * a **fun-bodied** process ([`ProcessEntry::Fun`]): its entry is a fun value, so
-    ///   there is no module to name the position's `M`/`F` atoms from — the position items
-    ///   are the honest capability gap there, never a fabricated module;
+    /// * a **fun-bodied** process ([`ProcessEntry::Fun`]): its entry is a fun value, and
+    ///   the position items stay the honest capability gap there (they are named from the
+    ///   module's function table, not from the lambda the engine entered), never a
+    ///   fabricated module;
     /// * the process whose machine the caller is *currently executing*: a scheduler pass
     ///   must take that one engine **out** of this map to drive it (see the module docs),
     ///   so it is simply absent while it runs.

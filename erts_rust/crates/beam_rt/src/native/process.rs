@@ -328,7 +328,12 @@ impl RuntimeContext<'_> {
             return Err(BeamError::BadArg);
         }
         if !self.owns_process_table() {
-            return self.spawn_in_pass(policy, priority, ProcessEntry::Fun { fun }, args);
+            return self.spawn_in_pass(
+                policy,
+                priority,
+                ProcessEntry::Fun { fun, target: None },
+                args,
+            );
         }
         Ok(self
             .runtime

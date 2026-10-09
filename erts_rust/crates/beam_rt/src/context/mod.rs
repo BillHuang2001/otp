@@ -1306,6 +1306,142 @@ impl<'a> RuntimeContext<'a> {
     }
 }
 
+/// The launch target of a `.beam` **local** (`make_fun3`) closure.
+///
+/// A local closure's term carries only its `uniq` (per-module) and `index` (the module-level
+/// lambda index); together they identify the [`FunDescriptor`] — hence the defining module
+/// and its entry label — unambiguously across every module the code server has loaded. The
+/// closure body is entered with the **free variables first**, followed by the call
+/// arguments (a lambda's captured variables are its leading parameters).
+///
+/// This is the seam a **fun-bodied process**'s entry is resolved through: unlike
+/// [`RuntimeContext::apply_fun`], which runs the closure on a fresh machine and therefore
+/// folds a suspension into the typed [`blocked`](beam_engine::error::blocked) error, a
+/// process entry has to enter the closure's own label on the **process's** machine so a
+/// `receive` inside it can suspend the process and be resumed later
+/// ([`crate::runner`]'s fun-entry arm).
+///
+/// [`FunDescriptor`]: beam_loader::FunDescriptor
+pub(crate) struct LocalFunTarget {
+    /// The fun's defining module (shared with the code server's cache).
+    pub(crate) module: Arc<Module>,
+    /// The lambda's entry label in that module.
+    pub(crate) label: Label,
+    /// The arity to enter the body with (`free.len() + args.len()`).
+    pub(crate) arity: u32,
+    /// The arguments to enter the body with: the fun's free variables, then the call
+    /// arguments.
+    pub(crate) args: Vec<Eterm>,
+}
+
+impl RuntimeContext<'_> {
+    /// Resolves `fun` to the [`LocalFunTarget`] of a `.beam` **local** closure; `Ok(None)`
+    /// when it has no local label to enter.
+    ///
+    /// `Ok(None)` covers the two fun kinds that are *not* a compiled local closure:
+    ///
+    /// * an **external** fun (`fun M:F/A`, the `EXPORT_EXT` encoding) — not a closure at
+    ///   all, it carries no `uniq`/`index` descriptor and is applied as an ordinary dynamic
+    ///   call through [`RuntimeContext::call_bif`];
+    /// * the `-eval` evaluator's own closure (`uniq ==` [`crate::eval::EVAL_FUN_UNIQ`]),
+    ///   whose body only the evaluator can run
+    ///   ([`crate::eval::apply_eval_closure`]).
+    ///
+    /// Both are what [`RuntimeContext::apply_fun`] falls back to, so a caller that wants the
+    /// blocking-aware local path (the runner's fun-entry arm) can keep the synchronous one
+    /// for them.
+    ///
+    /// # Errors
+    ///
+    /// A non-fun is [`BeamError::BadArg`]; so is a local closure **no loaded module
+    /// defines** (its `(uniq, index)` matches no `FunT` entry), and an `args`/free-variable
+    /// count the descriptor's arity disagrees with is [`BeamError::BadArity`] — exactly what
+    /// [`RuntimeContext::apply_fun`] reports for the same term, so nothing is fabricated.
+    pub(crate) fn local_fun_target(
+        &self,
+        fun: Eterm,
+        args: &[Eterm],
+    ) -> Result<Option<LocalFunTarget>> {
+        if !terms::is_fun(fun) {
+            return Err(BeamError::BadArg);
+        }
+        if matches!(
+            beam_codec::term::fun_kind_term(fun)?,
+            beam_codec::FunKind::External
+        ) {
+            return Ok(None);
+        }
+        let uniq = terms::fun_uniq(fun)?;
+        if uniq == crate::eval::EVAL_FUN_UNIQ {
+            return Ok(None);
+        }
+        let index = terms::fun_index(fun)?;
+        let mut combined = terms::fun_free(fun)?.to_vec();
+        combined.extend_from_slice(args);
+        let found = self
+            .runtime
+            .code_server
+            .modules()
+            .find(|module| descriptor_of(module, uniq, index).is_some())
+            .map(Arc::clone)
+            .ok_or(BeamError::BadArg)?;
+        let descriptor = descriptor_of(&found, uniq, index).ok_or(BeamError::BadArg)?;
+        if combined.len() != descriptor.arity as usize {
+            return Err(BeamError::BadArity);
+        }
+        Ok(Some(LocalFunTarget {
+            module: found,
+            label: descriptor.label,
+            arity: descriptor.arity,
+            args: combined,
+        }))
+    }
+
+    /// Applies a fun that has **no local label entry** — the two kinds
+    /// [`RuntimeContext::local_fun_target`] reports `Ok(None)` for.
+    ///
+    /// * An **external** fun (`fun m:f/A`, the `EXPORT_EXT` encoding) is not a closure at
+    ///   all: it carries no `uniq`/`index` descriptor, so `terms::fun_uniq` rejects it with
+    ///   `BadArg` and it must be recognised *before* that call. Its module/function/arity
+    ///   are its whole identity, so applying it is an ordinary dynamic call through the
+    ///   same dispatch every other call uses — the native floor, the registry, or a
+    ///   load-on-demand module export. That is what makes `term_to_binary(fun
+    ///   lists:reverse/1)` and `(fun lists:reverse/1)([1,2,3])` both work.
+    /// * The `-eval` evaluator's own closure is applied through the evaluator's store
+    ///   (`Runtime::eval_closures`): it may escape into a loaded module
+    ///   (`lists:map(fun(X) -> X*X end, …)`) which calls back into it, and only the
+    ///   evaluator can run its body.
+    ///
+    /// # Errors
+    ///
+    /// A non-fun is [`BeamError::BadArg`] (so a caller that skipped the classification gets
+    /// the same answer [`RuntimeContext::local_fun_target`] would have given), plus whatever
+    /// the dispatch or the evaluator reports.
+    pub(crate) fn apply_non_local_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        if !terms::is_fun(fun) {
+            return Err(BeamError::BadArg);
+        }
+        if matches!(
+            beam_codec::term::fun_kind_term(fun)?,
+            beam_codec::FunKind::External
+        ) {
+            let (module, function, arity) = {
+                let module_atom = beam_codec::term::fun_module(fun)?;
+                let function_atom = beam_codec::term::fun_function(fun)?;
+                let arity = beam_codec::term::fun_arity_term(fun)? as u32;
+                // Resolve the atoms to names while the shared table is borrowed, then
+                // release the borrow: `call_bif` needs `&mut self`.
+                let atoms = self.runtime.code_server.atoms();
+                let module = atoms.name(module_atom).ok_or(BeamError::BadArg)?;
+                let function = atoms.name(function_atom).ok_or(BeamError::BadArg)?;
+                (module.to_string(), function.to_string(), arity)
+            };
+            return self.call_bif(&module, &function, arity, args);
+        }
+        let index = terms::fun_index(fun)? as usize;
+        crate::eval::apply_eval_closure(self, fun, index, args)
+    }
+}
 impl ExecutionContext for RuntimeContext<'_> {
     /// The runtime's unified dispatch — see the module docs.
     ///
@@ -1557,69 +1693,35 @@ impl ExecutionContext for RuntimeContext<'_> {
 
     /// Applies a fun/closure value.
     ///
-    /// A fun built by the `-eval` evaluator (`uniq` == `eval::EVAL_FUN_UNIQ`) is applied
-    /// through the evaluator's own store (`Runtime::eval_closures`): the fun may escape
-    /// into a loaded module (`lists:map(fun(X) -> X*X end, …)`) which calls back into it,
-    /// and the closure body can only be run by the evaluator. Every other fun is a
-    /// `.beam` fun: it carries only its `uniq` (per-module) and `index` (the module-level
-    /// lambda index); together they identify the [`FunDescriptor`] — hence the defining
-    /// module and its entry label — unambiguously across every module the code server
-    /// has loaded. The closure body is entered with the **free variables first**,
-    /// followed by the call arguments (a lambda's captured variables are its leading
-    /// parameters).
+    /// A `.beam` **local** (`make_fun3`) closure is resolved to its
+    /// [`LocalFunTarget`] — the module, the lambda's entry label and the combined
+    /// arguments — and entered there on a **fresh** machine; the resolution is the
+    /// shared [`RuntimeContext::local_fun_target`] seam, so a fun-bodied *process*
+    /// resolves its entry through exactly the same lookup
+    /// ([`crate::runner`]).
     ///
-    /// [`FunDescriptor`]: beam_loader::FunDescriptor
+    /// The two fun kinds with no local label entry keep their own synchronous apply:
+    ///
+    /// * an **external** fun (`fun M:F/A`, the `EXPORT_EXT` encoding) is not a closure
+    ///   at all — its module/function/arity are its whole identity, so applying it is an
+    ///   ordinary dynamic call through [`RuntimeContext::call_bif`], which is what makes
+    ///   `term_to_binary(fun lists:reverse/1)` and `(fun lists:reverse/1)([1,2,3])` both
+    ///   work;
+    /// * a fun built by the `-eval` evaluator is applied through the evaluator's own
+    ///   store (`Runtime::eval_closures`): the fun may escape into a loaded module
+    ///   (`lists:map(fun(X) -> X*X end, …)`) which calls back into it, and the closure
+    ///   body can only be run by the evaluator.
     fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
-        if !terms::is_fun(fun) {
-            return Err(BeamError::BadArg);
+        match self.local_fun_target(fun, args)? {
+            Some(LocalFunTarget {
+                module,
+                label,
+                arity,
+                args,
+            }) => Machine::new().run_label(&module, label, arity, &args, self),
+            None => self.apply_non_local_fun(fun, args),
         }
-        // An **external** fun (`fun m:f/A`, the `EXPORT_EXT` encoding) is not a closure at
-        // all: it carries no `uniq`/`index` descriptor, so `terms::fun_uniq` rejects it with
-        // `BadArg` and it must be recognised *before* that call. Its module/function/arity
-        // are its whole identity, so applying it is an ordinary dynamic call through the
-        // same dispatch every other call uses — the native floor, the registry, or a
-        // load-on-demand module export. That is what makes `term_to_binary(fun
-        // lists:reverse/1)` and `(fun lists:reverse/1)([1,2,3])` both work.
-        if matches!(
-            beam_codec::term::fun_kind_term(fun)?,
-            beam_codec::FunKind::External
-        ) {
-            let (module, function, arity) = {
-                let module_atom = beam_codec::term::fun_module(fun)?;
-                let function_atom = beam_codec::term::fun_function(fun)?;
-                let arity = beam_codec::term::fun_arity_term(fun)? as u32;
-                // Resolve the atoms to names while the shared table is borrowed, then
-                // release the borrow: `call_bif` needs `&mut self`.
-                let atoms = self.runtime.code_server.atoms();
-                let module = atoms.name(module_atom).ok_or(BeamError::BadArg)?;
-                let function = atoms.name(function_atom).ok_or(BeamError::BadArg)?;
-                (module.to_string(), function.to_string(), arity)
-            };
-            return self.call_bif(&module, &function, arity, args);
-        }
-        let uniq = terms::fun_uniq(fun)?;
-        if uniq == crate::eval::EVAL_FUN_UNIQ {
-            let index = terms::fun_index(fun)? as usize;
-            return crate::eval::apply_eval_closure(self, fun, index, args);
-        }
-        let index = terms::fun_index(fun)?;
-        let mut combined = terms::fun_free(fun)?.to_vec();
-        combined.extend_from_slice(args);
-
-        let found = self
-            .runtime
-            .code_server
-            .modules()
-            .find(|module| descriptor_of(module, uniq, index).is_some())
-            .map(Arc::clone)
-            .ok_or(BeamError::BadArg)?;
-        let descriptor = descriptor_of(&found, uniq, index).ok_or(BeamError::BadArg)?;
-        if combined.len() != descriptor.arity as usize {
-            return Err(BeamError::BadArity);
-        }
-        Machine::new().run_label(&found, descriptor.label, descriptor.arity, &combined, self)
     }
-
     /// `send`: deliver `message` to the pid term `to`.
     ///
     /// `to` is resolved with [`ProcessId::from_eterm`] (a non-pid is [`BeamError::BadArg`])

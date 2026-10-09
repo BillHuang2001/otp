@@ -1180,8 +1180,12 @@ impl Runtime {
         // [`Runtime::stabilize_escaped`]); this is also what makes the copies
         // [`RunnerState::spawn`] then stores safe.
         spawn.entry = match spawn.entry {
-            ProcessEntry::Fun { fun } => ProcessEntry::Fun {
+            ProcessEntry::Fun { fun, .. } => ProcessEntry::Fun {
                 fun: self.stabilize_escaped(fun),
+                // A pending spawn has not run yet, so its local fun cannot have been
+                // resolved: the first run of the child does that (see
+                // [`ProcessEntry::Fun`]).
+                target: None,
             },
             export => export,
         };
