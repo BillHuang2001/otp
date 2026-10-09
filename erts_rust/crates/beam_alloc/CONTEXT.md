@@ -264,8 +264,24 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   local copy (there is one segment allocator per process, as in `erl_mseg.c`).
 - **One thread-safe allocator instance per `AllocType`**, one `parking_lot` mutex each; the legacy
   `ts`/`tspec`/`tpref`, per-scheduler instances and the delayed-dealloc queue are not in M1.
-- **`beam_term::heap::Heap` is a test arena; this crate's `Heap` is production** (allocator-backed,
-  `beam_common::Result`). The `beam_term` arena is not re-exported.
+- **`beam_term::heap::Heap` is a test arena; this crate's `Heap`/`ReservedHeap` are production**
+  (allocator-backed, `beam_common::Result`). The `beam_term` arena is not re-exported.
+- **Reservation + in-place growth, not reallocation.** `ReservedHeap` takes one large reservation and
+  raises its *committed* limit inside it, so growth never invalidates a handed-out pointer — which is
+  exactly what a plain reallocating arena cannot promise, and why the fixed `Heap` could only ever be
+  grown by replacement. Only exhausting the reservation itself needs a move.
+- **`try_grow` executes the host's policy; it does not invent one.** It commits exactly the range asked
+  for (no doubling heuristics) and answers `MoveRequired` — with **no** state change — instead of
+  allocating or moving anything itself. The host decides between `relocate` and a
+  growth-by-replacement collect.
+- **`relocate` is a rigid constant-delta move, deliberately not pointer-aware.** It allocates the
+  replacement *first* (so any failure leaves the heap and every pointer into it fully valid), copies
+  the live words verbatim, adopts the new block (`committed_words == new_reserved_words`, `peak`
+  preserved) and frees the old one. Fixing pointers needs term-structure knowledge this layer does not
+  own (see the host-adoption contract), and the delta is computed with a wrap-free `wrapping_sub`.
+- **`Heap` and `ReservedHeap` share one term-writing implementation** (`bump`), so the two arenas can
+  never drift apart on term layout, header encoding or the exhaustion error; each supplies only its own
+  bookkeeping.
 - **The refcount lives here, not in `beam_gc`.** `RefCount` is the single `erts_refc_*` primitive; the
   crate-layer contract forbids duplicating a type, and `beam_alloc` is the LCA.
 
