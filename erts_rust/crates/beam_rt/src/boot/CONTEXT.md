@@ -107,42 +107,45 @@ registered but the directive has not resumed). A directive that has **already** 
 (`heart`'s `start/0` returns after it `spawn`s a process it does **not** link) is skipped, not an error;
 `unlink(a, a)` for a self-registering directive is the process table's documented no-op.
 
-## Where the real `start.boot` stops now
-Execute the real script (`bootstrap/bin/start.boot`, 22 instructions) and it runs **instructions 0–19**
-(every `primLoad` batch, the three `kernelProcess` directives and the three earlier `apply` directives)
-and stops at **instruction 20** (0-based), `{apply,{c,erlangrc,[]}}`. The tail's 0-based indices:
-**12** `{kernelProcess,heart,{heart,start,[]}}`, **13**
-`{kernelProcess,logger,{logger_server,start_link,[]}}`, **14**
+## Where the real `start.boot` gets now
+Execute the real script (`bootstrap/bin/start.boot`, 22 instructions) with the CLI-equivalent
+configuration and it runs **all 22 directives to completion**, ending at the final
+`{progress,started}`. The tail's 0-based indices: **12** `{kernelProcess,heart,{heart,start,[]}}`,
+**13** `{kernelProcess,logger,{logger_server,start_link,[]}}`, **14**
 `{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`, **15**
 `{progress,init_kernel_started}`, **16** `{apply,{application,load,[{application,stdlib,Props}]}}`,
-**17** `{progress,applications_loaded}`, **18**/ **19**
+**17** `{progress,applications_loaded}`, **18**/**19**
 `{apply,{application,start_boot,[{application,kernel|stdlib,Props},permanent]}}`, **20**
-`{apply,{c,erlangrc,[]}}` (the stop), **21** `{progress,started}`.
-- **The CLI and the in-crate executor stop at the same directive, with the same exit class.** The CLI
-  (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **1** with
-  `{noproc,{gen_server,call,[file_server_2,{open,"$HOME/.erlang",[read]},infinity]}}` — `file_server_2`
-  is simply never registered, so `c:erlangrc/0`'s file consult fails. The in-crate executor
-  (`execute_reporting` + `BootStop::describe_with`) reports the **same** term:
-  `boot script stopped at instruction 20/22: c:erlangrc/0: {noproc,{gen_server,call,[file_server_2,…]}}`
-  — the same directive and the same exit class.
-- **The configuration is part of the measurement.** The stop depends on the runtime's **complete**
-  configuration, above all the command line `init:get_arguments/0` reports. The executor tests build
-  their runtime with their own `system_runtime()` helper — the CLI's own parser (`crate::cli::parse`,
-  not `parse_with_env`: a test must not depend on `ERL_*FLAGS`) over the CLI argv
-  `beam_rt -noshell -boot bootstrap/bin/start` — and `tests/boot.rs` mirrors it (`boot_cli_runtime`),
-  because a `RuntimeConfig::default()` runtime (an empty `init_args`, so `init:get_arguments/0` is `[]`
-  where the oracle also reports `root`/`bindir`/`progname`/`home`; see `../native/CONTEXT.md`) stops
-  three instructions earlier, at instruction 16 (`application:load/1`, an `error function_clause`).
-- **The kernel processes are ready when the stop is reached.** The three `{kernelProcess, …}` bursts
+`{apply,{c,erlangrc,[]}}`, **21** `{progress,started}`.
+- **Instruction 20 is what the native `file_server_2` service unblocks.** `c:erlangrc/0`'s file
+  consult is `gen_server:call(file_server_2, {open,"$HOME/.erlang",[read]}, infinity)`
+  (`lib/stdlib/src/c.erl:1049-1083` → `file:path_eval/2`). `beam_rt` registers a runtime-native
+  `file_server_2` at construction ([`../native/file_server.rs`](../native/CONTEXT.md)), which answers
+  the missing `$HOME/.erlang` with `{error,enoent}` — a value `c:erlangrc/0` treats as success — so the
+  directive returns and the chain reaches `{progress,started}`.
+- **The CLI and the in-crate executor reach the same end.** The CLI
+  (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **0** with empty
+  stdout/stderr. The in-crate executor (`boot_from_script` → `execute`) walks the same 22 directives;
+  its `BootStop`/`execute_reporting` report API is simply not reached on this path (there is no failure
+  to report).
+- **The configuration is part of the measurement.** `init:get_arguments/0` reports the whole command
+  line, and the executor tests build their runtime with their own `system_runtime()` helper — the
+  CLI's own parser (`crate::cli::parse`, not `parse_with_env`: a test must not depend on `ERL_*FLAGS`)
+  over the CLI argv `beam_rt -noshell -boot bootstrap/bin/start` — and `tests/boot.rs` mirrors it
+  (`boot_cli_runtime`). A `RuntimeConfig::default()` runtime (an empty `init_args`, so
+  `init:get_arguments/0` is `[]` where the oracle also reports `root`/`bindir`/`progname`/`home`; see
+  `../native/CONTEXT.md`) stops earlier, at instruction 16 (`application:load/1`, an `error
+  function_clause`).
+- **The kernel processes are ready when instruction 20 runs.** The three `{kernelProcess, …}` bursts
   drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
   (`application_controller.erl:203-211`), i.e. the AC completed `init/2` (`:531-558`) and reached
   `gen_server:enter_loop`. `heart` and `logger` are not registered — both legitimately (heart returns
-  `ignore`; logger never reaches registration). Instruction 21 is unreached.
-- **The stop's fold is `apply_boot_call`'s ordinary dispatch, not its `RunOutcome::Wait` arm.**
-  `c:erlangrc/0` runs to the typed `noproc` exit inside the AC's `gen_server:call`, so no
-  `Wait { func, pc }` is produced and `apply_boot_call`'s `Wait` arm (and its `ran == 0` fold) is
-  unreached on this path.
+  `ignore`; logger never reaches registration).
+- **Instruction 20's `gen_server:call` suspends and resumes.** `apply_boot_call` runs `c:erlangrc/0`
+  through the engine's blocking-aware entry; the scheduler pass services the `file_server_2` mailbox
+  and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
+  resumes — so the drive does not take its `ran == 0` (nothing happened) fold.
 
 ### A `-boot` value's shape changes the observed stop (owner: `beam_engine` — handoff)
 The stop is a function of the whole command line, and the `-boot` **value's byte length** perturbs it on
