@@ -526,7 +526,13 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **The match-spec compiler covers the common guard set**, not the full Erlang guard language
   (`map_get`, `float`/`trunc`/`round`, `list_to_tuple`, comprehensions in bodies, …) — anything outside
   it is `badarg`. Match-spec arithmetic via the default `ArithHook` is small-int only; a real runtime
-  installs a full hook via `set_arith_hook`.
+  installs a full hook via `set_arith_hook`. Four capabilities the oracle accepts are pinned as **typed
+  divergences** (always a typed error, never a wrong result): a map used as a guard/body **expression**
+  ⇒ `badarg`; a wildcard/variable inside a **head** map under-matches (the head map is compared as an
+  exact literal); `self/0` raises, so its clause is skipped; `abs/1` is small-int only. A match-spec
+  **body** runtime failure yields the atom `EXIT` resolved from the caller's `AtomTable`
+  (`select::exec::exit_term`), so a host running a raising body must pre-intern `EXIT` (real runtimes
+  do); an uninterned `EXIT` ⇒ typed `badarg`.
 - **`select_replace/2`'s key check is value-based, not the C's static syntactic check.** The oracle
   (`db_match_keeps_key`) rejects a body that is not syntactically `'$_'`/`{{…}}`/`{const,{…}}`/
   `{element,KeyPos,'$_'}` even when nothing matches; this crate validates the *value*, so an exotic
