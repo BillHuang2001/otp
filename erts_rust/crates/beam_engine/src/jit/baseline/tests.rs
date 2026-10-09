@@ -494,3 +494,200 @@ fn the_export_entry_records_the_run_entry_call_like_the_interpreter() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// the per-instruction reduction charge on the driver's deopt path
+// ---------------------------------------------------------------------------
+
+/// The non-allocating loop `label 1 | bif0 host:counter/0 x0 | jump 1`, exported as
+/// `run/0`, and left with **no** block decomposition on purpose: the native tier then
+/// compiles no block, so every instruction takes the driver's documented
+/// per-instruction deopt ([`Machine::step_instruction`]) rather than being inlined —
+/// which is exactly the path the reduction hook is charged on.
+fn yield_loop_module() -> (Module, Atom) {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("loop");
+    let function_name = module.atom_table.intern("run");
+    let host = module.atom_table.intern("host");
+    let counter = module.atom_table.intern("counter");
+    module.imports.push(Import {
+        module: host,
+        function: counter,
+        arity: 0,
+    });
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif0 {
+            bif: ImportRef(0),
+            dst: Operand::X(0),
+        },
+        Instr::Jump { target: Label(1) },
+    ];
+    let labels = code
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ins)| match ins {
+            Instr::Label(l) => Some((*l, i)),
+            _ => None,
+        })
+        .collect();
+    module.functions = vec![Function {
+        func_label: Label(1),
+        entry_label: Label(1),
+        module: module.name,
+        name: function_name,
+        arity: 0,
+        code,
+        blocks: Vec::new(),
+        labels,
+    }];
+    module.exports = vec![Export {
+        function: function_name,
+        arity: 0,
+        label: Label(1),
+    }];
+    (module, function_name)
+}
+
+/// A host that serves `host:counter/0` (returning the call count, and stopping the
+/// loop with a typed error once `calls > stop_after`) and whose reduction hook asks
+/// for a cooperative yield once it has accepted `yield_after` charges.
+struct YieldCtx {
+    stop_after: u32,
+    calls: u32,
+    charges: u32,
+    yield_after: Option<u32>,
+}
+
+impl ExecutionContext for YieldCtx {
+    fn call_bif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        _args: &[Eterm],
+    ) -> Result<Eterm> {
+        if module == "host" && function == "counter" && arity == 0 {
+            self.calls += 1;
+            return if self.calls > self.stop_after {
+                Err(error::unsupported("stop"))
+            } else {
+                Ok(make_small(self.calls as i64))
+            };
+        }
+        Err(error::unsupported(&format!("bif {module}:{function}")))
+    }
+
+    fn ensure_heap(
+        &mut self,
+        _heap_need: u32,
+        _live: u32,
+        _x_regs: &mut [Eterm],
+        _stack: &mut [Eterm],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn reduce_outcome(&mut self, n: u32) -> Result<ReduceOutcome> {
+        assert_eq!(n, 1, "the driver charges exactly one reduction per deopt");
+        self.charges += 1;
+        if let Some(budget) = self.yield_after {
+            if self.charges >= budget {
+                return Ok(ReduceOutcome::Yield);
+            }
+        }
+        Ok(ReduceOutcome::Continue)
+    }
+}
+
+/// The driver's deopt path is priced like the interpreter's loop: one charge per
+/// interpreted instruction, and a `Yield` answer stops the run at the **next**
+/// instruction (the step is applied first).
+#[test]
+fn the_deopt_path_charges_one_reduction_per_instruction_and_reports_a_yield() {
+    let (module, run) = yield_loop_module();
+    let mut machine = Machine::new();
+    let mut ctx = YieldCtx {
+        stop_after: u32::MAX,
+        calls: 0,
+        charges: 0,
+        yield_after: Some(3),
+    };
+
+    let outcome = machine
+        .run_export_outcome_with_tier(&module, run, 0, &[], &mut ctx, Tier::BaselineJit)
+        .expect("the deopt path reports the pre-emption");
+    // Charges #1/#2/#3 were the `label` at code 0, the `bif0` at code 1 and the
+    // `jump` at code 2; the step was applied first, so the yield names the jump's
+    // target — the loop head at code 0, never a re-execution of the jump.
+    assert_eq!(outcome, RunOutcome::Yield { func: 0, pc: 0 });
+    assert_eq!(ctx.charges, 3, "one charge per deopt instruction");
+    assert_eq!(
+        machine.reductions(),
+        3,
+        "the machine's slice counter agrees on the deopt path"
+    );
+    assert_eq!(ctx.calls, 1);
+}
+
+/// A non-blocking native entry cannot suspend a pre-empted process, so it folds the
+/// deopt yield into the same typed pre-emption error the interpreter's non-blocking
+/// entry produces.
+#[test]
+fn a_non_blocking_native_entry_folds_a_deopt_yield_into_the_typed_error() {
+    let (module, run) = yield_loop_module();
+    let mut machine = Machine::new();
+    let mut ctx = YieldCtx {
+        stop_after: u32::MAX,
+        calls: 0,
+        charges: 0,
+        yield_after: Some(1),
+    };
+
+    let err = machine
+        .run_with_tier(&module, run, 0, &[], &mut ctx, Tier::BaselineJit)
+        .expect_err("a non-blocking entry cannot suspend a pre-empted process");
+    match err {
+        beam_common::BeamError::Raise(raise) => assert_eq!(
+            raise.reason.as_atom(),
+            Some("unsupported_opcode: run: process pre-empted (reduction budget exhausted)")
+        ),
+        other => panic!("expected the typed pre-emption error, got {other:?}"),
+    }
+}
+
+/// The reported yield address is a real, resumable position: resuming there (the
+/// interpreter's `resume_outcome` re-enters the same suspended machine) continues
+/// the loop instead of re-executing the instruction already charged.
+#[test]
+fn a_deopt_yield_address_resumes_the_loop_to_its_terminal_outcome() {
+    let (module, run) = yield_loop_module();
+    let mut machine = Machine::new();
+    // The `counter/0` BIF stops the loop on its 3rd call, so the resumed run ends
+    // deterministically.
+    let mut ctx = YieldCtx {
+        stop_after: 2,
+        calls: 0,
+        charges: 0,
+        yield_after: Some(2),
+    };
+
+    let outcome = machine
+        .run_export_outcome_with_tier(&module, run, 0, &[], &mut ctx, Tier::BaselineJit)
+        .expect("the pre-emption is reported, not raised");
+    // Charge #2 was the `bif0` (call #1); its `Step::Next` moved the position to 2.
+    assert_eq!(outcome, RunOutcome::Yield { func: 0, pc: 2 });
+
+    // Resume with the yield switched off: the loop runs on to the terminal raise.
+    ctx.yield_after = None;
+    let err = machine
+        .resume_outcome(&module, 0, 2, &mut ctx)
+        .expect_err("the counter BIF ends the loop");
+    match err {
+        beam_common::BeamError::Raise(raise) => {
+            assert_eq!(raise.reason.as_atom(), Some("unsupported_opcode: stop"))
+        }
+        other => panic!("expected the host's typed error, got {other:?}"),
+    }
+    assert_eq!(ctx.calls, 3, "the failing 3rd call is not charged");
+}
