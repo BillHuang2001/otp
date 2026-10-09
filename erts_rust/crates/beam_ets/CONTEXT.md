@@ -177,11 +177,13 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   - The views are `!Send` by design (they carry a scratch `Heap`): neither a view nor its aliasing
     terms can move to another thread.
 
-### `table/ownership.rs` — `ets:give_away/3` + `{heir, …}` + the heir data
+### `table/ownership.rs` — `ets:give_away/3` + `{heir, …}` + `{protection, …}` + the heir data
 - `pub struct Heir { pub owner: OwnerId, pub data: Option<Eterm> }` — `Some(term)` = `{heir, Pid, Data}`
   (arity 3), `None` = `{heir, Pid}` (arity 2, the C `THE_NON_VALUE`: the heir inherits **silently**,
-  with no `{'ETS-TRANSFER'}` message). `pub enum SetOpt { Heir(Heir), ClearHeir }` — the parsed
-  `ets:setopts/2` option (the subset modelled).
+  with no `{'ETS-TRANSFER'}` message). `pub enum SetOpt { Heir(Heir), ClearHeir, Access(Access) }` — the
+  parsed `ets:setopts/2` option (the subset modelled). `Table::setopts(caller, SetOpt) -> Result<()>`
+  applies the **owner gate first** (`caller != owner` ⇒ `badarg`, nothing mutated), then `Heir`/`ClearHeir`
+  (through `set_heir`/`replace_heir`) or `Access(a)` (through `set_access`).
 - `Table::install_heir(owner, data: Option<Eterm>) -> Result<()>` — **copies** the gift data into
   table-owned storage (immediates by value; a non-copyable term is the typed `badarg` and the heir is
   left untouched). `Table::heir_data() -> Option<Eterm>` reads the table-owned copy back.
