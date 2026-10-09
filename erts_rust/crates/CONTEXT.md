@@ -245,9 +245,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
   `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
-  `summary: total=1100 agree=1093 mismatch=0 unsupported=7 skipped=0` (`../tools/differential/gate.sh` →
-  exit 3); re-run `gate.sh` for the live per-contract split. Of the seven `unsupported` cases (A.5
-  `wire/new_fun_ext_encode`; A.7's five `proc_signals/statistics_*`; A.9's
+  `summary: total=1213 agree=1210 mismatch=0 unsupported=3 skipped=0` (`../tools/differential/gate.sh` →
+  exit 3 until the allowlist is refreshed); re-run `gate.sh` for the live per-contract split. Of the three
+  `unsupported` cases (A.5 `wire/new_fun_ext_encode`; A.7 `proc_signals/statistics_runtime`; A.9
   `boot/proc_lib_start_link_blocks_the_boot_path`), the one unclosable by design is
   `wire/new_fun_ext_encode` (A.5): its
   `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`

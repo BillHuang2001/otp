@@ -121,8 +121,8 @@ jobs:
               exit 1
               ;;
             3)
-              echo "::warning::differential gate: no mismatch, but unsupported/skipped capability gaps remain (exit 3) — non-blocking"
-              exit 0
+              echo "::error::differential gate requires a ratchet update: an unauthorized capability gap appeared, or an entry in erts_rust/tools/differential/known-gaps.txt went stale (exit 3). Run erts_rust/tools/differential/gate.sh locally, then record a new gap or drop the closed one."
+              exit 1
               ;;
             *)
               echo "::error::differential gate exited with unexpected status $rc"

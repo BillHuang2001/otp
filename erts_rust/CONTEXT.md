@@ -111,26 +111,28 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   own `CONTEXT.md`; all implemented and tested. Verify the node tree via the routing table below.
 - **Build/test:** build with `scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace
   --all-targets` (warning-free); test with `scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  --workspace --no-fail-fast`. The suite is green (~6180 passing / 0 failing).
+  --workspace --no-fail-fast`. The suite is green (6700+ passing / 0 failing).
 - **CI runs the workspace and the gate:** `.github/workflows/erts_rust.yml` (path-triggered on
   `erts_rust/**` and on the workflow file itself, plus `workflow_dispatch`) installs the pinned
   toolchain (`rust-toolchain.toml`), then runs `cargo build --workspace --all-targets`,
   `cargo test --workspace --no-fail-fast`, a **non-blocking** `cargo clippy`, and the differential gate
   `tools/differential/gate.sh` against an OTP oracle (`erlef/setup-beam`); with no `erl`/`erlc` on
-  `PATH` the gate step warns and skips. `gate.sh`'s exit-code policy: `0` all agreed → pass; `1` a real
-  `mismatch` → fails the job; `2` env/usage error → fails the job; `3` no mismatch but
-  `unsupported`/`skipped` capability gaps remain → **non-blocking** warning. Parity claims are therefore
-  CI-checked, not manual-only.
+  `PATH` the gate step warns and skips. `gate.sh` always runs `--strict --allowlist known-gaps.txt`.
+  Its exit-code policy: `0` every executed case agreed, or every gap is recorded + the allowlist is fresh
+  → pass; `1` a real `mismatch` → fails the job; `2` env/usage error or an unparsable report → fails the
+  job; `3` no mismatch but the **ratchet** must be updated (an unrecorded capability gap appeared, or a
+  recorded one closed and went stale) → **fails the job**. Parity claims are therefore CI-checked, not
+  manual-only.
 - **Vertical slice WORKS:** `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam` (produced by
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
   outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate (`tools/differential`):** `summary: total=1100 agree=1093 mismatch=0 unsupported=7
-  skipped=0` (`gate.sh` → exit `3` without an allowlist; `--strict --allowlist known-gaps.txt` → exit `0`).
-  **No case disagrees.** `gate.sh` is authoritative — re-run it for the live per-contract split; the
-  remaining `unsupported` are honest, recorded capability gaps (never `mismatch`): `wire/new_fun_ext_encode`
-  (unclosable — an `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`), the five
-  `erlang:statistics/1` counters the runtime does not serve (`proc_signals/statistics_*_unsupported`), and
+- **Compatibility gate (`tools/differential`):** `summary: total=1213 agree=1210 mismatch=0 unsupported=3
+  skipped=0` (`gate.sh` → exit `3` until the allowlist is refreshed to those 3). **No case disagrees.**
+  `gate.sh` is authoritative — re-run it for the live per-contract split; the remaining `unsupported`
+  are honest, recorded capability gaps (never `mismatch`): `wire/new_fun_ext_encode` (unclosable — an
+  `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`),
+  `proc_signals/statistics_runtime_unsupported` (CPU time needs a `sysconf`/`clock_gettime` facility), and
   the A.9 boot seam (`boot/proc_lib_start_link_blocks_the_boot_path`).
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 637
   keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through defaulted
