@@ -134,8 +134,9 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`),
   `proc_signals/statistics_runtime_unsupported` (CPU time needs a `sysconf`/`clock_gettime` facility), and
   the A.9 boot seam (`boot/proc_lib_start_link_blocks_the_boot_path`).
-- **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 637
-  keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through defaulted
+- **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 640
+  keys = 556 declared + 84 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1` + the OTP-30
+  `pid_to_binary`/`ref_to_binary`/`port_to_binary`) through defaulted
   host seams (`RuntimeHooks::call`, `MemoryHook::memory`, …). Registered-but-unadopted BIFs return a
   typed `unsupported` until a host hook is installed.
 - **Benchmarks:** every measured figure and its caveats lives in `tools/bench/RESULTS.md` (raw artifacts
