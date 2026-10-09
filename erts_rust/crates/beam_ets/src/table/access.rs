@@ -19,7 +19,9 @@
 // %CopyrightEnd%
 
 //! The access-enforcing table view: [`TableAccess`] rechecks the table's
-//! `protection` against a requester process before every operation.
+//! `protection` against a requester process before every operation — **except**
+//! the ungated introspection (`info`/`size`/`is_empty`), which the oracle never
+//! access-checks.
 
 use beam_alloc::Heap;
 use beam_common::Result;
@@ -41,6 +43,17 @@ use crate::select::{MatchContinuation, MatchSpec};
 /// `private` admits only the owner, `public` admits anyone) is verified against
 /// the system `erl` (OTP 29 / erts-17.1) and reproduces the `DB_READ`/`DB_WRITE`
 /// status masks of `db_get_table_aux` (`../../erts/emulator/beam/erl_db.c`).
+///
+/// **The introspection surface is deliberately ungated**, exactly like the
+/// oracle: `ets:info/1,2` resolves a table with no access check, so a non-owner
+/// reads a `private` table's metadata where every read *and* write is `badarg`.
+/// There is no `info` wrapper at all ([`Table::info`] needs no requester), and
+/// the `size`/`is_empty` projections ([`size`](Self::size) /
+/// [`is_empty`](Self::is_empty)) perform no check either.
+///
+/// [`setopts`](Self::setopts)/[`set_access`](Self::set_access) are **owner**-gated
+/// (not protection-gated) and [`give_away`](Self::give_away) is owner-gated too:
+/// the ownership operations never consult the access mode.
 ///
 /// Ordered navigation needs no interior support: `ordered_set`
 /// `first`/`last`/`next`/`prev` are table-level operations, so the read-checked
@@ -337,15 +350,25 @@ impl TableAccess<'_> {
         Ok(self.table.tab2list())
     }
 
-    /// `ets:info(T, size)`, requiring read access.
+    /// The number of objects — the `size` field of `ets:info(T, size)`.
+    ///
+    /// **Ungated, exactly like `ets:info/1,2`.** The oracle resolves the table
+    /// for `ets:info` **without** the `DB_READ`/`DB_WRITE` status masks, so a
+    /// non-owner sizes a `protected` **and** a `private` table (verified against
+    /// the system `erl`, OTP 29 / erts-17.1: `ets:info(T, size)` answers for a
+    /// non-owner of a `private` table where every read *and* write is `badarg`).
+    /// It is therefore the one state projection of this view that performs **no**
+    /// access check — the read-gated bulk read is
+    /// [`tab2list`](Self::tab2list).
     pub fn size(&self) -> Result<usize> {
-        self.table.check_read(self.requester)?;
         Ok(self.table.size())
     }
 
-    /// Whether the table holds no objects, requiring read access.
+    /// Whether the table holds no objects (`ets:info(T, size) == 0`).
+    ///
+    /// **Ungated** like [`size`](Self::size) — emptiness is the `size` field of
+    /// the ungated `ets:info/1,2`, not a read, so no access check runs.
     pub fn is_empty(&self) -> Result<bool> {
-        self.table.check_read(self.requester)?;
         Ok(self.table.is_empty())
     }
 
