@@ -147,19 +147,16 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   preloaded modules on startup. Its boot-script executor (a public path the CLI does **not** drive)
   runs `bootstrap/bin/start.boot` instructions 0–15 and stops at instruction 16,
   `{apply,{application,load,[{application,stdlib,…}]}}`, with a typed `exit noproc` (no live
-  `application_controller`); instructions 17+ are unreached. The outstanding blocker chain, owner per
-  link:
-  1. **`beam_bifs`** — `ets:new/2`'s option grammar rejects every 2-tuple option except `{keypos,N}`
-     (so `application_controller:init/1` dies on `{read_concurrency,true}`), and the table-taking `ets`
-     BIFs decode a table by internal `Ref` only, so a `named_table` name is unreachable.
-  2. **`beam_engine`** — a cross-module callee that blocks in `receive` cannot suspend the process (the
-     synchronous `CallExt` path folds `RunOutcome::Wait` into an error), so `proc_lib:sync_start/2`-class
-     startup fails; the engine also binds one module per run.
-  3. **`beam_rt`** — no live `code_server`/`application_controller`/`logger` process (a runtime-native
-     `code:*`/`init:*` floor stands in).
-  `beam_gc`'s collector is implemented but not driven by `beam_rt` yet. A.9's differential coverage is
-  boot/version observability only. Per-crate detail: `crates/CONTEXT.md` (A.9 status) and
-  `crates/beam_rt/src/boot/CONTEXT.md`.
+  `application_controller`); instructions 17+ are unreached. The remaining blocker is the residual
+  `beam_engine` behaviour: a raise/`receive` from a cross-module callee (the `proc_lib:sync_start/2`-class
+  startup) is not suspended into the caller's frame, so instruction 16 still aborts — no committed
+  reproducer exists yet. The `beam_bifs` `ets` links formerly blamed here are implemented (`ets:new/2`
+  accepts the full option matrix incl. `{read_concurrency,true}`, and a `named_table` name resolves —
+  `beam_bifs/src/ets/resolve.rs`), and the `call_ext` seam is resolve-first / blocking-aware
+  (`beam_engine/src/families/funs/mod.rs`). `beam_rt` still runs no live
+  `code_server`/`application_controller`/`logger` process (a runtime-native `code:*`/`init:*` floor
+  stands in). A.9's differential coverage is boot/version observability only. Per-crate detail:
+  `crates/CONTEXT.md` (A.9 status) and `crates/beam_rt/src/boot/CONTEXT.md`.
 - **Honest coverage gaps** (per-crate `Known Issues`): the Cranelift hot tier (`jit-cranelift`,
   default-OFF, not on `beam_rt`'s path — the baseline JIT tier is wired for the first module entry);
   full match-spec compiler; ETS concurrency; `put_record/6`'s create form; several
