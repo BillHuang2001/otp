@@ -33,13 +33,27 @@
 //!
 //! # Why a real C `.so`
 //!
-//! Only a real driver can arm a *writable* descriptor and only a real driver's `output` callback can
-//! prove the bytes arrived, so the fixture is compiled with the host `cc` against the host
-//! `erl_driver.h` and `dlopen`ed exactly as `beam_rt`'s `{spawn_driver, Name}` port does. Two entry
-//! shapes come from one source via the `RT_READY_OUTPUT_MODE` macro (the `event_driver.c`
-//! convention): mode 0 leaves `ready_output` `NULL` (the pure case — the C substitutes
-//! `no_ready_output_callback`, which logs *and* deselects), mode 1 declares it, so the order the C
-//! uses (payload first, notification second) is pinned too.
+//! Only a real driver can arm a *writable* descriptor with `driver_select` and only a real driver's
+//! `output` callback can prove the bytes arrived, so the fixture is compiled with the host `cc`
+//! against the host `erl_driver.h` and `dlopen`ed exactly as `beam_rt`'s `{spawn_driver, Name}` port
+//! does. Two entry shapes come from one source via the `RT_READY_OUTPUT_MODE` macro (the
+//! `event_driver.c` convention): mode 0 leaves `ready_output` `NULL` (the pure case — the C
+//! substitutes `no_ready_output_callback`, which logs *and* deselects), mode 1 declares it, so the
+//! order the C uses (payload first, notification second) is pinned too.
+//!
+//! # How the fixture reaches the host (`driver_select`/`driver_output`)
+//!
+//! A driver `.so` normally leaves `driver_*` **undefined** and resolves them out of the loading
+//! process's dynamic symbol table, which exists because `build.rs` passes
+//! `-Wl,--export-dynamic` **for the `[[bin]]` and `tests/` targets**. Cargo's
+//! `rustc-link-arg-tests` does *not* cover a library's unit-test link, so the `--lib` harness this
+//! test runs in has no `.dynsym` entry for `driver_select`/`driver_output` and such a fixture would
+//! fail to `dlopen` (`undefined symbol: driver_free`). The fixture therefore imports no `driver_*`
+//! symbol and is handed the two host functions it needs **as addresses** in the loader's `command`
+//! string, which it receives in `start` and calls through. Everything else about it is an ordinary
+//! driver: the `ErlDrvPort` is the adapter's, the calls land in this crate's `DriverPort` host
+//! (`driver_select` → `DriverHost::select`, `driver_output` → `DriverHost::output`), and its
+//! storage is the object's own static (so `driver_alloc`/`driver_free` are not needed either).
 //!
 //! # Skip policy
 //!
@@ -73,8 +87,8 @@ const READY_OUTPUT_C: &str = r#"
 #include <erl_driver.h>
 
 #include <stdint.h>
+#include <stdio.h>
 #include <unistd.h>
-
 #ifndef RT_READY_OUTPUT_MODE
 #define RT_READY_OUTPUT_MODE 0
 #endif
@@ -87,32 +101,45 @@ const READY_OUTPUT_C: &str = r#"
 
 #define RT_READY_OUTPUT_INIT rt_ready_output
 
+/* The host's `driver_select`/`driver_output`, handed over by the test in the `command` string (two
+ * `%lx` addresses). See the module docs: a `--lib` unit-test link does not export the dynamic
+ * symbol table, so this fixture imports no `driver_*` symbol and calls the host through the
+ * pointers it is given instead. */
+typedef int (*rt_select_fn)(ErlDrvPort, ErlDrvEvent, int, int);
+typedef int (*rt_output_fn)(ErlDrvPort, char *, ErlDrvSizeT);
+
 typedef struct {
     ErlDrvPort port;
     int read_end;
     int write_end;
+    rt_select_fn select;
+    rt_output_fn output;
 } rt_state;
+
+/* One port per loaded object, so the state can live in this object's own storage: the fixture
+ * deliberately does not import `driver_alloc`/`driver_free` either. */
+static rt_state rt_state_storage;
 
 static ErlDrvData rt_start(ErlDrvPort port, char *command) {
     int fds[2];
-    rt_state *st;
-    (void) command;
+    rt_state *st = &rt_state_storage;
+    unsigned long select_addr = 0;
+    unsigned long output_addr = 0;
+    if (command == NULL || sscanf(command, "%lx %lx", &select_addr, &output_addr) != 2)
+        return (ErlDrvData) -1;
+    if (select_addr == 0 || output_addr == 0)
+        return (ErlDrvData) -1;
+    st->select = (rt_select_fn) (intptr_t) select_addr;
+    st->output = (rt_output_fn) (intptr_t) output_addr;
     if (pipe(fds) != 0)
         return (ErlDrvData) -1;
-    st = (rt_state *) driver_alloc(sizeof(rt_state));
-    if (st == NULL) {
-        close(fds[0]);
-        close(fds[1]);
-        return (ErlDrvData) -1;
-    }
     st->port = port;
     st->read_end = fds[0];
     st->write_end = fds[1];
     /* Arm the descriptor for writability BEFORE anything is queued: that is the state
      * `ready_output` has to cope with. A refusal fails the port, so a half-armed port never looks
      * healthy. */
-    if (driver_select(port, (ErlDrvEvent) (intptr_t) st->write_end, ERL_DRV_WRITE, 1) != 0) {
-        driver_free(st);
+    if (st->select(port, (ErlDrvEvent) (intptr_t) st->write_end, ERL_DRV_WRITE, 1) != 0) {
         close(fds[0]);
         close(fds[1]);
         return (ErlDrvData) -1;
@@ -124,9 +151,11 @@ static void rt_stop(ErlDrvData drv_data) {
     rt_state *st = (rt_state *) drv_data;
     if (st == NULL)
         return;
-    close(st->read_end);
-    close(st->write_end);
-    driver_free(st);
+    /* The pipe's ends are deliberately left open: a port that still has a descriptor armed for
+     * writability deregisters it *after* `stop` has run, so closing the write end here would make
+     * that deregistration fail (`EBADF`). The two fds one test leaks are reclaimed when the test
+     * process exits. */
+    (void) st;
 }
 
 /* `port_command` reaches this callback. Echoing the payload back makes the arrival of the bytes
@@ -135,7 +164,7 @@ static void rt_output(ErlDrvData drv_data, char *buf, ErlDrvSizeT len) {
     rt_state *st = (rt_state *) drv_data;
     if (st == NULL || len == 0)
         return;
-    (void) driver_output(st->port, buf, len);
+    (void) st->output(st->port, buf, len);
 }
 
 #if RT_READY_OUTPUT_MODE == 1
@@ -145,7 +174,7 @@ static void rt_ready_output(ErlDrvData drv_data, ErlDrvEvent event) {
     (void) event;
     if (st == NULL)
         return;
-    (void) driver_output(st->port, "W", 1);
+    (void) st->output(st->port, "W", 1);
 }
 #define RT_READY_OUTPUT_SLOT rt_ready_output
 #else
@@ -412,11 +441,12 @@ fn build_fixture(mode: u32, stem: &str) -> Option<Fixture> {
 
 /// Loads `fixture`'s driver and opens one port on it, returning the poller, registry and id.
 ///
-/// The `black_box` reference is the same anchor `crate::port::PortRegistry::new` uses: it keeps
-/// `beam_abi`'s `driver_*` codegen unit in the link, so `dlopen(RTLD_NOW)` can resolve the
-/// fixture's undefined `driver_*` imports out of the test binary's dynamic symbol table
-/// (`build.rs`'s `-Wl,--export-dynamic`).
+/// The fixture is handed this runtime's `driver_select`/`driver_output` as two `%lx` addresses in
+/// the `command` string (see the module docs): the `--lib` unit-test link does not export the
+/// dynamic symbol table a driver `.so` would resolve them from.
 fn open_port(fixture: &Fixture, stem: &str) -> (Poller, PortRegistry, PortId) {
+    // The same anchor `crate::port::PortRegistry::new` uses, so the suite still exercises the
+    // populated table.
     let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
     let atoms = Rc::new(AtomTable::new());
     let host = DriverPort::new(
@@ -424,11 +454,16 @@ fn open_port(fixture: &Fixture, stem: &str) -> (Poller, PortRegistry, PortId) {
         atoms,
         ProcessId::new(1, 0),
     );
+    let command = format!(
+        "{:x} {:x}",
+        beam_abi::driver::drv::driver_select as *const () as usize,
+        beam_abi::driver::drv::driver_output as *const () as usize
+    );
     let adapter = DriverPortAdapter::load(
         &[fixture.stem.display().to_string()],
         stem,
         host,
-        String::new(),
+        command,
     )
     .expect("the fixture driver loads");
     let mut poller = Poller::new().expect("a poller");
