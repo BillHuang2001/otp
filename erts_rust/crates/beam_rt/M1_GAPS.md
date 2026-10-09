@@ -24,7 +24,10 @@ or a measured own-state difference — never a wrong result. Present-state docum
   binaries from `beam_alloc::registry`, `code` from loaded `.beam` sizes, `ets` from the `TableRegistry`,
   `system` = those plus the remaining allocator live bytes excluding `Standard`/`EHeap`), snapshotted at
   construction (built only on the `uses_memory_hook` arm); `memory/1` answers in the requested order and
-  `badarg` for an unknown key. `erlang:statistics/0,1` and the other `RuntimeHooks` families stay gaps.
+  `badarg` for an unknown key. `erlang:statistics/0` — and, on `statistics/1`, the keys this runtime
+  cannot measure (`runtime`, `garbage_collection`, `run_queues`, `*_run_queue_lengths*`, `active_tasks*`,
+  `scheduler_wall_time_all`, `microstate_accounting`) — stay gaps, as do the other `RuntimeHooks`
+  families.
 
 ## Own-state answers (differ by construction, not bugs)
 * `erlang:processes/0`, `erlang:ports/0`, `system_info(port_count)`, the `persistent_term`/
