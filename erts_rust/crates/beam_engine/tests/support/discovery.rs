@@ -65,7 +65,20 @@ use std::process::Command;
 ///   every caller skip and assert nothing, so this **panics** with the exit status,
 ///   the captured stdout/stderr and the exact argv.
 fn run_discovery_probe(eval: &str) -> Option<String> {
-    let output = match Command::new("erl").args(["-noshell", "-eval", eval]).output() {
+    let argv = format!("erl -noshell -eval {eval:?}");
+    classify_probe(
+        Command::new("erl").args(["-noshell", "-eval", eval]).output(),
+        &argv,
+    )
+}
+
+/// Classifies one spawned probe's [`std::process::Output`] (a pure function of the
+/// spawn result, so the absent-vs-failed policy is unit-tested directly rather than
+/// only through a real `erl`).
+///
+/// `argv` is the human-readable command, used verbatim in the panic message.
+fn classify_probe(output: std::io::Result<std::process::Output>, argv: &str) -> Option<String> {
+    let output = match output {
         Ok(output) => output,
         // A genuine spawn failure (no `erl` on `PATH`, …): the oracle is absent, so
         // the caller must skip loudly. This loud SKIP is the only legitimate vacuity.
@@ -73,7 +86,7 @@ fn run_discovery_probe(eval: &str) -> Option<String> {
     };
     if !output.status.success() {
         panic!(
-            "the OTP discovery probe `erl -noshell -eval {eval:?}` RAN but exited with {} — \
+            "the OTP discovery probe `{argv}` RAN but exited with {} — \
              a harness failure (a broken OTP install or an invalid application name), never a \
              missing oracle.\n  stdout: {:?}\n  stderr: {:?}",
             output.status,
@@ -317,5 +330,67 @@ pub fn skip_reason() -> Option<String> {
         )
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The absent-vs-failed policy, unit-tested without a real `erl`
+// ---------------------------------------------------------------------------
+
+/// Pins [`classify_probe`]'s three-way policy directly (no external process), which is
+/// what stops the "ran and failed" case from silently degrading to a skip again.
+///
+/// Note: integration-test crates (`tests/*.rs`) are compiled without `cfg(test)`, so
+/// this module is gated on `unix` alone; it is collected by every test binary that
+/// includes `mod support;`.
+#[cfg(unix)]
+mod tests {
+    use super::classify_probe;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    /// One synthetic probe result with the given raw `wait(2)` status.
+    fn probe(raw_status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
+        Output {
+            status: ExitStatus::from_raw(raw_status),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_spawn_failure_is_the_absent_oracle() {
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "no `erl` on PATH");
+        assert!(
+            classify_probe(Err(error), "erl -noshell -eval \"...\"").is_none(),
+            "a spawn failure must stay the loud SKIP (None), never a panic"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_ran_and_exited_zero_returns_its_stdout() {
+        // Raw status 0 == exit code 0.
+        let output = probe(0, b"/some/such/lib\n", b"");
+        assert_eq!(
+            classify_probe(Ok(output), "erl -noshell -eval \"...\"").as_deref(),
+            Some("/some/such/lib\n")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "RAN but exited")]
+    fn a_probe_that_ran_and_exited_non_zero_panics() {
+        // Raw status `1 << 8` == exit code 1 with **empty** stdout/stderr -- the exact
+        // silent-failure signature a real `erl` shows for an unknown application name.
+        let output = probe(1 << 8, b"", b"");
+        let _ = classify_probe(Ok(output), "erl -noshell -eval \"...\"");
+    }
+
+    #[test]
+    #[should_panic(expected = "RAN but exited")]
+    fn a_probe_that_ran_and_died_by_signal_panics() {
+        // Raw status 9 == killed by SIGKILL (`output.status.success()` is false).
+        let output = probe(9, b"", b"");
+        let _ = classify_probe(Ok(output), "erl -noshell -eval \"...\"");
     }
 }
