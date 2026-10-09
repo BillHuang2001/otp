@@ -409,7 +409,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   sibling, read-only here) exits 3 because `tools/differential/known-gaps.txt` still lists
   `proc_signals/monitor_3_tag_option_unsupported` and `proc_signals/monitor_port_unsupported`, two cases
   that **agree**, so the gate exits 3 until they are dropped; the run itself is
-  `total=1100 agree=1093 mismatch=0 unsupported=7 skipped=0`.
+  `total=1213 agree=1210 mismatch=0 unsupported=3 skipped=0`.
 ## Routing Table
 - `DESIGN_DECISIONS.md` → the design rationale ("why") for the frozen API/constraints (signal-copy-at-enqueue, the resume-on-send wake list, the process-table mutation hub, the GC root set, dictionary equality/order, monitor/tag side tables, the SMP lock bounds, `SharedProcessTable`'s `Send/Sync`, non-flaky `wait_idle`)
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
