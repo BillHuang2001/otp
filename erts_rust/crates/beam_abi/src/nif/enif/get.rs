@@ -26,6 +26,15 @@
 //!
 //! `enif_get_int64`/`enif_get_uint64` are also implemented here, but on LP64 the header `#define`s
 //! them onto their `long`/`ulong` siblings, so they are free symbols rather than `ErlNifApi` slots.
+//!
+//! # Atom accessors and the per-call atom record
+//!
+//! [`enif_get_atom`] and [`enif_get_atom_length`] resolve an atom's name through the env's
+//! **per-call record first** (see [`NifEnv::recorded_atom_name`]) and fall back to
+//! [`NifHost::atom_name`]. The record closes a real divergence: the runtime commits a freshly
+//! interned atom lazily, so the host's reverse lookup does not see an atom interned earlier in the
+//! *same* call, and `enif_get_atom` would answer `0` where the oracle answers the name. A miss
+//! falls through to the hook exactly as before.
 
 use super::*;
 
@@ -192,7 +201,8 @@ pub unsafe extern "C" fn enif_get_double(
 
 /// `int enif_get_atom(ErlNifEnv*, ERL_NIF_TERM atom, char* buf, unsigned len, ErlNifCharEncoding);`
 ///
-/// Returns the number of bytes written **including the NUL**, or `0` on failure.
+/// Returns the number of bytes written **including the NUL**, or `0` on failure. The name is taken
+/// from the env's per-call atom record first, then from [`NifHost::atom_name`].
 ///
 /// # Safety
 ///
@@ -208,9 +218,12 @@ pub unsafe extern "C" fn enif_get_atom(
     let Some(e) = (unsafe { env_mut(env) }) else {
         return 0;
     };
-    let name = match e.host().atom_name(t(atom)) {
-        Some(name) => name,
-        None => return 0,
+    let name: String = match e.recorded_atom_name(t(atom)) {
+        Some(name) => name.to_string(),
+        None => match e.host().atom_name(t(atom)) {
+            Some(name) => name,
+            None => return 0,
+        },
     };
     let len = len as usize;
     if len == 0 || buf.is_null() {
@@ -254,6 +267,8 @@ pub unsafe extern "C" fn enif_get_atom(
 
 /// `int enif_get_atom_length(ErlNifEnv*, ERL_NIF_TERM atom, unsigned* len, ErlNifCharEncoding);`
 ///
+/// The name is taken from the env's per-call atom record first, then from [`NifHost::atom_name`].
+///
 /// # Safety
 ///
 /// `env` must be a live env; `len` must be null or writable.
@@ -267,8 +282,12 @@ pub unsafe extern "C" fn enif_get_atom_length(
     let Some(e) = (unsafe { env_mut(env) }) else {
         return 0;
     };
-    let Some(name) = e.host().atom_name(t(atom)) else {
-        return 0;
+    let name: String = match e.recorded_atom_name(t(atom)) {
+        Some(name) => name.to_string(),
+        None => match e.host().atom_name(t(atom)) {
+            Some(name) => name,
+            None => return 0,
+        },
     };
     let n = match encoding {
         ErlNifCharEncoding::Latin1 => {
