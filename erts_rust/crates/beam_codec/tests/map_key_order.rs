@@ -63,7 +63,17 @@
 //! this against the live oracle: interning `zzzq_one` before `zzzq_two` yields a
 //! different pair order than the reverse. Byte-exact cross-implementation comparison is
 //! consequently only meaningful for **non-atom** keys (or for an already-ordered
-//! flatmap), which is why the oracle cross-check below uses an **integer-keyed** corpus.
+//! flatmap), which is why the oracle cross-checks below use **integer-keyed**
+//! ([`oracle_and_our_encoder_agree_for_integer_keyed_maps`]) and **binary-keyed**
+//! ([`binary_keyed_map_matches_the_oracle_byte_exactly`]) corpora.
+//!
+//! Two further oracle cross-checks pin that an atom key orders by **index, not name**:
+//! [`atom_keyed_map_matches_the_oracle_in_index_order_not_name_order`] interns the two
+//! atoms in a *deliberately non-lexicographic* order and shows the emitted order is the
+//! index order (the opposite of name order), and
+//! [`decoded_flatmap_canonicalises_into_atom_index_order`] shows the decoder
+//! canonicalising a wire image whose atom order is *not* the receiving VM's index order
+//! (the atom-order seed there is derived from the oracle, never hard-coded).
 //!
 //! ## Hash maps (> 32 pairs) are encoded too, byte-identically to ERTS
 //!
@@ -89,11 +99,15 @@ use std::process::{Command, Stdio};
 
 use beam_alloc::Heap;
 
-use beam_codec::term::{flatmap_parts, make_flatmap, map_pairs_storage_order};
+use beam_codec::term::{
+    bitstring_bytes, flatmap_parts, make_binary, make_flatmap, map_pairs_storage_order,
+};
 use beam_codec::{decode_term, encode_term, MAP_EXT, VERSION_MAGIC};
 
 use beam_term::map::map_pairs;
-use beam_term::prelude::{atom_val, cmp_flatmap_keys, make_small, AtomTable, Eterm};
+use beam_term::prelude::{
+    atom_val, cmp_flatmap_keys, make_atom, make_small, AtomTable, Eterm,
+};
 
 // ---------------------------------------------------------------------------
 // Oracle resolution and process plumbing (mirrors tests/interop.rs)
@@ -214,6 +228,28 @@ fn parse_binary_list(out: &str) -> Vec<Vec<u8>> {
         }
     }
     images
+}
+
+/// Parse the `[list,float,bin]` atom-name list the oracle prints on its **first** output
+/// line into `Vec<String>`.
+///
+/// The atoms used by this file's atom-order tests are plain unquoted lowercase names, so
+/// a bracket-strip plus a comma split is exact; a quoted/embedded-comma name would need a
+/// real Erlang term parser, which is out of scope here.
+fn parse_key_name_list(out: &str) -> Vec<String> {
+    let line = out
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("the oracle printed nothing: {out:?}"))
+        .trim();
+    let inner = line
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("expected an Erlang list of atoms, got {line:?}"));
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner.split(',').map(|t| t.trim().to_string()).collect()
 }
 
 /// A fresh heap for building/decoding a term.
@@ -356,6 +392,73 @@ fn oracle_and_our_encoder_agree_for_integer_keyed_maps() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. Live oracle cross-check over a binary-keyed corpus.
+// ---------------------------------------------------------------------------
+
+/// Binary keys compare **bit-by-bit** — for byte-aligned binaries that is plain
+/// byte-lexicographic order, which (unlike atom keys) is stable across VM starts — so the
+/// oracle's `term_to_binary/1` image of `#{<<"bin">>=>2, <<"float">>=>2, <<"list">>=>2}`
+/// is a byte-exact target for our encoder.
+///
+/// Oracle: `erl -noshell -eval 'io:format("~w~n",[term_to_binary(#{<<"bin">>=>2,<<"float">>=>2,<<"list">>=>2})])' -s init stop`
+/// → `<<131,116,0,0,0,3,109,0,0,0,3,98,105,110,97,2,109,0,0,0,5,102,108,111,97,116,97,2,109,0,0,0,4,108,105,115,116,97,2>>`
+/// (order `bin`, `float`, `list`). This fills the gap left by the integer-keyed corpus.
+#[test]
+fn binary_keyed_map_matches_the_oracle_byte_exactly() {
+    use beam_term::map::{map_words_capacity, write_map};
+
+    let Some(oracle) = oracle_or_skip("binary_keyed_map_matches_the_oracle_byte_exactly") else {
+        return;
+    };
+
+    let images = parse_binary_list(&run_erl(
+        &oracle,
+        r#"io:format("~w~n", [term_to_binary(#{<<"bin">> => 2, <<"float">> => 2, <<"list">> => 2})])"#,
+    ));
+    assert_eq!(images.len(), 1, "one oracle image");
+    let oracle_image = &images[0];
+    assert_eq!(oracle_image[0], VERSION_MAGIC, "version byte");
+    assert_eq!(oracle_image[1], MAP_EXT, "MAP_EXT tag");
+    assert_eq!(
+        u32::from_be_bytes([oracle_image[2], oracle_image[3], oracle_image[4], oracle_image[5]]),
+        3,
+        "pair count"
+    );
+
+    // Build the same map on a heap: three binaries + the pairs, canonicalised by
+    // `write_map` (the ERTS flat-map sort), which the encoder then preserves verbatim.
+    let mut h = heap(256);
+    let atoms = AtomTable::new();
+    let pairs: Vec<(Eterm, Eterm)> = [&b"bin"[..], &b"float"[..], &b"list"[..]]
+        .into_iter()
+        .map(|key| (make_binary(&mut h, key).unwrap(), make_small(2)))
+        .collect();
+    // SAFETY: `map_words_capacity` is the documented upper bound for `write_map`, and the
+    // heap holds at least that many free words.
+    let hp = unsafe { h.alloc_words(map_words_capacity(pairs.len())) }.unwrap();
+    // SAFETY: `hp` owns `map_words_capacity(3)` writable words, the `write_map` precondition.
+    let map = unsafe { write_map(hp, &pairs, &atoms) }.unwrap();
+
+    // The flat-map sort put the binary keys in byte-lexicographic order: bin, float, list.
+    let (stored_keys, _values) = flatmap_parts(map).unwrap();
+    let names: Vec<&[u8]> = stored_keys
+        .iter()
+        .map(|k| bitstring_bytes(*k).unwrap().0)
+        .collect();
+    assert_eq!(
+        names,
+        vec![&b"bin"[..], &b"float"[..], &b"list"[..]],
+        "binary keys must sort byte-lexicographically"
+    );
+
+    let ours = encode_term(map, &atoms).expect("a binary-keyed flat map is encodable");
+    assert_eq!(
+        ours, *oracle_image,
+        "our binary-keyed flat-map image must be byte-identical to the oracle's"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3. Why atom-keyed multi-key maps are not byte-comparable across implementations.
 // ---------------------------------------------------------------------------
 
@@ -409,6 +512,216 @@ fn atom_keyed_map_bytes_depend_on_interning_order() {
     let t2 = decode_term(img_two, &mut h2, &mut a2).unwrap();
     let (keys2, _) = flatmap_parts(t2).unwrap();
     assert_eq!(a2.name(atom_val(keys2[0])).unwrap(), "zzzq_two");
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Atom keys order by INDEX, not NAME — pinned against the live oracle.
+// ---------------------------------------------------------------------------
+
+/// Proves the flat-map atom-key order is **atom-table index**, *not* lexicographic name
+/// order, by interning the two atoms in a deliberately **non-lexicographic** order and
+/// byte-comparing our image with the oracle's.
+///
+/// Oracle: `erl -noshell -eval 'B = list_to_atom("zzzq_two"), A = list_to_atom("zzzq_one"), io:format("~w~n",[term_to_binary(#{A=>1,B=>2})])' -s init stop`
+/// → `<<131,116,0,0,0,2,119,8,"zzzq_two",97,2,119,8,"zzzq_one",97,1>>` — `zzzq_two` is
+/// emitted **first** (its index is lower) even though `zzzq_one < zzzq_two`
+/// lexicographically, so index order is the exact opposite of name order here.
+#[test]
+fn atom_keyed_map_matches_the_oracle_in_index_order_not_name_order() {
+    use beam_term::map::{map_words_capacity, write_map};
+
+    let Some(oracle) =
+        oracle_or_skip("atom_keyed_map_matches_the_oracle_in_index_order_not_name_order")
+    else {
+        return;
+    };
+
+    // Intern `zzzq_two` BEFORE `zzzq_one`, so index(two) < index(one) while
+    // `zzzq_one < zzzq_two` lexicographically — the direction that distinguishes index
+    // order from name order.
+    let images = parse_binary_list(&run_erl(
+        &oracle,
+        r#"B = list_to_atom("zzzq_two"), A = list_to_atom("zzzq_one"), io:format("~w~n", [term_to_binary(#{A => 1, B => 2})])"#,
+    ));
+    assert_eq!(images.len(), 1, "one oracle image");
+    let oracle_image = &images[0];
+    assert_eq!(oracle_image[0], VERSION_MAGIC, "version byte");
+    assert_eq!(oracle_image[1], MAP_EXT, "MAP_EXT tag");
+
+    // The same relative intern order in a fresh table: `zzzq_two` first, then `zzzq_one`.
+    let mut h = heap(64);
+    let mut atoms = AtomTable::new();
+    let two = atoms.intern("zzzq_two");
+    let one = atoms.intern("zzzq_one");
+    assert!(
+        two.raw() < one.raw(),
+        "zzzq_two must hold the lower atom index in this deliberately non-lexicographic run"
+    );
+
+    let pairs = [
+        (make_atom(one), make_small(1)),
+        (make_atom(two), make_small(2)),
+    ];
+    // SAFETY: `map_words_capacity` is the documented upper bound for `write_map`, and the
+    // heap holds at least that many free words.
+    let hp = unsafe { h.alloc_words(map_words_capacity(pairs.len())) }.unwrap();
+    // SAFETY: `hp` owns `map_words_capacity(2)` writable words, the `write_map` precondition.
+    let map = unsafe { write_map(hp, &pairs, &atoms) }.unwrap();
+
+    // The stored (and emitted) order is index order: zzzq_two, zzzq_one.
+    let (keys, _values) = flatmap_parts(map).unwrap();
+    let names: Vec<&str> = keys
+        .iter()
+        .map(|k| atoms.name(atom_val(*k)).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["zzzq_two", "zzzq_one"],
+        "atom keys must order by atom-table INDEX, not by name"
+    );
+    // The inversion is the whole point: index order is NOT lexicographic name order.
+    assert_ne!(
+        names,
+        vec!["zzzq_one", "zzzq_two"],
+        "the emitted order must not be lexicographic name order"
+    );
+
+    let ours = encode_term(map, &atoms).expect("an atom-keyed flat map is encodable");
+    assert_eq!(
+        ours, *oracle_image,
+        "our index-ordered flat-map image must be byte-identical to the oracle's"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3c. The decoder canonicalises an incoming flat map into the receiving VM's
+//     atom-index order (not the wire order).
+// ---------------------------------------------------------------------------
+
+/// A hand-built `MAP_EXT` flat map whose **wire** atom order is byte-lexicographic
+/// (`bin, float, list`, `SMALL_ATOM_UTF8_EXT` = `119`).
+const BINARY_LEX_ATOM_KEYED_PAYLOAD: &[u8] = &[
+    VERSION_MAGIC,
+    MAP_EXT,
+    0,
+    0,
+    0,
+    3,
+    119,
+    3,
+    b'b',
+    b'i',
+    b'n',
+    97,
+    1,
+    119,
+    5,
+    b'f',
+    b'l',
+    b'o',
+    b'a',
+    b't',
+    97,
+    2,
+    119,
+    4,
+    b'l',
+    b'i',
+    b's',
+    b't',
+    97,
+    3,
+];
+
+/// The decoder canonicalises an incoming flat map into the *receiving* VM's
+/// `erts_cmp_flatmap_keys` order — atom keys by **atom-table index** — and a
+/// decode → re-encode then reproduces the oracle's canonical image byte-for-byte.
+///
+/// Oracle: `erl -noshell -eval 'P = <<…payload…>>, io:format("~w~n",[maps:keys(binary_to_term(P))]), io:format("~w~n",[term_to_binary(binary_to_term(P))])' -s init stop`
+/// prints `[list,float,bin]` then the canonical image `<<131,116,…>>`; `list`/`float`/`bin` are
+/// pre-interned at boot with index(list) < index(float) < index(bin).
+///
+/// **Why the atom-order seed is required.** Our decoder interns atoms in **wire** order
+/// into a fresh `AtomTable`, so a fresh table would give `bin < float < list` and would
+/// canonicalise to the *wire* order — which is NOT the oracle's. Atom-index order is
+/// per-VM-start interning order, so to reproduce the oracle's canonicalisation we must
+/// mirror its relative atom order *before* decoding. The order is derived from the oracle
+/// itself (never hard-coded), so the test stays honest if the oracle's boot order changes.
+#[test]
+fn decoded_flatmap_canonicalises_into_atom_index_order() {
+    let Some(oracle) = oracle_or_skip("decoded_flatmap_canonicalises_into_atom_index_order")
+    else {
+        return;
+    };
+
+    let byte_list = BINARY_LEX_ATOM_KEYED_PAYLOAD
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    // One oracle spawn yields BOTH the canonical key order and the canonical image.
+    // `~w` renders the key list as `[list,float,bin]` and the image binary as `<<131,…>>`.
+    let out = run_erl(
+        &oracle,
+        &format!(
+            "P = <<{byte_list}>>, \
+             io:format(\"~w~n\", [maps:keys(binary_to_term(P))]), \
+             io:format(\"~w~n\", [term_to_binary(binary_to_term(P))])"
+        ),
+    );
+    let canonical_names = parse_key_name_list(&out);
+    let canonical_images = parse_binary_list(&out);
+    assert_eq!(canonical_images.len(), 1, "one oracle image");
+    let oracle_image = &canonical_images[0];
+
+    // The oracle's boot table had list < float < bin by *index*, so its canonical order is
+    // `list, float, bin` — the opposite of the payload's byte-lexicographic wire order.
+    assert_eq!(
+        canonical_names,
+        vec!["list", "float", "bin"],
+        "the oracle canonicalises into its atom-index order"
+    );
+
+    // Mirror that interning order in OUR table before decoding (see the doc comment).
+    let mut atoms = AtomTable::new();
+    for name in &canonical_names {
+        atoms.intern(name);
+    }
+
+    let mut h = heap(256);
+    let decoded = decode_term(BINARY_LEX_ATOM_KEYED_PAYLOAD, &mut h, &mut atoms)
+        .expect("the payload is well-formed");
+
+    // The decoded map is a flat map whose key order is the index order (`list, float, bin`),
+    // NOT the wire order (`bin, float, list`).
+    let (keys, values) = flatmap_parts(decoded).unwrap();
+    let names: Vec<&str> = keys
+        .iter()
+        .map(|k| atoms.name(atom_val(*k)).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["list", "float", "bin"],
+        "decode must canonicalise into atom-index order, not the wire order"
+    );
+    assert_ne!(
+        names,
+        vec!["bin", "float", "list"],
+        "the decoded order must not be the payload's wire order"
+    );
+    // The values travel with their keys: list=>3, float=>2, bin=>1.
+    assert_eq!(
+        values,
+        &[make_small(3), make_small(2), make_small(1)],
+        "values must follow their canonicalised keys"
+    );
+
+    // Decode -> re-encode is byte-identical to the oracle's canonical image.
+    let ours = encode_term(decoded, &atoms).expect("the canonical flat map is encodable");
+    assert_eq!(
+        ours, *oracle_image,
+        "decode -> re-encode must reproduce the oracle's canonical image byte-for-byte"
+    );
 }
 
 // ---------------------------------------------------------------------------

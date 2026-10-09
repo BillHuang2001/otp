@@ -656,12 +656,23 @@ Both files carry the same chunks in the same order; only `LitT` differs.
 Both `LitT` payloads decode to the same nine literal records; the compressed one is the
 zlib stream of the verbatim record table (395 bytes -> 294 bytes). `tests/literals.rs`
 asserts the two pools carry byte-identical payloads and decode to identically re-encoded
-terms.
+terms — and that each literal re-encodes to what the real ERTS produces from that same
+payload, which for a **map-free** literal means byte-exact.
+
+A **map-bearing** literal (idx 2, 7, 8) is asserted against the oracle rather than
+byte-for-byte, because it need not be reproducible: `+deterministic` writes a flat map's
+keys in name-lexicographic order, while ERTS *stores* them in `erts_cmp_flatmap_keys` order
+(for atom keys: atom-table index order). Literal 7 therefore arrives as
+`#{bin => …, float => …, list => …}` and is stored as `#{list => …, float => …, bin => …}`
+— its payload bytes cannot be reproduced from the decoded term at all. `tests/literals.rs`
+asserts Rust == the oracle's re-encode for such literals and pins both orders (verbatim
+payload vs. stored) in
+`map_bearing_fixture_literal_is_normalized_to_erts_key_order_on_load`.
 
 ## `literals_oracle.escript`
 
 The oracle for `tests/literals.rs`. It is **not** a fixture in the `.beam` sense: it is the
-Erlang-side half of the installed-literal sweep. Run as
+Erlang-side half of the literal checks. It has two modes. Run as
 
 ```sh
 escript literals_oracle.escript <otp-lib-root>
@@ -669,11 +680,20 @@ escript literals_oracle.escript <otp-lib-root>
 
 it walks every `*.beam` under the root and prints one TAB-separated line per `LitT`
 literal — `<path relative to the root> <TAB> <index> <TAB> <hex>` — where the hex is
-`term_to_binary(binary_to_term(Payload))` (OTP's own decode/encode round-trip). It parses
-the `LitT` chunks with `beam_lib`/`zlib`, i.e. an implementation independent of
+`term_to_binary(binary_to_term(Payload))` (OTP's own decode/encode round-trip). Run as
+
+```sh
+escript literals_oracle.escript --reencode <beam-file>
+```
+
+it does the same for a single named module, printing `<index> <TAB> <hex>` (no path field);
+that is the mode the committed-fixture test uses to obtain ERTS's per-literal image. Either
+way it parses the `LitT` chunks with `beam_lib`/`zlib`, i.e. an implementation independent of
 `beam_loader`'s framing, so a framing bug cannot validate itself. `binary_to_term/1`
-normalizes a flat map's key order to ERTS's canonical order, which is why the Rust test
-compares terms semantically (`beam_term::compare`) rather than byte-for-byte.
+normalizes a flat map's key order to ERTS's canonical order — the reason a map-bearing
+payload is compared against this oracle rather than byte-for-byte, and why the install sweep
+compares terms semantically (`beam_term::compare`).
+
 ## `nr_def.beam` / `nr_use.beam` — the OTP-29 native-record family (186-191)
 
 The positive control for the OTP-29 **native-record** opcode family

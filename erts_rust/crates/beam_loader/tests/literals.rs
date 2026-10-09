@@ -34,7 +34,25 @@
 //!   (`tests/fixtures/literals_verbatim.beam` / `literals_compressed.beam`, the
 //!   same source compiled by the system `erlc` with and without
 //!   `+compressed_literals`) is loaded, and the two pools must carry the *same*
-//!   payloads and decode to byte-identically re-encoded terms.
+//!   payloads and decode to identically re-encoded terms (each framing's re-encode
+//!   equals the other's).
+//! * **Map-free literals round-trip byte-exactly** — for a payload that carries no
+//!   map, `encode_term(decode_term(payload))` is asserted to reproduce the payload
+//!   the compiler wrote, byte for byte.
+//! * **Map-bearing literals are asserted against the oracle, not the payload** —
+//!   the fixture is compiled with `+deterministic`, so a flat map's keys are written
+//!   in **name-lexicographic** order (the `term_to_binary/2` `[deterministic]`
+//!   option), whereas ERTS — and therefore this loader — stores a flat map's keys in
+//!   `erts_cmp_flatmap_keys` order, which orders two atom keys by **atom-table
+//!   index** (`../../erts/emulator/beam/erl_utils.h`). Such a payload is *not*
+//!   reproducible from the decoded term, so
+//!   [`both_litt_forms_decode_to_identically_encoded_terms`] asserts the real
+//!   contract for it — the Rust re-encode equals **ERTS's own**
+//!   `term_to_binary(binary_to_term(Payload))` (obtained from the oracle script) —
+//!   and
+//!   [`map_bearing_fixture_literal_is_normalized_to_erts_key_order_on_load`] pins
+//!   both the compiler's *payload* key order and the loader's *stored* key order of
+//!   the `nested/0` map.
 //! * **Nested/composite literals** — the fixture covers a tuple containing a
 //!   map/float/list, a binary literal, a non-byte-aligned bitstring and a bignum.
 //!   [`the_fixture_covers_every_required_literal_kind`] asserts each literal's
@@ -73,6 +91,9 @@
 //!
 //! With `-- --nocapture` the `LITERALS:` summary (module/literal counts and the
 //! verbatim-vs-compressed split) is printed.
+
+mod common;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -89,6 +110,8 @@ use beam_codec::{
 use beam_loader::container::{parse as parse_container, ChunkId};
 use beam_loader::Module;
 use beam_term::prelude::{atom_val, cmp, is_atom, is_nil, signed_value, Eterm};
+
+use crate::common::raw_map_key_names;
 
 // ---------------------------------------------------------------------------
 // The committed fixtures (both framings of the same source)
@@ -207,9 +230,12 @@ fn the_committed_fixtures_cover_both_litt_forms() {
     assert!(COMPRESSED_BEAM.len() < VERBATIM_BEAM.len());
 }
 
-/// Both framings carry the *same* payloads, and every literal of every fixture
-/// round-trips byte-exactly through the loader (decode -> encode == the payload the
-/// oracle's compiler wrote).
+/// Both framings carry the *same* payloads and decode to identically re-encoded
+/// terms, and every literal re-encodes to what the real ERTS produces from the same
+/// payload — byte-exactly for a map-free literal (where ERTS's image *is* the
+/// compiler's payload), and "equal to the oracle's own re-encode" for a map-bearing
+/// one (whose payload carries the compiler's `+deterministic` flat-map key order
+/// that ERTS normalizes; see the module docs).
 #[test]
 fn both_litt_forms_decode_to_identically_encoded_terms() {
     let verbatim = load(VERBATIM_BEAM);
@@ -225,14 +251,125 @@ fn both_litt_forms_decode_to_identically_encoded_terms() {
     assert_eq!(verbatim.literals().len(), 9);
     assert_eq!(compressed.literals().len(), 9);
 
+    // ERTS's own re-encode of each payload is the reference for the map-bearing
+    // literals. Without an OTP install the comparison is skipped *loudly* (the rest
+    // of the assertions below are deterministic and still run).
+    let oracle = fixture_oracle_reencode();
+
+    let mut map_literals = 0usize;
+    let mut oracle_checked = 0usize;
     for (index, payload) in verbatim_payloads.iter().enumerate() {
-        // Each framing decodes to a term that re-encodes to the payload exactly.
+        // Both framings must decode to the same term, seen as identical bytes.
         let v = encode_term(literal(&verbatim, index), &verbatim.atom_table)
             .unwrap_or_else(|error| panic!("verbatim literal {index} must encode: {error:?}"));
-        assert_eq!(&v, payload, "verbatim literal {index} must round-trip byte-exactly");
         let c = encode_term(literal(&compressed, index), &compressed.atom_table)
             .unwrap_or_else(|error| panic!("compressed literal {index} must encode: {error:?}"));
-        assert_eq!(&c, payload, "compressed literal {index} must round-trip byte-exactly");
+        assert_eq!(
+            c, v,
+            "the verbatim and compressed framings must decode literal {index} to identically \
+             encoded terms"
+        );
+
+        if !is_map_literal(literal(&verbatim, index), &verbatim.atom_table) {
+            // No map anywhere in the term: the decoded term re-encodes to the payload
+            // the compiler wrote, byte for byte.
+            assert_eq!(&v, payload, "verbatim literal {index} must round-trip byte-exactly");
+            continue;
+        }
+
+        // The payload carries a map, so it holds the compiler's `+deterministic`
+        // (name-lexicographic) key order, which ERTS normalizes on load: the assertion
+        // is Rust == ERTS's own re-encode of the same payload, never Rust == payload.
+        map_literals += 1;
+        if let Some(canonical) = &oracle {
+            let expected = canonical.get(&index).unwrap_or_else(|| {
+                panic!("the oracle reported no literal {index} of the verbatim fixture")
+            });
+            assert_eq!(
+                &v, expected,
+                "verbatim literal {index} (map-bearing) must re-encode exactly as the oracle's \
+                 `term_to_binary(binary_to_term(Payload))`"
+            );
+            oracle_checked += 1;
+        }
+    }
+    assert!(
+        map_literals > 0,
+        "the fixture must contain a map-bearing literal, otherwise the oracle-backed branch \
+         above never runs"
+    );
+    if oracle.is_some() {
+        assert_eq!(
+            oracle_checked, map_literals,
+            "every map-bearing literal must have been compared against the oracle"
+        );
+    }
+}
+
+/// The `nested/0` literal is `{#{list => [a, b], float => 1.5, bin => <<7, 8>>}, …}`.
+///
+/// Its inner flat map pins the loader's map **normalization**: the fixture's payload
+/// carries the compiler's `+deterministic` (name-lexicographic) key order
+/// (`bin`, `float`, `list`), while the loader — like ERTS's `binary_to_term/1` —
+/// must *store* it in `erts_cmp_flatmap_keys` order, which for atom keys is the
+/// **atom-table index** order (here `list`, `float`, `bin`). Those two orders differ,
+/// which is exactly why a map-bearing literal payload is not byte-preservable (see
+/// [`both_litt_forms_decode_to_identically_encoded_terms`]).
+#[test]
+fn map_bearing_fixture_literal_is_normalized_to_erts_key_order_on_load() {
+    let verbatim = load(VERBATIM_BEAM);
+    let compressed = load(COMPRESSED_BEAM);
+    let verbatim_payloads = raw_literals(VERBATIM_BEAM);
+    let compressed_payloads = raw_literals(COMPRESSED_BEAM);
+
+    // The raw payload bytes, read WITHOUT decoding (a decode normalizes the order
+    // away): the compiler's `+deterministic` image is name-lexicographic.
+    let compiler_order = vec!["bin".to_string(), "float".to_string(), "list".to_string()];
+    assert_eq!(
+        raw_map_key_names(&verbatim_payloads[7]),
+        compiler_order,
+        "the verbatim payload must carry the compiler's `+deterministic` key order"
+    );
+    assert_eq!(
+        raw_map_key_names(&compressed_payloads[7]),
+        compiler_order,
+        "the two framings must carry the same payload bytes"
+    );
+
+    // The stored order is `erts_cmp_flatmap_keys` order, in both framings.
+    let erts_order = vec!["list".to_string(), "float".to_string(), "bin".to_string()];
+    for (form, module, payloads) in [
+        ("verbatim", &verbatim, &verbatim_payloads),
+        ("compressed", &compressed, &compressed_payloads),
+    ] {
+        let tuple = literal(module, 7);
+        let inner_map = tuple_element(tuple, 0).expect("element 0 of `nested/0` is the map");
+        let (keys, values) = flatmap_parts(inner_map).expect("a flat map literal");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(values.len(), 3);
+        let stored: Vec<String> =
+            keys.iter().map(|&key| atom_name(module, key).to_string()).collect();
+        assert_eq!(
+            stored, erts_order,
+            "the {form} literal's stored flat map must be in `erts_cmp_flatmap_keys` order"
+        );
+        // ... which for atom keys means ascending ATOM-TABLE INDEX order.
+        let indices: Vec<u32> = keys.iter().map(|&key| atom_val(key).raw()).collect();
+        assert!(
+            indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "the {form} literal's stored keys must ascend by atom index, got {indices:?}"
+        );
+
+        // The two orders really do differ, so this literal is a genuine
+        // not-byte-preservable case: re-encoding the decoded term cannot reproduce the
+        // compiler's payload. (This is what makes the byte-exact assertion in
+        // `both_litt_forms_decode_to_identically_encoded_terms` impossible here.)
+        let re_encoded = encode_term(tuple, &module.atom_table)
+            .unwrap_or_else(|error| panic!("the {form} literal must encode: {error:?}"));
+        assert_ne!(
+            re_encoded, payloads[7],
+            "the {form} literal's re-encode must differ from the `+deterministic` payload"
+        );
     }
 }
 
@@ -502,13 +639,75 @@ fn oracle_literals(root: &Path) -> BTreeMap<(String, usize), Vec<u8>> {
     map
 }
 
+/// Runs the oracle script's `--reencode` mode over `beam_file` and returns
+/// `index -> term_to_binary(binary_to_term(Payload))`, the oracle's own decode/re-encode
+/// of every raw `LitT` payload of that one module.
+///
+/// The script (`tests/fixtures/literals_oracle.escript`) parses the `LitT` chunk with
+/// OTP's own `beam_lib`/`zlib`, so it is an implementation independent of this crate's
+/// framing. A failure to run it (or an undecodable payload) fails the test.
+fn oracle_reencode(beam_file: &Path) -> BTreeMap<usize, Vec<u8>> {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/literals_oracle.escript");
+    let output = Command::new("escript")
+        .arg(&script)
+        .arg("--reencode")
+        .arg(beam_file)
+        .output()
+        .unwrap_or_else(|error| panic!("could not run {}: {error}", script.display()));
+    assert!(
+        output.status.success(),
+        "the literal oracle (--reencode {}) failed ({}): {}",
+        beam_file.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("the oracle emits UTF-8");
+
+    let mut map = BTreeMap::new();
+    for line in stdout.lines() {
+        let mut fields = line.split('\t');
+        let index: usize = fields.next().expect("an index field").parse().expect("a decimal index");
+        let canonical = from_hex(fields.next().expect("a hex field"));
+        assert!(fields.next().is_none(), "unexpected field in the oracle line {line:?}");
+        assert!(
+            map.insert(index, canonical).is_none(),
+            "the oracle reported literal {index} twice"
+        );
+    }
+    map
+}
+
+/// The oracle's per-literal re-encode of the committed verbatim fixture, or `None`
+/// after a loud `SKIP:` line when no OTP install is available (the install checks
+/// reuse [`skip_reason`]); it never fails and never passes silently.
+fn fixture_oracle_reencode() -> Option<BTreeMap<usize, Vec<u8>>> {
+    match skip_reason() {
+        Some(reason) => {
+            eprintln!("{reason}");
+            eprintln!(
+                "SKIP: the map-bearing literal comparison needs the OTP oracle — the committed \
+                 fixtures' deterministic checks (payload counts, identical framings, byte-exact \
+                 map-FREE literals) still ran; only the oracle-side assertion was skipped"
+            );
+            None
+        }
+        None => {
+            let fixture =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/literals_verbatim.beam");
+            Some(oracle_reencode(&fixture))
+        }
+    }
+}
+
 /// Whether `term` is a map, or a tuple/list that contains one (transitively).
 ///
-/// A literal whose payload contains a map cannot be asserted to re-encode
+/// A literal whose payload contains a map is not asserted to re-encode
 /// **byte-exactly** to the compiler's bytes: ERTS normalizes a flat map's key
-/// order, so `encode_term(decode_term(payload)) != payload` is expected. Such
-/// literals are counted and reported, and their correctness rests on the
-/// semantic oracle comparison instead.
+/// order on load, and the fixture is compiled with `+deterministic` (which writes a
+/// different order), so `encode_term(decode_term(payload)) != payload` as soon as the
+/// two orders differ. Such literals are compared against the **oracle's** own
+/// re-encode of the same payload instead (and counted/reported by the install sweep,
+/// whose semantic comparison is insensitive to a flat map's stored key order).
 fn is_map_literal(term: Eterm, atoms: &beam_term::AtomTable) -> bool {
     if beam_term::map::map_size(term, atoms).is_ok() {
         return true;
