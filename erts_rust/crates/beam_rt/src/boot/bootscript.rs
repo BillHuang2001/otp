@@ -237,15 +237,130 @@ pub fn read(path: &Path) -> Result<BootScript> {
 ///
 /// The first directive's error (see above), propagated unchanged.
 pub fn execute(runtime: &mut Runtime, script: &BootScript) -> Result<()> {
+    execute_reporting(runtime, script).map_err(|stop| stop.error)
+}
+
+/// Where and why a boot script stopped — the [`execute_reporting`] report.
+///
+/// [`execute`] flattens a stop into its [`BeamError`]; this carries the **position** of that
+/// error so a caller can name the exact directive a boot reached (the runtime's boot
+/// observability, a differential case). All fields are the state at the moment of the stop.
+#[derive(Debug)]
+pub struct BootStop {
+    /// The 0-based index of the failing directive, or `None` when the runtime failed to boot
+    /// before the first directive ran.
+    pub index: Option<usize>,
+    /// The script's instruction count.
+    pub total: usize,
+    /// The failing directive, or `None` when no directive ran.
+    pub instruction: Option<Instruction>,
+    /// The error the failing directive reported.
+    pub error: BeamError,
+}
+
+impl BootStop {
+    /// A one-line, human-readable summary of the stop: the instruction position, the failing
+    /// directive (an `M:F/A` or a `{kernelProcess,Name,…}`) and the error.
+    ///
+    /// The error is rendered by its [`Display`](std::fmt::Display), so a **structured** raise
+    /// reason (the boot chain's `noproc`) shows as `exit <structured reason>`. Use
+    /// [`describe_with`](Self::describe_with) to render the real reason term through a runtime.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.render(&self.error.to_string())
+    }
+
+    /// [`describe`](Self::describe) with the error's **live reason term** rendered through
+    /// `runtime` when it carries one.
+    ///
+    /// A structured raise reason is an opaque term, so [`describe`](Self::describe) can only
+    /// show `exit <structured reason>`. This renders the real term — for the real `start.boot`
+    /// the `{noproc,{gen_server,call,[file_server_2,…]}}` of the failing `c:erlangrc/0` — so a
+    /// report names the failing call. A non-structured error, or a reason the printer itself
+    /// rejects, falls back to [`describe`](Self::describe) unchanged: never an invented reason.
+    #[must_use]
+    pub fn describe_with(&self, runtime: &mut Runtime) -> String {
+        let Some(term) = crate::error::live_reason_term(&self.error) else {
+            return self.describe();
+        };
+        match runtime.format_term_w(term, None) {
+            // `format_term_w` ends the rendering with a newline; `render` supplies its own.
+            Ok(text) => self.render(text.trim_end_matches('\n')),
+            Err(_) => self.describe(),
+        }
+    }
+
+    /// Formats the stop's position and directive around an already-rendered `reason`.
+    fn render(&self, reason: &str) -> String {
+        match (self.index, &self.instruction) {
+            (Some(index), Some(instruction)) => format!(
+                "boot script stopped at instruction {index}/{}: {}: {reason}",
+                self.total,
+                render_instruction(instruction)
+            ),
+            _ => format!("boot script failed before its first directive: {reason}"),
+        }
+    }
+}
+
+/// Renders one directive compactly for [`BootStop::describe`] (`M:F/A`, or the debug form).
+fn render_instruction(instruction: &Instruction) -> String {
+    match instruction {
+        Instruction::Apply { mfa } => {
+            format!("{}:{}/{}", mfa.module, mfa.function, mfa.args.len())
+        }
+        Instruction::KernelProcess { name, mfa } => format!(
+            "{{kernelProcess,{name},{{{},{}/{}}}}}",
+            mfa.module,
+            mfa.function,
+            mfa.args.len()
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Executes `script` against `runtime`, reporting the exact directive the boot stopped at.
+///
+/// This is [`execute`] with the failure's position preserved: it returns the same `Ok(())` on
+/// a fully executed script, and on failure hands back a [`BootStop`] carrying the 0-based
+/// instruction `index`, the script's `total`, the failing `instruction` and the `error`.
+/// `execute` delegates to it (flattening the stop into its error), so the two can never drift.
+///
+/// The execution is identical to [`execute`]: the runtime is booted first (idempotent), one
+/// wall-clock [`DRIVE_DEADLINE`](super::drive::DRIVE_DEADLINE) covers every scheduler drive of
+/// the pass, and the walk stops at the first directive that cannot run.
+///
+/// # Errors
+///
+/// A [`BootStop`] for the first directive that cannot run (`instruction`/`index` set), or — if
+/// the runtime cannot boot before the first directive — one with `index`/`instruction` unset.
+pub fn execute_reporting(
+    runtime: &mut Runtime,
+    script: &BootScript,
+) -> std::result::Result<(), BootStop> {
     // The script's `$ROOT` expansion and its module loads both need the system code path,
     // so the runtime is booted first (idempotent): a caller may hand `execute` a fresh
     // runtime, exactly as `Runtime::boot_from_script` does.
-    runtime.boot()?;
+    let total = script.instructions.len();
+    let before_first = |error: BeamError| BootStop {
+        index: None,
+        total,
+        instruction: None,
+        error,
+    };
+    runtime.boot().map_err(before_first)?;
     // One deadline for the whole pass: every scheduler drive below shares it, so the boot's
     // wall-clock bound does not multiply by the number of process directives.
     let deadline = Instant::now() + drive::DRIVE_DEADLINE;
-    for instruction in &script.instructions {
-        execute_instruction(runtime, instruction, deadline)?;
+    for (index, instruction) in script.instructions.iter().enumerate() {
+        if let Err(error) = execute_instruction(runtime, instruction, deadline) {
+            return Err(BootStop {
+                index: Some(index),
+                total,
+                instruction: Some(instruction.clone()),
+                error,
+            });
+        }
     }
     Ok(())
 }
@@ -633,13 +748,41 @@ mod tests {
         }
     }
 
-    /// A runtime whose code path includes the system directories, or `None` when no Erlang
-    /// install is available (the caller then skips **loudly**).
+    /// The CLI argv the executor tests model: the `-boot FILE` invocation of this checkout,
+    /// `beam_rt -noshell -boot bootstrap/bin/start` (the repository-root relative value a
+    /// developer types). The value is **recorded** as `init` records it and is never resolved
+    /// here — the executor is handed the parsed [`BootScript`] directly, read from
+    /// [`START_BOOT`] — but it is part of the command line `init:get_arguments/0` reports,
+    /// so the configuration is the real invocation's.
+    fn boot_argv() -> Vec<String> {
+        ["-noshell", "-boot", "bootstrap/bin/start"]
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect()
+    }
+
+    /// A runtime configured **exactly as the CLI configures a `-boot FILE` invocation**,
+    /// or `None` when no Erlang install is available (the caller then skips **loudly**).
+    ///
+    /// The configuration is part of the measurement: a `-boot FILE` run boots the preloaded
+    /// set and then drives the script, and the command line `init:get_arguments/0` reports
+    /// is the *whole* invocation. Building the runtime through [`crate::cli::parse`] — the
+    /// CLI's own parser, minus the `ERL_*FLAGS` merge a test must not depend on — is
+    /// therefore what keeps the in-crate executor measuring the invocation the CLI really
+    /// runs, rather than a configuration ([`RuntimeConfig::default`]'s empty argument list)
+    /// the CLI cannot produce for it.
     fn system_runtime() -> Option<Runtime> {
         if !have_system_erlang() {
             return None;
         }
-        match Runtime::with_defaults() {
+        let config = match crate::cli::parse(&boot_argv()) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("SKIP: cannot build the `-boot` invocation's configuration ({error})");
+                return None;
+            }
+        };
+        match Runtime::new(config) {
             Ok(runtime) => Some(runtime),
             Err(error) => {
                 eprintln!("SKIP: no system Erlang install ({error})");
@@ -982,17 +1125,19 @@ mod tests {
             "instruction {index} ({:?}) must fail with a typed BeamError: {error}",
             script.instructions[index]
         );
-        // Every `primLoad` batch and every `kernelProcess` before the first `apply` now
-        // succeeds, so the stop is at (or, once the kernel processes can do more, after) the
-        // first directive that needs one of them to *answer* — `application:load/1`.
-        assert!(
-            matches!(script.instructions[index], Instruction::Apply { .. }),
-            "the stop must be an `apply` directive, found instruction {index}: {:?}",
+        // Every `primLoad` batch, every `kernelProcess` and both
+        // `{apply,{application,start_boot,…}}` directives succeed, so the stop is the first
+        // directive that needs a **file server** to answer: `{apply,{c,erlangrc,[]}}`.
+        assert_eq!(
+            index, 20,
+            "the stop is `c:erlangrc/0` at instruction 20, found instruction {index}: {:?}",
             script.instructions[index]
         );
         assert!(
-            index >= 16,
-            "the stop must be at or after the application:load/1 apply, found instruction {index}"
+            matches!(&script.instructions[index], Instruction::Apply { mfa }
+                if mfa.module == "c" && mfa.function == "erlangrc" && mfa.args.is_empty()),
+            "the stop must be the `{{apply,{{c,erlangrc,[]}}}}` directive, found {:?}",
+            script.instructions[index]
         );
         // The `primLoad` batches really loaded before the stop.
         for module in ["lists", "gen_server", "application_starter", "argparse", "zstd"] {
@@ -1001,12 +1146,68 @@ mod tests {
                 "{module} must have been loaded before the stop"
             );
         }
-        eprintln!(
-            "note: the real start.boot stops at instruction {index} ({:?}): {error}",
-            script.instructions[index]
-        );
+        let stop = BootStop {
+            index: Some(index),
+            total: script.instructions.len(),
+            instruction: Some(script.instructions[index].clone()),
+            error,
+        };
+        eprintln!("note: {}", stop.describe_with(&mut runtime));
     }
 
+    #[test]
+    fn the_real_start_boot_reports_its_stop_through_execute_reporting() {
+        // The **whole** script in one pass, reporting its exact stop: the three kernel
+        // processes must survive their short-lived directive processes' exits (`heart`,
+        // `logger` and `application_controller` really stay registered — the unlink in
+        // `drive::start_kernel_process`), and the boot must then stop at the first directive
+        // that needs one of them to *answer*.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let path = Path::new(START_BOOT);
+        if !path.is_file() {
+            eprintln!("SKIP: {START_BOOT} is absent");
+            return;
+        }
+        let script = read(path).expect("the real start.boot parses");
+        let stop = execute_reporting(&mut runtime, &script)
+            .expect_err("the real start.boot cannot fully boot in Milestone 1");
+        // The unlink in `drive::start_kernel_process` keeps the `application_controller`'s
+        // server alive past its directive process's `normal` exit, so it is still registered
+        // when a later directive needs it. (`heart` returns without registering and `logger`
+        // never reaches its registration, so `application_controller` is the one to pin.)
+        let registered = runtime
+            .atoms()
+            .lookup("application_controller")
+            .and_then(|atom| runtime.processes().whereis(atom))
+            .is_some();
+        assert!(
+            registered,
+            "the application_controller server must survive its directive process: {}",
+            stop.describe_with(&mut runtime)
+        );
+        assert_eq!(
+            stop.total,
+            script.instructions.len(),
+            "the report counts every instruction"
+        );
+        // The exact stop: instruction 20/22, the `{apply,{c,erlangrc,[]}}` directive — the
+        // first one that needs a file server (the absent `file_server_2`) to answer.
+        assert_eq!(
+            stop.index,
+            Some(20),
+            "the boot stops at instruction 20/22: {}",
+            stop.describe_with(&mut runtime)
+        );
+        assert!(
+            matches!(&stop.instruction, Some(Instruction::Apply { mfa })
+                if mfa.module == "c" && mfa.function == "erlangrc" && mfa.args.is_empty()),
+            "the stop names `{{apply,{{c,erlangrc,[]}}}}`: {}",
+            stop.describe_with(&mut runtime)
+        );
+        eprintln!("note: {}", stop.describe_with(&mut runtime));
+    }
     // -----------------------------------------------------------------------
     // A synthetic script, executed end to end
     // -----------------------------------------------------------------------
@@ -1372,6 +1573,117 @@ seen() -> erlang:get(bootscript_seen).
             runtime.processes().whereis(atom).is_some(),
             "the self-registered name must still resolve after the burst"
         );
+    }
+
+    /// The fixture module of [`a_kernel_process_burst_waits_for_the_directive_to_return`].
+    ///
+    /// `serve/0` has exactly `application_controller:start/1`'s shape: it `spawn_link`s a
+    /// server that registers the directive's name **first** and only *then* does its real
+    /// setup, and `serve/0` blocks until that server acknowledges
+    /// (`application_controller.erl:203-211`, the ack at `:549`). Only after the ack does the
+    /// directive register its own second name (`bootscript_ack_done`) and settle into a
+    /// `receive` — so that name is a **cross-process-visible marker** of "the directive's MFA
+    /// has run to its end", which a burst that returned the instant the first name resolved
+    /// can never have observed.
+    const ACK_ERL: &str = r#"%% Generated by `beam_rt/src/boot/bootscript.rs` (never committed).
+-module(bootscript_ack).
+-export([serve/0, probe/0, seen/0]).
+serve() ->
+    Me = self(),
+    Child = spawn_link(fun() -> server(Me) end),
+    receive {ack, Child} -> ready() end.
+ready() ->
+    register(bootscript_ack_done, self()),
+    loop().
+server(Parent) ->
+    register(bootscript_ack, self()),
+    Parent ! {ack, self()},
+    loop().
+loop() ->
+    receive {ping, From} -> From ! {pong, self()}, loop() end.
+probe() ->
+    Value =
+        case {erlang:whereis(bootscript_ack), erlang:whereis(bootscript_ack_done)} of
+            {Child, Done} when is_pid(Child), is_pid(Done) ->
+                Child ! {ping, self()},
+                receive {pong, _Pid} -> acked end;
+            _ ->
+                not_acked
+        end,
+    erlang:put(bootscript_seen, Value).
+seen() -> erlang:get(bootscript_seen).
+"#;
+
+    /// The `{kernelProcess, …}` burst runs until the **directive's MFA has returned**, not
+    /// merely until its name resolves.
+    ///
+    /// `application_controller:init/2` registers the name as its very first statement and runs
+    /// `check_conf/0`, `ets:new(ac_tab, …)`, `make_appl/1` and `load/2` *afterwards*, only
+    /// acking its directive (and calling `gen_server:enter_loop`) at the end
+    /// (`lib/kernel/src/application_controller.erl:531-558`). Real `init` runs the directive
+    /// **synchronously** (`init.erl:1520`), so the next directive only runs once the server is
+    /// ready; a burst that returned at the first `whereis` resolution would leave it
+    /// mid-`init` and unable to answer the next directive's call.
+    ///
+    /// This test pins the matching stop criterion end to end: the fixture's `serve/0` blocks
+    /// until its `spawn_link`ed server acks and only then registers `bootscript_ack_done`, so
+    /// the script's later `{apply, {bootscript_ack, probe, []}}` can answer `acked` (and get a
+    /// reply from the server, proving the unlink left it in a working loop) only if the burst
+    /// drove the directive to its very end.
+    #[test]
+    fn a_kernel_process_burst_waits_for_the_directive_to_return() {
+        let Some(fixture) = build_fixture("ack", &[("bootscript_ack.erl", ACK_ERL)], |dir, boot| {
+            format!(
+                "ok = file:write_file(\"{boot}\", term_to_binary({{script,{{\"t\",\"1\"}},[\
+                 {{preLoaded,[erlang]}},\
+                 {{progress,preloaded}},\
+                 {{path,[\"{dir}\"]}},\
+                 {{module,lists}},\
+                 {{kernelProcess,bootscript_ack,{{bootscript_ack,serve,[]}}}},\
+                 {{apply,{{bootscript_ack,probe,[]}}}}]}})), halt(0).",
+                boot = boot.display(),
+                dir = dir.display(),
+            )
+        }) else {
+            return;
+        };
+        let boot = fixture.dir.join("synthetic.boot");
+        let script = read(&boot).expect("the synthetic script parses");
+        let Instruction::KernelProcess { name, .. } = &script.instructions[4] else {
+            panic!("instruction 4 must be the kernelProcess: {:?}", script.instructions[4]);
+        };
+        assert_eq!(name, "bootscript_ack", "the directive names the process");
+
+        let mut config = RuntimeConfig::default();
+        config.code_paths.push(fixture.dir.clone());
+        let mut runtime = Runtime::new(config).expect("the default runtime");
+        runtime
+            .boot_from_script(&boot)
+            .expect("the directive's ack is driven before the next directive runs");
+
+        let seen = runtime
+            .eval("bootscript_ack:seen()")
+            .expect("bootscript_ack:seen/0");
+        assert_eq!(
+            runtime.atom_name_of(seen),
+            Some("acked"),
+            "the burst must drive the directive's MFA to its end (the ack), not stop at the \
+             name resolution"
+        );
+
+        // Both the server and the directive are still registered and alive: the unlink landed
+        // between the server's registration and the directive's exit, so neither died.
+        for name in ["bootscript_ack", "bootscript_ack_done"] {
+            let atom = runtime
+                .atoms()
+                .lookup(name)
+                .unwrap_or_else(|| panic!("{name} is in the shared atom table"));
+            assert!(
+                runtime.processes().whereis(atom).is_some(),
+                "{name} must still resolve after the burst"
+            );
+        }
+        fixture.cleanup();
     }
 
     /// `Runtime::register_boot_process` keeps the process table's `name_taken` rule: a second

@@ -64,7 +64,7 @@ use beam_process::{
 };
 use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm};
 
-use crate::boot::bootscript::{self, BootScript};
+use crate::boot::bootscript::{self, BootScript, BootStop};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
@@ -991,6 +991,31 @@ impl Runtime {
         self.processes.register(atom, pid)
     }
 
+    /// Unlinks `a` and `b` in both directions (`ProcessTable::unlink`).
+    ///
+    /// This is the boot-script executor's seam for keeping a `{kernelProcess, …}` alive (see
+    /// the private `drive::start_kernel_process`). A real `init` runs each kernel-process
+    /// `apply` in the **one** long-lived process, so a `spawn_link` inside it
+    /// (`application_controller:start/1`, `logger_server:start_link/0`) is linked to a parent
+    /// that never exits. This runtime runs the directive in a *short-lived* process, whose
+    /// `normal` exit would otherwise tear the kernel server down: a `gen_server`/`proc_lib`
+    /// server traps exits and terminates on its parent's `{'EXIT', _, normal}`. Unlinking the
+    /// server from the directive **before the directive can exit** reproduces `init`'s
+    /// supervision without a long-lived stand-in process.
+    ///
+    /// Both pids must be **live**: calling this once the directive has already terminated is
+    /// the process table's typed unknown-pid diagnostic, so a caller that cannot prove
+    /// liveness (a `{kernelProcess, …}` whose `apply` returns before the process it spawned
+    /// registers, such as `heart`) checks [`Runtime::processes`]`().contains(..)` first.
+    ///
+    /// # Errors
+    ///
+    /// The process table's typed diagnostic when either pid is not a live process of this
+    /// runtime's table — never a panic, never a silent no-op.
+    pub fn unlink_processes(&mut self, a: ProcessId, b: ProcessId) -> Result<()> {
+        self.processes.unlink(a, b)
+    }
+
     /// Reads the OTP **boot script** at `path` and executes it (contract A.7, part 2).
     ///
     /// The runtime boots first (the preloaded set and the system code path), the script is
@@ -1009,6 +1034,44 @@ impl Runtime {
         let script = bootscript::read(path.as_ref())?;
         bootscript::execute(self, &script)?;
         Ok(script)
+    }
+
+    /// Reads the OTP **boot script** at `path` and executes it, **reporting the exact
+    /// directive the boot stopped at** ([`crate::boot::bootscript::BootStop`]).
+    ///
+    /// This is [`Runtime::boot_from_script`] with the failure's position preserved: on a
+    /// directive that cannot run it hands back a [`BootStop`] carrying the 0-based
+    /// `index`, the script's `total`, the failing `instruction` and the `error`, instead of
+    /// flattening those into the error alone. The two entry points share one execution
+    /// ([`crate::boot::bootscript::execute_reporting`]), so a script's stopping point is
+    /// identical whichever is used.
+    ///
+    /// A failure **before** the first directive — the runtime cannot boot, or `path` is not a
+    /// readable/parseable script — is reported with `index`/`instruction` unset (no directive
+    /// ran), exactly as [`crate::boot::bootscript::execute_reporting`] reports its own
+    /// pre-directive failure.
+    ///
+    /// # Errors
+    ///
+    /// A [`BootStop`] for the first directive that cannot run, or one with `index`/`instruction`
+    /// unset when the runtime cannot boot or the script cannot be read/parsed.
+    pub fn boot_from_script_reporting(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<(), BootStop> {
+        let script = match self.boot_if_needed().and_then(|()| bootscript::read(path.as_ref())) {
+            Ok(script) => script,
+            // No directive ran: the pre-directive failure shape `execute_reporting` uses.
+            Err(error) => {
+                return Err(BootStop {
+                    index: None,
+                    total: 0,
+                    instruction: None,
+                    error,
+                })
+            }
+        };
+        bootscript::execute_reporting(self, &script)
     }
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with
     /// `args` and returns `x(0)`.

@@ -1028,6 +1028,12 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
                 Some(value) => run_boot_script(&mut runtime, value),
                 None => runtime.boot(),
             };
+            // The boot chain's failure is often a **structured** raise reason (the applied
+            // directive's own term), which `BeamError`'s `Display` can only render as the
+            // placeholder `<structured reason>`. Recover the live term and render it through
+            // the runtime's one printer, exactly as the `run` action does — so the reported
+            // diagnostic names the directive's real reason instead of a placeholder.
+            let result = result.map_err(|error| reported_reason(&mut runtime, error));
             *snapshot = Some(runtime);
             result
         }

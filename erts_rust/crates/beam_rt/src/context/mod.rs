@@ -650,8 +650,66 @@ impl<'a> RuntimeContext<'a> {
         }
     }
 
-    /// Records the module whose **code** this context is about to execute — the BIF call
-    /// site, for the duration of one entry.
+    /// Runs the raw entry `label` of `module` to its `return`, **driving the scheduler**
+    /// while the callee is suspended in a `receive`.
+    ///
+    /// This is [`Machine::run_label`] made blocking-aware: the label-addressed counterpart of
+    /// [`RuntimeContext::run_export_blocking`], entering the body directly rather than
+    /// through an export. A local (`make_fun3`) closure has no export name — only a label —
+    /// so a fun whose body blocks (`gen:do_call/4`'s `receive`, reached through
+    /// `gen:do_for_proc/2`'s `call_fun2`) would otherwise collapse into the typed
+    /// [`beam_engine::blocked`] gap even though the process it waits on is merely *runnable*.
+    ///
+    /// The `Machine` is **reused** across a suspension ([`Machine::resume_outcome`] does not
+    /// `reset`), so the closure's registers, its captured free variables and its Erlang stack
+    /// survive the pump and it continues at exactly the reported `(func, pc)`. The
+    /// non-blocking case is byte-for-byte [`Machine::run_label`], which is itself
+    /// `fold_outcome(run_label_outcome(…))`.
+    ///
+    /// # When it cannot pump
+    ///
+    /// A context that is itself inside a scheduler slice ([`RuntimeContext::for_process`],
+    /// `may_pump_scheduler() == false`) must never re-enter the scheduler — that would run a
+    /// second process from within a slice — so it keeps the plain non-blocking entry's typed
+    /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
+    /// honest gap: no process could have changed the mailbox, so spinning further would only
+    /// hang, never produce a value.
+    ///
+    /// # Why the paused terms stay valid
+    ///
+    /// A collection moves terms in place, so it must never run while a machine whose roots it
+    /// cannot see is suspended. This crate collects **only** at the slice's own heap-admission
+    /// point, and only when its per-call GC latch is armed
+    /// ([`RuntimeContext::arm_gc`] — the sole armer is the slice's `BudgetContext`, see
+    /// [`crate::context::gc`]). This context is never a slice, so its latch is never armed, the
+    /// pump's allocations fall back to the pointer-stable arena and nothing paused here is
+    /// moved — the suspended machine's terms stay valid across the resume. Arming the latch
+    /// here too would move the paused roots.
+    fn run_label_blocking(
+        &mut self,
+        module: &Module,
+        label: Label,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        let mut machine = Machine::new();
+        let mut outcome = machine.run_label_outcome(module, label, arity, args, self)?;
+        loop {
+            match outcome {
+                RunOutcome::Returned(value) => return Ok(value),
+                RunOutcome::Wait { func, pc } => {
+                    if !self.may_pump_scheduler() {
+                        return Err(beam_engine::blocked());
+                    }
+                    let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+                    if ran == 0 {
+                        return Err(beam_engine::blocked());
+                    }
+                    outcome = machine.resume_outcome(module, func, pc, self)?;
+                }
+            }
+        }
+    }
     ///
     /// [`RuntimeContext::run_export`] sets `current_module` itself for the single-pass path;
     /// a scheduled process runs its entry through the engine's blocking-aware
@@ -1775,9 +1833,12 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///
     /// A `.beam` **local** (`make_fun3`) closure is resolved to its
     /// [`LocalFunTarget`] — the module, the lambda's entry label and the combined
-    /// arguments — and entered there on a **fresh** machine; the resolution is the
-    /// shared [`RuntimeContext::local_fun_target`] seam, so a fun-bodied *process*
-    /// resolves its entry through exactly the same lookup
+    /// arguments — and entered there on a **fresh** machine through the
+    /// blocking-aware [`RuntimeContext::run_label_blocking`], so a `receive` inside
+    /// the closure body suspends the process and is resumed by the scheduler
+    /// instead of folding into the typed [`beam_engine::blocked`] gap. The
+    /// resolution is the shared [`RuntimeContext::local_fun_target`] seam, so a
+    /// fun-bodied *process* resolves its entry through exactly the same lookup
     /// ([`crate::runner`]).
     ///
     /// The two fun kinds with no local label entry keep their own synchronous apply:
@@ -1798,7 +1859,7 @@ impl ExecutionContext for RuntimeContext<'_> {
                 label,
                 arity,
                 args,
-            }) => Machine::new().run_label(&module, label, arity, &args, self),
+            }) => self.run_label_blocking(&module, label, arity, &args),
             None => self.apply_non_local_fun(fun, args),
         }
     }
@@ -1978,4 +2039,142 @@ pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
                 _ => false,
             }
     })
+}
+
+/// The **discriminator** for [`RuntimeContext::run_label_blocking`]: applying a local
+/// (`make_fun3`) closure whose body blocks in a `receive` must **suspend and resume**, not
+/// fold into the typed [`beam_engine::blocked`] gap.
+///
+/// A `call_fun` reaches [`ExecutionContext::apply_fun`], whose `Some(LocalFunTarget)` arm
+/// enters the closure's entry label through [`RuntimeContext::run_label_blocking`] — the
+/// label-addressed twin of [`RuntimeContext::run_export_blocking`]. When the closure's bare
+/// `receive` finds no message, that entry drives the scheduler for a bounded number of
+/// slices ([`RUN_EXPORT_PUMP_SLICES`]) and resumes the **same** [`Machine`] at the reported
+/// `(func, pc)`. The plain non-blocking [`Machine::run_label`] folds that suspension into
+/// `unsupported_opcode: run: process blocked (no message available)` at the `call_fun` —
+/// which is exactly what the assertions below rule out.
+///
+/// Nothing here can hang: the pump is bounded, the waiting message is enqueued **before**
+/// the call (a child process, not a wall-clock timer), and the control phase uses a context
+/// that may not pump at all.
+///
+/// # Why the fixtures cross a module boundary
+///
+/// The Erlang compiler **inlines** a `fun` that is bound and called from the same function
+/// (it even does so through a local helper), turning the `call_fun` into a direct local
+/// call and bypassing [`ExecutionContext::apply_fun`] entirely. The waiting closure is
+/// therefore handed to a function in a **second** module — the shape
+/// `gen:do_for_proc/2`'s `call_fun2` really has — so the closure is genuinely materialized
+/// with `make_fun3` and genuinely applied with `call_fun`.
+#[cfg(test)]
+mod blocking_fun_apply {
+    use super::*;
+    use crate::context::test_support::{compile_fixture, find_on_path, resolve_erlc, skip_loudly};
+    use beam_term::make_small;
+
+    /// `bfwait:wait/0` materializes a 0-arity closure that blocks in a bare `receive` and
+    /// leaves the module as an argument (which is what defeats the compiler's fun
+    /// inlining); `bfwait:sender/2` is the child that delivers the message it waits for.
+    const WAIT_SRC: &str = r#"
+-module(bfwait).
+-export([wait/0, sender/2]).
+
+wait() -> bfhelper:call(fun() -> receive X -> X end end).
+
+sender(To, Msg) -> To ! Msg.
+"#;
+
+    /// The closure's receiving module: `call/1` is where the `call_fun` instruction lives,
+    /// so the apply reaches [`ExecutionContext::apply_fun`] whatever the compiler did to
+    /// the caller.
+    const HELPER_SRC: &str = r#"
+-module(bfhelper).
+-export([call/1]).
+
+call(F) -> F().
+"#;
+
+    #[test]
+    fn a_blocking_local_closure_suspends_and_resumes() {
+        // The pump boots the runtime on demand (`scheduler_pass` → `boot_if_needed`), so
+        // this test needs the system code path (`erl`, or `$ERTS_STDLIB_DIR`) as well as the
+        // compiler. A missing toolchain is a loud skip, never a silent pass.
+        if std::env::var_os("ERTS_STDLIB_DIR").is_none() && find_on_path("erl").is_none() {
+            skip_loudly(
+                "blocking local closure",
+                "no `erl` on $PATH and no $ERTS_STDLIB_DIR",
+            );
+            return;
+        }
+        let Some(erlc) = resolve_erlc() else {
+            skip_loudly(
+                "blocking local closure",
+                "no `erlc` (and none beside $ERTS_ORACLE either)",
+            );
+            return;
+        };
+
+        let wait_dir = compile_fixture(&erlc, "blockfun", "bfwait", WAIT_SRC);
+        let helper_dir = compile_fixture(&erlc, "blockfun", "bfhelper", HELPER_SRC);
+
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        rt.boot().expect("the boot sequence");
+        // `local_fun_target` finds a compiled closure through the **loaded** module set
+        // (`code_server.modules()`), and the helper is entered through the in-machine
+        // `call_ext` seam: both are cached here, so neither needs the code path.
+        let module = rt
+            .code_server
+            .load_path(wait_dir.join("bfwait.beam"))
+            .expect("load bfwait.beam");
+        rt.code_server
+            .load_path(helper_dir.join("bfhelper.beam"))
+            .expect("load bfhelper.beam");
+
+        // The message the closure waits for: a child that sends to this context's pid. It is
+        // enqueued **before** the call, so the pump's first round runs it — the resume is
+        // driven by real scheduler work, not by a wall-clock delay.
+        let payload = make_small(42);
+        let me = rt.self_pid();
+        rt.spawn_process("bfwait", "sender", vec![me.to_eterm(), payload])
+            .expect("spawn the sender child");
+
+        let result = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.run_export(&module, "wait", 0, &[])
+        };
+        assert_eq!(
+            result.expect("`wait/0` suspends inside its closure and is resumed by the sender"),
+            payload,
+            "the local closure's `receive` must return the message the child sent"
+        );
+        let mailbox = rt
+            .processes
+            .get(me)
+            .expect("the runtime's own process")
+            .mailbox();
+        assert!(
+            mailbox.is_empty(),
+            "the resumed receive removed the matched message"
+        );
+
+        // The control: a context that is itself a scheduler slice may never re-enter the
+        // scheduler, so the same closure keeps the engine's honest typed gap — no pump, no
+        // hang and no fabricated value.
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
+        let pid = table
+            .spawn_default()
+            .expect("spawn a process in the pass table");
+        let result = {
+            let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+            ctx.run_export(&module, "wait", 0, &[])
+        };
+        let error = result.expect_err("a slice context may not re-enter the scheduler");
+        assert_eq!(
+            error.to_string(),
+            beam_engine::blocked().to_string(),
+            "a context that may not pump reports the typed `blocked` gap, never a value"
+        );
+    }
 }
