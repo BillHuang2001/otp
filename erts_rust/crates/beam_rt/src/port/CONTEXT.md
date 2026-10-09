@@ -63,6 +63,12 @@ The four driver-registry slots are **all overridden** (not left at no-host defau
 - `take_exit_status` is always `Ok(None)` — a driver port owns no child, so no `{Port,{exit_status,…}}`.
 - A driver that armed **more than one** registration per direction is a typed `unsupported`
   (`armed_event`, `875`), never a wrong descriptor.
+- **The `stderr_to_stdout` and `eof` spawn-stream options are accepted but inert here.** Both are on
+  the whitelist (`PORT_OPTION_ATOMS`, `../port.rs:221`) and fall into the recognized-without-effect
+  `_ => {}` arm (`../port.rs:1250`); `SpawnOptions` is built (`../port.rs:1357-1363`) with no
+  `stderr_to_stdout`/`eof` field and `SpawnDriver::with_stream_options` is **never** called from this
+  crate, so `beam_io`'s `StreamOptions`/`take_eof` (implemented + tested in `beam_io`) are unreachable.
+  A child's stderr is `Stdio::inherit` by default, matching the oracle's `dup(2)`.
 
 ## Test Strategy
 - Colocated units in `../port.rs`: every `Name` form + option (`{fd,N}` over a socket pair), an empty
