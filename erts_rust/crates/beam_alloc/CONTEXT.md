@@ -369,8 +369,18 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   `erl_alloc_util.c` for the alloc/free/realloc flow before changing block or carrier code.
 - `AllocKind::Heap` from `Heap::alloc_words` means "collect", not "fatal OOM" (see Design Decisions).
 - Interior layouts (carrier size, class spacing, retention policy, the `RefcBinary` off-heap header)
-  are **not** externally pinned; only the seam in `allocator`/`heap`/`size_class`/`registry`/`stats`/
-  `types`/`refcount`/`binary`/`policy` is frozen.
+  are **not** externally pinned; only the seam in `allocator`/`heap`/`reserved_heap`/`size_class`/
+  `registry`/`stats`/`types`/`refcount`/`binary`/`policy` is frozen.
+- **Hostile-input arithmetic is saturating/checked by contract.** `error::heap_exhausted` saturates the
+  word→byte conversion (an `unsafe fn`'s word count is unbounded by its safety contract) and
+  `alloc_small` saturates `BLOCK_HEADER_SIZE + payload_capacity` (a hostile `SizeClasses` table is a
+  legal public input), so both yield a typed error instead of a debug panic or a silent wrap;
+  `SizeClasses` itself cannot overflow on any input. Keep that property when touching those paths.
+- **The flag byte is fully accounted for.** `ALL_FLAGS` (bits 0–6) plus the `prev_free` state bit
+  (bit 7) cover all 8 bits — compile-time asserted in `block.rs` — so `plausible_header` performs no
+  unknown-bit rejection; `BlockFlags::has_unknown_bits` is the predicate for the taxonomy union alone
+  (masking against `ALL_FLAGS` alone would reject a legitimately live MBC block and leak it).
+- `... clippy -p beam_alloc --all-targets` reports nothing for this crate; keep it that way.
 
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, seam types, dependency waves (this crate = wave 0).
