@@ -216,4 +216,4 @@ registration) and stops at **instruction 16** (0-based):
 - `../cli.rs` → the `Action::Boot` arm (`-boot FILE`) that drives `boot_from_script`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
-- `../context/mod.rs` → `RuntimeContext::run_export_blocking` — the current stop's blocker (read-only from this node)
+- `../context/mod.rs` → `RuntimeContext::run_export`/`run_export_blocking` and `resolve_external_call` (the in-machine seam the `application:load/1` chain is entered through); `run_export_blocking` is **not** the current stop's fold (read-only from this node)
