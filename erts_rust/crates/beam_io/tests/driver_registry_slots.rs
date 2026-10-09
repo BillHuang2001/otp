@@ -26,17 +26,33 @@
 //! [`DriverHost`](beam_abi::driver::host::DriverHost). This crate is the runtime side of that
 //! seam ([`beam_io::AbiHost`]): the two no-port slots reach the process-global
 //! [`DriverTable`], and the two port-carrying slots consult the **port's own** driver. This test
-//! pins the **exact** value each slot produces, so a follow-up differential case can assert the
-//! same numbers.
+//! pins the **exact** value each slot produces — including the value it produces with no live port
+//! in reach (outside a driver callback) — so a follow-up differential case can assert the same
+//! numbers.
 //!
 //! # What is pinned
 //!
 //! | slot | operand | value |
 //! |---|---|---|
 //! | `driver_lock_driver` | a host carrying the fixture's dynamically loaded identity | `0` |
-//! | `remove_driver_entry` | an entry the table has never seen | `0` |
-//! | `add_driver_entry` then `remove_driver_entry` | one fresh static entry, inside a published-host scope | `0` then `1` |
-//! | `driver_create_port` | any live port handle | `ERTS_INVALID_ERL_DRV_PORT` |
+//! | `driver_lock_driver` | a bare host (no identity) or a statically linked one | `-1` |
+//! | `driver_lock_driver` | a null / invalid port handle | `-1` |
+//! | `remove_driver_entry` | an entry the table has never seen, or a null entry | `0` |
+//! | `remove_driver_entry` | a **statically linked** registered entry | `1`, then `0` |
+//! | `remove_driver_entry` | a **dynamically loaded** registered entry | `-1` |
+//! | `add_driver_entry` then `remove_driver_entry` | one fresh static entry, inside a published-host scope | (recorded), then `1` |
+//! | `add_driver_entry` / `remove_driver_entry` | with **no** published host (outside a callback) | dropped, then `0` |
+//! | `driver_create_port` | any live port handle, or a null one | `ERTS_INVALID_ERL_DRV_PORT` |
+//!
+//! The first six rows together are the `0,1,0,-1` sequence
+//! `beam_rt/tests/driver.rs::driver_lock_driver_and_the_entry_registry_agree_with_the_oracle` pins
+//! against the real system `erl`: that test drives a C driver which, in its `start` callback, calls
+//! `driver_lock_driver(port)` (`0`), `add_driver_entry` + `remove_driver_entry` on a helper (`1`),
+//! a second `remove_driver_entry` of the same helper (`0`) and `remove_driver_entry` of the port's
+//! own, dynamically loaded entry (`-1`) — and asserts the oracle answers the identical
+//! `0,1,0,-1`. [`the_four_registry_slots_reproduce_the_oracles_0_1_0_minus_1_sequence`] runs that
+//! same sequence directly against this crate's host layer, so the two layers are pinned against
+//! the same reference codes.
 //!
 //! # The one seam this test cannot cross
 //!
@@ -223,6 +239,17 @@ fn the_registry_slots_answer_the_cs_codes_for_a_live_loaded_port() {
         "an unregistered entry is not found"
     );
 
+    // `add_driver_entry` with **no** host published is dropped (the C's own `void` wrapper discards
+    // the underlying `-1`, so "nothing was recorded" is the whole observable).
+    // SAFETY: `entry` is live; the pointer is only forwarded, and there is no host.
+    unsafe { add(&mut entry) };
+    assert!(
+        DriverTable::global()
+            .lookup("driver_registry_slots_probe")
+            .is_none(),
+        "with no published host nothing is recorded"
+    );
+
     // `add_driver_entry` then `remove_driver_entry` on the same fresh static entry. Both run
     // inside a published-host scope, which is the only way the no-port slots reach a host.
     beam_abi::with_current_host(&mut host, || {
@@ -250,4 +277,193 @@ fn the_registry_slots_answer_the_cs_codes_for_a_live_loaded_port() {
     );
 
     ports.close(&mut poller, id).expect("the port closes");
+}
+
+/// The four slots reproduce, one for one, the `0,1,0,-1` sequence the oracle pins
+/// (`beam_rt/tests/driver.rs::driver_lock_driver_and_the_entry_registry_agree_with_the_oracle`).
+///
+/// | step | call | code |
+/// |---|---|---|
+/// | 1 | `driver_lock_driver(port)` — the port's own driver was `dlopen`ed | `0` |
+/// | 2 | `add_driver_entry(helper)` then `remove_driver_entry(helper)` | `1` |
+/// | 3 | `remove_driver_entry(helper)` again — no such entry | `0` |
+/// | 4 | `remove_driver_entry` of the port's **own** loaded entry | `-1` |
+///
+/// Step 4 is the one that needs the load path's registration: the C records a port's own entry with
+/// `erts_add_driver_entry(dp, dh, …)` (`dp->handle != NULL`) — here
+/// [`DriverTable::add_loaded`] — which is exactly what turns the misleading `0` ("no such entry")
+/// into the C's `-1` ("not allowed for dynamic drivers").
+#[test]
+fn the_four_registry_slots_reproduce_the_oracles_0_1_0_minus_1_sequence() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    force_driver_symbols_link();
+    let path = so.to_str().expect("the fixture path is valid UTF-8");
+
+    let api = beam_abi::driver::drv::driver_api_table();
+    let add = api.add_driver_entry.expect("add_driver_entry is populated");
+    let remove = api
+        .remove_driver_entry
+        .expect("remove_driver_entry is populated");
+    let lock = api
+        .driver_lock_driver
+        .expect("driver_lock_driver is populated");
+
+    // The live port's identity: the fixture, **dynamically loaded** — what
+    // `DriverPort::from_library` records (`loaded = true`), so `driver_lock_driver` answers `0`.
+    let name = beam_abi::driver::loader::load(path, "host_driver")
+        .expect("the fixture loads")
+        .name();
+
+    // The load path's registration of the fixture's **own** entry: the C's
+    // `erts_add_driver_entry(dp, dh, …)` with `dp->handle != NULL`. `beam_io` has no load path of
+    // its own, so [`DriverTable::add_loaded`] is that registration (and the one `create_port`
+    // resolves a driver through).
+    let library = beam_abi::driver::loader::load(path, "host_driver").expect("the fixture loads");
+    let own_entry = library.entry() as *const ErlDrvEntry as *mut ErlDrvEntry;
+    DriverTable::global()
+        .add_loaded(library)
+        .expect("the dynamically loaded driver registers");
+    assert_eq!(
+        DriverTable::global()
+            .lookup("host_driver")
+            .map(|driver| driver.dynamic),
+        Some(true),
+        "the fixture's own entry is listed as a dynamically loaded driver"
+    );
+
+    // The oracle's helper: a statically linked entry a driver registers and removes again.
+    const HELPER: &[u8] = b"registry_slots_helper\0";
+    let mut helper = named_entry(HELPER.as_ptr());
+
+    let mut host = AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), name.clone(), true)
+        .expect("a driver heap");
+    {
+        let mut env = DriverEnv::new(&mut host);
+        let port = env.as_port();
+        // Step 1: `driver_lock_driver` = 0 — the port's own driver was `dlopen`ed.
+        // SAFETY: `port` came from `DriverEnv::as_port` on the live `env` above.
+        assert_eq!(
+            unsafe { lock(port) },
+            0,
+            "step 1: the port's dynamically loaded driver locks"
+        );
+    }
+
+    beam_abi::with_current_host(&mut host, || {
+        // Step 2: `add_driver_entry` (a statically linked helper) — recorded (the C's underlying
+        // `0`; the `void` slot itself discards it, so the table is the observable) ...
+        // SAFETY: `helper` is a live `ErlDrvEntry` for this test's whole body.
+        unsafe { add(&mut helper) };
+        assert_eq!(
+            DriverTable::global()
+                .lookup("registry_slots_helper")
+                .map(|driver| driver.entry),
+            Some(&mut helper as *mut ErlDrvEntry),
+            "step 2: the published host recorded the helper in the process-global table"
+        );
+        // ... then `remove_driver_entry` = 1: found and removed.
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { remove(&mut helper) },
+            1,
+            "step 2: the registered helper is removed"
+        );
+
+        // Step 3: a second `remove_driver_entry` of the same helper = 0 — no such entry.
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { remove(&mut helper) },
+            0,
+            "step 3: the helper is already gone"
+        );
+
+        // Step 4: `remove_driver_entry` of the port's **own** loaded entry = -1 — the C refuses it.
+        // SAFETY: `own_entry` points at the fixture's `ErlDrvEntry`; it is only compared by address.
+        assert_eq!(
+            unsafe { remove(own_entry) },
+            -1,
+            "step 4: a dynamically loaded driver entry may not be removed"
+        );
+        // The `-1` is a refusal, not a removal: the registration is still listed.
+        assert_eq!(
+            DriverTable::global()
+                .lookup("host_driver")
+                .map(|driver| driver.dynamic),
+            Some(true),
+            "step 4: the dynamic registration stays listed after the refused removal"
+        );
+    });
+}
+
+/// The two **port-carrying** slots answer the C's own failure values when no live port (or no
+/// per-port driver identity) is behind the handle — the values they produce outside a driver
+/// callback.
+///
+/// `driver_lock_driver` is `-1` for a null/invalid port (the C's `ERTS_INVALID_ERL_DRV_PORT` early
+/// return, `io.c:7324`) and for a port whose driver has no `dlopen` handle (`io.c:7337` — a
+/// statically linked driver, which a bare [`AbiHost`] models). `driver_create_port` is the
+/// invalid-port sentinel for *every* request it cannot honour, `io.c:787`.
+#[test]
+fn the_port_carrying_slots_answer_their_defaults_without_a_port_or_a_loaded_driver() {
+    let api = beam_abi::driver::drv::driver_api_table();
+    let lock = api
+        .driver_lock_driver
+        .expect("driver_lock_driver is populated");
+    let create = api
+        .driver_create_port
+        .expect("driver_create_port is populated");
+
+    // A null (invalid) port: no host is reachable, so the C's own early returns stand. Neither
+    // operand is dereferenced — a null port must never be a crash.
+    // SAFETY: a null port is the documented "no port" operand.
+    assert_eq!(
+        unsafe { lock(core::ptr::null_mut()) },
+        -1,
+        "an invalid port cannot lock its driver"
+    );
+    // SAFETY: a null creator port is the documented "no port" operand; the name is not dereferenced.
+    assert_eq!(
+        unsafe { create(core::ptr::null_mut(), 1, core::ptr::null_mut(), core::ptr::null_mut()) },
+        ERTS_INVALID_ERL_DRV_PORT,
+        "an invalid creator port answers the invalid-port sentinel"
+    );
+
+    // A **bare** host (no registered driver identity) models a port whose driver has no `dlopen`
+    // handle — the C's statically linked case.
+    let mut bare = AbiHost::new(Box::new(LocalAtomPortHost::new())).expect("a driver heap");
+    {
+        let mut env = DriverEnv::new(&mut bare);
+        let port = env.as_port();
+        // SAFETY: `port` came from `DriverEnv::as_port` on the live `env` above.
+        assert_eq!(
+            unsafe { lock(port) },
+            -1,
+            "a driver with no handle cannot lock"
+        );
+        let name = c"host_driver";
+        // SAFETY: `port` is live; `name` is NUL-terminated.
+        assert_eq!(
+            unsafe { create(port, 1, name.as_ptr() as *mut libc::c_char, core::ptr::null_mut()) },
+            ERTS_INVALID_ERL_DRV_PORT,
+            "a host with no port-creation service answers the sentinel"
+        );
+    }
+
+    // A host carrying a **statically linked** identity is the same `-1`: the C consults the port's
+    // own handle, never a lookup by name in any global table.
+    let mut statically =
+        AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), "host_driver", false)
+            .expect("a driver heap");
+    {
+        let mut env = DriverEnv::new(&mut statically);
+        let port = env.as_port();
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { lock(port) },
+            -1,
+            "a statically linked identity answers -1"
+        );
+    }
 }

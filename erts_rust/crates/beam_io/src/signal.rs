@@ -81,8 +81,10 @@
 //! [`SignalFacility`] should be alive at a time: a second [`SignalFacility::new`] re-points
 //! the global write end at its own pipe, so signals delivered while both exist would be
 //! reported by the newer facility. `Drop` restores only the signals *this* facility changed
-//! and clears the global write end only if it still points at its own pipe, so dropping and
-//! recreating a facility is safe; the runtime owns the one facility.
+//! and, **only if the global write end still points at its own pipe**, clears that end and
+//! resets the pending bitmask — so a superseded facility neither re-points nor discards its
+//! successor's plumbing, and dropping/recreating a facility is safe. The runtime owns the one
+//! facility.
 //!
 //! # Handoff to `beam_rt`
 //!
@@ -516,10 +518,12 @@ impl Drop for SignalFacility {
     /// Restores every disposition this facility changed, then tears down the self-pipe.
     ///
     /// Safe even if [`SignalFacility::set`] was never called (nothing is restored, the pipe
-    /// is still closed). The global write end is cleared only if it still points at this
-    /// facility's pipe, so a facility that was already superseded does not clobber its
-    /// successor. After `drop`, no handler this facility installed remains installed and no
-    /// dangling descriptor is left open.
+    /// is still closed). The global write end is cleared **only if it still points at this
+    /// facility's pipe**, and the pending bitmask is reset only when it does, so a facility
+    /// that was already superseded neither re-points its successor's trampoline plumbing nor
+    /// discards reports the successor has yet to collect. Nothing here can panic. After
+    /// `drop`, no handler this facility installed remains installed and no dangling descriptor
+    /// is left open.
     fn drop(&mut self) {
         for (index, sig) in Signal::ALL.iter().enumerate() {
             if let Some(prior) = self.prior[index].take() {
@@ -530,9 +534,14 @@ impl Drop for SignalFacility {
             }
         }
         // Only clear the global write end if it is still ours (a newer facility's fd must
-        // survive).
-        let _ = WRITE_FD.compare_exchange(self.write_fd, -1, Ordering::SeqCst, Ordering::SeqCst);
-        PENDING.store(0, Ordering::SeqCst);
+        // survive); the bitmask is reset only when we *were* the live facility, so a
+        // superseded facility cannot swallow its successor's pending reports.
+        if WRITE_FD
+            .compare_exchange(self.write_fd, -1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            PENDING.store(0, Ordering::SeqCst);
+        }
         // SAFETY: both descriptors were created by `open_pipe` in `new` and are owned by this
         // facility; they are not used after the close (the global write end has been cleared
         // first, so the trampoline can no longer reach `write_fd`).
@@ -857,5 +866,196 @@ mod tests {
             before,
             "drop restores the disposition this facility changed"
         );
+    }
+
+    /// Reads whatever is available on `fd` (non-blocking) and reports `(n, errno)`.
+    fn read_once(fd: RawFd, buf: &mut [u8]) -> (isize, Option<i32>) {
+        // SAFETY: `buf` is a valid writable slice of `buf.len()` bytes and `fd` is the
+        // facility's live, non-blocking pipe read end; `read(2)` retains no pointer.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            (n, IoError::last_os_error().raw_os_error())
+        } else {
+            (n, None)
+        }
+    }
+
+    /// `fcntl(fd, F_GETFD)`: `None` when `fd` names a live descriptor, else its failing errno.
+    fn fcntl_errno(fd: RawFd) -> Option<i32> {
+        // SAFETY: `fcntl` with `F_GETFD` only inspects the (possibly closed) descriptor number
+        // and retains no pointer.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if rc >= 0 {
+            None
+        } else {
+            IoError::last_os_error().raw_os_error()
+        }
+    }
+
+    #[test]
+    fn drop_closes_both_pipe_ends() {
+        let _guard = guard();
+        let (read_fd, write_fd) = {
+            let facility = SignalFacility::new().expect("a self-pipe");
+            (facility.read_fd(), facility.write_fd)
+        };
+        assert_eq!(fcntl_errno(read_fd), Some(libc::EBADF), "read end closed");
+        assert_eq!(fcntl_errno(write_fd), Some(libc::EBADF), "write end closed");
+    }
+
+    /// Raises `signo` on the calling thread and returns only once the disposition has run.
+    ///
+    /// `pthread_kill(self, …)` is deliberately used instead of `kill(getpid(), …)`: the latter
+    /// is process-directed and the kernel may hand it to *any* thread that does not block the
+    /// signal, whereas POSIX requires `pthread_kill` to deliver at least one of the target
+    /// thread's unblocked pending signals **before it returns**. Since the target is this
+    /// thread and its signals are unblocked, the trampoline has always returned by the next
+    /// statement — which is what makes the assertions below deterministic rather than
+    /// timing-dependent.
+    fn raise_self_now(signo: libc::c_int) {
+        // SAFETY: `pthread_self` has no preconditions; `pthread_kill` to the calling thread
+        // with a valid signal number is well formed and only posts a signal to this thread.
+        let rc = unsafe { libc::pthread_kill(libc::pthread_self(), signo) };
+        assert_eq!(rc, 0, "pthread_kill(self, {signo}) succeeds");
+    }
+
+    #[test]
+    fn the_trampoline_writes_exactly_one_byte_per_delivery() {
+        let _guard = guard();
+        let mut facility = SignalFacility::new().expect("a self-pipe");
+        facility
+            .set(Signal::SigUsr1, Disposition::Handle)
+            .expect("install the trampoline");
+
+        raise_self_now(libc::SIGUSR1);
+
+        // Exactly one `write(2)` of exactly one byte, and that byte is the raw signal number —
+        // the whole payload the async-signal-safe trampoline produces.
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            read_once(facility.read_fd(), &mut buf),
+            (1, None),
+            "one byte was written"
+        );
+        assert_eq!(
+            buf[0] as libc::c_int,
+            libc::SIGUSR1,
+            "the byte is the signo"
+        );
+        // A second read finds nothing, so the handler wrote nothing else.
+        let (n, errno) = read_once(facility.read_fd(), &mut buf);
+        assert_eq!(n, -1);
+        assert_eq!(errno, Some(libc::EAGAIN), "no further byte is written");
+        // The bit — not the pipe — carries the report.
+        assert_eq!(facility.drain(), vec![Signal::SigUsr1]);
+
+        facility
+            .set(Signal::SigUsr1, Disposition::Default)
+            .expect("restore");
+    }
+
+    #[test]
+    fn handle_installs_the_trampoline_with_sa_restart_and_an_empty_mask() {
+        let _guard = guard();
+        let mut facility = SignalFacility::new().expect("a self-pipe");
+        facility
+            .set(Signal::SigUsr1, Disposition::Handle)
+            .expect("install the trampoline");
+
+        // SAFETY: a `NULL` `act` makes `sigaction(2)` a pure query; `action` is a valid,
+        // writable out-parameter the kernel fills with the current action.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: as above — a valid signal number and a live out-pointer.
+        let rc = unsafe { libc::sigaction(Signal::SigUsr1.signo(), std::ptr::null(), &mut action) };
+        assert_eq!(rc, 0, "the kernel answers the disposition query");
+
+        // The handler really is *our* trampoline (the async-signal-safe one documented on the
+        // module), not some other library's.
+        assert_eq!(
+            action.sa_sigaction, trampoline as *const () as libc::sighandler_t,
+            "the trampoline is the installed handler"
+        );
+        assert_ne!(
+            action.sa_flags & libc::SA_RESTART,
+            0,
+            "SA_RESTART is set (this runtime's documented equivalent of the C's EINTR loops)"
+        );
+        // An empty `sa_mask`: the handler blocks nothing extra while it runs. That is safe
+        // precisely because it only touches atomics and `write(2)` — it can never deadlock
+        // against a signal it refused to mask.
+        for sig in Signal::ALL {
+            // SAFETY: `action.sa_mask` is an initialized `sigset_t` the kernel just returned.
+            let member = unsafe { libc::sigismember(&action.sa_mask, sig.signo()) };
+            assert_eq!(member, 0, "{} is not in the handler's mask", sig.name());
+        }
+
+        facility
+            .set(Signal::SigUsr1, Disposition::Default)
+            .expect("restore");
+    }
+
+    #[test]
+    fn a_stray_pipe_byte_is_not_a_signal() {
+        let _guard = guard();
+        let mut facility = SignalFacility::new().expect("a self-pipe");
+        // A byte in the pipe that no bitmask bit backs (a left-over/coalesced write, or one
+        // from a signal this facility does not map) must not fabricate a report: the pipe is
+        // only a wake-up, the bitmask is the record.
+        let fd = WRITE_FD.load(Ordering::SeqCst);
+        assert!(fd >= 0, "a live facility publishes its write end");
+        let mut byte = [0x2fu8];
+        // SAFETY: `WRITE_FD` is this facility's live, non-blocking pipe write end and `byte` is
+        // a valid, initialized 1-byte buffer; `write(2)` retains no pointer.
+        let wrote = unsafe { libc::write(fd, byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(wrote, 1, "the stray byte lands in the pipe");
+        assert!(
+            facility.drain().is_empty(),
+            "a stray byte with no pending bit reports nothing"
+        );
+        // `drain` consumed it, so readiness does not persist.
+        assert_eq!(read_once(facility.read_fd(), &mut byte).0, -1);
+    }
+
+    #[test]
+    fn a_pending_bit_without_a_pipe_byte_is_still_reported() {
+        let _guard = guard();
+        let mut facility = SignalFacility::new().expect("a self-pipe");
+        // The converse of the stray-byte case: a delivery whose `write(2)` was dropped (a full
+        // pipe, or no write end published) still set the bit, and the signal must not be lost.
+        PENDING.fetch_or(1u64 << Signal::SigUsr2.bit(), Ordering::SeqCst);
+        assert_eq!(facility.drain(), vec![Signal::SigUsr2]);
+        assert!(facility.drain().is_empty(), "reported exactly once");
+    }
+
+    #[test]
+    fn dropping_a_superseded_facility_does_not_clobber_its_successor() {
+        let _guard = guard();
+        let first = SignalFacility::new().expect("a self-pipe");
+        let first_write = first.write_fd;
+        let mut second = SignalFacility::new().expect("a self-pipe");
+        let second_write = second.write_fd;
+        assert_ne!(
+            first_write, second_write,
+            "each live facility owns its own pipe"
+        );
+
+        // A delivery the successor has not collected yet.
+        PENDING.fetch_or(1u64 << Signal::SigUsr1.bit(), Ordering::SeqCst);
+        drop(first);
+        assert_eq!(
+            WRITE_FD.load(Ordering::SeqCst),
+            second_write,
+            "the successor's write end is not cleared by a superseded drop"
+        );
+        assert_eq!(
+            second.drain(),
+            vec![Signal::SigUsr1],
+            "the successor's pending report is not discarded by a superseded drop"
+        );
+
+        // Dropping the *live* facility clears the global write end.
+        drop(second);
+        assert_eq!(WRITE_FD.load(Ordering::SeqCst), -1);
+        assert_eq!(PENDING.load(Ordering::SeqCst), 0);
     }
 }

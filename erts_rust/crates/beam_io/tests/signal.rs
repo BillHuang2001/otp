@@ -26,12 +26,15 @@
 //! orthogonal `SIGUSR1` dispositions and observe each other's deliveries. The lock makes the
 //! whole suite serial, which is the documented single-instance rule made concrete.
 //!
-//! Every raise targets the test process itself with `libc::kill(getpid(), …)` — no child
-//! process is ever spawned to deliver a signal. A raised signal whose disposition is `Handle`
-//! is always observed through the self-pipe before the facility is allowed to restore
-//! `SIG_DFL`, so a straggler delivery cannot terminate the test process; the coalescing and
-//! two-signal tests deliberately use signals whose default action is *not* "terminate"
-//! (`SIGWINCH`, `SIGCONT`).
+//! Every raise targets the test process itself — no child process is ever spawned to deliver
+//! a signal. A raise goes either to the whole process (`raise_self`, `libc::kill(getpid(), …)`)
+//! or, where a test needs deterministic delivery, to the **calling thread** (`raise_thread`,
+//! `pthread_kill(pthread_self(), …)` — POSIX delivers at least one of the target thread's
+//! unblocked pending signals *before* it returns, so the handler has always run by the next
+//! statement). A raised signal whose disposition is `Handle` is always observed through the
+//! self-pipe before the facility is allowed to restore `SIG_DFL`, so a straggler delivery
+//! cannot terminate the test process; the coalescing and multi-signal tests deliberately use
+//! signals whose default action is *not* "terminate" (`SIGWINCH`, `SIGCONT`, `SIGCHLD`).
 
 use std::os::unix::io::RawFd;
 use std::sync::{Mutex, MutexGuard};
@@ -117,6 +120,53 @@ fn raise_self(signo: libc::c_int) {
     // formed and only posts a signal to this process.
     let rc = unsafe { libc::kill(libc::getpid(), signo) };
     assert_eq!(rc, 0, "kill(getpid(), {signo}) succeeds");
+}
+
+/// Raises `signo` on the **calling thread** and returns only once its disposition has run.
+///
+/// `pthread_kill(self, …)` is used instead of `kill(getpid(), …)` whenever a test needs
+/// deterministic delivery: a process-directed `kill` may be handed to *any* thread that does
+/// not block the signal (in a libtest binary, typically an idle harness thread), whereas POSIX
+/// requires `pthread_kill` to deliver at least one of the target thread's unblocked pending
+/// signals **before it returns**. As the target is this thread and the signal is unblocked, the
+/// trampoline has always returned by the next statement — so `drain` right afterwards observes
+/// every delivery of the burst, with no sleeping and no polling.
+///
+/// # Errors
+///
+/// Panics if `pthread_kill(2)` fails (it never should for a valid signo targeting self).
+fn raise_thread(signo: libc::c_int) {
+    // SAFETY: `pthread_self` has no preconditions; `pthread_kill` to the calling thread with a
+    // valid signal number is well formed and only posts a signal to this thread.
+    let rc = unsafe { libc::pthread_kill(libc::pthread_self(), signo) };
+    assert_eq!(rc, 0, "pthread_kill(self, {signo}) succeeds");
+}
+
+/// The number of bytes currently readable on `fd` — `ioctl(FIONREAD)`.
+///
+/// Used to prove the coalescing rule's direction: the self-pipe can hold one byte per
+/// delivery while `drain` reports one entry per *distinct* signal, so the byte count is not
+/// the source of truth.
+fn bytes_available(fd: RawFd) -> libc::c_int {
+    let mut count: libc::c_int = 0;
+    // SAFETY: `FIONREAD` writes one `c_int` through the out-pointer, which is valid and
+    // writable for the call, and `fd` is a live descriptor.
+    let rc = unsafe { libc::ioctl(fd, libc::FIONREAD, std::ptr::addr_of_mut!(count)) };
+    assert_eq!(rc, 0, "FIONREAD succeeds on a live pipe");
+    count
+}
+
+/// `fcntl(fd, F_GETFD)`: `None` when `fd` names a live descriptor, else the failing errno
+/// (`EBADF` for a descriptor `Drop` has already closed).
+fn fcntl_errno(fd: RawFd) -> Option<i32> {
+    // SAFETY: `fcntl` with `F_GETFD` only inspects/reports the (possibly closed) descriptor
+    // number, takes no pointer and has no other precondition.
+    let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if rc >= 0 {
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    }
 }
 
 /// Drains repeatedly (bounded) until at least `want` distinct signals have been reported,
@@ -370,5 +420,257 @@ fn the_facility_can_be_dropped_and_recreated() {
         .expect("install the trampoline");
     raise_self(libc::SIGWINCH);
     assert!(wait_readable(facility.read_fd(), Duration::from_secs(2)));
+    assert_eq!(facility.drain(), vec![Signal::SigWinch]);
+}
+
+#[test]
+fn the_rejected_names_are_exactly_the_ones_the_oracle_rejects() {
+    // The C's `!`-commented rows plus the `#ifdef SIGINFO` row (`signalterm_to_signum`,
+    // `erts/emulator/sys/unix/sys.c`). The oracle answers `badarg` for every one of them, and
+    // this crate deliberately excludes the platform-conditional `siginfo` on all targets.
+    for rejected in [
+        "sigint", "sigill", "sigsegv", "sigttin", "sigttou", "siginfo", "sigkill", "sigpipe",
+        "sigurg", "sigio", "sigusr3", "sigfoo", "sighups", "sigtstp ", " sigtstp",
+    ] {
+        assert_eq!(
+            Signal::from_name(rejected),
+            None,
+            "{rejected:?} is rejected"
+        );
+    }
+}
+
+#[test]
+fn every_signal_owns_a_distinct_signo() {
+    for (index, sig) in Signal::ALL.iter().enumerate() {
+        assert_eq!(
+            Signal::from_signo(sig.signo()),
+            Some(*sig),
+            "{} resolves from its signo",
+            sig.name()
+        );
+        for other in &Signal::ALL[index + 1..] {
+            assert_ne!(
+                sig.signo(),
+                other.signo(),
+                "{} and {} must not share a signo",
+                sig.name(),
+                other.name()
+            );
+        }
+    }
+    // A signo this facility does not manage maps to nothing.
+    assert_eq!(Signal::from_signo(libc::SIGINT), None);
+    assert_eq!(Signal::from_signo(0), None);
+    assert_eq!(Signal::from_signo(-1), None);
+}
+
+#[test]
+fn three_signals_are_reported_in_all_order_not_arrival_order() {
+    let _guard = guard();
+    let mut facility = SignalFacility::new().expect("a self-pipe");
+    // All three have non-terminating default actions (winch: ignore, cont: continue, chld:
+    // ignore), so a straggler after `Drop` restores the default cannot terminate the test.
+    for sig in [Signal::SigWinch, Signal::SigCont, Signal::SigChld] {
+        facility
+            .set(sig, Disposition::Handle)
+            .expect("install the trampoline");
+    }
+
+    // Arrival order is the exact reverse of `Signal::ALL` order, and every delivery has
+    // completed its handler by the time `drain` runs.
+    raise_thread(libc::SIGWINCH);
+    raise_thread(libc::SIGCONT);
+    raise_thread(libc::SIGCHLD);
+
+    assert_eq!(
+        facility.drain(),
+        vec![Signal::SigChld, Signal::SigCont, Signal::SigWinch],
+        "one entry per distinct signal, in Signal::ALL order"
+    );
+}
+
+#[test]
+fn interleaved_repeats_of_two_signals_coalesce_to_one_entry_each() {
+    let _guard = guard();
+    let mut facility = SignalFacility::new().expect("a self-pipe");
+    facility
+        .set(Signal::SigWinch, Disposition::Handle)
+        .expect("install winch");
+    facility
+        .set(Signal::SigCont, Disposition::Handle)
+        .expect("install cont");
+
+    // Six deliveries, interleaved: three of each. An implementation that reported once per
+    // *delivery*, or in *arrival* order, could not produce the ALL-ordered single-entry pair
+    // asserted below.
+    for _ in 0..3 {
+        raise_thread(libc::SIGWINCH);
+        raise_thread(libc::SIGCONT);
+    }
+
+    assert_eq!(facility.drain(), vec![Signal::SigCont, Signal::SigWinch]);
+    assert!(
+        facility.drain().is_empty(),
+        "none of the six deliveries is reported twice"
+    );
+}
+
+#[test]
+fn each_drain_interval_reports_its_own_delivery() {
+    let _guard = guard();
+    let mut facility = SignalFacility::new().expect("a self-pipe");
+    facility
+        .set(Signal::SigWinch, Disposition::Handle)
+        .expect("install the trampoline");
+
+    // "Exactly once per drain *interval*": a fresh delivery after a drain is a fresh report.
+    raise_thread(libc::SIGWINCH);
+    assert_eq!(facility.drain(), vec![Signal::SigWinch], "first interval");
+    raise_thread(libc::SIGWINCH);
+    assert_eq!(
+        facility.drain(),
+        vec![Signal::SigWinch],
+        "a delivery after a drain is its own report"
+    );
+    assert!(
+        facility.drain().is_empty(),
+        "but still only once per interval"
+    );
+}
+
+#[test]
+fn the_pipe_byte_count_is_not_the_source_of_truth() {
+    let _guard = guard();
+    let mut facility = SignalFacility::new().expect("a self-pipe");
+    facility
+        .set(Signal::SigWinch, Disposition::Handle)
+        .expect("install the trampoline");
+
+    // Eight synchronous deliveries ⇒ eight separate `write(2)` calls; a pipe never coalesces
+    // writes, so the self-pipe physically holds one byte per delivery ...
+    for _ in 0..8 {
+        raise_thread(libc::SIGWINCH);
+    }
+    let bytes = bytes_available(facility.read_fd());
+    assert!(
+        bytes >= 2,
+        "the self-pipe holds one byte per delivery, not {bytes}"
+    );
+
+    // ... yet `drain` reports one entry per *distinct* signal, not one per byte, and empties
+    // the pipe so its readiness does not persist.
+    assert_eq!(facility.drain(), vec![Signal::SigWinch]);
+    assert!(
+        facility.drain().is_empty(),
+        "no byte produced a second report"
+    );
+    assert_eq!(
+        bytes_available(facility.read_fd()),
+        0,
+        "`drain` consumed every byte"
+    );
+}
+
+#[test]
+fn drop_restores_every_disposition_it_changed() {
+    let _guard = guard();
+    let signals = [
+        Signal::SigUsr1,
+        Signal::SigUsr2,
+        Signal::SigWinch,
+        Signal::SigCont,
+    ];
+    let before: Vec<Disposition> = {
+        let mut facility = SignalFacility::new().expect("a self-pipe");
+        let before = signals
+            .iter()
+            .map(|sig| facility.disposition(*sig).expect("query"))
+            .collect();
+        for sig in signals {
+            facility
+                .set(sig, Disposition::Ignore)
+                .expect("install ignore");
+        }
+        for sig in signals {
+            assert_eq!(
+                facility.disposition(sig).expect("query"),
+                Disposition::Ignore,
+                "{} was changed",
+                sig.name()
+            );
+        }
+        before
+    };
+
+    let facility = SignalFacility::new().expect("a self-pipe");
+    for (sig, want) in signals.iter().zip(before) {
+        assert_eq!(
+            facility.disposition(*sig).expect("query"),
+            want,
+            "drop restores {} to its pre-facility disposition",
+            sig.name()
+        );
+    }
+}
+
+#[test]
+fn drop_restores_the_prior_from_before_the_first_change() {
+    let _guard = guard();
+    let before = {
+        let mut facility = SignalFacility::new().expect("a self-pipe");
+        let before = facility.disposition(Signal::SigWinch).expect("query");
+        // Three changes to the same signal: only the *first* prior is the truth, so a `set`
+        // that captured the previous action every time would restore `Ignore` below instead.
+        facility
+            .set(Signal::SigWinch, Disposition::Ignore)
+            .expect("install ignore");
+        facility
+            .set(Signal::SigWinch, Disposition::Handle)
+            .expect("install handle");
+        facility
+            .set(Signal::SigWinch, Disposition::Ignore)
+            .expect("install ignore again");
+        assert_eq!(
+            facility.disposition(Signal::SigWinch).expect("query"),
+            Disposition::Ignore,
+            "the last change is live before the drop"
+        );
+        before
+    };
+
+    let facility = SignalFacility::new().expect("a self-pipe");
+    assert_eq!(
+        facility.disposition(Signal::SigWinch).expect("query"),
+        before,
+        "drop restores the disposition from before the *first* change, not the last"
+    );
+}
+
+#[test]
+fn drop_closes_the_self_pipe_and_the_facility_can_be_recreated() {
+    let _guard = guard();
+    let read_fd = {
+        let facility = SignalFacility::new().expect("a self-pipe");
+        let read_fd = facility.read_fd();
+        assert!(read_fd >= 0, "a real descriptor is exposed");
+        assert_eq!(fcntl_errno(read_fd), None, "the read end is live");
+        read_fd
+    };
+
+    // `Drop` closed it: the number no longer names an open descriptor, so a later readiness
+    // report for it is impossible.
+    assert_eq!(
+        fcntl_errno(read_fd),
+        Some(libc::EBADF),
+        "drop closes the self-pipe's read end"
+    );
+
+    // ... and the facility can be recreated and used end-to-end afterwards.
+    let mut facility = SignalFacility::new().expect("a self-pipe");
+    facility
+        .set(Signal::SigWinch, Disposition::Handle)
+        .expect("install the trampoline");
+    raise_thread(libc::SIGWINCH);
     assert_eq!(facility.drain(), vec![Signal::SigWinch]);
 }
