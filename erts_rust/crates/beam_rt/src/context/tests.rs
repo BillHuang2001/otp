@@ -1397,13 +1397,19 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tracing_tag_family() {
             );
         }
     }
-    // A wrong arity misses the arm: the seam's defaulted answer names the key instead of
-    // substituting a neighbouring arity's behaviour.
+    // A wrong arity is not a `RuntimeHooks` roster key at all, so the bridge is never
+    // installed for it and the call falls through to the ordinary namespace path — a bare
+    // `error:undef`, never a neighbouring arity's behaviour. (`needs_runtime_hooks` is
+    // per `(module, function, arity)`, so only the listed arity reaches the seam.)
     for (function, arity) in [("dt_get_tag", 1u32), ("dt_put_tag", 0), ("dt_get_tag_data", 2)] {
         let error = ctx
             .call_bif("erlang", function, arity, &[make_small(1)])
-            .expect_err("an unserved arity is the typed gap");
-        shared_gap(&error, &format!("erlang:{function}/{arity}"));
+            .expect_err("an unlisted arity is not a RuntimeHooks key");
+        assert_eq!(
+            error.as_atom(),
+            Some("undef"),
+            "{function}/{arity} is outside the roster, so no bridge is installed: {error}"
+        );
     }
 }
 
