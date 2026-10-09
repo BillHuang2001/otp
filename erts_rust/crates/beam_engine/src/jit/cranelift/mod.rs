@@ -42,13 +42,15 @@
 //!
 //! 1. **inlines** the IR instruction and transfers control to a successor block —
 //!    the metadata no-ops fall through to `pc + 1`, an inlinable `move` writes the
-//!    destination x-register slot and falls through to `pc + 1`, an inlinable
+//!    destination x-register slot and falls through to `pc + 1`, an inlinable `swap`
+//!    exchanges two x-register slots and falls through to `pc + 1`, an inlinable
 //!    small-int `gc_bif` falls through to `pc + 1` on its fast path, an inlinable
 //!    comparison BIF falls through to `pc + 1` after writing its `true`/`false`
 //!    word, an inlinable `test` branches to its `fail` label (or falls through to
-//!    `pc + 1` on success), and a `jump` whose label resolves **inside this IR
-//!    function** jumps straight to the label's `pc` (a `jump` into a *different* IR
-//!    function returns the encoded `(func, pc)` word to the driver); or
+//!    `pc + 1` on success), and a `jump`/`call_only` whose label resolves **inside
+//!    this IR function** jumps straight to the label's `pc` (a target in a
+//!    *different* IR function returns the encoded `(func, pc)` word to the driver);
+//!    or
 //! 2. calls the shared per-instruction helper
 //!    `jit_step_one(rt, FUNC_INDEX, pc)` — the **same** interpreter-backed helper
 //!    the baseline tier uses
@@ -373,6 +375,18 @@ pub struct CompiledFunctions {
     ///
     /// [`inlined_tuple_reads`]: CompiledFunctions::inlined_tuple_reads
     inlined_list_reads: Vec<&'static str>,
+    /// How many `swap` instructions the tier inlined natively.
+    ///
+    /// Same artifact-level observation as `inlined_select_vals`: the evidence that the
+    /// register-exchange fast path was compiled rather than silently deopted (read
+    /// through [`inlined_swap_count`](CompiledFunctions::inlined_swap_count)).
+    inlined_swaps: usize,
+    /// How many local tail calls (`call_only`) the tier inlined natively.
+    ///
+    /// Same artifact-level observation as `inlined_swaps`: the evidence that the
+    /// frame-less tail-call fast path was compiled rather than silently deopted
+    /// (read through [`inlined_tail_call_count`](CompiledFunctions::inlined_tail_call_count)).
+    inlined_tail_calls: usize,
 }
 
 impl CompiledFunctions {
@@ -456,6 +470,26 @@ impl CompiledFunctions {
     /// `ops.tab` spellings `"get_list"` / `"get_hd"` / `"get_tl"`.
     pub fn inlined_list_read_kinds(&self) -> &[&'static str] {
         &self.inlined_list_reads
+    }
+
+    /// How many `swap` instructions this artifact inlined natively (zero when the
+    /// tier inlined none).
+    ///
+    /// Read-only introspection, the register-exchange counterpart of
+    /// [`inlined_select_val_count`](CompiledFunctions::inlined_select_val_count): a
+    /// module whose swaps silently deopted would report zero here.
+    pub fn inlined_swap_count(&self) -> usize {
+        self.inlined_swaps
+    }
+
+    /// How many local tail calls (`call_only`) this artifact inlined natively (zero
+    /// when the tier inlined none).
+    ///
+    /// Read-only introspection, the tail-call counterpart of
+    /// [`inlined_swap_count`](CompiledFunctions::inlined_swap_count): a module whose
+    /// frame-less tail calls silently deopted would report zero here.
+    pub fn inlined_tail_call_count(&self) -> usize {
+        self.inlined_tail_calls
     }
 }
 /// The Cranelift tier's [`NativeCode`] lookup: a compiled function is entered

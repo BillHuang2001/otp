@@ -1445,6 +1445,101 @@ fn multi_register_moves_and_arithmetic_agree_with_the_interpreter() {
     agree_module(&swaps_memory, "swaps_memory", 0, &[]).expect("swaps_memory/0");
 }
 
+/// `handoff/0` — a block that **deopts mid-block** while cached x-registers hold values
+/// the inline prefix wrote. The tier's whole residency model is that the interpreter
+/// helper sees `machine.x` at every instruction boundary, so the `spill` before the
+/// helper and the `fill` after it are what carry a resident's value across a deopt:
+///
+/// ```text
+///   x0 = 7                  ; inlined `move` — x0 becomes a resident, machine.x[x0] stale
+///   put_tuple2 x1 [x0, x0]  ; DEOPT — the helper builds {7, 7} and writes machine.x[x1]
+///   x0 = x1                 ; inlined `move` — reads resident x1
+/// ```
+///
+/// Both registers fit the five-slot budget, so the block is entered natively. A missing
+/// `fill` after the helper would leave the x1 resident holding its **pre-helper** word,
+/// and the answer would be that stale word instead of `{7, 7}` — exactly the divergence
+/// the interpreter-agreement check below catches.
+fn handoff_module() -> Module {
+    block_module(
+        "handoff",
+        "handoff",
+        &[],
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Move {
+                src: Operand::Integer(7),
+                dst: Operand::X(0),
+            },
+            Instr::PutTuple2 {
+                dst: Operand::X(1),
+                elements: vec![Operand::X(0), Operand::X(0)],
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    )
+}
+
+#[test]
+fn an_inlined_resident_survives_a_mid_block_deopt() {
+    let module = handoff_module();
+    let compiled = BaselineJit::new()
+        .compile(&module)
+        .expect("compile the handoff fixture");
+    assert_eq!(compiled.block_count(), 1);
+    assert_eq!(
+        compiled.cached_registers(),
+        &[0u32, 1],
+        "both registers must be resident for the cross-deopt handoff to matter"
+    );
+
+    // The produced tuple lives in the run context's arena, so the context must outlive
+    // the comparison; the expected tuple is built in an independent arena.
+    let mut expected_heap = Heap::new(64);
+    let expected = expected_heap
+        .tuple(&[make_small(7), make_small(7)])
+        .expect("the expected {7, 7}");
+
+    let mut interpreted = Machine::new();
+    let mut interp_ctx = MinimalContext::new();
+    let interpreted_value = interpreted
+        .run_with_tier(
+            &module,
+            atom(&module, "handoff"),
+            0,
+            &[],
+            &mut interp_ctx,
+            Tier::Interpreter,
+        )
+        .expect("handoff/0 on the interpreter");
+
+    let mut jitted = Machine::new();
+    let mut jit_ctx = MinimalContext::new();
+    let jitted_value = jitted
+        .run_with_tier(
+            &module,
+            atom(&module, "handoff"),
+            0,
+            &[],
+            &mut jit_ctx,
+            Tier::BaselineJit,
+        )
+        .expect("handoff/0 on the native tier");
+
+    assert!(
+        beam_term::eq(jitted_value, expected, &module.atom_table),
+        "the x1 resident must be refreshed from machine.x after the mid-block deopt"
+    );
+    assert!(
+        beam_term::eq(interpreted_value, jitted_value, &module.atom_table),
+        "the interpreter and the native tier must agree across the deopt"
+    );
+}
+
 #[test]
 fn the_multi_register_fast_path_does_not_consult_the_bif_hook() {
     // All three `gc_bif '+'/2`s read their operands (and write the result) through

@@ -33,8 +33,9 @@ use beam_loader::TestKind;
 /// The codegen records what it actually inlined here so the artifact
 /// ([`CompiledFunctions`]) can expose it: the highest natively addressed x-register
 /// (the driver's native-entry guard reads it), the set of inlined `test` kinds, the
-/// set of inlined small-int `gc_bif` ops and the set of inlined comparison BIFs
-/// (evidence that the fast paths — not `jit_step_one` — ran).
+/// set of inlined small-int `gc_bif` ops, the set of inlined comparison BIFs, and how
+/// many `select_val`s / `swap`s were inlined (evidence that the fast paths — not
+/// `jit_step_one` — ran).
 #[derive(Default)]
 pub(super) struct CodegenReport {
     /// The highest x-register index any inlined instruction addresses natively.
@@ -55,6 +56,10 @@ pub(super) struct CodegenReport {
     /// The list-read kinds inlined natively (deduped, in first-inlined order):
     /// `"get_list"` / `"get_hd"` / `"get_tl"`.
     pub(super) inlined_list_reads: Vec<&'static str>,
+    /// How many `swap` instructions were inlined natively.
+    pub(super) inlined_swaps: usize,
+    /// How many local tail calls (`call_only`) were inlined natively.
+    pub(super) inlined_tail_calls: usize,
 }
 
 impl CodegenReport {
@@ -105,5 +110,15 @@ impl CodegenReport {
         if !self.inlined_list_reads.contains(&kind) {
             self.inlined_list_reads.push(kind);
         }
+    }
+
+    /// Record that a `swap` was inlined natively.
+    pub(super) fn inlined_swap(&mut self) {
+        self.inlined_swaps += 1;
+    }
+
+    /// Record that a local tail call (`call_only`) was inlined natively.
+    pub(super) fn inlined_tail_call(&mut self) {
+        self.inlined_tail_calls += 1;
     }
 }
