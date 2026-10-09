@@ -551,7 +551,8 @@ silently-accepted wrong value:
 - **`tests/chunks.rs`:** walks the whole installed corpus asserting every chunk id is classified
   (`chunk::classify`) and every module loads (unknown id ⇒ failure naming it); positive controls require
   all 15 corpus ids to appear so the pass cannot be vacuous; pins key ids' classes row-by-row and
-  cross-checks the decoded `Attr` against the runtime `module_info(attributes)` on `gen_server`/`kernel`.
+  cross-checks the decoded `Attr` against the runtime `module_info(attributes)` on `gen_server`/`kernel`,
+  plus a whole-corpus `CInf`/`Meta` decode-and-re-encode byte-exact round-trip.
 - **`tests/literals.rs`:** both `LitT` framings decode to identically-encoded terms; structural assertions
   for every literal kind; plus a whole-corpus sweep re-encoding every decoded literal byte-exactly and
   comparing semantically against `literals_oracle.escript` for map literals whose key order is non-canonical.
@@ -602,21 +603,22 @@ silently-accepted wrong value:
 - `src/container.rs` → `FOR1` header + chunk directory walk, `ChunkId`, raw `Chunk` iteration
 - `src/chunk/mod.rs` → chunk-parse dispatch + the assembled raw chunk set
 - `src/chunk/atom.rs` → `AtU8` parser (UTF-8, index 0 = NIL)
-- `src/chunk/code.rs` → `Code` chunk header (format/max_opcode/label_count/function_count)
+- `src/chunk/code.rs` → `Code` chunk header (format/max_opcode/label_count/function_count) + the `max_opcode` sanity window (`MIN_SUPPORTED_MAX_OPCODE` = 169, `MAX_GENERIC_OPCODE` = 193)
 - `src/chunk/table.rs` → `ExpT` / `LocT` / `ImpT` / `FunT` parsers (raw entries; `parse_locals` reuses the export reader)
 - `src/chunk/line.rs` → `Line` table parser
 - `src/chunk/types.rs` → `Type` chunk parser (`TypeTable`)
 - `src/chunk/literal.rs` → `LitT` framing parser (both the verbatim and the zlib/RFC1950-compressed form) → raw ETF payloads
 - `src/chunk/classify.rs` → `ChunkClass`/`ChunkKind`/`CHUNK_KINDS`/`classify`: the per-chunk-id classification (parsed+exposed / parsed-as-raw / tooling-only + reason) the corpus checker test enforces
-- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` raw capture (`DbgB`/`Dbgi` deliberately unparsed, tooling-only)
+- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` raw capture (`CInf`/`Meta` are decoded one layer up via `src/decoded.rs`; `DbgB`/`Dbgi` deliberately unparsed, tooling-only)
 - `src/chunk/record.rs` → `Recs` parser: `RawRecord`/`RawRecordField`/`RawRecordDefault` + `parse` (raw-tag defaults, declaration order)
-- `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`)
+- `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`) + the derived `OnceLock` arity lookup table `src/decode.rs` dispatches on
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
 - `src/instr.rs` → the typed instruction vocabulary: `Instr` (107 variants) + `TestKind`
 - `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `RecordDefinition`/`RecordField`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
 - `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap (+ the shared `decode_terms`/`decode_terms_at_capacity` retry path)
-- `src/attributes.rs` → `AttributeTable` / `SharedAttributeTable`: the decoded `Attr` chunk term (`Module::attributes_term`/`attribute_by_name`) for `module_info(attributes)`
+- `src/decoded.rs` → `DecodedTerm` / `SharedDecodedTerm`: the shared eagerly-decoded small-term holder (`terms`/`by_name`/`raw`) the `Attr`/`CInf`/`Meta` chunk tables build on
+- `src/attributes.rs` → `AttributeTable` / `SharedAttributeTable` (a `DecodedTerm` alias): the decoded `Attr` chunk term (`Module::attributes_term`/`attribute_by_name`) for `module_info(attributes)`
 - `src/lower.rs` → `build_module` + module assembly (re-exports the `group` helpers)
 - `src/lower/group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks`
 - `src/lower/fuse.rs` → `fuse` (the loader's only superinstruction pass: adjacent `Deallocate;Return` → `DeallocateReturn`)
@@ -633,7 +635,7 @@ silently-accepted wrong value:
 - `tests/native_record.rs` → the OTP-29 native-record family (186-191) over the committed `nr_def`/`nr_use` fixtures + the `erl_eval` `is_any_native_record` positive control + a stdlib/kernel/compiler sweep asserting no family member lowers to `Instr::Generic`
 - `tests/line_info.rs` → typed `executable_line`/`debug_line` (the `linecov`/`dbgline` fixtures) + line-table/`func_info` preservation
 - `tests/bs_test_tail.rs` → typed `bs_test_tail2` over the `bstail` fixture
-- `tests/chunks.rs` → the whole-corpus chunk-id classification checker + the `Attr` oracle cross-check
+- `tests/chunks.rs` → the whole-corpus chunk-id classification checker + the `Attr`/`CInf`/`Meta` oracle round-trip cross-check
 - `tests/literals.rs` → the two `LitT` framings + the whole-corpus literal round-trip/oracle sweep
 - `tests/load_cost.rs` → the committed module-load-cost measurement (ns/instruction, bytes/second)
 - `tests/fixtures/{nr_def,nr_use,linecov,dbgline,bstail}.{erl,beam}` → native-record / line / test-tail oracle fixtures
