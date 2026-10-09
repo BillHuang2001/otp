@@ -138,20 +138,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 
 ## Known Issues / Notes for Agents
 - **The Rust side is a partial runtime; today's gate is 0 mismatches** (1213-case corpus). The **module-run** cases (embedded sources, the native-record group, the NIF `.so` groups, the C-driver groups, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **1213 total · 1203 agree · 0 mismatch · 10 unsupported · 0 skipped**; all ten gaps are recorded in `known-gaps.txt` (`allowed=10 unauthorized=0 stale=0`), so `gate.sh` → exit `0`.
-  - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
-
-| Contract | total | agree | mismatch | unsupported | skipped |
-|---|---|---|---|---|---|
-| A.1 | 154 | 154 | 0 | 0 | 0 |
-| A.2 | 326 | 326 | 0 | 0 | 0 |
-| A.3 | 116 | 116 | 0 | 0 | 0 |
-| A.4 | 117 | 117 | 0 | 0 | 0 |
-| A.5 | 251 | 247 | 0 | 4 | 0 |
-| A.6 | 44 | 44 | 0 | 0 | 0 |
-| A.7 | 330 | 325 | 0 | 5 | 0 |
-| A.8 | 64 | 64 | 0 | 0 | 0 |
-| A.9 | 155 | 154 | 0 | 1 | 0 |
+  - **Gate state (verified against the runtime code, not the checked-in report):** only **3** cases are genuine capability gaps — `wire/new_fun_ext_encode`, `proc_signals/statistics_runtime_unsupported` and `boot/proc_lib_start_link_blocks_the_boot_path`. The `erlang:statistics/1` `reductions`/`exact_reductions`/`context_switches`/`io`/`scheduler_wall_time` counters and the three `wire_extra/eval_*_unsupported` `-eval` literal/parser shapes are now served by the runtime, so those cases AGREE and their `known-gaps.txt` entries are **stale**. `gate.sh` (authoritative) therefore exits `3` until the allowlist is refreshed to the 3 real gaps; the checked-in `GAPS.md` still reports the pre-fix `unsupported=10` and must be regenerated with `--gaps`. Re-run `gate.sh` for the live per-contract split.
 
 - **The 10 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so each flips to `agree` automatically once its gap closes:
   - **`local_fun`:** `wire/new_fun_ext_encode` (A.5, `beam_rt: unsupported: local_fun`) — a lambda is an evaluator closure that the `beam_rt` `-eval` path cannot give a faithful `NEW_FUN_EXT` image. `beam_codec` has `Encoder::with_fun_identity`; the remaining blocker is runtime wiring (`beam_rt`).
