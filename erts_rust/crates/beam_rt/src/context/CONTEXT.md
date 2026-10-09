@@ -53,7 +53,7 @@ It performs `find_module_file` + `code_server.load` **on demand** for an uncache
 - **`local_fun_target`'s free-vars-then-args closure argument order** (`mod.rs`) is flagged in the `beam_engine` handoff list as a possible mis-entry of `gen_server`'s init closure; neither boot stop above implicates it. It needs a focused test before any change.
 
 ## Routing Table
-* `mod.rs` → `RuntimeContext` (fields, `new`/`with_output`/`for_process`/`pid`/`eval_heap`/`enter_module`/`run_export`) + the **one** `impl ExecutionContext` (`call_bif`'s dispatch order, `call_registered`, `apply_fun`, `send_message`/`send_fragmented_message`, `alloc_words`/`heap_available`), plus the `uses_*` predicates.
+* `mod.rs` → `RuntimeContext` (fields, `new`/`with_output`/`for_process`/`pid`/`eval_heap`/`enter_module`/`run_export`) + the **one** `impl ExecutionContext` (`call_bif`'s dispatch order, `call_registered`, `apply_fun`, `send_message`/`send_fragmented_message`, `alloc_words`/`heap_available`), plus the `uses_*` predicates and the inline `#[cfg(test)] mod blocking_fun_apply` (the `run_label_blocking` discriminator).
 * `bridges.rs` → the nine bridges (`DictBridge`/`ProcessBridge`/`NifBridge`/`RecordBridge`/`SendBridge`/`ModuleInfoBridge`/`PersistentTermBridge`/`RuntimeHooksBridge`/`FunBridge`) + `NodeIdentity` + `local_fun_identity`/`module_md5`.
 * `fun_identity.rs` → `FunIdentityBridge`, the `NEW_FUN_EXT` (`112`) identity of a compiled module's local (`make_fun3`) fun.
 * `gc.rs` → the engine's heap-admission point (`ExecutionContext::ensure_heap`) and the `alloc_words`/`heap_available` seams for a *scheduled* process; the runtime-level GC state/accounting/valves are [`../runtime/gc.rs`](../runtime/CONTEXT.md).
