@@ -697,9 +697,10 @@ still reproduces today's collector exactly.
   has no on-heap reference *term*: the safe reference is the `OffHeap::insert -> slot` index, never a
   raw pointer. Reach a refc binary's `BinRef` via the `ErlSubBits` `orig` slot, not pointer adjacency.
   Covered by `tests/stress_cross_generation.rs`.
-- **The runtime should surface `HeapInfo`** (`beam_rt`): `HeapInfo::of(&collector)` (or
-  `AnyCollector::heap_info()`) backs `erlang:process_info(Pid, garbage_collection)` and
-  `system_info(garbage_collection)`; `GARBAGE_COLLECTION_KEYS` is the oracle's key order.
+- **`HeapInfo` is surfaced by the runtime.** `beam_rt` builds it directly (`HeapInfo::new` and `HeapObservable`)
+  for `erlang:process_info(Pid, garbage_collection)` and `system_info(garbage_collection)`, in
+  `GARBAGE_COLLECTION_KEYS` order (`beam_rt/src/native/memory/mod.rs`, `src/info/memory.rs`); only
+  `AnyCollector::heap_info()` itself still has no production caller.
 - **Repo-root owned** (`../../CHANGE.md`): owed entries for the heap-sizing policy (the C-faithful
   per-collection growth/shrink, the `min_bin_vheap_words`/`fullsweep_after` fields and `HeapInfo`), the
   fragment support, and the measured GenImmix decision.
