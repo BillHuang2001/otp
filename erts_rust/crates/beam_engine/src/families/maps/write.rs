@@ -89,7 +89,7 @@ pub(super) fn put_map_assoc(
     // post-collection state and merge into a pair list that is only ever read.
     let extra = merge_slack_words(source, pairs);
     let atoms = &module.atom_table;
-    let result = terms::make_map(
+    let result = terms::make_map_rooted(
         machine,
         ctx,
         RootSet::ALL_LIVE,
@@ -146,7 +146,7 @@ pub(super) fn put_map_exact(
     // the merge uses the post-collection terms).
     let extra = merge_slack_words(source, pairs);
     let atoms = &module.atom_table;
-    let result = terms::make_map(
+    let result = terms::make_map_rooted(
         machine,
         ctx,
         RootSet::ALL_LIVE,

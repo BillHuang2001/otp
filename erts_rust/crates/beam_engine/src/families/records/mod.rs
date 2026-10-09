@@ -237,7 +237,7 @@ pub(crate) fn exec(
             }
 
             let result =
-                terms::make_tuple(machine, ctx, RootSet::ALL_LIVE, arity, extra, |m, slack| {
+                terms::make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, arity, extra, |m, slack| {
                     let source = read_operand_slack(m, src, slack)?;
                     let found = terms::tuple_arity(source)
                         .map_err(|_| error::unsupported("update_record: non-tuple source"))?;

@@ -21,6 +21,11 @@
 //! The map writer/reader: the flat-map builder [`make_flatmap`] and the general
 //! [`make_map`] (flat ≤ 32 keys, else a hashmap), plus the frozen-layout readers
 //! [`map_entries`]/[`is_hashmap`] that walk both representations.
+//!
+//! The classic [`make_flatmap`]/[`make_map`] take their already-read pairs and
+//! allocate through the plain [`ExecutionContext::alloc_words`]; their `*_rooted`
+//! twins reserve the block **before** a reader closure supplies the pairs, so a
+//! moving collector may relocate the operands in between ([`super::slack`]).
 use beam_common::{BeamError, Result};
 use beam_term::{thing, AtomTable, Eterm};
 
@@ -28,8 +33,60 @@ use super::{reserve, Slack, HAMT_ARRAY_SLOTS, HAMT_HEAD_ITEM_OFFSET, HAMT_NODE_I
 use crate::context::ExecutionContext;
 use crate::machine::Machine;
 
-/// Builds a small *flat* map term from the `capacity_pairs` pairs the `read` closure
-/// supplies (insertion order preserved).
+/// Builds a small *flat* map term from `pairs` (insertion order preserved).
+///
+/// The `[arityval(n), k0 … k(n-1), head, n, keys, v0 … v(n-1)]` layout is written
+/// by [`beam_term::thing::write_flatmap`]. Duplicate keys are not detected here
+/// (that needs term comparison).
+///
+/// This is the *flat-layout-only* builder: more than `MAP_SMALL_MAP_LIMIT` (32)
+/// pairs would need a **hashmap**, so it is rejected with
+/// [`crate::error::unsupported`] rather than writing a wrong term. Use [`make_map`]
+/// for the general builder, which selects the layout (flat ≤ 32 pairs, hashmap
+/// above) as the oracle does.
+pub fn make_flatmap(ctx: &mut dyn ExecutionContext, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
+    let n = pairs.len();
+    if n > MAP_SMALL_MAP_LIMIT {
+        return Err(crate::error::unsupported("map > 32 pairs (use make_map)"));
+    }
+    let hp = ctx.alloc_words(thing::flatmap_size_words(n))?;
+    // SAFETY: `alloc_words` returned `flatmap_size_words(n)` writable words and
+    // `n <= MAP_SMALL_MAP_LIMIT`, the preconditions `write_flatmap` documents.
+    Ok(unsafe { thing::write_flatmap(hp, pairs) })
+}
+
+/// Builds a map term from `pairs`, choosing the frozen layout by size — the
+/// general map builder (`put_map_assoc` / `put_map_exact`).
+///
+/// Delegates to [`beam_term::map::write_map`], which reproduces
+/// `erts_map_from_ks_and_vs` / `erts_maps_put`: duplicate keys are collapsed
+/// **last value wins**, a map of at most `MAP_SMALL_MAP_LIMIT` (32) distinct keys
+/// is written as a **flat** map (keys in `erts_cmp_flatmap_keys` order) and a
+/// larger one as a **hash map** (HAMT), so a map grown past the flat-map limit by
+/// compiled code becomes a correct hashmap, exactly as the oracle builds it. The
+/// pair order of `pairs` is irrelevant.
+///
+/// Storage is reserved with [`beam_term::map::map_words_capacity`]`(pairs.len())`
+/// — the exact flat-map size and a sound upper bound for a hashmap. Because
+/// `write_map` deduplicates its input, reserving for the *input* length is always
+/// sufficient for the produced map.
+pub fn make_map(
+    ctx: &mut dyn ExecutionContext,
+    pairs: &[(Eterm, Eterm)],
+    atoms: &AtomTable,
+) -> Result<Eterm> {
+    let hp = ctx.alloc_words(beam_term::map::map_words_capacity(pairs.len()))?;
+    // SAFETY: `alloc_words` returned `map_words_capacity(pairs.len())`
+    // exclusively-owned, writable words. `write_map` writes every word of the
+    // produced map and never more than that (deduplication can only shrink the
+    // map), the precondition its own `# Safety` section documents. The returned
+    // term borrows the arena storage the context keeps live.
+    let map = unsafe { beam_term::map::write_map(hp, pairs, atoms) }?;
+    Ok(map)
+}
+
+/// The **rooted** twin of [`make_flatmap`]: builds a small *flat* map term from the
+/// `capacity_pairs` pairs the `read` closure supplies (insertion order preserved).
 ///
 /// The `[arityval(n), k0 … k(n-1), head, n, keys, v0 … v(n-1)]` layout is written
 /// by [`beam_term::thing::write_flatmap`]. The block is reserved **rooted** for
@@ -40,10 +97,10 @@ use crate::machine::Machine;
 ///
 /// This is the *flat-layout-only* builder: more than `MAP_SMALL_MAP_LIMIT` (32)
 /// pairs would need a **hashmap**, so it is rejected with
-/// [`crate::error::unsupported`] rather than writing a wrong term. Use [`make_map`]
-/// for the general builder, which selects the layout (flat ≤ 32 pairs, hashmap
-/// above) as the oracle does.
-pub fn make_flatmap<R>(
+/// [`crate::error::unsupported`] rather than writing a wrong term. Use
+/// [`make_map_rooted`] for the general builder, which selects the layout (flat ≤ 32
+/// pairs, hashmap above) as the oracle does.
+pub fn make_flatmap_rooted<R>(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     live: u32,
@@ -74,9 +131,9 @@ where
     Ok(unsafe { thing::write_flatmap(hp, &pairs) })
 }
 
-/// Builds a map term from the `capacity_pairs` pairs the `read` closure supplies,
-/// choosing the frozen layout by size — the general map builder (`put_map_assoc` /
-/// `put_map_exact`).
+/// The **rooted** twin of [`make_map`]: builds a map term from the `capacity_pairs`
+/// pairs the `read` closure supplies, choosing the frozen layout by size — the
+/// general map builder (`put_map_assoc` / `put_map_exact`).
 ///
 /// Delegates to [`beam_term::map::write_map`], which reproduces
 /// `erts_map_from_ks_and_vs` / `erts_maps_put`: duplicate keys are collapsed
@@ -94,7 +151,7 @@ where
 /// deduplicates its input and writes at most `map_words_capacity(pairs.len())`
 /// words, which the reservation covers because the closure must not exceed
 /// `capacity_pairs` pairs.
-pub fn make_map<R>(
+pub fn make_map_rooted<R>(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     live: u32,

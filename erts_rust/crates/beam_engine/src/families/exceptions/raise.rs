@@ -63,7 +63,7 @@ pub(super) fn raise_error_tuple(
     // Reserve the reason block first, then re-read the value operand from the
     // post-collection machine state (a moving collector may run in the reserve).
     let extra = operand_slack_words(value);
-    let reason = terms::make_tuple(machine, ctx, RootSet::ALL_LIVE, 2, extra, |m, s| {
+    let reason = terms::make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, 2, extra, |m, s| {
         Ok(vec![make_atom(tag_atom), read_operand_slack(m, value, s)?])
     })?;
     let _ = install_class_atom(machine, module, ExceptionClass::Error);

@@ -19,7 +19,7 @@
 // %CopyrightEnd%
 
 //! The **rooted-allocation regression suite** (Handoff #11): the three proofs that
-//! every `terms::make_*` builder routes its storage through the **rooted** seam
+//! every `terms::*_rooted` builder routes its storage through the **rooted** seam
 //! ([`Machine::alloc_rooted`](crate::machine::Machine::alloc_rooted) →
 //! [`ExecutionContext::alloc_words_rooted`](crate::context::ExecutionContext::alloc_words_rooted))
 //! and stays correct when that seam runs a **moving** collector underneath it.
@@ -64,8 +64,8 @@ use beam_term::{big_parts, boxed_val, is_boxed_term, is_list, make_atom, make_sm
 use beam_term::{AtomTable, Eterm, TAG_PTR_MASK};
 
 use super::{
-    float_value, list_elements, make_float, make_list, make_map, make_tuple, reserve_slack, Sink,
-    tuple_arity, tuple_element,
+    float_value, list_elements, make_float_rooted, make_list_rooted, make_map_rooted,
+    make_tuple_rooted, reserve_slack, Sink, tuple_arity, tuple_element,
 };
 use crate::context::{ExecutionContext, MinimalContext, RootSet};
 use crate::machine::Machine;
@@ -489,13 +489,13 @@ fn workload_iteration(
     k2: Atom,
     i: i64,
 ) -> Result<()> {
-    let tuple = make_tuple(machine, ctx, RootSet::ALL_LIVE, 3, 0, |_, _| {
+    let tuple = make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, 3, 0, |_, _| {
         Ok(vec![make_small(i), make_small(i + 1), make_small(i + 2)])
     })?;
-    let list = make_list(machine, ctx, RootSet::ALL_LIVE, 3, 0, |_, _| {
+    let list = make_list_rooted(machine, ctx, RootSet::ALL_LIVE, 3, 0, |_, _| {
         Ok(vec![make_small(i), make_small(i + 1), make_small(i + 2)])
     })?;
-    let map = make_map(machine, ctx, RootSet::ALL_LIVE, 2, 0, atoms, |_, _| {
+    let map = make_map_rooted(machine, ctx, RootSet::ALL_LIVE, 2, 0, atoms, |_, _| {
         Ok(vec![
             (make_atom(k1), make_small(i)),
             (make_atom(k2), make_small(i + 1)),
@@ -592,7 +592,7 @@ fn a_moving_collection_during_the_reserve_keeps_a_built_tuple_correct() {
 
     let arity = 4u32;
     for i in 0..arity {
-        let f = make_float(&mut machine, &mut ctx, f64::from(i) + 0.5).expect("float");
+        let f = make_float_rooted(&mut machine, &mut ctx, f64::from(i) + 0.5).expect("float");
         machine.set_x(i, f).expect("x register");
     }
     let before: Vec<usize> = (0..arity)
@@ -600,7 +600,7 @@ fn a_moving_collection_during_the_reserve_keeps_a_built_tuple_correct() {
         .collect();
 
     let n_elems = arity as usize;
-    let tuple = make_tuple(
+    let tuple = make_tuple_rooted(
         &mut machine,
         &mut ctx,
         RootSet::ALL_LIVE,
@@ -652,7 +652,7 @@ fn a_rooted_reservation_survives_a_moving_collection_during_the_reserve() {
 
     // An operand the graph will reference: a float parked in a root so the
     // reservation's collection relocates it.
-    let float = make_float(&mut machine, &mut ctx, 2.5).expect("float");
+    let float = make_float_rooted(&mut machine, &mut ctx, 2.5).expect("float");
     machine.set_x(0, float).expect("x register");
     let float_before = machine.x(0).expect("float root").raw();
 
@@ -688,7 +688,7 @@ fn a_rooted_reservation_survives_a_moving_collection_during_the_reserve() {
     // Force a *later* collection: the whole graph block — whose nodes reference each
     // other by absolute address — is copied as a unit, so the collector must rebase
     // its interior cons-cell/node pointers too.
-    let _ = make_float(&mut machine, &mut ctx, 7.5).expect("second float");
+    let _ = make_float_rooted(&mut machine, &mut ctx, 7.5).expect("second float");
     assert!(ctx.collections >= 3, "no collection ran");
 
     // The graph survived the copy: every node, link and value is still in place.
@@ -727,14 +727,14 @@ fn the_mock_collector_relocates_a_root_across_every_collection() {
     let mut machine = Machine::new();
     let mut ctx = MovingContext::new();
 
-    let first = make_float(&mut machine, &mut ctx, 1.25).expect("float");
+    let first = make_float_rooted(&mut machine, &mut ctx, 1.25).expect("float");
     machine.set_x(0, first).expect("x register");
 
     // Each further rooted allocation collects, so the root moves — and keeps reading
     // as the same float at its new address.
     let mut seen = vec![first.raw()];
     for round in 0..4 {
-        let _ = make_float(&mut machine, &mut ctx, round as f64).expect("float");
+        let _ = make_float_rooted(&mut machine, &mut ctx, round as f64).expect("float");
         let now = machine.x(0).expect("root");
         assert_ne!(now.raw(), *seen.last().expect("a previous address"));
         assert_eq!(float_value(now).expect("float"), 1.25);

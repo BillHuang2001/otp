@@ -85,9 +85,10 @@ pub(crate) fn exec(
             // then read every element operand from the post-collection machine state.
             let n = elements.len();
             let extra: usize = elements.iter().map(operand_slack_words).sum();
-            let tuple = terms::make_tuple(machine, ctx, RootSet::ALL_LIVE, n, extra, |m, slack| {
-                read_operands_slack(m, elements, slack)
-            })?;
+            let tuple =
+                terms::make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, n, extra, |m, slack| {
+                    read_operands_slack(m, elements, slack)
+                })?;
             write_operand(machine, dst, tuple)?;
             Ok(Some(Step::Next))
         }
@@ -107,10 +108,13 @@ pub(crate) fn exec(
                 // Not a tuple, or the element index is out of range. The reason's
                 // value is re-read from `source` after the reason block's reserve.
                 _ => {
-                    let reason =
-                        terms::badmatch_reason(machine, ctx, RootSet::ALL_LIVE, module, |m, s| {
-                            read_operand_slack(m, source, s)
-                        })?;
+                    let reason = terms::badmatch_reason_rooted(
+                        machine,
+                        ctx,
+                        RootSet::ALL_LIVE,
+                        module,
+                        |m, s| read_operand_slack(m, source, s),
+                    )?;
                     machine.throw_error(reason).map(Some)
                 }
             }
@@ -143,10 +147,13 @@ pub(crate) fn exec(
             let label = match target {
                 Some(label) => label,
                 None if *fail == NO_FAIL => {
-                    let reason =
-                        terms::badmatch_reason(machine, ctx, RootSet::ALL_LIVE, module, |m, s| {
-                            read_operand_slack(m, tuple, s)
-                        })?;
+                    let reason = terms::badmatch_reason_rooted(
+                        machine,
+                        ctx,
+                        RootSet::ALL_LIVE,
+                        module,
+                        |m, s| read_operand_slack(m, tuple, s),
+                    )?;
                     return machine.throw_error(reason).map(Some);
                 }
                 None => *fail,

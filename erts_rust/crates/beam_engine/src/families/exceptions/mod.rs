@@ -212,7 +212,7 @@ pub(crate) fn exec(
                     // root `x(1)` *inside* the reader closure, so a moving collector
                     // running under the one rooted reservation cannot leave this build
                     // holding the stale copy read above.
-                    let tuple = terms::make_tuple(
+                    let tuple = terms::make_tuple_rooted(
                         machine,
                         ctx,
                         RootSet::ALL_LIVE,

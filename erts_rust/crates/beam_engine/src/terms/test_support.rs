@@ -20,12 +20,12 @@
 
 //! **Test-only** convenience wrappers over the rooted builders.
 //!
-//! The production builders ([`crate::terms::make_tuple`], …) take the `Machine` and
-//! a reader closure so a moving collector can relocate operands between the reserve
-//! and the read ([`super::slack`]). The crate's test suite, however, overwhelmingly
-//! builds terms from already-materialized `Eterm`s against a non-collecting
-//! [`MinimalContext`](crate::context::MinimalContext), where the closure machinery is
-//! pure noise.
+//! The production **rooted** builders ([`crate::terms::make_tuple_rooted`], …) take
+//! the `Machine` and a reader closure so a moving collector can relocate operands
+//! between the reserve and the read ([`super::slack`]). The crate's test suite,
+//! however, overwhelmingly builds terms from already-materialized `Eterm`s against a
+//! non-collecting [`MinimalContext`](crate::context::MinimalContext), where the
+//! closure machinery is pure noise.
 //!
 //! These wrappers keep that ergonomics: they take the pre-built operands, run the
 //! same rooted builder with a throwaway `Machine` (whose registers carry no operand
@@ -46,9 +46,9 @@ fn scratch() -> Machine {
     Machine::new()
 }
 
-/// Test wrapper for [`crate::terms::make_tuple`].
+/// Test wrapper for [`crate::terms::make_tuple_rooted`].
 pub(crate) fn make_tuple(ctx: &mut dyn ExecutionContext, elems: &[Eterm]) -> Result<Eterm> {
-    crate::terms::make_tuple(
+    crate::terms::make_tuple_rooted(
         &mut scratch(),
         ctx,
         RootSet::ALL_LIVE,
@@ -58,20 +58,20 @@ pub(crate) fn make_tuple(ctx: &mut dyn ExecutionContext, elems: &[Eterm]) -> Res
     )
 }
 
-/// Test wrapper for [`crate::terms::make_cons`].
+/// Test wrapper for [`crate::terms::make_cons_rooted`].
 pub(crate) fn make_cons(
     ctx: &mut dyn ExecutionContext,
     head: Eterm,
     tail: Eterm,
 ) -> Result<Eterm> {
-    crate::terms::make_cons(&mut scratch(), ctx, RootSet::ALL_LIVE, 0, |_, _| {
+    crate::terms::make_cons_rooted(&mut scratch(), ctx, RootSet::ALL_LIVE, 0, |_, _| {
         Ok((head, tail))
     })
 }
 
-/// Test wrapper for [`crate::terms::make_list`].
+/// Test wrapper for [`crate::terms::make_list_rooted`].
 pub(crate) fn make_list(ctx: &mut dyn ExecutionContext, elems: &[Eterm]) -> Result<Eterm> {
-    crate::terms::make_list(
+    crate::terms::make_list_rooted(
         &mut scratch(),
         ctx,
         RootSet::ALL_LIVE,
@@ -81,7 +81,7 @@ pub(crate) fn make_list(ctx: &mut dyn ExecutionContext, elems: &[Eterm]) -> Resu
     )
 }
 
-/// Test wrapper for [`crate::terms::make_fun`].
+/// Test wrapper for [`crate::terms::make_fun_rooted`].
 pub(crate) fn make_fun(
     ctx: &mut dyn ExecutionContext,
     arity: u32,
@@ -89,7 +89,7 @@ pub(crate) fn make_fun(
     index: u32,
     free: &[Eterm],
 ) -> Result<Eterm> {
-    crate::terms::make_fun(
+    crate::terms::make_fun_rooted(
         &mut scratch(),
         ctx,
         RootSet::ALL_LIVE,
@@ -102,9 +102,9 @@ pub(crate) fn make_fun(
     )
 }
 
-/// Test wrapper for [`crate::terms::make_flatmap`].
+/// Test wrapper for [`crate::terms::make_flatmap_rooted`].
 pub(crate) fn make_flatmap(ctx: &mut dyn ExecutionContext, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
-    crate::terms::make_flatmap(
+    crate::terms::make_flatmap_rooted(
         &mut scratch(),
         ctx,
         RootSet::ALL_LIVE,
@@ -114,28 +114,28 @@ pub(crate) fn make_flatmap(ctx: &mut dyn ExecutionContext, pairs: &[(Eterm, Eter
     )
 }
 
-/// Test wrapper for [`crate::terms::make_float`].
+/// Test wrapper for [`crate::terms::make_float_rooted`].
 pub(crate) fn make_float(ctx: &mut dyn ExecutionContext, value: f64) -> Result<Eterm> {
-    crate::terms::make_float(&mut scratch(), ctx, value)
+    crate::terms::make_float_rooted(&mut scratch(), ctx, value)
 }
 
-/// Test wrapper for [`crate::terms::make_integer`].
+/// Test wrapper for [`crate::terms::make_integer_rooted`].
 pub(crate) fn make_integer(ctx: &mut dyn ExecutionContext, value: i64) -> Result<Eterm> {
-    crate::terms::make_integer(&mut scratch(), ctx, value)
+    crate::terms::make_integer_rooted(&mut scratch(), ctx, value)
 }
 
-/// Test wrapper for [`crate::terms::make_heap_binary`].
+/// Test wrapper for [`crate::terms::make_heap_binary_rooted`].
 pub(crate) fn make_heap_binary(ctx: &mut dyn ExecutionContext, bytes: &[u8]) -> Result<Eterm> {
-    crate::terms::make_heap_binary(&mut scratch(), ctx, bytes)
+    crate::terms::make_heap_binary_rooted(&mut scratch(), ctx, bytes)
 }
 
-/// Test wrapper for [`crate::terms::badmatch_reason`].
+/// Test wrapper for [`crate::terms::badmatch_reason_rooted`].
 pub(crate) fn badmatch_reason(
     ctx: &mut dyn ExecutionContext,
     module: &Module,
     value: Eterm,
 ) -> Result<Eterm> {
-    crate::terms::badmatch_reason(
+    crate::terms::badmatch_reason_rooted(
         &mut scratch(),
         ctx,
         RootSet::ALL_LIVE,

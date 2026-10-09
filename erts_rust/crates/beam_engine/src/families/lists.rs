@@ -80,7 +80,7 @@ pub(crate) fn exec(
     match instr {
         Instr::PutList { head, tail, dst } => {
             let extra = operand_slack_words(head) + operand_slack_words(tail);
-            let cons = terms::make_cons(machine, ctx, RootSet::ALL_LIVE, extra, |m, s| {
+            let cons = terms::make_cons_rooted(machine, ctx, RootSet::ALL_LIVE, extra, |m, s| {
                 Ok((
                     read_operand_slack(m, head, s)?,
                     read_operand_slack(m, tail, s)?,
@@ -146,7 +146,7 @@ fn badmatch(
     module: &Module,
     source: &beam_loader::Operand,
 ) -> Result<Eterm> {
-    terms::badmatch_reason(machine, ctx, RootSet::ALL_LIVE, module, |m, s| {
+    terms::badmatch_reason_rooted(machine, ctx, RootSet::ALL_LIVE, module, |m, s| {
         read_operand_slack(m, source, s)
     })
 }

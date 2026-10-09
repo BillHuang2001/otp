@@ -60,7 +60,7 @@ use crate::families::records::{exec, raw};
 use crate::interpreter::LabelMap;
 use crate::machine::Machine;
 use crate::terms::alloc_tests::MovingContext;
-use crate::terms::{float_value, make_float, reserve};
+use crate::terms::{float_value, make_float_rooted, reserve};
 use crate::Step;
 
 // ---------------------------------------------------------------------------
@@ -158,9 +158,9 @@ fn create_native_record_reads_its_update_values_after_the_reserve() {
 
     // The two update values are heap floats parked in the root set: the reserve runs
     // a collection that relocates both.
-    let va = make_float(&mut machine, &mut ctx, 1.5).expect("float a");
+    let va = make_float_rooted(&mut machine, &mut ctx, 1.5).expect("float a");
     machine.set_x(1, va).expect("root the value");
-    let vb = make_float(&mut machine, &mut ctx, 2.5).expect("float b");
+    let vb = make_float_rooted(&mut machine, &mut ctx, 2.5).expect("float b");
     machine.set_x(2, vb).expect("root the value");
     let before = [
         machine.x(1).expect("x(1)").raw(),
@@ -224,7 +224,7 @@ fn create_native_record_keeps_an_unupdated_field_default_across_the_reserve() {
     let mut machine = Machine::with_max_register(4);
     let mut ctx = MovingContext::new();
 
-    let va = make_float(&mut machine, &mut ctx, 1.5).expect("float a");
+    let va = make_float_rooted(&mut machine, &mut ctx, 1.5).expect("float a");
     machine.set_x(1, va).expect("root the value");
     let before = machine.x(1).expect("x(1)").raw();
 
@@ -286,7 +286,7 @@ fn update_native_record_reads_the_source_and_its_values_after_the_reserve() {
     machine.set_x(0, source).expect("root the source");
 
     // An update value the reserve's collection will relocate (rooted at x(1)).
-    let value = make_float(&mut machine, &mut ctx, 2.5).expect("float");
+    let value = make_float_rooted(&mut machine, &mut ctx, 2.5).expect("float");
     machine.set_x(1, value).expect("root the value");
 
     let source_before = machine.x(0).expect("x(0)").raw();

@@ -43,7 +43,7 @@ use crate::context::ExecutionContext;
 use crate::machine::Machine;
 use crate::operand::write_operand;
 use crate::predicates;
-use crate::terms::make_float;
+use crate::terms::make_float_rooted;
 use crate::Step;
 
 use super::{raise_badarith, read_value};
@@ -101,7 +101,7 @@ pub(super) fn fconv(
 /// value that is not a finite double. A non-number is the raise too.
 fn conv_to_float(machine: &mut Machine, ctx: &mut dyn ExecutionContext, source: Eterm) -> Result<Conv> {
     if is_small(source) {
-        return Ok(Conv::Value(make_float(machine, ctx, signed_value(source) as f64)?));
+        return Ok(Conv::Value(make_float_rooted(machine, ctx, signed_value(source) as f64)?));
     }
     if predicates::is_float(source) {
         // Float → float is the C `LOAD_DOUBLE` path: the value is unchanged.
@@ -112,7 +112,7 @@ fn conv_to_float(machine: &mut Machine, ctx: &mut dyn ExecutionContext, source: 
         // conversion; `None` is the C's `< 0` (the magnitude is too large for a
         // finite double), which `i_fconv` turns into `badarith`.
         return Ok(match big_to_f64(source) {
-            Some(value) => Conv::Value(make_float(machine, ctx, value)?),
+            Some(value) => Conv::Value(make_float_rooted(machine, ctx, value)?),
             None => Conv::BadArith,
         });
     }

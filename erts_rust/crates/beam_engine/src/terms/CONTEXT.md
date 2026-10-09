@@ -9,12 +9,42 @@ It is the crate's — and the widened interpreter's — **single point of raw-he
 `predicates`). Only the **heap binary** family has no `beam_term` owner and hand-rolls its
 layout here, pinned to the C ground truth.
 
+## Two builder flavours: classic (public) and `*_rooted`
+The module exposes **both** an allocation seam's worth of builders, side by side, and both are
+public:
+
+- **Classic builders — the public API consumed cross-crate** (`beam_rt`, the integration tests
+  under `tests/**`). Signatures are the frozen baseline ones and each obtains its storage with a
+  plain `ExecutionContext::alloc_words`:
+  `make_tuple(ctx, elems)`, `make_cons(ctx, head, tail)`, `make_list(ctx, elems)`,
+  `badmatch_reason(ctx, module, value)`, `make_heap_binary(ctx, bytes)`, `make_float(ctx, v)`,
+  `make_integer(ctx, v)`, `make_flatmap(ctx, pairs)`, `make_map(ctx, pairs, atoms)`,
+  `make_fun(ctx, arity, uniq, index, free)`.
+  They take already-materialized operands and hold no term across the allocation, so they are
+  correct for any host whose `alloc_words` never collects (the seam contract reserves collecting
+  behaviour for `alloc_words_rooted`).
+- **`*_rooted` builders** — the engine's own term-construction path, reserving through the rooted
+  seam so a **moving** collector may run. Every one is
+  `(machine: &mut Machine, ctx, live: u32, …, read: R)` where `R: FnOnce(&Machine, &mut Slack)
+  -> Result<…>` supplies the operands read *after* the reserve:
+  `make_tuple_rooted(machine, ctx, live, n_elems, extra, read)`,
+  `make_cons_rooted(machine, ctx, live, extra, read)`,
+  `make_list_rooted(machine, ctx, live, n, extra, read)` (**one** contiguous `2n`-word
+  reservation), `badmatch_reason_rooted(machine, ctx, live, module, read)`,
+  `make_fun_rooted(…)`, `make_map_rooted`/`make_flatmap_rooted`, `make_float_rooted`,
+  `make_integer_rooted`, `make_heap_binary_rooted(machine, ctx, bytes)` (whole-X-file live).
+  They live beside their classic twins in the same file (`construct.rs`/`number.rs`/`map.rs`/
+  `fun.rs`) and are re-exported from `mod.rs`. `make_integer_unrooted` is the operand-immediate
+  path (never collects) and stays `pub(crate)`.
+
+`mod.rs` re-exports both families under their own names; a caller picks the seam it needs.
+
 ## The frozen allocation discipline: reserve → read → write
 `ExecutionContext::alloc_words_rooted` may be backed by a **moving** collector: it relocates
 every term reachable from the `RootSet` it is handed (`x`/`stack`/`fr`) and rewrites those
 slices **in place**. Therefore any `Eterm` *copy* held in a Rust local across a collecting
 allocation is a stale pointer, and a `*mut Eterm` from a previous allocation is dead. Every
-builder here follows (`slack.rs` module docs):
+`*_rooted` builder follows (`slack.rs` module docs):
 1. reserve the whole block **first** with *exactly one* rooted allocation (`reserve` /
    `reserve_slack`) — the collection happens here;
 2. then read every operand from the machine's **post-collection** state (a builder's `read`
@@ -31,14 +61,10 @@ this discipline: `rg -n 'ctx.alloc_words' src/families` is empty. The one sancti
 is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
 
 ## API Surface (`crate::terms::*`)
-- **Rooted builders** (`construct.rs`, `fun.rs`, `map.rs`, `number.rs`). Every builder is
-  `(machine: &mut Machine, ctx, live: u32, …, read: R)` where `R: FnOnce(&Machine, &mut Slack)
-  -> Result<…>` supplies the operands read *after* the reserve:
-  `make_tuple(machine, ctx, live, n_elems, extra, read)`,
-  `make_cons(machine, ctx, live, extra, read)`,
-  `make_list(machine, ctx, live, n, extra, read)` (**one** contiguous `2n`-word reservation),
-  `badmatch_reason(machine, ctx, live, module, read)`, `make_fun(...)`, `make_map`/`make_flatmap`,
-  `make_float`, `make_integer`, `make_heap_binary(machine, ctx, bytes)` (whole-X-file live).
+- **Classic builders** (public, unrooted) — listed in the section above; each allocates with
+  `ctx.alloc_words` and takes already-materialized operands.
+- **`*_rooted` builders** (public, rooted) — listed in the section above; each reserves once
+  through the rooted seam and reads its operands through a closure.
 - **`reserve(machine, ctx, n, live) -> *mut Eterm`** — the single rooted admission point.
 - **`reserve_slack(machine, ctx, n) -> Slack`** — reserve `n` words rooted and wrap the
   **whole** region in a `Slack`; the entry point for a multi-node build (below).
@@ -60,15 +86,15 @@ is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
   Wrong type / out-of-range ⇒ `BeamError::BadArg`; no reader panics.
 - Constants: `MAP_SMALL_MAP_LIMIT` (32, the flat-map/HAMT boundary), `HAMT_*` node offsets,
   `ERL_ONHEAP_BINARY_LIMIT` (64), `HEAP_BIN_HEAD_WORDS`, `WORD_BYTES`.
-- `test_support` (`#[cfg(test)]`) — wrappers preserving the old 2-arg ergonomics over a
-  throwaway `Machine`; **never** moving-collector-safe, so they exist only for tests. In-module
-  tests reach them with an explicit `use super::test_support::{…};` (an explicit import shadows
-  the glob one, which still supplies the readers/constants).
+- `test_support` (`#[cfg(test)]`) — wrappers preserving the old 2-arg ergonomics **over the
+  rooted builders**; they keep the plain names (`make_tuple`, `make_cons`, …) so a test module
+  doing `use super::test_support::{…}` / `use crate::terms::test_support as terms;` shadows the
+  classic glob names. **Never** moving-collector-safe, so they exist only for tests.
 - `alloc_tests` (`#[cfg(test)] pub(crate)`) — a mock semi-space **moving** collector
   (`MovingContext`) that relocates every term reachable from a `RootSet` and rewrites the root
-  slices in place, plus the tests proving (a) the builders route every allocation through
-  `alloc_words_rooted` and never through the unrooted seam, (b) a built tuple/list/map and a
-  one-reservation nested graph stay correct across a relocation, (c) peak live words stay
+  slices in place, plus the tests proving (a) the `*_rooted` builders route every allocation
+  through `alloc_words_rooted` and never through the unrooted seam, (b) a built tuple/list/map
+  and a one-reservation nested graph stay correct across a relocation, (c) peak live words stay
   bounded under collection while the unrooted arena grows linearly in N. It is `pub(crate)` so
   the family suites reuse it: `../families/records/tests/rooted.rs` and
   `../families/bitstrings/matching/rooted.rs` drive those two families under the same collector.
@@ -84,19 +110,23 @@ is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
 - Files ~1000 lines, split by responsibility.
 
 ## Routing Table
-- `mod.rs` → module wiring, the root re-exports and the layout constants.
+- `mod.rs` → module wiring, the root re-exports (classic **and** `*_rooted`) and the layout
+  constants.
 - `slack.rs` → the rooted reserve seam, `Slack` (bump cursor, `alloc_words`, `integer`),
   `reserve`, `reserve_slack`; the reserve→read→write contract in the module docs.
 - `sink.rs` → the `Sink` trait, `impl Sink for Slack` (rooted carve), `ContextSink` (unrooted),
   and the shared `write_tuple_at`/`write_list_at` node writers.
-- `construct.rs` → tuple/cons/list/`badmatch_reason`/heap-binary builders.
-- `number.rs` → `make_float`, `make_integer` (rooted) and `make_integer_unrooted` (the
-  operand-immediate path).
-- `map.rs` → flat-map/HAMT builder + `map_entries` walker.
-- `fun.rs` → the `ErlFunThing` builder/readers.
+- `construct.rs` → the classic tuple/cons/list/`badmatch_reason`/heap-binary builders **and**
+  their `*_rooted` twins.
+- `number.rs` → the classic `make_float`/`make_integer` **and** the `*_rooted` twins, plus
+  `make_integer_unrooted` (the operand-immediate path).
+- `map.rs` → the classic `make_flatmap`/`make_map` **and** the `*_rooted` twins, plus the
+  `map_entries` walker.
+- `fun.rs` → the classic `make_fun` **and** `make_fun_rooted`, plus the `ErlFunThing` readers.
 - `read.rs` → the tuple/cons/list/binary readers.
-- `tests.rs` → in-module unit tests; `test_support.rs` → the test-only ergonomic wrappers;
-  `alloc_tests.rs` → the mock moving collector + the rooted-hook/peak-words proofs.
+- `tests.rs` → in-module unit tests; `test_support.rs` → the test-only ergonomic wrappers (over
+  the rooted builders); `alloc_tests.rs` → the mock moving collector + the rooted-hook/peak-words
+  proofs.
 
 ## Handoff — the one call site still on the unrooted path (owner: `beam_rt`)
 `../machine/location.rs:277`/`:409` — the four `&self` accessors (`current_function`,
