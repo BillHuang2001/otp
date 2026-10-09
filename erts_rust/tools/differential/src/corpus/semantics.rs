@@ -26,6 +26,13 @@
 //! and the structural results through the `~w` rendering. Every golden here is the value
 //! the reference system ERTS (`erl`) actually prints for the expression under the probe
 //! wrapper ([`super::probe_expr`]).
+//!
+//! The `semantics/closure_*` cases pin the **closure calling convention**: a `fun`'s arguments
+//! are passed *before* its captured free variables, so a capturing fun applied to a non-atom
+//! argument — or a fun with several captures and several arguments of mixed types — only
+//! observes the reference value while those two slot groups stay distinct. The numeric one
+//! (`semantics/closure_capture_plus_numeric_arg`) pins the canonical `term_to_binary/1` image
+//! (contract A.2) as well.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -564,5 +571,285 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- the closure calling convention (arguments BEFORE the free variables) ---
+        //
+        // A `fun` whose free variables are *also* bound at the call site is the shape that
+        // regressed: the arguments and the captured environment are distinct slots of the
+        // closure's calling convention, so any confusion between them changes the value.
+        Case {
+            id: "semantics/closure_capture_plus_numeric_arg",
+            description: "a fun with a captured variable applied to a numeric argument \
+                          (arguments before free variables)",
+            contracts: &[Contract::LanguageSemantics, Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin Offset = 7, F = fun(X) -> X + Offset end, F(35) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,97,42>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/closure_capture_plus_tuple_arg",
+            description: "a fun capturing an atom, applied to a tuple argument",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin Tag = ok, F = fun({A,B}) -> {Tag, A+B} end, F({20,22}) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,42}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/closure_curried_nested_applied",
+            description: "a curried fun (a fun returning a fun) applied in two steps",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin Adder = fun(X) -> fun(Y) -> X + Y end end, (Adder(40))(2) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 42"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/closure_returned_from_fun_applied",
+            description: "a fun returned from another fun, bound and then applied",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin Mk = fun(N) -> fun(X) -> X * N end end, F = Mk(6), F(7) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 42"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/closure_multiple_captures",
+            description: "a fun carrying three captured variables, applied to two arguments",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin A = 2, B = 3, D = 4, F = fun(X,Q) -> A+B+D+X+Q end, F(10,23) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 42"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/closure_capture_and_arg_types_differ",
+            description: "captured atom + integer free variables, applied to a list argument",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin Tag = tagged, Factor = 3, F = fun(L) -> {Tag, [E*Factor || E <- L]} end, \
+                       F([1,2,3]) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {tagged,[3,6,9]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/closure_capture_arity_two_arg",
+            description: "a fun capturing an integer, applied to a tuple and an integer argument",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin Base = 100, F = fun({K,Val}, Mult) -> {K, Base + Val * Mult} end, \
+                       F({score,7}, 6) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {score,142}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/closure_capture_list_arg_atom",
+            description: "a fun capturing a list, applied to an atom argument",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin Prefix = [1,2], F = fun(TailAtom) -> {TailAtom, Prefix ++ [TailAtom]} end, \
+                       F(tag) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {tag,[1,2,tag]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/closure_passed_to_lists_map",
+            description: "a capturing fun passed to lists:map/2 keeps its environment",
+            contracts: &[Contract::LanguageSemantics, Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin Factor = 5, lists:map(fun(X) -> X * Factor end, [1,2,3]) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [5,10,15]"),
+                exit_code: 0,
+            },
+        },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    //! Invariants of the A.1 closure cases: every one is a self-terminating `Eval` case whose
+    //! golden is the value the reference system ERTS printed for it, and **no** golden renders a
+    //! per-VM-start handle (a pid/ref/port/fun image) that would drift on the next run.
+    //!
+    //! The table below pins the observable of each case (the closure **calling convention**:
+    //! arguments first, captured free variables after) so a regression of the convention is
+    //! caught by this group, not only by a live `differential run`.
+    use super::{group, Case, CaseKind, Contract, Golden, Probe};
+
+    /// `(id, kind label, golden stdout)` for every closure case added to the A.1 group.
+    const CLOSURE_CASES: &[(&str, &str, &str)] = &[
+        (
+            "semantics/closure_capture_plus_numeric_arg",
+            "term_to_binary",
+            "ok <<131,97,42>>",
+        ),
+        (
+            "semantics/closure_capture_plus_tuple_arg",
+            "value",
+            "ok {ok,42}",
+        ),
+        ("semantics/closure_curried_nested_applied", "value", "ok 42"),
+        (
+            "semantics/closure_returned_from_fun_applied",
+            "value",
+            "ok 42",
+        ),
+        ("semantics/closure_multiple_captures", "value", "ok 42"),
+        (
+            "semantics/closure_capture_and_arg_types_differ",
+            "value",
+            "ok {tagged,[3,6,9]}",
+        ),
+        (
+            "semantics/closure_capture_arity_two_arg",
+            "value",
+            "ok {score,142}",
+        ),
+        (
+            "semantics/closure_capture_list_arg_atom",
+            "value",
+            "ok {tag,[1,2,tag]}",
+        ),
+        (
+            "semantics/closure_passed_to_lists_map",
+            "value",
+            "ok [5,10,15]",
+        ),
+    ];
+
+    fn find(id: &str) -> Case {
+        group()
+            .into_iter()
+            .find(|case| case.id == id)
+            .unwrap_or_else(|| panic!("case {id} is not registered in the A.1 group"))
+    }
+
+    #[test]
+    fn closure_cases_are_registered_eval_cases_with_the_expected_golden() {
+        for (id, label, stdout) in CLOSURE_CASES {
+            let case = find(id);
+            assert!(
+                case.contracts.contains(&Contract::LanguageSemantics),
+                "case {id}: a closure case is A.1 language semantics"
+            );
+            assert!(!case.description.is_empty(), "case {id} has no description");
+            assert_eq!(case.kind_label(), *label, "case {id}");
+            assert_eq!(
+                case.golden,
+                Golden {
+                    stdout: Some(stdout),
+                    exit_code: 0
+                },
+                "case {id}"
+            );
+            let CaseKind::Eval {
+                expr,
+                extra_argv,
+                probe,
+            } = case.kind
+            else {
+                panic!("case {id}: a closure case must be an eval case");
+            };
+            assert!(extra_argv.is_empty(), "case {id} takes no extra argv");
+            assert!(
+                !expr.is_empty() && !expr.contains('\n'),
+                "case {id} has a suspicious expression"
+            );
+            assert!(
+                expr.contains("fun("),
+                "case {id}: a closure case must build a fun, got {expr}"
+            );
+            assert_eq!(
+                probe,
+                if *label == "term_to_binary" {
+                    Probe::TermToBinary
+                } else {
+                    Probe::Value
+                },
+                "case {id}: the kind label and the probe agree"
+            );
+        }
+    }
+
+    #[test]
+    fn closure_goldens_never_render_a_per_vm_start_handle() {
+        for case in group() {
+            let golden = case.golden.stdout.expect("every case pins a golden");
+            for volatile in ["<", "#Ref<", "#Port<", "#Pid<", "#Fun<"] {
+                if volatile == "<" {
+                    // Only the stable ETF image (`<<131,…>>`), never a raw pid/ref/port/fun.
+                    assert!(
+                        !golden.contains('#'),
+                        "case {}: unexpected handle rendering in golden {golden:?}",
+                        case.id
+                    );
+                    continue;
+                }
+                assert!(
+                    !golden.contains(volatile),
+                    "case {}: golden {golden:?} renders {volatile}",
+                    case.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_closure_group_pins_argument_and_capture_slots_separately() {
+        // The shape that regressed: a free variable bound at the call site **and** a non-atom
+        // argument. The capturing fun must be applied to something that is not an atom, so a
+        // swapped argument/capture slot changes the result instead of coincidentally matching.
+        let case = find("semantics/closure_capture_plus_numeric_arg");
+        let expr = case.expr().expect("eval case");
+        assert!(expr.contains("Offset = 7"), "case: {expr}");
+        assert!(expr.contains("F(35)"), "case: {expr}");
+        let case = find("semantics/closure_capture_plus_tuple_arg");
+        let expr = case.expr().expect("eval case");
+        assert!(expr.contains("Tag = ok"), "case: {expr}");
+        assert!(expr.contains("F({20,22})"), "case: {expr}");
+    }
 }
