@@ -60,8 +60,7 @@ use super::{
     copy_out_list, element_pos, finish_chunk, resolve, restore_table, take_table_gated,
 };
 
-/// Registers the reverse select family (the keys `src/runtime/other.rs` leaves as
-/// typed `RuntimeHooks` gaps until a host adopts them).
+/// Registers the reverse select family (`ets:select_reverse/1,2,3`).
 pub(super) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "select_reverse", 1, select_reverse_1);
     reg.register("ets", "select_reverse", 2, select_reverse_2);
