@@ -116,8 +116,8 @@
 //!   is not completely independent of `N` (the loop's memory footprint grows with the
 //!   iteration count), so a run at other points is a different measurement.
 //! * `$ERTS_STDLIB_DIR` - passed to the child when set, else discovered *cheaply* from the
-//!   `erl` on `$PATH` (a filesystem walk - never a spawn), because an unset value costs
-//!   the child one `erl` start-up per run.
+//!   `erl` on `$PATH` (a filesystem walk - never a spawn), mirroring the child's own native
+//!   resolution of the system code path.
 //!
 //! A missing prerequisite (`erlc`, a built runtime binary) is a **loud skip that exits 0**
 //! - never a silent pass, and never a panic. A workload that does not print the value it
@@ -328,7 +328,7 @@ fn print_header(runtime: &Path, beam: &Path, n1: u64, stdlib: Option<&Path>) {
         "  ERTS_STDLIB_DIR:  {}",
         match stdlib {
             Some(dir) => dir.display().to_string(),
-            None => "<unset: the child spawns `erl` once per run>".to_string(),
+            None => "<unset: the child resolves the system code path itself>".to_string(),
         }
     );
     println!();
@@ -675,14 +675,14 @@ fn other_profile(profile_dir: &Path) -> &'static str {
 }
 
 /// A `stdlib` application directory the child can be pointed at with `$ERTS_STDLIB_DIR`,
-/// when one is discoverable **without running `erl`** - that spawn is precisely the
-/// start-up cost this avoids.
+/// when one is discoverable **without running `erl`** - the same filesystem layout the
+/// child's own native probe reads.
 ///
 /// `$ERTS_STDLIB_DIR` wins when it is already set and holds `lists.beam`; otherwise the
 /// `erl` on `$PATH` is resolved to a filesystem path (never executed) and its ancestors
 /// are scanned for `lib/stdlib-*/ebin/lists.beam` - the layout both a distro installation
 /// and a Nix store use. `$ERL_TOP` is tried last. `None` means the child resolves the
-/// code path itself (one `erl` spawn per run).
+/// code path itself.
 fn discover_stdlib() -> Option<PathBuf> {
     if let Some(dir) = env::var_os("ERTS_STDLIB_DIR") {
         let path = PathBuf::from(dir);
@@ -809,7 +809,7 @@ fn print_usage() {
     println!("environment:");
     println!("  PERF_BASELINE_ADD_NS   recorded ns/call for pc:add/2 (adds the comparison columns)");
     println!("  PERF_BASELINE_LOOP_NS  recorded ns/call for pc:loop/2 (adds the comparison columns)");
-    println!("  ERTS_STDLIB_DIR        the system stdlib directory, else discovered from `erl`");
+    println!("  ERTS_STDLIB_DIR        the system stdlib directory, else discovered from the filesystem");
 }
 
 /// `duration` in milliseconds.

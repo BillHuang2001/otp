@@ -83,9 +83,9 @@ const ALLOCATIONS: i64 = 100_000;
 /// A runtime with the fixture loaded and its boot sequence run.
 ///
 /// `boot` (and therefore every `spawn_process`, which boots on demand) resolves the system
-/// code path by asking the system `erl`, so a tree without the system installation cannot run
-/// this suite at all -- reported as a **loud skip** by [`support::require_oracle`], never a
-/// silent pass.
+/// code path from the filesystem (the system `erl` only when no installation is discoverable),
+/// so a tree without the system installation cannot run this suite at all -- reported as a
+/// **loud skip** by [`support::require_oracle`], never a silent pass.
 fn runtime_with(beam: &str) -> Option<Runtime> {
     support::require_oracle("preempt")?;
     let mut rt = Runtime::with_defaults().expect("the default runtime");

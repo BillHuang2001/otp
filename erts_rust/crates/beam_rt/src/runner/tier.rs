@@ -81,8 +81,8 @@
 //! The tier costs nothing observable and never regresses a workload, so the **default is
 //! [`JitMode::Auto`]** — the JIT exactly where the soundness predicate proves the entry
 //! module free of a module-context switch, the always-correct interpreter everywhere else.
-//! Measured on the release build with `$ERTS_STDLIB_DIR` set (so no per-process `erl`
-//! start-up is included), alternating runs: **min / median wall seconds**:
+//! Measured on the release build with no per-process `erl` start-up (the system code path
+//! resolves natively from the filesystem), alternating runs: **min / median wall seconds**:
 //!
 //! | workload | shape | interpreter | `auto` |
 //! |---|---|---|---|

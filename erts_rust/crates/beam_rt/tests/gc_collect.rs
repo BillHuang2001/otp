@@ -94,9 +94,9 @@ const LOOP_DEADLINE: Duration = Duration::from_secs(120);
 /// A runtime with `beam` loaded and the boot sequence run.
 ///
 /// `boot` (and therefore every `spawn_process`, which boots on demand) resolves the system
-/// code path through the system `erl` (unless `$ERTS_STDLIB_DIR` is set), so a tree without
-/// the system installation cannot run this suite — reported as a **loud skip** by
-/// [`support::require_oracle`], never a silent pass.
+/// code path natively from the filesystem (the system `erl` only when no installation is
+/// discoverable), so a tree without the system installation cannot run this suite — reported
+/// as a **loud skip** by [`support::require_oracle`], never a silent pass.
 fn runtime_with(beam: &str) -> Option<Runtime> {
     support::require_oracle("gc_collect")?;
     let mut rt = Runtime::with_defaults().expect("the default runtime");
