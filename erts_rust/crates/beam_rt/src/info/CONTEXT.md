@@ -65,8 +65,11 @@ different — from the oracle's run-time figure; the same rule `erlang:processes
 `ports/0` already follows; these must **never** be "fixed" to a hardcoded oracle number):
 `atom_count` (atom-table length), `process_count` (process-table length), `port_count`
 (live `PortRegistry` length), `ets_count` (live table-registry length), `allocated_areas`
-(every value derived from this runtime's own counters; items with no counterpart are an
-honest `0`), `heap_sizes` (`beam_gc::heap_sizes`), `logical_processors` / `_available` /
+(one `size_of::<usize>()` slot per entry of this runtime's own live tables — `export_table` /
+`fun_table` from the loaded modules' `ExpT` exports / `FunT` lambda descriptors,
+`module_refs` / `module_table` / `loaded_code` from the loaded-module set, `dist_table` /
+`node_table` from `Runtime::dist_node()`; an item with no counterpart is an honest `0`),
+`heap_sizes` (`beam_gc::heap_sizes`), `logical_processors` / `_available` /
 `_online` (`available_parallelism`), `schedulers` / `schedulers_online` (`+S N` or the
 processor count), `scheduler_id` (1), `dirty_cpu_schedulers` / `_online` and
 `dirty_io_schedulers` (`+SDcpu`/`+SDio`, else 0), `scheduler_bindings` (`unbound` per
