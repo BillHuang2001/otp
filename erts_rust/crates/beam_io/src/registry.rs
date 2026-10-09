@@ -220,6 +220,13 @@ impl PortRegistry {
     /// where the end-of-file latch lives — while a write-closed flag on a port that never
     /// armed a write fd schedules nothing (the kernel reports `EPOLLHUP` as *both* closed
     /// edges, so a full close of a read-only port must not be mistaken for write readiness).
+    ///
+    /// A poll **error** reaches both armed directions, matching the C: the legacy reactor
+    /// re-triggers *every* selected event on `ERTS_POLL_EV_ERR` (`EPOLLERR | EPOLLHUP`,
+    /// `erl_poll.h:184`; `revents = state->active_events`, `erl_check_io.c:2018-2027`), so
+    /// [`Readiness::write_ready`] counts `error` too and a fully armed port gets an `Output`
+    /// task as well as an `Input` task. The armed-direction gate above is unchanged, so the
+    /// error bit cannot schedule a direction the driver never armed.
     pub fn schedule_readiness(&mut self, key: u64, readiness: Readiness) -> bool {
         let Some(port) = self.ports.get_mut(&key) else {
             return false;

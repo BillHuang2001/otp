@@ -36,7 +36,8 @@
 //!   deadline has passed, so a not-yet-due timer never runs early;
 //! * [`Readiness`] — the poller-readiness bits an event carries, and the rule that decides
 //!   which tasks it schedules (readability **or** read-EOF **or** an error schedules
-//!   `INPUT`; writability **or** write-EOF schedules `OUTPUT`);
+//!   `INPUT`; writability **or** write-EOF **or** an error schedules `OUTPUT` — a poll
+//!   error re-triggers *every* armed direction, see [`Readiness`]);
 //! * [`PortNotification`] / [`PortTaskOutcome`] — what an execution round reports back to
 //!   the runtime. This is the seam the runtime turns into `{Port, {data, Data}}` messages.
 //!
@@ -325,7 +326,16 @@ impl PortTaskQueue {
 /// [`Readiness`] is deliberately a plain, constructible value (unlike [`Ready`], whose
 /// fields the poller owns) so the reactor's scheduling rule can be exercised directly:
 /// `read_ready` is readability **or** a read half-close **or** an error, and `write_ready`
-/// is writability **or** a write half-close.
+/// is writability **or** a write half-close **or** an error.
+///
+/// The `error` bit reaching **both** directions mirrors the legacy reactor. `EPOLLERR` and
+/// `EPOLLHUP` are one mask there (`ERTS_POLL_EV_ERR`, `erts/emulator/sys/common/erl_poll.h:184`),
+/// and a poll error is answered by re-triggering **every** event that has been selected — `revents
+/// = state->active_events` — after which both the out and the in callback fire
+/// (`erts/emulator/sys/common/erl_check_io.c:2018-2027`, `:2099-2110`). So a pure `EPOLLERR`
+/// without `EPOLLHUP` schedules `INPUT` *and* `OUTPUT`, not just `INPUT`. The armed-direction
+/// gate still applies (see [`crate::PortRegistry::schedule_readiness`]), so a port that never
+/// armed a write fd still gets no output task.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Readiness {
     /// The descriptor reported readability.
@@ -350,8 +360,15 @@ impl Readiness {
     }
 
     /// Whether the mask schedules an [`PortTaskKind::Output`] task.
+    ///
+    /// `error` is included for the same reason [`Readiness::read_ready`] includes it: the C
+    /// reactor re-triggers *every* armed direction on a poll error (`ERTS_POLL_EV_ERR` is
+    /// `EPOLLERR | EPOLLHUP`, `erl_poll.h:184`; `revents = state->active_events`,
+    /// `erl_check_io.c:2018-2027`), so a pure error also reaches the driver's `ready_output`.
+    /// Whether an `Output` task is actually scheduled is still gated on the driver having
+    /// armed a write fd (see [`crate::PortRegistry::schedule_readiness`]).
     pub fn write_ready(self) -> bool {
-        self.writable || self.write_closed
+        self.writable || self.write_closed || self.error
     }
 
     /// Whether the mask schedules nothing at all.
@@ -412,8 +429,52 @@ mod tests {
         PortTaskKind, PortTaskQueue, Readiness, CONTEXT_REDS, PORT_REDS_EXECUTE, PORT_REDS_INPUT,
         PORT_REDS_OUTPUT, PORT_REDS_TIMEOUT,
     };
-    use crate::poller::Ready;
+    use crate::driver::{Driver, DriverContext};
+    use crate::drivers::FdDriver;
+    use crate::poller::{Interest, Poller, Ready, Token};
+    use crate::PortRegistry;
+    use beam_common::Result;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
+
+    /// A driver that arms **both** poll directions on one borrowed descriptor.
+    ///
+    /// [`FdDriver::pipe`] arms only `READABLE` (it registers its write fd only once there is
+    /// something to flush), so it cannot express "a port whose write direction is armed" — the
+    /// case a poll error must reach in both directions. This driver registers the descriptor
+    /// with [`Interest::BOTH`] and deregisters it on `stop`; the owning [`UnixStream`] owns
+    /// the fd, so the driver never closes it.
+    struct BothDirectionsDriver {
+        fd: RawFd,
+        token: Option<Token>,
+    }
+
+    impl Driver for BothDirectionsDriver {
+        fn name(&self) -> &str {
+            "both-directions-test"
+        }
+
+        fn start(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+            self.token = Some(ctx.register(self.fd, Interest::BOTH)?);
+            Ok(())
+        }
+
+        fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+            if let Some(token) = self.token.take() {
+                ctx.deregister(self.fd, token)?;
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn reduction_costs_match_the_legacy_constants() {
@@ -664,12 +725,15 @@ mod tests {
         assert!(eof.read_ready(), "EOF must still reach ready_input");
         assert!(!eof.write_ready());
 
-        // An error condition is read readiness too.
+        // An error condition is readiness for **both** directions: the C reactor re-triggers
+        // every armed event on `ERTS_POLL_EV_ERR` (`EPOLLERR | EPOLLHUP`).
         let err = Readiness {
             error: true,
             ..Readiness::default()
         };
         assert!(err.read_ready());
+        assert!(err.write_ready());
+        assert!(!err.is_idle());
 
         // A half-closed write side schedules the output task.
         let wclosed = Readiness {
@@ -683,6 +747,100 @@ mod tests {
         assert!(Readiness::default().is_idle());
         assert!(!Readiness::default().read_ready());
         assert!(!Readiness::default().write_ready());
+    }
+
+    #[test]
+    fn a_poll_error_schedules_both_directions() {
+        // The legacy reactor turns a poll error into *every* armed event:
+        // `ERTS_POLL_EV_ERR == EPOLLERR | EPOLLHUP` (`erl_poll.h:184`) and
+        // `revents = state->active_events` (`erl_check_io.c:2018-2027`), after which both the
+        // out and the in callback fire. A pure `EPOLLERR` (no `EPOLLHUP`) must therefore be
+        // ready in *both* directions here.
+        let err = Readiness {
+            error: true,
+            ..Readiness::default()
+        };
+        assert!(err.read_ready(), "a poll error reaches ready_input");
+        assert!(
+            err.write_ready(),
+            "a poll error reaches ready_output as well"
+        );
+        assert!(!err.is_idle());
+
+        // The pre-existing rule is unchanged: a pure close (no error bit) is still not write
+        // readiness, so a read-only port's full close schedules no `OUTPUT` task.
+        let eof = Readiness {
+            read_closed: true,
+            ..Readiness::default()
+        };
+        assert!(eof.read_ready() && !eof.write_ready());
+    }
+
+    #[test]
+    fn a_pure_poll_error_schedules_output_only_for_an_armed_write_direction() {
+        // The C's rule end to end: `ERTS_POLL_EV_ERR` (`EPOLLERR | EPOLLHUP`, `erl_poll.h:184`)
+        // re-triggers *every* selected event (`revents = state->active_events`,
+        // `erl_check_io.c:2018-2027`), so a fully armed fd fires both `oready` and `iready`
+        // (`:2099-2110`) — while only the directions actually selected are fired.
+        let mut poller = Poller::new().expect("a poll set");
+        let mut registry = PortRegistry::new();
+
+        // A port that armed BOTH directions: the error bit reaches `write_ready` too, so an
+        // `Output` task is scheduled alongside the `Input` task.
+        let (stream, _peer) = UnixStream::pair().expect("a socketpair");
+        let id = registry
+            .open(
+                &mut poller,
+                Box::new(BothDirectionsDriver {
+                    fd: stream.as_raw_fd(),
+                    token: None,
+                }),
+            )
+            .expect("the both-directions port opens");
+        let err = Readiness {
+            error: true,
+            ..Readiness::default()
+        };
+        assert!(registry.schedule_readiness(id.number(), err));
+        assert!(
+            registry
+                .get(id)
+                .expect("live")
+                .has_pending_task(PortTaskKind::Input),
+            "a poll error reaches the armed read direction"
+        );
+        assert!(
+            registry
+                .get(id)
+                .expect("live")
+                .has_pending_task(PortTaskKind::Output),
+            "a poll error reaches the armed write direction too"
+        );
+
+        // A read-only port (`FdDriver::pipe` arms only `READABLE`): the armed-direction gate
+        // keeps the error bit from scheduling a direction the driver never armed.
+        let read_only = registry
+            .open(&mut poller, Box::new(FdDriver::pipe().expect("a pipe")))
+            .expect("a second, read-armed port");
+        assert!(registry.schedule_readiness(read_only.number(), err));
+        assert!(registry
+            .get(read_only)
+            .expect("live")
+            .has_pending_task(PortTaskKind::Input));
+        assert!(
+            !registry
+                .get(read_only)
+                .expect("live")
+                .has_pending_task(PortTaskKind::Output),
+            "an unarmed write direction is never scheduled, whatever the readiness"
+        );
+
+        registry.close(&mut poller, id).expect("closes");
+        registry.close(&mut poller, read_only).expect("closes");
+        assert!(
+            poller.is_empty(),
+            "closing deregisters both ports' descriptors"
+        );
     }
 
     #[test]
