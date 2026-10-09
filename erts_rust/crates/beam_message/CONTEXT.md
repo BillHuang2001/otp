@@ -350,7 +350,8 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `BadArg` promptly at both tiny and huge destinations (and for `copy_struct_shared`) — never a hang;
   a deep **acyclic** graph is refused only by *capacity*, never mis-typed; and a walk of a copied graph
   proves **every** non-shared compound subterm lies inside the destination heap region (nothing still
-  points into the source).
+  points into the source) — the corpus includes a `SUB_BITS` match context, which the copier flattens
+  to a fresh on-heap-bitstring leaf the walk asserts lives in the destination.
 - `tests/sizing.rs` — **sized-then-copied exactness**: for a 13-shape corpus (small tuple, deep list,
   improper list, flat map, 64-key HAMT map, nested graph, Local/External fun, record, bitstring, MSO
   container, refc binary, a graph with a shared refc binary), a destination of exactly
