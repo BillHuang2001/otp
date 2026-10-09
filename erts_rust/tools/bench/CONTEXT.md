@@ -433,6 +433,35 @@ growing with `N` while the oracle stays flat. So the rust `foreign`/`list_walk` 
 these are **not** like-for-like memory comparisons. `slice` (one call per process, `N`=1) is the
 comparable per-process memory metric. The figures are in `RESULTS.md`.
 
+## Honesty audit — measurement-integrity notes (current state)
+
+No workload returns a hard-coded or estimated metric; a workload that fails to build/run is always
+`failed`/`skipped`, never a number (verified across `src/workloads/*.rs`, `src/compare.rs`,
+`src/report.rs`, `src/runtime.rs`). No `todo!`/`unimplemented!`/non-doc `unreachable!`, no `#[ignore]`.
+Remaining labelling wrinkles — none fabricates a value:
+
+- **`foreign` maps an `erlc` compile failure to `skipped(sources-missing)`** (`src/workloads/foreign.rs:560`):
+  when the sources *are* present but `erlc` fails, the row is a skip (the staging note carries the error),
+  not `failed` — a real compile regression of the foreign sources can read as a benign skip. Contrast
+  `list_walk`, which treats the identical shape as `failed(module-compile-failed)`
+  (`src/workloads/list_walk.rs:509`), and `slice`, which maps a failed fixture rebuild to
+  `skipped(fixture-missing)` (`src/workloads/slice.rs:560`).
+- **`erlc_compiler`'s `files_per_sec`/`loc_per_sec` divide the *attempted* file/LOC count** by the wall time
+  (`src/workloads/erlc_compiler.rs:296,300`: `total_files`/`total_loc` from `files.len()`), not the
+  `files_compiled` (produced `.beam`) count, so a partial `erlc` run overstates throughput relative to
+  the `files_compiled` row beside it. `elixir_compiler` uses the produced count
+  (`produced as f64 / seconds`).
+- **Stale in-file doc:** `src/workloads/baseline.rs` (module doc and the `MEMORY_EVAL` comment) still says
+  `erlang:memory/0,1` "is not implemented by the Rust runtime yet"; `beam_rt` now serves it via the
+  `MemoryHook` seam and the workload records a real `vm_memory_total_bytes` for `rust` (`RESULTS.md` §3.2).
+  `is_capability_gap` survives only as a fallback classifier.
+- `proc.rs:126` (`h.join().unwrap_or_default()`) collapses a panicked stdout/stderr drain thread to an empty
+  string; the drain threads have no realistic panic path, so this is latent, not active.
+
+The `foreign`/`list_walk` per-call/per-element methodology is implemented exactly as `RESULTS.md` states
+(startup-cancelled `(mean wall@N − mean wall@0) / N`), and the registered-BIF `~116 ns/call` headline is
+**not** produced here — it is a `beam_rt` measurement (`../crates/beam_rt/CONTEXT.md`, `examples/perf_bif.rs`).
+
 ## See Also
 - `RESULTS.md` → the current results summary (one table per workload category, exact reproduction
   commands, verified skip reasons, host-load record, stability, and "what these numbers mean").
