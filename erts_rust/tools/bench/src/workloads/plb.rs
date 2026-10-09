@@ -245,7 +245,7 @@ impl Workload for Plb {
                 "build stage (dotnet --task build) exit {:?}",
                 build.exit_code
             ));
-            result.notes.push(failure_note(&build));
+            failure_notes(&build, &mut result.notes);
             return result;
         }
 
@@ -286,7 +286,7 @@ impl Workload for Plb {
                 "no result JSON found (bench stage, dotnet exit {:?})",
                 out.exit_code
             ));
-            result.notes.push(failure_note(&out));
+            failure_notes(&out, &mut result.notes);
         } else {
             result
                 .metrics
@@ -428,13 +428,52 @@ fn excerpt(text: &str, max: usize, from_tail: bool) -> String {
     }
 }
 
-/// The diagnostic `notes` entry for a failed (or result-less) tool stage: the fatal
-/// exception the tool reported on stderr when there is one, else the tail of its own log.
-fn failure_note(out: &Completed) -> String {
-    if out.stderr.trim().is_empty() {
-        format!("stdout: {}", excerpt(&out.stdout, NOTE_CHARS, true))
-    } else {
-        format!("stderr: {}", excerpt(&out.stderr, NOTE_CHARS, false))
+/// Markers that identify the explanatory line in the tool's own log.
+const DIAGNOSTIC_MARKERS: &[&str] = &[
+    "error",
+    "exception",
+    "failure",
+    "failed",
+    "cannot",
+    "not found",
+    "no such",
+];
+
+/// The first line of the tool's log that looks like a diagnosis of the failure.
+///
+/// The log is chronological, so the *earliest* error-ish line is the closest thing to the
+/// root cause (for a broken toolchain: the `mix` invocation and what it printed); the last
+/// lines are the aggregate exception's stack trace, which says only *that* something broke.
+fn first_diagnostic_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            DIAGNOSTIC_MARKERS.iter().any(|marker| lower.contains(marker))
+        })
+        .map(collapse)
+}
+
+/// The diagnostic `notes` for a failed (or result-less) tool stage.
+///
+/// The two streams carry different evidence and both are worth keeping: the fatal .NET
+/// exception lands on stderr and *names* the failure, while the tool's own chronological
+/// log on stdout shows *which* command it ran and what that command printed (the exception
+/// alone does not). Each note is bounded, and an empty stream contributes nothing.
+fn failure_notes(out: &Completed, notes: &mut Vec<String>) {
+    if !out.stderr.trim().is_empty() {
+        notes.push(format!(
+            "stderr: {}",
+            excerpt(&out.stderr, NOTE_CHARS, false)
+        ));
+    }
+    if !out.stdout.trim().is_empty() {
+        let log = match first_diagnostic_line(&out.stdout) {
+            Some(line) => excerpt(&line, NOTE_CHARS, false),
+            // No line looked like a diagnosis: the log tail is the only evidence left.
+            None => excerpt(&out.stdout, NOTE_CHARS, true),
+        };
+        notes.push(format!("stdout: {log}"));
     }
 }
 
@@ -641,17 +680,70 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_note_prefers_stderr_and_falls_back_to_stdout() {
-        let with_stderr = completed("some log", "Unhandled\nexception: boom", false);
-        assert_eq!(failure_note(&with_stderr), "stderr: Unhandled exception: boom");
+    fn failure_notes_carry_both_streams_bounded() {
+        // stderr names the failure (kept from its head) and stdout is searched for the line
+        // that explains it, so a failed run carries evidence from each.
+        let both = completed(
+            "starting…\nCommand:: mix local.hex --force\nmix: simulated failure\n   at Boom()",
+            "Unhandled\nexception: bad",
+            false,
+        );
+        let mut notes = Vec::new();
+        failure_notes(&both, &mut notes);
+        assert_eq!(
+            notes,
+            vec![
+                "stderr: Unhandled exception: bad",
+                "stdout: mix: simulated failure",
+            ]
+        );
 
-        // A silent, zero-exit no-result run has no exception to show: the tool's own log
-        // tail is the only evidence, and it must still be bounded to one line.
-        let stdout_only = completed("first line\nlast line", "   \n", true);
-        assert_eq!(failure_note(&stdout_only), "stdout: first line last line");
+        // Without a diagnostic-looking line the log tail is the only evidence left.
+        let tail_only = completed("first line\nlast line", "   \n", true);
+        let mut notes = Vec::new();
+        failure_notes(&tail_only, &mut notes);
+        assert_eq!(notes, vec!["stdout: first line last line"]);
 
-        let long = completed(&"x".repeat(5_000), "", true);
-        assert_eq!(failure_note(&long).chars().count(), "stdout: ".len() + NOTE_CHARS + 1);
+        let mut notes = Vec::new();
+        failure_notes(&completed("", "", true), &mut notes);
+        assert!(notes.is_empty());
+
+        // Both notes are bounded to one line each, however noisy the tool is.
+        let noisy = completed(&"x".repeat(5_000), &"y".repeat(5_000), false);
+        let mut notes = Vec::new();
+        failure_notes(&noisy, &mut notes);
+        assert_eq!(notes.len(), 2);
+        for note in &notes {
+            // `«stream»: ` + at most `NOTE_CHARS` characters + the truncation ellipsis.
+            assert_eq!(note.chars().count(), "stderr: ".len() + NOTE_CHARS + 1);
+        }
+        // The head is kept for stderr (where .NET states the exception); a stdout log with
+        // no diagnostic-looking line keeps its tail (its chronological end).
+        assert!(notes[0].starts_with("stderr: yyy") && notes[0].ends_with('…'));
+        assert!(notes[1].starts_with("stdout: …xxx") && notes[1].ends_with('x'));
+    }
+
+    #[test]
+    fn the_first_diagnostic_line_is_picked_from_a_noisy_log() {
+        let log = "An issue was encountered verifying workloads.\n\
+                   Command:: mix local.hex --force\n\
+                   mix: simulated failure (toolchain broken)\n\
+                   Command:: mv app out\n\
+                   mv: cannot stat 'app': No such file or directory\n\
+                   System.IO.DirectoryNotFoundException: /tmp/build\n   at X()";
+        assert_eq!(
+            first_diagnostic_line(log),
+            Some("mix: simulated failure (toolchain broken)".to_string()),
+            "the *first* error-ish line is the closest thing to the root cause"
+        );
+        // Markers are matched case-insensitively …
+        assert_eq!(
+            first_diagnostic_line("Nothing here\nNO SUCH FILE found"),
+            Some("NO SUCH FILE found".to_string())
+        );
+        // … and a clean log yields nothing, so the caller falls back to the tail.
+        assert_eq!(first_diagnostic_line("all good\nTask build finished"), None);
+        assert_eq!(first_diagnostic_line(""), None);
     }
 
     /// The build stage failing is a *distinguishable* outcome from the tool producing no
