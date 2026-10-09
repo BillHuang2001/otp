@@ -206,14 +206,34 @@ impl<'a> Decoder<'a> {
             Tag::Reference => {
                 let node = self.decode_node_atom(heap, atoms)?;
                 let id = self.reader.u32be()?;
+                // `MAX_REFERENCE` (`erl_term.h:771`, `1 << _REF_NUM_SIZE` = `1 << 18`):
+                // this legacy shape has only an 18-bit count space, and the C rejects
+                // a first id at or past it (`external.c:4757`). The modern
+                // `NEWER_REFERENCE_EXT` carries no such bound.
+                if id >= 262_144u32 {
+                    return Err(bad_arg());
+                }
                 let creation = u32::from(self.reader.u8()?);
+                // A legacy 8-bit creation must be *tiny* (`is_tiny_creation`,
+                // `external.c:71-72` / `:4763`).
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
                 crate::term::make_external_ref(heap, node, &[id], creation)
             }
             Tag::NewReference => {
                 let len = usize::from(self.reader.u16be()?);
                 let node = self.decode_node_atom(heap, atoms)?;
                 let creation = u32::from(self.reader.u8()?);
+                // Tiny creation only (`external.c:4777`).
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
                 let ids = self.read_ids(len)?;
+                // The first id is 18-bit-bounded for this form too (`external.c:4782`).
+                if matches!(ids.first(), Some(&id) if id >= 262_144u32) {
+                    return Err(bad_arg());
+                }
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::NewerReference => {
@@ -229,9 +249,17 @@ impl<'a> Decoder<'a> {
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::Port => {
+                // `[PORT_EXT][node atom][id:4 BE u32][creation:1]` (`external.c:4685-4716`:
+                // `get_uint32` for the id — a full 32-bit word, never 16-bit — then
+                // `get_int8` for the creation; the sizing pass skips 5 extra bytes,
+                // `external.c:6210-6211`).
                 let node = self.decode_node_atom(heap, atoms)?;
-                let number = u64::from(self.reader.u16be()?);
+                let number = u64::from(self.reader.u32be()?);
                 let creation = u32::from(self.reader.u8()?);
+                // Tiny creation only (`external.c:4709`).
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
                 crate::term::make_external_port(heap, node, number, creation)
             }
             Tag::NewPort => {
@@ -254,6 +282,12 @@ impl<'a> Decoder<'a> {
                 let number = self.reader.u32be()?;
                 let serial = self.reader.u32be()?;
                 let creation = u32::from(self.reader.u8()?);
+                // `PID_EXT` carries an 8-bit creation that must be tiny
+                // (`erlang:dec_pid`, `external.c:3159-3164` / `is_tiny_creation`
+                // `external.c:71-72`).
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
                 crate::term::make_external_pid(heap, node, number, serial, creation)
             }
             Tag::NewPid => {
