@@ -167,6 +167,7 @@ Current: **484 passing / 0 failing / 2 ignored** — **322** lib in-module (`#[c
 - **Task execution here, the scheduler thread above.** The poll loop, port run queues and scheduler-charged reductions are `beam_process`/`beam_rt`; `PortNotification` keeps the engine/runtime split and the DAG clean.
   Only `execute_port_tasks` yields `Data`/`Closed`.
 - **Readiness ⇒ task, gated by `PortArms`**: a full close (`EPOLLHUP` ⇒ `read_closed` **and** `write_closed`) schedules no bogus OUTPUT task on a read-only driver.
+  A poll **error** likewise reaches both armed directions (C parity), so a fully armed port gets an `Output` task from a pure `EPOLLERR`, while the `PortArms` gate still denies it to a read-only port.
   **Divergence:** the C keeps three FIFO queues with no cross-kind priority; here one queue is kind-priority-ordered (INPUT → OUTPUT → TIMEOUT, `seq` tie-break) — observable only in the order two *different* kinds run in a round.
 - **The spawn driver is constructed, not registered, and reaps eagerly:** a `DriverFactory` cannot carry command/argv/options, so it is built from a `SpawnSpec`; the child starts in the **constructor** (so a failed spawn registers nothing and `os_pid()` is readable before `PortRegistry::open`); `{fd, N}` adopts a descriptor as a **duplex** stream and never closes it; `stop`/`Drop` kill **and** reap (`Drop` reaps because Rust's `Child` does not).
   The failed-spawn split and the `stderr_to_stdout` alias are detailed in the `spawn.rs` API bullet above.
