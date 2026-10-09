@@ -49,7 +49,7 @@ fn allocator_info_lists_the_rows_of_every_type_bound_to_the_allocator() {
     let rows = &info.items[13 + policy_items..];
     let mut non_zero = 0usize;
     let mut seen_heap = false;
-    for row in rows.chunks_exact(4) {
+    for row in rows.as_chunks::<4>().0 {
         assert_eq!(row[0].key, "type");
         assert_eq!(row[1].key, "type blocks");
         assert_eq!(row[2].key, "type bytes");
@@ -192,7 +192,7 @@ fn a_snapshot_reports_the_process_global_mseg_counters_not_a_local_zero() {
     // test released in the meantime is handed over from the shared cache without a
     // new mapping, so it is only ordered — like the bracketed counters below.
     assert!(
-        mseg.calls.alloc >= before.calls.alloc + 1,
+        mseg.calls.alloc > before.calls.alloc,
         "mapping a carrier asks the shared segment allocator for a segment"
     );
     assert!(before.calls.create <= mseg.calls.create);

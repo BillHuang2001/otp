@@ -702,6 +702,39 @@ mod tests {
     }
 
     #[test]
+    fn an_unrepresentable_word_count_is_a_typed_failure_never_an_overflow() {
+        // `alloc_words` is an `unsafe fn` whose safety contract does not bound `n` (the
+        // request is simply checked against the heap's `available()`), so `usize::MAX` is
+        // a legal call. Converting that word count into the byte count an `AllocFailure`
+        // carries must saturate rather than overflow: a plain `n * size_of::<Eterm>()`
+        // panics in a debug build and wraps to a bogus count in a release build.
+        let (_alloc, mut heap) = new_heap(8);
+        let hp_before = heap.hp();
+
+        // SAFETY: the request is rejected against `available()` before any word is
+        // handed out, so no pointer is dereferenced.
+        let request = unsafe { heap.alloc_words(usize::MAX) };
+        match request {
+            Err(BeamError::Alloc(failure)) => {
+                assert_eq!(failure.kind, AllocKind::Heap);
+                assert_eq!(
+                    failure.requested,
+                    usize::MAX,
+                    "the byte count saturates instead of wrapping"
+                );
+            }
+            other => panic!("expected a heap allocation failure, got {other:?}"),
+        }
+
+        // The rejection left no half-built state behind: no word was consumed and the
+        // bump pointer stands exactly where it did.
+        assert_eq!(heap.used(), 0);
+        assert_eq!(heap.peak_used(), 0);
+        assert_eq!(heap.available(), 8);
+        assert_eq!(heap.hp(), hp_before);
+    }
+
+    #[test]
     fn drop_returns_the_whole_block_to_the_allocator() {
         let alloc = Arc::new(StdlibAllocator::default());
         let bytes = 32 * WORD;

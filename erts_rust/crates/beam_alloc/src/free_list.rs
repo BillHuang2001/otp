@@ -294,7 +294,7 @@ impl FreeList {
             "the class slot must be reserved before inserting"
         );
         debug_assert!(
-            size >= MIN_FREE_BLOCK_SIZE && size % UNIT_SIZE == 0 && size <= MAX_BLOCK_SIZE,
+            size >= MIN_FREE_BLOCK_SIZE && size.is_multiple_of(UNIT_SIZE) && size <= MAX_BLOCK_SIZE,
             "a free block must be UNIT_SIZE-granular and hold both link words"
         );
         if class >= self.classes.len() {
@@ -477,7 +477,7 @@ impl FreeList {
     ) -> bool {
         debug_assert!(
             new_size >= MIN_FREE_BLOCK_SIZE
-                && new_size % UNIT_SIZE == 0
+                && new_size.is_multiple_of(UNIT_SIZE)
                 && new_size <= MAX_BLOCK_SIZE,
             "a re-filed block must hold both link words"
         );

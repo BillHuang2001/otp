@@ -54,10 +54,18 @@ pub(crate) fn large_object_failure(bytes: usize) -> BeamError {
 /// A per-process [`crate::heap::Heap`] ran out of room for `words` term words.
 ///
 /// The word count is converted to bytes so the carried [`AllocFailure`] is uniform.
+/// The conversion saturates: [`crate::heap::Heap::alloc_words`] is an `unsafe fn`
+/// whose `n` the caller may pass arbitrarily, so `words * size_of::<Eterm>()` would
+/// otherwise overflow — panicking in debug builds and wrapping to a bogus byte count
+/// in release builds. Saturating keeps the call total: it always yields the typed
+/// `AllocKind::Heap` failure, never a panic and never a wrong number.
 /// The engine/GC layer treats this as *collect and retry*, **not** a fatal OOM (see
 /// the crate `CONTEXT.md`, Design Decisions).
 pub(crate) fn heap_exhausted(words: usize) -> BeamError {
-    oom(AllocKind::Heap, words * core::mem::size_of::<Eterm>())
+    oom(
+        AllocKind::Heap,
+        words.saturating_mul(core::mem::size_of::<Eterm>()),
+    )
 }
 
 /// An allocation requested an alignment the allocator cannot satisfy.
