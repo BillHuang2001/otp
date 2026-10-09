@@ -94,8 +94,8 @@ use std::sync::Arc;
 use beam_abi::nif::loader::NifCallError;
 use beam_bifs::{BifContext, OutputSink};
 use beam_common::{AllocKind, BeamError, Result};
-use beam_engine::{terms, ExecutionContext, Machine};
-use beam_loader::{Label, Module};
+use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
+use beam_loader::{Atom, Label, Module};
 use beam_message::{CopyContext, Message, OffHeapTable, Queue};
 use beam_process::{ProcessId, ProcessTable};
 use beam_term::Eterm;
@@ -120,6 +120,14 @@ use self::persistent_term::PersistentTermBridge;
 use self::process_bridge::ProcessBridge;
 use self::runtime_hooks::RuntimeHooksBridge;
 
+/// How many scheduler slices [`RuntimeContext::run_export`] drives between resumes of a
+/// cross-module callee suspended in a `receive`.
+///
+/// This is the external-call counterpart of the `-eval` evaluator's receive pump
+/// ([`crate::eval`]'s `RECEIVE_PUMP_SLICES`): a bounded step, so a call that blocks has the
+/// child it waits on run and re-scanned, and a pump that reports nothing ran ends the wait
+/// with the honest typed [`beam_engine::blocked`] gap instead of spinning.
+const RUN_EXPORT_PUMP_SLICES: u64 = 64;
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
 /// output sink that run writes to.
 ///
@@ -537,12 +545,17 @@ impl<'a> RuntimeContext<'a> {
     /// [`Runtime::run_function`]/[`Runtime::run_module`] use for the top-level run and
     /// what [`ExecutionContext::call_bif`] uses for an external module call.
     ///
+    /// It is **blocking-aware**: a callee that suspends in a `receive` is driven by the
+    /// scheduler ([`Self::run_export_blocking`]), so a cross-module call that waits on a
+    /// runnable process returns rather than reporting a gap.
+    ///
     /// # Errors
     ///
     /// [`crate::error::undef`] (class `error`, reason atom `undef`) when the function is
     /// not in the module's atom table or is not exported — exactly the raise the oracle
     /// produces for a call to a function the release does not have — plus any error the
-    /// running code raises.
+    /// running code raises, and the typed [`beam_engine::blocked`] gap when the callee
+    /// suspends with nothing left that could wake it (see [`Self::run_export_blocking`]).
     ///
     /// A raise that escapes the module is passed through [`error::name_atom_raise`], so an
     /// uncaught reason the engine can only carry as a *term* — the bare `function_clause`
@@ -569,11 +582,72 @@ impl<'a> RuntimeContext<'a> {
         let previous = self
             .current_module
             .replace(module.atom_name(module.name).unwrap_or_default().to_string());
-        let result = Machine::new()
-            .run_export(module, function_atom, arity, args, self)
+        let result = self
+            .run_export_blocking(module, function_atom, arity, args)
             .map_err(|err| error::name_atom_raise(err, self.runtime.atoms()));
         self.current_module = previous;
         result
+    }
+
+    /// Runs `module`'s exported `function/arity` to its `return`, **driving the scheduler**
+    /// while the callee is suspended in a `receive`.
+    ///
+    /// This is [`ExecutionContext::call_bif`]'s external-module route made blocking-aware: a
+    /// cross-module callee whose `receive` finds no message does not collapse into the typed
+    /// [`beam_engine::blocked`] gap when the process it waits on is merely *runnable*. It is
+    /// what makes `proc_lib:start_link/3` — whose `sync_start/2` bare `receive` waits for its
+    /// spawned child's `{'DOWN', …}` — return through the `-eval` evaluator, exactly the
+    /// blocking-aware behaviour [`crate::boot::drive`] gives a boot-script `{apply, …}` and
+    /// [`Runtime::run_scheduled`](crate::runtime::Runtime::run_scheduled) gives a `run`
+    /// workload.
+    ///
+    /// The `Machine` is **reused** across a suspension ([`Machine::resume_outcome`] does not
+    /// `reset`), so the callee's registers, Erlang stack and call frames survive the pump and
+    /// it continues at exactly the reported `(func, pc)`.
+    ///
+    /// # When it cannot pump
+    ///
+    /// A context that is itself inside a scheduler slice ([`RuntimeContext::for_process`],
+    /// `may_pump_scheduler() == false`) must never re-enter the scheduler — that would run a
+    /// second process from within a slice — so it keeps the plain non-blocking entry's typed
+    /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
+    /// honest gap: no process could have changed the mailbox, so spinning further would only
+    /// hang, never produce a value.
+    ///
+    /// # Why the paused terms stay valid
+    ///
+    /// A collection moves terms in place, so it must never run while a machine whose roots it
+    /// cannot see is suspended. This crate collects **only** at the slice's own heap-admission
+    /// point, and only when its per-call GC latch is armed
+    /// ([`RuntimeContext::arm_gc`] — the sole armer is the slice's `BudgetContext`, see
+    /// [`crate::context::gc`]). This context is never a slice, so its latch is never armed, the
+    /// pump's allocations fall back to the pointer-stable arena and nothing pauses here is
+    /// moved — the suspended machine's terms stay valid across the resume. Arming the latch
+    /// here too would move the paused roots.
+    fn run_export_blocking(
+        &mut self,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        let mut machine = Machine::new();
+        let mut outcome = machine.run_export_outcome(module, function, arity, args, self)?;
+        loop {
+            match outcome {
+                RunOutcome::Returned(value) => return Ok(value),
+                RunOutcome::Wait { func, pc } => {
+                    if !self.may_pump_scheduler() {
+                        return Err(beam_engine::blocked());
+                    }
+                    let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+                    if ran == 0 {
+                        return Err(beam_engine::blocked());
+                    }
+                    outcome = machine.resume_outcome(module, func, pc, self)?;
+                }
+            }
+        }
     }
 
     /// Records the module whose **code** this context is about to execute — the BIF call
