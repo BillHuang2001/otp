@@ -121,6 +121,65 @@ fn waiting_module() -> (Module, Atom) {
 /// The Y slot `waiting_module` writes (`Y(0)`), for the assertions below.
 const Y0_VALUE: i64 = 0x1234;
 
+/// `gcroots_testheap/0` = `allocate 1; Y0 = 0x1234; wait resume; resume: test_heap 8
+/// 3; return`.
+///
+/// The `test_heap` **after** the `wait` is what reaches [`Machine::ensure_heap`] — the
+/// engine's primary admission point (`test_heap`/`allocate_heap`) — when the machine
+/// is resumed. Suspending first is what gives the machine a real live root set (a
+/// live Y slot; the stack cannot be seeded from outside the crate), so the recording
+/// context observes genuine X/Y/FR roots at that door too, instead of a hand-forged
+/// state.
+fn waiting_test_heap_module() -> (Module, Atom) {
+    let mut module = Module::default();
+    let function = module.atom_table.intern("gcroots_testheap");
+    module.name = function;
+    let entry = Label(1);
+    let resume = Label(2);
+    let code = vec![
+        Instr::Label(entry),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(1),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(0x1234),
+            dst: Operand::Y(0),
+        },
+        Instr::Wait { target: resume },
+        Instr::Label(resume),
+        Instr::TestHeap {
+            heap_need: HeapNeed::Words(8),
+            live: 3,
+        },
+        Instr::Return,
+    ];
+    let labels: BTreeMap<Label, usize> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| match instr {
+            Instr::Label(label) => Some((*label, index)),
+            _ => None,
+        })
+        .collect();
+    module.functions.push(Function {
+        func_label: entry,
+        entry_label: entry,
+        module: module.name,
+        name: function,
+        arity: 0,
+        code,
+        blocks: Vec::new(),
+        labels,
+    });
+    module.exports.push(Export {
+        function,
+        arity: 0,
+        label: entry,
+    });
+    (module, function)
+}
+
 // ---------------------------------------------------------------------------
 // The mock collector: records every rooted allocation and its root set
 // ---------------------------------------------------------------------------
@@ -206,6 +265,92 @@ impl ExecutionContext for RootRecorder {
 }
 
 // ---------------------------------------------------------------------------
+// The mock collector for `ensure_heap` — the primary admission point
+// ---------------------------------------------------------------------------
+
+/// What [`HeapRecorder`] observed at the `ensure_heap` door.
+#[derive(Default)]
+struct HeapSeen {
+    /// How many times the **full-root** door (`ensure_heap_full`) was used.
+    full_calls: usize,
+    /// How many times the narrow, FR-less `ensure_heap` was used (expected: 0).
+    narrow_calls: usize,
+    x: Vec<Vec<Eterm>>,
+    stack: Vec<Vec<Eterm>>,
+    fr: Vec<Vec<Eterm>>,
+}
+
+/// A recording context that pins the **whole root set** at the engine's primary
+/// admission point ([`Machine::ensure_heap`], reached by `test_heap`/`allocate_heap`).
+///
+/// It overrides the full-root door
+/// [`ExecutionContext::ensure_heap_full`](beam_engine::ExecutionContext::ensure_heap_full)
+/// — the one the machine now calls — and counts the narrow `ensure_heap` separately,
+/// so a passing test proves the FR file travels with it (the FR file would be lost on
+/// the narrow door). A write through `roots.fr` simulates a relocating collector, and
+/// it must land back in `Machine::fr`.
+struct HeapRecorder {
+    seen: Rc<RefCell<HeapSeen>>,
+    /// The value the "collector" relocates the term in `fr(7)` to.
+    relocated_fr: Eterm,
+}
+
+impl HeapRecorder {
+    fn new(relocated_fr: Eterm) -> (HeapRecorder, Rc<RefCell<HeapSeen>>) {
+        let seen = Rc::new(RefCell::new(HeapSeen::default()));
+        (
+            HeapRecorder {
+                seen: Rc::clone(&seen),
+                relocated_fr,
+            },
+            seen,
+        )
+    }
+}
+
+impl ExecutionContext for HeapRecorder {
+    fn call_bif(
+        &mut self,
+        _module: &str,
+        _function: &str,
+        _arity: u32,
+        _args: &[Eterm],
+    ) -> Result<Eterm> {
+        Err(BeamError::BadArg)
+    }
+
+    /// The narrow door (no FR file): the machine must not use it any more, so this is
+    /// counted but never expected.
+    fn ensure_heap(
+        &mut self,
+        _heap_need: u32,
+        _live: u32,
+        _x_regs: &mut [Eterm],
+        _stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.seen.borrow_mut().narrow_calls += 1;
+        Ok(())
+    }
+
+    fn ensure_heap_full(&mut self, _heap_need: u32, roots: RootSet<'_>) -> Result<()> {
+        {
+            let mut seen = self.seen.borrow_mut();
+            seen.full_calls += 1;
+            seen.x.push(roots.x.to_vec());
+            seen.stack.push(roots.stack.to_vec());
+            seen.fr.push(roots.fr.to_vec());
+        }
+        // A real collector moves terms and writes them back through `roots`; here the
+        // "move" relocates `fr(7)` to a value only the heap owner knows, so the test
+        // can prove the write reached the machine's FR file.
+        if let Some(slot) = roots.fr.get_mut(7) {
+            *slot = self.relocated_fr;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The proof
 // ---------------------------------------------------------------------------
 
@@ -287,6 +432,93 @@ fn an_alloc_words_loop_reaches_the_hook_with_x_stack_and_fr_roots() {
         "a term moved through the root set must be visible in the machine"
     );
     // ...and the root that was never relocated is untouched.
+    assert_eq!(machine.x(3), Some(x_mark));
+}
+
+#[test]
+fn the_ensure_heap_admission_point_hands_over_the_fr_file() {
+    // The gap this closes: `test_heap`/`allocate_heap` route through
+    // `Machine::ensure_heap`, which today handed over only `x`/`stack`. A module with
+    // any float-family instruction could therefore never be collected over correctly.
+    // The machine must now reach the full-root door, and the FR file must be in it.
+    let (module, function) = waiting_test_heap_module();
+    let relocated_fr = make_small(0x0F0F);
+    let (mut ctx, seen) = HeapRecorder::new(relocated_fr);
+    let mut machine = Machine::new();
+
+    // Suspend first: the machine now really has a live frame (a root), and the X/FR
+    // files can be seeded afterwards (a run resets them; the stack cannot be seeded
+    // from outside the crate).
+    let outcome = machine
+        .run_export_outcome(&module, function, 0, &[], &mut ctx)
+        .expect("the synthetic module suspends rather than fails");
+    let (func, pc) = match outcome {
+        RunOutcome::Wait { func, pc } => (func, pc),
+        other => panic!("expected a wait, got {other:?}"),
+    };
+    assert_eq!(
+        machine.stack_depth(),
+        1,
+        "the suspended frame's Y slot is a live root"
+    );
+    assert_eq!(
+        seen.borrow().full_calls,
+        0,
+        "the suspend happens at `wait`, before the `test_heap` admission point"
+    );
+
+    // Live terms in the three files, exactly as a collector would have to see them.
+    let x_mark = make_small(0xABCD);
+    machine.x_mut()[3] = x_mark;
+    let fr_mark = make_small(0x5678);
+    machine.fr_mut()[7] = fr_mark;
+    let y0 = machine.stack_mut()[0];
+    assert_eq!(y0, make_small(Y0_VALUE));
+
+    // Resume into `test_heap` — the engine's primary admission point.
+    let resumed = machine
+        .resume_outcome(&module, func, pc, &mut ctx)
+        .expect("resume reaches the test_heap");
+    assert!(
+        matches!(resumed, RunOutcome::Returned(_)),
+        "the module returns after the test_heap, got {resumed:?}"
+    );
+
+    let seen = seen.borrow();
+    assert_eq!(
+        seen.full_calls, 1,
+        "the full-root door (`ensure_heap_full`) is the one the machine calls"
+    );
+    assert_eq!(
+        seen.narrow_calls, 0,
+        "the narrow, FR-less door is no longer used (it would drop the FR root)"
+    );
+    assert_eq!(
+        seen.x[0].len(),
+        MAX_REGISTER as usize,
+        "the whole X-register file is handed over"
+    );
+    assert_eq!(
+        seen.fr[0].len(),
+        MAX_FLOAT_REGISTER as usize,
+        "the whole FR file is handed over — the gap this suite closes"
+    );
+    assert_eq!(seen.x[0][3], x_mark, "the live X register is a root");
+    assert_eq!(seen.fr[0][7], fr_mark, "the live FR slot is a root");
+    assert_eq!(
+        seen.stack[0],
+        vec![y0],
+        "the whole Erlang stack (every Y slot) is handed over"
+    );
+    drop(seen);
+
+    // Mutability: the collector's relocation through the FR root landed in the machine.
+    assert_eq!(
+        machine.get_fr(7),
+        Some(relocated_fr),
+        "a term moved through the FR root must be visible in the machine"
+    );
+    // The untouched X root is preserved.
     assert_eq!(machine.x(3), Some(x_mark));
 }
 

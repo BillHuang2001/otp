@@ -268,9 +268,17 @@ impl Machine {
         Ok(())
     }
 
-    /// Ensure `heap_need` heap words are available, handing the context the exact
-    /// root set (`x[0..live)` plus the whole stack) so a Stage-4 collector can move
-    /// terms in place.
+    /// Ensure `heap_need` heap words are available, handing the context the **whole
+    /// live root set** (`x[0..live)`, the whole stack **and the whole FR file**) so a
+    /// Stage-4 collector can move terms in place.
+    ///
+    /// This delegates to
+    /// [`ExecutionContext::ensure_heap_full`](crate::context::ExecutionContext::ensure_heap_full),
+    /// whose default forwards to the narrow
+    /// [`ensure_heap`](crate::context::ExecutionContext::ensure_heap) with the FR
+    /// file discarded — so a host that predates the full-root door behaves exactly as
+    /// before, while a host that wants every live root (including the FR file, which
+    /// holds `Eterm` term slots) overrides the full variant.
     #[inline]
     pub(crate) fn ensure_heap(
         &mut self,
@@ -278,8 +286,7 @@ impl Machine {
         live: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<()> {
-        let (x, stack) = (&mut self.x, &mut self.stack);
-        ctx.ensure_heap(heap_need, live, x, stack)
+        self.with_roots(live, |roots| ctx.ensure_heap_full(heap_need, roots))
     }
 
     /// The `(function index, code offset, module context)` of every live call frame
@@ -441,6 +448,58 @@ mod tests {
         let mut ctx = Probe(0);
         machine.ensure_heap(16, 3, &mut ctx).unwrap();
         assert_eq!(ctx.0, 3 + 8 + 2);
+    }
+
+    #[test]
+    fn ensure_heap_hands_over_the_fr_file_at_the_full_root_door() {
+        // The full-root door carries the FR file (which the narrow `ensure_heap`
+        // cannot): a context that overrides it sees the whole FR file, and a write
+        // through `roots.fr` lands back in the machine. The narrow method must never
+        // be reached, or the FR file would be lost.
+        struct FrProbe {
+            fr_len: usize,
+            saw_fr: bool,
+        }
+        impl ExecutionContext for FrProbe {
+            fn call_bif(&mut self, _m: &str, _f: &str, _a: u32, _args: &[Eterm]) -> Result<Eterm> {
+                Err(beam_common::BeamError::BadArg)
+            }
+            fn ensure_heap(
+                &mut self,
+                _need: u32,
+                _live: u32,
+                _x_regs: &mut [Eterm],
+                _stack: &mut [Eterm],
+            ) -> Result<()> {
+                panic!("the machine must use the full-root door, not the narrow one");
+            }
+            fn ensure_heap_full(
+                &mut self,
+                _need: u32,
+                roots: crate::context::RootSet<'_>,
+            ) -> Result<()> {
+                self.fr_len = roots.fr.len();
+                if let Some(slot) = roots.fr.get_mut(1) {
+                    *slot = Eterm::from_raw(0xFEED);
+                }
+                self.saw_fr = true;
+                Ok(())
+            }
+        }
+        let mut machine = Machine::new();
+        machine.set_fr(1, Eterm::from_raw(0x0001)).unwrap();
+        let mut ctx = FrProbe {
+            fr_len: 0,
+            saw_fr: false,
+        };
+        machine.ensure_heap(16, 3, &mut ctx).unwrap();
+        assert!(ctx.saw_fr, "the full-root door was used");
+        assert_eq!(ctx.fr_len, crate::machine::MAX_FLOAT_REGISTER as usize);
+        assert_eq!(
+            machine.get_fr(1),
+            Some(Eterm::from_raw(0xFEED)),
+            "a write through the FR root landed back in the machine"
+        );
     }
 
     #[test]

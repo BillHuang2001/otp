@@ -312,6 +312,31 @@ pub trait ExecutionContext {
         stack: &mut [Eterm],
     ) -> Result<()>;
 
+    /// Ensure `heap_need` heap words are available, with the engine's **whole live
+    /// root set** handed in.
+    ///
+    /// This is the full-root twin of
+    /// [`ensure_heap`](ExecutionContext::ensure_heap): where `ensure_heap` receives
+    /// only the X registers and the Erlang stack, this method receives the whole
+    /// [`RootSet`] — the X-register file, the whole Erlang stack **and the whole FR
+    /// file**. The FR file holds `Eterm` **term slots** at Milestone 1, so a float
+    /// register can point into the process heap and must be a root; the narrow
+    /// `ensure_heap` cannot see it, so a module containing any float-family
+    /// instruction could never be collected over correctly.
+    /// [`Machine::ensure_heap`](crate::machine::Machine::ensure_heap) — reached by
+    /// `test_heap`/`allocate_heap` — calls **this** method, so a host whose heap must
+    /// be collected at the primary admission point now sees every live root.
+    ///
+    /// The default body forwards to
+    /// [`ensure_heap`](ExecutionContext::ensure_heap) with the FR file discarded, so
+    /// **every existing implementor keeps working unchanged** (and byte-identically):
+    /// a host with a real collector overrides this and runs its collector over the
+    /// full `roots` first, writing any moved term back through
+    /// `roots.x`/`roots.stack`/`roots.fr`.
+    fn ensure_heap_full(&mut self, heap_need: u32, roots: RootSet<'_>) -> Result<()> {
+        self.ensure_heap(heap_need, roots.live, roots.x, roots.stack)
+    }
+
     /// Heap words currently available (introspection). Default: unbounded.
     fn heap_available(&self) -> usize {
         usize::MAX
