@@ -109,14 +109,14 @@
 //!
 //! # Sharing with the copying engine
 //!
-//! Object sizing ([`move_size`](crate::copy::move_size)), the header/thing stepping rule
-//! ([`scan_step`](crate::copy::scan_step)), the per-object reference enumerator
-//! ([`for_each_ref`](crate::copy::for_each_ref)) and the whole in-place forwarding marker
-//! protocol ([`forward_slot`](crate::copy::forward_slot) over the
-//! [`EvacDest`](crate::copy::EvacDest) seam) are `pub(crate)` items of `copy.rs`: this
+//! Object sizing ([`move_size`](crate::copy::move_size)) and the per-object reference
+//! enumerator ([`for_each_ref`](crate::copy::for_each_ref)) are `pub(crate)` items of
+//! `copy.rs`, both driven by the canonical per-object walk of [`beam_term::layout`]; the
+//! whole in-place forwarding marker protocol
+//! ([`forward_slot`](crate::copy::forward_slot) over the
+//! [`EvacDest`](crate::copy::EvacDest) seam) shares the same `copy.rs` primitives. This
 //! module implements [`EvacDest`](crate::copy::EvacDest) — the *one* decision that
 //! differs between the two spaces is *which* objects move — and shares everything else.
-//! `copy.rs`'s observable behaviour is unchanged by that refactor.
 
 use core::cell::Cell;
 use core::mem::size_of;

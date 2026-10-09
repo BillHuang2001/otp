@@ -24,18 +24,21 @@
 //!
 //! `unsafe` is confined to this module's word-level code, which mirrors the legacy C
 //! `move_boxed`/`move_cons`/`sweep` (`erts/emulator/beam/erl_gc.c`): in-place forwarding
-//! plus a Cheney scan of the freshly-copied to-space. Object sizing ([`move_size`]), the
-//! header/thing stepping rule ([`scan_step`]) and the reference-forwarding switch
-//! ([`forward_slot`], over the [`EvacDest`] seam) are `pub(crate)` so that the two
-//! evacuating spaces share one implementation instead of each carrying its own copy of
-//! the marker scheme.
+//! plus a Cheney scan of the freshly-copied to-space. The per-object layout itself — how
+//! many words one object occupies and which of its payload words are references — is the
+//! canonical walk of [`beam_term::layout`] (the workspace's single owner of the per-object
+//! layout): [`move_size`] is [`beam_term::layout::object_words`] plus the copy-specific
+//! `ErlSubBits` override, and [`for_each_ref`] / [`Copier::complete`] drive
+//! [`beam_term::layout::for_each_child_slot`]. This module adds only those two
+//! copy-specific pieces and the reference-forwarding switch ([`forward_slot`], over the
+//! [`EvacDest`] seam), all `pub(crate)` so the two evacuating spaces share one
+//! implementation instead of each carrying its own copy of the marker scheme.
 
 use beam_common::Result;
 use beam_term::prelude::{
-    boxed_val, fun_desc_words, fun_env_offset_header, fun_kind_of_header, fun_num_free,
-    header_arity, header_is_thing, is_flatmap_header, is_fun_header, is_header, is_map_header,
-    is_non_value, list_val, make_boxed, make_list, map_header_val, primary_tag, thing_arityval,
-    Eterm, PrimaryTag, HEADER_SUB_BITS, THE_NON_VALUE,
+    boxed_val, for_each_child_slot, is_header, is_non_value, list_val, make_boxed, make_list,
+    object_words, primary_tag, Eterm, PrimaryTag, ERL_SUB_BITS_SIZE, HEADER_SUB_BITS,
+    THE_NON_VALUE,
 };
 
 use crate::error::heap_exhausted;
@@ -46,166 +49,117 @@ use crate::stats::GcStats;
 // Shared word-level forwarding primitives (used by this module and `immix.rs`)
 // ---------------------------------------------------------------------------
 
-/// How the word-by-word scan advances over a *non-reference* word it has just read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScanStep {
-    /// Advance one word: an immediate, or a transparent header (an arityval or a
-    /// record) whose elements follow as separately scanned words.
-    Word,
-    /// A thing header: advance `step` words. When `orig_index` is `Some`, that word of
-    /// the thing holds an interior reference that must be forwarded before stepping
-    /// over the thing (the C `HEADER_SUB_BITS` case, whose `orig` is word 4).
-    Thing {
-        /// The number of words the thing occupies (header + payload).
-        step: usize,
-        /// The word index of an interior reference inside the thing, if it has one.
-        orig_index: Option<usize>,
-    },
-}
-
-/// Classifies the header word `gval` for the word-by-word scan of the C `sweep()`.
+/// The total words (header word + payload) the boxed object at `ptr` occupies in the
+/// **copy** graph, whose header word is `hdr` — the `nelts + 1` of the C `move_boxed`.
 ///
-/// Precondition (checked by every caller): `gval` carries the [`PrimaryTag::Header`]
-/// primary tag, i.e. it is *not* a reference word.
-///
-/// A **fun** is sized from its inlined-descriptor layout (`beam_term::fun`) rather than
-/// `thing_arityval`: a fun block here is `[header][desc_words(kind)][env[0..num_free]]`
-/// with the C `entry` pointer expanded into descriptor words, so `thing_arityval(gval) + 1`
-/// (only 2, the C `ERL_FUN_SIZE`) would land the scan on the *second* descriptor word — a
-/// raw `index` for a `Local` fun, raw `uniq` bytes for an `Imported` one — and follow that
-/// raw value as if it were a term reference, corrupting the heap. Skipping the whole
-/// descriptor opaquely (`fun_env_offset_header == 1 + desc_words`) leaves the word-by-word
-/// loop to scan exactly the `num_free` env words that follow.
-pub(crate) fn scan_step(gval: Eterm) -> Result<ScanStep> {
-    if !header_is_thing(gval) {
-        // A transparent header (arityval/record): its elements follow as separately
-        // scanned words.
-        return Ok(ScanStep::Word);
-    }
-    if is_fun_header(gval) {
-        return Ok(ScanStep::Thing {
-            step: fun_env_offset_header(gval)?,
-            orig_index: None,
-        });
-    }
-    if gval == HEADER_SUB_BITS {
-        // `ErlSubBits.orig` is word 4 of the object (`erl_bits.h`); it holds the
-        // underlying bitstring as a boxed reference.
-        return Ok(ScanStep::Thing {
-            step: thing_arityval(gval) + 1,
-            orig_index: Some(4),
-        });
-    }
-    Ok(ScanStep::Thing {
-        step: thing_arityval(gval) + 1,
-        orig_index: None,
-    })
-}
-
-/// The total words (header word + payload) of the boxed object at `ptr`, whose header
-/// word is `hdr` — the `nelts + 1` of the C `move_boxed`.
-///
-/// A fun is sized explicitly from its inlined-descriptor layout (`beam_term::fun`):
-/// `1 + desc_words(kind) + num_free`. `header_arity` is **not** used for a fun because it
-/// deliberately carries the C `ERL_FUN_SIZE - 1 == 1` value (the old single
-/// `entry`-pointer assumption), which would under-size the copy by `desc_words(kind) - 1`
-/// words (1 for a `Local`/`External` fun, 9 for an `Imported` one). For every other boxed
-/// object `header_arity` already applies the map special case of
-/// `_unchecked_header_arity`, so only the *extra* words of a flatmap's size word and a
-/// hashmap's occupancy bitmap count are added here.
+/// Every shape follows the canonical per-object walk [`beam_term::layout::object_words`]
+/// **except** an `ErlSubBits`. `object_words` reports the object's contribution to the
+/// *sizing* graph — for a refc binary the whole `[BinRef(3)][ErlSubBits(5)]` pair (`8`),
+/// and for a match context a fresh heap-bits window — but a *copier* must not lay down
+/// that many words: it copies the `ErlSubBits` block's own [`ERL_SUB_BITS_SIZE`] (`5`)
+/// words and forwards its `orig` word, which copies the 3-word `BinRef` as its own child
+/// (the C `move_boxed`/`sweep` `SUB_BITS` protocol, `erl_gc.c:2332-2347`;
+/// `copy.c:1677-1700`). The pair is therefore copied as two separate allocations, exactly
+/// as [`Copier::complete`] and [`for_each_ref`] expect.
 ///
 /// # Preconditions
 ///
 /// `ptr` must point at a live, boxed object whose first word is `hdr`; it is dereferenced
-/// only for a flatmap's size word (which `hdr` guarantees to be present).
+/// by `object_words` only for the words `hdr`'s shape implies are present (a flatmap's
+/// size word, an `ErlSubBits`'s `start`/`end`/`orig`).
 pub(crate) fn move_size(hdr: Eterm, ptr: *const Eterm) -> usize {
-    if is_fun_header(hdr) {
-        // `fun_kind_of_header` is the infallible bit extraction and is valid because
-        // `is_fun_header(hdr)` just held; this avoids a `Result` on a path that cannot
-        // fail (never `unwrap` runtime data).
-        return 1 + fun_desc_words(fun_kind_of_header(hdr)) + fun_num_free(hdr);
+    if hdr == HEADER_SUB_BITS {
+        // The copy size of an `ErlSubBits` is its own block, never `object_words`'s graph
+        // size (which folds in the refc pair's separate `BinRef`).
+        ERL_SUB_BITS_SIZE
+    } else {
+        // SAFETY: the caller guarantees `ptr` heads a live object of `hdr`'s shape, so the
+        // canonical walk reads only the words that shape implies are present.
+        unsafe { object_words(hdr, ptr) }
     }
-    let mut nelts = header_arity(hdr);
-    if is_map_header(hdr) {
-        if is_flatmap_header(hdr) {
-            // SAFETY: a flatmap header is immediately followed by its untagged size
-            // word, which `ptr` addresses; the object is live and therefore readable.
-            nelts += unsafe { *ptr.add(1) }.raw() + 1;
-        } else {
-            // `hashmap_bitcount(MAP_HEADER_VAL(hdr))`: one occupied slot per set bit.
-            nelts += map_header_val(hdr).count_ones() as usize;
-        }
-    }
-    nelts + 1
 }
 
-/// Calls `visit` with the address of every *reference word* of the boxed object at
-/// `ptr`, which occupies `total` words (`total` = the [`move_size`] of its header).
+/// Calls `visit` with the address of every *reference word* of the object at `ptr`, which
+/// occupies `total` words (`total` = the [`move_size`] of its header, or `2` for a cons
+/// cell).
 ///
-/// This is the **per-object** form of the word walk [`Copier::complete`] performs over its
-/// contiguous to-space region: both step through words with [`scan_step`], so a fun's
-/// inlined descriptor is skipped opaquely, a transparent arityval is stepped word by word,
-/// and an `ErlSubBits`'s `orig` word is visited. They are not merged into one routine
-/// because `complete` walks a *region* that grows as it copies (the Cheney invariant
-/// `while (n_hp != n_htop)`), not an object of known size; sharing the loop would thread a
-/// moving region bound through the copier's hot path for no gain. The mark-region space
+/// For a **boxed object** this is the per-object form of the region walk
+/// [`Copier::complete`] performs over its contiguous to-space region: both drive the
+/// canonical child-slot enumeration [`beam_term::layout::for_each_child_slot`] (the
+/// workspace's single owner of the per-object layout), so a fun's inlined descriptor is
+/// skipped opaquely, a transparent arityval/record is stepped over, a map's occupancy/size
+/// words are handled, and an `ErlSubBits`'s `orig` word is visited. They are not merged
+/// into one routine because `complete` walks a *region* that grows as it copies (the
+/// Cheney invariant `while (n_hp != n_htop)`), not an object of known size; sharing the
+/// loop would thread a moving region bound through the copier's hot path for no gain.
+///
+/// A **cons cell** (`[CAR, CDR]`) has no header word, so it is not part of the
+/// header-based canonical walk (`beam_term::layout`: "every caller handles it directly");
+/// its two payload words are both references and are yielded here directly.
+///
+/// It yields **only child slots that hold a `Boxed`/`List` word** — exactly the set
+/// [`forward_slot`] can move — plus an `ErlSubBits`'s `orig` unconditionally, so a caller
+/// may enqueue a yielded slot without re-testing it. The mark-region space
 /// ([`crate::immix`]) uses this to enumerate objects it marks and objects it copies.
 ///
 /// # Safety
 ///
-/// `ptr` must address a live boxed object of exactly `total` words, all of which are
-/// readable, and `visit` must not invalidate them.
-pub(crate) unsafe fn for_each_ref<F>(
-    ptr: *mut Eterm,
-    total: usize,
-    visit: &mut F,
-) -> Result<()>
+/// `ptr` must address a live object of exactly `total` words (`2` for a cons cell), all of
+/// which are readable, and `visit` must not invalidate them.
+pub(crate) unsafe fn for_each_ref<F>(ptr: *mut Eterm, total: usize, visit: &mut F) -> Result<()>
 where
     F: FnMut(*mut Eterm) -> Result<()>,
 {
-    // Word 0 is the object's header, and it is the header that decides the payload
-    // layout: a transparent arityval is stepped over so its elements are visited one by
-    // one, while a fun's inlined descriptor and a map's untagged size/occupancy words are
-    // opaque and jumped over as a whole. Starting at the header (exactly what the
-    // `complete()` region walk does when it meets an object's header word) is what makes
-    // this the *per-object* form of that walk; starting at word 1 would read a fun's raw
-    // descriptor word (`uniq`/`index`) as if it were a term reference and, worse, would
-    // never visit the fun's real environment words.
-    let mut i = 0usize;
-    while i < total {
-        // SAFETY: `i < total`, so this word is inside the live `total`-word object.
-        let word = unsafe { *ptr.add(i) };
-        match primary_tag(word) {
-            PrimaryTag::Boxed | PrimaryTag::List => {
-                // SAFETY: word `i` of a live object is a live reference word.
-                visit(unsafe { ptr.add(i) })?;
-                i += 1;
-            }
-            PrimaryTag::Header => match scan_step(word)? {
-                ScanStep::Word => i += 1,
-                ScanStep::Thing { step, orig_index } => {
-                    if let Some(index) = orig_index {
-                        let at = i + index;
-                        if at < total {
-                            // SAFETY: `at < total`, so the interior reference is inside the
-                            // object.
-                            visit(unsafe { ptr.add(at) })?;
-                        }
-                    }
-                    if step == 0 || i + step > total {
-                        // A malformed object cannot happen for the objects this crate
-                        // writes; stopping is the safe reading of one rather than
-                        // walking out of the object.
-                        debug_assert!(false, "object at {ptr:p} over-runs its {total} words");
-                        break;
-                    }
-                    i += step;
+    // SAFETY: the caller guarantees `ptr` heads a live object of `total` words, so its
+    // first word is readable.
+    let first = unsafe { *ptr };
+    // [`for_each_child_slot`]'s callback is infallible while `visit` is fallible; the
+    // accumulator carries the first failure out of the walk without forking it.
+    let mut err: Result<()> = Ok(());
+
+    if is_header(first) {
+        // A boxed object: word 0 is its header, which decides the payload layout. An
+        // `ErlSubBits`'s `orig` slot is a reference the canonical copy walk exposes even
+        // when it does not itself hold a `Boxed`/`List` word (it names the object's
+        // underlying bitstring); every other child slot is yielded only when it holds a
+        // movable word.
+        let is_sub_bits = first == HEADER_SUB_BITS;
+        // SAFETY: `ptr` heads a live object of `first`'s shape (the caller's guarantee), so
+        // the canonical walk reads only words that shape implies are present.
+        unsafe {
+            for_each_child_slot(first, ptr, |offset| {
+                if err.is_err() || offset >= total {
+                    return;
                 }
-            },
-            PrimaryTag::Immed1 => i += 1,
+                // SAFETY: `offset < total`, so this word is inside the live object.
+                let slot = ptr.add(offset);
+                if is_sub_bits || matches!(primary_tag(*slot), PrimaryTag::Boxed | PrimaryTag::List)
+                {
+                    err = visit(slot);
+                }
+            });
+        }
+    } else {
+        // A cons cell (`[CAR, CDR]`): both payload words are references. Word 0 of a boxed
+        // object *is* its header (`is_header` is the frozen "not a value" pattern), so its
+        // primary tag tells the two apart — the same test `scan_young` uses.
+        // SAFETY: the caller guarantees a live cons cell of `total` words, so both words are
+        // readable.
+        unsafe {
+            for offset in 0..total.min(2) {
+                if err.is_err() {
+                    break;
+                }
+                // SAFETY: `offset < total`, so this word is inside the live cell.
+                let slot = ptr.add(offset);
+                if matches!(primary_tag(*slot), PrimaryTag::Boxed | PrimaryTag::List) {
+                    err = visit(slot);
+                }
+            }
         }
     }
-    Ok(())
+
+    err
 }
 
 /// How the object a BOXED/LIST reference points at relates to an evacuation.
@@ -461,26 +415,35 @@ impl<'a> Copier<'a> {
                     // the to-space (or lands exactly on its top).
                     self.scan = unsafe { self.scan.add(1) };
                 }
-                PrimaryTag::Header => match scan_step(gval)? {
-                    ScanStep::Word => {
-                        // SAFETY: one word further along the to-space.
-                        self.scan = unsafe { self.scan.add(1) };
+                PrimaryTag::Header => {
+                    // One canonical step over a whole object: size it, forward each of its
+                    // copy child slots (the word offsets `beam_term::layout` reports for its
+                    // shape), then jump past it. A transparent arityval/record, a fun's
+                    // inlined descriptor, a map's size/occupancy words and an `ErlSubBits`'s
+                    // `orig` are all handled by that shared walk, so no shape logic lives
+                    // here — the reference forwarding is the only thing this loop does.
+                    let scan = self.scan;
+                    let total = move_size(gval, scan);
+                    // `for_each_child_slot`'s callback is infallible; the accumulator
+                    // carries the first forwarding failure out of the walk.
+                    let mut err: Result<()> = Ok(());
+                    // SAFETY: `scan` addresses a live object header in the to-space of
+                    // exactly `total` words (the object was copied verbatim), so every child
+                    // slot the canonical walk reports lies inside it and holds a live term
+                    // reference.
+                    unsafe {
+                        for_each_child_slot(gval, scan, |offset| {
+                            if err.is_ok() {
+                                err = self.forward_one(scan.add(offset));
+                            }
+                        });
                     }
-                    ScanStep::Thing { step, orig_index } => {
-                        if let Some(index) = orig_index {
-                            // SAFETY: `scan` addresses a live thing of more than
-                            // `index` words, so the interior reference is inside it.
-                            let orig = unsafe { self.scan.add(index) };
-                            // SAFETY: `orig` addresses a live interior reference word.
-                            unsafe { self.forward_one(orig)? };
-                        }
-                        // SAFETY: `step` words are exactly the header + descriptor + env
-                        // of a fun (or the header + payload of any other thing), all
-                        // written into the to-space, so the advanced position stays
-                        // within it.
-                        self.scan = unsafe { self.scan.add(step) };
-                    }
-                },
+                    err?;
+                    // SAFETY: `total` is exactly the object's word count, all written into
+                    // the to-space, so the advanced position stays within it (or lands
+                    // exactly on its top).
+                    self.scan = unsafe { scan.add(total) };
+                }
                 PrimaryTag::Immed1 => {
                     // SAFETY: an immediate occupies one word.
                     self.scan = unsafe { self.scan.add(1) };
