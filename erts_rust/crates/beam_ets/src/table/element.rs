@@ -32,6 +32,7 @@ use beam_common::Result;
 use beam_term::prelude::*;
 
 use crate::error::badarg;
+use crate::key::key_of;
 use crate::kind::TableKind;
 
 use super::update::{
@@ -132,7 +133,7 @@ impl Table {
         if updated {
             // The interior rebuilt the object on the caller's `heap`; make it
             // table-owned (the A.1 copy boundary).
-            self.relocate_rebuilt_object(key, replaced, atoms)?;
+            self.relocate_rebuilt_object(replaced, atoms)?;
         }
         Ok(updated)
     }
@@ -245,7 +246,7 @@ impl Table {
         }
         // The last interior operation may have rebuilt the object on the caller's
         // `heap`; reconcile the index with table-owned storage once.
-        self.relocate_rebuilt_object(key, replaced, atoms)?;
+        self.relocate_rebuilt_object(replaced, atoms)?;
 
         if list_result {
             build_list(heap, &results)
@@ -263,13 +264,19 @@ impl Table {
     /// store copy replaces it in the index, and the table-owned object it replaced
     /// is reclaimed. An **in-place** update (the hash index's `update_counter`)
     /// leaves the stored root untouched, and then there is nothing to do.
-    fn relocate_rebuilt_object(
-        &mut self,
-        key: Eterm,
-        replaced: Eterm,
-        atoms: &AtomTable,
-    ) -> Result<()> {
-        let current = match self.interior.lookup(key, atoms).into_iter().next() {
+    ///
+    /// The index key is **re-derived from the table-owned object** rather than
+    /// reused from the caller: the stored key term must alias a live table object,
+    /// and only the table-owned copy (or the object being restored) qualifies. The
+    /// caller's `key` may point into a caller heap, so storing it would let the
+    /// index dangle once that heap is dropped.
+    fn relocate_rebuilt_object(&mut self, replaced: Eterm, atoms: &AtomTable) -> Result<()> {
+        let keypos = self.opts.keypos();
+        // The key is the table-owned object's own key element, so it is only
+        // reachable once we know which root anchors the entry. Locate the entry by
+        // the replaced object's key (the object is still table-owned and live here).
+        let located = key_of(replaced, keypos)?;
+        let current = match self.interior.lookup(located, atoms).into_iter().next() {
             Some(current) => current,
             // The `set`/`ordered_set` kinds this path serves always keep exactly
             // one object per key.
@@ -280,7 +287,10 @@ impl Table {
         }
         match self.store.copy(current) {
             Ok(stored) => {
-                self.interior.insert(key, stored, atoms)?;
+                // `stored` is the table-owned copy: its own key element anchors the
+                // entry it is about to replace.
+                let stored_key = key_of(stored, keypos)?;
+                self.interior.insert(stored_key, stored, atoms)?;
                 // The object it replaced was in the table, so a fixed table defers
                 // its storage like any other removal.
                 self.free_object(replaced);
@@ -290,7 +300,7 @@ impl Table {
                 // The rebuilt object is not expressible in table storage (a fun,
                 // an external pid, …): put the table-owned object back rather than
                 // retain a caller-heap pointer, and report the failure.
-                self.interior.insert(key, replaced, atoms)?;
+                self.interior.insert(located, replaced, atoms)?;
                 Err(err)
             }
         }

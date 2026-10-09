@@ -1,3 +1,23 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
 //! [`TableTerm`] — a table-owned term that may not outlive the view that read it.
 //!
 //! A `TableTerm` is deliberately *not* a term: it exposes read-only accessors, an
@@ -214,6 +234,27 @@ impl<'g> TableTerm<'g> {
                 Some(TableTerm::new(unsafe { tuple_element(self.term, i) }))
             }
             _ => None,
+        }
+    }
+
+    /// Every element of a tuple term, first to last — the whole-row counterpart of
+    /// [`tuple_element`](Self::tuple_element).
+    ///
+    /// An **empty** vector means the term is not a tuple: a tuple always has arity
+    /// `>= 1`, so a caller that must tell a non-tuple apart from a (nonexistent)
+    /// empty tuple reads [`tuple_arity`](Self::tuple_arity) instead. Like
+    /// `tuple_element`, each element is tagged to the view's borrow and cannot
+    /// outlive it.
+    pub fn tuple_elements(&self) -> Vec<TableTerm<'g>> {
+        match self.tuple_arity() {
+            Some(arity) => (0..arity)
+                .map(|i| {
+                    // SAFETY: `i < arity == tuple_size(self.term)`, which is exactly
+                    // `tuple_element`'s precondition for a live tuple.
+                    TableTerm::new(unsafe { tuple_element(self.term, i) })
+                })
+                .collect(),
+            None => Vec::new(),
         }
     }
 

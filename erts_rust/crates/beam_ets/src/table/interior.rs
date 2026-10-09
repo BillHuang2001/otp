@@ -266,17 +266,26 @@ pub(crate) trait Interior: Send + Sync {
 /// `set` (per `set_interior`), the chained hash index for `bag`/`duplicate_bag`,
 /// the key-sorted B+-tree or sorted `Vec` for `ordered_set` (per
 /// `ordered_interior`).
+///
+/// `keypos` is the table's 1-based key position, threaded into the hash interior
+/// so it can re-anchor a surviving entry's stored key term to one of its remaining
+/// table-owned objects (`Interior::delete_object`). The CHAMP and ordered
+/// interiors never keep an entry whose anchor object was removed, so they need no
+/// `keypos`.
 pub(super) fn build_interior(
     kind: TableKind,
     set_interior: SetInterior,
     ordered_interior: OrderedInterior,
+    keypos: usize,
 ) -> Box<dyn Interior> {
     match kind {
         TableKind::Set => match set_interior {
             SetInterior::Champ => Box::new(ChampInterior::new()),
-            SetInterior::Chained => Box::new(HashInterior::new(kind)),
+            SetInterior::Chained => Box::new(HashInterior::with_keypos(kind, keypos)),
         },
-        TableKind::Bag | TableKind::DuplicateBag => Box::new(HashInterior::new(kind)),
+        TableKind::Bag | TableKind::DuplicateBag => {
+            Box::new(HashInterior::with_keypos(kind, keypos))
+        }
         TableKind::OrderedSet => match ordered_interior {
             OrderedInterior::BPlusTree => Box::new(OrderedSetInterior::new()),
             OrderedInterior::Sorted => Box::new(SortedOrderedInterior::new()),
