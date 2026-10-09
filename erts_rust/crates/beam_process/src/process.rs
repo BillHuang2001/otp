@@ -39,6 +39,7 @@ use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::Eterm;
 
 use crate::dict::Dict;
+use crate::error;
 use crate::fragments::SavedArgs;
 use crate::link::Links;
 use crate::monitor::{MonitoredBy, Monitors, PortWatch};
@@ -243,6 +244,17 @@ pub struct Process {
     save_calls: u16,
     /// The two-generation collector owning the young (mutator) and mature heaps.
     collector: Collector,
+    /// Whether this process is **relocation-exempt** (default `false`).
+    ///
+    /// A host (e.g. `beam_rt`) may hold live terms from this process's young heap in Rust locals
+    /// and nested-`Machine` registers that are **not** in the crate root set
+    /// ([`Process::collect`] publishes only `x[0..live)`, the whole stack, the mailbox payloads,
+    /// the process dictionary, the saved BIF/NIF args and the pending-signal queue). Relocating
+    /// the heap against that incomplete root set would recycle live words — a wrong result. While
+    /// exempt, [`Process::deliver`] surfaces the raw allocation refusal instead of collecting and
+    /// growing, and [`Process::collect`]/[`Process::ensure_capacity`] refuse with a typed error
+    /// (see [`Process::set_relocation_exempt`]).
+    relocation_exempt: bool,
     /// The process's off-heap (MSO) handles.
     off_heap: OffHeapTable,
     /// The mailbox.
@@ -331,6 +343,7 @@ impl Process {
             priority,
             save_calls: 0,
             collector: Collector::new(policy)?,
+            relocation_exempt: false,
             off_heap: OffHeapTable::new(),
             mailbox: Queue::new(),
             regs: Registers::new(),
@@ -674,10 +687,18 @@ impl Process {
     /// so a payload larger than the bounded nursery is still delivered — never duplicated and
     /// never truncated.
     ///
+    /// **Relocation-exempt processes** ([`Process::set_relocation_exempt`]) never take that path:
+    /// the raw `AllocKind::Heap`/`AllocKind::Message` refusal is returned **unchanged** — no
+    /// collection, no growth, no retry — because the host holds live words outside the crate root
+    /// set and relocating would recycle them. The raw refusal is exactly the signal the host's
+    /// fragment fallback keys on, so the message is still delivered (through a fragment) without
+    /// moving a word.
+    ///
     /// # Errors
     ///
     /// Propagates the retry's own `BeamError::Alloc` — an `AllocKind::Message` refusal — when
-    /// the payload still does not fit under the heap policy.
+    /// the payload still does not fit under the heap policy; for a relocation-exempt process it
+    /// propagates the **first** `AllocKind::Heap`/`AllocKind::Message` refusal unchanged.
     pub fn deliver(
         &mut self,
         from: Eterm,
@@ -692,6 +713,17 @@ impl Process {
             Err(BeamError::Alloc(failure))
                 if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
+                // A relocation-exempt receiver must NOT collect or grow: its heap cannot be
+                // relocated against the crate root set, because the host holds live words in Rust
+                // locals / nested-Machine registers that the root set does not publish (see
+                // [`Process::set_relocation_exempt`]). Surface the RAW refusal unchanged (`kind`
+                // still Heap/Message) — that is exactly what the host's fragment fallback keys on
+                // (`beam_rt::context::RuntimeContext::deliver_message` → `send_fragmented_message`),
+                // so the message is delivered through a fragment with **no** heap word moving under
+                // the host's unpublished handles.
+                if self.relocation_exempt {
+                    return Err(BeamError::Alloc(failure));
+                }
                 // The copier reports the whole graph's flat word count in the failure (as
                 // bytes) — for the preflight `AllocKind::Message` refusal and the mid-copy
                 // `AllocKind::Heap` one alike — so the words the growth must cover are
@@ -701,6 +733,10 @@ impl Process {
                 // collection sizes the nursery from what it left alive in it, not from what
                 // this request is about to allocate, so an oversized payload needs the
                 // on-demand growth (`Process::ensure_capacity`).
+                //
+                // This branch is reached only for a **non**-exempt process: an exempt one
+                // returned above (no collect, no growth, no retry), so the heap is never moved
+                // under the host's unpublished roots.
                 //
                 // The growth's own error is deliberately ignored. When the policy's ceiling
                 // makes the request unreachable, `ensure_capacity` fails **fail-fast** with
@@ -780,6 +816,39 @@ impl Process {
         self.collector.young().used_words()
     }
 
+    /// Marks this process as **relocation-exempt** (or clears the mark).
+    ///
+    /// A host (the `beam_rt` runtime is the motivating one) can hold live terms from this
+    /// process's young heap in Rust locals and nested-`Machine` registers that are **not** in the
+    /// crate root set: [`Process::collect`] publishes only the x-registers/stack, the mailbox
+    /// payloads, the process dictionary, the saved BIF/NIF args and the pending-signal queue, so a
+    /// term held by the `-eval` evaluator's environment or by a nested `Machine` would not be
+    /// relocated and its words would be recycled — a **wrong result**. While exempt:
+    ///
+    /// * [`Process::deliver`] does **not** collect or grow on an allocation refusal: it returns the
+    ///   raw `BeamError::Alloc(AllocKind::Heap | AllocKind::Message)` unchanged, which is exactly
+    ///   what the host's fragment fallback keys on (so the oversized message is delivered through a
+    ///   fragment and no heap word moves under the host's unpublished handles);
+    /// * [`Process::collect`] and [`Process::ensure_capacity`] refuse with the typed
+    ///   `relocation_exempt` raise rather than relocating against an incomplete root set;
+    /// * [`Process::collect_if_needed`] is a no-op answering `Ok(false)` (its return value means
+    ///   "a collection ran").
+    ///
+    /// The exemption is **per process** and defaults to `false`, so a process the host does not
+    /// explicitly mark behaves exactly as before. Enabling it is the host's assertion that *every*
+    /// live term from this process is reachable through the crate root set (or is otherwise safe to
+    /// leave un-relocated).
+    pub fn set_relocation_exempt(&mut self, exempt: bool) {
+        self.relocation_exempt = exempt;
+    }
+
+    /// Whether this process is **relocation-exempt** (default `false`).
+    ///
+    /// See [`Process::set_relocation_exempt`] for the contract the flag expresses.
+    pub fn is_relocation_exempt(&self) -> bool {
+        self.relocation_exempt
+    }
+
     /// Runs a safepoint collection over the whole process root set.
     ///
     /// The root set is the registers/stack ([`Registers::gather_roots`]) **plus** the
@@ -796,10 +865,20 @@ impl Process {
     /// gathered: a [`PortWatch`] holds a reference and a port number, both plain values
     /// rather than heap terms, so it cannot be relocated and needs no root.
     ///
+    /// A **relocation-exempt** process ([`Process::set_relocation_exempt`]) must **not** be
+    /// collected: the crate root set is incomplete for it (the host holds live words outside it),
+    /// so relocating would recycle live terms. Instead of a fabricated
+    /// [`Collection`](beam_gc::Collection) this returns the typed `relocation_exempt` raise, and
+    /// [`Process::run_rooted_collection`] is never entered.
+    ///
     /// # Errors
     ///
-    /// Propagates the collector's and the rebuilding allocations' `BeamError`s.
+    /// Propagates the collector's and the rebuilding allocations' `BeamError`s; the typed
+    /// `relocation_exempt` raise for an exempt process.
     pub fn collect(&mut self) -> Result<Collection> {
+        if self.relocation_exempt {
+            return Err(error::relocation_exempt("collect"));
+        }
         self.run_rooted_collection(|collector, roots| collector.collect(roots))
     }
 
@@ -822,7 +901,14 @@ impl Process {
     /// ceiling) makes the request unreachable, the typed [`BeamError::Alloc`] is returned
     /// **fail-fast**, before anything is collected, leaving the collector untouched; otherwise
     /// the collector's and the rebuilding allocations' `BeamError`s are propagated.
+    ///
+    /// A **relocation-exempt** process ([`Process::set_relocation_exempt`]) must **not** be grown
+    /// (growing runs a collection first), so this returns the typed `relocation_exempt` raise
+    /// without touching the collector — see [`Process::collect`].
     pub fn ensure_capacity(&mut self, need_words: usize) -> Result<Collection> {
+        if self.relocation_exempt {
+            return Err(error::relocation_exempt("ensure_capacity"));
+        }
         self.run_rooted_collection(|collector, roots| collector.ensure_capacity(need_words, roots))
     }
 
@@ -892,10 +978,18 @@ impl Process {
     /// Collects first when `need` more words do not fit, then reports whether a collection
     /// ran.
     ///
+    /// A **relocation-exempt** process ([`Process::set_relocation_exempt`]) never collects here
+    /// (its heap must not be relocated against an incomplete root set), so this returns
+    /// `Ok(false)` — "no collection ran" — regardless of `need`. The caller must already handle
+    /// the not-enough-room case (the host's fragment fallback).
+    ///
     /// # Errors
     ///
     /// Propagates the collector's errors.
     pub fn collect_if_needed(&mut self, need: usize) -> Result<bool> {
+        if self.relocation_exempt {
+            return Ok(false);
+        }
         if self.should_collect(need) {
             self.collect()?;
             Ok(true)

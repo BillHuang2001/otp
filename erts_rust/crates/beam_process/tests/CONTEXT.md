@@ -143,7 +143,21 @@ SMP pool:
     typed `Err(BeamError::Alloc(AllocKind::Message))` path (a `from_min_max(cap, cap)` policy cannot
     grow ⇒ the growth is refused **fail-fast** with `minor_gcs == 0`, mailbox untouched, no partial
     write, no panic, and a fitting payload still delivered afterwards).
-28. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
+28. `gc_exemption.rs` (4 tests) — the **host-controllable GC relocation exemption**
+    (`Process::set_relocation_exempt`/`is_relocation_exempt` + the `ProcessTable` convenience), the
+    white-box evidence that it *works*: while exempt, a delivery too large for the nursery returns the
+    **raw** `Err(BeamError::Alloc(AllocKind::Heap | Message))` and neither `minor_gcs()` nor the nursery
+    `base()` moves, and a Rust-local term written into that nursery (the host's unpublished live root) is
+    still structurally intact afterwards; the **counterpart** pins that the *same* delivery on an
+    **unexempt** process **does** collect + grow (`minor_gcs` up, `base` moved, message enqueued whole);
+    the defensive entries (`collect_if_needed` ⇒ `Ok(false)`; `collect`/`ensure_capacity` ⇒ the typed
+    `relocation_exempt` raise, reversible by clearing the flag); and the `ProcessTable` delegation
+    (unknown pid ⇒ `TermNotFound`). **Discriminating by construction: it FAILS the moment `deliver`
+    collects despite the exemption** (removing the `deliver` short-circuit *and* the `ensure_capacity`
+    guard makes both the no-relocation assertions and the defensive-entry assertions fail — verified
+    during development, then restored). Deterministic — every size from the public heap-policy arithmetic,
+    no sleeps / wall-clock bounds.
+29. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
     `monitor_tag.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`: `ERL_TIMEOUT`,
     `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the normalizer). It runs
     `erl -noshell -kernel logger_level none -eval …` (the `none` level deterministically suppresses the
@@ -170,13 +184,13 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **392 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **396 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
-  `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs` → the
-  single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
-  pre-emption/fairness and the delivery collect-and-retry path
+  `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`, `gc_exemption.rs` →
+  the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
+  pre-emption/fairness, the delivery collect-and-retry path and the host-controllable GC relocation exemption
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
   `spawn_options.rs` → the process-control surface: name registry + monitors (incl. the `monitor/3` user
   tag), the typed-error/capability inventory, the `process_info` item→accessor mapping, and the
