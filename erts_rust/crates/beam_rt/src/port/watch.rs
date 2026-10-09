@@ -91,14 +91,69 @@ use beam_io::{Event, Interest, Poller, Token};
 /// [`SignalWatch`] can ever see it.
 pub(crate) const SIGNAL_KEY: u64 = u64::MAX - 1;
 
+/// The one [`SignalFacility`] of a runtime, held in the `FACILITY` slot — and *leaked* instead
+/// of dropped by a **test** build.
+///
+/// [`SignalFacility::drop`] restores every disposition the facility changed, and a signal
+/// disposition is **process-global** (that is the whole point of the module). In production the
+/// slot is dropped exactly once, when the runtime's single thread exits, and restoring the priors
+/// there is the correct behaviour.
+///
+/// A libtest thread, by contrast, is torn down the instant its test function returns — while
+/// sibling signal tests keep running in the same process. That teardown's restore would set, say,
+/// `SIGUSR1` back to `SIG_DFL` between another test's `kill(1)` and its handler, and `SIGUSR1`'s
+/// default action terminates the whole test binary (`signal: 10`). It is not part of any test
+/// body, so the shared `test_guard` lock cannot exclude it.
+///
+/// The **test** build therefore leaks the facility at that point. The teardown drop is the only
+/// `sigaction(2)` call outside a guarded test body, so removing it leaves every disposition change
+/// inside a test that holds `test_guard` — and the dispositions are what the tests assert on.
+/// Production keeps the restoring `Drop` (the runtime is single-threaded and never drops the
+/// facility itself, so the leak never happens there anyway).
+struct FacilitySlot(Option<SignalFacility>);
+
+impl FacilitySlot {
+    /// An empty slot, before any `os:set_signal/2`.
+    const fn new() -> FacilitySlot {
+        FacilitySlot(None)
+    }
+
+    /// The live facility, or `None` before the first `os:set_signal/2`.
+    fn get_mut(&mut self) -> Option<&mut SignalFacility> {
+        self.0.as_mut()
+    }
+
+    /// Fills an empty slot and hands the freshly created facility back.
+    fn set(&mut self, facility: SignalFacility) -> &mut SignalFacility {
+        self.0.insert(facility)
+    }
+}
+
+/// A test build leaks the facility rather than dropping it, so a libtest thread's teardown can
+/// never restore the process-global dispositions under a concurrently running signal test (see
+/// [`FacilitySlot`]).
+///
+/// `mem::forget` keeps the facility — and therefore its self-pipe, which the process-global
+/// trampoline still points at — alive for the rest of the test binary, exactly as if the runtime
+/// thread had not exited.
+#[cfg(test)]
+impl Drop for FacilitySlot {
+    fn drop(&mut self) {
+        if let Some(facility) = self.0.take() {
+            std::mem::forget(facility);
+        }
+    }
+}
+
 thread_local! {
     /// The runtime's one long-lived signal facility, created by the first `os:set_signal/2`
     /// and kept for the process's life (see the module docs on the single-instance rule).
     ///
-    /// `RefCell<Option<..>>` rather than a `OnceLock` because the constructor is fallible:
-    /// the first call either fills the slot or reports the pipe-creation failure, and a
-    /// failed creation leaves the slot empty so a later call can try again.
-    static FACILITY: RefCell<Option<SignalFacility>> = const { RefCell::new(None) };
+    /// A [`FacilitySlot`] rather than a bare `Option<SignalFacility>` because the constructor
+    /// is fallible (the first call either fills the slot or reports the pipe-creation failure,
+    /// and a failed creation leaves the slot empty so a later call can try again) *and*
+    /// because a test build must not let the facility's `Drop` run (see [`FacilitySlot`]).
+    static FACILITY: RefCell<FacilitySlot> = const { RefCell::new(FacilitySlot::new()) };
 
     /// The signals whose **current** disposition is [`Disposition::Handle`], mirrored from the
     /// facility by [`install`].
@@ -147,9 +202,9 @@ pub(crate) fn install(signal: Signal, disposition: Disposition) -> Result<()> {
 pub(crate) fn with_facility<R>(f: impl FnOnce(&mut SignalFacility) -> Result<R>) -> Result<R> {
     FACILITY.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let facility = match slot.as_mut() {
+        let facility = match slot.get_mut() {
             Some(facility) => facility,
-            None => slot.insert(SignalFacility::new()?),
+            None => slot.set(SignalFacility::new()?),
         };
         f(facility)
     })
@@ -161,7 +216,7 @@ pub(crate) fn with_facility<R>(f: impl FnOnce(&mut SignalFacility) -> Result<R>)
 /// self-pipe (and supersede the trampoline's write end) for a runtime that never asked for
 /// signal handling, so the read-only probes of this module deliberately never do.
 fn with_existing_facility<R>(f: impl FnOnce(&mut SignalFacility) -> R) -> Option<R> {
-    FACILITY.with(|slot| slot.borrow_mut().as_mut().map(f))
+    FACILITY.with(|slot| slot.borrow_mut().get_mut().map(f))
 }
 
 /// Whether any signal's current disposition is [`Disposition::Handle`] (see [`HANDLED`]).

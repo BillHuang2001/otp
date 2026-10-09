@@ -147,40 +147,24 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
   resumes — so the drive does not take its `ran == 0` (nothing happened) fold.
 
-### A `-boot` value's shape can defeat the boot (owner: `beam_rt`'s runner — handoff)
-The boot's outcome is a function of the whole command line, and the `-boot` **value's byte length**
-perturbs it on a knife edge: the short canonical form (`<repo>/bootstrap/bin/start`, ~71 chars) carries
-the script cleanly to completion, while a slightly longer value — or one with a non-canonical segment
-(`.`, `..`, a doubled `/`), which shifts the byte count just as a longer name does — makes the runtime
-exit **1** with the raw `beam_rt: allocation failure: message (<garbage> bytes)` (the count is
-deterministic for a given argv but varies with it: `21096`, `42408`, `17123030415440`, …).
-`$P/bootstrap/bin/start` (71) is fine, `$P/bootstrap/./bin/start` (74) fails, and a padded long canonical
-path fails too — so it is heap layout (argv size shifts the arena layout, hence *when* a collection
-intervenes), not path semantics.
-**Mechanism** (confirmed from a full-debug build's stack, not from inspection): the dying scheduled
-process's **machine registers were never part of its process root set**. `Machine`'s registers reach
-`Process::regs` **only** through the in-slice admission point (`../context/gc.rs::ensure_heap`); the
-runner's `Wait`/`Yield` park arms (`../runner/run.rs` — the runner manager's file) store the engine into
-`RunnerState.engines` without publishing them and the resume arm never copies the (possibly relocated)
-`Process::regs` back into the machine. `Process::collect` from `Process::deliver` (the exit-signal
-cascade: `../..//beam_process/src/ptab.rs::copy_reason_onto` → `Process::copy_into_heap`) is **not** gated
-by `Runtime::gc_process_enabled`, so a collection of a *parked* process's heap relocates it against that
-partial root set and leaves a stale word in `x`; the reason the dying process's runner then recovers
-(`../runner/run.rs`'s `exit_reason` → `error::live_reason_term`) is built from it, and the raw
-`Alloc(AllocKind::Message)` surfaces only *later*, from the process-termination propagation, out through
-`Scheduler::slice_end` → `scheduler_pass` → `pump_scheduler` → the CLI — never via
-`error::enforce_term_heap_limit`, which does not wrap the terminate path. **It is a latent flake, not an argv special case:** the in-crate executor's own
-completion test (`boot::bootscript::tests::the_real_start_boot_completes_through_execute_reporting`) has
-been observed to fail once under load at `bootscript.rs:1217` and pass on every re-run — same layout
-sensitivity, same path. The `Err(_)` arm of
-`../runtime/gc.rs::stabilize_escaped` compounds it by **swallowing** the un-copyable reason and returning
-the stale term (it also trips the global GC valve). **`src/boot/**` cannot fix it.**
-`tests/boot.rs`
-therefore builds its `-boot` value from `CARGO_MANIFEST_DIR`'s ancestors (`start_boot()`), whose canonical
-short form is the safe one. Repro:
-`ERL_CRASH_DUMP_SECONDS=0 beam_rt -noshell -boot "$PWD/bootstrap/./bin/start"` →
-`beam_rt: allocation failure: message (…)`; `… -boot "$PWD/bootstrap/bin/start"` → the boot completes
-(exit 0).
+### A `-boot` value's shape does not affect the outcome
+The boot is **not** sensitive to the byte length or the canonical form of the `-boot` value:
+`$P/bootstrap/bin/start`, `$P/bootstrap/./bin/start`, `$P/bootstrap//bin/start` and
+`$P/bootstrap/../bootstrap/bin/start` all carry the real script to completion (exit 0, empty
+stdout/stderr — 40/40 runs across the four forms).
+**What guarantees it is the runner's parked-root publication.** A suspended process's machine lives
+in `RunnerState.engines`, and a machine's registers are only a *copy* of the process's root set; the
+runner therefore publishes the parked machine's whole live root set into `Process::regs` at **both**
+park arms and re-syncs the machine from the process's authoritative root set on resume
+(`../runner/run.rs::publish_parked_roots` / `resume_from_process_roots`). Without that pair a
+collection driven while the process was parked — `Process::deliver`'s exit cascade is **not** gated
+by `Runtime::gc_process_enabled` — would relocate the heap against a partial root set and leave a
+stale word in `x`, which is what argv length used to perturb.
+**The escape-store stabilization is honest.** `../runtime/gc.rs::try_stabilize_escaped` copies a
+runtime-level store's term onto the pointer-stable arena, propagates a **genuine** copy failure as
+the emulator's `error:system_limit` (never storing an un-copied term) and trips the `disable_gc`
+valve **only** for the documented off-heap-payload capability gap, where the original term is kept
+because it cannot be duplicated.
 
 ### Remaining gaps (owner per link)
 1. **`beam_engine`.** `Instr::Apply`/`ApplyLast` (`families/funs.rs::apply_target`) dispatch through the
@@ -255,8 +239,8 @@ short form is the safe one. Repro:
 - `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry;
   `boot_from_script_reporting` is the boot-stop-position entry point, and the in-crate boot-script suite
   exercises the `execute_reporting`/`BootStop` report API a genuine future stop would use.
-- `../tests/boot.rs` (integration, owned by this node): `start_boot()` builds a canonical, short `-boot`
-  value (avoiding the heap-fragility above) and, with the CLI-equivalent configuration, asserts the real
+- `../tests/boot.rs` (integration, owned by this node): `start_boot()` builds the `-boot` value as a
+  canonical absolute path (`<repo>/bootstrap/bin/start`) from `CARGO_MANIFEST_DIR`'s ancestors and, with the CLI-equivalent configuration, asserts the real
   script runs **all 22 directives** to `{progress,started}` — instruction 20 is the `{apply,{c,erlangrc,[]}}`
   directive the native `file_server_2` service unblocks, and the `primLoad` batches really loaded; the
   `-boot` CLI drive of a synthetic script; the CLI running the real `start.boot` to completion (exit 0,

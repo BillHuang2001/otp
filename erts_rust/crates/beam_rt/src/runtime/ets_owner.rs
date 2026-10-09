@@ -71,6 +71,21 @@
 //! and a table's *name* discovered after creation (a `named_table` renamed by no one, but whose
 //! creation the runtime did not see) would leave a name registration behind. That is a name
 //! leak, not a table leak: the table itself is still reclaimed through the roster.
+//!
+//! # The `ets:setopts/2` gift-data gap (a handoff, not fixable here)
+//!
+//! The heir a `{heir, Pid, Data}` option installs must be a **table-owned copy** of `Data` (the
+//! A.1 copy boundary the oracle's `copy_heir_data`, `erl_db.c`, draws): the drain below hands
+//! that term to the `{'ETS-TRANSFER', Tid, FromPid, Data}` message **after** the owner is dead,
+//! so a term still aliasing the dead process's heap would be garbage. A creation-time option is
+//! safe — `beam_bifs`'s `ets:new/2` builds the table with `beam_ets::Table::new`, which deep-copies
+//! it — but `beam_bifs`'s `ets:setopts/2` (`src/ets/adopt.rs::setopts_2`) routes `{heir, …}` to
+//! `beam_ets::Table::setopts`, which by design installs the gift term **verbatim** (see its own
+//! "does not copy" doc). `Runtime::own_heir_gift` cannot neutralize that: it is reachable only
+//! from `Runtime::adopt_created_table`, i.e. the runtime's `ets:new/2` interception. The fix
+//! belongs in `beam_bifs` (install the heir through `beam_ets::Table::install_heir` after the
+//! same owner check) or in `beam_ets` (make `Table::setopts` copy like `install_heir`); either
+//! would make this drain's message term table-owned for every install path.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -278,23 +293,27 @@ impl Runtime {
         self.own_heir_gift(handle);
     }
 
-    /// Makes a freshly created table's heir gift term a **table-owned copy**.
+    /// Re-owns a freshly created table's heir gift term through
+    /// [`Table::install_heir`](beam_ets::Table::install_heir) — the A.1 copy boundary, which
+    /// deep-copies the gift data into table-owned storage and reclaims the outgoing copy.
     ///
-    /// A creation-time `{heir, Pid, Data}` reaches the table as a raw term living in the
-    /// **creating process's** heap (`beam_bifs`'s `ets:new/2` installs the parsed heir with
-    /// [`Table::set_heir`](beam_ets::Table::set_heir), the non-copying primitive), so it
-    /// aliases that heap: the moment the creator dies — or its per-process heap is collected
-    /// over — the pointer dangles and the `{'ETS-TRANSFER', …, Data}` message would carry
-    /// garbage. The oracle instead stores the gift data in a table-owned term
-    /// (`copy_heir_data`, `erl_db.c`), which is what
-    /// [`Table::install_heir`](beam_ets::Table::install_heir) reproduces (the A.1 copy
-    /// boundary). This runs while the creator is still alive, so the copy reads a live term.
+    /// The current `ets:new/2` ([`beam_bifs`]'s `src/ets.rs`) already builds the table with
+    /// [`Table::new`](beam_ets::Table::new), whose build path deep-copies a creation-time
+    /// `{heir, Pid, Data}` into the table's own store (`Table::build_with` → `Table::copy_heir`),
+    /// so the gift term this reads back is **already** a table-owned copy and the re-copy here is
+    /// a defensive, value-identical no-op. It stays because it is the copy boundary for any
+    /// creation path that reached the table through the raw, non-copying
+    /// [`Table::set_heir`](beam_ets::Table::set_heir): a raw term would live in the **creating
+    /// process's** heap, so the moment the creator died — or its per-process heap was collected
+    /// over — the pointer would dangle and the `{'ETS-TRANSFER', …, Data}` message would carry
+    /// garbage. The oracle stores the gift data in a table-owned term (`copy_heir_data`,
+    /// `erl_db.c`), which is what `install_heir` reproduces. This runs while the creator is still
+    /// alive, so any copy reads a live term.
     ///
     /// A term outside `beam_ets`'s copyable subset (a fun, an off-heap bin ref, …) is that
-    /// crate's documented typed `badarg`; the raw reference is then left in place — the
-    /// behaviour from before this copy existed — so a gift term this runtime cannot own never
-    /// turns a working `ets:new/2` into a failure. (The oracle copies *any* term, so closing
-    /// that subset is a `beam_ets` handoff, not a wrong result here.)
+    /// crate's documented typed `badarg`; the term already in the table is then left in place
+    /// (this step never turns a successful `ets:new/2` into a failure). The oracle copies *any*
+    /// term, so closing that subset is a `beam_ets` handoff, not a wrong result here.
     fn own_heir_gift(&mut self, handle: u64) {
         // The registry is free here (this runs right after the `ets:new/2` BIF returned), but a
         // `try_borrow_mut` keeps a nested borrow a no-op instead of a panic — the same
