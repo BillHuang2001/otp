@@ -166,6 +166,13 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
     `update_counter_with`, `update_element`, `select_delete`, `match_delete`, `select_replace`,
     `set_fixation`, `set_owner`, `set_heir`, `setopts`, `give_away`), `heir()`, `take ->
     Vec<TableTerm<'_>>`, and `as_requester`.
+  - **View-borrowed traversal** (`view/iter.rs`) — `TableRead::{iter_keys, iter_keys_rev, iter_objects,
+    iter_objects_rev}` (each yields `TableTerm<'a>` bound to the view borrow via `ets:first|next` /
+    `last|prev`; the `*_objects` forms expand the multi kinds per object), `TableRead::{foldl, foldr}`
+    over objects, and the bulk copy-out `TableRead::tab2list_into(&mut TermStore) -> Result<Vec<Eterm>>`.
+    Every item is a `TableTerm<'_>` tied to the borrow and the iterators are returned as
+    `impl Iterator`, so no private view type leaks into a public signature. A full hash-kind walk is
+    O(n²), so `tab2list_into` stays the bulk path.
   - The views are `!Send` by design (they carry a scratch `Heap`): neither a view nor its aliasing
     terms can move to another thread.
 
