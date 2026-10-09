@@ -610,7 +610,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `bitstring_parts`/`bit_at` vs `bit_size`/per-bit/byte views for `<<1:3>>`-style bitstrings and
   binaries, and bignum *observables* (`eq`/`cmp`/`cmp_arith`/`size_object` on multi-limb
   `write_big` terms) vs the oracle's `=:=`/`<`/`>` and `erts_debug:flat_size/1` across the 2- and
-  3-limb boundary. Skips loudly (never fails) when `erl` is absent/does not answer.
+  3-limb boundary, and the flat-map **stored key order** (`cmp_flatmap_keys` /
+  `map_pairs_storage_order`: binary keys byte-lexicographically, atom keys by atom-table *index*)
+  vs the oracle's `maps:to_list/1`. Skips loudly (never fails) when `erl` is absent/does not answer.
 - `tests/number_oracle.rs` — the crate-local live-`erl` cross-check of `number::big_to_f64`/
   `number_as_f64`: it materializes a large corpus of bignums (`write_big` limbs) both as `beam_term`
   terms and as Erlang integer literals, has the oracle convert each with `float/1`, and compares the
