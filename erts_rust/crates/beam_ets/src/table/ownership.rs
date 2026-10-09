@@ -18,8 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! The table **ownership** surface: `ets:give_away/3` and the `{heir, ...}`
-//! option of `ets:setopts/2`.
+//! The table **ownership** surface: `ets:give_away/3` and the `{heir, ...}` /
+//! `{protection, Access}` options of `ets:setopts/2`.
 //!
 //! The observable semantics mirror the oracle (`erl` OTP 29 / erts-17.1) and the
 //! legacy C (`ets_give_away_3` / `ets_setopts_2` in `../../erts/emulator/beam/erl_db.c`):
@@ -30,6 +30,10 @@
 //! * `ets:setopts(T, {heir, Pid})` / `ets:setopts(T, {heir, Pid, Data})` /
 //!   `ets:setopts(T, {heir, none})` installs or clears the heir and requires the
 //!   caller to be the owner.
+//! * `ets:setopts(T, {protection, Access})` changes the access mode and likewise
+//!   requires the caller to be the owner. It changes the **access mode only** —
+//!   the fine-locking flags keep their creation-time normalization (see
+//!   [`SetOpt::Access`], the one option that is not about the heir).
 //!
 //! # The heir has two forms, and the difference is observable
 //!
@@ -113,6 +117,7 @@
 use beam_common::Result;
 use beam_term::prelude::*;
 
+use crate::kind::Access;
 use crate::store::TermStore;
 
 use super::{OwnerId, Table};
@@ -135,8 +140,10 @@ pub struct Heir {
     pub data: Option<Eterm>,
 }
 
-/// The parsed `{heir, ...}` option of `ets:setopts/2` (the subset this crate
-/// models).
+/// The parsed `ets:setopts/2` option (the subset this crate models).
+///
+/// Both options `ets:setopts/2` can carry here require the caller to be the table
+/// **owner** (`badarg` otherwise); see [`Table::setopts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetOpt {
     /// `{heir, Pid}` (no gift data) or `{heir, Pid, Data}` — install the heir; see
@@ -144,6 +151,18 @@ pub enum SetOpt {
     Heir(Heir),
     /// `{heir, none}` — clear the heir.
     ClearHeir,
+    /// `{protection, Access}` — change the table's access mode (the `protection`
+    /// of `ets:info/2`) at runtime.
+    ///
+    /// The change is **only** the observable access mode: the oracle does *not*
+    /// re-normalize the fine-locking flags, so a `public` table created with
+    /// `{write_concurrency, true}` and then switched to `private` still reports
+    /// `write_concurrency => true` (and `decentralized_counters => true`), even
+    /// though a table *created* `private` with the same option reports `false`
+    /// (probed against the live `erl`). [`TableOptions`](crate::TableOptions)
+    /// therefore stays the creation-time model and is never mutated by this
+    /// option — see [`Table::set_access`].
+    Access(Access),
 }
 
 impl Table {
@@ -271,6 +290,12 @@ mod tests {
         assert_eq!(opt, SetOpt::Heir(copied));
         assert_ne!(opt, SetOpt::ClearHeir);
         assert!(format!("{opt:?}").contains("Heir"));
+
+        let access = SetOpt::Access(Access::Private);
+        assert_eq!(access, SetOpt::Access(Access::Private));
+        assert_ne!(access, SetOpt::Access(Access::Public));
+        assert_ne!(access, SetOpt::ClearHeir);
+        assert!(format!("{access:?}").contains("Private"));
     }
 
     /// The arity-2 form is representable and is **not** the same heir as the
@@ -372,6 +397,46 @@ mod tests {
             Err(BeamError::BadArg)
         ));
         assert_eq!(t.heir(), None, "heir unchanged after a denied setopts");
+    }
+
+    /// `setopts(SetOpt::Access(_))` moves the access mode for the owner and is
+    /// `badarg` — with nothing changed — for anyone else, the same owner gate the
+    /// `{heir, …}` forms obey.
+    #[test]
+    fn setopts_access_changes_the_access_mode_only_for_the_owner() {
+        let mut t = new_table();
+        let owner = OwnerId::new(1);
+        t.set_owner(Some(owner));
+        assert_eq!(t.access(), Access::Protected, "the default access mode");
+
+        t.setopts(Some(owner), SetOpt::Access(Access::Private))
+            .expect("the owner may change the protection");
+        assert_eq!(t.access(), Access::Private);
+        assert_eq!(t.info().access, Access::Private, "info carries the change");
+        assert!(t.check_read(Some(owner)).is_ok());
+
+        // A non-owner is `badarg` and the access mode is untouched: the owner gate
+        // runs before the mutation, so a denied call changes nothing.
+        let other = OwnerId::new(2);
+        assert!(matches!(
+            t.setopts(Some(other), SetOpt::Access(Access::Public)),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            t.setopts(None, SetOpt::Access(Access::Public)),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(t.access(), Access::Private, "unchanged after a denied call");
+        assert_eq!(t.info().access, Access::Private);
+
+        // An access change leaves the heir alone (and vice versa).
+        let heir = OwnerId::new(9);
+        t.setopts(Some(owner), SetOpt::Heir(Heir { owner: heir, data: None }))
+            .expect("the owner may set the heir");
+        t.setopts(Some(owner), SetOpt::Access(Access::Public))
+            .expect("the owner may change the protection");
+        assert_eq!(t.access(), Access::Public);
+        assert_eq!(t.heir(), Some(Heir { owner: heir, data: None }));
     }
 
     /// The owner-level primitive bypasses the owner check (it is what the runtime
