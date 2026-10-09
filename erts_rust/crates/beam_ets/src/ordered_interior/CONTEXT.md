@@ -80,6 +80,6 @@ traces. End-to-end `ordered_set` behaviour is oracle-differential-tested in `../
 - `sorted.rs` → `SortedOrderedInterior` (the sorted-`Vec` alternative) + its tests
 
 ## See Also
-- `../CONTEXT.md` (`beam_ets/src`) and `../../CONTEXT.md` (`beam_ets`) → the `Interior` seam, the crate API surface and the `ordered_set` interior entry.
+- `../../CONTEXT.md` (`beam_ets`) → the `Interior` seam, the crate API surface and the `ordered_set` interior entry.
 - `../table/interior.rs` → the `Interior` trait both interiors implement.
 - `../../../../erts/emulator/beam/erl_db_tree.c` → the legacy CATREE `ordered_set` being mirrored (read-only).
