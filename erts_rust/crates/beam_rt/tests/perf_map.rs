@@ -34,11 +34,13 @@
 //! * a value outside the grammar is a usage error (exit 2 in this runtime; the oracle
 //!   exits 1 — see `src/cli/flags.rs`'s documented divergence).
 //!
-//! The map this runtime writes is **empty**: it executes the typed IR on the interpreter and
-//! `beam_engine`'s baseline JIT exposes no native code ranges, and an address is never
-//! fabricated. That is pinned explicitly below, and the oracle cross-check (which skips
-//! loudly without `erl`) shows the same file path and the same line grammar on the real
-//! system's non-empty map.
+//! The map this runtime writes is **empty** for the invocations this suite drives: it holds only
+//! the baseline JIT's real cached code ranges, recorded once per module-export first entry by
+//! `src/runner/perf.rs::record_baseline_code`, so it only fills for a **scheduled** process — and
+//! the CLI actions below (`-eval ok`) run no scheduled process, so they record no baseline range.
+//! An address is never fabricated. That is pinned explicitly below, and the oracle cross-check
+//! (which skips loudly without `erl`) shows the same file path and the same line grammar on the
+//! real system's non-empty map.
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -201,11 +203,12 @@ fn plus_jperf_map_writes_the_map_at_the_documented_location() {
     assert_eq!(entries(&dir), [format!("perf-{pid}.map")]);
 }
 
-/// The map this runtime writes is **empty**: it produces no JIT-ed machine code and exposes
-/// no native ranges, and an address is never fabricated (see `src/perf_map.rs`).
+/// A non-scheduled invocation (`-eval ok`) fills no map because only a scheduled process feeds
+/// real ranges through `PerfMap::record`; an address is never fabricated (see `src/perf_map.rs`).
 ///
-/// This is the documented Milestone-1 outcome, pinned so that a future runtime which does
-/// feed ranges through `PerfMap::record` has to update it deliberately.
+/// This is the documented Milestone-1 outcome, pinned so that routing one of these actions
+/// through the scheduler (or any future runtime which feeds ranges through `PerfMap::record`)
+/// has to update it deliberately.
 #[test]
 fn the_map_is_a_well_formed_empty_file() {
     let dir = scratch("empty");
@@ -454,7 +457,8 @@ fn the_runtime_owns_the_perf_map_and_records_through_it() {
 // ---------------------------------------------------------------------------------------
 
 /// Both runtimes create the map at the same documented path with the same line grammar; the
-/// oracle's map is non-empty (it has JIT ranges) and this runtime's is empty (it has none).
+/// oracle's `-eval` probe has JIT ranges, while this runtime's `-eval` probe runs no scheduled
+/// process so it records no baseline range.
 ///
 /// The oracle probe is `-noshell +JPperf <value> -eval ok -s init stop`, with
 /// `ERL_SYM_MAP_FILE` pinning the path (the oracle's own pid is the launcher's `exec`-ed
@@ -485,7 +489,8 @@ fn the_map_location_and_line_grammar_match_the_oracle() {
     let text = assert_valid_map(&oracle_map);
     assert!(!text.is_empty(), "the oracle's map names its JIT ranges");
 
-    // The runtime under test: same path, same grammar, empty map.
+    // The runtime under test: same path, same grammar, empty map — `-eval` runs no scheduled
+    // process, so no baseline range is recorded.
     let (_, output) = beam_rt_perf(
         &["+JPperf", "map"],
         &[("ERL_SYM_MAP_FILE", oracle_map_str)],

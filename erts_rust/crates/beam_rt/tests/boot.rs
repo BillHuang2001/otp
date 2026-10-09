@@ -285,7 +285,7 @@ fn pre_loaded_matches_the_live_oracle() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. A real boot script: loads modules, then stops honestly
+// 4. A real boot script: loads modules and runs to completion
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -331,8 +331,9 @@ fn the_real_start_boot_runs_to_completion() {
         "the boot chain ends at `{{progress,started}}`, found {:?}",
         script.instructions.last()
     );
-    // The last `apply` directive really is instruction 20 — the one the chain used to stop
-    // at before the native `file_server_2` service answered its `{open, …}`.
+    // The last `apply` directive really is instruction 20 — `{apply,{c,erlangrc,[]}}`, whose
+    // file consult the native `file_server_2` service answers, so the chain proceeds to
+    // `{progress,started}`.
     assert!(
         matches!(
             script.instructions.get(20),
@@ -718,8 +719,8 @@ fn a_boot_without_the_boot_flag_keeps_the_preloaded_only_drive() {
     if booted_runtime().is_none() {
         return;
     }
-    // No `-boot`: the boot action loads the 22 preloaded modules and stops there, as before
-    // the boot script was wired in — no output, exit 0.
+    // No `-boot`: the boot action loads the 22 preloaded modules and drives no boot script —
+    // no output, exit 0.
     let output = beam_rt_boot(&["-noshell"]);
     assert_eq!(output.status.code(), Some(0), "stderr {:?}", stderr(&output));
     assert!(output.stdout.is_empty(), "stdout {:?}", stdout(&output));
