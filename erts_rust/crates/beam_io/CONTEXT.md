@@ -154,7 +154,7 @@ Full detail is in the child node **`src/abi/CONTEXT.md`** — read it there.
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN**, and `... build --workspace --all-targets` **GREEN, warning-free**.
-Current: **539 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[cfg(test)]`) + **160** across the 16 `tests/*.rs` suites + **5** doctests (3 passed: the `!Send`/`!Sync` compile-fail pins on `PortRegistry` + the `IoDevice` example; 2 `ignore`d: `cpu_time::RuntimeClock`, `port`).
+Current: **545 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[cfg(test)]`) + **166** across the 18 `tests/*.rs` suites + **5** doctests (3 passed: the `!Send`/`!Sync` compile-fail pins on `PortRegistry` + the `IoDevice` example; 2 `ignore`d: `cpu_time::RuntimeClock`, `port`).
 - **In-module (376):** `drivers` 183 (`inet` 115, `spawn` 23, `line_buffer` 13, `fd` 13, `efile` 11, `binary_io` 8), `io_device` 40 (`tests` 25, `encoding` 7, `source` 5, `continuation` 3), `abi` 33 (`host` 15, `port` 8, `table` 7, `job` 3), `registry` 25, `signal` 20, `port_task` 16, `poller` 12, `timer` 12, `ddll` 11, `queue` 8, `driver` 6, `cpu_time` 6, `error` 4.
 - The C-driver suites and the `erl`-oracle cases **skip loudly** without `cc`/`erl_nif.h`/`erl`.
   The C-driver fixtures assert a real `beam_abi::driver::loader::load`; **linking needs BOTH `build.rs`'s `-Wl,--export-dynamic` and a `driver_api_table()` reference from the test binary** (either alone ⇒ `dlopen(RTLD_NOW)` fails with `undefined symbol: driver_mk_port`).
