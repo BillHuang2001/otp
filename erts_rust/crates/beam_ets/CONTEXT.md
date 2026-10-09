@@ -487,8 +487,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   comparing canonical renderings line-by-line (`mismatch = 0`, `KNOWN_DIVERGENCES` empty). Without
   `erl` the live-oracle tests skip loudly; `BEAM_ETS_REQUIRE_ORACLE=1` turns a skip into a failure.
 - **Gates (GREEN required):**
-  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` (407 passed /
-  0 failed) and `… --workspace`. Forced-oracle:
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` (479 passed /
+  0 failed; the workspace is 6407/0) and `… --workspace`. Forced-oracle:
   `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_ets --test differential`.
 
