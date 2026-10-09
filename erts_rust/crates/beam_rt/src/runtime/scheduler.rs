@@ -44,13 +44,14 @@
 //! and only when it has nothing else to do.
 
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_dist::driver::ConnectionDriver;
 use beam_dist::Dispatched;
-use beam_process::{ProcessId, ProcessState, ProcessTable, Scheduler, SignalAtoms};
+use beam_process::{PortTable, ProcessId, ProcessState, ProcessTable, Scheduler, SignalAtoms};
 use beam_term::Eterm;
 
 use crate::dist::{LocalDeliverySink, NONODE_NAME};
@@ -228,8 +229,9 @@ impl Runtime {
     /// * **raised** — the **original** [`BeamError`] is returned, so the CLI classifies the
     ///   raise (its class, its `unsupported` marker) exactly as the single-pass path did
     ///   (see [`Runtime::take_process_error`]);
-    /// * is **blocked with nothing left that could wake it** — the run queue drained, no live
-    ///   port and no pending timer deadline — reported with the very
+    /// * is **blocked with nothing left that could wake it** — the run queue drained,
+    ///   nothing left to poll (no live port and no registered signal watch) and no pending
+    ///   timer deadline — reported with the very
     ///   [`beam_engine::blocked`] diagnostic the single-pass path reports, so a bare `wait`
     ///   keeps its immediate, honest answer instead of spinning out the deadline; or
     /// * **outlived [`RUN_DEADLINE`]** — an honest "did not terminate" diagnostic.
@@ -310,11 +312,18 @@ impl Runtime {
     }
 
     /// Whether the scheduler has nothing left that could wake a blocked process: an empty
-    /// run queue, no live port and no pending timer deadline.
+    /// run queue, **nothing left to poll** (no live port *and* no registered signal watch —
+    /// [`PortRegistry::has_nothing_to_poll`](crate::port::PortRegistry::has_nothing_to_poll))
+    /// and no pending timer deadline.
     ///
     /// This is the pump's quiescence test ([`Runtime::run_scheduled`]): when it holds, no
     /// process can run, no port can deliver and no timer can fire, so a blocked process
     /// would block forever and the honest answer is [`beam_engine::blocked`].
+    ///
+    /// The predicate is the port layer's own "is there anything for a poll round to wait
+    /// on?" question, not "is a port open": `os:set_signal/2`'s self-pipe is pollable with
+    /// **zero** ports, so a runtime that only watches a signal must not be declared stalled
+    /// while a caught signal could still deliver `{notify, Signal}`.
     ///
     /// A port table that cannot be borrowed (a nested borrow) is reported as **not**
     /// quiescent: the pump then keeps stepping rather than declaring a stall it cannot
@@ -324,7 +333,7 @@ impl Runtime {
             return false;
         }
         match self.ports.try_borrow() {
-            Ok(registry) if !registry.is_empty() => return false,
+            Ok(registry) if !registry.has_nothing_to_poll() => return false,
             Err(_) => return false,
             Ok(_) => {}
         }
@@ -889,7 +898,135 @@ impl Runtime {
     fn put_processes(&mut self, table: ProcessTable) {
         self.processes = table;
     }
+
+    /// Runs `f` with a **process table** and the runtime's live **port table** borrowed
+    /// together — the short-borrow seam for a `beam_process` operation that takes both.
+    ///
+    /// Several `beam_process` seams take the two tables as *disjoint* parameters because the
+    /// port table is a distinct type: `ProcessTable::port_closed(&mut self, ports, port,
+    /// reason)`, `ProcessTable::{monitor_port, monitor_port_term, demonitor_port}` and the
+    /// `*_with_ports` forms of [`Scheduler`] and [`ProcessTable`]. The port table, however,
+    /// lives **inside** the runtime's shared `Rc<RefCell<PortRegistry>>` (`Runtime::ports`),
+    /// reached through
+    /// [`PortRegistry::port_table_mut`](crate::port::PortRegistry::port_table_mut), so a
+    /// caller must borrow that cell to get at it. This is the one place that borrow dance
+    /// lives for a caller that already holds the other table:
+    ///
+    /// * the `Rc` is cloned **first**, so the returned `RefMut` borrows the *clone* rather
+    ///   than the runtime — which is what lets `table` be borrowed at the same time (the
+    ///   `#![deny(unsafe_code)]` runtime may not alias);
+    /// * the borrow is held for the **one `f` call**, and nothing else. A port BIF runs
+    ///   *inside* a scheduler slice — `open_port`/`port_command`/`port_close` from
+    ///   interpreted code — and borrows the same cell itself, so holding this borrow across
+    ///   anything that runs Erlang (the `Scheduler`/`ProcessTable` `*_with_ports` forms,
+    ///   say) turns every such BIF into the typed `unsupported` capability gap. That is why
+    ///   the pass does **not** route its slices through `run_ready_with_ports`; it discharges
+    ///   the same obligations at its boundaries instead (the dead watcher's outgoing
+    ///   `PortWatch` pairs — see `crate::runtime::ets_owner`);
+    /// * a **nested** borrow (a port operation re-entered from inside one) stays the typed
+    ///   capability gap, never a panic.
+    ///
+    /// `f`'s own error is returned untouched.
+    ///
+    /// # Errors
+    ///
+    /// The typed `unsupported` capability gap when the port registry is already borrowed (a
+    /// nested port operation), plus whatever `f` returns.
+    ///
+    /// [`RefMut`]: std::cell::RefMut
+    pub fn with_port_table<R>(
+        &self,
+        table: &mut ProcessTable,
+        f: impl FnOnce(&mut ProcessTable, &mut PortTable) -> Result<R>,
+    ) -> Result<R> {
+        let cell = Rc::clone(&self.ports);
+        let mut registry = cell
+            .try_borrow_mut()
+            .map_err(|_| error::unsupported("the port table is already in use"))?;
+        f(table, registry.port_table_mut())
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+/// The two pins that live next to the code they pin: the **quiescence predicate** (a
+/// portless runtime that only watches a signal is *not* stalled) and the **short-borrow
+/// seam** ([`Runtime::with_port_table`]).
+///
+/// They are inlined here rather than added to the sibling [`tests`] module because both are
+/// about this file's own borrow/quiescence pairing; the fixtures the sibling module needs
+/// (committed `.beam`s, a booted runtime) are not.
+#[cfg(test)]
+mod quiescence_and_port_table_tests {
+    use super::*;
+
+    use beam_io::signal::{Disposition, Signal};
+
+    use crate::port::watch;
+
+    /// A `handle` disposition makes `os:set_signal/2`'s self-pipe worth polling — with
+    /// **zero** ports open — so the pump must not declare quiescence while one is installed;
+    /// and once the disposition is gone the very same runtime is quiescent again.
+    ///
+    /// A signal disposition is **process-global**, so the test serializes on the port
+    /// layer's own lock ([`watch::test_guard`]) and restores `default` before it returns.
+    #[test]
+    fn a_pollable_signal_watch_keeps_a_portless_runtime_from_being_quiescent() {
+        let _guard = watch::test_guard();
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        assert!(rt.is_quiescent(), "an idle runtime is quiescent");
+
+        watch::install(Signal::SigUsr1, Disposition::Handle).expect("handle on sigusr1");
+        assert!(
+            !rt.ports
+                .try_borrow()
+                .expect("the port registry is free")
+                .has_nothing_to_poll(),
+            "a handled signal leaves something to poll with no port open"
+        );
+        assert!(
+            !rt.is_quiescent(),
+            "a pollable signal watch is work the pump still has, not a stall"
+        );
+
+        watch::install(Signal::SigUsr1, Disposition::Default).expect("restore the disposition");
+        assert!(
+            rt.is_quiescent(),
+            "with the watch no longer pollable there is nothing left that could wake a process"
+        );
+    }
+
+    /// The seam hands a caller the **process table** and the live **port table** together for
+    /// one call, and a nested borrow of the shared port cell is the typed capability gap —
+    /// never a panic.
+    #[test]
+    fn the_short_borrow_seam_hands_both_tables_out_and_a_nested_borrow_is_a_typed_gap() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let self_pid = rt.self_pid();
+        // The shape a pass has: the table is moved out of the runtime, so the caller owns it
+        // while the runtime still provides the port half.
+        let mut table = rt.take_processes();
+        let mut other = ProcessTable::new(SignalAtoms::from_table(rt.code_server.atoms_mut()));
+        let seen = rt
+            .with_port_table(&mut table, |table, ports| {
+                Ok((table.contains(self_pid), ports.len()))
+            })
+            .expect("the port registry is free");
+        assert_eq!(
+            seen,
+            (true, 0),
+            "the call sees the live process table and the (empty) live port table"
+        );
+
+        let nested = rt.with_port_table(&mut table, |_table, _ports| {
+            rt.with_port_table(&mut other, |_table, _ports| Ok(()))
+        });
+        let error = nested.expect_err("a nested borrow of the port table is a typed gap");
+        assert_eq!(
+            crate::error::unsupported_reason(&error).as_deref(),
+            Some("the port table is already in use")
+        );
+        rt.put_processes(table);
+    }
+}
