@@ -58,7 +58,7 @@ these eight directives, the full modelled set:
 | `{primLoad,[Mod]}` (2) | `PrimLoad` | load each name from the code path |
 | `{kernel_load_completed}` (1) | `KernelLoadCompleted` | informational marker; never fails |
 | `{module,Mod}` (2) | `Module` | load one name from the code path |
-| `{kernelProcess,Name,{M,F,A}}` (3) | `KernelProcess` | materialize args, spawn, then drive a bounded burst so the process registers `Name` **itself**; then **unlink** it from the short-lived directive process |
+| `{kernelProcess,Name,{M,F,A}}` (3) | `KernelProcess` | materialize args, spawn, then drive a bounded burst until the **directive's MFA has returned** (its server has registered, acked and entered its loop; a run-queue drain or the burst deadline ends it too) so a later directive finds the server answering; then **unlink** it from the short-lived directive process |
 | `{apply,{M,F,A}}` (2) | `Apply` | materialize args, call `M:F(A...)` through the normal dispatch |
 
 - **`$ROOT`** is the Erlang root derived from `CodeServer::lib_root().parent()` (the same convention as
@@ -71,16 +71,18 @@ these eight directives, the full modelled set:
 - **`execute` boots first** (`Runtime::boot`, idempotent) so `$ROOT` expansion and module loads work on
   a fresh runtime. It **stops at the first directive that cannot run** and returns that typed error.
 - **The two process directives drive the scheduler — bounded, and they never hang.** A
-  `{kernelProcess, …}` spawns and then runs a bounded burst that ends as soon as the directive's `Name`
-  resolves through `whereis`, the run queue drains, or the burst deadline expires; a burst that ends
-  without the name is deliberately **not** this directive's error (matching `init`, which never checks —
-  the failure surfaces at the next dependent directive). An `{apply, …}` runs the export through the
-  engine's blocking-aware entries and drives the scheduler whenever the call suspends, resuming it once a
-  boot-spawned process answers. Both drives go through `drive_scheduler` over the crate-internal
-  `Runtime::pump_scheduler`, with per-call slice budgets between deadline checks and **one** wall-clock
-  `DRIVE_DEADLINE` (10 s) shared by the whole `execute` pass, plus a 1 s `KERNEL_BURST_DEADLINE` cap per
-  burst. An exhausted deadline is a typed `error::message`; a blocked apply whose drive ran nothing is
-  the engine's typed `error::blocked()`; a drive stops as soon as a `pump_scheduler` call reports `0`.
+  `{kernelProcess, …}` spawns and then runs a bounded burst that ends as soon as **the directive's MFA
+  has returned** (its process leaves the table), the run queue drains, or the burst deadline expires —
+  registration alone is *not* a readiness signal (`application_controller:init/2` registers first and
+  sets up afterwards). A burst that ends without the name is deliberately **not** this directive's error
+  (matching `init`, which never checks — the failure surfaces at the next dependent directive). An
+  `{apply, …}` runs the export through the engine's blocking-aware entries and drives the scheduler
+  whenever the call suspends, resuming it once a boot-spawned process answers. Both drives go through
+  `drive_scheduler` over the crate-internal `Runtime::pump_scheduler`, with per-call slice budgets
+  between deadline checks and **one** wall-clock `DRIVE_DEADLINE` (10 s) shared by the whole `execute`
+  pass, plus a 1 s `KERNEL_BURST_DEADLINE` cap per burst. An exhausted deadline is a typed
+  `error::message`; a blocked apply whose drive ran nothing is the engine's typed `error::blocked()`; a
+  drive stops as soon as a `pump_scheduler` call reports `0`.
   A capability gap stays an `error::unsupported` raise.
 
 ### Surviving a `{kernelProcess, …}`'s directive exit (the unlink)
@@ -119,49 +121,44 @@ registration) and stops at **instruction 16** (0-based). The tail's 0-based indi
   `beam_rt: unsupported: opcode: run: process blocked (no message available)` and exits **3**. The
   in-crate executor agrees: `BootStop::describe()` →
   `boot script stopped at instruction 16/22: application:load/1: error unsupported_opcode: run: process blocked (no message available)`.
-- **Prerequisite now in place:** with the unlink, `whereis(application_controller)` answers a live pid
-  after the boot (the server survives its directive process). `heart` and `logger` are not registered —
-  both legitimately (heart returns `ignore`; logger never reaches registration). Instructions 17–21 are
-  unreached.
+- **The kernel processes are ready when the stop is reached.** The three `{kernelProcess, …}` bursts
+  drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
+  registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
+  (`application_controller.erl:203-211`), i.e. the AC completed `init/2` (`:531-558`) and reached
+  `gen_server:enter_loop`. `heart` and `logger` are not registered — both legitimately (heart returns
+  `ignore`; logger never reaches registration). Instructions 17–21 are unreached.
+- **The stop's fold is NOT `apply_boot_call`'s `RunOutcome::Wait` arm.** `application:load/1` never
+  reaches it: the top-level `run_export_outcome` returns the typed `blocked()` as an **`Err`** (its
+  `Raise` reason atom is `unsupported_opcode: run: process blocked (no message available)`, stacktrace
+  empty), so no `Wait { func, pc }` is ever produced (`drive.rs::apply_boot_call`'s `Wait` arm and its
+  `ran == 0` fold are unreached on this path).
 
 ### Remaining blocker chain (owner per link)
-1. **`beam_rt` / `./drive.rs::apply_boot_call` — the stop's fold is `drive.rs:322`, the only writer on
-   this path.** The top-level machine really suspends at the `application:load/1` chain's `gen:do_call/4`
-   `receive` (`application.erl:216,269` → `application_controller.erl:220-221` → `gen_server:call/3` →
-   `gen:call/4` → `gen:do_call/4`, all entered **in-machine** via `resolve_external_call`/`Step::Enter`),
-   so `RunOutcome::Wait { func, pc }` reaches `drive.rs:318`'s
-   `drive_scheduler(runtime, deadline, APPLY_BLOCK_SLICES)`. The drive loops `pump_scheduler(256)` until
-   one call reports `0` (`drive.rs:247-250`); `ran == 0` (nothing ran ⇒ the run queue drained with no
-   live port and no pending timer) hits `drive.rs:319-323`
-   `if ran == 0 { return Err(beam_engine::blocked()); }`. `beam_engine::blocked()` renders
-   `unsupported: opcode: run: process blocked (no message available)` (CLI exit 3).
-   **Correction:** the previously recorded blocker — `RuntimeContext::run_export_blocking`
-   (`context/mod.rs:627-651`, folds at `:641`/`:645`) — is **not** this stop; that entry was observed
-   only for `gen:init_it/7` on the kernel processes' own start path. A nested `call_bif`-routed callee
-   would have folded there (its message is byte-identical), but the top-level machine really suspended,
-   so this stop is `drive.rs:322`.
-2. **`beam_rt` / `./drive.rs::start_kernel_process` (`drive.rs:185-213`) — the burst's stop criterion,
-   the ordering divergence behind the non-answering `application_controller`.** The burst
-   `return Ok(())` the instant `whereis(name)` resolves (`drive.rs:195-206`), before pumping further. But
-   `application_controller:init/2` opens with `register(?AC, self())` (`application_controller.erl:531`),
-   so with `KERNEL_BURST_SLICES = 1` the burst can return with the server registered but its init —
-   `process_flag`, `check_conf`, `ets:new(ac_tab,…)`, `make_appl(Kernel)`, `load(S, KAppl)`,
-   `Init ! {ack,…}`, `gen_server:enter_loop/4` (`application_controller.erl:532-558`) — incomplete. The
-   oracle has no such race: `init` runs `{kernelProcess, …}` as `apply(Mod,Fun,Args)` **synchronously**
-   (`init.erl:1520-1522`) and `application_controller:start/1` blocks in `receive` until its child acks
-   (`application_controller.erl:204-211`), so real `init` reaches instruction 16 only after the ack (the
-   server has entered `enter_loop`). **Fix shape:** unlink on the first `whereis` resolution (unchanged),
-   then keep driving — bounded by the existing run-queue-drain (`pump_scheduler == 0`) and
-   `KERNEL_BURST_DEADLINE` stops — until the **directive process terminates** (its MFA returned) rather
-   than returning at the name. Necessary; **not proven sufficient**: a server merely
-   registered-but-not-in-loop would still be run to completion by the index-16 drive, so the fold also
-   needs the server non-runnable then. `bootscript.rs::the_real_start_boot_reports_its_stop_through_execute_reporting`
-   pins only that `whereis(application_controller)` resolves **after** the stop (alive + registered),
-   which a parked-but-alive server satisfies. If the server is parked on a genuine mid-init block, the
-   burst change cannot unblock it and that block is outside this node.
+1. **`beam_engine` + `beam_rt` / `src/context` — the fun-application seam cannot suspend (the stop).**
+   The `application:load/1` chain enters its blocking callees **in-machine**
+   (`resolve_external_call`/`Step::Enter`: `application_controller:load_application/1`, `gen_server:call/3`,
+   `gen:call/4` — none of them is a floor/NIF/registry name), but `gen:call/4` dispatches through
+   `gen:do_for_proc/2`, whose body is
+   `{call_fun2,{atom,safe},1,{tr,{x,1},…}}` (verified by disassembling `gen.erl` with the system `erlc`)
+   — a **fun application**, not a `call_ext`. `Instr::CallFun2`
+   (`beam_engine/src/families/funs/mod.rs:165-173`) delegates to
+   `ExecutionContext::apply_fun`, and `RuntimeContext::apply_fun`
+   (`src/context/mod.rs:1794-1804`) runs the local fun body through the **non-blocking**
+   `Machine::new().run_label(...)` (`beam_engine/src/machine/run.rs:71-76` `fold_outcome`), which folds
+   `do_call/4`'s `receive` into `error::blocked()`. **The trait signature is the limitation**:
+   `ExecutionContext::apply_fun` returns `Result<Eterm>` and has no `Step::Enter`-style outcome, so no
+   caller (and no `src/boot/**` wrapper context) can make a fun-bodied callee suspend —
+   `Instr::CallFun`/`CallFun2` must first enter the fun **in the caller's machine** (as
+   `Instr::Apply`'s `apply_target` already does via `ApplyTarget::Enter`), i.e.
+   `beam_engine`: a blocking-aware fun-call seam; `beam_rt`/`src/context`: implement it.
+2. **`beam_rt` / `./drive.rs::apply_boot_call` — ready for the next link, not the fold.** The top-level
+   `run_export_outcome` is the blocking-aware entry and its `Wait` arm drives the scheduler and resumes
+   the machine (`drive.rs`), so once link 1 lands the index-16 chain suspends there and the scheduler
+   can carry `gen:do_call/4`'s `receive` to the AC's reply. The `ran == 0` arm then legitimately means
+   "nothing left that could wake the receiver".
 3. **`beam_rt` / `tests/**` (owner: the parent node).** `tests/boot.rs::the_cli_reports_the_boot_scripts_honest_stop_as_a_typed_error`
-   (line 507) still asserts the OLD stop — exit **1** with `noproc` in stderr. The stop is now
-   exit **3** with `unsupported: … blocked`; the assertion must be updated to the new honest stop.
+   (line 507) still asserts the OLD stop — exit **1** with `noproc` in stderr. The stop is
+   exit **3** with `unsupported: … blocked`; the assertion must be updated to the honest stop.
 4. Benign remnants for instruction 16: `heart:init/2`'s `catch start_portprogram()` does not contain
    `check_start_heart/0`'s `throw(no_heart)`; `init:get_argument/1` is empty in the boot path.
 
@@ -178,7 +175,7 @@ registration) and stops at **instruction 16** (0-based). The tail's 0-based indi
   keep their existing semantics/return types; `boot()` stays idempotent and returns `Result<()>`;
   `execute_reporting` is purely additive (`execute` keeps its signature).
 - **Drives stay bounded** — an exhausted deadline is an honest typed error, never a spin.
-- `bootscript.rs` is ~1580 lines (production ~700) with its oracle test module; `drive.rs` is ~350 lines.
+- `bootscript.rs` is ~1690 lines (production ~700) with its oracle test module; `drive.rs` is ~380 lines.
   `#![deny(unsafe_code)]`; no `unwrap()` on runtime data.
 
 ## Test Strategy
@@ -199,9 +196,15 @@ registration) and stops at **instruction 16** (0-based). The tail's 0-based indi
   `.boot` with `erl`, asserts the `apply` step really ran); `a_boot_spawned_process_answers_a_blocked_apply`
   (pins `drive.rs`: a `{kernelProcess, …}` burst and a later `{apply, …}` blocked on it, resumed by a
   scheduler drive, its dictionary side effect read back through `runtime.eval`); 
-  `a_malformed_boot_script_is_a_typed_error`; and the registration pins
+  `a_malformed_boot_script_is_a_typed_error`; the burst pins
+  `a_kernel_process_burst_waits_for_the_directive_to_return` (a fixture whose `serve/0` `spawn_link`s a
+  server that registers the directive's name **first** and only then does its real setup, and which
+  registers a *second* visible name only after the server acks — so a later `{apply, …}` answers `acked`
+  only when the burst drove the directive's MFA to its end; it fails with `not_acked` against a burst
+  that returns at the first `whereis` resolution) and
   `a_kernel_process_registers_its_own_directive_name` (a synthetic boot whose `{kernelProcess,Name,…}`
-  entry registers `Name` itself, later resolved via `whereis`) and `registering_a_live_boot_name_is_badarg`.
+  entry registers `Name` itself and then parks in a plain `receive`, so that burst ends on the
+  run-queue drain, later resolved via `whereis`), plus `registering_a_live_boot_name_is_badarg`.
   Every test reads the committed script via
   `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../bootstrap/bin/start.boot")`; system-install tests
   **skip loudly** when `erl`/`erlc` or the file are absent.
