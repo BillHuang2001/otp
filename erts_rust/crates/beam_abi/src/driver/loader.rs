@@ -80,6 +80,16 @@
 //! private `dl_last_error`/`dl_sym`/`OpenHandle`/`read_cstring`/`shared_object_path` helpers
 //! deliberately mirror [`crate::nif::loader`]'s: both loaders speak to the same `libc` loader, and
 //! neither module's helpers are visible outside their own file.
+
+// The [`DriverLibrary`] callback wrappers ([`DriverLibrary::start`], `control`, `call`, `stop`,
+// `output`, …) are deliberately **safe** public functions whose parameters are the raw pointers of
+// the C `ErlDrvEntry` callback signatures, forwarded verbatim to the driver's own callback. The
+// pointer-validity contract therefore belongs to the caller — exactly as it does in the C, where
+// `drv->control(…)` asserts nothing about `port`/`command` — so these wrappers cannot enforce it
+// themselves. Marking them `unsafe fn` would be a breaking change to the frozen ABI-mirroring
+// public API that `beam_rt`/`beam_io` consume; the lint is allowed instead, with this rationale.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::ffi::{CStr, CString};
 use std::fmt;
 
