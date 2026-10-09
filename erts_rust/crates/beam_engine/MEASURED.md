@@ -26,6 +26,13 @@ Measured at this node's HEAD with `erts_rust/scripts/cargo.sh test --manifest-pa
 - **Allocation-free per call** (counting-global-allocator proof): 2048 and 4096 `gc_bif`s both give 4 allocations / 71 bytes per run.
 - **Attribution:** the engine's own side is **~11-12 ns (<= 0.15%)** of the runtime's **~10.5 us** per registered BIF call, so **~99.85% is HOST-side** (`beam_rt`'s `ExecutionContext::call_bif`).
 
+## Measured (the chunked `MinimalContext` arena -- `tests/gc_arena.rs`)
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test gc_arena -- --nocapture --test-threads=1`, same-body comparison against the pre-chunking shape (one `Box<[Eterm]>` per allocation) reproduced in the test, `N = 100 000` allocations of 4 words (3 200 000 bytes of payload). Three consecutive runs gave identical figures; RSS is `/proc/self/statm` delta over the measured region (4 KiB pages), so it is indicative rather than exact (glibc reuses its arena), while the **allocation counts are exact**:
+- **chunked**: **55** heap allocations (**49** chunks of 64 KiB == the payload 3 211 264 B + 39 bytes of bookkeeping), RSS **+948 pages ≈ 3.8 MiB**.
+- **box-per-allocation**: **100 016** heap allocations, RSS **+1563 pages ≈ 6.3 MiB**.
+- So the allocation **calls** fall ~1800x (55 vs 100 016), and the measured RSS per 4-word allocation falls from ≈64 B to ≈39 B (the payload alone is 32 B, so the retained overhead drops from ≈32 B to ≈7 B — a glibc chunk + a `Vec` handle slot per allocation becomes an amortised chunk tail). An allocation now costs essentially its payload. The structural suite also pins the shape: 10 000 x 4-word allocations come from exactly 5 chunks of 64 KiB, no allocation straddles a chunk boundary, a pointer stays byte-identical and keeps its words across 5 000 later allocations, and an oversized request gets a private chunk.
+- **Caveat.** The figure is the `MinimalContext` *test* arena; the measured per-BIF interpreter path still allocates nothing per call (`tests/bif_alloc.rs`, above), and the production heap is `beam_rt`'s, not this arena.
+
 ## Measured (JIT micro-benchmark)
 `... -p beam_engine --test jit_bench -- --nocapture` (add `--features jit-cranelift` for the feature-ON roster). Wall-clock ns/op -- noisy; the tiers are **mechanisms, not optimisers** (compile-once/run-many; one-time `compile` excluded).
 - **Feature OFF** -- interpreter -> baseline-jit speed-up: `fib/1(20)` 2.4x; `kernel/2` 13.6x; `wide/2` 13.9x; `aggr/2` 11.8x; `cmp/2` 14.9x.

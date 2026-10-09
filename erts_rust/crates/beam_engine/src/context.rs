@@ -588,8 +588,9 @@ pub type ExternalResolver =
 /// Large enough that the per-chunk `Box` handle (and the arena's own bookkeeping)
 /// is amortised to nothing over the thousands of small allocations a term-building
 /// run makes, yet small enough that a lightly-using context does not reserve 64 KiB
-/// for one word (the first request always allocates a whole chunk, so no chunk
-/// crosses a request boundary).
+/// for one word. A request that does not fit the current chunk's tail starts a new
+/// chunk (so no allocation straddles a boundary) and a request larger than a whole
+/// chunk gets a dedicated chunk of its own.
 const ARENA_CHUNK_WORDS: usize = 64 * 1024 / core::mem::size_of::<Eterm>();
 
 /// A **chunked** pointer-stable arena: the backing store of
