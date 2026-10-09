@@ -197,8 +197,9 @@ short form is the safe one. Repro:
   parked in a `receive`, so the queue drains and the pump returns; the gap is a latent one for
   a boot chain that would spawn a busy process. The cap belongs in `../context/mod.rs` (this
   node's, but not `src/boot/**`).
-- `bootscript.rs` is ~1690 lines (production ~700) with its oracle test module; `drive.rs` is ~380 lines.
-  `#![deny(unsafe_code)]`; no `unwrap()` on runtime data.
+- `bootscript.rs` is ~1756 lines (production ~700, the rest its oracle test module) — the crate's
+  documented long-file precedent; `drive.rs` is ~382 lines. `#![deny(unsafe_code)]`; no `unwrap()` on
+  runtime data.
 
 ## Test Strategy
 - `boot/preloaded.rs`: `boot_loads_every_preloaded_module_into_the_cache` (all 22 cached;
