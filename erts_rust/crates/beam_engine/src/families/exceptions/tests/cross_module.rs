@@ -38,7 +38,7 @@
 //! The engine reports such a landing as [`Step::Enter`](crate::Step::Enter) — the
 //! driver switches the module context and re-binds the literal area — instead of
 //! the intra-module [`Step::Goto`](crate::Step::Goto); the single decision point is
-//! `Machine::throw_with_stacktrace` (`src/machine/catch.rs`), which compares the
+//! `Machine::throw` (`throw_with_trace`, `src/machine/catch.rs`), which compares the
 //! landing catch frame's stamped context with the machine's current one. These
 //! tests pin the *observable* consequences of every containment shape the compiler
 //! emits, from the caller's point of view:

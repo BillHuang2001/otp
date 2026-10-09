@@ -21,11 +21,11 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   builders** — Rust has no overloading, so a signature change silently breaks `beam_rt` and the
   crate's own test suite (they must compile unchanged).
 - **`machine::RunOutcome` is matched EXHAUSTIVELY cross-crate**: `beam_rt/src/boot/drive.rs` and
-  `beam_rt/src/runner/run.rs`. It is exactly `{ Returned(Eterm), Wait { func, pc } }`. Adding a
-  variant is a breaking change for a crate this node cannot edit; a first-class resumable
-  `Yield`/pre-emption outcome requires a coordinated `beam_rt` change (both match arms) and cannot
-  land from `beam_engine` alone. The reduction hook stays the defaulted
-  `ExecutionContext::reduce(n) -> Result<()>` plus `Machine::reduce()`/`reductions()`.
+  `beam_rt/src/runner/run.rs`. It is exactly `{ Returned(Eterm), Wait { func, pc } }` — there is no
+  yield/pre-emption variant. The reduction hook is the defaulted
+  `ExecutionContext::reduce(n) -> Result<()>`, charged **once per interpreted instruction** by
+  `Machine::drive` and observed through `Machine::reductions()`/`reset_reductions()`; a host
+  pre-empts by returning its own typed error from `reduce`.
 - **`Step::Enter` is interpreter-only.** A raise that lands in a catch frame belonging to another
   module context, a resolved cross-module `call_ext`, and a cross-module `return` onto a
   caller-context continuation all cross the module boundary as `Step::Enter`; the driver switches
@@ -42,9 +42,11 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `context.rs` → the `ExecutionContext` / `Mailbox` seams, `MinimalContext` (`CONTEXT.md` beside it: none — see `../CONTEXT.md`)
-- `machine/` → `Machine` (registers, frames, catch/unwind, run entries, `RunOutcome`, module
-  contexts, driver, position introspection) — `machine/CONTEXT.md`
+- `context.rs` → the `ExecutionContext` / `Mailbox` seams, `RootSet`, `MinimalContext`
+  (`CONTEXT.md` beside it: none — see `../CONTEXT.md`)
+- `machine/` → `Machine` (registers + the `x_mut`/`fr_mut`/`stack_mut`/`with_roots`/`alloc_rooted`
+  root-set hand-off, frames, catch/unwind, run entries, `RunOutcome`, module contexts, driver,
+  reduction counter, position introspection) — `machine/CONTEXT.md`
 - `interpreter/` → dispatch loop, BIF arm/raise, `TestKind`, A.8 trace emission — `interpreter/CONTEXT.md`
 - `terms/` → the boxed-term builders/readers (classic + `*_rooted`), `map`, `fun`, `number`,
   `slack`, `sink`, rooted-allocation tests, `test_support` — `terms/CONTEXT.md`

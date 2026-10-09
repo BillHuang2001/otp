@@ -43,7 +43,9 @@ The per-opcode semantics and the full M1 gap list are in `../../INSTRUCTION_SURF
 - **Cross-module:** a raise landing in a catch frame stamped with another module
   context is reported as `Step::Enter { context, func, pc }` (not `Step::Goto`) so the
   driver switches module context and re-binds the literal area. The family relies on
-  `Machine::throw_with_stacktrace` for that decision; it does not re-derive it.
+  `Machine::throw` (its `throw_with_trace` entry) for that decision; the symbolic frames
+  of an *uncaught* raise are attached separately by the `Machine::with_uncaught_frames`
+  funnel at the `step_instruction`/`drive` boundary. It re-derives neither.
 
 ## Test Strategy
 Unit tests are in-module, split by responsibility under `tests/` (the module tree is
@@ -73,7 +75,8 @@ builder, `no_labels`, `exec_one` and `assert_reason_tuple`; several submodules a
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine`.
 
 ## See Also
-- `../../machine/catch.rs` → the catch-frame stack, `throw`/`throw_with_stacktrace`,
-  `land_exception`, `unwind_to_frame` (the raise half of this protocol).
+- `../../machine/catch.rs` → the catch-frame stack, `throw`/`throw_with_trace`,
+  `with_uncaught_frames`/`raise_stacktrace`, `land_exception`, `unwind_to_frame` (the raise
+  half of this protocol).
 - `../../CONTEXT.md` → crate contracts, the frozen seams, the execution model.
 - `../../INSTRUCTION_SURFACE.md` → per-opcode semantics and the complete gap list.

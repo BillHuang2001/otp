@@ -35,7 +35,7 @@ group's `try_inline_*`; **`Ok(false)` means "lowered nothing"** and the arm then
 |---|---|---|---|
 | Metadata no-ops | `Label`,`Line`,`IntCodeEnd`,`ExecutableLine`,`DebugLine` | `mod.rs` empty arm (no bytes) | n/a |
 | Move / swap | `Move`, `Swap` | `r#move.rs::try_inline_move`, `::try_inline_swap` | dst must be in-bound `X(n)` |
-| Word-level test | `Test` | `test.rs::try_inline_test` | `test.rs::test_plan` |
+| Test (word + boxed header) | `Test` | `test.rs::try_inline_test` | `test.rs::test_plan` |
 | Switch | `SelectVal` | `select.rs::try_inline_select_val` | `select.rs::select_val_plan` |
 | Arity switch | `SelectTupleArity` | `aggregate.rs::try_inline_select_tuple_arity` | `aggregate.rs::select_tuple_arity_plan` |
 | Cons readers | `GetList`,`GetHd`,`GetTl` | `aggregate.rs::try_inline_get_{list,hd,tl}` via `emit_list_read` | `get_{list,hd,tl}_shape` -> `shape` |
@@ -57,11 +57,15 @@ Note `GcBif` tries arith **then** comparison; `Bif` tries only comparison
   `MAX_REGISTER` is enforced per lowering (a register past it must deopt so the interpreter reports
   the faithful `bad_register`).
 - **`test`** (`test.rs` section comment): word tests `is_nil`/`is_atom`/`is_list`/`is_nonempty_list`
-  and `is_boolean` (only when the module interned `true`/`false`); `is_eq_exact`/`is_ne_exact` with a
-  constant operand or two guarded smalls; `is_eq`/`is_ne`; `is_lt`/`is_ge` **only smalls**.
-  `NO_FAIL` -> `None`; unresolved fail label -> `None`; every other `TestKind` (`IsInteger`,`IsFloat`,
-  `IsNumber`,`IsPid`,`IsReference`,`IsPort`,`IsBinary`,`IsBitstr`,`IsTuple`,`IsMap`,`IsFunction`,
-  `IsFunction2`,`IsTaggedTuple`,`TestArity`) -> `None`.
+  and `is_boolean` (only when the module interned `true`/`false`); the **boxed-term header tests**
+  `is_integer`/`is_number`/`is_float`/`is_tuple`/`is_map`/`is_bitstring`/`is_binary`/`is_function`/
+  `is_function2`/`is_tagged_tuple`/`test_arity`/`is_pid`/`is_port`/`is_reference` (each a pure
+  tag/header check over one `mov` of the boxed word, mirroring the matching `beam_term` predicate);
+  `is_eq_exact`/`is_ne_exact` with a constant operand or two guarded smalls; `is_eq`/`is_ne`;
+  `is_lt`/`is_ge` **only smalls**. `NO_FAIL` -> `None`; unresolved fail label -> `None`; an arity
+  operand outside the interpreter's range, a module with neither `true` nor `false` interned for
+  `is_boolean`, an out-of-bound register, or a bignum/float/literal operand -> `None` (the helper
+  then reproduces the interpreter's exact result).
 - **`select_val`** (`select.rs`): `NO_FAIL` -> `None`; unresolved label -> `None`; scrutinee must be
   `test_src`; **every** alternative must be an immediate `constant_word`.
 - **`select_tuple_arity`** (`aggregate.rs`): `NO_FAIL`/unresolved label -> `None`; scrutinee must be an

@@ -8,13 +8,16 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 
 ## API Surface (crate-internal; methods on `impl Machine`)
 - `mod.rs` — `Machine` (x-register file, float-register (FR) file of `Eterm` term slots, Erlang stack,
-  call frames, exception catch frames, literal area, module-context registry, latched A.8 trace gate);
-  `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`.
-- `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`).
+  call frames, exception catch frames, literal area, module-context registry, latched A.8 trace gate,
+  reduction counter); `MAX_REGISTER`/`MAX_FLOAT_REGISTER`; `reset`; the **root-set hand-off**
+  (`stack_mut`, `with_roots` handing over the whole `RootSet`, and `alloc_rooted` — the convenience
+  wrapper that calls `ExecutionContext::alloc_words_rooted`).
+- `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`; `x_mut`/`fr_mut` as
+  the single-view root-set accessors).
 - `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, and `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`).
 - `catch.rs` — the `CatchFrame` stack + the raise/unwind entry (`throw`/`throw_error`/`throw_with_trace`) and the
-  **uniform raise funnel**: `raise_stacktrace(Option<&Module>)` derives the symbolic `StackTrace` (raising function,
+  **uniform raise funnel**: `raise_stacktrace(entry_module: Option<&Module>, func, pc)` derives the symbolic `StackTrace` (raising function,
   then every live caller innermost first) and `with_uncaught_frames` attaches it to an uncaught `BeamError::Raise`
   (leaving a non-raise error, an already-framed raise and an **engine diagnostic** — a reason atom prefixed
   `unsupported_opcode: `, the `error::unsupported` sentinel — untouched). The funnel's first half runs at the
@@ -28,7 +31,8 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   (blocking-aware); `RunOutcome` (`Returned` / `Wait`), re-exported at the crate root.
 - `drive.rs` — **`Machine::drive`**: owns the `(func, pc)` position *and* the module context those indices belong
   to, folds every `Step` back into that position, charges **exactly one reduction per interpreted instruction**
-  through `ExecutionContext::reduce` (the only pre-emption point a non-allocating loop reaches), and re-binds the
+  through the defaulted `ExecutionContext::reduce` (the only pre-emption point a non-allocating loop reaches;
+  read back through `Machine::reductions()`/`reset_reductions()`), and re-binds the
   literal area exactly on a `Step::Enter` into a different context. It also runs the raise funnel's second half
   (`Machine::with_uncaught_frames`) over a raise that surfaced inside a cross-module callee — the driver is where
   the run's true entry module is known, so those caller frames are named against the right module.
