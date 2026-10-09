@@ -364,7 +364,7 @@ pub(super) fn decode(term: Eterm, atoms: &AtomTable, vars: &BTreeSet<u32>) -> Re
     // `pattern.rs` — that gap is documented, not changed here.
     if classify(term) == TermClass::Map {
         let mut pairs = Vec::new();
-        for (key, value) in map_pairs(term, atoms).map_err(badarg)? {
+        for (key, value) in map_pairs(term, atoms).map_err(|_| badarg())? {
             pairs.push((decode(key, atoms, vars)?, decode(value, atoms, vars)?));
         }
         return Ok(Expr::Map(pairs));
