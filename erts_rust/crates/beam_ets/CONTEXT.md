@@ -111,7 +111,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **Access control:** `check_read(requester)` / `check_write(requester)` / `as_requester(requester) ->
   TableAccess<'_>`.
 - **Select family** (`select/exec.rs`; also the `select_all(pred)` predicate primitive): `select(spec)`,
-  `select_delete(spec) -> usize`, `select_count(spec) -> usize`, `match_object(pattern)`, `match_(pattern)`,
+  `select_reverse(spec)`, `select_delete(spec) -> usize`, `select_count(spec) -> usize`, `match_object(pattern)`, `match_(pattern)`,
   `match_delete(pattern) -> usize`, `select_replace(spec) -> usize`.
 - **Limit + continuation forms** (`continuation.rs`; `Option::None` ⇒ `'$end_of_table'`): each
   `-> (Vec<Eterm>, Option<MatchContinuation>)`: `select_limit`/`select_continue`/`match_limit`/
