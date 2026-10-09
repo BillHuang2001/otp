@@ -380,6 +380,7 @@ fn a_nursery_reference_survives_a_relocating_fullsweep() {
 // ---------------------------------------------------------------------------
 // 2. Line-bitmap accounting consistency across collections
 // ---------------------------------------------------------------------------
+
 /// After a collection: `marked`/`kept` are reset, `allocated` is exactly the surviving lines,
 /// `used_lines()` is the allocated popcount, and the block classification agrees with the
 /// allocated bitmap. Then every hole the collection left is really free — filling them all
