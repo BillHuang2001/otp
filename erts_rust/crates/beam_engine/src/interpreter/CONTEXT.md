@@ -35,6 +35,16 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
 ## Constraints / Notes for Agents
 - Errors are `beam_common::Result` only — never a crate-local error enum, never a panic; an unsupported opcode/operand
   is the documented `error::unsupported`.
+- **Reduction charge / cooperative pre-emption.** `Machine::drive` (`../machine/drive.rs` — the hot loop these run
+  entries delegate to) charges **exactly one reduction per interpreted instruction** and offers it to the host once
+  per instruction through `ExecutionContext::reduce_outcome`. A `ReduceOutcome::Yield` answer applies the instruction's
+  `Step` **first**, then stops the loop at the *next* instruction and reports `RunOutcome::Yield { func, pc }`; the plain
+  `reduce` hook stays honoured (the default `reduce_outcome` forwards to it, so a host overriding only `reduce` is
+  byte-identical) and a **non-blocking** entry folds a `Yield` into the typed pre-emption error. Measured
+  (`perf record -e instructions:u`): the single remaining `MinimalContext::reduce_outcome` vtable call is ~4.7 % of
+  retired instructions and is **not** removable without changing the frozen reductions API (`tests/reductions.rs` pins
+  one charge per instruction). The default body's `self.reduce(n)` is a *static* call — trait default bodies monomorphise
+  per concrete `Self` — so it is not a second vtable dispatch.
 - `step_instruction` records `Machine::current_code = (func, pc)` at entry (the exact position at every interpreted
   suspension, incl. a blocking `wait`); a natively-executed JIT block does not update it.
 - **`FuncInfo` is NOT a metadata no-op** — a failed head-pattern/guard jumps into it and it raises class `error` with the
