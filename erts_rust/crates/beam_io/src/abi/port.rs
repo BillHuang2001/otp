@@ -31,9 +31,9 @@
 //! | [`Driver`](crate::driver::Driver) | `ErlDrvEntry` slot | notes |
 //! |---|---|---|
 //! | [`Driver::start`] | `start` | absent slot ⇒ `badarg` (the C's `init_driver` requires it) |
-//! | [`Driver::output`] | `output` | the port's output queue is drained and handed over |
+//! | [`Driver::output`] | `outputv`, falling back to `output` | the port's output queue is drained and handed over |
 //! | [`Driver::ready_input`] | `ready_input` | absent slot ⇒ no-op (the C's `no_ready_input_callback`) |
-//! | [`Driver::ready_output`] | `ready_output`, falling back to `output` | absent `ready_output` ⇒ `output` |
+//! | [`Driver::ready_output`] | `ready_output`, falling back to `outputv`/`output` | absent `ready_output` ⇒ the `output`/`outputv` write path |
 //! | [`Driver::timeout`] | `timeout` | absent slot ⇒ no-op (`no_timeout_callback`) |
 //! | [`Driver::control`] | `control` | absent slot ⇒ `badarg` (`io.c:4035`) |
 //! | [`Driver::port_exit`] | `process_exit`, falling back to `emergency_close` | the C has no port-exit callback |
@@ -101,7 +101,9 @@
 //!   callbacks return `void`; the port hands the driver whatever is in the output queue and counts
 //!   the whole buffer as written. A `ready_output`-only driver gets the drained bytes nowhere (its
 //!   callback has no buffer parameter), exactly as in the C where the driver is expected to write
-//!   what it stashed from `output`.
+//!   what it stashed from `output`. Both paths prefer the **`outputv`** slot when the entry
+//!   declares one (`if (drv->outputv) … else … drv->output`, `io.c:1782`), so an entry whose only
+//!   port-command callback is `outputv` still receives its `port_command` bytes.
 //! * **`ready_input`/`ready_output` name one fd.** The C fires one callback per `ErlDrvEvent`; the
 //!   poller here keys a registration by port number, so the fd is taken from the driver's own
 //!   `driver_select` bookkeeping (see [`DriverState::fd_armed`](crate::DriverState)). A port with
@@ -139,14 +141,16 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
-use libc::{c_char, c_int, c_uint};
+use libc::{c_char, c_int, c_uint, c_void};
 
 use beam_abi::driver::host::{DriverEnv, DriverHost};
 use beam_abi::driver::loader::{load, DriverLibrary};
 use beam_abi::driver::types::{
-    ErlDrvData, ErlDrvEvent, ErlDrvMonitor, ErlDrvPort, ErlDrvSizeT, ErlDrvThreadData,
-    ERL_DRV_ERROR_BADARG, ERL_DRV_ERROR_ERRNO, ERL_DRV_ERROR_GENERAL, ERL_DRV_FLAG_SOFT_BUSY,
+    ErlDrvBinary, ErlDrvData, ErlDrvEvent, ErlDrvMonitor, ErlDrvPort, ErlDrvSizeT,
+    ErlDrvThreadData, ErlIOVec, ERL_DRV_ERROR_BADARG, ERL_DRV_ERROR_ERRNO,
+    ERL_DRV_ERROR_GENERAL, ERL_DRV_FLAG_SOFT_BUSY,
 };
+use beam_abi::SysIOVec;
 use beam_common::{BeamError, ExitReason, Raise, Result};
 
 use crate::abi::host::{AbiHost, PortHost};
@@ -392,6 +396,59 @@ impl DriverPort {
         self.fire_stop_select(events);
     }
 
+    /// Hands `bytes` to the driver's `outputv` when the entry declares one, else to its `output`.
+    ///
+    /// This is the C's own preference: `if (drv->outputv) { … } else { … drv->output … }`
+    /// (`io.c:1782` on the `port_command` path, `io.c:1597` on the async one). An entry that
+    /// declares **both** callbacks therefore gets the vector one, and an entry that declares only
+    /// `outputv` is not left without any port-command callback at all — the divergence
+    /// `GAPS.md` §"A.4" records (an `outputv`-only entry never receiving `port_command/2`).
+    ///
+    /// The vector mirrors the C's build (`io.c:1842-1864`): `iov[0]` is the empty **header** block
+    /// a driver may fill in (`iov_base = NULL`, `iov_len = 0`), `iov[1]` the data, `binv` runs
+    /// parallel to `iov` (all `NULL` — these bytes are not backed by an `ErlDrvBinary`, the same
+    /// convention `beam_abi`'s own queue views use), `vsize` counts the header plus the data block
+    /// and `size` is the data's total byte count.
+    ///
+    /// The buffer is passed mutably because the C hands the driver the caller's own bytes (a driver
+    /// may write into them in place, e.g. to upper-case them). Nothing re-reads it afterwards: the
+    /// drained bytes are counted as consumed (the `output`/`outputv`/`ready_output` callbacks return
+    /// `void`).
+    fn write_driver(&mut self, ctx: &mut DriverContext<'_>, bytes: &mut [u8]) {
+        // `iov`/`binv` live on this stack frame and are the driver's to read (and, for the header
+        // block, to write) for the duration of the callback only — exactly the C's contract, where
+        // the vector is built on the caller's stack (`ev.common.iov = iv`, `io.c:1806`).
+        let prefers_outputv = self.lib.entry().outputv.is_some();
+        self.call(ctx, |port, _handle| {
+            if prefers_outputv {
+                let mut iov = [
+                    SysIOVec {
+                        iov_base: core::ptr::null_mut(),
+                        iov_len: 0,
+                    },
+                    SysIOVec {
+                        iov_base: bytes.as_mut_ptr() as *mut c_void,
+                        iov_len: bytes.len(),
+                    },
+                ];
+                let mut binv: [*mut ErlDrvBinary; 2] = [core::ptr::null_mut(); 2];
+                let mut ev = ErlIOVec {
+                    vsize: iov.len() as c_int,
+                    size: bytes.len() as ErlDrvSizeT,
+                    iov: iov.as_mut_ptr(),
+                    binv: binv.as_mut_ptr(),
+                };
+                let _ = port.lib.outputv(port.data, &mut ev);
+            } else {
+                let _ = port.lib.output(
+                    port.data,
+                    bytes.as_mut_ptr() as *mut c_char,
+                    bytes.len() as ErlDrvSizeT,
+                );
+            }
+        });
+    }
+
     /// Runs the driver's `ready_async` for each finished `driver_async` job, or its `async_free`
     /// when the entry has no `ready_async`.
     ///
@@ -577,17 +634,14 @@ impl Driver for DriverPort {
     ///
     /// The C callback returns `void`, so the whole drained buffer is counted as written (see the
     /// module docs). An absent `output` slot is the C's logging `no_output_callback`
-    /// (`io.c:7520-7529`): the bytes are still counted as consumed, exactly as the C's default
-    /// callback lets them vanish.
+    /// (`io.c:7520-7529`) when the entry has no `outputv` either: the bytes are still counted as
+    /// consumed, exactly as the C's default callback lets them vanish. When the entry declares
+    /// `outputv`, that slot is preferred (see [`DriverPort::write_driver`]).
     fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         let mut buf = ctx.output().front().to_vec();
         let len = buf.len();
         ctx.output().consume(len);
-        self.call(ctx, |port, _handle| {
-            let _ = port
-                .lib
-                .output(port.data, buf.as_mut_ptr() as *mut c_char, len as ErlDrvSizeT);
-        });
+        self.write_driver(ctx, &mut buf);
         Ok(len)
     }
 
@@ -609,8 +663,9 @@ impl Driver for DriverPort {
     /// The output queue is drained into `output`'s shape first (the port's single write path); when
     /// the entry has a `ready_output` slot the drained buffer has nowhere to go — the C callback
     /// takes only the event — and the driver is expected to write what it stashed from `output`. An
-    /// absent `ready_output` slot falls back to `output`'s behaviour, matching the C's
-    /// `no_ready_output_callback` default (`io.c:7524-7533`).
+    /// absent `ready_output` slot falls back to the `output`/`outputv` write path, matching the C's
+    /// `no_ready_output_callback` default (`io.c:7524-7533`, which calls `(*drv->output)(prt->data,
+    /// NULL, 0)` — here the drained bytes are handed over instead, the port's whole write path).
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         let mut buf = ctx.output().front().to_vec();
         let len = buf.len();
@@ -621,11 +676,7 @@ impl Driver for DriverPort {
                 let _ = port.lib.ready_output(port.data, event);
             });
         } else {
-            self.call(ctx, |port, _handle| {
-                let _ = port
-                    .lib
-                    .output(port.data, buf.as_mut_ptr() as *mut c_char, len as ErlDrvSizeT);
-            });
+            self.write_driver(ctx, &mut buf);
         }
         Ok(len)
     }
