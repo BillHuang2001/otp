@@ -35,6 +35,7 @@ Split by responsibility: `runner/entry.rs` (`ProcessEntry`/`ProcessEngine`/`Runn
 * **The scheduler moves the table (and the runner state) out of the `Runtime`.** A pass needs `&mut Runtime` **and** `&mut ProcessTable` at once, but the table is a *field*, so `run_pass` moves both out (`take_processes`/`put_processes`) and puts them back whatever the outcome; the runner likewise takes the pid's `Machine` out of its `HashMap`.
 * **A process's exit reason is not its return value** — see the parent node's Design Decisions.
 * **Heap lifetime**: `Runtime` owns the process heap so a returned `Eterm` stays valid after `run_*` returns; `system_info`/`format_term` use the separate `info_heap`, reset per call.
+* **There is no native (Rust-serviced) process kind.** `ProcessEntry` (`../runner/entry.rs`) has exactly two variants — `Export{module,function,arity}` and `Fun{fun,target}` — and `RuntimeRunner::run` requires a registered `ProcessEngine` (otherwise `error::unknown_process_entry`). A Rust-native service process that services its own inbox from the scheduler pass (e.g. a hand-written `file_server_2`) therefore needs an additive third entry variant + a `RuntimeRunner::run` arm + a step in the pass body (`scheduler_pass`, `scheduler.rs`); every existing runtime-owned service is either an interpreted process or a `Runtime`-level table (group leaders, the `init` stand-in).
 * **Files ~1000 lines**, split by responsibility; every public item documented (`#![warn(missing_docs)]`).
 
 ## Test Strategy
