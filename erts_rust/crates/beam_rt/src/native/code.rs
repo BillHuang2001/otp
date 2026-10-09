@@ -18,8 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! The `code:*` runtime-native floor: the code path, the loaded and preloaded module set
-//! and the installation directories.
+//! The `code:*` runtime-native floor: the code path, the loaded and preloaded module set,
+//! the code server's `interactive`/`embedded` mode and the installation directories.
 //!
 //! `code` is the module library's front end; its `.beam` (and the `code_server` process
 //! behind it) needs facilities outside Milestone-1, so the runtime answers these calls
@@ -340,6 +340,54 @@ impl RuntimeContext<'_> {
             error::message("code:root_dir/0: the <lib> directory has no parent component")
         })?;
         self.charlist(&root.display().to_string())
+    }
+
+    /// `code:get_mode/0`: the atom `interactive`, or `embedded` for a `-mode embedded`
+    /// command line.
+    ///
+    /// The oracle answers from the code server's start mode, which `code.erl`'s
+    /// `start_get_mode/0` (`code.erl:1741-1765`) derives from the **`-mode` init
+    /// argument**: `embedded` exactly when `init:get_argument(mode)` is
+    /// `{ok, [["embedded"]]}` — the *first* occurrence holds the *single* value
+    /// `"embedded"` — and `interactive` for every other command line (no `-mode`, a
+    /// valueless `-mode`, a different value, or several `-mode` flags, when the first
+    /// one still wins). Oracle-verified (OTP 29/erts-17.1): `code:get_mode()` ⇒
+    /// `interactive`; `-mode embedded …` ⇒ `embedded`;
+    /// `-mode embedded -mode interactive …` ⇒ `embedded` (with a warning);
+    /// `-mode foo …` and a valueless `-mode` ⇒ `interactive`.
+    ///
+    /// This runtime is head-less and resolves its modules from the code path, so
+    /// `interactive` is its real mode; the `-mode embedded` override is honoured because
+    /// it is what the release's own `code.erl` does with the same init argument. See
+    /// [`Self::code_get_path`] for how the mode-less default behaves.
+    ///
+    /// The `try_native` arm that reaches this entry is a registration in
+    /// `../native.rs` — one level up, outside this node — so until it lands the method
+    /// is reachable only from the unit tests below (hence the `allow`).
+    #[allow(dead_code)]
+    pub(super) fn code_get_mode(&mut self) -> Result<Eterm> {
+        self.atom(if self.wants_embedded_mode() {
+            "embedded"
+        } else {
+            "interactive"
+        })
+    }
+
+    /// Whether the `-mode` init argument asked for `embedded`: the [`code.erl`]
+    /// `start_get_mode/0` rule — the *first* occurrence must be the *single* string
+    /// `"embedded"`.
+    ///
+    /// [`code.erl`]: crate::native::code
+    fn wants_embedded_mode(&self) -> bool {
+        let Some(first) = self
+            .runtime
+            .init_args()
+            .get("mode")
+            .and_then(|occurrences| occurrences.first().copied())
+        else {
+            return false;
+        };
+        first.len() == 1 && first[0] == "embedded"
     }
 
     /// The `.beam` file of `name`: its recorded load path, its code-path entry, or —
@@ -786,5 +834,53 @@ mod tests {
             "a loaded module's beam is a path string, got {beam:?}"
         );
         assert!(string_of(beam).ends_with("lists.beam"));
+    }
+
+    // -- get_mode/0 -----------------------------------------------------------
+
+    /// `code:get_mode/0`, driven through the entry itself: the floor's `try_native`
+    /// dispatch arm for it is a registration in `src/native.rs`, outside this node (see
+    /// `src/native/CONTEXT.md`), so `call` cannot reach it.
+    fn get_mode(runtime: &mut crate::Runtime) -> Eterm {
+        let mut sink = beam_bifs::NullSink;
+        let mut context = crate::context::RuntimeContext::with_output(runtime, &mut sink);
+        context.code_get_mode().expect("code:get_mode/0")
+    }
+
+    #[test]
+    fn code_get_mode_is_interactive_by_default() {
+        // Oracle-verified (OTP 29/erts-17.1): `code:get_mode()` ⇒ `interactive` — the
+        // release's default when no `-mode` was given.
+        let mut runtime = runtime();
+        let mode = get_mode(&mut runtime);
+        assert_eq!(runtime.atom_name_of(mode), Some("interactive"));
+    }
+
+    #[test]
+    fn code_get_mode_follows_the_first_mode_argument() {
+        // The `code.erl` `start_get_mode/0` rule, oracle-verified (OTP 29/erts-17.1):
+        // `-mode embedded` ⇒ `embedded`; `-mode embedded -mode interactive` ⇒ `embedded`
+        // (the first occurrence wins); `-mode foo` ⇒ `interactive`; a valueless `-mode`
+        // ⇒ `interactive`. The first occurrence must hold the *single* value `embedded`,
+        // which is why the two-value form is `interactive` here.
+        for (occurrences, expected) in [
+            (vec![vec!["embedded"]], "embedded"),
+            (vec![vec!["embedded"], vec!["interactive"]], "embedded"),
+            (vec![vec!["foo"]], "interactive"),
+            (vec![vec!["interactive"]], "interactive"),
+            (vec![Vec::<&str>::new()], "interactive"),
+            (vec![vec!["embedded", "extra"]], "interactive"),
+        ] {
+            let mut config = crate::config::RuntimeConfig::default();
+            for values in &occurrences {
+                config.init_args.record(
+                    "mode",
+                    values.iter().map(|value| (*value).to_string()).collect(),
+                );
+            }
+            let mut runtime = crate::Runtime::new(config).expect("a runtime with -mode");
+            let mode = get_mode(&mut runtime);
+            assert_eq!(runtime.atom_name_of(mode), Some(expected), "{occurrences:?}");
+        }
     }
 }
