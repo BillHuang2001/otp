@@ -514,7 +514,12 @@ silently-accepted wrong value:
 - **`tests/negative.rs`:** truncated header, bad `"FOR1"` magic, bad form type, `format_number != 0`,
   a chunk size that overruns the file, an unknown/out-of-range opcode byte, an out-of-range atom/label
   index, a truncated operand varint, a `z` sub-tag `0`/unknown, a structurally wrong `HeapNeed` operand
-  and a truncated/malformed compressed `LitT` ⇒ each a typed `BeamError` (no panic).
+  and a truncated/malformed compressed `LitT` ⇒ each a typed `BeamError` (no panic). Plus a
+  "structural rejection" section covering every bound in the decode-bounds table above (`max_opcode`
+  above/below the `[169,193]` window, out-of-range label/`x`/`y`/float-register/type index, an
+  allocation list longer than 4, an argument list in a non-final slot, a `z,4` literal index the file
+  does not define) — EACH next to a well-formed control image that genuinely loads, so a negative case
+  can never pass for a structural reason.
 - **`tests/real_modules.rs`:** the broad real-OTP LOAD sweep. The `lib` root is discovered
   generically — `$ERTS_LIB_DIR` when set, else `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'`
   (no hardcoded app names) — then every `.beam` under it is collected recursively (each versioned app
