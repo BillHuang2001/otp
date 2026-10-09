@@ -80,7 +80,8 @@
 //! port-aware `ProcessTable` variant.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_process.c`
-//! (`scheduler_wait`/`schedule`), `erl_vm.h` (`CONTEXT_REDS`).
+//! (`scheduler_wait`/`schedule`), `erl_vm.h` (`CONTEXT_REDS`, adopted here as
+//! [`beam_common::CONTEXT_REDS`] behind [`DEFAULT_REDUCTIONS_PER_SLICE`]).
 
 use beam_common::Result;
 use beam_term::prelude::Eterm;
@@ -92,15 +93,18 @@ use crate::progress::ThreadProgress;
 use crate::ptab::ProcessTable;
 use crate::run_queue::{Priority, RunQueue};
 
-/// The number of reductions a process runs before being pre-empted (the C
-/// `CONTEXT_REDS`).
+/// The number of reductions a process runs before being pre-empted.
+///
+/// The value is the canonical cross-crate ERTS constant `beam_common::CONTEXT_REDS` (the C
+/// `CONTEXT_REDS` of `erts/emulator/beam/erl_vm.h`), so this crate cannot drift from the
+/// other transcription sites.
 ///
 /// This value is handed to [`ProcessRunner::run`] as its `budget`. The **runner** owns the
 /// reduction count — the scheduler never counts reductions itself — and pre-emption is
 /// **cooperative** in Milestone 1: a runner that ignores `budget` and never returns
 /// [`RunOutcome::Yield`] is never pre-empted by the scheduler. See [`ProcessRunner::run`] for
 /// the full contract a runner must honor.
-pub const DEFAULT_REDUCTIONS_PER_SLICE: u32 = 4000;
+pub const DEFAULT_REDUCTIONS_PER_SLICE: u32 = beam_common::CONTEXT_REDS as u32;
 
 /// The default maximum number of reductions a parked-table scheduler runs **while holding the
 /// process-table lock** (see [`crate::smp`]).
@@ -108,9 +112,10 @@ pub const DEFAULT_REDUCTIONS_PER_SLICE: u32 = 4000;
 /// The SMP pool splits a slice's reduction budget into quanta of at most this many reductions and
 /// **releases the table lock between quanta**, so another process (or a cross-thread send / timer /
 /// dirty completion) can make progress *inside* another process's slice instead of waiting for the
-/// whole slice to finish. The slice semantics are unchanged — the process keeps its own 4000
-/// reduction budget, stays out of the run queue for the whole slice, and is requeued exactly once,
-/// at its own priority — only the duration of one lock hold is bounded.
+/// whole slice to finish. The slice semantics are unchanged — the process keeps its own
+/// [`DEFAULT_REDUCTIONS_PER_SLICE`] reduction budget, stays out of the run queue for the whole
+/// slice, and is requeued exactly once, at its own priority — only the duration of one lock hold is
+/// bounded.
 ///
 /// A runner that exhausts the budget it is handed (the real execution engine) therefore behaves
 /// exactly as before; the only new nuance is that a runner returning `Yield` **before** spending
@@ -119,9 +124,9 @@ pub const DEFAULT_REDUCTIONS_PER_SLICE: u32 = 4000;
 /// `crate::smp::worker::run_locked_quanta`).
 ///
 /// The trade-off is the number of lock acquisitions per slice (a slice of
-/// [`DEFAULT_REDUCTIONS_PER_SLICE`] costs `ceil(4000 / 256) = 16` acquisitions instead of one): an
-/// uncontended `parking_lot` lock is a handful of instructions, so the cost is negligible next to
-/// the contention it removes.
+/// [`DEFAULT_REDUCTIONS_PER_SLICE`] costs `DEFAULT_REDUCTIONS_PER_SLICE / DEFAULT_LOCK_QUANTUM`
+/// acquisitions instead of one): an uncontended `parking_lot` lock is a handful of instructions, so
+/// the cost is negligible next to the contention it removes.
 pub const DEFAULT_LOCK_QUANTUM: u32 = 256;
 
 /// What happened during one reduction slice.
