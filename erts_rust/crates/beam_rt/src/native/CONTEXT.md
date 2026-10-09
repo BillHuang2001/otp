@@ -101,6 +101,7 @@ before the registry.
 | `trace` | `0` (no tracing subsystem in M1) |
 | `suspending` | `[]` (no `suspend_process` in M1) |
 | `last_calls` | `false` (no tracing subsystem in M1) |
+| `sequential_trace_token` | the process's sequential-trace token 5-tuple, or the bare `[]` while sequential tracing is inactive for it (read from `crate::seq_trace::token`) |
 | `memory` | this process's real bytes (`(total_heap_size + stack_size) * 8` + off-heap overhead) |
 
 #### The execution-position items (the engine's view of *where* a process is)
