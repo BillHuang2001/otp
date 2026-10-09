@@ -45,17 +45,28 @@
 //! An operand that would *itself* need a heap block (a non-small `integer`/`character`
 //! operand → an exact bignum) is materialized into the reserved block's spare
 //! **tail** through [`Slack`], so the whole build still costs a single allocation.
+//!
+//! # Carving a whole multi-node graph out of one reservation
+//!
+//! A build that produces *several* nodes (a `{M,F,A,Location}` stacktrace item and
+//! its `[{file,File},{line,N}]` location, a list of such items, …) cannot use one
+//! builder per node: each builder would reserve its **own** block, and a collection
+//! under a later reservation would strand the nodes already written (their pointers
+//! are not roots). Such a build therefore sizes the whole graph from **metadata**
+//! before allocating, takes ONE reservation ([`reserve_slack`]) and carves every
+//! node out of that single region with the [`Slack`]'s bump cursor —
+//! [`Slack::alloc_words`] plus the [`Sink`](super::Sink) writers, which never touch
+//! the context heap, so nothing can collect between the nodes.
 
 use beam_common::Result;
 use beam_term::{make_small, thing, Eterm, MAX_SMALL, MIN_SMALL};
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::machine::Machine;
-use crate::terms;
 
-/// The spare **tail** of a reserved block, where a builder materializes an operand
-/// that would otherwise need its own (collecting) heap allocation.
+/// The storage of a reserved block: the spare **tail** a builder materializes an
+/// operand into, or the **whole** region a multi-node builder carves node-by-node.
 ///
 /// The builders reserve `block_words + extra` words in one rooted allocation and
 /// hand the `extra`-word tail to the reader closure as a [`Slack`]. The closure may
@@ -64,7 +75,7 @@ use crate::terms;
 /// would invalidate the reserved block: the block's own pointer is not a root, so a
 /// second collection would strand it.
 ///
-/// The slack is a plain cursor over the tail; it never touches the context heap.
+/// The slack is a plain bump cursor; it never touches the context heap.
 #[derive(Debug)]
 pub struct Slack {
     /// The first word of the spare tail (inside the reserved block).
@@ -96,6 +107,32 @@ impl Slack {
         self.cap - self.cursor
     }
 
+    /// Bump-allocate `n` words out of the slack and return a pointer to them.
+    ///
+    /// This is the **carve** primitive a multi-node builder uses: it reserves the
+    /// whole graph in one rooted allocation, wraps it in a [`Slack`] over the whole
+    /// region ([`reserve_slack`]) and carves every node out of it. Nothing here
+    /// touches the context heap, so a carve can never trigger a collection — which is
+    /// exactly what keeps the nodes already written (whose pointers are not roots)
+    /// alive.
+    ///
+    /// A slack too small for `n` words is a typed [`crate::error::unsupported`] — a
+    /// caller sizing bug, never a wrong term.
+    #[inline]
+    pub(crate) fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        if self.remaining() < n {
+            return Err(error::unsupported(
+                "slack: reserved region too small for the node",
+            ));
+        }
+        // SAFETY: `remaining() >= n` words are unused at `cursor`, so `base + cursor`
+        // addresses `n` exclusively-owned, writable words inside the reserved block
+        // (which the caller has not handed out twice).
+        let hp = unsafe { self.base.add(self.cursor) };
+        self.cursor += n;
+        Ok(hp)
+    }
+
     /// Materialize `value` into the slack: a small int when it fits, an **exact
     /// bignum** otherwise. Never allocates from the context heap.
     ///
@@ -105,22 +142,16 @@ impl Slack {
         if (MIN_SMALL..=MAX_SMALL).contains(&value) {
             return Ok(make_small(value));
         }
-        let need = thing::big_size_words(1);
-        if self.remaining() < need {
-            return Err(error::unsupported("slack: no room for a bignum operand"));
-        }
         // `unsigned_abs` is total (including `i64::MIN`) and a non-small value has a
         // non-zero magnitude, so there is no leading zero digit to strip.
         let digits = [value.unsigned_abs()];
-        // SAFETY: `remaining() >= big_size_words(1)` words are unused at `cursor`, so
-        // `base + cursor` addresses a bignum-sized writable region inside the reserved
-        // block, which `write_big` fully initialises (header + one `ErtsDigit`).
-        let hp = unsafe { self.base.add(self.cursor) };
-        self.cursor += need;
+        let hp = self.alloc_words(thing::big_size_words(1))?;
+        // SAFETY: `alloc_words` returned `thing::big_size_words(1)` exclusively-owned,
+        // writable words, which `write_big` fully initialises (header + one
+        // `ErtsDigit`).
         Ok(unsafe { thing::write_big(hp, value < 0, &digits) })
     }
 }
-
 /// Reserve `n` words for a term build through the **rooted** allocation seam.
 ///
 /// This is the single admission point every builder in [`terms`] goes through: the
@@ -137,4 +168,25 @@ pub(crate) fn reserve(
     live: u32,
 ) -> Result<*mut Eterm> {
     machine.alloc_rooted(ctx, n, live)
+}
+
+/// Reserve `n` words through the **rooted** seam and hand them back as a [`Slack`]
+/// over the **whole** region — the entry point a multi-node builder carves from.
+///
+/// The one collection the reservation may run relocates the machine's roots, so a
+/// caller must compute every node's *shape* (and read every operand) only
+/// afterwards. `live` is fixed to [`RootSet::ALL_LIVE`]: a graph built from module
+/// metadata has no operand-derived live-X count, and treating every register as live
+/// is always a safe over-approximation for a copying collector.
+#[inline]
+pub fn reserve_slack(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    n: usize,
+) -> Result<Slack> {
+    let hp = reserve(machine, ctx, n, RootSet::ALL_LIVE)?;
+    // SAFETY: `reserve` returned `n` exclusively-owned, writable words and the slack
+    // is exactly those `n` words; the caller carves them, one node at a time, and
+    // hands no word out twice.
+    Ok(unsafe { Slack::new(hp, n) })
 }

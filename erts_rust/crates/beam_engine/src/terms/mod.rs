@@ -90,6 +90,7 @@ mod fun;
 mod map;
 mod number;
 mod read;
+mod sink;
 mod slack;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -100,8 +101,11 @@ pub use map::{is_hashmap, make_flatmap, make_map, map_entries};
 pub use number::{float_value, make_float, make_integer};
 pub(crate) use number::make_integer_unrooted;
 pub use read::{binary_bytes, cons_head, cons_tail, list_elements, tuple_arity, tuple_element};
+pub use sink::{ContextSink, Sink};
+pub(crate) use sink::{write_list_at, write_tuple_at};
 pub use slack::Slack;
 pub(crate) use slack::reserve;
+pub use slack::reserve_slack;
 
 /// `MAP_SMALL_MAP_LIMIT` (`erl_map.h:93-97`): the largest flat-map pair count.
 /// Above it ERTS uses a **hashmap** (HAMT), which [`make_map`] builds; this

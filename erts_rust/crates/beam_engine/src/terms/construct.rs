@@ -80,15 +80,9 @@ where
             "make_tuple: element count mismatch",
         ));
     }
-    // SAFETY: the reserve block is live and exclusively owned; word 0 receives the
-    // arityval header and words `1..=n_elems` the elements read after the reserve.
-    unsafe {
-        *hp = beam_term::make_arityval(n_elems);
-        for (i, elem) in elems.iter().enumerate() {
-            *hp.add(1 + i) = *elem;
-        }
-    }
-    Ok(beam_term::make_tuple(hp))
+    // SAFETY: the reserve block is live and exclusively owned and holds
+    // `1 + n_elems` words; `elems` was checked to hold exactly `n_elems`.
+    Ok(unsafe { super::write_tuple_at(hp, &elems) })
 }
 
 /// Builds a single cons cell `[Head | Tail]` the `read` closure supplies.
@@ -156,20 +150,10 @@ where
     if elems.len() != n {
         return Err(crate::error::unsupported("make_list: element count mismatch"));
     }
-    // SAFETY: the reserve block holds `2 * n` live, exclusively-owned cell words and
-    // the `extra` tail; the cells are `[CAR, CDR]` pairs tagged `TAG_PRIMARY_LIST`, the
-    // last `CDR` is `NIL` and every earlier `CDR` points at the next contiguous cell.
-    unsafe {
-        for (i, elem) in elems.iter().enumerate() {
-            *hp.add(2 * i) = *elem;
-            *hp.add(2 * i + 1) = if i + 1 == n {
-                beam_term::NIL
-            } else {
-                beam_term::make_list(hp.add(2 * (i + 1)))
-            };
-        }
-    }
-    Ok(beam_term::make_list(hp))
+    // SAFETY: the reserve block holds `2 * n` live, exclusively-owned cell words (the
+    // `extra` tail follows them) and `elems` was checked to hold exactly `n`
+    // elements, so the cells are `n` proper `[CAR, CDR]` pairs.
+    Ok(unsafe { super::write_list_at(hp, &elems) })
 }
 
 /// The `{badmatch, Value}` exception reason (class `error`) for a failed
