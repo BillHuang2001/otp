@@ -485,7 +485,13 @@ fn schedule_raises_badarg_without_host_support() {
     assert_eq!(env.pending_exception(), Some(badarg), "the refusal is raised");
     // SAFETY: `env` is live.
     unsafe { enif_clear_env(env.as_ptr()) };
-    assert_eq!(env.pending_exception(), None);
+    // The C `enif_clear_env` frees temporary objects but never clears `exception_thrown`
+    // (`erl_nif.c:700-723`), so the refusal is still pending afterwards.
+    assert_eq!(
+        env.pending_exception(),
+        Some(badarg),
+        "enif_clear_env must not clear the exception"
+    );
     assert!(host.scheduled.is_empty(), "nothing was scheduled");
 }
 
