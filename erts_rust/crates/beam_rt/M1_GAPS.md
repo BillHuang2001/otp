@@ -108,19 +108,25 @@ gets its five identity fields from `FunIdentityBridge`, so `term_to_binary/1` is
 The read path is thin (only **stdout** polled, stderr discarded, one `Read::read` per readiness);
 `connected` flips to `false` only at `port_close/1`; a `binary`-stream read wider than 64 bytes is the
 typed *unsupported* gap. `os:cmd/1` stays the runtime-native host spawn. A `{spawn_driver, Name}` port's
-`driver_output` **is** delivered to its owner as `{Port, {data, Data}}`; `driver_select`/
-`driver_set_timer` are real (one poller registration per direction; the timer mirrors into the port's
-`TIMEOUT` task). Typed gaps: `driver_async` (no async pool; `Runtime` is `!Send`), `port_control/3` not
-reaching `control`, a captured `send_term`, `ERL_DRV_USE`'s `stop_select`, no OS child (`os_pid` is
-`undefined`). With no `erl_ddll:load_driver/*`, the `Name` doubles as the *search* (a `/`-containing name
+`driver_output` **is** delivered to its owner as `{Port, {data, Data}}`; `driver_select` is real, and `driver_set_timer` arms for every attached port (the C substitutes a no-op
+`no_timeout_callback` when the entry declares no `timeout`, so `-1` only fires for an invalid port or an
+overflowing deadline). Typed gaps: `driver_async` (no async pool; `Runtime` is `!Send`), `port_control/3`
+not reaching `control`, a captured `send_term`, `ERL_DRV_USE`'s `stop_select`, no OS child (`os_pid` is
+`undefined`). The six `erl_ddll` registry BIFs (`loaded_drivers/0`, `try_load/3`, `try_unload/2`,
+`monitor/2`, `demonitor/1`, `info/2`) stay typed `unsupported`: `loaded_drivers/0` would report this
+runtime's own (empty) driver set where the oracle lists its statically-linked `tcp_inet`/`udp_inet`/
+`ram_file_drv` — a by-construction own-state divergence never worth fabricating — and the corpus covers
+none of them. With no `erl_ddll:load_driver/*`, the `Name` doubles as the *search* (a `/`-containing name
 is the object path, driver name = its file stem; else `<name>.so`). The send family: `erlang:send(Port, Data)`
 needs the port write path and the distributed `{Name, Node}` send is contract A.5; both raise
 `unsupported: …`, never a fabricated value.
 
 ## Timers
 `send_after` answers a `#Ref<>`; `cancel_timer(Pending)` the remaining ms, `cancel_timer(Fired|Cancelled|unknown-ref)`
-`false`, `cancel_timer(non-ref)`/a bad time or destination `badarg`. Unimplemented: `erlang:system_info/2`,
-`read_timer/1,2`, `start_timer`'s absolute form, and every other `RuntimeHooks` key.
+`false`, `cancel_timer(non-ref)`/a bad time or destination `badarg`. Unimplemented: `erlang:system_info/2`, `read_timer/1,2`,
+`start_timer`'s absolute form, and the roster keys this bridge does not serve (the `erl_ddll` registry
+family, `alias/1`/`unalias/1`, `delete_module/1`/`purge_module/2`, `port_get_data/1`/`port_set_data/2`,
+`term_to_iovec/1,2`, `erlang:is_builtin/3`, …); each is the typed `unsupported` gap.
 
 ## Heap model
 `DEFAULT_HEAP_WORDS` is `1 << 24` (16 Mi words of lazily-mapped address space). The term-construction
@@ -153,10 +159,12 @@ re-basing, and `beam_bifs` per-object `hp` re-fetch.
   since the fragment payload is larger than the receiver's ungrowable M1 heap. Plus a `!Send`-friendly
   `SchedulerPool` for SMP adoption (`Runtime` holds `Rc`/`RefCell` tables and `*mut Eterm` heaps, so
   `beam_process`'s `unsafe impl Send` escape is unavailable here).
-* **`beam_io` lifecycle.** Finish the driver-port lifecycle (the `async` default, `port_control/3`
-  reaching `control`, a delivered `send_term`, `ERL_DRV_USE`'s `stop_select`, a per-registration
-  `ErlDrvEvent` identity), and revisit `open_port({spawn_executable, <a DIRECTORY path>}, [])` (oracle: a
-  port; here: `error:eacces`).
+* **`beam_io` / `beam_abi` lifecycle.** Finish the driver-port lifecycle (the `async` default — needs a
+  `beam_abi::DriverHost` seam that can fire `ready_async`, since `beam_rt` is `#![deny(unsafe_code)]`;
+  `port_control/3` reaching `control`; a delivered `send_term`; `ERL_DRV_USE`'s `stop_select`; a
+  per-registration `ErlDrvEvent` identity). `erl_drv_monotonic_time`'s phase differs because
+  `beam_abi/src/driver/drv/mem.rs` reads `CLOCK_MONOTONIC` from the system epoch where the oracle returns
+  the Erlang monotonic time (a process-global origin shared with `beam_bifs`' `time.rs`).
 * **`beam_bifs` registry key allocation.** `BifRegistry::contains`/`lookup` build owned `(String, String)`
   key tuples per lookup, and the dispatch path does both (`contains` in `call_bif`, then `lookup` inside
   `BifRegistry::call`) — ~4 small `String` allocations per registered call, the largest attributable
