@@ -43,6 +43,13 @@
 //!   attribute term ([`beam_loader::Module::attributes_term`]) is re-encoded with the
 //!   crate's own ETF encoder and compared, byte for byte, with the raw `Attr` chunk
 //!   *and* with the system Erlang's own `term_to_binary(Module:module_info(attributes))`.
+//! * **`CInf`/`Meta` decode matches the oracle.** The decoded compiler information
+//!   ([`beam_loader::Module::compile_info_term`]) and feature metadata
+//!   ([`beam_loader::Module::meta_term`]) are re-encoded and compared, byte for byte,
+//!   with the raw `CInf`/`Meta` chunk and with the system Erlang's own
+//!   `beam_lib:chunks/2` + `term_to_binary` view of the same chunks. The census below
+//!   additionally round-trips both chunks for **every** module it loads, with a floor
+//!   asserting the check genuinely ran.
 //!
 //! # Locating the OTP install (generic, no hardcoded application names)
 //!
@@ -221,6 +228,9 @@ fn every_corpus_chunk_id_is_classified() {
     let mut unknown: Vec<(String, String)> = Vec::new();
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut loaded = 0usize;
+    // How many modules actually exercised each decoded term chunk (see the floor below).
+    let mut cinf_round_tripped = 0usize;
+    let mut meta_round_tripped = 0usize;
 
     for path in &beams {
         let label = rel_label(&root, path);
@@ -248,7 +258,46 @@ fn every_corpus_chunk_id_is_classified() {
             Ok(module) => {
                 loaded += 1;
                 if module.functions.is_empty() {
-                    failures.push((label, "loaded but yielded no function".to_string()));
+                    failures.push((label.clone(), "loaded but yielded no function".to_string()));
+                }
+                // The eagerly decoded term-carrying chunks must round-trip back to the
+                // chunk's own bytes: `CInf` and `Meta` are plain `binary_to_term`
+                // payloads (`beam_lib.erl:1071-1077` for `CInf`; the C only checksums
+                // `Meta`), so re-encoding the decoded term through the crate's own ETF
+                // encoder must reproduce the chunk byte for byte — and a chunk that is
+                // absent must leave the holder empty.
+                for (what, raw, decoded) in [
+                    ("CInf", &module.compile_info, module.compile_info_term()),
+                    ("Meta", &module.meta, module.meta_term()),
+                ] {
+                    match (raw.as_deref(), decoded) {
+                        (Some(raw), Some(term)) => {
+                            match beam_codec::encode_term(term, &module.atom_table) {
+                                Ok(reencoded) if reencoded == raw => {
+                                    if what == "CInf" {
+                                        cinf_round_tripped += 1;
+                                    } else {
+                                        meta_round_tripped += 1;
+                                    }
+                                }
+                                Ok(_) => failures.push((
+                                    label.clone(),
+                                    format!("{what} re-encode differs from the chunk"),
+                                )),
+                                Err(error) => failures
+                                    .push((label.clone(), format!("{what} encode: {error:?}"))),
+                            }
+                        }
+                        (None, None) => {}
+                        (Some(_), None) => failures.push((
+                            label.clone(),
+                            format!("{what} chunk present but did not decode"),
+                        )),
+                        (None, Some(_)) => failures.push((
+                            label.clone(),
+                            format!("{what} decoded without a chunk"),
+                        )),
+                    }
                 }
             }
             Err(error) => failures.push((label, format!("load: {error:?}"))),
@@ -279,6 +328,10 @@ fn every_corpus_chunk_id_is_classified() {
             }
         }
     }
+    let _ = writeln!(
+        report,
+        "  decoded round-trip: CInf x{cinf_round_tripped}, Meta x{meta_round_tripped}"
+    );
     println!("{report}");
 
     // Positive floors: the corpus genuinely carries the ids that must be classified, so
@@ -297,6 +350,14 @@ fn every_corpus_chunk_id_is_classified() {
         app_count >= 30 && beams.len() >= 1000,
         "the census covered only {app_count} application(s) / {} module(s) — expected the full OTP install",
         beams.len()
+    );
+    // ... and the decoded-term round-trip genuinely ran: `CInf` is present in every
+    // installed module and `Meta` in all but one, so a floor well below the real counts
+    // still catches a silently skipped check.
+    assert!(
+        cinf_round_tripped >= 1000 && meta_round_tripped >= 1000,
+        "the CInf/Meta round-trip only ran for {cinf_round_tripped}/{meta_round_tripped} module(s) \
+         — the decoded-term check is not being exercised"
     );
 
     // The classification must cover every id: an unclassified id is the regression this
@@ -319,12 +380,15 @@ fn every_corpus_chunk_id_is_classified() {
 /// relies on are classified exactly as documented.
 #[test]
 fn the_classification_table_matches_the_documented_categories() {
-    let cases: [(ChunkId, ChunkClass); 6] = [
+    let cases: [(ChunkId, ChunkClass); 7] = [
         (ChunkId::ATOM, ChunkClass::ParsedExposed),
         (ChunkId::CODE, ChunkClass::ParsedExposed),
         (ChunkId::ATTR, ChunkClass::ParsedExposed),
-        (ChunkId::CINF, ChunkClass::ParsedRaw),
-        (ChunkId::META, ChunkClass::ParsedRaw),
+        (ChunkId::CINF, ChunkClass::ParsedExposed),
+        (ChunkId::META, ChunkClass::ParsedExposed),
+        // `StrT` is the one chunk that stays captured-verbatim (the runtime never
+        // interprets it), so the `ParsedRaw` category is still exercised.
+        (ChunkId::STRT, ChunkClass::ParsedRaw),
         (ChunkId::DOCS, ChunkClass::ToolingOnly),
     ];
     for (id, expected) in cases {
@@ -439,5 +503,159 @@ fn decoded_attributes_match_the_oracle() {
         );
         // A name that is definitely not an attribute is `None`, never a panic.
         assert_eq!(loaded.attribute_by_name("no_such_attribute"), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The `CInf`/`Meta` oracle cross-check
+// ---------------------------------------------------------------------------
+
+/// The system Erlang's `term_to_binary(binary_to_term(Chunk))` for the `CInf` and `Meta`
+/// chunks of `file`, as hex strings (`"none"` for a chunk the file does not carry), or
+/// `None` when the oracle is unavailable.
+///
+/// The probe mirrors the reader side — `lib/stdlib/src/beam_lib.erl:1071-1077`
+/// (`chunk_to_data/6` decodes `compile_info` as `binary_to_term(Chunk)`) and the raw
+/// `"Meta"` chunk — so a difference can only mean this crate's decode is wrong. The file
+/// path is passed through the environment (`os:getenv/1`) rather than interpolated into
+/// the `-eval` source, so a path with quotes or backslashes cannot break the probe.
+fn oracle_compile_meta_hex(file: &Path) -> Option<(String, String)> {
+    let eval = "F=os:getenv(\"BEAM_ORACLE_FILE\"),\
+                {ok,{_,Cs}}=beam_lib:chunks(F,[\"CInf\",\"Meta\"],[allow_missing_chunks]),\
+                E=fun(missing_chunk)->\"none\";\
+                    (B)->binary:encode_hex(term_to_binary(binary_to_term(B))) end,\
+                io:format(\"~s ~s\",[E(proplists:get_value(\"CInf\",Cs,missing_chunk)),\
+                                     E(proplists:get_value(\"Meta\",Cs,missing_chunk))]),\
+                halt().";
+    let output = Command::new("erl")
+        .args(["-noshell", "-eval", eval])
+        .env("BEAM_ORACLE_FILE", file)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut fields = text.split_whitespace();
+    let cinf = fields.next()?.to_string();
+    let meta = fields.next()?.to_string();
+    Some((cinf, meta))
+}
+
+/// The decoded `CInf`/`Meta` terms must equal the oracle's view of the same chunks for
+/// two representative modules: each decoded term is re-encoded with the crate's own ETF
+/// encoder and compared, byte for byte, against the raw chunk *and* against the system
+/// Erlang's `term_to_binary(binary_to_term(Chunk))` (`beam_lib:chunks/2`).
+///
+/// `CInf` is the value `module_info(compile)` serves (the C decodes it with
+/// `erts_decode_ext`: `erts/emulator/beam/erl_bif_info.c:5896-5918`); `Meta` is the
+/// compiler's feature metadata (`lib/compiler/src/compile.erl:2274-2295`).
+#[test]
+fn decoded_compile_info_and_meta_match_the_oracle() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("{reason}");
+        return;
+    }
+
+    for (app, module) in [("stdlib", "gen_server"), ("kernel", "kernel")] {
+        let Some(ebin) = app_ebin(app) else {
+            eprintln!("SKIP: {app} ebin not found");
+            return;
+        };
+        let path = ebin.join(format!("{module}.beam"));
+        let loaded = beam_loader::load_file(&path)
+            .unwrap_or_else(|error| panic!("load {}: {error:?}", path.display()));
+        assert_eq!(loaded.atom_name(loaded.name), Some(module));
+
+        // --- `CInf` ---------------------------------------------------------
+        let raw = loaded
+            .compile_info
+            .as_deref()
+            .unwrap_or_else(|| panic!("{}: raw CInf bytes missing", path.display()));
+        let decoded = loaded
+            .compile_info_term()
+            .unwrap_or_else(|| panic!("{}: CInf chunk did not decode", path.display()));
+        let reencoded_cinf = beam_codec::encode_term(decoded, &loaded.atom_table)
+            .unwrap_or_else(|error| panic!("encode CInf of {module}: {error:?}"));
+        assert_eq!(
+            reencoded_cinf, raw,
+            "{module}: re-encoded CInf differs from the raw CInf chunk"
+        );
+
+        // Concrete, oracle-verified facts `module_info(compile)` relies on: the compiler
+        // writes `[{version,?COMPILER_VSN}|Compile]`, and every build records the source
+        // path (`beam_asm.erl:307-310`).
+        assert!(
+            loaded.compile_info_by_name("version").is_some(),
+            "{module}: decoded CInf carries no `version`"
+        );
+        assert!(
+            loaded.compile_info_by_name("source").is_some(),
+            "{module}: decoded CInf carries no `source`"
+        );
+        // A name that is definitely not present is `None`, never a panic.
+        assert_eq!(loaded.compile_info_by_name("no_such_key"), None);
+
+        // --- `Meta` ---------------------------------------------------------
+        // `Meta` is absent from a handful of installed modules, so the invariant is that
+        // the decoded holder is empty exactly when the chunk is absent.
+        let raw_meta = loaded.meta.as_deref();
+        let decoded_meta = loaded.meta_term();
+        let reencoded_meta = match (raw_meta, decoded_meta) {
+            (Some(raw), Some(term)) => {
+                let reencoded = beam_codec::encode_term(term, &loaded.atom_table)
+                    .unwrap_or_else(|error| panic!("encode Meta of {module}: {error:?}"));
+                assert_eq!(
+                    reencoded, raw,
+                    "{module}: re-encoded Meta differs from the raw Meta chunk"
+                );
+                // The one feature in this OTP release's universe is `maybe_expr`, and the
+                // compiler always records it under `enabled_features`
+                // (`compile.erl:2269-2289`).
+                assert!(
+                    loaded.meta_by_name("enabled_features").is_some(),
+                    "{module}: decoded Meta carries no `enabled_features`"
+                );
+                assert_eq!(loaded.meta_by_name("no_such_key"), None);
+                Some(reencoded)
+            }
+            (None, None) => {
+                eprintln!("SKIP: {module} carries no Meta chunk");
+                None
+            }
+            (raw, term) => panic!(
+                "{module}: Meta chunk/term mismatch: raw={raw:?} term={term:?}"
+            ),
+        };
+
+        // --- the oracle -----------------------------------------------------
+        match oracle_compile_meta_hex(&path) {
+            Some((oracle_cinf, oracle_meta)) => {
+                let oracle_cinf =
+                    decode_hex(&oracle_cinf).expect("the oracle CInf hex must decode");
+                assert_eq!(
+                    reencoded_cinf, oracle_cinf,
+                    "{module}: decoded CInf differs from the oracle's \
+                     term_to_binary(binary_to_term(CInf))"
+                );
+                match (&reencoded_meta, decode_hex(&oracle_meta)) {
+                    (Some(ours), Some(oracle)) => assert_eq!(
+                        *ours, oracle,
+                        "{module}: decoded Meta differs from the oracle's \
+                         term_to_binary(binary_to_term(Meta))"
+                    ),
+                    (None, None) => {}
+                    (ours, oracle) => panic!(
+                        "{module}: oracle Meta presence disagrees with the loaded module \
+                         (ours={ours:?} oracle_len={:?})",
+                        oracle.map(|bytes| bytes.len())
+                    ),
+                }
+            }
+            None => eprintln!(
+                "SKIP: oracle `erl` unavailable for {module} — the decoded terms were checked \
+                 against the raw chunks only"
+            ),
+        }
     }
 }

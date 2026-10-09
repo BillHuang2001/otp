@@ -36,6 +36,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::attributes::{AttributeTable, SharedAttributeTable};
+use crate::decoded::{DecodedTerm, SharedDecodedTerm};
 use crate::literal::LiteralArea;
 use crate::operand::Label;
 
@@ -322,9 +323,36 @@ pub struct Module {
     /// [`Module::attribute_by_name`].
     pub attribute_table: SharedAttributeTable,
     /// The raw `CInf` chunk bytes, if present.
+    ///
+    /// Kept alongside [`Module::compile_info_table`] (the decoded term) — the raw bytes
+    /// are what a byte-level consumer (and the module checksum) sees, the decoded term
+    /// what `module_info(compile)` serves.
     pub compile_info: Option<Vec<u8>>,
-    /// The raw `Meta` chunk bytes, if present (tooling-only, part of the checksum).
+    /// The decoded `CInf` chunk: the compiler information as an Erlang term.
+    ///
+    /// `CInf` is `term_to_binary([{version,?COMPILER_VSN}|Compile])`
+    /// (`lib/compiler/src/beam_asm.erl:236,309`), the value the oracle's
+    /// `Module:module_info(compile)` returns (the C decodes it on demand:
+    /// `erts/emulator/beam/erl_bif_info.c:5896-5918`, `compilation_info_for_module` →
+    /// `erts_decode_ext`).
+    ///
+    /// Shared behind an [`Arc`] (the holder owns a heap), so a `Module` clone stays
+    /// cheap. Reachable through [`Module::compile_info_term`].
+    pub compile_info_table: SharedDecodedTerm,
+    /// The raw `Meta` chunk bytes, if present (part of the module checksum).
     pub meta: Option<Vec<u8>>,
+    /// The decoded `Meta` chunk: the compiler's feature metadata as an Erlang term.
+    ///
+    /// `Meta` is `term_to_binary(MetaData, [deterministic])` written by
+    /// `lib/compiler/src/compile.erl:2274-2295` (the `?META_CHUNK_NAME` extra chunk)
+    /// and passed through `beam_asm.erl:216-224`; it is a property list, e.g.
+    /// `[{enabled_features,[maybe_expr]}]`. The C only feeds the raw bytes to the module
+    /// checksum (`erts/emulator/beam/beam_file.c:1811-1815`); the decoded term is exposed
+    /// here for the tooling/introspection layer.
+    ///
+    /// Shared behind an [`Arc`] (the holder owns a heap), so a `Module` clone stays
+    /// cheap. Reachable through [`Module::meta_term`].
+    pub meta_table: SharedDecodedTerm,
 }
 
 impl Default for Module {
@@ -348,7 +376,9 @@ impl Default for Module {
             attributes: None,
             attribute_table: Arc::new(AttributeTable::default()),
             compile_info: None,
+            compile_info_table: Arc::new(DecodedTerm::default()),
             meta: None,
+            meta_table: Arc::new(DecodedTerm::default()),
         }
     }
 }
@@ -441,5 +471,46 @@ impl Module {
     pub fn attribute_by_name(&self, name: &str) -> Option<Eterm> {
         let atom = self.atom_table.lookup(name)?;
         self.attribute_table.lookup(beam_term::make_atom(atom))
+    }
+
+    /// The module's compiler information as a decoded Erlang term (the `CInf` chunk),
+    /// or `None` when the chunk is absent/empty.
+    ///
+    /// This is exactly what the oracle's `Module:module_info(compile)` returns: a
+    /// `[{version, Vsn}, {options, Opts}, {source, File}]` property list. The term points
+    /// into the module's own atom table and compile-info heap, so it stays valid for as
+    /// long as this module.
+    pub fn compile_info_term(&self) -> Option<Eterm> {
+        self.compile_info_table.term()
+    }
+
+    /// The value of the first `{Key, Value}` pair in the decoded `CInf` property list
+    /// whose key is the atom named `name` (e.g. `"source"`), or `None` when the chunk is
+    /// absent/empty or carries no such pair.
+    ///
+    /// The name is resolved through this module's atom table first (like
+    /// [`Module::attribute_by_name`]), so the lookup works with the module-local atoms
+    /// the decoded term carries.
+    pub fn compile_info_by_name(&self, name: &str) -> Option<Eterm> {
+        let atom = self.atom_table.lookup(name)?;
+        self.compile_info_table.lookup(beam_term::make_atom(atom))
+    }
+
+    /// The module's compiler feature metadata as a decoded Erlang term (the `Meta`
+    /// chunk), or `None` when the chunk is absent/empty.
+    ///
+    /// A property list, e.g. `[{enabled_features,[maybe_expr]}]`. The term points into
+    /// the module's own atom table and metadata heap, so it stays valid for as long as
+    /// this module.
+    pub fn meta_term(&self) -> Option<Eterm> {
+        self.meta_table.term()
+    }
+
+    /// The value of the first `{Key, Value}` pair in the decoded `Meta` property list
+    /// whose key is the atom named `name` (e.g. `"enabled_features"`), or `None` when the
+    /// chunk is absent/empty or carries no such pair.
+    pub fn meta_by_name(&self, name: &str) -> Option<Eterm> {
+        let atom = self.atom_table.lookup(name)?;
+        self.meta_table.lookup(beam_term::make_atom(atom))
     }
 }

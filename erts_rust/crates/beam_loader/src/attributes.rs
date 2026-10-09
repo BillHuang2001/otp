@@ -42,26 +42,20 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::{AtomTable, Eterm};
 
-use crate::literal::decode_terms;
+use crate::decoded::DecodedTerm;
 
 /// The module's attributes, decoded into a private immutable heap.
 ///
 /// A module without an `Attr` chunk (or with an empty one) has `term() == None` and
-/// allocates nothing.
-pub struct AttributeTable {
-    /// The arena the decoded term lives in; `None` exactly when `term` is `None`.
-    heap: Option<Heap>,
-    /// The decoded attribute term (the property list), if the chunk was present.
-    term: Option<Eterm>,
-}
+/// allocates nothing. The decode/`Arc`/[`Default`]/[`Debug`] machinery is the shared
+/// [`DecodedTerm`] holder ([`crate::decoded`], which also holds the `CInf`/`Meta`
+/// terms this crate decodes); this type is the named `Attr`-chunk holder.
+pub struct AttributeTable(DecodedTerm);
 
 impl AttributeTable {
     /// A table with no attributes (`Attr` absent or empty).
     pub fn empty() -> AttributeTable {
-        AttributeTable {
-            heap: None,
-            term: None,
-        }
+        AttributeTable(DecodedTerm::empty())
     }
 
     /// Decodes the raw `Attr` payload into an attribute table.
@@ -73,76 +67,34 @@ impl AttributeTable {
     /// payload yields the decoder's typed [`beam_common::BeamError`] — never a panic
     /// and never a substituted value.
     pub fn decode(raw: Option<&[u8]>, atoms: &mut AtomTable) -> Result<AttributeTable> {
-        let raw = match raw {
-            Some(bytes) if !bytes.is_empty() => bytes,
-            _ => return Ok(AttributeTable::empty()),
-        };
-        let (heap, terms) = decode_terms(&[raw.to_vec()], atoms)?;
-        // `decode_terms` returns exactly one term per payload; the `Attr` chunk is a
-        // single payload, so this is always `Some`. Keep the `pop` defensive: a future
-        // multi-payload caller must not panic here.
-        let term = terms.into_iter().next();
-        Ok(AttributeTable {
-            heap: term.map(|_| heap),
-            term,
-        })
+        Ok(AttributeTable(DecodedTerm::decode(raw, atoms)?))
     }
 
     /// The decoded attribute list term, or `None` when the chunk was absent/empty.
     ///
     /// This is exactly the value the oracle's `Module:module_info(attributes)` returns.
     pub fn term(&self) -> Option<Eterm> {
-        self.term
+        self.0.term()
     }
 
     /// Whether this table holds no attributes.
     pub fn is_empty(&self) -> bool {
-        self.term.is_none()
+        self.0.is_empty()
     }
 
     /// The heap the decoded term lives in (introspection and tests), if any.
     pub fn heap(&self) -> Option<&Heap> {
-        self.heap.as_ref()
+        self.0.heap()
     }
 
     /// The value of the first `{Key, Value}` attribute whose key is the atom term
     /// `key`, or `None` when the list carries no such attribute.
     ///
-    /// The list is walked defensively: a non-list tail, a non-tuple element or a tuple
-    /// that is not a 2-tuple simply ends the search (`None`) — a malformed attribute
-    /// list is never a panic.
+    /// The property list is walked defensively (see [`DecodedTerm::lookup`]): a
+    /// malformed attribute list is never a panic.
     pub fn lookup(&self, key: Eterm) -> Option<Eterm> {
-        let mut rest = self.term?;
-        loop {
-            if beam_term::is_nil(rest) {
-                return None;
-            }
-            let head = match beam_codec::term::cons_head(rest) {
-                Ok(head) => head,
-                Err(_) => return None,
-            };
-            if let Some(value) = pair_value(head, key) {
-                return Some(value);
-            }
-            rest = match beam_codec::term::cons_tail(rest) {
-                Ok(tail) => tail,
-                Err(_) => return None,
-            };
-        }
+        self.0.lookup(key)
     }
-}
-
-/// The value of a `{key, Value}` 2-tuple `element`, or `None` when `element` is not a
-/// 2-tuple keyed by `key`.
-fn pair_value(element: Eterm, key: Eterm) -> Option<Eterm> {
-    if beam_codec::term::tuple_arity(element).ok()? != 2 {
-        return None;
-    }
-    let head = beam_codec::term::tuple_element(element, 0).ok()?;
-    if head != key {
-        return None;
-    }
-    beam_codec::term::tuple_element(element, 1).ok()
 }
 
 impl Default for AttributeTable {
@@ -156,10 +108,7 @@ impl core::fmt::Debug for AttributeTable {
     /// A compact, meaningful rendering: neither [`Eterm`] nor [`Heap`] has a useful
     /// `Debug` (the heap is a raw pointer).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("AttributeTable")
-            .field("has_term", &self.term.is_some())
-            .field("heap_words", &self.heap.as_ref().map_or(0, Heap::used))
-            .finish_non_exhaustive()
+        crate::decoded::fmt_holder(f, "AttributeTable", self.0.term(), self.0.heap())
     }
 }
 

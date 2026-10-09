@@ -62,6 +62,7 @@
 pub mod attributes;
 pub mod chunk;
 pub mod container;
+pub mod decoded;
 pub mod decode;
 pub mod error;
 pub mod instr;
@@ -73,6 +74,7 @@ pub mod opcode;
 pub mod operand;
 
 pub use crate::attributes::{AttributeTable, SharedAttributeTable};
+pub use crate::decoded::{DecodedTerm, SharedDecodedTerm};
 pub use crate::ir::*;
 pub use crate::literal::{LiteralArea, SharedLiteralArea};
 pub use crate::load::{load, load_file};
@@ -83,12 +85,14 @@ pub use crate::operand::*;
 ///
 /// `use beam_loader::prelude::*;` brings the frozen IR (`ir::*`, including
 /// [`FunDescriptor`](crate::ir::FunDescriptor)), the decoded literal area
-/// ([`literal::*`](crate::literal)), the decoded attribute table
-/// ([`AttributeTable`](crate::attributes::AttributeTable)), the operand and register
+/// ([`literal::*`](crate::literal)), the decoded term-chunk holders
+/// ([`AttributeTable`](crate::attributes::AttributeTable),
+/// [`DecodedTerm`](crate::decoded::DecodedTerm)), the operand and register
 /// identifiers (`operand::*`), the opcode roster (`opcode::*`) and the two entry
 /// points ([`load`], [`load_file`]) into scope. Mirrors the crate-root re-exports.
 pub mod prelude {
     pub use crate::attributes::{AttributeTable, SharedAttributeTable};
+    pub use crate::decoded::{DecodedTerm, SharedDecodedTerm};
     pub use crate::ir::*;
     pub use crate::literal::{LiteralArea, SharedLiteralArea};
     pub use crate::load::{load, load_file};

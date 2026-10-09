@@ -41,6 +41,7 @@ use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 use crate::chunk::record::{RawRecord, RawRecordDefault};
 use crate::chunk::Chunks;
+use crate::decoded::DecodedTerm;
 use crate::decode::RawInstr;
 use crate::error::bad_file;
 use crate::ir::{Export, Function, FunDescriptor, Import, Module, RecordDefinition, RecordField};
@@ -182,6 +183,16 @@ pub fn build_module(
         &mut atom_table,
     )?;
 
+    // The `CInf` chunk is `term_to_binary([{version,?COMPILER_VSN}|Compile])`
+    // (`beam_asm.erl:236,309`) — the value `module_info(compile)` serves — and the `Meta`
+    // chunk is `compile.erl`'s `term_to_binary(MetaData, [deterministic])` feature
+    // metadata (`compile.erl:2274-2295`). Both are plain `binary_to_term` payloads
+    // (`beam_lib.erl:1071-1077` for `CInf`; `beam_file.c:1811-1815` only checksums
+    // `Meta`), decoded eagerly through the same holder as `Attr`; a malformed payload is
+    // a typed error.
+    let compile_info_table = DecodedTerm::decode(chunks.compile_info.as_deref(), &mut atom_table)?;
+    let meta_table = DecodedTerm::decode(chunks.meta.as_deref(), &mut atom_table)?;
+
     Ok(Module {
         name,
         atoms,
@@ -200,7 +211,9 @@ pub fn build_module(
         attributes: chunks.attributes.clone(),
         attribute_table: Arc::new(attribute_table),
         compile_info: chunks.compile_info.clone(),
+        compile_info_table: Arc::new(compile_info_table),
         meta: chunks.meta.clone(),
+        meta_table: Arc::new(meta_table),
     })
 }
 
