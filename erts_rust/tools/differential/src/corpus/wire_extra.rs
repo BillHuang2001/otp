@@ -57,6 +57,14 @@
 //!   is asserted;
 //! * `erlang:binary_to_term/2` — the `[safe]` accept/reject surface, the `[used]`
 //!   `{Term, BytesUsed}` shape, and the truncated / garbage / wrong-arity error shapes.
+//! * evaluation limits — three `-eval` **literal/parser** shapes that the system-ERTS
+//!   oracle evaluates but the Rust `beam_rt` refuses through its documented unsupported
+//!   signal (a `beam_rt: unsupported: …` reason, exit `3`) rather than producing a
+//!   differing observable result: a `2^63` integer literal, a multi-element improper list
+//!   `[1,2|3]`, and an integer binary segment wider than 64 bits (`<<0:2048>>`). Each is an
+//!   **honest capability gap** whose golden is the oracle's own `ok …` line, so it flips to
+//!   `agree` for free once `beam_rt`'s `-eval` literal/parser grows the shape (owner:
+//!   `beam_rt`'s `-eval` literal/parser — confirmed by the `beam_rt: unsupported: …` reason).
 //!
 //! A live handshake and the `DOP_*` control framing are **not** expressible through a
 //! single CLI process (they need two connected nodes) — an honest, documented gap, not a
@@ -307,6 +315,13 @@ pub(crate) fn group() -> Vec<Case> {
         t("wire_extra/rt_bit_binary_13", "a 13-bit bitstring round-trips", "binary_to_term(term_to_binary(<<5:13>>)) =:= <<5:13>>", TRUE),
         t("wire_extra/rt_deep_list", "a deeply nested list round-trips", "binary_to_term(term_to_binary([1,[2,[3,[4,[5]]]]])) =:= [1,[2,[3,[4,[5]]]]]", TRUE),
         t("wire_extra/rt_mixed_terms", "a spread of mixed-type terms each round-trips", "lists:all(fun(E) -> binary_to_term(term_to_binary(E)) =:= E end, [[], [1,2,3], <<1,2>>, <<5:3>>, {a,b}, #{k=>v}])", TRUE),
+        // -- evaluation limits: honest `-eval` literal/parser capability gaps ----------
+        // Each golden is the oracle's own `ok …` line; `beam_rt` raises its documented
+        // unsupported signal (`beam_rt: unsupported: …`, exit 3) instead, so each case
+        // classifies `unsupported` — never a mismatch.
+        v("wire_extra/eval_bigint_literal_unsupported", "a 2^63 integer literal is an honest `-eval` literal-parser gap in the Rust runtime", "9223372036854775808", "ok 9223372036854775808"),
+        v("wire_extra/eval_improper_list_literal_unsupported", "a multi-element improper list literal [1,2|3] is an honest `-eval` parser gap in the Rust runtime", "[1,2|3]", "ok [1,2|3]"),
+        v("wire_extra/eval_wide_binary_segment_unsupported", "an integer binary segment wider than 64 bits is an honest `-eval` parser gap in the Rust runtime", "erlang:bit_size(<<0:2048>>)", "ok 2048"),
     ]
 }
 
@@ -388,6 +403,30 @@ mod tests {
                 cases.iter().any(|c| c.id == id),
                 "expected the tag-family case {id}"
             );
+        }
+    }
+
+    #[test]
+    fn wire_extra_covers_the_evaluation_limit_family() {
+        let cases = group();
+        // The three honest `-eval` literal/parser capability gaps: each golden is the
+        // oracle's own `ok …` line, so the case flips to `agree` once `beam_rt` grows
+        // the shape. Pin the ids and their value-probe goldens here.
+        for (id, golden) in [
+            ("wire_extra/eval_bigint_literal_unsupported", "ok 9223372036854775808"),
+            ("wire_extra/eval_improper_list_literal_unsupported", "ok [1,2|3]"),
+            ("wire_extra/eval_wide_binary_segment_unsupported", "ok 2048"),
+        ] {
+            let case = cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the evaluation-limit case {id}"));
+            assert_eq!(
+                case.golden.stdout,
+                Some(golden),
+                "case {id} must carry the oracle-derived golden"
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {id} golden must exit 0");
         }
     }
 }
