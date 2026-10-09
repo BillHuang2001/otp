@@ -30,8 +30,8 @@ submodules and their docs; do not look for `boot.rs` here.
   pub instruction: Option<Instruction>, pub error: BeamError }`, `BootStop::describe(&self) -> String`
   (a one-line summary: index/total + the failing directive as `M:F/A` or `{kernelProcess,Name,…}` + the
   error), `BootStop::describe_with(&self, &mut Runtime) -> String` (the same, but a **structured** raise
-  reason is rendered as its real term through the runtime's printer — e.g.
-  `{noproc,{gen_server,call,[file_server_2,…]}}` rather than `<structured reason>`; a non-structured or
+  reason is rendered as its real term through the runtime's printer — e.g. a structured
+  `{badmatch, Value}` rather than `<structured reason>`; a non-structured or
   unprintable reason falls back to `describe`), and
   `pub fn execute_reporting(&mut Runtime, &BootScript) -> std::result::Result<(), BootStop>`
   — the **primary** implementation, which `execute` delegates to (`execute(..).map_err(|stop| stop.error)`),
