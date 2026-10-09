@@ -723,13 +723,41 @@ mod tests {
         }
     }
 
-    /// A runtime whose code path includes the system directories, or `None` when no Erlang
-    /// install is available (the caller then skips **loudly**).
+    /// The CLI argv the executor tests model: the `-boot FILE` invocation of this checkout,
+    /// `beam_rt -noshell -boot bootstrap/bin/start` (the repository-root relative value a
+    /// developer types). The value is **recorded** as `init` records it and is never resolved
+    /// here — the executor is handed the parsed [`BootScript`] directly, read from
+    /// [`START_BOOT`] — but it is part of the command line `init:get_arguments/0` reports,
+    /// so the configuration is the real invocation's.
+    fn boot_argv() -> Vec<String> {
+        ["-noshell", "-boot", "bootstrap/bin/start"]
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect()
+    }
+
+    /// A runtime configured **exactly as the CLI configures a `-boot FILE` invocation**,
+    /// or `None` when no Erlang install is available (the caller then skips **loudly**).
+    ///
+    /// The configuration is part of the measurement: a `-boot FILE` run boots the preloaded
+    /// set and then drives the script, and the command line `init:get_arguments/0` reports
+    /// is the *whole* invocation. Building the runtime through [`crate::cli::parse`] — the
+    /// CLI's own parser, minus the `ERL_*FLAGS` merge a test must not depend on — is
+    /// therefore what keeps the in-crate executor measuring the invocation the CLI really
+    /// runs, rather than a configuration ([`RuntimeConfig::default`]'s empty argument list)
+    /// the CLI cannot produce for it.
     fn system_runtime() -> Option<Runtime> {
         if !have_system_erlang() {
             return None;
         }
-        match Runtime::with_defaults() {
+        let config = match crate::cli::parse(&boot_argv()) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("SKIP: cannot build the `-boot` invocation's configuration ({error})");
+                return None;
+            }
+        };
+        match Runtime::new(config) {
             Ok(runtime) => Some(runtime),
             Err(error) => {
                 eprintln!("SKIP: no system Erlang install ({error})");
