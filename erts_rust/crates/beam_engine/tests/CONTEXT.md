@@ -65,7 +65,37 @@ ones) plus the `support/` harness and `fixtures/`. No `#[ignore]`/`#[should_pani
   calls); `records.rs:724-734` compares create-form defaults to the same parsed `Recs` data the engine
   reads; `bitstrings_extra_big.rs:623-670` are `read(write(x))==x` round-trips. Documented mitigations
   exist (byte-aligned `g72`/`e72` absolute pin; oracle-pinned `Recs` parse).
-- No `#[ignore]`, no `#[should_panic]`, and no early-`return`/`continue` that skips on the normal path.
+- No `#[ignore]`/`#[should_panic]` anywhere. Most early `return`s are the legitimate narrow
+  `skip_if_unavailable()`/`oracle`-absent guards, but some silently pass on the normal path — see the
+  Known Issues below.
+
+## Known Issues (test honesty — current state)
+- **Silent skips inside sweeps (a partial regression stays green):**
+  `stdlib_lists.rs:757-780` (`breadth_runs_a_large_fraction_of_the_installed_corpus`) turns ANY typed
+  error into a counted `SKIP` (`:778`) and only the floors (`CALL_FLOOR=480` vs the 504-target corpus,
+  `MODULE_FLOOR=171` exact) catch a collapse; `exceptions_corpus.rs:370-416` skips any raise without a
+  live reason term (`:377-388`) or any other `Err` (`:413-416`), floor `MODULE_FLOOR=213` vs 215
+  modules; `clause_dispatch.rs:426-450` accepts ANY `Err` (identity never pinned).
+- **Live-oracle cross-checks that never run** (the `-pa` footgun above): `process_info.rs:459-476`
+  and every `tailcall.rs::cross_check` call site silently no-op; `tailcall.rs:304`'s pinned
+  `"unsupported_gap"` is itself wrong (the real oracle prints `{'EXIT',{unsupported_gap,…}}`) and is
+  masked by the dead check. `func_info_stacktrace.rs:375-394` runs a real `erl` but asserts only the
+  ORACLE's output, never the engine's — it says nothing about `beam_engine`.
+- **Cannot-fail assertions:** `stdlib_lists.rs:369` and `stdlib_more.rs:801`
+  (`skip_reason().is_some() == stdlib_ebin().is_none()` is true by definition);
+  `opcodes.rs:1971-1990` (`float_register_operand_is_read_from_the_fr_file` — both branches `Return`
+  writing nothing, so `Ok(NIL)` holds either way); `gc_arena.rs:242` (`first as usize == first_addr`
+  over a never-reassigned binding) and `:359-363` (compares a test-local reproduction, not the arena);
+  `engine_bench.rs:1323` (`reports.len() >= 12` over a fixed 12); `jit_bench.rs:1154-1183` anchors only
+  `aggr`/`cmp` — `fib`/`kernel`/`wide` compare tiers to each other (interpreter is both subject and
+  oracle); `jit_linking.rs:286-295` asserts no expected value for `add`; `stdlib_lists.rs:415-424` only
+  round-trips `support` helpers.
+- **`jit_real_module.rs` is tier-equivalence, not oracle-checked:** it discards the corpus expected
+  value (`:284` binds `_expected`) and compares errors by `Debug` string (`:195-204`, where
+  `live_reason` renders as a placeholder), so the doc's "736/736 oracle-checked" overstates.
+- `exceptions.rs:436-457` (and `:207-233`/`:473-506`/`:934-964`) pin behaviours that DELIBERATELY
+  diverge from the oracle (short/empty stacktraces; a body-BIF raise propagating instead of landing in
+  the catch frame) — labelled as locked M1 gaps, not dishonest, but they assert known-wrong results.
 
 ## Routing Table
 - `fixtures/` → committed oracle `.beam`/`.erl` sources + `README.md` (regeneration recipe + per-fixture
