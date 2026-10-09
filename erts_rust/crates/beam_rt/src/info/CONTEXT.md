@@ -55,7 +55,10 @@ families (`system → limits → schedulers → memory → unsupported`) and fal
 the build's constant tables rather than a literal: `port_limit`
 (`min(next_power_of_two(request), 134217727)`, or the default table `65536`; the request is
 `+Q N` or the clamped `ERL_MAX_PORTS` — `erts_ptab_init_table`/`erts_ptab_max`,
-`erl_ptab.c:383-388`/`erl_ptab.h:266-270`), `{allocator, A}` (`allocator_report`).
+`erl_ptab.c:383-388`/`erl_ptab.h:266-270`), `{allocator, A}` (`allocator_report`),
+`thread_pool_size` (the async-thread-pool size: the `+A N` the CLI preserves in
+`emulator.extra_emulator_flags`, reported as `max(1, N)` — matching the oracle's
+`+A 4`→`4` / `+A 0`→`1`; the oracle's own default `1` when `+A` is absent).
 
 **Self-derived from *this* runtime's own state** (correct-but-smaller — or simply
 different — from the oracle's run-time figure; the same rule `erlang:processes/0` /
