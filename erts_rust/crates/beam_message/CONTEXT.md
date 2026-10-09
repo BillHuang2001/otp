@@ -435,11 +435,20 @@ dominates the small shapes.)
   `THE_NON_VALUE` without panicking). The `beam_message` boundary is guarded by the cycle-safe
   `preflight_words`, but any other caller sizing a term with `size_object` (beam_gc, beam_rt, tools) is
   exposed; a bound/cycle guard belongs in `beam_term` (`src/size.rs`).
-- **`beam_term::size_object` under-counts a standalone `SUB_BITS` *match context*** (it reports the
-  C's fresh-window size, while this copier writes the 5-word `ErlSubBits` verbatim — the copier's own
-  `preflight_words` reserves the exact count). Unreachable today (no match-context constructor exists),
-  but a match context whose `orig` is *not* a `BinRef` is treated as an opaque leaf and a `orig`
-  pointing at a source-heap object would be copied as-is. Revisit if match contexts become reachable.
+- **A standalone `SUB_BITS` *match context* is copied as an opaque leaf with no `orig` fix-up.** Match
+  contexts **are** constructible (`beam_engine`'s bitstring families, `raw.rs::make_ctx`), but
+  `src/layout.rs` has no `SUB_BITS` arm, so `for_each_child_slot` visits no slot: a context whose
+  `orig` is *not* a `BinRef` (an on-heap bitstring) is copied verbatim and its `orig` keeps pointing
+  into the source heap. `object_words` also sizes such a context as `thing_arityval+1` (5 words) where
+  `beam_term::size_object` reports the copied window, so `size_of_copy` and `preflight_words` can
+  disagree. `beam_gc`'s scan DOES fix the context's `orig` up (`scan_step`'s `orig_index = Some(4)`),
+  so only a context crossing a *copy_struct* boundary (message/fragment) is affected — not reachable
+  through any current send path, but no longer justified as "unreachable".
+- **The per-object sizing + child-slot walk is re-implemented (and subtly divergent) in three crates.**
+  `src/layout.rs`'s `object_words`/`for_each_child_slot` re-derive `beam_gc::copy::{move_size,scan_step,
+  for_each_ref}` and `beam_term::size::describe_object` (`size.rs`); all three are private/`pub(crate)`,
+  so no LCA (not even `beam_term`) exposes one shared walk, and `layout.rs` lacks the `SUB_BITS` arm
+  `describe_object` has (see the bullet above). Extracting one per-object walk into `beam_term` is the fix.
 - **No sharing-preserving copy for the flat path.** `copy_struct` duplicates a repeated subterm
   (C's default); `copy_struct_shared` is the opt-in alternative. Only immediates, literal-area terms
   and the zero-arity tuple are shared outright.
