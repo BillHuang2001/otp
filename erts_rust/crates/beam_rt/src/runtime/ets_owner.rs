@@ -797,7 +797,10 @@ mod tests {
         assert_eq!(index.pending_gift_failures(), 2);
 
         let taken = index.take_gift_failures();
-        assert_eq!(taken, vec![BeamError::BadArg, BeamError::SystemLimit]);
+        assert!(
+            matches!(taken.as_slice(), [BeamError::BadArg, BeamError::SystemLimit]),
+            "both failures were taken, in order: {taken:?}"
+        );
         assert_eq!(index.pending_gift_failures(), 0, "a drain takes them out");
         assert!(index.take_gift_failures().is_empty());
     }
@@ -864,7 +867,7 @@ mod tests {
     fn a_successful_gift_copy_is_reowned_and_records_nothing() {
         let mut rt = Runtime::with_defaults().expect("the default runtime");
         let owner = ProcessId::new(0, 6);
-        let mut heap = Heap::new(16);
+        let mut heap = Heap::new(16).expect("a 16-word test heap");
         let gift = heap
             .tuple(&[make_atom(Atom::from_raw(3)), beam_term::make_small(17)])
             .expect("a two-word tuple fits");
