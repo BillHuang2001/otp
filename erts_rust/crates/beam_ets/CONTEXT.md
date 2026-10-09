@@ -506,11 +506,15 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   is `{Header, Objects, Footer}` with every field an ETF term, so it needs `beam_codec` plus file I/O
   (`beam_io` is wave 5 — an upward edge, forbidden for a wave-1 crate). `tab2list` + `first`/`next`
   remain the enumeration path. Full reasoning in `ETS_SURFACE.md` §5.
-- **Operations outside this crate's scope** (all present in OTP 29): `update_element/4`,
-  `select_reverse/*`, `foldl`/`foldr`, `whereis/1`, `table/1,2`, `slot/2`, `tab2file*`/`file2tab*` —
+- **Operations outside this crate's scope** (all present in OTP 29): `update_element/4`, the
+  `foldl`/`foldr` **BIFs** (the view layer has `TableRead::{foldl,foldr}` traversal, but the BIFs need a
+  `FunCaller`), `whereis/1`, `table/1,2`, `slot/2`, `tab2file*`/`file2tab*` —
   `ETS_SURFACE.md` §1–§5 names the owner and the blocker for every one. (`ets:clear/1` and `ets:size/1`
   do not exist in OTP 29, so their absence is correct.) The `/3` limited forms are implemented; their
   opaque continuation terms and the bare-vs-`{Results,'$end_of_table'}` shaping are `beam_bifs`'s.
+  `select_reverse/1,2,3` is now a **crate primitive** (`Table::{select_reverse, select_reverse_limit,
+  select_reverse_continue}` + the read-gated `TableAccess` forms); its **BIF bridge** is still
+  `beam_bifs`'s work (a handoff — see below).
 - **`match_spec_run` accepts a RAW spec, unlike the oracle.** The oracle requires
   `ets:match_spec_compile/1` first (a raw clause list is `badarg`); this crate has no compiled-spec
   *term*, so `run.rs` compiles the raw spec and the bridge maps `match_spec_compile/1` onto the compiled
