@@ -35,7 +35,7 @@
 //! address identifies its own module, so the transfer crosses modules freely
 //! (`../../erts/emulator/beam/beam_common.c:580-679`).
 use super::*;
-use crate::context::{ExecutionContext, MinimalContext};
+use crate::context::MinimalContext;
 use crate::machine::RunOutcome;
 use beam_loader::{Atom, Export};
 use std::sync::Arc;
