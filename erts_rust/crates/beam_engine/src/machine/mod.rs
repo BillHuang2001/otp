@@ -66,6 +66,7 @@ use beam_term::Eterm;
 pub use self::catch::CatchFrame;
 pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
+pub use self::location::WaitDeadline;
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
 pub use self::run::RunOutcome;
 
@@ -241,6 +242,27 @@ pub struct Machine {
     /// which clears it) and read back by [`Machine::initial_call`]. `None` before
     /// any run.
     pub(crate) entry_call: Option<(u32, u32)>,
+    /// The number of **interpreted instructions charged in the current scheduling
+    /// slice** — the engine half of the runtime's *reduction* accounting.
+    ///
+    /// Zeroed at every [`Machine::drive`](crate::machine::Machine) entry (one `drive`
+    /// call is one run or one resume, i.e. one slice) and incremented once per
+    /// `step_instruction`, so [`Machine::reductions`](crate::machine::Machine) read
+    /// when the slice ends is that slice's instruction count.
+    ///
+    /// The engine's other charging point is
+    /// [`ensure_heap`](crate::ExecutionContext::ensure_heap) (reached by
+    /// `test_heap`/`allocate_heap`), which prices *heap admissions* — a tight
+    /// **non-allocating** loop never reaches it, which is why the per-instruction
+    /// charge exists. A host observes the charge **during** the slice through
+    /// [`reduce`](crate::ExecutionContext::reduce) and may pre-empt there; it never
+    /// has to poll this field mid-run.
+    ///
+    /// Only the **interpreter's** dispatch loop
+    /// ([`Machine::drive`](crate::machine::Machine)) charges: a natively executed JIT
+    /// block bypasses `step_instruction`, so this is a lower bound under the baseline
+    /// tier (documented, never a fabricated count).
+    pub(crate) reductions: u64,
 }
 
 impl Machine {
@@ -269,6 +291,7 @@ impl Machine {
             trace_on: false,
             current_code: None,
             entry_call: None,
+            reductions: 0,
         };
         machine.reset();
         machine

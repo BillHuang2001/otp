@@ -520,6 +520,37 @@ pub trait ExecutionContext {
         Ok(None)
     }
 
+    /// The **per-instruction reduction hook**: charge `n` reductions for the
+    /// instruction the engine has just executed.
+    ///
+    /// A BEAM process is pre-emptible because the runtime prices work in
+    /// *reductions* and checks its budget at known points. The engine's **only**
+    /// other charging point is [`ensure_heap`](ExecutionContext::ensure_heap)
+    /// (reached by `test_heap`/`allocate_heap`), which a tight **non-allocating**
+    /// loop — the one shape that can monopolise a scheduler — never touches. This
+    /// hook closes that gap: [`Machine::drive`](crate::machine::Machine) calls it
+    /// **once per interpreted instruction** with `n = 1`, after the instruction
+    /// succeeded, so a host can price instructions rather than heap admissions.
+    ///
+    /// The default body is a **no-op** ([`Ok`]) — deliberately *not* a typed error:
+    /// a host that does not pre-empt simply ignores the hook, so every existing
+    /// implementor compiles and behaves byte-identically (it pays only the call).
+    /// Returning `Err` propagates out of the run exactly like any other engine
+    /// failure, so a host that has exhausted its budget returns **its own** typed
+    /// exhaustion error (a host that pre-empts *by failing* must remember that the
+    /// machine keeps its position: re-entering through
+    /// [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome) is what
+    /// continues the process, not [`Machine::run_export`](crate::machine::Machine::run_export)).
+    ///
+    /// The engine also counts the same charge in
+    /// [`Machine::reductions`](crate::machine::Machine::reductions) — the slice's
+    /// instruction count, readable *after* the slice returns — so a host that
+    /// prefers to poll rather than hook can; see that accessor for the tier caveat.
+    fn reduce(&mut self, n: u32) -> Result<()> {
+        let _ = n;
+        Ok(())
+    }
+
     /// Cheap tracing gate: does the host want `call`/`return_from`/`return_to`
     /// execution-trace events reported for the process currently running?
     ///

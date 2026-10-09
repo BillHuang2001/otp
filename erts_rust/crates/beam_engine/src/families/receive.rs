@@ -52,7 +52,10 @@
 //! - `recv_marker_*` terms are **opaque**: a marker produced by
 //!   `recv_marker_reserve` is stored in a register and handed back verbatim, and
 //!   only a separate *reference* term reaches `recv_marker_use`/`recv_marker_clear`.
-//!   This family never inspects, compares or hashes one.
+//!   This family never inspects, compares or hashes one. A host that does not serve
+//!   markers at all is rejected **by opcode name** ([`marker_call`]), so the
+//!   optional optimisation can never half-apply (a reserved marker a later
+//!   `recv_marker_use` silently ignores would leave the scan in the wrong place).
 //! - `wait`/`wait_timeout` (non-zero time) **suspend**: they return
 //!   [`Step::Wait`], which the dispatch loop reports as [`crate::RunOutcome::Wait`]
 //!   so the host can resume the process at the target address once a message
@@ -70,11 +73,12 @@
 
 use crate::interpreter::LabelMap;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_loader::{Instr, Label, Module, Operand};
 use beam_term::{is_small, signed_value};
 
 use crate::context::ExecutionContext;
+use crate::error;
 use crate::interpreter;
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
@@ -173,9 +177,15 @@ pub(crate) fn exec(
         }
 
         // `recv_marker_reserve Dst` — stash an opaque marker for the current scan
-        // position in `Dst`; the engine never looks at it again.
+        // position in `Dst`; the engine never looks at it again. A host without
+        // marker support is rejected by name (see [`marker_call`]) rather than
+        // leaving a marker that a later `recv_marker_use` could silently ignore.
         Instr::RecvMarkerReserve { marker } => {
-            let reserved = ctx.receive_marker_reserve()?;
+            let reserved = marker_call(
+                "recv_marker_reserve",
+                "receive_marker_reserve",
+                ctx.receive_marker_reserve(),
+            )?;
             write_operand(machine, marker, reserved)?;
             Ok(Some(Step::Next))
         }
@@ -185,7 +195,11 @@ pub(crate) fn exec(
         Instr::RecvMarkerBind { marker, reference } => {
             let marker = read_operand(machine, ctx, marker)?;
             let reference = read_operand(machine, ctx, reference)?;
-            ctx.receive_marker_bind(marker, reference)?;
+            marker_call(
+                "recv_marker_bind",
+                "receive_marker_bind",
+                ctx.receive_marker_bind(marker, reference),
+            )?;
             Ok(Some(Step::Next))
         }
 
@@ -193,14 +207,22 @@ pub(crate) fn exec(
         // marker recorded.
         Instr::RecvMarkerUse { reference } => {
             let reference = read_operand(machine, ctx, reference)?;
-            ctx.receive_marker_use(reference)?;
+            marker_call(
+                "recv_marker_use",
+                "receive_marker_use",
+                ctx.receive_marker_use(reference),
+            )?;
             Ok(Some(Step::Next))
         }
 
         // `recv_marker_clear Reference` — release the reference's marker.
         Instr::RecvMarkerClear { reference } => {
             let reference = read_operand(machine, ctx, reference)?;
-            ctx.receive_marker_clear(reference)?;
+            marker_call(
+                "recv_marker_clear",
+                "receive_marker_clear",
+                ctx.receive_marker_clear(reference),
+            )?;
             Ok(Some(Step::Next))
         }
 
@@ -221,6 +243,40 @@ fn goto_label(labels: &LabelMap, target: Label) -> Result<Step> {
 fn wait_at(labels: &LabelMap, target: Label) -> Result<Step> {
     let (func, pc) = interpreter::resolve(labels, target)?;
     Ok(Step::Wait { func, pc })
+}
+
+/// Run one `recv_marker_*` host call, naming the **opcode** when the host cannot
+/// serve markers at all.
+///
+/// A receive marker is a boost-only optimisation: the whole `recv_marker_*` family is
+/// optional, and the [`ExecutionContext`] seam answers it with a typed
+/// `unsupported_opcode: receive_marker_<op>` default (`MinimalContext` forwards that
+/// same answer when no mailbox is installed). That default is *correct* but says
+/// nothing about which pseudo-instruction asked, so the engine translates exactly
+/// that case into a rejection naming the `ops.tab` opcode and what is missing —
+/// `recv_marker_bind: the host does not serve receive markers` — and leaves every
+/// other host failure untouched (a host that *does* serve markers and fails has the
+/// real reason, which must survive verbatim).
+///
+/// The match is on the seam's own default reason, built from the method name here, so
+/// no host can be misclassified: the only error whose atom is exactly
+/// `unsupported_opcode: <method>` is the one that method's default body produces.
+/// The failure is a raise like any other — never a hang, never a silently skipped
+/// marker, and never a wrong scan position.
+fn marker_call<T>(opcode: &str, method: &str, result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        let default_reason = format!("unsupported_opcode: {method}");
+        let is_seam_default = match &error {
+            BeamError::Raise(raise) => raise.reason.as_atom() == Some(default_reason.as_str()),
+            _ => false,
+        };
+        if is_seam_default {
+            return error::unsupported(&format!(
+                "{opcode}: the host does not serve receive markers"
+            ));
+        }
+        error
+    })
 }
 
 #[cfg(test)]

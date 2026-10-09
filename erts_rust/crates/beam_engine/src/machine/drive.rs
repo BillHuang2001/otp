@@ -59,6 +59,14 @@ impl Machine {
     /// `trace_enabled()` vtable call per instruction, so an untraced run pays a
     /// single `bool` load and no event is ever built. See the `Machine::trace_on`
     /// field docs for the mid-run semantics.
+    ///
+    /// And charges **one reduction per interpreted instruction**: the slice's count
+    /// starts at zero here and is read back through [`Machine::reductions`], while
+    /// each charge is also offered to the host through
+    /// [`ExecutionContext::reduce`] — the only way a **non-allocating** loop can be
+    /// pre-empted, since `ensure_heap` is never reached by one. An `Err` from the
+    /// hook ends the run exactly like any other engine failure (the host has
+    /// exhausted its budget); it is never swallowed.
     pub(crate) fn drive(
         &mut self,
         module: &Module,
@@ -68,6 +76,10 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<RunOutcome> {
         self.trace_on = ctx.trace_enabled();
+        // One `drive` call is one scheduling slice, so the reduction counter starts
+        // here (the ERTS process counter, `c_p->fcalls`, is likewise reset when a
+        // process is scheduled in; the host reads the count when the slice returns).
+        self.reductions = 0;
         // The entry module's label index. A run entry that already resolved its
         // entry label hands its map in; otherwise it is built here (still exactly
         // one build per run).
@@ -99,7 +111,15 @@ impl Machine {
                 Some(handle) => (&handle.module, &handle.labels),
                 None => (module, entry_labels),
             };
-            match self.step_instruction(active_module, active_labels, func, pc, ctx)? {
+            let step = self.step_instruction(active_module, active_labels, func, pc, ctx)?;
+            // Price the instruction: the engine's own slice counter (read back by the
+            // host through `Machine::reductions`) and the host hook that lets a
+            // **non-allocating** loop be pre-empted. `ensure_heap` — the only other
+            // charge — is unreachable from such a loop, so this is the only point a
+            // host is offered one reduction per instruction.
+            self.reductions = self.reductions.saturating_add(1);
+            ctx.reduce(1)?;
+            match step {
                 Step::Next => pc += 1,
                 Step::Goto { func: f, pc: p } => {
                     func = f;
@@ -156,5 +176,33 @@ impl Machine {
                 pc,
             }),
         }
+    }
+
+    /// The number of interpreted instructions charged in the current (or most
+    /// recently finished) [`Machine::drive`] slice.
+    ///
+    /// One `drive` call — a run, or a resume of a suspended process — is one
+    /// scheduling slice, and the counter is zeroed at its start, so this is that
+    /// slice's work in the unit the runtime prices pre-emption in. It is the
+    /// **engine-side twin** of [`ExecutionContext::reduce`]: the hook lets a host
+    /// act *during* the slice, this accessor lets it observe *after* the slice
+    /// returns (`RunOutcome::Wait` included) without keeping its own tally.
+    ///
+    /// Honest by construction: only the interpreter's dispatch loop charges, so
+    /// under the baseline JIT tier — where a natively executed block bypasses
+    /// `step_instruction` — the count is a **lower bound** (each deopt still
+    /// charges). Never fabricated, never negative.
+    pub fn reductions(&self) -> u64 {
+        self.reductions
+    }
+
+    /// Zero the reduction counter, returning the value it held.
+    ///
+    /// [`Machine::drive`] already zeroes it at every slice entry, so a host only
+    /// needs this to *re-base* a running tally (e.g. when it wants a window that
+    /// spans several slices). The returned value is the count that was discarded, so
+    /// a host that re-bases can still account for the work it saw.
+    pub fn reset_reductions(&mut self) -> u64 {
+        std::mem::replace(&mut self.reductions, 0)
     }
 }

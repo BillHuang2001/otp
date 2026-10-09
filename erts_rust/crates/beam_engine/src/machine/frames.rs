@@ -82,13 +82,37 @@ pub(crate) struct Frame {
 impl Machine {
     /// Read Y slot `k` of the **current** frame, or `None` if there is no frame or
     /// `k` is outside the frame's Y slots.
+    ///
+    /// Public because a suspended frame is a host-visible fact: the runtime recovers
+    /// a `receive … after T` deadline whose `T` the compiler kept in a **Y register**
+    /// (a runtime variable) through this accessor — see
+    /// [`Machine::wait_deadline`], which reads a parked `wait_timeout`'s
+    /// [`Operand::Y(n)`](beam_loader::Operand::Y). Nothing here writes the frame, so
+    /// reading is always safe for a host holding the machine between slices.
     #[inline]
-    pub(crate) fn y(&self, k: u32) -> Option<Eterm> {
+    pub fn y(&self, k: u32) -> Option<Eterm> {
         let frame = self.frames.last()?;
         if k >= frame.y_count {
             return None;
         }
         self.stack.get(frame.y_base + k as usize).copied()
+    }
+
+    /// Mutable access to Y slot `k` of the **current** frame, under exactly
+    /// [`Machine::y`]'s bound (no frame, or `k` outside the frame's Y slots ⇒
+    /// `None`).
+    ///
+    /// The write half of the pair a host needs to *relocate* a slot it read — a
+    /// host that moves a term while a process is suspended updates the frame
+    /// through here rather than through the raw stack, so the bound check stays in
+    /// one place (see [`Machine::stack_mut`] for the whole-stack form).
+    #[inline]
+    pub fn y_mut(&mut self, k: u32) -> Option<&mut Eterm> {
+        let frame = self.frames.last()?;
+        if k >= frame.y_count {
+            return None;
+        }
+        self.stack.get_mut(frame.y_base + k as usize)
     }
 
     /// Write `v` into Y slot `k` of the current frame.
