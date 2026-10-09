@@ -47,6 +47,15 @@
 //! convention, so registering the case would introduce a real **mismatch** — hence it is left
 //! out until the runtime's large-map representation lands. (The 32-key edge itself, still a
 //! flatmap, does `agree`.)
+//!
+//! ## `compressed` images: the round trip is pinned, the zlib payload is **not**
+//! `term_to_binary(T, [compressed])` wraps the term in `VERSION_MAGIC` + `COMPRESSED` (80) +
+//! a 32-bit big-endian uncompressed size + a zlib stream. The oracle and the Rust runtime
+//! agree on the framing (the leading `<<131,80,…>>` and the size field) **and** on the
+//! trailing Adler-32 checksum, but their zlib *middle* differs byte-for-byte (different
+//! compressor output), so no case pins the compressed payload — only the `binary_to_term`
+//! round trip is asserted. Exposing only the first two bytes (`<<131,80>>`) stays safe and is
+//! pinned in `super::wire_extra`'s `co_prefix_two_value`.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -545,6 +554,217 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- edge cases: length boundaries, bitstrings, compression, framing, deep nesting -----
+        Case {
+            id: "etf/binary_ext_255_and_256_shape",
+            description: "a 255- and a 256-byte binary both stay BINARY_EXT (109), a six-byte header plus the payload",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "[{binary:at(term_to_binary(binary:copy(<<0>>,N)),1), byte_size(term_to_binary(binary:copy(<<0>>,N)))} || N <- [255,256]]",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{109,261},{109,262}]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_empty_binary",
+            description: "binary_to_term/1 inverts term_to_binary/1 for the empty binary",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary(<<>>)) =:= <<>>",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_bit_binary_3_bits",
+            description: "a 3-bit bitstring encodes as BIT_BINARY_EXT (77) with a bit count of 3 and a 5-bit trailing pad",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "<<5:3>>",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,77,0,0,0,1,3,160>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_bit_binary_9_bits",
+            description: "a 9-bit bitstring spans two bytes with a bit count of 1 (a 7-bit trailing pad)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "<<1:9>>",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,77,0,0,0,2,1,0,128>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_bit_binary_byte_aligned",
+            description: "a byte-aligned bitstring collapses to BINARY_EXT (109): <<1:8>> is a 7-byte image, <<1:16>> an 8-byte one",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "{[binary:at(term_to_binary(<<1:8>>),1), byte_size(term_to_binary(<<1:8>>))], [binary:at(term_to_binary(<<1:16>>),1), byte_size(term_to_binary(<<1:16>>))]}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {[109,7],[109,8]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_compressed",
+            description: "a `[compressed]` image round-trips (the zlib payload is never byte-compared)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary({a,lists:seq(1,200)}, [compressed])) =:= {a,lists:seq(1,200)}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_compressed_level9",
+            description: "a `{compressed,9}` image round-trips",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary(lists:seq(1,500), [{compressed,9}])) =:= lists:seq(1,500)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/binary_to_term_nil_blob",
+            description: "binary_to_term/1 decodes a hand-built VERSION_MAGIC + NIL_EXT (106) blob",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,106>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok []"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/binary_to_term_tuple_blob",
+            description: "binary_to_term/1 decodes a hand-built VERSION_MAGIC + SMALL_TUPLE_EXT (104) blob",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,104,2,97,1,97,2>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {1,2}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_minor_version_1",
+            description: "a `{minor_version,1}` image round-trips",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary({a,1}, [{minor_version,1}])) =:= {a,1}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_string_255_and_256",
+            description: "a 255- and a 256-byte character list both encode as STRING_EXT (107)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "[binary:at(term_to_binary(lists:duplicate(N,$a)),1) || N <- [255,256]]",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [107,107]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_list_255_and_256",
+            description: "a 255- and a 256-element non-byte list both encode as LIST_EXT (108)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "[binary:at(term_to_binary(lists:duplicate(N,300)),1) || N <- [255,256]]",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [108,108]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_deep_nested_list",
+            description: "a deeply nested list round-trips",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary([1,[2,[3,[4,[5]]]]])) =:= [1,[2,[3,[4,[5]]]]]",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_large_integer_list",
+            description: "a 500-element integer list round-trips",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary(lists:seq(1,500))) =:= lists:seq(1,500)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_mixed_terms",
+            description: "a spread of mixed-type terms each round-trips through term_to_binary/1",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "lists:all(fun(E) -> binary_to_term(term_to_binary(E)) =:= E end, [[], [1,2,3], <<1,2>>, <<5:3>>, {a,b}, #{k=>v}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -621,5 +841,92 @@ mod tests {
         let golden = case.golden.stdout.expect("golden");
         let expected = format!("ok <<131,109,0,0,0,100,{}>>", vec!["97"; 100].join(","));
         assert_eq!(golden, expected);
+    }
+
+    #[test]
+    fn edge_cases_pin_boundaries_bitstrings_and_roundtrips() {
+        let cases = group();
+        for (id, label, stdout) in [
+            (
+                "etf/binary_ext_255_and_256_shape",
+                "value",
+                "ok [{109,261},{109,262}]",
+            ),
+            (
+                "etf/roundtrip_empty_binary",
+                "term_to_binary",
+                "ok <<131,119,4,116,114,117,101>>",
+            ),
+            (
+                "etf/term_to_binary_bit_binary_3_bits",
+                "term_to_binary",
+                "ok <<131,77,0,0,0,1,3,160>>",
+            ),
+            (
+                "etf/term_to_binary_bit_binary_9_bits",
+                "term_to_binary",
+                "ok <<131,77,0,0,0,2,1,0,128>>",
+            ),
+            (
+                "etf/term_to_binary_bit_binary_byte_aligned",
+                "value",
+                "ok {[109,7],[109,8]}",
+            ),
+            (
+                "etf/roundtrip_compressed",
+                "term_to_binary",
+                "ok <<131,119,4,116,114,117,101>>",
+            ),
+            (
+                "etf/roundtrip_compressed_level9",
+                "term_to_binary",
+                "ok <<131,119,4,116,114,117,101>>",
+            ),
+            ("etf/binary_to_term_nil_blob", "value", "ok []"),
+            ("etf/binary_to_term_tuple_blob", "value", "ok {1,2}"),
+            (
+                "etf/roundtrip_minor_version_1",
+                "term_to_binary",
+                "ok <<131,119,4,116,114,117,101>>",
+            ),
+            (
+                "etf/term_to_binary_string_255_and_256",
+                "value",
+                "ok [107,107]",
+            ),
+            (
+                "etf/term_to_binary_list_255_and_256",
+                "value",
+                "ok [108,108]",
+            ),
+            (
+                "etf/roundtrip_deep_nested_list",
+                "term_to_binary",
+                "ok <<131,119,4,116,114,117,101>>",
+            ),
+            (
+                "etf/roundtrip_large_integer_list",
+                "term_to_binary",
+                "ok <<131,119,4,116,114,117,101>>",
+            ),
+            (
+                "etf/roundtrip_mixed_terms",
+                "term_to_binary",
+                "ok <<131,119,4,116,114,117,101>>",
+            ),
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), label, "{id}");
+            assert_eq!(case.golden.exit_code, 0, "{id}");
+            assert_eq!(
+                case.golden,
+                Golden {
+                    stdout: Some(stdout),
+                    exit_code: 0
+                },
+                "{id}"
+            );
+        }
     }
 }
