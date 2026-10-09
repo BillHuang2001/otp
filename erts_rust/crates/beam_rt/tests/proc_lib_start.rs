@@ -133,7 +133,7 @@ fn resolve_erlc() -> Option<PathBuf> {
 fn skip_loudly(why: &str) {
     eprintln!();
     eprintln!("=============== beam_rt proc_lib:start SKIPPED ===============");
-    eprintln!("{why}: the A.9 boot blocker cannot be reproduced.");
+    eprintln!("{why}: the cross-module receive regression gate cannot be exercised.");
     eprintln!("Set $ERTS_ORACLE (or install Erlang/OTP) and re-run. NOT a pass.");
     eprintln!("=============================================================");
     eprintln!();

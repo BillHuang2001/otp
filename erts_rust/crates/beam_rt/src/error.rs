@@ -65,10 +65,12 @@ use beam_term::{atom_val, is_atom, AtomTable, Eterm};
 ///   ([`beam_message::is_message_heap_exhaustion`]), raised by `copy_struct` and its siblings
 ///   when the receiver's message heap cannot hold the copied term.
 ///
-/// Milestone 1 has no collector, so the retry cannot happen: the honest answer is the
-/// emulator's own `error:system_limit` raise — the reason the C raises when a process exceeds
-/// its configured `max_heap_size` (`+hmax`) — which [`crate::cli`] reports as
-/// `beam_rt: system_limit` with [`EXIT_RUNTIME`](crate::cli::EXIT_RUNTIME).
+/// This runtime has no collector to retry with, so an exhausted term heap surfaces as the
+/// emulator's `error:system_limit` reason — [`crate::cli`] reports it as
+/// `beam_rt: system_limit` with [`EXIT_RUNTIME`](crate::cli::EXIT_RUNTIME). (The C does *not*
+/// raise `system_limit` when a process reaches its `max_heap_size` (`+hmax`): it kills the
+/// process with reason `killed` and may log an error report — `erts/emulator/beam/erl_gc.c:1208`.
+/// `system_limit` is this runtime's own honest reason for the retry it cannot perform.)
 ///
 /// Reporting the raw [`BeamError::Alloc`] instead would print the host-level
 /// `allocation failure: heap (N bytes)` / `allocation failure: message (N bytes)` diagnostic,
