@@ -40,9 +40,9 @@
 //!
 //! The io-device's `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` request IS served: the
 //! device's read loop drives an engine-backed `beam_io::io_device::Continuation` that runs the
-//! real `erl_scan:tokens/4` (`../../src/native/file_server/get_until.rs`). No integration test
-//! drives it here, because the library-level `io:scan_erl_exprs` path is blocked *earlier* by
-//! the unimplemented `net_kernel:dflag_unicode_io/1`; the request itself is pinned end to end in
+//! real `erl_scan:tokens/4` (`../../src/native/file_server/get_until.rs`), and the
+//! library-level `io:scan_erl_exprs`/`io:parse_erl_exprs` path over it is driven end to end by
+//! the sibling [`io_scan.rs`](io_scan.rs); the request itself is pinned in
 //! `../../src/native/file_server/get_until/tests.rs`.
 use std::fs;
 use std::path::{Path, PathBuf};

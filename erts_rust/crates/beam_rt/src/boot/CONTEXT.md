@@ -174,9 +174,10 @@ because it cannot be duplicated.
    with a blocking-aware entry). A `func_info`-driven raise also carries an EMPTY
    `Raise.stacktrace.frames`, so a boot-path `function_clause` is unlocalizable; and a native service
    hosts no engine, so the `{get_until,…}` io request (`erl_scan:tokens/4`) cannot be served here.
-2. **`beam_rt` `../native.rs`** — `io:request/2` (the `file:read/2`/`read_line/1` device-read path) dies
-   on the unimplemented `net_kernel:dflag_unicode_io/1`, so the served `{get_chars,…}` device is
-   unreachable from library code.
+2. **`beam_rt` `../native.rs`** — the io-device read path completes from library code
+   (`file:read/2`, `io:scan_erl_exprs/4`, `io:parse_erl_exprs/4`); only `file:read_line/1`'s
+   `{get_line,…}` request is still the typed `unsupported` gap (the served device surface is
+   itemised in `../native/CONTEXT.md`).
 3. **`beam_rt` `../native/init.rs` — `init:get_arguments/0` lists only the command-line flags**, so it
    omits the oracle's automatic `root`/`bindir`/`progname`/`home`. A `RuntimeConfig::default()` runtime
    therefore stops at instruction 16 (`application:load/1`, an `error function_clause`); the

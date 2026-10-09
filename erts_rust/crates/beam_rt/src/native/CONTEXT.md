@@ -319,6 +319,10 @@ request that runs Erlang code: [`file_server/get_until.rs`](file_server/get_unti
 device's read loop (shared with `{get_chars,…}` through [`beam_io::io_device::IoDevice`]) and an
 engine-backed [`Continuation`] that loads `Mod` and runs `Mod:Func(Cont, Data | eof, XtraArgs…)` on
 the interpreter. Every other request is the typed `unsupported` gap.
+The reply tag is **paired** with the request tag, never echoed: `{io_request, …}` is answered
+`{io_reply, ReplyAs, Reply}` and `{file_request, …}` with `{file_reply, ReplyAs, Reply}`
+(`file_io_server.erl:199-239`), because every caller matches the reply on its **own** tag
+(`io.erl:1670`'s `execute_request` matches `io_reply`).
 
 #### Honest capability gaps (never a fabricated term)
 * **`{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` is served** by
@@ -337,11 +341,12 @@ the interpreter. Every other request is the typed `unsupported` gap.
 * **A scheduled process's `gen_server:call` to the service cannot complete** — the engine's
   non-blocking `fold_outcome` folds the callee's suspend into `error::blocked()`. Owner:
   **`beam_engine`**.
-* **`io:request/2` is not served by this crate's native `io` handling** (`../native.rs`'s `io` arm
-  covers only `put_chars/1,2`), so it loads the `io` module body and dies on `net_kernel:dflag_unicode_io/1`
-  — the typed `unsupported` gap `unsupported: net_kernel:dflag_unicode_io/1`. Consequently
-  `file:read/2`/`file:read_line/1` (the io-device read path) is unreachable from library code even
-  though the device itself serves `{get_chars,…}`. Owner: **`beam_rt`** (`../native.rs`).
+* **The io-device read path completes from library code; `file:read_line/1` is the residual gap.**
+  `io:request/2` loads the `io` module body, `net_kernel:dflag_unicode_io/1` is served (the
+  `RuntimeHooks` bridge) and the service answers with the tag **paired** to the request, so
+  `file:read/2`, `io:scan_erl_exprs/4` and `io:parse_erl_exprs/4` all complete and agree with the
+  oracle (`../tests/io_scan.rs`). `file:read_line/1`'s `{get_line,…}` request is not served (the
+  list above), so it stays the typed `unsupported` gap.
 
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
@@ -518,7 +523,7 @@ The per-call dispatch arm for every native BIF is a registration in `../native.r
 `../native.rs`'s module-doc table still omits those two names, so the parent node should add them there.
 `init:get_argument(root)` and `init:get_argument(home)` agree with the oracle through the same `init:get_argument/1` arm.
 `init:get_argument(progname)` is a deliberate, invocation-dependent gap: both runtimes report the basename **they** were invoked as (the oracle's `"erl"` comes from the `erl` shell script's `$0`), so the value is a property of the harness's invocation, not one this runtime may fabricate — never a wrong result.
-The `file_server_2` service's two cross-node gaps — a scheduled `gen_server:call` to the service (**`beam_engine`**) and `io:request/2`'s `net_kernel:dflag_unicode_io/1` (**`beam_rt`**'s `../native.rs`) — are itemised in the `file_server.rs` subsection above.
+The `file_server_2` service's remaining cross-node gap — a scheduled `gen_server:call` to the service (**`beam_engine`**) — is itemised in the `file_server.rs` subsection above.
 
 ## See Also
 - `../../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.

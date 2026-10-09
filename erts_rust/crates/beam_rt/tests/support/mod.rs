@@ -155,13 +155,33 @@ enum Probe {
     Failed,
 }
 
+/// Runs `program` with `args` (stdin at `/dev/null`, stdout/stderr captured), bounded by
+/// [`PROBE_TIMEOUT`].
+///
+/// The child is **polled** rather than waited on, so a probe that blocks is killed and
+/// reaped at the bound instead of hanging the caller. `None` when the child could not be
+/// spawned, polled or collected, or when it was killed at the bound — a caller that needs a
+/// loud skip should treat `None` as "could not answer".
+///
+/// `#[allow(dead_code)]`: this shared module is compiled into **every** integration-test
+/// binary, and the ones that never run a bounded child of their own would otherwise warn.
+#[allow(dead_code)]
+pub fn run_bounded(program: &Path, args: &[&str]) -> Option<Output> {
+    let mut command = Command::new(program);
+    command.args(args);
+    match run_probe(command) {
+        Probe::Exited(output) => Some(output),
+        Probe::TimedOut | Probe::Failed => None,
+    }
+}
+
 /// Runs `command` with `/dev/null` as stdin and captured stdout/stderr.
 ///
 /// The child is **polled** rather than waited on, so a probe that blocks is killed and
 /// reaped at [`PROBE_TIMEOUT`] instead of hanging the caller. The pipes are drained after
 /// the child exits, so a probe must not write more than a pipe buffer (~64 KiB) before it
 /// exits — every probe here prints a handful of bytes.
-fn run_bounded(mut command: Command) -> Probe {
+fn run_probe(mut command: Command) -> Probe {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -234,7 +254,7 @@ pub fn oracle_eval(oracle: &Path, code_dir: Option<&Path>, expr: &str) -> Option
         .arg("-s")
         .arg("init")
         .arg("stop");
-    match run_bounded(command) {
+    match run_probe(command) {
         Probe::Exited(output) if output.status.success() => {
             Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
