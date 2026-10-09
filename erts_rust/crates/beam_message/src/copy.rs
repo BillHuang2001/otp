@@ -25,7 +25,10 @@
 //! **immediates** and **literal-area** compound terms are returned as-is (the literal bit means
 //! the term is permanent and heap-independent), everything else (cons cells, tuples/records, funs,
 //! flatmaps) is copied, and an **off-heap reference** (an MSO container or a refc binary) is
-//! refcounted into the destination table rather than deep-copied.
+//! refcounted into the destination table rather than deep-copied. A `SUB_BITS` **match context**
+//! (an `ErlSubBits` over an on-heap bitstring) is instead *flattened* into a fresh on-heap
+//! bitstring, so the copy never aliases the source heap, while a **refc binary** shares its
+//! off-heap payload ([`copy_refc_binary`]).
 //!
 //! Fidelity scope: this is a correct, *tree* copy — a subterm occurring twice is copied twice
 //! (C's default behaviour; the sharing-preserving copier is [`crate::copy_struct_shared`]). It
@@ -234,8 +237,9 @@ fn bounded_words(term: Eterm, limit: usize) -> Option<usize> {
 /// A depth-first walk (`car`/`cdr` for cons cells, [`layout::for_each_child_slot`] for boxed
 /// objects — the same children the copier descends into) that tracks, in `on_path`, exactly the
 /// compound objects on the current DFS path. A revisit of a word still on the path is a back-edge,
-/// i.e. a cycle. Shared objects (`immediates`/literals) and off-heap references are leaves here,
-/// matching the copier: they have no navigable child.
+/// i.e. a cycle. Shared objects (`immediates`/literals), off-heap references and an `ErlSubBits`
+/// (a refc binary, or a match context that `copy_struct` flattens) are leaves here, matching the
+/// copier: they have no navigable child.
 ///
 /// This is only ever called on the *error* path ([`preflight_words`] falls back to it after the
 /// bounded walk has already shown the graph does not fit), so the `HashSet` it needs is never paid
@@ -517,7 +521,9 @@ pub(crate) fn shallow(
 /// Iterative (an explicit worklist); immediates and literal-area terms are shared (returned
 /// unchanged); cons cells, tuples/records, funs, flatmaps and off-heap containers are copied, an
 /// off-heap **MSO** reference or **refc binary** is refcounted into `ctx`'s destination table
-/// (never deep-copied), and an external pid/port/reference registers its node there.
+/// (never deep-copied), a `SUB_BITS` **match context** is flattened into a fresh on-heap bitstring
+/// (so the copy never aliases the source heap), and an external pid/port/reference registers its
+/// node there.
 ///
 /// This is the **flat** copy: a subterm occurring twice is copied twice. See
 /// [`copy_struct_shared`](crate::copy_struct_shared) for the sharing-preserving variant.

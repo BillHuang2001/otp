@@ -22,8 +22,10 @@
 //! off-heap-container identification and the off-heap reference encoding used by the copier.
 //!
 //! Every boxed shape the copier can meet is sized and walked: transparent tuples/records, funs,
-//! flatmaps, **all three HAMT node kinds** (head-array, head-bitmap and inner node-bitmap) and the
-//! leaf things (float/bignum/ref/off-heap container/heap-sub bits/external pid/port/ref).
+//! flatmaps, **all three HAMT node kinds** (head-array, head-bitmap and inner node-bitmap), an
+//! **`ErlSubBits`** (sized as the whole 8-word refc-binary pair, or as the flattened match-context
+//! window the copier writes — so it is not a plain leaf) and the leaf things
+//! (float/bignum/ref/off-heap container/heap bits/external pid/port/ref).
 //!
 //! Ground truth: `copy.c`'s `move_boxed`/`size_object_x` (the HAMT shape mirrors
 //! `size_object_x`, `copy.c:192-214`) and the frozen `BinRef` container thing
@@ -131,9 +133,11 @@ pub(crate) fn object_words(header: Eterm, object: *const Eterm) -> usize {
 ///
 /// Offsets are relative to the header word (offset 0). Objects whose payload holds no navigable
 /// on-heap child — a float's value, a bignum's limbs, a reference's words, an off-heap container's
-/// `val`/`next`, and heap/sub-bit data — yield no offsets. Every **HAMT node kind** (head-array,
-/// head-bitmap, inner node-bitmap) instead visits all of its slots: each slot is non-immediate (a
-/// leaf cons cell, a boxed sub-node pointer or a collision tuple), so the whole trie is reached.
+/// `val`/`next`, heap bits, and an `ErlSubBits` (the `SUB_BITS` arm yields no offsets: the copier
+/// flattens a match context and copies a refc binary's `BinRef` itself) — yield no offsets. Every
+/// **HAMT node kind** (head-array, head-bitmap, inner node-bitmap) instead visits all of its slots:
+/// each slot is non-immediate (a leaf cons cell, a boxed sub-node pointer or a collision tuple), so
+/// the whole trie is reached.
 ///
 /// `object` must point at the object's header word; it is dereferenced only for a flatmap's size
 /// word.
