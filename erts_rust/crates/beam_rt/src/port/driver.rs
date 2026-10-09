@@ -1075,19 +1075,50 @@ impl DriverPortAdapter {
 
     /// Runs the driver's `ready_input`/`ready_output` for the descriptor the poller reported.
     ///
-    /// An entry that declares no callback for the direction is the C's own no-op *plus* deselect
-    /// (`io.c:7523-7538`: `no_ready_input_callback` logs and deselects the event), so the
-    /// registration is dropped rather than spinning on a readiness nothing consumes.
+    /// The descriptor is resolved here ([`DriverPortAdapter::armed_event`]) and handed to
+    /// [`DriverPortAdapter::notify_ready`]; a caller that must read it *before* another driver
+    /// interaction resolves it itself and calls `notify_ready` directly (see
+    /// [`DriverPortAdapter::ready_output`]). With no registration for the direction the task is
+    /// spurious (a `port_command`-driven OUTPUT task, say) and there is nothing to dispatch.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap for a driver that armed more than one descriptor per direction, and
+    /// whatever [`DriverPortAdapter::notify_ready`] returns.
     fn dispatch_ready(
         &mut self,
         ctx: &mut DriverContext<'_>,
         read: bool,
     ) -> beam_common::Result<()> {
-        let Some(fd) = self.armed_event(read)? else {
-            // No registration for this direction: the task is spurious (a `port_command`-driven
-            // OUTPUT task, say) and there is nothing to dispatch.
-            return Ok(());
-        };
+        match self.armed_event(read)? {
+            None => Ok(()),
+            Some(fd) => self.notify_ready(ctx, fd, read),
+        }
+    }
+
+    /// Runs the entry's `ready_input`/`ready_output` for one already-resolved descriptor.
+    ///
+    /// `fd` is the descriptor the C passes the callback (`(ErlDrvEvent) state->fd`,
+    /// `erl_check_io.c:1886`); it is passed in rather than looked up here so that a caller which had
+    /// to capture it earlier — [`DriverPortAdapter::ready_output`] reads it *before* the write,
+    /// because `output`/`outputv` are free to re-arm with `driver_select` — notifies with the
+    /// readiness the task was actually scheduled for.
+    ///
+    /// An entry that declares no callback for the direction is the C's `no_ready_*_callback`, which
+    /// the C substitutes for a `NULL` slot (`io.c:7523-7538`): it logs and **deselects** the event,
+    /// so the registration is dropped rather than spinning on a readiness nothing consumes.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has been torn down, [`BeamError::Io`] when the callback
+    /// reports a failure, and whatever applying its `driver_select`/`driver_output` requests
+    /// returns.
+    fn notify_ready(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        fd: c_int,
+        read: bool,
+    ) -> beam_common::Result<()> {
         let Some(driver) = self.driver.as_mut() else {
             return Err(BeamError::BadArg);
         };
@@ -1281,19 +1312,34 @@ impl beam_io::Driver for DriverPortAdapter {
         self.dispatch_ready(ctx, true)
     }
 
-    /// Runs the driver's `ready_output` when it armed a writable descriptor, else drains the
-    /// output queue through [`beam_io::Driver::output`].
+    /// Drains the port's queued output to the driver **and** runs its `ready_output` notification.
     ///
-    /// The trait default is `output`, which is what a `port_command`-driven `OUTPUT` task needs
-    /// for a driver with no write registration. A driver that *did* arm a descriptor for
-    /// writability wants its own `ready_output` instead (the C never calls `output` from the poll
-    /// path), so that is what runs — and the queue is left for the driver to drain.
+    /// The queued bytes always go down this port's single write path,
+    /// [`DriverPortAdapter::output`] — the C's `port_command` → `output`/`outputv` delivery
+    /// (`io.c:1782`, `io.c:1597`) — so a queued command reaches the driver whichever callback slots
+    /// its entry declares. When the entry also declares a `ready_output` slot, that slot then runs
+    /// with the write-armed descriptor as its event: it is the C's write-**readiness** notification
+    /// (the `ERTS_PORT_TASK_OUTPUT` arm, `erl_port_task.c:1793-1797`, which calls
+    /// `(*pp->drv_ptr->ready_output)(drv_data, ptp->u.alive.td.io.event)`), not a second write path,
+    /// so an entry declaring both callbacks sees the C's combined effect — bytes via
+    /// `output`/`outputv`, then the notification.
+    ///
+    /// The descriptor is read **before** the write: `output`/`outputv` are free to re-arm with
+    /// `driver_select`, so the notification reports the readiness the task was scheduled for rather
+    /// than whatever the write callback may have left armed.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has been torn down, [`BeamError::Io`] when either
+    /// callback reports a failure, and the typed capability gap for a driver that armed more than
+    /// one descriptor for writability.
     fn ready_output(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<usize> {
-        if self.armed_event(false)?.is_some() {
-            self.dispatch_ready(ctx, false)?;
-            return Ok(0);
+        let armed = self.armed_event(false)?;
+        let written = self.output(ctx)?;
+        if let Some(fd) = armed {
+            self.notify_ready(ctx, fd, false)?;
         }
-        self.output(ctx)
+        Ok(written)
     }
 
     /// Runs the driver's `timeout` callback for a fired port timer.
@@ -1386,6 +1432,12 @@ impl Drop for DriverPortAdapter {
         self.terms.clear();
     }
 }
+
+/// The A.4 **write-path regression test** for [`DriverPortAdapter::ready_output`], with the real C
+/// driver fixture it compiles. A separate file so the fixture text (and the `erl_driver.h`
+/// include-directory probe it needs) does not grow this one.
+#[cfg(test)]
+mod ready_output_tests;
 
 #[cfg(test)]
 mod tests {
