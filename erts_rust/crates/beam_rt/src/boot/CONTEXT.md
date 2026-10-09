@@ -104,7 +104,10 @@ registered but the directive has not resumed). A directive that has **already** 
 ## Where the real `start.boot` stops now
 Execute the real script (`bootstrap/bin/start.boot`, 22 instructions) and it runs **instructions 0–15**
 (every `primLoad` batch and the three `kernelProcess` directives, each driven to its process's own
-registration) and stops at **instruction 16** (0-based):
+registration) and stops at **instruction 16** (0-based). The tail's 0-based indices:
+**12** `{kernelProcess,heart,{heart,start,[]}}`, **13** `{kernelProcess,logger,{logger_server,start_link,[]}}`,
+**14** `{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`,
+**15** `{progress,init_kernel_started}`, **16** the `apply` below.
 
 ```
 {apply,{application,load,[{application,stdlib, Props}]}}
@@ -122,24 +125,44 @@ registration) and stops at **instruction 16** (0-based):
   unreached.
 
 ### Remaining blocker chain (owner per link)
-1. **`beam_rt` / `src/context/**` — `RuntimeContext::run_export_blocking` (`context/mod.rs:627-651`),
-   the `RunOutcome::Wait` arm.** `application:load/1` reaches the live `application_controller`'s
-   `gen_server:call`/`receive`, which suspends, but the nested cross-module external call folds the
-   suspension into `beam_engine::blocked()` instead of propagating it so the process suspends and the
-   scheduler answers it. The boot `{apply, …}` runs on a `RuntimeContext::new` (whose
-   `may_pump_scheduler()` is **`true`**, `context/mod.rs:221`), so the consistent branch is the
-   `ran == 0` one (`context/mod.rs:643-645`: the step's `pump_scheduler` advanced nothing, i.e. no
-   runnable process could answer the receiver); a prior instrumented probe of this exact stop attributed
-   it to the `may_pump_scheduler() == false` guard at `:640-642`. Either way the **fold into
-   `blocked()` inside `run_export_blocking` is the blocker** — the process must be allowed to suspend
-   there and the suspension propagate up to the runner/drive, not collapse into a capability gap.
-   (The previously recorded boot blockers are gone: `ets:new/2` accepts `{read_concurrency,true}`, the
-   table-taking BIFs resolve a `named_table` name, and `Instr::Apply`/`ApplyLast` dispatch through the
-   `resolve_external_call`/`Step::Enter` seam.)
-2. **`beam_rt` / `tests/**` (owner: the parent node).** `tests/boot.rs::the_cli_reports_the_boot_scripts_honest_stop_as_a_typed_error`
-   (around line 507) still asserts the OLD stop — exit **1** with `noproc` in stderr. The stop is now
+1. **`beam_rt` / `./drive.rs::apply_boot_call` — the stop's fold is `drive.rs:322`, the only writer on
+   this path.** The top-level machine really suspends at the `application:load/1` chain's `gen:do_call/4`
+   `receive` (`application.erl:216,269` → `application_controller.erl:220-221` → `gen_server:call/3` →
+   `gen:call/4` → `gen:do_call/4`, all entered **in-machine** via `resolve_external_call`/`Step::Enter`),
+   so `RunOutcome::Wait { func, pc }` reaches `drive.rs:318`'s
+   `drive_scheduler(runtime, deadline, APPLY_BLOCK_SLICES)`. The drive loops `pump_scheduler(256)` until
+   one call reports `0` (`drive.rs:247-250`); `ran == 0` (nothing ran ⇒ the run queue drained with no
+   live port and no pending timer) hits `drive.rs:319-323`
+   `if ran == 0 { return Err(beam_engine::blocked()); }`. `beam_engine::blocked()` renders
+   `unsupported: opcode: run: process blocked (no message available)` (CLI exit 3).
+   **Correction:** the previously recorded blocker — `RuntimeContext::run_export_blocking`
+   (`context/mod.rs:627-651`, folds at `:641`/`:645`) — is **not** this stop; that entry was observed
+   only for `gen:init_it/7` on the kernel processes' own start path. A nested `call_bif`-routed callee
+   would have folded there (its message is byte-identical), but the top-level machine really suspended,
+   so this stop is `drive.rs:322`.
+2. **`beam_rt` / `./drive.rs::start_kernel_process` (`drive.rs:185-213`) — the burst's stop criterion,
+   the ordering divergence behind the non-answering `application_controller`.** The burst
+   `return Ok(())` the instant `whereis(name)` resolves (`drive.rs:195-206`), before pumping further. But
+   `application_controller:init/2` opens with `register(?AC, self())` (`application_controller.erl:531`),
+   so with `KERNEL_BURST_SLICES = 1` the burst can return with the server registered but its init —
+   `process_flag`, `check_conf`, `ets:new(ac_tab,…)`, `make_appl(Kernel)`, `load(S, KAppl)`,
+   `Init ! {ack,…}`, `gen_server:enter_loop/4` (`application_controller.erl:532-558`) — incomplete. The
+   oracle has no such race: `init` runs `{kernelProcess, …}` as `apply(Mod,Fun,Args)` **synchronously**
+   (`init.erl:1520-1522`) and `application_controller:start/1` blocks in `receive` until its child acks
+   (`application_controller.erl:204-211`), so real `init` reaches instruction 16 only after the ack (the
+   server has entered `enter_loop`). **Fix shape:** unlink on the first `whereis` resolution (unchanged),
+   then keep driving — bounded by the existing run-queue-drain (`pump_scheduler == 0`) and
+   `KERNEL_BURST_DEADLINE` stops — until the **directive process terminates** (its MFA returned) rather
+   than returning at the name. Necessary; **not proven sufficient**: a server merely
+   registered-but-not-in-loop would still be run to completion by the index-16 drive, so the fold also
+   needs the server non-runnable then. `bootscript.rs::the_real_start_boot_reports_its_stop_through_execute_reporting`
+   pins only that `whereis(application_controller)` resolves **after** the stop (alive + registered),
+   which a parked-but-alive server satisfies. If the server is parked on a genuine mid-init block, the
+   burst change cannot unblock it and that block is outside this node.
+3. **`beam_rt` / `tests/**` (owner: the parent node).** `tests/boot.rs::the_cli_reports_the_boot_scripts_honest_stop_as_a_typed_error`
+   (line 507) still asserts the OLD stop — exit **1** with `noproc` in stderr. The stop is now
    exit **3** with `unsupported: … blocked`; the assertion must be updated to the new honest stop.
-3. Benign remnants for instruction 16: `heart:init/2`'s `catch start_portprogram()` does not contain
+4. Benign remnants for instruction 16: `heart:init/2`'s `catch start_portprogram()` does not contain
    `check_start_heart/0`'s `throw(no_heart)`; `init:get_argument/1` is empty in the boot path.
 
 ## Constraints
@@ -196,4 +219,4 @@ registration) and stops at **instruction 16** (0-based):
 - `../cli.rs` → the `Action::Boot` arm (`-boot FILE`) that drives `boot_from_script`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
-- `../context/mod.rs` → `RuntimeContext::run_export_blocking` — the current stop's blocker (read-only from this node)
+- `../context/mod.rs` → `RuntimeContext::run_export`/`run_export_blocking` and `resolve_external_call` (the in-machine seam the `application:load/1` chain is entered through); `run_export_blocking` is **not** the current stop's fold (read-only from this node)
