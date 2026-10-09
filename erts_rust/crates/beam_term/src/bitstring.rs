@@ -87,14 +87,18 @@ const WORD_BYTES: usize = size_of::<Eterm>();
 // (`heap_bits_size` divides the byte count by `sizeof(Eterm)`).
 const _: () = assert!(WORD_BYTES == 8, "the frozen term layout assumes ARCH_64");
 
-/// Word index `1` of an `ErlSubBits`: the `base_flags` word.
-const SUB_BITS_BASE_WORD: usize = 1;
+/// Word index `1` of an `ErlSubBits`: the `base_flags` word (the packed data base
+/// pointer + the low-bit flags).
+pub const SUB_BITS_BASE_WORD: usize = 1;
 /// Word index `2` of an `ErlSubBits`: the `start` bit offset.
-const SUB_BITS_START_WORD: usize = 2;
+pub const SUB_BITS_START_WORD: usize = 2;
 /// Word index `3` of an `ErlSubBits`: the `end` bit offset.
-const SUB_BITS_END_WORD: usize = 3;
-/// Word index `4` of an `ErlSubBits`: the `orig` term.
-const SUB_BITS_ORIG_WORD: usize = 4;
+pub const SUB_BITS_END_WORD: usize = 3;
+/// Word index `4` of an `ErlSubBits`: the `orig` term — the *only* word of the block
+/// that is itself a term reference (a boxed `BinRef` for a refc binary, or an on-heap
+/// bitstring for a match context). This is the slot `crate::layout::for_each_child_slot`
+/// reports to a copier.
+pub const SUB_BITS_ORIG_WORD: usize = 4;
 
 /// `ERL_SUB_BITS_FLAG_MASK` (`erl_bits.h:95`): the low two bits of an
 /// `ErlSubBits::base_flags` word hold the mutable/volatile flags, so the base
