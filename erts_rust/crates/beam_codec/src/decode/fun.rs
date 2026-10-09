@@ -154,6 +154,13 @@ impl<'a> Decoder<'a> {
                 let number = self.reader.u32be()?;
                 let serial = self.reader.u32be()?;
                 let creation = u32::from(self.reader.u8()?);
+                // The C routes the creator pid through the same `dec_pid` the plain
+                // `Tag::Pid` arm uses (`external.c:5153-5160`), so its 8-bit creation
+                // must be *tiny* (`is_tiny_creation`, `external.c:71-72`) — a value
+                // above 3 is `badarg`, exactly as in the top-level `PID_EXT` arm.
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
                 Ok(FunPid {
                     node: atom_val(node),
                     number,

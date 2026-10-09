@@ -162,7 +162,68 @@ impl<'a> Decoder<'a> {
                 let raw = self.reader.bytes(31)?;
                 let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
                 let text = str::from_utf8(&raw[..end]).map_err(|_| bad_arg())?;
-                let value: f64 = text.parse().map_err(|_| bad_arg())?;
+                // `sys_chars_to_double` (`../../erts/emulator/sys/unix/sys_float.c:72-140`)
+                // accepts exactly `[+-]? DIGIT+ [.,] DIGIT+ ([eE] [+-]? DIGIT+)?` and
+                // nothing else, and requires a **finite** result. Rust's
+                // `parse::<f64>()` is far more permissive — it also accepts `inf`,
+                // `-inf`, `nan`, `infinity`, `1e5` (no radix), `1.`, `.5`, ` 1.0`,
+                // hex floats and other spellings the oracle rejects with `badarg` —
+                // so the grammar is validated byte by byte before parsing.
+                let bytes = text.as_bytes();
+                let is_digit = |i: usize| matches!(bytes.get(i), Some(&d) if d.is_ascii_digit());
+                let mut i = 0usize;
+                if matches!(bytes.first(), Some(&b'+') | Some(&b'-')) {
+                    i += 1;
+                }
+                let int_start = i;
+                while is_digit(i) {
+                    i += 1;
+                }
+                if i == int_start {
+                    return Err(bad_arg()); // at least one leading digit
+                }
+                if !matches!(bytes.get(i), Some(&b'.') | Some(&b',')) {
+                    return Err(bad_arg()); // a radix character is required
+                }
+                i += 1;
+                let frac_start = i;
+                while is_digit(i) {
+                    i += 1;
+                }
+                if i == frac_start {
+                    return Err(bad_arg()); // at least one fractional digit
+                }
+                if matches!(bytes.get(i), Some(&b'e') | Some(&b'E')) {
+                    i += 1;
+                    if matches!(bytes.get(i), Some(&b'+') | Some(&b'-')) {
+                        i += 1;
+                    }
+                    let exp_start = i;
+                    while is_digit(i) {
+                        i += 1;
+                    }
+                    if i == exp_start {
+                        return Err(bad_arg()); // at least one exponent digit
+                    }
+                }
+                if i != bytes.len() {
+                    return Err(bad_arg()); // trailing characters
+                }
+                // The C retries `strtod` with the flipped radix character
+                // (`sys_float.c:115-124`), so a `,` radix is accepted; Rust's parser
+                // only knows `.`.
+                let normalized;
+                let parse_input = if bytes.contains(&b',') {
+                    normalized = text.replace(',', ".");
+                    normalized.as_str()
+                } else {
+                    text
+                };
+                let value: f64 = parse_input.parse().map_err(|_| bad_arg())?;
+                // `if (!erts_isfinite(*fp)) return -1;` (`sys_float.c:111-113`).
+                if !value.is_finite() {
+                    return Err(bad_arg());
+                }
                 crate::term::make_float(heap, value)
             }
             Tag::NewFloat => {

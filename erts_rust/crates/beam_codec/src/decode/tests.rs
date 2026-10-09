@@ -127,6 +127,43 @@
         let (_h, _a, term) = decode(&image);
         assert_eq!(float_value(term).unwrap(), 1.5);
 
+        // The accepted grammar is exactly `[+-]? DIGIT+ [.,] DIGIT+ ([eE] [+-]?
+        // DIGIT+)?` with a finite result — the C `sys_chars_to_double`
+        // (`sys_float.c:72-140`), each form verified live against the oracle. A
+        // `,` radix is accepted (the C retries `strtod` with the flipped radix
+        // character), as are an explicit `+` sign and an uppercase exponent.
+        let legacy = |text: &str| -> Vec<u8> {
+            let mut image = vec![131, 99];
+            image.extend_from_slice(text.as_bytes());
+            image.resize(2 + 31, 0);
+            image
+        };
+        for (text, expected) in [
+            ("1.0e5", 1.0e5f64),
+            ("+1.0", 1.0),
+            ("1.0E+05", 1.0e5),
+            ("1,5", 1.5),
+            ("-0.0", -0.0),
+        ] {
+            let (_h, _a, term) = decode(&legacy(text));
+            assert_eq!(
+                float_value(term).unwrap().to_bits(),
+                expected.to_bits(),
+                "{text:?}"
+            );
+        }
+
+        // Anything outside that grammar is malformed input: the `inf`/`nan`
+        // spellings, a radix-less mantissa, a missing integer or fractional part,
+        // leading whitespace, hex floats and trailing junk are all `BadArg` —
+        // Rust's `parse::<f64>()` would have accepted several of these.
+        for bad_text in [
+            "inf", "-inf", "nan", "infinity", "1e5", "1.", ".5", " 1.0", "0x1p3", "1", "+", "", "1.0e",
+            "1.5x",
+        ] {
+            assert_bad_arg(&legacy(bad_text));
+        }
+
         let mut bad = vec![131, 99];
         bad.extend_from_slice(b"not a number");
         bad.resize(2 + 31, 0);
