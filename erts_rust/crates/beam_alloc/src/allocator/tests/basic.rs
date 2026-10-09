@@ -23,6 +23,7 @@
 
 use super::*;
 
+use crate::size_class::SizeClasses;
 #[test]
 fn alignment_padding_is_a_function_of_the_alignment() {
     assert_eq!(padding_for(1), 0);
@@ -413,6 +414,47 @@ fn max_footprint_caps_carrier_acquisition() {
         alloc.alloc(big),
         Err(beam_common::BeamError::Alloc(_))
     ));
+}
+
+#[test]
+fn a_hostile_size_class_table_is_a_typed_failure_not_an_overflow() {
+    // The hostile table comes in through the public builder, so the whole input path is
+    // exercised: `alloc_bytes(0)` routes to `alloc_small`, `class_for(0)` selects the
+    // single class, and its payload capacity is `usize::MAX - 15`. Computing the block
+    // size as `BLOCK_HEADER_SIZE + payload_capacity` would overflow — panicking in a
+    // debug build and wrapping to `0` in a release build, where `0 > MAX_BLOCK_SIZE` is
+    // false and the request would slip past the guard. The block size is a *saturating*
+    // add, so the existing `> MAX_BLOCK_SIZE` guard always turns the hostile class into
+    // the typed carrier failure.
+    let classes = SizeClasses::new([usize::MAX - 15], usize::MAX - 15)
+        .expect("a UNIT_SIZE-granular, ascending table within the class limit is accepted");
+    assert_eq!(classes.class_size(0), Some(usize::MAX - 15));
+    assert_eq!(classes.class_for(0), Some(0));
+    let config = AllocatorConfig::builder()
+        .name("hostile")
+        .classes(classes)
+        .build();
+    let alloc = CarrierAllocator::new(config).expect("allocator");
+
+    let request = alloc.alloc_bytes(0);
+    match request {
+        Err(beam_common::BeamError::Alloc(failure)) => {
+            assert_eq!(failure.kind, beam_common::AllocKind::Carrier);
+            assert_eq!(
+                failure.requested,
+                usize::MAX,
+                "the block size saturates in the header-size guard"
+            );
+        }
+        other => panic!("expected a typed carrier failure, got {other:?}"),
+    }
+
+    // Nothing was half-built: no carrier was mapped and no block was accounted for.
+    let after = alloc.stats();
+    assert_eq!(after.carriers, 0);
+    assert_eq!(after.live_blocks, 0);
+    assert_eq!(after.live_bytes, 0);
+    assert_eq!(alloc.carrier_count(), 0);
 }
 
 #[test]

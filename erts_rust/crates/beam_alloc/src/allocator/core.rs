@@ -146,7 +146,7 @@ impl CarrierAllocator {
             class < MAX_CLASS_COUNT,
             "class index must fit the block header"
         );
-        let block_size = BLOCK_HEADER_SIZE + payload_capacity;
+        let block_size = BLOCK_HEADER_SIZE.saturating_add(payload_capacity);
         if block_size > MAX_BLOCK_SIZE {
             return Err(error::carrier_failure(block_size));
         }
@@ -512,7 +512,7 @@ impl CarrierAllocator {
                 // partial abandonment (`acul`/`rsbcmt`, which needs live-block
                 // relocation) is not implemented.
                 if let Some(mbc) = state.take_mbc(header.carrier as usize) {
-                    let carrier = (*mbc).into_carrier();
+                    let carrier = mbc.into_carrier();
                     state.note_mbc_carrier_down(carrier.size());
                     // SAFETY: the caller is done with `payload`, the carrier holds no
                     // live block (it is fully free), and it was just removed from the
@@ -527,7 +527,6 @@ impl CarrierAllocator {
         if flags.is_large() {
             match state.take_carrier(block_start as usize) {
                 Some(carrier) => {
-                    let carrier = *carrier;
                     // SAFETY: this block owns the whole mapping (nothing else was
                     // carved from it), the caller is done with `ptr`, and the carrier
                     // was just removed from the allocator's table, so the mapping is

@@ -802,7 +802,7 @@ fn unknown_option(name: &str) -> BeamError {
 /// maximum representable kilobyte count meaning `~((Uint) 0)` ("unlimited" at the
 /// width the C stores).
 fn kb_to_bytes(kind: PolicyOptionKind, kb: i64) -> Result<usize> {
-    if kb < 0 || kb > MAX_KB {
+    if !(0..=MAX_KB).contains(&kb) {
         return Err(bad_value(kind, kb));
     }
     if kb == MAX_KB {

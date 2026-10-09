@@ -47,7 +47,7 @@ pub const SUPER_ALIGNED_SIZE: usize = 1 << SUPER_ALIGN_BITS;
 /// Mirrors the legacy `ERTS_IS_SUPERALIGNED(X)` predicate: an address that is a whole
 /// multiple of [`SUPER_ALIGNED_SIZE`].
 pub fn is_super_aligned(address: usize) -> bool {
-    address % SUPER_ALIGNED_SIZE == 0
+    address.is_multiple_of(SUPER_ALIGNED_SIZE)
 }
 
 /// The OS page size, cached (shared with the carrier layer's `mmap` handling).

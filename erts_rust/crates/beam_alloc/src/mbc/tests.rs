@@ -284,7 +284,7 @@ fn the_mbc_minimum_block_size_is_local_and_holds_links_plus_footer() {
     // The slab path's own minimum is untouched, and every MBC block satisfies it, so
     // `FreeList::insert`'s existing lower bound is met rather than relaxed.
     assert_eq!(MIN_FREE_BLOCK_SIZE, 32);
-    assert!(MIN_MBC_BLOCK_SIZE >= MIN_FREE_BLOCK_SIZE);
+    const { assert!(MIN_MBC_BLOCK_SIZE >= MIN_FREE_BLOCK_SIZE) };
     assert_eq!(MIN_MBC_BLOCK_SIZE % UNIT_SIZE, 0);
 }
 
@@ -633,12 +633,9 @@ fn every_pointer_is_unit_aligned_and_every_size_is_unit_granular() {
 fn exhaustion_reports_none_and_leaves_the_carrier_intact() {
     let mut mbc = carrier(4096);
     let mut live = Vec::new();
-    loop {
-        // SAFETY: the carrier is exclusively owned.
-        match unsafe { mbc.alloc(64) } {
-            Some(ptr) => live.push(ptr),
-            None => break,
-        }
+    // SAFETY: the carrier is exclusively owned.
+    while let Some(ptr) = unsafe { mbc.alloc(64) } {
+        live.push(ptr);
     }
     assert!(live.len() > 1, "the carrier serves several 80-byte blocks");
     assert!(
@@ -791,11 +788,11 @@ fn releasing_the_carrier_hands_its_segment_back_to_the_mseg_allocator() {
     unsafe { carrier.unmap() };
     let after = crate::carrier::mseg().stats();
     assert!(
-        after.calls.alloc >= before.calls.alloc + 1,
+        after.calls.alloc > before.calls.alloc,
         "the carrier asked the segment allocator for a segment"
     );
     assert!(
-        after.calls.dealloc >= before.calls.dealloc + 1,
+        after.calls.dealloc > before.calls.dealloc,
         "and handed it back when released — no leaked segment"
     );
 }

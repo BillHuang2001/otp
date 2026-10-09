@@ -71,14 +71,17 @@
 //! | 6 | `is_super_aligned` | super-aligned carrier (`ERTS_HAVE_MSEG_SUPER_ALIGNED`) |
 //! | 7 | `prev_free` | previous block is free (`PREV_FREE_BLK_HDR_FLG`) |
 //!
-//! [`ALL_FLAGS`] is the union of the block-*taxonomy* bits above; the allocator's
-//! header plausibility check rejects a header whose flag byte has any other bit set.
-//! Bit 7 is deliberately **not** part of that union: it is a *block-state* bit
-//! ([`BlockFlags::is_prev_free`]) that only the variable-size multi-block-carrier path
-//! (`crate::mbc`) sets, mirroring the legacy `PREV_FREE_BLK_HDR_FLG`, which likewise
-//! sits beside — not inside — the legacy `SBC_BLK_HDR_FLG` carrier-kind combination.
-//! Keeping it out of the union leaves the taxonomy and its compile-time assertion
-//! below unchanged.
+//! [`ALL_FLAGS`] is the union of the block-*taxonomy* bits above — the predicate
+//! [`BlockFlags::has_unknown_bits`] is what rejects a flag byte carrying any bit
+//! outside it. Bit 7 is deliberately **not** part of that union: it is a *block-state*
+//! bit ([`BlockFlags::is_prev_free`]) that only the variable-size multi-block-carrier
+//! path (`crate::mbc`) sets, mirroring the legacy `PREV_FREE_BLK_HDR_FLG`, which
+//! likewise sits beside — not inside — the legacy `SBC_BLK_HDR_FLG` carrier-kind
+//! combination. That state bit plus the taxonomy union exhaust the flag byte, so the
+//! allocator's header plausibility check constrains the flag byte through the union
+//! alone — a residue mask against the union *and* the state bit would be `0x00` and
+//! accept everything (see `crate::allocator::plausible_header`). Keeping the bit out
+//! of the union leaves the taxonomy and its compile-time assertion below unchanged.
 //!
 //! `unsafe` is confined to the marked functions below; every `unsafe fn` has a
 //! `# Safety` section and every `unsafe` block a `// SAFETY:` rationale
@@ -153,6 +156,14 @@ pub const ALL_FLAGS: u8 =
 // so adding a bit without extending the union (or vice versa) fails to compile.
 const _: () = assert!(ALL_FLAGS == 0b0111_1111);
 const _: () = assert!(ALL_FLAGS.count_ones() == 7);
+
+// The taxonomy union plus the `prev_free` block-state bit exhaust the whole flag byte,
+// so there is no unknown-bit space left for the allocator's header plausibility check
+// to reject: a residue mask built from that union is `0x00` and constrains nothing (see
+// `crate::allocator::plausible_header`, which therefore writes no such conjunct). If
+// the flag space ever stops being exhausted — a new state bit, or a new taxonomy bit
+// beyond bit 7 — this stops compiling, so the now-reinstated check cannot be forgotten.
+const _: () = assert!(ALL_FLAGS | FLAG_PREV_FREE == u8::MAX);
 
 /// The `class` sentinel of a block that has no size class: a block carved from a
 /// dedicated (large) carrier.

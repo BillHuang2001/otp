@@ -256,7 +256,7 @@ impl Carrier {
         block_size: usize,
         lists: &mut FreeList,
     ) -> Result<()> {
-        if block_size < BLOCK_HEADER_SIZE || block_size % UNIT_SIZE != 0 {
+        if block_size < BLOCK_HEADER_SIZE || !block_size.is_multiple_of(UNIT_SIZE) {
             return Err(BeamError::BadArg);
         }
         let count = self.size() / block_size;
@@ -468,11 +468,11 @@ mod tests {
         unsafe { carrier.unmap() };
         let after = mseg().stats();
         assert!(
-            after.calls.alloc >= before.calls.alloc + 1,
+            after.calls.alloc > before.calls.alloc,
             "the carrier asked the shared segment allocator for a segment"
         );
         assert!(
-            after.calls.dealloc >= before.calls.dealloc + 1,
+            after.calls.dealloc > before.calls.dealloc,
             "and handed it back when it was unmapped"
         );
     }

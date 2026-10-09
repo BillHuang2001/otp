@@ -37,10 +37,11 @@ use crate::types::TypeId;
 /// [`CarrierAllocator`](super::CarrierAllocator).
 #[derive(Default)]
 pub(super) struct AllocatorState {
-    /// Carriers currently mapped. Boxed so a block's recorded carrier address stays
-    /// stable across later carrier insertions (never store a pointer into a growing
-    /// `Vec<Carrier>`).
-    pub(super) carriers: Vec<Box<Carrier>>,
+    /// Carriers currently mapped. Elements are held **by value**: a block records its
+    /// carrier's *segment base* (an `mmap` pointer recovered through `by_base` below),
+    /// never the address of the `Carrier` value itself, so nothing depends on an
+    /// element's address surviving a later `Vec` reallocation.
+    pub(super) carriers: Vec<Carrier>,
     /// `carrier base address -> index in `carriers``, for O(1) block→carrier
     /// recovery on the alloc/free paths.
     by_base: HashMap<usize, usize>,
@@ -48,9 +49,10 @@ pub(super) struct AllocatorState {
     pub(super) free_lists: FreeList,
     /// The pooled **variable-size** multi-block carriers ([`MbcCarrier`]) that serve
     /// requests above the size-class ladder and below the policy's single-block-carrier
-    /// threshold. Boxed so a block's recorded carrier base stays stable across later
-    /// pool insertions (never store a pointer into a growing `Vec`).
-    pub(super) mbcs: Vec<Box<MbcCarrier>>,
+    /// threshold. Held by value like [`AllocatorState::carriers`]: a block records the
+    /// carrier's *segment base*, not the value's own address, so a `Vec` reallocation is
+    /// harmless (`mbc_by_base` below recovers the index from that base).
+    pub(super) mbcs: Vec<MbcCarrier>,
     /// `variable-size carrier base -> index in `mbcs``, for the O(1) dispatch key the
     /// free path needs.
     ///
@@ -71,7 +73,7 @@ impl AllocatorState {
     pub(super) fn insert_carrier(&mut self, carrier: Carrier) -> usize {
         let index = self.carriers.len();
         self.by_base.insert(carrier.base() as usize, index);
-        self.carriers.push(Box::new(carrier));
+        self.carriers.push(carrier);
         index
     }
 
@@ -85,7 +87,7 @@ impl AllocatorState {
     pub(super) fn insert_mbc(&mut self, mbc: MbcCarrier) -> usize {
         let index = self.mbcs.len();
         self.mbc_by_base.insert(mbc.base() as usize, index);
-        self.mbcs.push(Box::new(mbc));
+        self.mbcs.push(mbc);
         index
     }
 
@@ -96,7 +98,7 @@ impl AllocatorState {
 
     /// Removes and returns the pooled variable-size carrier whose base address is
     /// `base`.
-    pub(super) fn take_mbc(&mut self, base: usize) -> Option<Box<MbcCarrier>> {
+    pub(super) fn take_mbc(&mut self, base: usize) -> Option<MbcCarrier> {
         let index = self.mbc_by_base.remove(&base)?;
         if index >= self.mbcs.len() {
             return None;
@@ -132,7 +134,7 @@ impl AllocatorState {
         None
     }
     /// Removes and returns the carrier whose base address is `base`.
-    pub(super) fn take_carrier(&mut self, base: usize) -> Option<Box<Carrier>> {
+    pub(super) fn take_carrier(&mut self, base: usize) -> Option<Carrier> {
         let index = self.by_base.remove(&base)?;
         if index >= self.carriers.len() {
             return None;
@@ -259,12 +261,11 @@ impl Drop for AllocatorState {
             // each variable-size carrier's segment is released exactly once here
             // (through the same `Carrier::unmap` the slab/dedicated carriers go
             // through).
-            let carrier = (*mbc).into_carrier();
+            let carrier = mbc.into_carrier();
             unsafe { carrier.unmap() };
         }
         self.mbc_by_base.clear();
         for carrier in self.carriers.drain(..) {
-            let carrier = *carrier;
             // SAFETY: this state exclusively owns every carrier it mapped and is
             // being dropped, so no live block is used afterwards; each mapping is
             // unmapped exactly once here (a `Carrier` has no `Drop` of its own).

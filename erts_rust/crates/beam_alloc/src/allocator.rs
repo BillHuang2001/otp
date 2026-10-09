@@ -128,7 +128,9 @@ pub(super) fn padding_for(align: usize) -> usize {
     if align <= UNIT_SIZE {
         0
     } else {
-        align - UNIT_SIZE
+        // `align > UNIT_SIZE` here, so the subtraction cannot underflow and
+        // `saturating_sub` is exactly `align - UNIT_SIZE`.
+        align.saturating_sub(UNIT_SIZE)
     }
 }
 
@@ -169,20 +171,32 @@ pub(super) const PREV_FREE_BIT: u8 = {
     flags.bits()
 };
 
-/// Whether `header` looks like one this crate's carrier allocator wrote for a payload
+// The taxonomy union plus that one state bit exhaust the whole flag byte, so a
+// plausibility conjunct masking an "unknown" residue against them would mask with
+// `0x00` and accept everything — there is no unknown-bit space left to reject here
+// (see [`plausible_header`]). Machine-checked so the reasoning cannot silently rot:
+// if the flag space ever stops being exhausted, this stops compiling and the
+// residue check has to be reinstated. The same invariant is pinned in `crate::block`.
+const _: () = assert!(ALL_FLAGS | PREV_FREE_BIT == u8::MAX);/// Whether `header` looks like one this crate's carrier allocator wrote for a payload
 /// at padding `offset`.
 pub(super) fn plausible_header(header: &BlockHdr, offset: usize) -> bool {
     let flags = BlockFlags::from_bits(header.flags);
-    header.size % UNIT_SIZE == 0
+    header.size.is_multiple_of(UNIT_SIZE)
         && header.size >= BLOCK_HEADER_SIZE + offset
         && header.size <= MAX_BLOCK_SIZE
         && header.payload_offset == offset
-        // Exactly one flag bit beyond the taxonomy union is tolerated: `prev_free`,
-        // the block-state bit a live variable-size-carrier block carries when its
-        // predecessor is free (see [`PREV_FREE_BIT`]). This widens acceptance by
-        // exactly that one bit and leaves [`ALL_FLAGS`] (and its compile-time
-        // assertion) untouched.
-        && header.flags & !(ALL_FLAGS | PREV_FREE_BIT) == 0
+        // The flag byte needs no "unknown bit" conjunct here. The taxonomy union
+        // [`ALL_FLAGS`] plus the `prev_free` block-*state* bit ([`PREV_FREE_BIT`] — the
+        // one bit a **live** variable-size-carrier block carries when its physical
+        // predecessor is free) already exhaust all eight bits: `ALL_FLAGS |
+        // PREV_FREE_BIT == u8::MAX`, pinned by the compile-time assertion in
+        // `crate::block`. A residue mask built from that union would therefore be
+        // `0x00` and constrain nothing, so none is written — the predicate imposes no
+        // constraint on the flag byte at this site. `prev_free` must stay tolerated in
+        // any case: rejecting it would make [`CarrierAllocator::locate`] skip a
+        // legitimately live mid-size block and [`Allocator::dealloc`] leak it. Callers
+        // that mean the taxonomy union *alone* still have
+        // [`BlockFlags::has_unknown_bits`].
         && (header.class == CLASS_NONE) == flags.is_large()
         && (header.class == CLASS_NONE || usize::from(header.class) < MAX_CLASS_COUNT)
 }

@@ -158,8 +158,7 @@ pub const MBC_CLASS: u16 = 0;
 /// module docs' layout diagram). This is an **MBC-local** constant: it does not change
 /// [`crate::free_list::MIN_FREE_BLOCK_SIZE`] (32), which guards the slab path.
 pub const MIN_MBC_BLOCK_SIZE: usize =
-    ((BLOCK_HEADER_SIZE + LINK_WORDS * WORD_SIZE + WORD_SIZE) + UNIT_SIZE - 1) / UNIT_SIZE
-        * UNIT_SIZE;
+    (BLOCK_HEADER_SIZE + LINK_WORDS * WORD_SIZE + WORD_SIZE).div_ceil(UNIT_SIZE) * UNIT_SIZE;
 
 // The footer must be a machine word and the link words must be payload-sized, so the
 // layout diagram's arithmetic is about the same units on any target.
@@ -169,7 +168,7 @@ const _: () = assert!(MIN_MBC_BLOCK_SIZE - WORD_SIZE >= BLOCK_HEADER_SIZE + LINK
 // A block this module creates is always large enough for `FreeList::insert`.
 const _: () = assert!(MIN_MBC_BLOCK_SIZE >= crate::free_list::MIN_FREE_BLOCK_SIZE);
 // `MIN_FREE_BLOCK_SIZE` is UNIT_SIZE-granular.
-const _: () = assert!(MIN_MBC_BLOCK_SIZE % UNIT_SIZE == 0);
+const _: () = assert!(MIN_MBC_BLOCK_SIZE.is_multiple_of(UNIT_SIZE));
 
 /// One variable-size multi-block carrier: a carrier plus the free list of the free
 /// blocks carved out of it.
@@ -695,7 +694,7 @@ unsafe fn read_prev_size(block: *mut u8) -> usize {
 /// `UNIT_SIZE`-granular total size `size >= MIN_MBC_BLOCK_SIZE`, so the footer word is
 /// inside the block and above the intrusive link words.
 unsafe fn write_footer(block: *mut u8, size: usize) {
-    debug_assert!(size >= MIN_MBC_BLOCK_SIZE && size % UNIT_SIZE == 0);
+    debug_assert!(size >= MIN_MBC_BLOCK_SIZE && size.is_multiple_of(UNIT_SIZE));
     // SAFETY: per the contract `size` is the block's own extent, so the word at
     // `block + size - WORD_SIZE` is inside the block and inside the carrier.
     unsafe { block.add(size - WORD_SIZE).cast::<usize>().write(size) };
