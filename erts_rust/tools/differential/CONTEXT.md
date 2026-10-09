@@ -144,14 +144,14 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
 | A.1 | 154 | 154 | 0 | 0 | 0 |
-| A.2 | 279 | 279 | 0 | 0 | 0 |
-| A.3 | 104 | 104 | 0 | 0 | 0 |
-| A.4 | 97 | 97 | 0 | 0 | 0 |
-| A.5 | 233 | 232 | 0 | 1 | 0 |
+| A.2 | 326 | 326 | 0 | 0 | 0 |
+| A.3 | 116 | 116 | 0 | 0 | 0 |
+| A.4 | 117 | 117 | 0 | 0 | 0 |
+| A.5 | 251 | 247 | 0 | 4 | 0 |
 | A.6 | 44 | 44 | 0 | 0 | 0 |
-| A.7 | 322 | 315 | 0 | 7 | 0 |
+| A.7 | 330 | 325 | 0 | 5 | 0 |
 | A.8 | 64 | 64 | 0 | 0 | 0 |
-| A.9 | 115 | 114 | 0 | 1 | 0 |
+| A.9 | 155 | 154 | 0 | 1 | 0 |
 
 - **The 9 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so each flips to `agree` automatically once its gap closes:
   - **`local_fun`:** `wire/new_fun_ext_encode` (A.5, `beam_rt: unsupported: local_fun`) — a lambda is an evaluator closure that the `beam_rt` `-eval` path cannot give a faithful `NEW_FUN_EXT` image. `beam_codec` has `Encoder::with_fun_identity`; the remaining blocker is runtime wiring (`beam_rt`).
