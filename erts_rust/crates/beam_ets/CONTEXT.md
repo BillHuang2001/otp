@@ -577,11 +577,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `MatchSpec`.
 - **Named-table lookup-by-name is the runtime's job.** `Table` exposes `name()`/`is_named()` only; the
   name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this crate holds no global state).
-- **`Tree::insert_rec` re-materialises `subtree_max_key` on every unwind step** (O(depth) per level) —
-  it cannot be relaxed to "only when the max *value* changed" because the replaced object's storage is
-  already reclaimed (the *term* would dangle); a safe version must propagate the new max term up the
-  recursion. **`Tree::insert_new`** performs two full descents (`find` then `insert`); removing the
-  first is a mechanical ~2× win for `ets:insert_new/2`. Both unlanded.
+- **The continuation position is an INDEX into iteration order, not a key-based cursor.** The oracle's
+  `ets:select/1` continuation carries the last key and resumes relative to it, so inserts/deletes
+  *behind* the cursor do not shift what the next chunk returns; this crate stores the position as an
+  ordinal, so a mutation between chunks can skip or repeat an object relative to the oracle. Every
+  single-chunk and no-mutation-between-chunks case agrees (the 135-case battery covers the latter); the
+  divergence only appears across a resume straddling a mutation.
 - **Deep-copy is a subset.** Funs, hash-maps, records, external pid/port/ref and off-heap bin
   refs/sub-bitstrings cannot be copied into table storage (`insert` ⇒ `BadArg`).
 - **The match-spec compiler covers the common guard set**, not the full Erlang guard language
