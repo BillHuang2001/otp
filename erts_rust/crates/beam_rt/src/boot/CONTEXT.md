@@ -29,7 +29,11 @@ submodules and their docs; do not look for `boot.rs` here.
   Boot-stop observability (additive): `pub struct BootStop { pub index: Option<usize>, pub total: usize,
   pub instruction: Option<Instruction>, pub error: BeamError }`, `BootStop::describe(&self) -> String`
   (a one-line summary: index/total + the failing directive as `M:F/A` or `{kernelProcess,Name,…}` + the
-  error), and `pub fn execute_reporting(&mut Runtime, &BootScript) -> std::result::Result<(), BootStop>`
+  error), `BootStop::describe_with(&self, &mut Runtime) -> String` (the same, but a **structured** raise
+  reason is rendered as its real term through the runtime's printer — e.g.
+  `{noproc,{gen_server,call,[file_server_2,…]}}` rather than `<structured reason>`; a non-structured or
+  unprintable reason falls back to `describe`), and
+  `pub fn execute_reporting(&mut Runtime, &BootScript) -> std::result::Result<(), BootStop>`
   — the **primary** implementation, which `execute` delegates to (`execute(..).map_err(|stop| stop.error)`),
   so the two can never drift. `index`/`instruction` are `None` when the runtime failed to boot before
   the first directive ran.
@@ -121,19 +125,18 @@ and stops at **instruction 20** (0-based), `{apply,{c,erlangrc,[]}}`. The tail's
   (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **1** with
   `{noproc,{gen_server,call,[file_server_2,{open,"$HOME/.erlang",[read]},infinity]}}` — `file_server_2`
   is simply never registered, so `c:erlangrc/0`'s file consult fails. The in-crate executor
-  (`execute_reporting`) reports
-  `boot script stopped at instruction 20/22: c:erlangrc/0: exit <structured reason>` — the same
-  directive and the same exit class. `BootStop::describe` renders `BeamError`'s `Display`, which shows
-  `<structured reason>` for a term-carrying raise; the CLI's `reported_reason` renders the live reason
-  term itself.
+  (`execute_reporting` + `BootStop::describe_with`) reports the **same** term:
+  `boot script stopped at instruction 20/22: c:erlangrc/0: {noproc,{gen_server,call,[file_server_2,…]}}`
+  — the same directive and the same exit class.
 - **The configuration is part of the measurement.** The stop depends on the runtime's **complete**
   configuration, above all the command line `init:get_arguments/0` reports. The executor tests build
   their runtime with their own `system_runtime()` helper — the CLI's own parser (`crate::cli::parse`,
   not `parse_with_env`: a test must not depend on `ERL_*FLAGS`) over the CLI argv
-  `beam_rt -noshell -boot bootstrap/bin/start` — because a `RuntimeConfig::default()` runtime (an empty
-  `init_args`) stops at a **different** instruction (16, `application:load/1`) with the
-  `application_controller` gone. Two configurations producing two different stops for the *same* script
-  under the *same* executor is a runtime bug, not a boot-script one (see "Runtime fragility" below).
+  `beam_rt -noshell -boot bootstrap/bin/start` — and `tests/boot.rs` mirrors it (`boot_cli_runtime`),
+  because a `RuntimeConfig::default()` runtime (an empty `init_args`, so `init:get_arguments/0` is `[]`
+  where the oracle also reports `root`/`bindir`/`progname`/`home`) stops three instructions earlier, at
+  instruction 16 (`application:load/1`, an `error function_clause`) — see the `src/native` handoff in
+  the blocker chain below.
 - **The kernel processes are ready when the stop is reached.** The three `{kernelProcess, …}` bursts
   drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
@@ -145,23 +148,23 @@ and stops at **instruction 20** (0-based), `{apply,{c,erlangrc,[]}}`. The tail's
   `Wait { func, pc }` is produced and `apply_boot_call`'s `Wait` arm (and its `ran == 0` fold) is
   unreached on this path.
 
-### Runtime fragility (owner: outside `src/boot/**` — handoff)
-The stop is a function of the **whole** command line, not only the script: two
-`init:get_arguments/0` configurations produce two different stops for the *same* script under the
-*same* executor. Reproduced: `-boot bootstrap/bin/start` (relative) and an absolute `-boot` value
-without `..` segments both carry the script to 20, while the absolute `..`-bearing `START_BOOT` stem
-that `tests/boot.rs` passes makes the `application_controller` die during its own `init/2`, with:
-
-* most often a `func_info`-driven `function_clause` (its `Raise.stacktrace.frames` is **empty**, so the
-  raise is not localizable from the message) — `beam_engine`'s raise path;
-* at least once a **message copy** into the AC failing with the raw internal
-  `allocation failure: message (N bytes)` text (`AllocKind::Message`, the `beam_message` copy engine's
-  destination-heap exhaustion), which `Runtime` is documented to translate into `error:system_limit`
-  (`src/runtime.rs`). An out-of-scope integration test invokes the CLI with the absolute `START_BOOT`
-  stem and observes exactly this diagnostic with a **garbage byte count** (`17535695143944`) — an
-  owner-side bug in `beam_rt`'s `src/context`/`src/runtime.rs` glue over `beam_message`.
-The boot tests therefore pin the **CLI-equivalent** configuration: the reproducible one, and the one
-comparable to `beam_rt`'s own CLI.
+### A `-boot` value's shape changes the observed stop (owner: `beam_engine` — handoff)
+The stop is a function of the whole command line, and the `-boot` **value's byte length** perturbs it on
+a knife edge: the short canonical form (`<repo>/bootstrap/bin/start`, ~71 chars) carries the script
+cleanly to instruction 20, while a slightly longer value — or one with a non-canonical segment (`.`, `..`,
+a doubled `/`), which shifts the byte count just as a longer name does — makes the runtime exit **1** with
+the raw `beam_rt: allocation failure: message (<garbage> bytes)` instead of the honest `{noproc,…}` (the
+count is deterministic for a given argv but varies with it: `21096`, `42408`, `17123030415440`, …).
+`$P/bootstrap/bin/start` (71) is fine, `$P/bootstrap/./bin/start` (74) fails, and a padded long canonical
+path fails too — so it is heap layout, not path semantics. Pinned by inspection to `beam_engine`'s
+structured-raise path: `Machine::throw_with_stacktrace` (`machine/catch.rs`) attaches a `LiveReason` over
+a term whose source heap frame is already gone, and a later copy (`beam_process` → `beam_message`'s
+`size_object`) reads the freed frame as a length. **`src/boot/**` cannot fix it.** `tests/boot.rs`
+therefore builds its `-boot` value from `CARGO_MANIFEST_DIR`'s ancestors (`start_boot()`), whose canonical
+short form is the safe one. Repro:
+`ERL_CRASH_DUMP_SECONDS=0 beam_rt -noshell -boot "$PWD/bootstrap/./bin/start"` →
+`beam_rt: allocation failure: message (…)`; `… -boot "$PWD/bootstrap/bin/start"` → the `file_server_2`
+`noproc`.
 
 ### Remaining blocker chain (owner per link)
 1. **`beam_rt` / `kernel` (owner: the parent node, not `src/boot/**`) — no `file_server_2`.** The stop
@@ -200,10 +203,10 @@ comparable to `beam_rt`'s own CLI.
   committed `bootstrap/bin/start.boot`; pins `{"Erlang/OTP","30"}`, 22 instructions and the instruction
   list); the bounded prefix test `the_real_start_boot_prefix_loads_its_prim_load_batches`; 
   `the_real_start_boot_stops_honestly_at_the_first_unbootable_directive` (asserts the stop is a typed
-  `BeamError::Raise` on an `Instruction::Apply` at index ≥ 16 — it is 20 — and that the `primLoad`
+  `BeamError::Raise` on the `{apply,{c,erlangrc,[]}}` directive at **index 20**, and that the `primLoad`
   modules loaded); `the_real_start_boot_reports_its_stop_through_execute_reporting` (the `execute_reporting`
-  API: `stop.total == instructions.len()`, `stop.index` `Some(index)` with `index >= 16`,
-  `stop.instruction` is `Apply`, and `whereis(application_controller)` is a live pid — pinning the
+  API: `stop.total == instructions.len()`, `stop.index == Some(20)`, the named `Apply` is `c:erlangrc/0`,
+  and `whereis(application_controller)` is a live pid — pinning the
   unlink); `a_synthetic_script_executes_end_to_end` (compiles a fixture with `erlc`, writes a synthetic
   `.boot` with `erl`, asserts the `apply` step really ran); `a_boot_spawned_process_answers_a_blocked_apply`
   (pins `drive.rs`: a `{kernelProcess, …}` burst and a later `{apply, …}` blocked on it, resumed by a
@@ -219,14 +222,17 @@ comparable to `beam_rt`'s own CLI.
   run-queue drain, later resolved via `whereis`), plus `registering_a_live_boot_name_is_badarg`.
   Every test reads the committed script via
   `concat!(env!("CARGO_MANIFEST_DIR"), "/../../../bootstrap/bin/start.boot")`; system-install tests
-  **skip loudly** when `erl`/`erlc` or the file are absent.
-- `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry.
-- `../tests/boot.rs` (integration, owned by the parent node): the real-script stop, the `-boot` CLI drive
-  and the preloaded-only default. NOTE: `the_cli_reports_the_boot_scripts_honest_stop_as_a_typed_error`
-  (out of scope) invokes the CLI with the **absolute** `START_BOOT` stem and asserts exit 1 with `noproc`
-  in stderr; that argv lands in the "Runtime fragility" configuration above, where the CLI reports
-  `beam_rt: allocation failure: message (<garbage> bytes)` instead (still exit 1, so only its `noproc`
-  assertion fails).
+  **skip loudly** when `erl`/`erlc` or the file are absent. The in-crate tests hand that path to `read`,
+  never as a `-boot` CLI value, so its shape is not a factor here.
+- `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry;
+  `boot_from_script_reporting` is the boot-stop-position entry point.
+- `../tests/boot.rs` (integration, owned by this node): `start_boot()` builds a canonical, short `-boot`
+  value (avoiding the heap-fragility above) and asserts the real-script stop is `stop.index == Some(20)`
+  on the `{apply,{c,erlangrc,[]}}` directive, reporting the real `{noproc,…}` term; the `-boot` CLI drive;
+  the CLI's honest-stop diagnostic (`file_server_2` `noproc`, and **not** `application_controller`); a
+  synthetic-probe boot (the real script's first 20 directives + a `probe:run/0` `apply`, built with the
+  oracle) proving the `application_controller` kernel process survives its short-lived directive process
+  (`whereis` = a live pid); and the preloaded-only default.
 
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
