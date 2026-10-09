@@ -202,10 +202,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   op and raises `BeamError::BadArg` on a violation. Wraps the whole observable surface: write-checked
   `insert`/`insert_list`/`insert_new`/`delete`/`delete_object`/`delete_all_objects`/`take`/
   `update_counter`/`update_counter_with`/`update_element`/`select_delete`/`match_delete`/
-  `select_replace`; read-checked `lookup`/`member`/`lookup_element(+_or/_all/_all_or)`/`select`/
-  `select_count`/`match_object`/`match_`/`first`/`last`/`next`/`prev`/`tab2list`/`size`/`is_empty`/
-  `set_fixation` (the oracle gates `safe_fixtable/2` as a READ) and the `/3`+`/1` limited forms.
-  `ets:info/1,2` is deliberately **not** gated. `give_away(new_owner)` and `setopts(opt)` are
+  `select_replace`/`rename`; read-checked `lookup`/`member`/`lookup_element(+_or/_all/_all_or)`/`select`/
+  `select_reverse`(+_limit/_continue)/`select_count`/`match_object`/`match_`/`first`/`last`/`next`/`prev`/
+  `tab2list`/`size`/`is_empty`/`set_fixation` (the oracle gates `safe_fixtable/2` as a READ) and the
+  `/3`+`/1` limited forms. `ets:match_spec_run/2` is a free function over a list with no table/requester,
+  so it has no access concept. `ets:info/1,2` is deliberately **not** gated. `give_away(new_owner)` and `setopts(opt)` are
   requester-implicit (`give_away` has no protection check — ownership is not a read/write op; `setopts`
   is owner-gated, like the oracle).
 
