@@ -76,7 +76,45 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   marked modules; every `unsafe` block/`fn` carries a preceding `// SAFETY: <invariant/rationale>`
   comment; any `unsafe` gains a Miri/fuzz or differential test where feasible. `beam_common` itself
   contains none (`#![forbid(unsafe_code)]`).
-- Files target ~1000 lines; split by responsibility (`error`, `version`, `config`, `logging`).
+- Files target ~1000 lines; split by responsibility (`error`, `version`, `config`, `constants`, `logging`).
+
+## Cross-Crate Constant Ownership
+`constants` is the single owner of ERTS constants genuinely shared by **two or more** workspace
+crates; a value used by a single crate stays in that crate. `beam_common` is the lowest common
+ancestor, so dependents import/re-export from here instead of transcribing their own copy.
+
+- **`CONTEXT_REDS`** (`= 4000`, `erts/emulator/beam/erl_vm.h:47`) — the ERTS reduction quantum /
+  context-switch threshold; a frozen ERTS interface constant reported by
+  `erlang:system_info(context_reductions)`. Transcribed independently in three sibling crates that
+  must adopt `beam_common::CONTEXT_REDS` (**read-only here — owners to route**):
+  `beam_io::port_task::CONTEXT_REDS` (`crates/beam_io/src/port_task.rs`, `usize`); the private
+  `CONTEXT_REDS` in `beam_rt::info::schedulers` (`crates/beam_rt/src/info/schedulers.rs`, `i64`, feeds
+  `system_info(context_reductions)`); and `beam_process::DEFAULT_REDUCTIONS_PER_SLICE`
+  (`crates/beam_process/src/scheduler.rs`, `u32`, the per-process slice budget).
+
+Other genuinely cross-crate-duplicated ERTS constants proved during the audit. Each already has (or
+needs) a canonical owner **outside** `beam_common`; adopters listed — **none edited from this node**:
+
+- **`MAP_SMALL_MAP_LIMIT`** (`= 32`, `erts/emulator/beam/erl_map.h:96`) — canonical
+  `beam_term::MAP_SMALL_MAP_LIMIT` (`crates/beam_term/src/map.rs`); copies to drop:
+  `crates/beam_engine/src/terms/mod.rs`, `crates/beam_bifs/src/maps.rs`.
+- **`MAX_ARG`** (`= 255`, `erts/emulator/beam/erl_vm.h:48`) — published twice already
+  (`beam_term::fun::MAX_ARG`, `beam_process::registers::MAX_ARG`); copies to drop:
+  `crates/beam_abi/src/nif/enif/process.rs` (`c_int`), `crates/beam_bifs/src/fun_info.rs` (`i64`).
+- **`MAX_REG`** (`= 1024`, `erts/emulator/beam/erl_vm.h:49`) — canonical `beam_process::MAX_REG`
+  (`crates/beam_process/src/registers.rs`); copy to drop: `crates/beam_loader/src/decode.rs` (`u64`).
+- **`MAX_ARITYVAL`** (`= (1<<24)-1`, `erts/emulator/beam/erl_term.h:322`) — canonical
+  `beam_term::MAX_ARITYVAL` (`crates/beam_term/src/tag.rs`); copy to drop:
+  `crates/beam_codec/src/encode/mod.rs`.
+- **`MAX_ATOM_CHARS`** (`= 255`, `erts/emulator/beam/atom.h:29` `MAX_ATOM_CHARACTERS`) — no canonical
+  Rust owner yet; duplicated in `crates/beam_codec/src/decode/mod.rs` and twice in `beam_bifs`
+  (`src/convert.rs`, `src/binconv.rs`).
+- **`VERSION_MAGIC`** (`= 131`, `erts/emulator/beam/external.h:84`) — canonical
+  `beam_codec::VERSION_MAGIC`; `beam_dist` already re-exports it (no duplicate).
+- Minor / trivially derived (noted, not actionable here): `NSEC_PER_SEC`
+  (`beam_abi/src/nif/enif/time.rs`, `beam_io/src/cpu_time.rs`); `WORD_BYTES` / `U32_PER_WORD`
+  (recomputed from `size_of::<Eterm>()` per crate); `POS_BIG_SUBTAG` / `REF_SUBTAG`
+  (canonical in `beam_term::tag`; only `#[cfg(test)]` copies elsewhere).
 
 ## Known Issues
 - **The `FeatureFlags` surface is largely inert.** Only `smp` is consumed anywhere (reported by
