@@ -159,9 +159,12 @@ allocates only through `ExecutionContext::alloc_words` (no `test_heap` admission
 to the pointer-stable arena and is never collected, `Machine`'s float-register file is not mirrored by
 this crate's root publish (so a module with a float-family instruction is never collected over), and a
 failed collection halts that process's collection rather than failing the program.
-**On-demand heap growth is NOT adopted in M1.** `beam_gc` exposes the growth seam
-(`Collector::ensure_capacity`/`HeapPolicy::unbounded()`/`GcConfig::growable()`), but wiring it needs
-sibling changes, so heap exhaustion still raises `error:system_limit`: the engine `ensure_heap` hook is a
+**On-demand heap growth is adopted only on the `beam_process` message-delivery path.** `Process::deliver`
+retries a refused `AllocKind::Heap`/`Message` copy after `Process::ensure_capacity` grows the nursery to
+fit it; a bounded `HeapPolicy::max_heap_words` makes that growth refuse fail-fast, and the refusal is what
+reproduces the raw `AllocKind::Message` that `deliver_message` keys its heap-fragment fallback on (an
+unbounded receiver would instead absorb the payload into its grown nursery). `beam_rt`'s own allocation
+paths still do **not** grow, so heap exhaustion there still raises `error:system_limit`: the engine `ensure_heap` hook is a
 no-op and BIFs build terms on a `beam_alloc::Heap` (`BifContext::heap()`) caching raw `hp`, so the live
 set is invisible to `roots`; the bounded heaps (`Runtime::bif_heaps`/`eval_heap`) are bump arenas that
 never move. To adopt: a reservation-capable `Heap` + re-derivable top/`hp`, `beam_engine` `alloc_words`
@@ -176,9 +179,10 @@ re-basing, and `beam_bifs` per-object `hp` re-fetch.
   (`beam_process/src/process.rs:579`) returns `(&mut Heap, &mut OffHeapTable)` in one borrow, and
   `Process::heap_and_mailbox_mut()` returns `(&mut Heap, &mut Queue)`, so calling
   `beam_message::Fragments::move_into` at receive is no longer blocked by borrowing.
-  The remaining blockers for adopting it here are heap growth — the fragment payload is larger than the
-  receiver's ungrowable M1 heap — and an owning drain for the wake list, without which this crate keeps
-  composing the public fragment primitives directly and `MailboxState::remove_at` retains a removed
+  The remaining blocker for adopting it here is an owning drain for the wake list; the receiver's heap is
+  no longer one, since `Process::deliver` grows the nursery on demand (a fragment is still produced when
+  the receiver's `HeapPolicy` bounds the heap below the payload). Without that owning drain this crate
+  keeps composing the public fragment primitives directly and `MailboxState::remove_at` retains a removed
   message's `Fragments` so a just-bound payload stays valid.
   Plus a `!Send`-friendly `SchedulerPool` for SMP adoption (`Runtime` holds `Rc`/`RefCell` tables and
   `*mut Eterm` heaps, so `beam_process`'s `unsafe impl Send` escape is unavailable here).
