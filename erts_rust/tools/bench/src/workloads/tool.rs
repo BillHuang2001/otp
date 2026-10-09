@@ -30,7 +30,10 @@
 //!    mutating `PATH` or the tool itself (empty entries are ignored);
 //! 3. an **automatic Nix-store scan** for `/nix/store/*<tool>*/bin/<tool>` — the sandbox
 //!    keeps tools such as `rebar3`/`dotnet` in the store but off `PATH`; the scan finds
-//!    them **without baking in a store hash** (see [`store_entry_names_tool`]);
+//!    them **without baking in a store hash** (see [`store_entry_names_tool`]) and ranks
+//!    several installed versions **by the version named in the entry**, greatest first, so
+//!    the store's random hash prefix never decides which one wins (see
+//!    [`store_bin_dirs_from`]);
 //! 4. **only when the developer opts in** (`$BENCH_TRY_NIX` set to a non-empty value, with
 //!    `nix` on `PATH`) a `nix shell nixpkgs#<attr> --command <tool>` shim, validated with
 //!    a bounded `--version` probe.
@@ -49,6 +52,7 @@
 //! Whatever resolves, when *nothing* does the caller keeps its own honest
 //! `skipped(<tool>-absent)` reason — never a fabricated number.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -161,25 +165,69 @@ fn store_entry_names_tool(entry: &str, tool: &str) -> bool {
     entry.split('-').any(|token| token == tool)
 }
 
+/// The version named by a Nix store entry (e.g. `9.0.318` from
+/// `g6lf…-dotnet-sdk-wrapped-9.0.318`, `3.27.1` from `z2nz…-rebar3-3.27.1`): the entry's
+/// trailing `-`-delimited token, when that token is a dotted-numeric version. `None` for an
+/// entry that names no version (`…-rebar3-nightly`, a bare store hash).
+///
+/// The components are parsed as numbers (trailing zeros dropped) so the versions compare
+/// *numerically* rather than as text — essential, because a store entry begins with a
+/// random 32-character hash and the names are therefore not ordered by version:
+/// `9.0.318 > 8.0.425` even though the *names* `…-dotnet-sdk-8.0.425` and
+/// `…-dotnet-sdk-9.0.318` compare the other way. Pure and store-independent, so the
+/// ordering it drives is unit-testable.
+fn entry_version(entry: &str) -> Option<Vec<u64>> {
+    let token = entry.rsplit('-').next()?;
+    if !token.contains('.') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in token.split('.') {
+        if component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        parts.push(component.parse::<u64>().ok()?);
+    }
+    while parts.last() == Some(&0) {
+        parts.pop();
+    }
+    Some(parts)
+}
+
 /// The `<entry>/bin` directories of the Nix store entries that name `tool` (step 3),
-/// ordered so the lexicographically greatest entry name comes first — a deterministic
-/// "newest installed" preference among several versions. Pure and store-independent so
-/// the ordering can be unit-tested.
+/// ordered so the **greatest version** comes first — a deterministic "newest installed"
+/// preference among several versions. The ordering key is the version parsed from the
+/// entry name ([`entry_version`]), never the whole name, so the store's random hash prefix
+/// cannot decide the winner: the store holding both `9ql…-dotnet-sdk-8.0.425` and
+/// `abbk…-dotnet-sdk-9.0.318` must rank the 9.0.318 entry first.
+///
+/// Entries of equal version are tie-broken by entry name, and entries naming **no** version
+/// always sort after the versioned ones (both deterministically), so the result is stable
+/// whatever the store contains. Pure and store-independent so the ordering can be
+/// unit-tested.
 fn store_bin_dirs_from(names: impl IntoIterator<Item = String>, tool: &str) -> Vec<PathBuf> {
-    let mut matching: Vec<String> = names
+    let mut matching: Vec<(Option<Vec<u64>>, String)> = names
         .into_iter()
         .filter(|name| store_entry_names_tool(name, tool))
+        .map(|name| (entry_version(&name), name))
         .collect();
-    matching.sort();
-    matching.reverse();
+    matching.sort_by(|(left_version, left_name), (right_version, right_name)| {
+        match (left_version, right_version) {
+            (Some(left), Some(right)) => right.cmp(left).then_with(|| left_name.cmp(right_name)),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => left_name.cmp(right_name),
+        }
+    });
     matching
         .into_iter()
-        .map(|name| Path::new(NIX_STORE).join(name).join("bin"))
+        .map(|(_, name)| Path::new(NIX_STORE).join(name).join("bin"))
         .collect()
 }
 
 /// Scans `$NIX_STORE` for entries naming `tool` and returns their `bin` directories,
-/// newest-name-first. Empty when the store is absent or names nothing.
+/// greatest-version-first ([`store_bin_dirs_from`]). Empty when the store is absent or
+/// names nothing.
 fn nix_store_bin_dirs(tool: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(NIX_STORE) else {
         return Vec::new();
@@ -378,20 +426,87 @@ mod tests {
         ));
     }
 
+    /// The version parsed from a `<store-entry>/bin` path produced by
+    /// [`store_bin_dirs_from`].
+    fn dir_version(dir: &Path) -> Option<Vec<u64>> {
+        entry_version(dir.parent()?.file_name()?.to_str()?)
+    }
+
     #[test]
-    fn store_bin_dirs_are_filtered_and_ordered_newest_name_first() {
+    fn entry_version_reads_the_trailing_dotted_numeric_token() {
+        // The real store-entry shapes for the tools this module resolves.
+        assert_eq!(
+            entry_version("z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1"),
+            Some(vec![3, 27, 1])
+        );
+        assert_eq!(
+            entry_version("g6lfw3lizv0ayzy7yhq5g0rk9swxysii-dotnet-sdk-wrapped-9.0.318"),
+            Some(vec![9, 0, 318])
+        );
+        assert_eq!(
+            entry_version("9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425"),
+            Some(vec![8, 0, 425])
+        );
+        // Trailing zeros are dropped, so `9.0` and `9`-as-a-version and `9.0.0` agree.
+        assert_eq!(entry_version("h-9.0.0"), Some(vec![9]));
+        assert_eq!(entry_version("h-9.0"), Some(vec![9]));
+        // A dotted-numeric token of unequal length compares numerically component-wise.
+        assert!(entry_version("h-9.0").unwrap() < entry_version("h-9.0.318").unwrap());
+        // No trailing dotted-numeric token: a bare hash, a word version, a pre-release
+        // suffix and a non-numeric component all name no version.
+        assert_eq!(entry_version("0123456789abcdef0123456789abcdef"), None);
+        assert_eq!(entry_version("abc-rebar3-nightly"), None);
+        assert_eq!(entry_version("abc-rebar3-1.0-rc1"), None);
+        assert_eq!(entry_version("abc-rebar3-1.x"), None);
+        assert_eq!(entry_version("abc-rebar3-"), None);
+    }
+
+    #[test]
+    fn store_bin_dirs_order_by_parsed_version_not_by_hash_prefix() {
+        // Hash prefixes taken from this host's store, chosen so that the *lexicographic*
+        // order of the entry names is the opposite of the version order: the greatest name
+        // is `qybc…-dotnet-sdk-wrapped-8.0.425`, so the old name-ordered rule picked .NET
+        // **8**, while PLB targets .NET 9 and its build then failed with NETSDK1045.
         let names = vec![
-            "h1-rebar3-3.27.0".to_string(),
-            "h2-rebar3-3.27.1".to_string(),
+            "9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425".to_string(),
+            "abbkzygy9aix7b6m9vqlm1xw766mlrf1-dotnet-sdk-9.0.318".to_string(),
+            "qybc3wpz3hz5daipbmnj7rgc73hn35j2-dotnet-sdk-wrapped-8.0.425".to_string(),
+            "g6lfw3lizv0ayzy7yhq5g0rk9swxysii-dotnet-sdk-wrapped-9.0.318".to_string(),
+        ];
+        // Both 9.0.318 entries come before both 8.0.425 ones, whatever their hash; equal
+        // versions are tie-broken by entry name for determinism.
+        assert_eq!(
+            store_bin_dirs_from(names.clone(), "dotnet"),
+            vec![
+                PathBuf::from("/nix/store/abbkzygy9aix7b6m9vqlm1xw766mlrf1-dotnet-sdk-9.0.318/bin"),
+                PathBuf::from(
+                    "/nix/store/g6lfw3lizv0ayzy7yhq5g0rk9swxysii-dotnet-sdk-wrapped-9.0.318/bin"
+                ),
+                PathBuf::from("/nix/store/9ql2v7xa762qgibgrq84prdz4sl212c7-dotnet-sdk-8.0.425/bin"),
+                PathBuf::from(
+                    "/nix/store/qybc3wpz3hz5daipbmnj7rgc73hn35j2-dotnet-sdk-wrapped-8.0.425/bin"
+                ),
+            ]
+        );
+        // The entry that the name-ordered rule ranked first is the *last* one now.
+        assert!(store_bin_dirs_from(names, "dotnet")[0]
+            .to_string_lossy()
+            .contains("9.0.318"));
+    }
+
+    #[test]
+    fn store_bin_dirs_prefer_the_greater_version_and_reject_unrelated_names() {
+        let names = vec![
+            "g16lbl9w5qf9m1c8m2px971vy47b15rx-rebar3-3.27.0".to_string(),
+            "z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1".to_string(),
             "h3-dotnet-sdk-9.0.318".to_string(),
             "h4-unrelated-1.0".to_string(),
         ];
-        // Only the rebar3 entries survive, and the greater version name comes first.
         assert_eq!(
             store_bin_dirs_from(names.clone(), "rebar3"),
             vec![
-                PathBuf::from("/nix/store/h2-rebar3-3.27.1/bin"),
-                PathBuf::from("/nix/store/h1-rebar3-3.27.0/bin"),
+                PathBuf::from("/nix/store/z2nzp267fq9mnd51rccz5a47x35q9xb6-rebar3-3.27.1/bin"),
+                PathBuf::from("/nix/store/g16lbl9w5qf9m1c8m2px971vy47b15rx-rebar3-3.27.0/bin"),
             ]
         );
         assert_eq!(
@@ -399,6 +514,47 @@ mod tests {
             vec![PathBuf::from("/nix/store/h3-dotnet-sdk-9.0.318/bin")]
         );
         assert!(store_bin_dirs_from(names, "nowhere").is_empty());
+    }
+
+    #[test]
+    fn store_bin_dirs_put_unversioned_entries_last_deterministically() {
+        let names = vec![
+            "h1-rebar3-nightly".to_string(),
+            "h0-rebar3-3.27.1".to_string(),
+            "zz-rebar3-master".to_string(),
+        ];
+        // A versioned entry always outranks an unversioned one (which must never jump
+        // ahead of a real version), and unversioned entries are still name-ordered.
+        assert_eq!(
+            store_bin_dirs_from(names, "rebar3"),
+            vec![
+                PathBuf::from("/nix/store/h0-rebar3-3.27.1/bin"),
+                PathBuf::from("/nix/store/h1-rebar3-nightly/bin"),
+                PathBuf::from("/nix/store/zz-rebar3-master/bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_real_store_scan_prefers_the_newest_installed_version() {
+        // `dotnet` on `PATH` would win by policy (step 1), making a store check vacuous.
+        if proc::which("dotnet").is_some() {
+            return;
+        }
+        let dirs = nix_store_bin_dirs("dotnet");
+        let Some(first_version) = dirs.first().and_then(|dir| dir_version(dir)) else {
+            return; // no versioned `dotnet` entry in this host's store
+        };
+        assert_eq!(
+            dirs.iter().filter_map(|dir| dir_version(dir)).max(),
+            Some(first_version.clone()),
+            "the greatest installed version must come first: {dirs:?}"
+        );
+        // This host's store holds the 8.0.425 and 9.0.318 SDKs, and the old name-ordered
+        // scan put an 8.0.425 entry first; the resolver must now pick the .NET 9 SDK.
+        if first_version == vec![9, 0, 318] {
+            assert_eq!(resolve_tool_path("dotnet"), Some(dirs[0].join("dotnet")));
+        }
     }
 
     #[cfg(unix)]

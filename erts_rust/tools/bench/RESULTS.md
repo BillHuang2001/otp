@@ -22,7 +22,7 @@ Raw harness JSON is committed under `results/` as `m5-*`; the previous run's art
 | Distribution | NixOS 26.11 (Zokor) |
 | CPU | Intel(R) Core(TM) Ultra 7 356H — `nproc` = **14** |
 | RAM | `MemTotal` = 65 317 432 kB (62.29 GiB) |
-| Host load (1-min `/proc/loadavg`) | primary full run **130.32 → 90.41**; focused `xrun` **118.13 → 101.17**; PLB attempt **89.90 → 94.04** |
+| Host load (1-min `/proc/loadavg`) | primary full run **130.32 → 90.41**; focused `xrun` **118.13 → 101.17**; PLB attempt (SDK forced) **89.90 → 94.04**; PLB re-run at the fixed default resolution **63.61 → 42.43** |
 | Repository state | commit `532eb3d11c` (the measurement tree) |
 | Toolchain | `rustc 1.98.1`, `cargo 1.98.0` |
 | Oracle (`sys`) | system `erl` at `/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl`, **OTP 29.1.1 / erts-17.1** (`otp_release` = `"29"`) |
@@ -30,8 +30,8 @@ Raw harness JSON is committed under `results/` as `m5-*`; the previous run's art
 | `erlc` | OTP 29.1.1 (on `PATH`) |
 | `elixirc` | **Elixir 1.20.4** (compiled with Erlang/OTP 29) |
 | `rebar3` | **3.27.1**, resolved from the Nix store by the driver's store scan (not on `PATH`); `khepri` runs with no `PATH` prefix needed (§4.3) |
-| `dotnet` | the store scan resolves **8.0.425** (the store also holds a 9.0.318 SDK); PLB needs .NET 9 (§5, §7) |
-| `$HOME` | read-only (`touch` fails with `Read-only file system`) — relevant to `plb` (§5) |
+| `dotnet` | the store scan resolves the **newest installed SDK, 9.0.318** (the store also holds an 8.0.425 one; the scan ranks entries by the version named in the entry, never by the random hash prefix, so it no longer picks .NET 8) — what PLB's .NET-9 target needs (§4.4) |
+| `$HOME` | read-only (`touch` fails with `Read-only file system`) — relevant to `plb` (§4.4) |
 
 Both runtimes resolve and pass the harness self-check (`supported: true`).
 The driver and the runtime were both built from this tree (`--release -p beam_rt -p bench`), so the numbers describe this tree, not a stale binary.
@@ -57,12 +57,11 @@ erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release
     run --full --runtime all --workloads baseline,slice,foreign,list_walk \
     --out-file erts_rust/tools/bench/results/m5-bench-xrun.json --verbose
 ```
-The **PLB attempt with the .NET 9 SDK forced** (the driver's `BENCH_TOOL_PATH` override, which is searched before the store scan) → `results/m5-bench-quick-plb-net9-attempt.json`:
+The **PLB run at the default tool resolution** — the driver's store scan ranks the Nix-store entries by parsed version, so it selects the newest installed SDK (`.NET 9.0.318`) with **no** `BENCH_TOOL_PATH` override and **no** `PATH` prefix → `results/m5-bench-plb.json`:
 ```sh
-BENCH_TOOL_PATH=/nix/store/g6lfw3lizv0ayzy7yhq5g0rk9swxysii-dotnet-sdk-wrapped-9.0.318/bin \
-  erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
+erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p bench -- \
     run --quick --runtime sys --workloads plb \
-    --out-file erts_rust/tools/bench/results/m5-bench-quick-plb-net9-attempt.json --verbose
+    --out-file erts_rust/tools/bench/results/m5-bench-plb.json --verbose
 ```
 Cross-runtime diff (archived as `results/m5-compare-cross-runtime.txt`):
 ```sh
@@ -222,19 +221,21 @@ All absolute values in this section are inflated by the 90–130 host load (§1)
 | `rebar3 eunit` wall | **98 436.55 ms** |
 | peak RSS | 376 393 728 B (358.9 MiB) |
 
-### 4.4 Programming-Language-Benchmarks (`plb`) — runs with a .NET 9 SDK
+### 4.4 Programming-Language-Benchmarks (`plb`) — runs by default, on the newest installed SDK
 
-`plb` **activates** (no longer `skipped(dotnet-absent)`), but the driver's store scan resolves a **.NET 8** SDK on this host, so under the default resolution the workload's build stage fails (`failed(plb-build-failed)`, §5). With the .NET 9 SDK forced through the driver's `BENCH_TOOL_PATH` override (§2) the build succeeds and the workload **produces real numbers** (`--quick`, 10 tests):
+`plb` **runs** (no longer `skipped(dotnet-absent)`, and no longer `failed(plb-build-failed)`). The driver's Nix-store scan ranks entries by the version named in the entry rather than by the whole entry name — whose 32-character hash prefix is random — so it resolves the **newest installed `dotnet` SDK, .NET 9.0.318**, and the workload's `.NET 9` build stage succeeds. No `BENCH_TOOL_PATH` override and no `PATH` prefix are needed (§2); the workload **produces real numbers** (`--quick`, 10 tests):
 
 | metric | value |
 |---|---|
-| build stage (`dotnet --task build`) | ok — 32 170 ms |
-| wall | 85 687.51 ms |
-| `test_time_ms` (n = 10) | min 0.00 / p50 559.79 / mean 1 217.16 / p99 4 472.20 ms |
-| `test_mem_bytes` | 91 336 704 B (87.1 MiB) |
-| peak RSS | 169 484 288 B (161.6 MiB) |
+| build stage (`dotnet --task build`) | ok — 29 162 ms |
+| wall | 77 669.86 ms |
+| `test_time_ms` (n = 10) | min 0.00 / p50 728.10 / mean 1 457.99 / p99 4 113.80 ms |
+| `test_mem_bytes` | 91 942 912 B (87.7 MiB) |
+| peak RSS | 169 451 520 B (161.6 MiB) |
 
-The per-test `test_time_ms` is the PLB tool's own measurement of its workload; the workload-level `wall_ms` also includes the 32 s build stage.
+The per-test `test_time_ms` is the PLB tool's own measurement of its workload; the workload-level `wall_ms` also includes the 29 s build stage.
+
+This re-run was recorded at host load **63.61 → 42.43** (§1) — quieter than the primary full run but still far above the `m4` near-quiet reference, so its absolute wall/latency figures stay load-inflated and are not comparable to `m4`; re-run on a quiet host before quoting a hard number. Artifact: `results/m5-bench-plb.json`.
 
 ## 5. Workloads that did **not** run — verified reasons
 
@@ -243,8 +244,9 @@ Every reason below was reproduced on this host, not assumed.
 | workload | status | verified reason |
 |---|---|---|
 | `emqx` | `skipped(emqx-requires-otp-28)` | EMQX builds with **Erlang/OTP 28** (`env.sh OTP_VSN` / `.tool-versions`), but `erl` on `PATH` is OTP **29**: the umbrella build aborts in a dependency NIF (`:ezstd`) whose makefile generates `env.mk` via `erl -noshell -s init stop -eval …`, an idiom OTP 29 no longer evaluates, so `mix compile` fails with `No rule to make target '…/env.mk'`. The workload detects the OTP-version gate and reports the precise skip instead of a meaningless wall time; **no number is fabricated.** |
-| `plb` (default resolution) | **`failed(plb-build-failed)`** | The driver's store scan resolves `dotnet-sdk-8.0.425`, while PLB targets **.NET 9**: `dotnet --task build` fails with `NETSDK1045: The current .NET SDK does not support targeting .NET 9.0`. With the .NET 9 SDK forced via `BENCH_TOOL_PATH` it **runs** and yields numbers (§4.4) — the row is `failed`, never a fake number. |
 | all 6 `sys-only` workloads scheduled under `rust` | `skipped(runtime-unsupported)` | The Rust runtime is not an OTP release host: it cannot run `rebar3`/bootstrap an OTP release, act as `erlc`/`elixirc`, or boot the Cowboy release. `Runtimes::SysOnly` in the harness gates this before any probe. |
+
+No `sys-only` workload fails on a *tool* any more: `plb` runs at the default resolution (§4.4), and `khepri` runs with `rebar3` found by the same store scan (§4.3).
 
 ## 6. Reproducibility, stability and known measurement caveats
 
@@ -284,20 +286,19 @@ The probe is a BIF-free module that builds a fresh 1000-element list (16 kB of g
 
 Every figure below is quoted from the committed artifacts: `m4-*` (2026-10-08, load 4.77 → 11.59) and `m5-*` (2026-10-09, load 90–153). **The load difference dominates the absolute numbers**, so each row states whether the move is code-attributable or load-attributable.
 
-**No code-attributable regression was found.** Every absolute-metric decrease vs `m4` (compiler throughput, cowboy throughput, khepri wall, the startup p99s) is attributable to the 10–25× higher host load; the only new failure mode is `plb`'s default tool resolution (below), which affects a path that produced no number in either run.
+**No code-attributable regression was found.** Every absolute-metric decrease vs `m4` (compiler throughput, cowboy throughput, khepri wall, the startup p99s) is attributable to the 10–25× higher host load.
 
 **Improvements (code-attributable):**
 
 * **`khepri` activates with no `PATH` prefix.** `m4`: `rebar3` had to be found by prepending its Nix-store `bin` dir to `PATH`. `m5`: the driver's store scan resolves `rebar3` 3.27.1 automatically (§4.3). Wall 76 503.14 ms → 98 436.55 ms (load), but the activation requirement is gone.
-* **`plb` can now produce a number.** `m4` best case was `failed(plb-tool-failed)` (no number, even with .NET 9 on `PATH`); `m5` with the .NET 9 SDK forced runs the build **and** the bench stage → real metrics (§4.4). (The *default* resolution still fails — see the behavior change below.)
+* **`plb` runs by default and yields real numbers.** `m4` best case was `failed(plb-tool-failed)` (no number, even with .NET 9 on `PATH`); before this fix the `m5` default resolution picked **.NET 8.0.425** — the store entry whose random hash prefix happened to sort greatest — so the build died on `NETSDK1045` and only a forced `BENCH_TOOL_PATH` made PLB run. The scan now ranks entries by the **parsed version** in the entry name, so the default resolution selects the newest installed SDK, **9.0.318**, and the `.NET 9` build succeeds: `ok`, build stage 29 162 ms, `test_time_ms` p50 728.10 ms, `test_mem_bytes` 91 942 912 B (§4.4, `results/m5-bench-plb.json`).
 * **`emqx` reports a precise blocker.** `m4`: `skipped(not-a-rebar3-project)`. `m5`: `skipped(emqx-requires-otp-28)` with the exact mechanism (the `:ezstd` `env.mk` make-target fails under OTP 29) — still no number, but the reason is now the real one.
 * **`slice` rust per-process peak RSS improved.** Whole-workload rust 39 096 320 B (37.3 MiB, `m4`) → 26 619 904 B (25.4 MiB, `m5` `xrun`); the heaviest case `string_str_length` 36.9 → 25.1 MiB. (Sys unchanged ~66 MiB.)
 * **`baseline` rust peak RSS improved slightly.** 35 008 512 B (33.4 MiB, `m4`) → 30 535 680 B (29.1 MiB, `m5`).
 * **`baseline` rust compute-loop robustness.** `compute_ops_per_sec` rust 5 036 960 (`m4`) → 3 035 587 (`m5` primary) / 2 065 328 (`m5` xrun); sys 4 888 889 → 1 067 224 / 2 725 003. Both fell with load, but the rust/sys ratio moved from 1.03× to **2.8× / 0.76×** — rust is the more contention-robust side.
+**Superseded, kept for the archive:**
 
-**Behavior change (neither the `m4` nor the `m5` default produced a PLB number):**
-
-* **`plb`'s default resolution now fails at the build stage.** `m4` default was `skipped(dotnet-absent)`; `m5` default (the store scan) resolves **.NET 8.0.425** and fails at the **build** stage with `NETSDK1045` (`failed(plb-build-failed)`, §5). The store also holds a 9.0.318 SDK, so the scan is picking a version that cannot build PLB's .NET-9 target — hence the §2 `BENCH_TOOL_PATH` override is what makes PLB run (§4.4). **Not fixed here — the driver's tool-resolution ordering is outside this task's edit scope.**
+* **`plb`'s default resolution used to fail at the build stage.** The `m5` **primary full run** row (`failed(plb-build-failed)`, `results/m5-bench-full-runtimes-all.json`) was measured before the store scan became version-aware: it resolved **.NET 8.0.425**, while PLB targets **.NET 9**, so `dotnet --task build` died with `NETSDK1045`. That row is left as measured; the current default resolution picks **9.0.318** and the workload runs (§4.4, `results/m5-bench-plb.json`).
 
 **Not a regression / not a reproducible change (load-attributable):**
 
@@ -324,7 +325,8 @@ Every figure below is quoted from the committed artifacts: `m4-*` (2026-10-08, l
 | `results/m5-bench-full-runtimes-all.json` | **primary full run**: `--full --runtime all`, all 10 workloads × both runtimes (host load 130.32 → 90.41) — the source of §3.6, §4.1–4.3, §5 |
 | `results/m5-bench-xrun.json` | focused cross-runtime run: `--full --runtime all --workloads baseline,slice,foreign,list_walk` (host load 118.13 → 101.17) — the source of §3.1–3.5 |
 | `results/m5-compare-cross-runtime.txt` | `bench compare` — sys vs rust inside `m5-bench-xrun.json` (47 numeric rows; the tool diffs the **mean**) |
-| `results/m5-bench-quick-plb-net9-attempt.json` | PLB with the .NET 9 SDK forced via `BENCH_TOOL_PATH` → `ok` with real metrics (§4.4) |
+| `results/m5-bench-plb.json` | **PLB at the default tool resolution** (`--quick --runtime sys --workloads plb`, host load 63.61 → 42.43): `ok` with real metrics (§4.4) — the current state |
+| `results/m5-bench-quick-plb-net9-attempt.json` | PLB with the .NET 9 SDK forced via `BENCH_TOOL_PATH` → `ok`; superseded by the default-resolution run above (§4.4) |
 | `results/m4-*` | the **previous** run (2026-10-08, load 4.77 → 11.59): primary `m4-bench-full-runtimes-all.json`, the three xruns, the compiler/cowboy/khepri runs, the PLB attempt, and the three `m4-compare-*.txt` diffs — kept as the regression baseline for §7 |
 
 The archived copies are the harness output except for two mechanical normalisations that strip environment-specific absolute paths: the run-host worktree prefix in `runtimes[].program` is replaced with the workspace-relative `erts_rust/target/release/beam_rt`, and a scratch `$TMPDIR` prefix in `notes` is replaced with `$TMPDIR/`. **No metric value is altered.**
