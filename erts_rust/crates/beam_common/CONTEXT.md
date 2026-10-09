@@ -141,6 +141,7 @@ needs) a canonical owner **outside** `beam_common`; adopters listed — **none e
     rejection of malformed input (`ParseVersionError`).
   - `config`: `Default` values, `Flavor` parse/`as_str`, `FeatureFlags::for_flavor`, builder setters,
     `LogLevel` parse + ordering.
+  - `constants`: `CONTEXT_REDS == 4000` (the frozen `erl_vm.h:47` value).
   - `logging`: level round-trip (`set_level`/`level`/`enabled`); `init_from_env` default when unset.
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_common` GREEN.
   Full-workspace `cargo test --workspace` must stay green as dependents land.
