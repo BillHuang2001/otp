@@ -50,7 +50,7 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 | `+Q N` | max port count (`legacy`, or `1024..=134217727`), preserved verbatim |
 | `+K true\|false` | kernel-poll switch, preserved verbatim |
 | `+sbt TYPE` | scheduler bind type (`u`/`db`/`s`/`ps`/`ts`/`tnnps`/`nnps`/`nnts`/`ns`), preserved verbatim |
-| `+M*` / `+MM*` / `+MB*` | ERTS allocator flags: `+M*` is an emulator flag (validated against the `erl_alloc.c` grammar, preserved verbatim in `extra_emulator_flags`); a user `-M*` is an ordinary unknown `-flag` (recorded as `init:get_argument(NAME)`, its value consumed) |
+| `+M*` / `+MM*` / `+MB*` | ERTS allocator flags: `+M*` is an emulator flag — validated against the `erl_alloc.c` grammar and then **discarded** (`../cli.rs`'s allocator arm calls only `flags::parse_allocator`; it does **not** call `Builder::preserve`, so nothing reaches `extra_emulator_flags`, and no init argument is recorded); a user `-M*` is an ordinary unknown `-flag` (recorded as `init:get_argument(NAME)`, its value consumed) |
 | `+hms N` / `+hmbs N` / `+hmax N` / `+hmaxk\|el\|ib B` | GC heap policy (`beam_gc::HeapPolicy`), rounded through the growth table; visible in `garbage_collection` |
 | `run <file.beam> <mod>:<func>/<arity> [arg…]` | the vertical slice: load the file, run, print the result |
 An unmodeled `-FLAG`/`+FLAG` is **data, not a usage error** (it is preserved, and a `-`-flag is recorded); only a **stray positional argument** (outside `run`) is a usage error (exit 2).
