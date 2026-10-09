@@ -93,9 +93,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `prev` return `Option` (`None` = `'$end_of_table'`). Unless noted an op takes `atoms: &AtomTable`;
   the select/match family and the element updates also take `heap: &mut Heap` (scratch space).
 - **Metadata:** `id`, `kind`, `name() -> Option<Atom>` (Some iff a name was recorded), `keypos()`
-  (1-based), `access`, `owner()/set_owner()`, `heir() -> Option<Heir>` / `set_heir()` / `heir_data()`,
-  `give_away(caller, new_owner)`, `setopts(caller, SetOpt)`, `owner_died(dead, is_alive) ->
-  OwnerDeath`, `info() -> TableInfo`, `rename(name, is_taken) -> Result<RenameOutcome>`.
+  (1-based), `access`, `is_named_table() -> bool`, `owner()/set_owner()`, `heir() -> Option<Heir>` /
+  `set_heir()` / `heir_data()`, `give_away(caller, new_owner)`, `setopts(caller, SetOpt)`,
+  `set_access(&mut self, access: Access)` (post-creation protection change), `owner_died(dead, is_alive)
+  -> OwnerDeath`, `info() -> TableInfo`, `rename(name, is_taken) -> Result<RenameOutcome>`.
 - **Writes** (object = the whole tuple; key from `keypos`): `insert` (upsert), `insert_new -> bool`,
   `insert_list(&[object])` (**ATOMIC** — validates and deep-copies the whole list first), `delete(key)`,
   `delete_object(object)`, `delete_all_objects()`.
