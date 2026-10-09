@@ -50,7 +50,11 @@ The precise symbols of `driver.rs`:
   `beam_io::Driver::control`'s no-reply default is used, and `erlang:port_control/3` raises
   `unsupported: erlang:port_control/3` (registered in `../error.rs`'s `KNOWN_UNIMPLEMENTED_ERLANG_BIFS`).
 - `driver_async` keeps the `DriverHost` default `-1` (no async pool; `Runtime` is `!Send`).
-- `driver_send_term`'s term is captured in `DriverPort::sent`, never delivered.
+- A queued `TermQueue` entry carries no sending-port identity (the C stamps `from = prt->common.id`).
+- **A driver-emitted term is queued but not delivered**: no consumer drains `TermQueue` yet, because
+  reaching it needs a `beam_io::Port` accessor for its `Box<dyn Driver>` (or the `beam_rt`-side handle
+  seized at `open_port/2`) plus a delivery point in `src/port.rs`/`src/runtime.rs` — both outside this
+  node.
 - `ERL_DRV_USE` is accepted but its `stop_select` callback never fires.
 - `take_exit_status` is always `Ok(None)` — a driver port owns no child, so no `{Port,{exit_status,…}}`.
 - A driver that armed **more than one** registration per direction is a typed `unsupported`
