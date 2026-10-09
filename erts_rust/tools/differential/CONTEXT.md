@@ -153,7 +153,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 | A.8 | 64 | 64 | 0 | 0 | 0 |
 | A.9 | 155 | 154 | 0 | 1 | 0 |
 
-- **The 9 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so each flips to `agree` automatically once its gap closes:
+- **The 10 `unsupported` cases (honest capability gaps, not mismatches).** Each golden is the oracle's own output, so each flips to `agree` automatically once its gap closes:
   - **`local_fun`:** `wire/new_fun_ext_encode` (A.5, `beam_rt: unsupported: local_fun`) — a lambda is an evaluator closure that the `beam_rt` `-eval` path cannot give a faithful `NEW_FUN_EXT` image. `beam_codec` has `Encoder::with_fun_identity`; the remaining blocker is runtime wiring (`beam_rt`).
   - **The boot chain's blocked seam (A.9):** `boot/proc_lib_start_link_blocks_the_boot_path` (`beam_rt: unsupported: opcode: run: process blocked (no message available)`) — the real `bootstrap/bin/start.boot` chain's `{kernelProcess, application_controller, {application_controller,start}}` directive is reached through `proc_lib:start_link/4`, whose cross-module `proc_lib:sync_start/2` `receive` the engine folds into a typed `blocked` gap (a cross-module `call_ext` boundary cannot suspend the process). The oracle answers the same shape; it flips to `agree` when the external-call boundary becomes blocking-aware.
   - **`erlang:statistics/1` counters (A.7, `proc_signals/statistics_*_unsupported`):** `reductions`, `runtime`, `context_switches`, `io` and `scheduler_wall_time` — the runtime serves only `wall_clock` and raises `beam_rt: unsupported: erlang:statistics/1: the \`<key>\` counter is not implemented` (exit 3).
