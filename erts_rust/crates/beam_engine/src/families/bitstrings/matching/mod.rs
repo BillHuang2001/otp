@@ -75,7 +75,7 @@ mod reads;
 #[allow(unused_imports)]
 pub(crate) use commands::{cmd_at, ensure_at_least, run_commands};
 #[allow(unused_imports)]
-pub(crate) use match_ctx::{enter_match, position_of, read_ctx, resolve_match4_fail};
+pub(crate) use match_ctx::{enter_match, position_of, read_ctx, reread_ctx, resolve_match4_fail};
 #[allow(unused_imports)]
 pub(crate) use reads::{
     bit_at, bits_equal, decode_utf16, decode_utf32, decode_utf8, f16_to_f32, read_float_field,
@@ -197,7 +197,7 @@ pub(super) fn exec(
                 flags,
                 dst,
             } = &**b;
-            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
+            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
             let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
@@ -208,6 +208,11 @@ pub(super) fn exec(
             let bytes = raw::subject_bytes(orig)?;
             let value = read_integer_field(machine, ctx, bytes, start, nbits, *flags)?;
             write_operand(machine, dst, value)?;
+            // `read_integer_field` allocates (a bignum) through the rooted seam, so a
+            // moving collector may have relocated the context read above: re-read the
+            // context operand before committing the new position (the frozen
+            // reserve, then read, then write ordering).
+            let term = reread_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
             raw::set_ctx_start(term, start + nbits);
             Ok(Some(Step::Next))
         }
@@ -221,7 +226,7 @@ pub(super) fn exec(
                 flags: _,
                 dst,
             } = &**b;
-            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
+            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
             let remaining = end.saturating_sub(start);
             let nbits = if is_all(module, size) {
                 remaining
@@ -239,6 +244,10 @@ pub(super) fn exec(
             let out = extract_bits(bytes, start, nbits)?;
             let value = raw::make_bits(machine, ctx, &out, nbits)?;
             write_operand(machine, dst, value)?;
+            // `raw::make_bits` reserves through the rooted seam, so a moving collector
+            // may have relocated the context read above: re-read the context operand
+            // before committing the new position (reserve, then read, then write).
+            let term = reread_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
             raw::set_ctx_start(term, start + nbits);
             Ok(Some(Step::Next))
         }
@@ -306,7 +315,7 @@ pub(super) fn exec(
                 flags,
                 dst,
             } = &**b;
-            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
+            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
             let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
                 return fail_step(machine, module, labels, *fail, ctx_op, ctx);
@@ -318,6 +327,10 @@ pub(super) fn exec(
             let value = read_float_field(bytes, start, nbits, *flags)?;
             let float = crate::terms::make_float(machine, ctx, value)?;
             write_operand(machine, dst, float)?;
+            // `make_float` reserves through the rooted seam, so a moving collector may
+            // have relocated the context read above: re-read the context operand
+            // before committing the new position (reserve, then read, then write).
+            let term = reread_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
             raw::set_ctx_start(term, start + nbits);
             Ok(Some(Step::Next))
         }
