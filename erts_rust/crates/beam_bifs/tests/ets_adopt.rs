@@ -537,3 +537,90 @@ fn folds_without_a_fun_caller_are_a_typed_gap() {
         assert_unsupported(err);
     }
 }
+
+// -------------------------------------------------------- owner→handle roster
+
+/// The runtime's reclamation seam, reached through the **public** registry API: a
+/// dead owner's tables are enumerated with `handles_owned_by` (keyed by
+/// `owner_of`, the lossless pid→owner bridge) and dropped through the existing
+/// `remove`/`remove_name` path.
+///
+/// An **unnamed** table's handle is not derivable from any public term, so this
+/// roster is the only way a host can enumerate it — the adoption gap the runtime's
+/// owner-death reclamation needed closed.
+#[test]
+fn the_owner_roster_lists_a_pids_handles_ascending() {
+    let bifs = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut tables = TableRegistry::new();
+    let alpha = self_pid();
+    let beta = ProcessId::new(2, 7);
+
+    // Alpha owns one unnamed table and one `named_table`; beta owns one unnamed
+    // table. Each `ets:new/2` runs as the creating process's own pid, so the
+    // registry key is set per context.
+    let named_term = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, alpha).with_tables(&mut tables);
+        new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
+        new_table(&bifs, &mut ctx, "ntab", &["named_table", "set"]).expect("ets:new")
+    };
+    {
+        let mut ctx = BifContext::new(&mut heap, &atoms, beta).with_tables(&mut tables);
+        new_table(&bifs, &mut ctx, "justname", &["set"]).expect("ets:new");
+    }
+    // The named table's handle *is* its registered name's target.
+    let named_handle = tables
+        .lookup_name(atom_val(named_term))
+        .expect("the named table is registered");
+
+    let alpha_roster = tables.handles_owned_by(TableRegistry::owner_of(alpha));
+    let beta_roster = tables.handles_owned_by(TableRegistry::owner_of(beta));
+
+    assert_eq!(alpha_roster.len(), 2, "alpha owns two tables: {alpha_roster:?}");
+    assert_eq!(beta_roster.len(), 1, "beta owns one table: {beta_roster:?}");
+    assert!(
+        alpha_roster.contains(&named_handle),
+        "the named table's handle is listed: {alpha_roster:?} vs {named_handle}"
+    );
+    assert!(
+        alpha_roster.windows(2).all(|pair| pair[0] < pair[1]),
+        "ascending by handle: {alpha_roster:?}"
+    );
+    assert!(
+        alpha_roster.iter().all(|handle| !beta_roster.contains(handle)),
+        "the two owners' rosters are disjoint"
+    );
+
+    // Every listed handle names a live table, so each can be dropped (the
+    // runtime's withdrawal) through the existing removal path.
+    let dead = alpha_roster.clone();
+    for handle in &dead {
+        assert!(
+            tables.get(*handle).is_some(),
+            "handle {handle} names a live table"
+        );
+    }
+    for handle in dead {
+        tables.remove(handle);
+    }
+    tables.remove_name(atom_val(named_term));
+    assert!(
+        tables.handles_owned_by(TableRegistry::owner_of(alpha)).is_empty(),
+        "the withdrawn tables leave the roster"
+    );
+
+    // A pid that owns nothing gets an empty roster.
+    assert!(tables
+        .handles_owned_by(TableRegistry::owner_of(ProcessId::new(3, 9)))
+        .is_empty());
+
+    // `owner_of` is lossless: the raw owner id is the pid immediate, exactly what
+    // `ets:new/2` recorded (and what `beam_rt`'s own `owner_key` computes).
+    for pid in [alpha, beta, ProcessId::new(3, 9)] {
+        assert_eq!(
+            TableRegistry::owner_of(pid).raw(),
+            pid.to_eterm().raw() as u64
+        );
+    }
+}

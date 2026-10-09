@@ -105,4 +105,34 @@ mod tests {
             other => panic!("expected unsupported_bif, got {other:?}"),
         }
     }
+
+    /// The per-family key counts this module's `CONTEXT.md` states, pinned against the
+    /// actual registrations: `77 + 56 + 18 + 44 = 195` `RuntimeHooks` seam keys, plus the
+    /// 2 `MemoryHook` (`erlang:memory/0,1`), 13 `atomics`/`counters` and 1 `ddll` real keys
+    /// — **211** registered under `runtime/`. A family that drifts must update the doc.
+    #[test]
+    fn the_family_key_counts_are_pinned() {
+        fn count(register: fn(&mut BifRegistry)) -> usize {
+            let mut reg = BifRegistry::new();
+            register(&mut reg);
+            reg.len()
+        }
+        assert_eq!(count(super::erlang::register), 77, "runtime/erlang.rs");
+        assert_eq!(
+            count(super::erts_internal::register),
+            56,
+            "runtime/erts_internal.rs"
+        );
+        assert_eq!(count(super::erts_debug::register), 18, "runtime/erts_debug.rs");
+        assert_eq!(count(super::other::register), 44, "runtime/other.rs");
+        assert_eq!(count(super::memory::register), 2, "runtime/memory.rs");
+        assert_eq!(count(super::atomics::register), 13, "runtime/atomics.rs");
+        assert_eq!(count(super::ddll::register), 1, "runtime/ddll.rs");
+
+        let seam = 77 + 56 + 18 + 44;
+        assert_eq!(seam, 195, "the RuntimeHooks seam roster");
+        let mut all = BifRegistry::new();
+        super::register(&mut all);
+        assert_eq!(all.len(), seam + 2 + 13 + 1, "211 runtime-coupled keys");
+    }
 }

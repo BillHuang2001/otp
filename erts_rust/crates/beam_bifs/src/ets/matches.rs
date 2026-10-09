@@ -71,7 +71,7 @@
 //! and leaves the table — and an unconsumed continuation — in place.
 
 use beam_common::Result;
-use beam_ets::{compile, Table};
+use beam_ets::compile;
 use beam_term::Eterm;
 
 use super::{
@@ -129,7 +129,7 @@ fn match_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let outcome = table.match_limit(args[1], limit, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
     let (results, cont) = outcome?;
-    finish_chunk(ctx, handle, results, cont)
+    finish_chunk(ctx, handle, results, cont, false)
 }
 
 /// `ets:match(Continuation)` — resumes a [`match_3`] traversal.
@@ -137,9 +137,14 @@ fn match_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// The oracle accepts *any* continuation ref here, including one produced by
 /// `ets:select/3` (verified: `ets:match(SelectContinuation)` resumes it and returns
 /// the spec's own body values), which falls out of the continuation carrying its
-/// compiled spec.
+/// compiled spec. `Table::match_continue` resumes the stored direction, so a
+/// reverse `ets:select_reverse/3` continuation handed here walks backward like the
+/// oracle (the direction parameter is threaded through to [`finish_chunk`] so a
+/// minted follow-up chunk keeps it).
 fn match_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    resume_continuation(ctx, args[0], Table::match_continue)
+    resume_continuation(ctx, args[0], |table, cont, _reverse, atoms, heap| {
+        table.match_continue(cont, atoms, heap)
+    })
 }
 
 // ------------------------------------------------------------- match_object
@@ -163,12 +168,14 @@ fn match_object_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let outcome = table.match_object_limit(args[1], limit, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
     let (results, cont) = outcome?;
-    finish_chunk(ctx, handle, results, cont)
+    finish_chunk(ctx, handle, results, cont, false)
 }
 
 /// `ets:match_object(Continuation)` — resumes a [`match_object_3`] traversal.
 fn match_object_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    resume_continuation(ctx, args[0], Table::match_object_continue)
+    resume_continuation(ctx, args[0], |table, cont, _reverse, atoms, heap| {
+        table.match_object_continue(cont, atoms, heap)
+    })
 }
 
 // --------------------------------------------------------- count and delete

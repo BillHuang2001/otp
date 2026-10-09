@@ -124,12 +124,24 @@ mod tests {
         super::register(&mut reg);
         assert!(reg.contains("re", "run", 3));
         assert!(reg.contains("ets", "slot", 2));
+        // `os:set_signal/2`'s home is *this* file (`src/runtime/other.rs`), not
+        // `src/os_bif.rs`; it is a seam key answering the typed gap with no provider
+        // (see the module `CONTEXT.md`).
+        assert!(reg.contains("os", "set_signal", 2));
 
         let mut heap = Heap::new(8).expect("test heap");
         let atoms = AtomTable::new();
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         let args = vec![ctx.int(0).expect("small int"); 3];
         match reg.call("re", "run", 3, &mut ctx, &args) {
+            Err(beam_common::BeamError::Raise(r)) => {
+                assert_eq!(r.reason, beam_common::ExitReason::atom("unsupported_bif"));
+            }
+            other => panic!("expected unsupported_bif, got {other:?}"),
+        }
+
+        let args = vec![ctx.int(0).expect("small int"); 2];
+        match reg.call("os", "set_signal", 2, &mut ctx, &args) {
             Err(beam_common::BeamError::Raise(r)) => {
                 assert_eq!(r.reason, beam_common::ExitReason::atom("unsupported_bif"));
             }

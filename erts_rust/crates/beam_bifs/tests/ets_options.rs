@@ -43,6 +43,8 @@ use beam_common::BeamError;
 use beam_process::ProcessId;
 use beam_term::{atom_val, signed_value, AtomTable, Eterm};
 
+use std::process::Command;
+
 /// The atom names the `ets:new/2` option parser, the `ets:info/2` field set and
 /// the destructuring helpers need.
 ///
@@ -920,6 +922,142 @@ fn a_deleted_table_leaves_no_profile_behind() {
     let live = ctx.tables().expect("a registry is installed").len();
     assert_eq!(live, 0, "the table is gone from the registry");
 }
+// ------------------------------------------------------ creation-time heir
+
+/// Runs one `-eval` statement under the system `erl`; `None` when the oracle is
+/// unavailable (the test then skips loudly — the `tests/ets_nav.rs` pattern).
+fn oracle_eval(statement: &str) -> Option<String> {
+    let output = Command::new("erl")
+        .args(["-noshell", "-eval", statement, "-s", "init", "stop"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(out) => {
+            eprintln!(
+                "SKIP: the oracle `erl` failed ({}); stderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!("SKIP: no `erl` oracle on PATH ({err})");
+            None
+        }
+    }
+}
+
+/// The oracle — a **creation-time** `{heir, …}` option installs the heir exactly
+/// as the `ets:setopts/2` form does, and the arity is invisible through
+/// `ets:info(T, heir)`:
+/// ```text
+/// 1> P = self(),
+///    T1 = ets:new(t1,[set,{heir,P}]), T2 = ets:new(t2,[set,{heir,P,42}]),
+///    T3 = ets:new(t3,[set,{heir,none}]), T4 = ets:new(t4,[set]),
+///    {ets:info(T1,heir) =:= P, ets:info(T2,heir) =:= P,
+///     ets:info(T3,heir), ets:info(T4,heir)}.
+/// {true,true,none,none}
+/// ```
+///
+/// ## What the arity changes (not observable through `info/2`)
+///
+/// The difference between `{heir, Pid}` (arity 2) and `{heir, Pid, Data}`
+/// (arity 3) is a *lifetime* fact, not an `info` one: on the owner's death the
+/// arity-3 heir receives `{'ETS-TRANSFER', Tid, FromPid, Data}` while the arity-2
+/// heir inherits in **silence**. It is held in the table's own
+/// [`beam_ets::Heir`], whose `data` is `Some(term)` for arity 3 and `None` for
+/// arity 2 (the C's `THE_NON_VALUE`) — asserted below through the registry's
+/// public `get` + `Table::heir`.
+#[test]
+fn a_creation_time_heir_is_installed_and_reported() {
+    let bifs = default_registry();
+    let (mut heap, atoms, mut tables) = parts();
+    let pid = ProcessId::new(1, 0);
+    let pid_term = pid.to_eterm();
+
+    // Create the three heir forms; each `ets:new/2` records `pid` as the owner, so
+    // the table's handle is reachable through the public owner roster afterwards.
+    let (with_pid, with_data, without) = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, pid).with_tables(&mut tables);
+        let set = bare(&mut ctx, "set");
+        let none = ctx.atom("none").expect("seeded");
+        let forty_two = ctx.int(42).expect("fits");
+        let heir_pid = pair(&mut ctx, "heir", pid_term);
+        let heir_pid_data = triple(&mut ctx, "heir", pid_term, forty_two);
+        let heir_none = pair(&mut ctx, "heir", none);
+        (
+            ets_new_ok(&bifs, &mut ctx, "t", &[set, heir_pid]),
+            ets_new_ok(&bifs, &mut ctx, "t", &[set, heir_pid_data]),
+            ets_new_ok(&bifs, &mut ctx, "t", &[set, heir_none]),
+        )
+    };
+
+    // `ets:info(T, heir)` reports the installed pid for both arity-2 and arity-3,
+    // and `none` for `{heir, none}` — the oracle's `{true, true, none}`.
+    {
+        let mut ctx = BifContext::new(&mut heap, &atoms, pid).with_tables(&mut tables);
+        for handle in [with_pid, with_data] {
+            let heir = ets_info2(&bifs, &mut ctx, handle, "heir").expect("info/2 heir");
+            assert_eq!(
+                heir, pid_term,
+                "a creation-time heir is reported as the pid: {heir:?}"
+            );
+        }
+        let none_heir = ets_info2(&bifs, &mut ctx, without, "heir").expect("info/2 heir");
+        assert!(
+            is_atom_named(&atoms, none_heir, "none"),
+            "{{heir, none}} installs no heir: {none_heir:?}"
+        );
+    }
+
+    // The arity distinction lives in the table's own `Heir`: the `{heir, none}`
+    // table holds **no** heir, the `{heir, Pid}` table holds one with no gift data,
+    // and the `{heir, Pid, Data}` table holds one carrying `42`.
+    let owned = tables.handles_owned_by(TableRegistry::owner_of(pid));
+    assert_eq!(owned.len(), 3, "the roster lists the three creations");
+    let mut heirs: Vec<Option<Option<i64>>> = owned
+        .iter()
+        .map(|handle| {
+            tables.get(*handle).expect("a live table").heir().map(|heir| {
+                assert_eq!(
+                    heir.owner,
+                    TableRegistry::owner_of(pid),
+                    "the heir is the pid the option named"
+                );
+                heir.data.map(signed_value)
+            })
+        })
+        .collect();
+    heirs.sort_unstable();
+    assert_eq!(
+        heirs,
+        vec![None, Some(None), Some(Some(42))],
+        "`{{heir, none}}` installs none; `{{heir, Pid}}` holds no gift data; \
+         `{{heir, Pid, 42}}` holds it"
+    );
+
+    // Live oracle cross-check of the pinned golden.
+    let statement = concat!(
+        "P = self(), ",
+        "T1 = ets:new(opt_heir_pid, [set, {heir, P}]), ",
+        "T2 = ets:new(opt_heir_data, [set, {heir, P, 42}]), ",
+        "T3 = ets:new(opt_heir_none, [set, {heir, none}]), ",
+        "T4 = ets:new(opt_heir_default, [set]), ",
+        "io:format(\"~w~n\", [{",
+        "ets:info(T1, heir) =:= P, ets:info(T2, heir) =:= P, ",
+        "ets:info(T3, heir), ets:info(T4, heir)}])"
+    );
+    let Some(actual) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        actual, "{true,true,none,none}",
+        "the live oracle disagrees with the pinned golden"
+    );
+}
+
 // ------------------------------------------------------------- return shape
 
 /// The oracle:
