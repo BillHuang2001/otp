@@ -1992,7 +1992,7 @@ fn operator_bif(op: BinOp) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use beam_term::{atom_val, is_small, signed_value};
+    use beam_term::{atom_val, is_immediate, is_small, signed_value};
 
     use super::*;
     use crate::config::RuntimeConfig;
@@ -2004,11 +2004,21 @@ mod tests {
     /// only usable while it is a **fixed immediate** (a small integer or an atom).
     /// A heap-allocated result (a float, list, tuple, binary, …) would dangle;
     /// such tests drive `RuntimeContext` directly so the runtime outlives the term.
+    ///
+    /// [`is_immediate`] enforces that contract instead of relying on the comment: a
+    /// heap-allocated result would otherwise survive as a dangling pointer and become an
+    /// intermittent SIGSEGV in a later read (which is exactly how it presented).
     fn run(expr: &str) -> Result<Eterm> {
         let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
         let mut sink = beam_bifs::NullSink;
         let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
-        eval(&mut ctx, expr)
+        let value = eval(&mut ctx, expr)?;
+        assert!(
+            is_immediate(value),
+            "{expr}: a heap-allocated result cannot outlive this helper's runtime (it is \
+             dropped on return) — evaluate it through a local `RuntimeContext` instead"
+        );
+        Ok(value)
     }
 
     /// Evaluates `expr` and asserts the result is the small integer `expected`.
@@ -2099,7 +2109,13 @@ mod tests {
         atom("not false", "true");
         atom("true xor true", "false");
         // `++` builds a list (`[1,2] ++ [3]` is `[1,2,3]`), so assert the list, not a scalar.
-        let concatenated = run("[1,2] ++ [3]").expect("[1,2] ++ [3]");
+        // The result is heap-allocated, so the runtime must outlive it — drive the
+        // `RuntimeContext` directly (see `run`) rather than letting it escape `run`, which
+        // drops its runtime (and heap) before returning.
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let concatenated = eval(&mut ctx, "[1,2] ++ [3]").expect("[1,2] ++ [3]");
         let elements = terms::list_elements(concatenated).expect("a list");
         assert_eq!(elements.len(), 3);
         assert_eq!(elements[2], make_small(3));
