@@ -362,11 +362,27 @@ fn stdlib_proplists_lookup_all_and_get_bool() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn skip_reason_and_stdlib_ebin_agree() {
-    // A cheap consistency check: whenever a skip reason exists, `stdlib_ebin`
-    // must be `None`, and vice versa — so the skip guard never masks a usable
-    // stdlib.
-    assert_eq!(skip_reason().is_some(), stdlib_ebin().is_none());
+fn the_located_stdlib_is_a_usable_stdlib() {
+    // A genuinely independent check of the skip guard's *input*: when the locator
+    // claims a stdlib, that directory must actually hold the real `lists.beam` the
+    // suites above load — so `skip_reason() == None` (no skip) can never mask a
+    // directory that is not a usable stdlib. (The former
+    // `skip_reason().is_some() == stdlib_ebin().is_none()` comparison was a
+    // definitional tautology: `skip_reason` is literally `stdlib_ebin().is_none()`.)
+    let Some(dir) = stdlib_ebin() else {
+        // No locatable stdlib at all: a genuine absent-optional-dependency skip.
+        eprintln!("{}", skip_reason().unwrap_or_default());
+        return;
+    };
+    assert!(
+        dir.join("lists.beam").is_file(),
+        "the located oracle stdlib {dir:?} must hold the real `lists.beam` the \
+         stdlib suites load"
+    );
+    assert!(
+        skip_reason().is_none(),
+        "a located, usable stdlib must not produce a skip reason"
+    );
 }
 
 #[test]
