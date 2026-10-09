@@ -58,6 +58,29 @@ const TAG_U: u8 = 0;
 /// value or one wider than a machine word (`beam_file.c:228-231`).
 const TAG_I: u8 = 1;
 
+/// The largest register index a `.beam` operand may name.
+///
+/// `x(N)`/`y(N)` must be below this (`beam_file.c:2335-2338`) and so must a `z,2` float
+/// register (`beam_file.c:2381`); it is the C's `MAX_REG` (`erl_vm.h:49`, "max number of
+/// x(N) registers used").
+const MAX_REG: u64 = 1024;
+
+/// The largest number of `(kind, number)` pairs a `z,3` allocation list may carry.
+///
+/// One entry per allocation kind and there are only four kinds, so the C asserts
+/// `count.word_value <= 4` (`beam_file.c:2241`).
+const MAX_ALLOC_ENTRIES: u64 = 4;
+
+/// The largest `z,3` allocation-list *number*.
+///
+/// The C bounds it by `ERTS_SINT32_MAX / MAX(FLOAT_SIZE_OBJECT, ERL_FUN_SIZE + 1)`
+/// (`beam_file.c:2255-2256`) — `i32::MAX / 3` on the 64-bit emulator — so that the word
+/// total accumulates in a 32-bit signed `Sint` without overflowing.
+const MAX_ALLOC_NUMBER: u64 = (i32::MAX as u64) / 3;
+
+/// The largest `z,3` word total (`sum`) as the C accumulates it: `Sint` heap words, so it
+/// must stay within `ERTS_SINT32_MAX` (`beam_file.c:2261-2274`).
+const MAX_ALLOC_WORDS: u64 = i32::MAX as u64;
 /// One decoded tag/length number: the tag and its magnitude
 /// (`beam_file.c:167-240`, `beamreader_read_tagged`).
 ///
@@ -298,13 +321,20 @@ pub fn decode_stream(
 
         // The operand count comes from the derived table rather than through
         // `Opcode::arity` (a linear scan of the roster) — see [`opcode_arity`]. The
-        // `derived_arity_table_matches_the_roster` unit test pins the two together.
+        // `derived_arity_table_must_match_the_roster` unit test pins the two together.
         let arity = usize::from(opcode_arity(op_byte));
         let mut operands = Vec::with_capacity(arity);
-        for _ in 0..arity {
-            operands.push(decode_operand(&mut r, atoms, types)?);
+        for index in 0..arity {
+            let operand = decode_operand(&mut r, atoms, types)?;
+            // `LoadAssert((i + 1) == arity)` (`beam_file.c:2352`): a `z,1` argument list is
+            // always the instruction's *last* operand (the compiler emits the variadic
+            // operand last, and the C expands it into the trailing argument slots).
+            if index + 1 < arity && matches!(operand, Operand::List(_)) {
+                return Err(bad_file("argument list is not the last operand"));
+            }
+            check_label(&operand, version.label_count)?;
+            operands.push(operand);
         }
-
         instrs.push(RawInstr {
             opcode: op,
             operands,
@@ -375,13 +405,31 @@ pub fn decode_operand(
             Ok(Operand::Atom(atom))
         }
         // `x` — X register.
-        3 => Ok(Operand::X(magnitude as u32)),
-        // `y` — Y register (stack slot).
-        4 => Ok(Operand::Y(magnitude as u32)),
+        //
+        // `raw_arg.word_value < MAX_REG` (`beam_file.c:2335-2338`): a register index at or
+        // above the runtime's register file cannot exist, so it is a malformed image.
+        3 => {
+            if magnitude >= MAX_REG {
+                return Err(bad_file("x register index out of range"));
+            }
+            Ok(Operand::X(magnitude as u32))
+        }
+        // `y` — Y register (stack slot). Same bound as `x` (`beam_file.c:2335-2338`).
+        4 => {
+            if magnitude >= MAX_REG {
+                return Err(bad_file("y register index out of range"));
+            }
+            Ok(Operand::Y(magnitude as u32))
+        }
         // `f` — label; `f,0` is the failure sentinel `NO_FAIL`, kept verbatim.
+        //
+        // The index bound against the chunk's `label_count` needs the `Code` header, so it
+        // is enforced by [`decode_stream`] on the decoded operand.
         5 => Ok(Operand::Label(Label(magnitude as u32))),
-        // `h` — character (defined but never emitted by the compiler).
-        6 => Ok(Operand::Character(magnitude as u32)),
+        // `h` — character (defined but never emitted by the compiler). The C applies no
+        // bound, but the IR field is 32-bit, so a wider value would silently truncate into
+        // a *different* character; reject it instead.
+        6 => Ok(Operand::Character(narrow_u32(magnitude)?)),
         // `z` — extended form; the magnitude is the sub-tag.
         7 => decode_extended(r, magnitude, atoms, types),
         // Tags 8–14 exist only inside the loader and must never appear in a file.
@@ -483,26 +531,50 @@ fn decode_extended(
             }
             Ok(Operand::list(args))
         }
-        // 2 — float register index (`beam_file.c:2388-2395`).
+        // 2 — float register index (`beam_file.c:2388-2395`), bounded by `MAX_REG` exactly
+        // like an `x`/`y` register (`beam_file.c:2381`).
         2 => {
             let index = read_unsigned(r, "float-register index is not unsigned")?;
+            if index >= MAX_REG {
+                return Err(bad_file("float register index out of range"));
+            }
             Ok(Operand::FloatReg(index as u32))
         }
         // 3 — allocation list: a `u` count then that many `(kind, number)` pairs.
         3 => {
             let count = read_unsigned(r, "allocation-list length is not unsigned")?;
+            // `LoadAssert(count.word_value <= 4)` (`beam_file.c:2241`): there are only four
+            // allocation kinds, so a longer list is malformed framing, not a big request.
+            if count > MAX_ALLOC_ENTRIES {
+                return Err(bad_file("allocation list is longer than the four kinds"));
+            }
             let mut entries = Vec::new();
+            // The C accumulates the word total in a `Sint` and refuses to exceed
+            // `ERTS_SINT32_MAX` (`beam_file.c:2243,2261-2274`); mirror that so the sum the
+            // engine reserves cannot wrap.
+            let mut sum: u64 = 0;
             for _ in 0..count {
                 let kind = read_unsigned(r, "allocation kind is not unsigned")?;
                 let number = read_unsigned(r, "allocation count is not unsigned")?;
-                entries.push(allocation_entry(kind, number)?);
+                let entry = allocation_entry(kind, number)?;
+                sum += u64::from(entry.words);
+                if sum > MAX_ALLOC_WORDS {
+                    return Err(beam_common::BeamError::SystemLimit);
+                }
+                entries.push(entry);
             }
             Ok(Operand::alloc(entries))
         }
         // 4 — static literal index into `Module.literals` (`beam_file.c:2400-2417`).
+        //
+        // The C asserts `index.word_value < literals->count` (the file's *static* literal
+        // table, `beam_file.c:2412`). The table size is not known to the decoder, so
+        // [`decode_stream`]'s caller-facing bound lives in `crate::lower::build_module`
+        // (which owns the `LitT` table); here the index is only narrowed to the IR's `u32`
+        // so a wider one cannot silently address a *different* literal.
         4 => {
             let index = read_unsigned(r, "literal index is not unsigned")?;
-            Ok(Operand::Literal(index as u32))
+            Ok(Operand::Literal(narrow_u32(index)?))
         }
         // 5 — `tr`, a register carrying a `Type` chunk index (`beam_file.c:2419-2443`).
         5 => {
@@ -522,13 +594,17 @@ fn decode_extended(
                     Reg::Y(n) => Operand::Y(n),
                 })
             } else {
+                // `LoadAssert(index.word_value < types->count)` (`beam_file.c:2437`): a
+                // `tr` annotation must name a real `Type` chunk entry.
+                if index >= types.entries.len() as u64 {
+                    return Err(bad_file("type index out of range"));
+                }
                 Ok(Operand::Typed {
                     reg,
-                    ty: TypeIndex(index as u32),
+                    ty: TypeIndex(narrow_u32(index)?),
                 })
             }
-        }
-        // 0 — the pre-R16B float byte form; anything else is unassigned.
+        }        // 0 — the pre-R16B float byte form; anything else is unassigned.
         _ => Err(bad_file("unrecognized `z` sub-tag")),
     }
 }
@@ -560,14 +636,19 @@ pub(crate) fn read_unsigned(r: &mut beam_codec::Reader<'_>, msg: &str) -> Result
 /// `RECORD_INST_SIZE(0) = sizeof(ErtsRecordInstance)/sizeof(Eterm)`
 /// (`erl_record.h:73-74`; `ErtsRecordInstance` is `{thing_word, record_definition,
 /// values[]}`). Any other kind is malformed.
+///
+/// `number` is bounded by [`MAX_ALLOC_NUMBER`], the C's `ERTS_SINT32_MAX /
+/// MAX(FLOAT_SIZE_OBJECT, ERL_FUN_SIZE + 1)` (`beam_file.c:2255-2256`); a wider one is a
+/// size limit, not a `badarg`, exactly as before.
 fn allocation_entry(kind: u64, number: u64) -> Result<AllocKind> {
     let words = match kind {
         0 => number,
         1 | 2 | 3 => number.saturating_mul(2),
         _ => return Err(bad_file("invalid allocation-list kind")),
     };
-    // The IR stores 32-bit counts; a wider one is a system limit, not a `badarg`.
-    if number > u64::from(u32::MAX) || words > u64::from(u32::MAX) {
+    // The C keeps its running total in a 32-bit signed `Sint`, so a single element that
+    // already exceeds `i32::MAX / 3` (its per-element bound) is rejected.
+    if number > MAX_ALLOC_NUMBER {
         return Err(beam_common::BeamError::SystemLimit);
     }
     Ok(AllocKind {
@@ -577,7 +658,41 @@ fn allocation_entry(kind: u64, number: u64) -> Result<AllocKind> {
     })
 }
 
-#[cfg(test)]
+/// Narrows an operand magnitude to the IR's 32-bit field, rejecting a wider one.
+///
+/// Several `Operand` fields are `u32` while the wire magnitude is a machine word;
+/// truncating with `as u32` would silently turn an out-of-range index into a *different*
+/// valid one (a wrong result rather than a typed error). The value is a size the IR cannot
+/// represent, so the loader reports [`beam_common::BeamError::SystemLimit`] — the same
+/// class it uses for its other representational bounds.
+fn narrow_u32(value: u64) -> Result<u32> {
+    u32::try_from(value).map_err(|_| beam_common::BeamError::SystemLimit)
+}
+
+/// Rejects a decoded `f` operand that names a label the `Code` chunk does not define.
+///
+/// The C asserts `raw_arg.word_value < code->label_count` for every non-zero `f` operand
+/// (`beam_file.c:2324-2331`); `f,0` is the `NO_FAIL` sentinel and is kept verbatim. A label
+/// operand may also appear inside a `z,1` argument list (`Operand::List`), so the walk
+/// descends into it — the C applies the same check to those slots, because a list's
+/// elements *are* the instruction's trailing operands.
+fn check_label(operand: &Operand, label_count: u32) -> Result<()> {
+    match operand {
+        Operand::Label(label) => {
+            if label.0 != 0 && label.0 >= label_count {
+                return Err(bad_file("label index out of range"));
+            }
+            Ok(())
+        }
+        Operand::List(items) => {
+            for item in items {
+                check_label(item, label_count)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ir::{TestKind, Type};

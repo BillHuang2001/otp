@@ -539,6 +539,25 @@ pub const OPCODE_TABLE: &[(u8, Opcode, &str, u8)] = &[
     (193, Opcode::update_record_id, "update_record_id", 7),
 ];
 
+/// The highest generic opcode this runtime understands.
+///
+/// The last numbered entry in `../../lib/compiler/src/genop.tab`
+/// (`193: update_record_id/7`). The C derives the same value from the very same roster
+/// (`erts/emulator/utils/beam_makeops:1005` emits `#define MAX_GENERIC_OPCODE
+/// $num_file_opcodes-1`) and uses it as *both* the opcode-byte bound
+/// (`beam_file.c:2295`) and the `Code`-header upper bound (`beam_load.c:189-196`).
+/// `opcode_roster_bounds_match_the_table` pins this constant to [`OPCODE_TABLE`].
+pub const MAX_GENERIC_OPCODE: u8 = 193;
+
+/// The lowest `Code`-header `max_opcode` a loadable image may declare.
+///
+/// `swap/2` ([`Opcode::swap`]) — generic opcode 169 (`genop.tab:611`), introduced in OTP 23.
+/// OTP 23-26 set the header's `max_opcode` to exactly this opcode, so a *smaller* value
+/// means the file was produced by OTP 22 or earlier, which the current runtime refuses
+/// (`beam_load.c:197-225`). `opcode_roster_bounds_match_the_table` pins it to
+/// `Opcode::swap.as_u8()`.
+pub const MIN_SUPPORTED_MAX_OPCODE: u8 = 169;
+
 impl Opcode {
     /// Maps a wire opcode byte to its [`Opcode`], or `None` if the byte is not a generic
     /// opcode (i.e. outside `1..=193`).
@@ -766,5 +785,41 @@ impl Opcode {
             .iter()
             .find(|entry| entry.1 == self)
             .expect("OPCODE_TABLE covers every Opcode variant")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The two roster-bound constants [`MAX_GENERIC_OPCODE`] / [`MIN_SUPPORTED_MAX_OPCODE`]
+    //! are derived from the roster, never guessed: these tests pin them to [`OPCODE_TABLE`]
+    //! so a `genop.tab` regeneration that moves either boundary fails here.
+
+    use super::*;
+
+    #[test]
+    fn opcode_roster_bounds_match_the_table() {
+        let highest = OPCODE_TABLE.iter().map(|entry| entry.0).max().unwrap();
+        assert_eq!(
+            MAX_GENERIC_OPCODE, highest,
+            "MAX_GENERIC_OPCODE must be the last numbered genop.tab opcode"
+        );
+        assert_eq!(
+            MIN_SUPPORTED_MAX_OPCODE,
+            Opcode::swap.as_u8(),
+            "the lower header bound is the `swap/2` opcode"
+        );
+    }
+
+    #[test]
+    fn every_numbered_table_row_is_contiguous_from_one() {
+        // `Opcode::from_u8` maps `1..=MAX_GENERIC_OPCODE` exhaustively (a byte above the
+        // roster is rejected by `decode_stream`, and `from_u8(0)` is not an opcode).
+        for byte in 1..=MAX_GENERIC_OPCODE {
+            let opcode = Opcode::from_u8(byte)
+                .unwrap_or_else(|| panic!("byte {byte} has no roster entry"));
+            assert_eq!(opcode.as_u8(), byte, "roster round-trip for byte {byte}");
+        }
+        assert!(Opcode::from_u8(0).is_none());
+        assert!(Opcode::from_u8(MAX_GENERIC_OPCODE + 1).is_none());
     }
 }

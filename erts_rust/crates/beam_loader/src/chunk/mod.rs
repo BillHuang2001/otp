@@ -83,13 +83,18 @@ pub struct Chunks<'a> {
     /// The raw `Attr` chunk bytes, if present.
     pub attributes: Option<Vec<u8>>,
     /// The raw `CInf` chunk bytes, if present.
+    ///
+    /// `CInf` is `term_to_binary(CompileInfo)` (`beam_asm.erl:236,309`); the decoded term
+    /// is materialized by [`crate::lower::build_module`] into
+    /// [`crate::ir::Module::compile_info_term`].
     pub compile_info: Option<Vec<u8>>,
     /// The raw `Meta` chunk bytes, if present.
     ///
-    /// `Meta` is the compiler's feature/CPU metadata (an external term,
-    /// `compile.erl`'s `?META_CHUNK_NAME`). It is not interpreted by the loader (it is
-    /// classified tooling-only — see [`classify`]) but it is part of the module
-    /// checksum (`beam_file.c:1811-1815`), so it is captured raw rather than dropped.
+    /// `Meta` is the compiler's feature/CPU metadata, an external term written by
+    /// `compile.erl` (`?META_CHUNK_NAME`) and passed through `beam_asm.erl:216-224`. It is
+    /// also part of the module checksum (`beam_file.c:1811-1815`), so it is captured raw;
+    /// the decoded term is materialized by [`crate::lower::build_module`] into
+    /// [`crate::ir::Module::meta_term`].
     pub meta: Option<Vec<u8>>,
     /// The `Code` header as the IR's [`CodeVersion`].
     pub code_version: CodeVersion,
@@ -333,18 +338,22 @@ mod tests {
         assert_eq!(chunks.literals, Vec::<Vec<u8>>::new());
         assert!(chunks.attributes.is_some());
         assert!(chunks.compile_info.is_some());
-        // The fixture carries a 45-byte `Meta` chunk, captured raw (tooling-only).
+        // The fixture carries a 45-byte `Meta` chunk, captured raw (and decoded into a
+        // term one layer up — `Module::meta_term`).
         assert_eq!(chunks.meta.as_deref().map(<[u8]>::len), Some(45));
     }
 
     #[test]
     fn missing_atom_chunk_is_rejected() {
-        // A container with only a `Code` chunk.
+        // A container with only a `Code` chunk (with a *valid* header, so the rejection
+        // can only come from the missing `AtU8`).
         let mut body = Vec::new();
         body.extend_from_slice(b"Code");
         body.extend_from_slice(&20u32.to_be_bytes());
         body.extend_from_slice(&16u32.to_be_bytes());
-        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&181u32.to_be_bytes());
+        body.extend_from_slice(&[0u8; 8]);
         let mut image = Vec::new();
         image.extend_from_slice(b"FOR1");
         image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
@@ -368,7 +377,10 @@ mod tests {
         body.extend_from_slice(b"Code");
         body.extend_from_slice(&20u32.to_be_bytes());
         body.extend_from_slice(&16u32.to_be_bytes()); // head_size
-        body.extend_from_slice(&[0u8; 16]); // format/max_opcode/labels/functions
+        body.extend_from_slice(&0u32.to_be_bytes()); // format_number
+        body.extend_from_slice(&181u32.to_be_bytes()); // max_opcode
+        body.extend_from_slice(&0u32.to_be_bytes()); // label_count
+        body.extend_from_slice(&0u32.to_be_bytes()); // function_count
         let mut image = Vec::new();
         image.extend_from_slice(b"FOR1");
         image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
