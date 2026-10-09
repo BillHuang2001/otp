@@ -287,11 +287,18 @@ parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term)
   `beam_codec::compress::decompress`, rejecting a length that disagrees with `uncompressed_size` — and
   parses the **framing** only (raw ETF payloads); `src/literal::LiteralArea` then decodes each payload
   into a term once at load time. Static literals are referenced by `Operand::Literal(idx)`.
-- **`StrT` / `CInf` / `Attr` / `Meta` / `Docs` / `DbgB` / `Dbgi`** — `StrT`/`CInf`/`Meta` are captured
-  raw (`StrT` → bytes, `CInf`/`Meta` → `Option<Vec<u8>>`); `Attr` is decoded into a term (an ETF list of
-  `{Atom, Value}` pairs — `Module::attributes_term`/`attribute_by_name`, `src/attributes.rs`) for
-  `module_info(attributes)`, while its raw bytes stay in `Module::attributes`; `Docs`/`DbgB`/`Dbgi` are
-  tooling-only ids whose payloads are deliberately **not** parsed.
+- **`StrT` / `CInf` / `Attr` / `Meta` / `Docs` / `DbgB` / `Dbgi`** — `StrT` is captured raw
+  (`Module::strings`). `Attr`, `CInf` and `Meta` are each a single `term_to_binary` payload and are
+  **decoded into a term** once at load time into a private arena shared through an `Arc`
+  ([`crate::decoded::DecodedTerm`]): `Attr` → the `[{Atom, Value}]` attribute list
+  (`Module::attributes_term`/`attribute_by_name`, `src/attributes.rs`) for `module_info(attributes)`;
+  `CInf` → the compile-info list (`Module::compile_info_term`/`compile_info_by_name`,
+  `beam_asm.erl:236,309` writes it, `erl_bif_info.c:5896-5918` serves `module_info(compile)`) and
+  `Meta` → the feature-metadata property list (`Module::meta_term`/`meta_by_name`, `compile.erl:2269-2295`).
+  Each chunk's raw bytes stay on the module too (`Module::attributes`/`compile_info`/`meta`).
+  `Docs`/`DbgB`/`Dbgi` are tooling-only ids whose payloads are deliberately **not** parsed: they are large
+  and near-universal, and eagerly materializing them would regress the measured module-load cost
+  (`tests/load_cost.rs`).
 - **`Recs`** — `u32 version` (must be `0`; a non-zero version means "no records" — chunk-absent,
   *not* an error, `beam_file.c:1335-1348`), `i32 record_count` (`≥ 0`; negative ⇒ `BadArg`),
   `i32 total_field_count` (informational; `≥ 0`), then `record_count` record entries EACH encoded as
