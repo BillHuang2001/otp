@@ -52,11 +52,14 @@
 //!   `call_fun` with a `move`).
 //! - `Apply { arity }` — `fixed_apply` (`beam_common.c:1536-1537`): the module is
 //!   `x(arity)`, the function is `x(arity+1)`, and the arguments are
-//!   `x(0)..x(arity-1)`. Both must be atoms; the call is dispatched through
-//!   [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif).
+//!   `x(0)..x(arity-1)`. Both must be atoms. The target is resolved through the
+//!   cross-module-call seam ([`ExecutionContext::resolve_external_call`]): on a hit
+//!   the callee is entered **in this machine** with the caller's return address
+//!   (`(func, pc + 1)`) stored in the live frame; otherwise it is dispatched
+//!   through [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif).
 //! - `ApplyLast { arity, deallocate }` — as `Apply`, but the frame is popped first
-//!   (`i_apply_last`: `$deallocate($Deallocate)`), then control follows the
-//!   machine's continuation **context-aware** via
+//!   (`i_apply_last`: `$deallocate($Deallocate)`). On the **synchronous** route
+//!   control then follows the machine's continuation **context-aware** via
 //!   [`Machine::continuation_step`](crate::machine::Machine::continuation_step):
 //!   `Continuation::Halt` ⇒ `Step::Done`, an address in the **current** module
 //!   context ⇒ `Step::Goto`, and an address in **another** context ⇒
@@ -65,12 +68,19 @@
 //!   have been entered through the cross-module
 //!   [`resolve_external_call`](crate::ExecutionContext::resolve_external_call)
 //!   seam: its tail `apply` must land back in the **caller's** module, never in the
-//!   callee's. The shape is the same the core `CallExtLast` arm uses.
+//!   callee's. The shape is the same the core `CallExtLast` arm uses. On the
+//!   **seam** route the callee is entered as `Step::Enter` (the popped frame is
+//!   gone, so the callee's `return` follows the caller's continuation).
 //!
 //! Fun application (the `call_fun`/`call_fun2` path) reaches the host through
 //! [`ExecutionContext::apply_fun`](crate::context::ExecutionContext::apply_fun)
 //! (default: a typed `unsupported`); `apply`/`apply_last` name a `module:function`
-//! directly and go through `call_bif`.
+//! directly and are resolved through the cross-module-call seam
+//! [`ExecutionContext::resolve_external_call`](crate::ExecutionContext::resolve_external_call)
+//! **first** — on a hit the callee runs in this machine ([`Step::Enter`]); on the
+//! seam's `Ok(None)` default the target is applied through
+//! [`ExecutionContext::call_bif`](crate::context::ExecutionContext::call_bif) as
+//! before.
 //!
 //! Every failure is a typed [`beam_common::BeamError`]: `read_operand`/
 //! `write_operand` propagate, an out-of-range register is
@@ -176,13 +186,25 @@ pub(crate) fn exec(
             // `$DISPATCH_ABS`, `emu/instrs.tab:298-304`), so a `receive` inside the
             // callee suspends *this* process and its `return` unwinds into the
             // caller's frame.
-            ApplyTarget::Enter { context, func, pc } => {
+            //
+            // The stored continuation is the **caller's** next instruction
+            // (`func`, `pc + 1` — this function's own position), which is why the
+            // target's own `(func, pc)` are bound under different names.
+            ApplyTarget::Enter {
+                context,
+                func: target_func,
+                pc: target_pc,
+            } => {
                 machine.set_continuation(Continuation::Address {
                     func,
                     pc: pc + 1,
                     context: machine.current_context(),
                 })?;
-                Ok(Some(Step::Enter { context, func, pc }))
+                Ok(Some(Step::Enter {
+                    context,
+                    func: target_func,
+                    pc: target_pc,
+                }))
             }
             // A non-atom target is the catchable `badarg` raise: the landing
             // already wrote x(0..=3), so x(0) must not be overwritten here.
