@@ -23,13 +23,16 @@
 
 use super::*;
 use beam_common::BeamError;
-use beam_loader::{FunDescriptor, Function, Label};
+use beam_loader::{Export, FunDescriptor, Function, Label};
 use beam_term::{make_small, signed_value, Atom};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::context::MinimalContext;
+use crate::context::{ExternalResolver, Mailbox, MinimalContext};
 use crate::machine::{CatchFrame, Continuation};
+use crate::RunOutcome;
 
 /// A one-function synthetic module with an owned atom table.
 struct Fixture {
@@ -43,8 +46,26 @@ impl Fixture {
         Fixture { module }
     }
 
+    /// A fixture whose module is named `name` (the cross-module seam tests use a
+    /// module per side, and the name is what a host matches on).
+    fn named(name: &str) -> Fixture {
+        let mut fixture = Fixture::new();
+        fixture.module.name = fixture.atom(name);
+        fixture
+    }
+
     fn atom(&mut self, name: &str) -> Atom {
         self.module.atom_table.intern(name)
+    }
+
+    /// Export `name/arity` at `label` (what `resolve_external_call` answers with).
+    fn add_export(&mut self, name: &str, arity: u32, label: Label) {
+        let function = self.atom(name);
+        self.module.exports.push(Export {
+            function,
+            arity,
+            label,
+        });
     }
 
     /// Register a `FunT` descriptor; its position is the fun-table index.
@@ -716,4 +737,416 @@ fn non_fun_variants_return_none() {
     )
     .expect("return is not this family's variant");
     assert!(outcome.is_none());
+}
+
+// -----------------------------------------------------------------------
+// Apply / ApplyLast through the cross-module call seam
+// (`ExecutionContext::resolve_external_call`)
+// -----------------------------------------------------------------------
+
+/// The cross-module `apply` callee `c:g/2`: a bare `receive` that finds nothing in
+/// an empty mailbox, suspends, and returns the message it later matched.
+///
+/// ```text
+/// c:g/2:
+///     label 10
+///     loop_rec 11 x0       ; the candidate, or jump to the wait
+///     remove_message
+///     return
+///     label 11
+///     wait 10              ; resume at the loop_rec once a message arrives
+/// ```
+fn cross_callee() -> Arc<Module> {
+    let mut fixture = Fixture::named("c");
+    let g = fixture.add_function(
+        "g",
+        2,
+        vec![
+            Instr::Label(Label(10)),
+            Instr::LoopRec {
+                fail: Label(11),
+                dst: beam_loader::Operand::X(0),
+            },
+            Instr::RemoveMessage,
+            Instr::Return,
+            Instr::Label(Label(11)),
+            Instr::Wait { target: Label(10) },
+        ],
+    );
+    fixture.add_export("g", 2, g);
+    Arc::new(fixture.finish())
+}
+
+/// The callee's `c:g/2` export entry — the `Label` the seam answers with (the
+/// label *after* `func_info`, i.e. exactly the label `run_export` would enter).
+fn cross_entry(callee: &Arc<Module>) -> Label {
+    let g = callee.atom_table.lookup("g").expect("`g` is interned");
+    callee.export(g, 2).expect("`c:g/2` is exported")
+}
+
+/// Intern the `c`/`g` atoms in a caller fixture's own table.
+fn cross_atoms(fixture: &mut Fixture) -> (Atom, Atom) {
+    (fixture.atom("c"), fixture.atom("g"))
+}
+
+/// A resolver that answers `c:g/2` with the callee handle and its export entry and
+/// declines everything else (`Ok(None)` — the synchronous `call_bif` route).
+fn cross_resolver(callee: Arc<Module>, label: Label) -> ExternalResolver {
+    Box::new(move |module, function, arity| {
+        if module == "c" && function == "g" && arity == 2 {
+            Ok(Some((Arc::clone(&callee), label)))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+/// A caller `f/4` that performs `apply c:g/2` with `x(2)`/`x(3)` = the `c`/`g`
+/// atoms — the `fixed_apply` register shape.
+fn apply_caller(fixture: &mut Fixture) -> Label {
+    let (c, g) = cross_atoms(fixture);
+    fixture.add_function(
+        "f",
+        4,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Move {
+                src: beam_loader::Operand::Atom(c),
+                dst: beam_loader::Operand::X(2),
+            },
+            Instr::Move {
+                src: beam_loader::Operand::Atom(g),
+                dst: beam_loader::Operand::X(3),
+            },
+            Instr::Apply { arity: 2 },
+            Instr::Return,
+        ],
+    )
+}
+
+/// A caller `run/0` that allocates a frame (so the `apply`'s return address is
+/// written there), sets up the `apply c:g/2` target and returns through its frame.
+fn apply_run_caller() -> (Module, Label) {
+    let mut fixture = Fixture::new();
+    let (c, g) = cross_atoms(&mut fixture);
+    let entry = fixture.add_function(
+        "run",
+        0,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Allocate {
+                stack_need: beam_loader::HeapNeed::Words(0),
+                live: 4,
+            },
+            Instr::Move {
+                src: beam_loader::Operand::Atom(c),
+                dst: beam_loader::Operand::X(2),
+            },
+            Instr::Move {
+                src: beam_loader::Operand::Atom(g),
+                dst: beam_loader::Operand::X(3),
+            },
+            Instr::Apply { arity: 2 },
+            Instr::Deallocate(0),
+            Instr::Return,
+        ],
+    );
+    (fixture.finish(), entry)
+}
+
+/// Seed the `apply c:g/2` argument registers `x(0)`/`x(1)`.
+fn seed_apply_args(machine: &mut Machine) {
+    machine.set_x(0, make_small(7)).unwrap();
+    machine.set_x(1, make_small(8)).unwrap();
+}
+
+/// Seed the `apply c:g/2` target registers `x(2)`/`x(3)`.
+fn seed_apply_target(machine: &mut Machine, c: Atom, g: Atom) {
+    machine.set_x(2, make_atom(c)).unwrap();
+    machine.set_x(3, make_atom(g)).unwrap();
+}
+
+#[test]
+fn apply_enters_a_resolved_callee_in_the_same_machine() {
+    // A host that answers `resolve_external_call` runs the applied callee in THIS
+    // machine: `apply c:g/2` registers the callee's module context, stores the
+    // caller's return address `(func, pc + 1)` in the live frame, and reports
+    // `Step::Enter` — exactly the local-call discipline, so a `receive` inside the
+    // callee suspends *this* process instead of folding into `error::blocked()` at
+    // the call site.
+    let callee = cross_callee();
+    let entry = cross_entry(&callee);
+    let mut fixture = Fixture::new();
+    let (c, g) = cross_atoms(&mut fixture);
+    let label = apply_caller(&mut fixture);
+    assert_eq!(label, Label(1));
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    seed_apply_args(&mut machine);
+    seed_apply_target(&mut machine, c, g);
+
+    let mut ctx = MinimalContext::with_external_resolver(cross_resolver(callee, entry));
+    let labels = LabelMap::new();
+    // The caller's own position is `(func 5, pc 7)`, so its return address is the
+    // `(5, 8)` the Apply must store.
+    let step = exec(
+        &mut machine,
+        &module,
+        &labels,
+        &Instr::Apply { arity: 2 },
+        5,
+        7,
+        &mut ctx,
+    )
+    .expect("the applied target resolves");
+    assert_eq!(
+        step,
+        Some(Step::Enter {
+            context: 1,
+            func: 0,
+            pc: 0,
+        }),
+        "the callee is entered in its own registered context"
+    );
+    assert_eq!(
+        machine.continuation().unwrap(),
+        Continuation::Address {
+            func: 5,
+            pc: 8,
+            context: 0,
+        },
+        "the caller's return address is stored in the live frame"
+    );
+}
+
+#[test]
+fn apply_into_a_cross_module_receive_suspends_and_resumes() {
+    // End to end through the driver loop: `apply c:g/2` enters the callee, whose
+    // bare `receive` finds an empty mailbox and suspends THIS process — reported as
+    // `RunOutcome::Wait` at the callee's own address, never as the folded
+    // `error::blocked()` the non-blocking entries surface. A message then resumes
+    // the process and the callee's `return` unwinds into the caller's frame.
+    let callee = cross_callee();
+    let entry = cross_entry(&callee);
+    let (module, run) = apply_run_caller();
+
+    let mut ctx = MinimalContext::new();
+    ctx.set_external_resolver(cross_resolver(callee, entry));
+    let messages = Rc::new(RefCell::new(Vec::new()));
+    ctx.set_mailbox(Box::new(TestMailbox::new(Rc::clone(&messages))));
+
+    let mut machine = Machine::new();
+    let suspended = machine
+        .run_label_outcome(&module, run, 0, &[], &mut ctx)
+        .expect("a suspend is not an error");
+    assert_eq!(
+        suspended,
+        RunOutcome::Wait { func: 0, pc: 0 },
+        "the block is the callee's, not an error at the call site"
+    );
+
+    messages.borrow_mut().push(make_small(42));
+    let resumed = machine
+        .resume_outcome(&module, 0, 0, &mut ctx)
+        .expect("the resume completes");
+    assert_eq!(
+        resumed,
+        RunOutcome::Returned(make_small(42)),
+        "the callee returns the matched message into the caller"
+    );
+}
+
+#[test]
+fn apply_without_the_seam_keeps_the_synchronous_bif_path() {
+    // A host that does not implement `resolve_external_call` (the trait's
+    // `Ok(None)` default) is byte-identical to before: the applied result lands in
+    // `x(0)`, the instruction is a plain `Next`, and the live frame is untouched
+    // (no return address is written).
+    let mut fixture = Fixture::new();
+    let (c, g) = cross_atoms(&mut fixture);
+    let label = apply_caller(&mut fixture);
+    assert_eq!(label, Label(1));
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    machine.push_frame(0).unwrap();
+    seed_apply_args(&mut machine);
+    seed_apply_target(&mut machine, c, g);
+
+    // No resolver installed => `resolve_external_call` stays the `Ok(None)` default.
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(|module, function, arity, args| {
+        assert_eq!((module, function, arity), ("c", "g", 2));
+        assert_eq!(args, &[make_small(7), make_small(8)][..]);
+        Ok(make_small(99))
+    }));
+    let labels = LabelMap::new();
+    let step = exec(
+        &mut machine,
+        &module,
+        &labels,
+        &Instr::Apply { arity: 2 },
+        5,
+        7,
+        &mut ctx,
+    )
+    .expect("the synchronous target runs");
+    assert_eq!(
+        step,
+        Some(Step::Next),
+        "the synchronous route reports no context switch"
+    );
+    assert_eq!(machine.x(0), Some(make_small(99)));
+    assert_eq!(
+        machine.continuation().unwrap(),
+        Continuation::Halt,
+        "the synchronous route leaves the frame's continuation untouched"
+    );
+}
+
+#[test]
+fn apply_last_pops_its_frame_then_enters_a_resolved_callee() {
+    // The tail discipline with the seam: the frame is popped FIRST (`i_apply_last`'s
+    // `$deallocate` precedes `fixed_apply`), then the callee is entered as
+    // `Step::Enter`. The callee therefore runs on the CALLER's frame, so its
+    // `return` follows that frame's (possibly cross-context) continuation — never
+    // the popped frame's.
+    let callee = cross_callee();
+    let entry = cross_entry(&callee);
+    let mut fixture = Fixture::new();
+    let (c, g) = cross_atoms(&mut fixture);
+    let label = fixture.add_function(
+        "f",
+        4,
+        vec![
+            Instr::Label(Label(1)),
+            Instr::ApplyLast {
+                arity: 2,
+                deallocate: 0,
+            },
+        ],
+    );
+    assert_eq!(label, Label(1));
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    // The CALLER's frame: its continuation is an address in module context `0`,
+    // the context the tail `apply_last` must return into.
+    machine.push_frame(0).unwrap();
+    machine
+        .set_continuation(Continuation::Address {
+            func: 9,
+            pc: 4,
+            context: 0,
+        })
+        .unwrap();
+    // The `apply_last`'s own frame — popped by the instruction.
+    machine.push_frame(0).unwrap();
+    seed_apply_args(&mut machine);
+    seed_apply_target(&mut machine, c, g);
+
+    let mut ctx = MinimalContext::with_external_resolver(cross_resolver(callee, entry));
+    let labels = LabelMap::new();
+    let step = exec(
+        &mut machine,
+        &module,
+        &labels,
+        &Instr::ApplyLast {
+            arity: 2,
+            deallocate: 0,
+        },
+        0,
+        1,
+        &mut ctx,
+    )
+    .expect("the tail apply resolves");
+    assert_eq!(
+        step,
+        Some(Step::Enter {
+            context: 1,
+            func: 0,
+            pc: 0,
+        }),
+        "the callee is entered directly, with no return address stored"
+    );
+    assert_eq!(machine.frame_depth(), 1, "the apply_last frame is popped");
+    assert_eq!(
+        machine.continuation().unwrap(),
+        Continuation::Address {
+            func: 9,
+            pc: 4,
+            context: 0,
+        },
+        "the callee's return follows the caller's continuation"
+    );
+}
+
+// -----------------------------------------------------------------------
+// The `Mailbox` seam the cross-module receive test drives
+// -----------------------------------------------------------------------
+
+/// A minimal mailbox: a shared message `Vec` plus a scan position — enough to
+/// drive `loop_rec` / `remove_message` / `wait` through the engine's receive seam.
+///
+/// The `Vec` is shared with the test (`Rc<RefCell<…>>`) so a message can be queued
+/// *after* the process has suspended in `wait`, which is what the resume path needs.
+struct TestMailbox {
+    messages: Rc<RefCell<Vec<Eterm>>>,
+    scan: usize,
+}
+
+impl TestMailbox {
+    fn new(messages: Rc<RefCell<Vec<Eterm>>>) -> TestMailbox {
+        TestMailbox { messages, scan: 0 }
+    }
+}
+
+impl Mailbox for TestMailbox {
+    fn send_message(&mut self, _to: Eterm, message: Eterm) -> Result<()> {
+        self.messages.borrow_mut().push(message);
+        Ok(())
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        Ok(self.messages.borrow().get(self.scan).copied())
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        self.scan += 1;
+        Ok(())
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        let mut messages = self.messages.borrow_mut();
+        if self.scan < messages.len() {
+            messages.remove(self.scan);
+        }
+        self.scan = 0;
+        Ok(())
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        self.scan = 0;
+        Ok(())
+    }
+
+    // The receive-marker bookkeeping is not exercised by these `apply` seam tests.
+    // Reporting the typed `unsupported` keeps the seam's "this host does not serve
+    // it" contract explicit rather than pretending a marker was reserved.
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        Err(error::unsupported("receive_marker_reserve"))
+    }
+
+    fn receive_marker_bind(&mut self, _marker: Eterm, _reference: Eterm) -> Result<()> {
+        Err(error::unsupported("receive_marker_bind"))
+    }
+
+    fn receive_marker_use(&mut self, _reference: Eterm) -> Result<()> {
+        Err(error::unsupported("receive_marker_use"))
+    }
+
+    fn receive_marker_clear(&mut self, _reference: Eterm) -> Result<()> {
+        Err(error::unsupported("receive_marker_clear"))
+    }
 }
