@@ -1342,6 +1342,31 @@ impl ExecutionContext for RuntimeContext<'_> {
             return result.map_err(error::enforce_term_heap_limit);
         }
         if self.runtime.registry.contains(module, function, arity) {
+            // A table-creating `ets:new/2` is observed here so the runtime's owner index can
+            // release the table when its creator dies (see `crate::runtime::ets_owner`). Only
+            // a `named_table` is reachable through the registry's *public* surface, so only it
+            // is indexed: the handle is resolved by the name registration the call newly made
+            // (a `before`/`after` `lookup_name` delta distinguishes a real registration from a
+            // pre-existing name or an unnamed table that merely carries the same name).
+            if module == "ets" && function == "new" && arity == 2 {
+                let name = args
+                    .first()
+                    .copied()
+                    .filter(|term| beam_term::is_atom(*term))
+                    .map(beam_term::atom_val);
+                let before = name.and_then(|atom| self.runtime.tables.borrow().lookup_name(atom));
+                let result = self.call_registered(module, function, arity, args);
+                if let (Some(atom), Ok(_)) = (name, &result) {
+                    let after = self.runtime.tables.borrow().lookup_name(atom);
+                    if let Some(handle) = after.filter(|handle| Some(*handle) != before) {
+                        self.runtime
+                            .ets_owners
+                            .borrow_mut()
+                            .record(self.mailbox_pid, handle, atom);
+                    }
+                }
+                return result;
+            }
             return self.call_registered(module, function, arity, args);
         }
         if module == "erlang" {

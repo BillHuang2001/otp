@@ -525,6 +525,18 @@ impl Runtime {
                 Ok(executed) => ran += executed,
                 Err(err) => break Err(err),
             }
+            // The ETS owner-death half: a process that died in the slices just run may have
+            // owned ETS tables. The obligation its exit observer recorded is discharged here,
+            // where the ETS registry is free (see `crate::runtime::ets_owner`); a transfer
+            // message enqueues its (blocked) heir, so go round again to run it.
+            match self.drain_ets_owner_exits(&mut table, &mut scheduler) {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    continue;
+                }
+            }
             // A child an `erlang:spawn*` created *during* the slices just run is registered
             // and enqueued here, so the next round runs it (see `absorb_pending_spawns`).
             if self.absorb_pending_spawns(&mut table, &mut state, &mut scheduler) > 0 {
