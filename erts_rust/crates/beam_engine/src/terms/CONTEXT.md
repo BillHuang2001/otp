@@ -26,11 +26,9 @@ materialized into the reserved block's spare tail via `Slack::integer`, so the b
 costs a single allocation. `live` is `RootSet::ALL_LIVE` whenever the caller has no
 operand-derived count (always a safe over-approximation for a copying collector).
 
-`construct.rs::make_tuple`/`make_list` and every other builder in this node are already
-rooted. The outstanding reroute is the *call sites outside this node*: the `terms::make_*`
-callers in `families/**`, `machine/**` and the integration tests still allocate through the
-unrooted `ExecutionContext::alloc_words`, so an ordinary run does not collect yet
-(`beam_engine/CONTEXT.md` Handoff #11).
+Every in-crate builder **and every in-crate call site** (`families/**`, `machine/**`) is on
+this discipline: `rg -n 'ctx.alloc_words' src/families` is empty. The one sanctioned exception
+is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
 
 ## API Surface (`crate::terms::*`)
 - **Rooted builders** (`construct.rs`, `fun.rs`, `map.rs`, `number.rs`). Every builder is
@@ -66,6 +64,14 @@ unrooted `ExecutionContext::alloc_words`, so an ordinary run does not collect ye
   throwaway `Machine`; **never** moving-collector-safe, so they exist only for tests. In-module
   tests reach them with an explicit `use super::test_support::{…};` (an explicit import shadows
   the glob one, which still supplies the readers/constants).
+- `alloc_tests` (`#[cfg(test)] pub(crate)`) — a mock semi-space **moving** collector
+  (`MovingContext`) that relocates every term reachable from a `RootSet` and rewrites the root
+  slices in place, plus the tests proving (a) the builders route every allocation through
+  `alloc_words_rooted` and never through the unrooted seam, (b) a built tuple/list/map and a
+  one-reservation nested graph stay correct across a relocation, (c) peak live words stay
+  bounded under collection while the unrooted arena grows linearly in N. It is `pub(crate)` so
+  the family suites reuse it: `../families/records/tests/rooted.rs` and
+  `../families/bitstrings/matching/rooted.rs` drive those two families under the same collector.
 
 ## Constraints
 - Safe Rust here only in the sense that raw-pointer work lives **only** in this node; every
@@ -89,31 +95,24 @@ unrooted `ExecutionContext::alloc_words`, so an ordinary run does not collect ye
 - `map.rs` → flat-map/HAMT builder + `map_entries` walker.
 - `fun.rs` → the `ErlFunThing` builder/readers.
 - `read.rs` → the tuple/cons/list/binary readers.
-- `tests.rs` → in-module unit tests; `test_support.rs` → the test-only ergonomic wrappers.
+- `tests.rs` → in-module unit tests; `test_support.rs` → the test-only ergonomic wrappers;
+  `alloc_tests.rs` → the mock moving collector + the rooted-hook/peak-words proofs.
 
-## Handoff — call sites outside this node (NOT yet migrated)
-Every builder in this node is rooted, but the callers below still use the old `(ctx, …)`
-shape; they are the outstanding `E0061`s, and each is owned outside this node.
-- `../families/exceptions/stacktrace.rs` (`:91`, `:113`, `:160`–`:166`) — `symbolic_stacktrace`,
-  `stacktrace_item` and `location_term` build a whole multi-node graph (a `[{file,File},{line,N}]`
-  location per frame, the `{M,F,A,Loc}` item tuples, the item list) and must do so under **one**
-  reservation: size the graph from **metadata** first (`LocationShape`/`ItemShape`), call
-  `reserve_slack(machine, ctx, total)`, then carve every node with [`Sink`] (a per-node
-  allocation would strand the nodes already written — their pointers are not roots).
-  `stacktrace_item` keeps its signature (it is `../machine/location.rs`'s entry point) and
-  builds through [`ContextSink`]; one `write_location`/`write_item` definition parameterised by
-  `&mut dyn Sink` keeps the rooted and unrooted paths from diverging. `nearest_line` stays put.
-- `../families/exceptions/mod.rs:210` (`catch_end`) — route `{exit,Reason}` through the rooted
-  `make_tuple`, reading the machine root `x(1)` **inside** the reader closure (never a stale local).
-- `../families/exceptions/tests*`, `../families/floats/tests.rs`, `../families/maps/tests.rs`,
-  `../families/records/tests/*` — test call sites; use `terms::test_support::{…}`.
-- `../families/bitstrings/**`, `../families/records/mod.rs` — the other two migration workstreams.
-- `../machine/location.rs:277`/`:409` — the four `&self` accessors cannot lend the machine's
-  `&mut` root slices, so they build through the **unrooted** [`ContextSink`]. Sanctioned: every
-  term there comes from module metadata/immediates with no machine-heap operand held across an
-  allocation, and `alloc_words` never collects. Adopting a rooted `&mut self` twin needs `beam_rt`
-  to change `engines.engine_at(pid)` → `engines.engine_at_mut(pid)`
-  (`beam_rt/src/native/memory/mod.rs:519-522`).
+## Handoff — the one call site still on the unrooted path (owner: `beam_rt`)
+`../machine/location.rs:277`/`:409` — the four `&self` accessors (`current_function`,
+`initial_call`, `current_location`, `current_stacktrace`) cannot lend the machine's `&mut` root
+slices, so they build through the **unrooted** [`ContextSink`]. Sanctioned: every term there
+comes from module metadata/immediates with no machine-heap operand held across an allocation,
+and `alloc_words` never collects. Adopting a rooted `&mut self` twin needs `beam_rt` to change
+`engines.engine_at(pid)` → `engines.engine_at_mut(pid)`
+(`beam_rt/src/native/memory/mod.rs:519-522`) — a change outside this crate.
+
+`../families/exceptions/stacktrace.rs`: `symbolic_stacktrace` sizes its whole graph from
+**metadata** first (`LocationShape`/`ItemShape`), takes **one** `reserve_slack`, then carves
+every node with [`Sink`] (a per-node allocation would strand the nodes already written — their
+pointers are not roots). `stacktrace_item` keeps its signature (it is `../machine/location.rs`'s
+entry point) and builds through [`ContextSink`]; one `write_location`/`write_item` definition
+parameterised by `&mut dyn Sink` keeps the rooted and unrooted paths from diverging.
 
 ## Test Strategy
 In-module `#[cfg(test)]` unit tests against a `MinimalContext` arena: round-trips through the
@@ -121,16 +120,17 @@ readers, raw-word layout assertions against stack buffers (allowed here — this
 module), the wrong-type/limit error cases, and the carve discipline (`slack_carves_*` builds a
 nested graph out of ONE reservation and asserts the region is consumed exactly once;
 `a_carve_region_too_small_*` pins the typed error; `context_sink_*` covers the unrooted sink).
-Cross-crate behaviour (the actual `{M,F,A,Location}` shapes, ETS/map HAMT copies) is covered by
-the owning families and by `beam_gc/tests/{map_copy,refc_binary_copy}.rs`; oracle cross-checks
-live in `beam_term/tests/oracle.rs`.
-Known gap: the rooted builders cannot be exercised under a real moving collector here — no
-in-crate context collects (Handoff #11), so the discipline is pinned by construction and by the
-single-reservation tests rather than by a relocating collector.
+The moving-collector discipline is proved by `alloc_tests.rs` (builders) and by the family
+suites `../families/records/tests/rooted.rs` and `../families/bitstrings/matching/rooted.rs`
+(which assert a real relocation occurred, the result is correct, and the vacated address was
+poisoned so a stale read could not pass). Cross-crate behaviour (the actual
+`{M,F,A,Location}` shapes, ETS/map HAMT copies) is covered by the owning families and by
+`beam_gc/tests/{map_copy,refc_binary_copy}.rs`; oracle cross-checks live in
+`beam_term/tests/oracle.rs`.
 
 ## See Also
-- `../../CONTEXT.md` → the crate-level contracts and Handoff #11 (the call sites still on
-  unrooted `alloc_words`), plus the `{M,F,A,Location}` shape consumer
+- `../../CONTEXT.md` → the crate-level contracts and Handoff #11 (the `beam_rt` term-builders
+  still on the unrooted seam), plus the `{M,F,A,Location}` shape consumer
   (`../families/exceptions/stacktrace.rs`) and the `&self` accessors
   (`../machine/location.rs`).
 - `../../../beam_term/CONTEXT.md` → the frozen term/`map`/`bitstring`/`refc`/`fun` writers this
