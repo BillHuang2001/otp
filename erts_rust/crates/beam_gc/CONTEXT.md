@@ -606,6 +606,22 @@ still reproduces today's collector exactly.
   measured 1.778×), capacities + occupancy are **constant** across the measured half (no growth per cycle),
   the nursery is empty after every collection, and RSS plateaus ≤1.5× (`/proc/self/statm`, skipped loudly
   off-Linux). Headline numbers are printed with `-- --nocapture`.
+- **`tests/immix_selection_curve.rs` — the two-axis selection curve.** A fixed in-place mature size swept over
+  five object-size distributions, and a fixed live set swept over mature capacities 128→8192 words, under both
+  strategies; the invariant "Immix evacuates only the trailing partial-block lines ⇒ its moved words are
+  object-size- and occupancy-invariant" is asserted at every point (deterministic counts), pauses printed only.
+  Supplies the verdict that the break-even constant is geometry-driven (Design Decisions §The automatic rule).
+- **`tests/immix_invariants.rs` — the mark-region invariant probes (mutation-verified).** Pins the load-bearing
+  `run_major` ordering (reclaim mature in place → rewrite the nursery's mature-reference slots → promote) with
+  five no-dangling-interior-pointer cases; `allocated == kept` line-bitmap consistency (`marked`/`kept` reset,
+  `used_lines` == allocated popcount, a freed line really free); and no double-free/spurious release
+  (`blocks_reclaimed` never counts a pinned `AllMarked` block; repeated collections over an unchanged live set
+  are idempotent at byte-identical addresses).
+- **`tests/immix_stress.rs` — the mark-region stress set.** Multi-block (257/513-word) large-object promotion +
+  reclamation; fragmentation/reuse over six re-fill rounds; repeated minors preserving a promoted term until a
+  major reclaims it only when dead; a mixed workload structurally equal under both strategies; and an
+  **asserted** live-set-bounded memory accounting (retained `used_lines`·`LINE_WORDS` ≥ live words, slack ≤
+  `live·(LINE_WORDS-1)`, and it drops when live objects are dropped).
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
