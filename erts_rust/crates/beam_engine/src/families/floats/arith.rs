@@ -97,7 +97,7 @@ pub(super) fn negate(
         Ok(x) => x,
         Err(_) => return arithmetic_failure(machine, module, labels, fail),
     };
-    let negated = make_float(ctx, -value)?;
+    let negated = make_float(machine, ctx, -value)?;
     write_operand(machine, dst, negated)?;
     Ok(Some(Step::Next))
 }
