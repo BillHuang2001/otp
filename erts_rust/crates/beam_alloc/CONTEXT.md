@@ -291,8 +291,12 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   exercisable in-module. Cross-module behaviour is tested through the **public** API.
 - Integration: `tests/allocator.rs` (alloc/dealloc/realloc round trips, alignment, dedicated-carrier
   path, stats deltas, `max_footprint` cap, typed/unsized entry points, `allocator_info`), `tests/heap.rs`
-  (`cons`/`tuple`/`alloc_words`/`alloc_tuple`/`reset`/peak, pointer stability, `Drop`), `tests/hot_path.rs`
-  (the micro-benchmark + a steady-state/no-leak test).
+  (`cons`/`tuple`/`alloc_words`/`alloc_tuple`/`reset`/peak, pointer stability, `Drop`),
+  `tests/reserved_heap.rs` (in-place growth across the committed limit with a byte-identical `hp` and no
+  extra allocation, reservation exhaustion ⇒ `MoveRequired` with no state change and still-usable old
+  limit, the host move path with its constant delta and byte-identical live region, zero/small
+  reservation and hostile-input edges, `Drop` accounting incl. the real mseg-backed allocator),
+  `tests/hot_path.rs` (the micro-benchmark + a steady-state/no-leak test).
 - A **leak/steady-state** test drives alloc/free cycles and asserts the carrier/free-block counters
   return to baseline (no leak on the tested paths).
 - Gate (GREEN required, current): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
