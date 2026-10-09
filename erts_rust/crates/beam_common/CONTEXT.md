@@ -73,6 +73,19 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   contains none (`#![forbid(unsafe_code)]`).
 - Files target ~1000 lines; split by responsibility (`error`, `version`, `config`, `logging`).
 
+## Known Issues
+- **The `FeatureFlags` surface is largely inert.** Only `smp` is consumed anywhere (reported by
+  `beam_rt`'s `system_info(smp_support)`, `info/system.rs:102`); `interpreter`, `jit`, `cranelift`,
+  `dirty_schedulers`, `lock_checking`, `debug_assertions` and `memory_instrumentation` are set by the
+  builders / `for_flavor` but read by no crate. In particular `-emu_flavor emu` only flips the reported
+  `emu_flavor` atom (`for_flavor` sets `features.jit = false`, which nothing branches on) — it does not
+  disable the JIT.
+- **`RuntimeConfig::log_level` and `RuntimeConfig::dist_port_range` are never read** outside this crate
+  (set + tested here only). `log_level` is not wired to the logging facade — the effective level comes
+  solely from `ERTS_RUST_LOG`/`set_level`/`init_from_env`, so `with_log_level` has no runtime effect.
+- **Unused public helpers:** `RuntimeConfig::is_jit` and `erts_version()` are referenced only by this
+  crate's own tests; no other crate calls them.
+
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` only (no fixture/data needs).
   - `error`: `Display` for every `BeamError` variant and reason; `From<io::Error>`; `source()`;
