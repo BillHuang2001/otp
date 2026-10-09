@@ -459,11 +459,12 @@ impl RuntimeContext<'_> {
         let reference = self.mint_timer_ref()?;
         // The message is delivered **later**, by the scheduler loop — long after the process
         // that scheduled the timer may have been collected. Copy it onto the pointer-stable
-        // arena now (see `Runtime::stabilize_escaped`). `from` needs no copy (a pid term is a
-        // heap-free immediate), and `reference` must **not** be copied: it is the caller's own
-        // handle (returned below) *and* the `Timers::refs` lookup key, so a copy would break
-        // `erlang:cancel_timer/1`.
-        let message = self.runtime.stabilize_escaped(message);
+        // arena now (see `Runtime::try_stabilize_escaped`, which reports a term the copier
+        // genuinely cannot copy as the honest `system_limit` instead of storing it). `from`
+        // needs no copy (a pid term is a heap-free immediate), and `reference` must **not** be
+        // copied: it is the caller's own handle (returned below) *and* the `Timers::refs`
+        // lookup key, so a copy would break `erlang:cancel_timer/1`.
+        let message = self.runtime.try_stabilize_escaped(message)?;
         let from = self.pid().to_eterm();
         self.runtime
             .timers_mut()

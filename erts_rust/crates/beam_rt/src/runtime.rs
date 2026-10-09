@@ -1315,16 +1315,25 @@ impl Runtime {
 
     /// Records a process created by an `erlang:spawn*` **from inside a scheduler slice** for
     /// the pass to register and enqueue (see [`Runtime::pending_spawns`]).
-    pub(crate) fn note_pending_spawn(&mut self, mut spawn: PendingSpawn) {
+    ///
+    /// # Errors
+    ///
+    /// The stabilization failure of the entry fun or an argument:
+    /// [`BeamError::SystemLimit`] when the term genuinely cannot be copied onto the arena (see
+    /// [`Runtime::try_stabilize_escaped`]). Nothing is recorded in that case, so a pass never
+    /// runs a child whose entry or arguments dangle — the caller reports the honest error
+    /// instead.
+    pub(crate) fn note_pending_spawn(&mut self, mut spawn: PendingSpawn) -> Result<()> {
         // The entry point and the arguments are read **later**, by the pass that registers and
         // enqueues the child ([`Runtime::absorb_pending_spawns`]) — and the spawning process
         // may be collected in between, which moves or drops the heap these terms were built
         // on. Copy them onto the pointer-stable arena first (see
-        // [`Runtime::stabilize_escaped`]); this is also what makes the copies
+        // [`Runtime::try_stabilize_escaped`], which reports a term the copier genuinely cannot
+        // copy as the honest `system_limit`); this is also what makes the copies
         // [`RunnerState::spawn`] then stores safe.
         spawn.entry = match spawn.entry {
             ProcessEntry::Fun { fun, .. } => ProcessEntry::Fun {
-                fun: self.stabilize_escaped(fun),
+                fun: self.try_stabilize_escaped(fun)?,
                 // A pending spawn has not run yet, so its local fun cannot have been
                 // resolved: the first run of the child does that (see
                 // [`ProcessEntry::Fun`]).
@@ -1335,9 +1344,10 @@ impl Runtime {
         spawn.args = spawn
             .args
             .into_iter()
-            .map(|arg| self.stabilize_escaped(arg))
-            .collect();
+            .map(|arg| self.try_stabilize_escaped(arg))
+            .collect::<Result<Vec<Eterm>>>()?;
         self.pending_spawns.push(spawn);
+        Ok(())
     }
 
     /// Spawns a process whose entry point is the **fun** `fun`, applied to `args`.

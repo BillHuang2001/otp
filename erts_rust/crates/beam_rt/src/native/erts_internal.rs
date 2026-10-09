@@ -872,13 +872,14 @@ impl RuntimeContext<'_> {
 
         // The match spec is read **later**, by the tracer that emits the events — after the
         // process that installed the pattern may have been collected. Copy its functions onto
-        // the pointer-stable arena first (see `Runtime::stabilize_escaped`).
+        // the pointer-stable arena first (see `Runtime::try_stabilize_escaped`, which reports a
+        // function the copier genuinely cannot copy as the honest `system_limit`).
         let match_spec = match match_spec {
             Some(crate::trace::MatchSpec::Functions(functions)) => {
                 let functions = functions
                     .into_iter()
-                    .map(|function| self.runtime.stabilize_escaped(function))
-                    .collect();
+                    .map(|function| self.runtime.try_stabilize_escaped(function))
+                    .collect::<Result<Vec<Eterm>>>()?;
                 Some(crate::trace::MatchSpec::Functions(functions))
             }
             other => other,

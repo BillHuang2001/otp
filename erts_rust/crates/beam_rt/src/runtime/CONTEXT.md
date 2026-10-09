@@ -24,7 +24,7 @@ Split by responsibility: `runner/entry.rs` (`ProcessEntry`/`ProcessEngine`/`Runn
 
 ### `gc.rs` — the runtime-level GC state
 `GcStatsSnapshot` (`gc_stats`) reports collections/failures/halted pids/valve trips; `GcState` holds the **pin** set (a pid whose heap must not move), the **halt** set (a pid whose collection failed, or whose root-set sizes changed) and the global **valve** (`disabled`, plus the first reason and a trip counter).
-`stabilize_escaped(term)` copies a runtime-level store's term when a heap may move and trips the valve when it cannot; `pin_process`/`halt_process_gc`/`disable_gc`/`gc_enabled`/`gc_process_enabled(pid)` are the mutators/queries the scheduler and the stores use.
+`try_stabilize_escaped(term) -> Result<Eterm>` is the honest escape-store stabilization: it copies a runtime-level store's term when a heap may move, propagates a **genuine** copy failure (`BeamError::SystemLimit` — the term does not fit the arena) and trips the valve (`disable_gc`) **only** for the documented off-heap-payload capability gap, returning the original term then. `stabilize_escaped(term) -> Eterm` is the conflating legacy form kept for the runner's exit-reason call site: every failure keeps the original term and trips the valve. `pin_process`/`halt_process_gc`/`disable_gc`/`gc_enabled`/`gc_process_enabled(pid)` are the mutators/queries the scheduler and the stores use.
 
 ### `ets_owner.rs` — the `ProcessExitObserver` host and the two drains
 `OwnerIndex` (additive, shared with `Runtime`) records, in death order, the dead pids waiting for a drain and the append-only `(PortId, MonitorRef)` `PortWatch` pairs.
@@ -44,7 +44,7 @@ Split by responsibility: `runner/entry.rs` (`ProcessEntry`/`ProcessEngine`/`Runn
 
 ## Test Strategy
 * `scheduler/tests.rs`: the bounded pass family (step budgets, wake absorption, the port/timer/distribution halves) over a real `Runtime`.
-* `gc.rs` units: the pin/halt/valve sets, `gc_stats`, and `stabilize_escaped` both on a movable heap and on a tripped valve.
+* `gc.rs` units: the pin/halt/valve sets, `gc_stats`, and the escape-store stabilization: `try_stabilize_escaped` on a copyable term (the copy, the valve closed), on an un-copyable one (the honest `SystemLimit`, **no** valve trip), the conflating `stabilize_escaped` on the same term (the original kept, the valve tripped), and `note_pending_spawn`'s `Result` (recorded with arena copies, or recorded nowhere on the honest failure).
 * `ets_owner.rs` units: append-only port-watch recording, the take-for-a-drain contract, and the two drains (incl. the deferred-borrow path).
 * `../runner/tests.rs`: the one-slice `ProcessRunner` contract, `RunnerState` bookkeeping, receive-deadline arming and the exit-reason mapping.
 * Integration (`../../tests/`): `port_wake.rs` (a port wake resumed through the scheduler), `proc_lib_start.rs` (the cross-module `receive` suspend seam), `file_server.rs` (the native `file_server_2` service driven over real temporary files/directories, oracle-cross-checked), `position.rs`, `boot.rs` (the real `start.boot` to completion), and the `run`-action suites (`cli.rs`, `slice.rs`).
@@ -52,7 +52,7 @@ Split by responsibility: `runner/entry.rs` (`ProcessEntry`/`ProcessEngine`/`Runn
 ## Routing Table
 * `../runtime.rs` → the `Runtime` façade (boot wiring, code server + module cache, the slice, the spawn API, the timer/distribution accessors, `stabilize_term`/`materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`, and the `file_services` field).
 * `scheduler.rs` (+ `scheduler/tests.rs`) → the scheduler-pass family (one pass = processes → ports → timers → distribution, in bounded steps; the native-service step `service_file_requests` runs right after the run queue drains).
-* `gc.rs` → `GcState` + `gc_stats`/`GcStatsSnapshot` + the pin/halt/valve sets + `stabilize_escaped`.
+* `gc.rs` → `GcState` + `gc_stats`/`GcStatsSnapshot` + the pin/halt/valve sets + `try_stabilize_escaped`/`stabilize_escaped`.
 * `ets_owner.rs` → the `ProcessExitObserver` host (`OwnerIndex`/`EtsExitObserver`) + `Runtime::drain_ets_owner_exits`/`drain_port_monitor_exits`.
 * `../runner/` → the `ProcessRunner` (`mod.rs`/`entry.rs`/`run.rs`/`budget.rs`/`reason.rs`/`perf.rs`/`tests.rs`), re-exporting `crate::runner::{ProcessEntry, RunnerState, RuntimeRunner}`.
 * `../context/gc.rs` → the engine's heap-admission point (`ExecutionContext::ensure_heap`) that drives this state.

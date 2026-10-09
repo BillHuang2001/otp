@@ -35,9 +35,11 @@
 //!   root-set sizes did not survive a collection) stops collecting, because a failing
 //!   collection must never fail the program where the unbounded arena could not;
 //! * the global **valve** ([`GcState::disabled`]) — tripped by
-//!   [`Runtime::stabilize_escaped`] when a runtime-level store cannot be copied onto the
-//!   pointer-stable arena. From then on **no** process heap is moved again, so the store's
-//!   term can never dangle.
+//!   [`Runtime::try_stabilize_escaped`] when a runtime-level store holds a term with an
+//!   **off-heap payload** this crate's copy engine cannot duplicate. From then on **no**
+//!   process heap is moved again, so the store's term can never dangle. A term that
+//!   *genuinely* cannot be copied is **not** a valve case: it is reported honestly (the
+//!   emulator's `error:system_limit`).
 //!
 //! Everything here is counters plus two small hash sets, deliberately: the runtime is
 //! single-threaded and these are read on the dispatch path, not the hot path (the GC point
@@ -48,9 +50,12 @@
 //! The state is owned by [`Runtime`] (a `gc: GcState` field), the collection point is
 //! [`crate::context::gc::ensure_heap`] (armed by the slice's own
 //! [`BudgetContext::ensure_heap`](crate::runner)), and the escape stores go through
-//! [`Runtime::stabilize_escaped`]. See those call sites for the details.
+//! [`Runtime::try_stabilize_escaped`] (the honest split; [`Runtime::stabilize_escaped`] is the
+//! conflating legacy form kept for the runner's exit-reason call site). See those call sites
+//! for the details.
 use std::collections::{HashMap, HashSet};
 
+use beam_common::{BeamError, Result};
 use beam_loader::Module;
 use beam_process::ProcessId;
 use beam_term::Eterm;
@@ -238,27 +243,76 @@ impl Runtime {
     pub(crate) fn module_float_free_cached(&self, name: &str) -> Option<bool> {
         self.gc.float_free.get(name).copied()
     }
-    /// Copies `term` onto the pointer-stable arena and returns the copy — the
-    /// **escape-store** stabilization every runtime-level store that can hold a term built by
-    /// a running process must go through.
+    /// The **escape-store** stabilization, with its two failure classes kept apart: copies
+    /// `term` onto the pointer-stable arena and returns the copy.
     ///
     /// A term on a scheduled process's young heap is only kept alive while it is reachable
-    /// from that process's root set ([`Process::collect`](beam_process::Process::collect)),
-    /// so a term parked in a *runtime*-level store (a timer's message, a persistent term, a
-    /// trace match spec, a pending spawn's arguments, …) would otherwise dangle the moment
-    /// the heap it lives on is moved or dropped. The copy is semantically identical (terms
-    /// are immutable and compared structurally), so it is an unobservable change — with one
-    /// exception this function handles by tripping the valve:
+    /// from that process's root set ([`Process::collect`](beam_process::Process::collect)), so
+    /// a term parked in a *runtime*-level store (a timer's message, a pending spawn's entry or
+    /// arguments, a trace match spec, a persistent term, …) would otherwise dangle the moment
+    /// the heap it lives on is moved or dropped. The copy is semantically identical (terms are
+    /// immutable and compared structurally), so it is unobservable — for every term this
+    /// runtime's own copy engine can actually copy.
     ///
-    /// [`beam_message::copy_struct_simple`] can only copy what this runtime's own copy engine
-    /// covers. A term that contains an **off-heap** payload (a reference-counted large binary,
-    /// MSO data, an external pid/port/ref) is copied as part of a message but is not
-    /// trivially duplicable here, so the original term is stored instead **and every process
-    /// heap is frozen** ([`Runtime::disable_gc`]). That keeps the store exactly as correct as
-    /// it was before the collector existed, at the price of collecting nothing for the rest of
-    /// the run.
-    pub(crate) fn stabilize_escaped(&mut self, term: Eterm) -> Eterm {
+    /// That copy ([`Runtime::stabilize_term`], i.e. `beam_message::copy_struct_simple`) can fail
+    /// in two very different ways, and conflating them is exactly what this method exists to
+    /// prevent:
+    ///
+    /// * **a genuine failure** — [`BeamError::SystemLimit`]. The term simply does not fit the
+    ///   arena: [`crate::error::enforce_term_heap_limit`] translates the copy engine's
+    ///   destination-heap exhaustion into the emulator's documented `error:system_limit` — the
+    ///   preflight refusal at `beam_message/src/copy.rs:484-487` (the message-heap
+    ///   `AllocFailure` built by `beam_message/src/error.rs:91-96`, recognised by
+    ///   `beam_message::is_message_heap_exhaustion`, `beam_message/src/error.rs:82-84`) or a
+    ///   mid-copy `Heap::alloc_words` failure (`copy.rs:396`/`448`). It is propagated as the
+    ///   **honest error**: never stored anyway, and never a reason to freeze the node's
+    ///   collection.
+    /// * **the documented capability gap** — `copy_struct_simple` copies against **empty**
+    ///   source/destination off-heap tables (`copy.rs:502-507`), and the copy engine can only
+    ///   copy what it covers. A term carrying an **off-heap payload** — the 8-word
+    ///   `[BinRef][ErlSubBits]` refc-binary pair, or an MSO container — is resolved through the
+    ///   *source* off-heap table at `copy.rs:348-351` and `copy.rs:410-415`; the lookup misses
+    ///   on an empty table and the copy is refused with
+    ///   [`BeamError::BadArg`] (`crate::error::bad_term`,
+    ///   `beam_message/src/error.rs:100-102`) — as is the cycle guard's refusal of a forged
+    ///   cyclic graph (`copy.rs:318-328`). So the split is exactly: **`Err(BeamError::SystemLimit)`
+    ///   propagates, every other error is the capability gap** (that error is the *only* genuine
+    ///   one `enforce_term_heap_limit` produces; `src/error.rs:89-97`). For it the original term
+    ///   is kept — exactly as correct as before the collector existed — **and every process heap
+    ///   is frozen** ([`Runtime::disable_gc`]), so the stored term can never dangle. The price is
+    ///   that nothing is collected for the rest of the run, which is the right trade against a
+    ///   wrong result.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::SystemLimit`] when the term genuinely cannot be copied onto the arena. The
+    /// valve is **not** tripped in that case.
+    pub(crate) fn try_stabilize_escaped(&mut self, term: Eterm) -> Result<Eterm> {
         match self.stabilize_term(term) {
+            Ok(copy) => Ok(copy),
+            // A genuine failure: the term does not fit the arena. Report it honestly — never
+            // store the un-copied term, never freeze collection over it.
+            Err(BeamError::SystemLimit) => Err(BeamError::SystemLimit),
+            // The documented capability gap (an off-heap payload this crate cannot duplicate,
+            // or a malformed graph): keep the original term and freeze every process heap.
+            Err(_) => {
+                self.disable_gc("an out-of-band store holds a term with an off-heap payload");
+                Ok(term)
+            }
+        }
+    }
+
+    /// Copies `term` onto the pointer-stable arena and returns the copy, **conflating** both
+    /// ways that copy can fail into "keep the original and freeze every heap".
+    ///
+    /// Prefer [`Runtime::try_stabilize_escaped`] — the honest split, which propagates a genuine
+    /// [`BeamError::SystemLimit`] instead of hiding it — at every call site whose enclosing
+    /// function can return a [`Result`]. This form survives for the **one** call site that
+    /// cannot (`src/runner/run.rs`'s exit-reason stabilization): a reason it cannot copy is
+    /// still stored (with the heaps frozen) rather than turning a process's termination reason
+    /// into a different error. Its behaviour is unchanged, valve trip included.
+    pub(crate) fn stabilize_escaped(&mut self, term: Eterm) -> Eterm {
+        match self.try_stabilize_escaped(term) {
             Ok(copy) => copy,
             Err(_) => {
                 self.disable_gc("an out-of-band store holds a term with an off-heap payload");
@@ -278,5 +332,144 @@ impl Runtime {
             self.gc.scratch.resize(n, beam_term::NIL);
         }
         &self.gc.scratch[..n]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use beam_common::BeamError;
+    use beam_engine::terms;
+    use beam_term::{compare, make_small, Eterm};
+
+    use super::*;
+    use crate::config::RuntimeConfig;
+    use crate::runtime::{PendingSpawn, MIN_HEAP_WORDS};
+    use crate::runner::ProcessEntry;
+
+    /// A runtime whose term-construction heaps — including the `-eval` heap the escape-store
+    /// stabilization copies onto — are at the floor, so a term too large for the destination is
+    /// cheap to build. The same rig `runtime.rs`'s
+    /// `an_oversized_return_value_becomes_the_documented_system_limit` uses.
+    fn small_runtime() -> Runtime {
+        Runtime::new(RuntimeConfig::new().with_heap_words(MIN_HEAP_WORDS))
+            .expect("the small-heap runtime")
+    }
+
+    /// A list far larger than the small runtime's destination heap (four cons words per element
+    /// against a [`MIN_HEAP_WORDS`]-word heap), built on the unbounded engine arena.
+    fn oversized_term(rt: &mut Runtime) -> Eterm {
+        let elems: Vec<Eterm> = (0..(MIN_HEAP_WORDS as i64 * 4)).map(make_small).collect();
+        let big = terms::make_list(&mut rt.arena, &elems).expect("the engine arena is unbounded");
+        assert!(
+            beam_term::size_object(big) > MIN_HEAP_WORDS,
+            "the term must exceed the destination heap to exercise the split"
+        );
+        big
+    }
+
+    /// **The honest split for a genuine failure.** A term the copier cannot fit is reported as
+    /// the emulator's documented `error:system_limit` — and, because that failure is *real*
+    /// rather than a capability gap, the global valve stays closed: one un-copyable store must
+    /// not freeze every process heap in the node.
+    #[test]
+    fn an_uncopyable_escaped_term_is_the_honest_system_limit() {
+        let mut rt = small_runtime();
+        let big = oversized_term(&mut rt);
+        assert!(
+            matches!(rt.try_stabilize_escaped(big), Err(BeamError::SystemLimit)),
+            "a term the copier cannot fit is the documented system_limit"
+        );
+        let stats = rt.gc_stats();
+        assert!(!stats.disabled, "a genuine failure must not freeze collection");
+        assert_eq!(stats.valve_trips, 0, "a genuine failure trips no valve");
+    }
+
+    /// **The happy path.** A copyable term becomes the pointer-stable copy (structurally equal,
+    /// different address) and the valve stays closed.
+    #[test]
+    fn a_copyable_escaped_term_is_copied_and_leaves_the_valve_closed() {
+        let mut rt = small_runtime();
+        let elems = [make_small(1), make_small(2), make_small(3)];
+        let original = terms::make_list(&mut rt.arena, &elems).expect("the engine arena");
+        let copy = rt.try_stabilize_escaped(original).expect("a small term copies");
+        assert!(
+            compare::eq(copy, original, rt.atoms()),
+            "the copy must be structurally the original"
+        );
+        assert_ne!(copy, original, "the copy lives on the destination heap");
+        let stats = rt.gc_stats();
+        assert!(!stats.disabled, "a successful copy trips no valve");
+        assert_eq!(stats.valve_trips, 0);
+    }
+
+    /// **The legacy, conflating form is unchanged.** The one remaining call site (the runner's
+    /// exit-reason stabilization) still keeps the un-copied original and freezes every process
+    /// heap — the documented behaviour it has always had, for a reason that must not become a
+    /// different error.
+    #[test]
+    fn the_conflating_form_still_keeps_the_original_and_trips_the_valve() {
+        let mut rt = small_runtime();
+        let big = oversized_term(&mut rt);
+        assert_eq!(
+            rt.stabilize_escaped(big),
+            big,
+            "the legacy form keeps the un-copied original"
+        );
+        let stats = rt.gc_stats();
+        assert!(stats.disabled, "the legacy form freezes every process heap");
+        assert_eq!(stats.valve_trips, 1);
+    }
+
+    /// **The pending-spawn store propagates the honest failure.** A child whose entry fun or
+    /// argument genuinely cannot be copied is recorded **nowhere** — the pass is handed the
+    /// honest `system_limit` instead of a record holding a dangling term — and no valve trips.
+    #[test]
+    fn a_pending_spawn_that_cannot_be_stabilized_is_recorded_nowhere() {
+        let mut rt = small_runtime();
+        let fun = oversized_term(&mut rt);
+        let spawn = PendingSpawn {
+            pid: rt.self_pid(),
+            entry: ProcessEntry::Fun { fun, target: None },
+            args: Vec::new(),
+        };
+        assert!(
+            matches!(rt.note_pending_spawn(spawn), Err(BeamError::SystemLimit)),
+            "an un-copyable entry is reported honestly"
+        );
+        assert!(rt.pending_spawns.is_empty(), "nothing was recorded");
+        let stats = rt.gc_stats();
+        assert!(!stats.disabled, "an honest failure trips no valve");
+        assert_eq!(stats.valve_trips, 0);
+    }
+
+    /// The counterpart: a recordable spawn is still recorded, with both the entry fun and the
+    /// arguments **copied** onto the arena.
+    #[test]
+    fn a_stabilizable_pending_spawn_is_recorded_with_arena_copies() {
+        let mut rt = small_runtime();
+        let fun = make_small(7);
+        let elems = [make_small(1), make_small(2)];
+        let arg = terms::make_list(&mut rt.arena, &elems).expect("the engine arena");
+        rt.note_pending_spawn(PendingSpawn {
+            pid: rt.self_pid(),
+            entry: ProcessEntry::Fun { fun, target: None },
+            args: vec![arg],
+        })
+        .expect("a recordable spawn");
+        assert_eq!(rt.pending_spawns.len(), 1, "the record was kept");
+        let recorded = &rt.pending_spawns[0];
+        match &recorded.entry {
+            ProcessEntry::Fun {
+                fun: recorded_fun, ..
+            } => assert_eq!(*recorded_fun, fun),
+            ProcessEntry::Export { .. } => panic!("a fun entry was recorded"),
+        }
+        let copied = recorded.args[0];
+        assert!(
+            compare::eq(copied, arg, rt.atoms()),
+            "the argument is the arena copy"
+        );
+        assert_ne!(copied, arg, "the copy lives on the destination heap");
+        assert!(!rt.gc_stats().disabled, "a successful store trips no valve");
     }
 }

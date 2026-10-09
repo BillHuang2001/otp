@@ -720,8 +720,10 @@ impl<'a> RuntimeHooksBridge<'a> {
     ///
     /// # Errors
     ///
-    /// Propagates the heap's failure when the reference term cannot be built — impossible
-    /// here (it was already built by the caller before scheduling).
+    /// The storage stabilization's failure: the message genuinely cannot be copied onto the
+    /// pointer-stable arena ([`Runtime::try_stabilize_escaped`], reported as the emulator's
+    /// `error:system_limit`). The reference term itself is already built by the caller before
+    /// scheduling, so building it cannot fail here.
     fn schedule(
         &mut self,
         delay: std::time::Duration,
@@ -732,11 +734,12 @@ impl<'a> RuntimeHooksBridge<'a> {
     ) -> Result<Eterm> {
         let _ = heap;
         // The message is delivered **later**, by the scheduler loop: copy it onto the
-        // pointer-stable arena now (see [`Runtime::stabilize_escaped`]) so it survives the
-        // scheduling process's own collection. `from` needs no copy (a pid term is a
-        // heap-free immediate) and `reference` must not be copied (it is the caller's own
-        // handle and the `Timers::refs` lookup key).
-        let message = self.runtime.stabilize_escaped(message);
+        // pointer-stable arena now (see [`Runtime::try_stabilize_escaped`]) so it survives the
+        // scheduling process's own collection, reporting a term the copier genuinely cannot
+        // copy as the honest `system_limit`. `from` needs no copy (a pid term is a heap-free
+        // immediate) and `reference` must not be copied (it is the caller's own handle and the
+        // `Timers::refs` lookup key).
+        let message = self.runtime.try_stabilize_escaped(message)?;
         let from = self.self_pid.to_eterm();
         self.runtime
             .timers_mut()

@@ -414,7 +414,7 @@ impl RuntimeContext<'_> {
         // observed by everything `Parent` later spawns. The store lives on the `Runtime`, so
         // it is reachable from inside a scheduler slice too.
         self.runtime.inherit_group_leader(parent, pid);
-        self.runtime.note_pending_spawn(PendingSpawn { pid, entry, args });
+        self.runtime.note_pending_spawn(PendingSpawn { pid, entry, args })?;
         Ok(pid.to_eterm())
     }
 
