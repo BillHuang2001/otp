@@ -478,8 +478,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   tagged-term discipline or a scoped `Table::view(&self)` handle.
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no fine-grained locking; the only synchronisation is `SharedTable`'s coarse `Arc<RwLock>`.
-  `{write_concurrency, auto}` and `{debug_hash_fixed_number_of_locks, N}` are not representable (the
-  flag is a `bool`).
+  The `{write_concurrency, auto}` and `{debug_hash_fixed_number_of_locks, N}` modes **are** representable
+  (`WriteConcurrency::Auto`/`FixedLocks(n)`, with `decentralized_counters` derived accordingly); what
+  remains host-side is the *rendering* — `TableInfo::write_concurrency` is still a `bool`, so the `auto`
+  atom / the normalized `{debug_hash_fixed_number_of_locks, Nlocks}` tuple is supplied by the
+  `beam_bifs` `TableProfile` sidecar. The stored `FixedLocks` count is the requested, un-normalized one.
 - **The owner-death transition has no caller.** `Table::owner_died` models it, but nothing in the
   runtime invokes it: `beam_bifs`'s `ets:new/2` never records an owner, its `TableRegistry` has no
   owner index, and `beam_process` has no process-death hook at all. `ETS_SURFACE.md` §7 names the exact
