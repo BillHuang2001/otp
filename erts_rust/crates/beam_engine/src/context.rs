@@ -34,6 +34,18 @@
 //! `apply` path). All are added with default bodies, so an existing implementor
 //! keeps compiling unchanged.
 //!
+//! ## The root-set hand-off (GC admission for `alloc_words`)
+//!
+//! [`ensure_heap`] is the engine's *admission point*: it hands the live root set
+//! over as mutable slices so the host can collect and move terms in place. Term
+//! **construction**, however, goes through [`alloc_words`], which has neither an
+//! admission point nor root access — so a host whose heap must be collected cannot
+//! collect while the engine builds a term. [`alloc_words_rooted`] closes that gap:
+//! it is the rooted twin of [`alloc_words`], taking a [`RootSet`] (the X
+//! registers, the whole Erlang stack and the whole FR file) and defaulting to
+//! [`alloc_words`] with the roots discarded, so **every existing implementor
+//! compiles and behaves byte-identically**. [`crate::machine::Machine::alloc_rooted`]
+//! is where the engine's own slices are handed over.//!
 //! ## The mailbox / message-receive seam
 //!
 //! The `receive` opcode family ([`crate::families::receive`]) never looks at a
@@ -120,6 +132,87 @@ pub trait Mailbox {
 
     /// `recv_marker_clear`: release `reference`'s marker.
     fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()>;
+}
+
+/// The engine's **mutable root set** — the terms a collection must keep alive and
+/// may relocate **in place**.
+///
+/// This is the hand-off [`ExecutionContext::alloc_words_rooted`] receives: an
+/// allocation that may run the collector is handed the live roots *by mutable
+/// slice*, and the context writes each moved term back through those slices, so a
+/// collector can compact/move a term without the engine keeping any frame liveness
+/// map (the same contract [`ExecutionContext::ensure_heap`] documents).
+///
+/// # The root-set contract (frozen)
+///
+/// The live roots of a running [`Machine`](crate::machine::Machine) are exactly:
+///
+/// * `x[0..live)` — the leading `live` X registers of [`RootSet::x`]; the trailing
+///   registers are dead for the instruction in flight;
+/// * **the whole** [`RootSet::stack`] (every Y slot of every live frame — there are
+///   no frame liveness maps);
+/// * **the whole** [`RootSet::fr`] (the float-register file, which at Milestone 1
+///   holds `Eterm` **term slots**, so it can hold heap pointers like any other
+///   register).
+///
+/// [`RootSet::live`] is only a **hint**: the engine hands over the whole x-register
+/// file (a conservative over-approximation is always *safe* for a copying
+/// collector — it can only keep a term alive that would otherwise die, never free a
+/// live one), and [`RootSet::live_len`] clamps it to the slice length, so
+/// [`RootSet::ALL_LIVE`] (`u32::MAX`) means "treat every register as live".
+///
+/// Nothing outside the root set is a root: a raw [`Eterm`] the engine is holding
+/// only in a local variable, or a `*mut Eterm` from a previous
+/// [`ExecutionContext::alloc_words`], is **not** preserved across a collection —
+/// exactly the C `HAlloc`/`heap_top` convention, so a pointer returned by
+/// `alloc_words` is invalidated by the next `ensure_heap`/collecting `alloc_words`
+/// and the engine must re-read any live term from `x`/`stack`/`fr`.
+#[derive(Debug)]
+pub struct RootSet<'a> {
+    /// The whole X-register file; `x[0..live_len()]` is declared live.
+    pub x: &'a mut [Eterm],
+    /// The whole Erlang stack: the Y slots of every live frame, oldest first.
+    pub stack: &'a mut [Eterm],
+    /// The whole float-register (FR) file (`Eterm` term slots at Milestone 1).
+    pub fr: &'a mut [Eterm],
+    /// How many leading `x` slots the caller declares live (a hint; clamped by
+    /// [`RootSet::live_len`]). [`RootSet::ALL_LIVE`] means "all of them".
+    pub live: u32,
+}
+
+impl<'a> RootSet<'a> {
+    /// The value of [`RootSet::live`] that declares **every** X register live.
+    pub const ALL_LIVE: u32 = u32::MAX;
+
+    /// Build a root set over the three mutable slices.
+    pub fn new(
+        x: &'a mut [Eterm],
+        stack: &'a mut [Eterm],
+        fr: &'a mut [Eterm],
+        live: u32,
+    ) -> RootSet<'a> {
+        RootSet { x, stack, fr, live }
+    }
+
+    /// The declared live X-register count, clamped to the actual file length.
+    #[inline]
+    pub fn live_len(&self) -> usize {
+        (self.live as usize).min(self.x.len())
+    }
+
+    /// The live X registers (`x[0..live_len()]`).
+    #[inline]
+    pub fn live_x(&self) -> &[Eterm] {
+        &self.x[..self.live_len()]
+    }
+
+    /// The live X registers, mutably (the slice a collector writes moved terms
+    /// back through).
+    #[inline]
+    pub fn live_x_mut(&mut self) -> &mut [Eterm] {
+        let live = self.live_len();
+        &mut self.x[..live]
+    }
 }
 
 /// One execution-trace event the engine reports to its host (contract A.8).
@@ -241,6 +334,33 @@ pub trait ExecutionContext {
         Err(crate::error::unsupported("alloc_words"))
     }
 
+    /// Allocate `n` uninitialized heap words **with the live root set handed in**,
+    /// so the context may run the collector (and move terms) as part of the
+    /// allocation.
+    ///
+    /// [`alloc_words`](ExecutionContext::alloc_words) has no admission point and no
+    /// root-set access, so a context whose heap must be collected cannot collect
+    /// when the engine builds a term: every `crate::terms::make_*` goes through
+    /// `alloc_words`, and there is nowhere to hand the roots over. This method is
+    /// that missing admission point: it takes the [`RootSet`] (the X registers, the
+    /// whole Erlang stack and the whole FR file — see the type docs for the frozen
+    /// contract) and returns a pointer to `n` **uninitialized** words under exactly
+    /// [`alloc_words`](ExecutionContext::alloc_words)'s stability rule (valid until
+    /// the next `ensure_heap`/collecting allocation).
+    ///
+    /// The default body is [`alloc_words`](ExecutionContext::alloc_words) with the
+    /// roots discarded, so **every existing implementor keeps working unchanged**
+    /// (and byte-identically): a host with a real collector overrides this and runs
+    /// its collector over `roots` first, writing any moved term back through
+    /// `roots.x`/`roots.stack`/`roots.fr`.
+    ///
+    /// The engine reaches this method through
+    /// [`Machine::alloc_rooted`](crate::machine::Machine::alloc_rooted), which is
+    /// where the machine's own slices are handed over.
+    fn alloc_words_rooted(&mut self, n: usize, roots: RootSet<'_>) -> Result<*mut Eterm> {
+        let _ = roots;
+        self.alloc_words(n)
+    }
     /// Dispatch the external-function / BIF application `module:function/arity`.
     ///
     /// This is the general `apply`/`call_ext` hook; the default delegates to
@@ -463,6 +583,80 @@ pub type ApplyHook = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Eterm>>;
 pub type ExternalResolver =
     Box<dyn FnMut(&str, &str, u32) -> Result<Option<(Arc<Module>, Label)>>>;
 
+/// Arena chunk size in `Eterm` words (64 KiB).
+///
+/// Large enough that the per-chunk `Box` handle (and the arena's own bookkeeping)
+/// is amortised to nothing over the thousands of small allocations a term-building
+/// run makes, yet small enough that a lightly-using context does not reserve 64 KiB
+/// for one word (the first request always allocates a whole chunk, so no chunk
+/// crosses a request boundary).
+const ARENA_CHUNK_WORDS: usize = 64 * 1024 / core::mem::size_of::<Eterm>();
+
+/// A **chunked** pointer-stable arena: the backing store of
+/// [`MinimalContext::alloc_words`](ExecutionContext::alloc_words).
+///
+/// Requests are served as sub-slices of a large fixed-size *chunk*, so an
+/// allocation costs its **payload only** — the arena holds **one** `Box` handle per
+/// chunk (a few thousand words), not one per allocation. (The previous shape boxed
+/// every request, retaining a whole `Box<[Eterm]>` handle plus an allocator
+/// header per allocation.)
+///
+/// # Pointer stability
+///
+/// The chunks are boxed and pushed into a `Vec` that only ever grows: the `Vec`'s
+/// reallocation moves the *chunk handles*, never the chunk buffers, so a pointer
+/// handed out by [`Arena::alloc`] stays valid (and unmoved) until the context is
+/// dropped. A request **larger than a chunk** gets a dedicated chunk of its own,
+/// marked fully consumed, so a later small request can never alias into it.
+struct Arena {
+    /// The chunks, oldest first. The last one is the allocation frontier.
+    chunks: Vec<Box<[Eterm]>>,
+    /// Words already handed out of the newest chunk.
+    used: usize,
+}
+
+impl Arena {
+    /// An empty arena (no chunk is allocated until the first request).
+    fn new() -> Arena {
+        Arena {
+            chunks: Vec::new(),
+            used: 0,
+        }
+    }
+
+    /// Hand out `n` uninitialized words and return a stable pointer to them.
+    fn alloc(&mut self, n: usize) -> *mut Eterm {
+        // A request larger than a chunk gets its own chunk. `used` is set past its
+        // end so a later small request cannot be served from — and alias into — the
+        // bytes the caller is about to write.
+        if n > ARENA_CHUNK_WORDS {
+            let mut block = vec![Eterm::default(); n].into_boxed_slice();
+            let ptr = block.as_mut_ptr();
+            self.chunks.push(block);
+            self.used = n;
+            return ptr;
+        }
+        // Room in the current chunk? (`saturating_sub` keeps the check total: no
+        // state can make `used` exceed a chunk's length.)
+        let room = match self.chunks.last() {
+            Some(chunk) => chunk.len().saturating_sub(self.used) >= n,
+            None => false,
+        };
+        if !room {
+            self.chunks
+                .push(vec![Eterm::default(); ARENA_CHUNK_WORDS].into_boxed_slice());
+            self.used = 0;
+        }
+        let chunk = self.chunks.last_mut().expect("a chunk was just ensured");
+        // Safe indexing into the free tail: the pointer to its first word. A
+        // zero-word request at the end of a full chunk yields a one-past-the-end
+        // (non-null, aligned) pointer, exactly as documented.
+        let ptr = chunk[self.used..].as_mut_ptr();
+        self.used += n;
+        ptr
+    }
+}
+
 /// Minimal context: an unbounded heap plus a pluggable BIF hook.
 ///
 /// Used by tests and embeddings. [`MinimalContext::ensure_heap`] is a no-op (the
@@ -489,15 +683,18 @@ pub struct MinimalContext {
     external_resolver: Option<ExternalResolver>,
     /// An optional mailbox (the body of the nine receive-seam methods).
     mailbox: Option<Box<dyn Mailbox>>,
-    /// A pointer-stable arena backing [`ExecutionContext::alloc_words`].
+    /// A **chunked**, pointer-stable arena backing
+    /// [`ExecutionContext::alloc_words`].
     ///
-    /// Each allocation is its own `Box<[Eterm]>`: growing the outer `Vec` moves
-    /// the *box handles*, never the boxes' buffers, so a pointer handed out by
-    /// `alloc_words` stays valid for the lifetime of the context (in this context
-    /// `ensure_heap` never moves anything). The boxes are never freed before the
-    /// context is dropped, which is exactly the "valid until the next
+    /// Each allocation is served as a sub-slice of a large fixed-size chunk (see
+    /// [`Arena`]), so an allocation costs its payload only — one `Box` handle is
+    /// retained **per chunk**, not per allocation. Chunks are boxed, so growing the
+    /// arena moves the chunk handles but never a chunk's buffer: a pointer handed
+    /// out by `alloc_words` stays valid for the lifetime of the context (in this
+    /// context `ensure_heap` never moves anything). The chunks are never freed
+    /// before the context is dropped, which is exactly the "valid until the next
     /// `ensure_heap`" stability contract the trait documents.
-    arena: Vec<Box<[Eterm]>>,
+    arena: Arena,
 }
 
 impl MinimalContext {
@@ -517,7 +714,7 @@ impl MinimalContext {
             apply_hook: None,
             external_resolver: None,
             mailbox: None,
-            arena: Vec::new(),
+            arena: Arena::new(),
         }
     }
 
@@ -621,14 +818,12 @@ impl ExecutionContext for MinimalContext {
     }
 
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
-        // `vec![..; n]` initialises every word; a zero-length box still yields a
-        // dangling-but-non-null, well-aligned pointer (the documented result of a
-        // zero-word request). Taking `as_mut_ptr` after boxing is safe Rust.
-        let mut block = vec![Eterm::default(); n].into_boxed_slice();
-        let ptr = block.as_mut_ptr();
-        // Keep the buffer alive and immovable for the lifetime of the context.
-        self.arena.push(block);
-        Ok(ptr)
+        // The chunked arena hands out a sub-slice of a fixed-size chunk (its words
+        // are pre-initialised to NIL, so they are already the "uninitialized words"
+        // the trait contracts); a zero-word request still yields a non-null,
+        // well-aligned pointer. The pointer stays stable for the life of the
+        // context because the chunks are boxed and never move.
+        Ok(self.arena.alloc(n))
     }
 
     fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {

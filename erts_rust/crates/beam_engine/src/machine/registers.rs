@@ -106,6 +106,19 @@ impl Machine {
         self.x.get(n as usize).copied()
     }
 
+    /// The whole X-register file as a mutable slice — the **root-set hand-off**.
+    ///
+    /// The engine's live roots are `x[0..live)` plus the whole Erlang stack plus the
+    /// whole FR file ([`crate::context::RootSet`]). This is the raw single-view
+    /// accessor for the X file; a caller that needs the **whole** root set at once
+    /// (all three files, disjointly borrowed) must use
+    /// [`Machine::with_roots`](crate::machine::Machine::with_roots), because three
+    /// separate `&mut self` accessor calls cannot coexist.
+    #[inline]
+    pub fn x_mut(&mut self) -> &mut [Eterm] {
+        &mut self.x
+    }
+
     /// Read float register `n`, or `None` if it is outside the FR file.
     ///
     /// Mirrors [`Machine::x`]: a bounds-checked read of the FR file.
@@ -114,6 +127,17 @@ impl Machine {
         self.fr.get(n as usize).copied()
     }
 
+    /// The whole float-register (FR) file as a mutable slice — part of the
+    /// **root-set hand-off**.
+    ///
+    /// The FR file holds `Eterm` **term slots** at Milestone 1, so a float register
+    /// can hold a pointer into the process heap and must be a GC root; see
+    /// [`Machine::x_mut`] for why the whole-set hand-off goes through
+    /// [`Machine::with_roots`](crate::machine::Machine::with_roots).
+    #[inline]
+    pub fn fr_mut(&mut self) -> &mut [Eterm] {
+        &mut self.fr
+    }
     /// Write `value` into float register `n`.
     ///
     /// Mirrors [`Machine::set_x`]: returns [`crate::error::bad_register`] if `n` is
