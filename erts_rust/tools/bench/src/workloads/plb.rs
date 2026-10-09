@@ -54,8 +54,9 @@
 //! never `ok`, because the only other number on such a row is the tool's own wall time,
 //! which is not a benchmark result. A **build** stage that fails is recorded
 //! `failed(plb-build-failed)` instead, so the row names the stage that broke; every failure
-//! carries a trimmed diagnostic in `notes` (the fatal .NET exception from stderr, else the
-//! tail of the tool's own stdout log).
+//! carries trimmed diagnostics in `notes` (the fatal .NET exception from stderr plus the
+//! first error-looking line of the tool's own stdout log — or its tail when the log looks
+//! clean), so the row says *which* command broke, not merely that something did.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
