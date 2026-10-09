@@ -45,9 +45,11 @@
 //! [`big_to_f64`] returns `None` for anything that is not a representable bignum
 //! (not a bignum at all, or a magnitude too large for a finite double); callers
 //! such as `beam_engine`'s `Fconv` map `None` onto `badarith`. It never returns a
-//! silently wrong value. [`number_as_f64`] is the best-effort total variant used
-//! by `compare`'s arithmetic-mode mixed int/float comparison.
-//!
+//! silently wrong value. [`number_as_f64`] is the best-effort total variant; it is
+//! **not** used for term comparison — `compare`'s arithmetic-mode mixed
+//! integer/float comparison uses ERTS's exact algorithm
+//! (`compare::numbers`), because converting both sides to `f64` is lossy beyond
+//! the 53-bit mantissa.//!
 //! Every `unsafe` block here carries a `// SAFETY:` rationale; the public
 //! functions are safe, exactly like [`crate::compare::cmp`] / [`crate::size::size_object`],
 //! because the crate treats an [`Eterm`] as a valid term by construction.
@@ -210,6 +212,15 @@ fn pow2(e: i32) -> f64 {
 
 /// Best-effort `f64` value of a numeric term (`number_as_f64`).
 ///
+/// **Not used for exact comparison.** `compare`'s arithmetic-mode mixed
+/// integer/float comparison deliberately does *not* call this: converting both
+/// sides to `f64` loses any integer precision beyond the 53-bit mantissa (e.g. it
+/// would report `9007199254740993 == 9007199254740992.0`), so that path ports
+/// ERTS's own exact integer ↔ float algorithm instead (`compare::numbers`).
+/// This function remains the convenience total conversion for callers that
+/// genuinely want a best-effort `double` (and [`big_to_f64`] the faithful,
+/// fallible one).
+///
 /// Total and panic-free over **any** word:
 /// * a small integer → its value;
 /// * a float → its value;
@@ -221,9 +232,6 @@ fn pow2(e: i32) -> f64 {
 /// * a word that is not a term at all (a bare header word, e.g. the ABI's
 ///   `THE_NON_VALUE`; see [`crate::tag::is_term_word`]) → `f64::NAN`, via
 ///   [`TermClass::NonValue`] and without any dereference.
-///
-/// This is what `compare`'s arithmetic-mode mixed integer/float comparison uses;
-/// a `NaN` therefore only ever arises from a non-number operand.
 pub fn number_as_f64(x: Eterm) -> f64 {
     // SAFETY: `class` is total: it classifies an immediate by its tag bits, derefs
     // the header of a well-formed boxed term, and answers `NonValue` (no deref) for
