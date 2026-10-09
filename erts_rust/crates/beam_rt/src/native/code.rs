@@ -360,11 +360,6 @@ impl RuntimeContext<'_> {
     /// `interactive` is its real mode; the `-mode embedded` override is honoured because
     /// it is what the release's own `code.erl` does with the same init argument. See
     /// [`Self::code_get_path`] for how the mode-less default behaves.
-    ///
-    /// The `try_native` arm that reaches this entry is a registration in
-    /// `../native.rs` — one level up, outside this node — so until it lands the method
-    /// is reachable only from the unit tests below (hence the `allow`).
-    #[allow(dead_code)]
     pub(super) fn code_get_mode(&mut self) -> Result<Eterm> {
         self.atom(if self.wants_embedded_mode() {
             "embedded"

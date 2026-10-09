@@ -191,11 +191,6 @@ impl RuntimeContext<'_> {
     /// answers for a process that belongs to none (verified against OTP 29/erts-17.1:
     /// `application:get_application()` ⇒ `undefined`). The `/1` form is not claimed; it
     /// would have to reason about a pid/module's owning application.
-    ///
-    /// The `try_native` arm that reaches this entry is a registration in
-    /// `../native.rs` — one level up, outside this node — so until it lands the method
-    /// is reachable only from the unit test below (hence the `allow`).
-    #[allow(dead_code)]
     pub(super) fn application_get_application_0(&mut self) -> Result<Eterm> {
         self.atom("undefined")
     }
