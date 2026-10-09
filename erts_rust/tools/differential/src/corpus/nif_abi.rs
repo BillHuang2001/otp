@@ -60,33 +60,43 @@
 //! forbidden here:
 //!
 //! * pinned — `enif_make_existing_atom` / `_len` **refusing** a name no one holds (both answer
-//!   `0` and leave `*atom` untouched, `atom.c:431`); `enif_whereis_pid` on an unregistered atom
-//!   and on a non-atom name (both `0`); `enif_binary_to_term` **refusing** data that is not a
-//!   `VERSION_MAGIC`-prefixed encoding (both `0`); `enif_clear_env` on a clean `enif_alloc_env`
-//!   env leaving no pending exception (both `0`); the **properties** of `enif_make_unique_integer`
-//!   (positive / monotonic / default-negative — the crate-internal counters are real, distinct
-//!   and monotone per flag set); the frozen fields of `enif_system_info` (the driver/NIF version
-//!   macros it was compiled with, `thread_support`, `smp_support`, the `"17.1"` erts version);
-//!   and a name first interned *during* the call still being one atom with one identity.
-//! * **not** pinned (a real, documented divergence — recorded as a gap, never as a corpus case) —
-//!   `enif_term_to_binary` / `enif_binary_to_term` on a **valid** term (`0` where the oracle
-//!   answers `1`: no `term_to_binary`/`binary_to_term` host hook); `enif_make_ref` (the Rust
-//!   runtime raises `badarg` where the oracle yields a ref: no `make_ref` host hook);
-//!   `enif_make_existing_atom`/`enif_whereis_pid` on a name that **is** held/registered (those
-//!   hooks answer `None` unconditionally); and an `enif_make_atom` → `enif_get_atom` round trip
-//!   on a brand-new name (the host's `atom_name` consults the **committed** atom table only, so a
-//!   name interned during this call is not yet resolvable). Owning crates:
-//!   `crates/beam_rt/src/nif.rs` (`NifHostImpl`) + `crates/beam_abi/src/nif/`. `enif_system_info`'s
-//!   `otp_release` / `async_threads` / `scheduler_threads` / `dirty_scheduler_support` values are
-//!   likewise documented to differ and are never asserted.
+//!   `0` and leave `*atom` untouched, `atom.c:431`) **and** *finding* a name interned earlier in
+//!   the same call (both answer `1` with that very atom: the env's per-call atom record makes a
+//!   freshly interned name visible to the lookup-only constructor, which is exactly the C's
+//!   `erts_atom_get` answer); `enif_get_atom` / `enif_get_atom_length` **reading back** a name
+//!   first interned during the call; `enif_whereis_pid` on an unregistered atom and on a non-atom
+//!   name (both `0`); `enif_binary_to_term` **refusing** data that is not a `VERSION_MAGIC`-
+//!   prefixed encoding (both `0`); `enif_clear_env` on a clean `enif_alloc_env` env leaving no
+//!   pending exception (both `0`); the **properties** of `enif_make_unique_integer` (positive /
+//!   monotonic / default-negative — the crate-internal counters are real, distinct and monotone
+//!   per flag set); the frozen fields of `enif_system_info` (the driver/NIF version macros it was
+//!   compiled with, `thread_support`, `smp_support`, the `"17.1"` erts version); and a name first
+//!   interned *during* the call still being one atom with one identity.
+//! * **not** pinned (a real, documented divergence — recorded as a gap, never as a corpus case,
+//!   each re-verified against the live runtimes at this revision) — `enif_term_to_binary` on a
+//!   **valid** term and `enif_binary_to_term` on a **valid** encoding: the Rust runtime answers
+//!   `0` (`enif_term_to_binary(42)` / the 3-byte `<<131,97,42>>` both answer `1` under the oracle)
+//!   because no `term_to_binary`/`binary_to_term` host hook is installed; `enif_make_ref` on a
+//!   valid env, where the Rust runtime raises `badarg` (the oracle yields a fresh ref: no
+//!   `make_ref` hook); `enif_make_existing_atom` on a name held in the **committed** atom table but
+//!   not interned during the call (`enif_make_existing_atom(env, "ok", …)` is `1` under the oracle,
+//!   `0` here: the `existing_atom` hook answers `None` unconditionally); and `enif_whereis_pid` on
+//!   a name a process **is** registered under (`init` is `1` under the oracle, `0` here: no
+//!   `whereis_pid` hook). Owning crates: `crates/beam_rt/src/nif.rs` (`NifHostImpl`) +
+//!   `crates/beam_abi/src/nif/`. `enif_system_info`'s `otp_release` / `async_threads` /
+//!   `scheduler_threads` / `dirty_scheduler_support` values are likewise documented to differ and
+//!   are never asserted.
 //!
 //! The time family is exercised only through the deterministic `enif_convert_time_unit`
 //! (`enif_monotonic_time`'s absolute value is documented to differ) and through the **shape** of
 //! `enif_now_time` / `enif_cpu_time` (their `{MegaSecs,Secs,MicroSecs}` 3-tuple, whose values are
 //! clock readings and are therefore never asserted).
 //!
-//! The **atom** read accessors are exercised over a name the runtime already holds (`ok`) and over
-//! a name first interned during the call (identity only). The exception slot is driven on an
+//! The **atom** read accessors are exercised over a name the runtime already holds (`ok`), over a
+//! name first interned during the call (identity), and over the **lookup/read-back** side of that
+//! same fresh name — `enif_make_existing_atom` / `_len` finding it, `enif_get_atom` /
+//! `enif_get_atom_length` reading it — which resolves through the env's per-call atom record here
+//! and through the global atom table in the oracle. The exception slot is driven on an
 //! **`enif_alloc_env` env** because `enif_raise_exception` on a process env leaks into the caller;
 //! `enif_clear_env` follows the same rule (on a clean allocated env it is a no-op in both — the
 //! oracle leaves the pending flag set where the Rust runtime clears it, so the *raisable* shape is
@@ -846,6 +856,47 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_int(env, (enif_is_atom(env, a) && enif_is_identical(a, b)) ? 1 : 0);
     }
 
+    /* ------------------------------------------- the atom lookups: the success shapes
+       The lookup/read side of the family above: a lookup that hits (through the env's per-call
+       atom record here, through the global atom table in the oracle) and a name interned during
+       the call staying readable. Each branch pins one integer the two runtimes answer alike. */
+    case 83: {                                 /* make_existing_atom hits a name held in this call */
+        const char* name = "nif_abi_held_atom";
+        ERL_NIF_TERM made = enif_make_atom(env, name);
+        ERL_NIF_TERM found = 0;
+        int r = enif_make_existing_atom(env, name, &found, ERL_NIF_LATIN1);
+        return enif_make_int(env, (r == 1 && enif_is_identical(made, found)) ? 1 : 0);
+    }
+    case 84: {                                 /* make_existing_atom_len hits, under its length */
+        const char* buf = "nif_abi_held_atom_lenXX";
+        size_t n = strlen(buf) - 2;            /* the trailing "XX" is not part of the name */
+        ERL_NIF_TERM made = enif_make_atom_len(env, buf, n);
+        ERL_NIF_TERM found = 0;
+        char got[64];
+        int r = enif_make_existing_atom_len(env, buf, n, &found, ERL_NIF_LATIN1);
+        int len = enif_get_atom(env, found, got, sizeof(got), ERL_NIF_LATIN1);
+        /* The explicit length is honoured on both sides: the atom is the truncated name, not the
+           whole buffer (`got` is only read once `enif_get_atom` reported success). */
+        return enif_make_int(env,
+            (r == 1 && enif_is_identical(made, found) && len == (int) n + 1 &&
+             strncmp(got, "nif_abi_held_atom_len", n) == 0) ? 1 : 0);
+    }
+    case 85: {                                 /* get_atom reads a name interned in this call */
+        const char* name = "nif_abi_fresh_get_atom";
+        ERL_NIF_TERM t = enif_make_atom(env, name);
+        char buf[64];
+        int r = enif_get_atom(env, t, buf, sizeof(buf), ERL_NIF_LATIN1);
+        return enif_make_int(env,
+            (r == (int) strlen(name) + 1 && strcmp(buf, name) == 0) ? 1 : 0);
+    }
+    case 86: {                                 /* get_atom_length counts that same fresh name */
+        const char* name = "nif_abi_fresh_atom_length";
+        ERL_NIF_TERM t = enif_make_atom(env, name);
+        unsigned n = 0;
+        int r = enif_get_atom_length(env, t, &n, ERL_NIF_LATIN1);
+        return enif_make_int(env, (r == 1 && n == (unsigned) strlen(name)) ? 1 : 0);
+    }
+
     default:
         break;
     }
@@ -1153,6 +1204,31 @@ pub(crate) fn group() -> Vec<Case> {
             &[82],
             "1",
         ),
+        // --- the host-hooked slots: the lookup/read success paths -------------------------
+        case(
+            "nif_abi/atom_make_existing_atom_hit",
+            "enif_make_existing_atom finds a name held in this call and yields the same atom",
+            &[83],
+            "1",
+        ),
+        case(
+            "nif_abi/atom_make_existing_atom_len_hit",
+            "enif_make_existing_atom_len finds that name under its explicit length",
+            &[84],
+            "1",
+        ),
+        case(
+            "nif_abi/atom_get_atom_fresh_name",
+            "enif_get_atom reads back a name first interned during the call",
+            &[85],
+            "1",
+        ),
+        case(
+            "nif_abi/atom_get_atom_length_fresh_name",
+            "enif_get_atom_length counts a name first interned during the call",
+            &[86],
+            "1",
+        ),
     ]
 }
 
@@ -1305,12 +1381,45 @@ mod tests {
         // library must never carry one:
         //   * enif_make_ref          -> the Rust runtime raises badarg (no host `make_ref`);
         //   * enif_term_to_binary    -> the Rust runtime answers 0 (no host `term_to_binary`);
-        //   * a *valid* enif_binary_to_term input is exercised nowhere (no host hook either).
-        for absent in ["enif_make_ref(", "enif_term_to_binary("] {
+        //   * a *valid* enif_binary_to_term input is exercised nowhere (no host hook either);
+        //   * an enif_whereis_pid **hit** on a registered name answers 0 here (no `whereis_pid`
+        //     hook) where the oracle answers 1 — see the new test for the shapes that DO hit.
+        for absent in [
+            "enif_make_ref(",
+            "enif_term_to_binary(",
+            "131, 97, 42",
+            "enif_whereis_pid(env, enif_make_atom(env, \"init\")",
+        ] {
             assert!(
                 !super::NIF_ABI_C.contains(absent),
                 "the library must not reference {absent} (a guaranteed mismatch)"
             );
+        }
+    }
+
+    #[test]
+    fn the_atom_lookup_success_paths_are_pinned() {
+        // The *success* half of the lookup-only constructor and of the two atom read accessors: a
+        // name first interned during the call is found / read back by both runtimes (the exact
+        // rule is in the module docs). Each is a real corpus case — the selector really drives the
+        // branch, and the golden is the oracle's own integer for it.
+        let cases = group();
+        for (id, selector) in [
+            ("nif_abi/atom_make_existing_atom_hit", 83i64),
+            ("nif_abi/atom_make_existing_atom_len_hit", 84),
+            ("nif_abi/atom_get_atom_fresh_name", 85),
+            ("nif_abi/atom_get_atom_length_fresh_name", 86),
+        ] {
+            let case = cases
+                .iter()
+                .find(|case| case.id == id)
+                .unwrap_or_else(|| panic!("the group must carry {id}"));
+            let CaseKind::Module(run) = case.kind else {
+                panic!("{id}: an A.3 case must be a module-run case");
+            };
+            assert_eq!(run.args, &[selector][..], "case {id}");
+            assert_eq!(case.golden.stdout, Some("1"), "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}");
         }
     }
 
