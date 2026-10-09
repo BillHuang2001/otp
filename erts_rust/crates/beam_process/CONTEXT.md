@@ -78,11 +78,12 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
 ### `scheduler.rs` — the single-threaded scheduler loop + the engine seam
 - `RunOutcome { Yield, Wait, Suspend, Exit(Eterm) }` — what happened in a reduction slice (`Exit(reason_term)` = the process terminated with that reason).
 - `ProcessRunner` — **the engine seam** (`beam_engine` is NOT a dependency; `beam_rt`/`beam_engine` implement it over an `ExecutionContext`): `fn run(&mut self, pid: ProcessId, table: &mut ProcessTable, budget: u32) -> Result<RunOutcome>`.
-- `Scheduler` — `new()` (default `DEFAULT_REDUCTIONS_PER_SLICE = 4000`), `with_slice(u32)`, `enqueue(pid)` (⇒ normal) / `enqueue_with_priority`, `progress()/progress_mut()`, and:
-  - `run_slice<R: ProcessRunner>(&mut self, table, runner) -> Result<Option<ProcessId>>` — pop one pid, **service its pending signals** (schedule-in; a fatal signal can terminate the pid, in which case `run_slice` returns early having run zero reductions), run one slice; `Yield` ⇒ requeue at the tail of the process's **own** current priority; `Wait`/`Suspend` ⇒ leave the queue (state set by the runner); `Exit(reason)` ⇒ `table.terminate(pid, reason)` (or `terminate_with_ports` in the `_with_ports` form). After the outcome (and on the empty-queue early return) it absorbs the table's wake list via `resume_woken`.
+- `Scheduler` — `new()` (default `DEFAULT_REDUCTIONS_PER_SLICE = 4000`), `with_slice(u32)`, an optional **owned** `PortTable` (`with_ports(PortTable)`, `set_ports`, `take_ports`, `ports`, `ports_mut`, `has_ports`; `new`/`with_slice` own none), `enqueue(pid)` (⇒ normal) / `enqueue_with_priority`, `progress()/progress_mut()`, and:
+  - `run_slice<R: ProcessRunner>(&mut self, table, runner) -> Result<Option<ProcessId>>` — pop one pid, **service its pending signals** (schedule-in; a fatal signal can terminate the pid, in which case `run_slice` returns early having run zero reductions), run one slice; `Yield` ⇒ requeue at the tail of the process's **own** current priority; `Wait`/`Suspend` ⇒ leave the queue (state set by the runner); `Exit(reason)` ⇒ terminate the pid (through `terminate_with_ports` when the scheduler owns a port table, else the port-less `terminate`). After the outcome (and on the empty-queue early return) it absorbs the table's wake list (via `resume_woken`/the free `resume_woken_into`).
   - `resume_woken(&mut self, table) -> usize` — drain `table.drain_woken()`; enqueue each still-live `Runnable` pid not already in a run queue **at its own priority**; returns the count. Also the hook `beam_rt` calls after a send made **outside** a slice.
-  - `run_ready<R>(&mut self, table, runner, max_slices: Option<u64>) -> Result<u64>` — run until the ready queue is empty or `max_slices` slices ran.
-  - `run_slice_with_ports<R>(&mut self, table, ports: &mut PortTable, runner) -> Result<Option<ProcessId>>` / `run_ready_with_ports<R>(&mut self, table, ports, runner, max_slices)` — the **port-aware** forms: identical slice semantics, but schedule-in uses `ProcessTable::service_signals_with_ports` and an `Exit` outcome uses `ProcessTable::terminate_with_ports`, so a death during (or at the start of) a slice cleans the dying process's matching **incoming** `PortMonitor` entries. The port-less `run_slice`/`run_ready` are the thin `None`-ports delegations (they drain the dying process's outgoing watch set but leave the port table alone), and the `pub(crate)` `run_one`/`slice_begin`/`slice_end` have the mirror pair (`run_one_with_ports`/`slice_begin_with_ports`/`slice_end_with_ports`) over shared private `*_inner` bodies. **Adoption:** an orchestrator that owns a `PortTable` (today `beam_rt` drives the port-less forms and works around the incoming half via its exit observer) should drive these; the SMP pool has no `PortTable` and stays on the port-less helpers.
+  - `run_ready<R>(&mut self, table, runner, max_slices: Option<u64>) -> Result<u64>` — run until the ready queue is empty or `max_slices` slices ran; every slice is a `run_slice`, so the owned-port-table dispatch below applies.
+  - **Port-aware adoption.** The default `run_slice`/`run_ready` resolve an effective port table from the scheduler's **owned** one: with a table set (`with_ports`/`set_ports`) they route to the port-aware helpers, so schedule-in services signals through `ProcessTable::service_signals_with_ports` and an `Exit` outcome terminates through `ProcessTable::terminate_with_ports` — a process that dies during (or at the start of) a slice then has its matching **incoming** `PortMonitor` removed. With no owned table they keep the prior port-less behaviour (they drain the dying process's outgoing watch set but leave the port table alone).
+  - `run_slice_with_ports<R>(&mut self, table, ports: &mut PortTable, runner) -> Result<Option<ProcessId>>` / `run_ready_with_ports<R>(&mut self, table, ports, runner, max_slices)` — the **explicit port-table** forms: identical semantics, but the passed table **takes precedence over the owned one for that call only** (the owned table is left untouched), so a caller can drive a slice against a table it owns itself. The `pub(crate)` `run_one`/`slice_begin`/`slice_end` have the mirror pair (`run_one_with_ports`/`slice_begin_with_ports`/`slice_end_with_ports`) over shared private `*_inner` bodies; the SMP pool has no `PortTable` and stays on the port-less helpers.
   - `set_priority(&mut self, table, pid, priority) -> Result<()>` — update the PCB priority and, **iff** the pid is already queued at a different level, move it to the new level's tail (the C `erts_set_process_priority` requeue); `TermNotFound` for an unknown pid leaves the queue untouched.
 - **Reduction accounting is delegated to the runner.** `ProcessRunner::run` receives `DEFAULT_REDUCTIONS_PER_SLICE` as its `budget`; the runner owns the reduction count and decides when to return `RunOutcome::Yield` (the scheduler never reads or resets `Process::reductions`), so **pre-emption is cooperative** — a runner that never yields is not pre-empted (see Known Issues).
 - **Shared slice helpers (the SMP reuse seam).** `pub(crate)` `slice_begin(pid, table) -> Result<bool>` (mark executing + apply the queued signals) and `slice_end<F>(pid, table, outcome, enqueue)` are the frozen schedule-in/schedule-out halves; `run_one<R, F>(pid, table, runner, reductions, enqueue)` = `slice_begin` + one full-budget runner call + `slice_end`, and `drain_woken_into<F>(table, enqueue)` absorbs the wake list; `run_slice`/`resume_woken` delegate to them, and the SMP pool calls the same helpers (splitting a slice into lock quanta around them) with a closure that **buffers** requeues instead of touching a queue.
@@ -300,9 +301,11 @@ The **local record** of a process's relationships with processes on other nodes;
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **366 passed / 0 failed / 1 ignored** (161 in-module unit + 204 integration across the
+  Current total: **391 passed / 0 failed / 1 ignored** (161 in-module unit + integration across the
   27 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
-  in `preemption.rs`), warning-free. Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
+  in `preemption.rs`), warning-free. The `oracle_*` suites share **one** `erl` driver
+  (`tests/common/mod.rs`), run with `-kernel logger_level none` and normalized stdout so a crashed
+  probe helper's `=ERROR REPORT====` block can never make a comparison flaky (see `tests/CONTEXT.md`). Always go through `../../scripts/cargo.sh` (`$HOME` is read-only),
   never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
   not here.
@@ -360,17 +363,20 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - **Port lifecycle driving** — port scheduling, port signals and the port's read path — remains
   `beam_io`'s; `PortTable` owns only the id plus the ownership/links/monitors, and
   `ProcessTable::port_closed` delivers the closing port's messages.
-- **Port-monitor cleanup on death is complete only when a `PortTable` is threaded in.** `terminate_into`
+- **Port-monitor cleanup on death needs a `PortTable` handle; the `Scheduler` now adopts one.** `terminate_into`
   always drains `Process::port_monitors` (and the exit observer always sees them), but the matching
-  *incoming* `PortMonitor` entries are removed from the `PortTable` only when the caller supplies one —
-  i.e. through `terminate_with_ports`/`service_signals_with_ports`/`port_closed`. The port-table-less
-  entry points (`terminate`, `service_signals`, `apply_exit_signal`/`send_exit` (`erlang:exit/2`) and
-  `node_down`) pass no ports; a process killed through one of those has its outgoing watches drained but
-  leaves its incoming `PortMonitor` in place until the owner runs `service_signals_with_ports` at the
-  peer's next schedule-in. A host that owns both tables should terminate through the ports-aware variants.
-  The single-threaded `Scheduler` offers `run_slice_with_ports`/`run_ready_with_ports` (plus the
-  `pub(crate)` `*_with_ports` helpers) for exactly this, but the SMP pool does not (it has no
-  `PortTable`), so the port-less entry points remain for it.
+  *incoming* `PortMonitor` entries are removed from the `PortTable` only when a handle is supplied.
+  A `Scheduler` built with `with_ports`/`set_ports` owns a `PortTable`, and its default
+  `run_slice`/`run_ready` then service signals through `service_signals_with_ports` and terminate through
+  `terminate_with_ports`, so a process that dies in a slice cleans its dangling incoming `PortMonitor`
+  (`tests/scheduler_ports.rs`). A scheduler built with `new`/`with_slice` owns none and keeps the
+  port-less behaviour (outgoing watches drained, incoming left in place); the explicit
+  `run_slice_with_ports`/`run_ready_with_ports` take a table that overrides the owned one for that call.
+  The port-less `ProcessTable` entry points (`terminate`, `service_signals`, `apply_exit_signal`/`send_exit`
+  (`erlang:exit/2`), `node_down`) still pass no ports, so a process killed through one of those leaves its
+  incoming `PortMonitor` until the owner runs `service_signals_with_ports` at the peer's next schedule-in.
+  The SMP pool is port-less — adopting a table there would add a **fourth lock family** to the BINDING
+  discipline in `src/smp/CONTEXT.md`, so it is deferred (the pool has no production consumer).
 - **Exact exit-reason term from `beam_common::ExitReason`**: signal reasons are carried as live `Eterm`
   terms (the deliverable form), not the term-independent `beam_common::ExitReason`; the mapping between
   them belongs to the raising BIF layer (`beam_bifs`).
@@ -420,7 +426,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter; keys and `get_keys/1` values compare structurally via `beam_term::compare::eq` through an `Rc<AtomTable>` handle)
 - `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
 - `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing + `reprioritize`)
-- `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam), `enqueue_with_priority`, `set_priority` (the queued-process requeue), `resume_woken`, the port-aware `run_slice_with_ports`/`run_ready_with_ports`, the shared `pub(crate)` slice helpers `slice_begin`/`slice_end`/`run_one`/`drain_woken_into` and their `*_with_ports` mirror pair, and `DEFAULT_REDUCTIONS_PER_SLICE`/`DEFAULT_LOCK_QUANTUM`
+- `src/scheduler.rs` → `Scheduler` (incl. the optional **owned** `PortTable` — `with_ports`/`set_ports`/`take_ports`/`ports`/`ports_mut`/`has_ports` — that the default `run_slice`/`run_ready` adopt), `RunOutcome`, `ProcessRunner` (the engine seam), `enqueue_with_priority`, `set_priority` (the queued-process requeue), `resume_woken`/`resume_woken_into`, the explicit port-table `run_slice_with_ports`/`run_ready_with_ports`, the shared `pub(crate)` slice helpers `slice_begin`/`slice_end`/`run_one`/`drain_woken_into` and their `*_with_ports` mirror pair, and `DEFAULT_REDUCTIONS_PER_SLICE`/`DEFAULT_LOCK_QUANTUM`
 - `src/smp/` → the SMP pool (`SchedulerConfig` incl. `lock_quantum`, `SharedProcessTable`, `Queues`/`reprioritize`, `Worker`/`run_locked_quanta`, `SchedulerPool` incl. `set_priority`, `SchedulerStats`/`SchedulerStat`, `PoolSignals`) — per-file detail, the locking discipline and the bounded-quantum rule in `src/smp/CONTEXT.md`
 - `src/timer.rs` → `TimerService` (one thread over a deadline min-heap), `TimerRef`, `TimerSink` (the high-level `send_after`/`cancel` service)
 - `src/dirty.rs` → `DirtyPool`, `DirtyKind`, `DirtyOutcome`, `DirtyJob`, `DirtyCompletionSink` (the dirty-CPU + dirty-IO worker pools)
@@ -513,8 +519,10 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   (10) once a `PortTable` is kept alongside the `ProcessTable`, terminate through `terminate_with_ports`
   (and `service_signals_with_ports` at schedule-in) so a dead port-watcher's incoming `PortMonitor` is
   removed; (11) `beam_message::send_fragmented` through `Process::heap_and_mailbox_mut()` instead of
-  re-composing the fragment primitives; (12) drive `Scheduler::run_slice_with_ports`/`run_ready_with_ports`
-  when a `PortTable` is owned, so a death during a slice cleans the port side; (13) the `link`/`link_term`
+  re-composing the fragment primitives; (12) install the owned `PortTable` on the `Scheduler`
+  (`Scheduler::set_ports`/`with_ports`) so its default `run_slice`/`run_ready` clean the port side
+  (or drive the explicit `run_slice_with_ports`/`run_ready_with_ports` when the table is owned
+  elsewhere), so a death during a slice cleans the port side; (13) the `link`/`link_term`
   `noproc` signal (the `RuntimeHooksBridge::link` comment claiming the signal "simply never arrives" is
   stale — the signal is delivered); (14) the `process_flag(max_heap_size/min_heap_size/…)` arm returning the previous value;
   (15) `spawn_opt`'s `max_heap_size < min_heap_size ⇒ badarg` and honest `message_queue_data`;

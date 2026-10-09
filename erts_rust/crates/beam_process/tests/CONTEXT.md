@@ -126,15 +126,28 @@ SMP pool:
     absent) pin the same end state against the real system — a process `monitor(port, P)` is listed by
     `port_info(P, monitored_by)` while alive and gone after it dies (`{spawn, Cmd}` uses
     `exec sleep 30 >/dev/null 2>&1` so the OS child never holds the probe's stdout pipe).
-26. `scheduler_ports.rs` (7 tests) — the port-aware scheduler slice: a death during a slice
-    (`run_slice_with_ports`/`run_ready_with_ports`) cleans the dangling incoming `PortMonitor`; the
-    port-less control leaves it; a fatal signal deferred while the target was `Running` terminates it at
-    schedule-in and cleans the port monitor (the runner is never entered); the wake list is absorbed
-    after the slice and on the empty-queue early return.
+26. `scheduler_ports.rs` (12 tests) — the port-aware scheduler slice. A death during a slice cleans the
+    dangling incoming `PortMonitor` **through the default `run_slice`/`run_ready` when the scheduler owns
+    a `PortTable`** (`Scheduler::with_ports`/`set_ports`), and the same holds for a multi-slice
+    `run_ready` loop and for a fatal signal deferred while the target was `Running` (terminated at
+    schedule-in, the runner never entered); the explicit `run_slice_with_ports`/`run_ready_with_ports`
+    forms are still pinned (an explicitly passed table takes precedence over the owned one); a scheduler
+    **without** a `PortTable` is the port-less control (the incoming entry stays); the owned-table
+    accessors round-trip; and the wake list is absorbed after the slice and on the empty-queue early
+    return.
 27. `exhaustion.rs` (3 tests) — `Process::deliver`'s collect-and-retry: a full nursery is grown one
     curated step and the payload is enqueued exactly once (`minor_gcs == 1`), FIFO preserved for a
     second delivery; and the typed `Err(BeamError::Alloc(AllocKind::Message))` path (a
     `from_min_max(cap, cap)` policy cannot grow ⇒ mailbox untouched, no partial write, no panic).
+28. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
+    `monitor_tag.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`: `ERL_TIMEOUT`,
+    `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the normalizer). It runs
+    `erl -noshell -kernel logger_level none -eval …` (the `none` level deterministically suppresses the
+    `=ERROR REPORT====` block a crashed probe helper would otherwise race onto **stdout**) and normalizes
+    the captured stdout (a report block — a line starting with `=`, through the next blank line — is
+    removed), so a comparison is exact and never flaky. A support module (subdirectory files are not
+    compiled as test targets); it carries `#![allow(dead_code)]` because not every including binary uses
+    every helper.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -146,13 +159,14 @@ SMP pool:
   two-sided (a cross-thread send must be serviced far below the slice's duration, and the slice must
   last far above that bound — the anti-vacuity guard).
 - The `oracle_*` suites (`dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, and the `erl`
-  cross-checks in `capability_inventory.rs`) **skip loudly** when `erl` is absent, and must never spawn a child
-  process that inherits `erl`'s stderr (a captured-stderr pipe blocks until the child dies — the
-  probes are written child-free).
+  cross-checks in `capability_inventory.rs`/`port_monitor_cleanup.rs`) go through the **shared driver**
+  `common/mod.rs`, **skip loudly** when `erl` is absent, and must never spawn a child process that
+  inherits `erl`'s stderr (a captured-stderr pipe blocks until the child dies — the probes are written
+  child-free).
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **366 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **391 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
@@ -169,7 +183,7 @@ SMP pool:
   death-side port-monitor cleanup
 - `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `port_monitor_cleanup.rs` (oracle tests) →
   `erl`-cross-checked process-dictionary, process-control and port-monitor evidence (loud skip when `erl`
-  is absent)
+  is absent); their driver is the shared `common/mod.rs`
 - `ports.rs`, `remote.rs` → the port table and distributed links/monitors
 - `smp.rs`, `lock_scope.rs`, `timers.rs`, `dirty.rs`, `progress.rs` → the SMP pool (see
   `../src/smp/CONTEXT.md`)
