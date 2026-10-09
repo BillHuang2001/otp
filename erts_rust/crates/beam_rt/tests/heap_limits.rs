@@ -22,14 +22,12 @@
 //! configured term-heap limit must raise the emulator's documented `error:system_limit` —
 //! never the host-level `beam_rt: allocation failure: heap (N bytes)` diagnostic.
 //!
-//! Background (the bug this pins): Milestone 1 has no collector and no heap-growth path
-//! (growth-by-collection is Stage 4), so the term-construction heaps are plain bump arenas
-//! whose *capacity* is the memory limit. The default was 64 Ki words (512 KiB), which a
-//! realistic compute loop — the benchmark's `lists:sum(lists:seq(1, 1_000_000))`, 2 Mi
-//! words of cons cells — overran, aborting the runtime with the internal allocator
-//! diagnostic and producing no benchmark metric. The fix raises the default
-//! ([`beam_rt::DEFAULT_HEAP_WORDS`], lazily mapped so the address space costs no RSS) and
-//! translates heap exhaustion into the emulator's own `system_limit`.
+//! Milestone 1 has no collector and no heap-growth path (growth-by-collection is Stage 4), so
+//! the term-construction heaps are plain bump arenas whose *capacity* is the memory limit. The
+//! default ([`beam_rt::DEFAULT_HEAP_WORDS`], lazily mapped so the address space costs no RSS) is
+//! large enough for a realistic compute loop — the benchmark's
+//! `lists:sum(lists:seq(1, 1_000_000))`, 2 Mi words of cons cells — and heap exhaustion
+//! translates into the emulator's own `system_limit`.
 //!
 //! These tests drive the **executable** (`CARGO_BIN_EXE_beam_rt`), i.e. the whole
 //! CLI → runtime → BIF → heap path, so they pin the observable contract (stdout, stderr,

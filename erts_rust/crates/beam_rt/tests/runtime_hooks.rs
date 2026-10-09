@@ -22,9 +22,8 @@
 //! cross-checked with the live system `erl` oracle.
 //!
 //! Three `erlang:*` keys that `beam_bifs` registers behind the defaulted `RuntimeHooks`
-//! seam used to answer the typed `unsupported: bif` capability gap (exit 3). They are now
-//! served by `beam_rt`'s `RuntimeHooksBridge` — and each one is a deterministic link on the
-//! OTP boot/self-hosting chain this suite pins, because the `file:`/`code:`/`.app`-read
+//! seam are served by `beam_rt`'s `RuntimeHooksBridge` — and each one is a deterministic link
+//! on the OTP boot/self-hosting chain this suite pins, because the `file:`/`code:`/`.app`-read
 //! path dies without them:
 //!
 //! * `erlang:dt_spread_tag/1` + `erlang:dt_restore_tag/1` — `lib/kernel/src/file.erl`'s

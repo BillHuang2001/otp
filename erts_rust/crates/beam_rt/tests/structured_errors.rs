@@ -29,8 +29,8 @@
 //! * the process runner's `exit_reason` — a process that raises a structured reason must
 //!   expose that very term through [`Runtime::process_exit`].
 //!
-//! The producers were already correct (`beam_bifs` builds the real term and carries it in
-//! the `beam_common::Raise` live-reason slot); these tests pin the consumers.
+//! The producers are correct (`beam_bifs` builds the real term and carries it in the
+//! `beam_common::Raise` live-reason slot); these tests pin the consumers.
 //!
 //! Oracle (OTP 29 / `erts-17.1`, verified with `erl -noshell`):
 //!
