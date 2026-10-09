@@ -198,7 +198,6 @@ This crate's link in the A.9 boot-blocker chain (the runtime's boot stop point a
 - `src/modinfo.rs` / `src/match_spec.rs` / `src/packet.rs` / `src/proc_reg.rs` / `src/persistent_term.rs` -> `get_module_info`; `match_spec_test`; `decode_packet`; the 11 `ProcessHook` BIFs; the 7 `persistent_term` BIFs
 - `src/string.rs` / `src/unicode.rs` / `src/time.rs` -> `string:list_to_float/1`; the `unicode` conversions; the `time` BIFs
 - `src/proc.rs` / `src/dict.rs` / `src/reason.rs` / `src/port.rs` -> `self`/`send`/`!`; the `DictHook` BIFs; `error`/`exit`/`throw`/`nif_error` + the reason mapping; the `PortHook` BIFs
-- `src/phash.rs` -> `phash/2` + `phash2/1,2`
 - `src/ets.rs` / `src/ets/` (**`./src/ets/CONTEXT.md`**) -> the `ets:*` bridge (57 keys)
 - `src/nif.rs` -> `erlang:load_nif/2`
 - `src/io.rs` / `src/print.rs` -> the `io`/`io_lib` format engine; the `~w`/`~p`/`~W`/`~P` leaf renderer
