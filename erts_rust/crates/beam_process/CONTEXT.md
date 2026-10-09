@@ -494,8 +494,10 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   signal behaviour, run the relevant probe: `erl -noshell -eval '<expr>, halt(0).'` — the oracle is OTP
   29.1.1 / erts-17.1. The `erl`-cross-checked suites (`tests/dict_oracle.rs`, `registry_monitors.rs`)
   skip loudly when `erl` is absent.
-- **Adoption owed by `beam_rt`/`beam_bifs`** (do NOT edit them from here): (1) `RuntimeRunner::run` must
-  honour `budget` and return `Yield`; (2) use `ProcessState::status_atom`/`Process::status` instead of
+- **Adoption notes for `beam_rt`/`beam_bifs`** (do NOT edit them from here; verify each item against the
+  consumer — several are already wired, e.g. the budget-honouring `RuntimeRunner` (1), the installed
+  `ProcessExitObserver` (9), and `send_fragmented` through `heap_and_mailbox_mut` (11)):
+  (1) `RuntimeRunner::run` honours `budget` and returns `Yield`; (2) use `ProcessState::status_atom`/`Process::status` instead of
   its own status mapping; (3) `erlang:demonitor/2 [flush]` → `demonitor_flush`; (4) `erlang:monitor/2`
   type dispatch via `MonitorKind::from_type_name` + `monitor_port_term`/`monitor_named`, and install
   `set_local_node` at boot for name targets; (5) `process_info(P, registered_name)` → `name_of`;
