@@ -89,7 +89,7 @@ use beam_term::{atom_val, is_atom, make_atom, Eterm};
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::machine::Machine;
+use crate::machine::{Continuation, Machine};
 use crate::operand::{read_operand, write_operand};
 use crate::terms;
 use crate::Step;
@@ -169,6 +169,21 @@ pub(crate) fn exec(
                 machine.set_x(0, result)?;
                 Ok(Some(Step::Next))
             }
+            // The host can run the callee here: enter it **in this machine** with
+            // the caller's return address stored in the live frame — exactly the
+            // local `Instr::Call` discipline (C's `i_apply` is
+            // `$FIXED_APPLY` + `$SAVE_CONTINUATION_POINTER($NEXT_INSTRUCTION)` +
+            // `$DISPATCH_ABS`, `emu/instrs.tab:298-304`), so a `receive` inside the
+            // callee suspends *this* process and its `return` unwinds into the
+            // caller's frame.
+            ApplyTarget::Enter { context, func, pc } => {
+                machine.set_continuation(Continuation::Address {
+                    func,
+                    pc: pc + 1,
+                    context: machine.current_context(),
+                })?;
+                Ok(Some(Step::Enter { context, func, pc }))
+            }
             // A non-atom target is the catchable `badarg` raise: the landing
             // already wrote x(0..=3), so x(0) must not be overwritten here.
             ApplyTarget::Raised(step) => Ok(Some(step)),
@@ -189,6 +204,14 @@ pub(crate) fn exec(
                     // cross-context `Enter` (the discipline the `call_ext*`
                     // synchronous fallbacks in the interpreter already follow).
                     Ok(Some(machine.continuation_step()?))
+                }
+                // The frame is already popped (C's `apply_last` is `$FIXED_APPLY` +
+                // `$deallocate` + `$DISPATCH_ABS`, `emu/instrs.tab:306-312`), so the
+                // callee runs on the **caller's** frame and its `return` follows that
+                // frame's (possibly cross-context) continuation — the tail-call
+                // discipline the `call_ext_last` seam arm follows too.
+                ApplyTarget::Enter { context, func, pc } => {
+                    Ok(Some(Step::Enter { context, func, pc }))
                 }
                 ApplyTarget::Raised(step) => Ok(Some(step)),
             }
@@ -213,6 +236,11 @@ enum ApplyTarget {
     /// The target was resolved to a `module:function` and dispatched; the applied
     /// result value is in hand (the caller stores it in `x(0)`).
     Called(Eterm),
+    /// The host can run the target **in this machine** (the cross-module-call seam,
+    /// [`ExecutionContext::resolve_external_call`]): `(context, func, pc)` is the
+    /// callee's registered module context and its export entry. The instruction
+    /// applies its own frame discipline and reports [`Step::Enter`].
+    Enter { context: u32, func: u32, pc: u32 },
     /// The target shape was invalid — a non-atom module/function — and the C's
     /// `badarg` raise was routed through the machine (see [`raise_badarg`]). The
     /// `Step` is the handler landing the raise produced (a live catch frame); the
@@ -221,14 +249,23 @@ enum ApplyTarget {
 }
 
 /// Dispatch the `fixed_apply` shape: `module = x(arity)`, `function = x(arity+1)`,
-/// arguments `x(0)..x(arity-1)`.
+/// arguments `x(0..arity-1)`.
 ///
 /// Both the module and the function must be atoms (the C raises `badarg` with the
-/// argument list otherwise — see [`raise_badarg`]); the target is then applied
-/// through [`ExecutionContext::call_bif`]. This also covers the C's `apply of
-/// apply/3` special case (`beam_common.c:1554-1557`): `x(0)`/`x(1)`/`x(2)` are then
-/// handed straight to `erlang:apply/3` as its `M,F,Args` arguments, which is
-/// exactly what the recursion into `apply()` computes.
+/// argument list otherwise — see [`raise_badarg`]). The target is then resolved
+/// through the host's cross-module-call seam
+/// ([`ExecutionContext::resolve_external_call`]) **first**: a host that owns the
+/// callee's module runs it in this machine ([`ApplyTarget::Enter`]) so a `receive`
+/// inside it suspends the *calling* process instead of folding into the typed
+/// [`error::blocked`](crate::error::blocked) at the call site. This mirrors C,
+/// where `fixed_apply` (`beam_common.c:1528`) resolves the export and jumps into
+/// its code in the same process. When the host declines (`Ok(None)` — the seam's
+/// default) the target is applied through
+/// [`ExecutionContext::call_bif`](crate::ExecutionContext::call_bif), byte-identical
+/// to the previous synchronous route. This also covers the C's `apply of apply/3`
+/// special case (`beam_common.c:1554-1557`): `x(0)`/`x(1)`/`x(2)` are then handed
+/// straight to `erlang:apply/3` as its `M,F,Args` arguments, which is exactly what
+/// the recursion into `apply()` computes.
 fn apply_target(
     machine: &mut Machine,
     module: &Module,
@@ -251,6 +288,20 @@ fn apply_target(
         _ => return raise_badarg(machine, module).map(ApplyTarget::Raised),
     };
     let args = register_args(machine, arity)?;
+    // The triple handed to the host is exactly the one `call_bif` receives (the
+    // applied `module:function/arity`), so a host answers the seam however it
+    // answers the BIF dispatch. A resolved callee is registered as a module
+    // context and its entry `Label` resolved against the callee's **own** label
+    // index — an unknown label is a typed error, never a jump into the wrong
+    // module.
+    if let Some((callee, label)) = ctx.resolve_external_call(module_name, function_name, arity)? {
+        let context = machine.register_context(&callee);
+        let handle = machine
+            .module_context(context)
+            .ok_or_else(|| error::unsupported("apply: unknown module context"))?;
+        let (func, pc) = handle.labels.resolve(label)?;
+        return Ok(ApplyTarget::Enter { context, func, pc });
+    }
     ctx.call_bif(module_name, function_name, arity, &args)
         .map(ApplyTarget::Called)
 }
