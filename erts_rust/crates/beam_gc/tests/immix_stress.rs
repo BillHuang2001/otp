@@ -729,10 +729,10 @@ fn write_local(heap: &mut Heap, arity: usize, uniq: u64, index: u32, env: &[Eter
     }
 }
 
-/// Writes an `External` fun (`[header][module][function]`).
+/// Writes an `External` fun (`[header][module][function][arity]`).
 fn write_external(heap: &mut Heap, arity: usize, module: Atom, function: Atom) -> Eterm {
     let words = fun_words(FunKind::External, 0);
-    // SAFETY: the 3 words `write_fun_external` writes are exclusively owned and reserved.
+    // SAFETY: the 4 words `write_fun_external` writes are exclusively owned and reserved.
     unsafe {
         let hp = heap.alloc_words(words).expect("reserve external fun");
         write_fun_external(hp, arity, module, function).expect("write external fun")
