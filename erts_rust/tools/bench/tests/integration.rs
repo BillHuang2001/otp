@@ -156,4 +156,24 @@ fn a_real_foreign_workload_is_measured_under_both_runtimes() {
         rust_capable.contains(&"foreign"),
         "the rust-schedulable workload set must include `foreign`; got {rust_capable:?}"
     );
+
+    // `list_walk` is the in-tree interpreter-throughput signal: it must stay registered,
+    // run under *both* runtimes, and stay a `compute` workload.
+    let list_walk =
+        workload::find("list_walk").expect("the `list_walk` workload must be registered");
+    assert!(
+        matches!(list_walk.runtimes(), Runtimes::Both),
+        "`list_walk` must run under both runtimes, got {:?}",
+        list_walk.runtimes()
+    );
+    assert_eq!(list_walk.category(), Category::Compute);
+    assert!(
+        list_walk.contracts().contains(&"A.1") && list_walk.contracts().contains(&"A.2"),
+        "contracts: {:?}",
+        list_walk.contracts()
+    );
+    assert!(
+        rust_capable.contains(&"list_walk"),
+        "the rust-schedulable workload set must include `list_walk`; got {rust_capable:?}"
+    );
 }
