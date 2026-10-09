@@ -8,8 +8,7 @@ crate below must close the gap, after which a case can be added to the corpus.
 
 (The honest capability gaps — the runtime *does* signal them via its documented
 `beam_rt: unsupported: …` / exit-3 convention — are recorded in the allowlist table above,
-not here: today only `wire/new_fun_ext_encode` and
-`proc_signals/statistics_runtime_unsupported` remain.)
+not here: today only `wire/new_fun_ext_encode` remains.)
 ## A.3 — NIF C ABI (owner: `beam_abi` / `beam_rt` NifHost)
 - `enif_clear_env` clears a pending exception in the Rust runtime but not in the oracle
   (`crates/beam_abi/src/nif/enif/exception.rs`). (On the *process* env it is illegal C and
@@ -97,7 +96,11 @@ not here: today only `wire/new_fun_ext_encode` and
 - A `[compressed]` image is **not** byte-identical: the framing (`131,80`), the 32-bit
   uncompressed size and the trailing Adler-32 match, but the zlib deflate middle differs.
   Only `binary_to_term(term_to_binary(T, [compressed])) =:= T` round trips are pinned.
-- Legacy `PORT_EXT` (102) preserves the port id in the oracle but zeroes it in the Rust runtime.
+- A `MAP_EXT` (116) blob with **more than 32 key/value pairs** decodes in the oracle
+  (`maps:size` -> `33`) but the Rust runtime aborts with `beam_rt: system_limit` / empty
+  stdout (exit 1). `system_limit` is a plain Erlang reason, outside the runtime's documented
+  `unsupported` convention, so a case would be a `mismatch` — hence deliberately not pinned.
+  Owner: `beam_term` / `beam_codec`.
 - The `[used]` byte count of `binary_to_term/2` on a `[compressed]` image differs by 1 byte —
   a consequence of the differing zlib bodies above (the compressed image's size is not
   byte-stable, so it is unpinnable; only the round trip is pinned).

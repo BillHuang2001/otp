@@ -35,20 +35,22 @@
 //!   improper tail);
 //! * binaries — `BINARY_EXT` (109) and `BIT_BINARY_EXT` (77);
 //! * maps — `MAP_EXT` (116); a *multi-key* map is compared through its **sorted** key list,
-//!   because map iteration order is an internal detail and not part of the wire contract;
+//!   because map iteration order is an internal detail and not part of the wire contract,
+//!   and a flatmap's canonical **key order** is pinned byte-exactly (`wire/map_ext_*`), as is
+//!   the rejection of a blob that repeats a key;
 //! * atoms — the legacy `ATOM_EXT` (100), and the UTF-8 `ATOM_UTF8_EXT` (118) /
 //!   `SMALL_ATOM_UTF8_EXT` (119) including the UTF-8 bytes of a non-Latin-1 atom;
 //! * external things — `NEW_PID_EXT` (88), `NEWER_REFERENCE_EXT` (90), `NEW_PORT_EXT` (89)
-//!   and `NEWER_PORT_EXT` (120), plus the *legacy* `PID_EXT` (103), `REFERENCE_EXT` (101)
-//!   and `NEW_REFERENCE_EXT` (114) forms — all encoded through the *decode → re-encode*
-//!   round-trip, which is deterministic inside one node's encoder. The terms whose bytes
-//!   depend on the runtime's **own** node identity — a local `self()` pid and an internal port
-//!   — carry per-VM-start values and are pinned (by their stable leading shape) in the
-//!   [`super::wire_ids`] group instead;
+//!   and `NEWER_PORT_EXT` (120), plus the *legacy* `PID_EXT` (103), `REFERENCE_EXT` (101),
+//!   `NEW_REFERENCE_EXT` (114) and `PORT_EXT` (102) forms — all encoded through the
+//!   *decode → re-encode* round-trip, which is deterministic inside one node's encoder. The
+//!   terms whose bytes depend on the runtime's **own** node identity — a local `self()` pid and
+//!   an internal port — carry per-VM-start values and are pinned (by their stable leading shape)
+//!   in the [`super::wire_ids`] group instead;
 //! * funs/records — `EXPORT_EXT` (113) (encode and decode → re-encode round-trip),
 //!   `NEW_FUN_EXT` (112), and the nominal-record `RECORD_EXT` (67) (decode → re-encode);
 //! * framing — `VERSION_MAGIC` (131) as the first byte, the `compressed` (80) option (both
-//!   directions), and `{minor_version, 0|1|2}`;
+//!   directions, including its declared uncompressed-size bound), and `{minor_version, 0|1|2}`;
 //! * `ATOM_CACHE_REF` (82) — a blob carrying one is decoded with **no** atom-cache context,
 //!   which both runtimes refuse identically.
 //!
@@ -555,6 +557,40 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "wire/legacy_port_ext_width_roundtrip",
+            description: "a legacy PORT_EXT (102) blob (32-bit id + 1-byte creation) decodes and re-encodes as the equivalent NEWER_PORT_EXT (120) image with the id and creation preserved",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                // A *fixed external-node* port (node `other`, id 7, creation 1): every field
+                // is byte-stable, so the decode -> re-encode image is pinnable.
+                expr: "binary_to_term(<<131,102,100,0,5,111,116,104,101,114,0,0,0,7,1>>)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,0,1>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/legacy_port_ext_creation_zero_roundtrip",
+            description: "a legacy PORT_EXT (102) blob with creation 0 decodes and re-encodes as the equivalent NEWER_PORT_EXT (120) image with the zero creation preserved",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,102,100,0,5,111,116,104,101,114,0,0,0,7,0>>)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,120,119,5,111,116,104,101,114,0,0,0,0,0,0,0,7,0,0,0,0>>",
+                ),
+                exit_code: 0,
+            },
+        },
         // -- funs: EXPORT_EXT (113) / NEW_FUN_EXT (112) -----------------------------
         Case {
             id: "wire/export_ext_encode",
@@ -802,6 +838,67 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "wire/map_ext_noncanonical_key_order_canonicalizes",
+            description: "a MAP_EXT (116) flatmap whose keys are on the wire in non-canonical order decodes and re-encodes in canonical sorted-key order",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                // `#{2 => 20, 1 => 10}` on the wire as `2` then `1`.
+                expr: "binary_to_term(<<131,116,0,0,0,2,97,2,97,20,97,1,97,10>>)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,116,0,0,0,2,97,1,97,10,97,2,97,20>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/map_ext_duplicate_key_badarg",
+            description: "a MAP_EXT (116) blob that repeats a key is rejected with badarg",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,116,0,0,0,2,97,1,97,10,97,1,97,20>>)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "wire/map_ext_canonical_key_order_float_list_binary",
+            description: "term_to_binary/1 of a map with a float, a list and a binary key emits the canonical term-order flatmap image byte-exactly",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "#{1.5 => a, [1,2] => b, <<\"z\">> => c}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,116,0,0,0,3,70,63,248,0,0,0,0,0,0,119,1,97,107,0,2,1,2,119,1,98,109,0,0,0,1,122,119,1,99>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/map_ext_binary_key_order",
+            description: "term_to_binary/1 orders several binary keys canonically in the flatmap image",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "#{<<\"b\">> => 1, <<\"a\">> => 2, <<\"c\">> => 3, <<\"aa\">> => 4}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,116,0,0,0,4,109,0,0,0,1,97,97,2,109,0,0,0,2,97,97,97,4,109,0,0,0,1,98,97,1,109,0,0,0,1,99,97,3>>",
+                ),
+                exit_code: 0,
+            },
+        },
         // -- legacy integer / atom forms: INTEGER_EXT (98), ATOM_EXT (100) -----------
         Case {
             id: "wire/integer_ext_legacy_decode",
@@ -972,6 +1069,36 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- COMPRESSED (80) declared-inner-size bound --------------------------------
+        Case {
+            id: "wire/compressed_declared_size_bound",
+            description: "a COMPRESSED (80) image declared with its true uncompressed size round-trips",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                // Rebuild the blob from its own declared size so the bound is exactly met.
+                expr: "begin T = binary:copy(<<\"abcdabcd\">>,400), Comp = term_to_binary(T,[compressed]), <<131,80,Sz:32,Tail/binary>> = Comp, binary_to_term(<<131,80,Sz:32,Tail/binary>>) =:= T end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/compressed_declared_size_mismatch_badarg",
+            description: "a COMPRESSED (80) image whose declared uncompressed size is one byte larger than the true size is rejected with badarg",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "begin T = binary:copy(<<\"abcdabcd\">>,400), Comp = term_to_binary(T,[compressed]), <<131,80,Sz:32,Tail/binary>> = Comp, binary_to_term(<<131,80,(Sz+1):32,Tail/binary>>) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
         // -- RECORD_EXT (67): the nominal-record instance form ------------------------
         Case {
             id: "wire/record_ext_roundtrip",
@@ -1008,10 +1135,30 @@ mod tests {
             "wire/compressed_decode_roundtrip_large",
             "wire/compressed_decode_trailing_bytes_ignored",
             "wire/record_ext_roundtrip",
+            "wire/legacy_port_ext_width_roundtrip",
+            "wire/legacy_port_ext_creation_zero_roundtrip",
+            "wire/map_ext_noncanonical_key_order_canonicalizes",
+            "wire/map_ext_canonical_key_order_float_list_binary",
+            "wire/map_ext_binary_key_order",
+            "wire/compressed_declared_size_bound",
         ] {
             let case = cases.iter().find(|c| c.id == id).expect("registered");
             assert_eq!(case.contracts, &[Contract::Distribution], "{id}");
             assert_eq!(case.golden.exit_code, 0, "{id}");
+        }
+    }
+
+    #[test]
+    fn exception_wire_cases_raise_badarg_under_the_distribution_contract() {
+        let cases = group();
+        for id in [
+            "wire/map_ext_duplicate_key_badarg",
+            "wire/compressed_declared_size_mismatch_badarg",
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::Distribution], "{id}");
+            assert_eq!(case.golden.stdout, Some("exception error badarg"), "{id}");
+            assert_eq!(case.golden.exit_code, 1, "{id}");
         }
     }
 }

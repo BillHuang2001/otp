@@ -43,6 +43,10 @@
 //! `maps:put/3` both raise `error:system_limit` once a map grows past 32 entries, where the
 //! oracle builds and encodes it. Observed for `maps:from_list([{N,N} || N <- lists:seq(1,33)])`:
 //! oracle ⇒ `ok <<131,116,0,0,0,33,…>>` (a 33-pair `MAP_EXT`), Rust ⇒ `exception error system_limit`.
+//! The same limit also bites the **decode** direction: `binary_to_term/1` of a `MAP_EXT` (116)
+//! blob carrying more than 32 key/value pairs also aborts with `system_limit` in the Rust
+//! runtime (a `maps:size` of `33` in the oracle), so a >32-key HAMT round-trip case is not
+//! pinnable either.
 //! `system_limit` is a plain Erlang reason, not the runtime's documented `unsupported`
 //! convention, so registering the case would introduce a real **mismatch** — hence it is left
 //! out until the runtime's large-map representation lands. (The 32-key edge itself, still a
