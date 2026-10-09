@@ -29,7 +29,11 @@ The precise symbols of `driver.rs`:
 - `DriverPortAdapter` (`669`) — `impl beam_io::Driver` over a loaded C driver: `load`/`name`/`state`/`selected`,
   plus the callback mapping `start`/`output`/`ready_input`/`ready_output`/`timeout`/`stop`.
 - `load_driver(candidates, name)` (`623`) — `dlopen` the driver object, reporting the last typed error.
-- The four driver-registry slots are **all overridden** (not left at no-host defaults):
+- The timer family matches the C for **every** live port: the C substitutes a silent `no_timeout_callback`
+when the entry declares no `timeout` slot (`io.c:7601`), so `io.c:6918`'s `-1` stands only for an invalid
+port (`DriverControl::attached == false`); `driver_set_timer` arms the deadline and answers `0`, and a
+fired deadline runs the entry's `timeout` or, when absent, is the C's silent no-op.
+The four driver-registry slots are **all overridden** (not left at no-host defaults):
   `add_driver_entry` (`565`, → `registry_add_entry`, `0`/`1`), `remove_driver_entry` (`571`, →
   `registry_remove_entry`, C's `1`/`0`/`-1`), `lock_driver` (`584`, `0` iff `control.driver_loaded`
   else `-1`), `create_port` (`601`, always `ERTS_INVALID_ERL_DRV_PORT`).
