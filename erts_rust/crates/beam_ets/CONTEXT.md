@@ -598,7 +598,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation/ownership/fixtable/shared/options/rename), plus `tests/select.rs` and `tests/match_spec_run.rs`
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation/ownership/fixtable/shared/options/rename/reclamation/concurrency), plus `tests/select.rs` and `tests/match_spec_run.rs`
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (135 cases)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)
