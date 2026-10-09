@@ -16,6 +16,4 @@ proc_signals/statistics_runtime_unsupported  beam_bifs  erlang:statistics/1 `run
 proc_signals/statistics_context_switches_unsupported  beam_bifs  erlang:statistics/1 `context_switches` counter not served
 proc_signals/statistics_io_unsupported  beam_bifs  erlang:statistics/1 `io` counter not served
 proc_signals/statistics_scheduler_wall_time_unsupported  beam_bifs  erlang:statistics/1 `scheduler_wall_time` counter not served
-proc_signals/monitor_3_tag_option_unsupported  beam_bifs  erlang:monitor/3 {tag,_} option not implemented
-proc_signals/monitor_port_unsupported  beam_bifs  erlang:monitor/2 on a port not implemented
 boot/proc_lib_start_link_blocks_the_boot_path  beam_engine  the cross-module call_ext boundary cannot suspend the process (proc_lib:sync_start/2 receive)
