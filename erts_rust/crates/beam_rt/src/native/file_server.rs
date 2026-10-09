@@ -147,11 +147,6 @@ impl FileServices {
     pub(crate) const fn server(&self) -> ProcessId {
         self.server
     }
-
-    /// Whether any native file service exists (always true after construction).
-    pub(crate) fn is_running(&self) -> bool {
-        true
-    }
 }
 
 impl Runtime {
@@ -178,7 +173,7 @@ impl Runtime {
     pub(crate) fn service_file_requests(&mut self, table: &mut ProcessTable) -> Result<usize> {
         // The servers are collected first so `self` is free while `table` is borrowed.
         let mut servers = Vec::with_capacity(1 + self.file_services.devices.len());
-        servers.push(self.file_services.server);
+        servers.push(self.file_services.server());
         servers.extend(self.file_services.devices.keys().copied());
         let mut delivered = 0;
         for service in servers {
@@ -233,7 +228,7 @@ impl Runtime {
                     return Ok(None);
                 };
                 let reply_as = fields[2];
-                let (reply, retire) = self.serve_device_request(service, &fields[3])?;
+                let (reply, retire) = self.serve_device_request(service, fields[3])?;
                 if retire {
                     self.file_services.devices.remove(&service);
                 }
@@ -244,7 +239,7 @@ impl Runtime {
         }
         // The gen_server protocol: {'$gen_call', {Pid, Tag}, Request}.
         if fields.len() == 3 && self.atom_name(fields[0]).as_deref() == Some("$gen_call") {
-            let Ok(from) = tuple_fields(fields[1]) else {
+            let Some(from) = tuple_fields(fields[1]) else {
                 return Ok(None);
             };
             if from.len() != 2 {
@@ -262,7 +257,7 @@ impl Runtime {
                     ));
                 }
             }
-            let reply = match self.serve_server_request(table, &fields[2])? {
+            let reply = match self.serve_server_request(table, fields[2])? {
                 Some(reply) => reply,
                 // The oracle's `handle_call(Request, From, State) -> {noreply, State}`.
                 None => return Ok(None),
@@ -591,7 +586,7 @@ impl Runtime {
     /// The path's bytes, or `None` for the path forms `prim_file` rejects
     /// (`{error, badarg}`).
     fn encode_path(&mut self, term: Eterm) -> Option<Vec<u8>> {
-        let mut ctx = RuntimeContext::new(&mut *self);
+        let ctx = RuntimeContext::new(&mut *self);
         ctx.encode_path(term)
     }
 }
@@ -748,7 +743,6 @@ mod tests {
             .whereis(name)
             .expect("the service is registered");
         assert_eq!(pid, runtime.file_services.server());
-        assert!(runtime.file_services.is_running());
     }
 
     /// The `{error, enoent}` value the boot's `file:open("$HOME/.erlang",[read])` receives.
@@ -838,7 +832,7 @@ mod tests {
         });
         assert!(matches!(seek_from(at, &runtime).unwrap(), SeekFrom::Current(7)));
         // An unknown form is the typed gap.
-        let at = build(&mut runtime, |ctx| make_small(3));
+        let at = build(&mut runtime, |_ctx| make_small(3));
         assert!(seek_from(at, &runtime).is_err());
     }
 

@@ -549,6 +549,7 @@ impl Runtime {
                     continue;
                 }
             }
+            // The port-monitor half of the exit obligation: a process that died in the slices
             // just run may have been watching a live port, and `beam_process`'s finalizer cannot
             // remove the matching *incoming* entry because this runtime threads no port table
             // into the termination. The dead watchers' recorded `(port, reference)` pairs are
