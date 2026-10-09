@@ -245,6 +245,11 @@ short form is the safe one. Repro:
   oracle) proving the `application_controller` kernel process survives its short-lived directive process
   (`whereis` = a live pid); and the preloaded-only default.
 
+## Notes for Agents — closing the last A.9 link (`file_server_2`)
+The boot chain stops at directive 21 `{apply,{c,erlangrc,[]}}` because no `file_server_2` is registered. The sanctioned fix is to run the **real** `file_server`/`file_io_server`/`raw_file_io` Erlang (loaded by primLoad batch 3) as interpreted processes and add only the missing host surface under them — NOT to reimplement the gen_server/io protocol in Rust (a feasibility study found a native inbox-serviced process kind does not exist, `ProcessEntry` being only `Export`/`Fun`).
+- The only missing host piece is `prim_file`'s open-file/fd family (`src/native/prim.rs` serves the other 11 entries); `file_io_server` drives I/O via `?CALL_FD(Handle, read, [Size]) = prim_file:read/#2` etc. on a `#file_descriptor{module=prim_file, data=?}`.
+- `file_server:start/0` self-registers `file_server_2` (`gen_server:start({local,file_server_2}, …)`); the faithful start point is kernel's application start (directive index 18), but that chain's result is currently discarded.
+
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
 - `./preloaded.rs` → the real preloaded `.beam` loading (`load_preloaded`/`load_names`)
