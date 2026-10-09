@@ -1508,8 +1508,7 @@ seen() -> erlang:get(bootscript_seen).
     /// `init` runs `apply(M,F,A)` (`erts/preloaded/src/init.erl:1520`) and the process
     /// registers itself (`heart.erl:187`, `logger_server.erl:55`,
     /// `application_controller.erl:531`). A pre-registration by the executor would make that
-    /// self-registration `error:badarg` and kill the kernel process — the bug that stopped
-    /// the real `start.boot` with `exit noproc` at instruction 16.
+    /// self-registration `error:badarg` and kill the kernel process.
     ///
     /// This test pins the corrected contract end to end: the fixture's entry point registers
     /// the directive's name itself (and would die on a `badarg`), the burst runs it, and the

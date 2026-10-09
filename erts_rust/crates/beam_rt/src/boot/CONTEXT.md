@@ -131,9 +131,8 @@ and stops at **instruction 20** (0-based), `{apply,{c,erlangrc,[]}}`. The tail's
   not `parse_with_env`: a test must not depend on `ERL_*FLAGS`) over the CLI argv
   `beam_rt -noshell -boot bootstrap/bin/start` — and `tests/boot.rs` mirrors it (`boot_cli_runtime`),
   because a `RuntimeConfig::default()` runtime (an empty `init_args`, so `init:get_arguments/0` is `[]`
-  where the oracle also reports `root`/`bindir`/`progname`/`home`) stops three instructions earlier, at
-  instruction 16 (`application:load/1`, an `error function_clause`) — see the `src/native` handoff in
-  the blocker chain below.
+  where the oracle also reports `root`/`bindir`/`progname`/`home`; see `../native/CONTEXT.md`) stops
+  three instructions earlier, at instruction 16 (`application:load/1`, an `error function_clause`).
 - **The kernel processes are ready when the stop is reached.** The three `{kernelProcess, …}` bursts
   drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
@@ -172,7 +171,11 @@ short form is the safe one. Repro:
    synchronous `call_bif` instead of the `resolve_external_call`/`Step::Enter` seam, so
    `proc_lib:init_p/5`'s `try apply(M,F,A) catch … end` cannot suspend; and a `func_info`-driven raise
    carries an EMPTY `Raise.stacktrace.frames`, so a boot-path `function_clause` is unlocalizable.
-3. **`beam_bifs`.** Whatever the started applications still need past the above.
+3. **`beam_rt` `../native/init.rs` — `init:get_arguments/0` lists only the command-line flags**, so
+   it omits the oracle's automatic `root`/`bindir`/`progname`/`home`. A `RuntimeConfig::default()`
+   runtime therefore stops three instructions earlier, at instruction 16 (`application:load/1`, an
+   `error function_clause`); the CLI-equivalent configuration reaches instruction 20.
+4. **`beam_bifs`.** Whatever the started applications still need past the above.
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
