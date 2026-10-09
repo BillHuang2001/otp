@@ -24,9 +24,12 @@
 //! rules, the fullsweep cadence). This file pins the two behaviours a runtime relies on when
 //! the mutator outgrows its heap:
 //!
-//! 1. **Sustained allocation grows the spaces.** A live set that keeps climbing forces the
-//!    nursery and the mature generation past their initial sizes, and every live term stays
-//!    structurally intact after every collection (`beam_term::compare::eq`).
+//! 1. **Sustained allocation grows the mature generation, the nursery stays bounded.** A live
+//!    set that keeps climbing forces the *mature* generation past its initial size, while the
+//!    nursery's capacity plateaus at a small constant instead of creeping one step per
+//!    collection (the runaway `HeapPolicy::young_after_collection` exists to prevent). Every
+//!    live term stays structurally intact after every collection
+//!    (`beam_term::compare::eq`).
 //! 2. **A collection never leaves a half-forwarded from-space.** A policy whose
 //!    `max_heap_words` cannot fit the live set makes `collect` / `collect_major` /
 //!    `collect_minor` return a **typed** heap-exhaustion error *before* a single word is
@@ -78,13 +81,14 @@ fn assert_pairs_intact(roots: &[Eterm], expected: &[(i64, i64)]) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Sustained allocation grows the spaces and preserves the live set
+// 1. Sustained allocation grows the mature generation; the nursery stays bounded
 // ---------------------------------------------------------------------------
 
 #[test]
-fn sustained_allocation_grows_the_spaces_and_preserves_every_live_term() {
-    // Start tiny; the live set climbs every round, so the collector must grow the nursery
-    // and the mature generation past these initial sizes to keep it alive.
+fn sustained_allocation_grows_the_mature_generation_while_the_nursery_stays_bounded() {
+    // Start tiny; the *live set* climbs every round, so the mature generation must grow past
+    // its initial size to keep it alive. The nursery, by contrast, is **bounded**: each
+    // round's batch always fits it, so its capacity never tracks the (ever larger) live set.
     let initial_young = 51;
     let initial_mature = 51;
     let policy = HeapPolicy {
@@ -99,11 +103,13 @@ fn sustained_allocation_grows_the_spaces_and_preserves_every_live_term() {
 
     let mut roots: Vec<Eterm> = Vec::new();
     let mut expected: Vec<(i64, i64)> = Vec::new();
+    let mut young_caps: Vec<usize> = Vec::new();
 
+    // A **constant** per-round batch, so the allocation itself always fits the bounded
+    // nursery; it is the *accumulated* live set that grows, round after round.
+    const BATCH: i64 = 8;
     for round in 0..30i64 {
-        // A growing batch of long-lived tuples, so the live set keeps climbing.
-        let batch = 2 + round;
-        for j in 0..batch {
+        for j in 0..BATCH {
             let a = round * 1000 + j;
             roots.push(live_tuple(&mut collector, a, 2 * a));
             expected.push((a, 2 * a));
@@ -121,23 +127,36 @@ fn sustained_allocation_grows_the_spaces_and_preserves_every_live_term() {
 
         // After *every* collection the whole live set is structurally intact.
         assert_pairs_intact(&roots, &expected);
+
+        young_caps.push(collector.young().capacity_words());
     }
 
-    // The spaces really did grow: the live set (495 tuples = 1485 words) far exceeds the
-    // 51-word initial sizes, so both the nursery and the mature generation had to expand.
-    assert!(
-        collector.young().capacity_words() > initial_young,
-        "the nursery grew ({} -> ...)",
-        initial_young
-    );
+    // The mature generation really did grow: the live set (240 tuples = 720 words) far
+    // exceeds the 51-word initial size, so it had to expand.
     assert!(
         collector.mature().capacity_words() > initial_mature,
-        "the mature generation grew ({} -> ...)",
-        initial_mature
+        "the mature generation grew ({initial_mature} -> {})",
+        collector.mature().capacity_words()
     );
     assert!(
         collector.mature().used_words() > initial_mature,
         "the live set now occupies the grown mature generation"
+    );
+
+    // The nursery stayed **bounded**: after the first collection its capacity is a small
+    // constant — it does *not* step up once per collection with the climbing live set (a
+    // 20 %-per-collection creep would be 51 * 1.2^30 ≈ 12 000 words by now).
+    let young_min = *young_caps.iter().min().expect("non-empty");
+    let young_max = *young_caps.iter().max().expect("non-empty");
+    assert_eq!(
+        young_min, young_max,
+        "the nursery capacity must plateau across collections, got {young_caps:?}"
+    );
+    assert!(
+        young_max < collector.mature().used_words(),
+        "the nursery ({young_max} words) must stay far below the live set ({} words): it must \
+         not track the live set",
+        collector.mature().used_words()
     );
 
     // A final fullsweep keeps everything alive and correct.

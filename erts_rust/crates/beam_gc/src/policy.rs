@@ -285,26 +285,44 @@ impl HeapPolicy {
         }
     }
 
-    /// The nursery size (in words) to use after a collection that ran with `used_words`
-    /// live words in a `capacity_words` nursery — the C's minor-time young-heap resize
-    /// `next_heap_size(p, stack_size + MAX(size_before, need), 0)` (`erl_gc.c:1493`).
+    /// The nursery size (in words) to use after a collection that left `live_words` of a
+    /// `capacity_words` nursery alive — the nursery half of the C's minor-time young-heap
+    /// resize (`next_heap_size(p, stack_size + MAX(size_before, need), 0)`,
+    /// `erl_gc.c:1493`) and of `adjust_after_fullsweep` (`erl_gc.c:2061-2098`).
     ///
-    /// The next round's request is at least [`need_reserve_words`](Self::need_reserve_words)
-    /// and otherwise whatever the round just used, so a nursery that filled up
-    /// ([`should_grow`](Self::should_grow)) steps up the growth table while one left mostly
-    /// empty ([`should_shrink`](Self::should_shrink)) steps back down to the live set; a
-    /// nursery that was neither keeps its size. Bounded by
+    /// The nursery is **bounded**: the *only* branch that grows it is a surviving set larger
+    /// than the nursery itself, so the capacity can never creep upward one collection at a
+    /// time. A nursery the round left mostly empty
+    /// ([`should_shrink`](Self::should_shrink)) falls back towards the live set; one that
+    /// turned out about right keeps its size. Either way the result is at least
+    /// [`need_reserve_words`](Self::need_reserve_words), so a shrunk nursery still starts the
+    /// next round with the documented reserve.
+    ///
+    /// `live_words` is the count the collection **left in the nursery**, never its
+    /// pre-collection occupancy (a nursery is only collected when it is full, so the stale
+    /// fill is ≈ the capacity and would grow the nursery on *every* collection — the runaway
+    /// this rule exists to prevent). A minor passes the words it promoted
+    /// ([`GcStats::words_copied`](crate::GcStats), which for a minor is exactly the live young
+    /// words); a fullsweep evacuates the nursery into the mature generation, so it passes
+    /// `0`.
+    ///
+    /// Growing the nursery to cover a *larger single request* is not this rule's job — it is
+    /// [`ensure_capacity`](crate::Collector::ensure_capacity)'s (the explicit,
+    /// request-driven growth seam), which is why the nursery never has to grow merely because
+    /// a collection ran. Bounded by
     /// [`min_heap_words`](Self::min_heap_words)/[`max_heap_words`](Self::max_heap_words).
-    pub fn young_after_collection(&self, capacity_words: usize, used_words: usize) -> usize {
-        let request = used_words.max(self.need_reserve_words);
-        if self.should_grow(capacity_words, request) {
-            // The round filled (or nearly filled) the nursery: grow one curated step past
-            // whatever it had, so the next round starts with room to spare.
-            self.next_words(capacity_words.max(request), 1)
+    pub fn young_after_collection(&self, capacity_words: usize, live_words: usize) -> usize {
+        let request = live_words.max(self.need_reserve_words);
+        if request > capacity_words {
+            // A surviving set larger than the nursery: step up to the smallest curated size
+            // that covers it. This is the sole growth path, so the capacity is monotone only
+            // within one request — it can never grow per collection.
+            self.next_words(request, 0)
         } else if self.should_shrink(capacity_words, request) {
-            // The round left the nursery mostly empty: fall back to the live set.
+            // The round kept only a small part of the nursery: fall back to the live set.
             self.next_words(request, 0)
         } else {
+            // The nursery turned out to be about right: keep it.
             capacity_words
         }
     }}
@@ -668,20 +686,31 @@ mod tests {
     }
 
     #[test]
-    fn young_after_collection_grows_under_pressure_and_shrinks_when_empty() {
+    fn young_after_collection_is_bounded_and_shrinks_when_empty() {
         let policy = HeapPolicy::default();
 
-        // A full nursery grows one curated step: 233 -> 376.
-        assert_eq!(policy.young_after_collection(233, 233), 376);
-        // "Under pressure" starts once the round used more than 3/4 of the nursery.
-        assert_eq!(policy.young_after_collection(233, 175), 376);
+        // A nursery a round left *full* of live words keeps its size: the capacity is never
+        // stepped up merely because a collection ran (the runaway this rule prevents — a
+        // nursery is only collected when it is full, so "grow when full" grows on *every*
+        // collection).
+        assert_eq!(policy.young_after_collection(233, 233), 233);
+        assert_eq!(policy.young_after_collection(233, 175), 233);
         assert_eq!(policy.young_after_collection(233, 174), 233);
+
+        // The *only* growth is a surviving set the nursery cannot hold.
+        assert_eq!(policy.young_after_collection(233, 234), 376);
+        assert_eq!(policy.young_after_collection(233, 1_000), 1_598);
+        // `need_reserve_words` (64) is the request's floor, so a nursery smaller than that
+        // reserve grows to cover it (12 -> curated 64 -> 90).
+        assert_eq!(policy.young_after_collection(12, 0), 90);
 
         // A nursery the round left mostly empty keeps its size (233 is not > 4 * 64).
         assert_eq!(policy.young_after_collection(233, 13), 233);
         // A grossly over-sized nursery shrinks back towards the live set.
         assert_eq!(policy.young_after_collection(1_000, 13), 90);
         assert_eq!(policy.young_after_collection(1_000, 0), 90);
+        // ... and a shrink is idempotent: the shrunk nursery is already about right.
+        assert_eq!(policy.young_after_collection(90, 0), 90);
 
         // The result is always bounded by the policy.
         let floored = HeapPolicy {
@@ -694,6 +723,7 @@ mod tests {
             max_heap_words: 300,
             ..HeapPolicy::default()
         };
-        assert_eq!(capped.young_after_collection(233, 233), 300);
+        assert_eq!(capped.young_after_collection(233, 1_000), 300);
+        assert_eq!(capped.young_after_collection(233, 233), 233);
     }
 }
