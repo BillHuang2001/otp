@@ -42,7 +42,7 @@
 //! | `-name N` / `-sname N` | distribution node name |
 //! | `-setcookie C` | distribution cookie (recorded as an init argument; sets `emulator.cookie`) |
 //! | `-config F` | config file, recorded as the init argument `config` |
-//! | `-boot F` | boot script, recorded as the init argument `boot` (consumed by the A.7 boot path) |
+//! | `-boot F` | boot script: recorded as the init argument `boot` **and** executed by the A.7 boot-script executor (the `Boot` action) |
 //! | `-emu_flavor F` | emulator flavor: `emu` ⇒ interpreter, `jit`/`smp` ⇒ JIT (recorded) |
 //! | `+Q N` | maximum number of ports (`legacy`, or `1024..=134217727`) |
 //! | `+K true\|false` | kernel-poll switch |
@@ -162,7 +162,8 @@ Switches:
   -name N, -sname N         distribution node name
   -setcookie C              distribution cookie
   -config FILE              configuration file (recorded as init:get_argument(config))
-  -boot FILE                boot script (recorded as init:get_argument(boot))
+  -boot FILE                boot script: executed by the boot action (a bare invocation);
+                            also recorded as init:get_argument(boot)
   -emu_flavor emu|jit|smp   emulator flavor
   any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1);
                             a +FLAG is an emulator flag and is not an init argument
@@ -1017,8 +1018,16 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             Ok(())
         }
         Action::Boot => {
+            // `-boot FILE` is the boot **action**'s script: a bare `beam_rt -boot F` really
+            // executes F (contract A.7/A.9) instead of only loading the preloaded set. The
+            // value comes from the recorded init arguments, exactly as `init` reads its own
+            // `boot` flag, so it must be copied out before `config` moves into the runtime.
+            let boot_file = boot_file_argument(&config).map(str::to_string);
             let mut runtime = Runtime::new(config)?;
-            let result = runtime.boot();
+            let result = match &boot_file {
+                Some(value) => run_boot_script(&mut runtime, value),
+                None => runtime.boot(),
+            };
             *snapshot = Some(runtime);
             result
         }
@@ -1074,6 +1083,109 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
             result
         }
     }
+}
+
+/// The `-boot FILE` drive: resolve `value` the way `init` resolves its `boot` flag and
+/// execute the resulting script (contracts A.7/A.9).
+///
+/// The **boot action** is the one invocation whose whole job is to boot, so it is the one
+/// that drives the script; a start instruction (`-eval`/`-s`/`-run`/`run`) keeps the
+/// preloaded-only floor it has always had, because Milestone 1's executor cannot get past
+/// the system's own `{apply,{application,load,…}}` directive and would therefore fail every
+/// such invocation before its instruction ever ran (see below).
+///
+/// The runtime boots first: [`Runtime::boot`] is what puts the preloaded set *and* the
+/// system code path in place, and the code path is what resolves `$ROOT` — in `value`
+/// itself and in the script's own `{path, …}` directives. It is idempotent, and
+/// [`Runtime::boot_from_script`] boots again as its own precondition.
+///
+/// Nothing is swallowed: a file on neither of `init`'s candidates, a malformed script and
+/// the **honest Milestone-1 stop** (the real `start.boot` cannot get past its
+/// `{apply,{application,load,…}}` directive, which needs a live `application_controller`)
+/// all return their typed [`BeamError`] — which [`run`] reports as `beam_rt: <error>` with
+/// exit code 1 — never a panic, a hang or a wrong result.
+fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {
+    runtime.boot()?;
+    let path = resolve_boot_file(value, boot_file_root(runtime).as_deref())?;
+    runtime.boot_from_script(&path).map(|_| ())
+}
+
+/// The `-boot FILE` argument of the merged command line, or `None` when none was given.
+///
+/// The value is read from the recorded init arguments rather than a field of its own
+/// because that is exactly where `init` reads it: `bootfile/2` resolves `get_flag(boot,
+/// Flags, Root ++ "/bin/start")` (`erts/preloaded/src/init.erl:1257-1258`), and the `boot`
+/// flag *is* the init argument `init:get_argument(boot)` reports (contract A.6). The
+/// **first** occurrence wins (`lists:keyfind/3`, `init.erl:1763`), so `-boot a -boot b`
+/// boots `a`.
+///
+/// A `-boot` with no operand never reaches this function: [`parse`] rejects it as a usage
+/// error, so a value is always present when there is an occurrence.
+fn boot_file_argument(config: &RuntimeConfig) -> Option<&str> {
+    let occurrences = config.init_args.get("boot")?;
+    let values = occurrences.first()?;
+    values.first().map(String::as_str)
+}
+
+/// The Erlang root (`<Root>`) a `-boot` argument is resolved against: the directory above
+/// `<lib>` ([`Runtime::code_server`]'s `lib_root`) — the same convention the boot script's
+/// own `$ROOT` expansion uses (see [`crate::boot::bootscript`]). `None` until the system
+/// install is on the code path, which is the only case that has a `<Root>` to speak of.
+fn boot_file_root(runtime: &Runtime) -> Option<PathBuf> {
+    let lib_root = runtime.code_server().lib_root()?;
+    lib_root.parent().map(Path::to_path_buf)
+}
+
+/// Resolves a `-boot FILE` value to the `.boot` file the oracle would read, exactly as
+/// `init`'s `get_boot/2` does (`erts/preloaded/src/init.erl:1265-1286`).
+///
+/// `init` builds one candidate name and then one fallback, in this order:
+///
+/// 1. `$ROOT/<Name>` becomes `<Root>/bin/<Name>.boot`; any other value is taken verbatim
+///    with `.boot` appended — so `-boot start` is `start.boot` (a path relative to the
+///    current directory) and `-boot /x/y` is `/x/y.boot`;
+/// 2. when (1) does not exist, `<Root>/bin/<candidate>` — a **string concatenation**, as the
+///    oracle writes it (`Root ++ "/bin/" ++ BootFile`, `init.erl:1275`), so a bare
+///    `-boot start` lands on the installed `<Root>/bin/start.boot` (the installed location
+///    of this checkout's `bootstrap/bin/start.boot`) and `init`'s own default `start`
+///    resolves to the very same file.
+///
+/// `<Root>` is the Erlang root ([`boot_file_root`]); it is `None` for a runtime with no
+/// system install on its code path, which is why a `$ROOT/…` value then fails rather than
+/// silently resolving to something else.
+///
+/// A `$ROOT/…` value with no resolvable root, and a value whose two candidates both do not
+/// exist, are a typed message naming the candidate — the oracle's
+/// `exit({'cannot get bootfile', Name})` — never a silent skip and never a different file.
+fn resolve_boot_file(value: &str, root: Option<&Path>) -> Result<PathBuf> {
+    let candidate = match value.strip_prefix("$ROOT/") {
+        Some(rest) => {
+            let root = root.ok_or_else(|| {
+                error::message(format!(
+                    "cannot get bootfile {value}: `$ROOT` cannot be resolved — the code path \
+                     has no <lib>/<app>-<vsn>/ebin directory"
+                ))
+            })?;
+            root.join("bin").join(format!("{rest}.boot"))
+        }
+        None => PathBuf::from(format!("{value}.boot")),
+    };
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    if let Some(root) = root {
+        // Deliberately a string concatenation, not `Path::join` (which would *replace* the
+        // path for an absolute candidate): the oracle concatenates, so an absolute
+        // `-boot /x/y` looks for `<Root>/bin//x/y.boot` and stays not-found there.
+        let fallback = PathBuf::from(format!("{}/bin/{}", root.display(), candidate.display()));
+        if fallback.is_file() {
+            return Ok(fallback);
+        }
+    }
+    Err(error::message(format!(
+        "cannot get bootfile {}",
+        candidate.display()
+    )))
 }
 
 /// The `-s Mod Func [Args…]` / `-run Mod Func [Args…]` action: the result is
@@ -1967,6 +2079,149 @@ mod tests {
                 "/nonexistent/nope.beam".to_string(),
                 "nope:f/0".to_string(),
             ]),
+            EXIT_RUNTIME
+        );
+    }
+
+    /// A scratch directory the boot-file resolution tests write their candidates into,
+    /// removed on drop.
+    struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        /// Creates an empty scratch directory unique to `label` and this process.
+        fn new(label: &str) -> ScratchDir {
+            let path = std::env::temp_dir().join(format!(
+                "beam_rt_cli_boot_{label}_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path)
+                .unwrap_or_else(|error| panic!("cannot create {}: {error}", path.display()));
+            ScratchDir { path }
+        }
+
+        /// Writes `name` (relative to the scratch directory, parents created) and returns
+        /// its full path.
+        fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
+            let file = self.path.join(name);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+                    panic!("cannot create {}: {error}", parent.display())
+                });
+            }
+            std::fs::write(&file, contents)
+                .unwrap_or_else(|error| panic!("cannot write {}: {error}", file.display()));
+            file
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
+                eprintln!("note: cannot remove {}: {error}", self.path.display());
+            }
+        }
+    }
+
+    /// The `-boot FILE` wiring: the switch stays the `boot` **init argument** the oracle
+    /// reports *and* becomes the script value the boot drive resolves. The boot action is
+    /// the only action that carries it (a start instruction keeps the preloaded-only
+    /// floor), so the extraction is pinned per action.
+    #[test]
+    fn boot_switch_is_recorded_and_selected_for_the_boot_action() {
+        let config = parsed(&["-noshell", "-boot", "start"]);
+        assert_eq!(config.action, Action::Boot);
+        assert_eq!(
+            config.init_args.get("boot"),
+            Some(vec![&["start".to_string()][..]])
+        );
+        assert_eq!(boot_file_argument(&config), Some("start"));
+
+        // The **first** occurrence wins — the oracle's `lists:keyfind/3`.
+        let config = parsed(&["-boot", "first", "-boot", "second"]);
+        assert_eq!(boot_file_argument(&config), Some("first"));
+
+        // No `-boot`: the boot action keeps its preloaded-only drive.
+        assert_eq!(boot_file_argument(&parsed(&["-noshell"])), None);
+        assert_eq!(boot_file_argument(&parsed(&[])), None);
+        // The **flag** is action-independent, but only the boot action drives it: a start
+        // instruction keeps the preloaded-only floor (the Milestone-1 executor cannot finish
+        // the boot, so driving it there would fail the instruction before it ever ran).
+        let config = parsed(&["-boot", "x", "-eval", "2+3"]);
+        assert_eq!(boot_file_argument(&config), Some("x"));
+        assert_eq!(config.action, Action::Eval("2+3".to_string()));
+        // `-config` is a different flag, never a boot script.
+        assert_eq!(boot_file_argument(&parsed(&["-config", "/etc/app.config"])), None);
+
+        // A `-boot` with no operand is a usage error, never a silent default.
+        assert!(parse_args(&["-boot"]).is_err());
+    }
+
+    /// The boot-file resolution mirrors `init`'s `get_boot/2` (`erts/preloaded/src/init.erl`):
+    /// the candidate is `<Name>.boot` (or `<Root>/bin/<Name>.boot` for a `$ROOT/…` value) and
+    /// the fallback is the **string** `<Root>/bin/<candidate>`, so `-boot start` finds the
+    /// installed `<Root>/bin/start.boot` and a value whose candidates are both absent is a
+    /// typed error naming the candidate.
+    #[test]
+    fn the_boot_file_is_resolved_exactly_as_init_does() {
+        let scratch = ScratchDir::new("resolve");
+        let root = scratch.path.join("root");
+        // A name no directory of this test run can hold, so the "relative to the current
+        // directory" candidate is provably absent and the `<Root>/bin` fallback is what
+        // answers (exactly the oracle's default `start` resolution).
+        let name = format!("beam_rt_cli_{}", std::process::id());
+        let installed = scratch.write(&format!("root/bin/{name}.boot"), b"installed");
+
+        // (1)+(2) a bare name: `<Name>.boot` relative to the current directory misses, so
+        // the `<Root>/bin` fallback wins.
+        assert_eq!(
+            resolve_boot_file(&name, Some(&root)).expect("the <Root>/bin fallback"),
+            installed
+        );
+        // (1) the `$ROOT/<Name>` form is `<Root>/bin/<Name>.boot`, hit directly.
+        assert_eq!(
+            resolve_boot_file(&format!("$ROOT/{name}"), Some(&root)).expect("the $ROOT form"),
+            installed
+        );
+        // (1) an existing path is taken verbatim with `.boot` appended.
+        let explicit = scratch.write("mine.boot", b"explicit");
+        let value = scratch.path.join("mine");
+        assert_eq!(
+            resolve_boot_file(&value.to_string_lossy(), Some(&root)).expect("an explicit file"),
+            explicit
+        );
+        // `.boot` is appended unconditionally, as the oracle does: `-boot …/mine.boot` looks
+        // for `…/mine.boot.boot`.
+        let with_suffix = scratch.path.join("mine.boot");
+        assert!(
+            resolve_boot_file(&with_suffix.to_string_lossy(), Some(&root)).is_err(),
+            "the `.boot` suffix is appended, never inferred from the argument"
+        );
+
+        // Both candidates absent: a typed message naming the candidate, never a silent skip
+        // and never a different file. The fallback is a *string* concatenation, so an
+        // absolute candidate lands under `<Root>/bin` and stays not-found.
+        let absent = scratch.path.join("absent");
+        let error = resolve_boot_file(&absent.to_string_lossy(), Some(&root))
+            .expect_err("an absent boot file is an error");
+        let text = format!("{error}");
+        assert!(text.contains("cannot get bootfile"), "{text}");
+        assert!(text.contains("absent.boot"), "{text}");
+
+        // A `$ROOT/…` value with no resolvable root is refused rather than guessed at.
+        let error = resolve_boot_file("$ROOT/start", None)
+            .expect_err("an unresolvable $ROOT is an error");
+        assert!(format!("{error}").contains("cannot get bootfile"), "{error}");
+    }
+
+    /// The `Boot` action really drives the executor: an unknown `-boot` value reaches the
+    /// resolution and is reported as a runtime error (exit 1), never a usage error, a panic
+    /// or a silent success.
+    #[test]
+    fn a_boot_flag_naming_an_absent_script_is_a_runtime_error() {
+        assert_eq!(
+            run(vec!["-boot".to_string(), "/nonexistent/nope".to_string()]),
             EXIT_RUNTIME
         );
     }
