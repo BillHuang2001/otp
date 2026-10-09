@@ -13,7 +13,13 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `registers.rs` — x/FR access (`get_fr`/`set_fr`, bounds-checked → `bad_register`).
 - `frames.rs` — `allocate*`/`deallocate*`/`trim`, the typed `Continuation` CP slot, and `Machine::ensure_heap`
   (the `ensure_heap_full` root-set admission point that hands over the whole `RootSet`).
-- `catch.rs` — the `CatchFrame` stack + `throw`/`throw_error`/`throw_with_trace` (the one raise/unwind entry).
+- `catch.rs` — the `CatchFrame` stack + the raise/unwind entry (`throw`/`throw_error`/`throw_with_trace`) and the
+  **uniform raise funnel**: `raise_stacktrace(Option<&Module>)` derives the symbolic `StackTrace` (raising function,
+  then every live caller innermost first) and `with_uncaught_frames` attaches it to an uncaught `BeamError::Raise`
+  (leaving a non-raise error, an already-framed raise and an **engine diagnostic** — a reason atom prefixed
+  `unsupported_opcode: `, the `error::unsupported` sentinel — untouched). The funnel's first half runs at the
+  `step_instruction` boundary (`../interpreter/dispatch.rs`), its **second half at the `drive` boundary** for a raise
+  that surfaced inside a cross-module callee (`drive.rs`).
 - `context.rs` — the `ModuleContext`/`Contexts` registry; `current_context`/`register_context`/`switch_context`/
   `module_context`.
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
@@ -23,7 +29,15 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `drive.rs` — **`Machine::drive`**: owns the `(func, pc)` position *and* the module context those indices belong
   to, folds every `Step` back into that position, charges **exactly one reduction per interpreted instruction**
   through `ExecutionContext::reduce` (the only pre-emption point a non-allocating loop reaches), and re-binds the
-  literal area exactly on a `Step::Enter` into a different context.
+  literal area exactly on a `Step::Enter` into a different context. It also runs the raise funnel's second half
+  (`Machine::with_uncaught_frames`) over a raise that surfaced inside a cross-module callee — the driver is where
+  the run's true entry module is known, so those caller frames are named against the right module.
+- `tests.rs` — the cross-cutting end-to-end tests of the raise funnel: one synthetic module per raise kind
+  (`throw`/`error`/`exit` `raw_raise`, a BIF error, `func_info`, a nested call, a cross-module callee), each run
+  through a real run entry and asserting the propagated `Err(BeamError::Raise)` frames name the raising function and
+  every live caller innermost first, plus the guard that a caught raise lands unchanged. `test_support.rs`
+  (`cfg(test)` only) is the synthetic-module builder (`Fixture`) and cross-module seam context (`seam`) these share
+  with `drive.rs`'s tests.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only — no crate-local error enum, no panic, no `unwrap()` on
