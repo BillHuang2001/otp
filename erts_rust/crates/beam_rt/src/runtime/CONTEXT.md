@@ -44,7 +44,7 @@ Split by responsibility: `runner/entry.rs` (`ProcessEntry`/`ProcessEngine`/`Runn
 * `gc.rs` units: the pin/halt/valve sets, `gc_stats`, and `stabilize_escaped` both on a movable heap and on a tripped valve.
 * `ets_owner.rs` units: append-only port-watch recording, the take-for-a-drain contract, and the two drains (incl. the deferred-borrow path).
 * `../runner/tests.rs`: the one-slice `ProcessRunner` contract, `RunnerState` bookkeeping, receive-deadline arming and the exit-reason mapping.
-* Integration (`../../tests/`): `port_wake.rs` (a port wake resumed through the scheduler), `proc_lib_start.rs` (the cross-module `receive` suspend seam), `position.rs`, `boot.rs`, and the `run`-action suites (`cli.rs`, `slice.rs`).
+* Integration (`../../tests/`): `port_wake.rs` (a port wake resumed through the scheduler), `proc_lib_start.rs` (the cross-module `receive` suspend seam), `file_server.rs` (the native `file_server_2` service driven over real temporary files/directories, oracle-cross-checked), `position.rs`, `boot.rs` (the real `start.boot` to completion), and the `run`-action suites (`cli.rs`, `slice.rs`).
 
 ## Routing Table
 * `../runtime.rs` → the `Runtime` façade (boot wiring, code server + module cache, the slice, the spawn API, the timer/distribution accessors, `stabilize_term`/`materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`, and the `file_services` field).
