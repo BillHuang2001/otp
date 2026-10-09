@@ -18,11 +18,11 @@
 //
 // %CopyrightEnd%
 
-//! `proc_lib:start/3,4` — **the A.9 self-hosted-boot blocker**.
+//! `proc_lib:start/3,4` — **the A.9 self-hosted-boot blocker**, and its regression gate.
 //!
 //! `init`'s `{kernelProcess, application_controller, {application_controller,start}}`
-//! directive is what stops `bootstrap/bin/start.boot` at instruction 16: the boot script's
-//! `{apply, {application, load, …}}` then raises `exit noproc`, because
+//! directive is what used to stop `bootstrap/bin/start.boot` at instruction 16: the boot
+//! script's `{apply, {application, load, …}}` then raised `exit noproc`, because
 //! `application_controller:start/1` — reached through `proc_lib:start_link/4` — crashed
 //! during the `{kernelProcess, …}` burst instead of blocking.
 //!
@@ -42,8 +42,8 @@
 //! | `sep` / `sep_hard` | a *local* function of the entry module | `{ok,pid}` | `{ok,pid}` |
 //! | `plshaped` | `plsync/2`, a local function (the `proc_lib` shape) | `{ok,pid}` | `{ok,pid}` |
 //! | `pure` | no receive at all, just a cross-module call | `42` | `42` |
-//! | `cross` / `cross_hard` | `plwait:wait[_hard]/2`, a **different module** | typed gap | `{ok,pid}` |
-//! | `run` / `startlink` | `proc_lib:sync_start/2`, a **different module** | typed gap | `{ok,pid}` |
+//! | `cross` / `cross_hard` | `plwait:wait[_hard]/2`, a **different module** | `{ok,pid}` | `{ok,pid}` |
+//! | `run` / `startlink` | `proc_lib:sync_start/2`, a **different module** | `{ok,pid}` | `{ok,pid}` |
 //!
 //! So neither "a receive in a non-entry frame" (H1) nor "a register-held `after Timeout`"
 //! (H2) is the discriminator: both work inside one module. The discriminator is the
@@ -60,28 +60,32 @@
 //! `Machine::new().run_export(...)`. `Machine::run_export` folds a
 //! `RunOutcome::Wait` into the typed `Err(error::blocked())`
 //! (`beam_engine/src/machine/run.rs:51-78`, `fold_outcome`), so a callee that blocks in its
-//! own `receive` cannot suspend the *process*: the block surfaces as a raise at the call
-//! site and the process dies.
+//! own `receive` could not suspend the *process*: the block surfaced as a raise at the call
+//! site and the process died.
 //!
 //! The real BEAM does not do this: `i_call_ext` saves a continuation pointer and **jumps
 //! into the callee's code in the same process frame**
 //! (`erts/emulator/beam/emu/instrs.tab:191`, `ops.tab:923`), so the callee's `receive`
 //! suspends the process and the scheduler resumes it there.
 //!
-//! # Why `beam_rt` cannot close it alone
+//! # How it was closed
 //!
-//! Reaching the `Wait` from the *caller* requires knowing where the caller's `call_ext`
-//! is — and `RuntimeContext` has no handle on the running `Machine`: the runner owns it
-//! (`src/runner/run.rs` takes `engine.machine` out of the [`RunnerState`] map and hands it
-//! to the engine by `&mut`), so a `call_bif` nested inside its dispatch loop cannot reach
-//! it (`#![deny(unsafe_code)]`). Making the boundary blocking-aware therefore needs an
-//! engine-side seam: an `ExecutionContext` method that resolves an external call to a
-//! `(Arc<Module>, func, pc)` *entry* so the `CallExt` arm can push a frame and
-//! `Step::Goto` into the callee — the C-faithful shape — instead of recursing.
+//! `beam_engine` exposes the cross-module call seam
+//! ([`ExecutionContext::resolve_external_call`]): a `call_ext*` the host can resolve to a
+//! `(Arc<Module>, entry_label)` is entered **in the calling machine** (the C-faithful
+//! shape — the callee's registers, stack and frames *are* the process's), so its `receive`
+//! suspends the process and the scheduler resumes it there.
 //!
-//! The `FRONTIER` table below is the honest pin of the current behaviour: exactly the typed
-//! capability gap, never a wrong result and never a hang, with the oracle's real answer
-//! recorded beside it.
+//! `beam_rt` implements the seam in `src/context/mod.rs::resolve_external_call`. It is
+//! consulted before every `call_ext*`, so it must answer `Ok(None)` for anything the
+//! synchronous path serves better (the runtime-native floor's namespaces, a NIF-backed
+//! module, a registered `beam_bifs` name, a float-using module, an unknown
+//! export) and it **loads the callee on demand** when the module is not cached yet —
+//! otherwise the *first* call (which is exactly what a `proc_lib` start is) would keep the
+//! synchronous, non-blocking path and still report the typed gap.
+//!
+//! [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -100,9 +104,13 @@ const MODULE: &str = "plstart";
 
 /// Entry points that **agree** with the live oracle: `(label, function, expected line)`.
 ///
-/// Every one of them spawns a child and waits for its ack *inside the fixture's own
-/// module*, which is why the block is reported and resumed correctly today.
-const AGREE: [(&str, &str, &str); 6] = [
+/// The first six spawn a child and wait for its ack *inside the fixture's own module*; the
+/// last four wait across a **module boundary** (`plwait:wait[_hard]/2`, or `proc_lib`'s own
+/// `sync_start/2`), which is the shape `proc_lib:start[_link]/4` uses — and the shape the
+/// cross-module call seam ([`beam_engine::ExecutionContext::resolve_external_call`], which
+/// `beam_rt` implements in `src/context/mod.rs`) now runs **in the calling machine**, so the
+/// callee's `receive` suspends the process instead of folding into `error::blocked()`.
+const AGREE: [(&str, &str, &str); 10] = [
     ("an inline receive", "inline", "{ok,pid}"),
     ("an inline receive with a hardcoded after", "inline_hard", "{ok,pid}"),
     ("a receive in a local non-entry function", "sep", "{ok,pid}"),
@@ -113,28 +121,11 @@ const AGREE: [(&str, &str, &str); 6] = [
     ),
     ("the proc_lib structure, reproduced locally", "plshaped", "{ok,pid}"),
     ("a cross-module call that does not block", "pure", "42"),
-];
-
-/// The **current frontier**: `(label, function, the oracle's answer)`.
-///
-/// Each of these waits for its ack across a **module boundary** — the shape
-/// `proc_lib:start/4`/`start_link/4` uses. The live oracle answers `{ok,pid}`; this runtime
-/// reports the typed capability gap below instead. They are asserted as a gap (not as a
-/// pass): the moment the engine's external-call boundary becomes blocking-aware, these
-/// entries must be moved into [`AGREE`].
-const FRONTIER: [(&str, &str, &str); 4] = [
     ("proc_lib:start/4", "run", "{ok,pid}"),
     ("proc_lib:start_link/4", "startlink", "{ok,pid}"),
     ("a receive in a foreign module", "cross", "{ok,pid}"),
     ("a receive in a foreign module with after", "cross_hard", "{ok,pid}"),
 ];
-
-/// The typed diagnostic a cross-module blocking call currently reports (exit code 3).
-const BLOCKED_GAP: &str = "unsupported: opcode: run: process blocked (no message available)";
-
-/// The CLI's `EXIT_UNSUPPORTED`.
-const EXIT_UNSUPPORTED: i32 = 3;
-
 // ---------------------------------------------------------------------------------------
 // Toolchain discovery + the loud skip
 // ---------------------------------------------------------------------------------------
@@ -356,16 +347,17 @@ fn same_module_receives_agree_with_the_oracle() {
     }
 }
 
-/// The A.9 boot blocker, pinned as a typed capability gap: a `receive` reached across a
-/// **module boundary** (`plwait:wait/2`, and so `proc_lib:sync_start/2`) reports the
-/// engine's unchanged `blocked` diagnostic on exit code 3 — never a wrong result, never a
-/// hang — while the live oracle answers `{ok,pid}` for the very same call.
+/// The A.9 boot blocker, **closed**: every shape — including the four that wait across a
+/// **module boundary** (`plwait:wait[_hard]/2`, and `proc_lib:start[_link]/4` through
+/// `proc_lib:sync_start/2`) — answers exactly what the live oracle answers.
 ///
-/// This test is the reproduction the fix must flip: when the cross-module call boundary
-/// suspends the process instead of raising, move these four entries into [`AGREE`] and
-/// delete [`FRONTIER`] / [`BLOCKED_GAP`].
+/// The cross-module call seam runs the callee **in the calling machine**, and the on-demand
+/// load makes that true for the *first* call to a module too — which is what a `proc_lib`
+/// start does (nothing has loaded `proc_lib` beforehand). So the callee's `receive` suspends
+/// the process, the scheduler resumes it when the child acks, and the answer is `{ok,pid}`
+/// instead of the engine's old typed `blocked` diagnostic.
 #[test]
-fn cross_module_blocking_calls_report_the_typed_boot_gap() {
+fn cross_module_receives_agree_with_the_oracle() {
     let Some(oracle) = support::require_oracle("proc_lib_start") else {
         return;
     };
@@ -382,27 +374,30 @@ fn cross_module_blocking_calls_report_the_typed_boot_gap() {
         .unwrap_or_else(|| panic!("the fixture path is not UTF-8: {}", fixtures.beam.display()));
     let dir = fixtures.dir.to_str().expect("the scratch dir is not UTF-8");
 
-    for (label, function, oracle_answer) in FRONTIER {
+    // The four that cross a module boundary are the ones this test is about: run them by
+    // name so a future reshuffle of `AGREE` cannot silently drop the discrimination.
+    for function in ["run", "startlink", "cross", "cross_hard"] {
         let spec = format!("{MODULE}:{function}/0");
         let ours = run_bounded(
             Path::new(env!("CARGO_BIN_EXE_beam_rt")),
             &["-pa", dir, "run", beam, &spec],
         );
+        eprintln!("{spec} -> exit {} out={:?} err={:?}", ours.code, ours.out, ours.err);
         assert_eq!(
-            ours.code, EXIT_UNSUPPORTED,
-            "{label}: `beam_rt run {beam} {spec}` must be the honest capability gap (exit \
-             {EXIT_UNSUPPORTED}), got exit {}: {} / {}",
-            ours.code, ours.out, ours.err
-        );
-        assert!(
-            ours.err.contains(BLOCKED_GAP),
-            "{label}: the gap must be the engine's own blocked diagnostic, got: {}",
+            ours.code, 0,
+            "{spec}: a cross-module receive is no longer a capability gap: {}",
             ours.err
         );
+        assert!(
+            !ours.err.contains("unsupported"),
+            "{spec}: still reported as a capability gap: {}",
+            ours.err
+        );
+        assert_eq!(ours.out, "{ok,pid}", "{spec}: beam_rt's answer");
         assert_eq!(
             oracle_line(&oracle, &fixtures.dir, function),
-            oracle_answer,
-            "{label}: the live oracle really does answer — so this is a gap, not a fixture bug"
+            "{ok,pid}",
+            "{spec}: the live oracle's answer"
         );
     }
 }
