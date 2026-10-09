@@ -27,7 +27,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use beam_ets::{compile, MatchSpec, Table, TableKind};
+use beam_ets::{compile, MatchSpec, TableKind};
 use beam_term::prelude::*;
 use common::*;
 
@@ -265,33 +265,6 @@ fn match_delete_removes_the_matching_objects_and_returns_the_count() {
 // `ets:select_reverse/2` — the reverse traversal
 // ---------------------------------------------------------------------------
 
-/// A fresh output heap for a select call.
-fn out_heap() -> beam_alloc::Heap {
-    beam_alloc::Heap::new(8192).expect("an output heap is allocatable")
-}
-
-/// `[{'$1', [], ['$1']}]` — a bare-variable head that binds the whole object and
-/// returns it (the spec the reverse probes below use).
-fn whole_object_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
-    let head = interned_atom(atoms, "$1");
-    let body = proper_list(heap, &[interned_atom(atoms, "$1")]);
-    let clause = heap.tuple(&[head, NIL, body]).unwrap();
-    let spec = proper_list(heap, &[clause]);
-    compile(spec, atoms).expect("the quoted spec compiles")
-}
-
-/// `[{{'$1','_'}, [], ['$1']}]` — bind the key and return it (one small integer
-/// per object), the spec the live-oracle cross-check below uses.
-fn key_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
-    let head = heap
-        .tuple(&[interned_atom(atoms, "$1"), interned_atom(atoms, "_")])
-        .unwrap();
-    let body = proper_list(heap, &[interned_atom(atoms, "$1")]);
-    let clause = heap.tuple(&[head, NIL, body]).unwrap();
-    let spec = proper_list(heap, &[clause]);
-    compile(spec, atoms).expect("the quoted spec compiles")
-}
-
 /// `ets:select_reverse/2` walks an `ordered_set` in **descending** numeric key
 /// order.
 ///
@@ -461,41 +434,6 @@ fn select_reverse_agrees_with_the_live_oracle_across_kinds() {
 // `select_delete`/`match_delete`/`select_count` — which objects go, and the
 // return count
 // ---------------------------------------------------------------------------
-
-/// The `{Key, Value}` objects `{1,10}..{5,50}` on `heap` — the fixture of the delete
-/// battery. (The traversal-order battery in `ets_order.rs` builds the same one.)
-fn objects_1_to_5(heap: &mut Heap) -> Vec<Eterm> {
-    (1..=5i64).map(|key| object(heap, key, key * 10)).collect()
-}
-
-/// The `(key, value)` of a `{K, V}` small-integer tuple.
-fn pair_of(object: Eterm) -> (i64, i64) {
-    // SAFETY: every term read here is a `{Key, Value}` two-word tuple of small
-    // integers built by `common::object`.
-    unsafe {
-        (
-            signed_value(tuple_element(object, 0)),
-            signed_value(tuple_element(object, 1)),
-        )
-    }
-}
-
-/// Render a list of small integers the way `erl`'s `~p` does: `[1,2,3]`.
-fn render_ints(values: &[i64]) -> String {
-    let joined = values
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{joined}]")
-}
-
-/// The keys of `table`, ascending (the order-insensitive rendering of a hash kind).
-fn sorted_keys(table: &Table) -> Vec<i64> {
-    let mut keys: Vec<i64> = table.tab2list().iter().map(|o| pair_of(*o).0).collect();
-    keys.sort();
-    keys
-}
 
 /// The four kinds, in the delete battery's order.
 const KINDS: [TableKind; 4] = [
@@ -746,15 +684,4 @@ fn select_delete_and_select_count_agree_with_the_live_oracle() {
         DELETE_EXPECTED.len(),
         DELETE_ORACLE_RETURN.len()
     );
-}
-
-/// Parse `name -> rendering` lines into pairs, tolerating leading/trailing noise.
-fn parse_lines(stdout: &str) -> BTreeMap<String, String> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let (name, rendered) = line.trim().split_once(" -> ")?;
-            Some((name.trim().to_string(), rendered.trim().to_string()))
-        })
-        .collect()
 }

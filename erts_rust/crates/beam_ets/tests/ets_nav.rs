@@ -570,18 +570,6 @@ fn absent_anchors_agree_with_the_live_oracle() {
         NAV_EXPECTED.len()
     );
 }
-
-/// Parse `name -> rendering` lines into pairs, tolerating leading/trailing noise.
-fn parse_lines(stdout: &str) -> BTreeMap<String, String> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let (name, rendered) = line.trim().split_once(" -> ")?;
-            Some((name.trim().to_string(), rendered.trim().to_string()))
-        })
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // The view-layer traversal ORDER (`TableRead::{iter_keys, iter_objects, foldl,
 // foldr, tab2list_into}`), for all four kinds
@@ -625,18 +613,6 @@ fn term_pair(object: &TableTerm<'_>) -> (i64, i64) {
         .and_then(|element| element.as_small_int())
         .expect("every stored value element is a small integer");
     (key, value)
-}
-
-/// The `(key, value)` of an owned `{K, V}` tuple.
-fn raw_pair(object: Eterm) -> (i64, i64) {
-    // SAFETY: every term read here is a `{Key, Value}` two-word tuple of small
-    // integers built by `common::object`.
-    unsafe {
-        (
-            signed_value(tuple_element(object, 0)),
-            signed_value(tuple_element(object, 1)),
-        )
-    }
 }
 
 /// The keys [`TableRead::iter_keys`] yields, as owned integers.
@@ -726,7 +702,7 @@ fn view_tab2list_into(shared: &SharedTable) -> Vec<(i64, i64)> {
         .with_read(|view| view.tab2list_into(&mut dest))
         .expect("no poisoned lock")
         .expect("every stored object is copyable");
-    owned.iter().map(|object| raw_pair(*object)).collect()
+    owned.iter().map(|object| pair_of(*object)).collect()
 }
 
 /// Every view-layer traversal visits the objects in exactly `tab2list` order, and
@@ -784,26 +760,6 @@ fn view_layer_traverses_in_tab2list_order_for_every_kind() {
             assert_eq!(keys, vec![1, 2, 3, 4, 5], "{kind:?}: ascending key order");
         }
     }
-}
-
-/// Render `(key, value)` pairs the way `erl`'s `~p` does: `[{1,10},{2,20}]`.
-fn render_pairs(pairs: &[(i64, i64)]) -> String {
-    let joined = pairs
-        .iter()
-        .map(|(key, value)| format!("{{{key},{value}}}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{joined}]")
-}
-
-/// Render a list of small integers the way `erl`'s `~p` does: `[1,2,3]`.
-fn render_ints(values: &[i64]) -> String {
-    let joined = values
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{joined}]")
 }
 
 /// The view-order facts of one kind: the `first`/`next` walk's keys and its objects.

@@ -35,7 +35,7 @@
 
 mod common;
 
-use beam_ets::{compile, MatchSpec, TableKind};
+use beam_ets::TableKind;
 use beam_term::prelude::*;
 use common::*;
 use core::cmp::Ordering;
@@ -417,66 +417,11 @@ fn ordered_set_iterates_in_ascending_key_order() {
 // recorded battery sorts a hash kind's sequences before rendering, and the live
 // cross-check compares those sorted renderings against the system `erl`.
 
-/// A fresh output heap for a select call.
-fn out_heap() -> beam_alloc::Heap {
-    beam_alloc::Heap::new(8192).expect("an output heap is allocatable")
-}
-
-/// `[{'$1', [], ['$1']}]` — a bare-variable head that binds the whole object and
-/// returns it (the whole-object spec the traversal battery below uses).
-fn whole_object_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
-    let head = interned_atom(atoms, "$1");
-    let body = proper_list(heap, &[interned_atom(atoms, "$1")]);
-    let clause = heap.tuple(&[head, NIL, body]).unwrap();
-    let spec = proper_list(heap, &[clause]);
-    compile(spec, atoms).expect("the quoted spec compiles")
-}
-
-/// `[{{'$1','_'}, [], ['$1']}]` — bind the key and return it (one small integer
-/// per object), the spec the live-oracle cross-check below uses.
-fn key_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
-    let head = heap
-        .tuple(&[interned_atom(atoms, "$1"), interned_atom(atoms, "_")])
-        .unwrap();
-    let body = proper_list(heap, &[interned_atom(atoms, "$1")]);
-    let clause = heap.tuple(&[head, NIL, body]).unwrap();
-    let spec = proper_list(heap, &[clause]);
-    compile(spec, atoms).expect("the quoted spec compiles")
-}
-
-/// The `{Key, Value}` objects `{1,10}..{5,50}` on `heap` — the shared fixture of
-/// the traversal-order battery.
-fn objects_1_to_5(heap: &mut Heap) -> Vec<Eterm> {
-    (1..=5i64).map(|key| object(heap, key, key * 10)).collect()
-}
-
-/// The `(key, value)` of a `{K, V}` small-integer tuple.
-fn pair_of(object: Eterm) -> (i64, i64) {
-    // SAFETY: every term read here is a `{Key, Value}` two-word tuple of small
-    // integers built by `common::object`.
-    unsafe {
-        (
-            signed_value(tuple_element(object, 0)),
-            signed_value(tuple_element(object, 1)),
-        )
-    }
-}
-
 /// The bound key of a one-element `[K]` `match/2` result.
 fn match_key(result: Eterm) -> i64 {
     // SAFETY: `match/2` with a `{'$1','_'}` head always yields a two-word cons cell
     // whose head is the bound key (a small integer in this battery).
     unsafe { signed_value(car(result)) }
-}
-
-/// Render a list of small integers the way `erl`'s `~p` does: `[1,2,3]`.
-fn render_ints(values: &[i64]) -> String {
-    let joined = values
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{joined}]")
 }
 
 /// Render a list of one-element integer lists the way `erl`'s `~p` does:
@@ -485,16 +430,6 @@ fn render_int_lists(values: &[i64]) -> String {
     let joined = values
         .iter()
         .map(|value| format!("[{value}]"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{joined}]")
-}
-
-/// Render `{Key, Value}` pairs the way `erl`'s `~p` does: `[{1,10},{2,20}]`.
-fn render_pairs(pairs: &[(i64, i64)]) -> String {
-    let joined = pairs
-        .iter()
-        .map(|(key, value)| format!("{{{key},{value}}}"))
         .collect::<Vec<_>>()
         .join(",");
     format!("[{joined}]")
@@ -796,15 +731,4 @@ fn traverse_order_agrees_with_the_live_oracle() {
         "[ets] traversal order: {} facts agree with the live oracle",
         ORDER_EXPECTED.len()
     );
-}
-
-/// Parse `name -> rendering` lines into pairs, tolerating leading/trailing noise.
-fn parse_lines(stdout: &str) -> BTreeMap<String, String> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let (name, rendered) = line.trim().split_once(" -> ")?;
-            Some((name.trim().to_string(), rendered.trim().to_string()))
-        })
-        .collect()
 }
