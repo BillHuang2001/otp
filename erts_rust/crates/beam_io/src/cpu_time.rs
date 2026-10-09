@@ -51,8 +51,10 @@
 //! owned by the single-threaded runtime — see [`RuntimeClock`].
 //!
 //! [`process_cpu_times`] is exactly that `getrusage(RUSAGE_SELF)` measurement, returning both
-//! the user and the system component (the system half is what
-//! `erlang:statistics(scheduler_wall_time)` and friends need; the `runtime` arm ignores it).
+//! the user and the system component. The `runtime` arm ignores the system half, and nothing
+//! else in the tree consumes it either — `erlang:statistics(runtime)` is the **only** caller of
+//! `erts_runtime_elapsed_both` (`erl_bif_info.c:4281`), and it passes `NULL` for both system
+//! out-parameters — so the system component is returned here for completeness.
 //! [`thread_cpu_times`] is the per-**thread** analogue via
 //! `clock_gettime(CLOCK_THREAD_CPUTIME_ID)`, whose reading is **user + system combined** —
 //! so it is reported as `user_ms` with `system_ms == 0` (the kernel does not split the two
@@ -164,9 +166,15 @@ pub fn process_cpu_times() -> Result<CpuTimes> {
 /// The nanosecond reading is truncated to milliseconds, consistent with
 /// [`process_cpu_times`] and the oracle's unit.
 ///
-/// This is the analogue of the emulator's `CLOCK_THREAD_CPUTIME_ID` reads (e.g. the NIF
-/// `enif_cpu_time`); it is **not** what `erlang:statistics(runtime)` measures, so the runtime
-/// adopts [`RuntimeClock`] (built on [`process_cpu_times`]) for that key.
+/// This is the analogue of the emulator's own thread-clock read `sys_get_cputime`
+/// (`erts/emulator/sys/unix/erl_unix_sys.h:319`, `clock_gettime(CLOCK_THREAD_CPUTIME_ID, …)`,
+/// the `HAVE_CLOCK_GETTIME_CPU_TIME` branch). The NIF `enif_cpu_time` reaches that same read
+/// **indirectly**, through `erts_get_now_cpu` (`erl_nif.c:2375` → `erl_time_sup.c:1949-1958`);
+/// on a platform whose header selects `gethrvtime` instead (`erl_unix_sys.h:309-315`) that
+/// emulator read is per **process**, not per thread.
+///
+/// It is **not** what `erlang:statistics(runtime)` measures — that arm uses `getrusage`, see
+/// [`process_cpu_times`] — so the runtime adopts [`RuntimeClock`] for that key.
 ///
 /// # Errors
 ///
@@ -191,10 +199,12 @@ pub fn thread_cpu_times() -> Result<CpuTimes> {
 
 /// `tv_sec * 1000000 + tv_usec`, then `/ 1000` — the C's `timeval` → milliseconds conversion.
 ///
-/// The unchecked casts and the wrapping arithmetic are the C's own unsigned conversion
-/// (`(ErtsMonotonicTime) now.ru_utime.tv_sec`): a value the kernel could never produce would
-/// wrap exactly as it does there rather than panicking in a debug build. A `timeval` from
-/// `getrusage` is always non-negative.
+/// The unchecked casts and the wrapping arithmetic mirror the C's own 64-bit conversion
+/// (`(ErtsMonotonicTime) now.ru_utime.tv_sec`, `erl_time_sup.c:1439-1442`): a value the kernel
+/// could never produce wraps rather than panicking in a debug build. The C's `ErtsMonotonicTime`
+/// is a **signed** 64-bit type (`erl_unix_sys.h:159-167`), whereas the casts here target `u64`;
+/// the two conversions still agree for every value a `getrusage` `timeval` can hold, because such
+/// a `timeval` is always non-negative.
 fn timeval_ms(tv: libc::timeval) -> u64 {
     (tv.tv_sec as u64)
         .wrapping_mul(USEC_PER_SEC)
@@ -287,5 +297,145 @@ impl Default for RuntimeClock {
     /// Equivalent to [`RuntimeClock::new`] — an anchor of 0.
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Deterministic pins for the parts of this module that have no need of a syscall: the two
+    //! unit conversions (the only numeric-parity risk against the C) and the `RuntimeClock`
+    //! anchor bookkeeping (reachable through the private field). The syscall wrappers themselves
+    //! are covered by the real-`getrusage`/`clock_gettime` cases in `tests/cpu_time.rs`, which
+    //! assert monotone/structural properties only — never exact CPU-time values.
+
+    use super::{timespec_ms, timeval_ms, RuntimeClock};
+
+    /// A `libc::timeval` for the pure-conversion cases.
+    fn timeval(sec: libc::time_t, usec: libc::suseconds_t) -> libc::timeval {
+        libc::timeval {
+            tv_sec: sec,
+            tv_usec: usec,
+        }
+    }
+
+    /// A `libc::timespec` for the pure-conversion cases.
+    fn timespec(sec: libc::time_t, nsec: libc::c_long) -> libc::timespec {
+        libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec,
+        }
+    }
+
+    /// The `timeval` conversion is the C's `tv_sec * 1000000 + tv_usec` then `/ 1000`
+    /// (`erl_time_sup.c:1439-1442`): whole milliseconds, truncating. The expected values are
+    /// hand-computed (not re-derived from the implementation) so a changed unit or a rounding
+    /// switch is caught.
+    #[test]
+    fn timeval_ms_truncates_microseconds_to_whole_milliseconds() {
+        let cases: [(libc::time_t, libc::suseconds_t, u64); 11] = [
+            (0, 0, 0),
+            (0, 1, 0),
+            (0, 999, 0),
+            (0, 1_000, 1),
+            (0, 1_999, 1),
+            (0, 999_999, 999),
+            (1, 0, 1_000),
+            (2, 500_000, 2_500),
+            (3_600, 999_999, 3_600_999),
+            (86_400, 0, 86_400_000),
+            (1_000_000, 999, 1_000_000_000),
+        ];
+        for (sec, usec, expected) in cases {
+            assert_eq!(
+                timeval_ms(timeval(sec, usec)),
+                expected,
+                "timeval {{ {sec}, {usec} }} is {expected} ms"
+            );
+        }
+    }
+
+    /// The `timespec` conversion truncates the same way, one unit lower: nanoseconds → ms.
+    #[test]
+    fn timespec_ms_truncates_nanoseconds_to_whole_milliseconds() {
+        let cases: [(libc::time_t, libc::c_long, u64); 10] = [
+            (0, 0, 0),
+            (0, 999_999, 0),
+            (0, 1_000_000, 1),
+            (0, 1_999_999, 1),
+            (0, 999_999_999, 999),
+            (1, 0, 1_000),
+            (2, 500_000_000, 2_500),
+            (3_600, 999_999_999, 3_600_999),
+            (86_400, 0, 86_400_000),
+            (1_000_000, 0, 1_000_000_000),
+        ];
+        for (sec, nsec, expected) in cases {
+            assert_eq!(
+                timespec_ms(timespec(sec, nsec)),
+                expected,
+                "timespec {{ {sec}, {nsec} }} is {expected} ms"
+            );
+        }
+    }
+
+    /// The two helpers describe the same instant in the same unit: a `timeval` and the
+    /// `timespec` holding the identical point in time (µs × 1000 = ns) must agree to the
+    /// millisecond. This is the cross-check that neither helper has drifted from the other.
+    #[test]
+    fn the_two_conversions_agree_for_the_same_instant() {
+        for sec in [0, 1, 2, 3_600, 86_400] {
+            for usec in [0, 1, 999, 1_000, 1_500, 999_999] {
+                let from_timeval = timeval_ms(timeval(sec, usec));
+                let from_timespec = timespec_ms(timespec(sec, usec * 1_000));
+                assert_eq!(
+                    from_timeval, from_timespec,
+                    "{sec}s + {usec}us must convert to the same milliseconds either way"
+                );
+            }
+        }
+    }
+
+    /// `RuntimeClock::new`/`Default` anchor the user total at 0 — the C's
+    /// `runtime_prev.data.user = 0` (`erl_time_sup.c:1071`).
+    #[test]
+    fn runtime_clock_new_and_default_anchor_the_user_total_at_zero() {
+        assert_eq!(RuntimeClock::new().prev_user_ms, 0);
+        assert_eq!(RuntimeClock::default().prev_user_ms, 0);
+    }
+
+    /// `runtime()` stores the reading it just took as the new anchor, and reports the difference
+    /// against the *previous* anchor (the C's `runtime_prev.data.user = user` inside the locked
+    /// block, `erl_time_sup.c:1473-1483`). With a 0 anchor the first difference *is* the total.
+    #[test]
+    fn runtime_clock_runtime_stores_the_latest_total_as_the_anchor() {
+        let mut clock = RuntimeClock::new();
+        let (total, since_last) = clock.runtime().expect("the runtime counter is readable");
+        assert_eq!(
+            clock.prev_user_ms, total,
+            "the anchor must become the reading just taken"
+        );
+        assert_eq!(since_last, total, "the anchor started at 0");
+
+        let (total2, since_last2) = clock.runtime().expect("the runtime counter is readable");
+        assert_eq!(clock.prev_user_ms, total2);
+        assert!(total2 >= total);
+        assert_eq!(since_last2, total2 - total);
+    }
+
+    /// `reset()` re-anchors at 0 (an additive seam with no C equivalent), so the next pair is
+    /// equal again.
+    #[test]
+    fn runtime_clock_reset_re_anchors_the_user_total_at_zero() {
+        let mut clock = RuntimeClock::new();
+        clock.prev_user_ms = 12_345;
+        clock.reset();
+        assert_eq!(clock.prev_user_ms, 0);
+
+        let (total, since_last) = clock.runtime().expect("the runtime counter is readable");
+        assert_eq!(
+            since_last, total,
+            "a re-anchored clock reports the total as its delta"
+        );
+        assert_eq!(clock.prev_user_ms, total);
     }
 }
