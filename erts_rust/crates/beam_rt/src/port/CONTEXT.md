@@ -20,7 +20,7 @@ Two "is it empty" predicates: `is_empty()` counts **ports only** (`system_info(p
 `Driver{library, host: Box<DriverPort>}` pairs a loaded driver with the host its callbacks run against (**field order is load-bearing**: the library's `Drop` runs the entry's `finish` before the host drops). `DriverPort` is the concrete `beam_abi::DriverHost` behind the opaque `ErlDrvPort_`: the handle **is** the per-port `DriverEnv`'s address (a driver-private term arena, the shared `AtomTable` + a `PendingInterner`, the owning `ProcessId`, and the output/pid services). `load_driver(candidates, name)` delegates to the **dedicated driver loader `beam_abi::driver::loader::load`** (a real `ErlDrvEntry` loader, distinct from the NIF loader and needing no host), tries each candidate (the loader appends `.so`) and reports the **last** typed error.
 `DriverPort::binary_to_term` (the `DriverHost` hook `erl_drv_binary_to_term` reaches) decodes the driver's bytes with `beam_codec::decode_term`: the decoder needs `&mut AtomTable`, so the shared table is **cloned** (the `beam_bifs::binconv` precedent) and a name the clone appended is recorded on the pending interner at its predicted index (via `intern`, never `intern_atom` — the interner's `base` was fixed when the host was built) for the port's atom-commit step; an invalid image is the C's `ERTS_DDT_FAIL` (`None`), never a raise.
 The `DriverHost` registry hooks carry the C's exact codes: `add_driver_entry`/`remove_driver_entry` (`add` returns `0`; `remove` `1`/`0`/`-1` per `io.c:7698`), `lock_driver` keyed off the port's load state (`io.c:7324`) and `create_port` = the invalid-port sentinel.
-`DriverPortAdapter` is the **port lifecycle** the host alone lacks — a `beam_io::Driver` over a loaded C driver: `start` runs the entry's `start` (the `ErlDrvPort` **is** the environment's address, kept in a `Box` that never moves), `output` hands the port's queued bytes to the entry's `outputv` when it declares one (**the C's preference**, `io.c:1782`/`io.c:1597`) and to `output` otherwise — so an **`outputv`-only** entry (an entry whose `output` slot is `NULL`) really receives `port_command` (`ErlIOVec` = an empty writable header `iov[0]` + the data `iov[1]`, parallel all-NULL `binv`, built on the caller's stack exactly as `io.c:1806/1842-1864`), queues the `driver_output` reply as the port's **input** (surfaced by `take_driver_outputs` as `{Port,{data,Data}}`), `stop` runs the entry's `stop`, and the drop runs `finish` + `dlclose`. `build.rs`'s `-Wl,--export-dynamic` publishes the `driver_*`/`erl_drv_*` symbols; `open_port({spawn_driver, Name}, Options)` routes here, and an unknown or empty driver name is `badarg`.
+`DriverPortAdapter` is the **port lifecycle** the host alone lacks — a `beam_io::Driver` over a loaded C driver: `start` runs the entry's `start` (the `ErlDrvPort` **is** the environment's address, kept in a `Box` that never moves), `output` hands the port's queued bytes to the entry's `outputv` when it declares one (**the C's preference**, `io.c:1782`/`io.c:1597`) and to `output` otherwise — so an **`outputv`-only** entry (an entry whose `output` slot is `NULL`) really receives `port_command` (`ErlIOVec` = an empty writable header `iov[0]` + the data `iov[1]`, parallel all-NULL `binv`, built on the caller's stack exactly as `io.c:1806/1842-1864`), queues the `driver_output` reply as the port's **input** (surfaced by `take_driver_outputs` as `{Port,{data,Data}}`), `stop` runs the entry's `stop`, and the drop runs `finish` + `dlclose`. An `OUTPUT` port task (`Port::run_task` → `DriverPortAdapter::ready_output`) **always** drains the port's output queue through the single write path (`DriverPortAdapter::output` → the entry's `outputv`/`output`, the C's `port_command` delivery, `io.c:1782`/`io.c:1597`) and *then* runs the entry's `ready_output` slot, when the entry declares one, as the write-**readiness** notification (the C's `ERTS_PORT_TASK_OUTPUT` arm, `erl_port_task.c:1793-1797`) — never as a second write path; the write-armed descriptor handed to that notification is captured **before** the write, because `output`/`outputv` are free to re-arm with `driver_select`. `build.rs`'s `-Wl,--export-dynamic` publishes the `driver_*`/`erl_drv_*` symbols; `open_port({spawn_driver, Name}, Options)` routes here, and an unknown or empty driver name is `badarg`.
 
 ### Driver-emitted terms (`erl_drv_output_term` / `erl_drv_send_term`) — `TermQueue`
 `beam_abi` decodes the driver's term-data stack machine into a real term on the host's arena and calls `DriverHost::send_term(port, to: Option<Eterm>, term)`. The C *delivers* there and then (`driver_deliver_term`, `io.c:5664`: the decoded term itself, `from = prt->common.id`); the frozen seam gives the host no route to a receiver's mailbox, so the term is **queued**: `TermQueue` (`pub struct`, `Rc<RefCell<Vec<(Option<Eterm>, Eterm)>>>`) is per port and shared by handle — `DriverPort::term_queue()` returns the handle, `send_term` pushes onto it (while still recording the accumulate-only `DriverPort::sent` view the A.4 test reads), `take()` drains, `is_empty()` reports. `None` = the port's connected process (`erl_drv_output_term`, `io.c:6254`), `Some(pid)` = an explicit destination (`erl_drv_send_term`, `io.c:6289`). **Lifetime invariant:** a queued term's words live on the host arena, so `DriverPortAdapter` **empties** the queue both in `beam_io::Driver::stop` (the C refuses a delivery while `ERTS_PORT_SFLG_CLOSING`, `deliver_term_check_port`, `io.c:6213`) and in its `Drop`; a late drain observes an empty queue, never a freed arena.
@@ -33,6 +33,11 @@ The precise symbols of `driver.rs`:
 - `Driver { library, host: Box<DriverPort> }` (`193`) — field order is load-bearing (`library` drops first).
 - `DriverPortAdapter` (`669`) — `impl beam_io::Driver` over a loaded C driver: `load`/`name`/`state`/`selected`,
   plus the callback mapping `start`/`output`/`ready_input`/`ready_output`/`timeout`/`stop`.
+- `notify_ready(&mut self, ctx, fd: c_int, read: bool)` (`1116`) — runs the entry's `ready_input`/`ready_output`
+  for one **already-resolved** descriptor (the C's `(ErlDrvEvent) state->fd`); `dispatch_ready(ctx, read)`
+  (`1088`) keeps the resolution half, and an entry with no callback for the direction gets the C's
+  `no_ready_*_callback` (log *and* deselect, `io.c:7523-7538`) before `settle`. `ready_output` resolves the
+  fd itself so it can capture it before the write.
 - `load_driver(candidates, name)` (`810`) — `beam_abi::driver::loader::load` per candidate, reporting the last typed error.
 - The timer family matches the C for **every** live port: the C substitutes a silent `no_timeout_callback`
 when the entry declares no `timeout` slot (`io.c:7601`), so `io.c:6918`'s `-1` stands only for an invalid
@@ -87,6 +92,18 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
   `ignore`/`default` leaving nothing pollable, and a zero-port runtime still polling a registered watch).
 - Colocated units in `driver.rs`: the registry-slot codes, the thread-local entry list, the
   `armed_event` rejection, and `binary_to_term` (a decoded image, an invalid one → `None`).
+- The A.4 **write-path regression suite** `driver/ready_output_tests.rs` (`a_queued_port_command_reaches_output_with_a_writable_descriptor_armed`
+  and `ready_output_delivers_the_payload_before_its_notification`) compiles a real C driver `.so` at test time
+  (`RT_READY_OUTPUT_MODE` 0/1: mode 0 leaves `ready_output` `NULL`, mode 1 declares it and appends a `"W"`
+  marker) and drives the real `port_command` → `OUTPUT`-task path. It discriminates on exactly one property:
+  with a writable descriptor armed (`driver_select(…, ERL_DRV_WRITE, 1)` in `start`), a queued `port_command`
+  byte still reaches the driver's `output` callback (the echo lands on the port's input queue) — a
+  notification-only `ready_output` returns `Ok(0)` and writes nothing, leaving `drain_input()` empty. Mode 1
+  additionally pins the payload-before-notification order (`pingW`). Because a `--lib` unit-test link does not
+  export the dynamic symbol table (`cargo`'s `rustc-link-arg-tests` covers only `tests/` targets), the fixture
+  imports no `driver_*` symbol and is handed `driver_select`/`driver_output` as two `%lx` addresses in the
+  loader's `command` string, which its `start` calls through; the test skips **loudly** without `cc` or
+  `erl_driver.h`.
 - Colocated units in `watch.rs`: nothing-to-poll with no disposition, the self-pipe registered once, and
   `ready`/`drain` over a really-sent signal; plus `#[cfg(test)]` `test_guard`/`pending`/`send_to_self`
   helpers shared by the three signal test modules.
@@ -97,6 +114,7 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
 
 ## Routing Table
 - `driver.rs` → the A.4 host + `beam_io::Driver` lifecycle above.
+- `driver/ready_output_tests.rs` → the A.4 write-path regression suite (a real C driver `.so` compiled at test time).
 - `watch.rs` → the `os:set_signal/2` delivery half (facility + `SignalWatch` + the `{notify,Signal}` name builder).
 - `../port.rs` → the A.4 `PortHook` provider, the poller/`PortRegistry`, the port-task round and the message builders.
 - `../native/port.rs` → the native `port_command/2,3` + `port_info` closed-port/`registered_name` floor.
