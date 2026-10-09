@@ -78,6 +78,28 @@
 //!   `THE_NON_VALUE` (the C's own "no term" word, `erl_term.h`; the crate's `prelude::is_non_value`
 //!   and every term predicate reject it), never `src_term` itself — returning the source term would
 //!   hand out a term whose memory belongs to the *source* env.
+//!
+//! # The caller contract the raw-pointer ABI cannot enforce
+//!
+//! Every pointer in this family is a bare C pointer. The C contract for `enif_free_env` is: the
+//! pointer must come from an env allocator (`enif_alloc_env`), and **after the call it designates
+//! freed memory** (`enif_clear_env(env); erts_free(ERTS_ALC_T_NIF, env)`, `erl_nif.c:676-680`) and
+//! must never be used again. **This crate cannot detect a violation of that contract, and it adds no
+//! tracking it could not enforce:**
+//!
+//! * a use-after-`enif_free_env` is a raw pointer to memory its owner has already released. The ABI
+//!   carries no owner tag, no generation counter and no allocation registry, and consulting one on
+//!   *every* `enif_*` call would be a hot-path cost paid by every NIF to catch a mistake the C does
+//!   not catch either. Such a use is therefore undefined behaviour here, exactly as in the C.
+//! * what the crate *does* guarantee is the ownership rule: **it never frees memory it did not
+//!   allocate.** `enif_free_env` hands the pointer to `NifHost::free_env`, which frees only the envs
+//!   it allocated (through `NifHost::alloc_env`) and reports `false` otherwise, so a per-call env, a
+//!   foreign env, or a host with no message-env support leaves the pointer **untouched** (where the C
+//!   would `erts_free` it and corrupt the owner's heap), and a `NULL` env is a no-op (where the C
+//!   faults in `enif_clear_env`).
+//! * correspondingly, `enif_make_copy` never fabricates a term from a word that is not one:
+//!   `THE_NON_VALUE` and a bare header word answer `THE_NON_VALUE` (the C's `size_object` would walk
+//!   the word instead).
 
 use libc::c_void;
 
@@ -140,7 +162,9 @@ pub unsafe extern "C" fn enif_alloc_env() -> *mut crate::nif::types::ErlNifEnv {
 /// # Safety
 ///
 /// `env` must be null, or a live env pointer produced by an env allocator (the C contract: a pointer
-/// from `enif_alloc_env`); a null `env` is a no-op.
+/// from `enif_alloc_env`); a null `env` is a no-op. After the call the pointer must not be used
+/// again — a **use-after-`enif_free_env` is a caller-contract violation this boundary cannot detect**
+/// (see the module docs, "The caller contract the raw-pointer ABI cannot enforce").
 #[no_mangle]
 pub unsafe extern "C" fn enif_free_env(env: *mut crate::nif::types::ErlNifEnv) {
     // The C dereferences `env` (`enif_clear_env(env)`, `erl_nif.c:678`): null is a fault there and a
@@ -212,6 +236,9 @@ pub unsafe extern "C" fn enif_priv_data(
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use crate::nif::host::{NifEnv, NifHost};
     use crate::nif::types::ErlNifEnv;
     use beam_alloc::Heap;
@@ -239,12 +266,20 @@ mod tests {
         addr as *mut ErlNifEnv
     }
 
-    /// A host whose `alloc_env` hook is test-controlled; every other hook keeps its default.
+    /// A host whose `alloc_env`/`free_env` hooks are test-controlled; every other hook keeps its
+    /// default. `owns` decides whether `free_env` claims the env it is handed (and so "frees" it);
+    /// `freed` records every pointer `free_env` was called with, so a test can assert on the exact
+    /// delivered pointer after the env borrow has ended (the `Rc` is cloned out before an env
+    /// borrows the host).
     struct AllocEnvHost {
         heap: Heap,
         atoms: AtomTable,
         /// What [`NifHost::alloc_env`] answers (`None` = the trait default: unsupported).
         env: Option<*mut ErlNifEnv>,
+        /// Whether `free_env` reports that it owns (and frees) the env it is handed.
+        owns: bool,
+        /// Every pointer `free_env` has been called with, in call order.
+        freed: Rc<RefCell<Vec<*mut ErlNifEnv>>>,
     }
 
     impl AllocEnvHost {
@@ -253,7 +288,20 @@ mod tests {
                 heap: Heap::new(256).expect("a small test heap is allocatable"),
                 atoms: AtomTable::new(),
                 env,
+                owns: false,
+                freed: Rc::new(RefCell::new(Vec::new())),
             }
+        }
+
+        /// Claim ownership of the envs this host is handed: `free_env` then reports `true`.
+        fn owning(mut self) -> AllocEnvHost {
+            self.owns = true;
+            self
+        }
+
+        /// A handle on the `free_env` call log, taken **before** an env borrows this host.
+        fn free_log(&self) -> Rc<RefCell<Vec<*mut ErlNifEnv>>> {
+            Rc::clone(&self.freed)
         }
     }
 
@@ -278,6 +326,68 @@ mod tests {
         fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
             self.env
         }
+
+        /// Record the delivered pointer and report ownership (the C `erts_free`s what
+        /// `enif_alloc_env` allocated; here only a host that claims the env frees it).
+        fn free_env(&mut self, env: *mut ErlNifEnv) -> bool {
+            self.freed.borrow_mut().push(env);
+            self.owns
+        }
+    }
+
+    /// The **message-env lifecycle** at the host seam: `enif_alloc_env` hands out the host's env, the
+    /// pointer is a genuinely usable env (its host's atom table included), and `enif_free_env` hands
+    /// it back to the host that **owns** it — once, with the exact pointer.
+    ///
+    /// The owner is the *message env's* host — the env the pointer designates, recovered by
+    /// `enif_free_env` — not the call env's: the C frees the pointer in the allocator that made it.
+    #[test]
+    fn alloc_use_free_hands_the_env_back_to_its_owner() {
+        let mut msg_host = AllocEnvHost::new(None).owning();
+        let msg_freed = msg_host.free_log();
+        let mut msg_env = NifEnv::new(&mut msg_host);
+        let msg_ptr = msg_env.as_ptr();
+
+        let mut call_host = AllocEnvHost::new(Some(msg_ptr));
+        let call_freed = call_host.free_log();
+        let mut call_env = NifEnv::new(&mut call_host);
+        let call_ptr = call_env.as_ptr();
+
+        // alloc: the host of the current NIF call hands out its own env.
+        // SAFETY: `call_env` is live, so a host is current.
+        let p = unsafe { enif_alloc_env() };
+        assert_eq!(p, msg_ptr, "the host's env comes back verbatim");
+
+        // use: the pointer really is a usable env.
+        {
+            // SAFETY: `p` came from `NifEnv::as_ptr` on `msg_env`, which is alive here.
+            let recovered = unsafe { NifEnv::from_opaque(p) }.expect("non-null");
+            let atom = recovered.host().intern_atom("msg_env_atom").expect("interns");
+            assert!(is_atom(atom), "the message env's host is reachable through it");
+        }
+
+        // free: the owning host is asked exactly once, for the exact pointer.
+        // SAFETY: `p` came from `enif_alloc_env` — the C contract for `enif_free_env`.
+        unsafe { enif_free_env(p) };
+        assert_eq!(*msg_freed.borrow(), vec![msg_ptr]);
+
+        // free(NULL) is a no-op: no host is consulted at all.
+        // SAFETY: a null env is explicitly allowed by the contract.
+        unsafe { enif_free_env(core::ptr::null_mut()) };
+        assert_eq!(msg_freed.borrow().len(), 1, "a NULL free reaches no host");
+
+        // An env the host does not own: the hook reports `false`, so the pointer is left alone.
+        // SAFETY: `call_env` is a live env.
+        unsafe { enif_free_env(call_ptr) };
+        assert_eq!(*call_freed.borrow(), vec![call_ptr]);
+        let atom = call_env.host().intern_atom("still_usable").expect("interns");
+        assert!(is_atom(atom), "a refused free leaves the env usable");
+
+        // Outside a NIF call there is no current host, so the answer is NULL.
+        drop(call_env);
+        drop(msg_env);
+        // SAFETY: no env is live on this thread here, which is exactly what the call reports.
+        assert!(unsafe { enif_alloc_env() }.is_null());
     }
 
     /// The pointer `enif_alloc_env` answers really is the env a supporting host handed out: it is
