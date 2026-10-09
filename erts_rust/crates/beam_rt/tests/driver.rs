@@ -1302,12 +1302,9 @@ echo() ->
 /// **The CLI's `run` action drives the full scheduler**: a driver echo round-trip really
 /// completes under `run`.
 ///
-/// `run` used to perform a **single** engine pass (`Runtime::run_function`), so this workload
-/// died with `beam_rt: unsupported: opcode: run: process blocked (no message available)`
-/// (exit 3): the receiver blocks on `{Port, {data, Data}}`, and only a **later** scheduler
-/// pass — the port half — can deliver it. `run` now loads the file, spawns the export as a
-/// real process and pumps the scheduler until it terminates, so the driver's echo reaches the
-/// owner and the bytes are printed.
+/// `run` loads the file, spawns the export as a real process and pumps the scheduler until it
+/// terminates, so the receiver blocked on `{Port, {data, Data}}` is served by the port half of
+/// a **later** scheduler pass and the driver's echo reaches the owner.
 ///
 /// Driven through the **real binary** (`CARGO_BIN_EXE_beam_rt`), because the C driver leaves
 /// its `driver_*` symbols undefined and `dlopen(RTLD_NOW)` resolves them from the loading

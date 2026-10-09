@@ -372,12 +372,10 @@ fn structured_raise_reasons_and_map_key_order_match_the_oracle() {
     }
 }
 
-/// The two `semantics/*` corpus probes this pass closed — a binary comprehension and
-/// `bit_size/1` of a **non-byte-aligned** bitstring. Both were previously `unsupported`
-/// (the `-eval` grammar had no binary generator and could not enter a non-byte-aligned
-/// segment); they now AGREE with the oracle. Pinned here — invoking the **same** probe
-/// wrapper and argv the corpus builds — so the fix cannot silently regress, even where
-/// the oracle is unavailable.
+/// The two `semantics/*` corpus probes this suite pins — a binary comprehension and
+/// `bit_size/1` of a **non-byte-aligned** bitstring — AGREE with the oracle. Pinned here —
+/// invoking the **same** probe wrapper and argv the corpus builds — so the capability cannot
+/// silently regress, even where the oracle is unavailable.
 #[test]
 fn the_binary_segment_probes_agree_with_the_oracle() {
     let cases: &[(&str, &str)] = &[
@@ -397,11 +395,9 @@ fn the_binary_segment_probes_agree_with_the_oracle() {
     }
 }
 
-/// The five `boot/*` corpus probes this pass closed: an `erlang:spawn/1` (or
+/// The five `boot/*` corpus probes this suite pins: an `erlang:spawn/1` (or
 /// `spawn_link/1`) process sends its parent a message, which the parent's `receive` picks up
-/// from the mailbox. They previously hit the typed *capability gap* (the `-eval` evaluator
-/// had no `!` send, no bare-`receive` scheduler pump and no `spawn`); they now **AGREE** with
-/// the oracle.
+/// from the mailbox. Each **AGREES** with the oracle.
 ///
 /// Each expression is the corpus's own text (`tools/differential/src/corpus/boot.rs`) and is
 /// run through the **same** probe wrapper and argv the corpus builds, so the capability can

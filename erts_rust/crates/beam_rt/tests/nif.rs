@@ -101,7 +101,7 @@ const NIF_IMPORTS: &[&str] = &[
 /// back into the call env with `enif_make_copy`, free the message env, and answer the copy. It
 /// pins the counterpart hook ([`NifHost::make_copy`], which `NifHostImpl` implements as the
 /// identity because both envs share its heap) — without it `enif_make_copy` answers the ABI's
-/// `THE_NON_VALUE` and the engine used to abort on the bare header word it received.
+/// `THE_NON_VALUE` — a bare header word, not a term.
 ///
 /// Both are **separate** sources from `beam_abi`'s `test_nif.c` (which cannot be edited by this
 /// crate); the crate's [`NifHostImpl`] overrides the `alloc_env`/`free_env`/`make_copy` hooks the
@@ -648,9 +648,8 @@ fn enif_alloc_env_returns_a_live_env() {
 /// `enif_make_copy` is driven by [`NifHost::make_copy`](beam_abi::NifHost::make_copy); the crate's
 /// [`NifHostImpl`](beam_rt) implements it as the **identity** because `alloc_env` builds the
 /// message env over the same host, so both envs share one heap. Without that hook `beam_abi`
-/// answers the ABI's `THE_NON_VALUE` — a bare header word, not a term — and the engine's term
-/// comparison used to dereference it and **abort** (SIGABRT), which a regression here would
-/// reproduce as a signal-killed child (`status` `-1`) with empty stdout.
+/// answers the ABI's `THE_NON_VALUE` — a bare header word, not a term — which this test would
+/// observe as a signal-killed child (`status` `-1`) with empty stdout.
 ///
 /// `env_caller:copy/1` maps the atom `ok` to `1` exactly as the corpus module does, so the asserted
 /// `1` is the observable the gate compares.
