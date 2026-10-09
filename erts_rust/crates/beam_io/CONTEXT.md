@@ -27,7 +27,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
 - **Regular-file fallback (internal, no signature change):** epoll refuses regular files (`EPOLL_CTL_ADD`⇒`EPERM`), so `register` keeps a `libc::poll(2)`-backed fallback set — an unsupported descriptor is watched with `poll(2)` and its readiness merged into `poll` in the same `Event`/`Ready` shape; the probe reports its `std::io::Error`; `poll` never blocks indefinitely while the set is non-empty (`FALLBACK_POLL_CAP`, 1 ms).
 
 ### `timer.rs` / `queue.rs`
-- `Timeout` (`Copy`) — a single deadline; `Timer` — deadlines keyed by `u64`.
+- `Timeout` (`Copy`) — a single deadline; `Timer` — deadlines keyed by `u64`; both are self-contained helpers for a caller with its own keyed deadline set — nothing in-crate consumes them (the reactor's poll bound is `PortRegistry::next_deadline` + the per-port task queue), they stay public/`prelude`-exported. `Timer::schedule` replaces **any** existing deadline for a key; `Timer::pop_expired` returns due keys in **schedule** order, not deadline order.
   · `ByteQueue` — a byte buffer whose `front()` is always contiguous.
 
 ### `port_task.rs` (port-task scheduling — `erts_port_task_execute`)
