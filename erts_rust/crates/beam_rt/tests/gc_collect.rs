@@ -32,15 +32,14 @@
 //!    `minor_gcs` counter grew, and no collection failed or disabled the runtime.
 //! 2. **Memory is bounded.** The same loop at a 10× larger `N` collects proportionally more
 //!    often, while the young heap's **capacity and peak occupancy do not scale with `N`** —
-//!    the whole point of adopting the collector (before it, `alloc_words` handed every block
-//!    out of the runtime-wide unbounded arena and peak RSS grew linearly in `N`).
+//!    the collector's guarantee.
 //! 3. **The float negative control.** A module doing float arithmetic across a heap boundary
 //!    (`gc_floats:l1/1`) must produce **correct** float results and must **never** be
 //!    collected over (its code touches `Machine::fr`, which is not part of the root set): the
 //!    post-slice float-register scan pins the pid and `gc_stats().collections` stays `0`.
-//! 4. **The arena fallback is a regression.** The pinned/halted process's allocations go to
-//!    the pointer-stable arena instead (the pre-collector behaviour), which must keep the
-//!    program correct — never a wrong answer, never a failure.
+//! 4. **The arena fallback stays correct.** The pinned/halted process's allocations go to the
+//!    pointer-stable arena instead, which must keep the program correct — never a wrong answer,
+//!    never a failure.
 //!
 //! # Honest limitation (pinned by these tests, not hidden by them)
 //!
@@ -50,7 +49,7 @@
 //! `RuntimeContext::run_export`, which builds a second `Machine` on the same context) never
 //! reaches a collection point. Its allocations are still served from the process young heap by
 //! `context::gc::alloc_words`, but when that fills they fall back to the runtime-wide
-//! **arena** — the pre-collector memory behaviour. `Runtime::gc_stats().fallbacks` is the
+//! **arena**. `Runtime::gc_stats().fallbacks` is the
 //! counter that makes that visible, and it is the number to read when a workload's resident
 //! memory still grows with its input (`tests/gc_collect.rs` covers the armed path only; the
 //! `foreign` benchmark workload is the cross-module case).//!
@@ -294,8 +293,7 @@ fn a_non_allocating_loop_is_never_collected_over() {
 ///
 /// The same loop at a 10× larger `N` collects more often (never fewer) and its young heap
 /// stays inside this runtime's collector geometry rather than growing with the *program's*
-/// total allocation. Before the collector was adopted every one of those blocks came from the
-/// runtime-wide unbounded arena and the peak grew linearly in `N`.
+/// total allocation.
 ///
 /// This pins the observed behaviour honestly, including its limitation: `beam_gc`'s hedging
 /// growth table enlarges the nursery when a collection reclaims too little
@@ -374,7 +372,7 @@ fn a_float_module_is_pinned_and_never_collected_over() {
 /// **Acceptance 4 — the arena fallback keeps a long float run correct.**
 ///
 /// The float process is pinned and its module is refused, so every allocation past its first
-/// young heap goes to the pointer-stable arena — the pre-collector path. The run must still
+/// young heap goes to the pointer-stable arena. The run must still
 /// return the right answer and report `errors == 0`, and the fallback counter must show the
 /// path was really taken.
 #[test]
