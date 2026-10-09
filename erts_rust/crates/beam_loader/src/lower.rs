@@ -112,6 +112,14 @@ pub fn build_module(
         });
     }
 
+    // Every `z,4` static-literal operand must name a literal the file's own `LitT` table
+    // defines: the C asserts `index.word_value < literals->count` and adds "it must not
+    // have been created at runtime" (`beam_file.c:2400-2417`). The check runs *before*
+    // `rewrite_wide_integers` appends the synthesized bignum literals — those are numbered
+    // *after* the file's own entries, so a synthesized index is legitimately at or above
+    // the file's count and must not be bounded by it.
+    check_static_literals(raw_instrs, chunks.literals.len())?;
+
     // The C loader turns a wide `i` operand into a bignum **static literal**
     // (`marshal_integer` → `beamfile_add_literal`, `beam_file.c:2210-2220`) that the
     // instruction references by literal index. Do the same here: each such operand is
@@ -212,6 +220,45 @@ fn atom_at(atoms: &[Atom], index: u32) -> Result<Atom> {
         .get(index as usize)
         .copied()
         .ok_or_else(|| bad_file("atom index out of range"))
+}
+
+/// Rejects an instruction operand that names a static literal the file's `LitT` table
+/// does not define.
+///
+/// The C asserts `index.word_value < literals->count` for every `z,4` operand against the
+/// file's *static* literal table (`beam_file.c:2400-2417`) — a reference the file does not
+/// define is malformed, because such a literal could only have been created at runtime.
+/// The literal count is not known to [`crate::decode`] (the decoder never sees the `LitT`
+/// chunk), so the bound is enforced here, where the module's literal table is in hand.
+fn check_static_literals(instrs: &[RawInstr], literal_count: usize) -> Result<()> {
+    for instr in instrs {
+        for operand in &instr.operands {
+            check_static_literal(operand, literal_count)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects `operand` — recursively, through a `z,1` argument list — if it names a static
+/// literal at or past `literal_count`.
+///
+/// [`Operand::List`] is the only nesting: every other variant carries leaf indices.
+fn check_static_literal(operand: &Operand, literal_count: usize) -> Result<()> {
+    match operand {
+        Operand::Literal(index) => {
+            if *index as usize >= literal_count {
+                return Err(bad_file("static literal index out of range"));
+            }
+            Ok(())
+        }
+        Operand::List(items) => {
+            for item in items.iter() {
+                check_static_literal(item, literal_count)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Points every wide-integer operand of `instrs` at a synthesized static literal.
@@ -1916,5 +1963,96 @@ mod tests {
         assert_eq!(&payload[2..6], &300u32.to_be_bytes());
         assert_eq!(payload[6], 1, "negative sign byte");
         assert_eq!(payload.len(), 7 + 300);
+    }
+
+    // ---- the `z,4` static-literal index bound ------------------------------
+
+    #[test]
+    fn rejects_a_static_literal_index_the_file_does_not_define() {
+        // `LoadAssert(index.word_value < literals->count)` against the file's own `LitT`
+        // (`beam_file.c:2400-2417`): the file must define every literal it references.
+        let chunks = minimal_chunks(Vec::new(), vec![vec![131, 97, 0]]); // one literal
+
+        // Index 1 is past the file's single literal.
+        let mut bad = minimal_stream();
+        bad.insert(3, raw(Opcode::r#move, vec![Operand::Literal(1), Operand::X(1)]));
+        let err = build_module(&chunks, &bad, beam_term::AtomTable::new()).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+
+        // Control: index 0 is defined, and resolves to the file's `0`.
+        let mut ok = minimal_stream();
+        ok.insert(3, raw(Opcode::r#move, vec![Operand::Literal(0), Operand::X(1)]));
+        let module = build_module(&chunks, &ok, beam_term::AtomTable::new()).unwrap();
+        assert_eq!(module.literals().len(), 1);
+        assert!(module.literal(0).is_some());
+    }
+
+    #[test]
+    fn rejects_a_static_literal_inside_an_argument_list_that_is_out_of_range() {
+        // A literal operand may also sit in a `z,1` argument list, so the walk descends
+        // into `Operand::List` — the bound applies to those slots too.
+        let mut stream = minimal_stream();
+        stream.insert(
+            3,
+            raw(
+                Opcode::gc_bif2,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::Integer(0),
+                    Operand::Integer(0),
+                    Operand::list(vec![Operand::Literal(3), Operand::X(0)]),
+                    Operand::X(0),
+                ],
+            ),
+        );
+
+        // The file defines no literal at all, so index 3 is out of range.
+        let err = build_module(
+            &minimal_chunks(Vec::new(), Vec::new()),
+            &stream,
+            beam_term::AtomTable::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+
+        // Control: the same stream over a file defining four literals loads.
+        let module = build_module(
+            &minimal_chunks(Vec::new(), vec![vec![131, 97, 0]; 4]),
+            &stream,
+            beam_term::AtomTable::new(),
+        )
+        .unwrap();
+        assert_eq!(module.literals().len(), 4);
+    }
+
+    #[test]
+    fn the_literal_bound_is_checked_before_synthesized_literals_are_appended() {
+        // A wide-integer operand becomes a literal numbered *after* the file's own
+        // `LitT`, so the bound must be enforced before `rewrite_wide_integers`: with no
+        // file literal at all, the synthesized index 0 legitimately equals the file's
+        // count (0) and must not be rejected.
+        let mut stream = minimal_stream();
+        stream.insert(
+            3,
+            raw(
+                Opcode::allocate_zero,
+                vec![Operand::big_integer(false, vec![0xFF; 8])],
+            ),
+        );
+        let module = build_module(
+            &minimal_chunks(Vec::new(), Vec::new()),
+            &stream,
+            beam_term::AtomTable::new(),
+        )
+        .unwrap();
+        assert_eq!(module.literals().len(), 1);
+        assert_eq!(
+            module.functions[0].code[3],
+            Instr::Generic {
+                op: Opcode::allocate_zero,
+                operands: vec![Operand::Literal(0)],
+                offset: 0,
+            }
+        );
     }
 }

@@ -1210,37 +1210,43 @@ mod tests {
 
     #[test]
     fn allocation_entry_bounds_the_count_and_rejects_a_bad_kind() {
-        // Kind `0` counts raw words, so the `u32` ceiling is representable.
-        assert_eq!(
-            allocation_entry(0, u64::from(u32::MAX)).unwrap().words,
-            u32::MAX
-        );
-        // Kinds `1`/`2`/`3` multiply by 2, so the largest representable count is
-        // `u32::MAX / 2` (the C's equivalent bound is
-        // `ERTS_SINT32_MAX / MAX(FLOAT_SIZE_OBJECT, ERL_FUN_SIZE + 1)`,
-        // `beam_file.c:2255-2257`); one more overflows the `u32` word count and is a
-        // system limit, not a `badarg`.
-        let half = u64::from(u32::MAX) / 2;
-        assert_eq!(
-            allocation_entry(2, half).unwrap().words,
-            (half * 2) as u32,
-            "the product is exact at the boundary"
-        );
-        assert!(matches!(
-            allocation_entry(2, half + 1),
-            Err(beam_common::BeamError::SystemLimit)
-        ));
-        // The multiplication saturates before the guard: a count at the `u32` ceiling
-        // cannot wrap, it is rejected as a system limit instead.
-        assert!(matches!(
-            allocation_entry(3, u64::from(u32::MAX)),
-            Err(beam_common::BeamError::SystemLimit)
-        ));
-        // A count one past `u32` is a system limit too.
-        assert!(matches!(
-            allocation_entry(3, u64::from(u32::MAX) + 1),
-            Err(beam_common::BeamError::SystemLimit)
-        ));
+        // The per-entry bound is the C's `ERTS_SINT32_MAX / MAX(FLOAT_SIZE_OBJECT,
+        // ERL_FUN_SIZE + 1)` (`beam_file.c:2255-2256`) — `i32::MAX / 3` on the 64-bit
+        // emulator, the factor `3` being the largest multiplier (`ERL_FUN_SIZE + 1`).
+        // It exists so the running word total stays inside a signed `Sint`.
+        const MAX: u64 = (i32::MAX as u64) / 3;
+        assert_eq!(MAX, MAX_ALLOC_NUMBER, "the pinned bound agrees with the decoder");
+
+        // Kind `0` counts raw words: the bound itself is accepted and the word count is
+        // the raw number.
+        assert_eq!(allocation_entry(0, MAX).unwrap().words, MAX as u32);
+        // Kinds `1`/`2`/`3` multiply by 2 (`FLOAT_SIZE_OBJECT` / `ERL_FUN_SIZE` /
+        // `RECORD_INST_SIZE(0)`), exactly and without overflow at the bound.
+        for kind in 1..=3u64 {
+            let entry = allocation_entry(kind, MAX).unwrap();
+            assert_eq!(u64::from(entry.kind), kind, "kind {kind}: the raw kind is preserved");
+            assert_eq!(
+                u64::from(entry.number),
+                MAX,
+                "kind {kind}: the raw count is preserved"
+            );
+            assert_eq!(
+                u64::from(entry.words),
+                MAX * 2,
+                "kind {kind}: two words per element"
+            );
+        }
+        // One past the per-element bound is a system limit (not a `badarg`), whatever the
+        // kind — the C's `LoadAssert(number <= ERTS_SINT32_MAX / MAX(...))`.
+        for kind in 0..=3 {
+            assert!(
+                matches!(
+                    allocation_entry(kind, MAX + 1),
+                    Err(beam_common::BeamError::SystemLimit)
+                ),
+                "kind {kind}: one past the per-element bound is a system limit"
+            );
+        }
         // Kind 4 (and anything else) is malformed.
         assert_bad_arg(allocation_entry(4, 1));
     }
@@ -1395,6 +1401,198 @@ mod tests {
                 &fallback_types(),
             ));
         }
+    }
+
+    // ---- operand range checks (the C's `LoadAssert`s) ----------------------
+    //
+    // Every bound below mirrors an assertion the C reader makes while it fills in one
+    // operand (`beam_file.c:2239-2443`). Each negative case sits next to a *control*
+    // stream that decodes successfully, so a rejection can only come from the bound
+    // under test.
+
+    /// A `z,1` argument list operand carrying `items`.
+    fn arg_list(items: &[&[u8]]) -> Vec<u8> {
+        let mut out = tagged(7, 1);
+        out.extend(tagged(0, items.len() as u64));
+        for item in items {
+            out.extend_from_slice(item);
+        }
+        out
+    }
+
+    /// Decodes `bytes` with the module-level [`VERSION`], panicking (with the typed
+    /// error) if it fails — the control half of a range-check case.
+    #[track_caller]
+    fn decode_ok(bytes: &[u8]) -> Vec<RawInstr> {
+        decode_stream(bytes, &[], &VERSION, &fallback_types())
+            .unwrap_or_else(|error| panic!("the control stream must decode, got {error:?}"))
+    }
+
+    /// Asserts the [`VERSION`]-headed decode of `bytes` fails with the loader's `badarg`.
+    #[track_caller]
+    fn assert_decode_rejects(bytes: &[u8]) {
+        assert_bad_arg(decode_stream(bytes, &[], &VERSION, &fallback_types()));
+    }
+
+    #[test]
+    fn rejects_a_label_index_at_or_past_label_count() {
+        // `LoadAssert(raw_arg.word_value < code->label_count)` for every non-zero `f`
+        // operand (`beam_file.c:2324-2331`); `f,0` is the `NO_FAIL` sentinel.
+        // `is_eq_exact/3` (43) `Fail Arg1 Arg2`, `VERSION.label_count` is 15.
+        let build = |label: u64| {
+            stream(&[
+                &[OP_IS_EQ_EXACT],
+                &tagged(5, label),
+                &tagged(3, 0),
+                &tagged(3, 0),
+                &[OP_INT_CODE_END],
+            ])
+        };
+        for label in [15u64, 16, 1000] {
+            assert_decode_rejects(&build(label));
+        }
+        // Control: the sentinel (`f,0`) and the largest legal index (`label_count - 1`)
+        // both decode.
+        for label in [0u64, 1, 14] {
+            let instrs = decode_ok(&build(label));
+            assert_eq!(instrs[0].operands[0], Operand::Label(Label(label as u32)));
+        }
+    }
+
+    #[test]
+    fn rejects_a_label_inside_an_argument_list_that_is_out_of_range() {
+        // The bound applies to a label in a `z,1` argument list too — a list's elements
+        // *are* the instruction's trailing operands. `select_val/3` (59) carries its
+        // `Value,Label` alternatives as one such list.
+        let build = |label: u64| {
+            let mut bytes = vec![Opcode::select_val.as_u8()];
+            bytes.extend(tagged(3, 0)); // Value = x0
+            bytes.extend(tagged(5, 0)); // Fail = `f,0`
+            bytes.extend(arg_list(&[&tagged(0, 1), &tagged(5, label)]));
+            bytes.push(OP_INT_CODE_END);
+            bytes
+        };
+        assert_decode_rejects(&build(15));
+        // Control: the same instruction with an in-range alternative label decodes.
+        let instrs = decode_ok(&build(14));
+        assert_eq!(
+            instrs[0].operands[2],
+            Operand::list(vec![Operand::Integer(1), Operand::Label(Label(14))])
+        );
+    }
+
+    #[test]
+    fn rejects_a_register_index_at_or_past_max_reg() {
+        // `raw_arg.word_value < MAX_REG` for `x`/`y` (`beam_file.c:2335-2338`,
+        // `erl_vm.h:49`). `move/2` (64) `Src Dst`.
+        let build = |tag: u8, index: u64| {
+            stream(&[
+                &[OP_MOVE],
+                &tagged(tag, index),
+                &tagged(3, 0),
+                &[OP_INT_CODE_END],
+            ])
+        };
+        for tag in [3u8, 4] {
+            assert_decode_rejects(&build(tag, MAX_REG));
+        }
+        // Control: `MAX_REG - 1` is the highest legal register index.
+        for tag in [3u8, 4] {
+            decode_ok(&build(tag, MAX_REG - 1));
+        }
+    }
+
+    #[test]
+    fn rejects_a_float_register_index_at_or_past_max_reg() {
+        // `z,2` shares the `MAX_REG` bound (`beam_file.c:2388-2395`).
+        let build = |index: u64| stream(&[&tagged(7, 2), &tagged(0, index)]);
+        assert_bad_arg(decode_operand(
+            &mut beam_codec::Reader::new(&build(MAX_REG)),
+            &[],
+            &fallback_types(),
+        ));
+        // Control: `MAX_REG - 1` decodes.
+        assert_eq!(
+            decode_operand(
+                &mut beam_codec::Reader::new(&build(MAX_REG - 1)),
+                &[],
+                &fallback_types()
+            )
+            .unwrap(),
+            Operand::FloatReg(1023)
+        );
+    }
+
+    #[test]
+    fn rejects_a_type_index_at_or_past_the_type_count() {
+        // `LoadAssert(index.word_value < types->count)` while the `Type` chunk is
+        // present (`beam_file.c:2436-2437`); `z,5` `x0` plus the index.
+        let types = types_with(3);
+        let build = |index: u64| stream(&[&tagged(7, 5), &tagged(3, 0), &tagged(0, index)]);
+        assert_bad_arg(decode_operand(
+            &mut beam_codec::Reader::new(&build(3)),
+            &[],
+            &types,
+        ));
+        // Control: the table's last entry decodes to a typed register …
+        assert_eq!(
+            decode_operand(&mut beam_codec::Reader::new(&build(2)), &[], &types).unwrap(),
+            Operand::Typed {
+                reg: Reg::X(0),
+                ty: TypeIndex(2)
+            }
+        );
+        // … and with a *fallback* table the annotation is dropped, so no index can be
+        // out of range (`beam_file.c:2433-2435`).
+        assert_eq!(
+            decode_operand(
+                &mut beam_codec::Reader::new(&build(9999)),
+                &[],
+                &fallback_types()
+            )
+            .unwrap(),
+            Operand::X(0)
+        );
+    }
+
+    #[test]
+    fn rejects_an_allocation_list_longer_than_the_four_kinds() {
+        // `LoadAssert(count.word_value <= 4)` (`beam_file.c:2241`): there are only four
+        // allocation kinds, so a longer list is malformed framing. `test_heap/2` (16)
+        // `Need Live`.
+        let build = |entries: usize| {
+            let mut bytes = vec![OP_TEST_HEAP];
+            bytes.extend(tagged(7, 3));
+            bytes.extend(tagged(0, entries as u64));
+            for _ in 0..entries {
+                bytes.extend(tagged(0, 0)); // kind 0 (raw words)
+                bytes.extend(tagged(0, 1)); // one word
+            }
+            bytes.extend(tagged(0, 1)); // Live
+            bytes.push(OP_INT_CODE_END);
+            bytes
+        };
+        assert_decode_rejects(&build(5));
+        // Control: exactly four entries (one per kind) decode.
+        decode_ok(&build(4));
+    }
+
+    #[test]
+    fn rejects_an_argument_list_that_is_not_the_last_operand() {
+        // `LoadAssert((i + 1) == arity)` (`beam_file.c:2352`): a `z,1` argument list is
+        // always the instruction's *last* operand. `put_tuple2/2` (164) `Dst Elements`.
+        let mut bad = vec![Opcode::put_tuple2.as_u8()];
+        bad.extend(arg_list(&[&tagged(3, 0)])); // the list in the FIRST of two slots
+        bad.extend(tagged(3, 1));
+        bad.push(OP_INT_CODE_END);
+        assert_decode_rejects(&bad);
+
+        // Control: the same list in the last slot (`Elements`) decodes.
+        let mut ok = vec![Opcode::put_tuple2.as_u8()];
+        ok.extend(tagged(3, 0));
+        ok.extend(arg_list(&[&tagged(3, 1)]));
+        ok.push(OP_INT_CODE_END);
+        decode_ok(&ok);
     }
 
     // ---- TestKind::from_opcode -------------------------------------------
