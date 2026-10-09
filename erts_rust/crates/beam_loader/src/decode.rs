@@ -685,7 +685,7 @@ fn check_label(operand: &Operand, label_count: u32) -> Result<()> {
             Ok(())
         }
         Operand::List(items) => {
-            for item in items {
+            for item in items.iter() {
                 check_label(item, label_count)?;
             }
             Ok(())
