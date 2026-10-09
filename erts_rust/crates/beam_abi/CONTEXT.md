@@ -653,11 +653,15 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
   `alloc_env`/`free_env`/`make_copy` (`beam_rt/src/nif.rs`), so the real runtime's message-env idiom
   works: every message env is built over the one shared pooled BIF heap, making `make_copy` the
   identity. A crate-owned env is not an option (its atoms would be unusable ⇒ a *wrong term*).
-- **The NIF host hooks the runtime does not yet implement.** `NifHost::{term_to_binary,
-  binary_to_term, make_ref, existing_atom, whereis_pid, unique_integer, system_info}` are defaulted to
-  "unsupported", and `beam_rt`'s `NifHostImpl` leaves them so — so the matching `enif_*` entry points
-  answer the C's failure (or, for `enif_make_ref`, raise `badarg`) where the oracle succeeds. Closing
-  these is a `beam_rt` change: `term_to_binary`/`binary_to_term` over `beam_codec`; `make_ref` over a
+- **The NIF host hooks the runtime does not yet implement.** `beam_rt`'s `NifHostImpl` overrides only
+  `heap`/`intern_atom`/`atom_name`/`self_pid`/`alloc_env`/`free_env`/`make_copy`; every other hook is
+  left at its default `None`/`false`/`null` — `term_to_binary`, `binary_to_term`, `make_ref`,
+  `existing_atom`, `whereis_pid`, `whereis_port`, `unique_integer`, `system_info`, `priv_data`, `send`,
+  `port_command`, `monitor_process`/`demonitor_process`, `select`, `schedule_nif`,
+  `dynamic_resource_call`, the `is_*_alive` family and `consume_timeslice`. The matching `enif_*` entry
+  points therefore answer the C's failure (or, for `enif_make_ref`, raise `badarg`) where the oracle
+  succeeds. Closing these is a `beam_rt` change: `term_to_binary`/`binary_to_term` over `beam_codec`;
+  `make_ref` over a
   fresh reference term; `existing_atom` over the committed table **and** the in-flight
   `PendingInterner`; `whereis_pid` over the process registry; `system_info` with the emulator's real
   `erts_version`/`otp_release`/`scheduler_threads`/`dirty_scheduler_support` (the built-in fallback
