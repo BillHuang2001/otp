@@ -510,9 +510,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   update,replace,continuation,continuation_direction,set_access,ownership,fixtable,shared,options,rename,
   reclamation,concurrency}.rs`, `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers from
   `tests/common/`, and the live-`erl` plumbing in `tests/common/oracle.rs`.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **151 cases**
-  (group files `tests/differential/battery/{kind,keypos,navigation,counter,lookup,matchspec,replace,
-  continuation,info,large,access,reclamation,multikind}.rs`, the embedded oracle program in
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **135 cases**
+  (14 group files `tests/differential/battery/*.rs`, the embedded oracle program in
   `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1) and under `beam_ets`,
   comparing canonical renderings line-by-line (`mismatch = 0`, `KNOWN_DIVERGENCES` empty). Without
   `erl` the live-oracle tests skip loudly; `BEAM_ETS_REQUIRE_ORACLE=1` turns a skip into a failure.
