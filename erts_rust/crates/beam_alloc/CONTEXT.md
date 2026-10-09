@@ -33,9 +33,9 @@ it; never modify it.
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_alloc::prelude::*`. The **frozen seam** for dependents is
-`allocator`, `heap`, `size_class`, `registry`, `stats`, `types`, `refcount`, `binary`, `policy`;
-`block`/`carrier`/`free_list`/`mbc`/`strategy`/`mseg` are implementation modules (public for
-testing/reuse, **not** part of the cross-crate contract).
+`allocator`, `heap`, `reserved_heap`, `size_class`, `registry`, `stats`, `types`, `refcount`, `binary`,
+`policy`; `block`/`carrier`/`free_list`/`mbc`/`strategy`/`mseg`/`bump` are implementation modules
+(public for testing/reuse, **not** part of the cross-crate contract).
 
 ### `allocator` — the `Allocator` seam (facade + submodules)
 Module layout: `allocator.rs` (facade: docs, `WORD_ALIGN`/`MIN_ALIGN`, `AllocRef`, re-exports),
