@@ -37,15 +37,20 @@ use beam_codec::term::{
     make_big, make_binary, make_bitstring, make_flatmap, make_fun_external, make_fun_imported,
     FunPid,
 };
-use beam_common::{BeamError, ExceptionClass, ExitReason};
+use beam_common::BeamError;
 use beam_process::ProcessId;
 use beam_term::{signed_value, AtomTable, Eterm, NIL};
 
 /// The atom names the cases below use. Only interned names resolve, and the atom
 /// hash is computed from the name, so the table is seeded up front.
-const ATOMS: [&str; 20] = [
-    "true", "abc", "hello", "node", "a", "x", "erlang", "abs", "lists", "map", "b", "c", "foo",
-    "bar", "h", "false", "is_exported", "rec", "k", "reverse",
+///
+/// Index 0/1 must be `false`/`true`: a native-record definition stores its
+/// `is_exported` flag as the frozen `AM_FALSE`/`AM_TRUE` index, which the
+/// definition hash resolves back to a *name* through this table, so the name at
+/// index 1 must be `true` for the record hash to match the oracle.
+const ATOMS: [&str; 21] = [
+    "false", "true", "abc", "hello", "node", "a", "x", "erlang", "abs", "lists", "map", "b", "c",
+    "foo", "bar", "h", "is_exported", "rec", "r", "k", "reverse",
 ];
 
 fn seeded_atoms() -> AtomTable {
@@ -134,17 +139,6 @@ fn assert_phash2_range(
         "{what}: expected a small integer result, got {got:?}"
     );
     assert_eq!(signed_value(got), expected, "{what}");
-}
-
-/// Asserts a failure is the typed `unsupported_bif` raise (never a wrong number).
-fn assert_unsupported(err: BeamError, what: &str) {
-    match err {
-        BeamError::Raise(raise) => {
-            assert_eq!(raise.class, ExceptionClass::Error, "{what}");
-            assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"), "{what}");
-        }
-        other => panic!("{what}: expected unsupported_bif, got {other:?}"),
-    }
 }
 
 /// The character list of `text` (each byte a small integer).
@@ -886,39 +880,74 @@ fn phash_maps_and_funs_match_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------
-// The one class that still raises the typed `unsupported_bif`
+// Native records hash to the oracle's definition hash
 // ---------------------------------------------------------------------------
 
+/// A native record's `make_hash`/`make_hash2` identity is its definition's
+/// computed hash (`beam_term::hashing::compute_record_definition_hash`), so both
+/// hashes agree with the oracle both at the top level and nested inside a tuple,
+/// a list and a flat map.
+///
+/// The record is built **through the real registry**
+/// (`records:create(rec, r, [{a,1}], #{is_exported => true})`); the exported
+/// one-field shape is the one whose oracle definition hash is stable run-to-run.
+///
+/// A *reference* cannot be built from this integration test (there is no public
+/// internal-reference constructor), so the reference-refusal contract lives in the
+/// `src/compare.rs` in-module test
+/// `internal_references_stay_the_typed_unsupported_bif_gap`.
 #[test]
-fn records_still_raise_unsupported_bif() {
+fn records_hash_to_the_oracle_definition_hash() {
     run(|reg, ctx| {
-        let key = ctx.atom("k").expect("seeded");
+        let key = ctx.atom("a").expect("seeded");
         let value = int_term(ctx, 1);
         let pair = ctx.tuple(&[key, value]).expect("fits");
         let fields = ctx.list(&[pair]).expect("fits");
         let module = ctx.atom("rec").expect("seeded");
-        let name = ctx.atom("k").expect("seeded");
+        let name = ctx.atom("r").expect("seeded");
         let opt_key = ctx.atom("is_exported").expect("seeded");
-        let opt_value = ctx.atom("false").expect("seeded");
+        let opt_value = ctx.atom("true").expect("seeded");
         let opts = make_flatmap(ctx.heap(), &[(opt_key, opt_value)]).expect("fits");
         let rec = call(reg, ctx, "records", "create", &[module, name, fields, opts]);
 
-        // A native record's `make_hash2` identity is its definition's **cached**
-        // `make_hash2` hash (`erl_record.c` computes it at creation time), which this
-        // tree stores as `make_small(0)` — no faithful `u32` is available, so both
-        // hashes must raise the typed `unsupported_bif` rather than return a wrong
-        // number.
-        assert_unsupported(
-            reg.call("erlang", "phash2", 1, ctx, &[rec])
-                .expect_err("a record must not hash"),
-            "phash2(a record)",
-        );
         let range = int_term(ctx, 1_000_000);
-        assert_unsupported(
-            reg.call("erlang", "phash", 2, ctx, &[rec, range])
-                .expect_err("a record must not hash"),
-            "phash(a record, 1000000)",
+
+        // Top level.
+        assert_phash2(ctx, &[rec], 33_491_412, "phash2(a record)");
+        assert_phash2_range(reg, ctx, rec, range, 709_140, "phash2(a record, 1000000)");
+        assert_phash(reg, ctx, rec, range, 567_678, "phash(a record, 1000000)");
+
+        // `{1, Record}`.
+        let in_tuple = ctx.tuple(&[value, rec]).expect("fits");
+        assert_phash2(ctx, &[in_tuple], 105_608_320, "phash2({1, record})");
+        assert_phash2_range(
+            reg,
+            ctx,
+            in_tuple,
+            range,
+            874_240,
+            "phash2({1, record}, 1000000)",
         );
+        assert_phash(reg, ctx, in_tuple, range, 964_745, "phash({1, record}, 1000000)");
+
+        // `[Record, 1]`.
+        let in_list = ctx.list(&[rec, value]).expect("fits");
+        assert_phash2(ctx, &[in_list], 46_225_311, "phash2([record, 1])");
+        assert_phash2_range(reg, ctx, in_list, range, 967_135, "phash2([record, 1], 1000000)");
+        assert_phash(reg, ctx, in_list, range, 812_886, "phash([record, 1], 1000000)");
+
+        // `#{a => Record}`.
+        let in_map = make_flatmap(ctx.heap(), &[(key, rec)]).expect("fits");
+        assert_phash2(ctx, &[in_map], 7_457_474, "phash2(#{a => record})");
+        assert_phash2_range(
+            reg,
+            ctx,
+            in_map,
+            range,
+            553_858,
+            "phash2(#{a => record}, 1000000)",
+        );
+        assert_phash(reg, ctx, in_map, range, 994_470, "phash(#{a => record}, 1000000)");
     });
 }
 
