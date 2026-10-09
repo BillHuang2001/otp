@@ -789,7 +789,7 @@ impl RuntimeContext<'_> {
     /// lifetime, and returning the heap to the pool keeps the borrow stack balanced.
     ///
     /// [`Runtime::take_bif_heap`]: crate::Runtime::take_bif_heap
-    fn mint_reference(&mut self) -> Result<(MonitorRef, Eterm)> {
+    pub(super) fn mint_reference(&mut self) -> Result<(MonitorRef, Eterm)> {
         let reference = self.runtime.refs_mut().next();
         let term = self.reference_term(reference)?;
         Ok((reference, term))
@@ -802,7 +802,7 @@ impl RuntimeContext<'_> {
     /// lifetime, and returning the heap to the pool keeps the borrow stack balanced.
     ///
     /// [`Runtime::take_bif_heap`]: crate::Runtime::take_bif_heap
-    fn reference_term(&mut self, reference: MonitorRef) -> Result<Eterm> {
+    pub(super) fn reference_term(&mut self, reference: MonitorRef) -> Result<Eterm> {
         let mut heap = self.runtime.take_bif_heap()?;
         let term = reference.to_eterm(&mut heap);
         self.runtime.put_bif_heap(heap);

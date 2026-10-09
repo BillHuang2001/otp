@@ -18,413 +18,606 @@
 //
 // %CopyrightEnd%
 
-//! `prim_file`'s **whole-file-descriptor** family (contract A.7, the `prim_*` family):
-//! `open/2`, `read/2`, `write/2`, `close/1`, `position/2`.
+//! The **whole-file-descriptor** family of the runtime-native `prim_file:*` floor
+//! (contract **A.7**): `open/2`, `read/2`, `write/2`, `close/1`, `position/2`.
 //!
-//! The sibling [`super::prim`] module serves the `prim_file` entries that take **paths**;
-//! this one serves the five that take a `#file_descriptor{}` the caller got back from
-//! `open/2` and therefore need an *open-file registry* — the equivalent of the C NIFs'
-//! `efile_data_t` resource (`erts/emulator/nifs/common/prim_file_nif.c`). Everything else
-//! still falls through to the preloaded `prim_file.beam` (see [`super::prim`]'s
-//! "Not served").
+//! These are the primitives `file.erl` delegates a **raw** file to; in the oracle they are
+//! the pure-Erlang wrappers of `erts/preloaded/src/prim_file.erl` over the C NIFs of
+//! `../../erts/emulator/nifs/{common,unix}/prim_file_nif.c`. This module serves the whole
+//! observable contract from the host's own file-system calls (`std::fs`) — a file
+//! descriptor is exactly what an OS host owns — so a raw file round-trips end to end.
+//! The path-only half of the floor (`get_cwd`, `read_file`, `delete`, …) lives in
+//! [`super::prim`]; the dispatch table that reaches both is
+//! [`RuntimeContext::prim_file_call`](super::prim::RuntimeContext::prim_file_call).
 //!
-//! # The descriptor (the `#file_descriptor{}` contract)
+//! # The handle contract (this runtime's one substitution)
 //!
-//! `open/2` answers `{ok, {file_descriptor, prim_file, Data}}` (`lib/kernel/include/file.hrl`
-//! `#file_descriptor{module, data}`) where `Data` is the map
-//! `prim_file.erl`'s `build_fd_data/3` (`:512-527`) builds:
+//! `open/2` answers `{ok, Fd}` with `Fd = #file_descriptor{}` =
+//! `{file_descriptor, prim_file, Data}` (`lib/kernel/include/file.hrl:64-66`,
+//! `prim_file.erl:151-152`). `Data` mirrors the oracle's `build_fd_data/3`
+//! (`prim_file.erl:512-527`) with **two** documented differences:
 //!
-//! | Key | Value | Source |
+//! * it carries an extra `fd_registry_id => <small integer>` entry, and
+//! * the value of `handle` is only ever used as the *presence* required for a decode.
+//!
+//! `fd_registry_id` is the runtime's private key into its open-file table
+//! ([`Runtime::open_files_mut`](crate::Runtime::open_files_mut), an
+//! `HashMap<u64, std::fs::File>` owned by the `Runtime` — several runtimes can live in one
+//! thread, so a process-global table would let their handles collide). The oracle instead
+//! *decodes* `handle` (a NIF resource reference) to find the descriptor; reading that
+//! payload here would need `beam_term::boxed_val`, which is `unsafe` and this crate is
+//! `#![deny(unsafe_code)]`, so the key is carried in the clear. The value is the reference
+//! id minted for `handle` out of the runtime's one reference id space
+//! ([`Runtime::refs_mut`](crate::Runtime::refs_mut)), so an id is never reused and a stale
+//! descriptor can never name a later descriptor's file.
+//!
+//! The oracle's `read` shape additionally carries `r_buffer` (a real `prim_buffer`) and
+//! `r_ahead_size`; this runtime stores a fresh reference **marker** for `r_buffer` and the
+//! read-ahead size for `r_ahead_size`. That is faithful to the structure and harmless to the
+//! behaviour: `prim_buffer`'s only export is `on_load/0` in this OTP's own `prim_buffer.erl`
+//! source, and `read_1/5`'s first guard (`RBufSz >= RSz`, `prim_file.erl:180-181`) fires for
+//! every non-positive request — the read-ahead path is dead code for the descriptor shapes
+//! this runtime hands out.
+//!
+//! Every BIF decodes the argument the same way: the term must be a 3-tuple whose element 0
+//! is an atom and whose element 2 is a map, and that map must carry `handle`, `owner` and a
+//! non-negative small-integer `fd_registry_id`; the caller must be the recorded `owner`
+//! (otherwise the oracle's own `error:not_on_controlling_process`, `prim_file.erl:499-504`);
+//! and the id must still be in the table (a **closed** descriptor and an unknown one both
+//! answer `{error,einval}`, the NIF's `EFILE_STATE_CLOSED` answer,
+//! `prim_file_nif.c:618-621`).
+//!
+//! # The BIFs (each verified against the `erl` oracle, OTP 29.1.1 / erts-17.1)
+//!
+//! | BIF | Ground truth | Probe ⇒ result |
 //! |---|---|---|
-//! | `handle` | a fresh **reference** — the C's resource | `build_fd_data`'s `FRef` |
-//! | `owner` | the process that opened it | `build_fd_data`'s `self()` |
-//! | `r_buffer` | a reference **marker** (see below) — present in the read shape only | `prim_buffer:new()` |
-//! | `r_ahead_size` | `0`, `65536` (bare `read_ahead`) or `{read_ahead,N}`'s `N` | `build_fd_data`'s `RASz` |
-//! | `fd_registry_id` | **this runtime's private key** into [`crate::Runtime::open_files`] | not in the oracle |
+//! | `open/2` | `prim_file.erl:132-141` + `build_fd_data/5` (`:512-527`); `efile_translate_modelist` (`prim_file_nif.c:500-539`) + `get_flags`/`efile_open` (`unix_prim_file.c:142-226`) | `{ok,Fd}`; a missing path⇒`{error,enoent}`; a directory with `[read]`⇒`{error,eisdir}`; `[write,exclusive]` on an existing file⇒`{error,eexist}`; a regular file with `[directory]`⇒`{error,enotdir}`; a bad path (`foo`, `<<"/a",0,"b">>`)⇒`{error,badarg}`; a non-list mode term⇒`{error,badarg}` |
+//! | `read/2` | `prim_file.erl:162-205` (`read_1/5`) + `read_nif_impl` (`prim_file_nif.c:632-663`) | `{ok,<<…>>}`; a drained file⇒`eof`; `0`⇒`{ok,<<>>}`; `-1`⇒`{error,badarg}`; a float⇒`{error,einval}`; a bigint⇒`{error,einval}`; a write-only fd⇒`{error,ebadf}`; a directory fd⇒`{error,eisdir}`; a closed/bogus fd⇒`{error,einval}` |
+//! | `write/2` | `prim_file.erl:247-263` + `write_nif_impl` (`prim_file_nif.c:664-682`, `enif_inspect_iovec`) | `ok` for `<<…>>`/`"…"`/`[<<"a">>,<<"b">>]`/`[<<"ab">>,[<<"c">>]]`/`[]`/`<<>>`; `{error,badarg}` for `foo`/`[256]`/`[-1]`/`[1.5]`/`[1\|2]`/`<<1:4>>`; a read-only fd⇒`{error,ebadf}`; a directory fd⇒`{error,ebadf}` |
+//! | `close/1` | `prim_file.erl:154-160` + `close_nif` (`prim_file_nif.c:612-631`) | `ok`; a second close⇒`{error,einval}`; a malformed descriptor⇒`{error,badarg}` |
+//! | `position/2` | `prim_file.erl:306-334` (`position/2` + `position_1/3`) + `efile_seek` (`unix_prim_file.c:502-533`) | `{ok,N}`; `bof`/`cur`/`eof`⇒offset 0; a bare integer `N`⇒`{N,bof}`; `{eof,-1}` on an 11-byte file⇒`{ok,10}`; `{bof,-1}`/`-3`⇒`{error,einval}`; `foo`/`{1,bof}`/`{bof,foo}`/`{bof,1.0}`/`{bof,1,2}`⇒`{error,badarg}`; past EOF⇒`{ok,100}`; a closed fd⇒`{error,einval}` |
 //!
-//! The read shape is exactly `build_fd_data/5`'s: a `write` mode that appears while the
-//! mode is still `default` makes it the **write** shape (`#{handle, owner}`, no
-//! `r_buffer`/`r_ahead_size`), a later `read` makes it a read shape again, and every
-//! ignored option leaves the mode alone — so `[write]` is write-shaped, `[read,write]` and
-//! `[append]` are read-shaped, exactly as the oracle builds them (probed).
+//! # The mode list (`open/2`)
 //!
-//! # Oracle ground truth (OTP 29.1.1 / erts-17.1, probed with raw `prim_file` calls)
+//! `read`, `write`, `exclusive`, `append`, `sync`, `directory`, `skip_type_check`,
+//! `read_ahead` (bare, ⇒ 65536) and `{read_ahead, N}` are recognised; **every other option
+//! is silently ignored**, exactly as `efile_translate_modelist` does (`:516-525`) — `raw`,
+//! `binary`, `list`, `ram`, `delayed_write`, `{delayed_write,_,_}`, `compressed`,
+//! `{compressed,_}` are accepted and have no effect here. `append`/`exclusive` additionally
+//! imply **write** and, with neither `read` nor `write` set, **read** is the default
+//! (`:531-536`); the resulting OS flags are `get_flags`' (`unix_prim_file.c:142-171`):
+//! `read` only ⇒ `O_RDONLY`; `write` only ⇒ `O_WRONLY|O_CREAT|O_TRUNC`; both ⇒
+//! `O_RDWR|O_CREAT`; then `append` ⇒ `O_APPEND` with `O_TRUNC` cleared, `exclusive` ⇒
+//! `O_EXCL`, `sync` ⇒ `O_SYNC`, `directory` ⇒ `O_DIRECTORY`. The oracle's post-open type
+//! checks are reproduced for real (`efile_open`, `:196-212`): `open(2)` succeeds on a
+//! directory on Linux, so a non-`skip_type_check` open of a directory without `directory`
+//! is `{error,eisdir}`, and a `directory` open of anything else is `{error,enotdir}`.
 //!
-//! | Call | Answer |
-//! |---|---|
-//! | `open(P,[read])` | `{ok,{…,#{handle,owner,r_buffer,r_ahead_size=>0}}}`; missing ⇒ `{error,enoent}` |
-//! | `open(adir,[read])` | `{error,eisdir}` — the C's post-open `fstat` (`efile_open`, `unix_prim_file.c:196-206`) |
-//! | `open(P,[directory])` | `ok` for a directory, `{error,enotdir}` for a file (Linux `O_DIRECTORY`) |
-//! | `open(P,[exclusive])` on an existing file | `{error,eexist}` |
-//! | `open(P, foo)` / `(P, <<"read">>)` | `{error,badarg}` (`open_nif`'s `enif_is_list`) |
-//! | `read(Fd,N)` | `{ok,Binary}`; at EOF `eof`; `N=0` ⇒ `{ok,<<>>}`; `3.0`/`1 bsl 80` ⇒ `{error,einval}`; `-1` ⇒ `{error,badarg}`; a write-shaped fd ⇒ `{error,ebadf}` |
-//! | `write(Fd,IoData)` | `ok`; `foo`/`[256]`/`1.5`/`[-1]`/`[1\|2]`/a non-byte-aligned bitstring ⇒ `{error,badarg}` |
-//! | `close(Fd)` | `ok`; again ⇒ `{error,einval}` (the C's `EFILE_STATE_CLOSED`) |
-//! | `position(Fd,L)` | `{ok,Pos}` for `bof`/`cur`/`eof`/an integer/`{Mark,Offset}`; `{1,bof}`/`foo`/`{bof,1.0}` ⇒ `{error,badarg}`; `{bof,-1}` ⇒ `{error,einval}` (the kernel's `lseek`) |
+//! A bad **path** (whatever `encode_path/1` rejects) and a mode term that is not a proper
+//! list are the *value* `{error,badarg}` — the wrapper's own `catch error:badarg`
+//! (`prim_file.erl:139-141`), never a raise. A host failure is its `errno`
+//! (`error_tuple_for`).
 //!
-//! # Documented divergences (all in error paths; none fabricates a success)
+//! # Documented divergences
 //!
-//! * **`r_buffer` is a marker, not a `prim_buffer`.** The oracle's read shape carries a
-//!   real buffer, and `prim_buffer:size/1` of a fresh one is `0` — the only thing
-//!   `read/2`/`position/2` consult it for. A zero-sized buffer is also the state in which
-//!   `read_1/5`'s `RBufSz >= RSz` clause *always* fires, so the read-ahead amount never
-//!   changes which bytes a caller sees: this floor reads **directly** from the OS file with
-//!   a single `read(2)` of at most `N` bytes (the C's `read_nif_impl` is one `efile_readv`
-//!   of exactly that extent). The seven probed read results above are reproduced exactly.
-//! * **A malformed `Data` map is `{error,badarg}`.** The oracle's `get_fd_data/1` matches
-//!   `#{owner := Owner}` and raises `{badmatch, Data}` when `owner` is missing; this floor
-//!   answers the `{error,badarg}` the file-level interface documents for an unusable
-//!   descriptor (a hand-built map only — every map `open/2` returns is accepted).
-//! * **A non-integer read size is `{error,badarg}`.** In the oracle the raw
-//!   `prim_file:read(Fd, foo)` raises `badarith` from `read_1/5`'s `RASz + RSz` (its
-//!   `enif_get_int64` badarg is never reached); the documented contract is
-//!   `is_integer(N), N >= 0` ⇒ `{error,badarg}`, which this floor serves for every
-//!   non-number, while a **float** and a bignum that cannot fit `int64` are the C's
-//!   `EINVAL` (`{error,einval}`).
-//! * **`close/1` does not report a close(2) failure.** `std::fs::File`'s `Drop` closes the
-//!   descriptor and discards the error, so an unobservable `EIO`/`ENOSPC` at close is
-//!   `ok` here where the C answers `{error,Reason}`.
-//! * **A `{bof, Negative}` seek is answered `{error,einval}` without a syscall** —
-//!   `lseek(fd, -1, SEEK_SET)`'s own `EINVAL`, which `std::io::SeekFrom::Start` cannot
-//!   express (it is an unsigned `u64`); the other two marks go to `lseek` unchanged.
-//! * **`Data`'s key order is canonical** (`beam_engine::terms::make_map`), where the
-//!   oracle's `~p` shows insertion order — a map's order is not otherwise observable, and
-//!   `fd_registry_id` is an extra key no oracle map has.
-//!
-//! `directory` mode and `skip_type_check` are served **for real** (`O_DIRECTORY` plus the
-//! C's post-open type check), not as a capability gap: a directory descriptor opens, and
-//! `read`/`write` on it are the kernel's `EISDIR`/`EBADF`, exactly as probed. A
-//! `{read_ahead, N}` whose `N` is not an integer is the one mode value this floor cannot
-//! carry, and it reads with a zero read-ahead (`N` then only ever reaches the map).
+//! * **A malformed `Data` map is uniformly `{error,badarg}`.** The oracle raises
+//!   `{badmatch, Data}` from `get_fd_data/1` when `owner` is absent
+//!   (`prim_file.erl:500-504`), raises `function_clause` for a term that is not a
+//!   `#file_descriptor{}` at all, and throws `{error,ebadf}` when `handle` is absent on the
+//!   read path (`:506-510`); this runtime answers the single `{error,badarg}` value for all
+//!   of them. Never a panic, never a fabricated success.
+//! * **A non-integer `read/2` size is `{error,badarg}`, not `badarith`.** The oracle's
+//!   `read_1/5` computes `RASz + RSz`, which raises `badarith` for an atom, a list or any
+//!   other non-number (`prim_file.erl:192`). `read_1/5`'s own guard also fires first for a
+//!   **non-positive** size, so the oracle answers `read(ClosedFd, 0)` ⇒ `{ok,<<>>}` and
+//!   `read(ClosedFd, -1)` ⇒ `{error,badarg}` without consulting the descriptor at all;
+//!   this runtime validates the descriptor (so a closed handle is `{error,einval}`) and
+//!   the size before reading.
+//! * **The read is one `read(2)`.** `efile_readv` loops until the whole requested extent is
+//!   filled or the file ends; for the regular-file stacks this runtime is used on, a single
+//!   host read returns the same bytes.
+//! * **`r_buffer` is a marker, the handle key is `fd_registry_id`** — see above.
+//! * **`close/1` cannot report a close(2) failure.** The descriptor is closed by
+//!   `std::fs::File`'s `Drop`, whose result cannot be observed; the oracle forwards
+//!   `efile_close`'s errno.
+//! * **The iodata walk is iterative and bounded by nesting, not by recursion.** `write/2`
+//!   flattens the argument with an explicit pending list (as `erl_unicode.c`'s filename walk
+//!   is), so no nesting can exhaust the Rust stack; a nesting deeper than
+//!   [`MAX_IODATA_DEPTH`] is `{error,badarg}`.
 
-use std::ffi::OsStr;
-use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 
-use beam_common::{BeamError, ExitReason, Raise, Result};
+use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_term::{is_list, is_nil, is_small, signed_value, Eterm};
+use beam_term::{is_atom, is_list, is_nil, is_small, make_small, signed_value, Eterm};
 
 use super::RuntimeContext;
-use crate::runtime::{Descriptor, OpenFile};
+use crate::error;
+
+/// The `Data` key holding this runtime's private open-file registry id.
+///
+/// The oracle's map has no such entry: it decodes `handle` (a NIF resource reference)
+/// instead. Carrying the key in the clear is what keeps the decode `unsafe`-free — see the
+/// module docs.
+const REGISTRY_ID_KEY: &str = "fd_registry_id";
+
+/// The deepest nesting `write/2` accepts in its iodata argument.
+///
+/// The walk itself is iterative (an explicit pending list), so this is not a stack-overflow
+/// bound but a sanity limit on a pathological argument — the counterpart of the depth guard
+/// a recursive formulation would need.
+const MAX_IODATA_DEPTH: u32 = 10_000;
 
 impl RuntimeContext<'_> {
     // -- prim_file:open/2 -----------------------------------------------------
 
-    /// `prim_file:open(Path, Modes)` — `open_nif` (`prim_file_nif.c:572-593`) behind
-    /// `prim_file:open/2` (`prim_file.erl:132-141`), on `std::fs::OpenOptions`.
+    /// `prim_file:open/2` — the file descriptor the whole raw-file surface is built on
+    /// (`prim_file.erl:132-141`, `build_fd_data/3`).
     ///
-    /// The option grammar is the C's `efile_translate_modelist` (`:500-539`): `read`,
-    /// `write`, `exclusive`, `append`, `sync`, `directory` and `skip_type_check` are
-    /// recognized; **every other option is ignored** (the C's own comment sends `raw`,
-    /// `ram`, `delayed_write*`, `compressed`, `binary`/`list` "further up the chain", and
-    /// `prim_file` does nothing with them — probed). A mode that neither reads nor writes
-    /// defaults to **read** (`:529-537`), and `append`/`exclusive` imply **write**.
+    /// The mode list is parsed by [`OpenModes`] (the wrapper's `build_fd_data/5` plus the
+    /// NIF's `efile_translate_modelist`/`get_flags`), the file is opened through the host's
+    /// own `open(2)` with those flags, the post-open type checks are applied, and the
+    /// descriptor is built on the runtime's pointer-stable `-eval` heap.
+    ///
+    /// Oracle: `open(P,[read])`⇒`{ok,Fd}`; a missing path⇒`{error,enoent}`;
+    /// `open(Dir,[read])`⇒`{error,eisdir}`; `open(File,[directory])`⇒`{error,enotdir}`;
+    /// `open(P,[write,exclusive])` on an existing file⇒`{error,eexist}`;
+    /// `open(foo,[read])`/`open(<<"/a",0,"b">>,[read])`⇒`{error,badarg}`;
+    /// `open(P,foo)`⇒`{error,badarg}`.
     pub(super) fn prim_open(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let Some(path) = self.first_path(args) else {
+        let name = *args.first().ok_or(BeamError::BadArg)?;
+        let modes = *args.get(1).ok_or(BeamError::BadArg)?;
+        let Some(path) = self.encode_path(name) else {
             return self.error_tuple("badarg");
         };
-        // `open_nif` rejects a non-list mode argument with `enif_make_badarg`, which
-        // `prim_file:open/2`'s `catch error:badarg` turns into the value `{error,badarg}`.
-        let Some(modes) = args.get(1).copied().and_then(open_modes) else {
+        let Some(modes) = self.open_modes(modes) else {
             return self.error_tuple("badarg");
         };
-
-        let mut options = fs::OpenOptions::new();
-        match (modes.reads(), modes.writes()) {
-            (true, false) => {
-                options.read(true);
-            }
-            (false, true) => {
-                options.write(true).create(true).truncate(true);
-            }
-            (true, true) => {
-                options.read(true).write(true).create(true);
-            }
-            (false, false) => return self.error_tuple("einval"),
-        }
-        if modes.append {
-            // The C clears `O_TRUNC` and adds `O_APPEND` (`unix_prim_file.c:157-160`).
-            options.truncate(false).append(true);
-        }
-        if modes.exclusive {
-            options.create_new(true);
-        }
-        if modes.sync {
-            options.custom_flags(libc::O_SYNC);
-        }
-        if modes.directory {
-            options.custom_flags(libc::O_DIRECTORY);
-        }
-        let file = match options.open(OsStr::from_bytes(&path)) {
+        let file = match modes.options().open(std::ffi::OsStr::from_bytes(&path)) {
             Ok(file) => file,
             Err(error) => return self.error_tuple_for(&error),
         };
-        // The post-open type check of `efile_open` (`unix_prim_file.c:196-206`): `open(2)`
-        // succeeds on a directory, so a **non**-directory mode must reject one explicitly.
-        if !modes.skip_type_check && !modes.directory {
-            match file.metadata() {
-                Ok(metadata) if metadata.is_dir() => return self.error_tuple("eisdir"),
-                Ok(_) => {}
-                Err(error) => return self.error_tuple_for(&error),
+        // `efile_open`'s post-open type checks (`unix_prim_file.c:196-212`). `open(2)`
+        // succeeds on a directory on Linux, so asking for one without `directory` must be
+        // rejected here; `O_DIRECTORY` already rejects the reverse, and the explicit check
+        // keeps it honest on a platform whose `open(2)` does not.
+        if !modes.skip_type_check {
+            let is_directory = file.metadata().map(|meta| meta.is_dir()).unwrap_or(false);
+            if modes.directory && !is_directory {
+                return self.error_tuple("enotdir");
+            }
+            if !modes.directory && is_directory {
+                return self.error_tuple("eisdir");
             }
         }
-
-        // The descriptor's identity: the resource-equivalent `handle` reference and the
-        // private registry key (`MonitorRef::id`, drawn from the runtime's one reference
-        // id space, so it can never collide with another id).
+        // The reference is minted **before** the descriptor is built and registered, so a
+        // failure while building it leaves no entry behind (nothing is leaked).
         let (reference, handle) = self.mint_reference()?;
-        let buffer = if modes.write_shape() {
-            None
-        } else {
-            // The read shape carries `prim_buffer:new()` — a reference. See the module
-            // docs: the value is a marker, not a buffer.
-            let (_, marker) = self.mint_reference()?;
-            Some(marker)
-        };
-        let mut pairs: Vec<(Eterm, Eterm)> = Vec::with_capacity(5);
-        let handle_key = self.atom("handle")?;
-        pairs.push((handle_key, handle));
-        let owner_key = self.atom("owner")?;
-        pairs.push((owner_key, self.pid().to_eterm()));
-        if let Some(marker) = buffer {
-            let buffer_key = self.atom("r_buffer")?;
-            pairs.push((buffer_key, marker));
-            let ahead_key = self.atom("r_ahead_size")?;
-            let ahead = terms::make_integer(self, modes.read_ahead)?;
-            pairs.push((ahead_key, ahead));
-        }
-        let id_key = self.atom("fd_registry_id")?;
-        let id_term = terms::make_integer(self, i64::try_from(reference.id()).unwrap_or(i64::MAX))?;
-        pairs.push((id_key, id_term));
-        let atoms = self.runtime.code_server.atoms_handle();
-        let data = terms::make_map(self, &pairs, &atoms)?;
-
-        self.runtime
-            .open_files_mut()
-            .insert(reference.id(), Descriptor::Open(OpenFile { file }));
-        let module = self.atom("prim_file")?;
-        let tag = self.atom("file_descriptor")?;
-        let descriptor = terms::make_tuple(self, &[tag, module, data])?;
+        let id = reference.id();
+        let descriptor = self.build_descriptor(&modes, handle, id)?;
+        self.runtime.open_files_mut().insert(id, file);
         self.ok_tuple(descriptor)
     }
 
     // -- prim_file:read/2 -----------------------------------------------------
 
-    /// `prim_file:read(Fd, N)` — `read_nif` behind `prim_file:read/2`
-    /// (`prim_file.erl:162-170`, `read_1/5` `:171-201`).
+    /// `prim_file:read/2` — up to `Size` bytes as `{ok, Binary}`, or `eof`
+    /// (`prim_file.erl:162-205`, `read_nif_impl`).
     ///
-    /// A **write-shaped** descriptor (`read_1`'s `get_fd_data_for_read/1`, `:506-510`)
-    /// answers `{error,ebadf}` before the handle is even consulted — probed.
+    /// `Size` must be a **non-negative small integer**: a negative one is
+    /// `{error,badarg}` (`read_1/5`'s buffer read), a float or a bigint is `{error,einval}`
+    /// (`enif_get_int64` fails, `prim_file_nif.c:639-641`), an atom/list is
+    /// `{error,badarg}` (documented divergence: the oracle raises `badarith`). `Size = 0` is
+    /// legal and answers `{ok,<<>>}`.
+    ///
+    /// A drained descriptor answers the bare atom `eof` (the NIF's `am_eof`, `:653-655`);
+    /// a host failure is its errno, which is what makes a write-only descriptor
+    /// `{error,ebadf}` and a directory `{error,eisdir}` — exactly as the oracle does.
+    ///
+    /// Oracle: `read(Fd,5)`⇒`{ok,<<"hello">>}`; again⇒`{ok,<<" world">>}`; again⇒`eof`;
+    /// `read(Fd,0)`⇒`{ok,<<>>}`; `read(Fd,-1)`⇒`{error,badarg}`;
+    /// `read(Fd,3.0)`/`read(Fd,1 bsl 80)`⇒`{error,einval}`; a `[write]`/`[append]` fd
+    /// ⇒`{error,ebadf}`; a `[directory]` fd⇒`{error,eisdir}`; after `close/1`
+    /// ⇒`{error,einval}`.
     pub(super) fn prim_read(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let size = args.get(1).copied().unwrap_or(beam_term::NIL);
-        let count = match read_size(size) {
-            ReadSize::Count(count) => count,
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let size = *args.get(1).ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        let count = match self.read_size(size) {
+            ReadSize::Bytes(count) => count,
             ReadSize::BadArg => return self.error_tuple("badarg"),
             ReadSize::EInval => return self.error_tuple("einval"),
         };
-        let id = match self.descriptor_id(args.first().copied(), true) {
-            DescriptorId::Open(id) => id,
-            DescriptorId::Error(reason) => return self.error_tuple(reason),
-            DescriptorId::NotOwner => return Err(not_on_controlling_process()),
+        // The descriptor borrow stays inside the `match` statement: the `File` is never
+        // held across a heap-borrowing `self` call.
+        let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+            None => None,
+            Some(file) => Some(read_extent(file, count)),
         };
-        // `read_1/5`'s `RBufSz >= RSz` clause with a zero-sized buffer: `prim_buffer:read/2`
-        // of `0` bytes is `<<>>`, before and at EOF alike (probed).
-        if count == 0 {
-            let bytes = beam_codec::term::make_binary(self.eval_heap(), &[])?;
-            return self.ok_tuple(bytes);
-        }
-        let outcome = {
-            let mut buffer = Vec::new();
-            if buffer.try_reserve_exact(count).is_err() {
-                // The C's `enif_alloc_binary` failure (`prim_file_nif.c:662-664`).
-                ReadOutcome::Error("enomem")
-            } else {
-                buffer.resize(count, 0);
-                match self.runtime.open_files_mut().get_mut(&id) {
-                    Some(Descriptor::Open(entry)) => match entry.file.read(&mut buffer) {
-                        Ok(0) => ReadOutcome::Eof,
-                        Ok(read) => {
-                            buffer.truncate(read);
-                            ReadOutcome::Bytes(buffer)
-                        }
-                        Err(error) => ReadOutcome::Failed(error),
-                    },
-                    Some(Descriptor::Closed) => ReadOutcome::Error("einval"),
-                    None => ReadOutcome::Error("badarg"),
-                }
-            }
+        let Some(read) = outcome else {
+            return self.error_tuple("einval");
         };
-        match outcome {
-            ReadOutcome::Bytes(bytes) => {
-                let binary = beam_codec::term::make_binary(self.eval_heap(), &bytes)?;
-                self.ok_tuple(binary)
+        match read {
+            // A drained descriptor answers the bare atom `eof` (`am_eof`, `:653-655`) —
+            // but only a **positive** request can drain: a zero-byte read is `{ok,<<>>}`
+            // wherever the descriptor stands, exactly as `read_1/5`'s zero-size head is.
+            Ok(bytes) if bytes.is_empty() && count > 0 => self.atom("eof"),
+            // The contents are built on the runtime's long-lived `-eval` heap, the same
+            // `beam_codec::term::make_binary` `prim_file:read_file/1` uses (and, unlike
+            // `beam_engine::terms::make_heap_binary`, with no 64-byte on-heap limit).
+            Ok(bytes) => {
+                let contents = beam_codec::term::make_binary(self.eval_heap(), &bytes)?;
+                self.ok_tuple(contents)
             }
-            ReadOutcome::Eof => self.atom("eof"),
-            ReadOutcome::Error(reason) => self.error_tuple(reason),
-            ReadOutcome::Failed(error) => self.error_tuple_for(&error),
+            Err(error) => self.error_tuple_for(&error),
         }
     }
 
     // -- prim_file:write/2 ----------------------------------------------------
 
-    /// `prim_file:write(Fd, IoData)` — `write_nif` behind `prim_file:write/2`
-    /// (`prim_file.erl:247-263`), whose `erlang:iolist_to_iovec/1` is the flattened
-    /// iodata this floor walks itself.
+    /// `prim_file:write/2` — the iodata written, `ok` on success
+    /// (`prim_file.erl:247-263`, `write_nif_impl`).
     ///
-    /// Every invalid iodata — an atom, a float, a byte above 255, a negative integer, an
-    /// **improper** list, a non-byte-aligned bitstring — is the value `{error,badarg}`,
-    /// exactly as the wrapper's `catch error:badarg` renders `iolist_to_iovec`'s raise.
-    /// The C's `{continue, Remainder}` retry loop (one more call per 64 iovecs) collapses
-    /// into one complete write.
+    /// The argument is flattened exactly as `erlang:iolist_to_iovec/1` does it (see
+    /// [`flatten_iodata`]): a byte-aligned binary, a byte, or a proper list of those, at any
+    /// nesting. Anything else — an atom, a float, an integer outside `0..=255`, an improper
+    /// tail, a non-byte-aligned bitstring — is `{error,badarg}`. An **empty** payload is
+    /// `ok` without a host call.
+    ///
+    /// Oracle: `write(Fd,<<1,2>>)`/`("ab")`/`([<<"a">>,<<"b">>])`/`([<<"ab">>,[<<"c">>]])`
+    /// `/`(`[]`)`/`(<<>>)`⇒`ok`; `write(Fd,foo)`/`([256])`/`([-1])`/`([1.5])`/`([1|2])`
+    /// `/`(<<1:4>>)⇒`{error,badarg}`; a read-only fd⇒`{error,ebadf}`; a directory
+    /// ⇒`{error,ebadf}`; after `close/1`⇒`{error,einval}`.
     pub(super) fn prim_write(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let mut bytes = Vec::new();
-        let Some(data) = args.get(1).copied() else {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let io_data = *args.get(1).ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
             return self.error_tuple("badarg");
         };
-        if collect_iodata(data, &mut bytes).is_err() {
+        self.check_owner(&descriptor)?;
+        let Some(bytes) = flatten_iodata(io_data) else {
             return self.error_tuple("badarg");
-        }
-        let id = match self.descriptor_id(args.first().copied(), false) {
-            DescriptorId::Open(id) => id,
-            DescriptorId::Error(reason) => return self.error_tuple(reason),
-            DescriptorId::NotOwner => return Err(not_on_controlling_process()),
         };
-        let outcome = match self.runtime.open_files_mut().get_mut(&id) {
-            Some(Descriptor::Open(entry)) => match entry.file.write_all(&bytes) {
-                Ok(()) => WriteOutcome::Ok,
-                Err(error) => WriteOutcome::Failed(error),
-            },
-            Some(Descriptor::Closed) => WriteOutcome::Error("einval"),
-            None => WriteOutcome::Error("badarg"),
+        let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+            None => None,
+            // An empty payload is `ok` without a host call (`efile_writev` with no iovec
+            // writes nothing); a closed descriptor is still an error, as the oracle's
+            // `close_nif` state check makes it (`{error,einval}`).
+            Some(_) if bytes.is_empty() => Some(Ok(())),
+            Some(file) => Some(file.write_all(&bytes)),
         };
         match outcome {
-            WriteOutcome::Ok => self.ok_atom(),
-            WriteOutcome::Error(reason) => self.error_tuple(reason),
-            WriteOutcome::Failed(error) => self.error_tuple_for(&error),
+            None => self.error_tuple("einval"),
+            Some(Ok(())) => self.ok_atom(),
+            Some(Err(error)) => self.error_tuple_for(&error),
         }
     }
 
     // -- prim_file:close/1 ----------------------------------------------------
 
-    /// `prim_file:close(Fd)` — `close_nif` behind `prim_file:close/1`
-    /// (`prim_file.erl:154-160`).
+    /// `prim_file:close/1` — the descriptor removed from the runtime's open-file table,
+    /// `ok` on success (`prim_file.erl:154-160`, `close_nif`).
     ///
-    /// The descriptor becomes the C's `EFILE_STATE_CLOSED` ([`Descriptor::Closed`]): every
-    /// later operation on the same handle answers `{error,einval}` — *distinguishable* from
-    /// a handle this runtime never minted, which is the C's non-resource `badarg`.
+    /// Removing the entry drops the `std::fs::File`, which closes the host descriptor. A
+    /// second close, and an unknown id, are the NIF's `EFILE_STATE_CLOSED` answer
+    /// `{error,einval}`; a malformed descriptor is `{error,badarg}`.
+    ///
+    /// Oracle: `close(Fd)`⇒`ok`; `close(Fd)` again⇒`{error,einval}`;
+    /// `close(<<>>)`/`close({file_descriptor,prim_file,{}})`⇒`{error,badarg}`.
     pub(super) fn prim_close(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let id = match self.descriptor_id(args.first().copied(), false) {
-            DescriptorId::Open(id) => id,
-            DescriptorId::Error(reason) => return self.error_tuple(reason),
-            DescriptorId::NotOwner => return Err(not_on_controlling_process()),
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
         };
-        match self.runtime.open_files_mut().insert(id, Descriptor::Closed) {
-            Some(Descriptor::Open(entry)) => {
-                // Dropping the `File` closes the descriptor. `std` discards a close error
-                // (module docs).
-                drop(entry);
-                self.ok_atom()
-            }
-            _ => self.error_tuple("einval"),
+        self.check_owner(&descriptor)?;
+        let closed = self.runtime.open_files_mut().remove(&descriptor.id).is_some();
+        if closed {
+            self.ok_atom()
+        } else {
+            self.error_tuple("einval")
         }
     }
 
     // -- prim_file:position/2 -------------------------------------------------
 
-    /// `prim_file:position(Fd, Loc)` — `seek_nif` behind `prim_file:position/2`
-    /// (`prim_file.erl:306-334`): the mark selects `lseek`'s `SEEK_SET`/`SEEK_CUR`/
-    /// `SEEK_END` and the answer is the absolute position `lseek` returned.
+    /// `prim_file:position/2` — the descriptor seeked, `{ok, NewPosition}`
+    /// (`prim_file.erl:306-334`, `position_1/3`, `efile_seek`).
     ///
-    /// A read-shaped descriptor's `prim_buffer:wipe/1` (`position_1/3`, `:326-333`) is the
-    /// no-op stub of an empty buffer, so the seek **is** the whole implementation. Seeks
-    /// past EOF are legal, and a `{bof,-1}`-style negative target is the kernel's `EINVAL`
-    /// (module docs).
+    /// The `Loc` grammar is the wrapper's own: the atoms `bof`/`cur`/`eof` mean offset 0, a
+    /// bare term means `{bof, Term}`, and a 2-tuple is `{Mark, Offset}` — whose `Mark` must
+    /// be one of the three atoms and whose `Offset` must be an integer (`enif_get_int64`,
+    /// `seek_nif`). Anything else is `{error,badarg}`. A **negative** offset from `bof`
+    /// cannot be expressed as a position and is the kernel's `EINVAL` ⇒ `{error,einval}`
+    /// (`efile_seek`'s `lseek`); a `cur`/`eof` seek that would land before the start of the
+    /// file fails the same way through the host. Seeking past EOF is legal.
+    ///
+    /// Oracle: `position(Fd,bof)`⇒`{ok,0}`; `position(Fd,3)`⇒`{ok,3}`;
+    /// `position(Fd,{cur,1})`⇒`{ok,1}`; `position(Fd,{eof,-1})` on an 11-byte file
+    /// ⇒`{ok,10}`; `position(Fd,100)`⇒`{ok,100}`; `position(Fd,{bof,-1})`/`(Fd,-3)`
+    /// ⇒`{error,einval}`; `position(Fd,foo)`/`({1,bof})`/`({bof,foo})`/`({bof,1.0})`
+    /// `/`({bof,1,2})⇒`{error,badarg}`; after `close/1`⇒`{error,einval}`.
     pub(super) fn prim_position(&mut self, args: &[Eterm]) -> Result<Eterm> {
-        let Some(location) = args.get(1).copied().and_then(position_mark) else {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let location = *args.get(1).ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
             return self.error_tuple("badarg");
         };
-        let id = match self.descriptor_id(args.first().copied(), false) {
-            DescriptorId::Open(id) => id,
-            DescriptorId::Error(reason) => return self.error_tuple(reason),
-            DescriptorId::NotOwner => return Err(not_on_controlling_process()),
+        self.check_owner(&descriptor)?;
+        let Some(seek) = self.seek_target(location) else {
+            return self.error_tuple("badarg");
         };
-        let Some(seek) = location.seek_from() else {
-            // `lseek(fd, -1, SEEK_SET)`'s own `EINVAL`.
+        // `SeekFrom::Start` is `u64`-only, so a negative `bof` offset never reaches the host
+        // — it is the `lseek(SEEK_SET, -1)` `EINVAL` the oracle reports.
+        let seek = match seek {
+            SeekTarget::Bof(offset) if offset < 0 => return self.error_tuple("einval"),
+            SeekTarget::Bof(offset) => SeekFrom::Start(offset as u64),
+            SeekTarget::Cur(offset) => SeekFrom::Current(offset),
+            SeekTarget::Eof(offset) => SeekFrom::End(offset),
+        };
+        // `position_1/3` wipes the read buffer first; the oracle's `prim_buffer:wipe/1`
+        // only resets the (dead, see the module docs) read-ahead buffer, so the seek is the
+        // whole observable effect.
+        let outcome = match self.runtime.open_files_mut().get_mut(&descriptor.id) {
+            None => None,
+            Some(file) => Some(match file.seek(seek) {
+                Ok(_) => file.stream_position(),
+                Err(error) => Err(error),
+            }),
+        };
+        let Some(position) = outcome else {
             return self.error_tuple("einval");
         };
-        let outcome = match self.runtime.open_files_mut().get_mut(&id) {
-            Some(Descriptor::Open(entry)) => match entry.file.seek(seek) {
-                Ok(position) => SeekOutcome::Position(position),
-                Err(error) => SeekOutcome::Failed(error),
-            },
-            Some(Descriptor::Closed) => SeekOutcome::Error("einval"),
-            None => SeekOutcome::Error("badarg"),
-        };
-        match outcome {
-            SeekOutcome::Position(position) => {
-                let position = i64::try_from(position).map_err(|_| {
-                    BeamError::Raise(Raise::error(ExitReason::atom("einval")))
+        match position {
+            Ok(position) => {
+                let value = i64::try_from(position).map_err(|_| {
+                    error::unsupported(
+                        "prim_file:position/2: file position beyond the signed 64-bit range",
+                    )
                 })?;
-                let position = terms::make_integer(self, position)?;
-                self.ok_tuple(position)
+                let value = terms::make_integer(self, value)?;
+                self.ok_tuple(value)
             }
-            SeekOutcome::Error(reason) => self.error_tuple(reason),
-            SeekOutcome::Failed(error) => self.error_tuple_for(&error),
+            Err(error) => self.error_tuple_for(&error),
         }
     }
 
-    // -- helpers --------------------------------------------------------------
+    // -- the descriptor decode ------------------------------------------------
 
-    /// The registry id a `#file_descriptor{}` argument names — the C's
-    /// `get_file_data`/`file_handle_wrapper` (`prim_file_nif.c:315-357`) over this
-    /// runtime's registry.
+    /// The runtime's private id and recorded owner of a `#file_descriptor{}` argument.
     ///
-    /// `read_capable` additionally applies `get_fd_data_for_read/1`
-    /// (`prim_file.erl:506-510`), which is how a **write-shaped** descriptor reaches
-    /// `read/2` as `{error,ebadf}`.
-    fn descriptor_id(&mut self, fd: Option<Eterm>, read_capable: bool) -> DescriptorId {
-        let Some(data) = descriptor_data(fd) else {
-            return DescriptorId::Error("badarg");
-        };
-        // `get_fd_data/1`'s controlling-process check (`prim_file.erl:499-504`).
-        match map_lookup(self, data, "owner") {
-            Some(owner) if owner == self.pid().to_eterm() => {}
-            Some(_) => return DescriptorId::NotOwner,
-            None => return DescriptorId::Error("badarg"),
+    /// `None` is the malformed-descriptor failure every BIF answers as the value
+    /// `{error,badarg}` (see "Documented divergences").
+    fn decode_descriptor(&self, fd: Eterm) -> Option<Descriptor> {
+        let data = descriptor_data(fd)?;
+        let mut handle = false;
+        let mut owner = None;
+        let mut id = None;
+        for (key, value) in terms::map_entries(data).ok()? {
+            match self.atom_name(key).as_deref() {
+                Some("handle") => handle = true,
+                Some("owner") => owner = Some(value),
+                Some(REGISTRY_ID_KEY) => {
+                    if !is_small(value) || signed_value(value) < 0 {
+                        return None;
+                    }
+                    id = u64::try_from(signed_value(value)).ok();
+                }
+                _ => {}
+            }
         }
-        if map_lookup(self, data, "handle").is_none() {
-            return DescriptorId::Error("badarg");
+        if !handle {
+            return None;
         }
-        if read_capable && map_lookup(self, data, "r_buffer").is_none() {
-            return DescriptorId::Error("ebadf");
+        Some(Descriptor {
+            id: id?,
+            owner: owner?,
+        })
+    }
+
+    /// The oracle's `get_fd_data/1` owner test (`prim_file.erl:499-504`): the calling
+    /// process must be the one the descriptor was opened by, else the raise
+    /// `error:not_on_controlling_process` — which is **not** caught by the wrappers'
+    /// `catch error:badarg`, so it really is a raise here too.
+    fn check_owner(&self, descriptor: &Descriptor) -> Result<()> {
+        if descriptor.owner == self.pid().to_eterm() {
+            Ok(())
+        } else {
+            Err(error::message("not_on_controlling_process"))
         }
-        let Some(id) = map_lookup(self, data, "fd_registry_id") else {
-            return DescriptorId::Error("badarg");
-        };
-        if !is_small(id) || signed_value(id) < 0 {
-            return DescriptorId::Error("badarg");
+    }
+
+    /// The `#file_descriptor{}` an `open/2` answers with (`prim_file.erl:151-152`,
+    /// `build_fd_data/3`).
+    ///
+    /// The `handle` entry is the reference minted for this file, the `owner` entry this
+    /// process's own pid, and [`REGISTRY_ID_KEY`] the runtime-table key; the **read shape**
+    /// additionally carries the `r_buffer` marker and `r_ahead_size`.
+    fn build_descriptor(&mut self, modes: &OpenModes, handle: Eterm, id: u64) -> Result<Eterm> {
+        let id_value = i64::try_from(id).map(make_small).map_err(|_| {
+            error::unsupported("prim_file:open/2: file handle id beyond the immediate range")
+        })?;
+        let owner = self.pid().to_eterm();
+        let mut pairs = vec![
+            (self.atom("handle")?, handle),
+            (self.atom("owner")?, owner),
+            (self.atom(REGISTRY_ID_KEY)?, id_value),
+        ];
+        if modes.read_shape() {
+            let (_, buffer) = self.mint_reference()?;
+            pairs.push((self.atom("r_buffer")?, buffer));
+            pairs.push((self.atom("r_ahead_size")?, make_small(modes.read_ahead)));
         }
-        let id = signed_value(id) as u64;
-        match self.runtime.open_files_mut().get(&id) {
-            Some(Descriptor::Open(_)) => DescriptorId::Open(id),
-            Some(Descriptor::Closed) => DescriptorId::Error("einval"),
-            None => DescriptorId::Error("badarg"),
+        // The shared atom table is cloned as an `Rc` handle first, so the borrow of the
+        // runtime ends before `make_map` needs the context itself.
+        let atoms = self.runtime.code_server.atoms_handle();
+        let data = terms::make_map(self, &pairs, &atoms)?;
+        let tag = self.atom("file_descriptor")?;
+        let module = self.atom("prim_file")?;
+        terms::make_tuple(self, &[tag, module, data])
+    }
+
+    /// The parsed `Size` of `read/2` (`read_1/5` + `read_nif_impl`).
+    ///
+    /// A **non-negative** small integer is the byte count; a negative one, an atom, a list
+    /// or a nil is `{error,badarg}`; every other non-small term — a float, a bigint — is
+    /// `{error,einval}`, the NIF's `enif_is_number`-then-`enif_get_int64` answer.
+    fn read_size(&self, size: Eterm) -> ReadSize {
+        if is_small(size) {
+            let value = signed_value(size);
+            return match usize::try_from(value) {
+                Ok(value) => ReadSize::Bytes(value),
+                Err(_) => ReadSize::BadArg,
+            };
         }
+        if terms::float_value(size).is_ok() {
+            return ReadSize::EInval;
+        }
+        if is_atom(size) || is_list(size) || is_nil(size) {
+            return ReadSize::BadArg;
+        }
+        ReadSize::EInval
+    }
+
+    /// The parsed `Loc` of `position/2` — the wrapper's own clauses (`prim_file.erl:306-325`)
+    /// followed by the C's argument checks (`seek_nif`).
+    ///
+    /// `None` is the C's `badarg`: a `Mark` that is not one of `bof`/`cur`/`eof`, an `Offset`
+    /// that is not an integer, or a term the wrapper's clauses cannot turn into a pair
+    /// (only a 2-tuple and the three marker atoms are special; every other term is
+    /// `{bof, Itself}`, which the integer check then rejects unless it is an integer).
+    fn seek_target(&self, location: Eterm) -> Option<SeekTarget> {
+        if terms::tuple_arity(location).is_ok() {
+            if terms::tuple_arity(location).ok()? != 2 {
+                return None;
+            }
+            let mark = self.atom_name(terms::tuple_element(location, 0).ok()?)?;
+            let offset = terms::tuple_element(location, 1).ok()?;
+            if !is_small(offset) {
+                return None;
+            }
+            return SeekTarget::new(&mark, signed_value(offset));
+        }
+        if let Some(mark) = self.atom_name(location) {
+            if let Some(target) = SeekTarget::new(&mark, 0) {
+                return Some(target);
+            }
+        }
+        // The wrapper's fallthrough clause: `position(Fd, Offset) -> position(Fd, {bof, Offset})`.
+        if is_small(location) {
+            return Some(SeekTarget::Bof(signed_value(location)));
+        }
+        None
+    }
+
+    /// The parsed `open/2` mode list — the wrapper's `build_fd_data/5` state machine
+    /// (`prim_file.erl:512-527`) over the NIF's option vocabulary
+    /// (`efile_translate_modelist`, `prim_file_nif.c:500-539`).
+    ///
+    /// `None` when `modes` is not a **proper** list: the wrapper's `catch error:badarg`
+    /// turns that into the `{error,badarg}` value. (The oracle's own NIF silently stops at
+    /// an improper tail — the Erlang `file:open/2` rejects it before `prim_file` is reached,
+    /// and `prim_file:open/2` aborts the emulator outright. `{error,badarg}` is the honest
+    /// answer here.)
+    fn open_modes(&self, modes: Eterm) -> Option<OpenModes> {
+        let mut parsed = OpenModes::default();
+        let mut current = modes;
+        loop {
+            if is_nil(current) {
+                break;
+            }
+            if !is_list(current) {
+                return None;
+            }
+            let head = terms::cons_head(current).ok()?;
+            current = terms::cons_tail(current).ok()?;
+            // Atom names are resolved through the **shared** atom table: indices are only
+            // comparable inside the table that produced them.
+            match self.atom_name(head).as_deref() {
+                Some("read") => {
+                    parsed.read = true;
+                    parsed.shape = FdShape::Read;
+                }
+                Some("write") => {
+                    parsed.write = true;
+                    if parsed.shape == FdShape::Default {
+                        parsed.shape = FdShape::Write;
+                    }
+                }
+                Some("exclusive") => parsed.exclusive = true,
+                Some("append") => parsed.append = true,
+                Some("sync") => parsed.sync = true,
+                Some("directory") => parsed.directory = true,
+                Some("skip_type_check") => parsed.skip_type_check = true,
+                Some("read_ahead") => parsed.read_ahead = DEFAULT_READ_AHEAD,
+                _ => {
+                    if let Some(size) = self.read_ahead_option(head) {
+                        parsed.read_ahead = size;
+                    }
+                    // Every other option (`raw`, `binary`, `ram`, `delayed_write`, …) is
+                    // silently ignored, exactly as `efile_translate_modelist` does.
+                }
+            }
+        }
+        // `efile_translate_modelist`'s tail (`prim_file_nif.c:531-536`): `append` and
+        // `exclusive` are documented as "open for writing", and with neither bit set the
+        // mode defaults to read.
+        if parsed.append || parsed.exclusive {
+            parsed.write = true;
+        } else if !(parsed.read || parsed.write) {
+            parsed.read = true;
+        }
+        Some(parsed)
+    }
+
+    /// The `N` of a `{read_ahead, N}` mode option (`prim_file.erl:522-523`), `None` for
+    /// anything else — including a `{read_ahead, _}` whose payload is not a non-negative
+    /// small integer, which the Erlang clause would store verbatim (the value only ever
+    /// reaches `r_ahead_size`, which this runtime does not read back).
+    fn read_ahead_option(&self, option: Eterm) -> Option<i64> {
+        if terms::tuple_arity(option).ok()? != 2 {
+            return None;
+        }
+        let tag = self.atom_name(terms::tuple_element(option, 0).ok()?)?;
+        if tag != "read_ahead" {
+            return None;
+        }
+        let size = terms::tuple_element(option, 1).ok()?;
+        if !is_small(size) {
+            return None;
+        }
+        let size = signed_value(size);
+        if size < 0 {
+            return None;
+        }
+        Some(size)
     }
 }
 
-/// The `Data` map of a `#file_descriptor{}` argument, or `None` for anything else
-/// (`get_fd_data/1`'s single `#file_descriptor{data = Data}` clause is a
-/// `function_clause` for every other shape).
-fn descriptor_data(fd: Option<Eterm>) -> Option<Eterm> {
-    let fd = fd?;
+/// The `read_ahead` mode option's read-ahead size (`64 bsl 10`, `prim_file.erl:521`).
+const DEFAULT_READ_AHEAD: i64 = 64 * 1024;
+
+/// The runtime's private handle for one open file: what a descriptor decode yields.
+struct Descriptor {
+    /// The key into [`Runtime::open_files_mut`](crate::Runtime::open_files_mut).
+    id: u64,
+    /// The pid `open/2` recorded, compared against the caller's own.
+    owner: Eterm,
+}
+
+/// The `Data` map of a `#file_descriptor{}` argument, or `None` when the term is not a
+/// well-shaped descriptor at all (`prim_file.erl:499-504`).
+fn descriptor_data(fd: Eterm) -> Option<Eterm> {
     if terms::tuple_arity(fd).ok()? != 3 {
         return None;
     }
-    if terms::tuple_element(fd, 0).ok()? != fd {
-        // `file_descriptor` is the first element's atom; the tag is checked by name below.
+    if !is_atom(terms::tuple_element(fd, 0).ok()?) {
+        return None;
     }
     let data = terms::tuple_element(fd, 2).ok()?;
     if terms::map_entries(data).is_err() {
@@ -433,368 +626,195 @@ fn descriptor_data(fd: Option<Eterm>) -> Option<Eterm> {
     Some(data)
 }
 
-/// The value of `key` (an atom name) in the flat map/map term `data`.
-fn map_lookup(context: &mut RuntimeContext<'_>, data: Eterm, key: &str) -> Option<Eterm> {
-    let name = context.atom(key).ok()?;
-    terms::map_entries(data)
-        .ok()?
-        .into_iter()
-        .find(|(candidate, _)| *candidate == name)
-        .map(|(_, value)| value)
-}
-
-/// The `{error, not_on_controlling_process}` raise of a descriptor whose `owner` is not
-/// the calling process (`get_fd_data/1`, `prim_file.erl:499-504`: `error(...)`, which no
-/// `catch error:badarg` contains).
-fn not_on_controlling_process() -> BeamError {
-    BeamError::Raise(Raise::error(ExitReason::atom("not_on_controlling_process")))
-}
-
-/// What a descriptor argument resolved to.
-enum DescriptorId {
-    /// The open descriptor's registry id.
-    Open(u64),
-    /// The `{error, Reason}` answer.
-    Error(&'static str),
-    /// The `not_on_controlling_process` raise.
-    NotOwner,
-}
-
-/// The outcome of a read (so the `File` borrow ends before any term is built).
-enum ReadOutcome {
-    /// `{ok, Binary}`.
-    Bytes(Vec<u8>),
-    /// `eof`.
-    Eof,
-    /// `{error, Reason}`.
-    Error(&'static str),
-    /// `{error, <errno>}`.
-    Failed(std::io::Error),
-}
-
-/// The outcome of a write.
-enum WriteOutcome {
-    /// `ok`.
-    Ok,
-    /// `{error, Reason}`.
-    Error(&'static str),
-    /// `{error, <errno>}`.
-    Failed(std::io::Error),
-}
-
-/// The outcome of a seek.
-enum SeekOutcome {
-    /// `{ok, Position}`.
-    Position(u64),
-    /// `{error, Reason}`.
-    Error(&'static str),
-    /// `{error, <errno>}`.
-    Failed(std::io::Error),
-}
-
-/// The read size `read_nif` accepts: `enif_get_int64` of a non-negative number, with
-/// `enif_is_number` rejecting the non-numbers first (`prim_file_nif.c:655-660`).
-enum ReadSize {
-    /// A count of bytes to read.
-    Count(usize),
-    /// Not a number at all — the file-level interface's `{error,badarg}`.
-    BadArg,
-    /// A float or a bignum that cannot fit `int64` — the C's `EINVAL`.
-    EInval,
-}
-
-/// Classifies `read/2`'s size argument (see [`ReadSize`]).
-fn read_size(term: Eterm) -> ReadSize {
-    if is_small(term) {
-        let value = signed_value(term);
-        return match usize::try_from(value) {
-            Ok(count) => ReadSize::Count(count),
-            // A negative size: the documented `is_integer(N), N >= 0` contract's
-            // `{error,badarg}` (module docs).
-            Err(_) => ReadSize::BadArg,
-        };
+/// One `read(2)` of at most `count` bytes (`efile_readv`,
+/// `unix_prim_file.c:400-440`), with the descriptor's position advanced by what the host
+/// returned.
+///
+/// The destination is pre-sized to `count` — the oracle's `enif_alloc_binary(block_size)`
+/// — and a reservation the host cannot satisfy is the NIF's own `ENOMEM` answer
+/// (`prim_file_nif.c:642-644`), never an abort.
+fn read_extent(file: &mut File, count: usize) -> std::io::Result<Vec<u8>> {
+    if count == 0 {
+        return Ok(Vec::new());
     }
-    if terms::float_value(term).is_ok() {
-        // `enif_get_int64` does not convert a float.
-        return ReadSize::EInval;
-    }
-    // A bignum: `enif_get_int64` fails for one that overflows `int64` (and a bignum is
-    // always outside the small-int range).
-    if beam_term::big_to_f64(term).is_some() {
-        return ReadSize::EInval;
-    }
-    ReadSize::BadArg
+    let mut buffer: Vec<u8> = Vec::new();
+    buffer
+        .try_reserve_exact(count)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+    buffer.resize(count, 0);
+    let read = file.read(&mut buffer)?;
+    buffer.truncate(read);
+    Ok(buffer)
 }
 
-/// `prim_file:position/2`'s mark, resolved: `bof`/`cur`/`eof` plus an integer offset, as
-/// the C's `seek_nif` reads them (`prim_file_nif.c:782-806`).
-struct Position {
-    /// The mark (an atom name, `bof`/`cur`/`eof`).
-    mark: Mark,
-    /// The offset (`enif_get_int64`'s integer).
-    offset: i64,
-}
-
-/// An `lseek` whence.
-enum Mark {
-    /// `SEEK_SET`.
-    Bof,
-    /// `SEEK_CUR`.
-    Cur,
-    /// `SEEK_END`.
-    Eof,
-}
-
-impl Position {
-    /// The `std::io` seek this mark/offset asks for, or `None` where `lseek` itself
-    /// answers `EINVAL` (a negative offset from the beginning).
-    fn seek_from(&self) -> Option<SeekFrom> {
-        match self.mark {
-            Mark::Bof => u64::try_from(self.offset).ok().map(SeekFrom::Start),
-            Mark::Cur => Some(SeekFrom::Current(self.offset)),
-            Mark::Eof => Some(SeekFrom::End(self.offset)),
-        }
-    }
-}
-
-/// `position/2`'s second argument: a bare mark (offset `0`), `{Mark, Offset}`, or a bare
-/// integer (`{N, bof}`) — `prim_file.erl:306-321`. `None` is the wrapper's
-/// `{error,badarg}`.
-fn position_mark(term: Eterm) -> Option<Position> {
-    if is_small(term) {
-        return Some(Position {
-            mark: Mark::Bof,
-            offset: signed_value(term),
-        });
-    }
-    if let Some(mark) = mark_name(term) {
-        return Some(Position { mark, offset: 0 });
-    }
-    if terms::tuple_arity(term).ok()? == 2 {
-        let mark = mark_name(terms::tuple_element(term, 0).ok()?)?;
-        let offset = terms::tuple_element(term, 1).ok()?;
-        if !is_small(offset) {
+/// The flattened bytes of a `write/2` iodata argument — `erlang:iolist_to_iovec/1`'s walk
+/// (`erl_bif_binary.c`), `None` for the `badarg` it raises.
+///
+/// Accepted: a byte-aligned binary (its bytes), a byte (`0..=255`), and a proper list of
+/// those at any nesting. Rejected: any other term, an integer outside a byte's range, an
+/// improper tail, a non-byte-aligned bitstring, and a nesting deeper than
+/// [`MAX_IODATA_DEPTH`].
+///
+/// The walk is **iterative** — an explicit pending list carrying each element's nesting
+/// depth — so no argument can exhaust the Rust stack. Elements are pushed in reverse so the
+/// bytes come out in source order.
+fn flatten_iodata(term: Eterm) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut pending: Vec<(Eterm, u32)> = vec![(term, 0)];
+    while let Some((current, depth)) = pending.pop() {
+        if depth > MAX_IODATA_DEPTH {
             return None;
         }
-        return Some(Position {
-            mark,
-            offset: signed_value(offset),
-        });
-    }
-    None
-}
-
-/// The `bof`/`cur`/`eof` mark of an atom term.
-fn mark_name(term: Eterm) -> Option<Mark> {
-    let index = beam_term::atom_val_checked(term)?;
-    let _ = index;
-    None
-}
-
-/// Collects `data`'s bytes — the C's `enif_inspect_iovec` over the iodata
-/// `erlang:iolist_to_iovec/1` builds.
-///
-/// A byte-aligned **binary** (top level or nested) contributes its bytes; a byte small-int
-/// contributes one; a **proper** list of either contributes the concatenation; everything
-/// else — an atom, a float, a byte above 255, a negative integer, a non-byte-aligned
-/// bitstring, an improper tail — is `Err(BadArg)`.
-fn collect_iodata(term: Eterm, out: &mut Vec<u8>) -> Result<()> {
-    if !is_list(term) {
-        return match terms::binary_bytes(term) {
-            Ok(bytes) => {
-                out.extend_from_slice(bytes);
-                Ok(())
-            }
-            Err(_) => Err(BeamError::BadArg),
-        };
-    }
-    let mut pending: Vec<Eterm> = Vec::new();
-    let mut current = term;
-    loop {
-        if is_nil(current) {
-            match pending.pop() {
-                Some(rest) => {
-                    current = rest;
-                    continue;
-                }
-                None => return Ok(()),
-            }
-        }
-        if let Ok(bytes) = terms::binary_bytes(current) {
-            out.extend_from_slice(bytes);
-        } else if is_small(current) {
-            let byte = u8::try_from(signed_value(current)).map_err(|_| BeamError::BadArg)?;
-            out.push(byte);
-        } else if is_list(current) {
-            let head = terms::cons_head(current)?;
-            let tail = terms::cons_tail(current)?;
-            if !is_nil(tail) {
-                // An improper tail is not an iolist.
-                if !is_list(tail) {
-                    return Err(BeamError::BadArg);
-                }
-                pending.push(tail);
-            }
-            current = head;
+        if let Ok(binary) = terms::binary_bytes(current) {
+            bytes.extend_from_slice(binary);
             continue;
-        } else {
-            return Err(BeamError::BadArg);
         }
-        match pending.pop() {
-            Some(rest) => current = rest,
-            None => return Ok(()),
-        }
-    }
-}
-
-/// The modes `efile_translate_modelist` (`prim_file_nif.c:500-539`) recognizes, plus the
-/// `build_fd_data/5` (`prim_file.erl:512-527`) descriptor shape they imply.
-struct OpenModes {
-    /// `read` was given.
-    read: bool,
-    /// `write` was given.
-    write: bool,
-    /// `append` was given.
-    append: bool,
-    /// `exclusive` was given.
-    exclusive: bool,
-    /// `sync` was given.
-    sync: bool,
-    /// `directory` was given.
-    directory: bool,
-    /// `skip_type_check` was given.
-    skip_type_check: bool,
-    /// `build_fd_data/5`'s mode after the walk: `write` subsumes the read shape, `read`
-    /// always does, and a second `write` no longer matches (`Mode =:= default`).
-    write_shape: bool,
-    /// `build_fd_data`'s `RASz`: `0`, `65536` (bare `read_ahead`) or `{read_ahead, N}`.
-    read_ahead: i64,
-}
-
-impl OpenModes {
-    /// Whether the open **reads** (`efile_translate_modelist`'s defaulting).
-    fn reads(&self) -> bool {
-        if self.append || self.exclusive {
-            self.read
-        } else {
-            self.read || !self.write
-        }
-    }
-
-    /// Whether the open **writes** (`append`/`exclusive` imply write).
-    fn writes(&self) -> bool {
-        self.write || self.append || self.exclusive
-    }
-
-    /// Whether the `Data` map is the write shape (no `r_buffer`/`r_ahead_size`).
-    fn write_shape(&self) -> bool {
-        self.write_shape
-    }
-}
-
-/// Reads a mode list the way the C does — `None` for a non-list (`open_nif`'s
-/// `enif_is_list` badarg).
-fn open_modes(term: Eterm) -> Option<OpenModes> {
-    let mut modes = OpenModes {
-        read: false,
-        write: false,
-        append: false,
-        exclusive: false,
-        sync: false,
-        directory: false,
-        skip_type_check: false,
-        write_shape: false,
-        read_ahead: 0,
-    };
-    let mut default = true;
-    let mut current = term;
-    let mut stack: Vec<Eterm> = Vec::new();
-    loop {
-        if is_nil(current) {
-            match stack.pop() {
-                Some(rest) => {
-                    current = rest;
-                    continue;
-                }
-                None => return Some(modes),
+        if is_small(current) {
+            let value = signed_value(current);
+            if !(0..=255).contains(&value) {
+                return None;
             }
+            bytes.push(value as u8);
+            continue;
+        }
+        if is_nil(current) {
+            continue;
         }
         if !is_list(current) {
             return None;
         }
-        let head = terms::cons_head(current).ok()?;
-        let tail = terms::cons_tail(current).ok()?;
-        match mode_name(head) {
-            Some("read") => {
-                modes.read = true;
-                default = false;
+        let mut cells = Vec::new();
+        let mut cell = current;
+        loop {
+            if is_nil(cell) {
+                break;
             }
-            Some("write") if default => {
-                modes.write = true;
-                modes.write_shape = true;
+            if !is_list(cell) {
+                return None;
             }
-            Some("exclusive") => modes.exclusive = true,
-            Some("append") => modes.append = true,
-            Some("sync") => modes.sync = true,
-            Some("directory") => modes.directory = true,
-            Some("skip_type_check") => modes.skip_type_check = true,
-            Some("read_ahead") => modes.read_ahead = 64 * 1024,
-            _ => {
-                if let Some(ahead) = read_ahead_pair(head) {
-                    modes.read_ahead = ahead;
-                }
-                // Every other option (raw, ram, delayed_write, compressed, binary, list,
-                // …) is ignored, exactly as `efile_translate_modelist` ignores it.
-            }
+            cells.push(terms::cons_head(cell).ok()?);
+            cell = terms::cons_tail(cell).ok()?;
         }
-        current = tail;
+        pending.extend(cells.into_iter().rev().map(|element| (element, depth + 1)));
+    }
+    Some(bytes)
+}
+
+/// Where `position/2` wants the descriptor moved to, after the wrapper's clause selection
+/// and the C's argument checks.
+enum SeekTarget {
+    /// `{bof, Offset}` — relative to the start of the file.
+    Bof(i64),
+    /// `{cur, Offset}` — relative to the current position.
+    Cur(i64),
+    /// `{eof, Offset}` — relative to the end of the file.
+    Eof(i64),
+}
+
+impl SeekTarget {
+    /// The target for the atom `mark`, or `None` for a `Mark` the C rejects.
+    fn new(mark: &str, offset: i64) -> Option<SeekTarget> {
+        match mark {
+            "bof" => Some(SeekTarget::Bof(offset)),
+            "cur" => Some(SeekTarget::Cur(offset)),
+            "eof" => Some(SeekTarget::Eof(offset)),
+            _ => None,
+        }
     }
 }
 
-/// The atom name of `term`, when it is an atom (`None` otherwise) — the C's
-/// `enif_is_identical` tests.
-fn mode_name(term: Eterm) -> Option<&'static str> {
-    const NAMES: [&str; 8] = [
-        "read",
-        "write",
-        "exclusive",
-        "append",
-        "sync",
-        "directory",
-        "skip_type_check",
-        "read_ahead",
-    ];
-    if !beam_term::is_atom(term) {
-        return None;
-    }
-    let index = beam_term::atom_val(term);
-    NAMES.iter().copied().find(|name| atom_index(name) == Some(index))
+/// `build_fd_data/5`'s `Mode` accumulator (`prim_file.erl:512-527`): which of the two
+/// descriptor shapes the option list produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FdShape {
+    /// No `read` and no `write` option yet — the read shape, like `build_fd_data/5`'s
+    /// `default` mode.
+    #[default]
+    Default,
+    /// A `read` option was seen.
+    Read,
+    /// A `write` option was seen while the mode was still `Default`.
+    Write,
 }
 
-/// The `{read_ahead, N}` form of the read-ahead option, or `None`.
-fn read_ahead_pair(term: Eterm) -> Option<i64> {
-    if terms::tuple_arity(term).ok()? != 2 {
-        return None;
-    }
-    if mode_name(terms::tuple_element(term, 0).ok()?)? != "read_ahead" {
-        return None;
-    }
-    let size = terms::tuple_element(term, 1).ok()?;
-    if !is_small(size) {
-        return None;
-    }
-    Some(signed_value(size).max(0))
+/// The parsed `open/2` mode list.
+#[derive(Debug, Default)]
+struct OpenModes {
+    /// A `read` option appeared.
+    read: bool,
+    /// A `write` option appeared (or `append`/`exclusive` implied one).
+    write: bool,
+    /// `append` appeared: `O_APPEND`, and no truncation.
+    append: bool,
+    /// `exclusive` appeared: `O_EXCL`.
+    exclusive: bool,
+    /// `sync` appeared: `O_SYNC`.
+    sync: bool,
+    /// `directory` appeared: `O_DIRECTORY`, plus the type checks' counterpart.
+    directory: bool,
+    /// `skip_type_check` appeared: the post-open directory checks are skipped.
+    skip_type_check: bool,
+    /// The accumulated read-ahead size (`read_ahead`/`{read_ahead, N}`), 0 by default.
+    read_ahead: i64,
+    /// `build_fd_data/5`'s final mode.
+    shape: FdShape,
 }
 
-/// The atom-table index of `name`, interned in a fresh table — the module's own fixed
-/// vocabulary, so it is only ever *compared* with a term's atom (never mixed in).
-fn atom_index(name: &str) -> Option<beam_term::Atom> {
-    let mut table = beam_term::AtomTable::new();
-    Some(table.intern(name))
+impl OpenModes {
+    /// Whether the descriptor carries the **read** shape, i.e. `r_buffer` + `r_ahead_size`.
+    fn read_shape(&self) -> bool {
+        self.shape != FdShape::Write
+    }
+
+    /// The host open flags `get_flags` derives (`unix_prim_file.c:142-171`).
+    ///
+    /// `OpenOptions`' own accessors express `O_RDONLY`/`O_WRONLY`/`O_RDWR` + `O_CREAT` +
+    /// `O_TRUNC`; the flag-only bits (`O_APPEND`/`O_EXCL`/`O_SYNC`/`O_DIRECTORY`) go through
+    /// `custom_flags`, which `std` ORs into the same `open(2)` call.
+    fn options(&self) -> OpenOptions {
+        let mut options = OpenOptions::new();
+        if self.read && !self.write {
+            options.read(true);
+        } else if self.write && !self.read {
+            options.write(true).create(true);
+            // `[write]` truncates; `append` clears `O_TRUNC` afterwards
+            // (`unix_prim_file.c:159-162`).
+            if !self.append {
+                options.truncate(true);
+            }
+        } else if self.read && self.write {
+            options.read(true).write(true).create(true);
+        } else {
+            // Unreachable: `open_modes` defaults to READ, as `efile_translate_modelist`
+            // does. Kept as the same read-only open rather than an invented failure.
+            options.read(true);
+        }
+        let mut extra = 0i32;
+        if self.append {
+            extra |= libc::O_APPEND;
+        }
+        if self.exclusive {
+            extra |= libc::O_EXCL;
+        }
+        if self.sync {
+            extra |= libc::O_SYNC;
+        }
+        if self.directory {
+            extra |= libc::O_DIRECTORY;
+        }
+        if extra != 0 {
+            options.custom_flags(extra);
+        }
+        options
+    }
 }
 
-/// `is_list`'s complement for the mode walk (an empty list is a valid mode list).
-trait Indexed {
-    /// The atom's table index.
-    fn index(self) -> u32;
+/// The `Size` argument of `read/2`.
+enum ReadSize {
+    /// A non-negative small integer: the byte count.
+    Bytes(usize),
+    /// A term the wrapper answers `{error,badarg}` for.
+    BadArg,
+    /// A term the wrapper answers `{error,einval}` for.
+    EInval,
 }

@@ -39,7 +39,7 @@
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:lib_dir/0,1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
 //! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
-//! | `prim_file:get_cwd/0,1`, `prim_file:read_file/1` | the file-system **primitives** `file.erl` delegates to: they are the host's own `getcwd`/`open`+`read` (`std::env`/`std::fs`), which only the host can perform |
+//! | `prim_file:get_cwd/0,1`, `prim_file:read_file/1`, `prim_file:open/2`, `prim_file:read/2`, `prim_file:write/2`, `prim_file:close/1`, `prim_file:position/2` | the file-system **primitives** `file.erl` delegates to: they are the host's own `getcwd`/`open`/`read`/`write`/`close`/`lseek` (`std::env`/`std::fs`), which only the host can perform |
 //!
 //! The `init`/`code`/`application` calls are **preloaded-module surface** (contract
 //! A.7): the oracle serves them from `init.beam`/`code.beam`/`application.beam`, but
@@ -88,6 +88,7 @@ pub(crate) mod memory;
 mod node;
 mod port;
 mod prim;
+mod prim_file;
 mod process;
 #[cfg(test)]
 mod test_support;

@@ -422,6 +422,19 @@ pub struct Runtime {
     /// unopenable file is recorded on the [`PerfMap`] (never raised, never printed), exactly
     /// as the oracle logs it and carries on. See [`crate::perf_map`].
     perf_map: PerfMap,
+    /// The open **whole-file descriptors** `prim_file:open/2` handed out and
+    /// `prim_file:close/1` has not yet removed (contract A.7).
+    ///
+    /// Keyed by the reference id minted for the descriptor's `handle`
+    /// ([`Runtime::refs_mut`]'s one id space, whose ids are never reused), the value the
+    /// host `std::fs::File` the descriptor denotes. The oracle keeps the same table in C
+    /// behind a NIF resource and *decodes* the `handle` reference to find it; this runtime
+    /// carries the id in the descriptor's own `Data` map instead, because reading a
+    /// reference's payload needs `unsafe` and this crate is `#![deny(unsafe_code)]`. The
+    /// table is owned by the `Runtime` (not a `thread_local!`) because several runtimes can
+    /// live in one thread — a process-global table would let their handles collide. See
+    /// [`crate::native::prim_file`].
+    open_files: HashMap<u64, std::fs::File>,
 }
 
 impl Runtime {
@@ -549,6 +562,7 @@ impl Runtime {
             local_node,
             inbound_delivery: false,
             perf_map,
+            open_files: HashMap::new(),
         })
     }
 
@@ -768,6 +782,17 @@ impl Runtime {
     /// woken by a message (resume the receive scan).
     pub(crate) fn take_timer_resume(&mut self, pid: ProcessId) -> Option<(u32, u32)> {
         self.timer_resumes.remove(&pid)
+    }
+
+    /// The open **whole-file-descriptor** table (contract A.7): the host files
+    /// `prim_file:open/2` handed a descriptor for and `prim_file:close/1` has not yet
+    /// removed.
+    ///
+    /// Keyed by the reference id the descriptor's `handle` carries; see the field's own
+    /// docs for why the key is carried in the clear and the table is per-`Runtime`.
+    /// [`crate::native::prim_file`] is the module that mutates it.
+    pub(crate) fn open_files_mut(&mut self) -> &mut HashMap<u64, std::fs::File> {
+        &mut self.open_files
     }
 
     /// Takes a heap for one BIF call out of the pool.
