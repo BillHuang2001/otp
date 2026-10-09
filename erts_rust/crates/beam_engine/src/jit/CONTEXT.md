@@ -87,7 +87,7 @@ interpreter's exact semantics (and exact typed error) stand.
 - **`select_tuple_arity`** (`emit/aggregate.rs:572-617`) + `emit_tuple_header_guard` (`:627-655`):
   `is_boxed` bit trick → header ptr → `test hdr, 0x3F; jne` ⇔ `is_arity_value`
   (`ARITYVAL_SUBTAG=0x00`, `TAG_HEADER_MASK=0x3F`).
-- **Local tail calls** (`emit/link.rs:209-248`): `jac_tail_call` (`runtime.rs:266-284` / `jit_tail_call`)
+- **Local tail calls** (`emit/link.rs:209-248`): `jit_tail_call` (`runtime.rs:266-284`)
   IS `Machine::pop_frame_checked`, the identical call the interpreter makes after `resolve`
   (`interpreter/dispatch.rs:303-304`). Target resolved at compile time first; a failed pop ⇒ `ERROR`
   ⇒ driver propagates the exact typed error. `call_only` (no frame) lowers as a `jump` with **no** pop.
