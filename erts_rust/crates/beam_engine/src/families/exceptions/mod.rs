@@ -90,7 +90,7 @@ use beam_common::Result;
 use beam_loader::{Instr, Module, Operand};
 use beam_term::{is_nil, make_atom, Eterm, NIL};
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::machine::{CatchFrame, Machine};
 use crate::operand::{read_operand, write_operand};
@@ -207,7 +207,24 @@ pub(crate) fn exec(
                     let exit_atom = module.atom_table.lookup("EXIT").ok_or_else(|| {
                         error::unsupported("catch_end: module atom table lacks the 'EXIT' atom")
                     })?;
-                    let tuple = terms::make_tuple(ctx, &[make_atom(exit_atom), reason])?;
+                    let exit_term = make_atom(exit_atom);
+                    // Reserve → read → write: the reason is re-read from the machine
+                    // root `x(1)` *inside* the reader closure, so a moving collector
+                    // running under the one rooted reservation cannot leave this build
+                    // holding the stale copy read above.
+                    let tuple = terms::make_tuple_rooted(
+                        machine,
+                        ctx,
+                        RootSet::ALL_LIVE,
+                        2,
+                        0,
+                        |m, _slack| {
+                            let reason = m.x(1).ok_or_else(|| {
+                                error::unsupported("catch_end: x(1) out of range")
+                            })?;
+                            Ok(vec![exit_term, reason])
+                        },
+                    )?;
                     machine.set_x(0, tuple)?;
                 }
             }

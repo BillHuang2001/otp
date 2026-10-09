@@ -68,10 +68,10 @@ use beam_common::Result;
 use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
 use beam_term::{make_atom, Eterm};
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::machine::Machine;
-use crate::operand::read_operand;
+use crate::operand::{read_operand, read_operand_slack};
 use crate::Step;
 
 /// `BSF_ALIGNED` (`erl_bits.h:461`): the field is guaranteed byte-aligned.
@@ -121,19 +121,33 @@ pub(crate) fn exec(
 /// Reproduces the C `$FAIL`/`$FAIL_HEAD_OR_BODY` split (`emu/macros.tab:266`): the
 /// compiler emits a live fail label for an ordinary clause mismatch, while `f,0`
 /// means "there is no handler — this is a hard match failure" and becomes a
-/// `badmatch` raise with `subject` as the value.
+/// `badmatch` raise with the subject as the value.
+///
+/// The subject is handed in as its **operand**, not as a read `Eterm`: the raise
+/// reason's block is reserved first and the subject is then re-read from the
+/// machine's post-collection state inside the reader closure
+/// ([`crate::terms::badmatch_reason`]), so a moving collector can never leave a
+/// stale subject pointer inside the raised `{badmatch, Subject}` — the frozen
+/// **reserve, then read, then write** ordering. A subject operand is a
+/// register/literal, never a non-small integer immediate, so the reason block's
+/// zero-word tail is exactly right (a bignum operand cannot occur here).
 pub(super) fn fail_step(
     machine: &mut Machine,
     module: &Module,
     labels: &LabelMap,
     fail: Label,
-    subject: Eterm,
+    subject: &Operand,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
     if fail == NO_FAIL {
-        return machine
-            .throw_error(crate::terms::badmatch_reason(ctx, module, subject)?)
-            .map(Some);
+        let reason = crate::terms::badmatch_reason_rooted(
+            machine,
+            ctx,
+            RootSet::ALL_LIVE,
+            module,
+            |m, slack| read_operand_slack(m, subject, slack),
+        )?;
+        return machine.throw_error(reason).map(Some);
     }
     Ok(Some(goto_label(labels, fail)?))
 }
@@ -365,8 +379,10 @@ pub(super) fn twos_complement_bits(bytes: &mut [u8], nbits: usize) {
 /// The magnitude is taken to be normalised (no leading zero digit); an empty
 /// `digits` is the value zero. `IS_USMALL` (`big.h:76`) decides between a small
 /// (`w <= MAX_SMALL`, or `<= MAX_SMALL + 1` when negative — exactly the range
-/// [`beam_term::try_make_small`] accepts) and a **bignum**.
+/// [`beam_term::try_make_small`] accepts) and a **bignum**, which is reserved
+/// **rooted** ([`raw::make_big`]).
 pub(super) fn make_int(
+    machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     negative: bool,
     digits: &[u64],
@@ -378,10 +394,10 @@ pub(super) fn make_int(
             let signed = if negative { -magnitude } else { magnitude };
             match beam_term::try_make_small(signed) {
                 Ok(t) => Ok(t),
-                Err(_) => raw::make_big(ctx, negative, digits),
+                Err(_) => raw::make_big(machine, ctx, negative, digits),
             }
         }
-        _ => raw::make_big(ctx, negative, digits),
+        _ => raw::make_big(machine, ctx, negative, digits),
     }
 }
 

@@ -33,7 +33,7 @@
 //! * the ranges are never fabricated — every `start` is an address
 //!   [`beam_engine::jit::baseline::CompiledModule::entry`] returns for that block, lies
 //!   inside `code_address_range()` of the *same artifact*, and carries a non-empty
-//!   `<module>:<function>/<pc>` name;
+//!   `<module>:<function>/<arity>/<pc>` name;
 //! * the regions are ascending, disjoint and contiguous, so a consumer can hand them
 //!   straight to a profiler;
 //! * an artifact that compiled **no** block reports an **empty** map rather than an

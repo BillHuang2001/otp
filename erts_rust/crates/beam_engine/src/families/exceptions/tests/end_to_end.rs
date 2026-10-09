@@ -21,6 +21,14 @@
 //! End-to-end synthetic sequences: `try` → `case_end` → `try_case` → `return`,
 //! and nested handlers with a re-raise.
 use super::*;
+
+// The production builders take the `Machine` plus a reader closure so a moving
+// collector can relocate operands between the reserve and the read; these tests
+// build from already-materialized terms against a non-collecting arena, so alias
+// `terms` to the test-only wrappers that keep the old ergonomic arity. (An explicit
+// import shadows the glob-imported `terms` above.)
+use crate::terms::test_support as terms;
+
 // ------------------------------------------------------------------
 // End-to-end synthetic sequence: try → case_end → try_case → return
 // ------------------------------------------------------------------

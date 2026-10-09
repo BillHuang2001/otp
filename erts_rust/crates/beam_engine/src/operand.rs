@@ -35,6 +35,7 @@ use crate::context::ExecutionContext;
 use crate::error;
 use crate::machine::Machine;
 use crate::terms;
+use crate::terms::Slack;
 
 /// Evaluate a `.beam` operand to a term in the current machine state.
 ///
@@ -65,13 +66,13 @@ pub(crate) fn read_operand(
 ) -> Result<Eterm> {
     match operand {
         Operand::X(n) => machine.x(*n).ok_or_else(|| error::bad_register(*n)),
-        Operand::Integer(i) => terms::make_integer(ctx, *i),
+        Operand::Integer(i) => terms::make_integer_unrooted(ctx, *i),
         Operand::Nil => Ok(NIL),
         Operand::Y(n) => machine.y(*n).ok_or_else(|| error::bad_register(*n)),
         Operand::Atom(a) => Ok(make_atom(*a)),
         Operand::FloatReg(n) => machine.get_fr(*n).ok_or_else(|| error::bad_register(*n)),
         Operand::Typed { reg, .. } => read_register(machine, *reg),
-        Operand::Character(c) => terms::make_integer(ctx, i64::from(*c)),
+        Operand::Character(c) => terms::make_integer_unrooted(ctx, i64::from(*c)),
         // The module's decoded `LitT` literal at `idx`, bound to the machine for
         // the duration of the run. A missing/out-of-range index is a structural
         // error (the code references a literal the module does not define), never
@@ -79,6 +80,92 @@ pub(crate) fn read_operand(
         Operand::Literal(idx) => machine
             .literal(*idx)
             .ok_or_else(|| error::unsupported("operand: literal")),
+        other => Err(error::unsupported(operand_kind(other))),
+    }
+}
+
+/// BEAM-heap words a `read_operand` of `operand` would need beyond its container:
+/// `beam_term::big_size_words(1)` for a non-small `Operand::Integer`/`Character`,
+/// else 0.
+///
+/// Every other operand kind is a pure machine read (a register/Y-slot load, an
+/// immediate, or a literal-area lookup) and needs no heap words at all. Builders add
+/// this to their reserved block's spare **tail** so a non-small integer operand is
+/// materialized there instead of through a second (collecting) allocation — see
+/// [`crate::terms::Slack`].
+pub(crate) fn operand_slack_words(operand: &Operand) -> usize {
+    match operand {
+        Operand::Integer(i) if !is_small_int(*i) => beam_term::big_size_words(1),
+        Operand::Character(c) if !is_small_int(i64::from(*c)) => beam_term::big_size_words(1),
+        _ => 0,
+    }
+}
+
+/// Whether `value` fits the 60-bit small-integer immediate range.
+fn is_small_int(value: i64) -> bool {
+    (beam_term::MIN_SMALL..=beam_term::MAX_SMALL).contains(&value)
+}
+
+/// Read `operand` **without allocating from the BEAM heap**: a non-small
+/// `Operand::Integer`/`Character` is written into `slack`; every other kind is a pure
+/// machine read.
+///
+/// This is the read half of the frozen **reserve, then read, then write** ordering
+/// ([`crate::terms`]): a builder reserves its block (one rooted allocation, which a
+/// moving collector may run under) and only then reads its operands through this
+/// function, so the terms it captures are the machine's post-collection ones. The
+/// closure must size its block's tail with [`operand_slack_words`] for every operand
+/// it reads here that could be a non-small integer.
+///
+/// A too-small slack is the typed [`crate::error::unsupported`] from
+/// [`Slack::integer`] — never a wrong term.
+#[inline]
+pub(crate) fn read_operand_slack(
+    machine: &Machine,
+    operand: &Operand,
+    slack: &mut Slack,
+) -> Result<Eterm> {
+    match operand {
+        Operand::Integer(i) => slack.integer(*i),
+        Operand::Character(c) => slack.integer(i64::from(*c)),
+        // Every other kind is a pure read (no allocation), so it shares the
+        // `read_operand` arms. A register/immediate/literal operand never needs the
+        // slack.
+        other => read_operand_pure(machine, other),
+    }
+}
+
+/// Read a slice of operands through [`read_operand_slack`] — the builder-closure
+/// helper call sites use.
+#[inline]
+pub(crate) fn read_operands_slack(
+    machine: &Machine,
+    operands: &[Operand],
+    slack: &mut Slack,
+) -> Result<Vec<Eterm>> {
+    operands
+        .iter()
+        .map(|operand| read_operand_slack(machine, operand, slack))
+        .collect()
+}
+
+/// The non-allocating arms of [`read_operand`] (everything but a non-small integer
+/// immediate), shared by [`read_operand_slack`].
+#[inline]
+fn read_operand_pure(machine: &Machine, operand: &Operand) -> Result<Eterm> {
+    match operand {
+        Operand::X(n) => machine.x(*n).ok_or_else(|| error::bad_register(*n)),
+        Operand::Nil => Ok(NIL),
+        Operand::Y(n) => machine.y(*n).ok_or_else(|| error::bad_register(*n)),
+        Operand::Atom(a) => Ok(make_atom(*a)),
+        Operand::FloatReg(n) => machine.get_fr(*n).ok_or_else(|| error::bad_register(*n)),
+        Operand::Typed { reg, .. } => read_register(machine, *reg),
+        Operand::Literal(idx) => machine
+            .literal(*idx)
+            .ok_or_else(|| error::unsupported("operand: literal")),
+        Operand::Integer(_) | Operand::Character(_) => {
+            Err(error::unsupported("operand: integer needs slack"))
+        }
         other => Err(error::unsupported(operand_kind(other))),
     }
 }

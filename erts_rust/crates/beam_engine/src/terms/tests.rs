@@ -22,11 +22,20 @@
 //! assertions against stack buffers (allowed here — this is the SAFETY
 //! module) and the wrong-type / limit error cases.
 use super::*;
+// The production builders take the `Machine` plus a reader closure so a moving
+// collector can relocate operands between the reserve and the read; these tests
+// build from already-materialized terms against a non-collecting arena, so they use
+// the `test_support` wrappers that keep the old ergonomic arity. An explicit import
+// shadows the glob one above, which still supplies the readers and the constants.
+use super::test_support::{
+    badmatch_reason, make_cons, make_flatmap, make_float, make_fun, make_heap_binary,
+    make_integer, make_list, make_tuple,
+};
 use crate::context::MinimalContext;
+use crate::machine::Machine;
 use beam_common::{BeamError, Result};
 use beam_loader::Module;
 use beam_term::{make_atom, make_small, Eterm, MAX_SMALL, MIN_SMALL, NIL};
-
 fn ctx() -> MinimalContext {
     MinimalContext::new()
 }
@@ -614,4 +623,64 @@ fn heap_binary_over_the_limit_is_unsupported() {
 fn binary_bytes_rejects_non_binaries() {
     assert_bad_arg(binary_bytes(make_small(1)));
     assert_bad_arg(binary_bytes(NIL));
+}
+
+// -- the node sink (carving a multi-node graph out of ONE reservation) -----
+
+/// `[{1,11},{2,22}]` carved out of a **single** reserved region: every node (the two
+/// pair tuples and the two list cells) must come out of that one block, which is what
+/// keeps a multi-node build alive under a moving collector.
+#[test]
+fn slack_carves_a_multi_node_graph_out_of_one_reservation() {
+    let mut c = ctx();
+    let mut machine = Machine::new();
+    // `{1,11}` + `{2,22}` = 3 + 3 words, the list of two = 4 words.
+    let mut slack = reserve_slack(&mut machine, &mut c, 3 + 3 + 4).unwrap();
+
+    let pair_a = slack.tuple(&[make_small(1), make_small(11)]).unwrap();
+    let pair_b = slack.tuple(&[make_small(2), make_small(22)]).unwrap();
+    let list = slack.list(&[pair_a, pair_b]).unwrap();
+
+    // Every word of the reservation was consumed exactly once.
+    assert_eq!(slack.remaining(), 0);
+    let elems = list_elements(list).unwrap();
+    assert_eq!(elems.len(), 2);
+    assert_eq!(tuple_element(elems[0], 0).unwrap(), make_small(1));
+    assert_eq!(tuple_element(elems[0], 1).unwrap(), make_small(11));
+    assert_eq!(tuple_element(elems[1], 0).unwrap(), make_small(2));
+    assert_eq!(tuple_element(elems[1], 1).unwrap(), make_small(22));
+}
+
+#[test]
+fn a_carve_region_too_small_for_a_node_is_a_typed_error() {
+    let mut c = ctx();
+    let mut machine = Machine::new();
+    // Room for two words only: the 3-word `{1,1}` tuple cannot fit.
+    let mut slack = reserve_slack(&mut machine, &mut c, 2).unwrap();
+    let err = slack.tuple(&[make_small(1), make_small(1)]).unwrap_err();
+    assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
+    // The failed carve must not have consumed anything.
+    assert_eq!(slack.remaining(), 2);
+    // A 2-word cons-shaped list is still buildable (`2 * 1` cells).
+    let one = slack.list(&[make_small(9)]).unwrap();
+    assert_eq!(list_elements(one).unwrap(), vec![make_small(9)]);
+    assert_eq!(slack.remaining(), 0);
+}
+
+/// The **unrooted** sink: one `alloc_words` per node, sharing the exact layout of the
+/// carve writers (an empty list is [`NIL`](beam_term::NIL) and allocates nothing).
+#[test]
+fn context_sink_builds_each_node_with_alloc_words() {
+    let mut c = ctx();
+    let mut sink = ContextSink::new(&mut c);
+
+    let t = sink
+        .tuple(&[make_small(1), make_small(2), make_small(3)])
+        .unwrap();
+    assert_eq!(tuple_arity(t).unwrap(), 3);
+    assert_eq!(tuple_element(t, 2).unwrap(), make_small(3));
+
+    let l = sink.list(&[make_small(4), make_small(5)]).unwrap();
+    assert_eq!(list_elements(l).unwrap(), vec![make_small(4), make_small(5)]);
+    assert_eq!(sink.list(&[]).unwrap(), NIL);
 }

@@ -57,7 +57,7 @@ pub(crate) fn skip_utf(
             raw::set_ctx_start(term, start + len);
             Ok(Some(Step::Next))
         }
-        None => fail_step(machine, module, labels, fail, term, ctx),
+        None => fail_step(machine, module, labels, fail, ctx_op, ctx),
     }
 }
 /// Extract an integer field of `nbits` bits at bit `start`, honouring the
@@ -78,6 +78,7 @@ pub(crate) fn skip_utf(
 /// field of 9 or more bits (C has no small fast path for those), can therefore
 /// exceed `MAX_SMALL` and must build a bignum.
 pub(crate) fn read_integer_field(
+    machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     bytes: &[u8],
     start: usize,
@@ -92,7 +93,7 @@ pub(crate) fn read_integer_field(
     // standard compiler emits (`<<Y:12/little>>`, `<<Y:20/little>>`, …).
     let le_fast_path = nbits % 8 == 0 && start % 8 == 0;
     if nbits > 64 || (little && !le_fast_path) {
-        return read_wide_integer_field(ctx, bytes, start, nbits, flags);
+        return read_wide_integer_field(machine, ctx, bytes, start, nbits, flags);
     }
     let raw_value = if little {
         read_uint_le(bytes, start, nbits)?
@@ -109,7 +110,7 @@ pub(crate) fn read_integer_field(
     } else {
         (false, raw_value)
     };
-    make_int(ctx, negative, &[magnitude])
+    make_int(machine, ctx, negative, &[magnitude])
 }
 /// Read an integer field **wider than 64 bits** and build the (possibly bignum)
 /// term, reproducing `erts_bs_get_integer_2` beyond its small-integer special
@@ -128,6 +129,7 @@ pub(crate) fn read_integer_field(
 /// (`MAYBE_SIGN_EXTEND`); the leading-zero normalisation is
 /// [`le_bytes_to_digits`], and `IS_USMALL` is [`make_int`].
 pub(crate) fn read_wide_integer_field(
+    machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     bytes: &[u8],
     start: usize,
@@ -160,7 +162,7 @@ pub(crate) fn read_wide_integer_field(
         twos_complement_bits(&mut value, nbits);
     }
     let digits = le_bytes_to_digits(&value);
-    make_int(ctx, negative, &digits)
+    make_int(machine, ctx, negative, &digits)
 }
 // ---------------------------------------------------------------------------
 // Bit-level helpers (a *bit* offset, not necessarily byte-aligned)

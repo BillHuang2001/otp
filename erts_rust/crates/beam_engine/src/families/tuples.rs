@@ -57,9 +57,11 @@ use crate::interpreter::LabelMap;
 use beam_common::Result;
 use beam_loader::{Instr, Module, Operand, NO_FAIL};
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::machine::Machine;
-use crate::operand::{read_operand, write_operand};
+use crate::operand::{
+    operand_slack_words, read_operand, read_operand_slack, read_operands_slack, write_operand,
+};
 use crate::terms;
 use crate::Step;
 
@@ -79,11 +81,14 @@ pub(crate) fn exec(
     let _ = (func, pc);
     match instr {
         Instr::PutTuple2 { dst, elements } => {
-            let mut elems = Vec::with_capacity(elements.len());
-            for operand in elements {
-                elems.push(read_operand(machine, ctx, operand)?);
-            }
-            let tuple = terms::make_tuple(ctx, &elems)?;
+            // Reserve first (one rooted allocation a moving collector may run under),
+            // then read every element operand from the post-collection machine state.
+            let n = elements.len();
+            let extra: usize = elements.iter().map(operand_slack_words).sum();
+            let tuple =
+                terms::make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, n, extra, |m, slack| {
+                    read_operands_slack(m, elements, slack)
+                })?;
             write_operand(machine, dst, tuple)?;
             Ok(Some(Step::Next))
         }
@@ -100,10 +105,18 @@ pub(crate) fn exec(
                     write_operand(machine, dst, elem)?;
                     Ok(Some(Step::Next))
                 }
-                // Not a tuple, or the element index is out of range.
-                _ => machine
-                    .throw_error(terms::badmatch_reason(ctx, module, value)?)
-                    .map(Some),
+                // Not a tuple, or the element index is out of range. The reason's
+                // value is re-read from `source` after the reason block's reserve.
+                _ => {
+                    let reason = terms::badmatch_reason_rooted(
+                        machine,
+                        ctx,
+                        RootSet::ALL_LIVE,
+                        module,
+                        |m, s| read_operand_slack(m, source, s),
+                    )?;
+                    machine.throw_error(reason).map(Some)
+                }
             }
         }
 
@@ -134,9 +147,14 @@ pub(crate) fn exec(
             let label = match target {
                 Some(label) => label,
                 None if *fail == NO_FAIL => {
-                    return machine
-                        .throw_error(terms::badmatch_reason(ctx, module, value)?)
-                        .map(Some);
+                    let reason = terms::badmatch_reason_rooted(
+                        machine,
+                        ctx,
+                        RootSet::ALL_LIVE,
+                        module,
+                        |m, s| read_operand_slack(m, tuple, s),
+                    )?;
+                    return machine.throw_error(reason).map(Some);
                 }
                 None => *fail,
             };

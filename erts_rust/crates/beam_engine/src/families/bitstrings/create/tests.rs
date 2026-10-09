@@ -257,7 +257,7 @@ fn segment_size_distinguishes_positive_and_negative_bignums() {
     //   X = <<1:4>>, <<X:(-(1 bsl 59))/binary>>   ⇒ {error,badarg}
     // 2^59 = MAX_SMALL + 1, so both sizes are bignums.
     let mut ctx = MinimalContext::new();
-    let positive = crate::terms::make_integer(&mut ctx, 1i64 << 59).expect("bignum");
+    let positive = crate::terms::test_support::make_integer(&mut ctx, 1i64 << 59).expect("bignum");
     assert!(
         !beam_term::is_small(positive),
         "the fixture must exercise the bignum arm"
@@ -266,7 +266,7 @@ fn segment_size_distinguishes_positive_and_negative_bignums() {
         size_of(&mut ctx, positive),
         SegSize::Fail(SegReason::SystemLimit)
     );
-    let negative = crate::terms::make_integer(&mut ctx, -(1i64 << 59)).expect("bignum");
+    let negative = crate::terms::test_support::make_integer(&mut ctx, -(1i64 << 59)).expect("bignum");
     assert_eq!(
         size_of(&mut ctx, negative),
         SegSize::Fail(SegReason::BadArg)

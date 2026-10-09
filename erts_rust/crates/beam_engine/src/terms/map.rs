@@ -21,11 +21,17 @@
 //! The map writer/reader: the flat-map builder [`make_flatmap`] and the general
 //! [`make_map`] (flat ≤ 32 keys, else a hashmap), plus the frozen-layout readers
 //! [`map_entries`]/[`is_hashmap`] that walk both representations.
+//!
+//! The classic [`make_flatmap`]/[`make_map`] take their already-read pairs and
+//! allocate through the plain [`ExecutionContext::alloc_words`]; their `*_rooted`
+//! twins reserve the block **before** a reader closure supplies the pairs, so a
+//! moving collector may relocate the operands in between ([`super::slack`]).
 use beam_common::{BeamError, Result};
 use beam_term::{thing, AtomTable, Eterm};
 
-use super::{HAMT_ARRAY_SLOTS, HAMT_HEAD_ITEM_OFFSET, HAMT_NODE_ITEM_OFFSET, MAP_SMALL_MAP_LIMIT};
+use super::{reserve, Slack, HAMT_ARRAY_SLOTS, HAMT_HEAD_ITEM_OFFSET, HAMT_NODE_ITEM_OFFSET, MAP_SMALL_MAP_LIMIT};
 use crate::context::ExecutionContext;
+use crate::machine::Machine;
 
 /// Builds a small *flat* map term from `pairs` (insertion order preserved).
 ///
@@ -76,6 +82,106 @@ pub fn make_map(
     // map), the precondition its own `# Safety` section documents. The returned
     // term borrows the arena storage the context keeps live.
     let map = unsafe { beam_term::map::write_map(hp, pairs, atoms) }?;
+    Ok(map)
+}
+
+/// The **rooted** twin of [`make_flatmap`]: builds a small *flat* map term from the
+/// `capacity_pairs` pairs the `read` closure supplies (insertion order preserved).
+///
+/// The `[arityval(n), k0 … k(n-1), head, n, keys, v0 … v(n-1)]` layout is written
+/// by [`beam_term::thing::write_flatmap`]. The block is reserved **rooted** for
+/// `flatmap_size_words(capacity_pairs) + extra` words and the closure is then invoked
+/// (so the pairs are read from the machine's post-collection state); it may hold at
+/// most `capacity_pairs` pairs. Duplicate keys are not detected here (that needs term
+/// comparison).
+///
+/// This is the *flat-layout-only* builder: more than `MAP_SMALL_MAP_LIMIT` (32)
+/// pairs would need a **hashmap**, so it is rejected with
+/// [`crate::error::unsupported`] rather than writing a wrong term. Use
+/// [`make_map_rooted`] for the general builder, which selects the layout (flat ≤ 32
+/// pairs, hashmap above) as the oracle does.
+pub fn make_flatmap_rooted<R>(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    live: u32,
+    capacity_pairs: usize,
+    extra: usize,
+    read: R,
+) -> Result<Eterm>
+where
+    R: FnOnce(&Machine, &mut Slack) -> Result<Vec<(Eterm, Eterm)>>,
+{
+    let n = capacity_pairs;
+    if n > MAP_SMALL_MAP_LIMIT {
+        return Err(crate::error::unsupported("map > 32 pairs (use make_map)"));
+    }
+    let hp = reserve(machine, ctx, thing::flatmap_size_words(n) + extra, live)?;
+    // SAFETY: the reserve returned `flatmap_size_words(n) + extra` exclusively-owned,
+    // writable words; the `extra`-word tail after the map words is the slack.
+    let mut slack = unsafe { Slack::new(hp.add(thing::flatmap_size_words(n)), extra) };
+    let pairs = read(machine, &mut slack)?;
+    if pairs.len() > n {
+        return Err(crate::error::unsupported(
+            "make_flatmap: pair count exceeds the reserved capacity",
+        ));
+    }
+    // SAFETY: the reserve returned `flatmap_size_words(n)` writable map words with
+    // `n <= MAP_SMALL_MAP_LIMIT` and the closure returned `<= n` pairs, the
+    // preconditions `write_flatmap` documents.
+    Ok(unsafe { thing::write_flatmap(hp, &pairs) })
+}
+
+/// The **rooted** twin of [`make_map`]: builds a map term from the `capacity_pairs`
+/// pairs the `read` closure supplies, choosing the frozen layout by size — the
+/// general map builder (`put_map_assoc` / `put_map_exact`).
+///
+/// Delegates to [`beam_term::map::write_map`], which reproduces
+/// `erts_map_from_ks_and_vs` / `erts_maps_put`: duplicate keys are collapsed
+/// **last value wins**, a map of at most `MAP_SMALL_MAP_LIMIT` (32) distinct keys
+/// is written as a **flat** map (keys in `erts_cmp_flatmap_keys` order) and a
+/// larger one as a **hash map** (HAMT), so a map grown past the flat-map limit by
+/// compiled code becomes a correct hashmap, exactly as the oracle builds it. The
+/// pair order returned by `read` is irrelevant.
+///
+/// The block is reserved **rooted** for
+/// [`beam_term::map::map_words_capacity`]`(capacity_pairs) + extra` words **before**
+/// the closure runs, so the pairs are read from the machine's post-collection state
+/// and a non-small integer operand is materialized into the spare tail (never a
+/// second collecting allocation that would strand the reserved block). `write_map`
+/// deduplicates its input and writes at most `map_words_capacity(pairs.len())`
+/// words, which the reservation covers because the closure must not exceed
+/// `capacity_pairs` pairs.
+pub fn make_map_rooted<R>(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    live: u32,
+    capacity_pairs: usize,
+    extra: usize,
+    atoms: &AtomTable,
+    read: R,
+) -> Result<Eterm>
+where
+    R: FnOnce(&Machine, &mut Slack) -> Result<Vec<(Eterm, Eterm)>>,
+{
+    let words = beam_term::map::map_words_capacity(capacity_pairs);
+    let hp = reserve(machine, ctx, words + extra, live)?;
+    // SAFETY: the reserve returned `map_words_capacity(capacity_pairs) + extra`
+    // exclusively-owned, writable words; the `extra`-word tail after the map words is
+    // the slack.
+    let mut slack = unsafe { Slack::new(hp.add(words), extra) };
+    let pairs = read(machine, &mut slack)?;
+    if pairs.len() > capacity_pairs {
+        return Err(crate::error::unsupported(
+            "make_map: pair count exceeds the reserved capacity",
+        ));
+    }
+    // SAFETY: the reserve returned `map_words_capacity(capacity_pairs)` writable map
+    // words. `write_map` writes every word of the produced map and never more than
+    // `map_words_capacity(pairs.len())` (deduplication can only shrink the map), which
+    // is `<= map_words_capacity(capacity_pairs)`, the precondition its own `# Safety`
+    // section documents. The returned term borrows the arena storage the context keeps
+    // live.
+    let map = unsafe { beam_term::map::write_map(hp, &pairs, atoms) }?;
     Ok(map)
 }
 

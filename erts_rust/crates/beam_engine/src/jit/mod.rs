@@ -86,6 +86,14 @@ use crate::context::ExecutionContext;
 use crate::{Machine, RunOutcome};
 
 pub mod baseline;
+/// The engine's interpreter-vs-native measurement harness and its workload set.
+///
+/// Public (not `#[cfg(test)]`) because the tier table is measured from **both** the
+/// in-crate unit tests (the Cranelift ABBA harness consumes its `support`) and the
+/// integration test `tests/jit_bench.rs`, which owns the `#[test]` entry points and
+/// drives [`bench::run_measurement_table`]/[`bench::assert_tier_agreement`]. Keeping
+/// one harness here is what stops the two from growing a copy each.
+pub mod bench;
 pub mod cache;
 #[cfg(feature = "jit-cranelift")]
 pub mod cranelift;

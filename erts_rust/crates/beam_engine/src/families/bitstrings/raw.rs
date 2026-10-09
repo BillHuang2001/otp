@@ -57,9 +57,10 @@ use beam_term::{
     boxed_val, Eterm, ERL_SUB_BITS_SIZE, HEADER_BIN_REF, HEADER_SUB_BITS,
 };
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::machine::Machine;
+use crate::terms::{reserve, Slack};
 
 /// `ERL_ONHEAP_BINARY_LIMIT` (`erl_bits.h:167`): the largest byte count a hardware
 /// *heap* binary holds; a larger result needs the off-heap ref-counted binary this
@@ -169,22 +170,49 @@ pub(super) fn ctx_parts(t: Eterm) -> Option<(Eterm, usize, usize)> {
     Some((orig, start, end))
 }
 
-/// Build a fresh match-context term over `orig` positioned at bit `start` with
-/// subject size `end` bits.
+/// The inner subject (`orig`, word 4) of a match-context term, or `None` when `t`
+/// is not one.
+///
+/// The readers that must *re-derive* the `orig` of a fresh subject (the
+/// `bs_start_match*` reuse path and the `bs_get_position` snapshot) use this after
+/// re-reading the context's operand, so the re-wrapped context keeps the inner
+/// subject the C `reuse` path keeps — never the outer context.
+pub(super) fn inner_orig(t: Eterm) -> Option<Eterm> {
+    ctx_parts(t).map(|(orig, _, _)| orig)
+}
+
+/// Build a fresh match-context term positioned at bit `start` with subject size
+/// `end` bits, over the `orig` the `read` closure returns.
 ///
 /// The five words are `ERL_SUB_BITS_SIZE` (`erl_bits.h:128`), matching the C
 /// `HEADER_SUB_BITS` block layout exactly; `base_flags` stays 0 (see the module
-/// docs). The pointer is valid until the next `ensure_heap` (GC).
-pub(super) fn make_ctx(
+/// docs). The block is reserved **rooted** first — one collecting allocation a
+/// moving collector may run under — and only then does `read` supply the context's
+/// `orig` from the machine's *post-collection* state, so the stored `orig` is never
+/// a stale copy (the frozen **reserve, then read, then write** ordering,
+/// [`crate::terms`]). `extra` words of spare tail are handed to the reader for a
+/// bignum operand.
+pub(super) fn make_ctx<R>(
+    machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
-    orig: Eterm,
     start: usize,
     end: usize,
-) -> Result<Eterm> {
-    let hp = ctx.alloc_words(ERL_SUB_BITS_SIZE)?;
-    // SAFETY: `alloc_words` returned exactly `ERL_SUB_BITS_SIZE` (5)
-    // exclusively-owned, writable words; every write below is in bounds and the
-    // header is written before the block is turned into a term.
+    extra: usize,
+    read: R,
+) -> Result<Eterm>
+where
+    R: FnOnce(&Machine, &mut Slack) -> Result<Eterm>,
+{
+    let hp = reserve(machine, ctx, ERL_SUB_BITS_SIZE + extra, RootSet::ALL_LIVE)?;
+    // SAFETY: the rooted reserve returned `ERL_SUB_BITS_SIZE + extra`
+    // exclusively-owned, writable words; the `extra`-word tail at
+    // `hp + ERL_SUB_BITS_SIZE` is exactly what the slack hands the reader (it is not
+    // aliased by the machine).
+    let mut slack = unsafe { Slack::new(hp.add(ERL_SUB_BITS_SIZE), extra) };
+    let orig = read(machine, &mut slack)?;
+    // SAFETY: the reserve block is live and exclusively owned; every word is written
+    // below (header, `base_flags`, `start`, `end`, `orig`) before the block is turned
+    // into a term.
     unsafe {
         *hp = HEADER_SUB_BITS;
         *hp.add(1) = Eterm::from_raw(0);
@@ -211,10 +239,12 @@ pub(super) fn set_ctx_start(t: Eterm, start: usize) {
 ///
 /// `digits` must be non-empty and normalised (no leading zero digit) — exactly the
 /// shape [`beam_term::write_big`] requires (`big.h:96-97`,
-/// `BIG_NEED_SIZE(n) = n + 1`). The block is allocated through the
-/// [`ExecutionContext`] (`alloc_words`), so the term stays valid until the next
-/// `ensure_heap`/GC.
+/// `BIG_NEED_SIZE(n) = n + 1`). The block is reserved through the **rooted** seam
+/// ([`crate::terms::reserve`] → `Machine::alloc_rooted`), so a host with a moving
+/// collector may relocate the machine's root set as part of this allocation; the
+/// term is then valid until the next collecting allocation.
 pub(super) fn make_big(
+    machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     negative: bool,
     digits: &[u64],
@@ -224,8 +254,13 @@ pub(super) fn make_big(
         // zero-width bignum would be a wrong result, so surface it.
         return Err(error::unsupported("bitstring: zero-width bignum"));
     }
-    let hp = ctx.alloc_words(beam_term::big_size_words(digits.len()))?;
-    // SAFETY: `alloc_words` returned exactly `big_size_words(n) = n + 1`
+    let hp = reserve(
+        machine,
+        ctx,
+        beam_term::big_size_words(digits.len()),
+        RootSet::ALL_LIVE,
+    )?;
+    // SAFETY: the rooted reserve returned exactly `big_size_words(n) = n + 1`
     // exclusively-owned, writable words — the block `write_big` requires and fully
     // writes (header + `n` `ErtsDigit`s, `big.h:68-73`). The context owns the arena
     // and keeps it alive for as long as the term is used.
@@ -256,6 +291,7 @@ pub(super) fn big_parts_safe(t: Eterm) -> Option<(bool, Vec<u64>)> {
 /// surplus is ignored). More than [`ERL_ONHEAP_BINARY_LIMIT`] bytes needs the
 /// off-heap representation and yields [`crate::error::unsupported`].
 pub(super) fn make_bits(
+    machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     bytes: &[u8],
     nbits: usize,
@@ -269,10 +305,12 @@ pub(super) fn make_bits(
         return Err(error::unsupported("bitstring: short byte buffer"));
     }
     let num_words = HEAP_BITS_HEAD_WORDS + num_bytes.div_ceil(WORD_BYTES);
-    let hp = ctx.alloc_words(num_words)?;
-    // SAFETY: `alloc_words` returned `2 + ceil(num_bytes / word_bytes)`
+    let hp = reserve(machine, ctx, num_words, RootSet::ALL_LIVE)?;
+    // SAFETY: the rooted reserve returned `2 + ceil(num_bytes / word_bytes)`
     // exclusively-owned, writable words. Word 0 takes the heap-bits header, word 1
     // the bit count, and the data region at word 2 has room for `num_bytes` bytes.
+    // (`bytes` is a Rust-owned buffer — never a live term's storage — so the reserve
+    // cannot invalidate it.)
     unsafe {
         *hp = beam_term::make_header(num_words - 1, beam_term::HEAP_BITS_SUBTAG);
         *hp.add(1) = Eterm::from_raw(nbits);
@@ -312,7 +350,7 @@ pub(super) fn make_binary(
 ) -> Result<Eterm> {
     let num_bytes = nbits.div_ceil(8);
     if num_bytes <= ERL_ONHEAP_BINARY_LIMIT {
-        return make_bits(ctx, bytes, nbits);
+        return make_bits(machine, ctx, bytes, nbits);
     }
     if bytes.len() < num_bytes {
         // An internal invariant: every caller passes a buffer covering `nbits`.
@@ -323,9 +361,19 @@ pub(super) fn make_binary(
         let keep = nbits % 8;
         payload[num_bytes - 1] &= 0xFFu8 << (8 - keep);
     }
-    let hp = ctx.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)?;
+    // Reserve the 8-word `[BinRef][ErlSubBits]` pair **rooted** first — the single
+    // collecting allocation of this build may relocate the machine's root set — and
+    // only then allocate the off-heap payload and write the pair. The payload is
+    // `beam_alloc`'s and is never moved by a collection, so the pre-reserve pointer
+    // hazard the frozen ordering guards against cannot arise here.
+    let hp = reserve(
+        machine,
+        ctx,
+        beam_term::refc::ERL_REFC_BITS_SIZE,
+        RootSet::ALL_LIVE,
+    )?;
     let data = machine.alloc_refc_binary(&payload)?;
-    // SAFETY: `alloc_words` returned exactly `ERL_REFC_BITS_SIZE` (8)
+    // SAFETY: the rooted reserve returned exactly `ERL_REFC_BITS_SIZE` (8)
     // exclusively-owned words — the `[BinRef][ErlSubBits]` pair `write_refc_binary`
     // fully writes — and `data` points at the first byte of a live off-heap payload
     // the machine keeps alive (and unmoved) for at least as long as the term is
@@ -352,12 +400,21 @@ pub(super) fn make_binary(
 /// reproduces the observable part exactly: a 0-bit refc binary over a
 /// `capacity`-byte payload, which the first `bs_create_bin` `append`/`private_append`
 /// segment then extends.
+///
+/// The 8-word `[BinRef][ErlSubBits]` pair is reserved **rooted** first, then the
+/// off-heap payload is allocated and the pair written (the frozen
+/// reserve-then-write ordering; the payload is off-heap and never moves).
 pub(super) fn make_writable(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     capacity: usize,
 ) -> Result<Eterm> {
-    let hp = ctx.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)?;
+    let hp = reserve(
+        machine,
+        ctx,
+        beam_term::refc::ERL_REFC_BITS_SIZE,
+        RootSet::ALL_LIVE,
+    )?;
     let data = machine.alloc_refc_binary(&vec![0u8; capacity])?;
     // SAFETY: as `make_binary` — 8 exclusively-owned words for the pair, a live
     // `UNIT_SIZE`-aligned off-heap payload owned by `machine`, and a 0-bit window

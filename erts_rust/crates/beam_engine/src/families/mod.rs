@@ -27,19 +27,16 @@
 //! to the one family that owns it (family ownership is disjoint — see the list
 //! below); an instruction **no** family owns — including the families' own
 //! not-yet-implemented variants, which are stubs returning `Ok(None)` — yields the
-//! same documented `unsupported` error the interpreter emitted before this seam
-//! existed, with the unclaimed instruction's `ops.tab` spelling appended so the
-//! gap is diagnosable ([`instr_name`]).
+//! documented `unsupported` error, with the unclaimed instruction's `ops.tab`
+//! spelling appended so the gap is diagnosable ([`instr_name`]).
 //!
-//! The routing `match` compiles to a jump table on the [`Instr`] discriminant, so
-//! a dispatched instruction hands control **straight** to its owning family. It
-//! replaced the original implementation, which *probed every family in order*
-//! (tuples → records → lists → …) and returned the first `Ok(Some(..))`: that was
-//! pure overhead on the hot path — the most frequent dispatched instruction,
-//! `get_list`, paid two *failing* family probes (`tuples::exec`, `records::exec`)
-//! before its real owner `lists::exec`. Disjoint ownership is what makes the
-//! re-route semantically identical: no instruction was ever claimed by a family
-//! other than the one the ordering below names for it.
+//! Ownership being **disjoint** is what lets the routing `match` — a jump table on
+//! the [`Instr`] discriminant — hand a dispatched instruction **straight** to its
+//! owning family: no non-owning family is ever consulted, so a dispatched
+//! instruction costs one jump and the most heavily exercised one, `get_list`,
+//! lands in its real owner `lists::exec` on the first hop. Each variant is claimed
+//! by the single family the ordering below names for it, so the route is
+//! unambiguous.
 //!
 //! The point of the split is **edit locality**: a later agent implements a whole
 //! instruction family inside its own file (e.g. `tuples.rs`) and never has to
@@ -61,8 +58,8 @@
 //!
 //! Variants owned by **no** family (`Bif0`/`Bif`, `Jump`, `InitYregs`,
 //! the debug-line opcodes) fall to the routing `match`'s last arm, so [`dispatch`]
-//! reports them as unsupported exactly as before — naming the instruction when
-//! [`instr_name`] knows its `ops.tab` spelling.
+//! reports them as unsupported, naming the instruction when [`instr_name`] knows
+//! its `ops.tab` spelling.
 //! (`NifStart`/`OnLoad` never reach [`dispatch`]: the interpreter executes them
 //! as no-ops in its metadata arm, and the residual `Instr::Generic` opcodes are
 //! handled by `crate::generic` before the catch-all arm too.)

@@ -556,8 +556,8 @@ fn cross_module_throw_lands_in_the_callers_catch_seam() {
 #[test]
 fn cross_module_function_clause_lands_in_the_callers_catch_seam() {
     // `c:fc/0`'s failed head clause raises `function_clause` from the callee's own
-    // `func_info` (a `throw_with_stacktrace` raise, not a BIF failure) — the
-    // cross-module path that already worked must keep working.
+    // `func_info` — an engine raise, not a BIF failure (an uncaught one's frames are
+    // attached by `Machine::with_uncaught_frames` via `Machine::raise_stacktrace`).
     let (caller, run) = caller_module("c", "fc", 0, Handler::Reason);
     let mut ctx = CatchCtx::new(callees(), raising_bif());
     let mut machine = Machine::new();

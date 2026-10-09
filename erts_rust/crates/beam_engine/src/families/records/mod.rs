@@ -123,9 +123,11 @@
 //!   place, so the result is always a fresh copy (as for
 //!   [`Instr::UpdateRecord`]).
 //! - `live` is carried by the update/create instructions (the C uses it to root the
-//!   operands across the GC it may trigger); the engine's `alloc_words` seam takes
-//!   care of the heap and the whole X-register file plus the stack is the standing
-//!   root set, so the count is not consulted — the same stance
+//!   operands across the GC it may trigger); every record build here first reserves
+//!   its block through the **rooted** allocation seam
+//!   ([`crate::terms::reserve`] → `Machine::alloc_rooted`) with
+//!   [`RootSet::ALL_LIVE`], so the whole X-register file plus the stack and the FR
+//!   file are the standing root set and the count is not consulted — the same stance
 //!   [`Instr::UpdateRecord`] takes.
 //!
 //! # Failure model (never a panic, never a wrong result)
@@ -171,11 +173,11 @@ use beam_loader::{
 };
 use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::interpreter::resolve;
 use crate::machine::Machine;
-use crate::operand::{read_operand, write_operand};
+use crate::operand::{operand_slack_words, read_operand, read_operand_slack, write_operand};
 use crate::predicates;
 use crate::terms;
 use crate::Step;
@@ -208,33 +210,67 @@ pub(crate) fn exec(
                 dst,
                 updates,
             } = &**b;
-            let source = read_operand(machine, ctx, src)?;
-            let arity = terms::tuple_arity(source)
-                .map_err(|_| error::unsupported("update_record: non-tuple source"))?;
-            if arity != *size as usize {
-                return Err(error::unsupported("update_record: size/arity mismatch"));
-            }
-
-            // Copy the source tuple first (arities may exceed a fixed-size array,
-            // and this is the one place the family reads raw element slots).
-            let mut elements = Vec::with_capacity(arity);
-            for index in 0..arity {
-                elements.push(terms::tuple_element(source, index)?);
-            }
-
-            for (offset, value) in updates {
-                let offset = match offset {
-                    Operand::Integer(offset) => *offset,
-                    _ => return Err(error::unsupported("update_record: non-integer index")),
-                };
-                // `Offset` is 1-based: element `Offset - 1` of the tuple.
-                if offset < 1 || offset as usize > arity {
-                    return Err(error::unsupported("update_record: index out of range"));
+            // The declared arity sizes the reserved block; the source tuple is read
+            // *after* the (possibly collecting) reserve, from the machine's
+            // post-collection state, so no `Eterm` copy is ever held across it.
+            let arity = *size as usize;
+            let extra: usize = operand_slack_words(src)
+                + updates
+                    .iter()
+                    .map(|(_, value)| operand_slack_words(value))
+                    .sum::<usize>();
+            if arity == 0 {
+                // `terms::make_tuple` returns the shared zero-arity literal without
+                // invoking its reader, which would skip the source test the reader
+                // performs. A record tuple always carries its name tag, so the
+                // compiler never emits `update_record` for arity 0 — this keeps a
+                // malformed module a typed error instead of a silent `{}`.
+                let source = read_operand(machine, ctx, src)?;
+                if terms::tuple_arity(source)
+                    .map_err(|_| error::unsupported("update_record: non-tuple source"))?
+                    != 0
+                {
+                    return Err(error::unsupported("update_record: size/arity mismatch"));
                 }
-                elements[offset as usize - 1] = read_operand(machine, ctx, value)?;
+                write_operand(machine, dst, beam_term::tuple0())?;
+                return Ok(Some(Step::Next));
             }
 
-            let result = terms::make_tuple(ctx, &elements)?;
+            let result =
+                terms::make_tuple_rooted(machine, ctx, RootSet::ALL_LIVE, arity, extra, |m, slack| {
+                    let source = read_operand_slack(m, src, slack)?;
+                    let found = terms::tuple_arity(source)
+                        .map_err(|_| error::unsupported("update_record: non-tuple source"))?;
+                    if found != arity {
+                        return Err(error::unsupported("update_record: size/arity mismatch"));
+                    }
+
+                    // Copy the source tuple first (arities may exceed a fixed-size
+                    // array, and this is the one place the family reads raw element
+                    // slots). `src` is copied, never reused in place: M1 has no
+                    // destructive update (see the module docs).
+                    let mut elements = Vec::with_capacity(arity);
+                    for index in 0..arity {
+                        elements.push(terms::tuple_element(source, index)?);
+                    }
+
+                    for (offset, value) in updates {
+                        let offset = match offset {
+                            Operand::Integer(offset) => *offset,
+                            _ => {
+                                return Err(error::unsupported(
+                                    "update_record: non-integer index",
+                                ))
+                            }
+                        };
+                        // `Offset` is 1-based: element `Offset - 1` of the tuple.
+                        if offset < 1 || offset as usize > arity {
+                            return Err(error::unsupported("update_record: index out of range"));
+                        }
+                        elements[offset as usize - 1] = read_operand_slack(m, value, slack)?;
+                    }
+                    Ok(elements)
+                })?;
             write_operand(machine, dst, result)?;
             Ok(Some(Step::Next))
         }
@@ -661,15 +697,31 @@ fn create_native_record(
 
     // The update list in the ascending order `ops.tab:1648`'s `map_key_sort`
     // guarantees. Reading each field-name operand here (before any value operand)
-    // mirrors the C, which receives the field names as resolved `a` operands.
+    // mirrors the C, which receives the field names as resolved `a` operands. An
+    // atom operand is an *immediate* and `sorted` otherwise holds `&Operand`s into
+    // the module's decoded IR — neither is a machine-heap term, so this walk is
+    // collection-invariant and may run before the reservation below.
     let mut sorted: Vec<(Atom, &Operand)> = Vec::with_capacity(updates.len());
     for (field, value) in updates {
         sorted.push((read_atom(machine, ctx, field, instruction)?, value));
     }
     sorted.sort_by_key(|&(key, _)| key);
 
+    // **Reserve, then read, then write.** The construction block is reserved with
+    // ONE rooted allocation *before* any field value is read: `reserve` may run a
+    // moving collector, so an `Eterm` read into `values` before it would be a stale
+    // pointer afterwards. The block's size is fixed by the definition's field count
+    // (known above, before any value is read), so a single reservation suffices.
+    let hp = crate::terms::reserve(
+        machine,
+        ctx,
+        beam_term::record_block_words(fields.len()),
+        RootSet::ALL_LIVE,
+    )?;
+
     // `values[declaration index]` — the block is built in declaration order and
-    // `write_record` re-sorts it exactly as the C's `qsort` does.
+    // `write_record` re-sorts it exactly as the C's `qsort` does. Every update value
+    // is read from the machine's POST-collection state (i.e. after the reservation).
     let mut values: Vec<Eterm> = vec![NIL; fields.len()];
     let mut absent: Option<Atom> = None;
     let mut position = 0usize;
@@ -683,6 +735,10 @@ fn create_native_record(
             continue;
         }
         match field.default {
+            // A default is either an immediate or a term in the module's immutable
+            // literal area (`beam_loader::LiteralArea`, its own `beam_alloc::Heap`) —
+            // never on the process heap — so no collection relocates it and the value
+            // copied here is valid before or after the reservation.
             Some(value) => values[index] = value,
             None => {
                 // `if (is_value(res)) { p->fvalue = defp->keys[i]; … }`
@@ -691,9 +747,11 @@ fn create_native_record(
             }
         }
     }
-
     // `badfield` outranks `no_value` (`erl_record.c:331-337`): the entry that was
     // never consumed is `new_p`, which the walk above left at the first one.
+    // The failure reason is built by [`create_failure`], which takes its **own**
+    // rooted reservation — the block reserved above is simply abandoned (its pointer
+    // is not a root, and no term in it was published), never partially written.
     if position < sorted.len() {
         return create_failure(
             machine,
@@ -726,7 +784,10 @@ fn create_native_record(
         .zip(&values)
         .map(|(field, value)| (make_atom(field.name), *value))
         .collect();
-    let record = write_local_record(ctx, module, definition, &fields)?;
+    // `hp` is still valid: nothing has allocated from the BEAM heap since the
+    // reservation (every `read_operand` above is a pure machine read, save for a
+    // non-small integer operand's **unrooted** `alloc_words`, which never collects).
+    let record = write_local_record(module, definition, &fields, hp)?;
     write_operand(machine, dst, record)?;
     Ok(Step::Next)
 }
@@ -782,6 +843,12 @@ fn local_definition<'a>(
 /// never mentions it cannot name the reason, so a missing atom is a documented
 /// typed `error::unsupported` (never a substituted, wrong atom) — the same
 /// convention the maps family's `{badmap,_}`/`{badkey,_}` reasons follow.
+///
+/// The whole reason graph is laid out as **one** 9-word block reserved with a
+/// single rooted allocation ([`crate::terms::reserve`]) and carved by
+/// [`raw::write_create_failure_reason`]: three successive allocations would strand
+/// the earlier tuples under a moving collector, and the graph's elements are all
+/// immediates (atoms and `arityval` headers), so it needs no spare tail.
 fn create_failure(
     machine: &mut Machine,
     module: &Module,
@@ -796,14 +863,14 @@ fn create_failure(
     if fail != NO_FAIL {
         return fail_step(labels, fail, instruction);
     }
-    let owner = terms::make_tuple(ctx, &[make_atom(module.name), make_atom(definition.name)])?;
-    let value = terms::make_tuple(ctx, &[owner, make_atom(field)])?;
     let tag = module.atom_table.lookup(tag).ok_or_else(|| {
         error::unsupported(&format!(
             "{instruction}: create: no '{tag}' atom in the module"
         ))
     })?;
-    let reason = terms::make_tuple(ctx, &[make_atom(tag), value])?;
+    // `{Tag, {{Module, Name}, Field}}` in one reservation (see the doc above).
+    let reason =
+        raw::write_create_failure_reason(machine, ctx, module.name, definition.name, field, tag)?;
     if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }
@@ -811,10 +878,16 @@ fn create_failure(
 }
 
 /// Build a fresh native-record instance from the running module's record
-/// `definition` — the `erl_create_local_native_record` result.
+/// `definition` — the `erl_create_local_native_record` result — into the
+/// **already-reserved** construction block at `hp`.
 ///
 /// `fields` are the `(key atom term, value)` pairs in **declaration** order, the
-/// shape [`raw::write_record`] takes.
+/// shape [`raw::write_record`] takes. `hp` must point at
+/// [`beam_term::record_block_words`]`(fields.len())` exclusively-owned, writable
+/// words the caller reserved with one rooted allocation ([`crate::terms::reserve`]);
+/// taking `hp` rather than reserving here is what lets [`create_native_record`]
+/// reserve **before** it reads the field values (the frozen *reserve, then read, then
+/// write* ordering).
 ///
 /// The definition's cached hash is a word of the very block it describes, so the
 /// block is written once with a `0` placeholder to obtain a *valid* definition
@@ -825,13 +898,15 @@ fn create_failure(
 /// observable — `erlang:phash2/1` of a record mixes definition word 2
 /// (`beam_term::hashing::make_hash2`) — so it must never be a placeholder; it is
 /// computed by the bit-exact `beam_term::hashing::compute_record_definition_hash`.
+///
+/// `hp` stays valid across the second write because neither `raw::record_definition`
+/// nor `compute_record_definition_hash` allocates from the BEAM heap.
 fn write_local_record(
-    ctx: &mut dyn ExecutionContext,
     module: &Module,
     definition: &RecordDefinition,
     fields: &[(Eterm, Eterm)],
+    hp: *mut Eterm,
 ) -> Result<Eterm> {
-    let hp = ctx.alloc_words(beam_term::record_block_words(fields.len()))?;
     let (owner, name, exported) = (module.name, definition.name, definition.is_exported);
     // `hp` owns `record_block_words(fields.len())` exclusively-owned, writable words
     // and `fields` are the declaration-order `(key, value)` pairs `write_record`
@@ -880,8 +955,31 @@ fn update_native_record(
     updates: &[(Operand, Operand)],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
+    // A pure machine read (no allocation) that only *sizes* the reservation: the
+    // source's field count is metadata of the record's own definition.
+    let probe = read_operand(machine, ctx, src)?;
+    if !predicates::is_record(probe) {
+        return fail_step(labels, fail, instruction);
+    }
+    let count = raw::definition_field_count(record_definition(probe, instruction)?)?;
+
+    // **Reserve, then read, then write.** The construction block is reserved with ONE
+    // rooted allocation *before* any field value is read: `reserve` may run a moving
+    // collector, so the source record (`probe` above is only a copy, and it is dead
+    // once the collector relocates it) and every value derived from it must be read
+    // from the machine's POST-collection state below. The block's size is fixed by the
+    // source's field count, which is available before any value is read.
+    let hp = crate::terms::reserve(
+        machine,
+        ctx,
+        beam_term::record_block_words(count),
+        RootSet::ALL_LIVE,
+    )?;
+
     let source = read_operand(machine, ctx, src)?;
     if !predicates::is_record(source) {
+        // Unreachable — `probe` already tested this very term — but reported rather
+        // than dereferenced as a record.
         return fail_step(labels, fail, instruction);
     }
     let definition = record_definition(source, instruction)?;
@@ -898,7 +996,11 @@ fn update_native_record(
         values[index] = read_operand(machine, ctx, value)?;
     }
 
-    let result = write_record_instance(ctx, definition, &values, instruction)?;
+    // `hp` (and `definition`/`values`) are still valid: nothing has allocated from the
+    // BEAM heap since the reservation — the update reads are pure machine reads, save
+    // for a non-small integer operand's **unrooted** `alloc_words`, which never
+    // collects.
+    let result = write_record_instance(definition, &values, instruction, hp)?;
     write_operand(machine, dst, result)?;
     Ok(Step::Next)
 }
@@ -929,11 +1031,17 @@ fn record_definition(source: Eterm, instruction: &str) -> Result<Eterm> {
 /// frozen layout (and therefore `beam_term`'s readers, `beam_gc`'s sizing) is
 /// unchanged, and no `beam_term` writer exists for an instance alone (the layout is
 /// owned there; this family never re-derives it).
+///
+/// The construction block is passed in as `hp` ([`beam_term::record_block_words`]`(count)`
+/// exclusively-owned words): [`update_native_record`] reserves it with **one** rooted
+/// allocation **before** it reads the source, so this function must not allocate — it
+/// only reads `definition`'s metadata (which lives in the source's block) and writes
+/// `hp`.
 fn write_record_instance(
-    ctx: &mut dyn ExecutionContext,
     definition: Eterm,
     values: &[Eterm],
     instruction: &str,
+    hp: *mut Eterm,
 ) -> Result<Eterm> {
     let count = raw::definition_field_count(definition)?;
     if count != values.len() {
@@ -962,6 +1070,5 @@ fn write_record_instance(
         fields.push((key, value));
     }
 
-    let hp = ctx.alloc_words(beam_term::record_block_words(count))?;
     raw::write_record(hp, owner, name, is_exported, &fields, hash)
 }

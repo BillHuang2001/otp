@@ -47,7 +47,9 @@
 //! * [`update`] — `put_record` (its update path and the create form's typed
 //!   unsupported id cases) and `update_record_id`,
 //! * [`access`] — `is_record_accessible`,
-//! * [`field`] — `get_record_field`.
+//! * [`field`] — `get_record_field`,
+//! * [`rooted`] — the two build paths driven under the mock **moving** collector
+//!   (the rooted-allocation reroute's regression proof).
 //!
 //! This file owns the fixtures/helpers those submodules share and the
 //! family-membership test.
@@ -64,6 +66,7 @@ mod access;
 mod elements;
 mod field;
 mod native;
+mod rooted;
 mod update;
 
 // ---------------------------------------------------------------------------
@@ -108,8 +111,7 @@ fn record(
     fields: &[(Atom, Eterm)],
 ) -> Eterm {
     let fields: Vec<(Eterm, Eterm)> = fields.iter().map(|(k, v)| (make_atom(*k), *v)).collect();
-    let hp = ctx
-        .alloc_words(beam_term::record_block_words(fields.len()))
+    let hp = crate::terms::test_support::reserve_words(ctx, beam_term::record_block_words(fields.len()))
         .expect("arena allocation");
     raw::write_record(hp, owner, name, exported, &fields, make_small(0))
         .expect("record construction")

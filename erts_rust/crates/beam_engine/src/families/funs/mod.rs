@@ -97,10 +97,12 @@ use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Module};
 use beam_term::{atom_val, is_atom, make_atom, Eterm};
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::machine::{Continuation, Machine};
-use crate::operand::{read_operand, write_operand};
+use crate::operand::{
+    operand_slack_words, read_operand, read_operands_slack, write_operand,
+};
 use crate::terms;
 use crate::Step;
 
@@ -131,17 +133,26 @@ pub(crate) fn exec(
                     "make_fun3: free-variable operand count mismatch",
                 ));
             }
-            let mut free = Vec::with_capacity(env.len());
-            for operand in env {
-                free.push(read_operand(machine, ctx, operand)?);
-            }
-            // Header arity is the *closure* arity: total lambda arity minus the
+            // Reserve the closure block first (one rooted allocation), then read the
+            // free-variable operands from the post-collection machine state. The
+            // header arity is the *closure* arity: total lambda arity minus the
             // captured free variables (`emu_load.c`, `emu/instrs.tab:565`).
             let arity = descriptor
                 .arity
                 .checked_sub(descriptor.num_free)
                 .ok_or_else(|| error::unsupported("make_fun3: num_free exceeds arity"))?;
-            let fun = terms::make_fun(ctx, arity, descriptor.uniq as u64, descriptor.index, &free)?;
+            let extra: usize = env.iter().map(operand_slack_words).sum();
+            let fun = terms::make_fun_rooted(
+                machine,
+                ctx,
+                RootSet::ALL_LIVE,
+                arity,
+                descriptor.uniq as u64,
+                descriptor.index,
+                env.len(),
+                extra,
+                |m, slack| read_operands_slack(m, env, slack),
+            )?;
             write_operand(machine, dst, fun)?;
             Ok(Some(Step::Next))
         }

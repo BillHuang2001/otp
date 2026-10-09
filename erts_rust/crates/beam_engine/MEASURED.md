@@ -3,6 +3,7 @@
 Current-state measurement and execution-coverage evidence for `beam_engine`.
 Relocated from the sibling `CONTEXT.md` (which now only points here) so the crate context stays under the Context Tree per-file read limit.
 The numbers are current-state evidence, not a change log: re-run the cited command for the live figure.
+**The sandbox is heavily oversubscribed**, so every figure below is wall-clock with no CPU pinning: a single sample is meaningless — read a **range over 3-4 runs** (or interleave two binaries) and never one number.
 
 ## Execution coverage
 Measured by `tests/census.rs` (an executable census **and** regression gate over synthetic modules and the corpus):
@@ -11,7 +12,7 @@ Measured by `tests/census.rs` (an executable census **and** regression gate over
 - **Every remaining gap is a typed error, pinned** (`tests/gaps.rs`; `tests/stdlib_sweep.rs::blocked_mechanisms_report_their_typed_error`; `tests/bitstrings_create_fail.rs`), and the exception reason atoms are seeded by the test host (`tests/support/mod.rs::SEED_ATOMS`, append-only so indices never shift; production `beam_rt` must do the same -- Handoffs #2).
 
 ## Measured (interpreter ns/instruction -- `tests/engine_bench.rs`)
-Measured at this node's HEAD with `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test engine_bench -- --nocapture` (median of 5 samples per run). The sandbox is heavily oversubscribed, so a **single sample is meaningless**: the same row moves by ~1.6x between a quiet and a busy window, so read a range over 3-4 runs (or interleave two binaries) and never one number.
+Measured at this node's HEAD with `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test engine_bench -- --nocapture` (median of 5 samples per run).
 - per-run **setup floor** (`Machine::reset` + run entry for a 2-instruction run): **~115-125 ns/run** in a quiet window (`setup/empty` is the noisiest row of all; a busy window reaches ~315).
 - `dispatch/noop` (shared-label no-op loop): **2.2-2.5 ns/instr**; `dispatch/many-labels` **7.7-8.0**.
 - `move/2` **4.2-4.7** ns/instr - `test/2` (no branch) **5.8-6.0** - `ctrl/2` (call/return chain) **3.8-3.9** - `branch-loop/2` (taken test + jump) **7.9-8.0** - `tail-loop/2` (test + `call_only`) **6.9-7.2** - real `erlc` `tailcall:even/1` **6.3-7.0**.
@@ -33,10 +34,57 @@ Measured at this node's HEAD with `erts_rust/scripts/cargo.sh test --manifest-pa
 - So the allocation **calls** fall ~1800x (55 vs 100 016), and the measured RSS per 4-word allocation falls from ≈64 B to ≈39 B (the payload alone is 32 B, so the retained overhead drops from ≈32 B to ≈7 B — a glibc chunk + a `Vec` handle slot per allocation becomes an amortised chunk tail). An allocation now costs essentially its payload. The structural suite also pins the shape: 10 000 x 4-word allocations come from exactly 5 chunks of 64 KiB, no allocation straddles a chunk boundary, a pointer stays byte-identical and keeps its words across 5 000 later allocations, and an oversized request gets a private chunk.
 - **Caveat.** The figure is the `MinimalContext` *test* arena; the measured per-BIF interpreter path still allocates nothing per call (`tests/bif_alloc.rs`, above), and the production heap is `beam_rt`'s, not this arena.
 
-## Measured (JIT micro-benchmark)
-`... -p beam_engine --test jit_bench -- --nocapture` (add `--features jit-cranelift` for the feature-ON roster). Wall-clock ns/op -- noisy; the tiers are **mechanisms, not optimisers** (compile-once/run-many; one-time `compile` excluded).
-- **Feature OFF** -- interpreter -> baseline-jit speed-up: `fib/1(20)` 2.4x; `kernel/2` 13.6x; `wide/2` 13.9x; `aggr/2` 11.8x; `cmp/2` 14.9x.
-- **Feature ON** -- interpreter -> baseline-jit -> Cranelift: `fib` 2.0x; `kernel` 11.1x; `wide` 13.0x; `aggr` 6.2x; `cmp` 11.0x (`cmp` is a wash; on `fib`/`aggr` Cranelift is **slower** than the baseline -- it is a correctness-first mechanism over the same shared helper, **not** a win over the interpreter on any measured workload).
-- **Local tail-call linking (`call_last`/`call_only`)** removes one driver round-trip per local tail call: `slice:fib/1(20)` baseline-jit **665.6 -> 580.4 ns/op** (paired means over 6 runs). The Cranelift tier now lowers the frame-less `call_only` the same way (`DISPATCH_REL` -> the `jump` lowering) and inlines `swap`; both are interpreter-identical and counted by `CompiledFunctions::{inlined_swap_count,inlined_tail_call_count}` (`tests/jit_cranelift.rs`). Re-run the two `jit_bench`/`jit_real_module`/`jit_cranelift_real` binaries for the live figures.
-- **Not done (honest):** `call_ext_last` still round-trips through the driver; the frame-popping `call_last` stays on the helper in Cranelift (the pop is Rust-side `Machine` state); `PutTuple2`/`BsTestTail` deopt; residency is block-fixed.
-- **The engine's own hot path is O(1) and per-BIF allocation-free** (dense `LabelMap` fetch, Vec-index registers; a wide BIF/`call_ext` reuses a per-`Machine` `args_scratch`, pinned by `tests/bif_alloc.rs`); the multi-microsecond per-iteration cost of `beam_rt run ...` is HOST-side (see above; also `../beam_rt/CONTEXT.md` and `../beam_bifs/CONTEXT.md` "Performance Notes").
+## Measured (JIT tier micro-benchmark -- `tests/jit_bench.rs` over `src/jit/bench/**`)
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --test jit_bench -- --ignored --nocapture` (add `--features jit-cranelift` for the Cranelift column). Nine workloads, `3000` timed runs each, warm-up excluded; a native tier is compiled **once** outside the timed loop (that one-time `compile` is **excluded**, and reported separately — 12 us-1.4 ms for the baseline, 0.3-120 ms for Cranelift). `ns/op` is the **mean** and includes the per-run setup (`Machine::reset` + the label-map build).
+
+Every workload **asserts the tiers agree** on its intended value (structural `beam_term::cmp`; the tiers have separate heaps) — never "the JIT is faster" (that is environment-dependent). These tiers are **correctness-first mechanisms, not optimisers** (Part II §F).
+
+**`beam_rt` still hardcodes `Tier::Interpreter` on its process-run path**, so these are **ENGINE-Mechanism** figures — the baseline/Cranelift columns are *not* end-to-end runtime figures (the runtime never selects a native tier yet).
+
+**Feature OFF** — interpreter -> baseline-jit (two runs, showing the sandbox spread):
+
+| workload (category) | interpreter ns/op | baseline-jit ns/op | speed-up |
+|---|---|---|---|
+| `build/0` (tuple/list BUILDING: `put_tuple2`/`put_list`) | 7.9k-14.3k | 6.7k-8.7k | 1.2-1.7x |
+| `map/2` (map build + get + put) | 10.1k-10.5k | 9.1k-9.2k | 1.1-1.2x |
+| `select/1` (`select_val`-heavy branches) | 2.5k-2.6k | 1.5k | 1.7x |
+| `walk/2` (recursive non-allocating list walk) | 3.3k | 0.40k-0.41k | 8.1-8.2x |
+| `slice:fib/1 (20)` (real `.beam` fixture) | 1.96k | 0.59k | 3.3x |
+| `kernel/2` (256 chained `gc_bif '+'/2`) | 3.8k | 0.56k | 6.7-6.8x |
+| `wide/2` (256 steps over 8 x-registers) | 5.5k | 0.59k | 9.2-9.3x |
+| `aggr/2` (128 steps of aggregate reads + `'*'/2`) | 9.9k | 2.2k | 4.4x |
+| `cmp/2` (64 rounds of the eight comparison BIFs) | 7.8k | 1.9k | 4.1x |
+
+**Feature ON** (`--features jit-cranelift`) — interpreter -> baseline-jit -> Cranelift (`cl` speed-up over the interpreter; one run — the sandbox was busier, e.g. `build` interpreter read 17.7k vs 7.9k feature-off):
+
+| workload | interpreter ns/op | baseline-jit ns/op | Cranelift ns/op | baseline speed-up | Cranelift speed-up |
+|---|---|---|---|---|---|
+| `build/0` | 17.7k | 17.3k | 13.4k | 1.0x | 1.3x |
+| `map/2` | 9.1k | 7.9k | 8.5k | 1.2x | 1.1x |
+| `select/1` | 2.6k | 1.5k | 1.5k | 1.7x | 1.8x |
+| `walk/2` | 3.3k | 0.42k | 0.44k | 7.9x | 7.5x |
+| `slice:fib/1 (20)` | 1.98k | 0.62k | 0.66k | 3.2x | 3.0x |
+| `kernel/2` | 3.8k | 0.59k | 0.82k | 6.3x | 4.6x |
+| `wide/2` | 5.5k | 0.61k | 0.88k | 9.0x | 6.3x |
+| `aggr/2` | 10.0k | 2.2k | 2.1k | 4.5x | 4.7x |
+| `cmp/2` | 7.9k | 1.9k | 2.0k | 4.2x | 3.9x |
+
+- **Cranelift is NOT a win.** It sits behind the default-OFF `jit-cranelift` feature and is **not enabled**. In the fixed-order table it is roughly level with the baseline on `aggr`/`select`/`walk` and clearly slower on `kernel`/`wide`/`fib`/`cmp`. The order-balanced ABBA harness (`src/jit/cranelift/bench.rs::cl_bench_cranelift_vs_baseline_interleaved`, 15 rounds × 2 samples/tier; ratio < 1.0 = Cranelift faster) confirms it: `aggr` **0.946x** (marginally faster), `arith/2` **1.425x** (slower), `cmp` **1.072x** (slower). It is a correctness-first mechanism over the **same** shared interpreter helper, not an optimiser — the tiering seam keeps it available for future inlining work, but the measured outcome is a negative result and it stays off.
+- **Local tail-call linking (`call_last`/`call_only`)** removes one driver round-trip per local tail call: `slice:fib/1(20)` baseline-jit **665.6 -> 580.4 ns/op** (paired means over 6 runs, an older sample; re-run for the live figure). The Cranelift tier lowers the frame-less `call_only` the same way (`DISPATCH_REL` -> the `jump` lowering) and inlines `swap`; both are interpreter-identical and counted by `CompiledFunctions::{inlined_swap_count,inlined_tail_call_count}` (`tests/jit_cranelift.rs`).
+- **Not done (honest):** `call_ext_last` still round-trips through the driver; the frame-popping `call_last` stays on the helper in Cranelift (the pop is Rust-side `Machine` state); `PutTuple2`/`BsTestTail` deopt; residency is block-fixed. Both tiers allocate in the never-freed `MinimalContext` arena, so a term-building workload grows RSS with the iteration count (the run counts keep that bounded).
+
+## Measured (rooted-allocation memory bound -- `src/terms/alloc_tests.rs`)
+`erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_engine --lib the_rooted_seam_bounds_peak_live_words_as_the_loop_grows -- --nocapture`. An allocation-heavy loop of `N` iterations runs **twice** over the same synthetic builders — once through an **UNROOTED** context (a fallback that hands out fresh words and never relocates, modelling a host that ignores `alloc_words_rooted`) and once through a **rooted** context that installs a mock **moving semi-space** collector behind `ExecutionContext::alloc_words_rooted` (it relocates every live root on each collection). Each loop keeps a small live set (a running accumulator), so the *retained* footprint should stay constant while the unrooted churn grows with `N`:
+
+| N | BEFORE: unrooted words | AFTER: rooted live words | collections |
+|---|---|---|---|
+| 1 000 | 18 000 | 8 | 3 000 |
+| 5 000 | 90 000 | 8 | 15 000 |
+| 20 000 | 360 000 | 8 | 60 000 |
+| 50 000 | 900 000 | 8 | 150 000 |
+
+- The unrooted peak grows **exactly linearly** in `N` (18 x `N` words); the rooted live set stays **constant at 8 words** regardless of `N`, and a real collection fires **~3 per iteration** (`N * 3`). The test asserts `collections >= 3 * N`, `live < 64`, a strictly increasing unrooted series and a constant rooted series.
+- **Real collection is demonstrated by a test** (not just counted): the live terms survive relocation and stay correct after every collection —
+  - `tests/rooted_alloc.rs::a_moving_collector_relocates_the_live_operands_and_the_terms_stay_correct` runs the term-construction arms (`ralloc_tuple`/`ralloc_list`/`ralloc_build`) through the rooted seam under a `MovingContext` that moves the arena on each collection, and reads the built terms back (addresses changed, values intact);
+  - `src/terms/alloc_tests.rs::the_mock_collector_relocates_a_root_across_every_collection` and `a_moving_collection_during_the_reserve_keeps_a_built_tuple_correct` pin the same for a `terms::make_*` builder.
+- **Caveat.** The collector is a **test mock** (a moving semi-space); the production heap is `beam_rt`'s, and **no crate overrides `alloc_words_rooted` yet**, so the ordinary run still allocates through the unrooted seam and triggers no collection (an `ensure_heap`/root-set hand-off is in place, but the `terms::make_*` call sites have not moved to it — see `CONTEXT.md` Handoff #11). This table is the mechanism-level evidence that the rooted seam *can* bound retained memory, not a runtime figure.

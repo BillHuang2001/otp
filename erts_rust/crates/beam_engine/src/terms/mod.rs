@@ -82,6 +82,16 @@
 //! suite (raw-word layout assertions and the HAMT fixtures). Every submodule is
 //! re-exported here, so the public paths (`crate::terms::make_tuple`,
 //! `crate::terms::map_entries`, …) are unchanged.
+//!
+//! Each builder comes in two flavours. The **classic** public builder
+//! (`make_tuple`, `make_cons`, `make_list`, `badmatch_reason`, `make_heap_binary`,
+//! `make_float`, `make_integer`, `make_flatmap`, `make_map`, `make_fun`) takes the
+//! already-materialized operands and allocates through the plain
+//! [`ExecutionContext::alloc_words`](crate::context::ExecutionContext::alloc_words);
+//! its `*_rooted` twin (e.g. [`make_tuple_rooted`]) takes the machine's root set and
+//! reserves the block **before** a reader closure supplies the operands, so a
+//! **moving** collector may relocate them in between — the frozen
+//! reserve → read → write discipline (`slack.rs`).
 
 use beam_term::Eterm;
 
@@ -90,12 +100,28 @@ mod fun;
 mod map;
 mod number;
 mod read;
+mod sink;
+mod slack;
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+pub(crate) mod alloc_tests;
 
-pub use construct::{badmatch_reason, make_cons, make_heap_binary, make_list, make_tuple};
+pub use construct::{
+    badmatch_reason, badmatch_reason_rooted, make_cons, make_cons_rooted, make_heap_binary,
+    make_heap_binary_rooted, make_list, make_list_rooted, make_tuple, make_tuple_rooted,
+};
 pub use fun::{fun_arity, fun_free, fun_index, fun_num_free, fun_uniq, is_fun, make_fun};
-pub use map::{is_hashmap, make_flatmap, make_map, map_entries};
-pub use number::{float_value, make_float, make_integer};
+pub use fun::make_fun_rooted;
+pub use map::{is_hashmap, make_flatmap, make_flatmap_rooted, make_map, make_map_rooted, map_entries};
+pub use number::{float_value, make_float, make_float_rooted, make_integer, make_integer_rooted};
+pub(crate) use number::make_integer_unrooted;
 pub use read::{binary_bytes, cons_head, cons_tail, list_elements, tuple_arity, tuple_element};
+pub use sink::{ContextSink, Sink};
+pub(crate) use sink::{write_list_at, write_tuple_at};
+pub use slack::Slack;
+pub(crate) use slack::reserve;
+pub use slack::reserve_slack;
 
 /// `MAP_SMALL_MAP_LIMIT` (`erl_map.h:93-97`): the largest flat-map pair count.
 /// Above it ERTS uses a **hashmap** (HAMT), which [`make_map`] builds; this

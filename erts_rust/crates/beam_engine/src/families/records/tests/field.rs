@@ -172,7 +172,7 @@ fn get_record_field_foreign_form_reads_an_exported_record_from_another_module() 
     let mut ctx = MinimalContext::new();
     let (other, r, a) = (fx.atom("other"), fx.atom("r"), fx.atom("a"));
     let rec = record(&mut ctx, other, r, true, &[(a, make_small(11))]);
-    let id = terms::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
+    let id = crate::terms::test_support::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
     machine.set_x(3, id).unwrap();
@@ -201,7 +201,7 @@ fn get_record_field_foreign_form_branches_to_fail_on_a_non_exported_record() {
     let mut ctx = MinimalContext::new();
     let (other, r, a) = (fx.atom("other"), fx.atom("r"), fx.atom("a"));
     let rec = record(&mut ctx, other, r, false, &[(a, make_small(11))]);
-    let id = terms::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
+    let id = crate::terms::test_support::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
     machine.set_x(3, id).unwrap();
@@ -230,7 +230,7 @@ fn get_record_field_foreign_form_branches_to_fail_on_a_name_mismatch() {
     let (other, r, s, a) = (fx.atom("other"), fx.atom("r"), fx.atom("s"), fx.atom("a"));
     // The record is named `s`, but the `Id` asks for `r`.
     let rec = record(&mut ctx, other, s, true, &[(a, make_small(11))]);
-    let id = terms::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
+    let id = crate::terms::test_support::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
     let mut machine = Machine::with_max_register(4);
     machine.set_x(0, rec).unwrap();
     machine.set_x(3, id).unwrap();

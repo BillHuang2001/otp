@@ -46,7 +46,14 @@ use beam_term::{is_small, make_atom, make_small, Atom, NIL};
 
 use crate::context::MinimalContext;
 use crate::machine::CatchFrame;
-use crate::terms::{float_value, make_float};
+use crate::terms::float_value;
+
+// The production builders take the `Machine` plus a reader closure so a moving
+// collector can relocate operands between the reserve and the read; these tests
+// build from already-materialized terms against a non-collecting arena, so use the
+// test-only wrappers that keep the old ergonomic arity. (`float_value` above is a
+// reader, unchanged.)
+use crate::terms::test_support::{make_float, make_integer};
 
 /// An empty label map (only the tests that exercise a `fail` target build one).
 fn no_labels() -> LabelMap {
@@ -281,7 +288,7 @@ fn fconv_converts_a_representable_bignum_to_the_nearest_double() {
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
         let source =
-            crate::terms::make_integer(&mut ctx, source_value).expect("the arena builds a bignum");
+            make_integer(&mut ctx, source_value).expect("the arena builds a bignum");
         assert!(!is_small(source), "{source_value} must be a bignum");
         machine.set_x(0, source).unwrap();
         let instr = Instr::Fconv {

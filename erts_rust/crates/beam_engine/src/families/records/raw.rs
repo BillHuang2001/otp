@@ -30,6 +30,12 @@
 //! layouts, so the dispatcher ([`super`]) stays safe Rust. **No record layout is
 //! re-derived here**: every function forwards to `beam_term::record`.
 //!
+//! Its second responsibility is the one term build that must be carved by hand —
+//! the create form's `{Tag, {{Module, Name}, Field}}` reason graph
+//! ([`write_create_failure_reason`]), whose three tuples have to share a **single**
+//! rooted reservation (see that function). The carve writes terms through
+//! `beam_term`'s public constructors; it re-derives no layout.
+//!
 //! # Safety argument
 //!
 //! Every entry point is called with a term the machine already holds — an X/Y-slot
@@ -42,6 +48,9 @@
 #![allow(unsafe_code)]
 use beam_common::Result;
 use beam_term::{Atom, AtomTable, Eterm};
+
+use crate::context::{ExecutionContext, RootSet};
+use crate::machine::Machine;
 
 /// `record_definition(x)` (`erl_record.h`) — the definition term of the
 /// native-record instance `x`, or `None` when `x` is not a live native record.
@@ -195,11 +204,12 @@ pub(crate) fn write_record(
     fields: &[(Eterm, Eterm)],
     definition_hash: Eterm,
 ) -> Result<Eterm> {
-    // SAFETY: the caller (the family's `write_record_instance`) reserved
-    // `record_block_words(fields.len())` exclusively-owned words at `hp` via
-    // `ExecutionContext::alloc_words` and keeps them unmoved until the returned
-    // term is written to its destination register; every key is an atom and
-    // duplicate keys are rejected by `beam_term`.
+    // SAFETY: the caller (the family's `write_record_instance` /
+    // `write_local_record`) reserved `record_block_words(fields.len())`
+    // exclusively-owned words at `hp` with a single rooted allocation
+    // ([`crate::terms::reserve`]) and keeps them unmoved until the returned term is
+    // written to its destination register; every key is an atom and duplicate keys
+    // are rejected by `beam_term`.
     Ok(unsafe { beam_term::write_record(hp, module, name, is_exported, fields, definition_hash) }?)
 }
 
@@ -213,4 +223,54 @@ fn atom_of(term: Eterm) -> Result<Atom> {
             "native record: definition module/name is not an atom",
         ))
     }
+}
+
+/// Lay out the create form's failure reason `{Tag, {{Module, Name}, Field}}` —
+/// the C's `TUPLE2(TUPLE2(Module, Name), Field)` (`erl_record.c:339-351`) — and
+/// return the tagged reason term.
+///
+/// The three 2-tuples are carved as **one contiguous 9-word block** reserved with
+/// a single rooted allocation, so the whole graph costs one (collecting)
+/// allocation: building it tuple by tuple would strand the earlier tuples under a
+/// moving collector. The layout is
+///
+/// ```text
+/// words 0..3   {Module, Name}                  header, module atom, name atom
+/// words 3..6   {{Module, Name}, Field}         header, term at word 0, field atom
+/// words 6..9   {Tag, {{Module, Name}, Field}}  header, tag atom, term at word 3
+/// ```
+///
+/// Every element is an **immediate** (an atom or an `arityval` header), so no
+/// sub-term needs the heap and the reservation needs no spare tail.
+pub(crate) fn write_create_failure_reason(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    module: Atom,
+    name: Atom,
+    field: Atom,
+    tag: Atom,
+) -> Result<Eterm> {
+    const WORDS: usize = 9;
+    let hp = crate::terms::reserve(machine, ctx, WORDS, RootSet::ALL_LIVE)?;
+    // SAFETY: `reserve` returned `WORDS` (9) exclusively-owned, writable words at
+    // `hp`, live until the next collecting allocation and not aliased by the
+    // machine. Every one of the nine words is initialised below, and the three
+    // `beam_term::make_tuple` results tag pointers into that same live block (a
+    // tuple is one `arityval` header word followed by its elements).
+    let root = unsafe {
+        // `{Module, Name}`.
+        *hp = beam_term::make_arityval(2);
+        *hp.add(1) = beam_term::make_atom(module);
+        *hp.add(2) = beam_term::make_atom(name);
+        // `{{Module, Name}, Field}` — its first element points at word 0.
+        *hp.add(3) = beam_term::make_arityval(2);
+        *hp.add(4) = beam_term::make_tuple(hp);
+        *hp.add(5) = beam_term::make_atom(field);
+        // `{Tag, {{Module, Name}, Field}}` — its second element points at word 3.
+        *hp.add(6) = beam_term::make_arityval(2);
+        *hp.add(7) = beam_term::make_atom(tag);
+        *hp.add(8) = beam_term::make_tuple(hp.add(3));
+        hp.add(6)
+    };
+    Ok(beam_term::make_tuple(root))
 }
