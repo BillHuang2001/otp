@@ -376,6 +376,23 @@ needs:
     floor is deliberately minimal (`os:cmd/1`, `beam_io`'s spawn driver, the port write stream) and
     is not a `prim_*` implementation.
 
+## Handoffs (owned by OTHER nodes)
+The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up,
+the parent node — outside *this* node's scope). Two served entries have **no arm yet**, so they are
+unreachable from a real call and carry a documented `#[allow(dead_code)]`:
+- `("code", "get_mode", 0) => Some(self.code_get_mode()),`
+- `("application", "get_application", 0) => Some(self.application_get_application_0()),`
+
+Until they land, `differential compare 'code:get_mode()'` and
+`compare 'application:get_application()'` MISMATCH (the oracle answers `interactive` / `undefined`;
+this runtime falls through to the preloaded module's `erlang:nif_error(undef)`, surfacing as
+`badarg`). `../native.rs`'s own module-doc table should gain those two names in the same change.
+`init:get_argument(root)` and `init:get_argument(home)` already AGREE (they ride the registered
+`init:get_argument/1` arm). `init:get_argument(progname)` cannot agree in general: both runtimes
+report the basename **they** were invoked as (the oracle's `"erl"` comes from the `erl` shell
+script's `$0`), which is a property of the harness's invocation, not a value this runtime may
+fabricate — so it is a deliberate, invocation-dependent gap, never a wrong result.
+
 ## See Also
 - `../../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.
 - `../beam_gc`, `../beam_process`, `../beam_message` → the state this floor reads.
