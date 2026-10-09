@@ -8,7 +8,8 @@ crate below must close the gap, after which a case can be added to the corpus.
 
 (The honest capability gaps — the runtime *does* signal them via its documented
 `beam_rt: unsupported: …` / exit-3 convention — are recorded in the allowlist table above,
-not here: today the `-eval` literal/parser trio and the `erlang:statistics/1` counters.)
+not here: today only `wire/new_fun_ext_encode`, `proc_signals/statistics_runtime_unsupported`
+and the A.9 boot seam remain.)
 
 ## A.3 — NIF C ABI (owner: `beam_abi` / `beam_rt` NifHost)
 - An atom name first interned *during* a NIF call is not readable back in the same call:
@@ -38,12 +39,26 @@ not here: today the `-eval` literal/parser trio and the `erlang:statistics/1` co
   `thread_support`/`smp_support`/`erts_version` fields.
 
 ## A.4 — driver C ABI (owner: `beam_rt` / `beam_io`; `beam_abi` for the timer units)
-- `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` / `driver_send_term` do
-  not deliver their well-formed `ErlDrvTerm` spec to the receiving process: the Rust runtime
-  captures the decoded term in `DriverPort::sent` and never sends it (`{data,Bytes}` spec:
-  oracle rc `1`, rust rc `0`; the accept/refuse *split* agrees and is pinned).
-- The four forms' exact success code on a valid spec differs (oracle `1`, rust `0`).
-- `driver_async/5` schedules nothing on the port's pool (oracle a positive handle, rust `-1`).
+- **Landed:** `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` /
+  `driver_send_term` now *deliver* the decoded `ErlDrvTerm` spec to the receiving process
+  (the port's connected process — the delivered message is the term itself, never a
+  `{Port, Term}` wrapper, `io.c:6162-6176`). Pinned byte-exactly by the new delivery family
+  (`driver_abi` selectors `130..137`, images of `{7,42}`, `{ok,7}` and `{<<1,2,3>>,5}`).
+- The four forms' exact success code still differs (oracle `1` for a queued delivery, rust `0`
+  — the frozen `DriverHost::send_term` "accepted" code), so only the accept/refuse split is
+  pinned (selectors `30..38`).
+- **An `ErlDrvTerm` spec that interns a *new* atom is not delivered observably.** The Rust
+  runtime's driver host records the name on its `PendingInterner` and never commits it, so the
+  delivered term carries a nameless atom: an `ERL_DRV_ATOM` spec for `"driver_abi_term"` yields
+  oracle `{driver_abi_term,7}` / `term_to_binary` `<<131,104,2,119,15,"driver_abi_term",97,7>>`
+  vs rust `term_to_binary/1` → `error:badarg` (the atom has no name). A spec over an atom both
+  tables already hold (`ok`) agrees and **is** pinned. Owner: `beam_rt` / `beam_io`
+  (`crates/beam_rt/src/port/driver.rs`, `commit_atoms/1` is only reached from its unit test).
+- **`driver_async/5` schedules nothing.** Measured: the C's `driver_async(port, &key, invoke,
+  data, free)` answers a positive handle (oracle `1`, the queued job's id) and later runs
+  `async_invoke`; the Rust runtime keeps the [`beam_abi::DriverHost`] default and answers `-1`.
+  A case observing the handle is a plain-value `mismatch` (oracle `49` vs rust `11569`), so the
+  scheduler family stays unpinned. Owner: `beam_rt` / `beam_io`.
 - `driver_set_timer/2` on an entry **without** a `timeout` callback differs (oracle accepts,
   rust `-1`); the timing shapes (0 ms, large, re-arm, pending/idle read) agree and are pinned.
 - `erl_drv_monotonic_time/1` differs by **absolute phase** (oracle non-positive `0`, rust `1`);
@@ -51,6 +66,9 @@ not here: today the `-eval` literal/parser trio and the `erlang:statistics/1` co
 - `erl_drv_time_offset/1` differs (oracle a non-zero offset, rust `0`).
 - An entry whose only port-command callback is `outputv` never receives `port_command/2`
   (oracle `49`, rust `-1`).
+- An `ErlDrvTerm` `ERL_DRV_LIST N` spec differs: `INT 1, INT 2, INT 3, LIST 3` is the
+  **improper** list `[1,2|3]` in the oracle (the last popped word is the tail) but the proper
+  list `[1,2,3]` in the Rust runtime. No case pins it.
 - `driver_enq`/`driver_sizeq` as probed hangs the **oracle**; `driver_async` with a NULL port
   and `erl_drv_output_term(port, NULL, 2)` SIGSEGV the oracle — harness/probe hazards,
   unpinnable, to re-check before treating any as a runtime gap.
@@ -60,9 +78,10 @@ not here: today the `-eval` literal/parser trio and the `erlang:statistics/1` co
   uncompressed size and the trailing Adler-32 match, but the zlib deflate middle differs.
   Only `binary_to_term(term_to_binary(T, [compressed])) =:= T` round trips are pinned.
 - Legacy `PORT_EXT` (102) preserves the port id in the oracle but zeroes it in the Rust runtime.
-- (The `-eval` **literal/parser** limits — big-integer literal, improper-list tail, an integer
-  binary segment wider than 64 bits — are honest `unsupported` capability gaps, so they ARE
-  pinned as allowlisted corpus cases; see the table above, owner `beam_rt`.)
+- (The `-eval` **literal/parser** limits — a big-integer literal, an improper-list tail, an
+  integer binary segment wider than 64 bits — are no longer divergences: `beam_rt` now evaluates
+  each shape, so they are pinned as **agreeing** regression cases; see the table above, owner
+  `beam_rt`.)
 
 ## A.7 — process signals (owner: `beam_bifs` / `beam_process`)
 - A `{'DOWN', …}` for a monitored **port** is not delivered after `port_close/1`: the oracle

@@ -40,16 +40,22 @@
 //!   phase-free `erl_drv_monotonic_time` properties;
 //! * `110..113` — the driver *delivers bytes* through `driver_output`/`driver_output2`/
 //!   `driver_output_binary`/`driver_outputv`;
+//! * `130..137` — the driver *delivers a decoded term* through
+//!   `erl_drv_output_term`/`driver_output_term`/`erl_drv_send_term`/`driver_send_term` and emits
+//!   **no** byte payload, so the owner's own message is the whole observable;
 //! * `200..202` — the driver **arms** something (a descriptor via `driver_select`, a port
 //!   timer via `driver_set_timer`) and its `ready_input`/`ready_output`/`timeout` callback
 //!   answers later, without another `port_command`.
 //!
 //! # The observable (honest, never asserted module-side)
 //!
-//! `classify/1` **returns exactly what the driver delivered**, encoded as a stable integer — it
-//! never compares against an expectation and never raises. The base-256 value of the bytes a
-//! `driver_output*` call delivered, or `-1` when no `{Port, {data, Bytes}}` message arrived within
-//! the module's own 2 s bound. The **golden is the oracle's own answer**, so the corpus self-tests
+//! `classify/1` and `classify_term/1` **return exactly what the driver delivered**, encoded as a
+//! stable integer — they never compare against an expectation and never raise. For a
+//! `driver_output*` byte payload that is the base-256 value of the delivered bytes; for the
+//! `*_output_term`/`*_send_term` delivery family it is the base-256 value of the *delivered term's*
+//! canonical `term_to_binary/1` image (the C queues the term itself as the message, never a
+//! `{Port, Term}` wrapper, `io.c:6162-6176`). Nothing arriving within the module's own 2 s bound is
+//! the sentinel `-1`. The **golden is the oracle's own answer**, so the corpus self-tests
 //! and a runtime that answers differently is a *differing observable* (a `Mismatch`), which is
 //! exactly what a module-run case must be. Only the surfaces on which the two runtimes genuinely
 //! agree are kept here; every divergence is a documented handoff (see *Known gaps*), never a
@@ -68,25 +74,27 @@
 //!
 //! # Known gaps (why the group is not larger)
 //!
-//! The `ErlDrvTerm` spec family is pinned on its **accept/refuse split only**: both runtimes
-//! decode a well-formed spec and refuse a malformed one identically, but the *delivery* itself is a
-//! handoff — the C queues the decoded term to the destination process, while the Rust runtime
-//! captures it and never delivers it. So `erl_drv_output_term`/`*_send_term` byte-exact
-//! delivery, `driver_output_term`/`driver_send_term`'s *success code* (`1` in the C, `0` in this
-//! seam for a captured delivery) and `outputv`-only routing are **not** pinned (each is a plain,
-//! differing observable, never a capability gap — the Rust runtime answers a different *value*, it
-//! does not signal `unsupported`). Owner: `beam_rt` / `beam_io`.
+//! The four `*_output_term`/`*_send_term` forms **do** deliver, and their delivery is pinned
+//! byte-exactly by the delivery family (selectors `130..137`, driven through `classify_term/1`:
+//! the fixture emits only the spec, and the owner's own message *is* the observable). What is
+//! **not** pinned is each form's *success code* — the C answers `1` for a queued delivery while
+//! this seam answers `0` for its captured one — so the selectors `30..38` keep asserting only
+//! "not `-1`" (the accept/refuse split, on which the two runtimes agree). Owner: `beam_rt` /
+//! `beam_io`.
 //!
-//! * `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` / `driver_send_term` do not
-//!   deliver their `ErlDrvTerm` spec to the receiving process (the C delivers it, the Rust runtime
-//!   captures it in `DriverPort::sent`); the four forms' success code therefore differs too (`1`
-//!   vs `0`), which is why the selectors only assert "not `-1`". Owner: `beam_rt` / `beam_io`.
+//! * An `ErlDrvTerm` spec that interns a **new** atom cannot be delivered observably: this seam's
+//!   driver host records the name on its `PendingInterner` and never commits it
+//!   ([`beam_abi::DriverHost::intern_atom`]'s doc: commit is the runtime's step), so the delivered
+//!   term carries a nameless atom and `term_to_binary/1` on it raises `badarg` where the C delivers
+//!   `{driver_abi_term,7}`. The delivery family therefore uses `ok`, an atom both tables already
+//!   hold. Owner: `beam_rt` / `beam_io` (`crates/beam_rt/src/port/driver.rs`, `commit_atoms/1`).
 //! * An entry whose only port-command callback is `outputv` never receives `port_command/2`
 //!   (the C routes through the entry's `outputv`; the Rust runtime has no `outputv` path). Owner:
 //!   `beam_rt` / `beam_io`.
 //! * `driver_async/5` — the C schedules the job on the port's async pool and answers a positive
-//!   handle; the Rust runtime keeps the [`beam_abi::DriverHost`] default (`-1`). No live-port shape
-//!   can agree, so the scheduler family is unpinned. Owner: `beam_rt` / `beam_io`.
+//!   handle (`1`), the Rust runtime keeps the [`beam_abi::DriverHost`] default (`-1`). No live-port
+//!   shape can agree, so the scheduler family is unpinned. Owner: `beam_rt` / `beam_io`.
+//!   `broadcast`/`outputv`-only routing is unpinned for the same reason.
 //! * `driver_set_timer/2` **without** a `timeout` callback — the C *accepts* it (`0`) and this
 //!   seam answers `-1`; the group's one fixture declares a `timeout` callback (selectors `22`,
 //!   `202`, `40..44`), so the refusal half cannot be reached. Owner: `beam_rt` / `beam_io`.
@@ -115,7 +123,7 @@ use crate::module_build::NifFixture;
 /// prints a path (the fixture is reached through a name that differs by construction between
 /// the two runtimes).
 const DRIVER_ABI_MODULE_SOURCE: &str = r#"-module(driver_abi).
--export([classify/1]).
+-export([classify/1, classify_term/1]).
 
 %% Send one selector byte to the C fixture and encode the answer it delivered as an integer.
 %%
@@ -130,13 +138,33 @@ classify(N) ->
     wait(P).
 
 %% Only the `driver_output*` byte channels carry the answer as `{Port, {data, Bytes}}`. The
-%% `*_output_term`/`*_send_term` forms also deliver a *term* the driver decoded (a `{Port, Term}`
-%% message), whose order relative to the byte channel is not pinned; every other message is
-%% therefore skipped rather than mistaken for the answer.
+%% `*_output_term`/`*_send_term` forms deliver the decoded *term itself* — never a `{Port, Term}`
+%% wrapper (`io.c:6174`) — whose order relative to the byte channel is not pinned; any other
+%% message is therefore skipped rather than mistaken for the answer.
 wait(P) ->
     receive
         {P, {data, Data}} -> bytes_code(iolist_to_binary(Data));
         _Other -> wait(P)
+    after 2000 -> -1
+    end.
+
+%% Send one selector byte to the C fixture and encode the term it **delivered** as an integer.
+%%
+%% The driver's `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` /
+%% `driver_send_term` call queues the decoded term itself as the message (`io.c:6162-6176`), so the
+%% message that arrives *is* the whole observable — its canonical `term_to_binary/1` image, read as
+%% a base-256 integer, is byte-exact and stable across VM starts. The delivery cases' fixture
+%% selectors emit no byte payload, so the first message is the delivered term; nothing arriving
+%% within the module's own 2 s bound is the sentinel `-1`.
+classify_term(N) ->
+    Dir = filename:dirname(code:which(?MODULE)),
+    P = open(Dir),
+    true = erlang:port_command(P, <<N>>),
+    wait_term(P).
+
+wait_term(_P) ->
+    receive
+        Term -> bytes_code(term_to_binary(Term))
     after 2000 -> -1
     end.
 
@@ -480,8 +508,9 @@ static void abi_term_spec(ErlDrvTermData *spec) {
 
 /* The four delivery forms all report "the spec was not the C's failure code" for a well-formed
  * spec. Their *success* code is not pinned: the C answers `1` for a queued delivery and this seam
- * answers `0` for a captured one (see the module docs' *Known gaps*), so only the accept/refuse
- * split is observable identically. `-1` is the shared failure code. */
+ * answers `0` — the frozen `DriverHost::send_term` "accepted" code `beam_abi`'s own hosts answer
+ * (see the module docs' *Known gaps*) — so only the accept/refuse split is observable identically.
+ * `-1` is the shared failure code. The *delivery* itself is pinned by the `130..137` family. */
 
 static int chk_erl_drv_output_term_accepts(abi_state *st) {
     ErlDrvTermData spec[6];
@@ -543,6 +572,77 @@ static int chk_send_term_absent_destination(abi_state *st) {
     ErlDrvTermData spec[6];
     abi_term_spec(spec);
     return erl_drv_send_term(driver_mk_port(st->port), driver_term_nil, spec, 6) == 0;
+}
+
+/* -- the ErlDrvTerm *delivery* family ------------------------------------------------------- */
+
+/* The three well-formed specs the delivery selectors hand the four `*_output_term`/`*_send_term`
+ * forms, one per operand shape:
+ *
+ *   * `{7, 42}`          — two small integers (`ERL_DRV_INT`);
+ *   * `{ok, 7}`          — an atom **both** atom tables already hold, plus an integer;
+ *   * `{<<1, 2, 3>>, 5}` — a byte-string operand (`ERL_DRV_BUF2BINARY`), plus an integer.
+ *
+ * The delivered term itself is the whole observable (the destination process sees it as its message,
+ * `io.c:6162-6176`), so every operand is a value both runtimes can name: a spec that interns a *new*
+ * atom is not pinnable, because the Rust runtime's driver host never commits the names it records
+ * (see the module docs' *Known gaps*). */
+
+static void abi_deliver_ints(ErlDrvTermData *spec) {
+    spec[0] = ERL_DRV_INT;
+    spec[1] = 7;
+    spec[2] = ERL_DRV_INT;
+    spec[3] = 42;
+    spec[4] = ERL_DRV_TUPLE;
+    spec[5] = 2;
+}
+
+static void abi_deliver_atom(ErlDrvTermData *spec) {
+    spec[0] = ERL_DRV_ATOM;
+    spec[1] = driver_mk_atom("ok");
+    spec[2] = ERL_DRV_INT;
+    spec[3] = 7;
+    spec[4] = ERL_DRV_TUPLE;
+    spec[5] = 2;
+}
+
+static void abi_deliver_binary(ErlDrvTermData *spec) {
+    static const char bytes[3] = {1, 2, 3};
+    spec[0] = ERL_DRV_BUF2BINARY;
+    spec[1] = (ErlDrvTermData) (intptr_t) bytes;
+    spec[2] = 3;
+    spec[3] = ERL_DRV_INT;
+    spec[4] = 5;
+    spec[5] = ERL_DRV_TUPLE;
+    spec[6] = 2;
+}
+
+/* Deliver one of those specs through one of the four forms, to the port's connected process: the
+ * `*_output_term` forms target it implicitly, the `*_send_term` forms through `driver_connected/1`.
+ *
+ * No byte payload is emitted, so the *only* thing the owner can observe is the delivered term — a
+ * form that does not deliver leaves the module-side `classify_term/1` at its 2 s sentinel, never a
+ * status byte the return code could have produced. The forms' own success codes (`1` queued in the
+ * C, `0` for this seam's captured delivery) are therefore deliberately unobserved here; they are
+ * pinned on their accept/refuse split by the selectors above. */
+static void abi_deliver(abi_state *st, int form, int shape) {
+    ErlDrvTermData spec[7];
+    int len;
+    switch (shape) {
+    case 0: abi_deliver_ints(spec); len = 6; break;
+    case 1: abi_deliver_atom(spec); len = 6; break;
+    default: abi_deliver_binary(spec); len = 7; break;
+    }
+    switch (form) {
+    case 0: (void) erl_drv_output_term(driver_mk_port(st->port), spec, len); break;
+    case 1: (void) driver_output_term(st->port, spec, len); break;
+    case 2:
+        (void) erl_drv_send_term(driver_mk_port(st->port), driver_connected(st->port), spec, len);
+        break;
+    default:
+        (void) driver_send_term(st->port, driver_connected(st->port), spec, len);
+        break;
+    }
 }
 
 /* -- the `driver_set_timer` shapes --------------------------------------------------------- */
@@ -672,6 +772,16 @@ static void abi_dispatch(abi_state *st, unsigned char sel) {
     case 36: abi_answer(st, chk_output_term_unknown_tag_refused(st)); break;
     case 37: abi_answer(st, chk_output_term_empty_spec_refused(st)); break;
     case 38: abi_answer(st, chk_send_term_absent_destination(st)); break;
+    /* The ErlDrvTerm *delivery* family: one selector per (form, spec shape). Nothing is answered
+     * through the byte channel — the delivered term is the observable. */
+    case 130: abi_deliver(st, 0, 0); break;
+    case 131: abi_deliver(st, 0, 1); break;
+    case 132: abi_deliver(st, 0, 2); break;
+    case 133: abi_deliver(st, 1, 0); break;
+    case 134: abi_deliver(st, 2, 0); break;
+    case 135: abi_deliver(st, 2, 2); break;
+    case 136: abi_deliver(st, 3, 0); break;
+    case 137: abi_deliver(st, 3, 1); break;
     /* The `driver_set_timer` shapes. */
     case 40: abi_answer(st, chk_set_timer_zero(st)); break;
     case 41: abi_answer(st, chk_set_timer_large(st)); break;
@@ -830,6 +940,29 @@ fn case(
     selector: &'static [i64],
     golden: &'static str,
 ) -> Case {
+    module_case(id, description, selector, golden, "classify")
+}
+
+/// The same over the **delivery** entry point (`classify_term/1`): the fixture's selector emits an
+/// `ErlDrvTerm` spec through one of the four `*_output_term`/`*_send_term` forms and *no* byte
+/// payload, so the observable is the ETF image of the term the owner received.
+fn delivery_case(
+    id: &'static str,
+    description: &'static str,
+    selector: &'static [i64],
+    golden: &'static str,
+) -> Case {
+    module_case(id, description, selector, golden, "classify_term")
+}
+
+/// One module-run case over [`DRIVER_ABI_MODULE_SOURCE`] with [`DRIVER_ABI`] as its `.so`.
+fn module_case(
+    id: &'static str,
+    description: &'static str,
+    selector: &'static [i64],
+    golden: &'static str,
+    function: &'static str,
+) -> Case {
     Case {
         id,
         description,
@@ -837,7 +970,7 @@ fn case(
         kind: CaseKind::Module(ModuleRun {
             source: DRIVER_ABI_MODULE_SOURCE,
             module: "driver_abi",
-            function: "classify",
+            function,
             arity: 1,
             args: selector,
             nif: Some(DRIVER_ABI),
@@ -1109,6 +1242,54 @@ pub(crate) fn group() -> Vec<Case> {
             &[38],
             "49",
         ),
+        delivery_case(
+            "driver_abi/erl_drv_output_term_delivers_the_decoded_term",
+            "erl_drv_output_term/3 delivers {7,42} to the port owner as its message",
+            &[130],
+            "36987581376192810",
+        ),
+        delivery_case(
+            "driver_abi/erl_drv_output_term_delivers_a_term_with_an_existing_atom",
+            "erl_drv_output_term/3 delivers {ok,7} — an atom both atom tables already hold",
+            &[131],
+            "2424018157238192136455",
+        ),
+        delivery_case(
+            "driver_abi/erl_drv_output_term_delivers_a_binary_operand",
+            "erl_drv_output_term/3 delivers {<<1,2,3>>,5} built from an ERL_DRV_BUF2BINARY operand",
+            &[132],
+            "10411078662979633977254176055557",
+        ),
+        delivery_case(
+            "driver_abi/driver_output_term_delivers_the_decoded_term",
+            "the deprecated driver_output_term/3 delivers the same {7,42} to the port owner",
+            &[133],
+            "36987581376192810",
+        ),
+        delivery_case(
+            "driver_abi/erl_drv_send_term_delivers_the_decoded_term",
+            "erl_drv_send_term/4 delivers {7,42} to the process driver_connected/1 names",
+            &[134],
+            "36987581376192810",
+        ),
+        delivery_case(
+            "driver_abi/erl_drv_send_term_delivers_a_binary_operand",
+            "erl_drv_send_term/4 delivers {<<1,2,3>>,5} to the connected process",
+            &[135],
+            "10411078662979633977254176055557",
+        ),
+        delivery_case(
+            "driver_abi/driver_send_term_delivers_the_decoded_term",
+            "the deprecated driver_send_term/4 delivers {7,42} to the connected process",
+            &[136],
+            "36987581376192810",
+        ),
+        delivery_case(
+            "driver_abi/driver_send_term_delivers_a_term_with_an_existing_atom",
+            "the deprecated driver_send_term/4 delivers {ok,7} to the connected process",
+            &[137],
+            "2424018157238192136455",
+        ),
         case(
             "driver_abi/driver_set_timer_accepts_a_zero_millisecond_delay",
             "driver_set_timer/2 accepts a zero-millisecond delay on a timeout-capable entry",
@@ -1181,11 +1362,25 @@ pub(crate) fn group() -> Vec<Case> {
 #[cfg(test)]
 mod tests {
     //! Invariants of the expanded A.4 group: every case is a module-run case claiming
-    //! [`Contract::DriverAbi`], it drives the shared module through `classify/1` with the real
-    //! C fixture, and its golden is the oracle's integer answer for its one selector byte.
+    //! [`Contract::DriverAbi`], it drives the shared module with the real C fixture, and its golden
+    //! is the oracle's integer answer for its one selector byte.
 
     use super::{group, CaseKind, Contract, NifFixture};
     use std::collections::HashSet;
+
+    /// The one selector family whose observable is a **delivered term** rather than a
+    /// `driver_output*` byte payload, and the module entry point it must drive.
+    const DELIVERY_SELECTORS: std::ops::RangeInclusive<i64> = 130..=137;
+
+    /// The module entry point a case drives: `classify/1` for the byte/status families,
+    /// `classify_term/1` for the `ErlDrvTerm` delivery family.
+    fn expected_function(selector: i64) -> &'static str {
+        if DELIVERY_SELECTORS.contains(&selector) {
+            "classify_term"
+        } else {
+            "classify"
+        }
+    }
 
     #[test]
     fn every_case_is_a_driver_module_run_over_the_compiled_fixture() {
@@ -1208,7 +1403,13 @@ mod tests {
                 panic!("case {}: an A.4 case must be a module-run case", case.id);
             };
             assert_eq!(run.module, "driver_abi", "case {}", case.id);
-            assert_eq!(run.function, "classify", "case {}", case.id);
+            assert_eq!(
+                run.function,
+                expected_function(run.args[0]),
+                "case {}: selector {} must drive its family's entry point",
+                case.id,
+                run.args[0]
+            );
             assert_eq!(run.arity, 1, "case {}", case.id);
             let Some(NifFixture::CompiledLibrary { name, c_source }) = run.nif else {
                 panic!("case {}: the driver must be a real C-compiled .so", case.id);
@@ -1253,21 +1454,64 @@ mod tests {
     }
 
     /// The status selectors answer the single status byte `'1'` (integer `49`), so their golden is
-    /// `49`; the four payload selectors answer the base-256 value of the bytes the fixture emits.
+    /// `49`; the byte-payload selectors answer the base-256 value of the bytes the fixture emits and
+    /// the delivery selectors the base-256 value of the delivered term's ETF image — never `49`.
     #[test]
     fn the_goldens_are_the_status_byte_or_a_payload_value() {
         let mut payloads = 0;
+        let mut deliveries = 0;
         for case in group() {
             let CaseKind::Module(run) = case.kind else { unreachable!() };
             let golden = case.golden.stdout.unwrap();
             if run.args[0] >= 110 && run.args[0] <= 113 {
                 payloads += 1;
                 assert_ne!(golden, "49", "case {}: a payload selector has a byte payload", case.id);
+            } else if DELIVERY_SELECTORS.contains(&run.args[0]) {
+                deliveries += 1;
+                assert_ne!(
+                    golden, "49",
+                    "case {}: a delivery selector has the delivered term as its payload",
+                    case.id
+                );
             } else {
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
         assert_eq!(payloads, 4, "the four driver_output* byte round trips");
+        assert_eq!(
+            deliveries,
+            DELIVERY_SELECTORS.count(),
+            "one delivery case per (form, spec) selector"
+        );
+    }
+
+    /// The delivery family is only worth pinning if it covers **all four** forms
+    /// (`erl_drv_output_term`, the deprecated `driver_output_term`, `erl_drv_send_term`, the
+    /// deprecated `driver_send_term`) and all three operand shapes (integers, an existing atom, a
+    /// byte-string `ERL_DRV_BUF2BINARY`). The fixture keys both on the selector, so a dropped
+    /// selector would silently shrink the surface.
+    #[test]
+    fn the_delivery_family_covers_every_form_and_spec_shape() {
+        let selectors: HashSet<i64> = group()
+            .into_iter()
+            .map(|case| match case.kind {
+                CaseKind::Module(run) => run.args[0],
+                _ => unreachable!("every A.4 case is a module-run case"),
+            })
+            .collect();
+        // 130..137: `erl_drv_output_term` ×3 shapes, `driver_output_term`, `erl_drv_send_term` ×2,
+        // `driver_send_term` ×2.
+        assert_eq!(
+            DELIVERY_SELECTORS.count(),
+            8,
+            "one selector per (form, spec) pair of the delivery family"
+        );
+        for selector in DELIVERY_SELECTORS {
+            assert!(
+                selectors.contains(&selector),
+                "selector {selector} (a delivery family member) is missing"
+            );
+        }
     }
 
     /// The three families this group widened are all present: the `ErlDrvTerm` spec family
