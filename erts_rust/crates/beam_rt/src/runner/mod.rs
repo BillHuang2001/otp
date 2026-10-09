@@ -70,6 +70,18 @@
 //! Legacy C ground truth (read-only): `../../erts/emulator/beam/erl_process.c`
 //! (`schedule`/`erts_schedule`), `beam_common.c` (`apply`/`return`).
 //!
+//! # The execution tier of a first entry
+//!
+//! A process's **first** entry can run on either execution tier (`beam_engine::Tier`); a
+//! *resume* continues the machine it suspended in, on the interpreter, with no tier entry.
+//! [`tier`] owns the selection and the soundness argument for it: the baseline JIT is only
+//! chosen when the entry module is **provably free of a module-context switch**
+//! (`Step::Enter`) — no `apply`/`apply_last`, and every `call_ext*` target provably
+//! synchronous — because the JIT driver has no in-machine module switch and would turn such
+//! a step into a bogus exit reason. The mode is [`JitMode`](tier::JitMode):
+//! [`Auto`](tier::JitMode::Auto) (the default, gated by the predicate), or a forced
+//! interpreter/baseline from `BEAM_RT_TIER` / a test.
+//!
 //! # Layout
 //!
 //! * [`entry`] — the runtime-scheduled entry point ([`ProcessEntry`]) and the per-pid
@@ -77,6 +89,7 @@
 //! * [`run`] — the [`ProcessRunner`](beam_process::ProcessRunner) implementation
 //!   ([`RuntimeRunner`]): one reduction slice of one scheduled process.
 //! * [`budget`] — the slice's reduction budget and the wrapper context that charges it.
+//! * [`tier`] — the static execution-tier selection and the switch-safety predicate.
 //! * [`reason`] — the exit-reason translation and the finite-`receive` deadline recovery.
 //! * [`perf`] — the `+JPperf` code-map feed (contract A.8).
 
@@ -85,6 +98,7 @@ mod entry;
 mod perf;
 mod reason;
 mod run;
+mod tier;
 #[cfg(test)]
 mod tests;
 
