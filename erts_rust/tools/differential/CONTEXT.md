@@ -91,8 +91,8 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - **No coupling to `crates/*` internals** (crate deps are `serde` + `serde_json` only). No `clap`; arg parsing is hand-rolled `std`. `unsafe` is **forbidden**.
 - **Loud failures:** stderr messages + nonzero exit; never silently swallow an error.
 - Machine-readable JSON, stable schema, written under the gitignored `out/` (or `--out <dir>`).
-- Files target ~1000 lines; split by responsibility. Apache-2.0. The corpus group files are **data registries** (one embedded module/expression per case) and legitimately run past the soft target (`errors.rs`, `wire.rs`, `nif_abi.rs`, `driver_abi.rs`); do not split them for line count alone. `src/report.rs` (production + its `#[cfg(test)]` tests) is a plain module and is the node to split next when it grows.
-- The built-in corpus is the **conformance corpus** (1100 cases) and runs end to end in CI; keep it fast enough for that, and reserve the heavy external suites (root §6) for milestones.
+- Files target ~1000 lines; split by responsibility. Apache-2.0. The corpus group files are **data registries** (one embedded module/expression per case) and legitimately run past the soft target (`errors.rs`, `wire.rs`, `nif_abi.rs`, `driver_abi.rs`); do not split them for line count alone. The `report` module is a directory module split by responsibility (`report/{model,json,render}.rs`, each well under the target).
+- The built-in corpus is the **conformance corpus** (1213 cases) and runs end to end in CI; keep it fast enough for that, and reserve the heavy external suites (root §6) for milestones.
 - **Never assert a golden whose output is order-unstable.** A `~w` rendering of a multi-key map (or any structure containing one) has a per-VM-start iteration order, so compare it structurally (`maps:size`, `lists:sort(maps:keys(M))`, single-key maps) instead. Same rule for pids/refs/ports/creation values that vary per VM start, and for a `load_nif` failure message that embeds a temp-dir path — assert a shape or classify into an integer, or use a deterministic decode→re-encode round-trip.
 
 ## Design Decisions
