@@ -806,14 +806,20 @@ mod tests {
 
     /// A runtime with the boot floor loaded, so the shared atom table holds the names the
     /// reply shapes need.
-    fn runtime() -> Runtime {
+    ///
+    /// `pub(super)` so the `get_until` child's tests reuse the one runtime fixture rather
+    /// than booting a second, subtly different one.
+    pub(super) fn runtime() -> Runtime {
         let mut runtime = Runtime::with_defaults().expect("a runtime");
         runtime.boot().expect("boot");
         runtime
     }
 
     /// Builds a term on `runtime`'s arena through a fresh context.
-    fn build(runtime: &mut Runtime, f: impl FnOnce(&mut RuntimeContext) -> Eterm) -> Eterm {
+    pub(super) fn build(
+        runtime: &mut Runtime,
+        f: impl FnOnce(&mut RuntimeContext) -> Eterm,
+    ) -> Eterm {
         let mut ctx = RuntimeContext::new(runtime);
         f(&mut ctx)
     }

@@ -189,10 +189,15 @@ pub(super) fn serve(
 }
 
 /// The device `service`, or the typed gap for a request that arrived after it was retired.
-fn device(runtime: &Runtime, service: ProcessId) -> Result<&Device> {
-    runtime.file_services.devices.get(&service).ok_or_else(|| {
-        error::unsupported("file_server: a request for a closed io device")
-    })
+///
+/// The borrow is mutable because serving a request consumes the stashed buffer
+/// (`State#state.buf`) and writes the new leftover back into it.
+fn device(runtime: &mut Runtime, service: ProcessId) -> Result<&mut Device> {
+    runtime
+        .file_services
+        .devices
+        .get_mut(&service)
+        .ok_or_else(|| error::unsupported("file_server: a request for a closed io device"))
 }
 
 /// The oracle's `{'EXIT', Reason}` boxing of a continuation that raised
@@ -354,7 +359,12 @@ fn interpret(runtime: &Runtime, value: Eterm) -> Result<Option<Applied<Eterm, Et
     let Some(fields) = tuple_fields(value) else {
         return Ok(None);
     };
-    let tag = runtime.atom_name(fields[0]);
+    // `{}` is a tuple with no head — `io_lib:get_until/4`'s `case` has no clause for it
+    // (the `case_clause`), so it must not be indexed.
+    let Some(head) = fields.first() else {
+        return Ok(None);
+    };
+    let tag = runtime.atom_name(*head);
     match (tag.as_deref(), fields.len()) {
         (Some("more"), 2) => Ok(Some(Applied::More(fields[1]))),
         (Some("done"), 3) => Ok(Some(Applied::Done {
