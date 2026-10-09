@@ -482,6 +482,37 @@ impl ProcessTable {
             .ok_or_else(error::unknown_process)
             .map(|process| process.set_priority(priority))
     }
+
+    // --- GC relocation exemption ---------------------------------------------
+
+    /// Marks the process named by `pid` as **relocation-exempt** (or clears the mark).
+    ///
+    /// A thin table-level convenience over
+    /// [`Process::set_relocation_exempt`](crate::process::Process::set_relocation_exempt): the host
+    /// (`beam_rt`) marks a process whose full root set it cannot publish, so the crate never
+    /// relocates its heap (see that method for the full contract). The table's own `deliver`
+    /// already propagates [`Process::deliver`](crate::process::Process::deliver)'s error unchanged,
+    /// so no table-level delivery change is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `pid` is unknown.
+    pub fn set_relocation_exempt(&mut self, pid: ProcessId, exempt: bool) -> Result<()> {
+        self.get_mut(pid)
+            .ok_or_else(error::unknown_process)
+            .map(|process| process.set_relocation_exempt(exempt))
+    }
+
+    /// Whether the process named by `pid` is **relocation-exempt** (default `false`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `pid` is unknown.
+    pub fn is_relocation_exempt(&self, pid: ProcessId) -> Result<bool> {
+        self.get(pid)
+            .map(Process::is_relocation_exempt)
+            .ok_or_else(error::unknown_process)
+    }
     // --- message delivery ----------------------------------------------------
 
     /// Delivers `term` (with off-heap references resolved against `src_off_heap`) from `from`

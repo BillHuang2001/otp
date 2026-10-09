@@ -37,7 +37,9 @@
 //! * an `erlang:monitor/3` `{tag, Tag}` whose `Tag` is not a heap-independent immediate ⇒
 //!   [`unsupported_tag`],
 //! * a genuinely unimplemented capability ⇒ [`unsupported`] (a BEAM `error` raise), so a caller
-//!   never receives a wrong result in place of a typed diagnostic.
+//!   never receives a wrong result in place of a typed diagnostic,
+//! * a collection / nursery growth refused because the process is **relocation-exempt** ⇒
+//!   [`relocation_exempt`] (also a BEAM `error` raise).
 //!
 //! Heap exhaustion during delivery is *not* modelled here: it is the underlying
 //! `BeamError::Alloc` propagated after a collect-and-retry (see `Process::deliver`).
@@ -75,6 +77,25 @@ pub(crate) fn system_limit() -> BeamError {
 /// single place the `unsupported:` prefix is spelled.
 pub(crate) fn unsupported(what: &str) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(format!("unsupported: {what}"))))
+}
+
+/// The typed diagnostic for a [`Process::collect`](crate::process::Process::collect) /
+/// [`Process::ensure_capacity`](crate::process::Process::ensure_capacity) that was **refused**
+/// because the process is **relocation-exempt**.
+///
+/// A relocation-exempt process's heap must not be relocated: a host holds live terms from it in
+/// Rust locals and nested-`Machine` registers that are outside the crate's root set (see
+/// [`Process::set_relocation_exempt`](crate::process::Process::set_relocation_exempt)), so a
+/// collection against the incomplete root set would recycle live words. There is **no**
+/// `CollectionKind::None`, so the refusal cannot be represented as a fake
+/// [`Collection`](beam_gc::Collection) — it is raised as this typed `error` instead, exactly as
+/// [`unsupported`] reports a capability gap rather than a silent default. The no-op sibling
+/// [`Process::collect_if_needed`](crate::process::Process::collect_if_needed) answers `Ok(false)`
+/// directly (its return value already means "no collection ran") and never reaches here.
+pub(crate) fn relocation_exempt(what: &str) -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom(format!(
+        "relocation_exempt: {what}"
+    ))))
 }
 
 /// The typed diagnostic for an `erlang:monitor(port, Name)` on a **registered name**
