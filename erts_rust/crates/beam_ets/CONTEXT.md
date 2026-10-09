@@ -606,21 +606,23 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   (including the small-int/float keys the tests pin) is exact.
 
 ## Handoffs (to other nodes — NOT adopted here)
-- **`beam_bifs` — adopt `select_reverse/1,2,3`.** The crate primitive + read gate exist
-  (`Table::select_reverse*` / `TableAccess::select_reverse*`); the BIF is still a seam-backed
-  `unsupported_bif`. Route it through the read-gated `TableAccess` forms.
-- **`beam_bifs` — adopt `WriteConcurrency`.** `src/kind.rs` now models the whole `{write_concurrency,_}`
-  surface (`WriteConcurrency::Off`/`On`/`Auto`/`FixedLocks(n)`); the parser can drop its private mirror.
+- **`beam_bifs` — adopt the new `{protection, Access}` setter.** This crate now exposes the post-creation
+  protection change (`SetOpt::Access(Access)` + the owner-gated `Table::setopts(caller, SetOpt)` + the
+  primitive `Table::set_access` + the enforcing `TableAccess::set_access`). `beam_bifs::ets::adopt::setopts_2`
+  still answers the typed `unsupported_bif` for **any** `{protection, _}` (it validates the argument, then
+  returns the gap before touching the table). The adoption is: after the existing owner check, map the
+  parsed protection onto `SetOpt::Access` and call `table.as_requester(Some(caller)).setopts(opt)` — the
+  parse-level `{protection, bogus}` `badarg` stays `beam_bifs`'s (`parse_setopts`).
 - **`beam_bifs` — the `auto` / `{debug_hash_fixed_number_of_locks, Nlocks}` rendering stays host-side.**
   `TableInfo::write_concurrency` is a `bool`, so the `TableProfile` sidecar must supply the `auto` atom /
   the normalized lock count (`TableOptions` stores the *requested*, un-normalized count).
-- **`beam_bifs`/`beam_rt` — the `ets:*` bridge is still un-gated and owner-less** (pre-existing;
-  `ETS_SURFACE.md` §7.1–§7.4): it calls the raw `Table::*` primitives, records no owner, and nothing
-  calls `Table::owner_died`. Routing through `Table::as_requester`, recording the owner, and a
-  process-exit observer remain the runtime's work.
-- **`beam_bifs` — the option parser/renderer lag** (`ETS_SURFACE.md` §7.5): it still rejects
-  `compressed`/`{write_concurrency,_}`/`{read_concurrency,_}`/`{heir,…}`/`{decentralized_counters,_}`
-  and recomputes `decentralized_counters` instead of reading `TableInfo::decentralized_counters`.
+- **`beam_bifs`/`beam_rt` — the runtime owner index is `named_table`-only.** The owner is recorded
+  (`ets:new/2` calls `Table::set_owner`), the access gate is enforced (`take_table_gated`), and the
+  process-exit hook exists (`beam_process::ProcessExitObserver`, driven by
+  `beam_rt::runtime::ets_owner::drain_ets_owner_exits` → `Table::owner_died`); the residual is that the
+  runtime's `OwnerIndex` is built from the `named_table`s seen at `ets:new/2`, so a dead owner's **unnamed**
+  table is not reclaimed. `beam_bifs::TableRegistry::handles_owned_by` (which covers unnamed tables) exists
+  but is not yet the runtime's index (`ETS_SURFACE.md` §7.4).
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
