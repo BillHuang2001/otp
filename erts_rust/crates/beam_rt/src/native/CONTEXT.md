@@ -485,6 +485,7 @@ The per-call dispatch arm for every native BIF is a registration in `../native.r
 `../native.rs`'s module-doc table still omits those two names, so the parent node should add them there.
 `init:get_argument(root)` and `init:get_argument(home)` agree with the oracle through the same `init:get_argument/1` arm.
 `init:get_argument(progname)` is a deliberate, invocation-dependent gap: both runtimes report the basename **they** were invoked as (the oracle's `"erl"` comes from the `erl` shell script's `$0`), so the value is a property of the harness's invocation, not one this runtime may fabricate — never a wrong result.
+The `file_server_2` service's three cross-node gaps — the `{get_until,…}` tokenizer request and a scheduled `gen_server:call` (**`beam_engine`**), and `io:request/2`'s `net_kernel:dflag_unicode_io/1` (**`beam_rt`**'s `../native.rs`) — are itemised in the `file_server.rs` subsection above.
 
 ## See Also
 - `../../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.
