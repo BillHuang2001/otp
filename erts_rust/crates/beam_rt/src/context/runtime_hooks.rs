@@ -74,6 +74,7 @@ use beam_term::prelude::{atom_val, is_atom, is_small, make_small, signed_value};
 use beam_term::{AtomTable, Eterm};
 
 use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::error;
@@ -344,6 +345,212 @@ impl<'a> RuntimeHooksBridge<'a> {
         atom_term(atoms, "true")
     }
 
+    /// `erlang:dt_get_tag/0`, `erlang:dt_get_tag_data/0`, `erlang:dt_put_tag/1` — the
+    /// dynamic-tracing tag family.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): with dynamic tracing compiled out
+    /// (`!USE_VM_PROBES`, `erts/emulator/beam/bif.c:5980-6160`) all three answer the atom
+    /// `undefined`; `dt_put_tag/1` ignores its argument entirely.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap when the atom `undefined` is not interned.
+    fn dt_tag(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "undefined")
+    }
+
+    /// `erlang:dt_append_vm_tag_data/1`, `erlang:dt_prepend_vm_tag_data/1` — the VM-probe tag
+    /// data helpers.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): with dynamic tracing compiled out both return
+    /// their argument **unchanged** and apply no type check — `dt_append_vm_tag_data(42)`
+    /// answers `42` (`bif.c`'s `!USE_VM_PROBES` bodies). `lib/kernel/src/file.erl` brackets
+    /// its calls with these, so serving them is what keeps that path running.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` when the argument is missing.
+    fn dt_vm_tag_data(&self, args: &[Eterm]) -> Result<Eterm> {
+        args.first().copied().ok_or(BeamError::BadArg)
+    }
+
+    /// `erlang:system_profile/0` — the profiler start request.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers the atom `undefined`. The C only answers
+    /// anything else when a profiling subsystem is actually running in the emulator, and this
+    /// runtime has none.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap when the atom `undefined` is not interned.
+    fn system_profile(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "undefined")
+    }
+
+    /// `erlang:check_old_code/1` — whether any process still runs old code for `Module`.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): a non-atom is `badarg`; **any** atom answers
+    /// `false` (even an unloaded one). There is never old code here: loading a module never
+    /// replaces a live one in this runtime, so the honest answer is always `false`.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom.
+    fn check_old_code(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(BeamError::BadArg);
+        }
+        atom_term(atoms, "false")
+    }
+
+    /// `erlang:finish_loading/1` — the prepared-code loading primitive.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): the empty list answers `ok`; anything else —
+    /// including the non-empty list a real `code:load_binary` would pass — is `badarg`,
+    /// because `prepare_loading/2` (which mints the internal prepared-code terms) is not
+    /// implemented and the C requires a genuine prepared term
+    /// (`erts/emulator/beam/beam_bif_load.c:793-845`).
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for anything but the empty list.
+    fn finish_loading(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let prepared = *args.first().ok_or(BeamError::BadArg)?;
+        if !terms::list_elements(prepared)
+            .map_err(|_| BeamError::BadArg)?
+            .is_empty()
+        {
+            return Err(BeamError::BadArg);
+        }
+        atom_term(atoms, "ok")
+    }
+
+    /// `erlang:call_on_load_function/1`, `erlang:has_prepared_code_on_load/1` and
+    /// `erlang:finish_after_on_load/2` — the on-load-hook primitives.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`, a BEAMASM build): all three always answer
+    /// `badarg`. They require an internal prepared-code term that only `prepare_loading/2`
+    /// can mint (and on BEAMASM `call_on_load_function` rejects even that form,
+    /// `beam_bif_load.c:793-799`), so `badarg` is the honest, complete answer.
+    ///
+    /// # Errors
+    ///
+    /// Always `badarg`.
+    fn badarg_always(&self) -> Result<Eterm> {
+        Err(BeamError::BadArg)
+    }
+
+    /// `erts_internal:is_system_process/1` and `erts_internal:is_process_executing_dirty/1`
+    /// — process-state predicates over an **internal** pid.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): a local pid answers `false` for both (this
+    /// runtime has no system process and never executes Process code on a dirty scheduler);
+    /// anything that is not a pid is `badarg`. A **remote** pid is the typed capability gap
+    /// rather than a fabricated `false`: the C reads the local process record
+    /// (`erl_bif_info.c:4336-4360`, `erl_process.c:9216-9250`), which a foreign pid has none
+    /// of (`PidTarget::Remote` is a distribution, contract A.5, not implemented here).
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-pid; the typed gap for a remote pid.
+    fn is_process_predicate(&self, atoms: &AtomTable, args: &[Eterm], what: &str) -> Result<Eterm> {
+        let term = *args.first().ok_or(BeamError::BadArg)?;
+        match PidTarget::from_eterm(term) {
+            Ok(PidTarget::Local(_)) => atom_term(atoms, "false"),
+            Ok(PidTarget::Remote(_)) => Err(error::unsupported(&format!(
+                "erts_internal:{what}/1 on a remote pid: distribution is not implemented"
+            ))),
+            Err(_) => Err(BeamError::BadArg),
+        }
+    }
+
+    /// `erts_internal:erase_persistent_terms/0` — erase **every** persistent term.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers `true`. This is the test suite's reset
+    /// hook (`erts/emulator/beam/erl_bif_persistent.c:551-567`), and it really clears this
+    /// runtime's own store (`Runtime::persistent_terms`) — a later
+    /// `persistent_term:get/0` sees an empty table.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap when the store is already borrowed (the BIF cannot re-enter
+    /// it), mirroring the `PersistentTerm` arm's nested-borrow contract.
+    fn erase_persistent_terms(&self, atoms: &AtomTable) -> Result<Eterm> {
+        let store = Rc::clone(&self.runtime.persistent_terms);
+        let mut store = store.try_borrow_mut().map_err(|_| {
+            error::unsupported(
+                "erts_internal:erase_persistent_terms/0: the persistent-term store is in use",
+            )
+        })?;
+        for (key, _) in store.get_all() {
+            store.erase(key, atoms);
+        }
+        atom_term(atoms, "true")
+    }
+
+    /// `erts_literal_area_collector:release_area_switch/0` — the literal-area switch probe.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers the atom `notsup`, i.e. the facility is
+    /// not available in this build. This runtime has no literal-area-collector process at
+    /// all, so `notsup` is the honest answer rather than a fabricated success.
+    ///
+    /// # Errors
+    ///
+    /// The typed gap when the atom `notsup` is not interned.
+    fn notsup(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "notsup")
+    }
+
+    /// `erts_trace_cleaner:check/0` — whether the trace-cleaner has work to do.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers `false`
+    /// (`erts/emulator/beam/erl_bif_trace.c:605-640` returns `am_false` unless a cleanup
+    /// signal is pending). This runtime never mints one.
+    ///
+    /// # Errors
+    ///
+    /// The typed gap when the atom `false` is not interned.
+    fn trace_cleaner_check(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "false")
+    }
+
+    /// `error_logger:warning_map/0` — the logger-level → error-logger-event mapping.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers the atom `warning`, the fixed
+    /// `erts_error_logger_warnings` mapping this build ships.
+    ///
+    /// # Errors
+    ///
+    /// The typed gap when the atom `warning` is not interned.
+    fn warning_map(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "warning")
+    }
+
+    /// `code:set_coverage_mode/1` — set the coverage mode, answering the **previous** mode.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): only the atoms `none` and `line` are accepted
+    /// (anything else, `call` included, is `badarg`) and the answer is `none` — this runtime
+    /// has no coverage-instrumented code, so the previous mode is always `none`
+    /// (`code:coverage_support/0` is `true`, `code:get_coverage_mode/0` is `none`; the
+    /// per-module and per-call coverage *readers* — `get_coverage/2`, `reset_coverage/1`,
+    /// `get_debug_info/1` — are `badarg` for every argument in this build, so they stay the
+    /// typed capability gap).
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom or an atom other than `none`/`line`.
+    fn set_coverage_mode(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let mode = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(mode) {
+            return Err(BeamError::BadArg);
+        }
+        match atoms.name(atom_val(mode)) {
+            Some("none") | Some("line") => atom_term(atoms, "none"),
+            _ => Err(BeamError::BadArg),
+        }
+    }
+
     /// `erlang:statistics/1` — the counters this runtime can answer **honestly** from its
     /// own real state.
     ///
@@ -529,6 +736,35 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             ("erlang", "dt_spread_tag", 1) => self.dt_spread_tag(atoms, args),
             ("erlang", "dt_restore_tag", 1) => self.dt_restore_tag(atoms, args),
             ("erlang", "statistics", 1) => self.statistics(heap, atoms, args),
+            // Dynamic-tracing tag family: compiled out, so each is the oracle's fixed answer.
+            ("erlang", "dt_get_tag", 0)
+            | ("erlang", "dt_get_tag_data", 0)
+            | ("erlang", "dt_put_tag", 1) => self.dt_tag(atoms),
+            ("erlang", "dt_append_vm_tag_data", 1)
+            | ("erlang", "dt_prepend_vm_tag_data", 1) => self.dt_vm_tag_data(args),
+            ("erlang", "system_profile", 0) => self.system_profile(atoms),
+            // The code-store primitives the runtime can answer from its own real state.
+            ("erlang", "check_old_code", 1) => self.check_old_code(atoms, args),
+            ("erlang", "finish_loading", 1) => self.finish_loading(atoms, args),
+            ("erlang", "call_on_load_function", 1)
+            | ("erlang", "has_prepared_code_on_load", 1)
+            | ("erlang", "finish_after_on_load", 2) => self.badarg_always(),
+            // Internal process-state predicates and the persistent-term reset hook.
+            ("erts_internal", "is_system_process", 1) => {
+                self.is_process_predicate(atoms, args, "is_system_process")
+            }
+            ("erts_internal", "is_process_executing_dirty", 1) => {
+                self.is_process_predicate(atoms, args, "is_process_executing_dirty")
+            }
+            ("erts_internal", "erase_persistent_terms", 0) => self.erase_persistent_terms(atoms),
+            // The internal `notsup` probes and the trace-cleaner / error-logger constants.
+            ("erts_literal_area_collector", "release_area_switch", 0) => self.notsup(atoms),
+            ("erts_trace_cleaner", "check", 0) => self.trace_cleaner_check(atoms),
+            ("error_logger", "warning_map", 0) => self.warning_map(atoms),
+            // The `code:*` coverage-mode surface (see `set_coverage_mode`).
+            ("code", "coverage_support", 0) => atom_term(atoms, "true"),
+            ("code", "get_coverage_mode", 0) => atom_term(atoms, "none"),
+            ("code", "set_coverage_mode", 1) => self.set_coverage_mode(atoms, args),
             // Unreachable: `RuntimeContext::uses_runtime_hooks` gates this bridge to exactly
             // the keys above. Reporting the same typed capability gap the defaulted seam
             // reports keeps an ungated key honest rather than fabricated (workspace
