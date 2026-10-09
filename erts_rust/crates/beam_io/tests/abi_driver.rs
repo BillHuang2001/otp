@@ -122,13 +122,17 @@ fn the_drivers_output_callback_echoes_bytes_back_to_the_owner() {
     registry.close(&mut poller, id).expect("the port closes");
 }
 
-/// A `port_command` write-readiness task reaches the driver's `ready_output` callback.
+/// A `port_command` write-readiness task delivers the command bytes through the driver's `output`
+/// callback **and** runs its `ready_output` notification callback.
 ///
 /// `port_command`/`PortRegistry::port_command` only queues the bytes and schedules an `OUTPUT`
-/// task (the `erlang:port_command/2` contract); the task dispatches the port's *write-readiness*
-/// seam, which the C-ABI adapter maps onto the entry's `ready_output` callback when it has one (the
-/// fixture's emits `"W"`) — an Erlang→driver command does **not** run the `output` callback through
-/// this task. The driver's `output` callback is exercised separately, above and below.
+/// task (the `erlang:port_command/2` contract); running that task reproduces the C's combined
+/// effect: the queued bytes go to the entry's `output`/`outputv` slot (the C's `port_command` →
+/// `output`/`outputv`, `io.c:1782`/`io.c:1517`) and, when the entry also declares `ready_output`,
+/// that slot then runs as the C's write-readiness notification (the `ERTS_PORT_TASK_OUTPUT` arm,
+/// `erl_port_task.c:1793-1797`). The fixture echoes the bytes its `output` receives and emits `"W"`
+/// from `ready_output`, both through `driver_output`, so the owner sees `"hello"` then `"W"` — the
+/// order in which the C performs them, coalesced by the port's single input queue.
 #[test]
 fn a_port_command_write_readiness_task_reaches_ready_output() {
     let Some(so) = fixture_so() else {
@@ -144,12 +148,14 @@ fn a_port_command_write_readiness_task_reaches_ready_output() {
         .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
         .expect("the OUTPUT task runs");
     assert_eq!(outcome.ran, 1, "the queued command schedules one task");
-    // One round both runs the task and harvests what it produced, so the marker is in this
+    // One round both runs the task and harvests what it produced, so both echoes are in this
     // outcome's notifications (a second round would find the port's input queue already drained).
     assert_eq!(
         data_of(&outcome, id),
-        vec![b"W".to_vec()],
-        "the OUTPUT task runs the driver's ready_output callback"
+        vec![b"helloW".to_vec()],
+        "the OUTPUT task writes the queued bytes through the driver's output callback, then runs \
+         its ready_output notification — both echo through driver_output into the port's input \
+         queue, so the owner sees them coalesced in that order"
     );
 
     registry.close(&mut poller, id).expect("the port closes");

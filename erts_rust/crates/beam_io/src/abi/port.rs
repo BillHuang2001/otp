@@ -33,7 +33,7 @@
 //! | [`Driver::start`] | `start` | absent slot ⇒ `badarg` (the C's `init_driver` requires it) |
 //! | [`Driver::output`] | `outputv`, falling back to `output` | the port's output queue is drained and handed over |
 //! | [`Driver::ready_input`] | `ready_input` | absent slot ⇒ no-op (the C's `no_ready_input_callback`) |
-//! | [`Driver::ready_output`] | `ready_output`, falling back to `outputv`/`output` | absent `ready_output` ⇒ the `output`/`outputv` write path |
+//! | [`Driver::ready_output`] | `outputv`/`output`, then `ready_output` | the write path, then the write-readiness notification when the slot exists |
 //! | [`Driver::timeout`] | `timeout` | absent slot ⇒ no-op (`no_timeout_callback`) |
 //! | [`Driver::control`] | `control` | absent slot ⇒ `badarg` (`io.c:4035`) |
 //! | [`Driver::port_exit`] | `process_exit`, falling back to `emergency_close` | the C has no port-exit callback |
@@ -99,11 +99,12 @@
 //!
 //! * **`output`/`ready_output` bytes are treated as consumed.** The C `output`/`ready_output`
 //!   callbacks return `void`; the port hands the driver whatever is in the output queue and counts
-//!   the whole buffer as written. A `ready_output`-only driver gets the drained bytes nowhere (its
-//!   callback has no buffer parameter), exactly as in the C where the driver is expected to write
-//!   what it stashed from `output`. Both paths prefer the **`outputv`** slot when the entry
-//!   declares one (`if (drv->outputv) … else … drv->output`, `io.c:1782`), so an entry whose only
-//!   port-command callback is `outputv` still receives its `port_command` bytes.
+//!   the whole buffer as written. Both paths drain that queue through the **`outputv`** slot when
+//!   the entry declares one, else its `output` (`if (drv->outputv) … else … drv->output`,
+//!   `io.c:1782`), so an entry whose only port-command callback is `outputv` still receives its
+//!   `port_command` bytes. When the entry additionally declares `ready_output`, that slot runs
+//!   afterwards as the C's write-readiness notification; it receives no buffer (its parameter is
+//!   the event), so the bytes are delivered by `output`/`outputv`, never by it.
 //! * **`ready_input`/`ready_output` name one fd.** The C fires one callback per `ErlDrvEvent`; the
 //!   poller here keys a registration by port number, so the fd is taken from the driver's own
 //!   `driver_select` bookkeeping (see [`DriverState::fd_armed`](crate::DriverState)). A port with
@@ -634,7 +635,7 @@ impl Driver for DriverPort {
     ///
     /// The C callback returns `void`, so the whole drained buffer is counted as written (see the
     /// module docs). An absent `output` slot is the C's logging `no_output_callback`
-    /// (`io.c:7520-7529`) when the entry has no `outputv` either: the bytes are still counted as
+    /// (`io.c:7516-7520`) when the entry has no `outputv` either: the bytes are still counted as
     /// consumed, exactly as the C's default callback lets them vanish. When the entry declares
     /// `outputv`, that slot is preferred (see [`DriverPort::write_driver`]).
     fn output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
@@ -658,39 +659,34 @@ impl Driver for DriverPort {
         Ok(())
     }
 
-    /// `ready_output`: tell the driver its selected fd is writable.
+    /// `ready_output`: drain the port's output queue to the driver **and** report write-readiness.
     ///
-    /// The output queue is drained into `output`'s shape first (the port's single write path); when
-    /// the entry has a `ready_output` slot the drained buffer has nowhere to go — the C callback
-    /// takes only the event — so those queued bytes are dropped and the driver is expected to write
-    /// what it stashed from `output`. An absent `ready_output` slot falls back to the
-    /// `output`/`outputv` write path, so a driver *without* the slot still receives a queued command.
+    /// The drained bytes always go down this crate's single write path,
+    /// [`DriverPort::write_driver`] — the C's `port_command` → `output`/`outputv` delivery
+    /// (`io.c:1782`/`io.c:1517`) — so a queued command reaches the driver whichever callback slots
+    /// its entry declares. When the entry also declares a `ready_output` slot, that slot then runs
+    /// with the write-armed fd as the event: it is the C's write-**readiness** notification (the
+    /// `ERTS_PORT_TASK_OUTPUT` arm, `erl_port_task.c:1793-1797`), not a second write path, so an
+    /// entry declaring both callbacks sees the C's combined effect (bytes via `output`/`outputv`,
+    /// then the notification).
     ///
-    /// # The C writes nothing here (the source of the `ready_output`-present gap)
-    ///
-    /// The C's `no_ready_output_callback` (`io.c:7531-7538`) does **not** call `output` — it only
-    /// reports the missing callback and deselects — because the C never routes a command through
-    /// `ready_output`: `port_command` hands the bytes to `output`/`outputv` directly
-    /// (`io.c:1782`/`io.c:1517`) and an `ERTS_PORT_TASK_OUTPUT` task only reports write-readiness
-    /// (`erl_port_task.c:1793-1797`), while a *deferred* write is a separate `PROC_SIG` task whose
-    /// callback is `port_sig_output` → `call_driver_output` (`io.c:1537-1553`).
-    /// This port instead carries the output queue itself, so `PortRegistry::port_command`
-    /// (`src/registry.rs`) defers the write to the `OUTPUT` task: that task is therefore the write
-    /// path for a slot-absent entry, but leaves a slot-present entry's queued command bytes
-    /// undelivered (the adapter can hand the slot the event only). Closing that gap belongs to the
-    /// command path (`PortRegistry::port_command`), not to this adapter — see
-    /// `src/abi/CONTEXT.md` › *Known Issues*.
+    /// A slot-absent entry is unaffected: [`DriverPort::write_driver`] routes to the entry's
+    /// `outputv`/`output`, and an entry declaring neither gets the C's logging `no_output_callback`
+    /// (`io.c:7516-7520`), which writes nothing — the bytes still count as written (the C callbacks
+    /// return `void`).
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         let mut buf = ctx.output().front().to_vec();
         let len = buf.len();
         ctx.output().consume(len);
+        // Read the write-armed fd *before* the write: the notification reports the readiness the
+        // task was scheduled for, not whatever the write callback may re-arm (`output`/`outputv`
+        // are free to call `driver_select`).
         let event = fd_to_event(self.abi.state().fd_armed(false));
+        self.write_driver(ctx, &mut buf);
         if self.lib.entry().ready_output.is_some() {
             self.call(ctx, |port, _handle| {
                 let _ = port.lib.ready_output(port.data, event);
             });
-        } else {
-            self.write_driver(ctx, &mut buf);
         }
         Ok(len)
     }
