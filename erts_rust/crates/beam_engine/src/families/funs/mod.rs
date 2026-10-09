@@ -142,7 +142,7 @@ pub(crate) fn exec(
                 .checked_sub(descriptor.num_free)
                 .ok_or_else(|| error::unsupported("make_fun3: num_free exceeds arity"))?;
             let extra: usize = env.iter().map(operand_slack_words).sum();
-            let fun = terms::make_fun(
+            let fun = terms::make_fun_rooted(
                 machine,
                 ctx,
                 RootSet::ALL_LIVE,

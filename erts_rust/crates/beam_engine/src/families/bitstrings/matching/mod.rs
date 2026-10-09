@@ -327,7 +327,7 @@ pub(super) fn exec(
             }
             let bytes = raw::subject_bytes(orig)?;
             let value = read_float_field(bytes, start, nbits, *flags)?;
-            let float = crate::terms::make_float(machine, ctx, value)?;
+            let float = crate::terms::make_float_rooted(machine, ctx, value)?;
             write_operand(machine, dst, float)?;
             // `make_float` reserves through the rooted seam, so a moving collector may
             // have relocated the context read above: re-read the context operand

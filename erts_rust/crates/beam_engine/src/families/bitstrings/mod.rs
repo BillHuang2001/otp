@@ -140,7 +140,7 @@ pub(super) fn fail_step(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
     if fail == NO_FAIL {
-        let reason = crate::terms::badmatch_reason(
+        let reason = crate::terms::badmatch_reason_rooted(
             machine,
             ctx,
             RootSet::ALL_LIVE,
