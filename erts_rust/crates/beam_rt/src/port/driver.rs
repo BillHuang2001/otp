@@ -71,7 +71,9 @@
 //!   (`beam_io::Port::refresh_timeout`). The runtime's poll round is clamped by that deadline
 //!   (`beam_io::PortRegistry::next_deadline`), so the driver's `timeout` callback fires **at** its
 //!   deadline. `driver_read_timer` reports the remaining milliseconds and `driver_cancel_timer`
-//!   drops the deadline — with the C's own return codes.
+//!   drops the deadline — with the C's own return codes. The timer is armed for **every** live port:
+//!   an entry with no `timeout` callback gets the C's silent `no_timeout_callback`
+//!   (`io.c:7601`), so `driver_set_timer` answers `0` there too, and the fired deadline is a no-op.
 //!
 //! The host function a C driver calls has no way to reach the port lifecycle that owns the poller
 //! (the `DriverHost` seam is frozen and the opaque `ErlDrvPort` is the *only* thing a callback
@@ -208,9 +210,6 @@ struct DriverControl {
     /// Whether a port lifecycle claimed this host ([`DriverPortAdapter::load`]). Until then a
     /// select/timer request has nobody to apply it and is refused with the C's failure code.
     attached: bool,
-    /// Whether the driver's entry declares a `timeout` callback — the C's precondition for
-    /// `driver_set_timer` succeeding (`io.c:6918`: `-1` when `entry->timeout == NULL`).
-    timer_capable: bool,
     /// Whether the port's driver was `dlopen`ed — the C's `prt->drv_ptr->handle != NULL`
     /// (`io.c:7337`), which is what decides `driver_lock_driver`.
     ///
@@ -611,9 +610,15 @@ impl DriverHost for DriverPort {
 
     /// Arms the port's timer at `ms` from now (`driver_set_timer`).
     ///
-    /// `0`/`-1` are the C's own codes: a port whose entry declares no `timeout` callback answers
-    /// `-1` (`io.c:6918`), as does a host no lifecycle has claimed. The call *is* synchronous: the
-    /// deadline is stored here and the port picks it up as this callback returns.
+    /// `0` is the C's answer for **any** live port, including one whose entry declares no `timeout`
+    /// callback: the C never leaves `drv->timeout` null, it substitutes its own `no_timeout_callback`
+    /// (`io.c:7601`: `drv->timeout = de->timeout ? de->timeout : no_timeout_callback`), so the `-1`
+    /// at `io.c:6918` stands only for the *invalid port* case and the timer is armed either way. A
+    /// host no lifecycle has claimed is that invalid-port case here, so it keeps the C's `-1`; the
+    /// call *is* synchronous: the deadline is stored here and the port picks it up as this callback
+    /// returns. When such a deadline fires with no `timeout` callback, the C's `no_timeout_callback`
+    /// is a silent no-op — which is what [`DriverPortAdapter::timeout`] reproduces for an entry
+    /// without the slot.
     fn set_timer(&mut self, _port: ErlDrvPort, ms: c_ulong) -> c_int {
         let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
             // A delay that does not fit an `Instant` cannot be a deadline: the C's failure code is
@@ -623,7 +628,7 @@ impl DriverHost for DriverPort {
         let Ok(mut control) = self.control.try_borrow_mut() else {
             return -1;
         };
-        if !control.attached || !control.timer_capable {
+        if !control.attached {
             return -1;
         }
         control.deadline = Some(deadline);
@@ -883,9 +888,6 @@ impl DriverPortAdapter {
             state.attached = true;
             // The port's driver was `dlopen`ed, so `driver_lock_driver` answers the C's `0`.
             state.driver_loaded = true;
-            // The C's precondition for `driver_set_timer` succeeding: an entry without a `timeout`
-            // callback has no timer at all (`io.c:6918`).
-            state.timer_capable = library.entry().timeout.is_some();
         }
         Ok(DriverPortAdapter {
             driver: Some(Driver::new(library, host)),
@@ -1432,6 +1434,35 @@ mod tests {
             ),
             -1
         );
+    }
+
+    /// A **claimed** host answers the timer family with the C's own codes for *every* driver,
+    /// including one whose entry declares no `timeout` callback — the C substitutes a silent
+    /// `no_timeout_callback` (`io.c:7601`) so `io.c:6918`'s `-1` stands only for an invalid port.
+    ///
+    /// Oracle ground truth (OTP 29 / erts-17.1): a real C `.so` whose entry leaves `.timeout` NULL
+    /// and whose `output` reports `driver_set_timer(port, 1000)` prints `1` (the call returned `0`);
+    /// `driver_read_timer`/`driver_cancel_timer` answer `0` there too.
+    #[test]
+    fn an_attached_host_arms_its_timer_without_a_timeout_callback() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+        // Stand in for [`DriverPortAdapter::load`], which is the only thing that claims a host.
+        host.control.borrow_mut().attached = true;
+
+        // The C's `0`: armed, so the port's `TIMEOUT` task really fires.
+        assert_eq!(host.set_timer(std::ptr::null_mut(), 100), 0);
+        assert_eq!(
+            host.control.borrow().deadline.is_some(),
+            true,
+            "a `0` answer must really arm the deadline"
+        );
+        // `io.c:6936`: a live port answers `0` with the remaining time (which is what `Some` means).
+        assert!(host.read_timer(std::ptr::null_mut()).is_some());
+        assert_eq!(host.cancel_timer(std::ptr::null_mut()), 0);
+        assert!(host.control.borrow().deadline.is_none());
+        // ...and `io.c:6925`: cancelling on a live port is `0` even with nothing pending.
+        assert_eq!(host.cancel_timer(std::ptr::null_mut()), 0);
     }
 
     /// The four port-less `DriverHost` registry slots answer the C's own return codes, pinned
