@@ -78,6 +78,25 @@
 //! oracle's loaded-vs-unloaded MFA resolution, nor the module's checksum-derived
 //! `new_uniq` for the *bare* `Exported`/loaded distinction).
 //!
+//! # The arity split (`fun_to_list/1` vs `fun_info/2`)
+//!
+//! An `EXPORT_EXT` (external) fun stores its arity twice: the header's 8-bit
+//! field and, in this runtime, descriptor word 3 — the inlined `Export`'s
+//! `info.mfa.arity` ([`beam_term::fun::fun_true_arity`]). The C reads the two
+//! separately, and so does this module:
+//!
+//! * **`fun_to_list/1` uses the TRUE arity** — the C `FUN_DEF` printer emits
+//!   `ep->info.mfa.arity` (`erl_printf_term.c:721-723`), so an `EXPORT_EXT` fun
+//!   with true arity 256 renders `"fun lists:reverse/256"` and 300 renders
+//!   `"fun lists:reverse/300"` (oracle-verified). It is read through
+//!   [`crate::access::fun_true_arity`].
+//! * **`fun_info/2`'s `arity` item and `fun_info_mfa/1` use the header's 8-bit
+//!   field** — the C reads `fun_arity(funp)` (`erl_bif_info.c:4003-4006`,
+//!   `:4049-4052`), so those same funs report `0` and `44`
+//!   (`beam_codec::term::fun_arity_term`). `erlang:is_function/2`
+//!   ([`crate::type_test`], via [`crate::access::fun_arity`]) reads the same
+//!   header field.
+//!
 //! # `make_fun/3`
 //!
 //! `bif.c:4474-4492`: both atoms plus a small integer, `0 <= A <= MAX_ARG` (255),
@@ -139,6 +158,10 @@ fn fun_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         // `am_type`: local (incl. a decoded `NEW_FUN_EXT`) vs external.
         "type" => ctx.atom(if external { "external" } else { "local" })?,
         // `am_arity`: the *closure* arity (total lambda arity minus the captures).
+        // The C reads `fun_arity(funp)` — the **header's 8-bit field**, so an
+        // `EXPORT_EXT` fun with true arity 256 reports `0` and true arity 300
+        // reports `44` (oracle-verified). Only `fun_to_list/1` renders the true
+        // arity; do not switch this to `access::fun_true_arity`.
         "arity" => ctx.int(beam_codec::term::fun_arity_term(fun)? as i64)?,
         // `am_env`: the free variables in `env` order; `[]` for an external fun.
         "env" => {
@@ -213,6 +236,9 @@ fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let function = atom_term_name(ctx, fun_function(fun)?)?;
     let module = ctx.atom(&module)?;
     let function = ctx.atom(&function)?;
+    // As for `fun_info/2`'s `arity`: the header's 8-bit field, not the true arity
+    // (`erl_bif_info.c:4049-4052` reads `fun_arity`), so true arity 256 ⇒
+    // `{lists,reverse,0}` (oracle-verified).
     let arity = ctx.int(beam_codec::term::fun_arity_term(fun)? as i64)?;
     ctx.tuple(&[module, function, arity])
 }
@@ -227,6 +253,9 @@ fn fun_info_mfa_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `"fun Module:Function/Arity"` with the C's own atom quoting
 /// (`print_atom_name`, `erl_printf_term.c:235-330` — *not* `io_lib`'s
 /// `write_atom`: `make_fun(nonode@nohost, foo, 1)` ⇒ `"fun 'nonode@nohost':foo/1"`).
+/// `Arity` is the **true** arity (`ep->info.mfa.arity`, descriptor word 3 for an
+/// external fun) — so this reader differs from `fun_info/2`'s `arity` item and
+/// `fun_info_mfa/1` for an arity above 255 (module docs).
 /// A non-fun is `badarg`; a local/imported fun would need the `#Fun<M.OldIndex.
 /// OldUniq>` triple from its `ErlFunEntry` — the documented typed gap.
 fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
@@ -239,7 +268,11 @@ fn fun_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
     let module = atom_term_name(ctx, fun_module(fun)?)?;
     let function = atom_term_name(ctx, fun_function(fun)?)?;
-    let arity = beam_codec::term::fun_arity_term(fun)?;
+    // The `FUN_DEF` printer uses the **true** arity (`ep->info.mfa.arity`,
+    // `erl_printf_term.c:721-723`), *not* the header's 8-bit field: an
+    // `EXPORT_EXT` fun with true arity 256 renders `fun lists:reverse/256` while
+    // `erlang:fun_info(F, arity)` reports `0` — the oracle-verified split.
+    let arity = access::fun_true_arity(fun)?;
     let text = format!(
         "fun {}:{}/{}",
         quoted_atom(&module),
