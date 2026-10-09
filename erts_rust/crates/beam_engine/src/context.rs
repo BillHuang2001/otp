@@ -699,7 +699,7 @@ const HEAP_COMMIT_WORDS: usize = 64 * 1024 / core::mem::size_of::<Eterm>();
 /// valid) and a fresh, larger region becomes the allocation frontier. That is the
 /// identical "stable until dropped" shape the arena has always had, with
 /// [`ReservedHeap`] supplying the bump pointer, the in-place commit growth and a
-/// typed, return-based failure instead of a chunk-Box.
+/// typed, return-based failure.
 ///
 /// # Growth
 ///

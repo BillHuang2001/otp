@@ -899,8 +899,8 @@ mod tests {
     fn boxed(ctx: &mut MinimalContext, words: &[Eterm]) -> Eterm {
         let hp = ctx.alloc_words(words.len()).expect("arena words");
         // SAFETY: `alloc_words` hands out `words.len()` writable words that stay valid
-        // for as long as `ctx` lives (a pointer-stable chunked arena) and every word is
-        // written before the term escapes.
+        // for as long as `ctx` lives (a pointer-stable reserved-heap arena grown in
+        // place) and every word is written before the term escapes.
         unsafe {
             for (i, word) in words.iter().enumerate() {
                 *hp.add(i) = *word;

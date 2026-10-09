@@ -202,8 +202,8 @@ struct Measurement {
     result: Eterm,
     /// The context the run used — it **owns** the arena `result` points into, so it
     /// must outlive every read of `result` (the tiers have separate heaps). Never read
-    /// directly: keeping the owner alive *is* the point (the arena's chunks are boxed,
-    /// so moving this struct does not move them).
+    /// directly: keeping the owner alive *is* the point (the terms live in the
+    /// arena's reserved heap regions, so moving this struct does not move them).
     _context: MinimalContext,
 }
 
