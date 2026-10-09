@@ -157,11 +157,12 @@ fn needs_visit(term: Eterm) -> bool {
 ///
 /// It mirrors [`shallow`]/[`copy_refc_binary`]'s allocation exactly: `2` words per cons cell,
 /// [`ERL_BIN_REF_SIZE`] for an off-heap MSO container, [`ERL_REFC_BITS_SIZE`] for a refc binary,
-/// nothing for the shared zero-arity-tuple literal, and [`layout::object_words`] for every other
-/// boxed object (walking its child slots with [`layout::for_each_child_slot`]). A `SUB_BITS`
-/// **match context** is one of those "other" objects: [`layout::object_words`] returns the
-/// `heap_bits_size_words(size)` block [`copy_match_context`] writes and [`layout::for_each_child_slot`]
-/// yields no child, so this walk sizes it exactly as the copy writes it.
+/// nothing for the shared zero-arity-tuple literal, and the canonical
+/// `beam_term::layout::object_words` for every other boxed object (walking its child slots with
+/// `beam_term::layout::for_each_sizing_child_slot`). A `SUB_BITS` **match context** is one of those
+/// "other" objects: `beam_term::layout::object_words` returns the `heap_bits_size_words(size)` block
+/// [`copy_match_context`] writes and the sizing enumerator yields no child, so this walk sizes it
+/// exactly as the copy writes it.
 ///
 /// The `limit` is what makes it cycle-safe: a forged cyclic graph revisits its own objects, so its
 /// count grows without bound and the walk stops at `limit` instead of looping forever. Every
@@ -197,23 +198,31 @@ fn bounded_words(term: Eterm, limit: usize) -> Option<usize> {
                     } else {
                         // Everything else — including a `SUB_BITS` match context, whose
                         // `object_words` is the flattened heap-bits block's size — is sized by
-                        // `object_words` and walked by `for_each_child_slot`.
+                        // the canonical `beam_term::layout::object_words` and walked by the
+                        // sizing child-slot enumerator.
                         let p = boxed_val(current);
                         // SAFETY: `current` is a live boxed term, so `p` addresses its header word.
                         let header = unsafe { *p };
                         // The zero-arity tuple is the shared global literal: no destination word.
                         if !(is_arity_value(header) && header_arity(header) == 0) {
-                            total = total.saturating_add(layout::object_words(header, p));
+                            // SAFETY: `header`/`p` head a live, initialized object of `header`'s
+                            // shape, so its per-object word count is well-defined.
+                            total = total.saturating_add(unsafe { layout::object_words(header, p) });
                             if total > limit {
                                 return None;
                             }
-                            layout::for_each_child_slot(header, p, |offset| {
-                                // SAFETY: `offset` is an in-bounds slot of the object at `p`.
-                                let child = unsafe { *p.add(offset) };
-                                if needs_visit(child) {
-                                    work.push(child);
-                                }
-                            });
+                            // SAFETY: `header`/`p` head a live object whose payload words are
+                            // live, so its sizing child slots are readable; the closure only
+                            // reads them.
+                            unsafe {
+                                layout::for_each_sizing_child_slot(header, p, |offset| {
+                                    // SAFETY: `offset` is an in-bounds slot of the object at `p`.
+                                    let child = *p.add(offset);
+                                    if needs_visit(child) {
+                                        work.push(child);
+                                    }
+                                });
+                            }
                         }
                     }
                     if total > limit {
@@ -234,12 +243,13 @@ fn bounded_words(term: Eterm, limit: usize) -> Option<usize> {
 
 /// Whether the term graph rooted at `term` is **acyclic**.
 ///
-/// A depth-first walk (`car`/`cdr` for cons cells, [`layout::for_each_child_slot`] for boxed
-/// objects — the same children the copier descends into) that tracks, in `on_path`, exactly the
-/// compound objects on the current DFS path. A revisit of a word still on the path is a back-edge,
-/// i.e. a cycle. Shared objects (`immediates`/literals), off-heap references and an `ErlSubBits`
-/// (a refc binary, or a match context that `copy_struct` flattens) are leaves here, matching the
-/// copier: they have no navigable child.
+/// A depth-first walk (`car`/`cdr` for cons cells,
+/// `beam_term::layout::for_each_sizing_child_slot` for boxed objects — the same children the
+/// copier descends into) that tracks, in `on_path`, exactly the compound objects on the current
+/// DFS path. A revisit of a word still on the path is a back-edge, i.e. a cycle. Shared objects
+/// (`immediates`/literals), off-heap references and an `ErlSubBits` (a refc binary, or a match
+/// context that `copy_struct` flattens) are leaves here, matching the copier: they have no
+/// navigable child.
 ///
 /// This is only ever called on the *error* path ([`preflight_words`] falls back to it after the
 /// bounded walk has already shown the graph does not fit), so the `HashSet` it needs is never paid
@@ -294,13 +304,17 @@ fn is_acyclic(term: Eterm) -> bool {
                             return false;
                         }
                         stack.push(Step::Exit(addr));
-                        layout::for_each_child_slot(header, p, |offset| {
-                            // SAFETY: `offset` is an in-bounds slot of the object at `p`.
-                            let child = unsafe { *p.add(offset) };
-                            if needs_visit(child) {
-                                stack.push(Step::Enter(child));
-                            }
-                        });
+                        // SAFETY: `header`/`p` head a live object whose payload words are live,
+                        // so its sizing child slots are readable; the closure only reads them.
+                        unsafe {
+                            layout::for_each_sizing_child_slot(header, p, |offset| {
+                                // SAFETY: `offset` is an in-bounds slot of the object at `p`.
+                                let child = *p.add(offset);
+                                if needs_visit(child) {
+                                    stack.push(Step::Enter(child));
+                                }
+                            });
+                        }
                     }
                     // Unreachable (see `bounded_words`); a non-term has no children.
                     PrimaryTag::Header | PrimaryTag::Immed1 => {}
@@ -495,18 +509,26 @@ pub(crate) fn shallow(
                 return Ok(tuple0());
             }
 
-            let words = layout::object_words(header, src_obj);
+            // SAFETY: `src` is a live boxed term, so `src_obj` heads the live, initialized object
+            // `header` names, making its per-object word count well-defined.
+            let words = unsafe { layout::object_words(header, src_obj) };
             // SAFETY: `alloc_words` returns `words` exclusively-owned, writable words.
             let dst = unsafe { to.alloc_words(words)? };
             // SAFETY: `src_obj` addresses `words` live words and `dst` is a distinct,
             // non-overlapping `words`-word region (a separate, never-reallocated heap).
             unsafe { core::ptr::copy_nonoverlapping(src_obj, dst, words) };
-            layout::for_each_child_slot(header, src_obj, |offset| {
-                // SAFETY: `dst` owns `words` words and every visited offset is `< words`.
-                let child = unsafe { *dst.add(offset) };
-                // SAFETY: as above — the same in-bounds offset into `dst`.
-                push_fixup(work, unsafe { dst.add(offset) }, child);
-            });
+            // SAFETY: `src_obj` heads a live object of `header`'s shape whose payload words are
+            // live. A `SUB_BITS` never reaches this generic arm — the off-heap, refc-binary and
+            // match-context cases all returned above — so the copy-child enumeration here equals
+            // the sizing one for every object seen.
+            unsafe {
+                layout::for_each_child_slot(header, src_obj, |offset| {
+                    // SAFETY: `dst` owns `words` words and every visited offset is `< words`, so
+                    // `dst.add(offset)` is an in-bounds, live reference word inside the copy.
+                    let child = *dst.add(offset);
+                    push_fixup(work, dst.add(offset), child);
+                });
+            }
             Ok(make_boxed(dst as *const Eterm))
         }
         // A bare header word is never a standing term: a malformed graph.
