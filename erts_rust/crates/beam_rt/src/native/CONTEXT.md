@@ -239,6 +239,84 @@ A path built from a **file's raw bytes** (`read_file`'s result, `read_link`'s ta
 (`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with the C's own `errno_<n>`
 form (`:47`) for an errno outside the table.
 
+### `file_server.rs` — the native **`file_server_2`** service (contract A.9)
+The runtime-native **file service** that completes the real boot chain. `lib/kernel/src/file.erl`
+routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`,
+and the last working directive of `bootstrap/bin/start.boot` — `{apply,{c,erlangrc,[]}}` — is the
+first such caller (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
+`FileServices` supplies the missing registered service. It is **not** a BIF: it is a process plus a
+scheduler-pass step, the topic of the rest of this subsection.
+
+#### The process model (never enqueued)
+`FileServices::start(&mut ProcessTable, &mut AtomTable, HeapPolicy)` is called from `Runtime::new`
+next to the `init` registration and runs **one** process, born `ProcessState::Runnable`, `insert`ed
+into the table and registered under the atom `file_server_2`, but **never enqueued** and given no
+engine — the pattern the runtime's own `init`/`self_pid` process already uses. Because
+`Process::wake` only wakes a `Waiting`/`Suspended` process, a message delivered into the service's
+mailbox never puts it on a run queue, so the runner never sees it and
+`error::unknown_process_entry` is unreachable. `whereis(file_server_2)`, `monitor(process, Name)`
+and a send all resolve it (`server()`/`is_running()` accessors). A successful `{open,…}` spawns a
+**second** `Runnable`, never-enqueued process — the **io-device** — under the same heap policy, and
+keys it in `FileServices::devices` as a `Device` (the open `std::fs::File` plus the `binary`/`list`
+read mode `file_io_server:parse_options/1` derived).
+
+#### The scheduler-pass step
+`Runtime::service_file_requests(&mut ProcessTable) -> Result<usize>` drains every service/io-device
+mailbox (`Process::receive`) and delivers each reply through `ProcessTable::deliver_simple`,
+returning the delivery count; a reply to a since-dead caller is dropped
+(`BeamError::TermNotFound`), exactly as `gen:reply/2` swallows its own send failure.
+`scheduler_pass` calls it as an **additive step right after the run queue drains** (the same place
+the port half runs); a non-zero count is added to the pass's `delivered` total and followed by
+`scheduler.resume_woken`, so a serviced-only pass never looks like "nothing happened" and a caller
+blocked in `gen_server:call`'s `receive` makes progress. The requesting process is normally the
+runtime's own `Runnable` `self_pid`, which the delivery therefore does **not** enqueue; it resumes
+through the engine's blocking-aware entry (`RunOutcome::Wait` → `Machine::resume_outcome`), not a
+scheduler slice.
+
+#### The wire protocols (verbatim from `lib/`)
+| Request | Reply |
+|---|---|
+| `{'$gen_call', {Pid, Tag}, Request}` (the local `infinity` form, `gen.erl:231-250`) | `{Tag, Reply}` to `Pid`; a `[alias\|Ref]` tag is the typed `unsupported` gap (the alias delivery this runtime cannot perform), never a fabricated delivery |
+| `{file_request\|io_request, From, ReplyAs, Request}` (`file_io_server.erl:199-233`) | `{file_reply\|io_reply, ReplyAs, Reply}` to `From` |
+An unknown `file_server` request is the oracle's `{noreply, State}`: nothing is delivered. A
+`FileServices` process never runs and never collects, so a mailbox payload (already copied onto the
+service's own heap by `deliver_simple`) is stable for as long as it is read.
+
+#### The served request surface (`file_server:handle_call/3`, `file_server.erl:101-201`)
+| Request | Behaviour |
+|---|---|
+| `{open, Name, ModeList}` | `{error,einval}` for a non-list mode; `{error,badarg}` for a path `prim_file` rejects; `{error,eisdir}` for a **directory** (an explicit `metadata().is_dir()` check is required, because Linux `open(2)` **succeeds** on a directory while the oracle's `efile_open` answers `EISDIR`); another OS failure → the oracle's errno atom; a readable file → `{ok, IoPid}` with a fresh native io-device |
+| `{read_file,_}`, `{delete,_}`, `{make_dir,_}`, `{del_dir,_}`, `{read_link,_}`, `{altname,_}` | reuse the existing `prim_file` primitives (`prim.rs`), so the errno remaps are identical |
+| `{rename,_,_}`, `{make_link,_,_}`, `{make_symlink,_,_}` | reuse the `prim_file` primitives |
+| `{get_cwd}` (bare atom or 1-tuple) / `{get_cwd,_}` | reuse `prim_file:get_cwd` |
+| `{list_dir,_}` | `{ok, Names}` from `std::fs::read_dir` in the **host directory order** (`file.erl:1044` documents "The names are not sorted") |
+| anything else (`write_file`, `read_file_info`, `copy`, …) | the typed `unsupported` capability gap, never a wrong value |
+
+#### The io-device request surface (`file_io_server.erl:199-233`)
+A request is either a **bare command atom** or a tuple whose head is the command: `file.erl` sends
+`close`/`sync`/`datasync`/`truncate` as the bare atom (`:1536`) and the positioned form as
+`{position,At}` (`:1954`). Served for real: `close` (retires the device), `sync`, `datasync`,
+`truncate`, `{position,At}` (`At` is `bof`/`cur`/`eof` or `{Mark,Offset}`, and a bare non-negative
+integer is `file.erl`'s `{N,bof}` shorthand), `{get_chars,Enc,Prompt,N}` (shaped `binary`/`list`
+from the open mode) and `{put_chars,Enc,Chars}`. Every other request is the typed `unsupported` gap.
+
+#### Honest capability gaps (never a fabricated term)
+* **`{get_until,Enc,_Prompt,Mod,Func,XtraArgs}`** — the request `io:parse_erl_exprs/4`/
+  `scan_erl_exprs/4` use. `file_io_server` answers it with `io_lib:get_until/4` →
+  `apply(erl_scan, tokens, [Cont, Chars, Pos0, Options])` (`erl_scan:tokens/4`) — real Erlang
+  tokenizer code, and a native service process hosts no engine. Owner: a **`beam_engine`**-class
+  capability (an Erlang-engine host inside the native step), never a `beam_rt` gap to fake. The same
+  applies to `get_line`/`setopts`/`getopts`/`pread`/`pwrite`/`advise`/`allocate`/`read_handle_info`,
+  the legacy `put_chars` arities, a non-`latin1` encoding and `read_file_info`/`write_file`.
+* **A scheduled process's `gen_server:call` to the service cannot complete** — the engine's
+  non-blocking `fold_outcome` folds the callee's suspend into `error::blocked()`. Owner:
+  **`beam_engine`**.
+* **`io:request/2` is not served by this crate's native `io` handling** (`../native.rs`'s `io` arm
+  covers only `put_chars/1,2`), so it loads the `io` module body and dies on `net_kernel:dflag_unicode_io/1`
+  — the typed `unsupported` gap `unsupported: net_kernel:dflag_unicode_io/1`. Consequently
+  `file:read/2`/`file:read_line/1` (the io-device read path) is unreachable from library code even
+  though the device itself serves `{get_chars,…}`. Owner: **`beam_rt`** (`../native.rs`).
+
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
   read only through `beam_engine::terms` (heap-seam builders/readers), `beam_codec::term`
