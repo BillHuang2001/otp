@@ -30,6 +30,7 @@ deopt are the load-bearing contracts.
 - `cranelift/` → the optional Cranelift hot tier (feature-gated); see its own `CONTEXT.md`.
 - `emitter/` → the x86-64 encoder + executable `CodeBuffer`; see its own `CONTEXT.md`.
 - `cache.rs` → cross-run compiled-block cache + host code-map entry; `tiering.rs` → tier policy; `mod.rs` → the tier seam.
+- `bench/` (`#[cfg(test)]`) → the in-crate tier measurement harnesses: the fixed-order interpreter-vs-baseline tier table, the `support.rs` scaffolding shared with `cranelift/bench.rs`, and the per-workload result checks; see its own `CONTEXT.md`.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only; no panic, no `unwrap()` on loaded data, no wrong result — an un-lowered op is a typed `unsupported`.
@@ -37,4 +38,4 @@ deopt are the load-bearing contracts.
 
 ## See Also
 - `../CONTEXT.md` (engine) → the `JitBackend`/tier seam and `Machine::run_*_with_tier`; `INSTRUCTION_SURFACE.md`/`MEASURED.md`/`TEST_NOTES.md`.
-- `baseline/emit/CONTEXT.md`, `emitter/CONTEXT.md`, `cranelift/CONTEXT.md` → per-file detail.
+- `baseline/emit/CONTEXT.md`, `emitter/CONTEXT.md`, `cranelift/CONTEXT.md`, `bench/CONTEXT.md` → per-file detail.

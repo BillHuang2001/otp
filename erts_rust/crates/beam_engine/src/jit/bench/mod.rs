@@ -68,6 +68,8 @@
 //!
 //! # Layout
 //!
+//! [`support`] owns the scaffolding both measurement harnesses share (the synthetic
+//! [`Module`] builder, the arithmetic BIF hook and the ns/op report primitives);
 //! [`workloads`] owns the workload definitions (the synthetic modules, their argument
 //! preparation and their result-shape checks); this file owns the measurement harness
 //! (the tier seam, the timing loop and the reporting).
@@ -91,9 +93,12 @@ use crate::jit::{available_tiers, JitBackend, Tier};
 use crate::machine::Machine;
 
 mod checks;
+/// The scaffolding shared with the sibling Cranelift bench (`crate::jit::cranelift::bench`).
+pub(crate) mod support;
 mod workloads;
 
-use workloads::{arith_hook, workloads, Workload};
+use support::{arith_hook, ns_per_op, ops_per_sec};
+use workloads::{workloads, Workload};
 
 // ---------------------------------------------------------------------------
 // The tiers
@@ -208,7 +213,7 @@ impl Measurement {
     /// A measurement of `runs` timed runs of `workload` on `tier`.
     fn run(tier: Tier, workload: &Workload, runs: u32) -> Measurement {
         let mut machine = Machine::new();
-        let mut context = MinimalContext::with_bif_hook(Box::new(arith_hook));
+        let mut context = MinimalContext::with_bif_hook(arith_hook(None, None));
         let args = workload
             .arguments(&mut context)
             .expect("the workload's arguments must build");
@@ -256,15 +261,14 @@ impl Measurement {
 
 /// Print one measurement line and return its `ns/op`.
 fn report(measurement: &Measurement) -> f64 {
-    let per_op = measurement.elapsed.as_secs_f64() / f64::from(measurement.runs);
-    let per_op_ns = per_op * 1e9;
+    let per_op_ns = ns_per_op(measurement.elapsed, measurement.runs);
     println!(
         "jit_bench | tier={:<12} runs={:<6} total={:>9.3} ms | {:>14.1} ns/op | {:>14.1} ops/s",
         measurement.tier.name(),
         measurement.runs,
         measurement.elapsed.as_secs_f64() * 1e3,
         per_op_ns,
-        if per_op > 0.0 { 1.0 / per_op } else { f64::INFINITY },
+        ops_per_sec(per_op_ns),
     );
     if let Some(compile) = measurement.compile {
         println!(

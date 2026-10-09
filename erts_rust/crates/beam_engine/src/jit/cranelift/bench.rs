@@ -59,19 +59,22 @@
 //! operator's operands stay small integers, and comparison results are never read back
 //! as operands.
 //!
-//! The module builders are deliberately **not** shared with `tests/jit_bench.rs`: an
-//! in-crate `#[cfg(test)]` module cannot import from an integration test, and the two
-//! harnesses answer different questions (a fixed-order tier table vs a balanced
-//! two-tier comparison), so the near-duplication is confined to the kernel skeleton.
+//! The module builders are still deliberately **not** shared with `tests/jit_bench.rs`:
+//! an in-crate `#[cfg(test)]` module cannot import from an integration test, and the two
+//! answer different questions (a fixed-order tier table vs a balanced two-tier
+//! comparison). The two in-crate harnesses *do* share their scaffolding —
+//! `crate::jit::bench::support` owns the one synthetic-`Module` builder, the one
+//! small-int BIF hook and the ns/op report primitive — while the **measurement
+//! strategy** below stays this harness's own.
 
 use std::time::{Duration, Instant};
 
-use beam_loader::lower::build_blocks;
-use beam_loader::{Export, Function, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL};
-use beam_term::{is_small, make_small, signed_value, Atom, Eterm};
+use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
+use beam_term::{make_small, Atom, Eterm};
 
 use crate::context::BifHook;
 use crate::jit::baseline::{BaselineJit, CompiledModule};
+use crate::jit::bench::support::{arith_hook, ns_per_op, Fixture, Samples};
 use crate::jit::JitBackend;
 use crate::{Machine, MinimalContext};
 
@@ -131,28 +134,10 @@ struct Kernel {
 /// It is reached only on a **deopt** path (a native tier's inlined fast path computes
 /// the same word itself), so this is the reference implementation the inlines must
 /// agree with, not the code under measurement.
-fn bif_hook(truthy: Option<Eterm>, falsy: Option<Eterm>) -> BifHook {
-    Box::new(move |module, function, arity, args| {
-        if module != "erlang" || arity != 2 || args.len() != 2 {
-            return Err(beam_common::BeamError::BadArg);
-        }
-        if !is_small(args[0]) || !is_small(args[1]) {
-            return Err(beam_common::BeamError::BadArith);
-        }
-        let (a, b) = (signed_value(args[0]), signed_value(args[1]));
-        match function {
-            "+" => Ok(make_small(a + b)),
-            "-" => Ok(make_small(a - b)),
-            "*" => Ok(make_small(a * b)),
-            "=:=" | "==" if truthy.is_some() => Ok(if a == b { truthy } else { falsy }.unwrap()),
-            "=/=" | "/=" if truthy.is_some() => Ok(if a != b { truthy } else { falsy }.unwrap()),
-            "<" if truthy.is_some() => Ok(if a < b { truthy } else { falsy }.unwrap()),
-            "=<" if truthy.is_some() => Ok(if a <= b { truthy } else { falsy }.unwrap()),
-            ">" if truthy.is_some() => Ok(if a > b { truthy } else { falsy }.unwrap()),
-            ">=" if truthy.is_some() => Ok(if a >= b { truthy } else { falsy }.unwrap()),
-            _ => Err(beam_common::BeamError::BadArg),
-        }
-    })
+fn hook_for(kernel: &Kernel) -> BifHook {
+    let truthy = kernel.module.atom_table.lookup("true").map(beam_term::make_atom);
+    let falsy = kernel.module.atom_table.lookup("false").map(beam_term::make_atom);
+    arith_hook(truthy, falsy)
 }
 
 /// The aggregate kernel: `aggr/2`, [`AGGR_STEPS`] steps of the inlined aggregate reads
@@ -161,29 +146,16 @@ fn bif_hook(truthy: Option<Eterm>, falsy: Option<Eterm>) -> BifHook {
 /// `x(0)` arrives as `1` and both multipliers are `1`, so the product stays `1` (the
 /// inlined `'*'` range check never rejects) and the export's result is exactly `1`.
 fn aggregate_kernel() -> Kernel {
-    let mut module = Module::default();
-    module.name = module.atom_table.intern("cl_bench_aggregate");
+    let mut fixture = Fixture::new("cl_bench_aggregate");
     // The reads' deopt path builds `{badmatch, Source}`; the kernel never takes it,
     // but the atom must exist so a typed reason can never differ from the oracle's.
-    module.atom_table.intern("badmatch");
+    fixture.intern("badmatch");
 
-    let star = module.atom_table.intern("*");
-    module.imports.push(Import {
-        module: module.atom_table.intern("erlang"),
-        function: star,
-        arity: 2,
-    });
-    let star = ImportRef(0);
+    let star = fixture.import("erlang", "*", 2);
 
-    let aggr = module.atom_table.intern("aggr");
     let entry = Label(1);
     let body = Label(2);
     let fail = Label(9);
-    module.exports.push(Export {
-        function: aggr,
-        arity: 2,
-        label: entry,
-    });
 
     let mul = |arg: u32| Instr::GcBif {
         arity: 2,
@@ -248,17 +220,7 @@ fn aggregate_kernel() -> Kernel {
     });
     code.push(Instr::Return);
 
-    let (blocks, labels) = build_blocks(&code);
-    module.functions.push(Function {
-        func_label: entry,
-        entry_label: entry,
-        module: module.name,
-        name: aggr,
-        arity: 2,
-        code,
-        blocks,
-        labels,
-    });
+    let (module, aggr) = fixture.finish("aggr", 2, code);
 
     Kernel {
         label: "aggr/2 (aggregate reads + '*')",
@@ -278,25 +240,10 @@ fn aggregate_kernel() -> Kernel {
 /// small integer (a `(1, 1)` start would leave the small range after ~90 ops) and the
 /// inlined fast path lowers every instruction.
 fn arith_kernel() -> Kernel {
-    let mut module = Module::default();
-    module.name = module.atom_table.intern("cl_bench_arith");
+    let mut fixture = Fixture::new("cl_bench_arith");
+    let plus = fixture.import("erlang", "+", 2);
 
-    let plus = module.atom_table.intern("+");
-    module.imports.push(Import {
-        module: module.atom_table.intern("erlang"),
-        function: plus,
-        arity: 2,
-    });
-    let plus = ImportRef(0);
-
-    let arith = module.atom_table.intern("arith");
     let entry = Label(1);
-    module.exports.push(Export {
-        function: arith,
-        arity: 2,
-        label: entry,
-    });
-
     let mut code = vec![Instr::Label(entry)];
     for step in 0..ARITH_OPS {
         let (args, dst) = if step % 2 == 0 {
@@ -315,17 +262,7 @@ fn arith_kernel() -> Kernel {
     }
     code.push(Instr::Return);
 
-    let (blocks, labels) = build_blocks(&code);
-    module.functions.push(Function {
-        func_label: entry,
-        entry_label: entry,
-        module: module.name,
-        name: arith,
-        arity: 2,
-        code,
-        blocks,
-        labels,
-    });
+    let (module, arith) = fixture.finish("arith", 2, code);
 
     Kernel {
         label: "arith/2 (256 chained '+')",
@@ -344,33 +281,18 @@ fn arith_kernel() -> Kernel {
 ///
 /// The export's result is the trailing `x(2) < x(1)` — the module's own `true` atom.
 fn compare_kernel() -> Kernel {
-    let mut module = Module::default();
-    module.name = module.atom_table.intern("cl_bench_compare");
-    let truthy = module.atom_table.intern("true");
+    let mut fixture = Fixture::new("cl_bench_compare");
+    let truthy = fixture.intern("true");
     // The comparison fast paths materialize the module's **own** `true`/`false` words
     // and refuse to inline when either is absent, so both must be interned.
-    module.atom_table.intern("false");
+    fixture.intern("false");
 
-    let erlang = module.atom_table.intern("erlang");
     let mut operators = Vec::with_capacity(CMP_OPERATORS.len());
     for name in CMP_OPERATORS {
-        let function = module.atom_table.intern(name);
-        operators.push(ImportRef(module.imports.len() as u32));
-        module.imports.push(Import {
-            module: erlang,
-            function,
-            arity: 2,
-        });
+        operators.push(fixture.import("erlang", name, 2));
     }
 
-    let cmp = module.atom_table.intern("cmp");
     let entry = Label(1);
-    module.exports.push(Export {
-        function: cmp,
-        arity: 2,
-        label: entry,
-    });
-
     let mut code = vec![Instr::Label(entry)];
     code.push(Instr::Move {
         src: Operand::Integer(3),
@@ -403,17 +325,7 @@ fn compare_kernel() -> Kernel {
     });
     code.push(Instr::Return);
 
-    let (blocks, labels) = build_blocks(&code);
-    module.functions.push(Function {
-        func_label: entry,
-        entry_label: entry,
-        module: module.name,
-        name: cmp,
-        arity: 2,
-        code,
-        blocks,
-        labels,
-    });
+    let (module, cmp) = fixture.finish("cmp", 2, code);
 
     Kernel {
         label: "cmp/2 (512 comparison BIFs)",
@@ -423,42 +335,6 @@ fn compare_kernel() -> Kernel {
         args: vec![make_small(10), make_small(20)],
         iterations: CMP_ITERATIONS,
         expected: beam_term::make_atom(truthy),
-    }
-}
-
-/// The BIF hook a kernel needs (`truthy`/`falsy` only for the comparison kernel).
-fn hook_for(kernel: &Kernel) -> BifHook {
-    let truthy = kernel.module.atom_table.lookup("true").map(beam_term::make_atom);
-    let falsy = kernel.module.atom_table.lookup("false").map(beam_term::make_atom);
-    bif_hook(truthy, falsy)
-}
-
-/// The per-tier samples of one kernel.
-struct Samples {
-    /// The tier's name.
-    tier: &'static str,
-    /// One-time compile latency.
-    compile: Duration,
-    /// One ns/op sample per timed loop.
-    ns_per_op: Vec<f64>,
-}
-
-impl Samples {
-    /// The minimum ns/op (the robust statistic under additive background load).
-    fn min(&self) -> f64 {
-        self.ns_per_op.iter().copied().fold(f64::INFINITY, f64::min)
-    }
-
-    /// The median ns/op.
-    fn median(&self) -> f64 {
-        let mut sorted = self.ns_per_op.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite ns/op"));
-        let middle = sorted.len() / 2;
-        if sorted.len() % 2 == 0 {
-            (sorted[middle - 1] + sorted[middle]) / 2.0
-        } else {
-            sorted[middle]
-        }
     }
 }
 
@@ -587,12 +463,11 @@ fn measure_kernel(kernel: &Kernel) -> (Samples, Samples, Vec<f64>) {
         let (cranelift_b, _) = timed_tier(&cranelift, kernel, &mut machine, &mut ctx);
         let (baseline_b, _) = timed_tier(&baseline, kernel, &mut machine, &mut ctx);
 
-        let per_op = |d: Duration| d.as_secs_f64() * 1e9 / f64::from(kernel.iterations);
         let (ba, ca, cb, bb) = (
-            per_op(baseline_a),
-            per_op(cranelift_a),
-            per_op(cranelift_b),
-            per_op(baseline_b),
+            ns_per_op(baseline_a, kernel.iterations),
+            ns_per_op(cranelift_a, kernel.iterations),
+            ns_per_op(cranelift_b, kernel.iterations),
+            ns_per_op(baseline_b, kernel.iterations),
         );
         ratios.push((ca + cb) / (ba + bb));
         baseline_samples.push(ba);

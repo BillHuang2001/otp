@@ -31,17 +31,15 @@
 //! (mean `ns/op`, shared/high-load sandbox, and the fact that correctness — never
 //! "the JIT is faster" — is the only thing asserted).
 
-use beam_common::{BeamError, Result};
-use beam_loader::{
-    Export, Function, Import, ImportRef, Instr, Label, MapWriteArgs, Module, Operand, TestKind,
-    NO_FAIL,
-};
-use beam_term::{is_small, make_small, signed_value, Atom, Eterm, NIL};
+use beam_common::Result;
+use beam_loader::{Instr, Label, MapWriteArgs, Module, Operand, TestKind, NO_FAIL};
+use beam_term::{make_small, Atom, Eterm, NIL};
 
 use crate::context::MinimalContext;
 use crate::terms;
 
 use super::checks::{verify_build, verify_map, verify_select, verify_walk};
+use super::support::Fixture;
 
 // ---------------------------------------------------------------------------
 // Workload parameters
@@ -71,101 +69,8 @@ pub(super) const TIMED_RUNS: u32 = 3_000;
 pub(super) const AGREEMENT_RUNS: u32 = 4;
 
 // ---------------------------------------------------------------------------
-// The one BIF the workloads need
-// ---------------------------------------------------------------------------
-
-/// `erlang:'+'/2` over small integers — the only BIF any workload imports.
-///
-/// On a native tier the inlined fast path computes the same small-int sum itself, so
-/// this is what the **interpreter** tier (and any rejected operand) goes through.
-pub(super) fn arith_hook(module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
-    if module != "erlang" || function != "+" || arity != 2 || args.len() != 2 {
-        return Err(BeamError::BadArg);
-    }
-    if !is_small(args[0]) || !is_small(args[1]) {
-        return Err(BeamError::BadArith);
-    }
-    Ok(make_small(signed_value(args[0]) + signed_value(args[1])))
-}
-
-// ---------------------------------------------------------------------------
-// Module construction
-// ---------------------------------------------------------------------------
-
-/// A synthetic module under construction: an owned atom table plus the one
-/// `erlang:'+'/2` import every workload chains on.
-struct Fixture {
-    /// The module being built (its atom table interns every name used).
-    module: Module,
-}
-
-impl Fixture {
-    /// A module named `name` importing `erlang:'+'/2` (import index 0).
-    fn new(name: &str) -> Fixture {
-        let mut module = Module::default();
-        module.name = module.atom_table.intern(name);
-        let erlang = module.atom_table.intern("erlang");
-        let plus = module.atom_table.intern("+");
-        module.imports.push(Import {
-            module: erlang,
-            function: plus,
-            arity: 2,
-        });
-        Fixture { module }
-    }
-
-    /// The `erlang:'+'/2` import reference (always index 0).
-    fn plus(&self) -> ImportRef {
-        ImportRef(0)
-    }
-
-    /// A `Dst = A + B` small-int addition (`gc_bif '+'/2`, no fail label).
-    fn add(&self, a: Operand, b: Operand, dst: Operand, live: u32) -> Instr {
-        Instr::GcBif {
-            arity: 2,
-            bif: self.plus(),
-            fail: NO_FAIL,
-            live,
-            args: vec![a, b],
-            dst,
-        }
-    }
-
-    /// Assemble `code` as the sole function `name/arity`, export it, and return the
-    /// module and the exported name atom.
-    ///
-    /// The blocks come from the loader's own decomposition
-    /// ([`beam_loader::lower::build_blocks`]) — a native tier compiles **blocks**, so
-    /// hand-rolled grouping would risk leaving a body without a native entry point.
-    /// The entry label is the first label in `code` (which `build_blocks` preserves in
-    /// order).
-    fn finish(mut self, name: &str, arity: u32, code: Vec<Instr>) -> (Module, Atom) {
-        let function = self.module.atom_table.intern(name);
-        let (blocks, labels) = beam_loader::lower::build_blocks(&code);
-        let entry = blocks.first().map_or(Label(0), |block| block.label);
-        self.module.exports.push(Export {
-            function,
-            arity,
-            label: entry,
-        });
-        self.module.functions.push(Function {
-            func_label: entry,
-            entry_label: entry,
-            module: self.module.name,
-            name: function,
-            arity,
-            code,
-            blocks,
-            labels,
-        });
-        (self.module, function)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Workloads
 // ---------------------------------------------------------------------------
-
 /// How a workload's call arguments are produced for a run.
 enum Args {
     /// Immediate-only arguments: identical in every context, so they can be shared.
@@ -240,7 +145,7 @@ pub(super) fn workloads() -> Vec<Workload> {
 /// hands to `jit_step_one` one at a time. The result is the built list, so the check
 /// pins both the length and every element.
 fn build_workload() -> Workload {
-    let fixture = Fixture::new("jit_bench_build");
+    let fixture = Fixture::with_plus("jit_bench_build");
     let mut code = vec![Instr::Label(Label(1))];
     code.push(Instr::Move {
         src: Operand::Nil,
@@ -295,7 +200,7 @@ fn build_workload() -> Workload {
 /// in the run's own context by [`map_args`]; `x(1)` is a small-int accumulator bounded
 /// by `MAP_ROUNDS * 6`, so every `'+'` stays in the small-int fast path.
 fn map_workload() -> Workload {
-    let fixture = Fixture::new("jit_bench_map");
+    let fixture = Fixture::with_plus("jit_bench_map");
     let fail = Label(9);
 
     let mut code = vec![Instr::Label(Label(1))];
@@ -378,7 +283,7 @@ fn map_workload() -> Workload {
 /// instruction stays on the helper — the mix is by construction, not by chance. The
 /// accumulator is what the result check pins.
 fn select_workload() -> Workload {
-    let fixture = Fixture::new("jit_bench_select");
+    let fixture = Fixture::with_plus("jit_bench_select");
     let entry = Label(1);
     let mut code = vec![
         Instr::Label(entry),
@@ -456,7 +361,7 @@ fn select_workload() -> Workload {
 /// iteration per element, with a guard and a tail call, i.e. control flow the
 /// straight-line `aggr/2` workload of `tests/jit_bench.rs` never exercises.
 fn walk_workload() -> Workload {
-    let fixture = Fixture::new("jit_bench_walk");
+    let fixture = Fixture::with_plus("jit_bench_walk");
     let loop_label = Label(4);
     let base = Label(5);
     let code = vec![
