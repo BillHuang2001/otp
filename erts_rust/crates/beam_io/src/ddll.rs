@@ -71,7 +71,7 @@
 //! candidate list, a code-path search) belongs to the caller — exactly as
 //! [`beam_abi::driver::loader`] keeps the "append the suffix only when absent" rule to itself.
 //!
-//! # `-Wl,--export-dynamic` (a hard requirement, stated here once)
+//! # `-Wl,--export-dynamic` (a property of the *loading* link, shared by every load path)
 //!
 //! A shared object loaded with `RTLD_NOW` leaves the `enif_*` (contract A.3) and `driver_*`/
 //! `erl_drv_*` (contract A.4) symbols **undefined** and resolves them out of the *loading*
@@ -79,10 +79,17 @@
 //! `-Wl,--no-export-dynamic` by default, so those symbols are absent and
 //! `dlopen(RTLD_NOW)` fails with `<path>: undefined symbol: driver_mk_port`. The loading
 //! executable must therefore be linked with **`-Wl,--export-dynamic`** (the linker spelling of
-//! `-rdynamic`) — this crate's `build.rs` emits exactly that for its test targets, and `beam_rt`
-//! must do the same for the runtime binary. A load failure of this shape is reported as
-//! [`DllErrorKind::Open`] with an `undefined symbol` text; [`DllError::is_undefined_symbol`]
-//! recognises it.
+//! `-rdynamic`).
+//!
+//! This module only *describes* the requirement — it cannot satisfy it and states none on any
+//! other file. Satisfying it belongs to the linker invocation of whoever loads, so the workspace
+//! carries one statement of it per loading link rather than one in total: `beam_io`'s own is its
+//! `build.rs` (which emits `-Wl,--export-dynamic` for this crate's test targets), and the sibling
+//! owners record theirs independently — `beam_abi`'s `build.rs` for its test targets, `beam_rt`'s
+//! `build.rs` for the runtime binary and its tests, `beam_rt`'s driver host and the `beam_abi`
+//! driver/NIF symbol-table modules for the mechanism itself. A load failure of this shape is
+//! reported as [`DllErrorKind::Open`] with an `undefined symbol` text;
+//! [`DllError::is_undefined_symbol`] recognises it.
 //!
 //! # `dlerror` handling (the C idiom, exactly)
 //!
@@ -182,6 +189,11 @@ pub const ERL_DE_DYNAMIC_ERROR_OFFSET: i32 = -10;
 /// numeric code as an atom; a code absent from it becomes the tuple `{open_error, Code}` instead.
 /// It is exposed so the runtime's `erl_ddll` floor renders `{error, Atom}` from the same data the
 /// emulator does, rather than re-typing it.
+///
+/// It is also the **single** atom↔code mapping in this module: [`errcode_to_atom`] and
+/// [`atom_to_errcode`] are its two directions, [`format_error_text`] keys its messages off it, and
+/// [`DllErrorKind::errcode`] derives from it through [`DllErrorKind::reason_atom`] — so a code and
+/// an atom can never disagree anywhere in this module.
 pub const ERRCODE_TAB: &[(&str, i32)] = &[
     ("no_error", ERL_DE_NO_ERROR),
     ("no_driver_init", ERL_DE_LOAD_ERROR_NO_INIT),
@@ -194,15 +206,45 @@ pub const ERRCODE_TAB: &[(&str, i32)] = &[
     ("symbol_not_found", ERL_DE_LOOKUP_ERROR_NOT_FOUND),
 ];
 
+/// Byte-for-byte `str` equality — the comparison the C's `errdesc_to_code` performs on each table
+/// name (`erl_bif_ddll.c:1722-1745`: no case folding, no trimming).
+///
+/// Private, and written as an explicit loop, only so the two table lookups below can be `const fn`:
+/// `str`'s `PartialEq` is not const-callable. The loop is the exhaustive definition of "the bytes
+/// are equal", so it introduces no behaviour of its own.
+const fn str_bytes_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// The atom for a numeric code — `build_load_error_hp`, `erl_bif_ddll.c:1770-1780`.
 ///
 /// Returns `Some(atom)` for a code in [`ERRCODE_TAB`], `None` for anything else — the C's signal
 /// to build the tuple `{open_error, Code}` instead of a bare atom.
+///
+/// `const` (not required by the C) so the one-shot kind→code derivation
+/// ([`DllErrorKind::errcode`]) can read the same table without a second copy of the mapping.
 #[must_use]
-pub fn errcode_to_atom(code: i32) -> Option<&'static str> {
-    ERRCODE_TAB
-        .iter()
-        .find_map(|&(atom, c)| (c == code).then_some(atom))
+pub const fn errcode_to_atom(code: i32) -> Option<&'static str> {
+    let mut i = 0;
+    while i < ERRCODE_TAB.len() {
+        let (atom, entry_code) = ERRCODE_TAB[i];
+        if entry_code == code {
+            return Some(atom);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The numeric code for an atom — `errdesc_to_code`, `erl_bif_ddll.c:1722-1745`.
@@ -210,11 +252,20 @@ pub fn errcode_to_atom(code: i32) -> Option<&'static str> {
 /// Returns `Some(code)` for an atom in [`ERRCODE_TAB`], `None` otherwise (the C then rejects the
 /// whole `erl_ddll:format_error/1` call with `badarg`). The C compares the atom's **bytes** with
 /// each table name byte-for-byte, so this comparison is exact (no case folding, no trimming).
+///
+/// `const` so this table stays the single source of truth for the atom↔code mapping: it is the
+/// direction [`DllErrorKind::errcode`] uses.
 #[must_use]
-pub fn atom_to_errcode(atom: &str) -> Option<i32> {
-    ERRCODE_TAB
-        .iter()
-        .find_map(|&(name, code)| (name == atom).then_some(code))
+pub const fn atom_to_errcode(atom: &str) -> Option<i32> {
+    let mut i = 0;
+    while i < ERRCODE_TAB.len() {
+        let (name, code) = ERRCODE_TAB[i];
+        if str_bytes_eq(name, atom) {
+            return Some(code);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The human-readable text for a table atom — `erts_ddll_error`, `erl_bif_ddll.c:1201-1224`.
@@ -454,6 +505,10 @@ impl DllErrorKind {
     /// [`DllErrorKind::Open`] yields `open_error` — the atom member of the `{open_error, Code}`
     /// tuple (the code itself is the loader's process-local index; see the module docs).
     /// [`DllErrorKind::BadArg`] yields `badarg`, which the oracle **raises** rather than returns.
+    ///
+    /// This match is the module's **only** kind→atom mapping; [`DllErrorKind::errcode`],
+    /// [`DllError::reason_atom`] and [`DllError::Display`](fmt::Display) all read it rather than
+    /// re-typing an atom.
     #[must_use]
     pub const fn reason_atom(self) -> &'static str {
         match self {
@@ -470,21 +525,15 @@ impl DllErrorKind {
         }
     }
 
-    /// The numeric code [`ERRCODE_TAB`] assigns to this kind, or `None` for a kind outside the
-    /// table ([`DllErrorKind::Open`]'s `{open_error, Code}` and [`DllErrorKind::BadArg`]'s raise).
+    /// The numeric code [`ERRCODE_TAB`] assigns to this kind's
+    /// [`reason_atom`](Self::reason_atom), or `None` for a kind outside the table
+    /// ([`DllErrorKind::Open`]'s `{open_error, Code}` and [`DllErrorKind::BadArg`]'s raise).
+    ///
+    /// Derived from the table through the reason atom, so the code and the atom always agree: the
+    /// atom↔code pairing lives in exactly one place ([`ERRCODE_TAB`], via [`atom_to_errcode`]).
     #[must_use]
     pub const fn errcode(self) -> Option<i32> {
-        match self {
-            DllErrorKind::NoDriverInit => Some(ERL_DE_LOAD_ERROR_NO_INIT),
-            DllErrorKind::DriverInitFailed => Some(ERL_DE_LOAD_ERROR_FAILED_INIT),
-            DllErrorKind::BadDriverName => Some(ERL_DE_LOAD_ERROR_BAD_NAME),
-            DllErrorKind::DriverNameTooLong => Some(ERL_DE_LOAD_ERROR_NAME_TO_LONG),
-            DllErrorKind::DriverIncorrectVersion => Some(ERL_DE_LOAD_ERROR_INCORRECT_VERSION),
-            DllErrorKind::NoDdllAvailable => Some(ERL_DE_ERROR_NO_DDLL_FUNCTIONALITY),
-            DllErrorKind::Unspecified => Some(ERL_DE_ERROR_UNSPECIFIED),
-            DllErrorKind::SymbolNotFound => Some(ERL_DE_LOOKUP_ERROR_NOT_FOUND),
-            DllErrorKind::Open | DllErrorKind::BadArg => None,
-        }
+        atom_to_errcode(self.reason_atom())
     }
 }
 

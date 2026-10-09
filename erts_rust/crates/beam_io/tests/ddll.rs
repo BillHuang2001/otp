@@ -31,6 +31,12 @@
 //! * an **unresolved symbol** — both a `dlsym` miss on a loaded object, and a `dlopen(RTLD_NOW)`
 //!   failure of an object whose reference nothing defines (`tests/fixtures/ddll_undefined.c`).
 //!
+//! It also pins the atom↔code mapping's **single sourcing**: [`ERRCODE_TAB`] is the one table,
+//! [`DllErrorKind::reason_atom`]/[`DllErrorKind::errcode`] derive from it, and every variant +
+//! every table row must round-trip through it (see
+//! [`every_kind_round_trips_through_the_single_err_code_table`] and its siblings), so
+//! re-duplicating the mapping fails a test.
+//!
 //! # Skipping
 //!
 //! The fixture `.so`s need a C compiler and the system OTP include directory (the helpers in
@@ -55,7 +61,7 @@ use std::path::{Path, PathBuf};
 
 use beam_io::ddll::{
     atom_to_errcode, errcode_to_atom, format_error_text, symbol_name, DllErrorKind, DynLib,
-    DynLibFlags,
+    DynLibFlags, ERL_DE_DYNAMIC_ERROR_OFFSET, ERL_DE_LOOKUP_ERROR_NOT_FOUND, ERRCODE_TAB,
 };
 
 use support::{cc_available, compile_so, erl_include_dir, scratch_dir, skip};
@@ -266,4 +272,99 @@ fn the_default_mode_is_the_emulators_and_global_scope_is_opt_in() {
     // And a library opened with the default mode loads and resolves fine.
     let Some(lib) = open_system_lib() else { return };
     assert!(lib.symbol(&symbol_name("malloc").unwrap()).is_ok());
+}
+
+// ---------------------------------------------------------------------------------------------
+// One source of truth for the atom <-> code mapping
+// ---------------------------------------------------------------------------------------------
+
+/// Every [`DllErrorKind`] variant — a new variant must be listed here. The tests below use this
+/// list to prove that the whole kind layer reads its atoms and codes from **one** table
+/// ([`ERRCODE_TAB`]) instead of re-encoding the mapping a second time.
+const ALL_KINDS: &[DllErrorKind] = &[
+    DllErrorKind::Open,
+    DllErrorKind::SymbolNotFound,
+    DllErrorKind::NoDriverInit,
+    DllErrorKind::DriverInitFailed,
+    DllErrorKind::BadDriverName,
+    DllErrorKind::DriverNameTooLong,
+    DllErrorKind::DriverIncorrectVersion,
+    DllErrorKind::NoDdllAvailable,
+    DllErrorKind::Unspecified,
+    DllErrorKind::BadArg,
+];
+
+#[test]
+fn every_kind_round_trips_through_the_single_err_code_table() {
+    // `reason_atom`/`errcode` are `const fn` (public API: a caller may use them in a `const`
+    // context) and the single-sourcing must not cost that.
+    const CODE: Option<i32> = DllErrorKind::SymbolNotFound.errcode();
+    const ATOM: &str = DllErrorKind::NoDriverInit.reason_atom();
+    assert_eq!(CODE, Some(ERL_DE_LOOKUP_ERROR_NOT_FOUND));
+    assert_eq!(ATOM, "no_driver_init");
+
+    assert_eq!(ALL_KINDS.len(), 10, "every DllErrorKind variant must be listed");
+
+    for &kind in ALL_KINDS {
+        let atom = kind.reason_atom();
+        // `DllErrorKind::errcode` is derived from the table *through* the reason atom, so these two
+        // cannot disagree. A hand re-typed atom or code — the duplication this pins against — would
+        // make one of the assertions below fail.
+        assert_eq!(kind.errcode(), atom_to_errcode(atom), "{atom}: errcode vs table");
+
+        match atom_to_errcode(atom) {
+            // A table-backed kind round-trips: the atom the kind renders is the atom the table
+            // assigns to the code the kind reports.
+            Some(code) => {
+                // The literal composition `errcode_to_atom(atom_to_errcode(atom))` is the identity
+                // for a table atom, and it yields exactly the code the kind reports.
+                assert_eq!(atom_to_errcode(atom).map(errcode_to_atom), Some(Some(atom)), "{atom}");
+                assert_eq!(kind.errcode(), Some(code), "{atom}");
+                assert_eq!(errcode_to_atom(code), Some(atom), "{atom}: code {code}");
+            }
+            // Exactly two kinds sit outside `errcode_tab`: the dynamic `{open_error, Code}` case
+            // and the `badarg` raise. Neither may be handed a table code.
+            None => {
+                assert!(
+                    matches!(kind, DllErrorKind::Open | DllErrorKind::BadArg),
+                    "{atom} is neither a table atom nor one of the two non-table kinds"
+                );
+                assert_eq!(kind.errcode(), None, "{atom} must not have a table code");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_err_code_table_is_an_exact_bijection() {
+    // One atom per code and one code per atom, so neither lookup can shadow a row: a duplicate
+    // would make one of the two directions disagree with the kind layer.
+    for (i, &(atom, code)) in ERRCODE_TAB.iter().enumerate() {
+        assert_eq!(atom_to_errcode(atom), Some(code), "{atom}");
+        assert_eq!(errcode_to_atom(code), Some(atom), "{code}");
+        for &(other_atom, other_code) in &ERRCODE_TAB[i + 1..] {
+            assert_ne!(atom, other_atom, "duplicate atom in errcode_tab");
+            assert_ne!(code, other_code, "duplicate code in errcode_tab");
+        }
+    }
+    // And nothing outside the table resolves — including the dynamic `{open_error, Code}` base.
+    assert_eq!(errcode_to_atom(ERL_DE_DYNAMIC_ERROR_OFFSET), None);
+    assert_eq!(atom_to_errcode("open_error"), None);
+    assert_eq!(atom_to_errcode("badarg"), None);
+}
+
+#[test]
+fn format_error_text_covers_every_errcode_table_atom() {
+    // `erts_ddll_error` (`erl_bif_ddll.c:1201-1224`) translates every row of `errcode_tab`: a table
+    // atom with no message would make the oracle's `erl_ddll:format_error/1` raise instead.
+    for &(atom, code) in ERRCODE_TAB {
+        assert!(
+            format_error_text(atom).is_some(),
+            "{atom} ({code}) has no erts_ddll_error text"
+        );
+    }
+    // The two non-table renderings have no message *by construction*: `open_error` carries the raw
+    // `dlerror` text (the loader's process-local table) and `badarg` is a raise.
+    assert_eq!(format_error_text("open_error"), None);
+    assert_eq!(format_error_text("badarg"), None);
 }
