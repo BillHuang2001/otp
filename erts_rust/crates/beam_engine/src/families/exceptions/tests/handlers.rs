@@ -21,6 +21,14 @@
 //! `try`/`catch` frame pushes, the catch-frame handler opcodes
 //! (`try_case`/`try_end`/`catch_end`) and the `catch_end` fold.
 use super::*;
+
+// The production builders take the `Machine` plus a reader closure so a moving
+// collector can relocate operands between the reserve and the read; these tests
+// build from already-materialized terms against a non-collecting arena, so alias
+// `terms` to the test-only wrappers that keep the old ergonomic arity. (An explicit
+// import shadows the glob-imported `terms` above.)
+use crate::terms::test_support as terms;
+
 // ------------------------------------------------------------------
 // try / catch push a frame
 // ------------------------------------------------------------------

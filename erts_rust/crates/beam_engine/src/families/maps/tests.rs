@@ -35,6 +35,13 @@ use beam_loader::{Atom, Function, MapWriteArgs, Operand};
 use beam_term::make_small;
 use std::collections::BTreeMap;
 
+// The production builders take the `Machine` plus a reader closure so a moving
+// collector can relocate operands between the reserve and the read; these tests
+// build from already-materialized terms against a non-collecting arena, so import
+// the test-only wrappers that keep the old ergonomic arity. (`terms::map_entries`
+// and `terms::is_hashmap` are readers, unchanged.)
+use crate::terms::test_support::{make_flatmap, make_tuple};
+
 /// A tiny module builder with an owned atom table (mirrors the `Fixture`
 /// scaffolding in `tests/opcodes.rs`, kept local so the unit tests here do not
 /// depend on integration-test helpers).
@@ -177,7 +184,7 @@ fn get_map_elements_reads_present_keys() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let map = terms::make_flatmap(
+    let map = make_flatmap(
         &mut ctx,
         &[
             (make_atom(a), make_small(10)),
@@ -221,7 +228,7 @@ fn get_map_elements_writes_each_value_to_its_destination() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let map = terms::make_flatmap(
+    let map = make_flatmap(
         &mut ctx,
         &[
             (make_atom(b), make_small(20)),
@@ -254,7 +261,7 @@ fn get_map_elements_missing_key_jumps_to_fail() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let map = terms::make_flatmap(&mut ctx, &[(make_atom(b), make_small(1))]).unwrap();
+    let map = make_flatmap(&mut ctx, &[(make_atom(b), make_small(1))]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
     assert_eq!(
@@ -280,7 +287,7 @@ fn get_map_elements_empty_map_jumps_to_fail() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let empty = terms::make_flatmap(&mut ctx, &[]).unwrap();
+    let empty = make_flatmap(&mut ctx, &[]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[empty]);
     assert_eq!(result.unwrap(), make_small(99));
@@ -328,7 +335,7 @@ fn get_map_elements_non_map_without_fail_raises_badmap() {
     let mut ctx = MinimalContext::new();
     let (result, machine) = run(&mut ctx, &module, entry, &[source]);
     assert_eq!(machine.catch_frame_depth(), 0);
-    let expected = terms::make_tuple(&mut ctx, &[make_atom(badmap), source]).unwrap();
+    let expected = make_tuple(&mut ctx, &[make_atom(badmap), source]).unwrap();
     assert!(
         cmp(result.unwrap(), expected, &module.atom_table).is_eq(),
         "the landed reason is {{badmap, Source}}"
@@ -351,7 +358,7 @@ fn get_map_elements_missing_key_without_fail_is_a_typed_error() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let map = terms::make_flatmap(&mut ctx, &[(make_atom(b), make_small(1))]).unwrap();
+    let map = make_flatmap(&mut ctx, &[(make_atom(b), make_small(1))]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
     assert!(
@@ -378,7 +385,7 @@ fn has_map_fields_all_present_falls_through() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let map = terms::make_flatmap(
+    let map = make_flatmap(
         &mut ctx,
         &[(make_atom(a), make_small(1)), (make_atom(b), make_small(2))],
     )
@@ -404,7 +411,7 @@ fn has_map_fields_missing_key_jumps_to_fail() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let map = terms::make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
+    let map = make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
     assert_eq!(
@@ -467,7 +474,7 @@ fn put_map_assoc_adds_and_overwrites() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let source = terms::make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
+    let source = make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
     let result = result.unwrap();
@@ -493,7 +500,7 @@ fn put_map_assoc_on_an_empty_map_builds_a_new_map() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let source = terms::make_flatmap(&mut ctx, &[]).unwrap();
+    let source = make_flatmap(&mut ctx, &[]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
     let entries = terms::map_entries(result.unwrap()).unwrap();
@@ -518,7 +525,7 @@ fn put_map_assoc_non_map_raises_badmap() {
     let source = make_small(7);
     let mut ctx = MinimalContext::new();
     let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
-    let expected = terms::make_tuple(&mut ctx, &[make_atom(badmap), source]).unwrap();
+    let expected = make_tuple(&mut ctx, &[make_atom(badmap), source]).unwrap();
     assert!(cmp(result.unwrap(), expected, &module.atom_table).is_eq());
 }
 
@@ -535,7 +542,7 @@ fn put_map_assoc_at_the_flat_map_limit_stays_flat() {
 
     let mut ctx = MinimalContext::new();
     let source: Vec<(Eterm, Eterm)> = (0..31).map(|i| (make_small(i), make_small(i))).collect();
-    let source = terms::make_flatmap(&mut ctx, &source).unwrap();
+    let source = make_flatmap(&mut ctx, &source).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
     let result = result.unwrap();
@@ -564,7 +571,7 @@ fn put_map_assoc_over_the_flat_map_limit_builds_a_hashmap() {
 
     let mut ctx = MinimalContext::new();
     let source: Vec<(Eterm, Eterm)> = (0..32).map(|i| (make_small(i), make_small(i))).collect();
-    let source = terms::make_flatmap(&mut ctx, &source).unwrap();
+    let source = make_flatmap(&mut ctx, &source).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
     let result = result.unwrap();
@@ -613,7 +620,7 @@ fn put_map_assoc_with_33_pairs_on_an_empty_map_builds_a_hashmap() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let empty = terms::make_flatmap(&mut ctx, &[]).unwrap();
+    let empty = make_flatmap(&mut ctx, &[]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[empty]);
     let result = result.unwrap();
@@ -665,7 +672,7 @@ fn put_map_assoc_growing_past_the_limit_enumerates_exactly_the_inserted_pairs() 
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let empty = terms::make_flatmap(&mut ctx, &[]).unwrap();
+    let empty = make_flatmap(&mut ctx, &[]).unwrap();
     let (result, _machine) = run(&mut ctx, &module, entry, &[empty]);
     let result = result.unwrap();
     assert!(terms::is_hashmap(result));
@@ -706,7 +713,7 @@ fn put_map_exact_updates_an_existing_key() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let source = terms::make_flatmap(
+    let source = make_flatmap(
         &mut ctx,
         &[(make_atom(a), make_small(1)), (make_atom(b), make_small(2))],
     )
@@ -742,7 +749,7 @@ fn put_map_exact_missing_key_jumps_to_fail() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let source = terms::make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
+    let source = make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
     assert_eq!(result.unwrap(), make_small(99));
@@ -764,10 +771,10 @@ fn put_map_exact_missing_key_without_fail_raises_badkey() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let source = terms::make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
+    let source = make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
-    let expected = terms::make_tuple(&mut ctx, &[make_atom(badkey), make_atom(b)]).unwrap();
+    let expected = make_tuple(&mut ctx, &[make_atom(badkey), make_atom(b)]).unwrap();
     assert!(
         cmp(result.unwrap(), expected, &module.atom_table).is_eq(),
         "the landed reason is {{badkey, Key}}"
@@ -791,10 +798,10 @@ fn put_map_exact_empty_map_without_fail_raises_badkey() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let empty = terms::make_flatmap(&mut ctx, &[]).unwrap();
+    let empty = make_flatmap(&mut ctx, &[]).unwrap();
 
     let (result, _machine) = run(&mut ctx, &module, entry, &[empty]);
-    let expected = terms::make_tuple(&mut ctx, &[make_atom(badkey), make_atom(a)]).unwrap();
+    let expected = make_tuple(&mut ctx, &[make_atom(badkey), make_atom(a)]).unwrap();
     assert!(cmp(result.unwrap(), expected, &module.atom_table).is_eq());
 }
 

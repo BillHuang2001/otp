@@ -33,6 +33,13 @@ use beam_loader::{Function, HeapNeed, Label, LineEntry};
 use beam_term::{cmp, make_small};
 use std::collections::BTreeMap;
 
+// The production builders take the `Machine` plus a reader closure so a moving
+// collector can relocate operands between the reserve and the read; these tests
+// build from already-materialized terms against a non-collecting arena, so alias
+// `terms` to the test-only wrappers that keep the old ergonomic arity. (An explicit
+// import shadows the glob-imported `terms` above.)
+use crate::terms::test_support as terms;
+
 /// A tiny module builder with an owned atom table (mirrors the `Fixture`
 /// scaffolding in `tests/opcodes.rs`, kept local so the unit tests here do not
 /// depend on integration-test helpers).

@@ -21,6 +21,14 @@
 //! `build_stacktrace` — the symbolic stacktrace, the `NIL` handling and the
 //! source-location items.
 use super::*;
+
+// The production builders take the `Machine` plus a reader closure so a moving
+// collector can relocate operands between the reserve and the read; these tests
+// build from already-materialized terms against a non-collecting arena, so alias
+// `terms` to the test-only wrappers that keep the old ergonomic arity. (An explicit
+// import shadows the glob-imported `terms` above.)
+use crate::terms::test_support as terms;
+
 // ------------------------------------------------------------------
 // build_stacktrace (the symbolic stacktrace)
 // ------------------------------------------------------------------
