@@ -15,7 +15,8 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   `resolve`, `resolve_label`, `import_target` (the uncached fallback), `resolve_imports`.
 - `dispatch.rs` — `run_loop`/`run_loop_with_map` (thin run entries over `Machine::drive`), `enter_run` (the per-run
   prologue that binds the literal area and records the entry call), **`Machine::step_instruction`** (the one-instruction
-  dispatcher — also the JIT deopt target), `return_step`, `resolve_external_entry` (the `call_ext*` cross-module seam).
+  dispatcher — also the JIT deopt target — which wraps the body `step_instruction_inner` with the uniform raise
+  funnel, see below), `return_step`, `resolve_external_entry` (the `call_ext*` cross-module seam).
 - `bif.rs` — `exec_bif` (`gc_bif`/`bif`/`bif0` operand marshalling + the fail-label/raise split), `call_import`
   (`call_ext*`), `raise_bif_error` (the catch-aware raise, shared with the families), `dispatch_wide`;
   `STACK_ARGS = 2` (arities ≤ it marshal through a fixed stack array, larger ones through the reusable `args_scratch`).
@@ -42,6 +43,12 @@ Ground truth (read-only, never modify): `../../../../../erts/emulator/beam/emu/*
   `tests/reductions.rs` pins one charge per instruction.
 - `step_instruction` records `Machine::current_code = (func, pc)` at entry (the exact position at every interpreted
   suspension, incl. a blocking `wait`); a natively-executed JIT block does not update it.
+- **`step_instruction` wraps its body (`step_instruction_inner`) with the uniform raise funnel.** In the run's entry
+  context (module context `0`) an uncaught `BeamError::Raise` gets its symbolic frames attached here via
+  `Machine::with_uncaught_frames`; because this is the one body both the interpreter's dispatch loop and the native
+  tier's per-instruction deopt helper (`../jit/baseline/runtime.rs::jit_step_one`) call, the two attach identical
+  frames for the same raise. A raise in a cross-module callee context (non-zero) is left untouched here and framed by
+  `Machine::drive`, which knows the run's true entry module.
 - **`FuncInfo` is NOT a metadata no-op** — a failed head-pattern/guard jumps into it and it raises class `error` with the
   bare atom `function_clause`. Inlining it as a no-op would loop on the entry label.
 - `Test`/`SelectVal` raise on a `NO_FAIL` failure; a comparison `Test`/`SelectVal` uses `cmp` (`=:=`) vs `cmp_arith` (`==`).

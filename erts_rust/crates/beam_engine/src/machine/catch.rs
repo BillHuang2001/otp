@@ -25,9 +25,9 @@
 //! `handle_error` convention) or propagates as a typed
 //! [`BeamError::Raise`]. [`Machine::throw_with_trace`] is the **one uniform
 //! raise/unwind entry point** every instruction family calls, and
-//! [`Machine::throw_with_stacktrace`] is that same entry carrying the raise's
-//! symbolic [`StackTrace`] (derived by [`Machine::raise_stacktrace`]) out of the
-//! machine on the uncaught path
+//! [`Machine::with_uncaught_frames`] is the funnel that attaches an *uncaught*
+//! raise's symbolic [`StackTrace`] (derived by [`Machine::raise_stacktrace`])
+//! as it leaves the machine — so **every** raise kind gets the same frames
 //! (`crate::families::exceptions` owns the handler opcodes that pop the frame).
 
 use std::sync::Arc;
@@ -227,28 +227,11 @@ impl Machine {
     }
 
     /// Raise a BEAM exception with class `class`, `reason` and raw stacktrace
-    /// `trace` (C: `c_p->fvalue`/`c_p->ftrace` at `find_func_info`), carrying no
-    /// symbolic frames.
+    /// `trace` (C: `c_p->fvalue`/`c_p->ftrace` at `find_func_info`).
     ///
     /// **The one uniform raise/unwind entry point** every instruction family calls
-    /// (the wave-2 contract); the exact semantics are documented on
-    /// [`Machine::throw_with_stacktrace`], to which this forwards with an empty
-    /// [`StackTrace`]. A raise site that can *name* its frames (the interpreter's
-    /// `func_info` arm, via [`Machine::raise_stacktrace`]) calls
-    /// `throw_with_stacktrace` directly instead.
-    pub(crate) fn throw_with_trace(
-        &mut self,
-        class: ExceptionClass,
-        reason: Eterm,
-        trace: Eterm,
-    ) -> Result<Step> {
-        self.throw_with_stacktrace(class, reason, trace, StackTrace::new())
-    }
-
-    /// [`Machine::throw_with_trace`] plus the symbolic [`StackTrace`] the raise
-    /// carries when it leaves the machine **uncaught**.
-    ///
-    /// A raise is *not* a bare `BeamError` — it is a control-flow decision:
+    /// (the wave-2 contract). A raise is *not* a bare `BeamError` — it is a
+    /// control-flow decision:
     ///
     /// 1. The pending exception `(class, reason)` is recorded on the machine
     ///    ([`Machine::pending_exception`]); it is also the class a later `raise`
@@ -267,33 +250,37 @@ impl Machine {
     ///    [`ExitReason::Structured`] keeps [`BeamError::as_atom`] answering `None`,
     ///    so a caller with a term representation can recover the compound reason.
     ///
-    /// `stacktrace` is [`beam_common`]'s term-independent frame list (the engine
-    /// derives it with [`Machine::raise_stacktrace`]); it is **metadata only** — the
-    /// landing registers ([`Machine::land_exception`]), the reason and the pending
-    /// class are untouched, so a caught raise behaves byte-identically with or
-    /// without it and only an **uncaught** raise carries the frames out (in its
-    /// `Raise::stacktrace`, which is what makes a bare-atom `function_clause`
-    /// localizable).
+    /// The symbolic [`StackTrace`] an **uncaught** raise carries is deliberately
+    /// **not** a parameter here: it is attached uniformly by
+    /// [`Machine::with_uncaught_frames`] as the raise leaves the machine (at the
+    /// [`Machine::step_instruction`](crate::machine::Machine) /
+    /// [`Machine::drive`](crate::machine::Machine) boundary), so **every** raise kind
+    /// — a `throw`/`error`/`exit` family builder, a BIF failure, the `func_info`
+    /// failed-clause raise — gets the same localizable frames (what makes a bare-atom
+    /// `function_clause`/`badmatch` reason name its function) without each site
+    /// deriving them. A **caught** raise never carries them out: the frames are
+    /// metadata on the uncaught `Raise` only, so the landing registers
+    /// ([`Machine::land_exception`]), the reason and the pending class are untouched
+    /// and a caught raise behaves byte-identically.
     ///
     /// A family body typically ends with `machine.throw(class, reason).map(Some)`
     /// (or, for a `{badmatch,V}`-style raise, [`Machine::throw_error`]).
-    pub(crate) fn throw_with_stacktrace(
+    pub(crate) fn throw_with_trace(
         &mut self,
         class: ExceptionClass,
         reason: Eterm,
         trace: Eterm,
-        stacktrace: StackTrace,
     ) -> Result<Step> {
         self.pending_exception = Some((class, reason));
         let frame = match self.catch_frames.last() {
             Some(frame) => *frame,
             // An uncaught structured raise carries its live reason term out of the
             // machine in the raise's `live_reason` slot; `ExitReason::Structured`
-            // keeps `as_atom()` at `None`.
+            // keeps `as_atom()` at `None`. The symbolic frames are attached later,
+            // by `Machine::with_uncaught_frames`.
             None => {
                 return Err(BeamError::Raise(
                     Raise::new(class, ExitReason::Structured)
-                        .with_stacktrace(stacktrace)
                         .with_live_reason(LiveReason::new(reason)),
                 ))
             }
@@ -320,6 +307,72 @@ impl Machine {
                 func: frame.func,
                 pc: frame.pc,
             })
+        }
+    }
+
+    /// Attach the symbolic frames of an **uncaught** raise to `err`, when it is a
+    /// [`BeamError::Raise`] that carries none yet.
+    ///
+    /// This is the single funnel that makes **every** raise kind localizable: a
+    /// raise leaves the machine as a bare `BeamError::Raise` with an empty
+    /// [`StackTrace`] (only the raising *address* is known at the raise site), and
+    /// [`Machine::raise_stacktrace`] derives the frames from the live call frames
+    /// plus that address. Running this at the one boundary the interpreter and the
+    /// native tiers both pass through (see
+    /// [`Machine::step_instruction`](crate::machine::Machine) and
+    /// [`Machine::drive`](crate::machine::Machine)) means no individual raise site —
+    /// the `throw`/`error`/`exit` family builders, a BIF failure through
+    /// [`Machine::raise_bif_error`], the `func_info` failed-clause raise — has to
+    /// derive them, and all agree on the same frames.
+    ///
+    /// * `entry_module` is the run's entry module (module context `0`). `None` means
+    ///   the caller cannot name that module at this point, so any context-`0` frame
+    ///   is **skipped** — a frame is never named against the wrong module.
+    /// * `func`/`pc` are the raising instruction's address.
+    ///
+    /// A raise that already carries frames (a caller that has run this before),
+    /// a *caught* raise (which never reaches here — it is an `Ok(Step)` landing),
+    /// or any non-[`BeamError::Raise`] error is returned **unchanged**. When the
+    /// derived trace is empty the raise is returned unchanged too, so a raise the
+    /// module cannot name is never given an invented frame.
+    ///
+    /// **Engine diagnostics are deliberately excluded** ([`is_engine_diagnostic`]):
+    /// a [`BeamError::Raise`] whose reason is the [`crate::error::unsupported`]
+    /// sentinel describes a **coverage limit of the engine itself** (an
+    /// unimplemented opcode/operand, a stale catch frame, `deallocate: frame size
+    /// mismatch`, a `receive` that cannot suspend), not an exception the Erlang
+    /// program raised. Such a diagnostic is not localizable *as a program position*
+    /// and — crucially — reaches the driver through **two different paths**: the
+    /// interpreter's every-diagnostic goes through [`Machine::step_instruction`],
+    /// while the native baseline tier's linked-tail-call helper
+    /// (`jit_tail_call`, which calls [`Machine::pop_frame_checked`] directly) reports
+    /// its own diagnostic to the driver without passing through this funnel. Frames
+    /// here would therefore make the two tiers disagree on the *same* error's
+    /// [`Debug`](std::fmt::Debug) — which the
+    /// `interpreter_and_baseline_agree_over_the_real_error_path_corpus` gate forbids.
+    /// So `error::unsupported` is the single choke point for engine diagnostics and
+    /// they stay frame-less; every **program-level** raise (class `throw`/`error`/
+    /// `exit`, a BIF's own `badarg`/`badmatch`/… reason, the `func_info`
+    /// `function_clause`) is decorated.
+    pub(crate) fn with_uncaught_frames(
+        &self,
+        err: BeamError,
+        entry_module: Option<&Module>,
+        func: u32,
+        pc: u32,
+    ) -> BeamError {
+        match err {
+            BeamError::Raise(raise)
+                if raise.stacktrace.is_empty() && !is_engine_diagnostic(&raise.reason) =>
+            {
+                let frames = self.raise_stacktrace(entry_module, func, pc);
+                if frames.is_empty() {
+                    BeamError::Raise(raise)
+                } else {
+                    BeamError::Raise(raise.with_stacktrace(frames))
+                }
+            }
+            other => other,
         }
     }
 
@@ -360,11 +413,13 @@ impl Machine {
     /// **Which module a frame belongs to.** A code address identifies its own
     /// module (C's model, and this engine's: a frame's [`Continuation`] carries the
     /// module context it returns into). `entry_module` is the run's entry module
-    /// (context `0`, which the machine borrows rather than owns); a registered
+    /// (context `0`, which the machine borrows rather than owns) — `None` means the
+    /// caller cannot name it at this point, so any context-`0` frame is **skipped**
+    /// rather than attributed to a module it does not belong to; a registered
     /// callee's module comes from [`Machine::module_context`]. A frame whose context
-    /// names neither (an id that was never registered) is **skipped** rather than
-    /// resolved against the wrong module — a frame is never named with a module the
-    /// address does not belong to.
+    /// names neither (context `0` with no entry module, or an id that was never
+    /// registered) is **skipped** rather than resolved against the wrong module — a
+    /// frame is never named with a module the address does not belong to.
     ///
     /// A frame whose function index is out of range, or whose module/function atom
     /// the module's own table cannot name, is likewise skipped: this is
@@ -374,7 +429,7 @@ impl Machine {
     /// Only the frames are derived: the reason and the class are untouched.
     pub(crate) fn raise_stacktrace(
         &self,
-        entry_module: &Module,
+        entry_module: Option<&Module>,
         func: u32,
         pc: u32,
     ) -> StackTrace {
@@ -398,13 +453,18 @@ impl Machine {
     }
 
     /// The module a frame in module context `id` belongs to — the borrowed entry
-    /// module for context `0`, else the registered context's `Arc<Module>`.
+    /// module for context `0` (when the caller can name it), else the registered
+    /// context's `Arc<Module>`.
     ///
-    /// `None` for a context that was never registered (see
-    /// [`Machine::raise_stacktrace`]).
-    fn frame_module<'a>(&self, entry_module: &'a Module, id: u32) -> Option<FrameModule<'a>> {
+    /// `None` for context `0` when no entry module is known, and for a context that
+    /// was never registered (see [`Machine::raise_stacktrace`]).
+    fn frame_module<'a>(
+        &self,
+        entry_module: Option<&'a Module>,
+        id: u32,
+    ) -> Option<FrameModule<'a>> {
         if id == 0 {
-            return Some(FrameModule::Entry(entry_module));
+            return entry_module.map(FrameModule::Entry);
         }
         self.module_context(id)
             .map(|handle| FrameModule::Registered(Arc::clone(&handle.module)))
@@ -482,7 +542,33 @@ fn exception_class_index(class: ExceptionClass) -> Option<usize> {
     }
 }
 
-/// The "no class atom resolved yet" marker (`THE_NON_VALUE` is not a term any
+/// The reason-atom prefix of every **engine diagnostic** raise
+/// ([`crate::error::unsupported`]).
+const ENGINE_DIAGNOSTIC_PREFIX: &str = "unsupported_opcode: ";
+
+/// Whether `reason` describes an **engine diagnostic** rather than a
+/// program-level exception.
+///
+/// A [`crate::error::unsupported`] raise means "this engine cannot execute this
+/// opcode/operand", "this state is inconsistent", "this run cannot suspend" —
+/// a *coverage limit of the runtime*, not an exception the Erlang program raised.
+/// Such a reason is always an atom beginning [`ENGINE_DIAGNOSTIC_PREFIX`]; no
+/// program-level reason (`badarg`, `function_clause`, `badmatch`, a `throw`/`exit`
+/// reason, …) ever carries that prefix, so the test is exact rather than
+/// heuristic.
+///
+/// The distinction matters for the uniform raise funnel
+/// ([`Machine::with_uncaught_frames`]): diagnostics reach the driver through two
+/// different paths (the interpreter funnels every instruction's diagnostic through
+/// [`Machine::step_instruction`]; the native baseline tier's linked-tail-call helper
+/// reports [`Machine::pop_frame_checked`]'s own diagnostic straight to the driver),
+/// so decorating them would make the tiers disagree on the same error's
+/// [`Debug`](std::fmt::Debug). See [`Machine::with_uncaught_frames`].
+fn is_engine_diagnostic(reason: &ExitReason) -> bool {
+    reason
+        .as_atom()
+        .is_some_and(|name| name.starts_with(ENGINE_DIAGNOSTIC_PREFIX))
+}/// The "no class atom resolved yet" marker (`THE_NON_VALUE` is not a term any
 /// atom could be).
 ///
 /// It is the machine's initial `class_atoms` value (set by
@@ -499,6 +585,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use crate::error;
     use crate::machine::Continuation;
     use crate::Step;
 
@@ -636,7 +723,7 @@ mod tests {
             })
             .unwrap();
 
-        let trace = machine.raise_stacktrace(&entry, 1, 7);
+        let trace = machine.raise_stacktrace(Some(&entry), 1, 7);
         assert_eq!(trace.len(), 2, "the raising function then its caller");
         // The function that raised comes first: `g/2` at `(1, 7)`.
         assert_eq!(trace.frames[0].module.as_str(), "m");
@@ -665,7 +752,7 @@ mod tests {
             Instr::Return,
         ];
 
-        let trace = Machine::new().raise_stacktrace(&module, 0, 2);
+        let trace = Machine::new().raise_stacktrace(Some(&module), 0, 2);
         let location = trace.frames[0]
             .location
             .as_ref()
@@ -673,7 +760,10 @@ mod tests {
         assert_eq!(location.file.as_str(), "m.erl");
         assert_eq!(location.line, 7);
         // Before the marker there is no location (C's LINE_INVALID_LOCATION).
-        assert_eq!(Machine::new().raise_stacktrace(&module, 0, 0).frames[0].location, None);
+        assert_eq!(
+            Machine::new().raise_stacktrace(Some(&module), 0, 0).frames[0].location,
+            None
+        );
     }
 
     #[test]
@@ -696,7 +786,7 @@ mod tests {
         let id = machine.register_context(&callee);
         machine.switch_context(id).unwrap();
 
-        let trace = machine.raise_stacktrace(&entry, 0, 5);
+        let trace = machine.raise_stacktrace(Some(&entry), 0, 5);
         assert_eq!(trace.len(), 2);
         assert_eq!(trace.frames[0].module.as_str(), "c", "the raising function");
         assert_eq!(trace.frames[0].function.as_str(), "g");
@@ -708,7 +798,7 @@ mod tests {
     fn raise_stacktrace_skips_a_frame_the_module_or_context_cannot_name() {
         let entry = module_with("m", &[("f", 1)]);
         // A function index outside the module's table is skipped, never invented.
-        assert!(Machine::new().raise_stacktrace(&entry, 9, 0).is_empty());
+        assert!(Machine::new().raise_stacktrace(Some(&entry), 9, 0).is_empty());
 
         // A continuation in a context that was never registered is skipped too: the
         // address cannot be attributed to a module, so it is not named at all.
@@ -722,39 +812,155 @@ mod tests {
                 context: 9,
             })
             .unwrap();
-        let trace = machine.raise_stacktrace(&entry, 0, 0);
+        let trace = machine.raise_stacktrace(Some(&entry), 0, 0);
         assert_eq!(trace.len(), 1, "only the raising function is named");
         assert_eq!(trace.frames[0].function.as_str(), "f");
     }
 
+    /// `raise_stacktrace(None, ..)` cannot name the run's entry module, so every
+    /// context-`0` frame is **skipped** — while a frame in a *registered* context is
+    /// still named (its module comes from the registry, not from the entry module).
     #[test]
-    fn throw_with_stacktrace_attaches_the_frames_to_the_uncaught_raise() {
+    fn raise_stacktrace_without_an_entry_module_skips_context_zero_frames() {
+        let callee = Arc::new(module_with("c", &[("g", 0)]));
         let mut machine = Machine::new();
-        let mut frames = StackTrace::new();
-        frames.push(StackFrame::new("m", "f", 1));
-        let reason = Eterm::from_raw(0x1234);
+        machine.push_frame(0).unwrap();
+        machine.push_frame(0).unwrap();
+        // The caller frame is a context-`0` address (the entry module)…
+        machine
+            .set_continuation(Continuation::Address {
+                func: 0,
+                pc: 1,
+                context: 0,
+            })
+            .unwrap();
+        // …while the machine executes in a registered callee context.
+        let id = machine.register_context(&callee);
+        machine.switch_context(id).unwrap();
 
-        let err = machine
-            .throw_with_stacktrace(ExceptionClass::Error, reason, NIL, frames)
-            .expect_err("no catch frame: the raise propagates");
-        match err {
+        // With an entry module: the raising function (callee) and the caller.
+        assert_eq!(machine.raise_stacktrace(Some(&module_with("m", &[("f", 1)])), 0, 5).len(), 2);
+        // Without one: the context-`0` caller frame is skipped, so only the callee's
+        // frame remains — never named against the wrong module.
+        let trace = machine.raise_stacktrace(None, 0, 5);
+        assert_eq!(trace.len(), 1, "the context-0 caller is skipped");
+        assert_eq!(trace.frames[0].module.as_str(), "c");
+        assert_eq!(trace.frames[0].function.as_str(), "g");
+    }
+
+    /// A raise starts life with no frames (`throw_with_trace`); the funnel attaches
+    /// them. A raise that already carries frames, and a non-`Raise` error, are
+    /// returned untouched.
+    #[test]
+    fn with_uncaught_frames_attaches_only_to_an_empty_raise() {
+        let entry = module_with("m", &[("f", 1), ("g", 2)]);
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.push_frame(0).unwrap();
+        machine
+            .set_continuation(Continuation::Address {
+                func: 0,
+                pc: 3,
+                context: 0,
+            })
+            .unwrap();
+
+        // A fresh, frame-less uncaught raise: the funnel names `g/2` then its caller.
+        let bare = machine
+            .throw(ExceptionClass::Throw, Eterm::from_raw(0x99))
+            .expect_err("no catch frame");
+        assert!(matches!(&bare, BeamError::Raise(r) if r.stacktrace.is_empty()));
+        match machine.with_uncaught_frames(bare, Some(&entry), 1, 7) {
             BeamError::Raise(raise) => {
-                assert_eq!(raise.class, ExceptionClass::Error);
-                assert_eq!(raise.reason.as_atom(), None, "a structured reason");
-                assert_eq!(raise.stacktrace.len(), 1);
-                assert_eq!(raise.stacktrace.frames[0].module.as_str(), "m");
-                assert_eq!(raise.stacktrace.frames[0].function.as_str(), "f");
-                assert_eq!(raise.stacktrace.frames[0].arity, 1);
-                assert!(raise.live_reason().is_some(), "the reason term still rides out");
+                assert_eq!(raise.stacktrace.len(), 2);
+                assert_eq!(raise.stacktrace.frames[0].function.as_str(), "g");
+                assert_eq!(raise.stacktrace.frames[0].arity, 2);
+                assert_eq!(raise.stacktrace.frames[1].function.as_str(), "f");
             }
             other => panic!("expected a raise, got {other:?}"),
         }
-        // The rest of the raise is exactly `throw_with_trace`'s.
-        assert_eq!(machine.pending_exception(), Some((ExceptionClass::Error, reason)));
+
+        // A raise that already carries frames is left unchanged (the second caller of
+        // the funnel does not re-derive them).
+        let mut with_frames = StackTrace::new();
+        with_frames.push(StackFrame::new("m", "already", 0));
+        let carried = BeamError::Raise(
+            beam_common::Raise::new(ExceptionClass::Error, beam_common::ExitReason::Structured)
+                .with_stacktrace(with_frames),
+        );
+        match machine.with_uncaught_frames(carried, Some(&entry), 1, 7) {
+            BeamError::Raise(raise) => {
+                assert_eq!(raise.stacktrace.len(), 1);
+                assert_eq!(raise.stacktrace.frames[0].function.as_str(), "already");
+            }
+            other => panic!("expected a raise, got {other:?}"),
+        }
+
+        // A non-raise error is untouched.
+        assert!(matches!(
+            machine.with_uncaught_frames(BeamError::BadArg, Some(&entry), 1, 7),
+            BeamError::BadArg
+        ));
+
+        // A raise the module cannot name keeps an empty trace rather than inventing a
+        // frame: the raising function index is out of range AND the machine holds no
+        // live caller frame to name either.
+        let mut frameless = Machine::new();
+        let bare = frameless
+            .throw(ExceptionClass::Throw, Eterm::from_raw(0x11))
+            .expect_err("no catch frame");
+        match frameless.with_uncaught_frames(bare, Some(&entry), 9, 0) {
+            BeamError::Raise(raise) => assert!(raise.stacktrace.is_empty()),
+            other => panic!("expected a raise, got {other:?}"),
+        }
+    }
+
+    /// An **engine diagnostic** (a [`crate::error::unsupported`] raise, whose reason
+    /// atom starts `unsupported_opcode: `) is never decorated with frames, even when
+    /// the machine's live frames *could* name one: the interpreter and the native
+    /// baseline tier reach such a diagnostic through different paths, so frames here
+    /// would make the two tiers disagree on the same error's `Debug`.
+    #[test]
+    fn with_uncaught_frames_leaves_engine_diagnostics_unframed() {
+        let entry = module_with("m", &[("f", 1), ("g", 2)]);
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.push_frame(0).unwrap();
+        machine
+            .set_continuation(Continuation::Address {
+                func: 0,
+                pc: 3,
+                context: 0,
+            })
+            .unwrap();
+
+        // The very frames the funnel *would* have named for a program-level raise.
+        assert_eq!(machine.raise_stacktrace(Some(&entry), 1, 7).len(), 2);
+
+        // A diagnostic is returned byte-identically: same reason, empty trace.
+        let diagnostic = error::unsupported("deallocate: frame size mismatch");
+        match machine.with_uncaught_frames(diagnostic, Some(&entry), 1, 7) {
+            BeamError::Raise(raise) => {
+                assert_eq!(
+                    raise.reason.as_atom(),
+                    Some("unsupported_opcode: deallocate: frame size mismatch")
+                );
+                assert!(raise.stacktrace.is_empty(), "diagnostics stay frame-less");
+            }
+            other => panic!("expected a raise, got {other:?}"),
+        }
+        // `error::blocked()` is the same sentinel and is excluded too.
+        match machine.with_uncaught_frames(error::blocked(), Some(&entry), 1, 7) {
+            BeamError::Raise(raise) => assert!(raise.stacktrace.is_empty()),
+            other => panic!("expected a raise, got {other:?}"),
+        }
     }
 
     #[test]
     fn throw_with_trace_leaves_the_frames_empty() {
+        // The raise *site* attaches no frames: the funnel
+        // (`Machine::with_uncaught_frames`) is what derives them, at the instruction
+        // / driver boundary.
         let mut machine = Machine::new();
         let err = machine
             .throw(ExceptionClass::Throw, Eterm::from_raw(0x99))
@@ -767,17 +973,18 @@ mod tests {
 
     #[test]
     fn a_caught_raise_lands_unchanged_and_never_exposes_the_frames() {
+        // A raise that lands in a live catch frame is an `Ok(Step)`, so the frames the
+        // funnel would derive never reach it: the landing registers and the catch
+        // frame are exactly what they were before the frames existed.
         let mut machine = Machine::new();
         machine.push_frame(0).unwrap();
         machine.push_catch_frame(CatchFrame::new(9, 9, 0));
         let class_atom = make_atom(Atom::from_raw(11));
         machine.set_class_atom(ExceptionClass::Error, class_atom);
         let reason = Eterm::from_raw(0x1234);
-        let mut frames = StackTrace::new();
-        frames.push(StackFrame::new("m", "f", 1));
 
         let step = machine
-            .throw_with_stacktrace(ExceptionClass::Error, reason, NIL, frames)
+            .throw_with_trace(ExceptionClass::Error, reason, NIL)
             .expect("a live frame catches");
         assert_eq!(step, Step::Goto { func: 9, pc: 9 });
         // The C landing convention is untouched by the frames: x0 = THE_NON_VALUE,

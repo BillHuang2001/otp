@@ -111,6 +111,17 @@ impl Machine {
     /// A raise (or any other typed error — an out-of-range `pc`/function index, an
     /// unsupported opcode/operand) stays an `Err(beam_common::BeamError)`; it is
     /// never a panic and never a wrong result.
+    ///
+    /// **The uniform raise funnel.** A raise that leaves the machine **uncaught**
+    /// gets its symbolic frames attached here, at the one point the interpreter's
+    /// dispatch loop and the native tiers' per-instruction deopt helper
+    /// ([`crate::jit::baseline`]'s `jit_step_one`) both pass through: in the run's
+    /// **entry** context (`0`) the active `module` IS the entry module, so
+    /// [`Machine::with_uncaught_frames`] can name every frame. A raise inside a
+    /// cross-module callee (a non-zero context) is left untouched here, because the
+    /// driver ([`Machine::drive`], which knows the true entry module) attaches the
+    /// fuller frame set — naming the callee's module for a context-`0` caller would
+    /// be a wrong result.
     #[inline]
     pub(crate) fn step_instruction(
         &mut self,
@@ -129,6 +140,29 @@ impl Machine {
         // blocking `wait` is interpreted, never inlined); a natively-executed JIT
         // block does not update it (see the field docs).
         self.current_code = Some((func, pc));
+        let result = self.step_instruction_inner(module, labels, func, pc, ctx);
+        // The uniform raise funnel (see this method's docs). In context `0` the
+        // active module is the entry module, so `Some(module)` is exactly the
+        // `entry_module` `Machine::raise_stacktrace` needs; in a callee context the
+        // result is left for the driver, which knows the true entry module.
+        if self.current_context() == 0 {
+            result.map_err(|err| self.with_uncaught_frames(err, Some(module), func, pc))
+        } else {
+            result
+        }
+    }
+
+    /// The body of one dispatch-loop iteration — the effect of the corresponding
+    /// dispatch arm, without the raise funnel [`Machine::step_instruction`] wraps
+    /// around it (so the driver and the native tiers share one step).
+    fn step_instruction_inner(
+        &mut self,
+        module: &Module,
+        labels: &LabelMap,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Step> {
         // The instruction borrows `module` (never `self`), so mutating the machine
         // in the arms below is sound and clone-free.
         let instr = match module.functions.get(func as usize) {
@@ -189,14 +223,13 @@ impl Machine {
                 {
                     self.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
                 }
-                // The raise carries the frames it happened through, the raising
-                // function first (`Machine::raise_stacktrace`): the reason is the
-                // bare atom (C's `EXC_FUNCTION_CLAUSE`), so without them an
-                // *uncaught* `function_clause` — the boot path's failure mode —
-                // would name no function at all. A caught raise is unaffected (the
-                // frames are metadata on the uncaught `Raise` only).
-                let frames = self.raise_stacktrace(module, func, pc);
-                self.throw_with_stacktrace(ExceptionClass::Error, reason, NIL, frames)
+                // The frames an *uncaught* `function_clause` carries (the boot path's
+                // failure mode) are attached uniformly as the raise leaves the machine
+                // ([`Machine::with_uncaught_frames`], via `step_instruction`), so this
+                // arm stays the plain raise and every raise kind shares one frame
+                // derivation. A caught raise is unaffected (the frames are metadata on
+                // the uncaught `Raise` only).
+                self.throw_error(reason)
             }
             Instr::Move { src, dst } => {
                 let value = read_operand(self, ctx, src)?;
