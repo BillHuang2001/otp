@@ -168,9 +168,14 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   (`../lib/compiler`), per Part II §E/§H. Language-agnostic (Erlang/Elixir/LFE). Not part of the Rust
   runtime rewrite; the Rust runtime must ultimately run the compiler (contract A.9, self-hosted build)
   — that is future work.
-- **Stage 4 adoption:** the copying collector and the measurement-gated GenImmix mature generation
-  (`beam_gc`) are implemented and auto-selected at/above `IMMIX_BREAK_EVEN_WORDS`; no outer crate drives
-  a collector yet (`beam_rt` does not).
+- **Stage 4 adoption:** the copying collector IS driven by `beam_rt` at the engine heap-admission
+  point (`beam_rt/src/context/gc.rs`), conservatively gated (a process is pinned once a live float
+  register is seen, halted on a collection error, and a global valve disables collection once an escaped
+  runtime store holds an off-heap term). The GenImmix mature generation (`beam_gc`, `AnyCollector`/
+  `select_mature`) is implemented but its strategy dispatch is unreached at runtime — the
+  `IMMIX_BREAK_EVEN_WORDS` auto-selection runs only in `beam_gc` tests. `OffHeap::sweep` and
+  `beam_gc::HeapFragment`/`FragmentChain`/`FragmentRoots` likewise have no production consumer (the
+  production fragment model is `beam_message`'s).
 - **Stage 6 (Level-2 clean-room VM):** new ISA + full toolchain — research track with an explicit exit
   criterion (Part II §H).
 - **Legacy-C removal:** delete the corresponding C under `../erts/emulator/beam/` module-by-module as
