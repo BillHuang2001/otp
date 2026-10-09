@@ -181,6 +181,24 @@ impl RuntimeContext<'_> {
         terms::make_list(self, &entries)
     }
 
+    /// `application:get_application/0`: always the atom `undefined`.
+    ///
+    /// `application.erl:1007-1008` is
+    /// `get_application() -> application_controller:get_application(group_leader())`: the
+    /// `/0` form resolves the application of the **calling process's group leader**. This
+    /// runtime runs no application controller (see the module docs) and no application
+    /// owns any process, so there is no application to name — exactly as the oracle
+    /// answers for a process that belongs to none (verified against OTP 29/erts-17.1:
+    /// `application:get_application()` ⇒ `undefined`). The `/1` form is not claimed; it
+    /// would have to reason about a pid/module's owning application.
+    ///
+    /// The `try_native` arm that reaches this entry is a registration in
+    /// `../native.rs` — one level up, outside this node — so until it lands the method
+    /// is reachable only from the unit test below (hence the `allow`).
+    #[allow(dead_code)]
+    pub(super) fn application_get_application_0(&mut self) -> Result<Eterm> {
+        self.atom("undefined")
+    }
     // -- application:loaded_applications/0, which_applications/0 --------------
 
     /// `application:loaded_applications/0`: `{Application, Description, Vsn}` for every
@@ -1197,6 +1215,30 @@ mod tests {
                 call(&mut runtime, "application", "get_key", &[app, nope_key]).expect("get_key/2");
             assert_eq!(runtime.atom_name_of(answer), Some("undefined"));
         }
+    }
+
+    // -- get_application/0 ----------------------------------------------------
+
+    #[test]
+    fn get_application_0_is_undefined() {
+        // Oracle-verified (OTP 29/erts-17.1): `application:get_application()` ⇒
+        // `undefined`. The `/0` form asks for the *calling process's* application
+        // (`application.erl:1007-1008`), and this runtime runs no application controller,
+        // so no process belongs to an application — the same reason `get_env/1` is
+        // `undefined` for every key.
+        //
+        // Driven through the entry itself rather than `call`: `application:get_application/0`
+        // has no `try_native` dispatch arm yet (the registration lives in `src/native.rs`,
+        // outside this node — see `src/native/CONTEXT.md`).
+        let mut runtime = runtime();
+        let answer = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = crate::context::RuntimeContext::with_output(&mut runtime, &mut sink);
+            context
+                .application_get_application_0()
+                .expect("application:get_application/0")
+        };
+        assert_eq!(runtime.atom_name_of(answer), Some("undefined"));
     }
 
     // -- the application-resource reader --------------------------------------

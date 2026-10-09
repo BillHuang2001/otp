@@ -253,7 +253,10 @@ pub struct MapField {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// An integer literal.
-    Int(i64),
+    ///
+    /// `i128` so a literal past the 64-bit range still has an exact value (the evaluator
+    /// materializes a bignum term from it); a literal past `i128` is a typed capability gap.
+    Int(i128),
     /// A float literal.
     Float(f64),
     /// An atom (bare or quoted).

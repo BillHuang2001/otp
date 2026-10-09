@@ -27,14 +27,14 @@ per-function bodies. Files:
 | Module | Serves |
 |---|---|
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), the `erlang` core (`halt/0,1`, `display/1`, `io:put_chars/1,2`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `os:cmd/1`), the binary-surface and scheduler-model test modules |
-| `init.rs` | `init:get_argument/1`, `get_arguments/0`, `get_plain_arguments/0`, `get_status/0` |
-| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1`, `root_dir/0` |
+| `init.rs` | `init:get_argument/1` — a command-line flag from `RuntimeConfig::init_args`, plus the three **automatic** flags the emulator defines itself (`root` = the code root dir, `home` = `$HOME`, `progname` = the basename this runtime was invoked as) — `get_arguments/0`, `get_plain_arguments/0`, `get_status/0` |
+| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1`, `root_dir/0`, `get_mode/0` (the code server's `interactive`/`embedded` mode, from the `-mode` init argument per `code.erl:1741-1765`) |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4` (incl. the heap-size options → `beam_gc::HeapPolicy`), `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`, `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` (per-process, default the root pid; see below) |
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
-| `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
+| `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
 | `prim.rs` | the `prim_file` floor (11 entries) — see below |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
@@ -282,7 +282,7 @@ form (`:47`) for an errno outside the table.
   (`encode_path`/`collect_path`), the `errno`→atom table, and the served entries `get_cwd/0,1`,
   `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`, `make_link/2`,
   `make_symlink/2`, `altname/1`
-- `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7)
+- `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the `init` automatic flags (`root`/`home`/`progname`), the code server's `get_mode/0` and `application:get_application/0` included
 - `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl. `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling surfaces, and the port-write surface (contracts A.4/A.7/A.8/A.9)
 - `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`) + its unit tests
 - `test_support.rs` → the shared fixtures
@@ -375,6 +375,23 @@ needs:
     protocol (`erl_prim_loader`), and the `prim_eval` iteration protocol. M1's own file/socket/OS
     floor is deliberately minimal (`os:cmd/1`, `beam_io`'s spawn driver, the port write stream) and
     is not a `prim_*` implementation.
+
+## Handoffs (owned by OTHER nodes)
+The per-call dispatch arm for every native BIF is a registration in `../native.rs` (one level up,
+the parent node — outside *this* node's scope). Two served entries have **no arm yet**, so they are
+unreachable from a real call and carry a documented `#[allow(dead_code)]`:
+- `("code", "get_mode", 0) => Some(self.code_get_mode()),`
+- `("application", "get_application", 0) => Some(self.application_get_application_0()),`
+
+Until they land, `differential compare 'code:get_mode()'` and
+`compare 'application:get_application()'` MISMATCH (the oracle answers `interactive` / `undefined`;
+this runtime falls through to the preloaded module's `erlang:nif_error(undef)`, surfacing as
+`badarg`). `../native.rs`'s own module-doc table should gain those two names in the same change.
+`init:get_argument(root)` and `init:get_argument(home)` already AGREE (they ride the registered
+`init:get_argument/1` arm). `init:get_argument(progname)` cannot agree in general: both runtimes
+report the basename **they** were invoked as (the oracle's `"erl"` comes from the `erl` shell
+script's `$0`), which is a property of the harness's invocation, not a value this runtime may
+fabricate — so it is a deliberate, invocation-dependent gap, never a wrong result.
 
 ## See Also
 - `../../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.
