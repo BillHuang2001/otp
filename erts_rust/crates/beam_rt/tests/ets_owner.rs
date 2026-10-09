@@ -38,7 +38,8 @@
 //! # Oracle ground truth (system `erl`, OTP 29 / `erts-17.1`)
 //!
 //! The flows print exactly (re-probed — and re-asserted — by
-//! [`the_owner_death_flows_match_the_live_oracle`]):
+//! [`the_owner_death_flows_match_the_live_oracle`] and
+//! [`unnamed_owner_death_flows_match_the_live_oracle`]):
 //!
 //! ```text
 //! undefined          %% (a) a named_table's dead owner leaves ets:info(Name) undefined
@@ -46,6 +47,12 @@
 //!                         %%     Data =:= the gift (`Tid` is the table's *name atom*)
 //! {no_transfer,true,true} %% (c) the arity-2 {heir, Self} inherits in silence, table survives
 //! {true,true,undefined}   %% (d) an arity-3 {heir, Self, undefined} *does* transfer `undefined`
+//! true                    %% (e) an *unnamed* table's dead owner leaves ets:info(Tid) undefined
+//! {true,true,{gift,42},true,1,true}
+//!                         %% (f) an *unnamed* table with {heir, Self, {gift,42}}: Tid is a
+//!                         %%     reference, From =:= Owner, Data =:= the gift, the heir can
+//!                         %%     ets:insert/2 through the received tid and reads size 1 and
+//!                         %%     itself as owner
 //! ```
 //!
 //! Flow (b) is also the regression pin for the two defects the owner-death work shipped with:
@@ -55,22 +62,30 @@
 //! (`beam_rt`'s `Runtime::own_heir_gift`). Either defect turns (b) into `no_transfer` /
 //! `{true,true,{}}`, so the flow fails loudly if either regresses.
 //!
-//! # The unreachable case: an *unnamed* table (the documented capability gap)
+//! # *Unnamed* tables: reclaimed through the registry roster
 //!
-//! `beam_rt` reclaims only tables it can *prove* an owner created: `beam_bifs`'s table
-//! registry exposes no public owner→handle roster and no handle iterator (`all_tids` is
-//! `pub(super)`), so the runtime resolves a fresh table's handle at `ets:new/2` time through
-//! the public `lookup_name` surface — which exists only for a **`named_table`**. An owner's
-//! **unnamed** table is therefore not indexed and not reclaimed: it leaks, exactly as it did
-//! before the owner-death work, and no fabricated tid is ever produced. The oracle instead
-//! drops (or transfers) an unnamed table like any other, so the case is a **known divergence**
-//! rather than a wrong result — pinned by
-//! [`unnamed_tables_are_not_reclaimed_the_documented_gap`], and reported as the handoff
-//! `beam_bifs::TableRegistry` needs a public owner/handle roster to close.
+//! `beam_bifs::TableRegistry::handles_owned_by` is the public owner→handle roster, so the
+//! runtime now acts on the **roster** (unioned with the handles it indexed at `ets:new/2` time)
+//! rather than on the index alone — which is what closes the unnamed-table leak flows (e) and
+//! (f) pin. The index is kept only for the one thing the roster cannot supply, a
+//! `named_table`'s **registered name**.
 //!
-//! The `ets:setopts/2`-installed heir path is likewise unindexed: this crate observes only
-//! `ets:new/2`, so a table whose heir is installed *after* creation is not reclaimed (its
-//! gift survives here only because M1 never resets a process heap). Same handoff, same owner.
+//! Flow (f)'s tid is the table's **reference** (the oracle's tid for an unnamed table); the
+//! runtime materializes it through `beam_process::MonitorRef::to_eterm`, which writes the very
+//! same frozen `[header(3,REF_SUBTAG), node, serial, id]` block `beam_bifs`'s `make_ref_thing`
+//! does — see `runtime::ets_owner::tid_ref_thing`. The flow therefore asserts only **derived**
+//! facts (`is_reference(Tid)`, `From =:= Pid`, the gift, and that the tid still *works* for
+//! `ets:insert/2`/`ets:info/2`), never the raw ref, whose id space differs between the two
+//! runtimes.
+//!
+//! # Not observed: a `{heir, …}` installed *after* creation
+//!
+//! This crate observes only `ets:new/2`, so a `named_table` whose **name registration** it did
+//! not itself see created is the one thing it could leave behind (a *name* leak, never a table
+//! leak — the table is still reclaimed through the roster, and `beam_ets::Table::owner_died`
+//! honours a `setopts`-installed heir like any other). The gift data of a `setopts`-installed
+//! arity-3 heir is likewise not copied into table-owned storage (`Table::setopts` is the
+//! non-copying primitive), which is a `beam_bifs` handoff, not a wrong result here.
 //!
 //! A missing `erl` is a **loud** skip, never a silent pass (`tests/support/mod.rs`).
 
@@ -226,6 +241,34 @@ io:format("~p~n", [Obs]),
 halt(0).
 "#;
 
+/// (e) An **unnamed** table's owner dies: the table is reclaimed like any other, so the tid the
+/// owner handed over before dying no longer resolves (`ets:info/1` is `undefined`).
+const EXPR_UNNAMED_TABLE_DIES: &str = r#"
+Self = self(),
+{Pid, Ref} = spawn_opt(fun() -> T = ets:new(owned_unnamed, [public]), Self ! {tid, T} end, [monitor]),
+T = receive {tid, X} -> X end,
+receive {'DOWN', Ref, process, _, _} -> ok end,
+io:format("~p~n", [ets:info(T) =:= undefined]),
+halt(0).
+"#;
+
+/// (f) An **unnamed** table with `{heir, Self, {gift,42}}`: the heir receives the table — this
+/// time under the table's **reference** as the tid, not a name atom — and the received tid is
+/// still a live handle (`ets:insert/2` succeeds and the table now holds one object, owned by
+/// the heir). Only derived facts are compared: the raw reference's id differs between runtimes.
+const EXPR_UNNAMED_HEIR_GIFT: &str = r#"
+Self = self(),
+{Pid, Ref} = spawn_opt(fun() -> ets:new(unnamed_gift_probe, [public, {heir, Self, {gift,42}}]) end, [monitor]),
+receive {'DOWN', Ref, process, _, _} -> ok end,
+Obs = receive {'ETS-TRANSFER', Tid, From, Data} ->
+          Inserted = ets:insert(Tid, {k, v}),
+          {is_reference(Tid), From =:= Pid, Data, Inserted,
+           ets:info(Tid, size), ets:info(Tid, owner) =:= Self}
+      after 2000 -> no_transfer end,
+io:format("~p~n", [Obs]),
+halt(0).
+"#;
+
 /// One `-eval` program and the value both runtimes must print for it.
 struct Flow {
     /// A one-line description used in failure messages.
@@ -260,6 +303,22 @@ const FLOWS: [Flow; 4] = [
     },
 ];
 
+/// The **unnamed**-table owner-death flows (see the module documentation's (e) and (f)): the
+/// table itself is reclaimed through the `beam_bifs` owner→handle roster, and a transferred one
+/// carries the table's **reference** as its tid.
+const UNNAMED_FLOWS: [Flow; 2] = [
+    Flow {
+        label: "(e) a dead owner's unnamed table is gone",
+        expr: EXPR_UNNAMED_TABLE_DIES,
+        expected: "true",
+    },
+    Flow {
+        label: "(f) an unnamed table with {heir, Self, {gift,42}} transfers its reference tid",
+        expr: EXPR_UNNAMED_HEIR_GIFT,
+        expected: "{true,true,{gift,42},true,1,true}",
+    },
+];
+
 // ---------------------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------------------
@@ -290,38 +349,32 @@ fn the_owner_death_flows_match_the_live_oracle() {
     }
 }
 
-/// The documented capability gap: an **unnamed** table's dead owner does not release it here/// (the oracle releases it — `ets:info(Tid)` is `undefined`).
+/// The **unnamed**-table flows print exactly what the live oracle prints for the same program:
+/// the gone tid of a dead owner's unnamed table, and the heir's
+/// `{'ETS-TRANSFER', Tid, FromPid, Data}` carrying the table's **reference** (a tid that still
+/// works), the dead owner's pid, the gift, and the heir's ownership afterwards.
 ///
-/// The owner hands its `ets:new/2` handle to the `-eval` process before dying, so both
-/// runtimes are asked the same question about the same tid. Asserting the *divergence*
-/// explicitly (rather than skipping the case) keeps the gap executable: the day `beam_bifs`
-/// exposes a public owner/handle roster and this crate indexes unnamed tables, the `beam_rt`
-/// half below fails loudly and must be updated.
+/// This is the regression pin for the unnamed-table leak: before the runtime adopted
+/// `beam_bifs::TableRegistry::handles_owned_by` as the authority on which tables a death acts
+/// on, flow (e) printed `false` here (the table leaked) and flow (f) timed out into
+/// `no_transfer`.
+///
+/// The oracle is consulted per flow, so a divergence fails on the side that disagrees.
 #[test]
-fn unnamed_tables_are_not_reclaimed_the_documented_gap() {
+fn unnamed_owner_death_flows_match_the_live_oracle() {
     let Some(oracle) = support::require_oracle("ets_owner") else {
         return;
     };
-    let expr = r#"
-Self = self(),
-{Pid, Ref} = spawn_opt(fun() -> T = ets:new(owned_unnamed, [public]), Self ! {tid, T} end, [monitor]),
-T = receive {tid, X} -> X end,
-receive {'DOWN', Ref, process, _, _} -> ok end,
-io:format("~p~n", [ets:info(T) =:= undefined]),
-halt(0).
-"#;
+    for Flow {
+        label,
+        expr,
+        expected,
+    } in UNNAMED_FLOWS
+    {
+        let ours = beam_rt_eval(expr);
+        assert_run("beam_rt", label, &ours, expected);
 
-    // The oracle: the table is gone with its owner.
-    let theirs = oracle_eval(&oracle, expr);
-    assert_run("erl", "unnamed table reclaimed", &theirs, "true");
-
-    // This runtime: only `named_table`s are indexed, so the table survives (the gap).
-    let ours = beam_rt_eval(expr);
-    assert_run(
-        "beam_rt",
-        "unnamed table NOT reclaimed (documented gap — needs a public owner/handle roster \
-         on beam_bifs::TableRegistry; see tests/ets_owner.rs)",
-        &ours,
-        "false",
-    );
+        let theirs = oracle_eval(&oracle, expr);
+        assert_run("erl", label, &theirs, expected);
+    }
 }
