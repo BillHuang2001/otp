@@ -535,14 +535,17 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   remains host-side is the *rendering* — `TableInfo::write_concurrency` is still a `bool`, so the `auto`
   atom / the normalized `{debug_hash_fixed_number_of_locks, Nlocks}` tuple is supplied by the
   `beam_bifs` `TableProfile` sidecar. The stored `FixedLocks` count is the requested, un-normalized one.
-- **The owner-death transition has no caller.** `Table::owner_died` models it, but nothing in the
-  runtime invokes it: `beam_bifs`'s `ets:new/2` never records an owner, its `TableRegistry` has no
-  owner index, and `beam_process` has no process-death hook at all. `ETS_SURFACE.md` §7 names the exact
-  API each of those needs.
-- **`ets:info/1` `owner`/`heir` are `undefined` and `id` is a small integer.** `owner` (a pid in the
-  oracle) has no term representation at this stage; `heir` is `none` when unset and `undefined` when
-  installed (its structured `TableInfo::heir` still carries the pid); `id` renders as a small integer
-  rather than a ref.
+- **The owner-death transition's runtime caller indexes `named_table`s only.** `Table::owner_died` is
+  driven by `beam_rt::runtime::ets_owner::drain_ets_owner_exits` (over the `EtsExitObserver` installed
+  on the `ProcessTable`), and `beam_bifs`'s `ets:new/2` records the owner; the residual gap is that the
+  runtime's `OwnerIndex` is populated from the `named_table`s seen at `ets:new/2`, so a dead owner's
+  **unnamed** table is not reclaimed. The closing API,
+  `beam_bifs::TableRegistry::handles_owned_by` (which does cover unnamed tables), exists but is not yet
+  the runtime's index (`ETS_SURFACE.md` §7.4).
+- **`TableInfo::entries` renders `owner` as `undefined` and `id` as a small integer.** The crate's own
+  15-field proplist has no pid/ref term; the observable `ets:info/1,2` bridge in `beam_bifs` substitutes
+  the recorded owner pid and the tid reference, so the BIF output matches the oracle. `heir` is `none`
+  when unset and `undefined` when installed (the structured `TableInfo::heir` carries the pid).
 - **Ownership modelling has no pid/liveness concept.** `give_away/3` treats `None` as the oracle's
   non-pid/dead-pid target (both `badarg`); an unknown table id is the registry/BIF layer's concern.
   `Table::owner_died` decides the transition and returns `OwnerDeath`; the delivery of the transfer
