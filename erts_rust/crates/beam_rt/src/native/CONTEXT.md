@@ -34,7 +34,7 @@ per-function bodies. Files:
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
 | `group_leader.rs` | `erlang:group_leader/2` + `erts_internal:group_leader/2,3` over `Runtime::group_leaders` (per-process, default the root pid; see below) |
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
-| `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
+| `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
 | `prim.rs` | the `prim_file` floor (11 entries) — see below |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
