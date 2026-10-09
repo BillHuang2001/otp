@@ -181,12 +181,12 @@ pub(crate) fn group() -> Vec<Case> {
             "is_integer(element(1, erlang:statistics(reductions)))",
             "ok true",
         ),
-        // `runtime` is the only remaining Rust capability gap (the runtime exits 3 with
-        // `erlang:statistics/1: the `runtime` counter is not implemented`), so it classifies
-        // `unsupported`; its golden is the oracle's own stable shape.
+        // `runtime` is served too (its `_unsupported` id suffix is historical, kept so the
+        // id stays byte-stable); it is pinned as a regression-pinned agreement, like the
+        // other counters, and its golden is the oracle's own stable shape.
         case(
             "proc_signals/statistics_runtime_unsupported",
-            "erlang:statistics(runtime) is a two-integer tuple (a Rust capability gap)",
+            "erlang:statistics(runtime) is a two-integer tuple (now served; regression-pinned agreement)",
             "is_integer(element(1, erlang:statistics(runtime)))",
             "ok true",
         ),
