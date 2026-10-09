@@ -57,6 +57,15 @@
 //!   is asserted;
 //! * `erlang:binary_to_term/2` — the `[safe]` accept/reject surface, the `[used]`
 //!   `{Term, BytesUsed}` shape, and the truncated / garbage / wrong-arity error shapes.
+//! * decode-side hand-built blobs for tags an encode-only case never emits — the legacy
+//!   `SMALL_ATOM_EXT` (115) and ASCII `FLOAT_EXT` (99), a `LARGE_TUPLE_EXT` (105), a
+//!   zero-arity `SMALL_TUPLE_EXT` (104), a non-byte `LIST_EXT` (108), the zero-length
+//!   `STRING_EXT` (107) / `BINARY_EXT` (109) / `MAP_EXT` (116), and the decode → re-encode
+//!   byte identity of a `BINARY_EXT` and a 1-bit `BIT_BINARY_EXT` (77); plus option
+//!   identities on top of the framing — `{minor_version,2}` equals the default image, a
+//!   small term is left uncompressed (`[compressed]` byte-identical), and the
+//!   `[compressed]` / `[compressed, {minor_version,2}]` / `[safe]` round trips over a
+//!   bitstring, a bignum, a mixed compound and a long list.
 //! * evaluation limits — the `-eval` **literal/parser** shapes that the system-ERTS oracle
 //!   evaluates and the Rust `beam_rt` now evaluates too: a `≥ 2^63` integer literal, a
 //!   multi-element improper list `[1,2|3]`, and an integer binary segment wider than 64 bits
@@ -314,6 +323,32 @@ pub(crate) fn group() -> Vec<Case> {
         t("wire_extra/rt_bit_binary_13", "a 13-bit bitstring round-trips", "binary_to_term(term_to_binary(<<5:13>>)) =:= <<5:13>>", TRUE),
         t("wire_extra/rt_deep_list", "a deeply nested list round-trips", "binary_to_term(term_to_binary([1,[2,[3,[4,[5]]]]])) =:= [1,[2,[3,[4,[5]]]]]", TRUE),
         t("wire_extra/rt_mixed_terms", "a spread of mixed-type terms each round-trips", "lists:all(fun(E) -> binary_to_term(term_to_binary(E)) =:= E end, [[], [1,2,3], <<1,2>>, <<5:3>>, {a,b}, #{k=>v}])", TRUE),
+        // -- decode-side hand-built tag blobs the encode-only cases never exercised -------
+        // Every shape below is a *fixed* ETF blob decoded under both runtimes and compared
+        // through a value / re-encode predicate, so the tag's decode path is pinned even
+        // when term_to_binary/1 would never emit that exact image.
+        v("wire_extra/at_decode_115_small_atom_latin1", "a legacy SMALL_ATOM_EXT (115) blob decodes and re-encodes as SMALL_ATOM_UTF8_EXT (119)", "term_to_binary(binary_to_term(<<131,115,3,102,111,111>>))", "ok <<131,119,3,102,111,111>>"),
+        t("wire_extra/fl_decode_99_legacy_eq", "a legacy ASCII FLOAT_EXT (99) image (from {minor_version,0}) decodes back to the double", "binary_to_term(term_to_binary(1.5, [{minor_version,0}])) =:= 1.5", TRUE),
+        t("wire_extra/tu_decode_105_large_tuple_eq", "a hand-built LARGE_TUPLE_EXT (105) blob decodes to its 3-tuple", "binary_to_term(<<131,105,0,0,0,3,97,1,97,2,97,3>>) =:= {1,2,3}", TRUE),
+        t("wire_extra/tu_decode_104_zero_arity_eq", "a hand-built zero-arity SMALL_TUPLE_EXT (104) blob decodes to the empty tuple", "binary_to_term(<<131,104,0>>) =:= {}", TRUE),
+        t("wire_extra/li_decode_108_nonbyte_eq", "a hand-built LIST_EXT (108) blob with a non-byte element decodes to the list", "binary_to_term(<<131,108,0,0,0,2,97,1,98,0,0,1,44,106>>) =:= [1,300]", TRUE),
+        t("wire_extra/li_decode_107_empty_string_eq", "a hand-built zero-length STRING_EXT (107) blob decodes to the empty list", "binary_to_term(<<131,107,0,0>>) =:= []", TRUE),
+        t("wire_extra/bi_decode_109_empty_eq", "a hand-built zero-length BINARY_EXT (109) blob decodes to the empty binary", "binary_to_term(<<131,109,0,0,0,0>>) =:= <<>>", TRUE),
+        t("wire_extra/bi_decode_109_identity_eq", "a hand-built BINARY_EXT (109) blob re-encodes to identical bytes", "term_to_binary(binary_to_term(<<131,109,0,0,0,2,1,2>>)) =:= <<131,109,0,0,0,2,1,2>>", TRUE),
+        t("wire_extra/bit_decode_77_identity_eq", "a hand-built 1-bit BIT_BINARY_EXT (77) blob re-encodes to identical bytes", "term_to_binary(binary_to_term(<<131,77,0,0,0,1,1,128>>)) =:= <<131,77,0,0,0,1,1,128>>", TRUE),
+        t("wire_extra/ma_decode_116_empty_eq", "a hand-built zero-pair MAP_EXT (116) blob decodes to the empty map", "binary_to_term(<<131,116,0,0,0,0>>) =:= #{}", TRUE),
+        t("wire_extra/ma_decode_116_single_nil_value_eq", "a hand-built MAP_EXT (116) blob whose value is NIL_EXT decodes to a single-pair map", "binary_to_term(<<131,116,0,0,0,1,97,1,106>>) =:= #{1 => []}", TRUE),
+        v("wire_extra/ma_empty_encode_bytes", "the empty map is the six-byte MAP_EXT (116) image", "term_to_binary(#{})", "ok <<131,116,0,0,0,0>>"),
+        v("wire_extra/bi_empty_encode_bytes", "the empty binary is the six-byte BINARY_EXT (109) image", "term_to_binary(<<>>)", "ok <<131,109,0,0,0,0>>"),
+        verr("wire_extra/err_version_magic_only", "a bare VERSION_MAGIC (131) with no term is badarg", "binary_to_term(<<131>>)"),
+        // -- term_to_binary/2 option identities on top of the framing cases ---------------
+        t("wire_extra/mv2_default_exact_eq", "the {minor_version,2} image equals the default image byte for byte", "term_to_binary(#{a=>1,b=>2}, [{minor_version,2}]) =:= term_to_binary(#{a=>1,b=>2})", TRUE),
+        t("wire_extra/co_noop_small_term_exact_eq", "a small term is left uncompressed, so [compressed] is byte-identical to the default image", "term_to_binary(foo, [compressed]) =:= term_to_binary(foo)", TRUE),
+        t("wire_extra/co_roundtrip_bitstring_eq", "a bitstring round-trips through the [compressed] option", "binary_to_term(term_to_binary(<<5:13>>, [compressed])) =:= <<5:13>>", TRUE),
+        t("wire_extra/co_roundtrip_bignum_eq", "a 201-bit integer round-trips through the [compressed] option", "binary_to_term(term_to_binary(1 bsl 200, [compressed])) =:= 1 bsl 200", TRUE),
+        t("wire_extra/co_roundtrip_mixed_compound_eq", "a mixed float/atom/binary/list/map structure round-trips through [compressed]", "binary_to_term(term_to_binary({1.5,a,<<1,2>>,[3],#{k=>v}}, [compressed])) =:= {1.5,a,<<1,2>>,[3],#{k=>v}}", TRUE),
+        t("wire_extra/co_mv2_roundtrip_eq", "the combined [compressed, {minor_version,2}] options round-trip a long list", "binary_to_term(term_to_binary(lists:seq(1,500), [compressed, {minor_version,2}])) =:= lists:seq(1,500)", TRUE),
+        t("wire_extra/opt_safe_compressed_accept_eq", "[safe] accepts a compressed image that introduces no new atoms", "binary_to_term(term_to_binary({ok,1}, [compressed]), [safe]) =:= {ok,1}", TRUE),
         // -- evaluation limits: regression-pinned `-eval` literal/parser shapes -------------
         // Each golden is the oracle's own `ok …` line and the Rust runtime now reproduces it,
         // so each case `agree`s. They were once honest capability gaps (`beam_rt: unsupported:
@@ -335,7 +370,7 @@ pub(crate) fn group() -> Vec<Case> {
 
 #[cfg(test)]
 mod tests {
-    use super::group;
+    use super::{group, TRUE};
     use crate::corpus::Contract;
     use std::collections::HashSet;
 
@@ -442,5 +477,54 @@ mod tests {
             );
             assert_eq!(case.golden.exit_code, 0, "case {id} golden must exit 0");
         }
+    }
+
+    #[test]
+    fn wire_extra_covers_the_decode_side_and_option_families() {
+        let cases = group();
+        // The decode-side hand-built tag blobs and the `term_to_binary/2` option identities
+        // added on top of the encode-only cases. Every golden is the oracle's own line and the
+        // Rust runtime reproduces it (each case `agree`s); pin the ids and their goldens here so
+        // the agreements cannot regress silently.
+        for (id, golden) in [
+            ("wire_extra/at_decode_115_small_atom_latin1", "ok <<131,119,3,102,111,111>>"),
+            ("wire_extra/fl_decode_99_legacy_eq", TRUE),
+            ("wire_extra/tu_decode_105_large_tuple_eq", TRUE),
+            ("wire_extra/tu_decode_104_zero_arity_eq", TRUE),
+            ("wire_extra/li_decode_108_nonbyte_eq", TRUE),
+            ("wire_extra/li_decode_107_empty_string_eq", TRUE),
+            ("wire_extra/bi_decode_109_empty_eq", TRUE),
+            ("wire_extra/bi_decode_109_identity_eq", TRUE),
+            ("wire_extra/bit_decode_77_identity_eq", TRUE),
+            ("wire_extra/ma_decode_116_empty_eq", TRUE),
+            ("wire_extra/ma_decode_116_single_nil_value_eq", TRUE),
+            ("wire_extra/ma_empty_encode_bytes", "ok <<131,116,0,0,0,0>>"),
+            ("wire_extra/bi_empty_encode_bytes", "ok <<131,109,0,0,0,0>>"),
+            ("wire_extra/mv2_default_exact_eq", TRUE),
+            ("wire_extra/co_noop_small_term_exact_eq", TRUE),
+            ("wire_extra/co_roundtrip_bitstring_eq", TRUE),
+            ("wire_extra/co_roundtrip_bignum_eq", TRUE),
+            ("wire_extra/co_roundtrip_mixed_compound_eq", TRUE),
+            ("wire_extra/co_mv2_roundtrip_eq", TRUE),
+            ("wire_extra/opt_safe_compressed_accept_eq", TRUE),
+        ] {
+            let case = cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("expected the decode/option case {id}"));
+            assert_eq!(
+                case.golden.stdout,
+                Some(golden),
+                "case {id} must carry the oracle-derived golden"
+            );
+            assert_eq!(case.golden.exit_code, 0, "case {id} golden must exit 0");
+        }
+        // The bare VERSION_MAGIC shape is the one error case in this family.
+        let err = cases
+            .iter()
+            .find(|c| c.id == "wire_extra/err_version_magic_only")
+            .expect("expected the bare VERSION_MAGIC error case");
+        assert_eq!(err.golden.stdout, Some("exception error badarg"));
+        assert_eq!(err.golden.exit_code, 1);
     }
 }

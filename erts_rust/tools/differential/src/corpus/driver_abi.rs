@@ -35,12 +35,12 @@
 //! callback dispatches on that byte:
 //!
 //! * selectors `< 100` — the driver runs one ABI check and answers with a single status byte
-//!   (`'1'` pass, `'0'` fail); `30..38` are the `ErlDrvTerm` spec family
-//!   (`*_output_term`/`*_send_term`), `40..44` the `driver_set_timer` shapes and `60..65` the
-//!   phase-free `erl_drv_monotonic_time` properties;
-//! * `110..113` — the driver *delivers bytes* through `driver_output`/`driver_output2`/
+//!   (`'1'` pass, `'0'` fail); `30..38` and `39`/`66..69` are the `ErlDrvTerm` spec family
+//!   (`*_output_term`/`*_send_term` accept and refusal shapes), `40..44` plus `50`/`51` the
+//!   `driver_set_timer` shapes and `60..65` the phase-free `erl_drv_monotonic_time` properties;
+//! * `110..115` — the driver *delivers bytes* through `driver_output`/`driver_output2`/
 //!   `driver_output_binary`/`driver_outputv`;
-//! * `130..137` — the driver *delivers a decoded term* through
+//! * `130..140` — the driver *delivers a decoded term* through
 //!   `erl_drv_output_term`/`driver_output_term`/`erl_drv_send_term`/`driver_send_term` and emits
 //!   **no** byte payload, so the owner's own message is the whole observable;
 //! * `200..202` — the driver **arms** something (a descriptor via `driver_select`, a port
@@ -75,7 +75,7 @@
 //! # Known gaps (why the group is not larger)
 //!
 //! The four `*_output_term`/`*_send_term` forms **do** deliver, and their delivery is pinned
-//! byte-exactly by the delivery family (selectors `130..137`, driven through `classify_term/1`:
+//! byte-exactly by the delivery family (selectors `130..140`, driven through `classify_term/1`:
 //! the fixture emits only the spec, and the owner's own message *is* the observable). What is
 //! **not** pinned is each form's *success code* — the C answers `1` for a queued delivery while
 //! this seam answers `0` for its captured one — so the selectors `30..38` keep asserting only
@@ -573,6 +573,114 @@ static int chk_send_term_absent_destination(abi_state *st) {
     abi_term_spec(spec);
     return erl_drv_send_term(driver_mk_port(st->port), driver_term_nil, spec, 6) == 0;
 }
+/* A spec that leaves **two** values on the decode stack is not one term either. */
+static int chk_two_values_left_refused(abi_state *st) {
+    ErlDrvTermData spec[3];
+    spec[0] = ERL_DRV_NIL;
+    spec[1] = ERL_DRV_INT;
+    spec[2] = 1;
+    return erl_drv_output_term(driver_mk_port(st->port), spec, 3) == -1;
+}
+/* The same negative-length refusal on the two forms the `34` selector does not reach. */
+static int chk_driver_output_term_negative_len_refused(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return driver_output_term(st->port, spec, -1) == -1;
+}
+static int chk_erl_drv_send_term_negative_len_refused(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return erl_drv_send_term(driver_mk_port(st->port), driver_connected(st->port), spec, -1) == -1;
+}
+/* The deprecated `driver_send_term` shares the "absent destination" code `0` with its
+ * `erl_drv_send_term` sibling (selector `38`). */
+static int chk_driver_send_term_absent_destination(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return driver_send_term(st->port, driver_term_nil, spec, 6) == 0;
+}
+/* An **arithmetically incomplete** spec is refused before any term is built: a `TUPLE 1` with an
+ * empty stack, and a `TUPLE 3` with one value behind it. */
+static int chk_incomplete_tuple_spec_refused(abi_state *st) {
+    ErlDrvTermData empty_stack[2];
+    ErlDrvTermData too_few[4];
+    empty_stack[0] = ERL_DRV_TUPLE;
+    empty_stack[1] = 1;
+    too_few[0] = ERL_DRV_INT;
+    too_few[1] = 1;
+    too_few[2] = ERL_DRV_TUPLE;
+    too_few[3] = 3;
+    return erl_drv_output_term(driver_mk_port(st->port), empty_stack, 2) == -1
+        && erl_drv_output_term(driver_mk_port(st->port), too_few, 4) == -1;
+}
+/* -- the `*_name` slots (thread / mutex / cond / rwlock) ------------------------------------- */
+/* `erl_drv_thread_name/1` names the thread `erl_drv_thread_create/5` started. */
+static int chk_thread_name(abi_state *st) {
+    ErlDrvTid tid = NULL;
+    void *res = NULL;
+    int ok;
+    (void) st;
+    if (erl_drv_thread_create("driver_abi_thread", &tid, abi_thread_body, NULL, NULL) != 0)
+        return 0;
+    ok = (tid != NULL) && (erl_drv_thread_name(tid) != NULL)
+        && (strcmp(erl_drv_thread_name(tid), "driver_abi_thread") == 0);
+    (void) erl_drv_thread_join(tid, &res);
+    return ok;
+}
+/* `erl_drv_mutex_name/1` reports the name `erl_drv_mutex_create/1` was handed. */
+static int chk_mutex_name(void) {
+    ErlDrvMutex *m = erl_drv_mutex_create("driver_abi_mutex");
+    int ok = 0;
+    if (m != NULL) {
+        char *n = erl_drv_mutex_name(m);
+        ok = (n != NULL) && (strcmp(n, "driver_abi_mutex") == 0);
+        erl_drv_mutex_destroy(m);
+    }
+    return ok;
+}
+/* -- the slots that answer a C `NULL` for a `NULL` handle ------------------------------------ */
+static int chk_name_slots_answer_null(void) {
+    return erl_drv_mutex_name(NULL) == NULL
+        && erl_drv_cond_name(NULL) == NULL
+        && erl_drv_rwlock_name(NULL) == NULL
+        && erl_drv_thread_name(NULL) == NULL;
+}
+/* `driver_mk_atom/1` interns: the same name twice is one term, two names are two terms. */
+static int chk_mk_atom_identity(void) {
+    ErlDrvTermData a = driver_mk_atom("ok");
+    ErlDrvTermData b = driver_mk_atom("ok");
+    ErlDrvTermData c = driver_mk_atom("driver_abi_fresh_atom");
+    ErlDrvTermData d = driver_mk_atom("driver_abi_fresh_atom");
+    return a == b && c == d && a != c;
+}
+/* `null_func/0` is the frozen table's always-zero slot. */
+static int chk_null_func(void) {
+    return null_func() == 0;
+}
+/* -- the dynamic-loading slots --------------------------------------------------------------- */
+/* `driver_dl_open/1` refuses an object that is not a shared library and reports a message
+ * through `driver_dl_error/0`. */
+static int chk_dl_open_refuses_non_library(void) {
+    void *h = driver_dl_open((char *) "/dev/null");
+    char *err;
+    if (h != NULL) {
+        (void) driver_dl_close(h);
+        return 0;
+    }
+    err = driver_dl_error();
+    return err != NULL;
+}
+/* -- the timer arming shapes the `40..44` family does not reach ------------------------------ */
+static int chk_cancel_timer_idle_twice(abi_state *st) {
+    return driver_cancel_timer(st->port) == 0 && driver_cancel_timer(st->port) == 0;
+}
+static int chk_read_timer_after_cancel(abi_state *st) {
+    unsigned long left = 12345;
+    int armed = driver_set_timer(st->port, 60000);
+    int cancelled = driver_cancel_timer(st->port);
+    int rc = driver_read_timer(st->port, &left);
+    return armed == 0 && cancelled == 0 && rc == 0 && left == 0;
+}
 
 /* -- the ErlDrvTerm *delivery* family ------------------------------------------------------- */
 
@@ -616,6 +724,33 @@ static void abi_deliver_binary(ErlDrvTermData *spec) {
     spec[5] = ERL_DRV_TUPLE;
     spec[6] = 2;
 }
+/* Three further operand shapes: the empty list (`ERL_DRV_NIL`), a byte string
+ * (`ERL_DRV_STRING`, delivered as the character list) and a `double` (`ERL_DRV_FLOAT`). */
+static void abi_deliver_nil(ErlDrvTermData *spec) {
+    spec[0] = ERL_DRV_NIL;
+    spec[1] = ERL_DRV_INT;
+    spec[2] = 5;
+    spec[3] = ERL_DRV_TUPLE;
+    spec[4] = 2;
+}
+static void abi_deliver_string(ErlDrvTermData *spec) {
+    spec[0] = ERL_DRV_STRING;
+    spec[1] = (ErlDrvTermData) (intptr_t) "hi";
+    spec[2] = 2;
+    spec[3] = ERL_DRV_INT;
+    spec[4] = 5;
+    spec[5] = ERL_DRV_TUPLE;
+    spec[6] = 2;
+}
+static void abi_deliver_float(ErlDrvTermData *spec) {
+    static double value = 1.5;
+    spec[0] = ERL_DRV_FLOAT;
+    spec[1] = (ErlDrvTermData) (intptr_t) &value;
+    spec[2] = ERL_DRV_INT;
+    spec[3] = 9;
+    spec[4] = ERL_DRV_TUPLE;
+    spec[5] = 2;
+}
 
 /* Deliver one of those specs through one of the four forms, to the port's connected process: the
  * `*_output_term` forms target it implicitly, the `*_send_term` forms through `driver_connected/1`.
@@ -631,7 +766,10 @@ static void abi_deliver(abi_state *st, int form, int shape) {
     switch (shape) {
     case 0: abi_deliver_ints(spec); len = 6; break;
     case 1: abi_deliver_atom(spec); len = 6; break;
-    default: abi_deliver_binary(spec); len = 7; break;
+    case 2: abi_deliver_binary(spec); len = 7; break;
+    case 3: abi_deliver_nil(spec); len = 5; break;
+    case 4: abi_deliver_string(spec); len = 7; break;
+    default: abi_deliver_float(spec); len = 6; break;
     }
     switch (form) {
     case 0: (void) erl_drv_output_term(driver_mk_port(st->port), spec, len); break;
@@ -772,6 +910,22 @@ static void abi_dispatch(abi_state *st, unsigned char sel) {
     case 36: abi_answer(st, chk_output_term_unknown_tag_refused(st)); break;
     case 37: abi_answer(st, chk_output_term_empty_spec_refused(st)); break;
     case 38: abi_answer(st, chk_send_term_absent_destination(st)); break;
+    /* The refusal shapes the `30..38` family does not reach. */
+    case 39: abi_answer(st, chk_incomplete_tuple_spec_refused(st)); break;
+    case 66: abi_answer(st, chk_driver_output_term_negative_len_refused(st)); break;
+    case 67: abi_answer(st, chk_erl_drv_send_term_negative_len_refused(st)); break;
+    case 68: abi_answer(st, chk_driver_send_term_absent_destination(st)); break;
+    case 69: abi_answer(st, chk_two_values_left_refused(st)); break;
+    /* The `*_name` slots, the C-`NULL` slots, `null_func` and the dynamic-loading slots. */
+    case 19: abi_answer(st, chk_thread_name(st)); break;
+    case 28: abi_answer(st, chk_mutex_name()); break;
+    case 46: abi_answer(st, chk_name_slots_answer_null()); break;
+    case 47: abi_answer(st, chk_mk_atom_identity()); break;
+    case 48: abi_answer(st, chk_null_func()); break;
+    case 49: abi_answer(st, chk_dl_open_refuses_non_library()); break;
+    /* The timer arming shapes the `40..44` family does not reach. */
+    case 50: abi_answer(st, chk_cancel_timer_idle_twice(st)); break;
+    case 51: abi_answer(st, chk_read_timer_after_cancel(st)); break;
     /* The ErlDrvTerm *delivery* family: one selector per (form, spec shape). Nothing is answered
      * through the byte channel — the delivered term is the observable. */
     case 130: abi_deliver(st, 0, 0); break;
@@ -782,6 +936,10 @@ static void abi_dispatch(abi_state *st, unsigned char sel) {
     case 135: abi_deliver(st, 2, 2); break;
     case 136: abi_deliver(st, 3, 0); break;
     case 137: abi_deliver(st, 3, 1); break;
+    /* The three further operand shapes (`ERL_DRV_NIL`, `ERL_DRV_STRING`, `ERL_DRV_FLOAT`). */
+    case 138: abi_deliver(st, 0, 3); break;
+    case 139: abi_deliver(st, 0, 4); break;
+    case 140: abi_deliver(st, 0, 5); break;
     /* The `driver_set_timer` shapes. */
     case 40: abi_answer(st, chk_set_timer_zero(st)); break;
     case 41: abi_answer(st, chk_set_timer_large(st)); break;
@@ -822,6 +980,16 @@ static void abi_dispatch(abi_state *st, unsigned char sel) {
         ev.iov = iov;
         ev.binv = NULL;
         (void) driver_outputv(st->port, NULL, 0, &ev, 0);
+        break;
+    }
+    case 114: abi_emit(st, "X", 1); break;
+    case 115: {
+        ErlDrvBinary *b = driver_alloc_binary(5);
+        if (b != NULL) {
+            memcpy(b->orig_bytes, "12345", 5);
+            (void) driver_output_binary(st->port, NULL, 0, b, 0, 5);
+            driver_free_binary(b);
+        }
         break;
     }
     /* Readiness selectors: arm the mechanism; the callback answers later. */
@@ -1099,6 +1267,54 @@ pub(crate) fn group() -> Vec<Case> {
             "49",
         ),
         case(
+            "driver_abi/erl_drv_thread_name_names_the_created_thread",
+            "erl_drv_thread_name/1 reports the name erl_drv_thread_create/5 was handed",
+            &[19],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_mutex_name_reports_the_created_name",
+            "erl_drv_mutex_name/1 reports the name erl_drv_mutex_create/1 was handed",
+            &[28],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_name_slots_answer_null_for_a_null_handle",
+            "erl_drv_{mutex,cond,rwlock,thread}_name/1 answer NULL for a NULL handle",
+            &[46],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_mk_atom_interns_a_name_to_one_term",
+            "driver_mk_atom/1 answers one term per name: the same name twice, two names once each",
+            &[47],
+            "49",
+        ),
+        case(
+            "driver_abi/null_func_is_the_zero_slot",
+            "null_func/0 answers the frozen table's zero",
+            &[48],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_dl_open_refuses_a_non_library_path",
+            "driver_dl_open/1 answers NULL for a non-library path and driver_dl_error/0 a message",
+            &[49],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_cancel_timer_on_an_idle_timer_answers_zero",
+            "driver_cancel_timer/1 answers 0 repeatedly when no port timer is armed",
+            &[50],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_read_timer_reports_zero_after_cancel",
+            "driver_read_timer/2 answers 0 once an armed port timer is cancelled",
+            &[51],
+            "49",
+        ),
+        case(
             "driver_abi/erl_drv_convert_time_unit_is_exact",
             "erl_drv_convert_time_unit/3 is exact across SEC/MSEC/USEC",
             &[20],
@@ -1169,6 +1385,18 @@ pub(crate) fn group() -> Vec<Case> {
             "driver_outputv/5 delivers the gathered vectors of an ErlIOVec",
             &[113],
             "280267735618",
+        ),
+        case(
+            "driver_abi/driver_output_delivers_a_single_byte",
+            "driver_output/3 delivers a one-byte payload to the port owner",
+            &[114],
+            "88",
+        ),
+        case(
+            "driver_abi/driver_output_binary_delivers_the_whole_window",
+            "driver_output_binary/6 with offset 0 delivers the whole driver binary",
+            &[115],
+            "211295614005",
         ),
         case(
             "driver_abi/ready_input_fires_for_an_armed_descriptor",
@@ -1242,6 +1470,36 @@ pub(crate) fn group() -> Vec<Case> {
             &[38],
             "49",
         ),
+        case(
+            "driver_abi/driver_output_term_refuses_an_incomplete_tuple_spec",
+            "a TUPLE arity larger than the values behind it is refused before any term is built",
+            &[39],
+            "49",
+        ),
+        case(
+            "driver_abi/deprecated_driver_output_term_refuses_a_negative_spec_length",
+            "the deprecated driver_output_term/3 refuses a negative spec length like erl_drv_output_term/3",
+            &[66],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_send_term_refuses_a_negative_spec_length",
+            "erl_drv_send_term/4 refuses a negative spec length like erl_drv_output_term/3",
+            &[67],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_send_term_absent_destination_reports_not_delivered",
+            "the deprecated driver_send_term/4 addressed to driver_term_nil reports the same 0",
+            &[68],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_output_term_refuses_two_values_on_the_stack",
+            "a spec that leaves two values on the decode stack (NIL then INT) is refused",
+            &[69],
+            "49",
+        ),
         delivery_case(
             "driver_abi/erl_drv_output_term_delivers_the_decoded_term",
             "erl_drv_output_term/3 delivers {7,42} to the port owner as its message",
@@ -1289,6 +1547,24 @@ pub(crate) fn group() -> Vec<Case> {
             "the deprecated driver_send_term/4 delivers {ok,7} to the connected process",
             &[137],
             "2424018157238192136455",
+        ),
+        delivery_case(
+            "driver_abi/erl_drv_output_term_delivers_the_empty_list_operand",
+            "erl_drv_output_term/3 delivers {[],5} built from an ERL_DRV_NIL operand",
+            &[138],
+            "144482740363525",
+        ),
+        delivery_case(
+            "driver_abi/erl_drv_output_term_delivers_a_string_operand",
+            "erl_drv_output_term/3 delivers {\"hi\",5} built from an ERL_DRV_STRING operand",
+            &[139],
+            "620548644872610241929477",
+        ),
+        delivery_case(
+            "driver_abi/erl_drv_output_term_delivers_a_float_operand",
+            "erl_drv_output_term/3 delivers {1.5,9} built from an ERL_DRV_FLOAT operand",
+            &[140],
+            "2665236090876763213312065785585929",
         ),
         case(
             "driver_abi/driver_set_timer_accepts_a_zero_millisecond_delay",
@@ -1370,7 +1646,7 @@ mod tests {
 
     /// The one selector family whose observable is a **delivered term** rather than a
     /// `driver_output*` byte payload, and the module entry point it must drive.
-    const DELIVERY_SELECTORS: std::ops::RangeInclusive<i64> = 130..=137;
+    const DELIVERY_SELECTORS: std::ops::RangeInclusive<i64> = 130..=140;
 
     /// The module entry point a case drives: `classify/1` for the byte/status families,
     /// `classify_term/1` for the `ErlDrvTerm` delivery family.
@@ -1463,7 +1739,7 @@ mod tests {
         for case in group() {
             let CaseKind::Module(run) = case.kind else { unreachable!() };
             let golden = case.golden.stdout.unwrap();
-            if run.args[0] >= 110 && run.args[0] <= 113 {
+            if run.args[0] >= 110 && run.args[0] <= 115 {
                 payloads += 1;
                 assert_ne!(golden, "49", "case {}: a payload selector has a byte payload", case.id);
             } else if DELIVERY_SELECTORS.contains(&run.args[0]) {
@@ -1477,7 +1753,7 @@ mod tests {
                 assert_eq!(golden, "49", "case {}: a status selector is the '1' byte", case.id);
             }
         }
-        assert_eq!(payloads, 4, "the four driver_output* byte round trips");
+        assert_eq!(payloads, 6, "the six driver_output* byte round trips");
         assert_eq!(
             deliveries,
             DELIVERY_SELECTORS.count(),
@@ -1487,9 +1763,10 @@ mod tests {
 
     /// The delivery family is only worth pinning if it covers **all four** forms
     /// (`erl_drv_output_term`, the deprecated `driver_output_term`, `erl_drv_send_term`, the
-    /// deprecated `driver_send_term`) and all three operand shapes (integers, an existing atom, a
-    /// byte-string `ERL_DRV_BUF2BINARY`). The fixture keys both on the selector, so a dropped
-    /// selector would silently shrink the surface.
+    /// deprecated `driver_send_term`) and all six operand shapes (integers, an existing atom, a
+    /// byte-string `ERL_DRV_BUF2BINARY`, the empty list `ERL_DRV_NIL`, a byte string
+    /// `ERL_DRV_STRING` and a `double` `ERL_DRV_FLOAT`). The fixture keys both on the selector, so
+    /// a dropped selector would silently shrink the surface.
     #[test]
     fn the_delivery_family_covers_every_form_and_spec_shape() {
         let selectors: HashSet<i64> = group()
@@ -1499,11 +1776,11 @@ mod tests {
                 _ => unreachable!("every A.4 case is a module-run case"),
             })
             .collect();
-        // 130..137: `erl_drv_output_term` ×3 shapes, `driver_output_term`, `erl_drv_send_term` ×2,
+        // 130..140: `erl_drv_output_term` ×4 shapes, `driver_output_term`, `erl_drv_send_term` ×2,
         // `driver_send_term` ×2.
         assert_eq!(
             DELIVERY_SELECTORS.count(),
-            8,
+            11,
             "one selector per (form, spec) pair of the delivery family"
         );
         for selector in DELIVERY_SELECTORS {
