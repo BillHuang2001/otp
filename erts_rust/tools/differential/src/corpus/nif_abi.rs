@@ -54,24 +54,43 @@
 //! `enif_make_list`, `enif_fprintf`, `enif_set_option`, …) is referenced — the non-variadic
 //! `enif_make_*_from_array` / `enif_make_list_cell` forms stand in.
 //!
-//! The families whose host hook the runtime leaves **unimplemented** are deliberately absent,
-//! because each would produce a *plain differing value* (a mismatch), not a capability gap:
-//! `enif_term_to_binary` / `enif_binary_to_term` / `enif_make_ref` / `enif_make_existing_atom`
-//! / `enif_whereis_pid` / `enif_make_unique_integer` (each answers the C's failure where the
-//! oracle succeeds). The time family is exercised only through the deterministic
-//! `enif_convert_time_unit` (`enif_monotonic_time`'s absolute value is documented to differ)
-//! and through the **shape** of `enif_now_time` / `enif_cpu_time` (their `{MegaSecs,Secs,MicroSecs}`
-//! 3-tuple, whose values are clock readings and are therefore never asserted).
+//! The families whose host hook the runtime may leave at its trait default (`NifHost` in
+//! `beam_abi`, implemented by `beam_rt`'s `NifHostImpl`) are covered **only** by the shapes both
+//! runtimes answer alike, because a *plain differing value* is a mismatch and a mismatch is
+//! forbidden here:
 //!
-//! The **atom** read accessors are likewise exercised only over a name the runtime already holds
-//! (`ok`): the Rust runtime's host `atom_name` consults the **committed** atom table only, so a
-//! name interned for the first time *during this call* is not yet resolvable — an
-//! `enif_make_atom` → `enif_get_atom` round trip on a brand-new name answers `0` where the oracle
-//! answers `1` (a real divergence, omitted; owning crate `beam_abi` / the `beam_rt` `NifHost`
-//! `intern_atom`+`atom_name` pair). The exception slot is driven on an **`enif_alloc_env` env**
-//! because `enif_raise_exception` on a process env leaks into the caller; `enif_clear_env` is
-//! omitted for the same reason the fresh-name atom round trip is: the oracle leaves the pending
-//! flag set after it where the Rust runtime clears it (`beam_abi` `enif/exception.rs`).
+//! * pinned — `enif_make_existing_atom` / `_len` **refusing** a name no one holds (both answer
+//!   `0` and leave `*atom` untouched, `atom.c:431`); `enif_whereis_pid` on an unregistered atom
+//!   and on a non-atom name (both `0`); `enif_binary_to_term` **refusing** data that is not a
+//!   `VERSION_MAGIC`-prefixed encoding (both `0`); `enif_clear_env` on a clean `enif_alloc_env`
+//!   env leaving no pending exception (both `0`); the **properties** of `enif_make_unique_integer`
+//!   (positive / monotonic / default-negative — the crate-internal counters are real, distinct
+//!   and monotone per flag set); the frozen fields of `enif_system_info` (the driver/NIF version
+//!   macros it was compiled with, `thread_support`, `smp_support`, the `"17.1"` erts version);
+//!   and a name first interned *during* the call still being one atom with one identity.
+//! * **not** pinned (a real, documented divergence — recorded as a gap, never as a corpus case) —
+//!   `enif_term_to_binary` / `enif_binary_to_term` on a **valid** term (`0` where the oracle
+//!   answers `1`: no `term_to_binary`/`binary_to_term` host hook); `enif_make_ref` (the Rust
+//!   runtime raises `badarg` where the oracle yields a ref: no `make_ref` host hook);
+//!   `enif_make_existing_atom`/`enif_whereis_pid` on a name that **is** held/registered (those
+//!   hooks answer `None` unconditionally); and an `enif_make_atom` → `enif_get_atom` round trip
+//!   on a brand-new name (the host's `atom_name` consults the **committed** atom table only, so a
+//!   name interned during this call is not yet resolvable). Owning crates:
+//!   `crates/beam_rt/src/nif.rs` (`NifHostImpl`) + `crates/beam_abi/src/nif/`. `enif_system_info`'s
+//!   `otp_release` / `async_threads` / `scheduler_threads` / `dirty_scheduler_support` values are
+//!   likewise documented to differ and are never asserted.
+//!
+//! The time family is exercised only through the deterministic `enif_convert_time_unit`
+//! (`enif_monotonic_time`'s absolute value is documented to differ) and through the **shape** of
+//! `enif_now_time` / `enif_cpu_time` (their `{MegaSecs,Secs,MicroSecs}` 3-tuple, whose values are
+//! clock readings and are therefore never asserted).
+//!
+//! The **atom** read accessors are exercised over a name the runtime already holds (`ok`) and over
+//! a name first interned during the call (identity only). The exception slot is driven on an
+//! **`enif_alloc_env` env** because `enif_raise_exception` on a process env leaks into the caller;
+//! `enif_clear_env` follows the same rule (on a clean allocated env it is a no-op in both — the
+//! oracle leaves the pending flag set where the Rust runtime clears it, so the *raisable* shape is
+//! the one that stays out).
 //!
 //! # Skip policy (inherited from [`super::nif_so`])
 //!
@@ -133,6 +152,7 @@ reason_code(_) -> 9.
 /// referenced. Each branch returns an integer: `1` when the C ABI contract held, `0` otherwise.
 const NIF_ABI_C: &str = r#"/* A real NIF exercising the enif_* C ABI end to end (contract A.3). */
 #include <erl_nif.h>
+#include <erl_driver.h>   /* ERlNifSysInfo is an ErlDrvSysInfo: its version macros live here */
 #include <string.h>
 #include <stdint.h>
 
@@ -722,6 +742,110 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_int(env, (arity == 0 && enif_is_empty_list(env, lst)) ? 1 : 0);
     }
 
+    /* ------------------------------------------- the host-hooked slots, shape by shape
+       The families below are the ones whose `NifHost` hook the runtime may leave at its trait
+       default. Each branch pins **one** shape whose answer is the same under both runtimes a
+       real C ABI contract fixes: a miss both refuse, a malformed input both refuse, a clean env
+       both leave clean, or a *property* of a value the crate-internal implementation really
+       produces. A shape that would answer differently is not in this group (see the module
+       docs for the ones that are not). */
+    case 71: {                                 /* make_existing_atom refuses an unheld name */
+        ERL_NIF_TERM t = 0;
+        int r = enif_make_existing_atom(env, "nif_abi_no_such_atom_zzz", &t, ERL_NIF_LATIN1);
+        /* Lookup-only: an unheld name is refused and `*atom` is left untouched (atom.c:431). */
+        return enif_make_int(env, (r == 0 && t == 0) ? 1 : 0);
+    }
+    case 72: {                                 /* make_existing_atom_len, same miss */
+        const char* name = "nif_abi_no_such_atom_len_zzz";
+        ERL_NIF_TERM t = 0;
+        int r = enif_make_existing_atom_len(env, name, strlen(name) - 1, &t, ERL_NIF_LATIN1);
+        return enif_make_int(env, (r == 0 && t == 0) ? 1 : 0);
+    }
+    case 73: {                                 /* whereis_pid on an unregistered atom */
+        ErlNifPid pid;
+        int r;
+        memset(&pid, 0, sizeof(pid));
+        r = enif_whereis_pid(env, enif_make_atom(env, "nif_abi_no_such_registered_name"), &pid);
+        return enif_make_int(env, r == 0 ? 1 : 0);
+    }
+    case 74: {                                 /* whereis_pid refuses a non-atom name */
+        ErlNifPid pid;
+        int r;
+        memset(&pid, 0, sizeof(pid));
+        r = enif_whereis_pid(env, enif_make_int(env, 1), &pid);
+        return enif_make_int(env, r == 0 ? 1 : 0);
+    }
+
+    /* Unique integers: the crate-internal counters are real, distinct and monotone per flag set,
+       so the *properties* (not the values) are the pinnable contract. */
+    case 75: {                                 /* unique_integer([positive]) is positive */
+        ErlNifSInt64 v = 0;
+        ERL_NIF_TERM t = enif_make_unique_integer(env, ERL_NIF_UNIQUE_POSITIVE);
+        return enif_make_int(env, (enif_get_int64(env, t, &v) && v > 0) ? 1 : 0);
+    }
+    case 76: {                                 /* unique_integer([monotonic]) increases */
+        ErlNifSInt64 a = 0, b = 0;
+        ERL_NIF_TERM t1 = enif_make_unique_integer(env, ERL_NIF_UNIQUE_MONOTONIC);
+        ERL_NIF_TERM t2 = enif_make_unique_integer(env, ERL_NIF_UNIQUE_MONOTONIC);
+        if (!enif_get_int64(env, t1, &a) || !enif_get_int64(env, t2, &b))
+            return enif_make_int(env, 0);
+        return enif_make_int(env, b > a ? 1 : 0);
+    }
+    case 77: {                                 /* unique_integer() defaults to negative */
+        ErlNifSInt64 v = 0;
+        ERL_NIF_TERM t = enif_make_unique_integer(env, (ErlNifUniqueInteger) 0);
+        /* The default counter is the "non-positive" one: its values are negative in both. */
+        return enif_make_int(env, (enif_get_int64(env, t, &v) && v < 0) ? 1 : 0);
+    }
+    case 78: {                                 /* unique_integer([positive,monotonic]) is positive */
+        ErlNifSInt64 v = 0;
+        ErlNifUniqueInteger flags =
+            (ErlNifUniqueInteger) (ERL_NIF_UNIQUE_POSITIVE | ERL_NIF_UNIQUE_MONOTONIC);
+        ERL_NIF_TERM t = enif_make_unique_integer(env, flags);
+        return enif_make_int(env, (enif_get_int64(env, t, &v) && v > 0) ? 1 : 0);
+    }
+
+    /* System information: the *frozen* ABI fields, compared against the very macros the C was
+       compiled with (so the comparison is header-relative, not a hard-coded number). */
+    case 79: {                                 /* system_info fills the frozen ABI fields */
+        ErlNifSysInfo si;
+        memset(&si, 0, sizeof(si));
+        enif_system_info(&si, sizeof(si));
+        return enif_make_int(env,
+            (si.driver_major_version == ERL_DRV_EXTENDED_MAJOR_VERSION &&
+             si.driver_minor_version == ERL_DRV_EXTENDED_MINOR_VERSION &&
+             si.nif_major_version == ERL_NIF_MAJOR_VERSION &&
+             si.nif_minor_version == ERL_NIF_MINOR_VERSION &&
+             si.thread_support == 1 && si.smp_support == 1 &&
+             si.erts_version != NULL && strcmp(si.erts_version, "17.1") == 0) ? 1 : 0);
+    }
+
+    /* Term <-> binary: only the *refusal* shapes are pinned; the success paths are a documented
+       host-hook gap (see the module docs). */
+    case 80: {                                 /* binary_to_term refuses a malformed encoding */
+        static const unsigned char bad[1] = {0};   /* not VERSION_MAGIC (131) */
+        ERL_NIF_TERM t = 0;
+        size_t n = enif_binary_to_term(env, bad, sizeof(bad), &t, 0);
+        return enif_make_int(env, (n == 0 && t == 0) ? 1 : 0);
+    }
+    case 81: {                                 /* clear_env leaves a clean env clean */
+        ErlNifEnv* e2 = enif_alloc_env();
+        ERL_NIF_TERM reason = 0;
+        int pending;
+        if (e2 == NULL)
+            return enif_make_int(env, 0);
+        enif_clear_env(e2);
+        pending = enif_has_pending_exception(e2, &reason);
+        enif_free_env(e2);
+        return enif_make_int(env, pending == 0 ? 1 : 0);
+    }
+    case 82: {                                 /* a fresh name is still one atom, same identity */
+        const char* name = "nif_abi_fresh_atom_identity";
+        ERL_NIF_TERM a = enif_make_atom(env, name);
+        ERL_NIF_TERM b = enif_make_atom(env, name);
+        return enif_make_int(env, (enif_is_atom(env, a) && enif_is_identical(a, b)) ? 1 : 0);
+    }
+
     default:
         break;
     }
@@ -956,6 +1080,79 @@ pub(crate) fn group() -> Vec<Case> {
             &[70],
             "1",
         ),
+        // --- the host-hooked slots: the shapes both runtimes answer alike -----------------
+        case(
+            "nif_abi/atom_make_existing_atom_miss",
+            "enif_make_existing_atom refuses a name the runtime does not hold (and leaves *atom untouched)",
+            &[71],
+            "1",
+        ),
+        case(
+            "nif_abi/atom_make_existing_atom_len_miss",
+            "enif_make_existing_atom_len refuses an unheld name under its explicit length",
+            &[72],
+            "1",
+        ),
+        case(
+            "nif_abi/process_whereis_pid_unregistered",
+            "enif_whereis_pid answers 0 for a name no process is registered under",
+            &[73],
+            "1",
+        ),
+        case(
+            "nif_abi/process_whereis_pid_rejects_non_atom",
+            "enif_whereis_pid answers 0 for a non-atom name",
+            &[74],
+            "1",
+        ),
+        case(
+            "nif_abi/unique_integer_positive",
+            "enif_make_unique_integer([positive]) yields a positive integer",
+            &[75],
+            "1",
+        ),
+        case(
+            "nif_abi/unique_integer_monotonic_increases",
+            "enif_make_unique_integer([monotonic]) strictly increases across two calls",
+            &[76],
+            "1",
+        ),
+        case(
+            "nif_abi/unique_integer_default_is_negative",
+            "enif_make_unique_integer with no properties yields a negative integer",
+            &[77],
+            "1",
+        ),
+        case(
+            "nif_abi/unique_integer_positive_monotonic",
+            "enif_make_unique_integer([positive,monotonic]) yields a positive integer",
+            &[78],
+            "1",
+        ),
+        case(
+            "nif_abi/system_info_frozen_fields",
+            "enif_system_info fills the frozen driver/NIF versions and the erts version",
+            &[79],
+            "1",
+        ),
+        case(
+            "nif_abi/binary_to_term_rejects_malformed",
+            "enif_binary_to_term refuses data that is not a VERSION_MAGIC-prefixed encoding",
+            &[80],
+            "1",
+        ),
+        case(
+            "nif_abi/exception_clear_env_clean",
+            "enif_clear_env on a clean allocated env leaves no pending exception",
+            &[81],
+            "1",
+        ),
+        case(
+            "nif_abi/atom_fresh_name_identity",
+            "a name interned during the call is one atom with one identity",
+            &[82],
+            "1",
+        ),
     ]
 }
 
@@ -1079,6 +1276,40 @@ mod tests {
             assert!(
                 super::NIF_ABI_C.contains(symbol),
                 "the library must reference {symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_c_library_covers_the_host_hooked_slots() {
+        // The slots whose host hook the runtime may leave at its trait default: only the shapes
+        // both runtimes answer alike are referenced (see the module docs).
+        for symbol in [
+            "enif_make_existing_atom(",
+            "enif_make_existing_atom_len(",
+            "enif_whereis_pid(",
+            "enif_make_unique_integer(",
+            "enif_system_info(",
+            "enif_binary_to_term(",
+            "enif_clear_env(",
+            "enif_has_pending_exception(",
+            "enif_alloc_env(",
+            "enif_free_env(",
+        ] {
+            assert!(
+                super::NIF_ABI_C.contains(symbol),
+                "the library must reference {symbol}"
+            );
+        }
+        // A call site for one of these would be a plain differing value (a mismatch), so the
+        // library must never carry one:
+        //   * enif_make_ref          -> the Rust runtime raises badarg (no host `make_ref`);
+        //   * enif_term_to_binary    -> the Rust runtime answers 0 (no host `term_to_binary`);
+        //   * a *valid* enif_binary_to_term input is exercised nowhere (no host hook either).
+        for absent in ["enif_make_ref(", "enif_term_to_binary("] {
+            assert!(
+                !super::NIF_ABI_C.contains(absent),
+                "the library must not reference {absent} (a guaranteed mismatch)"
             );
         }
     }
