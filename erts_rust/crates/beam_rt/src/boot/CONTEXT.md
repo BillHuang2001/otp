@@ -273,4 +273,5 @@ request/reply surface, the errno mapping, the io-device and the three remaining 
 - `../cli.rs` → the `Action::Boot` arm (`-boot FILE`) that drives `boot_from_script`
 - `../codeserver.rs` → `CodeServer::{add_system_paths, load, is_loaded, loaded}` (the cache this feeds)
 - `../native/code.rs` → the `code:*` surface that reports `preloaded` from the name registry (not owned here)
-- `../context/mod.rs` → `RuntimeContext::run_export`/`run_export_blocking` and `resolve_external_call` (the in-machine seam the `application:load/1` chain is entered through); `run_export_blocking` is **not** the current stop's fold (read-only from this node)
+- `../native/file_server.rs` → the native `file_server_2` service the script's final `{apply,{c,erlangrc,[]}}` reaches (not owned here; see `../native/CONTEXT.md`)
+- `../context/mod.rs` → `RuntimeContext::run_export`/`run_export_blocking` and `resolve_external_call` (the in-machine seam the boot's `{apply, …}` chains are entered through; read-only from this node)
