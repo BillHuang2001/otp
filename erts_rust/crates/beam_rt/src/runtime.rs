@@ -991,6 +991,31 @@ impl Runtime {
         self.processes.register(atom, pid)
     }
 
+    /// Unlinks `a` and `b` in both directions (`ProcessTable::unlink`).
+    ///
+    /// This is the boot-script executor's seam for keeping a `{kernelProcess, …}` alive (see
+    /// the private `drive::start_kernel_process`). A real `init` runs each kernel-process
+    /// `apply` in the **one** long-lived process, so a `spawn_link` inside it
+    /// (`application_controller:start/1`, `logger_server:start_link/0`) is linked to a parent
+    /// that never exits. This runtime runs the directive in a *short-lived* process, whose
+    /// `normal` exit would otherwise tear the kernel server down: a `gen_server`/`proc_lib`
+    /// server traps exits and terminates on its parent's `{'EXIT', _, normal}`. Unlinking the
+    /// server from the directive **before the directive can exit** reproduces `init`'s
+    /// supervision without a long-lived stand-in process.
+    ///
+    /// Both pids must be **live**: calling this once the directive has already terminated is
+    /// the process table's typed unknown-pid diagnostic, so a caller that cannot prove
+    /// liveness (a `{kernelProcess, …}` whose `apply` returns before the process it spawned
+    /// registers, such as `heart`) checks [`Runtime::processes`]`().contains(..)` first.
+    ///
+    /// # Errors
+    ///
+    /// The process table's typed diagnostic when either pid is not a live process of this
+    /// runtime's table — never a panic, never a silent no-op.
+    pub fn unlink_processes(&mut self, a: ProcessId, b: ProcessId) -> Result<()> {
+        self.processes.unlink(a, b)
+    }
+
     /// Reads the OTP **boot script** at `path` and executes it (contract A.7, part 2).
     ///
     /// The runtime boots first (the preloaded set and the system code path), the script is
