@@ -282,7 +282,7 @@ form (`:47`) for an errno outside the table.
   (`encode_path`/`collect_path`), the `errno`→atom table, and the served entries `get_cwd/0,1`,
   `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`, `make_link/2`,
   `make_symlink/2`, `altname/1`
-- `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7)
+- `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the `init` automatic flags (`root`/`home`/`progname`), the code server's `get_mode/0` and `application:get_application/0` included
 - `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl. `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling surfaces, and the port-write surface (contracts A.4/A.7/A.8/A.9)
 - `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`) + its unit tests
 - `test_support.rs` → the shared fixtures
