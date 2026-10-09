@@ -60,12 +60,13 @@
 //!   statistics key this runtime cannot answer honestly, so it reports the typed capability
 //!   gap. A name that is not a statistics key at all is the oracle's `badarg`.
 //! * `os:set_signal/2` installs the disposition for real (the one process-global
-//!   [`signal`] facility), but the **notification leg** of ERTS's signal handling is not
-//!   wired: this runtime boots no `erl_signal_server` process and registers the facility's
-//!   read end with no poller, so a handled signal is never turned into a `{notify, Signal}`
-//!   message. The three `sigstop` forms are the oracle's `ok` without a syscall — the kernel
-//!   refuses every disposition change for a kernel-only signal. `signal`'s module docs carry
-//!   the full reasoning and the exact wiring a future pass must add.
+//!   [`signal`] facility) and the `{notify, Signal}` leg is wired: a caught signal is
+//!   written to the facility's self-pipe, and the port layer's pumps deliver the 2-tuple
+//!   `{notify, Signal}` to the process registered as `erl_signal_server`, dropping it
+//!   silently when none is registered — exactly as the C does
+//!   (`erts/emulator/sys/unix/sys.c:589-604`). The three `sigstop` forms are the oracle's
+//!   `ok` without a syscall — the kernel refuses every disposition change for a kernel-only
+//!   signal. `signal`'s module docs carry the full reasoning.
 //!
 //! # Destination semantics (the C `erts_hl_timer`, read-only reference)
 //!
@@ -299,10 +300,10 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// answers `EINVAL` for it, whose result the C discards); it is the oracle's `ok` here
     /// too, without issuing the syscall — see [`signal::install`].
     ///
-    /// The **notification** leg (ERTS's `{notify, SignalName}` to `erl_signal_server`) is
-    /// not wired: there is no such process and no poller registration for the facility's
-    /// read end (see [`signal`]). A handled signal is therefore recorded and not delivered —
-    /// a documented gap, never a fabricated recipient.
+    /// The **notification** leg is wired: a caught signal is written to the facility's
+    /// self-pipe, and the port layer's pumps deliver ERTS's `{notify, SignalName}` to the
+    /// process registered as `erl_signal_server`, dropping it silently when none is
+    /// registered — matching the C (`sys.c:589-604`, see [`signal`]).
     ///
     /// # Errors
     ///
