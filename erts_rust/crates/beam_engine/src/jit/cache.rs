@@ -457,7 +457,7 @@ pub(crate) fn run_baseline_cached_label_outcome(
 /// path: the module is compiled into the thread's cache on first sight (so a host
 /// that has already run it pays only a key probe) and the compiled blocks' actual
 /// `[start, size)` ranges are returned in ascending address order, each named
-/// `<module>:<function>/<pc>`.
+/// `<module>:<function>/<arity>/<pc>`.
 ///
 /// Every range is a live address inside the cached artifact's sealed executable
 /// mapping, which the cache **owns** — the regions describe code that stays mapped
