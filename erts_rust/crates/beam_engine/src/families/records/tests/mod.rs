@@ -108,8 +108,7 @@ fn record(
     fields: &[(Atom, Eterm)],
 ) -> Eterm {
     let fields: Vec<(Eterm, Eterm)> = fields.iter().map(|(k, v)| (make_atom(*k), *v)).collect();
-    let hp = ctx
-        .alloc_words(beam_term::record_block_words(fields.len()))
+    let hp = crate::terms::test_support::reserve_words(ctx, beam_term::record_block_words(fields.len()))
         .expect("arena allocation");
     raw::write_record(hp, owner, name, exported, &fields, make_small(0))
         .expect("record construction")

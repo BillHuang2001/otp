@@ -203,7 +203,7 @@ fn put_record_create_for_another_module_is_a_typed_error() {
     let mut ctx = MinimalContext::new();
     let (r, a, other) = (fx.atom("r"), fx.atom("a"), fx.atom("other"));
     // `{other, r}` in X(1); the create form's `dst` is X(0).
-    let id = terms::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
+    let id = crate::terms::test_support::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
     let mut machine = Machine::with_max_register(4);
     machine.set_x(1, id).unwrap();
 
