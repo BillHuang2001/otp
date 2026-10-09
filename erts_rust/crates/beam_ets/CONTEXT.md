@@ -151,7 +151,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
     returning a bare `Eterm`. Accessors: `is_integer/is_float/is_atom/is_tuple/is_list/is_bitstring/
     is_binary/is_map/is_pid/is_port/is_reference/is_function`, `as_small_int() -> Option<i64>`,
     `as_atom() -> Option<Atom>`, `as_float() -> Option<f64>`, `tuple_arity()`, `tuple_element(i)`,
-    `list_to_terms()`, `size()`, `eq_term(Eterm, atoms) -> bool`, `cmp_term(Eterm, atoms) -> Ordering`,
+    `tuple_elements() -> Vec<TableTerm<'g>>`, `list_to_terms()`, `size()`, `eq_term(Eterm, atoms) -> bool`, `cmp_term(Eterm, atoms) -> Ordering`,
     and the copy-out `copy_into(&mut TermStore) -> Result<Eterm>` (deep copy into a caller-owned arena,
     the only way to keep a term past the guard; costs one allocation per call, opt-in).
   - `TableRead<'g>` — owned metadata (`id/size/is_empty/memory/info/kind/keypos/access/owner/name/
