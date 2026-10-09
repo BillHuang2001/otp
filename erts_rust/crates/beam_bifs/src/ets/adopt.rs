@@ -48,8 +48,12 @@
 //!   malformed option, an improper list or a non-list/non-tuple argument is
 //!   `badarg`. Two C behaviours are modelled structurally: a **dead** heir pid is
 //!   accepted and then **clears** the heir (`set_heir`, `erl_db.c:5324`) — that
-//!   needs a `ProcessHook`, see below — and `{heir, Pid}` (no data) stores the
-//!   gift data as `[]` (`THE_NON_VALUE` in the C, which is not a term at all).
+//!   needs a `ProcessHook`, see below — and the arity-2 `{heir, Pid}` form carries
+//!   **no** gift data (`None`, the C's `THE_NON_VALUE`, which is not a term at
+//!   all). An install goes through `Table::install_heir`, so the arity-3 gift data
+//!   is **deep-copied into table-owned storage** and survives the caller's heap
+//!   (unchanged for an immediate, `badarg` for a term outside the store's copyable
+//!   subset).
 //! * **`ets:give_away/3`** — transfers ownership to a live, *different* pid and
 //!   returns `true`; `badarg` for a non-pid, a dead pid, the caller's own pid, a
 //!   non-owner caller, or a table argument that names no table (`ets_give_away_3`,
@@ -116,10 +120,14 @@
 //! # Runtime handoffs (not this crate's to do)
 //!
 //! * **`{'ETS-TRANSFER', Tid, FromPid, GiftData}`** — the oracle's
-//!   `ets:give_away/3` (and an heir stepping in) **delivers** this message to the
-//!   new owner (`send_ets_transfer_message`, `erl_db.c:4943`). This crate performs
-//!   the observable ownership transfer only; the delivery is a message-passing
-//!   concern (`beam_rt`). It is deliberately **not** fabricated here.
+//!   `ets:give_away/3` and an **heir stepping in on the owner's death** both
+//!   **deliver** this message to the new owner (`send_ets_transfer_message`,
+//!   `erl_db.c:4943`). It is sent **only** when the heir was installed by the
+//!   arity-3 `{heir, Pid, Data}` form; an arity-2 `{heir, Pid}` heir inherits in
+//!   **silence**. This crate performs the observable ownership transfer and stores
+//!   the gift (`Heir::data`, the table-owned copy `Table::install_heir` made); the
+//!   delivery itself is a message-passing concern (`beam_rt`) and is deliberately
+//!   **not** fabricated here.
 //! * **Process liveness** — the C's `give_away`/`set_heir` resolve the target with
 //!   `erts_pid2proc`/`erts_proc_lookup`, so a dead pid is `badarg` for
 //!   `give_away/3` and clears the heir for `setopts/2`. Liveness is asked of the
@@ -129,7 +137,7 @@
 //!   `beam_rt` installs the hook, so the real runtime is exact.
 
 use beam_common::Result;
-use beam_ets::{Heir, SetOpt, Table};
+use beam_ets::{OwnerId, Table};
 use beam_process::ProcessId;
 use beam_term::{atom_val, is_internal_pid, make_atom, AtomTable, Eterm};
 
@@ -194,6 +202,26 @@ enum HeirOpt {
     },
 }
 
+/// The heir change `ets:setopts/2` must apply, resolved **before** the table is
+/// taken out of the registry (the dead-heir clear needs the [`ProcessHook`]
+/// question answered through the whole context).
+///
+/// [`ProcessHook`]: crate::context::ProcessHook
+enum HeirChange {
+    /// No `{heir, …}` option was given: nothing to change (the owner check still
+    /// runs).
+    Nothing,
+    /// Clear the heir: `{heir, none}`, or an install onto a **dead** pid (the C
+    /// `set_heir` clears it, `erl_db.c:5324`).
+    Clear,
+    /// Install `owner` as the heir. `data` is the option's arity — `None` for
+    /// `{heir, Pid}`, `Some(term)` for `{heir, Pid, Data}`.
+    Install {
+        owner: OwnerId,
+        data: Option<Eterm>,
+    },
+}
+
 /// `ets:setopts(Tab, Options)` — installs or clears the table's heir and returns
 /// `true`.
 ///
@@ -201,8 +229,12 @@ enum HeirOpt {
 /// (`erl_db.c:3151`): the second argument is a proper list of options, **or a
 /// single option tuple** (the C wraps a tuple in a one-element list), every
 /// element being a tuple of arity ≥ 2 whose first element is a **known** option
-/// tag. `heir` accepts `none` (arity 2) or an internal pid (arity 2 ⇒ the gift
-/// data is `[]`, arity 3 ⇒ the given data); a second `heir` option is `badarg`.
+/// tag. `heir` accepts `none` (arity 2) or an internal pid (arity 2 ⇒ no gift
+/// data, the C's `THE_NON_VALUE`; arity 3 ⇒ the given data); a second `heir`
+/// option is `badarg`. An install runs through [`Table::install_heir`], so the
+/// gift data is **deep-copied into table-owned storage** (the A.1 copy boundary,
+/// the C `set_heir`'s `DbTerm`) and cannot dangle when the caller's heap is reused;
+/// a dead heir pid is accepted and clears the heir.
 /// `protection` is recognised (so a malformed one is still `badarg`) but **cannot
 /// be applied** — see the module docs — and answers the typed `unsupported_bif`.
 ///
@@ -218,32 +250,44 @@ fn setopts_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         // the whole call is the typed gap and the table is left untouched.
         return Err(unsupported_bif());
     }
-    let caller = caller_owner(ctx);
-    let opt = match heir {
-        None => None,
-        Some(HeirOpt::Clear) => Some(SetOpt::ClearHeir),
+    // Resolve the `{heir, …}` option before taking the table: the dead-heir clear
+    // asks the `ProcessHook` through the whole context.
+    let change = match heir {
+        None => HeirChange::Nothing,
+        Some(HeirOpt::Clear) => HeirChange::Clear,
         Some(HeirOpt::Install { pid, data }) => {
             // `set_heir` (`erl_db.c:5324`) clears the heir when the pid is not
             // alive; liveness is only answerable with a `ProcessHook` installed.
             if pid_liveness(ctx, pid)? == Some(false) {
-                Some(SetOpt::ClearHeir)
+                HeirChange::Clear
             } else {
-                Some(SetOpt::Heir(Heir {
+                HeirChange::Install {
                     owner: owner_of(pid),
                     data,
-                }))
+                }
             }
         }
     };
+    let caller = caller_owner(ctx);
     let mut table = take_table_gated(ctx, handle, Gate::Write)?;
     let outcome = if table.owner() != Some(caller) {
         // Even an empty option list requires the owner (`ets_setopts_2` checks
         // `tb->common.owner != BIF_P->common.id` unconditionally).
         Err(badarg())
-    } else if let Some(opt) = opt {
-        table.as_requester(Some(caller)).setopts(opt)
     } else {
-        Ok(())
+        match change {
+            HeirChange::Nothing => Ok(()),
+            // The owner-level clear reclaims the outgoing heir's table-owned gift
+            // copy (the C `free_heir_data`).
+            HeirChange::Clear => {
+                table.set_heir(None);
+                Ok(())
+            }
+            // `Table::install_heir` deep-copies the gift into table-owned storage
+            // (the A.1 copy boundary, the C `set_heir`'s `DbTerm`), so a
+            // non-immediate `data` does not alias the caller's heap.
+            HeirChange::Install { owner, data } => table.install_heir(owner, data),
+        }
     };
     restore_table(ctx, handle, table)?;
     outcome?;
@@ -453,12 +497,18 @@ fn pid_liveness(ctx: &mut BifContext<'_>, pid: ProcessId) -> Result<Option<bool>
 mod tests {
     use super::*;
 
-    use beam_alloc::Heap;
-    use beam_common::BeamError;
-    use beam_term::NIL;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
-    use crate::context::BifContext;
+    use beam_alloc::Heap;
+    use beam_common::{BeamError, ExitReason};
+    use beam_process::PortId;
+    use beam_term::{atom_val, Atom, AtomTable, NIL};
+
+    use crate::access::ref_thing_id;
+    use crate::context::{BifContext, ProcessHook, ProcessInfoItem};
     use crate::registry::BifRegistry;
+    use crate::TableRegistry;
 
     /// The option list of a single `{heir, …}` option, on `ctx`'s heap.
     fn heir_list(ctx: &mut BifContext<'_>, elems: &[Eterm]) -> Eterm {
@@ -595,5 +645,337 @@ mod tests {
             assert!(reg.contains("ets", key.0, key.1), "missing ets:{}", key.0);
         }
         assert_eq!(reg.len(), 5);
+    }
+
+    // ------------------------------------------------- setopts: heir lifetime
+
+    /// A [`ProcessHook`] whose only meaningful answer is `is_process_alive`
+    /// (`alive`); `ets:setopts/2` needs nothing else.
+    struct LivenessHook {
+        alive: Rc<Cell<bool>>,
+    }
+
+    impl ProcessHook for LivenessHook {
+        fn whereis(&mut self, _name: Atom) -> Result<Option<Eterm>> {
+            Ok(None)
+        }
+        fn register(&mut self, _name: Atom, _id: Eterm) -> Result<bool> {
+            Ok(false)
+        }
+        fn unregister(&mut self, _name: Atom) -> Result<bool> {
+            Ok(false)
+        }
+        fn registered(&mut self) -> Result<Vec<Atom>> {
+            Ok(Vec::new())
+        }
+        fn is_process_alive(&mut self, _pid: ProcessId) -> Result<bool> {
+            Ok(self.alive.get())
+        }
+        fn processes(&mut self) -> Result<Vec<ProcessId>> {
+            Ok(Vec::new())
+        }
+        fn ports(&mut self) -> Result<Vec<PortId>> {
+            Ok(Vec::new())
+        }
+        fn process_info_keys(&mut self, _pid: ProcessId) -> Result<Option<Vec<Atom>>> {
+            Ok(None)
+        }
+        fn process_info_item(
+            &mut self,
+            _heap: &mut Heap,
+            _atoms: &AtomTable,
+            _pid: ProcessId,
+            _item: Atom,
+        ) -> Result<ProcessInfoItem> {
+            Ok(ProcessInfoItem::Unknown)
+        }
+        fn process_flag(
+            &mut self,
+            _heap: &mut Heap,
+            _atoms: &AtomTable,
+            _flag: Atom,
+            _value: Eterm,
+        ) -> Result<Option<Eterm>> {
+            Ok(None)
+        }
+        fn group_leader(&mut self) -> Result<ProcessId> {
+            Ok(ProcessId::new(1, 0))
+        }
+    }
+
+    /// The atoms the `ets:new`/`ets:setopts` fixtures need.
+    fn setopts_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed([
+            "set",
+            "heir",
+            "none",
+            "true",
+            "t",
+            "owner",
+            "protection",
+            "public",
+            "protected",
+        ]);
+        atoms
+    }
+
+    /// Asserts `err` is this crate's typed capability gap (`unsupported_bif`).
+    fn assert_unsupported(err: BeamError) {
+        match err {
+            BeamError::Raise(raise) => assert_eq!(
+                raise.reason,
+                ExitReason::atom("unsupported_bif"),
+                "expected the typed unsupported_bif gap"
+            ),
+            other => panic!("expected unsupported_bif, got {other:?}"),
+        }
+    }
+
+    /// `ets:setopts/2`'s arity-3 `{heir, Pid, Data}` form **deep-copies** the gift
+    /// into table-owned storage (the A.1 copy boundary) — the raw `SetOpt::Heir`
+    /// primitive would alias the caller's heap, so the BIF goes through
+    /// [`beam_ets::Table::install_heir`]. The arity-2 `{heir, Pid}` form installs a
+    /// **silent** heir (`Heir::data == None`) and `{heir, none}` clears it.
+    #[test]
+    fn setopts_installs_a_table_owned_copy_of_the_gift_data() {
+        let bifs = crate::default_registry();
+        let atoms = setopts_atoms();
+        let mut heap = Heap::new(1 << 14).expect("heap");
+        let mut tables = TableRegistry::new();
+        let pid = ProcessId::new(1, 0);
+
+        let mut ctx = BifContext::new(&mut heap, &atoms, pid).with_tables(&mut tables);
+        let name = ctx.atom("t").expect("seeded");
+        let set = ctx.atom("set").expect("seeded");
+        let set_opts = ctx.list(&[set]).expect("option list");
+        let table = bifs
+            .call("ets", "new", 2, &mut ctx, &[name, set_opts])
+            .expect("ets:new");
+        let handle = ref_thing_id(table).expect("an unnamed table handle");
+
+        // A boxed gift term on the caller's (process-like) heap.
+        let source = {
+            let a = ctx.int(1).expect("small int");
+            let b = ctx.int(2).expect("small int");
+            let c = ctx.int(3).expect("small int");
+            ctx.tuple(&[a, b, c]).expect("a boxed gift")
+        };
+        let heir = ctx.atom("heir").expect("seeded");
+        let opt = ctx
+            .tuple(&[heir, pid.to_eterm(), source])
+            .expect("the {heir, Pid, Data} option");
+        let opts = ctx.list(&[opt]).expect("option list");
+        assert_eq!(
+            bifs.call("ets", "setopts", 2, &mut ctx, &[table, opts])
+                .expect("ets:setopts"),
+            ctx.atom("true").expect("seeded")
+        );
+
+        let stored = ctx
+            .tables()
+            .expect("tables")
+            .get(handle)
+            .expect("a live table")
+            .heir_data()
+            .expect("the arity-3 gift is installed");
+        assert_ne!(
+            stored.raw(),
+            source.raw(),
+            "the gift is deep-copied, never aliased into the caller's heap"
+        );
+        assert!(
+            beam_term::compare::eq(stored, source, ctx.atoms()),
+            "the table-owned copy is structurally the gift"
+        );
+
+        // The arity-2 form is a **silent** gift: an heir with no gift data.
+        let opt = ctx
+            .tuple(&[heir, pid.to_eterm()])
+            .expect("the {heir, Pid} option");
+        let opts = ctx.list(&[opt]).expect("option list");
+        bifs.call("ets", "setopts", 2, &mut ctx, &[table, opts])
+            .expect("ets:setopts");
+        let installed = ctx
+            .tables()
+            .expect("tables")
+            .get(handle)
+            .expect("a live table")
+            .heir()
+            .expect("the arity-2 heir is installed");
+        assert_eq!(installed.owner, owner_of(pid));
+        assert_eq!(
+            installed.data, None,
+            "an arity-2 heir carries no gift data (and inherits in silence)"
+        );
+
+        // `{heir, none}` clears the heir (and reclaims the copy).
+        let none = ctx.atom("none").expect("seeded");
+        let opt = ctx.tuple(&[heir, none]).expect("the {heir, none} option");
+        let opts = ctx.list(&[opt]).expect("option list");
+        bifs.call("ets", "setopts", 2, &mut ctx, &[table, opts])
+            .expect("ets:setopts");
+        assert_eq!(
+            ctx.tables()
+                .expect("tables")
+                .get(handle)
+                .expect("a live table")
+                .heir(),
+            None,
+            "`{{heir, none}}` clears the heir"
+        );
+    }
+
+    /// A **dead** heir pid is accepted and then **clears** the heir (the C
+    /// `set_heir`, `erl_db.c:5324`), and a non-owner caller is `badarg` (the owner
+    /// check `ets_setopts_2` performs unconditionally).
+    #[test]
+    fn setopts_clears_on_a_dead_heir_and_requires_the_owner() {
+        let bifs = crate::default_registry();
+        let atoms = setopts_atoms();
+        let mut heap = Heap::new(1 << 14).expect("heap");
+        let mut tables = TableRegistry::new();
+        let owner = ProcessId::new(1, 0);
+        let other = ProcessId::new(2, 0);
+        let heir_pid = ProcessId::new(9, 0);
+        let alive = Rc::new(Cell::new(true));
+        let mut hook = LivenessHook {
+            alive: Rc::clone(&alive),
+        };
+
+        let (table, handle) = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, owner)
+                .with_tables(&mut tables)
+                .with_process_hook(&mut hook);
+            let name = ctx.atom("t").expect("seeded");
+            let set = ctx.atom("set").expect("seeded");
+            let set_opts = ctx.list(&[set]).expect("option list");
+            let table = bifs
+                .call("ets", "new", 2, &mut ctx, &[name, set_opts])
+                .expect("ets:new");
+            let handle = ref_thing_id(table).expect("an unnamed table handle");
+            (table, handle)
+        };
+
+        // (a) A **live** heir pid installs the heir.
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, owner)
+                .with_tables(&mut tables)
+                .with_process_hook(&mut hook);
+            let heir = ctx.atom("heir").expect("seeded");
+            let opt = ctx.tuple(&[heir, heir_pid.to_eterm()]).expect("option");
+            let opts = ctx.list(&[opt]).expect("option list");
+            bifs.call("ets", "setopts", 2, &mut ctx, &[table, opts])
+                .expect("ets:setopts");
+        }
+        assert_eq!(
+            tables.get(handle).expect("a live table").heir().map(|h| h.owner),
+            Some(owner_of(heir_pid)),
+            "a live heir is installed"
+        );
+
+        // (b) The same pid after it dies: accepted, and **clears** the heir.
+        alive.set(false);
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, owner)
+                .with_tables(&mut tables)
+                .with_process_hook(&mut hook);
+            let heir = ctx.atom("heir").expect("seeded");
+            let opt = ctx.tuple(&[heir, heir_pid.to_eterm()]).expect("option");
+            let opts = ctx.list(&[opt]).expect("option list");
+            bifs.call("ets", "setopts", 2, &mut ctx, &[table, opts])
+                .expect("ets:setopts");
+        }
+        assert_eq!(
+            tables.get(handle).expect("a live table").heir(),
+            None,
+            "a dead heir is accepted and clears the heir"
+        );
+
+        // (c) A non-owner caller is `badarg` and leaves the heir untouched.
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, other)
+                .with_tables(&mut tables)
+                .with_process_hook(&mut hook);
+            let heir = ctx.atom("heir").expect("seeded");
+            let opt = ctx.tuple(&[heir, heir_pid.to_eterm()]).expect("option");
+            let opts = ctx.list(&[opt]).expect("option list");
+            assert!(matches!(
+                bifs.call("ets", "setopts", 2, &mut ctx, &[table, opts]),
+                Err(BeamError::BadArg)
+            ));
+        }
+        assert_eq!(
+            tables.get(handle).expect("a live table").heir(),
+            None,
+            "the denied call left the heir untouched"
+        );
+    }
+
+    /// A valid `{protection, P}` option is **recognised** but is the typed
+    /// capability gap — `beam_ets` exposes no post-creation access setter — so the
+    /// whole call raises `unsupported_bif` and leaves the protection untouched
+    /// (never a wrong protection). A malformed value and a duplicate
+    /// `{protection, _}` are still the oracle's `badarg` (the C validates the whole
+    /// list first).
+    #[test]
+    fn setopts_protection_is_a_typed_gap() {
+        let bifs = crate::default_registry();
+        let atoms = setopts_atoms();
+        let mut heap = Heap::new(1 << 14).expect("heap");
+        let mut tables = TableRegistry::new();
+        let pid = ProcessId::new(1, 0);
+
+        let mut ctx = BifContext::new(&mut heap, &atoms, pid).with_tables(&mut tables);
+        let name = ctx.atom("t").expect("seeded");
+        let set = ctx.atom("set").expect("seeded");
+        let set_opts = ctx.list(&[set]).expect("option list");
+        let table = bifs
+            .call("ets", "new", 2, &mut ctx, &[name, set_opts])
+            .expect("ets:new");
+
+        let protection = ctx.atom("protection").expect("seeded");
+        let public = ctx.atom("public").expect("seeded");
+
+        // A **valid** `{protection, public}` is the typed gap.
+        let valid = {
+            let opt = ctx.tuple(&[protection, public]).expect("option");
+            ctx.list(&[opt]).expect("option list")
+        };
+        assert_unsupported(
+            bifs.call("ets", "setopts", 2, &mut ctx, &[table, valid])
+                .expect_err("the protection typed gap"),
+        );
+        let info = bifs
+            .call("ets", "info", 2, &mut ctx, &[table, protection])
+            .expect("ets:info/2");
+        assert_eq!(
+            ctx.atoms().name(atom_val(info)),
+            Some("protected"),
+            "the protection is unchanged (the gap never applies a wrong one)"
+        );
+
+        // A malformed `{protection, <non-access atom>}` is `badarg`.
+        let bad_value = {
+            let opt = ctx
+                .tuple(&[protection, ctx.atom("heir").expect("seeded")])
+                .expect("option");
+            ctx.list(&[opt]).expect("option list")
+        };
+        assert!(matches!(
+            bifs.call("ets", "setopts", 2, &mut ctx, &[table, bad_value]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A duplicate `{protection, _}` is `badarg` (the C rejects it, even when both
+        // entries are equal).
+        let duplicate = {
+            let one = ctx.tuple(&[protection, public]).expect("option");
+            ctx.list(&[one, one]).expect("option list")
+        };
+        assert!(matches!(
+            bifs.call("ets", "setopts", 2, &mut ctx, &[table, duplicate]),
+            Err(BeamError::BadArg)
+        ));
     }
 }
