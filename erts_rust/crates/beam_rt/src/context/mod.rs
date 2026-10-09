@@ -2050,9 +2050,9 @@ pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
 /// label-addressed twin of [`RuntimeContext::run_export_blocking`]. When the closure's bare
 /// `receive` finds no message, that entry drives the scheduler for a bounded number of
 /// slices ([`RUN_EXPORT_PUMP_SLICES`]) and resumes the **same** [`Machine`] at the reported
-/// `(func, pc)`. The non-blocking [`Machine::run_label`] it replaced would instead have
-/// raised `unsupported_opcode: run: process blocked (no message available)` at the
-/// `call_fun` — which is exactly what the assertions below rule out.
+/// `(func, pc)`. The plain non-blocking [`Machine::run_label`] folds that suspension into
+/// `unsupported_opcode: run: process blocked (no message available)` at the `call_fun` —
+/// which is exactly what the assertions below rule out.
 ///
 /// Nothing here can hang: the pump is bounded, the waiting message is enqueued **before**
 /// the call (a child process, not a wall-clock timer), and the control phase uses a context
@@ -2160,8 +2160,9 @@ call(F) -> F().
         // The control: a context that is itself a scheduler slice may never re-enter the
         // scheduler, so the same closure keeps the engine's honest typed gap — no pump, no
         // hang and no fabricated value.
-        let mut table =
-            ProcessTable::new(beam_process::SignalAtoms::from_table(&mut beam_term::AtomTable::new()));
+        let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::AtomTable::new(),
+        ));
         let pid = table
             .spawn_default()
             .expect("spawn a process in the pass table");
