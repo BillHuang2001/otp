@@ -32,9 +32,11 @@
 //! Both of the adapter's write paths are exercised, because the C reaches `outputv` from both:
 //!
 //! * `Driver::output` — the registry-level direct write ([`PortRegistry::output`]); and
-//! * the **absent-`ready_output` fallback** of `Driver::ready_output` — what an `OUTPUT` port task
-//!   runs ([`PortRegistry::port_command`] + [`PortRegistry::execute_port_tasks`]), matching the C's
-//!   `no_ready_output_callback` default (`io.c:7524-7533`).
+//! * `Driver::ready_output` on a **slot-absent** entry (no readiness callback runs) — what an
+//!   `OUTPUT` port task runs ([`PortRegistry::port_command`] + [`PortRegistry::execute_port_tasks`]):
+//!   this crate's adapter carries the output queue itself, so the drained bytes go through the same
+//!   `outputv` path (the C's `no_ready_output_callback`, `io.c:7531-7538`, writes nothing — the C
+//!   delivers a command's bytes at `port_command` time instead).
 //!
 //! The exact vector the adapter builds is pinned too (`io.c:1842-1864`): `iov[0]` is the empty
 //! **header** block, `iov[1]` the data, `binv` runs parallel to `iov` with every entry NULL,
@@ -116,11 +118,12 @@ fn an_outputv_only_entry_receives_the_output_path_bytes() {
     registry.close(&mut poller, id).expect("the port closes");
 }
 
-/// The absent-`ready_output` fallback of `Driver::ready_output` runs the same `outputv` write path,
-/// so a `port_command` on this entry lands with an `OUTPUT` port task as the caller.
+/// `Driver::ready_output` on a **slot-absent** entry runs the same `outputv` write path, so a
+/// `port_command` on this entry lands with an `OUTPUT` port task as the caller.
 ///
-/// This is the C's `no_ready_output_callback` default (`io.c:7524-7533`): an entry with no
-/// `ready_output` slot is handed its queued output through the ordinary write path.
+/// This crate's adapter carries the output queue itself, so an entry with no `ready_output` slot is
+/// handed its queued output through the ordinary write path (the C's `no_ready_output_callback`,
+/// `io.c:7531-7538`, writes nothing there).
 #[test]
 fn the_absent_ready_output_fallback_also_runs_outputv() {
     let Some(so) = vector_fixture_so() else {
