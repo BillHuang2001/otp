@@ -91,6 +91,30 @@ unrooted `ExecutionContext::alloc_words`, so an ordinary run does not collect ye
 - `read.rs` → the tuple/cons/list/binary readers.
 - `tests.rs` → in-module unit tests; `test_support.rs` → the test-only ergonomic wrappers.
 
+## Handoff — call sites outside this node (NOT yet migrated)
+Every builder in this node is rooted, but the callers below still use the old `(ctx, …)`
+shape; they are the outstanding `E0061`s, and each is owned outside this node.
+- `../families/exceptions/stacktrace.rs` (`:91`, `:113`, `:160`–`:166`) — `symbolic_stacktrace`,
+  `stacktrace_item` and `location_term` build a whole multi-node graph (a `[{file,File},{line,N}]`
+  location per frame, the `{M,F,A,Loc}` item tuples, the item list) and must do so under **one**
+  reservation: size the graph from **metadata** first (`LocationShape`/`ItemShape`), call
+  `reserve_slack(machine, ctx, total)`, then carve every node with [`Sink`] (a per-node
+  allocation would strand the nodes already written — their pointers are not roots).
+  `stacktrace_item` keeps its signature (it is `../machine/location.rs`'s entry point) and
+  builds through [`ContextSink`]; one `write_location`/`write_item` definition parameterised by
+  `&mut dyn Sink` keeps the rooted and unrooted paths from diverging. `nearest_line` stays put.
+- `../families/exceptions/mod.rs:210` (`catch_end`) — route `{exit,Reason}` through the rooted
+  `make_tuple`, reading the machine root `x(1)` **inside** the reader closure (never a stale local).
+- `../families/exceptions/tests*`, `../families/floats/tests.rs`, `../families/maps/tests.rs`,
+  `../families/records/tests/*` — test call sites; use `terms::test_support::{…}`.
+- `../families/bitstrings/**`, `../families/records/mod.rs` — the other two migration workstreams.
+- `../machine/location.rs:277`/`:409` — the four `&self` accessors cannot lend the machine's
+  `&mut` root slices, so they build through the **unrooted** [`ContextSink`]. Sanctioned: every
+  term there comes from module metadata/immediates with no machine-heap operand held across an
+  allocation, and `alloc_words` never collects. Adopting a rooted `&mut self` twin needs `beam_rt`
+  to change `engines.engine_at(pid)` → `engines.engine_at_mut(pid)`
+  (`beam_rt/src/native/memory/mod.rs:519-522`).
+
 ## Test Strategy
 In-module `#[cfg(test)]` unit tests against a `MinimalContext` arena: round-trips through the
 readers, raw-word layout assertions against stack buffers (allowed here — this is the SAFETY
