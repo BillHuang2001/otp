@@ -104,7 +104,10 @@ registered but the directive has not resumed). A directive that has **already** 
 ## Where the real `start.boot` stops now
 Execute the real script (`bootstrap/bin/start.boot`, 22 instructions) and it runs **instructions 0–15**
 (every `primLoad` batch and the three `kernelProcess` directives, each driven to its process's own
-registration) and stops at **instruction 16** (0-based):
+registration) and stops at **instruction 16** (0-based). The tail's 0-based indices:
+**12** `{kernelProcess,heart,{heart,start,[]}}`, **13** `{kernelProcess,logger,{logger_server,start_link,[]}}`,
+**14** `{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`,
+**15** `{progress,init_kernel_started}`, **16** the `apply` below.
 
 ```
 {apply,{application,load,[{application,stdlib, Props}]}}
