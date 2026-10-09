@@ -609,10 +609,10 @@ pub(crate) fn group() -> Vec<Case> {
             "ok true",
         ),
         eval(
-            "boot_extra/system_info_debug_compiled_is_false",
-            "erlang:system_info(debug_compiled) reports a non-debug emulator build",
-            "erlang:system_info(debug_compiled)",
-            "ok false",
+            "boot_extra/system_info_debug_compiled_is_boolean",
+            "erlang:system_info(debug_compiled) is a boolean build flag (true for a debug build, false for a release build)",
+            "is_boolean(erlang:system_info(debug_compiled))",
+            "ok true",
         ),
         eval(
             "boot_extra/system_info_nif_version_is_a_string",
