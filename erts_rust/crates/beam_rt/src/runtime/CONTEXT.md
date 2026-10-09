@@ -39,10 +39,10 @@ Split by responsibility: `runner/entry.rs` (`ProcessEntry`/`ProcessEngine`/`Runn
 
 ## Test Strategy
 * `scheduler/tests.rs`: the bounded pass family (step budgets, wake absorption, the port/timer/distribution halves) over a real `Runtime`.
-* `gc.rs` units: the pin/halt/valve sets, `gc_stats`, and `stabilize_escaped` both on a movable heap and on a tripped valve.
-* `ets_owner.rs` units: append-only port-watch recording, the take-for-a-drain contract, and the two drains (incl. the deferred-borrow path).
+* `gc.rs` has **no in-module tests**: its coverage is the oracle-guarded integration suite `../../tests/gc_collect.rs` (the collector really runs at the allocating admission point; the non-allocating and float-pinned loops assert `collections == 0` as the discriminating control). `stabilize_escaped`'s tripped-valve path is **untested**.
+* `ets_owner.rs` units cover only `OwnerIndex` bookkeeping (idempotent recording, per-owner keying, `owner_key` pid round-trip, append-only port watches); **the two drains and the deferred-borrow path have no unit test** — they are covered by the integration suites `../../tests/ets_owner.rs` and `../../tests/port_monitor_cleanup.rs`.
 * `../runner/tests.rs`: the one-slice `ProcessRunner` contract, `RunnerState` bookkeeping, receive-deadline arming and the exit-reason mapping.
-* Integration (`../../tests/`): `port_wake.rs` (a port wake resumed through the scheduler), `proc_lib_start.rs` (the cross-module `receive` suspend seam), `position.rs`, `boot.rs`, and the `run`-action suites (`cli.rs`, `slice.rs`).
+* Integration (`../../tests/`): `port_wake.rs` (a port wake resumed through the scheduler), `proc_lib_start.rs` (the cross-module `receive` suspend seam), `scheduler.rs` (white-box block-then-resume ordering), `preempt.rs` (the reduction-budget interleaving), `gc_collect.rs`, `ets_owner.rs`, `port_monitor_cleanup.rs`, `position.rs`, `boot.rs`, and the `run`-action suites (`cli.rs`, `slice.rs`).
 
 ## Routing Table
 * `../runtime.rs` → the `Runtime` façade (boot wiring, code server + module cache, the slice, the spawn API, the timer/distribution accessors, `stabilize_term`/`materialize_args`, `system_info`, `eval`, `format_term`, `refs_mut`).

@@ -641,15 +641,37 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   (fall back to the raw atom index).
   Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
+- **`cmp_arith`'s mixed integer/float arm is a documented `f64` approximation (`src/compare.rs`).**
+  `cmp`/`eq` (exact) are unaffected. In arithmetic mode a mixed int/float pair — including a **small
+  int** — is converted with [`number::number_as_f64`] and compared as `f64`, whereas the C
+  (`utils.c:2366-2456`) keeps the exact integer path when the float is outside the lossless
+  `±(2^53−2)` window. So a small int ≥ `2^53` can compare differently: e.g. the C reports
+  `9007199254740993 > 9007199254740992.0` (`signed_val(aw) - (Sint)f2.fd`), while `number_as_f64`
+  rounds the int to `2^53` and the Rust returns `Equal`. A bignum vs float outside the lossless window
+  likewise uses nearest-double conversion instead of the C's exact `big_comp`/`double_to_big`.
+  Fixing it means porting the C's `SMALL_FLOAT`/`BIG_FLOAT` branches (lossless-window test + exact
+  integer/bignum compare) into `cmp_numbers`.
+- **`Atom` identity is table-relative, not global (`src/atom.rs` + `src/compare.rs`).** `Atom` is a bare
+  index into one `AtomTable`; two atoms carry the same `Eterm` only if their table interned the names in
+  the same order. The `cmp_impl` fast path (`a.raw() == b.raw()` ⇒ `Equal`, `src/compare.rs:205`) means
+  two atoms with the same index but *different* names (from two different tables) compare `Eq`; and an
+  atom whose index is out of range of the passed table falls back to comparing raw indices. Atom
+  comparison is only name-faithful when the operands and the passed `AtomTable` share one table — a
+  per-module `AtomTable` (as `beam_loader::Module` builds) therefore makes cross-module atom comparisons
+  unreliable.
 - **`term_hash` is internal, not compatibility-pinned (`src/hashing/mod.rs`).** It guarantees only
   the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
   exact bit values are not part of any contract. Maps hash structurally (their sorted pairs); funs hash
   over exactly the fields `compare` compares (so `eq ⇒ equal hash`, with the same `External`-last /
   kind-rank rules); native records hash over exactly the fields `cmp_records` compares (their content —
   the definition address is never mixed, so a record equals its copy hash-wise and `beam_ets`'s CHAMP
-  invariant holds). External pid/port/ref carry no pointer in their words, so their raw-word hash is
-  already content-stable; on-heap bin refs use an opaque raw-word fallback, so their hash is not stable
-  across processes/images.
+  invariant holds). External pid/port carry no pointer in their words, so their raw-word hash is
+  content-stable; internal refs and on-heap bin refs use an opaque raw-word fallback, so their hash is
+  not stable across processes/images. One marginal `eq ⇒ equal hash` gap: `hash_words` mixes the
+  external-ref block's header/arity, but `cmp_external_refs` (`src/compare.rs`) trims the longer id
+  slice's leading **zero** ids, so two external refs of different id-array lengths whose extra ids are
+  zero compare `Equal` yet hash differently. Reachable only with a forged/foreign ref (a real ref from
+  a given node always has one id length), so it is not observed through the safe API.
 - **Object-size approximation (`src/size.rs`).** Native records are treated like tuples (their
   field-table layout is not modelled).
 - **The HAMT is `erts_map_hash`-driven (`src/map.rs` + `src/ihash.rs`).** The map trie is placed by
