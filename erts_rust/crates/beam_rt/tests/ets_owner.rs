@@ -21,7 +21,8 @@
 //! **ETS owner-death reclamation** at the **executable** boundary.
 //!
 //! `src/runtime/ets_owner.rs`'s unit tests pin the owner index in isolation (recording,
-//! keying, the pid-immediate round trip); this suite pins what a user observes: an ETS table
+//! keying, the pid-immediate round trip, and the tid substitution's draw arithmetic); this
+//! suite pins what a user observes: an ETS table
 //! whose owning process dies is released — dropped, or handed to its installed heir with the
 //! oracle's `{'ETS-TRANSFER', Tid, FromPid, Data}` message — through the built `beam_rt`
 //! binary, the process finalizer, the `ProcessExitObserver` seam and a scheduler-pass drain,
