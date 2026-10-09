@@ -571,6 +571,23 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `number_as_f64` rounds an out-of-range bignum to `±inf`. Every representable integer/float pair
   (including the small-int/float keys the tests pin) is exact.
 
+## Handoffs (to other nodes — NOT adopted here)
+- **`beam_bifs` — adopt `select_reverse/1,2,3`.** The crate primitive + read gate exist
+  (`Table::select_reverse*` / `TableAccess::select_reverse*`); the BIF is still a seam-backed
+  `unsupported_bif`. Route it through the read-gated `TableAccess` forms.
+- **`beam_bifs` — adopt `WriteConcurrency`.** `src/kind.rs` now models the whole `{write_concurrency,_}`
+  surface (`WriteConcurrency::Off`/`On`/`Auto`/`FixedLocks(n)`); the parser can drop its private mirror.
+- **`beam_bifs` — the `auto` / `{debug_hash_fixed_number_of_locks, Nlocks}` rendering stays host-side.**
+  `TableInfo::write_concurrency` is a `bool`, so the `TableProfile` sidecar must supply the `auto` atom /
+  the normalized lock count (`TableOptions` stores the *requested*, un-normalized count).
+- **`beam_bifs`/`beam_rt` — the `ets:*` bridge is still un-gated and owner-less** (pre-existing;
+  `ETS_SURFACE.md` §7.1–§7.4): it calls the raw `Table::*` primitives, records no owner, and nothing
+  calls `Table::owner_died`. Routing through `Table::as_requester`, recording the owner, and a
+  process-exit observer remain the runtime's work.
+- **`beam_bifs` — the option parser/renderer lag** (`ETS_SURFACE.md` §7.5): it still rejects
+  `compressed`/`{write_concurrency,_}`/`{read_concurrency,_}`/`{heir,…}`/`{decentralized_counters,_}`
+  and recomputes `decentralized_counters` instead of reading `TableInfo::decentralized_counters`.
+
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; unit tests in `src/kind/tests.rs`
