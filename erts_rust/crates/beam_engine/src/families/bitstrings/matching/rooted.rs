@@ -18,11 +18,12 @@
 //
 // %CopyrightEnd%
 
-//! **Moving-collector regression tests for the three allocating bitstring reads**
+//! **Moving-collector regression tests for the allocating bitstring reads**
 //! (Handoff #11).
 //!
-//! [`BsGetInteger2`]/[`BsGetBinary2`]/[`BsGetFloat2`] read their match context, take
-//! an **allocating** field read (`raw::make_big`, `raw::make_bits`,
+//! [`BsGetInteger2`]/[`BsGetBinary2`]/[`BsGetFloat2`] — and the allocating commands of
+//! the flattened [`bs_match`](run_commands) interpreter — read their match context,
+//! take an **allocating** field read (`raw::make_big`, `raw::make_bits`,
 //! `crate::terms::make_float` — each a rooted reservation), and then commit the
 //! advanced position back into the context. Because the reserve can run a **moving**
 //! collector
@@ -30,7 +31,11 @@
 //! that relocates every block reachable from the machine's root set and rewrites
 //! `machine.x`/`stack`/`fr` in place, the context read *before* the allocation is a
 //! stale pointer afterwards — so each opcode re-reads the context operand
-//! (`reread_ctx`) before the final `set_ctx_start`.
+//! (`reread_ctx`) before the `set_ctx_start`. It also re-reads it **before** it binds
+//! the read's destination: the C advances `sb->start` inside the read
+//! (`i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_read_bits`) *before*
+//! `$Dst = result`, and a destination may be the register the context lives in
+//! (`bs_match`'s `get_tail` binds the tail into it).
 //!
 //! These tests drive all three opcodes through
 //! [`exec`](super::exec) over the crate's mock semi-space collector
@@ -43,6 +48,11 @@
 //! 3. the **advanced position is committed to the moved context** — a write into the
 //!    stale pre-collection block would leave the machine's context at position 0 and
 //!    fail this assertion.
+//!
+//! [`bs_match_commits_each_advance_before_it_binds_the_context_register`] is the same
+//! discipline for the flattened command interpreter, in the shape the compiler emits
+//! for `coverage:bits/1`: an allocating `integer` command followed by a `get_tail` that
+//! binds the tail into the context's own register.
 //!
 //! The fixtures are hand-built devices: a heap binary and its match context carved
 //! into the moving region through the family's own `raw` writers, and a hand-built
@@ -58,7 +68,7 @@ use crate::terms::alloc_tests::MovingContext;
 use crate::terms::{binary_bytes, float_value};
 use crate::Step;
 
-use super::{enter_match, exec};
+use super::{enter_match, exec, run_commands};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -246,4 +256,96 @@ fn bs_get_binary2_commits_the_advanced_position_to_the_moved_context() {
         &[1u8, 2, 3, 4][..]
     );
     assert_eq!(position(&machine), (32, 32));
+}
+
+// ---------------------------------------------------------------------------
+// bs_match — the flattened command interpreter
+// ---------------------------------------------------------------------------
+
+/// The `integer`/`get_tail` command list `coverage:bits/1` compiles to, driven under
+/// the mock moving collector.
+///
+/// The `integer` command reads a 64-bit field, so its rooted reservation builds a
+/// bignum and collects, relocating the context; the `get_tail` that follows binds the
+/// tail **into the register the context lives in** (`bits/1`'s `get_tail … {x,1}`).
+/// That is why every advancing command must mirror its advance into the context as it
+/// runs: a single write-back after the loop would have to re-read a register a command
+/// had already overwritten — the typed `bs_match: operand is not a match context`
+/// raised from [`read_ctx`](super::match_ctx::read_ctx), which is exactly the failure
+/// this test pins.
+#[test]
+fn bs_match_commits_each_advance_before_it_binds_the_context_register() {
+    let mut machine = Machine::with_max_register(4);
+    let mut ctx = MovingContext::new();
+
+    // `2^60` (a bignum read) followed by the distinctive tail `<<1,…,8>>`.
+    let bytes = [0x10, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+    let subject = raw::make_bits(&mut machine, &mut ctx, &bytes, 128).expect("heap binary");
+    machine.set_x(0, subject).expect("root the subject");
+    let context = enter_match(&mut machine, &mut ctx, &Operand::X(0))
+        .expect("no raise")
+        .expect("a bitstring subject enters a match");
+    // Root the context at `x(0)` (the operand `bs_match` reads) *and* at `x(2)`, so its
+    // committed position stays observable after `get_tail` overwrites `x(0)`.
+    machine.set_x(0, context).expect("root the context");
+    machine.set_x(2, context).expect("a second root for the context");
+
+    let mut module = Module::default();
+    let integer = module.atom_table.intern("integer");
+    let get_tail = module.atom_table.intern("get_tail");
+    let commands = [
+        // `integer Live Flags Size Unit Dst` — the leading 64-bit field into `x(1)`.
+        Operand::Atom(integer),
+        Operand::Integer(1), // Live
+        Operand::Nil,        // Flags (no `little`/`signed`/`native`)
+        Operand::Integer(64),
+        Operand::Integer(1),
+        Operand::X(1), // Dst
+        // `get_tail Live Unit Dst` — the remaining bits into the **context's** register.
+        Operand::Atom(get_tail),
+        Operand::Integer(1), // Live
+        Operand::Integer(8), // Unit
+        Operand::X(0),       // Dst
+    ];
+
+    // A run that reaches `Step::Next` at all is the first half of the witness: the
+    // buggy single trailing write-back re-read the overwritten `x(0)` here and raised
+    // `unsupported_opcode: bs_match: operand is not a match context`.
+    let step = run_commands(
+        &mut machine,
+        &module,
+        &LabelMap::new(),
+        NO_FAIL,
+        &Operand::X(0),
+        &commands,
+        &mut ctx,
+    )
+    .expect("the flattened command list reports no raise")
+    .expect("the flattened command list reports a step");
+    assert_eq!(step, Step::Next);
+
+    // (1) Both allocating commands ran the collector, so the context was relocated
+    // while the list was executing. (The mock collector alternates two fixed regions,
+    // so the *address* returns to its starting value after the even number of
+    // collections this list performs — the committed position below is the reliable
+    // witness that the write landed in the relocated block.)
+    assert!(ctx.moved_any, "the mock collector must have relocated a block");
+    assert!(ctx.collections >= 1, "a collection must have run");
+
+    // (2) The field and the tail were read from the (moved) subject.
+    let (negative, digits) =
+        raw::big_parts_safe(machine.x(1).expect("the field")).expect("a bignum");
+    assert!(!negative, "the field is unsigned");
+    assert_eq!(digits, vec![1u64 << 60]);
+    assert_eq!(
+        binary_bytes(machine.x(0).expect("the tail")).expect("a binary"),
+        &[1u8, 2, 3, 4, 5, 6, 7, 8][..]
+    );
+
+    // (3) The advanced position was mirrored into the context as the `integer` command
+    // ran — via the second root, which `get_tail` did not overwrite. A write into the
+    // stale pre-collection block would leave `start` at 0 here.
+    let (_, start, end) =
+        raw::ctx_parts(machine.x(2).expect("the second context root")).expect("a match context");
+    assert_eq!((start, end), (64, 128));
 }

@@ -21,10 +21,14 @@
 //! The flattened `bs_match` command interpreter.
 //!
 //! `bs_match`'s `commands` operand is the raw flattened list the loader preserved;
-//! decoding the records is this module's job. A `pos` cursor advances locally through
-//! the commands and is written back into the context once the whole list has
-//! succeeded. `ensure_at_least`/`ensure_exactly` only test; the reads snapshot a
-//! value into a register.
+//! decoding the records is this module's job. A local `pos` cursor walks the subject
+//! bits, and every command that advances it mirrors the advance into the context's own
+//! position field **before** binding its destination ([`commit`]) — the C order
+//! (`i_bs_read_bits`/`i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_skip` all do
+//! `sb->start += …` before `$Dst = result`), which has to hold even when the destination
+//! *is* the register the context lives in (`get_tail` binds the tail into the context's
+//! own register). `ensure_at_least`/`ensure_exactly` only test; the reads bind a value
+//! into a register.
 use crate::interpreter::LabelMap;
 
 use beam_common::Result;
@@ -54,9 +58,12 @@ pub(crate) fn run_commands(
     commands: &[Operand],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    // `pos` is a *local* cursor: the context's own position is written back only
-    // once the whole command list has succeeded, so every re-read below yields the
-    // same `(start, end)` for this invocation.
+    // `pos` is a *local* cursor over the subject bits. Every command that advances it
+    // mirrors the advance into the context's own position field straight away
+    // ([`commit`]) — never in one batch after the loop: a command binds its destination
+    // *after* the C has advanced `sb->start`, and that destination may be the very
+    // operand the context lives in (`get_tail` in `bits/1`), so a trailing write-back
+    // would have to re-read a register a command had already overwritten.
     let (_, _, start, _) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
     let mut pos = start;
     let mut i = 0usize;
@@ -95,7 +102,8 @@ pub(crate) fn run_commands(
                 }
                 i += 2;
             }
-            // `skip Stride` — advance without binding (`i_bs_skip`).
+            // `skip Stride` — advance without binding (`i_bs_skip`, which does
+            // `sb->start += size`).
             "skip" => {
                 let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 let Some(next) = pos.checked_add(stride) else {
@@ -105,6 +113,7 @@ pub(crate) fn run_commands(
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos = next;
+                commit(machine, ctx, ctx_op, pos)?;
                 i += 2;
             }
             // `integer Live Flags Size Unit Dst` (`i_bs_get_fixed_integer`).
@@ -120,8 +129,12 @@ pub(crate) fn run_commands(
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 let value = read_integer_field(machine, ctx, bytes, pos, nbits, flags)?;
-                write_operand(machine, dst, value)?;
                 pos += nbits;
+                // The C advances `sb->start` (inside `erts_bs_get_integer_2`) *before*
+                // it binds `$Dst`, so the advance is mirrored first: `Dst` may be the
+                // context's own operand.
+                commit(machine, ctx, ctx_op, pos)?;
+                write_operand(machine, dst, value)?;
                 i += 6;
             }
             // `binary Live Flags Size Unit Dst` (`i_bs_get_fixed_binary`).
@@ -143,8 +156,12 @@ pub(crate) fn run_commands(
                 }
                 let out = extract_bits(bytes, pos, nbits)?;
                 let value = raw::make_bits(machine, ctx, &out, nbits)?;
-                write_operand(machine, dst, value)?;
                 pos += nbits;
+                // `i_bs_get_fixed_binary` does `sb->start += size;` *before*
+                // `$Dst = result;` — mirror the advance first (`Dst` may be the
+                // context's own operand).
+                commit(machine, ctx, ctx_op, pos)?;
+                write_operand(machine, dst, value)?;
                 i += 6;
             }
             // `get_tail Live Unit Dst` — bind the whole remaining bits
@@ -178,6 +195,9 @@ pub(crate) fn run_commands(
                     return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos += bits;
+                // The C consumes `Bits` through the `i_bs_read_bits` that feeds
+                // `i_bs_eq`, which advances `sb->start` by `Bits`.
+                commit(machine, ctx, ctx_op, pos)?;
                 i += 4;
             }
             other => {
@@ -185,12 +205,32 @@ pub(crate) fn run_commands(
             }
         }
     }
-    // Commit the advanced position only once the whole command list succeeded. The
-    // last command may have allocated, so re-read the context operand for a fresh
-    // (post-collection) term before mutating its position in place.
+    Ok(Some(Step::Next))
+}
+
+/// Mirror the local cursor `pos` into the match context's own position field.
+///
+/// The context operand is re-read **here**, right before the write: the command that
+/// advanced the cursor may have allocated through the rooted seam
+/// ([`read_integer_field`] -> [`raw::make_big`], [`raw::make_bits`]), whose moving
+/// collector may have relocated the context block, so the term captured at the top of
+/// the iteration is stale (the frozen reserve, then read, then write ordering). The
+/// operand itself is part of the machine's root set and is rewritten in place by the
+/// collector, so re-evaluating it yields the live term.
+///
+/// Every caller commits **before** binding a command's destination: the C advances
+/// `sb->start` first (`i_bs_get_fixed_integer`/`i_bs_get_fixed_binary`/`i_bs_skip`/
+/// `i_bs_read_bits`) and `bs_match`'s `get_tail` binds the tail into the context's own
+/// register, so a destination binding can make the context operand unreadable.
+fn commit(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    ctx_op: &Operand,
+    pos: usize,
+) -> Result<()> {
     let term = reread_ctx(machine, ctx, ctx_op, "bs_match")?;
     raw::set_ctx_start(term, pos);
-    Ok(Some(Step::Next))
+    Ok(())
 }
 /// The `i`-th command operand, or a typed error when the list is truncated.
 pub(crate) fn cmd_at(commands: &[Operand], index: usize) -> Result<&Operand> {
