@@ -587,7 +587,10 @@ fn run_loop(label: &str, config: &GcConfig, kind: MatureKind) {
 /// up immediately as growth. The initial sizes are chosen inside each strategy's
 /// growth/shrink fixed point so the steady state is reached during warm-up:
 ///
-/// * a 8192-word nursery holds the live graph plus the garbage and neither grows nor shrinks;
+/// * a 8192-word nursery holds the live graph plus the garbage and neither grows nor shrinks —
+///   it is **pinned** with `min_heap_words` because the bounded
+///   [`HeapPolicy::young_after_collection`] shrinks a nursery a fullsweep leaves empty, and
+///   every cycle re-allocates the same corpus;
 /// * a 12288-word mature generation (48 whole mark-region blocks) is a fixed point for both
 ///   strategies — the copying space shrinks it to the curated fixed point above the live set
 ///   once and then keeps it, while the mark-region space keeps it in place.
@@ -595,6 +598,7 @@ fn shared_policy() -> HeapPolicy {
     HeapPolicy {
         fullsweep_after: 0,
         initial_young_words: 8192,
+        min_heap_words: 8192,
         initial_mature_words: 12_288,
         ..HeapPolicy::default()
     }
