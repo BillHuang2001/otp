@@ -17,7 +17,7 @@ assume a different layout.**
 (both are one machine word). `beam_abi` will transmute between them; no other crate may redefine it.
 
 ### crate root (`src/lib.rs`)
-`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, bitstring, refc, map, fun, record, number, error}` plus
+`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, layout, thing, bitstring, refc, map, fun, record, number, error}` plus
 `pub mod prelude` and flat `pub use` re-exports of every public item below, so downstream code can
 `use beam_term::prelude::*;`.
 
@@ -140,9 +140,12 @@ operators) and `<`/`>` between same-typed terms.
 - `pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool` — `cmp(a,b).is_eq()` (`=:=`).
 - `pub fn cmp_arith(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering` — the
   arithmetic (`==`) order, reproducing `erts_cmp(a, b, exact=0, eq_only=0)` (differs from `cmp`
-  only for floats and mixed integer/float pairs). A mixed integer/float pair is converted with
-  [`number::number_as_f64`](#numberrs--safe-numeric--f64-conversion) (single definition; the
-  former crate-private helper was removed).
+  only for floats and mixed integer/float pairs). A mixed integer/float pair is compared with the
+  C's **exact** algorithm, *not* an `f64` conversion: the `mixed_types` block of
+  `erts_cmp_compound` (`utils.c:2345-2460`), ported in
+  [`compare/numbers.rs`](#comparenumbersrs--exact-mixed-integerfloat-comparison). So `1 == 1.0`,
+  `-0.0 == +0.0` and `9007199254740993 > 9007199254740992.0` all hold; NaN/±inf are deterministic
+  (documented at the module).
 - **Same-class structural arms.** Besides the scalar/compound classes, `cmp`/`eq` compare the
   *content* of external pids, external ports, external references and native records field-by-field
   in the C's `erts_cmp` order, so a **copy of such a term is `=:=` its original** (the copy boundary's
@@ -154,6 +157,18 @@ operators) and `<`/`>` between same-typed terms.
   counterpart here).
 - The bit/float payload helpers live in [`bitstring.rs`](#bitstringrs--bit-level-payloads); this
   module forwards to them so each layout has a single definition.
+### `compare/numbers.rs` — exact mixed integer/float comparison
+The `mixed_types` port of `erts_cmp_compound` (`../../erts/emulator/beam/utils.c:2345-2460`) plus
+`erts_float_comp` (`erl_utils.h:187`): the exact numeric comparison for a pair of *different*
+numeric classes, and the crate's private `double_to_big` (an exact integral-`f64` → LS-first `u64`
+limb conversion, `big.c:2536`) that lets a bignum vs a non-lossless float be compared exactly
+instead of by nearest-double rounding.
+- `Small,Big`/`Big,Small` decide by the bignum's sign (a bignum is always outside the small range);
+  `Small,Float`/`Float,Small` compare inside the lossless `±(2^53−2)` window and otherwise fall to
+  the C's exact integer subtraction; `Big,Float`/`Float,Big` walk the C's magnitude bands, the
+  lossless `big_to_f64` compare, then the exact `double_to_big` + bignum compare (`FLOAT_BIG` swaps
+  and negates).
+- `pub(super) fn cmp_numbers(...)` is consumed by [`compare.rs`](#comparers--erlang-term-ordering-erts_cmp).
 ### `hashing/` — hashing: the compatibility-pinned `phash2`/`phash` + the internal structural hash
 Split by responsibility: `mod.rs` (module docs + the internal structural hash `term_hash` + its tests),
 `common.rs` (the low-level primitives shared by both ERTS ports: `HCONST*`/`FN*`, `mix32`/`mix3`,
@@ -207,6 +222,30 @@ places leaves with, so a `write_map`-built hash map's stored pair order equals t
 `maps:to_list/1` order (`tests/map_hash.rs`). Classes whose C hash is pointer-derived (external
 pid/port/ref, external/local fun, internal ref) use a documented deterministic substitute; the C hash is
 itself documented non-portable across VM instances.
+### `layout.rs` — canonical per-object layout (the single source of truth)
+The per-object layout walk every copier/sizer adopts: how many heap words one object occupies and
+which of its payload words are term references a copier must forward. Owned here (the frozen-layout
+LCA, workspace §2); `size.rs` consumes it, and the sibling copies (`beam_message::layout`,
+`beam_gc::copy`) must be derived from it rather than transcribed — both currently lack the
+`SUB_BITS` sizing arm (they fall through to `thing_arityval + 1 == 5` for a real 8-word refc pair).
+- `pub unsafe fn object_words(header: Eterm, ptr: *const Eterm) -> usize` — the words the boxed
+  object headed by `header` at `ptr` occupies, **header word included**: tuple/record `arity + 1`;
+  fun (all three kinds) `1 + fun_desc_words(kind) + fun_num_free`; flatmap `size + 3`; HAMT node
+  (head-array / head-bitmap / inner node-bitmap) `1 + header_arity + popcount(MAP_HEADER_VAL)`;
+  every other thing (float, bignum, ref, `BinRef`, heap-bits, external pid/port/ref)
+  `thing_arityval + 1`; `ErlSubBits` → `ERL_REFC_BITS_SIZE` (8, the whole
+  `[BinRef(3)][ErlSubBits(5)]` pair) when `orig` is a `BinRef`, `heap_bits_size_words(end - start)`
+  for a match context over an on-heap bitstring, else `ERL_SUB_BITS_SIZE` (5). The shared zero-arity
+  tuple literal (`tuple0()`) is the caller's special case (`size_object` skips it; `object_words`
+  reports `1`). Offsets are relative to the header word (offset 0).
+- `pub unsafe fn for_each_sizing_child_slot(header, ptr, visit: impl FnMut(usize))` — the **sizing**
+  child offsets; an `ErlSubBits` exposes none.
+- `pub unsafe fn for_each_child_slot(header, ptr, visit: impl FnMut(usize))` — the **copy** child
+  offsets a copier must forward; identical except an `ErlSubBits` exposes its `orig` word
+  (`SUB_BITS_ORIG_WORD` = 4). This sizing/copying divergence is documented explicitly
+  (`copy.c:219-242` vs `copy.c:1677-1700`).
+- `bitstring.rs` exports the `SUB_BITS_{BASE,START,END,ORIG}_WORD` indices.
+
 ### `size.rs` — object word size
 - `pub fn size_object(a: Eterm) -> usize` — the *flat* number of heap words the term graph
   occupies, reproducing `size_object_x(obj, NULL)` (`copy.c`): `0` for immediates, `2` per cons
@@ -218,7 +257,10 @@ itself documented non-portable across VM instances.
   `Err(TermGraphCyclic)` for a cycle, which takes priority over the size limit. Both entry points
   share ONE iterative walk; cycle detection is **path-based** (`on_path`), so a shared-but-acyclic
   subterm is still counted once per occurrence — matching `size_object_x`/`copy_struct`. A non-term
-  word contributes `0` and is never dereferenced.
+  word contributes `0` and is never dereferenced. Its per-object interior (its words and its child
+  slots) is **not** defined here: the walk drives
+  [`layout`](#layoutrs--canonical-per-object-layout-the-single-source-of-truth) (`object_words` +
+  `for_each_sizing_child_slot`), so the crate holds exactly one definition of an object's interior.
 
 ### `thing.rs` — off-heap term materialization (heap-agnostic)
 Frozen-layout **writers and readers for the boxed "thing" families whose interior layout this
@@ -395,8 +437,10 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   value; `None` for a non-bignum or an out-of-range magnitude (the C's `< 0`, which `i_fconv` turns
   into `badarith`) — never a silently wrong value. This is the API `beam_engine`'s `Fconv` will adopt.
 - `pub fn number_as_f64(x: Eterm) -> f64` — total/panic-free: small → value, float → value, bignum →
-  `big_to_f64` or `±f64::INFINITY` when unrepresentable, non-number → `NaN`. Used by
-  [`compare::cmp_arith`].
+  `big_to_f64` or `±f64::INFINITY` when unrepresentable, non-number → `NaN`. A **best-effort**
+  (nearest-double) conversion: it is NOT used for exact comparison — the arithmetic mixed
+  integer/float compare lives in
+  [`compare/numbers.rs`](#comparenumbersrs--exact-mixed-integerfloat-comparison).
 
 ### `error.rs` — crate error types
 - `pub enum TermError` / `pub type TermResult<T>` — this crate's error types, reconciled into
@@ -490,6 +534,16 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   Keeping one definition avoids the `ambiguous_glob_reexports` hazard of two modules exporting the
   same name, and removes the previous `pub(crate)`-only duplication between `compare.rs` and the
   deleted `beam_codec` bitstring shim.
+- **The per-object layout walk has a single definition (`src/layout.rs`).** The words-per-object count
+  and the child-slot enumeration for every boxed shape — including the three `ErlSubBits` cases — live
+  in one place; `size.rs` and the sibling `beam_message`/`beam_gc` copies are consumers. The sizing
+  and copy child enumerations are deliberately split because they diverge for `ErlSubBits`: the sizing
+  walk must NOT descend into `orig` (it would double-count the block it already counted), while a
+  copier MUST forward it.
+- **`cmp_arith`'s mixed integer/float compare is exact (`src/compare/numbers.rs`).** It ports the C
+  `mixed_types` block (`utils.c:2345-2460`) instead of rounding the integer to `f64`, so a small int
+  ≥ `2^53` and a bignum outside the lossless window compare exactly as the oracle does; the exact
+  integral-`f64`→bignum conversion (`double_to_big`) is a private single definition there.
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` unit tests.
@@ -520,6 +574,12 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   over-limit), budget inclusivity, non-terms (`THE_NON_VALUE`, `HEADER_FLONUM`, forged HEADER-tagged
   words) ⇒ `Ok(0)`, a 100 000-element list (no stack overflow), flat and 33-key HAMT maps sized
   exactly, and shared-subterm per-occurrence counting.
+- `src/layout.rs` carries its own `#[cfg(test)]` suite: `object_words` for every boxed shape (incl.
+  the three `ErlSubBits` cases) and the sizing/copy child-slot enumeration per shape, plus a
+  `sum(object_words over the graph) == size_object` cross-check demanding the two halves agree.
+- `src/compare/numbers.rs` carries its own `#[cfg(test)]` suite for the exact mixed numeric compare:
+  the `2^53` asymmetry both orders, the lossless boundary, bignum↔float both signs and by arity, the
+  exact-`double_to_big` path, NaN/±inf, and an antisymmetry sweep.
 - `src/thing.rs` carries its own `#[cfg(test)]` suite pinning each block's raw words against the
   legacy headers (float `[HEADER_FLONUM, bits]`; bignum header arity `n`, the digit count, + LS-first
   `u64` digits and the sign bit; flatmap `[arityval(n), k.., MAP_HEADER_FLATMAP, raw size, keys-tuple, v..]` plus
@@ -559,6 +619,10 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   pseudo-random, both signs) + randomised multi-limb values + curated rounding-boundary vectors;
   `ERL_TIMEOUT = 60s`; skips loudly when `erl` is absent. The bignum *observables* (equality/order/
   `flat_size`) are cross-checked separately in `tests/oracle.rs`.
+- `tests/compare_oracle.rs` — the live-`erl` cross-check of `cmp_arith`/`eq`: the same terms are
+  materialized in Rust and as Erlang literals, and the Rust ordering agrees with `==`/`=:=`/`<`/`>`
+  over a corpus spanning the `>2^53` asymmetry, small/bignum × float (both orders) and the special
+  values. Skips loudly when `erl` is absent.
 - `tests/map_hash.rs` — the crate-local oracle cross-check for the **HAMT pair-storage order**:
   it pins two verified literal vectors (60 small-int keys `#{K => K*2}`; 40 binary keys
   `#{<<N>> => N}`) as expected lists, and compares `map_pairs_storage_order` against
@@ -583,13 +647,14 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/heap.rs` → minimal bump term arena (the representation's allocation interface)
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
-- `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port: full-class structural arms (incl. external pid/port/ref and native records) + the residual deterministic fallbacks
+- `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port: full-class structural arms (incl. external pid/port/ref and native records) + the residual deterministic fallbacks; `src/compare/numbers.rs` → the exact `mixed_types` numeric compare (`cmp_numbers`) + the private `double_to_big`
 - `src/hashing/mod.rs` → module root: docs + the internal structural hash `term_hash` (+ tests); re-exports the public ERTS-hash API
 - `src/hashing/common.rs` → primitives shared by the two ERTS hash ports (`HCONST*`/`FN*`, `mix32`/`mix3`, `uint32_hash*`/`sint32_hash`/`uint32_hash_step`, `le32`, `block_hash`, `bitstring_parts_any`, `base_bits`, work-stack item types; `pub(super)`)
 - `src/hashing/make_hash2.rs` → the **bit-exact** ERTS `make_hash2` (`erlang:phash2/1,2`) + `compute_record_definition_hash` (fetch this value for a native record's `hash` word)
 - `src/hashing/make_hash.rs` → the **bit-exact** ERTS `make_hash` (`erlang:phash/2`) + `hash_binary_bytes`
 - `src/ihash.rs` → the **bit-exact** `erts_map_hash` / `make_internal_hash` port (`erl_term_hashing.c`): `erts_map_hash`/`erts_internal_hash`/`erts_internal_salted_hash`/`ihash_mix64`, plus the map-trie helpers `swizzle_map_hash` (nibble reversal) and `hashmap_nibble` (level-`L` LSB nibble)
 - `src/size.rs` → object word size (`size_object`, total/panic-free) + the bounded, cycle-safe `size_object_bounded`, sharing one `size_object_x`-faithful walk
+- `src/layout.rs` → canonical per-object layout: `object_words` (words per object, header included) + the sizing (`for_each_sizing_child_slot`) / copy (`for_each_child_slot`) child-slot enumerators incl. the `SUB_BITS` `orig` divergence; the single source of truth `size.rs` consumes
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
 - `src/fun.rs` → the on-heap fun/export layout: `FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_arity`/`fun_num_free`/`fun_words`/`fun_block_words`, the `write_fun_{local,external,imported}` writers and the `fun_*` accessors (`erl_term.h`/`erl_fun.h`/`external.c` ground truth)
 - `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`, keyed by `ihash::erts_map_hash`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`/`map_pairs_storage_order`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
@@ -599,7 +664,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` (incl. `FunIdentityUnavailable`; `TermGraphCyclic`/`TermGraphTooLarge` from bounded sizing) + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
-- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, term-ordering `compare_terms.rs`, external/record comparison `compare_external.rs`, bounded sizing `size_bounded.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs` and `number_oracle.rs`)
+- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, term-ordering `compare_terms.rs`, external/record comparison `compare_external.rs`, bounded sizing `size_bounded.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs`, `number_oracle.rs` and `compare_oracle.rs`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
 - **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed
@@ -622,6 +687,11 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   re-implements a bounded, cycle-safe sizing walk (`bounded_words`, `is_acyclic`, `preflight_words`) to
   guard the messaging copy boundary; `size::size_object_bounded` now provides exactly that machinery, so
   the duplicate can collapse onto it. Owner: `beam_message` (outside this node).
+- **Copier/sizer layout copies should adopt `beam_term::layout`.** `beam_message::layout::{object_words,
+  for_each_child_slot}` and `beam_gc::copy::{move_size, for_each_ref}` both **lack the `SUB_BITS` sizing
+  arm** (they fall through to `thing_arityval + 1 == 5` for a real 8-word refc pair); `beam_term::layout`
+  supplies the single canonical, correct walk they should be derived from. Owner: those crates (outside
+  this node).
 
 ## Known Issues
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
@@ -641,16 +711,6 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   (fall back to the raw atom index).
   Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
-- **`cmp_arith`'s mixed integer/float arm is a documented `f64` approximation (`src/compare.rs`).**
-  `cmp`/`eq` (exact) are unaffected. In arithmetic mode a mixed int/float pair — including a **small
-  int** — is converted with [`number::number_as_f64`] and compared as `f64`, whereas the C
-  (`utils.c:2366-2456`) keeps the exact integer path when the float is outside the lossless
-  `±(2^53−2)` window. So a small int ≥ `2^53` can compare differently: e.g. the C reports
-  `9007199254740993 > 9007199254740992.0` (`signed_val(aw) - (Sint)f2.fd`), while `number_as_f64`
-  rounds the int to `2^53` and the Rust returns `Equal`. A bignum vs float outside the lossless window
-  likewise uses nearest-double conversion instead of the C's exact `big_comp`/`double_to_big`.
-  Fixing it means porting the C's `SMALL_FLOAT`/`BIG_FLOAT` branches (lossless-window test + exact
-  integer/bignum compare) into `cmp_numbers`.
 - **`Atom` identity is table-relative, not global (`src/atom.rs` + `src/compare.rs`).** `Atom` is a bare
   index into one `AtomTable`; two atoms carry the same `Eterm` only if their table interned the names in
   the same order. The `cmp_impl` fast path (`a.raw() == b.raw()` ⇒ `Equal`, `src/compare.rs:205`) means
