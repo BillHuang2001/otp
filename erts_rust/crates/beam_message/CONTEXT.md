@@ -323,7 +323,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   that can cross a copy boundary (incl. a `SUB_BITS` match context, whose `object_words` is the
   flattened window size). The LCA's `object_words` and child-slot enumerators cover every HAMT node
   kind with the same `1 + header_arity + popcount(MAP_HEADER_VAL)` formulation, so a hash map copies
-  as a whole trie.
+  as a whole trie. Because that single-object count *is* the LCA's `object_words`, a widened fun
+  descriptor (the 3-word `External` `[module, function, arity]` descriptor ⇒ a 4-word block) is sized
+  and copied automatically, with no change in this crate.
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` per module: `layout` (the off-heap container round-trip and the
   non-container negative case — the per-object sizing/child-slot walk itself is tested in
@@ -347,7 +349,8 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `thing` accessors for external things): immediates; proper and improper cons lists; tuples/records
   (nested + the shared zero-arity literal); flat map and HAMT map (head-array/head-bitmap/inner-node +
   collision tuples); on-heap bitstrings (aligned + non-aligned); refc binary; MSO container; all three
-  fun kinds; external pid/port/ref.
+  fun kinds (the External case pins the widened 4-word `[header, module, function, arity]` block, incl.
+  the true-arity word); external pid/port/ref.
 - `tests/guards.rs` — **non-term and cycle guards + the relocation invariant**: `is_shared`/`shallow`
   reject every bare header word (incl. `THE_NON_VALUE`/`HEADER_SUB_BITS`) with a typed `BadArg` and
   write nothing; a forged cyclic graph (self-cons, self-tuple, 2-cell, 100-cell) returns a typed
@@ -392,7 +395,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `=:=` to the original, encode to byte-identical `NEW_FUN_EXT`, still resolve to a callable lambda
   (a test lambda table stands in for `beam_engine`'s, since the wave DAG forbids
   `beam_message → beam_engine`), and `env[0]` is fixed up **into the destination heap** while the raw
-  `uniq`/`index` descriptor words are copied verbatim.
+  `uniq`/`index` descriptor words are copied verbatim. The same frozen layout makes an `External`
+  (`EXPORT_EXT`) fun the 4-word block `fun_words(External, 0) == 4` (`fun_desc_words(External) == 3`,
+  descriptor `[module, function, arity]`), copied verbatim — true-arity word included, read back with
+  `fun_true_arity` (the External case itself is exercised in `tests/classes.rs`).
 - `tests/fragments.rs` — the message-fragment evidence: a payload larger than the receiver heap makes
   plain `send` fail with `AllocKind::Message` **and leave `to_heap.used() == 0` and the destination
   table empty**; the same `CopyContext` then drives `send_fragmented` (proving the retry needs no

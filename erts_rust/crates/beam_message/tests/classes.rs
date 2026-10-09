@@ -419,19 +419,31 @@ fn an_external_export_fun_copies_the_module_and_function() {
     let mut atoms = AtomTable::new();
     let module = atoms.intern("lists");
     let function = atoms.intern("reverse");
+    let arity = 2;
 
     let mut src = src_heap();
-    // SAFETY: `fun_words(External, 0)` words are reserved.
+    // SAFETY: `fun_words(External, 0)` words (the 4-word block) are reserved.
     let fun = unsafe {
         let hp = src.alloc_words(fun_words(FunKind::External, 0)).expect("fits");
-        write_fun_external(hp, 1, module, function).expect("a valid external fun")
+        write_fun_external(hp, arity, module, function).expect("a valid external fun")
     };
 
     let mut dst = dest_for(fun);
     let copy = copy_into(fun, &mut dst);
     assert_faithful_copy(fun, copy, &atoms);
-    assert_eq!(size_object(fun), 1 + 2, "header + module + function");
-    assert_eq!(dst.used(), 3);
+    assert_eq!(size_object(fun), 1 + 3, "header + module + function + arity");
+    assert_eq!(dst.used(), 4, "the whole 4-word block is copied");
+    // The 4-word block is copied verbatim, so the true arity (descriptor word 3, reached through
+    // `fun_true_arity` rather than the masked header field) survives the copy.
+    // SAFETY: `fun` and `copy` are live external-fun terms.
+    let (src_arity, copied_arity) = unsafe {
+        (
+            fun_true_arity(fun).expect("a valid external fun"),
+            fun_true_arity(copy).expect("the copy is a valid external fun"),
+        )
+    };
+    assert_eq!(copied_arity, src_arity, "the copied arity word equals the source's");
+    assert_eq!(copied_arity, arity);
 }
 
 #[test]
