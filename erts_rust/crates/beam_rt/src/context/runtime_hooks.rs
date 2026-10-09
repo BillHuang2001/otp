@@ -40,6 +40,7 @@
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
 //! | `erlang:statistics/1` | `run_queue`; `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `scheduler_wall_time` (`undefined`, never enabled) |
 //! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
+//! | `net_kernel:dflag_unicode_io/1` | `true` for a local pid (a `badarg` for a non-pid; the typed gap for a remote pid) — the io-device read path's unicode fast-path probe |
 //!
 //! Every **other** `(module, function, arity)` answers the same typed capability gap the
 //! defaulted seam does (see [`RuntimeHooksBridge::call`]), so installing this bridge never
@@ -528,6 +529,35 @@ impl<'a> RuntimeHooksBridge<'a> {
         }
     }
 
+    /// `net_kernel:dflag_unicode_io/1` — whether the distribution unicode-IO flag is set for
+    /// the node `Pid` belongs to.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): a non-pid argument is `badarg`; a pid whose
+    /// distribution entry is **this** node answers the atom `true`
+    /// (`dist.c:6693-6709`'s `net_kernel_dflag_unicode_io_1`, whose
+    /// `de == erts_this_dist_entry` arm short-circuits to `am_true` *before* reading any
+    /// flags). This runtime is a single node, so a **local** pid always answers `true`. A
+    /// **remote** pid would need the peer's negotiated `DFLAG_UNICODE_IO`, but the accepted
+    /// links (`crate::dist::DistConnection`) expose no peer-flag accessor and a pid term
+    /// carries no link identity, so the honest answer is the typed capability gap rather
+    /// than a fabricated `true`. `lib/stdlib/src/io.erl`'s `bc_req/3` reads this flag on
+    /// every `io:request/2`, so serving the local case is what lets the io-device read path
+    /// (`file:read/2`, `io:scan_erl_exprs/4`, …) run at all.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-pid; the typed gap for a remote pid.
+    fn dflag_unicode_io(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let term = *args.first().ok_or(BeamError::BadArg)?;
+        match PidTarget::from_eterm(term) {
+            Ok(PidTarget::Local(_)) => atom_term(atoms, "true"),
+            Ok(PidTarget::Remote(_)) => Err(error::unsupported(
+                "net_kernel:dflag_unicode_io/1 on a remote pid: distribution is not implemented",
+            )),
+            Err(_) => Err(BeamError::BadArg),
+        }
+    }
+
     /// `erts_internal:erase_persistent_terms/0` — erase **every** persistent term.
     ///
     /// Oracle-verified (OTP 29/`erts-17.1`): answers `true`. This is the test suite's reset
@@ -851,6 +881,7 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             ("erlang", "cancel_timer", 2) => self.cancel_timer_2(heap, args),
             ("erlang", "function_exported", 3) => self.function_exported(heap, atoms, args),
             ("os", "set_signal", 2) => self.set_signal(atoms, args),
+            ("net_kernel", "dflag_unicode_io", 1) => self.dflag_unicode_io(atoms, args),
             ("erlang", "link", 1) => self.link(args, false),
             ("erlang", "unlink", 1) => self.link(args, true),
             ("erlang", "dt_spread_tag", 1) => self.dt_spread_tag(atoms, args),

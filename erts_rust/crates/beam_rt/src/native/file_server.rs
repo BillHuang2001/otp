@@ -244,19 +244,27 @@ impl Runtime {
         // The io-device protocol: {file_request|io_request, From, ReplyAs, Request}.
         if fields.len() == 4 {
             let tag = self.atom_name(fields[0]);
-            if tag.as_deref() == Some("file_request") || tag.as_deref() == Some("io_request") {
-                let Ok(from) = ProcessId::from_eterm(fields[1]) else {
-                    return Ok(None);
-                };
-                let reply_as = fields[2];
-                let (reply, retire) = self.serve_device_request(service, fields[3])?;
-                if retire {
-                    self.file_services.devices.remove(&service);
-                }
-                let tag_atom = self.atom(&tag.expect("checked above"))?;
-                let envelope = self.tuple(&[tag_atom, reply_as, reply])?;
-                return Ok(Some((from, envelope)));
+            // The reply tag is **paired** with the request tag, never echoed:
+            // `file_io_server`'s `file_reply/3`/`io_reply/3` answer `{file_request, …}` with
+            // `{file_reply, ReplyAs, Reply}` and `{io_request, …}` with
+            // `{io_reply, ReplyAs, Reply}` (`file_io_server.erl:199-239`), and every caller
+            // matches the reply on its own tag (`io.erl:1670`'s `execute_request`).
+            let reply_tag = match tag.as_deref() {
+                Some("file_request") => "file_reply",
+                Some("io_request") => "io_reply",
+                _ => return Ok(None),
+            };
+            let Ok(from) = ProcessId::from_eterm(fields[1]) else {
+                return Ok(None);
+            };
+            let reply_as = fields[2];
+            let (reply, retire) = self.serve_device_request(service, fields[3])?;
+            if retire {
+                self.file_services.devices.remove(&service);
             }
+            let tag_atom = self.atom(reply_tag)?;
+            let envelope = self.tuple(&[tag_atom, reply_as, reply])?;
+            return Ok(Some((from, envelope)));
         }
         // The gen_server protocol: {'$gen_call', {Pid, Tag}, Request}.
         if fields.len() == 3 && self.atom_name(fields[0]).as_deref() == Some("$gen_call") {
