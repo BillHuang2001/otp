@@ -238,7 +238,8 @@ Current: **539 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[c
 - `src/drivers/inet/` → the `tcp_inet` driver + read-path framing (child node `src/drivers/inet/CONTEXT.md`)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
 - `src/abi/` → the driver C-ABI host layer (child node `src/abi/CONTEXT.md`)
-- `src/error.rs` → `pub(crate)` error constructors, `errno_atom`, `spawn_failure`
+- `src/io_device/` → the io-device request layer (`{get_until, Enc, Prompt, Mod, Func, XtraArgs}`): `IoDevice`/`Encoding`/`ByteSource`/`SliceSource`/`EmptySource` + the `Continuation` seam (`ContData`/`Applied`/`Leftover`/`NoEngineContinuation`)/`read_size`; sub-files `mod.rs`/`device.rs`/`encoding.rs`/`source.rs`/`continuation.rs`/`tests.rs`
+- `src/error.rs` → `pub(crate)` error constructors (`badarg`/`io`/`system_limit`/`notsup`/`unsupported`/`spawn_failure`/`driver_init_failed`), `errno_atom`
 - `tests/poller.rs` (11) → reactor gate: registration/readiness on real pipes/socketpairs (`key`, no-events, `reregister` flip, `deregister`, double-register), timeout/waker, `EINTR` tolerance
 - `tests/port.rs` (4) → the `open`→`output`→`poll`→`handle_events`→`read_input` round-trip, `close` id release, `open_named`, unknown keys incl.
   `WAKER_KEY`
