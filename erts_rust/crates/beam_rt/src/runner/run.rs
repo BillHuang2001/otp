@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use beam_common::Result;
 use beam_engine::context::RootSet;
-use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome, Tier};
+use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome};
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 
 use crate::context::gc;
@@ -130,6 +130,17 @@ impl ProcessRunner for RuntimeRunner<'_> {
     /// no `test_heap`) has no admission point and therefore runs to its next
     /// `return`/`wait` without being pre-empted — the honest limit, reported as such.
     ///
+    /// # Execution tier
+    ///
+    /// The tier ([`Tier`](beam_engine::Tier)) is selected **once**, on the process's first
+    /// entry (`super::tier`), and remembered on its engine (`ProcessEngine::tier`); every
+    /// later slice — a pre-emption or a `receive` park — resumes on that **same** tier
+    /// through [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier),
+    /// so a native-tier process is never silently demoted to the interpreter mid-life. A
+    /// process whose remembered tier is [`Tier::Interpreter`](beam_engine::Tier::Interpreter)
+    /// behaves exactly as it always did (the dispatcher delegates to the plain
+    /// [`Machine::resume_outcome`](beam_engine::Machine::resume_outcome)).
+    ///
     /// # Errors
     ///
     /// * a typed diagnostic when `pid` has no registered engine (a pid the runtime did
@@ -183,17 +194,22 @@ impl ProcessRunner for RuntimeRunner<'_> {
             _ => None,
         };
 
-        // The execution tier for this process's **first** entry, resolved *before* the
-        // context borrows the runtime: the switch-safety predicate reads `Runtime`'s
-        // `registry`/`nifs`, which `for_process_with_engines` takes mutably below. A
-        // resumed process continues the machine it suspended in — the resume path has no
-        // tier entry — so a parked process needs no selection (the interpreter is the
-        // unused, always-correct value). A fun entry whose local target is only resolved
-        // by that first run reports no module here, and is conservatively interpreted.
-        let tier_mode = self.state.jit_mode();
+        // The slice's execution tier: selected at the process's **first** entry (resolved
+        // *before* the context borrows the runtime, because the switch-safety predicate reads
+        // `Runtime`'s `registry`/`nifs`, which `for_process_with_engines` takes mutably below)
+        // and then **remembered on the engine** (`ProcessEngine::tier`), so a resumed process —
+        // one that pre-empted on the reduction budget, or parked in a `receive` — re-enters on
+        // that same tier instead of falling back to the interpreter. A fun entry whose local
+        // target is only resolved by that first run reports no module here, and is
+        // conservatively interpreted.
         let tier = match engine.parked {
-            Some(_) => Tier::Interpreter,
-            None => select_entry_tier(self.runtime, self.state, &engine.entry, tier_mode),
+            Some(_) => engine.tier,
+            None => {
+                let mode = self.state.jit_mode();
+                let selected = select_entry_tier(self.runtime, self.state, &engine.entry, mode);
+                engine.tier = selected;
+                selected
+            }
         };
         let (outcome, used, exhausted) = {
             // The context also gets the **engines** of this pass (`self.state`): it drives
@@ -252,18 +268,23 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 Ok(()) => match engine.parked {
                     // A resume continues the SAME machine: the registers, the Erlang stack and
                     // the frames of the suspended `receive` must survive, so this deliberately
-                    // does not reset (see `Machine::resume_outcome`). The entry module is the
+                    // does not reset (see `Machine::resume_outcome_with_tier`). It also
+                    // continues on the **same tier** the process was selected for (`tier`,
+                    // remembered on the engine), so a native-tier process is not demoted to the
+                    // interpreter after its first slice. The entry module is the
                     // module the suspended `(func, pc)` are named against — the export's own
                     // module, or the module a fun entry resolved to. A parked fun entry with
                     // **no** resolved target is unreachable (it is applied synchronously and
                     // never returns a resume address) and is reported as a typed capability
                     // gap rather than run as a wrong (or empty) function.
                     Some((func, pc)) => match engine.entry.entry_module() {
-                        Some(module) => {
-                            engine
-                                .machine
-                                .resume_outcome(module, func, pc, &mut budget_ctx)
-                        }
+                        Some(module) => engine.machine.resume_outcome_with_tier(
+                            module,
+                            func,
+                            pc,
+                            &mut budget_ctx,
+                            tier,
+                        ),
                         None => Err(crate::error::unsupported(
                             "resume of a fun-bodied process with no local entry",
                         )),
@@ -287,9 +308,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
                             // path would become the process's exit reason. `tier` is
                             // `Tier::Interpreter` for every module the predicate cannot
                             // prove safe; the argument and the exact conditions are in
-                            // `super::tier`. The resume path below always runs on the
-                            // interpreter (it has no tier entry), so both halves of a
-                            // parked-and-resumed process stay equivalent.
+                            // `super::tier`. The resume path above re-enters on the tier this
+                            // process was selected for (remembered in `ProcessEngine::tier`),
+                            // so both halves of a parked-and-resumed process stay
+                            // tier-equivalent.
                             //
                             // The label entry stays the equivalence-preserving route to the
                             // export: `run_label_outcome_with_tier` calls `Machine::enter_run`,

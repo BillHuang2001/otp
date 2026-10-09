@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beam_common::{BeamError, ExitReason};
+use beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache};
 use beam_engine::{Machine, Tier};
 use beam_loader::{Function, Import, ImportRef, Instr, Label, Module, Operand};
 use beam_process::{ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms};
@@ -822,5 +823,242 @@ fn the_scheduler_path_computes_fib_under_the_selected_tier() {
     assert_eq!(
         signed_value(rt.process_result(pid).expect("the process returned")),
         55
+    );
+}
+
+// -- tier persistence across a resume (`resume_outcome_with_tier`) ---------
+
+/// The committed **allocating** tail-loop fixture, reused by relative path (never copied).
+///
+/// `alloc_loop/1` builds one cons cell per iteration, so the compiler emits a `test_heap` —
+/// the runner's one reduction-budget admission point — and a small budget therefore
+/// **pre-empts** it part-way through (see the fixture's own docs).
+fn preempt_fixture() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/preempt.beam"
+    )
+}
+
+/// `alloc_loop/1`'s result length: it returns `[N, N-1, …, 1]`.
+const PREEMPT_N: i64 = 50;
+
+/// Spawns `preempt:alloc_loop/1` as a process on `mode` and registers its engine.
+fn spawn_preempting_loop(
+    state: &mut RunnerState,
+    pid: ProcessId,
+    mode: JitMode,
+) -> Arc<Module> {
+    state.jit_mode = Some(mode);
+    let module = Arc::new(beam_loader::load_file(preempt_fixture()).expect("preempt.beam"));
+    let function = module
+        .atom_table
+        .lookup("alloc_loop")
+        .expect("alloc_loop is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module: Arc::clone(&module),
+            function,
+            arity: 1,
+        },
+        vec![make_small(PREEMPT_N)],
+    );
+    module
+}
+
+/// A process selected for the **baseline** tier that is pre-empted on the reduction budget
+/// resumes on that **same** tier.
+///
+/// The tier actually taken is proven through the per-thread compiled-block cache the baseline
+/// backend runs over: the first entry compiles `preempt` into it, and the **resume** brings
+/// the (emptied) entry back. A resume that fell back to the interpreter — the pre-tier-aware
+/// behaviour — compiles nothing, so the post-resume assertion is the discriminating one.
+#[test]
+fn a_preempted_process_resumes_on_its_baseline_tier() {
+    // The cache is per thread; start from a known state so the counts below are exact.
+    clear_baseline_cache();
+    assert_eq!(baseline_cache_len(), 0, "the per-thread cache starts empty");
+
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_preempting_loop(&mut state, pid, JitMode::Baseline);
+
+    // The first slice: the allocating loop spends its (tiny) budget and is pre-empted.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the budget pre-empts the loop");
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::BaselineJit),
+        "the tier chosen at the first entry is remembered on the engine"
+    );
+    assert!(
+        state
+            .engines
+            .get(&pid)
+            .is_some_and(|engine| engine.parked.is_some()),
+        "the pre-empted machine is parked at the exhausting instruction"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        1,
+        "the first entry ran on the baseline tier"
+    );
+
+    // Forget the compiled artifact: after this, only the resume's own tier lookup can bring
+    // the entry back.
+    clear_baseline_cache();
+    assert_eq!(baseline_cache_len(), 0);
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    let elements = beam_engine::terms::list_elements(state.result(pid).expect("recorded"))
+        .expect("alloc_loop returns a proper list");
+    assert_eq!(
+        elements.len(),
+        PREEMPT_N as usize,
+        "the two slices together ran the loop to completion"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        1,
+        "the resume ran on the remembered baseline tier (the interpreter compiles nothing)"
+    );
+}
+
+/// A process parked in a `receive` and woken by a message resumes on its remembered tier.
+///
+/// The discriminating observation is again the compiled-block cache: the parked slice ran on
+/// the baseline tier (it compiled the module), the cache is emptied while the process waits,
+/// and the **resume** puts the entry back — which only the baseline tier's resume path does.
+#[test]
+fn a_receive_parked_process_resumes_on_its_baseline_tier() {
+    clear_baseline_cache();
+    assert_eq!(baseline_cache_len(), 0, "the per-thread cache starts empty");
+
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    state.jit_mode = Some(JitMode::Baseline);
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    let module = Arc::new(beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam"));
+    let function = module
+        .atom_table
+        .lookup("wait_forever")
+        .expect("wait_forever is interned");
+    state.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 0,
+        },
+        Vec::new(),
+    );
+
+    // The first slice: `receive X -> X after infinity` parks on the empty mailbox.
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Wait, "the empty mailbox parks the receive");
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::BaselineJit),
+        "the tier chosen at the first entry is remembered on the engine"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        1,
+        "the first entry ran on the baseline tier"
+    );
+
+    clear_baseline_cache();
+    assert_eq!(baseline_cache_len(), 0);
+
+    // Wake the receiver: the message is copied into its own mailbox queue (the very queue the
+    // runner's receive seam scans). A delivery-driven collection may relocate its heap while
+    // it waits, which is why the parked machine published its roots.
+    table
+        .deliver_simple(pid, pid.to_eterm(), make_small(42))
+        .expect("the message is delivered");
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    assert_eq!(
+        signed_value(state.result(pid).expect("the received value is recorded")),
+        42,
+        "the resumed receive took the delivered message"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        1,
+        "the resume ran on the remembered baseline tier (the interpreter compiles nothing)"
+    );
+}
+
+/// An **interpreter**-tier process is unchanged: it still pre-empts and resumes, records the
+/// same result, and never compiles native code on either slice.
+#[test]
+fn an_interpreter_tier_process_is_unchanged_across_a_resume() {
+    clear_baseline_cache();
+
+    let mut rt = runtime();
+    let mut state = RunnerState::default();
+    let mut table = table();
+    let pid = table.spawn_default().expect("a fresh process");
+    spawn_preempting_loop(&mut state, pid, JitMode::Interpreter);
+
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 2)
+            .expect("the first slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Yield, "the budget pre-empts the loop");
+    assert_eq!(
+        state.engines.get(&pid).map(|engine| engine.tier),
+        Some(Tier::Interpreter),
+        "the interpreter tier is remembered just the same"
+    );
+
+    clear_baseline_cache();
+    let outcome = {
+        let mut runner = RuntimeRunner::new(&mut rt, &mut state);
+        runner
+            .run(pid, &mut table, 1_000_000)
+            .expect("the resume slice runs")
+    };
+    assert_eq!(outcome, ProcOutcome::Exit(normal(&mut rt)));
+    let elements = beam_engine::terms::list_elements(state.result(pid).expect("recorded"))
+        .expect("alloc_loop returns a proper list");
+    assert_eq!(
+        elements.len(),
+        PREEMPT_N as usize,
+        "the interpreter tier computes the same result across the resume"
+    );
+    assert_eq!(
+        baseline_cache_len(),
+        0,
+        "an interpreter-tier process compiles no native code on either slice"
     );
 }
