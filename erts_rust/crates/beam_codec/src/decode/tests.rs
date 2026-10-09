@@ -224,8 +224,9 @@
         assert_eq!(term, NIL);
         assert!(is_nil(term));
 
-        // An arity above `MAX_ARITYVAL` is a hard wire bound.
-        assert_system_limit(&[131, 105, 1, 0, 0, 0]);
+        // An arity above `MAX_ARITYVAL` is a hard wire bound; like every other decode
+        // failure the oracle reports `badarg` (never `system_limit`).
+        assert_bad_arg(&[131, 105, 1, 0, 0, 0]);
         // `MAX_ARITYVAL` itself is only rejected for lack of elements.
         assert_bad_arg(&[131, 105, 0, 255, 255, 255]);
     }
@@ -371,8 +372,9 @@
         assert_eq!(term, make_small(0));
 
         // More base-256 bytes than `BIG_ARITY_MAX * sizeof(ErtsDigit)` (524280) is a
-        // hard wire bound (`external.c:6146`).
-        assert_system_limit(&[131, 111, 0, 8, 0, 25]);
+        // hard wire bound (`external.c:6146`) — reported as `badarg` like every other
+        // decode failure (the oracle answers `badarg`).
+        assert_bad_arg(&[131, 111, 0, 8, 0, 25]);
     }
 
     #[test]
@@ -514,8 +516,9 @@
         assert_bad_arg(&[131, 88, 97, 5, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);
         assert_bad_arg(&[131, 101, 106, 0, 0, 0, 1, 5]);
 
-        // `NEWER_REFERENCE_EXT` carries at most five ids.
-        assert_system_limit(&[131, 90, 0, 6]);
+        // `NEWER_REFERENCE_EXT` carries at most five ids; an over-long count is a wire
+        // bound and therefore `badarg` in the oracle.
+        assert_bad_arg(&[131, 90, 0, 6]);
     }
 
     #[test]

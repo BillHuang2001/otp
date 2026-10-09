@@ -49,7 +49,7 @@ use beam_common::Result;
 use beam_term::prelude::{atom_val, make_small, MAX_ARITYVAL};
 use beam_term::{AtomTable, Eterm};
 
-use crate::error::{bad_arg, system_limit};
+use crate::error::bad_arg;
 use crate::term::{make_record, record_def_size_words};
 
 use super::Decoder;
@@ -63,8 +63,9 @@ impl<'a> Decoder<'a> {
     /// and values are read in **declaration** order and the block is allocated
     /// **after** all values are decoded, so a malformed tail never leaves a
     /// half-built record. A field count whose definition arity would overflow
-    /// `MAX_ARITYVAL` is `BeamError::SystemLimit` (checked before any allocation); a
-    /// duplicate key is `BadArg`.
+    /// `MAX_ARITYVAL` is a `BeamError::BadArg` (checked before any allocation, as
+    /// the C routes every decode failure — bounds included — to `B2TBadArg`,
+    /// `external.c:1989-1991`); a duplicate key is `BadArg` too.
     ///
     /// **Cached definition hash.** The definition's word 2 carries
     /// `make_hash2({module,name,is_exported,keys-in-declaration-order})` — exactly what
@@ -85,12 +86,14 @@ impl<'a> Decoder<'a> {
         let name = self.decode_node_atom(heap, atoms)?;
 
         // A count whose definition arity would not fit the header's arity field is a
-        // `SystemLimit` (the wire can declare more fields than a term can hold). This
-        // is the one `write_record` size guard, checked before the block is allocated
-        // (and before the loop below), so the remaining failure from `make_record` can
-        // only be a duplicate key (`BadArg`).
+        // `BadArg` (the wire can declare more fields than a term can hold): the C
+        // routes every decode failure, bounds included, to `B2TBadArg`
+        // (`external.c:1989-1991`), so the oracle answers `badarg`, never
+        // `system_limit`. This is the one `write_record` size guard, checked before the
+        // block is allocated (and before the loop below), so the remaining failure from
+        // `make_record` can only be a duplicate key (`BadArg`).
         if record_def_size_words(num_fields).saturating_sub(1) > MAX_ARITYVAL {
-            return Err(system_limit());
+            return Err(bad_arg());
         }
 
         // Keys and values are both in declaration order; a key must be an atom.
@@ -276,9 +279,10 @@ mod tests {
     }
 
     #[test]
-    fn a_field_count_past_max_arityval_is_a_system_limit() {
+    fn a_field_count_past_max_arityval_is_bad_arg() {
         // `record_def_size_words(n) - 1 > MAX_ARITYVAL` — the wire can declare more
-        // fields than the record header's arity field can hold.
+        // fields than the record header's arity field can hold. A wire bound, so the
+        // oracle's `binary_to_term` answers `badarg` (never `system_limit`).
         let mut image = vec![131u8, RECORD_EXT];
         image.extend_from_slice(&u32::MAX.to_be_bytes());
         image.push(0);
@@ -288,7 +292,7 @@ mod tests {
         let mut decoder = Decoder::new(&image).unwrap();
         assert!(matches!(
             decoder.decode(&mut heap, &mut atoms),
-            Err(BeamError::SystemLimit)
+            Err(BeamError::BadArg)
         ));
     }
 }

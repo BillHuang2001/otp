@@ -246,9 +246,12 @@ impl<'a> Decoder<'a> {
             Tag::NewerReference => {
                 let len = usize::from(self.reader.u16be()?);
                 // `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`); `make_external_ref`
-                // enforces the same bound.
+                // enforces the same bound. The count bound is a *wire* bound, and the
+                // C routes every decode failure — bounds included — to `B2TBadArg`
+                // (`binary_to_term_int`, `external.c:1989-1991`), so the oracle reports
+                // **`badarg`** here, never `system_limit` (verified against erts-17.1).
                 if len > crate::term::MAX_REF_IDS {
-                    return Err(system_limit());
+                    return Err(bad_arg());
                 }
                 let node = self.decode_node_atom(heap, atoms)?;
                 let creation = self.reader.u32be()?;
@@ -313,8 +316,13 @@ impl<'a> Decoder<'a> {
                     usize::from(self.reader.u8()?)
                 } else {
                     let arity = self.reader.u32be()? as usize;
+                    // The arity is a wire bound, and the C routes every decode failure
+                    // — bounds included — to `B2TBadArg` (`binary_to_term_int`,
+                    // `external.c:1989-1991`), so the oracle reports **`badarg`** for
+                    // an over-long arity, never `system_limit` (verified: erts-17.1
+                    // answers `badarg` for `<<131,105,1,0,0,0>>`).
                     if arity > MAX_ARITYVAL {
-                        return Err(system_limit());
+                        return Err(bad_arg());
                     }
                     arity
                 };
@@ -546,8 +554,13 @@ impl<'a> Decoder<'a> {
             usize::from(self.reader.u8()?)
         } else {
             let count = self.reader.u32be()? as usize;
+            // A byte count past `BIG_ARITY_MAX * sizeof(ErtsDigit)`
+            // (`external.c:6146`) is a *wire* bound, and the C routes every decode
+            // failure — bounds included — to `B2TBadArg` (`binary_to_term_int`,
+            // `external.c:1989-1991`): the oracle reports **`badarg`**, never
+            // `system_limit` (verified: 524281 bytes ⇒ `badarg`, 524280 ⇒ `ok`).
             if count > BIG_ARITY_MAX * BIG_DIGIT_BYTES {
-                return Err(system_limit());
+                return Err(bad_arg());
             }
             count
         };

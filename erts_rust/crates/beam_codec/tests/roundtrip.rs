@@ -2022,10 +2022,12 @@ fn over_long_atoms_are_bad_arg() {
 }
 
 #[test]
-fn oversized_bignums_are_system_limit() {
+fn oversized_bignums_are_bad_arg() {
     // `LARGE_BIG_EXT` with a byte count past `BIG_ARITY_MAX * sizeof(ErtsDigit)`
-    // (65535 * 8 = 524280 bytes, `external.c:6146`).
-    assert_system_limit(&[VERSION_MAGIC, LARGE_BIG_EXT, 0x00, 0x08, 0x00, 0x19]);
+    // (65535 * 8 = 524280 bytes, `external.c:6146`). The bound is a wire bound, and
+    // the C routes every decode failure — bounds included — to `B2TBadArg`
+    // (`external.c:1989-1991`), so the oracle answers `badarg`, not `system_limit`.
+    assert_bad_arg(&[VERSION_MAGIC, LARGE_BIG_EXT, 0x00, 0x08, 0x00, 0x19]);
 
     // Building such a bignum is rejected by the constructor as well (the bound is on
     // the digit count).
