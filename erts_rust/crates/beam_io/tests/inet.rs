@@ -57,6 +57,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use beam_common::BeamError;
+use beam_io::drivers::inet::{
+    INET_LOPT_ACTIVE, INET_LOPT_LINE_DELIM, INET_LOPT_PACKET, INET_LOPT_PACKET_SIZE,
+    INET_LOPT_TCP_SEND_TIMEOUT, INET_LOPT_TCP_SEND_TIMEOUT_CLOSE,
+};
 use beam_io::prelude::*;
 use beam_process::PortId;
 
@@ -728,4 +732,156 @@ fn the_socket_option_replies_agree_with_the_erl_oracle() {
     assert_eq!(oracle[11], vec![INET_REP_OK], "a partial setopts record is ignored");
     assert_eq!(oracle[12], vec![INET_REP_OK], "an empty getopts payload");
     assert_eq!(oracle[13], vec![INET_REP_OK], "an empty setopts payload");
+}
+
+// ---------------------------------------------------------------------------
+// The driver-state option codes
+// ---------------------------------------------------------------------------
+
+/// The Erlang side of the **driver-state option** cross-check: it opens a real `"tcp_inet"` port
+/// (`open_port({spawn_driver, …})`, as `prim_inet.erl:103` does), `open`s/`bind`s/`listen`s it and
+/// runs one default read-back plus one `set`/read-back pair per settable **driver-state** code —
+/// `{packet, …}` (`23`), `{packet_size, …}` (`32`), `{send_timeout_close, …}` (`35`) and
+/// `{send_timeout, …}` (`30`) — and a `getopts` of the **set-only** `{line_delim, …}` (`40`),
+/// printing each reply as comma-separated bytes separated by `|`.
+///
+/// `{active, …}` (`22`) is read back in the opening multi-code `getopts` (its default is
+/// `active,false`, so no trailing two-byte `N` is appended); `send_timeout`/`send_timeout_close`
+/// are gated on a stream socket, so they only report after the `open`.
+fn oracle_driver_state_expression() -> String {
+    format!(
+        "M = {CONTROL_MAGIC}, \
+         P = open_port({{spawn_driver, \"tcp_inet\"}}, [binary]), \
+         F = fun(C, A) -> binary_to_list(iolist_to_binary(erlang:port_control(P, C + M, A))) end, \
+         _ = F({INET_REQ_OPEN}, <<1,1,0>>), \
+         _ = F({INET_REQ_BIND}, <<4,0,0>>), \
+         _ = F({INET_REQ_LISTEN}, <<0,5>>), \
+         R = [F({INET_REQ_GETOPTS}, <<{INET_LOPT_ACTIVE},{INET_LOPT_PACKET},\
+                                     {INET_LOPT_PACKET_SIZE}>>), \
+              F({INET_REQ_SETOPTS}, <<{INET_LOPT_PACKET},0,0,0,2>>), \
+              F({INET_REQ_GETOPTS}, <<{INET_LOPT_PACKET}>>), \
+              F({INET_REQ_SETOPTS}, <<{INET_LOPT_PACKET_SIZE},0,0,4,0>>), \
+              F({INET_REQ_GETOPTS}, <<{INET_LOPT_PACKET_SIZE}>>), \
+              F({INET_REQ_SETOPTS}, <<{INET_LOPT_TCP_SEND_TIMEOUT_CLOSE},0,0,0,1>>), \
+              F({INET_REQ_GETOPTS}, <<{INET_LOPT_TCP_SEND_TIMEOUT_CLOSE}>>), \
+              F({INET_REQ_SETOPTS}, <<{INET_LOPT_TCP_SEND_TIMEOUT},0,0,19,136>>), \
+              F({INET_REQ_GETOPTS}, <<{INET_LOPT_TCP_SEND_TIMEOUT}>>), \
+              F({INET_REQ_GETOPTS}, <<{INET_LOPT_LINE_DELIM}>>)], \
+         S = fun(L) -> lists:flatten(lists:join(\",\", [integer_to_list(B) || B <- L])) end, \
+         io:format(\"~s~n\", [lists:flatten(lists:join(\"|\", [S(L) || L <- R]))])"
+    )
+}
+
+/// The driver-state half of the compatibility gate for the `getopts`/`setopts` vocabulary: the
+/// **same** sequence over the driver-state codes (`22` `23` `30` `32` `35` `40`) run against the
+/// real system `tcp_inet` driver must answer the same reply bytes this floor answers — the
+/// `active`/`packet`/`packet_size` defaults in request order, each set/read-back pair, and the
+/// set-only `line_delim` read-back, whose unserved code replaces the **whole** reply with
+/// `[0] ++ "einval"`. Nothing is hard-coded for the settable values: the comparison is
+/// byte-for-byte against the oracle's dump, and the defaults and the set-only error are asserted
+/// separately so the measured behaviour is on the record.
+///
+/// If `erl` is absent the check **skips loudly**, never fails.
+#[test]
+fn the_driver_state_option_replies_agree_with_the_erl_oracle() {
+    let Some(stdout) = erl_stdout(&oracle_driver_state_expression()) else {
+        return; // the oracle is unavailable; the check skipped loudly above
+    };
+    let Some(oracle) = parse_reply_dump(&stdout) else {
+        panic!("could not parse the oracle reply dump: {stdout:?}");
+    };
+    assert_eq!(oracle.len(), 10, "ten replies: {oracle:?}");
+
+    // The Rust side runs the identical sequence against this floor.
+    let mut poller = poller();
+    let (mut ports, id) = tcp_port(&mut poller);
+    listen_on_loopback(&mut poller, &mut ports, id);
+    let rust: Vec<Vec<u8>> = vec![
+        control(
+            &mut ports,
+            &mut poller,
+            id,
+            "getopts",
+            &[INET_LOPT_ACTIVE, INET_LOPT_PACKET, INET_LOPT_PACKET_SIZE],
+        ),
+        control(&mut ports, &mut poller, id, "setopts", &[INET_LOPT_PACKET, 0, 0, 0, 2]),
+        control(&mut ports, &mut poller, id, "getopts", &[INET_LOPT_PACKET]),
+        control(
+            &mut ports,
+            &mut poller,
+            id,
+            "setopts",
+            &[INET_LOPT_PACKET_SIZE, 0, 0, 4, 0],
+        ),
+        control(&mut ports, &mut poller, id, "getopts", &[INET_LOPT_PACKET_SIZE]),
+        control(
+            &mut ports,
+            &mut poller,
+            id,
+            "setopts",
+            &[INET_LOPT_TCP_SEND_TIMEOUT_CLOSE, 0, 0, 0, 1],
+        ),
+        control(
+            &mut ports,
+            &mut poller,
+            id,
+            "getopts",
+            &[INET_LOPT_TCP_SEND_TIMEOUT_CLOSE],
+        ),
+        control(
+            &mut ports,
+            &mut poller,
+            id,
+            "setopts",
+            &[INET_LOPT_TCP_SEND_TIMEOUT, 0, 0, 19, 136],
+        ),
+        control(&mut ports, &mut poller, id, "getopts", &[INET_LOPT_TCP_SEND_TIMEOUT]),
+        control(&mut ports, &mut poller, id, "getopts", &[INET_LOPT_LINE_DELIM]),
+    ];
+    ports.close(&mut poller, id).expect("closes the port");
+
+    eprintln!("oracle driver-state replies: {oracle:?}");
+    eprintln!("rust driver-state replies:   {rust:?}");
+
+    // Every reply must match byte for byte.
+    assert_eq!(rust.len(), oracle.len(), "one reply per step");
+    for (index, (rust_reply, oracle_reply)) in rust.iter().zip(oracle.iter()).enumerate() {
+        assert_eq!(rust_reply, oracle_reply, "reply {index} disagrees");
+    }
+
+    // The oracle's own values, on the record: the `active`/`packet`/`packet_size` defaults are the
+    // C descriptor's (`active,false`, `raw`, `0`), reported in request order.
+    assert_eq!(
+        oracle[0],
+        vec![
+            1, INET_LOPT_ACTIVE, 0, 0, 0, 0, // `{active, false}` — no trailing `N`
+            INET_LOPT_PACKET, 0, 0, 0, 0, // `{packet, raw}`
+            INET_LOPT_PACKET_SIZE, 0, 0, 0, 0, // `{packet_size, 0}`
+        ],
+        "the driver-state defaults"
+    );
+    // Each set/read-back pair echoes the value that was set, big-endian.
+    assert_eq!(oracle[2], vec![1, INET_LOPT_PACKET, 0, 0, 0, 2], "the `packet` read-back");
+    assert_eq!(
+        oracle[4],
+        vec![1, INET_LOPT_PACKET_SIZE, 0, 0, 4, 0],
+        "the `packet_size` read-back"
+    );
+    assert_eq!(
+        oracle[6],
+        vec![1, INET_LOPT_TCP_SEND_TIMEOUT_CLOSE, 0, 0, 0, 1],
+        "the `send_timeout_close` read-back"
+    );
+    assert_eq!(
+        oracle[8],
+        vec![1, INET_LOPT_TCP_SEND_TIMEOUT, 0, 0, 19, 136],
+        "the `send_timeout` read-back"
+    );
+    // `line_delim` is set-only: a `getopts` naming it is the C's `default: RETURN_ERROR()`, which
+    // replaces the whole reply rather than contributing a record.
+    assert_eq!(
+        oracle[9],
+        ctl_xerror("einval"),
+        "getopts of the set-only line_delim"
+    );
 }

@@ -693,6 +693,73 @@ fn a_reselection_declining_the_callback_clears_the_stop_select_obligation() {
     registry.close(&mut poller, id).expect("the port closes");
 }
 
+/// `stop_select` is owed **exactly once per release**: re-selecting an `ERL_DRV_USE` fd (with or
+/// without repeating the bit) fires nothing extra, the deselect fires it once, and a *new*
+/// selection after that release owes its own single callback.
+///
+/// This is the "exactly once per port" property of the sticky `ERTS_EV_FLAG_USED` bookkeeping: the
+/// obligation lives with the registration, is merged (never multiplied) by a re-select, and is
+/// consumed exactly once when the registration is released — whether that release is a deselect,
+/// port teardown or a `Drop`. The fixture's `stop_select` appends one line per call, so the *count*
+/// of those lines is the assertion.
+#[test]
+fn a_use_selection_owes_stop_select_exactly_once_per_release() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let probe = logged_port_command("stop-select-once-per-release");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
+
+    // Select USE, then re-select twice — once repeating USE, once plain (`READ`).
+    registry
+        .port_control(&mut poller, id, "9", &[])
+        .expect("control verb 9 selects READ|USE");
+    registry
+        .port_control(&mut poller, id, "9", &[])
+        .expect("control verb 9 re-selects READ|USE");
+    registry
+        .port_control(&mut poller, id, "11", &[])
+        .expect("control verb 11 re-selects plain READ");
+    assert_eq!(
+        poller.len(),
+        1,
+        "the re-selections re-register the same fd rather than adding a second registration"
+    );
+    assert_eq!(
+        log_lines(&probe.log),
+        vec!["start".to_string()],
+        "a live ERL_DRV_USE selection owes nothing yet — a re-selection fires no stop_select"
+    );
+
+    // The deselect releases the registration and fires the callback exactly once.
+    registry
+        .port_control(&mut poller, id, "12", &[])
+        .expect("control verb 12 de-selects");
+    assert_eq!(
+        count_line(&log_lines(&probe.log), "stop_select"),
+        1,
+        "three selects and one deselect owe exactly one release callback"
+    );
+
+    // A fresh selection takes on a fresh obligation, released once more at teardown.
+    registry
+        .port_control(&mut poller, id, "9", &[])
+        .expect("control verb 9 selects READ|USE again");
+    registry.close(&mut poller, id).expect("the port closes");
+    let lines = log_lines(&probe.log);
+    assert_eq!(
+        count_line(&lines, "stop_select"),
+        2,
+        "one callback per released selection: the deselect's and the teardown's; log = {lines:?}"
+    );
+    assert_eq!(
+        count_line(&lines, "stop"),
+        1,
+        "teardown ran the driver's stop exactly once; log = {lines:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // `port_control/3` -> the C driver's `control` callback
 // ---------------------------------------------------------------------------------------------

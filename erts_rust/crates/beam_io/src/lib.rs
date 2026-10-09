@@ -58,6 +58,10 @@
 //! floor. It is deliberately *not* used by `beam_abi`'s own loaders, which would close a
 //! dependency cycle (`beam_io` depends on `beam_abi`); see [`ddll`]'s module docs.
 //!
+//! The [`cpu_time`] module is the **CPU-time facility** — a safe `getrusage(2)`/
+//! `clock_gettime(2)` floor (the raw syscalls `beam_rt` cannot issue) plus [`RuntimeClock`],
+//! the `erlang:statistics(runtime)` counter with the oracle's `{Total, SinceLastCall}`
+//! semantics.//!
 //! # Status
 //!
 //! Milestone-1 is implemented (see this crate's `CONTEXT.md`, Milestone-1 scope): the
@@ -89,6 +93,7 @@
 #![warn(missing_docs)]
 
 pub mod abi;
+pub mod cpu_time;
 pub mod ddll;
 pub mod driver;
 pub mod drivers;
@@ -103,6 +108,7 @@ pub mod timer;
 mod error; // `pub(crate)` constructors only — NOT public
 
 pub use crate::abi::*;
+pub use crate::cpu_time::*;
 pub use crate::ddll::*;
 pub use crate::driver::*;
 pub use crate::drivers::*;
@@ -127,11 +133,13 @@ pub use crate::timer::*;
 /// [`PortHost`], [`AbiHost`], [`LocalAtomPortHost`], [`DriverState`], [`AsyncJobs`],
 /// [`make_loaded`], [`DriverTable`], [`RegisteredDriver`]) and the timer/queue helpers
 /// ([`Timeout`], [`Timer`], [`ByteQueue`]) plus the OS-signal facility ([`Signal`],
-/// [`Disposition`], [`SignalFacility`]) and the dynamic-library primitive ([`DynLib`],
+/// [`Disposition`], [`SignalFacility`]), the dynamic-library primitive ([`DynLib`],
 /// [`DynLibFlags`], [`DllError`], [`DllErrorKind`], [`ERRCODE_TAB`], [`format_error_text`])
-/// into scope.
+/// and the CPU-time facility ([`CpuTimes`], [`process_cpu_times`], [`thread_cpu_times`],
+/// [`RuntimeClock`]) into scope.
 pub mod prelude {
     pub use crate::abi::*;
+    pub use crate::cpu_time::*;
     pub use crate::ddll::*;
     pub use crate::driver::*;
     pub use crate::drivers::*;

@@ -57,45 +57,11 @@
 
 mod cdriver;
 
-use std::time::{Duration, Instant};
-
-use beam_io::prelude::*;
-use beam_process::PortId;
+use beam_abi::driver::host::DriverEnv;
+use beam_abi::driver::types::ErlDrvPort;
+use beam_io::prelude::{AbiHost, LocalAtomPortHost};
 
 use cdriver::*;
-
-/// How long a test waits for a worker-thread log line or a completion to be drained.
-///
-/// Generous relative to the work (the slow job sleeps 500 ms): it only has to absorb a loaded test
-/// runner, so a real hang still fails rather than passing slowly.
-const ASYNC_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Drives the port's async completions until at least one job is processed, or `timeout` elapses
-/// (a panic — never a silent pass).
-///
-/// The drive point is [`PortRegistry::drive_async`], which `DriverPort` maps onto the C entry's
-/// `ready_async`/`async_free` (there is no `PortTaskKind::Async` in M1).
-fn drive_until_drained(
-    poller: &mut Poller,
-    registry: &mut PortRegistry,
-    id: PortId,
-    timeout: Duration,
-) -> usize {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let processed = registry
-            .drive_async(poller, id)
-            .expect("the async drive point runs");
-        if processed > 0 {
-            return processed;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the driver_async job's completion was never drained by the drive point within {timeout:?}"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
 
 /// The `handle=<%p>` lines of the fixture's callback log (the `hdl` token makes one per callback).
 fn handle_lines(lines: &[String]) -> Vec<String> {
@@ -106,13 +72,25 @@ fn handle_lines(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Waits a short, bounded time and re-reads the log, so a "runs exactly once" assertion cannot be
-/// fooled by a second release that lands a moment after the first.
-fn settle_log(path: &std::path::Path) -> Vec<String> {
-    std::thread::sleep(Duration::from_millis(150));
-    log_lines(path)
+/// The fixture's callback log reduced to its *shape*: every `handle=<%p>` line becomes `"handle"`,
+/// every other line stays as it is.
+///
+/// The `hdl` token makes the fixture append a `handle=` line **inside** each callback that runs
+/// (`start`/`output`/`stop`), so the shape shows which callback each logged handle came from — the
+/// property that makes the pointer-identity assertion below a genuine stash-in-one-callback /
+/// read-back-in-a-later-one comparison rather than two captures inside a single callback.
+fn log_shape(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| {
+            if line.starts_with("handle=") {
+                "handle".to_string()
+            } else {
+                line.clone()
+            }
+        })
+        .collect()
 }
-
 // ---------------------------------------------------------------------------------------------
 // The `ready_async` arm (the default fixture)
 // ---------------------------------------------------------------------------------------------
@@ -377,13 +355,21 @@ fn dropping_a_port_after_a_job_completed_but_before_draining_releases_it_exactly
 // The `ErlDrvPort` a driver sees never moves
 // ---------------------------------------------------------------------------------------------
 
-/// The `ErlDrvPort` the driver stashes at `start` is the **same pointer** a later callback is handed
-/// through `DriverEnv::as_port()` — the property the C gives a driver for free (`&prt->drv_port`
-/// never moves) and the one that lets a driver keep the handle in its own data.
+/// The `ErlDrvPort` the driver stashes at `start` is the **same pointer** it reads back in every
+/// later callback — the property the C gives a driver for free (`&prt->drv_port` never moves) and
+/// the one that lets a driver keep the handle in its own data.
 ///
-/// The fixture's `hdl` token makes every callback append `handle=<%p>`; `start` logs one and the
-/// `output` callback (driven later, through the real port data path) logs its own, and the two must
-/// be byte-identical.
+/// The fixture's `hdl` token makes every callback append `handle=<%p>` for the handle the driver
+/// **stashed at `start`**; `start` logs one and each later `output` callback (driven through the
+/// real port data path) logs its own. The assertion is only meaningful as a *cross-callback*
+/// comparison, so the shape of the log is pinned first: a callback line, then that callback's own
+/// `handle=` line, for `start` and for each `output` — proving the two handles come from two
+/// different callbacks (never two captures inside one), and that the value read back later is
+/// byte-identical to the one stashed.
+///
+/// The handle is also still *usable* later: the `output` callback sends its echo through the very
+/// handle it stashed at `start` (`driver_output(st->port, …)`), and those bytes reach the port
+/// owner — so the pointer is not merely unchanged but still names the live port.
 #[test]
 fn the_erl_drv_port_handle_a_driver_sees_is_the_same_pointer_through_the_ports_life() {
     let Some(so) = fixture_so() else {
@@ -394,34 +380,179 @@ fn the_erl_drv_port_handle_a_driver_sees_is_the_same_pointer_through_the_ports_l
     let command = format!("{} hdl", probe.command);
     let (mut poller, mut registry, id) = open_port(&so, &command, host);
 
-    // `start` already logged its handle during the open; a later callback logs its own.
-    assert_eq!(
-        registry
-            .output(&mut poller, id, b"x")
-            .expect("the driver's output callback runs"),
-        1,
-        "the driver consumes the whole output buffer"
-    );
-    assert_eq!(
-        round_data(&mut poller, &mut registry, id).expect("the echo reaches the port owner"),
-        b"x".to_vec(),
-        "the port moves data through the handle it stashed at start"
-    );
+    // `start` already logged its handle during the open; two *later* `output` callbacks log their own.
+    for payload in [b"x".as_slice(), b"y".as_slice()] {
+        assert_eq!(
+            registry
+                .output(&mut poller, id, payload)
+                .expect("the driver's output callback runs"),
+            payload.len(),
+            "the driver consumes the whole output buffer"
+        );
+        assert_eq!(
+            round_data(&mut poller, &mut registry, id).expect("the echo reaches the port owner"),
+            payload.to_vec(),
+            "the port moves data through the handle it stashed at start"
+        );
+    }
 
     let lines = log_lines(&probe.log);
+    // The interleaving proves the handles below come from three *different* callbacks.
+    assert_eq!(
+        log_shape(&lines),
+        vec![
+            "start".to_string(),
+            "handle".to_string(),
+            "output".to_string(),
+            "handle".to_string(),
+            "output".to_string(),
+            "handle".to_string(),
+        ],
+        "each callback appends its own event line and, under `hdl`, its own handle line; \
+         log = {lines:?}"
+    );
+
     let handles = handle_lines(&lines);
-    assert!(
-        handles.len() >= 2,
-        "`start` and `output` each logged their handle; log = {lines:?}"
+    assert_eq!(
+        handles.len(),
+        3,
+        "`start` and the two later `output` callbacks each logged one handle; log = {lines:?}"
     );
     assert_eq!(
         handles[0], handles[1],
-        "the ErlDrvPort a driver stashes at start is the same pointer a later callback sees; \
+        "the ErlDrvPort a driver stashes at start is the same pointer a later callback reads back; \
          log = {lines:?}"
     );
     assert!(
         handles.iter().all(|handle| *handle == handles[0]),
         "every logged handle carries the same pointer; log = {lines:?}"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+/// The documented **counterpart** of the pointer-stability contract: the handle *pointer* is stable
+/// for the port's whole life, but the *host context* that makes it usable is installed only for the
+/// duration of a driver callback.
+///
+/// A `driver_output` on a plain `std::thread` — a driver's own worker, with no callback running — is
+/// the C's `-1`, and its bytes are dropped; the same call inside a callback reaches the port owner
+/// (the echo tests above prove the `0` arm). The handle here is a real one: a boxed [`AbiHost`]
+/// behind a boxed [`DriverEnv`] — exactly the shape `DriverPort::from_library` builds (both boxed so
+/// the pointer never moves) — so the pointer stays valid across the thread; only the callback-scoped
+/// context is missing.
+#[test]
+fn a_driver_output_from_a_plain_thread_is_refused() {
+    let mut host = Box::new(AbiHost::new(Box::new(LocalAtomPortHost::new())).expect("a driver heap"));
+    let mut env = Box::new(DriverEnv::new(&mut *host));
+    let port = env.as_port();
+
+    // On this (non-callback) thread the handle is already refused, so the refusal is about the
+    // missing callback context rather than about thread identity.
+    let mut byte = *b"x";
+    // SAFETY: `port` is the live handle for this test's body (the env/host outlive it), and `byte`
+    // points at one readable byte.
+    assert_eq!(
+        unsafe {
+            beam_abi::driver::drv::driver_output(port, &mut byte as *mut u8 as *mut libc::c_char, 1)
+        },
+        -1,
+        "with no driver callback running the handle cannot reach the port's queue"
+    );
+
+    // And from a plain worker thread, as a driver's own `driver_async` worker would call it. Only
+    // the handle's *address* crosses the thread: raw pointers are not `Send` (and must not be), so
+    // the test round-trips the integer address, which keeps the pointer identity under test.
+    let addr = port as usize;
+    let code = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let port = addr as ErlDrvPort;
+                let mut byte = *b"x";
+                // SAFETY: `port` is the live handle for this test's body (the env/host outlive the
+                // scope), and `byte` points at one readable byte.
+                unsafe {
+                    beam_abi::driver::drv::driver_output(
+                        port,
+                        &mut byte as *mut u8 as *mut libc::c_char,
+                        1,
+                    )
+                }
+            })
+            .join()
+            .expect("the plain worker thread runs")
+    });
+    assert_eq!(
+        code, -1,
+        "a driver_output from a plain std::thread has no installed callback context — the C's -1"
+    );
+
+    // The handle is still the same, valid pointer after the round-trip: nothing moved.
+    assert_eq!(env.as_port(), port, "the port handle never moves");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exactly-once delivery of each completion
+// ---------------------------------------------------------------------------------------------
+
+/// `ready_async` runs **exactly once per `driver_async` job**, and a later drive point re-delivers
+/// nothing.
+///
+/// A completion is a single value the drive point hands to exactly one arm: two jobs therefore
+/// produce exactly two `ready_async` calls, and once they are drained the port reports no pending
+/// async work — so a second drive point cannot hand the same completion over again. The count of the
+/// fixture's `ready_async h=same` lines is the observable: a duplicate (or a missing) delivery moves
+/// it.
+#[test]
+fn each_job_reaches_ready_async_exactly_once_and_is_never_re_delivered() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let probe = logged_port_command("async-exactly-once");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
+
+    for _ in 0..2 {
+        registry
+            .port_control(&mut poller, id, "14", &[])
+            .expect("control verb 14 schedules a job");
+    }
+
+    let processed = drive_until(&mut poller, &mut registry, id, 2, ASYNC_TIMEOUT);
+    assert_eq!(processed, 2, "each of the two jobs reported its own completion");
+
+    let lines = settle_log(&probe.log);
+    assert_eq!(
+        count_line(&lines, "ready_async h=same"),
+        2,
+        "one ready_async call per job — no more, no fewer; log = {lines:?}"
+    );
+    assert_eq!(
+        count_line(&lines, "async_free"),
+        0,
+        "ready_async owned each job's async_data, so async_free never ran"
+    );
+    assert!(
+        !registry
+            .get(id)
+            .expect("a live port")
+            .has_pending_async(),
+        "both drained jobs leave nothing pending on the port"
+    );
+
+    // A further drive point has nothing left to deliver: draining is not re-delivery.
+    assert_eq!(
+        registry
+            .drive_async(&mut poller, id)
+            .expect("the async drive point runs"),
+        0,
+        "a drained port re-delivers nothing"
+    );
+    let lines = settle_log(&probe.log);
+    assert_eq!(
+        count_line(&lines, "ready_async h=same"),
+        2,
+        "the drained completion was never handed over a second time; log = {lines:?}"
     );
 
     registry.close(&mut poller, id).expect("the port closes");
