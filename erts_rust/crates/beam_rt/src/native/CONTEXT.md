@@ -181,7 +181,9 @@ for an unregistered `registered_name`), so the list is a genuine, shorter-by-con
 ### `erts_internal.rs` — the served BIFs (contract A.7)
 `RuntimeContext::erts_internal_call(function, arity, args) -> Option<Result<Eterm>>`; `beam_bifs`
 owns exactly **one** `erts_internal` BIF (`cmp_term/2`), which this module deliberately does not
-claim so it falls through to the registry.
+claim so it falls through to the registry. `get_dflags/0`'s five flag words are
+`beam_dist::flags`'s constants (the single source of truth, each defined from the individual
+`DFLAG_*` bits) narrowed to `i64` at the emit site — this module keeps **no** local duplicate.
 
 | BIF | Ground truth | Behaviour (oracle-verified, OTP 29.1.1 / erts-17.1) |
 |---|---|---|
