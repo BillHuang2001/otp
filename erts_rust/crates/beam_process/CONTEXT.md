@@ -407,8 +407,9 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   port_level}`; the 7-item `port_info/1` roster and order already match.
 - **The differential allowlist carries 2 stale entries.** The gate `tools/differential/gate.sh` (a
   sibling, read-only here) exits 3 because `tools/differential/known-gaps.txt` still lists
-  `proc_signals/monitor_3_tag_option_unsupported` and `proc_signals/monitor_port_unsupported`, both of
-  which now **agree**; the run itself is `total=1100 agree=1093 mismatch=0 unsupported=7 skipped=0`.
+  `proc_signals/monitor_3_tag_option_unsupported` and `proc_signals/monitor_port_unsupported`, two cases
+  that **agree**, so the gate exits 3 until they are dropped; the run itself is
+  `total=1100 agree=1093 mismatch=0 unsupported=7 skipped=0`.
 ## Routing Table
 - `DESIGN_DECISIONS.md` → the design rationale ("why") for the frozen API/constraints (signal-copy-at-enqueue, the resume-on-send wake list, the process-table mutation hub, the GC root set, dictionary equality/order, monitor/tag side tables, the SMP lock bounds, `SharedProcessTable`'s `Send/Sync`, non-flaky `wait_idle`)
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -511,8 +512,8 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   removed; (11) `beam_message::send_fragmented` through `Process::heap_and_mailbox_mut()` instead of
   re-composing the fragment primitives; (12) drive `Scheduler::run_slice_with_ports`/`run_ready_with_ports`
   when a `PortTable` is owned, so a death during a slice cleans the port side; (13) the `link`/`link_term`
-  `noproc` signal — `RuntimeHooksBridge::link`'s comment claiming the signal "simply never arrives" is no
-  longer true; (14) the `process_flag(max_heap_size/min_heap_size/…)` arm returning the previous value;
+  `noproc` signal (the `RuntimeHooksBridge::link` comment claiming the signal "simply never arrives" is
+  stale — the signal is delivered); (14) the `process_flag(max_heap_size/min_heap_size/…)` arm returning the previous value;
   (15) `spawn_opt`'s `max_heap_size < min_heap_size ⇒ badarg` and honest `message_queue_data`;
   (16) `port_info`'s `queue_size`/`locking` items.
 ## See Also
