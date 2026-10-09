@@ -27,7 +27,7 @@
 //! everything else is a documented typed error ([`crate::error::unsupported`]),
 //! never a panic (crate `CONTEXT.md`, "Operand subset").
 
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 use beam_loader::{Operand, Reg};
 use beam_term::{make_atom, Eterm, NIL};
 
