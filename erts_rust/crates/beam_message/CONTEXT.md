@@ -34,7 +34,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   is copied twice.
   Immediates and literal-area terms are **shared** (returned unchanged); cons cells, tuples/records,
   funs, flat maps and **hash maps** (the whole HAMT trie — every node kind plus its leaf cons cells and
-  collision tuples) are copied.
+  collision tuples) are copied. A `SUB_BITS` **match context** (an `ErlSubBits` over an on-heap
+  bitstring) is **flattened** into a fresh on-heap bitstring for its window (never copied verbatim, so
+  the destination never aliases the source heap).
   An off-heap reference is **refcounted, never deep-copied**, in three flavours: an **MSO container**
   (`HEADER_BIN_REF`, `val` = the MSO slot), a **refc binary** (the 8-word `[BinRef][ErlSubBits]` pair,
   the payload shared via its `RefcBinary` handle) and an **external pid/port/ref** (whose node is
