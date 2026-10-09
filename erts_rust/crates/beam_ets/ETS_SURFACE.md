@@ -55,7 +55,7 @@ Three owners exist:
 | `select_count/2` | implemented | `beam_ets::Table::select_count` |
 | `select_delete/2` | implemented | `beam_ets::Table::select_delete` |
 | `select_replace/2` | implemented | `beam_ets::Table::select_replace` (two-phase value-validated rewrite; `bag` ⇒ `badarg`, `duplicate_bag` rewrites each matched copy) |
-| `select_reverse/1,2,3` | missing | seam-backed `unsupported_bif` |
+| `select_reverse/1,2,3` | state here, BIF missing | `beam_ets::Table::{select_reverse, select_reverse_limit, select_reverse_continue}` + the read-gated `TableAccess::select_reverse*`; the `beam_bifs` bridge is still a seam-backed `unsupported_bif` |
 | `match/2`, `match/3`, `match/1` | implemented | `beam_ets::Table::{match_, match_limit, match_continue}` |
 | `match_object/2`, `/3`, `/1` | implemented | `beam_ets::Table::{match_object, match_object_limit, match_object_continue}` |
 | `match_delete/2` | implemented | `beam_ets::Table::match_delete` |
@@ -78,6 +78,11 @@ These are the reference answers, each compared against the live `erl` (`tests/di
   * `ets:info/1` and `ets:info/2` are **never** access-gated (a non-owner may `info` a `private` table).
   * `ets:safe_fixtable/2` and `ets:take/2` are gated as **read** / **write** (a non-owner may fix a
     `protected` table); `ets:rename/2` is **write**-gated.
+  * `ets:select_reverse/1,2,3` is gated as **read**, exactly like `ets:select/1,2,3`: a non-owner may
+    run all three forms on a `protected`/`public` table; a `private` table denies with `badarg`. A
+    failed match-spec **body** yields the atom `EXIT` resolved from the caller's `AtomTable`
+    (`select::exec::exit_term`), so a host whose spec body can raise must pre-intern `EXIT` (the C
+    `FAIL_TERM` is a static atom that always exists).
 * **Rename.** On a `named_table`: a free new name rekeys the registry, the old name stops resolving,
   the new name resolves to the **same tid**, the data/tid/owner/protection survive, and the BIF returns
   the **new name atom**; an already-taken name — **including its own current name** — is `badarg` with
@@ -120,8 +125,9 @@ These are the reference answers, each compared against the live `erl` (`tests/di
 1. **No BIF path is access-gated.** `beam_bifs`'s `ets:*` bridge calls the owner-level `Table::*`
    primitives directly, so the protection matrix is enforced only by `TableAccess` + the differential
    battery, never by the running runtime's dispatch. Needed: the `ets:*` bridge must build
-   `Table::as_requester(self_pid)` per call and go through `TableAccess` (and use
-   `TableAccess::set_fixation` for `safe_fixtable/2`), while keeping `info/1,2` ungated.
+   `Table::as_requester(self_pid)` per call and go through `TableAccess` (use `TableAccess::set_fixation`
+   for `safe_fixtable/2`, `TableAccess::rename` for `rename/2`, `TableAccess::select_reverse*` for
+   `select_reverse/1,2,3`), while keeping `info/1,2` ungated.
 2. **No owner is ever recorded.** `beam_bifs::ets::new_2` never calls `Table::set_owner`, and
    `beam_bifs::TableRegistry` has no owner index, so `OwnerId` is always `None` and
    `ets:info(T, owner)`/`T, heir` always render `undefined`. Needed: record `Table::set_owner(Some(..))`
@@ -144,9 +150,13 @@ These are the reference answers, each compared against the live `erl` (`tests/di
    `kind.is_ordered() && write_concurrency` instead of reading `TableInfo::decentralized_counters`.
    Needed: accept every option `TableOptions` can hold (mapping `{heir,Pid}` ⇒ `Heir { data: None }`,
    `{heir,Pid,D}` ⇒ `Some(D)`, `{heir,none}` ⇒ `set_heir(None)`), and switch the info field to the
-   `TableInfo` value. Options `TableOptions` still cannot express: `{write_concurrency, auto}` and
-   `{write_concurrency, {debug_hash_fixed_number_of_locks, N}}` (the flag is a `bool`; the oracle
-   accepts `auto` and reports `wc=auto`, `decentralized_counters=true`).
+   `TableInfo` value. Options `TableOptions` **now models every `{write_concurrency, …}` form** — the
+   parsed mode is `TableOptions::write_concurrency_mode()`, a `WriteConcurrency`
+   (`Off`/`On`/`Auto`/`FixedLocks(n)`, also the parse surface via `WriteConcurrency::from_atom_name`),
+   and `decentralized_counters` is derived accordingly (the oracle accepts `auto` and reports `wc=auto`,
+   `decentralized_counters=true`). The `TableProfile` sidecar now only carries what the model cannot: the
+   **normalized** `ets:info(T, write_concurrency)` rendering (requested count rounded down to a power of
+   two then clamped up to 64) and the parser-side accept/reject rules.
 6. **Raw-`Table` reads still alias table storage.** `Table`/`TableAccess` return bare `Eterm`s that a
    caller can hold past the borrowed table (or past a `take`), so only the shared handle is
    escape-proof. This is a cross-crate API decision (a host as `beam_bifs` consumes the raw forms):
@@ -154,4 +164,15 @@ These are the reference answers, each compared against the live `erl` (`tests/di
    lookup_element_all_or, first, last, next, prev, tab2list, take, select, select_count,
    select_delete, match_object, match_, match_delete, select_replace}` and the mirrored
    `TableAccess` methods; the fix is to route them through the guard-scoped `TableRead`/`TableWrite`
-   view layer (`src/table/view/`) or a scoped `Table::view(&self)` handle.
+   view layer (`src/table/view/`) or a scoped `Table::view(&self)` handle. The view layer now carries the
+   traversal API a host needs to avoid the raw forms — `TableRead::{iter_keys, iter_keys_rev,
+   iter_objects, iter_objects_rev, foldl, foldr, tab2list_into}` and `TableTerm::tuple_elements` — so
+   `beam_bifs` can adopt the safe views without the raw read family.
+## 8. Storage-lifetime invariants (no residual gap)
+* Every interior index key **and** every B+-tree branch separator term must alias a **live, table-owned**
+  object: an overwrite or removal that reclaims the aliased object re-points the key/separator (a `set`
+  upsert in `hash_interior`/`champ_interior`; a `bag`/`duplicate_bag` `delete_object` re-anchors from a
+  surviving object; the B+-tree re-materialises separators from the rightmost live leaf). `Table` derives
+  a rebuilt object's index key from the **table-owned copy**, never the caller's key. Covered by
+  `tests/ets_reclamation.rs` (focused reproductions + memory-accounting stress across every kind and
+  interior shape).
