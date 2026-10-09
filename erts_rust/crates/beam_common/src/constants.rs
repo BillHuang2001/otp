@@ -40,14 +40,17 @@
 /// This is a **frozen ERTS interface constant**: `erlang:system_info(context_reductions)`
 /// reports exactly `4000`, so the value is observable and must not drift.
 ///
-/// This is the single canonical definition within the Rust workspace. The following call
-/// sites currently carry their own transcription and must adopt `CONTEXT_REDS` (path in
-/// parentheses):
+/// This is the single canonical definition within the Rust workspace. Dependents reference or
+/// re-derive from it instead of transcribing the value; the call sites (path in parentheses):
+///
+/// * `beam_process::scheduler` (`crates/beam_process/src/scheduler.rs`) re-derives it as the
+///   per-process slice budget `DEFAULT_REDUCTIONS_PER_SLICE = CONTEXT_REDS as u32`.
+/// * `beam_rt::info::schedulers` (`crates/beam_rt/src/info/schedulers.rs`) reports
+///   `erlang:system_info(context_reductions)` as `CONTEXT_REDS`.
+///
+/// One local transcription remains and has yet to adopt this definition:
 ///
 /// * `beam_io::port_task::CONTEXT_REDS` (`crates/beam_io/src/port_task.rs`)
-/// * the private `CONTEXT_REDS` in `beam_rt::info::schedulers`
-///   (`crates/beam_rt/src/info/schedulers.rs`)
-/// * `beam_process::DEFAULT_REDUCTIONS_PER_SLICE` (`crates/beam_process/src/scheduler.rs`)
 pub const CONTEXT_REDS: usize = 4000;
 
 #[cfg(test)]
