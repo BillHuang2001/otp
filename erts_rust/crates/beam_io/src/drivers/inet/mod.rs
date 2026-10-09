@@ -203,6 +203,7 @@ use crate::error;
 use crate::poller::{Interest, Token};
 
 mod opt;
+pub mod packet;
 mod sys;
 mod wire;
 
