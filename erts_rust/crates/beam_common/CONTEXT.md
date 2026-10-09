@@ -5,8 +5,9 @@ The single shared foundation crate of the Rust ERTS rewrite (Stage 0 — Foundat
 `../../CONTEXT.md` §7). Every other crate depends on it, so its public API must be **small, stable and
 idiomatic**. It owns the workspace-wide **error/result strategy** (Part I §A.1; Part II §B: BIF/NIF
 failure is **return-based** — no `setjmp`/`longjmp`), the OTP/ERTS **version constants**, the
-runtime **configuration / feature-flag / flavor skeleton**, a dependency-free **logging facade**, and
-the documented **`unsafe` marker convention**.
+runtime **configuration / feature-flag / flavor skeleton**, a dependency-free **logging facade**,
+the **canonical definitions of ERTS constants genuinely shared by two or more workspace crates**
+(`constants`, currently `CONTEXT_REDS`), and the documented **`unsafe` marker convention**.
 
 This is a **dependency sink**: it depends on `std` (and `libc` for ABI-sized integer aliases) and on
 **nothing else** — deliberately no `thiserror`, no `tracing`, no `bitflags`. Adding any dependency
