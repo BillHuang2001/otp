@@ -60,7 +60,7 @@ pub(super) fn get_map_elements(
 ) -> Result<Step> {
     let map = read_operand(machine, ctx, source)?;
     if !predicates::is_map(map) {
-        return fail_or_raise(machine, module, labels, ctx, fail, "badmap", map);
+        return fail_or_raise(machine, module, labels, ctx, fail, "badmap", source);
     }
     let entries = terms::map_entries(map)?;
     for (key_operand, dst_operand) in pairs {
@@ -92,7 +92,7 @@ pub(super) fn has_map_fields(
 ) -> Result<Step> {
     let map = read_operand(machine, ctx, source)?;
     if !predicates::is_map(map) {
-        return fail_or_raise(machine, module, labels, ctx, fail, "badmap", map);
+        return fail_or_raise(machine, module, labels, ctx, fail, "badmap", source);
     }
     let entries = terms::map_entries(map)?;
     for key_operand in keys {

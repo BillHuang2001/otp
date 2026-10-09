@@ -97,7 +97,7 @@ use beam_term::{is_small, make_atom, make_small, signed_value, Eterm, NIL};
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::families::exceptions::stacktrace::stacktrace_item;
-use crate::terms;
+use crate::terms::{ContextSink, Sink};
 
 use super::{Machine, ModuleContext};
 
@@ -274,7 +274,16 @@ impl Machine {
                 None => frames.push(stacktrace_item(module, ctx, func, pc)?),
             }
         }
-        terms::make_list(ctx, &frames)
+        // These four accessors are `&self`: a `&self` receiver cannot lend the
+        // machine's `&mut` root slices, so the list is built through the **unrooted**
+        // `ContextSink` (one `alloc_words` per node) rather than a rooted
+        // reservation. That is moving-safe here — every item comes from module
+        // metadata/immediates with no machine-heap operand held across an
+        // allocation, and `alloc_words` never collects. Adopting a rooted `&mut self`
+        // twin requires the sole external caller (`beam_rt`'s `position_value`) to
+        // change `engines.engine_at(pid)` to `engine_at_mut(pid)`.
+        let mut sink = ContextSink::new(ctx);
+        sink.list(&frames)
     }
 
     /// The finite `after T` deadline of the `receive` this machine is parked at — the
@@ -404,16 +413,19 @@ fn function_at(module: &Module, func: u32) -> Result<&Function> {
 
 /// The `{Module, Function, Arity}` tuple for the function at index `func` — the
 /// `current_function`/`initial_call` value (C's MFA term).
+///
+/// Built through the **unrooted** [`ContextSink`] for the same reason
+/// [`Machine::current_stacktrace`] is (see the comment there): the tuple's three
+/// elements are all immediates derived from module metadata, so nothing that could
+/// move is held across the allocation.
 fn mfa_term(module: &Module, ctx: &mut dyn ExecutionContext, func: u32) -> Result<Eterm> {
     let function = function_at(module, func)?;
-    terms::make_tuple(
-        ctx,
-        &[
-            make_atom(function.module),
-            make_atom(function.name),
-            make_small(function.arity as i64),
-        ],
-    )
+    let mut sink = ContextSink::new(ctx);
+    sink.tuple(&[
+        make_atom(function.module),
+        make_atom(function.name),
+        make_small(function.arity as i64),
+    ])
 }
 
 #[cfg(test)]

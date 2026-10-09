@@ -39,14 +39,29 @@ use crate::interpreter::LabelMap;
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand};
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
+use crate::error;
 use crate::machine::Machine;
-use crate::operand::{read_operand, write_operand};
+use crate::operand::{operand_slack_words, read_operand, read_operand_slack, write_operand};
 use crate::predicates;
 use crate::terms;
 use crate::Step;
 
 use super::{fail_or_raise, position};
+
+/// The spacer words the reserve must add for the `Eterm` operands a map update
+/// re-reads after the reserve: the source operand plus every key/value operand
+/// (each a bignum only when it is a non-small integer immediate).
+fn merge_slack_words(
+    source: &Operand,
+    pairs: &[(Operand, Operand)],
+) -> usize {
+    operand_slack_words(source)
+        + pairs
+            .iter()
+            .map(|(k, v)| operand_slack_words(k) + operand_slack_words(v))
+            .sum::<usize>()
+}
 
 /// `put_map_assoc Fail Src Dst Live {Key,Value}*` — build a new map with each pair
 /// associated, then write it to `Dst`.
@@ -61,26 +76,40 @@ pub(super) fn put_map_assoc(
     live: u32,
     pairs: &[(Operand, Operand)],
 ) -> Result<Step> {
-    // `live` is the C collector's GC-root count; M1 has no moving
-    // collector (see the module docs), so the update cannot relocate terms.
     let _ = live;
+    // Phase A (nothing retained past the reserve): the `badmap` check and the entry
+    // count that sizes the reservation. Both are pure reads.
     let map = read_operand(machine, ctx, source)?;
     if !predicates::is_map(map) {
-        return fail_or_raise(machine, module, labels, ctx, fail, "badmap", map);
+        return fail_or_raise(machine, module, labels, ctx, fail, "badmap", source);
     }
-    let mut merged = terms::map_entries(map)?;
-    for (key_operand, value_operand) in pairs {
-        let key = read_operand(machine, ctx, key_operand)?;
-        let value = read_operand(machine, ctx, value_operand)?;
-        match position(&merged, key, &module.atom_table) {
-            // Overwrite the existing binding…
-            Some(index) => merged[index].1 = value,
-            // …or associate the new key (maps are immutable; this is a
-            // fresh copy, never an in-place mutation of `source`).
-            None => merged.push((key, value)),
-        }
-    }
-    let result = terms::make_map(ctx, &merged, &module.atom_table)?;
+    let capacity = terms::map_entries(map)?.len() + pairs.len();
+    // Phase B: reserve the whole map block (one rooted allocation a moving collector
+    // may run under), then re-read the source and every key/value operand from the
+    // post-collection state and merge into a pair list that is only ever read.
+    let extra = merge_slack_words(source, pairs);
+    let atoms = &module.atom_table;
+    let result = terms::make_map(
+        machine,
+        ctx,
+        RootSet::ALL_LIVE,
+        capacity,
+        extra,
+        atoms,
+        |m, slack| {
+            let map = read_operand_slack(m, source, slack)?;
+            let mut merged = terms::map_entries(map)?;
+            for (key_operand, value_operand) in pairs {
+                let key = read_operand_slack(m, key_operand, slack)?;
+                let value = read_operand_slack(m, value_operand, slack)?;
+                match position(&merged, key, atoms) {
+                    Some(index) => merged[index].1 = value,
+                    None => merged.push((key, value)),
+                }
+            }
+            Ok(merged)
+        },
+    )?;
     write_operand(machine, dst, result)?;
     Ok(Step::Next)
 }
@@ -98,24 +127,50 @@ pub(super) fn put_map_exact(
     live: u32,
     pairs: &[(Operand, Operand)],
 ) -> Result<Step> {
-    // As `PutMapAssoc`: `live` is unused at M1.
     let _ = live;
+    // Phase A: the `badmap` check, the entry count, and the `{badkey,Key}` validation
+    // — all pure reads, nothing retained past the reserve.
     let map = read_operand(machine, ctx, source)?;
     if !predicates::is_map(map) {
-        return fail_or_raise(machine, module, labels, ctx, fail, "badmap", map);
+        return fail_or_raise(machine, module, labels, ctx, fail, "badmap", source);
     }
-    let mut merged = terms::map_entries(map)?;
-    for (key_operand, value_operand) in pairs {
+    let existing = terms::map_entries(map)?;
+    for (key_operand, _) in pairs {
         let key = read_operand(machine, ctx, key_operand)?;
-        let Some(index) = position(&merged, key, &module.atom_table) else {
-            // Exact update on an absent key: `{badkey, Key}` on the
-            // no-fail-label path (`beam_common.c:2237-2268`).
-            return fail_or_raise(machine, module, labels, ctx, fail, "badkey", key);
-        };
-        let value = read_operand(machine, ctx, value_operand)?;
-        merged[index].1 = value;
+        if position(&existing, key, &module.atom_table).is_none() {
+            return fail_or_raise(machine, module, labels, ctx, fail, "badkey", key_operand);
+        }
     }
-    let result = terms::make_map(ctx, &merged, &module.atom_table)?;
+    let capacity = existing.len() + pairs.len();
+    // Phase B: reserve, then re-read and merge (the pre-validated keys are re-read so
+    // the merge uses the post-collection terms).
+    let extra = merge_slack_words(source, pairs);
+    let atoms = &module.atom_table;
+    let result = terms::make_map(
+        machine,
+        ctx,
+        RootSet::ALL_LIVE,
+        capacity,
+        extra,
+        atoms,
+        |m, slack| {
+            let map = read_operand_slack(m, source, slack)?;
+            let mut merged = terms::map_entries(map)?;
+            for (key_operand, value_operand) in pairs {
+                let key = read_operand_slack(m, key_operand, slack)?;
+                let value = read_operand_slack(m, value_operand, slack)?;
+                match position(&merged, key, atoms) {
+                    Some(index) => merged[index].1 = value,
+                    None => {
+                        return Err(error::unsupported(
+                            "put_map_exact: key vanished across the reserve",
+                        ))
+                    }
+                }
+            }
+            Ok(merged)
+        },
+    )?;
     write_operand(machine, dst, result)?;
     Ok(Step::Next)
 }

@@ -21,8 +21,9 @@
 //! Bitstring **match entry** and match-context handling.
 //!
 //! Owns `bs_start_match3`/`bs_start_match4` (`enter_match` plus its
-//! `no_fail`/`resume` fail-operand decode), the match-context operand reader
-//! (`read_ctx`) and the `bs_set_position` position decode (`position_of`).
+//! `no_fail`/`resume` fail-operand decode), the match-context operand readers
+//! (`read_ctx`, and its post-allocation twin `reread_ctx`) and the
+//! `bs_set_position` position decode (`position_of`).
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand, NO_FAIL};
 use beam_term::Eterm;
@@ -30,24 +31,49 @@ use beam_term::Eterm;
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::machine::Machine;
-use crate::operand::read_operand;
+use crate::operand::{operand_slack_words, read_operand, read_operand_slack};
 
 use super::super::{raw, small_value};
 // ---------------------------------------------------------------------------
 // Match entry
 // ---------------------------------------------------------------------------
-/// Start (or resume) a match over `subject`, yielding the match context.
+/// Start (or resume) a match over the subject **operand**, yielding the match
+/// context.
 ///
 /// A heap binary becomes a fresh context at position 0 (`i_bs_start_match3`,
 /// `bs_instrs.tab:1199`); a term that is already an `ErlSubBits` is re-wrapped with
 /// its current position (the C `reuse` path). Anything else is a *match* failure
 /// (`None`), not an error.
-pub(crate) fn enter_match(ctx: &mut dyn ExecutionContext, subject: Eterm) -> Result<Option<Eterm>> {
-    if let Some((_, bits)) = raw::heap_bits(subject) {
-        return Ok(Some(raw::make_ctx(ctx, subject, 0, bits)?));
+///
+/// The subject is handed in as its operand rather than as a read `Eterm` so the new
+/// context's `orig` word can be re-read from the machine's **post-collection** state
+/// after the context block's reserve ([`raw::make_ctx`]): a moving collector may
+/// relocate the subject, and storing the pre-reserve copy would leave a stale
+/// pointer inside a live term.
+pub(crate) fn enter_match(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    subject: &Operand,
+) -> Result<Option<Eterm>> {
+    let value = read_operand(machine, ctx, subject)?;
+    let extra = operand_slack_words(subject);
+    if let Some((_, bits)) = raw::heap_bits(value) {
+        // A heap binary: the context starts at bit 0 and spans its whole size.
+        let context = raw::make_ctx(machine, ctx, 0, bits, extra, |m, slack| {
+            read_operand_slack(m, subject, slack)
+        })?;
+        return Ok(Some(context));
     }
-    if let Some((orig, start, end)) = raw::ctx_parts(subject) {
-        return Ok(Some(raw::make_ctx(ctx, orig, start, end)?));
+    if let Some((_, start, end)) = raw::ctx_parts(value) {
+        // The `reuse` path: re-wrap the *inner* subject at the current position, so
+        // the re-derived `orig` keeps naming the underlying binary, never the outer
+        // context.
+        let context = raw::make_ctx(machine, ctx, start, end, extra, |m, slack| {
+            let value = read_operand_slack(m, subject, slack)?;
+            raw::inner_orig(value)
+                .ok_or_else(|| error::unsupported("bs_start_match: subject is not a match context"))
+        })?;
+        return Ok(Some(context));
     }
     Ok(None)
 }
@@ -80,6 +106,30 @@ pub(crate) fn read_ctx(
     let (orig, start, end) = raw::ctx_parts(term)
         .ok_or_else(|| error::unsupported(&format!("{what}: operand is not a match context")))?;
     Ok((term, orig, start, end))
+}
+/// Re-read a match-context operand **after** an allocating read; the fresh
+/// (post-collection) context term is returned.
+///
+/// A rooted allocation ([`raw::make_bits`]/[`raw::make_big`]/
+/// [`crate::terms::make_float`]) may run a **moving** collector that relocates the
+/// context block, so an `Eterm` read *before* the allocation is a stale pointer
+/// afterwards. Any match opcode that (1) reads its context, (2) performs an
+/// allocating field read and (3) then writes the new position back into the
+/// context must therefore re-read the context operand **here** before the write —
+/// the frozen **reserve, then read, then write** ordering ([`crate::terms`]).
+/// The operand (a register/Y slot, part of the machine's root set, which the
+/// collector rewrites in place) is re-evaluated rather than the stale term reused.
+///
+/// This is the term-only twin of [`read_ctx`]; it still validates that the operand
+/// is a live match context.
+pub(crate) fn reread_ctx(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    operand: &Operand,
+    what: &str,
+) -> Result<Eterm> {
+    let (term, _, _, _) = read_ctx(machine, ctx, operand, what)?;
+    Ok(term)
 }
 /// The bit position a `bs_set_position` operand denotes.
 ///

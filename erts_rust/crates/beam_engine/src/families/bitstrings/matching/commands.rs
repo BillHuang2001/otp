@@ -39,7 +39,7 @@ use crate::Step;
 use super::super::{
     decode_flags, extract_bits, fail_step, is_all, raw, read_size, read_uint_be, small_value,
 };
-use super::match_ctx::read_ctx;
+use super::match_ctx::{read_ctx, reread_ctx};
 use super::reads::read_integer_field;
 // ---------------------------------------------------------------------------
 // The `bs_match` command interpreter
@@ -54,11 +54,21 @@ pub(crate) fn run_commands(
     commands: &[Operand],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
-    let bytes = raw::subject_bytes(orig)?;
+    // `pos` is a *local* cursor: the context's own position is written back only
+    // once the whole command list has succeeded, so every re-read below yields the
+    // same `(start, end)` for this invocation.
+    let (_, _, start, _) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
     let mut pos = start;
     let mut i = 0usize;
     while i < commands.len() {
+        // Re-derive the context and its byte view at the top of **every** iteration:
+        // the previous iteration's `integer`/`binary`/`get_tail` command allocated
+        // through the rooted seam (`read_integer_field` -> `raw::make_big`,
+        // `raw::make_bits`), whose moving collector may have relocated the context
+        // block, so a `term`/`bytes` captured before that allocation is stale
+        // (the frozen reserve, then read, then write ordering).
+        let (_, orig, _, end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
+        let bytes = raw::subject_bytes(orig)?;
         let Operand::Atom(command) = &commands[i] else {
             return Err(error::unsupported(
                 "bs_match: command list does not start with an atom",
@@ -73,7 +83,7 @@ pub(crate) fn run_commands(
                 let size = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 let unit = read_size(machine, ctx, cmd_at(commands, i + 2)?)?;
                 if !ensure_at_least(end.saturating_sub(pos), size, unit) {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 i += 3;
             }
@@ -81,7 +91,7 @@ pub(crate) fn run_commands(
             "ensure_exactly" => {
                 let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 if end.saturating_sub(pos) != stride {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 i += 2;
             }
@@ -89,10 +99,10 @@ pub(crate) fn run_commands(
             "skip" => {
                 let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 let Some(next) = pos.checked_add(stride) else {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 };
                 if next > end {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos = next;
                 i += 2;
@@ -104,12 +114,12 @@ pub(crate) fn run_commands(
                 let unit = read_size(machine, ctx, cmd_at(commands, i + 4)?)?;
                 let dst = cmd_at(commands, i + 5)?;
                 let Some(nbits) = size.checked_mul(unit) else {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 };
                 if nbits > end.saturating_sub(pos) {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                let value = read_integer_field(ctx, bytes, pos, nbits, flags)?;
+                let value = read_integer_field(machine, ctx, bytes, pos, nbits, flags)?;
                 write_operand(machine, dst, value)?;
                 pos += nbits;
                 i += 6;
@@ -125,14 +135,14 @@ pub(crate) fn run_commands(
                     let size = read_size(machine, ctx, size_op)?;
                     match size.checked_mul(unit) {
                         Some(nbits) => nbits,
-                        None => return fail_step(machine, module, labels, fail, term, ctx),
+                        None => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     }
                 };
                 if nbits > end.saturating_sub(pos) {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 let out = extract_bits(bytes, pos, nbits)?;
-                let value = raw::make_bits(ctx, &out, nbits)?;
+                let value = raw::make_bits(machine, ctx, &out, nbits)?;
                 write_operand(machine, dst, value)?;
                 pos += nbits;
                 i += 6;
@@ -144,7 +154,7 @@ pub(crate) fn run_commands(
                 let dst = cmd_at(commands, i + 3)?;
                 let nbits = end.saturating_sub(pos);
                 let out = extract_bits(bytes, pos, nbits)?;
-                let value = raw::make_bits(ctx, &out, nbits)?;
+                let value = raw::make_bits(machine, ctx, &out, nbits)?;
                 write_operand(machine, dst, value)?;
                 i += 4;
             }
@@ -162,10 +172,10 @@ pub(crate) fn run_commands(
                     return Err(error::unsupported("bs_match '=:=': non-integer value"));
                 };
                 if bits > 64 || bits > end.saturating_sub(pos) {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 if read_uint_be(bytes, pos, bits)? != want as u64 {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos += bits;
                 i += 4;
@@ -175,7 +185,10 @@ pub(crate) fn run_commands(
             }
         }
     }
-    // Commit the advanced position only once the whole command list succeeded.
+    // Commit the advanced position only once the whole command list succeeded. The
+    // last command may have allocated, so re-read the context operand for a fresh
+    // (post-collection) term before mutating its position in place.
+    let term = reread_ctx(machine, ctx, ctx_op, "bs_match")?;
     raw::set_ctx_start(term, pos);
     Ok(Some(Step::Next))
 }

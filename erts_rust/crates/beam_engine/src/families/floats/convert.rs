@@ -80,7 +80,7 @@ pub(super) fn fconv(
     dst: &Operand,
 ) -> Result<Option<Step>> {
     let source = read_value(machine, module, ctx, src)?;
-    let value = match conv_to_float(ctx, source)? {
+    let value = match conv_to_float(machine, ctx, source)? {
         Conv::Value(value) => value,
         // A non-numeric source, and a bignum that is not a finite double, are
         // both the `$BADARITH0` raise; `fconv` has no fail label, so it goes
@@ -99,9 +99,9 @@ pub(super) fn fconv(
 /// bignum is `big_to_double` (`../../erts/emulator/beam/big.c:2412`) via
 /// [`beam_term::number::big_to_f64`], whose `None` is exactly C's `< 0` failure — a
 /// value that is not a finite double. A non-number is the raise too.
-fn conv_to_float(ctx: &mut dyn ExecutionContext, source: Eterm) -> Result<Conv> {
+fn conv_to_float(machine: &mut Machine, ctx: &mut dyn ExecutionContext, source: Eterm) -> Result<Conv> {
     if is_small(source) {
-        return Ok(Conv::Value(make_float(ctx, signed_value(source) as f64)?));
+        return Ok(Conv::Value(make_float(machine, ctx, signed_value(source) as f64)?));
     }
     if predicates::is_float(source) {
         // Float → float is the C `LOAD_DOUBLE` path: the value is unchanged.
@@ -112,7 +112,7 @@ fn conv_to_float(ctx: &mut dyn ExecutionContext, source: Eterm) -> Result<Conv> 
         // conversion; `None` is the C's `< 0` (the magnitude is too large for a
         // finite double), which `i_fconv` turns into `badarith`.
         return Ok(match big_to_f64(source) {
-            Some(value) => Conv::Value(make_float(ctx, value)?),
+            Some(value) => Conv::Value(make_float(machine, ctx, value)?),
             None => Conv::BadArith,
         });
     }

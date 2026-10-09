@@ -75,7 +75,7 @@ pub(super) fn binary(
     if !result.is_finite() {
         return arithmetic_failure(machine, module, labels, fail);
     }
-    let value = make_float(ctx, result)?;
+    let value = make_float(machine, ctx, result)?;
     write_operand(machine, dst, value)?;
     Ok(Some(Step::Next))
 }
@@ -97,7 +97,7 @@ pub(super) fn negate(
         Ok(x) => x,
         Err(_) => return arithmetic_failure(machine, module, labels, fail),
     };
-    let negated = make_float(ctx, -value)?;
+    let negated = make_float(machine, ctx, -value)?;
     write_operand(machine, dst, negated)?;
     Ok(Some(Step::Next))
 }

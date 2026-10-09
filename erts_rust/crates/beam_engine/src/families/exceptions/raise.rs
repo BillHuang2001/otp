@@ -30,10 +30,10 @@ use beam_common::{ExceptionClass, Result};
 use beam_loader::{Module, Operand};
 use beam_term::{make_atom, Eterm};
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::error;
 use crate::machine::Machine;
-use crate::operand::read_operand;
+use crate::operand::{operand_slack_words, read_operand_slack};
 use crate::terms;
 use crate::Step;
 
@@ -56,12 +56,16 @@ pub(super) fn raise_error_tuple(
     tag: &str,
     value: &Operand,
 ) -> Result<Option<Step>> {
-    let value = read_operand(machine, ctx, value)?;
     let tag_atom = module
         .atom_table
         .lookup(tag)
         .ok_or_else(|| error::unsupported(&format!("exceptions: no '{tag}' atom in the module")))?;
-    let reason = terms::make_tuple(ctx, &[make_atom(tag_atom), value])?;
+    // Reserve the reason block first, then re-read the value operand from the
+    // post-collection machine state (a moving collector may run in the reserve).
+    let extra = operand_slack_words(value);
+    let reason = terms::make_tuple(machine, ctx, RootSet::ALL_LIVE, 2, extra, |m, s| {
+        Ok(vec![make_atom(tag_atom), read_operand_slack(m, value, s)?])
+    })?;
     let _ = install_class_atom(machine, module, ExceptionClass::Error);
     machine.throw_error(reason).map(Some)
 }

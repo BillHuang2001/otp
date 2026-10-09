@@ -59,7 +59,7 @@ use beam_loader::{BsGetArgs, Instr, Module};
 
 use crate::context::ExecutionContext;
 use crate::machine::Machine;
-use crate::operand::{read_operand, write_operand};
+use crate::operand::{operand_slack_words, read_operand, read_operand_slack, write_operand};
 use crate::Step;
 
 use super::{extract_bits, fail_step, is_all, make_small_checked, raw, read_size};
@@ -67,6 +67,8 @@ use super::{extract_bits, fail_step, is_all, make_small_checked, raw, read_size}
 mod commands;
 mod match_ctx;
 mod reads;
+#[cfg(test)]
+mod rooted;
 
 // Every moved item is re-exported here so its existing
 // `crate::families::bitstrings::matching::…` path keeps resolving. Some are only
@@ -75,7 +77,7 @@ mod reads;
 #[allow(unused_imports)]
 pub(crate) use commands::{cmd_at, ensure_at_least, run_commands};
 #[allow(unused_imports)]
-pub(crate) use match_ctx::{enter_match, position_of, read_ctx, resolve_match4_fail};
+pub(crate) use match_ctx::{enter_match, position_of, read_ctx, reread_ctx, resolve_match4_fail};
 #[allow(unused_imports)]
 pub(crate) use reads::{
     bit_at, bits_equal, decode_utf16, decode_utf32, decode_utf8, f16_to_f32, read_float_field,
@@ -100,13 +102,12 @@ pub(super) fn exec(
             live: _,
             dst,
         } => {
-            let subject = read_operand(machine, ctx, bin)?;
-            match enter_match(ctx, subject)? {
+            match enter_match(machine, ctx, bin)? {
                 Some(context) => {
                     write_operand(machine, dst, context)?;
                     Ok(Some(Step::Next))
                 }
-                None => fail_step(machine, module, labels, *fail, subject, ctx),
+                None => fail_step(machine, module, labels, *fail, bin, ctx),
             }
         }
         Instr::BsStartMatch4 {
@@ -122,17 +123,17 @@ pub(super) fn exec(
                 // (`emu/ops.tab:1251-1252`): the source is already a match context,
                 // so rebinding must keep the *same* mutable context, not a copy.
                 if raw::ctx_parts(subject).is_none() {
-                    return fail_step(machine, module, labels, fail_label, subject, ctx);
+                    return fail_step(machine, module, labels, fail_label, src, ctx);
                 }
                 write_operand(machine, dst, subject)?;
                 return Ok(Some(Step::Next));
             }
-            match enter_match(ctx, subject)? {
+            match enter_match(machine, ctx, src)? {
                 Some(context) => {
                     write_operand(machine, dst, context)?;
                     Ok(Some(Step::Next))
                 }
-                None => fail_step(machine, module, labels, fail_label, subject, ctx),
+                None => fail_step(machine, module, labels, fail_label, src, ctx),
             }
         }
         Instr::BsGetPosition {
@@ -140,8 +141,17 @@ pub(super) fn exec(
             dst,
             live: _,
         } => {
-            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_position")?;
-            let snapshot = raw::make_ctx(ctx, orig, start, end)?;
+            let (_, _, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_position")?;
+            // Reserve the snapshot first, then re-read the context operand so the
+            // snapshot's `orig` is the post-collection inner subject of the *current*
+            // context.
+            let extra = operand_slack_words(ctx_op);
+            let snapshot = raw::make_ctx(machine, ctx, start, end, extra, |m, slack| {
+                let value = read_operand_slack(m, ctx_op, slack)?;
+                raw::inner_orig(value).ok_or_else(|| {
+                    crate::error::unsupported("bs_get_position: operand is not a match context")
+                })
+            })?;
             write_operand(machine, dst, snapshot)?;
             Ok(Some(Step::Next))
         }
@@ -163,7 +173,7 @@ pub(super) fn exec(
             let nbits = end.saturating_sub(start);
             let bytes = raw::subject_bytes(orig)?;
             let out = extract_bits(bytes, start, nbits)?;
-            let value = raw::make_bits(ctx, &out, nbits)?;
+            let value = raw::make_bits(machine, ctx, &out, nbits)?;
             write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
         }
@@ -172,11 +182,11 @@ pub(super) fn exec(
             ctx: ctx_op,
             bits,
         } => {
-            let (term, _, start, end) = read_ctx(machine, ctx, ctx_op, "bs_test_tail2")?;
+            let (_, _, start, end) = read_ctx(machine, ctx, ctx_op, "bs_test_tail2")?;
             if end.saturating_sub(start) == *bits as usize {
                 Ok(Some(Step::Next))
             } else {
-                fail_step(machine, module, labels, *fail, term, ctx)
+                fail_step(machine, module, labels, *fail, ctx_op, ctx)
             }
         }
         Instr::BsGetInteger2(b) => {
@@ -189,17 +199,22 @@ pub(super) fn exec(
                 flags,
                 dst,
             } = &**b;
-            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
+            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
             let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             };
             if nbits > end.saturating_sub(start) {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             let bytes = raw::subject_bytes(orig)?;
-            let value = read_integer_field(ctx, bytes, start, nbits, *flags)?;
+            let value = read_integer_field(machine, ctx, bytes, start, nbits, *flags)?;
             write_operand(machine, dst, value)?;
+            // `read_integer_field` allocates (a bignum) through the rooted seam, so a
+            // moving collector may have relocated the context read above: re-read the
+            // context operand before committing the new position (the frozen
+            // reserve, then read, then write ordering).
+            let term = reread_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
             raw::set_ctx_start(term, start + nbits);
             Ok(Some(Step::Next))
         }
@@ -213,7 +228,7 @@ pub(super) fn exec(
                 flags: _,
                 dst,
             } = &**b;
-            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
+            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
             let remaining = end.saturating_sub(start);
             let nbits = if is_all(module, size) {
                 remaining
@@ -221,16 +236,20 @@ pub(super) fn exec(
                 let size = read_size(machine, ctx, size)?;
                 match size.checked_mul(*unit as usize) {
                     Some(nbits) => nbits,
-                    None => return fail_step(machine, module, labels, *fail, term, ctx),
+                    None => return fail_step(machine, module, labels, *fail, ctx_op, ctx),
                 }
             };
             if nbits > remaining {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             let bytes = raw::subject_bytes(orig)?;
             let out = extract_bits(bytes, start, nbits)?;
-            let value = raw::make_bits(ctx, &out, nbits)?;
+            let value = raw::make_bits(machine, ctx, &out, nbits)?;
             write_operand(machine, dst, value)?;
+            // `raw::make_bits` reserves through the rooted seam, so a moving collector
+            // may have relocated the context read above: re-read the context operand
+            // before committing the new position (reserve, then read, then write).
+            let term = reread_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
             raw::set_ctx_start(term, start + nbits);
             Ok(Some(Step::Next))
         }
@@ -244,13 +263,13 @@ pub(super) fn exec(
             let (term, _, start, end) = read_ctx(machine, ctx, ctx_op, "bs_skip_bits2")?;
             let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             };
             let Some(next) = start.checked_add(nbits) else {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             };
             if next > end {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             raw::set_ctx_start(term, next);
             Ok(Some(Step::Next))
@@ -274,12 +293,12 @@ pub(super) fn exec(
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_match_string")?;
             let size = *bits as usize;
             if end.saturating_sub(start) < size {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             let pattern = module.strings.get(*offset as usize..).unwrap_or(&[]);
             let bytes = raw::subject_bytes(orig)?;
             if size > pattern.len() * 8 || !bits_equal(bytes, start, pattern, 0, size) {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             raw::set_ctx_start(term, start + size);
             Ok(Some(Step::Next))
@@ -298,18 +317,22 @@ pub(super) fn exec(
                 flags,
                 dst,
             } = &**b;
-            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
+            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
             let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             };
             if !matches!(nbits, 0 | 16 | 32 | 64) || nbits > end.saturating_sub(start) {
-                return fail_step(machine, module, labels, *fail, term, ctx);
+                return fail_step(machine, module, labels, *fail, ctx_op, ctx);
             }
             let bytes = raw::subject_bytes(orig)?;
             let value = read_float_field(bytes, start, nbits, *flags)?;
-            let float = crate::terms::make_float(ctx, value)?;
+            let float = crate::terms::make_float(machine, ctx, value)?;
             write_operand(machine, dst, float)?;
+            // `make_float` reserves through the rooted seam, so a moving collector may
+            // have relocated the context read above: re-read the context operand
+            // before committing the new position (reserve, then read, then write).
+            let term = reread_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
             raw::set_ctx_start(term, start + nbits);
             Ok(Some(Step::Next))
         }
@@ -329,7 +352,7 @@ pub(super) fn exec(
                     raw::set_ctx_start(term, start + len);
                     Ok(Some(Step::Next))
                 }
-                None => fail_step(machine, module, labels, *fail, term, ctx),
+                None => fail_step(machine, module, labels, *fail, ctx_op, ctx),
             }
         }
         Instr::BsGetUtf16 {
@@ -348,7 +371,7 @@ pub(super) fn exec(
                     raw::set_ctx_start(term, start + len);
                     Ok(Some(Step::Next))
                 }
-                None => fail_step(machine, module, labels, *fail, term, ctx),
+                None => fail_step(machine, module, labels, *fail, ctx_op, ctx),
             }
         }
         // `bs_get_utf32` is rewritten by `emu/ops.tab` into
@@ -370,7 +393,7 @@ pub(super) fn exec(
                     raw::set_ctx_start(term, start + len);
                     Ok(Some(Step::Next))
                 }
-                None => fail_step(machine, module, labels, *fail, term, ctx),
+                None => fail_step(machine, module, labels, *fail, ctx_op, ctx),
             }
         }
         Instr::BsSkipUtf8 {
@@ -393,7 +416,7 @@ pub(super) fn exec(
                     raw::set_ctx_start(term, start + len);
                     Ok(Some(Step::Next))
                 }
-                None => fail_step(machine, module, labels, *fail, term, ctx),
+                None => fail_step(machine, module, labels, *fail, ctx_op, ctx),
             }
         }
         Instr::BsSkipUtf32 {

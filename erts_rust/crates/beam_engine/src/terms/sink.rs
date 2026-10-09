@@ -1,0 +1,177 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
+//! The **node sink**: the storage abstraction a shape writer carves the nodes of a
+//! multi-node term out of.
+//!
+//! Two implementations, one per allocation discipline, so a shape (a
+//! `{M,F,A,Location}` stacktrace item, its `[{file,File},{line,N}]` location, a
+//! proper list) has exactly **one** definition regardless of which the caller can
+//! use:
+//!
+//! * [`Slack`] — the **rooted** sink. The caller reserves the whole graph in ONE
+//!   rooted allocation ([`reserve_slack`], [`crate::context::RootSet::ALL_LIVE`]) and
+//!   every node is carved out of that single region via [`Slack::alloc_words`]. It
+//!   never touches the context heap, so nothing can collect between nodes and the
+//!   nodes already written (whose pointers are not roots) stay put — which is what
+//!   makes a multi-node build correct under a **moving** collector.
+//! * [`ContextSink`] — the **unrooted** sink. Each node is one
+//!   [`ExecutionContext::alloc_words`], which never collects (only `ensure_heap`/
+//!   `alloc_words_rooted` do). It is the one sanctioned exception for callers that
+//!   hold **no** machine roots at all — the read-only `&self` execution-position
+//!   accessors, whose `&self` receiver cannot lend the machine's `&mut` root slices
+//!   ([`crate::machine::location`]).
+//!
+//! Both share the same low-level writers ([`write_tuple_at`], [`write_list_at`]), so
+//! the word layout of a tuple/list node is defined once.
+
+use beam_common::Result;
+use beam_term::{make_arityval, make_tuple, Eterm, NIL};
+
+use super::Slack;
+use crate::context::ExecutionContext;
+
+/// A sink a term-shape writer carves its nodes out of.
+///
+/// The trait is deliberately tiny: every node a shape writer builds is either a
+/// tuple or a proper list, and both are expressed with the two methods below. The
+/// implementation chooses *where* the words come from (one rooted reservation carved
+/// node-by-node, or one `alloc_words` per node) and nothing else.
+pub trait Sink {
+    /// Build the tuple `{Elem, …}` out of `elems`, carving the `1 + elems.len()`-word
+    /// block (`arityval` header + elements) from the sink.
+    fn tuple(&mut self, elems: &[Eterm]) -> Result<Eterm>;
+
+    /// Build the proper list `[Elem, …]` out of `elems` as `elems.len()` contiguous
+    /// `[CAR, CDR]` cells (`2 * elems.len()` words) carved from the sink, linked
+    /// front-to-back with the final `CDR` being [`NIL`]. The empty list is [`NIL`] and
+    /// carves nothing.
+    fn list(&mut self, elems: &[Eterm]) -> Result<Eterm>;
+}
+
+/// The **rooted** sink: the slack of one whole-region rooted reservation
+/// ([`reserve_slack`]), carved node-by-node.
+impl Sink for Slack {
+    fn tuple(&mut self, elems: &[Eterm]) -> Result<Eterm> {
+        let hp = self.alloc_words(elems.len() + 1)?;
+        // SAFETY: `alloc_words` returned `1 + elems.len()` exclusively-owned, writable
+        // words inside this slack's reserved region, which nothing else writes.
+        Ok(unsafe { write_tuple_at(hp, elems) })
+    }
+
+    fn list(&mut self, elems: &[Eterm]) -> Result<Eterm> {
+        if elems.is_empty() {
+            return Ok(NIL);
+        }
+        let hp = self.alloc_words(2 * elems.len())?;
+        // SAFETY: `alloc_words` returned `2 * elems.len()` exclusively-owned, writable
+        // words inside this slack's reserved region, which nothing else writes.
+        Ok(unsafe { write_list_at(hp, elems) })
+    }
+}
+
+/// The **unrooted** sink: one [`ExecutionContext::alloc_words`] per node.
+///
+/// # Moving safety
+///
+/// [`ExecutionContext::alloc_words`] hands out a stable pointer to `n` uninitialized
+/// words that stay valid and unmoved until the next `ensure_heap`/collecting
+/// allocation; it never collects itself. A caller may therefore only use this sink
+/// for a shape whose operands are **not machine-heap terms held across an
+/// allocation** — everything it builds must come from module metadata and immediates
+/// (atoms, small ints, and nodes this same sink already built). A caller that *does*
+/// hold machine-heap operands must use the rooted [`Slack`] sink instead, which
+/// reserves the whole graph before reading any operand.
+pub struct ContextSink<'a> {
+    ctx: &'a mut dyn ExecutionContext,
+}
+
+impl<'a> ContextSink<'a> {
+    /// A sink allocating each node through `ctx`.
+    pub fn new(ctx: &'a mut dyn ExecutionContext) -> ContextSink<'a> {
+        ContextSink { ctx }
+    }
+}
+
+impl Sink for ContextSink<'_> {
+    fn tuple(&mut self, elems: &[Eterm]) -> Result<Eterm> {
+        let hp = self.ctx.alloc_words(elems.len() + 1)?;
+        // SAFETY: `alloc_words` returned `1 + elems.len()` words valid until the next
+        // collecting allocation; the write below is the very next thing this sink
+        // does, and `alloc_words` never collects.
+        Ok(unsafe { write_tuple_at(hp, elems) })
+    }
+
+    fn list(&mut self, elems: &[Eterm]) -> Result<Eterm> {
+        if elems.is_empty() {
+            return Ok(NIL);
+        }
+        let hp = self.ctx.alloc_words(2 * elems.len())?;
+        // SAFETY: `alloc_words` returned `2 * elems.len()` words valid until the next
+        // collecting allocation; the write below is the very next thing this sink
+        // does, and `alloc_words` never collects.
+        Ok(unsafe { write_list_at(hp, elems) })
+    }
+}
+
+/// Write the tuple `{elems…}` into `1 + elems.len()` words at `hp`.
+///
+/// # Safety
+///
+/// `hp` must point at `1 + elems.len()` exclusively-owned, writable words that
+/// nothing else writes and that stay put for as long as the returned term is live.
+pub(crate) unsafe fn write_tuple_at(hp: *mut Eterm, elems: &[Eterm]) -> Eterm {
+    // SAFETY: the caller guarantees `1 + elems.len()` exclusive words at `hp`; word 0
+    // receives the `arityval` header (`elems.len() <= MAX_ARITYVAL` is the caller's
+    // shape contract, and every shape this module writes is a 3- or 4-element tuple)
+    // and words `1..=n` the elements.
+    unsafe {
+        *hp = make_arityval(elems.len());
+        for (i, elem) in elems.iter().enumerate() {
+            *hp.add(1 + i) = *elem;
+        }
+    }
+    make_tuple(hp)
+}
+
+/// Write the proper list `[elems…]` into `2 * elems.len()` words at `hp`.
+///
+/// # Safety
+///
+/// `hp` must point at `2 * elems.len()` exclusively-owned, writable words that
+/// nothing else writes and that stay put for as long as the returned term is live.
+/// `elems` must not be empty (the empty list is [`NIL`] and has no block).
+pub(crate) unsafe fn write_list_at(hp: *mut Eterm, elems: &[Eterm]) -> Eterm {
+    let n = elems.len();
+    // SAFETY: the caller guarantees `2 * n` exclusive words at `hp`; the cells are
+    // `[CAR, CDR]` pairs tagged `TAG_PRIMARY_LIST`, the last `CDR` is `NIL` and every
+    // earlier `CDR` points at the next contiguous cell inside the same block.
+    unsafe {
+        for (i, elem) in elems.iter().enumerate() {
+            *hp.add(2 * i) = *elem;
+            *hp.add(2 * i + 1) = if i + 1 == n {
+                NIL
+            } else {
+                beam_term::make_list(hp.add(2 * (i + 1)))
+            };
+        }
+    }
+    beam_term::make_list(hp)
+}

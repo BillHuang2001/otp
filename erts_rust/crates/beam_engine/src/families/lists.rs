@@ -49,10 +49,11 @@ use crate::interpreter::LabelMap;
 
 use beam_common::Result;
 use beam_loader::{Instr, Module};
+use beam_term::Eterm;
 
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, RootSet};
 use crate::machine::Machine;
-use crate::operand::{read_operand, write_operand};
+use crate::operand::{operand_slack_words, read_operand, read_operand_slack, write_operand};
 use crate::terms;
 use crate::Step;
 
@@ -78,9 +79,13 @@ pub(crate) fn exec(
     let _ = (labels, func, pc);
     match instr {
         Instr::PutList { head, tail, dst } => {
-            let h = read_operand(machine, ctx, head)?;
-            let t = read_operand(machine, ctx, tail)?;
-            let cons = terms::make_cons(ctx, h, t)?;
+            let extra = operand_slack_words(head) + operand_slack_words(tail);
+            let cons = terms::make_cons(machine, ctx, RootSet::ALL_LIVE, extra, |m, s| {
+                Ok((
+                    read_operand_slack(m, head, s)?,
+                    read_operand_slack(m, tail, s)?,
+                ))
+            })?;
             write_operand(machine, dst, cons)?;
             Ok(Some(Step::Next))
         }
@@ -94,9 +99,10 @@ pub(crate) fn exec(
                     Ok(Some(Step::Next))
                 }
                 // `[]` or a non-list is not a cons cell.
-                _ => machine
-                    .throw_error(terms::badmatch_reason(ctx, module, value)?)
-                    .map(Some),
+                _ => {
+                    let reason = badmatch(machine, ctx, module, source)?;
+                    machine.throw_error(reason).map(Some)
+                }
             }
         }
 
@@ -107,9 +113,10 @@ pub(crate) fn exec(
                     write_operand(machine, head, h)?;
                     Ok(Some(Step::Next))
                 }
-                Err(_) => machine
-                    .throw_error(terms::badmatch_reason(ctx, module, value)?)
-                    .map(Some),
+                Err(_) => {
+                    let reason = badmatch(machine, ctx, module, source)?;
+                    machine.throw_error(reason).map(Some)
+                }
             }
         }
 
@@ -120,12 +127,26 @@ pub(crate) fn exec(
                     write_operand(machine, tail, t)?;
                     Ok(Some(Step::Next))
                 }
-                Err(_) => machine
-                    .throw_error(terms::badmatch_reason(ctx, module, value)?)
-                    .map(Some),
+                Err(_) => {
+                    let reason = badmatch(machine, ctx, module, source)?;
+                    machine.throw_error(reason).map(Some)
+                }
             }
         }
 
         _ => Ok(None),
     }
+}
+
+/// The `{badmatch, Source}` reason for a non-cons `source`, re-reading the operand
+/// **after** the reason block's reserve (see [`crate::terms::badmatch_reason`]).
+fn badmatch(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    module: &Module,
+    source: &beam_loader::Operand,
+) -> Result<Eterm> {
+    terms::badmatch_reason(machine, ctx, RootSet::ALL_LIVE, module, |m, s| {
+        read_operand_slack(m, source, s)
+    })
 }

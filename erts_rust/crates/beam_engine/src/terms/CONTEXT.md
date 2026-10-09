@@ -1,0 +1,138 @@
+# `beam_engine::terms` — the boxed-term builder/reader over the heap seam
+
+## Intent
+The engine's term-heap glue. Term *construction/inspection* is owned by `beam_term` (the
+frozen-layout LCA, which never allocates); this node obtains raw storage from the execution
+context and passes it to the `beam_term` writers, and reads terms back for the interpreter.
+It is the crate's — and the widened interpreter's — **single point of raw-heap access**
+(`lib.rs` lifts the crate-wide `#![deny(unsafe_code)]` for `pub mod terms` alone, alongside
+`predicates`). Only the **heap binary** family has no `beam_term` owner and hand-rolls its
+layout here, pinned to the C ground truth.
+
+## The frozen allocation discipline: reserve → read → write
+`ExecutionContext::alloc_words_rooted` may be backed by a **moving** collector: it relocates
+every term reachable from the `RootSet` it is handed (`x`/`stack`/`fr`) and rewrites those
+slices **in place**. Therefore any `Eterm` *copy* held in a Rust local across a collecting
+allocation is a stale pointer, and a `*mut Eterm` from a previous allocation is dead. Every
+builder here follows (`slack.rs` module docs):
+1. reserve the whole block **first** with *exactly one* rooted allocation (`reserve` /
+   `reserve_slack`) — the collection happens here;
+2. then read every operand from the machine's **post-collection** state (a builder's `read`
+   closure, reading through `crate::operand::read_operands_slack` / `read_operand_slack`);
+3. then write the header/tag words.
+Nothing may allocate from the BEAM heap between the reserve and the final write. An operand
+that would itself need a heap block (a non-small `integer`/`character` → an exact bignum) is
+materialized into the reserved block's spare tail via `Slack::integer`, so the build still
+costs a single allocation. `live` is `RootSet::ALL_LIVE` whenever the caller has no
+operand-derived count (always a safe over-approximation for a copying collector).
+
+Every in-crate builder **and every in-crate call site** (`families/**`, `machine/**`) is on
+this discipline: `rg -n 'ctx.alloc_words' src/families` is empty. The one sanctioned exception
+is the four `&self` accessors in `../machine/location.rs` (see Handoff below).
+
+## API Surface (`crate::terms::*`)
+- **Rooted builders** (`construct.rs`, `fun.rs`, `map.rs`, `number.rs`). Every builder is
+  `(machine: &mut Machine, ctx, live: u32, …, read: R)` where `R: FnOnce(&Machine, &mut Slack)
+  -> Result<…>` supplies the operands read *after* the reserve:
+  `make_tuple(machine, ctx, live, n_elems, extra, read)`,
+  `make_cons(machine, ctx, live, extra, read)`,
+  `make_list(machine, ctx, live, n, extra, read)` (**one** contiguous `2n`-word reservation),
+  `badmatch_reason(machine, ctx, live, module, read)`, `make_fun(...)`, `make_map`/`make_flatmap`,
+  `make_float`, `make_integer`, `make_heap_binary(machine, ctx, bytes)` (whole-X-file live).
+- **`reserve(machine, ctx, n, live) -> *mut Eterm`** — the single rooted admission point.
+- **`reserve_slack(machine, ctx, n) -> Slack`** — reserve `n` words rooted and wrap the
+  **whole** region in a `Slack`; the entry point for a multi-node build (below).
+- **`Sink`** (`sink.rs`) — the node-shape abstraction a shape writer carves from:
+  `tuple(&[Eterm])` (arityval + elements) and `list(&[Eterm])` (contiguous `[CAR,CDR]` cells,
+  empty ⇒ `NIL`). Two implementations, **one** definition per node shape:
+  - `impl Sink for Slack` — the **rooted** sink: every node is carved out of the one
+    reservation via the bump cursor (`Slack::alloc_words`). Nothing touches the context heap,
+    so nothing can collect between nodes and the nodes already written (whose pointers are not
+    roots) stay put. This is what makes a multi-node graph — e.g. a `{M,F,A,Location}`
+    stacktrace item plus its `[{file,File},{line,N}]` location, or a list of such items —
+    correct under a moving collector.
+  - `ContextSink::new(ctx)` — the **unrooted** sink: one `ctx.alloc_words` per node (a
+    `&self` caller that cannot lend `&mut` roots uses it; `alloc_words` never collects). It is
+    only moving-safe for shapes with **no** machine-heap operand held across an allocation.
+  A region too small for a node is a typed `crate::error::unsupported`, never a wrong term.
+- **Readers** (`read.rs`, `map.rs::map_entries`, `fun.rs`): `tuple_arity`, `tuple_element`,
+  `cons_head`, `cons_tail`, `list_elements`, `binary_bytes`, `fun_*`, `is_fun`, `is_hashmap`.
+  Wrong type / out-of-range ⇒ `BeamError::BadArg`; no reader panics.
+- Constants: `MAP_SMALL_MAP_LIMIT` (32, the flat-map/HAMT boundary), `HAMT_*` node offsets,
+  `ERL_ONHEAP_BINARY_LIMIT` (64), `HEAP_BIN_HEAD_WORDS`, `WORD_BYTES`.
+- `test_support` (`#[cfg(test)]`) — wrappers preserving the old 2-arg ergonomics over a
+  throwaway `Machine`; **never** moving-collector-safe, so they exist only for tests. In-module
+  tests reach them with an explicit `use super::test_support::{…};` (an explicit import shadows
+  the glob one, which still supplies the readers/constants).
+- `alloc_tests` (`#[cfg(test)] pub(crate)`) — a mock semi-space **moving** collector
+  (`MovingContext`) that relocates every term reachable from a `RootSet` and rewrites the root
+  slices in place, plus the tests proving (a) the builders route every allocation through
+  `alloc_words_rooted` and never through the unrooted seam, (b) a built tuple/list/map and a
+  one-reservation nested graph stay correct across a relocation, (c) peak live words stay
+  bounded under collection while the unrooted arena grows linearly in N. It is `pub(crate)` so
+  the family suites reuse it: `../families/records/tests/rooted.rs` and
+  `../families/bitstrings/matching/rooted.rs` drive those two families under the same collector.
+
+## Constraints
+- Safe Rust here only in the sense that raw-pointer work lives **only** in this node; every
+  `unsafe` block carries a `// SAFETY:` rationale and every `unsafe fn` a `# Safety` section.
+- `beam_common::{Result, BeamError}` only; never panic, never `unwrap()` runtime data, never
+  produce a wrong result — an unsupported case is a typed error.
+- Frozen term layout is `beam_term`'s; reuse its writers rather than re-deriving a layout
+  (the tuple/list node writers are shared by `construct.rs` and `sink.rs` via
+  `write_tuple_at`/`write_list_at`).
+- Files ~1000 lines, split by responsibility.
+
+## Routing Table
+- `mod.rs` → module wiring, the root re-exports and the layout constants.
+- `slack.rs` → the rooted reserve seam, `Slack` (bump cursor, `alloc_words`, `integer`),
+  `reserve`, `reserve_slack`; the reserve→read→write contract in the module docs.
+- `sink.rs` → the `Sink` trait, `impl Sink for Slack` (rooted carve), `ContextSink` (unrooted),
+  and the shared `write_tuple_at`/`write_list_at` node writers.
+- `construct.rs` → tuple/cons/list/`badmatch_reason`/heap-binary builders.
+- `number.rs` → `make_float`, `make_integer` (rooted) and `make_integer_unrooted` (the
+  operand-immediate path).
+- `map.rs` → flat-map/HAMT builder + `map_entries` walker.
+- `fun.rs` → the `ErlFunThing` builder/readers.
+- `read.rs` → the tuple/cons/list/binary readers.
+- `tests.rs` → in-module unit tests; `test_support.rs` → the test-only ergonomic wrappers;
+  `alloc_tests.rs` → the mock moving collector + the rooted-hook/peak-words proofs.
+
+## Handoff — the one call site still on the unrooted path (owner: `beam_rt`)
+`../machine/location.rs:277`/`:409` — the four `&self` accessors (`current_function`,
+`initial_call`, `current_location`, `current_stacktrace`) cannot lend the machine's `&mut` root
+slices, so they build through the **unrooted** [`ContextSink`]. Sanctioned: every term there
+comes from module metadata/immediates with no machine-heap operand held across an allocation,
+and `alloc_words` never collects. Adopting a rooted `&mut self` twin needs `beam_rt` to change
+`engines.engine_at(pid)` → `engines.engine_at_mut(pid)`
+(`beam_rt/src/native/memory/mod.rs:519-522`) — a change outside this crate.
+
+`../families/exceptions/stacktrace.rs`: `symbolic_stacktrace` sizes its whole graph from
+**metadata** first (`LocationShape`/`ItemShape`), takes **one** `reserve_slack`, then carves
+every node with [`Sink`] (a per-node allocation would strand the nodes already written — their
+pointers are not roots). `stacktrace_item` keeps its signature (it is `../machine/location.rs`'s
+entry point) and builds through [`ContextSink`]; one `write_location`/`write_item` definition
+parameterised by `&mut dyn Sink` keeps the rooted and unrooted paths from diverging.
+
+## Test Strategy
+In-module `#[cfg(test)]` unit tests against a `MinimalContext` arena: round-trips through the
+readers, raw-word layout assertions against stack buffers (allowed here — this is the SAFETY
+module), the wrong-type/limit error cases, and the carve discipline (`slack_carves_*` builds a
+nested graph out of ONE reservation and asserts the region is consumed exactly once;
+`a_carve_region_too_small_*` pins the typed error; `context_sink_*` covers the unrooted sink).
+The moving-collector discipline is proved by `alloc_tests.rs` (builders) and by the family
+suites `../families/records/tests/rooted.rs` and `../families/bitstrings/matching/rooted.rs`
+(which assert a real relocation occurred, the result is correct, and the vacated address was
+poisoned so a stale read could not pass). Cross-crate behaviour (the actual
+`{M,F,A,Location}` shapes, ETS/map HAMT copies) is covered by the owning families and by
+`beam_gc/tests/{map_copy,refc_binary_copy}.rs`; oracle cross-checks live in
+`beam_term/tests/oracle.rs`.
+
+## See Also
+- `../../CONTEXT.md` → the crate-level contracts and Handoff #11 (the `beam_rt` term-builders
+  still on the unrooted seam), plus the `{M,F,A,Location}` shape consumer
+  (`../families/exceptions/stacktrace.rs`) and the `&self` accessors
+  (`../machine/location.rs`).
+- `../../../beam_term/CONTEXT.md` → the frozen term/`map`/`bitstring`/`refc`/`fun` writers this
+  node calls.
+- `../context.rs` → `ExecutionContext::{alloc_words, alloc_words_rooted}` and `RootSet`.
