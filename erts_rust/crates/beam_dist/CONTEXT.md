@@ -507,7 +507,9 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   `runtime/scheduler.rs::pump_dist`) derives the node name from `-name`/`-sname` (`NodeName`), registers
   with `epmd` (`ALIVE2_REQ`), binds a listener and completes the `'N'` handshake as **server** via this
   crate's `ConnectionDriver`, then routes the inbound **send family** into local mailboxes through the
-  `InboundSink` impl (`LocalDeliverySink`, `beam_rt/src/runtime/scheduler.rs`). What is still missing:
+  `InboundSink` impl (`LocalDeliverySink`, `beam_rt/src/runtime/scheduler.rs`) — **gated by
+  `Runtime::allow_inbound_delivery`, which is default-OFF** (so a node handshakes and decodes inbound
+  traffic but routes nothing into a mailbox until a caller enables it; `beam_rt/src/runtime.rs`). What is still missing:
   the **connector half** and the `net_kernel` `{setup,…}`/`{nodeup,…}` protocol; every non-send delivery
   is `DeliveryOutcome::Unsupported`; and the node does **not** advertise `DFLAG_PUBLISHED`/visibility at
   startup (no `publish_flag` caller). The value/connection layer plus this accept-only wiring is the

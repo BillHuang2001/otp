@@ -530,9 +530,13 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **The raw `Table`/`TableAccess` read family still returns bare `Eterm`s that alias table storage** —
   the same hazard class the shared handle now closes at compile time. A caller can hold such a term past
   its borrow (or past `take`, or past the table itself) and then observe words reclaimed and reused by
-  a later same-size insert. Only `SharedTable` is escape-proof; the fix for the raw API is a cross-crate
-  decision (hosts consume it) — `ETS_SURFACE.md` §7.6 names every method that should move behind the
-  tagged-term discipline or a scoped `Table::view(&self)` handle.
+  a later same-size insert. The tagged `TableRead`/`TableWrite` views close this for terms, **with two
+  exceptions**: `TableWrite::as_requester` (a documented residual hazard re-exposing the raw
+  `TableAccess` bare-`Eterm` reads) and `TableWrite::heir`, whose `Copy` `Heir.data: Option<Eterm>` is a
+  table-owned gift-data copy that a later `set_heir`/`replace_heir` frees and recycles, so the term
+  escapes the guard's lifetime. The raw API fix is a cross-crate decision (hosts consume it) —
+  `ETS_SURFACE.md` §7.6 names every method that should move behind the tagged-term discipline or a
+  scoped `Table::view(&self)` handle.
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no fine-grained locking; the only synchronisation is `SharedTable`'s coarse `Arc<RwLock>`.
   The `{write_concurrency, auto}` and `{debug_hash_fixed_number_of_locks, N}` modes **are** representable

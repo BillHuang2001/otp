@@ -309,9 +309,18 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
 - Thread-specific / thread-preferred allocators (`tspec`/`tpref`), per-scheduler instances, and the
   delayed-dealloc queue + thread-progress barrier for cross-scheduler frees.
-- The variable-block engine's **strategy plugins** (`goodfit`/`bestfit`/`afit`) — `Strategy` selects
-  but all variants fall to first-fit. The legacy `mbcgs` carrier-pool **size-growth ladder** is not
-  modelled (the MBC pool scan is a linear first-fit).
+- The variable-block engine's **strategy plugins** (`goodfit`/`bestfit`/`afit`) — `AllocatorConfig::strategy`
+  is stored and reported but **never consulted by the alloc/free routing** (`core.rs`), so every `Strategy`
+  variant behaves identically (the plugin seam is reserved). The legacy `mbcgs` carrier-pool **size-growth
+  ladder** is not modelled (the MBC pool scan is a linear first-fit).
+- The per-allocator policy presets in `policy.rs` (`TEMP_ALLOC`/`SL_ALLOC`/`STD_ALLOC`/…) are reference
+  data: `registry.rs` builds every allocator from the one default `AllocatorConfig`, so those presets are
+  not installed and the policy is the same default for all 12 allocators.
+- `free_list::FreeList::refile` is dead (carries `#[allow(dead_code)]`): MBC coalescing (`mbc.rs::dealloc`)
+  unlinks neighbours with `remove` and re-files with `insert`, so `refile` is exercised only by its own tests.
+- `stats.rs`'s `Counters::{note_alloc_typed,note_free_typed,note_{sbc,mbc}_carrier_{up,down}}` are called by
+  the allocator wiring (`allocator/state.rs`); their `#[allow(dead_code)]` and "ahead of the allocator
+  wiring" comment are stale (the comments in `stats.rs` and `mbc.rs:195` predate the wiring).
 - Carrier pools / carrier migration between allocator instances; `madvise`/carrier shrinking.
 - `fix` (fixed-size type) allocators and `erts_alloc_permanent_aligned` cache-line-aligned permanents.
 - Runtime option parsing (`+MMscs`, `+Mea`, …) — `AllocatorConfig`/`CarrierPolicy` expose the knobs,

@@ -340,11 +340,12 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   see `run_queue.rs`), are follow-ups. `Scheduler::set_priority`/`SchedulerPool::set_priority` DO
   requeue an already-queued process. The `save_calls` *effect* (actually saving the last `N` calls for
   `seq_trace`/`dbg`) is not modelled — only the `process_flag(save_calls, N)` value contract.
-- **Pre-emption has no producer in Milestone 1.** `ProcessRunner::run` receives a `budget` and the
-  scheduler requeues on `RunOutcome::Yield`, and `tests/preemption.rs` proves a budget-respecting runner
-  interleaves CPU-bound processes round-robin with no starvation — but the production runner
-  (`beam_rt::RuntimeRunner`) ignores its `budget` and never yields, so a non-yielding process is not
-  pre-empted. Making `RuntimeRunner` honour the budget is the adoption `beam_rt` owes.
+- **Pre-emption is produced by `beam_rt`'s runner.** `beam_rt::RuntimeRunner::run` honours its `budget`
+  (charged at the machine's heap-admission points through `beam_rt/src/runner/budget.rs`) and returns
+  `RunOutcome::Yield`, parking the process at the exact instruction — `beam_rt/tests/preempt.rs` pins the
+  resulting interleaving. The crate-level contract is unchanged: the scheduler never pre-empts, so a
+  runner that ignored its budget and never yielded would still run to completion in one call (the
+  scheduler half is pinned by `tests/preemption.rs`).
 - **Process-dictionary interior and heap fragments.** The dictionary is modelled as a flat key/value
   list (no hash-array interior), and `erlang:process_info/1`'s view of it is still absent. A real
   in-heap `ErlHeapFragment` (a `beam_gc`/`beam_message`-owned type, still absent) is not modelled: saved
@@ -493,8 +494,10 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   signal behaviour, run the relevant probe: `erl -noshell -eval '<expr>, halt(0).'` — the oracle is OTP
   29.1.1 / erts-17.1. The `erl`-cross-checked suites (`tests/dict_oracle.rs`, `registry_monitors.rs`)
   skip loudly when `erl` is absent.
-- **Adoption owed by `beam_rt`/`beam_bifs`** (do NOT edit them from here): (1) `RuntimeRunner::run` must
-  honour `budget` and return `Yield`; (2) use `ProcessState::status_atom`/`Process::status` instead of
+- **Adoption notes for `beam_rt`/`beam_bifs`** (do NOT edit them from here; verify each item against the
+  consumer — several are already wired, e.g. the budget-honouring `RuntimeRunner` (1), the installed
+  `ProcessExitObserver` (9), and `send_fragmented` through `heap_and_mailbox_mut` (11)):
+  (1) `RuntimeRunner::run` honours `budget` and returns `Yield`; (2) use `ProcessState::status_atom`/`Process::status` instead of
   its own status mapping; (3) `erlang:demonitor/2 [flush]` → `demonitor_flush`; (4) `erlang:monitor/2`
   type dispatch via `MonitorKind::from_type_name` + `monitor_port_term`/`monitor_named`, and install
   `set_local_node` at boot for name targets; (5) `process_info(P, registered_name)` → `name_of`;
