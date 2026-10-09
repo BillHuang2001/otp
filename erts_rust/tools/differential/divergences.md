@@ -12,23 +12,20 @@ not here: today only `wire/new_fun_ext_encode`, `proc_signals/statistics_runtime
 and the A.9 boot seam remain.)
 
 ## A.3 — NIF C ABI (owner: `beam_abi` / `beam_rt` NifHost)
-- An atom name first interned *during* a NIF call is not readable back in the same call:
-  `enif_make_atom(env, "<new>")` then `enif_get_atom` → `0` in the Rust runtime vs `1` in the
-  oracle (same for `enif_get_atom_length`, `enif_make_new_atom(_len)`, `enif_make_atom_len`).
-  Cause: `NifHostImpl::atom_name` (`crates/beam_rt/src/nif.rs`) reads only the committed
-  `AtomTable`, not the in-flight `PendingInterner` (`intern_atom`). (The fresh name's
-  *identity* — one atom, `enif_is_identical` — does agree and is pinned in `nif_abi`.)
 - `enif_clear_env` clears a pending exception in the Rust runtime but not in the oracle
   (`crates/beam_abi/src/nif/enif/exception.rs`). (On the *process* env it is illegal C and
   SIGSEGVs the oracle.) The clean-env shape agrees and is pinned.
 - Host hooks whose success path has no implementation (a case would be a plain-value
   mismatch):
-  `enif_make_ref` (oracle `1`, rust falls back to `enif_make_badarg` → `error:badarg`);
+  `enif_make_ref` (oracle a fresh ref → `1`, rust falls back to `enif_make_badarg` → `error:badarg`);
   `enif_term_to_binary` on a valid term (oracle `1`, rust `0`);
-  `enif_binary_to_term` on valid ETF (oracle `1`, rust `0`);
-  `enif_make_existing_atom` / `enif_make_existing_atom_len` on a **held** name
+  `enif_binary_to_term` on a valid encoding (oracle the byte count consumed — `3` for the
+  3-byte `<<131,97,42>>` — rust `0`);
+  `enif_make_existing_atom` / `enif_make_existing_atom_len` on a name held in the **committed**
+  atom table but **not** interned during the call, e.g. `enif_make_existing_atom(env, "ok", …)`
   (oracle `1`, rust `0` — `NifHost::existing_atom` is a `None` stub,
-  `crates/beam_abi/src/nif/host.rs`);
+  `crates/beam_abi/src/nif/host.rs`; this is distinct from the within-call hit, which agrees and
+  is pinned in `nif_abi`);
   `enif_whereis_pid` on a **registered** name (oracle `1`, rust `0`).
   Their *failure* shapes (a missing atom/name, malformed ETF) DO agree and are pinned.
 - `enif_make_unique_integer` values differ by design (crate counters vs emulator state);
@@ -44,9 +41,9 @@ and the A.9 boot seam remain.)
   (the port's connected process — the delivered message is the term itself, never a
   `{Port, Term}` wrapper, `io.c:6162-6176`). Pinned byte-exactly by the new delivery family
   (`driver_abi` selectors `130..137`, images of `{7,42}`, `{ok,7}` and `{<<1,2,3>>,5}`).
-- The four forms' exact success code still differs (oracle `1` for a queued delivery, rust `0`
-  — the frozen `DriverHost::send_term` "accepted" code), so only the accept/refuse split is
-  pinned (selectors `30..38`).
+- The four forms' exact **success code** still differs (oracle `1` for a queued delivery, rust `0`
+  — the frozen `DriverHost::send_term` "accepted" code), so the return value is not pinned; the
+  accept/refuse split (selectors `30..38`) and the delivered term (the delivery family above) are.
 - **An `ErlDrvTerm` spec that interns a *new* atom is not delivered observably.** The Rust
   runtime's driver host records the name on its `PendingInterner` and never commits it, so the
   delivered term carries a nameless atom: an `ERL_DRV_ATOM` spec for `"driver_abi_term"` yields
