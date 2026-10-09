@@ -30,6 +30,9 @@
 //! * map size (`maps:size`), the sorted key list (`lists:sort(maps:keys/1)`) and a
 //!   set of `maps:get` results, including the flat-map / hash-map boundary at
 //!   [`MAP_SMALL_MAP_LIMIT`] (31/32/33 keys) and a 40-key hash map;
+//! * the flat-map **stored key order** (`cmp_flatmap_keys`): binary keys order
+//!   byte-lexicographically, atom keys by atom-table **index** (not by name),
+//!   cross-checked against `maps:to_list/1`;
 //! * bitstring bit size (`bit_size/1`), the individual bits (`[X || <<X:1>> <= B]`)
 //!   and the full bytes (`[Y || <<Y:8>> <= B]`) for `<<1:3>>`, `<<11:4>>`, a
 //!   10-bit window, an arbitrary byte-aligned binary, and the empty bitstring;
@@ -1231,4 +1234,162 @@ fn oracle_agrees_on_make_hash2_and_make_hash() {
             "make_hash({spec:?}) % (2^32-1)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Flat-map key order (`cmp_flatmap_keys` / the stored key order)
+// ---------------------------------------------------------------------------
+//
+// A flat map stores its keys in `erts_cmp_flatmap_keys` order
+// (`erts/emulator/beam/erl_utils.h:267-272`), which is reproduced by
+// [`cmp_flatmap_keys`]: two **atom** keys order by atom-table *index* (the C's
+// `key_a - key_b`), every other pair by the full term order [`cmp`]. The two
+// checks below pin that against the live oracle through its observable
+// `maps:to_list/1` order (a small map is flat, so its list order *is* the stored
+// key order), for the two interesting cases: binary keys (byte-lexicographic) and
+// atom keys (deliberately *not* name-ordered).
+
+/// Binary keys order byte-lexicographically: the stored key order is
+/// `<<"bin">> < <<"float">> < <<"list">>`, regardless of the insertion order (the
+/// pairs are deliberately inserted list-first, so an insertion-ordered map would
+/// disagree), and the oracle's `maps:to_list/1` reports the same ordinals.
+#[test]
+fn oracle_agrees_on_flatmap_binary_key_order() {
+    let atoms = AtomTable::new();
+
+    // The three keys as on-heap binaries; each returned buffer owns the payload its
+    // key term points into and must stay alive while the map is read.
+    let key_bytes: [&[u8]; 3] = [b"bin", b"float", b"list"];
+    let mut bufs: Vec<Vec<Eterm>> = Vec::new();
+    let keys: Vec<Eterm> = key_bytes
+        .iter()
+        .map(|bytes| {
+            let (buf, t) = build_heap_bits(bytes, bytes.len() * 8);
+            bufs.push(buf);
+            t
+        })
+        .collect();
+    let (bin_key, float_key, list_key) = (keys[0], keys[1], keys[2]);
+
+    // Deliberately non-sorted insertion order (list, bin, float) with the ordinals
+    // (2, 0, 1); the stored order must still be bin(0) < float(1) < list(2).
+    let pairs = [
+        (list_key, make_small(2)),
+        (bin_key, make_small(0)),
+        (float_key, make_small(1)),
+    ];
+    let (_buf, map) = build_map(&pairs, &atoms);
+    // SAFETY: `map` is a live boxed map with three pairs.
+    assert!(unsafe { is_flatmap(map) }, "3 keys must build a flat map");
+
+    let stored: Vec<i64> = map_pairs_storage_order(map)
+        .expect("map_pairs_storage_order")
+        .iter()
+        .map(|(_, v)| signed_value(*v))
+        .collect();
+    assert_eq!(
+        stored,
+        vec![0, 1, 2],
+        "flat-map stored order must be bin < float < list",
+    );
+    assert_ne!(
+        stored,
+        vec![2, 0, 1],
+        "flat-map stored order must not be the insertion order",
+    );
+
+    assert_eq!(
+        cmp_flatmap_keys(bin_key, float_key, &atoms),
+        Ordering::Less,
+        "cmp_flatmap_keys(<<\"bin\">>, <<\"float\">>)",
+    );
+    assert_eq!(
+        cmp_flatmap_keys(list_key, bin_key, &atoms),
+        Ordering::Greater,
+        "cmp_flatmap_keys(<<\"list\">>, <<\"bin\">>)",
+    );
+
+    let expr = "M = #{<<\"bin\">>=>0,<<\"float\">>=>1,<<\"list\">>=>2}, \
+                io:format(\"~w\", [[I || {_,I} <- maps:to_list(M)]])";
+    let Some(out) = erl_stdout(expr) else {
+        eprintln!("skipping flat-map binary-key order check: no oracle");
+        return;
+    };
+    let oracle: Vec<Option<i64>> = parse_int_list(&out);
+    let stored_as_options: Vec<Option<i64>> = stored.iter().map(|v| Some(*v)).collect();
+    assert_eq!(
+        oracle, stored_as_options,
+        "oracle maps:to_list ordinals vs the stored key order",
+    );
+}
+
+/// Atom keys order by atom-table **index**, not by name: `"zzzq_two"` is interned
+/// before `"zzzq_one"` (so it has the lower index) while sorting *after* it
+/// lexicographically, so the stored key order is `two, one` (= ordinals `[2, 1]`)
+/// and the oracle's `maps:to_list/1` reports the same (deliberately
+/// non-name-sorted) order.
+#[test]
+fn oracle_agrees_on_flatmap_atom_key_order() {
+    let mut atoms = AtomTable::new();
+    // Intern in an order opposite to the name order: `zzzq_two` gets the lower index.
+    atoms.seed(["zzzq_two", "zzzq_one"]);
+    let two = make_atom(atoms.lookup("zzzq_two").expect("interned"));
+    let one = make_atom(atoms.lookup("zzzq_one").expect("interned"));
+    assert!(
+        atom_val(two).raw() < atom_val(one).raw(),
+        "test premise: `zzzq_two` is interned before `zzzq_one`",
+    );
+
+    let pairs = [(two, make_small(2)), (one, make_small(1))];
+    let (_buf, map) = build_map(&pairs, &atoms);
+    // SAFETY: `map` is a live boxed map with two pairs.
+    assert!(unsafe { is_flatmap(map) }, "2 keys must build a flat map");
+
+    let stored: Vec<i64> = map_pairs_storage_order(map)
+        .expect("map_pairs_storage_order")
+        .iter()
+        .map(|(_, v)| signed_value(*v))
+        .collect();
+    assert_eq!(
+        stored,
+        vec![2, 1],
+        "atom keys order by index, so `zzzq_two`(2) precedes `zzzq_one`(1)",
+    );
+
+    assert_eq!(
+        cmp_flatmap_keys(two, one, &atoms),
+        Ordering::Less,
+        "cmp_flatmap_keys(zzzq_two, zzzq_one) must order by index",
+    );
+    assert_eq!(
+        cmp_flatmap_keys(one, two, &atoms),
+        Ordering::Greater,
+        "cmp_flatmap_keys(zzzq_one, zzzq_two) must order by index",
+    );
+
+    let expr = "A2 = list_to_atom(\"zzzq_two\"), A1 = list_to_atom(\"zzzq_one\"), \
+                M = #{A2=>2,A1=>1}, \
+                io:format(\"~w\", [[I || {_,I} <- maps:to_list(M)]])";
+    let Some(out) = erl_stdout(expr) else {
+        eprintln!("skipping flat-map atom-key order check: no oracle");
+        return;
+    };
+    let oracle_ordinals: Vec<i64> = parse_int_list(&out)
+        .into_iter()
+        .map(|v| v.expect("no `none` in a maps:to_list ordinal list"))
+        .collect();
+    assert_eq!(oracle_ordinals.len(), 2, "unexpected oracle output: {out:?}");
+
+    // Derive the expectation from the oracle rather than guessing it.
+    assert_eq!(
+        stored, oracle_ordinals,
+        "stored atom-key order must equal the oracle's maps:to_list order",
+    );
+    // Teeth: the oracle's order is the NON-name-sorted one (`zzzq_one` would sort
+    // before `zzzq_two` lexicographically), so *index* order drives the stored order.
+    assert_ne!(
+        oracle_ordinals,
+        vec![1, 2],
+        "the order must not be the lexicographic name order (that would prove nothing)",
+    );
 }

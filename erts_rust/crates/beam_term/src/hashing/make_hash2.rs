@@ -26,31 +26,37 @@
 //! are a compatibility contract**: the system ERTS produces them, so a Rust term
 //! must hash identically (Level-1 drop-in).
 //!
-//! The reachable typed failure is a `FunKind::Local` fun (a `make_fun3` closure),
-//! whose inlined 2-word descriptor carries no module and no `old_uniq`; it is
-//! reported as `TermError::FunIdentityUnavailable` — see the `common` submodule
-//! for the shared error-handling note.
+//! The reachable typed failures for a well-formed term are two identity gaps: a
+//! `FunKind::Local` fun (a `make_fun3` closure), whose inlined 2-word descriptor
+//! carries no module and no `old_uniq` (`TermError::FunIdentityUnavailable`), and an
+//! internal reference, whose C hash mixes an id of the node container this tree's M1
+//! `Ref` thing does not carry (`TermError::RefIdentityUnavailable`) — see the
+//! `common` submodule for the shared error-handling note.
+//!
+//! A **native record** hashes bit-exactly: the C mixes the definition's cached
+//! `hash` word (`erl_term_hashing.c:1093-1096`), which this crate computes from the
+//! definition block itself (see [`compute_record_definition_hash`]) because
+//! `record::write_record` can only store a placeholder there.
 
 use crate::atom::AtomTable;
 use crate::bitstring::float_bits;
 use crate::boxed::{
-    arityval, boxed_val, header_arity, header_subtag, internal_ref_numbers, is_arity_value,
-    is_boxed_term, make_header, map_header_val,
+    arityval, boxed_val, header_arity, header_subtag, is_arity_value, is_boxed_term, make_header,
+    map_header_val,
 };
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::fun::{
-    fun_arity, fun_env, fun_function, fun_index, fun_kind_of_header, fun_module, fun_num_free,
-    fun_old_uniq, FunKind,
+    fun_env, fun_function, fun_index, fun_kind_of_header, fun_module, fun_num_free, fun_old_uniq,
+    fun_true_arity, FunKind,
 };
 use crate::immediate::{
-    atom_val, internal_port_data, is_byte, is_small, pid_number, signed_value, unsigned_value,
+    atom_val, internal_port_data, is_byte, pid_number, signed_value, unsigned_value,
 };
 use crate::list::{is_list, list_val};
 use crate::record::{
-    record_declaration_keys, record_definition, record_definition_hash,
-    record_definition_is_exported, record_definition_module, record_definition_name,
-    record_field_count, record_values,
+    record_declaration_keys, record_definition, record_definition_is_exported,
+    record_definition_module, record_definition_name, record_field_count, record_values,
 };
 use crate::tag::{
     primary_tag, PrimaryTag, ARITYVAL_SUBTAG, BIN_REF_SUBTAG, EXTERNAL_PID_SUBTAG,
@@ -166,11 +172,16 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                     RECORD_SUBTAG => {
                         let field_count = unsafe { record_field_count(term)? };
                         let def = unsafe { record_definition(term)? };
-                        let hash_term = unsafe { record_definition_hash(def)? };
-                        if !is_small(hash_term) {
-                            return Err(TermError::BadRecord);
-                        }
-                        let def_hash_val = unsigned_value(hash_term) as u32;
+                        // `term_to_Uint(defp->hash, &def_hash_val)`
+                        // (`erl_term_hashing.c:1093-1096`): the definition's cached
+                        // `hash` word, which `records:create/4` sets to
+                        // `make_hash2({module, name, is_exported, keys-in-declaration-order})`
+                        // (`erl_record.c:1041-1054`). This tree's `record::write_record`
+                        // stores a caller-supplied placeholder there, so the value is
+                        // *computed* from the definition (`compute_record_definition_hash`)
+                        // instead of read — the same value the C's cache holds, and the
+                        // only one that can be reproduced without the record BIF layer.
+                        let def_hash_val = compute_record_definition_hash(def, atoms)?;
                         let values = unsafe { record_values(term)? };
                         hash = uint32_hash_2(hash, field_count as u32, def_hash_val, HCONST_23);
                         if field_count == 0 {
@@ -334,7 +345,12 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                                 }
                             }
                             FunKind::External => {
-                                let arity = fun_arity(hdr);
+                                // The C mixes `ep->info.mfa.arity` — the `Export`'s
+                                // TRUE arity (`erl_term_hashing.c:1248-1255`), not the
+                                // header's 8-bit field. `mfa.arity` is a `Uint`, so the
+                                // `u32` cast is the C's own width.
+                                // SAFETY: `term` is a live external fun.
+                                let arity = unsafe { fun_true_arity(term)? };
                                 let module = unsafe { fun_module(term)? };
                                 let function = unsafe { fun_function(term)? };
                                 hash = uint32_hash_2(
@@ -414,15 +430,24 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                         to_common = true;
                     }
                     REF_SUBTAG => {
-                        // SAFETY: the header says internal reference.
-                        let nums = unsafe { internal_ref_numbers(term) };
-                        hash = uint32_hash(hash, nums[0], HCONST_7);
-                        to_common = true;
+                        // The C mixes `internal_ref_numbers(term)[0]`
+                        // (`erl_term_hashing.c:1454-1458`) — the first id of the
+                        // reference's **node container**. This tree's M1 on-heap `Ref`
+                        // thing (`[header, w1, w2]`) carries a single process-local id
+                        // and no node container, so the oracle's value (itself
+                        // environment-dependent) cannot be reproduced. Refuse rather
+                        // than mix a wrong number.
+                        return Err(TermError::RefIdentityUnavailable);
                     }
                     EXTERNAL_REF_SUBTAG => {
                         // SAFETY: the header says external reference.
                         let (_, ids, _) = unsafe { external_ref_parts(term) };
-                        let first = *ids.first().ok_or(TermError::BadFun)?;
+                        // `UINT32_HASH_RET(external_ref_numbers(term)[0], …)`
+                        // (`erl_term_hashing.c:1459-1461`): `external_ref_numbers` is
+                        // `&external_ref_data(x)[1]`, i.e. the word right after the id
+                        // count, so a zero-length reference mixes the zeroed word there
+                        // — 0 — rather than failing.
+                        let first = ids.first().copied().unwrap_or(0);
                         hash = uint32_hash(hash, first, HCONST_7);
                         to_common = true;
                     }

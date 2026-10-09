@@ -62,6 +62,15 @@ use crate::runtime::Runtime;
 /// pre-empts (yields) a CPU-bound process once
 /// `beam_process::DEFAULT_REDUCTIONS_PER_SLICE` (4000, charged at the machine's
 /// heap-admission points) is spent, so this constant is also the runtime's own slice budget.
+///
+/// **TODO (de-duplication): this local copy is to be REPLACED.** The same quantum is
+/// declared independently as this constant, `beam_io::port_task::CONTEXT_REDS` and
+/// `beam_process::scheduler::DEFAULT_REDUCTIONS_PER_SLICE`; the three are not linked at
+/// compile time. A single canonical owner is being established in the `beam_common`
+/// foundation crate (the workspace's lowest common ancestor, a dependency of every crate
+/// here); once that lands, replace this declaration — and the `beam_io`/`beam_process`
+/// copies — with a reference/re-export to the canonical constant. Until then the value
+/// below must stay `4000` (identical to the canonical one) so behaviour is unchanged.
 const CONTEXT_REDS: i64 = 4000;
 
 /// The `system_info/1` value of a `schedulers`-family key, or `None` when `key` is not

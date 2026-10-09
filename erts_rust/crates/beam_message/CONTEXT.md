@@ -276,8 +276,8 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   A **match context** `SUB_BITS` (its `orig` is *not* a `BinRef`, i.e. an on-heap bitstring) is instead
   **flattened** by `copy_match_context` into a fresh on-heap bitstring for the window `start..end`
   (`copy.c:849-863`), never copied verbatim, so the copy carries no `base_flags`/`orig` pointer into
-  the source heap; `object_words` sizes it `heap_bits_size_words(end - start)` and `for_each_child_slot`
-  yields no child, so the preflight agrees with the copy.
+  the source heap; `beam_term::layout::object_words` sizes it `heap_bits_size_words(end - start)` and
+  the sizing child-slot enumerator yields no child, so the preflight agrees with the copy.
 - **External pid/port/reference nodes: refcounted per identity, modeled locally.** Copying an
   external thing registers its node (`copy.c:882-909`) and copies the thing's words verbatim. There is
   **no node-registry crate anywhere in the workspace** and no `ErlNode *` to point at, so the node
@@ -313,17 +313,21 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - **A refc binary whose payload no held handle owns is a malformed graph ⇒ `BeamError::BadArg`.**
   The M1 encoding has no other way to recover the handle (there is no `Binary*` back-pointer), and a
   silent deep copy would be a wrong result.
-- **Per-object sizing is owned here; the whole-graph count is the copier's own.** A tiny local
-  `layout::object_words` gives the *single-object* word count the incremental allocator needs — the
-  same split as `beam_gc::copy`'s `move_size` — and `preflight_words`' `bounded_words` mirrors it to
-  give the whole-graph count the copier will actually write. `beam_term::size_object` (`size_object_x`
-  port) remains the canonical flat count and equals `bounded_words` for every shape that can cross a
-  copy boundary (incl. a `SUB_BITS` match context, whose `object_words` is the flattened window size). All
-  three size/walk every HAMT node kind with the same `1 + header_arity + popcount(MAP_HEADER_VAL)`
-  formulation, so a hash map copies as a whole trie.
+- **Per-object sizing comes from the LCA; the whole-graph count is the copier's own.**
+  `beam_term::layout::object_words` (the frozen term layout's owner, re-exported by `layout.rs`)
+  gives the *single-object* word count the incremental allocator needs — the same split as
+  `beam_gc::copy`'s `move_size` — and `preflight_words`' `bounded_words` mirrors it (walking the
+  child slots with the LCA's `for_each_sizing_child_slot`) to give the whole-graph count the copier
+  will actually write; the crate keeps **no** local copy of the walk. `beam_term::size_object`
+  (`size_object_x` port) remains the canonical flat count and equals `bounded_words` for every shape
+  that can cross a copy boundary (incl. a `SUB_BITS` match context, whose `object_words` is the
+  flattened window size). The LCA's `object_words` and child-slot enumerators cover every HAMT node
+  kind with the same `1 + header_arity + popcount(MAP_HEADER_VAL)` formulation, so a hash map copies
+  as a whole trie.
 ## Test Strategy
-- In-module `#[cfg(test)] mod tests` per module: `layout` (per-object word counts + child-slot
-  enumeration for tuple/record/fun/flatmap/**HAMT node**/off-heap container), `off_heap` (slot
+- In-module `#[cfg(test)] mod tests` per module: `layout` (the off-heap container round-trip and the
+  non-container negative case — the per-object sizing/child-slot walk itself is tested in
+  `beam_term::layout`), `off_heap` (slot
   push/get/clone bumps the refcount; `into_handles`; `drain_handles` empties the table and leaves it
   re-usable; binaries tracked beside the MSO list; `push_node` dedups and counts references; dropping
   the table releases them), `message` (builder + accessors for all three off-heap categories;
@@ -448,11 +452,6 @@ dominates the small shapes.)
   `THE_NON_VALUE` without panicking). The `beam_message` boundary is guarded by the cycle-safe
   `preflight_words`, but any other caller sizing a term with `size_object` (beam_gc, beam_rt, tools) is
   exposed; a bound/cycle guard belongs in `beam_term` (`src/size.rs`).
-- **`src/layout.rs` is a to-be-replaced duplicate walk.** `object_words`/`for_each_child_slot` re-derive
-  `beam_gc::copy::{move_size,scan_step,for_each_ref}` and `beam_term::size::describe_object` (`size.rs`);
-  all three are private/`pub(crate)`, so no LCA exposes one shared walk. `beam_term` is publishing a
-  canonical per-object sizing/copy walk that will replace this crate's local one — a follow-up batch
-  adopts it; delete `layout.rs`'s duplicate walk then.
 - **No sharing-preserving copy for the flat path.** `copy_struct` duplicates a repeated subterm
   (C's default); `copy_struct_shared` is the opt-in alternative. Only immediates, literal-area terms
   and the zero-arity tuple are shared outright.
@@ -500,7 +499,7 @@ dominates the small shapes.)
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + the cycle-safe `preflight_words`/`bounded_words`/`is_acyclic` + `size_of_copy`
 - `src/share.rs` → the sharing-preserving `copy_struct_shared` (source-identity memo over `copy.rs`'s `shallow`; preflights via `copy::preflight_words`)
 - `src/fragment.rs` → `HeapFragment` (bump region + off-heap table + roots) and `Fragments` (the chain + `move_into`, ownership released only after the whole chain moves); the `ErlHeapFragment` message-buffer model
-- `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/`SUB_BITS` sub-bits/off-heap container) + refc-binary/match-context/external-thing identification + the off-heap container encoding. A fun's block size (`1 + desc_words(kind) + num_free`) and its `env[0]` offset (`1 + desc_words(kind)`) come from `beam_term::fun` (`fun_kind_of_header`/`fun_desc_words`/`fun_num_free`), never the legacy C `ERL_FUN_SIZE`. To-be-replaced duplicate of `beam_term`'s forthcoming canonical walk (see Known Issues)
+- `src/layout.rs` → the beam_message-specific M1 **identification + encoding** helpers for the copier: off-heap container (`is_off_heap_container`/`is_off_heap_term`/`off_heap_slot`/`make_off_heap_container`), refc binary (`is_refc_binary_term`), match context (`is_match_context_term`) and external thing (`is_external_header`/`external_node_creation`). Per-object word counts and child-slot enumeration are **not** defined here — the canonical walk (`object_words`, `for_each_child_slot`, `for_each_sizing_child_slot`) is re-exported (`pub(crate) use`) from the LCA `beam_term::layout`
 - `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`, plus the refc-binary and node lists); MSO handle re-export
 - `src/node.rs` → `NodeEntry`, the refcounted `(node, creation)` external-thing node identity
 - `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + `Queue` FIFO

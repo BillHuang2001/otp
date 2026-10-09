@@ -39,6 +39,7 @@ per-function bodies. Files:
 | `prim.rs` | the `prim_file` floor (16 entries) — see below |
 | `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2`) + its unit tests |
 | `file_server.rs` | the native **`file_server_2` service** (contract A.9) — the registered service process + its native io-devices, the `gen_server`/`file`/`io` wire, and the scheduler-pass step that services their mailboxes (see below) |
+| `file_server/get_until.rs` | the `{get_until, …}` io-device request (`get_until::serve` + the engine-backed `EngineContinuation`) — the one io-device step that runs Erlang code, driving `Mod:Func(Cont, Data, XtraArgs…)` on the engine (see below); its unit tests live in `file_server/get_until/tests.rs` |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
 **`init:get_arguments/0` lists ONLY the command-line flags**, so it differs from the oracle by exactly its four automatic `root`/`bindir`/`progname`/`home` entries — which is why a `RuntimeConfig::default()` runtime (an empty `init_args`, so the listing is `[]`) stops the real boot script earlier, at instruction 16 (`application:load/1`, an `error function_clause`); the CLI-equivalent configuration runs the whole script to `{progress,started}` — the boot-chain consequence is in [`../boot/CONTEXT.md`](../boot/CONTEXT.md).
@@ -312,24 +313,40 @@ A request is either a **bare command atom** or a tuple whose head is the command
 `{position,At}` (`:1954`). Served for real: `close` (retires the device), `sync`, `datasync`,
 `truncate`, `{position,At}` (`At` is `bof`/`cur`/`eof` or `{Mark,Offset}`, and a bare non-negative
 integer is `file.erl`'s `{N,bof}` shorthand), `{get_chars,Enc,Prompt,N}` (shaped `binary`/`list`
-from the open mode) and `{put_chars,Enc,Chars}`. Every other request is the typed `unsupported` gap.
+from the open mode), `{put_chars,Enc,Chars}`, and `{get_until,Enc,Prompt,Mod,Func,XtraArgs}` (plus
+the legacy 4-tuple form, whose encoding defaults to `latin1`). The `{get_until,…}` arm is the one
+request that runs Erlang code: [`file_server/get_until.rs`](file_server/get_until.rs) owns the
+device's read loop (shared with `{get_chars,…}` through [`beam_io::io_device::IoDevice`]) and an
+engine-backed [`Continuation`] that loads `Mod` and runs `Mod:Func(Cont, Data | eof, XtraArgs…)` on
+the interpreter. Every other request is the typed `unsupported` gap.
+The reply tag is **paired** with the request tag, never echoed: `{io_request, …}` is answered
+`{io_reply, ReplyAs, Reply}` and `{file_request, …}` with `{file_reply, ReplyAs, Reply}`
+(`file_io_server.erl:199-239`), because every caller matches the reply on its **own** tag
+(`io.erl:1670`'s `execute_request` matches `io_reply`).
 
 #### Honest capability gaps (never a fabricated term)
-* **`{get_until,Enc,_Prompt,Mod,Func,XtraArgs}`** — the request `io:parse_erl_exprs/4`/
-  `scan_erl_exprs/4` use. `file_io_server` answers it with `io_lib:get_until/4` →
-  `apply(erl_scan, tokens, [Cont, Chars, Pos0, Options])` (`erl_scan:tokens/4`) — real Erlang
-  tokenizer code, and a native service process hosts no engine. Owner: a **`beam_engine`**-class
-  capability (an Erlang-engine host inside the native step), never a `beam_rt` gap to fake. The same
-  applies to `get_line`/`setopts`/`getopts`/`pread`/`pwrite`/`advise`/`allocate`/`read_handle_info`,
-  the legacy `put_chars` arities, a non-`latin1` encoding and `read_file_info`/`write_file`.
+* **`{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` is served** by
+  [`file_server/get_until.rs`](file_server/get_until.rs): the device's read loop drives an
+  engine-backed `Continuation` that loads `Mod` and runs `Mod:Func(Cont, Data, XtraArgs…)` on the
+  interpreter, decodes `{more, Cont}` / `{done, Reply, Buf}` and stashes `Buf` as the device's
+  `State#state.buf` (so the next request scans it first). Remaining typed gaps of that request:
+  a continuation that suspends in a `receive`; a leftover that is a deep iolist, a non-charlist,
+  a negative code point or a non-byte-aligned bitstring; a **request** encoding other than
+  `latin1`/`unicode`; and a request for a pid with no registered device (the "closed io device"
+  gap). The `{get_chars, …}` arm does not consult the stashed buffer, and a `{utf16,_}`/`{utf32,_}`
+  **stream** encoding is read as `latin1` (both shared divergences).
+* **Other io-device requests stay the typed `unsupported` gap** — `get_line`/`setopts`/`getopts`/
+  `pread`/`pwrite`/`advise`/`allocate`/`read_handle_info`, the legacy `put_chars` arities, a
+  non-`latin1` encoding and `read_file_info`/`write_file`.
 * **A scheduled process's `gen_server:call` to the service cannot complete** — the engine's
   non-blocking `fold_outcome` folds the callee's suspend into `error::blocked()`. Owner:
   **`beam_engine`**.
-* **`io:request/2` is not served by this crate's native `io` handling** (`../native.rs`'s `io` arm
-  covers only `put_chars/1,2`), so it loads the `io` module body and dies on `net_kernel:dflag_unicode_io/1`
-  — the typed `unsupported` gap `unsupported: net_kernel:dflag_unicode_io/1`. Consequently
-  `file:read/2`/`file:read_line/1` (the io-device read path) is unreachable from library code even
-  though the device itself serves `{get_chars,…}`. Owner: **`beam_rt`** (`../native.rs`).
+* **The io-device read path completes from library code; `file:read_line/1` is the residual gap.**
+  `io:request/2` loads the `io` module body, `net_kernel:dflag_unicode_io/1` is served (the
+  `RuntimeHooks` bridge) and the service answers with the tag **paired** to the request, so
+  `file:read/2`, `io:scan_erl_exprs/4` and `io:parse_erl_exprs/4` all complete and agree with the
+  oracle (`../tests/io_scan.rs`). `file:read_line/1`'s `{get_line,…}` request is not served (the
+  list above), so it stays the typed `unsupported` gap.
 
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
@@ -363,6 +380,10 @@ from the open mode) and `{put_chars,Enc,Chars}`. Every other request is the type
   the errno→atom table and the `binary`/`list` open-mode parse; the service is proven end to end over
   real temporary files/directories by `../tests/file_server.rs` (every rendering cross-checked
   against the live `erl`).
+- `file_server/get_until/tests.rs` pins the `{get_until, …}` request: the protocol decoders
+  (`interpret`, `leftover_from`), `Runtime::open_encoding`, the rejections, and the request end to
+  end through `Runtime::serve_device_request` over a real temporary file with the real
+  `erl_scan:tokens/4` on the engine (the stashed leftover is fed to the second request).
 - **Oracle values** are quoted in each test's doc comment and were re-verified against the system
   `erl` (`erl -noshell -eval '…'`, OTP 29.1.1 / erts-17.1). Where the runtime answers a typed
   capability gap the oracle answers a value, the test pins the `unsupported` outcome with a
@@ -390,6 +411,9 @@ from the open mode) and `{put_chars,Enc,Chars}`. Every other request is the type
 - `file_server.rs` → the native `file_server_2` service (`FileServices`, its `Device` io-devices and
   the request/reply wire) + its unit tests; the pass step is `Runtime::service_file_requests`
   (owned by `../runtime/scheduler.rs`)
+- `file_server/get_until.rs` → the `{get_until, …}` io-device request (`get_until::serve` + the
+  engine-backed `EngineContinuation` implementing `beam_io::io_device::Continuation`) + its unit
+  tests in `file_server/get_until/tests.rs`
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the `init` automatic flags (`root`/`home`/`progname`), the code server's `get_mode/0` and `application:get_application/0` included
 - `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl. `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling surfaces, and the port-write surface (contracts A.4/A.7/A.8/A.9)
 - `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`) + its unit tests
@@ -499,7 +523,7 @@ The per-call dispatch arm for every native BIF is a registration in `../native.r
 `../native.rs`'s module-doc table still omits those two names, so the parent node should add them there.
 `init:get_argument(root)` and `init:get_argument(home)` agree with the oracle through the same `init:get_argument/1` arm.
 `init:get_argument(progname)` is a deliberate, invocation-dependent gap: both runtimes report the basename **they** were invoked as (the oracle's `"erl"` comes from the `erl` shell script's `$0`), so the value is a property of the harness's invocation, not one this runtime may fabricate — never a wrong result.
-The `file_server_2` service's three cross-node gaps — the `{get_until,…}` tokenizer request and a scheduled `gen_server:call` (**`beam_engine`**), and `io:request/2`'s `net_kernel:dflag_unicode_io/1` (**`beam_rt`**'s `../native.rs`) — are itemised in the `file_server.rs` subsection above.
+The `file_server_2` service's remaining cross-node gap — a scheduled `gen_server:call` to the service (**`beam_engine`**) — is itemised in the `file_server.rs` subsection above.
 
 ## See Also
 - `../../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.

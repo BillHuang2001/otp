@@ -73,6 +73,19 @@ pub enum TermError {
     /// [`TermError::BadFun`] (see [`crate::hashing`]). Never substituted with a
     /// wrong value.
     FunIdentityUnavailable,
+    /// The operation needs identity information the term does not carry: the C
+    /// hashes an [internal reference](crate::boxed::internal_ref_numbers) through
+    /// `internal_ref_numbers(ref)[0]` — the first id of the reference's **node
+    /// container** (`erl_term_hashing.c:288-290` for `make_hash`, `:1454-1458` for
+    /// `make_hash2`) — but this tree's M1 on-heap `Ref` thing (`[header, w1, w2]`)
+    /// holds a single process-local id and no node container, so
+    /// `make_hash2`/`make_hash` cannot reproduce the oracle's value.
+    ///
+    /// This is *not* a malformed term — it is a well-formed term the operation
+    /// cannot faithfully complete — so it is deliberately distinct from
+    /// [`TermError::NotATerm`] (which says "this is not a term at all"). Never
+    /// substituted with a wrong value.
+    RefIdentityUnavailable,
     /// A native-record layout helper or accessor was applied to a term that is not
     /// a well-formed native record (an `ErtsRecordInstance` /
     /// `ErtsRecordDefinition`), or a record construction argument was invalid:
@@ -121,6 +134,7 @@ impl fmt::Display for TermError {
             TermError::BadBitstring => "invalid bitstring byte count",
             TermError::BadFun => "not a fun",
             TermError::FunIdentityUnavailable => "fun identity unavailable",
+            TermError::RefIdentityUnavailable => "reference identity unavailable",
             TermError::BadRecord => "not a record",
             TermError::NotATerm => "not a term",
             TermError::TermGraphCyclic => "term graph is cyclic",
@@ -149,6 +163,7 @@ impl core::error::Error for TermError {}
 /// | `BadBitstring` | `BadArg` | `badarg` |
 /// | `BadFun` | `BadArg` | `badarg` |
 /// | `FunIdentityUnavailable` | `BadArg` | `badarg` |
+/// | `RefIdentityUnavailable` | `BadArg` | `badarg` |
 /// | `BadRecord` | `BadArg` | `badarg` |
 /// | `NotATerm` | `BadArg` | `badarg` |
 /// | `TermGraphCyclic` | `BadArg` | `badarg` |
@@ -179,6 +194,10 @@ impl From<TermError> for BeamError {
             // no oracle reason to reproduce — the oracle simply never takes this
             // path, because its funs do carry the identity).
             TermError::FunIdentityUnavailable => BeamError::BadArg,
+            // Missing reference identity is the same kind of capability gap as
+            // `FunIdentityUnavailable` above: the term is well-formed, the node
+            // container the C mixes in is simply not carried here.
+            TermError::RefIdentityUnavailable => BeamError::BadArg,
             // A malformed native record reached a record layout helper, or a
             // record-construction argument was invalid: an argument failure.
             TermError::BadRecord => BeamError::BadArg,
@@ -225,6 +244,10 @@ mod tests {
             TermError::FunIdentityUnavailable.to_string(),
             "fun identity unavailable"
         );
+        assert_eq!(
+            TermError::RefIdentityUnavailable.to_string(),
+            "reference identity unavailable"
+        );
         assert_eq!(TermError::BadRecord.to_string(), "not a record");
         assert_eq!(TermError::NotATerm.to_string(), "not a term");
         assert_eq!(
@@ -257,6 +280,19 @@ mod tests {
         assert_ne!(TermError::FunIdentityUnavailable, TermError::BadFun);
     }
 
+    #[test]
+    fn ref_identity_unavailable_is_not_a_malformed_term() {
+        // Same rationale as `fun_identity_unavailable_is_not_bad_fun`: an internal
+        // reference is a perfectly well-formed term, it just does not carry the node
+        // container the C mixes into its hash — so it must be tellable from "this is
+        // not a term" and from the fun gap.
+        assert_ne!(TermError::RefIdentityUnavailable, TermError::NotATerm);
+        assert_ne!(TermError::RefIdentityUnavailable, TermError::BadFun);
+        assert_ne!(
+            TermError::RefIdentityUnavailable,
+            TermError::FunIdentityUnavailable
+        );
+    }
     #[test]
     fn term_graph_errors_are_distinguishable() {
         // The whole point of the two variants: "cannot size, it is cyclic" (a
@@ -300,6 +336,10 @@ mod tests {
         assert!(matches!(BeamError::from(TermError::BadFun), BeamError::BadArg));
         assert!(matches!(
             BeamError::from(TermError::FunIdentityUnavailable),
+            BeamError::BadArg
+        ));
+        assert!(matches!(
+            BeamError::from(TermError::RefIdentityUnavailable),
             BeamError::BadArg
         ));
         assert!(matches!(

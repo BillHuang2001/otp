@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use beam_common::BeamError;
-use beam_engine::Machine;
+use beam_engine::{Machine, Tier};
 use beam_loader::Module;
 use beam_process::ProcessId;
 use beam_term::{Atom, Eterm};
@@ -130,6 +130,20 @@ pub(super) struct ProcessEngine {
     /// `wait` with no timeout — including the `after infinity` the compiler emits as a plain
     /// `wait` — leaves it `None`, so the process parks indefinitely.
     pub(super) parked_timeout: Option<TimerHandle>,
+    /// The execution tier this process is running on, chosen at its **first** entry and
+    /// remembered for the rest of its life.
+    ///
+    /// It is selected there by
+    /// [`select_entry_tier`](super::tier::select_entry_tier) (or forced by a
+    /// [`JitMode`](super::tier::JitMode)) and written by the runner; every later re-entry —
+    /// a slice pre-empted on the reduction budget, or a `receive` that parked — resumes on
+    /// **this** tier through
+    /// [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier),
+    /// so a native-tier process is not silently demoted to the interpreter after its first
+    /// slice. A process that has not run yet holds the conservative
+    /// [`Tier::Interpreter`] (its first entry overwrites it), which is also the always-correct
+    /// value if a tier were ever read before that entry.
+    pub(super) tier: Tier,
 }
 
 /// The per-pid engine state and recorded outcomes of every process the runtime spawned.
@@ -189,6 +203,9 @@ impl RunnerState {
                 args,
                 parked: None,
                 parked_timeout: None,
+                // Only a placeholder: the process's first entry selects the real tier and
+                // writes it here (see the field docs).
+                tier: Tier::Interpreter,
             },
         );
     }

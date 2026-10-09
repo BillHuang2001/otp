@@ -1583,6 +1583,38 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tracing_tag_family() {
     }
 }
 
+/// `net_kernel:dflag_unicode_io/1` — the io-device unicode fast-path probe.
+///
+/// Oracle-verified (OTP 29/`erts-17.1`): a **local** pid answers the atom `true` (the
+/// C's `net_kernel_dflag_unicode_io_1` short-circuits for a pid on *this* node,
+/// `dist.c:6693-6709`); anything that is not a pid is `badarg`. A remote pid is the
+/// typed capability gap (no peer-flag accessor) rather than a fabricated `true`. A wrong
+/// arity is outside the roster, so no bridge is installed (bare `error:undef`).
+#[test]
+fn the_runtime_hooks_bridge_serves_the_dflag_unicode_io_probe() {
+    let mut rt = runtime();
+    let true_atom = rt.intern("true");
+    let me = rt.self_pid().to_eterm();
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    assert_eq!(
+        ctx.call_bif("net_kernel", "dflag_unicode_io", 1, &[me])
+            .expect("dflag_unicode_io/1 on a local pid"),
+        true_atom,
+        "a local pid answers `true`"
+    );
+    for argument in [make_small(42), NIL] {
+        let error = ctx
+            .call_bif("net_kernel", "dflag_unicode_io", 1, &[argument])
+            .expect_err("a non-pid is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
+    let error = ctx
+        .call_bif("net_kernel", "dflag_unicode_io", 0, &[])
+        .expect_err("an unlisted arity is not a RuntimeHooks key");
+    assert_eq!(error.as_atom(), Some("undef"), "{error}");
+}
+
 /// `erlang:system_profile/0`, `erlang:check_old_code/1`, `erlang:finish_loading/1` and the
 /// three `badarg`-always on-load-hook primitives.
 #[test]

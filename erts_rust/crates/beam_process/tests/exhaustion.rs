@@ -18,23 +18,30 @@
 //
 // %CopyrightEnd%
 
-//! Integration evidence for [`Process::deliver`]'s **collect-and-retry** on heap exhaustion.
+//! Integration evidence for [`Process::deliver`]'s **collect-grow-and-retry** on heap
+//! exhaustion.
 //!
 //! `Process::deliver` treats `BeamError::Alloc(AllocKind::Heap | AllocKind::Message)` as a
-//! *normal* condition: it collects the process's young heap once and retries the copy, and any
-//! other (or second) failure is propagated untouched. That branch had no coverage — this file
-//! exercises it deterministically, from both sides:
+//! *normal* condition: it collects and grows the receiver's young heap **on demand** to fit the
+//! refused request, retries the copy once, and any other (or second) failure is propagated
+//! untouched. The nursery is **bounded** — a collection alone never grows it past what it left
+//! alive — so a payload larger than the nursery is only delivered because the retry explicitly
+//! grows it (`Process::ensure_capacity`, seeded with the word count the copier reported). This
+//! file exercises that branch deterministically, from both sides:
 //!
 //! 1. [`deliver_retries_once_after_a_collection_and_enqueues_exactly_one_message`] — the copy is
-//!    refused on a full nursery, the retry's collection grows the nursery one curated step, and
-//!    the payload is enqueued **whole** and **once**.
+//!    refused on a full nursery, the retry collects once and grows the nursery on demand to the
+//!    smallest curated size covering the request, and the payload is enqueued **whole** and
+//!    **once**.
 //! 2. [`the_collection_leaves_the_heap_usable_for_a_second_delivery`] — the retried copy left the
-//!    nursery partly used, so the next, larger payload takes the same path again: the collection
-//!    left a usable heap, not a wedged one.
+//!    nursery partly used, so the next, larger payload takes the same path again: the explicit
+//!    growth left a usable heap, not a wedged one.
 //! 3. [`a_payload_that_cannot_fit_is_a_typed_error_and_leaves_the_mailbox_untouched`] — a
 //!    genuinely unfittable payload (a nursery bounded by the heap policy) is the typed
-//!    `BeamError::Alloc`, with the mailbox and the heap left exactly as they were. The copier
-//!    preflights capacity before writing a word, so there is no partial write and no half message.
+//!    `BeamError::Alloc`, with the mailbox and the heap left exactly as they were. The growth is
+//!    refused **fail-fast** (the policy's ceiling makes the request unreachable before anything is
+//!    collected), and the retry's own refusal — the copier preflights capacity before writing a
+//!    word — keeps there being no partial write and no half message.
 //!
 //! Determinism: every number below is derived from the public heap-policy arithmetic
 //! ([`beam_gc::next_heap_size`], `HeapPolicy::from_min_max`), never from a wall-clock bound or a
@@ -44,7 +51,7 @@
 
 use beam_alloc::Heap;
 use beam_common::{AllocKind, BeamError, Result};
-use beam_gc::{next_heap_size, HeapPolicy};
+use beam_gc::{next_heap_size, CollectionKind, HeapPolicy};
 use beam_message::OffHeapTable;
 use beam_process::prelude::*;
 use beam_term::compare;
@@ -88,23 +95,18 @@ fn fill_nursery(process: &mut Process) -> usize {
     capacity
 }
 
-/// A payload larger than the *free* space is refused, the single retry collects (which grows the
-/// nursery one curated step), and the payload then lands in the mailbox whole and exactly once.
+/// A payload larger than the whole nursery is refused, the single retry collects and grows the
+/// nursery **on demand** (to the smallest curated size covering the request), and the payload
+/// then lands in the mailbox whole and exactly once.
 #[test]
 fn deliver_retries_once_after_a_collection_and_enqueues_exactly_one_message() -> Result<()> {
     let mut receiver = Process::new(pid(1))?;
     let mut src = source();
 
     let capacity = fill_nursery(&mut receiver);
-    // The size a collection resizes a *filled* nursery to: one curated step past its capacity
-    // (`HeapPolicy::young_after_collection` -> `next_words(capacity, 1)`).
-    let grown = next_heap_size(capacity, 1);
-    assert!(grown > capacity);
-
-    // Larger than the free space (0 words), small enough for the grown nursery: the first copy
-    // must fail, the retry must succeed.
-    let payload_words = grown / 2;
-    assert!(payload_words > 0 && payload_words <= grown);
+    // One word larger than the whole nursery: the first copy is refused (0 free words), and a
+    // *bounded* nursery cannot fit it by collecting alone -- the retry must grow it on demand.
+    let payload_words = capacity + 1;
     let elems = tuple_elems(payload_words);
     let payload = src
         .tuple(&elems)
@@ -118,17 +120,28 @@ fn deliver_retries_once_after_a_collection_and_enqueues_exactly_one_message() ->
         DeliverOutcome::Enqueued | DeliverOutcome::Woke
     ));
 
-    // The collection really is what made room: the retry's collect ran exactly once and resized
-    // the nursery.
+    // The refusal collected exactly once (the on-demand growth's single collection) ...
     assert_eq!(
         receiver.collector().minor_gcs(),
         1,
         "the refused copy collected exactly once before retrying"
     );
+    // ... and then grew the nursery to the smallest curated size that covers the request -- NOT
+    // one step past the old capacity (a collection alone never grows a bounded nursery).
+    let grown = next_heap_size(payload_words, 0);
     assert_eq!(
         receiver.collector().young().capacity_words(),
         grown,
-        "the refused copy collected, and that collection grew the nursery one step"
+        "the retry grew the nursery on demand to the smallest size covering the request"
+    );
+    // The grown nursery covers the refused request, and the copied payload (and nothing else) now
+    // occupies it, so exactly `grown - payload_words` words are still free. (Availability is
+    // asserted directly on the growth seam in `ensure_capacity_grows_the_nursery_on_demand`, on the
+    // empty nursery before the copy consumes the room.)
+    assert_eq!(
+        receiver.collector().young().available_words(),
+        grown - payload_words,
+        "the grown nursery held the whole request, and only the request"
     );
 
     // Exactly ONE message: the retry re-enqueues, it does not enqueue twice.
@@ -159,7 +172,8 @@ fn deliver_retries_once_after_a_collection_and_enqueues_exactly_one_message() ->
 }
 
 /// The retried copy leaves the nursery partly used — and *usable*: the next, larger payload is
-/// refused again, collects, and is delivered. The two messages are whole and in FIFO order.
+/// refused again, collected and grown on demand, and delivered. The two messages are whole and in
+/// FIFO order.
 #[test]
 fn the_collection_leaves_the_heap_usable_for_a_second_delivery() -> Result<()> {
     let mut receiver = Process::new(pid(3))?;
@@ -167,9 +181,10 @@ fn the_collection_leaves_the_heap_usable_for_a_second_delivery() -> Result<()> {
     let from = pid(4).to_eterm();
 
     let capacity = fill_nursery(&mut receiver);
+    // The smallest curated size that covers the larger of the two payloads below: 376 words.
     let grown = next_heap_size(capacity, 1);
 
-    // Round 1: the payload only fits after the retry's collection (see the test above).
+    // Round 1: the payload only fits after the retry's collect-and-grow (see the test above).
     let first_words = grown / 2;
     let first_elems = tuple_elems(first_words);
     let first = src
@@ -185,9 +200,9 @@ fn the_collection_leaves_the_heap_usable_for_a_second_delivery() -> Result<()> {
     );
 
     // Round 2: only `grown - first_words` words are free, so this payload is refused too and takes
-    // the same collect-and-retry path. The retry succeeds because the collection resizes the
-    // nursery from what the round used (`HeapPolicy::young_after_collection`), which keeps the
-    // capacity the refused payload needs — the collection left a usable heap, not a wedged one.
+    // the same collect-grow-and-retry path. The retry succeeds because it grows the nursery **on
+    // demand** to cover the request (`Process::ensure_capacity`), which keeps the capacity the
+    // refused payload needs — the explicit growth left a usable heap, not a wedged one.
     let second_words = grown * 3 / 4;
     assert!(
         second_words > grown - first_words,
@@ -245,8 +260,9 @@ fn the_collection_leaves_the_heap_usable_for_a_second_delivery() -> Result<()> {
 ///
 /// The bound is made deterministic by the heap policy: with `max_heap_words == capacity` the
 /// nursery can never grow past its initial capacity, so a payload one word larger than the whole
-/// nursery is refused on the first copy, survives the collection, and is refused again by the
-/// retry.
+/// nursery is refused on the first copy, and the on-demand growth is declined **fail-fast** (the
+/// policy's ceiling leaves no room before anything is collected) — the retry then reproduces the
+/// refusal.
 #[test]
 fn a_payload_that_cannot_fit_is_a_typed_error_and_leaves_the_mailbox_untouched() -> Result<()> {
     let capacity = HeapPolicy::default().initial_young_words;
@@ -259,7 +275,9 @@ fn a_payload_that_cannot_fit_is_a_typed_error_and_leaves_the_mailbox_untouched()
     assert_eq!(receiver.collector().young().available_words(), capacity);
     assert_eq!(receiver.heap_used_words(), 0);
 
-    // One word past the whole nursery: unfittable under this policy, before AND after the collect.
+    // One word past the whole nursery: unfittable under this policy. `next_words(capacity + 1, 0)`
+    // clamps back to `max_heap_words == capacity < capacity + 1`, so the growth is refused without
+    // collecting anything.
     let oversized_words = capacity + 1;
     let oversized_elems = tuple_elems(oversized_words);
     let payload = src
@@ -277,19 +295,21 @@ fn a_payload_that_cannot_fit_is_a_typed_error_and_leaves_the_mailbox_untouched()
             assert_eq!(
                 failure.requested,
                 oversized_words * core::mem::size_of::<Eterm>(),
-                "the failure reports the words the copy still wanted"
+                "the retry's own refusal reports the words the copy still wanted"
             );
         }
         other => panic!("expected the typed allocation failure, got {other:?}"),
     }
 
-    // No partial write and no phantom message: the copier preflights before writing a word, and
-    // the recovery path never enqueues.
+    // The growth was refused fail-fast: it neither collected nor grew, so under this bound the
+    // collector is left exactly as it was (no collection ran at all).
     assert_eq!(
         receiver.collector().minor_gcs(),
-        1,
-        "the refused copy did collect once -- the retry was attempted, not skipped"
+        0,
+        "the unreachable request was refused before collecting"
     );
+    // No partial write and no phantom message: the copier preflights before writing a word, and
+    // the recovery path never enqueues.
     assert_eq!(receiver.mailbox().len(), 0, "a refused payload is not enqueued");
     assert_eq!(
         receiver.heap_used_words(),
@@ -299,7 +319,7 @@ fn a_payload_that_cannot_fit_is_a_typed_error_and_leaves_the_mailbox_untouched()
     assert_eq!(
         receiver.collector().young().capacity_words(),
         capacity,
-        "the bounded policy held: the collection could not grow the nursery"
+        "the bounded policy held: the growth could not enlarge the nursery"
     );
 
     // The bound is the nursery's size, not the retry: a payload that fits is delivered normally,
@@ -321,6 +341,50 @@ fn a_payload_that_cannot_fit_is_a_typed_error_and_leaves_the_mailbox_untouched()
         .tuple(&fitting_elems)
         .expect("the expected tuple fits the source heap");
     assert!(compare::eq(copied, expected, &AtomTable::new()));
+
+    Ok(())
+}
+
+/// [`Process::ensure_capacity`] is the explicit on-demand growth seam [`Process::deliver`] drives
+/// on its refusal path: it collects once and then grows the **bounded** nursery to the smallest
+/// curated size covering the request, leaving it empty and able to satisfy that request.
+#[test]
+fn ensure_capacity_grows_the_nursery_on_demand() -> Result<()> {
+    let mut process = Process::new(pid(7))?;
+    let capacity = process.collector().young().capacity_words();
+
+    // A request larger than the nursery -- unreachable by collecting alone, since a collection
+    // sizes the nursery from what it left alive, not from what is about to be allocated.
+    let need_words = capacity * 2;
+    assert!(
+        need_words > capacity,
+        "the request must exceed the initial nursery"
+    );
+
+    let collection = process.ensure_capacity(need_words)?;
+    assert_eq!(collection.kind, CollectionKind::Minor);
+
+    // The now-empty nursery was grown on demand to the smallest curated size covering the
+    // request, and it really can satisfy it.
+    assert_eq!(
+        process.collector().young().capacity_words(),
+        next_heap_size(need_words, 0),
+        "the nursery grew to the smallest curated size covering the request"
+    );
+    assert!(
+        process.collector().young().available_words() >= need_words,
+        "the grown nursery can hold the request"
+    );
+    assert_eq!(
+        process.heap_used_words(),
+        0,
+        "the collection left nothing live in the nursery -- the growth only resizes an empty space"
+    );
+    assert_eq!(
+        process.collector().minor_gcs(),
+        1,
+        "exactly one collection ran"
+    );
 
     Ok(())
 }

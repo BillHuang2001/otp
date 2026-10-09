@@ -475,17 +475,25 @@ pub unsafe fn external_port_parts(t: Eterm) -> (Eterm, u64, u32) {
 /// described on [`write_external_pid`]); `ids` are the 32-bit
 /// `NEWER_REFERENCE_EXT` identifier words (three on a 64-bit node).
 ///
+/// **`ids` may be empty.** The oracle accepts a zero-id external reference
+/// (`binary_to_term(<<131,90,0:16,Node,0:32>>)` succeeds and re-encodes
+/// byte-identically), whose block is exactly `[header, node, creation, count = 0]`
+/// — 4 words, [`external_ref_size_words`]`(0) == 4`. Nothing else changes: the
+/// count word is the `data.ui32` section's first and only word, and copying zero
+/// ids is a no-op. Hashing a zero-id reference mixes the (zeroed) word that
+/// follows the count, i.e. 0 — see `crate::hashing`.
+///
 /// # Safety
 ///
 /// `hp` must point at [`external_ref_size_words`]`(ids.len())` exclusively-owned,
 /// writable words, which are all written by this call and must stay live (and
-/// unmoved) for as long as the returned term is used. `ids` must be non-empty and
-/// at most [`MAX_REF_IDS`] long (`1 <= n <= MAX_REF_IDS`, `erl_term.h:780`); the
+/// unmoved) for as long as the returned term is used. `ids` must be at most
+/// [`MAX_REF_IDS`] long (`0 <= n <= MAX_REF_IDS`, `erl_term.h:780`); the
 /// `data.ui32` array's `u32` slots are `**mut`-written by this call.
 pub unsafe fn write_external_ref(hp: *mut Eterm, node: Eterm, ids: &[u32], creation: u32) -> Eterm {
     debug_assert!(
-        !ids.is_empty() && ids.len() <= MAX_REF_IDS,
-        "1 <= reference id count <= MAX_REF_IDS"
+        ids.len() <= MAX_REF_IDS,
+        "0 <= reference id count <= MAX_REF_IDS"
     );
     let n = ids.len();
     // `DW = n / (u32s per word) + 1` ref "words" (`bif.c:4818-4835`), i.e. one word
@@ -550,6 +558,7 @@ mod tests {
     };
     use crate::heap::Heap;
     use crate::immediate::{make_small, NIL};
+    use crate::AtomTable;
 
     /// A small bump arena, big enough for every block these tests build.
     fn new_heap() -> Heap {
@@ -877,6 +886,68 @@ mod tests {
         // SAFETY: `r` is the live external reference built above.
         let (_, ids, _) = unsafe { external_ref_parts(r) };
         assert_eq!(ids, &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn external_ref_zero_ids_is_four_words_with_a_zero_count() {
+        // The oracle accepts a zero-id external reference
+        // (`binary_to_term(<<131,90,0:16,Node,0:32>>)`), whose block is exactly
+        // `[header, node, creation, count = 0]`.
+        assert_eq!(external_ref_size_words(0), 4);
+        let mut heap = new_heap();
+        let node = make_small(7);
+        // SAFETY: `alloc_words` hands out exactly the 4-word block for zero ids.
+        let hp = unsafe { heap.alloc_words(external_ref_size_words(0)).unwrap() };
+        // SAFETY: `hp` points at those 4 writable words; an empty `ids` is in bounds.
+        let r = unsafe { write_external_ref(hp, node, &[], 0x0BAD_F00D) };
+        assert_eq!(heap.used(), EXTERNAL_THING_HEAD_SIZE + 0 / U32_PER_WORD + 1);
+        assert_eq!(heap.used(), 4);
+
+        // SAFETY: `r` is the 4-word block this test just wrote.
+        unsafe {
+            let p = boxed_val(r);
+            assert_eq!(p, hp);
+            assert_eq!(*p, make_header(3, EXTERNAL_REF_SUBTAG));
+            assert!(is_external_ref_header(*p));
+            assert_eq!(arityval(*p) + 1, 4);
+            assert_eq!(*p.add(1), node);
+            assert_eq!((*p.add(2)).raw() as u32, 0x0BAD_F00D);
+            let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+            assert_eq!(*data, 0, "the id count is 0");
+            assert_eq!(*data.add(1), 0, "the slot hashing reads is zeroed");
+        }
+
+        // SAFETY: `r` is the live external reference built above; `heap` outlives the
+        // returned slice.
+        let (n, ids, cre) = unsafe { external_ref_parts(r) };
+        assert_eq!(n, node);
+        assert!(ids.is_empty(), "zero ids reads back as an empty slice");
+        assert_eq!(cre, 0x0BAD_F00D);
+    }
+
+    /// The hashing arms must not error on a zero-id external reference: the C reads
+    /// `external_ref_numbers(x)[0]` — the word *after* the count, zeroed here — so
+    /// the mixed value is 0, which is what a single `0` id mixes too.
+    #[test]
+    fn zero_id_external_ref_hashes_as_a_zero_first_id() {
+        use crate::hashing::{make_hash, make_hash2};
+
+        let mut atoms = AtomTable::new();
+        atoms.seed(["node"]);
+        let mut heap = new_heap();
+        let node = make_small(3);
+        let ids = [0u32];
+        // SAFETY: both blocks are allocated from `heap`, which outlives the terms.
+        let (empty, one_zero) = unsafe {
+            let p = heap.alloc_words(external_ref_size_words(0)).unwrap();
+            let empty = write_external_ref(p, node, &[], 0x11);
+            let p = heap.alloc_words(external_ref_size_words(ids.len())).unwrap();
+            let one_zero = write_external_ref(p, node, &ids, 0x11);
+            (empty, one_zero)
+        };
+
+        assert_eq!(make_hash2(empty, &atoms).unwrap(), make_hash2(one_zero, &atoms).unwrap());
+        assert_eq!(make_hash(empty, &atoms).unwrap(), make_hash(one_zero, &atoms).unwrap());
     }
 
     #[test]

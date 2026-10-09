@@ -57,13 +57,22 @@ Honors the crate-layer root-set contract: `x_reg_array[0..Live)` **plus the whol
     fragment path. These are the only two `*_mut` pairs with a real caller need (the rest were audited);
     do not add a combined raw-pointer accessor for any pair.
   - **message delivery:** `deliver(from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) ->
-    Result<DeliverOutcome>` — copies `term` into the young heap (collect-and-retry once on
-    `AllocKind::Heap`/`Message` exhaustion), enqueues the `Message`, then `wake()`s;
+    Result<DeliverOutcome>` — copies `term` into the young heap (on `AllocKind::Heap`/`Message`
+    exhaustion it collects and grows the nursery **on demand** to fit the refused request, then retries
+    once; the retry's own failure is what the delivery returns), enqueues the `Message`, then `wake()`s;
     `deliver_simple(from, term)` — the no-off-heap form; `receive(pred) -> Option<Message>` (delegates
-    to `beam_message::receive`).
+    to `beam_message::receive`). Because the nursery is grown on demand, a refused delivery — the raw
+    `AllocKind::Message` a caller's heap-fragment fallback keys on (`../beam_rt`'s
+    `deliver_message`) — now means the receiver's heap policy could NOT grow the nursery to fit the
+    payload (e.g. a `max_heap_words` cap, or a collection that cannot make room); with an unbounded
+    policy every payload is delivered into the grown young heap instead.
   - **GC:** `collector()`, `should_collect(need_words)`, `heap_used_words()`, `collect_if_needed(need)`,
-    and `collect() -> Result<Collection>` (gather root set → run collector → scatter back; see Design
-    Decisions).
+    `collect() -> Result<Collection>` (gather root set → run collector → scatter back), and the
+    on-demand-growth sibling `ensure_capacity(need_words) -> Result<Collection>` (collect once, then grow
+    the nursery to the smallest curated size covering `need_words`; a fail-fast typed `AllocKind::Heap`
+    when the policy's ceiling makes the request unreachable). Both route through one shared
+    `run_rooted_collection` helper that writes every root region back even when the collection action
+    returned `Err` (see Design Decisions).
 ### `dict.rs` — the per-process dictionary
 - `Dict` (`Default`) backing `erlang:put/2`/`get/1`/`erase/1`: `put(Key, Val) -> Option<Eterm>` (last put wins, returns the replaced value), `get`, `erase`, `erase_all`, `get_keys`, `get_keys_for_value`, `entries()`; `new()` (empty) / `with_atoms(Rc<AtomTable>)`.
   - **GC pair:** `gather_roots(out) -> usize` (appends each entry's key then value) / `scatter_roots(roots, start)` (never-panic).
@@ -254,7 +263,7 @@ The **local record** of a process's relationships with processes on other nodes;
   - Every relationship mutation on an unallocated id returns `BeamError::BadArg`; `ProcessTable::port_closed` is the one-call orchestrator resolving a closing port's relationships.
 ### `error.rs` — `pub(crate)` constructors only (no new error enum)
 ## Constraints
-- **Errors:** `beam_common::{Result, BeamError}` only — never a crate-local error enum, never `panic!`/`unwrap()` on runtime data. Unknown pid/name/ref ⇒ `BeamError::TermNotFound`; a malformed pid term or out-of-range register index ⇒ `BeamError::BadArg`; pid/port space exhaustion ⇒ `BeamError::SystemLimit`; heap exhaustion during delivery ⇒ propagate the underlying `BeamError::Alloc` after a collect-and-retry; `beam_term::TermError` is reconciled upstream, so `?` crosses the boundary.
+- **Errors:** `beam_common::{Result, BeamError}` only — never a crate-local error enum, never `panic!`/`unwrap()` on runtime data. Unknown pid/name/ref ⇒ `BeamError::TermNotFound`; a malformed pid term or out-of-range register index ⇒ `BeamError::BadArg`; pid/port space exhaustion ⇒ `BeamError::SystemLimit`; heap exhaustion during delivery ⇒ collect, grow the nursery on demand and retry once, propagating the retry's own `BeamError::Alloc`; `beam_term::TermError` is reconciled upstream, so `?` crosses the boundary.
 - **`unsafe` is confined** to the modules that touch raw words: `signal.rs`/`monitor.rs` message builders and `remote.rs` (reading/writing the external-pid thing through `beam_term`'s `unsafe` predicates, building tuple/ref words through `beam_alloc::Heap::alloc_words`), plus `src/smp/mod.rs`'s two documented `unsafe impl Send`/`Sync for SharedProcessTable` — nothing else in the SMP pool. Every `unsafe fn` carries a `# Safety` section and every `unsafe` block a preceding `// SAFETY:` rationale (`../beam_common/src/safety.rs` convention); `unsafe_op_in_unsafe_fn` stays clean. `pid.rs`, `registers.rs`, `run_queue.rs`, `link.rs`, `monitor.rs` set logic, `ptab.rs` bookkeeping, `signal_queue.rs`, `port.rs` and `progress.rs` are safe Rust; `queues.rs`/`worker.rs`/`stats.rs`/`pool.rs` and `timer.rs`/`dirty.rs` are safe Rust (synchronisation is `parking_lot` mutexes/condvars + atomics).
 - **Never assume a different term layout** — build/inspect terms only through `beam_term`'s public accessors + `beam_alloc::Heap`'s builders; pid/port immediates are bit-exact with `beam_term::immediate` (`make_internal_pid`/`pid_number`/`pid_serial`).
 - **Reuse, do not reimplement:** the mailbox is `beam_message::Queue`; the copy engine is `beam_message::{send, receive, CopyContext}`; the heaps are `beam_gc::Collector`/`beam_gc::HeapSpace`/`beam_alloc::Heap`; the off-heap objects are `beam_gc::MsoHandle`/`beam_message::OffHeapTable`.
@@ -281,7 +290,7 @@ The **local record** of a process's relationships with processes on other nodes;
   cross-checks); `preemption` the measured round-robin fairness; `split_borrow` the two split borrows
   (`heap_and_off_heap_mut` storage identity + `Fragments::move_into`; `heap_and_mailbox_mut` +
   `send_fragmented`); `scheduler_ports` the port-aware slice cleanup and `exhaustion` the delivery
-  collect-and-retry path; and
+  collect-grow-and-retry path; and
   `capability_inventory`/`process_info_source`/`spawn_options` the typed-error inventory, the
   `process_info` item→accessor map and the spawn-option composition. `tests/lock_scope.rs` is the
   bounded-quantum-lock evidence (a slice = `ceil(budget/quantum)` runner invocations under one slice; a
@@ -301,7 +310,7 @@ The **local record** of a process's relationships with processes on other nodes;
   hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **391 passed / 0 failed / 1 ignored** (161 in-module unit + integration across the
+  Current total: **392 passed / 0 failed / 1 ignored** (161 in-module unit + integration across the
   27 `tests/` files + 1 doctest; the ignored test is the documented non-yielding-runner hang failure mode
   in `preemption.rs`), warning-free. The `oracle_*` suites share **one** `erl` driver
   (`tests/common/mod.rs`), run with `-kernel logger_level none` and normalized stdout so a crashed
@@ -352,8 +361,8 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - **Process-dictionary interior and heap fragments.** The dictionary is modelled as a flat key/value
   list (no hash-array interior), and `erlang:process_info/1`'s view of it is still absent. A real
   in-heap `ErlHeapFragment` (a `beam_gc`/`beam_message`-owned type, still absent) is not modelled: saved
-  args are a plain `Eterm` root list and M1 assumes a message fits the receiver's young heap
-  (collect-and-retry once).
+  args are a plain `Eterm` root list and M1 fits a message into the receiver's own young heap,
+  growing that heap on demand (collect + grow + retry once) rather than falling back to a fragment.
 - **Distribution-wide links/monitors**: external pids are decomposed into a `remote::RemotePid` and
   recorded (`remote_links`/`remote_monitors`), and every relationship change is routed through the
   `remote::DistSignalRouter` trait seam (implemented downstream over `beam_dist`; no crate dependency).
@@ -422,7 +431,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
 - `src/registers.rs` → `XRegs`, `Stack`, `Registers` (the root-set containers); `MAX_REG`/`MAX_ARG`
-- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority` and the `port_monitors` watch set; the `heap_and_off_heap_mut` and `heap_and_mailbox_mut` split borrows; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
+- `src/process.rs` → `Process` (PCB) incl. `status`/`status_atom`, `with_policy_and_priority` and the `port_monitors` watch set; the `heap_and_off_heap_mut` and `heap_and_mailbox_mut` split borrows; `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry (`collect`/`ensure_capacity` over the shared `run_rooted_collection`) + the dict/saved-args/signal sub-rootsets
 - `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter; keys and `get_keys/1` values compare structurally via `beam_term::compare::eq` through an `Rc<AtomTable>` handle)
 - `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
 - `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing + `reprioritize`)
@@ -440,7 +449,7 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
 - `src/port.rs` → `PortTable` (id alloc + ownership/link/monitor surface, the incoming half of a port monitor), `PortMonitor`, `PortClose`
 - `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry incl. `name_of` + the monitor hub (`monitor`/`noproc`, `demonitor`/`demonitor_flush`, `monitor_named`/`set_local_node`, `monitor_port(_term)`/`demonitor_port`, and the `*_with_tag` variants over their `tags` side table; a target's death resolves both halves — the watcher's outgoing `Monitor` is dropped) + the signal/link hub (incl. a non-live `link` signalling `noproc` from the dead target) + decoupled signal servicing (`service_signals`, `service_signals_with_ports`) + termination (`terminate`, `terminate_with_ports`, the port-threaded `terminate_into` cascade) + the process-death observer seam + the wake list + `is_process_alive`/`exit_reason` + the remote records + the distribution seam), `ExitEffect`
 - `src/error.rs` → `pub(crate)` error constructors incl. the typed-`unsupported` raise constructors (no new error type)
-- `tests/*.rs` (27 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `scheduler_ports.rs` = the port-aware scheduler slice cleanup; `exhaustion.rs` = deliver collect-and-retry + typed exhaustion; `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence)
+- `tests/*.rs` (27 files) → the integration evidence; the authoritative per-file list is in `tests/CONTEXT.md` (`lock_scope.rs` = the bounded-quantum-lock + 1-vs-4-scheduler determinism evidence; `scheduler_ports.rs` = the port-aware scheduler slice cleanup; `exhaustion.rs` = deliver collect-grow-and-retry + on-demand `ensure_capacity` + fail-fast typed exhaustion; `dict_oracle.rs`/`registry_monitors.rs`/`monitor_tag.rs`/`port_monitor_cleanup.rs` = `erl`-cross-checked semantics; `preemption.rs` = the measured fairness evidence; `capability_inventory.rs` = the typed-error inventory; `split_borrow.rs` = the two split-borrow evidence sets (`heap_and_off_heap_mut` + `Fragments::move_into`; `heap_and_mailbox_mut` + `send_fragmented`); `process_exit_observer.rs`/`port_monitor_cleanup.rs` = the death-side observer + port-monitor cleanup evidence)
 - `tests/CONTEXT.md` → per-file topic list, the anti-flakiness constraint, the gate command
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)

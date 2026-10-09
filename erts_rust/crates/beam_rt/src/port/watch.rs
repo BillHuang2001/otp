@@ -387,6 +387,22 @@ pub(crate) mod watcher {
         }
     }
 
+    /// Waits (bounded) for the trampoline to catch a signal [`send_to_self`] sent.
+    ///
+    /// `kill(1)` returns as soon as the kernel has queued the signal, and the handler that writes
+    /// the self-pipe runs asynchronously, so a `drain` immediately after `send_to_self` is a race.
+    /// Bounded, so a genuine regression (a signal that never arrives) still fails loudly.
+    pub(crate) fn wait_until_pending() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if pending() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the handled signal never reached the self-pipe");
+    }
+
     #[test]
     fn a_watch_with_no_disposition_is_not_pollable() {
         let _guard = test_guard();
@@ -423,6 +439,7 @@ pub(crate) mod watcher {
 
         // The registered signal is reported by the drain and by `ready`.
         send_to_self(Signal::SigUsr1);
+        wait_until_pending();
         let token = watch.token.expect("the registered token");
         assert!(watch.ready(&[Event::new(token, SIGNAL_KEY, beam_io::Ready::default())]));
         assert!(!watch.ready(&[Event::new(token, 7, beam_io::Ready::default())]));

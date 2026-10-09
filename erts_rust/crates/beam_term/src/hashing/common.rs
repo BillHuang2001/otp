@@ -28,13 +28,16 @@
 //! bitstring accessors and the `make_hash` work-stack entry types. The two ports
 //! themselves live in the sibling modules and consume these.
 //!
-//! Error handling note (shared by both ports): a well-formed term always hashes.
-//! The only *reachable* typed failure for a well-formed term is a `FunKind::Local`
-//! fun (a `make_fun3` closure), whose inlined 2-word descriptor carries neither the
-//! module nor `old_uniq` that the C's `ErlFunEntry` supplies — see [`crate::fun`].
-//! That is reported as the dedicated `TermError::FunIdentityUnavailable` (the term
-//! is fine; the identity is not carried), never as a substituted value. A word that
-//! is not a term at all (a bare header word, e.g. the ABI's `THE_NON_VALUE`) is
+//! Error handling note (shared by both ports): a well-formed term almost always
+//! hashes. The *reachable* typed failures for a well-formed term are the two
+//! identity gaps: a `FunKind::Local` fun (a `make_fun3` closure), whose inlined
+//! 2-word descriptor carries neither the module nor `old_uniq` that the C's
+//! `ErlFunEntry` supplies — see [`crate::fun`] — and an internal reference, whose C
+//! hash mixes an id of the node container this tree's M1 `Ref` thing does not carry
+//! (see [`crate::boxed::internal_ref_numbers`]). They are reported as the dedicated
+//! `TermError::FunIdentityUnavailable` / `TermError::RefIdentityUnavailable` (the
+//! term is fine; the identity is not carried), never as a substituted value. A word
+//! that is not a term at all (a bare header word, e.g. the ABI's `THE_NON_VALUE`) is
 //! reported as `TermError::NotATerm` rather than dereferenced. Every other `Err` in
 //! the ports is for a forged/unknown term layout (unreachable through the safe API)
 //! and stays `TermError::BadFun`, whose meaning — "this is not a well-formed fun" —

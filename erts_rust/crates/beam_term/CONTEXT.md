@@ -187,13 +187,23 @@ Two distinct surfaces live here:
     byte-batched lists, flat maps and HAMT maps (xor pair protocol), bitstrings (byte-aligned ⇒
     `block_hash(bytes, HCONST_13 + hash)`; non-byte-aligned ⇒ bit-copy into a flat buffer; a trailing
     partial byte ⇒ `UINT32_HASH_2(bitsize, last >> (8-bitsize), HCONST_15)`), floats (`±0.0` normalized
-    to `+0.0`), ± bignums, internal/external refs, external pid/port, and funs.
+    to `+0.0`), ± bignums, external refs, external pid/port, native records, and funs. An
+    **internal** reference (an on-heap `Ref` thing) is REFUSED with the typed
+    `TermError::RefIdentityUnavailable` — the C mixes `internal_ref_numbers(x)[0]`, an id of the
+    running node's container the M1 `Ref` thing does not carry, so a wrong value is never substituted.
   - `pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32>` (`erl_term_hashing.c:165-425`).
     `erlang:phash(T, R)` is `1 + (make_hash(T) % R)` for `R < 2^32` and `make_hash(T) + 1` for `R = 2^32`
     (`bif.c:5413-5452`).
   - `pub fn compute_record_definition_hash(def: Eterm, atoms: &AtomTable) -> TermResult<u32>` — the
     synthetic record-definition hash (see [`record.rs`](#recordrs) below); named `compute_*` so it does
     not collide with `record::record_definition_hash` (the header *reader*) under `lib.rs`'s glob re-exports.
+  - **Native records hash bit-exactly.** The record arm of both `make_hash2` (`RECORD_SUBTAG` arm) and
+    `make_hash` (`HOp::RecordInit` + a `def_hash_patch`) mixes the definition's **real computed** hash —
+    `compute_record_definition_hash` over the definition block (`module,name,is_exported,keys-in-key-order`,
+    the C's `make_hash2(make_tuple(&defp->hash))`, `erl_record.c:1041-1054`) — never the placeholder
+    `record::write_record` stores (it has no `AtomTable`), and walks the stored values in the instance's
+    sorted-key order. Oracle-verified (OTP 29 / erts-17.1) via `tests/record_ref_hash.rs`: a record copied
+    to a different address hashes equal; the stored `hash` word is ignored.
   - **Fun-kind coverage:** `FunKind::External` (`EXPORT_EXT`) and `FunKind::Imported` (`NEW_FUN_EXT`,
     which carries the same `module`/`index`/`old_uniq`/env fields as the C's `ErlFunEntry`) both compute
     the oracle's value. `FunKind::Local` (a `make_fun3` closure) returns the typed
@@ -293,6 +303,11 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   `unsafe write_external_port(hp, node, number: u64, creation: u32)`,
   `unsafe write_external_ref(hp, node, ids: &[u32], creation: u32)` and their `unsafe *_parts`
   inverses (`external_pid_parts`/`external_port_parts`/`external_ref_parts`).
+  **`ids` may be empty** (`0 <= n <= MAX_REF_IDS`): the oracle accepts a zero-id external reference
+  (`binary_to_term(<<131,90,0:16,Node,0:32>>)` round-trips), whose block is exactly
+  `[header, node, creation, count = 0]` — `external_ref_size_words(0) == 4` — and `external_ref_parts`
+  reports an empty slice. Hashing such a reference mixes the word after the count (zeroed) ⇒ `0`, the
+  C's `external_ref_numbers(x)[0]` (`erl_term_hashing.c:1459-1461`/`:290`), not an error.
 
 ### `bitstring.rs` — bit-level payloads
 The `ErlHeapBits` / `ErlSubBits` block writers and readers plus the crate's public bit/float payload
@@ -374,22 +389,33 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 [`FUN_HEADER_IMPORTED_OFFS`] (this crate's `NEW_FUN_EXT` marker).
 - Constants: `FUN_HEADER_ARITY_OFFS=8`, `FUN_HEADER_ENV_SIZE_OFFS=16`, `FUN_HEADER_KIND_OFFS=24`,
   `FUN_HEADER_IMPORTED_OFFS=25`, `FUN_MAX_FIELD=0xFF`, `MAX_ARG=255`, `FUN_DESC_WORDS_LOCAL=2`,
-  `FUN_DESC_WORDS_EXTERNAL=2`, `FUN_DESC_WORDS_IMPORTED=10`.
+  `FUN_DESC_WORDS_EXTERNAL=3`, `FUN_DESC_WORDS_IMPORTED=10`.
 - `pub enum FunKind { Local, External, Imported }`; `pub struct FunPid { node: Atom, number, serial, creation: u32 }`.
 - Pure (no `unsafe`, take a *header word*) helpers: `make_fun_header(arity, num_free, kind) -> TermResult<Eterm>`,
   `fun_kind_of_header(hdr) -> FunKind` (const), `fun_kind(hdr) -> TermResult<FunKind>`,
   `fun_arity`/`fun_num_free` (const), `fun_desc_words(kind)`, `fun_words(kind, num_free)`,
   `fun_desc_words_header`/`fun_env_offset_header`/`fun_block_words_header` (term→error on non-fun).
+- **The external fun's true arity is carried out of band.** The header's 8-bit `arity` field is what
+  the C's `fun_info(F, arity)` reports (the true arity truncated to its low byte), while the C
+  encoder emits the `Export`'s full `info.mfa.arity` (`external.c:3997-4001`). So
+  `FUN_DESC_WORDS_EXTERNAL = 3` and the descriptor is `[hdr][module][function][true arity]`;
+  `write_fun_external` accepts **any** arity (no `ArityOutOfRange` — it masks the header field with
+  `FUN_MAX_FIELD`, keeping `num_free == 0` so block sizing stays `1 + 3`), and `fun_arity` remains the
+  header reader. Verified against the oracle (OTP 29 / erts-17.1): an `EXPORT_EXT` blob with arity 256
+  reports `{arity,0}` from `fun_info/2` yet re-encodes 256.
 - `pub fn fun_block_words(t: Eterm) -> TermResult<usize>` (boxed-fun required).
 - Heap-agnostic writers (`pub unsafe fn`, caller reserves `fun_words(kind, num_free)` words):
   `write_fun_local(hp, arity, uniq: u64, index: u32, env: &[Eterm])`,
   `write_fun_external(hp, arity, module: Atom, function: Atom)`,
   `write_fun_imported(hp, arity, module: Atom, uniq: &[u8;16], index, old_index, old_uniq: u32, creator: FunPid, env: &[Eterm])`.
 - Accessors (`pub unsafe fn`, wrong-kind/non-fun ⇒ `TermError::BadFun`, never a panic):
+  `fun_true_arity -> TermResult<usize>` (the **true** arity — descriptor word 3 for `External`, the
+  header field for `Local`/`Imported`; what an encoder/`compare`/hashing must use),
   `fun_uniq -> TermResult<u64>`, `fun_uniq_bytes -> TermResult<[u8;16]>`, `fun_index`/`fun_old_index`/`fun_old_uniq -> TermResult<u32>`,
   `fun_module`/`fun_function -> TermResult<Atom>`, `fun_creator_pid -> TermResult<FunPid>`, `fun_env -> TermResult<&[Eterm]>`.
 - Word layout, `env[i]` at `hp[1 + desc_words(kind) + i]`, block = `1 + desc_words + num_free` words:
-  `Local` = `[hdr][uniq:u64][index:u32][env…]`; `External` = `[hdr][module:Atom][function:Atom]`;
+  `Local` = `[hdr][uniq:u64][index:u32][env…]`;
+  `External` = `[hdr][module:Atom][function:Atom][arity:usize raw]`;
   `Imported` = `[hdr][module][uniq0..8][uniq8..16][index][old_index][old_uniq][pid_node][pid_number][pid_serial][pid_creation][env…]`.
 - `boxed.rs` provides header-word predicates `is_external_fun`/`is_imported_fun`/`is_local_fun`.
 - `size.rs` sizes a fun as `1 + desc_words + num_free`; `compare.rs` orders funs structurally
@@ -451,6 +477,10 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `TermError::FunIdentityUnavailable` — `make_hash`/`make_hash2` return this for a `make_fun3`
   `Local` fun, whose inlined descriptor carries no `module`/`old_uniq` (a documented capability gap).
   Maps to `BeamError::BadArg` (never a wrong hash value).
+- `TermError::RefIdentityUnavailable` — `make_hash`/`make_hash2` return this for an **internal
+  reference** (an on-heap `Ref` thing), whose C hash mixes `internal_ref_numbers(x)[0]` (an id of the
+  running node's container this representation does not carry). Maps to `BeamError::BadArg` (never a
+  wrong hash value). The internal structural `term_hash` is unaffected (deterministic fallback).
 
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
@@ -610,7 +640,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `bitstring_parts`/`bit_at` vs `bit_size`/per-bit/byte views for `<<1:3>>`-style bitstrings and
   binaries, and bignum *observables* (`eq`/`cmp`/`cmp_arith`/`size_object` on multi-limb
   `write_big` terms) vs the oracle's `=:=`/`<`/`>` and `erts_debug:flat_size/1` across the 2- and
-  3-limb boundary. Skips loudly (never fails) when `erl` is absent/does not answer.
+  3-limb boundary, and the flat-map **stored key order** (`cmp_flatmap_keys` /
+  `map_pairs_storage_order`: binary keys byte-lexicographically, atom keys by atom-table *index*)
+  vs the oracle's `maps:to_list/1`. Skips loudly (never fails) when `erl` is absent/does not answer.
 - `tests/number_oracle.rs` — the crate-local live-`erl` cross-check of `number::big_to_f64`/
   `number_as_f64`: it materializes a large corpus of bignums (`write_big` limbs) both as `beam_term`
   terms and as Erlang integer literals, has the oracle convert each with `float/1`, and compares the
@@ -664,9 +696,16 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` (incl. `FunIdentityUnavailable`; `TermGraphCyclic`/`TermGraphTooLarge` from bounded sizing) + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
-- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, term-ordering `compare_terms.rs`, external/record comparison `compare_external.rs`, bounded sizing `size_bounded.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs`, `number_oracle.rs` and `compare_oracle.rs`)
+- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, term-ordering `compare_terms.rs`, external/record comparison `compare_external.rs`, bounded sizing `size_bounded.rs`, record/internal-ref hashing `record_ref_hash.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs`, `number_oracle.rs` and `compare_oracle.rs`). `record_ref_hash.rs` carries offline pins for two native records (`(make_hash2, make_hash, definition_hash)`) and, when `erlc`/`erl` are present, compiles a real `-record #r{...}` fixture and cross-checks `phash2(T,1 bsl 32)`/`phash(T,1 bsl 32)-1` (skips loudly otherwise). Its corpus uses only keys defined in `atom.names` so the oracle's atom indices agree with `AtomTable::from_atom_names` (the C record hash is not portable for keys outside `atom.names`, and a record's value walk follows the definition's sorted-key order, not the declaration order).
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
+- **`beam_codec` can now carry an external fun arity > 255 and a zero-length external reference.**
+  `fun::write_fun_external` accepts **any** arity (it masks the header field with `FUN_MAX_FIELD`, so a
+  block for an `External` fun with `num_free == 0` is `fun_words(External, 0) == 4` words and the true
+  arity lives in descriptor word 3, read back by `fun::fun_true_arity`); an encoder should therefore
+  emit `EXPORT_EXT`'s `info.mfa.arity` via `fun_true_arity` and reserve `fun_words(External, 0)`.
+  `thing::write_external_ref` also accepts an **empty** `ids` slice (`external_ref_size_words(0) == 4`),
+  so a `NEWER_REFERENCE_EXT` with zero id words round-trips. Owner: `beam_codec` (outside this node).
 - **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed
   `unsupported` for >32-key (HAMT) maps because it cannot read the order the map stores its pairs in;
   `map::map_pairs_storage_order` supplies exactly that (flat map ⇒ keys-tuple order, hash map ⇒ HAMT

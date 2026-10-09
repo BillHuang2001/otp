@@ -498,9 +498,11 @@ silently-accepted wrong value:
     opts on, `bs_translate/1` folds it into a `bs_match` `ensure_exactly` command, so `+no_ssa_opt` is
     needed to observe the generic opcode.
   - `tests/fixtures/literals_verbatim.beam` / `literals_compressed.beam` (same source
-    `literals_fixture.erl`, the second with `+compressed_literals`) — the two `LitT` framings, covering
-    every literal kind (tuples/lists/maps/floats/bignums/binaries/external funs); plus
-    `literals_oracle.escript`, the independent Erlang-side oracle for the literal sweep.
+    `literals_fixture.erl` compiled with `+deterministic`, the second also with `+compressed_literals`)
+    — the two `LitT` framings, covering every literal kind (tuples/lists/maps/floats/bignums/binaries/
+    external funs); plus `literals_oracle.escript`, the independent Erlang-side oracle, in its two modes
+    (`<otp-lib-root>` for the whole-corpus sweep, `--reencode <beam-file>` for the per-literal canonical
+    images of one module).
 - **Ground truth is derived, never guessed:** `beam_disasm:file(...)` plus a byte decode; if a fixture
   byte changes, re-derive the expected IR.
 - **`tests/container.rs`:** the chunk directory (ids/sizes in file order), the `AtU8` atoms, the
@@ -553,9 +555,18 @@ silently-accepted wrong value:
   all 15 corpus ids to appear so the pass cannot be vacuous; pins key ids' classes row-by-row and
   cross-checks the decoded `Attr` against the runtime `module_info(attributes)` on `gen_server`/`kernel`,
   plus a whole-corpus `CInf`/`Meta` decode-and-re-encode byte-exact round-trip.
-- **`tests/literals.rs`:** both `LitT` framings decode to identically-encoded terms; structural assertions
-  for every literal kind; plus a whole-corpus sweep re-encoding every decoded literal byte-exactly and
-  comparing semantically against `literals_oracle.escript` for map literals whose key order is non-canonical.
+- **`tests/literals.rs`:** both `LitT` framings carry identical payloads and decode to
+  identically-encoded terms; for a **map-free** literal the decode→encode round-trip is asserted
+  **byte-exact** against the compiler's payload; for a **map-bearing** one (the fixtures are compiled
+  with `+deterministic`, whose flat-map key order differs from ERTS's `erts_cmp_flatmap_keys` storage
+  order — see Known Issues) the assertion is Rust == the **oracle's** own
+  `term_to_binary(binary_to_term(Payload))` (the script's `--reencode` mode; a missing OTP skips it
+  LOUDLY); a dedicated test pins the `nested/0` literal's compiler payload key order
+  (`bin, float, list`) against its stored order (`list, float, bin`, ascending atom index) in **both**
+  framings; plus structural assertions for every literal kind, and a whole-corpus sweep re-encoding
+  every decoded literal and comparing semantically against `literals_oracle.escript`. Raw-payload byte
+  inspection — the only way to observe the pre-normalization key order — lives in the `tests/`-level
+  test-support module `tests/common/mod.rs`.
 - **`tests/load_cost.rs`:** the committed, dependency-free module-load-cost measurement (Design Decisions):
   a deterministic 200-module sample reporting ns/instruction and bytes/second, with per-stage and
   per-module breakdown; loud skip without OTP.
@@ -566,6 +577,19 @@ silently-accepted wrong value:
 - Cross-checks against the real system ERTS belong to the sibling `../tools/differential/` harness.
 
 ## Known Issues / Intentional M1 gaps
+- **A map-bearing `LitT` payload is NOT byte-preservable — do not assert a byte-exact round-trip for
+  it.** The committed literals fixtures are compiled with `erlc +deterministic`, which writes a flat
+  map's keys in **name-lexicographic** order (the `term_to_binary/2` `[deterministic]` option), while
+  this crate — like ERTS's `binary_to_term/1` — **stores** a flat map's keys in
+  `erts_cmp_flatmap_keys` order, which orders two atom keys by **atom-table index**
+  (`erts/emulator/beam/erl_utils.h:267-272`; the normalization happens inside
+  `beam_codec`'s `MAP_EXT` decode → `beam_term::map::write_map`). The `nested/0` fixture literal
+  therefore arrives with payload keys `bin, float, list` and is stored as `list, float, bin`, so
+  `encode_term(decode_term(payload)) != payload` by construction. `tests/literals.rs` asserts Rust ==
+  ERTS's own `term_to_binary(binary_to_term(Payload))` for such literals instead
+  (`tests/literals.rs` + `tests/common/mod.rs` for the raw byte scan); a byte-exact assertion is only
+  valid for a **map-free** literal. (This is faithful behavior, not a defect: the two images denote the
+  same term.)
 - **`Instr::Generic` fallback opcodes — 133 of 193 typed, 60 Generic.** 108 opcodes lower to a named
   `Instr` mapping (`src/lower/instr.rs`) and the 25 `is_*`/`test_arity` opcodes to `Instr::Test`, so 133
   of the 193 `genop.tab` opcodes are typed; the other 60 keep `Instr::Generic`. 59 of those are the
@@ -636,10 +660,11 @@ silently-accepted wrong value:
 - `tests/line_info.rs` → typed `executable_line`/`debug_line` (the `linecov`/`dbgline` fixtures) + line-table/`func_info` preservation
 - `tests/bs_test_tail.rs` → typed `bs_test_tail2` over the `bstail` fixture
 - `tests/chunks.rs` → the whole-corpus chunk-id classification checker + the `Attr`/`CInf`/`Meta` oracle round-trip cross-check
-- `tests/literals.rs` → the two `LitT` framings + the whole-corpus literal round-trip/oracle sweep
+- `tests/literals.rs` → the two `LitT` framings (map-free literals byte-exact; map-bearing ones against the oracle) + the map-normalization pin + the whole-corpus literal round-trip/oracle sweep
+- `tests/common/mod.rs` → `tests/`-level test-support module (not a test target of its own): raw, non-normalizing ETF payload inspection (`raw_map_key_names`) used by `tests/literals.rs`
 - `tests/load_cost.rs` → the committed module-load-cost measurement (ns/instruction, bytes/second)
 - `tests/fixtures/{nr_def,nr_use,linecov,dbgline,bstail}.{erl,beam}` → native-record / line / test-tail oracle fixtures
-- `tests/fixtures/literals_fixture.erl` + `literals_{verbatim,compressed}.beam` + `literals_oracle.escript` → the `LitT` framing fixtures + the Erlang-side literal oracle
+- `tests/fixtures/literals_fixture.erl` + `literals_{verbatim,compressed}.beam` + `literals_oracle.escript` → the `LitT` framing fixtures + the Erlang-side literal oracle (`<otp-lib-root>` walk mode / `--reencode <beam-file>` mode)
 - `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
 - `../../lib/compiler/src/genop.tab` → the authoritative opcode roster (read-only)

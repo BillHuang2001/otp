@@ -60,18 +60,23 @@
 //!   `{io_request,From,ReplyAs,Request}` → `{io_reply,ReplyAs,Reply}` protocol for
 //!   `{get_chars,Enc,_Prompt,N}`/`{put_chars,…}` (`file_io_server.erl:199-233`).
 //!
+//! # The `{get_until, …}` incremental reader
+//!
+//! `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` is the one request that runs **Erlang
+//! code**: `file_io_server` answers it with `get_chars(io_lib, get_until, {Mod,Func,XtraArgs},
+//! …)`, whose loop ends in `apply(Mod, Func, [Cont, Chars | XtraArgs])` — for `io`'s own
+//! calls `erl_scan:tokens/4`. The device state, the read loop and the `latin1`/`unicode`
+//! conversions live in `beam_io`'s [`io_device`](beam_io::io_device) module; this crate
+//! supplies the missing half — the [`Continuation`](beam_io::io_device::Continuation) — by
+//! running the real export on the engine (see [`get_until`]).
+//!
 //! # Honest capability gaps (never a fabricated term)
 //!
-//! * `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}` is answered by
-//!   `file_io_server`'s `get_chars(io_lib, get_until, …)`, i.e. by repeatedly applying
-//!   `Mod:Func([Continuation|XtraArgs])` — for `io:parse_erl_exprs/4` that is
-//!   `erl_scan:tokens/4`, real Erlang parser code. A native service process hosts no
-//!   engine, so this request is reported as the typed
-//!   [`crate::error::unsupported`] gap rather than a plausible-looking wrong answer; the
-//!   bounded boot/scheduler drive turns it into a typed error at the deadline.
-//! * The same applies to every request this module does not serve (`get_line`, `setopts`,
-//!   `getopts`, `pread`/`pwrite`, `advise`, `allocate`, `read_handle_info`, the legacy
-//!   `put_chars` arities, a non-`latin1` encoding, `read_file_info`, `write_file`).
+//! * Every *other* request this module does not serve is reported as the typed
+//!   [`crate::error::unsupported`] gap rather than a plausible-looking wrong answer
+//!   (`get_line`, `setopts`, `getopts`, `pread`/`pwrite`, `advise`, `allocate`,
+//!   `read_handle_info`, the legacy `put_chars` arities, a tuple encoding,
+//!   `read_file_info`, `write_file`).
 //! * An unknown `file_server` `handle_call` request is the oracle's `{noreply, State}`:
 //!   the service replies **nothing** and carries on.
 
@@ -83,12 +88,15 @@ use std::os::unix::ffi::OsStrExt;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_gc::HeapPolicy;
+use beam_io::io_device::Encoding;
 use beam_process::{ProcessId, ProcessTable};
 use beam_term::prelude::*;
 
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::runtime::Runtime;
+
+mod get_until;
 
 /// The native file service: the `file_server_2` process plus one **io-device** process per
 /// successful `open`.
@@ -115,6 +123,17 @@ struct Device {
     /// The read mode `file_io_server:parse_options/1` derived (`binary`/`list`): whether a
     /// read is shaped as a binary or as a char list.
     binary: bool,
+    /// The device's own **stream** encoding (`file_io_server`'s `State#state.unic`): `unicode`
+    /// when the open's mode list carried `unicode`/`utf8` (or `{encoding,unicode|utf8}`),
+    /// `latin1` otherwise — `parse_options/1`'s default, and the value every explicitly
+    /// modelled encoding maps to here. The `{utf16,_}`/`{utf32,_}` tuple encodings are *not*
+    /// modelled and also read as `latin1` (a documented divergence, unchanged by the
+    /// `{get_until,…}` work).
+    encoding: Encoding,
+    /// The leftover `{get_until, …}` request stashed in the device (`State#state.buf`): the
+    /// bytes a continuation reported as unconsumed, fed to the next request before any
+    /// fresh read.
+    buf: Vec<u8>,
 }
 
 impl FileServices {
@@ -225,19 +244,27 @@ impl Runtime {
         // The io-device protocol: {file_request|io_request, From, ReplyAs, Request}.
         if fields.len() == 4 {
             let tag = self.atom_name(fields[0]);
-            if tag.as_deref() == Some("file_request") || tag.as_deref() == Some("io_request") {
-                let Ok(from) = ProcessId::from_eterm(fields[1]) else {
-                    return Ok(None);
-                };
-                let reply_as = fields[2];
-                let (reply, retire) = self.serve_device_request(service, fields[3])?;
-                if retire {
-                    self.file_services.devices.remove(&service);
-                }
-                let tag_atom = self.atom(&tag.expect("checked above"))?;
-                let envelope = self.tuple(&[tag_atom, reply_as, reply])?;
-                return Ok(Some((from, envelope)));
+            // The reply tag is **paired** with the request tag, never echoed:
+            // `file_io_server`'s `file_reply/3`/`io_reply/3` answer `{file_request, …}` with
+            // `{file_reply, ReplyAs, Reply}` and `{io_request, …}` with
+            // `{io_reply, ReplyAs, Reply}` (`file_io_server.erl:199-239`), and every caller
+            // matches the reply on its own tag (`io.erl:1670`'s `execute_request`).
+            let reply_tag = match tag.as_deref() {
+                Some("file_request") => "file_reply",
+                Some("io_request") => "io_reply",
+                _ => return Ok(None),
+            };
+            let Ok(from) = ProcessId::from_eterm(fields[1]) else {
+                return Ok(None);
+            };
+            let reply_as = fields[2];
+            let (reply, retire) = self.serve_device_request(service, fields[3])?;
+            if retire {
+                self.file_services.devices.remove(&service);
             }
+            let tag_atom = self.atom(reply_tag)?;
+            let envelope = self.tuple(&[tag_atom, reply_as, reply])?;
+            return Ok(Some((from, envelope)));
         }
         // The gen_server protocol: {'$gen_call', {Pid, Tag}, Request}.
         if fields.len() == 3 && self.atom_name(fields[0]).as_deref() == Some("$gen_call") {
@@ -330,8 +357,17 @@ impl Runtime {
                 Err(failure) => self.error_tuple_for(&failure),
                 Ok(file) => {
                     let binary = self.open_is_binary(args[1]);
+                    let encoding = self.open_encoding(args[1]);
                     let device = table.spawn(self.file_services.policy.clone())?;
-                    self.file_services.devices.insert(device, Device { file, binary });
+                    self.file_services.devices.insert(
+                        device,
+                        Device {
+                            file,
+                            binary,
+                            encoding,
+                            buf: Vec::new(),
+                        },
+                    );
                     let ok = self.atom("ok")?;
                     self.tuple(&[ok, device.to_eterm()])
                 }
@@ -349,6 +385,38 @@ impl Runtime {
                 })
             })
             .unwrap_or(false)
+    }
+
+    /// The read mode `ModeList` selects the **stream encoding** of the device it opens
+    /// (`file_io_server:parse_options/1`'s `unicode` result, reached through
+    /// `expand_encoding/1`).
+    ///
+    /// Only the two byte-oriented encodings `beam_io` models are recognised: a `unicode`
+    /// (or `utf8`) atom, or an `{encoding, unicode | utf8}` pair, selects
+    /// [`Encoding::Unicode`]; every other mode list — including an absent `encoding` option
+    /// and the `{utf16,_}`/`{utf32,_}` tuple encodings, which have no counterpart here —
+    /// selects [`Encoding::Latin1`], `parse_options/1`'s default.
+    fn open_encoding(&self, mode_list: Eterm) -> Encoding {
+        let is_unicode = |term: Eterm| {
+            matches!(self.atom_name(term).as_deref(), Some("unicode") | Some("utf8"))
+        };
+        let unicode = terms::list_elements(mode_list)
+            .map(|elements| {
+                elements.iter().any(|element| {
+                    is_unicode(*element)
+                        || tuple_fields(*element).is_some_and(|fields| {
+                            fields.len() == 2
+                                && self.atom_name(fields[0]).as_deref() == Some("encoding")
+                                && is_unicode(fields[1])
+                        })
+                })
+            })
+            .unwrap_or(false);
+        if unicode {
+            Encoding::Unicode
+        } else {
+            Encoding::Latin1
+        }
     }
 
     /// `file_server:handle_call({list_dir, Name}, …)` → `prim_file:list_dir/1`:
@@ -438,6 +506,11 @@ impl Runtime {
             // -- io_request --------------------------------------------------------------
             ("get_chars", 3) => self.reply_get_chars(service, args),
             ("put_chars", 2) => self.reply_put_chars(service, args),
+            // The incremental reader: `{get_until,Enc,_Prompt,Mod,Func,XtraArgs}`
+            // (`file_io_server.erl:362-364`) and its legacy 5-tuple form, which defaults the
+            // encoding to `latin1` (`:395-396`).
+            ("get_until", 5) => get_until::serve(self, service, Some(args[0]), &args[1..]),
+            ("get_until", 4) => get_until::serve(self, service, None, args),
             _ => Err(error::unsupported(&format!(
                 "file_server: the `{command}/{}` io request is not implemented",
                 args.len()
@@ -741,14 +814,20 @@ mod tests {
 
     /// A runtime with the boot floor loaded, so the shared atom table holds the names the
     /// reply shapes need.
-    fn runtime() -> Runtime {
+    ///
+    /// `pub(super)` so the `get_until` child's tests reuse the one runtime fixture rather
+    /// than booting a second, subtly different one.
+    pub(super) fn runtime() -> Runtime {
         let mut runtime = Runtime::with_defaults().expect("a runtime");
         runtime.boot().expect("boot");
         runtime
     }
 
     /// Builds a term on `runtime`'s arena through a fresh context.
-    fn build(runtime: &mut Runtime, f: impl FnOnce(&mut RuntimeContext) -> Eterm) -> Eterm {
+    pub(super) fn build(
+        runtime: &mut Runtime,
+        f: impl FnOnce(&mut RuntimeContext) -> Eterm,
+    ) -> Eterm {
         let mut ctx = RuntimeContext::new(runtime);
         f(&mut ctx)
     }

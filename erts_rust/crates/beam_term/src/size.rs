@@ -511,13 +511,14 @@ mod tests {
         };
         assert_eq!(size_object(local), 3 + 2);
 
-        // An exported (`EXPORT_EXT`) fun has no environment: `1 + 2`.
+        // An exported (`EXPORT_EXT`) fun has no environment: `1 + 3` (header,
+        // module, function, true arity).
         // SAFETY: `fun_words` sizes the block exactly; the heap owns it.
         let external = unsafe {
             let hp = heap.alloc_words(fun_words(FunKind::External, 0)).unwrap();
             write_fun_external(hp, 2, Atom::from_raw(1), Atom::from_raw(2)).unwrap()
         };
-        assert_eq!(size_object(external), 3);
+        assert_eq!(size_object(external), 4);
 
         // A wire fun is `1 (header) + 10 (descriptor) + num_free`.
         for n in [0usize, 1, 3] {

@@ -30,6 +30,8 @@
 //!   turns a [`BeamError`] into the actual raise by storing the exception tag in `x(0)`;
 //! * the OTP/ERTS **version constants** ([`OTP_VERSION`], [`ERTS_VERSION`],
 //!   [`ERTS_VSN`]) and their parser ([`Version`]);
+//! * the canonical **cross-crate ERTS constants** ([`CONTEXT_REDS`]) that two or more
+//!   workspace crates share — this crate owns the single definition of each;
 //! * the **configuration skeleton** over the emulator start-up surface
 //!   ([`RuntimeConfig`], [`Flavor`], [`FeatureFlags`], [`LogLevel`]);
 //! * a dependency-free **logging facade** ([`init_logging`], [`init_from_env`],
@@ -81,6 +83,7 @@
 #![warn(rustdoc::broken_intra_doc_links)]
 
 mod config;
+mod constants;
 mod error;
 mod logging;
 mod version;
@@ -89,6 +92,7 @@ mod version;
 pub mod safety;
 
 pub use config::*;
+pub use constants::*;
 pub use error::*;
 pub use logging::{enabled, init_from_env, init_logging, level, set_level};
 pub use version::*;

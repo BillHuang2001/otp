@@ -46,8 +46,15 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - The shared `pub(crate)` evacuation primitives every other module builds on (so the word-level logic
   lives in exactly one place): `Target` (`Foreign`/`Live`/`Forwarded`), the `EvacDest` trait (a
   destination's `classify_boxed`/`classify_cons`/`can_reserve`/`reserve`), the generic
-  `forward_slot<D: EvacDest>`, `move_size`, `ScanStep`/`scan_step`, and `for_each_ref` (`for_each_ref`
-  walks from word 0 **including the header**, because the header selects the payload layout). `Copier`,
+  `forward_slot<D: EvacDest>`, `move_size`, and `for_each_ref`. **The per-object layout is not this
+  crate's:** `move_size`, `for_each_ref` and `Copier::complete` all drive
+  `beam_term::layout::{object_words, for_each_child_slot}` (the workspace's single owner of the
+  per-object walk). `move_size` is `object_words` for every shape **except** an `ErlSubBits`, whose
+  *copy* size is `ERL_SUB_BITS_SIZE` (`5`): a copier lays down the 5-word `ErlSubBits` block and
+  forwards its `orig` word, which copies the 3-word `BinRef` as its own child, whereas `object_words`
+  reports the whole `[BinRef][ErlSubBits]` pair (`8`) as the *sizing* contribution. `for_each_ref`
+  yields the child slots holding a `Boxed`/`List` word (plus an `ErlSubBits`'s `orig`); a cons cell
+  (no header word) is yielded directly, as the header-based canonical API does not cover it. `Copier`,
   `immix/`, and `immix_collector`'s `PromoteDest` all consume them.
 - Fun blocks are sized and scanned from `beam_term::fun`'s inlined-descriptor layout
   (`1 + desc_words(kind) + num_free`, env at `fun_env_offset_header`), **never** via
@@ -357,12 +364,13 @@ still reproduces today's collector exactly.
 - **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with
   the new BOXED-tagged pointer (`IS_MOVED_BOXED = !is_header`, `erl_gc.h:36`); a cons cell's car is set
   to `THE_NON_VALUE` and its cdr to the new LIST pointer (`IS_MOVED_CONS`, `erl_gc.h:37,42-55`). The
-  scan phase mirrors the C `sweep()` switch verbatim: walking the to-space word by word, a `BOXED`/`LIST`
-  word is a *reference* to forward, a **transparent** `HEADER` (arityval/record) is stepped over so its
-  elements are scanned individually, any other **thing** header is skipped by `thing_arityval+1`
-  (opaque interior; map keys/values follow the size word the same way), and `HEADER_SUB_BITS` forwards
-  its `orig` field (`erl_gc.c:2328-2348`). A **fun** header is the one exception to the
-  `thing_arityval+1` step — see the fun bullet below.
+  scan phase reproduces the C `sweep()` (`erl_gc.c:2328-2348`) over the canonical per-object walk: a
+  `BOXED`/`LIST` word is a *reference* to forward and is stepped over one word (a cons cell has no
+  header, so its two words are handled directly), while a `HEADER` word sizes its object with
+  `move_size`, forwards every copy child slot `beam_term::layout::for_each_child_slot` reports for the
+  shape at once, and then jumps past the whole object. The per-shape stepping — a transparent
+  arityval/record's elements, a fun's inlined descriptor, a map's occupancy/size words, and
+  `HEADER_SUB_BITS`'s `orig` — is exactly `beam_term::layout`'s, so `copy.rs` holds no shape logic.
 - **Funs are sized and scanned from the inlined-descriptor layout in `beam_term::fun`, *not*
   `header_arity`/`thing_arityval`.** `beam_term::boxed::header_arity` (and therefore `thing_arityval`)
   deliberately returns the C `ERL_FUN_SIZE - 1 == 1` for a fun — the old assumption that a fun block is
@@ -370,34 +378,36 @@ still reproduces today's collector exactly.
   C `entry` as descriptor words, so a fun block is `[header][desc_words(kind)][env[0..num_free]]`, where
   `desc_words` = 2 (`Local`), 2 (`External`), 10 (`Imported`), and `env[i]` is at
   `hp[1 + desc_words(kind) + i]`. The copier therefore never uses `header_arity` for a fun:
-  `move_size` sizes it as `1 + fun_desc_words(fun_kind_of_header(hdr)) + fun_num_free(hdr)` (==
-  `fun_block_words_header`, but computed infallibly since `is_fun_header(hdr)` already held), and the
-  Cheney scan advances a fun header by `fun_env_offset_header(hdr)` (== `1 + desc_words`, so the whole
-  descriptor is skipped opaquely) instead of `thing_arityval(hdr) + 1`, after which the word-by-word
-  loop scans exactly the `num_free` env words. Using `header_arity`/`thing_arityval` for a fun would
-  **under-size** the copy by `desc_words(kind) - 1` words (1 for `Local`/`External`, 9 for `Imported`)
-  and land the scan on a raw descriptor word (`index` for `Local`, `uniq` bytes for `Imported`),
-  following it as a bogus term reference and corrupting the heap. Every fun offset/width comes from
-  `beam_term::fun`; `copy.rs` defines none of its own.
-- **Object sizing/walking is shared, not duplicated.** `copy.rs` exposes the word-level evacuation
-  primitives (`pub(crate)` `EvacDest`, `forward_slot`, `move_size`, `scan_step`, `for_each_ref`, `Target`)
-  and both the copying `Copier` and the mark-region `immix/` mark/evacuation phases consume them, so the
-  fun-layout sizing rules live in one place. `space.rs`, `collector.rs`, `policy.rs`, `stats.rs`,
-  `config.rs` and `error.rs` deal in space geometry, collection policy, statistics and error construction
-  and never inspect a term's interior; `mso.rs` mentions "the magic reference of a fun" only in a doc
-  comment about off-heap liveness.
+  `beam_term::layout::object_words` sizes it as `fun_words(kind, num_free)` ==
+  `1 + fun_desc_words(kind) + fun_num_free` (`fun_block_words_header`), and the canonical walk's fun
+  case reports exactly the `num_free` env slots at `1 + desc_words(kind) + i`, so the whole descriptor
+  is skipped opaquely. Using `header_arity`/`thing_arityval` for a fun would **under-size** the copy by
+  `desc_words(kind) - 1` words (1 for `Local`/`External`, 9 for `Imported`) and land the scan on a raw
+  descriptor word (`index` for `Local`, `uniq` bytes for `Imported`), following it as a bogus term
+  reference and corrupting the heap. Every fun offset/width comes from `beam_term::fun`; `copy.rs`
+  defines none of its own.
+- **Object sizing/walking is shared, not duplicated.** The per-object walk lives in exactly one place —
+  `beam_term::layout::{object_words, for_each_child_slot}` (the LCA that owns the frozen term layout).
+  `copy.rs` exposes only the copy-specific `pub(crate)` pieces (`EvacDest`, `forward_slot`, `move_size`,
+  `for_each_ref`, `Target`), and both the copying `Copier` and the mark-region `immix/`
+  mark/evacuation phases consume them, so no crate re-derives a shape's size or its child slots.
+  `space.rs`, `collector.rs`, `policy.rs`, `stats.rs`, `config.rs` and `error.rs` deal in space
+  geometry, collection policy, statistics and error construction and never inspect a term's interior;
+  `mso.rs` mentions "the magic reference of a fun" only in a doc comment about off-heap liveness.
 - **`xptr_tag` is not needed.** The C ORs the literal bit back in only for literal-area copies
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the
   literal bit. Literal-tagged (and every other out-of-from-space) reference fails the `FromSet.contains`
   test and is left verbatim — the C `erts_is_literal`/area-test rule (`erl_gc.c:2013,2292-2297`).
-- **Local object-size traversal; `beam_term` is not modified.** `copy.rs` computes only what the copier
-  needs — an *incremental, per-object* `move_size(header, ptr)`: the `nelts` of the C `move_boxed`.
-  A **fun** is `1 + desc_words(kind) + num_free` (`fun_desc_words`/`fun_num_free`, see the fun bullet);
-  every other boxed object is `header_arity` plus the flatmap/HAMT extras, read through `beam_term`'s
-  public accessors (`header_arity`, `is_map_header`, `is_flatmap_header`, `map_header_val`). The scan
-  then walks the block word by word. It does **not** call `beam_term::size::size_object`: that is a
-  whole-graph size (it cannot size the single object the copier is looking at). The decision and the
-  exact formulas live here so no agent re-derives them.
+- **The copier sizes and walks through `beam_term::layout`, with one copy-size override.**
+  `copy.rs::move_size(header, ptr)` is `beam_term::layout::object_words` (the object's header-included
+  word count) for every shape **except** an `ErlSubBits`, for which it returns `ERL_SUB_BITS_SIZE`
+  (`5`) rather than the *sizing* graph's `ERL_REFC_BITS_SIZE` (`8`) / heap-bits window — those are the
+  words a copier lays down, after which forwarding `orig` copies the separate 3-word `BinRef`. It does
+  **not** call `beam_term::size::size_object`: that is a whole-graph size (it cannot size the single
+  object the copier is looking at). It is also **not** the message copier's layout — `beam_message`
+  has its own private walk (a different node). The override is the only shape-specific decision left in
+  `copy.rs`, and `tests/refc_binary_copy.rs` pins it (the pair copies as two objects totalling exactly
+  8 words).
 - **Root set = a flat `&mut [Eterm]`.** The C scans the whole stack *word by word* with no frame
   metadata (a word is a term iff its primary tag is BOXED/LIST and it points into a swept area —
   `erl_gc.c:1677-1717`), so a flat slice of root words (live x registers + live stack cells) is
@@ -664,7 +674,7 @@ still reproduces today's collector exactly.
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
-- `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `move_size`/`move_*`, `collect`
+- `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `collect`, and the copy-specific `pub(crate)` primitives (`EvacDest`, `forward_slot`, `Target`, `move_size` — `beam_term::layout::object_words` plus the `ErlSubBits` copy-size override — and `for_each_ref`); all per-object sizing/walking is delegated to `beam_term::layout`
 - `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver, bounded per-collection nursery re-size + mature growth/shrink + `minor_gcs`, the capacity pre-check (no half-forward) and the `ensure_capacity` growth seam
 - `src/config.rs` → GC-strategy seam: `GcConfig { policy, selection }`, `MatureKind::{Copying,Immix}` (the *strategy*; default `Copying`), `MatureSelection::{Auto,Explicit}` (the *how*; default `Auto` = the automatic rule). `mature()` is the resolved strategy, `mature_choice()` the observable decision, `growable`
 - `src/selection.rs` → the **automatic rule**: `IMMIX_BREAK_EVEN_WORDS`/`IMMIX_BREAK_EVEN_BLOCKS`, `select_mature`, `mature_words_of`, `resolve_mature`/`choice_for`, `MatureSource`, `MatureChoice` (`rule_kind`/`is_override`/`describe`). Safe Rust; depends only on `config`/`policy`/`immix`

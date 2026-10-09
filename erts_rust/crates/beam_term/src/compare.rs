@@ -117,7 +117,7 @@ use crate::atom::AtomTable;
 use crate::bitstring::{bit_at, bitstring_parts, float_bits};
 use crate::boxed::{boxed_val, header_arity, is_float};
 use crate::eterm::Eterm;
-use crate::fun::{fun_arity, fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
+use crate::fun::{fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
 use crate::immediate::{
     atom_val, internal_pid_data, internal_port_data, is_atom, is_small, signed_value,
 };
@@ -801,7 +801,9 @@ const fn fun_kind_rank(kind: FunKind) -> u8 {
 ///   the environment — exactly the C's field order (`index`/`old_uniq` compared
 ///   unsigned; the C subtracts them as `int`s, which is unobservable for real
 ///   lambda indices).
-/// * `External` ⇒ `(module, function, arity)`.
+/// * `External` ⇒ `(module, function, arity)` — the arity being descriptor word
+///   3, the `Export`'s **true** `info.mfa.arity` (`crate::fun::fun_true_arity`),
+///   not the header's truncated 8-bit field.
 ///
 /// **Documented deviation for mixed `Local`/`Imported` pairs:** their descriptors
 /// have different shapes, so — *as far as the descriptor allows* — they are
@@ -841,7 +843,12 @@ unsafe fn cmp_funs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Orderi
             if ord != Ordering::Equal {
                 return ord;
             }
-            fun_arity(ha).cmp(&fun_arity(hb))
+            // Descriptor word 3 is the `Export`'s `info.mfa.arity` — the TRUE arity,
+            // which the C compares here (`utils.c:2203-2206`). The header's 8-bit
+            // field would be wrong for an arity above 255.
+            // SAFETY: as above — descriptor word 3.
+            let (ara, arb) = unsafe { ((*pa.add(3)).raw(), (*pb.add(3)).raw()) };
+            ara.cmp(&arb)
         }
         // The inlined `(uniq, index)` descriptor stands in for the C entry.
         FunKind::Local => {

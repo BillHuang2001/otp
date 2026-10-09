@@ -5,8 +5,9 @@ The single shared foundation crate of the Rust ERTS rewrite (Stage 0 — Foundat
 `../../CONTEXT.md` §7). Every other crate depends on it, so its public API must be **small, stable and
 idiomatic**. It owns the workspace-wide **error/result strategy** (Part I §A.1; Part II §B: BIF/NIF
 failure is **return-based** — no `setjmp`/`longjmp`), the OTP/ERTS **version constants**, the
-runtime **configuration / feature-flag / flavor skeleton**, a dependency-free **logging facade**, and
-the documented **`unsafe` marker convention**.
+runtime **configuration / feature-flag / flavor skeleton**, a dependency-free **logging facade**,
+the **canonical definitions of ERTS constants genuinely shared by two or more workspace crates**
+(`constants`, currently `CONTEXT_REDS`), and the documented **`unsafe` marker convention**.
 
 This is a **dependency sink**: it depends on `std` (and `libc` for ABI-sized integer aliases) and on
 **nothing else** — deliberately no `thiserror`, no `tracing`, no `bitflags`. Adding any dependency
@@ -48,6 +49,10 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   so `init:get_argument/1`/`get_arguments/0` cannot be served from it — the raw boot argv must be
   captured (and split into `{Flag, Values}` groups) by `beam_rt` (matching `init.erl`'s
   `parse_boot_args/1`).
+- `constants` — the canonical cross-crate ERTS constants: `CONTEXT_REDS` (`= 4000`), the ERTS
+  reduction quantum / context-switch threshold (`erts/emulator/beam/erl_vm.h:47`). This module is the
+  designated home for any ERTS constant genuinely shared by ≥2 crates; a value used by a single crate
+  stays in that crate. See *Cross-Crate Constant Ownership*.
 - `logging` — dependency-free facade: `init_logging`, `init_from_env`, `set_level`, `level`,
   `enabled`, plus the `beam_trace!`/`beam_debug!`/`beam_info!`/`beam_warn!`/`beam_error!` macros.
 - `safety` — documentation-only module stating the `unsafe` convention (see Constraints).
@@ -71,7 +76,45 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   marked modules; every `unsafe` block/`fn` carries a preceding `// SAFETY: <invariant/rationale>`
   comment; any `unsafe` gains a Miri/fuzz or differential test where feasible. `beam_common` itself
   contains none (`#![forbid(unsafe_code)]`).
-- Files target ~1000 lines; split by responsibility (`error`, `version`, `config`, `logging`).
+- Files target ~1000 lines; split by responsibility (`error`, `version`, `config`, `constants`, `logging`).
+
+## Cross-Crate Constant Ownership
+`constants` is the single owner of ERTS constants genuinely shared by **two or more** workspace
+crates; a value used by a single crate stays in that crate. `beam_common` is the lowest common
+ancestor, so dependents import/re-export from here instead of transcribing their own copy.
+
+- **`CONTEXT_REDS`** (`= 4000`, `erts/emulator/beam/erl_vm.h:47`) — the ERTS reduction quantum /
+  context-switch threshold; a frozen ERTS interface constant reported by
+  `erlang:system_info(context_reductions)`. Transcribed independently in three sibling crates that
+  must adopt `beam_common::CONTEXT_REDS` (**read-only here — owners to route**):
+  `beam_io::port_task::CONTEXT_REDS` (`crates/beam_io/src/port_task.rs`, `usize`); the private
+  `CONTEXT_REDS` in `beam_rt::info::schedulers` (`crates/beam_rt/src/info/schedulers.rs`, `i64`, feeds
+  `system_info(context_reductions)`); and `beam_process::DEFAULT_REDUCTIONS_PER_SLICE`
+  (`crates/beam_process/src/scheduler.rs`, `u32`, the per-process slice budget).
+
+Other genuinely cross-crate-duplicated ERTS constants proved during the audit. Each already has (or
+needs) a canonical owner **outside** `beam_common`; adopters listed — **none edited from this node**:
+
+- **`MAP_SMALL_MAP_LIMIT`** (`= 32`, `erts/emulator/beam/erl_map.h:96`) — canonical
+  `beam_term::MAP_SMALL_MAP_LIMIT` (`crates/beam_term/src/map.rs`); copies to drop:
+  `crates/beam_engine/src/terms/mod.rs`, `crates/beam_bifs/src/maps.rs`.
+- **`MAX_ARG`** (`= 255`, `erts/emulator/beam/erl_vm.h:48`) — published twice already
+  (`beam_term::fun::MAX_ARG`, `beam_process::registers::MAX_ARG`); copies to drop:
+  `crates/beam_abi/src/nif/enif/process.rs` (`c_int`), `crates/beam_bifs/src/fun_info.rs` (`i64`).
+- **`MAX_REG`** (`= 1024`, `erts/emulator/beam/erl_vm.h:49`) — canonical `beam_process::MAX_REG`
+  (`crates/beam_process/src/registers.rs`); copy to drop: `crates/beam_loader/src/decode.rs` (`u64`).
+- **`MAX_ARITYVAL`** (`= (1<<24)-1`, `erts/emulator/beam/erl_term.h:322`) — canonical
+  `beam_term::MAX_ARITYVAL` (`crates/beam_term/src/tag.rs`); copy to drop:
+  `crates/beam_codec/src/encode/mod.rs`.
+- **`MAX_ATOM_CHARS`** (`= 255`, `erts/emulator/beam/atom.h:29` `MAX_ATOM_CHARACTERS`) — no canonical
+  Rust owner yet; duplicated in `crates/beam_codec/src/decode/mod.rs` and twice in `beam_bifs`
+  (`src/convert.rs`, `src/binconv.rs`).
+- **`VERSION_MAGIC`** (`= 131`, `erts/emulator/beam/external.h:84`) — canonical
+  `beam_codec::VERSION_MAGIC`; `beam_dist` already re-exports it (no duplicate).
+- Minor / trivially derived (noted, not actionable here): `NSEC_PER_SEC`
+  (`beam_abi/src/nif/enif/time.rs`, `beam_io/src/cpu_time.rs`); `WORD_BYTES` / `U32_PER_WORD`
+  (recomputed from `size_of::<Eterm>()` per crate); `POS_BIG_SUBTAG` / `REF_SUBTAG`
+  (canonical in `beam_term::tag`; only `#[cfg(test)]` copies elsewhere).
 
 ## Known Issues
 - **The `FeatureFlags` surface is largely inert.** Only `smp` is consumed anywhere (reported by
@@ -98,6 +141,7 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
     rejection of malformed input (`ParseVersionError`).
   - `config`: `Default` values, `Flavor` parse/`as_str`, `FeatureFlags::for_flavor`, builder setters,
     `LogLevel` parse + ordering.
+  - `constants`: `CONTEXT_REDS == 4000` (the frozen `erl_vm.h:47` value).
   - `logging`: level round-trip (`set_level`/`level`/`enabled`); `init_from_env` default when unset.
 - Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_common` GREEN.
   Full-workspace `cargo test --workspace` must stay green as dependents land.
@@ -113,6 +157,7 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
 - `src/error.rs` → `BeamError`/`Result` + term-independent exception machinery (`Raise`, `ExitReason`, …)
 - `src/version.rs` → OTP/ERTS version constants, `Version` parsing/`Display`
 - `src/config.rs` → `Flavor`, `FeatureFlags`, `RuntimeConfig`, `LogLevel`
+- `src/constants.rs` → canonical cross-crate ERTS constants (`CONTEXT_REDS`)
 - `src/logging.rs` → dependency-free logging facade + log macros
 - `src/safety.rs` → the workspace `unsafe` marker convention (docs only)
 - `src/lib.rs` → crate docs, module wiring, root re-exports

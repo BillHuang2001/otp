@@ -73,12 +73,29 @@
 //! | kind | descriptor words after the header | words |
 //! |---|---|---|
 //! | `Local` | `uniq` (u64) · `index` (u32) | 2 |
-//! | `External` | `module` (atom) · `function` (atom) | 2 |
+//! | `External` | `module` (atom) · `function` (atom) · `arity` (the true arity) | 3 |
 //! | `Imported` | `module` · `uniq[0..8]` · `uniq[8..16]` · `index` · `old_index` · `old_uniq` · `pid_node` · `pid_number` · `pid_serial` · `pid_creation` | 10 |
 //!
 //! `env[i]` lives at `hp[1 + desc_words(kind) + i]`, in the same order
 //! `i_make_fun3` stores it, and the block is `1 + desc_words(kind) + num_free`
 //! words **including the header**.
+//!
+//! # The external fun's true arity (descriptor word 3)
+//!
+//! The C fun *header* holds only an 8-bit `arity` field (`fun_arity(hdr) = (hdr
+//! >> 8) & 0xFF`, `erl_fun.h:92-93`), but the **true** arity of an `EXPORT_EXT`
+//! fun lives out-of-band in the `Export` (`exp->info.mfa.arity`, `erl_fun.h:79-80`)
+//! — a full machine word. The encoder emits that true value
+//! (`make_small(exp->info.mfa.arity)`, `external.c:3997-4001`) while
+//! `fun_info(F, arity)` reports the header's 8-bit field, i.e. the arity truncated
+//! to its low byte (verified against the oracle: an `EXPORT_EXT` blob with arity
+//! 256 has `fun_info(F, arity) = {arity,0}` yet re-encodes arity 256).
+//!
+//! The inlined descriptor therefore carries the true arity in its third word
+//! ([`write_fun_external`]), and [`fun_true_arity`] is the accessor an **encoder**
+//! or **hashing** must use. [`fun_arity`] stays the header reader (the `fun_info`
+//! parity), and the header's 8-bit field is written as `arity & FUN_MAX_FIELD` —
+//! an observationally identical, non-spilling alternative to the C's raw shift.
 //!
 //! Carrying every wire field is deliberate: `EXPORT_EXT` and `NEW_FUN_EXT`
 //! decode→encode stays byte-exact, a later `beam_engine`/`beam_rt` can call the
@@ -137,8 +154,9 @@ pub const MAX_ARG: usize = 255;
 /// `index` (u32) — in place of the C `entry` pointer (`erl_fun.h:65-85`).
 pub const FUN_DESC_WORDS_LOCAL: usize = 2;
 /// The descriptor words a [`FunKind::External`] fun carries — the `Export`'s
-/// `module` and `function` atoms (`optimize.h`/`erl_fun.h:79-80`).
-pub const FUN_DESC_WORDS_EXTERNAL: usize = 2;
+/// `module` and `function` atoms plus its **true** arity (`exp->info.mfa.arity`,
+/// `optimize.h`/`erl_fun.h:79-80`; see the module docs).
+pub const FUN_DESC_WORDS_EXTERNAL: usize = 3;
 /// The descriptor words a [`FunKind::Imported`] fun carries — the whole
 /// `NEW_FUN_EXT` signature (`external.c:5102-5176`): `module`, the two packed
 /// `uniq` words, `index`, `old_index`, `old_uniq` and the creator pid.
@@ -188,10 +206,15 @@ pub struct FunPid {
 /// ([`FUN_MAX_FIELD`] / [`MAX_ARG`]); a larger value yields
 /// [`TermError::ArityOutOfRange`] instead of silently truncating.
 ///
+/// This is the **header-word** builder, so the arity limit is the header's. An
+/// [`FunKind::External`] fun whose true arity exceeds it is written by
+/// [`write_fun_external`], which masks the header field and stores the true arity
+/// in the descriptor ([`fun_true_arity`]).
+///
 /// C's macro `ASSERT`s `NumFree == 0` for an external fun. That is an invariant
 /// of the *writers* here ( [`write_fun_external`] has no environment), not of
 /// the layout, so it is not enforced: [`fun_block_words`] sizes any combination
-/// consistently.
+/// consistently. [`write_fun_external`] asserts it on the header it built.
 pub fn make_fun_header(arity: usize, num_free: usize, kind: FunKind) -> TermResult<Eterm> {
     if arity > MAX_ARG || num_free > FUN_MAX_FIELD {
         return Err(TermError::ArityOutOfRange);
@@ -368,16 +391,26 @@ pub unsafe fn write_fun_local(
 /// `external.c:3994-4002`):
 ///
 /// ```text
-/// word 0   MAKE_FUN_HEADER(arity, 0, external = 1)
+/// word 0   MAKE_FUN_HEADER(arity & 0xFF, 0, external = 1)
 /// word 1   module    (atom term)
 /// word 2   function  (atom term)
+/// word 3   arity     (raw word — the TRUE arity, `exp->info.mfa.arity`)
 /// ```
 ///
 /// `num_free` is zero for an external fun, so there is no environment.
 ///
+/// **The true arity is not limited to 255.** The C header holds only 8 bits, so
+/// the C shifts the raw arity into the header (spilling into `num_free`); the
+/// oracle's `fun_info(F, arity)` therefore reports `arity & 0xFF`. This writer
+/// is observationally identical for that reader but masks instead of spilling —
+/// the header keeps `num_free == 0` and the block size stays `1 + 3` — and it
+/// stores the full arity in descriptor word 3, reachable via [`fun_true_arity`]
+/// (what an encoder must emit). So any `arity` is accepted: there is no
+/// [`TermError::ArityOutOfRange`] for an external fun.
+///
 /// # Safety
 ///
-/// `hp` must point at `fun_words(FunKind::External, 0)` (3) exclusively-owned,
+/// `hp` must point at `fun_words(FunKind::External, 0)` (4) exclusively-owned,
 /// writable words; all of them are written by this call and must stay live (and
 /// unmoved) for as long as the returned term is used.
 pub unsafe fn write_fun_external(
@@ -386,13 +419,19 @@ pub unsafe fn write_fun_external(
     module: Atom,
     function: Atom,
 ) -> TermResult<Eterm> {
-    let header = make_fun_header(arity, 0, FunKind::External)?;
-    // SAFETY: the caller reserved `fun_words(External, 0) == 1 + 2` words. Word 0
-    // receives the header, words 1 and 2 the module and function atoms.
+    let header = make_fun_header(arity & FUN_MAX_FIELD, 0, FunKind::External)?;
+    // The masking above must not let a large arity reach the header's `num_free`
+    // field, or the block sizing (`fun_block_words`) would overrun the block.
+    debug_assert_eq!(fun_num_free(header), 0);
+    debug_assert_eq!(fun_arity(header), arity & FUN_MAX_FIELD);
+    // SAFETY: the caller reserved `fun_words(External, 0) == 1 + 3` words. Word 0
+    // receives the header, words 1 and 2 the module and function atoms, word 3 the
+    // true arity.
     unsafe {
         *hp = header;
         *hp.add(1) = make_atom(module);
         *hp.add(2) = make_atom(function);
+        *hp.add(3) = Eterm::from_raw(arity);
     }
     Ok(make_boxed(hp))
 }
@@ -620,6 +659,34 @@ pub unsafe fn fun_function(t: Eterm) -> TermResult<Atom> {
     Ok(atom_val(unsafe { *boxed_val(t).add(2) }))
 }
 
+/// The **true** arity of a fun term — what an encoder (`external.c:3997-4001`
+/// emits `make_small(exp->info.mfa.arity)`) and hashing must use.
+///
+/// * [`FunKind::External`] ⇒ descriptor word 3, the `Export`'s
+///   `info.mfa.arity` inlined (module docs). Unlike [`fun_arity`] this is **not**
+///   truncated to the header's 8 bits, so an `EXPORT_EXT` fun with arity 256
+///   reports 256 here and 0 from [`fun_arity`] — exactly the oracle's split
+///   between `term_to_binary/1` and `fun_info(F, arity)`.
+/// * [`FunKind::Local`] / [`FunKind::Imported`] ⇒ the header's 8-bit field
+///   ([`fun_arity`]). For those two kinds the C arity *is* header-pinned (a
+///   `make_fun3` closure's `ErlFunEntry.arity` and a `NEW_FUN_EXT` fun's arity
+///   both come from the same 8-bit field), so there is no out-of-band copy.
+///
+/// A non-fun yields [`TermError::BadFun`].
+///
+/// # Safety
+///
+/// `t` must be a live boxed term; if it is a fun, its whole block must be live.
+pub unsafe fn fun_true_arity(t: Eterm) -> TermResult<usize> {
+    let header = fun_term_header(t)?;
+    match fun_kind_of_header(header) {
+        // SAFETY: descriptor word 3 (the true arity) of a live external fun is live
+        // and initialised.
+        FunKind::External => Ok(unsafe { (*boxed_val(t).add(3)).raw() }),
+        FunKind::Local | FunKind::Imported => Ok(fun_arity(header)),
+    }
+}
+
 /// The creator pid of a [`FunKind::Imported`] fun term — descriptor words 7..=10.
 /// A non-fun, or a fun of another kind, yields [`TermError::BadFun`].
 ///
@@ -710,7 +777,7 @@ mod tests {
         assert_eq!(FUN_MAX_FIELD, 0xFF);
         assert_eq!(MAX_ARG, 255);
         assert_eq!(FUN_DESC_WORDS_LOCAL, 2);
-        assert_eq!(FUN_DESC_WORDS_EXTERNAL, 2);
+        assert_eq!(FUN_DESC_WORDS_EXTERNAL, 3);
         assert_eq!(FUN_DESC_WORDS_IMPORTED, 10);
         assert_eq!(FUN_SUBTAG, 0x14);
     }
@@ -753,6 +820,8 @@ mod tests {
             make_fun_header(0, 256, FunKind::Local),
             Err(TermError::ArityOutOfRange)
         );
+        // The **header** builder is the 8-bit one for every kind; only
+        // `write_fun_external` masks and carries the true arity out of band.
         assert_eq!(
             make_fun_header(MAX_ARG + 1, 0, FunKind::External),
             Err(TermError::ArityOutOfRange)
@@ -802,10 +871,11 @@ mod tests {
         assert_eq!(fun_desc_words(FunKind::Local), FUN_DESC_WORDS_LOCAL);
 
         let external = make_fun_header(2, 0, FunKind::External).unwrap();
-        assert_eq!(fun_desc_words_header(external).unwrap(), 2);
-        assert_eq!(fun_env_offset_header(external).unwrap(), 3);
-        assert_eq!(fun_block_words_header(external).unwrap(), 3);
-        assert_eq!(fun_words(FunKind::External, 0), 3);
+        assert_eq!(fun_desc_words_header(external).unwrap(), 3);
+        assert_eq!(fun_env_offset_header(external).unwrap(), 4);
+        assert_eq!(fun_block_words_header(external).unwrap(), 4);
+        assert_eq!(fun_words(FunKind::External, 0), 4);
+        assert_eq!(fun_desc_words(FunKind::External), FUN_DESC_WORDS_EXTERNAL);
 
         let imported = make_fun_header(0, 4, FunKind::Imported).unwrap();
         assert_eq!(fun_desc_words_header(imported).unwrap(), 10);
@@ -864,28 +934,30 @@ mod tests {
     }
 
     #[test]
-    fn external_fun_layout_is_header_module_function() {
+    fn external_fun_layout_is_header_module_function_arity() {
         let a = atoms();
         let module = a.lookup("module").unwrap();
         let function = a.lookup("function").unwrap();
         let mut heap = Heap::new(8);
         let p = hp(&mut heap, fun_words(FunKind::External, 0));
-        // SAFETY: `p` addresses exactly `fun_words(External, 0) == 3` words.
+        // SAFETY: `p` addresses exactly `fun_words(External, 0) == 4` words.
         let f = unsafe { write_fun_external(p, 2, module, function) }.unwrap();
-        assert_eq!(heap.used(), 3);
-        assert_eq!(fun_block_words(f).unwrap(), 3);
+        assert_eq!(heap.used(), 4);
+        assert_eq!(fun_block_words(f).unwrap(), 4);
         // SAFETY: `f` is the live external fun just written.
         unsafe {
             let q = boxed_val(f);
             assert_eq!(*q, make_fun_header(2, 0, FunKind::External).unwrap());
             assert_eq!(*q.add(1), make_atom(module));
             assert_eq!(*q.add(2), make_atom(function));
+            assert_eq!((*q.add(3)).raw(), 2, "descriptor word 3 = the true arity");
         }
         // SAFETY: `f` is a live external fun.
         unsafe {
             assert_eq!(fun_module(f).unwrap(), module);
             assert_eq!(fun_function(f).unwrap(), function);
             assert_eq!(fun_env(f).unwrap(), &[] as &[Eterm]);
+            assert_eq!(fun_true_arity(f).unwrap(), 2);
         }
     }
 
@@ -1026,11 +1098,78 @@ mod tests {
             unsafe { write_fun_local(p, 1, 0, 0, &free) },
             Err(TermError::ArityOutOfRange)
         );
-        // SAFETY: as above.
-        assert_eq!(
-            unsafe { write_fun_external(p, 256, Atom::from_raw(0), Atom::from_raw(1)) },
-            Err(TermError::ArityOutOfRange)
-        );
+    }
+
+    #[test]
+    fn external_writer_keeps_the_true_arity_beyond_the_8_bit_header_field() {
+        let a = atoms();
+        let module = a.lookup("module").unwrap();
+        let function = a.lookup("function").unwrap();
+        // The oracle's split (verified against OTP 29 / erts-17.1): an `EXPORT_EXT`
+        // fun with arity 256 reports `fun_info(F, arity) = {arity,0}` (the header's
+        // low byte) yet `term_to_binary/1` re-encodes 256.
+        for (arity, want_header) in [(256usize, 0usize), (1_000_000, 64), (255, 255)] {
+            let mut heap = Heap::new(8);
+            let p = hp(&mut heap, fun_words(FunKind::External, 0));
+            // SAFETY: `p` addresses exactly the 4 words of the block.
+            let f = unsafe { write_fun_external(p, arity, module, function) }.unwrap();
+            assert_eq!(heap.used(), 4, "a large arity must not grow the block");
+            assert_eq!(fun_block_words(f).unwrap(), 4);
+            // SAFETY: `f` is the live external fun just written.
+            let header = unsafe { *boxed_val(f) };
+            assert_eq!(
+                fun_arity(header),
+                want_header,
+                "`fun_arity(hdr)` stays the header's low 8 bits (arity {arity})"
+            );
+            assert_eq!(fun_num_free(header), 0, "arity must not spill into num_free");
+            // SAFETY: `f` is the live external fun just written, so descriptor word 3
+            // is live and initialised.
+            assert_eq!(unsafe { (*boxed_val(f).add(3)).raw() }, arity);
+            // SAFETY: `f` is a live external fun.
+            assert_eq!(unsafe { fun_true_arity(f) }.unwrap(), arity);
+            assert_eq!(unsafe { fun_env(f) }.unwrap(), &[] as &[Eterm]);
+        }
+    }
+
+    #[test]
+    fn true_arity_of_local_and_imported_funs_is_the_header_field() {
+        let a = atoms();
+        let module = a.lookup("module").unwrap();
+        let mut heap = Heap::new(32);
+        let p = hp(&mut heap, fun_words(FunKind::Local, 1));
+        // SAFETY: `p` addresses exactly the 4 words of the local block.
+        let local = unsafe { write_fun_local(p, 7, 1, 2, &[make_small(0)]) }.unwrap();
+        let p = hp(&mut heap, fun_words(FunKind::Imported, 0));
+        // SAFETY: `p` addresses exactly the 11 words of the imported block.
+        let imp = unsafe {
+            write_fun_imported(
+                p,
+                9,
+                module,
+                &[0u8; 16],
+                1,
+                2,
+                3,
+                FunPid {
+                    node: module,
+                    number: 4,
+                    serial: 5,
+                    creation: 6,
+                },
+                &[],
+            )
+        }
+        .unwrap();
+        // SAFETY: both terms are live funs the heap owns.
+        unsafe {
+            assert_eq!(fun_true_arity(local).unwrap(), 7);
+            assert_eq!(fun_true_arity(imp).unwrap(), 9);
+            // The reader tests the boxed flag and the fun subtag, so a non-fun is a
+            // typed error, not a dereference.
+            assert_eq!(fun_true_arity(NIL), Err(TermError::BadFun));
+            assert_eq!(fun_true_arity(make_small(1)), Err(TermError::BadFun));
+        }
     }
 
     // -- wrong kind / wrong type ----------------------------------------------
@@ -1089,6 +1228,10 @@ mod tests {
             assert_eq!(fun_uniq_bytes(ext), Err(TermError::BadFun));
             assert_eq!(fun_module(ext).unwrap(), module);
             assert_eq!(fun_function(ext).unwrap(), function);
+            // The true arity is a per-kind accessor; both funs here have arity 0.
+            assert_eq!(fun_true_arity(ext).unwrap(), 0);
+            assert_eq!(fun_true_arity(local).unwrap(), 0);
+            assert_eq!(fun_true_arity(imp).unwrap(), 0);
 
             // An imported fun has no function name and no local `uniq`.
             assert_eq!(fun_function(imp), Err(TermError::BadFun));
@@ -1102,6 +1245,9 @@ mod tests {
     fn term_level_readers_reject_non_funs() {
         assert_eq!(fun_block_words(make_small(1)), Err(TermError::BadFun));
         assert_eq!(fun_block_words(NIL), Err(TermError::BadFun));
+        // SAFETY: `fun_true_arity` rejects anything that is not a boxed fun term
+        // before touching memory, so an immediate is a typed error here.
+        assert_eq!(unsafe { fun_true_arity(make_small(1)) }, Err(TermError::BadFun));
         let mut heap = Heap::new(8);
         // A boxed non-fun reaches the header read and is rejected by the subtag test.
         let tuple = heap.tuple(&[make_small(1)]).unwrap();
