@@ -48,7 +48,7 @@ It performs `find_module_file` + `code_server.load` **on demand** for an uncache
 
 ## Routing Table
 * `mod.rs` → `RuntimeContext` (fields, `new`/`with_output`/`for_process`/`pid`/`eval_heap`/`enter_module`/`run_export`) + the **one** `impl ExecutionContext` (`call_bif`'s dispatch order, `call_registered`, `apply_fun`, `send_message`/`send_fragmented_message`, `alloc_words`/`heap_available`), plus the `uses_*` predicates.
-* `bridges.rs` → the nine bridges (`DictBridge`/`ProcessBridge`/`NifBridge`/`RecordBridge`/`SendBridge`/`ModuleInfoBridge`/`PersistentTermBridge`/`RuntimeHooksBridge`/`FunBridge`) + `NodeIdentity` + `local_fun_identity`/`module_md5`.
+* `bridges.rs` → the nine bridges (`DictBridge`/`ProcessBridge`/`NifBridge`/`RecordBridge`/`SendBridge`/`ModuleInfoBridge`/`PersistentTermBridge`/`RuntimeHooksBridge`/`FunBridge`) + `NodeIdentity` + `local_fun_identity`/`module_md5`. `module_md5` (re-walking the raw `.beam` bytes through `beam_loader::container::parse`) is also consumed **outside** this node by `../native/erts_internal.rs` (`beamfile_module_md5/1`) and by `module_info.rs`.
 * `fun_identity.rs` → `FunIdentityBridge`, the `NEW_FUN_EXT` (`112`) identity of a compiled module's local (`make_fun3`) fun.
 * `gc.rs` → the engine's heap-admission point (`ExecutionContext::ensure_heap`) and the `alloc_words`/`heap_available` seams for a *scheduled* process; the runtime-level GC state/accounting/valves are [`../runtime/gc.rs`](../runtime/CONTEXT.md).
 * `trace.rs` → the execution-trace seam (`call`/`return_from`/`return_to` over `ExecutionContext::trace_event`).
