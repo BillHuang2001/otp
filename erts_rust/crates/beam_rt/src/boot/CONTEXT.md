@@ -146,11 +146,12 @@ and stops at **instruction 20** (0-based), `{apply,{c,erlangrc,[]}}`. The tail's
   unreached on this path.
 
 ### Runtime fragility (owner: outside `src/boot/**` — handoff)
-The stop moves with the configuration's init-argument **text**, size-sensitively rather than
-content-sensitively: `["-noshell"]`, `["-noshell","-foo"]` and a long absolute `-boot` value stop at 16,
-while `["-noshell","-boot","bootstrap/bin/start"]`, `["-foo","bar"]` and `["-foo","ba"]` carry the same
-script to 20. The failing configurations differ in *how* they lose the `application_controller` during
-its own `init/2`:
+The stop is a function of the **whole** command line, not only the script: two
+`init:get_arguments/0` configurations produce two different stops for the *same* script under the
+*same* executor. Reproduced: `-boot bootstrap/bin/start` (relative) and an absolute `-boot` value
+without `..` segments both carry the script to 20, while the absolute `..`-bearing `START_BOOT` stem
+that `tests/boot.rs` passes makes the `application_controller` die during its own `init/2`, with:
+
 * most often a `func_info`-driven `function_clause` (its `Raise.stacktrace.frames` is **empty**, so the
   raise is not localizable from the message) — `beam_engine`'s raise path;
 * at least once a **message copy** into the AC failing with the raw internal
@@ -199,7 +200,7 @@ comparable to `beam_rt`'s own CLI.
   committed `bootstrap/bin/start.boot`; pins `{"Erlang/OTP","30"}`, 22 instructions and the instruction
   list); the bounded prefix test `the_real_start_boot_prefix_loads_its_prim_load_batches`; 
   `the_real_start_boot_stops_honestly_at_the_first_unbootable_directive` (asserts the stop is a typed
-  `BeamError::Raise` on an `Instruction::Apply` at index ≥ 16 — it is 16 — and that the `primLoad`
+  `BeamError::Raise` on an `Instruction::Apply` at index ≥ 16 — it is 20 — and that the `primLoad`
   modules loaded); `the_real_start_boot_reports_its_stop_through_execute_reporting` (the `execute_reporting`
   API: `stop.total == instructions.len()`, `stop.index` `Some(index)` with `index >= 16`,
   `stop.instruction` is `Apply`, and `whereis(application_controller)` is a live pid — pinning the
