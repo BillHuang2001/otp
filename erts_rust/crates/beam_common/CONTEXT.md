@@ -49,6 +49,10 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   so `init:get_argument/1`/`get_arguments/0` cannot be served from it — the raw boot argv must be
   captured (and split into `{Flag, Values}` groups) by `beam_rt` (matching `init.erl`'s
   `parse_boot_args/1`).
+- `constants` — the canonical cross-crate ERTS constants: `CONTEXT_REDS` (`= 4000`), the ERTS
+  reduction quantum / context-switch threshold (`erts/emulator/beam/erl_vm.h:47`). This module is the
+  designated home for any ERTS constant genuinely shared by ≥2 crates; a value used by a single crate
+  stays in that crate. See *Cross-Crate Constant Ownership*.
 - `logging` — dependency-free facade: `init_logging`, `init_from_env`, `set_level`, `level`,
   `enabled`, plus the `beam_trace!`/`beam_debug!`/`beam_info!`/`beam_warn!`/`beam_error!` macros.
 - `safety` — documentation-only module stating the `unsafe` convention (see Constraints).
