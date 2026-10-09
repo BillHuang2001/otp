@@ -114,8 +114,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `select_reverse(spec)`, `select_delete(spec) -> usize`, `select_count(spec) -> usize`, `match_object(pattern)`, `match_(pattern)`,
   `match_delete(pattern) -> usize`, `select_replace(spec) -> usize`.
 - **Limit + continuation forms** (`continuation.rs`; `Option::None` ⇒ `'$end_of_table'`): each
-  `-> (Vec<Eterm>, Option<MatchContinuation>)`: `select_limit`/`select_continue`/`match_limit`/
-  `match_continue`/`match_object_limit`/`match_object_continue`.
+  `-> (Vec<Eterm>, Option<MatchContinuation>)`: `select_limit`/`select_continue`/`select_reverse_limit`/
+  `select_reverse_continue`/`match_limit`/`match_continue`/`match_object_limit`/`match_object_continue`.
+  `select_reverse` (`exec.rs`) enumerates the exact reverse of `Table::tab2list()` order; a
+  continuation carries a private direction so its resume keeps the direction.
 - `Table::set_fixation(bool)` / `is_fixed()` / `deferred_objects()` — `ets:safe_fixtable/2`.
 - `pub fn match_spec_run(list, spec, atoms, heap) -> Result<Vec<Eterm>>` (`run.rs`) — the
   table-independent `ets:match_spec_run/2` runner.
