@@ -247,7 +247,13 @@ fn relocate_term(
 /// [`alloc_words`](ExecutionContext::alloc_words) is deliberately **not** overridden:
 /// the trait default is a typed `unsupported`, so a builder that fell back to the
 /// unrooted seam would fail loudly instead of silently skipping the collector.
-struct MovingContext {
+///
+/// It is `pub(crate)` (with its constructor and the `collections`/`moved_any`
+/// witnesses) so the **family**-level regression suites (`families::records`,
+/// `families::bitstrings`) can drive their own instruction paths under the same
+/// moving collector — the shared witness for the whole rooted-allocation reroute
+/// (Handoff #11). It stays test-only: the module that owns it is `#[cfg(test)]`.
+pub(crate) struct MovingContext {
     /// The two region buffers — never read directly (they only keep the words alive;
     /// every access goes through the raw `base` pointers).
     _regions: [Box<[Eterm]>; 2],
@@ -261,16 +267,17 @@ struct MovingContext {
     /// collection compacts and every allocation appends).
     blocks: Vec<Block>,
     /// How many collections have run.
-    collections: usize,
+    pub(crate) collections: usize,
     /// The high-water mark of **live** words: the words retained by a collection.
     peak_live_words: usize,
     /// Whether any collection has actually relocated a block (i.e. changed an
     /// address) — the "the collector really moves something" witness.
-    moved_any: bool,
+    pub(crate) moved_any: bool,
 }
 
 impl MovingContext {
-    fn new() -> MovingContext {
+    /// A collector with two empty `REGION_WORDS`-word semi-spaces.
+    pub(crate) fn new() -> MovingContext {
         let a = vec![Eterm::default(); REGION_WORDS].into_boxed_slice();
         let b = vec![Eterm::default(); REGION_WORDS].into_boxed_slice();
         let base = [a.as_ptr() as *mut Eterm, b.as_ptr() as *mut Eterm];

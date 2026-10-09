@@ -47,7 +47,9 @@
 //! * [`update`] — `put_record` (its update path and the create form's typed
 //!   unsupported id cases) and `update_record_id`,
 //! * [`access`] — `is_record_accessible`,
-//! * [`field`] — `get_record_field`.
+//! * [`field`] — `get_record_field`,
+//! * [`rooted`] — the two build paths driven under the mock **moving** collector
+//!   (the rooted-allocation reroute's regression proof).
 //!
 //! This file owns the fixtures/helpers those submodules share and the
 //! family-membership test.
@@ -64,6 +66,7 @@ mod access;
 mod elements;
 mod field;
 mod native;
+mod rooted;
 mod update;
 
 // ---------------------------------------------------------------------------

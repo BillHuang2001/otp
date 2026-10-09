@@ -67,6 +67,8 @@ use super::{extract_bits, fail_step, is_all, make_small_checked, raw, read_size}
 mod commands;
 mod match_ctx;
 mod reads;
+#[cfg(test)]
+mod rooted;
 
 // Every moved item is re-exported here so its existing
 // `crate::families::bitstrings::matching::…` path keeps resolving. Some are only
