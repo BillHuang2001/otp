@@ -49,30 +49,6 @@ use beam_common::Result;
 use super::{logical_processors, schedulers_count, InfoValue};
 use crate::runtime::Runtime;
 
-/// `CONTEXT_REDS` (`erts/emulator/beam/erl_vm.h:47`: *"Swap process out after this
-/// number"*) — the emulator's reduction quantum.
-///
-/// `erlang:system_info(context_reductions)` is `make_small(CONTEXT_REDS)`
-/// (`erl_bif_info.c:3363-3364`), i.e. a **compile-time constant of the ERTS interface**,
-/// like `atom_limit`/`ets_limit` — not a measured property of a particular run. The
-/// oracle reports `4000` for every invocation (verified against OTP 29.1.1 / erts-17.1),
-/// so the number is reported as the interface constant it is.
-///
-/// The runtime does **honour** a per-slice reduction budget of the same size: the runner
-/// pre-empts (yields) a CPU-bound process once
-/// `beam_process::DEFAULT_REDUCTIONS_PER_SLICE` (4000, charged at the machine's
-/// heap-admission points) is spent, so this constant is also the runtime's own slice budget.
-///
-/// **TODO (de-duplication): this local copy is to be REPLACED.** The same quantum is
-/// declared independently as this constant, `beam_io::port_task::CONTEXT_REDS` and
-/// `beam_process::scheduler::DEFAULT_REDUCTIONS_PER_SLICE`; the three are not linked at
-/// compile time. A single canonical owner is being established in the `beam_common`
-/// foundation crate (the workspace's lowest common ancestor, a dependency of every crate
-/// here); once that lands, replace this declaration — and the `beam_io`/`beam_process`
-/// copies — with a reference/re-export to the canonical constant. Until then the value
-/// below must stay `4000` (identical to the canonical one) so behaviour is unchanged.
-const CONTEXT_REDS: i64 = 4000;
-
 /// The `system_info/1` value of a `schedulers`-family key, or `None` when `key` is not
 /// ours.
 pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
@@ -106,7 +82,9 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
             Some(Ok(InfoValue::List(Vec::new())))
         }
         "thread_pool_size" => Some(Ok(InfoValue::Int(thread_pool_size(rt)))),
-        "context_reductions" => Some(Ok(InfoValue::Int(CONTEXT_REDS))),
+        // `erlang:system_info(context_reductions)` is `make_small(CONTEXT_REDS)`, a frozen
+        // ERTS interface constant (`beam_common::CONTEXT_REDS`) reported as `4000` always.
+        "context_reductions" => Some(Ok(InfoValue::Int(beam_common::CONTEXT_REDS as i64))),
         _ => None,
     }
 }
@@ -217,6 +195,18 @@ mod tests {
         assert!(try_value("nonsense", &rt).is_none());
     }
 
+    #[test]
+    fn context_reductions_is_the_canonical_erlang_value() {
+        let rt = runtime();
+        assert_eq!(
+            try_value("context_reductions", &rt).unwrap().unwrap(),
+            InfoValue::Int(beam_common::CONTEXT_REDS as i64)
+        );
+        assert_eq!(
+            try_value("context_reductions", &rt).unwrap().unwrap(),
+            InfoValue::Int(4000)
+        );
+    }
     #[test]
     fn dirty_schedulers_default_to_zero_and_follow_the_flags() {
         let rt = runtime();
