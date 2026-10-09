@@ -116,6 +116,12 @@ stable. A test seeds exactly `INFO_ATOMS` and materializes every `SUPPORTED_KEYS
   `loaded_modules()`, `ports`, `tables`, `dist_node()`. **No new `Runtime` getter was
   needed.**
 
+## Known Issues
+- `trace_control_word` is a static `0` (`system.rs:112`), **not** this runtime's live trace-control word (the real trace state lives in `../trace.rs`); it is pinned against the oracle only for an untraced runtime, so it is grouped with the build/host constants.
+- `os_type` (`info.rs:538-544`) answers `{unix,linux}` for **every** non-Windows target, so it is wrong on macOS / other Unix hosts (the oracle reports `{unix,darwin}`, …); only the Linux case is oracle-equal. `system_architecture` (`info.rs:552-562`) spells out more targets and falls back to `"<arch>-unknown-<os>"`.
+- `CONTEXT_REDS = 4000` is declared here (`schedulers.rs:63`) and independently re-declared as `beam_io::port_task::CONTEXT_REDS` and `beam_process::scheduler::DEFAULT_REDUCTIONS_PER_SLICE`; the three are not linked at compile time.
+- The `{allocator, A}` rows are a live `beam_alloc` snapshot (`beam_alloc::registry::all_stats`) and the counts are real table lengths, but no test drives an allocation and observes a counter rise — "measured" here rests on the `beam_alloc` registry, not on a regression test in this node.
+
 ## Test Strategy
 - Per-key unit tests colocated in each family module: the value **shape** (and the exact
   value for the constants), plus `try_value(other_key) == None` and the unknown-key
