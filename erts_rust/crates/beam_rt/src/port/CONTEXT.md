@@ -19,7 +19,7 @@ Public: `PORT_INFO_ATOMS` (incl. `registered_name`), `PortName{Spawn,SpawnExecut
 
 ### Driver-emitted terms (`erl_drv_output_term` / `erl_drv_send_term`) — `TermQueue`
 `beam_abi` decodes the driver's term-data stack machine into a real term on the host's arena and calls `DriverHost::send_term(port, to: Option<Eterm>, term)`. The C *delivers* there and then (`driver_deliver_term`, `io.c:5664`: the decoded term itself, `from = prt->common.id`); the frozen seam gives the host no route to a receiver's mailbox, so the term is **queued**: `TermQueue` (`pub struct`, `Rc<RefCell<Vec<(Option<Eterm>, Eterm)>>>`) is per port and shared by handle — `DriverPort::term_queue()` returns the handle, `send_term` pushes onto it (while still recording the accumulate-only `DriverPort::sent` view the A.4 test reads), `take()` drains, `is_empty()` reports. `None` = the port's connected process (`erl_drv_output_term`, `io.c:6254`), `Some(pid)` = an explicit destination (`erl_drv_send_term`, `io.c:6289`). **Lifetime invariant:** a queued term's words live on the host arena, so `DriverPortAdapter` **empties** the queue both in `beam_io::Driver::stop` (the C refuses a delivery while `ERTS_PORT_SFLG_CLOSING`, `deliver_term_check_port`, `io.c:6213`) and in its `Drop`; a late drain observes an empty queue, never a freed arena.
-**The drain is not wired in this crate yet** — the runtime half needs `src/port.rs`/`src/runtime.rs` (outside this node), since `beam_io::Port` exposes no accessor for its `Box<dyn Driver>`.
+**The drain is wired**: `PortRegistry` seizes the handle as `meta.driver_terms` at `open_port/2` and `take_driver_terms` (`../port.rs`) surfaces each queued term as `PortEvent::Term{to, term, owner}`, which the pump copies onto the port heap (`RuntimeContext::stabilize_driver_term`) and delivers to the destination — the connected process for `None`, the explicit pid for `Some`.
 
 The precise symbols of `driver.rs`:
 - `DriverPort` (`driver.rs:235`) — `impl beam_abi::DriverHost` (`driver.rs:445`); the concrete host behind
@@ -55,10 +55,10 @@ The four driver-registry slots are **all overridden** (not left at no-host defau
   `unsupported: erlang:port_control/3` (registered in `../error.rs`'s `KNOWN_UNIMPLEMENTED_ERLANG_BIFS`).
 - `driver_async` keeps the `DriverHost` default `-1` (no async pool; `Runtime` is `!Send`).
 - A queued `TermQueue` entry carries no sending-port identity (the C stamps `from = prt->common.id`).
-- **A driver-emitted term is queued but not delivered**: no consumer drains `TermQueue` yet, because
-  reaching it needs a `beam_io::Port` accessor for its `Box<dyn Driver>` (or the `beam_rt`-side handle
-  seized at `open_port/2`) plus a delivery point in `src/port.rs`/`src/runtime.rs` — both outside this
-  node.
+- **A driver-emitted term is delivered end to end**: the handle is seized at `open_port/2`
+  (`meta.driver_terms`), `PortRegistry::take_driver_terms` drains it as `PortEvent::Term`, and the
+  pump stabilizes it onto the port heap (`RuntimeContext::stabilize_driver_term`) and delivers it to
+  the destination (`None` = the port's connected process, `Some(pid)` = an explicit one).
 - `ERL_DRV_USE` is accepted but its `stop_select` callback never fires.
 - `take_exit_status` is always `Ok(None)` — a driver port owns no child, so no `{Port,{exit_status,…}}`.
 - A driver that armed **more than one** registration per direction is a typed `unsupported`
