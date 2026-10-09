@@ -273,6 +273,11 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   pointer in the copied `BinRef.val`, and fixes the copied `ErlSubBits.orig` up to the **copied**
   `BinRef` — the fix-up an opaque-leaf treatment of a `SUB_BITS` would leave dangling. An on-heap
   **`ErlHeapBits`** small binary has no navigable child and is copied verbatim (its words are opaque).
+  A **match context** `SUB_BITS` (its `orig` is *not* a `BinRef`, i.e. an on-heap bitstring) is instead
+  **flattened** by `copy_match_context` into a fresh on-heap bitstring for the window `start..end`
+  (`copy.c:849-863`), never copied verbatim, so the copy carries no `base_flags`/`orig` pointer into
+  the source heap; `object_words` sizes it `heap_bits_size_words(end - start)` and `for_each_child_slot`
+  yields no child, so the preflight agrees with the copy.
 - **External pid/port/reference nodes: refcounted per identity, modeled locally.** Copying an
   external thing registers its node (`copy.c:882-909`) and copies the thing's words verbatim. There is
   **no node-registry crate anywhere in the workspace** and no `ErlNode *` to point at, so the node
