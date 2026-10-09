@@ -48,8 +48,8 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   pub exports: Vec<Export>, pub locals: Vec<Export>, pub imports: Vec<Import>, pub functions: Vec<Function>,
   pub funs: Vec<FunDescriptor>, pub records: Vec<RecordDefinition>, pub code_version: CodeVersion,
   pub types: TypeTable, pub line: LineTable, pub literals: Arc<LiteralArea>, pub strings: Vec<u8>,
-  pub attributes: Option<Vec<u8>>, pub attribute_table: Arc<AttributeTable>, pub compile_info: Option<Vec<u8>>,
-  pub meta: Option<Vec<u8>> }`
+  pub attributes: Option<Vec<u8>>, pub attribute_table: SharedAttributeTable, pub compile_info: Option<Vec<u8>>,
+  pub compile_info_table: SharedDecodedTerm, pub meta: Option<Vec<u8>>, pub meta_table: SharedDecodedTerm }`
   + `Module::atom_name(&self, Atom) -> Option<&str>`, `Module::export(&self, Atom, u32) -> Option<Label>`,
   `Module::function(&self, Atom, u32) -> Option<&Function>`, `Module::literal(&self, u32) -> Option<Eterm>`,
   `Module::literals(&self) -> &LiteralArea`, `Module::fun(&self, u32) -> Option<&FunDescriptor>`,
