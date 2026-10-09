@@ -35,6 +35,11 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `from_atom_name(name)`.
 - `pub enum Concurrency { None, Read, Write, ReadWrite }`; `as_atom_name()`, `from_atom_name(name)` —
   **advisory** (parsed/reported, not enforced).
+- `pub enum WriteConcurrency { #[default] Off, On, Auto, FixedLocks(u32) }` — the `{write_concurrency,_}`
+  mode (the plain bool is its `Off`/`On` projection): `is_enabled()`, `fixed_locks() -> Option<u32>`,
+  `as_atom_name() -> Option<&'static str>` (`"false"`/`"true"`/`"auto"`; `None` for `FixedLocks`),
+  `from_atom_name(name) -> Option<WriteConcurrency>`. `TableOptions` stores the mode; `FixedLocks(n)` keeps
+  the **requested** count (the power-of-two / `>= 64` normalization is the parser's).
 - `pub enum SetInterior { Chained, #[default] Champ }` and
   `pub enum OrderedInterior { #[default] BPlusTree, Sorted }` — the crate-internal interior selectors
   (`as_str()`); `Table::with_set_interior`/`with_ordered_interior` install them, `set_interior()`/
