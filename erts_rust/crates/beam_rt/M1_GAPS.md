@@ -52,21 +52,29 @@ foreign/decoded reference or ETS id is `badarg` vs the oracle's `true`. `spawn_o
 `{scheduler, N}`/`{async_dist, B}` stay `unsupported`; every other option is applied for real.
 
 ## ETS ownership
-`ets:new/2` records the calling process as the table owner (`beam_ets::Table::set_owner`) and the
+`ets:new/2` records the calling process as the table owner (`beam_ets::Table::set_owner`) and installs the
 parsed `{heir, …}`; `ets:info(T, owner)`/`heir` render the recorded pids (`undefined` when unset),
 `ets:setopts/2`/`ets:give_away/3` are registered, and `private`/`protected` access is enforced per
 owner. A dead owner's table is reclaimed through the `beam_process` `ProcessExitObserver` seam: the
-observer records the dead pid and `Runtime::drain_ets_owner_exits` releases each indexed table —
+observer records the dead pid and `Runtime::drain_ets_owner_exits` releases every table a dead pid owned —
 dropped, or handed to its heir with the oracle's `{'ETS-TRANSFER', Tid, FromPid, Data}` (silent for
 the `{heir, Pid}` 2-tuple form, which carries no data; an arity-3 `{heir, Pid, undefined}` *does*
-transfer `undefined`). `tests/ets_owner.rs` oracle-cross-checks the four flows.
-**The honest gap is an *unnamed* table.** `beam_bifs::TableRegistry` exposes no public owner→handle
-roster (`all_tids` is `pub(super)`) and no handle iterator, and an unnamed table's handle is only
-reachable from its on-heap ref thing through a crate-private decoder, so this runtime can index only
-a table whose handle it can *prove* at `ets:new/2` time — a **`named_table`**, via the public
-`TableRegistry::lookup_name`. A dead owner's unnamed table therefore leaks (it is not reclaimed
-here). A public roster — or a creation hook reporting "this call created handle `H` for owner `P`" —
-would close it.
+transfer `undefined`). `tests/ets_owner.rs` oracle-cross-checks the flows.
+**The authority is the public owner→handle roster, so an *unnamed* table is reclaimed too:**
+`beam_bifs::TableRegistry::handles_owned_by(TableRegistry::owner_of(dead))` lists every live table whose
+recorded owner is the dead pid (its handle is the registry key, reachable from no public term otherwise).
+The index this runtime built at `ets:new/2` time is unioned in only for what the roster cannot supply — a
+`named_table`'s **registered name**, released with `TableRegistry::remove_name` (an unnamed table has
+none). An unnamed table's tid in the transfer message is this runtime's own ref thing
+(`src/runtime/ets_owner.rs::tid_ref_thing`, a fresh `RefAllocator` walked to the handle, because the
+runtime's ref id space differs from `beam_bifs`'s).
+**The remaining live gap is `ets:setopts/2`'s gift data.** `beam_bifs`'s `src/ets/adopt.rs::setopts_2`
+installs an `{heir, …}` option through `beam_ets::Table::setopts`, which stores the gift term **verbatim**
+(its own "does not copy" contract) where `beam_ets::Table::install_heir` (a table-owned deep copy) is
+meant. The drain hands that term to a `{'ETS-TRANSFER', …, Data}` message **after** the owner is dead, so
+a term still aliasing the dead process's heap would be garbage; the creation path is safe (the
+`ets:new/2` build path copies). The fix belongs in `beam_bifs` (or in `beam_ets`, by making `setopts`
+copy); `Runtime::own_heir_gift` mitigates only the `ets:new/2` path.
 
 ## `process_info/1,2`
 The heap items read the target process's own policy (`Process::collector().policy()`), so a `spawn_opt`
@@ -97,8 +105,14 @@ admission point; a `receive ... after T` with a **non-statically-readable** dela
 
 ## NIF (A.3)
 `load_nif/2` really `dlopen`s the shared object and runs the C NIF; a load failure is the oracle's
-**returned** `{error, {Reason, Text}}`, never a raise. `term_to_binary`/`binary_to_term`/`make_ref`
-remain at the `NifHost` defaults; a second `load_nif` for a loaded module is `reload`; a NIF returning a
+**returned** `{error, {Reason, Text}}`, never a raise. `NifHostImpl` implements the runtime-dependent
+hooks: `term_to_binary`/`binary_to_term` (ETF), `existing_atom`, `unique_integer` and `system_info`
+(whose `scheduler_threads` is this runtime's **real** normal-scheduler count). `make_ref` and
+`whereis_pid` need runtime state the host does not own, so they arrive through the borrowed
+`NifHostServices` provider (`RuntimeNifServices`: the runtime's reference-id allocator, reference
+registry and name table) threaded into the **per-call** host; the **load/unload** host lives in
+`Runtime::nifs` (so it cannot borrow the runtime) and is built with `services = None`, leaving those two
+at the trait default `None` there. A second `load_nif` for a loaded module is `reload`; a NIF returning a
 non-term is caught by `try_call_nif` as a typed error, never an abort.
 
 ## Funs
@@ -136,9 +150,14 @@ family, `alias/1`/`unalias/1`, `delete_module/1`/`purge_module/2`, `port_get_dat
 heaps (the BIF-heap pool + the `-eval` heap) are plain bump arenas sized `config.heap_words`; `+hmax N`
 is a **real** cap on that capacity (`runtime.rs::term_heap_words`). The `system_limit` translation is
 applied **after** the copy engine's own retry (so `deliver_message` still matches the **raw**
-`AllocKind::Message` to trigger the heap-fragment retry). This crate drives no collector (only
-`HeapPolicy`/`next_heap_size`/`DEFAULT_MIN_HEAP_WORDS` plus read-only `HeapInfo`/`HeapObservable` for
-`process_info`).
+`AllocKind::Message` to trigger the heap-fragment retry). This crate **does** drive `beam_gc`: a *scheduled* process allocates on its own young heap and is
+collected at `ExecutionContext::ensure_heap` (armed by the slice's `BudgetContext`, roots = `x[0..live)`
+plus the Erlang stack), pinned by `tests/gc_collect.rs` and reported by `Runtime::gc_stats()`; every
+other context is a no-op on the unbounded arena. The limits are honest and measured: a workload that
+allocates only through `ExecutionContext::alloc_words` (no `test_heap` admission point) always falls back
+to the pointer-stable arena and is never collected, `Machine`'s float-register file is not mirrored by
+this crate's root publish (so a module with a float-family instruction is never collected over), and a
+failed collection halts that process's collection rather than failing the program.
 **On-demand heap growth is NOT adopted in M1.** `beam_gc` exposes the growth seam
 (`Collector::ensure_capacity`/`HeapPolicy::unbounded()`/`GcConfig::growable()`), but wiring it needs
 sibling changes, so heap exhaustion still raises `error:system_limit`: the engine `ensure_heap` hook is a
