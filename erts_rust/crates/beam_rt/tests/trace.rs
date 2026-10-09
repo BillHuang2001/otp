@@ -243,12 +243,18 @@ fn erts_trace_targets_and_capability_gaps() {
     let mut sink = NullSink;
     let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
 
-    // Every group atom selects the runtime's own one process.
+    // Every group atom selects the runtime's own two processes: the `init` root process and
+    // the native `file_server_2` service (`src/native/file_server.rs`, contract A.9), both
+    // started by `Runtime::new` and neither spawned by user code.
     for target in [all, existing, existing_processes, processes] {
         let count = ctx
             .call_bif("erts_internal", "trace", 3, &[target, how_true, flags_list])
             .expect("erts_internal:trace/3");
-        assert_eq!(signed_value(count), 1, "one process in the table");
+        assert_eq!(
+            signed_value(count),
+            2,
+            "the `init` root process and the native `file_server_2` service are both in the table"
+        );
     }
 
     // A port/new PidSpec is the honest capability gap, never a fabricated count.

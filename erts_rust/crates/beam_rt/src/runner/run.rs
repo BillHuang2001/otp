@@ -40,6 +40,7 @@ use super::budget::{BudgetContext, BudgetProbe};
 use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal, parked_receive_timeout};
+use super::tier::select_entry_tier;
 
 /// The `beam_process::ProcessRunner` the runtime hands to the scheduler.
 ///
@@ -144,6 +145,18 @@ impl ProcessRunner for RuntimeRunner<'_> {
             _ => None,
         };
 
+        // The execution tier for this process's **first** entry, resolved *before* the
+        // context borrows the runtime: the switch-safety predicate reads `Runtime`'s
+        // `registry`/`nifs`, which `for_process_with_engines` takes mutably below. A
+        // resumed process continues the machine it suspended in — the resume path has no
+        // tier entry — so a parked process needs no selection (the interpreter is the
+        // unused, always-correct value). A fun entry whose local target is only resolved
+        // by that first run reports no module here, and is conservatively interpreted.
+        let tier_mode = self.state.jit_mode();
+        let tier = match engine.parked {
+            Some(_) => Tier::Interpreter,
+            None => select_entry_tier(self.runtime, self.state, &engine.entry, tier_mode),
+        };
         let (outcome, used, exhausted) = {
             // The context also gets the **engines** of this pass (`self.state`): it drives
             // *this* process's machine (taken out of the map above), but a
@@ -215,23 +228,26 @@ impl ProcessRunner for RuntimeRunner<'_> {
                             function,
                             arity,
                         } => match module.export(*function, *arity) {
-                            // Entered at the export's own label on the **interpreter** tier.
+                            // Entered at the export's own label on the tier chosen above.
                             //
-                            // The tier is the interpreter, not the baseline JIT, because the
-                            // slice's process may **switch module context** mid-run: a
-                            // `call_ext*` the host resolves through
+                            // The tier is the baseline JIT only when the module is
+                            // *provably* free of a module-context switch (`Step::Enter`):
+                            // a `call_ext*` the host resolves through
                             // `ExecutionContext::resolve_external_call` (see
                             // `src/context/mod.rs`) is entered in this same machine as a
-                            // `Step::Enter`, and a native tier has no in-machine module-context
-                            // switch (it reports the typed
-                            // `unsupported("jit: module context switch …")` rather than
-                            // running the callee). The interpreter is also the only tier the
-                            // resume path (`Machine::resume_outcome` below) enters, so both
-                            // halves of a parked-and-resumed process run on one tier.
+                            // `Step::Enter`, and a native tier has no in-machine
+                            // module-context switch — it reports the typed
+                            // `unsupported("jit: module context switch …")`, which on this
+                            // path would become the process's exit reason. `tier` is
+                            // `Tier::Interpreter` for every module the predicate cannot
+                            // prove safe; the argument and the exact conditions are in
+                            // `super::tier`. The resume path below always runs on the
+                            // interpreter (it has no tier entry), so both halves of a
+                            // parked-and-resumed process stay equivalent.
                             //
                             // The label entry stays the equivalence-preserving route to the
-                            // export: `run_label_outcome` calls `Machine::enter_run`, so the
-                            // run's `initial_call`/`current_function` are recorded and
+                            // export: `run_label_outcome_with_tier` calls `Machine::enter_run`,
+                            // so the run's `initial_call`/`current_function` are recorded and
                             // `process_info/2`'s execution-position items can be answered.
                             Some(label) => engine.machine.run_label_outcome_with_tier(
                                 module,
@@ -239,7 +255,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
                                 *arity,
                                 &engine.args,
                                 &mut budget_ctx,
-                                Tier::Interpreter,
+                                tier,
                             ),
                             // An export the module does not define stays the engine's own typed
                             // error, byte for byte (`Machine::run_export_outcome`'s). Unreachable
@@ -263,7 +279,7 @@ impl ProcessRunner for RuntimeRunner<'_> {
                                 target.arity,
                                 &target.args,
                                 &mut budget_ctx,
-                                Tier::Interpreter,
+                                tier,
                             ),
                             None => budget_ctx
                                 .apply_fun(*fun, &engine.args)

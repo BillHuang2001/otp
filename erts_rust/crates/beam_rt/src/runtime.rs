@@ -64,7 +64,7 @@ use beam_process::{
 };
 use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm};
 
-use crate::boot::bootscript::{self, BootScript};
+use crate::boot::bootscript::{self, BootScript, BootStop};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
@@ -422,6 +422,26 @@ pub struct Runtime {
     /// unopenable file is recorded on the [`PerfMap`] (never raised, never printed), exactly
     /// as the oracle logs it and carries on. See [`crate::perf_map`].
     perf_map: PerfMap,
+    /// The open **whole-file descriptors** `prim_file:open/2` handed out and
+    /// `prim_file:close/1` has not yet removed (contract A.7).
+    ///
+    /// Keyed by the reference id minted for the descriptor's `handle`
+    /// ([`Runtime::refs_mut`]'s one id space, whose ids are never reused), the value the
+    /// host `std::fs::File` the descriptor denotes. The oracle keeps the same table in C
+    /// behind a NIF resource and *decodes* the `handle` reference to find it; this runtime
+    /// carries the id in the descriptor's own `Data` map instead, because reading a
+    /// reference's payload needs `unsafe` and this crate is `#![deny(unsafe_code)]`. The
+    /// table is owned by the `Runtime` (not a `thread_local!`) because several runtimes can
+    /// live in one thread — a process-global table would let their handles collide. See
+    /// [`crate::native::prim_file`].
+    open_files: HashMap<u64, std::fs::File>,
+    /// The **native `file_server_2` service** and its live io-devices (contract A.9) — see
+    /// [`crate::native::file_server`].
+    ///
+    /// `pub(crate)` because the service's whole implementation lives in that module (its
+    /// request decoding, reply shaping and scheduler-pass step); the field itself is the
+    /// state that ties the registered `file_server_2` pid to the runtime.
+    pub(crate) file_services: crate::native::file_server::FileServices,
 }
 
 impl Runtime {
@@ -472,6 +492,15 @@ impl Runtime {
         processes
             .register(init_name, self_pid)
             .map_err(|_| error::message("boot: the `init` name is already registered"))?;
+        // The native **`file_server_2` service** (contract A.9): a `Runnable`, never-enqueued
+        // process that answers the OTP file protocol, so the real `bootstrap/bin/start.boot`'s
+        // final `{apply,{c,erlangrc,[]}}` directive completes instead of dying with
+        // `{noproc,{gen_server,call,[file_server_2,…]}}` (see `src/native/file_server.rs`).
+        let file_services = crate::native::file_server::FileServices::start(
+            &mut processes,
+            code_server.atoms_mut(),
+            config.heap.policy().clone(),
+        )?;
         // A zero-word heap can hold nothing, so the configured size is floored — and a
         // `+hmax` the emulator was given is the ceiling (see `term_heap_words`).
         let heap_words = term_heap_words(&config);
@@ -549,6 +578,8 @@ impl Runtime {
             local_node,
             inbound_delivery: false,
             perf_map,
+            open_files: HashMap::new(),
+            file_services,
         })
     }
 
@@ -770,6 +801,17 @@ impl Runtime {
         self.timer_resumes.remove(&pid)
     }
 
+    /// The open **whole-file-descriptor** table (contract A.7): the host files
+    /// `prim_file:open/2` handed a descriptor for and `prim_file:close/1` has not yet
+    /// removed.
+    ///
+    /// Keyed by the reference id the descriptor's `handle` carries; see the field's own
+    /// docs for why the key is carried in the clear and the table is per-`Runtime`.
+    /// [`crate::native::prim_file`] is the module that mutates it.
+    pub(crate) fn open_files_mut(&mut self) -> &mut HashMap<u64, std::fs::File> {
+        &mut self.open_files
+    }
+
     /// Takes a heap for one BIF call out of the pool.
     ///
     /// The pool is a stack: a call takes a heap, runs, and puts it back
@@ -841,7 +883,8 @@ impl Runtime {
         self.arena.ensure_heap(heap_need, live, x_regs, stack)
     }
 
-    /// The process table (Milestone-1: one process — the runtime itself).
+    /// The process table (a fresh runtime holds the runtime's own `init` root process and
+    /// the native `file_server_2` service; user code adds the rest).
     pub fn processes(&self) -> &ProcessTable {
         &self.processes
     }
@@ -991,14 +1034,40 @@ impl Runtime {
         self.processes.register(atom, pid)
     }
 
+    /// Unlinks `a` and `b` in both directions (`ProcessTable::unlink`).
+    ///
+    /// This is the boot-script executor's seam for keeping a `{kernelProcess, …}` alive (see
+    /// the private `drive::start_kernel_process`). A real `init` runs each kernel-process
+    /// `apply` in the **one** long-lived process, so a `spawn_link` inside it
+    /// (`application_controller:start/1`, `logger_server:start_link/0`) is linked to a parent
+    /// that never exits. This runtime runs the directive in a *short-lived* process, whose
+    /// `normal` exit would otherwise tear the kernel server down: a `gen_server`/`proc_lib`
+    /// server traps exits and terminates on its parent's `{'EXIT', _, normal}`. Unlinking the
+    /// server from the directive **before the directive can exit** reproduces `init`'s
+    /// supervision without a long-lived stand-in process.
+    ///
+    /// Both pids must be **live**: calling this once the directive has already terminated is
+    /// the process table's typed unknown-pid diagnostic, so a caller that cannot prove
+    /// liveness (a `{kernelProcess, …}` whose `apply` returns before the process it spawned
+    /// registers, such as `heart`) checks [`Runtime::processes`]`().contains(..)` first.
+    ///
+    /// # Errors
+    ///
+    /// The process table's typed diagnostic when either pid is not a live process of this
+    /// runtime's table — never a panic, never a silent no-op.
+    pub fn unlink_processes(&mut self, a: ProcessId, b: ProcessId) -> Result<()> {
+        self.processes.unlink(a, b)
+    }
+
     /// Reads the OTP **boot script** at `path` and executes it (contract A.7, part 2).
     ///
     /// The runtime boots first (the preloaded set and the system code path), the script is
     /// parsed into its typed form ([`crate::boot::bootscript::read`]) and then executed in
     /// instruction order ([`crate::boot::bootscript::execute`]). Execution stops at the
-    /// first directive that cannot run, returning its typed error — a real `start.boot`
-    /// loads every `primLoad` batch and then stops at the first directive M1 cannot run
-    /// (see the `bootscript` module docs). Nothing is printed.
+    /// first directive that cannot run, returning its typed error — the real `start.boot`
+    /// runs all 22 of its directives through to `{progress,started}`, and a script that
+    /// still needs machinery M1 does not have stops at the first such directive (see the
+    /// `bootscript` module docs). Nothing is printed.
     ///
     /// # Errors
     ///
@@ -1009,6 +1078,44 @@ impl Runtime {
         let script = bootscript::read(path.as_ref())?;
         bootscript::execute(self, &script)?;
         Ok(script)
+    }
+
+    /// Reads the OTP **boot script** at `path` and executes it, **reporting the exact
+    /// directive the boot stopped at** ([`crate::boot::bootscript::BootStop`]).
+    ///
+    /// This is [`Runtime::boot_from_script`] with the failure's position preserved: on a
+    /// directive that cannot run it hands back a [`BootStop`] carrying the 0-based
+    /// `index`, the script's `total`, the failing `instruction` and the `error`, instead of
+    /// flattening those into the error alone. The two entry points share one execution
+    /// ([`crate::boot::bootscript::execute_reporting`]), so a script's stopping point is
+    /// identical whichever is used.
+    ///
+    /// A failure **before** the first directive — the runtime cannot boot, or `path` is not a
+    /// readable/parseable script — is reported with `index`/`instruction` unset (no directive
+    /// ran), exactly as [`crate::boot::bootscript::execute_reporting`] reports its own
+    /// pre-directive failure.
+    ///
+    /// # Errors
+    ///
+    /// A [`BootStop`] for the first directive that cannot run, or one with `index`/`instruction`
+    /// unset when the runtime cannot boot or the script cannot be read/parsed.
+    pub fn boot_from_script_reporting(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<(), BootStop> {
+        let script = match self.boot_if_needed().and_then(|()| bootscript::read(path.as_ref())) {
+            Ok(script) => script,
+            // No directive ran: the pre-directive failure shape `execute_reporting` uses.
+            Err(error) => {
+                return Err(BootStop {
+                    index: None,
+                    total: 0,
+                    instruction: None,
+                    error,
+                })
+            }
+        };
+        bootscript::execute_reporting(self, &script)
     }
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with
     /// `args` and returns `x(0)`.
@@ -1208,16 +1315,25 @@ impl Runtime {
 
     /// Records a process created by an `erlang:spawn*` **from inside a scheduler slice** for
     /// the pass to register and enqueue (see [`Runtime::pending_spawns`]).
-    pub(crate) fn note_pending_spawn(&mut self, mut spawn: PendingSpawn) {
+    ///
+    /// # Errors
+    ///
+    /// The stabilization failure of the entry fun or an argument:
+    /// [`BeamError::SystemLimit`] when the term genuinely cannot be copied onto the arena (see
+    /// [`Runtime::try_stabilize_escaped`]). Nothing is recorded in that case, so a pass never
+    /// runs a child whose entry or arguments dangle — the caller reports the honest error
+    /// instead.
+    pub(crate) fn note_pending_spawn(&mut self, mut spawn: PendingSpawn) -> Result<()> {
         // The entry point and the arguments are read **later**, by the pass that registers and
         // enqueues the child ([`Runtime::absorb_pending_spawns`]) — and the spawning process
         // may be collected in between, which moves or drops the heap these terms were built
         // on. Copy them onto the pointer-stable arena first (see
-        // [`Runtime::stabilize_escaped`]); this is also what makes the copies
+        // [`Runtime::try_stabilize_escaped`], which reports a term the copier genuinely cannot
+        // copy as the honest `system_limit`); this is also what makes the copies
         // [`RunnerState::spawn`] then stores safe.
         spawn.entry = match spawn.entry {
             ProcessEntry::Fun { fun, .. } => ProcessEntry::Fun {
-                fun: self.stabilize_escaped(fun),
+                fun: self.try_stabilize_escaped(fun)?,
                 // A pending spawn has not run yet, so its local fun cannot have been
                 // resolved: the first run of the child does that (see
                 // [`ProcessEntry::Fun`]).
@@ -1228,9 +1344,10 @@ impl Runtime {
         spawn.args = spawn
             .args
             .into_iter()
-            .map(|arg| self.stabilize_escaped(arg))
-            .collect();
+            .map(|arg| self.try_stabilize_escaped(arg))
+            .collect::<Result<Vec<Eterm>>>()?;
         self.pending_spawns.push(spawn);
+        Ok(())
     }
 
     /// Spawns a process whose entry point is the **fun** `fun`, applied to `args`.
@@ -1651,14 +1768,31 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_runtime_has_core_atoms_and_one_process() {
+    fn a_fresh_runtime_has_core_atoms_and_its_native_service_processes() {
         let rt = runtime();
         assert!(rt.atoms().lookup("unix").is_some());
         assert!(rt.atoms().lookup("linux").is_some());
-        assert_eq!(rt.processes().len(), 1);
+        // `Runtime::new` starts exactly **two** processes, both of them the runtime's own —
+        // neither was spawned by user code:
+        //   1. the **root process**, registered as `init` (`erlang:whereis(init)` answers it —
+        //      the oracle answers `<0.0.0>`), which every action runs as; and
+        //   2. the native **`file_server_2` service** (contract A.9), a `Runnable`,
+        //      never-enqueued process that answers the OTP file protocol the boot script needs
+        //      (`src/native/file_server.rs`).
+        assert_eq!(rt.processes().len(), 2);
+        for name in ["init", "file_server_2"] {
+            let atom = rt
+                .atoms()
+                .lookup(name)
+                .unwrap_or_else(|| panic!("`{name}` is a core atom"));
+            assert!(
+                rt.processes().whereis(atom).is_some(),
+                "the fresh runtime must have a live `{name}` process"
+            );
+        }
         assert_eq!(
             rt.system_info_value("process_count").expect("count"),
-            InfoValue::Int(1)
+            InfoValue::Int(2)
         );
     }
 

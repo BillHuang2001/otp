@@ -36,8 +36,12 @@ per-function bodies. Files:
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
-| `prim.rs` | the `prim_file` floor (11 entries) — see below |
+| `prim.rs` | the `prim_file` floor (16 entries) — see below |
+| `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2`) + its unit tests |
+| `file_server.rs` | the native **`file_server_2` service** (contract A.9) — the registered service process + its native io-devices, the `gen_server`/`file`/`io` wire, and the scheduler-pass step that services their mailboxes (see below) |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
+
+**`init:get_arguments/0` lists ONLY the command-line flags**, so it differs from the oracle by exactly its four automatic `root`/`bindir`/`progname`/`home` entries — which is why a `RuntimeConfig::default()` runtime (an empty `init_args`, so the listing is `[]`) stops the real boot script earlier, at instruction 16 (`application:load/1`, an `error function_clause`); the CLI-equivalent configuration runs the whole script to `{progress,started}` — the boot-chain consequence is in [`../boot/CONTEXT.md`](../boot/CONTEXT.md).
 
 **The process-control families route through the sibling `beam_process` machinery.** `monitor/2,3` and `demonitor/1,2` use `ProcessTable::{monitor, monitor_named, demonitor, demonitor_flush}`: `[flush]` removes a queued `'DOWN'` from the caller's mailbox and `[info]` answers the **real** "was a monitor on record and got removed" boolean (a second `demonitor(Ref, [info])` is `false`; the reference stays on record so it is never `badarg`). `exit/2,3` signals another process through `ProcessTable::send_exit`, but a **self**-directed exit is raised directly (non-trapping caller, or the untrappable `kill`) or delivered as `{'EXIT', self(), R}` via `RuntimeContext::deliver_message` (trapping caller and `Reason != kill`) — because the sibling scheduler defers a self-directed signal that arrives while the pid is `Running`, which it is inside a slice. `exit/3` accepts ONLY the bare atom `priority` as an option (`[{priority, high}]` is `badarg`). `is_alive/0`/`get_cookie/0`/`set_cookie/2`/`nodes/0,1` read the runtime's `DistNode`/cookie/local-node state (`../runtime.rs`; `get_cookie/0` is the atom `nocookie` while the node is not alive, and `set_cookie/2` RAISES `badarg`/`distribution_not_started`, matching the oracle). `spawn_opt` parses and validates EVERY option **before** the child is allocated, then builds the child's `HeapPolicy` with `beam_gc::HeapPolicy::from_spawn_opts` and applies it via the policy-aware `Runtime::spawn_*_with_policy`.
 
@@ -212,7 +216,11 @@ system (`std::fs`/`std::env`) — "primitive" is exactly what this layer is for.
 | `make_link/2` | `prim_file.erl:829-834` → `efile_make_hard_link` = `link(2)` (`unix_prim_file.c:963-969`) | `ok`; an existing link name ⇒ `{error,eexist}`; a missing source ⇒ `{error,enoent}`; bad path ⇒ `{error,badarg}` |
 | `make_symlink/2` | `prim_file.erl:835-840` → `efile_make_soft_link` = `symlink(2)` (`unix_prim_file.c:971-977`) | `ok` (the target need not exist); an existing link name ⇒ `{error,eexist}`; bad path ⇒ `{error,badarg}` |
 | `altname/1` | `prim_file.erl:842-848`; on Unix `efile_altname` is a constant `ENOTSUP` (`unix_prim_file.c:1085-1090`) | `{error,enotsup}` for every valid path (it does **not** return its argument); a bad path ⇒ `{error,badarg}` |
-
+| `open/2` | `prim_file.erl:132-141` (`open_nif(encode_path(Name), Modes)` → `make_fd/2` → `#file_descriptor{module = prim_file, data = build_fd_data(...)}`), `build_fd_data/5` (`:512-527`); C `efile_open` (`unix_prim_file.c:173-226`) + `efile_translate_modelist` (`common/prim_file_nif.c:500-539`) | `{ok, {file_descriptor, prim_file, Data}}` where `Data` is the oracle's map shape (`handle`, `owner`, plus `r_buffer`/`r_ahead_size` only for a **read-capable** descriptor) plus the private `fd_registry_id`. Modes follow the C's flags (`read`→`O_RDONLY`; `write` alone→`O_TRUNC\|O_WRONLY\|O_CREAT`; read+write→`O_RDWR\|O_CREAT`; `append`→`O_APPEND` and no `O_TRUNC`; `exclusive`, `sync`, `{read_ahead,S}`); **every** unmodelled option (`raw`, `binary`, `list`, `compress`, `retry_read`, …) is silently ignored, exactly as the C does. `{error,badarg}` for a bad path or a non-list mode list; `{error,enoent}`/`{error,eisdir}`/`{error,eexist}`/`{error,eacces}`/… from the errno; a `directory`-mode open is the honest `unsupported` gap (`std::fs::File` cannot `OPENDIR`) |
+| `read/2` | `prim_file.erl:162-171` + `read_1/5` (`:180-204`) → `read_nif`; C `read_nif_impl` (`common/prim_file_nif.c:632-663`) | `{ok, Binary}` (`N` bytes, fewer at EOF) \| `eof` (0 bytes read and `N` ≠ 0) \| `{error, Reason}`. One `read(2)` of at most `N`: **read-ahead is not reproduced** (`prim_buffer` is never called — its only export is `on_load/0`; divergence documented in `prim_file.rs`). `N` must be a non-negative integer (`-1` ⇒ `{error,badarg}`, `1 bsl 80` ⇒ `{error,einval}`); a write-only descriptor ⇒ `{error,ebadf}`; a malformed `Data` ⇒ `{error,badarg}`; a closed/unknown handle ⇒ `{error,einval}` |
+| `write/2` | `prim_file.erl:247-263` → `write_nif`; C `write_nif_impl` (`common/prim_file_nif.c:664-682`, `enif_inspect_iovec`) | `ok` \| `{error, Reason}`; the argument is iodata (a byte-aligned binary, a char list of byte-sized integers, proper sub-lists, `[]`, `<<>>`); an atom, a float, a negative/overflowing integer, a non-byte-aligned binary or an improper tail ⇒ `{error,badarg}`; a read-only descriptor ⇒ `{error,ebadf}` |
+| `close/1` | `prim_file.erl:154-160` → `close_nif`; C `close_nif` (`common/prim_file_nif.c:612-631`) | `ok`; releases the registry entry, so a second `close` and every later op on that handle ⇒ `{error,einval}` (the C `file_handle_wrapper` CLOSED branch); an unknown/non-resource handle ⇒ `{error,badarg}` |
+| `position/2` | `prim_file.erl:306-334` → `position_nif`; C `seek_nif_impl` (`common/prim_file_nif.c:782-806`) + `efile_seek` (`unix_prim_file.c:502-533`) | `{ok, NewPos}` \| `{error, Reason}`; `Loc` = `bof`/`cur`/`eof` (offset 0), `{Mark, Offset}`, or a bare non-negative integer (`{N, bof}`); a seek past EOF is legal; a negative resulting offset ⇒ `{error,einval}`; a bad mark or non-integer offset (`{1,bof}`, `foo`, `{bof,1.0}`) ⇒ `{error,badarg}`; a closed handle ⇒ `{error,einval}` |
 Every path-only entry is a direct NIF call wrapped by
 `try … catch error:badarg -> {error,badarg}` in `prim_file.erl`, so a **bad path is always the
 *value* `{error,badarg}`, never a raise**; the C's errno REMAPs (`EISDIR`→`EPERM`,
@@ -230,6 +238,84 @@ A path built from a **file's raw bytes** (`read_file`'s result, `read_link`'s ta
 `beam_engine::terms::make_heap_binary`). The `errno`→atom mapping is the C's
 (`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with the C's own `errno_<n>`
 form (`:47`) for an errno outside the table.
+
+### `file_server.rs` — the native **`file_server_2`** service (contract A.9)
+The runtime-native **file service** that completes the real boot chain. `lib/kernel/src/file.erl`
+routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`,
+and the file service is first *reached* at the `{apply,{c,erlangrc,[]}}` directive of
+`bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
+`FileServices` supplies the missing registered service. It is **not** a BIF: it is a process plus a
+scheduler-pass step, the topic of the rest of this subsection.
+
+#### The process model (never enqueued)
+`FileServices::start(&mut ProcessTable, &mut AtomTable, HeapPolicy)` is called from `Runtime::new`
+next to the `init` registration and runs **one** process, born `ProcessState::Runnable`, `insert`ed
+into the table and registered under the atom `file_server_2`, but **never enqueued** and given no
+engine — the pattern the runtime's own `init`/`self_pid` process already uses. Because
+`Process::wake` only wakes a `Waiting`/`Suspended` process, a message delivered into the service's
+mailbox never puts it on a run queue, so the runner never sees it and
+`error::unknown_process_entry` is unreachable. `whereis(file_server_2)`, `monitor(process, Name)`
+and a send all resolve it (`server()`/`is_running()` accessors). A successful `{open,…}` spawns a
+**second** `Runnable`, never-enqueued process — the **io-device** — under the same heap policy, and
+keys it in `FileServices::devices` as a `Device` (the open `std::fs::File` plus the `binary`/`list`
+read mode `file_io_server:parse_options/1` derived).
+
+#### The scheduler-pass step
+`Runtime::service_file_requests(&mut ProcessTable) -> Result<usize>` drains every service/io-device
+mailbox (`Process::receive`) and delivers each reply through `ProcessTable::deliver_simple`,
+returning the delivery count; a reply to a since-dead caller is dropped
+(`BeamError::TermNotFound`), exactly as `gen:reply/2` swallows its own send failure.
+`scheduler_pass` calls it as an **additive step right after the run queue drains** (the same place
+the port half runs); a non-zero count is added to the pass's `delivered` total and followed by
+`scheduler.resume_woken`, so a serviced-only pass never looks like "nothing happened" and a caller
+blocked in `gen_server:call`'s `receive` makes progress. The requesting process is normally the
+runtime's own `Runnable` `self_pid`, which the delivery therefore does **not** enqueue; it resumes
+through the engine's blocking-aware entry (`RunOutcome::Wait` → `Machine::resume_outcome`), not a
+scheduler slice.
+
+#### The wire protocols (verbatim from `lib/`)
+| Request | Reply |
+|---|---|
+| `{'$gen_call', {Pid, Tag}, Request}` (the local `infinity` form, `gen.erl:231-250`) | `{Tag, Reply}` to `Pid`; a `[alias\|Ref]` tag is the typed `unsupported` gap (the alias delivery this runtime cannot perform), never a fabricated delivery |
+| `{file_request\|io_request, From, ReplyAs, Request}` (`file_io_server.erl:199-233`) | `{file_reply\|io_reply, ReplyAs, Reply}` to `From` |
+An unknown `file_server` request is the oracle's `{noreply, State}`: nothing is delivered. A
+`FileServices` process never runs and never collects, so a mailbox payload (already copied onto the
+service's own heap by `deliver_simple`) is stable for as long as it is read.
+
+#### The served request surface (`file_server:handle_call/3`, `file_server.erl:101-201`)
+| Request | Behaviour |
+|---|---|
+| `{open, Name, ModeList}` | `{error,einval}` for a non-list mode; `{error,badarg}` for a path `prim_file` rejects; `{error,eisdir}` for a **directory** (an explicit `metadata().is_dir()` check is required, because Linux `open(2)` **succeeds** on a directory while the oracle's `efile_open` answers `EISDIR`); another OS failure → the oracle's errno atom; a readable file → `{ok, IoPid}` with a fresh native io-device |
+| `{read_file,_}`, `{delete,_}`, `{make_dir,_}`, `{del_dir,_}`, `{read_link,_}`, `{altname,_}` | reuse the existing `prim_file` primitives (`prim.rs`), so the errno remaps are identical |
+| `{rename,_,_}`, `{make_link,_,_}`, `{make_symlink,_,_}` | reuse the `prim_file` primitives |
+| `{get_cwd}` (bare atom or 1-tuple) / `{get_cwd,_}` | reuse `prim_file:get_cwd` |
+| `{list_dir,_}` | `{ok, Names}` from `std::fs::read_dir` in the **host directory order** (`file.erl:1044` documents "The names are not sorted") |
+| anything else (`write_file`, `read_file_info`, `copy`, …) | the typed `unsupported` capability gap, never a wrong value |
+
+#### The io-device request surface (`file_io_server.erl:199-233`)
+A request is either a **bare command atom** or a tuple whose head is the command: `file.erl` sends
+`close`/`sync`/`datasync`/`truncate` as the bare atom (`:1536`) and the positioned form as
+`{position,At}` (`:1954`). Served for real: `close` (retires the device), `sync`, `datasync`,
+`truncate`, `{position,At}` (`At` is `bof`/`cur`/`eof` or `{Mark,Offset}`, and a bare non-negative
+integer is `file.erl`'s `{N,bof}` shorthand), `{get_chars,Enc,Prompt,N}` (shaped `binary`/`list`
+from the open mode) and `{put_chars,Enc,Chars}`. Every other request is the typed `unsupported` gap.
+
+#### Honest capability gaps (never a fabricated term)
+* **`{get_until,Enc,_Prompt,Mod,Func,XtraArgs}`** — the request `io:parse_erl_exprs/4`/
+  `scan_erl_exprs/4` use. `file_io_server` answers it with `io_lib:get_until/4` →
+  `apply(erl_scan, tokens, [Cont, Chars, Pos0, Options])` (`erl_scan:tokens/4`) — real Erlang
+  tokenizer code, and a native service process hosts no engine. Owner: a **`beam_engine`**-class
+  capability (an Erlang-engine host inside the native step), never a `beam_rt` gap to fake. The same
+  applies to `get_line`/`setopts`/`getopts`/`pread`/`pwrite`/`advise`/`allocate`/`read_handle_info`,
+  the legacy `put_chars` arities, a non-`latin1` encoding and `read_file_info`/`write_file`.
+* **A scheduled process's `gen_server:call` to the service cannot complete** — the engine's
+  non-blocking `fold_outcome` folds the callee's suspend into `error::blocked()`. Owner:
+  **`beam_engine`**.
+* **`io:request/2` is not served by this crate's native `io` handling** (`../native.rs`'s `io` arm
+  covers only `put_chars/1,2`), so it loads the `io` module body and dies on `net_kernel:dflag_unicode_io/1`
+  — the typed `unsupported` gap `unsupported: net_kernel:dflag_unicode_io/1`. Consequently
+  `file:read/2`/`file:read_line/1` (the io-device read path) is unreachable from library code even
+  though the device itself serves `{get_chars,…}`. Owner: **`beam_rt`** (`../native.rs`).
 
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
@@ -258,6 +344,11 @@ form (`:47`) for an errno outside the table.
 - `memory/tests.rs` pins the `process_info` reply shapes, the failure modes, the `unsupported` set,
   and the oracle `registered_name` wrapping rules (the root pid is registered as `init`, so a test
   can `unregister` it to reach the live-unregistered case).
+- `file_server.rs`'s colocated units pin the wire decoders (`improper_list_head`'s `[alias|Ref]`
+  detection, `seek_from`'s `bof`/`cur`/`eof`/bare-integer forms, `iodata_bytes`, `tuple_fields`),
+  the errno→atom table and the `binary`/`list` open-mode parse; the service is proven end to end over
+  real temporary files/directories by `../tests/file_server.rs` (every rendering cross-checked
+  against the live `erl`).
 - **Oracle values** are quoted in each test's doc comment and were re-verified against the system
   `erl` (`erl -noshell -eval '…'`, OTP 29.1.1 / erts-17.1). Where the runtime answers a typed
   capability gap the oracle answers a value, the test pins the `unsupported` outcome with a
@@ -282,6 +373,9 @@ form (`:47`) for an errno outside the table.
   (`encode_path`/`collect_path`), the `errno`→atom table, and the served entries `get_cwd/0,1`,
   `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`, `make_link/2`,
   `make_symlink/2`, `altname/1`
+- `file_server.rs` → the native `file_server_2` service (`FileServices`, its `Device` io-devices and
+  the request/reply wire) + its unit tests; the pass step is `Runtime::service_file_requests`
+  (owned by `../runtime/scheduler.rs`)
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7) — the `init` automatic flags (`root`/`home`/`progname`), the code server's `get_mode/0` and `application:get_application/0` included
 - `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) / `port.rs` → the process/spawn (incl. `spawn_monitor`) and registry/reference surfaces, the monitor/demonitor and exit-signalling surfaces, and the port-write surface (contracts A.4/A.7/A.8/A.9)
 - `node.rs` → the node/cookie surface (`is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1`) + its unit tests
@@ -351,24 +445,33 @@ needs:
   `port_connect/2`, `port_control/3`, `port_info/1,2`) is **not** claimed *here*: the `erlang:*`
   counterparts are served by `../port.rs` + `beam_bifs`' `PortHook` seam. `erts_internal`'s own
   entries stay unclaimed (the preloaded wrapper is irrelevant to M1 callers).
-- **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` serves (the 11 entries in
-  its table) is on the floor; **every other** `prim_file` entry and all of `erl_prim_loader`,
-  `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval` are **Not
-  implemented** and still fall through to a real preloaded-`.beam` load (they ship in the `erts`
-  `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the matching
-  host. Two families are deliberately unclaimed:
-  * the **open-file / fd** entries — `open`/`read`/`write`/`position`/`pread`/`pwrite`/`allocate`/
-    `truncate`/`sync`/`datasync`/`advise`/`read_handle_info`/`copy/3`/`write_file/2` (the last a pure
-    Erlang composition) — all need the `#file_descriptor{}` resource machinery (and M1 has no
-    `open`; a non-fd argument raises the wrapper's uncaught `function_clause`, which is not modelled);
-  * **`read_file_info/1,2` / `read_link_info/1,2`** — the `#file_info{}` tuple is fillable from
+- **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` + `prim_file.rs` serve (the
+  16 entries in their tables) is on the floor; **every other** `prim_file` entry and all of
+  `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval`
+  are **Not implemented** and still fall through to a real preloaded-`.beam` load (they ship in the
+  `erts` `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the
+  matching host. Families still deliberately unclaimed:
+  * the **rest of the fd family** — `pread`/`pwrite`/`allocate`/`truncate`/`sync`/`datasync`/
+    `advise`/`read_handle_info`/`copy/3`/`write_file/2` (the last a pure Erlang composition) — plus
+    a `directory`-mode `open/2`, which `std::fs::File` cannot `OPENDIR` (that open is the honest
+    `unsupported` capability gap, never a fabricated handle);
+
+  The served fd family keeps the oracle's `#file_descriptor{}` shape so the Erlang glue above it
+  (`raw_file_io`, `raw_file_io_list`, `file_io_server`) pattern-matches unchanged, with three
+  documented divergences: the fd registry is keyed by a **private `fd_registry_id`** map entry
+  instead of decoding the `handle` reference (decoding needs `unsafe`); `r_buffer` holds a
+  **reference marker** rather than a real `prim_buffer` (dead code: `prim_buffer`'s only export is
+  `on_load/0`, and `read_1/5`'s `RBufSz >= RSz` clause always fires with one `read(2)`); and a
+  malformed `Data` answers `{error,badarg}` where the oracle sometimes raises `{badmatch,_}`.  * **`read_file_info/1,2` / `read_link_info/1,2`** — the `#file_info{}` tuple is fillable from
     `std::fs::Metadata`/`MetadataExt` for every field **except** `access` (the C calls `access(2)`,
     absent from safe `std::` and the crate is `deny(unsafe_code)`), and the *default* time type is
     `local`, needing a TZ conversion the runtime does not have. Only `[{time,posix}]` (and
     `[{time,universal}]` by pure arithmetic) would be exact — deferring the whole family keeps the
     default form from answering a wrong value.
   * `list_dir/1` is **not** claimed: its entries come back in `readdir(3)` order, which the oracle
-    does not sort and this runtime cannot pin. `prim_zip:splitter/3` is likewise unclaimed — pure
+    does not sort and this runtime cannot pin. (`file_server.rs` *does* serve the `{list_dir,Name}`
+    request — see above — over `std::fs::read_dir`, whose order the client is documented not to
+    rely on.) `prim_zip:splitter/3` is likewise unclaimed — pure
     Erlang over iolists (not a runtime primitive) whose error paths this floor does not reproduce.
   * Remaining machinery: the socket/NIF resource machinery (`prim_socket`, `prim_net`,
     `prim_inet`), zlib (`prim_zip`), a binary-buffer resource (`prim_buffer`), the boot loader
@@ -382,6 +485,7 @@ The per-call dispatch arm for every native BIF is a registration in `../native.r
 `../native.rs`'s module-doc table still omits those two names, so the parent node should add them there.
 `init:get_argument(root)` and `init:get_argument(home)` agree with the oracle through the same `init:get_argument/1` arm.
 `init:get_argument(progname)` is a deliberate, invocation-dependent gap: both runtimes report the basename **they** were invoked as (the oracle's `"erl"` comes from the `erl` shell script's `$0`), so the value is a property of the harness's invocation, not one this runtime may fabricate — never a wrong result.
+The `file_server_2` service's three cross-node gaps — the `{get_until,…}` tokenizer request and a scheduled `gen_server:call` (**`beam_engine`**), and `io:request/2`'s `net_kernel:dflag_unicode_io/1` (**`beam_rt`**'s `../native.rs`) — are itemised in the `file_server.rs` subsection above.
 
 ## See Also
 - `../../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.

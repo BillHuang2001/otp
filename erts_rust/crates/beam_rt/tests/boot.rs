@@ -34,17 +34,18 @@
 //!    the preloaded names come first, in `erlang:pre_loaded/0`'s order
 //!    ([`code_which_is_loaded_and_all_loaded_put_preloaded_first`]);
 //! 3. `erlang:pre_loaded/0` equals the **live oracle's** answer ([`pre_loaded_matches_the_live_oracle`]);
-//! 4. the real committed `bootstrap/bin/start.boot` loads its `primLoad` batches and then
-//!    stops with an **honest typed error** at the first directive M1 cannot run
-//!    ([`the_real_start_boot_loads_modules_then_stops_honestly`]);
+//! 4. the real committed `bootstrap/bin/start.boot` executes **all 22 directives** to
+//!    completion — every `primLoad` batch loads, every `kernelProcess` directive runs and the
+//!    final `{apply,{c,erlangrc,[]}}` reaches the native `file_server_2` service
+//!    ([`the_real_start_boot_runs_to_completion`]);
 //! 5. a synthetic boot script — compiled at test time with the system toolchain — executes
 //!    end to end and its `{apply, …}` step's side effect is observable
 //!    ([`a_synthetic_boot_script_executes_end_to_end`]);
 //! 6. the **CLI** really drives that executor for `-boot FILE` (contract A.7/A.9): a
 //!    synthetic script's `{apply, …}` reaches stdout through the executable
-//!    ([`the_cli_drives_the_boot_script_of_a_boot_flag`]), the real `start.boot`'s honest
-//!    stop is reported as a typed runtime error, never a panic
-//!    ([`the_cli_reports_the_boot_scripts_honest_stop_as_a_typed_error`]), and a boot with
+//!    ([`the_cli_drives_the_boot_script_of_a_boot_flag`]), the real `start.boot` boots to
+//!    completion and the CLI exits 0
+//!    ([`the_cli_runs_the_real_boot_script_to_completion`]), and a boot with
 //!    **no** `-boot` keeps the preloaded-only drive
 //!    ([`a_boot_without_the_boot_flag_keeps_the_preloaded_only_drive`]).
 //!
@@ -54,17 +55,26 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use beam_common::BeamError;
+use beam_rt::boot::bootscript::Instruction;
 use beam_rt::{Runtime, RuntimeConfig};
 
 /// The committed `start.boot` of this checkout (the oracle-identical real script).
 ///
 /// `CARGO_MANIFEST_DIR` is `<repo>/erts_rust/crates/beam_rt`, so the repository root (which
-/// holds `bootstrap/`) is three levels up.
-const START_BOOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../bootstrap/bin/start.boot"
-);
+/// holds `bootstrap/`) is three ancestors up. The path is assembled from those ancestors
+/// rather than by concatenating `..` segments: an **absolute** path containing `..` currently
+/// trips an out-of-tree soundness bug on the engine's structured-raise path — a boot driven
+/// that way exits 1 with `beam_rt: allocation failure: message (…)` instead of carrying the
+/// script through its 22 directives to `{progress,started}` — so the suite must avoid it to
+/// measure the *boot chain* rather than that bug. (See the handoff note in
+/// `src/boot/CONTEXT.md`; the bug is owned by `beam_engine`.)
+fn start_boot() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("the repository root is three levels above the crate")
+        .join("bootstrap/bin/start.boot")
+}
 
 // ---------------------------------------------------------------------------
 // Harnesses
@@ -131,6 +141,40 @@ fn booted_runtime() -> Option<Runtime> {
         Ok(()) => Some(rt),
         Err(error) => {
             eprintln!("SKIP: boot needs the system Erlang install ({error})");
+            None
+        }
+    }
+}
+
+/// A runtime configured **exactly as the CLI configures a `-boot FILE` invocation**, or
+/// `None` — loudly — when the system Erlang install is unavailable or the invocation does not
+/// parse.
+///
+/// The configuration is part of the measurement: `Runtime::with_defaults()` has an *empty*
+/// command line, so `init:get_arguments/0` omits the automatic entries the boot chain reads and
+/// `application:load/1` fails early (see the `src/native` handoff in `src/boot/CONTEXT.md`).
+/// Building the runtime through the CLI's own parser is what makes the in-process executor
+/// measure the invocation the CLI — and this suite's CLI test — really runs.
+fn boot_cli_runtime(boot_arg: &str) -> Option<Runtime> {
+    if booted_runtime().is_none() {
+        return None;
+    }
+    let argv = vec![
+        "-noshell".to_string(),
+        "-boot".to_string(),
+        boot_arg.to_string(),
+    ];
+    let config = match beam_rt::parse(&argv) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("SKIP: cannot build the `-boot` invocation's configuration ({error})");
+            return None;
+        }
+    };
+    match Runtime::new(config) {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            eprintln!("SKIP: no system Erlang install ({error})");
             None
         }
     }
@@ -251,43 +295,72 @@ fn pre_loaded_matches_the_live_oracle() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_real_start_boot_loads_modules_then_stops_honestly() {
-    let Some(mut rt) = booted_runtime() else {
+fn the_real_start_boot_runs_to_completion() {
+    // The CLI-equivalent configuration: the directive positions below are what this suite
+    // measures, and a bare `Runtime::with_defaults()` stops three instructions earlier (an
+    // empty `init:get_arguments/0` — see `boot_cli_runtime`).
+    let Some(mut rt) = boot_cli_runtime("bootstrap/bin/start") else {
         return;
     };
-    let path = Path::new(START_BOOT);
+    let path = start_boot();
     if !path.is_file() {
-        eprintln!("SKIP: {START_BOOT} is absent");
+        eprintln!("SKIP: {} is absent", path.display());
         return;
     }
 
-    // The real `start.boot` cannot fully boot in Milestone 1: `boot_from_script` walks the
-    // directives in order, loading every `primLoad` batch, and stops at the first directive
-    // the runtime cannot run with a typed error. It cannot panic or hang — `execute` drives
-    // the engine directly (never `run_scheduler`), so a blocking receive is the engine's
-    // typed `error::blocked()`. A watchdog thread is impossible here because `Runtime` is
-    // `!Send`; the boundedness is the executor's own by construction.
-    let error = rt
-        .boot_from_script(path)
-        .expect_err("the real start.boot cannot fully boot in Milestone 1");
+    // The real `start.boot` now runs to completion: `boot_from_script` walks every directive
+    // in order — loading each `primLoad` batch, running all three `kernelProcess` directives
+    // (whose servers really register) and then `{apply,{c,erlangrc,[]}}`, whose file consult
+    // reaches the **native `file_server_2` service** the runtime registers at construction
+    // (`src/native/file_server.rs`). That service answers `{open,"$HOME/.erlang",[read]}` with
+    // `{error,enoent}` (this environment has no `$HOME/.erlang`), which `c:erlangrc/0` treats
+    // as success, so the executor reaches the final `{progress,started}` directive. It cannot
+    // panic or hang — `execute` drives the engine directly (never `run_scheduler`), so a
+    // blocking receive is the engine's typed `error::blocked()`, and every scheduler drive is
+    // bounded. A watchdog thread is impossible here because `Runtime` is `!Send`; the
+    // boundedness is the executor's own by construction.
+    let script = rt
+        .boot_from_script(&path)
+        .expect("the real start.boot runs to completion now that file_server_2 answers");
+    assert_eq!(
+        script.instructions.len(),
+        22,
+        "the real start.boot has 22 instructions"
+    );
+    // The last directive is `{progress, started}` — the observable end of the chain, reached
+    // only because `c:erlangrc/0` (the directive before it) ran without error.
     assert!(
-        matches!(error, BeamError::Raise(_)),
-        "the stop must be a typed BeamError, never a panic: {error}"
+        matches!(
+            script.instructions.last(),
+            Some(Instruction::Progress(marker)) if marker == "started"
+        ),
+        "the boot chain ends at `{{progress,started}}`, found {:?}",
+        script.instructions.last()
+    );
+    // The last `apply` directive really is instruction 20 — the one the chain used to stop
+    // at before the native `file_server_2` service answered its `{open, …}`.
+    assert!(
+        matches!(
+            script.instructions.get(20),
+            Some(Instruction::Apply { mfa })
+                if mfa.module == "c" && mfa.function == "erlangrc" && mfa.args.is_empty()
+        ),
+        "instruction 20 is `{{apply,{{c,erlangrc,[]}}}}`, found {:?}",
+        script.instructions.get(20)
     );
 
-    // The `primLoad` batches really loaded before the stop, and they are **not** preloaded
-    // modules — so this is a genuine script-driven load.
-    for module in ["lists", "gen_server", "application_starter"] {
+    // The `primLoad` batches really loaded, and they are **not** preloaded modules — so this
+    // is a genuine script-driven load.
+    for module in ["lists", "gen_server", "application_starter", "argparse", "zstd"] {
         assert!(
             rt.module(module).is_some(),
-            "{module} must have been loaded by the script before the stop"
+            "{module} must have been loaded by the script"
         );
         assert!(
             !rt.is_preloaded_loaded(module),
             "{module} is not a preloaded module, so the load came from the script"
         );
     }
-    eprintln!("note: the real start.boot stops with: {error}");
 }
 
 // ---------------------------------------------------------------------------
@@ -490,31 +563,159 @@ fn the_cli_drives_the_boot_script_of_a_boot_flag() {
 }
 
 #[test]
-fn the_cli_reports_the_boot_scripts_honest_stop_as_a_typed_error() {
+fn the_cli_runs_the_real_boot_script_to_completion() {
     if booted_runtime().is_none() {
         return;
     }
-    if !Path::new(START_BOOT).is_file() {
-        eprintln!("SKIP: {START_BOOT} is absent");
+    let boot = start_boot();
+    if !boot.is_file() {
+        eprintln!("SKIP: {} is absent", boot.display());
         return;
     }
-    // The real `start.boot` cannot finish in Milestone 1: the executor stops at the
-    // `{apply,{application,load,…}}` directive (no live `application_controller`) with a
-    // typed raise the CLI reports as `beam_rt: exit noproc` — exit 1, never a panic, a hang
-    // or a silently-wrong success.
-    let stem = START_BOOT.trim_end_matches(".boot");
-    let output = beam_rt_boot(&["-noshell", "-boot", stem]);
+    // The real `start.boot` now boots to completion: its three `kernelProcess` directives
+    // really run, and its final `{apply,{c,erlangrc,[]}}` directive reaches the **native
+    // `file_server_2` service** the runtime registers at construction. That service answers
+    // `{open,"$HOME/.erlang",[read]}` with `{error,enoent}` (no `$HOME/.erlang` here), which
+    // `c:erlangrc/0` treats as success, so the chain reaches `{progress,started}` and the CLI
+    // exits 0, never a panic, a hang or a silently-wrong success.
+    //
+    // The switch names the boot file **without** its `.boot` suffix — `init` appends it
+    // (`erts/preloaded/src/init.erl:1268`).
+    let stem = boot.with_extension("");
+    let output = beam_rt_boot(&["-noshell", "-boot", &stem.to_string_lossy()]);
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "the honest boot stop is a runtime error (stderr {:?})",
+        Some(0),
+        "the real boot chain completes (stderr {:?})",
         stderr(&output)
     );
-    assert_eq!(stdout(&output), "", "the boot stop prints nothing");
-    assert!(
-        stderr(&output).contains("noproc"),
-        "the diagnostic is the boot chain's `noproc`: {:?}",
+    assert_eq!(stdout(&output), "", "the boot completion prints nothing");
+    assert_eq!(stderr(&output), "", "the boot completion reports no error");
+}
+
+/// The module the boot-chain survival probe applies: it reports whether the boot chain's
+/// `application_controller` kernel process is registered at the point the real script would
+/// next need to call it (right after the last `kernelProcess` directive).
+const PROBE_ERL: &str = r#"%% Generated by `beam_rt/tests/boot.rs` (never committed).
+-module(probe).
+-export([run/0]).
+run() -> io:format("ac=~p~n", [erlang:whereis(application_controller)]).
+"#;
+
+/// A scratch directory holding the compiled probe and its `.boot`, removed on drop.
+struct Probe {
+    dir: PathBuf,
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            println!("note: could not remove {}: {error}", self.dir.display());
+        }
+    }
+}
+
+/// Compiles [`PROBE_ERL`] and writes a `.boot` whose first 20 directives are the **real**
+/// `start.boot`'s verbatim — every `primLoad` batch and all three `kernelProcess` directives —
+/// followed by a code-path entry for the probe and the probe `apply`. `None` — loudly — when
+/// the toolchain is unavailable.
+fn build_probe_boot(real_boot: &Path) -> Option<Probe> {
+    let dir = std::env::temp_dir().join(format!("beam_rt_boot_probe_{}", std::process::id()));
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!("SKIP probe: cannot create {}: {error}", dir.display());
+        return None;
+    }
+    let source = dir.join("probe.erl");
+    if let Err(error) = std::fs::write(&source, PROBE_ERL) {
+        eprintln!("SKIP probe: cannot write {}: {error}", source.display());
+        return None;
+    }
+    match Command::new("erlc")
+        .arg("+deterministic")
+        .arg("-o")
+        .arg(&dir)
+        .arg(&source)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "SKIP probe: `erlc` exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+        Err(error) => {
+            eprintln!("SKIP probe: cannot run `erlc`: {error}");
+            return None;
+        }
+    }
+    let boot = dir.join("probe.boot");
+    // Slice and re-encode the real script with the oracle: `lists:sublist(Is, 20)` is its
+    // directives 0..=19 (ending at the `application_controller` kernelProcess), to which the
+    // probe's code path and `apply` are appended.
+    let program = format!(
+        "{{ok,B}} = file:read_file(\"{real}\"),\
+         {{script,{{N,V}},Is}} = binary_to_term(B),\
+         New = {{script,{{N,V}}, lists:sublist(Is, 20) ++ \
+             [{{path,[\"{dir}\"]}}, {{apply,{{probe,run,[]}}}}]}},\
+         ok = file:write_file(\"{boot}\", term_to_binary(New)), halt(0).",
+        real = real_boot.display(),
+        dir = dir.display(),
+        boot = boot.display(),
+    );
+    match Command::new("erl").args(["-noshell", "-eval", &program]).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "SKIP probe: `erl` exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+        Err(error) => {
+            eprintln!("SKIP probe: cannot run `erl`: {error}");
+            return None;
+        }
+    }
+    if !boot.is_file() {
+        eprintln!("SKIP probe: the oracle wrote no {}", boot.display());
+        return None;
+    }
+    Some(Probe { dir })
+}
+
+#[test]
+fn the_boot_chains_kernel_processes_survive_their_directive_processes() {
+    if booted_runtime().is_none() {
+        return;
+    }
+    let real = start_boot();
+    if !real.is_file() {
+        eprintln!("SKIP: {} is absent", real.display());
+        return;
+    }
+    let Some(probe) = build_probe_boot(&real) else {
+        return;
+    };
+    // The synthetic script is the real one's first 20 directives — through its
+    // `{kernelProcess, application_controller, …}` directive — plus the probe. If a kernel
+    // process died with its short-lived directive process, `whereis(application_controller)`
+    // would be `undefined` here; the real chain must report a live pid (`ac=<0.x.y>`).
+    let stem = probe.dir.join("probe");
+    let output = beam_rt_boot(&["-noshell", "-boot", &stem.to_string_lossy()]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the probe boot must run to completion (stderr {:?})",
         stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.starts_with("ac=<0."),
+        "the `application_controller` kernel process must survive its directive process: {out:?}"
     );
 }
 

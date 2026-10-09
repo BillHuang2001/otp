@@ -1028,6 +1028,12 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
                 Some(value) => run_boot_script(&mut runtime, value),
                 None => runtime.boot(),
             };
+            // The boot chain's failure is often a **structured** raise reason (the applied
+            // directive's own term), which `BeamError`'s `Display` can only render as the
+            // placeholder `<structured reason>`. Recover the live term and render it through
+            // the runtime's one printer, exactly as the `run` action does — so the reported
+            // diagnostic names the directive's real reason instead of a placeholder.
+            let result = result.map_err(|error| reported_reason(&mut runtime, error));
             *snapshot = Some(runtime);
             result
         }
@@ -1090,20 +1096,22 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
 ///
 /// The **boot action** is the one invocation whose whole job is to boot, so it is the one
 /// that drives the script; a start instruction (`-eval`/`-s`/`-run`/`run`) keeps the
-/// preloaded-only floor it has always had, because Milestone 1's executor cannot get past
-/// the system's own `{apply,{application,load,…}}` directive and would therefore fail every
-/// such invocation before its instruction ever ran (see below).
+/// preloaded-only floor, because a start instruction runs code, not the boot script that
+/// would start it.
 ///
 /// The runtime boots first: [`Runtime::boot`] is what puts the preloaded set *and* the
 /// system code path in place, and the code path is what resolves `$ROOT` — in `value`
 /// itself and in the script's own `{path, …}` directives. It is idempotent, and
 /// [`Runtime::boot_from_script`] boots again as its own precondition.
 ///
-/// Nothing is swallowed: a file on neither of `init`'s candidates, a malformed script and
-/// the **honest Milestone-1 stop** (the real `start.boot` cannot get past its
-/// `{apply,{application,load,…}}` directive, which needs a live `application_controller`)
-/// all return their typed [`BeamError`] — which [`run`] reports as `beam_rt: <error>` with
-/// exit code 1 — never a panic, a hang or a wrong result.
+/// Nothing is swallowed: a file on neither of `init`'s candidates, a malformed script and a
+/// directive the runtime cannot execute all return their typed [`BeamError`] — which [`run`]
+/// reports as `beam_rt: <error>` with exit code 1 — never a panic, a hang or a wrong result.
+///
+/// The real `start.boot` runs to **completion**: all 22 directives execute, the last being
+/// `{progress,started}`. The `{apply,{c,erlangrc,[]}}` directive's `{open, …}` of `$HOME/.erlang`
+/// is answered `{error,enoent}` by the native `file_server_2` service whenever that file is
+/// absent, which `file:path_eval/2` treats as success; see [`crate::boot`].
 fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {
     runtime.boot()?;
     let path = resolve_boot_file(value, boot_file_root(runtime).as_deref())?;
@@ -2146,8 +2154,7 @@ mod tests {
         assert_eq!(boot_file_argument(&parsed(&["-noshell"])), None);
         assert_eq!(boot_file_argument(&parsed(&[])), None);
         // The **flag** is action-independent, but only the boot action drives it: a start
-        // instruction keeps the preloaded-only floor (the Milestone-1 executor cannot finish
-        // the boot, so driving it there would fail the instruction before it ever ran).
+        // instruction keeps the preloaded-only floor (it runs code, not the boot script).
         let config = parsed(&["-boot", "x", "-eval", "2+3"]);
         assert_eq!(boot_file_argument(&config), Some("x"));
         assert_eq!(config.action, Action::Eval("2+3".to_string()));

@@ -18,16 +18,18 @@
 //
 // %CopyrightEnd%
 
-//! `proc_lib:start/3,4` — **the A.9 self-hosted-boot blocker**, and its regression gate.
+//! `proc_lib:start/3,4` — a `receive` that lives **one module boundary away**, and its
+//! regression gate.
 //!
 //! `init`'s `{kernelProcess, application_controller, {application_controller,start}}`
-//! directive is what used to stop `bootstrap/bin/start.boot` at instruction 16: the boot
-//! script's `{apply, {application, load, …}}` then raised `exit noproc`, because
-//! `application_controller:start/1` — reached through `proc_lib:start_link/4` — crashed
-//! during the `{kernelProcess, …}` burst instead of blocking.
+//! boot-script directive, and a plain `proc_lib:start[_link]/4`, both reach
+//! `application_controller:start/1` through `proc_lib:start_link/4`, which waits in
+//! `proc_lib:sync_start/2`'s bare `receive` — a **different module** from the entry point.
+//! Suspending the process across that boundary is what makes the start answer `{ok,pid}`
+//! instead of a capability gap.
 //!
 //! This suite is the committed, oracle-cross-checked bisection of *why*, and it is the
-//! regression gate for the fix. `tests/fixtures/plstart.erl` is one shape of "spawn a child,
+//! regression gate for that seam. `tests/fixtures/plstart.erl` is one shape of "spawn a child,
 //! wait for its ack" per entry point and `tests/fixtures/plwait.erl` holds the waiting
 //! `receive` that lives **one module boundary away** (exactly as `proc_lib:sync_start/2`
 //! does from `plstart`'s entry points). Both are compiled at test time with the system
@@ -47,42 +49,28 @@
 //!
 //! So neither "a receive in a non-entry frame" (H1) nor "a register-held `after Timeout`"
 //! (H2) is the discriminator: both work inside one module. The discriminator is the
-//! **cross-module `call_ext` boundary** — see the root cause below.
+//! **cross-module `call_ext` boundary** — see below.
 //!
-//! # The root cause (in `beam_engine`, not in `beam_rt`)
+//! # The two seams that suspend the process
 //!
-//! `beam_engine`'s `Instr::CallExt` arm
-//! (`erts_rust/crates/beam_engine/src/interpreter/dispatch.rs:301-307`) dispatches an
-//! external call **synchronously** through `ExecutionContext::call_bif`,
-//! `beam_rt`'s implementation of which serves a module export by loading it and running it
-//! on a **fresh, non-blocking** machine:
-//! `RuntimeContext::call_bif` → `RuntimeContext::run_export` (`src/context/mod.rs`) →
-//! `Machine::new().run_export(...)`. `Machine::run_export` folds a
-//! `RunOutcome::Wait` into the typed `Err(error::blocked())`
-//! (`beam_engine/src/machine/run.rs:51-78`, `fold_outcome`), so a callee that blocks in its
-//! own `receive` could not suspend the *process*: the block surfaced as a raise at the call
-//! site and the process died.
+//! * **Inside a running machine** — the engine's cross-module call seam
+//!   ([`ExecutionContext::resolve_external_call`]): a `call_ext*` the host resolves to an
+//!   `(Arc<Module>, entry_label)` is entered **in the calling machine**, the C-faithful shape
+//!   (`i_call_ext` saves a continuation pointer and jumps into the callee's code in the same
+//!   process frame — `erts/emulator/beam/emu/instrs.tab:191`, `ops.tab:923`), so the callee's
+//!   registers, stack and frames *are* the process's and its `receive` suspends the process.
+//! * **Through `ExecutionContext::call_bif`** (the `-eval` evaluator's route, an `apply`, a
+//!   `{kernelProcess, …}`/`{apply, …}` boot directive) — `beam_rt`'s blocking-aware direct
+//!   entries, `RuntimeContext::run_export_blocking`/`run_label_blocking`
+//!   (`src/context/mod.rs`): a callee that reports `RunOutcome::Wait` is resumed after the
+//!   scheduler has been pumped.
 //!
-//! The real BEAM does not do this: `i_call_ext` saves a continuation pointer and **jumps
-//! into the callee's code in the same process frame**
-//! (`erts/emulator/beam/emu/instrs.tab:191`, `ops.tab:923`), so the callee's `receive`
-//! suspends the process and the scheduler resumes it there.
-//!
-//! # How it was closed
-//!
-//! `beam_engine` exposes the cross-module call seam
-//! ([`ExecutionContext::resolve_external_call`]): a `call_ext*` the host can resolve to a
-//! `(Arc<Module>, entry_label)` is entered **in the calling machine** (the C-faithful
-//! shape — the callee's registers, stack and frames *are* the process's), so its `receive`
-//! suspends the process and the scheduler resumes it there.
-//!
-//! `beam_rt` implements the seam in `src/context/mod.rs::resolve_external_call`. It is
-//! consulted before every `call_ext*`, so it must answer `Ok(None)` for anything the
-//! synchronous path serves better (the runtime-native floor's namespaces, a NIF-backed
-//! module, a registered `beam_bifs` name, a float-using module, an unknown
-//! export) and it **loads the callee on demand** when the module is not cached yet —
-//! otherwise the *first* call (which is exactly what a `proc_lib` start is) would keep the
-//! synchronous, non-blocking path and still report the typed gap.
+//! `beam_rt` implements the engine seam in `src/context/mod.rs::resolve_external_call`. It is
+//! consulted before every `call_ext*`, so it answers `Ok(None)` for anything the synchronous
+//! path serves better (the runtime-native floor's namespaces, a NIF-backed module, a
+//! registered `beam_bifs` name, a float-using module, an unknown export) and it **loads the
+//! callee on demand** when the module is not cached yet — otherwise the *first* call (exactly
+//! what a `proc_lib` start is) would keep the synchronous path.
 //!
 //! [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
 

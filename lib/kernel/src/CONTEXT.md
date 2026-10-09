@@ -121,6 +121,14 @@ OS / terminal / processes:
 - `error_handler` carries a strong warning in its moduledoc: it interacts with the code server's `init` process and the I/O mechanism, so small edits can deadlock the system.
 - `prim_tty` (this module) is a thin wrapper over the C NIF in `erts/emulator/nifs/common/prim_tty_nif.c`; the process/terminal protocol lives in `user_drv` and `group`.
 
+## File Server Wire Protocol (`file.erl` ↔ `file_server` ↔ `file_io_server`)
+- `file.erl` addresses the process registered as `file_server_2` (`?FILE_SERVER`, `file.erl:251`) through `call/2` (`file.erl:3039`): `gen_server:call(file_server_2, list_to_tuple([Command|Args]), infinity)`. `check_and_call/2` (`file.erl:3046`) runs `check_args/1` first.
+- Only `open` plus the stat/mutate ops (`read_file`, `write_file`, `set_cwd`, `delete`, `rename`, `make_dir`, `del_dir`, `list_dir(_all)`, `get_cwd`, `read_file_info`, `altname`, `write_file_info`, `read_link_info`, `read_link(_all)`, `make_link`, `make_symlink`, `copy`, `stop`) are sent to `file_server_2`. `open` sends `{open, FileName, ModeList}`; the server replies with the result of `file_io_server:start_link/3` = `{ok, Pid} | {error, Reason}` (`file_server.erl:101-103`) — NOT a `#file_descriptor{}`.
+- The returned `Pid` is a `file_io_server`: a hand-written receive loop `server_loop/1`, NOT a `gen_server`. Reads/writes use the io protocol: `read/2` → `io:request(Pid, {get_chars, latin1, '', Sz})` (`file.erl:1634`), `write/2` → `{put_chars, latin1, Bin}` (`file.erl:1800`); messages are `{io_request, From, ReplyAs, Request}` ↔ `{io_reply, ReplyAs, Reply}` (`file_io_server.erl:215-239`, `io.erl:1669-1672`).
+- `close/sync/position/advise/allocate/pread/pwrite/truncate/datasync` use the file protocol: `file_request(Pid, Req)` (`file.erl:3068`) sends `{file_request, From, Ref, Req}` ↔ `{file_reply, Ref, Reply}` (`file_io_server.erl:201-236`).
+- `#file_descriptor{module=M, data=D}` is the 3-tuple `{file_descriptor, M, D}` (`../include/file.hrl:64-66`); it is returned only by the `raw`/`ram` handles (`raw_file_io:open` → `prim_file:open`, `prim_file.erl:137,151-152`), whereas the cooked file-server path returns a `Pid`.
+- `path_open/3`/`path_open_first/4` (`file.erl:2601,2960`) call `open/2`; on `{error, enoent|enotdir}` they try the next path, on `{ok, Fd}` they return `{ok, Fd, FileName}`.
+
 ## Notes for Agents
 - `prim_file`, `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `socket_registry`, `prim_buffer`, `prim_zip`, `zlib`, `init`, `erlang`, `erts_internal` are NOT here — they are preloaded modules in `erts/preloaded/src/`. `kernel` modules may assume they are available.
 - The preloaded `init` module boots the system and starts applications through `application`; `application_controller` is already registered before `kernel:start/2` runs.
