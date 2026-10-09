@@ -180,7 +180,7 @@ suites that load real OTP `.beam` skip loudly when `erl`/the install is absent.
   inliner groups (`emit/{move,arith,compare,test,select,aggregate,link,operands}.rs`).
 - `cranelift/*` -> the optional hot tier (feature-gated): one Cranelift function per IR `Function` over
   the same shared interpreter-backed helper, `inline.rs` (the shared inline set + `inline_swap`),
-  `shape.rs`, `report.rs` (`CompilegenReport`); `inlined_swap_count`/`inlined_tail_call_count`.
+  `shape.rs`, `report.rs` (`CodegenReport`); `inlined_swap_count`/`inlined_tail_call_count`.
 
 ## See Also
 - `../CONTEXT.md` -> the engine's API surface, the `Step` protocol, and Handoff #9 (native-tier
