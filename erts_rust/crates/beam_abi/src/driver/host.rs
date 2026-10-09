@@ -51,11 +51,10 @@ use crate::common::SysIOVec;
 use crate::driver::types::{
     ErlDrvBinary, ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvMonitor, ErlDrvNowData, ErlDrvPDL,
     ErlDrvPort, ErlDrvPort_, ErlDrvSInt, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_ATOM,
-    ERL_DRV_BINARY, ERL_DRV_BUF2BINARY, ERL_DRV_FLOAT, ERL_DRV_INT, ERL_DRV_INT64, ERL_DRV_LIST,
-    ERL_DRV_NIL, ERL_DRV_PORT, ERL_DRV_STRING, ERL_DRV_STRING_CONS, ERL_DRV_TUPLE, ERL_DRV_UINT,
-    ERL_DRV_UINT64,
+    ERL_DRV_BINARY, ERL_DRV_BUF2BINARY, ERL_DRV_EXT2TERM, ERL_DRV_FLOAT, ERL_DRV_INT,
+    ERL_DRV_INT64, ERL_DRV_LIST, ERL_DRV_MAP, ERL_DRV_NIL, ERL_DRV_PID, ERL_DRV_PORT,
+    ERL_DRV_STRING, ERL_DRV_STRING_CONS, ERL_DRV_TUPLE, ERL_DRV_UINT, ERL_DRV_UINT64,
 };
-
 // Re-exported so the runtime reaches the publication through the same module as the seam it belongs
 // to (`beam_abi::driver::host::with_current_host`); `current_host` documents the mechanism.
 pub use crate::driver::current_host::with_current_host;
@@ -97,6 +96,23 @@ pub trait DriverHost {
     /// `to` is `None`, else to that specific process. `0` = ok, `-1` = fail.
     fn send_term(&mut self, port: ErlDrvPort, to: Option<Eterm>, term: Eterm) -> c_int;
 
+    /// Decode an **External Term Format** image — the `ERL_DRV_EXT2TERM` operand of a term-data spec
+    /// (`io.c:5826-5848`, the C's `erts_binary2term_*` two-pass decoder).
+    ///
+    /// `bytes` is the `(char *ext, ErlDrvUInt size)` operand pair (never empty — the C rejects
+    /// `size <= 0` before asking). The hook allocates the decoded term on [`heap`](Self::heap) and
+    /// returns it, or `None` for an invalid image — which the decoder reports exactly as the C's
+    /// `ERTS_DDT_FAIL` ("Invalid data"), never as a wrong term.
+    ///
+    /// The default returns `None`: `beam_abi` has **no** ETF decoder (the codec is
+    /// `beam_codec`'s, a crate this one must not depend on — see the crate `CONTEXT.md`), so the
+    /// runtime that owns this host (`beam_rt`/`beam_io`) implements the hook over
+    /// `beam_codec`'s decoder. Until then `ERL_DRV_EXT2TERM` answers `None`, exactly as the C does
+    /// for an undecodable image.
+    fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
+        let _ = bytes;
+        None
+    }
     /// Register/cancel interest in `event` (`driver_select`). `mode` is `ERL_DRV_READ`/
     /// `ERL_DRV_WRITE`/`ERL_DRV_USE`; `on` non-zero selects, zero deselects. `0` = ok, `-1` = fail
     /// (default: unsupported).
@@ -503,9 +519,11 @@ impl DriverEnv {
 /// fully consumed, as the C requires (`io.c`: `if (depth != 1 || ptr != ptr_end) fail`). Returns
 /// `None` for any malformed spec — never a wrong term.
 ///
-/// Handled tags: `ERL_DRV_NIL`, `ERL_DRV_ATOM`, `ERL_DRV_INT`, `ERL_DRV_UINT`, `ERL_DRV_INT64`,
-/// `ERL_DRV_UINT64`, `ERL_DRV_STRING`, `ERL_DRV_STRING_CONS`, `ERL_DRV_BUF2BINARY`,
-/// `ERL_DRV_BINARY`, `ERL_DRV_TUPLE`, `ERL_DRV_LIST`, `ERL_DRV_PORT`, `ERL_DRV_FLOAT`.
+/// Handled tags: **every one of the 17** `ERL_DRV_*` tags — `ERL_DRV_NIL`, `ERL_DRV_ATOM`,
+/// `ERL_DRV_INT`, `ERL_DRV_UINT`, `ERL_DRV_INT64`, `ERL_DRV_UINT64`, `ERL_DRV_STRING`,
+/// `ERL_DRV_STRING_CONS`, `ERL_DRV_BUF2BINARY`, `ERL_DRV_BINARY`, `ERL_DRV_TUPLE`, `ERL_DRV_LIST`,
+/// `ERL_DRV_PORT`, `ERL_DRV_PID`, `ERL_DRV_FLOAT`, `ERL_DRV_EXT2TERM`, `ERL_DRV_MAP`. Any other tag
+/// is malformed and yields `None`.
 ///
 /// # Documented deviations from the C (never a wrong term)
 ///
@@ -513,12 +531,24 @@ impl DriverEnv {
 ///   [`DriverHost::intern_atom`]. In the C the operand is already an atom term from
 ///   `driver_mk_atom`; this seam has no `driver_mk_atom`, so the spec carries the *name* and the
 ///   host interns it — the same atom either way.
-/// * `ERL_DRV_PID`, `ERL_DRV_EXT2TERM` and `ERL_DRV_MAP` are **unsupported** (`None`): they need a
-///   pid term, an ETF decoder and a map builder outside this seam.
-/// * Counts (`LIST`/`TUPLE` arity, `STRING`/`BUF2BINARY` length) are read as non-negative 32-bit
-///   values, mirroring the C's `(int)` casts, so a malformed spec cannot request an astronomically
-///   large copy. `ERL_DRV_BINARY`'s `size`/`offset` are read as full words and bounds-checked
-///   against the binary's `orig_size`, exactly as the C does.
+/// * `ERL_DRV_PID`'s (and `ERL_DRV_PORT`'s) operand is the **pid/port term itself**, exactly as in
+///   the C (`mess = ptr[0]`, `io.c:6089`); the C's `driver_connected`-derived term data fits the
+///   same slot, so this is a note rather than a difference.
+/// * `ERL_DRV_EXT2TERM`'s bytes are handed to the **additive, defaulted** [`DriverHost::binary_to_term`]
+///   hook, because the ETF decoder lives outside this crate (see that hook's docs). With the hook
+///   left at its default the tag answers `None` — the C's "invalid data" outcome (`ERTS_DDT_FAIL`),
+///   never a wrong term. A host that installs the hook gets the C's behaviour.
+/// * `ERL_DRV_MAP` builds its map with [`beam_term::map::write_map`], which reproduces the C's
+///   flatmap-vs-hashmap choice (the `MAP_SMALL_MAP_LIMIT` = 32 threshold) and **rejects duplicate
+///   keys** (`io.c:6151`'s `erts_validate_and_sort_flatmap` / `hashmap_from_unsorted_array`'s
+///   `reject_dupkeys`) — a duplicate-keyed spec is `None`, as the C's `ERTS_DDT_FAIL`. The
+///   comparison/ordering the builder needs comes from the terms themselves (atoms carry their
+///   runtime index), so a local empty [`AtomTable`](beam_term::atom::AtomTable) is sufficient.
+/// * Counts (`LIST`/`TUPLE`/`MAP` arity, `STRING`/`BUF2BINARY` length) are read as non-negative
+///   32-bit values, mirroring the C's `(int)` casts, so a malformed spec cannot request an
+///   astronomically large copy. `ERL_DRV_BINARY`'s `size`/`offset` are read as full words and
+///   bounds-checked against the binary's `orig_size`, and `ERL_DRV_EXT2TERM`'s `size` as a full-word
+///   `Sint` rejected when `<= 0` — exactly as the C does (`io.c:5758`, `io.c:5834`).
 pub fn decode_term_spec(env: &mut DriverEnv, spec: &[ErlDrvTermData]) -> Option<Eterm> {
     // The intermediate value stack (the C's `ESTACK_PUSH`/`ESTACK_POP`).
     let mut stack: Vec<Eterm> = Vec::new();
@@ -643,6 +673,51 @@ pub fn decode_term_spec(env: &mut DriverEnv, spec: &[ErlDrvTermData]) -> Option<
                 stack.push(term);
             }
 
+            ERL_DRV_PID => {
+                // The operand is the pid term itself (`mess = ptr[0]`, `io.c:6089`); the C rejects
+                // anything that is not an internal pid (`io.c:5816`).
+                let term = Eterm::from_raw(*spec.get(ix)? as usize);
+                ix += 1;
+                if !prelude::is_internal_pid(term) {
+                    return None;
+                }
+                stack.push(term);
+            }
+
+            ERL_DRV_EXT2TERM => {
+                let ptr = *spec.get(ix)?;
+                let size = *spec.get(ix + 1)?;
+                ix += 2;
+                // The C reads the length as a full-word `Sint` and rejects `size <= 0` (`io.c:5834`).
+                let n = usize::try_from(size as i64).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                // SAFETY: `(char*, length)` declares `n` readable bytes at `ptr` (a null `ptr` is
+                // refused by `buf`).
+                let bytes = unsafe { buf(ptr as *const c_char, n) }?;
+                // The ETF decoder is outside this crate; a host without the hook answers `None`
+                // (the C's "invalid data" failure, `io.c:5842-5843`).
+                stack.push(env.host().binary_to_term(bytes)?);
+            }
+
+            ERL_DRV_MAP => {
+                let n = count_operand(*spec.get(ix)?)?;
+                ix += 1;
+                // The C pops `2*n` values (`depth -= 2*ptr[0]`, `io.c:5858`).
+                let Some(consumed) = n.checked_mul(2) else {
+                    return None;
+                };
+                if stack.len() < consumed {
+                    return None;
+                }
+                // Key/value pairs are pushed in spec order, so the first two of the consumed items
+                // are the first pair (the C pops the value first, then the key — `io.c:6147-6150`).
+                let items = stack.split_off(stack.len() - consumed);
+                let pairs: Vec<(Eterm, Eterm)> =
+                    items.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect();
+                stack.push(map_term(env, &pairs)?);
+            }
             ERL_DRV_FLOAT => {
                 // SAFETY: the `ERL_DRV_FLOAT` operand is a `double*`.
                 let value = unsafe { read_scalar(*spec.get(ix)? as *const f64) }?;
@@ -650,11 +725,10 @@ pub fn decode_term_spec(env: &mut DriverEnv, spec: &[ErlDrvTermData]) -> Option<
                 stack.push(float_term(env, value)?);
             }
 
-            // `ERL_DRV_PID` / `ERL_DRV_EXT2TERM` / `ERL_DRV_MAP` and any unknown tag.
+            // Any tag outside the 17 the header defines (`erl_driver.h:540-555`).
             _ => return None,
         }
     }
-
     // Exactly one value, array fully consumed (the C's final depth check).
     if stack.len() != 1 {
         return None;
@@ -777,6 +851,32 @@ fn float_term(env: &mut DriverEnv, value: f64) -> Option<Eterm> {
     Some(unsafe { prelude::write_float(hp, value) })
 }
 
+/// An `ERL_DRV_MAP` term from `pairs` — the C's `ERL_DRV_MAP` arm (`io.c:6116-6156`).
+///
+/// The C builds a flat map for at most `MAP_SMALL_MAP_LIMIT` (32) pairs and a hash map beyond that,
+/// and **rejects duplicate keys** in both cases (`erts_validate_and_sort_flatmap`, `io.c:6151`;
+/// `hashmap_from_unsorted_array`'s `reject_dupkeys`, `io.c:6126`). `None` mirrors that failure.
+///
+/// Ordering/hashing come from the terms themselves — atoms carry their runtime index — so the
+/// builder only needs a table to name atoms, and a fresh empty one is enough here (see the
+/// [`decode_term_spec`] deviations).
+fn map_term(env: &mut DriverEnv, pairs: &[(Eterm, Eterm)]) -> Option<Eterm> {
+    let atoms = prelude::AtomTable::new();
+    let mut keys: Vec<Eterm> = pairs.iter().map(|(key, _)| *key).collect();
+    keys.sort_by(|a, b| prelude::cmp_flatmap_keys(*a, *b, &atoms));
+    if keys
+        .windows(2)
+        .any(|pair| prelude::cmp_flatmap_keys(pair[0], pair[1], &atoms).is_eq())
+    {
+        return None; // Duplicate keys: the C's `ERTS_DDT_FAIL`.
+    }
+    // SAFETY: `map_words_capacity(n)` is the builder's documented reservation for `n` pairs.
+    let hp = unsafe { env.heap().alloc_words(prelude::map_words_capacity(pairs.len())) }.ok()?;
+    // SAFETY: `hp` heads the reserved block; `write_map` writes every word of the map it produces
+    // (the reservation is an upper bound, so trailing words may stay unwritten — `beam_term`'s
+    // contract, exactly as `nif::enif::map` uses it).
+    unsafe { prelude::write_map(hp, pairs, &atoms) }.ok()
+}
 /// `make_small` when the value fits, else a one-limb bignum of the right sign.
 ///
 /// Equivalent to `nif/enif.rs`'s `small_or_big`, which cannot be shared without touching that
@@ -826,7 +926,12 @@ mod tests {
     };
     use std::ffi::CString;
 
-    use crate::driver::types::{term_data, ERL_DRV_PID};
+    use crate::driver::types::{
+        term_data, ERL_DRV_ATOM, ERL_DRV_BINARY, ERL_DRV_BUF2BINARY, ERL_DRV_EXT2TERM,
+        ERL_DRV_FLOAT, ERL_DRV_INT, ERL_DRV_INT64, ERL_DRV_LIST, ERL_DRV_MAP, ERL_DRV_NIL,
+        ERL_DRV_PID, ERL_DRV_PORT, ERL_DRV_STRING, ERL_DRV_STRING_CONS, ERL_DRV_TUPLE,
+        ERL_DRV_UINT, ERL_DRV_UINT64,
+    };
 
     /// A minimal [`DriverHost`]: a bump heap, an atom table, and recording output/term buffers.
     struct TestDriverHost {
@@ -871,6 +976,65 @@ mod tests {
         }
     }
 
+    /// A host whose `binary_to_term` hook is a **stub ETF decoder**: the single byte `42` decodes to
+    /// the small int 42, anything else is "invalid data". It records every window it is handed, so a
+    /// test can pin *which* bytes `ERL_DRV_EXT2TERM` forwarded.
+    struct EtfHost {
+        heap: Heap,
+        atoms: AtomTable,
+        seen: Vec<Vec<u8>>,
+    }
+
+    impl EtfHost {
+        fn new() -> EtfHost {
+            EtfHost {
+                heap: Heap::new(1024).expect("a small test heap is allocatable"),
+                atoms: AtomTable::new(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl DriverHost for EtfHost {
+        fn heap(&mut self) -> &mut Heap {
+            &mut self.heap
+        }
+
+        fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+            Some(make_atom(self.atoms.intern(name)))
+        }
+
+        fn output(&mut self, _port: ErlDrvPort, _data: &[u8]) -> c_int {
+            -1
+        }
+
+        fn send_term(&mut self, _port: ErlDrvPort, _to: Option<Eterm>, _term: Eterm) -> c_int {
+            -1
+        }
+
+        fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
+            self.seen.push(bytes.to_vec());
+            match bytes {
+                [42] => Some(make_small(42)),
+                _ => None,
+            }
+        }
+    }
+
+    /// The payload bytes of a byte-aligned binary [`Eterm`] (a test-only reader).
+    ///
+    /// # Safety
+    ///
+    /// `term` must be a live, byte-aligned binary term.
+    unsafe fn binary_bytes_of(term: Eterm) -> Vec<u8> {
+        // SAFETY: `term` is a live binary (the caller's contract).
+        assert!(unsafe { prelude::is_binary(term) }, "{term:?} is not a binary");        // SAFETY: `term` is a live binary (asserted above).
+        let (ptr, bit_offset, bit_len) = unsafe { prelude::bitstring_parts(term) };
+        assert_eq!(bit_offset % 8, 0, "the test reader only handles byte-aligned binaries");
+        // SAFETY: `ptr` heads `bit_len` readable bits starting at `bit_offset`, and the block is a
+        // whole number of bytes (the `is_binary` invariant).
+        unsafe { core::slice::from_raw_parts(ptr.add(bit_offset / 8), bit_len / 8) }.to_vec()
+    }
     #[test]
     fn as_port_round_trips_through_from_port() {
         let mut host = TestDriverHost::new();
@@ -988,29 +1152,457 @@ mod tests {
     }
 
     #[test]
-    fn decode_term_spec_rejects_malformed_and_unsupported_specs() {
+    fn decode_term_spec_rejects_malformed_specs() {
         let mut host = TestDriverHost::new();
         let mut env = DriverEnv::new(&mut host);
+        let digits = CString::new("digits").expect("no interior NUL");
 
-        // An empty spec leaves no value; a tag whose operands are missing; two values left on the
-        // stack; a tuple arity larger than the stack; `ERL_DRV_LIST 0` (which the C rejects);
-        // `ERL_DRV_PID` (like `EXT2TERM`/`MAP`, unsupported); a NULL string buffer; a null float
-        // pointer.
+        // Every entry below is a spec the C's two-pass decoder fails (`ERTS_DDT_FAIL`): an empty
+        // spec leaves no value; a tag whose operands are missing; two values left on the stack
+        // (final depth != 1); a tuple arity larger than the stack; `ERL_DRV_LIST 0` (the C rejects
+        // `ptr[0] <= 0`); a port/pid operand that is not an internal port/pid (`NIL`, a small int);
+        // a NULL string buffer; a null float pointer; a negative count; an unknown tag; a `MAP` with
+        // fewer than `2n` values or a negative arity; an `EXT2TERM` with a zero/NULL/negative size;
+        // and an `EXT2TERM` whose bytes the (default) host hook cannot decode.
         for spec in [
             &[] as &[ErlDrvTermData],
             &[ERL_DRV_INT],
             &[ERL_DRV_INT, 1, ERL_DRV_INT, 2],
             &[ERL_DRV_TUPLE, 1],
+            &[ERL_DRV_TUPLE, -1i64 as ErlDrvTermData],
             &[ERL_DRV_LIST, 0],
+            &[ERL_DRV_LIST, -1i64 as ErlDrvTermData],
+            &[ERL_DRV_PORT, 0],
+            &[ERL_DRV_PORT, 1], // low nibble 1 != the port tag 7, so not an internal port
             &[ERL_DRV_PID, 0],
+            &[ERL_DRV_PID, 7],
             &[ERL_DRV_STRING, 0, 0],
+            &[ERL_DRV_STRING, term_data(digits.as_ptr() as usize), 6, ERL_DRV_INT, 1],
+            &[ERL_DRV_STRING_CONS, term_data(digits.as_ptr() as usize), 0],
             &[ERL_DRV_FLOAT, 0],
+            &[ERL_DRV_MAP, -1i64 as ErlDrvTermData],
+            &[ERL_DRV_MAP, 1],
+            &[ERL_DRV_INT, 1, ERL_DRV_MAP, 1],
+            &[ERL_DRV_MAP, 2, ERL_DRV_INT, 1, ERL_DRV_INT, 2],
+            &[ERL_DRV_EXT2TERM, 0, 0],
+            &[ERL_DRV_EXT2TERM, 0, 1],
+            &[ERL_DRV_EXT2TERM, term_data(digits.as_ptr() as usize), 0],
+            &[ERL_DRV_EXT2TERM, term_data(digits.as_ptr() as usize), 6],
+            &[99, 0], // An unknown tag (`erl_driver.h` stops at 17).
         ] {
             assert_eq!(decode_term_spec(&mut env, spec), None, "spec {spec:?}");
         }
     }
+    #[test]
+    fn decode_term_spec_handles_a_pid_and_a_port_operand() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+
+        // The operand is the term itself, exactly as in the C (`mess = ptr[0]`, `io.c:6089`).
+        let pid = prelude::make_internal_pid(prelude::make_pid_data(3, 42));
+        let term = decode_term_spec(&mut env, &[ERL_DRV_PID, term_data(pid.raw())])
+            .expect("an internal pid is a valid operand");
+        assert_eq!(term, pid);
+
+        let port = prelude::make_internal_port(prelude::make_port_data(9));
+        let term = decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(port.raw())])
+            .expect("an internal port is a valid operand");
+        assert_eq!(term, port);
+
+        // `NIL` is the operand both `driver_term_nil` and `driver_connected` produce when there is
+        // no port/pid; the C refuses it (`is_not_internal_pid`, `io.c:5816`), and so does this.
+        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PID, term_data(NIL.raw())]), None);
+        assert_eq!(decode_term_spec(&mut env, &[ERL_DRV_PORT, term_data(NIL.raw())]), None);
+
+        // The C's `is_internal_port` is only `x & 0xF == 0x7` (`erl_term.h`), so the raw word `7`
+        // *passes* it and the spec is accepted verbatim — the same tag-overlap quirk the C has.
+        // (`is_internal_pid`'s tag is `0x3`, which `7 & 0xF` does not match, so `ERL_DRV_PID` is
+        // unaffected.) Reproduced exactly rather than "fixed", since the C is the contract.
+        assert_eq!(
+            decode_term_spec(&mut env, &[ERL_DRV_PORT, 7]).map(Eterm::raw),
+            Some(7)
+        );
+    }
 
     #[test]
+    fn decode_term_spec_handles_a_zero_length_and_a_full_binary() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+
+        // `ERL_DRV_BUF2BINARY` with a NULL buffer and a zero length is the C's allowed empty binary
+        // (`if (!bufp && size > 0) ERTS_DDT_FAIL`, `io.c:5773`).
+        let term = decode_term_spec(&mut env, &[ERL_DRV_BUF2BINARY, 0, 0])
+            .expect("a zero-length buffer builds an empty binary");
+        // SAFETY: `term` is a live binary.
+        assert!(unsafe { binary_bytes_of(term) }.is_empty());
+
+        // A zero-length *string* over a valid (non-NULL) buffer is the empty list
+        // (`buf_to_intlist(&factory.hp, (char*)ptr[0], 0, NIL)`, `io.c:6037`). A NULL buffer is
+        // refused by the decoder *even for length 0* (`(char*)ptr[0] == NULL`, `io.c:5778`), which
+        // the malformed-spec test pins.
+        let empty = b"";
+        let term = decode_term_spec(
+            &mut env,
+            &[ERL_DRV_STRING, term_data(empty.as_ptr() as usize), 0],
+        )
+        .expect("a zero-length string over a non-NULL buffer is valid");
+        assert_eq!(term, NIL, "a zero-length string is []");
+
+        // A full `ERL_DRV_BINARY`: `{ptr, size, offset}` windows the payload of an `ErlDrvBinary`.
+        // SAFETY: the contract of `driver_alloc_binary` (a live driver binary with `orig_size == 5`).
+        let bin = unsafe { crate::driver::drv::driver_alloc_binary(5) };
+        assert!(!bin.is_null(), "the driver-binary allocator must succeed");
+        // SAFETY: `orig_bytes` (offset 8, pinned in `crate::driver::types`) heads the 5-byte payload.
+        let payload = unsafe { core::ptr::addr_of_mut!((*bin).orig_bytes) } as *mut u8;
+        // SAFETY: the payload is 5 writable bytes, as requested above.
+        unsafe { core::ptr::copy_nonoverlapping(b"hello".as_ptr(), payload, 5) };
+
+        let term = decode_term_spec(&mut env, &[ERL_DRV_BINARY, term_data(bin as usize), 5, 0])
+            .expect("an in-bounds window is valid");
+        // SAFETY: `term` is a live binary built from the 5 payload bytes.
+        assert_eq!(unsafe { binary_bytes_of(term) }, b"hello");
+        // A sub-window (`size` + `offset` still inside `orig_size`) is legal.
+        let term = decode_term_spec(&mut env, &[ERL_DRV_BINARY, term_data(bin as usize), 3, 2])
+            .expect("an in-bounds sub-window is valid");
+        // SAFETY: as above.
+        assert_eq!(unsafe { binary_bytes_of(term) }, b"llo");
+        // `size + offset > orig_size` is refused (the C's "outside the binary", `io.c:5758`).
+        assert_eq!(
+            decode_term_spec(&mut env, &[ERL_DRV_BINARY, term_data(bin as usize), 4, 2]),
+            None
+        );
+        // SAFETY: `bin` came from `driver_alloc_binary` and is freed exactly once.
+        unsafe { crate::driver::drv::driver_free_binary(bin) };
+    }
+    #[test]
+    fn decode_term_spec_handles_int64_and_uint64_operands() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+
+        // `ERL_DRV_INT64`/`ERL_DRV_UINT64` carry a *pointer* to the value (`Sint64*`/`Uint64*`).
+        let signed: i64 = -5;
+        let term = decode_term_spec(&mut env, &[ERL_DRV_INT64, term_data(&signed as *const i64 as usize)])
+            .expect("a valid INT64 spec");
+        assert_eq!(signed_value(term), -5);
+
+        let unsigned: u64 = u64::MAX;
+        let term = decode_term_spec(
+            &mut env,
+            &[ERL_DRV_UINT64, term_data(&unsigned as *const u64 as usize)],
+        )
+        .expect("a valid UINT64 spec");
+        // SAFETY: `u64::MAX` does not fit a 60-bit small int, so the builder produced a bignum.
+        assert!(unsafe { is_big(term) });
+    }
+
+    #[test]
+    fn decode_term_spec_handles_an_empty_tuple() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+
+        // The C accepts `ERL_DRV_TUPLE 0` (it yields the global empty-tuple literal, `io.c:6068`) —
+        // unlike `ERL_DRV_LIST 0`, which it rejects.
+        let term = decode_term_spec(&mut env, &[ERL_DRV_TUPLE, 0]).expect("an empty tuple is valid");
+        // SAFETY: `term` is the live empty tuple.
+        assert!(unsafe { is_tuple(term) });
+        // SAFETY: as above.
+        assert_eq!(unsafe { tuple_size(term) }, 0);
+    }
+
+    #[test]
+    fn decode_term_spec_cons_a_string_onto_a_stack_value() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+        let text = b"ab";
+
+        // `ERL_DRV_STRING_CONS` builds the character list and uses the popped stack value as its
+        // *tail* (`buf_to_intlist(&factory.hp, (char*)ptr[0], ptr[1], ESTACK_POP(stack))`,
+        // `io.c:6043-6045`), so it **prepends**: the characters come first and the popped value ends
+        // the list — `"ab" ++ [1]` = `[97, 98 | 1]`, an improper list, exactly as the C builds it.
+        let term = decode_term_spec(
+            &mut env,
+            &[
+                ERL_DRV_INT,
+                1,
+                ERL_DRV_STRING_CONS,
+                term_data(text.as_ptr() as usize),
+                2,
+            ],
+        )
+        .expect("a valid STRING_CONS spec");
+        assert!(is_list(term));
+        // SAFETY: `term` is the live cons cell built above.
+        let (first, rest) = unsafe { (car(term), cdr(term)) };
+        assert_eq!(signed_value(first), 97);
+        // SAFETY: `rest` is a live cons cell.
+        let (second, tail) = unsafe { (car(rest), cdr(rest)) };
+        assert_eq!(signed_value(second), 98);
+        assert_eq!(signed_value(tail), 1, "the popped value becomes the list tail");
+
+        // Consing onto `[]` is the plain character list, `[97, 98]`.
+        let term = decode_term_spec(
+            &mut env,
+            &[
+                ERL_DRV_NIL,
+                ERL_DRV_STRING_CONS,
+                term_data(text.as_ptr() as usize),
+                2,
+            ],
+        )
+        .expect("consing onto [] is a proper list");
+        // SAFETY: `term` is a live cons cell.
+        let (first, rest) = unsafe { (car(term), cdr(term)) };
+        // SAFETY: `rest` is a live cons cell.
+        let (second, tail) = unsafe { (car(rest), cdr(rest)) };
+        assert_eq!([signed_value(first), signed_value(second)], [97, 98]);
+        assert_eq!(tail, NIL);
+    }
+
+    #[test]
+    fn decode_term_spec_nests_a_list_inside_a_tuple() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+
+        // `{[1,2], 3}` — the list is built first (`ERL_DRV_LIST`) and the tuple pops it together
+        // with the trailing int, exactly the reverse-Polish nesting the C specifies.
+        let term = decode_term_spec(
+            &mut env,
+            &[
+                ERL_DRV_INT,
+                1,
+                ERL_DRV_INT,
+                2,
+                ERL_DRV_LIST,
+                2,
+                ERL_DRV_INT,
+                3,
+                ERL_DRV_TUPLE,
+                2,
+            ],
+        )
+        .expect("a valid nested spec");
+        // SAFETY: `term` is the live 2-tuple built above.
+        assert!(unsafe { is_tuple(term) });
+        // SAFETY: as above.
+        assert_eq!(unsafe { tuple_size(term) }, 2);
+        // SAFETY: element 0 of the live 2-tuple is the list.
+        let list = unsafe { tuple_element(term, 0) };
+        // SAFETY: `list` is a live two-element list.
+        let (first, rest) = unsafe { (car(list), cdr(list)) };
+        // SAFETY: `rest` is a live one-element list.
+        let (second, tail) = unsafe { (car(rest), cdr(rest)) };
+        assert_eq!([signed_value(first), signed_value(second)], [1, 2]);
+        assert_eq!(tail, NIL);
+        // SAFETY: element 1 of the live 2-tuple.
+        assert_eq!(signed_value(unsafe { tuple_element(term, 1) }), 3);
+    }
+
+    #[test]
+    fn decode_term_spec_builds_a_small_map() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+        let atoms = AtomTable::new();
+        let b = CString::new("b").expect("no interior NUL");
+        let a = CString::new("a").expect("no interior NUL");
+
+        // `#{b => 2, a => 1}` — pairs in spec order `(b,2), (a,1)`.
+        let spec = [
+            ERL_DRV_ATOM,
+            term_data(b.as_ptr() as usize),
+            ERL_DRV_INT,
+            2,
+            ERL_DRV_ATOM,
+            term_data(a.as_ptr() as usize),
+            ERL_DRV_INT,
+            1,
+            ERL_DRV_MAP,
+            2,
+        ];
+        let term = decode_term_spec(&mut env, &spec).expect("a valid map spec");
+        // SAFETY: `term` is a live map written by `beam_term::map::write_map`.
+        assert!(unsafe { prelude::is_map(term) });
+        // SAFETY: as above — 2 <= MAP_SMALL_MAP_LIMIT, so the builder chose a flat map.
+        assert!(unsafe { prelude::is_flatmap(term) });
+        assert_eq!(prelude::map_size(term, &atoms).expect("a map"), 2);
+
+        // The keys carry the indices `TestDriverHost` interned them at, so a lookup finds both.
+        let a = host.intern_atom("a").expect("the test table is unbounded");
+        let b = host.intern_atom("b").expect("the test table is unbounded");
+        assert_eq!(prelude::map_get(term, a, &atoms).expect("a map"), Some(make_small(1)));
+        assert_eq!(prelude::map_get(term, b, &atoms).expect("a map"), Some(make_small(2)));
+    }
+    #[test]
+    fn decode_term_spec_builds_an_empty_map() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+        let atoms = AtomTable::new();
+
+        // The C allows `ERL_DRV_MAP 0` (`if ((int) ptr[0] < 0) ERTS_DDT_FAIL`, then a flat map with
+        // `size == 0` and the global empty-tuple keys, `io.c:6129-6142`).
+        let term = decode_term_spec(&mut env, &[ERL_DRV_MAP, 0]).expect("an empty map is valid");
+        // SAFETY: `term` is the live empty flat map.
+        assert!(unsafe { prelude::is_flatmap(term) });
+        assert_eq!(prelude::map_size(term, &atoms).expect("a map"), 0);
+    }
+
+    #[test]
+    fn decode_term_spec_switches_a_map_to_a_hash_map_past_the_flat_map_limit() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+        let atoms = AtomTable::new();
+
+        // `MAP_SMALL_MAP_LIMIT` + 1 pairs: the C takes the hash-map arm (`io.c:6118`), and
+        // `beam_term::map::write_map` switches at the same threshold.
+        let n = prelude::MAP_SMALL_MAP_LIMIT + 1;
+        let mut spec: Vec<ErlDrvTermData> = Vec::new();
+        for i in 0..n {
+            spec.push(ERL_DRV_UINT);
+            spec.push(i as ErlDrvTermData);
+            spec.push(ERL_DRV_INT);
+            spec.push((i * 2) as ErlDrvTermData);
+        }
+        spec.push(ERL_DRV_MAP);
+        spec.push(n as ErlDrvTermData);
+
+        let term = decode_term_spec(&mut env, &spec).expect("a valid large map spec");
+        // SAFETY: `term` is a live map.
+        assert!(unsafe { prelude::is_map(term) });
+        // SAFETY: as above — more than `MAP_SMALL_MAP_LIMIT` pairs, so it is a HAMT.
+        assert!(unsafe { prelude::is_hashmap(term) }, "{n} pairs must produce a hash map");
+        assert_eq!(prelude::map_size(term, &atoms).expect("a map"), n);
+        // Every key resolves to its value (the builder hashed each key exactly once).
+        for i in 0..n {
+            assert_eq!(
+                prelude::map_get(term, make_small(i as i64), &atoms).expect("a map"),
+                Some(make_small((i * 2) as i64)),
+                "key {i}"
+            );
+        }
+
+        // And the limit itself is still a flat map.
+        let mut spec: Vec<ErlDrvTermData> = Vec::new();
+        for i in 0..prelude::MAP_SMALL_MAP_LIMIT {
+            spec.push(ERL_DRV_UINT);
+            spec.push(i as ErlDrvTermData);
+            spec.push(ERL_DRV_INT);
+            spec.push(0);
+        }
+        spec.push(ERL_DRV_MAP);
+        spec.push(prelude::MAP_SMALL_MAP_LIMIT as ErlDrvTermData);
+        let term = decode_term_spec(&mut env, &spec).expect("a valid limit-sized map spec");
+        // SAFETY: `term` is a live flat map of exactly `MAP_SMALL_MAP_LIMIT` pairs.
+        assert!(unsafe { prelude::is_flatmap(term) });
+    }
+
+    #[test]
+    fn decode_term_spec_rejects_a_map_with_duplicate_keys() {
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+
+        // Identical keys: the C fails (`erts_validate_and_sort_flatmap` returns 0 on `c == 0`,
+        // `erl_map.c:3202`).
+        let dup = [
+            ERL_DRV_INT,
+            1,
+            ERL_DRV_INT,
+            10,
+            ERL_DRV_INT,
+            1,
+            ERL_DRV_INT,
+            20,
+            ERL_DRV_MAP,
+            2,
+        ];
+        assert_eq!(decode_term_spec(&mut env, &dup), None);
+
+        // `1` and `1.0` are *different* map keys (the C compares exact), so that spec is accepted
+        // with two entries.
+        let one: f64 = 1.0;
+        let mixed = [
+            ERL_DRV_INT,
+            1,
+            ERL_DRV_INT,
+            10,
+            ERL_DRV_FLOAT,
+            term_data(&one as *const f64 as usize),
+            ERL_DRV_INT,
+            20,
+            ERL_DRV_MAP,
+            2,
+        ];
+        let term = decode_term_spec(&mut env, &mixed).expect("1 and 1.0 are distinct keys");
+        assert_eq!(prelude::map_size(term, &AtomTable::new()).expect("a map"), 2);
+    }
+
+    #[test]
+    fn decode_term_spec_routes_ext2term_through_the_host_hook() {
+        let mut host = EtfHost::new();
+        let mut env = DriverEnv::new(&mut host);
+        let image = [42u8];
+
+        // The hook decodes `[42]` to the small int 42 and is handed exactly the declared bytes.
+        let term = decode_term_spec(
+            &mut env,
+            &[
+                ERL_DRV_EXT2TERM,
+                term_data(image.as_ptr() as usize),
+                image.len() as ErlDrvTermData,
+            ],
+        )
+        .expect("the stub hook decodes this image");
+        assert_eq!(signed_value(term), 42);
+        assert_eq!(host.seen, vec![image.to_vec()], "the hook receives the declared window");
+
+        // An un-decodable image is the C's `ERTS_DDT_FAIL` ("Invalid data"), never a wrong term.
+        let bad = [7u8, 7, 7];
+        assert_eq!(
+            decode_term_spec(
+                &mut env,
+                &[
+                    ERL_DRV_EXT2TERM,
+                    term_data(bad.as_ptr() as usize),
+                    bad.len() as ErlDrvTermData,
+                ],
+            ),
+            None
+        );
+        assert_eq!(host.seen.last().map(Vec::as_slice), Some(&bad[..]));
+
+        // The decoded value nests like any other term: `{42, 7}`.
+        let term = decode_term_spec(
+            &mut env,
+            &[
+                ERL_DRV_EXT2TERM,
+                term_data(image.as_ptr() as usize),
+                1,
+                ERL_DRV_INT,
+                7,
+                ERL_DRV_TUPLE,
+                2,
+            ],
+        )
+        .expect("a nested EXT2TERM term is valid");
+        // SAFETY: `term` is the live 2-tuple built above.
+        assert_eq!(unsafe { tuple_size(term) }, 2);
+        // SAFETY: element 0 of the live 2-tuple.
+        assert_eq!(signed_value(unsafe { tuple_element(term, 0) }), 42);
+    }
+
+    #[test]
+    fn decode_term_spec_rejects_ext2term_without_a_host_hook() {
+        // `TestDriverHost` leaves `binary_to_term` at its trait default (`None`), which is the
+        // `beam_rt`/`beam_io` situation until either installs the hook.
+        let mut host = TestDriverHost::new();
+        let mut env = DriverEnv::new(&mut host);
+        let image = [42u8];
+        assert_eq!(
+            decode_term_spec(
+                &mut env,
+                &[ERL_DRV_EXT2TERM, term_data(image.as_ptr() as usize), 1],
+            ),
+            None
+        );
+    }    #[test]
     fn the_new_family_hooks_default_to_unsupported() {
         let mut host = TestDriverHost::new();
 
