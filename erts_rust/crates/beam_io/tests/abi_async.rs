@@ -57,45 +57,7 @@
 
 mod cdriver;
 
-use std::time::{Duration, Instant};
-
-use beam_io::prelude::*;
-use beam_process::PortId;
-
 use cdriver::*;
-
-/// How long a test waits for a worker-thread log line or a completion to be drained.
-///
-/// Generous relative to the work (the slow job sleeps 500 ms): it only has to absorb a loaded test
-/// runner, so a real hang still fails rather than passing slowly.
-const ASYNC_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Drives the port's async completions until at least one job is processed, or `timeout` elapses
-/// (a panic — never a silent pass).
-///
-/// The drive point is [`PortRegistry::drive_async`], which `DriverPort` maps onto the C entry's
-/// `ready_async`/`async_free` (there is no `PortTaskKind::Async` in M1).
-fn drive_until_drained(
-    poller: &mut Poller,
-    registry: &mut PortRegistry,
-    id: PortId,
-    timeout: Duration,
-) -> usize {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let processed = registry
-            .drive_async(poller, id)
-            .expect("the async drive point runs");
-        if processed > 0 {
-            return processed;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the driver_async job's completion was never drained by the drive point within {timeout:?}"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
 
 /// The `handle=<%p>` lines of the fixture's callback log (the `hdl` token makes one per callback).
 fn handle_lines(lines: &[String]) -> Vec<String> {
@@ -105,14 +67,6 @@ fn handle_lines(lines: &[String]) -> Vec<String> {
         .cloned()
         .collect()
 }
-
-/// Waits a short, bounded time and re-reads the log, so a "runs exactly once" assertion cannot be
-/// fooled by a second release that lands a moment after the first.
-fn settle_log(path: &std::path::Path) -> Vec<String> {
-    std::thread::sleep(Duration::from_millis(150));
-    log_lines(path)
-}
-
 // ---------------------------------------------------------------------------------------------
 // The `ready_async` arm (the default fixture)
 // ---------------------------------------------------------------------------------------------
@@ -422,6 +376,73 @@ fn the_erl_drv_port_handle_a_driver_sees_is_the_same_pointer_through_the_ports_l
     assert!(
         handles.iter().all(|handle| *handle == handles[0]),
         "every logged handle carries the same pointer; log = {lines:?}"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exactly-once delivery of each completion
+// ---------------------------------------------------------------------------------------------
+
+/// `ready_async` runs **exactly once per `driver_async` job**, and a later drive point re-delivers
+/// nothing.
+///
+/// A completion is a single value the drive point hands to exactly one arm: two jobs therefore
+/// produce exactly two `ready_async` calls, and once they are drained the port reports no pending
+/// async work — so a second drive point cannot hand the same completion over again. The count of the
+/// fixture's `ready_async h=same` lines is the observable: a duplicate (or a missing) delivery moves
+/// it.
+#[test]
+fn each_job_reaches_ready_async_exactly_once_and_is_never_re_delivered() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let probe = logged_port_command("async-exactly-once");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
+
+    for _ in 0..2 {
+        registry
+            .port_control(&mut poller, id, "14", &[])
+            .expect("control verb 14 schedules a job");
+    }
+
+    let processed = drive_until(&mut poller, &mut registry, id, 2, ASYNC_TIMEOUT);
+    assert_eq!(processed, 2, "each of the two jobs reported its own completion");
+
+    let lines = settle_log(&probe.log);
+    assert_eq!(
+        count_line(&lines, "ready_async h=same"),
+        2,
+        "one ready_async call per job — no more, no fewer; log = {lines:?}"
+    );
+    assert_eq!(
+        count_line(&lines, "async_free"),
+        0,
+        "ready_async owned each job's async_data, so async_free never ran"
+    );
+    assert!(
+        !registry
+            .get(id)
+            .expect("a live port")
+            .has_pending_async(),
+        "both drained jobs leave nothing pending on the port"
+    );
+
+    // A further drive point has nothing left to deliver: draining is not re-delivery.
+    assert_eq!(
+        registry
+            .drive_async(&mut poller, id)
+            .expect("the async drive point runs"),
+        0,
+        "a drained port re-delivers nothing"
+    );
+    let lines = settle_log(&probe.log);
+    assert_eq!(
+        count_line(&lines, "ready_async h=same"),
+        2,
+        "the drained completion was never handed over a second time; log = {lines:?}"
     );
 
     registry.close(&mut poller, id).expect("the port closes");

@@ -18,19 +18,22 @@
 //
 // %CopyrightEnd%
 
-//! Builds the committed C driver fixture and proves it is a real, *loadable* driver shared object.
+//! Builds the committed C driver fixtures and proves they are real, *loadable* driver shared
+//! objects.
 //!
 //! `tests/fixtures/host_driver.c` is an ordinary driver: it `#include`s `erl_driver.h` and calls
 //! `driver_alloc`, `driver_output`, `driver_select`, `driver_set_timer`, `erl_drv_output_term`, …
 //! Its `driver_*` imports are left **undefined** by the linker, exactly like a real OTP driver, so
-//! they can only be resolved out of the *loading process*'s dynamic symbol table. This test does
-//! two things:
+//! they can only be resolved out of the *loading process*'s dynamic symbol table. The
+//! `ready_async`-less variant (`host_driver_no_ready_async.c`) and the `outputv`-only sibling
+//! (`vector_driver.c`) are the same kind of object with the opposite callback shape. This test does
+//! two things for each of them:
 //!
 //! 1. compiles the fixture with the system `cc` against the system `erl_driver.h` and asserts a
 //!    shared object was produced (the fixture must stay buildable — a broken fixture is a hard
 //!    failure, not a skip); and
 //! 2. loads it with the crate-level loader `beam_abi::driver::loader::load` and asserts the loaded
-//!    driver reports `"host_driver"`.
+//!    driver reports the name its `driver_init` entry carries.
 //!
 //! # Skip-vs-fail policy
 //!
@@ -60,6 +63,14 @@ fn variant_fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver_no_ready_async.c")
 }
 
+/// The committed `outputv`-only fixture (`vector_driver.c`): `.output = NULL`,
+/// `.outputv = vector_outputv`, `.ready_output = NULL` and `.ready_async = NULL`. It is the
+/// opposite shape of `host_driver.c`, and the only fixture that can exercise the host's preference
+/// for the vector port-command callback (`io.c:1782`).
+fn vector_fixture_source() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vector_driver.c")
+}
+
 /// Force the `#[no_mangle]` `driver_*` host symbols into this test binary's **dynamic** symbol
 /// table (see `tests/abi_driver.rs`, which carries the long explanation).
 ///
@@ -71,10 +82,10 @@ fn force_driver_symbols_link() {
 }
 
 /// Compile `src` (stem `stem`) into a scratch `.so` and load it with the crate-level loader: the
-/// produced object must be a real driver reporting the name `host_driver`. Skips **loudly** when no
-/// C compiler or OTP include directory is present; a build or load failure with the toolchain
-/// present is a hard failure (never a skip).
-fn build_and_load(src: PathBuf, stem: &str) {
+/// produced object must be a real driver reporting the name `name` (the entry's `driver_name`).
+/// Skips **loudly** when no C compiler or OTP include directory is present; a build or load failure
+/// with the toolchain present is a hard failure (never a skip).
+fn build_and_load(src: PathBuf, stem: &str, name: &str) {
     let Some(include) = erl_include_dir() else {
         skip("host_driver: no OTP include directory (erl_driver.h) found");
         return;
@@ -104,10 +115,10 @@ fn build_and_load(src: PathBuf, stem: &str) {
     // gap (the host symbols are not exported), never a fixture bug — and never something to skip.
     force_driver_symbols_link();
     let path = so.to_str().expect("the fixture path is valid UTF-8");
-    match beam_abi::driver::loader::load(path, "host_driver") {
+    match beam_abi::driver::loader::load(path, name) {
         Ok(library) => assert_eq!(
             library.name(),
-            "host_driver",
+            name,
             "a loaded driver must report the name its `driver_init` entry carries"
         ),
         Err(err) => panic!(
@@ -123,16 +134,28 @@ fn build_and_load(src: PathBuf, stem: &str) {
 /// `host_driver`.
 #[test]
 fn host_driver_fixture_builds_and_loads() {
-    build_and_load(fixture_source(), "host_driver");
+    build_and_load(fixture_source(), "host_driver", "host_driver");
 }
 
 /// The same for the variant fixture (`ready_async` forced to `NULL`): it must stay buildable and
-/// loadable too, so `tests/abi_async.rs`'s `async_free`-arm test can rely on it.
+/// loadable too, so `tests/abi_async.rs`'s `async_free`-arm test can rely on it. Its entry keeps
+/// the `driver_name` of the fixture it `#include`s, so it is loaded under `"host_driver"`.
 #[test]
 fn host_driver_no_ready_async_variant_builds_and_loads() {
-    build_and_load(variant_fixture_source(), "host_driver_no_ready_async");
+    build_and_load(
+        variant_fixture_source(),
+        "host_driver_no_ready_async",
+        "host_driver",
+    );
 }
-/// The include-directory helper must return a directory that really holds the driver header (the
+
+/// The same for the `outputv`-only fixture: it must stay buildable and loadable, so
+/// `tests/abi_vector.rs`'s vector-callback tests can rely on it. The load also validates the
+/// entry's `driver_name` (`vector_driver`), which is the name a port is opened under.
+#[test]
+fn vector_driver_fixture_builds_and_loads() {
+    build_and_load(vector_fixture_source(), "vector_driver", "vector_driver");
+}/// The include-directory helper must return a directory that really holds the driver header (the
 /// contract the fixture build relies on).
 #[test]
 fn the_driver_header_is_locatable() {

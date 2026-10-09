@@ -116,6 +116,12 @@ pub fn variant_fixture_source() -> PathBuf {
     fixture_dir().join("host_driver_no_ready_async.c")
 }
 
+/// The committed `outputv`-only fixture (`vector_driver.c`): `.output = NULL`,
+/// `.outputv = vector_outputv`, `.ready_output = NULL` and `.ready_async = NULL`.
+pub fn vector_fixture_source() -> PathBuf {
+    fixture_dir().join("vector_driver.c")
+}
+
 /// Compile the fixture into a loadable `.so`, or print a loud `SKIP:` and answer `None` when the
 /// toolchain is unavailable (never a silent pass, never a failure for a missing toolchain).
 pub fn fixture_so() -> Option<PathBuf> {
@@ -125,6 +131,11 @@ pub fn fixture_so() -> Option<PathBuf> {
 /// The same for the `ready_async`-less variant fixture.
 pub fn variant_fixture_so() -> Option<PathBuf> {
     compile_fixture(&variant_fixture_source(), "host_driver_no_ready_async")
+}
+
+/// The same for the `outputv`-only fixture.
+pub fn vector_fixture_so() -> Option<PathBuf> {
+    compile_fixture(&vector_fixture_source(), "vector_driver")
 }
 
 /// Compile `src` into `<scratch>/<stem>.so`, skipping loudly when `cc`/`erl_driver.h` are absent.
@@ -176,29 +187,49 @@ pub fn force_driver_symbols_link() {
 /// path), so the dynamic loader's own diagnostic (typically `undefined symbol: driver_mk_port`) is
 /// part of the panic message.
 pub fn load_driver(so: &Path, command: &str, host: Box<dyn PortHost>) -> DriverPort {
+    load_named_driver(so, "host_driver", command, host)
+}
+
+/// The same, for a driver whose `ErlDrvEntry.driver_name` is `name` (the loader validates it).
+pub fn load_named_driver(
+    so: &Path,
+    name: &str,
+    command: &str,
+    host: Box<dyn PortHost>,
+) -> DriverPort {
     force_driver_symbols_link();
     let path = so.to_str().expect("the fixture path is valid UTF-8");
-    match beam_abi::driver::loader::load(path, "host_driver") {
+    match beam_abi::driver::loader::load(path, name) {
         Ok(library) => assert_eq!(
             library.name(),
-            "host_driver",
+            name,
             "a loaded driver reports the name its driver_init entry carries"
         ),
         Err(err) => panic!(
-            "the host_driver fixture could not be opened with dlopen(RTLD_NOW): {err}\n\
+            "the {name} fixture could not be opened with dlopen(RTLD_NOW): {err}\n\
              an `undefined symbol: driver_*` here means the driver_* host symbols are not in this \
              test binary's dynamic symbol table — check build.rs's -Wl,--export-dynamic and the \
              driver_api_table() reference in force_driver_symbols_link()."
         ),
     }
-    DriverPort::load(path, "host_driver", command, host)
+    DriverPort::load(path, name, command, host)
         .unwrap_or_else(|err| panic!("the port could not be created from the loaded driver: {err:?}"))
 }
 
 /// Opens a port around the fixture loaded with `command`, returning the reactor, the registry and
 /// the port id.
 pub fn open_port(so: &Path, command: &str, host: TestPortHost) -> (Poller, PortRegistry, PortId) {
-    let driver = load_driver(so, command, Box::new(host));
+    open_named_port(so, "host_driver", command, host)
+}
+
+/// The same, for a driver whose entry `driver_name` is `name`.
+pub fn open_named_port(
+    so: &Path,
+    name: &str,
+    command: &str,
+    host: TestPortHost,
+) -> (Poller, PortRegistry, PortId) {
+    let driver = load_named_driver(so, name, command, Box::new(host));
     let mut poller = Poller::new().expect("a poll set");
     let mut registry = PortRegistry::new();
     let id = registry
@@ -372,4 +403,66 @@ pub fn logged_port_command(stem: &str) -> LoggedPort {
         _read_end: read_end,
         _write_end: write_end,
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Driving the async completion arms (shared by `tests/abi_async.rs` and `tests/abi_vector.rs`)
+// ---------------------------------------------------------------------------------------------
+
+/// How long a test waits for a worker-thread log line or a completion to be drained.
+///
+/// Generous relative to the work (the slow job sleeps ~500 ms): it only has to absorb a loaded test
+/// runner, so a real hang still fails rather than passing slowly.
+pub const ASYNC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Drives the port's async completions until at least one job is processed, or `timeout` elapses
+/// (a panic — never a silent pass).
+///
+/// The drive point is [`PortRegistry::drive_async`](beam_io::PortRegistry::drive_async), which
+/// `DriverPort` maps onto the C entry's `ready_async`/`async_free` (there is no `PortTaskKind::Async`
+/// in M1).
+pub fn drive_until_drained(
+    poller: &mut Poller,
+    registry: &mut PortRegistry,
+    id: PortId,
+    timeout: Duration,
+) -> usize {
+    drive_until(poller, registry, id, 1, timeout)
+}
+
+/// Drives the port's async completions until at least `wanted` jobs have been processed, or
+/// `timeout` elapses (a panic — never a silent pass).
+///
+/// A completion is a single value the drive point hands to exactly one arm, so the count it returns
+/// is a one-per-job count: waiting for `wanted` of them is how a test proves *each* scheduled job
+/// was delivered.
+pub fn drive_until(
+    poller: &mut Poller,
+    registry: &mut PortRegistry,
+    id: PortId,
+    wanted: usize,
+    timeout: Duration,
+) -> usize {
+    let deadline = Instant::now() + timeout;
+    let mut processed = 0usize;
+    loop {
+        processed += registry
+            .drive_async(poller, id)
+            .expect("the async drive point runs");
+        if processed >= wanted {
+            return processed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {processed} of {wanted} driver_async completions were drained within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Waits a short, bounded time and re-reads the log, so a "runs exactly once" assertion cannot be
+/// fooled by a second release that lands a moment after the first.
+pub fn settle_log(path: &Path) -> Vec<String> {
+    std::thread::sleep(Duration::from_millis(150));
+    log_lines(path)
 }
