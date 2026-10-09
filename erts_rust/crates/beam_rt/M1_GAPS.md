@@ -49,15 +49,21 @@ foreign/decoded reference or ETS id is `badarg` vs the oracle's `true`. `spawn_o
 `{scheduler, N}`/`{async_dist, B}` stay `unsupported`; every other option is applied for real.
 
 ## ETS ownership
-The runtime-global `beam_bifs::TableRegistry` ([`Runtime::tables`]) keys tables by handle only;
-`ets:new/2` never records an owner (`beam_ets::Table::owner` stays `None`), so `ets:info(T, owner)`
-always answers `undefined`, an installed heir renders as `undefined`, and `ets:give_away/3`/`ets:setopts/2`
-are unregistered (`{heir, …}` in `ets:new` is `badarg`). **No code deletes or transfers a table when its
-owner dies** (`beam_process`'s `ProcessTable::terminate_into` is the sole finalizer and calls no subsystem
-back), so the `{'ETS-TRANSFER', …}` message is never produced. A future owner-death sweep needs a
-`beam_process` exit-observer seam (mirroring `DistSignalRouter`, invoked from
-`../beam_process/src/ptab.rs:1061`) plus an owner index + batch `owner_died()` op on the registry, wired
-by this crate.
+`ets:new/2` records the calling process as the table owner (`beam_ets::Table::set_owner`) and the
+parsed `{heir, …}`; `ets:info(T, owner)`/`heir` render the recorded pids (`undefined` when unset),
+`ets:setopts/2`/`ets:give_away/3` are registered, and `private`/`protected` access is enforced per
+owner. A dead owner's table is reclaimed through the `beam_process` `ProcessExitObserver` seam: the
+observer records the dead pid and `Runtime::drain_ets_owner_exits` releases each indexed table —
+dropped, or handed to its heir with the oracle's `{'ETS-TRANSFER', Tid, FromPid, Data}` (silent for
+the `{heir, Pid}` 2-tuple form, which carries no data; an arity-3 `{heir, Pid, undefined}` *does*
+transfer `undefined`). `tests/ets_owner.rs` oracle-cross-checks the four flows.
+**The honest gap is an *unnamed* table.** `beam_bifs::TableRegistry` exposes no public owner→handle
+roster (`all_tids` is `pub(super)`) and no handle iterator, and an unnamed table's handle is only
+reachable from its on-heap ref thing through a crate-private decoder, so this runtime can index only
+a table whose handle it can *prove* at `ets:new/2` time — a **`named_table`**, via the public
+`TableRegistry::lookup_name`. A dead owner's unnamed table therefore leaks (it is not reclaimed
+here). A public roster — or a creation hook reporting "this call created handle `H` for owner `P`" —
+would close it.
 
 ## `process_info/1,2`
 The heap items read the target process's own policy (`Process::collector().policy()`), so a `spawn_opt`

@@ -96,10 +96,11 @@ impl RuntimeContext<'_> {
     /// oracle's does: the monitor is born down and the caller is sent the matching
     /// `{'DOWN', …}` with reason `noproc` (delivered by `beam_process`).
     ///
-    /// A `port` kind, a remote `{Name, Node}` target and any other kind are rejected: the
-    /// first two are Milestone-1 capability gaps (no port monitors, no distribution — the
-    /// oracle answers `badarg` and a reference respectively), the last is the oracle's
-    /// `badarg`.
+    /// A `port` kind is served (the monitor is recorded on the runtime's **port table**, the
+    /// one `open_port/2` allocates from — a non-port target is `badarg`, a registered *name*
+    /// the typed named-port-monitor gap). A remote `{Name, Node}` target and any other kind
+    /// are rejected: the former is the Milestone-1 distribution gap (the oracle answers a
+    /// reference), the latter the oracle's `badarg`.
     pub(in crate::native) fn monitor_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let kind = *args.first().ok_or(BeamError::BadArg)?;
         let target = *args.get(1).ok_or(BeamError::BadArg)?;

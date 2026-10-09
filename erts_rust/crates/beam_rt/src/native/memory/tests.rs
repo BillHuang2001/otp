@@ -308,10 +308,10 @@ fn the_reachable_items_have_their_oracle_shapes() {
 /// `monitors => [{port,#Port<0.3>},{process,<0.84.0>}]`).
 ///
 /// Process monitors live in `Process::monitors` and port monitors in
-/// `Process::port_monitors`, which only `ProcessTable::monitor_port` populates — and
-/// `beam_rt` holds no `beam_process::PortTable`, so `erlang:monitor(port, _)` is a typed
-/// capability gap and the port family is empty at runtime. The rendering is pinned here by
-/// populating both sets directly on a `Process` and inserting it into the runtime's table.
+/// `Process::port_monitors`, which `ProcessTable::monitor_port` populates — which is exactly
+/// what `erlang:monitor/2,3` on a port does, over the shared `beam_io` port table. The
+/// rendering is pinned here by populating both sets directly on a `Process` and inserting it
+/// into the runtime's table.
 #[test]
 fn monitors_carries_the_port_monitors_alongside_the_process_monitors() {
     use beam_process::{Monitor, MonitorKind, PortId, PortWatch, Process, RefAllocator};

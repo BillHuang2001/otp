@@ -36,7 +36,7 @@
 //!
 //! # The directives
 //!
-//! The real `start.boot` (OTP 29/erts-17.1, 22 instructions) uses exactly these eight
+//! The real `start.boot` (OTP 30/erts-17.1, 22 instructions) uses exactly these eight
 //! directives, all of which this module models:
 //!
 //! | Directive | Meaning |
