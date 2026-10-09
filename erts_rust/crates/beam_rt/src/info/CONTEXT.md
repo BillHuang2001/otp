@@ -134,6 +134,11 @@ stable. A test seeds exactly `INFO_ATOMS` and materializes every `SUPPORTED_KEYS
   value for the constants), plus `try_value(other_key) == None` and the unknown-key
   `badarg`. `info/limits.rs` additionally pins the whole `+Q`/`ERL_MAX_PORTS` sizing matrix
   (`1024→1024 … 134217727→134217727`, `legacy`/none→65536) and the default table.
+  `info/schedulers.rs` pins `thread_pool_size` against the `+A` flag (`+A 4`→4, absent→1,
+  `+A 0`→1, a malformed preserved flag→the default); `info/host.rs` pins the OS/triple
+  mapping (`os_type_for`/`architecture_for` incl. the macOS/BSD/Windows cases and the
+  fallback); `info/memory.rs` pins the `allocated_areas` derivations (the real items rise
+  with a loaded module; the counterpart-less items stay `0`).
 - `src/info.rs` tests: `SUPPORTED_KEYS.len() == 63`, `UNSUPPORTED_KEYS.len() == 19`, the
   two sets duplicate-free and disjoint, every supported key answers and **materializes**
   once `INFO_ATOMS` is seeded, every unsupported key classifies as `unsupported`, the
