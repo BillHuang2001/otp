@@ -604,12 +604,39 @@ impl ProcessTable {
 
     /// Links `a` and `b` (both directions).
     ///
+    /// Links are **set** semantics, not reference-counted: a re-link of an already-linked pair
+    /// changes nothing (see [`crate::link::Links`]).
+    ///
+    /// A **non-live `b`** (a dead pid, or one that never existed) is not an error and records no
+    /// link: the oracle answers `true` and signals a `noproc` exit **from that pid** at the
+    /// linking caller, so a **trapping** caller is handed `{'EXIT', b, noproc}` and a
+    /// non-trapping one is terminated with `noproc`. The signal goes through
+    /// [`ProcessTable::apply_exit_signal`] (no new mechanism), so it inherits that path's
+    /// eager-vs-deferred rule: a caller that is *not* currently executing sees the effect before
+    /// this returns, while a `Running` caller — the one inside `erlang:link/1` — has it queued
+    /// and applied at its next schedule-in, exactly as `erlang:exit(self(), Reason)` already is.
+    ///
+    /// Documented approximation: the oracle *raises* `error:noproc` in the non-trapping caller
+    /// (whose uncaught reason is `{noproc, Stacktrace}`), whereas this signals the exit reason as
+    /// the bare atom `noproc`. The trapping case matches the oracle exactly; the raise's
+    /// stacktrace shape belongs to `beam_rt`'s link floor.
+    ///
     /// # Errors
     ///
-    /// Returns `BeamError::TermNotFound` when either pid is unknown.
+    /// Returns `BeamError::TermNotFound` when the **caller** `a` is unknown; propagates the
+    /// signal path's allocation/termination errors for a non-live target.
     pub fn link(&mut self, a: ProcessId, b: ProcessId) -> Result<()> {
-        if !self.contains(a) || !self.contains(b) {
+        if !self.contains(a) {
             return Err(error::unknown_process());
+        }
+        if !self.contains(b) {
+            // Nothing to link to: the oracle signals `noproc` from the target at the caller (a
+            // pid the process table does not hold is exactly the "there is no such process" the
+            // signal reports). `b == a` cannot reach this branch — `a` is live here.
+            let reason = self.atoms.noproc_term();
+            return self
+                .apply_exit_signal(a, ExitSignal { from: b, reason })
+                .map(|_effect| ());
         }
         if a == b {
             // A self-link would only ever signal the process to itself on exit, which
@@ -1345,6 +1372,15 @@ impl ProcessTable {
         //    `erlang:monitor/3` user tag when it has one. The records hold no tag field, so it is
         //    read from the side table; the DOWN that consumes it is its last use, so the entry is
         //    dropped as soon as the signal is queued.
+        //
+        //    The watcher's **outgoing** record goes too: the oracle resolves both halves when the
+        //    target's death is signalled, so `erlang:process_info(W, monitors)` stops listing the
+        //    monitor and a later `demonitor(Ref)` reports that it is gone (only
+        //    `demonitor(Ref, [info])` distinguishes them — `demonitor/1` answers `true`
+        //    unconditionally). Leaving it behind would dangle forever. The `named_monitors`
+        //    `{Name, node}` descriptor is **not** dropped here: it is consumed by
+        //    `build_and_enqueue_down` when the (possibly deferred) DOWN is materialised, and the
+        //    DOWN must still carry the name.
         for watcher in watchers {
             if !self.contains(watcher.watcher) {
                 // The watcher died earlier in this same propagation.
@@ -1361,6 +1397,9 @@ impl ProcessTable {
                 Some(process.off_heap()),
             )?;
             forget_tag(&mut self.tags, watcher.reference);
+            if let Some(watcher_process) = self.get_mut(watcher.watcher) {
+                watcher_process.monitors_mut().remove(watcher.reference);
+            }
             receivers.push(watcher.watcher);
         }
 
@@ -1880,11 +1919,16 @@ impl ProcessTable {
     /// [`ProcessTable::link`], an external pid is recorded as a remote link and routed as a
     /// `DOP_LINK` control signal.
     ///
+    /// The local branch inherits both of [`ProcessTable::link`]'s properties for a **non-live**
+    /// local target: no error, and a `noproc` exit signal from that pid applied to `a` (deferred
+    /// when `a` is currently executing).
+    ///
     /// # Errors
     ///
     /// Returns [`beam_common::BeamError::BadArg`] when `b` is not a pid; for a local `b`,
-    /// propagates [`ProcessTable::link`]'s `BeamError::TermNotFound`; for a remote `b`,
-    /// `BeamError::TermNotFound` when `a` is unknown; and the router's transport errors.
+    /// propagates [`ProcessTable::link`]'s `BeamError::TermNotFound` when the **caller** `a` is
+    /// unknown; for a remote `b`, `BeamError::TermNotFound` when `a` is unknown; and the
+    /// router's transport errors.
     pub fn link_term(&mut self, a: ProcessId, b: Eterm) -> Result<()> {
         match PidTarget::from_eterm(b)? {
             PidTarget::Local(pid) => self.link(a, pid),
@@ -2692,14 +2736,99 @@ mod tests {
         assert!(!table.get(a).expect("a").links().contains(b));
         assert!(!table.get(b).expect("b").links().contains(a));
 
+        // An unknown **caller** is still `TermNotFound` (the dead-target case is a signal, not an
+        // error — see `link_to_a_non_live_target_signals_noproc_from_it`).
         assert!(matches!(
-            table.link(a, ProcessId::new(999, 0)),
+            table.link(ProcessId::new(999, 0), a),
+            Err(BeamError::TermNotFound)
+        ));
+        assert!(matches!(
+            table.link_term(ProcessId::new(999, 0), a.to_eterm()),
             Err(BeamError::TermNotFound)
         ));
         assert!(matches!(
             table.unlink(ProcessId::new(999, 0), a),
             Err(BeamError::TermNotFound)
         ));
+    }
+
+    #[test]
+    fn link_to_a_non_live_target_signals_noproc_from_it() {
+        // Oracle probe (OTP 29.1.1): a **trapping** caller's `link(DeadPid)` answers `true` and
+        // delivers `{'EXIT', DeadPid, noproc}`; a non-trapping caller dies with the `noproc` raise
+        // (whose uncaught reason is `{noproc, Stacktrace}`). Links are set semantics: nothing is
+        // recorded for a pid that is not there.
+        let (mut table, names) = table_and_names();
+        let noproc = named(&names, "noproc");
+        let dead = ProcessId::new(999, 0);
+
+        // The caller of `erlang:link/1` is the **currently executing** process, so its signal is
+        // queued (the `exit/2` model) rather than applied inline.
+        let trapper = table.spawn_default().expect("trapper");
+        table.get_mut(trapper).expect("trapper").set_trap_exit(true);
+        table
+            .get_mut(trapper)
+            .expect("trapper")
+            .set_state(ProcessState::Running);
+        table.link(trapper, dead).expect("a non-live target is not an error");
+        assert_eq!(
+            table.pending_signals(trapper).expect("trapper is live"),
+            1,
+            "one noproc signal is queued for the caller"
+        );
+        assert!(
+            table.get(trapper).expect("trapper").links().is_empty(),
+            "no link is recorded to a pid that is not there"
+        );
+        assert!(table.get(dead).is_none(), "the target stays non-live");
+
+        table.service_signals(trapper).expect("trapper is live");
+        assert!(table.contains(trapper), "the trapping caller survives");
+        let payload = table
+            .get(trapper)
+            .expect("trapper")
+            .mailbox()
+            .peek()
+            .expect("the trapped exit is queued")
+            .payload();
+        // SAFETY: the payload is the live 3-tuple the signal builder wrote on the trapper's heap.
+        unsafe {
+            assert_eq!(tuple_size(payload), 3);
+            assert_eq!(tuple_element(payload, 0), named(&names, "EXIT"));
+            assert_eq!(
+                tuple_element(payload, 1),
+                dead.to_eterm(),
+                "the signal came *from* the non-live target"
+            );
+            assert_eq!(tuple_element(payload, 2), noproc);
+        }
+
+        // A non-trapping caller is terminated with `noproc` once its signals are serviced.
+        let victim = table.spawn_default().expect("victim");
+        table
+            .get_mut(victim)
+            .expect("victim")
+            .set_state(ProcessState::Running);
+        table.link(victim, dead).expect("a non-live target is not an error");
+        assert!(table.contains(victim));
+        assert_eq!(table.pending_signals(victim).expect("victim"), 1);
+        table.service_signals(victim).expect("victim is live");
+        assert!(
+            !table.contains(victim),
+            "the non-trapping caller is terminated with noproc"
+        );
+
+        // `link_term`'s local branch routes through the same path.
+        let via_term = table.spawn_default().expect("via_term");
+        table.get_mut(via_term).expect("via_term").set_trap_exit(true);
+        table
+            .get_mut(via_term)
+            .expect("via_term")
+            .set_state(ProcessState::Running);
+        table
+            .link_term(via_term, dead.to_eterm())
+            .expect("a non-live local target is not an error");
+        assert_eq!(table.pending_signals(via_term).expect("via_term"), 1);
     }
 
     #[test]

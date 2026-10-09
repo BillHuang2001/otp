@@ -23,7 +23,8 @@ Read the crate `CONTEXT.md` first for the contracts this module obeys (error str
     `set_timers` (+ matching getters), `with_schedulers(n)`.
   - `SharedProcessTable { inner: Mutex<ProcessTable> }` — the whole table behind one
     `parking_lot::Mutex`; `new(ProcessTable) -> Arc<Self>`, `lock()`, `try_lock()`. Carries two
-    **documented `unsafe impl Send`/`unsafe impl Sync`** (a contained handoff — see Known Issues).
+    **documented `unsafe impl Send`/`unsafe impl Sync`** (a contained handoff — see the `Send`/`Sync`
+    invariant under *Locking discipline*).
 - `queues.rs` — `pub(crate) Queues`: a shared **injector** `Mutex<RunQueue>` + one `Mutex<RunQueue>`
   per scheduler index + the shared `InFlight` counter; `acquire(index)` tries own queue → injector →
   round-robin **steal of half** a peer's queue (`RunQueue::split_off_half`), returning
@@ -98,6 +99,41 @@ Three lock families: the **queue locks** (`Mutex<RunQueue>` inside `Queues`), th
 5. `worker.rs` flushes `buf` **before** `finish_slice` (which decrements in-flight), otherwise a
    yielded pid could be invisible to `is_idle()` for a moment.
 
+### The `Send`/`Sync` invariant (BINDING)
+`SharedProcessTable` carries two `unsafe impl Send`/`Sync`. They are **load-bearing**: `parking_lot::Mutex<T>`
+is `Send + Sync` only when `T: Send`, and the pool shares the table as `Arc<SharedProcessTable>`, so both
+bounds are required (removing them breaks compilation and the `shared_table_is_send_and_sync` unit test in
+`mod.rs`). They are asserted on the **wrapper only** — never on bare `ProcessTable`.
+
+`ProcessTable` is `!Send` for **five** reasons (each reproduced, with the soundness argument, in the
+`// SAFETY:` comments on the impls in `mod.rs`):
+1. `beam_alloc::Heap`'s `base: *mut Eterm` (`beam_alloc/src/heap.rs`), reached via `Process.collector →
+   beam_gc::Collector → HeapSpace → beam_alloc::Heap`.
+2. `beam_gc::MsoHandle`'s `ptr: NonNull<Mso>` (`beam_gc/src/mso.rs`), reached via
+   `beam_message::OffHeapTable`.
+3. `Dict.atoms: Rc<AtomTable>` (`dict.rs`) — `Rc`'s refcount is not atomic, so `Rc` is `!Send`.
+4. `ProcessTable.router: Option<Box<dyn DistSignalRouter>>` (`ptab.rs`) — the trait object has no `Send`
+   bound.
+5. `ProcessTable.exit_observer: Option<Box<dyn ProcessExitObserver>>` (`ptab.rs`) — likewise no `Send`
+   bound.
+
+Soundness rests on the **single-lock invariant**: `SharedProcessTable` exposes the table ONLY through
+`lock`/`try_lock`, which return a `MutexGuard` that is itself `!Send`, so at most one thread is ever inside
+the table and no `!Send` value (nor any `&mut ProcessTable`) can move off the locking thread. Under that
+lock the `beam_alloc::Heap` uniquely owns a `Send` carrier block whose address is stable across the move,
+the `MsoHandle` uniquely owns an immutable `Box<dyn Any + Send>` payload, and the two trait objects are
+invoked only while the lock is held and carry no thread-affine state. **The `Rc<AtomTable>` needs one
+explicit rule:** every process's `Rc<AtomTable>` must come from `Dict::new()` (production does —
+`process.rs`) and must **never** be cloned or shared outside the table — do NOT clone a dictionary's
+`Rc<AtomTable>` to another thread, and do NOT adopt `Dict::with_atoms` (test-only today) with an `Rc` the
+host also holds on another thread.
+
+Durable fix — a **documented handoff** to the upstream crates, do **not** make it here: `unsafe impl Send
+for beam_alloc::Heap` and for `beam_gc::MsoHandle`; `Dict.atoms: Rc<AtomTable>` → `Arc<AtomTable>`
+(`AtomTable` is already `Send + Sync`); `trait DistSignalRouter: Send` and `trait ProcessExitObserver:
+Send`. After those, the two impls (and this section) can be deleted. (`beam_alloc::RefcBinary` already
+carries `unsafe impl Send`, so it is **not** a blocker.)
+
 ## Design Decisions
 - **The SMP pool reuses the frozen slice.** Concurrency is added *around* the slice, never inside it:
   the worker calls the same `pub(crate)` helpers the single-threaded `Scheduler` uses, and the only
@@ -108,14 +144,10 @@ Three lock families: the **queue locks** (`Mutex<RunQueue>` inside `Queues`), th
   lock and a slice API that hands the runner its own process plus a *re-entrant* table handle — i.e.
   a `ProcessRunner::run(&mut self, pid, &mut SliceContext<'_>, budget)` seam change owned downstream
   (`beam_rt`) plus per-slot locking in `ptab.rs`. That is deliberately NOT done here.
-- **`SharedProcessTable`'s `unsafe impl Send/Sync` is a contained handoff.** `ProcessTable` is
-  `!Send`; the two impls assert that confining every access to the inner mutex makes moving/sharing
-  the wrapper sound. Measured causes (compile-verified at HEAD): `beam_alloc::Heap`'s `base: *mut
-  Eterm` (`beam_alloc/src/heap.rs`), `beam_gc::MsoHandle`'s `ptr: NonNull<Mso>`
-  (`beam_gc/src/mso.rs`, reaching `Process` through `MsoHandle → beam_gc::OffHeap →
-  beam_message::OffHeapTable`), and **this crate's own** `Option<Box<dyn DistSignalRouter>>`
-  (`ptab.rs` — the trait object has no `Send` bound). `beam_alloc::RefcBinary` already carries
-  `unsafe impl Send`. The durable fix belongs upstream; do not widen this `unsafe`.
+- **`SharedProcessTable`'s `unsafe impl Send/Sync` is a contained handoff.** The five `!Send` causes,
+  the single-lock soundness argument, the `Rc<AtomTable>` never-shared rule and the durable-fix handoff
+  live in the `Send`/`Sync` invariant under *Locking discipline* above (and in the `// SAFETY:` comments
+  in `mod.rs`). Do not widen this `unsafe`.
 - **Non-flaky `wait_idle` via an in-flight counter**, and **loss-free park/notify** (the predicate is
   re-checked under the signals mutex immediately before `Condvar::wait`; every notifier takes the
   same mutex before signalling).
@@ -125,9 +157,9 @@ Three lock families: the **queue locks** (`Mutex<RunQueue>` inside `Queues`), th
   all schedulers exactly one process executes at a time. Lock-free/threaded run queues, scheduler
   balancing and the `+S`/`+SDcpu`/`+SDio` flag parsing are not modelled. Port tasks are not
   load-balanced across schedulers.
-- **`unsafe impl Send/Sync for SharedProcessTable`** is still required (see above for the exact
-  blocker list). `ThreadProgress` implements the barrier but has **no** delayed-dealloc coupling
-  with `beam_alloc`.
+- **`unsafe impl Send/Sync for SharedProcessTable`** is still required (see the `Send`/`Sync` invariant
+  under *Locking discipline* for the exact five-cause list and the durable-fix handoff).
+  `ThreadProgress` implements the barrier but has **no** delayed-dealloc coupling with `beam_alloc`.
 - **Dirty-job term plumbing** is absent (a `DirtyJob` carries no live heap data) and a timer message
   must be **thread-valid** (an immediate or literal-area term — no heap-resident terms).
 - **A parked worker only re-checks its own queue and the injector** (`has_takeable_work` excludes

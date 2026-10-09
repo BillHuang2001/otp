@@ -18,8 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! The inlined instruction set: `move`, the small-int arithmetic fast path and
-//! the word-level `test` subset.
+//! The inlined instruction set: `move`, `swap`, the small-int arithmetic fast path
+//! and the word-level `test` subset.
 //!
 //! Everything here is a **shape** test (never a value test): a compile-time
 //! shape rejection deopts the whole instruction to the helper, and a run-time
@@ -103,6 +103,54 @@ pub(super) fn emit_inline_move(
         .ins()
         .store(MemFlags::trusted(), value, x_regs, x_offset(dst_x));
     report.touch(dst_x);
+}
+
+/// The `(a, b)` x-register pair of a `swap` the tier can inline, or `None` when the
+/// block must deopt to the helper.
+///
+/// Only two in-bound x-registers are inlinable; a `Y` (or other) operand, or an index
+/// past the engine's [`MAX_REGISTER`] bound, deopts so the interpreter's exact
+/// `bad_register` error surfaces. This is the **same** shape the baseline tier's
+/// `try_inline_swap` accepts, so the two native tiers inline the same swaps.
+pub(super) fn inline_swap(a: &Operand, b: &Operand) -> Option<(u32, u32)> {
+    let a_x = x_register(a)?;
+    let b_x = x_register(b)?;
+    if a_x >= MAX_REGISTER || b_x >= MAX_REGISTER {
+        return None;
+    }
+    Some((a_x, b_x))
+}
+
+/// Emit an inlined `swap A B`: read both x-register slots, then store them exchanged.
+///
+/// The exchange is the interpreter's exact `write(a, read(b)); write(b, read(a))`: both
+/// words are read **before** either is written, so an aliasing pair (`a == b`) is a
+/// no-op rather than a lost value. Both slots are addressed directly in `machine.x`, the
+/// tier's single x-register representation (see the parent module docs).
+pub(super) fn emit_inline_swap(
+    builder: &mut FunctionBuilder,
+    rt: Value,
+    a_x: u32,
+    b_x: u32,
+    report: &mut CodegenReport,
+) {
+    let x_regs = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), rt, XREGS_DISP);
+    let a = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), x_regs, x_offset(a_x));
+    let b = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), x_regs, x_offset(b_x));
+    builder
+        .ins()
+        .store(MemFlags::trusted(), b, x_regs, x_offset(a_x));
+    builder
+        .ins()
+        .store(MemFlags::trusted(), a, x_regs, x_offset(b_x));
+    report.touch(a_x);
+    report.touch(b_x);
 }
 
 // ---------------------------------------------------------------------------

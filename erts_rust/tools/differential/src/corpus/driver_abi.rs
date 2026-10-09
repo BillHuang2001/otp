@@ -35,7 +35,9 @@
 //! callback dispatches on that byte:
 //!
 //! * selectors `< 100` — the driver runs one ABI check and answers with a single status byte
-//!   (`'1'` pass, `'0'` fail);
+//!   (`'1'` pass, `'0'` fail); `30..38` are the `ErlDrvTerm` spec family
+//!   (`*_output_term`/`*_send_term`), `40..44` the `driver_set_timer` shapes and `60..65` the
+//!   phase-free `erl_drv_monotonic_time` properties;
 //! * `110..113` — the driver *delivers bytes* through `driver_output`/`driver_output2`/
 //!   `driver_output_binary`/`driver_outputv`;
 //! * `200..202` — the driver **arms** something (a descriptor via `driver_select`, a port
@@ -66,24 +68,33 @@
 //!
 //! # Known gaps (why the group is not larger)
 //!
-//! Five A.4 surfaces were driven here but **do not agree**, so they are handoffs to the runtime
-//! nodes rather than corpus cases (each is a plain, differing observable, never a capability gap
-//! — the Rust runtime answers a different *value*, it does not signal `unsupported`):
+//! The `ErlDrvTerm` spec family is pinned on its **accept/refuse split only**: both runtimes
+//! decode a well-formed spec and refuse a malformed one identically, but the *delivery* itself is a
+//! handoff — the C queues the decoded term to the destination process, while the Rust runtime
+//! captures it and never delivers it. So `erl_drv_output_term`/`*_send_term` byte-exact
+//! delivery, `driver_output_term`/`driver_send_term`'s *success code* (`1` in the C, `0` in this
+//! seam for a captured delivery) and `outputv`-only routing are **not** pinned (each is a plain,
+//! differing observable, never a capability gap — the Rust runtime answers a different *value*, it
+//! does not signal `unsupported`). Owner: `beam_rt` / `beam_io`.
 //!
-//! * `erl_drv_output_term` / `erl_drv_send_term` and their deprecated `driver_output_term` /
-//!   `driver_send_term` aliases — the oracle delivers the bare term (`[7,9]`) to the port owner;
-//!   the Rust runtime delivers nothing (`-1`). Owner: `beam_rt` / `beam_io`.
-//! * `outputv`-only routing — the oracle routes `port_command/2` through the entry's `outputv`;
-//!   the Rust runtime has no `outputv` path and delivers nothing (`-1`). Owner: `beam_rt` /
-//!   `beam_io`.
-//! * `driver_async/5` — the oracle schedules the job on the port's async pool; the Rust runtime
-//!   answers the C's own failure code (`-1`, so the fixture reports `'0'`). Owner: `beam_rt` /
-//!   `beam_io`.
-//! * `driver_set_timer/2` without a `timeout` callback — the oracle *accepts* it (`0`); the Rust
-//!   runtime answers the C's `-1`. Owner: `beam_rt` / `beam_io`.
-//! * `erl_drv_monotonic_time/1` — the oracle answers a non-positive value for this call site (so
-//!   the fixture's `> 0` check reports `'0'`); the Rust runtime answers a positive one (`'1'`).
-//!   Owner: `beam_rt` / `beam_abi`.
+//! * `erl_drv_output_term` / `erl_drv_send_term` / `driver_output_term` / `driver_send_term` do not
+//!   deliver their `ErlDrvTerm` spec to the receiving process (the C delivers it, the Rust runtime
+//!   captures it in `DriverPort::sent`); the four forms' success code therefore differs too (`1`
+//!   vs `0`), which is why the selectors only assert "not `-1`". Owner: `beam_rt` / `beam_io`.
+//! * An entry whose only port-command callback is `outputv` never receives `port_command/2`
+//!   (the C routes through the entry's `outputv`; the Rust runtime has no `outputv` path). Owner:
+//!   `beam_rt` / `beam_io`.
+//! * `driver_async/5` — the C schedules the job on the port's async pool and answers a positive
+//!   handle; the Rust runtime keeps the [`beam_abi::DriverHost`] default (`-1`). No live-port shape
+//!   can agree, so the scheduler family is unpinned. Owner: `beam_rt` / `beam_io`.
+//! * `driver_set_timer/2` **without** a `timeout` callback — the C *accepts* it (`0`) and this
+//!   seam answers `-1`; the group's one fixture declares a `timeout` callback (selectors `22`,
+//!   `202`, `40..44`), so the refusal half cannot be reached. Owner: `beam_rt` / `beam_io`.
+//! * `erl_drv_monotonic_time/1`'s **absolute phase** — the C answers *Erlang* monotonic time
+//!   (anchored to the time offset, so early values are non-positive), this seam answers the raw
+//!   system monotonic clock (always positive); only monotonicity and unit consistency are pinned
+//!   (`60..65`). `erl_drv_time_offset/1` likewise differs (the C's offset is non-zero, this seam's
+//!   is `0`). Owner: `beam_rt` / `beam_abi`.
 //!
 //! `driver_enq/3` + `driver_sizeq/1` (the port-queue family) **hangs the oracle** for a driver port
 //! under a single CLI process, so it is deliberately unpinned. Owner: `beam_rt` / `beam_io`.
@@ -109,16 +120,23 @@ const DRIVER_ABI_MODULE_SOURCE: &str = r#"-module(driver_abi).
 %% Send one selector byte to the C fixture and encode the answer it delivered as an integer.
 %%
 %% Nothing is compared here. A `driver_output*` byte delivery arrives as `{Port, {data, Bytes}}`
-%% and becomes the base-256 value of the bytes; any other first message, or none within the
-%% module's own 2 s bound, is the sentinel `-1`. The harness compares this integer against the
-%% oracle's, so a runtime that behaves differently is a visible divergence, never a hidden one.
+%% and becomes the base-256 value of the bytes; no such message within the module's own 2 s bound is
+%% the sentinel `-1`. The harness compares this integer against the oracle's, so a runtime that
+%% behaves differently is a visible divergence, never a hidden one.
 classify(N) ->
     Dir = filename:dirname(code:which(?MODULE)),
     P = open(Dir),
     true = erlang:port_command(P, <<N>>),
+    wait(P).
+
+%% Only the `driver_output*` byte channels carry the answer as `{Port, {data, Bytes}}`. The
+%% `*_output_term`/`*_send_term` forms also deliver a *term* the driver decoded (a `{Port, Term}`
+%% message), whose order relative to the byte channel is not pinned; every other message is
+%% therefore skipped rather than mistaken for the answer.
+wait(P) ->
     receive
         {P, {data, Data}} -> bytes_code(iolist_to_binary(Data));
-        _Other -> -1
+        _Other -> wait(P)
     after 2000 -> -1
     end.
 
@@ -445,6 +463,175 @@ static int chk_putenv(void) {
     return size == 2 && memcmp(value, "42", 2) == 0;
 }
 
+/* -- the ErlDrvTerm spec family (`*_output_term` / `*_send_term`) --------------------------- */
+
+/* The shared `{driver_abi_term, 7}` spec the four delivery forms hand the term-data decoder.
+ * `driver_mk_atom` is passed straight through as the `ERL_DRV_ATOM` operand, which is exactly what
+ * both runtimes' decoders expect (the C interns it into the atom term; this seam keeps it as the
+ * NUL-terminated name the decoder interns). */
+static void abi_term_spec(ErlDrvTermData *spec) {
+    spec[0] = ERL_DRV_ATOM;
+    spec[1] = driver_mk_atom("driver_abi_term");
+    spec[2] = ERL_DRV_INT;
+    spec[3] = 7;
+    spec[4] = ERL_DRV_TUPLE;
+    spec[5] = 2;
+}
+
+/* The four delivery forms all report "the spec was not the C's failure code" for a well-formed
+ * spec. Their *success* code is not pinned: the C answers `1` for a queued delivery and this seam
+ * answers `0` for a captured one (see the module docs' *Known gaps*), so only the accept/refuse
+ * split is observable identically. `-1` is the shared failure code. */
+
+static int chk_erl_drv_output_term_accepts(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return erl_drv_output_term(driver_mk_port(st->port), spec, 6) != -1;
+}
+
+static int chk_driver_output_term_accepts(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return driver_output_term(st->port, spec, 6) != -1;
+}
+
+static int chk_erl_drv_send_term_accepts(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return erl_drv_send_term(driver_mk_port(st->port), driver_connected(st->port), spec, 6) != -1;
+}
+
+static int chk_driver_send_term_accepts(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return driver_send_term(st->port, driver_connected(st->port), spec, 6) != -1;
+}
+
+/* A negative spec length is refused before any word is decoded. */
+static int chk_output_term_negative_len_refused(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return erl_drv_output_term(driver_mk_port(st->port), spec, -1) == -1;
+}
+
+/* Two values left on the decode stack: the spec is not one term. */
+static int chk_output_term_leftover_values_refused(abi_state *st) {
+    ErlDrvTermData spec[4];
+    spec[0] = ERL_DRV_INT;
+    spec[1] = 1;
+    spec[2] = ERL_DRV_INT;
+    spec[3] = 2;
+    return erl_drv_output_term(driver_mk_port(st->port), spec, 4) == -1;
+}
+
+/* An out-of-grammar tag is refused. */
+static int chk_output_term_unknown_tag_refused(abi_state *st) {
+    ErlDrvTermData spec[1];
+    spec[0] = (ErlDrvTermData) 99999;
+    return erl_drv_output_term(driver_mk_port(st->port), spec, 1) == -1;
+}
+
+/* An empty spec (`NULL` array, zero length) decodes to no term at all. */
+static int chk_output_term_empty_spec_refused(abi_state *st) {
+    return erl_drv_output_term(driver_mk_port(st->port), NULL, 0) == -1;
+}
+
+/* `_send_term` with `driver_term_nil` as the destination: there is no process to receive, so the C
+ * answers the "not delivered" code `0` and this seam answers its capture code `0` — the one shape on
+ * which the two success codes coincide. */
+static int chk_send_term_absent_destination(abi_state *st) {
+    ErlDrvTermData spec[6];
+    abi_term_spec(spec);
+    return erl_drv_send_term(driver_mk_port(st->port), driver_term_nil, spec, 6) == 0;
+}
+
+/* -- the `driver_set_timer` shapes --------------------------------------------------------- */
+
+static int chk_set_timer_zero(abi_state *st) {
+    int rc = driver_set_timer(st->port, 0);
+    if (rc == 0)
+        (void) driver_cancel_timer(st->port);
+    return rc == 0;
+}
+
+static int chk_set_timer_large(abi_state *st) {
+    int rc = driver_set_timer(st->port, (unsigned long) 1 << 40);
+    if (rc == 0)
+        (void) driver_cancel_timer(st->port);
+    return rc == 0;
+}
+
+static int chk_set_timer_rearm(abi_state *st) {
+    int a = driver_set_timer(st->port, 60000);
+    int b = driver_set_timer(st->port, 1000);
+    if (a == 0 || b == 0)
+        (void) driver_cancel_timer(st->port);
+    return a == 0 && b == 0;
+}
+
+static int chk_read_timer_pending(abi_state *st) {
+    unsigned long left = 0;
+    int armed = driver_set_timer(st->port, 60000);
+    int rc = driver_read_timer(st->port, &left);
+    (void) driver_cancel_timer(st->port);
+    return armed == 0 && rc == 0 && left > 0 && left <= 60000;
+}
+
+static int chk_read_timer_idle(abi_state *st) {
+    unsigned long left = 12345;
+    int rc = driver_read_timer(st->port, &left);
+    return rc == 0 && left == 0;
+}
+
+/* -- the `erl_drv_monotonic_time` phase-free properties ------------------------------------ */
+
+/* The absolute phase is *not* pinnable (the C anchors Erlang monotonic time, this seam anchors the
+ * system clock, so early values differ in sign — see the module docs' *Known gaps*). What both
+ * clocks share is monotonicity and unit consistency, which is what the selectors below pin. */
+
+static int chk_monotonic_nsec_monotone(void) {
+    ErlDrvTime a = erl_drv_monotonic_time(ERL_DRV_NSEC);
+    ErlDrvTime b = erl_drv_monotonic_time(ERL_DRV_NSEC);
+    return b >= a;
+}
+
+static int chk_monotonic_msec_monotone(void) {
+    ErlDrvTime a = erl_drv_monotonic_time(ERL_DRV_MSEC);
+    ErlDrvTime b = erl_drv_monotonic_time(ERL_DRV_MSEC);
+    return b >= a;
+}
+
+static int chk_monotonic_usec_monotone(void) {
+    ErlDrvTime a = erl_drv_monotonic_time(ERL_DRV_USEC);
+    ErlDrvTime b = erl_drv_monotonic_time(ERL_DRV_USEC);
+    return b >= a;
+}
+
+static int chk_monotonic_msec_rate(void) {
+    ErlDrvTime a = erl_drv_monotonic_time(ERL_DRV_MSEC);
+    ErlDrvTime b = erl_drv_monotonic_time(ERL_DRV_MSEC);
+    ErlDrvTime d = b - a;
+    return d >= 0 && d < 60000;
+}
+
+/* The SEC and NSEC readings are two views of one clock, so they agree to within the (sub-second)
+ * gap between the two calls. */
+static int chk_monotonic_sec_matches_nsec(void) {
+    ErlDrvTime sec = erl_drv_monotonic_time(ERL_DRV_SEC);
+    ErlDrvTime ns = erl_drv_monotonic_time(ERL_DRV_NSEC);
+    ErlDrvTime d = erl_drv_convert_time_unit(ns, ERL_DRV_NSEC, ERL_DRV_SEC) - sec;
+    return d >= 0 && d <= 2;
+}
+
+/* `erl_drv_convert_time_unit` and a direct `MSEC` reading of the same clock agree (the reading is
+ * taken later, so it is >= the conversion of the earlier nanosecond value). */
+static int chk_monotonic_convert_consistency(void) {
+    ErlDrvTime ns = erl_drv_monotonic_time(ERL_DRV_NSEC);
+    ErlDrvTime m = erl_drv_monotonic_time(ERL_DRV_MSEC);
+    ErlDrvTime d = m - erl_drv_convert_time_unit(ns, ERL_DRV_NSEC, ERL_DRV_MSEC);
+    return d >= 0 && d <= 100;
+}
+
 /* -- the selectors ------------------------------------------------------------------------- */
 
 static void abi_dispatch(abi_state *st, unsigned char sel) {
@@ -475,6 +662,29 @@ static void abi_dispatch(abi_state *st, unsigned char sel) {
     case 25: abi_answer(st, chk_select(st)); break;
     case 26: abi_answer(st, chk_system_info()); break;
     case 27: abi_answer(st, chk_putenv()); break;
+    /* The ErlDrvTerm spec family: the four delivery forms (accept) and the refusal shapes. */
+    case 30: abi_answer(st, chk_erl_drv_output_term_accepts(st)); break;
+    case 31: abi_answer(st, chk_driver_output_term_accepts(st)); break;
+    case 32: abi_answer(st, chk_erl_drv_send_term_accepts(st)); break;
+    case 33: abi_answer(st, chk_driver_send_term_accepts(st)); break;
+    case 34: abi_answer(st, chk_output_term_negative_len_refused(st)); break;
+    case 35: abi_answer(st, chk_output_term_leftover_values_refused(st)); break;
+    case 36: abi_answer(st, chk_output_term_unknown_tag_refused(st)); break;
+    case 37: abi_answer(st, chk_output_term_empty_spec_refused(st)); break;
+    case 38: abi_answer(st, chk_send_term_absent_destination(st)); break;
+    /* The `driver_set_timer` shapes. */
+    case 40: abi_answer(st, chk_set_timer_zero(st)); break;
+    case 41: abi_answer(st, chk_set_timer_large(st)); break;
+    case 42: abi_answer(st, chk_set_timer_rearm(st)); break;
+    case 43: abi_answer(st, chk_read_timer_pending(st)); break;
+    case 44: abi_answer(st, chk_read_timer_idle(st)); break;
+    /* The `erl_drv_monotonic_time` phase-free properties. */
+    case 60: abi_answer(st, chk_monotonic_nsec_monotone()); break;
+    case 61: abi_answer(st, chk_monotonic_msec_monotone()); break;
+    case 62: abi_answer(st, chk_monotonic_usec_monotone()); break;
+    case 63: abi_answer(st, chk_monotonic_msec_rate()); break;
+    case 64: abi_answer(st, chk_monotonic_sec_matches_nsec()); break;
+    case 65: abi_answer(st, chk_monotonic_convert_consistency()); break;
     /* Payload selectors: the bytes the *owner* receives are the observable. */
     case 110: abi_emit(st, "ABCDE", 5); break;
     case 111: (void) driver_output2(st->port, "H", 1, "body", 4); break;
@@ -845,6 +1055,126 @@ pub(crate) fn group() -> Vec<Case> {
             &[202],
             "49",
         ),
+        case(
+            "driver_abi/erl_drv_output_term_accepts_a_well_formed_spec",
+            "erl_drv_output_term/3 decodes the ErlDrvTerm spec and reports it is not the failure code",
+            &[30],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_output_term_accepts_a_well_formed_spec",
+            "the deprecated driver_output_term/3 accepts the same ErlDrvTerm spec",
+            &[31],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_send_term_accepts_a_well_formed_spec",
+            "erl_drv_send_term/4 accepts the spec with the port owner as the destination",
+            &[32],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_send_term_accepts_a_well_formed_spec",
+            "the deprecated driver_send_term/4 accepts the spec with the port owner as the destination",
+            &[33],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_output_term_refuses_a_negative_spec_length",
+            "a negative ErlDrvTerm spec length is the failure code, not a partial decode",
+            &[34],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_output_term_refuses_a_spec_with_leftover_values",
+            "a spec that leaves more than one value on the decode stack is refused",
+            &[35],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_output_term_refuses_an_unknown_tag",
+            "an out-of-grammar ErlDrvTermData tag is refused",
+            &[36],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_output_term_refuses_an_empty_spec",
+            "a null spec array with zero length decodes to no term and is refused",
+            &[37],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_send_term_to_an_absent_destination_reports_not_delivered",
+            "driver_send_term/4 addressed to driver_term_nil reports 0 in both runtimes",
+            &[38],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_set_timer_accepts_a_zero_millisecond_delay",
+            "driver_set_timer/2 accepts a zero-millisecond delay on a timeout-capable entry",
+            &[40],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_set_timer_accepts_a_large_delay",
+            "driver_set_timer/2 accepts a delay that does not overflow the deadline",
+            &[41],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_set_timer_re_arms_an_armed_timer",
+            "a second driver_set_timer/2 call while a timer is armed is accepted",
+            &[42],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_read_timer_reports_a_pending_delay",
+            "driver_read_timer/2 reports a remaining time in (0, delay] for an armed port timer",
+            &[43],
+            "49",
+        ),
+        case(
+            "driver_abi/driver_read_timer_reports_zero_with_no_timer_armed",
+            "driver_read_timer/2 succeeds and reports 0 when no port timer is pending",
+            &[44],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_monotonic_time_nanosecond_readings_are_non_decreasing",
+            "two erl_drv_monotonic_time/1 reads in nanoseconds are non-decreasing",
+            &[60],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_monotonic_time_millisecond_readings_are_non_decreasing",
+            "two erl_drv_monotonic_time/1 reads in milliseconds are non-decreasing",
+            &[61],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_monotonic_time_microsecond_readings_are_non_decreasing",
+            "two erl_drv_monotonic_time/1 reads in microseconds are non-decreasing",
+            &[62],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_monotonic_time_millisecond_delta_is_a_sane_rate",
+            "the millisecond delta between two reads is non-negative and below a minute",
+            &[63],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_monotonic_time_second_and_nanosecond_readings_agree",
+            "the second reading and the converted nanosecond reading differ by at most the call gap",
+            &[64],
+            "49",
+        ),
+        case(
+            "driver_abi/erl_drv_monotonic_time_agrees_with_erl_drv_convert_time_unit",
+            "a millisecond reading agrees with the converted nanosecond reading of the same clock",
+            &[65],
+            "49",
+        ),
     ]
 }
 
@@ -938,5 +1268,30 @@ mod tests {
             }
         }
         assert_eq!(payloads, 4, "the four driver_output* byte round trips");
+    }
+
+    /// The three families this group widened are all present: the `ErlDrvTerm` spec family
+    /// (`30..38`), the `driver_set_timer` shapes (`40..44`) and the phase-free
+    /// `erl_drv_monotonic_time` properties (`60..65`). Each selector is answered by a distinct ABI
+    /// check in the shared C fixture, so a dropped one would silently shrink the surface.
+    #[test]
+    fn the_widened_driver_abi_families_are_all_present() {
+        let selectors: HashSet<i64> = group()
+            .into_iter()
+            .map(|case| match case.kind {
+                CaseKind::Module(run) => run.args[0],
+                _ => unreachable!("every A.4 case is a module-run case"),
+            })
+            .collect();
+        for selector in [
+            30, 31, 32, 33, 34, 35, 36, 37, 38, // the ErlDrvTerm spec family
+            40, 41, 42, 43, 44, // the driver_set_timer shapes
+            60, 61, 62, 63, 64, 65, // the erl_drv_monotonic_time properties
+        ] {
+            assert!(
+                selectors.contains(&selector),
+                "selector {selector} (an added A.4 family member) is missing"
+            );
+        }
     }
 }

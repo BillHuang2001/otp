@@ -150,6 +150,153 @@ fn an_object_with_no_term_is_destroyed_on_release() {
     );
 }
 
+/// The destructor runs with a **live environment built from the type's host** — the analogue of the
+/// C's `pre_nif_noproc(&msg_env, type->owner, NULL)` (`erl_nif.c:3016-3018`). A destructor that drives
+/// the env's host (here: interns an atom) therefore works, and it is handed the type's env, **not**
+/// the env of the call that released the last reference.
+#[test]
+fn the_destructor_receives_a_live_environment_from_the_types_host() {
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+    static ENV_REACHED_HOST: AtomicBool = AtomicBool::new(false);
+    static PAYLOAD_SEEN: AtomicBool = AtomicBool::new(false);
+    static DTOR_ENV: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn probing_dtor(env: *mut ErlNifEnv, obj: *mut c_void) {
+        PAYLOAD_SEEN.store(!obj.is_null(), AtomicOrdering::Relaxed);
+        // SAFETY: `env` is the live environment `destroy` built for this call — its pointer came from
+        // `NifEnv::as_ptr` on a `NifEnv` that outlives the destructor call.
+        if let Some(e) = unsafe { NifEnv::from_opaque(env) } {
+            DTOR_ENV.store(env as usize, AtomicOrdering::Relaxed);
+            ENV_REACHED_HOST.store(
+                e.host().intern_atom("dtor_env_atom").is_some(),
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
+
+    let mut host = RetainHost {
+        heap: beam_alloc::Heap::new(4096).expect("a small test heap is allocatable"),
+        atoms: beam_term::atom::AtomTable::new(),
+    };
+    let mut env = NifEnv::new(&mut host);
+    let call_env = env.as_ptr();
+    let name = CString::new("dtor_env_rt").expect("no interior NUL");
+    let mut tried = ErlNifResourceFlags::from_bits(0);
+    // SAFETY: `env` is live; `name` is NUL-terminated; `tried` is a live local.
+    let ty = unsafe {
+        enif_open_resource_type(
+            env.as_ptr(),
+            core::ptr::null(),
+            name.as_ptr(),
+            Some(probing_dtor),
+            ErlNifResourceFlags::CREATE,
+            &mut tried,
+        )
+    };
+    assert!(!ty.is_null(), "the type must open");
+
+    // SAFETY: `ty` came from the open call above.
+    let obj = unsafe { enif_alloc_resource(ty, 4) };
+    assert!(!obj.is_null(), "the allocation must succeed");
+    // The object is never exported as a term, so this release reaches zero and runs the destructor.
+    // SAFETY: `obj` is a live payload pointer with its one outstanding reference.
+    unsafe { enif_release_resource(obj) };
+
+    assert!(
+        PAYLOAD_SEEN.load(AtomicOrdering::Relaxed),
+        "the destructor is handed the payload"
+    );
+    assert!(
+        ENV_REACHED_HOST.load(AtomicOrdering::Relaxed),
+        "the destructor's environment must reach the type's host"
+    );
+    assert_ne!(
+        DTOR_ENV.load(AtomicOrdering::Relaxed),
+        call_env as usize,
+        "the destructor is handed the type's own env, not the releasing call's"
+    );
+
+    // SAFETY: `env` is still a live env.
+    let atom = env.host().intern_atom("after_dtor").expect("interns");
+    assert!(prelude::is_atom(atom), "the call env is untouched");
+}
+
+/// The destructor's **count and ordering**, which match the oracle exactly (only the timing differs):
+/// it does not run while a `keep` is outstanding, runs exactly once on the release that reaches zero,
+/// and runs in release order across objects.
+#[test]
+fn a_keep_defers_the_destructor_until_the_last_release() {
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    static ORDER: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn tagging_dtor(_: *mut ErlNifEnv, obj: *mut c_void) {
+        // SAFETY: the fixture-shaped contract: `obj` is a live payload whose first byte is readable.
+        let byte = unsafe { *(obj as *const u8) } as usize;
+        // Append the tag, so the final value encodes the order the destructors ran in.
+        let _ = ORDER.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |prev| Some((prev << 8) | byte),
+        );
+        COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    let mut host = RetainHost {
+        heap: beam_alloc::Heap::new(4096).expect("a small test heap is allocatable"),
+        atoms: beam_term::atom::AtomTable::new(),
+    };
+    let mut env = NifEnv::new(&mut host);
+    let name = CString::new("keep_rt").expect("no interior NUL");
+    let mut tried = ErlNifResourceFlags::from_bits(0);
+    // SAFETY: `env` is live; `name` is NUL-terminated; `tried` is a live local.
+    let ty = unsafe {
+        enif_open_resource_type(
+            env.as_ptr(),
+            core::ptr::null(),
+            name.as_ptr(),
+            Some(tagging_dtor),
+            ErlNifResourceFlags::CREATE,
+            &mut tried,
+        )
+    };
+    assert!(!ty.is_null(), "the type must open");
+
+    let base = COUNT.load(AtomicOrdering::Relaxed);
+    // SAFETY: `ty` is a live type; each `obj` is released exactly as often as it is kept/allocated.
+    unsafe {
+        let a = enif_alloc_resource(ty, 1);
+        let b = enif_alloc_resource(ty, 1);
+        assert!(!a.is_null() && !b.is_null());
+        *(a as *mut u8) = 0x11;
+        *(b as *mut u8) = 0x22;
+
+        enif_keep_resource(a); // a: 2
+        enif_release_resource(a); // a: 1 — a live keep, so no destructor
+        assert_eq!(
+            COUNT.load(AtomicOrdering::Relaxed) - base,
+            0,
+            "a keep is outstanding, so nothing is destroyed"
+        );
+        enif_release_resource(a); // a: 0 — destructor #1 (tag 0x11)
+        enif_release_resource(b); // b: 0 — destructor #2 (tag 0x22)
+    }
+    assert_eq!(
+        COUNT.load(AtomicOrdering::Relaxed) - base,
+        2,
+        "exactly one destructor run per object reaching zero"
+    );
+    assert_eq!(
+        ORDER.load(AtomicOrdering::Relaxed),
+        0x1122,
+        "the destructors run in release order"
+    );
+}
+
 #[test]
 fn header_layout_is_the_documented_block_shape() {
     assert_eq!(RESOURCE_HEADER_SIZE, 32);

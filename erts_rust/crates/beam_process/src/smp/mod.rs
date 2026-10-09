@@ -49,11 +49,14 @@
 //!
 //! # `unsafe` and `Send`
 //!
-//! [`ProcessTable`] is `!Send` (it owns off-heap [`beam_gc::MsoHandle`]s whose payload pointer is
-//! a `NonNull`). Wrapping it in the shared [`SharedProcessTable`] therefore needs the two
-//! `unsafe impl`s on that type; see their documentation. This is a **documented handoff** — the
-//! proper fix is for `beam_gc::MsoHandle` / `beam_alloc::RefcBinary` to be `Send` themselves, which
-//! is out of this crate's scope.
+//! [`ProcessTable`] is `!Send` for five reasons — a raw `*mut Eterm` in [`beam_alloc::Heap`], a
+//! `NonNull<Mso>` in [`beam_gc::MsoHandle`], the `Rc<AtomTable>` each process's dictionary holds,
+//! and the two `Box<dyn …>` trait objects the table stores (`DistSignalRouter` and
+//! `ProcessExitObserver`, neither `Send`). Wrapping it in the shared [`SharedProcessTable`]
+//! therefore needs the two `unsafe impl`s on that type; the single-lock argument and the full
+//! cause list live in their `// SAFETY:` comments. This is a **documented handoff**: the durable
+//! fix is `Send` on `beam_alloc::Heap` and `beam_gc::MsoHandle`, an `Arc<AtomTable>` dictionary and
+//! `Send` bounds on the two traits — all outside this crate's scope.
 //!
 //! # Locking discipline (BINDING — follow it in every change)
 //!
@@ -117,27 +120,48 @@ use crate::ptab::ProcessTable;
 ///
 /// # `Send`/`Sync`
 ///
-/// A table owns off-heap [`beam_gc::MsoHandle`]s whose payload is reached through a `NonNull`, so
-/// `ProcessTable` is `!Send` and the automatic impls do not apply. The two `unsafe impl`s below
+/// [`ProcessTable`] is `!Send`, so the automatic impls do not apply; the two `unsafe impl`s below
 /// assert that confining every access to the inner mutex makes moving and sharing the wrapper
-/// sound. This is a **documented handoff**: the durable fix lives in `beam_gc`/`beam_alloc`
-/// (making the off-heap handles `Send`), which this crate must not change.
+/// sound. The five `!Send` causes and the full argument are enumerated on those impls. This is a
+/// **documented handoff**: the durable fix is `Send` on `beam_alloc::Heap` and `beam_gc::MsoHandle`,
+/// an `Arc<AtomTable>` dictionary and `Send`-bounded `DistSignalRouter`/`ProcessExitObserver`
+/// traits, none of which this crate owns.
 pub struct SharedProcessTable {
     /// The guarded table.
     inner: Mutex<ProcessTable>,
 }
 
-// SAFETY: all access to the wrapped `ProcessTable` — reads and writes of every field, and every
-// off-heap `MsoHandle` it owns — goes through the inner `parking_lot::Mutex`, which serialises
-// them. A handle is uniquely owned inside the table and is moved (never concurrently aliased)
-// between threads; the MSO payload it points at is immutable once created. No `!Send` value ever
-// escapes a mutex guard, so moving the whole wrapper to another thread (or sharing it by
-// reference) cannot create an aliasing or data race.
+// SAFETY: `ProcessTable` is `!Send` for exactly five reasons, each accounted for here:
+//   1. `beam_alloc::Heap.base: *mut Eterm` (`beam_alloc/src/heap.rs`), reached via
+//      `Process.collector → beam_gc::Collector → HeapSpace → beam_alloc::Heap`. The heap uniquely
+//      owns the block; the pointer targets a carrier block owned by a `Send` (`Arc<dyn Allocator>`
+//      over a `Send + Sync` allocator) whose address is stable across the move, and nothing aliases
+//      it concurrently.
+//   2. `beam_gc::MsoHandle.ptr: NonNull<Mso>` (`beam_gc/src/mso.rs`), reached through
+//      `beam_message::OffHeapTable`. The handle uniquely owns the `Mso`, whose payload is an
+//      immutable `Box<dyn Any + Send>`.
+//   3. `Dict.atoms: Rc<AtomTable>` (`beam_process/src/dict.rs`) — `Rc` is `!Send` (its refcount is
+//      not atomic). INVARIANT: every process's dictionary is built by `Dict::new()` and its
+//      `Rc<AtomTable>` is NEVER cloned or shared outside this table, so no `Rc` is ever touched from
+//      two threads. Do NOT clone a dictionary's `Rc<AtomTable>` to another thread, and do NOT adopt
+//      `Dict::with_atoms` with an `Rc` the host also holds on another thread (it is test-only today).
+//   4. `ProcessTable.router: Option<Box<dyn DistSignalRouter>>` (`ptab.rs`) — the trait object has
+//      no `Send` bound.
+//   5. `ProcessTable.exit_observer: Option<Box<dyn ProcessExitObserver>>` (`ptab.rs`) — likewise no
+//      `Send` bound. Both trait objects are invoked only with the table lock held and carry no
+//      thread-affine state.
+//
+// Every access to the wrapped table — every field, and every off-heap pointer it owns — goes
+// through the single inner `parking_lot::Mutex`, and `SharedProcessTable` exposes the table ONLY
+// via `lock`/`try_lock`, returning a `MutexGuard` that is itself `!Send` (it borrows the mutex). So
+// at most one thread is ever inside the table and no `&mut ProcessTable` — nor any `!Send` value it
+// owns — can move off the locking thread: those values are safe to move under the lock, and sharing
+// `&self` across threads cannot create an aliasing or data race.
 unsafe impl Send for SharedProcessTable {}
 
-// SAFETY: `&SharedProcessTable` exposes only `lock`/`try_lock`, both of which return a mutex
-// guard, so cross-thread sharing is mediated entirely by the inner mutex — the same argument as
-// the `Send` impl above.
+// SAFETY: `&SharedProcessTable` exposes only `lock`/`try_lock`, both of which return a `!Send`
+// mutex guard, so cross-thread sharing is mediated entirely by the inner mutex — the same
+// single-lock argument as the `Send` impl above.
 unsafe impl Sync for SharedProcessTable {}
 
 impl SharedProcessTable {

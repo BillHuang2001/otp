@@ -41,11 +41,31 @@
 //! A.6) through the environment half ([`CaseKind::EvalEnv`](super::CaseKind::EvalEnv)), pinning
 //! that an `ERL_AFLAGS`-supplied `-boot` reaches `init:get_argument(boot)` identically.
 //!
-//! The surfaces deliberately **not** pinned here (a plain differing observable, i.e. a genuine
-//! divergence that would be a `mismatch`, not a capability gap — handoffs to `beam_rt`):
-//! `code:get_mode/0`, `init:get_argument(root|home|progname)`, `application:get_application/0`,
-//! `erlang:module_info/1`, and the `whereis(code_server|erl_prim_loader|kernel_sup)` boot
-//! processes (the runtime's native `code:*`/`init:*` floor does not register them).
+//! The surfaces deliberately **not** pinned here are plain differing observables — genuine
+//! divergences that would be a `mismatch`, not a capability gap — and are handoffs to `beam_rt`
+//! (the oracle value state, verified with `differential compare` against the live system ERTS, is
+//! what the runtime should converge on):
+//!
+//! | surface | oracle (OTP 29 / erts-17.1) | rust runtime |
+//! |---|---|---|
+//! | `code:get_mode/0` | `interactive` | raises `badarg` |
+//! | `code:lib_dir/2` (e.g. `code:lib_dir(kernel, ebin)`) | a path string | raises `badarg` |
+//! | `code:get_path/0` | the installation's path list | a differing path list |
+//! | `init:get_argument(root\|home\|progname)` | `{ok,[[Path]]}` / `{ok,[["erl"]]}` | `error` |
+//! | `init:script_id/0` | `{"Erlang/OTP","29"}` | raises `badarg` |
+//! | `application:get_application/0,1` | `undefined` / `{ok,App}` | raises `badarg` |
+//! | `application:get_key(App, mod)` on a library app | `{ok,[]}` | `undefined` |
+//! | `erlang:module_info/1`, `erlang:get_module_info/2` | the export table (from `erlang`) | `undef` / `badarg` |
+//! | `lists:module_info(exports)` | the export set | the same set in a differing order |
+//! | `erlang:module_loaded(kernel)` | `true` | `false` |
+//! | `erl_prim_loader:get_path/0` | `{ok,Paths}` | raises `badarg` |
+//! | `erlang:system_info(logical_processors)` | 16 | 14 |
+//! | `erlang:system_info(heap_sizes)` | the sizing list | a list with one extra entry |
+//! | `whereis(code_server\|erl_prim_loader\|kernel_sup)` | a pid | the atom `undefined` |
+//!
+//! (`erlang:check_old_code/1`, `erlang:system_info(loaded)` and `erlang:system_info(check_io)` are
+//! capability gaps — the runtime raises its documented `unsupported` — so they are neither cases
+//! nor mismatches.)
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -391,6 +411,266 @@ pub(crate) fn group() -> Vec<Case> {
             "lists:all(fun({F,A}) -> is_atom(F) andalso is_integer(A) end, init:module_info(exports))",
             "ok true",
         ),
+        // --- The code server's view of the booted module universe -------------------------
+        // Once the boot script has run, the code server can answer for the whole module universe:
+        // where the root is, which module lives in which file, what is loaded, and what the code
+        // path is. Only the *shapes* and the frozen constants are pinned — an object path is an
+        // absolute path of the host installation and is never asserted by value.
+        eval(
+            "boot_extra/code_objfile_extension_is_beam",
+            "code:objfile_extension/0 reports the frozen object-file extension \".beam\"",
+            "code:objfile_extension() =:= \".beam\"",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_root_dir_is_non_empty_string",
+            "code:root_dir/0 is a non-empty string (the installation root, never pinned by value)",
+            "begin D = code:root_dir(), is_list(D) andalso length(D) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_lib_dir_kernel_is_non_empty_string",
+            "code:lib_dir/1 is a non-empty string for the booted `kernel` application",
+            "begin D = code:lib_dir(kernel), is_list(D) andalso length(D) > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_lib_dir_unknown_application_is_bad_name",
+            "code:lib_dir/1 reports {error,bad_name} for an application that does not exist",
+            "code:lib_dir(nonexisting_module_xyz)",
+            "ok {error,bad_name}",
+        ),
+        eval(
+            "boot_extra/code_which_unknown_module_is_non_existing",
+            "code:which/1 reports the atom `non_existing` for a module that was never loaded",
+            "code:which(no_such_module_xyz)",
+            "ok non_existing",
+        ),
+        eval(
+            "boot_extra/code_which_erlang_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for the `erlang` module",
+            "code:which(erlang)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_which_lists_is_a_beam_object_path",
+            "code:which/1 reports a string ending in \".beam\" for the loaded `lists` module",
+            "begin P = code:which(lists), is_list(P) andalso filename:extension(P) =:= \".beam\" end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_unknown_module_is_false",
+            "code:is_loaded/1 reports the atom `false` for a module that was never loaded",
+            "code:is_loaded(no_such_module_xyz)",
+            "ok false",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_lists_is_a_file_pair",
+            "code:is_loaded/1 reports a {file,Path} pair for the loaded `lists` module",
+            "begin L = code:is_loaded(lists), is_tuple(L) andalso element(1, L) =:= file andalso is_list(element(2, L)) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_all_loaded_entries_are_module_file_pairs",
+            "every code:all_loaded/0 entry is a 2-tuple tagged by a module atom",
+            "lists:all(fun(X) -> is_tuple(X) andalso tuple_size(X) =:= 2 andalso is_atom(element(1, X)) end, code:all_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_get_path_is_a_list_of_strings",
+            "every code:get_path/0 entry is a string (the paths themselves are host-specific)",
+            "lists:all(fun erlang:is_list/1, code:get_path())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/code_ensure_loaded_lists_is_module_lists",
+            "code:ensure_loaded/1 on the already-loaded `lists` module is idempotent",
+            "code:ensure_loaded(lists)",
+            "ok {module,lists}",
+        ),
+        eval(
+            "boot_extra/code_is_sticky_kernel_is_true",
+            "code:is_sticky/1 reports the boot-loaded `kernel` module as sticky",
+            "code:is_sticky(kernel)",
+            "ok true",
+        ),
+        // --- The init/boot argument surface the boot script itself relies on --------------
+        // `init`'s own status and the argument table it recorded from the boot command line; the
+        // full `init:get_arguments/0` rendering is pinned by shape in the section above.
+        eval(
+            "boot_extra/init_get_status_is_starting_started",
+            "init:get_status/0 reports the {starting,started} booted phase pair",
+            "init:get_status()",
+            "ok {starting,started}",
+        ),
+        eval(
+            "boot_extra/init_get_arguments_records_the_noshell_flag",
+            "the -noshell flag the harness always passes is present in init:get_arguments/0",
+            "lists:keymember(noshell, 1, init:get_arguments())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/init_get_argument_absent_flag_is_error",
+            "init:get_argument/1 reports the atom `error` for a flag that was never passed",
+            "init:get_argument(some_flag_xyz_absent)",
+            "ok error",
+        ),
+        // --- The applications the boot script started -------------------------------------
+        // `loaded_applications/0` carries release-varying version strings, so only its shape is
+        // pinned; `which_applications/0` is observed by membership.
+        eval(
+            "boot_extra/loaded_applications_entries_are_three_tuples",
+            "every loaded_applications/0 entry is {AppAtom,Description,String}",
+            "lists:all(fun({A,V,D}) -> is_atom(A) andalso is_list(V) andalso is_list(D) end, application:loaded_applications())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/which_applications_kernel_is_running",
+            "the boot script has started `kernel` (it appears in which_applications/0)",
+            "lists:keymember(kernel, 1, application:which_applications())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_description_shape",
+            "application:get_key(kernel, description) carries a string value",
+            "is_list(element(2, application:get_key(kernel, description)))",
+            "ok true",
+        ),
+        // --- Module introspection of boot-loaded modules ----------------------------------
+        // `module_info/1` is a real export of every loaded module; its `module` key is stable while
+        // the *order* of the `exports` list is not (it is pinned by membership, never by value).
+        eval(
+            "boot_extra/lists_module_info_module_is_lists",
+            "lists:module_info(module) reports the module's own name",
+            "lists:module_info(module)",
+            "ok lists",
+        ),
+        eval(
+            "boot_extra/init_module_info_module_is_init",
+            "init:module_info(module) reports the module's own name",
+            "init:module_info(module)",
+            "ok init",
+        ),
+        eval(
+            "boot_extra/lists_module_info_exports_contains_sort_1",
+            "the `lists` module's export table contains the {sort,1} entry",
+            "lists:member({sort,1}, lists:module_info(exports))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_lists_sort_1_is_true",
+            "erlang:function_exported/3 reports lists:sort/1 as exported",
+            "erlang:function_exported(lists, sort, 1)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_unknown_function_is_false",
+            "erlang:function_exported/3 reports a nonexistent function as not exported",
+            "erlang:function_exported(lists, no_such_fun_xyz, 1)",
+            "ok false",
+        ),
+        eval(
+            "boot_extra/module_loaded_unknown_module_is_false",
+            "erlang:module_loaded/1 reports a module that was never loaded as not loaded",
+            "erlang:module_loaded(no_such_module_xyz)",
+            "ok false",
+        ),
+        // --- Emulator constants of the booted system --------------------------------------
+        // The frozen emulator constants both runtimes must report are pinned exactly; the
+        // build-flavour / machine-dependent values are pinned by shape only.
+        eval(
+            "boot_extra/system_info_machine_is_beam",
+            "erlang:system_info(machine) reports the frozen emulator family \"BEAM\"",
+            "erlang:system_info(machine) =:= \"BEAM\"",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_emu_flavor_is_atom",
+            "erlang:system_info(emu_flavor) is an atom (jit/emu — the build flavour)",
+            "is_atom(erlang:system_info(emu_flavor))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_heap_type_is_atom",
+            "erlang:system_info(heap_type) is an atom (the process heap flavour)",
+            "is_atom(erlang:system_info(heap_type))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_smp_support_is_true",
+            "erlang:system_info(smp_support) reports a multi-scheduler-capable emulator",
+            "erlang:system_info(smp_support)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_threads_is_true",
+            "erlang:system_info(threads) reports a thread-enabled emulator",
+            "erlang:system_info(threads)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_debug_compiled_is_boolean",
+            "erlang:system_info(debug_compiled) is a boolean build flag (true for a debug build, false for a release build)",
+            "is_boolean(erlang:system_info(debug_compiled))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_nif_version_is_a_string",
+            "erlang:system_info(nif_version) is a string (value is release-dependent)",
+            "is_list(erlang:system_info(nif_version))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_driver_version_is_a_string",
+            "erlang:system_info(driver_version) is a string",
+            "is_list(erlang:system_info(driver_version))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_atom_limit_is_positive_integer",
+            "erlang:system_info(atom_limit) is a positive integer limit",
+            "begin N = erlang:system_info(atom_limit), is_integer(N) andalso N > 0 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_min_heap_size_pair_shape",
+            "erlang:system_info(min_heap_size) is the {min_heap_size,Words} pair",
+            "begin M = erlang:system_info(min_heap_size), is_tuple(M) andalso element(1, M) =:= min_heap_size andalso is_integer(element(2, M)) end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_schedulers_online_is_positive",
+            "erlang:system_info(schedulers_online) is a positive scheduler count (value is host-dependent)",
+            "erlang:system_info(schedulers_online) > 0",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_system_architecture_is_a_string",
+            "erlang:system_info(system_architecture) is a string (the target triple, host-dependent)",
+            "is_list(erlang:system_info(system_architecture))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_system_version_is_a_string",
+            "erlang:system_info(system_version) is a string (value is release-dependent)",
+            "is_list(erlang:system_info(system_version))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/system_info_modified_timing_level_is_undefined",
+            "with no timing override, erlang:system_info(modified_timing_level) is `undefined`",
+            "erlang:system_info(modified_timing_level)",
+            "ok undefined",
+        ),
+        // --- The preloaded-module runtime floor -------------------------------------------
+        // `persistent_term` is preloaded (see the membership case above); its observable floor is
+        // live without any application having started.
+        eval(
+            "boot_extra/persistent_term_missing_key_returns_the_default",
+            "the preloaded `persistent_term` serves get/2's default for an unset key",
+            "persistent_term:get(nonexistent_key_xyz, default)",
+            "ok default",
+        ),
         // --- The `-boot` init argument, through the environment half (contract A.6) --------
         // The `-boot FILE` switch is what selects the boot script; it is recorded by `init`
         // identically whether it arrives on the command line or through `ERL_AFLAGS`. The
@@ -463,28 +743,42 @@ mod tests {
 
     #[test]
     fn every_case_has_a_well_formed_ok_golden() {
+        use std::collections::HashSet;
+        let mut used: HashSet<&str> = HashSet::new();
         for case in group() {
             let golden = case
                 .golden
                 .stdout
                 .unwrap_or_else(|| panic!("case {} asserts stdout", case.id));
             assert!(
-                golden == "ok true"
-                    || golden == "ok error"
-                    || golden == "ok preloaded"
-                    || golden == "ok {file,preloaded}",
-                "case {}: unexpected golden {golden:?}",
+                golden.starts_with("ok "),
+                "case {}: a Probe::Value golden is an `ok <value>` line, got {golden:?}",
+                case.id
+            );
+            assert!(
+                ALLOWED_GOLDENS.contains(&golden),
+                "case {}: golden {golden:?} is outside the reviewed set",
                 case.id
             );
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
+            // No volatile rendering may be baked into a golden: no pid/ref/port (`<`), no
+            // filesystem path (`/`), no map (`#{`).
+            for unstable in ["<", "/", "#{"] {
+                assert!(
+                    !golden.contains(unstable),
+                    "case {}: the golden pins an unstable rendering: {golden:?}",
+                    case.id
+                );
+            }
+            used.insert(golden);
+        }
+        for golden in ALLOWED_GOLDENS {
             assert!(
-                !golden.contains("<0."),
-                "case {}: the golden pins an unstable pid: {golden:?}",
-                case.id
+                used.contains(golden),
+                "the reviewed golden set lists an unused golden: {golden:?}"
             );
         }
     }
-
     #[test]
     fn only_the_environment_case_carries_an_environment() {
         for case in group() {
@@ -519,18 +813,50 @@ mod tests {
         }
     }
 
+    /// Every golden this group may assert. The list is explicit (rather than a set of loose shape
+    /// rules) so that a new case cannot slip a volatile rendering past review, and the test also
+    /// asserts that no entry here is unused. Volatile values are observed by shape only, so
+    /// whatever a case asserts is either a frozen constant or a boolean/tuple-shaped predicate.
+    const ALLOWED_GOLDENS: &[&str] = &[
+        "ok true",
+        "ok false",
+        "ok error",
+        "ok undefined",
+        "ok preloaded",
+        "ok non_existing",
+        "ok default",
+        "ok lists",
+        "ok init",
+        "ok {file,preloaded}",
+        "ok {module,lists}",
+        "ok {error,bad_name}",
+        "ok {starting,started}",
+    ];
+
+    /// The keys whose *value* varies per VM start, per host or per OTP release. A case may observe
+    /// their **shape** (`is_list/1`, `> 0`, `is_integer/1`), but must never compare the value
+    /// itself — the oracle is OTP 29 while the rewrite targets OTP 30.
+    const VOLATILE_KEYS: &[&str] = &[
+        "process_count",
+        "wall_clock",
+        "unique_integer",
+        "otp_release",
+        "system_version",
+        "logical_processors",
+        "creation",
+    ];
+
     #[test]
     fn no_expression_pins_a_volatile_value() {
         for case in group() {
             let expr = case.expr().expect("every case is an eval case");
-            assert!(
-                !expr.contains("process_count")
-                    && !expr.contains("wall_clock")
-                    && !expr.contains("system_version")
-                    && !expr.contains("otp_release) =:="),
-                "case {}: the expression pins a volatile value: {expr:?}",
-                case.id
-            );
+            for key in VOLATILE_KEYS {
+                assert!(
+                    !expr.contains(&format!("{key}) =:=")) && !expr.contains(&format!("{key}) ==")),
+                    "case {}: the expression pins the volatile `{key}` value: {expr:?}",
+                    case.id
+                );
+            }
         }
     }
 }

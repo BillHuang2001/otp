@@ -434,7 +434,17 @@ fn badarg_raise_pending_exception_and_clear() {
         assert_eq!(enif_has_pending_exception(env.as_ptr(), &mut reason), 1);
         assert_eq!(eterm_from_nif(reason), badarg_term);
 
+        // The C `enif_clear_env` frees temporary objects / rewinds the heap top but leaves the
+        // `exception_thrown` flag alone (`erl_nif.c:700-723`), so the pending reason survives it.
         enif_clear_env(env.as_ptr());
+        assert_eq!(env.pending_exception(), Some(badarg_term));
+        assert_eq!(enif_has_pending_exception(env.as_ptr(), &mut reason), 1);
+        assert_eq!(eterm_from_nif(reason), badarg_term);
+        // A null out-pointer is still fine: only the count matters.
+        assert_eq!(enif_has_pending_exception(env.as_ptr(), std::ptr::null_mut()), 1);
+
+        // `NifEnv::clear` is the Rust-only reset helper — deliberately *not* the C `enif_clear_env`.
+        env.clear();
         assert_eq!(env.pending_exception(), None);
         assert_eq!(enif_has_pending_exception(env.as_ptr(), &mut reason), 0);
         // No pending exception: a null out-pointer is still fine.
@@ -448,6 +458,8 @@ fn badarg_raise_pending_exception_and_clear() {
         assert_eq!(enif_has_pending_exception(env.as_ptr(), &mut back), 1);
         assert_eq!(eterm_from_nif(back), make_small(42));
         enif_clear_env(env.as_ptr());
+        assert_eq!(enif_has_pending_exception(env.as_ptr(), &mut back), 1);
+        assert_eq!(eterm_from_nif(back), make_small(42));
 
         // Null env: the exception API degrades to a safe default, never a panic.
         assert_eq!(enif_has_pending_exception(std::ptr::null_mut(), &mut back), 0);

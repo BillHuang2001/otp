@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "tool": "bench",
+  "tool_version": "0.1.0",
+  "generated_at_unix_ms": 1791525642361,
+  "profile": "quick",
+  "runtimes": [
+    {
+      "kind": "sys",
+      "program": "/nix/store/khp1dd3fk8476mwg62cinwvk5a17r53s-erlang-29.1.1/lib/erlang/erts-17.1/bin/erl",
+      "version": "29",
+      "supported": true,
+      "notes": []
+    }
+  ],
+  "results": [
+    {
+      "workload": "plb",
+      "runtime": "sys",
+      "category": "compute",
+      "description": "Programming-Language-Benchmarks kernels via the dotnet tool",
+      "status": "ok",
+      "reason": null,
+      "metrics": [
+        {
+          "name": "wall_ms",
+          "unit": "ms",
+          "value": 77669.863406
+        },
+        {
+          "name": "test_time_ms",
+          "unit": "ms",
+          "summary": {
+            "count": 10,
+            "min": 0.0,
+            "max": 4121.5201,
+            "mean": 1457.9892,
+            "p50": 728.1035999999999,
+            "p90": 4044.29938,
+            "p99": 4113.798028
+          }
+        },
+        {
+          "name": "test_mem_bytes",
+          "unit": "bytes",
+          "value": 91942912.0
+        }
+      ],
+      "peak_memory_bytes": 169451520,
+      "notes": [
+        "build stage ok (dotnet --task build took 29162 ms)"
+      ]
+    }
+  ]
+}

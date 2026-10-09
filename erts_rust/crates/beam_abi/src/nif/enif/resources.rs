@@ -93,11 +93,8 @@
 //!    which this crate never does. An object that no term holds is released and destroyed normally.
 //!    The destructor itself is **run synchronously** on the release that takes the reference count to
 //!    zero — exactly once per object, never while a `keep` is outstanding, and never for a `NULL`
-//!    release. Measured on the oracle, the C's destructor is *asynchronous*: after a release to zero
-//!    `dtor_count` still reads `0` and only reads `1` a moment later (the object is decoupled and
-//!    freed off the releasing thread — a misc aux-work thread). The **count and ordering** of
-//!    destructor invocations is therefore the same as the oracle's; only the *timing* differs (it is
-//!    deterministic here, GC/aux-work-driven there).
+//!    release. The C *schedules* it instead; the full comparison is in "The destructor's timing"
+//!    below.
 //! 4. **The type's identity is its name.** The C keys a resource type by `(module, name)` and takes
 //!    the module from the calling module instance (`env->mod_nif->mod->module`); `enif_open_resource_type`
 //!    additionally *asserts* `module_str == NULL`. The env handed to a `load`/NIF call here carries no
@@ -114,6 +111,54 @@
 //!    driven by `beam_io`/`beam_process`, which are not wired to this crate); no `rt_id`/`enif_select`
 //!    registration; the type is never freed (the C frees it on module unload) — the registry is
 //!    process-lifetime, exactly like the C's global `resource_type_list`.
+//!
+//! # The destructor's timing — the deviation the C does not let us close
+//!
+//! **What the C does** (`erts/emulator/beam/erl_nif.c`). `enif_release_resource` (`:3164-3175`)
+//! drops one reference. The release that reaches zero does **not** run the destructor: it runs
+//! `nif_resource_dtor_prologue` (`:2961-2972`), which does
+//! `erts_schedule_misc_aux_work(<sched_id>, run_resource_dtor, bin)` and returns `0` ("don't free"),
+//! so the magic binary and its payload stay live for an **aux-work** task to pick up.
+//! `run_resource_dtor` (`:2974-3030`) then runs on that other context, builds a *fresh* message
+//! environment from the type's owner module instance (`pre_nif_noproc(&msg_env, type->owner, NULL)`,
+//! `:3016-3021`), calls `type->fn.dtor(&msg_env.env, resource->data)`, and only then frees the magic
+//! binary (`:3029`). The destructor is thus **asynchronous and on a different thread**: measured on
+//! the oracle, a destructor count read immediately after a release-to-zero still reads `0` and reads
+//! `1` only a moment later.
+//!
+//! **Why that cannot be reproduced safely here.** The deferred destructor needs a live environment,
+//! and the C gets one from a **refcounted, thread-independent** object: `type->owner` is the module
+//! instance, whose lifetime is pinned by the type's own reference count (`enif_alloc_resource` does
+//! `erts_refc_inc(&resource->type->refc, 2)`, `:3149`), so it outlives every resource of the type on
+//! whichever thread the destructor later runs. This crate has no such object: the type's environment
+//! source (`ResourceType::host`) is a **borrowed** host pointer, erased from the `&mut dyn NifHost`
+//! of the NIF call that opened the type. That borrow is
+//!   * **not `Send`** — a raw `*mut dyn NifHost` is `!Send`, and `unsafe impl Send`-ing it would be
+//!     a lie, because nothing keeps that host alive across the boundary; and
+//!   * **not refcounted** — `NifHost` offers no retention, so the borrow necessarily ends when the
+//!     call that produced it returns (for the destructor path, the very call that released the last
+//!     reference), i.e. *before* any deferred job could run.
+//! Handing a later thread that pointer would run the destructor with a freed host: that is memory
+//! unsafety, not merely a wrong result. The asynchronous form is therefore **not implemented, and no
+//! stand-in is faked** — `destroy` runs the destructor **synchronously**, on the releasing thread,
+//! with a live environment, exactly once.
+//!
+//! **What is identical, and what differs.** The **count** (one run per object whose reference count
+//! reaches zero), the **ordering** (release order), the **environment** the callback receives (the
+//! type's, not the releasing call's) and the **payload** it is handed are all the oracle's. Only the
+//! **timing** differs: deterministic and in-call here, aux-work-driven and slightly deferred there.
+//! It is pinned from both sides — `tests/nif_resource.rs::resource_family_end_to_end`'s
+//! `roundtrip/0` last slot is `1` here and `0` on the oracle, while the Rust-only `dtor_probe/0` +
+//! `dtor_state/0` (the oracle cannot run them: its C dereferences the `NULL` keep/release and
+//! segfaults) pin the count and the order exactly.
+//!
+//! **The sound seam, if it is ever wanted** (a `NifHost`/`beam_rt` change — reported, not added
+//! here): a defaulted `NifHost` hook by which the *host* owns the deferral and runs the job later
+//! with a host **it** owns (its own refcounted runtime state), with the default answering "run the
+//! job inline". `destroy` would hand it a job capturing the payload, the block and the `dtor`
+//! pointer (wrapped in a `Send` newtype — sound because that block is exclusively owned by the
+//! pending job once its term bindings are dropped), and run the job itself when the hook declines.
+//! Reconstructing the type's host pointer inside such a job is precisely what cannot be done today.
 //!
 //! # The one cross-crate seam added
 //!
@@ -625,6 +670,9 @@ pub unsafe extern "C" fn enif_keep_resource(obj: *mut c_void) {
 /// term holds one more reference (see the module docs, point 3), so releasing the allocator's
 /// reference leaves it alive — exactly as on the oracle.
 ///
+/// The destructor is run **synchronously** on this thread, where the C schedules it as misc aux work;
+/// see the module docs, "The destructor's timing", for why the asynchronous form is not reproduced.
+///
 /// # Safety
 ///
 /// `obj` must be a payload pointer from [`enif_alloc_resource`] with an outstanding reference (or
@@ -647,6 +695,11 @@ pub unsafe extern "C" fn enif_release_resource(obj: *mut c_void) {
 }
 
 /// Run the destructor and free the block of a resource whose count just reached zero.
+///
+/// The destructor runs **here and now**, on the releasing thread, with a live environment built from
+/// the type's host — where the C decouples the object and runs it later on a misc aux-work thread.
+/// The deviation, its reason and the sound seam that would close it are documented in the module
+/// header ("The destructor's timing").
 ///
 /// # Safety
 ///

@@ -723,6 +723,48 @@ mod tests {
         ),
     ];
 
+    /// Every per-module `register` body
+    /// [`BifRegistry::with_core_bifs`](crate::registry::BifRegistry::with_core_bifs)
+    /// runs, **in its exact order**, with a name for assertion messages.
+    /// `runtime::register` is listed once (it fans out to its own family modules).
+    const REGISTERS: &[(&str, fn(&mut BifRegistry))] = &[
+        ("arith", crate::arith::register),
+        ("bool", crate::bool::register),
+        ("compare", crate::compare::register),
+        ("type_test", crate::type_test::register),
+        ("term_ops", crate::term_ops::register),
+        ("convert", crate::convert::register),
+        ("lists", crate::lists::register),
+        ("maps", crate::maps::register),
+        ("math", crate::math::register),
+        ("binary", crate::binary::register),
+        ("binconv", crate::binconv::register),
+        ("unicode", crate::unicode::register),
+        ("time", crate::time::register),
+        ("phash", crate::phash::register),
+        ("proc", crate::proc::register),
+        ("dict", crate::dict::register),
+        ("reason", crate::reason::register),
+        ("string", crate::string::register),
+        ("io", crate::io::register),
+        ("ets", crate::ets::register),
+        ("port", crate::port::register),
+        ("records", crate::records::register),
+        ("nif", crate::nif::register),
+        ("checksum", crate::checksum::register),
+        ("calendar", crate::calendar::register),
+        ("os_bif", crate::os_bif::register),
+        ("fun_info", crate::fun_info::register),
+        ("term_conv", crate::term_conv::register),
+        ("erts_internal", crate::erts_internal::register),
+        ("modinfo", crate::modinfo::register),
+        ("match_spec", crate::match_spec::register),
+        ("packet", crate::packet::register),
+        ("proc_reg", crate::proc_reg::register),
+        ("persistent_term", crate::persistent_term::register),
+        ("runtime", crate::runtime::register),
+    ];
+
     /// The `(module, function, arity)` keys a `register` body installs, sorted.
     fn keys_of(register: impl FnOnce(&mut BifRegistry)) -> Vec<(String, String, u32)> {
         let mut reg = BifRegistry::new();
@@ -985,6 +1027,72 @@ mod tests {
         }
     }
 
+    /// Where a seam's consumers all come from specific module(s), the table must be a
+    /// **subset** of those modules' rosters (the tables whose defining *module* is the
+    /// whole seam are covered by the **equality** guard above).
+    ///
+    /// This pins the doc's attribution — "the four `src/port.rs` operations",
+    /// "`erlang:send/2` and its quoted alias … the same `src/proc.rs`
+    /// implementation", `node/0,1` in `src/convert.rs`, the encoders split across
+    /// `src/binconv.rs`/`src/term_conv.rs`, the fun-taking surface across
+    /// `src/lists.rs`/`src/maps.rs` — and catches a key listed under the wrong module
+    /// (a typo, or a BIF that moved).
+    #[test]
+    fn subset_tables_are_contained_in_their_defining_modules() {
+        let cases: &[(&str, &[(&str, &str, u32)], &[fn(&mut BifRegistry)])] = &[
+            (
+                "MEMORY_HOOK_BIFS",
+                MEMORY_HOOK_BIFS,
+                &[crate::runtime::register],
+            ),
+            (
+                "LOCAL_FUN_IDENTITY_BIFS",
+                LOCAL_FUN_IDENTITY_BIFS,
+                &[crate::binconv::register, crate::term_conv::register],
+            ),
+            ("PORT_HOOK_BIFS", PORT_HOOK_BIFS, &[crate::port::register]),
+            ("SEND_HOOK_BIFS", SEND_HOOK_BIFS, &[crate::proc::register]),
+            (
+                "RECORD_SOURCE_BIFS",
+                RECORD_SOURCE_BIFS,
+                &[crate::records::register],
+            ),
+            (
+                "FUN_CALLER_BIFS",
+                FUN_CALLER_BIFS,
+                &[crate::lists::register, crate::maps::register],
+            ),
+            (
+                "LOCAL_NODE_BIFS",
+                LOCAL_NODE_BIFS,
+                &[
+                    crate::convert::register,
+                    crate::binconv::register,
+                    crate::term_conv::register,
+                ],
+            ),
+            (
+                "RUNTIME_HOOKS_BIFS",
+                RUNTIME_HOOKS_BIFS,
+                &[crate::runtime::register],
+            ),
+        ];
+        for (name, table, modules) in cases {
+            let mut roster: std::collections::HashSet<(String, String, u32)> =
+                std::collections::HashSet::new();
+            for register in *modules {
+                roster.extend(keys_of(*register));
+            }
+            for (module, function, arity) in *table {
+                assert!(
+                    roster.contains(&(module.to_string(), function.to_string(), *arity)),
+                    "{name} lists {module}:{function}/{arity}, which none of the module(s) \
+                     listed for it registers"
+                );
+            }
+        }
+    }
+
     /// The strongest guard: [`RUNTIME_HOOKS_BIFS`] is asserted **equal** to the roster
     /// of `src/runtime/`'s four `runtime_bif!` families, so the table is provably
     /// complete, not merely sound.
@@ -1018,6 +1126,106 @@ mod tests {
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
         assert_eq!(RUNTIME_HOOKS_BIFS.len(), 195);
+    }
+
+    /// The module-doc table at the top of this file is the human-readable record of the
+    /// seam → table → key-count mapping; the tables are the code. This ties the two
+    /// together by **parsing the doc out of this very source file**, so a count that
+    /// drifts from its table (or a table missing from the doc) fails the build instead
+    /// of misleading a host that sizes its gates from the doc.
+    ///
+    /// The doc row shape is `//! | [\`Seam\`] | [\`TABLE_BIFS\`] | N |`; rows naming a
+    /// non-`_BIFS` symbol (the "private host gate → predicate" table) are ignored, and
+    /// the "every exported table" assertion below keeps that filter from hiding a row
+    /// that should have been matched.
+    #[test]
+    fn the_module_doc_table_counts_match_the_tables() {
+        let src = include_str!("hook_sets.rs");
+        let mut documented: Vec<(&str, usize)> = Vec::new();
+        for line in src.lines() {
+            let Some(row) = line.strip_prefix("//! |") else {
+                continue;
+            };
+            let columns: Vec<&str> = row.split('|').map(str::trim).collect();
+            if columns.len() < 3 {
+                continue;
+            }
+            let Some(name) = columns[1]
+                .strip_prefix("[`")
+                .and_then(|cell| cell.strip_suffix("`]"))
+            else {
+                continue;
+            };
+            if !name.ends_with("_BIFS") {
+                continue;
+            }
+            let count = columns[2]
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("the doc's key-count cell for {name} is not a number"));
+            documented.push((name, count));
+        }
+
+        assert_eq!(
+            documented.len(),
+            TABLES.len(),
+            "the module doc must document every seam table exactly once (documented: {documented:?})"
+        );
+        for (name, count) in documented {
+            let (_, table, _) = TABLES
+                .iter()
+                .find(|(table_name, _, _)| *table_name == name)
+                .unwrap_or_else(|| {
+                    panic!("the doc documents `{name}`, which is not an exported seam table")
+                });
+            assert_eq!(
+                count,
+                table.len(),
+                "`{name}` is documented as {count} keys but the table holds {}",
+                table.len()
+            );
+        }
+    }
+
+    /// The registration bodies are **pairwise disjoint**: [`BifRegistry::register`]
+    /// keeps the *last* implementation registered for a key, so an overlap between two
+    /// bodies silently *shadows* the earlier one — the later implementation wins and the
+    /// earlier is unreachable, with nothing else failing.
+    ///
+    /// This is the guard against the ordering trap `with_core_bifs` sets up: the `ets`
+    /// bridge (a key-per-verb body) runs before the `runtime` family, so a key both
+    /// bodies installed would resolve to the runtime one rather than to the ets bridge,
+    /// and vice versa for any earlier/later pair.
+    #[test]
+    fn no_registration_body_shadows_another() {
+        let mut owner: std::collections::HashMap<(String, String, u32), &str> =
+            std::collections::HashMap::new();
+        for (name, register) in REGISTERS {
+            for key in keys_of(*register) {
+                if let Some(previous) = owner.insert(key.clone(), name) {
+                    panic!(
+                        "{key:?} is installed by both `{previous}` and `{name}`: \
+                         `register` keeps the last one, so `{previous}`'s implementation is shadowed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`REGISTERS`] is the whole of `with_core_bifs`: running exactly those bodies in
+    /// order reproduces the default registry key-for-key, so the disjointness guard
+    /// above cannot miss a body (and a body dropped from the list fails here).
+    #[test]
+    fn the_registration_bodies_reproduce_the_default_registry() {
+        let mut reg = BifRegistry::new();
+        for (_, register) in REGISTERS {
+            register(&mut reg);
+        }
+        assert_eq!(
+            reg.names(),
+            default_registry().names(),
+            "REGISTERS must run exactly the bodies with_core_bifs runs, in the same order"
+        );
+        assert_eq!(reg.len(), BifRegistry::with_core_bifs().len());
     }
 
     /// Near misses (wrong arity / wrong module / a different BIF) answer `false`.

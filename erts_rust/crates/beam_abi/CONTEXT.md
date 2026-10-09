@@ -161,9 +161,15 @@ Not part of the C ABI; the *internal* boundary the `enif_*` bodies are written a
   `beam_abi` needs **no** `beam_codec` dependency.
 - `pub struct NifEnv` — the concrete per-call environment behind the C-facing opaque
   `*mut ErlNifEnv`: `new(&mut dyn NifHost)`, `host()`, `heap()`, `as_ptr()`,
-  `unsafe from_opaque(*mut ErlNifEnv) -> Option<&mut NifEnv>`, and the pending-exception slot
-  (`pending_exception`/`set_exception`/`clear`, the C `enif_raise_exception`/`enif_clear_env`
-  semantics). Re-exported at the crate root as `beam_abi::{NifEnv, NifHost}`.
+  `unsafe from_opaque(*mut ErlNifEnv) -> Option<&mut NifEnv>`, the pending-exception slot
+  (`pending_exception`/`set_exception`/`clear`), and a **bounded per-call record of the atoms
+  interned through this env** (`record_atom`, read back by `recorded_atom_name`/`recorded_atom`;
+  `MAX_RECORDED_ATOMS = 256`, first-wins dedupe) — the runtime commits a fresh atom lazily, so `NifHost::atom_name` (committed
+  table only) cannot see one interned earlier in the *same* call. Re-exported at the crate root as
+  `beam_abi::{NifEnv, NifHost}`.
+  `enif_clear_env` does **not** touch the exception slot (matching the C, which frees temporary
+  objects / rewinds the heap top but leaves `exception_thrown` set — `erl_nif.c:700-723`);
+  `NifEnv::clear()` is the Rust-only reset helper, not the C `enif_clear_env`.
 - **Current-NIF-host stack (host discovery for `enif_alloc_env`).** `NifEnv::new` — the single
   construction point for every real call env — publishes the host it was given onto a crate-private
   thread-local stack, and `NifEnv`'s `Drop` pops exactly its own entry (out-of-order drop restores
@@ -179,7 +185,8 @@ Not part of the C ABI; the *internal* boundary the `driver_*`/`erl_drv_*` bodies
 - `pub trait DriverHost` — **required** `heap() -> &mut beam_alloc::Heap`, `intern_atom(&str) ->
   Option<Eterm>`, `output(port, &[u8]) -> c_int`, `send_term(port, Option<Eterm>, Eterm) -> c_int`;
   plus **defaulted** hooks (defaults report "unsupported" as `-1`/`None`): `select`, `set_timer`,
-  `cancel_timer`, `read_timer`, `r#async`, `connected_pid`, `caller_pid`, the port-queue hooks
+  `cancel_timer`, `read_timer`, `r#async`, `connected_pid`, `caller_pid`, `binary_to_term` (the ETF
+  decode behind `ERL_DRV_EXT2TERM`), the port-queue hooks
   `enq`/`pushq`/`deq`/`sizeq`/`peekq`, the attribute hooks `set_busy_port`/`set_control_flags`/
   `get_port_flags`, the failure/lifecycle hooks `failure`/`port_exit`/`busy_msgq_limits`/`init_ack`/
   `set_os_pid`/`async_port_key`, the monitor hooks `monitor_process`/`demonitor_process`/
@@ -252,6 +259,17 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   bodies, so `unsafe` appears throughout; every declaration is documented and every `unsafe` block
   (term/pointer transmutes, the `NifEnv`/`DriverEnv` opaque-pointer recover paths) carries a
   preceding `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean.
+- **The raw-pointer ABI wrappers intentionally `allow(clippy::not_unsafe_ptr_arg_deref)`.** The
+  `DriverLibrary` callback wrappers (`src/driver/loader.rs`: `start`/`control`/`call`/`stop`/
+  `output`/`outputv`/`timeout`/`ready_input`/`ready_output`/`ready_async`/`flush`/`process_exit`/
+  `stop_select`/`emergency_close`) and `sync::thread_exit` are **safe** public fns whose parameters
+  are the raw pointers of the C `ErlDrvEntry`/pthread signatures, forwarded verbatim to the driver's
+  own callback (or `pthread_exit`): the pointer-validity contract belongs to the caller, exactly as
+  in the C. The lint is allowed with a recorded rationale — a module-scoped inner attribute in
+  `src/driver/loader.rs` and a function-scoped attribute on `thread_exit` — because making them
+  `unsafe fn` would be a breaking change to the frozen ABI-mirroring public API that `beam_rt`/
+  `beam_io` consume. `cargo clippy -p beam_abi --all-targets --no-deps` is error-free as a result
+  (warnings remain; the workspace clippy step is non-blocking).
 - **Nullability:** C function-pointer fields are `Option<unsafe extern "C" fn …>` (null-pointer
   optimized, same size/align as a raw pointer). Data pointers stay raw `*mut T`/`*const T`.
 - **Opaque handles** are `#[repr(C)] pub struct X { _private: [u8; 0] }` (incomplete C type), used
@@ -454,11 +472,16 @@ writers over the host's `beam_alloc::Heap`, atoms through `NifHost::intern_atom`
 - **`mem`** — libc-backed `enif_alloc`/`enif_free`/`enif_realloc`; the binary family
   (`enif_alloc_binary`/`enif_realloc_binary`/`enif_release_binary`/`enif_make_new_binary`/
   `enif_make_binary`/`enif_make_sub_binary`/`enif_inspect_binary`/`enif_inspect_iolist_as_binary`);
-  the ETF pair `enif_term_to_binary`/`enif_binary_to_term` through `NifHost`.
+  the ETF pair `enif_term_to_binary`/`enif_binary_to_term` through `NifHost` (each answers the C's
+  failure `0` when the host hook is absent).
 - **`get`** — `enif_get_int/uint/long/ulong/double/list_cell/tuple/list_length/string/
   string_length/atom/atom_length`.
 - **`make`** — `enif_make_int/uint/long/ulong/double/atom(_len)/new_atom(_len)/existing_atom(_len)/
-  string(_len)/list_cell/reverse_list/ref/tuple_from_array/list_from_array`.
+  string(_len)/list_cell/reverse_list/ref/tuple_from_array/list_from_array`. The four make-atom
+  entry points **record** each interned atom on the env; `enif_make_existing_atom(_len)` consults
+  that record first (so a just-interned name resolves) then `NifHost::existing_atom`, and answers
+  `0` with `*atom` untouched on a miss. `enif_make_ref` raises `badarg` when `NifHost::make_ref` is
+  absent (the C never fails).
 - **`map`** — `enif_get_map_size`/`enif_get_map_value`/`enif_make_new_map`/`enif_make_map_from_arrays`/
   `enif_make_map_put`/`enif_make_map_update`/`enif_make_map_remove`.
 - **`pred`** — the `enif_is_*` predicates, `enif_compare`, `enif_is_identical`, `enif_hash`,
@@ -467,11 +490,13 @@ writers over the host's `beam_alloc::Heap`, atoms through `NifHost::intern_atom`
   `enif_is_pid_undefined`, `enif_get_atom_cache_index`/`enif_max_atom_cache_index`.
 - **`process`** — monitors (`enif_monitor_process`/`demonitor_process`/`compare_monitors`/
   `make_monitor_term`), liveness (`enif_is_process_alive`/`is_current_process_alive`/`is_port_alive`),
-  `enif_send`, `enif_port_command`, `enif_whereis_pid`/`whereis_port`, `enif_schedule_nif`. All drive
+  `enif_send`, `enif_port_command`, `enif_whereis_pid`/`whereis_port` (0 when `NifHost::whereis_pid`/
+  `whereis_port` is absent), `enif_schedule_nif`. All drive
   existing `NifHost` hooks and add no runtime state. The monitor payload is the C's 3-word reference
   block copied into the 32-byte `ErlNifMonitor` (bytes 24..32 zeroed).
 - **`exception`** — `enif_make_badarg`, `enif_raise_exception` (sets the env's pending exception),
-  `enif_has_pending_exception`, `enif_clear_env`.
+  `enif_has_pending_exception`, `enif_clear_env` (**leaves the pending exception intact**, as the C
+  does; the env owns no temporary objects of its own, so it is otherwise a validated no-op).
 - **`threads`** — the 34 mutex/cond/rwlock/tsd/thread slots, thin cast-and-forward facades over
   `crate::sync`; `enif_thread_type` and the `*_name` accessors are the only non-forwarding ones.
 - **`ioq`** — `enif_ioq_create`/`destroy`/`enq_binary`/`enqv`/`size`/`deq`/`peek`/`peek_head` plus
@@ -485,6 +510,9 @@ writers over the host's `beam_alloc::Heap`, atoms through `NifHost::intern_atom`
   `enif_cpu_time`/`enif_system_info`/`enif_getenv`/`enif_make_unique_integer`/
   `enif_consume_timeslice`/`enif_dlopen`/`enif_dlsym`. The Erlang monotonic-time / time-offset
   relation is reproduced; `enif_time_offset/1` is pinned against the oracle.
+  `enif_system_info` takes no env, so it reaches the host via `with_current_host` and prefers
+  `NifHost::system_info` (falling back to the crate's built-in values); `enif_make_unique_integer`
+  prefers `NifHost::unique_integer` and otherwise serves real values from a crate-internal counter.
 - **`resources`** — the eleven resource slots over a crate-internal resource-type registry plus a
   real refcounted allocation (`enif_open_resource_type`/`_x`/`init_resource_type`/`alloc_resource`/
   `release_resource`/`keep_resource`/`make_resource`/`make_resource_binary`/`get_resource`/
@@ -497,14 +525,18 @@ writers over the host's `beam_alloc::Heap`, atoms through `NifHost::intern_atom`
   that reference is never dropped — an object ever exported as a term is retained (block + payload)
   for the process lifetime and its destructor never runs; an object never exported is destroyed on its
   last release, with the destructor run **synchronously** (the C schedules it on a misc aux-work
-  thread). The count/ordering of destructor runs matches the oracle; only the timing differs.
+  thread). The count/ordering — and the environment/payload the callback receives — match the
+  oracle; only the timing differs. The asynchronous form **cannot be reproduced safely** here: the
+  type's host borrow is a non-`Send` `*mut dyn NifHost` that is not kept alive past the call.
 - **`select`** — `enif_select`/`enif_select_x` reproduce the C's argument handling and return codes
   and hand the request to `NifHost::select` (the poller is `beam_io`'s); a request no host can
   service answers `-1`.
 - **`envs`** — `enif_alloc_env` (reads the thread-local current-NIF-host and returns
-  `NifHost::alloc_env()`, else `NULL`), `enif_free_env` (hands the env back to `NifHost::free_env`),
-  `enif_make_copy` (`NifHost::make_copy`; `THE_NON_VALUE` when unsupported), `enif_priv_data`
-  (`NifHost::priv_data`).
+  `NifHost::alloc_env()`, else `NULL`), `enif_free_env` (hands the env back to `NifHost::free_env`;
+  `NULL` and a pointer the host does not own are no-ops — this crate never frees memory it did not
+  allocate), `enif_make_copy` (`NifHost::make_copy`; `THE_NON_VALUE` when unsupported), `enif_priv_data`
+  (`NifHost::priv_data`). A use-after-`enif_free_env` is a caller-contract violation the raw-pointer
+  ABI cannot detect; this crate adds no ownership tracking it cannot enforce.
 - **`variadic`** — the seven C-variadic slots via the C shim (see *The C-variadic shim*).
 
 `pub fn enif_api_table() -> &'static ErlNifApi` returns the `#[used] static ENIF_API` built with the
@@ -548,8 +580,11 @@ Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of it
 - **`port`** (port/host-dependent; the `ErlDrvPort` operand **is** the `DriverEnv::as_port` pointer,
   recovered by `DriverEnv::from_port`) — the output family, the term-data family
   (`driver_output_term`/`driver_send_term`/`erl_drv_output_term`/`erl_drv_send_term` over
-  `decode_term_spec`), the port queries (`driver_mk_atom`/`driver_mk_port`/`driver_connected`/
-  `driver_caller`), and the select/timer/async group.
+  `decode_term_spec`, which decodes **all 17 `ERL_DRV_*` tags** — `ERL_DRV_PID` accepts only an
+  internal pid, `ERL_DRV_MAP` builds via `beam_term::map` (flat ≤ 32, else HAMT; duplicate keys
+  refused), `ERL_DRV_EXT2TERM` routes through the defaulted `DriverHost::binary_to_term`), the port
+  queries (`driver_mk_atom`/`driver_mk_port`/`driver_connected`/`driver_caller`), and the
+  select/timer/async group.
 - **`queues`** — the port-queue family (`driver_vec_to_buf`, `driver_enq`/`driver_pushq`/
   `driver_deq`/`driver_sizeq`, `driver_enq_bin`/`driver_pushq_bin`, `driver_peekq`/`driver_peekqv`,
   `driver_enqv`/`driver_pushqv`), delegating to the `DriverHost` queue hooks. The return codes were
@@ -618,6 +653,16 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
   `alloc_env`/`free_env`/`make_copy` (`beam_rt/src/nif.rs`), so the real runtime's message-env idiom
   works: every message env is built over the one shared pooled BIF heap, making `make_copy` the
   identity. A crate-owned env is not an option (its atoms would be unusable ⇒ a *wrong term*).
+- **The NIF host hooks the runtime does not yet implement.** `NifHost::{term_to_binary,
+  binary_to_term, make_ref, existing_atom, whereis_pid, unique_integer, system_info}` are defaulted to
+  "unsupported", and `beam_rt`'s `NifHostImpl` leaves them so — so the matching `enif_*` entry points
+  answer the C's failure (or, for `enif_make_ref`, raise `badarg`) where the oracle succeeds. Closing
+  these is a `beam_rt` change: `term_to_binary`/`binary_to_term` over `beam_codec`; `make_ref` over a
+  fresh reference term; `existing_atom` over the committed table **and** the in-flight
+  `PendingInterner`; `whereis_pid` over the process registry; `system_info` with the emulator's real
+  `erts_version`/`otp_release`/`scheduler_threads`/`dirty_scheduler_support` (the built-in fallback
+  rounds `dirty_scheduler_support` to `0` where the C reports `1`). The `beam_abi` side is complete
+  (C-failure/edge behaviour + the per-call atom record).
 - **No scheduler threads.** `enif_thread_type` can only report `ERL_NIF_THR_UNDEFINED` (a foreign
   thread) or `ERL_NIF_THR_OTHER` (a thread created through `sync::thread_create`) — never a
   scheduler/dirty-scheduler type. An **unnamed** handle's `*_name` accessor returns `NULL` where the
@@ -679,7 +724,7 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
 - `src/driver/loader.rs` → the dynamic driver loader: `DriverLibrary`, `DriverLoadError`/`DriverCallError`, `load()` (dlopen/dlsym `driver_init` + oracle-order `ErlDrvEntry` validation), the per-callback wrappers, `Drop` (finish + dlclose)
 - `src/layout.rs` → the compile-time layout freeze (all `const _: () = assert!(...)` for the table above)
 - `tests/common/mod.rs` → shared test helpers (NOT a test target: a subdirectory module pulled in with `mod common;`): `erl_include_dir`, `cc_available`, `compile_so`, `skip`, `TestHost`, `TestDriverHost`
-- `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `abi_conformance.rs`, `entry.rs`, `host_seam.rs`, `enif.rs`, `loader.rs`, `nif_end_to_end.rs`, `nif_process.rs`, `nif_resource.rs`, `nif_env.rs`, `nif_ioq.rs`, `nif_mapiter.rs`, `nif_threads.rs`, `nif_variadic.rs`, `driver_end_to_end.rs`, `driver_binary_refc.rs`, `driver_lifecycle.rs`, `driver_queues.rs`, `driver_pdl.rs`, `driver_threads.rs`) + `tests/fixtures/*.c` (real C NIFs/drivers), all compiled at test time with the system `cc` against the system OTP headers
+- `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `abi_conformance.rs`, `entry.rs`, `host_seam.rs`, `enif.rs`, `loader.rs`, `nif_end_to_end.rs`, `nif_process.rs`, `nif_resource.rs`, `nif_env.rs`, `nif_ioq.rs`, `nif_mapiter.rs`, `nif_threads.rs`, `nif_variadic.rs`, `nif_atom_env.rs`, `driver_end_to_end.rs`, `driver_loader.rs`, `driver_binary_refc.rs`, `driver_lifecycle.rs`, `driver_queues.rs`, `driver_pdl.rs`, `driver_threads.rs`) + `tests/fixtures/*.c` (real C NIFs/drivers), all compiled at test time with the system `cc` against the system OTP headers
 
 ## Notes for Agents
 - **Read the legacy headers before touching a layout**: `../../erts/emulator/beam/erl_nif.h`,

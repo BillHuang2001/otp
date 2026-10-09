@@ -27,7 +27,8 @@
 //! primitives the dispatch loop builds on: the Y-slot accessors
 //! ([`Machine::y`]/[`Machine::set_y`]), the frame push/pop/trim operations, the
 //! continuation accessors, the heap request seam ([`Machine::ensure_heap`]) and
-//! the caller-chain introspection ([`Machine::resumption_addresses`]).
+//! the caller-chain introspection ([`Machine::resumption_contexts`] /
+//! [`Machine::resumption_addresses`]).
 
 use beam_common::Result;
 use beam_term::Eterm;
@@ -82,13 +83,37 @@ pub(crate) struct Frame {
 impl Machine {
     /// Read Y slot `k` of the **current** frame, or `None` if there is no frame or
     /// `k` is outside the frame's Y slots.
+    ///
+    /// Public because a suspended frame is a host-visible fact: the runtime recovers
+    /// a `receive … after T` deadline whose `T` the compiler kept in a **Y register**
+    /// (a runtime variable) through this accessor — see
+    /// [`Machine::wait_deadline`], which reads a parked `wait_timeout`'s
+    /// [`Operand::Y(n)`](beam_loader::Operand::Y). Nothing here writes the frame, so
+    /// reading is always safe for a host holding the machine between slices.
     #[inline]
-    pub(crate) fn y(&self, k: u32) -> Option<Eterm> {
+    pub fn y(&self, k: u32) -> Option<Eterm> {
         let frame = self.frames.last()?;
         if k >= frame.y_count {
             return None;
         }
         self.stack.get(frame.y_base + k as usize).copied()
+    }
+
+    /// Mutable access to Y slot `k` of the **current** frame, under exactly
+    /// [`Machine::y`]'s bound (no frame, or `k` outside the frame's Y slots ⇒
+    /// `None`).
+    ///
+    /// The write half of the pair a host needs to *relocate* a slot it read — a
+    /// host that moves a term while a process is suspended updates the frame
+    /// through here rather than through the raw stack, so the bound check stays in
+    /// one place (see [`Machine::stack_mut`] for the whole-stack form).
+    #[inline]
+    pub fn y_mut(&mut self, k: u32) -> Option<&mut Eterm> {
+        let frame = self.frames.last()?;
+        if k >= frame.y_count {
+            return None;
+        }
+        self.stack.get_mut(frame.y_base + k as usize)
     }
 
     /// Write `v` into Y slot `k` of the current frame.
@@ -243,9 +268,17 @@ impl Machine {
         Ok(())
     }
 
-    /// Ensure `heap_need` heap words are available, handing the context the exact
-    /// root set (`x[0..live)` plus the whole stack) so a Stage-4 collector can move
-    /// terms in place.
+    /// Ensure `heap_need` heap words are available, handing the context the **whole
+    /// live root set** (`x[0..live)`, the whole stack **and the whole FR file**) so a
+    /// Stage-4 collector can move terms in place.
+    ///
+    /// This delegates to
+    /// [`ExecutionContext::ensure_heap_full`](crate::context::ExecutionContext::ensure_heap_full),
+    /// whose default forwards to the narrow
+    /// [`ensure_heap`](crate::context::ExecutionContext::ensure_heap) with the FR
+    /// file discarded — so a host that predates the full-root door behaves exactly as
+    /// before, while a host that wants every live root (including the FR file, which
+    /// holds `Eterm` term slots) overrides the full variant.
     #[inline]
     pub(crate) fn ensure_heap(
         &mut self,
@@ -253,19 +286,23 @@ impl Machine {
         live: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<()> {
-        let (x, stack) = (&mut self.x, &mut self.stack);
-        ctx.ensure_heap(heap_need, live, x, stack)
+        self.with_roots(live, |roots| ctx.ensure_heap_full(heap_need, roots))
     }
 
-    /// The `(function index, code offset)` of every live call frame that is
-    /// currently **suspended in a call**, innermost frame first.
+    /// The `(function index, code offset, module context)` of every live call frame
+    /// that is currently **suspended in a call**, innermost frame first.
     ///
     /// A frame's continuation-pointer slot holds the address its function resumes
     /// at once the call it is waiting for returns ([`Instr::Call`](beam_loader::Instr)
     /// writes it through [`Machine::set_continuation`]), so this sequence is the
     /// engine's replacement for the C runtime's **saved raw stacktrace**: the chain
     /// of callers, innermost first — the same order C's `build_stacktrace` emits
-    /// (`../../erts/emulator/beam/beam_common.c:1274-1288`).
+    /// (`../../erts/emulator/beam/beam_common.c:1274-1288`). The context recorded
+    /// with each address is the module the `(func, pc)` belongs to (`0` = the run's
+    /// entry module, otherwise a [`ModuleContext`](super::ModuleContext) id), which
+    /// is what lets a caller resolve each frame against its **own** module instead
+    /// of naming it in the running one (a caller frame reached through a cross-module
+    /// `call_ext` carries an address in *another* module).
     ///
     /// A frame sitting at [`Continuation::Halt`] contributes nothing: that is the
     /// bottom frame (pushed by [`Machine::run_label`]) and any frame whose function
@@ -273,21 +310,32 @@ impl Machine {
     /// is executing right now, whose own location the dispatch loop already knows
     /// and supplies itself (see `crate::families::exceptions`).
     ///
-    /// Read-only introspection (no state is changed); the caller is the
-    /// Milestone-1 stacktrace builder. Only the module-local part of each
-    /// continuation is reported: a caller frame reached through a cross-module
-    /// `call_ext` carries a `(func, pc)` in *another* module context, so it is
-    /// reported here without that context and must not be resolved against the
-    /// running module (a documented Milestone-1 limit of the symbolic trace, see
-    /// [`crate::machine`]).
-    pub fn resumption_addresses(&self) -> Vec<(u32, u32)> {
+    /// Read-only introspection (no state is changed); the callers are the
+    /// Milestone-1 stacktrace builder and the module-context-aware
+    /// [`Machine::current_stacktrace`](crate::machine::Machine::current_stacktrace).
+    pub fn resumption_contexts(&self) -> Vec<(u32, u32, u32)> {
         self.frames
             .iter()
             .rev()
             .filter_map(|frame| match frame.continuation {
-                Continuation::Address { func, pc, .. } => Some((func, pc)),
+                Continuation::Address { func, pc, context } => Some((func, pc, context)),
                 Continuation::Halt => None,
             })
+            .collect()
+    }
+
+    /// The `(function index, code offset)` of every live call frame suspended in a
+    /// call, innermost frame first — [`Machine::resumption_contexts`] with the module
+    /// context dropped.
+    ///
+    /// Resolving every address this returns against a **single** module is only
+    /// correct when they all belong to it; a caller looking at a chain that may have
+    /// crossed a cross-module `call_ext` must use [`Machine::resumption_contexts`]
+    /// and resolve each frame in the module its context names.
+    pub fn resumption_addresses(&self) -> Vec<(u32, u32)> {
+        self.resumption_contexts()
+            .into_iter()
+            .map(|(func, pc, _context)| (func, pc))
             .collect()
     }
 }
@@ -400,6 +448,58 @@ mod tests {
         let mut ctx = Probe(0);
         machine.ensure_heap(16, 3, &mut ctx).unwrap();
         assert_eq!(ctx.0, 3 + 8 + 2);
+    }
+
+    #[test]
+    fn ensure_heap_hands_over_the_fr_file_at_the_full_root_door() {
+        // The full-root door carries the FR file (which the narrow `ensure_heap`
+        // cannot): a context that overrides it sees the whole FR file, and a write
+        // through `roots.fr` lands back in the machine. The narrow method must never
+        // be reached, or the FR file would be lost.
+        struct FrProbe {
+            fr_len: usize,
+            saw_fr: bool,
+        }
+        impl ExecutionContext for FrProbe {
+            fn call_bif(&mut self, _m: &str, _f: &str, _a: u32, _args: &[Eterm]) -> Result<Eterm> {
+                Err(beam_common::BeamError::BadArg)
+            }
+            fn ensure_heap(
+                &mut self,
+                _need: u32,
+                _live: u32,
+                _x_regs: &mut [Eterm],
+                _stack: &mut [Eterm],
+            ) -> Result<()> {
+                panic!("the machine must use the full-root door, not the narrow one");
+            }
+            fn ensure_heap_full(
+                &mut self,
+                _need: u32,
+                roots: crate::context::RootSet<'_>,
+            ) -> Result<()> {
+                self.fr_len = roots.fr.len();
+                if let Some(slot) = roots.fr.get_mut(1) {
+                    *slot = Eterm::from_raw(0xFEED);
+                }
+                self.saw_fr = true;
+                Ok(())
+            }
+        }
+        let mut machine = Machine::new();
+        machine.set_fr(1, Eterm::from_raw(0x0001)).unwrap();
+        let mut ctx = FrProbe {
+            fr_len: 0,
+            saw_fr: false,
+        };
+        machine.ensure_heap(16, 3, &mut ctx).unwrap();
+        assert!(ctx.saw_fr, "the full-root door was used");
+        assert_eq!(ctx.fr_len, crate::machine::MAX_FLOAT_REGISTER as usize);
+        assert_eq!(
+            machine.get_fr(1),
+            Some(Eterm::from_raw(0xFEED)),
+            "a write through the FR root landed back in the machine"
+        );
     }
 
     #[test]

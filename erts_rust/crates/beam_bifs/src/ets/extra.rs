@@ -81,14 +81,23 @@
 //! * **`ets:slot/2`** — returns the objects of an internal tree node / hash bucket
 //!   slot; the contract pins the *interior layout*, which the crate contract
 //!   explicitly leaves open (§2), so the value cannot be reproduced faithfully.
-//! * **`ets:internal_request_all/0`** — an underscore-internal helper of the C
-//!   implementation (it answers this scheduler's *fan-in reference*);
-//!   implementation-specific, and not part of the documented `ets` surface.
+//! * **`ets:internal_request_all/0`** — the helper `ets.erl`'s own `ets:all/0`
+//!   drives: it mints a fresh `make_ref()` and has **each scheduler** reply
+//!   `{Ref, Tables}`, so `ets.erl`'s `receive_all/3` waits for
+//!   `system_info(schedulers)` messages. A `BifFn` can neither mint a reference nor
+//!   send messages, and a single reply would leave that `receive` **blocked
+//!   forever** — so it stays a typed gap. (`ets:all/0` itself is served directly in
+//!   [`super::adopt`].)
 //! * **`ets:setopts/2`'s `{protection, _}` sub-option** — `beam_ets::Table` has no
 //!   access setter, so that single sub-option is the typed `unsupported_bif` gap.
 //!
 //! `ets:slot/2` and `ets:internal_request_all/0` are registered through the
 //! `RuntimeHooks` stub in `src/runtime/other.rs`.
+//!
+//! `ets:fun2ms/1` and `ets:repair_continuation/2` are **not** `bif.tab` entries:
+//! they are pure `stdlib/src/ets.erl` functions (a `parse_transform` helper and a
+//! continuation-tuple rewriter), so the registry can never dispatch them and they
+//! stay unregistered.
 //!
 //! Everything registered here is pinned against the system `erl` (OTP 29.1.1 /
 //! erts-17.1) — see the in-module tests below and `tests/ets_extra.rs`.

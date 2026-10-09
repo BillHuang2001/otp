@@ -279,6 +279,12 @@ impl ProcessRunner for RuntimeRunner<'_> {
             (outcome, used, exhausted)
         };
 
+        // Credit every reduction unit this slice charged to the node-global counter behind
+        // `erlang:statistics(reductions)` (see `Runtime::note_reductions`). The charge site is
+        // the slice's `BudgetProbe`, so this is exactly the work the machine did — the same
+        // `used` the exhausted branch below records on the process.
+        self.runtime.note_reductions(u64::from(used));
+
         // The **float-register safety valve**, checked while the machine is no longer
         // running: `Machine::fr` holds *terms* at Milestone 1 and is not part of the root set
         // `ensure_heap` hands out, so a heap move while a float register is live could

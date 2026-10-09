@@ -66,11 +66,16 @@
 //!   [`NifHost::consume_timeslice`](crate::nif::host::NifHost::consume_timeslice) and, with no host
 //!   support, returns the C's **"not reached"** answer `0` — i.e. "the process need not yield".
 //!   It never fabricates a `1` (which would force a yield that never happened).
-//! * **`enif_system_info` counts.** `scheduler_threads` is reported as `1` (the runtime is
-//!   single-threaded) and `async_threads` as `0`, exactly as the sibling `driver_system_info` in
-//!   this crate reports them — the C implements `enif_system_info` *as* `driver_system_info`, so
-//!   the two must agree. `otp_release` is the frozen workspace claim (`"30"`), which differs from
-//!   the installed oracle's `"29"`; `erts_version` (`"17.1"`) matches the oracle.
+//! * **`enif_system_info` values.** The runtime-dependent fields prefer the host's
+//!   [`NifHost::system_info`](crate::nif::host::NifHost::system_info) block — reached through the
+//!   current-call host stack, because the C entry point takes no env — and fall back to the
+//!   built-ins when no host hook answers. With no host, `scheduler_threads` is reported as `1` (the
+//!   runtime is single-threaded) and `async_threads` as `0`, exactly as the sibling
+//!   `driver_system_info` in this crate reports them — the C implements `enif_system_info` *as*
+//!   `driver_system_info`, so the two must agree. The built-in `otp_release` is the frozen workspace
+//!   claim (`"30"`), which differs from the installed oracle's `"29"`; `erts_version` (`"17.1"`)
+//!   matches the oracle. `beam_rt`'s `NifHostImpl` must supply the emulator's real values for the
+//!   oracle to be matched.
 //! * **`enif_make_unique_integer`** honours both SDK flag bits over a crate-internal monotonic
 //!   counter when the host supplies no `unique_integer` hook. The counter's *base* is reproduced
 //!   from the oracle's observed first values; the values are real, distinct, and monotone per flag
@@ -311,9 +316,26 @@ static OTP_RELEASE_STR: &[u8] = b"30\0";
 
 /// `void enif_system_info(ErlNifSysInfo *sip, size_t si_size);`
 ///
-/// The C implements this **as** `driver_system_info`, so the values and the partial-fill contract
-/// are the same as the sibling driver function's: a field group is written only when its last field
-/// lies fully inside `si_size`.
+/// The C implements this **as** `driver_system_info`, so the partial-fill contract is the same: a
+/// field group is written only when its last field lies fully inside `si_size` (the groups are
+/// delimited by `smp_support`, `scheduler_threads`, `nif_minor_version`, `dirty_scheduler_support`).
+///
+/// # Host values (the runtime's real system information)
+///
+/// The C reads emulator globals. There is no env argument here, so the runtime's values are reached
+/// through the host of the current NIF call via the same thread-local mechanism `enif_alloc_env`
+/// uses ([`crate::nif::host::with_current_host`]). When a host is reachable **and** its
+/// [`NifHost::system_info`] hook answers, the **runtime-dependent** fields (`erts_version`,
+/// `otp_release`, `thread_support`, `smp_support`, `async_threads`, `scheduler_threads`,
+/// `dirty_scheduler_support`) come from it; otherwise the built-in values are used (nothing
+/// regresses). The four **ABI-version** fields (`driver_major_version`, `driver_minor_version`,
+/// `nif_major_version`, `nif_minor_version`) are always this crate's compile-time constants — the C
+/// hard-codes them in `driver_system_info` too, so they are not runtime state.
+///
+/// **`beam_rt`'s `NifHostImpl` must supply the emulator's real values** (`erts_version`,
+/// `otp_release`, `scheduler_threads`, `dirty_scheduler_support`, plus `thread_support`/
+/// `smp_support`/`async_threads`) for `enif_system_info` to match the oracle. With no hook, the
+/// built-ins are reported: `scheduler_threads = 1` (single-threaded) and `async_threads = 0`.
 ///
 /// **Documented deviation:** the C calls `erts_exit(ERTS_ERROR_EXIT, …)` for a null `sip` or an
 /// `si_size` shorter than the first field group; this returns without writing, because a library
@@ -327,6 +349,10 @@ pub unsafe extern "C" fn enif_system_info(sip: *mut ErlNifSysInfo, si_size: size
     if sip.is_null() {
         return;
     }
+    // The host of the current NIF call, if any. `with_current_host` answers `None` when this thread
+    // is not inside a NIF call (e.g. a direct call from a test), in which case the built-ins below
+    // are reported.
+    let host = crate::nif::host::with_current_host(|host| host.system_info()).flatten();
     let int_size = core::mem::size_of::<c_int>();
     let smp_support_end = core::mem::offset_of!(ErlNifSysInfo, smp_support) + int_size;
     let scheduler_threads_end = core::mem::offset_of!(ErlNifSysInfo, scheduler_threads) + int_size;
@@ -334,34 +360,62 @@ pub unsafe extern "C" fn enif_system_info(sip: *mut ErlNifSysInfo, si_size: size
     let dirty_end = core::mem::offset_of!(ErlNifSysInfo, dirty_scheduler_support) + int_size;
 
     if si_size >= smp_support_end {
+        // The version *strings* and the two support flags prefer the host; the two driver-ABI
+        // version fields stay this crate's constants.
+        let (erts_version, otp_release, thread_support, smp_support) = match host {
+            Some(info) => (
+                info.erts_version,
+                info.otp_release,
+                info.thread_support,
+                info.smp_support,
+            ),
+            None => (
+                ERTS_VERSION_STR.as_ptr() as *mut c_char,
+                OTP_RELEASE_STR.as_ptr() as *mut c_char,
+                1,
+                1,
+            ),
+        };
         // SAFETY: the caller guarantees `sip` is writable for `si_size >= 32` bytes, covering
         // exactly these six fields (offsets 0..32).
         unsafe {
             (*sip).driver_major_version = crate::ERL_DRV_EXTENDED_MAJOR_VERSION;
             (*sip).driver_minor_version = crate::ERL_DRV_EXTENDED_MINOR_VERSION;
-            (*sip).erts_version = ERTS_VERSION_STR.as_ptr() as *mut c_char;
-            (*sip).otp_release = OTP_RELEASE_STR.as_ptr() as *mut c_char;
-            (*sip).thread_support = 1;
-            (*sip).smp_support = 1;
+            (*sip).erts_version = erts_version;
+            (*sip).otp_release = otp_release;
+            (*sip).thread_support = thread_support;
+            (*sip).smp_support = smp_support;
         }
     }
     if si_size >= scheduler_threads_end {
+        let (async_threads, scheduler_threads) = match host {
+            Some(info) => (info.async_threads, info.scheduler_threads),
+            None => (0, 1),
+        };
         // SAFETY: `si_size` covers `async_threads`/`scheduler_threads` (offsets 32..40).
         unsafe {
-            (*sip).async_threads = 0;
-            (*sip).scheduler_threads = 1;
+            (*sip).async_threads = async_threads;
+            (*sip).scheduler_threads = scheduler_threads;
         }
     }
     if si_size >= nif_minor_version_end {
-        // SAFETY: `si_size` covers `nif_major_version`/`nif_minor_version` (offsets 40..48).
+        // SAFETY: `si_size` covers `nif_major_version`/`nif_minor_version` (offsets 40..48). These
+        // are the NIF-ABI constants, not runtime state.
         unsafe {
             (*sip).nif_major_version = crate::ERL_NIF_MAJOR_VERSION;
             (*sip).nif_minor_version = crate::ERL_NIF_MINOR_VERSION;
         }
     }
     if si_size >= dirty_end {
+        // Built-in fallback: the sibling `driver_system_info` in this crate reports `0` too (the C
+        // hard-codes `1` at `io.c:7494-7497`), so the two Rust entry points keep agreeing with one
+        // another until a host supplies the real value.
+        let dirty = match host {
+            Some(info) => info.dirty_scheduler_support,
+            None => 0,
+        };
         // SAFETY: `si_size` covers `dirty_scheduler_support` (offset 48..52).
-        unsafe { (*sip).dirty_scheduler_support = 0 };
+        unsafe { (*sip).dirty_scheduler_support = dirty };
     }
 }
 

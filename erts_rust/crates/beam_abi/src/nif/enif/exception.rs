@@ -26,6 +26,10 @@
 //! The pending exception lives on [`NifEnv`] (the C runtime's `enif_environment_t` exception slot);
 //! a raise records the reason there and the loader turns a pending exception into
 //! `NifCallError::Raised`.
+//!
+//! [`enif_clear_env`] does **not** touch that slot: the C frees the env's temporary objects and
+//! rewinds its heap top but leaves the `exception_thrown` flag alone (`erl_nif.c:700-723`), so a
+//! raised reason survives it. See the function's own docs.
 
 use super::*;
 
@@ -106,12 +110,28 @@ pub unsafe extern "C" fn enif_has_pending_exception(
 
 /// `void enif_clear_env(ErlNifEnv* env);`
 ///
+/// Frees the environment's temporary objects and resets its heap top. In the C
+/// (`erts/emulator/beam/erl_nif.c:700-723`) that is *all* it does: it calls `free_tmp_objs`, drops
+/// the message buffer and rewinds `hp`/`hp_end` to the heap top — and it **deliberately leaves the
+/// `exception_thrown` flag alone** (only env setup clears that). This implementation follows suit:
+/// a raised reason **survives** `enif_clear_env`, and [`enif_has_pending_exception`] still reports
+/// it afterwards.
+///
+/// # What remains a no-op here (honest scope)
+///
+/// A [`NifEnv`] borrows the host's heap for its lifetime and owns no temporary objects of its own:
+/// there is no message buffer, no off-heap MSO list and no per-call allocation arena behind it (a
+/// *message* env is the host's, minted through
+/// [`NifHost::alloc_env`](crate::nif::host::NifHost::alloc_env)). So there is nothing to free
+/// and no heap top to rewind, and the only observable effect is that nothing changes. The pointer
+/// is still validated so a null handle is handled as the documented "no env" case.
+///
 /// # Safety
 ///
 /// `env` must be null or a live env.
 #[no_mangle]
 pub unsafe extern "C" fn enif_clear_env(env: *mut crate::nif::types::ErlNifEnv) {
-    if let Some(e) = unsafe { env_mut(env) } {
-        e.clear();
-    }
+    // Recover (and thereby validate) the env; nothing is freed or reset, and — matching the C —
+    // the pending-exception flag is left untouched.
+    let _env = unsafe { env_mut(env) };
 }

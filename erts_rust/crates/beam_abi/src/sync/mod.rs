@@ -819,6 +819,10 @@ pub fn thread_equal_tids(a: Tid, b: Tid) -> bool {
 ///
 /// Reproduces `erl_drv_thread_exit` (`erl_drv_thread.c:704-713`) minus its "only from a thread
 /// created by this interface" check, which the C enforces with `erts_exit`.
+// `resp` is the opaque response value `pthread_exit` merely forwards to a joiner; it is never
+// dereferenced (or even read) here, so the pointer-validity contract stays the caller's, exactly as
+// in the C. An `unsafe fn` would break the C-mirroring public API for no safety gain.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn thread_exit(resp: *mut c_void) -> ! {
     // SAFETY: `pthread_exit` runs the platform's thread-exit sequence for the calling thread; it
     // has no other precondition and does not return.

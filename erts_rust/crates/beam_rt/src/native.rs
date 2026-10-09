@@ -172,11 +172,13 @@ impl RuntimeContext<'_> {
             ("code", "lib_dir", 0) => Some(self.code_lib_dir_0()),
             ("code", "lib_dir", 1) => Some(self.code_lib_dir_1(args)),
             ("code", "root_dir", 0) => Some(self.code_root_dir()),
+            ("code", "get_mode", 0) => Some(self.code_get_mode()),
             ("application", "get_env", 1) => Some(self.application_get_env_1()),
             ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
             ("application", "get_env", 3) => Some(self.application_get_env_3(args)),
             ("application", "get_all_env", 1) => Some(self.application_get_all_env_1(args)),
             ("application", "get_key", 2) => Some(self.application_get_key_2(args)),
+            ("application", "get_application", 0) => Some(self.application_get_application_0()),
             ("application", "loaded_applications", 0) => {
                 Some(self.application_loaded_applications())
             }

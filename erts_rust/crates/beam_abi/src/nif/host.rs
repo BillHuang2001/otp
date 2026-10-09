@@ -31,7 +31,13 @@
 //! [`NifEnv`] is the concrete per-call environment behind the C-facing opaque `*mut ErlNifEnv`
 //! (`struct enif_environment_t`, deliberately opaque in [`super::types`]): it borrows the host for
 //! its lifetime and carries the pending-exception slot that mirrors the C
-//! `enif_raise_exception` / `enif_clear_env` semantics.
+//! `enif_raise_exception` semantics.
+//!
+//! Besides the exception slot, [`NifEnv`] carries a small **per-call record of the atoms interned
+//! through it** ([`NifEnv::record_atom`]). It exists because the real runtime commits a freshly
+//! interned atom lazily, so [`NifHost::atom_name`] (which sees only the *committed* table) misses an
+//! atom interned earlier in the *same* call — the record restores that visibility for
+//! `enif_get_atom`/`enif_make_existing_atom`. See [`NifEnv::record_atom`] for the full account.
 //!
 //! `unsafe` is confined to [`NifEnv::host`] and [`NifEnv::from_opaque`], each documented with a
 //! `# Safety` section / `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
@@ -65,18 +71,28 @@ pub trait NifHost {
     }
 
     /// ETF encode (host-provided; `beam_abi` must NOT depend on `beam_codec`).
+    ///
+    /// **Owner: `beam_rt`'s `NifHostImpl`** — implement it with `beam_codec`'s encoder. With no
+    /// hook, `enif_term_to_binary` answers the C's failure code `0` and writes nothing (never a
+    /// wrong binary).
     fn term_to_binary(&mut self, term: Eterm) -> Option<Vec<u8>> {
         let _ = term;
         None
     }
 
     /// ETF decode (host-provided).
+    ///
+    /// **Owner: `beam_rt`'s `NifHostImpl`** — implement it with `beam_codec`'s decoder. With no
+    /// hook, `enif_binary_to_term` answers `0` and writes nothing.
     fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
         let _ = bytes;
         None
     }
 
     /// `erlang:make_ref/0` (default: unsupported).
+    ///
+    /// **Owner: `beam_rt`'s `NifHostImpl`** — it must mint a fresh internal reference term. With no
+    /// hook, `enif_make_ref` raises `badarg` (never a fabricated reference).
     fn make_ref(&mut self) -> Option<Eterm> {
         None
     }
@@ -91,6 +107,13 @@ pub trait NifHost {
     // behind it exists. Each names the C function it backs.
 
     /// Look up an atom **without creating it** (C `enif_make_existing_atom`); default: unsupported.
+    ///
+    /// **Owner: `beam_rt`'s `NifHostImpl`.** It must consult the committed atom table *and any
+    /// pending interner* — the C's `erts_atom_get` sees an atom interned moments earlier in the same
+    /// call. [`NifEnv`]'s per-call record closes that gap on the `beam_abi` side (it is consulted
+    /// first, and only a miss falls through to this hook). With no hook,
+    /// `enif_make_existing_atom(_len)` answers `0` and leaves `*atom` untouched — it never
+    /// fabricates an atom.
     fn existing_atom(&mut self, name: &str) -> Option<Eterm> {
         let _ = name;
         None
@@ -103,6 +126,15 @@ pub trait NifHost {
 
     /// The emulator's information block (C `enif_system_info`, which fills an `ErlNifSysInfo`,
     /// i.e. an [`ErlDrvSysInfo`]); default: unsupported.
+    ///
+    /// **Owner: `beam_rt`'s `NifHostImpl`.** For `enif_system_info` to match the oracle it must
+    /// return the emulator's *real* values: `erts_version` and `otp_release` (pointing at
+    /// NUL-terminated strings that outlive the call), `scheduler_threads`, and
+    /// `dirty_scheduler_support` — plus `thread_support`/`smp_support`/`async_threads`. The
+    /// ABI-version fields (`driver_major_version`, `driver_minor_version`, `nif_major_version`,
+    /// `nif_minor_version`) are this crate's compile-time constants and are ignored here — the C
+    /// hard-codes them in `driver_system_info` too. With no hook, `enif_system_info` reports the
+    /// built-in values.
     fn system_info(&mut self) -> Option<ErlDrvSysInfo> {
         None
     }
@@ -155,6 +187,9 @@ pub trait NifHost {
 
     /// Resolve the **registered name** `name` to a pid (C `enif_whereis_pid`); default:
     /// unsupported.
+    ///
+    /// **Owner: `beam_rt`'s `NifHostImpl`** — it must consult its process registry and return an
+    /// internal pid term. With no hook, `enif_whereis_pid` answers `0` and writes nothing.
     fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm> {
         let _ = name;
         None
@@ -320,10 +355,19 @@ pub(crate) fn with_current_host<R>(f: impl FnOnce(&mut dyn NifHost) -> R) -> Opt
     Some(f(host))
 }
 
+/// The maximum number of atoms one [`NifEnv`] records for the duration of a NIF call.
+///
+/// The record makes an atom interned earlier in the *same* call visible to `enif_get_atom` /
+/// `enif_make_existing_atom` (see [`NifEnv::record_atom`]). It is deliberately small — a NIF
+/// interns a handful of atoms per call — and a call that interns more simply stops recording and
+/// falls back to the host's committed table (never a wrong answer; at worst the pre-record answer).
+const MAX_RECORDED_ATOMS: usize = 256;
+
 /// The concrete per-call NIF environment behind the C-facing opaque `*mut ErlNifEnv`.
 ///
 /// Holds a raw pointer to the host (so the environment itself is lifetime-free and can be recovered
-/// from the opaque C pointer by [`NifEnv::from_opaque`]) plus the pending-exception slot.
+/// from the opaque C pointer by [`NifEnv::from_opaque`]) plus the pending-exception slot and the
+/// per-call record of atoms interned through it.
 pub struct NifEnv {
     /// The host, borrowed for the lifetime of this environment.
     ///
@@ -337,6 +381,11 @@ pub struct NifEnv {
     token: u64,
     /// The exception reason recorded by a raise, if any (the C `enif_raise_exception` slot).
     pending_exception: Option<Eterm>,
+    /// Atoms interned **through this env** so far in the current call, most recent last; keyed by
+    /// the raw term word. Consulted by the atom accessors *before* [`NifHost::atom_name`] /
+    /// [`NifHost::existing_atom`] (see [`NifEnv::record_atom`] for why). It lives and dies with the
+    /// env, so it never leaks across NIF calls.
+    recorded_atoms: Vec<(usize, String)>,
 }
 
 impl NifEnv {
@@ -363,6 +412,7 @@ impl NifEnv {
             host,
             token,
             pending_exception: None,
+            recorded_atoms: Vec::new(),
         }
     }
 
@@ -410,7 +460,64 @@ impl NifEnv {
         self.pending_exception = Some(reason);
     }
 
-    /// Clear the pending exception (C `enif_clear_env` semantics).
+    /// Record that `atom` was interned under `name` through this env during the current call.
+    ///
+    /// Called by the four atom-constructing entry points — `enif_make_atom`, `enif_make_atom_len`,
+    /// `enif_make_new_atom`, `enif_make_new_atom_len` (see `nif::enif::make`). A term word already
+    /// recorded is not recorded twice, and the record stops growing past [`MAX_RECORDED_ATOMS`].
+    /// It is scoped to the env, so it can never leak into another NIF call.
+    ///
+    /// # Why this is needed (the deeper cause)
+    ///
+    /// The real runtime does **not** publish a freshly interned atom to the global atom table at
+    /// once: `enif_make_atom` goes through `erts_atom_put`, which for a late-index atom defers the
+    /// commit via a **pending interner** that is only flushed later in the call. Consequently the
+    /// host's reverse lookup ([`NifHost::atom_name`], backed by the *committed* table only) does not
+    /// see an atom interned moments earlier in the same call, and `enif_get_atom` would answer `0`
+    /// where the oracle answers the name. This per-call record supplies the missing visibility on
+    /// the `beam_abi` side; a host whose [`NifHost::atom_name`]/[`NifHost::existing_atom`] consult
+    /// its own pending interner resolves the same divergence without it. The two mechanisms are
+    /// complementary: the record is consulted first, and only a miss falls through to the host.
+    pub(crate) fn record_atom(&mut self, atom: Eterm, name: &str) {
+        if self.recorded_atoms.len() >= MAX_RECORDED_ATOMS {
+            return;
+        }
+        if self.recorded_atoms.iter().any(|(raw, _)| *raw == atom.raw()) {
+            return;
+        }
+        self.recorded_atoms.push((atom.raw(), name.to_string()));
+    }
+
+    /// The name `atom` was interned under **through this env** during the current call, if any.
+    ///
+    /// The `enif_get_atom`/`enif_get_atom_length` fast path (see `nif::enif::get`); a miss falls
+    /// back to [`NifHost::atom_name`].
+    pub(crate) fn recorded_atom_name(&self, atom: Eterm) -> Option<&str> {
+        self.recorded_atoms
+            .iter()
+            .find(|(raw, _)| *raw == atom.raw())
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// The atom interned **through this env** under `name` during the current call, if any.
+    ///
+    /// The lookup-only counterpart of [`NifEnv::record_atom`]: the `enif_make_existing_atom*`
+    /// constructors (see `nif::enif::make`) consult it before [`NifHost::existing_atom`], so an atom
+    /// interned earlier in the call is found **without creating one**.
+    pub(crate) fn recorded_atom(&self, name: &str) -> Option<Eterm> {
+        self.recorded_atoms
+            .iter()
+            .find(|(_, recorded)| recorded == name)
+            .map(|(raw, _)| Eterm::from_raw(*raw))
+    }
+
+    /// Reset the pending-exception slot to "none" (a test/runtime helper).
+    ///
+    /// **This is *not* the C `enif_clear_env`.** In the C the two are unrelated: `enif_clear_env`
+    /// frees the env's temporary objects and resets its heap top, and it **deliberately leaves the
+    /// `exception_thrown` flag alone** (only env setup clears that — `erl_nif.c:700-723`). This
+    /// helper only exists so a caller can reset the slot explicitly; the C-facing `enif_clear_env`
+    /// does not call it (see `nif::enif::exception`).
     pub fn clear(&mut self) {
         self.pending_exception = None;
     }
@@ -433,6 +540,8 @@ mod tests {
     use super::*;
     use beam_term::atom::{Atom, AtomTable};
     use beam_term::prelude::{atom_val, is_atom, make_atom, make_small};
+
+    use crate::nif::enif::{enif_clear_env, enif_has_pending_exception, enif_raise_exception};
 
     /// A minimal host: a bump heap plus an atom table.
     struct TestHost {
@@ -491,15 +600,81 @@ mod tests {
     }
 
     #[test]
-    fn clear_empties_the_exception_slot() {
+    fn clear_helper_empties_the_exception_slot_but_is_not_enif_clear_env() {
         let mut host = TestHost::new();
         let reason = host.intern_atom("boom").expect("interns unconditionally");
         let mut env = NifEnv::new(&mut host);
         assert_eq!(env.pending_exception(), None);
         env.set_exception(reason);
         assert_eq!(env.pending_exception(), Some(reason));
+        // The `clear` helper resets the slot...
         env.clear();
         assert_eq!(env.pending_exception(), None);
+        // ...but the C-facing `enif_clear_env` must NOT (it does not touch the flag at all).
+        env.set_exception(reason);
+        // SAFETY: `env` is live for the whole test.
+        unsafe { enif_clear_env(env.as_ptr()) };
+        assert_eq!(
+            env.pending_exception(),
+            Some(reason),
+            "enif_clear_env must leave the pending exception set (erl_nif.c:700-723)"
+        );
+    }
+
+    #[test]
+    fn enif_clear_env_survives_a_raise_and_has_pending_still_reports_it() {
+        let mut host = TestHost::new();
+        let reason = host.intern_atom("kaboom").expect("interns unconditionally");
+        let mut env = NifEnv::new(&mut host);
+        let mut got = ERL_NIF_TERM::default();
+        // SAFETY: `env` is live; `got` is a live local and `enif_*` take a live env.
+        unsafe {
+            assert_eq!(enif_has_pending_exception(env.as_ptr(), &mut got), 0);
+            enif_raise_exception(env.as_ptr(), crate::nif::term::nif_from_eterm(reason));
+            assert_eq!(enif_has_pending_exception(env.as_ptr(), &mut got), 1);
+            enif_clear_env(env.as_ptr());
+            assert_eq!(
+                enif_has_pending_exception(env.as_ptr(), &mut got),
+                1,
+                "a raise survives enif_clear_env"
+            );
+            assert_eq!(crate::nif::term::eterm_from_nif(got), reason);
+        }
+    }
+
+    #[test]
+    fn the_atom_record_resolves_a_just_interned_atom() {
+        let mut host = TestHost::new();
+        let atom = host.intern_atom("just_now").expect("interns unconditionally");
+        let mut env = NifEnv::new(&mut host);
+        assert_eq!(env.recorded_atom_name(atom), None, "nothing recorded yet");
+        env.record_atom(atom, "just_now");
+        assert_eq!(env.recorded_atom_name(atom), Some("just_now"));
+        assert_eq!(env.recorded_atom("just_now"), Some(atom));
+        // A different term word is not resolved by the record.
+        assert_eq!(env.recorded_atom_name(make_small(7)), None);
+        assert_eq!(env.recorded_atom("other"), None);
+    }
+
+    #[test]
+    fn the_atom_record_dedupes_and_stops_growing() {
+        let mut host = TestHost::new();
+        let atom = host.intern_atom("dup").expect("interns unconditionally");
+        let mut env = NifEnv::new(&mut host);
+        for _ in 0..(MAX_RECORDED_ATOMS + 32) {
+            env.record_atom(atom, "dup");
+        }
+        assert_eq!(
+            env.recorded_atoms.len(),
+            1,
+            "a repeated term word is recorded once"
+        );
+        // Distinct atoms stop being recorded past the cap; the earlier ones stay resolvable.
+        for i in 0..(MAX_RECORDED_ATOMS as u32 + 8) {
+            env.record_atom(make_atom(Atom::from_raw(i)), "bounded");
+        }
+        assert_eq!(env.recorded_atoms.len(), MAX_RECORDED_ATOMS);
+        assert_eq!(env.recorded_atom_name(atom), Some("dup"));
     }
 
     #[test]

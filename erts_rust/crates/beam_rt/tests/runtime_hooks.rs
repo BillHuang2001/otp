@@ -35,15 +35,21 @@
 //!   atoms `true`/`false` and answers `true`; `dt_restore_tag/1` accepts **only** `true`.
 //! * `erlang:statistics/1` — `timer:tc`, `heart`, `disk_log` and `pool.erl`'s load
 //!   estimator read it. This runtime serves **only** the counters it can measure for real:
-//!   `run_queue` (its own single run queue: `beam_process`'s `Scheduler`) and `wall_clock`
-//!   (the process monotonic clock). Every other valid key stays the honest typed gap, and
-//!   a name that is not a statistics key at all is the oracle's `badarg`.
+//!   `run_queue` (its own single run queue: `beam_process`'s `Scheduler`), `wall_clock`
+//!   (the process monotonic clock), the cumulative counter pairs
+//!   `reductions`/`exact_reductions` and `context_switches`, `io` (the port subsystem's own
+//!   byte counters) and `scheduler_wall_time` (the atom `undefined` — this runtime never
+//!   enables it, exactly as the oracle answers when it is not enabled). Every other valid
+//!   key stays the honest typed gap, and a name that is not a statistics key at all is the
+//!   oracle's `badarg`. `runtime` (CPU time) is a documented gap: this crate is
+//!   `#![deny(unsafe_code)]` and cannot read a CPU clock, and wall-clock time must **not**
+//!   be substituted for it.
 //!
 //! # What is compared, and what is recorded instead
 //!
 //! Every flow below runs the **same** `-eval` program under the built `beam_rt` binary and
 //! under the oracle. The boolean results (`{true,true,true}`, `badarg`, the `badarg` exit
-//! code, and the *shape* of the two statistics values) are compared directly. Two figures
+//! code, and the *shape* of the statistics values) are compared directly. Two figures
 //! read **this runtime's own state** and are asserted on this side, with the oracle's
 //! differing value recorded rather than failed on — the same class as `erlang:processes/0`
 //! and `module_loaded/1`'s boot-set size:
@@ -189,8 +195,34 @@ const EXPR_WALL_CLOCK_MONOTONIC: &str = "\
 {T1,_} = erlang:statistics(wall_clock), {T2,_} = erlang:statistics(wall_clock), \
 io:format(\"~p~n\", [T2 >= T1]), halt(0).";
 
+/// `statistics(reductions)`/`statistics(exact_reductions)`: a 2-tuple of integers, in both
+/// runtimes (the shape only — the figures are this runtime's own).
+const EXPR_REDUCTIONS_SHAPE: &str = "\
+{T,S} = erlang:statistics(reductions), io:format(\"~p~n\", [{is_integer(T), is_integer(S)}]), halt(0).";
+const EXPR_EXACT_REDUCTIONS_SHAPE: &str = "\
+{T,S} = erlang:statistics(exact_reductions), io:format(\"~p~n\", [{is_integer(T), is_integer(S)}]), halt(0).";
+
+/// `statistics(context_switches)`: a 2-tuple whose first element is an integer, in both
+/// runtimes.
+const EXPR_CONTEXT_SWITCHES_SHAPE: &str = "\
+{T,_S} = erlang:statistics(context_switches), io:format(\"~p~n\", [is_integer(T)]), halt(0).";
+
+/// `statistics(io)`: `{{input, InN}, {output, OutN}}` with the two tag atoms fixed and both
+/// figures integers, in both runtimes.
+const EXPR_IO_SHAPE: &str = "\
+{{In, InN}, {Out, OutN}} = erlang:statistics(io), \
+io:format(\"~p~n\", [{In, Out, is_integer(InN), is_integer(OutN)}]), halt(0).";
+
+/// `statistics(scheduler_wall_time)`: the atom `undefined` in both runtimes (neither enables
+/// the scheduler wall-time measurement).
+const EXPR_SCHEDULER_WALL_TIME: &str = "\
+io:format(\"~p~n\", [erlang:statistics(scheduler_wall_time)]), halt(0).";
+
 /// A valid statistics key this runtime cannot measure: the honest typed capability gap.
-const EXPR_STATISTICS_GAP: &str = "erlang:statistics(reductions).";
+///
+/// `runtime` is CPU time; this crate is `#![deny(unsafe_code)]` and no safe Rust API exposes a
+/// CPU clock, so it stays a gap rather than a wall-clock substitute.
+const EXPR_STATISTICS_GAP: &str = "erlang:statistics(runtime).";
 
 /// A name that is not a statistics key at all: the oracle's `badarg` (exit 1).
 const EXPR_STATISTICS_BADARG: &str = "erlang:statistics(atom_count).";
@@ -269,6 +301,19 @@ fn the_served_statistics_shapes_match_the_live_oracle() {
             "{true,true,true,true,true}",
         ),
         ("statistics(wall_clock) monotonic", EXPR_WALL_CLOCK_MONOTONIC, "true"),
+        ("statistics(reductions)", EXPR_REDUCTIONS_SHAPE, "{true,true}"),
+        (
+            "statistics(exact_reductions)",
+            EXPR_EXACT_REDUCTIONS_SHAPE,
+            "{true,true}",
+        ),
+        (
+            "statistics(context_switches)",
+            EXPR_CONTEXT_SWITCHES_SHAPE,
+            "true",
+        ),
+        ("statistics(io)", EXPR_IO_SHAPE, "{input,output,true,true}"),
+        ("statistics(scheduler_wall_time)", EXPR_SCHEDULER_WALL_TIME, "undefined"),
     ];
     let Some(oracle) = support::require_oracle("runtime_hooks") else {
         for (what, expr, expected) in flows {
@@ -335,7 +380,7 @@ fn the_unmeasurable_and_invalid_statistics_keys_are_classified_honestly() {
         ours.err
     );
     assert!(
-        ours.err.contains("reductions"),
+        ours.err.contains("runtime"),
         "the gap must name the counter: {}",
         ours.err
     );
@@ -346,12 +391,12 @@ fn the_unmeasurable_and_invalid_statistics_keys_are_classified_honestly() {
         assert!(ours.err.contains("badarg"), "{}", ours.err);
         return;
     };
-    // The oracle **accepts** `reductions` (it has the counter this runtime lacks), so the
+    // The oracle **accepts** `runtime` (it has the counters this runtime lacks), so the
     // two runtimes differ by capability here — recorded, never asserted as agreement.
     let theirs = oracle_eval(&oracle, EXPR_STATISTICS_GAP);
     assert_eq!(theirs.code, 0, "oracle: exit {} — {}", theirs.code, theirs.err);
     eprintln!(
-        "note: statistics(reductions) — this runtime exit 3 (unsupported), oracle {} {:?}",
+        "note: statistics(runtime) — this runtime exit 3 (unsupported), oracle {} {:?}",
         theirs.code, theirs.out
     );
 

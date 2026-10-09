@@ -235,16 +235,53 @@ impl BitBuf {
         }
     }
 
-    /// Appends the little-endian encoding of the low `n_bits` bits of `value`.
+    /// Appends the low `n_bits` bits of the two's-complement integer whose magnitude is
+    /// `magnitude` (`ErtsDigit`s, least significant first) and whose sign is `negative`.
     ///
-    /// Erlang's `little` integer segment emits the least significant byte of the value
-    /// first and then the first `n_bits` bits of that byte sequence, so the value's
-    /// bytes are laid out in reverse and truncated to `n_bits` (`<<255:12/little>>` is
-    /// `<<255,0:4>>`).
-    fn push_bits_le(&mut self, value: u64, n_bits: usize) {
-        let n_bytes = n_bits.div_ceil(8);
-        let little = value.to_le_bytes();
-        self.push_bit_slice(&little[..n_bytes], 0, n_bits);
+    /// `n_bits` may exceed 64: the magnitude is widened to `ceil(n_bits / 64)` words
+    /// (zero-padded) and a negative value is complemented within that width, exactly as
+    /// Erlang truncates the value to `n_bits` in two's complement (`<<-1:2048>>` is 2048
+    /// one-bits, `<<300:8>>` is `<<44>>`, `<<0:2048>>` is 256 zero bytes).
+    ///
+    /// A **big-endian** segment (`little == false`) emits the words most significant
+    /// first, the top word truncated to its `n_bits % 64` bits. A **little-endian** segment
+    /// emits the least significant byte of the value first and then the first `n_bits` bits
+    /// of that byte sequence (`<<255:12/little>>` is `<<255,0:4>>`), the inverse of
+    /// [`read_bits_le`].
+    fn push_integer_bits(
+        &mut self,
+        magnitude: &[u64],
+        negative: bool,
+        n_bits: usize,
+        little: bool,
+    ) {
+        let words_count = n_bits.div_ceil(64);
+        let mut words = vec![0u64; words_count];
+        let copied = magnitude.len().min(words_count);
+        words[..copied].copy_from_slice(&magnitude[..copied]);
+        if negative {
+            // Two's complement within `words_count` words: invert every word, then add one,
+            // propagating the carry. (`words_count >= 1` because `n_bits > 0` here.)
+            let mut carry = true;
+            for word in words.iter_mut() {
+                let (value, overflow) = (!*word).overflowing_add(u64::from(carry));
+                *word = value;
+                carry = overflow;
+            }
+        }
+        let top_bits = n_bits - 64 * (words_count - 1);
+        if little {
+            let mut bytes = Vec::with_capacity(words_count * 8);
+            for word in &words {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            self.push_bit_slice(&bytes, 0, n_bits);
+        } else {
+            self.push_bits(words[words_count - 1] & mask_bits(top_bits), top_bits);
+            for index in (0..words_count - 1).rev() {
+                self.push_bits(words[index], 64);
+            }
+        }
     }
 
     /// Appends one byte (eight bits, most significant first).
@@ -355,7 +392,7 @@ impl Evaluator<'_, '_> {
     /// Evaluates `expr` in `env`.
     fn expr(&mut self, expr: &Expr, env: &mut Env) -> EResult<Eterm> {
         match expr {
-            Expr::Int(value) => self.small(*value),
+            Expr::Int(value) => self.integer(*value),
             Expr::Float(value) => Ok(heap!(terms::make_float(self.ctx, *value))),
             Expr::Atom(name) => Ok(self.atom(name)),
             Expr::Str(text) => self.string(text),
@@ -472,12 +509,15 @@ impl Evaluator<'_, '_> {
     /// Materializes accumulated bits: a byte-aligned result is a **binary**, a
     /// non-byte-aligned one a **bitstring**.
     ///
-    /// A byte-aligned binary goes on the engine arena ([`terms::make_heap_binary`]); a
-    /// non-byte-aligned bitstring is written by [`beam_codec::term::make_bitstring`] on
-    /// the runtime's long-lived [`eval_heap`](crate::context::RuntimeContext::eval_heap).
-    /// Both are pointer-stable, so the term stays valid for the runtime's lifetime.
+    /// A small byte-aligned binary goes on the engine arena
+    /// ([`terms::make_heap_binary`], which is limited to `ERL_ONHEAP_BINARY_LIMIT` — 64 —
+    /// bytes); anything else — a non-byte-aligned bitstring, or a payload past that limit
+    /// (e.g. `<<0:2048>>`) — is written by [`beam_codec::term::make_bitstring`] on the
+    /// runtime's long-lived [`eval_heap`](crate::context::RuntimeContext::eval_heap),
+    /// which has no size limit. Both are pointer-stable, so the term stays valid for the
+    /// runtime's lifetime.
     fn materialize_bits(&mut self, buf: &BitBuf) -> EResult<Eterm> {
-        if buf.bits % 8 == 0 {
+        if buf.bits % 8 == 0 && buf.bytes.len() <= 64 {
             Ok(heap!(terms::make_heap_binary(self.ctx, &buf.bytes)))
         } else {
             let heap = self.ctx.eval_heap();
@@ -593,6 +633,12 @@ impl Evaluator<'_, '_> {
     }
 
     /// A numeric segment: `Value[:Size][/integer-…]`.
+    ///
+    /// An integer of **any** width is accepted — a small int or an exact bignum — so
+    /// `<<0:2048>>` is 256 zero bytes and `<<(1 bsl 70):8>>` is `<<0>>`. The value is
+    /// truncated to the segment's bit width exactly as the C's `erts_new_binary`/
+    /// `bs_put_integer` do: two's complement, low `bits` first (`<<-1:2048>>` is 2048
+    /// one-bits, `<<300:8>>` is `<<44>>`).
     fn push_integer_segment(
         &mut self,
         segment: &Seg,
@@ -600,10 +646,7 @@ impl Evaluator<'_, '_> {
         env: &mut Env,
         out: &mut BitBuf,
     ) -> EResult<()> {
-        if !is_small(value) {
-            return Err(self.raise(ExceptionClass::Error, "badarg"));
-        }
-        let number = signed_value(value);
+        let (negative, magnitude) = self.integer_magnitude(value)?;
         let bits = match self.segment_size_bits(segment, env, 1)? {
             Some(bits) => bits,
             None => 8,
@@ -612,26 +655,12 @@ impl Evaluator<'_, '_> {
         if bits == 0 {
             return Ok(());
         }
-        if bits > 64 {
-            // A segment wider than a machine word needs a bignum encoder (Stage 2):
-            // a documented Milestone-1 capability gap.
-            return Err(Flow::Fatal(error::unsupported(
-                "an integer binary segment wider than 64 bits",
-            )));
-        }
-        // Erlang truncates the value to `bits` (two's complement), so `<<-1:8>>` is
-        // `<<255>>` and `<<300:8>>` is `<<44>>` — there is no range error here.
-        let mask = if bits == 64 {
-            u64::MAX
-        } else {
-            (1u64 << bits) - 1
-        };
-        let low = (number as u64) & mask;
-        if integer_segment_is_little(segment) {
-            out.push_bits_le(low, bits);
-        } else {
-            out.push_bits(low, bits);
-        }
+        out.push_integer_bits(
+            &magnitude,
+            negative,
+            bits,
+            integer_segment_is_little(segment),
+        );
         Ok(())
     }
 
@@ -1830,6 +1859,43 @@ impl Evaluator<'_, '_> {
         }
     }
 
+    /// An integer literal term: a small int when it fits, an **exact bignum** otherwise.
+    ///
+    /// A value in `i64` range is materialised by [`terms::make_integer`] (a small int or a
+    /// one-limb bignum — `9223372036854775807` is the oracle's `SMALL_BIG_EXT`); a value
+    /// past `i64::MAX`/below `i64::MIN` (reachable only because the parser keeps an `i128`)
+    /// needs at most two `ErtsDigit`s (`u128` magnitude). The literal is exact up to
+    /// `i128`; anything wider was already rejected as a typed capability gap by the parser.
+    fn integer(&mut self, value: i128) -> EResult<Eterm> {
+        if let Ok(value) = i64::try_from(value) {
+            return Ok(heap!(terms::make_integer(self.ctx, value)));
+        }
+        let magnitude = value.unsigned_abs();
+        let digits = [
+            (magnitude & u128::from(u64::MAX)) as u64,
+            (magnitude >> 64) as u64,
+        ];
+        let heap = self.ctx.eval_heap();
+        Ok(heap!(beam_codec::term::make_big(
+            heap,
+            value < 0,
+            trim_digits(&digits)
+        )))
+    }
+
+    /// The sign and magnitude limbs (least significant `ErtsDigit` first) of an integer
+    /// term — a small int or an exact bignum; a non-integer is `error:badarg`.
+    fn integer_magnitude(&mut self, value: Eterm) -> EResult<(bool, Vec<u64>)> {
+        if is_small(value) {
+            let value = signed_value(value);
+            return Ok((value < 0, vec![value.unsigned_abs()]));
+        }
+        match beam_codec::term::big_parts(value) {
+            Ok((negative, digits)) => Ok((negative, digits.to_vec())),
+            Err(_) => Err(self.raise(ExceptionClass::Error, "badarg")),
+        }
+    }
+
     /// A string literal as an Erlang string (a list of character codes).
     fn string(&mut self, text: &str) -> EResult<Eterm> {
         let elements: Vec<Eterm> = text
@@ -1943,7 +2009,7 @@ fn read_bits_be(bytes: &[u8], start: usize, n: usize) -> u64 {
 /// Reads `n` bits (`n <= 64`) starting at bit `start` as a **little-endian** unsigned
 /// integer: the bits are gathered MSB-first into `ceil(n / 8)` bytes, and those bytes
 /// are then interpreted least-significant byte first (the inverse of
-/// [`BitBuf::push_bits_le`]).
+/// [`BitBuf::push_integer_bits`] with `little = true`).
 fn read_bits_le(bytes: &[u8], start: usize, n: usize) -> u64 {
     let n_bytes = n.div_ceil(8);
     let mut gathered = [0u8; 8];
@@ -1967,6 +2033,29 @@ fn sign_extend(value: u64, n: usize) -> i64 {
     }
     let shift = 64 - n;
     ((value << shift) as i64) >> shift
+}
+
+/// The low `n` bits set (`n <= 64`).
+fn mask_bits(n: usize) -> u64 {
+    if n >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << n) - 1
+    }
+}
+
+/// Drops leading zero `ErtsDigit`s (`digits` is least significant first), yielding a
+/// normalised magnitude: `[0, 1]` becomes `[1]`, and `[0, 0]` becomes `[0]`.
+///
+/// Erlang forbids a bignum with a zero-width magnitude (the sign lives in the header), so
+/// the one caller trims before [`beam_codec::term::make_big`]; it never yields an empty
+/// slice (at least the least significant digit is kept).
+fn trim_digits(digits: &[u64]) -> &[u64] {
+    let mut end = digits.len();
+    while end > 1 && digits[end - 1] == 0 {
+        end -= 1;
+    }
+    &digits[..end]
 }
 
 /// The `erlang` BIF implementing a delegatable binary operator.
@@ -2076,6 +2165,97 @@ mod tests {
         int("(1 bsl 70) bsr 70", 1);
         // A bignum `band` a bignum stays exact and fits a small integer here.
         int("((1 bsl 70) bor 3) band 3", 3);
+    }
+
+    /// Evaluates `expr` to an integer and returns its `(negative, magnitude)` limbs
+    /// (`ErtsDigit`s, least significant first).
+    ///
+    /// A bignum is heap-allocated, so it cannot outlive the runtime (see [`run`]); copying
+    /// its limbs out is the representation-independent way to assert one.
+    fn integer_parts(expr: &str) -> (bool, Vec<u64>) {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let value = eval(&mut ctx, expr).unwrap_or_else(|error| panic!("{expr} failed: {error}"));
+        if is_small(value) {
+            let value = signed_value(value);
+            return (value < 0, vec![value.unsigned_abs()]);
+        }
+        let (negative, digits) = beam_codec::term::big_parts(value)
+            .unwrap_or_else(|_| panic!("{expr} is not an integer"));
+        (negative, digits.to_vec())
+    }
+
+    #[test]
+    fn integer_literals_past_the_small_range_materialize_a_bignum() {
+        // 2^63 - 1 is past the 60-bit small range, so the oracle materializes the exact
+        // `SMALL_BIG_EXT` bignum (`<<131,110,8,0,255,255,255,255,255,255,255,127>>`). The
+        // literal path must build it rather than raise `system_limit`.
+        assert_eq!(
+            integer_parts("9223372036854775807"),
+            (false, vec![0x7fff_ffff_ffff_ffff])
+        );
+        // 2^63 does not fit `i64`: the lexer keeps an `i128` so the value stays exact.
+        assert_eq!(
+            integer_parts("9223372036854775808"),
+            (false, vec![0x8000_0000_0000_0000])
+        );
+        // Past 64 bits the magnitude needs two limbs (2^64 + 1).
+        assert_eq!(integer_parts("18446744073709551617"), (false, vec![1, 1]));
+        // A negative literal keeps the sign in the header and the magnitude in the limbs.
+        assert_eq!(
+            integer_parts("(-9223372036854775808)"),
+            (true, vec![0x8000_0000_0000_0000])
+        );
+        // A literal still inside the small range stays a small integer.
+        int("9223372036854775807 - 9223372036854775806", 1);
+    }
+
+    #[test]
+    fn an_integer_literal_past_i128_is_a_typed_gap() {
+        // 10^40 is past `i128` (~1.7e38): the parser reports the honest capability gap
+        // rather than fabricating a truncated value.
+        let error = run("10000000000000000000000000000000000000000").expect_err("past i128");
+        assert!(error::unsupported_reason(&error).is_some(), "{error}");
+    }
+
+    #[test]
+    fn improper_list_literals_keep_their_tail() {
+        // `[1,2|3]` is a *multi-element* improper list; before the parser accepted a tail
+        // after the elements it was a capability gap. The printed term is the oracle's.
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        for (expr, expected) in [
+            ("[1,2|3]", "[1,2|3]"),
+            ("[1|2]", "[1|2]"),
+            ("[1,2,3]", "[1,2,3]"),
+            ("[1,2|[3]]", "[1,2,3]"),
+        ] {
+            let value = eval(&mut ctx, expr).unwrap_or_else(|error| panic!("{expr}: {error}"));
+            let printed = ctx.runtime.format_term(value, None).expect("~p renders it");
+            assert_eq!(printed.trim_end(), expected, "{expr}");
+        }
+    }
+
+    #[test]
+    fn integer_segments_are_arbitrary_precision() {
+        // `<<0:2048>>` is 256 zero bytes — a segment far wider than a machine word (this
+        // used to be a typed capability gap).
+        assert_eq!(bits("<<0:2048>>"), (vec![0u8; 256], 0, 2048));
+        // A negative value is laid out in two's complement within the segment width.
+        assert_eq!(bits("<<-1:2048>>"), (vec![0xffu8; 256], 0, 2048));
+        // A bignum value truncates to the segment width (`<<(1 bsl 70):8>>` is `<<0>>`).
+        assert_eq!(bits("<<(1 bsl 70):8>>"), (vec![0u8], 0, 8));
+        // A 72-bit segment lays the bignum's low 72 bits out big-endian (2^64 is bit 64).
+        assert_eq!(bits("<<(1 bsl 64):72>>"), (vec![1, 0, 0, 0, 0, 0, 0, 0, 0], 0, 72));
+        // … and little-endian reverses the byte order without touching the bit count.
+        assert_eq!(
+            bits("<<(1 bsl 64):72/little>>"),
+            (vec![0, 0, 0, 0, 0, 0, 0, 0, 1], 0, 72)
+        );
+        // A non-byte-aligned wide segment still ends up a bitstring.
+        assert_eq!(bits("<<1:65>>"), (vec![0, 0, 0, 0, 0, 0, 0, 0, 0x80], 0, 65));
     }
 
     #[test]
@@ -2239,16 +2419,18 @@ mod tests {
 
     #[test]
     fn a_capability_gap_is_uncatchable() {
-        // `erlang:statistics(scheduler_wall_time)` is a valid statistics key this runtime
-        // cannot measure (per-scheduler CPU time), so the `RuntimeHooks` bridge reports it
-        // as the `unsupported` capability gap. A `try`/`catch` in the expression must NOT
-        // turn that into an apparent exception: it propagates out (classified by
-        // `unsupported_reason`) so the CLI exits 3 with `beam_rt: unsupported: …`.
-        // (`statistics(wall_clock)`/`statistics(run_queue)` are **served** now — they are
-        // cross-checked against the oracle by `tests/runtime_hooks.rs`.)
+        // `erlang:statistics(runtime)` is a valid statistics key this runtime cannot
+        // measure (it needs a CPU-time clock, and this crate is `#![deny(unsafe_code)]`), so
+        // the `RuntimeHooks` bridge reports it as the `unsupported` capability gap. A
+        // `try`/`catch` in the expression must NOT turn that into an apparent exception: it
+        // propagates out (classified by `unsupported_reason`) so the CLI exits 3 with
+        // `beam_rt: unsupported: …`. (`statistics(wall_clock)`/`statistics(run_queue)`/
+        // `statistics(reductions)`/`statistics(scheduler_wall_time)` and the other measurable
+        // keys are **served** — they are cross-checked against the oracle by
+        // `tests/runtime_hooks.rs`.)
         for expr in [
-            "try erlang:statistics(scheduler_wall_time) catch _:_ -> 0 end",
-            "try (erlang:statistics(scheduler_wall_time)) of V -> V catch C:R -> ok end",
+            "try erlang:statistics(runtime) catch _:_ -> 0 end",
+            "try (erlang:statistics(runtime)) of V -> V catch C:R -> ok end",
         ] {
             let error = run(expr).expect_err("a capability gap propagates");
             assert!(

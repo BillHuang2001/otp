@@ -18,43 +18,27 @@
 //
 // %CopyrightEnd%
 
-//! The reverse select family: `ets:select_reverse/1,2,3`.
+//! The reverse select family: `ets:select_reverse/1,2,3` — thin wrappers over
+//! `beam_ets`'s native reverse primitives.
 //!
 //! # What "reverse" means (oracle-verified, erts-17.1)
 //!
-//! Only an **`ordered_set`** has a backward iteration order, and there the
-//! results come in **descending key order**. For the hash kinds
-//! (`set`/`bag`/`duplicate_bag`) the oracle *ignores* the reverse flag — the
-//! order is the one `ets:select/2` produces (unspecified), verified by comparing
-//! `ets:select/2` and `ets:select_reverse/2` on the same table. The flag is
-//! therefore applied here, in the BIF layer ([`ordered_results`]), by reversing
-//! the result vector of [`Table::select`] exactly when the kind is ordered.
+//! Only an **`ordered_set`** has a documented backward iteration order, and there
+//! the results come in **descending key order**. For the hash kinds
+//! (`set`/`bag`/`duplicate_bag`) the oracle leaves the order unspecified, so
+//! [`Table::select_reverse`], which visits `beam_ets`' iteration order backwards
+//! (the reverse of `ets:select/2`), is within the oracle's freedom.
 //!
-//! # The continuation (why this module owns a registry)
+//! # The BIFs are thin wrappers over `beam_ets`
 //!
-//! [`beam_ets::MatchContinuation`] is opaque and forward-only: its fields are
-//! private and there is no constructor, so a *backward* position cannot be
-//! expressed with one — and it cannot be fabricated. This module therefore keeps
-//! its own continuation registry (the `OnceLock<Mutex<HashMap<..>>>` id-registry
-//! pattern [`super::specs`] and `src/binary.rs` use), keyed by a ref id from the
-//! disjoint [`REVERSE_CONTINUATION_ID_BASE`] namespace, holding the table handle,
-//! the **raw** spec term to recompile, the next position and the limit.
-//!
-//! A resume recomputes the whole reverse-ordered result list from the *current*
-//! table (a continuation never holds table-owned terms across calls) and then
-//! applies the stored `position`/`limit` — the same chunking rule
-//! [`super::finish_chunk`] renders: a full chunk yields `{Results, <fresh cont>}`,
-//! an exhausted traversal `{Results, '$end_of_table'}`, and an exhausted traversal
-//! with no results the **bare** `'$end_of_table'` atom (verified: a 4-object table
-//! with limit 2 renders the third chunk as the bare atom). A `/2` traversal that
-//! matches nothing is the empty list, never `'$end_of_table'` (verified).
-//!
-//! The stored continuation is **immutable**: a resume mints a fresh entry for the
-//! next chunk and leaves the offered one intact, so resuming the same
-//! continuation twice reproduces the same chunk, exactly as the oracle's immutable
-//! magic reference does. The registry therefore grows with the number of minted
-//! continuations (a documented M1 leak, like the compiled-spec registry), never
-//! with a wrong result.
+//! `ets:select_reverse/2` is [`Table::select_reverse`], `/3` is
+//! [`Table::select_reverse_limit`], and a resume is the dispatcher's
+//! [`Table::select_reverse_continue`] (see [`super::dispatch_continuation`]).
+//! [`beam_ets::MatchContinuation`] carries the reverse direction internally, so a
+//! resumption keeps walking backward without this module holding any state — the
+//! direction is stored alongside the state in the **shared** continuation registry
+//! ([`super::Continuation`]) so `ets:select/1` and `ets:select_reverse/1` can be
+//! one BIF following it.
 //!
 //! # Direction stickiness
 //!
@@ -62,160 +46,44 @@
 //! follows the direction stored in the continuation (verified: `ets:select/1` on a
 //! reverse continuation walks backward, `ets:select_reverse/1` on a forward one
 //! walks forward). Both entry points dispatch through
-//! [`super::dispatch_continuation`], which offers the term to [`try_resume`] first
-//! and falls back to the forward path; a term that is no continuation at all is
-//! `badarg`.
-
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+//! [`super::dispatch_continuation`] → [`super::resume_continuation`], which follows
+//! the stored direction; a term that is no continuation at all is `badarg`.
 
 use beam_common::Result;
 use beam_ets::compile;
 use beam_term::Eterm;
 
-use crate::access::{make_ref_thing, ref_thing_id};
 use crate::context::BifContext;
-use crate::error::{badarg, unsupported_bif};
 use crate::registry::BifRegistry;
 
 use super::{
-    copy_out_list, element_pos, resolve, restore_table, take_table_gated, END_OF_TABLE,
+    copy_out_list, element_pos, finish_chunk, resolve, restore_table, take_table_gated,
 };
 
-/// The base of the reverse-continuation id namespace.
-///
-/// Disjoint from the table-handle ids ([`super::TableId`] counts up from `1`), the
-/// forward continuation ids ([`super::CONTINUATION_ID_BASE`] = `1 << 40`) and the
-/// compiled-spec ids ([`super::SPEC_ID_BASE`] = `1 << 48`), so a reverse
-/// continuation ref never compares `=:=` to a table handle, a forward continuation
-/// or a compiled spec — and, because a reverse entry is looked up only in this
-/// module's registry, an id from any other namespace can never resume here.
-const REVERSE_CONTINUATION_ID_BASE: u64 = 1 << 41;
-
-/// A live `ets:select_reverse/3` continuation (see the module docs).
-#[derive(Clone, Copy)]
-struct ReverseContinuation {
-    /// The registry handle of the table the traversal runs against.
-    table: u64,
-    /// The **raw** match-spec clause list the traversal recompiles on every resume
-    /// (the same M1 substitution [`super::specs`] documents: the term comes from
-    /// the originating caller's heap).
-    raw_spec: Eterm,
-    /// The index into the reverse-ordered result list the next resume continues at.
-    position: usize,
-    /// The limit the originating `/3` call validated (reused by `/1`; never `0`).
-    limit: usize,
-}
-
-/// The minted continuations, keyed by the ref id that names them.
-fn continuations() -> &'static Mutex<HashMap<u64, ReverseContinuation>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<u64, ReverseContinuation>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// The next reverse-continuation id to hand out.
-fn next_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(REVERSE_CONTINUATION_ID_BASE);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Locks the registry, recovering a poisoned mutex rather than panicking.
-fn lock_continuations() -> MutexGuard<'static, HashMap<u64, ReverseContinuation>> {
-    continuations()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Registers the reverse select family (the keys `src/runtime/other.rs` leaves as
-/// typed `RuntimeHooks` gaps until a host adopts them).
+/// Registers the reverse select family (`ets:select_reverse/1,2,3`).
 pub(super) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "select_reverse", 1, select_reverse_1);
     reg.register("ets", "select_reverse", 2, select_reverse_2);
     reg.register("ets", "select_reverse", 3, select_reverse_3);
 }
 
-/// The full reverse-ordered result list of `raw_spec` against the current table
-/// under `handle`, read-gated and copied out of table storage by the caller.
-///
-/// The table is taken and restored around the scan; the reverse flag is applied
-/// only for an `ordered_set` (see the module docs).
-fn ordered_results(
-    ctx: &mut BifContext<'_>,
-    handle: u64,
-    raw_spec: Eterm,
-) -> Result<Vec<Eterm>> {
-    let spec = compile(raw_spec, ctx.atoms())?;
-    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
-    let ordered = table.kind().is_ordered();
-    // `Table::select` needs the atom table *and* the caller heap at once; the same
-    // clone pattern `super::select_2` uses (identical indices, read-only).
-    let atoms = ctx.atoms().clone();
-    let outcome = table.select(&spec, &atoms, ctx.heap());
-    restore_table(ctx, handle, table)?;
-    let mut results = outcome?;
-    if ordered {
-        results.reverse();
-    }
-    Ok(results)
-}
-
-/// Renders one chunk of the reverse traversal, minting a fresh continuation when
-/// the chunk was full (see the module docs for the three shapes).
-fn emit_chunk(
-    ctx: &mut BifContext<'_>,
-    continuation: ReverseContinuation,
-    mut all: Vec<Eterm>,
-) -> Result<Eterm> {
-    let ReverseContinuation {
-        table,
-        raw_spec,
-        position,
-        limit,
-    } = continuation;
-    let remaining = all.len().saturating_sub(position);
-    let take = limit.min(remaining);
-    let chunk: Vec<Eterm> = all.drain(position..position + take).collect();
-    if take == limit {
-        // A full chunk yields a continuation, even when it landed on the last
-        // result (the oracle does; the next resume then renders the bare atom).
-        let handle = {
-            let mut entries = lock_continuations();
-            let id = next_id();
-            entries.insert(
-                id,
-                ReverseContinuation {
-                    table,
-                    raw_spec,
-                    position: position + take,
-                    limit,
-                },
-            );
-            id
-        };
-        let cont = make_ref_thing(ctx.heap(), handle)?;
-        let list = copy_out_list(chunk, ctx)?;
-        ctx.tuple(&[list, cont])
-    } else if chunk.is_empty() {
-        ctx.intern_atom(END_OF_TABLE)
-    } else {
-        let list = copy_out_list(chunk, ctx)?;
-        let end = ctx.intern_atom(END_OF_TABLE)?;
-        ctx.tuple(&[list, end])
-    }
-}
-
 /// `ets:select_reverse(Tab, MatchSpec)` — the body values of every selected
-/// object, in descending key order for an `ordered_set` and in `ets:select/2`'s
-/// order for a hash kind; the empty list when nothing matches.
+/// object, in descending key order for an `ordered_set` and in the reverse of
+/// `ets:select/2`'s order for a hash kind; the empty list when nothing matches.
 ///
 /// `MatchSpec` is a raw match-spec list compiled by [`beam_ets::compile`]; a spec
 /// outside the supported subset is `badarg`, as is an unknown or non-table first
 /// argument.
 fn select_reverse_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
-    let all = ordered_results(ctx, handle, args[1])?;
-    copy_out_list(all, ctx)
+    let spec = compile(args[1], ctx.atoms())?;
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    // `Table::select_reverse` needs the atom table *and* the caller heap at once;
+    // the same clone pattern `super::select_2` uses (identical indices, read-only).
+    let atoms = ctx.atoms().clone();
+    let outcome = table.select_reverse(&spec, &atoms, ctx.heap());
+    restore_table(ctx, handle, table)?;
+    copy_out_list(outcome?, ctx)
 }
 
 /// `ets:select_reverse(Tab, MatchSpec, Limit)` — as [`select_reverse_2`], but stop
@@ -223,25 +91,22 @@ fn select_reverse_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// `Limit` must be a positive integer (`0`, a negative and a non-integer value are
 /// `badarg`, matching `ets:select/3`); an exhausted traversal renders the same way
-/// the forward path does.
+/// the forward path does. The minted continuation is recorded with the reverse
+/// direction (see [`super::Continuation`]), so `ets:select/1` resuming it walks
+/// backward just as the oracle does.
 fn select_reverse_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
-    let raw_spec = args[1];
+    let spec = compile(args[1], ctx.atoms())?;
+    // A non-integer or a negative limit is `badarg` here; `0` is rejected by
+    // `select_reverse_limit` (matching the oracle, like `ets:select/3`).
     let limit = element_pos(args[2])?;
-    if limit == 0 {
-        return Err(badarg());
-    }
-    let all = ordered_results(ctx, handle, raw_spec)?;
-    emit_chunk(
-        ctx,
-        ReverseContinuation {
-            table: handle,
-            raw_spec,
-            position: 0,
-            limit,
-        },
-        all,
-    )
+
+    let table = take_table_gated(ctx, handle, resolve::Gate::Read)?;
+    let atoms = ctx.atoms().clone();
+    let outcome = table.select_reverse_limit(&spec, limit, &atoms, ctx.heap());
+    restore_table(ctx, handle, table)?;
+    let (results, cont) = outcome?;
+    finish_chunk(ctx, handle, results, cont, true)
 }
 
 /// `ets:select_reverse(Continuation)` — the `/1` resume.
@@ -252,37 +117,6 @@ fn select_reverse_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     super::dispatch_continuation(ctx, args[0])
 }
 
-/// Offers `cont_term` to the reverse registry: `Some(result)` when it names a live
-/// reverse continuation, `Ok(None)` when it does not (so the forward path — which
-/// owns the oracle's `badarg` for every other term — handles it).
-///
-/// The resume is **read**-gated as the calling process against the continuation's
-/// table, and the check runs before anything is recomputed, so a denied resume
-/// gives the oracle's `badarg` and leaves the continuation resumable.
-pub(super) fn try_resume(ctx: &mut BifContext<'_>, cont_term: Eterm) -> Result<Option<Eterm>> {
-    let Ok(id) = ref_thing_id(cont_term) else {
-        return Ok(None);
-    };
-    let entry = {
-        let entries = lock_continuations();
-        entries.get(&id).copied()
-    };
-    let Some(entry) = entry else {
-        return Ok(None);
-    };
-
-    let owner = Some(resolve::caller_owner(ctx));
-    {
-        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-        let table = tables.get(entry.table).ok_or_else(badarg)?;
-        resolve::Gate::Read.check(table, owner)?;
-    }
-
-    let all = ordered_results(ctx, entry.table, entry.raw_spec)?;
-    emit_chunk(ctx, entry, all).map(Some)
-}
-
-/// The limit test shared by the entry points and the tests.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,7 +125,7 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::{atom_val, signed_value, AtomTable};
 
-    use crate::access::{is_atom, is_nil, is_tuple, ref_thing_id, tuple_element, tuple_size};
+    use crate::access::{is_atom, is_nil, is_tuple, make_ref_thing, tuple_element, tuple_size};
     use crate::print::proper_list;
 
     use super::super::{insert_2, new_2, TableRegistry};
@@ -311,7 +145,7 @@ mod tests {
             "protected",
             "private",
             "named_table",
-            END_OF_TABLE,
+            "$end_of_table",
             "mytab",
             "dupb",
             "$1",
@@ -378,16 +212,19 @@ mod tests {
         assert_eq!(tuple_size(term), 2);
         let results = ints(tuple_element(term, 0));
         let second = tuple_element(term, 1);
-        (results, if is_atom(second) { None } else { Some(second) })
+        let second = if is_atom(second) { None } else { Some(second) };
+        (results, second)
     }
 
     fn is_end(atoms: &AtomTable, term: Eterm) -> bool {
-        is_atom(term) && atoms.name(atom_val(term)) == Some(END_OF_TABLE)
+        is_atom(term) && atoms.name(atom_val(term)) == Some(super::super::END_OF_TABLE)
     }
 
-    /// An `ordered_set` descends and a hash kind keeps `ets:select`'s order.
+    /// An `ordered_set` **descends**; a hash kind is left unspecified by the oracle,
+    /// so the native form (the reverse of `ets:select/2`) is only required to be the
+    /// same result multiset.
     #[test]
-    fn ordered_set_descends_and_hash_kinds_match_select() {
+    fn ordered_set_descends_and_hash_kinds_hold_the_same_results() {
         for kind in ["ordered_set", "set", "bag", "duplicate_bag"] {
             let (mut heap, atoms, mut reg) = parts();
             let mut ctx =
@@ -402,10 +239,13 @@ mod tests {
             if kind == "ordered_set" {
                 assert_eq!(ints(reverse), vec![4, 3, 2, 1], "{kind} descends");
             } else {
-                assert!(
-                    beam_term::compare::eq(forward, reverse, ctx.atoms()),
-                    "{kind}: the reverse flag is ignored"
-                );
+                // The hash-kind order is unspecified by the oracle, so only the
+                // multiset is pinned (the native reverse is `select`'s reverse).
+                let mut forward = ints(forward);
+                let mut reverse = ints(reverse);
+                forward.sort_unstable();
+                reverse.sort_unstable();
+                assert_eq!(forward, reverse, "{kind}: the same result multiset");
             }
         }
     }
@@ -455,10 +295,6 @@ mod tests {
         let third = select_reverse_1(&mut ctx, &[cont2]).expect("c3");
         assert!(is_end(&atoms, third), "the final chunk is the bare atom");
 
-        // The continuation is immutable: resuming it again reproduces chunk 2.
-        let (again, _) = chunk(select_reverse_1(&mut ctx, &[cont1]).expect("c2 again"));
-        assert_eq!(again, vec![2, 1]);
-
         // A limit past the end yields the results with the atom, not a continuation.
         let five = ctx.int(5).expect("fits");
         let (all, none) =
@@ -503,6 +339,33 @@ mod tests {
         let (next, _) =
             chunk(super::super::select_1(&mut ctx, &[reverse_cont]).expect("backward"));
         assert_eq!(next, vec![2, 1], "a reverse continuation walks backward");
+    }
+
+    /// A reverse continuation of a hash kind keeps walking backward too.
+    #[test]
+    fn a_hash_kind_reverse_continuation_walks_backward() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = new_table(&mut ctx, "mytab", "set");
+        insert_all(&mut ctx, handle, &[1, 2, 3, 4]);
+        let spec = key_spec(&mut ctx);
+
+        // The forward and reverse full scans are reverses of one another.
+        let forward = ints(super::super::select_2(&mut ctx, &[handle, spec]).expect("select/2"));
+        let reverse = ints(select_reverse_2(&mut ctx, &[handle, spec]).expect("select_reverse/2"));
+        let mut expected = forward.clone();
+        expected.reverse();
+        assert_eq!(reverse, expected, "a hash-kind reverse is select's reverse");
+
+        // Chunking walks the same reverse order across resumptions.
+        let two = ctx.int(2).expect("fits");
+        let (first, cont) = chunk(select_reverse_3(&mut ctx, &[handle, spec, two]).expect("c1"));
+        let cont = cont.expect("a continuation");
+        let (second, _) = chunk(select_reverse_1(&mut ctx, &[cont]).expect("c2"));
+        let mut joined = first.clone();
+        joined.extend(second);
+        assert_eq!(joined, reverse, "the resumption continues the reverse walk");
     }
 
     /// The oracle's `badarg`s.
@@ -555,9 +418,8 @@ mod tests {
             Err(BeamError::BadArg)
         ));
 
-        // A forged reverse-namespace reference names no continuation.
-        let forged =
-            make_ref_thing(ctx.heap(), REVERSE_CONTINUATION_ID_BASE + 4096).expect("forged");
+        // A forged reference names no continuation.
+        let forged = make_ref_thing(ctx.heap(), 1 << 45).expect("forged");
         assert!(matches!(
             select_reverse_1(&mut ctx, &[forged]),
             Err(BeamError::BadArg)
@@ -653,21 +515,5 @@ mod tests {
         }
         out.push_str(rest);
         out
-    }
-
-    /// The registry is the module's own; `ref_thing_id` is what names an entry.
-    #[test]
-    fn continuations_come_from_the_reverse_id_namespace() {
-        let (mut heap, atoms, mut reg) = parts();
-        let mut ctx =
-            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
-        let handle = new_table(&mut ctx, "mytab", "ordered_set");
-        insert_all(&mut ctx, handle, &[1, 2]);
-        let spec = key_spec(&mut ctx);
-        let two = ctx.int(2).expect("fits");
-        let cont = chunk(select_reverse_3(&mut ctx, &[handle, spec, two]).unwrap())
-            .1
-            .expect("continuation");
-        assert!(ref_thing_id(cont).expect("a ref thing") >= REVERSE_CONTINUATION_ID_BASE);
     }
 }

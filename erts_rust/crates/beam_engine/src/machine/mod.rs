@@ -66,8 +66,11 @@ use beam_term::Eterm;
 pub use self::catch::CatchFrame;
 pub(crate) use self::context::{Contexts, ModuleContext};
 pub(crate) use self::frames::{Continuation, Frame};
+pub use self::location::WaitDeadline;
 pub use self::registers::{MAX_FLOAT_REGISTER, MAX_REGISTER};
 pub use self::run::RunOutcome;
+
+use crate::context::{ExecutionContext, RootSet};
 
 use self::catch::UNRESOLVED_CLASS_ATOMS;
 
@@ -239,6 +242,27 @@ pub struct Machine {
     /// which clears it) and read back by [`Machine::initial_call`]. `None` before
     /// any run.
     pub(crate) entry_call: Option<(u32, u32)>,
+    /// The number of **interpreted instructions charged in the current scheduling
+    /// slice** — the engine half of the runtime's *reduction* accounting.
+    ///
+    /// Zeroed at every [`Machine::drive`](crate::machine::Machine) entry (one `drive`
+    /// call is one run or one resume, i.e. one slice) and incremented once per
+    /// `step_instruction`, so [`Machine::reductions`](crate::machine::Machine) read
+    /// when the slice ends is that slice's instruction count.
+    ///
+    /// The engine's other charging point is
+    /// [`ensure_heap`](crate::ExecutionContext::ensure_heap) (reached by
+    /// `test_heap`/`allocate_heap`), which prices *heap admissions* — a tight
+    /// **non-allocating** loop never reaches it, which is why the per-instruction
+    /// charge exists. A host observes the charge **during** the slice through
+    /// [`reduce`](crate::ExecutionContext::reduce) and may pre-empt there; it never
+    /// has to poll this field mid-run.
+    ///
+    /// Only the **interpreter's** dispatch loop
+    /// ([`Machine::drive`](crate::machine::Machine)) charges: a natively executed JIT
+    /// block bypasses `step_instruction`, so this is a lower bound under the baseline
+    /// tier (documented, never a fabricated count).
+    pub(crate) reductions: u64,
 }
 
 impl Machine {
@@ -267,6 +291,7 @@ impl Machine {
             trace_on: false,
             current_code: None,
             entry_call: None,
+            reductions: 0,
         };
         machine.reset();
         machine
@@ -287,6 +312,62 @@ impl Machine {
         self.context
     }
 
+    /// The whole Erlang stack (every Y slot of every live frame) as a mutable slice
+    /// — part of the **root-set hand-off**.
+    ///
+    /// See [`Machine::x_mut`] for why the whole-set hand-off goes through
+    /// [`Machine::with_roots`] rather than three separate accessor calls.
+    #[inline]
+    pub fn stack_mut(&mut self) -> &mut [Eterm] {
+        &mut self.stack
+    }
+
+    /// Run `f` with the engine's **whole live root set** handed over as a
+    /// [`RootSet`]: the X-register file, the whole Erlang stack and the whole FR
+    /// file, all borrowed mutably and disjointly from one `&mut self`.
+    ///
+    /// This is the engine's root hand-off for an allocation that may collect
+    /// ([`Machine::alloc_rooted`] is the convenience wrapper). The three files are
+    /// borrowed **together** — three separate `x_mut`/`stack_mut`/`fr_mut` calls
+    /// cannot coexist, so a caller needing more than one of them must come through
+    /// here. `live` declares how many leading X registers are live for the
+    /// operation in flight; [`RootSet::ALL_LIVE`] is the conservative choice (a
+    /// copying collector may always over-approximate the root set — it can only
+    /// keep a term alive, never free a live one). The root-set contract itself is
+    /// the frozen one on [`RootSet`].
+    pub fn with_roots<R>(&mut self, live: u32, f: impl FnOnce(RootSet<'_>) -> R) -> R {
+        let roots = RootSet::new(&mut self.x, &mut self.stack, &mut self.fr, live);
+        f(roots)
+    }
+
+    /// Allocate `n` heap words **with the live root set handed to `ctx`**, so a
+    /// context with a real collector can collect (and move terms) as part of the
+    /// allocation.
+    ///
+    /// This is the engine-side twin of
+    /// [`ExecutionContext::alloc_words`](crate::context::ExecutionContext::alloc_words):
+    /// where `alloc_words` gives the host no admission point and no roots,
+    /// `alloc_rooted` hands over the machine's whole root set (see
+    /// [`Machine::with_roots`]) and calls
+    /// [`ExecutionContext::alloc_words_rooted`](crate::context::ExecutionContext::alloc_words_rooted).
+    /// The default `alloc_words_rooted` discards the roots and forwards to
+    /// `alloc_words`, so a host without a collector behaves exactly as before; a host
+    /// with one runs the collector over `roots` first, writing any moved term back
+    /// through the mutable slices, and may then hand back a different (moved) heap.
+    ///
+    /// `live` declares how many leading X registers are live (use
+    /// [`RootSet::ALL_LIVE`](crate::context::RootSet::ALL_LIVE) when unknown). The
+    /// returned pointer is uninitialized storage valid **until the next
+    /// `ensure_heap`/collecting allocation**, exactly as `alloc_words` documents —
+    /// so the caller must re-read any live term from `x`/`stack`/`fr` afterwards.
+    pub fn alloc_rooted(
+        &mut self,
+        ctx: &mut dyn ExecutionContext,
+        n: usize,
+        live: u32,
+    ) -> Result<*mut Eterm> {
+        self.with_roots(live, |roots| ctx.alloc_words_rooted(n, roots))
+    }
     /// Register `module` as an enterable module context and return its id (`>= 1`).
     ///
     /// Idempotent by the `Arc`'s allocation identity (see [`Contexts::register`]),

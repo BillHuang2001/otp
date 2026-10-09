@@ -71,7 +71,9 @@
 //!   (`beam_io::Port::refresh_timeout`). The runtime's poll round is clamped by that deadline
 //!   (`beam_io::PortRegistry::next_deadline`), so the driver's `timeout` callback fires **at** its
 //!   deadline. `driver_read_timer` reports the remaining milliseconds and `driver_cancel_timer`
-//!   drops the deadline — with the C's own return codes.
+//!   drops the deadline — with the C's own return codes. The timer is armed for **every** live port:
+//!   an entry with no `timeout` callback gets the C's silent `no_timeout_callback`
+//!   (`io.c:7601`), so `driver_set_timer` answers `0` there too, and the fired deadline is a no-op.
 //!
 //! The host function a C driver calls has no way to reach the port lifecycle that owns the poller
 //! (the `DriverHost` seam is frozen and the opaque `ErlDrvPort` is the *only* thing a callback
@@ -80,6 +82,29 @@
 //! [`DriverPort::take_outputs`] already uses for `driver_output` bytes. A host that no port
 //! lifecycle has claimed (a bare [`Driver`] driven by a test) therefore answers the C's failure
 //! code rather than recording a request nobody would ever apply.
+//!
+//! # Driver-emitted terms (`erl_drv_output_term` / `erl_drv_send_term`)
+//!
+//! A driver hands a term to the runtime through the term-data stack machine
+//! (`ERL_DRV_ATOM`/`ERL_DRV_TUPLE`/…), and `beam_abi` decodes that spec into a real term on this
+//! host's arena before calling [`DriverHost::send_term`] with the destination (`None` = the port's
+//! connected process, `erl_drv_output_term`, `io.c:6254`; `Some(pid)` = `erl_drv_send_term`,
+//! `io.c:6289`). The C *delivers* it there and then: it builds the term straight on the receiving
+//! process's heap and queues the message from inside the callback (`driver_deliver_term`,
+//! `io.c:5664`). The frozen [`DriverHost`] seam gives a host no way to reach a receiver's mailbox
+//! (it has the owning pid and nothing else), so the term is **queued** instead:
+//! [`DriverHost::send_term`] pushes `(destination, term)` onto the port's [`TermQueue`], and
+//! whoever holds that queue — the runtime's port pump, which owns the process table — drains it
+//! and delivers each entry's term to its destination.
+//!
+//! The queue is per port and shared by handle between the host (which pushes, from inside a
+//! callback) and the runtime (which takes the handle before the port is registered and drains it).
+//! Its one invariant is a lifetime one: a term's words live on [`DriverPort`]'s arena, so they may
+//! only be read while the driver is alive. [`DriverPortAdapter`] therefore **empties** the queue
+//! when it tears the driver down (from [`beam_io::Driver::stop`], where the C's own
+//! `ERTS_PORT_SFLG_CLOSING` check refuses a delivery — `deliver_term_check_port`, `io.c:6213` — and
+//! from its `Drop`, for a port whose `stop` never ran), so a late drain observes an empty queue
+//! rather than a term built on a heap that has gone away.
 //!
 //! # What is NOT wired yet (the typed gaps)
 //!
@@ -93,9 +118,11 @@
 //! * **`driver_control`** (the driver's `control` callback behind `port_control/3`). It is
 //!   reachable only from the port lifecycle, and its reply protocol (`rbuf`/`rlen`, plus the
 //!   `driver_free_buf` rule for a driver-allocated reply) is not modelled here.
-//! * **`driver_send_term` is captured, not delivered.** The decoded term is recorded in
-//!   [`DriverPort::sent`]; turning it into a port message to the owner needs a term-carrying port
-//!   notification the port machinery does not have (a port's input queue is bytes).
+//! * **A queued term carries no sending port.** The C stamps the port into the message header
+//!   (`from = prt->common.id`, `io.c:6172`), which is what send-tracing shows; a [`TermQueue`]
+//!   entry is `(destination, term)` only, so the runtime that drains it delivers the term itself
+//!   (`erl_drv_output_term` sends the decoded term, never a `{Port, Term}` wrapper) with no
+//!   sending-port identity.
 //! * **`ERL_DRV_USE` / `stop_select`** is accepted but never fires: a deselected event is
 //!   deregistered from the poll set, yet the driver's `stop_select` callback is not run.
 
@@ -107,9 +134,10 @@ use libc::{c_int, c_ulong};
 
 use beam_abi::driver::loader::{self, DriverLibrary, DriverLoadError};
 use beam_abi::driver::types::{
-    ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_WRITE,
+    ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlIOVec, ERTS_INVALID_ERL_DRV_PORT,
+    ERL_DRV_READ, ERL_DRV_WRITE,
 };
-use beam_abi::{DriverEnv, DriverHost};
+use beam_abi::{DriverEnv, DriverHost, SysIOVec};
 use beam_common::BeamError;
 use beam_alloc::Heap;
 use beam_bifs::AtomInterner;
@@ -182,9 +210,6 @@ struct DriverControl {
     /// Whether a port lifecycle claimed this host ([`DriverPortAdapter::load`]). Until then a
     /// select/timer request has nobody to apply it and is refused with the C's failure code.
     attached: bool,
-    /// Whether the driver's entry declares a `timeout` callback — the C's precondition for
-    /// `driver_set_timer` succeeding (`io.c:6918`: `-1` when `entry->timeout == NULL`).
-    timer_capable: bool,
     /// Whether the port's driver was `dlopen`ed — the C's `prt->drv_ptr->handle != NULL`
     /// (`io.c:7337`), which is what decides `driver_lock_driver`.
     ///
@@ -243,6 +268,74 @@ impl Driver {
     }
 }
 
+/// The terms a driver emitted through `erl_drv_output_term` / `erl_drv_send_term`, awaiting
+/// delivery to a process mailbox.
+///
+/// One queue belongs to one port and is shared by handle between the port's [`DriverPort`] host
+/// (which pushes, from inside a driver callback) and its reader: the runtime's port pump, which
+/// holds the process table and can turn an entry into a message. The C instead delivers the term
+/// synchronously from inside the callback (`driver_deliver_term`, `io.c:5664`), which a
+/// [`DriverHost`] cannot do — the frozen seam hands it the owning pid and nothing else (see the
+/// module docs).
+///
+/// The entry shape is the C's: `destination` is `None` for `erl_drv_output_term` (the port's
+/// connected process) and `Some(pid)` for `erl_drv_send_term`'s explicit destination. Terms are
+/// **not** wrapped in `{Port, Term}` — the decoded term itself is what the C queues
+/// (`io.c:6174`).
+///
+/// # Lifetime contract
+///
+/// A queued term's words live on the port host's arena ([`DriverPort::heap`]), so an entry may only
+/// be read while the driver is alive. [`DriverPortAdapter`] empties the queue when it unloads the
+/// driver, so a reader that drains after the port went away observes an empty queue, never a
+/// dangling term.
+#[derive(Clone, Debug, Default)]
+pub struct TermQueue {
+    /// The queued `(destination, term)` pairs, in emission order.
+    pending: Rc<RefCell<Vec<(Option<Eterm>, Eterm)>>>,
+}
+
+impl TermQueue {
+    /// An empty queue.
+    pub fn new() -> TermQueue {
+        TermQueue::default()
+    }
+
+    /// Takes every queued term out, in emission order — the delivery side's drain.
+    ///
+    /// # Panics
+    ///
+    /// Never: a driver callback does not hold a borrow of this cell across a call (the pushing
+    /// side borrows it only for the length of one `push`).
+    pub fn take(&self) -> Vec<(Option<Eterm>, Eterm)> {
+        std::mem::take(&mut *self.pending.borrow_mut())
+    }
+
+    /// Whether nothing is awaiting delivery.
+    pub fn is_empty(&self) -> bool {
+        self.pending.borrow().is_empty()
+    }
+
+    /// Queues `term` for `destination` (the host's push, from inside a driver callback).
+    ///
+    /// A re-entrant push while the cell is already borrowed cannot happen (a driver callback never
+    /// holds the queue's borrow) and, if it ever did, dropping this one term is the honest outcome
+    /// — never a panic and never a term delivered twice.
+    fn push(&self, destination: Option<Eterm>, term: Eterm) {
+        if let Ok(mut pending) = self.pending.try_borrow_mut() {
+            pending.push((destination, term));
+        }
+    }
+
+    /// Drops everything queued: the driver that built these terms is being unloaded, so its arena
+    /// is about to disappear (see the lifetime contract above).
+    fn clear(&self) {
+        if let Ok(mut pending) = self.pending.try_borrow_mut() {
+            pending.clear();
+        }
+    }
+}
+
 /// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
 ///
 /// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
@@ -271,7 +364,14 @@ pub struct DriverPort {
     outputs: Vec<Vec<u8>>,
     /// Every decoded term handed to `send_term` (`erl_drv_output_term` / `erl_drv_send_term`),
     /// with the destination (`None` = the port owner).
+    ///
+    /// The accumulate-only view the A.4 integration test reads — the same split as
+    /// [`DriverPort::outputs`] / [`DriverPort::take_outputs`]. Delivery goes through
+    /// [`DriverPort::terms`] instead (see [`TermQueue`]).
     sent: Vec<(Option<Eterm>, Eterm)>,
+    /// The port's delivery queue for those terms, shared with whoever drains it (see
+    /// [`TermQueue`]).
+    terms: TermQueue,
     /// The event/timer state shared with the port lifecycle that owns this host (see
     /// [`DriverControl`]).
     control: Rc<RefCell<DriverControl>>,
@@ -288,10 +388,20 @@ impl DriverPort {
             owner,
             outputs: Vec::new(),
             sent: Vec::new(),
+            terms: TermQueue::new(),
             control: Rc::new(RefCell::new(DriverControl::default())),
         }
     }
 
+    /// The port's [`TermQueue`] — the handle a driver callback's `erl_drv_output_term` /
+    /// `erl_drv_send_term` pushes onto and the one the port pump drains.
+    ///
+    /// Taken **before** the host is boxed into a port (the boxed driver is reached through
+    /// [`beam_io::Driver`], which exposes no host), which is why the queue is a shared handle
+    /// rather than a field the reader can borrow.
+    pub fn term_queue(&self) -> TermQueue {
+        self.terms.clone()
+    }
     /// The event/timer state this host shares with its port lifecycle.
     ///
     /// [`DriverPortAdapter::load`] takes this handle so the driver's `driver_select` and
@@ -500,9 +610,15 @@ impl DriverHost for DriverPort {
 
     /// Arms the port's timer at `ms` from now (`driver_set_timer`).
     ///
-    /// `0`/`-1` are the C's own codes: a port whose entry declares no `timeout` callback answers
-    /// `-1` (`io.c:6918`), as does a host no lifecycle has claimed. The call *is* synchronous: the
-    /// deadline is stored here and the port picks it up as this callback returns.
+    /// `0` is the C's answer for **any** live port, including one whose entry declares no `timeout`
+    /// callback: the C never leaves `drv->timeout` null, it substitutes its own `no_timeout_callback`
+    /// (`io.c:7601`: `drv->timeout = de->timeout ? de->timeout : no_timeout_callback`), so the `-1`
+    /// at `io.c:6918` stands only for the *invalid port* case and the timer is armed either way. A
+    /// host no lifecycle has claimed is that invalid-port case here, so it keeps the C's `-1`; the
+    /// call *is* synchronous: the deadline is stored here and the port picks it up as this callback
+    /// returns. When such a deadline fires with no `timeout` callback, the C's `no_timeout_callback`
+    /// is a silent no-op — which is what [`DriverPortAdapter::timeout`] reproduces for an entry
+    /// without the slot.
     fn set_timer(&mut self, _port: ErlDrvPort, ms: c_ulong) -> c_int {
         let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
             // A delay that does not fit an `Instant` cannot be a deadline: the C's failure code is
@@ -512,7 +628,7 @@ impl DriverHost for DriverPort {
         let Ok(mut control) = self.control.try_borrow_mut() else {
             return -1;
         };
-        if !control.attached || !control.timer_capable {
+        if !control.attached {
             return -1;
         }
         control.deadline = Some(deadline);
@@ -555,13 +671,17 @@ impl DriverHost for DriverPort {
         self.outputs.push(data.to_vec());
         0
     }
-    /// Captures the decoded term (`erl_drv_output_term` / `erl_drv_send_term`). Delivery to the
-    /// owner's mailbox is the port lifecycle's job (a phase-1 gap, see the module docs).
+    /// Captures the decoded term (`erl_drv_output_term` / `erl_drv_send_term`).
+    ///
+    /// The C delivers it synchronously into the destination's mailbox (`io.c:5664`); here the term
+    /// goes onto this port's [`TermQueue`], which the runtime's port pump drains and delivers (see
+    /// the module docs). `0` is the frozen [`DriverHost`] seam's "accepted" code — the same code
+    /// `beam_abi`'s own hosts answer.
     fn send_term(&mut self, _port: ErlDrvPort, to: Option<Eterm>, term: Eterm) -> c_int {
         self.sent.push((to, term));
+        self.terms.push(to, term);
         0
     }
-
     /// `driver_connected`: the port's owning process (this runtime's own pid term).
     fn connected_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
         Some(self.owner.to_eterm())
@@ -668,11 +788,16 @@ pub fn load_driver(
 /// # Output is the driver's own callback, not a pipe
 ///
 /// A `spawn`-driver port writes to the child's stdin; a *C driver* port has no child, so
-/// [`beam_io::Driver::output`] hands the bytes to the driver's `output` callback instead. The
-/// bytes the driver answers with through `driver_output` are captured by [`DriverPort`] and are
-/// then queued on the port's **input** queue — which is exactly what the port hands up to Erlang
-/// as `{Port, {data, Data}}` (see `crate::port::PortRegistry::pump`). Nothing here builds a term:
-/// the message is the runtime's, this type only moves bytes.
+/// [`beam_io::Driver::output`] hands the bytes to the driver's `outputv` callback when the entry
+/// declares one, else to `output`. The bytes the driver answers with through `driver_output` are
+/// captured by [`DriverPort`] and are then queued on the port's **input** queue — which is exactly
+/// what the port hands up to Erlang as `{Port, {data, Data}}` (see `crate::port::PortRegistry::pump`).
+/// Nothing here builds a term: the message is the runtime's, this type only moves bytes.
+///
+/// A driver-emitted *term* (`erl_drv_output_term`/`erl_drv_send_term`) does not go through that byte
+/// queue: the host queues it on the port's [`TermQueue`], which a reader holding the queue handle
+/// (the runtime's port pump) drains. This adapter's part in it is the teardown: it empties the queue
+/// when the driver is unloaded, so no queued term survives its arena (see [`TermQueue`]).
 ///
 /// # Typed gaps (documented, never a fabricated success)
 ///
@@ -681,8 +806,7 @@ pub fn load_driver(
 ///   which the frozen host seam does not hand the host function.
 /// * `driver_control` (the entry's `control` callback behind `port_control/3`) is not routed here
 ///   yet, so [`beam_io::Driver::control`]'s default (no reply bytes) is used.
-/// * `driver_send_term`'s term is captured in [`DriverPort::sent`], never delivered: a port's
-///   notification channel carries bytes, not terms.
+/// * A queued term is delivered without a sending-port identity (the C stamps `from = prt`).
 /// * `ERL_DRV_USE` is accepted but its `stop_select` callback never fires.
 /// * `take_exit_status` is always `Ok(None)`: a driver port owns no child to reap, so no
 ///   `{Port, {exit_status, …}}` message is ever synthesized for it.
@@ -708,6 +832,11 @@ pub struct DriverPortAdapter {
     command: String,
     /// The event/timer state shared with the host (see [`DriverControl`]).
     control: Rc<RefCell<DriverControl>>,
+    /// The port's [`TermQueue`], shared with the host (which pushes from inside a callback).
+    ///
+    /// Held here for one purpose: emptying it when the driver is unloaded, so a queued term can
+    /// never outlive the arena it was built on (see [`TermQueue`]'s lifetime contract).
+    terms: TermQueue,
     /// The descriptors this port has registered with the poller, in selection order.
     ///
     /// One port shares a single poller key, so the event identity the C carries per registration
@@ -753,14 +882,12 @@ impl DriverPortAdapter {
         // `remove_driver_entry` slot answer the C's `-1` for a port's own driver.
         registry_note_loaded_entry(library.entry() as *const ErlDrvEntry as *mut ErlDrvEntry);
         let control = host.control();
+        let terms = host.term_queue();
         {
             let mut state = control.borrow_mut();
             state.attached = true;
             // The port's driver was `dlopen`ed, so `driver_lock_driver` answers the C's `0`.
             state.driver_loaded = true;
-            // The C's precondition for `driver_set_timer` succeeding: an entry without a `timeout`
-            // callback has no timer at all (`io.c:6918`).
-            state.timer_capable = library.entry().timeout.is_some();
         }
         Ok(DriverPortAdapter {
             driver: Some(Driver::new(library, host)),
@@ -769,10 +896,10 @@ impl DriverPortAdapter {
             name: name.to_string(),
             command,
             control,
+            terms,
             selected: Vec::new(),
         })
     }
-
     /// The driver name this port was loaded as.
     pub fn name(&self) -> &str {
         &self.name
@@ -1031,16 +1158,24 @@ impl beam_io::Driver for DriverPortAdapter {
         self.settle(ctx)
     }
 
-    /// Hands the port's queued bytes to the driver's `output` callback and queues whatever the
-    /// driver answers with through `driver_output` as this port's **input**.
+    /// Hands the port's queued bytes to the driver's `outputv` (when the entry declares one) or its
+    /// `output` callback, and queues whatever the driver answers with through `driver_output` as
+    /// this port's **input**.
     ///
-    /// An entry without an `output` callback is the C's own no-op (`io.c`'s `no_output_callback`),
-    /// so its absence is not a failure.
+    /// The C's own preference: `if (drv->outputv) …` else `… drv->output` (`io.c:1782` for the
+    /// `port_command` path, `io.c:1597` for the async one) — an entry that declares **both** gets
+    /// the vector callback, and an entry that declares only `outputv` is not left without any
+    /// output callback at all.
+    ///
+    /// The vector mirrors the C's build: `iov[0]` is the empty **header** block a driver may fill
+    /// in and `iov[1..]` the data, `binv` runs parallel to `iov` (all `NULL` here — these bytes are
+    /// not backed by an `ErlDrvBinary`, the same convention `beam_abi`'s own queue views use), and
+    /// `size` is the data's total byte count (`io.c:1842-1864`).
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] when the driver has been torn down, and [`BeamError::Io`] when the
-    /// `output` callback reports a failure.
+    /// callback reports a failure.
     fn output(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<usize> {
         // Copy first: the queue is cleared below and the callback takes a raw pointer into the
         // buffer, so the slice must outlive the borrow of the context.
@@ -1051,9 +1186,34 @@ impl beam_io::Driver for DriverPortAdapter {
                 return Err(BeamError::BadArg);
             };
             let state = self.state;
-            let buf = bytes.as_ptr() as *mut std::os::raw::c_char;
-            let len = bytes.len();
-            match publishing(driver, |library| library.output(state, buf, len)) {
+            let result = if driver.library().entry().outputv.is_some() {
+                // `iov`/`binv` are the driver's to read (and, for the header block, to write) for
+                // the duration of the call only, which is exactly the C's contract: the vector is
+                // built on the caller's stack (`ev.common.iov = iv`, `io.c:1806`).
+                let mut iov = [
+                    SysIOVec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    },
+                    SysIOVec {
+                        iov_base: bytes.as_ptr() as *mut std::os::raw::c_void,
+                        iov_len: bytes.len(),
+                    },
+                ];
+                let mut binv: [*mut ErlDrvBinary; 2] = [std::ptr::null_mut(); 2];
+                let mut ev = ErlIOVec {
+                    vsize: iov.len() as c_int,
+                    size: bytes.len(),
+                    iov: iov.as_mut_ptr(),
+                    binv: binv.as_mut_ptr(),
+                };
+                publishing(driver, |library| library.outputv(state, &mut ev))
+            } else {
+                let buf = bytes.as_ptr() as *mut std::os::raw::c_char;
+                let len = bytes.len();
+                publishing(driver, |library| library.output(state, buf, len))
+            };
+            match result {
                 Ok(()) => {}
                 Err(error) if error.is_absent() => {}
                 Err(error) => return Err(driver_call_error(error)),
@@ -1065,7 +1225,6 @@ impl beam_io::Driver for DriverPortAdapter {
         self.settle(ctx)?;
         Ok(bytes.len())
     }
-
     /// Runs the driver's `ready_input` for the descriptor the poller found readable.
     ///
     /// Only reached when the driver itself armed that descriptor with `driver_select`; an entry
@@ -1159,9 +1318,25 @@ impl beam_io::Driver for DriverPortAdapter {
         // The environment goes now: the port handle the driver held is dead the moment `stop`
         // returned, exactly as the C's `ErlDrvPort` is.
         self.env = None;
+        // A term the driver queued is built on the host's arena, which this unload is about to
+        // destroy, so the queue is emptied — the C's own outcome for a close in progress
+        // (`deliver_term_check_port` refuses a delivery while `ERTS_PORT_SFLG_CLOSING`, `io.c:6213`).
+        self.terms.clear();
         // `driver` drops here: `DriverLibrary::Drop` runs the entry's `finish` and `dlclose`s, and
         // the boxed host goes with it.
         result.and(released)
+    }
+}
+
+impl Drop for DriverPortAdapter {
+    /// Empties the port's [`TermQueue`] when the port goes away without [`beam_io::Driver::stop`]
+    /// having run (a dropped registry, an unwound start).
+    ///
+    /// The queue's entries point into this adapter's own host arena, so leaving them for a reader
+    /// to drain after the arena is freed would be a dangling read; an emptied queue is the honest
+    /// answer (see [`TermQueue`]).
+    fn drop(&mut self) {
+        self.terms.clear();
     }
 }
 
@@ -1208,6 +1383,29 @@ mod tests {
         assert_eq!(atoms.name(atom_val(fresh)), None);
     }
 
+    /// `erl_drv_output_term` / `erl_drv_send_term` queue their decoded term on the port's
+    /// [`TermQueue`] — the delivery half — while [`DriverPort::sent`] keeps the accumulate-only
+    /// view the A.4 integration test reads; draining the queue empties it.
+    #[test]
+    fn send_term_queues_the_decoded_term_and_draining_empties_the_queue() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+        let queue = host.term_queue();
+        assert!(queue.is_empty());
+        let term = host.owner().to_eterm();
+        // `None` = the port's connected process (`erl_drv_output_term`, `io.c:6254`).
+        assert_eq!(host.send_term(std::ptr::null_mut(), None, term), 0);
+        assert_eq!(host.sent(), &[(None, term)]);
+        assert!(!queue.is_empty());
+        // `Some(pid)` = an explicit destination (`erl_drv_send_term`, `io.c:6289`).
+        assert_eq!(host.send_term(std::ptr::null_mut(), Some(term), term), 0);
+        assert_eq!(queue.take(), vec![(None, term), (Some(term), term)]);
+        // Draining empties it; the teardown path (`clear`) leaves it empty too.
+        assert!(queue.is_empty());
+        assert_eq!(queue.take(), Vec::new());
+        host.terms.clear();
+        assert!(queue.is_empty());
+    }
     #[test]
     fn the_host_captures_output_and_answers_the_port_queries() {
         let atoms = Rc::new(AtomTable::new());
@@ -1236,6 +1434,35 @@ mod tests {
             ),
             -1
         );
+    }
+
+    /// A **claimed** host answers the timer family with the C's own codes for *every* driver,
+    /// including one whose entry declares no `timeout` callback — the C substitutes a silent
+    /// `no_timeout_callback` (`io.c:7601`) so `io.c:6918`'s `-1` stands only for an invalid port.
+    ///
+    /// Oracle ground truth (OTP 29 / erts-17.1): a real C `.so` whose entry leaves `.timeout` NULL
+    /// and whose `output` reports `driver_set_timer(port, 1000)` prints `1` (the call returned `0`);
+    /// `driver_read_timer`/`driver_cancel_timer` answer `0` there too.
+    #[test]
+    fn an_attached_host_arms_its_timer_without_a_timeout_callback() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+        // Stand in for [`DriverPortAdapter::load`], which is the only thing that claims a host.
+        host.control.borrow_mut().attached = true;
+
+        // The C's `0`: armed, so the port's `TIMEOUT` task really fires.
+        assert_eq!(host.set_timer(std::ptr::null_mut(), 100), 0);
+        assert_eq!(
+            host.control.borrow().deadline.is_some(),
+            true,
+            "a `0` answer must really arm the deadline"
+        );
+        // `io.c:6936`: a live port answers `0` with the remaining time (which is what `Some` means).
+        assert!(host.read_timer(std::ptr::null_mut()).is_some());
+        assert_eq!(host.cancel_timer(std::ptr::null_mut()), 0);
+        assert!(host.control.borrow().deadline.is_none());
+        // ...and `io.c:6925`: cancelling on a live port is `0` even with nothing pending.
+        assert_eq!(host.cancel_timer(std::ptr::null_mut()), 0);
     }
 
     /// The four port-less `DriverHost` registry slots answer the C's own return codes, pinned

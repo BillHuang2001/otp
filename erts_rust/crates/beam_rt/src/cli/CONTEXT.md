@@ -43,7 +43,7 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 | `-name N` / `-sname N` | node name → `emulator.node_name`; makes the runtime a distributed node (A.5 phase 1) |
 | `-setcookie C` | distribution cookie → `emulator.cookie` (also the init argument `setcookie`) |
 | `-config F` | config file, recorded as the init argument `config` |
-| `-boot F` | boot script, recorded as the init argument `boot` |
+| `-boot F` | boot script: recorded as the init argument `boot` **and** executed by the bare `Boot` action through the A.7 boot-script executor (a start instruction keeps the preloaded-only floor) |
 | `-emu_flavor emu\|jit\|smp` | emulator flavor → `emulator.flavor` + `FeatureFlags` |
 | `+A N` | async-thread pool size, preserved verbatim |
 | `+P N` | max process count (`legacy`, or `1024..=134217727`) → `emulator.max_processes` |
@@ -54,6 +54,12 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 | `+hms N` / `+hmbs N` / `+hmax N` / `+hmaxk\|el\|ib B` | GC heap policy (`beam_gc::HeapPolicy`), rounded through the growth table; visible in `garbage_collection` |
 | `run <file.beam> <mod>:<func>/<arity> [arg…]` | the vertical slice: load the file, run, print the result |
 An unmodeled `-FLAG`/`+FLAG` is **data, not a usage error** (it is preserved, and a `-`-flag is recorded); only a **stray positional argument** (outside `run`) is a usage error (exit 2).
+
+### The `-boot` boot action
+The bare `Boot` action — the invocation with no `-eval`/`-s`/`-run`/`run` — is the one that drives a boot script: `../cli.rs`'s `run_boot_script` boots the 22 preloaded modules, resolves the `-boot` value exactly as `init`'s `get_boot/2` does and executes the script through the A.7 boot-script executor (`Runtime::boot_from_script`).
+Its helpers are `boot_file_argument` (the recorded `boot` init argument, first occurrence wins), `boot_file_root` (the Erlang root above `<lib>`) and `resolve_boot_file` (the `<Name>.boot` candidate plus the string-concatenated `<Root>/bin/<candidate>` fallback; a `$ROOT/…` value is read against the same root).
+A missing script is the typed `cannot get bootfile <Name>` error; a malformed script and the executor's honest Milestone-1 stop at the system script's `{apply,{application,load,…}}` directive are typed errors too — all reported `beam_rt: <error>` with exit 1, never a silent skip, a panic or a hang.
+A start instruction (`-eval`/`-s`/`-run`/`run`) keeps the preloaded-only floor, so `-boot` is recorded there but **not** executed.
 
 ## `ERL_*FLAGS` — the environment merge
 `parse_with_env` merges four environment variables into the command line before parsing, in real `erl`'s order (`erts/etc/common/erlexec.c`, `initial_argv_massage`):
@@ -100,7 +106,7 @@ The parser reproduces the oracle's split between emulator/`init` switches and fl
 * The `-eval`/`-s`/`-run` **Start instructions** are consumed by `init` and are **not** recorded (`init:get_argument('eval'|'s'|'run')` is the bare atom `error`).
 A flag's name is its switch with the leading `-`/`+` run removed (`--nope` → `nope`, `-pa` → `pa`).
 A valueless flag is one occurrence with no values (`-noshell` ⇒ `{ok,[[]]}`); `-pa /a -pa /b` is two occurrences (`{ok,[["/a"],["/b"]]}`).
-The oracle additionally reports its own `root`/`bindir`/`progname`/`home` entries, which this runtime does not model.
+The oracle additionally reports its own `root`/`bindir`/`progname`/`home` entries in this listing, none of which is an `InitArgs` occurrence here: the native `init:get_argument/1` floor answers `root`/`home`/`progname` from the runtime's own state (`../native/init.rs`) — where `progname` is a deliberate, invocation-dependent gap, each runtime reporting the basename **it** was invoked as — while `bindir` is not modelled.
 
 ## Exit codes (the stable external contract)
 | Code | Meaning | stderr |
@@ -131,7 +137,7 @@ A runtime **halt** the program requests is neither: it exits with the requested 
 * `env.rs` in-module tests: the tokenizer (whitespace runs, quote grouping/concatenation, escapes, `#`, empty input, multi-token expansion) and the merge (order, unset omission, per-variable tokenization, `ERL_FLAGS` before `ERL_ZFLAGS`).
 * `flags.rs` in-module tests: the `+Q`/`+P` ranges, the `+sbt` literals, `+K`, `-emu_flavor`, and the `-M*`/`+M*` allocator grammar.
 * `vars.rs` in-module tests: each variable alone and unset (`None`), the `atoi` primitive (`c_atoi`, incl. sign/whitespace/trailing garbage/saturation), the `ERL_MAX_PORTS` clamp (`1`/`100`/`2000`/`999999999`/`bogus`), a malformed `ERL_CRASH_DUMP_SECONDS` and a non-numeric `ERL_MAX_ETS_TABLES`, and the `+Q` token detection.
-* `../cli.rs` in-module tests: every switch, the init-argument recording rule, the `run` grammar, the trailing-dot `-eval`, and the four exit codes.
+* `../cli.rs` in-module tests: every switch, the init-argument recording rule, the `run` grammar, the trailing-dot `-eval`, the `-boot` value selection + `init`'s `get_boot/2` resolution (and an absent script ⇒ exit 1), and the four exit codes.
 * `../../tests/cli_flags.rs` (integration): the **built binary** honours the `ERL_*FLAGS` merge — each variable reaches `init:get_argument/1`, the full merge order, tokenization at the CLI boundary — with golden values pinned from the oracle, plus a direct cross-check against the system `erl` that **skips loudly** when `erl` is unavailable.
 * `../../tests/cli_env.rs` (integration): the second environment family through `beam_rt::cli::parse_with_env` + `MapEnv` (the clamped `+Q` injection **and** the `config.max_ports` request it records, the `+Q`-override cases, `parse`'s purity, every field landing in `config.env_vars()`, and that none becomes an init argument), plus oracle probes of `system_info(port_limit)` that **skip loudly** when `erl` is unavailable. The full `+Q`/`ERL_MAX_PORTS` `port_limit` matrix against this runtime lives in `../../tests/system_info_oracle.rs`.
 

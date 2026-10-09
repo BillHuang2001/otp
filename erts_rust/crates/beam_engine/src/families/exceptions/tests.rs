@@ -113,6 +113,7 @@ fn assert_reason_tuple(
     );
 }
 
+mod cross_module;
 mod end_to_end;
 mod handlers;
 mod raising;

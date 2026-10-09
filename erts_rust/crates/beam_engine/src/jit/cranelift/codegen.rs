@@ -46,7 +46,8 @@ use crate::jit::baseline::{encode_target, jit_step_one};
 
 use super::compare::{emit_inline_comparison, inline_comparison};
 use super::inline::{
-    emit_inline_arith, emit_inline_move, emit_inline_test, fast_arith, inline_move, inline_test,
+    emit_inline_arith, emit_inline_move, emit_inline_swap, emit_inline_test, fast_arith,
+    inline_move, inline_swap, inline_test,
 };
 use super::module_error;
 use super::report::CodegenReport;
@@ -174,6 +175,8 @@ pub(super) fn compile_module(
         inlined_select_vals: report.inlined_select_vals,
         inlined_tuple_reads: report.inlined_tuple_reads,
         inlined_list_reads: report.inlined_list_reads,
+        inlined_swaps: report.inlined_swaps,
+        inlined_tail_calls: report.inlined_tail_calls,
     })
 }
 /// Emit one cranelift function for IR function `function` (`func_index` of
@@ -404,6 +407,14 @@ fn emit_pc(
                 return;
             }
         }
+        Some(Instr::Swap { a, b }) => {
+            if let Some((a_x, b_x)) = inline_swap(a, b) {
+                report.inlined_swap();
+                emit_inline_swap(builder, rt, a_x, b_x, report);
+                goto_or_leave(builder, cfg, code_len, func_index, pc + 1);
+                return;
+            }
+        }
         Some(Instr::Jump { target }) => {
             if let Ok(resolved) = labels.resolve(*target) {
                 emit_target_branch(builder, cfg, code_len, func_index, resolved);
@@ -411,6 +422,19 @@ fn emit_pc(
             }
             // An undefined label keeps the interpreter's exact `unknown_label` error:
             // hand the jump to the helper rather than inventing one.
+        }
+        // A local tail call **without** a frame to pop (`call_only Arity Label`):
+        // `i_call_only(Dest)` is `$DISPATCH_REL(Dest)`, so it transfers control exactly
+        // like a `jump` — the same lowering the baseline tier gives it. (`call_last`
+        // must first pop the frame, which is Rust-side `Machine` state, so it stays on
+        // the helper; a target in another IR function, or an undefined label, deopts
+        // the same way a `jump` does.)
+        Some(Instr::CallOnly { target, .. }) => {
+            if let Ok(resolved) = labels.resolve(*target) {
+                report.inlined_tail_call();
+                emit_target_branch(builder, cfg, code_len, func_index, resolved);
+                return;
+            }
         }
         // The inlined word-level `test` subset: the type tests and the provably-exact
         // comparison shapes (see [`inline::inline_test`]). Everything outside that subset, and

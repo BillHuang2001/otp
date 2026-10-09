@@ -38,7 +38,8 @@
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer) + the BIF registry |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
-//! | `erlang:statistics/1` | `run_queue` from [`Runtime::run_queue_len`]; `wall_clock` from the process clock |
+//! | `erlang:statistics/1` | `run_queue`; `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `io` (the port subsystem's byte counters); `scheduler_wall_time` (`undefined`, never enabled) |
+//! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
 //!
 //! Every **other** `(module, function, arity)` answers the same typed capability gap the
 //! defaulted seam does (see [`RuntimeHooksBridge::call`]), so installing this bridge never
@@ -53,10 +54,18 @@
 //!   exposes — so the absolute form is reported as the typed capability gap rather than
 //!   approximated by a millisecond-off estimate. `{abs, false}` (the default) IS served.
 //! * `statistics/1` serves **only** the keys this runtime can measure for real
-//!   (`run_queue`, `wall_clock`, see [`RuntimeHooksBridge::statistics`]); every other key
-//!   the oracle accepts is a valid statistics key this runtime cannot answer honestly, so
-//!   it reports the typed capability gap. A name that is not a statistics key at all is
-//!   the oracle's `badarg`.
+//!   (`run_queue`, `wall_clock`, `reductions`/`exact_reductions`, `context_switches`, `io`
+//!   and the never-enabled `scheduler_wall_time`, see
+//!   [`RuntimeHooksBridge::statistics`]); every other key the oracle accepts is a valid
+//!   statistics key this runtime cannot answer honestly, so it reports the typed capability
+//!   gap. A name that is not a statistics key at all is the oracle's `badarg`.
+//! * `os:set_signal/2` installs the disposition for real (the one process-global
+//!   [`signal`] facility), but the **notification leg** of ERTS's signal handling is not
+//!   wired: this runtime boots no `erl_signal_server` process and registers the facility's
+//!   read end with no poller, so a handled signal is never turned into a `{notify, Signal}`
+//!   message. The three `sigstop` forms are the oracle's `ok` without a syscall — the kernel
+//!   refuses every disposition change for a kernel-only signal. `signal`'s module docs carry
+//!   the full reasoning and the exact wiring a future pass must add.
 //!
 //! # Destination semantics (the C `erts_hl_timer`, read-only reference)
 //!
@@ -67,18 +76,22 @@
 
 use beam_alloc::Heap;
 use beam_bifs::RuntimeHooks;
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
+use beam_io::signal::{Disposition, Signal};
 use beam_process::{PidTarget, ProcessId, ProcessTable};
 use beam_term::prelude::{atom_val, is_atom, is_small, make_small, signed_value};
 use beam_term::{AtomTable, Eterm};
 
 use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::error;
 use crate::runtime::Runtime;
 use crate::timers::{self, TimerTarget};
+
+use super::signal;
 
 /// The [`RuntimeHooks`] provider over the running runtime.
 ///
@@ -262,6 +275,56 @@ impl<'a> RuntimeHooksBridge<'a> {
         atom_term(atoms, if exported { "true" } else { "false" })
     }
 
+    /// `os:set_signal/2` — install an OS-signal disposition.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`) against
+    /// `erts/emulator/beam/erl_bif_os.c:145-160` (`os_set_signal_2`) and
+    /// `erts/emulator/sys/unix/sys.c:698-767` (`signalterm_to_signum`/`erts_set_signal`):
+    ///
+    /// * both arguments must be **atoms** (`is_atom`; a string or an integer is `badarg`);
+    /// * the option must be exactly `default`, `handle` or `ignore` — in the C the option is
+    ///   validated **first**, so an unknown option is `badarg` even for an unknown signal,
+    ///   and both are `badarg` regardless of order here (the answer is the same);
+    /// * the signal must be one of the twelve atoms `signalterm_to_signum` maps
+    ///   ([`Signal::ALL`]) — `sigkill`, `sigttin`, `sigttou`, `siginfo` and every other atom
+    ///   are `badarg`;
+    /// * otherwise the answer is the bare atom `ok` and the disposition is installed
+    ///   *process-globally*: the C's `sys_signal` is a plain `sigaction(2)`, so the
+    ///   disposition outlives the calling process and is shared by the whole node. This
+    ///   runtime keeps that in the one long-lived [`signal`] facility, so
+    ///   `os:set_signal(sigusr1, ignore)` followed by `os:set_signal(sigusr1, handle)`
+    ///   really does leave `handle` installed.
+    ///
+    /// `sigstop` is the one accepted signal the kernel refuses to change (`sigaction(2)`
+    /// answers `EINVAL` for it, whose result the C discards); it is the oracle's `ok` here
+    /// too, without issuing the syscall — see [`signal::install`].
+    ///
+    /// The **notification** leg (ERTS's `{notify, SignalName}` to `erl_signal_server`) is
+    /// not wired: there is no such process and no poller registration for the facility's
+    /// read end (see [`signal`]). A handled signal is therefore recorded and not delivered —
+    /// a documented gap, never a fabricated recipient.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom argument, an unknown signal name or an unknown option; a
+    /// genuine `BeamError::Io` only if the OS refuses to create the facility or install the
+    /// disposition (reported, never swallowed).
+    fn set_signal(&mut self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let signal_term = *args.first().ok_or(BeamError::BadArg)?;
+        let option_term = *args.get(1).ok_or(BeamError::BadArg)?;
+        if !is_atom(signal_term) || !is_atom(option_term) {
+            return Err(BeamError::BadArg);
+        }
+        // A name the caller's shared table does not hold cannot be one of the accepted
+        // atoms, so it is the oracle's `badarg` — never the typed "not interned" gap.
+        let signal_name = atoms.name(atom_val(signal_term)).ok_or(BeamError::BadArg)?;
+        let option_name = atoms.name(atom_val(option_term)).ok_or(BeamError::BadArg)?;
+        let signal = Signal::from_name(signal_name).ok_or(BeamError::BadArg)?;
+        let disposition = Disposition::from_name(option_name).ok_or(BeamError::BadArg)?;
+        signal::install(signal, disposition)?;
+        atom_term(atoms, "ok")
+    }
+
     /// `erlang:link/1`: link the calling process to `Target`, answering `true`.
     ///
     /// Oracle-verified (OTP 29/`erts-17.1`): `Target` must be a pid — anything else is
@@ -344,11 +407,221 @@ impl<'a> RuntimeHooksBridge<'a> {
         atom_term(atoms, "true")
     }
 
+    /// `erlang:dt_get_tag/0`, `erlang:dt_get_tag_data/0`, `erlang:dt_put_tag/1` — the
+    /// dynamic-tracing tag family.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): with dynamic tracing compiled out
+    /// (`!USE_VM_PROBES`, `erts/emulator/beam/bif.c:5980-6160`) all three answer the atom
+    /// `undefined`; `dt_put_tag/1` ignores its argument entirely.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap when the atom `undefined` is not interned.
+    fn dt_tag(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "undefined")
+    }
+
+    /// `erlang:dt_append_vm_tag_data/1`, `erlang:dt_prepend_vm_tag_data/1` — the VM-probe tag
+    /// data helpers.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): with dynamic tracing compiled out both return
+    /// their argument **unchanged** and apply no type check — `dt_append_vm_tag_data(42)`
+    /// answers `42` (`bif.c`'s `!USE_VM_PROBES` bodies). `lib/kernel/src/file.erl` brackets
+    /// its calls with these, so serving them is what keeps that path running.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` when the argument is missing.
+    fn dt_vm_tag_data(&self, args: &[Eterm]) -> Result<Eterm> {
+        args.first().copied().ok_or(BeamError::BadArg)
+    }
+
+    /// `erlang:system_profile/0` — the profiler start request.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers the atom `undefined`. The C only answers
+    /// anything else when a profiling subsystem is actually running in the emulator, and this
+    /// runtime has none.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap when the atom `undefined` is not interned.
+    fn system_profile(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "undefined")
+    }
+
+    /// `erlang:check_old_code/1` — whether any process still runs old code for `Module`.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): a non-atom is `badarg`; **any** atom answers
+    /// `false` (even an unloaded one). There is never old code here: loading a module never
+    /// replaces a live one in this runtime, so the honest answer is always `false`.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom.
+    fn check_old_code(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let module = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(module) {
+            return Err(BeamError::BadArg);
+        }
+        atom_term(atoms, "false")
+    }
+
+    /// `erlang:finish_loading/1` — the prepared-code loading primitive.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): the empty list answers `ok`; anything else —
+    /// including the non-empty list a real `code:load_binary` would pass — is `badarg`,
+    /// because `prepare_loading/2` (which mints the internal prepared-code terms) is not
+    /// implemented and the C requires a genuine prepared term
+    /// (`erts/emulator/beam/beam_bif_load.c:793-845`).
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for anything but the empty list.
+    fn finish_loading(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let prepared = *args.first().ok_or(BeamError::BadArg)?;
+        if !terms::list_elements(prepared)
+            .map_err(|_| BeamError::BadArg)?
+            .is_empty()
+        {
+            return Err(BeamError::BadArg);
+        }
+        atom_term(atoms, "ok")
+    }
+
+    /// `erlang:call_on_load_function/1`, `erlang:has_prepared_code_on_load/1` and
+    /// `erlang:finish_after_on_load/2` — the on-load-hook primitives.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`, a BEAMASM build): all three always answer
+    /// `badarg`. They require an internal prepared-code term that only `prepare_loading/2`
+    /// can mint (and on BEAMASM `call_on_load_function` rejects even that form,
+    /// `beam_bif_load.c:793-799`), so `badarg` is the honest, complete answer.
+    ///
+    /// # Errors
+    ///
+    /// Always `badarg`.
+    fn badarg_always(&self) -> Result<Eterm> {
+        Err(BeamError::BadArg)
+    }
+
+    /// `erts_internal:is_system_process/1` and `erts_internal:is_process_executing_dirty/1`
+    /// — process-state predicates over an **internal** pid.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): a local pid answers `false` for both (this
+    /// runtime has no system process and never executes Process code on a dirty scheduler);
+    /// anything that is not a pid is `badarg`. A **remote** pid is the typed capability gap
+    /// rather than a fabricated `false`: the C reads the local process record
+    /// (`erl_bif_info.c:4336-4360`, `erl_process.c:9216-9250`), which a foreign pid has none
+    /// of (`PidTarget::Remote` is a distribution, contract A.5, not implemented here).
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-pid; the typed gap for a remote pid.
+    fn is_process_predicate(&self, atoms: &AtomTable, args: &[Eterm], what: &str) -> Result<Eterm> {
+        let term = *args.first().ok_or(BeamError::BadArg)?;
+        match PidTarget::from_eterm(term) {
+            Ok(PidTarget::Local(_)) => atom_term(atoms, "false"),
+            Ok(PidTarget::Remote(_)) => Err(error::unsupported(&format!(
+                "erts_internal:{what}/1 on a remote pid: distribution is not implemented"
+            ))),
+            Err(_) => Err(BeamError::BadArg),
+        }
+    }
+
+    /// `erts_internal:erase_persistent_terms/0` — erase **every** persistent term.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers `true`. This is the test suite's reset
+    /// hook (`erts/emulator/beam/erl_bif_persistent.c:551-567`), and it really clears this
+    /// runtime's own store (`Runtime::persistent_terms`) — a later
+    /// `persistent_term:get/0` sees an empty table.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap when the store is already borrowed (the BIF cannot re-enter
+    /// it), mirroring the `PersistentTerm` arm's nested-borrow contract.
+    fn erase_persistent_terms(&self, atoms: &AtomTable) -> Result<Eterm> {
+        let store = Rc::clone(&self.runtime.persistent_terms);
+        let mut store = store.try_borrow_mut().map_err(|_| {
+            error::unsupported(
+                "erts_internal:erase_persistent_terms/0: the persistent-term store is in use",
+            )
+        })?;
+        for (key, _) in store.get_all() {
+            store.erase(key, atoms);
+        }
+        atom_term(atoms, "true")
+    }
+
+    /// `erts_literal_area_collector:release_area_switch/0` — the literal-area switch probe.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): the oracle **raises** `error notsup` (`i_notsup`
+    /// in `erts/emulator/beam/erl_bif_info.c`) — the facility is not compiled in — so this
+    /// arm must raise the same reason, never return the bare atom. This runtime has no
+    /// literal-area-collector process at all, so `notsup` is the honest answer rather than a
+    /// fabricated success.
+    ///
+    /// # Errors
+    ///
+    /// Always the `error notsup` raise the oracle produces.
+    fn notsup(&self) -> Result<Eterm> {
+        Err(BeamError::Raise(Raise::error(ExitReason::atom(String::from(
+            "notsup",
+        )))))
+    }
+
+    /// `erts_trace_cleaner:check/0` — whether the trace-cleaner has work to do.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers `false`
+    /// (`erts/emulator/beam/erl_bif_trace.c:605-640` returns `am_false` unless a cleanup
+    /// signal is pending). This runtime never mints one.
+    ///
+    /// # Errors
+    ///
+    /// The typed gap when the atom `false` is not interned.
+    fn trace_cleaner_check(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "false")
+    }
+
+    /// `error_logger:warning_map/0` — the logger-level → error-logger-event mapping.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): answers the atom `warning`, the fixed
+    /// `erts_error_logger_warnings` mapping this build ships.
+    ///
+    /// # Errors
+    ///
+    /// The typed gap when the atom `warning` is not interned.
+    fn warning_map(&self, atoms: &AtomTable) -> Result<Eterm> {
+        atom_term(atoms, "warning")
+    }
+
+    /// `code:set_coverage_mode/1` — set the coverage mode, answering the **previous** mode.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`): only the atoms `none` and `line` are accepted
+    /// (anything else, `call` included, is `badarg`) and the answer is `none` — this runtime
+    /// has no coverage-instrumented code, so the previous mode is always `none`
+    /// (`code:coverage_support/0` is `true`, `code:get_coverage_mode/0` is `none`; the
+    /// per-module and per-call coverage *readers* — `get_coverage/2`, `reset_coverage/1`,
+    /// `get_debug_info/1` — are `badarg` for every argument in this build, so they stay the
+    /// typed capability gap).
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom or an atom other than `none`/`line`.
+    fn set_coverage_mode(&self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let mode = *args.first().ok_or(BeamError::BadArg)?;
+        if !is_atom(mode) {
+            return Err(BeamError::BadArg);
+        }
+        match atoms.name(atom_val(mode)) {
+            Some("none") | Some("line") => atom_term(atoms, "none"),
+            _ => Err(BeamError::BadArg),
+        }
+    }
+
     /// `erlang:statistics/1` — the counters this runtime can answer **honestly** from its
     /// own real state.
     ///
-    /// Oracle-verified (OTP 29/`erts-17.1`). The two keys served, and why each figure is a
-    /// real measurement rather than a placeholder:
+    /// Oracle-verified (OTP 29/`erts-17.1`). The served keys, and why each figure is a real
+    /// measurement rather than a placeholder:
     ///
     /// * `run_queue` → the total length of the runnable queues, as a small integer. This is
     ///   [`Runtime::run_queue_len`], the length of the runtime's **one** real run queue
@@ -359,6 +632,21 @@ impl<'a> RuntimeHooksBridge<'a> {
     ///   process monotonic clock ([`std::time::Instant`]). The oracle's relationship holds
     ///   exactly: the first read answers the same value for both elements, and every later
     ///   read answers the delta since the previous one. This is what `c:uptime/0` reads.
+    /// * `reductions`/`exact_reductions` → `{Total, SinceLast}` from the node-global
+    ///   **cumulative** reduction count the runner keeps ([`Runtime::note_reductions`]): the
+    ///   number of reduction units (`BudgetProbe`) the executing machine was charged at its
+    ///   heap-admission points, summed over every scheduler slice. `SinceLast` is the delta
+    ///   since the previous read of the *same* key (see [`Runtime::reductions_statistics`]).
+    /// * `context_switches` → `{Total, SinceLast}` from the node-global process-dispatch
+    ///   counter the scheduler keeps ([`Runtime::note_context_switches`]): one per slice the
+    ///   run loop dispatched. `SinceLast` is the delta since the previous read.
+    /// * `io` → `{{input, BytesIn}, {output, BytesOut}}` from the shared byte counters the
+    ///   port subsystem bumps ([`crate::port::IoCounters`]): bytes delivered from a port as
+    ///   `{Port, {data, …}}` and bytes written to a port by `port_command/2,3`.
+    /// * `scheduler_wall_time` → the atom `undefined`, the oracle's own "not enabled"
+    ///   answer. Only `erlang:system_flag(scheduler_wall_time, true)` turns it into a list of
+    ///   `{SchedulerId, ActiveTime, TotalTime}` tuples, and this runtime never enables it, so
+    ///   `undefined` is exact rather than an approximation.
     ///
     /// **Documented divergence (the epoch, never the clock).** The oracle's `wall_clock`
     /// total is measured from emulator start; this runtime anchors it at the **first**
@@ -366,19 +654,20 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// — the runtime's other monotonic origin lives inside `beam_bifs` (`src/time.rs`) and
     /// exposes no reader. The numbers are therefore real elapsed time with a different
     /// zero, exactly the class of divergence as `erlang:processes/0` ("an answer that reads
-    /// *this* runtime's own state").
+    /// *this* runtime's own state"). The same "different zero" holds for `reductions` and
+    /// `context_switches`: they count *this* runtime's own work from its own start, and the
+    /// oracle counts far more of both because it runs a much larger emulator.
     ///
     /// Every **other** key the oracle accepts is a genuine statistics key this runtime
-    /// cannot measure — `reductions`/`exact_reductions` need a node-global **cumulative**
-    /// reduction counter (this runtime's counters are per-process and reset by every
-    /// scheduler slice, so summing them would be a made-up total), `runtime` needs CPU time,
-    /// `context_switches` a context-switch counter, `garbage_collection` a collector,
-    /// `scheduler_wall_time`/`scheduler_wall_time_all` per-scheduler CPU time,
-    /// `microstate_accounting` the MSACC machinery, `io` I/O byte counters and `run_queues`
-    /// / `active_tasks*` / `*_run_queue_lengths*` the per-scheduler queue lists — so each
-    /// answers the typed capability gap rather than a fabricated number (workspace
-    /// `CONTEXT.md` §3). A name that is **not** a statistics key at all is the oracle's
-    /// `badarg` (`erl_bif_info.c:4333`), which is reproduced rather than reported as a gap.
+    /// cannot measure — `runtime` needs CPU time this crate cannot read without `unsafe`
+    /// (it is `#![deny(unsafe_code)]` and `std` exposes no CPU-time clock, so wall-clock
+    /// time is deliberately **not** substituted), `garbage_collection` a real accumulative
+    /// collector, `scheduler_wall_time_all`/`*_run_queue_lengths*`/`active_tasks*`/
+    /// `run_queues` per-scheduler queue lists and CPU time, and `microstate_accounting` the
+    /// MSACC machinery — so each answers the typed capability gap rather than a fabricated
+    /// number (workspace `CONTEXT.md` §3). A name that is **not** a statistics key at all is
+    /// the oracle's `badarg` (`erl_bif_info.c:4333`), which is reproduced rather than
+    /// reported as a gap.
     ///
     /// # Errors
     ///
@@ -397,6 +686,27 @@ impl<'a> RuntimeHooksBridge<'a> {
             "wall_clock" => {
                 let (total, since) = wall_clock_millis();
                 heap.tuple(&[make_small(total), make_small(since)])
+            }
+            // `scheduler_wall_time` answers `undefined` until
+            // `erlang:system_flag(scheduler_wall_time, true)` has been applied
+            // (`erl_bif_info.c:4258-4273`), and this runtime never enables it — it keeps no
+            // per-scheduler CPU accounting to hand out. The oracle's own "not enabled"
+            // answer is therefore the exact one to give, not a substitute for a missing
+            // measurement (`tests/runtime_hooks.rs` pins it against the live oracle).
+            "scheduler_wall_time" => atom_term(atoms, "undefined"),
+            // The three `{Total, SinceLast}` counter pairs, read from the runtime's own real
+            // cumulative counters (`SinceLast` is the delta since the previous read of this
+            // same key — see `Runtime::reductions_statistics`).
+            "reductions" => counter_pair(heap, self.runtime.reductions_statistics(false)),
+            "exact_reductions" => counter_pair(heap, self.runtime.reductions_statistics(true)),
+            "context_switches" => counter_pair(heap, self.runtime.context_switch_statistics()),
+            // `{{input, BytesIn}, {output, BytesOut}}` from the port subsystem's own byte
+            // counters — the bytes this runtime really read from and wrote to its ports.
+            "io" => {
+                let (input, output) = self.runtime.io_statistics();
+                let in_pair = heap.tuple(&[atom_term(atoms, "input")?, small_u64(input)])?;
+                let out_pair = heap.tuple(&[atom_term(atoms, "output")?, small_u64(output)])?;
+                heap.tuple(&[in_pair, out_pair])
             }
             other if STATISTICS_KEYS.contains(&other) => Err(error::unsupported(&format!(
                 "erlang:statistics/1: the `{other}` counter is not implemented"
@@ -524,11 +834,41 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             ("erlang", "send_after", 4) => self.send_after_4(heap, args),
             ("erlang", "cancel_timer", 2) => self.cancel_timer_2(heap, args),
             ("erlang", "function_exported", 3) => self.function_exported(heap, atoms, args),
+            ("os", "set_signal", 2) => self.set_signal(atoms, args),
             ("erlang", "link", 1) => self.link(args, false),
             ("erlang", "unlink", 1) => self.link(args, true),
             ("erlang", "dt_spread_tag", 1) => self.dt_spread_tag(atoms, args),
             ("erlang", "dt_restore_tag", 1) => self.dt_restore_tag(atoms, args),
             ("erlang", "statistics", 1) => self.statistics(heap, atoms, args),
+            // Dynamic-tracing tag family: compiled out, so each is the oracle's fixed answer.
+            ("erlang", "dt_get_tag", 0)
+            | ("erlang", "dt_get_tag_data", 0)
+            | ("erlang", "dt_put_tag", 1) => self.dt_tag(atoms),
+            ("erlang", "dt_append_vm_tag_data", 1)
+            | ("erlang", "dt_prepend_vm_tag_data", 1) => self.dt_vm_tag_data(args),
+            ("erlang", "system_profile", 0) => self.system_profile(atoms),
+            // The code-store primitives the runtime can answer from its own real state.
+            ("erlang", "check_old_code", 1) => self.check_old_code(atoms, args),
+            ("erlang", "finish_loading", 1) => self.finish_loading(atoms, args),
+            ("erlang", "call_on_load_function", 1)
+            | ("erlang", "has_prepared_code_on_load", 1)
+            | ("erlang", "finish_after_on_load", 2) => self.badarg_always(),
+            // Internal process-state predicates and the persistent-term reset hook.
+            ("erts_internal", "is_system_process", 1) => {
+                self.is_process_predicate(atoms, args, "is_system_process")
+            }
+            ("erts_internal", "is_process_executing_dirty", 1) => {
+                self.is_process_predicate(atoms, args, "is_process_executing_dirty")
+            }
+            ("erts_internal", "erase_persistent_terms", 0) => self.erase_persistent_terms(atoms),
+            // The internal `notsup` probes and the trace-cleaner / error-logger constants.
+            ("erts_literal_area_collector", "release_area_switch", 0) => self.notsup(),
+            ("erts_trace_cleaner", "check", 0) => self.trace_cleaner_check(atoms),
+            ("error_logger", "warning_map", 0) => self.warning_map(atoms),
+            // The `code:*` coverage-mode surface (see `set_coverage_mode`).
+            ("code", "coverage_support", 0) => atom_term(atoms, "true"),
+            ("code", "get_coverage_mode", 0) => atom_term(atoms, "none"),
+            ("code", "set_coverage_mode", 1) => self.set_coverage_mode(atoms, args),
             // Unreachable: `RuntimeContext::uses_runtime_hooks` gates this bridge to exactly
             // the keys above. Reporting the same typed capability gap the defaulted seam
             // reports keeps an ungated key honest rather than fabricated (workspace
@@ -541,16 +881,16 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
     }
 }
 
-/// Every key the oracle's `erlang:statistics/1` accepts beyond the two this runtime serves
+/// Every key the oracle's `erlang:statistics/1` accepts beyond the ones this runtime serves
 /// (`erts/emulator/beam/erl_bif_info.c:4169-4332`, plus the `ERTS_ENABLE_MSACC`-gated
 /// `microstate_accounting`).
 ///
 /// The list exists to tell a **valid** key this runtime cannot measure (the honest typed
 /// capability gap, [`RuntimeHooksBridge::statistics`]) from a name that is not a statistics
 /// key at all (the oracle's `badarg`) — the only two answers, since a fabricated figure is
-/// never acceptable (workspace `CONTEXT.md` §3).
+/// never acceptable (workspace `CONTEXT.md` §3). A key this runtime *does* serve has its own
+/// arm in [`RuntimeHooksBridge::statistics`] and must **not** appear here.
 const STATISTICS_KEYS: &[&str] = &[
-    "scheduler_wall_time",
     "scheduler_wall_time_all",
     "total_active_tasks",
     "total_run_queue_lengths",
@@ -561,14 +901,27 @@ const STATISTICS_KEYS: &[&str] = &[
     "active_tasks_all",
     "run_queue_lengths_all",
     "microstate_accounting",
-    "context_switches",
     "garbage_collection",
-    "reductions",
-    "exact_reductions",
     "runtime",
-    "io",
     "run_queues",
 ];
+
+/// The `{Total, SinceLast}` pair of small integers the three counter keys answer with.
+///
+/// # Errors
+///
+/// Propagates the heap's failure when the tuple cannot be built.
+fn counter_pair(heap: &mut Heap, (total, since): (u64, u64)) -> Result<Eterm> {
+    heap.tuple(&[small_u64(total), small_u64(since)])
+}
+
+/// `value` as a small-integer term, saturated at `i64::MAX`.
+///
+/// A counter is `u64` so it can never wrap, while a term's small integer is signed; the
+/// saturation keeps the conversion total without ever trapping.
+fn small_u64(value: u64) -> Eterm {
+    make_small(i64::try_from(value).unwrap_or(i64::MAX))
+}
 
 thread_local! {
     /// The wall-clock anchor and the previous `statistics(wall_clock)` read, in one slot.

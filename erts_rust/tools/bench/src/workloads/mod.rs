@@ -36,6 +36,7 @@ pub mod emqx;
 pub mod erlc_compiler;
 pub mod foreign;
 pub mod khepri;
+pub mod list_walk;
 pub mod plb;
 pub mod slice;
 pub mod tool;
@@ -122,6 +123,7 @@ pub fn registry() -> Vec<Box<dyn Workload>> {
         Box::new(emqx::Emqx),
         Box::new(slice::Slice),
         Box::new(foreign::Foreign),
+        Box::new(list_walk::ListWalk),
     ]
 }
 
@@ -197,7 +199,8 @@ mod tests {
                 "khepri",
                 "emqx",
                 "slice",
-                "foreign"
+                "foreign",
+                "list_walk"
             ]
         );
     }

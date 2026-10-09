@@ -117,6 +117,31 @@
 //! `update_counter`/`update_element`/the delete+replace verbs, and no check at all
 //! for `ets:info/1,2`. A denial is `badarg` **and leaves the table in the registry**.
 //!
+//! # The owner→handle roster (the runtime's reclamation seam)
+//!
+//! An ETS table belongs to the process that created it, so the *runtime* — which
+//! owns process death — must reclaim a dead owner's tables. It cannot see this
+//! registry's private table map, so [`TableRegistry`] exposes the two public
+//! entry points that adoption needs:
+//!
+//! * [`TableRegistry::owner_of`] — the pid→owner bridge
+//!   (`OwnerId::new(pid.to_eterm().raw() as u64)`), the **same** encoding
+//!   [`resolve::caller_owner`] records at `ets:new/2` time, so an owner read back
+//!   from a table and a pid converted here always agree;
+//! * [`TableRegistry::handles_owned_by`] — every handle a given owner holds,
+//!   ascending, **including an unnamed table's** (whose handle is otherwise
+//!   unreachable from any public term).
+//!
+//! A host lists a dead pid's handles, then per table calls
+//! `beam_ets::Table::owner_died` and acts on the returned `OwnerDeath`: an
+//! unnamed/orphan table is dropped through the existing
+//! [`TableRegistry::remove`] (+ [`TableRegistry::remove_name`] for a
+//! `named_table`), a live heir takes it over, and `{'ETS-TRANSFER', Tid, FromPid,
+//! Data}` is delivered **only** when `heir.data` is `Some` (an arity-2
+//! `{heir, Pid}` inherits in silence). [`ets:delete/1`] already drops the profile
+//! and the name, so an index handle for a deleted table resolves to no table
+//! ([`TableRegistry::get_mut`] is `None`) and is skipped.
+//!
 //! # The child modules and the remaining gaps (see the crate `CONTEXT.md`)
 //!
 //! The faithful verbs live in the child modules: `ets:safe_fixtable/2`,
@@ -127,11 +152,15 @@
 //! fun through the `FunCaller` seam, so a non-empty fold is the typed
 //! `unsupported_bif` gap until a host installs it.)
 //!
-//! The verbs that stay **unregistered** are the honest typed gaps documented in
-//! [`adopt`] and [`extra`], each with the exact `beam_ets` API that would close it:
-//! `ets:slot/2` and `ets:internal_request_all/0` — seam-backed through the
-//! `RuntimeHooks` stub in `src/runtime/other.rs` — and the `ets:setopts/2`
-//! `{protection, _}` sub-option.
+//! Four `ets` keys stay honest typed gaps, each for a reason no `BifFn` can
+//! satisfy (see [`adopt`] and [`extra`]): `ets:slot/2` (C-interior `db_slot`), and
+//! `ets:internal_request_all/0` (a ref + one reply message per scheduler, which
+//! needs process messaging), both seam-backed through the `RuntimeHooks` stub in
+//! `src/runtime/other.rs`; plus the `ets:setopts/2` `{protection, _}` sub-option
+//! (no post-creation access setter in `beam_ets`). `ets:fun2ms/1` and
+//! `ets:repair_continuation/2` are pure `stdlib/src/ets.erl` functions — **not**
+//! `bif.tab` entries — so the registry can never dispatch them and they stay
+//! unregistered.
 //!
 //! # The `*_lookup` family (see [`nav`] for the BIFs)
 //!
@@ -144,20 +173,24 @@
 //!
 //! # The reverse select family (see [`reverse`] for the BIFs)
 //!
-//! `ets:select_reverse/1,2,3` lives in the child module [`reverse`]: for an
-//! `ordered_set` results come in **descending** key order, for the hash kinds the
-//! oracle ignores the reverse flag and the order is `select`'s (unspecified). Its
-//! continuations are private to that module, because a
-//! [`beam_ets::MatchContinuation`] cannot express a backward position; they carry
-//! a ref id from a distinct namespace, and `ets:select/1` and
-//! `ets:select_reverse/1` share one dispatcher so resuming follows the *stored*
-//! direction, as the oracle does.
+//! `ets:select_reverse/1,2,3` lives in the child module [`reverse`] and is a thin
+//! wrapper over `beam_ets`'s native reverse family
+//! (`Table::select_reverse`/`select_reverse_limit`/`select_reverse_continue`): for
+//! an `ordered_set` results come in **descending** key order, for the hash kinds
+//! the oracle leaves the order unspecified and the native form yields the reverse
+//! of `select`'s order. Reverse continuations live in the *shared*
+//! [`TableRegistry::continuations`] map alongside the forward ones — a
+//! [`Continuation`] records the **direction** it was minted with, and
+//! `ets:select/1` / `ets:select_reverse/1` share one dispatcher
+//! ([`dispatch_continuation`]) so resuming follows the *stored* direction, as the
+//! oracle does.
 
 use std::collections::HashMap;
 
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_ets::{compile, key_of, MatchContinuation, Table, TableId, TableInfo};
+use beam_ets::{compile, key_of, MatchContinuation, OwnerId, Table, TableId, TableInfo};
+use beam_process::ProcessId;
 use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
 
 use crate::access::{
@@ -207,11 +240,11 @@ mod adopt;
 mod nav;
 /// The reverse select family (`ets:select_reverse/1,2,3`).
 ///
-/// It shares this module's handle contract, its helpers
-/// (`take_table_gated`/`restore_table`/`copy_out_list`) and the shared resolver
-/// [`resolve`]; its continuation registry is private to the child module, because
-/// a `beam_ets::MatchContinuation` cannot express a backward position — a child
-/// of `ets` (declared here, not in `src/lib.rs`).
+/// It is a thin wrapper over `beam_ets`'s native reverse primitives
+/// (`Table::select_reverse`/`select_reverse_limit`); it shares this module's handle
+/// contract, its helpers (`take_table_gated`/`restore_table`/`copy_out_list`/
+/// `finish_chunk`), the shared resolver [`resolve`] and the shared continuation
+/// registry — a child of `ets` (declared here, not in `src/lib.rs`).
 mod reverse;
 /// The shared table-argument resolver, the process/owner bridge, the
 /// creation-time [`resolve::TableProfile`] and the `ets:new/2` option parser.
@@ -271,6 +304,14 @@ struct Continuation {
     table: u64,
     /// The opaque traversal state [`beam_ets::Table::select_continue`] resumes.
     state: MatchContinuation,
+    /// The **direction** the traversal was minted with: `true` for an
+    /// `ets:select_reverse/3` chunk, `false` for `ets:select/3`/`ets:match/3`/
+    /// `ets:match_object/3`. `ets:select/1` and `ets:select_reverse/1` are one BIF
+    /// following the *stored* direction (the oracle), so the dispatcher resumes a
+    /// reverse continuation through `Table::select_reverse_continue` and a forward
+    /// one through `Table::select_continue`, and a chunk minted while resuming
+    /// keeps the direction.
+    reverse: bool,
 }
 
 /// The runtime's ETS tables, keyed by the numeric id of the on-heap ref thing
@@ -303,10 +344,11 @@ pub struct TableRegistry {
     /// The next compiled-spec id to hand out.
     next_spec: u64,
     /// The creation-time [`resolve::TableProfile`] of each live table, keyed by its
-    /// handle. [`TableOptions`] records the `{write_concurrency, …}` flag as a bool
-    /// and has no `{decentralized_counters, _}` field, so the *effective*
-    /// `ets:info/1,2` rendering of those two fields is computed by the `ets:new/2`
-    /// option parser and carried here.
+    /// handle. A profile is recorded only for a table whose
+    /// `ets:info(T, write_concurrency)` value the model cannot express — the
+    /// `beam_ets` [`TableInfo::write_concurrency`] boolean covers `false`/`true`, so
+    /// the profile carries the atom `auto` and the hidden
+    /// `{debug_hash_fixed_number_of_locks, N}` rendering (with `N` normalized).
     ///
     /// The entry **outlives a take/restore round trip**: every table-taking BIF
     /// takes its table through [`TableRegistry::take`] (which keeps the profile) and
@@ -362,8 +404,7 @@ impl TableRegistry {
     /// This is the *permanent* removal (a whole-table delete): the profile is gone
     /// with the table. A caller that only borrows the table and puts it back must
     /// use [`TableRegistry::take`] instead, which keeps the profile so a later
-    /// `ets:info/1,2` still reports the creation-time `write_concurrency` /
-    /// `decentralized_counters` values.
+    /// `ets:info/1,2` still reports the creation-time `write_concurrency` form.
     pub fn remove(&mut self, handle: u64) -> Option<Table> {
         self.continuations.retain(|_, cont| cont.table != handle);
         self.profiles.remove(&handle);
@@ -451,22 +492,37 @@ impl TableRegistry {
     }
     /// Registers `state` as a live continuation of the table stored under
     /// `table`, returning the fresh continuation id (the id of the ref thing the
-    /// `ets:select` BIFs hand to Erlang).
-    pub fn insert_continuation(&mut self, table: u64, state: MatchContinuation) -> u64 {
+    /// `ets:select` BIFs hand to Erlang). `reverse` records the traversal's
+    /// direction (see [`Continuation`]).
+    pub fn insert_continuation(
+        &mut self,
+        table: u64,
+        state: MatchContinuation,
+        reverse: bool,
+    ) -> u64 {
         let handle = self.next_continuation;
         self.next_continuation += 1;
-        self.continuations
-            .insert(handle, Continuation { table, state });
+        self.continuations.insert(
+            handle,
+            Continuation {
+                table,
+                state,
+                reverse,
+            },
+        );
         handle
     }
 
-    /// Removes and returns the continuation stored under `handle`, together with
-    /// the handle of its table (`None` when `handle` is unknown — the caller
-    /// raises `badarg`).
-    pub fn take_continuation(&mut self, handle: u64) -> Option<(u64, MatchContinuation)> {
+    /// Removes and returns the continuation stored under `handle`: the handle of
+    /// its table, its opaque state and its direction (`None` when `handle` is
+    /// unknown — the caller raises `badarg`).
+    pub fn take_continuation(
+        &mut self,
+        handle: u64,
+    ) -> Option<(u64, MatchContinuation, bool)> {
         self.continuations
             .remove(&handle)
-            .map(|cont| (cont.table, cont.state))
+            .map(|cont| (cont.table, cont.state, cont.reverse))
     }
 
     /// The handle of the table a live continuation belongs to, if any.
@@ -533,6 +589,55 @@ impl TableRegistry {
             })
             .collect()
     }
+
+    /// Every live table handle owned by `owner`, **ascending by handle** — the
+    /// owner→handle roster the runtime reclaims through on a process death
+    /// (`beam_ets::Table::owner_died`).
+    ///
+    /// The table's owner is read from [`Table::owner`] (`Option<OwnerId>`); only a
+    /// table whose owner is `Some(owner)` is listed, so an ownerless table (one
+    /// inserted straight into the registry, as a test does) is never reported for
+    /// any `owner`. The order is the ascending handle — the same order
+    /// [`TableRegistry::all_tids`] uses — so a caller that mutates the registry
+    /// while walking the roster (dropping a table, or re-keying it to a surviving
+    /// heir) sees a deterministic sequence.
+    ///
+    /// `owner` comes from the [`TableRegistry::owner_of`] bridge, which encodes a
+    /// `beam_process::ProcessId` exactly as [`resolve::caller_owner`] recorded it
+    /// at `ets:new/2` time, so a pid read back here and one recorded there always
+    /// compare equal.
+    ///
+    /// # Whole-roster, not just `named_table`s
+    ///
+    /// Unlike [`TableRegistry::all_tids`]'s name column, this roster covers an
+    /// **unnamed** table too: its handle is the registry key, which a caller
+    /// cannot derive from any public term, so this is the only way a host can
+    /// enumerate (and therefore reclaim) the unnamed tables a dead owner left
+    /// behind.
+    pub fn handles_owned_by(&self, owner: OwnerId) -> Vec<u64> {
+        let mut handles: Vec<u64> = self
+            .tables
+            .iter()
+            .filter(|(_, table)| table.owner() == Some(owner))
+            .map(|(handle, _)| *handle)
+            .collect();
+        handles.sort_unstable();
+        handles
+    }
+
+    /// The `beam_ets` [`OwnerId`] of a `beam_process::ProcessId` — the pid→owner
+    /// bridge a host needs to feed [`TableRegistry::handles_owned_by`] the key
+    /// `ets:new/2` recorded.
+    ///
+    /// It is `OwnerId::new(pid.to_eterm().raw() as u64)`, a **lossless** function of
+    /// the pid immediate and the same encoding [`resolve::owner_of`] (and
+    /// `beam_rt`'s own `owner_key`) uses, so an owner read back from a table and a
+    /// pid converted here always agree. Exposed as an associated function on the
+    /// re-exported registry because `mod ets` is private: a free `pub fn` in
+    /// [`resolve`] would not be reachable by a dependent crate.
+    pub fn owner_of(pid: ProcessId) -> OwnerId {
+        resolve::owner_of(pid)
+    }
 }
 
 /// Registers the implemented `ets:*` BIFs (see the module docs for the scope).
@@ -597,9 +702,12 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 /// the name); every other table records its name field only and takes part in no
 /// registry, matching `ets:whereis/1`'s `undefined` for it.
 ///
-/// The calling process is recorded as the table owner and the parsed `{heir, …}`
-/// option as the heir, and the parsed [`resolve::TableProfile`] is carried alongside
-/// the table for `ets:info/1,2`.
+/// The calling process is recorded as the table owner. The parsed `{heir, …}`
+/// option is set on the `TableOptions` before [`Table::new`], so the table
+/// deep-copies it into table-owned storage at build time; a parsed
+/// [`resolve::TableProfile`] (only present for a `write_concurrency` form the
+/// model's boolean cannot express) is carried alongside the table for
+/// `ets:info/1,2`.
 fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let name = args[0];
     if !is_atom(name) {
@@ -608,7 +716,6 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let resolve::ParsedOptions {
         mut options,
         profile,
-        heir,
     } = resolve::parse_options(ctx.atoms(), args[1])?;
     options.set_name(atom_val(name));
     // Read the name metadata before the options move into the table.
@@ -616,9 +723,10 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let table_name = options.name();
 
     let id = TableId::next();
+    // `Table::new` installs the creation-time heir from the options (deep-copying
+    // its gift data into table-owned storage).
     let mut table = Table::new(id, options)?;
     table.set_owner(Some(resolve::caller_owner(ctx)));
-    table.set_heir(heir);
     {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
         if named {
@@ -630,7 +738,9 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
                 return Err(badarg());
             }
         }
-        tables.insert_profile(id.raw(), profile);
+        if let Some(profile) = profile {
+            tables.insert_profile(id.raw(), profile);
+        }
         tables.insert(id.raw(), table);
     }
     if named {
@@ -1140,7 +1250,7 @@ fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let outcome = table.select_limit(&spec, limit, &atoms, ctx.heap());
     restore_table(ctx, handle, table)?;
     let (results, cont) = outcome?;
-    finish_chunk(ctx, handle, results, cont)
+    finish_chunk(ctx, handle, results, cont, false)
 }
 
 /// `ets:select(Continuation)` — resumes a [`select_3`] (or `select_reverse/3`)
@@ -1158,19 +1268,22 @@ fn select_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     dispatch_continuation(ctx, args[0])
 }
 
-/// The shared `ets:select/1` / `ets:select_reverse/1` dispatcher: a continuation
-/// minted by `select_reverse/3` resumes on the reverse path
-/// ([`reverse::try_resume`]), every other (a forward `select/3` continuation)
-/// through [`resume_continuation`]. An argument that is no continuation at all is
-/// `badarg`, exactly as before.
+/// The shared `ets:select/1` / `ets:select_reverse/1` dispatcher: it resumes the
+/// continuation through `Table::select_reverse_continue` when the mapper minted it
+/// on the reverse path and through `Table::select_continue` otherwise, so the walk
+/// follows the **stored** direction (the oracle's one-BIF rule). An argument that
+/// is no continuation at all is `badarg`.
 pub(super) fn dispatch_continuation(
     ctx: &mut BifContext<'_>,
     cont_term: Eterm,
 ) -> Result<Eterm> {
-    if let Some(result) = reverse::try_resume(ctx, cont_term)? {
-        return Ok(result);
-    }
-    resume_continuation(ctx, cont_term, Table::select_continue)
+    resume_continuation(ctx, cont_term, |table, cont, reverse, atoms, heap| {
+        if reverse {
+            table.select_reverse_continue(cont, atoms, heap)
+        } else {
+            table.select_continue(cont, atoms, heap)
+        }
+    })
 }
 
 /// Resumes the continuation named by `cont_term` with `resume` and renders the
@@ -1182,6 +1295,10 @@ pub(super) fn dispatch_continuation(
 /// compiled spec inside the state, so the resume needs nothing but the opaque
 /// continuation term. An unknown continuation is `badarg`.
 ///
+/// The stored **direction** is handed to `resume` (so the select dispatcher picks
+/// the right `beam_ets` primitive) and to [`finish_chunk`] (so a minted follow-up
+/// chunk keeps the direction).
+///
 /// The resume is **read**-gated as the calling process against the continuation's
 /// table (`erl_db.c`'s `ets_select_1` calls `db_get_table` with `DB_READ`), and the
 /// check runs *before* the continuation is consumed, so a denied resume gives the
@@ -1189,7 +1306,7 @@ pub(super) fn dispatch_continuation(
 pub(super) fn resume_continuation(
     ctx: &mut BifContext<'_>,
     cont_term: Eterm,
-    resume: impl FnOnce(&Table, &MatchContinuation, &AtomTable, &mut Heap) -> Result<Traversal>,
+    resume: impl FnOnce(&Table, &MatchContinuation, bool, &AtomTable, &mut Heap) -> Result<Traversal>,
 ) -> Result<Eterm> {
     let handle = ref_thing_id(cont_term)?;
     let owner = Some(resolve::caller_owner(ctx));
@@ -1199,17 +1316,17 @@ pub(super) fn resume_continuation(
         let table = tables.get(table_handle).ok_or_else(badarg)?;
         resolve::Gate::Read.check(table, owner)?;
     }
-    let (table_handle, cont) = {
+    let (table_handle, cont, reverse) = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
         tables.take_continuation(handle).ok_or_else(badarg)?
     };
 
     let table = take_table(ctx, table_handle)?;
     let atoms = ctx.atoms().clone();
-    let outcome = resume(&table, &cont, &atoms, ctx.heap());
+    let outcome = resume(&table, &cont, reverse, &atoms, ctx.heap());
     restore_table(ctx, table_handle, table)?;
     let (results, next) = outcome?;
-    finish_chunk(ctx, table_handle, results, next)
+    finish_chunk(ctx, table_handle, results, next, reverse)
 }
 
 /// Renders one chunk of the select/match family exactly as the oracle (erts-17.1)
@@ -1221,17 +1338,22 @@ pub(super) fn resume_continuation(
 ///   **bare** atom `'$end_of_table'` when `Results` is empty (verified against the
 ///   system `erl`: a 4-object table with `limit` 2 renders the final chunk as the
 ///   bare atom while a 5-object table renders `{[{5,a}], '$end_of_table'}`).
+///
+/// `reverse` is the direction the minted continuation carries (see [`Continuation`]);
+/// the forward callers (`ets:select/3`, `ets:match/3`, `ets:match_object/3`) pass
+/// `false`, the reverse path true.
 pub(super) fn finish_chunk(
     ctx: &mut BifContext<'_>,
     table: u64,
     results: Vec<Eterm>,
     cont: Option<MatchContinuation>,
+    reverse: bool,
 ) -> Result<Eterm> {
     match cont {
         Some(state) => {
             let handle = {
                 let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-                tables.insert_continuation(table, state)
+                tables.insert_continuation(table, state, reverse)
             };
             let cont_term = make_ref_thing(ctx.heap(), handle)?;
             let list = copy_out_list(results, ctx)?;
@@ -1350,10 +1472,10 @@ pub(super) fn element_pos(term: Eterm) -> Result<usize> {
 /// `owner` and `heir` render the recorded pid terms ([`resolve::owner_pid`] of the
 /// table's [`TableInfo::owner`]/[`TableInfo::heir`]); an unset owner is the atom
 /// `undefined` and an unset heir (or one whose recorded owner bridges to no pid)
-/// is `none`. `write_concurrency` and `decentralized_counters` come from the
-/// creation-time `profile` [`resolve::parse_options`] recorded, falling back to the
-/// [`TableInfo`]-derived value only when no profile was recorded (a table inserted
-/// directly through [`TableRegistry::insert`]).
+/// is `none`. `decentralized_counters` is the value the model resolved
+/// ([`TableInfo::decentralized_counters`]); `write_concurrency` uses the
+/// creation-time `profile` for the forms the model's boolean cannot express (the
+/// atom `auto` and the hidden lock-count tuple) and the boolean otherwise.
 ///
 /// [`entries`]: TableInfo::entries
 fn info_field(
@@ -1369,18 +1491,19 @@ fn info_field(
         // (the registry key), so it is re-wrapped into the handle ref thing rather
         // than returned as a small int.
         "id" => make_ref_thing(ctx.heap(), info.id.raw()),
-        // The effective `write_concurrency`/`decentralized_counters` values are the
-        // ones `ets:new/2` computed (they are not fully recoverable from
-        // `TableInfo`: `{write_concurrency, auto}` sets the counters flag even for
-        // a `set`, which `TableInfo` does not record); only a directly-inserted
-        // table falls back to the value `beam_ets` resolved on the snapshot.
-        "decentralized_counters" => match profile {
-            Some(profile) => ctx.boolean(profile.decentralized_counters),
-            None => ctx.boolean(info.decentralized_counters),
-        },
+        // The `decentralized_counters` value is the one `beam_ets` resolved at
+        // creation (`TableOptions::decentralized_counters`, whose rule the model
+        // owns): `{write_concurrency, auto}` sets the counters flag even for a
+        // `set`, while `{write_concurrency, true}` on a `set` does not, and the
+        // resolved value is carried on the snapshot.
+        "decentralized_counters" => ctx.boolean(info.decentralized_counters),
         "read_concurrency" => ctx.boolean(info.read_concurrency),
+        // The model's boolean cannot distinguish `true` from `auto` or from the
+        // hidden lock-count tuple, so a profile (recorded by `ets:new/2` for those
+        // two forms only) wins when present; a table inserted directly through the
+        // registry has no profile and falls back to the boolean.
         "write_concurrency" => match profile {
-            Some(profile) => write_concurrency_term(ctx, profile.write_concurrency),
+            Some(profile) => write_concurrency_term(ctx, profile),
             None => ctx.boolean(info.write_concurrency),
         },
         "compressed" => ctx.boolean(info.compressed),
@@ -1412,19 +1535,19 @@ fn info_field(
     }
 }
 
-/// The term of the effective `ets:info(T, write_concurrency)` value
-/// ([`resolve::WriteConcurrencyInfo`]): the atom `false`/`true`/`auto`, or the
-/// hidden lock-count tuple `{debug_hash_fixed_number_of_locks, N}` (whose count
-/// [`resolve::parse_options`] already normalized).
+/// The term of the `ets:info(T, write_concurrency)` value the model's
+/// [`TableInfo::write_concurrency`] boolean cannot express
+/// ([`resolve::TableProfile`]): the atom `auto`, or the hidden lock-count tuple
+/// `{debug_hash_fixed_number_of_locks, N}` (whose count
+/// [`resolve::parse_options`] already normalized). The plain `false`/`true`
+/// forms are rendered by the caller from the boolean.
 fn write_concurrency_term(
     ctx: &mut BifContext<'_>,
-    info: resolve::WriteConcurrencyInfo,
+    form: resolve::TableProfile,
 ) -> Result<Eterm> {
-    match info {
-        resolve::WriteConcurrencyInfo::Off => ctx.boolean(false),
-        resolve::WriteConcurrencyInfo::On => ctx.boolean(true),
-        resolve::WriteConcurrencyInfo::Auto => ctx.intern_atom("auto"),
-        resolve::WriteConcurrencyInfo::FixedLocks(n) => {
+    match form {
+        resolve::TableProfile::Auto => ctx.intern_atom("auto"),
+        resolve::TableProfile::FixedLocks(n) => {
             let tag = ctx.intern_atom("debug_hash_fixed_number_of_locks")?;
             let count = ctx.int(n as i64)?;
             ctx.tuple(&[tag, count])
@@ -1596,12 +1719,109 @@ mod tests {
         assert_eq!(reg.len(), 1);
     }
 
-    /// An `auto`/fine-locked profile, for the profile-lifetime tests.
-    fn auto_profile() -> resolve::TableProfile {
-        resolve::TableProfile {
-            write_concurrency: resolve::WriteConcurrencyInfo::Auto,
-            decentralized_counters: true,
+    /// The owner→handle roster lists each owner apart, **ascending by handle**,
+    /// and never reports an ownerless table for any owner.
+    #[test]
+    fn the_owner_roster_is_per_owner_and_ascending() {
+        let alpha = OwnerId::new(0x11);
+        let beta = OwnerId::new(0x22);
+        let mut reg = TableRegistry::new();
+        // Inserted out of handle order so the sort is observable.
+        for (handle, owner) in [
+            (30u64, Some(alpha)),
+            (10, Some(alpha)),
+            (20, Some(beta)),
+            (5, None),
+        ] {
+            let mut t = table(handle);
+            t.set_owner(owner);
+            reg.insert(handle, t);
         }
+
+        assert_eq!(reg.handles_owned_by(alpha), vec![10, 30]);
+        assert_eq!(reg.handles_owned_by(beta), vec![20]);
+        // A non-owner gets an empty roster — including the raw owner id of the
+        // ownerless table's (absent) owner.
+        assert!(reg.handles_owned_by(OwnerId::new(0x33)).is_empty());
+        assert!(reg.handles_owned_by(OwnerId::new(5)).is_empty());
+    }
+
+    /// A dead owner's tables are reclaimed through the roster and the **existing**
+    /// removal path: the roster hands back the handles, and `remove` (+
+    /// `remove_name`) drops them.
+    #[test]
+    fn the_roster_withdrawal_uses_the_existing_remove_path() {
+        let alpha = OwnerId::new(0x11);
+        let mut reg = TableRegistry::new();
+        let mut t = table(40);
+        t.set_owner(Some(alpha));
+        reg.insert(40, t);
+        assert!(reg.insert_name(Atom::from_raw(1), 40), "name registered");
+
+        // The runtime lists the dead owner's handles...
+        let owned = reg.handles_owned_by(alpha);
+        assert_eq!(owned, vec![40]);
+        // ...and drops each through the existing removal path.
+        for handle in owned {
+            assert!(reg.remove(handle).is_some());
+            reg.remove_name(Atom::from_raw(1));
+        }
+        assert!(reg.is_empty());
+        assert!(reg.handles_owned_by(alpha).is_empty());
+        assert!(reg.lookup_name(Atom::from_raw(1)).is_none());
+    }
+
+    /// `owner_of` round-trips the pid immediate, and the roster finds the tables
+    /// `ets:new/2` recorded for that pid.
+    #[test]
+    fn owner_of_round_trips_a_pid_and_the_roster_finds_its_tables() {
+        let alpha = ProcessId::new(1, 1);
+        let beta = ProcessId::new(1, 2);
+        for pid in [alpha, beta, ProcessId::new(0, 0), ProcessId::new(255, 7)] {
+            assert_eq!(
+                TableRegistry::owner_of(pid).raw(),
+                pid.to_eterm().raw() as u64,
+                "the pid→owner bridge is lossless for {pid:?}"
+            );
+        }
+
+        // Two contexts with different `self_pid`s over one registry: each context
+        // creates its tables as *its* process.
+        let mut heap = Heap::new(65536).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+        let alpha_handles: Vec<u64> = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, alpha).with_tables(&mut reg);
+            let h1 = new_table(&mut ctx, "mytab");
+            let h2 = new_table(&mut ctx, "mytab");
+            vec![
+                ref_thing_id(h1).expect("handle"),
+                ref_thing_id(h2).expect("handle"),
+            ]
+        };
+        let beta_handle = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, beta).with_tables(&mut reg);
+            ref_thing_id(new_table(&mut ctx, "mytab")).expect("handle")
+        };
+
+        let mut expected = alpha_handles.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            reg.handles_owned_by(TableRegistry::owner_of(alpha)),
+            expected,
+            "alpha's two tables, ascending"
+        );
+        assert_eq!(
+            reg.handles_owned_by(TableRegistry::owner_of(beta)),
+            vec![beta_handle]
+        );
+        assert!(reg
+            .handles_owned_by(TableRegistry::owner_of(ProcessId::new(3, 9)))
+            .is_empty());
+    }    /// An `auto` profile, for the profile-lifetime tests (the only non-boolean
+    /// form besides the hidden lock count).
+    fn auto_profile() -> resolve::TableProfile {
+        resolve::TableProfile::Auto
     }
 
     /// A table take/**restore** round trip — what every table-taking BIF performs
@@ -2276,9 +2496,9 @@ mod tests {
             }
         }
 
-        // A table inserted **without** a creation-time profile falls back to the
-        // value `beam_ets` resolved on the snapshot (`type`/`write_concurrency`
-        // cannot express `auto`, which is why `new/2` records the profile).
+        // A table inserted **without** going through `ets:new/2` still reports the
+        // value `beam_ets` resolved on the snapshot: `decentralized_counters` reads
+        // `TableInfo` directly (the model owns the rule), so no profile is needed.
         let mut reg = TableRegistry::new();
         let mut opts = TableOptions::new();
         opts.set_kind(beam_ets::TableKind::OrderedSet)

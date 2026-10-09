@@ -56,6 +56,17 @@
 //!   `scheduler.resume_woken(&mut table)` so the woken receiver is enqueued.
 //! * **run** ⇒ `scheduler.run_ready(&mut table, &mut runner, None)`.
 //!
+//! # Port-aware variants (the port-monitor cleanup adoption)
+//!
+//! An orchestrator that also owns a [`PortTable`] should drive the scheduler through
+//! [`Scheduler::run_slice_with_ports`]/[`Scheduler::run_ready_with_ports`] (and, at the
+//! lower level, [`run_one_with_ports`]/[`slice_begin_with_ports`]/[`slice_end_with_ports`]).
+//! Those thread `&mut PortTable` into the schedule-in and schedule-out steps, so a process
+//! that dies during a slice — or is terminated at schedule-in by a queued signal — also has
+//! its matching *incoming* port-monitor entries removed from the port table (the last step of
+//! `ProcessTable::terminate_into`). The port-less forms delegate with `None` and behave
+//! exactly as before; they remain for callers that hold no port table.
+//!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_process.c`
 //! (`scheduler_wait`/`schedule`), `erl_vm.h` (`CONTEXT_REDS`).
 
@@ -63,6 +74,7 @@ use beam_common::Result;
 use beam_term::prelude::Eterm;
 
 use crate::pid::ProcessId;
+use crate::port::PortTable;
 use crate::process::ProcessState;
 use crate::progress::ThreadProgress;
 use crate::ptab::ProcessTable;
@@ -245,6 +257,10 @@ impl Scheduler {
     /// (see [`Scheduler::resume_woken`]), so `run_ready` does not exit while a freshly-woken
     /// process is still pending.
     ///
+    /// This form has no [`PortTable`] handle: a process that dies during the slice has its
+    /// outgoing port monitors drained but leaves the matching incoming entries in the port
+    /// table. A caller holding the port table should use [`Scheduler::run_slice_with_ports`].
+    ///
     /// # Errors
     ///
     /// Propagates the runner's and the table's errors.
@@ -253,6 +269,45 @@ impl Scheduler {
         table: &mut ProcessTable,
         runner: &mut R,
     ) -> Result<Option<ProcessId>> {
+        self.run_slice_inner(table, None, runner)
+    }
+
+    /// [`Scheduler::run_slice`] with the [`PortTable`] in hand: a process that terminates
+    /// during the slice also has its matching *incoming* port monitors removed from `ports`.
+    ///
+    /// This is the entry point an orchestrator that owns both tables (`beam_rt`) should use —
+    /// the port-less [`Scheduler::run_slice`] cannot reach the port table, so the monitor a
+    /// dying process held on a port would stay listed by `erlang:port_info(Port, monitored_by)`
+    /// for a process that no longer exists.
+    ///
+    /// The slice semantics are otherwise identical: pop one pid, run it, then requeue
+    /// (`Yield`), drop (`Wait`/`Suspend`) or terminate (`Exit`) it, and absorb the table's wake
+    /// list (see [`Scheduler::run_slice`]).
+    ///
+    /// `ProcessTable` and `PortTable` are distinct types passed in separately, so `table` and
+    /// `ports` are disjoint borrows.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the runner's and the table's errors.
+    pub fn run_slice_with_ports<R: ProcessRunner>(
+        &mut self,
+        table: &mut ProcessTable,
+        ports: &mut PortTable,
+        runner: &mut R,
+    ) -> Result<Option<ProcessId>> {
+        self.run_slice_inner(table, Some(ports), runner)
+    }
+
+    /// The shared body of [`Scheduler::run_slice`] and [`Scheduler::run_slice_with_ports`]:
+    /// `ports` is `Some` only when the caller holds a [`PortTable`].
+    fn run_slice_inner<R: ProcessRunner>(
+        &mut self,
+        table: &mut ProcessTable,
+        ports: Option<&mut PortTable>,
+        runner: &mut R,
+    ) -> Result<Option<ProcessId>> {
+        let mut ports = ports;
         let Some(pid) = self.run_queue.dequeue() else {
             // Nothing to run, but a wake produced by a send *outside* a slice (which the
             // orchestrator may not have absorbed yet) must still be turned into a run-queue
@@ -263,9 +318,11 @@ impl Scheduler {
 
         // Read the budget into a local *before* the closure below borrows the run queue.
         let reductions = self.reductions_per_slice;
-        run_one(pid, table, runner, reductions, |pid, priority| {
-            self.run_queue.enqueue_with_priority(pid, priority)
-        })?;
+        let mut enqueue = |pid, priority| self.run_queue.enqueue_with_priority(pid, priority);
+        match ports.as_deref_mut() {
+            Some(ports) => run_one_with_ports(pid, table, ports, runner, reductions, &mut enqueue)?,
+            None => run_one(pid, table, runner, reductions, &mut enqueue)?,
+        };
         self.slices = self.slices.wrapping_add(1);
 
         // Absorb every wake produced during the slice (a send to a blocked receiver, or a
@@ -295,6 +352,10 @@ impl Scheduler {
     /// Runs slices until the run queue empties (or `max_slices` have run), returning the
     /// number of slices executed.
     ///
+    /// The port-less form; a caller holding a [`PortTable`] should use
+    /// [`Scheduler::run_ready_with_ports`] so a death inside any slice cleans the dying
+    /// process's incoming port monitors too.
+    ///
     /// # Errors
     ///
     /// Propagates the runner's and the table's errors.
@@ -304,6 +365,39 @@ impl Scheduler {
         runner: &mut R,
         max_slices: Option<u64>,
     ) -> Result<u64> {
+        self.run_ready_inner(table, None, runner, max_slices)
+    }
+
+    /// [`Scheduler::run_ready`] with the [`PortTable`] in hand: every slice runs through
+    /// [`Scheduler::run_slice_with_ports`], so a process that dies inside any of them cleans
+    /// its incoming port monitors.
+    ///
+    /// This is the port-aware counterpart an orchestrator that owns both tables should drive;
+    /// see [`Scheduler::run_slice_with_ports`] for why the port-less form is not enough.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the runner's and the table's errors.
+    pub fn run_ready_with_ports<R: ProcessRunner>(
+        &mut self,
+        table: &mut ProcessTable,
+        ports: &mut PortTable,
+        runner: &mut R,
+        max_slices: Option<u64>,
+    ) -> Result<u64> {
+        self.run_ready_inner(table, Some(ports), runner, max_slices)
+    }
+
+    /// The shared body of [`Scheduler::run_ready`] and [`Scheduler::run_ready_with_ports`]:
+    /// `ports` is `Some` only when the caller holds a [`PortTable`].
+    fn run_ready_inner<R: ProcessRunner>(
+        &mut self,
+        table: &mut ProcessTable,
+        ports: Option<&mut PortTable>,
+        runner: &mut R,
+        max_slices: Option<u64>,
+    ) -> Result<u64> {
+        let mut ports = ports;
         let mut executed: u64 = 0;
         while !self.run_queue.is_empty() {
             if let Some(max) = max_slices {
@@ -311,7 +405,7 @@ impl Scheduler {
                     break;
                 }
             }
-            match self.run_slice(table, runner)? {
+            match self.run_slice_inner(table, ports.as_deref_mut(), runner)? {
                 Some(_) => executed = executed.wrapping_add(1),
                 None => break,
             }
@@ -356,11 +450,66 @@ where
     R: ProcessRunner,
     F: FnMut(ProcessId, Priority),
 {
-    if !slice_begin(pid, table)? {
+    let mut ports: Option<&mut PortTable> = None;
+    run_one_inner(pid, table, &mut ports, runner, reductions, &mut enqueue)
+}
+
+/// [`run_one`] with the [`PortTable`] in hand: the schedule-in step uses
+/// [`slice_begin_with_ports`] and the schedule-out step [`slice_end_with_ports`], so a death
+/// in either half cleans the dying process's incoming port monitors.
+///
+/// # Parameters
+///
+/// As [`run_one`], plus:
+///
+/// * `ports` — the port table, threaded into both slice halves.
+///
+/// # Errors
+///
+/// Propagates the signal-servicing, runner and termination errors.
+pub(crate) fn run_one_with_ports<R, F>(
+    pid: ProcessId,
+    table: &mut ProcessTable,
+    ports: &mut PortTable,
+    runner: &mut R,
+    reductions: u32,
+    mut enqueue: F,
+) -> Result<Option<RunOutcome>>
+where
+    R: ProcessRunner,
+    F: FnMut(ProcessId, Priority),
+{
+    let mut ports: Option<&mut PortTable> = Some(ports);
+    run_one_inner(pid, table, &mut ports, runner, reductions, &mut enqueue)
+}
+
+/// The shared body of [`run_one`] and [`run_one_with_ports`]: `ports` is `Some` only when the
+/// caller holds a [`PortTable`]. Both slice halves are dispatched on it, so the slice logic
+/// exists exactly once.
+fn run_one_inner<R, F>(
+    pid: ProcessId,
+    table: &mut ProcessTable,
+    ports: &mut Option<&mut PortTable>,
+    runner: &mut R,
+    reductions: u32,
+    enqueue: &mut F,
+) -> Result<Option<RunOutcome>>
+where
+    R: ProcessRunner,
+    F: FnMut(ProcessId, Priority),
+{
+    let ready = match ports.as_deref_mut() {
+        Some(ports) => slice_begin_with_ports(pid, table, ports)?,
+        None => slice_begin(pid, table)?,
+    };
+    if !ready {
         return Ok(None);
     }
     let outcome = runner.run(pid, table, reductions)?;
-    slice_end(pid, table, outcome, &mut enqueue)?;
+    match ports.as_deref_mut() {
+        Some(ports) => slice_end_with_ports(pid, table, ports, outcome, &mut *enqueue)?,
+        None => slice_end(pid, table, outcome, &mut *enqueue)?,
+    }
     Ok(Some(outcome))
 }
 
@@ -373,12 +522,39 @@ where
 ///
 /// This is the process-table half of [`run_one`], factored out so the SMP pool can run a slice as
 /// several **quanta** (one lock acquisition each) without duplicating the slice semantics. The
-/// paired schedule-out half is [`slice_end`].
+/// paired schedule-out half is [`slice_end`]. [`slice_begin_with_ports`] is the port-aware form.
 ///
 /// # Errors
 ///
 /// Propagates the signal-servicing errors.
 pub(crate) fn slice_begin(pid: ProcessId, table: &mut ProcessTable) -> Result<bool> {
+    let mut ports: Option<&mut PortTable> = None;
+    slice_begin_inner(pid, table, &mut ports)
+}
+
+/// [`slice_begin`] with the [`PortTable`] in hand: the schedule-in signal servicing uses
+/// [`ProcessTable::service_signals_with_ports`], so a queued signal that terminates the process
+/// here also removes its incoming port monitors.
+///
+/// # Errors
+///
+/// Propagates the signal-servicing errors.
+pub(crate) fn slice_begin_with_ports(
+    pid: ProcessId,
+    table: &mut ProcessTable,
+    ports: &mut PortTable,
+) -> Result<bool> {
+    let mut ports: Option<&mut PortTable> = Some(ports);
+    slice_begin_inner(pid, table, &mut ports)
+}
+
+/// The shared body of [`slice_begin`] and [`slice_begin_with_ports`]: `ports` is `Some` only
+/// when the caller holds a [`PortTable`].
+fn slice_begin_inner(
+    pid: ProcessId,
+    table: &mut ProcessTable,
+    ports: &mut Option<&mut PortTable>,
+) -> Result<bool> {
     // The process is off the queue and executing.
     match table.get_mut(pid) {
         Some(process) => {
@@ -393,7 +569,10 @@ pub(crate) fn slice_begin(pid: ProcessId, table: &mut ProcessTable) -> Result<bo
     // before it runs — this is where a signal that was deferred because the process was
     // executing (see the crate `CONTEXT.md`) finally lands. Servicing may terminate the
     // process, in which case there is nothing to run.
-    table.service_signals(pid)?;
+    match ports.as_deref_mut() {
+        Some(ports) => table.service_signals_with_ports(ports, pid)?,
+        None => table.service_signals(pid)?,
+    }
     Ok(table.contains(pid))
 }
 
@@ -407,6 +586,9 @@ pub(crate) fn slice_begin(pid: ProcessId, table: &mut ProcessTable) -> Result<bo
 /// The scheduler does **not** count reductions here or anywhere: the runner owns the reduction
 /// count and decides when to yield (see [`ProcessRunner`] — pre-emption is cooperative).
 ///
+/// [`slice_end_with_ports`] is the port-aware form, whose `Exit` arm terminates through
+/// `ProcessTable::terminate_with_ports`.
+///
 /// # Errors
 ///
 /// Propagates the termination errors.
@@ -415,6 +597,38 @@ pub(crate) fn slice_end<F: FnMut(ProcessId, Priority)>(
     table: &mut ProcessTable,
     outcome: RunOutcome,
     mut enqueue: F,
+) -> Result<()> {
+    let mut ports: Option<&mut PortTable> = None;
+    slice_end_inner(pid, table, &mut ports, outcome, &mut enqueue)
+}
+
+/// [`slice_end`] with the [`PortTable`] in hand: a [`RunOutcome::Exit`] terminates through
+/// [`ProcessTable::terminate_with_ports`], so the dying process's incoming port monitors are
+/// removed from `ports` (the last step of `ProcessTable::terminate_into`). The `Yield` and
+/// `Wait`/`Suspend` arms are unaffected.
+///
+/// # Errors
+///
+/// Propagates the termination errors.
+pub(crate) fn slice_end_with_ports<F: FnMut(ProcessId, Priority)>(
+    pid: ProcessId,
+    table: &mut ProcessTable,
+    ports: &mut PortTable,
+    outcome: RunOutcome,
+    mut enqueue: F,
+) -> Result<()> {
+    let mut ports: Option<&mut PortTable> = Some(ports);
+    slice_end_inner(pid, table, &mut ports, outcome, &mut enqueue)
+}
+
+/// The shared body of [`slice_end`] and [`slice_end_with_ports`]: `ports` is `Some` only when
+/// the caller holds a [`PortTable`].
+fn slice_end_inner<F: FnMut(ProcessId, Priority)>(
+    pid: ProcessId,
+    table: &mut ProcessTable,
+    ports: &mut Option<&mut PortTable>,
+    outcome: RunOutcome,
+    enqueue: &mut F,
 ) -> Result<()> {
     match outcome {
         RunOutcome::Yield => {
@@ -436,8 +650,12 @@ pub(crate) fn slice_end<F: FnMut(ProcessId, Priority)>(
         // scheduler only takes it out of the ready queue.
         RunOutcome::Wait | RunOutcome::Suspend => {}
         RunOutcome::Exit(reason) => {
-            // Termination propagates to the process's links and monitors.
-            table.terminate(pid, reason)?;
+            // Termination propagates to the process's links and monitors — and, when the port
+            // table is in hand, to its incoming port monitors.
+            match ports.as_deref_mut() {
+                Some(ports) => table.terminate_with_ports(ports, pid, reason)?,
+                None => table.terminate(pid, reason)?,
+            }
         }
     }
     Ok(())

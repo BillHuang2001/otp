@@ -38,6 +38,16 @@
 //! [`NifHost::existing_atom`] hook, which answers `None` when the runtime's atom table does not
 //! already hold the name.
 //!
+//! # The per-call atom record (visibility of a just-interned atom)
+//!
+//! The real runtime commits a freshly interned atom lazily (a *pending interner*), so the host's
+//! reverse lookup does not see an atom interned earlier in the **same** call. All four
+//! atom-constructing entry points here ([`enif_make_atom`], [`enif_make_atom_len`],
+//! [`enif_make_new_atom`], [`enif_make_new_atom_len`]) therefore also record `(term, name)` on the
+//! [`NifEnv`] (see [`NifEnv::record_atom`]), and the two lookup-only constructors below consult
+//! that record **before** [`NifHost::existing_atom`] — so `enif_make_atom` → `enif_make_existing_atom`
+//! agrees with the oracle within one call. A miss still falls through to the hook, unchanged.
+//!
 //! Documented substitution: the C rejects an over-long name up front (`len > MAX_ATOM_CHARACTERS`
 //! for LATIN1, `len > MAX_ATOM_SZ_LIMIT` for UTF8 — `atom.c:392/402/416`). Here the host's atom
 //! table *is* the atom namespace, so an over-long name simply is not in it and the hook answers
@@ -216,6 +226,10 @@ pub unsafe extern "C" fn enif_make_double(
 
 /// `ERL_NIF_TERM enif_make_atom(ErlNifEnv* env, const char* name);`
 ///
+/// The name is decoded as UTF-8 and interned through [`NifHost::intern_atom`]; the resulting atom
+/// is recorded on the env so a later `enif_get_atom`/`enif_make_existing_atom` in the **same** call
+/// resolves it (see the module docs).
+///
 /// # Safety
 ///
 /// `env` must be a live env; `name` must be null or a NUL-terminated string.
@@ -231,14 +245,24 @@ pub unsafe extern "C" fn enif_make_atom(
         // SAFETY: `e` is a live env.
         return unsafe { enif_make_badarg(env) };
     };
-    match core::str::from_utf8(bytes).ok().and_then(|s| e.host().intern_atom(s)) {
-        Some(atom) => n(atom),
+    let Some(name) = core::str::from_utf8(bytes).ok() else {
+        // SAFETY: `e` is a live env.
+        return unsafe { enif_make_badarg(env) };
+    };
+    match e.host().intern_atom(name) {
+        Some(atom) => {
+            e.record_atom(atom, name);
+            n(atom)
+        }
         // SAFETY: `e` is a live env.
         None => unsafe { enif_make_badarg(env) },
     }
 }
 
 /// `ERL_NIF_TERM enif_make_atom_len(ErlNifEnv* env, const char* name, size_t len);`
+///
+/// As [`enif_make_atom`] with an explicit length (the name is not NUL-terminated); the interned
+/// atom is recorded on the env.
 ///
 /// # Safety
 ///
@@ -256,8 +280,15 @@ pub unsafe extern "C" fn enif_make_atom_len(
         // SAFETY: `e` is a live env.
         return unsafe { enif_make_badarg(env) };
     };
-    match core::str::from_utf8(bytes).ok().and_then(|s| e.host().intern_atom(s)) {
-        Some(atom) => n(atom),
+    let Some(name) = core::str::from_utf8(bytes).ok() else {
+        // SAFETY: `e` is a live env.
+        return unsafe { enif_make_badarg(env) };
+    };
+    match e.host().intern_atom(name) {
+        Some(atom) => {
+            e.record_atom(atom, name);
+            n(atom)
+        }
         // SAFETY: `e` is a live env.
         None => unsafe { enif_make_badarg(env) },
     }
@@ -273,6 +304,9 @@ fn decode_name(bytes: &[u8], encoding: ErlNifCharEncoding) -> Option<String> {
 }
 
 /// `int enif_make_new_atom(ErlNifEnv *env, const char *name, ERL_NIF_TERM *atom, ErlNifCharEncoding encoding);`
+///
+/// Decodes the name per `encoding` and interns it; the resulting atom is recorded on the env (see
+/// the module docs).
 ///
 /// # Safety
 ///
@@ -290,14 +324,22 @@ pub unsafe extern "C" fn enif_make_new_atom(
     let Some(bytes) = (unsafe { cstr(name) }) else {
         return 0;
     };
-    match decode_name(bytes, encoding).and_then(|s| e.host().intern_atom(&s)) {
-        // SAFETY: `atom` may be null (handled) or valid for one write.
-        Some(term) => (unsafe { write_out(atom, n(term)) }) as c_int,
+    let Some(decoded) = decode_name(bytes, encoding) else {
+        return 0;
+    };
+    match e.host().intern_atom(&decoded) {
+        Some(term) => {
+            e.record_atom(term, &decoded);
+            // SAFETY: `atom` may be null (handled) or valid for one write.
+            (unsafe { write_out(atom, n(term)) }) as c_int
+        }
         None => 0,
     }
 }
 
 /// `int enif_make_new_atom_len(ErlNifEnv *env, const char *name, size_t len, ERL_NIF_TERM *atom, ErlNifCharEncoding encoding);`
+///
+/// As [`enif_make_new_atom`] with an explicit length; the interned atom is recorded on the env.
 ///
 /// # Safety
 ///
@@ -316,9 +358,15 @@ pub unsafe extern "C" fn enif_make_new_atom_len(
     let Some(bytes) = (unsafe { cbuf(name, len) }) else {
         return 0;
     };
-    match decode_name(bytes, encoding).and_then(|s| e.host().intern_atom(&s)) {
-        // SAFETY: `atom` may be null (handled) or valid for one write.
-        Some(term) => (unsafe { write_out(atom, n(term)) }) as c_int,
+    let Some(decoded) = decode_name(bytes, encoding) else {
+        return 0;
+    };
+    match e.host().intern_atom(&decoded) {
+        Some(term) => {
+            e.record_atom(term, &decoded);
+            // SAFETY: `atom` may be null (handled) or valid for one write.
+            (unsafe { write_out(atom, n(term)) }) as c_int
+        }
         None => 0,
     }
 }
@@ -328,6 +376,9 @@ pub unsafe extern "C" fn enif_make_new_atom_len(
 /// The lookup-only atom constructor: **1** with `*atom` written when the runtime already holds the
 /// atom, **0** with `*atom` left **untouched** otherwise (C `erts_atom_get`, `atom.c:431`). The name
 /// is NUL-terminated.
+///
+/// The env's per-call record is consulted first (so an atom interned earlier in this call is found),
+/// then [`NifHost::existing_atom`] — see the module docs.
 ///
 /// # Safety
 ///
@@ -378,8 +429,9 @@ pub unsafe extern "C" fn enif_make_existing_atom_len(
 /// The shared body of the two lookup-only atom constructors (see the module docs).
 ///
 /// A `NULL` `atom` out-pointer is answered `0` where the C would `*ap = …` through it and fault; a
-/// name the host's atom table does not already hold is answered `0` with `*atom` left alone, exactly
-/// like the C's `i < 0 ? 0 : (*ap = …, 1)`.
+/// name the env has not interned in this call **and** the host's atom table does not already hold is
+/// answered `0` with `*atom` left alone, exactly like the C's `i < 0 ? 0 : (*ap = …, 1)`. The env's
+/// per-call record is consulted first (see [`NifEnv::recorded_atom`]), the host hook second.
 fn existing_atom_out(
     env: &mut NifEnv,
     bytes: &[u8],
@@ -389,7 +441,15 @@ fn existing_atom_out(
     if atom.is_null() {
         return 0;
     }
-    match decode_name(bytes, encoding).and_then(|s| env.host().existing_atom(&s)) {
+    let Some(name) = decode_name(bytes, encoding) else {
+        return 0;
+    };
+    if let Some(found) = env.recorded_atom(&name) {
+        // SAFETY: `atom` is non-null (just checked) and valid for one write (caller contract).
+        unsafe { atom.write(n(found)) };
+        return 1;
+    }
+    match env.host().existing_atom(&name) {
         // SAFETY: `atom` is non-null (just checked) and valid for one write (caller contract).
         Some(term) => {
             unsafe { atom.write(n(term)) };

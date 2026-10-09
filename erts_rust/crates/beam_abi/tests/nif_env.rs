@@ -56,7 +56,9 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use beam_abi::common::{ErlNifSelectFlags, ERL_NIF_SELECT_INVALID_EVENT};
 use beam_abi::nif::enif::{enif_alloc_env, enif_free_env};
@@ -95,6 +97,11 @@ struct EnvHost {
     with_priv: bool,
     /// What `alloc_env` answers (`None` = unsupported, the trait default).
     env_ptr: Option<*mut ErlNifEnv>,
+    /// Whether `free_env` claims to own (and so "free") the env it is handed.
+    owns_env: bool,
+    /// Every pointer `free_env` has been called with, in call order (shared with the test, because
+    /// the host is mutably borrowed by its `NifEnv` for the whole test).
+    freed_envs: Rc<RefCell<Vec<*mut ErlNifEnv>>>,
 }
 
 impl EnvHost {
@@ -105,6 +112,8 @@ impl EnvHost {
             select_code,
             with_priv,
             env_ptr: None,
+            owns_env: false,
+            freed_envs: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -116,6 +125,17 @@ impl EnvHost {
     fn with_alloc_env(mut self, ptr: *mut ErlNifEnv) -> EnvHost {
         self.env_ptr = Some(ptr);
         self
+    }
+
+    /// Claim ownership of the envs this host is handed: `free_env` then reports `true`.
+    fn owning(mut self) -> EnvHost {
+        self.owns_env = true;
+        self
+    }
+
+    /// A handle on the `free_env` call log, taken **before** a `NifEnv` borrows this host.
+    fn free_log(&self) -> Rc<RefCell<Vec<*mut ErlNifEnv>>> {
+        Rc::clone(&self.freed_envs)
     }
 }
 
@@ -152,6 +172,13 @@ impl NifHost for EnvHost {
 
     fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
         self.env_ptr
+    }
+
+    /// Record the delivered pointer and report ownership (the C `erts_free`s what `enif_alloc_env`
+    /// allocated; here only a host that claims the env frees it).
+    fn free_env(&mut self, env: *mut ErlNifEnv) -> bool {
+        self.freed_envs.borrow_mut().push(env);
+        self.owns_env
     }
 
     fn select(
@@ -421,4 +448,89 @@ fn enif_free_env_is_null_safe_and_never_frees_a_foreign_env() {
     let atom = env.host().intern_atom("still_usable").expect("interns");
     assert!(is_atom(atom), "the env is untouched by a no-op free");
     assert_eq!(NIL, NIL);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The message-env lifecycle: alloc -> use -> free, plus the no-op protocol
+// ---------------------------------------------------------------------------------------------
+
+/// The **message-env lifecycle** and its whole observable protocol, driven through the public API.
+///
+/// It needs no C toolchain (a host here can hand out a *real* `NifEnv` a test owns), so it always
+/// runs — where the fixture-driven tests above skip without `cc`.
+///
+/// What it pins, in the order the C contract prescribes (`erl_nif.c:669-680`):
+/// * `enif_alloc_env()` returns the **current NIF call's host's** env (here: the message env the call
+///   host hands out), and that pointer is a genuinely usable env — its host's atom table included;
+/// * `enif_free_env(p)` hands `p` back to the host that **owns** it — the env `p` designates, exactly
+///   as the C frees in the allocator that made it — once, with the exact pointer;
+/// * `enif_free_env(NULL)` is a no-op that reaches no host;
+/// * `enif_free_env` on an env the host does not own is a refusal (`false`), so nothing is freed and
+///   the env stays usable;
+/// * outside a NIF call (no live env on this thread) `enif_alloc_env()` is `NULL`.
+#[test]
+fn message_env_lifecycle_alloc_use_free_and_the_no_op_protocol() {
+    // The message env is a REAL env over its own host (a host cannot build a genuine `NifEnv` for
+    // itself through the public API), so the "use" step below is a genuine atom intern.
+    let mut msg_host = EnvHost::new(None, false).owning();
+    let msg_freed = msg_host.free_log();
+    let mut msg_env = NifEnv::new(&mut msg_host);
+    let msg_ptr = msg_env.as_ptr();
+
+    // The call env's host is the one `enif_alloc_env` reaches; it does NOT own message envs.
+    let mut host = EnvHost::new(None, false).with_alloc_env(msg_ptr);
+    let call_freed = host.free_log();
+    let mut call_env = NifEnv::new(&mut host);
+    let call_ptr = call_env.as_ptr();
+
+    // --- alloc: the current call's host hands out its own env -------------------------------
+    // SAFETY: `call_env` is live, so a host is current.
+    let p = unsafe { enif_alloc_env() };
+    assert_eq!(p, msg_ptr, "`enif_alloc_env` returns the host's own env");
+
+    // --- use: the hand-out pointer is a real, usable env ------------------------------------
+    {
+        // SAFETY: `p` is `msg_env.as_ptr()`, and `msg_env` is alive here.
+        let recovered = unsafe { NifEnv::from_opaque(p) }.expect("non-null");
+        let atom = recovered
+            .host()
+            .intern_atom("message_env_atom")
+            .expect("the message env's host interns");
+        assert_eq!(
+            recovered.host().atom_name(atom).as_deref(),
+            Some("message_env_atom"),
+            "the message env is usable, atoms included"
+        );
+    }
+
+    // --- free: handed back to the owning host, once, with the exact pointer ------------------
+    // SAFETY: `p` came from `enif_alloc_env` — the C contract for `enif_free_env`.
+    unsafe { enif_free_env(p) };
+    assert_eq!(
+        *msg_freed.borrow(),
+        vec![msg_ptr],
+        "the owning host is asked exactly once, for the exact pointer"
+    );
+
+    // --- free(NULL) is a no-op: no host is consulted -----------------------------------------
+    // SAFETY: a null env is explicitly allowed by the contract.
+    unsafe { enif_free_env(core::ptr::null_mut()) };
+    assert_eq!(msg_freed.borrow().len(), 1, "a NULL free reaches no host");
+
+    // --- free on an env the host does NOT own: refused, and the env stays usable -------------
+    // SAFETY: `call_env` is a live env.
+    unsafe { enif_free_env(call_ptr) };
+    assert_eq!(
+        *call_freed.borrow(),
+        vec![call_ptr],
+        "the non-owning host saw the pointer and refused it"
+    );
+    let atom = call_env.host().intern_atom("still_usable").expect("interns");
+    assert!(is_atom(atom), "a refused free leaves the env untouched");
+
+    // --- outside a NIF call there is no current host, so the answer is NULL ------------------
+    drop(call_env);
+    drop(msg_env);
+    // SAFETY: no env is live on this thread here, which is exactly what the call reports.
+    assert!(unsafe { enif_alloc_env() }.is_null());
 }

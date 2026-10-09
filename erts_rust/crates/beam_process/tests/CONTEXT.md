@@ -14,7 +14,12 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
    queued), `DeliverOutcome::Woke` vs `Enqueued`.
 3. `signals.rs` — link exit propagation (non-trapping dies, trapping survives with
    `{'EXIT', A, Reason}`), monitor down-message, reason ownership (a structured reason survives the
-   recipient's `Process::collect`); trapping-peer, cascaded A→B→C link, `{'DOWN'}`, self-signal.
+   recipient's `Process::collect`); trapping-peer, cascaded A→B→C link, `{'DOWN'}`, self-signal. Also
+   `a_targets_death_resolves_the_watchers_outgoing_monitor` (a target's death drops the watcher's
+   outgoing `Monitor`, so a later `demonitor` reports it gone) and
+   `link_to_a_non_live_pid_signals_noproc_from_it` (a non-live `link` target signals `noproc` from it:
+   a trapping caller is handed `{'EXIT', Target, noproc}`, a non-trapping one is terminated with
+   `noproc`).
 4. `gc.rs` — safepoint GC over the process root set (x-register + stack + mailbox payload relocate
    while garbage is reclaimed).
 5. `priority.rs` — four-level order (MAX → NORMAL → LOW, FIFO within a level), requeue at **own**
@@ -41,8 +46,11 @@ Single-threaded scheduler, mailbox, signals, GC roots, PCB state:
     `name_of`, incl. the `badarg` for a dead pid or an unregistered name), liveness
     (`is_process_alive`) and exit-reason observability, a monitor of a dead/never-existing target
     (immediate `noproc` DOWN), a monitor of a registered **name** (the `{Name, Node}` target and the
-    no-local-node typed diagnostic), and the flushed demonitor. The `oracle_*` tests drive the real
-    `erl` and skip loudly when it is absent.
+    no-local-node typed diagnostic), and the flushed demonitor. The death-side resolution of a
+    watcher's outgoing monitor is asserted for a **named** monitor too (the `{Name, node}` descriptor
+    survives until its DOWN materialises). The `oracle_*` tests drive the real `erl` and skip loudly
+    when it is absent, including `oracle_a_targets_death_resolves_the_watchers_outgoing_monitor` and
+    `oracle_link_to_a_non_live_pid_signals_noproc_from_it`.
 12. `capability_inventory.rs` — the crate's **typed-error / capability inventory** (objective items
     2/6/8): the atom-target monitor with no local node installed ⇒ the exact `unsupported`; the
     `erlang:monitor/2` **type dispatch** (`time_offset`/unknown ⇒ no kind ⇒ the oracle's `badarg`);
@@ -118,6 +126,15 @@ SMP pool:
     absent) pin the same end state against the real system — a process `monitor(port, P)` is listed by
     `port_info(P, monitored_by)` while alive and gone after it dies (`{spawn, Cmd}` uses
     `exec sleep 30 >/dev/null 2>&1` so the OS child never holds the probe's stdout pipe).
+26. `scheduler_ports.rs` (7 tests) — the port-aware scheduler slice: a death during a slice
+    (`run_slice_with_ports`/`run_ready_with_ports`) cleans the dangling incoming `PortMonitor`; the
+    port-less control leaves it; a fatal signal deferred while the target was `Running` terminates it at
+    schedule-in and cleans the port monitor (the runner is never entered); the wake list is absorbed
+    after the slice and on the empty-queue early return.
+27. `exhaustion.rs` (3 tests) — `Process::deliver`'s collect-and-retry: a full nursery is grown one
+    curated step and the payload is enqueued exactly once (`minor_gcs == 1`), FIFO preserved for a
+    second delivery; and the typed `Err(BeamError::Alloc(AllocKind::Message))` path (a
+    `from_min_max(cap, cap)` policy cannot grow ⇒ mailbox untouched, no partial write, no panic).
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -135,12 +152,13 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **351 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **366 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
-  `preemption.rs`, `dict.rs`, `fragments.rs` → the single-threaded scheduler, mailbox, signals, GC
-  roots, PCB state and pre-emption/fairness
+  `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs` → the
+  single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
+  pre-emption/fairness and the delivery collect-and-retry path
 - `registry_monitors.rs`, `monitor_tag.rs`, `capability_inventory.rs`, `process_info_source.rs`,
   `spawn_options.rs` → the process-control surface: name registry + monitors (incl. the `monitor/3` user
   tag), the typed-error/capability inventory, the `process_info` item→accessor mapping, and the
