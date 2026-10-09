@@ -103,6 +103,16 @@ const TEST_B: Reg = Reg::R8;
 pub(super) const TEST_T: Reg = Reg::R10;
 /// The header test's boxed-pointer scratch ([`load_boxed_header`]).
 const TEST_C: Reg = Reg::R9;
+/// The header test's staging scratch for the **masked** header value ([`header_matches`]).
+///
+/// It must not be one of the operand/pointer scratch registers: every caller passes
+/// the loaded header in [`TEST_T`] and several of them (the float branch of
+/// [`emit_is_number`], the sub-bits branch of [`emit_is_binary`], the arity field of
+/// [`emit_is_fun_arity`]) go on to read that header again, so the predicate has to
+/// test it **without consuming it**. `R11` is the emitter's existing transient
+/// scratch (short-lived uses in `emit_helper_call`/`emit_step_and_continue`), so it
+/// is free for the length of one predicate.
+pub(super) const TEST_H: Reg = Reg::R11;
 
 /// `beam_term::TAG_IMMED2_MASK` as an `i64` — the low-six-bits mask `is_atom` tests.
 const ATOM_MASK: i64 = TAG_IMMED2_MASK as i64;
@@ -556,18 +566,29 @@ fn load_boxed_header(
     buffer.cmp_rr(ptr, out)?;
     buffer.jcc(Cond::Ne, failed)?;
     // `ptr` = boxed_val(value): mask off TAG_PTR_MASK and read the header word.
+    //
+    // `ptr` currently holds the *primary tag* of `value` (the `2` the guard just
+    // matched), **not** `value`, so reload the term word first: masking the tag
+    // value with `PTR_MASK` would leave `2 & !0x7 == 0` and the header read below
+    // would dereference a null pointer.
+    buffer.mov_rr(ptr, value)?;
     buffer.mov_ri(FAST_C, PTR_MASK)?;
     buffer.and_rr(ptr, FAST_C)?;
     buffer.mov_rm(out, ptr, 0)
 }
 
 /// `jcc E, success` when `(reg & mask) == tag` — the header predicate itself.
+///
+/// `reg` is **preserved**: the masked value is staged in [`TEST_H`], not in `reg`, so a
+/// caller that still needs the header word (the `HEADER_FLONUM` branch of
+/// [`emit_is_number`], the `HEADER_SUB_BITS` branch of [`emit_is_binary`], the arity
+/// field of [`emit_is_fun_arity`]) can keep reading it.
 fn header_matches(buffer: &mut CodeBuffer, reg: Reg, mask: i64, tag: i64, success: CodeLabel) -> Result<()> {
     buffer.mov_ri(FAST_C, mask)?;
-    buffer.mov_rr(TEST_T, reg)?;
-    buffer.and_rr(TEST_T, FAST_C)?;
+    buffer.mov_rr(TEST_H, reg)?;
+    buffer.and_rr(TEST_H, FAST_C)?;
     buffer.mov_ri(FAST_C, tag)?;
-    buffer.cmp_rr(TEST_T, FAST_C)?;
+    buffer.cmp_rr(TEST_H, FAST_C)?;
     buffer.jcc(Cond::E, success)
 }
 

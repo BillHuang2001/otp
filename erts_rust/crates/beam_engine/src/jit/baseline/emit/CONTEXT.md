@@ -21,7 +21,8 @@ The driver, block ABI and the two helpers (`jit_step_one`, `jit_tail_call`) live
   `mod.rs`.
 - Caller-saved scratch registers, used only *within* one instruction's lowering: `MOVE_SCRATCH`=`r11`,
   `MOVE_SCRATCH_2`=`r10` (`mod.rs`); `FAST_A`=`rax`, `FAST_B`=`r8`, `FAST_C`=`rcx`, `FAST_T`=`r10`,
-  `FAST_R`=`r11` (`arith.rs`); `TEST_A`=`rax`, `TEST_B`=`r8`, `TEST_T`=`r10` (`test.rs`);
+  `FAST_R`=`r11` (`arith.rs`); `TEST_A`=`rax`, `TEST_B`=`r8`, `TEST_C`=`r9`, `TEST_T`=`r10`,
+  `TEST_H`=`r11` (`test.rs`);
   `GUARD_SCRATCH`=`r8` (`aggregate.rs`). None overlaps a cache register, `rbx` or `rsp`.
 
 ## The lowering dispatch (the compile-time inlinable-vs-deopt decision)

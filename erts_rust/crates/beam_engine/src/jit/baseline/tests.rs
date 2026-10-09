@@ -811,9 +811,20 @@ fn error_reason(err: &beam_common::BeamError) -> String {
     }
 }
 
-/// Run exported `name/0` on both tiers with the same fresh machine/context and
-/// return the two outcomes.
-fn run_both_tiers(module: &Module, name: Atom) -> (Result<RunOutcome>, Result<RunOutcome>) {
+/// Run exported `name/0` on both tiers with a **fresh** machine/context each and
+/// hand the two outcomes to `check`.
+///
+/// Each run builds on its own [`MinimalContext`] heap, and a returned **boxed**
+/// term is a pointer into that heap. A `MinimalContext` owns its heap and must
+/// outlive every boxed term built through it, so the comparison has to happen
+/// *inside* this function: returning the outcomes and comparing them after the
+/// contexts have been dropped would dereference freed memory (the boxed-term
+/// cases would then be compared against recycled heap words, not values).
+fn with_both_tiers<R>(
+    module: &Module,
+    name: Atom,
+    check: impl FnOnce(&Result<RunOutcome>, &Result<RunOutcome>) -> R,
+) -> R {
     let mut interpreter = Machine::new();
     let mut interpreter_ctx = MinimalContext::new();
     let interpreter_outcome = interpreter.run_export_outcome_with_tier(
@@ -834,7 +845,7 @@ fn run_both_tiers(module: &Module, name: Atom) -> (Result<RunOutcome>, Result<Ru
         &mut baseline_ctx,
         Tier::BaselineJit,
     );
-    (interpreter_outcome, baseline_outcome)
+    check(&interpreter_outcome, &baseline_outcome)
 }
 
 /// Assert the two tiers' outcomes are observably identical: structurally equal
@@ -1023,60 +1034,67 @@ fn un_lowered_instructions_deopt_to_the_interpreter_with_identical_outcomes() {
         ("bs_start_match3", bs_start_match3_case()),
     ];
     for (label, (module, name)) in cases {
-        let (interpreter, baseline) = run_both_tiers(&module, name);
-        assert_same_outcome(label, &interpreter, &baseline, &module.atom_table);
+        with_both_tiers(&module, name, |interpreter, baseline| {
+            assert_same_outcome(label, interpreter, baseline, &module.atom_table);
+        });
     }
 
     // Concrete anchors — the cross-tier comparison above would be vacuous if
     // both sides raised the same trivial error.
     let (module, name) = has_map_fields_case();
-    let (interpreter, baseline) = run_both_tiers(&module, name);
-    assert_eq!(
-        interpreter.expect("interpreter run"),
-        RunOutcome::Returned(make_small(2)),
-        "`has_map_fields` on a non-map takes the live fail branch"
-    );
-    assert_eq!(
-        baseline.expect("baseline run"),
-        RunOutcome::Returned(make_small(2)),
-        "the deopt produced the interpreter's exact value"
-    );
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_eq!(
+            interpreter.as_ref().expect("interpreter run"),
+            &RunOutcome::Returned(make_small(2)),
+            "`has_map_fields` on a non-map takes the live fail branch"
+        );
+        assert_eq!(
+            baseline.as_ref().expect("baseline run"),
+            &RunOutcome::Returned(make_small(2)),
+            "the deopt produced the interpreter's exact value"
+        );
+    });
 
     let (module, name) = local_call_case();
-    let (interpreter, baseline) = run_both_tiers(&module, name);
-    assert_eq!(
-        interpreter.expect("interpreter run"),
-        RunOutcome::Returned(make_small(7)),
-        "the leaf callee's `move`/`return` transferred x(0)"
-    );
-    assert_eq!(
-        baseline.expect("baseline run"),
-        RunOutcome::Returned(make_small(7)),
-        "the deopted `call`/`deallocate_return` frame discipline is identical"
-    );
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        assert_eq!(
+            interpreter.as_ref().expect("interpreter run"),
+            &RunOutcome::Returned(make_small(7)),
+            "the leaf callee's `move`/`return` transferred x(0)"
+        );
+        assert_eq!(
+            baseline.as_ref().expect("baseline run"),
+            &RunOutcome::Returned(make_small(7)),
+            "the deopted `call`/`deallocate_return` frame discipline is identical"
+        );
+    });
 
     let (module, name) = put_tuple2_case();
-    let (interpreter, baseline) = run_both_tiers(&module, name);
-    for (label, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
-        match outcome.expect("run") {
-            RunOutcome::Returned(value) => assert!(
-                !beam_term::is_small(value),
-                "{label}: `put_tuple2` must return a boxed tuple, not a small int"
-            ),
-            other => panic!("{label}: unexpected outcome {other:?}"),
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        for (label, outcome) in [("interpreter", interpreter), ("baseline", baseline)] {
+            match outcome.as_ref().expect("run") {
+                RunOutcome::Returned(value) => assert!(
+                    !beam_term::is_small(*value),
+                    "{label}: `put_tuple2` must return a boxed tuple, not a small int"
+                ),
+                other => panic!("{label}: unexpected outcome {other:?}"),
+            }
         }
-    }
+    });
 
     // The non-match-context bitstring test is the same typed error on both tiers.
     let (module, name) = bs_test_tail2_case();
-    let (interpreter, baseline) = run_both_tiers(&module, name);
-    for err in [interpreter, baseline] {
-        let err = err.expect_err("a non-context operand is a typed error");
-        assert_eq!(
-            error_reason(&err),
-            "unsupported_opcode: bs_test_tail2: operand is not a match context"
-        );
-    }
+    with_both_tiers(&module, name, |interpreter, baseline| {
+        for err in [interpreter, baseline] {
+            let err = err
+                .as_ref()
+                .expect_err("a non-context operand is a typed error");
+            assert_eq!(
+                error_reason(err),
+                "unsupported_opcode: bs_test_tail2: operand is not a match context"
+            );
+        }
+    });
 }
 
 /// A context that answers `erlang:'+'/2` with a fixed small-int result (recording
