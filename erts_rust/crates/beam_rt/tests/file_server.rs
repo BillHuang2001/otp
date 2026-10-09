@@ -38,10 +38,12 @@
 //!   are *not* sorted — the test sorts them itself so the comparison against the oracle is
 //!   order-independent).
 //!
-//! A `.beam`-only `file_server_2` cannot host the io-device's
-//! `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` request: `file_io_server` answers it with
-//! `io_lib:get_until/4` → `erl_scan:tokens/4`, real Erlang tokenizer code. That stays a typed
-//! capability gap (never a fabricated term) and is deliberately not exercised here.
+//! The io-device's `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` request IS served: the
+//! device's read loop drives an engine-backed `beam_io::io_device::Continuation` that runs the
+//! real `erl_scan:tokens/4` (`../../src/native/file_server/get_until.rs`). No integration test
+//! drives it here, because the library-level `io:scan_erl_exprs` path is blocked *earlier* by
+//! the unimplemented `net_kernel:dflag_unicode_io/1`; the request itself is pinned end to end in
+//! `../../src/native/file_server/get_until/tests.rs`.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
