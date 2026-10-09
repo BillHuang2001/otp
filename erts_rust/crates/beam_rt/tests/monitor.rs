@@ -205,10 +205,10 @@ const REJECTIONS: [(&str, &str); 9] = [
     ),
 ];
 
-/// The two target/option forms the oracle accepts and this runtime cannot express: a port
-/// monitor (its table is `beam_io`'s, not reachable here) and a per-monitor `{tag, _}` (the
-/// `beam_process` monitor carries no tag field).
-const CAPABILITY_GAPS: [(&str, &str); 2] = [
+/// The two target/option forms the oracle accepts and this runtime **adopts**: a port
+/// monitor (recorded on the runtime's authoritative port table — `beam_io`'s
+/// `PortRegistry`, the one `open_port/2` allocates from) and a per-monitor `{tag, _}`.
+const ADOPTED_TARGETS: [(&str, &str); 2] = [
     (
         "monitor(port, Port)",
         "erlang:monitor(port, open_port({spawn,\"true\"}, []))",
@@ -278,26 +278,21 @@ fn malformed_monitor_and_demonitor_calls_are_badarg_in_both_runtimes() {
     }
 }
 
-/// The two forms the oracle accepts but this runtime cannot express are the honest typed
-/// capability gap: exit 3 with `beam_rt: unsupported: …`, never a fabricated monitor. The
-/// live oracle is run too, so the gap is proved to be a *gap* (the oracle answers a
-/// reference) rather than a rejection both runtimes share.
+/// The two forms the oracle accepts and this runtime now **adopts** — a port monitor and a
+/// per-monitor `{tag, _}` — succeed silently (exit 0, nothing printed), and the live oracle
+/// answers a reference for both, so the two runtimes agree rather than both rejecting.
 #[test]
-fn the_inexpressible_targets_are_typed_capability_gaps_where_the_oracle_accepts() {
+fn the_formerly_inexpressible_targets_are_adopted_like_the_oracle() {
     let Some(oracle) = support::require_oracle("monitor") else {
         return;
     };
-    for (label, expr) in CAPABILITY_GAPS {
+    for (label, expr) in ADOPTED_TARGETS {
         let ours = beam_rt_eval(expr);
-        assert_eq!(ours.code, 3, "{label}: expected exit 3, stderr {}", ours.err);
-        assert!(
-            ours.err.starts_with("beam_rt: unsupported:"),
-            "{label}: stderr {}",
-            ours.err
-        );
+        assert_eq!(ours.code, 0, "{label}: expected exit 0, stderr {}", ours.err);
+        assert_eq!(ours.out, "", "{label}: a monitor prints nothing");
     }
-    // The oracle answers a reference for both, which is what makes them gaps.
-    for (label, expr) in CAPABILITY_GAPS {
+    // The oracle answers a reference for both, which is what these cases compare against.
+    for (label, expr) in ADOPTED_TARGETS {
         let accepted = format!("io:format(\"~p~n\", [is_reference({expr})]), halt(0).");
         let theirs = oracle_eval(&oracle, &accepted);
         assert_eq!(

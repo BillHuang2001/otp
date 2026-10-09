@@ -150,7 +150,7 @@ use beam_io::{
     PortRegistry as IoPortRegistry, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
     PORT_REDS_EXECUTE,
 };
-use beam_process::{PortId, ProcessId, ProcessTable};
+use beam_process::{PortId, PortTable, ProcessId, ProcessTable};
 use beam_term::{
     atom_val, is_atom, is_small, make_atom, make_small, signed_value, try_make_small, AtomTable,
     Eterm, NIL,
@@ -476,6 +476,25 @@ impl PortRegistry {
             .registry
             .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
         Ok(())
+    }
+
+    /// The registry's port-number table, mutably — the seam the **port-monitor** BIFs drive.
+    ///
+    /// This is the **same** [`beam_process::PortTable`] instance
+    /// [`beam_io::PortRegistry::open`] allocates from and [`PortRegistry::close`] releases
+    /// through (see [`beam_io::PortRegistry::port_table_mut`], of which this is a forwarder), so
+    /// a monitor recorded here is the one `open`/`close` and the port's own lifecycle observe.
+    /// It is therefore the **authoritative** port table for port monitors.
+    ///
+    /// # Borrowing rule
+    ///
+    /// The returned `&mut PortTable` borrows this registry, which lives behind the runtime's
+    /// `Rc<RefCell<PortRegistry>>`: scope the borrow so it is dropped before any nested borrow
+    /// of the same cell (acquire the `RefMut`, take the table, run the single monitor/demonitor
+    /// call, drop the whole chain). A nested borrow stays the typed capability gap
+    /// ([`crate::port::RuntimePorts::registry_mut`]'s `error::unsupported`), never a panic.
+    pub fn port_table_mut(&mut self) -> &mut PortTable {
+        self.registry.port_table_mut()
     }
 
     /// The number of **live** ports — the value `erlang:system_info(port_count)` reports.
