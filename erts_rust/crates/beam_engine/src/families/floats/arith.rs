@@ -75,7 +75,7 @@ pub(super) fn binary(
     if !result.is_finite() {
         return arithmetic_failure(machine, module, labels, fail);
     }
-    let value = make_float(ctx, result)?;
+    let value = make_float(machine, ctx, result)?;
     write_operand(machine, dst, value)?;
     Ok(Some(Step::Next))
 }

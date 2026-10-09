@@ -24,7 +24,9 @@
 use beam_common::{BeamError, Result};
 use beam_term::Eterm;
 
+use super::{reserve, Slack};
 use crate::context::ExecutionContext;
+use crate::machine::Machine;
 
 /// Builds a local **fun** (closure) term.
 ///
@@ -55,16 +57,27 @@ use crate::context::ExecutionContext;
 /// ```
 ///
 /// `arity` and `num_free` must each fit 8 bits; a larger value yields
-/// [`BeamError::SystemLimit`]. The pointer is valid until the next
-/// [`ExecutionContext::ensure_heap`] call.
-pub fn make_fun(
+/// [`BeamError::SystemLimit`]. The block is reserved **rooted** for
+/// `1 + FUN_DESC_WORDS_LOCAL + num_free + extra` words **before** the `read` closure
+/// runs, so the free variables are read from the machine's post-collection state and
+/// a non-small integer operand is materialized into the spare tail (never a second
+/// collecting allocation). A closure returning the wrong free-variable count is a
+/// typed [`crate::error::unsupported`]. The pointer is valid until the next
+/// collecting allocation.
+pub fn make_fun<R>(
+    machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
+    live: u32,
     arity: u32,
     uniq: u64,
     index: u32,
-    free: &[Eterm],
-) -> Result<Eterm> {
-    let num_free = free.len();
+    num_free: usize,
+    extra: usize,
+    read: R,
+) -> Result<Eterm>
+where
+    R: FnOnce(&Machine, &mut Slack) -> Result<Vec<Eterm>>,
+{
     if arity as usize > beam_term::fun::FUN_MAX_FIELD || num_free > beam_term::fun::FUN_MAX_FIELD {
         return Err(BeamError::SystemLimit);
     }
@@ -72,11 +85,20 @@ pub fn make_fun(
         beam_term::fun::make_fun_header(arity as usize, num_free, beam_term::fun::FunKind::Local)
             .map_err(BeamError::from)?;
     let env_offset = 1 + beam_term::fun::FUN_DESC_WORDS_LOCAL;
-    let hp = ctx.alloc_words(env_offset + num_free)?;
-    // SAFETY: `alloc_words` returned `1 + FUN_DESC_WORDS_LOCAL + num_free`
-    // exclusively-owned, writable words. Word 0 receives the fun header, word 1 the
-    // `uniq`, word 2 the `index` and words `env_offset..env_offset + num_free` the
-    // free variables — every write is in bounds.
+    let hp = reserve(machine, ctx, env_offset + num_free + extra, live)?;
+    // SAFETY: the reserve returned `env_offset + num_free + extra` exclusively-owned,
+    // writable words; the `extra`-word tail after the env words is the slack.
+    let mut slack = unsafe { Slack::new(hp.add(env_offset + num_free), extra) };
+    let free = read(machine, &mut slack)?;
+    if free.len() != num_free {
+        return Err(crate::error::unsupported(
+            "make_fun: free-variable count mismatch",
+        ));
+    }
+    // SAFETY: the reserve block is live and exclusively owned. Word 0 receives the fun
+    // header, word 1 the `uniq`, word 2 the `index` and words
+    // `env_offset..env_offset + num_free` the free variables — every write is in
+    // bounds.
     let root = unsafe {
         *hp = header;
         *hp.add(1) = Eterm::from_raw(uniq as usize);
