@@ -127,15 +127,15 @@ pub(crate) fn dispatch(
             tuples::exec(machine, module, labels, instr, func, pc, ctx)
         }
         // records (tagged-tuple update + the native-record set)
-        Instr::UpdateRecord { .. }
+        Instr::UpdateRecord(_)
         | Instr::IsAnyNativeRecord { .. }
         | Instr::IsNativeRecord { .. }
         | Instr::GetRecordElements { .. }
         | Instr::GetRecordElementsId { .. }
-        | Instr::PutRecord { .. }
+        | Instr::PutRecord(_)
         | Instr::IsRecordAccessible { .. }
-        | Instr::GetRecordField { .. }
-        | Instr::UpdateRecordId { .. } => {
+        | Instr::GetRecordField(_)
+        | Instr::UpdateRecordId(_) => {
             records::exec(machine, module, labels, instr, func, pc, ctx)
         }
         // lists
@@ -173,8 +173,8 @@ pub(crate) fn dispatch(
         // maps
         Instr::GetMapElements { .. }
         | Instr::HasMapFields { .. }
-        | Instr::PutMapAssoc { .. }
-        | Instr::PutMapExact { .. } => maps::exec(machine, module, labels, instr, func, pc, ctx),
+        | Instr::PutMapAssoc(_)
+        | Instr::PutMapExact(_) => maps::exec(machine, module, labels, instr, func, pc, ctx),
         // bitstrings (the whole `Bs*` family)
         Instr::BsStartMatch3 { .. }
         | Instr::BsStartMatch4 { .. }
@@ -182,12 +182,12 @@ pub(crate) fn dispatch(
         | Instr::BsSetPosition { .. }
         | Instr::BsGetTail { .. }
         | Instr::BsTestTail2 { .. }
-        | Instr::BsGetInteger2 { .. }
-        | Instr::BsGetBinary2 { .. }
+        | Instr::BsGetInteger2(_)
+        | Instr::BsGetBinary2(_)
         | Instr::BsSkipBits2 { .. }
         | Instr::BsMatch { .. }
         | Instr::BsMatchString { .. }
-        | Instr::BsGetFloat2 { .. }
+        | Instr::BsGetFloat2(_)
         | Instr::BsGetUtf8 { .. }
         | Instr::BsGetUtf16 { .. }
         | Instr::BsGetUtf32 { .. }

@@ -83,7 +83,7 @@ use std::collections::BTreeMap;
 
 use beam_common::BeamError;
 use beam_engine::{terms, Machine, MinimalContext};
-use beam_loader::{load_file, Function, Instr, Label, Module, Operand, NO_FAIL};
+use beam_loader::{load_file, BsGetArgs, Function, Instr, Label, Module, Operand, NO_FAIL};
 use beam_term::{is_small, make_small, Atom, Eterm, MAX_SMALL};
 
 /// The committed wide-integer fixture (`erlc bsbig.erl`).
@@ -720,7 +720,7 @@ fn get_integer_module(size: i64, unit: u32, flags: u32) -> (Module, Label) {
             live: 1,
             dst: Operand::X(1),
         },
-        Instr::BsGetInteger2 {
+        Instr::BsGetInteger2(Box::new(BsGetArgs {
             fail: NO_FAIL,
             ctx: Operand::X(1),
             live: 1,
@@ -728,7 +728,7 @@ fn get_integer_module(size: i64, unit: u32, flags: u32) -> (Module, Label) {
             unit,
             flags,
             dst: Operand::X(0),
-        },
+        })),
         Instr::Return,
     ])
 }

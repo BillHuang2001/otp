@@ -224,9 +224,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   directories** load, with no allowlist and **zero failures**.
 - **Engine execution breadth reaches beyond stdlib/kernel/compiler:** `beam_engine`'s `tests/apps_lists.rs`
   runs oracle-cross-checked functions from parsetools (yecc/leex), syntax_tools, xmerl, inets, edoc, eunit,
-  dialyzer, asn1 and snmp; `tests/census.rs` reaches **1366/1366 modules / 2,942,736 instructions with
-  zero unmodelled opcodes** (the 11 unused `Instr` variants are the seven native-record variants — an
-  OTP-29 feature this toolchain does not enable — plus `BsTestTail2`, `ExecutableLine`, `DebugLine` and
+  dialyzer, asn1 and snmp; `tests/census.rs` reaches **1366/1366 modules / 2,888,257 instructions with
+  zero unmodelled opcodes** (the 12 unused `Instr` variants are the seven native-record variants — an
+  OTP-29 feature this toolchain does not enable — plus `Deallocate` (every corpus `deallocate` is
+  fused into `DeallocateReturn` by the loader), `BsTestTail2`, `ExecutableLine`, `DebugLine` and
   the `Generic` sentinel).
 - **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
@@ -244,8 +245,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
   `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches**:
-  `summary: total=723 agree=722 mismatch=0 unsupported=1 skipped=0` (`../tools/differential/gate.sh` →
-  exit 3); re-run `gate.sh` for the live per-contract split. The one `unsupported` is
+  `summary: total=794 agree=785 mismatch=0 unsupported=9 skipped=0` (`../tools/differential/gate.sh` →
+  exit 3); re-run `gate.sh` for the live per-contract split. Of the nine `unsupported` cases (A.5
+  `wire/new_fun_ext_encode`; A.7's five `proc_signals/statistics_*` and two `proc_signals/monitor_*`;
+  A.9's `boot/proc_lib_start_link_blocks_the_boot_path`), the one unclosable by design is
   `wire/new_fun_ext_encode` (A.5): its
   `-eval` `fun() -> ok end` is an `erl_eval` *template* closure (the arity-selected `-expr/6-fun-7-`
   slot) whose single free variable is erl_eval's internal `Info` tuple holding the clause in `erl_parse`

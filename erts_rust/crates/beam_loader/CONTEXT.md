@@ -118,7 +118,7 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `pub type SharedLiteralArea = Arc<LiteralArea>;` — the type of `Module.literals`.
   `LiteralArea` is **not `Send`/`Sync`** (it owns a raw-pointer `Heap`), and therefore neither is a loaded `Module`.
 ### The instruction vocabulary (`src/instr.rs`, re-exported by `ir.rs`)
-- `pub enum Instr` — ~120 named, typed variants covering the opcode families the compiler emits, plus
+- `pub enum Instr` — **107** named, typed variants covering the opcode families the compiler emits, plus
   the lossless fallback `Generic { op: Opcode, operands: Vec<Operand>, offset: u32 }`.
   Every variant's field order is the **file's** operand order (`emu/ops.tab`). The families:
   - **module/function framing** — `Label(Label)`, `Line(LineRef)`,
@@ -138,7 +138,8 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   - **stack frames** — `Allocate { stack_need: HeapNeed, live }`,
     `AllocateHeap { stack_need: HeapNeed, heap_need: HeapNeed, live }`,
     `TestHeap { heap_need: HeapNeed, live }`, `InitYregs { registers: Vec<Operand> }`,
-    `Deallocate(u32)`, `Trim { n: u32, remaining: u32 }`, `Return`.
+    `Deallocate(u32)`, `Trim { n: u32, remaining: u32 }`, `Return`,
+    `DeallocateReturn(u32)` (the loader's only superinstruction — see `src/lower/fuse.rs`).
   - **tuples** — `PutTuple2 { dst, elements: Vec<Operand> }`,
     `GetTupleElement { source, element: u32, dst }`.
   - **lists** — `PutList { head, tail, dst }`, `GetList { source, head, tail }`,
@@ -331,7 +332,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   by `(module, function, arity)` following the real `bif.tab` naming — the loader does **not** know and
   must **not** encode `bif.tab` numbering. `Module.imports` is the single source of BIF identity.
 - **`Instr` and `TestKind` live in `src/instr.rs`, re-exported from `ir.rs`.** The instruction
-  vocabulary is one large flat enum (~120 variants); an enum cannot be spread across submodules and
+  vocabulary is one large flat enum (107 variants); an enum cannot be spread across submodules and
   splitting the *variants* would destroy the single-name surface the engine matches on, so it is kept in
   one dedicated module while `ir.rs` (the data types) does `pub use crate::instr::*;` so `crate::ir::Instr`,
   `crate::Instr` and `prelude::*` are unchanged. This keeps `ir.rs` focused on the module/function/table
@@ -542,7 +543,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   module, run under both runtimes through `beam_rt`); `beam_engine`'s own suite covers them structurally
   only, and `put_record/6`'s cross-module create form is a typed `unsupported` there (see
   `../../crates/CONTEXT.md`).
-- **Lowering is strictly 1:1 — no `ops.tab` transform / superinstruction combining.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`; it does not expand multi-instruction sequences nor build the C loader's superinstructions (the C does that from `emu/ops.tab` in `beam_load.c`). A `.beam` file carries only generic opcodes, so this is an engine-side optimization the interpreter does not need — never a correctness gap.
+- **Lowering is one peephole pass, not a full `ops.tab` transform.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`. The only rewrite after that is `src/lower/fuse.rs` (`fuse`), a single forward pass that coalesces an **adjacent** `Deallocate(N); Return` pair in each function body into the one superinstruction `Instr::DeallocateReturn(N)`, run *before* `build_blocks` derives the blocks/labels (so a block's `start..end` indexes the same fused vector the engine dispatches on). `Label` is the only branch target, so two adjacent non-`Label` instructions share a block and the pair can never cross one; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules that bypass the loader. That is the whole superinstruction surface here; the C builds a much larger set from `emu/ops.tab` in `beam_load.c` (a candidate for later). Never a correctness gap: `beam_engine`'s core `DeallocateReturn` arm executes exactly the two constituents in order.
 - **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
 - **Contract A.2 divergences from the C loader (`beam_load.c`/`beam_file.c`), both currently unenforced:**
   - **No `max_opcode` sanity bound.** `decode_stream` (`src/decode.rs:229`) only rejects an opcode *byte*
@@ -574,12 +575,13 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`)
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
-- `src/instr.rs` → the typed instruction vocabulary: `Instr` (~120 variants) + `TestKind`
+- `src/instr.rs` → the typed instruction vocabulary: `Instr` (107 variants) + `TestKind`
 - `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `RecordDefinition`/`RecordField`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
 - `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap (+ the shared `decode_terms`/`decode_terms_at_capacity` retry path)
 - `src/attributes.rs` → `AttributeTable` / `SharedAttributeTable`: the decoded `Attr` chunk term (`Module::attributes_term`/`attribute_by_name`) for `module_info(attributes)`
 - `src/lower.rs` → `build_module` + module assembly (re-exports the `group` helpers)
 - `src/lower/group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks`
+- `src/lower/fuse.rs` → `fuse` (the loader's only superinstruction pass: adjacent `Deallocate;Return` → `DeallocateReturn`)
 - `src/lower/instr.rs` → `lower_instr` (one `RawInstr` → one `Instr`)
 - `src/load.rs` → `load` / `load_file` orchestrator
 - `tests/fixtures/slice.erl` + `slice.beam` → the vertical-slice oracle fixture

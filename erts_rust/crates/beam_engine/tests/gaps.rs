@@ -36,7 +36,9 @@ use std::collections::BTreeMap;
 
 use beam_common::BeamError;
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
-use beam_loader::{Function, Instr, Label, Module, Operand, TestKind, NO_FAIL};
+use beam_loader::{
+    Function, Instr, Label, MapWriteArgs, Module, Operand, PutRecordArgs, TestKind, NO_FAIL,
+};
 use beam_term::{make_small, Atom, Eterm};
 
 // ---------------------------------------------------------------------------
@@ -53,15 +55,17 @@ use beam_term::{make_small, Atom, Eterm};
 // that turns a typed error into a value (or into the sentinel) fails here.
 //
 // Corpus reachability (evidence: `tests/census.rs`'s counts over the whole installed
-// OTP — 1366 `.beam` over 34 applications, 2,942,736 instructions):
+// OTP — 1366 `.beam` over 34 applications, 2,888,257 instructions):
 //   * CORPUS-REACHABLE  — the installed toolchain emits the instruction today, so
 //     the gap is a live limitation a real module can hit.
 //   * FORWARD-COMPAT-ONLY — the instruction has **zero** corpus occurrences, so the
 //     gap exists only for a future toolchain that emits it. The census's full
 //     zero-occurrence set is the 7 OTP-29 native-record opcodes (`IsNativeRecord`,
 //     `GetRecordElements`, `PutRecord`, `IsRecordAccessible`, `GetRecordField`,
-//     `GetRecordElementsId`, `UpdateRecordId`) plus `BsTestTail2`,
-//     `ExecutableLine`, `DebugLine`, `Generic` — 11 of the 106 `Instr` variants.
+//     `GetRecordElementsId`, `UpdateRecordId`) plus `Deallocate` (the loader fuses
+//     every corpus `deallocate;return` into `DeallocateReturn`, so the standalone
+//     variant is unreached), `BsTestTail2`, `ExecutableLine`, `DebugLine`,
+//     `Generic` — 12 of the 107 `Instr` variants.
 //     Toolchain evidence for the native-record family: `erl_features:configurable()`
 //     ⇒ `[compr_assign,maybe_expr]` (`native_record` is not in it), `erlc
 //     -enable-feature native_record` ⇒ "the feature 'native_record' does not
@@ -277,13 +281,13 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         let a = f.atom("a");
         let assoc = vec![
             Instr::Label(Label(1)),
-            Instr::PutMapAssoc {
+            Instr::PutMapAssoc(Box::new(MapWriteArgs {
                 fail: NO_FAIL,
                 source: Operand::X(0),
                 dst: Operand::X(0),
                 live: 1,
                 pairs: vec![(Operand::Atom(a), Operand::Integer(1))],
-            },
+            })),
             Instr::Return,
         ];
         let entry = f.add_function("f", 1, assoc);
@@ -299,13 +303,13 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         let a = f.atom("a");
         let exact = vec![
             Instr::Label(Label(1)),
-            Instr::PutMapExact {
+            Instr::PutMapExact(Box::new(MapWriteArgs {
                 fail: NO_FAIL,
                 source: Operand::X(0),
                 dst: Operand::X(0),
                 live: 1,
                 pairs: vec![(Operand::Atom(a), Operand::Integer(1))],
-            },
+            })),
             Instr::Return,
         ];
         let entry = f.add_function("f", 1, exact);
@@ -370,14 +374,14 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
                 dst: Operand::X(0),
                 elements: vec![Operand::X(0), Operand::X(1)],
             },
-            Instr::PutRecord {
+            Instr::PutRecord(Box::new(PutRecordArgs {
                 fail: NO_FAIL,
                 id: Operand::X(0),
                 src: Operand::Nil,
                 dst: Operand::X(2),
                 live: 0,
                 updates: vec![],
-            },
+            })),
             Instr::Return,
         ];
         let entry = f.add_function("f", 0, code);
@@ -394,14 +398,14 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
         let rec = f.atom("rec");
         let code = vec![
             Instr::Label(Label(1)),
-            Instr::PutRecord {
+            Instr::PutRecord(Box::new(PutRecordArgs {
                 fail: NO_FAIL,
                 id: Operand::Atom(rec),
                 src: Operand::X(0),
                 dst: Operand::X(0),
                 live: 1,
                 updates: vec![],
-            },
+            })),
             Instr::Return,
         ];
         let entry = f.add_function("f", 1, code);

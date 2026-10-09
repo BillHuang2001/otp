@@ -55,7 +55,7 @@
 use crate::interpreter::LabelMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Module};
+use beam_loader::{BsGetArgs, Instr, Module};
 
 use crate::context::ExecutionContext;
 use crate::machine::Machine;
@@ -179,15 +179,16 @@ pub(super) fn exec(
                 fail_step(machine, module, labels, *fail, term, ctx)
             }
         }
-        Instr::BsGetInteger2 {
-            fail,
-            ctx: ctx_op,
-            live: _,
-            size,
-            unit,
-            flags,
-            dst,
-        } => {
+        Instr::BsGetInteger2(b) => {
+            let BsGetArgs {
+                fail,
+                ctx: ctx_op,
+                live: _,
+                size,
+                unit,
+                flags,
+                dst,
+            } = &**b;
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
             let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
@@ -202,15 +203,16 @@ pub(super) fn exec(
             raw::set_ctx_start(term, start + nbits);
             Ok(Some(Step::Next))
         }
-        Instr::BsGetBinary2 {
-            fail,
-            ctx: ctx_op,
-            live: _,
-            size,
-            unit,
-            flags: _,
-            dst,
-        } => {
+        Instr::BsGetBinary2(b) => {
+            let BsGetArgs {
+                fail,
+                ctx: ctx_op,
+                live: _,
+                size,
+                unit,
+                flags: _,
+                dst,
+            } = &**b;
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
             let remaining = end.saturating_sub(start);
             let nbits = if is_all(module, size) {
@@ -286,15 +288,16 @@ pub(super) fn exec(
         // (`i_bs_get_float2`, `bs_instrs.tab:227` into `erts_bs_get_float_2`). Only
         // 0/16/32/64 bits are valid; a short subject or any other size is a match
         // failure.
-        Instr::BsGetFloat2 {
-            fail,
-            ctx: ctx_op,
-            live: _,
-            size,
-            unit,
-            flags,
-            dst,
-        } => {
+        Instr::BsGetFloat2(b) => {
+            let BsGetArgs {
+                fail,
+                ctx: ctx_op,
+                live: _,
+                size,
+                unit,
+                flags,
+                dst,
+            } = &**b;
             let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
             let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {

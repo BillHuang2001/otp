@@ -453,6 +453,14 @@ impl Machine {
                 self.pop_frame_checked(*n)?;
                 Ok(Step::Next)
             }
+            // `deallocate N; return` — the loader's fused superinstruction
+            // (`beam_loader::lower::fuse`). Exactly the two constituents in order: pop
+            // the frame (validated like `Instr::Deallocate`), then take the return
+            // path the popped frame's continuation now addresses.
+            Instr::DeallocateReturn(n) => {
+                self.pop_frame_checked(*n)?;
+                self.return_step(module, func, ctx)
+            }
             Instr::Trim { n, .. } => {
                 self.trim(*n)?;
                 Ok(Step::Next)
@@ -467,42 +475,7 @@ impl Machine {
                 }
                 Ok(Step::Next)
             }
-            Instr::Return => match self.continuation()? {
-                Continuation::Halt => Ok(Step::Done),
-                Continuation::Address {
-                    func: caller,
-                    pc: caller_pc,
-                    context,
-                } => {
-                    // Contract A.8: the returning function and the function control
-                    // returns *to*. The frame is already the caller's (the compiler's
-                    // `deallocate` has popped the returning function's own frame), so
-                    // a tail-called function's `return` names the ORIGINAL caller —
-                    // and the continuation names the *caller's* module context, which
-                    // is what brings a cross-module `call_ext` back home.
-                    //
-                    // The event is only reported for an intra-module return: the
-                    // oracle's `return_to` names a function in the frame the trace
-                    // would have to resolve, and `module` here is the *callee's*
-                    // module, so a cross-context caller's index is not a nameable
-                    // function of it (reporting one would invent an event).
-                    if self.trace_on && context == self.current_context() {
-                        self.trace_return(module, func, caller, ctx);
-                    }
-                    if context == self.current_context() {
-                        Ok(Step::Goto {
-                            func: caller,
-                            pc: caller_pc,
-                        })
-                    } else {
-                        Ok(Step::Enter {
-                            context,
-                            func: caller,
-                            pc: caller_pc,
-                        })
-                    }
-                }
-            },
+            Instr::Return => self.return_step(module, func, ctx),
             // An opcode the loader has no typed IR variant for: a residual
             // [`crate::generic`] opcode is reported as the documented
             // `unsupported(op.name())` typed error carrying its own `ops.tab` name.
@@ -515,6 +488,58 @@ impl Machine {
             // a [`Step`] telling the driver where to continue. Never a panic and
             // never a wrong result.
             other => families::dispatch(self, module, labels, other, func, pc, ctx),
+        }
+    }
+
+    /// The `return` path: follow the current frame's continuation
+    /// ([`Machine::continuation`]) to its caller, or halt the run when it is the
+    /// bottom frame's [`Continuation::Halt`].
+    ///
+    /// Factored out of the `Instr::Return` arm so the loader's fused
+    /// `Instr::DeallocateReturn` (which has already popped the returning function's
+    /// frame) shares it verbatim. `module`/`func` name the **returning** function for
+    /// the contract-A.8 [`Machine::trace_return`] event.
+    fn return_step(
+        &mut self,
+        module: &Module,
+        func: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Step> {
+        match self.continuation()? {
+            Continuation::Halt => Ok(Step::Done),
+            Continuation::Address {
+                func: caller,
+                pc: caller_pc,
+                context,
+            } => {
+                // Contract A.8: the returning function and the function control
+                // returns *to*. The frame is already the caller's (the compiler's
+                // `deallocate` has popped the returning function's own frame), so
+                // a tail-called function's `return` names the ORIGINAL caller —
+                // and the continuation names the *caller's* module context, which
+                // is what brings a cross-module `call_ext` back home.
+                //
+                // The event is only reported for an intra-module return: the
+                // oracle's `return_to` names a function in the frame the trace
+                // would have to resolve, and `module` here is the *callee's*
+                // module, so a cross-context caller's index is not a nameable
+                // function of it (reporting one would invent an event).
+                if self.trace_on && context == self.current_context() {
+                    self.trace_return(module, func, caller, ctx);
+                }
+                if context == self.current_context() {
+                    Ok(Step::Goto {
+                        func: caller,
+                        pc: caller_pc,
+                    })
+                } else {
+                    Ok(Step::Enter {
+                        context,
+                        func: caller,
+                        pc: caller_pc,
+                    })
+                }
+            }
         }
     }
 

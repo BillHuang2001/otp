@@ -147,7 +147,7 @@ fn fixture_emits_the_target_opcodes() {
         for instr in &function.code {
             match instr {
                 Instr::BsMatchString { .. } => match_string = true,
-                Instr::BsGetFloat2 { .. } => float2 = true,
+                Instr::BsGetFloat2(_) => float2 = true,
                 Instr::BsGetUtf8 { .. } => utf8 = true,
                 Instr::BsGetUtf16 { .. } => utf16 = true,
                 Instr::BsGetUtf32 { .. } => utf32 = true,

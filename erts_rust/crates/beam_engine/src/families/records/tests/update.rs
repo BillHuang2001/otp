@@ -48,14 +48,14 @@ fn put_record_updates_a_field_and_returns_a_fresh_copy() {
         fx.module(),
         &LabelMap::new(),
         &mut machine,
-        &Instr::PutRecord {
+        &Instr::PutRecord(Box::new(PutRecordArgs {
             fail: NO_FAIL,
             id: Operand::X(3), // the update path discards the Id (`emu/ops.tab:1653`)
             src: Operand::X(0),
             dst: Operand::X(0),
             live: 1,
             updates: vec![(Operand::Atom(a), Operand::Integer(9))],
-        },
+        })),
         &mut ctx,
     )
     .unwrap();
@@ -83,7 +83,7 @@ fn put_record_reads_every_update_before_writing_dst() {
         fx.module(),
         &LabelMap::new(),
         &mut machine,
-        &Instr::PutRecord {
+        &Instr::PutRecord(Box::new(PutRecordArgs {
             fail: NO_FAIL,
             id: Operand::Nil,
             src: Operand::X(0),
@@ -93,7 +93,7 @@ fn put_record_reads_every_update_before_writing_dst() {
                 (Operand::Atom(a), Operand::X(0)),
                 (Operand::Atom(b), Operand::Integer(7)),
             ],
-        },
+        })),
         &mut ctx,
     )
     .unwrap();
@@ -120,14 +120,14 @@ fn put_record_branches_to_fail_on_an_absent_update_field() {
         fx.module(),
         &labels_with(Label(7), 0, 4),
         &mut machine,
-        &Instr::PutRecord {
+        &Instr::PutRecord(Box::new(PutRecordArgs {
             fail: Label(7),
             id: Operand::Nil,
             src: Operand::X(0),
             dst: Operand::X(0),
             live: 1,
             updates: vec![(Operand::Atom(z), Operand::Integer(9))],
-        },
+        })),
         &mut ctx,
     )
     .unwrap();
@@ -148,14 +148,14 @@ fn put_record_with_no_fail_is_a_capability_gap() {
         fx.module(),
         &LabelMap::new(),
         &mut machine,
-        &Instr::PutRecord {
+        &Instr::PutRecord(Box::new(PutRecordArgs {
             fail: NO_FAIL,
             id: Operand::Nil,
             src: Operand::X(0),
             dst: Operand::X(0),
             live: 1,
             updates: vec![(Operand::Atom(z), Operand::Integer(9))],
-        },
+        })),
         &mut ctx,
     ));
     assert_eq!(reason, "unsupported_opcode: put_record/no_fail");
@@ -176,14 +176,14 @@ fn put_record_create_with_an_unknown_record_name_is_a_typed_error() {
         fx.module(),
         &LabelMap::new(),
         &mut machine,
-        &Instr::PutRecord {
+        &Instr::PutRecord(Box::new(PutRecordArgs {
             fail: NO_FAIL,
             id: Operand::Atom(r),
             src: Operand::Nil,
             dst: Operand::X(0),
             live: 0,
             updates: vec![(Operand::Atom(a), Operand::Integer(1))],
-        },
+        })),
         &mut ctx,
     ));
     let _ = m;
@@ -211,14 +211,14 @@ fn put_record_create_for_another_module_is_a_typed_error() {
         fx.module(),
         &LabelMap::new(),
         &mut machine,
-        &Instr::PutRecord {
+        &Instr::PutRecord(Box::new(PutRecordArgs {
             fail: NO_FAIL,
             id: Operand::X(1),
             src: Operand::Nil,
             dst: Operand::X(0),
             live: 0,
             updates: vec![(Operand::Atom(a), Operand::Integer(1))],
-        },
+        })),
         &mut ctx,
     ));
     assert_eq!(
@@ -243,7 +243,7 @@ fn update_record_id_updates_a_field_and_ignores_the_hint() {
         fx.module(),
         &LabelMap::new(),
         &mut machine,
-        &Instr::UpdateRecordId {
+        &Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
             fail: NO_FAIL,
             hint: Operand::Atom(hint),
             id: Operand::X(3),
@@ -251,7 +251,7 @@ fn update_record_id_updates_a_field_and_ignores_the_hint() {
             dst: Operand::X(0),
             live: 1,
             updates: vec![(Operand::Atom(a), Operand::Integer(9))],
-        },
+        })),
         &mut ctx,
     )
     .unwrap();
@@ -277,7 +277,7 @@ fn update_record_id_branches_to_fail_on_an_absent_update_field() {
         fx.module(),
         &labels_with(Label(7), 0, 4),
         &mut machine,
-        &Instr::UpdateRecordId {
+        &Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
             fail: Label(7),
             hint: Operand::Atom(reuse),
             id: Operand::Nil,
@@ -285,7 +285,7 @@ fn update_record_id_branches_to_fail_on_an_absent_update_field() {
             dst: Operand::X(0),
             live: 1,
             updates: vec![(Operand::Atom(z), Operand::Integer(9))],
-        },
+        })),
         &mut ctx,
     )
     .unwrap();
@@ -306,7 +306,7 @@ fn update_record_id_with_no_fail_is_a_capability_gap() {
         fx.module(),
         &LabelMap::new(),
         &mut machine,
-        &Instr::UpdateRecordId {
+        &Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
             fail: NO_FAIL,
             hint: Operand::Nil,
             id: Operand::Nil,
@@ -314,7 +314,7 @@ fn update_record_id_with_no_fail_is_a_capability_gap() {
             dst: Operand::X(0),
             live: 1,
             updates: vec![(Operand::Atom(z), Operand::Integer(9))],
-        },
+        })),
         &mut ctx,
     ));
     assert_eq!(reason, "unsupported_opcode: update_record_id/no_fail");
@@ -332,7 +332,7 @@ fn update_record_id_branches_to_fail_on_a_non_record_source() {
         fx.module(),
         &labels_with(Label(7), 0, 4),
         &mut machine,
-        &Instr::UpdateRecordId {
+        &Instr::UpdateRecordId(Box::new(UpdateRecordIdArgs {
             fail: Label(7),
             hint: Operand::Nil,
             id: Operand::Nil,
@@ -340,7 +340,7 @@ fn update_record_id_branches_to_fail_on_a_non_record_source() {
             dst: Operand::X(0),
             live: 1,
             updates: vec![(Operand::Atom(a), Operand::Integer(9))],
-        },
+        })),
         &mut ctx,
     )
     .unwrap();
