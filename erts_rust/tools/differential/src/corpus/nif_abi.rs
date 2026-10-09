@@ -102,6 +102,36 @@
 //! oracle leaves the pending flag set where the Rust runtime clears it, so the *raisable* shape is
 //! the one that stays out).
 //!
+//! # The local-id / liveness / hash / size / width extensions
+//!
+//! A second, later block widens the same library with families the first pass did not reach; each
+//! is pinned only through a shape both runtimes answer alike:
+//!
+//! * **local ids & liveness** — `enif_get_local_pid` resolving the pid from `enif_self` back to the
+//!   same live process (and `enif_get_local_pid` / `enif_get_local_port` **refusing** a non-id),
+//!   and `enif_is_current_process_alive` on the calling process (both `1`).
+//! * **`enif_hash`** — only the `ERL_NIF_PHASH2` **properties** are pinned (the salt is ignored and
+//!   the value stays below 2^27). `ERL_NIF_INTERNAL_HASH`'s *value* is implementation-defined and
+//!   differs by design, so no case pins it.
+//! * **`enif_term_size`** — a small integer occupies no heap words (`0`) and a 3-element proper
+//!   list occupies six (`6`); the count is divided by `sizeof(ERL_NIF_TERM)` so the golden is
+//!   word-size independent.
+//! * **`enif_compare` / `enif_term_type` across the type lattice** — a number orders before an
+//!   atom, and tuple / map / list report their own `ErlNifTermType`.
+//! * **`enif_getenv`** — both the missing-key refusal (`-1`) and the oversized buffer that finds a
+//!   key the environment carries (`0`).
+//! * **`enif_consume_timeslice`** — charging a slice without forcing a yield (`0`).
+//! * **`enif_is_identical` on floats / mixed numbers**, the **UTF-8** `enif_make_string` /
+//!   `enif_get_string` / `enif_get_string_length` round trip (the length is the *encoded byte*
+//!   count), and the **map** edges (`enif_get_map_size` on an empty map, `enif_make_map_update`
+//!   refusing a missing key, a `ERL_NIF_MAP_ITERATOR_LAST` iterator walking back over its
+//!   entries).
+//!
+//! The **atom-cache** slots are deliberately **not** pinned: the oracle answers a real
+//! `enif_max_atom_cache_index` (`2038`) and a per-atom cache index (`399` for a fresh name), while
+//! the Rust runtime exposes no cached indices (always `0` / a refusal) — a plain differing value,
+//! i.e. a mismatch, not a corpus case. Owners: `crates/beam_abi/src/nif/enif/proc.rs`.
+//!
 //! # Skip policy (inherited from [`super::nif_so`])
 //!
 //! A C-compiled fixture needs a C compiler *and* the host `erl_nif.h`; when either is missing
@@ -897,6 +927,154 @@ static ERL_NIF_TERM probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
         return enif_make_int(env, (r == 1 && n == (unsigned) strlen(name)) ? 1 : 0);
     }
 
+    /* ------------------------------------------- the local-id / liveness / hash family */
+    case 87: {                                 /* get_local_pid round trips a self pid */
+        ErlNifPid pid, back;
+        ERL_NIF_TERM t;
+        if (enif_self(env, &pid) == NULL)
+            return enif_make_int(env, 0);
+        t = enif_make_pid(env, &pid);
+        if (!enif_get_local_pid(env, t, &back))
+            return enif_make_int(env, 0);
+        return enif_make_int(env,
+            (enif_is_identical(t, enif_make_pid(env, &back)) &&
+             enif_is_process_alive(env, &back)) ? 1 : 0);
+    }
+    case 88: {                                 /* get_local_pid refuses a non-pid */
+        ErlNifPid pid;
+        return enif_make_int(env,
+            enif_get_local_pid(env, enif_make_int(env, 1), &pid) ? 0 : 1);
+    }
+    case 89: {                                 /* get_local_port refuses a non-port */
+        ErlNifPort p;
+        return enif_make_int(env,
+            enif_get_local_port(env, enif_make_atom(env, "a_port"), &p) ? 0 : 1);
+    }
+    case 90: {                                 /* is_current_process_alive */
+        return enif_make_int(env, enif_is_current_process_alive(env) ? 1 : 0);
+    }
+    case 91: {                                 /* phash2 is salt-independent and < 2^27 */
+        ERL_NIF_TERM t = enif_make_int(env, 42);
+        ErlNifUInt64 h0 = enif_hash(ERL_NIF_PHASH2, t, 0);
+        ErlNifUInt64 h1 = enif_hash(ERL_NIF_PHASH2, t, 987654321);
+        return enif_make_int(env,
+            (h0 == h1 && h0 < ((ErlNifUInt64) 1 << 27)) ? 1 : 0);
+    }
+
+    /* The term-size slot: enif_term_size counts the bytes the term occupies in the term heap. A
+       small integer is one word; a cons cell is two, so a 3-element proper list is three cons
+       cells = six words. Both are word-size-independent *counts of words* times the word size,
+       and the word size is the host ABI's, so the golden is the byte count. */
+    case 92: {                                 /* term_size of a small integer */
+        return enif_make_int(env, (int) enif_term_size(enif_make_int(env, 7)));
+    }
+    case 93: {                                 /* term_size of a 3-element list, in words */
+        ERL_NIF_TERM arr[3];
+        arr[0] = enif_make_int(env, 1);
+        arr[1] = enif_make_int(env, 2);
+        arr[2] = enif_make_int(env, 3);
+        return enif_make_int(env,
+            (int) (enif_term_size(enif_make_list_from_array(env, arr, 3))
+                   / sizeof(ERL_NIF_TERM)));
+    }
+    /* comparison / term_type across the type lattice (not just integer-vs-integer) */
+    case 94: {                                 /* compare follows the term order across types */
+        int n_lt_a = enif_compare(enif_make_int(env, 1), enif_make_atom(env, "an_atom"));
+        int a_gt_n = enif_compare(enif_make_atom(env, "an_atom"), enif_make_int(env, 1));
+        return enif_make_int(env, (n_lt_a == -1 && a_gt_n == 1) ? 1 : 0);
+    }
+    case 95: {                                 /* term_type of tuple / map / proper list */
+        ERL_NIF_TERM arr[1];
+        int tup, mp, lst;
+        arr[0] = enif_make_int(env, 1);
+        tup = enif_term_type(env, enif_make_tuple_from_array(env, arr, 1))
+                  == ERL_NIF_TERM_TYPE_TUPLE;
+        mp = enif_term_type(env, enif_make_new_map(env)) == ERL_NIF_TERM_TYPE_MAP;
+        lst = enif_term_type(env, enif_make_list_from_array(env, arr, 1))
+                  == ERL_NIF_TERM_TYPE_LIST;
+        return enif_make_int(env, (tup && mp && lst) ? 1 : 0);
+    }
+
+    /* The environment slot: a key no one set is refused by both (the C's -1). */
+    case 96: {                                 /* getenv refuses a missing key */
+        char buf[8];
+        size_t n = sizeof(buf);
+        return enif_make_int(env,
+            enif_getenv("NIF_ABI_NO_SUCH_ENV_VAR_ZZZ", buf, &n) == -1 ? 1 : 0);
+    }
+    case 97: {                                 /* consume_timeslice charges without a forced yield */
+        return enif_make_int(env, enif_consume_timeslice(env, 10));
+    }
+
+    /* ------------------------------------------- the identity / string-width / map edges */
+    case 98: {                                 /* is_identical on floats and mixed numbers */
+        int same = enif_is_identical(enif_make_double(env, 1.5), enif_make_double(env, 1.5));
+        int mixed = enif_is_identical(enif_make_int(env, 1), enif_make_double(env, 1.0));
+        return enif_make_int(env, (same && !mixed) ? 1 : 0);
+    }
+    case 99: {                                 /* UTF-8 string round trip */
+        ERL_NIF_TERM t = enif_make_string(env, "hello", ERL_NIF_UTF8);
+        char buf[16];
+        int r = enif_get_string(env, t, buf, sizeof(buf), ERL_NIF_UTF8);
+        return enif_make_int(env, (r == 6 && strcmp(buf, "hello") == 0) ? 1 : 0);
+    }
+    case 100: {                                /* UTF-8 string length is the encoded byte count */
+        const char* s = "abc\xc3\xa5" "d";     /* "abc<U+00E5>d": 5 chars over 6 bytes */
+        ERL_NIF_TERM t = enif_make_string(env, s, ERL_NIF_UTF8);
+        unsigned n = 0;
+        int r = enif_get_string_length(env, t, &n, ERL_NIF_UTF8);
+        return enif_make_int(env, r == 1 ? (int) n : -1);
+    }
+    case 101: {                                /* get_map_size on an empty map */
+        size_t sz = 99;
+        return enif_make_int(env,
+            (enif_get_map_size(env, enif_make_new_map(env), &sz) && sz == 0) ? 1 : 0);
+    }
+    case 102: {                                /* make_map_update refuses a missing key */
+        ERL_NIF_TERM m2;
+        int r = enif_make_map_update(env, enif_make_new_map(env), enif_make_atom(env, "k"),
+                                     enif_make_int(env, 1), &m2);
+        return enif_make_int(env, r ? 0 : 1);
+    }
+    case 103: {                                /* a LAST map iterator walks back over both entries */
+        ERL_NIF_TERM m1, m2, k = 0, v = 0;
+        int count = 0;
+        ErlNifMapIterator it;
+        ERL_NIF_TERM empty = enif_make_new_map(env);
+        if (!enif_make_map_put(env, empty, enif_make_int(env, 1), enif_make_int(env, 10), &m1))
+            return enif_make_int(env, 0);
+        if (!enif_make_map_put(env, m1, enif_make_int(env, 2), enif_make_int(env, 20), &m2))
+            return enif_make_int(env, 0);
+        if (!enif_map_iterator_create(env, m2, &it, ERL_NIF_MAP_ITERATOR_LAST))
+            return enif_make_int(env, 0);
+        while (enif_map_iterator_get_pair(env, &it, &k, &v)) {
+            count++;
+            enif_map_iterator_prev(env, &it);
+        }
+        enif_map_iterator_destroy(env, &it);
+        return enif_make_int(env, count);
+    }
+
+    /* The environment slot, positive half: a key both runtimes' environments carry (the very
+       `PATH` the harness resolved them through). The probe asserts the documented *contract*
+       rather than a length: with a generously sized buffer the copy path answers `0` and reports
+       the copied string's own length (`strlen(value)`), and only a `PATH` longer than the buffer
+       would make both answer the positive "too small" code with a larger capacity. The value's
+       bytes are never compared (they are the host's `PATH`), so the answer is independent of how
+       long `PATH` happens to be. */
+    case 107: {                                /* getenv finds a key the environment carries */
+        char* buf = (char*) enif_alloc(65536);
+        size_t n = 65536;
+        int r, ok;
+        if (buf == NULL)
+            return enif_make_int(env, 0);
+        r = enif_getenv("PATH", buf, &n);
+        ok = (r == 0) ? (strlen(buf) == n)      /* copied: the reported size is the length */
+                      : (r == 1 && n > 65536);  /* too small: only if PATH exceeded the buffer */
+        enif_free(buf);
+        return enif_make_int(env, ok ? 1 : 0);
+    }
+
     default:
         break;
     }
@@ -1229,9 +1407,118 @@ pub(crate) fn group() -> Vec<Case> {
             &[86],
             "1",
         ),
+        // --- the local-id / liveness / hash / term-size family ----------------------------
+        case(
+            "nif_abi/local_pid_from_self_roundtrip",
+            "enif_get_local_pid resolves the pid from enif_self back to the same live process",
+            &[87],
+            "1",
+        ),
+        case(
+            "nif_abi/local_pid_rejects_non_pid",
+            "enif_get_local_pid refuses a non-pid term",
+            &[88],
+            "1",
+        ),
+        case(
+            "nif_abi/local_port_rejects_non_port",
+            "enif_get_local_port refuses a non-port term",
+            &[89],
+            "1",
+        ),
+        case(
+            "nif_abi/current_process_alive",
+            "enif_is_current_process_alive is true for the calling process",
+            &[90],
+            "1",
+        ),
+        case(
+            "nif_abi/hash_phash2_salt_independent",
+            "enif_hash(ERL_NIF_PHASH2, ..) ignores the salt and stays below 2^27",
+            &[91],
+            "1",
+        ),
+        case(
+            "nif_abi/term_size_small_int",
+            "enif_term_size reports no heap words for a small integer",
+            &[92],
+            "0",
+        ),
+        case(
+            "nif_abi/term_size_three_element_list",
+            "enif_term_size reports six words for a 3-element proper list",
+            &[93],
+            "6",
+        ),
+        case(
+            "nif_abi/compare_across_types",
+            "enif_compare orders a number before an atom (the term order)",
+            &[94],
+            "1",
+        ),
+        case(
+            "nif_abi/term_type_container_terms",
+            "enif_term_type reports tuple / map / list for the three container kinds",
+            &[95],
+            "1",
+        ),
+        case(
+            "nif_abi/env_getenv_missing_key",
+            "enif_getenv refuses a key no one set",
+            &[96],
+            "1",
+        ),
+        case(
+            "nif_abi/sched_consume_timeslice",
+            "enif_consume_timeslice charges a slice without forcing a yield",
+            &[97],
+            "0",
+        ),
+        // --- the identity / string-width / map edges ---------------------------------------
+        case(
+            "nif_abi/identity_float_vs_mixed_number",
+            "enif_is_identical holds for two equal floats and differs for 1 vs 1.0",
+            &[98],
+            "1",
+        ),
+        case(
+            "nif_abi/string_utf8_roundtrip",
+            "enif_make_string/enif_get_string round trip under ERL_NIF_UTF8",
+            &[99],
+            "1",
+        ),
+        case(
+            "nif_abi/string_utf8_length_counts_encoded_bytes",
+            "enif_get_string_length under ERL_NIF_UTF8 reports the encoded byte count (6)",
+            &[100],
+            "6",
+        ),
+        case(
+            "nif_abi/map_get_map_size_empty",
+            "enif_get_map_size reports 0 for an empty map",
+            &[101],
+            "1",
+        ),
+        case(
+            "nif_abi/map_make_map_update_missing_key",
+            "enif_make_map_update refuses a key the map does not hold",
+            &[102],
+            "1",
+        ),
+        case(
+            "nif_abi/map_iterator_last_walks_all",
+            "a ERL_NIF_MAP_ITERATOR_LAST iterator walks back over both entries",
+            &[103],
+            "2",
+        ),
+        case(
+            "nif_abi/env_getenv_present_key",
+            "enif_getenv finds a key the environment carries and reports the copied string's own length",
+            &[107],
+            "1",
+        ),
     ]
 }
-
 #[cfg(test)]
 mod tests {
     //! Invariants of the expanded A.3 group: every case is a module-run case claiming
@@ -1420,6 +1707,40 @@ mod tests {
             assert_eq!(run.args, &[selector][..], "case {id}");
             assert_eq!(case.golden.stdout, Some("1"), "case {id}");
             assert_eq!(case.golden.exit_code, 0, "case {id}");
+        }
+    }
+
+    #[test]
+    fn the_c_library_covers_the_local_id_liveness_hash_and_size_families() {
+        // The families the second block adds (each symbol must really be referenced).
+        for symbol in [
+            "enif_get_local_pid(",
+            "enif_get_local_port(",
+            "enif_is_current_process_alive(",
+            "enif_hash(",
+            "ERL_NIF_PHASH2",
+            "enif_term_size(",
+            "enif_getenv(",
+            "enif_consume_timeslice(",
+            "enif_map_iterator_prev(",
+            "ERL_NIF_MAP_ITERATOR_LAST",
+        ] {
+            assert!(
+                super::NIF_ABI_C.contains(symbol),
+                "the library must reference {symbol}"
+            );
+        }
+        // The internal-hash *value* and the atom-cache slots are implementation-defined and differ
+        // between the two runtimes, so no call site may pin them (a guaranteed mismatch):
+        for banned in [
+            "ERL_NIF_INTERNAL_HASH",
+            "enif_max_atom_cache_index(",
+            "enif_get_atom_cache_index(",
+        ] {
+            assert!(
+                !super::NIF_ABI_C.contains(banned),
+                "the library must not reference {banned} (a guaranteed mismatch)"
+            );
         }
     }
 
