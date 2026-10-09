@@ -52,6 +52,8 @@ All three share two goals: a tokenized environment flag must be indistinguishabl
 | `+sbt TYPE` | scheduler bind type (`u`/`db`/`s`/`ps`/`ts`/`tnnps`/`nnps`/`nnts`/`ns`), preserved verbatim |
 | `+M*` / `+MM*` / `+MB*` | ERTS allocator flags: `+M*` is an emulator flag — validated against the `erl_alloc.c` grammar and then **discarded** (`../cli.rs`'s allocator arm calls only `flags::parse_allocator`; it does **not** call `Builder::preserve`, so nothing reaches `extra_emulator_flags`, and no init argument is recorded); a user `-M*` is an ordinary unknown `-flag` (recorded as `init:get_argument(NAME)`, its value consumed) |
 | `+hms N` / `+hmbs N` / `+hmax N` / `+hmaxk\|el\|ib B` | GC heap policy (`beam_gc::HeapPolicy`), rounded through the growth table; visible in `garbage_collection` |
+| `+JPperf VALUE` | perf support (`true`/`false`/`dump`/`map`/`fp`/`no_fp`) → `PerfMapConfig` (validated, preserved verbatim; a bad value is a usage error) |
+| `+JPperfdirectory Dir` | where the perf files are written (default `/tmp`; `ERL_SYM_MAP_FILE` overrides the map file's whole path) → `PerfMapConfig` (preserved verbatim) |
 | `run <file.beam> <mod>:<func>/<arity> [arg…]` | the vertical slice: load the file, run, print the result |
 An unmodeled `-FLAG`/`+FLAG` is **data, not a usage error** (it is preserved, and a `-`-flag is recorded); only a **stray positional argument** (outside `run`) is a usage error (exit 2).
 
