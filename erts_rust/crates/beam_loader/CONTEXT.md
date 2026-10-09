@@ -567,16 +567,13 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   `../../crates/CONTEXT.md`).
 - **Lowering is one peephole pass, not a full `ops.tab` transform.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`. The only rewrite after that is `src/lower/fuse.rs` (`fuse`), a single forward pass that coalesces an **adjacent** `Deallocate(N); Return` pair in each function body into the one superinstruction `Instr::DeallocateReturn(N)`, run *before* `build_blocks` derives the blocks/labels (so a block's `start..end` indexes the same fused vector the engine dispatches on). `Label` is the only branch target, so two adjacent non-`Label` instructions share a block and the pair can never cross one; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules that bypass the loader. That is the whole superinstruction surface here; the C builds a much larger set from `emu/ops.tab` in `beam_load.c` (a candidate for later). Never a correctness gap: `beam_engine`'s core `DeallocateReturn` arm executes exactly the two constituents in order.
 - **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
-- **Contract A.2 divergences from the C loader (`beam_load.c`/`beam_file.c`), both currently unenforced:**
-  - **No `max_opcode` sanity bound.** `decode_stream` (`src/decode.rs:229`) only rejects an opcode *byte*
-    above the chunk's `max_opcode`; the C also refuses `max_opcode > MAX_GENERIC_OPCODE` (193) and
-    `max_opcode < genop_swap_2` (169, "OTP 22 or earlier") at `beam_load.c:189-197`. A header declaring
-    `max_opcode = 200` (or `< 169`) is accepted here as long as every emitted byte is a valid roster
-    opcode; `tests/negative.rs:131-146` exercises exactly this.
-  - **No module MD5/checksum.** The C builds `beam->checksum` as an MD5 over `AtU8`+`Code`+`StrT`+`ImpT`+
-    `ExpT`+`FunT` (each `OldUniq` zeroed)+`LitT`+`Meta`+`Recs`+`DbgB` at load (`beam_file.c:1751-1830`);
-    the loader computes no checksum (no `checksum`/`md5` symbol anywhere in `src/`); the `Meta` chunk it
-    feeds on is now captured raw (`Module::meta`), so only the hashing is missing.
+- **No module MD5/checksum (the remaining recorded A.2 divergence).** The C builds `beam->checksum` as
+  an MD5 over `AtU8`+`Code`+`StrT`+`ImpT`+`ExpT`+`FunT` (each `OldUniq` zeroed)+`LitT`+`Meta`+`Recs`+`DbgB`
+  at load (`beam_file.c:1751-1830`); the loader computes no checksum (no `checksum`/`md5` symbol anywhere
+  in `src/`), so `Module` carries no MD5. Closing it is a crate-layer decision, not a `beam_loader` one:
+  `crates/beam_dist/src/auth.rs` already ships a self-contained RFC 1321 `md5`, so the algorithm belongs
+  at a lowest-common-ancestor crate (`beam_codec`/`beam_common`) or behind a new dependency edge — do not
+  duplicate it here.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 
