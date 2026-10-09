@@ -216,8 +216,9 @@ fn internal_reference_is_refused_by_both_ports() {
 /// `None` — with a loud `eprintln!` — when `erl` is absent or does not answer in
 /// time (the crate's usual "skip loudly" pattern).
 fn erl_stdout(expr: &str) -> Option<String> {
+    let code = format!("{}, halt(0).", expr.trim().trim_end_matches('.'));
     let mut child = match Command::new("erl")
-        .args(["-noshell", "-eval", expr])
+        .args(["-noshell", "-eval", &code])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
