@@ -172,6 +172,7 @@ The headline M1 gaps; the full list, each with its ground-truth detail, is in `I
 - **Compiled arithmetic is oracle-exact on overflow** (`+ - * div rem` promote to exact bignums, and an out-of-range integer operand becomes an exact bignum).
 - **No reductions / preemption / scheduler** (Stage 5, `beam_process`): `run_*` executes to the function's `return`, and stack growth is an unbounded `Vec`.
 - **`apply_fun` must reproduce `call_fun`'s x-register order: arguments first, free variables after** (C fills `reg[i] = args[i]` then `reg[i + arity] = funp->env[i]`), never `free ++ args`.
+- **The engine owns no monitor/link/`{'DOWN'}`/signal logic.** `erlang:monitor/2` (the `gen:call/4` shape) is an ordinary `call_ext*` BIF -- `erlang` is a host FLOOR module and `monitor/2` a registered BIF, so `beam_rt`'s `resolve_external_call` declines it and the host floor serves it through `call_bif`; the engine never sees it. A missing `{'DOWN',...}` that leaves `gen:do_call/4`'s receive parked is therefore a `beam_process`/`beam_rt` signal-delivery gap, never an engine one -- the engine only executes the `loop_rec`/`wait` and reports `Wait`.
 
 ## Handoffs (opcodes/capabilities this crate cannot close alone)
 The execution gaps the standard compiler emits for real OTP modules, plus the host/foundation gaps behind a compiled-vs-oracle divergence; each names the owning node.
