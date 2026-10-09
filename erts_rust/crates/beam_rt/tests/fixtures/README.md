@@ -48,6 +48,22 @@ also the differential oracle.
   one byte, and collects the two `{Port, {data, Data}}` messages — each `receive` bounded by
   `after 5000`, so a missing byte shows up as the atom `timeout` in its position.
 
+The C is compiled in one of four **modes** (`-DEVENT_DRIVER_MODE=N`, defaulting `EVENT_DRIVER_NAME`),
+so one fixture drives every A.4 output path; each mode's `.so` is opened under its own `driver_name`:
+
+| Mode | `driver_name` | Entry shape | `event_driver.erl` | Pins |
+|---|---|---|---|---|
+| 0 (default) | `event` | `output` + `driver_select` + `driver_set_timer` (the event/timer round) | `recv/0` | `a_driver_select_and_a_driver_timer_both_reach_the_owner` |
+| 1 | `eventv` | **`outputv` only** (`.output = NULL`) | `recv_v/0` | `an_outputv_only_entry_receives_port_command` |
+| 2 | `eventt` | `output` emits a term via `erl_drv_output_term` (an `ERL_DRV_EXT2TERM` operand) to the owner | `recv_term/0` | `a_driver_output_term_reaches_the_owner_as_a_bare_term` |
+| 3 | `eventp` | `output` emits a term via `erl_drv_send_term` to the named pid | `recv_term/0` | `a_driver_send_term_reaches_the_connected_process` |
+
+`recv_v/0` `port_command`s one byte and returns the bytes the `outputv` vector produced; `recv_term/0`
+returns the bare term the driver delivered (the port's owner and the explicit pid are the same process in
+the test, so the two destination paths are observationally identical). Modes 2/3 emit an **atom-free**
+image (`<<131,97,9>>` = the integer `9`), so delivery is asserted without depending on a driver-interned
+atom landing in the live table — see the atom-commit gap in `src/port/CONTEXT.md`.
+
 Neither is committed in compiled form, because **both** embed the scratch directory the test builds
 in: the test replaces the `.erl`'s `{path}` placeholder with the compiled `.so`'s path (known only
 then) and compiles the result. The C side is compiled with `$CC` (or `cc`) against the host
