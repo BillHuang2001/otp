@@ -162,7 +162,7 @@ use beam_common::Result;
 use beam_loader::{Atom, Label, Module};
 use beam_term::Eterm;
 
-use crate::context::{ExecutionContext, ReduceOutcome};
+use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter;
 use crate::jit::emitter::CodeBuffer;
@@ -577,11 +577,6 @@ pub(crate) fn run_native(
     match run_native_outcome(machine, module, function, arity, args, ctx, code)? {
         RunOutcome::Returned(value) => Ok(value),
         RunOutcome::Wait { .. } => Err(crate::error::blocked()),
-        // A cooperative pre-emption is a suspend a non-blocking entry cannot honour:
-        // fold it into a typed error, mirroring `crate::error::blocked()`.
-        RunOutcome::Yield { .. } => Err(error::unsupported(
-            "run: process pre-empted (reduction budget exhausted)",
-        )),
     }
 }
 
@@ -659,16 +654,6 @@ pub(crate) fn run_native_label_outcome(
 /// latched, without the per-instruction `trace_enabled()` vtable call. Both native
 /// tiers enter here (`run_native_outcome` and `run_native_label_outcome`, the latter
 /// shared with the Cranelift tier), so the flag is set for either.
-///
-/// Each **deopt** instruction is priced exactly as the interpreter's own dispatch
-/// loop prices one: the machine's slice counter is incremented and the host's
-/// [`ExecutionContext::reduce_outcome`](crate::ExecutionContext::reduce_outcome) hook
-/// is offered one reduction. A [`ReduceOutcome::Yield`](crate::context::ReduceOutcome::Yield)
-/// answer stops the driver at the next instruction and reports
-/// [`RunOutcome::Yield`], again exactly as the interpreter does. A natively executed
-/// block bypasses this path, so under the native tier
-/// [`Machine::reductions`](crate::Machine::reductions) is an honest **lower bound**
-/// (never fabricated).
 fn drive(
     machine: &mut Machine,
     module: &Module,
@@ -733,37 +718,14 @@ fn drive(
         // `machine_ptr`/`ctx_ptr` point at the driver's live, distinct objects
         // (`Machine` and the `ExecutionContext`), never at each other.
         let step = unsafe { (*machine_ptr).step_instruction(module, &labels, func, pc, &mut *ctx_ptr)? };
-        // Price the deopt instruction exactly as the interpreter's own dispatch loop
-        // does: charge one reduction in the machine's slice counter and offer it to the
-        // host hook. Only instructions that deopt through here are charged — a
-        // natively executed block bypasses this path entirely — so under the native
-        // tier the count is an honest **lower bound**, never a fabricated one.
-        //
-        // SAFETY: the `step_instruction` borrow of `machine_ptr`/`ctx_ptr` ended with
-        // the call above, so no `&mut` derived from them is alive here, and both
-        // pointers still point at the driver's live, distinct objects.
-        let outcome = unsafe {
-            (*machine_ptr).reductions = (*machine_ptr).reductions.saturating_add(1);
-            (*ctx_ptr).reduce_outcome(1)?
-        };
         match step {
-            Step::Next => {
-                pc += 1;
-                // The step is applied, so a yield names the *next* instruction —
-                // never a re-execution of the one already charged.
-                if outcome == ReduceOutcome::Yield {
-                    return Ok(RunOutcome::Yield { func, pc });
-                }
-            }
+            Step::Next => pc += 1,
             Step::Goto {
                 func: next_func,
                 pc: next_pc,
             } => {
                 func = next_func;
                 pc = next_pc;
-                if outcome == ReduceOutcome::Yield {
-                    return Ok(RunOutcome::Yield { func, pc });
-                }
             }
             Step::Wait {
                 func: wait_func,

@@ -19,11 +19,11 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
   `initial_call`, `current_stacktrace`).
 - `run.rs` — `run_export`/`run_label` (non-blocking) and `run_export_outcome`/`run_label_outcome`/`resume_outcome`
-  (blocking-aware); `RunOutcome` (`Returned` / `Wait` / `Yield`), re-exported at the crate root.
+  (blocking-aware); `RunOutcome` (`Returned` / `Wait`), re-exported at the crate root.
 - `drive.rs` — **`Machine::drive`**: owns the `(func, pc)` position *and* the module context those indices belong
   to, folds every `Step` back into that position, charges **exactly one reduction per interpreted instruction**
-  through `ExecutionContext::reduce_outcome` (applies the `Step` first, then returns `RunOutcome::Yield { func, pc }`
-  at the next position), and re-binds the literal area exactly on a `Step::Enter` into a different context.
+  through `ExecutionContext::reduce` (the only pre-emption point a non-allocating loop reaches), and re-binds the
+  literal area exactly on a `Step::Enter` into a different context.
 
 ## Constraints
 - Errors are `beam_common::{Result, BeamError}` only — no crate-local error enum, no panic, no `unwrap()` on
