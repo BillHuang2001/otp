@@ -1331,6 +1331,13 @@ expand_opt(ssa_opt_gates, Os) ->
     %% Opt-in eligibility gates and statistics for the SSA optimization
     %% passes (see beam_ssa_opt_budget). Default off.
     [ssa_opt_gates|Os];
+expand_opt(ssa_opt_fn_budget, Os) ->
+    %% Opt-in per-function time allowance for the SSA optimization passes,
+    %% overriding the size-derived allowance (see beam_ssa_opt_budget).
+    %% Default off.
+    [ssa_opt_fn_budget|Os];
+expand_opt({ssa_opt_fn_budget,_}=O, Os) ->
+    [O|Os];
 expand_opt(time, Os) ->
     [{time,fun print_pass_times/2}|Os];
 expand_opt(O, Os) -> [O|Os].
@@ -3273,6 +3280,7 @@ options() ->
     %% and are therefore not visible to help/1 through standard_passes/0.
     %% List them explicitly so that they show up in --help.
     help([{iff,loop_opt,  {ssa_opt_loop_opt,fun(_) -> ok end}},
+          {iff,loop_arith_licm,{ssa_opt_loop_arith_licm,fun(_) -> ok end}},
           {iff,fusion_opt,{ssa_opt_fus,     fun(_) -> ok end}},
           {iff,fbip_opt,  {ssa_opt_fbip,    fun(_) -> ok end}}]),
     %% Likewise for the opt-in SSA pass budget/watchdog and eligibility
@@ -3282,7 +3290,9 @@ options() ->
           {iff,ssa_opt_watchdog,
            {desc,"Bound the time (ms) of a single SSA optimization pass"}},
           {iff,ssa_opt_gates,
-           {desc,"Enable the SSA pass eligibility gates and statistics"}}]).
+           {desc,"Enable the SSA pass eligibility gates and statistics"}},
+          {iff,ssa_opt_fn_budget,
+           {desc,"Set a per-function time allowance (ms) for the SSA optimization passes"}}]).
 help([{delay,Ps}|T]) ->
     help(Ps),
     help(T);

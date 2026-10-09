@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+#
+# %CopyrightBegin%
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Copyright Ericsson AB 2026. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# %CopyrightEnd%
+#
+# Build and test the `compiler' application in an otherwise unbuilt OTP tree.
+#
+# This tree needs an OTP-30 runtime: the checked-in primary bootstrap
+# (`bootstrap/lib/compiler`) is compiled for OTP 30 opcodes that the host
+# `erl` (if it is older) cannot load, and an in-tree compiler that is compiled
+# by an older compiler gets an incompatible record representation. The script
+# therefore builds the OTP-30 emulator first, then uses the primary bootstrap
+# on top of it to build kernel/stdlib/compiler, and finally builds
+# `common_test` so the CT suites can run on the same (OTP-30) runtime.
+#
+# Usage (from the repository root, i.e. $ERL_TOP):
+#     lib/compiler/scripts/otp30_env.sh setup
+#     lib/compiler/scripts/otp30_env.sh test <SUITE> [<SUITE> ...]
+#     lib/compiler/scripts/otp30_env.sh shell
+#
+# The `test' subcommand compiles test_lib, the named suites and the
+# `ts_install_cth' hook with the in-tree compiler, then runs them under
+# Common Test with `lib/compiler/ebin' first on the code path, so the
+# in-tree compiler is the one under test.
+#
+# NOTE: not installed, not part of `SUB_DIRECTORIES'; a development helper
+# for constrained environments that have no prebuilt OTP-30 available.
+
+set -e
+
+ERL_TOP="${ERL_TOP:-$(cd "$(dirname "$0")"/../../.. && pwd)}"
+export ERL_TOP
+# A yecc/leex-capable erlc: the primary bootstrap compiler has no parsetools,
+# so it cannot turn the checked-in `.yrl' sources into `.erl' (see
+# `gen_sources' below). This resolves the erlc on the ambient PATH, before the
+# bootstrap wrappers are prepended.
+HOST_ERLC="$(command -v erlc || true)"
+# Always use a bash that exists here: the ambient CONFIG_SHELL may point at a
+# stale store path, which would make the generated `configure' scripts fail.
+export CONFIG_SHELL="$(command -v bash)"
+cd "$ERL_TOP"
+JOBS="$(nproc 2>/dev/null || echo 4)"
+
+TARGET_DIR="$ERL_TOP/make/x86_64-pc-linux-gnu"
+BIN="$ERL_TOP/bootstrap/bin"
+COMPILER_EBIN="$ERL_TOP/lib/compiler/ebin"
+TESTDIR="$ERL_TOP/lib/compiler/test"
+LOGDIR="${LOGDIR:-$ERL_TOP/lib/compiler/scripts/ct_logs}"
+# Compiled test modules go next to the suites (as the app's own test Makefile
+# does: EBIN = .); Common Test locates a suite by its module beam in that dir.
+# *.beam is ignored by the global .gitignore, so this never dirties the tree.
+CTBIN="$TESTDIR"
+
+# Generate the `.erl' files derived from the checked-in `.yrl'/`.xrl' sources
+# of the named applications (relative to lib/). Uses $HOST_ERLC because the
+# primary bootstrap compiler has no parsetools. Regenerates a file only when it
+# is missing or older than its source.
+gen_sources() {
+    [ -n "$HOST_ERLC" ] || {
+        echo "no erlc on PATH: need a yecc/leex-capable erlc to generate sources" >&2
+        exit 1
+    }
+    local app dir f gen
+    for app in "$@"; do
+        dir="$ERL_TOP/lib/$app/src"
+        for f in "$dir"/*.yrl "$dir"/*.xrl; do
+            [ -e "$f" ] || continue
+            gen="${f%.*}.erl"
+            if [ -e "$gen" ] && [ "$gen" -nt "$f" ]; then continue; fi
+            echo "=== generating $(basename "$gen") from $(basename "$f") ==="
+            # Run from the source directory and pass a bare file name: yecc/leex
+            # record the given path in a `-file(...)' attribute, which the
+            # compiler in turn replays into the generated `deps/deps.mk'. An
+            # absolute or root-relative path would end up there verbatim and
+            # make would then look for it relative to the source directory.
+            ( cd "$dir" && "$HOST_ERLC" "$(basename "$f")" )
+        done
+    done
+}
+
+setup() {
+    # 1. Per-directory autoconf. `make/configure' produces the top-level
+    #    Makefile and output.mk; `erts/configure' produces make/$(TARGET)/otp.mk
+    #    (which every application Makefile includes).
+    [ -f "$ERL_TOP/make/output.mk" ] || (cd "$ERL_TOP/make" && ./configure)
+    [ -f "$TARGET_DIR/otp.mk" ] || (cd "$ERL_TOP/erts" && ./configure --without-termcap)
+    # erl_interface provides `erl_call'; the emulator build installs it.
+    [ -f "$ERL_TOP/lib/erl_interface/src/x86_64-pc-linux-gnu/Makefile" ] || \
+        (cd "$ERL_TOP/lib/erl_interface" && ./configure)
+
+    echo "=== building erl_interface, emulator, bootstrap wrappers ==="
+    make -j"$JOBS" erl_interface
+    make -j"$JOBS" emulator bootstrap_setup
+    # The primary bootstrap ships kernel, stdlib and compiler only -- not
+    # parsetools. The freshly built bootstrap `erlc' therefore has no `yecc'
+    # or `leex' and cannot turn the committed grammar sources (stdlib's
+    # `erl_parse.yrl', compiler's `core_parse.yrl') into Erlang sources.
+    # Build parsetools first, then put all of `lib/' on the code path of the
+    # in-tree builds below so that bootstrap `erlc' finds `yecc' and `leex'.
+    # Build outputs are git-ignored, so none of this dirties the tree.
+    echo "=== building parsetools (yecc/leex) with the primary bootstrap ==="
+    PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/parsetools" opt
+    export ERL_LIBS="$ERL_TOP/lib"
+    # Build kernel, stdlib and compiler in-tree with the primary bootstrap
+    # compiler (which now runs on the freshly built OTP-30 emulator). The
+    # `primary_bootstrap' target is deliberately NOT used: it also rewrites
+    # the version-controlled files under bootstrap/, which must stay pristine.
+    # ERL_LIBS is scoped to these steps only, because the ambient `erlc' used
+    # for common_test below is an older OTP and must not load OTP-30 beams.
+    echo "=== building kernel, stdlib, compiler with the primary bootstrap ==="
+    # The primary bootstrap has no yecc/leex, and make's generated-source
+    # pattern rule is written with a leading `./' that does not match the
+    # normalized prerequisite names, so a parallel `make opt' would abort with
+    # `No rule to make target '<x>.erl'' the first time a generated source
+    # (stdlib's erl_parse.erl, compiler's core_parse.erl) is needed.
+    # Generate them up front with the host's yecc/leex-capable erlc.
+    gen_sources kernel stdlib compiler
+    ERL_LIBS="$ERL_TOP/lib" PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/kernel" opt
+    ERL_LIBS="$ERL_TOP/lib" PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/stdlib" opt
+    ERL_LIBS="$ERL_TOP/lib" PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/compiler" opt
+
+    echo "=== building common_test ==="
+    [ -f "$ERL_TOP/lib/common_test/priv/x86_64-pc-linux-gnu/Makefile" ] || \
+        (cd "$ERL_TOP/lib/common_test" && PATH="$BIN:$PATH" ./configure)
+    # Prefix PATH with $BIN (as for the apps above): else the ambient `erlc'
+    # (e.g. a system OTP built for a different runtime) is used and the build
+    # fails with "BEAM file was compiled for a later version of the runtime".
+    PATH="$BIN:$PATH" make -j"$JOBS" -C "$ERL_TOP/lib/common_test"
+    echo "=== setup done ==="
+}
+
+test_suites() {
+    [ $# -gt 0 ] || { echo "usage: $0 test <SUITE> [<SUITE> ...]" >&2; exit 2; }
+    rm -rf "$LOGDIR"
+    mkdir -p "$LOGDIR"
+    export ERL_LIBS="$ERL_TOP/lib"
+    local suites=()
+    for s in "$@"; do suites+=("$TESTDIR/$s.erl"); done
+    "$BIN/erlc" -o "$CTBIN" \
+        -I "$ERL_TOP/lib/compiler/src" -I "$ERL_TOP/lib/stdlib/include" \
+        +clint +ssalint +nowarn_missing_spec_documented \
+        "$TESTDIR/test_lib.erl" "${suites[@]}"
+    "$BIN/erlc" -o "$CTBIN" "$ERL_TOP/lib/common_test/test_server/ts_install_cth.erl"
+    local suites_arg
+    suites_arg=$(printf '"%s",' "$@"); suites_arg="[${suites_arg%,}]"
+    "$BIN/erl" -pa "$COMPILER_EBIN" -pa "$CTBIN" -noshell -eval "
+        R = ct:run_test([{dir,\"$TESTDIR\"},
+                         {suite,$suites_arg},
+                         {logdir,\"$LOGDIR\"},
+                         {auto_compile,false}]),
+        io:format(\"RESULT: ~p~n\",[R]),
+        case R of {_,0,_} -> halt(0); _ -> halt(1) end."
+}
+
+shell() {
+    export ERL_LIBS="$ERL_TOP/lib"
+    exec "$BIN/erl" -pa "$COMPILER_EBIN" -pa "$CTBIN" "$@"
+}
+
+case "${1:-}" in
+    setup) setup ;;
+    test)  shift; test_suites "$@" ;;
+    shell) shift; shell "$@" ;;
+    *) echo "usage: $0 {setup|test <SUITE>...|shell}" >&2; exit 2 ;;
+esac

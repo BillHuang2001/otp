@@ -19,7 +19,7 @@
 %%
 %% %CopyrightEnd%
 %%
-%% Tests for the opt-in "map lookup fusion" pass beam_ssa_fus/1.
+%% Tests for the opt-in "operation fusion" pass beam_ssa_fus/1.
 %%
 %% The pass is only added to the repeated SSA optimization passes when the
 %% compile option `fusion_opt' is given (see beam_ssa_opt:repeated_passes/1),
@@ -50,7 +50,18 @@
 %% guard of the form `is_map(M), is_map_key(Key, M)' is what makes the pass
 %% fire. Everything else is left untouched.
 %%
-%% The test approach: a small probe module is compiled with each of the option
+%% Fusion 4 folds a multiplication by an integer constant whose result is
+%% immediately multiplied by a second integer constant:
+%%
+%%     D1 = V * K1,  D2 = D1 * K2   ->   D2 = V * (K1 * K2)
+%%
+%% It requires the type analysis to have proven V to be an integer, which makes
+%% the fold exact (`*' is associative for integers but not for floats) and keeps
+%% the failure set unchanged (`badarith' cannot be reached for a proven
+%% integer). The `is_integer/1' guard is what makes the pass fire: an unguarded
+%% chain, a chain guarded by `is_float/1', or a chain interrupted by another
+%% operation must stay untouched.
+%%%% The test approach: a small probe module is compiled with each of the option
 %% sets in opt_sets/0 and each build is executed. For every case we check
 %%
 %%   * that all the builds return exactly the same values *and* the same
@@ -72,7 +83,9 @@
          multi_key_match/1,
          no_fusion_different_key/1,
          no_fusion_not_sole_success_edge/1,
-         error_semantics/1]).
+         error_semantics/1,
+         fuse_const_mul_chain/1,
+         no_fusion_const_mul_chain/1]).
 
 suite() ->
     [{ct_hooks,[ts_install_cth]}].
@@ -90,7 +103,9 @@ groups() ->
        multi_key_match,
        no_fusion_different_key,
        no_fusion_not_sole_success_edge,
-       error_semantics]}].
+       error_semantics,
+       fuse_const_mul_chain,
+       no_fusion_const_mul_chain]}].
 
 init_per_suite(Config) ->
     Config.
@@ -360,9 +375,104 @@ error_semantics(Config) ->
     ok.
 
 %%============================================================================
-%% Probe modules
+%% Fusion 4
 %%============================================================================
 
+%% Fusion 4, positive case: a chain of multiplications by integer constants is
+%% folded into a single multiplication by the product of the constants. The
+%% transformed code must contain one multiplication instead of two (three), and
+%% every build must return exactly the same values *and* the same exceptions.
+fuse_const_mul_chain(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_mul", mulchain_probe()),
+
+    Args2 = [{[0],{ok,0}},
+             {[1],{ok,6}},
+             {[-1],{ok,-6}},
+             {[7],{ok,42}},
+             {[1 bsl 200],{ok,(1 bsl 200) * 2 * 3}},
+             %% The guard is what makes the fusion safe, so a non-integer
+             %% never reaches the multiplication.
+             {[3.0],{error,function_clause}},
+             {[a],{error,function_clause}}],
+    check_calls(Builds, chain2, Args2),
+
+    Args3 = [{[0],{ok,0}},
+             {[1],{ok,24}},
+             {[-2],{ok,-48}},
+             {[5],{ok,120}},
+             {[1 bsl 200],{ok,(1 bsl 200) * 2 * 3 * 4}},
+             {[3.0],{error,function_clause}}],
+    check_calls(Builds, chain3, Args3),
+
+    Fusion = code(fusion, Builds),
+    Plain = code(plain, Builds),
+    %% With the pass enabled the two multiplications have been folded into one,
+    %% and the three of the longer chain into one as well - and the single
+    %% remaining multiplication is by the *product* of the constants of the
+    %% chain (2*3 and 2*3*4), not by just one of them.
+    ?assertEqual(1, count_instr(Fusion, chain2, '*')),
+    ?assertEqual(1, count_instr(Fusion, chain3, '*')),
+    ?assertEqual(6, mul_constant(Fusion, chain2)),
+    ?assertEqual(24, mul_constant(Fusion, chain3)),
+
+    %% Without the pass - including with it explicitly turned off - both (all
+    %% three) multiplications are still there and nothing has been folded.
+    lists:foreach(fun(Set) ->
+                          Code = code(Set, Builds),
+                          ?assertEqual(2, count_instr(Code, chain2, '*')),
+                          ?assertEqual(3, count_instr(Code, chain3, '*'))
+                  end, [plain,no_fus_plain,no_fus,no_ssa_opt]),
+    ?assertEqual(2, count_instr(Plain, chain2, '*')),
+    ok.
+
+%% The chain must NOT be folded when the operand is not proven to be an
+%% integer: without a guard the operand may be a float and `(X * 2) * 3' is not
+%% `X * 6' in floating-point arithmetic, with an `is_float/1' guard the operand
+%% is known to be a float, and an addition between the multiplications breaks
+%% the chain. This is a strict no-op, and `badarith' must still be raised for a
+%% non-number in every build.
+no_fusion_const_mul_chain(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_mulneg", mulchain_neg_probe()),
+
+    FloatArgs = [{[F],{ok,F * 2 * 3}} || F <- [0.1,1.0e-308,2.5e-10,1.5,-3.25]],    check_calls(Builds, unguarded, FloatArgs),
+    check_calls(Builds, unguarded,
+                [{[X],{ok,X * 2 * 3}} ||
+                    X <- [0,1,-7,1 bsl 200]]),
+    check_calls(Builds, unguarded,
+                [{[a],{error,badarith}},
+                 {[[]],{error,badarith}},
+                 {[[1.0]],{error,badarith}}]),
+    check_calls(Builds, float_operand, FloatArgs),
+    check_calls(Builds, no_chain, [{[X],{ok,X * 2 + 3}} || X <- [0,1,-7]]),
+    check_calls(Builds, add_const, [{[X],{ok,X + 1 + 2}} || X <- [0,1,-7]]),
+
+    %% The pass is an exact no-op for this probe: with it enabled the
+    %% disassembly is identical to the default build, operands included.
+    %% Comparing the complete code (rather than only the instruction shape)
+    %% also catches a rewrite that changed an operand without changing the
+    %% instruction sequence.
+    Plain = code(plain, Builds),
+    Fusion = code(fusion, Builds),
+    ?assertEqual(Plain, Fusion),
+
+    %% The chains are really there, so the check above is not vacuous.
+    %% `count_mul/2' counts both the `*' BIF emitted for an integer operand and
+    %% the `fmul' instruction emitted for a float operand - a float
+    %% multiplication is not a generic `*' - so the source-level number of
+    %% multiplications can be pinned without hard-coding which instruction a
+    %% given operand type happens to produce. The pass must leave that number
+    %% unchanged.
+    lists:foreach(fun({Fun, Expected}) ->
+                          ?assertEqual({Fun, Expected},
+                                       {Fun, count_mul(Fusion, Fun)}),
+                          ?assertEqual({Fun, Expected},
+                                       {Fun, count_mul(Plain, Fun)})
+                  end, [{unguarded, 2}, {float_operand, 2}, {no_chain, 1}]),
+    ok.
+
+%%============================================================================
+%% Probe modules
+%%============================================================================
 %% The `is_map/1' guard is what makes the pass fire: it lets the type analysis
 %% prove that the operand of `is_map_key/2' is a map, which turns the guard
 %% into a `has_map_field/2' SSA test. The extraction that follows it on the
@@ -479,10 +589,34 @@ badmap_probe() ->
     "\n"
     "e(M) -> maps:get(a, M).\n".
 
+%% Chains of multiplications by integer constants under an `is_integer/1'
+%% guard, which is what lets the type analysis prove the operand to be an
+%% integer (Fusion 4).
+mulchain_probe() ->
+    "-module(beam_ssa_fus_mul).\n"
+    "-export([chain2/1,chain3/1]).\n"
+    "\n"
+    "chain2(X) when is_integer(X) -> X * 2 * 3.\n"
+    "\n"
+    "chain3(X) when is_integer(X) -> X * 2 * 3 * 4.\n".
+
+%% The same chains without a type proof (no guard at all, or a float guard), and
+%% chains that are not multiplication chains: none of these may be folded.
+mulchain_neg_probe() ->
+    "-module(beam_ssa_fus_mulneg).\n"
+    "-export([unguarded/1,float_operand/1,add_const/1,no_chain/1]).\n"
+    "\n"
+    "unguarded(X) -> X * 2 * 3.\n"
+    "\n"
+    "float_operand(X) when is_float(X) -> X * 2 * 3.\n"
+    "\n"
+    "add_const(X) when is_integer(X) -> X + 1 + 2.\n"
+    "\n"
+    "no_chain(X) when is_integer(X) -> X * 2 + 3.\n".
+
 %%============================================================================
 %% Compiling, disassembling and running the probes
 %%============================================================================
-
 %% The option sets every probe is compiled with.
 %%
 %% `fusion' enables the pass, `plain' is the default, `no_fus' enables the
@@ -608,13 +742,53 @@ instr_name(I) when is_tuple(I) ->
     case element(1, I) of
         test -> element(2, I);
         bif -> element(2, I);
+        gc_bif -> element(2, I);
         Name -> Name
-    end;
-instr_name(_) ->
+    end;instr_name(_) ->
     none.
 
-%% A compact description of the code - the instruction names in order - used
-%% to compare builds without dumping complete instruction lists on failure.
+%% The number of `Name' instructions in the function `Fun'. Fails if the
+%% function is missing - which is what makes a count assertion a real check
+%% that the function was compiled.
+count_instr(Code, Fun, Name) ->
+    case [Is || {function,N,_,_,Is} <- Code, N =:= Fun] of
+        [Is] -> length([I || I <- Is, instr_name(I) =:= Name]);
+        Other -> ct:fail({missing_function, Fun, Other})
+    end.
+
+%% The number of multiplication instructions in the function `Fun'. A
+%% multiplication by a constant is emitted as the `*' BIF for an integer
+%% operand but as the dedicated `fmul' instruction for a float operand, so both
+%% spellings must be counted; counting only `'*'' would miss a float chain
+%% entirely.
+count_mul(Code, Fun) ->
+    count_instr(Code, Fun, '*') + count_instr(Code, Fun, fmul).
+
+%% The integer constant of the multiplication by a constant in `Fun'. Fails
+%% unless `Fun' contains exactly one `*' instruction with an integer literal
+%% operand; used to check that a chain was folded into a single multiplication
+%% by the *product* of the chain's constants.
+mul_constant(Code, Fun) ->
+    Is = case [Is0 || {function,N,_,_,Is0} <- Code, N =:= Fun] of
+             [Is1] -> Is1;
+             Other -> ct:fail({missing_function, Fun, Other})
+         end,
+    case [K || I <- Is, {integer,K} <- mul_args(I)] of
+        [K] -> K;
+        Constants -> ct:fail({unexpected_multiplication, Fun, Constants})
+    end.
+
+%% The operands of a multiplication instruction, and [] for every other
+%% instruction. Both the `bif' and the `gc_bif' spelling are recognized so that
+%% the constant can be read regardless of how the multiplication was emitted.
+mul_args({bif,'*',_Fail,Args,_Dst}) ->
+    Args;
+mul_args({gc_bif,'*',_Fail,_Live,Args,_Dst}) ->
+    Args;
+mul_args(_) ->
+    [].
+
+%% A compact description of the code - the instruction names in order - used%% to compare builds without dumping complete instruction lists on failure.
 shape(Code) ->
     [{Name,Arity,[instr_name(I) || I <- Is]} ||
         {function,Name,Arity,_,Is} <- Code].

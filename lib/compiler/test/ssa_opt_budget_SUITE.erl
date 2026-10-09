@@ -19,18 +19,27 @@
 %%
 %% %CopyrightEnd%
 %%
-%% Tests for the opt-in per-SSA-pass time budget, watchdog and eligibility
-%% gates implemented by beam_ssa_opt_budget and wired into
-%% beam_ssa_opt:passes_1/3 / beam_ssa_destructive_update:opt/2.
+%% Tests for the opt-in per-SSA-pass time budget, watchdog, eligibility gates
+%% and per-function effort/budget model implemented by beam_ssa_opt_budget and
+%% wired into beam_ssa_opt:passes_1/3 / beam_ssa_destructive_update:opt/2.
 %%
 %% The machinery is default OFF: when none of the options
-%% ssa_opt_budget / {ssa_opt_budget,Millis}, ssa_opt_watchdog /
-%% {ssa_opt_watchdog,Millis} or ssa_opt_gates is given, the pass funs are
-%% not wrapped at all and no budget state is created (see `default_off/1').
+%% ssa_opt_budget / {ssa_opt_budget,Millis}, {ssa_opt_fn_budget,Millis},
+%% ssa_opt_watchdog / {ssa_opt_watchdog,Millis} or ssa_opt_gates is given, the
+%% pass funs are not wrapped at all and no budget state is created (see
+%% `default_off/1' and `default_path_unchanged/1').
+%%
+%% The per-function effort model classifies every function by its SSA size and
+%% hands it a size-derived wall-clock allowance; `{ssa_opt_fn_budget,Millis}'
+%% overrides that allowance for every function. Per-function skipping is only
+%% active with a cumulative budget or such an explicit allowance; with
+%% `ssa_opt_gates' alone the output is unchanged (see `effort_levels/1',
+%% `classify_model/1' and the `fn_budget_*' cases).
 %%
 %% Every test case here compiles probe modules with `no_spawn_compiler_process'
 %% so that the compilation - and thus the per-compilation statistics
-%% (beam_ssa_opt_budget:get_stats/0) - happens in the test process.
+%% (beam_ssa_opt_budget:get_stats/0) and the per-function queries - happens in
+%% the test process.
 %%
 -module(ssa_opt_budget_SUITE).
 
@@ -46,7 +55,14 @@
          budget_takes_effect/1,
          watchdog_takes_effect/1,
          tight_budget_equivalence/1,
-         real_module_budget_equivalence/1]).
+         real_module_budget_equivalence/1,
+         classify_model/1,
+         effort_levels/1,
+         fn_budget_takes_effect/1,
+         fn_budget_equivalence/1,
+         fn_budget_ample_does_not_change_output/1,
+         fn_budget_option_registered/1,
+         default_path_unchanged/1]).
 
 suite() ->
     [{ct_hooks,[ts_install_cth]}].
@@ -64,7 +80,14 @@ groups() ->
        budget_takes_effect,
        watchdog_takes_effect,
        tight_budget_equivalence,
-       real_module_budget_equivalence]}].
+       real_module_budget_equivalence,
+       classify_model,
+       effort_levels,
+       fn_budget_takes_effect,
+       fn_budget_equivalence,
+       fn_budget_ample_does_not_change_output,
+       fn_budget_option_registered,
+       default_path_unchanged]}].
 
 init_per_suite(Config) ->
     Config.
@@ -83,13 +106,20 @@ end_per_group(_GroupName, Config) ->
 %%============================================================================
 
 %% Without any of the new options there is no budget state at all, i.e. the
-%% machinery is off by default.
+%% machinery is off by default. The whole query surface must say so instead of
+%% inventing a state: `effort/0' and `function_size/0' are `undefined',
+%% `remaining/0' is `infinity' and no function is "over budget".
 default_off(Config) ->
     Builds = build_sets(Config, "ssa_opt_budget_flat", flat_probe(),
                         [{plain, [binary,no_spawn_compiler_process]}]),
     [{plain, {_Mod, Bin}}] = Builds,
     ?assertEqual(undefined, stats()),
     ?assert(is_binary(Bin)),
+    ?assertEqual(undefined, effort()),
+    ?assertEqual(undefined, function_size()),
+    ?assertEqual(undefined, function_budget()),
+    ?assertEqual(false, function_over_budget()),
+    ?assertEqual(infinity, remaining()),
     ok.
 
 %% The eligibility gates skip the opt-in passes when their (cheap)
@@ -215,16 +245,224 @@ real_module_budget_equivalence(Config) ->
     check_behaviour(Builds),
     ok.
 
-%% The path of this suite's source, valid both when running under Common
-%% Test (cwd = this directory) and when the callbacks are driven from a
-%% driver started in the repository root.
+%%============================================================================
+%% Per-function effort model and per-function allowance
+%%============================================================================
+
+%% `classify/2' is pure, so the effort model is checked directly against its
+%% documentation: `full' for at most 500 instructions, `reduced' for at most
+%% 5000 and `minimal' above that, with an allowance of
+%% `max(50, 500 - Instructions div 20)' milliseconds. The model is derived
+%% from the number of instructions alone, so the block count must not matter,
+%% the level must never improve and the allowance must never grow as the
+%% function gets bigger nor drop below the floor.
+classify_model(_Config) ->
+    %% The documented pairs, spelled out.
+    ?assertEqual({full, 500}, model(1, 0)),
+    ?assertMatch({reduced, _}, model(1, 501)),
+    ?assertMatch({minimal, _}, model(1, 5001)),
+    ?assertEqual({minimal, 50}, model(1, 9000)),
+    %% The block count is part of the size description but must influence
+    %% neither the level nor the allowance.
+    lists:foreach(fun(Blocks) ->
+                          ?assertEqual(model(0, 5000), model(Blocks, 5000))
+                  end, [0, 1, 2, 17, 999, 100000]),
+    %% The model agrees with the documented formula on every threshold and on
+    %% the allowance floor.
+    Counts = [0, 1, 20, 499, 500, 501, 2500, 4999, 5000, 5001,
+              8999, 9000, 9001, 20000, 1000000],
+    lists:foreach(fun(N) ->
+                          ?assertEqual({expected_level(N), expected_allowance(N)},
+                                       model(1, N))
+                  end, Counts),
+    %% ... and it is monotone over the whole sweep.
+    check_monotone(Counts),
+    ok.
+
+%% A module with both a tiny function and a generated huge one (a long
+%% arithmetic chain) must be classified at both `full' and `minimal'. The
+%% per-function queries must describe the most recently seen function:
+%% `function_size/0' a size pair with at least one block, `function_budget/0'
+%% a non-negative allowance and `effort/0' one of the four levels. With
+%% `ssa_opt_gates' alone there is no cumulative budget, so `remaining/0' is
+%% `infinity' and nothing is spent.
+effort_levels(Config) ->
+    Source = mixed_probe(huge_body(6000)),
+    Opts = [binary,no_spawn_compiler_process,ssa_opt_gates],
+    _ = build_sets(Config, "ssa_opt_budget_mixed", Source, [{gates, Opts}]),
+    St = stats(),
+    ?assert(is_map(St)),
+    Effort = maps:get(effort, St),
+    ?assert(maps:get(full, Effort) >= 1),
+    ?assert(maps:get(minimal, Effort) >= 1),
+    ?assertEqual(infinity, remaining()),
+    {Blocks, Instructions} = function_size(),
+    ?assert(is_integer(Blocks) andalso Blocks >= 1),
+    ?assert(is_integer(Instructions) andalso Instructions >= 0),
+    Budget = function_budget(),
+    ?assert(is_integer(Budget) andalso Budget >= 50),
+    ?assert(lists:member(effort(), [full, reduced, minimal, none])),
+    ct:pal("effort=~p size=~p budget=~p current=~p",
+           [Effort, {Blocks, Instructions}, Budget, effort()]),
+    ok.
+
+%% `{ssa_opt_fn_budget,0}' exhausts every function's allowance immediately, so
+%% every skippable pass is skipped from the start: the per-function "optimizer
+%% off from here on" shape. It must be observable in the statistics, must
+%% change the generated code (it is less optimized) and must not change
+%% behaviour.
+fn_budget_takes_effect(Config) ->
+    Sets = [{plain, [binary,no_spawn_compiler_process]},
+            {fn_tight, [binary,no_spawn_compiler_process,
+                        {ssa_opt_fn_budget,0}]}],
+    Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    St = stats(),
+    ?assert(is_map(St)),
+    ?assert(maps:get(function_over_budget, St) > 0),
+    ?assert(code_of(key(plain, Builds)) =/= code_of(key(fn_tight, Builds))),
+    check_behaviour(Builds),
+    ok.
+
+%% Compile the same probe with the default options and with an exhausted
+%% per-function allowance, execute both builds and check that they agree
+%% exactly (including exceptions).
+fn_budget_equivalence(Config) ->
+    Sets = [{plain, [binary,no_spawn_compiler_process]},
+            {fn_tight, [binary,no_spawn_compiler_process,
+                        {ssa_opt_fn_budget,0}]}],
+    Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    check_behaviour(Builds),
+    ok.
+
+%% A per-function allowance that is never reached must not change the
+%% generated code either.
+fn_budget_ample_does_not_change_output(Config) ->
+    Sets = [{plain, [binary,no_spawn_compiler_process]},
+            {fn_ample, [binary,no_spawn_compiler_process,
+                        {ssa_opt_fn_budget,1000000}]}],
+    Builds = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    ?assertEqual(code_of(key(plain, Builds)), code_of(key(fn_ample, Builds))),
+    ok.
+
+%% `{ssa_opt_fn_budget,Millis}' is a first-class compiler option: `compile.erl'
+%% accepts and expands it (so it is not reported as an unknown option),
+%% `compile:options/0' advertises it in the help text, and driving it through
+%% `compile:file/2' with an exhausted allowance activates per-function
+%% skipping, which is observable in the statistics.
+fn_budget_option_registered(Config) ->
+    Sets = [{fn_tight, [binary,no_spawn_compiler_process,
+                        {ssa_opt_fn_budget,0}]}],
+    _ = build_sets(Config, "ssa_opt_budget_rich", rich_probe(), Sets),
+    St = stats(),
+    ?assert(is_map(St)),
+    ?assert(maps:get(function_over_budget, St) > 0),
+    %% Accepted directly by compile:file/2 as well.
+    Dir = tmp_dir(Config),
+    File = write_probe(Dir, "ssa_opt_budget_opts", flat_probe()),
+    ?assertMatch({ok,_,_},
+                 compile:file(File, [binary,return_errors,
+                                     {ssa_opt_fn_budget,0}])),
+    %% ... and advertised in the `compile:options/0' help text.
+    Help = capture_options(),
+    ?assert(string:find(Help, "ssa_opt_fn_budget") =/= nomatch),
+    ok.
+
+%% Capture the text `compile:options/0' writes by running it with a collecting
+%% process as the group leader. `compile:options/0' only uses `io:fwrite', i.e.
+%% sends `put_chars' io requests, so a minimal io server is enough.
+-spec capture_options() -> string().
+capture_options() ->
+    Self = self(),
+    Ref = make_ref(),
+    Collector = spawn_link(fun() -> options_collector(Self, Ref, []) end),
+    OldLeader = group_leader(),
+    true = group_leader(Collector, Self),
+    Result =
+        try
+            compile:options()
+        after
+            group_leader(OldLeader, Self)
+        end,
+    ok = Result,
+    Collector ! {text, Self, Ref},
+    receive
+        {Ref, Text} -> Text
+    after 10000 ->
+            ct:fail(options_capture_timeout)
+    end.
+
+-spec options_collector(pid(), reference(), [unicode:chardata()]) -> ok.
+options_collector(Parent, Ref, Acc) ->
+    receive
+        {io_request, From, ReplyAs, Request} ->
+            case Request of
+                {put_chars, Chars} ->
+                    From ! {io_reply, ReplyAs, ok},
+                    options_collector(Parent, Ref, [Chars|Acc]);
+                {put_chars, _Enc, Chars} ->
+                    From ! {io_reply, ReplyAs, ok},
+                    options_collector(Parent, Ref, [Chars|Acc]);
+                {put_chars, Mod, Fun, Args} ->
+                    From ! {io_reply, ReplyAs, ok},
+                    options_collector(Parent, Ref,
+                                      [apply(Mod, Fun, Args)|Acc]);
+                {put_chars, _Enc, Mod, Fun, Args} ->
+                    From ! {io_reply, ReplyAs, ok},
+                    options_collector(Parent, Ref,
+                                      [apply(Mod, Fun, Args)|Acc]);
+                _Other ->
+                    From ! {io_reply, ReplyAs, {error, enotsup}},
+                    options_collector(Parent, Ref, Acc)
+            end;
+        {text, Parent, Ref} ->
+            Parent ! {Ref, lists:flatten(lists:reverse(Acc))},
+            ok
+    end.
+
+%% The explicit check that the default path is untouched: compiling this
+%% suite's own source with no option, with the gates and with a no-op
+%% per-function allowance must produce byte-for-byte identical code.
+default_path_unchanged(_Config) ->
+    Src = suite_source(),
+    Sets = [{plain, [binary,no_spawn_compiler_process]},
+            {gates, [binary,no_spawn_compiler_process,ssa_opt_gates]},
+            {fn_ample, [binary,no_spawn_compiler_process,
+                        {ssa_opt_fn_budget,1000000}]}],
+    Builds = [{Set, build(Src, Opts)} || {Set,Opts} <- Sets],
+    ?assertEqual(code_of(key(plain, Builds)), code_of(key(gates, Builds))),
+    ?assertEqual(code_of(key(plain, Builds)), code_of(key(fn_ample, Builds))),
+    ok.
+
+%% The path of this suite's source.
+%%
+%% It cannot rely on the current working directory: Common Test runs a test
+%% case with the cwd set to its log directory, and `?FILE' is only usable if
+%% the suite happened to be compiled with a path that is still valid there.
+%% The primary candidate is therefore derived from the loaded module itself:
+%% `code:which(?MODULE)' is the compiled suite's `.beam' (the harness
+%% compiles the suites into the test directory, next to their sources), so
+%% the source is the same basename with an `.erl' extension in the beam's
+%% directory. If the beam is not a regular file (preloaded or a stale beam)
+%% the compile-time and repo-root-relative forms are tried as fallbacks,
+%% which is what makes this work when the callbacks are driven directly from
+%% a driver started in the repository root.
 suite_source() ->
-    Candidates = [?FILE, "test/" ++ filename:basename(?FILE),
-                  "lib/compiler/test/" ++ filename:basename(?FILE)],
+    Candidates = suite_source_candidates(),
     case [F || F <- Candidates, filelib:is_regular(F)] of
         [F|_] -> F;
         [] -> ct:fail({no_suite_source, Candidates})
     end.
+
+suite_source_candidates() ->
+    Base = atom_to_list(?MODULE) ++ ".erl",
+    FromBeam =
+        case code:which(?MODULE) of
+            Beam when is_list(Beam) ->
+                [filename:join(filename:dirname(Beam), Base)];
+            _ ->
+                []
+        end,
+    FromBeam ++ [?FILE, "test/" ++ Base, "lib/compiler/test/" ++ Base].
 
 %%============================================================================
 %% Checking helpers
@@ -241,8 +479,61 @@ check(Stats, Name, MinRan, MinGated) ->
 pass_zero() ->
     #{ran => 0, gated => 0, over_budget => 0, timed_out => 0}.
 
+%% The pure model function under test, aliased to keep the assertions short.
+model(Blocks, Instructions) ->
+    beam_ssa_opt_budget:classify(Blocks, Instructions).
+
+%% The effort model as documented, derived independently of the module under
+%% test: the level from the instruction thresholds and the allowance from
+%% `max(50, 500 - Instructions div 20)'.
+expected_level(Instructions) when Instructions =< 500 -> full;
+expected_level(Instructions) when Instructions =< 5000 -> reduced;
+expected_level(_) -> minimal.
+
+expected_allowance(Instructions) ->
+    max(50, 500 - Instructions div 20).
+
+%% More effort: `full' > `reduced' > `minimal'.
+level_rank(full) -> 3;
+level_rank(reduced) -> 2;
+level_rank(minimal) -> 1.
+
+%% Assert that the level is non-increasing, and that the allowance is
+%% non-increasing and never below the documented floor, over the given
+%% ascending instruction counts.
+check_monotone([A, B | Rest]) ->
+    ?assert(A =< B),
+    {LevelA, MsA} = model(1, A),
+    {LevelB, MsB} = model(1, B),
+    ?assert(level_rank(LevelA) >= level_rank(LevelB)),
+    ?assert(MsA >= MsB),
+    ?assert(MsA >= 50),
+    ?assert(MsB >= 50),
+    check_monotone([B | Rest]);
+check_monotone([_Last]) ->
+    ok;
+check_monotone([]) ->
+    ok.
+
 stats() ->
     beam_ssa_opt_budget:get_stats().
+
+%% The per-function query surface (see beam_ssa_opt_budget), aliased so the
+%% assertions read like the model they check.
+effort() ->
+    beam_ssa_opt_budget:effort().
+
+function_size() ->
+    beam_ssa_opt_budget:function_size().
+
+function_budget() ->
+    beam_ssa_opt_budget:function_budget().
+
+function_over_budget() ->
+    beam_ssa_opt_budget:function_over_budget().
+
+remaining() ->
+    beam_ssa_opt_budget:remaining().
 
 key(Set, Builds) ->
     case lists:keyfind(Set, 1, Builds) of
@@ -417,3 +708,33 @@ rich_probe() ->
     "    receive\n"
     "        {msg, X} -> X\n"
     "    end.\n".
+
+%% A module with a tiny function and one huge function, whose body is
+%% generated by `huge_body/1'. Used to exercise the per-function effort model
+%% end to end: the tiny function is classified `full', the huge one `minimal'.
+mixed_probe(Body) ->
+    ["-module(ssa_opt_budget_mixed).\n",
+     "-export([tiny/1,huge/1]).\n",
+     "\n",
+     "tiny(X) when is_integer(X) -> X + 1;\n",
+     "tiny(X) -> X.\n",
+     "\n",
+     "%% A long arithmetic chain: `N' steps, each one SSA instruction, so the\n"
+     "%% function's instructions count is at least `N'.\n",
+     "huge(X) ->\n",
+     Body].
+
+%% Generate the body of the `huge/1' function: a chain of `N' distinct
+%% single-assignment variables, the first derived from the argument `X' and
+%% each later one from the previous one by one addition, ending with the last
+%% variable. The chain keeps every step live, so no step can be folded away
+%% and the SSA instruction count is at least `N'.
+huge_body(N) ->
+    Vars = [var(I) || I <- lists:seq(0, N - 1)],
+    Prev = ["X" | lists:droplast(Vars)],
+    Steps = [["    ", V, " = ", P, " + 1,\n"]
+             || {V, P} <- lists:zip(Vars, Prev)],
+    [Steps, "    ", lists:last(Vars), ".\n"].
+
+var(I) ->
+    "V" ++ integer_to_list(I).
