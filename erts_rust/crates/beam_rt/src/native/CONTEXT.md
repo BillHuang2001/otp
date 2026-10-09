@@ -37,7 +37,9 @@ per-function bodies. Files:
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
 | `prim.rs` | the `prim_file` floor (16 entries) — see below |
-| `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2`) + its unit tests || `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
+| `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2`) + its unit tests |
+| `file_server.rs` | the native **`file_server_2` service** (contract A.9) — the registered service process + its native io-devices, the `gen_server`/`file`/`io` wire, and the scheduler-pass step that services their mailboxes (see below) |
+| `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
 **`init:get_arguments/0` lists ONLY the command-line flags**, so it differs from the oracle by exactly its four automatic `root`/`bindir`/`progname`/`home` entries — which is why a `RuntimeConfig::default()` runtime (an empty `init_args`, so the listing is `[]`) stops the real boot script three instructions earlier, at instruction 16 (`application:load/1`, an `error function_clause`); the boot-chain consequence is in [`../boot/CONTEXT.md`](../boot/CONTEXT.md).
 
