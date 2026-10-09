@@ -46,7 +46,7 @@
 //! | [`PersistentTerm`] | [`PERSISTENT_TERM_BIFS`] | 7 |
 //! | [`FunCaller`] | [`FUN_CALLER_BIFS`] | 22 |
 //! | [`LocalNode`] | [`LOCAL_NODE_BIFS`] | 6 |
-//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 222 |
+//! | [`RuntimeHooks`] | [`RUNTIME_HOOKS_BIFS`] | 195 |
 //!
 //! # Why the sets live **here**, not in the host
 //!
@@ -100,7 +100,7 @@
 //! | `RuntimeContext::uses_send_hook` | [`needs_send_hook`] |
 //! | `RuntimeContext::uses_module_info` | [`needs_module_info`] |
 //! | `RuntimeContext::uses_persistent_term` | [`needs_persistent_term`] |
-//! | `RuntimeContext::uses_runtime_hooks` (a 10-key subset today) | [`needs_runtime_hooks`] (the whole 222-key seam) |
+//! | `RuntimeContext::uses_runtime_hooks` (a 10-key subset today) | [`needs_runtime_hooks`] (the whole 195-key seam) |
 //! | — (the port hook is installed unconditionally today) | [`needs_port_hook`] |
 //! | — (the fun caller is gated by `reentrancy_capable(args)` today) | [`needs_fun_caller`] |
 //! | — (the local node is installed unconditionally today) | [`needs_local_node`] |
@@ -321,23 +321,21 @@ pub const LOCAL_NODE_BIFS: &[(&str, &str, u32)] = &[
 /// [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif).
 ///
 /// The union of the four `runtime_bif!` family modules: `runtime/erlang.rs` (77),
-/// `runtime/erts_internal.rs` (62), `runtime/erts_debug.rs` (18) and
-/// `runtime/other.rs` (65) = **222** keys. The `erlang:memory/0,1` pair in
-/// `runtime/memory.rs` is registered against the separate [`MEMORY_HOOK_BIFS`] seam
-/// and is **not** here.
+/// `runtime/erts_internal.rs` (56), `runtime/erts_debug.rs` (18) and
+/// `runtime/other.rs` (44) = **195** keys. The `erlang:memory/0,1` pair in
+/// `runtime/memory.rs` is registered against the separate [`MEMORY_HOOK_BIFS`] seam,
+/// the 13 `atomics`/`counters` resource-object keys are real implementations
+/// registered by `runtime/atomics.rs` ([`crate::runtime::atomics::REAL_BIFS`]), and
+/// `erl_ddll:format_error_int/1` is a real implementation registered by
+/// `runtime/ddll.rs` ([`crate::runtime::ddll::REAL_BIFS`]) — so none of those groups
+/// is here.
 ///
-/// The set is exactly `runtime::register`'s roster, so the module's registration and
-/// this table are asserted **equal** — the strongest drift guard in this module, and
-/// the reason the whole table can be trusted to be complete rather than merely sound.
-/// Sorted by `(module, function, arity)`; see [`needs_runtime_hooks`].
+/// The set is exactly `runtime::register`'s roster minus those three groups, so the
+/// module's registration and this table are asserted **equal** — the strongest drift
+/// guard in this module, and the reason the whole table can be trusted to be complete
+/// rather than merely sound. Sorted by `(module, function, arity)`; see
+/// [`needs_runtime_hooks`].
 pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
-    ("atomics", "add", 3),
-    ("atomics", "add_get", 3),
-    ("atomics", "compare_exchange", 4),
-    ("atomics", "exchange", 3),
-    ("atomics", "get", 2),
-    ("atomics", "info", 1),
-    ("atomics", "put", 3),
     ("code", "coverage_support", 0),
     ("code", "get_coverage", 2),
     ("code", "get_coverage_mode", 0),
@@ -346,7 +344,6 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("code", "reset_coverage", 1),
     ("code", "set_coverage_mode", 1),
     ("erl_ddll", "demonitor", 1),
-    ("erl_ddll", "format_error_int", 1),
     ("erl_ddll", "info", 2),
     ("erl_ddll", "loaded_drivers", 0),
     ("erl_ddll", "monitor", 2),
@@ -462,16 +459,10 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_debug", "size_shared", 1),
     ("erts_debug", "unaligned_bitstring", 2),
     ("erts_internal", "abort_pending_connection", 2),
-    ("erts_internal", "atomics_new", 2),
     ("erts_internal", "beamfile_chunk", 2),
     ("erts_internal", "beamfile_module_md5", 1),
     ("erts_internal", "check_dirty_process_code", 2),
     ("erts_internal", "check_process_code", 1),
-    ("erts_internal", "counters_add", 3),
-    ("erts_internal", "counters_get", 2),
-    ("erts_internal", "counters_info", 1),
-    ("erts_internal", "counters_new", 1),
-    ("erts_internal", "counters_put", 3),
     ("erts_internal", "create_dist_channel", 3),
     ("erts_internal", "dirty_process_handle_signals", 1),
     ("erts_internal", "dist_spawn_request", 4),
@@ -527,18 +518,7 @@ pub const RUNTIME_HOOKS_BIFS: &[(&str, &str, u32)] = &[
     ("erts_literal_area_collector", "send_copy_request", 3),
     ("erts_trace_cleaner", "check", 0),
     ("erts_trace_cleaner", "send_trace_clean_signal", 1),
-    ("ets", "first_lookup", 1),
-    ("ets", "internal_delete_all", 2),
     ("ets", "internal_request_all", 0),
-    ("ets", "internal_select_delete", 2),
-    ("ets", "last_lookup", 1),
-    ("ets", "match_spec_run_r", 3),
-    ("ets", "next_lookup", 2),
-    ("ets", "prev_lookup", 2),
-    ("ets", "rename", 2),
-    ("ets", "select_reverse", 1),
-    ("ets", "select_reverse", 2),
-    ("ets", "select_reverse", 3),
     ("ets", "slot", 2),
     ("net_kernel", "dflag_unicode_io", 1),
     ("os", "set_signal", 2),
@@ -1009,16 +989,26 @@ mod tests {
     /// of `src/runtime/`'s four `runtime_bif!` families, so the table is provably
     /// complete, not merely sound.
     ///
-    /// `runtime::register` additionally installs the `erlang:memory/0,1` pair, which
-    /// reads the separate [`MemoryHook`] seam, so that pair is filtered out first.
+    /// `runtime::register` additionally installs the `erlang:memory/0,1` pair (which
+    /// reads the separate [`MemoryHook`] seam), the 13 real `atomics`/`counters`
+    /// resource-object keys and the real `erl_ddll:format_error_int/1` (which do not
+    /// go through the `RuntimeHooks` seam at all), so all three groups are filtered out
+    /// first.
     #[test]
     fn runtime_hooks_bifs_is_exactly_the_runtime_bif_roster() {
         let mut expected = keys_of(crate::runtime::register);
         expected.retain(|(m, f, a)| !MEMORY_HOOK_BIFS.contains(&(m.as_str(), f.as_str(), *a)));
+        expected.retain(|(m, f, a)| {
+            !crate::runtime::atomics::REAL_BIFS.contains(&(m.as_str(), f.as_str(), *a))
+        });
+        expected.retain(|(m, f, a)| {
+            !crate::runtime::ddll::REAL_BIFS.contains(&(m.as_str(), f.as_str(), *a))
+        });
         assert_eq!(
             sorted_keys(RUNTIME_HOOKS_BIFS),
             expected,
-            "RUNTIME_HOOKS_BIFS must equal the runtime_bif! roster (minus the memory pair)"
+            "RUNTIME_HOOKS_BIFS must equal the runtime_bif! roster \
+             (minus the memory pair and the real atomics/counters + erl_ddll keys)"
         );
     }
 
@@ -1027,7 +1017,7 @@ mod tests {
     /// magnitude explicit).
     #[test]
     fn runtime_hooks_bifs_has_the_expected_size() {
-        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 220);
+        assert_eq!(RUNTIME_HOOKS_BIFS.len(), 195);
     }
 
     /// Near misses (wrong arity / wrong module / a different BIF) answer `false`.

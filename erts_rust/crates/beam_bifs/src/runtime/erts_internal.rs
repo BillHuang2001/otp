@@ -18,16 +18,15 @@
 //
 // %CopyrightEnd%
 
-//! The `erts_internal` runtime-coupled BIFs (the resource-object stores, the port
-//! and process-control internals, the tracing machinery, code loading, ...).
+//! The `erts_internal` runtime-coupled BIFs (the port and process-control
+//! internals, the tracing machinery, code loading, ...).
 //!
 //! # Why these are here and not in `src/*.rs`
 //!
 //! The keys in this family are the `erts_internal:*` entries from
 //! `../../erts/emulator/beam/bif.tab` that this crate does not implement
 //! natively: they all need the **running** runtime, which lives in other crates
-//! of the workspace and is unreachable from a BIF. The resource-object stores
-//! (`counters_*`, `atomics_new/2`), the port machinery (`port_call/3`,
+//! of the workspace and is unreachable from a BIF. The port machinery (`port_call/3`,
 //! `port_command/3`, `port_control/3`, `port_close/1`, `port_connect/2`,
 //! `port_info/1,2`, `open_port/2`), process control (`suspend_process/2`,
 //! `process_flag/3`, `process_display/2`, `processes_next/1`, `system_check/1`,
@@ -49,7 +48,7 @@
 //!
 //! # One seam, one honest gap
 //!
-//! All 62 keys resolve through the **single**
+//! All 56 keys resolve through the **single**
 //! [`RuntimeHooks`](crate::context::RuntimeHooks) dispatcher (via
 //! [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif)),
 //! which is handed the `(module, function, arity)` identity verbatim so the
@@ -64,11 +63,11 @@
 //! registry call, or a `beam_rt` that defers to it, gets the honest gap rather
 //! than a plain `undef`.
 //!
-//! # Roster (62 keys, all `bif.tab`-declared)
+//! # Roster (56 keys, all `bif.tab`-declared)
 //!
 //! `../../erts/emulator/beam/bif.tab` lines: 74, 79, 80, 124, 130, 170-176,
 //! 178-180, 189, 191, 193, 195, 197, 199, 201-203, 216, 217, 224, 226, 282,
-//! 661-663, 692, 693, 696, 697, 712, 714, 723-727, 733, 747-749, 755, 762,
+//! 661-663, 692, 693, 696, 697, 712, 733, 747-749, 755, 762,
 //! 768-770, 787, 799-803, 810-812, 825.
 
 use crate::registry::BifRegistry;
@@ -77,16 +76,10 @@ use crate::runtime::runtime_bif;
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     runtime_bif!(reg, "erts_internal", abort_pending_connection, 2);
-    runtime_bif!(reg, "erts_internal", atomics_new, 2);
     runtime_bif!(reg, "erts_internal", beamfile_chunk, 2);
     runtime_bif!(reg, "erts_internal", beamfile_module_md5, 1);
     runtime_bif!(reg, "erts_internal", check_dirty_process_code, 2);
     runtime_bif!(reg, "erts_internal", check_process_code, 1);
-    runtime_bif!(reg, "erts_internal", counters_add, 3);
-    runtime_bif!(reg, "erts_internal", counters_get, 2);
-    runtime_bif!(reg, "erts_internal", counters_info, 1);
-    runtime_bif!(reg, "erts_internal", counters_new, 1);
-    runtime_bif!(reg, "erts_internal", counters_put, 3);
     runtime_bif!(reg, "erts_internal", create_dist_channel, 3);
     runtime_bif!(reg, "erts_internal", dirty_process_handle_signals, 1);
     runtime_bif!(reg, "erts_internal", dist_spawn_request, 4);
@@ -156,7 +149,6 @@ mod tests {
         let mut reg = BifRegistry::new();
         super::register(&mut reg);
         assert!(reg.contains("erts_internal", "garbage_collect", 1));
-        assert!(reg.contains("erts_internal", "counters_new", 1));
 
         let mut heap = Heap::new(8).expect("test heap");
         let atoms = AtomTable::new();

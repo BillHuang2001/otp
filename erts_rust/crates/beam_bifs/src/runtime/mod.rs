@@ -32,6 +32,8 @@
 
 use crate::registry::BifRegistry;
 
+pub(crate) mod atomics;
+pub(crate) mod ddll;
 mod erlang;
 mod erts_debug;
 mod erts_internal;
@@ -70,6 +72,12 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     erts_internal::register(reg);
     erts_debug::register(reg);
     other::register(reg);
+    // The real `atomics`/`counters` resource objects and the real `erl_ddll` error
+    // table register LAST so their keys are the ones the registry answers for (the
+    // registry keeps the last registration for a key; their keys are in any case
+    // disjoint from every `runtime_bif!` key above).
+    ddll::register(reg);
+    atomics::register(reg);
 }
 
 #[cfg(test)]

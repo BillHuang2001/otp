@@ -1,3 +1,23 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
 //! The **adopted** `ets:*` verbs: the roster (`ets:all/0`), the ownership verbs
 //! (`ets:setopts/2`, `ets:give_away/3`) and the fun-folds (`ets:foldl/3`,
 //! `ets:foldr/3`).
@@ -51,47 +71,25 @@
 //!
 //! # Honest typed gaps (never a wrong result)
 //!
-//! Each gap below is registered elsewhere (the [`super::extra`] docs, or the
-//! `runtime_bif!` seam in `src/runtime/other.rs`) and answers the typed
-//! `unsupported_bif` raise; this list records *why*, and the exact `beam_ets` API
-//! that would close it.
+//! Each gap below answers the typed `unsupported_bif` raise; this list records
+//! *why*, and the exact `beam_ets` API that would close it. The related verbs that
+//! are served by a sibling child module rather than here are `ets:rename/2`
+//! ([`super::extra`]), `ets:select_reverse/1,2,3` ([`super::reverse`]),
+//! `ets:match_spec_run_r/3` ([`super::specs`]) and the `*_lookup` family
+//! ([`super::nav`]).
 //!
 //! * **`ets:setopts(T, {protection, P})`** — the C also accepts the
 //!   `{protection, private|protected|public}` option (`am_protection` arm of
 //!   `ets_setopts_2`) and changes `ets:info(T, protection)`. `beam_ets::Table`
-//!   exposes `access()` but **no setter**, so this one sub-option is the typed
+//!   exposes `access()` but **no post-creation setter** (`TableOptions::set_access`
+//!   only affects *creation*), so this one sub-option is the typed
 //!   `unsupported_bif` gap (the whole option list is validated first, so a
-//!   `{protection, _}` call leaves the table untouched). Missing API:
-//!   `beam_ets::Table::set_access(Access)` (or a `SetOpt::Protection(Access)`
-//!   variant).
-//! * **`ets:rename/2`** (a `bif.tab` BIF) — the oracle answers the table's tid
-//!   (the new **name atom** for a `named_table`, otherwise the handle it was
-//!   given, i.e. **not** `true`) and rewrites the table's own name field
-//!   (`ets:info(T, name)` reports the new name afterwards; for a `named_table` the
-//!   atom is *removed* from the meta name table, so `whereis(Old)` is `undefined`
-//!   and `whereis(New)` is a fresh tid). `beam_ets::Table` has `name()` but no
-//!   setter. Missing API: `beam_ets::Table::set_name(Option<Atom>)` (the
-//!   `named_table` flag itself stays in `TableOptions`).
-//! * **`ets:select_reverse/1,2,3`** (a `bif.tab` BIF) — a genuine *descending*
-//!   traversal (verified on an `ordered_set`; `ets:select/1` can resume the
-//!   reverse continuation). `beam_ets`'s `select_limit`/`select_continue` and its
-//!   `MatchContinuation` are forward-only (`SelectKind::Reverse` exists in the
-//!   exec engine but no traversal uses it), so the descending order could only be
-//!   fabricated. Missing API: a reverse family, e.g.
-//!   `Table::select_reverse_limit(&MatchSpec, usize, &AtomTable, &mut Heap) ->
-//!   Result<(Vec<Eterm>, Option<MatchContinuation>)>` **plus**
-//!   `Table::select_reverse_continue(&MatchContinuation, …)` and a reverse-capable
-//!   `MatchContinuation` so `ets:select/1` resumes it.
-//! * **`ets:match_spec_run_r/3`** (a `bif.tab` BIF) — the oracle agrees with
-//!   `ets:match_spec_run/2` per element but **prepends** each produced value to the
-//!   accumulator, preserving the accumulator's tail
-//!   (`run_r([1,2], Spec, Acc)` ⇒ `[2,1|Acc]`; `[]` ⇒ `Acc`; `badarg` for an
-//!   improper list, a non-list, a raw clause list or a non-reference spec). That
-//!   is `ets_match_spec_run_r_3` (`erl_db.c:4610`), a pure loop over the existing
-//!   `beam_ets::match_spec_run` results. Missing API:
-//!   `beam_ets::match_spec_run_r(list: Eterm, spec: Eterm, acc: Eterm,
-//!   atoms: &AtomTable, heap: &mut Heap) -> Result<Eterm>` (build the reversed
-//!   prefix on the caller heap, then reuse the accumulator's tail).
+//!   `{protection, _}` call leaves the table untouched). The missing API is
+//!   `beam_ets::Table::set_access(&mut self, Access)` — or a `SetOpt::Access(Access)`
+//!   variant handled by `Table::setopts` — carrying the same **owner write gate**
+//!   `Table::setopts` already applies (the caller must be the table's owner; the C
+//!   is `ets_setopts_2`'s `DB_WRITE` acquisition plus its owner test). Until such a
+//!   setter exists there is no way to change the protection without fabricating it.
 //! * **`ets:fun2ms/1`** (a stdlib function) — it needs the *literal* fun written
 //!   at the call site (`ms_transform:transform_from_shell/3` → `erl_eval:fun_data/1`
 //!   → `erl_parse`'s abstract format). A [`BifFn`](crate::registry::BifFn) is a
@@ -110,19 +108,10 @@
 //! * **`ets:slot/2`** — the objects of an internal B-tree node / hash bucket. The
 //!   workspace contract (§2) explicitly leaves the interior layout open, so the
 //!   value is interior-specific and cannot be reproduced faithfully.
-//! * **`ets:first_lookup/1`**, **`ets:last_lookup/1`**, **`ets:next_lookup/2`**,
-//!   **`ets:prev_lookup/2`** — the paired *value* traversal
-//!   (`{Key, Objects}` per step) of the C's key lookup. They are interior steps,
-//!   not the documented surface: `first_lookup`/`next_lookup` hand out internal
-//!   bucket contents, and [`super::extra`] documents the gap. (`ets:foldl/3` and
-//!   `ets:foldr/3` above reach the same objects through the registered
-//!   `ets:first/1`+`ets:next/2`+`ets:lookup/2` primitives instead, which is why
-//!   they *are* servable.)
-//! * **`ets:internal_request_all/0`**, **`internal_delete_all/2`**,
-//!   **`internal_select_delete/2`** — underscore-internal C helpers: the first
-//!   answers this scheduler's *fan-in reference* (`#Ref<…>`), and the other two
-//!   hand out table internals (`internal_delete_all/2` returns the tiny count the
-//!   C uses for reds accounting). Implementation-specific, not the documented API.
+//! * **`ets:internal_request_all/0`** — an underscore-internal C helper: it answers
+//!   this scheduler's *fan-in reference* (`#Ref<…>`), an implementation-specific
+//!   value, not part of the documented API. (`internal_delete_all/2` and
+//!   `internal_select_delete/2` are implemented in [`super::extra`].)
 //!
 //! # Runtime handoffs (not this crate's to do)
 //!

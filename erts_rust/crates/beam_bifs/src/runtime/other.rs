@@ -18,34 +18,28 @@
 //
 // %CopyrightEnd%
 
-//! The remaining runtime-coupled families (the ETS C interior, `re`, `erl_ddll`, distribution, ...).
+//! The remaining runtime-coupled families (`erl_debugger`, `re`, `erl_ddll`, `code`, ...).
 //!
 //! Every key here is a declared `bif.tab` entry whose implementation needs host
-//! machinery this crate does not own: PCRE (`re`), a driver loader (`erl_ddll`),
-//! resource objects (`atomics`), the code-coverage bookkeeping (`code`), the ETS
-//! C interior (`ets`) and the tracing/literal-area distribution internals. Each is
-//! registered through the single [`RuntimeHooks`](crate::context::RuntimeHooks)
-//! seam, so a call answers the typed `unsupported_bif` capability gap until the
-//! runtime installs a hook -- never `undef`, never a fabricated value.
+//! machinery this crate does not own: the interpreter-level debugger tools
+//! (`erl_debugger`), PCRE (`re`), the live driver registry (`erl_ddll`), the
+//! code-coverage bookkeeping (`code`), the `ets` scheduler fan-in
+//! (`internal_request_all/0`) and C-interior slot walk (`slot/2`), the
+//! tracing-state cleanup and literal-area copy protocols, and the `prim_file` NFC
+//! normalizer, `os` signal handling, `net_kernel` distribution flag and
+//! `error_logger` category map. Each is registered through the single
+//! [`RuntimeHooks`](crate::context::RuntimeHooks) seam, so a call answers the typed
+//! `unsupported_bif` capability gap until the runtime installs a hook -- never
+//! `undef`, never a fabricated value.
 
 use crate::registry::BifRegistry;
 
 /// Registers this family's BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
-    // `ets` -- the C interior surface (the C-only lookups, the reverse scan,
-    // the unmodelled `rename` name setter and the raw match-spec run).
-    crate::runtime::runtime_bif!(reg, "ets", first_lookup, 1);
-    crate::runtime::runtime_bif!(reg, "ets", internal_delete_all, 2);
+    // `ets` -- the C-only `slot/2` interior walk and the scheduler fan-in
+    // `internal_request_all/0`; every other `ets:*` key the C interior used to
+    // stand in for now has a real implementation in `src/ets/`.
     crate::runtime::runtime_bif!(reg, "ets", internal_request_all, 0);
-    crate::runtime::runtime_bif!(reg, "ets", internal_select_delete, 2);
-    crate::runtime::runtime_bif!(reg, "ets", last_lookup, 1);
-    crate::runtime::runtime_bif!(reg, "ets", match_spec_run_r, 3);
-    crate::runtime::runtime_bif!(reg, "ets", next_lookup, 2);
-    crate::runtime::runtime_bif!(reg, "ets", prev_lookup, 2);
-    crate::runtime::runtime_bif!(reg, "ets", rename, 2);
-    crate::runtime::runtime_bif!(reg, "ets", select_reverse, 1);
-    crate::runtime::runtime_bif!(reg, "ets", select_reverse, 2);
-    crate::runtime::runtime_bif!(reg, "ets", select_reverse, 3);
     crate::runtime::runtime_bif!(reg, "ets", slot, 2);
 
     // `erl_debugger` -- the interpreter-level debugger tools.
@@ -73,9 +67,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "re", run, 3);
     crate::runtime::runtime_bif!(reg, "re", version, 0);
 
-    // `erl_ddll` -- the dynamically linked driver loader.
+    // `erl_ddll` -- the dynamically linked driver loader. `format_error_int/1` is
+    // the one self-contained key and is implemented for real in `src/runtime/ddll.rs`.
     crate::runtime::runtime_bif!(reg, "erl_ddll", demonitor, 1);
-    crate::runtime::runtime_bif!(reg, "erl_ddll", format_error_int, 1);
     crate::runtime::runtime_bif!(reg, "erl_ddll", info, 2);
     crate::runtime::runtime_bif!(reg, "erl_ddll", loaded_drivers, 0);
     crate::runtime::runtime_bif!(reg, "erl_ddll", monitor, 2);
@@ -90,15 +84,6 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "code", get_debug_info, 1);
     crate::runtime::runtime_bif!(reg, "code", reset_coverage, 1);
     crate::runtime::runtime_bif!(reg, "code", set_coverage_mode, 1);
-
-    // `atomics` -- the fixed-width atomic resource objects.
-    crate::runtime::runtime_bif!(reg, "atomics", add, 3);
-    crate::runtime::runtime_bif!(reg, "atomics", add_get, 3);
-    crate::runtime::runtime_bif!(reg, "atomics", compare_exchange, 4);
-    crate::runtime::runtime_bif!(reg, "atomics", exchange, 3);
-    crate::runtime::runtime_bif!(reg, "atomics", get, 2);
-    crate::runtime::runtime_bif!(reg, "atomics", info, 1);
-    crate::runtime::runtime_bif!(reg, "atomics", put, 3);
 
     // `erts_trace_cleaner` -- the trace-state cleanup signal machinery.
     crate::runtime::runtime_bif!(reg, "erts_trace_cleaner", check, 0);
@@ -138,8 +123,7 @@ mod tests {
         let mut reg = BifRegistry::new();
         super::register(&mut reg);
         assert!(reg.contains("re", "run", 3));
-        assert!(reg.contains("atomics", "get", 2));
-        assert!(reg.contains("ets", "rename", 2));
+        assert!(reg.contains("ets", "slot", 2));
 
         let mut heap = Heap::new(8).expect("test heap");
         let atoms = AtomTable::new();
