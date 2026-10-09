@@ -171,16 +171,16 @@ re-basing, and `beam_bifs` per-object `hp` re-fetch.
 `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1.
 
 ## Cross-node handoff detail
-* **`beam_process` / `beam_message` split borrow.** `beam_message::send_fragmented` wants the receiver's
-  **heap** and **mailbox** at once, but `Process` exposes them only through two `&mut self` accessors, so
-  this crate composes the public fragment primitives directly and `MailboxState::remove_at` retains a
-  removed message's `Fragments` so a just-bound payload stays valid; an owning drain for the wake list
-  would delete both. **`Process` needs a split accessor handing out `&mut Heap` *and* `&mut OffHeapTable`
-  together** (today `heap_mut`/`off_heap_mut` are two `&mut self` methods and the fields are private)
-  before `beam_message::Fragments::move_into` can be called at receive — which also needs heap growth,
-  since the fragment payload is larger than the receiver's ungrowable M1 heap. Plus a `!Send`-friendly
-  `SchedulerPool` for SMP adoption (`Runtime` holds `Rc`/`RefCell` tables and `*mut Eterm` heaps, so
-  `beam_process`'s `unsafe impl Send` escape is unavailable here).
+* **`beam_process` / `beam_message` split borrow.** The split accessor exists: `Process::heap_and_off_heap_mut()`
+  (`beam_process/src/process.rs:579`) returns `(&mut Heap, &mut OffHeapTable)` in one borrow, and
+  `Process::heap_and_mailbox_mut()` returns `(&mut Heap, &mut Queue)`, so calling
+  `beam_message::Fragments::move_into` at receive is no longer blocked by borrowing.
+  The remaining blockers for adopting it here are heap growth — the fragment payload is larger than the
+  receiver's ungrowable M1 heap — and an owning drain for the wake list, without which this crate keeps
+  composing the public fragment primitives directly and `MailboxState::remove_at` retains a removed
+  message's `Fragments` so a just-bound payload stays valid.
+  Plus a `!Send`-friendly `SchedulerPool` for SMP adoption (`Runtime` holds `Rc`/`RefCell` tables and
+  `*mut Eterm` heaps, so `beam_process`'s `unsafe impl Send` escape is unavailable here).
 * **`beam_io` / `beam_abi` lifecycle.** Finish the driver-port lifecycle (the `async` default — needs a
   `beam_abi::DriverHost` seam that can fire `ready_async`, since `beam_rt` is `#![deny(unsafe_code)]`;
   `port_control/3` reaching `control`; a delivered `send_term`; `ERL_DRV_USE`'s `stop_select`; a
