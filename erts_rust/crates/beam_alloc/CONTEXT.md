@@ -388,4 +388,21 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
   and `erts_alloc:info/0` are **not** wired yet.
 - **`../../CHANGE.md` entries owed to the repo-root owner:** the type-table inventory, the mseg layer,
   the typed allocator surface, the stats layer, the MBC/coalescing wiring, and the `policy.rs` thresholds.
+- **`beam_engine` / `beam_rt` — the runtime heap-growth adoption (the blocker this crate was asked to
+  unblock):** `ReservedHeap` is implemented and tested here but **no outer crate drives it yet**, so a
+  process heap still cannot grow. The adopting host follows the host-adoption contract in
+  `reserved_heap.rs`'s module docs: on an `AllocKind::Heap` exhaustion call `try_grow(n)`; after
+  `GrewInPlace` retry and re-read `limit()` (never `hp`, which cannot have moved); take the move path
+  **only** on `MoveRequired`, re-basing its roots (`x_regs[0..live]` ++ the Erlang stack, the root set
+  `beam_engine`'s `Machine::{x_mut, fr_mut, stack_mut}` supplies) and the moved region's pointer words
+  by the returned delta. `beam_engine::alloc_words` and the `beam_bifs` allocation sites are the
+  adoption points.
+- **`beam_term` (reported read-only, not fixable from here):** the crate-layer audit of
+  `size_object`/`size_class` found no overflow path (`size_object` accumulates with `saturating_add`
+  and its real failure modes — `TermGraphCyclic`, `TermGraphTooLarge` — already surface as typed
+  `TermError`s). One non-arithmetic caveat was reported for `../beam_term`: for a *forged* header with
+  a huge arity field, `describe_object` builds `Children::Slots { count: arity }` and
+  `push_children` reads `*base.add(i)` for `i in 0..count`, guarded only by the documented "live word"
+  caller invariant (an OOB read/hang, not a wrap) — the `beam_term` owner may want an arity
+  plausibility bound.
 - **`beam_gc`:** expected to replace its own `RefCount` with `pub use beam_alloc::RefCount;`.
