@@ -179,7 +179,7 @@ pub(crate) fn reserve(
 /// metadata has no operand-derived live-X count, and treating every register as live
 /// is always a safe over-approximation for a copying collector.
 #[inline]
-pub(crate) fn reserve_slack(
+pub fn reserve_slack(
     machine: &mut Machine,
     ctx: &mut dyn ExecutionContext,
     n: usize,

@@ -631,7 +631,6 @@ fn binary_bytes_rejects_non_binaries() {
 /// pair tuples and the two list cells) must come out of that one block, which is what
 /// keeps a multi-node build alive under a moving collector.
 #[test]
-#[allow(unsafe_code)]
 fn slack_carves_a_multi_node_graph_out_of_one_reservation() {
     let mut c = ctx();
     let mut machine = Machine::new();
@@ -653,7 +652,6 @@ fn slack_carves_a_multi_node_graph_out_of_one_reservation() {
 }
 
 #[test]
-#[allow(unsafe_code)]
 fn a_carve_region_too_small_for_a_node_is_a_typed_error() {
     let mut c = ctx();
     let mut machine = Machine::new();
