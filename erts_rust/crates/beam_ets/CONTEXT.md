@@ -630,29 +630,29 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/key.rs` → object/key validation (`key_of`, `is_valid_object`, `object_elements`)
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/relinquish/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
-- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors, metadata/ownership accessors, write ops, access checks, `select_all`, module wiring
-- `src/table/read.rs` → the read/navigation `impl Table`
+- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors, metadata/ownership accessors (incl. the live `access` field + `set_access`), write ops, access checks, `select_all`, module wiring
+- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`)
 - `src/table/rename.rs` → `Table::rename` + `RenameOutcome` (`ets:rename/2` semantics)
 - `src/table/shared.rs` → `SharedTable` (the locked handle) + its unit tests
-- `src/table/view/mod.rs`, `view/read.rs`, `view/write.rs`, `view/term.rs`, `view/iter.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence) + the view-borrowed traversal API (iterators / `foldl` / `foldr` / `tab2list_into`)
+- `src/table/view/mod.rs`, `view/read.rs`, `view/write.rs`, `view/term.rs`, `view/iter.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence, incl. `TableWrite::set_access`) + the view-borrowed traversal API (iterators / `foldl` / `foldr` / `tab2list_into`)
 - `src/table/view/tests.rs` → the view-layer unit tests (incl. the aliasing evidence)
 - `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior`
-- `src/table/access.rs` → `TableAccess` (access-enforcing view)
-- `src/table/ownership.rs` → `Heir`/`SetOpt`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`, the `give_away`/`setopts` semantics + the pid-gap docs
+- `src/table/access.rs` → `TableAccess` (access-enforcing view, incl. `set_access`)
+- `src/table/ownership.rs` → `Heir`/`SetOpt` (incl. `Access(Access)`), the owner-gated `Table::setopts`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`, the `give_away` semantics + the pid-gap docs
 - `src/table/lifecycle.rs` → `OwnerDeath` + `Table::owner_died`
 - `src/table/element.rs` → the table-level `update_counter`/`update_element` operations
 - `src/table/update.rs` → the counter/element operand machinery (shared with the interiors)
 - `src/champ_interior.rs` → `ChampInterior` (CHAMP index) — the **default `set`** interior
-- `src/hash_interior.rs` → `HashInterior` (chained index) for `bag`/`duplicate_bag` (and opt-in `set`)
+- `src/hash_interior.rs` → `HashInterior` (chained index) for `bag`/`duplicate_bag` (and opt-in `set`), `with_keypos` key re-anchoring
 - `src/interior_parity.rs` → cross-interior equivalence + default-selection tests (`#[cfg(test)]`)
 - `src/interior_bench.rs` → the interior microbenchmarks (`#[cfg(test)]`)
-- `src/ordered_interior/{mod,sorted,node,tree,iter}.rs` → the B+-tree `ordered_set` interior, the sorted-`Vec` alternative, the node arena, the tree ops, the iterator
-- `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations
+- `src/ordered_interior/{mod,sorted,node,tree,iter}.rs` → the B+-tree `ordered_set` interior (conditional separator refresh via `InsertStep`, single-descent `insert_new`), the sorted-`Vec` alternative, the node arena, the tree ops, the iterator
+- `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations (`MatchContinuation` carries the table id + registered name + spec + direction + position)
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation/ownership/fixtable/shared/options/rename/reclamation/concurrency), plus `tests/select.rs` and `tests/match_spec_run.rs`
-- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (135 cases)
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/set_access/update/replace/continuation/continuation_direction/ownership/fixtable/shared/options/rename/reclamation/concurrency), plus `tests/select.rs` and `tests/match_spec_run.rs`
+- `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl` (135 cases, 14 battery groups)
 - `ETS_SURFACE.md` → the `ets:*` coverage census + the oracle-probed semantic facts + the runtime-level gaps and the exact API each needs
 - `../../erts/emulator/beam/erl_db.c` / `erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` / `erl_db*.h` → the API, interiors, key/match handling and flags being mirrored (read-only)
 
