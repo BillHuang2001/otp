@@ -633,9 +633,11 @@ still reproduces today's collector exactly.
   default 233-word policy never reaches — so `GcConfig::default()`/`AnyCollector::from_config(default)` still
   build the copying `Collector`. The mark-region path is reached only by a caller that opts in
   (`GcConfig::immix` / `MatureSelection::Explicit`) or configures a large mature generation. No *outer* crate
-  consumes `GcConfig`/`AnyCollector` at all yet (`beam_process` owns a concrete `Collector`;
-  `beam_rt`/`beam_bifs` use neither `AnyCollector` nor `HeapInfo`), so the rule runs only in this crate's
-  tests — the runtime wiring is Stage-5 work.
+  consumes `GcConfig`/`AnyCollector` at all yet, so the strategy rule runs only in this crate's tests: the
+  runtime always builds the concrete copying `Collector` (`beam_process::Process`), which `beam_rt` **does**
+  drive at its heap-admission point (`beam_rt/src/context/gc.rs::ensure_heap` → `Process::collect`), and
+  `beam_rt` **does** use `HeapInfo` (in `system_info`/`process_info(garbage_collection)`). Only the
+  mark-region strategy *dispatch* stays unreached in production — Stage-5 work.
 - **The Immix region grows only by GC replacement, and only when the policy asks.** `ImmixSpace` wraps a
   `beam_alloc::Heap`; it never reallocates in place. A major whose `HeapPolicy::mature_after_fullsweep`
   target differs from the current capacity **relocates** the whole region into a fresh `ImmixSpace`
