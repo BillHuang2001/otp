@@ -15,9 +15,12 @@ Responsibilities (deliberately one node):
 1. **Byte allocation** for anything off the process heap — ETS nodes, code, binaries, carriers
    (`Allocator`/`AllocRef`) — mirroring `erts_alloc(type, size)` / `erts_realloc` / `erts_free` and
    the carrier framework of `../../erts/emulator/beam/erl_alloc_util.c`.
-2. **Term allocation** within a fixed per-process heap (`Heap`) — the *production* bump arena with
-   the geometry of `beam_term::heap::Heap` but never reallocating; growth is by *replacement* (GC),
-   not reallocation.
+2. **Term allocation** inside a per-process term heap — the *production* bump arena the copy engine
+   (`beam_message`) and the collector (`beam_gc`) construct terms in. Two shapes: `Heap`
+   (fixed-capacity; it never reallocates, so growth is by *replacement* (GC), exactly as
+   `beam_term::heap::Heap` does) and `ReservedHeap` (reserves a large address range once, commits a
+   slice of it, and grows by raising the committed limit **in place** — no move — until the
+   reservation itself is exhausted).
 3. **Refcounted off-heap objects** — the shared atomic `RefCount` (`erts_refc_*` semantics) and the
    refcounted off-heap byte buffer `RefcBinary` built on it.
 4. **The `erts_alloc` inventory and its tuning/statistics surface** — the parsed
