@@ -112,7 +112,7 @@ mod tests {
     use crate::registry::BifRegistry;
     use beam_alloc::Heap;
     use beam_process::ProcessId;
-    use beam_term::AtomTable;
+    use beam_term::{AtomTable, Eterm};
 
     /// Every key registered here is reachable and, with no [`RuntimeHooks`] hook
     /// installed, answers the typed capability gap rather than a fabricated value.
@@ -146,6 +146,49 @@ mod tests {
                 assert_eq!(r.reason, beam_common::ExitReason::atom("unsupported_bif"));
             }
             other => panic!("expected unsupported_bif, got {other:?}"),
+        }
+    }
+
+    /// `os:set_signal/2` is a **seam key and nothing more** on this side of the seam.
+    ///
+    /// This node owns the key + the forward: `src/runtime/other.rs` registers it, the
+    /// `RUNTIME_HOOKS_BIFS` roster (the one authoritative set, in `crate::hook_sets`)
+    /// contains it, and the body only calls
+    /// [`BifContext::call_runtime_bif`](crate::context::BifContext::call_runtime_bif).
+    /// With no `RuntimeHooks` installed **every** argument shape — a plausible small-int
+    /// pair *and* a pair of `[]`, which no signal name or disposition could ever be —
+    /// answers the same typed `unsupported_bif`: the key interprets no argument itself
+    /// (never `badarg`), and never fabricates the oracle's `ok`.
+    ///
+    /// The *provider* (the `("os", "set_signal", 2)` arm of `RuntimeHooks::call`, over
+    /// `beam_io::signal::SignalFacility`) lives in `beam_rt`, not here — see the module
+    /// `CONTEXT.md`.
+    #[test]
+    fn os_set_signal_is_a_roster_seam_key_forwarder() {
+        assert!(
+            crate::hook_sets::needs_runtime_hooks("os", "set_signal", 2),
+            "os:set_signal/2 must be in the 195-key RuntimeHooks roster"
+        );
+
+        let mut reg = BifRegistry::new();
+        super::register(&mut reg);
+        assert!(reg.contains("os", "set_signal", 2));
+
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = AtomTable::new();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        for args in [
+            vec![ctx.int(0).expect("small int"); 2],
+            vec![Eterm::default(); 2],
+        ] {
+            match reg.call("os", "set_signal", 2, &mut ctx, &args) {
+                Err(beam_common::BeamError::Raise(r)) => assert_eq!(
+                    r.reason,
+                    beam_common::ExitReason::atom("unsupported_bif"),
+                    "the seam gap, never badarg and never a fabricated `ok`"
+                ),
+                other => panic!("expected unsupported_bif, got {other:?}"),
+            }
         }
     }
 }

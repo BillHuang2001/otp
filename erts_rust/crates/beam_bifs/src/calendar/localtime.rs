@@ -39,8 +39,12 @@
 //! Every `unsafe` block below passes a `libc` time function a fully initialised
 //! local `struct tm` (or a `*mut` to a live `time_t`) and null-checks the returned
 //! pointer before dereferencing it. The `daylight` external is a plain scalar read
-//! after `tzset`, taken under the crate's single-threaded BIF execution model.
+//! taken under the crate's single-threaded BIF execution model; `tzset()` — which
+//! only primes the C library's timezone tables — runs **once per process**
+//! ([`TZ_INIT`], see [`sys_daylight`]).
 #![allow(unsafe_code)]
+
+use std::sync::OnceLock;
 
 use beam_common::{BeamError, Result};
 
@@ -123,15 +127,32 @@ fn gmtime_r_at(clock: libc::time_t) -> Option<Tm> {
     }
 }
 
+/// Guards the **one** `tzset()` a process needs — see [`sys_daylight`].
+static TZ_INIT: OnceLock<()> = OnceLock::new();
+
 /// The C-library `daylight` flag, after ensuring the timezone tables are loaded
 /// (`sys_daylight` / `sys_tzset`, `erts/emulator/sys/unix/sys_time.c`).
+///
+/// The C runs `tzset()` on every read; here it runs **at most once per process**
+/// (`TZ_INIT`), because the timezone tables only need priming once and this crate
+/// never changes `TZ`. The `daylight` scalar itself is then **re-read on every
+/// call**, and must be: glibc's `daylight` is not a pure function of the zone — a
+/// `mktime(3)`/`localtime_r(3)` conversion updates it, and a later `tzset()` does
+/// not recompute it while the timezone file is unchanged. `local_to_utc` branches on
+/// this flag (`if !sys_daylight() { tm.tm_isdst = 0; }`), so freezing the *value* in
+/// a `OnceLock` would change `localtime_to_universaltime/2` results; only the
+/// setup call is cached.
 fn sys_daylight() -> bool {
-    // SAFETY: `tzset` has no preconditions and populates the `daylight` global;
-    // reading a scalar `c_int` takes no reference and is a plain copy.
-    unsafe {
-        tzset();
-        daylight != 0
-    }
+    TZ_INIT.get_or_init(|| {
+        // SAFETY: `tzset` has no preconditions and only primes the C library's
+        // process-global timezone tables.
+        unsafe {
+            tzset();
+        }
+    });
+    // SAFETY: reading a scalar `c_int` takes no reference and is a plain copy.
+    let flag = unsafe { daylight };
+    flag != 0
 }
 
 /// `time(NULL)` then `sys_localtime_r` — the C `get_localtime`/`get_date`/
@@ -214,4 +235,51 @@ pub(crate) fn local_to_utc(t: Tm, isdst: libc::c_int) -> Result<Tm> {
 
     let clock = erl_mktime(&mut tm).ok_or_else(badarg)?;
     gmtime_r_at(clock as libc::time_t).ok_or_else(badarg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sys_daylight` primes the C timezone tables with `tzset()` **once**
+    /// ([`TZ_INIT`]) and then re-reads the `daylight` scalar on every call — the flag
+    /// is observed exactly as an uncached `tzset()` + read would, but without
+    /// repeating the setup.
+    #[test]
+    fn tzset_runs_at_most_once_and_the_flag_is_re_read() {
+        let first = sys_daylight();
+        assert!(
+            TZ_INIT.get().is_some(),
+            "the first call must run the one-time tzset"
+        );
+        assert_eq!(sys_daylight(), first, "the flag reads are consistent");
+        // The `daylight` scalar is shared process state, not a frozen snapshot: a
+        // direct read agrees with the accessor (the cache holds only the setup call).
+        // SAFETY: reading a scalar `c_int` takes no reference and is a plain copy.
+        let fresh = unsafe { daylight != 0 };
+        assert_eq!(first, fresh);
+    }
+
+    /// `local_to_utc` must keep seeing the **current** `daylight` flag: the cache
+    /// covers `tzset()`, not the value, so a `mktime(3)`-driven change to the scalar
+    /// is still observable (this is why caching the `bool` would be wrong).
+    #[test]
+    fn the_flag_is_not_frozen_behind_the_cache() {
+        let _ = sys_daylight();
+        // A conversion like `erl_mktime`'s updates the C library's process-global
+        // `daylight`; whatever it leaves behind, a later `sys_daylight()` reports it.
+        // SAFETY: a zero-initialised `struct tm`; only the fields `mktime` reads are
+        // written, and `mktime` normalises it in place.
+        let mut tm: libc::tm = unsafe { core::mem::zeroed() };
+        tm.tm_year = 2020 - 1900;
+        tm.tm_mon = 5;
+        tm.tm_mday = 1;
+        tm.tm_hour = 12;
+        tm.tm_isdst = -1;
+        // SAFETY: `tm` is a live local `struct tm`.
+        let _ = unsafe { libc::mktime(&mut tm) };
+        // SAFETY: a scalar `c_int` read.
+        let after = unsafe { daylight != 0 };
+        assert_eq!(sys_daylight(), after);
+    }
 }

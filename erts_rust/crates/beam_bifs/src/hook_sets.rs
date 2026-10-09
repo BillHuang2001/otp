@@ -1170,6 +1170,7 @@ mod tests {
             TABLES.len(),
             "the module doc must document every seam table exactly once (documented: {documented:?})"
         );
+        let mut aggregate = 0usize;
         for (name, count) in documented {
             let (_, table, _) = TABLES
                 .iter()
@@ -1183,7 +1184,22 @@ mod tests {
                 "`{name}` is documented as {count} keys but the table holds {}",
                 table.len()
             );
+            aggregate += count;
         }
+        // The doc's own **aggregate** total, pinned so a table added (or an existing
+        // count changed) without updating the roll-up is caught even when every
+        // individual row still matches its table — i.e. the sum is a second,
+        // independent witness of the documented surface's size.
+        assert_eq!(
+            aggregate,
+            TABLES.iter().map(|(_, table, _)| table.len()).sum::<usize>(),
+            "the doc's documented-key total must equal the sum over every exported table"
+        );
+        assert_eq!(
+            aggregate, 264,
+            "the documented seam surface is 264 keys across the 13 tables; a table \
+             added/removed (or resized) without refreshing the module-doc table changes this"
+        );
     }
 
     /// The registration bodies are **pairwise disjoint**: [`BifRegistry::register`]

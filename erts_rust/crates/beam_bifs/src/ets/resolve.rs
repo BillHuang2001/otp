@@ -465,8 +465,9 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_ets::{Table, TableId};
     use beam_term::heap::Heap;
-    use beam_term::{make_atom, NIL};
+    use beam_term::{make_atom, make_small, NIL};
 
     /// A heap big enough for the option lists these tests build.
     fn heap() -> Heap {
@@ -498,6 +499,8 @@ mod tests {
             "read_concurrency",
             "decentralized_counters",
             "debug_hash_fixed_number_of_locks",
+            "heir",
+            "none",
         ]);
         table
     }
@@ -576,5 +579,66 @@ mod tests {
         }
         let parsed = parse(&atoms, &mut heap, &["public", "private"]).expect("accepted");
         assert_eq!(parsed.options.access(), Access::Private);
+    }
+
+    /// A **creation-time** `{heir, Pid, Data}` option installs an heir whose gift
+    /// data is **deep-copied into table-owned storage** (the A.1 copy boundary, the
+    /// C `set_heir`'s `DbTerm`), so the table never aliases the calling process's
+    /// heap; the arity-2 `{heir, Pid}` form owns no storage and carries no gift
+    /// data.
+    #[test]
+    fn a_creation_time_heir_gift_is_deep_copied_into_table_storage() {
+        let atoms = atoms();
+        let mut heap = heap();
+
+        // A boxed gift term on the caller's (process-like) heap.
+        let source = heap
+            .tuple(&[make_small(1), make_small(2), make_small(3)])
+            .expect("a boxed gift");
+        let pid_term = ProcessId::new(1, 0).to_eterm();
+
+        let heir_opt = heap
+            .tuple(&[atom(&atoms, "heir"), pid_term, source])
+            .expect("the {heir, Pid, Data} option");
+        let opts_term = list(&mut heap, &[atom(&atoms, "set"), heir_opt]);
+        let parsed = parse_options(&atoms, opts_term).expect("accepted");
+        let table = Table::new(TableId::next(), parsed.options).expect("a table");
+
+        let stored = table
+            .heir_data()
+            .expect("the arity-3 gift data is installed");
+        assert_ne!(
+            stored.raw(),
+            source.raw(),
+            "the creation-time gift is deep-copied, never aliased into the caller's heap"
+        );
+        assert!(
+            beam_term::compare::eq(stored, source, &atoms),
+            "the table-owned copy is structurally the gift"
+        );
+        assert_eq!(
+            table.heir().map(|heir| heir.owner),
+            Some(owner_of(ProcessId::new(1, 0))),
+            "the heir is the pid the option named"
+        );
+
+        // The arity-2 `{heir, Pid}` form: an heir with **no** gift data (the C's
+        // `THE_NON_VALUE`), which owns no storage.
+        let heir_pid_only = heap
+            .tuple(&[atom(&atoms, "heir"), pid_term])
+            .expect("the {heir, Pid} option");
+        let opts_pid_only = list(&mut heap, &[atom(&atoms, "set"), heir_pid_only]);
+        let parsed = parse_options(&atoms, opts_pid_only).expect("accepted");
+        let table = Table::new(TableId::next(), parsed.options).expect("a table");
+        assert_eq!(
+            table.heir_data(),
+            None,
+            "an arity-2 heir carries no gift data (and inherits in silence)"
+        );
+        assert_eq!(
+            table.heir().map(|heir| heir.owner),
+            Some(owner_of(ProcessId::new(1, 0))),
+            "the arity-2 pid is still installed"
+        );
     }
 }
