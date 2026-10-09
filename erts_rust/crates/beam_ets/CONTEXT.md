@@ -568,9 +568,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `ETS_SURFACE.md` §1–§5 names the owner and the blocker for every one. (`ets:clear/1` and `ets:size/1`
   do not exist in OTP 29, so their absence is correct.) The `/3` limited forms are implemented; their
   opaque continuation terms and the bare-vs-`{Results,'$end_of_table'}` shaping are `beam_bifs`'s.
-  `select_reverse/1,2,3` is now a **crate primitive** (`Table::{select_reverse, select_reverse_limit,
-  select_reverse_continue}` + the read-gated `TableAccess` forms); its **BIF bridge** is still
-  `beam_bifs`'s work (a handoff — see below).
+  `select_reverse/1,2,3` is a crate primitive **and** is adopted by `beam_bifs::ets::reverse` (read-gated)
+  over `Table::{select_reverse, select_reverse_limit, select_reverse_continue}`, sharing the
+  direction-aware continuation dispatch with `ets:select/1`.
 - **`match_spec_run` accepts a RAW spec, unlike the oracle.** The oracle requires
   `ets:match_spec_compile/1` first (a raw clause list is `badarg`); this crate has no compiled-spec
   *term*, so `run.rs` compiles the raw spec and the bridge maps `match_spec_compile/1` onto the compiled
