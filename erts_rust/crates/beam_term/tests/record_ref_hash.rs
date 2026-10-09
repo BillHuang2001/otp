@@ -22,18 +22,43 @@
 //! care beyond the straight transcription:
 //!
 //! * a **native record** must hash bit-exactly — the C mixes the definition's
-//!   cached `hash` word (`erl_term_hashing.c:369-378` / `:1093-1096`), which this
-//!   crate computes from the definition block because `record::write_record` can
-//!   only store a caller-supplied placeholder — and
+//!   cached `hash` word (`erl_term_hashing.c:1082-1111`), which this crate
+//!   computes from the definition block itself ([`compute_record_definition_hash`])
+//!   because `record::write_record` can only store a caller-supplied placeholder —
+//!   and
 //! * an **internal reference** must be REFUSED with the typed
 //!   [`TermError::RefIdentityUnavailable`] (its C hash mixes an id of the node
 //!   container this tree's M1 `Ref` thing does not carry), never hashed to a
 //!   non-oracle value.
 //!
 //! The offline pins keep the record contract verifiable without `erl`; the live
-//! cross-check (skipped loudly when `erl` is absent) reproduces the same records
-//! with `records:create/4`.
+//! cross-check (skipped loudly when `erlc`/`erl` are absent) compiles a real
+//! native-record module with the system `erlc` and runs it.
+//!
+//! ## The oracle corpus is built from a COMPILED module
+//!
+//! Two facts drive the corpus design (both verified against OTP 29 / erts-17.1):
+//!
+//! 1. **A native record needs the `-record #name{...}` syntax.** The legacy
+//!    `-record(name, {...})` form still compiles to a plain TUPLE
+//!    `{name, V0, V1, …}`; only the `#` form is lowered to the OTP-29
+//!    `create_native_record` / `RECORD_SUBTAG` opcodes. Hashing a legacy record is
+//!    therefore just hashing a tuple — a different term with a different value.
+//! 2. **A record's value walk follows the definition's SORTED-key order**, i.e. the
+//!    runtime's **atom-index** order (`record_compare` = `erts_cmp_flatmap_keys`,
+//!    which for atoms is `key_a - key_b`, `erl_utils.h:267-272`), *not* the
+//!    declaration order the definition hash uses. So the record's value is only
+//!    portable across VMs when the keys' atom indices agree — the C itself is
+//!    **not** portable here. The corpus therefore uses keys that are defined in
+//!    `erts/emulator/beam/atom.names` (`x`, `y`, `value`, `name`), which this
+//!    crate's [`AtomTable::from_atom_names`] and the running system ERTS both
+//!    assign from the same file in the same order. (Keys absent from `atom.names`
+//!    — e.g. `a`/`b`/`c` — are inserted in *module-load* order by the oracle and in
+//!    *insertion* order by a hand-built table, so their relative indices, and hence
+//!    the record's hash, can differ; that is an oracle-configuration artifact, not
+//!    a hashing gap.)
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -41,24 +66,23 @@ use beam_term::error::TermError;
 use beam_term::hashing::{compute_record_definition_hash, make_hash, make_hash2};
 use beam_term::heap::Heap;
 use beam_term::prelude::*;
-use beam_term::record::{record_block_words, record_definition, write_record};
+use beam_term::record::{record_block_words, record_definition, record_values, write_record};
 use beam_term::tag::REF_SUBTAG;
 
 /// The ORACLE's atom ordering source, so `false`=0 / `true`=1 exactly as in the
-/// running system ERTS (the record definition hash mixes the `is_exported` atom).
+/// running system ERTS (the record definition hash mixes the `is_exported` atom)
+/// and — crucially — so every key used by the corpus carries the same atom index
+/// the oracle assigns it.
 const ATOM_NAMES: &str = include_str!("../../../../erts/emulator/beam/atom.names");
 
 /// The record corpus: `(module, name, is_exported, fields-in-declaration-order)`.
-/// `fields` are `(atom name, small value)`; the atom table is seeded so that the
-/// record's stored key order matches the oracle (see [`table_for`]).
+/// `fields` are `(atom name, small value)`.
 type Fields = &'static [(&'static str, i64)];
 
 /// The atom table seeding the oracle was verified against for the given record:
-/// the standard `atom.names` order, then the module/name, then — for the `a`/`b`/`c`
-/// case — the keys in the order the oracle stored them. (`AtomTable::hvalue` is
-/// name-derived, so the value is index-independent; only `records:create/4`'s
-/// stored key order depends on the construction order, and the seeds below are the
-/// ones that reproduce it.)
+/// the standard `atom.names` order, then the module/name. All corpus *keys* are
+/// drawn from `atom.names`, so re-interning them here is a no-op and both tables
+/// agree on their indices (see the module docs).
 fn table_for(module: &str, name: &str, fields: Fields) -> AtomTable {
     let mut t = AtomTable::from_atom_names(ATOM_NAMES).expect("atom.names");
     assert_eq!(t.lookup("false"), Some(Atom::from_raw(0)));
@@ -67,8 +91,8 @@ fn table_for(module: &str, name: &str, fields: Fields) -> AtomTable {
         t.intern(n);
     }
     for (k, _) in fields {
-        // `x`/`y` are already in `atom.names`; re-interning a present name is a
-        // no-op, so this is correct either way.
+        // Every corpus key is already in `atom.names`; re-interning a present name
+        // is a no-op, so this is correct either way.
         t.intern(k);
     }
     t
@@ -130,54 +154,108 @@ fn build_record(
     }
 }
 
-/// The offline pins: the exact oracle values for two records (verified against
-/// `records:create/4` on OTP 29 / erts-17.1).
+/// The two oracle-verified records the fixture module below also builds.
+///
+/// `(module, name, fields)`. Record `#s{x, value, name}` is deliberately declared
+/// in an order that is NOT the atoms' index order (`name` = 455, `value` = 756,
+/// `x` = 767 in `atom.names`), so the stored value order differs from the
+/// declaration order and the walk order is actually exercised.
+const R2: (&str, &str, Fields) = ("recprobe", "r", &[("x", 1), ("y", 2)]);
+const R3: (&str, &str, Fields) = (
+    "recprobe",
+    "s",
+    &[("x", 1), ("value", 2), ("name", 3)],
+);
+
+/// The offline pins: the exact oracle values for the two corpus records (verified
+/// on OTP 29 / erts-17.1 against the compiled fixture in `oracle_agrees_...`).
+///
+/// `(make_hash2, make_hash, definition_hash)`.
+const R2_PIN: (u32, u32, u32) = (1_808_676_500, 3_043_701_549, 213_562_295);
+const R3_PIN: (u32, u32, u32) = (1_972_919_111, 746_198_781, 975_688_124);
+
+/// Both corpus records hash to the exact oracle integers, and the definition hash
+/// they mix is the real one (not the stored placeholder).
 #[test]
 fn native_record_hashes_pin_the_oracle_vectors() {
-    // The port must IGNORE the definition-`hash` word `record::write_record` stores
-    // (this tree can only store a placeholder there) and COMPUTE the value from the
-    // definition block instead. So a record whose cached word is a placeholder hashes
-    // exactly like one whose cached word is the computed value -- and the resulting
-    // value agrees with the live oracle (checked in
-    // `oracle_agrees_on_native_record_hashes`).
-    let t = table_for("rec", "r", &[("a", 1), ("b", 2), ("c", 3)]);
-    let mut ha = Heap::new(256);
-    let mut hb = Heap::new(256);
-    let computed = build_record(&mut ha, &t, "rec", "r", false, &[("a", 1), ("b", 2), ("c", 3)]);
+    for (module, name, fields, pin) in [(R2.0, R2.1, R2.2, R2_PIN), (R3.0, R3.1, R3.2, R3_PIN)] {
+        let t = table_for(module, name, fields);
+        let mut heap = Heap::new(512);
+        let r = build_record(&mut heap, &t, module, name, false, fields);
+        // SAFETY: `r` is a live native record.
+        let def = unsafe { record_definition(r).expect("definition") };
+        assert_eq!(
+            make_hash2(r, &t).expect("make_hash2"),
+            pin.0,
+            "make_hash2({module}:{name})"
+        );
+        assert_eq!(
+            make_hash(r, &t).expect("make_hash"),
+            pin.1,
+            "make_hash({module}:{name})"
+        );
+        assert_eq!(
+            compute_record_definition_hash(def, &t).expect("def hash"),
+            pin.2,
+            "definition hash ({module}:{name})"
+        );
+    }
+
+    // The 3-field record is declared (x, value, name); its stored values follow the
+    // atoms' *index* order, so the rounded-out instance is (3, 2, 1) — the exact
+    // sequence the hash walk consumes.
+    let t = table_for(R3.0, R3.1, R3.2);
+    let mut heap = Heap::new(512);
+    let r = build_record(&mut heap, &t, R3.0, R3.1, false, R3.2);
+    // SAFETY: `r` is a live native record with 3 fields.
+    let values = unsafe { record_values(r).expect("values") };
+    assert_eq!(values, &[make_small(3), make_small(2), make_small(1)]);
+}
+
+/// The port must IGNORE the definition-`hash` word `record::write_record` stores
+/// (this tree can only store a placeholder there) and COMPUTE the value from the
+/// definition block instead — the same value the C's cache holds, so a record whose
+/// cached word is a placeholder hashes exactly like one whose cached word is the
+/// computed value.
+#[test]
+fn native_record_hash_ignores_the_stored_definition_hash_word() {
+    let (module, name, fields) = R2;
+    let t = table_for(module, name, fields);
+    let mut ha = Heap::new(512);
+    let mut hb = Heap::new(512);
+    let computed = build_record(&mut ha, &t, module, name, false, fields);
     // SAFETY: `hb` owns the block and outlives the term; `write_record` fills it all.
     let placeholder = unsafe {
-        let hp = hb.alloc_words(record_block_words(3)).unwrap();
+        let hp = hb.alloc_words(record_block_words(fields.len())).unwrap();
         write_record(
             hp,
-            t.lookup("rec").unwrap(),
-            t.lookup("r").unwrap(),
+            t.lookup(module).unwrap(),
+            t.lookup(name).unwrap(),
             false,
-            &[
-                (make_atom(t.lookup("a").unwrap()), make_small(1)),
-                (make_atom(t.lookup("b").unwrap()), make_small(2)),
-                (make_atom(t.lookup("c").unwrap()), make_small(3)),
-            ],
+            &fields
+                .iter()
+                .map(|(k, v)| (make_atom(t.lookup(k).unwrap()), make_small(*v)))
+                .collect::<Vec<_>>(),
             make_small(0),
         )
         .unwrap()
     };
     assert_eq!(make_hash2(computed, &t), make_hash2(placeholder, &t));
     assert_eq!(make_hash(computed, &t), make_hash(placeholder, &t));
-    assert!(make_hash2(computed, &t).is_ok());
-    assert!(make_hash(computed, &t).is_ok());
 }
 
 /// A record copy (a different address) hashes equal; a record differing in one
 /// compared field hashes differently.
 #[test]
 fn native_record_hash_is_content_stable() {
-    let t = table_for("rec", "r", &[("a", 1), ("b", 2), ("c", 3)]);
-    let mut h1 = Heap::new(256);
-    let mut h2 = Heap::new(256);
-    let mut h3 = Heap::new(256);
-    let r1 = build_record(&mut h1, &t, "rec", "r", false, &[("a", 1), ("b", 2), ("c", 3)]);
-    let r2 = build_record(&mut h2, &t, "rec", "r", false, &[("a", 1), ("b", 2), ("c", 3)]);
-    let r3 = build_record(&mut h3, &t, "rec", "r", false, &[("a", 1), ("b", 2), ("c", 4)]);
+    let (module, name, fields) = R2;
+    let t = table_for(module, name, fields);
+    let mut h1 = Heap::new(512);
+    let mut h2 = Heap::new(512);
+    let mut h3 = Heap::new(512);
+    let r1 = build_record(&mut h1, &t, module, name, false, fields);
+    let r2 = build_record(&mut h2, &t, module, name, false, fields);
+    let r3 = build_record(&mut h3, &t, module, name, false, &[("x", 1), ("y", 9)]);
     assert_ne!(r1.raw(), r2.raw(), "the two copies must be distinct words");
     assert_eq!(make_hash2(r1, &t), make_hash2(r2, &t));
     assert_eq!(make_hash(r1, &t), make_hash(r2, &t));
@@ -188,6 +266,11 @@ fn native_record_hash_is_content_stable() {
 /// An internal reference is a well-formed term the operation cannot faithfully
 /// complete: both ports refuse it with the dedicated typed error (never a wrong
 /// value), while the internal structural `term_hash` is unaffected.
+///
+/// The oracle's `erlang:phash2(make_ref(), 1 bsl 32)` is **environment-dependent**
+/// (the C mixes `internal_ref_numbers(x)[0]`, an id of the running node's container
+/// — `erl_term_hashing.c:1454-1458`), so it is deliberately NOT pinned; the
+/// contract asserted here is the typed refusal.
 #[test]
 fn internal_reference_is_refused_by_both_ports() {
     let mut t = AtomTable::new();
@@ -212,9 +295,153 @@ fn internal_reference_is_refused_by_both_ports() {
     assert_eq!(make_hash(tup, &t), Err(TermError::RefIdentityUnavailable));
 }
 
+// ---------------------------------------------------------------------------
+// Live oracle cross-check (compiled native-record fixture).
+// ---------------------------------------------------------------------------
+
+/// The compiled-module fixture. NOTE the `-record #r{...}` syntax (see the module
+/// docs): the legacy `-record(r, {...})` form would compile to a plain tuple.
+///
+/// `erlang:phash(T, 1 bsl 32)` is `make_hash(T) + 1` (`bif.c:5413-5452`), so the
+/// fixture reports `phash - 1`.
+const FIXTURE_SRC: &str = "\
+-module(recprobe).
+-export([r2/0, r3/0]).
+-record #r{x, y}.
+-record #s{x, value, name}.
+r2() -> T = (#r{x=1, y=2}), {erlang:phash2(T, 1 bsl 32), erlang:phash(T, 1 bsl 32) - 1}.
+r3() -> T = (#s{x=1, value=2, name=3}), {erlang:phash2(T, 1 bsl 32), erlang:phash(T, 1 bsl 32) - 1}.
+";
+
+/// `(r2_h2, r2_h, r3_h2, r3_h)` as reported by the compiled fixture.
+struct OracleFixture {
+    r2_h2: i64,
+    r2_h: i64,
+    r3_h2: i64,
+    r3_h: i64,
+}
+
+/// Compiles [`FIXTURE_SRC`] with the system `erlc` and runs it with the system
+/// `erl`, returning the four reported hashes — or `None` (with a loud
+/// `eprintln!`) when `erlc`/`erl` are absent or the fixture cannot be built/run.
+fn oracle_fixture() -> Option<OracleFixture> {
+    let dir: PathBuf = std::env::temp_dir().join(format!(
+        "beam_term_recprobe_fixture_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("skipping oracle check: could not create {}: {e}", dir.display());
+        return None;
+    }
+    let src = dir.join("recprobe.erl");
+    if let Err(e) = std::fs::write(&src, FIXTURE_SRC) {
+        eprintln!("skipping oracle check: could not write {}: {e}", src.display());
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+
+    let compiled = match Command::new("erlc")
+        .args(["-o"])
+        .arg(&dir)
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skipping oracle check: could not spawn `erlc`: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+    };
+    if !compiled.success() {
+        eprintln!("skipping oracle check: `erlc` failed to build the fixture");
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+
+    // `code:add_path/1` (not `erl -pa`) — `-pa` is unusable in this sandbox.
+    let path = dir.to_str().expect("fixture path is UTF-8").to_string();
+    let out = erl_stdout(&format!(
+        "code:add_path(\"{path}\"), \
+         io:format(\"~w|~w|~w|~w\", \
+                   [element(1, recprobe:r2()), element(2, recprobe:r2()), \
+                    element(1, recprobe:r3()), element(2, recprobe:r3())])"
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = out?;
+
+    let mut fields = out.split('|');
+    let mut next = |what: &str| -> Option<i64> {
+        fields
+            .next()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .or_else(|| {
+                eprintln!("skipping oracle check: unparsable {what} in {out:?}");
+                None
+            })
+    };
+    Some(OracleFixture {
+        r2_h2: next("r2 make_hash2")?,
+        r2_h: next("r2 make_hash")?,
+        r3_h2: next("r3 make_hash2")?,
+        r3_h: next("r3 make_hash")?,
+    })
+}
+
+/// The LIVE oracle cross-check: the same two native records, built here with
+/// `record::write_record`, are built in the oracle by a **compiled module**
+/// (`-record #r{...}`, the only form the compiler lowers to native records) and
+/// both `make_hash2` (`phash2(T, 1 bsl 32)`) and `make_hash`
+/// (`phash(T, 1 bsl 32) - 1`) must agree — with the offline pins too.
+#[test]
+fn oracle_agrees_on_native_record_hashes() {
+    let Some(fx) = oracle_fixture() else {
+        return;
+    };
+    let r2 = (fx.r2_h2, fx.r2_h, R2_PIN.0, R2_PIN.1);
+    let r3 = (fx.r3_h2, fx.r3_h, R3_PIN.0, R3_PIN.1);
+    assert_eq!(
+        (r2.0, r2.1),
+        (i64::from(r2.2), i64::from(r2.3)),
+        "the offline pin for {}:{} went stale against the oracle",
+        R2.0,
+        R2.1
+    );
+    assert_eq!(
+        (r3.0, r3.1),
+        (i64::from(r3.2), i64::from(r3.3)),
+        "the offline pin for {}:{} went stale against the oracle",
+        R3.0,
+        R3.1
+    );
+
+    for (module, name, fields, oracle) in [
+        (R2.0, R2.1, R2.2, (fx.r2_h2, fx.r2_h)),
+        (R3.0, R3.1, R3.2, (fx.r3_h2, fx.r3_h)),
+    ] {
+        let t = table_for(module, name, fields);
+        let mut heap = Heap::new(512);
+        let r = build_record(&mut heap, &t, module, name, false, fields);
+        assert_eq!(
+            i64::from(make_hash2(r, &t).expect("make_hash2")),
+            oracle.0,
+            "erlang:phash2(T, 1 bsl 32) must equal make_hash2(T) for {module}:{name}"
+        );
+        assert_eq!(
+            i64::from(make_hash(r, &t).expect("make_hash")),
+            oracle.1,
+            "erlang:phash(T, 1 bsl 32) - 1 must equal make_hash(T) for {module}:{name}"
+        );
+    }
+}
+
 /// Runs `expr` under `erl -noshell -eval` and returns its stdout (trimmed), or
 /// `None` — with a loud `eprintln!` — when `erl` is absent or does not answer in
-/// time (the crate's usual "skip loudly" pattern).
+/// time (the crate's usual "skip loudly" pattern). The trailing `halt(0)` is
+/// appended here.
 fn erl_stdout(expr: &str) -> Option<String> {
     let code = format!("{}, halt(0).", expr.trim().trim_end_matches('.'));
     let mut child = match Command::new("erl")
@@ -229,7 +456,7 @@ fn erl_stdout(expr: &str) -> Option<String> {
             return None;
         }
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -238,7 +465,7 @@ fn erl_stdout(expr: &str) -> Option<String> {
             }
             Ok(None) => {
                 let _ = child.kill();
-                eprintln!("skipping oracle check: `erl` did not answer within 30s");
+                eprintln!("skipping oracle check: `erl` did not answer within 60s");
                 return None;
             }
             Err(e) => {
@@ -254,61 +481,4 @@ fn erl_stdout(expr: &str) -> Option<String> {
         return None;
     }
     Some(text)
-}
-
-/// The LIVE oracle cross-check: the same two records, built here with
-/// `record::write_record`, are built in the oracle with `records:create/4` and
-/// both `make_hash2` (`phash2(T, 1 bsl 32)`) and `make_hash`
-/// (`phash(T, 1 bsl 32) - 1`) must agree.
-///
-/// NOTE: the oracle's stored definition-key order for atoms *not* in `atom.names`
-/// (here `a`/`b`/`c`) is parse-time and its `phash2` can in principle be
-/// run-dependent; [`table_for`] is the seeding configuration that was verified to
-/// match. An internal `make_ref/0` reference hashes to an environment-dependent
-/// value (it embeds the node container of the running node), which is exactly why
-/// the Rust side refuses it — so it is deliberately NOT pinned here.
-#[test]
-fn oracle_agrees_on_native_record_hashes() {
-    let t1 = table_for("rec", "r", &[("a", 1), ("b", 2), ("c", 3)]);
-    let t2 = table_for("other", "s", &[("x", 1), ("y", 2)]);
-    let mut h1 = Heap::new(256);
-    let mut h2 = Heap::new(256);
-    let rec = build_record(&mut h1, &t1, "rec", "r", false, &[("a", 1), ("b", 2), ("c", 3)]);
-    let s = build_record(&mut h2, &t2, "other", "s", false, &[("x", 1), ("y", 2)]);
-
-    let expr = "T1 = records:create(rec, r, [{a,1},{b,2},{c,3}], #{is_exported => false}), \
-                T2 = records:create(other, s, [{x,1},{y,2}], #{is_exported => false}), \
-                io:format(\"~w|~w\", [[erlang:phash2(T, 1 bsl 32) || T <- [T1,T2]], \
-                                     [erlang:phash(T, 1 bsl 32) - 1 || T <- [T1,T2]]]).";
-    let Some(out) = erl_stdout(expr) else {
-        return;
-    };
-    let mut fields = out.split('|');
-    let parse = |s: &str| -> Vec<i64> {
-        s.trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .split(',')
-            .map(|v| v.trim().parse().expect("oracle int"))
-            .collect()
-    };
-    let h2s = parse(fields.next().expect("first field"));
-    let h1s = parse(fields.next().expect("second field"));
-    assert_eq!(h2s.len(), 2, "unexpected oracle output: {out:?}");
-    assert_eq!(
-        h2s,
-        vec![
-            i64::from(make_hash2(rec, &t1).unwrap()),
-            i64::from(make_hash2(s, &t2).unwrap())
-        ],
-        "erlang:phash2(T, 1 bsl 32) must equal make_hash2(T)"
-    );
-    assert_eq!(
-        h1s,
-        vec![
-            i64::from(make_hash(rec, &t1).unwrap()),
-            i64::from(make_hash(s, &t2).unwrap())
-        ],
-        "erlang:phash(T, 1 bsl 32) - 1 must equal make_hash(T)"
-    );
 }
