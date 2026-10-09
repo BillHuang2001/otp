@@ -30,22 +30,27 @@ use super::{
     ctl_error, ctl_ok, ctl_xerror, errno_name, make_tcp_inet, parse_address, socket_fd, InetState,
     PeerClose, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK,
     INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT, INET_REP_OK,
-    INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RDWR, TCP_SHUT_WR,
+    INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 use crate::driver::{Driver, DriverContext, DriverFlags, PortArms};
 use crate::poller::Poller;
 use crate::port::{PortRegistry, PortState};
 use crate::port_task::{PortTaskKind, Readiness};
 use crate::queue::ByteQueue;
-use beam_common::BeamError;
+use beam_common::{BeamError, Result};
 use beam_process::PortId;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::process::Command;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// How long a helper waits for the kernel or the peer before failing the test.
 const WAIT: Duration = Duration::from_secs(5);
+
+/// Wall-clock budget for the `erl` oracle before the affected cross-check is skipped.
+const ERL_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn poller() -> Poller {
     Poller::new().expect("a poll set")
@@ -934,4 +939,509 @@ fn the_option_verbs_on_a_socket_less_port_match_the_oracle() {
         opt_reply(INET_OPT_KEEPALIVE, 0)
     );
     registry.close(&mut poller, id).expect("closes");
+}
+
+// -----------------------------------------------------------------------
+// Half-close, deferred shutdown and the latched peer close
+// -----------------------------------------------------------------------
+
+/// A [`TcpInetDriver`] driven **directly** through a [`DriverContext`] rather than through a
+/// [`PortRegistry`], because the half-close tests need the driver's own fields
+/// (`pending_shutdown`, the registered `interest`, `peer_closed`) and the port's queues — none of
+/// which a [`crate::port::Port`] exposes.
+///
+/// The context is rebuilt for every call: it borrows the rig's fields, and a driver never holds
+/// one across calls anyway (`crate::port::Port` builds one per driver interaction).
+struct Rig {
+    driver: TcpInetDriver,
+    poller: Poller,
+    input: ByteQueue,
+    output: ByteQueue,
+    arms: PortArms,
+}
+
+impl Rig {
+    /// Wraps `driver` in a fresh poll set and a pair of empty port queues.
+    fn new(driver: TcpInetDriver) -> Rig {
+        Rig {
+            driver,
+            poller: poller(),
+            input: ByteQueue::new(),
+            output: ByteQueue::new(),
+            arms: PortArms::default(),
+        }
+    }
+
+    /// Adopts one end of a **connected loopback pair**, starts it, and returns the rig together
+    /// with the peer [`TcpStream`] the test drives.
+    fn connected() -> (Rig, TcpStream) {
+        let listener = loopback_listener();
+        let address = listener.local_addr().expect("an address");
+        let client = TcpStream::connect(address).expect("the peer connects");
+        let (server, _peer) = listener.accept().expect("the driver's end is accepted");
+        let driver = TcpInetDriver::from_socket(duplicate(server.as_raw_fd())).expect("adopts");
+        let mut rig = Rig::new(driver);
+        rig.start().expect("the socket registers");
+        (rig, client)
+    }
+
+    /// [`Driver::start`]: registers the socket with the poll set.
+    ///
+    /// The [`DriverContext`] is built **inline** by each method below rather than returned from a
+    /// `&mut self` helper: such a helper would borrow the whole rig, so the driver could not be
+    /// borrowed at the same time (`crate::port::Port` builds one context per driver interaction
+    /// for the same reason).
+    fn start(&mut self) -> Result<()> {
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut self.poller,
+            &mut self.input,
+            &mut self.output,
+            &mut self.arms,
+        );
+        self.driver.start(&mut ctx)
+    }
+
+    /// One control verb on the driver.
+    fn control(&mut self, command: &str, arg: &[u8]) -> Result<Vec<u8>> {
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut self.poller,
+            &mut self.input,
+            &mut self.output,
+            &mut self.arms,
+        );
+        self.driver.control(&mut ctx, command, arg)
+    }
+
+    /// [`Driver::output`]: drains the port output queue to the socket.
+    fn drain_output(&mut self) -> Result<usize> {
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut self.poller,
+            &mut self.input,
+            &mut self.output,
+            &mut self.arms,
+        );
+        self.driver.output(&mut ctx)
+    }
+
+    /// The bytes the driver has read into the port input queue, consumed.
+    fn take_input(&mut self) -> Vec<u8> {
+        let bytes = self.input.front().to_vec();
+        self.input.consume(bytes.len());
+        bytes
+    }
+
+    /// How many bytes are waiting in the port input queue.
+    fn input_len(&self) -> usize {
+        self.input.len()
+    }
+
+    /// How many bytes are waiting in the port output queue.
+    fn output_len(&self) -> usize {
+        self.output.len()
+    }
+}
+
+/// Offers 256 KiB chunks through the `send` verb until the kernel stops accepting them, so the
+/// remainder stays in the port output queue — the precondition of the C's
+/// `TCP_ADDF_PENDING_SHUT_WR`/`TCP_ADDF_PENDING_SHUT_RDWR` (`inet_drv.c:12362`), and the same
+/// state a short `write(2)` leaves behind. Returns the number of queued bytes.
+fn fill_output_queue(rig: &mut Rig) -> usize {
+    let chunk = vec![b'x'; 256 * 1024];
+    let deadline = Instant::now() + WAIT;
+    while rig.output_len() == 0 {
+        assert!(Instant::now() < deadline, "the kernel accepted every byte");
+        assert_eq!(
+            rig.control("send", &chunk).expect("the send verb"),
+            ctl_ok()
+        );
+    }
+    rig.output_len()
+}
+
+/// **A write-side `shutdown` leaves the connection readable**: the peer's later bytes are still
+/// read into the port input queue.
+///
+/// This is the `gen_tcp:shutdown(S, write)` -> `ok`, `gen_tcp:recv(S, 5)` -> `{ok, <<"hello">>}`
+/// pair the oracle cross-check below pins on the real `inet` stack.
+#[test]
+fn a_half_close_leaves_the_connection_readable() {
+    let (mut rig, mut client) = Rig::connected();
+
+    // Nothing is queued, so `SHUT_WR` takes the C's immediate path: the reply is `[1]` and
+    // nothing is deferred.
+    assert_eq!(
+        rig.control("shutdown", &[TCP_SHUT_WR]).expect("the verb"),
+        ctl_ok()
+    );
+    assert_eq!(
+        rig.driver.pending_shutdown, None,
+        "nothing was queued, so nothing was deferred"
+    );
+    assert!(
+        rig.driver.interest.is_readable(),
+        "the read direction stays armed"
+    );
+
+    // The peer observes the half-close as end-of-file ...
+    client
+        .set_read_timeout(Some(WAIT))
+        .expect("a read timeout");
+    let mut eof = [0u8; 1];
+    assert_eq!(
+        client.read(&mut eof).expect("the peer reads its end-of-file"),
+        0,
+        "a real `shutdown(2)` on the write side reaches the peer as EOF"
+    );
+
+    // ... and the connection is still READABLE: the bytes the peer sends afterwards arrive.
+    client.write_all(b"hello").expect("the peer writes");
+    let deadline = Instant::now() + WAIT;
+    while rig.input_len() < 5 {
+        assert!(Instant::now() < deadline, "the half-closed driver read nothing");
+        assert_eq!(rig.control("recv", b"").expect("the recv verb"), ctl_ok());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(rig.take_input(), b"hello");
+}
+
+/// **A `SHUT_WR` with output still queued is deferred, never dropped** — and it is applied as
+/// soon as the queue drains (the C's `TCP_ADDF_PENDING_SHUT_WR`, applied from the write path).
+#[test]
+fn a_deferred_shutdown_is_applied_when_the_output_queue_drains() {
+    let (mut rig, mut client) = Rig::connected();
+    let queued = fill_output_queue(&mut rig);
+    assert!(queued > 0, "the output queue is stalled");
+
+    // The request is remembered, not dropped, and the reply is still the C's `[1]`.
+    assert_eq!(
+        rig.control("shutdown", &[TCP_SHUT_WR]).expect("the verb"),
+        ctl_ok()
+    );
+    assert_eq!(
+        rig.driver.pending_shutdown,
+        Some(TCP_SHUT_WR),
+        "deferred until the queue drains"
+    );
+    assert_eq!(rig.output_len(), queued, "no queued byte was dropped");
+    assert!(
+        rig.driver.interest.is_writable(),
+        "the stalled write keeps write readiness armed"
+    );
+
+    // The peer reads everything, so the queue drains; *that* is when the deferred `shutdown(2)`
+    // is applied and write readiness is dropped again.
+    let (done_tx, done_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 64 * 1024];
+        let mut total = 0usize;
+        let outcome = loop {
+            match client.read(&mut buf) {
+                Ok(0) => break Ok(total),
+                Ok(n) => total += n,
+                Err(err) => break Err(err),
+            }
+        };
+        let _ = done_tx.send(outcome);
+    });
+
+    let deadline = Instant::now() + WAIT;
+    while rig.output_len() > 0 {
+        assert!(Instant::now() < deadline, "the peer never drained the queue");
+        rig.drain_output().expect("the output callback");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        rig.driver.pending_shutdown, None,
+        "the deferred shutdown was applied on drain"
+    );
+    assert!(rig.driver.interest.is_readable(), "read readiness is kept");
+    assert!(
+        !rig.driver.interest.is_writable(),
+        "write readiness is dropped once the queue drains"
+    );
+
+    // The peer read every byte and then hit end-of-file, which only the real `shutdown(2)`
+    // produces.
+    let total = match done_rx.recv_timeout(WAIT) {
+        Ok(Ok(total)) => total,
+        Ok(Err(err)) => panic!("the peer read failed: {err}"),
+        Err(err) => panic!("the peer never reached end-of-file: {err}"),
+    };
+    assert!(
+        total >= queued,
+        "the peer read at least the queued {queued} bytes, not {total}"
+    );
+    reader.join().expect("the reader thread");
+}
+
+/// **`SHUT_RD` is never deferred**: the read direction has nothing to do with the output queue,
+/// so it is applied at once even while bytes are still queued, leaving them untouched.
+///
+/// The read half really is gone afterwards — a `recv` now finds end-of-file (not `EAGAIN`) and
+/// latches the peer's close, which is how the oracle reports `gen_tcp:shutdown(S, read)` followed
+/// by `gen_tcp:recv(S, 0)` as `ok` then `{error, closed}`.
+#[test]
+fn a_read_side_shutdown_is_never_deferred() {
+    let (mut rig, _client) = Rig::connected();
+    let queued = fill_output_queue(&mut rig);
+    assert!(queued > 0, "the output queue is stalled");
+
+    assert_eq!(
+        rig.control("shutdown", &[TCP_SHUT_RD]).expect("the verb"),
+        ctl_ok()
+    );
+    assert_eq!(
+        rig.driver.pending_shutdown, None,
+        "`SHUT_RD` is never deferred"
+    );
+    assert_eq!(rig.output_len(), queued, "the queued output is untouched");
+
+    assert_eq!(
+        rig.control("recv", b"").expect("the recv verb"),
+        ctl_xerror("closed"),
+        "the read side is shut immediately, so the read finds end-of-file"
+    );
+}
+
+/// **The latched peer close answers `closed` once per direction, then `enotconn` forever** — and
+/// the close **drops** the output that can never reach the peer (the C's `tcp_clear_output`,
+/// `inet_drv.c:12786`).
+#[test]
+fn latching_the_peer_close_drops_the_queued_output_and_answers_closed_once() {
+    let (mut rig, client) = Rig::connected();
+    let queued = fill_output_queue(&mut rig);
+    assert!(queued > 0, "the output queue is stalled");
+
+    // The peer half-closes: the driver's read finds end-of-file, which is what latches the
+    // close. (`Shutdown::Write` keeps the peer reachable, so the driver must see a clean EOF
+    // rather than a reset.)
+    client
+        .shutdown(Shutdown::Write)
+        .expect("the peer ends its write side");
+
+    let deadline = Instant::now() + WAIT;
+    let reply = loop {
+        let reply = rig.control("recv", b"").expect("the recv verb");
+        if reply != ctl_ok() {
+            break reply;
+        }
+        assert!(Instant::now() < deadline, "the close was never observed");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        reply,
+        ctl_xerror("closed"),
+        "the read that found the end-of-file answers `closed` itself"
+    );
+    assert!(rig.driver.peer_closed(), "the accessor the runtime reads");
+    assert_eq!(rig.driver.pending_shutdown, None);
+    assert_eq!(
+        rig.output_len(),
+        0,
+        "the {queued} queued bytes can never reach the peer, so they are dropped"
+    );
+
+    // Each direction owes its one-shot `closed` and then `enotconn`.
+    assert_eq!(
+        rig.control("recv", b"").expect("the recv verb"),
+        ctl_xerror("enotconn")
+    );
+    assert_eq!(
+        rig.control("send", b"x").expect("the send verb"),
+        ctl_xerror("closed")
+    );
+    assert_eq!(
+        rig.control("send", b"x").expect("the send verb"),
+        ctl_xerror("enotconn")
+    );
+}
+
+/// A `shutdown` on a port that is not connected is the C's operational error, for **every**
+/// direction — with no socket at all, and with a socket that simply has no peer.
+#[test]
+fn a_shutdown_on_a_not_connected_port_is_enotconn() {
+    let mut rig = Rig::new(TcpInetDriver::new());
+    rig.start().expect("a socket-less driver registers nothing");
+
+    for how in [TCP_SHUT_RD, TCP_SHUT_WR, TCP_SHUT_RDWR] {
+        assert_eq!(
+            rig.control("shutdown", &[how]).expect("the verb"),
+            ctl_xerror("enotconn"),
+            "`shutdown` with `how` = {how} and no socket"
+        );
+    }
+
+    // A bare `open` leaves a socket in `Open`, which is still not connected.
+    assert_eq!(
+        rig.control("open", &open_arg()).expect("the open verb"),
+        ctl_ok()
+    );
+    assert_eq!(rig.driver.state(), InetState::Open);
+    for how in [TCP_SHUT_RD, TCP_SHUT_WR, TCP_SHUT_RDWR] {
+        assert_eq!(
+            rig.control("shutdown", &[how]).expect("the verb"),
+            ctl_xerror("enotconn"),
+            "`shutdown` with `how` = {how} on an unconnected socket"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
+// The oracle cross-check (skips loudly when `erl` is absent)
+// -----------------------------------------------------------------------
+
+/// Runs `<expr>, halt(0).` under the system `erl` and returns its stdout, or `None` — after
+/// printing a clear skip message — when `erl` cannot be spawned or does not answer within
+/// [`ERL_TIMEOUT`]. A spawned `erl` that exits non-zero is a bug in the expression, so it fails
+/// the test.
+///
+/// A local copy of the helper the `self::opt` suite and `tests/inet.rs` each keep: a
+/// `#[cfg(test)]` module's private helpers are not reachable across those boundaries, and the
+/// crate's convention is to skip loudly rather than fail when the oracle is unavailable.
+fn erl_stdout(expr: &str) -> Option<String> {
+    let code = format!("{expr}, halt(0).");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            Command::new("erl")
+                .arg("-noshell")
+                .arg("-eval")
+                .arg(&code)
+                .output(),
+        );
+    });
+
+    match rx.recv_timeout(ERL_TIMEOUT) {
+        Err(_) => {
+            eprintln!("skipping oracle check: `erl` did not answer within {ERL_TIMEOUT:?}");
+            None
+        }
+        Ok(Err(err)) => {
+            eprintln!("skipping oracle check: could not spawn `erl` ({err}); is Erlang on PATH?");
+            None
+        }
+        Ok(Ok(out)) => {
+            assert!(
+                out.status.success(),
+                "the oracle expression failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+    }
+}
+
+/// The Erlang side of the half-close cross-check: a real `gen_tcp` pair over loopback, the
+/// server's write side shut down, a `gen_tcp:recv` that **still** returns the peer's bytes, the
+/// peer's end-of-file, and then the peer close with the two reasons after it — printed as
+/// `Shut|R1|E|R2|R3`.
+///
+/// `gen_tcp` is used rather than a raw `open_port({spawn_driver, "tcp_inet"})` because the C's
+/// `INET_REQ_ACCEPT` makes a *second* port for the accepted socket (`inet_drv.c:12236`), which the
+/// Erlang side hides; the observable `{ok, Bytes}`/`{error, closed}`/`{error, enotconn}` results
+/// are exactly what this floor's `[1]`/`[0] ++ name` replies encode.
+fn oracle_half_close_expression() -> String {
+    "{ok, L} = gen_tcp:listen(0, [{ip, {127,0,0,1}}, binary, {active, false}]), \
+     {ok, P} = inet:port(L), \
+     {ok, C} = gen_tcp:connect({127,0,0,1}, P, [binary, {active, false}]), \
+     {ok, S} = gen_tcp:accept(L), \
+     Shut = gen_tcp:shutdown(S, write), \
+     ok = gen_tcp:send(C, <<\"hello\">>), \
+     R1 = gen_tcp:recv(S, 5, 5000), \
+     E = gen_tcp:recv(C, 0, 5000), \
+     R2 = gen_tcp:recv(S, 0, 5000), \
+     R3 = gen_tcp:recv(S, 0, 5000), \
+     io:format(\"~p|~p|~p|~p|~p~n\", [Shut, R1, E, R2, R3])"
+        .to_string()
+}
+
+/// The **compatibility gate** for the half-close, the deferred shutdown and the latched peer
+/// close: the same sequence run against the real `inet` stack must produce the results this
+/// driver's replies encode.
+///
+/// The oracle pins that a write-side `shutdown` leaves the socket readable (`{ok, <<"hello">>}`),
+/// that the peer sees it as end-of-file (`{error, closed}`), and that the peer close is reported
+/// as `closed` once and `enotconn` after that.
+#[test]
+fn the_half_close_and_peer_close_semantics_agree_with_the_erl_oracle() {
+    let Some(stdout) = erl_stdout(&oracle_half_close_expression()) else {
+        return; // the oracle is unavailable; the check skipped loudly above
+    };
+    let Some(line) = stdout.lines().find(|line| line.contains('|')) else {
+        panic!("could not parse the oracle reply dump: {stdout:?}");
+    };
+    let oracle: Vec<&str> = line.trim().split('|').collect();
+    eprintln!("oracle half-close sequence: {oracle:?}");
+    assert_eq!(
+        oracle,
+        vec![
+            "ok",
+            "{ok,<<\"hello\">>}",
+            "{error,closed}",
+            "{error,closed}",
+            "{error,enotconn}",
+        ],
+        "the real inet stack's own sequence"
+    );
+
+    // The driver runs the identical sequence, step for step.
+    let (mut rig, mut client) = Rig::connected();
+    client
+        .set_read_timeout(Some(WAIT))
+        .expect("a read timeout");
+
+    // `Shut` — `gen_tcp:shutdown(S, write)` -> `ok` is this floor's `[1]`.
+    assert_eq!(
+        rig.control("shutdown", &[TCP_SHUT_WR]).expect("the verb"),
+        ctl_ok(),
+        "the oracle's `ok`"
+    );
+
+    // `R1` — the socket is still readable, so the peer's bytes arrive: the oracle's
+    // `{ok, <<"hello">>}`.
+    client.write_all(b"hello").expect("the peer writes");
+    let deadline = Instant::now() + WAIT;
+    while rig.input_len() < 5 {
+        assert!(Instant::now() < deadline, "the half-closed driver read nothing");
+        assert_eq!(rig.control("recv", b"").expect("the recv verb"), ctl_ok());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        rig.take_input(),
+        b"hello",
+        "the oracle's `{{ok, <<\"hello\">>}}`"
+    );
+
+    // `E` — the peer observes the half-close as end-of-file: the oracle's `{error, closed}`.
+    // (`gen_tcp` closes its socket when that `recv` reports `closed`, so the peer's end of the
+    // connection is what the driver must observe next.)
+    let mut eof = [0u8; 1];
+    assert_eq!(
+        client.read(&mut eof).expect("the peer reads its end-of-file"),
+        0,
+        "the oracle's `{{error,closed}}` on the peer's next read"
+    );
+
+    // `R2`/`R3` — the peer is gone: `closed` once, then `enotconn`.
+    client
+        .shutdown(Shutdown::Write)
+        .expect("the peer's end of the connection goes away");
+    let deadline = Instant::now() + WAIT;
+    let reply = loop {
+        let reply = rig.control("recv", b"").expect("the recv verb");
+        if reply != ctl_ok() {
+            break reply;
+        }
+        assert!(Instant::now() < deadline, "the close was never observed");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(reply, ctl_xerror("closed"), "the oracle's `{{error,closed}}`");
+    assert_eq!(
+        rig.control("recv", b"").expect("the recv verb"),
+        ctl_xerror("enotconn"),
+        "the oracle's `{{error,enotconn}}`"
+    );
 }
