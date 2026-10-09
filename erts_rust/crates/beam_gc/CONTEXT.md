@@ -298,6 +298,16 @@ live set (10 obj; copying 20 w vs Immix 160 line-w, Immix faster), and large-hea
 (copying 633 obj / 1824 w vs Immix 121 obj / 288 w, 10128 resident line-w). Both strategies find the **same**
 live set (`evacuated + pinned == copied`) and reclaim identical garbage.
 
+`tests/immix_selection_curve.rs` extends the gate to **two further axes** (deterministic counts asserted,
+pauses fastest-of-9 printed only). *Axis 1 — object-size distribution* at a fixed in-place mature size, five
+shapes (cons 2w / small tuple 3w / line tuple 16w / multi tuple 17w / mixed): Immix evacuates only the
+trailing **partial-block** lines, so its moved words are **distribution-invariant at 96 words** for every
+shape while copying's cost tracks the payload (268→2144 words); its resident footprint ranges **1.0×–8.0×**
+copying's and pause immix/copy 1.83×–2.38×. *Axis 2 — configured mature capacity* 128→8192 words at a fixed
+live set (occupancy 62.5%→22.7%): Immix's moved words / footprint / pause are **flat** across the whole range.
+Net: the constant is a **geometry-driven copy-work** break-even (whole-block pinning + line-rounded trailing
+evacuation), insensitive to occupancy and object-size distribution — no point below 2048 words becomes
+favourable, none above becomes unfavourable.
 **Decision — the copying space is the default; GenImmix is a large-live-set regime selected automatically.**
 GenImmix wins the copying work on long-lived data, but every win is paired with a loss: (a) **footprint**
 3.6–8× (line-granular internal fragmentation); (b) **pause** worse wherever it saves work (≈2.4× on the large
