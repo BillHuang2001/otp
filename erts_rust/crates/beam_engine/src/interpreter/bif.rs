@@ -220,28 +220,30 @@ impl Machine {
     /// runs `handle_error` (`emu/bif_instrs.tab:308-314`, `:409-415`); both end in
     /// `next_catch` (`../../erts/emulator/beam/beam_common.c:580-679`), which finds
     /// the innermost live `try`/`catch` handler and continues there. The engine's
-    /// single equivalent entry point is [`Machine::throw_error`].
+    /// single equivalent entry point is [`Machine::throw_with_trace`].
     ///
     /// * **No live catch frame** ([`Machine::catch_frame_depth`] `== 0`) ⇒ the error
-    ///   propagates unchanged (unless it carries a live reason term — see below).
-    /// * **A live catch frame** ⇒ the error's BEAM atom name
-    ///   ([`BeamError::as_atom`]: `badarg`/`badarith`/`badarity`/`badmatch`/
-    ///   `system_limit`/`out_of_memory`) is resolved in the running module's atom
-    ///   table, turned into a reason term and raised with class `error` — the class
-    ///   every BIF failure carries (`BADARG`/`BADARITH`/… are `EXTAG_ERROR`
-    ///   reasons), which is what the handler's `catch error:Reason` clause sees.
+    ///   propagates unchanged (whether it carries a live reason term or not).
+    /// * **A live catch frame** ⇒ the exception is landed in the handler. Its reason
+    ///   atom and class come from the error itself: a reason variant
+    ///   (`badarg`/`badarith`/`badarity`/`badmatch`/`system_limit`/`out_of_memory`)
+    ///   is raised with class `error` — the class every BIF failure carries
+    ///   (`BADARG`/`BADARITH`/… are `EXTAG_ERROR` reasons) — while a
+    ///   [`BeamError::Raise`] whose reason **is an atom** keeps its own class
+    ///   (`error`/`exit`/`throw`: the shape `erlang:throw/1`/`exit/1` and every
+    ///   `beam_bifs`-backed no-clause failure raise). The atom is resolved in the
+    ///   running module's atom table and turned into the `x(1)` reason term.
     /// * An error the engine cannot name as a term propagates unchanged instead: a
-    ///   [`BeamError::Raise`] **without** a live reason slot (its class/reason are
-    ///   carried term-independently and the reason may be
-    ///   [`beam_common::ExitReason::Structured`]), a variant with no BEAM atom
-    ///   ([`BeamError::TermNotFound`], [`BeamError::Io`]), or an atom the running
-    ///   module's atom table does not hold. Substituting a *different* atom would be
-    ///   a wrong result, so the caller's typed error is preferred — a documented
-    ///   Milestone-1 limit (the [`Module`] reaches the interpreter read-only, so a
-    ///   name the compiler never emitted cannot be interned here, unlike the C
-    ///   runtime's global atom table).
+    ///   [`BeamError::Raise`] whose reason is
+    ///   [`beam_common::ExitReason::Structured`] **without** a live reason slot, a
+    ///   variant with no BEAM atom ([`BeamError::TermNotFound`], [`BeamError::Io`]),
+    ///   or an atom the running module's atom table does not hold. Substituting a
+    ///   *different* atom would be a wrong result, so the caller's typed error is
+    ///   preferred — a documented Milestone-1 limit (the [`Module`] reaches the
+    ///   interpreter read-only, so a name the compiler never emitted cannot be
+    ///   interned here, unlike the C runtime's global atom table).
     ///
-    /// A [`BeamError::Raise`] that **does** carry a live reason term
+    /// A [`BeamError::Raise`] that carries a live reason term
     /// ([`beam_common::Raise::live_reason`], payload [`Eterm`]) is an exception
     /// whose reason is a compound term — the shape [`beam_bifs`]-backed BIFs raise
     /// (e.g. `{badmap,M}`/`{badkey,K}`/`{bad_generator,G}`). It is raised through
@@ -270,21 +272,35 @@ impl Machine {
                 return self.throw_with_trace(class, reason, NIL);
             }
         }
-        if self.catch_frame_depth() == 0 || matches!(&error, BeamError::Raise(_)) {
+        // No live catch frame: the error propagates unchanged, carrying whatever
+        // class/reason (and live reason term) it already has.
+        if self.catch_frame_depth() == 0 {
             return Err(error);
         }
-        let Some(name) = error.as_atom() else {
+        // A live catch frame: the exception must be **nameable as a term** to land
+        // in `x(1)`, so its reason atom and class come from the error itself. A
+        // [`BeamError::Raise`] keeps its OWN class — a `throw`/`exit` whose reason
+        // is a bare atom (the shape `erlang:throw/1`/`exit/1` and every
+        // `beam_bifs`-backed no-clause failure raise) is a first-class raise and
+        // must land in the handler exactly like a term-reason raise, never escape
+        // because the reason happens to have no live *term* slot. A reason variant
+        // (`badarg`/`badarith`/…) is always class `error`.
+        let (class, name) = match &error {
+            BeamError::Raise(raise) => (raise.class, raise.reason.as_atom()),
+            other => (ExceptionClass::Error, other.as_atom()),
+        };
+        let Some(name) = name else {
             return Err(error);
         };
         let Some(atom) = module.atom_table.lookup(name) else {
             return Err(error);
         };
         // The class atom a landing installs in `x(3)`; a module that cannot name
-        // `error` leaves it unset and `throw_error` reports its own typed error
-        // rather than substituting a wrong atom.
-        if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
-            self.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+        // the class leaves it unset and `throw_with_trace` reports its own typed
+        // error rather than substituting a wrong atom.
+        if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
+            self.set_class_atom(class, make_atom(class_atom));
         }
-        self.throw_error(make_atom(atom))
+        self.throw_with_trace(class, make_atom(atom), NIL)
     }
 }

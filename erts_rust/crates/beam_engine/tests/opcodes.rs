@@ -2352,10 +2352,11 @@ fn a_bif_raise_pins_the_badmap_badkey_and_bad_generator_terms() {
 }
 
 #[test]
-fn a_raise_without_a_live_reason_slot_still_propagates_unchanged() {
-    // Regression guard: an atom-reason `Raise` (no `live_reason` slot) is NOT
-    // recovered, so it propagates unchanged even with a live catch frame — the
-    // engine does not broaden beyond the live-term case.
+fn an_atom_reason_raise_lands_in_a_live_catch_frame() {
+    // An atom-reason `Raise` (no `live_reason` slot) is a first-class raise: with a
+    // live catch frame it lands like any other, resolved through the running
+    // module's atom table. `try erlang:boom() catch _ -> Reason end` must yield
+    // `badarith` — C's `handle_error` -> `next_catch` runs for every reason shape.
     let (module, entry) = module_with(
         &[("erlang", "boom", 0)],
         &["badarith", "error"],
@@ -2375,17 +2376,15 @@ fn a_raise_without_a_live_reason_slot_still_propagates_unchanged() {
     };
 
     let (result, machine) = run_hooked(&module, entry, &[], atom_raise);
-    match result {
-        Err(BeamError::Raise(raise)) => {
-            assert_eq!(raise.reason.as_atom(), Some("badarith"));
-            assert!(raise.live_reason().is_none());
-        }
-        other => panic!("expected the raise to propagate unchanged, got {other:?}"),
-    }
     assert_eq!(
-        machine.catch_frame_depth(),
-        1,
-        "the handler was never entered"
+        result.map_err(|_| ()),
+        Ok(badarith(&module)),
+        "the atom-reason raise must land in the handler"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module))),
+        "the landed exception is class `error` with the raise's own reason atom"
     );
 }
 
@@ -2727,10 +2726,10 @@ fn a_bif_error_the_module_cannot_name_propagates_unchanged() {
 }
 
 #[test]
-fn an_explicit_raise_error_is_not_folded_into_a_catch_frame() {
-    // A `BeamError::Raise` carries its own class/reason term-independently (the
-    // reason may be `ExitReason::Structured`), so it is not converted here: it
-    // propagates unchanged even with a live catch frame.
+fn an_atom_reason_explicit_raise_lands_in_a_live_catch_frame() {
+    // An explicit `BeamError::Raise` whose reason is a bare atom is a first-class
+    // raise: with a live catch frame it lands in the handler (class from the raise,
+    // reason atom resolved in the module), returning the landed reason `badarith`.
     let (module, entry) = module_with(
         &[("erlang", "boom", 0)],
         &["badarith", "error"],
@@ -2744,13 +2743,19 @@ fn an_explicit_raise_error_is_not_folded_into_a_catch_frame() {
         }]),
     );
 
-    let (result, _machine) = run_hooked(&module, entry, &[], |_m, _f, _a, _args| {
+    let (result, machine) = run_hooked(&module, entry, &[], |_m, _f, _a, _args| {
         Err(BeamError::Raise(beam_common::Raise::error(
             beam_common::ExitReason::atom("badarith"),
         )))
     });
-    assert!(
-        matches!(result, Err(BeamError::Raise(_))),
-        "an explicit raise propagates, got {result:?}"
+    assert_eq!(
+        result.map_err(|_| ()),
+        Ok(badarith(&module)),
+        "an atom-reason raise lands in the handler"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module))),
+        "the landed exception is class `error` with the raise's own reason atom"
     );
 }
