@@ -64,7 +64,7 @@ use beam_process::{
 };
 use beam_term::{atom_val, is_atom, make_atom, make_small, Atom, AtomTable, Eterm};
 
-use crate::boot::bootscript::{self, BootScript};
+use crate::boot::bootscript::{self, BootScript, BootStop};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
@@ -1034,6 +1034,44 @@ impl Runtime {
         let script = bootscript::read(path.as_ref())?;
         bootscript::execute(self, &script)?;
         Ok(script)
+    }
+
+    /// Reads the OTP **boot script** at `path` and executes it, **reporting the exact
+    /// directive the boot stopped at** ([`crate::boot::bootscript::BootStop`]).
+    ///
+    /// This is [`Runtime::boot_from_script`] with the failure's position preserved: on a
+    /// directive that cannot run it hands back a [`BootStop`] carrying the 0-based
+    /// `index`, the script's `total`, the failing `instruction` and the `error`, instead of
+    /// flattening those into the error alone. The two entry points share one execution
+    /// ([`crate::boot::bootscript::execute_reporting`]), so a script's stopping point is
+    /// identical whichever is used.
+    ///
+    /// A failure **before** the first directive — the runtime cannot boot, or `path` is not a
+    /// readable/parseable script — is reported with `index`/`instruction` unset (no directive
+    /// ran), exactly as [`crate::boot::bootscript::execute_reporting`] reports its own
+    /// pre-directive failure.
+    ///
+    /// # Errors
+    ///
+    /// A [`BootStop`] for the first directive that cannot run, or one with `index`/`instruction`
+    /// unset when the runtime cannot boot or the script cannot be read/parsed.
+    pub fn boot_from_script_reporting(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<(), BootStop> {
+        let script = match self.boot_if_needed().and_then(|()| bootscript::read(path.as_ref())) {
+            Ok(script) => script,
+            // No directive ran: the pre-directive failure shape `execute_reporting` uses.
+            Err(error) => {
+                return Err(BootStop {
+                    index: None,
+                    total: 0,
+                    instruction: None,
+                    error,
+                })
+            }
+        };
+        bootscript::execute_reporting(self, &script)
     }
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with
     /// `args` and returns `x(0)`.

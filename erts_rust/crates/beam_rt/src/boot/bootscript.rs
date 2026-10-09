@@ -261,19 +261,44 @@ pub struct BootStop {
 impl BootStop {
     /// A one-line, human-readable summary of the stop: the instruction position, the failing
     /// directive (an `M:F/A` or a `{kernelProcess,Name,…}`) and the error.
+    ///
+    /// The error is rendered by its [`Display`](std::fmt::Display), so a **structured** raise
+    /// reason (the boot chain's `noproc`) shows as `exit <structured reason>`. Use
+    /// [`describe_with`](Self::describe_with) to render the real reason term through a runtime.
     #[must_use]
     pub fn describe(&self) -> String {
+        self.render(&self.error.to_string())
+    }
+
+    /// [`describe`](Self::describe) with the error's **live reason term** rendered through
+    /// `runtime` when it carries one.
+    ///
+    /// A structured raise reason is an opaque term, so [`describe`](Self::describe) can only
+    /// show `exit <structured reason>`. This renders the real term — for the real `start.boot`
+    /// the `{noproc,{gen_server,call,[file_server_2,…]}}` of the failing `c:erlangrc/0` — so a
+    /// report names the failing call. A non-structured error, or a reason the printer itself
+    /// rejects, falls back to [`describe`](Self::describe) unchanged: never an invented reason.
+    #[must_use]
+    pub fn describe_with(&self, runtime: &mut Runtime) -> String {
+        let Some(term) = crate::error::live_reason_term(&self.error) else {
+            return self.describe();
+        };
+        match runtime.format_term_w(term, None) {
+            // `format_term_w` ends the rendering with a newline; `render` supplies its own.
+            Ok(text) => self.render(text.trim_end_matches('\n')),
+            Err(_) => self.describe(),
+        }
+    }
+
+    /// Formats the stop's position and directive around an already-rendered `reason`.
+    fn render(&self, reason: &str) -> String {
         match (self.index, &self.instruction) {
             (Some(index), Some(instruction)) => format!(
-                "boot script stopped at instruction {index}/{}: {}: {}",
+                "boot script stopped at instruction {index}/{}: {}: {reason}",
                 self.total,
-                render_instruction(instruction),
-                self.error
+                render_instruction(instruction)
             ),
-            _ => format!(
-                "boot script failed before its first directive: {}",
-                self.error
-            ),
+            _ => format!("boot script failed before its first directive: {reason}"),
         }
     }
 }
@@ -1100,17 +1125,19 @@ mod tests {
             "instruction {index} ({:?}) must fail with a typed BeamError: {error}",
             script.instructions[index]
         );
-        // Every `primLoad` batch and every `kernelProcess` before the first `apply` now
-        // succeeds, so the stop is at (or, once the kernel processes can do more, after) the
-        // first directive that needs one of them to *answer* — `application:load/1`.
-        assert!(
-            matches!(script.instructions[index], Instruction::Apply { .. }),
-            "the stop must be an `apply` directive, found instruction {index}: {:?}",
+        // Every `primLoad` batch, every `kernelProcess` and both
+        // `{apply,{application,start_boot,…}}` directives succeed, so the stop is the first
+        // directive that needs a **file server** to answer: `{apply,{c,erlangrc,[]}}`.
+        assert_eq!(
+            index, 20,
+            "the stop is `c:erlangrc/0` at instruction 20, found instruction {index}: {:?}",
             script.instructions[index]
         );
         assert!(
-            index >= 16,
-            "the stop must be at or after the application:load/1 apply, found instruction {index}"
+            matches!(&script.instructions[index], Instruction::Apply { mfa }
+                if mfa.module == "c" && mfa.function == "erlangrc" && mfa.args.is_empty()),
+            "the stop must be the `{{apply,{{c,erlangrc,[]}}}}` directive, found {:?}",
+            script.instructions[index]
         );
         // The `primLoad` batches really loaded before the stop.
         for module in ["lists", "gen_server", "application_starter", "argparse", "zstd"] {
@@ -1119,10 +1146,13 @@ mod tests {
                 "{module} must have been loaded before the stop"
             );
         }
-        eprintln!(
-            "note: the real start.boot stops at instruction {index} ({:?}): {error}",
-            script.instructions[index]
-        );
+        let stop = BootStop {
+            index: Some(index),
+            total: script.instructions.len(),
+            instruction: Some(script.instructions[index].clone()),
+            error,
+        };
+        eprintln!("note: {}", stop.describe_with(&mut runtime));
     }
 
     #[test]
@@ -1143,7 +1173,6 @@ mod tests {
         let script = read(path).expect("the real start.boot parses");
         let stop = execute_reporting(&mut runtime, &script)
             .expect_err("the real start.boot cannot fully boot in Milestone 1");
-        eprintln!("note: {}", stop.describe());
         // The unlink in `drive::start_kernel_process` keeps the `application_controller`'s
         // server alive past its directive process's `normal` exit, so it is still registered
         // when a later directive needs it. (`heart` returns without registering and `logger`
@@ -1155,23 +1184,29 @@ mod tests {
             .is_some();
         assert!(
             registered,
-            "the application_controller server must survive its directive process"
+            "the application_controller server must survive its directive process: {}",
+            stop.describe_with(&mut runtime)
         );
         assert_eq!(
             stop.total,
             script.instructions.len(),
             "the report counts every instruction"
         );
-        let index = stop.index.expect("the stop names an instruction");
-        assert!(
-            index >= 16,
-            "the stop must be at or after instruction 16, found {index}"
+        // The exact stop: instruction 20/22, the `{apply,{c,erlangrc,[]}}` directive — the
+        // first one that needs a file server (the absent `file_server_2`) to answer.
+        assert_eq!(
+            stop.index,
+            Some(20),
+            "the boot stops at instruction 20/22: {}",
+            stop.describe_with(&mut runtime)
         );
         assert!(
-            matches!(stop.instruction, Some(Instruction::Apply { .. })),
-            "the stop names an `apply`: {:?}",
-            stop.instruction
+            matches!(&stop.instruction, Some(Instruction::Apply { mfa })
+                if mfa.module == "c" && mfa.function == "erlangrc" && mfa.args.is_empty()),
+            "the stop names `{{apply,{{c,erlangrc,[]}}}}`: {}",
+            stop.describe_with(&mut runtime)
         );
+        eprintln!("note: {}", stop.describe_with(&mut runtime));
     }
     // -----------------------------------------------------------------------
     // A synthetic script, executed end to end
