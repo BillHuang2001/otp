@@ -38,7 +38,7 @@
 //!
 //! # Absence of the oracle is not a failure
 //!
-//! If `erl` is not on `PATH` (or does not answer within [`ERL_TIMEOUT`]) every check **skips
+//! If `erl` is not on `PATH` (or does not answer within [`common::ERL_TIMEOUT`]) every check **skips
 //! loudly** (a clear `eprintln!`) and returns, never failing the suite — `cargo test -p
 //! beam_process` therefore stays green on a host without a system Erlang.
 //!
@@ -48,11 +48,9 @@
 //! `lists:sort/1`): the oracle's order follows its hash array (see the `Dict` module docs for
 //! the documented deviation), which is an orthogonal concern to term equality.
 
-use std::process::Command;
+mod common;
+
 use std::rc::Rc;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use beam_process::prelude::Dict;
 use beam_term::prelude::{
@@ -60,69 +58,12 @@ use beam_term::prelude::{
     write_map, AtomTable, Eterm, Heap, FLOAT_SIZE_WORDS, NIL,
 };
 
-/// Wall-clock budget for a single `erl` invocation before the oracle is declared unusable and
-/// the affected check skips.
-const ERL_TIMEOUT: Duration = Duration::from_secs(30);
+use common::expect_oracle;
 
-// ---------------------------------------------------------------------------
-// The oracle driver (text protocol)
-// ---------------------------------------------------------------------------
-
-/// Runs `<expr>, halt(0).` under the system `erl` and returns its stdout.
-///
-/// Returns `None` — after printing a clear skip message — when `erl` cannot be spawned or does
-/// not answer within [`ERL_TIMEOUT`]. A *spawned* `erl` that exits non-zero is a bug in the
-/// embedded expression, so that is asserted rather than skipped.
-fn erl_stdout(expr: &str) -> Option<String> {
-    let code = format!("{expr}, halt(0).");
-    let (tx, rx) = mpsc::channel();
-    let code_for_thread = code.clone();
-    thread::spawn(move || {
-        let out = Command::new("erl")
-            .arg("-noshell")
-            .arg("-eval")
-            .arg(&code_for_thread)
-            .output();
-        // The receiver may have timed out and gone away; that is fine.
-        let _ = tx.send(out);
-    });
-
-    match rx.recv_timeout(ERL_TIMEOUT) {
-        Err(_) => {
-            eprintln!("skipping oracle check: `erl` did not answer within {ERL_TIMEOUT:?}");
-            None
-        }
-        Ok(Err(e)) => {
-            eprintln!("skipping oracle check: could not spawn `erl` ({e}); is Erlang on PATH?");
-            None
-        }
-        Ok(Ok(out)) => {
-            assert!(
-                out.status.success(),
-                "`erl` exited with {} for expression:\n{code}\nstderr:\n{}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr),
-            );
-            Some(String::from_utf8_lossy(&out.stdout).into_owned())
-        }
-    }
-}
-
-/// Runs `expr` under the oracle and asserts the printed result is `expected`.
-///
-/// Returns `false` (after the driver's loud skip message) when the oracle is unusable, so a
-/// caller can `return` early; an oracle that *answers with something else* is a failure.
-fn expect_oracle(expr: &str, expected: &str) -> bool {
-    let Some(out) = erl_stdout(expr) else {
-        return false;
-    };
-    assert_eq!(
-        out.trim(),
-        expected,
-        "the oracle disagrees with the expected result for:\n{expr}"
-    );
-    true
-}
+// The oracle driver (`ERL_TIMEOUT`, `erl_stdout`, `expect_oracle` and the stdout normalisation) is
+// shared with the crate's other `oracle_*` files; it lives in `tests/common/mod.rs` so the
+// logger-suppression fix exists once. `erl` runs with `-kernel logger_level none` and its stdout is
+// normalised, so a crashed probe helper's run-time error report can never make a comparison flaky.
 
 // ---------------------------------------------------------------------------
 // Term builders (the Rust side of every comparison)

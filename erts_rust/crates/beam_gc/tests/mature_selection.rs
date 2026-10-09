@@ -57,11 +57,17 @@ fn policy(mature_words: usize) -> HeapPolicy {
 /// A policy for the threshold-crossing corpus: a mature generation of exactly the break-even
 /// size, a nursery that holds the whole corpus, and a fullsweep cadence that forces both
 /// minors and majors so both collectors are exercised on both collection kinds.
+///
+/// The nursery is **pinned** (`min_heap_words`) because the bounded
+/// [`HeapPolicy::young_after_collection`] shrinks a nursery a fullsweep leaves empty: the
+/// corpus needs one large, *stable* nursery across every round.
 fn crossing_policy() -> HeapPolicy {
     let objects = IMMIX_BREAK_EVEN_BLOCKS * LINES_PER_BLOCK;
+    let young = objects * LINE_WORDS + 4096;
     HeapPolicy {
         fullsweep_after: 2,
-        initial_young_words: objects * LINE_WORDS + 4096,
+        initial_young_words: young,
+        min_heap_words: young,
         initial_mature_words: IMMIX_BREAK_EVEN_WORDS,
         ..HeapPolicy::default()
     }

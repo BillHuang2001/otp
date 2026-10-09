@@ -229,27 +229,43 @@ fn list(t: Eterm) -> Vec<Eterm> {
 // The live oracle
 // ---------------------------------------------------------------------------
 
-/// Run `expr` under the system `erl` with the fixture's directory on the code
-/// path and return its stdout, or `None` when no `erl` is available.
+/// Run `expr` under the system `erl` with the fixture's directory **appended**
+/// to the code path and return its stdout.
+///
+/// The append flag is `-pz`, never `-pa`: the fixture directory contains
+/// stand-in modules (e.g. `tests/fixtures/lists.beam`) that would **shadow** the
+/// real stdlib once *prepended*, crashing the emulator at boot
+/// (`lists:usort/1` undefined). Appending keeps the real stdlib ahead of the
+/// fixtures.
+///
+/// `None` means no runnable `erl` at all (the caller skips loudly). A spawned
+/// `erl` that exits non-zero is a **harness** failure, not "no oracle" -- it
+/// panics with the captured stderr so a broken oracle can never masquerade as a
+/// silent skip.
 fn oracle(expr: &str) -> Option<String> {
     let dir = std::path::Path::new(TAILCALL_BEAM).parent()?;
     let output = Command::new("erl")
         .arg("-noshell")
-        .arg("-pa")
+        .arg("-pz")
         .arg(dir)
         .arg("-eval")
         .arg(expr)
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    assert!(
+        output.status.success(),
+        "the system `erl` exited {} for `{expr}`\n  stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Cross-check `expected` against the live oracle, or print a loud skip.
 ///
-/// `expr` must print exactly `expected` (with `~p`) and then halt.
+/// `expr` must print exactly `expected` (with `~p`) and then halt. The skip is
+/// only for a **genuine** `None` (no runnable `erl`); a spawned `erl` that exits
+/// non-zero has already panicked inside [`oracle`].
 fn cross_check(expr: &str, expected: &str) {
     match oracle(expr) {
         Some(actual) => assert_eq!(
@@ -301,7 +317,13 @@ fn raising_tail_call_reports_the_bifs_own_reason() {
 
     // The oracle agrees on the observable reason, and it is a bare atom.
     assert!(beam_term::is_atom(reason), "the reason is a bare atom");
-    cross_check("io:format(\"~p\",[catch tailcall:gap(6)]),halt(0).", "unsupported_gap");
+    // `catch` would evaluate to the *whole* `{'EXIT',{unsupported_gap,[...]}}`
+    // term, so the printed value must be the bare reason atom: a `try … catch
+    // error:R -> R end` yields exactly what the engine's raise carries.
+    cross_check(
+        "io:format(\"~p\",[try tailcall:gap(6) catch error:R -> R end]),halt(0).",
+        "unsupported_gap",
+    );
 }
 
 // ---------------------------------------------------------------------------

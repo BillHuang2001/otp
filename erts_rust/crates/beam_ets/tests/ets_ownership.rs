@@ -872,8 +872,9 @@ main(_) ->
 /// The owner-death observations the crate's [`Table::owner_died`] models must match
 /// the live oracle: a live heir inherits (receiving the arity-4 transfer message with
 /// the table id, the dead owner and the gift data) and the heir stays installed; no
-/// heir / a self-heir / a dead heir each drop the table. Skips loudly without an
-/// oracle; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure.
+/// heir / a self-heir / a dead heir each drop the table. The oracle is **required by
+/// default**, so a missing one fails this check rather than skipping it
+/// (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out).
 #[test]
 fn owner_death_observations_match_the_live_oracle() {
     let Some(escript) = oracle::resolve_escript() else {
@@ -978,8 +979,9 @@ keep_alive() -> receive go -> ok end.
 /// `{heir, Pid}` heir inherits the table **silently**, while an arity-3
 /// `{heir, Pid, undefined}` heir receives `{'ETS-TRANSFER', …, undefined}` —
 /// `undefined` is a *value*, the C's `THE_NON_VALUE` is not. Both forms install the
-/// heir and move ownership; only the message differs. Skips loudly without an
-/// oracle; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure.
+/// heir and move ownership; only the message differs. The oracle is **required by
+/// default**, so a missing one fails this check rather than skipping it
+/// (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out).
 #[test]
 fn heir_forms_match_the_live_oracle() {
     let Some(escript) = oracle::resolve_escript() else {

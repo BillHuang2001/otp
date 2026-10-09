@@ -32,12 +32,17 @@
 //! * a process carrying a deferred fatal signal is terminated by the schedule-in step (before it
 //!   ever reaches the runner).
 //!
-//! Driving the scheduler through the port-less `Scheduler::run_slice`/`Scheduler::run_ready`
-//! cannot clean the port side (no handle), so `Scheduler::run_slice_with_ports` /
-//! `Scheduler::run_ready_with_ports` are the adoption an orchestrator that owns both tables
-//! (`beam_rt`) owes. Both halves are pinned below, together with the port-less control that
-//! proves the variant is what adds the cleanup, and with the two wake-absorption paths (after a
-//! slice and on the empty-queue early return) that the port-aware forms must preserve.
+//! A `Scheduler` reaches a port table in one of two ways: it **owns** one
+//! ([`Scheduler::with_ports`]/[`Scheduler::set_ports`]), which the default
+//! `Scheduler::run_slice`/`Scheduler::run_ready` entry points then use; or it is handed one
+//! **explicitly** (`Scheduler::run_slice_with_ports`/`Scheduler::run_ready_with_ports`), in which
+//! case the explicitly passed table **takes precedence** over the owned one for that call. A
+//! scheduler that owns none (`Scheduler::new`/`with_slice`) keeps the port-less behaviour, leaving
+//! the incoming entry dangling. Both halves are pinned below — through the explicit forms *and*
+//! through the default forms on a port-owning scheduler — together with the port-less control that
+//! proves the table is what adds the cleanup, the precedence rule, the owned-table accessors, and
+//! the two wake-absorption paths (after a slice and on the empty-queue early return) that the
+//! port-aware forms must preserve.
 //!
 //! The port-aware slice helpers themselves (`run_one_with_ports`/`slice_begin_with_ports`/
 //! `slice_end_with_ports`) are `pub(crate)` — the SMP-reuse seam, exactly like the port-less
@@ -437,4 +442,201 @@ fn run_slice_with_ports_on_an_empty_queue_absorbs_a_pending_wake() {
         "the empty-queue early return absorbed the pending wake"
     );
     assert!(runner.ran.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The DEFAULT entry points use the scheduler's OWNED port table
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_default_slice_cleans_the_port_monitor_when_the_scheduler_owns_the_table() {
+    let mut fx = Fixture::new();
+    let owner = fx.spawn();
+    let watcher = fx.spawn();
+    let port = fx.port(owner);
+    let reference = fx.watch_port(watcher, port);
+    assert_eq!(fx.assert_watched(watcher, port), reference);
+
+    // Move the port table into the scheduler: the DEFAULT entry points are now port-aware.
+    let Fixture { mut table, ports } = fx;
+    let mut scheduler = Scheduler::with_ports(ports);
+    assert!(scheduler.has_ports());
+
+    scheduler.enqueue(watcher);
+    let mut runner = ExitRunner::new(watcher, make_small(1));
+    let ran = scheduler
+        .run_slice(&mut table, &mut runner)
+        .expect("the runner never fails");
+
+    assert_eq!(ran, Some(watcher), "the slice ran the dequeued pid");
+    assert_eq!(runner.ran, vec![watcher], "exactly one slice");
+    assert!(!table.contains(watcher), "the Exit terminated the watcher");
+    assert!(
+        scheduler
+            .ports()
+            .expect("the scheduler owns the port table")
+            .monitors(port)
+            .is_empty(),
+        "the dead watcher's incoming port monitor is gone through the DEFAULT `run_slice`"
+    );
+}
+
+#[test]
+fn run_ready_cleans_every_death_when_the_scheduler_owns_the_table() {
+    let mut fx = Fixture::new();
+    let owner = fx.spawn();
+    let watcher = fx.spawn();
+    let peer = fx.spawn();
+    let port = fx.port(owner);
+    fx.watch_port(watcher, port);
+
+    let Fixture { mut table, ports } = fx;
+    // `set_ports` on a `with_slice` scheduler keeps the custom budget and adopts the table.
+    let mut scheduler = Scheduler::with_slice(10);
+    scheduler.set_ports(ports);
+    assert!(scheduler.has_ports());
+    scheduler.enqueue(watcher);
+    scheduler.enqueue(peer);
+    let mut runner = ExitRunner::new(watcher, make_small(3));
+    let slices = scheduler
+        .run_ready(&mut table, &mut runner, Some(2))
+        .expect("the runner never fails");
+
+    assert_eq!(slices, 2, "the watcher exited, the peer yielded");
+    assert_eq!(runner.ran, vec![watcher, peer], "FIFO order preserved");
+    assert!(!table.contains(watcher));
+    assert!(table.contains(peer), "the yielding peer survives");
+    assert!(
+        scheduler.ports().expect("owned").monitors(port).is_empty(),
+        "the DEFAULT `run_ready` loop cleaned the port monitor"
+    );
+}
+
+#[test]
+fn a_deferred_fatal_signal_cleans_the_port_monitor_through_the_default_slice() {
+    let mut fx = Fixture::new();
+    let owner = fx.spawn();
+    let target = fx.spawn();
+    let sender = fx.spawn();
+    let port = fx.port(owner);
+    let reference = fx.watch_port(target, port);
+    assert_eq!(fx.assert_watched(target, port), reference);
+
+    // The single scheduler marks the executing process `Running`; a signal sent to it is
+    // therefore deferred (see the crate `CONTEXT.md`, the eager-vs-queued rule).
+    fx.table
+        .get_mut(target)
+        .expect("target")
+        .set_state(ProcessState::Running);
+    fx.table
+        .send_exit(sender, target, make_small(7))
+        .expect("a live target");
+    assert!(fx.table.contains(target), "the signal is deferred");
+
+    let Fixture { mut table, ports } = fx;
+    let mut scheduler = Scheduler::with_ports(ports);
+    scheduler.enqueue(target);
+    // A runner that would run anybody *except* the target: the schedule-in servicing terminates it
+    // first, so the runner is never entered.
+    let mut runner = ExitRunner::new(ProcessId::new(9999, 0), make_small(0));
+    let ran = scheduler
+        .run_slice(&mut table, &mut runner)
+        .expect("the runner never fails");
+
+    assert_eq!(ran, Some(target), "the pid was dequeued before the death");
+    assert!(
+        runner.ran.is_empty(),
+        "the deferred signal terminated it at schedule-in, before the runner was entered"
+    );
+    assert!(!table.contains(target), "the schedule-in servicing killed it");
+    assert!(
+        scheduler.ports().expect("owned").monitors(port).is_empty(),
+        "the DEFAULT `run_slice` schedule-in cascade cleaned the target's incoming port monitor"
+    );
+}
+
+#[test]
+fn an_explicitly_passed_table_takes_precedence_over_the_owned_one() {
+    let mut fx = Fixture::new();
+    let owner = fx.spawn();
+    let watcher = fx.spawn();
+    let port = fx.port(owner);
+    let reference = fx.watch_port(watcher, port);
+    assert_eq!(fx.sole_monitor(port).reference, reference, "the monitor was installed");
+
+    // The scheduler owns a *different* (empty) table; the explicit one is where the monitor lives.
+    let mut scheduler = Scheduler::with_ports(PortTable::new());
+    assert_eq!(scheduler.ports().expect("owned").len(), 0);
+
+    scheduler.enqueue(watcher);
+    let mut runner = ExitRunner::new(watcher, make_small(1));
+    let ran = scheduler
+        .run_slice_with_ports(&mut fx.table, &mut fx.ports, &mut runner)
+        .expect("the runner never fails");
+
+    assert_eq!(ran, Some(watcher));
+    assert!(!fx.table.contains(watcher));
+    assert!(
+        fx.ports.monitors(port).is_empty(),
+        "the explicitly passed table won the cleanup"
+    );
+    assert_eq!(
+        scheduler.ports().expect("owned").len(),
+        0,
+        "the owned table was left untouched"
+    );
+    assert_eq!(
+        scheduler.ports().expect("owned").monitors(port).len(),
+        0,
+        "the owned (empty) table never saw the watcher"
+    );
+}
+
+#[test]
+fn the_owned_port_table_accessors_round_trip() {
+    // `new`/`with_slice` own no table: the default forms stay port-less.
+    let mut scheduler = Scheduler::new();
+    assert!(!scheduler.has_ports());
+    assert!(scheduler.ports().is_none());
+    assert!(scheduler.ports_mut().is_none());
+    assert!(scheduler.take_ports().is_none());
+
+    // `with_ports` installs one.
+    let mut fx = Fixture::new();
+    let owner = fx.spawn();
+    let _first = fx.port(owner);
+    let _second = fx.port(owner);
+    let mut owned_scheduler = Scheduler::with_ports(fx.ports);
+    assert!(owned_scheduler.has_ports());
+    assert_eq!(owned_scheduler.ports().expect("owned").len(), 2);
+
+    // `set_ports` installs/replaces one, on a `with_slice` scheduler too.
+    let mut replacement = PortTable::new();
+    let replacement_port = replacement.alloc_owned(owner).expect("room in the port space");
+    let mut scheduler = Scheduler::with_slice(7);
+    assert_eq!(scheduler.reductions_per_slice(), 7);
+    scheduler.set_ports(replacement);
+    assert_eq!(
+        scheduler.ports().expect("owned").len(),
+        1,
+        "the new table replaced the old one"
+    );
+    assert!(scheduler.ports().expect("owned").contains(replacement_port));
+
+    // `ports_mut` hands out a mutable borrow.
+    scheduler
+        .ports_mut()
+        .expect("owned")
+        .release(replacement_port);
+    assert!(!scheduler.ports().expect("owned").contains(replacement_port));
+
+    // `take_ports` removes the table: the default forms are port-less again.
+    let taken = scheduler.take_ports().expect("there was an owned table");
+    assert_eq!(taken.len(), 0, "the released port left the number space");
+    assert!(!scheduler.has_ports());
+    assert!(scheduler.ports().is_none());
+
+    // The first scheduler still owns its table; taking it empties the slot.
+    assert!(owned_scheduler.take_ports().is_some());
+    assert!(!owned_scheduler.has_ports());
 }

@@ -50,7 +50,9 @@
 //! scaffolding shapes of `tests/external_call.rs`; the resolver passes plain strings,
 //! so no shared [`AtomTable`](beam_loader::Module::atom_table) is needed.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use beam_common::Result;
@@ -229,13 +231,19 @@ type BifFloor = Box<dyn FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm>>;
 ///   message and `receive_reset` repositions at the first.
 /// * `bif` — a pluggable BIF floor (the synchronous `call_ext*` target when the
 ///   seam declines).
+/// * `resolved` — every `(module, function, arity)` the seam **answered `Some`**
+///   for. It is the observable "the callee really ran in this machine" signal: a
+///   seam that silently declined would leave it empty, and the tests that depend
+///   on a live callee module assert it is exactly the call they made.
 struct SeamCtx {
     callees: Vec<(String, Arc<Module>)>,
     messages: Vec<Eterm>,
     scan: usize,
     bif: BifFloor,
+    /// The `(module, function, arity)` triples the seam resolved, in call order.
+    resolved: Vec<(String, String, u32)>,
     /// The term arena the position accessors build `{M,F,A}`/stacktrace terms in —
-    /// the same pointer-stable chunked heap `MinimalContext` serves, delegated so a
+    /// the same pointer-stable region heap `MinimalContext` serves, delegated so a
     /// seam context can hand the term builders words (the trait default is a typed
     /// `unsupported`).
     arena: MinimalContext,
@@ -248,6 +256,7 @@ impl SeamCtx {
             messages: Vec::new(),
             scan: 0,
             bif,
+            resolved: Vec::new(),
             arena: MinimalContext::new(),
         }
     }
@@ -283,18 +292,29 @@ impl ExecutionContext for SeamCtx {
         function: &str,
         arity: u32,
     ) -> Result<Option<(Arc<Module>, Label)>> {
+        // Find the answer first (the `&self.callees` borrow cannot coexist with a
+        // `self.resolved` push), then record it.
+        let mut answer = None;
         for (name, callee) in &self.callees {
             if name != module {
                 continue;
             }
-            let Some(function) = callee.atom_table.lookup(function) else {
+            let Some(symbol) = callee.atom_table.lookup(function) else {
                 continue;
             };
-            if let Some(label) = callee.export(function, arity) {
-                return Ok(Some((Arc::clone(callee), label)));
+            if let Some(label) = callee.export(symbol, arity) {
+                answer = Some((Arc::clone(callee), label));
+                break;
             }
         }
-        Ok(None)
+        match answer {
+            Some(resolved) => {
+                self.resolved
+                    .push((module.to_string(), function.to_string(), arity));
+                Ok(Some(resolved))
+            }
+            None => Ok(None),
+        }
     }
 
     fn receive_next(&mut self) -> Result<Option<Eterm>> {
@@ -399,6 +419,14 @@ fn suspended_in_callee(
     assert!(
         matches!(outcome, RunOutcome::Wait { .. }),
         "the callee's receive must suspend on an empty mailbox, got {outcome:?}"
+    );
+    // The suspension must be a *cross-module* one: the seam has to have answered
+    // `Some` for the exact call `m:run/0` makes. Otherwise the `Wait` above would
+    // be indistinguishable from a run that never left the entry module.
+    assert_eq!(
+        ctx.resolved,
+        vec![("c".to_string(), callee_function.to_string(), 0)],
+        "the seam must have resolved the call, not declined it"
     );
     (callee, caller, run, machine, ctx)
 }
@@ -537,5 +565,60 @@ fn a_run_that_stays_in_the_entry_module_reports_none() {
     assert!(
         machine.current_module().is_none(),
         "a run that never entered a cross-module callee has no callee module"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (d) a callee the seam DECLINES falls through to the synchronous BIF floor
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_declined_callee_falls_through_to_the_synchronous_bif_floor() {
+    // The seam answers by NAME, looked up in the *callee's own* atom table; a
+    // function the callee module does not even intern must make it answer
+    // `Ok(None)` -- "I cannot run this callee in your machine" -- so the
+    // `call_ext*` takes the synchronous `call_bif` path. This pins the decline
+    // branch independently: a resolver that declined *everything* would still
+    // satisfy the accessor tests above only through their `rejecting()` floor,
+    // and a resolver that resolved by name alone (ignoring the callee's atom
+    // table) would enter a module context that cannot name the target.
+    let callee = callee_module();
+    let (caller, run) = caller_module("missing");
+    assert!(
+        callee.atom_table.lookup("missing").is_none(),
+        "the fixture must not intern `missing`, or the seam would resolve it"
+    );
+
+    let seen = Rc::new(RefCell::new(Vec::<(String, String, u32)>::new()));
+    let recorder = Rc::clone(&seen);
+    let bif: BifFloor = Box::new(move |module, function, arity, args| {
+        recorder
+            .borrow_mut()
+            .push((module.to_string(), function.to_string(), arity));
+        assert!(
+            args.is_empty(),
+            "the declined `missing/0` call carries no arguments, got {args:?}"
+        );
+        Ok(make_small(42))
+    });
+    let mut ctx = SeamCtx::new(vec![("c".to_string(), Arc::clone(&callee))], bif);
+    let mut machine = Machine::new();
+
+    let outcome = machine
+        .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+        .expect("the synchronous call succeeds");
+    assert_eq!(outcome, RunOutcome::Returned(make_small(42)));
+    assert_eq!(
+        seen.borrow().as_slice(),
+        [("c".to_string(), "missing".to_string(), 0)],
+        "the declined callee must reach the synchronous BIF floor exactly once"
+    );
+    assert!(
+        ctx.resolved.is_empty(),
+        "the seam must not claim to have resolved a name the callee does not intern"
+    );
+    assert!(
+        machine.current_module().is_none(),
+        "a synchronous call runs elsewhere: the machine enters no module context"
     );
 }

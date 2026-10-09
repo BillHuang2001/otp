@@ -252,8 +252,9 @@ main(_) ->
 
 /// Run the oracle battery once and return its `key -> value` facts.
 ///
-/// Returns `None` (after a **loud** skip, or a failure under
-/// `BEAM_ETS_REQUIRE_ORACLE=1`) when no Erlang oracle is available.
+/// Returns `None` (after a **loud** skip) only under the explicit oracle opt-out
+/// (`BEAM_ETS_ALLOW_NO_ORACLE=1`); a genuinely absent Erlang otherwise **fails** the
+/// calling test, since the oracle is required by default.
 ///
 /// The scratch directory is keyed by the *test* name, not just the process id, so
 /// two tests of this binary can run the battery concurrently without one removing

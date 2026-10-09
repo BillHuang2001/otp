@@ -1,3 +1,23 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
 //! Integration evidence for **cleaning up a dead port-watcher's monitor**.
 //!
 //! When a process that monitors a port (`erlang:monitor(port, Port)`) dies, the port must stop
@@ -18,17 +38,12 @@
 //! the probe runs on a thread with a timeout, so a host without a functioning `erl` **skips
 //! loudly** and never hangs the suite.
 
-use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+mod common;
 
 use beam_process::prelude::*;
 use beam_term::prelude::{make_small, AtomTable};
 
-/// Wall-clock budget for a single `erl` invocation before the oracle is declared unusable and the
-/// check skips.
-const ERL_TIMEOUT: Duration = Duration::from_secs(30);
+use common::erl_stdout;
 
 /// A table plus the atom intern table behind its signal atoms, and a port table.
 struct Fixture {
@@ -252,45 +267,10 @@ fn port_closed_cleans_a_dying_linked_peers_other_port_monitors() {
 // Oracle cross-check (the real system Erlang)
 // ---------------------------------------------------------------------------
 
-/// Runs `<expr>, halt(0).` under the system `erl` and returns its stdout.
-///
-/// Returns `None` — after printing a clear skip message — when `erl` cannot be spawned or does not
-/// answer within [`ERL_TIMEOUT`]. `stdout`/`stderr` are **captured** (never inherited) and the
-/// probe runs on a thread, so a wedged `erl` fails with a clear timeout instead of hanging.
-fn erl_stdout(expr: &str) -> Option<String> {
-    let code = format!("{expr}, halt(0).");
-    let (tx, rx) = mpsc::channel();
-    let code_for_thread = code.clone();
-    thread::spawn(move || {
-        let out = Command::new("erl")
-            .arg("-noshell")
-            .arg("-eval")
-            .arg(&code_for_thread)
-            .output();
-        // The receiver may have timed out and gone away; that is fine.
-        let _ = tx.send(out);
-    });
-
-    match rx.recv_timeout(ERL_TIMEOUT) {
-        Err(_) => {
-            eprintln!("skipping oracle check: `erl` did not answer within {ERL_TIMEOUT:?}");
-            None
-        }
-        Ok(Err(e)) => {
-            eprintln!("skipping oracle check: could not spawn `erl` ({e}); is Erlang on PATH?");
-            None
-        }
-        Ok(Ok(out)) => {
-            assert!(
-                out.status.success(),
-                "`erl` exited with {} for expression:\n{code}\nstderr:\n{}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr),
-            );
-            Some(String::from_utf8_lossy(&out.stdout).into_owned())
-        }
-    }
-}
+// The oracle driver (`erl_stdout` and its stdout normalisation) is shared with the crate's other
+// `oracle_*` files; it lives in `tests/common/mod.rs` so the logger-suppression fix exists once.
+// `erl` runs with `-kernel logger_level none` (and its stdout is normalised), so a crashed probe
+// helper's run-time error report can never make these comparisons flaky.
 
 /// The `erl` probe: a process monitors a long-lived port, **is observed to be listed** by
 /// `erlang:port_info(Port, monitored_by)`, is then stopped, and is observed to be **gone** from

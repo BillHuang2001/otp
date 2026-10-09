@@ -34,7 +34,9 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `Operand::Literal` (a bignum literal), so a loaded `Module` never carries it.
   `Operand::Literal(idx)` is an index into the module's decoded [`LiteralArea`], resolved through `Module::literal`.
 - `pub struct AllocKind { pub kind: u32, pub number: u32, pub words: u32 }` — one decoded
-  `z,3` allocation entry (`words` = the entry's contribution to the heap-word total).
+  `z,3` allocation entry, `words` per `marshal_allocation_list` (`beam_file.c:2259-2284`): kind `0`
+  (raw words) → `number`, kinds `1` (floats) / `2` (funs) / `3` (native records) → `2 × number`
+  (`FLOAT_SIZE_OBJECT` / `ERL_FUN_SIZE` / `RECORD_INST_SIZE(0)`, all `2` on 64-bit).
 - `pub enum HeapNeed { Words(u32), Alloc(Vec<AllocKind>) }` — the heap/stack-need operand of the frame
   instructions, in *either* wire encoding (a plain word count or a `z,3` allocation list), with
   `HeapNeed::words(&self) -> u32` (the saturating word total) and
@@ -46,8 +48,8 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   pub exports: Vec<Export>, pub locals: Vec<Export>, pub imports: Vec<Import>, pub functions: Vec<Function>,
   pub funs: Vec<FunDescriptor>, pub records: Vec<RecordDefinition>, pub code_version: CodeVersion,
   pub types: TypeTable, pub line: LineTable, pub literals: Arc<LiteralArea>, pub strings: Vec<u8>,
-  pub attributes: Option<Vec<u8>>, pub attribute_table: Arc<AttributeTable>, pub compile_info: Option<Vec<u8>>,
-  pub meta: Option<Vec<u8>> }`
+  pub attributes: Option<Vec<u8>>, pub attribute_table: SharedAttributeTable, pub compile_info: Option<Vec<u8>>,
+  pub compile_info_table: SharedDecodedTerm, pub meta: Option<Vec<u8>>, pub meta_table: SharedDecodedTerm }`
   + `Module::atom_name(&self, Atom) -> Option<&str>`, `Module::export(&self, Atom, u32) -> Option<Label>`,
   `Module::function(&self, Atom, u32) -> Option<&Function>`, `Module::literal(&self, u32) -> Option<Eterm>`,
   `Module::literals(&self) -> &LiteralArea`, `Module::fun(&self, u32) -> Option<&FunDescriptor>`,
@@ -55,13 +57,18 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `Module::record(&self, Atom) -> Option<&RecordDefinition>`,
   `Module::record_by_name(&self, &str) -> Option<&RecordDefinition>`,
   `Module::attributes_term(&self) -> Option<Eterm>` (the decoded `Attr` list) and
-  `Module::attribute_by_name(&self, &str) -> Option<Eterm>` (both `None` when the chunk is absent/malformed,
-  never a panic).
+  `Module::attribute_by_name(&self, &str) -> Option<Eterm>`,
+  `Module::compile_info_term(&self) -> Option<Eterm>` / `Module::compile_info_by_name(&self, &str) -> Option<Eterm>`
+  (the decoded `CInf` compile-info list — what `module_info(compile)` serves) and
+  `Module::meta_term(&self) -> Option<Eterm>` / `Module::meta_by_name(&self, &str) -> Option<Eterm>`
+  (the decoded `Meta` feature-metadata property list) — all `None` when the chunk is absent/malformed,
+  never a panic.
   `records` is the lowered `Recs` table (native-record definitions, declaration order); `record_by_name`
   resolves a *runtime* atom by looking its string up in the module's `atom_table` first (the lookup the
   `records:get_definition/2` BIF needs).
   `atoms[i]` = the atom for wire index `i`; `atoms[0]` = `Atom::MAX` (NIL placeholder, never a real atom).
-  `Module` is `Clone` (cheap: `literals` is shared behind the `Arc`) and `Debug`, but it is **neither
+  `Module` is `Clone` (cheap: `literals`/`attribute_table`/`compile_info_table`/`meta_table` are shared
+  behind `Arc`s) and `Debug`, but it is **neither
   `Send` nor `Sync`** (see `src/literal.rs` / Design Decisions) — a loaded module stays on its loading thread.
 - `pub struct Export { pub function: Atom, pub arity: u32, pub label: Label }` — `label` = the function **entry label**.
   `Module.locals` holds one `Export` per `LocT` entry (byte-for-byte the `ExpT` layout — the JIT-only
@@ -243,6 +250,10 @@ parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term)
   (`beam_file.c:262-297`). Total entries = `count+1`.
 - **`Code`** — header `u32 head_size` (== 16) then `u32 format_number` (== `BEAM_FORMAT_NUMBER` 0,
   guarded), `u32 max_opcode`, `u32 label_count`, `u32 function_count`; then the instruction stream.
+  `max_opcode` must lie in `[169, 193]` — `169` = `swap/2` (`genop_swap_2`, `lib/compiler/src/genop.tab:611`),
+  `193` = `MAX_GENERIC_OPCODE` (the last `genop.tab` entry, `193: update_record_id/7`); outside that window
+  the image is rejected with `BadArg`, exactly as the C refuses an OTP-22-or-earlier or later-version image
+  (`beam_load.c:189-225`).
   The stream ends at the `int_code_end/0` instruction (genop 3), not at size exhaustion
   (`beam_file.c:1527,2596`). Instruction = 1 opcode byte (`1..=max_opcode`) + `Opcode::arity` operands.
 - **`ExpT`** — `i32 count` × `{ i32 function_atom, i32 arity, i32 label }` (label = **entry** label).
@@ -276,11 +287,18 @@ parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term)
   `beam_codec::compress::decompress`, rejecting a length that disagrees with `uncompressed_size` — and
   parses the **framing** only (raw ETF payloads); `src/literal::LiteralArea` then decodes each payload
   into a term once at load time. Static literals are referenced by `Operand::Literal(idx)`.
-- **`StrT` / `CInf` / `Attr` / `Meta` / `Docs` / `DbgB` / `Dbgi`** — `StrT`/`CInf`/`Meta` are captured
-  raw (`StrT` → bytes, `CInf`/`Meta` → `Option<Vec<u8>>`); `Attr` is decoded into a term (an ETF list of
-  `{Atom, Value}` pairs — `Module::attributes_term`/`attribute_by_name`, `src/attributes.rs`) for
-  `module_info(attributes)`, while its raw bytes stay in `Module::attributes`; `Docs`/`DbgB`/`Dbgi` are
-  tooling-only ids whose payloads are deliberately **not** parsed.
+- **`StrT` / `CInf` / `Attr` / `Meta` / `Docs` / `DbgB` / `Dbgi`** — `StrT` is captured raw
+  (`Module::strings`). `Attr`, `CInf` and `Meta` are each a single `term_to_binary` payload and are
+  **decoded into a term** once at load time into a private arena shared through an `Arc`
+  ([`crate::decoded::DecodedTerm`]): `Attr` → the `[{Atom, Value}]` attribute list
+  (`Module::attributes_term`/`attribute_by_name`, `src/attributes.rs`) for `module_info(attributes)`;
+  `CInf` → the compile-info list (`Module::compile_info_term`/`compile_info_by_name`,
+  `beam_asm.erl:236,309` writes it, `erl_bif_info.c:5896-5918` serves `module_info(compile)`) and
+  `Meta` → the feature-metadata property list (`Module::meta_term`/`meta_by_name`, `compile.erl:2269-2295`).
+  Each chunk's raw bytes stay on the module too (`Module::attributes`/`compile_info`/`meta`).
+  `Docs`/`DbgB`/`Dbgi` are tooling-only ids whose payloads are deliberately **not** parsed: they are large
+  and near-universal, and eagerly materializing them would regress the measured module-load cost
+  (`tests/load_cost.rs`).
 - **`Recs`** — `u32 version` (must be `0`; a non-zero version means "no records" — chunk-absent,
   *not* an error, `beam_file.c:1335-1348`), `i32 record_count` (`≥ 0`; negative ⇒ `BadArg`),
   `i32 total_field_count` (informational; `≥ 0`), then `record_count` record entries EACH encoded as
@@ -318,7 +336,21 @@ magnitude bytes; if `(byte>>5)==7` a `u`-tagged sub-varint gives `count = S+9` b
 carries `reg | (type_index << 10)` conceptually — but the loader keeps reg and `TypeIndex` **separate**
 in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag collapses to a plain
 `X`/`Y` operand (the type index is discarded).
-
+### Structural bounds enforced at decode (`src/decode.rs` / `src/lower.rs`)
+Mirrors the C reader's `LoadAssert`s, so a construct the C rejects is a typed error here too — never a
+silently-accepted wrong value:
+- a non-zero `f` label index `< label_count`, recursively inside a `z,1` list (`beam_file.c:2324-2331`);
+- `x`/`y` register index `< MAX_REG` (1024, `erl_vm.h:49`) and `z,2` float-register index `< MAX_REG`
+  (`beam_file.c:2335-2338,2381`);
+- `z,5` `tr` type index `< TypeTable.entries.len()` when the table is not a fallback (`beam_file.c:2437`);
+- `z,3` allocation list: `<= 4` entries (`beam_file.c:2241`), per-entry `number <= i32::MAX/3`
+  (`beam_file.c:2255-2256`) and running word total `<= i32::MAX` (`beam_file.c:2261-2274`) ⇒ `SystemLimit`;
+- a `z,1` argument list only in the instruction's final operand slot (`beam_file.c:2352`);
+- a `z,4` static-literal index `< the file's own LitT count` — checked in `src/lower.rs::build_module`
+  *before* synthesized literals are appended, so it covers `load`, `beam_rt`'s code-server path and
+  `beam_engine`'s test support (`beam_file.c:2412`);
+- a `z,4`/`h` magnitude that would truncate on the 32-bit `Operand` field ⇒ `SystemLimit` (never a
+  silently-wrapped, different-but-valid index).
 ## Design Decisions
 - **The opcode roster is embedded from `genop.tab`, not from generated C.** `Opcode` enumerates every
   generic opcode in `../../lib/compiler/src/genop.tab` (the checked-in, wire-frozen roster the compiler
@@ -482,7 +514,12 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - **`tests/negative.rs`:** truncated header, bad `"FOR1"` magic, bad form type, `format_number != 0`,
   a chunk size that overruns the file, an unknown/out-of-range opcode byte, an out-of-range atom/label
   index, a truncated operand varint, a `z` sub-tag `0`/unknown, a structurally wrong `HeapNeed` operand
-  and a truncated/malformed compressed `LitT` ⇒ each a typed `BeamError` (no panic).
+  and a truncated/malformed compressed `LitT` ⇒ each a typed `BeamError` (no panic). Plus a
+  "structural rejection" section covering every bound in the decode-bounds table above (`max_opcode`
+  above/below the `[169,193]` window, out-of-range label/`x`/`y`/float-register/type index, an
+  allocation list longer than 4, an argument list in a non-final slot, a `z,4` literal index the file
+  does not define) — EACH next to a well-formed control image that genuinely loads, so a negative case
+  can never pass for a structural reason.
 - **`tests/real_modules.rs`:** the broad real-OTP LOAD sweep. The `lib` root is discovered
   generically — `$ERTS_LIB_DIR` when set, else `erl -noshell -eval 'io:format("~s",[code:lib_dir()])'`
   (no hardcoded app names) — then every `.beam` under it is collected recursively (each versioned app
@@ -514,7 +551,8 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - **`tests/chunks.rs`:** walks the whole installed corpus asserting every chunk id is classified
   (`chunk::classify`) and every module loads (unknown id ⇒ failure naming it); positive controls require
   all 15 corpus ids to appear so the pass cannot be vacuous; pins key ids' classes row-by-row and
-  cross-checks the decoded `Attr` against the runtime `module_info(attributes)` on `gen_server`/`kernel`.
+  cross-checks the decoded `Attr` against the runtime `module_info(attributes)` on `gen_server`/`kernel`,
+  plus a whole-corpus `CInf`/`Meta` decode-and-re-encode byte-exact round-trip.
 - **`tests/literals.rs`:** both `LitT` framings decode to identically-encoded terms; structural assertions
   for every literal kind; plus a whole-corpus sweep re-encoding every decoded literal byte-exactly and
   comparing semantically against `literals_oracle.escript` for map literals whose key order is non-canonical.
@@ -549,26 +587,13 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   `../../crates/CONTEXT.md`).
 - **Lowering is one peephole pass, not a full `ops.tab` transform.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`. The only rewrite after that is `src/lower/fuse.rs` (`fuse`), a single forward pass that coalesces an **adjacent** `Deallocate(N); Return` pair in each function body into the one superinstruction `Instr::DeallocateReturn(N)`, run *before* `build_blocks` derives the blocks/labels (so a block's `start..end` indexes the same fused vector the engine dispatches on). `Label` is the only branch target, so two adjacent non-`Label` instructions share a block and the pair can never cross one; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules that bypass the loader. That is the whole superinstruction surface here; the C builds a much larger set from `emu/ops.tab` in `beam_load.c` (a candidate for later). Never a correctness gap: `beam_engine`'s core `DeallocateReturn` arm executes exactly the two constituents in order.
 - **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
-- **Allocation-list word total is under-counted for `{funs,N}` / native-record entries.**
-  `decode::allocation_entry` (`src/decode.rs:559-575`) maps kind `2` (funs) and kind `3` (native
-  records) to `N` words, but the C `marshal_allocation_list` (`beam_file.c:2259-2275`) uses
-  `ERL_FUN_SIZE` / `RECORD_INST_SIZE(0)` — both `2` words — per element. Kinds `0` (raw words) and
-  `1` (floats ×`FLOAT_SIZE_OBJECT`=2) match the C; kinds `2`/`3` are short by `N` words, so any
-  `HeapNeed` the compiler emits as a `z,3` list is under-sized. The engine consumes that total
-  directly for admission (`beam_engine` `dispatch.rs` `test_heap`/`allocate_heap`/`allocate` →
-  `*.words()` → `ensure_heap`/`push_frame`; `bs_create_bin.alloc` is bound but ignored), so the
-  heap-overflow guard is too lax for those kinds. The test comment at `src/lower.rs:1478-1481`
-  ("exactly what the real loader produces") is wrong for kinds 2/3.
-- **Contract A.2 divergences from the C loader (`beam_load.c`/`beam_file.c`), both currently unenforced:**
-  - **No `max_opcode` sanity bound.** `decode_stream` (`src/decode.rs:229`) only rejects an opcode *byte*
-    above the chunk's `max_opcode`; the C also refuses `max_opcode > MAX_GENERIC_OPCODE` (193) and
-    `max_opcode < genop_swap_2` (169, "OTP 22 or earlier") at `beam_load.c:189-197`. A header declaring
-    `max_opcode = 200` (or `< 169`) is accepted here as long as every emitted byte is a valid roster
-    opcode; `tests/negative.rs:131-146` exercises exactly this.
-  - **No module MD5/checksum.** The C builds `beam->checksum` as an MD5 over `AtU8`+`Code`+`StrT`+`ImpT`+
-    `ExpT`+`FunT` (each `OldUniq` zeroed)+`LitT`+`Meta`+`Recs`+`DbgB` at load (`beam_file.c:1751-1830`);
-    the loader computes no checksum (no `checksum`/`md5` symbol anywhere in `src/`); the `Meta` chunk it
-    feeds on is now captured raw (`Module::meta`), so only the hashing is missing.
+- **No module MD5/checksum (the remaining recorded A.2 divergence).** The C builds `beam->checksum` as
+  an MD5 over `AtU8`+`Code`+`StrT`+`ImpT`+`ExpT`+`FunT` (each `OldUniq` zeroed)+`LitT`+`Meta`+`Recs`+`DbgB`
+  at load (`beam_file.c:1751-1830`); the loader computes no checksum (no `checksum`/`md5` symbol anywhere
+  in `src/`), so `Module` carries no MD5. Closing it is a crate-layer decision, not a `beam_loader` one:
+  `crates/beam_dist/src/auth.rs` already ships a self-contained RFC 1321 `md5`, so the algorithm belongs
+  at a lowest-common-ancestor crate (`beam_codec`/`beam_common`) or behind a new dependency edge — do not
+  duplicate it here.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 
@@ -578,21 +603,22 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `src/container.rs` → `FOR1` header + chunk directory walk, `ChunkId`, raw `Chunk` iteration
 - `src/chunk/mod.rs` → chunk-parse dispatch + the assembled raw chunk set
 - `src/chunk/atom.rs` → `AtU8` parser (UTF-8, index 0 = NIL)
-- `src/chunk/code.rs` → `Code` chunk header (format/max_opcode/label_count/function_count)
+- `src/chunk/code.rs` → `Code` chunk header (format/max_opcode/label_count/function_count) + the `max_opcode` sanity window (`MIN_SUPPORTED_MAX_OPCODE` = 169, `MAX_GENERIC_OPCODE` = 193)
 - `src/chunk/table.rs` → `ExpT` / `LocT` / `ImpT` / `FunT` parsers (raw entries; `parse_locals` reuses the export reader)
 - `src/chunk/line.rs` → `Line` table parser
 - `src/chunk/types.rs` → `Type` chunk parser (`TypeTable`)
 - `src/chunk/literal.rs` → `LitT` framing parser (both the verbatim and the zlib/RFC1950-compressed form) → raw ETF payloads
 - `src/chunk/classify.rs` → `ChunkClass`/`ChunkKind`/`CHUNK_KINDS`/`classify`: the per-chunk-id classification (parsed+exposed / parsed-as-raw / tooling-only + reason) the corpus checker test enforces
-- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` raw capture (`DbgB`/`Dbgi` deliberately unparsed, tooling-only)
+- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` raw capture (`CInf`/`Meta` are decoded one layer up via `src/decoded.rs`; `DbgB`/`Dbgi` deliberately unparsed, tooling-only)
 - `src/chunk/record.rs` → `Recs` parser: `RawRecord`/`RawRecordField`/`RawRecordDefault` + `parse` (raw-tag defaults, declaration order)
-- `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`)
+- `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`) + the derived `OnceLock` arity lookup table `src/decode.rs` dispatches on
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
 - `src/instr.rs` → the typed instruction vocabulary: `Instr` (107 variants) + `TestKind`
 - `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `RecordDefinition`/`RecordField`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
 - `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap (+ the shared `decode_terms`/`decode_terms_at_capacity` retry path)
-- `src/attributes.rs` → `AttributeTable` / `SharedAttributeTable`: the decoded `Attr` chunk term (`Module::attributes_term`/`attribute_by_name`) for `module_info(attributes)`
+- `src/decoded.rs` → `DecodedTerm` / `SharedDecodedTerm`: the shared eagerly-decoded small-term holder (`terms`/`by_name`/`raw`) the `Attr`/`CInf`/`Meta` chunk tables build on
+- `src/attributes.rs` → `AttributeTable` / `SharedAttributeTable` (a `DecodedTerm` alias): the decoded `Attr` chunk term (`Module::attributes_term`/`attribute_by_name`) for `module_info(attributes)`
 - `src/lower.rs` → `build_module` + module assembly (re-exports the `group` helpers)
 - `src/lower/group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks`
 - `src/lower/fuse.rs` → `fuse` (the loader's only superinstruction pass: adjacent `Deallocate;Return` → `DeallocateReturn`)
@@ -609,7 +635,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/native_record.rs` → the OTP-29 native-record family (186-191) over the committed `nr_def`/`nr_use` fixtures + the `erl_eval` `is_any_native_record` positive control + a stdlib/kernel/compiler sweep asserting no family member lowers to `Instr::Generic`
 - `tests/line_info.rs` → typed `executable_line`/`debug_line` (the `linecov`/`dbgline` fixtures) + line-table/`func_info` preservation
 - `tests/bs_test_tail.rs` → typed `bs_test_tail2` over the `bstail` fixture
-- `tests/chunks.rs` → the whole-corpus chunk-id classification checker + the `Attr` oracle cross-check
+- `tests/chunks.rs` → the whole-corpus chunk-id classification checker + the `Attr`/`CInf`/`Meta` oracle round-trip cross-check
 - `tests/literals.rs` → the two `LitT` framings + the whole-corpus literal round-trip/oracle sweep
 - `tests/load_cost.rs` → the committed module-load-cost measurement (ns/instruction, bytes/second)
 - `tests/fixtures/{nr_def,nr_use,linecov,dbgline,bstail}.{erl,beam}` → native-record / line / test-tail oracle fixtures

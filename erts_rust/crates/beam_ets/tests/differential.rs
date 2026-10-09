@@ -58,11 +58,11 @@
 //!
 //! # Skipping without Erlang
 //!
-//! Tests 2 and 3 resolve `erl`/`erlc` from `$ERTS_ORACLE` and then `$PATH`. When
-//! they are absent the test prints a note and returns — CI without Erlang stays
-//! green. Set `BEAM_ETS_REQUIRE_ORACLE=1` to turn that skip into a failure (what
-//! this repository's gate run does, so a silently-skipped differential can never
-//! look like a pass).
+//! Tests 2, 3 and 4 resolve `erl`/`erlc` from `$ERTS_ORACLE` and then `$PATH`. The
+//! oracle cross-checks are **required by default** — a genuinely absent Erlang makes
+//! them fail, so a silently-skipped differential can never look like a pass. Set
+//! `BEAM_ETS_ALLOW_NO_ORACLE=1` to opt out explicitly (see `tests/common/oracle.rs`,
+//! the crate's single gate); `BEAM_ETS_REQUIRE_ORACLE=1` still forces the requirement.
 //!
 //! # Battery coverage
 //!
@@ -80,8 +80,11 @@
 //! counter-incapable kinds, and a threshold/default combination); `update_element/3`;
 //! `lookup_element/3,4`; `select/2`
 //! with variables/wildcards/literals/guards (comparison, type test,
-//! `andalso`/`orelse`) and bodies (`'$_'`, `'$$'`, `'$N'`, constants, `{{…}}`
-//! construction) — incl. a whole `fun2ms`-shaped spec family
+//! `andalso`/`orelse`, `/`, `float/1`, `element/2`, `abs/1` over a small integer
+//! and a float, the map guards `map_size/1`/`is_map_key/2`/`map_get/2`,
+//! `tuple_size/1`, `byte_size/1`, `bit_size/1`) and bodies (`'$_'`, `'$$'`,
+//! `'$N'`, constants, `{{…}}` construction, map construction) — incl. a whole
+//! `fun2ms`-shaped spec family
 //! (`select`/`select_count`/`select_replace`/`select_delete`/`match`/`match_object`/
 //! `match_spec_run`); `select_delete/2`+`select_count/2`; the `match` family;
 //! malformed specs (`badarg`); `ets:match_spec_run/2` (variable/whole-element/
@@ -188,14 +191,22 @@
 //!   `delete_all_objects/1` leave only an observable trace (`size`, `member`,
 //!   `lookup`, `tab2list`); `memory` and the table `id` are never rendered
 //!   (`reclamation_observable`).
+//! * **A guard that is the runtime's own capability gap is *not* swallowed.**
+//!   `erl` runs match-spec arithmetic through the ordinary BIFs, so `/` (whose
+//!   Erlang result is always a float) and any float/bignum operand answer a
+//!   float/bignum. This crate's `DefaultArithHook` has no float/bignum arithmetic
+//!   and answers the typed `unsupported_ets` raise, which the guard path
+//!   propagates (only the oracle's own `badarg` skips a clause) — so
+//!   `select_guard_div` and `select_guard_float_arith` are the two recorded
+//!   [`KNOWN_DIVERGENCES`], rendered honestly through `cap_select` rather than
+//!   silently under-matching. Every other new guard/body construct agrees.
 
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
 
 // The support modules live in `tests/differential/` so that they are *not*
 // themselves integration-test targets (Cargo only builds the `.rs` files
@@ -206,7 +217,10 @@ mod battery;
 #[path = "differential/erl_program.rs"]
 mod erl_program;
 
+mod common;
+
 use battery::rust_battery;
+use common::oracle;
 
 /// How long the oracle is given to compile and then to run. Generous: the two
 /// 10 001-key cases build and walk a large table, and a loaded CI box can be slow.
@@ -439,10 +453,21 @@ const EXPECTED: &[(&str, &str)] = &[
     ("select_guard_comparison", "[2,3]"),
     ("select_guard_typetest", "[2]"),
     ("select_guard_andalso_orelse", "{[1,2],[1,3]}"),
+    ("select_guard_div", "ok:[2]"),
+    ("select_guard_float", "ok:[2]"),
+    ("select_guard_element", "ok:[2,3]"),
+    ("select_guard_abs", "{ok:[2,3],ok:[1]}"),
+    ("select_guard_map_size", "ok:[1]"),
+    ("select_guard_is_map_key", "ok:[1]"),
+    ("select_guard_map_get", "ok:[1]"),
+    ("select_guard_tuple_size", "ok:[1]"),
+    ("select_guard_size_family", "ok:[1]"),
+    ("select_guard_float_arith", "ok:[2]"),
     ("select_body_whole", "[{1,a,10},{2,b,20}]"),
     ("select_body_var", "[1,2]"),
     ("select_body_const", "[ok,ok]"),
     ("select_body_construct", "[{1,a},{2,b}]"),
+    ("select_body_map_construct", "ok:[10,20]"),
     ("select_delete_and_count", "{0,0,2,2,1,[1]}"),
     (
         "match_family",
@@ -532,14 +557,6 @@ struct Oracle {
     erlc: PathBuf,
 }
 
-/// Whether `$BEAM_ETS_REQUIRE_ORACLE` asks for the oracle to be mandatory.
-fn oracle_required() -> bool {
-    match env::var("BEAM_ETS_REQUIRE_ORACLE") {
-        Ok(value) => !value.is_empty() && value != "0",
-        Err(_) => false,
-    }
-}
-
 /// Resolve the oracle from `$ERTS_ORACLE`, then `$PATH`.
 ///
 /// Returns `None` when no Erlang is installed (the caller skips), but **fails
@@ -550,59 +567,24 @@ fn resolve_oracle() -> Option<Oracle> {
         Some(value) => {
             let candidate = PathBuf::from(&value);
             assert!(
-                is_executable(&candidate),
+                oracle::is_executable(&candidate),
                 "$ERTS_ORACLE is set to '{}', which is not an executable file",
                 candidate.display()
             );
             candidate
         }
-        None => find_in_path("erl")?,
+        None => oracle::find_in_path("erl")?,
     };
     // `erlc` normally sits next to `erl`; fall back to `$PATH` (a wrapper script
     // may install only `erl`).
     let sibling = erl.with_file_name("erlc");
-    let erlc = if is_executable(&sibling) {
+    let erlc = if oracle::is_executable(&sibling) {
         sibling
     } else {
-        find_in_path("erlc")?
+        oracle::find_in_path("erlc")?
     };
     Some(Oracle { erl, erlc })
 }
-
-/// The first executable `name` on `$PATH`.
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    for dir in env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// Whether `path` is an executable file.
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 /// Compile the embedded oracle program and run its battery, returning the
 /// `case_name -> rendered_result` pairs it emitted.
 ///
@@ -629,7 +611,7 @@ fn run_oracle(oracle: &Oracle) -> Vec<(String, String)> {
         .arg(&dir)
         .arg(&source)
         .current_dir(&dir);
-    let compiled = run_bounded(&mut compile, ORACLE_TIMEOUT).unwrap_or_else(|error| {
+    let compiled = oracle::run_bounded(&mut compile, ORACLE_TIMEOUT).unwrap_or_else(|error| {
         panic!(
             "erlc ({}) could not compile the oracle program: {error}",
             oracle.erlc.display()
@@ -655,7 +637,7 @@ fn run_oracle(oracle: &Oracle) -> Vec<(String, String)> {
         .arg("-s")
         .arg("init")
         .arg("stop");
-    let output = run_bounded(&mut run, ORACLE_TIMEOUT).unwrap_or_else(|error| {
+    let output = oracle::run_bounded(&mut run, ORACLE_TIMEOUT).unwrap_or_else(|error| {
         panic!(
             "erl ({}) could not run the oracle battery: {error}",
             oracle.erl.display()
@@ -676,41 +658,6 @@ fn run_oracle(oracle: &Oracle) -> Vec<(String, String)> {
     let emitted = parse_emitted(&String::from_utf8_lossy(&output.stdout));
     let _ = fs::remove_dir_all(&dir);
     emitted
-}
-
-/// Spawn `command`, wait at most `timeout` for it, and collect its output.
-///
-/// Both pipes are read only after the child has exited; the battery writes a few
-/// kilobytes, far below the pipe capacity, so that cannot deadlock.
-fn run_bounded(command: &mut Command, timeout: Duration) -> Result<Output, String> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to spawn: {error}"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("timed out after {timeout:?}"));
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("failed while waiting: {error}"));
-            }
-        }
-    }
-    child
-        .wait_with_output()
-        .map_err(|error| format!("failed to collect the output: {error}"))
 }
 
 /// Parse the oracle's `name|rendered` lines.
@@ -762,13 +709,37 @@ fn expected_map() -> BTreeMap<String, String> {
 /// in the battery (rather than dropping them) keeps the oracle's real behaviour in
 /// `EXPECTED` and the gap actionable.
 ///
-/// **Currently empty**: the whole battery agrees with the live oracle, so every
-/// case is compared strictly. (The single former entry, `ordered_float_key_order`,
-/// recorded `ordered_set` grouping every integer before every float; it was fixed
-/// by ordering keys with `compare::cmp_arith` — ERTS's arithmetic key order — so
-/// the case now agrees and is compared strictly.)
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[];
-
+/// Both entries are the **same typed capability gap**: match-spec arithmetic
+/// outside the small-integer subset. The C runs every arithmetic operator through
+/// the ordinary BIFs, so a `/` (whose Erlang result is *always* a float) or any
+/// float/bignum operand answers a float/bignum; this crate's `DefaultArithHook`
+/// has no float/bignum arithmetic and deliberately answers the typed
+/// `unsupported_ets` raise instead of guessing (workspace `CONTEXT.md` §3 — never
+/// a wrong result). In a **guard** the error is not swallowed: `guards_hold`
+/// propagates everything but the oracle's own `badarg`, so `select` fails and
+/// [`Battery::cap_select`] renders `error:unsupported_ets: …` where the oracle
+/// renders the selected keys. A real runtime installs a full `ArithHook`
+/// (`set_arith_hook`), which is what closes both cases.
+const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
+    (
+        "select_guard_div",
+        "the `/` match-spec operator: Erlang's result is always a float, so \
+         DefaultArithHook answers the typed `unsupported_ets` instead of a \
+         fabricated small integer, and a guard propagates it (no silent \
+         under-match). The oracle selects `ok:[2]`; beam_ets renders \
+         `error:unsupported_ets: match-spec arithmetic '/': the result is a float`. \
+         Closed by installing a full ArithHook.",
+    ),
+    (
+        "select_guard_float_arith",
+        "match-spec arithmetic with a float operand (`{'*', '$2', 1.5}`): \
+         DefaultArithHook is small-integer only, so the operand is the typed \
+         `unsupported_ets` rather than a guessed value, and the guard propagates \
+         it. The oracle selects `ok:[2]`; beam_ets renders \
+         `error:unsupported_ets: match-spec arithmetic '*': operand 2 is not a \
+         small integer`. Closed by installing a full ArithHook.",
+    ),
+];
 /// `true` when `name` is a recorded divergence.
 fn is_known_divergence(name: &str) -> bool {
     KNOWN_DIVERGENCES.iter().any(|(case, _)| *case == name)
@@ -814,21 +785,18 @@ fn assert_agree(expected: &BTreeMap<String, String>, actual: &BTreeMap<String, S
 
 /// Resolve the oracle, or skip the calling test with a note.
 ///
-/// `None` means "skip": no Erlang on this machine. When
-/// `$BEAM_ETS_REQUIRE_ORACLE` is set, a missing oracle is a failure instead.
+/// `None` means "skip": this environment explicitly accepted a missing oracle
+/// (`BEAM_ETS_ALLOW_NO_ORACLE=1`). Because the oracle is **required by default**, a
+/// genuinely absent Erlang **fails** the test instead — see `oracle::skip`.
 fn oracle_or_skip(test: &str) -> Option<Oracle> {
     match resolve_oracle() {
         Some(oracle) => Some(oracle),
         None => {
-            assert!(
-                !oracle_required(),
-                "{test}: $BEAM_ETS_REQUIRE_ORACLE is set but neither $ERTS_ORACLE nor an \
-                 executable `erl` on $PATH could be found"
-            );
-            eprintln!(
-                "{test}: SKIPPED — no Erlang oracle found ($ERTS_ORACLE unset and no executable \
-                 `erl` on $PATH). The embedded, erl-derived expectation table is still checked by \
-                 `rust_battery_matches_the_embedded_oracle_table`."
+            oracle::skip(
+                test,
+                "no Erlang oracle found ($ERTS_ORACLE unset and no executable `erl` on $PATH); the \
+                 embedded, erl-derived expectation table is still checked by \
+                 `rust_battery_matches_the_embedded_oracle_table`",
             );
             None
         }

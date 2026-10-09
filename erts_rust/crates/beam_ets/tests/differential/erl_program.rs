@@ -183,10 +183,21 @@ battery() ->
     emit("select_guard_comparison", select_guard_comparison()),
     emit("select_guard_typetest", select_guard_typetest()),
     emit("select_guard_andalso_orelse", select_guard_andalso_orelse()),
+    emit("select_guard_div", select_guard_div()),
+    emit("select_guard_float", select_guard_float()),
+    emit("select_guard_element", select_guard_element()),
+    emit("select_guard_abs", select_guard_abs()),
+    emit("select_guard_map_size", select_guard_map_size()),
+    emit("select_guard_is_map_key", select_guard_is_map_key()),
+    emit("select_guard_map_get", select_guard_map_get()),
+    emit("select_guard_tuple_size", select_guard_tuple_size()),
+    emit("select_guard_size_family", select_guard_size_family()),
+    emit("select_guard_float_arith", select_guard_float_arith()),
     emit("select_body_whole", select_body_whole()),
     emit("select_body_var", select_body_var()),
     emit("select_body_const", select_body_const()),
     emit("select_body_construct", select_body_construct()),
+    emit("select_body_map_construct", select_body_map_construct()),
     emit("select_delete_and_count", select_delete_and_count()),
     emit("match_family", match_family()),
     emit("malformed_specs", malformed_specs()),
@@ -750,6 +761,77 @@ select_guard_andalso_orelse() ->
     S2 = [{{'$1', '$2', '$3'}, [{'orelse', {'=:=', '$1', 1}, {'=:=', '$1', 3}}], ['$1']}],
     t([inorder(ets:select(T, S1)), inorder(ets:select(T, S2))]).
 
+%% The guard/body language the earlier cases miss, all rendered through `cap_str/1`
+%% so a raising call is compared as a value: the `/` operator (whose Erlang result
+%% is *always* a float) and a float arithmetic operand, `float/1`, `element/2`,
+%% `abs/1` over a small integer and over a float, the map guards `map_size/1`,
+%% `is_map_key/2` and `map_get/2`, `tuple_size/1`, `byte_size/1`+`bit_size/1`, and a
+%% map *constructed in a body*.
+select_guard_div() ->
+    T = new(ordered_set),
+    [ets:insert(T, {K, K * 10}) || K <- [1, 2, 3]],
+    S = [{{'$1', '$2'}, [{'==', {'/', '$2', 2}, 10.0}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_float() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20.0}), ets:insert(T, {3, 30}),
+    S = [{{'$1', '$2'}, [{'==', {float, '$2'}, 20.0}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_element() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, a, 10}), ets:insert(T, {2, b, 20}), ets:insert(T, {3, c, 30}),
+    S = [{{'$1', '$2', '$3'}, [{'>', {element, 3, '$_'}, 15}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_abs() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, -10}), ets:insert(T, {2, 20}), ets:insert(T, {3, -30}),
+    S = [{{'$1', '$2'}, [{'>', {abs, '$2'}, 15}], ['$1']}],
+    F = new(ordered_set),
+    ets:insert(F, {1, -10.0}), ets:insert(F, {2, 20.0}),
+    SF = [{{'$1', '$2'}, [{'==', {abs, '$2'}, 10.0}], ['$1']}],
+    t([cap_str(fun() -> inorder(ets:select(T, S)) end),
+       cap_str(fun() -> inorder(ets:select(F, SF)) end)]).
+
+select_guard_map_size() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{a => 1, b => 2}}), ets:insert(T, {2, #{a => 1}}),
+    S = [{{'$1', '$2'}, [{'==', {map_size, '$2'}, 2}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_is_map_key() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{a => 10}}), ets:insert(T, {2, #{b => 20}}),
+    S = [{{'$1', '$2'}, [{is_map_key, a, '$2'}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_map_get() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, #{a => 10}}), ets:insert(T, {2, #{b => 20}}),
+    S = [{{'$1', '$2'}, [{'==', {map_get, a, '$2'}, 10}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_tuple_size() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, {a, b, c}}), ets:insert(T, {2, {a, b}}),
+    S = [{{'$1', '$2'}, [{'==', {tuple_size, '$2'}, 3}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_size_family() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, <<"abc">>}), ets:insert(T, {2, <<"ab">>}),
+    S = [{{'$1', '$2'}, [{'andalso', {'==', {byte_size, '$2'}, 3},
+                                  {'==', {bit_size, '$2'}, 24}}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
+select_guard_float_arith() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [{'==', {'*', '$2', 1.5}, 30.0}], ['$1']}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
+
 select_body_whole() ->
     T = new(ordered_set),
     ets:insert(T, {1, a, 10}), ets:insert(T, {2, b, 20}),
@@ -773,6 +855,15 @@ select_body_construct() ->
     ets:insert(T, {1, a}), ets:insert(T, {2, b}),
     Spec = [{{'$1', '$2'}, [], [{{'$1', '$2'}}]}],
     inorder(ets:select(T, Spec)).
+
+%% A map *constructed in a body* from the bound variables, then read back with
+%% `map_get/2` so the clause value stays a small integer (the renderer has no map
+%% clause).
+select_body_map_construct() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [], [{map_get, '$1', #{'$1' => '$2'}}]}],
+    cap_str(fun() -> inorder(ets:select(T, S)) end).
 
 select_delete_and_count() ->
     T = new(ordered_set),

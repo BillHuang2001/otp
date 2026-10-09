@@ -34,11 +34,12 @@
 //!
 //! Coverage: boundary integers (small/`INTEGER_EXT`/bignum/sign), bignums across the
 //! wire byte-count boundaries including high-zero stripping, every atom tag (short,
-//! long, multi-byte UTF-8, plus Latin-1), floats including `±0`, `±inf`, `NaN` (quiet
-//! and signaling) and subnormals, tuples at the arity boundaries, proper/improper lists
-//! and byte lists up to the `STRING_EXT`/`LIST_EXT` switchover, small maps,
-//! pids/ports/references and both fun tags — `EXPORT_EXT` (`113`) and `NEW_FUN_EXT`
-//! (`112`), standalone and nested inside tuples/lists/maps.
+//! long, multi-byte UTF-8, plus Latin-1), floats including `±0`, subnormals and the
+//! finite extremes (a non-finite `NEW_FLOAT_EXT` is `badarg`, matching the oracle —
+//! the wire cannot carry an infinity or NaN), tuples at the arity boundaries,
+//! proper/improper lists and byte lists up to the `STRING_EXT`/`LIST_EXT` switchover,
+//! small maps, pids/ports/references and both fun tags — `EXPORT_EXT` (`113`) and
+//! `NEW_FUN_EXT` (`112`), standalone and nested inside tuples/lists/maps.
 //!
 //! Two documented *non*-byte-identical transformations are asserted explicitly: a
 //! bignum whose magnitude fits the 60-bit small range decodes to a small (matching the
@@ -47,9 +48,10 @@
 //! Negative cases cover truncation at every byte offset (including every `NEW_FUN_EXT`
 //! field boundary), unknown/unsupported/obsolete tags (the removed `FUN_EXT`), the fun
 //! field rules (non-small `old_index`/`old_uniq`, a non-pid creator, `num_free` past
-//! its 8-bit field, missing environment terms), over-long atoms and bignums
-//! (`BeamError::SystemLimit`), oversized maps (`error::unsupported`), a malformed
-//! bignum sign and trailing bytes. Encoding a local (`make_fun3`) fun — which has no
+//! its 8-bit field, missing environment terms), over-long atoms (`badarg`, not a
+//! resource limit), bignums past the wire bound (`BeamError::SystemLimit`), oversized
+//! maps (`error::unsupported`), a non-zero bignum sign byte (any non-zero byte means
+//! negative) and trailing bytes. Encoding a local (`make_fun3`) fun — which has no
 //! faithful wire image — raises `unsupported_local_fun`, never a mis-encoded term.
 //! Every malformed input must yield an error — never a panic, never a silently
 //! truncated or mis-encoded term.
@@ -693,16 +695,11 @@ fn floats_round_trip_bit_exactly() {
         3.14f64.to_bits(),
         0.0f64.to_bits(),
         (-0.0f64).to_bits(),
-        f64::INFINITY.to_bits(),
-        f64::NEG_INFINITY.to_bits(),
-        f64::NAN.to_bits(),
-        0x7ff0_0000_0000_0001, // signaling NaN
-        0x7ff8_0000_dead_beef, // quiet NaN with a payload
-        0xfff0_0000_0000_0001, // negative signaling NaN
-        1,                     // the smallest subnormal
+        1, // the smallest subnormal
         f64::MIN_POSITIVE.to_bits(),
         f64::MIN.to_bits(),
         f64::MAX.to_bits(),
+        0x000f_ffff_ffff_ffff, // the largest subnormal
     ] {
         let mut h1 = heap(16);
         let t = make_float(&mut h1, f64::from_bits(bits)).unwrap();
@@ -713,6 +710,23 @@ fn floats_round_trip_bit_exactly() {
             bits,
             "bits {bits:#018x}"
         );
+    }
+
+    // A non-finite value has no `NEW_FLOAT_EXT` image the oracle will accept: the
+    // C rejects it at decode time (`if (!erts_isfinite(ff.fd)) goto error;`,
+    // `external.c:4667-4669`), so `binary_to_term/1` raises `badarg` for both an
+    // infinity and a NaN. Every one of these images must therefore be `BadArg`.
+    for &bits in &[
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        f64::NAN.to_bits(),
+        0x7ff0_0000_0000_0001, // signaling NaN
+        0x7ff8_0000_dead_beef, // quiet NaN with a payload
+        0xfff0_0000_0000_0001, // negative signaling NaN
+    ] {
+        let mut image = vec![VERSION_MAGIC, NEW_FLOAT_EXT];
+        image.extend_from_slice(&bits.to_be_bytes());
+        assert_bad_arg(&image);
     }
 }
 
@@ -873,8 +887,11 @@ fn proper_and_improper_lists_round_trip() {
 
 #[test]
 fn maps_round_trip_at_pair_boundaries() {
-    // Includes counts past `MAP_SMALL_MAP_LIMIT` (32): every map is a flatmap now.
-    for &n in &[0usize, 1, 2, 32, 33, 40, 100] {
+    // A map of at most `MAP_SMALL_MAP_LIMIT` (32) distinct keys is a **flat map**, whose
+    // keys the decoder sorts into `erts_cmp_flatmap_keys` order
+    // (`beam_term::map::MAP_SMALL_MAP_LIMIT`, `erl_map.c:3187`). The atom keys below are
+    // interned in index order, so that sorted order is exactly the insertion order.
+    for &n in &[0usize, 1, 2, 32] {
         let mut atoms = AtomTable::new();
         let cap = 4 + 2 * n + 64;
         let mut h1 = heap(cap);
@@ -899,6 +916,66 @@ fn maps_round_trip_at_pair_boundaries() {
             assert!(is_atom(keys[i]));
             assert_eq!(a2.name(atom_val(keys[i])).unwrap(), expected.as_str());
             assert_eq!(values[i], make_small(i as i64));
+        }
+    }
+
+    // Above `MAP_SMALL_MAP_LIMIT` the map is a **HAMT**, so the canonical `MAP_EXT` image
+    // is the HAMT image ERTS emits — not the flat-map order of the input. A
+    // `write_map`-built HAMT is byte-identical to the oracle's image
+    // (`tests/map_key_order.rs`), so a canonical image round-trips byte-for-byte while a
+    // locally built flat map is first *canonicalized* into that HAMT image. Integer keys
+    // are used here because a HAMT's storage order depends on `erts_map_hash`, which for
+    // an atom depends on the per-VM-start atom index (see `tests/map_key_order.rs`)
+    // whereas for an integer it is stable.
+    for &n in &[33usize, 40, 100] {
+        let mut h1 = heap(4 + 2 * n + 64);
+        let pairs: Vec<(Eterm, Eterm)> = (0..n as i64)
+            .map(|i| (make_small(i), make_small(i + 100)))
+            .collect();
+        let flat = make_flatmap(&mut h1, &pairs).unwrap();
+        let flat_image = encode_term(flat, &AtomTable::new()).unwrap();
+        assert_eq!(flat_image[1], MAP_EXT);
+        assert_eq!(
+            u32::from_be_bytes([
+                flat_image[2],
+                flat_image[3],
+                flat_image[4],
+                flat_image[5]
+            ]) as usize,
+            n
+        );
+
+        // Decoding the (non-canonical) flat image yields a HAMT; re-encoding gives the
+        // canonical HAMT image.
+        let cap = beam_term::map::map_words_capacity(n) + 64;
+        let mut h2 = heap(cap);
+        let mut atoms2 = AtomTable::new();
+        let t2 = decode_term(&flat_image, &mut h2, &mut atoms2).unwrap();
+        assert!(
+            flatmap_parts(t2).is_err(),
+            "a > 32-pair map decodes to a HAMT, not a flat map"
+        );
+        assert_eq!(beam_term::map::map_size(t2, &atoms2).unwrap(), n);
+
+        let canonical = encode_term(t2, &atoms2).unwrap();
+        assert_eq!(canonical[1], MAP_EXT);
+        assert_eq!(
+            u32::from_be_bytes([canonical[2], canonical[3], canonical[4], canonical[5]]) as usize,
+            n
+        );
+
+        // The canonical image is itself byte-stable: decode → encode is the identity.
+        let mut h3 = heap(cap);
+        let mut atoms3 = AtomTable::new();
+        let t3 = decode_term(&canonical, &mut h3, &mut atoms3).unwrap();
+        assert_eq!(encode_term(t3, &atoms3).unwrap(), canonical);
+
+        // ... and every key maps to its value (checked independently of representation).
+        for i in 0..n as i64 {
+            assert_eq!(
+                beam_term::map::map_get(t2, make_small(i), &atoms2).unwrap(),
+                Some(make_small(i + 100))
+            );
         }
     }
 }
@@ -1922,13 +1999,22 @@ fn binaries_and_bitstrings_round_trip() {
 }
 
 #[test]
-fn over_long_atoms_are_system_limit() {
-    // A crafted `ATOM_UTF8_EXT` carrying 256 characters.
+fn over_long_atoms_are_bad_arg() {
+    // A crafted `ATOM_UTF8_EXT` carrying 256 characters. Decoding it is malformed
+    // input (`badarg`), matching the oracle: C rejects an over-long name in
+    // `erts_atom_put`/`erts_atom_get` (`atom.c:258-274`, `atom.c:392-418`) and
+    // `dec_term` turns that into `goto error` (`external.c:4529-4539`).
     let mut image = vec![VERSION_MAGIC, ATOM_UTF8_EXT, 0x01, 0x00];
     image.extend(std::iter::repeat(b'a').take(256));
-    assert_system_limit(&image);
+    assert_bad_arg(&image);
 
-    // Interning a 256-character name and encoding it is a `SystemLimit` too.
+    // Latin-1 too.
+    let mut latin1 = vec![VERSION_MAGIC, ATOM_EXT, 0x01, 0x00];
+    latin1.extend(std::iter::repeat(b'a').take(256));
+    assert_bad_arg(&latin1);
+
+    // Encoding a 256-character name is still a `SystemLimit` (the encoder's own
+    // bound; the wire has no way to carry it).
     let mut atoms = AtomTable::new();
     let long = make_atom(atoms.intern(&"a".repeat(256)));
     assert!(matches!(
@@ -1938,10 +2024,12 @@ fn over_long_atoms_are_system_limit() {
 }
 
 #[test]
-fn oversized_bignums_are_system_limit() {
+fn oversized_bignums_are_bad_arg() {
     // `LARGE_BIG_EXT` with a byte count past `BIG_ARITY_MAX * sizeof(ErtsDigit)`
-    // (65535 * 8 = 524280 bytes, `external.c:6146`).
-    assert_system_limit(&[VERSION_MAGIC, LARGE_BIG_EXT, 0x00, 0x08, 0x00, 0x19]);
+    // (65535 * 8 = 524280 bytes, `external.c:6146`). The bound is a wire bound, and
+    // the C routes every decode failure — bounds included — to `B2TBadArg`
+    // (`external.c:1989-1991`), so the oracle answers `badarg`, not `system_limit`.
+    assert_bad_arg(&[VERSION_MAGIC, LARGE_BIG_EXT, 0x00, 0x08, 0x00, 0x19]);
 
     // Building such a bignum is rejected by the constructor as well (the bound is on
     // the digit count).
@@ -1959,38 +2047,103 @@ fn oversized_bignums_are_system_limit() {
 }
 
 #[test]
-fn signed_bignum_with_bad_sign_byte_is_bad_arg() {
-    // The sign byte is neither 0 nor 1.
-    assert_bad_arg(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 2, 5]);
+fn non_zero_bignum_sign_byte_means_negative() {
+    /// Decodes one image and returns the term plus the heap/atom table that own it.
+    fn decode(image: &[u8], cap: usize) -> (Eterm, Heap, AtomTable) {
+        let mut h = heap(cap);
+        let mut a = AtomTable::new();
+        let t = decode_term(image, &mut h, &mut a).expect("decode the fixture image");
+        (t, h, a)
+    }
+
+    // C reads `neg = get_int8(ep)` and treats it as a boolean: **any** non-zero
+    // sign byte means negative (`if (xsgn) d = -d;`, `big.c:3446-3448`), so the
+    // oracle's `binary_to_term(<<131,110,1,2,42>>)` is `-42`, not `badarg`.
+    let (t, _h, _a) = decode(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 2, 42], 64);
+    assert_eq!(t, make_small(-42));
+    assert!(is_small(t));
+
+    // Sign byte 1 is the canonical negative form.
+    let (t, _h, _a) = decode(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 1, 42], 64);
+    assert_eq!(t, make_small(-42));
+
+    // Sign byte 0 is positive.
+    let (t, _h, _a) = decode(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 0, 42], 64);
+    assert_eq!(t, make_small(42));
+
+    // A zero magnitude is zero whatever the sign byte is
+    // (`external.c:4484-4486` "Zero width bignum defaults to zero").
+    let (t, _h, _a) = decode(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 5, 0], 64);
+    assert_eq!(t, make_small(0));
+
+    // The same rule applies to a magnitude that becomes a bignum: 2^64 (nine
+    // base-256 bytes) with sign byte 200 is negative, and its digits are the
+    // magnitude's.
+    let mut image = vec![VERSION_MAGIC, SMALL_BIG_EXT, 9, 200];
+    image.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let (t, _h, _a) = decode(&image, 64);
+    let (negative, digits) = big_parts(t).unwrap();
+    assert!(negative);
+    assert_eq!(digits, &[0, 1]);
 }
 
 #[test]
 fn maps_with_more_than_32_pairs_round_trip() {
-    // 40 pairs is a flatmap now: encode → decode → encode must be byte-stable, with a
-    // 40-pair `MAP_EXT` count and the wire order preserved.
+    // 40 pairs is above `MAP_SMALL_MAP_LIMIT`: the decoded map is a **HAMT**, so the
+    // canonical `MAP_EXT` image is the HAMT image ERTS emits (not the flat-map order of
+    // the input). A `write_map`-built HAMT is byte-identical to the oracle's image
+    // (`tests/map_key_order.rs`), so once canonicalized the wire form is byte-stable.
+    // Integer keys keep the HAMT deterministic (an atom key's hash depends on the
+    // per-VM-start atom index).
     let n = 40usize;
-    let mut atoms = AtomTable::new();
     let mut h1 = heap(4 + 2 * n + 64);
-    let mut pairs = Vec::new();
-    for i in 0..n {
-        let key = make_atom(atoms.intern(&format!("key{i}")));
-        pairs.push((key, make_small(i as i64)));
-    }
+    let pairs: Vec<(Eterm, Eterm)> = (0..n as i64)
+        .map(|i| (make_small(i), make_small(i + 100)))
+        .collect();
     let m = make_flatmap(&mut h1, &pairs).unwrap();
 
-    let (b1, t2, _h2, a2) = roundtrip(m, &atoms, 4 + 2 * n + 64);
+    let atoms = AtomTable::new();
+    let flat_image = encode_term(m, &atoms).unwrap();
+    assert_eq!(flat_image[1], MAP_EXT);
+    assert_eq!(
+        u32::from_be_bytes([flat_image[2], flat_image[3], flat_image[4], flat_image[5]]),
+        40
+    );
 
-    assert_eq!(b1[1], MAP_EXT);
-    assert_eq!(u32::from_be_bytes([b1[2], b1[3], b1[4], b1[5]]), 40);
-    let (keys, values) = flatmap_parts(t2).unwrap();
-    assert_eq!(keys.len(), n);
-    for i in 0..n {
-        assert_eq!(a2.name(atom_val(keys[i])).unwrap(), format!("key{i}"));
-        assert_eq!(values[i], make_small(i as i64));
+    // Decode → HAMT; the flat path no longer applies.
+    let cap = beam_term::map::map_words_capacity(n) + 64;
+    let mut h2 = heap(cap);
+    let mut atoms2 = AtomTable::new();
+    let t2 = decode_term(&flat_image, &mut h2, &mut atoms2).unwrap();
+    assert!(
+        flatmap_parts(t2).is_err(),
+        "a 40-pair map is a HAMT, not a flat map"
+    );
+    assert_eq!(beam_term::map::map_size(t2, &atoms2).unwrap(), 40);
+
+    // The canonical HAMT image round-trips byte-for-byte, and holds every pair.
+    let canonical = encode_term(t2, &atoms2).unwrap();
+    assert_eq!(canonical[1], MAP_EXT);
+    assert_eq!(
+        u32::from_be_bytes([canonical[2], canonical[3], canonical[4], canonical[5]]),
+        40
+    );
+    let mut h3 = heap(cap);
+    let mut atoms3 = AtomTable::new();
+    let t3 = decode_term(&canonical, &mut h3, &mut atoms3).unwrap();
+    assert_eq!(encode_term(t3, &atoms3).unwrap(), canonical);
+    for i in 0..n as i64 {
+        assert_eq!(
+            beam_term::map::map_get(t2, make_small(i), &atoms2).unwrap(),
+            Some(make_small(i + 100))
+        );
     }
 
-    // A pair count past `MAX_ARITYVAL` cannot be a flatmap `arityval`.
-    assert_system_limit(&[VERSION_MAGIC, MAP_EXT, 0x01, 0x00, 0x00, 0x00]);
+    // A pair count whose bit 31 is set is malformed (`external.c:6312`).
+    assert_bad_arg(&[VERSION_MAGIC, MAP_EXT, 0x80, 0x00, 0x00, 0x00]);
+    // A pair count that overruns the wire is `BadArg`: the old flatmap-`arityval`
+    // `SystemLimit` guard is gone, since a HAMT has no `MAX_ARITYVAL` bound.
+    assert_bad_arg(&[VERSION_MAGIC, MAP_EXT, 0x01, 0x00, 0x00, 0x00]);
 }
 
 #[test]

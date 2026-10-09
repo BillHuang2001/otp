@@ -25,8 +25,9 @@
 //! live-oracle cross-checks of the values the oracle reports.
 //!
 //! The oracle is the system `erl` (`$ERTS_ORACLE` or `erl` on `$PATH`, OTP 29 /
-//! erts-17.1). Every check that shells out is a **loud skip** when no Erlang is
-//! installed (`BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure).
+//! erts-17.1). The oracle is **required by default**: a genuinely absent Erlang
+//! fails a check that shells out rather than skipping it; set
+//! `BEAM_ETS_ALLOW_NO_ORACLE=1` to opt out (`BEAM_ETS_REQUIRE_ORACLE=1` forces it).
 
 mod common;
 

@@ -27,8 +27,14 @@ committed `.beam` fixtures, and `src/**` is never touched from here.
 - `TEST_NOTES.md` (crate-root, not owned here) is the authoritative per-suite enumeration; do not
   duplicate it here.
 - A suite needing the system toolchain (a real `.beam`, the `erl` oracle, or an `erlc` fixture
-  build) must SKIP LOUDLY when it is absent — a green run without `erl` proves nothing about
-  corpus parity.
+  build) must SKIP LOUDLY **only when the tool is absent** — a spawn failure
+  (`Command::new("erl"/"erlc").output()` returned `Err`, no tool on PATH); a green run without
+  `erl` proves nothing about corpus parity. A tool that RAN and exited non-zero is a HARNESS
+  failure and must PANIC with its captured stdout/stderr, never be folded into "no oracle".
+  Reference: `trace.rs::oracle_eval`.
+- The `fixtures/` directory holds stand-in modules (`lists.beam`, `recv.beam`, …) that SHADOW
+  stdlib when PREPENDED, so an oracle invocation must APPEND it (`erl -pz <dir>`), never prepend
+  (`-pa`, which crashes the emulator at boot with an EMPTY stdout+stderr).
 - `support/` is shared by every test crate; its facade re-exports the whole surface, so a
   re-export an individual crate does not use is not an unused import.
 
@@ -39,6 +45,6 @@ committed `.beam` fixtures, and `src/**` is never touched from here.
 - `type_sizes.rs` → observes the frozen IR size guards (`Instr` ≤ 64 / `Operand` ≤ 16 / `HeapNeed` ≤ 24) over the public types (authoritative pins are the compile-time asserts in `beam_loader/src/instr.rs`)
 - `census.rs` → the `Instr`-variant / `TestKind` execution census + whole-OTP corpus reachability
 - `reductions.rs` → per-instruction reduction charging (exactly-once, host pre-emption) and the suspend/resume slice boundary
-- `gc_roots.rs`, `gc_arena.rs`, `bif_alloc.rs` → GC root-set hand-off, the chunked arena, BIF-driven allocation
+- `gc_roots.rs`, `gc_arena.rs`, `bif_alloc.rs` → GC root-set hand-off, the region heap, BIF-driven allocation
 - `jit.rs`, `jit_real_module.rs` → native baseline tier equivalence (synthetic + real-`erlc` modules); `jit_linking.rs`, `jit_cache.rs`, `jit_code_map.rs`, `jit_compare.rs`, `jit_coverage.rs` → block linking, the cross-run cache, the host code map, and baseline-vs-interpreter coverage; `jit_bench.rs` → the thin driver over the `crate::jit::bench` measurement harness; `jit_cranelift.rs`, `jit_cranelift_real.rs` → the feature-gated Cranelift hot tier
 - everything else (`stdlib_*`, `apps_lists`, `coverage`, `opcodes`, `tuples_lists`, `maps`, `funs`, `floats`, `records`, `bitstrings*`, `exceptions*`, `receive`, `tailcall`, `external_call`, `cross_module_catch`, `clause_dispatch`, `func_info_stacktrace`, `current_module`, `process_info`, `wait_deadline`, `trace`, `gaps`, `bignum_compiled`, `slice`, and the `*_bench`/`*_cost` measurement suites) → per-family / per-contract execution and error-surface suites; see `TEST_NOTES.md`.

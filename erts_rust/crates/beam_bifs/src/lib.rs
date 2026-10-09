@@ -93,7 +93,6 @@ mod numeric;
 mod os_bif;
 mod packet;
 mod persistent_term;
-mod phash;
 mod port;
 mod print;
 mod proc;

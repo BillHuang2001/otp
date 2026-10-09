@@ -41,9 +41,10 @@
 //!   `write_concurrency => true`, while a table *created* `private` with the same
 //!   option reports `false` (probed against the live `erl`).
 //!
-//! The final test re-probes those facts against the system oracle; it skips loudly
-//! without `erl`/`escript` and `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a
-//! failure.
+//! The final test re-probes those facts against the system oracle; the oracle is
+//! **required by default**, so a missing `erl`/`escript` fails the check rather than
+//! skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out; `BEAM_ETS_REQUIRE_ORACLE=1`
+//! forces it).
 
 mod common;
 
@@ -246,8 +247,8 @@ fn changing_the_protection_does_not_renormalize_the_fine_locking_flags() {
 }
 
 /// The oracle probe: it prints one line per fact and the model reproduces every
-/// one of them. Skips loudly without an oracle; `BEAM_ETS_REQUIRE_ORACLE=1` turns
-/// the skip into a failure.
+/// one of them. The oracle is **required by default**, so a missing one fails the
+/// check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out).
 #[test]
 fn protection_change_matches_the_live_oracle() {
     let Some(escript) = oracle::resolve_escript() else {
@@ -278,6 +279,9 @@ fn protection_change_matches_the_live_oracle() {
     // (c) The runtime change does not re-normalize `write_concurrency` /
     //     `decentralized_counters`, while a table *created* `private` is normalized
     //     off.
+    // (d) The change is enforced immediately: a non-owner's read and write of a
+    //     `public` table are denied once it becomes `private`, and re-admitted when
+    //     it is moved back to `public`.
     let expected = [
         "a_non_owner {error,badarg}",
         "b_before public",
@@ -287,6 +291,12 @@ fn protection_change_matches_the_live_oracle() {
         "c_write_concurrency_created_private false",
         "c_decentralized_before true",
         "c_decentralized_after true",
+        "d_public_read ok",
+        "d_public_write ok",
+        "d_private_read badarg",
+        "d_private_write badarg",
+        "d_back_public_read ok",
+        "d_back_public_write ok",
     ];
     assert_eq!(
         observed,
@@ -331,6 +341,53 @@ fn protection_change_matches_the_live_oracle() {
     assert!(ordered.as_requester(Some(owner)).set_access(Access::Private).is_ok());
     assert_eq!(ordered.info().access, Access::Private);
     assert!(ordered.info().decentralized_counters, "c_decentralized_after");
+
+    // (d) the runtime change is enforced immediately for a non-owner: admitted
+    //     while `public`, denied once `private`, admitted again back on `public`.
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(64);
+    let mut prop = table(TableKind::Set, Access::Public, false);
+    prop.set_owner(Some(owner));
+    assert!(
+        prop.as_requester(Some(non_owner))
+            .insert(object(&mut heap, 1, 10), &atoms)
+            .is_ok(),
+        "d_public_write"
+    );
+    assert!(
+        prop.as_requester(Some(non_owner)).lookup(make_small(1), &atoms).is_ok(),
+        "d_public_read"
+    );
+    prop.as_requester(Some(owner))
+        .set_access(Access::Private)
+        .expect("the owner may move it to `private`");
+    assert!(
+        matches!(
+            prop.as_requester(Some(non_owner)).lookup(make_small(1), &atoms),
+            Err(BeamError::BadArg)
+        ),
+        "d_private_read"
+    );
+    assert!(
+        matches!(
+            prop.as_requester(Some(non_owner)).insert(object(&mut heap, 3, 30), &atoms),
+            Err(BeamError::BadArg)
+        ),
+        "d_private_write"
+    );
+    prop.as_requester(Some(owner))
+        .set_access(Access::Public)
+        .expect("the owner may move it back to `public`");
+    assert!(
+        prop.as_requester(Some(non_owner)).lookup(make_small(1), &atoms).is_ok(),
+        "d_back_public_read"
+    );
+    assert!(
+        prop.as_requester(Some(non_owner))
+            .insert(object(&mut heap, 4, 40), &atoms)
+            .is_ok(),
+        "d_back_public_write"
+    );
 }
 
 /// The oracle program: a non-owner's denied `{protection, …}`, an owner's accepted
@@ -364,6 +421,29 @@ main(_) ->
     true = ets:setopts(T3, {protection, private}),
     DcAfter = ets:info(T3, decentralized_counters),
 
+    %% (d) A runtime change is enforced **immediately** for a non-owner: moving a
+    %%     `public` table to `private` denies its read and write, and moving it
+    %%     back to `public` re-admits them.
+    Run = fun(F) ->
+        RRef = make_ref(),
+        Mom = self(),
+        spawn(fun() ->
+            V = try F() of _ -> ok catch error:badarg -> badarg end,
+            Mom ! {RRef, V}
+        end),
+        receive {RRef, W} -> W end
+    end,
+    T4 = ets:new(prop_table, [set, public]),
+    ets:insert(T4, {1, 10}),
+    DPublicRead = Run(fun() -> ets:lookup(T4, 1) end),
+    DPublicWrite = Run(fun() -> ets:insert(T4, {2, 20}) end),
+    true = ets:setopts(T4, {protection, private}),
+    DPrivateRead = Run(fun() -> ets:lookup(T4, 1) end),
+    DPrivateWrite = Run(fun() -> ets:insert(T4, {3, 30}) end),
+    true = ets:setopts(T4, {protection, public}),
+    DBackRead = Run(fun() -> ets:lookup(T4, 1) end),
+    DBackWrite = Run(fun() -> ets:insert(T4, {4, 40}) end),
+
     io:format("a_non_owner ~p~n", [NonOwner]),
     io:format("b_before ~p~n", [Before]),
     io:format("b_result ~p~n", [Result]),
@@ -372,5 +452,11 @@ main(_) ->
     io:format("c_write_concurrency_created_private ~p~n", [WcCreatedPrivate]),
     io:format("c_decentralized_before ~p~n", [DcBefore]),
     io:format("c_decentralized_after ~p~n", [DcAfter]),
+    io:format("d_public_read ~p~n", [DPublicRead]),
+    io:format("d_public_write ~p~n", [DPublicWrite]),
+    io:format("d_private_read ~p~n", [DPrivateRead]),
+    io:format("d_private_write ~p~n", [DPrivateWrite]),
+    io:format("d_back_public_read ~p~n", [DBackRead]),
+    io:format("d_back_public_write ~p~n", [DBackWrite]),
     halt(0).
 "#;

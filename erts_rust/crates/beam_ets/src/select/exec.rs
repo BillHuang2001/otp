@@ -91,9 +91,12 @@ pub(super) fn spec_for_pattern(
 /// Run `spec` against one object: the value of the first clause whose head
 /// matches and whose guards all hold, or `None` when no clause matches.
 ///
-/// A guard that raises makes its clause fail (mirroring the C `matchCatch`), while
-/// a **body** expression that raises at runtime is replaced by the atom `EXIT`
-/// and evaluation continues (the C `FAIL_TERM`) — see the body comment below.
+/// A guard the oracle itself raises (`badarg`) makes its clause fail (mirroring the
+/// C `matchCatch`) — see [`guards_hold`] for the exact classification — while a guard
+/// this runtime **cannot evaluate** is a typed error propagated to the caller, never a
+/// silent non-match. A **body** expression that raises at runtime is replaced by the
+/// atom `EXIT` and evaluation continues (the C `FAIL_TERM`) — see the body comment
+/// below.
 ///
 /// # Host requirement: `EXIT` must be interned
 ///
@@ -114,7 +117,7 @@ pub(super) fn run_clauses(
         if !pattern::matches(&clause.head, object, atoms, &mut binds) {
             continue;
         }
-        if !guards_hold(&clause.guards, &binds, object, atoms, heap) {
+        if !guards_hold(&clause.guards, &binds, object, atoms, heap)? {
             continue;
         }
         // The body is a sequence: the clause's value is the value of its **last**
@@ -170,8 +173,31 @@ fn exit_term(atoms: &AtomTable) -> Result<Eterm> {
         .ok_or_else(crate::error::badarg)
 }
 
-/// Whether every guard expression evaluates to `true`; a raising or non-boolean
-/// guard makes the clause fail.
+/// Whether every guard expression holds. A guard the **oracle itself raises** makes
+/// its clause fail (`Ok(false)`); a guard this runtime cannot evaluate is a typed
+/// error and is propagated, never turned into a silent non-match.
+///
+/// # The guard-error classification (mirrors the body path in [`run_clauses`])
+///
+/// The clause fails (`Ok(false)`) for exactly the three ways `erl` treats a guard as
+/// unmet, and **only** those:
+///
+/// 1. a guard that **raises in the oracle** — every oracle-raising guard construct is
+///    the C `badarg` (`element/2` out of range, `hd`/`tl`/`length` of a non-list,
+///    `size/1` of a non-tuple/binary, `map_get/2` with an absent key, `div`/`rem` by
+///    zero, a non-number arithmetic operand, …) and reaches the executor as
+///    [`BeamError::BadArg`] — so `Err(BeamError::BadArg) => Ok(false)`, the C
+///    `matchCatch`;
+/// 2. a guard whose value is **not a boolean** (`Value::Bool`/`true`/`false` is
+///    required) — `erl` treats it as unmet, not as an error;
+/// 3. a guard that evaluates to `false` (or, for `and`/`or`, fails the conjunction).
+///
+/// Any **other** error is a capability gap of this runtime (e.g. `unsupported_ets`
+/// from `ArithHook` arithmetic outside small integers), and is returned with `Err` so
+/// the caller of `select`/`match_spec_run` sees a typed failure instead of a silently
+/// under-matching spec (workspace `CONTEXT.md` §3 — no silent swallowing). The body
+/// path below applies the same rule: `BadArg` → the C `FAIL_TERM`, everything else
+/// propagated.
 ///
 /// Guard truth is taken from the value *kind*: a comparison/type test/connective
 /// carries an internal boolean, so no `AtomTable` lookup is needed for the common
@@ -182,17 +208,21 @@ pub(super) fn guards_hold(
     object: Eterm,
     atoms: &AtomTable,
     heap: &mut Heap,
-) -> bool {
+) -> Result<bool> {
     for guard in guards {
         match expr::eval(guard, binds, object, atoms, heap) {
+            // The oracle's own raise: the guard is unmet, the clause is skipped.
+            Err(BeamError::BadArg) => return Ok(false),
+            // A capability gap: never masked as an unmet guard.
+            Err(other) => return Err(other),
+            // A non-boolean guard value is unmet, not an error.
             Ok(value) => match expr::value_bool(value, atoms) {
                 Ok(true) => {}
-                _ => return false,
+                _ => return Ok(false),
             },
-            Err(_) => return false,
         }
     }
-    true
+    Ok(true)
 }
 
 /// Whether a body value is the boolean `true` (`select_delete`/`select_count`).

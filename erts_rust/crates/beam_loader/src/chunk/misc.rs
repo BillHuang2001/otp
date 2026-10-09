@@ -23,9 +23,11 @@
 //! None of these are interpreted *at this layer*: their payloads are opaque bytes here
 //! (`StrT` becomes [`crate::ir::Module::strings`]; `Attr`/`CInf`/`Meta` become
 //! [`crate::ir::Module::attributes`] / [`crate::ir::Module::compile_info`] /
-//! [`crate::ir::Module::meta`]). The `Attr` bytes are additionally *decoded* into a
-//! term one layer up ([`crate::attributes::AttributeTable`], on
-//! [`crate::ir::Module::attributes_term`]).
+//! [`crate::ir::Module::meta`]). The `Attr`, `CInf` and `Meta` bytes are additionally
+//! *decoded* into terms one layer up, through the shared
+//! [`crate::decoded::DecodedTerm`] holder ([`crate::attributes::AttributeTable`] for
+//! `Attr`, on [`crate::ir::Module::attributes_term`] /
+//! [`crate::ir::Module::compile_info_term`] / [`crate::ir::Module::meta_term`]).
 //!
 //! The debug chunks `DbgB`/`Dbgi` are recognized ids whose payloads are deliberately
 //! neither parsed nor captured (tooling-only); see [`crate::chunk::classify`] for the

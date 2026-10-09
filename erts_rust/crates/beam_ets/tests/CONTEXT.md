@@ -13,16 +13,23 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
   the live `erl` and under `beam_ets`, compared as canonical text renderings.
 
 ## Oracle gate (important)
-`common/oracle.rs` is the shared `erl`/`escript` plumbing.
-- **A genuinely absent oracle is a LOUD SKIP that COUNTS AS A PASS**: `oracle::skip()` prints
-  `[oracle] … SKIPPED …` to stderr and returns, so `cargo test` reports the test as *passing*.
-- `BEAM_ETS_REQUIRE_ORACLE=1` turns that skip into a failure (`oracle::required()`); **no in-repo
-  script or CI sets it** (`.github/workflows/erts_rust.yml` runs plain `cargo test --workspace`).
-  CI does install OTP (`erlef/setup-beam`, otp-version '28'), so the oracle tests normally run there;
-  locally without `erl` they silently pass.
-- `$ERTS_ORACLE` set to a non-executable path is a HARD error (a misconfig must not read as "no oracle").
-- `ets_continuation.rs` duplicates the oracle plumbing + gate locally rather than using `common::oracle`
-  (functionally equivalent; drift risk).
+`common/oracle.rs` is the crate's **single** oracle gate and the one home for the shared
+`erl`/`erlc`/`escript` plumbing every live cross-check goes through.
+- **The oracle is REQUIRED by default**: `oracle::required()` is `true` unless the environment
+  explicitly opts out, so a genuinely absent Erlang **FAILS** the calling test — with a message that
+  names the check and the opt-out — instead of skipping it. A machine without `erl` can therefore no
+  longer turn the differential evidence into a vacuous pass.
+- **Opt-out (explicit):** `BEAM_ETS_ALLOW_NO_ORACLE=1` restores the loud skip (`[oracle] … SKIPPED …`
+  on stderr, test reported as passing) for an environment that genuinely has no Erlang.
+  `BEAM_ETS_REQUIRE_ORACLE=1` still **forces** the requirement and overrides the opt-out.
+- `$ERTS_ORACLE` set to a non-executable path is a HARD error in every mode (a misconfig must not read
+  as "no oracle").
+- With `erl`/`escript` on `PATH` the cross-checks run; the `-p beam_ets` suite reports **0 skips**.
+- `differential.rs` and `ets_continuation_direction.rs` keep **no local gate or plumbing**: both
+  resolve their tools through `common::oracle` (`resolve_oracle`/`resolve_escript` built on
+  `find_in_path`/`is_executable`, plus `run_bounded`/`run_escript` and `required`/`skip`).
+  `ets_continuation.rs` holds only fixed-expectation pins (its live battery lives in the `_direction`
+  sibling), so it has no gate to consolidate.
 
 ## Routing Table
 - `ets_basic.rs` → insert/lookup/delete/delete_object/delete_all_objects/take/tab2list, insert_list atomicity, memory-bounded churn per kind/interior
@@ -30,7 +37,8 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
 - `ets_nav.rs` → navigation on every kind (absent anchors, `'$end_of_table'` → `None`)
 - `ets_bag.rs` → `bag`/`duplicate_bag` multi-object semantics + `lookup_element_all`
 - `ets_select.rs`, `select.rs`, `match_spec_run.rs` → match-spec compile/exec, `select*`/`match*`, `fun2ms`-shaped specs
-- `ets_continuation.rs` → limited/continuation forms (own `escript` oracle cross-check)
+- `ets_continuation.rs` → limited/continuation forms: fixed-expectation pins (its live-oracle battery is in the `_direction` sibling, so it needs no gate)
+- `ets_continuation_direction.rs` → the direction/identity half of the continuation family + the shared live-oracle battery (gated through `common::oracle`)
 - `ets_update.rs` → `update_counter`/`update_element` operands
 - `ets_replace.rs` → `select_replace/2` + body-runtime-failure (`EXIT`) rule; oracle renderings quoted inline (offline-derived — pin tests, not live cross-checks) + `recorded_divergence_*` for the oracle's stricter static body check
 - `ets_info.rs` → `ets:info` 15-field proplist
@@ -43,7 +51,7 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
 - `ets_shared.rs` → `Send`/`Sync`, the `SharedTable` lock, no-lost-update concurrency, guard-scoped read aliasing note
 - `ets_concurrency.rs` → lock independence, serial equivalence, no-lost-update check-then-act, live-oracle winner count
 - `differential.rs` + `differential/` → the differential battery (embedded table + live oracle); `battery/` and `erl_program.rs`
-- `common/mod.rs` → shared term/table helpers; `common/oracle.rs` → the live-`erl` plumbing and skip gate
+- `common/mod.rs` → shared term/table helpers; `common/oracle.rs` → the crate's single oracle gate (required by default) + the live-`erl` plumbing (`find_in_path`/`is_executable`/`resolve_escript`/`run_escript`/`run_bounded`/`required`/`skip`)
 
 ## Notes for Agents
 - The aliasing-hazard evidence tests (`a_stale_raw_term_reads_as_a_different_object_after_arena_churn`,

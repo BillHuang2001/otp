@@ -57,10 +57,12 @@
 //!   (so `-0.0 < +0.0` and NaN has a stable position) or IEEE comparison in
 //!   arithmetic mode. In *exact* mode a mixed integer/float pair (`1` vs `1.0`)
 //!   compares by class rank, not numerically — exactly as `erts_cmp` does. In
-//!   *arithmetic* mode a mixed integer/float pair instead compares via the
-//!   best-effort `f64` conversion
-//!   [`crate::number::number_as_f64`] (faithful nearest-double rounding for a
-//!   representable bignum; an unrepresentable magnitude becomes `±inf`).
+//!   *arithmetic* mode a mixed integer/float pair is compared by ERTS's **exact**
+//!   algorithm (`SMALL_FLOAT`/`FLOAT_SMALL`/`BIG_FLOAT`/`FLOAT_BIG`, ported in
+//!   [`numbers`]) — never by lossily converting both sides to `f64`, so
+//!   `9007199254740993 == 9007199254740992.0` is `false` and
+//!   `9007199254740993 > 9007199254740992.0` is `true`, as in the real runtime.
+//!   ([`crate::number::number_as_f64`] is *not* used on this path.)
 //! * **Tuples** compare elementwise after the arity; **lists** (cons cells)
 //!   compare elementwise with the shorter/improper tail deciding a prefix tie;
 //!   **bitstrings** compare bit-by-bit (most-significant first) then by bit size;
@@ -120,16 +122,21 @@ use crate::immediate::{
     atom_val, internal_pid_data, internal_port_data, is_atom, is_small, signed_value,
 };
 use crate::list::{car, cdr, is_list};
-use crate::number::number_as_f64;
 use crate::ops::{class, TermClass};
 use crate::record::{
     record_definition, record_definition_is_exported, record_definition_keys,
     record_definition_module, record_definition_name, record_field_count, record_values,
 };
-use crate::tag::{is_term_word, BIG_SIGN_BIT};
+use crate::tag::is_term_word;
 use crate::thing::{external_pid_parts, external_port_parts, external_ref_parts};
 use crate::tuple::{tuple_element, tuple_size};
 
+/// The numeric arm of the comparison — `erts_cmp_compound`'s `mixed_types` block
+/// and the `big`/`float` helpers it dispatches to. Kept in its own file so the
+/// exact integer ↔ float algorithm stays under its own roof (and file-size budget).
+mod numbers;
+
+use numbers::cmp_numbers;
 /// Ascending term-order rank of a [`TermClass`].
 ///
 /// `rank = 0x11 - _DEF`, so a smaller rank sorts first. See the module docs.
@@ -386,93 +393,7 @@ unsafe fn cmp_floats(a: Eterm, b: Eterm, exact: bool) -> Ordering {
     }
 }
 
-/// Compare two *different-representation* numeric terms.
-fn cmp_numbers(a: Eterm, b: Eterm, ca: TermClass, cb: TermClass, exact: bool) -> Ordering {
-    use TermClass::{Big, Float, Small};
-    match (ca, cb) {
-        // A bignum is always outside the 60-bit small range, so the small's
-        // position is decided solely by the bignum's sign.
-        (Small, Big) => {
-            if big_is_negative(b) {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Big, Small) => {
-            if big_is_negative(a) {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (Big, Big) => unsafe { cmp_bigs(a, b) },
-        // Mixed integer/float.
-        (Float, Small) | (Float, Big) | (Small, Float) | (Big, Float) => {
-            if exact {
-                class_rank(ca).cmp(&class_rank(cb))
-            } else {
-                number_as_f64(a)
-                    .partial_cmp(&number_as_f64(b))
-                    .unwrap_or(Ordering::Greater)
-            }
-        }
-        _ => Ordering::Equal,
-    }
-}
-
-/// Whether a bignum term is negative (`big_sign` — the header's `_BIG_SIGN_BIT`).
-///
-/// # Safety
-///
-/// `x` must be a live bignum term.
-fn big_is_negative(x: Eterm) -> bool {
-    // SAFETY: `x` is boxed; its header word is live.
-    unsafe { (*boxed_val(x)).raw() & BIG_SIGN_BIT != 0 }
-}
-
-/// Compare two bignums limb-by-limb (`big_comp`).
-///
-/// Bignums store `ErtsDigit` (one machine word) limbs least-significant first,
-/// normalised so the most significant limb is non-zero; comparing the sign, then
-/// the limb count, then the limbs from the most significant downward is exact.
-///
-/// # Safety
-///
-/// `a` and `b` must be live bignum terms.
-unsafe fn cmp_bigs(a: Eterm, b: Eterm) -> Ordering {
-    let (na, nb) = (big_is_negative(a), big_is_negative(b));
-    if na != nb {
-        return if na { Ordering::Less } else { Ordering::Greater };
-    }
-    // SAFETY: both are boxed bignums.
-    let (pa, pb) = (boxed_val(a), boxed_val(b));
-    let (arity_a, arity_b) = unsafe { (header_arity(*pa), header_arity(*pb)) };
-    let magnitude = if arity_a != arity_b {
-        arity_a.cmp(&arity_b)
-    } else {
-        let mut ord = Ordering::Equal;
-        let mut i = arity_a;
-        while i > 0 {
-            i -= 1;
-            // SAFETY: limb `i` is within the bignum's payload.
-            let (da, db) = unsafe { ((*pa.add(1 + i)).raw(), (*pb.add(1 + i)).raw()) };
-            if da != db {
-                ord = da.cmp(&db);
-                break;
-            }
-        }
-        ord
-    };
-    if na {
-        magnitude.reverse()
-    } else {
-        magnitude
-    }
-}
-
-/// Compare two tuples: by arity first, then elementwise.
-///
+/// Compare two tuples: by arity first, then elementwise.///
 /// # Safety
 ///
 /// `a` and `b` must be live tuple terms.

@@ -269,6 +269,28 @@ pub enum Expr {
     Tl(Box<Expr>),
     /// `length/1`.
     Length(Box<Expr>),
+    /// `map_size/1`.
+    MapSize(Box<Expr>),
+    /// `map_get/2` — `(Key, Map)`; an absent key raises `badarg` (the oracle).
+    MapGet(Box<Expr>, Box<Expr>),
+    /// `is_map_key/2` — `(Key, Map)`; a non-map raises `badarg`.
+    IsMapKey(Box<Expr>, Box<Expr>),
+    /// `tuple_size/1`.
+    TupleSize(Box<Expr>),
+    /// `byte_size/1` — the byte count of a bitstring (`NBYTES(size_in_bits)`).
+    ByteSize(Box<Expr>),
+    /// `bit_size/1` — the bit count of a bitstring.
+    BitSize(Box<Expr>),
+    /// `float/1`.
+    Float(Box<Expr>),
+    /// `trunc/1`.
+    Trunc(Box<Expr>),
+    /// `round/1`.
+    Round(Box<Expr>),
+    /// A map built from key/value expression pairs (`#{K => V, …}` in a guard or a
+    /// body — the C `dmc_map`). The pairs are in the spec's storage order; the map is
+    /// materialised by `beam_term::map::write_map`, which canonicalises them.
+    Map(Vec<(Expr, Expr)>),
     /// `self/0`.
     SelfPid,
     /// An internal boolean literal. Never produced by [`decode`] (a literal
@@ -333,10 +355,19 @@ pub(super) fn decode(term: Eterm, atoms: &AtomTable, vars: &BTreeSet<u32>) -> Re
         let tail = Box::new(decode(tail_term, atoms, vars)?);
         return Ok(Expr::Cons(head, tail));
     }
-    // A map expression would have to be constructed (its values may be
-    // variables); that is outside the supported subset.
+    // A map expression is **constructed** (`dmc_map`): its keys/values may be
+    // variables, so each is decoded as an expression and the map is materialised on
+    // the caller's heap at evaluation time. Verified against the system `erl`: a map
+    // literal is accepted in both a guard and a body
+    // (`ets:select(T, [{{'$1','$2'},[], [#{'$1' => '$2'}]}])` yields a map per
+    // matched object). A map **in a head** is still compared as an exact literal by
+    // `pattern.rs` — that gap is documented, not changed here.
     if classify(term) == TermClass::Map {
-        return Err(badarg());
+        let mut pairs = Vec::new();
+        for (key, value) in map_pairs(term, atoms).map_err(|_| badarg())? {
+            pairs.push((decode(key, atoms, vars)?, decode(value, atoms, vars)?));
+        }
+        return Ok(Expr::Map(pairs));
     }
     Ok(Expr::Literal(term))
 }
@@ -507,6 +538,63 @@ fn decode_call(name: &str, args: &[Eterm], atoms: &AtomTable, vars: &BTreeSet<u3
             }
             Ok(Expr::Length(Box::new(arg(0)?)))
         }
+        // The `guard_tab` additions below are all in the C's callable-guard table
+        // (`erl_db_util.c:572-976`) — each was probed against the system `erl` in
+        // both a guard and a body.
+        "map_size" => {
+            if args.len() != 1 {
+                return Err(badarg());
+            }
+            Ok(Expr::MapSize(Box::new(arg(0)?)))
+        }
+        "map_get" => {
+            if args.len() != 2 {
+                return Err(badarg());
+            }
+            Ok(Expr::MapGet(Box::new(arg(0)?), Box::new(arg(1)?)))
+        }
+        "is_map_key" => {
+            if args.len() != 2 {
+                return Err(badarg());
+            }
+            Ok(Expr::IsMapKey(Box::new(arg(0)?), Box::new(arg(1)?)))
+        }
+        "tuple_size" => {
+            if args.len() != 1 {
+                return Err(badarg());
+            }
+            Ok(Expr::TupleSize(Box::new(arg(0)?)))
+        }
+        "byte_size" => {
+            if args.len() != 1 {
+                return Err(badarg());
+            }
+            Ok(Expr::ByteSize(Box::new(arg(0)?)))
+        }
+        "bit_size" => {
+            if args.len() != 1 {
+                return Err(badarg());
+            }
+            Ok(Expr::BitSize(Box::new(arg(0)?)))
+        }
+        "float" => {
+            if args.len() != 1 {
+                return Err(badarg());
+            }
+            Ok(Expr::Float(Box::new(arg(0)?)))
+        }
+        "trunc" => {
+            if args.len() != 1 {
+                return Err(badarg());
+            }
+            Ok(Expr::Trunc(Box::new(arg(0)?)))
+        }
+        "round" => {
+            if args.len() != 1 {
+                return Err(badarg());
+            }
+            Ok(Expr::Round(Box::new(arg(0)?)))
+        }
         "self" => {
             if !args.is_empty() {
                 return Err(badarg());
@@ -627,10 +715,23 @@ pub(super) fn eval(
         }
         Expr::Abs(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
-            if !is_small(operand) {
-                return Err(badarg());
+            match classify(operand) {
+                // `abs(MIN_SMALL)` is a bignum in the oracle, so the widened value is
+                // range-checked rather than handed to `make_small`.
+                TermClass::Small => try_make_small(signed_value(operand).abs())
+                    .map(Value::Term)
+                    .map_err(|_| unsupported("match-spec 'abs': the result is not a small integer")),
+                // SAFETY: the class established a live float block.
+                TermClass::Float => {
+                    let value = unsafe { float_value(operand) };
+                    write_float_term(heap, value.abs()).map(Value::Term)
+                }
+                // The absolute value of a bignum needs bignum arithmetic: a typed gap,
+                // never a `badarg` that would silently under-match a guard.
+                TermClass::Big => Err(unsupported("match-spec 'abs': a bignum operand")),
+                // The oracle raises `badarg` for every other operand.
+                _ => Err(badarg()),
             }
-            Ok(Value::Term(make_small(signed_value(operand).abs())))
         }
         Expr::Arith(op, parts) => {
             let mut values = Vec::with_capacity(parts.len());
@@ -676,9 +777,176 @@ pub(super) fn eval(
             }
             Ok(Value::Term(make_small(count)))
         }
+        Expr::MapSize(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            map_size(operand, atoms)
+                .map(|count| Value::Term(make_small(count as i64)))
+                .map_err(|_| badarg())
+        }
+        Expr::MapGet(key, map) => {
+            let key = eval_term(key, binds, object, atoms, heap)?;
+            let map = eval_term(map, binds, object, atoms, heap)?;
+            map_get(map, key, atoms)
+                .map_err(|_| badarg())?
+                .map(Value::Term)
+                .ok_or_else(badarg)
+        }
+        Expr::IsMapKey(key, map) => {
+            let key = eval_term(key, binds, object, atoms, heap)?;
+            let map = eval_term(map, binds, object, atoms, heap)?;
+            let present = map_get(map, key, atoms).map_err(|_| badarg())?.is_some();
+            Ok(Value::Bool(present))
+        }
+        Expr::TupleSize(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            tuple_size_of(operand).map(Value::Term)
+        }
+        Expr::ByteSize(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            bitstring_length(operand, true).map(Value::Term)
+        }
+        Expr::BitSize(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            bitstring_length(operand, false).map(Value::Term)
+        }
+        Expr::Float(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            float_of(operand, heap).map(Value::Term)
+        }
+        Expr::Trunc(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            integral_of(operand, false).map(Value::Term)
+        }
+        Expr::Round(operand) => {
+            let operand = eval_term(operand, binds, object, atoms, heap)?;
+            integral_of(operand, true).map(Value::Term)
+        }
+        Expr::Map(pairs) => {
+            let mut built = Vec::with_capacity(pairs.len());
+            for (key, value) in pairs {
+                built.push((
+                    eval_term(key, binds, object, atoms, heap)?,
+                    eval_term(value, binds, object, atoms, heap)?,
+                ));
+            }
+            build_map(built, atoms, heap).map(Value::Term)
+        }
         // No process identity at the ETS layer: the guard raises (the clause is
-        // skipped) rather than producing a wrong pid.
+        // skipped) rather than producing a wrong pid. This is a **semantic**
+        // under-match (the oracle evaluates `self/0` against the calling process),
+        // NOT a swallowed capability gap — see `guards_hold`'s classification.
         Expr::SelfPid => Err(badarg()),
+    }
+}
+
+/// `tuple_size/1`.
+fn tuple_size_of(operand: Eterm) -> Result<Eterm> {
+    if classify(operand) != TermClass::Tuple {
+        return Err(badarg());
+    }
+    // SAFETY: `class` established a live tuple header, whose arity word is readable.
+    Ok(make_small(unsafe { tuple_size(operand) } as i64))
+}
+
+/// `byte_size/1` (`bytes`) / `bit_size/1`: the bitstring's bit count, or its byte
+/// count `NBYTES(bits) = (bits + 7) / 8` (`erts/emulator/beam/erl_bits.h:27`).
+///
+/// A non-bitstring is the oracle's `badarg`. An **off-heap** (refc) binary is a
+/// typed capability gap rather than a `badarg`: it *is* a bitstring, so reporting
+/// `badarg` would let a guard silently under-match (workspace `CONTEXT.md` §3).
+fn bitstring_length(operand: Eterm, bytes: bool) -> Result<Eterm> {
+    match classify(operand) {
+        // SAFETY: the class established a live `ErlHeapBits`/`ErlSubBits` block, which
+        // is all `bitstring_size` reads.
+        TermClass::Bitstring => {
+            let bits = unsafe { bitstring_size(operand) };
+            Ok(make_small(if bytes { (bits + 7) / 8 } else { bits } as i64))
+        }
+        TermClass::BinRef => Err(unsupported(
+            "match-spec 'byte_size'/'bit_size' on an off-heap (refc) binary",
+        )),
+        _ => Err(badarg()),
+    }
+}
+
+/// `float/1`: a small integer casts to the nearest `f64` (the same rounding the
+/// oracle's integer→float conversion uses), a bignum goes through
+/// `beam_term::number::big_to_f64` (faithful nearest-double rounding, `badarg` when
+/// beyond the `f64` range — what the oracle raises), a float is the identity, and
+/// anything else is `badarg`.
+fn float_of(operand: Eterm, heap: &mut Heap) -> Result<Eterm> {
+    let value = match classify(operand) {
+        TermClass::Small => signed_value(operand) as f64,
+        TermClass::Big => match big_to_f64(operand) {
+            None => return Err(badarg()),
+            Some(value) => value,
+        },
+        // `float/1` on a float is the identity (the term is returned unchanged).
+        TermClass::Float => return Ok(operand),
+        _ => return Err(badarg()),
+    };
+    write_float_term(heap, value)
+}
+
+/// Materialise a fresh float term on `heap`.
+fn write_float_term(heap: &mut Heap, value: f64) -> Result<Eterm> {
+    // SAFETY: `alloc_words(FLOAT_SIZE_WORDS)` hands back the two exclusively-owned,
+    // writable words a float occupies; `write_float` writes both before the term
+    // escapes, and the heap outlives it.
+    unsafe {
+        let words = heap.alloc_words(FLOAT_SIZE_WORDS)?;
+        Ok(write_float(words, value))
+    }
+}
+
+/// `trunc/1` (`round == false`) / `round/1`.
+///
+/// An integer operand is the **identity** (what `erl` returns). A float truncates
+/// toward zero (`f64::trunc`) or rounds **half away from zero** (`f64::round` is
+/// exactly Erlang's — verified against `erl`: `round(2.5)` is `3`, `round(-2.5)` is
+/// `-3`, `round(2.4)` is `2`, `trunc(1.9)` is `1`, `trunc(-1.9)` is `-1`). A result
+/// outside the 60-bit small range is a bignum in the oracle (`round(1.0e30)`), so it
+/// is the typed `unsupported_ets` — never a truncated wrong integer. A non-number is
+/// the oracle's `badarg`.
+fn integral_of(operand: Eterm, round: bool) -> Result<Eterm> {
+    match classify(operand) {
+        // An integer operand is returned unchanged (`trunc/1`/`round/1` are the
+        // identity on integers, including a bignum).
+        TermClass::Small | TermClass::Big => Ok(operand),
+        TermClass::Float => {
+            // SAFETY: the class established a live float block.
+            let value = unsafe { float_value(operand) };
+            let integral = if round { value.round() } else { value.trunc() };
+            // `2^59` is the exclusive bound of the 60-bit small range.
+            const BOUND: f64 = 576_460_752_303_423_488.0;
+            if !integral.is_finite() || integral.abs() >= BOUND {
+                return Err(unsupported(
+                    "match-spec 'trunc'/'round': the result is not a small integer",
+                ));
+            }
+            // `|integral| < 2^59` and `integral` is integer-valued, so the cast is
+            // exact and in range.
+            try_make_small(integral as i64).map_err(|_| {
+                unsupported("match-spec 'trunc'/'round': the result is not a small integer")
+            })
+        }
+        _ => Err(badarg()),
+    }
+}
+
+/// Materialise a map from already-evaluated key/value pairs on `heap`, through
+/// `beam_term::map::write_map` (last-wins dedup, a flat map at most
+/// `MAP_SMALL_MAP_LIMIT` keys, else the ERTS HAMT layout) — the frozen map builder,
+/// never a local one.
+fn build_map(pairs: Vec<(Eterm, Eterm)>, atoms: &AtomTable, heap: &mut Heap) -> Result<Eterm> {
+    let capacity = map_words_capacity(pairs.len());
+    // SAFETY: `alloc_words(capacity)` hands back `capacity` exclusively-owned,
+    // writable words — exactly `write_map`'s precondition — and `write_map`
+    // initialises every word of the map it returns, which borrows that storage; the
+    // heap outlives the term.
+    unsafe {
+        let hp = heap.alloc_words(capacity)?;
+        write_map(hp, &pairs, atoms).map_err(BeamError::from)
     }
 }
 

@@ -21,13 +21,25 @@
 //! Shared plumbing for the integration tests that shell out to the **system Erlang
 //! oracle** (`erl`/`escript` on `$PATH`, or whatever `$ERTS_ORACLE` points at).
 //!
-//! Every test that needs the real `ets` follows the same conventions:
+//! # The oracle gate
 //!
-//! * a genuinely absent Erlang is a **loud skip** (`eprintln!` of what was skipped and
-//!   why), turned into a failure by `BEAM_ETS_REQUIRE_ORACLE=1` — for CI, where a
-//!   silently skipped oracle must not look like evidence;
-//! * a `$ERTS_ORACLE` that points at a non-executable file is a **hard error**, since a
-//!   misconfiguration must never be mistaken for "no oracle";
+//! The oracle cross-checks are the crate's compatibility evidence, so they **run by
+//! default and a genuinely absent Erlang is a FAILURE**, never a skip: a machine
+//! without `erl` must not be able to turn the differential evidence into a vacuous
+//! pass. The gate is:
+//!
+//! * the oracle is **required** by default — [`required`] is `true` unless the
+//!   environment explicitly opts out;
+//! * `BEAM_ETS_ALLOW_NO_ORACLE=1` is the **opt-out** for an environment that genuinely
+//!   has no Erlang; it restores the old loud-skip behaviour (`oracle::skip` prints
+//!   `[oracle] … SKIPPED …` to stderr and the test passes);
+//! * `BEAM_ETS_REQUIRE_ORACLE=1` still **forces** the requirement (it overrides the
+//!   opt-out), so a runner can be explicit about demanding the oracle;
+//! * a `$ERTS_ORACLE` that points at a non-executable file is a **hard error** in every
+//!   mode, since a misconfiguration must never be mistaken for "no oracle".
+//!
+//! Further conventions:
+//!
 //! * any scratch file lives under `env::temp_dir()` (i.e. `$TMPDIR`) and is removed
 //!   afterwards, whether or not the oracle succeeded;
 //! * the child is run with a wall-clock bound, so a wedged oracle fails the test
@@ -43,26 +55,55 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Whether `$BEAM_ETS_REQUIRE_ORACLE` asks for the oracle to be mandatory.
+/// The env var that explicitly opts OUT of the oracle requirement.
 ///
-/// An unset, empty or `0` value means "skipping is acceptable".
+/// A "truthy" value (set, non-empty, not `0`) accepts a missing oracle: `oracle::skip`
+/// then prints a note and the test passes — the behaviour every oracle-less
+/// environment must ask for explicitly.
+pub const ALLOW_NO_ORACLE: &str = "BEAM_ETS_ALLOW_NO_ORACLE";
+
+/// The env var that explicitly **forces** the oracle to be required.
+///
+/// Redundant with the default (required), but it overrides [`ALLOW_NO_ORACLE`], so a
+/// runner can demand the oracle unambiguously.
+pub const REQUIRE_ORACLE: &str = "BEAM_ETS_REQUIRE_ORACLE";
+
+/// Whether the oracle is **mandatory** — the default.
+///
+/// `true` unless `BEAM_ETS_ALLOW_NO_ORACLE` explicitly opts out; `BEAM_ETS_REQUIRE_ORACLE`
+/// always wins. See the module docs for why skipping must be opt-in.
 pub fn required() -> bool {
-    match env::var("BEAM_ETS_REQUIRE_ORACLE") {
+    env_flag(REQUIRE_ORACLE) || !allow_no_oracle()
+}
+
+/// Whether `$BEAM_ETS_ALLOW_NO_ORACLE` explicitly accepts a missing oracle.
+pub fn allow_no_oracle() -> bool {
+    env_flag(ALLOW_NO_ORACLE)
+}
+
+/// A "truthy" environment flag: set, non-empty and not `0`.
+fn env_flag(name: &str) -> bool {
+    match env::var(name) {
         Ok(value) => !value.is_empty() && value != "0",
         Err(_) => false,
     }
 }
 
-/// Report a skipped oracle cross-check, or panic when the oracle was required.
+/// Report a skipped oracle cross-check, or **fail** when the oracle is required
+/// (the default — see [`required`]).
 ///
-/// Every caller passes its own test name, so the printed note names the check that
-/// did not run.
+/// Every caller passes its own test name, so both the failure and the skip note name
+/// the check that did not run, and the failure says how to opt out.
 pub fn skip(test: &str, why: &str) {
-    let note = format!("{test}: SKIPPED — {why}.");
     if required() {
-        panic!("{note} $BEAM_ETS_REQUIRE_ORACLE is set, so this is a failure.");
+        panic!(
+            "{test}: FAILED — {why}.\n\
+             The oracle cross-checks are REQUIRED by default so that a machine without Erlang \
+             cannot turn the differential evidence into a vacuous pass. Install Erlang, or point \
+             $ERTS_ORACLE at an existing one, or set {ALLOW_NO_ORACLE}=1 to opt out explicitly."
+        );
     }
-    eprintln!("[oracle] {note}");
+    eprintln!("[oracle] {test}: SKIPPED — {why}. ({ALLOW_NO_ORACLE} is set.)");
 }
 
 /// Locate the oracle's `escript` from `$ERTS_ORACLE`, then `$PATH`.

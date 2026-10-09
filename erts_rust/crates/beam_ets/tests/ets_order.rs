@@ -688,8 +688,9 @@ norm(_, L) -> lists:sort(L).
 /// the comparison is exact (ascending / descending); for the hash kinds it is the
 /// multiset the recorded battery pins.
 ///
-/// Skips loudly when no Erlang is installed; `BEAM_ETS_REQUIRE_ORACLE=1` turns the
-/// skip into a failure.
+/// The oracle is **required by default**, so a missing Erlang fails this check
+/// rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out;
+/// `BEAM_ETS_REQUIRE_ORACLE=1` forces it).
 #[test]
 fn traverse_order_agrees_with_the_live_oracle() {
     let Some(escript) = oracle::resolve_escript() else {

@@ -34,7 +34,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   is copied twice.
   Immediates and literal-area terms are **shared** (returned unchanged); cons cells, tuples/records,
   funs, flat maps and **hash maps** (the whole HAMT trie — every node kind plus its leaf cons cells and
-  collision tuples) are copied.
+  collision tuples) are copied. A `SUB_BITS` **match context** (an `ErlSubBits` over an on-heap
+  bitstring) is **flattened** into a fresh on-heap bitstring for its window (never copied verbatim, so
+  the destination never aliases the source heap).
   An off-heap reference is **refcounted, never deep-copied**, in three flavours: an **MSO container**
   (`HEADER_BIN_REF`, `val` = the MSO slot), a **refc binary** (the 8-word `[BinRef][ErlSubBits]` pair,
   the payload shared via its `RefcBinary` handle) and an **external pid/port/ref** (whose node is
@@ -271,6 +273,11 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   pointer in the copied `BinRef.val`, and fixes the copied `ErlSubBits.orig` up to the **copied**
   `BinRef` — the fix-up an opaque-leaf treatment of a `SUB_BITS` would leave dangling. An on-heap
   **`ErlHeapBits`** small binary has no navigable child and is copied verbatim (its words are opaque).
+  A **match context** `SUB_BITS` (its `orig` is *not* a `BinRef`, i.e. an on-heap bitstring) is instead
+  **flattened** by `copy_match_context` into a fresh on-heap bitstring for the window `start..end`
+  (`copy.c:849-863`), never copied verbatim, so the copy carries no `base_flags`/`orig` pointer into
+  the source heap; `object_words` sizes it `heap_bits_size_words(end - start)` and `for_each_child_slot`
+  yields no child, so the preflight agrees with the copy.
 - **External pid/port/reference nodes: refcounted per identity, modeled locally.** Copying an
   external thing registers its node (`copy.c:882-909`) and copies the thing's words verbatim. There is
   **no node-registry crate anywhere in the workspace** and no `ErlNode *` to point at, so the node
@@ -311,7 +318,7 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   same split as `beam_gc::copy`'s `move_size` — and `preflight_words`' `bounded_words` mirrors it to
   give the whole-graph count the copier will actually write. `beam_term::size_object` (`size_object_x`
   port) remains the canonical flat count and equals `bounded_words` for every shape that can cross a
-  copy boundary (they diverge only for a standalone `SUB_BITS` match context — see Known Issues). All
+  copy boundary (incl. a `SUB_BITS` match context, whose `object_words` is the flattened window size). All
   three size/walk every HAMT node kind with the same `1 + header_arity + popcount(MAP_HEADER_VAL)`
   formulation, so a hash map copies as a whole trie.
 ## Test Strategy
@@ -343,10 +350,12 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `BadArg` promptly at both tiny and huge destinations (and for `copy_struct_shared`) — never a hang;
   a deep **acyclic** graph is refused only by *capacity*, never mis-typed; and a walk of a copied graph
   proves **every** non-shared compound subterm lies inside the destination heap region (nothing still
-  points into the source).
-- `tests/sizing.rs` — **sized-then-copied exactness**: for a 13-shape corpus (small tuple, deep list,
-  improper list, flat map, 64-key HAMT map, nested graph, Local/External fun, record, bitstring, MSO
-  container, refc binary, a graph with a shared refc binary), a destination of exactly
+  points into the source) — the corpus includes a `SUB_BITS` match context, which the copier flattens
+  to a fresh on-heap-bitstring leaf the walk asserts lives in the destination.
+- `tests/sizing.rs` — **sized-then-copied exactness**: for a 14-shape corpus (small tuple, deep list,
+  improper list, flat map, 64-key HAMT map, nested graph, Local/External fun, record, bitstring,
+  `SUB_BITS` match context, MSO container, refc binary, a graph with a shared refc binary), a
+  destination of exactly
   `size_of_copy(term)` words accepts the copy with `to.used() == size_object(term) <= capacity`, and a
   one-word-short (and zero-word) destination is refused with `Alloc(Message)` and
   `used() == peak_used() == 0` (no partial write); immediates/`tuple0()` copy into a zero-capacity heap
@@ -363,7 +372,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `refc_size` on the copy, `dst.used() == ERL_REFC_BITS_SIZE`, dropping the destination table returning
   the source refcount to 1; two occurrences sharing one payload; a refc binary with no owning handle ⇒
   `BadArg`; and an on-heap `ErlHeapBits` small binary copied by value (equal bytes, distinct address,
-  `heap_bits_size_words` words).
+  `heap_bits_size_words` words); and a `SUB_BITS` **match context** over an on-heap bitstring is
+  **flattened** — the copy is a fresh on-heap bitstring (`HEAP_BITS_SUBTAG`, not a `SUB_BITS`) whose
+  bits equal the source window (a non-byte-aligned `start` exercises the bit shift) and whose data base
+  lies inside the destination region, not the source.
 - `tests/external.rs` — external thing copy: words verbatim and the node atom/creation preserved (via
   `external_*_parts`), one node entry per distinct node, two references to the same node ⇒ one entry
   with refcount 2, port and reference nodes registered separately, and dropping the destination
@@ -436,20 +448,11 @@ dominates the small shapes.)
   `THE_NON_VALUE` without panicking). The `beam_message` boundary is guarded by the cycle-safe
   `preflight_words`, but any other caller sizing a term with `size_object` (beam_gc, beam_rt, tools) is
   exposed; a bound/cycle guard belongs in `beam_term` (`src/size.rs`).
-- **A standalone `SUB_BITS` *match context* is copied as an opaque leaf with no `orig` fix-up.** Match
-  contexts **are** constructible (`beam_engine`'s bitstring families, `raw.rs::make_ctx`), but
-  `src/layout.rs` has no `SUB_BITS` arm, so `for_each_child_slot` visits no slot: a context whose
-  `orig` is *not* a `BinRef` (an on-heap bitstring) is copied verbatim and its `orig` keeps pointing
-  into the source heap. `object_words` also sizes such a context as `thing_arityval+1` (5 words) where
-  `beam_term::size_object` reports the copied window, so `size_of_copy` and `preflight_words` can
-  disagree. `beam_gc`'s scan DOES fix the context's `orig` up (`scan_step`'s `orig_index = Some(4)`),
-  so only a context crossing a *copy_struct* boundary (message/fragment) is affected — not reachable
-  through any current send path, but no longer justified as "unreachable".
-- **The per-object sizing + child-slot walk is re-implemented (and subtly divergent) in three crates.**
-  `src/layout.rs`'s `object_words`/`for_each_child_slot` re-derive `beam_gc::copy::{move_size,scan_step,
-  for_each_ref}` and `beam_term::size::describe_object` (`size.rs`); all three are private/`pub(crate)`,
-  so no LCA (not even `beam_term`) exposes one shared walk, and `layout.rs` lacks the `SUB_BITS` arm
-  `describe_object` has (see the bullet above). Extracting one per-object walk into `beam_term` is the fix.
+- **`src/layout.rs` is a to-be-replaced duplicate walk.** `object_words`/`for_each_child_slot` re-derive
+  `beam_gc::copy::{move_size,scan_step,for_each_ref}` and `beam_term::size::describe_object` (`size.rs`);
+  all three are private/`pub(crate)`, so no LCA exposes one shared walk. `beam_term` is publishing a
+  canonical per-object sizing/copy walk that will replace this crate's local one — a follow-up batch
+  adopts it; delete `layout.rs`'s duplicate walk then.
 - **No sharing-preserving copy for the flat path.** `copy_struct` duplicates a repeated subterm
   (C's default); `copy_struct_shared` is the opt-in alternative. Only immediates, literal-area terms
   and the zero-arity tuple are shared outright.
@@ -497,7 +500,7 @@ dominates the small shapes.)
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + the cycle-safe `preflight_words`/`bounded_words`/`is_acyclic` + `size_of_copy`
 - `src/share.rs` → the sharing-preserving `copy_struct_shared` (source-identity memo over `copy.rs`'s `shallow`; preflights via `copy::preflight_words`)
 - `src/fragment.rs` → `HeapFragment` (bump region + off-heap table + roots) and `Fragments` (the chain + `move_into`, ownership released only after the whole chain moves); the `ErlHeapFragment` message-buffer model
-- `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/off-heap container) + refc-binary/external-thing identification + the off-heap container encoding. A fun's block size (`1 + desc_words(kind) + num_free`) and its `env[0]` offset (`1 + desc_words(kind)`) come from `beam_term::fun` (`fun_kind_of_header`/`fun_desc_words`/`fun_num_free`), never the legacy C `ERL_FUN_SIZE`
+- `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/`SUB_BITS` sub-bits/off-heap container) + refc-binary/match-context/external-thing identification + the off-heap container encoding. A fun's block size (`1 + desc_words(kind) + num_free`) and its `env[0]` offset (`1 + desc_words(kind)`) come from `beam_term::fun` (`fun_kind_of_header`/`fun_desc_words`/`fun_num_free`), never the legacy C `ERL_FUN_SIZE`. To-be-replaced duplicate of `beam_term`'s forthcoming canonical walk (see Known Issues)
 - `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`, plus the refc-binary and node lists); MSO handle re-export
 - `src/node.rs` → `NodeEntry`, the refcounted `(node, creation)` external-thing node identity
 - `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + `Queue` FIFO
@@ -505,10 +508,10 @@ dominates the small shapes.)
 - `src/error.rs` → `pub(crate)` copy-failure constructors + the public `is_message_heap_exhaustion` predicate (no new error type)
 - `tests/copy.rs` → flat-copy correctness: nested-graph equality, deep list, literal sharing, MSO refcount, exhaustion, HAMT trie
 - `tests/classes.rs` → term-class completeness across every copyable class
-- `tests/guards.rs` → non-term/cycle guards + the destination-relocation invariant
-- `tests/sizing.rs` → sized-then-copied exactness + too-small-reservation refusal
+- `tests/guards.rs` → non-term/cycle guards + the destination-relocation invariant (incl. a `SUB_BITS` match context)
+- `tests/sizing.rs` → sized-then-copied exactness (incl. the `SUB_BITS` match-context shape) + too-small-reservation refusal
 - `tests/share.rs` → sharing-preserving evidence: N-fold subterm, structural equality, no-sharing size, shared MSO identity
-- `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value
+- `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value + `SUB_BITS` match-context flattening (no source aliasing)
 - `tests/external.rs` → external pid/port/ref verbatim copy + node linkage/refcounting
 - `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path + send atomicity
 - `tests/fun.rs` → closure copy correctness: `make_fun`/`make_fun3` blocks sized/walked from the frozen `beam_term::fun` layout, `=:=` equality, byte-identical `NEW_FUN_EXT`, callability, `env[0]` fix-up

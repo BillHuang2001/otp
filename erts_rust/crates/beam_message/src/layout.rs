@@ -22,8 +22,10 @@
 //! off-heap-container identification and the off-heap reference encoding used by the copier.
 //!
 //! Every boxed shape the copier can meet is sized and walked: transparent tuples/records, funs,
-//! flatmaps, **all three HAMT node kinds** (head-array, head-bitmap and inner node-bitmap) and the
-//! leaf things (float/bignum/ref/off-heap container/heap-sub bits/external pid/port/ref).
+//! flatmaps, **all three HAMT node kinds** (head-array, head-bitmap and inner node-bitmap), an
+//! **`ErlSubBits`** (sized as the whole 8-word refc-binary pair, or as the flattened match-context
+//! window the copier writes — so it is not a plain leaf) and the leaf things
+//! (float/bignum/ref/off-heap container/heap bits/external pid/port/ref).
 //!
 //! Ground truth: `copy.c`'s `move_boxed`/`size_object_x` (the HAMT shape mirrors
 //! `size_object_x`, `copy.c:192-214`) and the frozen `BinRef` container thing
@@ -95,7 +97,32 @@ pub(crate) fn object_words(header: Eterm, object: *const Eterm) -> usize {
             let nslots = map_header_val(header).count_ones() as usize;
             1 + arity + nslots
         }
-        // Every leaf thing (float, bignum, ref, off-heap container, heap/sub bits, external
+        SUB_BITS_SUBTAG => {
+            // `[HEADER_SUB_BITS, base_flags, start, end, orig]` (`copy.c:219-242`) has two shapes,
+            // and this mirrors what `copy_struct` actually writes for each:
+            //
+            // * a **refc binary** (`orig` is a live `BinRef`) is the whole 8-word
+            //   `[BinRef(3)][ErlSubBits(5)]` pair — `copy_refc_binary` materialises all 8 words
+            //   (`copy.c:224-231`);
+            // * anything else is a **match context** over an on-heap bitstring, which `shallow`
+            //   *flattens* into a fresh `heap_bits_size(size)` block (`copy.c:232-239`).
+            //
+            // SAFETY: `object` points at a live, initialized `ErlSubBits` head (the copier's
+            // invariant for every arm here), so words 1..4 of the block are live.
+            let (_base_flags, start, end, orig) = unsafe { sub_bits_parts(make_boxed(object)) };
+            // SAFETY: `orig` is guarded by `is_boxed_term`, so `boxed_val` dereferences only a
+            // live boxed term word (`orig` is an on-heap bitstring for a match context).
+            let is_refc = is_boxed_term(orig) && unsafe { *boxed_val(orig) } == HEADER_BIN_REF;
+            if is_refc {
+                ERL_REFC_BITS_SIZE
+            } else {
+                // A match context over an on-heap bitstring: the copy materialises a fresh
+                // heap-bits block for the window (`copy.c:232-239`), sized exactly as
+                // `beam_term::size::describe_object` counts it.
+                heap_bits_size_words(end.raw().saturating_sub(start.raw()))
+            }
+        }
+        // Every leaf thing (float, bignum, ref, off-heap container, heap bits, external
         // pid/port/ref): header + `arity` payload words.
         _ => thing_arityval(header) + 1,
     }
@@ -106,9 +133,11 @@ pub(crate) fn object_words(header: Eterm, object: *const Eterm) -> usize {
 ///
 /// Offsets are relative to the header word (offset 0). Objects whose payload holds no navigable
 /// on-heap child — a float's value, a bignum's limbs, a reference's words, an off-heap container's
-/// `val`/`next`, and heap/sub-bit data — yield no offsets. Every **HAMT node kind** (head-array,
-/// head-bitmap, inner node-bitmap) instead visits all of its slots: each slot is non-immediate (a
-/// leaf cons cell, a boxed sub-node pointer or a collision tuple), so the whole trie is reached.
+/// `val`/`next`, heap bits, and an `ErlSubBits` (the `SUB_BITS` arm yields no offsets: the copier
+/// flattens a match context and copies a refc binary's `BinRef` itself) — yield no offsets. Every
+/// **HAMT node kind** (head-array, head-bitmap, inner node-bitmap) instead visits all of its slots:
+/// each slot is non-immediate (a leaf cons cell, a boxed sub-node pointer or a collision tuple), so
+/// the whole trie is reached.
 ///
 /// `object` must point at the object's header word; it is dereferenced only for a flatmap's size
 /// word.
@@ -150,6 +179,13 @@ pub(crate) fn for_each_child_slot(
                 visit(1 + arity + i);
             }
         }
+        SUB_BITS_SUBTAG => {
+            // An `ErlSubBits` exposes **no** navigable child. A **match context** is *flattened*
+            // by `copy_struct` into an opaque on-heap-bitstring leaf (the window's bits are copied
+            // out; its `orig` is never followed), and a **refc binary**'s `BinRef` is copied
+            // together with the `ErlSubBits` by `copy_refc_binary`, which also writes the copied
+            // `orig` — so neither is a fix-up slot the caller's worklist must resolve.
+        }
         _ => {}
     }
 }
@@ -180,6 +216,27 @@ pub(crate) fn is_off_heap_term(term: Eterm) -> bool {
 pub(crate) fn is_refc_binary_term(term: Eterm) -> bool {
     // SAFETY: the copier only calls this on a live boxed word whose header is initialized.
     unsafe { beam_term::refc::is_refc_binary(term) }
+}
+
+/// Whether `term` is a `SUB_BITS` **match context** — an `ErlSubBits` that is *not* a refc binary
+/// (its `orig` is an on-heap bitstring rather than a `BinRef`).
+///
+/// `copy_struct` **flattens** such a value into a fresh on-heap bitstring (`copy.c:849-863`)
+/// rather than copying the window's `base_flags`/`orig` pointers verbatim, which would leave the
+/// destination term pointing into the source process's heap (a dangling reference once the source
+/// is collected or read). A refc binary is handled separately by `copy_refc_binary` (it shares its
+/// off-heap payload and fixes `orig` up itself), so it is excluded here.
+pub(crate) fn is_match_context_term(term: Eterm) -> bool {
+    if !is_boxed_term(term) {
+        return false;
+    }
+    // SAFETY: `term` is a boxed term, so its header word is a live term word.
+    if unsafe { *boxed_val(term) } != HEADER_SUB_BITS {
+        return false;
+    }
+    // SAFETY: the header fixed `term` at the 5-word `ErlSubBits` layout, so its `orig` slot is
+    // live; `is_refc_binary` reads it and dereferences only a boxed `BinRef`.
+    !unsafe { beam_term::refc::is_refc_binary(term) }
 }
 
 /// Whether `header` is the head word of an external pid, port or reference (`ExternalThing`).
@@ -251,8 +308,6 @@ mod tests {
         assert_eq!(object_words(HEADER_FLONUM, ptr), 2);
         // BIN_REF: header + 2 => 3 words.
         assert_eq!(object_words(HEADER_BIN_REF, ptr), 3);
-        // Sub-bits: header arity 4 => 5 words.
-        assert_eq!(object_words(HEADER_SUB_BITS, ptr), 5);
         // A tuple header of arity 3 => 4 words.
         assert_eq!(object_words(make_arityval(3), ptr), 4);
         // A fun header: `1 + desc_words(kind) + num_free` from the frozen `beam_term::fun`
@@ -281,6 +336,52 @@ mod tests {
         ];
         assert!(is_flatmap_header(words[0]));
         assert_eq!(object_words(words[0], words.as_ptr()), 5);
+    }
+
+    #[test]
+    fn object_words_of_a_sub_bits_matches_the_copy_shape() {
+        // A **match context** over an on-heap bitstring: `orig` is a boxed `ErlHeapBits`, so the
+        // copy flattens the window into a `heap_bits_size(end - start)` block.
+        let heap_bits = [
+            make_header(2, HEAP_BITS_SUBTAG),
+            Eterm::from_raw(16),
+            Eterm::from_raw(0),
+        ];
+        let match_context = [
+            HEADER_SUB_BITS,
+            Eterm::from_raw(0),             // base_flags (unused for sizing)
+            Eterm::from_raw(3),             // start
+            Eterm::from_raw(3 + 21),        // end
+            make_boxed(heap_bits.as_ptr()), // orig = an on-heap bitstring
+        ];
+        assert_eq!(
+            object_words(match_context[0], match_context.as_ptr()),
+            heap_bits_size_words(21)
+        );
+        assert!(
+            is_match_context_term(make_boxed(match_context.as_ptr())),
+            "a `SUB_BITS` whose `orig` is an on-heap bitstring is a match context"
+        );
+
+        // A **refc binary**: `orig` is a boxed `BinRef`, so the whole 8-word pair is copied.
+        let bin_ref = [HEADER_BIN_REF, Eterm::from_raw(0), Eterm::from_raw(0)];
+        let refc = [
+            HEADER_SUB_BITS,
+            Eterm::from_raw(0),
+            Eterm::from_raw(0),
+            Eterm::from_raw(32),
+            make_boxed(bin_ref.as_ptr()),
+        ];
+        assert_eq!(object_words(refc[0], refc.as_ptr()), ERL_REFC_BITS_SIZE);
+        assert!(!is_match_context_term(make_boxed(refc.as_ptr())));
+        assert!(is_refc_binary_term(make_boxed(refc.as_ptr())));
+
+        // Neither `ErlSubBits` shape exposes a navigable child offset.
+        for block in [&match_context[..], &refc[..]] {
+            let mut slots = Vec::new();
+            for_each_child_slot(block[0], block.as_ptr(), |offset| slots.push(offset));
+            assert!(slots.is_empty(), "an `ErlSubBits` exposes no child slot");
+        }
     }
 
     #[test]

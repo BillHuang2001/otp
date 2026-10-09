@@ -38,7 +38,7 @@ use core::mem::size_of;
 use core::str;
 
 use beam_alloc::Heap;
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::prelude::{
     is_atom, make_atom, make_small, try_make_small, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL, NIL,
 };
@@ -62,6 +62,36 @@ const BIG_ARITY_MAX: usize = (1 << 16) - 1;
 /// wire bound is expressed in *bytes* (`n > BIG_ARITY_MAX*sizeof(ErtsDigit)`,
 /// `external.c:6146`).
 const BIG_DIGIT_BYTES: usize = size_of::<u64>();
+
+/// `MAX_REFERENCE` (`erl_term.h:771`): `1 << _REF_NUM_SIZE` = `1 << 18`. The first
+/// reference number of the legacy 18-bit forms (`REFERENCE_EXT` and
+/// `NEW_REFERENCE_EXT`) must stay below it (`external.c:4758` / `:4782`); the
+/// modern `NEWER_REFERENCE_EXT` (and a local node in the shared block,
+/// `external.c:4810`) enforces it only for its own first number.
+const MAX_REFERENCE: u32 = 1 << 18;
+
+/// The error for a **well-formed** external reference whose wire id count is zero.
+///
+/// A zero-length reference is *not* malformed: the C builds a 0-number external
+/// ref block for it (`ref_num[0] = r0` followed by the odd-size padding write,
+/// `external.c:4846-4856`; `external_ref_no_numbers()` then reports 0) and the
+/// oracle accepts it — verified against erts-17.1:
+/// `binary_to_term(<<131,90,0,0,119,1,$n,0,0,0,0,0,0,0,0,0>>)` ⇒ `#Ref<…>`, and
+/// `binary_to_term(<<131,114,0,0,119,1,$n,0,0,0,0>>)` ⇒ `#Ref<…>` with
+/// `[used]` = 12 (the extra `r0` word is consumed either way).
+///
+/// This tree's external-ref block **cannot represent** such a term:
+/// [`beam_term::thing::write_external_ref`] — the layout owner, out of this
+/// crate's scope — requires `1 <= ids.len() <= MAX_REF_IDS`, and
+/// `beam_term`'s `make_hash`/`make_hash2` index `ids[0]` directly. Reported as a
+/// typed `SystemLimit` (a wire-supplied length outside the *representable* range —
+/// the same error [`crate::term::make_external_ref`] returns for a zero-id slice)
+/// rather than materializing a term that would mis-encode on the way out. See the
+/// crate `CONTEXT.md` §Known Issues for the exact `beam_term` change that would
+/// close this gap.
+fn zero_length_ref() -> BeamError {
+    system_limit()
+}
 
 /// Incremental external term format decoder.
 ///
@@ -162,12 +192,80 @@ impl<'a> Decoder<'a> {
                 let raw = self.reader.bytes(31)?;
                 let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
                 let text = str::from_utf8(&raw[..end]).map_err(|_| bad_arg())?;
-                let value: f64 = text.parse().map_err(|_| bad_arg())?;
+                // `sys_chars_to_double` (`../../erts/emulator/sys/unix/sys_float.c:72-140`)
+                // accepts exactly `[+-]? DIGIT+ [.,] DIGIT+ ([eE] [+-]? DIGIT+)?` and
+                // nothing else, and requires a **finite** result. Rust's
+                // `parse::<f64>()` is far more permissive — it also accepts `inf`,
+                // `-inf`, `nan`, `infinity`, `1e5` (no radix), `1.`, `.5`, ` 1.0`,
+                // hex floats and other spellings the oracle rejects with `badarg` —
+                // so the grammar is validated byte by byte before parsing.
+                let bytes = text.as_bytes();
+                let is_digit = |i: usize| matches!(bytes.get(i), Some(&d) if d.is_ascii_digit());
+                let mut i = 0usize;
+                if matches!(bytes.first(), Some(&b'+') | Some(&b'-')) {
+                    i += 1;
+                }
+                let int_start = i;
+                while is_digit(i) {
+                    i += 1;
+                }
+                if i == int_start {
+                    return Err(bad_arg()); // at least one leading digit
+                }
+                if !matches!(bytes.get(i), Some(&b'.') | Some(&b',')) {
+                    return Err(bad_arg()); // a radix character is required
+                }
+                i += 1;
+                let frac_start = i;
+                while is_digit(i) {
+                    i += 1;
+                }
+                if i == frac_start {
+                    return Err(bad_arg()); // at least one fractional digit
+                }
+                if matches!(bytes.get(i), Some(&b'e') | Some(&b'E')) {
+                    i += 1;
+                    if matches!(bytes.get(i), Some(&b'+') | Some(&b'-')) {
+                        i += 1;
+                    }
+                    let exp_start = i;
+                    while is_digit(i) {
+                        i += 1;
+                    }
+                    if i == exp_start {
+                        return Err(bad_arg()); // at least one exponent digit
+                    }
+                }
+                if i != bytes.len() {
+                    return Err(bad_arg()); // trailing characters
+                }
+                // The C retries `strtod` with the flipped radix character
+                // (`sys_float.c:115-124`), so a `,` radix is accepted; Rust's parser
+                // only knows `.`.
+                let normalized;
+                let parse_input = if bytes.contains(&b',') {
+                    normalized = text.replace(',', ".");
+                    normalized.as_str()
+                } else {
+                    text
+                };
+                let value: f64 = parse_input.parse().map_err(|_| bad_arg())?;
+                // `if (!erts_isfinite(*fp)) return -1;` (`sys_float.c:111-113`).
+                if !value.is_finite() {
+                    return Err(bad_arg());
+                }
                 crate::term::make_float(heap, value)
             }
             Tag::NewFloat => {
                 let bits = self.reader.u64be()?;
-                crate::term::make_float(heap, f64::from_bits(bits))
+                // `NEW_FLOAT_EXT` cannot carry an infinity or NaN:
+                // `if (!erts_isfinite(ff.fd)) goto error;` (`external.c:4667-4669`),
+                // so the oracle's `binary_to_term/1` raises `badarg` for both.
+                let value = f64::from_bits(bits);
+                if !value.is_finite() {
+                    return Err(bad_arg());
+                }
+                crate::term::make_float(heap, value)
             }
 
             // ---------------------------------------------------------------
@@ -204,34 +302,102 @@ impl<'a> Decoder<'a> {
             // External identifiers (all carry a nested node atom)
             // ---------------------------------------------------------------
             Tag::Reference => {
+                // `[101][node atom][r0:4 BE][creation:1]` — the C reads `r0`
+                // **before** the 8-bit creation (`external.c:4752-4763`).
                 let node = self.decode_node_atom(heap, atoms)?;
-                let id = self.reader.u32be()?;
+                let r0 = self.reader.u32be()?;
+                // This legacy shape has only an 18-bit count space, and the C
+                // rejects a first number at or past it (`external.c:4758`).
+                if r0 >= MAX_REFERENCE {
+                    return Err(bad_arg());
+                }
                 let creation = u32::from(self.reader.u8()?);
-                crate::term::make_external_ref(heap, node, &[id], creation)
+                // A legacy 8-bit creation must be *tiny* (`is_tiny_creation`,
+                // `external.c:71-72` / `:4763`).
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
+                crate::term::make_external_ref(heap, node, &[r0], creation)
             }
             Tag::NewReference => {
+                // `[114][len:2 BE][node atom][creation:1][r0:4][ids…]`. The C reads
+                // the count, the node, a *tiny* 8-bit creation and then `r0`
+                // **unconditionally** — never gated on `len > 0` (`external.c:4768-4784`):
+                // for `len >= 1` `r0` *is* the first number (`ref_num[0] = r0`,
+                // `external.c:4846`), and for `len == 0` it is read and then zeroed by
+                // the odd-size padding write (`external.c:4856`). So exactly
+                // `max(1, len)` id words follow the creation byte, which is what keeps
+                // the stream aligned (verified against erts-17.1 through
+                // `binary_to_term/2 [used]`: the 8-byte `len == 0` image without the
+                // trailing word reports `used = 12`).
                 let len = usize::from(self.reader.u16be()?);
                 let node = self.decode_node_atom(heap, atoms)?;
                 let creation = u32::from(self.reader.u8()?);
-                let ids = self.read_ids(len)?;
+                // Tiny creation only (`external.c:4777`).
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
+                let r0 = self.reader.u32be()?;
+                // `r0 >= MAX_REFERENCE` ⇒ `badarg` for this form on *every* node,
+                // local or remote (`external.c:4782`; verified against erts-17.1:
+                // `r0 = 262143` ⇒ a ref, `r0 = 262144` ⇒ `badarg`).
+                if r0 >= MAX_REFERENCE {
+                    return Err(bad_arg());
+                }
+                // `ref_words > ERTS_MAX_REF_NUMBERS` ⇒ `badarg`
+                // (`external.c:4799`, in `ref_ext_common`, i.e. *after* `r0`). The
+                // count bound is a *wire* bound, and the C routes every decode
+                // failure — bounds included — to `B2TBadArg` (`binary_to_term_int`,
+                // `external.c:1989-1991`), so the oracle reports **`badarg`** here,
+                // never `system_limit` (verified against erts-17.1).
+                if len > crate::term::MAX_REF_IDS {
+                    return Err(bad_arg());
+                }
+                if len == 0 {
+                    return Err(zero_length_ref());
+                }
+                let mut ids = Vec::with_capacity(len);
+                ids.push(r0);
+                ids.extend(self.read_ids(len - 1)?);
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::NewerReference => {
+                // `[90][len:2 BE][node atom][creation:4][r0:4][ids…]`
+                // (`external.c:4786-4796`): a full 32-bit creation, the same
+                // unconditional `r0` as `NEW_REFERENCE_EXT`, and **no** tiny-creation
+                // or `r0` bound here — the C's `r0 >= MAX_REFERENCE` check sits in the
+                // *local*-node branch (`external.c:4810`), which a remote image never
+                // reaches (verified against erts-17.1: `r0 = 4294967295` ⇒ a ref whose
+                // `262144`-valued first number re-encodes unharmed).
                 let len = usize::from(self.reader.u16be()?);
-                // `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`); `make_external_ref`
-                // enforces the same bound.
-                if len > crate::term::MAX_REF_IDS {
-                    return Err(system_limit());
-                }
                 let node = self.decode_node_atom(heap, atoms)?;
                 let creation = self.reader.u32be()?;
-                let ids = self.read_ids(len)?;
+                let r0 = self.reader.u32be()?;
+                // `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`) ⇒ `badarg` (verified
+                // against erts-17.1).
+                if len > crate::term::MAX_REF_IDS {
+                    return Err(bad_arg());
+                }
+                if len == 0 {
+                    return Err(zero_length_ref());
+                }
+                let mut ids = Vec::with_capacity(len);
+                ids.push(r0);
+                ids.extend(self.read_ids(len - 1)?);
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::Port => {
+                // `[PORT_EXT][node atom][id:4 BE u32][creation:1]` (`external.c:4685-4716`:
+                // `get_uint32` for the id — a full 32-bit word, never 16-bit — then
+                // `get_int8` for the creation; the sizing pass skips 5 extra bytes,
+                // `external.c:6210-6211`).
                 let node = self.decode_node_atom(heap, atoms)?;
-                let number = u64::from(self.reader.u16be()?);
+                let number = u64::from(self.reader.u32be()?);
                 let creation = u32::from(self.reader.u8()?);
+                // Tiny creation only (`external.c:4709`).
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
                 crate::term::make_external_port(heap, node, number, creation)
             }
             Tag::NewPort => {
@@ -254,6 +420,12 @@ impl<'a> Decoder<'a> {
                 let number = self.reader.u32be()?;
                 let serial = self.reader.u32be()?;
                 let creation = u32::from(self.reader.u8()?);
+                // `PID_EXT` carries an 8-bit creation that must be tiny
+                // (`erlang:dec_pid`, `external.c:3159-3164` / `is_tiny_creation`
+                // `external.c:71-72`).
+                if creation > 3 {
+                    return Err(bad_arg());
+                }
                 crate::term::make_external_pid(heap, node, number, serial, creation)
             }
             Tag::NewPid => {
@@ -272,8 +444,13 @@ impl<'a> Decoder<'a> {
                     usize::from(self.reader.u8()?)
                 } else {
                     let arity = self.reader.u32be()? as usize;
+                    // The arity is a wire bound, and the C routes every decode failure
+                    // — bounds included — to `B2TBadArg` (`binary_to_term_int`,
+                    // `external.c:1989-1991`), so the oracle reports **`badarg`** for
+                    // an over-long arity, never `system_limit` (verified: erts-17.1
+                    // answers `badarg` for `<<131,105,1,0,0,0>>`).
                     if arity > MAX_ARITYVAL {
-                        return Err(system_limit());
+                        return Err(bad_arg());
                     }
                     arity
                 };
@@ -313,26 +490,44 @@ impl<'a> Decoder<'a> {
             }
             Tag::Map => {
                 let count = self.reader.u32be()? as usize;
-                // The pair count becomes a flatmap `arityval`, whose size field is
-                // `MAX_ARITYVAL` wide, so a larger map cannot be represented.
-                if count > MAX_ARITYVAL {
-                    return Err(system_limit());
+                // ERTS rejects a pair count with bit 31 set before reading any
+                // pair: the sizing pass' `(n >> 31) != 0` guard on 64-bit
+                // `ARCH_64` limits a map to `2^31 - 1` pairs
+                // (`external.c:6311-6315`). A larger count is malformed.
+                if (count >> 31) != 0 {
+                    return Err(bad_arg());
                 }
-                // The wire order (interleaved `K1,V1,…,Kn,Vn`) is what defines the map,
-                // so it is preserved verbatim: this crate never sorts or dedupes on
-                // decode either. ERTS stores a ≤ 32-pair map sorted in
-                // `erts_cmp_flatmap_keys` order and emits that order on the wire
-                // (`erl_map.h:181-199`, `external.c:3746-3769`), so a faithful
-                // decode→re-encode is byte-stable (see the crate `CONTEXT.md`,
-                // §"Map key encode order"). Any pair count (including a > 32-pair HAMT's
-                // image) is materialized as one flat map here.
+                // The pair count is attacker-controlled, so the pairs vector grows
+                // as pairs are read rather than being pre-sized from `count`; a
+                // count that overruns the wire fails on the first truncated read
+                // (below), never with a blind length-driven allocation. The wire
+                // order is interleaved `K1,V1,…,Kn,Vn`.
                 let mut pairs = Vec::new();
                 for _ in 0..count {
                     let key = self.decode(heap, atoms)?;
                     let value = self.decode(heap, atoms)?;
                     pairs.push((key, value));
                 }
-                crate::term::make_flatmap(heap, &pairs)
+                // ERTS canonicalizes the map here (the `external.c:5438-5456`
+                // fixup): `count <= MAP_SMALL_MAP_LIMIT` becomes a FLAT map with
+                // keys sorted in `erts_cmp_flatmap_keys` order
+                // (`erts_validate_and_sort_flatmap`, `erl_map.c:3187`), a larger
+                // count a HAMT (`erts_hashmap_from_array(..., 1)`, `erl_map.c:644`,
+                // keyed by `erts_map_hash`). `write_map` is that constructor, so the
+                // decoded map carries ERTS's storage order and re-encodes
+                // byte-identically (see the crate `CONTEXT.md`, §"Map key encode
+                // order").
+                let map = crate::term::make_map(heap, &pairs, atoms)?;
+                // `write_map` collapses duplicate keys (last value wins), whereas
+                // ERTS **rejects** them in both representations (`external.c:5448`
+                // `error_map_fixup`, reached when the fixup's duplicate check
+                // fails). `maps:from_list/1` is what collapses, not the codec, so a
+                // produced key count below the wire count means a duplicate was
+                // present and the image is malformed.
+                if beam_term::map::map_size(map, atoms)? != count {
+                    return Err(bad_arg());
+                }
+                Ok(map)
             }
 
             // ---------------------------------------------------------------
@@ -441,10 +636,13 @@ impl<'a> Decoder<'a> {
 
     /// Interns `name` and returns the atom term.
     ///
-    /// A name longer than `MAX_ATOM_CHARS` *characters* is a `SystemLimit`.
+    /// A name longer than `MAX_ATOM_CHARS` *characters* is malformed input
+    /// (`badarg`): C rejects such a name in `erts_atom_put`/`erts_atom_get`
+    /// (`atom.c:258-274`, `atom.c:392-418`) and `dec_term` turns that into
+    /// `goto error` (`external.c:4529-4539`).
     fn atom_term(name: &str, atoms: &mut AtomTable) -> Result<Eterm> {
         if name.chars().count() > MAX_ATOM_CHARS {
-            return Err(system_limit());
+            return Err(bad_arg());
         }
         Ok(make_atom(atoms.intern(name)))
     }
@@ -471,27 +669,31 @@ impl<'a> Decoder<'a> {
     /// Decodes a `SMALL_BIG_EXT`/`LARGE_BIG_EXT` magnitude into a small integer
     /// when it fits one, otherwise into a bignum.
     ///
-    /// Mirrors `external.c:4464-4497` (`dec_term`): the sign byte is `0` (positive)
-    /// or `1` (negative), the magnitude is base-256 **least significant first**, and
-    /// a magnitude that fits a single `ErtsDigit` and a 60-bit small decodes to a
-    /// small (never a bignum). Leading zero bytes are stripped first, exactly as C
-    /// does "to avoid creating illegal bignums".
+    /// Mirrors `external.c:4457-4497` (`dec_term`): the sign byte is `neg =
+    /// get_int8(ep)` and C treats it as a boolean — **any non-zero value means
+    /// negative** (`bytes_to_big`'s `if (xsgn) d = -d;`, `big.c:3446-3448`), while
+    /// a zero magnitude defaults to `0` whatever the sign byte is
+    /// (`external.c:4484-4486`). The magnitude is base-256 **least significant
+    /// first**, and a magnitude that fits a single `ErtsDigit` and a 60-bit small
+    /// decodes to a small (never a bignum). Leading zero bytes are stripped first,
+    /// exactly as C does "to avoid creating illegal bignums".
     fn decode_big(&mut self, tag: Tag, heap: &mut Heap) -> Result<Eterm> {
         let byte_count = if tag == Tag::SmallBig {
             usize::from(self.reader.u8()?)
         } else {
             let count = self.reader.u32be()? as usize;
+            // A byte count past `BIG_ARITY_MAX * sizeof(ErtsDigit)`
+            // (`external.c:6146`) is a *wire* bound, and the C routes every decode
+            // failure — bounds included — to `B2TBadArg` (`binary_to_term_int`,
+            // `external.c:1989-1991`): the oracle reports **`badarg`**, never
+            // `system_limit` (verified: 524281 bytes ⇒ `badarg`, 524280 ⇒ `ok`).
             if count > BIG_ARITY_MAX * BIG_DIGIT_BYTES {
-                return Err(system_limit());
+                return Err(bad_arg());
             }
             count
         };
-        let negative = match self.reader.u8()? {
-            0 => false,
-            1 => true,
-            // Any other sign byte is malformed.
-            _ => return Err(bad_arg()),
-        };
+        // Any non-zero sign byte means negative (`external.c:4471` + `big.c:3446`).
+        let negative = self.reader.u8()? != 0;
         let bytes = self.reader.bytes(byte_count)?;
 
         // Strip high-order zero bytes (the most significant end of a
@@ -630,7 +832,14 @@ fn decompress_wrapper(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     }
     // `is_compressed_image` guarantees `bytes[..6]` is present.
     let size = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
-    let body = crate::compress::decompress(&bytes[6..])?;
+    // Inflate bounded by the declared size: the C allocates exactly `size` bytes and
+    // requires zlib to fill it (`dlen != dest_len` is an error, `external.c:1805-1810`),
+    // so a payload that inflates to more than the declaration is `badarg` too. Using the
+    // declaration (rather than `decompress`'s fixed 32 MiB ceiling) keeps a legitimately
+    // large payload — e.g. the 33 MiB binary `tests/compressed_oracle.rs` compresses —
+    // decodable, exactly as the oracle does (`external.c:1768-1781` measures the real
+    // uncompressed size instead of failing).
+    let body = crate::compress::decompress_bounded(&bytes[6..], size)?;
     if body.len() != size {
         return Err(bad_arg());
     }

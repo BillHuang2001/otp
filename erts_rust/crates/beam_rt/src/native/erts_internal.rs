@@ -96,6 +96,10 @@
 //! module.
 
 use beam_common::{BeamError, ExitReason, LiveReason, Raise, Result};
+use beam_dist::flags::{
+    DFLAG_DIST_ADDABLE, DFLAG_DIST_DEFAULT, DFLAG_DIST_MANDATORY, DFLAG_DIST_REJECTABLE,
+    DFLAG_DIST_STRICT_ORDER,
+};
 use beam_engine::terms;
 use beam_loader::container::{ChunkId, Container};
 use beam_process::ProcessId;
@@ -106,22 +110,6 @@ use beam_term::{
 
 use super::RuntimeContext;
 use crate::error;
-
-/// `DFLAG_DIST_DEFAULT` — ERTS's preferred distribution-flag set (`dist.h:113-122`).
-///
-/// The whole flag word, as the oracle's `erts_internal:get_dflags/0` reports it. The
-/// value is a build-time constant (`ERTS_GLOBAL_LIT_DFLAGS_RECORD`), so it is identical
-/// on a non-distributed and on a distributed node and is pinned against the oracle by
-/// the unit test below.
-const DFLAG_DIST_DEFAULT: i64 = 468_283_523_004;
-/// `DFLAG_DIST_MANDATORY` (`dist.h:80-98`) — the flags every peer must support.
-const DFLAG_DIST_MANDATORY: i64 = 17_230_663_572;
-/// `DFLAG_DIST_ADDABLE` (`dist.h:126`) — `DFLAG_DIST_DEFAULT` under its other name.
-const DFLAG_DIST_ADDABLE: i64 = 468_283_523_004;
-/// `DFLAG_DIST_REJECTABLE` (`dist.h:129-132`).
-const DFLAG_DIST_REJECTABLE: i64 = 8_396_866;
-/// `DFLAG_DIST_STRICT_ORDER` (`dist.h:135`) — `DFLAG_DIST_HDR_ATOM_CACHE`.
-const DFLAG_DIST_STRICT_ORDER: i64 = 8_192;
 
 /// The number of base-`b` digits that always fit a small integer —
 /// `digits_per_small_lookup` (`big.c:4115-4122`), `b = 2..=36`, the 64-bit table.
@@ -363,7 +351,12 @@ impl RuntimeContext<'_> {
     ///
     /// The C returns `ERTS_GLOBAL_LIT_DFLAGS_RECORD`, a build-time literal, whenever the
     /// internal `erts_dflags_test_remove` mask is clear — so the answer is the same fixed
-    /// 6-tuple on a non-distributed node and on a `-sname` node alike. The two values
+    /// 6-tuple on a non-distributed node and on a `-sname` node alike. The five flag words
+    /// are the emitter's own `beam_dist::flags` constants (the single source of truth,
+    /// each defined in terms of the individual `DFLAG_*` bits), narrowed to `i64` for
+    /// `make_small`: `DFLAG_DIST_DEFAULT` (the whole preferred set), `DFLAG_DIST_MANDATORY`
+    /// (what every peer must offer), `DFLAG_DIST_ADDABLE` (`DFLAG_DIST_DEFAULT` under its
+    /// other name), `DFLAG_DIST_REJECTABLE` and `DFLAG_DIST_STRICT_ORDER`. The two values
     /// above 2^32 are 60-bit `fixnum`s in the oracle (they are *slots* in a literal
     /// record, not heap-built bignums), so `term_to_binary/1` renders them through the
     /// codec's `SMALL_BIG_EXT` path for a wide fixnum; the unit test pins the whole
@@ -378,11 +371,11 @@ impl RuntimeContext<'_> {
             self,
             &[
                 tag,
-                make_small(DFLAG_DIST_DEFAULT),
-                make_small(DFLAG_DIST_MANDATORY),
-                make_small(DFLAG_DIST_ADDABLE),
-                make_small(DFLAG_DIST_REJECTABLE),
-                make_small(DFLAG_DIST_STRICT_ORDER),
+                make_small(DFLAG_DIST_DEFAULT as i64),
+                make_small(DFLAG_DIST_MANDATORY as i64),
+                make_small(DFLAG_DIST_ADDABLE as i64),
+                make_small(DFLAG_DIST_REJECTABLE as i64),
+                make_small(DFLAG_DIST_STRICT_ORDER as i64),
             ],
         )
     }

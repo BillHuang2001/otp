@@ -134,8 +134,8 @@ pub const CHUNK_KINDS: &[ChunkKind] = &[
     ChunkKind {
         id: ChunkId::CINF,
         name: "CInf",
-        class: ChunkClass::ParsedRaw,
-        reason: "compiler info term -> Module::compile_info (opaque at this layer)",
+        class: ChunkClass::ParsedExposed,
+        reason: "compiler information term -> Module::compile_info (raw) + Module::compile_info_term (decoded)",
     },
     ChunkKind {
         id: ChunkId::LINE,
@@ -164,8 +164,8 @@ pub const CHUNK_KINDS: &[ChunkKind] = &[
     ChunkKind {
         id: ChunkId::META,
         name: "Meta",
-        class: ChunkClass::ParsedRaw,
-        reason: "compiler feature/CPU metadata (part of the module checksum) -> Module::meta (opaque at this layer)",
+        class: ChunkClass::ParsedExposed,
+        reason: "compiler feature metadata term (part of the module checksum) -> Module::meta (raw) + Module::meta_term (decoded)",
     },
     ChunkKind {
         id: ChunkId::DBGB,

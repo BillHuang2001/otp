@@ -12,4 +12,3 @@
 # The owning crate is the node that must close the gap.
 wire/new_fun_ext_encode  beam_rt  an erl_eval lambda's closure identity needs erl_eval/erl_scan/erl_parse (deliberately unclosable)
 proc_signals/statistics_runtime_unsupported  beam_bifs  erlang:statistics/1 `runtime` counter not served
-boot/proc_lib_start_link_blocks_the_boot_path  beam_engine  the cross-module call_ext boundary cannot suspend the process (proc_lib:sync_start/2 receive)

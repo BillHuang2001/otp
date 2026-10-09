@@ -773,8 +773,9 @@ mod tests {
 
     #[test]
     fn an_allocation_list_need_lowers_to_alloc_preserving_entries() {
-        // `{test_heap,{alloc,[{words,1},{floats,0},{funs,1}]},1}` (the fixture form).
-        let entries = vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 1)];
+        // `{test_heap,{alloc,[{words,1},{floats,0},{funs,1}]},1}` (the fixture form);
+        // one fun is `ERL_FUN_SIZE` = 2 words.
+        let entries = vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 2)];
         assert_eq!(
             lower_instr(&raw(
                 Opcode::test_heap,
@@ -857,10 +858,10 @@ mod tests {
     fn heap_need_words_recovers_the_total() {
         assert_eq!(HeapNeed::Words(7).words(), 7);
         assert_eq!(HeapNeed::Alloc(vec![]).words(), 0);
-        // `{alloc,[{words,1},{floats,0},{funs,1}]}` → 1 + 0 + 1 = 2.
+        // `{alloc,[{words,1},{floats,0},{funs,1}]}` → 1 + 0 + (2 × 1) = 3.
         assert_eq!(
-            HeapNeed::Alloc(vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 1)]).words(),
-            2
+            HeapNeed::Alloc(vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 2)]).words(),
+            3
         );
         // `{alloc,[{words,3},{floats,1},{funs,0}]}` → 3 + 2 + 0 = 5.
         assert_eq!(
@@ -939,13 +940,13 @@ mod tests {
         let mut saw_floats = false;
         for (entries, total) in &alloc_forms {
             match total {
-                2 => {
-                    // `{alloc,[{words,1},{floats,0},{funs,1}]}`.
-                    assert_eq!(*entries, vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 1)]);
+                3 => {
+                    // `{alloc,[{words,1},{floats,0},{funs,1}]}` → 1 + 0 + 2.
+                    assert_eq!(*entries, vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 2)]);
                     saw_funs = true;
                 }
                 5 => {
-                    // `{alloc,[{words,3},{floats,1},{funs,0}]}`.
+                    // `{alloc,[{words,3},{floats,1},{funs,0}]}` → 3 + 2 + 0.
                     assert_eq!(*entries, vec![entry(0, 3, 3), entry(1, 1, 2), entry(2, 0, 0)]);
                     saw_floats = true;
                 }

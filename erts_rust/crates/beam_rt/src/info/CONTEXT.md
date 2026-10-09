@@ -14,7 +14,8 @@ erlang:system_info(KEY)]), halt(0).'`.
 ## Module split
 | module | keys |
 |---|---|
-| `info.rs` (parent) | docs · `InfoValue` + `to_eterm` · `SUPPORTED_KEYS` / `UNSUPPORTED_KEYS` · `INFO_ATOMS` · `system_info_value` dispatcher · `allocator_report` · shared helpers · `#[cfg(test)] test_support` |
+| `info.rs` (parent) | docs · `InfoValue` + `to_eterm` · `SUPPORTED_KEYS` / `UNSUPPORTED_KEYS` · `INFO_ATOMS` · `system_info_value` dispatcher · `allocator_report` · shared helpers · re-exports `host::{os_type, system_architecture}` · `#[cfg(test)] test_support` |
+| `info/host.rs` | the host-identity derivations `os_type` (`{unix,<os>}` / `{win32,nt}` from `std::env::consts::OS`) and `system_architecture` (best-effort target triple), via the pure `os_type_for` / `architecture_for` helpers |
 | `info/system.rs` | build/host identity: `version`, `otp_release`, `system_architecture`, `system_version`, `nif_version`, `driver_version`, `wordsize`, `emu_flavor`, `emu_type`, `machine`, `threads`, `smp_support`, `async_dist`, `os_type`, `os_version`, `break_ignored`, `debug_compiled`, `dynamic_trace`, `dynamic_trace_probes`, `modified_timing_level`, `update_cpu_info`, `trace_control_word`, `port_parallelism`, `kernel_poll`, `halt_flush_timeout`, `creation` |
 | `info/limits.rs` | `atom_count`, `atom_limit`, `process_count`, `process_limit`, `port_count`, `port_limit`, `ets_count`, `ets_limit`, `outstanding_system_requests_limit`, `dist_buf_busy_limit`, `delayed_node_table_gc` |
 | `info/schedulers.rs` | `logical_processors` / `_available` / `_online`, `schedulers`, `schedulers_online`, `scheduler_id`, `dirty_cpu_schedulers` / `_online`, `dirty_io_schedulers`, `scheduler_bind_type`, `scheduler_bindings`, `multi_scheduling`, `multi_scheduling_blockers`, `normal_multi_scheduling_blockers`, `thread_pool_size`, `context_reductions` |
@@ -44,7 +45,7 @@ families (`system → limits → schedulers → memory → unsupported`) and fal
 (1048576 or `+P N`), `ets_limit` (8192), `outstanding_system_requests_limit` (32),
 `dist_buf_busy_limit` (1048576), `delayed_node_table_gc` (60), `context_reductions`
 (`CONTEXT_REDS`, `erl_vm.h:47` — the ERTS reduction quantum, an interface constant),
-`heap_type`, `message_queue_data`, `scheduler_bind_type`, `thread_pool_size`,
+`heap_type`, `message_queue_data`, `scheduler_bind_type`,
 `min_heap_size`, `min_bin_vheap_size`, `fullsweep_after`, `garbage_collection`,
 `alloc_util_allocators`, `multi_scheduling_blockers`,
 `normal_multi_scheduling_blockers`, and the `{wordsize, internal|external}` tuple key
@@ -54,15 +55,21 @@ families (`system → limits → schedulers → memory → unsupported`) and fal
 the build's constant tables rather than a literal: `port_limit`
 (`min(next_power_of_two(request), 134217727)`, or the default table `65536`; the request is
 `+Q N` or the clamped `ERL_MAX_PORTS` — `erts_ptab_init_table`/`erts_ptab_max`,
-`erl_ptab.c:383-388`/`erl_ptab.h:266-270`), `{allocator, A}` (`allocator_report`).
+`erl_ptab.c:383-388`/`erl_ptab.h:266-270`), `{allocator, A}` (`allocator_report`),
+`thread_pool_size` (the async-thread-pool size: the `+A N` the CLI preserves in
+`emulator.extra_emulator_flags`, reported as `max(1, N)` — matching the oracle's
+`+A 4`→`4` / `+A 0`→`1`; the oracle's own default `1` when `+A` is absent).
 
 **Self-derived from *this* runtime's own state** (correct-but-smaller — or simply
 different — from the oracle's run-time figure; the same rule `erlang:processes/0` /
 `ports/0` already follows; these must **never** be "fixed" to a hardcoded oracle number):
 `atom_count` (atom-table length), `process_count` (process-table length), `port_count`
 (live `PortRegistry` length), `ets_count` (live table-registry length), `allocated_areas`
-(every value derived from this runtime's own counters; items with no counterpart are an
-honest `0`), `heap_sizes` (`beam_gc::heap_sizes`), `logical_processors` / `_available` /
+(one `size_of::<usize>()` slot per entry of this runtime's own live tables — `export_table` /
+`fun_table` from the loaded modules' `ExpT` exports / `FunT` lambda descriptors,
+`module_refs` / `module_table` / `loaded_code` from the loaded-module set, `dist_table` /
+`node_table` from `Runtime::dist_node()`; an item with no counterpart is an honest `0`),
+`heap_sizes` (`beam_gc::heap_sizes`), `logical_processors` / `_available` /
 `_online` (`available_parallelism`), `schedulers` / `schedulers_online` (`+S N` or the
 processor count), `scheduler_id` (1), `dirty_cpu_schedulers` / `_online` and
 `dirty_io_schedulers` (`+SDcpu`/`+SDio`, else 0), `scheduler_bindings` (`unbound` per
@@ -118,8 +125,8 @@ stable. A test seeds exactly `INFO_ATOMS` and materializes every `SUPPORTED_KEYS
 
 ## Known Issues
 - `trace_control_word` is a static `0` (`system.rs:112`), **not** this runtime's live trace-control word (the real trace state lives in `../trace.rs`); it is pinned against the oracle only for an untraced runtime, so it is grouped with the build/host constants.
-- `os_type` (`info.rs:538-544`) answers `{unix,linux}` for **every** non-Windows target, so it is wrong on macOS / other Unix hosts (the oracle reports `{unix,darwin}`, …); only the Linux case is oracle-equal. `system_architecture` (`info.rs:552-562`) spells out more targets and falls back to `"<arch>-unknown-<os>"`.
-- `CONTEXT_REDS = 4000` is declared here (`schedulers.rs:63`) and independently re-declared as `beam_io::port_task::CONTEXT_REDS` and `beam_process::scheduler::DEFAULT_REDUCTIONS_PER_SLICE`; the three are not linked at compile time.
+- `os_type` / `system_architecture` live in `info/host.rs` and derive from `std::env::consts::OS` / `ARCH` (`os_type_for` / `architecture_for`): `linux`, `macos`(`darwin`) and the BSDs map to the oracle's `{unix,<name>}`, `windows` to `{win32,nt}`, and any other target falls back to the OS constant itself — a best-effort name, not the oracle's build-time `os_type` string. `system_architecture` falls back to the vendor-less `"{arch}-unknown-{os}"` (the vendor is never invented). `info/system.rs`'s `os_type` unit test still asserts the Linux `{unix,linux}` literally (correct here, host-specific); the host-independent mapping is covered by `info/host.rs`'s tests.
+- `CONTEXT_REDS = 4000` is declared here (`info/schedulers.rs`) and independently re-declared as `beam_io::port_task::CONTEXT_REDS` and `beam_process::scheduler::DEFAULT_REDUCTIONS_PER_SLICE`; the three are not linked at compile time.
 - The `{allocator, A}` rows are a live `beam_alloc` snapshot (`beam_alloc::registry::all_stats`) and the counts are real table lengths, but no test drives an allocation and observes a counter rise — "measured" here rests on the `beam_alloc` registry, not on a regression test in this node.
 
 ## Test Strategy
@@ -127,6 +134,11 @@ stable. A test seeds exactly `INFO_ATOMS` and materializes every `SUPPORTED_KEYS
   value for the constants), plus `try_value(other_key) == None` and the unknown-key
   `badarg`. `info/limits.rs` additionally pins the whole `+Q`/`ERL_MAX_PORTS` sizing matrix
   (`1024→1024 … 134217727→134217727`, `legacy`/none→65536) and the default table.
+  `info/schedulers.rs` pins `thread_pool_size` against the `+A` flag (`+A 4`→4, absent→1,
+  `+A 0`→1, a malformed preserved flag→the default); `info/host.rs` pins the OS/triple
+  mapping (`os_type_for`/`architecture_for` incl. the macOS/BSD/Windows cases and the
+  fallback); `info/memory.rs` pins the `allocated_areas` derivations (the real items rise
+  with a loaded module; the counterpart-less items stay `0`).
 - `src/info.rs` tests: `SUPPORTED_KEYS.len() == 63`, `UNSUPPORTED_KEYS.len() == 19`, the
   two sets duplicate-free and disjoint, every supported key answers and **materializes**
   once `INFO_ATOMS` is seeded, every unsupported key classifies as `unsupported`, the

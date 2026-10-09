@@ -179,6 +179,24 @@ impl Machine {
     }
 
     /// `test_arity Value Integer` — the value is a tuple of that arity.
+    ///
+    /// This reproduces C's `test_arity(Fail, Pointer, Arity)`
+    /// (`emu/instrs.tab:1055`): `if (*tuple_val($Pointer) != $Arity) FAIL;` — a bare
+    /// header-word compare with **no** `is_boxed` guard. [`predicates::is_tuple_arity`]
+    /// is `is_boxed(x) && *boxed_val(x) == make_arityval(A)`, and `tuple_val(p) ==
+    /// boxed_val(p)`, so for a **boxed** operand the two are the exact same test: a
+    /// tuple of the right arity succeeds and every other boxed term (float / bignum /
+    /// map / record / binary — none of whose headers is an `ARITYVAL`) fails. Those
+    /// are precisely the semantics of C's production `BEAM_IS_TUPLE`
+    /// (`emu/beam_emu.c:222-227`) and of the fused `is_tuple_of_arity`
+    /// (`emu/instrs.tab:1048`) the compiler emits.
+    ///
+    /// The one divergence is an **immediate** operand: C dereferences
+    /// `p - TAG_PRIMARY_BOXED` (an out-of-term word — undefined behaviour) while the
+    /// engine safely returns `false`. A well-formed module never reaches `test_arity`
+    /// with an immediate, because the loader rewrites that operand to a jump
+    /// (`emu/ops.tab:686`), so the engine is behaviourally equivalent — only strictly
+    /// safer.
     fn eval_test_arity(&self, args: &[Operand], ctx: &mut dyn ExecutionContext) -> Result<bool> {
         let value = self.test_arg(args, 0, ctx)?;
         match args.get(1) {
@@ -219,5 +237,136 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<(Eterm, Eterm)> {
         Ok((self.test_arg(args, 0, ctx)?, self.test_arg(args, 1, ctx)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the `test_arity` test kind (Handoff #6).
+    //!
+    //! Drives `Machine::eval_test` with `TestKind::TestArity` and a real operand
+    //! list (`[x(0), Arity]`) — the interpreter path, not just the predicate. It pins
+    //! the equivalence with C's `test_arity` (`emu/instrs.tab:1055`): a tuple of the
+    //! matching arity succeeds, a tuple of a different arity fails, and a **boxed
+    //! non-tuple** (float / bignum / map — the case the crate note missed) fails too,
+    //! because none of those headers is an `ARITYVAL`.
+    use super::*;
+    use crate::context::MinimalContext;
+    use crate::terms;
+    use beam_term::{make_small, NIL};
+
+    /// Evaluate `test_arity x(0) Arity` over `machine` with `x(0)` set to `value`.
+    ///
+    /// `ctx` is threaded in (rather than created here) so the arena holding the
+    /// boxed `value` outlives the call — `MinimalContext` frees its arena on drop.
+    fn eval_test_arity(
+        ctx: &mut MinimalContext,
+        machine: &mut Machine,
+        module: &Module,
+        value: Eterm,
+        arity: i64,
+    ) -> bool {
+        machine.x_mut()[0] = value;
+        let args = [Operand::X(0), Operand::Integer(arity)];
+        machine
+            .eval_test(module, TestKind::TestArity, &args, ctx)
+            .expect("test_arity evaluates")
+    }
+
+    #[test]
+    fn test_arity_matches_a_tuple_of_the_right_arity() {
+        let module = Module::default();
+        let mut ctx = MinimalContext::new();
+        let mut machine = Machine::new();
+        let t2 = terms::make_tuple(&mut ctx, &[make_small(1), make_small(2)]).unwrap();
+        let elems3 = [make_small(1), make_small(2), make_small(3)];
+        let t3 = terms::make_tuple(&mut ctx, &elems3).unwrap();
+
+        assert!(eval_test_arity(&mut ctx, &mut machine, &module, t2, 2));
+        assert!(!eval_test_arity(&mut ctx, &mut machine, &module, t2, 3));
+        assert!(eval_test_arity(&mut ctx, &mut machine, &module, t3, 3));
+        assert!(!eval_test_arity(&mut ctx, &mut machine, &module, t3, 2));
+    }
+
+    #[test]
+    fn test_arity_rejects_boxed_non_tuples() {
+        // For every *boxed* non-tuple C's `test_arity` (`emu/instrs.tab:1055`) reads
+        // the very same header word the engine reads, and it is never an `ARITYVAL`,
+        // so both fail — the equivalence C's production `BEAM_IS_TUPLE`
+        // (`emu/beam_emu.c:222-227`) implies.
+        let module = Module::default();
+        let mut ctx = MinimalContext::new();
+        let mut machine = Machine::new();
+        let float = terms::make_float(&mut ctx, 1.5).unwrap();
+        let big = terms::make_integer(&mut ctx, i64::MAX).unwrap(); // an exact bignum
+        let map = terms::make_map(
+            &mut ctx,
+            &[(make_small(1), make_small(2))],
+            &module.atom_table,
+        )
+        .unwrap();
+
+        for value in [float, big, map] {
+            for arity in [0, 1, 2, 3] {
+                assert!(
+                    !eval_test_arity(&mut ctx, &mut machine, &module, value, arity),
+                    "a boxed non-tuple must fail test_arity for any arity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_arity_is_safe_for_immediates() {
+        // The one place the engine differs from C: `test_arity` on an immediate
+        // dereferences an out-of-term word in C (undefined behaviour); here it is a
+        // safe `false`. A well-formed module never reaches this (the loader rewrites
+        // an immediate operand to a jump — `emu/ops.tab:686`), but the engine must not
+        // crash on it either.
+        let mut module = Module::default();
+        let atom = module.atom_table.intern("an_atom");
+        let mut ctx = MinimalContext::new();
+        let mut machine = Machine::new();
+
+        for arity in [0, 1, 2] {
+            assert!(!eval_test_arity(
+                &mut ctx,
+                &mut machine,
+                &module,
+                make_small(7),
+                arity
+            ));
+            assert!(!eval_test_arity(
+                &mut ctx,
+                &mut machine,
+                &module,
+                NIL,
+                arity
+            ));
+            assert!(!eval_test_arity(
+                &mut ctx,
+                &mut machine,
+                &module,
+                make_atom(atom),
+                arity
+            ));
+        }
+    }
+
+    #[test]
+    fn test_arity_out_of_range_or_negative_fails() {
+        let module = Module::default();
+        let mut ctx = MinimalContext::new();
+        let mut machine = Machine::new();
+        let t2 = terms::make_tuple(&mut ctx, &[make_small(1), make_small(2)]).unwrap();
+
+        assert!(!eval_test_arity(&mut ctx, &mut machine, &module, t2, -1));
+        assert!(!eval_test_arity(
+            &mut ctx,
+            &mut machine,
+            &module,
+            t2,
+            MAX_ARITYVAL as i64 + 1
+        ));
     }
 }

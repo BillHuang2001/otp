@@ -304,15 +304,26 @@ pub fn cap_chunk(
 }
 
 /// The BEAM error atom a failure raises — `badarg` renders bare, any other
-/// reason as `error:<reason>`, matching the oracle's `catch error:E`.
+/// reason as `error:<reason>`, matching the oracle's `cap/1` (`catch error:E ->
+/// atom_to_list(E)`).
+///
+/// `BeamError::as_atom` can only hand out `&'static str` names, so an **owned**
+/// atom reason — this crate's typed capability gaps, whose reason is
+/// `unsupported_ets: <what>` — would collapse to `error:unknown`. The raise still
+/// carries the name and the oracle renders it, so it is read through the raise's
+/// `ExitReason` (whose `as_atom` *borrows* the name instead of requiring
+/// `'static`), keeping the gap visible instead of masked.
 fn cap_error(error: &BeamError) -> String {
-    match error.as_atom() {
+    let reason = match error {
+        BeamError::Raise(raise) => raise.reason.as_atom(),
+        other => other.as_atom(),
+    };
+    match reason {
         Some("badarg") => "badarg".to_string(),
         Some(reason) => format!("error:{reason}"),
         None => "error:unknown".to_string(),
     }
 }
-
 // ---------------------------------------------------------------------------
 // The battery
 // ---------------------------------------------------------------------------
@@ -424,6 +435,25 @@ impl Battery {
         // SAFETY: `hp` addresses exactly `heap_bits_size_words(len * 8)` words.
         unsafe { write_binary(hp, bytes).expect("the binary fits") }
     }
+
+    /// A flat map on the arena from `pairs` (the `#{K => V, …}` a spec guard, a
+    /// spec body or an object constructs), built with the frozen
+    /// `beam_term::map::write_map` the runtime uses — never a local map builder.
+    fn map(&mut self, pairs: &[(Eterm, Eterm)]) -> Eterm {
+        let capacity = map_words_capacity(pairs.len());
+        // SAFETY: `alloc_words(capacity)` hands back exactly the `capacity`
+        // exclusively-owned, writable words `write_map`'s contract requires;
+        // `write_map` initialises every word of the map it returns and the arena
+        // outlives the term.
+        unsafe {
+            let hp = self
+                .heap
+                .alloc_words(capacity)
+                .expect("the battery arena has room");
+            write_map(hp, pairs, &self.atoms).expect("the map is writable")
+        }
+    }
+
     /// A fresh table of `kind` with the given 1-based `keypos`.
     fn table(&mut self, kind: TableKind, keypos: usize) -> Table {
         let mut options = TableOptions::new();

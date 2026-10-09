@@ -430,6 +430,47 @@ pub(crate) fn run_cranelift_label_outcome(
     Err(crate::error::unsupported("jit-cranelift tier not built"))
 }
 
+/// Resume a suspended machine on the Cranelift hot tier, reporting whether the
+/// resumed slice returned or blocked again.
+///
+/// Backs
+/// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
+/// for [`Tier::Cranelift`]: with the **`jit-cranelift`** feature enabled the tier's
+/// compiled functions bake in their entry `pc`, so a mid-function suspension address
+/// is unserviceable and the tier reports the honest typed
+/// [`unsupported`](crate::error::unsupported) error (see
+/// [`cranelift::run_resume_outcome`]). Without the feature the backend is not
+/// compiled in at all, so this is the same typed `unsupported` error the first-entry
+/// Cranelift path reports — never a panic and never a silent fallback to another
+/// tier.
+#[cfg(feature = "jit-cranelift")]
+pub(crate) fn run_cranelift_resume_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    cranelift::run_resume_outcome(machine, module, func, pc, ctx)
+}
+
+/// Resume a suspended machine on the Cranelift hot tier (backend not compiled in).
+///
+/// The feature-off half of the [`Tier::Cranelift`] resume entry point; see the
+/// feature-on definition for the contract. Without the **`jit-cranelift`** feature
+/// the tier has no backend, so this is always a typed
+/// [`unsupported`](crate::error::unsupported) error.
+#[cfg(not(feature = "jit-cranelift"))]
+pub(crate) fn run_cranelift_resume_outcome(
+    _machine: &mut Machine,
+    _module: &Module,
+    _func: u32,
+    _pc: u32,
+    _ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    Err(crate::error::unsupported("jit-cranelift tier not built"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

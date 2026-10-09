@@ -86,6 +86,21 @@
 //! belongs in `beam_bifs` (install the heir through `beam_ets::Table::install_heir` after the
 //! same owner check) or in `beam_ets` (make `Table::setopts` copy like `install_heir`); either
 //! would make this drain's message term table-owned for every install path.
+//!
+//! # A failed gift copy is never swallowed
+//!
+//! [`Runtime::adopt_created_table`] re-owns a freshly created table's creation-time heir gift
+//! through [`Table::install_heir`](beam_ets::Table::install_heir), which is **fallible** (the
+//! ETS store's copyable subset is smaller than the oracle's, and its allocator can be
+//! exhausted). Discarding that error would leave a table whose gift data the runtime never took
+//! ownership of — a silent data-loss path. The failure is therefore handled by
+//! [`Runtime::report_heir_gift_failure`]: it is reported immediately through the workspace
+//! logging facade and **recorded** ([`OwnerIndex::record_gift_failure`]), so the next
+//! [`Runtime::drain_ets_owner_exits`] returns it as the typed error it is. The successful
+//! `ets:new/2` stays successful — the table exists and every term in it is table-owned (the
+//! creation-time gift was deep-copied by [`Table::new`](beam_ets::Table::new)'s build path
+//! before the re-ownership is attempted), so a failure here is the ETS store's own and never a
+//! term aliasing a foreign heap.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -93,7 +108,7 @@ use std::rc::Rc;
 
 use beam_alloc::Heap;
 use beam_bifs::TableRegistry;
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_ets::{OwnerDeath, OwnerId};
 use beam_process::{
     MonitorRef, PortId, PortWatch, ProcessExit, ProcessExitObserver, ProcessId, ProcessTable,
@@ -144,6 +159,14 @@ pub(crate) struct OwnerIndex {
     /// the port table (see [`crate::port`]), which this drain removes so the port keeps no
     /// monitor for a watcher that no longer exists.
     port_watches: Vec<(PortId, MonitorRef)>,
+    /// The **heir gift copies the runtime could not complete**, waiting for a drain.
+    ///
+    /// [`Runtime::report_heir_gift_failure`] records one per failed
+    /// [`Table::install_heir`](beam_ets::Table::install_heir), so the genuine failure a failed
+    /// deep copy is reaches the next [`Runtime::drain_ets_owner_exits`] as the **typed error**
+    /// it is, instead of being discarded. A [`BeamError`] is a plain value (`Alloc`/`BadArg`),
+    /// so it is safe to retain here.
+    gift_failures: Vec<BeamError>,
 }
 
 impl OwnerIndex {
@@ -173,6 +196,26 @@ impl OwnerIndex {
         std::mem::take(&mut self.port_watches)
     }
 
+    /// Records a **failed heir-gift deep copy** ([`Table::install_heir`](beam_ets::Table::install_heir))
+    /// so the next drain can report it as the typed error it is.
+    ///
+    /// Append-only: two failed copies are two separate obligations even when they are the same
+    /// kind of failure, exactly like the port watches. Nothing is discarded here — the error
+    /// either reaches a drain or is still held for one.
+    pub(crate) fn record_gift_failure(&mut self, error: BeamError) {
+        self.gift_failures.push(error);
+    }
+
+    /// Takes the recorded heir-gift failures out for a drain, leaving the cell empty.
+    pub(crate) fn take_gift_failures(&mut self) -> Vec<BeamError> {
+        std::mem::take(&mut self.gift_failures)
+    }
+
+    /// The number of heir-gift failures waiting for a drain (test/diagnostic).
+    #[cfg(test)]
+    pub(crate) fn pending_gift_failures(&self) -> usize {
+        self.gift_failures.len()
+    }
     /// The number of owners with at least one indexed table (test/diagnostic).
     #[cfg(test)]
     pub(crate) fn owner_count(&self) -> usize {
@@ -236,6 +279,18 @@ fn owner_is_alive(table: &ProcessTable, owner: OwnerId) -> bool {
     }
 }
 
+/// Folds the heir-gift failures a drain took out into its return value: the **first** recorded
+/// failure becomes the drain's typed `Err`, whatever the deaths it just discharged returned.
+///
+/// Every failure was already reported through the logging facade where it was recorded
+/// ([`Runtime::report_heir_gift_failure`]), so reporting the window's first one here is a
+/// summary, never a loss — and the rest are dropped only because a `Result` carries one error.
+fn report_gift_failures(failures: &mut Vec<BeamError>, outcome: Result<usize>) -> Result<usize> {
+    if failures.is_empty() {
+        return outcome;
+    }
+    Err(failures.remove(0))
+}
 /// The **tid** the oracle puts in `{'ETS-TRANSFER', Tid, FromPid, Data}` for an *unnamed*
 /// table: the table's reference — this runtime's frozen 4-word ref thing
 /// `[make_header(3, REF_SUBTAG), 0, 0, id]` whose `id` **is the registry handle** (the
@@ -288,9 +343,17 @@ impl Runtime {
     /// cannot see `beam_bifs`'s private table registry, can resolve a fresh table's handle.
     /// (The *set* of tables a death reclaims no longer needs this: it comes from the registry's
     /// owner→handle roster, so an unnamed table is covered too.)
+    ///
+    /// The gift hand-off ([`Runtime::own_heir_gift`]) is the one step here that can fail, and it
+    /// must not fail the `ets:new/2` that already succeeded. Its error is therefore **handled**
+    /// — reported and recorded, never discarded — by
+    /// [`Runtime::report_heir_gift_failure`].
     pub(crate) fn adopt_created_table(&mut self, owner: ProcessId, handle: u64, name: Atom) {
         self.ets_owners.borrow_mut().record(owner, handle, name);
-        self.own_heir_gift(handle);
+        if let Err(error) = self.own_heir_gift(handle) {
+            // Explicitly handled, never a `let _ =`: see `report_heir_gift_failure`.
+            self.report_heir_gift_failure(error);
+        }
     }
 
     /// Re-owns a freshly created table's heir gift term through
@@ -310,30 +373,62 @@ impl Runtime {
     /// `erl_db.c`), which is what `install_heir` reproduces. This runs while the creator is still
     /// alive, so any copy reads a live term.
     ///
-    /// A term outside `beam_ets`'s copyable subset (a fun, an off-heap bin ref, …) is that
-    /// crate's documented typed `badarg`; the term already in the table is then left in place
-    /// (this step never turns a successful `ets:new/2` into a failure). The oracle copies *any*
-    /// term, so closing that subset is a `beam_ets` handoff, not a wrong result here.
-    fn own_heir_gift(&mut self, handle: u64) {
-        // The registry is free here (this runs right after the `ets:new/2` BIF returned), but a
-        // `try_borrow_mut` keeps a nested borrow a no-op instead of a panic — the same
-        // discipline [`Runtime::drain_ets_owner_exits`] follows.
+    /// The copy is **fallible** and its error is returned, never discarded: a term outside
+    /// `beam_ets`'s copyable subset (a fun, an off-heap bin ref, …, all `badarg`) or an
+    /// exhausted ETS store (`Alloc`). `install_heir` leaves the current heir untouched when it
+    /// fails, so there is nothing to undo here; the caller decides what the failure means (see
+    /// [`Runtime::report_heir_gift_failure`]).
+    ///
+    /// A `try_borrow_mut` miss (a nested borrow, i.e. no registry to act on) is **not** a copy
+    /// failure and yields `Ok(())`: this runs right after the `ets:new/2` BIF returned, but a
+    /// nested borrow must stay a no-op instead of a panic — the same discipline
+    /// [`Runtime::drain_ets_owner_exits`] follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's own error when it could not copy the gift data into table-owned
+    /// storage (the table is otherwise unchanged).
+    fn own_heir_gift(&mut self, handle: u64) -> Result<()> {
         let Ok(mut registry) = self.tables.try_borrow_mut() else {
-            return;
+            return Ok(());
         };
         let Some(table) = registry.get_mut(handle) else {
-            return;
+            return Ok(());
         };
         let Some(heir) = table.heir() else {
-            return;
+            return Ok(());
         };
         let Some(data) = heir.data else {
             // An arity-2 `{heir, Pid}` owns no gift storage — nothing to take ownership of.
-            return;
+            return Ok(());
         };
-        let _ = table.install_heir(heir.owner, Some(data));
+        table.install_heir(heir.owner, Some(data))
     }
 
+    /// Handles a failed heir-gift deep copy — the **one** policy for it, so no site can
+    /// silently drop the error.
+    ///
+    /// The failure is genuine but must not turn the `ets:new/2` that just succeeded into a
+    /// failure (the table **was** created, and every term in it is table-owned: the
+    /// creation-time gift was already deep-copied by [`Table::new`](beam_ets::Table::new)'s
+    /// build path before this re-ownership was attempted, and `install_heir` leaves the current
+    /// heir untouched when it fails). So it is neither propagated into the BIF's result nor
+    /// discarded; it is made **observable** in the two places a runtime-level failure belongs:
+    ///
+    /// * **immediately** through the workspace logging facade ([`beam_common::beam_error!`]) —
+    ///   the same policy `beam_process`'s exit-observer seam uses for a panicking observer (a
+    ///   failure on a path that must not fail the operation is logged, and the operation
+    ///   completes);
+    /// * **deferred and typed** via [`OwnerIndex::record_gift_failure`], so the next
+    ///   [`Runtime::drain_ets_owner_exits`] returns it as the [`BeamError`] it is and the
+    ///   scheduled paths fail loudly instead of running on with a table whose gift data the
+    ///   runtime never took ownership of.
+    fn report_heir_gift_failure(&mut self, error: BeamError) {
+        beam_common::beam_error!(
+            "ets: heir gift data could not be copied into table-owned storage: {error:?}"
+        );
+        self.ets_owners.borrow_mut().record_gift_failure(error);
+    }
     /// Discharges the ETS obligations recorded since the last drain: every table a dead process
     /// owned is dropped, or handed to its live heir with the oracle's
     /// `{'ETS-TRANSFER', Tid, FromPid, Data}` message.
@@ -353,31 +448,49 @@ impl Runtime {
     /// Returns the number of transfer messages delivered. Idempotent and cheap with nothing
     /// pending.
     ///
+    /// # A recorded heir-gift failure is reported here
+    ///
+    /// [`Runtime::report_heir_gift_failure`] records a failed gift deep copy instead of failing
+    /// the `ets:new/2` it happened under; this drain is where that genuine failure becomes the
+    /// **typed error** it is (a pass boundary is where a runtime-level error belongs). The
+    /// recorded failures are taken out up front and reported **after** the deaths are
+    /// discharged, so a failing pass still releases every dead owner's table. Each failure is
+    /// also logged where it is recorded, so reporting only the first of several same-kind
+    /// failures in one window loses nothing.
+    ///
     /// # Errors
     ///
     /// Propagates a heap exhaustion while building a transfer message (the same documented
-    /// `error::system_limit`) and a delivery failure from the process table.
+    /// `error::system_limit`), a delivery failure from the process table, and a recorded
+    /// **heir-gift copy failure** (the ETS store's own error: `badarg` for a term outside its
+    /// copyable subset, `out_of_memory` for an exhausted store).
     pub(crate) fn drain_ets_owner_exits(
         &mut self,
         table: &mut ProcessTable,
         scheduler: &mut Scheduler,
     ) -> Result<usize> {
+        let mut failures = {
+            let mut index = self.ets_owners.borrow_mut();
+            index.take_gift_failures()
+        };
         let deaths = {
             let mut index = self.ets_owners.borrow_mut();
             std::mem::take(&mut index.deaths)
         };
         if deaths.is_empty() {
-            return Ok(0);
+            // Nothing to discharge, but a recorded failure is still reported (a drain is the
+            // only place the runtime reports it).
+            return report_gift_failures(&mut failures, Ok(0));
         }
         let Ok(mut registry) = self.tables.try_borrow_mut() else {
             // The registry is held by an in-flight BIF call (a death reached the finalizer from
             // inside it). Put the deaths back, in order, in front of anything recorded since —
-            // and never drop them.
+            // and never drop them. The gift failures were taken above and are reported now.
             let mut index = self.ets_owners.borrow_mut();
             let mut deferred = deaths;
             deferred.append(&mut index.deaths);
             index.deaths = deferred;
-            return Ok(0);
+            return report_gift_failures(&mut failures, Ok(0));
         };
         // `(heir pid, gift data, the handle's registered name, the handle, dead owner term)`
         // per pending transfer. `name` is `Some` exactly for a `named_table` (the only kind the
@@ -443,7 +556,7 @@ impl Runtime {
         }
         drop(registry);
         if transfers.is_empty() {
-            return Ok(0);
+            return report_gift_failures(&mut failures, Ok(0));
         }
         // The message is built on the pooled BIF heap (returned below) and copied into the
         // receiver's mailbox by the delivery, exactly like the port half's messages.
@@ -473,7 +586,7 @@ impl Runtime {
             // path so the pass that discharged the obligation also runs it.
             scheduler.resume_woken(table);
         }
-        Ok(delivered)
+        report_gift_failures(&mut failures, Ok(delivered))
     }
 
     /// Sweeps the **dangling incoming port monitors** dead watchers left on the runtime's live
@@ -552,6 +665,35 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use beam_process::SignalAtoms;
+    use beam_term::AtomTable;
+
+    /// A table holding a **raw** (non-copying) creation-time heir — the shape
+    /// [`Runtime::own_heir_gift`] exists for: an `ets:new/2` reached through the raw
+    /// [`Table::set_heir`](beam_ets::Table::set_heir) rather than the copying build path.
+    fn table_with_raw_heir(owner: ProcessId, gift: Option<Eterm>) -> (u64, beam_ets::Table) {
+        let id = beam_ets::TableId::next();
+        let handle = id.raw();
+        let mut table =
+            beam_ets::Table::new(id, beam_ets::TableOptions::new()).expect("a fresh table");
+        table.set_owner(Some(beam_ets::OwnerId::new(owner_key(owner))));
+        table.set_heir(Some(beam_ets::Heir {
+            owner: beam_ets::OwnerId::new(owner_key(owner)),
+            data: gift,
+        }));
+        (handle, table)
+    }
+
+    /// A term `beam_ets`'s store cannot copy, and the reason it cannot: a **bare header
+    /// word** (`make_header(0, 0)`, the C ABI's `THE_NON_VALUE`) is not a term at all, so the
+    /// store's `copy_term` rejects it before any dereference with the same typed `badarg` it
+    /// gives a kind outside its copyable subset (a fun, an off-heap bin ref, …). Nothing else
+    /// that the store rejects is constructible from this crate without `unsafe` (this crate is
+    /// `#![deny(unsafe_code)]`), and the code under test cannot tell the reasons apart.
+    fn an_uncopyable_term() -> Eterm {
+        beam_term::make_header(0, 0)
+    }
 
     /// Recording is per `(owner, handle)`: a re-observation never duplicates an entry.
     #[test]
@@ -640,5 +782,131 @@ mod tests {
         assert_eq!(taken, vec![(port_a, r1), (port_b, r2), (port_a, r3)]);
         assert_eq!(index.pending_port_watches(), 0);
         assert!(index.take_port_watches().is_empty());
+    }
+
+    // -- the heir-gift copy: a failure is recorded, never swallowed --------------
+
+    /// The gift failures an index holds are appended and taken whole (nothing is discarded by
+    /// the record/take pair).
+    #[test]
+    fn gift_failures_are_recorded_append_only_and_taken_for_a_drain() {
+        let mut index = OwnerIndex::default();
+        assert_eq!(index.pending_gift_failures(), 0);
+        index.record_gift_failure(BeamError::BadArg);
+        index.record_gift_failure(BeamError::SystemLimit);
+        assert_eq!(index.pending_gift_failures(), 2);
+
+        let taken = index.take_gift_failures();
+        assert!(
+            matches!(taken.as_slice(), [BeamError::BadArg, BeamError::SystemLimit]),
+            "both failures were taken, in order: {taken:?}"
+        );
+        assert_eq!(index.pending_gift_failures(), 0, "a drain takes them out");
+        assert!(index.take_gift_failures().is_empty());
+    }
+
+    /// A **failed** gift copy is handled explicitly: the failure is recorded (so the next drain
+    /// reports it as a typed error) instead of being discarded, the table keeps the very term
+    /// `beam_ets` left in it (`install_heir` leaves the heir untouched on failure — nothing to
+    /// undo here), and the table is still adopted for owner-death reclamation.
+    #[test]
+    fn a_failed_gift_copy_is_recorded_and_leaves_the_table_untouched() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let owner = ProcessId::new(0, 3);
+        let name = Atom::from_raw(9);
+        let gift = an_uncopyable_term();
+        let (handle, table) = table_with_raw_heir(owner, Some(gift));
+        rt.tables.borrow_mut().insert(handle, table);
+
+        rt.adopt_created_table(owner, handle, name);
+
+        // Recorded, not swallowed.
+        assert_eq!(rt.ets_owners.borrow().pending_gift_failures(), 1);
+        // The table was adopted all the same: the registered name is what a death drain needs.
+        assert_eq!(rt.ets_owners.borrow().owner_count(), 1);
+        // The failed copy left the table's heir exactly as `beam_ets` held it.
+        let registry = rt.tables.borrow();
+        let table = registry.get(handle).expect("the table is still registered");
+        assert_eq!(table.heir_data(), Some(gift), "the failed copy is a no-op");
+    }
+
+    /// The recorded failure reaches the drain as the **typed error** it is — the runtime never
+    /// runs on as if the gift copy had succeeded — and a second drain has nothing left to
+    /// report. (This is the no-deaths path: a recorded failure is reported even when there is
+    /// no death obligation to discharge alongside it.)
+    #[test]
+    fn the_drain_reports_a_recorded_gift_failure_once() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let owner = ProcessId::new(0, 4);
+        let (handle, table) = table_with_raw_heir(owner, Some(an_uncopyable_term()));
+        rt.tables.borrow_mut().insert(handle, table);
+        rt.adopt_created_table(owner, handle, Atom::from_raw(11));
+
+        let mut processes = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+        let mut scheduler = Scheduler::new();
+
+        match rt.drain_ets_owner_exits(&mut processes, &mut scheduler) {
+            Err(BeamError::BadArg) => {}
+            other => panic!("the recorded gift failure must be reported, got {other:?}"),
+        }
+        assert_eq!(
+            rt.ets_owners.borrow().pending_gift_failures(),
+            0,
+            "reporting takes the failure out"
+        );
+        assert_eq!(
+            rt.drain_ets_owner_exits(&mut processes, &mut scheduler)
+                .expect("nothing left to report"),
+            0
+        );
+    }
+
+    /// The happy path is unchanged: a **copyable** gift is re-owned into table-owned storage
+    /// (a distinct, equal term) and records no failure.
+    #[test]
+    fn a_successful_gift_copy_is_reowned_and_records_nothing() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let owner = ProcessId::new(0, 6);
+        let mut heap = Heap::new(16).expect("a 16-word test heap");
+        let gift = heap
+            .tuple(&[make_atom(Atom::from_raw(3)), beam_term::make_small(17)])
+            .expect("a two-word tuple fits");
+        let (handle, table) = table_with_raw_heir(owner, Some(gift));
+        rt.tables.borrow_mut().insert(handle, table);
+
+        rt.adopt_created_table(owner, handle, Atom::from_raw(12));
+
+        assert_eq!(rt.ets_owners.borrow().pending_gift_failures(), 0);
+        let registry = rt.tables.borrow();
+        let table = registry.get(handle).expect("the table is still registered");
+        let reowned = table.heir_data().expect("the gift data survives the hand-off");
+        assert_ne!(
+            reowned, gift,
+            "the gift is a *copy* in table-owned storage, not the caller's term"
+        );
+    }
+
+    /// No heir, and an arity-2 `{heir, Pid}` (which owns no gift storage), are both `Ok(())`
+    /// with nothing recorded — the hand-off is a no-op, not a failure.
+    #[test]
+    fn a_missing_heir_or_arity_two_heir_hands_off_nothing() {
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        let owner = ProcessId::new(0, 7);
+
+        let (no_heir_handle, mut no_heir) = table_with_raw_heir(owner, None);
+        no_heir.set_heir(None);
+        rt.tables.borrow_mut().insert(no_heir_handle, no_heir);
+        rt.adopt_created_table(owner, no_heir_handle, Atom::from_raw(13));
+        assert_eq!(rt.ets_owners.borrow().pending_gift_failures(), 0);
+
+        // An arity-2 heir: `data` is `None`, so there is no gift term to re-own.
+        let (arity2_handle, arity2) = table_with_raw_heir(owner, None);
+        rt.tables.borrow_mut().insert(arity2_handle, arity2);
+        rt.adopt_created_table(owner, arity2_handle, Atom::from_raw(14));
+        assert_eq!(rt.ets_owners.borrow().pending_gift_failures(), 0);
+
+        // An unknown handle is likewise not a failure (the table is simply not ours).
+        rt.adopt_created_table(owner, 0xdead_beef, Atom::from_raw(15));
+        assert_eq!(rt.ets_owners.borrow().pending_gift_failures(), 0);
     }
 }

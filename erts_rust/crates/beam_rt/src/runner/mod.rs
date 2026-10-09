@@ -89,8 +89,9 @@
 //! [`tier::jit_is_switch_safe`] is the only thing between a JIT slice and the driver's
 //! `Step::Enter` gap, so the default is the *predicate-guarded* mode, never the switch-blind
 //! [`Baseline`](tier::JitMode::Baseline): a module the predicate cannot prove safe runs on
-//! the always-correct interpreter. The measured picture (release build, `$ERTS_STDLIB_DIR`
-//! set so no per-process `erl` start-up is included, alternating runs, min/median seconds):
+//! the always-correct interpreter. The measured picture (release build, no per-process `erl`
+//! start-up — the system code path resolves natively from the filesystem — alternating runs,
+//! min/median seconds):
 //!
 //! | workload | interpreter | `auto` (JIT where safe) |
 //! |---|---|---|

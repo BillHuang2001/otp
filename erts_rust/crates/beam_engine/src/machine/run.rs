@@ -140,6 +140,58 @@ impl Machine {
         self.run_loop(module, func, pc, ctx)
     }
 
+    /// Resume a suspended machine at a [`RunOutcome::Wait`] address on a selected
+    /// execution tier, reporting whether the resumed slice returned or blocked again.
+    ///
+    /// This is [`Machine::resume_outcome`] with the tier selection of
+    /// [`Machine::run_export_outcome_with_tier`]: a slice that suspended on a native
+    /// tier (or on the interpreter) resumes on the **same** tier the caller names, so
+    /// the tier seam survives a suspension. As with the first-entry tier entries, the
+    /// engine never silently substitutes a different tier — the requested tier's
+    /// result or a typed error is what the caller gets.
+    ///
+    /// The machine must be the one the preceding [`RunOutcome::Wait`] reported its
+    /// `(func, pc)` for; none of these entries [`reset`](Machine::reset) it (the
+    /// registers, the Erlang stack and every call frame of the suspended `receive`
+    /// must survive). `module` is the run's **entry** module (context `0`): a
+    /// suspended `(func, pc)` may live in a context the process entered through
+    /// [`ExecutionContext::resolve_external_call`], which the host's module context
+    /// registry recovers from [`Machine::current_context`].
+    ///
+    /// Each tier is **interpreter-identical** — the same value, the same
+    /// [`RunOutcome`] and the same typed errors the interpreter would produce:
+    ///
+    /// * [`Tier::Interpreter`] — delegates to [`Machine::resume_outcome`], which
+    ///   remains the **default resume entry** (unchanged; this method is a
+    ///   dispatcher, not a replacement).
+    /// * [`Tier::BaselineJit`] — the native baseline backend over the per-thread
+    ///   cross-run cache ([`crate::jit::cache`]), resuming through its no-reset
+    ///   driver rather than recompiling or resetting.
+    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier. Its compiled
+    ///   functions bake in their entry `pc`, so resuming a mid-function `wait`
+    ///   address is unserviceable natively: this is a typed
+    ///   [`unsupported`](crate::error::unsupported) error (or, with the
+    ///   `jit-cranelift` feature off, the same typed error the first-entry Cranelift
+    ///   path reports) — never a panic and never a silent fallback to another tier.
+    pub fn resume_outcome_with_tier(
+        &mut self,
+        module: &Module,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+        tier: Tier,
+    ) -> Result<RunOutcome> {
+        match tier {
+            Tier::Interpreter => self.resume_outcome(module, func, pc, ctx),
+            Tier::BaselineJit => {
+                crate::jit::cache::run_baseline_cached_resume_outcome(self, module, func, pc, ctx)
+            }
+            Tier::Cranelift => {
+                crate::jit::run_cranelift_resume_outcome(self, module, func, pc, ctx)
+            }
+        }
+    }
+
     /// Run the exported `function/arity` on a selected execution tier; yields `x(0)`.
     ///
     /// The tier-selecting entry point of the engine ([`crate::jit::Tier`]): the
@@ -732,6 +784,143 @@ mod tests {
             machine.resume_outcome(&module, 0, 7, &mut ctx).unwrap(),
             RunOutcome::Returned(make_small(42))
         );
+    }
+
+    /// The tier seam must survive a **resume**: a slice that suspended on the native
+    /// baseline tier resumes on it (through `resume_outcome_with_tier`) and produces
+    /// exactly the interpreter's result.
+    #[test]
+    fn a_baseline_tier_wait_resumes_natively_and_matches_the_interpreter() {
+        let (module, name) = with_blocks(receive_module());
+
+        // Suspend two fresh machines the *same* way — on an empty mailbox — one via
+        // the interpreter tier and one via the baseline tier. Both must report the
+        // interpreter's exact suspension address.
+        let mut interpreter = Machine::new();
+        assert_eq!(
+            interpreter
+                .run_export_outcome_with_tier(
+                    &module,
+                    name,
+                    0,
+                    &[],
+                    &mut empty_mailbox(),
+                    Tier::Interpreter,
+                )
+                .expect("interpreter run"),
+            RunOutcome::Wait { func: 0, pc: 7 }
+        );
+
+        let mut baseline = Machine::new();
+        assert_eq!(
+            baseline
+                .run_export_outcome_with_tier(
+                    &module,
+                    name,
+                    0,
+                    &[],
+                    &mut empty_mailbox(),
+                    Tier::BaselineJit,
+                )
+                .expect("baseline run"),
+            RunOutcome::Wait { func: 0, pc: 7 }
+        );
+
+        // Resume each through the tier-selecting resume entry with its matching tier.
+        // The message has arrived, so both must return the interpreter-identical value.
+        let mut interpreter_ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+            messages: VecDeque::from([make_small(42)]),
+        }));
+        let expected = interpreter
+            .resume_outcome_with_tier(&module, 0, 7, &mut interpreter_ctx, Tier::Interpreter)
+            .expect("interpreter resume");
+        assert_eq!(expected, RunOutcome::Returned(make_small(42)));
+
+        // Empty the module's cached artifact right before the baseline resume, so the
+        // resume must compile (and therefore really drive native code) rather than
+        // reuse what the first suspension compiled. A resume that fell back to the
+        // interpreter would touch neither the cache nor the compile counter.
+        crate::jit::cache::clear_baseline_cache();
+        assert_eq!(crate::jit::cache::baseline_compile_count(), 0);
+        assert_eq!(crate::jit::cache::baseline_cache_len(), 0);
+
+        let mut baseline_ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+            messages: VecDeque::from([make_small(42)]),
+        }));
+        let got = baseline
+            .resume_outcome_with_tier(&module, 0, 7, &mut baseline_ctx, Tier::BaselineJit)
+            .expect("baseline resume");
+        assert_eq!(
+            got, expected,
+            "a resumed baseline slice must agree with the interpreter exactly"
+        );
+        assert_eq!(
+            crate::jit::cache::baseline_compile_count(),
+            1,
+            "the baseline resume must have compiled and driven a native artifact, not the interpreter"
+        );
+        assert_eq!(
+            crate::jit::cache::baseline_cache_len(),
+            1,
+            "the baseline resume must have cached its artifact"
+        );
+        assert!(
+            crate::jit::baseline::compile_module(&module)
+                .expect("compile the fixture")
+                .block_count()
+                > 0,
+            "the fixture must actually lower to compiled blocks for the resume to run natively"
+        );
+        assert!(
+            crate::jit::baseline::compile_module(&module)
+                .expect("compile the fixture")
+                .entry(0, 7)
+                .is_some(),
+            "the resume address must be a compiled block entry, so the resume runs native code"
+        );
+    }
+
+    /// A `Tier::Cranelift` resume is the honest typed `unsupported` error: the
+    /// Cranelift tier can only enter a compiled function at its baked-in entry `pc`,
+    /// so a mid-function suspension address is unserviceable — never a silent
+    /// fallback to the interpreter.
+    #[cfg(feature = "jit-cranelift")]
+    #[test]
+    fn a_cranelift_tier_resume_is_the_honest_typed_unsupported_error() {
+        let (module, name) = with_blocks(receive_module());
+        // Park the machine on the empty mailbox through the interpreter; the
+        // Cranelift resume is what we are exercising.
+        let mut machine = Machine::new();
+        assert_eq!(
+            machine
+                .run_export_outcome_with_tier(
+                    &module,
+                    name,
+                    0,
+                    &[],
+                    &mut empty_mailbox(),
+                    Tier::Interpreter,
+                )
+                .expect("interpreter run"),
+            RunOutcome::Wait { func: 0, pc: 7 }
+        );
+
+        let mut ctx = MinimalContext::with_mailbox(Box::new(ScriptedMailbox {
+            messages: VecDeque::from([make_small(42)]),
+        }));
+        let err = machine
+            .resume_outcome_with_tier(&module, 0, 7, &mut ctx, Tier::Cranelift)
+            .expect_err("the cranelift tier cannot resume at an arbitrary pc");
+        match err {
+            BeamError::Raise(raise) => {
+                let reason = raise.reason.as_atom().unwrap_or_default();
+                assert!(
+                    reason.starts_with("unsupported_opcode: ") && reason.contains("cranelift"),
+                    "expected the honest cranelift resume error, got {reason:?}"
+                );
+            }
+            other => panic!("expected the typed cranelift unsupported error, got {other:?}"),
+        }
     }
 
     #[test]

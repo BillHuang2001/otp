@@ -54,8 +54,12 @@ pub struct TypeIndex(pub u32);
 
 /// One decoded `z,3` allocation-list entry.
 ///
-/// `kind` and `number` are the raw sub-tags from the file (heap/stack/floats/…);
-/// `words` is this entry's contribution to the instruction's heap-word total.
+/// `kind` and `number` are the raw sub-tags from the file; `words` is this entry's
+/// contribution to the instruction's heap-word total per `marshal_allocation_list`
+/// (`beam_file.c:2259-2284`): kind `0` (raw words) → `number`, kind `1` (floats) →
+/// `FLOAT_SIZE_OBJECT × number`, kind `2` (funs) → `ERL_FUN_SIZE × number`, kind `3`
+/// (native records) → `RECORD_INST_SIZE(0) × number`. All three multipliers are 2 on
+/// the 64-bit emulator (`erl_term.h:525-526`, `erl_fun.h:99`, `erl_record.h:73-74`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AllocKind {
     /// The allocation kind sub-tag (`z,3` first `u` of the pair).

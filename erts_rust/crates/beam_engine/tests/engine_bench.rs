@@ -110,8 +110,10 @@
 //! ```
 //!
 //! The real workload is driven through the shared multi-module test host
-//! (`tests/support`, the same one `tests/stdlib_lists.rs` uses) and **skips
-//! loudly** if the committed fixture cannot be loaded.
+//! (`tests/support`, the same one `tests/stdlib_lists.rs` uses). Its fixture is a
+//! **tracked file of this repository** and loading it is a pure in-process `.beam`
+//! parse, so there is no optional dependency to skip on: a load failure, a shape
+//! drift or a run error is a hard failure (see [`bench_real_even`]).
 
 mod support;
 
@@ -924,20 +926,24 @@ impl ExecutionContext for CountingHost {
 /// fixture that drifted fails the build loudly rather than silently reporting a
 /// wrong divisor.
 ///
-/// Returns `None` (after a loud `SKIP`) when the fixture cannot be loaded or its
-/// shape is not the recognised one.
-fn bench_real_even() -> Option<Report> {
+/// Returns the report; **every** failure here panics (see below).
+///
+/// # Why there is no skip
+///
+/// The fixture is a **tracked file in this repository** and loading it is a pure
+/// in-process `.beam` parse ([`ModuleHost::load`]) — no `erl`/`erlc`, no code-path
+/// lookup, no optional dependency. There is therefore no "the dependency is
+/// absent" state to skip on: a load failure, an unrecognised shape, a shape
+/// mismatch or a run error is a broken fixture or an engine regression. This lane
+/// exists precisely to measure a real `erlc`-compiled recursion, so quietly not
+/// measuring it while the test stayed green was the bug: a `None` here used to
+/// fold three distinct harness failures into "no benchmark today".
+fn bench_real_even() -> Report {
     let mut inner = ModuleHost::new(FIXTURES_DIR);
     inner.register("tailcall", TAILCALL_BEAM);
-    let module = match inner.load("tailcall") {
-        Ok(module) => module,
-        Err(error) => {
-            eprintln!(
-                "engine_bench | SKIP the real workload: cannot load {TAILCALL_BEAM}: {error:?}"
-            );
-            return None;
-        }
-    };
+    let module = inner.load("tailcall").unwrap_or_else(|error| {
+        panic!("cannot load the committed fixture {TAILCALL_BEAM}: {error:?}")
+    });
     let expected = inner.intern("true");
 
     // Both halves of the mutual recursion must have the same per-pass shape, or
@@ -951,18 +957,17 @@ fn bench_real_even() -> Option<Report> {
             .and_then(tail_loop_shape)
     };
     let (Some(even_shape), Some(odd_shape)) = (shape_of("even"), shape_of("odd")) else {
-        eprintln!(
-            "engine_bench | SKIP the real workload: `even/1`/`odd/1` have no recognised loop shape"
+        panic!(
+            "`even/1`/`odd/1` in {TAILCALL_BEAM} have no recognised loop shape, so the real \
+             workload's divisor cannot be derived (there is no safe fallback: a guessed divisor \
+             would silently mis-report ns/instruction)"
         );
-        return None;
     };
-    if even_shape != odd_shape {
-        eprintln!(
-            "engine_bench | SKIP the real workload: `even/1` {even_shape:?} and `odd/1` \
-             {odd_shape:?} have different per-pass shapes"
-        );
-        return None;
-    }
+    assert_eq!(
+        even_shape, odd_shape,
+        "`even/1` and `odd/1` are the two halves of the same recursion, so they must share a \
+         per-pass shape"
+    );
     let (rec, base) = even_shape;
     // Pinned: the observed shape of this fixture's two recursion halves. A drift
     // (a recompiled fixture, a changed lowering) therefore fails loudly. Checked
@@ -980,13 +985,9 @@ fn bench_real_even() -> Option<Report> {
     let mut host = CountingHost::new(inner);
     let mut machine = Machine::new();
     host.bif_calls = 0;
-    let probe = match machine.run_export(&module, function, 1, &args, &mut host) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("engine_bench | SKIP the real workload: even/{EVEN_N} failed: {error:?}");
-            return None;
-        }
-    };
+    let probe = machine
+        .run_export(&module, function, 1, &args, &mut host)
+        .unwrap_or_else(|error| panic!("tailcall:even({EVEN_N}) failed to run: {error:?}"));
     assert_eq!(
         probe, expected,
         "tailcall:even({EVEN_N}) must return true (the oracle's value)"
@@ -1006,7 +1007,8 @@ fn bench_real_even() -> Option<Report> {
         (rec, base),
         EXPECTED_SHAPE,
         "tailcall.beam's even/1 & odd/1 must keep their pinned per-pass shape"
-    );    let report = measure(
+    );
+    let report = measure(
         format!("real tailcall:even/1 ({EVEN_N})"),
         instructions,
         400,
@@ -1023,7 +1025,7 @@ fn bench_real_even() -> Option<Report> {
         host.bif_calls, EVEN_N as u64,
         "every timed run must perform the same {EVEN_N} recursive passes"
     );
-    Some(report)
+    report
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1073,96 @@ fn tail_loop_shape(function: &Function) -> Option<(usize, usize)> {
     let base_len = return_at - entry_at + 1;
     let rec_len = (call_at - fail_at + 1) + (guard_at - entry_at + 1);
     Some((rec_len, base_len))
+}
+
+/// Wrap raw `code` in the [`Function`] value [`tail_loop_shape`] takes (the
+/// negative/positive controls below build shapes by hand, without a module).
+fn probe_function(code: Vec<Instr>) -> Function {
+    let mut module = Module::default();
+    let name = module.atom_table.intern("probe");
+    module.name = name;
+    let entry_label = Label(1);
+    let labels = collect_labels(&code);
+    Function {
+        func_label: entry_label,
+        entry_label,
+        module: name,
+        name,
+        arity: 1,
+        code,
+        blocks: Vec::new(),
+        labels,
+    }
+}
+
+/// The can-fail control for [`tail_loop_shape`], the one helper the **real**
+/// workload's divisor is derived from.
+///
+/// `None` is the helper's "not the recognised loop shape" answer, and its callers
+/// treat that as the *only* safe outcome (they refuse to guess a divisor). An
+/// `Option`-returning classifier whose `None` arm is never reached is a
+/// cannot-fail guard — and the real lane's whole divisor would then rest on an
+/// unexercised branch. So this asserts both arms: three shapes that must be
+/// **rejected**, and one that must be decomposed **exactly** as documented.
+///
+/// It is a plain function (not a `#[test]`) called from the single test in this
+/// file: this file deliberately runs one test so no workload ever times
+/// concurrently with another, and this control does no timing.
+fn assert_tail_loop_shape_classifier() {
+    let guard = |fail: Label| Instr::Test {
+        kind: TestKind::IsEqExact,
+        fail,
+        args: vec![Operand::X(0), Operand::Integer(0)],
+    };
+    let tail = || Instr::CallOnly {
+        arity: 1,
+        target: Label(1),
+    };
+
+    assert_eq!(
+        tail_loop_shape(&probe_function(vec![
+            Instr::Label(Label(1)),
+            Instr::Return,
+        ])),
+        None,
+        "a body with no `test` at all is not a guarded loop"
+    );
+    assert_eq!(
+        tail_loop_shape(&probe_function(vec![
+            Instr::Label(Label(1)),
+            guard(NO_FAIL),
+            Instr::Return,
+            tail(),
+        ])),
+        None,
+        "a `test` with fail == NO_FAIL raises instead of branching, so it cannot \
+         delimit a recursive arm"
+    );
+    assert_eq!(
+        tail_loop_shape(&probe_function(vec![
+            Instr::Label(Label(1)),
+            guard(Label(2)),
+            Instr::Return,
+            Instr::Label(Label(2)),
+        ])),
+        None,
+        "a guarded body with no `call_only`/`call_last` has no recursive pass"
+    );
+
+    // The positive arm, decomposed by hand from the documented formula:
+    //   entry(0) guard(1) | base = entry..=return(2)                    => base_len = 3
+    //   fail(3)  tail(4)  | rec  = fail..=tail (2) + entry..=guard (2)  => rec_len  = 4
+    assert_eq!(
+        tail_loop_shape(&probe_function(vec![
+            Instr::Label(Label(1)),
+            guard(Label(2)),
+            Instr::Return,
+            Instr::Label(Label(2)),
+            tail(),
+        ])),
+        Some((4, 3)),
+        "rec = (tail - fail + 1) + (guard - entry + 1), base = return - entry + 1"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,6 +1383,11 @@ fn report_attribution(reports: &[Report]) {
 
 #[test]
 fn interpreter_reports_ns_per_instruction() {
+    // The real lane's divisor comes from a shape classifier; prove that
+    // classifier can reject a non-loop before trusting its answer (no timing, so
+    // it cannot contaminate the samples below).
+    assert_tail_loop_shape_classifier();
+
     // One test (not several) so the workloads never run concurrently and
     // contaminate each other's timing.
     let mut reports = vec![
@@ -1307,23 +1404,41 @@ fn interpreter_reports_ns_per_instruction() {
         bench_gate_call_only(),
         bench_list_walk(),
     ];
-    match bench_real_even() {
-        Some(report) => reports.push(report),
-        None => eprintln!(
-            "engine_bench | the real workload was skipped; the synthetic numbers below are still \
-             valid"
-        ),
-    }
+    // The real `erlc` fixture lane is unconditional: `bench_real_even` panics
+    // rather than skipping, so this lane can never silently vanish.
+    reports.push(bench_real_even());
 
     report_table(&reports);
     report_attribution(&reports);
 
     // Structural invariants only — never a performance threshold (that would be
     // flaky in a shared sandbox; the printed numbers are the deliverable).
-    assert!(
-        reports.len() >= 12,
-        "every synthetic workload must have been measured"
-    );
+    //
+    // The label-set guard below is a *harness* invariant, not a measurement: the
+    // table/attribution loops print (and `report_attribution` silently skips) only
+    // what they find, so a workload quietly dropping out of the list above would
+    // otherwise go unnoticed.
+    for label in [
+        "setup/empty",
+        "dispatch/noop",
+        "dispatch/many-labels",
+        "move/2",
+        "test/2",
+        "gc_bif",
+        "ctrl/2",
+        "gate/call+return",
+        "branch-loop/2",
+        "tail-loop/2",
+        "gate/call_only",
+        "list-walk/1",
+        "real tailcall:even/1",
+    ] {
+        assert!(
+            reports.iter().any(|r| r.label.starts_with(label)),
+            "the workload `{label}` must be measured, measured: {:?}",
+            reports.iter().map(|r| r.label.as_str()).collect::<Vec<_>>()
+        );
+    }
     for report in &reports {
         let ns = report.median_ns_per_instruction();
         assert!(

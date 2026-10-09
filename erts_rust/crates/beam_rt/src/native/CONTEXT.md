@@ -101,10 +101,10 @@ before the registry.
 | `garbage_collection` | the 5-item proplist `[{max_heap_size,Map},{min_bin_vheap_size,N},{min_heap_size,N},{fullsweep_after,N},{minor_gcs,N}]` (`beam_gc::GARBAGE_COLLECTION_KEYS` order) |
 | `min_heap_size` / `min_bin_vheap_size` / `fullsweep_after` | the emulator's heap policy (`+hms`/`+hmbs`, rounded through the growth table) |
 | `max_heap_size` | the process flag **map** `#{error_logger,include_shared_binaries,kill,size}` (`size` is the raw word bound, 0 = unlimited) |
-| `message_queue_data` | `on_heap` (this runtime's `beam_message::Queue` is heap-resident — a true placement) |
-| `trace` | the constant `0` — **divergence:** a traced process's real trace-flag bitmask (tracked by `crate::trace::TraceState`, exposed by `trace_info/2`) is not surfaced here, so the oracle's non-zero `{trace,N}` is not reproduced |
+| `message_queue_data` | `on_heap` — this runtime's real current placement (`beam_message::Queue` is heap-resident); the one divergence is an explicit `process_flag(message_queue_data, off_heap)`, accepted-and-ignored (see below) |
+| `trace` | the process's **live** ERTS tracee-flag **bitmask** as an integer (`0` while untraced), read from [`crate::trace::TraceState`] and translated via `crate::trace::flags_to_atoms` + the `ERTS_TRACE_FLAG_BITS` table (this runtime's internal trace bits are deliberately not ERTS's); the two flags with no canonical atom (`return_from`, `cpu_timestamp`) are unmapped on purpose |
 | `suspending` | `[]` (no `suspend_process` in M1) |
-| `last_calls` | the constant `false` (the `call`-flag call list is not tracked) |
+| `last_calls` | `false` — the oracle's own answer for a process with no saved-calls buffer (`erl_bif_info.c:2184-2188`); this runtime never saves calls |
 | `sequential_trace_token` | the process's sequential-trace token 5-tuple, or the bare `[]` while sequential tracing is inactive for it (read from `crate::seq_trace::token`) |
 | `memory` | this process's real bytes (`(total_heap_size + stack_size) * 8` + off-heap overhead) |
 
@@ -163,13 +163,27 @@ for an unregistered `registered_name`), so the list is a genuine, shorter-by-con
   of truth shared by `erlang:group_leader/0`, the `/2` BIFs and this item. It is this runtime's real
   pid, not the oracle's `<0.70.0>` io process.
 - **`reductions`** is this process's real counter (the absolute value differs — the code differs).
-- **`error_handler`/`trace`/`suspending`/`last_calls`/`message_queue_data`** are unchanging M1
-  defaults (the facts they report are true of this runtime).
+- **`error_handler`** (the atom `error_handler`), **`suspending`** (`[]`) and **`last_calls`** (`false`)
+  are unchanging runtime defaults — the facts they report are true of this runtime.
+- **`message_queue_data`** is `on_heap` because that is this runtime's real **current** placement
+  (`beam_message::Queue` is heap-resident FIFO). The one divergence is an **explicit**
+  `process_flag(message_queue_data, off_heap)`, which `process.rs` accepts and ignores — so such a
+  process reports `on_heap` where the oracle reports `off_heap`. Honouring it needs per-process
+  storage in `beam_process::Process` (a cross-crate handoff, not a value this floor may fabricate).
+- **`trace`** is the **live** per-process ERTS tracee-flag bitmask — an **integer**, never the
+  `trace_info(P, flags)` atom list (C `make_small(ERTS_IS_P_TRACED_FL(rp, TRACEE_FLAGS))`,
+  `erl_bif_info.c:2133`; oracle `{trace,0}` untraced, `{trace,1024}` after `[call]`,
+  `{trace,32763895}` after `[all]`). `trace_bitmask` maps `crate::trace::flags_to_atoms(flags)`
+  through the `ERTS_TRACE_FLAG_BITS` table (`F_TRACE_FLAG(n) = 1 << (3 + n)`), whose 21 rows sum to
+  the oracle's `[all]` bitmask exactly; an untraced process ⇒ `0`. The table's coverage is
+  drift-guarded by `memory/tests.rs`.
 
 ### `erts_internal.rs` — the served BIFs (contract A.7)
 `RuntimeContext::erts_internal_call(function, arity, args) -> Option<Result<Eterm>>`; `beam_bifs`
 owns exactly **one** `erts_internal` BIF (`cmp_term/2`), which this module deliberately does not
-claim so it falls through to the registry.
+claim so it falls through to the registry. `get_dflags/0`'s five flag words are
+`beam_dist::flags`'s constants (the single source of truth, each defined from the individual
+`DFLAG_*` bits) narrowed to `i64` at the emit site — this module keeps **no** local duplicate.
 
 | BIF | Ground truth | Behaviour (oracle-verified, OTP 29.1.1 / erts-17.1) |
 |---|---|---|

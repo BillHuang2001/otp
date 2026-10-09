@@ -56,16 +56,28 @@
 //!   `scheduler.resume_woken(&mut table)` so the woken receiver is enqueued.
 //! * **run** ⇒ `scheduler.run_ready(&mut table, &mut runner, None)`.
 //!
-//! # Port-aware variants (the port-monitor cleanup adoption)
+//! # The port table (port-monitor cleanup on death)
 //!
-//! An orchestrator that also owns a [`PortTable`] should drive the scheduler through
-//! [`Scheduler::run_slice_with_ports`]/[`Scheduler::run_ready_with_ports`] (and, at the
-//! lower level, [`run_one_with_ports`]/[`slice_begin_with_ports`]/[`slice_end_with_ports`]).
-//! Those thread `&mut PortTable` into the schedule-in and schedule-out steps, so a process
-//! that dies during a slice — or is terminated at schedule-in by a queued signal — also has
-//! its matching *incoming* port-monitor entries removed from the port table (the last step of
-//! `ProcessTable::terminate_into`). The port-less forms delegate with `None` and behave
-//! exactly as before; they remain for callers that hold no port table.
+//! A process that dies — either from its slice's [`RunOutcome::Exit`] or at schedule-in, before
+//! the runner is ever entered, when a queued signal terminates it — must also have its matching
+//! *incoming* port-monitor entries removed from the [`PortTable`] (the last step of
+//! `ProcessTable::terminate_into`). That needs a port-table handle at the schedule-in and
+//! schedule-out steps, so a scheduler **can own** one:
+//!
+//! * [`Scheduler::with_ports`] (or [`Scheduler::set_ports`]) gives the scheduler an owned
+//!   [`PortTable`], and the **default** entry points [`Scheduler::run_slice`]/
+//!   [`Scheduler::run_ready`] then use it — a scheduler built with [`Scheduler::new`]/
+//!   [`Scheduler::with_slice`] owns none and keeps the previous port-less behaviour exactly.
+//! * [`Scheduler::run_slice_with_ports`]/[`Scheduler::run_ready_with_ports`] take the table
+//!   **explicitly**. An explicitly passed table **takes precedence** over the owned one, so a
+//!   caller can drive one slice against another table (or against a table it owns itself)
+//!   without disturbing the scheduler's owned table.
+//!
+//! Either way the table is threaded into the same `pub(crate)` helpers
+//! ([`run_one_with_ports`]/[`slice_begin_with_ports`]/[`slice_end_with_ports`]), so the slice
+//! semantics — schedule-in, the one-runner-per-slice budget, schedule-out, the wake sweep — are
+//! identical to the port-less path; only the signal servicing and the termination call pick the
+//! port-aware `ProcessTable` variant.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_process.c`
 //! (`scheduler_wait`/`schedule`), `erl_vm.h` (`CONTEXT_REDS`).
@@ -160,6 +172,11 @@ pub struct Scheduler {
     reductions_per_slice: u32,
     progress: ThreadProgress,
     slices: u64,
+    /// An optional **owned** [`PortTable`]: when present, the default
+    /// [`Scheduler::run_slice`]/[`Scheduler::run_ready`] entry points use it for the
+    /// schedule-in/schedule-out port-monitor cleanup. `None` (the [`Scheduler::new`] default) is
+    /// the port-less behaviour. See [`Scheduler::with_ports`].
+    ports: Option<PortTable>,
 }
 
 impl Scheduler {
@@ -169,12 +186,35 @@ impl Scheduler {
     }
 
     /// A scheduler with an explicit per-slice reduction budget.
+    ///
+    /// The scheduler owns **no** [`PortTable`]; see [`Scheduler::with_ports`] (or
+    /// [`Scheduler::set_ports`]) to make its default entry points port-aware.
     pub fn with_slice(reductions_per_slice: u32) -> Scheduler {
         Scheduler {
             run_queue: RunQueue::new(),
             reductions_per_slice,
             progress: ThreadProgress::new(),
             slices: 0,
+            ports: None,
+        }
+    }
+
+    /// A scheduler that **owns** `ports` with [`DEFAULT_REDUCTIONS_PER_SLICE`] reductions per
+    /// slice.
+    ///
+    /// The owned table is what the default [`Scheduler::run_slice`]/[`Scheduler::run_ready`]
+    /// entry points thread into the schedule-in/schedule-out steps, so a process that dies
+    /// inside a slice — or is terminated at schedule-in by a queued signal — also has its
+    /// matching *incoming* port monitors removed (the last step of
+    /// `ProcessTable::terminate_into`). Combine with [`Scheduler::set_ports`] on a
+    /// [`Scheduler::with_slice`] scheduler for a non-default reduction budget.
+    pub fn with_ports(ports: PortTable) -> Scheduler {
+        Scheduler {
+            run_queue: RunQueue::new(),
+            reductions_per_slice: DEFAULT_REDUCTIONS_PER_SLICE,
+            progress: ThreadProgress::new(),
+            slices: 0,
+            ports: Some(ports),
         }
     }
 
@@ -183,6 +223,38 @@ impl Scheduler {
         self.reductions_per_slice
     }
 
+    /// Installs `ports` as the scheduler's **owned** port table, replacing any previous one.
+    ///
+    /// After this, the default [`Scheduler::run_slice`]/[`Scheduler::run_ready`] entry points
+    /// clean a dying process's incoming port monitors. A table passed explicitly to
+    /// [`Scheduler::run_slice_with_ports`]/[`Scheduler::run_ready_with_ports`] takes precedence
+    /// over the owned one.
+    pub fn set_ports(&mut self, ports: PortTable) {
+        self.ports = Some(ports);
+    }
+
+    /// Removes and returns the scheduler's owned port table, if any.
+    ///
+    /// After this the default entry points are port-less again (they drain a dying process's
+    /// outgoing watch set but leave the port table alone) until a new table is installed.
+    pub fn take_ports(&mut self) -> Option<PortTable> {
+        self.ports.take()
+    }
+
+    /// The scheduler's owned port table, if any.
+    pub fn ports(&self) -> Option<&PortTable> {
+        self.ports.as_ref()
+    }
+
+    /// The scheduler's owned port table, mutably.
+    pub fn ports_mut(&mut self) -> Option<&mut PortTable> {
+        self.ports.as_mut()
+    }
+
+    /// Whether the scheduler owns a port table (so its default entry points are port-aware).
+    pub fn has_ports(&self) -> bool {
+        self.ports.is_some()
+    }
     /// The run queue.
     pub fn run_queue(&self) -> &RunQueue {
         &self.run_queue
@@ -257,9 +329,12 @@ impl Scheduler {
     /// (see [`Scheduler::resume_woken`]), so `run_ready` does not exit while a freshly-woken
     /// process is still pending.
     ///
-    /// This form has no [`PortTable`] handle: a process that dies during the slice has its
-    /// outgoing port monitors drained but leaves the matching incoming entries in the port
-    /// table. A caller holding the port table should use [`Scheduler::run_slice_with_ports`].
+    /// This form uses the scheduler's **owned** [`PortTable`] (installed through
+    /// [`Scheduler::with_ports`]/[`Scheduler::set_ports`]) when it has one: a process that dies
+    /// during the slice then has its matching *incoming* port monitors removed, not just its
+    /// outgoing watch set drained. A scheduler with **no** owned table (the [`Scheduler::new`]
+    /// default) cannot reach a port table and leaves the incoming entries in place — such a
+    /// caller should use [`Scheduler::run_slice_with_ports`] instead.
     ///
     /// # Errors
     ///
@@ -272,13 +347,14 @@ impl Scheduler {
         self.run_slice_inner(table, None, runner)
     }
 
-    /// [`Scheduler::run_slice`] with the [`PortTable`] in hand: a process that terminates
-    /// during the slice also has its matching *incoming* port monitors removed from `ports`.
+    /// [`Scheduler::run_slice`] with an **explicitly passed** [`PortTable`]: a process that
+    /// terminates during the slice also has its matching *incoming* port monitors removed from
+    /// `ports`.
     ///
-    /// This is the entry point an orchestrator that owns both tables (`beam_rt`) should use —
-    /// the port-less [`Scheduler::run_slice`] cannot reach the port table, so the monitor a
-    /// dying process held on a port would stay listed by `erlang:port_info(Port, monitored_by)`
-    /// for a process that no longer exists.
+    /// The explicit table **takes precedence** over the scheduler's owned table (see
+    /// [`Scheduler::run_slice`]) for this call only: the owned table is left untouched, so a
+    /// caller can drive one slice against a different table (e.g. one it owns itself) without
+    /// disturbing the scheduler's.
     ///
     /// The slice semantics are otherwise identical: pop one pid, run it, then requeue
     /// (`Yield`), drop (`Wait`/`Suspend`) or terminate (`Exit`) it, and absorb the table's wake
@@ -299,35 +375,52 @@ impl Scheduler {
         self.run_slice_inner(table, Some(ports), runner)
     }
 
-    /// The shared body of [`Scheduler::run_slice`] and [`Scheduler::run_slice_with_ports`]:
-    /// `ports` is `Some` only when the caller holds a [`PortTable`].
+    /// The shared body of [`Scheduler::run_slice`] and [`Scheduler::run_slice_with_ports`].
+    ///
+    /// `explicit_ports` is `Some` only when the caller passed a [`PortTable`] explicitly; it
+    /// **takes precedence** over the scheduler's owned `self.ports`, which is used (when
+    /// present) by the default [`Scheduler::run_slice`] form only.
     fn run_slice_inner<R: ProcessRunner>(
         &mut self,
         table: &mut ProcessTable,
-        ports: Option<&mut PortTable>,
+        explicit_ports: Option<&mut PortTable>,
         runner: &mut R,
     ) -> Result<Option<ProcessId>> {
-        let mut ports = ports;
-        let Some(pid) = self.run_queue.dequeue() else {
+        // Destructure so the run-queue borrow (the requeue closure) and the port-table borrow
+        // are provably disjoint fields.
+        let Scheduler {
+            run_queue,
+            reductions_per_slice,
+            slices,
+            progress: _,
+            ports: owned_ports,
+        } = self;
+        // An explicitly passed table wins over the scheduler's owned one.
+        let mut ports: Option<&mut PortTable> = match explicit_ports {
+            Some(ports) => Some(ports),
+            None => owned_ports.as_mut(),
+        };
+
+        let Some(pid) = run_queue.dequeue() else {
             // Nothing to run, but a wake produced by a send *outside* a slice (which the
             // orchestrator may not have absorbed yet) must still be turned into a run-queue
             // entry; absorbing here keeps a direct `run_slice` caller correct.
-            self.resume_woken(table);
+            resume_woken_into(run_queue, table);
             return Ok(None);
         };
 
         // Read the budget into a local *before* the closure below borrows the run queue.
-        let reductions = self.reductions_per_slice;
-        let mut enqueue = |pid, priority| self.run_queue.enqueue_with_priority(pid, priority);
+        let reductions = *reductions_per_slice;
+        let mut enqueue = |pid, priority| run_queue.enqueue_with_priority(pid, priority);
         match ports.as_deref_mut() {
             Some(ports) => run_one_with_ports(pid, table, ports, runner, reductions, &mut enqueue)?,
             None => run_one(pid, table, runner, reductions, &mut enqueue)?,
         };
-        self.slices = self.slices.wrapping_add(1);
+        *slices = slices.wrapping_add(1);
 
         // Absorb every wake produced during the slice (a send to a blocked receiver, or a
         // signal/trapped-`EXIT`/`{'DOWN'}` message) into this same sweep.
-        self.resume_woken(table);
+        resume_woken_into(run_queue, table);
 
         Ok(Some(pid))
     }
@@ -345,16 +438,16 @@ impl Scheduler {
     /// scheduler slice (`run_slice` calls it automatically at each slice's end). See the
     /// crate `CONTEXT.md` for the full single-threaded orchestration contract.
     pub fn resume_woken(&mut self, table: &mut ProcessTable) -> usize {
-        drain_woken_into(table, |pid, priority| {
-            self.run_queue.enqueue_with_priority(pid, priority)
-        })
+        resume_woken_into(&mut self.run_queue, table)
     }
+
     /// Runs slices until the run queue empties (or `max_slices` have run), returning the
     /// number of slices executed.
     ///
-    /// The port-less form; a caller holding a [`PortTable`] should use
-    /// [`Scheduler::run_ready_with_ports`] so a death inside any slice cleans the dying
-    /// process's incoming port monitors too.
+    /// This form uses the scheduler's **owned** [`PortTable`] (installed through
+    /// [`Scheduler::with_ports`]/[`Scheduler::set_ports`]) when it has one, so a death inside
+    /// any slice cleans the dying process's incoming port monitors too. A caller that holds the
+    /// port table itself should use [`Scheduler::run_ready_with_ports`] instead.
     ///
     /// # Errors
     ///
@@ -368,12 +461,12 @@ impl Scheduler {
         self.run_ready_inner(table, None, runner, max_slices)
     }
 
-    /// [`Scheduler::run_ready`] with the [`PortTable`] in hand: every slice runs through
-    /// [`Scheduler::run_slice_with_ports`], so a process that dies inside any of them cleans
-    /// its incoming port monitors.
+    /// [`Scheduler::run_ready`] with an **explicitly passed** [`PortTable`]: every slice runs
+    /// through [`Scheduler::run_slice_with_ports`], so a process that dies inside any of them
+    /// cleans its incoming port monitors.
     ///
-    /// This is the port-aware counterpart an orchestrator that owns both tables should drive;
-    /// see [`Scheduler::run_slice_with_ports`] for why the port-less form is not enough.
+    /// The explicit table **takes precedence** over the scheduler's owned table for this call
+    /// only (see [`Scheduler::run_slice_with_ports`]).
     ///
     /// # Errors
     ///
@@ -388,16 +481,18 @@ impl Scheduler {
         self.run_ready_inner(table, Some(ports), runner, max_slices)
     }
 
-    /// The shared body of [`Scheduler::run_ready`] and [`Scheduler::run_ready_with_ports`]:
-    /// `ports` is `Some` only when the caller holds a [`PortTable`].
+    /// The shared body of [`Scheduler::run_ready`] and [`Scheduler::run_ready_with_ports`].
+    ///
+    /// `ports` is `Some` only when the caller passed a [`PortTable`] explicitly; it takes
+    /// precedence over the scheduler's owned table (which the default form resolves inside
+    /// [`Scheduler::run_slice_inner`]).
     fn run_ready_inner<R: ProcessRunner>(
         &mut self,
         table: &mut ProcessTable,
-        ports: Option<&mut PortTable>,
+        mut ports: Option<&mut PortTable>,
         runner: &mut R,
         max_slices: Option<u64>,
     ) -> Result<u64> {
-        let mut ports = ports;
         let mut executed: u64 = 0;
         while !self.run_queue.is_empty() {
             if let Some(max) = max_slices {
@@ -659,6 +754,17 @@ fn slice_end_inner<F: FnMut(ProcessId, Priority)>(
         }
     }
     Ok(())
+}
+
+/// Turns the table's pending wakes into run-queue entries on `run_queue`, returning how many
+/// were enqueued. This is the free-function form of [`Scheduler::resume_woken`], so a caller that
+/// has already split-borrowed the scheduler (e.g. [`Scheduler::run_slice_inner`], which needs the
+/// run queue and the owned port table at once) can drive it without re-borrowing the whole
+/// scheduler.
+pub(crate) fn resume_woken_into(run_queue: &mut RunQueue, table: &mut ProcessTable) -> usize {
+    drain_woken_into(table, |pid, priority| {
+        run_queue.enqueue_with_priority(pid, priority)
+    })
 }
 
 /// Turns the table's pending wakes into run-queue entries via `enqueue`, returning how many

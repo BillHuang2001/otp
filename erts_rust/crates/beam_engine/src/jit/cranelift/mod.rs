@@ -291,6 +291,34 @@ pub(crate) fn run_label_outcome(
     run_native_label_outcome(machine, module, label, arity, args, ctx, &code)
 }
 
+/// Resume a suspended machine on the Cranelift hot tier.
+///
+/// The Cranelift tier compiles **one function per IR function** and bakes that
+/// function's entry `pc` into the generated code ([`CompiledFunctions::entry_pc`]),
+/// so [`CompiledEntries::enter`] refuses any other address. A suspension address is a
+/// `wait`/`wait_timeout` **mid-function** `pc`, which no compiled function can be
+/// entered at, so an arbitrary-`pc` resume is unserviceable natively.
+///
+/// Rather than silently fall back to another tier (which would hide a real
+/// capability limit and misreport which tier ran the slice), this reports the honest
+/// typed error. The resume position is not even examined: a compiled function can
+/// only be entered at its entry `pc`, so the mismatching-entry case is the required,
+/// deterministic behavior. This backs
+/// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
+/// for [`Tier::Cranelift`](crate::jit::Tier::Cranelift) (see
+/// [`crate::jit::run_cranelift_resume_outcome`]).
+pub(crate) fn run_resume_outcome(
+    _machine: &mut Machine,
+    _module: &Module,
+    _func: u32,
+    _pc: u32,
+    _ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    Err(error::unsupported(
+        "cranelift jit: cannot resume at an arbitrary pc (a compiled function can only be entered at its entry pc)",
+    ))
+}
+
 /// The artifact [`CraneliftJit::compile`] produces: the Cranelift [`JITModule`]
 /// that owns the executable mapping plus the per-function native entries.
 ///

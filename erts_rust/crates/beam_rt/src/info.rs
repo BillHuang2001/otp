@@ -39,6 +39,7 @@
 //!
 //! | module | keys |
 //! |---|---|
+//! | [`host`] | the host-derived `os_type` / `system_architecture` pair (used by [`system`]) |
 //! | [`system`] | build/host identity constants (`version`, `nif_version`, `os_type`, `emu_type`, …) |
 //! | [`limits`] | counts read from this runtime's live tables plus the emulator limits (`atom_count`, `process_count`, `port_limit`, …) |
 //! | [`schedulers`] | processor/scheduler/multi-scheduling keys |
@@ -78,11 +79,18 @@ use beam_term::{make_atom, try_make_small, AtomTable, Eterm, NIL};
 use crate::error;
 use crate::runtime::Runtime;
 
+mod host;
 mod limits;
 mod memory;
 mod schedulers;
 mod system;
 mod unsupported;
+
+// The host-identity helpers (`os_type`, `system_architecture`) live in their own child
+// module — they are the only keys here that turn a *host* fact into a value, and the
+// mapping is worth unit-testing on its own. Re-exported so the `system` family's
+// `use super::{os_type, system_architecture, InfoValue};` keeps resolving.
+pub(crate) use host::{os_type, system_architecture};
 
 /// The keys [`system_info_value`] answers — every key whose value this runtime can give
 /// in the oracle's exact shape. Some are constants of this build/host, others are
@@ -210,8 +218,12 @@ pub const UNSUPPORTED_KEYS: &[&str] = &[
 /// with the core set is harmless, and **appending** to this list keeps every index the
 /// core seed assigned before it unchanged.
 pub const INFO_ATOMS: &[&str] = &[
-    // `os_type` (`{unix,linux}` / `{win32,nt}`) and `threads`/`*_support` (`true` / `false`).
+    // `os_type`: the `{unix,linux}` / `{win32,nt}` pair of the two families (see [`host`]),
+    // the other ERTS OS names a supported platform answers (`{unix,darwin}` on macOS,
+    // `{unix,freebsd}`/`openbsd`/`netbsd`/`dragonfly` on the BSDs), and
+    // `threads`/`*_support` (`true` / `false`).
     "unix", "linux", "win32", "nt", "true", "false",
+    "darwin", "freebsd", "openbsd", "netbsd", "dragonfly",
     // `emu_flavor` (`jit` for the JIT emulator, `emu` for the plain interpreter).
     "jit", "emu",
     // `alloc_util_allocators`: the ten alloc-util allocator names, in the oracle's order
@@ -531,33 +543,6 @@ pub(crate) fn live_tables(rt: &Runtime) -> Result<i64> {
         Err(_) => Err(error::unsupported(
             "erlang:system_info(ets_count): the ETS table registry is already borrowed",
         )),
-    }
-}
-
-/// The Erlang `{OsFamily,OsName}` pair of the host.
-pub(crate) fn os_type() -> InfoValue {
-    if cfg!(target_os = "windows") {
-        InfoValue::Tuple("win32", "nt")
-    } else {
-        InfoValue::Tuple("unix", "linux")
-    }
-}
-
-/// The target triple of this build, best-effort.
-///
-/// `std` exposes the architecture and the operating system but not the vendor, so the
-/// known targets are spelled out and anything else falls back to
-/// `"<arch>-unknown-<os>"`. This is introspection only; the build itself never depends
-/// on it.
-pub(crate) fn system_architecture() -> String {
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-    match (arch, os) {
-        ("x86_64", "linux") => "x86_64-pc-linux-gnu".to_string(),
-        ("aarch64", "linux") => "aarch64-unknown-linux-gnu".to_string(),
-        ("x86_64", "macos") => "x86_64-apple-darwin".to_string(),
-        ("aarch64", "macos") => "aarch64-apple-darwin".to_string(),
-        _ => format!("{arch}-unknown-{os}"),
     }
 }
 

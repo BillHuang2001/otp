@@ -258,7 +258,12 @@ fn a_container_without_a_loct_chunk_has_no_locals() {
     body.extend_from_slice(b"Code");
     body.extend_from_slice(&20u32.to_be_bytes());
     body.extend_from_slice(&16u32.to_be_bytes()); // head_size
-    body.extend_from_slice(&[0u8; 16]);
+    // The four header fields: `format_number` 0, a `max_opcode` inside the accepted
+    // window ([169, 193], `beam_load.c:189-225`), `label_count` and `function_count`.
+    body.extend_from_slice(&0u32.to_be_bytes()); // format_number
+    body.extend_from_slice(&181u32.to_be_bytes()); // max_opcode
+    body.extend_from_slice(&0u32.to_be_bytes()); // label_count
+    body.extend_from_slice(&0u32.to_be_bytes()); // function_count
     let mut image = Vec::new();
     image.extend_from_slice(b"FOR1");
     image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());

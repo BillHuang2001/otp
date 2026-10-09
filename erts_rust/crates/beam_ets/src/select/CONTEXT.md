@@ -19,7 +19,8 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
 - `expr.rs` — `Expr`, `CmpOp`, `TypeTest`, `ArithOp`, `Value`; `decode`, `eval`,
   `value_bool`; the `ArithHook` seam (`DefaultArithHook`, `set_arith_hook`, thread-local).
 - `exec.rs` — `impl Table`: `select`, `select_reverse`, `select_delete`, `select_count`,
-  `match_object`, `match_`, `match_delete`, `select_replace`; `BodyKind`; `run_clauses`.
+  `match_object`, `match_`, `match_delete`, `select_replace`; `BodyKind`; `run_clauses`,
+  `guards_hold`.
 - `run.rs` — `match_spec_run(list, raw_spec, atoms, heap)` (the oracle's
   `match_spec_run/2` takes an already-compiled spec; this takes the **raw** list).
 - `continuation.rs` — `MatchContinuation` (opaque) + the `/3`+`/1` limited/continue forms.
@@ -34,27 +35,35 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   `expr.rs`), each with a `// SAFETY:` rationale.
 
 ## Known Issues (honest gaps)
-- **A guard's typed capability-gap error is silently swallowed.** `exec.rs::guards_hold`
-  maps **every** `Err(_)` to "clause fails". A guard whose evaluation hits an
-  *unsupported* (not oracle-raising) construct — match-spec arithmetic outside small
-  ints (`/`, bignum/float operands, i64 overflow → `unsupported_ets`) or `self/0`
-  (→ `badarg`) — therefore makes the clause fail and the spec silently **under-matches**,
-  while the oracle evaluates it and matches. The body path (`run_clauses`) correctly
-  propagates non-`BadArg` errors; the guard path does not. No `ArithHook` is installed
-  anywhere in the workspace (`set_arith_hook` appears only here + its tests), so the
-  shipped runtime is permanently small-int-only.
-- **Unsupported constructs fail as `badarg`, indistinguishable from a malformed spec.**
-  `expr.rs::decode_call`'s fallthrough `_ => Err(badarg())` and the map-expression guard
-  (`expr.rs` map branch) reject every call outside the recognised set with plain `badarg`
-  — the same error a genuinely-invalid spec yields. Missing vs the oracle's `guard_tab`:
-  `map_get`, `float`, `trunc`, `round`, `list_to_tuple`, `is_map_key`, `map_size`,
-  `tuple_size`, `byte_size`/`bit_size`, `binary_part`, comprehensions, map construction
-  and map patterns in a head (the head map is compared as an exact literal, so it
-  **under-matches**). `abs/1` is small-int only; `self/0` raises. Inconsistent with the
-  `ArithHook` path, which reports `unsupported_ets`.
-- **Map patterns/expressions and `self/0` are the pinned typed divergences** (see
-  `tests/select.rs::documented_capability_gaps_are_typed_and_diverge_from_the_oracle`,
-  `tests/match_spec_run.rs::documented_gaps_diverge_from_the_oracle_in_a_run`).
+- **The guard-BIF surface is implemented and oracle-checked.** `expr.rs::decode_call`/
+  `eval` cover the C `guard_tab` (`erl_db_util.c:572-976`) set already present plus the
+  additions `map_get/2`, `is_map_key/2`, `map_size/1`, `tuple_size/1`, `byte_size/1`,
+  `bit_size/1`, `float/1`, `trunc/1`, `round/1`, `abs/1` (small int **and** float) and
+  map **construction** in a guard or a body (`#{K => V}` — the C `dmc_map`, evaluated per
+  object). Every case is pinned against the live `erl` in `tests/select.rs` and
+  `tests/match_spec_run.rs`. **Remaining typed gaps** (each a typed `unsupported_ets`
+  raise, or a `badarg` the oracle also raises — never a wrong result):
+  - `list_to_tuple/1` is **not** in the oracle's `guard_tab`, so the oracle and this
+    crate both reject it with `badarg` (a matching behaviour, not a divergence);
+  - `abs/1` on a **bignum** operand (`unsupported_ets: match-spec 'abs'`);
+  - `trunc/1`/`round/1` whose result is beyond the 60-bit small range — the oracle
+    returns a bignum (`unsupported_ets: match-spec 'trunc'/'round'`);
+  - `binary_part/3` and comprehensions are still absent (`badarg`).
+  `byte_size/1`/`bit_size/1` read an **off-heap** (refc) binary **correctly**: the
+  on-heap `[BinRef][ErlSubBits]` pair's root classifies as `TermClass::Bitstring` and
+  `bitstring_size` returns `end - start`, so it is oracle parity — the sibling
+  `TermClass::BinRef` → `unsupported_ets` arm is reachable only for a *bare* `BinRef`
+  term, which is not a user-visible term. (`tests/select.rs::
+  byte_size_and_bit_size_read_an_off_heap_refc_binary_correctly`.)
+- **A map in a HEAD is compared as an exact literal**, so a wildcard/variable inside a
+  head map **under-matches**; the oracle matches structurally (`#{a=>'_'}` matches
+  `#{a=>1}`). A map *expression* in a guard/body **is** constructed (`dmc_map`); only a
+  head map is literal.
+- **`self/0` is an honest SEMANTIC under-match**, not a typed gap: the ETS layer has no
+  process identity, so it raises `badarg` and its clause is skipped, while the oracle
+  evaluates it against the calling process (`{self} =:= {self}` matches for the oracle).
+  Pinned by `tests/select.rs::documented_capability_gaps_are_typed_and_diverge_from_the_oracle`
+  and `tests/match_spec_run.rs::documented_gaps_diverge_from_the_oracle_in_a_run`.
 - **`select_replace/2`'s key check is value-based**, not the oracle's static
   `db_match_keeps_key` shape check (`exec.rs` `keeps_key` + the doc block); more
   permissive in three corners, recorded by `tests/ets_replace.rs::recorded_divergence_*`.
@@ -65,6 +74,16 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   (only self-recursion; no test). Its doc "handy for tests" is aspirational.
 
 ## Design Decisions
+- **The guard-error classification (`exec.rs::guards_hold` returns `Result<bool>`).** A
+  guard the **oracle itself raises** — every oracle-raising guard construct is the C
+  `badarg` (`element/2` out of range, `hd`/`tl`/`length` of a non-list, `size/1` of a
+  non-tuple/binary, `map_get/2` with an absent key, `div`/`rem` by zero, a non-number
+  arithmetic operand, …) — makes its clause fail (`Err(BeamError::BadArg) => Ok(false)`,
+  the C `matchCatch`); so does a guard whose value is non-boolean or `false`. Any
+  **other** error is a capability gap of this runtime (e.g. `unsupported_ets` from
+  `ArithHook` arithmetic outside small integers) and is propagated with `Err`, so the
+  caller sees a typed failure instead of a silently under-matching spec (workspace
+  `CONTEXT.md` §3).
 - **`ArithHook` is a thread-local seam** (`set_arith_hook`) so `beam_ets` (wave 1) needs
   no `beam_bifs` edge; `DefaultArithHook` is total-or-refusing (never a fabricated result:
   `/`, non-small operands, overflow → `unsupported_ets`; `div`/`rem` by 0 → `badarg`).
@@ -83,16 +102,19 @@ its compiled-opcode program. The interior is a Rust AST, not a term program.
   `tests/ets_continuation.rs`, `tests/ets_replace.rs`, and the differential group
   `tests/differential/battery/{matchspec,replace,continuation}.rs` (compared line-by-line
   against the live `erl`).
-- **Coverage caveat:** the differential `matchspec` group exercises only small-int
-  arithmetic-in-a-body (`*`) and `>`/`is_*`/`andalso`/`orelse` guards — it never exercises
-  `/`, floats, bignums, `self/0`, `abs/1`, `element/2`, maps or the unsupported-call set,
-  so `mismatch = 0` does **not** establish guard/body-language parity (and
-  `KNOWN_DIVERGENCES` is empty).
+- **Coverage:** the differential `matchspec` group still exercises only small-int
+  arithmetic-in-a-body (`*`) and `>`/`is_*`/`andalso`/`orelse` guards, so `mismatch = 0`
+  alone does **not** establish guard/body-language parity (`KNOWN_DIVERGENCES` is empty).
+  The crate-local `tests/select.rs` / `tests/match_spec_run.rs` close that gap: they pin
+  the full guard-BIF set (map/tuple/bitstring/float/`trunc`/`round`/`abs` + map
+  construction, each with its live-`erl` probe quoted) and the guard-error
+  classification (an unevaluable guard is a typed error; an oracle-raising guard skips
+  the clause).
 
 ## Routing Table
 - `mod.rs` → `MatchSpec`/`MatchClause`/`compile`/`SelectPredicate` + term-decode helpers (`atom_name`, `var_index`, `tuple_elements`, `list_elements`)
 - `pattern.rs` → `Pattern` + head decode/match (+ dead `bound_vars`)
-- `expr.rs` → `Expr`/`CmpOp`/`TypeTest`/`ArithOp`/`Value` + `ArithHook` + `decode`/`eval`
+- `expr.rs` → `Expr`/`CmpOp`/`TypeTest`/`ArithOp`/`Value` + `ArithHook` + `decode`/`eval` (incl. `map_get`/`map_size`/`is_map_key`/`tuple_size`/`byte_size`/`bit_size`/`float`/`trunc`/`round`/`abs` + map construction)
 - `exec.rs` → `impl Table` select/match/delete/replace/count + `run_clauses`/`guards_hold`/`spec_for_pattern`/`BodyKind`
 - `run.rs` → `match_spec_run` (raw-spec list runner)
 - `continuation.rs` → `MatchContinuation` + the limit/continue forms (`traverse`/`resume`)

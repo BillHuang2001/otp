@@ -108,8 +108,8 @@ so a reason that genuinely cannot be copied is the honest `error:system_limit`, 
 word.
 
 ## Measured: why the default is the safe `auto` mode
-Release build (`cargo build --release -p beam_rt`), **`$ERTS_STDLIB_DIR` set** so no per-process `erl`
-start-up is included, `beam_rt run <mod>.beam <f>/<a> <arg>` alternating between
+Release build (`cargo build --release -p beam_rt`), no per-process `erl` start-up (the system code
+path resolves natively from the filesystem), `beam_rt run <mod>.beam <f>/<a> <arg>` alternating between
 `BEAM_RT_TIER=interpreter` and the default, **min / median wall seconds**:
 
 | workload (module compiled with the system `erlc`) | shape (from `erlc -S`) | interpreter | `auto` (the default) |
@@ -129,12 +129,6 @@ the default on a fresh `tb` fixture: `tb:cnt/1 20000000` (non-allocating tail lo
 `BEAM_RT_TIER=auto`), and the FULL differential suite under the new default is
 `total=1213 agree=1211 mismatch=0 unsupported=2` (A.9 `155/155` agree) — so the default is CI-checked
 corpus-correct.
-
-Contaminated with the per-process `erl` start-up (i.e. `$ERTS_STDLIB_DIR` unset, ≈150 ms added to
-every run): `slice:fib/1 30` interpreter **0.276/0.322** vs `auto` 0.212/0.343, `slice:add/2 2 3`
-0.321/0.342 vs 0.320/0.380, `walk:cnt/1 2000000` 1.831/1.925 vs 0.244/0.260 — the earlier
-"the JIT is ~1.8× *slower* on `slice:fib/1 30`" reading was this start-up plus a debug build, not the
-tier.
 
 **Conclusion.** The tier is taken on a process's **first** entry only, and a pre-empted process is
 **resumed on the interpreter** (a tier-aware resume does not exist yet), so a module whose hot loop

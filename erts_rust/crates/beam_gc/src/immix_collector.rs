@@ -480,7 +480,9 @@ impl GenImmixCollector {
         stats.words_reclaimed = used.saturating_sub(stats.words_copied);
         self.young.reset();
         self.minor_since_major += 1;
-        self.resize_nursery(used)?;
+        // What the minor left in the nursery is exactly what it promoted (see
+        // `HeapPolicy::young_after_collection`), never the pre-collection fill.
+        self.resize_nursery(stats.words_copied)?;
         Ok(stats)
     }
 
@@ -543,7 +545,9 @@ impl GenImmixCollector {
         stats.words_reclaimed = immix.words_reclaimed + nursery_garbage;
         self.young.reset();
         self.minor_since_major = 0;
-        self.resize_nursery(used)?;
+        // The fullsweep promoted the nursery's live words into the mature region, so the
+        // nursery's surviving occupancy is zero and the resize can only shrink it.
+        self.resize_nursery(0)?;
         Ok(stats)
     }
 
@@ -595,17 +599,21 @@ impl GenImmixCollector {
         self.minor_since_major = 0;
         // No in-place reclaim ran, so there is nothing to report for it.
         self.last_immix = None;
-        self.resize_nursery(used)?;
+        // The relocation copied every live word — the nursery's included — into the fresh
+        // mature region, so the nursery's surviving occupancy is zero.
+        self.resize_nursery(0)?;
         Ok(stats)
     }
 
-    /// Sizes the (now empty) nursery for the next round from the heap-size policy — the
-    /// same `next_heap_size(p, stack_size + MAX(size_before, need), 0)` rule the copying
-    /// [`crate::Collector`] applies (`erl_gc.c:1493`). The space is only replaced when the
+    /// Sizes the (now empty) nursery for the next round from the heap-size policy
+    /// ([`HeapPolicy::young_after_collection`]) — the same bounded rule the copying
+    /// [`crate::Collector`] applies: `live_words` is what the collection left *in the
+    /// nursery* (the promoted words for a minor, `0` after a fullsweep), and the capacity
+    /// never grows merely because a collection ran. The space is only replaced when the
     /// target differs.
-    fn resize_nursery(&mut self, used_words: usize) -> Result<()> {
+    fn resize_nursery(&mut self, live_words: usize) -> Result<()> {
         let capacity = self.young.capacity_words();
-        let target = self.policy.young_after_collection(capacity, used_words);
+        let target = self.policy.young_after_collection(capacity, live_words);
         if target != capacity {
             let alloc = self.young.allocator().clone();
             self.young = HeapSpace::with_allocator(alloc, target)?;

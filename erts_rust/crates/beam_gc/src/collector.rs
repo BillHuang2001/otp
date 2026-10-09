@@ -152,16 +152,19 @@ impl Collector {
         let mut from = FromSet::new();
         from.add(&self.young);
         let stats = Copier::new(&from, &mut self.mature).run(roots)?;
-        let used = self.young.used_words();
         self.young.reset();
         self.minor_since_major += 1;
         self.stats.words_copied += stats.words_copied;
         self.stats.words_reclaimed += stats.words_reclaimed;
         self.stats.objects_copied += stats.objects_copied;
         self.stats.minor_collections += 1;
-        // The nursery is empty again: size it for the next round (the C's minor-time
-        // young-heap resize, `erl_gc.c:1493`).
-        self.resize_nursery(used)?;
+        // The nursery is empty again: size it for the next round from what the collection
+        // *left in it* — for a minor that is exactly the words it promoted
+        // (`GcStats::words_copied`), i.e. the C's minor-time young-heap resize fed with the
+        // surviving usage (`erl_gc.c:1493`). Never the pre-collection fill: a nursery is only
+        // collected when it is full, so that stale count is ≈ the capacity and would grow the
+        // nursery on every collection, without bound.
+        self.resize_nursery(stats.words_copied)?;
         Ok(stats)
     }
 
@@ -202,7 +205,11 @@ impl Collector {
         self.stats.words_reclaimed += stats.words_reclaimed;
         self.stats.objects_copied += stats.objects_copied;
         self.stats.major_collections += 1;
-        self.resize_nursery(used)?;
+        // The fullsweep relocated *every* live word — the nursery's included — into the fresh
+        // mature space, so the nursery's surviving occupancy is now zero: the resize can only
+        // bring it down towards its reserved minimum, never up (sizing it from the live set
+        // would make the nursery track the mature generation's contents).
+        self.resize_nursery(0)?;
         Ok(stats)
     }
 
@@ -212,9 +219,9 @@ impl Collector {
     ///
     /// It collects once (a minor, escalating to a major when a minor cannot make room), then
     /// grows the now-empty nursery to the smallest curated size that covers `need_words`.
-    /// The growth is *explicit* because a collection sizes the nursery from what the previous
-    /// round happened to use, not from what the caller is about to allocate — without this
-    /// step a request larger than the nursery could never be met by collecting alone. The
+    /// The growth is *explicit* because a collection sizes the nursery from what it left alive
+    /// in it, not from what the caller is about to allocate — without this step a request
+    /// larger than the nursery could never be met by collecting alone. The
     /// returned [`Collection`] is the one it ran.
     ///
     /// Afterwards `young().available_words() >= need_words`. If
@@ -238,14 +245,16 @@ impl Collector {
         Ok(collection)
     }
 
-    /// Sizes the (now empty) nursery for the next round from the heap-size policy — the
-    /// C's `next_heap_size(p, stack_size + MAX(size_before, need), 0)` applied to the
-    /// nursery (`erl_gc.c:1493`). A nursery that filled up grows, one left mostly empty
-    /// shrinks, and one in between keeps its size; the space is only replaced when the
-    /// target differs, so a steady-state workload pays nothing.
-    fn resize_nursery(&mut self, used_words: usize) -> Result<()> {
+    /// Sizes the (now empty) nursery for the next round from the heap-size policy
+    /// ([`HeapPolicy::young_after_collection`]), where `live_words` is the number of words the
+    /// collection **left in the nursery** — the promoted words for a minor, `0` after a
+    /// fullsweep. A nursery the round left mostly empty shrinks, one that is already about
+    /// right keeps its size, and the capacity never grows merely because a collection ran (see
+    /// that method's contract); the space is only replaced when the target differs, so a
+    /// steady-state workload pays nothing.
+    fn resize_nursery(&mut self, live_words: usize) -> Result<()> {
         let capacity = self.young.capacity_words();
-        let target = self.policy.young_after_collection(capacity, used_words);
+        let target = self.policy.young_after_collection(capacity, live_words);
         if target != capacity {
             let alloc = self.young.allocator().clone();
             self.young = HeapSpace::with_allocator(alloc, target)?;

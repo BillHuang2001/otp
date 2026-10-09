@@ -758,7 +758,16 @@ mod tests {
 
         assert_eq!(atom_val(putenv_2(&mut ctx, &[key, value]).expect("putenv")),
                    atom_val(ctx.atom("true").unwrap()));
-        assert_eq!(atom_val(getenv_1(&mut ctx, &[key]).expect("getenv")), atom_val(value));
+        // `getenv/1` returns a **freshly materialized** char list (the value was
+        // stored as native bytes and converted back), so it is never the same
+        // heap cell as `value`. Compare structurally — `atom_val` would only
+        // compare two truncated heap pointers. `=:=` still rejects a wrong
+        // value or a wrong shape.
+        let got = getenv_1(&mut ctx, &[key]).expect("getenv");
+        assert!(
+            beam_term::compare::eq(got, value, &atoms),
+            "getenv/1 must return the stored value"
+        );
         assert_eq!(atom_val(unsetenv_1(&mut ctx, &[key]).expect("unsetenv")),
                    atom_val(ctx.atom("true").unwrap()));
         assert_eq!(atom_val(getenv_1(&mut ctx, &[key]).expect("getenv")),

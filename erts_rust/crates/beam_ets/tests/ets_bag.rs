@@ -665,8 +665,9 @@ fn multi_kind_battery_matches_the_recorded_oracle_figures() {
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Run the oracle battery once and return its `key -> value` facts. Returns
-/// `None` (after a **loud** skip, or a failure under `BEAM_ETS_REQUIRE_ORACLE=1`)
-/// when no Erlang oracle is available.
+/// `None` (after a **loud** skip) only under the explicit oracle opt-out
+/// (`BEAM_ETS_ALLOW_NO_ORACLE=1`); a genuinely absent Erlang otherwise **fails**
+/// the calling test, since the oracle is required by default.
 fn oracle_facts(test: &str) -> Option<BTreeMap<String, String>> {
     let Some(escript) = oracle::resolve_escript() else {
         oracle::skip(

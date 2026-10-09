@@ -18,8 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! The `MAP_EXT` (`116`) **key-order contract**: the codec *preserves* a flat map's
-//! stored pair order and never sorts or canonicalises it.
+//! The `MAP_EXT` (`116`) **key-order contract**: the encoder *preserves* a flat map's
+//! stored pair order and never sorts or canonicalises it, while the **decoder**
+//! canonicalises an incoming `MAP_EXT` exactly as ERTS does.
 //!
 //! ## Who owns the order
 //!
@@ -30,21 +31,28 @@
 //! (`erts_cmp`). A larger map is a **hash map** (HAMT), traversed in node-slot order
 //! (`external.c:3746-3823`).
 //!
-//! The encoder emits a flat map's pairs **in that stored order** (`external.c:3746-3769`
-//! — `flatmap_get_keys`/`flatmap_get_values`, `ENC_MAP_PAIR`, no sort unless the
-//! `deterministic` dflag is set). So *sorting is the constructor's job*, not the codec's:
-//! [`beam_term::map::write_map`] is what applies `cmp_flatmap_keys`, and every map built
-//! through the compiled path already carries ERTS's order. `beam_codec` therefore only
-//! *preserves* whatever order its input term stores — which is exactly what makes
-//! decode → re-encode **byte-stable** (see [`flatmap_pairs_encode_in_stored_order`] and
+//! The **encoder** emits a flat map's pairs **in that stored order**
+//! (`external.c:3746-3769` — `flatmap_get_keys`/`flatmap_get_values`, `ENC_MAP_PAIR`, no
+//! sort unless the `deterministic` dflag is set). So *sorting is the constructor's job*,
+//! not the encoder's: [`beam_term::map::write_map`] is what applies `cmp_flatmap_keys`,
+//! and every map built through the compiled path already carries ERTS's order.
+//! `beam_codec`'s encoder therefore only *preserves* whatever order its input term
+//! stores — which is exactly what makes decode → re-encode **byte-stable** (see
+//! [`flatmap_pairs_encode_in_stored_order`] and
 //! [`oracle_and_our_encoder_agree_for_integer_keyed_maps`]).
 //!
-//! **Sorting inside `beam_codec` would be wrong.** It breaks the byte-exact fixture
-//! `tests/ground_truth.rs::literals_gen_server_decodes_with_its_export_funs` — a real
-//! `gen_server` literal pool whose map wire order is *not* this crate's atom-table index
-//! order — and the live `interop` harness. (Confirmed by a throwaway experiment that
-//! sorted in `encode_map`: those two tests fail; the change was reverted. See the crate
-//! `CONTEXT.md`, "Map key encode order".)
+//! The **decoder** is the other half: `binary_to_term/1` canonicalises a `MAP_EXT` the
+//! way the C does — a ≤ 32-pair flat map is sorted into `erts_cmp_flatmap_keys` order
+//! (`erts_validate_and_sort_flatmap`, `external.c:5425-5453`), a larger one is rebuilt as
+//! a HAMT, and a **duplicate key** is `badarg`. A decode → re-encode therefore stays
+//! byte-stable for oracle-produced (already-canonical) input.
+//!
+//! **Sorting inside the `beam_codec` *encoder* would be wrong.** It breaks the byte-exact
+//! fixture `tests/ground_truth.rs::literals_gen_server_decodes_with_its_export_funs` — a
+//! real `gen_server` literal pool whose map wire order is *not* this crate's atom-table
+//! index order — and the live `interop` harness. (Confirmed by a throwaway experiment
+//! that sorted in `encode_map`: those two tests fail; the change was reverted. See the
+//! crate `CONTEXT.md`, "Map key encode order".)
 //!
 //! ## Why atom-keyed multi-key maps cannot be byte-compared across implementations
 //!
@@ -453,20 +461,34 @@ fn hashmap_terms_encode_and_roundtrip() {
 
     // (c) The wire carries the HAMT's *stored* order **reversed** — the C walks the tree
     //     through a LIFO work stack, so it emits the reverse of the ascending node-slot
-    //     pre-order `map_pairs_storage_order` returns. (Our decoder materializes any
-    //     MAP_EXT as one flat map, so its keys-tuple order *is* the wire order.)
-    let wire = map_pairs_storage_order(decoded).unwrap();
-    let mut reversed_stored = stored.clone();
+    //     pre-order `map_pairs_storage_order` returns. The decoded map is itself a HAMT
+    //     (40 > `MAP_SMALL_MAP_LIMIT`), rebuilt by the same `write_map`, so its storage
+    //     order equals the original's while the image carries the reverse.
+    let wire_stored = map_pairs_storage_order(decoded).unwrap();
+    assert_eq!(
+        wire_stored, stored,
+        "the decoded HAMT stores the same pairs in the same order as the original"
+    );
+    // Read the pair order straight off the image (every key/value is a small here) and
+    // check it is the reverse of that storage order.
+    let mut wire_keys: Vec<Eterm> = Vec::new();
+    let mut i = 6; // past `[version, MAP_EXT, count:4]`
+    for _ in 0..40 {
+        assert_eq!(bytes[i], 97, "SMALL_INTEGER_EXT key");
+        wire_keys.push(make_small(i64::from(bytes[i + 1])));
+        assert_eq!(bytes[i + 2], 97, "SMALL_INTEGER_EXT value");
+        i += 4;
+    }
+    let mut reversed_stored: Vec<Eterm> = stored.iter().map(|(k, _)| *k).collect();
     reversed_stored.reverse();
     assert_eq!(
-        wire, reversed_stored,
+        wire_keys, reversed_stored,
         "MAP_EXT must carry the reverse of the HAMT storage order (the C's LIFO walk)"
     );
     // ... and that order is NOT the sorted key order (1,2,…,40), proving no sort happened.
     let sorted_keys: Vec<Eterm> = (1..=40).map(make_small).collect();
     assert_ne!(
-        wire.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
-        sorted_keys,
+        wire_keys, sorted_keys,
         "the encoder must not sort HAMT pairs into key order"
     );
 

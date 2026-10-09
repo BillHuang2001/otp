@@ -2154,9 +2154,11 @@ call(F) -> F().
 
     #[test]
     fn a_blocking_local_closure_suspends_and_resumes() {
-        // The pump boots the runtime on demand (`scheduler_pass` → `boot_if_needed`), so
-        // this test needs the system code path (`erl`, or `$ERTS_STDLIB_DIR`) as well as the
-        // compiler. A missing toolchain is a loud skip, never a silent pass.
+        // The pump boots the runtime on demand (`scheduler_pass` → `boot_if_needed`), which
+        // resolves the system code path (natively from the filesystem, else `$ERTS_STDLIB_DIR`
+        // or the system `erl`). The guard below is conservative — it skips when neither
+        // `$ERTS_STDLIB_DIR` nor an `erl` on `$PATH` is available — and this test needs the
+        // compiler too. A missing toolchain is a loud skip, never a silent pass.
         if std::env::var_os("ERTS_STDLIB_DIR").is_none() && find_on_path("erl").is_none() {
             skip_loudly(
                 "blocking local closure",
