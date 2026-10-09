@@ -25,9 +25,9 @@
 //! `driver_alloc`, `driver_output`, `driver_select`, `driver_set_timer`, `erl_drv_output_term`, …
 //! Its `driver_*` imports are left **undefined** by the linker, exactly like a real OTP driver, so
 //! they can only be resolved out of the *loading process*'s dynamic symbol table. The
-//! `ready_async`-less variant (`host_driver_no_ready_async.c`) and the `outputv`-only sibling
-//! (`vector_driver.c`) are the same kind of object with the opposite callback shape. This test does
-//! two things for each of them:
+//! `ready_async`-less variant (`host_driver_no_ready_async.c`), the `process_exit`-less variant
+//! (`host_driver_no_process_exit.c`) and the `outputv`-only sibling (`vector_driver.c`) are the same
+//! kind of object with a different callback shape. This test does two things for each of them:
 //!
 //! 1. compiles the fixture with the system `cc` against the system `erl_driver.h` and asserts a
 //!    shared object was produced (the fixture must stay buildable — a broken fixture is a hard
@@ -61,6 +61,13 @@ fn fixture_source() -> PathBuf {
 /// `ready_async` slot forced to `NULL`), used to exercise the host's `async_free` arm.
 fn variant_fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver_no_ready_async.c")
+}
+
+/// The committed `process_exit`-less variant fixture (`#include`s `host_driver.c` with the entry's
+/// `process_exit` slot forced to `NULL`), used to exercise the host's port-exit adapter's
+/// `emergency_close` fallback.
+fn no_process_exit_variant_fixture_source() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver_no_process_exit.c")
 }
 
 /// The committed `outputv`-only fixture (`vector_driver.c`): `.output = NULL`,
@@ -155,7 +162,21 @@ fn host_driver_no_ready_async_variant_builds_and_loads() {
 #[test]
 fn vector_driver_fixture_builds_and_loads() {
     build_and_load(vector_fixture_source(), "vector_driver", "vector_driver");
-}/// The include-directory helper must return a directory that really holds the driver header (the
+}
+
+/// The same for the `process_exit`-less variant fixture: it must stay buildable and loadable, so
+/// `tests/abi_lifecycle.rs`'s `emergency_close`-fallback test can rely on it. Its entry keeps the
+/// `driver_name` of the fixture it `#include`s, so it is loaded under `"host_driver"`.
+#[test]
+fn host_driver_no_process_exit_variant_builds_and_loads() {
+    build_and_load(
+        no_process_exit_variant_fixture_source(),
+        "host_driver_no_process_exit",
+        "host_driver",
+    );
+}
+
+/// The include-directory helper must return a directory that really holds the driver header (the
 /// contract the fixture build relies on).
 #[test]
 fn the_driver_header_is_locatable() {

@@ -133,6 +133,21 @@ pub fn variant_fixture_so() -> Option<PathBuf> {
     compile_fixture(&variant_fixture_source(), "host_driver_no_ready_async")
 }
 
+/// The committed `process_exit`-less variant fixture (`#include`s `host_driver.c` with the entry's
+/// `process_exit` slot forced to `NULL`), the build that exercises the host's port-exit adapter's
+/// `emergency_close` fallback.
+pub fn no_process_exit_variant_fixture_source() -> PathBuf {
+    fixture_dir().join("host_driver_no_process_exit.c")
+}
+
+/// The same for the `process_exit`-less variant fixture.
+pub fn no_process_exit_variant_fixture_so() -> Option<PathBuf> {
+    compile_fixture(
+        &no_process_exit_variant_fixture_source(),
+        "host_driver_no_process_exit",
+    )
+}
+
 /// The same for the `outputv`-only fixture.
 pub fn vector_fixture_so() -> Option<PathBuf> {
     compile_fixture(&vector_fixture_source(), "vector_driver")

@@ -32,7 +32,11 @@
  *     `handle=<%p>` (the `ErlDrvPort` the driver stashed at `start`), so a host can assert the
  *     handle is the *same value* the whole port's life;
  *   * `hdr=<n>`   — the async data a `driver_async` verb hands over (`0`, the default, is this
- *     port's own state pointer; `1` is `NULL`, the "no async data" case).
+ *     port's own state pointer; `1` is `NULL`, the "no async data" case);
+ *   * `fail-start=<kind>` — a **start failure** token: `start` returns the matching C sentinel
+ *     (`ERL_DRV_ERROR_GENERAL` / `_ERRNO` / `_BADARG`) for the exact spellings
+ *     `general`/`errno`/`badarg`, before allocating any state (see `start_failure_sentinel`); any
+ *     other value is ignored, so the port starts normally.
  *
  * Anything else is ignored. The parsed state is stored in the per-port `host_state`.
  *
@@ -46,6 +50,16 @@
  * the same path, so both the job's completion on its worker and the arm its completion was handed
  * to are observable too. (An `async_invoke`/`async_free` line is written from the async worker
  * thread; every append opens, writes and closes the file, so the lines never interleave.)
+ *
+ * ## The port-exit notifications
+ *
+ * The entry declares both port-exit slots, so a host can observe the adapter that maps
+ * `Driver::port_exit` onto the closest slot the entry has: `process_exit` when the entry declares
+ * it, else `emergency_close`. `host_process_exit` appends `"process_exit"` and `driver_output`s
+ * `"P"`; `host_emergency_close` appends `"emergency_close"` and `driver_output`s `"E"`. Both get
+ * their `ErlDrvData`, so both log through the port's own `log=` path. The
+ * `host_driver_no_process_exit.c` variant forces the `process_exit` slot to `NULL` and so exercises
+ * the `emergency_close` fallback.
  *
  * ## The control vocabulary (integer commands, `port_control/3`)
  *
@@ -112,10 +126,12 @@
  *
  * ## The two builds
  *
- * `host_driver.c` builds an entry whose `ready_async` is `host_ready_async`, so this file must
- * define `HOST_DRIVER_READY_ASYNC_SLOT` before its entry if it is included by a variant (see
- * `host_driver_no_ready_async.c`, the `NULL`-slot build the host's `async_free` arm is exercised
- * with).
+ * `host_driver.c` builds an entry whose `ready_async` is `host_ready_async`, whose `process_exit` is
+ * `host_process_exit` and whose `emergency_close` is `host_emergency_close`. Each slot has its own
+ * `_SLOT` override macro, so a variant that `#include`s this file can force any of them to `NULL`
+ * (see `host_driver_no_ready_async.c`, the `NULL`-slot build the host's `async_free` arm is
+ * exercised with, and `host_driver_no_process_exit.c`, the build the port-exit adapter's
+ * `emergency_close` fallback is exercised with).
  */
 
 /* The fixture uses the POSIX `nanosleep` (the slow async job) and `read`/`close`, which a strict
@@ -142,6 +158,24 @@
 #else
 #define HOST_DRIVER_READY_ASYNC_SLOT host_ready_async
 #define HOST_DRIVER_HAS_READY_ASYNC 1
+#endif
+
+/* The entry's two port-exit slots: the fixture's own callbacks normally, `NULL` in a variant build
+ * (`host_driver_no_process_exit.c`, the `emergency_close`-only build the host's port-exit adapter's
+ * fallback arm is exercised with). Same pattern as `HOST_DRIVER_READY_ASYNC_SLOT` above: a variant
+ * defines the `_SLOT` macro before including this file, and the `HAS_` macro then omits the
+ * corresponding function so it is never an unused-function warning. */
+#ifdef HOST_DRIVER_PROCESS_EXIT_SLOT
+/* Defined by a variant — respect its choice. */
+#else
+#define HOST_DRIVER_PROCESS_EXIT_SLOT host_process_exit
+#define HOST_DRIVER_HAS_PROCESS_EXIT 1
+#endif
+#ifdef HOST_DRIVER_EMERGENCY_CLOSE_SLOT
+/* Defined by a variant — respect its choice. */
+#else
+#define HOST_DRIVER_EMERGENCY_CLOSE_SLOT host_emergency_close
+#define HOST_DRIVER_HAS_EMERGENCY_CLOSE 1
 #endif
 
 /* Private per-port state, allocated in `start` and freed in `stop`. */
@@ -244,8 +278,50 @@ static int buf_int(char *buf, ErlDrvSizeT len, int def) {
     return v;
 }
 
+/* The `fail-start=<kind>` token: the `start` sentinel the command string asks for, so a host can
+ * observe the C's three `ERL_DRV_ERROR_*` `start` failures through a real shared object. Scans
+ * `command` (the same whitespace/comma separated tokenization `parse_command` uses) and answers the
+ * sentinel for an exact `general`/`errno`/`badarg` spelling, else `(ErlDrvData) 0`.
+ *
+ * `host_start` consults this **before** allocating its state and returns the sentinel without ever
+ * building a `host_state`: a failed `start` must leave nothing behind (the host runs the driver's
+ * `stop` with a null `ErlDrvData`, so a state allocated before the failure would leak). */
+static ErlDrvData start_failure_sentinel(const char *command) {
+    const char *p = command;
+    char token[32];
+    if (p == NULL)
+        return (ErlDrvData) 0;
+    while (*p != '\0') {
+        const char *s;
+        size_t n = 0;
+        while (*p == ' ' || *p == '\t' || *p == ',')
+            p++;
+        if (*p == '\0')
+            break;
+        s = p;
+        while (s[n] != '\0' && s[n] != ' ' && s[n] != '\t' && s[n] != ',')
+            n++;
+        copy_token(token, sizeof(token), s, n);
+        if (strncmp(token, "fail-start=", 11) == 0) {
+            const char *kind = token + 11;
+            if (strcmp(kind, "general") == 0)
+                return ERL_DRV_ERROR_GENERAL;
+            if (strcmp(kind, "errno") == 0)
+                return ERL_DRV_ERROR_ERRNO;
+            if (strcmp(kind, "badarg") == 0)
+                return ERL_DRV_ERROR_BADARG;
+        }
+        p = s + n;
+    }
+    return (ErlDrvData) 0;
+}
+
 static ErlDrvData host_start(ErlDrvPort port, char *command) {
-    host_state *st = (host_state *) driver_alloc(sizeof(host_state));
+    ErlDrvData failure = start_failure_sentinel(command);
+    host_state *st;
+    if (failure != (ErlDrvData) 0)
+        return failure;
+    st = (host_state *) driver_alloc(sizeof(host_state));
     if (st == NULL)
         return (ErlDrvData) -1;
     st->port = port;
@@ -286,6 +362,37 @@ static void host_stop_select(ErlDrvEvent event, void *reserved) {
     fprintf(f, "stop_select\n");
     fclose(f);
 }
+
+/* The `ErlDrvEntry.process_exit` slot: the host's port-exit adapter reaches it from the port-exit
+ * seam (`PortRegistry::notify_port_exit` -> `DriverPort::port_exit`), the advisory notification a
+ * port delivers **before** its teardown `stop`. The callback has its `ErlDrvData`, so it logs
+ * through the port's own `log=` path and emits a `"P"` marker through `driver_output` — both
+ * observable end to end (the log line, and the marker as port data on the next port-task round). */
+#ifdef HOST_DRIVER_HAS_PROCESS_EXIT
+static void host_process_exit(ErlDrvData drv_data, ErlDrvMonitor *monitor) {
+    host_state *st = (host_state *) drv_data;
+    (void) monitor; /* the adapter passes a null monitor — see the crate's driver-ABI note */
+    if (st == NULL)
+        return;
+    log_event(st, "process_exit");
+    log_handle(st);
+    (void) driver_output(st->port, "P", 1);
+}
+#endif
+
+/* The `ErlDrvEntry.emergency_close` slot: the host's port-exit adapter's **fallback** for an entry
+ * with no `process_exit`, so a driver whose only exit hook is `emergency_close` still observes the
+ * notification. Observable exactly like `host_process_exit`, with its own line and marker. */
+#ifdef HOST_DRIVER_HAS_EMERGENCY_CLOSE
+static void host_emergency_close(ErlDrvData drv_data) {
+    host_state *st = (host_state *) drv_data;
+    if (st == NULL)
+        return;
+    log_event(st, "emergency_close");
+    log_handle(st);
+    (void) driver_output(st->port, "E", 1);
+}
+#endif
 
 /* Echo whatever Erlang sends to the port back to its owner. `output` receives no port argument,
  * so the handle stored at `start` is used. In `upper` mode the echoed bytes are upper-cased, so
@@ -530,9 +637,9 @@ static ErlDrvEntry host_driver_entry = {
     .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
     .driver_flags = 0,
     .handle2 = NULL,
-    .process_exit = NULL,
+    .process_exit = HOST_DRIVER_PROCESS_EXIT_SLOT,
     .stop_select = host_stop_select,
-    .emergency_close = NULL,
+    .emergency_close = HOST_DRIVER_EMERGENCY_CLOSE_SLOT,
 };
 
 DRIVER_INIT(host_driver) {
