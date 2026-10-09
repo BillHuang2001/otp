@@ -8,7 +8,7 @@
 
 ## API Surface
 ### `runtime.rs` — the façade
-`Runtime` owns every table (config, atom table, processes + mailboxes, BIF heaps, scheduler + runner state, ETS/port/NIF registries, refs, timers, the node-global `persistent_terms` store, dist) and the scratch `info_heap`.
+`Runtime` owns every table (config, atom table, processes + mailboxes, BIF heaps, scheduler + runner state, ETS/port/NIF registries, refs, timers, the node-global `persistent_terms` store, the native `file_server_2` service — `file_services` — dist) and the scratch `info_heap`.
 The **scheduler-pass family** (`run_one_slice`/`run_slices`/`run_scheduler`/`pump_scheduler`/`run_scheduled`, the shared pass body, wake absorption, the port/timer/distribution halves) lives in `src/runtime/scheduler.rs` (+ `tests.rs`), but every entry point stays an inherent `Runtime` method.
 * **boot/config**: `new(RuntimeConfig)`, `with_defaults()`, `boot()` (idempotent; A.7), `boot_from_script(path)` (A.7), `is_booted()`, `config()`, `load_module(path)`, `module(name)`, `preloaded()`, `preloaded_loaded()`/`is_preloaded_loaded(name)`.
 * **the slice**: `run_function(path, function, arity, args) -> Result<Eterm>` (x(0)); `run_module(module, function, arity, args, out: &mut dyn OutputSink)`.
