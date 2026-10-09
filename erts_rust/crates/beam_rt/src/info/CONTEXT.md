@@ -45,7 +45,7 @@ families (`system → limits → schedulers → memory → unsupported`) and fal
 (1048576 or `+P N`), `ets_limit` (8192), `outstanding_system_requests_limit` (32),
 `dist_buf_busy_limit` (1048576), `delayed_node_table_gc` (60), `context_reductions`
 (`CONTEXT_REDS`, `erl_vm.h:47` — the ERTS reduction quantum, an interface constant),
-`heap_type`, `message_queue_data`, `scheduler_bind_type`, `thread_pool_size`,
+`heap_type`, `message_queue_data`, `scheduler_bind_type`,
 `min_heap_size`, `min_bin_vheap_size`, `fullsweep_after`, `garbage_collection`,
 `alloc_util_allocators`, `multi_scheduling_blockers`,
 `normal_multi_scheduling_blockers`, and the `{wordsize, internal|external}` tuple key
