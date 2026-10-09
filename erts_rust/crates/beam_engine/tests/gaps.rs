@@ -645,12 +645,15 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
             ),
             ("timeout", Instr::Timeout, "receive_reset"),
             ("remove_message", Instr::RemoveMessage, "receive_remove"),
+            // The four `recv_marker_*` opcodes *are* claimed by the receive family,
+            // which names the missing capability by opcode rather than forwarding
+            // the seam's bare `unsupported_opcode: receive_marker_<op>` default.
             (
                 "recv_marker_reserve",
                 Instr::RecvMarkerReserve {
                     marker: Operand::X(1),
                 },
-                "receive_marker_reserve",
+                "recv_marker_reserve: the host does not serve receive markers",
             ),
             (
                 "recv_marker_bind",
@@ -658,24 +661,24 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
                     marker: Operand::X(1),
                     reference: Operand::X(2),
                 },
-                "receive_marker_bind",
+                "recv_marker_bind: the host does not serve receive markers",
             ),
             (
                 "recv_marker_use",
                 Instr::RecvMarkerUse {
                     reference: Operand::X(1),
                 },
-                "receive_marker_use",
+                "recv_marker_use: the host does not serve receive markers",
             ),
             (
                 "recv_marker_clear",
                 Instr::RecvMarkerClear {
                     reference: Operand::X(1),
                 },
-                "receive_marker_clear",
+                "recv_marker_clear: the host does not serve receive markers",
             ),
         ];
-        for (label, instr, method) in cases {
+        for (label, instr, reason) in cases {
             let mut f = GapFixture::new();
             let code = vec![Instr::Label(Label(1)), instr, Instr::Label(Label(2)), Instr::Return];
             let entry = f.add_function("f", 0, code);
@@ -683,7 +686,7 @@ fn interpreter_capability_gaps_report_their_exact_typed_error() {
             pin(
                 &format!("context/mailbox-{label}"),
                 run_gap(&module, entry, &[]),
-                method,
+                reason,
             );
         }
     }

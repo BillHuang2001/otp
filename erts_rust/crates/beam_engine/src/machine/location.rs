@@ -85,7 +85,8 @@
 //! empty list exactly as `build_stacktrace` does. The stacktrace is the engine's
 //! **cooked** (`build_stacktrace`-style) trace over its **live interpreted
 //! frames** — the same approximation the exception family documents — so it omits
-//! host frames outside the run rather than fabricating them.
+//! host frames outside the run rather than fabricating them, and each frame is
+//! resolved in its **own** module context (see [`Machine::current_stacktrace`]).
 
 use std::sync::Arc;
 
@@ -95,7 +96,7 @@ use beam_term::{is_small, make_atom, make_small, signed_value, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
-use crate::families::exceptions::stacktrace::{stacktrace_item, symbolic_stacktrace};
+use crate::families::exceptions::stacktrace::stacktrace_item;
 use crate::terms;
 
 use super::{Machine, ModuleContext};
@@ -228,14 +229,20 @@ impl Machine {
     /// The value of `process_info(P, current_stacktrace)`: the **cooked** stacktrace
     /// `[{Module, Function, Arity, Location}, …]`, innermost frame first.
     ///
-    /// Built from the machine's current position and its live interpreted frames by
-    /// the exception family's `build_stacktrace` (`symbolic_stacktrace`), so it
-    /// carries that builder's documented approximation: it describes the engine's
-    /// live call frames and cannot name host frames outside the run. The innermost
-    /// frame is resolved in the module the machine is executing in (as
-    /// [`Machine::current_function`] does), so a stacktrace taken inside a
-    /// cross-module callee starts with the callee. Before any instruction has been
-    /// interpreted the stacktrace is the empty list ([`NIL`]).
+    /// Built here — not by the exception family's single-module builder — from the
+    /// machine's current position and its live interpreted frames, so it carries the
+    /// builder's documented approximation: it describes the engine's live call frames
+    /// and cannot name host frames outside the run. Unlike
+    /// `symbolic_stacktrace` (which the `build_stacktrace` opcode uses and which
+    /// resolves every frame against the single module it is handed), this assembles
+    /// the list itself and resolves **each** frame in the module its own context
+    /// names: the innermost item is the current position in the module the machine is
+    /// executing in, and every outer frame ([`Machine::resumption_contexts`]) is
+    /// resolved in the module its recorded context is, so a stacktrace taken inside a
+    /// cross-module callee names the callee and the caller's module separately rather
+    /// than resolving the caller's `(func, pc)` — which belongs to another module —
+    /// against the callee (which would fabricate a frame). Before any instruction has
+    /// been interpreted the stacktrace is the empty list ([`NIL`]).
     pub fn current_stacktrace(
         &self,
         module: &Module,
@@ -245,10 +252,29 @@ impl Machine {
             Some(code) => code,
             None => return Ok(NIL),
         };
+        // The current position resolves in the module the machine is executing in.
+        let mut frames = Vec::new();
         match self.active_context() {
-            Some(context) => symbolic_stacktrace(self, &context.module, ctx, func, pc),
-            None => symbolic_stacktrace(self, module, ctx, func, pc),
+            Some(context) => frames.push(stacktrace_item(&context.module, ctx, func, pc)?),
+            None => frames.push(stacktrace_item(module, ctx, func, pc)?),
         }
+        // Then every frame suspended in a call, innermost first, each resolved in its
+        // own module. Context `0` is the run's entry module, which the machine borrows;
+        // any other id is a callee handle in the machine's own registry. A missing
+        // handle for a non-zero id is practically unreachable — the registry only grows
+        // within a run — so falling back to the passed entry module keeps the accessor
+        // total instead of inventing an error.
+        for (func, pc, context) in self.resumption_contexts() {
+            let owner = match context {
+                0 => None,
+                id => self.module_context(id).map(|context| context.module.clone()),
+            };
+            match owner {
+                Some(owner) => frames.push(stacktrace_item(&owner, ctx, func, pc)?),
+                None => frames.push(stacktrace_item(module, ctx, func, pc)?),
+            }
+        }
+        terms::make_list(ctx, &frames)
     }
 
     /// The finite `after T` deadline of the `receive` this machine is parked at — the

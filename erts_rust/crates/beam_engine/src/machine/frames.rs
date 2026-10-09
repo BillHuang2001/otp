@@ -27,7 +27,8 @@
 //! primitives the dispatch loop builds on: the Y-slot accessors
 //! ([`Machine::y`]/[`Machine::set_y`]), the frame push/pop/trim operations, the
 //! continuation accessors, the heap request seam ([`Machine::ensure_heap`]) and
-//! the caller-chain introspection ([`Machine::resumption_addresses`]).
+//! the caller-chain introspection ([`Machine::resumption_contexts`] /
+//! [`Machine::resumption_addresses`]).
 
 use beam_common::Result;
 use beam_term::Eterm;
@@ -281,15 +282,20 @@ impl Machine {
         ctx.ensure_heap(heap_need, live, x, stack)
     }
 
-    /// The `(function index, code offset)` of every live call frame that is
-    /// currently **suspended in a call**, innermost frame first.
+    /// The `(function index, code offset, module context)` of every live call frame
+    /// that is currently **suspended in a call**, innermost frame first.
     ///
     /// A frame's continuation-pointer slot holds the address its function resumes
     /// at once the call it is waiting for returns ([`Instr::Call`](beam_loader::Instr)
     /// writes it through [`Machine::set_continuation`]), so this sequence is the
     /// engine's replacement for the C runtime's **saved raw stacktrace**: the chain
     /// of callers, innermost first — the same order C's `build_stacktrace` emits
-    /// (`../../erts/emulator/beam/beam_common.c:1274-1288`).
+    /// (`../../erts/emulator/beam/beam_common.c:1274-1288`). The context recorded
+    /// with each address is the module the `(func, pc)` belongs to (`0` = the run's
+    /// entry module, otherwise a [`ModuleContext`](super::ModuleContext) id), which
+    /// is what lets a caller resolve each frame against its **own** module instead
+    /// of naming it in the running one (a caller frame reached through a cross-module
+    /// `call_ext` carries an address in *another* module).
     ///
     /// A frame sitting at [`Continuation::Halt`] contributes nothing: that is the
     /// bottom frame (pushed by [`Machine::run_label`]) and any frame whose function
@@ -297,21 +303,32 @@ impl Machine {
     /// is executing right now, whose own location the dispatch loop already knows
     /// and supplies itself (see `crate::families::exceptions`).
     ///
-    /// Read-only introspection (no state is changed); the caller is the
-    /// Milestone-1 stacktrace builder. Only the module-local part of each
-    /// continuation is reported: a caller frame reached through a cross-module
-    /// `call_ext` carries a `(func, pc)` in *another* module context, so it is
-    /// reported here without that context and must not be resolved against the
-    /// running module (a documented Milestone-1 limit of the symbolic trace, see
-    /// [`crate::machine`]).
-    pub fn resumption_addresses(&self) -> Vec<(u32, u32)> {
+    /// Read-only introspection (no state is changed); the callers are the
+    /// Milestone-1 stacktrace builder and the module-context-aware
+    /// [`Machine::current_stacktrace`](crate::machine::Machine::current_stacktrace).
+    pub fn resumption_contexts(&self) -> Vec<(u32, u32, u32)> {
         self.frames
             .iter()
             .rev()
             .filter_map(|frame| match frame.continuation {
-                Continuation::Address { func, pc, .. } => Some((func, pc)),
+                Continuation::Address { func, pc, context } => Some((func, pc, context)),
                 Continuation::Halt => None,
             })
+            .collect()
+    }
+
+    /// The `(function index, code offset)` of every live call frame suspended in a
+    /// call, innermost frame first — [`Machine::resumption_contexts`] with the module
+    /// context dropped.
+    ///
+    /// Resolving every address this returns against a **single** module is only
+    /// correct when they all belong to it; a caller looking at a chain that may have
+    /// crossed a cross-module `call_ext` must use [`Machine::resumption_contexts`]
+    /// and resolve each frame in the module its context names.
+    pub fn resumption_addresses(&self) -> Vec<(u32, u32)> {
+        self.resumption_contexts()
+            .into_iter()
+            .map(|(func, pc, _context)| (func, pc))
             .collect()
     }
 }

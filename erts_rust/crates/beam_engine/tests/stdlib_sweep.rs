@@ -877,7 +877,7 @@ fn blocked_mechanisms_report_their_typed_error() {
             let got = raise.reason.as_atom();
             assert_eq!(
                 got,
-                Some("unsupported_opcode: receive_marker_reserve"),
+                Some("unsupported_opcode: recv_marker_reserve: the host does not serve receive markers"),
                 "unexpected `code_server:call/1` typed error: {err:?}"
             );
         }

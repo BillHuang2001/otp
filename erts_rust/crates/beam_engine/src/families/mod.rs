@@ -323,42 +323,46 @@ mod tests {
         // The four `recv_marker_*` opcodes are what a real `.beam` (e.g. kernel
         // `code.beam`) hits first. They used to fall through to the unclaimed
         // sentinel; [`super::receive`] owns them now, so `dispatch` reports that
-        // family's own error — here the receive seam's typed `unsupported`, since
-        // the bare `MinimalContext` below has no mailbox installed.
+        // family's own error — here the receive seam's typed `unsupported`, which
+        // the family translates into a rejection naming the opcode (the bare
+        // `MinimalContext` below has no mailbox, so it does not serve markers).
         let labels = LabelMap::new();
         let cases: [(Instr, &str); 4] = [
             (
                 Instr::RecvMarkerReserve {
                     marker: Operand::X(0),
                 },
-                "receive_marker_reserve",
+                "recv_marker_reserve",
             ),
             (
                 Instr::RecvMarkerBind {
                     marker: Operand::X(0),
                     reference: Operand::X(1),
                 },
-                "receive_marker_bind",
+                "recv_marker_bind",
             ),
             (
                 Instr::RecvMarkerClear {
                     reference: Operand::X(1),
                 },
-                "receive_marker_clear",
+                "recv_marker_clear",
             ),
             (
                 Instr::RecvMarkerUse {
                     reference: Operand::X(1),
                 },
-                "receive_marker_use",
+                "recv_marker_use",
             ),
         ];
-        for (instr, method) in cases {
+        for (instr, opcode) in cases {
             let reason = error_reason(dispatch_step(&instr, &labels));
-            assert_eq!(reason, format!("unsupported_opcode: {method}"));
+            assert_eq!(
+                reason,
+                format!("unsupported_opcode: {opcode}: the host does not serve receive markers")
+            );
             assert!(
                 !reason.contains(UNCLAIMED_PREFIX),
-                "{method} is claimed, so the unclaimed sentinel must be gone"
+                "{opcode} is claimed, so the unclaimed sentinel must be gone"
             );
         }
     }
