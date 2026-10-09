@@ -570,6 +570,13 @@ fn monitor_named_reports_the_name_node_target_on_death() {
         assert_eq!(tuple_element(target_term, 1), make_atom(node));
         assert_eq!(tuple_element(payload, 4), reason);
     }
+    // The outgoing record is resolved by the death like any other monitor — the `{Name, node}`
+    // descriptor is held separately (a `ProcessTable` side table) precisely so this DOWN could
+    // still carry the name.
+    assert!(
+        f.table.get(watcher).expect("watcher").monitors().is_empty(),
+        "the named monitor's outgoing half is resolved too"
+    );
 }
 
 #[test]
@@ -950,4 +957,173 @@ fn oracle_down_reason_fidelity() {
             "the reason is the rewritten `killed`, not the sent `kill`"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Oracle cross-checks: a target's death resolves the watcher's outgoing monitor
+// ---------------------------------------------------------------------------
+
+/// A target's death resolves **both** halves of the monitor: the DOWN is still delivered, and the
+/// watcher's own outgoing entry disappears, so `process_info(W, monitors)` goes from
+/// `[{process,T}]` to `[]` and `demonitor(Ref, [info])` then answers `false`
+/// (`demonitor/1` without `info` answers `true` unconditionally — that is the BIF layer's
+/// rendering, not this table's "was it on record" boolean).
+///
+/// The probe's observables are reported from **inside** the watcher process (the `-eval` process
+/// cannot be the watcher and read its own list at the right moments), and every step is
+/// synchronized by a message or a `receive`, so the probe is deterministic.
+#[test]
+fn oracle_a_targets_death_resolves_the_watchers_outgoing_monitor() {
+    let expr = r#"
+        Parent = self(),
+        T = spawn(fun() -> receive stop -> ok end end),
+        W = spawn(fun() ->
+                M = erlang:monitor(process, T),
+                Parent ! {m, M},
+                receive {'DOWN', M, process, _, _} -> ok end,
+                Parent ! {observed, erlang:process_info(self(), monitors),
+                                    erlang:demonitor(M, [info])}
+            end),
+        _M = receive {m, Ref} -> Ref end,
+        Before = erlang:process_info(W, monitors),
+        T ! stop,
+        {After, D} = receive {observed, A, R} -> {A, R} after 2000 -> {timeout, timeout} end,
+        io:format("~p|~p|~p~n", [Before =:= {monitors, [{process, T}]}, After, D])
+    "#;
+    if !expect_oracle(expr, "true|{monitors,[]}|false") {
+        return;
+    }
+
+    // The Rust side of the same statement: the outgoing `[{process,T}]` record is resolved when
+    // the target dies, while the DOWN it produced is still queued.
+    let mut f = Fixture::new();
+    let down = f.atom("DOWN");
+    let watcher = f.table.spawn_default().expect("watcher");
+    let target = f.table.spawn_default().expect("target");
+    let reference = f
+        .table
+        .monitor(watcher, target, MonitorKind::Process)
+        .expect("both pids are live");
+    assert_eq!(
+        f.table.get(watcher).expect("watcher").monitors().len(),
+        1,
+        "`{{monitors, [{{process, T}}]}}` while the target lives"
+    );
+
+    let boom = f.atom_term("boom");
+    f.table
+        .terminate(target, boom)
+        .expect("the target is live");
+
+    let payload = f.sole_payload(watcher);
+    assert!(
+        payload_is_down_for(payload, reference, down),
+        "the DOWN is still delivered"
+    );
+    assert!(
+        f.table.get(watcher).expect("watcher").monitors().is_empty(),
+        "`{{monitors, []}}` once the target is gone"
+    );
+    assert!(
+        !f.table
+            .demonitor(watcher, reference)
+            .expect("the watcher is live"),
+        "`demonitor(Ref, [info])` => false: the monitor is no longer on record"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Oracle cross-checks: `link/1` to a non-live pid
+// ---------------------------------------------------------------------------
+
+/// `link(DeadPid)` signals `noproc` **from that pid** at the linking caller: a **trapping** caller
+/// answers `true` and is handed `{'EXIT', DeadPid, noproc}`, while a **non-trapping** caller dies
+/// — a `noproc` raise whose uncaught reason is `{noproc, Stacktrace}` (this crate signals the bare
+/// atom `noproc`; see `ProcessTable::link`'s documented approximation).
+///
+/// `D`'s death is established by monitoring it and waiting for the DOWN, so the pid is genuinely
+/// non-live before either caller links to it.
+#[test]
+fn oracle_link_to_a_non_live_pid_signals_noproc_from_it() {
+    let expr = r#"
+        Parent = self(),
+        D = spawn(fun() -> ok end),
+        DM = erlang:monitor(process, D),
+        receive {'DOWN', DM, process, D, _} -> ok end,
+        W = spawn(fun() ->
+                process_flag(trap_exit, true),
+                R = link(D),
+                Parent ! {ret, R},
+                receive X -> Parent ! {msg, X} after 2000 -> Parent ! {msg, timeout} end
+            end),
+        {ret, Ret} = receive {ret, R0} -> {ret, R0} end,
+        Msg = receive {msg, M} -> M end,
+        V = spawn(fun() -> link(D) end),
+        VM = erlang:monitor(process, V),
+        Reason = receive {'DOWN', VM, process, V, Rn} -> Rn after 2000 -> timeout end,
+        io:format("~p|~p|~p|~p~n",
+                  [Ret, Msg =:= {'EXIT', D, noproc},
+                   element(1, Reason) =:= noproc, is_list(element(2, Reason))])
+    "#;
+    if !expect_oracle(expr, "true|true|true|true") {
+        return;
+    }
+
+    // The Rust side of the trapping half: `link/1` runs in the *executing* process, so its
+    // `noproc` signal is queued (the `exit/2` model) and applied at the caller's schedule-in.
+    let mut f = Fixture::new();
+    let exit_atom = f.atom("EXIT");
+    let noproc = f.atom_term("noproc");
+    let dead = ProcessId::new(999, 0);
+
+    let trapper = f.table.spawn_default().expect("trapper");
+    f.table
+        .get_mut(trapper)
+        .expect("trapper")
+        .set_trap_exit(true);
+    f.table
+        .get_mut(trapper)
+        .expect("trapper")
+        .set_state(ProcessState::Running);
+    f.table
+        .link(trapper, dead)
+        .expect("a non-live target is not an error");
+    assert_eq!(
+        f.table.pending_signals(trapper).expect("trapper is live"),
+        1,
+        "one noproc signal is queued for the caller"
+    );
+    f.table
+        .service_signals(trapper)
+        .expect("trapper is live");
+    assert!(f.table.contains(trapper), "the trapping caller survives");
+    let payload = f.sole_payload(trapper);
+    // SAFETY: the payload is the live 3-tuple the signal builder wrote on the trapper's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 3);
+        assert_eq!(tuple_element(payload, 0), make_atom(exit_atom));
+        assert_eq!(tuple_element(payload, 1), dead.to_eterm());
+        assert_eq!(tuple_element(payload, 2), noproc);
+    }
+
+    // The non-trapping half: the caller is terminated with `noproc`.
+    let victim = f.table.spawn_default().expect("victim");
+    f.table
+        .get_mut(victim)
+        .expect("victim")
+        .set_state(ProcessState::Running);
+    f.table
+        .link(victim, dead)
+        .expect("a non-live target is not an error");
+    assert!(
+        f.table.contains(victim),
+        "the signal is deferred while the caller runs"
+    );
+    f.table
+        .service_signals(victim)
+        .expect("victim is live");
+    assert!(
+        !f.table.contains(victim),
+        "the non-trapping caller is terminated with noproc"
+    );
 }

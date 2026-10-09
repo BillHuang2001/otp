@@ -609,3 +609,136 @@ fn a_cascaded_link_exit_reaches_a_trapping_head_from_the_relay() {
         assert!(compare::eq(delivered, expected, &names));
     }
 }
+#[test]
+fn a_targets_death_resolves_the_watchers_outgoing_monitor() {
+    // Oracle probe (OTP 29.1.1), run in a *watcher* process so the caller's own list is read:
+    //   W = spawn(fun() -> M = monitor(process, T), Parent ! {m, M},
+    //                       receive {'DOWN', M, process, _, _} -> ok end,
+    //                       Parent ! {after, process_info(self(), monitors),
+    //                                demonitor(M, [info])} end),
+    //   (parent) before `T ! stop`: `{monitor,W}`-style read => `{monitors,[{process,T}]}`;
+    //   after the DOWN:                                            => `{monitors,[]}`;
+    //   `demonitor(M, [info])`                                     => `false`
+    //   (`demonitor/1` without `info` answers `true` unconditionally — the BIF layer's rendering).
+    // The target's death therefore resolves **both** halves: the DOWN is still delivered, but the
+    // watcher no longer lists the monitor and `[info]` reports it gone.
+    let (mut table, mut names) = table_with_names();
+    let down_atom = names.intern("DOWN");
+    let watcher = table.spawn_default().expect("watcher");
+    let target = table.spawn_default().expect("target");
+    let reference = table
+        .monitor(watcher, target, MonitorKind::Process)
+        .expect("both pids are live");
+    assert_eq!(
+        table.get(watcher).expect("watcher").monitors().len(),
+        1,
+        "the monitor is recorded while the target lives"
+    );
+
+    let boom = make_atom(names.intern("boom"));
+    table.terminate(target, boom).expect("the target is live");
+
+    // The DOWN is still delivered …
+    let down = sole_payload(&table, watcher);
+    assert!(payload_is_down_for(down, reference, down_atom));
+    // … and the outgoing half is gone with it.
+    assert!(
+        table.get(watcher).expect("watcher").monitors().is_empty(),
+        "the target's death resolves the watcher's outgoing monitor"
+    );
+    assert!(
+        !table
+            .demonitor(watcher, reference)
+            .expect("the watcher is live"),
+        "a resolved monitor is no longer on record"
+    );
+    // `demonitor/1` (no `[flush]`) leaves the already-queued DOWN; `[flush]` still removes it.
+    assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 1);
+    assert!(table
+        .demonitor_flush(watcher, reference)
+        .expect("the watcher is live"));
+    assert_eq!(table.get(watcher).expect("watcher").mailbox().len(), 0);
+}
+#[test]
+fn link_to_a_non_live_pid_signals_noproc_from_it() {
+    // Oracle probes (OTP 29.1.1):
+    //   trapping:     `link(DeadPid)` => `true`; the caller then receives
+    //                 `{'EXIT', DeadPid, noproc}`.
+    //   non-trapping: `link(DeadPid)` kills the caller — a `noproc` raise whose uncaught reason is
+    //                 `{noproc, Stacktrace}` (this crate signals the bare atom `noproc`; see
+    //                 `ProcessTable::link`'s documented approximation).
+    //   `link(LivePid)` and `link(self())` => `true`, recording the link.
+    let (mut table, mut names) = table_with_names();
+    let exit_atom = make_atom(names.intern("EXIT"));
+    let noproc = make_atom(names.intern("noproc"));
+    let dead = ProcessId::new(999, 0);
+
+    // A trapping caller, *currently executing* — the position `erlang:link/1` itself runs in. The
+    // signal is queued there (the `exit/2` model) and applied at the caller's next schedule-in.
+    let trapper = table.spawn_default().expect("trapper");
+    table
+        .get_mut(trapper)
+        .expect("the trapper is live")
+        .set_trap_exit(true);
+    table
+        .get_mut(trapper)
+        .expect("the trapper is live")
+        .set_state(ProcessState::Running);
+    table
+        .link(trapper, dead)
+        .expect("a non-live target is not an error");
+    assert_eq!(
+        table.pending_signals(trapper).expect("the trapper is live"),
+        1,
+        "one noproc signal is queued for the caller"
+    );
+    assert!(
+        table.get(trapper).expect("trapper").links().is_empty(),
+        "nothing is linked to a pid that is not there"
+    );
+
+    table
+        .service_signals(trapper)
+        .expect("the trapper is live");
+    assert!(table.contains(trapper), "the trapping caller survives");
+    let payload = sole_payload(&table, trapper);
+    // SAFETY: the live `{'EXIT', Dead, noproc}` tuple the table built on the trapper's heap.
+    unsafe {
+        assert_eq!(tuple_size(payload), 3);
+        assert_eq!(tuple_element(payload, 0), exit_atom);
+        assert_eq!(
+            tuple_element(payload, 1),
+            dead.to_eterm(),
+            "the signal came *from* the non-live target"
+        );
+        assert_eq!(tuple_element(payload, 2), noproc);
+    }
+
+    // A non-trapping caller is terminated with `noproc` once its signals are serviced.
+    let victim = table.spawn_default().expect("victim");
+    table
+        .get_mut(victim)
+        .expect("the victim is live")
+        .set_state(ProcessState::Running);
+    table
+        .link(victim, dead)
+        .expect("a non-live target is not an error");
+    assert!(table.contains(victim), "the signal was deferred while the caller ran");
+    table
+        .service_signals(victim)
+        .expect("the victim is live");
+    assert!(
+        !table.contains(victim),
+        "the non-trapping caller is terminated with noproc"
+    );
+
+    // Contrast: a **live** target records the link (both directions) and a self-link is a no-op.
+    let a = table.spawn_default().expect("a");
+    let b = table.spawn_default().expect("b");
+    table.link(a, b).expect("both pids are live");
+    assert!(table.get(a).expect("a").links().contains(b));
+    assert!(table.get(b).expect("b").links().contains(a));
+    table.link(a, a).expect("a self-link is a no-op");
+    assert!(!table.get(a).expect("a").links().contains(a));
+    assert_eq!(table.pending_signals(a).expect("a is live"), 0);
+}
