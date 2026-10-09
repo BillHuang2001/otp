@@ -27,6 +27,11 @@
 //! its invariants, the code server's view of every preloaded module, the `init`/boot status
 //! and its recorded arguments, the kernel processes the boot script registered, the
 //! applications it started, and the version/emulator constants a booted system reports.
+//! Beyond that state, the group pins the booted system's **introspection floor**: the
+//! `function_exported/3` answers for the preloaded-module set, the whole-set invariants of the
+//! preloaded floor (all sticky, all in `code:all_loaded/0`), the kernel application's
+//! registered-name manifest, and the live floors of the preloaded `persistent_term`/`atomics`
+//! modules.
 //!
 //! Every assertion is **structural** or a **release-stable value** wherever the value is
 //! machine/release-dependent (the oracle is OTP 29 while the rewrite targets OTP 30, so the
@@ -62,6 +67,10 @@
 //! | `erlang:system_info(logical_processors)` | 16 | 14 |
 //! | `erlang:system_info(heap_sizes)` | the sizing list | a list with one extra entry |
 //! | `whereis(code_server\|erl_prim_loader\|kernel_sup)` | a pid | the atom `undefined` |
+//! | `erlang:function_exported/3` on `kernel` / `code` | `true` | `false` |
+//! | `erlang:system_info(schedulers\|dirty_cpu_schedulers\|dirty_io_schedulers)` | the host's scheduler counts | different counts |
+//! | `erlang:system_info(endian)` / `erlang:system_info(build_type)` | `little` / `opt` | raises `badarg` |
+//! | `persistent_term:info/0` | the live `count`/`memory` counters | zero-valued counters |
 //!
 //! (`erlang:check_old_code/1`, `erlang:system_info(loaded)` and `erlang:system_info(check_io)` are
 //! capability gaps — the runtime raises its documented `unsupported` — so they are neither cases
@@ -691,6 +700,119 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- The preloaded-module export floor (`function_exported/3`) --------------------
+        // The preloaded set is *loaded*, so its export tables answer before any application
+        // has started: this is the boot chain's own introspection floor. (`kernel`/`code` are
+        // handoffs instead: the runtime answers `false` there where the oracle answers `true`,
+        // so see the divergence table above rather than a case.)
+        eval(
+            "boot_extra/function_exported_erlang_system_info_1",
+            "the preloaded `erlang` module exports system_info/1",
+            "erlang:function_exported(erlang, system_info, 1)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_init_get_status_0",
+            "the preloaded `init` module exports get_status/0",
+            "erlang:function_exported(init, get_status, 0)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_erts_internal_cmp_term_2",
+            "the preloaded `erts_internal` module exports cmp_term/2",
+            "erlang:function_exported(erts_internal, cmp_term, 2)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_prim_file_read_file_1",
+            "the preloaded `prim_file` module exports read_file/1",
+            "erlang:function_exported(prim_file, read_file, 1)",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/function_exported_erl_prim_loader_get_path_0",
+            "the preloaded `erl_prim_loader` module exports get_path/0",
+            "erlang:function_exported(erl_prim_loader, get_path, 0)",
+            "ok true",
+        ),
+        // --- The code server's view of the remaining preloaded modules -------------------
+        // The sibling section above covers the first half of the preloaded set; these pin the
+        // same `{file,preloaded}` / `preloaded` invariants for further members of the frozen 22.
+        eval(
+            "boot_extra/code_which_atomics_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for the preloaded `atomics` module",
+            "code:which(atomics)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_which_counters_is_preloaded",
+            "code:which/1 reports the atom `preloaded` for the preloaded `counters` module",
+            "code:which(counters)",
+            "ok preloaded",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_persistent_term_is_preloaded",
+            "code:is_loaded(persistent_term) is the {file,preloaded} pair",
+            "code:is_loaded(persistent_term)",
+            "ok {file,preloaded}",
+        ),
+        eval(
+            "boot_extra/code_is_loaded_erl_tracer_is_preloaded",
+            "code:is_loaded(erl_tracer) is the {file,preloaded} pair",
+            "code:is_loaded(erl_tracer)",
+            "ok {file,preloaded}",
+        ),
+        // --- Whole-set invariants of the preloaded floor ---------------------------------
+        // The boot chain relies on *every* preloaded module being sticky (it may not be
+        // purged) and present in the code server's loaded registry. These are set-wide
+        // queries, so a single extra/missing member cannot slip past.
+        eval(
+            "boot_extra/pre_loaded_every_module_is_sticky",
+            "code:is_sticky/1 reports every member of erlang:pre_loaded/0 as sticky",
+            "lists:all(fun(M) -> code:is_sticky(M) end, erlang:pre_loaded())",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/pre_loaded_every_module_is_in_all_loaded",
+            "every member of erlang:pre_loaded/0 appears in code:all_loaded/0",
+            "lists:all(fun(M) -> lists:keymember(M, 1, code:all_loaded()) end, erlang:pre_loaded())",
+            "ok true",
+        ),
+        // --- The kernel application's registered-name table -------------------------------
+        // `application:get_key(kernel, registered)` is the boot script's own kernel-process
+        // manifest; its shape (atoms only) and the `application_controller` entry it names are
+        // the boot progress observable, without pinning any per-VM pid.
+        eval(
+            "boot_extra/application_get_key_kernel_registered_is_atom_list",
+            "application:get_key(kernel, registered) is a list of registered-name atoms",
+            "lists:all(fun erlang:is_atom/1, element(2, application:get_key(kernel, registered)))",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/application_get_key_kernel_registered_contains_application_controller",
+            "the kernel application's registered-name table names `application_controller`",
+            "lists:member(application_controller, element(2, application:get_key(kernel, registered)))",
+            "ok true",
+        ),
+        // --- Further booted-system constants and the preloaded runtime floor --------------
+        eval(
+            "boot_extra/system_info_wordsize_is_eight",
+            "erlang:system_info(wordsize) is the frozen 8-byte machine word of the 64-bit target",
+            "erlang:system_info(wordsize) =:= 8",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/persistent_term_put_get_round_trip",
+            "the preloaded `persistent_term` round-trips a put/get without an application start",
+            "begin persistent_term:put(boot_extra_key, 42), persistent_term:get(boot_extra_key) =:= 42 end",
+            "ok true",
+        ),
+        eval(
+            "boot_extra/atomics_get_initial_is_zero",
+            "the preloaded `atomics` module serves a fresh 1-slot array whose initial value is 0",
+            "atomics:get(atomics:new(1, []), 1) =:= 0",
+            "ok true",
+        ),
     ]
 }
 
