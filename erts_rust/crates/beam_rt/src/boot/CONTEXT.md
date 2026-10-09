@@ -169,7 +169,10 @@ partial root set and leaves a stale word in `x`; the reason the dying process's 
 (`../runner/run.rs`'s `exit_reason` → `error::live_reason_term`) is built from it, and the raw
 `Alloc(AllocKind::Message)` surfaces only *later*, from the process-termination propagation, out through
 `Scheduler::slice_end` → `scheduler_pass` → `pump_scheduler` → the CLI — never via
-`error::enforce_term_heap_limit`, which does not wrap the terminate path. The `Err(_)` arm of
+`error::enforce_term_heap_limit`, which does not wrap the terminate path. **It is a latent flake, not an argv special case:** the in-crate executor's own
+completion test (`boot::bootscript::tests::the_real_start_boot_completes_through_execute_reporting`) has
+been observed to fail once under load at `bootscript.rs:1217` and pass on every re-run — same layout
+sensitivity, same path. The `Err(_)` arm of
 `../runtime/gc.rs::stabilize_escaped` compounds it by **swallowing** the un-copyable reason and returning
 the stale term (it also trips the global GC valve). **`src/boot/**` cannot fix it.**
 `tests/boot.rs`

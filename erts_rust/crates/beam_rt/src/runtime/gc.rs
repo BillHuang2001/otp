@@ -310,9 +310,11 @@ impl Runtime {
     /// function can return a [`Result`]. This form survives for the **one** call site that
     /// cannot (`src/runner/run.rs`'s exit-reason stabilization): a reason it cannot copy is
     /// still stored (with the heaps frozen) rather than turning a process's termination reason
-    /// into a different error. Its behaviour is unchanged, valve trip included.
+    /// into a different error. Its behaviour — the single valve trip included — is unchanged,
+    /// so it is deliberately **not** a re-entry point of [`Runtime::try_stabilize_escaped`]
+    /// (which would trip the valve twice on the off-heap path).
     pub(crate) fn stabilize_escaped(&mut self, term: Eterm) -> Eterm {
-        match self.try_stabilize_escaped(term) {
+        match self.stabilize_term(term) {
             Ok(copy) => copy,
             Err(_) => {
                 self.disable_gc("an out-of-band store holds a term with an off-heap payload");
