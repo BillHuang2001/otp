@@ -1,4 +1,4 @@
-# `beam_io` — Poller/Reactor, Ports, Port-Task Scheduling, Built-in Drivers, Signals, CPU time, ddll
+# `beam_io` — Poller/Reactor, Ports, Port-Task Scheduling, Built-in Drivers, io-device requests, Signals, CPU time, ddll
 
 ## Intent
 Owns the **I/O subsystem** of the Rust ERTS rewrite (Stage 5, Part II §H) and the **OS/driver seam** — a clean rewrite seam (Part II §A) reproduced with the *frozen* driver C ABI (workspace `../CONTEXT.md` §1 **A.4**): a driver `.so` compiled against the unmodified `erl_driver.h` links and behaves identically.
