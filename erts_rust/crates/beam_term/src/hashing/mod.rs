@@ -81,7 +81,7 @@ use crate::bitstring::{bitstring_parts, float_bits};
 use crate::boxed::{boxed_val, header_arity, thing_arityval};
 use crate::compare::{exported_rank, record_parts};
 use crate::eterm::Eterm;
-use crate::fun::{fun_arity, fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
+use crate::fun::{fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
 use crate::immediate::{atom_val, internal_pid_data, internal_port_data, signed_value};
 use crate::list::{car, cdr, is_list};
 use crate::ops::{class, TermClass};
@@ -225,7 +225,10 @@ unsafe fn hash_fun(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
             // function atoms.
             h = hash_term(unsafe { *p.add(1) }, atoms, h);
             h = hash_term(unsafe { *p.add(2) }, atoms, h);
-            mix64(h, fun_arity(hdr) as u64)
+            // Descriptor word 3 is the true arity — the key [`crate::compare::cmp`]
+            // orders external funs by, so it must be mixed here too.
+            // SAFETY: descriptor word 3 of a live external fun is live.
+            mix64(h, unsafe { (*p.add(3)).raw() } as u64)
         }
     }
 }
@@ -720,25 +723,43 @@ mod tests {
         let m = a.lookup("a").unwrap();
         let n = a.lookup("b").unwrap();
         // SAFETY: the heap owns every block built here.
-        let (l1, l1_copy, l_uniq, l_index, l_env, e1, e1_copy, e_arity, i1, i1_copy, i_index, i_uniq_bytes) =
-            unsafe {
-                (
-                    local_fun(&mut heap, 7, 3, &[]),
-                    local_fun(&mut heap, 7, 3, &[]),
-                    local_fun(&mut heap, 8, 3, &[]),
-                    local_fun(&mut heap, 7, 4, &[]),
-                    local_fun(&mut heap, 7, 3, &[make_small(1)]),
-                    external_fun(&mut heap, m, n, 2),
-                    external_fun(&mut heap, m, n, 2),
-                    external_fun(&mut heap, m, n, 3),
-                    imported_fun(&mut heap, m, 1, 0, [1u8; 16], &[]),
-                    imported_fun(&mut heap, m, 1, 0, [1u8; 16], &[]),
-                    imported_fun(&mut heap, m, 2, 0, [1u8; 16], &[]),
-                    // Only the `uniq` bytes differ: the comparison ignores them, so
-                    // the hash must too.
-                    imported_fun(&mut heap, m, 1, 0, [2u8; 16], &[]),
-                )
-            };
+        let (
+            l1,
+            l1_copy,
+            l_uniq,
+            l_index,
+            l_env,
+            e1,
+            e1_copy,
+            e_arity,
+            e_big_arity,
+            e_zero_arity,
+            i1,
+            i1_copy,
+            i_index,
+            i_uniq_bytes,
+        ) = unsafe {
+            (
+                local_fun(&mut heap, 7, 3, &[]),
+                local_fun(&mut heap, 7, 3, &[]),
+                local_fun(&mut heap, 8, 3, &[]),
+                local_fun(&mut heap, 7, 4, &[]),
+                local_fun(&mut heap, 7, 3, &[make_small(1)]),
+                external_fun(&mut heap, m, n, 2),
+                external_fun(&mut heap, m, n, 2),
+                external_fun(&mut heap, m, n, 3),
+                // Arity 256 shares the header's low 8 bits with arity 0 but not the
+                // descriptor's true arity — the field `crate::compare::cmp` orders by.
+                external_fun(&mut heap, m, n, 256),
+                external_fun(&mut heap, m, n, 0),
+                imported_fun(&mut heap, m, 1, 0, [1u8; 16], &[]),
+                imported_fun(&mut heap, m, 1, 0, [1u8; 16], &[]),
+                imported_fun(&mut heap, m, 2, 0, [1u8; 16], &[]),
+                // Only the `uniq` bytes differ: the comparison ignores them, so
+                // the hash must too.
+                imported_fun(&mut heap, m, 1, 0, [2u8; 16], &[]),
+            )
+        };
 
         // Equal funs hash equal, for every kind.
         assert_eq!(term_hash(l1, &a), term_hash(l1_copy, &a));
@@ -748,6 +769,10 @@ mod tests {
         assert!(crate::eq(i1, i_uniq_bytes, &a));
         assert_eq!(term_hash(i1, &a), term_hash(i_uniq_bytes, &a));
 
+        // The true arity is compared, so it must hash too.
+        assert!(!crate::eq(e_big_arity, e_zero_arity, &a));
+        assert_ne!(term_hash(e_big_arity, &a), term_hash(e_zero_arity, &a));
+
         // Structurally different funs hash differently.
         let distinct = [
             term_hash(l1, &a),
@@ -756,6 +781,8 @@ mod tests {
             term_hash(l_env, &a),
             term_hash(e1, &a),
             term_hash(e_arity, &a),
+            term_hash(e_big_arity, &a),
+            term_hash(e_zero_arity, &a),
             term_hash(i1, &a),
             term_hash(i_index, &a),
         ];

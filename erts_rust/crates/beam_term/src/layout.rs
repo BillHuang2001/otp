@@ -412,7 +412,11 @@ mod tests {
         for (kind, num_free, expected) in [
             (FunKind::Local, 0usize, 1 + 2),
             (FunKind::Local, 3, 1 + 2 + 3),
-            (FunKind::External, 0, 1 + 2),
+            (FunKind::External, 0, 1 + 3),
+            // No writer builds an external fun with an environment (the C asserts
+            // `num_free == 0`), but the layout must still size one consistently from
+            // `desc_words(External) == 3` rather than the legacy `ERL_FUN_SIZE`.
+            (FunKind::External, 2, 1 + 3 + 2),
             (FunKind::Imported, 0, 1 + 10),
             (FunKind::Imported, 2, 1 + 10 + 2),
         ] {
@@ -613,6 +617,7 @@ mod tests {
             (FunKind::Local, 3usize, 1 + 2usize),
             (FunKind::Imported, 2, 1 + 10),
             (FunKind::External, 0, 0), // no environment at all
+            (FunKind::External, 2, 1 + 3), // env starts after the 3-word descriptor
         ] {
             let hdr = make_fun_header(1, num_free, kind).expect("a valid fun header");
             // SAFETY: a fun header at a scratch address; the shape reads no payload.

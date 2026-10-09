@@ -293,6 +293,11 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   `unsafe write_external_port(hp, node, number: u64, creation: u32)`,
   `unsafe write_external_ref(hp, node, ids: &[u32], creation: u32)` and their `unsafe *_parts`
   inverses (`external_pid_parts`/`external_port_parts`/`external_ref_parts`).
+  **`ids` may be empty** (`0 <= n <= MAX_REF_IDS`): the oracle accepts a zero-id external reference
+  (`binary_to_term(<<131,90,0:16,Node,0:32>>)` round-trips), whose block is exactly
+  `[header, node, creation, count = 0]` — `external_ref_size_words(0) == 4` — and `external_ref_parts`
+  reports an empty slice. Hashing such a reference mixes the word after the count (zeroed) ⇒ `0`, the
+  C's `external_ref_numbers(x)[0]` (`erl_term_hashing.c:1459-1461`/`:290`), not an error.
 
 ### `bitstring.rs` — bit-level payloads
 The `ErlHeapBits` / `ErlSubBits` block writers and readers plus the crate's public bit/float payload
@@ -374,22 +379,33 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 [`FUN_HEADER_IMPORTED_OFFS`] (this crate's `NEW_FUN_EXT` marker).
 - Constants: `FUN_HEADER_ARITY_OFFS=8`, `FUN_HEADER_ENV_SIZE_OFFS=16`, `FUN_HEADER_KIND_OFFS=24`,
   `FUN_HEADER_IMPORTED_OFFS=25`, `FUN_MAX_FIELD=0xFF`, `MAX_ARG=255`, `FUN_DESC_WORDS_LOCAL=2`,
-  `FUN_DESC_WORDS_EXTERNAL=2`, `FUN_DESC_WORDS_IMPORTED=10`.
+  `FUN_DESC_WORDS_EXTERNAL=3`, `FUN_DESC_WORDS_IMPORTED=10`.
 - `pub enum FunKind { Local, External, Imported }`; `pub struct FunPid { node: Atom, number, serial, creation: u32 }`.
 - Pure (no `unsafe`, take a *header word*) helpers: `make_fun_header(arity, num_free, kind) -> TermResult<Eterm>`,
   `fun_kind_of_header(hdr) -> FunKind` (const), `fun_kind(hdr) -> TermResult<FunKind>`,
   `fun_arity`/`fun_num_free` (const), `fun_desc_words(kind)`, `fun_words(kind, num_free)`,
   `fun_desc_words_header`/`fun_env_offset_header`/`fun_block_words_header` (term→error on non-fun).
+- **The external fun's true arity is carried out of band.** The header's 8-bit `arity` field is what
+  the C's `fun_info(F, arity)` reports (the true arity truncated to its low byte), while the C
+  encoder emits the `Export`'s full `info.mfa.arity` (`external.c:3997-4001`). So
+  `FUN_DESC_WORDS_EXTERNAL = 3` and the descriptor is `[hdr][module][function][true arity]`;
+  `write_fun_external` accepts **any** arity (no `ArityOutOfRange` — it masks the header field with
+  `FUN_MAX_FIELD`, keeping `num_free == 0` so block sizing stays `1 + 3`), and `fun_arity` remains the
+  header reader. Verified against the oracle (OTP 29 / erts-17.1): an `EXPORT_EXT` blob with arity 256
+  reports `{arity,0}` from `fun_info/2` yet re-encodes 256.
 - `pub fn fun_block_words(t: Eterm) -> TermResult<usize>` (boxed-fun required).
 - Heap-agnostic writers (`pub unsafe fn`, caller reserves `fun_words(kind, num_free)` words):
   `write_fun_local(hp, arity, uniq: u64, index: u32, env: &[Eterm])`,
   `write_fun_external(hp, arity, module: Atom, function: Atom)`,
   `write_fun_imported(hp, arity, module: Atom, uniq: &[u8;16], index, old_index, old_uniq: u32, creator: FunPid, env: &[Eterm])`.
 - Accessors (`pub unsafe fn`, wrong-kind/non-fun ⇒ `TermError::BadFun`, never a panic):
+  `fun_true_arity -> TermResult<usize>` (the **true** arity — descriptor word 3 for `External`, the
+  header field for `Local`/`Imported`; what an encoder/`compare`/hashing must use),
   `fun_uniq -> TermResult<u64>`, `fun_uniq_bytes -> TermResult<[u8;16]>`, `fun_index`/`fun_old_index`/`fun_old_uniq -> TermResult<u32>`,
   `fun_module`/`fun_function -> TermResult<Atom>`, `fun_creator_pid -> TermResult<FunPid>`, `fun_env -> TermResult<&[Eterm]>`.
 - Word layout, `env[i]` at `hp[1 + desc_words(kind) + i]`, block = `1 + desc_words + num_free` words:
-  `Local` = `[hdr][uniq:u64][index:u32][env…]`; `External` = `[hdr][module:Atom][function:Atom]`;
+  `Local` = `[hdr][uniq:u64][index:u32][env…]`;
+  `External` = `[hdr][module:Atom][function:Atom][arity:usize raw]`;
   `Imported` = `[hdr][module][uniq0..8][uniq8..16][index][old_index][old_uniq][pid_node][pid_number][pid_serial][pid_creation][env…]`.
 - `boxed.rs` provides header-word predicates `is_external_fun`/`is_imported_fun`/`is_local_fun`.
 - `size.rs` sizes a fun as `1 + desc_words + num_free`; `compare.rs` orders funs structurally

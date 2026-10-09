@@ -32,8 +32,8 @@ use crate::boxed::{arityval, boxed_val, header_subtag, internal_ref_numbers};
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::fun::{
-    fun_arity, fun_env, fun_function, fun_index, fun_kind_of_header, fun_module, fun_num_free,
-    fun_old_uniq, FunKind,
+    fun_env, fun_function, fun_index, fun_kind_of_header, fun_module, fun_num_free, fun_old_uniq,
+    fun_true_arity, FunKind,
 };
 use crate::immediate::{
     atom_val, internal_port_data, is_byte, pid_number, signed_value, unsigned_value,
@@ -203,7 +203,10 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
                         }
                     }
                     FunKind::External => {
-                        let arity = fun_arity(hdr);
+                        // The C mixes `mfa->arity` — the `Export`'s TRUE arity
+                        // (`erl_term_hashing.c:262-269`), widened to `Uint32` there.
+                        // SAFETY: `term` is a live external fun.
+                        let arity = unsafe { fun_true_arity(term)? };
                         hash = hash.wrapping_mul(FN11).wrapping_add(arity as u32);
                         hash = hash
                             .wrapping_mul(FN1)
@@ -247,10 +250,14 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
                     unsafe { internal_ref_numbers(term)[0] }
                 } else {
                     // SAFETY: the tag says external reference.
-                    match unsafe { external_ref_parts(term) }.1.first() {
-                        Some(v) => *v,
-                        None => return Err(TermError::BadFun),
-                    }
+                    // `external_ref_numbers(x)` is `&external_ref_data(x)[1]` — the word
+                    // after the id count — so a zero-length reference reads/mixes the
+                    // zeroed word there: 0 (`erl_term_hashing.c:290`).
+                    unsafe { external_ref_parts(term) }
+                        .1
+                        .first()
+                        .copied()
+                        .unwrap_or(0)
                 };
                 hash = uint32_hash_step(hash, first, FN9);
                 hash = hash.wrapping_mul(FN10);

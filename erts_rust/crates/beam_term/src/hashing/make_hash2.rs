@@ -40,8 +40,8 @@ use crate::boxed::{
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::fun::{
-    fun_arity, fun_env, fun_function, fun_index, fun_kind_of_header, fun_module, fun_num_free,
-    fun_old_uniq, FunKind,
+    fun_env, fun_function, fun_index, fun_kind_of_header, fun_module, fun_num_free, fun_old_uniq,
+    fun_true_arity, FunKind,
 };
 use crate::immediate::{
     atom_val, internal_port_data, is_byte, is_small, pid_number, signed_value, unsigned_value,
@@ -334,7 +334,12 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                                 }
                             }
                             FunKind::External => {
-                                let arity = fun_arity(hdr);
+                                // The C mixes `ep->info.mfa.arity` — the `Export`'s
+                                // TRUE arity (`erl_term_hashing.c:1248-1255`), not the
+                                // header's 8-bit field. `mfa.arity` is a `Uint`, so the
+                                // `u32` cast is the C's own width.
+                                // SAFETY: `term` is a live external fun.
+                                let arity = unsafe { fun_true_arity(term)? };
                                 let module = unsafe { fun_module(term)? };
                                 let function = unsafe { fun_function(term)? };
                                 hash = uint32_hash_2(
@@ -422,7 +427,12 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                     EXTERNAL_REF_SUBTAG => {
                         // SAFETY: the header says external reference.
                         let (_, ids, _) = unsafe { external_ref_parts(term) };
-                        let first = *ids.first().ok_or(TermError::BadFun)?;
+                        // `UINT32_HASH_RET(external_ref_numbers(term)[0], …)`
+                        // (`erl_term_hashing.c:1459-1461`): `external_ref_numbers` is
+                        // `&external_ref_data(x)[1]`, i.e. the word right after the id
+                        // count, so a zero-length reference mixes the zeroed word there
+                        // — 0 — rather than failing.
+                        let first = ids.first().copied().unwrap_or(0);
                         hash = uint32_hash(hash, first, HCONST_7);
                         to_common = true;
                     }
