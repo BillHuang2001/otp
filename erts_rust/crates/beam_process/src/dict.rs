@@ -70,16 +70,21 @@
 //!
 //! # Iteration order (documented deviation, unchanged by the equality fix)
 //!
-//! `erlang:get/0`, `erlang:get_keys/0` and `erlang:erase/0` report the pairs in
-//! **insertion order** here. The C instead walks its hash array (`pd_hash_get_all`,
-//! `erl_process_dict.c:579-626`) and prepends each entry to the result, so the oracle's
-//! order is an artifact of its hash slots and of the array's grow/shrink history: on OTP
-//! 29.1.1 `put(a,1), put(b,2), get()` reports `[{b,2},{a,1}]` while
-//! `put(1,1), put(2,2), put(3,3), get()` reports `[{3,3},{2,2},{1,1}]`. Reproducing that
-//! means porting the hash array — the O(1)-lookup optimization this module deliberately
-//! defers (see the top of the module). The **value** semantics are unaffected and are
-//! pinned by tests: `put` replaces in place, returns the replaced value (last put wins),
-//! `get` returns the last `put`'s value and `erase` returns the erased value.
+//! `erlang:get/0`, `erlang:get_keys/0`, `erlang:erase/0` and `process_info(P, dictionary)`
+//! report the pairs in **insertion order** here. The C instead walks a hash array
+//! (`pd_hash_get_all`, `erl_process_dict.c:579`), whose order is an unspecified artifact of
+//! the hash slots and of the array's grow/shrink history — and, probed on OTP 29.1.1, is
+//! **not stable across VM starts**: `put(a,1), put(b,2), get()` reports `[{b,2},{a,1}]` in
+//! most starts and `[{a,1},{b,2}]` in others, and `put(a,1), put(b,2), put(c,3), get()`
+//! varies between `[{a,1},{c,3},{b,2}]` and `[{a,1},{b,2},{c,3}]`. The C's order therefore
+//! cannot be reproduced (nor pinned by a differential case), so the crate-local oracle
+//! cross-check (`tests/dict_oracle.rs`) compares `get/0` as a **set** (`lists:sort/1`) and
+//! this crate fixes the one order it can offer deterministically: insertion order.
+//! Reproducing the C's would mean porting the hash array — the O(1)-lookup optimization
+//! this module deliberately defers (see the top of the module). The **value** semantics are
+//! unaffected and are pinned by tests: `put` replaces in place, returns the replaced value
+//! (last put wins), `get` returns the last `put`'s value and `erase` returns the erased
+//! value.
 
 use std::rc::Rc;
 
