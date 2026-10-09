@@ -38,7 +38,7 @@
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer) + the BIF registry |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
-//! | `erlang:statistics/1` | `run_queue` from [`Runtime::run_queue_len`]; `wall_clock` from the process clock |
+//! | `erlang:statistics/1` | `run_queue`; `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `io` (the port subsystem's byte counters); `scheduler_wall_time` (`undefined`, never enabled) |
 //! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
 //!
 //! Every **other** `(module, function, arity)` answers the same typed capability gap the
@@ -54,10 +54,11 @@
 //!   exposes — so the absolute form is reported as the typed capability gap rather than
 //!   approximated by a millisecond-off estimate. `{abs, false}` (the default) IS served.
 //! * `statistics/1` serves **only** the keys this runtime can measure for real
-//!   (`run_queue`, `wall_clock`, see [`RuntimeHooksBridge::statistics`]); every other key
-//!   the oracle accepts is a valid statistics key this runtime cannot answer honestly, so
-//!   it reports the typed capability gap. A name that is not a statistics key at all is
-//!   the oracle's `badarg`.
+//!   (`run_queue`, `wall_clock`, `reductions`/`exact_reductions`, `context_switches`, `io`
+//!   and the never-enabled `scheduler_wall_time`, see
+//!   [`RuntimeHooksBridge::statistics`]); every other key the oracle accepts is a valid
+//!   statistics key this runtime cannot answer honestly, so it reports the typed capability
+//!   gap. A name that is not a statistics key at all is the oracle's `badarg`.
 //! * `os:set_signal/2` installs the disposition for real (the one process-global
 //!   [`signal`] facility), but the **notification leg** of ERTS's signal handling is not
 //!   wired: this runtime boots no `erl_signal_server` process and registers the facility's
@@ -619,8 +620,8 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// `erlang:statistics/1` — the counters this runtime can answer **honestly** from its
     /// own real state.
     ///
-    /// Oracle-verified (OTP 29/`erts-17.1`). The two keys served, and why each figure is a
-    /// real measurement rather than a placeholder:
+    /// Oracle-verified (OTP 29/`erts-17.1`). The served keys, and why each figure is a real
+    /// measurement rather than a placeholder:
     ///
     /// * `run_queue` → the total length of the runnable queues, as a small integer. This is
     ///   [`Runtime::run_queue_len`], the length of the runtime's **one** real run queue
@@ -631,6 +632,21 @@ impl<'a> RuntimeHooksBridge<'a> {
     ///   process monotonic clock ([`std::time::Instant`]). The oracle's relationship holds
     ///   exactly: the first read answers the same value for both elements, and every later
     ///   read answers the delta since the previous one. This is what `c:uptime/0` reads.
+    /// * `reductions`/`exact_reductions` → `{Total, SinceLast}` from the node-global
+    ///   **cumulative** reduction count the runner keeps ([`Runtime::note_reductions`]): the
+    ///   number of reduction units (`BudgetProbe`) the executing machine was charged at its
+    ///   heap-admission points, summed over every scheduler slice. `SinceLast` is the delta
+    ///   since the previous read of the *same* key (see [`Runtime::reductions_statistics`]).
+    /// * `context_switches` → `{Total, SinceLast}` from the node-global process-dispatch
+    ///   counter the scheduler keeps ([`Runtime::note_context_switches`]): one per slice the
+    ///   run loop dispatched. `SinceLast` is the delta since the previous read.
+    /// * `io` → `{{input, BytesIn}, {output, BytesOut}}` from the shared byte counters the
+    ///   port subsystem bumps ([`crate::port::IoCounters`]): bytes delivered from a port as
+    ///   `{Port, {data, …}}` and bytes written to a port by `port_command/2,3`.
+    /// * `scheduler_wall_time` → the atom `undefined`, the oracle's own "not enabled"
+    ///   answer. Only `erlang:system_flag(scheduler_wall_time, true)` turns it into a list of
+    ///   `{SchedulerId, ActiveTime, TotalTime}` tuples, and this runtime never enables it, so
+    ///   `undefined` is exact rather than an approximation.
     ///
     /// **Documented divergence (the epoch, never the clock).** The oracle's `wall_clock`
     /// total is measured from emulator start; this runtime anchors it at the **first**
@@ -638,19 +654,20 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// — the runtime's other monotonic origin lives inside `beam_bifs` (`src/time.rs`) and
     /// exposes no reader. The numbers are therefore real elapsed time with a different
     /// zero, exactly the class of divergence as `erlang:processes/0` ("an answer that reads
-    /// *this* runtime's own state").
+    /// *this* runtime's own state"). The same "different zero" holds for `reductions` and
+    /// `context_switches`: they count *this* runtime's own work from its own start, and the
+    /// oracle counts far more of both because it runs a much larger emulator.
     ///
     /// Every **other** key the oracle accepts is a genuine statistics key this runtime
-    /// cannot measure — `reductions`/`exact_reductions` need a node-global **cumulative**
-    /// reduction counter (this runtime's counters are per-process and reset by every
-    /// scheduler slice, so summing them would be a made-up total), `runtime` needs CPU time,
-    /// `context_switches` a context-switch counter, `garbage_collection` a collector,
-    /// `scheduler_wall_time`/`scheduler_wall_time_all` per-scheduler CPU time,
-    /// `microstate_accounting` the MSACC machinery, `io` I/O byte counters and `run_queues`
-    /// / `active_tasks*` / `*_run_queue_lengths*` the per-scheduler queue lists — so each
-    /// answers the typed capability gap rather than a fabricated number (workspace
-    /// `CONTEXT.md` §3). A name that is **not** a statistics key at all is the oracle's
-    /// `badarg` (`erl_bif_info.c:4333`), which is reproduced rather than reported as a gap.
+    /// cannot measure — `runtime` needs CPU time this crate cannot read without `unsafe`
+    /// (it is `#![deny(unsafe_code)]` and `std` exposes no CPU-time clock, so wall-clock
+    /// time is deliberately **not** substituted), `garbage_collection` a real accumulative
+    /// collector, `scheduler_wall_time_all`/`*_run_queue_lengths*`/`active_tasks*`/
+    /// `run_queues` per-scheduler queue lists and CPU time, and `microstate_accounting` the
+    /// MSACC machinery — so each answers the typed capability gap rather than a fabricated
+    /// number (workspace `CONTEXT.md` §3). A name that is **not** a statistics key at all is
+    /// the oracle's `badarg` (`erl_bif_info.c:4333`), which is reproduced rather than
+    /// reported as a gap.
     ///
     /// # Errors
     ///
@@ -670,6 +687,13 @@ impl<'a> RuntimeHooksBridge<'a> {
                 let (total, since) = wall_clock_millis();
                 heap.tuple(&[make_small(total), make_small(since)])
             }
+            // `scheduler_wall_time` answers `undefined` until
+            // `erlang:system_flag(scheduler_wall_time, true)` has been applied
+            // (`erl_bif_info.c:4258-4273`), and this runtime never enables it — it keeps no
+            // per-scheduler CPU accounting to hand out. The oracle's own "not enabled"
+            // answer is therefore the exact one to give, not a substitute for a missing
+            // measurement (`tests/runtime_hooks.rs` pins it against the live oracle).
+            "scheduler_wall_time" => atom_term(atoms, "undefined"),
             other if STATISTICS_KEYS.contains(&other) => Err(error::unsupported(&format!(
                 "erlang:statistics/1: the `{other}` counter is not implemented"
             ))),
@@ -843,16 +867,16 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
     }
 }
 
-/// Every key the oracle's `erlang:statistics/1` accepts beyond the two this runtime serves
+/// Every key the oracle's `erlang:statistics/1` accepts beyond the ones this runtime serves
 /// (`erts/emulator/beam/erl_bif_info.c:4169-4332`, plus the `ERTS_ENABLE_MSACC`-gated
 /// `microstate_accounting`).
 ///
 /// The list exists to tell a **valid** key this runtime cannot measure (the honest typed
 /// capability gap, [`RuntimeHooksBridge::statistics`]) from a name that is not a statistics
 /// key at all (the oracle's `badarg`) — the only two answers, since a fabricated figure is
-/// never acceptable (workspace `CONTEXT.md` §3).
+/// never acceptable (workspace `CONTEXT.md` §3). A key this runtime *does* serve is handled
+/// by its own arm above and must **not** appear here.
 const STATISTICS_KEYS: &[&str] = &[
-    "scheduler_wall_time",
     "scheduler_wall_time_all",
     "total_active_tasks",
     "total_run_queue_lengths",
