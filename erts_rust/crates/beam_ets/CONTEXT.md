@@ -433,15 +433,26 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   object whose key element the entry's stored key pointed at (re-derived from a surviving object at
   `keypos`). `Table::relocate_rebuilt_object` derives the index key from the **table-owned copy**, never
   the caller's key. This was the crate's live use-after-free class — see `tests/ets_reclamation.rs`.
-- **B+-tree branch separators are always re-materialised from the rightmost live leaf**
-  (`NodeStore::subtree_max_key`). An upsert replaces the object that established a subtree maximum and
-  reclaims its storage, so a stored separator term dangles even when the key *value* is unchanged. The
-  branch descent is a lower bound, so `node::child_index` **binary-searches** the strictly ascending
-  separators (`O(log ORDER)`, ≤5 `cmp_arith` at `ORDER = 32`) instead of scanning them. (Structural
-  change → `../../CHANGE.md`.)
+- **B+-tree branch separators are re-materialised from the rightmost live leaf, but only where the
+  subtree max actually moves.** `Tree::insert_rec` returns an `InsertStep` that carries the ascending
+  path's new maximum, so on the unwind a separator is rewritten only when the subtree maximum it names
+  changed (or a split creates a new one) — an insert under an unchanged maximum touches no separator.
+  A separator that IS replaced must be re-materialised (`NodeStore::subtree_max_key`): an upsert
+  replaces the object that established the subtree maximum and reclaims its storage, so a stored
+  separator term would dangle even when the key *value* is unchanged. The branch descent is a lower
+  bound, so `node::child_index` **binary-searches** the strictly ascending separators (`O(log ORDER)`,
+  ≤5 `cmp_arith` at `ORDER = 32`) instead of scanning them. `Tree::check_invariants` asserts separator
+  **term identity**; `an_upsert_that_moves_a_subtree_maximum_leaves_every_separator_live` pins it.
+  (Structural change → `../../CHANGE.md`.)
+- **`insert_new` is a single descent.** The same `insert_rec` runs with a refuse-on-existing-key flag,
+  stopping with `InsertStep::Refused` and mutating nothing, so `ets:insert_new/2` no longer performs a
+  separate `find` before its `insert` (≈1.5–2.2× faster; `interior_bench.rs`).
 - **`{write_concurrency,_}` is a mode, not a bool.** `WriteConcurrency` (`Off`/`On`/`Auto`/`FixedLocks`)
   is the model; the bool API is its `Off`/`On` projection, so `beam_bifs` stays source-compatible, and
-  `decentralized_counters` is derived from the mode.
+  `decentralized_counters` is derived from the mode. The fine-locking normalization (power-of-two lock
+  count, `>= NLOCKS_WITH_ITEM_COUNTERS`, the `private`-forces-off rule) is a **creation-time** property
+  of `TableOptions`: a runtime `set_access` change does **not** re-normalize it (the oracle agrees — see
+  the `table/ownership.rs` entry).
 - **The guard-scoped view gains a view-borrowed traversal API** (`view/iter.rs`) returning `TableTerm`
   bound to the borrow — so a full table walk is expressible without a bare `Eterm` escaping.
 
