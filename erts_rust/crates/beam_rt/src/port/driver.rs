@@ -337,7 +337,8 @@ impl TermQueue {
     }
 }
 
-/// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.///
+/// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
+///
 /// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
 /// handle to the runtime's **one shared** [`AtomTable`] plus the deferred-commit [`PendingInterner`]
 /// a *new* atom is recorded on, and answers the port queries with the owning [`ProcessId`].
@@ -1380,6 +1381,29 @@ mod tests {
         assert_eq!(atoms.name(atom_val(fresh)), None);
     }
 
+    /// `erl_drv_output_term` / `erl_drv_send_term` queue their decoded term on the port's
+    /// [`TermQueue`] — the delivery half — while [`DriverPort::sent`] keeps the accumulate-only
+    /// view the A.4 integration test reads; draining the queue empties it.
+    #[test]
+    fn send_term_queues_the_decoded_term_and_draining_empties_the_queue() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+        let queue = host.term_queue();
+        assert!(queue.is_empty());
+        let term = host.owner().to_eterm();
+        // `None` = the port's connected process (`erl_drv_output_term`, `io.c:6254`).
+        assert_eq!(host.send_term(std::ptr::null_mut(), None, term), 0);
+        assert_eq!(host.sent(), &[(None, term)]);
+        assert!(!queue.is_empty());
+        // `Some(pid)` = an explicit destination (`erl_drv_send_term`, `io.c:6289`).
+        assert_eq!(host.send_term(std::ptr::null_mut(), Some(term), term), 0);
+        assert_eq!(queue.take(), vec![(None, term), (Some(term), term)]);
+        // Draining empties it; the teardown path (`clear`) leaves it empty too.
+        assert!(queue.is_empty());
+        assert_eq!(queue.take(), Vec::new());
+        host.terms.clear();
+        assert!(queue.is_empty());
+    }
     #[test]
     fn the_host_captures_output_and_answers_the_port_queries() {
         let atoms = Rc::new(AtomTable::new());
