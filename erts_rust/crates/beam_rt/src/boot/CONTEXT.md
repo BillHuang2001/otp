@@ -158,7 +158,16 @@ deterministic for a given argv but varies with it: `21096`, `42408`, `1712303041
 path fails too — so it is heap layout, not path semantics. Pinned by inspection to `beam_engine`'s
 structured-raise path: `Machine::throw_with_stacktrace` (`machine/catch.rs`) attaches a `LiveReason` over
 a term whose source heap frame is already gone, and a later copy (`beam_process` → `beam_message`'s
-`size_object`) reads the freed frame as a length. **`src/boot/**` cannot fix it.** `tests/boot.rs`
+`size_object`) reads the freed frame as a length. The `beam_rt`-side chain that surfaces it: the dying
+**scheduled** process's runner recovers the reason at `../runner/run.rs` (`exit_reason` →
+`error::live_reason_term`, a plain `downcast_ref::<Eterm>`), then `Runtime::stabilize_escaped`
+(`../runtime/gc.rs`) tries to copy it onto the arena — its `copy_struct_simple` fails on the garbage and
+the `Err` arm **swallows** the failure, returning the original stale term. The raw
+`Alloc(AllocKind::Message)` therefore first surfaces *later*, from the process-termination propagation
+(`../..//beam_process/src/ptab.rs::copy_reason_onto` → `Process::copy_into_heap`), out through
+`Scheduler::slice_end` → `scheduler_pass` → `pump_scheduler` → the CLI — never via
+`error::enforce_term_heap_limit`, which does not wrap the terminate path. **`src/boot/**` cannot fix it.**
+`tests/boot.rs`
 therefore builds its `-boot` value from `CARGO_MANIFEST_DIR`'s ancestors (`start_boot()`), whose canonical
 short form is the safe one. Repro:
 `ERL_CRASH_DUMP_SECONDS=0 beam_rt -noshell -boot "$PWD/bootstrap/./bin/start"` →
