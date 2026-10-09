@@ -669,21 +669,18 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
   C returns the static string `"unknown"`.
 - **`sync::tsd_*` passes the key straight to pthreads unchecked** (no `used_tsd_keys[]` validation);
   an invalid/destroyed key makes `set`/`get` a safe no-op (`NULL`) where the C aborts.
-- **The four driver-registry slots are wired but not yet reachable from the running runtime.** They are
-  populated in the frozen table (a driver `.so` that binds them now `dlopen`s on the Rust side) and the
-  `beam_io` host implements the hooks, but a `DriverHost` only ever sees them if the runtime (a) publishes
-  itself with [`with_current_host`] for the two port-free slots and (b) passes a `DriverEnv::as_port()`
-  handle **and** overrides the hooks for the two port-carrying ones. `beam_rt`'s driver host does neither
-  today — it implements `DriverHost` for its own `DriverEnv`-backed host but leaves the four hooks at
-  their trait defaults, and `beam_io`'s A.4 host layer is not on its `.so` driver path. A real driver
-  callback calling them therefore observes the C's own failure defaults: measured under `beam_rt run`,
-  `driver_lock_driver` answers `-1` and `remove_driver_entry` `0` where the oracle answers `0`/`1`.
-  Making them agree is a `beam_rt` change (its hooks + a `with_current_host` wrapper).
-- **`driver_create_port` is implementable but not yet plumbed.** The hook needs a live
+- **The driver-registry slots are reachable from the running runtime (`beam_rt`).** `beam_rt`'s per-port
+  `DriverHost` (`beam_rt/src/port/driver.rs`) implements the three port-reachable hooks over its own
+  driver-entry list: `add_driver_entry`/`remove_driver_entry` (`:705`/`:711`, against its `DRIVER_ENTRIES`
+  list) and `lock_driver` (`:724`, reflecting the port's **own** loaded driver, C `io.c:7337`). Its
+  callback dispatch is wrapped in [`with_current_host`] (the `publishing` helper, `:570`), so the two
+  port-free slots reach the host too.
+- **`driver_create_port` is not plumbed — a hard-coded failure sentinel.** The hook needs a live
   `PortRegistry`+`Poller`+driver-table reachable from a per-port `DriverHost`, which no host supplies
-  today; until `beam_io` hands those to its host the hook returns the invalid-port sentinel. Likewise
-  `lock_driver` must reflect the port's **own** loaded driver `handle` (C `io.c:7337`), not a
-  global-table lookup by name.
+  (the registry is owned elsewhere; a re-entrant open would alias the borrow the running callback was
+  dispatched through), so a `beam_rt` host returns the invalid-port sentinel
+  (`beam_rt/src/port/driver.rs:741-749`). A fabricated port handle would be a wrong value, so the C's
+  own single failure answer is the honest one.
 - **The `driver_binary_*_refc` trio refuses a NULL/foreign operand with `-1`** where the C would
   recover a bogus `Binary*` and crash — the crate's "refuse rather than fault" policy (the count
   itself is oracle-exact).
