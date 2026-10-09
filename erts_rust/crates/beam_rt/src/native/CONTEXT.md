@@ -101,10 +101,10 @@ before the registry.
 | `garbage_collection` | the 5-item proplist `[{max_heap_size,Map},{min_bin_vheap_size,N},{min_heap_size,N},{fullsweep_after,N},{minor_gcs,N}]` (`beam_gc::GARBAGE_COLLECTION_KEYS` order) |
 | `min_heap_size` / `min_bin_vheap_size` / `fullsweep_after` | the emulator's heap policy (`+hms`/`+hmbs`, rounded through the growth table) |
 | `max_heap_size` | the process flag **map** `#{error_logger,include_shared_binaries,kill,size}` (`size` is the raw word bound, 0 = unlimited) |
-| `message_queue_data` | `on_heap` (this runtime's `beam_message::Queue` is heap-resident — a true placement) |
-| `trace` | the constant `0` — **divergence:** a traced process's real trace-flag bitmask (tracked by `crate::trace::TraceState`, exposed by `trace_info/2`) is not surfaced here, so the oracle's non-zero `{trace,N}` is not reproduced |
+| `message_queue_data` | `on_heap` — this runtime's real current placement (`beam_message::Queue` is heap-resident); the one divergence is an explicit `process_flag(message_queue_data, off_heap)`, accepted-and-ignored (see below) |
+| `trace` | the process's **live** ERTS tracee-flag **bitmask** as an integer (`0` while untraced), read from [`crate::trace::TraceState`] and translated via `crate::trace::flags_to_atoms` + the `ERTS_TRACE_FLAG_BITS` table (this runtime's internal trace bits are deliberately not ERTS's); the two flags with no canonical atom (`return_from`, `cpu_timestamp`) are unmapped on purpose |
 | `suspending` | `[]` (no `suspend_process` in M1) |
-| `last_calls` | the constant `false` (the `call`-flag call list is not tracked) |
+| `last_calls` | `false` — the oracle's own answer for a process with no saved-calls buffer (`erl_bif_info.c:2184-2188`); this runtime never saves calls |
 | `sequential_trace_token` | the process's sequential-trace token 5-tuple, or the bare `[]` while sequential tracing is inactive for it (read from `crate::seq_trace::token`) |
 | `memory` | this process's real bytes (`(total_heap_size + stack_size) * 8` + off-heap overhead) |
 
