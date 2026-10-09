@@ -18,7 +18,7 @@
 //
 // %CopyrightEnd%
 
-//! Key identity and ordering across number representations.
+//! Key identity, ordering and traversal ORDER across all four table kinds.
 //!
 //! `ordered_set` compares keys **arithmetically** (`erl_db_tree.c` `cmp_key_eq`,
 //! `CMP = erts_cmp(a, b, 0, 0)`), so `1` and `1.0` are the *same* key and numbers
@@ -26,6 +26,12 @@
 //! keep exact (`=:=`) key equality, so `1` and `1.0` stay distinct there. Whole-
 //! object identity in `delete_object/2` also stays exact (`db_eq`). Every
 //! expectation below was probed against the system `erl` (OTP 29 / erts-17.1).
+//!
+//! The second half pins the **traversal order** of the select family
+//! (`select`/`select_reverse`/`match`/`match_object`/`tab2list`): `ordered_set` is
+//! the exact ascending arithmetic key order (`select_reverse` descending), while a
+//! hash kind's order is unspecified — the oracle-comparable claim there is the
+//! multiset, so the recorded battery sorts before rendering.
 
 mod common;
 
@@ -33,6 +39,8 @@ use beam_ets::TableKind;
 use beam_term::prelude::*;
 use common::*;
 use core::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::time::Duration;
 
 #[test]
 fn set_keeps_integer_and_float_keys_distinct() {
@@ -389,4 +397,338 @@ fn ordered_set_iterates_in_ascending_key_order() {
             "unexpected object at this position"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Traversal ORDER of the whole select family, for all four kinds
+// ---------------------------------------------------------------------------
+//
+// `select`, `select_reverse`, `match`, `match_object` and `tab2list` are five
+// traversals of the *same* table, so their orders are related by construction:
+//
+//   * `select`, `match`, `match_object` and `tab2list` all walk the interior's own
+//     iteration order (`select` iterates `tab2list`, and the `match` family is
+//     `select` over a body that returns the whole object / the bound variables);
+//   * `select_reverse` walks exactly the **reverse** of it.
+//
+// For an `ordered_set` that order is the ascending arithmetic key order — exact and
+// oracle-comparable. For the hash kinds (`set`/`bag`/`duplicate_bag`) ERTS leaves
+// the order unspecified, so the oracle-comparable claim is the *multiset* only: the
+// recorded battery sorts a hash kind's sequences before rendering, and the live
+// cross-check compares those sorted renderings against the system `erl`.
+
+/// The bound key of a one-element `[K]` `match/2` result.
+fn match_key(result: Eterm) -> i64 {
+    // SAFETY: `match/2` with a `{'$1','_'}` head always yields a two-word cons cell
+    // whose head is the bound key (a small integer in this battery).
+    unsafe { signed_value(car(result)) }
+}
+
+/// Render a list of one-element integer lists the way `erl`'s `~p` does:
+/// `[[1],[2]]` — the shape of a `match/2` result list.
+fn render_int_lists(values: &[i64]) -> String {
+    let joined = values
+        .iter()
+        .map(|value| format!("[{value}]"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{joined}]")
+}
+
+/// The five select-family sequences over `{1,10}..{5,50}`, one set of facts per
+/// kind.
+///
+/// An `ordered_set` keeps its exact iteration order; a hash kind's order is
+/// unspecified, so its sequences are **sorted** (the oracle-comparable claim is the
+/// multiset, never the internal order).
+fn traversal_facts(kind: TableKind) -> BTreeMap<String, String> {
+    let mut atoms = AtomTable::new();
+    let mut heap = Heap::new(1024);
+    let mut table = new_table(kind);
+    for object in objects_1_to_5(&mut heap) {
+        table.insert(object, &atoms).unwrap();
+    }
+    let name = kind.as_atom_name();
+    let ordered = kind.is_ordered();
+
+    let mut forward: Vec<(i64, i64)> = table.tab2list().iter().map(|o| pair_of(*o)).collect();
+
+    let key_spec = key_spec(&mut heap, &mut atoms);
+    let mut select_keys: Vec<i64> = table
+        .select(&key_spec, &atoms, &mut out_heap())
+        .unwrap()
+        .iter()
+        .map(|key| signed_value(*key))
+        .collect();
+    let mut select_reverse_keys: Vec<i64> = table
+        .select_reverse(&key_spec, &atoms, &mut out_heap())
+        .unwrap()
+        .iter()
+        .map(|key| signed_value(*key))
+        .collect();
+
+    let pattern = heap
+        .tuple(&[
+            interned_atom(&mut atoms, "$1"),
+            interned_atom(&mut atoms, "_"),
+        ])
+        .unwrap();
+    let mut match_keys: Vec<i64> = table
+        .match_(pattern, &atoms, &mut out_heap())
+        .unwrap()
+        .iter()
+        .map(|result| match_key(*result))
+        .collect();
+    let mut match_object: Vec<(i64, i64)> = table
+        .match_object(pattern, &atoms, &mut out_heap())
+        .unwrap()
+        .iter()
+        .map(|o| pair_of(*o))
+        .collect();
+
+    if !ordered {
+        select_keys.sort();
+        select_reverse_keys.sort();
+        match_keys.sort();
+        match_object.sort();
+        forward.sort();
+    }
+
+    let mut facts = BTreeMap::new();
+    facts.insert(format!("{name}.select"), render_ints(&select_keys));
+    facts.insert(
+        format!("{name}.select_reverse"),
+        render_ints(&select_reverse_keys),
+    );
+    facts.insert(format!("{name}.match"), render_int_lists(&match_keys));
+    facts.insert(format!("{name}.match_object"), render_pairs(&match_object));
+    facts.insert(format!("{name}.tab2list"), render_pairs(&forward));
+    facts
+}
+
+/// The traversal-order facts the battery must produce — the figures printed by the
+/// system `erl` (OTP 29.1.1 / erts-17.1) for the identical script. Recording them
+/// here keeps the rules pinned with no `erl` on `$PATH`; the live-oracle test below
+/// re-derives every one from the real runtime.
+///
+/// A hash kind is recorded **sorted** (its order is unspecified); `ordered_set`
+/// keeps its exact ascending / descending order.
+#[rustfmt::skip]
+const ORDER_EXPECTED: &[(&str, &str)] = &[
+    ("set.select", "[1,2,3,4,5]"),
+    ("set.select_reverse", "[1,2,3,4,5]"),
+    ("set.match", "[[1],[2],[3],[4],[5]]"),
+    ("set.match_object", "[{1,10},{2,20},{3,30},{4,40},{5,50}]"),
+    ("set.tab2list", "[{1,10},{2,20},{3,30},{4,40},{5,50}]"),
+    ("ordered_set.select", "[1,2,3,4,5]"),
+    ("ordered_set.select_reverse", "[5,4,3,2,1]"),
+    ("ordered_set.match", "[[1],[2],[3],[4],[5]]"),
+    ("ordered_set.match_object", "[{1,10},{2,20},{3,30},{4,40},{5,50}]"),
+    ("ordered_set.tab2list", "[{1,10},{2,20},{3,30},{4,40},{5,50}]"),
+    ("bag.select", "[1,2,3,4,5]"),
+    ("bag.select_reverse", "[1,2,3,4,5]"),
+    ("bag.match", "[[1],[2],[3],[4],[5]]"),
+    ("bag.match_object", "[{1,10},{2,20},{3,30},{4,40},{5,50}]"),
+    ("bag.tab2list", "[{1,10},{2,20},{3,30},{4,40},{5,50}]"),
+    ("duplicate_bag.select", "[1,2,3,4,5]"),
+    ("duplicate_bag.select_reverse", "[1,2,3,4,5]"),
+    ("duplicate_bag.match", "[[1],[2],[3],[4],[5]]"),
+    ("duplicate_bag.match_object", "[{1,10},{2,20},{3,30},{4,40},{5,50}]"),
+    ("duplicate_bag.tab2list", "[{1,10},{2,20},{3,30},{4,40},{5,50}]"),
+];
+
+/// The four kinds, in the battery's order.
+const KINDS: [TableKind; 4] = [
+    TableKind::Set,
+    TableKind::OrderedSet,
+    TableKind::Bag,
+    TableKind::DuplicateBag,
+];
+
+/// Every fact of the traversal-order battery, keyed by `"<kind>.<api>"`.
+fn all_traversal_facts() -> BTreeMap<String, String> {
+    let mut facts = BTreeMap::new();
+    for kind in KINDS {
+        facts.extend(traversal_facts(kind));
+    }
+    facts
+}
+
+/// The crate's traversal-order rules, pinned to the recorded oracle figures (no
+/// oracle needed): `select`/`match`/`match_object`/`tab2list` agree on the table's
+/// iteration order, `select_reverse` is its exact reverse, and an `ordered_set` is
+/// the ascending key order.
+#[test]
+fn traverse_order_matches_the_recorded_oracle_figures() {
+    let facts = all_traversal_facts();
+    for (key, want) in ORDER_EXPECTED {
+        assert_eq!(facts.get(*key).map(String::as_str), Some(*want), "fact `{key}`");
+    }
+    assert_eq!(
+        facts.len(),
+        ORDER_EXPECTED.len(),
+        "the battery produced a different number of facts than recorded"
+    );
+}
+
+/// The invariant behind the recorded figures, asserted directly on the sequences
+/// (not their renderings): for **every** kind the four forward traversals visit the
+/// objects in exactly `tab2list` order, and `select_reverse` visits them in the
+/// exact reverse — with `ordered_set` the ascending numeric key order.
+#[test]
+fn select_family_visits_objects_in_tab2list_order_for_every_kind() {
+    for kind in KINDS {
+        let mut atoms = AtomTable::new();
+        let mut heap = Heap::new(1024);
+        let mut table = new_table(kind);
+        for object in objects_1_to_5(&mut heap) {
+            table.insert(object, &atoms).unwrap();
+        }
+
+        let forward = table.tab2list();
+        let forward_keys: Vec<i64> = forward.iter().map(|o| pair_of(*o).0).collect();
+
+        // `select` with a whole-object body (`['$_']`) is `tab2list`, in order.
+        let whole = whole_object_spec(&mut heap, &mut atoms);
+        let selected = table.select(&whole, &atoms, &mut out_heap()).unwrap();
+        assert_eq!(selected.len(), forward.len(), "{kind:?}: select count");
+        for (got, want) in selected.iter().zip(&forward) {
+            assert!(
+                eq(*got, *want, &atoms),
+                "{kind:?}: select order differs from tab2list"
+            );
+        }
+
+        // `select` with a key body returns exactly the `tab2list` keys, in order.
+        let key_spec = key_spec(&mut heap, &mut atoms);
+        let keys: Vec<i64> = table
+            .select(&key_spec, &atoms, &mut out_heap())
+            .unwrap()
+            .iter()
+            .map(|key| signed_value(*key))
+            .collect();
+        assert_eq!(keys, forward_keys, "{kind:?}: select keys vs tab2list keys");
+
+        // The `match` family walks the same order: `match_object` yields whole
+        // objects, `match` yields one-element lists of the same keys.
+        let pattern = heap
+            .tuple(&[
+                interned_atom(&mut atoms, "$1"),
+                interned_atom(&mut atoms, "_"),
+            ])
+            .unwrap();
+        let matched = table.match_object(pattern, &atoms, &mut out_heap()).unwrap();
+        assert_eq!(matched.len(), forward.len(), "{kind:?}: match_object count");
+        for (got, want) in matched.iter().zip(&forward) {
+            assert!(
+                eq(*got, *want, &atoms),
+                "{kind:?}: match_object order differs from tab2list"
+            );
+        }
+        let matched_keys: Vec<i64> = table
+            .match_(pattern, &atoms, &mut out_heap())
+            .unwrap()
+            .iter()
+            .map(|result| match_key(*result))
+            .collect();
+        assert_eq!(
+            matched_keys, forward_keys,
+            "{kind:?}: match order differs from tab2list"
+        );
+
+        // `select_reverse` is the exact reverse of the forward order.
+        let reversed = table
+            .select_reverse(&whole, &atoms, &mut out_heap())
+            .unwrap();
+        assert_eq!(reversed.len(), forward.len(), "{kind:?}: reverse count");
+        for (got, want) in reversed.iter().zip(forward.iter().rev()) {
+            assert!(
+                eq(*got, *want, &atoms),
+                "{kind:?}: select_reverse is not the reverse of tab2list"
+            );
+        }
+
+        // An `ordered_set` is the exact ascending key order.
+        if kind.is_ordered() {
+            assert_eq!(forward_keys, vec![1, 2, 3, 4, 5], "{kind:?}: ascending order");
+        }
+    }
+}
+
+/// The oracle program of the traversal-order battery (see [`ORDER_EXPECTED`]): it
+/// builds one table per kind over `{1,10}..{5,50}` and prints the five select-family
+/// sequences, **sorting** a hash kind's output (`norm/2`) so only the unspecified
+/// part is normalised away.
+const ORDER_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+main(_) ->
+    P = fun(K, V) -> io:format("~s -> ~p~n", [K, V]) end,
+    Objs = [{N, N * 10} || N <- lists:seq(1, 5)],
+    S = [{{'$1','_'}, [], ['$1']}],
+    Pat = {'$1','_'},
+    F = fun(Kind) ->
+        KS = atom_to_list(Kind),
+        T = ets:new(order, [Kind]),
+        [ets:insert(T, O) || O <- Objs],
+        P(KS ++ ".select", norm(Kind, ets:select(T, S))),
+        P(KS ++ ".select_reverse", norm(Kind, ets:select_reverse(T, S))),
+        P(KS ++ ".match", lists:sort(ets:match(T, Pat))),
+        P(KS ++ ".match_object", norm(Kind, ets:match_object(T, Pat))),
+        P(KS ++ ".tab2list", norm(Kind, ets:tab2list(T))),
+        ets:delete(T)
+    end,
+    [F(K) || K <- [set, ordered_set, bag, duplicate_bag]],
+    ok.
+
+norm(ordered_set, L) -> L;
+norm(_, L) -> lists:sort(L).
+"#;
+
+/// The live cross-check of the traversal order: the system `erl` runs the identical
+/// battery and both sides must reproduce every recorded figure. For an `ordered_set`
+/// the comparison is exact (ascending / descending); for the hash kinds it is the
+/// multiset the recorded battery pins.
+///
+/// Skips loudly when no Erlang is installed; `BEAM_ETS_REQUIRE_ORACLE=1` turns the
+/// skip into a failure.
+#[test]
+fn traverse_order_agrees_with_the_live_oracle() {
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "traverse_order_agrees_with_the_live_oracle",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable escript on $PATH)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(
+        &escript,
+        ORDER_ORACLE_PROGRAM,
+        &[],
+        "order_traversal",
+        Duration::from_secs(60),
+    );
+    let live = parse_lines(&String::from_utf8_lossy(&output.stdout));
+    let facts = all_traversal_facts();
+
+    for (key, want) in ORDER_EXPECTED {
+        assert_eq!(
+            live.get(*key).map(String::as_str),
+            Some(*want),
+            "the oracle disagrees with the recorded figure for `{key}`"
+        );
+        assert_eq!(
+            facts.get(*key).map(String::as_str),
+            Some(*want),
+            "the crate disagrees with the recorded figure for `{key}`"
+        );
+    }
+    assert_eq!(
+        live.len(),
+        ORDER_EXPECTED.len(),
+        "the oracle printed a different number of facts than recorded:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    println!(
+        "[ets] traversal order: {} facts agree with the live oracle",
+        ORDER_EXPECTED.len()
+    );
 }

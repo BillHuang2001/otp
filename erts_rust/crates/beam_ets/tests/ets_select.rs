@@ -265,33 +265,6 @@ fn match_delete_removes_the_matching_objects_and_returns_the_count() {
 // `ets:select_reverse/2` — the reverse traversal
 // ---------------------------------------------------------------------------
 
-/// A fresh output heap for a select call.
-fn out_heap() -> beam_alloc::Heap {
-    beam_alloc::Heap::new(8192).expect("an output heap is allocatable")
-}
-
-/// `[{'$1', [], ['$1']}]` — a bare-variable head that binds the whole object and
-/// returns it (the spec the reverse probes below use).
-fn whole_object_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
-    let head = interned_atom(atoms, "$1");
-    let body = proper_list(heap, &[interned_atom(atoms, "$1")]);
-    let clause = heap.tuple(&[head, NIL, body]).unwrap();
-    let spec = proper_list(heap, &[clause]);
-    compile(spec, atoms).expect("the quoted spec compiles")
-}
-
-/// `[{{'$1','_'}, [], ['$1']}]` — bind the key and return it (one small integer
-/// per object), the spec the live-oracle cross-check below uses.
-fn key_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
-    let head = heap
-        .tuple(&[interned_atom(atoms, "$1"), interned_atom(atoms, "_")])
-        .unwrap();
-    let body = proper_list(heap, &[interned_atom(atoms, "$1")]);
-    let clause = heap.tuple(&[head, NIL, body]).unwrap();
-    let spec = proper_list(heap, &[clause]);
-    compile(spec, atoms).expect("the quoted spec compiles")
-}
-
 /// `ets:select_reverse/2` walks an `ordered_set` in **descending** numeric key
 /// order.
 ///
@@ -457,13 +430,258 @@ fn select_reverse_agrees_with_the_live_oracle_across_kinds() {
     }
 }
 
-/// Parse `name -> rendering` lines into pairs, tolerating leading/trailing noise.
-fn parse_lines(stdout: &str) -> BTreeMap<String, String> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let (name, rendered) = line.trim().split_once(" -> ")?;
-            Some((name.trim().to_string(), rendered.trim().to_string()))
-        })
-        .collect()
+// ---------------------------------------------------------------------------
+// `select_delete`/`match_delete`/`select_count` — which objects go, and the
+// return count
+// ---------------------------------------------------------------------------
+
+/// The four kinds, in the delete battery's order.
+const KINDS: [TableKind; 4] = [
+    TableKind::Set,
+    TableKind::OrderedSet,
+    TableKind::Bag,
+    TableKind::DuplicateBag,
+];
+
+/// `[{{'$1','_'}, [{'>','$1',1},{'<','$1',5}], [true]}]` — a literal-`true` body
+/// whose guard keeps only the keys `2,3,4`.
+fn guarded_true_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
+    let head = heap
+        .tuple(&[
+            interned_atom(atoms, "$1"),
+            interned_atom(atoms, "_"),
+        ])
+        .unwrap();
+    let gt = heap
+        .tuple(&[
+            interned_atom(atoms, ">"),
+            interned_atom(atoms, "$1"),
+            make_small(1),
+        ])
+        .unwrap();
+    let lt = heap
+        .tuple(&[
+            interned_atom(atoms, "<"),
+            interned_atom(atoms, "$1"),
+            make_small(5),
+        ])
+        .unwrap();
+    let guards = proper_list(heap, &[gt, lt]);
+    let body = proper_list(heap, &[interned_atom(atoms, "true")]);
+    let clause = heap.tuple(&[head, guards, body]).unwrap();
+    compile(proper_list(heap, &[clause]), atoms).expect("the guarded spec compiles")
+}
+
+/// `[{{'$1','$2'}, [], [true]}]` — a literal-`true` body over every 2-tuple object.
+fn all_true_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
+    let head = heap
+        .tuple(&[
+            interned_atom(atoms, "$1"),
+            interned_atom(atoms, "$2"),
+        ])
+        .unwrap();
+    let body = proper_list(heap, &[interned_atom(atoms, "true")]);
+    let clause = heap.tuple(&[head, NIL, body]).unwrap();
+    compile(proper_list(heap, &[clause]), atoms).expect("the all-true spec compiles")
+}
+
+/// The delete/return-value facts of one kind.
+///
+/// On `{1,10}..{5,50}`: `select_count` and `select_delete` over the guard
+/// `1 < key < 5` agree (3 objects, keys 2/3/4 removed, leaving `[1,5]`); a
+/// `match_delete({5, '_'})` removes the one object keyed by 5 and reports **1** —
+/// the crate returns the deleted count where the BIF returns `true` (see
+/// [`DELETE_ORACLE_RETURN`]); and a fresh table holding three same-key objects
+/// (`{1,10}/{1,20}/{1,30}`) reports the per-kind object count, deletes them all and
+/// empties — proving the count is objects, never keys.
+fn delete_facts(kind: TableKind) -> BTreeMap<String, String> {
+    let mut atoms = AtomTable::new();
+    let mut heap = Heap::new(2048);
+    let name = kind.as_atom_name();
+    let mut facts = BTreeMap::new();
+
+    let mut table = new_table(kind);
+    for object in objects_1_to_5(&mut heap) {
+        table.insert(object, &atoms).unwrap();
+    }
+
+    let guarded = guarded_true_spec(&mut heap, &mut atoms);
+    let count = table.select_count(&guarded, &atoms, &mut out_heap()).unwrap();
+    let deleted = table.select_delete(&guarded, &atoms, &mut out_heap()).unwrap();
+    facts.insert(format!("{name}.select_count"), count.to_string());
+    facts.insert(format!("{name}.select_delete"), deleted.to_string());
+    facts.insert(
+        format!("{name}.after_select_delete"),
+        render_ints(&sorted_keys(&table)),
+    );
+
+    let pattern = heap
+        .tuple(&[make_small(5), interned_atom(&mut atoms, "_")])
+        .unwrap();
+    let matched = table.match_delete(pattern, &atoms, &mut out_heap()).unwrap();
+    facts.insert(format!("{name}.match_delete_count"), matched.to_string());
+    facts.insert(
+        format!("{name}.after_match_delete"),
+        render_ints(&sorted_keys(&table)),
+    );
+
+    // Size counts *objects*: three inserts sharing one key.
+    let mut multi = new_table(kind);
+    for value in [10i64, 20, 30] {
+        multi.insert(object(&mut heap, 1, value), &atoms).unwrap();
+    }
+    let all = all_true_spec(&mut heap, &mut atoms);
+    facts.insert(format!("{name}.objs.size"), multi.size().to_string());
+    let removed = multi.select_delete(&all, &atoms, &mut out_heap()).unwrap();
+    facts.insert(format!("{name}.objs.select_delete_all"), removed.to_string());
+    facts.insert(
+        format!("{name}.objs.size_after"),
+        multi.size().to_string(),
+    );
+    facts
+}
+
+/// Every delete fact the crate produces — the figures printed by the system `erl`
+/// (OTP 29.1.1 / erts-17.1) for the identical script.
+fn all_delete_facts() -> BTreeMap<String, String> {
+    let mut facts = BTreeMap::new();
+    for kind in KINDS {
+        facts.extend(delete_facts(kind));
+    }
+    facts
+}
+
+/// The delete facts the crate and the oracle share. (`match_delete/2`'s *return
+/// value* is not one: the crate returns the deleted count, the BIF returns `true` —
+/// see [`DELETE_ORACLE_RETURN`].)
+#[rustfmt::skip]
+const DELETE_EXPECTED: &[(&str, &str)] = &[
+    ("set.select_count", "3"), ("set.select_delete", "3"), ("set.after_select_delete", "[1,5]"),
+    ("set.match_delete_count", "1"), ("set.after_match_delete", "[1]"),
+    ("set.objs.size", "1"), ("set.objs.select_delete_all", "1"), ("set.objs.size_after", "0"),
+    ("ordered_set.select_count", "3"), ("ordered_set.select_delete", "3"), ("ordered_set.after_select_delete", "[1,5]"),
+    ("ordered_set.match_delete_count", "1"), ("ordered_set.after_match_delete", "[1]"),
+    ("ordered_set.objs.size", "1"), ("ordered_set.objs.select_delete_all", "1"), ("ordered_set.objs.size_after", "0"),
+    ("bag.select_count", "3"), ("bag.select_delete", "3"), ("bag.after_select_delete", "[1,5]"),
+    ("bag.match_delete_count", "1"), ("bag.after_match_delete", "[1]"),
+    ("bag.objs.size", "3"), ("bag.objs.select_delete_all", "3"), ("bag.objs.size_after", "0"),
+    ("duplicate_bag.select_count", "3"), ("duplicate_bag.select_delete", "3"), ("duplicate_bag.after_select_delete", "[1,5]"),
+    ("duplicate_bag.match_delete_count", "1"), ("duplicate_bag.after_match_delete", "[1]"),
+    ("duplicate_bag.objs.size", "3"), ("duplicate_bag.objs.select_delete_all", "3"), ("duplicate_bag.objs.size_after", "0"),
+];
+
+/// The oracle-only facts: the atom `ets:match_delete/2` returns for every kind
+/// (`true`). The crate's `Table::match_delete` returns the deleted **count**
+/// instead, so this is deliberately **not** a shared fact — it is checked only
+/// against the live oracle.
+#[rustfmt::skip]
+const DELETE_ORACLE_RETURN: &[(&str, &str)] = &[
+    ("set.match_delete_ret", "true"),
+    ("ordered_set.match_delete_ret", "true"),
+    ("bag.match_delete_ret", "true"),
+    ("duplicate_bag.match_delete_ret", "true"),
+];
+
+/// The crate's delete rules, pinned to the recorded oracle figures (no oracle
+/// needed).
+#[test]
+fn select_delete_and_select_count_match_the_recorded_oracle_figures() {
+    let facts = all_delete_facts();
+    for (key, want) in DELETE_EXPECTED {
+        assert_eq!(facts.get(*key).map(String::as_str), Some(*want), "fact `{key}`");
+    }
+    assert_eq!(
+        facts.len(),
+        DELETE_EXPECTED.len(),
+        "the battery produced a different number of facts than recorded"
+    );
+}
+
+/// The oracle program of the delete battery (see [`DELETE_EXPECTED`] and
+/// [`DELETE_ORACLE_RETURN`]).
+const DELETE_ORACLE_PROGRAM: &str = r#"#!/usr/bin/env escript
+main(_) ->
+    P = fun(K, V) -> io:format("~s -> ~p~n", [K, V]) end,
+    Objs = [{N, N * 10} || N <- lists:seq(1, 5)],
+    Guard = [{{'$1','_'}, [{'>','$1',1},{'<','$1',5}], [true]}],
+    AllTrue = [{{'$1','$2'}, [], [true]}],
+    F = fun(Kind) ->
+        KS = atom_to_list(Kind),
+        T = ets:new(del, [Kind]),
+        [ets:insert(T, O) || O <- Objs],
+        P(KS ++ ".select_count", ets:select_count(T, Guard)),
+        P(KS ++ ".select_delete", ets:select_delete(T, Guard)),
+        P(KS ++ ".after_select_delete", lists:sort([K || {K,_} <- ets:tab2list(T)])),
+        P(KS ++ ".match_delete_count", length(ets:match_object(T, {5,'_'}))),
+        P(KS ++ ".match_delete_ret", ets:match_delete(T, {5,'_'})),
+        P(KS ++ ".after_match_delete", lists:sort([K || {K,_} <- ets:tab2list(T)])),
+        ets:delete(T),
+        M = ets:new(del2, [Kind]),
+        [ets:insert(M, {1, V}) || V <- [10,20,30]],
+        P(KS ++ ".objs.size", ets:info(M, size)),
+        P(KS ++ ".objs.select_delete_all", ets:select_delete(M, AllTrue)),
+        P(KS ++ ".objs.size_after", ets:info(M, size)),
+        ets:delete(M)
+    end,
+    [F(K) || K <- [set, ordered_set, bag, duplicate_bag]],
+    ok.
+"#;
+
+/// The live cross-check of the delete battery: the system `erl` runs the identical
+/// script and both sides must reproduce every recorded figure — including the
+/// `ets:match_delete/2` **return** (`true`, [`DELETE_ORACLE_RETURN`]) the crate's
+/// count-returning API deliberately does not produce.
+///
+/// Skips loudly when no Erlang is installed; `BEAM_ETS_REQUIRE_ORACLE=1` turns the
+/// skip into a failure.
+#[test]
+fn select_delete_and_select_count_agree_with_the_live_oracle() {
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "select_delete_and_select_count_agree_with_the_live_oracle",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable escript on $PATH)",
+        );
+        return;
+    };
+    let output = oracle::run_escript(
+        &escript,
+        DELETE_ORACLE_PROGRAM,
+        &[],
+        "order_delete",
+        Duration::from_secs(60),
+    );
+    let live = parse_lines(&String::from_utf8_lossy(&output.stdout));
+    let facts = all_delete_facts();
+
+    for (key, want) in DELETE_EXPECTED {
+        assert_eq!(
+            live.get(*key).map(String::as_str),
+            Some(*want),
+            "the oracle disagrees with the recorded figure for `{key}`"
+        );
+        assert_eq!(
+            facts.get(*key).map(String::as_str),
+            Some(*want),
+            "the crate disagrees with the recorded figure for `{key}`"
+        );
+    }
+    // The oracle's own `ets:match_delete/2` return is the atom `true`.
+    for (key, want) in DELETE_ORACLE_RETURN {
+        assert_eq!(
+            live.get(*key).map(String::as_str),
+            Some(*want),
+            "the oracle's `ets:match_delete/2` return for `{key}`"
+        );
+    }
+    assert_eq!(
+        live.len(),
+        DELETE_EXPECTED.len() + DELETE_ORACLE_RETURN.len(),
+        "the oracle printed a different number of facts than recorded:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    println!(
+        "[ets] delete family: {} shared + {} oracle-only facts agree with the live oracle",
+        DELETE_EXPECTED.len(),
+        DELETE_ORACLE_RETURN.len()
+    );
 }

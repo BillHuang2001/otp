@@ -168,6 +168,20 @@ impl Table {
         self.store.words() + self.interior.memory()
     }
 
+    /// Whether the table was created as a `named_table` (the oracle's
+    /// `ets:info(Tab, named_table)`).
+    ///
+    /// This is not merely introspection: it determines a continuation's identity.
+    /// The oracle's `ets:select/3` family stores the **name atom** in the
+    /// continuation of a `named_table` (and a runtime table id for every other
+    /// table), so a `named_table`'s previously-issued continuations become
+    /// unresolvable — `error:badarg` — once the table is renamed, while an unnamed
+    /// table's survive a rename. [`Table::select_limit`](Table::select_limit) and
+    /// its siblings read this flag to reproduce that rule.
+    pub fn is_named_table(&self) -> bool {
+        self.opts.is_named()
+    }
+
     // --------------------------------------------------------------- navigation
 
     /// The first key in the table's iteration order (`ets:first/1`); `None` is the

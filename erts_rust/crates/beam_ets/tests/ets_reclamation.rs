@@ -58,6 +58,23 @@ fn ordered_table(interior: OrderedInterior) -> Table {
         .expect("a fresh table is constructible")
 }
 
+/// A table of `kind` with an explicit `keypos` — the shape that exercises the
+/// keypos-aware re-anchor (`HashInterior::with_keypos`).
+fn keypos_table(kind: TableKind, keypos: usize) -> Table {
+    let mut opts = TableOptions::new();
+    opts.set_kind(kind);
+    opts.set_keypos(keypos).expect("a keypos >= 1");
+    Table::new(TableId::next(), opts).expect("a fresh table is constructible")
+}
+
+/// Every multi-object kind, with a display name.
+fn multi_kinds() -> [(&'static str, TableKind); 2] {
+    [
+        ("bag", TableKind::Bag),
+        ("duplicate_bag", TableKind::DuplicateBag),
+    ]
+}
+
 /// A table builder under stress: a display name and a way to make a fresh table.
 type Shape = (&'static str, fn() -> Table);
 
@@ -139,37 +156,253 @@ fn set_upsert_keeps_the_key_anchor_alive_for_every_interior() {
     }
 }
 
-/// The `bag` variant: `delete_object` removes the object whose storage the
-/// entry's key aliased while the entry survives on its other objects.
+/// The multi-kind variant: `delete_object/2` removes the object whose storage the
+/// entry's key aliased while the entry survives on its other objects, so the
+/// surviving entry must be re-anchored to a live object's own key element — the
+/// keypos-aware `HashInterior::with_keypos` path.
+///
+/// Both multi kinds are driven, and both argument shapes the oracle accepts:
+/// the **stored object itself** (the original anchor argument) and a separately
+/// built **structurally-equal copy** that is not the stored term. Memory
+/// accounting is asserted around the removal (the removed object's storage is
+/// reclaimed; the survivor's is not).
 #[test]
-fn bag_delete_object_keeps_the_key_anchor_alive() {
-    let atoms = AtomTable::new();
-    let mut heap = Heap::new(256);
-    let mut t = table(TableKind::Bag);
+fn multi_kind_delete_object_keeps_the_key_anchor_alive() {
+    for (shape, kind) in multi_kinds() {
+        // (a) the argument is the *stored* object (the anchor).
+        {
+            let atoms = AtomTable::new();
+            let mut heap = Heap::new(256);
+            let mut t = table(kind);
 
-    let key = int_tuple(&mut heap, &[7]);
-    let a = tuple_of(&mut heap, &[key, make_small(10)]);
-    let b = tuple_of(&mut heap, &[key, make_small(20)]);
-    t.insert(a, &atoms).unwrap();
-    t.insert(b, &atoms).unwrap();
-    assert_eq!(t.size(), 2);
+            let key = int_tuple(&mut heap, &[7]);
+            let a = tuple_of(&mut heap, &[key, make_small(10)]);
+            let b = tuple_of(&mut heap, &[key, make_small(20)]);
+            t.insert(a, &atoms).unwrap();
+            t.insert(b, &atoms).unwrap();
+            assert_eq!(t.size(), 2, "{shape}");
 
-    // Remove the *first* object, which is the one the entry's key anchors to; the
-    // entry survives on `b`.
-    t.delete_object(a, &atoms).unwrap();
-    assert_eq!(t.size(), 1);
+            let loaded = t.memory();
+            // Remove the *first* object, which is the one the entry's key anchors
+            // to; the entry survives on `b`.
+            t.delete_object(a, &atoms).unwrap();
+            assert_eq!(t.size(), 1, "{shape}");
+            assert!(
+                t.memory() < loaded,
+                "{shape}: the removed object's storage was not reclaimed"
+            );
 
-    // Reuse the freed runs with same-shaped objects under fresh keys.
-    for k in 8..12i64 {
-        let other = int_tuple(&mut heap, &[k]);
-        t.insert(tuple_of(&mut heap, &[other, make_small(k)]), &atoms)
-            .unwrap();
+            // Reuse the freed runs with same-shaped objects under fresh keys.
+            for k in 8..12i64 {
+                let other = int_tuple(&mut heap, &[k]);
+                t.insert(tuple_of(&mut heap, &[other, make_small(k)]), &atoms)
+                    .unwrap();
+            }
+
+            let looked = t.lookup(key, &atoms);
+            assert_eq!(
+                looked.len(),
+                1,
+                "{shape}: the surviving entry lost its key anchor"
+            );
+            assert!(eq(looked[0], b, &atoms), "{shape}");
+            assert!(t.member(key, &atoms), "{shape}");
+        }
+
+        // (b) the argument is a separately built **equal copy**, never the stored
+        // term — the shape a caller who re-builds the tuple produces.
+        {
+            let atoms = AtomTable::new();
+            let mut heap = Heap::new(256);
+            let mut t = table(kind);
+
+            let key = int_tuple(&mut heap, &[7]);
+            let a = tuple_of(&mut heap, &[key, make_small(10)]);
+            let b = tuple_of(&mut heap, &[key, make_small(20)]);
+            t.insert(a, &atoms).unwrap();
+            t.insert(b, &atoms).unwrap();
+
+            let copy = tuple_of(&mut heap, &[key, make_small(10)]);
+            assert!(
+                eq(copy, a, &atoms) && copy.raw() != a.raw(),
+                "{shape}: the argument must be an equal but distinct term"
+            );
+            t.delete_object(copy, &atoms).unwrap();
+            assert_eq!(t.size(), 1, "{shape}: the equal copy removed nothing");
+
+            for k in 8..12i64 {
+                let other = int_tuple(&mut heap, &[k]);
+                t.insert(tuple_of(&mut heap, &[other, make_small(k)]), &atoms)
+                    .unwrap();
+            }
+
+            let looked = t.lookup(key, &atoms);
+            assert_eq!(
+                looked.len(),
+                1,
+                "{shape}: the copy-deleted entry lost its key anchor"
+            );
+            assert!(eq(looked[0], b, &atoms), "{shape}");
+            assert!(t.member(key, &atoms), "{shape}");
+        }
+
+        // (c) a `duplicate_bag` holding two *identical* objects: removing them by
+        // an equal copy leaves the third object's entry, re-anchored to it.
+        {
+            let atoms = AtomTable::new();
+            let mut heap = Heap::new(256);
+            let mut t = table(kind);
+
+            let key = int_tuple(&mut heap, &[7]);
+            let a1 = tuple_of(&mut heap, &[key, make_small(10)]);
+            let a2 = tuple_of(&mut heap, &[key, make_small(10)]);
+            let b = tuple_of(&mut heap, &[key, make_small(20)]);
+            t.insert(a1, &atoms).unwrap();
+            t.insert(a2, &atoms).unwrap();
+            t.insert(b, &atoms).unwrap();
+            // A `bag` keeps one `{7,10}`; a `duplicate_bag` keeps both.
+            let expected = if kind == TableKind::Bag { 2 } else { 3 };
+            assert_eq!(t.size(), expected, "{shape}");
+
+            let copy = tuple_of(&mut heap, &[key, make_small(10)]);
+            t.delete_object(copy, &atoms).unwrap();
+            assert_eq!(t.size(), 1, "{shape}: every equal object must go");
+
+            for k in 8..12i64 {
+                let other = int_tuple(&mut heap, &[k]);
+                t.insert(tuple_of(&mut heap, &[other, make_small(k)]), &atoms)
+                    .unwrap();
+            }
+
+            let looked = t.lookup(key, &atoms);
+            assert_eq!(
+                looked.len(),
+                1,
+                "{shape}: the entry surviving the duplicate purge lost its anchor"
+            );
+            assert!(eq(looked[0], b, &atoms), "{shape}");
+            assert!(t.member(key, &atoms), "{shape}");
+        }
     }
+}
 
-    let looked = t.lookup(key, &atoms);
-    assert_eq!(looked.len(), 1, "the surviving bag entry lost its key anchor");
-    assert!(eq(looked[0], b, &atoms));
-    assert!(t.member(key, &atoms));
+/// The same re-anchor on a `{keypos, 2}` multi-kind table: the surviving entry's
+/// key must be re-derived from **element 2** (the `HashInterior::with_keypos`
+/// path). Element 1 of the survivor is a deliberately different term, so a
+/// re-anchor that used position 1 (or none at all) would make `lookup/2` miss the
+/// entry after the freed words are reused.
+#[test]
+fn multi_kind_delete_object_reanchors_with_a_custom_keypos() {
+    for (shape, kind) in multi_kinds() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(512);
+        let mut t = keypos_table(kind, 2);
+
+        // `{Tag, Key}` objects; the key (element 2) is boxed, so the entry's stored
+        // key term aliases table-owned storage.
+        let key = int_tuple(&mut heap, &[7]);
+        let a = tuple_of(&mut heap, &[make_small(1), key]);
+        let b = tuple_of(&mut heap, &[make_small(2), key]);
+        t.insert(a, &atoms).unwrap();
+        t.insert(b, &atoms).unwrap();
+        assert_eq!(t.size(), 2, "{shape}");
+
+        let loaded = t.memory();
+        t.delete_object(a, &atoms).unwrap();
+        assert_eq!(t.size(), 1, "{shape}");
+        assert!(
+            t.memory() < loaded,
+            "{shape}: the removed object's storage was not reclaimed"
+        );
+
+        // Same-shaped objects under fresh keys (element 1 is the tag, element 2 the
+        // key), so the freed runs are reused by a later insert.
+        for k in 8..12i64 {
+            let other = int_tuple(&mut heap, &[k]);
+            t.insert(tuple_of(&mut heap, &[make_small(k), other]), &atoms)
+                .unwrap();
+        }
+
+        let looked = t.lookup(key, &atoms);
+        assert_eq!(
+            looked.len(),
+            1,
+            "{shape}: the re-anchor used the wrong keypos (or none)"
+        );
+        assert!(eq(looked[0], b, &atoms), "{shape}");
+        assert!(t.member(key, &atoms), "{shape}");
+    }
+}
+
+/// `delete_object/2` accepts a structurally-equal **copy** (never the stored term)
+/// for every kind and interior shape, and reclaims the removed object's storage.
+/// Afterwards the freed key's runs are reused and the key must resolve to the
+/// freshly inserted object — a stale entry (or a lost anchor) would show up here.
+#[test]
+fn delete_object_copy_removes_the_object_for_every_shape() {
+    for (shape, make) in all_shapes() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(512);
+        let mut t = make();
+
+        let key = int_tuple(&mut heap, &[7]);
+        let a = tuple_of(&mut heap, &[key, make_small(10)]);
+        t.insert(a, &atoms).unwrap();
+        assert_eq!(t.size(), 1, "{shape}");
+        let loaded = t.memory();
+
+        let copy = tuple_of(&mut heap, &[key, make_small(10)]);
+        assert!(
+            eq(copy, a, &atoms) && copy.raw() != a.raw(),
+            "{shape}: the argument must be an equal but distinct term"
+        );
+        t.delete_object(copy, &atoms).unwrap();
+        assert_eq!(t.size(), 0, "{shape}: the equal copy removed nothing");
+        assert!(t.memory() < loaded, "{shape}: storage was not reclaimed");
+        assert!(t.lookup(key, &atoms).is_empty(), "{shape}: the entry survived");
+
+        // Reuse the freed runs, then re-insert the key and confirm the fresh object.
+        let other = int_tuple(&mut heap, &[8]);
+        t.insert(tuple_of(&mut heap, &[other, make_small(30)]), &atoms)
+            .unwrap();
+        let b = tuple_of(&mut heap, &[key, make_small(20)]);
+        t.insert(b, &atoms).unwrap();
+        let looked = t.lookup(key, &atoms);
+        assert_eq!(looked.len(), 1, "{shape}");
+        assert!(eq(looked[0], b, &atoms), "{shape}");
+    }
+}
+
+/// A `{keypos, 2}` `delete_object/2` on the **non-anchor copy**: the key is
+/// derived from element 2 of the caller's copy (never element 1), and the purge
+/// still finds and re-anchors the surviving entry.
+#[test]
+fn multi_kind_delete_object_copy_with_a_custom_keypos() {
+    for (shape, kind) in multi_kinds() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(512);
+        let mut t = keypos_table(kind, 2);
+
+        let key = int_tuple(&mut heap, &[7]);
+        let a = tuple_of(&mut heap, &[make_small(1), key]);
+        let b = tuple_of(&mut heap, &[make_small(2), key]);
+        t.insert(a, &atoms).unwrap();
+        t.insert(b, &atoms).unwrap();
+
+        let copy = tuple_of(&mut heap, &[make_small(1), key]);
+        t.delete_object(copy, &atoms).unwrap();
+        assert_eq!(t.size(), 1, "{shape}: the copy removed nothing");
+
+        for k in 8..12i64 {
+            let other = int_tuple(&mut heap, &[k]);
+            t.insert(tuple_of(&mut heap, &[make_small(k), other]), &atoms)
+                .unwrap();
+        }
+
+        let looked = t.lookup(key, &atoms);
+        assert_eq!(looked.len(), 1, "{shape}: the copy-deleted entry lost its key");
+        assert!(eq(looked[0], b, &atoms), "{shape}");
+    }
 }
 
 /// The `ordered_set` B+-tree variant of the same defect, on its **internal
@@ -351,6 +584,154 @@ fn balanced_churn_returns_to_a_stable_floor_for_every_shape() {
         for &key in &keys {
             assert!(t.member(key, &atoms), "{shape}: a key was lost to the churn");
         }
+    }
+}
+
+/// A `delete_object/2`-driven churn across the multi kinds: every round removes
+/// each stored object by its exact value — which re-anchors the surviving entry on
+/// every key — then reuses the freed runs under fresh keys, and the observable
+/// memory returns to a stable floor, three cycles landing on exactly the same
+/// figure.
+#[test]
+fn delete_object_churn_returns_to_a_stable_floor_for_the_multi_kinds() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(1 << 18);
+    let keys: Vec<Eterm> = (0..KEYS as i64).map(|i| churn_key(&mut heap, i)).collect();
+    let per_key: Vec<Vec<Eterm>> = keys
+        .iter()
+        .enumerate()
+        .map(|(n, &key)| {
+            // Two distinct objects under the same boxed key.
+            (0..2i64)
+                .map(|variant| churn_object(&mut heap, key, n as i64, variant))
+                .collect()
+        })
+        .collect();
+
+    for (shape, kind) in multi_kinds() {
+        let mut t = table(kind);
+        let empty = t.memory();
+        let mut floors = Vec::new();
+        for cycle in 0..3 {
+            for objects in &per_key {
+                for &object in objects {
+                    t.insert(object, &atoms).unwrap();
+                }
+            }
+            assert_eq!(t.size(), 2 * KEYS, "{shape} cycle {cycle}: size after insert");
+
+            // Remove only the first variant of each key, so every entry keeps a
+            // survivor and its key has to be re-anchored to it.
+            for objects in &per_key {
+                t.delete_object(objects[0], &atoms).unwrap();
+            }
+            assert_eq!(t.size(), KEYS, "{shape} cycle {cycle}: size after delete_object");
+
+            // Reuse the freed runs with same-shaped objects under fresh keys, then
+            // confirm each original entry still resolves to its survivor.
+            for n in KEYS..KEYS + 16 {
+                let key = churn_key(&mut heap, n as i64);
+                t.insert(churn_object(&mut heap, key, n as i64, 0), &atoms)
+                    .unwrap();
+            }
+            for (n, objects) in per_key.iter().enumerate() {
+                let key = keys[n];
+                let looked = t.lookup(key, &atoms);
+                assert_eq!(
+                    looked.len(),
+                    1,
+                    "{shape} cycle {cycle}: key {n} lost its anchor"
+                );
+                assert!(
+                    eq(looked[0], objects[1], &atoms),
+                    "{shape} cycle {cycle}: key {n} kept the removed object"
+                );
+            }
+            for n in KEYS..KEYS + 16 {
+                t.delete(churn_key(&mut heap, n as i64), &atoms).unwrap();
+            }
+            for objects in &per_key {
+                t.delete_object(objects[1], &atoms).unwrap();
+            }
+            assert_eq!(t.size(), 0, "{shape} cycle {cycle}: size after purge");
+            let floor = t.memory();
+            assert!(floor >= empty, "{shape} cycle {cycle}: floor below empty");
+            floors.push(floor);
+        }
+        assert_eq!(floors[0], floors[1], "{shape}: the memory floor moved ({floors:?})");
+        assert_eq!(floors[1], floors[2], "{shape}: the memory floor moved ({floors:?})");
+    }
+}
+
+/// The `{keypos, 2}` `delete_object/2` churn: each key has two objects sharing the
+/// key element (element 2) and differing in the tag (element 1), so every
+/// `delete_object/2` leaves a survivor whose entry must be re-anchored **from
+/// element 2** — the `HashInterior::with_keypos` path — while the freed runs are
+/// reused by later same-shaped inserts.
+#[test]
+fn delete_object_churn_reanchors_for_a_custom_keypos() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(1 << 18);
+    let keys: Vec<Eterm> = (0..KEYS as i64).map(|i| churn_key(&mut heap, i)).collect();
+    // `{Tag, Key}` with the boxed key at element 2 (tag 0 and tag 1 under each key).
+    let per_key: Vec<Vec<Eterm>> = keys
+        .iter()
+        .map(|&key| {
+            (0..2i64)
+                .map(|tag| tuple_of(&mut heap, &[make_small(tag), key]))
+                .collect()
+        })
+        .collect();
+
+    for (shape, kind) in multi_kinds() {
+        let mut t = keypos_table(kind, 2);
+        let empty = t.memory();
+        let mut floors = Vec::new();
+        for cycle in 0..3 {
+            for objects in &per_key {
+                for &object in objects {
+                    t.insert(object, &atoms).unwrap();
+                }
+            }
+            assert_eq!(t.size(), 2 * KEYS, "{shape} cycle {cycle}: size after insert");
+
+            for objects in &per_key {
+                t.delete_object(objects[0], &atoms).unwrap();
+            }
+            assert_eq!(t.size(), KEYS, "{shape} cycle {cycle}: size after delete_object");
+
+            // Reuse the freed (tag-0) runs under fresh keys, then confirm every
+            // original key still resolves to its tag-1 survivor.
+            for n in KEYS..KEYS + 16 {
+                let key = churn_key(&mut heap, n as i64);
+                t.insert(tuple_of(&mut heap, &[make_small(0), key]), &atoms)
+                    .unwrap();
+            }
+            for (n, objects) in per_key.iter().enumerate() {
+                let looked = t.lookup(keys[n], &atoms);
+                assert_eq!(
+                    looked.len(),
+                    1,
+                    "{shape} cycle {cycle}: key {n} lost its anchor"
+                );
+                assert!(
+                    eq(looked[0], objects[1], &atoms),
+                    "{shape} cycle {cycle}: the re-anchor used the wrong keypos"
+                );
+            }
+            for n in KEYS..KEYS + 16 {
+                t.delete(churn_key(&mut heap, n as i64), &atoms).unwrap();
+            }
+            for objects in &per_key {
+                t.delete_object(objects[1], &atoms).unwrap();
+            }
+            assert_eq!(t.size(), 0, "{shape} cycle {cycle}: size after purge");
+            let floor = t.memory();
+            assert!(floor >= empty, "{shape} cycle {cycle}: floor below empty");
+            floors.push(floor);
+        }
+        assert_eq!(floors[0], floors[1], "{shape}: the memory floor moved ({floors:?})");
+        assert_eq!(floors[1], floors[2], "{shape}: the memory floor moved ({floors:?})");
     }
 }
 

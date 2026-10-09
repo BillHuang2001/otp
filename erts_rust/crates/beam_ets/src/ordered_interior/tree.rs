@@ -75,6 +75,43 @@ pub(crate) struct Tree {
     store: NodeStore,
 }
 
+/// What one recursive insert step did to its subtree — exactly the information the
+/// caller (whose node is the parent of that subtree) needs to keep the separator
+/// invariant (see the module docs) satisfied *without* descending back into it.
+///
+/// The separator a branch stores for a child is the child subtree's maximum, and it
+/// has to alias a **live** table-owned term (see [`NodeStore::subtree_max_key`]). An
+/// insert may therefore have to rewrite that separator — but only when the subtree's
+/// maximum actually moved. This type carries the new maximum up when it did, so the
+/// unwind no longer has to re-derive every separator from scratch.
+enum InsertStep {
+    /// The key was already present and the caller asked for `insert_new`: the
+    /// subtree is exactly as it was, so nothing above it changed either.
+    Refused,
+    /// The subtree was mutated but did not split. `added` reports whether a new key
+    /// appeared. `new_max` is `Some(term)` exactly when the subtree's maximum no
+    /// longer is the live term the parent's stored separator holds — `term` is the
+    /// new maximum, aliasing the live stored entry that carries it. `None` means the
+    /// stored separator still *is* the subtree's (live) maximum.
+    Grown {
+        /// Whether a new key was added (as opposed to an existing one replaced).
+        added: bool,
+        /// The subtree's new maximum, when the parent must rewrite its separator.
+        new_max: Option<Eterm>,
+    },
+    /// The subtree was mutated and split in two: the parent adopts `right` — whose
+    /// maximum is `right_max` — directly behind its child and rewrites that child's
+    /// separator (the left half's maximum).
+    Split {
+        /// Whether a new key was added (as opposed to an existing one replaced).
+        added: bool,
+        /// The split-off right half.
+        right: NodeId,
+        /// The right half's maximum key.
+        right_max: Eterm,
+    },
+}
+
 impl Tree {
     /// A new, empty tree: a single empty root leaf (invariant 3's empty case).
     pub(crate) fn new() -> Tree {
@@ -211,24 +248,59 @@ impl Tree {
     /// Insert `object` under `key`, replacing the object when `key` already
     /// exists. Returns whether a *new* key was added.
     pub(crate) fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> bool {
-        let (inserted, split) = self.insert_rec(self.root, key, object, atoms);
-        if let Some((right_max, right)) = split {
-            self.split_root(right, right_max);
+        match self.insert_rec(self.root, key, object, atoms, false) {
+            InsertStep::Grown { added, .. } => {
+                if added {
+                    self.len += 1;
+                }
+                added
+            }
+            InsertStep::Split {
+                added,
+                right,
+                right_max,
+            } => {
+                self.split_root(right, right_max);
+                if added {
+                    self.len += 1;
+                }
+                added
+            }
+            // Only `insert_new` sets the refuse flag, and `insert` never does.
+            InsertStep::Refused => {
+                debug_assert!(false, "an upsert never refuses an existing key");
+                false
+            }
         }
-        if inserted {
-            self.len += 1;
-        }
-        inserted
     }
 
     /// Insert `object` under `key` only if `key` is absent; returns whether the
     /// key was added.
+    ///
+    /// One descent: the leaf that would hold `key` reports a hit as
+    /// [`InsertStep::Refused`], so the presence test costs the caller nothing beyond
+    /// the insertion descent it was going to make anyway.
     pub(crate) fn insert_new(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> bool {
-        if self.find(key, atoms).is_some() {
-            return false;
+        match self.insert_rec(self.root, key, object, atoms, true) {
+            InsertStep::Refused => false,
+            InsertStep::Grown { added, .. } => {
+                if added {
+                    self.len += 1;
+                }
+                added
+            }
+            InsertStep::Split {
+                added,
+                right,
+                right_max,
+            } => {
+                self.split_root(right, right_max);
+                if added {
+                    self.len += 1;
+                }
+                added
+            }
         }
-        self.insert(key, object, atoms);
-        true
     }
 
     /// Remove `key` (and its object); returns whether the key was present.
@@ -250,21 +322,25 @@ impl Tree {
         }
     }
 
-    /// Descend to the leaf `key` would live in, inserting/replacing along the way.
+    /// Descend to the leaf `key` would live in, inserting/replacing along the way,
+    /// and report what changed on the way back up ([`InsertStep`]).
     ///
-    /// Returns whether a new key was added and, when this node overflowed and was
-    /// split, the split-off right node together with its maximum key (the caller
-    /// adopts it into the parent).
+    /// `refuse_existing` is `insert_new`'s mode: a leaf that already holds `key`
+    /// stops the descent with [`InsertStep::Refused`] and mutates nothing.
     fn insert_rec(
         &mut self,
         id: NodeId,
         key: Eterm,
         object: Eterm,
         atoms: &AtomTable,
-    ) -> (bool, Option<(Eterm, NodeId)>) {
+        refuse_existing: bool,
+    ) -> InsertStep {
         if self.store.node(id).is_leaf() {
             let (pos, found) = search_entries(&self.store.leaf(id).entries, key, atoms);
             if found {
+                if refuse_existing {
+                    return InsertStep::Refused;
+                }
                 // Replace *both* the key term and the object. The stored key may be
                 // arithmetically equal to `key` without being the same term (`1` vs
                 // `1.0`); the oracle's `ordered_set` makes the key follow the stored
@@ -272,50 +348,89 @@ impl Tree {
                 // new term. Replacing it is invariant-safe: `cmp_arith`-equality with
                 // the old key keeps every ordering/search/separator comparison —
                 // hence the tree's routing — unchanged.
-                let entry = &mut self.store.leaf_mut(id).entries[pos];
+                let leaf = self.store.leaf_mut(id);
+                // A leaf's maximum is its *last* entry, so only replacing that one
+                // moves the subtree maximum the parent's separator holds — and it
+                // moves to the new key term, which aliases the stored entry (a live,
+                // table-owned term) rather than the reclaimed storage of the object
+                // that established the old separator.
+                let is_max = pos + 1 == leaf.entries.len();
+                let entry = &mut leaf.entries[pos];
                 entry.key = key;
                 entry.obj = object;
-                return (false, None);
+                return InsertStep::Grown {
+                    added: false,
+                    new_max: is_max.then_some(key),
+                };
             }
-            self.store
-                .leaf_mut(id)
-                .entries
-                .insert(pos, Entry { key, obj: object });
+            let leaf = self.store.leaf_mut(id);
+            leaf.entries.insert(pos, Entry { key, obj: object });
+            let is_max = pos + 1 == leaf.entries.len();
             if self.store.node(id).is_overfull() {
-                return (true, Some(self.split_overfull(id)));
+                let (right_max, right) = self.split_overfull(id);
+                return InsertStep::Split {
+                    added: true,
+                    right,
+                    right_max,
+                };
             }
-            return (true, None);
+            return InsertStep::Grown {
+                added: true,
+                new_max: is_max.then_some(key),
+            };
         }
 
         // A branch: descend into the child whose subtree can hold `key`.
         let idx = child_index(self.store.branch(id), key, atoms);
         let child = self.store.branch(id).child_at(idx);
-        let (inserted, split) = self.insert_rec(child, key, object, atoms);
-        match split {
-            Some((right_max, right)) => {
-                // The child's maximum may have moved (the split pushed its right
-                // half out), so re-derive the left separator from the child itself.
+        // A branch's own maximum is its *last* child's, so this is what decides
+        // whether the change below has to be reported further up.
+        let is_last_child = idx + 1 == self.store.branch(id).children.len();
+        match self.insert_rec(child, key, object, atoms, refuse_existing) {
+            InsertStep::Refused => InsertStep::Refused,
+            InsertStep::Split {
+                added,
+                right,
+                right_max,
+            } => {
+                // The child split; its right half is adopted behind it. The left
+                // half's maximum — the separator just rewritten — is re-derived from
+                // the child itself: a split is amortized-`O(1)` per insert (one per
+                // `ORDER / 2` inserts), so this descent is not on the hot path.
                 let left_max = self.store.subtree_max_key(child);
                 self.store
                     .branch_mut(id)
                     .adopt_split(idx, left_max, right, right_max);
                 if self.store.node(id).is_overfull() {
-                    return (inserted, Some(self.split_overfull(id)));
+                    let (right_max, right) = self.split_overfull(id);
+                    return InsertStep::Split {
+                        added,
+                        right,
+                        right_max,
+                    };
+                }
+                // The adopted right half is this subtree's last child exactly when
+                // the split child was, so only then did this subtree's maximum move
+                // (and it moved to the right half's maximum — a live term).
+                InsertStep::Grown {
+                    added,
+                    new_max: is_last_child.then_some(right_max),
                 }
             }
-            None => {
-                // Re-derive the separator from the child's subtree on **every**
-                // descent, not only when a new key was added: an upsert replaces the
-                // object that established the child's maximum, and the caller reclaims
-                // that object's storage right after this call returns. A separator
-                // left pointing at it would go stale and misroute the next search.
-                // `subtree_max_key` descends to the rightmost leaf, so the term it
-                // yields always aliases a live table-owned object.
-                let child_max = self.store.subtree_max_key(child);
-                self.store.branch_mut(id).set_separator(idx, child_max);
+            InsertStep::Grown { added, new_max } => {
+                if let Some(new_max) = new_max {
+                    // The descended-into subtree's maximum was rewritten, so the
+                    // separator that points at it must follow — with the live term
+                    // the child handed up. Leaving it alone would keep a term that
+                    // aliases an object the caller may already have reclaimed.
+                    self.store.branch_mut(id).set_separator(idx, new_max);
+                }
+                InsertStep::Grown {
+                    added,
+                    new_max: if is_last_child { new_max } else { None },
+                }
             }
         }
-        (inserted, None)
     }
 
     /// Split an over-full node in half, leaving the left half in place and
@@ -764,6 +879,18 @@ impl Tree {
                         cmp_arith(branch.separator(idx), max, atoms),
                         core::cmp::Ordering::Equal,
                         "separator {idx} is exactly its child's (subtree) maximum"
+                    );
+                    // …and it is the *live term* that carries that maximum, not a
+                    // term that merely compares equal: the recursion handed up the
+                    // rightmost leaf's last entry key, which is the term a separator
+                    // must alias (see `NodeStore::subtree_max_key`). A separator left
+                    // holding the term of an object that has since been replaced
+                    // would dangle once the caller reclaims it — the failure mode
+                    // this pins.
+                    assert_eq!(
+                        branch.separator(idx),
+                        max,
+                        "separator {idx} is the child's live maximum term"
                     );
                     if let Some(previous) = subtree_max {
                         assert_eq!(

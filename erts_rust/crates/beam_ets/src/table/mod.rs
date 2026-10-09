@@ -129,8 +129,22 @@ impl OwnerId {
 pub struct Table {
     /// The table identifier.
     id: TableId,
-    /// The parsed `ets:new/2` options.
+    /// The parsed `ets:new/2` options. This is the **creation-time** model: the
+    /// fine-locking normalization ([`TableOptions::write_concurrency`] &c.) reads
+    /// [`TableOptions::access`] and is therefore never recomputed — see
+    /// [`Table::access`].
     opts: TableOptions,
+    /// The **current** access mode (`ets:info/2`'s `protection`).
+    ///
+    /// Initialised from [`TableOptions::access`] at build time and changed only by
+    /// [`Table::set_access`] / [`Table::setopts`]'s `{protection, …}` option. It is
+    /// deliberately *not* written back into the `opts` field: the oracle does **not**
+    /// re-normalize the fine-locking flags when the protection changes at runtime,
+    /// so a `public` table created with `{write_concurrency, true}` and then moved
+    /// to `private` still reports `write_concurrency => true` (probed against the
+    /// live `erl`), while a table *created* `private` with the same option reports
+    /// `false`.
+    access: Access,
     /// The owning process, if known.
     owner: Option<OwnerId>,
     /// The heir installed with `ets:setopts/2` / the creation-time `{heir, …}`
@@ -255,6 +269,7 @@ impl Table {
         let heir = Table::copy_heir(&mut store, opts.heir())?;
         Ok(Table {
             id,
+            access: opts.access(),
             opts,
             owner: None,
             heir,
@@ -301,9 +316,33 @@ impl Table {
         self.opts.keypos()
     }
 
-    /// The access mode.
+    /// The **current** access mode (`ets:info/2`'s `protection`).
+    ///
+    /// Initially the creation-time [`TableOptions::access`] and changed at runtime
+    /// by [`set_access`](Table::set_access) / [`setopts`](Table::setopts). Note the
+    /// fine-locking flags are *not* affected: they keep the creation-time
+    /// normalization recorded in the `opts` field.
     pub fn access(&self) -> Access {
-        self.opts.access()
+        self.access
+    }
+
+    /// Set the access mode directly (**owner-level primitive**; no access check).
+    ///
+    /// This is the primitive behind `ets:setopts(Tab, {protection, Access})`, the
+    /// counterpart of [`set_owner`](Table::set_owner)/[`set_heir`](Table::set_heir):
+    /// the BIF layer routes its access-checked form through
+    /// [`setopts`](Table::setopts) (or [`TableAccess::set_access`](TableAccess)) so
+    /// the owner gate is applied.
+    ///
+    /// **Only the access mode changes.** The creation-time fine-locking
+    /// normalization in [`TableOptions`] is left untouched, exactly like the oracle:
+    /// `ets:setopts(T, {protection, private})` on a `public` table created with
+    /// `{write_concurrency, true}` leaves `ets:info(T, write_concurrency)` and
+    /// `ets:info(T, decentralized_counters)` at `true`, whereas a table *created*
+    /// `private` with that option reports `false` (both probed against the live
+    /// `erl`).
+    pub fn set_access(&mut self, access: Access) {
+        self.access = access;
     }
 
     /// The owning process, if known.
@@ -368,13 +407,21 @@ impl Table {
         self.replace_heir(heir);
     }
 
-    /// `ets:setopts/2` for the `{heir, ...}` option: requires `caller` to be the
-    /// current owner (`badarg` otherwise), then installs/clears the heir.
+    /// `ets:setopts/2` for the modelled options: requires `caller` to be the
+    /// current owner (`badarg` otherwise), then applies the option.
     ///
     /// `SetOpt::Heir` carries the option's arity in [`Heir::data`]: `Some(term)` for
     /// `{heir, Pid, Data}` and `None` for `{heir, Pid}`. Like the primitive it
     /// reclaims the outgoing heir's copy, and like the primitive it does **not** copy
     /// the incoming gift data (prefer [`install_heir`](Table::install_heir)).
+    ///
+    /// `SetOpt::Access` is `{protection, Access}`: it moves the table's *current*
+    /// access mode ([`set_access`](Table::set_access)) and nothing else — the
+    /// creation-time concurrency normalization is deliberately left alone, matching
+    /// the oracle (see [`SetOpt::Access`] and [`Table::set_access`]).
+    ///
+    /// The owner gate runs **before** any mutation, so a denied call changes
+    /// nothing.
     pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()> {
         if caller != self.owner {
             return Err(badarg());
@@ -382,6 +429,7 @@ impl Table {
         match opt {
             SetOpt::Heir(heir) => self.replace_heir(Some(heir)),
             SetOpt::ClearHeir => self.replace_heir(None),
+            SetOpt::Access(access) => self.set_access(access),
         }
         Ok(())
     }
@@ -393,7 +441,7 @@ impl Table {
             name: self.opts.name(),
             kind: self.opts.kind(),
             keypos: self.opts.keypos(),
-            access: self.opts.access(),
+            access: self.access,
             size: self.interior.size(),
             memory: self.memory(),
             owner: self.owner,
@@ -632,7 +680,7 @@ impl Table {
     /// Whether `requester` may **read** the table; an access violation is
     /// `BeamError::BadArg`, matching how `ets` reports it.
     pub fn check_read(&self, requester: Option<OwnerId>) -> Result<()> {
-        if can_read(self.opts.access(), self.owner, requester) {
+        if can_read(self.access, self.owner, requester) {
             Ok(())
         } else {
             Err(badarg())
@@ -642,7 +690,7 @@ impl Table {
     /// Whether `requester` may **write** the table; an access violation is
     /// `BeamError::BadArg`, matching how `ets` reports it.
     pub fn check_write(&self, requester: Option<OwnerId>) -> Result<()> {
-        if can_write(self.opts.access(), self.owner, requester) {
+        if can_write(self.access, self.owner, requester) {
             Ok(())
         } else {
             Err(badarg())
@@ -681,309 +729,5 @@ impl Table {
     }
 
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use beam_common::BeamError;
-    use beam_term::heap::Heap;
-
-    /// A `{Key, Value}` object (keypos 1) on `heap`.
-    fn object(heap: &mut Heap, key: i64, value: i64) -> Eterm {
-        heap.tuple(&[make_small(key), make_small(value)]).unwrap()
-    }
-
-    /// A `{Key, Value, Tag}` object (keypos 1) on `heap`.
-    fn triple(heap: &mut Heap, key: i64, value: i64, tag: i64) -> Eterm {
-        heap.tuple(&[make_small(key), make_small(value), make_small(tag)])
-            .unwrap()
-    }
-
-    /// A fresh keypos-1 table of `kind`.
-    fn table(kind: TableKind) -> Table {
-        let mut opts = TableOptions::new();
-        opts.set_kind(kind);
-        Table::new(TableId::next(), opts).expect("a fresh table is constructible")
-    }
-
-    /// `err` is the crate's typed "unsupported operation" raise (not a `badarg`),
-    /// and it names `needle`.
-    fn assert_unsupported_naming(err: BeamError, needle: &str) {
-        let raise = err.into_raise().expect("the unsupported marker is a raise");
-        let reason = raise.reason.as_atom().expect("the reason is an atom");
-        assert_eq!(raise.class, beam_common::ExceptionClass::Error);
-        assert_eq!(
-            reason,
-            format!("unsupported_ets: {needle}"),
-            "the raise names this crate's unsupported surface"
-        );
-    }
-    /// The interior reports a rejected `bag` duplicate, so `Table::insert` reclaims
-    /// the deep copy it just made: the store's live-word count does not grow.
-    #[test]
-    fn a_rejected_bag_duplicate_costs_no_store_words() {
-        let atoms = AtomTable::new();
-        let mut heap = Heap::new(64);
-        let mut t = table(TableKind::Bag);
-
-        t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
-        let live = t.store.words();
-        assert!(live > 0, "the stored object owns store words");
-
-        for _ in 0..10 {
-            t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
-        }
-        assert_eq!(
-            t.store.words(),
-            live,
-            "a rejected duplicate's copy must be reclaimed, not orphaned"
-        );
-        assert_eq!(t.size(), 1);
-    }
-
-    /// `insert_new` reclaims the deep copy it made when the key already exists.
-    #[test]
-    fn a_refused_insert_new_costs_no_store_words() {
-        let atoms = AtomTable::new();
-        let mut heap = Heap::new(64);
-        let mut t = table(TableKind::Set);
-
-        assert!(t.insert_new(object(&mut heap, 1, 10), &atoms).unwrap());
-        let live = t.store.words();
-
-        for _ in 0..10 {
-            assert!(!t.insert_new(object(&mut heap, 1, 20), &atoms).unwrap());
-        }
-        assert_eq!(t.store.words(), live, "a refused insert_new leaks no copy");
-        assert_eq!(t.size(), 1);
-    }
-
-    /// `take` reclaims the stored object (the store holds no live words afterwards)
-    /// and hands the caller a checked-out copy that stays valid.
-    #[test]
-    fn take_reclaims_the_stored_object_and_returns_a_checked_out_copy() {
-        let atoms = AtomTable::new();
-        let mut heap = Heap::new(64);
-        let mut t = table(TableKind::Set);
-
-        let source = object(&mut heap, 1, 10);
-        t.insert(source, &atoms).unwrap();
-        assert!(t.store.words() > 0);
-
-        let taken = t.take(make_small(1), &atoms).unwrap();
-        assert_eq!(taken.len(), 1);
-        assert_eq!(
-            t.store.words(),
-            0,
-            "the stored object is reclaimed; the returned copy is checked out"
-        );
-        assert_eq!(t.size(), 0);
-        assert!(
-            eq(taken[0], source, &atoms),
-            "the returned copy is structurally the removed object"
-        );
-    }
-
-    /// `insert_list` validates the whole list **before** the first store write, so
-    /// an invalid element inserts none of the elements — including the valid ones
-    /// that precede it (verified `erl` behaviour).
-    #[test]
-    fn insert_list_validates_every_object_before_inserting_any() {
-        let atoms = AtomTable::new();
-        let mut heap = Heap::new(64);
-        let mut t = table(TableKind::Set);
-
-        let kept = object(&mut heap, 1, 10);
-        t.insert(kept, &atoms).unwrap();
-        let live = t.store.words();
-        let good = object(&mut heap, 2, 20);
-
-        // A non-tuple element after a valid one: nothing is inserted.
-        assert!(matches!(
-            t.insert_list(&[good, make_small(7)], &atoms),
-            Err(BeamError::BadArg)
-        ));
-        assert_eq!(t.size(), 1, "only the pre-existing object survives");
-        assert!(!t.member(make_small(2), &atoms));
-        assert_eq!(
-            t.store.words(),
-            live,
-            "the valid element's copy must not be left in the store"
-        );
-
-        // The invalid element may also come first.
-        assert!(matches!(
-            t.insert_list(&[make_small(7), good], &atoms),
-            Err(BeamError::BadArg)
-        ));
-        assert_eq!(t.size(), 1);
-        assert_eq!(t.store.words(), live);
-
-        // A valid list still inserts everything (the failure above left no residue).
-        t.insert_list(&[good, object(&mut heap, 3, 30)], &atoms).unwrap();
-        assert_eq!(t.size(), 3);
-    }
-
-    /// A `{keypos,2}` table rejects a list containing an element whose arity is
-    /// `< keypos` without inserting the valid elements either.
-    #[test]
-    fn insert_list_is_atomic_under_a_custom_keypos() {
-        let atoms = AtomTable::new();
-        let mut heap = Heap::new(64);
-        let mut opts = TableOptions::new();
-        opts.set_keypos(2).unwrap();
-        let mut t = Table::new(TableId::next(), opts).unwrap();
-
-        let kept = heap.tuple(&[make_small(1), make_small(10)]).unwrap();
-        t.insert(kept, &atoms).unwrap();
-        let live = t.store.words();
-
-        // `{b}` is a 1-tuple: arity 1 < keypos 2, so the whole list is `badarg`.
-        let good = heap.tuple(&[make_small(2), make_small(20)]).unwrap();
-        let short = heap.tuple(&[make_small(3)]).unwrap();
-        assert!(matches!(
-            t.insert_list(&[good, short], &atoms),
-            Err(BeamError::BadArg)
-        ));
-        assert_eq!(t.size(), 1);
-        assert!(t.member(make_small(10), &atoms));
-        assert!(!t.member(make_small(20), &atoms));
-        assert_eq!(t.store.words(), live);
-    }
-
-    /// The element projection of every object under a key, for all four kinds:
-    /// the list `ets:lookup_element/3` returns for `bag`/`duplicate_bag`, and the
-    /// one-element list the single-object kinds yield.
-    #[test]
-    fn lookup_element_all_projects_every_object_under_a_key() {
-        let atoms = AtomTable::new();
-        let mut heap = Heap::new(256);
-
-        let mut bag = table(TableKind::Bag);
-        bag.insert(triple(&mut heap, 1, 10, 100), &atoms).unwrap();
-        bag.insert(triple(&mut heap, 1, 20, 200), &atoms).unwrap();
-        let values = bag.lookup_element_all(make_small(1), 2, &atoms).unwrap();
-        assert!(values
-            .iter()
-            .zip([make_small(10), make_small(20)])
-            .all(|(got, want)| eq(*got, want, &atoms)));
-        let tags = bag.lookup_element_all(make_small(1), 3, &atoms).unwrap();
-        assert!(eq(tags[1], make_small(200), &atoms));
-
-        // A key element repeats once per object.
-        let keys = bag.lookup_element_all(make_small(1), 1, &atoms).unwrap();
-        assert_eq!(keys.len(), 2);
-        assert!(eq(keys[0], make_small(1), &atoms) && eq(keys[1], make_small(1), &atoms));
-
-        // `duplicate_bag` preserves identical objects (and so identical elements).
-        let mut dup = table(TableKind::DuplicateBag);
-        dup.insert(object(&mut heap, 5, 1), &atoms).unwrap();
-        dup.insert(object(&mut heap, 5, 1), &atoms).unwrap();
-        assert_eq!(dup.lookup_element_all(make_small(5), 2, &atoms).unwrap().len(), 2);
-
-        // The single-object kinds store at most one object per key.
-        for kind in [TableKind::Set, TableKind::OrderedSet] {
-            let mut t = table(kind);
-            t.insert(triple(&mut heap, 9, 10, 100), &atoms).unwrap();
-            let one = t.lookup_element_all(make_small(9), 2, &atoms).unwrap();
-            assert_eq!(one.len(), 1, "{kind:?} holds one object per key");
-            assert!(eq(one[0], t.lookup_element(make_small(9), 2, &atoms).unwrap(), &atoms));
-        }
-    }
-
-    /// The element-list projection's failures mirror the oracle: an absent key, a
-    /// `pos` of 0, and an object too short to have `pos` are all `badarg`.
-    #[test]
-    fn lookup_element_all_rejects_absent_keys_zero_and_short_objects() {
-        let atoms = AtomTable::new();
-        let mut heap = Heap::new(256);
-        let mut bag = table(TableKind::Bag);
-        bag.insert(object(&mut heap, 1, 10), &atoms).unwrap();
-
-        assert!(matches!(
-            bag.lookup_element_all(make_small(1), 0, &atoms),
-            Err(BeamError::BadArg)
-        ));
-        assert!(matches!(
-            bag.lookup_element_all(make_small(99), 2, &atoms),
-            Err(BeamError::BadArg)
-        ));
-        // `{1,10}` has arity 2, so position 3 is out of range for the whole call.
-        assert!(matches!(
-            bag.lookup_element_all(make_small(1), 3, &atoms),
-            Err(BeamError::BadArg)
-        ));
-
-        // `/4` reports the absent key as `None` (the caller yields `default`), but
-        // validates `pos` first and keeps a present key's `badarg`.
-        let default = make_small(-1);
-        assert_eq!(
-            bag.lookup_element_all_or(make_small(99), 9, default, &atoms).unwrap(),
-            None
-        );
-        assert!(matches!(
-            bag.lookup_element_all_or(make_small(99), 0, default, &atoms),
-            Err(BeamError::BadArg)
-        ));
-        assert!(matches!(
-            bag.lookup_element_all_or(make_small(1), 3, default, &atoms),
-            Err(BeamError::BadArg)
-        ));
-        let present = bag
-            .lookup_element_all_or(make_small(1), 2, default, &atoms)
-            .unwrap()
-            .expect("a present key yields the elements");
-        assert_eq!(present.len(), 1);
-        assert!(eq(present[0], make_small(10), &atoms));
-    }
-
-    /// The scalar `lookup_element`/`lookup_element_or` are honest for the
-    /// multi-object kinds: they raise the crate's typed "unsupported" (never a
-    /// wrong scalar) while still answering the oracle's failures with `badarg`.
-    #[test]
-    fn scalar_lookup_element_is_unsupported_for_multi_kinds() {
-        for kind in [TableKind::Bag, TableKind::DuplicateBag] {
-            let atoms = AtomTable::new();
-            let mut heap = Heap::new(64);
-            let mut t = table(kind);
-            t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
-            t.insert(object(&mut heap, 1, 20), &atoms).unwrap();
-
-            // A present key with an in-range position: the oracle returns a list.
-            assert_unsupported_naming(
-                t.lookup_element(make_small(1), 2, &atoms).unwrap_err(),
-                MULTI_ELEMENT_SCALAR,
-            );
-            // ... and the `/4` form of the same call.
-            assert_unsupported_naming(
-                t.lookup_element_or(make_small(1), 2, make_small(-1), &atoms)
-                    .unwrap_err(),
-                MULTI_ELEMENT_SCALAR,
-            );
-
-            // The oracle's failures stay `badarg`, not "unsupported".
-            assert!(matches!(
-                t.lookup_element(make_small(1), 0, &atoms),
-                Err(BeamError::BadArg)
-            ));
-            assert!(matches!(
-                t.lookup_element(make_small(99), 2, &atoms),
-                Err(BeamError::BadArg)
-            ));
-            assert!(matches!(
-                t.lookup_element(make_small(1), 3, &atoms),
-                Err(BeamError::BadArg)
-            ));
-            // An absent key is `default` for `/4`, whatever the kind.
-            assert_eq!(
-                t.lookup_element_or(make_small(99), 9, make_small(-1), &atoms)
-                    .unwrap(),
-                make_small(-1)
-            );
-            assert!(matches!(
-                t.lookup_element_or(make_small(99), 0, make_small(-1), &atoms),
-                Err(BeamError::BadArg)
-            ));
-        }
-    }
-}
+mod tests;
