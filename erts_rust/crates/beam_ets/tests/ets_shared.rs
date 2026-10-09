@@ -48,9 +48,9 @@
 //!    are the serial ones.
 //! 4. **Live-oracle cross-check** ([`concurrent_counter_total_agrees_with_the_live_oracle`]):
 //!    the *same* `N` workers × `M` increments workload runs under the real `erl`, and
-//!    the Rust total must equal the oracle's total for the same `N` and `M`. It skips
-//!    loudly when no Erlang is installed; set `BEAM_ETS_REQUIRE_ORACLE=1` to make that
-//!    skip a failure.
+//!    the Rust total must equal the oracle's total for the same `N` and `M`. The
+//!    oracle is **required by default**, so a missing Erlang fails this check; set
+//!    `BEAM_ETS_ALLOW_NO_ORACLE=1` to opt out explicitly.
 //!
 //! # A read result is only valid while its read guard is held
 //!

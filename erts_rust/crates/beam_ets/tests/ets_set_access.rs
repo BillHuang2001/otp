@@ -41,9 +41,10 @@
 //!   `write_concurrency => true`, while a table *created* `private` with the same
 //!   option reports `false` (probed against the live `erl`).
 //!
-//! The final test re-probes those facts against the system oracle; it skips loudly
-//! without `erl`/`escript` and `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a
-//! failure.
+//! The final test re-probes those facts against the system oracle; the oracle is
+//! **required by default**, so a missing `erl`/`escript` fails the check rather than
+//! skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out; `BEAM_ETS_REQUIRE_ORACLE=1`
+//! forces it).
 
 mod common;
 
@@ -246,8 +247,8 @@ fn changing_the_protection_does_not_renormalize_the_fine_locking_flags() {
 }
 
 /// The oracle probe: it prints one line per fact and the model reproduces every
-/// one of them. Skips loudly without an oracle; `BEAM_ETS_REQUIRE_ORACLE=1` turns
-/// the skip into a failure.
+/// one of them. The oracle is **required by default**, so a missing one fails the
+/// check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out).
 #[test]
 fn protection_change_matches_the_live_oracle() {
     let Some(escript) = oracle::resolve_escript() else {

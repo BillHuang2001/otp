@@ -1205,8 +1205,9 @@ main(_) ->
 /// `ets:info/1,2`, and the **owner**-gated `setopts/2 {protection,_}` /
 /// `give_away/3`.
 ///
-/// The oracle is a **loud skip** when absent (`BEAM_ETS_REQUIRE_ORACLE=1` turns the
-/// skip into a failure).
+/// The oracle is **required by default**: an absent Erlang fails this check rather
+/// than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out;
+/// `BEAM_ETS_REQUIRE_ORACLE=1` forces it).
 #[test]
 fn the_access_matrix_matches_the_live_oracle() {
     const TEST: &str = "the_access_matrix_matches_the_live_oracle";

@@ -53,8 +53,8 @@
 //!    ([`the_insert_new_winner_count_agrees_with_the_live_oracle`]): the *same*
 //!    contended `insert_new` workload runs under the real `erl`, and the oracle's
 //!    own winner count is one — so the Rust invariant is the oracle's invariant, not
-//!    a local convention. It skips loudly when no Erlang is installed; set
-//!    `BEAM_ETS_REQUIRE_ORACLE=1` to make that skip a failure.
+//!    a local convention. The oracle is **required by default**, so a missing Erlang
+//!    fails this check; set `BEAM_ETS_ALLOW_NO_ORACLE=1` to opt out explicitly.
 //!
 //! # Why every assertion is exact
 //!

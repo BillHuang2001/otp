@@ -526,8 +526,8 @@ main(_) ->
 /// The live cross-check of the absent-anchor rules: the system `erl` runs the
 /// identical probes and both sides must reproduce every recorded figure.
 ///
-/// Skips loudly when no Erlang is installed; `BEAM_ETS_REQUIRE_ORACLE=1` turns the
-/// skip into a failure.
+/// The oracle is **required by default**, so a missing Erlang fails this check
+/// rather than skipping it; `BEAM_ETS_ALLOW_NO_ORACLE=1` opts out explicitly.
 #[test]
 fn absent_anchors_agree_with_the_live_oracle() {
     let Some(escript) = oracle::resolve_escript() else {
@@ -845,8 +845,9 @@ walk_keys(Key, T, Acc) -> walk_keys(ets:next(T, Key), T, [Key | Acc]).
 
 /// The live cross-check of the view order: the crate's `iter_keys` (an
 /// `ets:first`+`ets:next` walk) and `iter_objects` must reproduce the same normalised
-/// sequences the system `erl` prints for the identical walk. Skips loudly when no
-/// Erlang is installed; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure.
+/// sequences the system `erl` prints for the identical walk. The oracle is
+/// **required by default**, so a missing Erlang fails this check rather than skipping
+/// it; `BEAM_ETS_ALLOW_NO_ORACLE=1` opts out explicitly.
 #[test]
 fn view_order_agrees_with_the_live_oracle() {
     let Some(escript) = oracle::resolve_escript() else {
