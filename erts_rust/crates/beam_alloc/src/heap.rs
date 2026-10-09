@@ -39,12 +39,10 @@ use core::mem::size_of;
 use core::ptr::NonNull;
 
 use beam_common::Result;
-use beam_term::prelude::{
-    make_list, make_tuple, try_make_arityval, Eterm, CAR_OFFSET, CDR_OFFSET,
-};
+use beam_term::prelude::Eterm;
 
 use crate::allocator::{AllocRef, MIN_ALIGN};
-use crate::error;
+use crate::bump;
 use crate::registry::default_allocator;
 
 /// A fixed-capacity bump arena over a carrier-provided block.
@@ -127,10 +125,10 @@ impl Heap {
     /// are read, and must not use them after this heap is dropped. The heap never
     /// reallocates, so the pointer stays valid for the heap's lifetime.
     pub unsafe fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
-        if n > self.available() {
-            return Err(error::heap_exhausted(n));
-        }
-        let p = self.hp();
+        // SAFETY: `hp()` is a pointer into this exclusively-owned heap's block with
+        // `available()` writable words still ahead of it, which is exactly
+        // `bump::alloc_words_at`'s contract.
+        let p = unsafe { bump::alloc_words_at(self.hp(), self.available(), n)? };
         self.used += n;
         self.peak = self.peak.max(self.used);
         Ok(p)
@@ -144,37 +142,32 @@ impl Heap {
     /// The `n` element words are uninitialised; the caller must write them before they
     /// are read, and must not use the pointer after this heap is dropped.
     pub unsafe fn alloc_tuple(&mut self, n: usize) -> Result<*mut Eterm> {
-        let header = try_make_arityval(n)?;
-        // SAFETY: `alloc_words` returned `n + 1` exclusively-owned, writable words.
-        let p = unsafe { self.alloc_words(n + 1)? };
-        // SAFETY: `p` points at the first of those words; the header goes there and
-        // the remaining `n` words are left for the caller to fill.
-        unsafe { *p = header };
+        // SAFETY: as for `alloc_words`; `alloc_tuple_at` writes the header word itself
+        // and leaves the `n` element words to the caller.
+        let p = unsafe { bump::alloc_tuple_at(self.hp(), self.available(), n)? };
+        self.used += n + 1;
+        self.peak = self.peak.max(self.used);
         Ok(p)
     }
 
     /// Builds a cons cell `[car, cdr]` and returns the list term.
     pub fn cons(&mut self, car: Eterm, cdr: Eterm) -> Result<Eterm> {
-        // SAFETY: `alloc_words` returned two exclusively-owned, writable words.
-        let p = unsafe { self.alloc_words(2)? };
-        // SAFETY: `p` is the base of the two words just allocated.
-        unsafe {
-            *p.add(CAR_OFFSET) = car;
-            *p.add(CDR_OFFSET) = cdr;
-        }
-        Ok(make_list(p as *const Eterm))
+        // SAFETY: `hp()` has `available()` writable words ahead of it in this
+        // exclusively-owned heap, which is `bump::cons_at`'s contract.
+        let term = unsafe { bump::cons_at(self.hp(), self.available(), car, cdr)? };
+        self.used += 2;
+        self.peak = self.peak.max(self.used);
+        Ok(term)
     }
 
     /// Builds a tuple from `elems` and returns the tuple term.
     pub fn tuple(&mut self, elems: &[Eterm]) -> Result<Eterm> {
-        // SAFETY: `alloc_tuple` writes the header and leaves `elems.len()` writable
-        // element words.
-        let p = unsafe { self.alloc_tuple(elems.len())? };
-        for (i, elem) in elems.iter().enumerate() {
-            // SAFETY: `p` owns `1 + elems.len()` words, so `1 + i` is in-bounds.
-            unsafe { *p.add(1 + i) = *elem };
-        }
-        Ok(make_tuple(p))
+        // SAFETY: `hp()` has `available()` writable words ahead of it in this
+        // exclusively-owned heap, which is `bump::tuple_at`'s contract.
+        let term = unsafe { bump::tuple_at(self.hp(), self.available(), elems)? };
+        self.used += 1 + elems.len();
+        self.peak = self.peak.max(self.used);
+        Ok(term)
     }
 }
 
@@ -218,7 +211,7 @@ mod tests {
     use beam_common::{AllocFailure, AllocKind, BeamError};
     use beam_term::prelude::{
         arityval, car, cdr, is_arity_value, is_list, is_tuple, list_val, make_arityval, make_small,
-        signed_value, tuple_element, tuple_size, MAX_ARITYVAL, NIL,
+        make_tuple, signed_value, tuple_element, tuple_size, MAX_ARITYVAL, NIL,
     };
 
     use crate::allocator::{AllocRef, Allocator};

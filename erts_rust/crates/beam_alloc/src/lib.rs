@@ -66,8 +66,10 @@ pub mod mseg;
 pub mod allocator;
 pub mod registry;
 pub mod heap;
+pub mod reserved_heap;
 pub mod refcount;
 pub mod binary;
+mod bump; // pub(crate) primitives only — NOT public
 mod error; // pub(crate) helpers only — NOT public
 
 pub use crate::allocator::{
@@ -79,6 +81,7 @@ pub use crate::heap::Heap;
 pub use crate::policy::{CarrierPolicy, PolicyOptionKind};
 pub use crate::refcount::RefCount;
 pub use crate::registry::{all_stats, allocator, default_allocator, AllocType};
+pub use crate::reserved_heap::{GrowOutcome, ReservedHeap};
 pub use crate::size_class::SizeClasses;
 pub use crate::stats::AllocStats;
 pub use crate::strategy::Strategy;
@@ -96,6 +99,7 @@ pub mod prelude {
     pub use crate::heap::Heap;
     pub use crate::refcount::RefCount;
     pub use crate::registry::{all_stats, allocator, default_allocator, AllocType};
+    pub use crate::reserved_heap::{GrowOutcome, ReservedHeap};
     pub use crate::size_class::SizeClasses;
     pub use crate::stats::AllocStats;
     pub use crate::types::{
