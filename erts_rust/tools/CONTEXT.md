@@ -45,10 +45,12 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `unsafe` is forbidden in both crates.
 
 ## Status
-- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=794 agree=785
-  mismatch=0 unsupported=9 skipped=0` (per-contract counts under "Gate coverage" in Notes for Agents).
-  `wire/new_fun_ext_encode` is unclosable by design; the other eight are the five `erlang:statistics/1`
-  counters the runtime does not serve and the two `erlang:monitor/2,3` gap shapes.
+- **Compatibility gate:** the corpus covers all nine contracts A.1–A.9 — `summary: total=1100 agree=1093
+  mismatch=0 unsupported=7 skipped=0` (`gate.sh` is authoritative; re-run it for the live per-contract
+  split). Keep per-contract counts in `differential/` (its own CONTEXT.md) rather than copied here, so
+  they cannot drift.
+  `wire/new_fun_ext_encode` is unclosable by design; the other six are the five `erlang:statistics/1`
+  counters the runtime does not serve plus the A.9 boot seam.
 - **`beam_rt` gap signalling is honoured:** cases the runtime cannot run classify as `unsupported`,
   never `mismatch`.
 - **CI:** `.github/workflows/erts_rust.yml` builds/tests the workspace and runs `differential/gate.sh`
@@ -67,11 +69,10 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
 - Oracle is the system Erlang on `PATH` (OTP 29.1.1 / erts-17.1). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
 - **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
-- **Gate coverage (verified against code):** `differential suite` reports `summary: total=794 agree=785
-  mismatch=0 unsupported=9 skipped=0` (a case may declare several contracts, so the per-contract totals
-  below exceed `summary.total`). All nine contracts A.1–A.9 have corpus cases — A.1 154/154 · A.2 176/176
-  · A.3 34/34 · A.4 64/64 · A.5 79 (78 agree + 1 unsupported) · A.6 44/44 · A.7 322 (315 agree + 7
-  unsupported) · A.8 64/64 · A.9 66 (65 agree + 1 unsupported). A.4 (driver C ABI) is covered end to end by the `driver_c` group
+- **Gate coverage (verified against code):** `differential suite` reports `summary: total=1100 agree=1093
+  mismatch=0 unsupported=7 skipped=0` (a case may declare several contracts, so the per-contract totals
+  exceed `summary.total`). All nine contracts A.1–A.9 have corpus cases; the live per-contract split is in
+  `differential/CONTEXT.md` — do not copy it here (it drifts). A.4 (driver C ABI) is covered end to end by the `driver_c` group
   (a real C driver `.so` driven through the port lifecycle and the `port_command` echo round trip),
   alongside the built-in spawn-driver `driver/` cases and the structural C-ABI check (`tests/abi.rs`). The
   genuine end-to-end agreement core is the module-run groups (`modules`/`mexec`/`nif_so`/`nif_res`/`driver_c`/`records`).

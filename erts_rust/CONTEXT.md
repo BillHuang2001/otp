@@ -125,16 +125,13 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
   the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
   `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
   outside it returns a typed `BeamError` (never a wrong result).
-- **Compatibility gate (`tools/differential`):** per `tools/differential/CONTEXT.md`, `summary: total=794
-  agree=785 mismatch=0 unsupported=9 skipped=0` (`gate.sh` → exit `3`) — per contract A.1 154/154 · A.2
-  176/176 · A.3 34/34 · A.4 64/64 · A.5 79 (78 agree + 1 unsupported) · A.6 44/44 · A.7 322 (315 + 7) · A.8
-  64/64 · A.9 66 (65 + 1). **No case disagrees.** The 9 `unsupported` are honest capability gaps, never
-  `mismatch`: `wire/new_fun_ext_encode` (unclosable — an `erl_eval` lambda's closure identity needs
-  `erl_eval`/`erl_scan`/`erl_parse`), the five `erlang:statistics/1` counters the runtime does not serve
-  (`proc_signals/statistics_*_unsupported`), the two `erlang:monitor/2,3` gap shapes
-  (`proc_signals/monitor_3_tag_option_unsupported`, `proc_signals/monitor_port_unsupported`), and the
-  A.9 boot seam (`boot/proc_lib_start_link_blocks_the_boot_path`). `gate.sh` is authoritative — re-run it
-  for the live split.
+- **Compatibility gate (`tools/differential`):** `summary: total=1100 agree=1093 mismatch=0 unsupported=7
+  skipped=0` (`gate.sh` → exit `3` without an allowlist; `--strict --allowlist known-gaps.txt` → exit `0`).
+  **No case disagrees.** `gate.sh` is authoritative — re-run it for the live per-contract split; the
+  remaining `unsupported` are honest, recorded capability gaps (never `mismatch`): `wire/new_fun_ext_encode`
+  (unclosable — an `erl_eval` lambda's closure identity needs `erl_eval`/`erl_scan`/`erl_parse`), the five
+  `erlang:statistics/1` counters the runtime does not serve (`proc_signals/statistics_*_unsupported`), and
+  the A.9 boot seam (`boot/proc_lib_start_link_blocks_the_boot_path`).
 - **BIF surface complete:** `beam_bifs` registers **556/556 declared `bif.tab` BIFs** (registry 637
   keys = 556 declared + 81 non-table keys: 79 stdlib fast paths + `erlang:memory/0,1`) through defaulted
   host seams (`RuntimeHooks::call`, `MemoryHook::memory`, …). Registered-but-unadopted BIFs return a

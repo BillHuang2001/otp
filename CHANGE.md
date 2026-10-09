@@ -8,7 +8,108 @@ Format: one entry per major change — date, area, what changed and why. Newest 
 
 ---
 
-## 2026-10-08 — Milestone 4: runtime dispatch fixed (per-BIF cost ~90×), real pre-emption, copy-boundary hardening, legacy-C removal gate
+## 2026-10-09 — Milestone 5: in-machine cross-module calls, ETS lifetime/concurrency fixes, per-object reclamation, slim IR + superinstruction, NIF/driver ABI completion, signal/ddll facilities, Stage-2 compiler passes
+Scope: a broad correctness + performance milestone across the runtime. The headline structural
+changes are (a) a **suspendable cross-module call seam** so a `receive` inside a callee parks and
+resumes instead of failing, (b) a **storage-lifetime fix in all four ETS interiors** (a real
+use-after-free), (c) a **slimmer execution IR plus a superinstruction pass**, (d) the **NIF/driver C
+ABI brought to completion**, and (e) **loop-optimisation / operation-fusion passes in the real
+compiler**. Verified: `cargo build --workspace --all-targets` warning-free, `cargo test --workspace
+--no-fail-fast` all green (6646 passed / 0 failed), and the differential gate
+**`total=1100 agree=1093 mismatch=0 unsupported=7 skipped=0`** — no case disagrees.
+
+- **Area:** `erts_rust/crates/beam_rt` — the `ExecutionContext` glue + runner (over the seam `beam_engine` exposes)
+- **Change:** `RuntimeContext` implements the engine's `ExecutionContext::resolve_external_call`, so a
+  `call_ext*` callee runnable in this machine runs **in the caller's machine** — the engine stores the
+  caller's return address and enters the callee's export label — instead of recursing through the
+  synchronous `call_bif` → `run_export`. The override returns the *same* `Arc<Module>` the `CodeServer`
+  holds (contexts dedupe by pointer identity) and the export label after `func_info`, loads an uncached
+  callee on demand, and answers `Ok(None)` — preserving the synchronous path byte-for-byte — for every
+  import it must not intercept. A **fun-bodied** process entry gets the same treatment.
+  Consequence: `proc_lib:start/4` / `proc_lib:start_link/4` — and hence `gen_server`-class startup —
+  park in `receive` and resume instead of folding into a `blocked` error.
+- **Area:** `erts_rust/crates/beam_rt` (`runtime/ets_owner.rs`) + `erts_rust/crates/beam_process` (`ProcessExitObserver`)
+- **Change:** The runtime installs a process-exit observer and two scheduler-pass **drains**: a dead
+  process's ETS tables are released (dropped, or handed to the installed heir with the oracle's
+  `{'ETS-TRANSFER', Tid, FromPid, Data}`), and its dangling incoming **port monitors** are swept. The
+  observer only *records* obligations into its own cell (a death can be reached while a BIF holds a
+  registry borrow); the drains discharge them with `try_borrow_mut` and defer — never panic, never drop
+  — while that borrow is live.
+- **Area:** `erts_rust/crates/beam_rt` (`context/gc.rs`, `runtime/gc.rs`)
+- **Change:** The runtime now **drives `beam_gc`**: a scheduled process allocates on its own young heap
+  and is collected at the engine's heap-admission point (`ensure_heap`), with the executing machine's
+  `x[0..live)` plus the Erlang stack as the root set. Collection is armed per call by the slice's own
+  budget context (a nested machine cannot clobber outer roots); a module with a float-family
+  instruction is never collected over (`Machine::fr` is outside the root set); a failed collection halts
+  that process's collection only; and an uncopiable store term trips a global valve that freezes every
+  process heap. An `alloc_words`-only workload (no `test_heap` admission point) still falls back to the
+  pointer-stable arena and is not collected — reaching it needs a mutable root-set hook on `Machine`.
+- **Area:** `erts_rust/crates/beam_ets` — `src/table/{element,node,hash_interior,champ_interior}.rs`
+- **Change (a live use-after-free):** `key_of(object, keypos)` returns a pointer **into** a table-owned
+  `TermStore` object, but the chained-hash (`Entry.key`) and CHAMP (`Slot.key`) interiors stored that
+  pointer as the index key, and the B+-tree stored **branch separators** aliasing a leaf's key element.
+  On an upsert — or a `bag`/`duplicate_bag` `delete_object` that removed the anchor object — the stale
+  term was not re-pointed, so `TermStore::free` reclaimed its runs and a later same-size insert reused
+  them, and the stale term then read a *different, well-formed* term. Fixes: re-point the stored key on
+  the replace arm; re-anchor a surviving entry via a keypos-aware `HashInterior::with_keypos`; derive
+  the index key from the **table-owned copy**; and always re-materialise B+-tree separators from the
+  rightmost live leaf (`NodeStore::subtree_max_key`).
+- **Area:** `erts_rust/crates/beam_ets` — `WriteConcurrency` + `select_reverse` + `child_index`
+- **Change:** `{write_concurrency, auto}` and `{debug_hash_fixed_number_of_locks, N}` are now modelled
+  (`WriteConcurrency { Off, On, Auto, FixedLocks(u32) }`, with the bool API as its `Off`/`On`
+  projection, so the change is source-compatible) and `decentralized_counters` is derived from it.
+  `select_reverse/1,2,3` is implemented for all four kinds with direction-carrying continuations.
+  `node::child_index` now **binary-searches** the strictly-ascending B+-tree separators instead of a
+  linear `O(ORDER)` scan — measured `ordered_set` insert **0.32–0.69×**, hit **0.52–0.68×**, miss
+  **0.26–0.31×** at n=10⁵. A guard-scoped traversal API (`TableRead::{iter_keys, iter_keys_rev,
+  iter_objects, iter_objects_rev, foldl, foldr, tab2list_into}`, `TableTerm::tuple_elements`) makes an
+  escaping borrowed term *unrepresentable* (three `compile_fail` doctests).
+- **Area:** `erts_rust/crates/beam_loader` (`src/instr.rs`, `src/lower/fuse.rs`) + `erts_rust/crates/beam_engine`
+- **Change:** the typed IR is made cheaper to dispatch with **no behavioural change**.
+  `size_of::<Instr>()` **160 → 64 bytes**, `size_of::<Operand>()` **32 → 16**. The drivers were
+  decode-time-only, never-stored payloads: `Operand::BigInteger/List/Allocation` are boxed
+  (`Box<BigInt>` / `Box<Vec<..>>` — *not* `Box<[T]>`, whose fat pointer re-inflates `Operand` to 24),
+  and nine operand-heavy **cold** `Instr` variants carry boxed payload bundles, while the hot variants
+  (move/call/`gc_bif`/test/select and the whole receive family) stay inline. Compile-time
+  `assert!(size_of::<Instr>() <= 64)` / `Operand <= 16` / `HeapNeed <= 24` guards prevent silent
+  re-inflation. A new `beam_loader` **superinstruction pass** (`src/lower/fuse.rs`, run before blocks
+  and labels are built) coalesces the adjacent `Deallocate(N); Return` emitted at every non-tail exit
+  into `Instr::DeallocateReturn(N)`; both JIT tiers deopt it to the same `step_instruction`, and
+  `Deallocate`/`Return` stay live for hand-built modules. Measured (release list walk, median-of-3):
+  **45.01 → 41.05 ns/element (~1.10×)**; deterministic **8,000,006 → 7,000,006 instructions/run
+  (−12.5 %)**, 54,479 pairs fused corpus-wide.
+- **Area:** `erts_rust/crates/beam_abi` + `erts_rust/crates/beam_io` — the C ABI surfaces
+- **Change:** the NIF ABI reaches full coverage and the driver ABI gains its remaining callback slots
+  and `ErlDrvTerm` output encoding; a driver `.so` now loads, runs and unloads end-to-end. New
+  `beam_io` facilities: a **safe OS-signal facility** (self-pipe + async-signal-safe trampoline;
+  `Signal`/`Disposition`/`SignalFacility` with `set`/`disposition`/`read_fd`/`drain`) for
+  `os:set_signal/2`, and a **`DynLib`** wrapper (`dlopen`/`dlsym`/`dlclose` + the full `erl_ddll`
+  error-atom taxonomy) for the dynamic-driver loader. `Poller::poll` is now `EINTR`-tolerant (retry
+  preserving the deadline) — required by the signal facility. Real bug fixed: a scheduled
+  `driver_async` job's `free()` was silently dropped when the port died first; `AsyncCompletion` now
+  owns the release exactly-once by construction, and `ERL_DRV_USE` is a single sticky merged
+  obligation.
+- **Area:** `lib/compiler` — Stage 2 (Part II §E), opt-in and OFF by default
+- **Change:** three new compiler passes on the BEAM-SSA IR: **loop optimisation**
+  (`beam_ssa_loop_opt` + `beam_ssa_loop_cfg`/`_reduce`/`_arith` — induction-variable strength
+  reduction, canonicalisation, loop-invariant code motion of pure tag tests), **operation fusion**
+  (`beam_ssa_fus` — map-lookup fusion and multiplicity fusion `(V*K1)*K2 → V*(K1*K2)` for type-proven
+  integers), and **FBIP** (`beam_ssa_fbip` — a copying `update_record` becomes in-place when the source
+  is provably fresh and every cycle through the use passes through the definition). All are wired
+  through `beam_ssa_opt_budget.erl`, the single decision point, which now also carries a per-**function**
+  effort model so a huge function cannot blow up compile time. Every pass is default-OFF, so the default
+  compilation path is byte-identical (verified by Code-chunk md5). **Loop unrolling and loop-index
+  narrowing are not implementable** in BEAM (no compile-time trip count for the only reachable CFG
+  cycles; a single arbitrary-precision integer type means no narrower index to narrow into) — a
+  documented negative result.
+- **Area:** `erts_rust/tools/differential` — corpus, ratchet, honesty ledger
+- **Change:** the corpus grew **794 → 1100 cases** with new groups for the four under-covered
+  contracts (`nif_abi/` A.3, `driver_abi/` A.4, `wire_extra/` A.5, `boot_extra/` A.9). A **strict
+  ratchet** (`--strict --allowlist known-gaps.txt`) makes an un-recorded capability gap *and* a stale
+  allowlist entry hard failures (`gate.sh` exit 3), with `GAPS.md` + `divergences.md` as the honesty
+  ledger. Every capability gap is recorded with its owning crate.
+
+---
 Scope: the runtime's **registered-BIF dispatch** — the single largest measured overhead — is
 root-caused and fixed (**~10.6 µs → ~116 ns per call**), the runner gains **real pre-emption**
 (`RunOutcome::Yield` on budget exhaustion) and runs scheduled entries on the **baseline JIT**, the
