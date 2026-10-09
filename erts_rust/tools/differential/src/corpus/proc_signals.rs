@@ -27,12 +27,14 @@
 //! oracle's own (stable) shapes, so each flips to `agree` automatically once the counter
 //! is implemented.
 //!
-//! # The two unsupported signalling cases
+//! # The `{tag, _}` monitor option and port monitors are live
 //!
-//! `erlang:monitor/3` with a `{tag, _}` option and `erlang:monitor/2` on a **port** are
-//! documented capability gaps of the Rust runtime (exit 3 with a `beam_rt: unsupported: …`
-//! reason), so they are `unsupported` too — the oracle monitors successfully, so the case
-//! becomes `agree` once the option/port target is honoured.
+//! `erlang:monitor/3` with a `{tag, _}` option and `erlang:monitor/2` on a **port** were once
+//! Rust capability gaps (the runtime raised `beam_rt: unsupported: …`, exit 3). The runtime now
+//! honours both, so `proc_signals/monitor_3_tag_option_unsupported` and
+//! `proc_signals/monitor_port_unsupported` **agree** — their `_unsupported` id suffix (kept so
+//! the ids stay byte-stable) is historical. The extra `monitor_3_tag_*` / `monitor_3_*` cases
+//! below deepen that coverage so the behaviour cannot silently regress.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// One A.7 case: evaluate `expr` under both runtimes and pin the oracle's `~w` rendering.
@@ -255,21 +257,99 @@ pub(crate) fn group() -> Vec<Case> {
             "begin M = erlang:monitor(process, self()), is_reference(M) end",
             "ok true",
         ),
-        // erlang:monitor/3 with a `{tag, _}` option and erlang:monitor/2 on a port are
-        // documented Rust capability gaps (exit 3), so both are `unsupported`; the oracle
-        // succeeds, so they flip to `agree` once the option/target is honoured.
+        // erlang:monitor/3 with a `{tag, _}` option and erlang:monitor/2 on a port are now
+        // honoured by the Rust runtime, so both cases agree; the `_unsupported` suffix is
+        // historical — kept only so the case ids stay stable.
         case(
             "proc_signals/monitor_3_tag_option_unsupported",
-            "erlang:monitor/3 with a {tag, _} option monitors successfully (a Rust gap)",
+            "erlang:monitor/3 with a {tag, _} option monitors successfully",
             "begin Ref = erlang:monitor(process, self(), [{tag, foo}]), \
              is_reference(Ref) end",
             "ok true",
         ),
         case(
             "proc_signals/monitor_port_unsupported",
-            "erlang:monitor/2 accepts a port and returns a reference (a Rust capability gap)",
+            "erlang:monitor/2 accepts a port and returns a reference",
             "begin P = open_port({spawn, \"cat\"}, []), M = erlang:monitor(port, P), \
              port_close(P), is_reference(M) end",
+            "ok true",
+        ),
+        // --- erlang:monitor/3 `{tag, T}` delivery regression coverage ----------------------
+        // The tag is delivered as the leading element of the DOWN message; every assertion is
+        // a *shape* (element positions, `is_reference/1`, `process`, the locally bound pid) or
+        // the reason — never a pid/ref/port identity, which differs per VM start.
+        case(
+            "proc_signals/monitor_3_tag_delivers_tagged_down",
+            "a {tag, T} monitor delivers {T, Ref, process, Pid, normal} when the target exits",
+            "begin P = spawn(fun() -> receive go -> exit(normal) end end), \
+             Ref = erlang:monitor(process, P, [{tag, mytag}]), P ! go, \
+             receive Msg -> case Msg of \
+                 {mytag, MRef, process, Pid, Reason} -> \
+                     {element(1, Msg) =:= mytag, element(3, Msg) =:= process, \
+                      element(5, Msg) =:= normal, is_reference(MRef), Pid =:= P}; \
+                 _ -> unexpected \
+             end after 2000 -> timeout end end",
+            "ok {true,true,true,true,true}",
+        ),
+        case(
+            "proc_signals/monitor_3_tag_abnormal_reason_delivers_tagged_down",
+            "a {tag, T} monitor's DOWN carries the target's abnormal exit reason",
+            "begin P = spawn(fun() -> receive go -> exit(boom) end end), \
+             Ref = erlang:monitor(process, P, [{tag, mytag}]), P ! go, \
+             receive Msg -> case Msg of \
+                 {mytag, MRef, process, Pid, Reason} -> \
+                     {element(1, Msg) =:= mytag, Reason, is_reference(MRef), Pid =:= P}; \
+                 _ -> unexpected \
+             end after 2000 -> timeout end end",
+            "ok {true,boom,true,true}",
+        ),
+        case(
+            "proc_signals/monitor_3_integer_tag_delivers_tagged_down",
+            "a non-atom (integer) {tag, T} is delivered verbatim as the DOWN's leading element",
+            "begin P = spawn(fun() -> receive go -> exit(normal) end end), \
+             Ref = erlang:monitor(process, P, [{tag, 42}]), P ! go, \
+             receive Msg -> case Msg of \
+                 {42, MRef, process, Pid, Reason} -> \
+                     {element(1, Msg) =:= 42, element(3, Msg) =:= process, \
+                      element(5, Msg) =:= normal, is_reference(MRef), Pid =:= P}; \
+                 _ -> unexpected \
+             end after 2000 -> timeout end end",
+            "ok {true,true,true,true,true}",
+        ),
+        case(
+            "proc_signals/monitor_3_duplicate_tag_last_wins",
+            "erlang:monitor/3 with two {tag, T} options uses the last one",
+            "begin P = spawn(fun() -> receive go -> exit(normal) end end), \
+             Ref = erlang:monitor(process, P, [{tag, a}, {tag, b}]), P ! go, \
+             receive Msg -> case Msg of \
+                 {Tag, _, process, _, _} -> Tag; _ -> unexpected \
+             end after 2000 -> timeout end end",
+            "ok b",
+        ),
+        case(
+            "proc_signals/monitor_3_empty_options_is_reference",
+            "erlang:monitor/3 with an empty options list behaves like erlang:monitor/2",
+            "is_reference(erlang:monitor(process, self(), []))",
+            "ok true",
+        ),
+        case(
+            "proc_signals/monitor_3_named_target_is_reference",
+            "erlang:monitor/3 accepts the {Name, Node} target form with a {tag, T} option",
+            "is_reference(erlang:monitor(process, {a_named_target, node()}, [{tag, t1}]))",
+            "ok true",
+        ),
+        case(
+            "proc_signals/monitor_3_port_tag_option",
+            "erlang:monitor/3 accepts a port with a {tag, T} option",
+            "begin P = open_port({spawn, \"cat\"}, []), \
+             M = erlang:monitor(port, P, [{tag, t1}]), port_close(P), is_reference(M) end",
+            "ok true",
+        ),
+        case(
+            "proc_signals/monitor_3_tag_demonitor",
+            "a {tag, T} monitor's reference can be demonitored",
+            "begin Ref = erlang:monitor(process, self(), [{tag, t1}]), \
+             erlang:demonitor(Ref) end",
             "ok true",
         ),
     ]
@@ -311,6 +391,14 @@ mod tests {
         "proc_signals/monitor_bound_self_is_reference",
         "proc_signals/monitor_3_tag_option_unsupported",
         "proc_signals/monitor_port_unsupported",
+        "proc_signals/monitor_3_tag_delivers_tagged_down",
+        "proc_signals/monitor_3_tag_abnormal_reason_delivers_tagged_down",
+        "proc_signals/monitor_3_integer_tag_delivers_tagged_down",
+        "proc_signals/monitor_3_duplicate_tag_last_wins",
+        "proc_signals/monitor_3_empty_options_is_reference",
+        "proc_signals/monitor_3_named_target_is_reference",
+        "proc_signals/monitor_3_port_tag_option",
+        "proc_signals/monitor_3_tag_demonitor",
     ];
 
     fn case<'a>(cases: &'a [Case], id: &str) -> &'a Case {

@@ -39,15 +39,22 @@
 //!   `LIST_EXT` (108) incl. atom/binary/integer tails and long round trips;
 //! * tuples — `SMALL_TUPLE_EXT` (104) / `LARGE_TUPLE_EXT` (105) at the 255/256 arity
 //!   boundary, nested round trips;
-//! * binaries — `BINARY_EXT` (109) and `BIT_BINARY_EXT` (77) at every bit-count a
-//!   non-byte-aligned value exercises (2..15) plus round trips;
+//! * binaries — `BINARY_EXT` (109) at the 255/256-byte length boundary (always a 32-bit
+//!   length — no small-binary tag exists) and `BIT_BINARY_EXT` (77) at every bit-count a
+//!   non-byte-aligned value exercises (1..15) plus round trips, and the byte-aligned edge
+//!   (8/16 bits collapse back to `BINARY_EXT`);
 //! * maps — `MAP_EXT` (116): single-key byte goldens, and multi-key maps only ever
 //!   through round-trip equality / `maps:size` / sorted key lists (iteration order is
 //!   per-VM and never asserted);
 //! * funs — `EXPORT_EXT` (113) for external funs (`fun M:F/A`) plus the decode round trip;
 //! * framing — `VERSION_MAGIC` (131) as the first byte, the `compressed` (80) option
 //!   (`[compressed]`, `{compressed,Level}`, and the no-op small-term path),
-//!   `{minor_version,1|2}` and the first-byte/tag determinism predicates;
+//!   `{minor_version,1|2}`, hand-built `VERSION_MAGIC` blobs and the first-byte/tag
+//!   determinism predicates. The **compressed** framing is pinned (the leading `<<131,80,…>>`
+//!   and the 32-bit uncompressed size agree) but the zlib *middle* is **never** byte-compared:
+//!   the two runtimes' compressors emit different bytes there (the trailing Adler-32 still
+//!   matches), so a raw compressed golden would drift — only the `binary_to_term` round trip
+//!   is asserted;
 //! * `erlang:binary_to_term/2` — the `[safe]` accept/reject surface, the `[used]`
 //!   `{Term, BytesUsed}` shape, and the truncated / garbage / wrong-arity error shapes.
 //!
@@ -192,6 +199,8 @@ pub(crate) fn group() -> Vec<Case> {
         t("wire_extra/li_two_nonbyte", "a two-element list with non-byte elements uses LIST_EXT (108)", "[300,400]", "ok <<131,108,0,0,0,2,98,0,0,1,44,98,0,0,1,144,106>>"),
         v("wire_extra/li_string_255_tag", "a 255-byte list is a STRING_EXT (107)", "binary:at(term_to_binary(lists:duplicate(255,$a)),1)", "ok 107"),
         v("wire_extra/li_string_256_tag", "a 256-byte list is still a STRING_EXT (107) (16-bit length)", "binary:at(term_to_binary(lists:duplicate(256,$a)),1)", "ok 107"),
+        v("wire_extra/li_list_255_tag", "a 255-element list with a non-byte element is a LIST_EXT (108), not STRING_EXT", "binary:at(term_to_binary(lists:duplicate(255,300)),1)", "ok 108"),
+        v("wire_extra/li_list_256_tag", "a 256-element list with a non-byte element is a LIST_EXT (108), not STRING_EXT", "binary:at(term_to_binary(lists:duplicate(256,300)),1)", "ok 108"),
         v("wire_extra/li_empty_nil_size", "the empty list is the two-byte NIL_EXT (106) image", "byte_size(term_to_binary([]))", "ok 2"),
         t("wire_extra/li_string_long_roundtrip", "a 1000-byte string list round-trips", "binary_to_term(term_to_binary(lists:duplicate(1000,$a))) =:= lists:duplicate(1000,$a)", TRUE),
         t("wire_extra/li_long_list_roundtrip", "a 1000-element integer list round-trips", "binary_to_term(term_to_binary(lists:seq(1,1000))) =:= lists:seq(1,1000)", TRUE),
@@ -201,6 +210,8 @@ pub(crate) fn group() -> Vec<Case> {
         t("wire_extra/bi_one_byte", "a one-byte binary encodes as BINARY_EXT (109)", "<<0>>", "ok <<131,109,0,0,0,1,0>>"),
         t("wire_extra/bi_two_bytes", "a two-byte binary encodes as BINARY_EXT (109)", "<<1,2>>", "ok <<131,109,0,0,0,2,1,2>>"),
         v("wire_extra/bi_256_size", "a 256-byte binary image is the six-byte header plus 256 bytes", "byte_size(term_to_binary(binary:copy(<<0>>,256)))", "ok 262"),
+        v("wire_extra/bi_255_size", "a 255-byte binary image is the six-byte header plus 255 bytes", "byte_size(term_to_binary(binary:copy(<<0>>,255)))", "ok 261"),
+        v("wire_extra/bi_255_tag", "a 255-byte binary still leads with BINARY_EXT (109)", "binary:at(term_to_binary(binary:copy(<<0>>,255)),1)", "ok 109"),
         t("wire_extra/bi_large_roundtrip", "a 1000-byte binary round-trips", "binary_to_term(term_to_binary(binary:copy(<<0>>,1000))) =:= binary:copy(<<0>>,1000)", TRUE),
         t("wire_extra/bi_roundtrip_bytes", "a four-byte binary round-trips", "binary_to_term(term_to_binary(<<1,2,3,255>>)) =:= <<1,2,3,255>>", TRUE),
         t("wire_extra/bi_roundtrip_empty", "the empty binary round-trips", "binary_to_term(term_to_binary(<<>>)) =:= <<>>", TRUE),
@@ -212,6 +223,11 @@ pub(crate) fn group() -> Vec<Case> {
         t("wire_extra/bit_7_bits", "a 7-bit bitstring encodes a bit count of 7", "<<1:7>>", "ok <<131,77,0,0,0,1,7,2>>"),
         t("wire_extra/bit_9_bits", "a 9-bit bitstring spans two bytes with a bit count of 1", "<<3:9>>", "ok <<131,77,0,0,0,2,1,1,128>>"),
         t("wire_extra/bit_12_bits", "a 12-bit bitstring spans two bytes with a bit count of 4", "<<5:12>>", "ok <<131,77,0,0,0,2,4,0,80>>"),
+        t("wire_extra/bit_1_roundtrip", "a 1-bit bitstring round-trips", "binary_to_term(term_to_binary(<<1:1>>)) =:= <<1:1>>", TRUE),
+        t("wire_extra/bit_3_roundtrip", "a 3-bit bitstring round-trips", "binary_to_term(term_to_binary(<<5:3>>)) =:= <<5:3>>", TRUE),
+        v("wire_extra/bit_8_bits_is_binary_tag", "an 8-bit value is byte-aligned and encodes as BINARY_EXT (109), not BIT_BINARY_EXT", "binary:at(term_to_binary(<<1:8>>),1)", "ok 109"),
+        v("wire_extra/bit_8_bits_is_binary_size", "an 8-bit value's image is the six-byte header plus one byte", "byte_size(term_to_binary(<<1:8>>))", "ok 7"),
+        v("wire_extra/bit_16_bits_is_binary_tag", "a 16-bit value is byte-aligned and encodes as BINARY_EXT (109)", "binary:at(term_to_binary(<<1:16>>),1)", "ok 109"),
         t("wire_extra/bit_13_roundtrip", "a 13-bit bitstring round-trips", "binary_to_term(term_to_binary(<<5:13>>)) =:= <<5:13>>", TRUE),
         t("wire_extra/bit_15_roundtrip", "a 15-bit bitstring round-trips", "binary_to_term(term_to_binary(<<7:15>>)) =:= <<7:15>>", TRUE),
         // -- maps: MAP_EXT (116) ------------------------------------------------------
@@ -241,6 +257,7 @@ pub(crate) fn group() -> Vec<Case> {
         t("wire_extra/co_large_roundtrip_eq", "a compressed large term round-trips", "binary_to_term(term_to_binary(lists:duplicate(1000,$a), [compressed])) =:= lists:duplicate(1000,$a)", TRUE),
         t("wire_extra/co_level9_roundtrip", "the {compressed,9} option round-trips", "binary_to_term(term_to_binary(lists:seq(1,500), [{compressed,9}])) =:= lists:seq(1,500)", TRUE),
         t("wire_extra/co_level1_roundtrip", "the {compressed,1} option round-trips", "binary_to_term(term_to_binary(lists:seq(1,500), [{compressed,1}])) =:= lists:seq(1,500)", TRUE),
+        t("wire_extra/co_roundtrip_nested", "a compressed nested map/list round-trips", "binary_to_term(term_to_binary(#{a => lists:seq(1,100)}, [compressed])) =:= #{a => lists:seq(1,100)}", TRUE),
         // -- minor_version ------------------------------------------------------------
         v("wire_extra/mv1_nonlatin_atom_tag", "a non-latin1 atom is still SMALL_ATOM_UTF8_EXT (119) under {minor_version,1}", "binary:at(term_to_binary(list_to_atom([945]), [{minor_version,1}]),1)", "ok 119"),
         v("wire_extra/mv2_nonlatin_atom_tag", "a non-latin1 atom is still SMALL_ATOM_UTF8_EXT (119) under {minor_version,2}", "binary:at(term_to_binary(list_to_atom([945]), [{minor_version,2}]),1)", "ok 119"),
@@ -277,6 +294,9 @@ pub(crate) fn group() -> Vec<Case> {
         v("wire_extra/vf_len_tuple", "the {a,1,<<2>>} image is 14 bytes", "byte_size(term_to_binary({a,1,<<2>>}))", "ok 14"),
         t("wire_extra/vf_determinism_tuple", "term_to_binary/1 is deterministic for a tuple", "term_to_binary({a,1,<<2>>}) =:= term_to_binary({a,1,<<2>>})", TRUE),
         t("wire_extra/vf_determinism_map", "term_to_binary/1 is deterministic for a map", "term_to_binary(#{a=>1}) =:= term_to_binary(#{a=>1})", TRUE),
+        v("wire_extra/vf_decode_hand_built_nil", "a hand-built VERSION_MAGIC + NIL_EXT blob decodes to the empty list", "binary_to_term(<<131,106>>)", "ok []"),
+        v("wire_extra/vf_decode_hand_built_tuple", "a hand-built VERSION_MAGIC + SMALL_TUPLE_EXT blob decodes to a tuple", "binary_to_term(<<131,104,2,97,1,97,2>>)", "ok {1,2}"),
+        v("wire_extra/vf_decode_hand_built_atom", "a hand-built VERSION_MAGIC + SMALL_ATOM_UTF8_EXT blob decodes to an atom", "binary_to_term(<<131,119,4,116,114,117,101>>)", "ok true"),
         // -- round trips across every family ------------------------------------------
         t("wire_extra/rt_negative_ints", "a list of negative integers (incl. the 64-bit floor) round-trips", "binary_to_term(term_to_binary([-1,-300,-(1 bsl 63)])) =:= [-1,-300,-(1 bsl 63)]", TRUE),
         t("wire_extra/rt_small_ints_0_255", "the 0..255 integer range round-trips", "binary_to_term(term_to_binary(lists:seq(0,255))) =:= lists:seq(0,255)", TRUE),
@@ -285,6 +305,8 @@ pub(crate) fn group() -> Vec<Case> {
         t("wire_extra/rt_list_of_binaries", "a list of binaries round-trips", "binary_to_term(term_to_binary([<<1>>,<<2>>,<<3>>])) =:= [<<1>>,<<2>>,<<3>>]", TRUE),
         t("wire_extra/rt_deep_tuple", "a deeply nested tuple round-trips", "binary_to_term(term_to_binary({a,{b,{c,{d,e}}}})) =:= {a,{b,{c,{d,e}}}}", TRUE),
         t("wire_extra/rt_bit_binary_13", "a 13-bit bitstring round-trips", "binary_to_term(term_to_binary(<<5:13>>)) =:= <<5:13>>", TRUE),
+        t("wire_extra/rt_deep_list", "a deeply nested list round-trips", "binary_to_term(term_to_binary([1,[2,[3,[4,[5]]]]])) =:= [1,[2,[3,[4,[5]]]]]", TRUE),
+        t("wire_extra/rt_mixed_terms", "a spread of mixed-type terms each round-trips", "lists:all(fun(E) -> binary_to_term(term_to_binary(E)) =:= E end, [[], [1,2,3], <<1,2>>, <<5:3>>, {a,b}, #{k=>v}])", TRUE),
     ]
 }
 
@@ -349,10 +371,16 @@ mod tests {
             "wire_extra/tu_arity256_tag",
             "wire_extra/li_improper_atom_tail",
             "wire_extra/bit_9_bits",
+            "wire_extra/bit_8_bits_is_binary_tag",
+            "wire_extra/bi_255_tag",
+            "wire_extra/li_list_256_tag",
             "wire_extra/ma_single_binary_key",
             "wire_extra/fun_export_map_encode",
             "wire_extra/co_large_tag",
+            "wire_extra/co_roundtrip_nested",
             "wire_extra/mv2_nonlatin_atom_tag",
+            "wire_extra/vf_decode_hand_built_atom",
+            "wire_extra/rt_mixed_terms",
             "wire_extra/opt_used_shape",
             "wire_extra/err_truncated_tuple",
         ] {
