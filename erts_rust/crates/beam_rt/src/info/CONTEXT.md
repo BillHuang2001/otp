@@ -14,7 +14,8 @@ erlang:system_info(KEY)]), halt(0).'`.
 ## Module split
 | module | keys |
 |---|---|
-| `info.rs` (parent) | docs · `InfoValue` + `to_eterm` · `SUPPORTED_KEYS` / `UNSUPPORTED_KEYS` · `INFO_ATOMS` · `system_info_value` dispatcher · `allocator_report` · shared helpers · `#[cfg(test)] test_support` |
+| `info.rs` (parent) | docs · `InfoValue` + `to_eterm` · `SUPPORTED_KEYS` / `UNSUPPORTED_KEYS` · `INFO_ATOMS` · `system_info_value` dispatcher · `allocator_report` · shared helpers · re-exports `host::{os_type, system_architecture}` · `#[cfg(test)] test_support` |
+| `info/host.rs` | the host-identity derivations `os_type` (`{unix,<os>}` / `{win32,nt}` from `std::env::consts::OS`) and `system_architecture` (best-effort target triple), via the pure `os_type_for` / `architecture_for` helpers |
 | `info/system.rs` | build/host identity: `version`, `otp_release`, `system_architecture`, `system_version`, `nif_version`, `driver_version`, `wordsize`, `emu_flavor`, `emu_type`, `machine`, `threads`, `smp_support`, `async_dist`, `os_type`, `os_version`, `break_ignored`, `debug_compiled`, `dynamic_trace`, `dynamic_trace_probes`, `modified_timing_level`, `update_cpu_info`, `trace_control_word`, `port_parallelism`, `kernel_poll`, `halt_flush_timeout`, `creation` |
 | `info/limits.rs` | `atom_count`, `atom_limit`, `process_count`, `process_limit`, `port_count`, `port_limit`, `ets_count`, `ets_limit`, `outstanding_system_requests_limit`, `dist_buf_busy_limit`, `delayed_node_table_gc` |
 | `info/schedulers.rs` | `logical_processors` / `_available` / `_online`, `schedulers`, `schedulers_online`, `scheduler_id`, `dirty_cpu_schedulers` / `_online`, `dirty_io_schedulers`, `scheduler_bind_type`, `scheduler_bindings`, `multi_scheduling`, `multi_scheduling_blockers`, `normal_multi_scheduling_blockers`, `thread_pool_size`, `context_reductions` |
