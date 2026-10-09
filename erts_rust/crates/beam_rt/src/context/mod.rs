@@ -103,7 +103,7 @@ use beam_term::Eterm;
 
 use crate::error;
 use crate::mailbox::MailboxState;
-use crate::nif::NifHostImpl;
+use crate::nif::{NifHostImpl, RuntimeNifServices};
 use crate::port::RuntimePorts;
 use crate::runner::RunnerState;
 use crate::runtime::Runtime;
@@ -1436,16 +1436,43 @@ impl<'a> RuntimeContext<'a> {
         let interner = PendingInterner::new(atoms.len());
         let heap = self.runtime.take_bif_heap()?;
         let self_pid = self.mailbox_pid.to_eterm();
-        let mut host =
-            NifHostImpl::new(heap, Rc::clone(&atoms), interner.clone(), self_pid);
+        let schedulers = crate::info::schedulers_count(self.runtime) as i32;
+        // Clone the registry `Rc` so the call itself does not borrow `self.runtime` — the borrow
+        // below is spent on `services`.
+        let nifs = Rc::clone(&self.runtime.nifs);
+        // The runtime services the host calls back into, over the same process table the rest of
+        // the context resolves against (the slice's own table when there is one, else the
+        // runtime's). These are **disjoint** field borrows of `self.runtime`, which is what lets
+        // them co-exist with each other and with `self.mailbox_table`.
+        let processes: &ProcessTable = match &self.mailbox_table {
+            Some(table) => &**table,
+            None => &self.runtime.processes,
+        };
+        let mut services = RuntimeNifServices {
+            refs: &mut self.runtime.refs,
+            references: &mut self.runtime.references,
+            processes,
+        };
+        let mut host = NifHostImpl::new(
+            heap,
+            Rc::clone(&atoms),
+            interner.clone(),
+            self_pid,
+            schedulers,
+            Some(&mut services),
+        );
         // The registry is borrowed immutably only for the duration of the call, and released
         // before the interner is committed (which needs `&mut` on the code server).
         let outcome = {
-            let nifs = self.runtime.nifs.borrow();
+            let reg = nifs.borrow();
             let mut env = beam_abi::NifEnv::new(&mut host);
-            nifs.call(module, function, arity, &mut env, args)
+            reg.call(module, function, arity, &mut env, args)
         };
-        self.runtime.put_bif_heap(host.into_heap());
+        // Consuming the host releases its borrow of `services`, and dropping `services` releases
+        // the runtime field borrows before the heap/interner work below reuses `self.runtime`.
+        let heap = host.into_heap();
+        drop(services);
+        self.runtime.put_bif_heap(heap);
         // Same load-bearing emptiness guard as `call_registered`: `atoms_mut()` is
         // `Rc::make_mut`, and the live host/NIF-registry handles keep the shared table's
         // strong count above 1, so an unconditional commit would deep-clone the whole

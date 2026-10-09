@@ -416,11 +416,19 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
         let heap = beam_alloc::Heap::new(self.runtime.bif_heap_words).map_err(|error| {
             beam_bifs::NifLoadError::Load(format!("cannot allocate the NIF host heap: {error}"))
         })?;
+        // The real normal-scheduler count (`+S N` or the machine's parallelism); the count is
+        // recorded from the runtime, not hard-coded, so `enif_system_info` reports the truth.
+        let schedulers = crate::info::schedulers_count(self.runtime) as i32;
+        // This host is MOVED INTO the runtime's NIF registry, so it cannot borrow the runtime and
+        // carries no services: a `load`/`unload` callback's `make_ref`/`whereis_pid` stay the typed
+        // default (never a fabricated reference or pid).
         let mut host = Box::new(NifHostImpl::new(
             heap,
             Rc::clone(&self.atoms),
             self.interner.clone(),
             self.self_pid,
+            schedulers,
+            None,
         ));
         let lib = beam_abi::nif::loader::load(path, module, host.as_mut(), load_info)
             .map_err(crate::nif::map_load_error)?;
