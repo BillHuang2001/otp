@@ -47,15 +47,22 @@
 //!
 //! # [`TableProfile`]
 //!
-//! `beam_ets::TableOptions` stores the `{write_concurrency, …}` flag as a bool
-//! and has no field for the `{decentralized_counters, Bool}` option, so the
-//! *effective* `ets:info/1,2` rendering of those two fields is computed by the
-//! `ets:new/2` option parser and carried alongside the table in the registry. It
-//! reproduces the C exactly (`ets_new_2` in `erl_db.c`, plus
-//! `db_hash_create`'s lock-count normalization in `erl_db_hash.c`).
+//! `beam_ets`'s model owns the `ets:new/2` concurrency options: the parser drives
+//! [`TableOptions::set_write_concurrency_mode`] /
+//! [`TableOptions::set_decentralized_counters`], so the table itself records the
+//! `{write_concurrency, …}` mode and
+//! [`TableInfo::write_concurrency`](beam_ets::TableInfo::write_concurrency) /
+//! [`TableInfo::decentralized_counters`](beam_ets::TableInfo::decentralized_counters)
+//! are correct.
+//!
+//! The one thing the model's *boolean* `write_concurrency` cannot express is the
+//! **form** the oracle reports: the atom `auto` and the hidden
+//! `{debug_hash_fixed_number_of_locks, N}` tuple (whose `N` is the count
+//! `db_hash_create` normalizes). [`TableProfile`] carries exactly those two forms,
+//! and `ets:new/2` records one only when the parsed options asked for it.
 
 use beam_common::Result;
-use beam_ets::{Access, Heir, OwnerId, TableKind, TableOptions};
+use beam_ets::{Access, Heir, OwnerId, TableKind, TableOptions, WriteConcurrency};
 use beam_process::ProcessId;
 use beam_term::{atom_val, is_internal_pid, signed_value, AtomTable, Eterm};
 
@@ -163,51 +170,37 @@ pub(super) fn owner_pid(owner: OwnerId) -> Option<Eterm> {
 
 // ------------------------------------------------------- the table profile
 
-/// The `{write_concurrency, …}` form as written in an option list.
+/// The creation-time `ets:info(T, write_concurrency)` value that the model cannot
+/// express through
+/// [`TableInfo::write_concurrency`](beam_ets::TableInfo::write_concurrency)'s
+/// boolean — the atom `auto` and the hidden `{debug_hash_fixed_number_of_locks, N}`
+/// tuple.
+///
+/// The mode itself lives in the model ([`TableOptions::set_write_concurrency_mode`],
+/// with a `private` table normalizing it to `WriteConcurrency::Off`); the model's
+/// boolean already renders the plain `false`/`true` forms, so a profile is recorded
+/// only for these two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteConcurrency {
-    /// No `{write_concurrency, …}` option, or `{write_concurrency, false}`.
-    Off,
-    /// `{write_concurrency, true}`.
-    On,
-    /// `{write_concurrency, auto}`.
+pub(super) enum TableProfile {
+    /// `{write_concurrency, auto}` — the atom `auto`.
     Auto,
-    /// `{write_concurrency, {debug_hash_fixed_number_of_locks, N}}`.
-    FixedLocks(i64),
-}
-
-/// The effective `ets:info(T, write_concurrency)` rendering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WriteConcurrencyInfo {
-    /// The atom `false`.
-    Off,
-    /// The atom `true`.
-    On,
-    /// The atom `auto`.
-    Auto,
-    /// `{debug_hash_fixed_number_of_locks, N}`.
+    /// `{write_concurrency, {debug_hash_fixed_number_of_locks, N}}` — the hidden
+    /// tuple, with `N` the **normalized** lock count (`db_hash_create`'s rule: round
+    /// the requested count down to a power of two, then clamp up to
+    /// `NLOCKS_WITH_ITEM_COUNTERS`).
     FixedLocks(u64),
-}
-
-/// The creation-time option shapes `beam_ets::TableOptions`/`TableInfo` cannot
-/// express but `ets:info/1,2` reports: the effective `write_concurrency` and the
-/// `decentralized_counters` flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TableProfile {
-    /// The effective `write_concurrency` rendering.
-    pub(super) write_concurrency: WriteConcurrencyInfo,
-    /// The `decentralized_counters` flag.
-    pub(super) decentralized_counters: bool,
 }
 
 /// The `ets:new/2` option list, parsed.
 pub(super) struct ParsedOptions {
-    /// The `beam_ets`-storable option set (the name is set by the caller).
+    /// The `beam_ets`-storable option set (the name is set by the caller). It holds
+    /// the kind/access/flags, the effective `{write_concurrency, …}` mode and the
+    /// creation-time heir (set through [`TableOptions::set_heir`], so `Table::new`
+    /// deep-copies it into table-owned storage).
     pub(super) options: TableOptions,
-    /// The creation-time [`TableProfile`].
-    pub(super) profile: TableProfile,
-    /// The creation-time heir (`{heir, Pid}` / `{heir, Pid, Data}`).
-    pub(super) heir: Option<Heir>,
+    /// The `write_concurrency` form the model's boolean cannot express, if the
+    /// parsed options asked for one (see [`TableProfile`]).
+    pub(super) profile: Option<TableProfile>,
 }
 
 /// Parses the `ets:new/2` option list, reproducing the accept/reject matrix of
@@ -232,18 +225,22 @@ pub(super) struct ParsedOptions {
 /// `public`). Since `set`/`protected` are the defaults, a lone `set`/`protected`
 /// still yields a `set`/`protected` table.
 ///
-/// Two combinations are rejected **after** the loop, exactly as the C does:
-/// an `ordered_set` whose final `{write_concurrency, …}` form is the explicit
+/// One combination is rejected **after** the loop, exactly as the C does: an
+/// `ordered_set` whose final `{write_concurrency, …}` form is the explicit
 /// lock-count one (`erl_db.c:2727-2732`).
+///
+/// The parsed `{write_concurrency, …}` mode and `{decentralized_counters, Bool}` are
+/// handed to the model ([`TableOptions::set_write_concurrency_mode`] /
+/// [`TableOptions::set_decentralized_counters`]), so `TableInfo` resolves them; the
+/// parser additionally records the [`TableProfile`] for the two forms the boolean
+/// cannot express.
 pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOptions> {
     let elems = proper_list(term).ok_or_else(badarg)?;
     let mut options = TableOptions::new();
+    // The C's `is_fine_locked` request, accumulated through the loop (last wins).
     let mut wc = WriteConcurrency::Off;
-    // The C's `is_decentralized_counters`, accumulated through the loop.
-    let mut dc_derived = false;
-    // The C's `decentralized_counters_option` (`-1` = unset).
+    // The C's `decentralized_counters_option` (`None` = unset).
     let mut dc_option: Option<bool> = None;
-    let mut heir: Option<Heir> = None;
 
     for elem in elems {
         if is_atom(elem) {
@@ -255,7 +252,6 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
                     // the default, so a lone `set` still yields `set`.
                 }
                 "ordered_set" => {
-                    dc_derived = true;
                     options.set_kind(TableKind::OrderedSet);
                 }
                 "bag" => {
@@ -309,23 +305,12 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
             ("write_concurrency", 2) => {
                 let value = tuple_element(elem, 1);
                 wc = match atoms.name(atom_val(value)) {
-                    Some("auto") => {
-                        dc_derived = true;
-                        WriteConcurrency::Auto
-                    }
-                    Some("true") => {
-                        // `{write_concurrency, true}` clears the decentralized
-                        // flag unless the table is already an `ordered_set`.
-                        if options.kind() != TableKind::OrderedSet {
-                            dc_derived = false;
-                        }
-                        WriteConcurrency::On
-                    }
+                    Some("auto") => WriteConcurrency::Auto,
+                    Some("true") => WriteConcurrency::On,
                     Some("false") => WriteConcurrency::Off,
                     _ => {
                         let locks = locks_option(atoms, value)?;
-                        dc_derived = true;
-                        WriteConcurrency::FixedLocks(locks)
+                        WriteConcurrency::FixedLocks(locks as u32)
                     }
                 };
             }
@@ -344,15 +329,17 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
             ("heir", 2) => {
                 let value = tuple_element(elem, 1);
                 match atoms.name(atom_val(value)) {
-                    Some("none") => heir = None,
+                    Some("none") => {
+                        options.set_heir(None);
+                    }
                     _ => {
                         // The C stores `THE_NON_VALUE` as the gift data for the
                         // 2-tuple form => `None`, i.e. the heir inherits with no
                         // `{'ETS-TRANSFER', …}` message.
-                        heir = Some(Heir {
+                        options.set_heir(Some(Heir {
                             owner: owner_of(pid_arg(value)?),
                             data: None,
-                        });
+                        }));
                     }
                 }
             }
@@ -362,10 +349,10 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
                     return Err(badarg());
                 }
                 let data = tuple_element(elem, 2);
-                heir = Some(Heir {
+                options.set_heir(Some(Heir {
                     owner: owner_of(pid_arg(pid)?),
                     data: Some(data),
-                });
+                }));
             }
             ("decentralized_counters", 2) => {
                 let value = tuple_element(elem, 1);
@@ -381,37 +368,23 @@ pub(super) fn parse_options(atoms: &AtomTable, term: Eterm) -> Result<ParsedOpti
 
     // An `ordered_set` cannot take the hidden explicit lock count (it is a hash
     // table's knob): `erl_db.c:2727-2732`.
-    if options.kind() == TableKind::OrderedSet {
-        if let WriteConcurrency::FixedLocks(_) = wc {
-            return Err(badarg());
-        }
+    if options.kind() == TableKind::OrderedSet && wc.fixed_locks().is_some() {
+        return Err(badarg());
     }
 
-    let access = options.access();
-    // `DB_FINE_LOCKED`: the C only sets it for a fine-locked table that is not
-    // `private` (`erl_db.c:2722`, `:2748`).
-    let fine_locked = wc != WriteConcurrency::Off && access != Access::Private;
-    let write_concurrency = if !fine_locked {
-        WriteConcurrencyInfo::Off
-    } else {
-        match wc {
-            WriteConcurrency::Auto => WriteConcurrencyInfo::Auto,
-            WriteConcurrency::FixedLocks(n) => {
-                WriteConcurrencyInfo::FixedLocks(normalize_locks(n))
-            }
-            _ => WriteConcurrencyInfo::On,
-        }
+    // The model owns the mode and the counters flag (a `private` table normalizes
+    // its mode to `Off` on read, so the effective values come out right however the
+    // options were ordered).
+    options.set_write_concurrency_mode(wc);
+    options.set_decentralized_counters(dc_option);
+
+    // Only the two forms the model's boolean cannot express need a profile.
+    let profile = match options.write_concurrency_mode() {
+        WriteConcurrency::Auto => Some(TableProfile::Auto),
+        WriteConcurrency::FixedLocks(n) => Some(TableProfile::FixedLocks(normalize_locks(n))),
+        WriteConcurrency::Off | WriteConcurrency::On => None,
     };
-    let dc_derived = dc_option.unwrap_or(dc_derived);
-    let profile = TableProfile {
-        write_concurrency,
-        decentralized_counters: fine_locked && dc_derived,
-    };
-    Ok(ParsedOptions {
-        options,
-        profile,
-        heir,
-    })
+    Ok(ParsedOptions { options, profile })
 }
 
 /// The hidden lock-count option's inner tuple `{debug_hash_fixed_number_of_locks,
@@ -449,8 +422,11 @@ fn pid_arg(term: Eterm) -> Result<ProcessId> {
 /// `db_hash_create`'s lock-count normalization (`erl_db_hash.c:1040-1050`): round
 /// the requested count **down** to a power of two, then clamp up to
 /// `NLOCKS_WITH_ITEM_COUNTERS` (64).
-fn normalize_locks(requested: i64) -> u64 {
-    let requested = requested as u64;
+///
+/// `requested` is always `>= 1` (the option range is checked by [`locks_option`]),
+/// so the power-of-two rounding is well defined.
+fn normalize_locks(requested: u32) -> u64 {
+    let requested = u64::from(requested);
     let shift = 63 - requested.leading_zeros();
     (1u64 << shift).max(NLOCKS_WITH_ITEM_COUNTERS)
 }
