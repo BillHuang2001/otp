@@ -652,7 +652,8 @@ mod tests {
             dir.join(format!("perf-{}.map", std::process::id())),
             "the file must be <directory>/perf-<pid>.map"
         );
-        // Created, but empty: this runtime has no JIT ranges to name.
+        // Created, but empty: this unit test records nothing (a scheduled process's
+        // first module-export entry is what feeds real ranges through `PerfMap::record`).
         assert_eq!(std::fs::read(&path).expect("the map is readable"), b"");
 
         perf.record(0x1000, 0x20, "mymod:fun/1")
