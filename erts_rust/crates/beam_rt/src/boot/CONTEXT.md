@@ -218,12 +218,7 @@ short form is the safe one. Repro:
 - `boot/bootscript.rs`: `reads_the_real_start_boot_into_the_oracle_instruction_sequence` (parses the
   committed `bootstrap/bin/start.boot`; pins `{"Erlang/OTP","30"}`, 22 instructions and the instruction
   list); the bounded prefix test `the_real_start_boot_prefix_loads_its_prim_load_batches`; 
-  `the_real_start_boot_stops_honestly_at_the_first_unbootable_directive` (asserts the stop is a typed
-  `BeamError::Raise` on the `{apply,{c,erlangrc,[]}}` directive at **index 20**, and that the `primLoad`
-  modules loaded); `the_real_start_boot_reports_its_stop_through_execute_reporting` (the `execute_reporting`
-  API: `stop.total == instructions.len()`, `stop.index == Some(20)`, the named `Apply` is `c:erlangrc/0`,
-  and `whereis(application_controller)` is a live pid — pinning the
-  unlink); `a_synthetic_script_executes_end_to_end` (compiles a fixture with `erlc`, writes a synthetic
+  `a_synthetic_script_executes_end_to_end` (compiles a fixture with `erlc`, writes a synthetic
   `.boot` with `erl`, asserts the `apply` step really ran); `a_boot_spawned_process_answers_a_blocked_apply`
   (pins `drive.rs`: a `{kernelProcess, …}` burst and a later `{apply, …}` blocked on it, resumed by a
   scheduler drive, its dictionary side effect read back through `runtime.eval`); 
