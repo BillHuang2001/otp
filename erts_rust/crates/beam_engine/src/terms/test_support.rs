@@ -35,7 +35,7 @@
 //! and are never reachable from production code.
 use beam_common::Result;
 use beam_loader::Module;
-use beam_term::{AtomTable, Eterm};
+use beam_term::Eterm;
 
 use crate::context::{ExecutionContext, RootSet};
 use crate::machine::Machine;
@@ -99,23 +99,6 @@ pub(crate) fn make_fun(
         free.len(),
         0,
         |_, _| Ok(free.to_vec()),
-    )
-}
-
-/// Test wrapper for [`crate::terms::make_map`].
-pub(crate) fn make_map(
-    ctx: &mut dyn ExecutionContext,
-    pairs: &[(Eterm, Eterm)],
-    atoms: &AtomTable,
-) -> Result<Eterm> {
-    crate::terms::make_map(
-        &mut scratch(),
-        ctx,
-        RootSet::ALL_LIVE,
-        pairs.len(),
-        0,
-        atoms,
-        |_, _| Ok(pairs.to_vec()),
     )
 }
 

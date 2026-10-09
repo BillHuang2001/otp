@@ -21,8 +21,9 @@
 //! Bitstring **match entry** and match-context handling.
 //!
 //! Owns `bs_start_match3`/`bs_start_match4` (`enter_match` plus its
-//! `no_fail`/`resume` fail-operand decode), the match-context operand reader
-//! (`read_ctx`) and the `bs_set_position` position decode (`position_of`).
+//! `no_fail`/`resume` fail-operand decode), the match-context operand readers
+//! (`read_ctx`, and its post-allocation twin `reread_ctx`) and the
+//! `bs_set_position` position decode (`position_of`).
 use beam_common::Result;
 use beam_loader::{Label, Module, Operand, NO_FAIL};
 use beam_term::Eterm;
@@ -105,6 +106,30 @@ pub(crate) fn read_ctx(
     let (orig, start, end) = raw::ctx_parts(term)
         .ok_or_else(|| error::unsupported(&format!("{what}: operand is not a match context")))?;
     Ok((term, orig, start, end))
+}
+/// Re-read a match-context operand **after** an allocating read; the fresh
+/// (post-collection) context term is returned.
+///
+/// A rooted allocation ([`raw::make_bits`]/[`raw::make_big`]/
+/// [`crate::terms::make_float`]) may run a **moving** collector that relocates the
+/// context block, so an `Eterm` read *before* the allocation is a stale pointer
+/// afterwards. Any match opcode that (1) reads its context, (2) performs an
+/// allocating field read and (3) then writes the new position back into the
+/// context must therefore re-read the context operand **here** before the write —
+/// the frozen **reserve, then read, then write** ordering ([`crate::terms`]).
+/// The operand (a register/Y slot, part of the machine's root set, which the
+/// collector rewrites in place) is re-evaluated rather than the stale term reused.
+///
+/// This is the term-only twin of [`read_ctx`]; it still validates that the operand
+/// is a live match context.
+pub(crate) fn reread_ctx(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    operand: &Operand,
+    what: &str,
+) -> Result<Eterm> {
+    let (term, _, _, _) = read_ctx(machine, ctx, operand, what)?;
+    Ok(term)
 }
 /// The bit position a `bs_set_position` operand denotes.
 ///

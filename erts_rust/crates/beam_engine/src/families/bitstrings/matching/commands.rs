@@ -39,7 +39,7 @@ use crate::Step;
 use super::super::{
     decode_flags, extract_bits, fail_step, is_all, raw, read_size, read_uint_be, small_value,
 };
-use super::match_ctx::read_ctx;
+use super::match_ctx::{read_ctx, reread_ctx};
 use super::reads::read_integer_field;
 // ---------------------------------------------------------------------------
 // The `bs_match` command interpreter
@@ -54,11 +54,21 @@ pub(crate) fn run_commands(
     commands: &[Operand],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
-    let bytes = raw::subject_bytes(orig)?;
+    // `pos` is a *local* cursor: the context's own position is written back only
+    // once the whole command list has succeeded, so every re-read below yields the
+    // same `(start, end)` for this invocation.
+    let (_, _, start, _) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
     let mut pos = start;
     let mut i = 0usize;
     while i < commands.len() {
+        // Re-derive the context and its byte view at the top of **every** iteration:
+        // the previous iteration's `integer`/`binary`/`get_tail` command allocated
+        // through the rooted seam (`read_integer_field` -> `raw::make_big`,
+        // `raw::make_bits`), whose moving collector may have relocated the context
+        // block, so a `term`/`bytes` captured before that allocation is stale
+        // (the frozen reserve, then read, then write ordering).
+        let (_, orig, _, end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
+        let bytes = raw::subject_bytes(orig)?;
         let Operand::Atom(command) = &commands[i] else {
             return Err(error::unsupported(
                 "bs_match: command list does not start with an atom",
@@ -175,7 +185,10 @@ pub(crate) fn run_commands(
             }
         }
     }
-    // Commit the advanced position only once the whole command list succeeded.
+    // Commit the advanced position only once the whole command list succeeded. The
+    // last command may have allocated, so re-read the context operand for a fresh
+    // (post-collection) term before mutating its position in place.
+    let term = reread_ctx(machine, ctx, ctx_op, "bs_match")?;
     raw::set_ctx_start(term, pos);
     Ok(Some(Step::Next))
 }
