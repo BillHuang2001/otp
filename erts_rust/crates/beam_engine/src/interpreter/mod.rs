@@ -109,11 +109,43 @@ type ImportTable = Vec<std::result::Result<ImportTarget, &'static str>>;
 
 /// The two backing representations of a [`LabelMap`].
 enum Slots {
-    /// `slots[label.0]` over ids `0..=max`; `slots[0]` is the unused `NO_FAIL`
-    /// sentinel and stays `None`.
-    Dense(Vec<Option<(u32, u32)>>),
+    /// `slots[label.0]` over ids `0..=max`, each entry the target **packed** into
+    /// one word ([`pack_target`]); `slots[0]` is the unused `NO_FAIL` sentinel and
+    /// stays [`UNUSED_LABEL`].
+    ///
+    /// Packing the `(func index, code index)` pair into a single `u64` is what makes
+    /// [`LabelMap::resolve`] — one of the hottest non-dispatch operations in the
+    /// loop (every branch, `test`-fail, `call`, `select_val` and `return` resolves
+    /// one) — a single 8-byte load and one compare: the previous
+    /// `Option<(u32, u32)>` slot was 12 bytes, so every lookup paid a
+    /// `base + index * 12` `lea` chain *and* a separate discriminant-byte load and
+    /// branch, and the table was 1.5x larger.
+    Dense(Vec<u64>),
     /// `(label id, target)` sorted by id, for a sparse id space.
     Sparse(Vec<(u32, (u32, u32))>),
+}
+
+/// The "this label is not defined" sentinel of the dense slot table
+/// ([`Slots::Dense`]).
+///
+/// A packed target is `func_index << 32 | code_index`, so the sentinel collides
+/// only with the pair `(u32::MAX, u32::MAX)`: neither a module's function table nor
+/// a function's code array can be `u32::MAX` entries long, and `build_label_map`
+/// never emits a target with either half `u32::MAX` for a table that small. So a
+/// defined label and the sentinel can never be confused.
+const UNUSED_LABEL: u64 = u64::MAX;
+
+/// Pack a `(func index, code index)` label target into one word for
+/// [`Slots::Dense`] (the inverse of the unpacking [`LabelMap::resolve`] does).
+#[inline]
+const fn pack_target(target: (u32, u32)) -> u64 {
+    ((target.0 as u64) << 32) | target.1 as u64
+}
+
+/// Unpack a [`Slots::Dense`] word back into its `(func index, code index)` target.
+#[inline]
+const fn unpack_target(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, packed as u32)
 }
 
 impl LabelMap {
@@ -135,9 +167,9 @@ impl LabelMap {
             Slots::Dense(slots) => {
                 let index = label.0 as usize;
                 if index >= slots.len() {
-                    slots.resize(index + 1, None);
+                    slots.resize(index + 1, UNUSED_LABEL);
                 }
-                slots[index] = Some(target);
+                slots[index] = pack_target(target);
             }
             Slots::Sparse(entries) => match entries.binary_search_by_key(&label.0, |(id, _)| *id) {
                 Ok(found) => match entries.get_mut(found) {
@@ -155,7 +187,7 @@ impl LabelMap {
     pub(crate) fn resolve(&self, label: Label) -> Result<(u32, u32)> {
         match &self.slots {
             Slots::Dense(slots) => match slots.get(label.0 as usize) {
-                Some(Some(target)) => Ok(*target),
+                Some(&packed) if packed != UNUSED_LABEL => Ok(unpack_target(packed)),
                 _ => Err(error::unknown_label(label)),
             },
             Slots::Sparse(entries) => {
@@ -260,10 +292,10 @@ pub(crate) fn build_label_map(module: &Module) -> LabelMap {
         }
     }
     if max as u64 <= (count as u64).saturating_mul(4) + 64 {
-        let mut slots: Vec<Option<(u32, u32)>> = vec![None; max as usize + 1];
+        let mut slots: Vec<u64> = vec![UNUSED_LABEL; max as usize + 1];
         for (func_index, function) in module.functions.iter().enumerate() {
             for (label, &code_index) in &function.labels {
-                slots[label.0 as usize] = Some((func_index as u32, code_index as u32));
+                slots[label.0 as usize] = pack_target((func_index as u32, code_index as u32));
             }
         }
         LabelMap {
