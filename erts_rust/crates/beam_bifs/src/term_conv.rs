@@ -447,9 +447,25 @@ fn is_integer_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// (`erts/lib_src/common/erl_printf.c:135`, whose flag
 /// `erts_printf_add_cr_to_stdout` is set by `erts/emulator/sys/unix/sys.c:342`),
 /// which turns every `\n` into `\r\n`. Pinned to the oracle — the bytes of
-/// `erlang:display(<<"a b">>)`, `erlang:display([97,98])` and
-/// `erlang:display("ström")` are `<<"a b">>\r\n`, `"ab"\r\n` and `"ström"\r\n`
-/// (with the raw latin-1 byte `0xF6`), and the return value is `true`.
+/// `erlang:display(<<"a b">>)` and `erlang:display([97,98])` are `<<"a b">>\r\n`
+/// and `"ab"\r\n`, and the return value is `true`.
+///
+/// # Documented deviation: a printable latin-1 character ≥ `16#80`
+///
+/// The oracle's `%T` renderer emits **raw latin-1 code units**, so
+/// `erlang:display("ström")` — the list `[115,116,114,246,109]` — writes
+/// `22 73 74 72 F6 6D 22 0D 0A` (`erl -noshell -eval 'erlang:display("str\xF6m"), halt().'`).
+/// This crate's leaf renderer ([`src/print.rs`](crate::print), `quoted_string`)
+/// builds a Rust `String` from those code points — which is what makes the *same*
+/// renderer byte-exact for `io:format("~p", …)`, whose oracle path (`io_lib`)
+/// really does write UTF-8 — so the `ö` (`16#F6`) leaves here as the **UTF-8**
+/// pair: `22 73 74 72 C3 B6 6D 22 0D 0A`. Every code unit ≤ `16#7F` (the whole ASCII
+/// surface, i.e. everything an ordinary non-string term renders to) is
+/// byte-identical to the oracle; only a latin-1 byte ≥ `16#80` inside a printable
+/// string/binary leaf differs. Closing it needs a byte-oriented `OutputSink`
+/// (a `context.rs`/`beam_rt` interface change) — the `&str` sink cannot carry a
+/// bare `16#F6` — not a fix local to this BIF (see the `display_writes_a_printable_latin1_char_as_utf8`
+/// test).
 ///
 /// # Errors
 ///
@@ -1248,5 +1264,30 @@ mod tests {
             assert!(display_string_2(&mut ctx, &[stderr, NIL]).is_err());
         }
         assert_eq!(sink.contents(), b"<<\"a b\">>\r\n\xC3\xB6".to_vec());
+    }
+
+    /// The `display/1` latin-1 deviation, pinned exactly: `erlang:display("ström")`
+    /// (the list `[115,116,114,246,109]`) writes UTF-8 `C3 B6` where the oracle's
+    /// `%T` renderer writes the raw latin-1 `F6` (see the `display_1` doc). The rest
+    /// of the line (`"str` … `m"` + `\r\n`) is byte-identical to the oracle, whose
+    /// bytes are `22 73 74 72 F6 6D 22 0D 0A`.
+    #[test]
+    fn display_writes_a_printable_latin1_char_as_utf8() {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = atoms();
+        let mut sink = crate::context::BytesSink::new();
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_output(&mut sink);
+            let chars: Vec<Eterm> = [115, 116, 114, 246, 109]
+                .into_iter()
+                .map(|c| ctx.int(c).expect("fits"))
+                .collect();
+            let list = ctx.list(&chars).expect("fits");
+            let result = display_1(&mut ctx, &[list]).expect("renderable");
+            assert_eq!(ctx.atoms().name(atom_val(result)), Some("true"));
+        }
+        // `"str` + UTF-8 `C3 B6` + `m"` + `\r\n` (the oracle: `22 73 74 72 F6 6D 22 0D 0A`).
+        assert_eq!(sink.contents(), b"\"str\xC3\xB6m\"\r\n".to_vec());
     }
 }
