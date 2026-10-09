@@ -738,6 +738,9 @@ still reproduces today's collector exactly.
 - `tests/cyclic_safety.rs` → `size_object_bounded` cyclic verdict (typed `TermGraphCyclic`, no hang) + the collector's forwarding-pointer cycle-safety under both strategies
 - `tests/fill_barrier.rs` → the young-heap-exhaustion / fill-barrier contract (typed error before any copy, no half-forward, `ensure_capacity` growth, boundary cases)
 - `tests/retained_vs_live.rs` → GC-side retained-vs-live accounting over a long allocate/collect loop (steady-state capacities, bounded non-growing surplus, RSS plateau)
+- `tests/immix_selection_curve.rs` → the two-axis mature-strategy selection curve (object-size distribution × mature capacity); deterministic counts asserted, pause printed only
+- `tests/immix_invariants.rs` → the mark-region invariant probes (major reclaim→slot-rewrite→promote ordering, line-bitmap consistency, no double-free; mutation-verified)
+- `tests/immix_stress.rs` → the mark-region stress set (multi-block promotion, fragmentation/reuse, repeated-minor promotion, mixed workload, asserted live-set-bounded accounting)
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`/`adjust_after_fullsweep`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
 - `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`) (read-only)
