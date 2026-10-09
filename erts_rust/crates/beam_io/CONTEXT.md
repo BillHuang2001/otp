@@ -32,6 +32,7 @@ Only **frozen contracts and non-obvious behaviour** are listed; rustdoc carries 
 
 ### `port_task.rs` (port-task scheduling — `erts_port_task_execute`)
 - Reduction constants: `CONTEXT_REDS = 4000`; `PORT_REDS_{INPUT,OUTPUT,TIMEOUT} = CONTEXT_REDS/100 (40)`; `PORT_REDS_EXECUTE = CONTEXT_REDS/4 (1000)`.
+  `PortTaskOutcome::reds_used` models the per-kind cost only: the C additionally charges `erts_port_driver_callback_epilogue` + `ERTS_PORT_CALLBACK_VREDS` (`CONTEXT_REDS/20`) per task and `ERTS_PORT_REDS_FREE` on teardown, and bounds the round at `CONTEXT_REDS` (`erl_port_task.c:1730,1833,1848,1854-1860`).
   · `PortTaskKind { Input, Output, Timeout }` (`priority()`: Input < Output < Timeout; `reductions()`); `PortTask` (`Copy + Eq + Debug`).
   · `PortTaskQueue` — one pending task per kind (dedupe), ordered by kind priority then FIFO `seq`, timeouts deadline-gated; `arm_timeout(deadline)` re-points/replaces a pending `TIMEOUT` (unlike the dedupe-only `enqueue_timeout`).
 - `Readiness { readable, writable, error, read_closed, write_closed }` — `read_ready()` (readable ‖ read_closed ‖ error), `write_ready()` (writable ‖ write_closed), `is_idle()`, `From<Ready>`.
