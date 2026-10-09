@@ -48,14 +48,22 @@
 //! directories (both as configured) and finally the **system** `ebin` directories
 //! (stdlib, kernel and erts) resolved from the running Erlang installation at start-up.
 //!
+//! Those directories are located **from the filesystem** — `$ERTS_STDLIB_DIR` when set, else the
+//! standard OTP installation layout under the `erl` on `$PATH` (resolved to a path, never
+//! executed), this executable, `$ERL_TOP` or a standard prefix (see [`native_system_ebins`]).
+//! The system `erl` is only *run* ([`erl_system_ebins`]) for an installation that layout cannot
+//! see; asking it is authoritative but costs a whole interpreter start-up per OS process, which
+//! is why it is the last resort.
+//!
 //! # Failure is loud
 //!
 //! A module that cannot be found raises the bare `error:undef` the oracle raises for a call
 //! to a module the release does not have (see [`CodeServer::not_found`]) — never a silent
-//! miss and never a fabricated module. The system code path is resolved either from the
-//! `ERTS_STDLIB_DIR` environment override or by asking the system `erl`; if neither
-//! works, [`CodeServer::add_system_paths`] reports an honest error rather than
-//! quietly running without a standard library.
+//! miss and never a fabricated module. No path is ever guessed: every candidate has to really
+//! hold the probe module (`lists.beam` decides for stdlib, the hard requirement), and if
+//! neither the filesystem probe nor `erl` produces a usable stdlib,
+//! [`CodeServer::add_system_paths`] reports an honest error rather than quietly running
+//! without a standard library.
 
 use std::collections::HashMap;
 use std::env;
@@ -122,13 +130,14 @@ impl CodeServer {
     /// path.
     ///
     /// The directories are resolved once per process (see [`system_ebins`]) from
-    /// `$ERTS_STDLIB_DIR` or, failing that, from the system `erl`. A failure here is a
-    /// hard error: running without a standard library is never silent.
+    /// `$ERTS_STDLIB_DIR`, from the installation's own filesystem layout, or — as a last
+    /// resort — from the system `erl`. A failure here is a hard error: running without a
+    /// standard library is never silent.
     ///
     /// # Errors
     ///
-    /// A message-carrying [`beam_common::BeamError`] naming the environment variable
-    /// or the `erl` invocation that failed.
+    /// A message-carrying [`beam_common::BeamError`] naming the environment variable or the
+    /// `erl` invocation that failed.
     pub fn add_system_paths(&mut self) -> Result<()> {
         for dir in system_ebins()? {
             self.add_path(dir);
@@ -370,8 +379,8 @@ impl Default for CodeServer {
 ///
 /// # Errors
 ///
-/// The recorded resolution failure (an unusable `$ERTS_STDLIB_DIR` or a failed `erl`
-/// invocation), reported loyally on every call.
+/// The recorded resolution failure (an unusable `$ERTS_STDLIB_DIR` or — when the filesystem
+/// probe found no installation — a failed `erl` invocation), reported loyally on every call.
 fn system_ebins() -> Result<Vec<PathBuf>> {
     static CACHE: OnceLock<std::result::Result<Vec<PathBuf>, String>> = OnceLock::new();
     match CACHE.get_or_init(|| resolve_system_ebins().map_err(|error| error.to_string())) {
@@ -380,18 +389,164 @@ fn system_ebins() -> Result<Vec<PathBuf>> {
     }
 }
 
-/// Resolves the system `ebin` directories from the environment or the system `erl`.
+/// Resolves the system `ebin` directories from the environment, the filesystem or — as a last
+/// resort — the system `erl`.
+///
+/// `erl` is the authority on where its own release lives (`code:lib_dir/1`), but running it costs
+/// a whole interpreter start-up **per OS process** and needs an `erl` on `$PATH`, which a
+/// standalone runtime does not have. What it answers is the *standard* OTP installation layout,
+/// which the filesystem already describes — so the native probe ([`native_system_ebins`]) runs
+/// first and the shell-out ([`erl_system_ebins`]) covers only the layouts it cannot see.
 fn resolve_system_ebins() -> Result<Vec<PathBuf>> {
     if let Ok(dir) = env::var("ERTS_STDLIB_DIR") {
         return stdlib_dir_override(Path::new(&dir));
     }
+    if let Some(dirs) = native_system_ebins() {
+        return Ok(dirs);
+    }
+    erl_system_ebins()
+}
 
+/// The system `ebin` directories located **without running `erl`**, when the installation is
+/// discoverable from the filesystem.
+///
+/// Candidate roots ([`native_roots`]) are accepted only when they hold the [`SYSTEM_APPS`] probe
+/// modules: `lists.beam` decides (no stdlib, no usable code path) while `kernel` and `erts` are
+/// best-effort, exactly as in the `erl` probe.
+fn native_system_ebins() -> Option<Vec<PathBuf>> {
+    native_roots().into_iter().find_map(|root| system_ebins_under(&root))
+}
+
+/// The candidate OTP installation roots, most specific first, deduplicated.
+///
+/// A root is a directory the standard layout can be read from (`<root>/lib/<app>-<vsn>/ebin`,
+/// `<root>/erts-<vsn>/ebin`, or their unversioned source-tree forms). The seeds are, in order:
+/// the `erl` on `$PATH` — resolved to a filesystem path and **never executed**, so that the
+/// installation this runtime is interchangeable with wins (`…/erts-<vsn>/bin/erl` makes its
+/// release root an ancestor); this executable (an OTP source tree above it, or a runtime copied
+/// into an installation); `$ERL_TOP`, a *build* tree, hence after the installed runtimes; and
+/// finally the standard prefixes ([`STANDARD_OTP_ROOTS`]).
+///
+/// Every seed is tried both as itself and as a `<seed>/lib/erlang` prefix: that is where a
+/// `--prefix` installation puts the release root (`/usr/lib/erlang`, a Nix store path, …).
+fn native_roots() -> Vec<PathBuf> {
+    let mut seeds: Vec<PathBuf> = Vec::new();
+    if let Some(erl) = find_on_path("erl") {
+        let erl = erl.canonicalize().unwrap_or(erl);
+        seeds.extend(ancestors(erl.parent().unwrap_or_else(|| Path::new(".")), 8));
+    }
+    if let Ok(current) = env::current_exe() {
+        seeds.extend(ancestors(current.parent().unwrap_or_else(|| Path::new(".")), 8));
+    }
+    if let Some(top) = env::var_os("ERL_TOP") {
+        seeds.push(PathBuf::from(top));
+    }
+    seeds.extend(STANDARD_OTP_ROOTS.iter().map(|base| PathBuf::from(*base)));
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for seed in seeds {
+        for root in [seed.clone(), seed.join("lib").join("erlang")] {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+/// The [`SYSTEM_APPS`] `ebin` directories under one candidate OTP root, or `None` when the root
+/// is not an installation this runtime can use (it holds no `lists.beam`).
+///
+/// An installed release keeps every application in `<root>/lib` (the Nix build keeps the `erts`
+/// application there too), a source tree keeps stdlib/kernel in `<root>/lib` but its preloaded
+/// modules in `<root>/erts/preloaded/ebin`, and a `--prefix` installation may put `erts-<vsn>`
+/// next to `lib/` instead of inside it. All those shapes are searched, and each application is
+/// accepted only where it holds its probe module.
+fn system_ebins_under(root: &Path) -> Option<Vec<PathBuf>> {
+    let containers = [
+        root.join("lib"),
+        root.to_path_buf(),
+        root.join("erts").join("preloaded"),
+    ];
+    let mut dirs = Vec::new();
+    for (index, (app, module)) in SYSTEM_APPS.iter().enumerate() {
+        match containers
+            .iter()
+            .find_map(|container| app_ebin_under(container, app, module))
+        {
+            Some(ebin) => dirs.push(ebin),
+            // stdlib must be usable, or nothing above it can be loaded.
+            None if index == 0 => return None,
+            // kernel and erts are best-effort: `<app dir>/ebin` when it holds the probe module.
+            None => {}
+        }
+    }
+    Some(dirs)
+}
+
+/// The `ebin` directory of the application `app` inside `container`, when it holds
+/// `<module>.beam`.
+///
+/// `container` is a `<lib>` directory (`<container>/<app>-<vsn>/ebin`), an OTP root
+/// (`<container>/<app>-<vsn>/ebin`, or `<container>/<app>/ebin` for a source tree), or the
+/// application directory itself (`<container>/ebin`, the source tree's `erts/preloaded`). The
+/// versioned name wins: it is the installed layout.
+fn app_ebin_under(container: &Path, app: &str, module: &str) -> Option<PathBuf> {
+    find_sibling_ebin(container, app, module)
+        .or_else(|| app_ebin(&container.join(app), module))
+        .or_else(|| app_ebin(container, module))
+}
+
+/// The standard OTP installation prefixes (a `<prefix>` holding the release root itself or
+/// `<prefix>/lib/erlang`), probed after everything discoverable from the environment.
+const STANDARD_OTP_ROOTS: &[&str] = &[
+    "/usr/lib/erlang",
+    "/usr/local/lib/erlang",
+    "/usr/lib64/erlang",
+    "/opt/erlang",
+];
+
+/// The first `name` on `$PATH` (whether or not it is executable): used only to locate an
+/// installation layout, so the file is canonicalized before anything is read out of it.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// `path` and its ancestors, at most `limit` of them.
+fn ancestors(path: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        out.push(dir.to_path_buf());
+        if out.len() >= limit {
+            break;
+        }
+        current = dir.parent();
+    }
+    out
+}
+
+/// The **last-resort** probe: ask the system `erl` for `code:lib_dir/1` of every [`SYSTEM_APPS`]
+/// entry.
+///
+/// Kept — rather than removed in favour of [`native_system_ebins`] — because no filesystem probe
+/// can see *every* installation: a version manager (`asdf`, `kerl`) may expose a **shim script**
+/// on `$PATH` while keeping the release under a layout reachable from neither the shim nor this
+/// executable, and a wrapper `erl` may live outside the release it starts. Asking `erl` is
+/// authoritative, so it is the honest fallback (a path is never fabricated), and its cost — one
+/// interpreter start-up — is paid only when the native probe found no stdlib at all.
+fn erl_system_ebins() -> Result<Vec<PathBuf>> {
     let output = Command::new("erl")
         .args(["-noshell", "-eval", &system_apps_eval()])
         .output()
         .map_err(|source| {
             error::message(format!(
-                "cannot run `erl` to locate the system code path (set $ERTS_STDLIB_DIR to override): {source}"
+                "cannot locate the system code path: the filesystem probe found no stdlib and \
+                 `erl` cannot be run to report it either (set $ERTS_STDLIB_DIR to name the \
+                 stdlib directory): {source}"
             ))
         })?;
     if !output.status.success() {
@@ -431,9 +586,10 @@ fn resolve_system_ebins() -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-/// The system applications whose `ebin` directories make up the default code path, in
-/// the order [`system_apps_eval`] asks the system `erl` for them, each paired with a
-/// module the directory must contain (the resolver's proof that it is the real thing).
+/// The system applications whose `ebin` directories make up the default code path, in the
+/// order they are searched (and the order [`system_apps_eval`] asks the system `erl` for
+/// them), each paired with a module the directory must contain (the resolver's proof that it
+/// is the real thing).
 ///
 /// `erts` holds the **preloaded** modules' `.beam` files (`init`, `persistent_term`,
 /// `prim_*`, …): they ship in `<lib>/erts-<vsn>/ebin`, not in stdlib or kernel, so the
@@ -441,6 +597,8 @@ fn resolve_system_ebins() -> Result<Vec<PathBuf>> {
 const SYSTEM_APPS: &[(&str, &str)] = &[("stdlib", "lists"), ("kernel", "kernel"), ("erts", "init")];
 
 /// The `erl -eval` program that prints the [`SYSTEM_APPS`] directories, one per line.
+///
+/// This is the shell-out fallback's argument list ([`erl_system_ebins`]) only.
 fn system_apps_eval() -> String {
     let control: String = SYSTEM_APPS.iter().map(|_| "~s~n").collect();
     let args: Vec<String> = SYSTEM_APPS
@@ -522,6 +680,8 @@ fn find_sibling_ebin(lib_root: &Path, prefix: &str, module: &str) -> Option<Path
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     /// A server over the system code path, or `None` when no system Erlang is
@@ -537,6 +697,31 @@ mod tests {
         }
     }
 
+    /// Creates `$TMPDIR/beam_rt_codeserver_<pid>_<n>_<label>` (unique per test and run): the root
+    /// of a synthetic OTP installation layout.
+    fn scratch(label: &str) -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = env::temp_dir().join(format!(
+            "beam_rt_codeserver_{}_{}_{label}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// Creates an empty `<module>.beam` under `dir` (with its parents): the resolver's proof that a
+    /// directory is an application's `ebin`.
+    fn touch(dir: &Path, module: &str) {
+        std::fs::create_dir_all(dir).expect("an application directory");
+        std::fs::write(dir.join(format!("{module}.beam")), b"").expect("a probe module");
+    }
+
+    /// The `<app>-<vsn>/ebin` directory of a synthetic installed release under `root`.
+    fn installed_ebin(root: &Path, app: &str) -> PathBuf {
+        root.join("lib").join(format!("{app}-9.9")).join("ebin")
+    }
     #[test]
     fn an_empty_server_has_no_atoms_no_modules_and_no_path() {
         let mut server = CodeServer::new();
@@ -632,6 +817,8 @@ mod tests {
             SYSTEM_APPS.iter().map(|(app, _)| *app).collect::<Vec<_>>(),
             vec!["stdlib", "kernel", "erts"]
         );
+        // The native probe and the shell-out share this table, so the order (and the proof
+        // module each entry must find) is fixed in one place; this pins the fallback's argv.
         let probe = system_apps_eval();
         for (app, _) in SYSTEM_APPS {
             assert!(probe.contains(&format!("code:lib_dir({app})")), "{probe}");
@@ -642,6 +829,104 @@ mod tests {
         assert!(probe.ends_with("]),halt()."));
     }
 
+    #[test]
+    fn a_root_is_recognised_from_the_installation_layout() {
+        // An installed release: every application under `<root>/lib/<app>-<vsn>/ebin`.
+        let root = scratch("installed");
+        for (app, module) in SYSTEM_APPS {
+            touch(&installed_ebin(&root, app), module);
+        }
+        assert_eq!(
+            system_ebins_under(&root),
+            Some(SYSTEM_APPS.iter().map(|(app, _)| installed_ebin(&root, app)).collect())
+        );
+
+        // The same, with the `erts` application *next to* `lib/` — the `--prefix` layout that
+        // `code:lib_dir(erts)` reports for an in-tree build.
+        let root = scratch("erts_sibling");
+        touch(&installed_ebin(&root, "stdlib"), "lists");
+        touch(&installed_ebin(&root, "kernel"), "kernel");
+        touch(&root.join("erts-9.9").join("ebin"), "init");
+        assert_eq!(
+            system_ebins_under(&root),
+            Some(vec![
+                installed_ebin(&root, "stdlib"),
+                installed_ebin(&root, "kernel"),
+                root.join("erts-9.9").join("ebin"),
+            ])
+        );
+
+        // An OTP source tree: unversioned applications (`<root>/lib/<app>/ebin`, covered above by
+        // stdlib), the preloaded modules under `erts/`, and no kernel app at all (best-effort, so
+        // it is simply absent).
+        let root = scratch("source_tree");
+        touch(&root.join("lib").join("stdlib").join("ebin"), "lists");
+        touch(&root.join("erts").join("preloaded").join("ebin"), "init");
+        assert_eq!(
+            system_ebins_under(&root),
+            Some(vec![
+                root.join("lib").join("stdlib").join("ebin"),
+                root.join("erts").join("preloaded").join("ebin"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_root_is_judged_by_the_probe_modules_not_by_directory_names() {
+        // A `stdlib-*` directory without `lists.beam` is not an application: the search does not
+        // stop at the (lexicographically first) versioned directory but at the first one that
+        // really holds the module.
+        let root = scratch("proof");
+        std::fs::create_dir_all(root.join("lib").join("stdlib-1.0").join("ebin"))
+            .expect("an empty application directory");
+        touch(&installed_ebin(&root, "stdlib"), "lists");
+        assert_eq!(system_ebins_under(&root), Some(vec![installed_ebin(&root, "stdlib")]));
+
+        // No stdlib at all: the root is rejected even when the kernel probe module is there
+        // (stdlib is the hard requirement).
+        let root = scratch("no_stdlib");
+        touch(&installed_ebin(&root, "kernel"), "kernel");
+        assert_eq!(system_ebins_under(&root), None);
+
+        // And an empty or missing directory is not an installation either.
+        let root = scratch("empty");
+        assert_eq!(system_ebins_under(&root), None);
+        assert_eq!(system_ebins_under(&root.join("does-not-exist")), None);
+    }
+
+    /// The native probe resolves **this host's** installation without running `erl` — the path a
+    /// runtime with no `erl` on `$PATH` takes — and the directories it returns are usable.
+    #[test]
+    fn the_native_probe_resolves_this_hosts_installation() {
+        let Some(dirs) = native_system_ebins() else {
+            eprintln!("SKIP: no OTP installation is discoverable from the filesystem on this host");
+            return;
+        };
+        assert!(dirs.len() <= SYSTEM_APPS.len(), "{dirs:?}");
+        assert!(dirs[0].join("lists.beam").is_file(), "{} must hold lists.beam", dirs[0].display());
+        let mut server = CodeServer::new();
+        for dir in &dirs {
+            assert!(dir.is_dir(), "{} is a directory", dir.display());
+            server.add_path(dir.clone());
+        }
+        assert!(server.load("lists").is_ok(), "stdlib must load from the native code path");
+    }
+
+    /// The runtime's own resolution uses the native probe: with no `$ERTS_STDLIB_DIR`, the cached
+    /// system path *is* the filesystem probe's answer (the shell-out is only for hosts where that
+    /// probe comes up empty).
+    #[test]
+    fn the_system_path_is_the_native_probe_when_no_override_is_set() {
+        if env::var_os("ERTS_STDLIB_DIR").is_some() {
+            eprintln!("SKIP: $ERTS_STDLIB_DIR is set, so the override (not the probe) wins");
+            return;
+        }
+        let Some(native) = native_system_ebins() else {
+            eprintln!("SKIP: the filesystem probe found no installation on this host");
+            return;
+        };
+        assert_eq!(system_ebins().expect("the native answer"), native);
+    }
     #[test]
     fn the_system_code_path_includes_the_erts_preloaded_modules() {
         let Some(server) = system_server() else {
