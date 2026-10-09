@@ -710,6 +710,9 @@ impl<'a> RuntimeContext<'a> {
             }
         }
     }
+
+    /// Records the module whose **code** this context is about to execute — the BIF call
+    /// site, for the duration of one entry.
     ///
     /// [`RuntimeContext::run_export`] sets `current_module` itself for the single-pass path;
     /// a scheduled process runs its entry through the engine's blocking-aware
