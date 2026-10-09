@@ -223,8 +223,9 @@ fn timespec_ms(ts: libc::timespec) -> u64 {
 ///
 /// **Keep one instance alive for the whole lifetime of the runtime.** The anchor is stateful
 /// and process-wide in the C; a per-call clock would report `SinceLastCall == Total` every
-/// time. There is no locking: the shape is a value the single-threaded runtime owns, matching
-/// the fact that `beam_io`'s types are `!Send`/`!Sync` by design.
+/// time. There is no locking here: the C's mutex exists because any scheduler thread may call
+/// `erts_runtime_elapsed_both`, whereas this type is a plain value the single-threaded runtime
+/// owns — the same counter without the lock.
 ///
 /// # Examples
 ///
@@ -259,9 +260,10 @@ impl RuntimeClock {
     ///
     /// # Errors
     ///
-    /// [`beam_common::BeamError::Io`] carrying the errno if the underlying `getrusage(2)` fails. The anchor
-    /// is left **unchanged** on failure, exactly as the C leaves `runtime_prev` (it aborts
-    /// before storing), so a transient failure does not corrupt `SinceLastCall`.
+    /// [`beam_common::BeamError::Io`] carrying the errno if the underlying `getrusage(2)`
+    /// fails. The anchor is then left **unchanged** (nothing is stored), so a transient failure
+    /// cannot corrupt `SinceLastCall`; the C instead aborts the emulator at that point, which a
+    /// Rust runtime must not do.
     pub fn runtime(&mut self) -> Result<(u64, u64)> {
         let total = process_cpu_times()?.user_ms;
         // The C's `user - prev_user` on an unsigned 64-bit type, so a clock that went
