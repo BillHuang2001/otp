@@ -202,7 +202,7 @@ The mandate is to delete it **module by module as Rust parity is proven** — ne
 - No ETS `ordered_set`/CA-tree (`erl_db_catree.c`) equivalent.
 - No Rust tracing events; no live NIF/driver ABI.
 - The JIT/tiering path (`../jit/`) is off the `erts_rust` execution path.
-- **No CI runs the Rust workspace or the differential gate** — parity is only as good as the last manual run; treat every verdict as stale until re-proven.
+- **CI gate scope**: `.github/workflows/erts_rust.yml` (path-triggered only on `erts_rust/**` + its own file) DOES build/test the Rust workspace and run `erts_rust/tools/differential/gate.sh`. It is deliberately separate from `main.yaml`/the OTP build — `main.yaml` and `path-filters.sh` have no `erts_rust` entry, so an `erts_rust`-only change gates nothing in the OTP build — and its `cargo test` step currently fails on a pre-existing `beam_gc` test. Parity verdicts are therefore still only as good as the last gate run: treat every verdict as stale until re-proven.
 ### Mechanical result
 - Checker reports `deletable: 0`; nothing here is mechanically unreferenced except the exempt vendored 3PP and CT fixtures.
 - Deleted in this pass: `../drivers/unix/bin_drv.c` (227 lines) — unreferenced by every `Makefile`, `#include` and symbol; `driver_tab.c` is generated only from `$(DRV_OBJS)`, so it was never linked (proof in the commit message). Previously removed: `../drivers/unix/{multi_drv,sig_drv}.c`, `../sys/unix/vxworks_resolv.c`.
