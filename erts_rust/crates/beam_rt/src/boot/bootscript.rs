@@ -1090,12 +1090,15 @@ mod tests {
     }
 
     #[test]
-    fn the_real_start_boot_stops_honestly_at_the_first_unbootable_directive() {
+    fn the_real_start_boot_executes_every_directive_to_progress_started() {
         // The full script loads every `primLoad` batch, spawns (and drives) the three kernel
-        // processes, and then stops with a typed error at the first directive the runtime
-        // cannot run. It **must not** panic or hang: every scheduler drive `execute` performs
-        // is bounded by its own deadline, and the test executes the instructions one at a
-        // time and stops at the first failure.
+        // processes, runs the four `apply` directives — the last of them, `{apply,{c,erlangrc,
+        // []}}`, against the runtime-native `file_server_2` service registered by
+        // `Runtime::new` — and ends at the final `{progress,started}`. It **must not** panic
+        // or hang: every scheduler drive `execute` performs is bounded by its own deadline.
+        //
+        // Each instruction is executed in isolation here so a regression names the *exact*
+        // directive it broke (the single-pass form is pinned by the companion test below).
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -1105,7 +1108,7 @@ mod tests {
             return;
         }
         let script = read(path).expect("the real start.boot parses");
-        let mut failure = None;
+        assert_eq!(script.instructions.len(), 22, "the oracle has 22 instructions");
         for (index, instruction) in script.instructions.iter().enumerate() {
             let single = BootScript {
                 name: script.name.clone(),
@@ -1113,55 +1116,91 @@ mod tests {
                 instructions: vec![instruction.clone()],
             };
             if let Err(error) = execute(&mut runtime, &single) {
-                failure = Some((index, error));
-                break;
+                panic!("instruction {index} ({instruction:?}) must execute: {error}");
             }
         }
-        let (index, error) = failure.expect("the real start.boot cannot fully boot in Milestone 1");
-        // A typed error, never a panic: every failure the runtime reports is a
-        // `BeamError::Raise` (a load `undef`, a BIF raise, an engine capability gap).
-        assert!(
-            matches!(error, BeamError::Raise(_)),
-            "instruction {index} ({:?}) must fail with a typed BeamError: {error}",
-            script.instructions[index]
-        );
-        // Every `primLoad` batch, every `kernelProcess` and both
-        // `{apply,{application,start_boot,…}}` directives succeed, so the stop is the first
-        // directive that needs a **file server** to answer: `{apply,{c,erlangrc,[]}}`.
+        // The last directive is the boot's completion marker.
         assert_eq!(
-            index, 20,
-            "the stop is `c:erlangrc/0` at instruction 20, found instruction {index}: {:?}",
-            script.instructions[index]
+            script.instructions.last(),
+            Some(&Instruction::Progress("started".to_string())),
+            "the completed boot ends at the final `{{progress,started}}`"
         );
-        assert!(
-            matches!(&script.instructions[index], Instruction::Apply { mfa }
-                if mfa.module == "c" && mfa.function == "erlangrc" && mfa.args.is_empty()),
-            "the stop must be the `{{apply,{{c,erlangrc,[]}}}}` directive, found {:?}",
-            script.instructions[index]
-        );
-        // The `primLoad` batches really loaded before the stop.
+        // The `primLoad` batches really loaded.
         for module in ["lists", "gen_server", "application_starter", "argparse", "zstd"] {
             assert!(
                 runtime.module(module).is_some(),
-                "{module} must have been loaded before the stop"
+                "{module} must have been loaded by the script"
             );
         }
-        let stop = BootStop {
-            index: Some(index),
-            total: script.instructions.len(),
-            instruction: Some(script.instructions[index].clone()),
-            error,
-        };
-        eprintln!("note: {}", stop.describe_with(&mut runtime));
     }
 
     #[test]
-    fn the_real_start_boot_reports_its_stop_through_execute_reporting() {
-        // The **whole** script in one pass, reporting its exact stop: the three kernel
-        // processes must survive their short-lived directive processes' exits (`heart`,
-        // `logger` and `application_controller` really stay registered — the unlink in
-        // `drive::start_kernel_process`), and the boot must then stop at the first directive
-        // that needs one of them to *answer*.
+    fn a_synthetic_unbootable_directive_reports_a_boot_stop() {
+        // The `BootStop`/`execute_reporting` reporting machinery, pinned **without** depending
+        // on the real script stopping: the real `start.boot` now runs to completion, so the
+        // stop path needs a synthetic unbootable directive. The second instruction applies a
+        // non-existent module, so the walk stops at 0-based index 2 with the script's
+        // instruction count, the failing directive and a typed error — never a panic.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let unbootable = Instruction::Apply {
+            mfa: Mfa {
+                module: "nonexistent_mod".to_string(),
+                function: "no_such_fun".to_string(),
+                args: Vec::new(),
+            },
+        };
+        let script = BootScript {
+            name: "synthetic".to_string(),
+            vsn: "1".to_string(),
+            instructions: vec![
+                Instruction::PreLoaded(vec!["erlang".to_string()]),
+                Instruction::Progress("preloaded".to_string()),
+                unbootable.clone(),
+                Instruction::Progress("started".to_string()),
+            ],
+        };
+        let stop = execute_reporting(&mut runtime, &script)
+            .expect_err("an unbootable directive must stop the script");
+        assert_eq!(
+            stop.index,
+            Some(2),
+            "the walk must stop at the unbootable directive: {}",
+            stop.describe_with(&mut runtime)
+        );
+        assert_eq!(stop.total, 4, "the report counts every instruction");
+        assert_eq!(
+            stop.instruction,
+            Some(unbootable),
+            "the report names the failing directive"
+        );
+        // A typed error, never a panic: a missing module/export is a `BeamError::Raise`.
+        assert!(
+            matches!(stop.error, BeamError::Raise(_)),
+            "the stop must be the directive's typed BeamError, got {}",
+            stop.error
+        );
+        // The one-line report names the exact position and the failing `M:F/A`.
+        let described = stop.describe_with(&mut runtime);
+        assert!(
+            described.contains("instruction 2/4")
+                && described.contains("nonexistent_mod:no_such_fun/0"),
+            "the report must name the position and the directive, got {described}"
+        );
+    }
+
+    #[test]
+    fn the_real_start_boot_completes_through_execute_reporting() {
+        // The **whole** script in one pass: `execute_reporting` returns `Ok(())` — all 22
+        // directives run, including the final `{apply,{c,erlangrc,[]}}` at instruction 20
+        // (which needs the native `file_server_2` service) and the closing
+        // `{progress,started}` — so there is no `BootStop` to report on this path.
+        //
+        // The three kernel processes must survive their short-lived directive processes'
+        // exits (`heart`, `logger` and `application_controller`): the unlink in
+        // `drive::start_kernel_process` keeps the `application_controller`'s server alive, so
+        // it is still registered after the whole script has run.
         let Some(mut runtime) = system_runtime() else {
             return;
         };
@@ -1171,42 +1210,34 @@ mod tests {
             return;
         }
         let script = read(path).expect("the real start.boot parses");
-        let stop = execute_reporting(&mut runtime, &script)
-            .expect_err("the real start.boot cannot fully boot in Milestone 1");
+        execute_reporting(&mut runtime, &script)
+            .expect("the real start.boot must boot all 22 directives to `{progress,started}`");
+        assert_eq!(
+            script.instructions.last(),
+            Some(&Instruction::Progress("started".to_string())),
+            "the completed boot ends at the final `{{progress,started}}`"
+        );
         // The unlink in `drive::start_kernel_process` keeps the `application_controller`'s
-        // server alive past its directive process's `normal` exit, so it is still registered
-        // when a later directive needs it. (`heart` returns without registering and `logger`
-        // never reaches its registration, so `application_controller` is the one to pin.)
-        let registered = runtime
-            .atoms()
-            .lookup("application_controller")
-            .and_then(|atom| runtime.processes().whereis(atom))
-            .is_some();
+        // server alive past its directive process's `normal` exit. (`heart` returns without
+        // registering and `logger` never reaches its registration, so `application_controller`
+        // is the one to pin.)
+        let registered = |runtime: &Runtime, name: &str| {
+            runtime
+                .atoms()
+                .lookup(name)
+                .and_then(|atom| runtime.processes().whereis(atom))
+                .is_some()
+        };
         assert!(
-            registered,
-            "the application_controller server must survive its directive process: {}",
-            stop.describe_with(&mut runtime)
+            registered(&runtime, "application_controller"),
+            "the application_controller server must survive its directive process"
         );
-        assert_eq!(
-            stop.total,
-            script.instructions.len(),
-            "the report counts every instruction"
-        );
-        // The exact stop: instruction 20/22, the `{apply,{c,erlangrc,[]}}` directive — the
-        // first one that needs a file server (the absent `file_server_2`) to answer.
-        assert_eq!(
-            stop.index,
-            Some(20),
-            "the boot stops at instruction 20/22: {}",
-            stop.describe_with(&mut runtime)
-        );
+        // The boot's own file service is a permanent runtime process, registered at
+        // construction and still registered after the script has consumed its replies.
         assert!(
-            matches!(&stop.instruction, Some(Instruction::Apply { mfa })
-                if mfa.module == "c" && mfa.function == "erlangrc" && mfa.args.is_empty()),
-            "the stop names `{{apply,{{c,erlangrc,[]}}}}`: {}",
-            stop.describe_with(&mut runtime)
+            registered(&runtime, "file_server_2"),
+            "the native file_server_2 service must still be registered after the boot"
         );
-        eprintln!("note: {}", stop.describe_with(&mut runtime));
     }
     // -----------------------------------------------------------------------
     // A synthetic script, executed end to end

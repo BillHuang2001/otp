@@ -883,7 +883,8 @@ impl Runtime {
         self.arena.ensure_heap(heap_need, live, x_regs, stack)
     }
 
-    /// The process table (Milestone-1: one process — the runtime itself).
+    /// The process table (a fresh runtime holds the runtime's own `init` root process and
+    /// the native `file_server_2` service; user code adds the rest).
     pub fn processes(&self) -> &ProcessTable {
         &self.processes
     }
@@ -1756,14 +1757,31 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_runtime_has_core_atoms_and_one_process() {
+    fn a_fresh_runtime_has_core_atoms_and_its_native_service_processes() {
         let rt = runtime();
         assert!(rt.atoms().lookup("unix").is_some());
         assert!(rt.atoms().lookup("linux").is_some());
-        assert_eq!(rt.processes().len(), 1);
+        // `Runtime::new` starts exactly **two** processes, both of them the runtime's own —
+        // neither was spawned by user code:
+        //   1. the **root process**, registered as `init` (`erlang:whereis(init)` answers it —
+        //      the oracle answers `<0.0.0>`), which every action runs as; and
+        //   2. the native **`file_server_2` service** (contract A.9), a `Runnable`,
+        //      never-enqueued process that answers the OTP file protocol the boot script needs
+        //      (`src/native/file_server.rs`).
+        assert_eq!(rt.processes().len(), 2);
+        for name in ["init", "file_server_2"] {
+            let atom = rt
+                .atoms()
+                .lookup(name)
+                .unwrap_or_else(|| panic!("`{name}` is a core atom"));
+            assert!(
+                rt.processes().whereis(atom).is_some(),
+                "the fresh runtime must have a live `{name}` process"
+            );
+        }
         assert_eq!(
             rt.system_info_value("process_count").expect("count"),
-            InfoValue::Int(1)
+            InfoValue::Int(2)
         );
     }
 
