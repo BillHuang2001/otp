@@ -380,6 +380,78 @@ fn an_empty_mailbox_blocks_and_the_plain_entry_is_the_typed_blocked_error() {
 }
 
 #[test]
+fn a_pump_resumes_a_cross_module_receive_whose_mailbox_the_pump_filled() {
+    // `run_export` is **blocking-aware**: a cross-module callee whose bare `receive`
+    // (`mailbox:wait/0` is `receive X -> X end`) finds an empty mailbox is driven by the
+    // scheduler — the very `Runtime::pump_scheduler` the `-eval` evaluator's `receive`
+    // drives — rather than folded into the typed `beam_engine::blocked()` gap.
+    //
+    // The message the pump delivers into the runtime's own mailbox (the process `run_export`
+    // runs as) arrives by the same deliver+wake path a runnable sender's `send` takes, so
+    // the suspended callee really re-scans a mailbox the pump changed: an `erlang:send_after/3`
+    // deadline owed to ourselves is fired by the pass (`Runtime::fire_due_timers`). Without
+    // the pump this exact call is the typed `blocked()` error (see the sibling case above and
+    // the slice case below).
+    let image = mailbox_fixture();
+    let mut rt = runtime();
+    let me = self_term(&rt);
+    let message = make_small(42);
+
+    let mut ctx = RuntimeContext::new(&mut rt);
+    assert!(
+        ctx.may_pump_scheduler(),
+        "a plain context may advance the scheduler between resumes"
+    );
+    // A 0 ms deadline to our own mailbox. It has not fired yet, so the mailbox is still
+    // empty when the callee suspends and the value can only come from the pump.
+    let _reference = ctx
+        .call_bif("erlang", "send_after", 3, &[make_small(0), me, message])
+        .expect("arm a 0 ms timer to the runtime's own mailbox");
+
+    let result = ctx
+        .run_export(&image, "wait", 0, &[])
+        .expect("the pump delivers the timed message and the receive resumes");
+    assert_eq!(
+        result, message,
+        "the resumed receive took the message the pump delivered"
+    );
+
+    // The resume removed the matched message.
+    let mailbox = ctx
+        .runtime
+        .processes
+        .get(ctx.runtime.self_pid)
+        .expect("the runtime process")
+        .mailbox();
+    assert!(mailbox.is_empty(), "the receive removed the message");
+}
+
+#[test]
+fn a_slice_context_that_may_not_pump_reports_the_typed_blocked_gap() {
+    // A context built by `RuntimeContext::for_process` is itself **inside** a scheduler
+    // slice, so it must never re-enter the scheduler (that would run a second process from
+    // within a slice). A cross-module callee that suspends on an empty mailbox therefore
+    // keeps the plain non-blocking entry's typed `beam_engine::blocked()` capability gap —
+    // never a wrong result and never a hang.
+    let image = mailbox_fixture();
+    let mut rt = runtime();
+    let mut table = beam_process::ProcessTable::new(beam_process::SignalAtoms::from_table(
+        &mut beam_term::prelude::AtomTable::new(),
+    ));
+    let pid = table.spawn_default().expect("spawn a process");
+
+    let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+    assert!(
+        !ctx.may_pump_scheduler(),
+        "a slice context is inside a pass and may not re-enter the scheduler"
+    );
+    let error = ctx
+        .run_export(&image, "wait", 0, &[])
+        .expect_err("an empty mailbox with nothing runnable is the typed gap");
+    assert_eq!(error.to_string(), beam_engine::blocked().to_string());
+}
+
+#[test]
 fn a_suspended_receive_resumes_against_the_runtime_stored_scan_position() {
     // The point of storing the scan state per pid: the resume happens through a
     // **fresh context**, and it still finds the position where the receive blocked.
