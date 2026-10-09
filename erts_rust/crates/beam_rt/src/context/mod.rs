@@ -94,6 +94,7 @@ use std::sync::Arc;
 use beam_abi::nif::loader::NifCallError;
 use beam_bifs::{BifContext, OutputSink};
 use beam_common::{AllocKind, BeamError, Result};
+use beam_engine::context::RootSet;
 use beam_engine::{terms, ExecutionContext, Machine, RunOutcome};
 use beam_loader::{Atom, Label, Module};
 use beam_message::{CopyContext, Message, OffHeapTable, Queue};
@@ -345,6 +346,33 @@ impl<'a> RuntimeContext<'a> {
         match &self.mailbox_table {
             Some(table) => &**table,
             None => self.runtime.processes(),
+        }
+    }
+
+    /// Re-syncs a **resuming** machine from this context's process root set (the runner's
+    /// resume seam).
+    ///
+    /// A parked machine can be relocated under it: while the process waits, a delivery-driven
+    /// collection ([`Process::deliver`](beam_process::Process::deliver)'s exit cascade, which —
+    /// unlike the in-slice admission point — is **not** gated by
+    /// [`gc_process_enabled`](Runtime::gc_process_enabled)) rewrites the process's `regs` in
+    /// place, so the machine's own `x`/`stack` point into the abandoned space. The process's
+    /// root set is the truth a resume must run from, so this copies it back into the machine.
+    /// If their slice lengths no longer match, the process's collection is halted rather than
+    /// run against inconsistent roots ([`crate::context::gc`] documents the hand-off).
+    ///
+    /// A `pid` with no process reconciles nothing: the runner only calls this for a parked pid
+    /// whose process it owns.
+    pub(crate) fn resync_parked_roots(&mut self, pid: ProcessId, machine: &mut Machine) {
+        let reconciled = match self.process_table().get(pid) {
+            Some(process) => machine.with_roots(RootSet::ALL_LIVE, |roots| {
+                let live = roots.live_len();
+                gc::scatter_roots(process, live, roots.x, roots.stack)
+            }),
+            None => true,
+        };
+        if !reconciled {
+            self.runtime.halt_process_gc(pid);
         }
     }
 

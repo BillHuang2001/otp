@@ -30,9 +30,11 @@
 use std::sync::Arc;
 
 use beam_common::Result;
-use beam_engine::{ExecutionContext, RunOutcome as EngineRunOutcome, Tier};
+use beam_engine::context::RootSet;
+use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome, Tier};
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 
+use crate::context::gc;
 use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
@@ -59,6 +61,42 @@ impl<'a> RuntimeRunner<'a> {
     pub(crate) fn new(runtime: &'a mut Runtime, state: &'a mut RunnerState) -> RuntimeRunner<'a> {
         RuntimeRunner { runtime, state }
     }
+}
+
+/// Publishes a **parked** machine's whole live root set into `pid`'s process root set.
+///
+/// A suspended process's machine lives in [`RunnerState::engines`], but a machine's registers
+/// are only a *copy* of the process's root set. A collection driven while the process is parked
+/// — [`Process::deliver`](beam_process::Process::deliver)'s exit cascade is **not** gated by
+/// [`Runtime::gc_process_enabled`](crate::runtime::Runtime) — relocates the process's heap
+/// against its own `regs`, so the parked machine must have published them first; otherwise the
+/// collector runs against a partial root set and leaves a stale word in the machine's `x`
+/// ([`crate::context::gc`] documents the hand-off).
+///
+/// [`RootSet::ALL_LIVE`] is the conservative choice: the parked machine's live count is not
+/// exposed, and over-approximating a copying collector's root set is always *safe* (it can only
+/// keep a term alive, never free a live one). A `pid` with no process in `table` has nothing to
+/// publish into; the machine is left as it is.
+fn publish_parked_roots(table: &mut ProcessTable, pid: ProcessId, machine: &mut Machine) {
+    let Some(process) = table.get_mut(pid) else {
+        return;
+    };
+    machine.with_roots(RootSet::ALL_LIVE, |roots| {
+        let live = roots.live_len();
+        gc::publish_roots(process, live, roots.x, roots.stack)
+    });
+}
+
+/// Re-syncs a machine about to **resume** from the process's authoritative root set.
+///
+/// The twin of [`publish_parked_roots`]: while the process was parked, a delivery-driven
+/// collection may have relocated its heap and rewritten the process's `regs` in place, leaving
+/// the parked machine's own `x`/`stack` pointing into the abandoned space. The process's root
+/// set — not the machine's stale copy — is therefore the truth a resume must run from; the
+/// context method reconciles them and halts the process's collection if their slices no longer
+/// match (see [`RuntimeContext::resync_parked_roots`]).
+fn resume_from_process_roots(ctx: &mut RuntimeContext<'_>, pid: ProcessId, machine: &mut Machine) {
+    ctx.resync_parked_roots(pid, machine);
 }
 
 impl ProcessRunner for RuntimeRunner<'_> {
@@ -194,7 +232,15 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // local label keeps `None` (it is applied as a value, not entered as code).
             if let Some(module) = engine.entry.entry_module() {
                 ctx.enter_module(module);
-            }            // The slice's reduction budget, charged at the machine's heap-admission points
+            }
+            // A resume continues a machine an earlier slice parked. While it was parked a
+            // delivery-driven collection may have relocated this process's heap, so re-sync
+            // the machine from the process's authoritative root set before running it (see
+            // `resume_from_process_roots`).
+            if engine.parked.is_some() {
+                resume_from_process_roots(&mut ctx, pid, &mut engine.machine);
+            }
+            // The slice's reduction budget, charged at the machine's heap-admission points
             // (see the `run` docs).
             let mut probe = BudgetProbe::new(budget);
             let mut budget_ctx = BudgetContext {
@@ -349,6 +395,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // A parked receive's deadline was settled above; a yield has no deadline of its
             // own, so nothing is left armed here (a stale one would fire mid-run later).
             engine.parked_timeout = None;
+            // Publish the machine's roots before the engine is parked: a collection driven
+            // while this process sits in `RunnerState.engines` must be able to relocate the
+            // heap against the machine's live terms (see `publish_parked_roots`).
+            publish_parked_roots(table, pid, &mut engine.machine);
             self.state.engines.insert(pid, engine);
             return Ok(RunOutcome::Yield);
         }
@@ -390,6 +440,11 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 if let Some(process) = table.get_mut(pid) {
                     process.set_state(ProcessState::Waiting);
                 }
+                // Publish the machine's roots before the engine is parked: a delivery-driven
+                // collection (`Process::deliver`'s exit cascade, ungated by
+                // `gc_process_enabled`) may relocate this process's heap while it waits (see
+                // `publish_parked_roots`).
+                publish_parked_roots(table, pid, &mut engine.machine);
                 self.state.engines.insert(pid, engine);
                 Ok(RunOutcome::Wait)
             }
@@ -397,9 +452,12 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 let reason = exit_reason(self.runtime, &error);
                 // The reason may be a term the failing process built on **its own** heap,
                 // which the collector may move or drop the moment the process terminates:
-                // copy it onto the runtime's pointer-stable arena before it is recorded (see
-                // `Runtime::stabilize_escaped`).
-                let reason = self.runtime.stabilize_escaped(reason);
+                // copy it onto the runtime's pointer-stable arena before it is recorded. A
+                // reason that *genuinely* cannot be copied is the honest `error:system_limit`
+                // (it is propagated, never stored dangling), while the documented off-heap
+                // capability gap keeps the original term and freezes the heaps — see
+                // `Runtime::try_stabilize_escaped`.
+                let reason = self.runtime.try_stabilize_escaped(reason)?;
                 self.state.exits.insert(pid, reason);
                 // Keep the original error as well: the reason *term* above is what the exit
                 // propagates, but only the error carries the raise class and the

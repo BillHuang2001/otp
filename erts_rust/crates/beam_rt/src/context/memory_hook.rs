@@ -50,7 +50,7 @@
 //! | key | source |
 //! |---|---|
 //! | `processes` | the live processes' collector capacities ([`Process::collector`] via [`beam_gc::HeapObservable`]) |
-//! | `processes_used` | the live processes' used young-heap words ([`Process::heap_used_words`]) |
+//! | `processes_used` | the live processes' used heap words — nursery **and** mature generation ([`Process::collector`]) |
 //! | `atom` / `atom_used` | the shared [`AtomTable`]'s index slots plus its name text |
 //! | `binary` | `binary_alloc`'s live bytes ([`beam_alloc::registry`]) |
 //! | `code` | the loaded modules' `.beam` image sizes, from the [`CodeServer`] |
@@ -131,8 +131,14 @@ impl RuntimeMemory {
         let mut process_used = 0u64;
         for pid in processes.pids() {
             if let Some(process) = processes.get(pid) {
-                process_bytes += process.collector().total_heap_size_words() as u64 * word;
-                process_used += process.heap_used_words() as u64 * word;
+                let collector = process.collector();
+                process_bytes += collector.total_heap_size_words() as u64 * word;
+                // Both half-spaces of the process heap: a term that survived a collection
+                // lives in the mature generation, so counting only the nursery would
+                // systematically under-report a long-lived process (`processes_used` would
+                // even fall *below* the oracle's ratio against `processes`).
+                process_used +=
+                    (collector.young().used_words() + collector.mature().used_words()) as u64 * word;
             }
         }
         RuntimeMemory {

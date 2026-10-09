@@ -60,7 +60,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_gc::CollectionKind;
 use beam_loader::{Instr, Module};
-use beam_process::{ProcessTable, MAX_REG};
+use beam_process::{Process, ProcessTable, MAX_REG};
 use beam_term::Eterm;
 
 use crate::runtime::Runtime;
@@ -138,6 +138,73 @@ fn module_may_be_collected(runtime: &mut Runtime, name: &str) -> bool {
     }
 }
 
+/// Hand the executing machine's live roots to `process` — the **publish** half of the GC
+/// hand-off.
+///
+/// `live` is the number of leading `x_regs` slots the caller declares live;
+/// `x_regs.len()` (or [`MAX_REG`], whichever is smaller) declares **every** register live,
+/// which is the conservative choice when the true count is unknown: a copying collector may
+/// always over-approximate its root set (it can only keep a term alive that would otherwise
+/// die, never free a live one). The whole `stack` is published, because there are no frame
+/// liveness maps.
+///
+/// Returns whether the hand-over was complete. A `false` means the process's root set could
+/// not hold the machine's state intact, so the caller must **not** collect against it.
+///
+/// This is the single publish implementation shared by the in-slice heap-admission point
+/// ([`ensure_heap`]) and the runner's **park** arm ([`crate::runner`]), which publishes a
+/// suspended process's machine so that a delivery-driven collection can relocate the parked
+/// heap against the machine's real roots.
+///
+/// # Errors
+///
+/// None: an impossible `set_live` is reported as `false` (the caller's "do not collect").
+pub(crate) fn publish_roots(
+    process: &mut Process,
+    live: usize,
+    x_regs: &[Eterm],
+    stack: &[Eterm],
+) -> bool {
+    let live = live.min(x_regs.len()).min(MAX_REG);
+    let regs = process.registers_mut();
+    match regs.x_mut().set_live(live) {
+        Ok(()) => {
+            regs.x_mut().live_slice_mut()[..live].copy_from_slice(&x_regs[..live]);
+            let process_stack = regs.stack_mut();
+            process_stack.clear();
+            for word in stack.iter() {
+                process_stack.push(*word);
+            }
+            process.registers().stack().len() == stack.len()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Write a collected process's (possibly relocated) registers back into the machine's slices
+/// — the **scatter** half of the GC hand-off.
+///
+/// `live` must be the same count [`publish_roots`] was called with. The collector preserves
+/// the slice lengths and the word order, so a length mismatch means the machine's slices can
+/// no longer be trusted: the function reports `false` and the caller must stop collecting over
+/// this process rather than write a mis-sized block back.
+pub(crate) fn scatter_roots(
+    process: &Process,
+    live: usize,
+    x_regs: &mut [Eterm],
+    stack: &mut [Eterm],
+) -> bool {
+    let regs = process.registers();
+    let relocated_x = regs.x().live_slice();
+    let relocated_stack = regs.stack().as_slice();
+    if relocated_x.len() != live || relocated_stack.len() != stack.len() {
+        return false;
+    }
+    x_regs[..live].copy_from_slice(relocated_x);
+    stack.copy_from_slice(relocated_stack);
+    true
+}
+
 /// The engine's heap-admission point for a scheduled slice: collect the running process's
 /// own heap when it cannot satisfy `heap_need` more words.
 ///
@@ -197,25 +264,10 @@ pub(crate) fn ensure_heap(
 
     // Transfer the machine's roots into the process root set. `Process::collect` gathers
     // exactly these containers (registers, then the mailbox, dictionary, saved arguments and
-    // pending signals), so writing them here is what makes the machine's live terms survive
+    // pending signals), so publishing them here is what makes the machine's live terms survive
     // the move; the relocated words are copied back below.
     let live = (live as usize).min(x_regs.len()).min(MAX_REG);
-    let registered = {
-        let regs = process.registers_mut();
-        match regs.x_mut().set_live(live) {
-            Ok(()) => {
-                regs.x_mut().live_slice_mut()[..live].copy_from_slice(&x_regs[..live]);
-                let process_stack = regs.stack_mut();
-                process_stack.clear();
-                for word in stack.iter() {
-                    process_stack.push(*word);
-                }
-                process.registers().stack().len() == stack.len()
-            }
-            Err(_) => false,
-        }
-    };
-    if !registered {
+    if !publish_roots(process, live, x_regs, stack) {
         // The root set could not be handed over intact: keep this process's heap put rather
         // than collect against a partial root set.
         runtime.halt_process_gc(pid);
@@ -235,15 +287,10 @@ pub(crate) fn ensure_heap(
     // Copy the relocated roots back into the machine's slices, in place: the collector
     // preserves the slice lengths and the word order, so every `Machine::frames` `y_base`
     // index and every frame slot stays valid.
-    let regs = process.registers();
-    let relocated_x = regs.x().live_slice();
-    let relocated_stack = regs.stack().as_slice();
-    if relocated_x.len() != live || relocated_stack.len() != stack.len() {
+    if !scatter_roots(process, live, x_regs, stack) {
         runtime.halt_process_gc(pid);
         return Ok(());
     }
-    x_regs[..live].copy_from_slice(relocated_x);
-    stack.copy_from_slice(relocated_stack);
     Ok(())
 }
 

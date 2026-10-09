@@ -49,10 +49,9 @@
 //!
 //! The state is owned by [`Runtime`] (a `gc: GcState` field), the collection point is
 //! [`crate::context::gc::ensure_heap`] (armed by the slice's own
-//! [`BudgetContext::ensure_heap`](crate::runner)), and the escape stores go through
-//! [`Runtime::try_stabilize_escaped`] (the honest split; [`Runtime::stabilize_escaped`] is the
-//! conflating legacy form kept for the runner's exit-reason call site). See those call sites
-//! for the details.
+//! [`BudgetContext::ensure_heap`](crate::runner)), and every escape store — the runner's
+//! exit-reason stabilization included — goes through [`Runtime::try_stabilize_escaped`]. See
+//! those call sites for the details.
 use std::collections::{HashMap, HashSet};
 
 use beam_common::{BeamError, Result};
@@ -302,27 +301,6 @@ impl Runtime {
         }
     }
 
-    /// Copies `term` onto the pointer-stable arena and returns the copy, **conflating** both
-    /// ways that copy can fail into "keep the original and freeze every heap".
-    ///
-    /// Prefer [`Runtime::try_stabilize_escaped`] — the honest split, which propagates a genuine
-    /// [`BeamError::SystemLimit`] instead of hiding it — at every call site whose enclosing
-    /// function can return a [`Result`]. This form survives for the **one** call site that
-    /// cannot (`src/runner/run.rs`'s exit-reason stabilization): a reason it cannot copy is
-    /// still stored (with the heaps frozen) rather than turning a process's termination reason
-    /// into a different error. Its behaviour — the single valve trip included — is unchanged,
-    /// so it is deliberately **not** a re-entry point of [`Runtime::try_stabilize_escaped`]
-    /// (which would trip the valve twice on the off-heap path).
-    pub(crate) fn stabilize_escaped(&mut self, term: Eterm) -> Eterm {
-        match self.stabilize_term(term) {
-            Ok(copy) => copy,
-            Err(_) => {
-                self.disable_gc("an out-of-band store holds a term with an off-heap payload");
-                term
-            }
-        }
-    }
-
     /// The reusable placeholder fill of `n` words the safe heap bump pads with.
     ///
     /// Only ever grown, so a bump never allocates (see
@@ -402,24 +380,6 @@ mod tests {
         let stats = rt.gc_stats();
         assert!(!stats.disabled, "a successful copy trips no valve");
         assert_eq!(stats.valve_trips, 0);
-    }
-
-    /// **The legacy, conflating form is unchanged.** The one remaining call site (the runner's
-    /// exit-reason stabilization) still keeps the un-copied original and freezes every process
-    /// heap — the documented behaviour it has always had, for a reason that must not become a
-    /// different error.
-    #[test]
-    fn the_conflating_form_still_keeps_the_original_and_trips_the_valve() {
-        let mut rt = small_runtime();
-        let big = oversized_term(&mut rt);
-        assert_eq!(
-            rt.stabilize_escaped(big),
-            big,
-            "the legacy form keeps the un-copied original"
-        );
-        let stats = rt.gc_stats();
-        assert!(stats.disabled, "the legacy form freezes every process heap");
-        assert_eq!(stats.valve_trips, 1);
     }
 
     /// **The pending-spawn store propagates the honest failure.** A child whose entry fun or
