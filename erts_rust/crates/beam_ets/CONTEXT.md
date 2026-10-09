@@ -48,10 +48,14 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   concurrency, no heir, no explicit `decentralized_counters`): `new()`, `set_kind`, `set_keypos(usize)
   -> Result<&mut Self>` (rejects 0 — the only fallible builder), `set_access`, `set_named(bool)`,
   `set_name(Atom)`, `set_compressed(bool)`, `set_write_concurrency(bool)`, `set_read_concurrency(bool)`,
-  `set_heir(Option<Heir>)`, `set_decentralized_counters(Option<bool>)`; getters `kind()/keypos()/
+  `set_write_concurrency_mode(WriteConcurrency)`, `set_heir(Option<Heir>)`,
+  `set_decentralized_counters(Option<bool>)`; getters `kind()/keypos()/
   access()/is_named()/name() -> Option<Atom>/is_compressed()/write_concurrency()/read_concurrency()/
-  heir() -> Option<Heir>/decentralized_counters_option() -> Option<bool>/decentralized_counters() ->
-  bool/concurrency() -> Concurrency`; `impl Default`.
+  write_concurrency_mode() -> WriteConcurrency/heir() -> Option<Heir>/decentralized_counters_option() ->
+  Option<bool>/decentralized_counters() -> bool/concurrency() -> Concurrency`; `impl Default`.
+  `write_concurrency()` is the effective `Off`/`On` projection of the mode (a `private` table forces
+  `Off`); `decentralized_counters()` is `true` for `Auto`/`FixedLocks(_)` when the effective flag is on.
+  Unit tests live in `src/kind/tests.rs`.
   `set_name` records the name only — it does not set `named_table` (the oracle: `ets:new(myanon, [])`
   reports `name => myanon` but `named_table => false`).
 - `pub fn can_read(access, owner, requester) -> bool` / `can_write(…)` — the access matrix
