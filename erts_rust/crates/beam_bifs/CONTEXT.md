@@ -187,7 +187,7 @@ This crate's link in the A.9 boot-blocker chain (the runtime's boot stop point a
 - `src/access.rs` -> term/int/float/bignum wrappers, bitstring/flatmap/native-record access, the M1 ref thing
 - `src/bits.rs` / `src/numeric.rs` -> the on-heap bitstring/binary facade; `parse_integer`, int/float rendering
 - `src/arith.rs` -> bignum-promoting arithmetic, the six bit operators, `add_terms`/`int_from_*`/`integer_to_f64`
-- `src/bool.rs` / `src/compare.rs` / `src/type_test.rs` -> strict booleans; comparisons + `cmp_term/2`; the `is_*` tests
+- `src/bool.rs` / `src/compare.rs` / `src/type_test.rs` -> strict booleans; comparisons + `cmp_term/2` + the legacy hashes `phash/2`/`phash2/1,2` (thin adapters over `beam_term::hashing`); the `is_*` tests
 - `src/term_ops.rs` / `src/convert.rs` -> tuple/list/size primitives; the pure conversions (incl. `node/0,1`)
 - `src/lists.rs` / `src/maps.rs` -> the list operators + the 45 `lists` fast paths; the 24 `maps` BIFs
 - `src/math.rs` / `src/binary.rs` -> the 24 `math` BIFs; the 24 `binary` + 4 iolist/bitstring BIFs
