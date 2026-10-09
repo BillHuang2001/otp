@@ -147,7 +147,7 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
   resumes — so the drive does not take its `ran == 0` (nothing happened) fold.
 
-### A `-boot` value's shape can defeat the boot (owner: `beam_engine` — handoff)
+### A `-boot` value's shape can defeat the boot (owner: `beam_rt`'s runner — handoff)
 The boot's outcome is a function of the whole command line, and the `-boot` **value's byte length**
 perturbs it on a knife edge: the short canonical form (`<repo>/bootstrap/bin/start`, ~71 chars) carries
 the script cleanly to completion, while a slightly longer value — or one with a non-canonical segment
@@ -155,18 +155,23 @@ the script cleanly to completion, while a slightly longer value — or one with 
 exit **1** with the raw `beam_rt: allocation failure: message (<garbage> bytes)` (the count is
 deterministic for a given argv but varies with it: `21096`, `42408`, `17123030415440`, …).
 `$P/bootstrap/bin/start` (71) is fine, `$P/bootstrap/./bin/start` (74) fails, and a padded long canonical
-path fails too — so it is heap layout, not path semantics. Pinned by inspection to `beam_engine`'s
-structured-raise path: `Machine::throw_with_stacktrace` (`machine/catch.rs`) attaches a `LiveReason` over
-a term whose source heap frame is already gone, and a later copy (`beam_process` → `beam_message`'s
-`size_object`) reads the freed frame as a length. The `beam_rt`-side chain that surfaces it: the dying
-**scheduled** process's runner recovers the reason at `../runner/run.rs` (`exit_reason` →
-`error::live_reason_term`, a plain `downcast_ref::<Eterm>`), then `Runtime::stabilize_escaped`
-(`../runtime/gc.rs`) tries to copy it onto the arena — its `copy_struct_simple` fails on the garbage and
-the `Err` arm **swallows** the failure, returning the original stale term. The raw
-`Alloc(AllocKind::Message)` therefore first surfaces *later*, from the process-termination propagation
-(`../..//beam_process/src/ptab.rs::copy_reason_onto` → `Process::copy_into_heap`), out through
+path fails too — so it is heap layout (argv size shifts the arena layout, hence *when* a collection
+intervenes), not path semantics.
+**Mechanism** (confirmed from a full-debug build's stack, not from inspection): the dying scheduled
+process's **machine registers were never part of its process root set**. `Machine`'s registers reach
+`Process::regs` **only** through the in-slice admission point (`../context/gc.rs::ensure_heap`); the
+runner's `Wait`/`Yield` park arms (`../runner/run.rs` — the runner manager's file) store the engine into
+`RunnerState.engines` without publishing them and the resume arm never copies the (possibly relocated)
+`Process::regs` back into the machine. `Process::collect` from `Process::deliver` (the exit-signal
+cascade: `../..//beam_process/src/ptab.rs::copy_reason_onto` → `Process::copy_into_heap`) is **not** gated
+by `Runtime::gc_process_enabled`, so a collection of a *parked* process's heap relocates it against that
+partial root set and leaves a stale word in `x`; the reason the dying process's runner then recovers
+(`../runner/run.rs`'s `exit_reason` → `error::live_reason_term`) is built from it, and the raw
+`Alloc(AllocKind::Message)` surfaces only *later*, from the process-termination propagation, out through
 `Scheduler::slice_end` → `scheduler_pass` → `pump_scheduler` → the CLI — never via
-`error::enforce_term_heap_limit`, which does not wrap the terminate path. **`src/boot/**` cannot fix it.**
+`error::enforce_term_heap_limit`, which does not wrap the terminate path. The `Err(_)` arm of
+`../runtime/gc.rs::stabilize_escaped` compounds it by **swallowing** the un-copyable reason and returning
+the stale term (it also trips the global GC valve). **`src/boot/**` cannot fix it.**
 `tests/boot.rs`
 therefore builds its `-boot` value from `CARGO_MANIFEST_DIR`'s ancestors (`start_boot()`), whose canonical
 short form is the safe one. Repro:
