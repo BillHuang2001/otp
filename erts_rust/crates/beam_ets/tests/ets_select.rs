@@ -632,8 +632,9 @@ main(_) ->
 /// `ets:match_delete/2` **return** (`true`, [`DELETE_ORACLE_RETURN`]) the crate's
 /// count-returning API deliberately does not produce.
 ///
-/// Skips loudly when no Erlang is installed; `BEAM_ETS_REQUIRE_ORACLE=1` turns the
-/// skip into a failure.
+/// The oracle is **required** by default: a missing Erlang FAILS this test (it does
+/// not silently skip); `BEAM_ETS_ALLOW_NO_ORACLE=1` opts out explicitly (loud skip),
+/// and `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement.
 #[test]
 fn select_delete_and_select_count_agree_with_the_live_oracle() {
     let Some(escript) = oracle::resolve_escript() else {

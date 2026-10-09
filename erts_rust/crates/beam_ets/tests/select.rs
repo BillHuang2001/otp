@@ -49,7 +49,8 @@ fn atoms() -> AtomTable {
         "is_tuple", "is_float", "is_map", "is_pid", "is_port", "is_reference", "is_function",
         "is_binary", "is_bitstring", "is_foo", "=:=", "=/=", "==", "/=", "<", "=<", ">", ">=",
         "+", "-", "*", "/", "div", "rem", "band", "bor", "bxor", "bsl", "bsr", "$", "$1x", "$01",
-        "$5",
+        "$5", "map_get", "is_map_key", "map_size", "tuple_size", "byte_size", "bit_size", "float",
+        "trunc", "round", "list_to_tuple",
     ] {
         atoms.intern(name);
     }
