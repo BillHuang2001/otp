@@ -352,9 +352,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   proves **every** non-shared compound subterm lies inside the destination heap region (nothing still
   points into the source) — the corpus includes a `SUB_BITS` match context, which the copier flattens
   to a fresh on-heap-bitstring leaf the walk asserts lives in the destination.
-- `tests/sizing.rs` — **sized-then-copied exactness**: for a 13-shape corpus (small tuple, deep list,
-  improper list, flat map, 64-key HAMT map, nested graph, Local/External fun, record, bitstring, MSO
-  container, refc binary, a graph with a shared refc binary), a destination of exactly
+- `tests/sizing.rs` — **sized-then-copied exactness**: for a 14-shape corpus (small tuple, deep list,
+  improper list, flat map, 64-key HAMT map, nested graph, Local/External fun, record, bitstring,
+  `SUB_BITS` match context, MSO container, refc binary, a graph with a shared refc binary), a
+  destination of exactly
   `size_of_copy(term)` words accepts the copy with `to.used() == size_object(term) <= capacity`, and a
   one-word-short (and zero-word) destination is refused with `Alloc(Message)` and
   `used() == peak_used() == 0` (no partial write); immediates/`tuple0()` copy into a zero-capacity heap
