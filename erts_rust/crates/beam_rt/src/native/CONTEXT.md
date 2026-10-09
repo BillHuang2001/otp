@@ -27,8 +27,8 @@ per-function bodies. Files:
 | Module | Serves |
 |---|---|
 | `../native.rs` (parent) | module docs, `try_native`, the shared helpers (`atom`/`atom_name`/`charlist`/`render`/`string_list`/`write_output`/`chars_to_string`), the `erlang` core (`halt/0,1`, `display/1`, `io:put_chars/1,2`, `apply/2,3`, `system_info/1`, `send_after/3`, `cancel_timer/1`, `os:cmd/1`), the binary-surface and scheduler-model test modules |
-| `init.rs` | `init:get_argument/1`, `get_arguments/0`, `get_plain_arguments/0`, `get_status/0` |
-| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1`, `root_dir/0` |
+| `init.rs` | `init:get_argument/1` — a command-line flag from `RuntimeConfig::init_args`, plus the three **automatic** flags the emulator defines itself (`root` = the code root dir, `home` = `$HOME`, `progname` = the basename this runtime was invoked as) — `get_arguments/0`, `get_plain_arguments/0`, `get_status/0` |
+| `code.rs` | `code:get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1`, `root_dir/0`, `get_mode/0` (the code server's `interactive`/`embedded` mode, from the `-mode` init argument per `code.erl:1741-1765`) |
 | `process.rs` (+ `process/monitor.rs`, `process/exit.rs`) | `erlang:make_ref/0`, `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4` (incl. the heap-size options → `beam_gc::HeapPolicy`), `spawn_monitor/1,2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`; the monitor family (`monitor/2,3`, `demonitor/1,2`) in `process/monitor.rs`, `exit/2,3` in `process/exit.rs` |
 | `node.rs` | `erlang:is_alive/0`, `get_cookie/0`, `set_cookie/2`, `nodes/0,1` |
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
