@@ -117,6 +117,31 @@
 //! `update_counter`/`update_element`/the delete+replace verbs, and no check at all
 //! for `ets:info/1,2`. A denial is `badarg` **and leaves the table in the registry**.
 //!
+//! # The owner→handle roster (the runtime's reclamation seam)
+//!
+//! An ETS table belongs to the process that created it, so the *runtime* — which
+//! owns process death — must reclaim a dead owner's tables. It cannot see this
+//! registry's private table map, so [`TableRegistry`] exposes the two public
+//! entry points that adoption needs:
+//!
+//! * [`TableRegistry::owner_of`] — the pid→owner bridge
+//!   (`OwnerId::new(pid.to_eterm().raw() as u64)`), the **same** encoding
+//!   [`resolve::caller_owner`] records at `ets:new/2` time, so an owner read back
+//!   from a table and a pid converted here always agree;
+//! * [`TableRegistry::handles_owned_by`] — every handle a given owner holds,
+//!   ascending, **including an unnamed table's** (whose handle is otherwise
+//!   unreachable from any public term).
+//!
+//! A host lists a dead pid's handles, then per table calls
+//! `beam_ets::Table::owner_died` and acts on the returned `OwnerDeath`: an
+//! unnamed/orphan table is dropped through the existing
+//! [`TableRegistry::remove`] (+ [`TableRegistry::remove_name`] for a
+//! `named_table`), a live heir takes it over, and `{'ETS-TRANSFER', Tid, FromPid,
+//! Data}` is delivered **only** when `heir.data` is `Some` (an arity-2
+//! `{heir, Pid}` inherits in silence). [`ets:delete/1`] already drops the profile
+//! and the name, so an index handle for a deleted table resolves to no table
+//! ([`TableRegistry::get_mut`] is `None`) and is skipped.
+//!
 //! # The child modules and the remaining gaps (see the crate `CONTEXT.md`)
 //!
 //! The faithful verbs live in the child modules: `ets:safe_fixtable/2`,
@@ -127,11 +152,15 @@
 //! fun through the `FunCaller` seam, so a non-empty fold is the typed
 //! `unsupported_bif` gap until a host installs it.)
 //!
-//! The verbs that stay **unregistered** are the honest typed gaps documented in
-//! [`adopt`] and [`extra`], each with the exact `beam_ets` API that would close it:
-//! `ets:slot/2` and `ets:internal_request_all/0` — seam-backed through the
-//! `RuntimeHooks` stub in `src/runtime/other.rs` — and the `ets:setopts/2`
-//! `{protection, _}` sub-option.
+//! Four `ets` keys stay honest typed gaps, each for a reason no `BifFn` can
+//! satisfy (see [`adopt`] and [`extra`]): `ets:slot/2` (C-interior `db_slot`), and
+//! `ets:internal_request_all/0` (a ref + one reply message per scheduler, which
+//! needs process messaging), both seam-backed through the `RuntimeHooks` stub in
+//! `src/runtime/other.rs`; plus the `ets:setopts/2` `{protection, _}` sub-option
+//! (no post-creation access setter in `beam_ets`). `ets:fun2ms/1` and
+//! `ets:repair_continuation/2` are pure `stdlib/src/ets.erl` functions — **not**
+//! `bif.tab` entries — so the registry can never dispatch them and they stay
+//! unregistered.
 //!
 //! # The `*_lookup` family (see [`nav`] for the BIFs)
 //!
@@ -160,7 +189,8 @@ use std::collections::HashMap;
 
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_ets::{compile, key_of, MatchContinuation, Table, TableId, TableInfo};
+use beam_ets::{compile, key_of, MatchContinuation, OwnerId, Table, TableId, TableInfo};
+use beam_process::ProcessId;
 use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
 
 use crate::access::{
@@ -558,6 +588,55 @@ impl TableRegistry {
                 (id, name)
             })
             .collect()
+    }
+
+    /// Every live table handle owned by `owner`, **ascending by handle** — the
+    /// owner→handle roster the runtime reclaims through on a process death
+    /// (`beam_ets::Table::owner_died`).
+    ///
+    /// The table's owner is read from [`Table::owner`] (`Option<OwnerId>`); only a
+    /// table whose owner is `Some(owner)` is listed, so an ownerless table (one
+    /// inserted straight into the registry, as a test does) is never reported for
+    /// any `owner`. The order is the ascending handle — the same order
+    /// [`TableRegistry::all_tids`] uses — so a caller that mutates the registry
+    /// while walking the roster (dropping a table, or re-keying it to a surviving
+    /// heir) sees a deterministic sequence.
+    ///
+    /// `owner` comes from the [`TableRegistry::owner_of`] bridge, which encodes a
+    /// `beam_process::ProcessId` exactly as [`resolve::caller_owner`] recorded it
+    /// at `ets:new/2` time, so a pid read back here and one recorded there always
+    /// compare equal.
+    ///
+    /// # Whole-roster, not just `named_table`s
+    ///
+    /// Unlike [`TableRegistry::all_tids`]'s name column, this roster covers an
+    /// **unnamed** table too: its handle is the registry key, which a caller
+    /// cannot derive from any public term, so this is the only way a host can
+    /// enumerate (and therefore reclaim) the unnamed tables a dead owner left
+    /// behind.
+    pub fn handles_owned_by(&self, owner: OwnerId) -> Vec<u64> {
+        let mut handles: Vec<u64> = self
+            .tables
+            .iter()
+            .filter(|(_, table)| table.owner() == Some(owner))
+            .map(|(handle, _)| *handle)
+            .collect();
+        handles.sort_unstable();
+        handles
+    }
+
+    /// The `beam_ets` [`OwnerId`] of a `beam_process::ProcessId` — the pid→owner
+    /// bridge a host needs to feed [`TableRegistry::handles_owned_by`] the key
+    /// `ets:new/2` recorded.
+    ///
+    /// It is `OwnerId::new(pid.to_eterm().raw() as u64)`, a **lossless** function of
+    /// the pid immediate and the same encoding [`resolve::owner_of`] (and
+    /// `beam_rt`'s own `owner_key`) uses, so an owner read back from a table and a
+    /// pid converted here always agree. Exposed as an associated function on the
+    /// re-exported registry because `mod ets` is private: a free `pub fn` in
+    /// [`resolve`] would not be reachable by a dependent crate.
+    pub fn owner_of(pid: ProcessId) -> OwnerId {
+        resolve::owner_of(pid)
     }
 }
 
@@ -1640,7 +1719,106 @@ mod tests {
         assert_eq!(reg.len(), 1);
     }
 
-    /// An `auto` profile, for the profile-lifetime tests (the only non-boolean
+    /// The owner→handle roster lists each owner apart, **ascending by handle**,
+    /// and never reports an ownerless table for any owner.
+    #[test]
+    fn the_owner_roster_is_per_owner_and_ascending() {
+        let alpha = OwnerId::new(0x11);
+        let beta = OwnerId::new(0x22);
+        let mut reg = TableRegistry::new();
+        // Inserted out of handle order so the sort is observable.
+        for (handle, owner) in [
+            (30u64, Some(alpha)),
+            (10, Some(alpha)),
+            (20, Some(beta)),
+            (5, None),
+        ] {
+            let mut t = table(handle);
+            t.set_owner(owner);
+            reg.insert(handle, t);
+        }
+
+        assert_eq!(reg.handles_owned_by(alpha), vec![10, 30]);
+        assert_eq!(reg.handles_owned_by(beta), vec![20]);
+        // A non-owner gets an empty roster — including the raw owner id of the
+        // ownerless table's (absent) owner.
+        assert!(reg.handles_owned_by(OwnerId::new(0x33)).is_empty());
+        assert!(reg.handles_owned_by(OwnerId::new(5)).is_empty());
+    }
+
+    /// A dead owner's tables are reclaimed through the roster and the **existing**
+    /// removal path: the roster hands back the handles, and `remove` (+
+    /// `remove_name`) drops them.
+    #[test]
+    fn the_roster_withdrawal_uses_the_existing_remove_path() {
+        let alpha = OwnerId::new(0x11);
+        let mut reg = TableRegistry::new();
+        let mut t = table(40);
+        t.set_owner(Some(alpha));
+        reg.insert(40, t);
+        assert!(reg.insert_name(Atom::from_raw(1), 40), "name registered");
+
+        // The runtime lists the dead owner's handles...
+        let owned = reg.handles_owned_by(alpha);
+        assert_eq!(owned, vec![40]);
+        // ...and drops each through the existing removal path.
+        for handle in owned {
+            assert!(reg.remove(handle).is_some());
+            reg.remove_name(Atom::from_raw(1));
+        }
+        assert!(reg.is_empty());
+        assert!(reg.handles_owned_by(alpha).is_empty());
+        assert!(reg.lookup_name(Atom::from_raw(1)).is_none());
+    }
+
+    /// `owner_of` round-trips the pid immediate, and the roster finds the tables
+    /// `ets:new/2` recorded for that pid.
+    #[test]
+    fn owner_of_round_trips_a_pid_and_the_roster_finds_its_tables() {
+        let alpha = ProcessId::new(1, 1);
+        let beta = ProcessId::new(1, 2);
+        for pid in [alpha, beta, ProcessId::new(0, 0), ProcessId::new(255, 7)] {
+            assert_eq!(
+                TableRegistry::owner_of(pid).raw(),
+                pid.to_eterm().raw() as u64,
+                "the pid→owner bridge is lossless for {pid:?}"
+            );
+        }
+
+        // Two contexts with different `self_pid`s over one registry: each context
+        // creates its tables as *its* process.
+        let mut heap = Heap::new(65536).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut reg = TableRegistry::new();
+        let alpha_handles: Vec<u64> = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, alpha).with_tables(&mut reg);
+            let h1 = new_table(&mut ctx, "mytab");
+            let h2 = new_table(&mut ctx, "mytab");
+            vec![
+                ref_thing_id(h1).expect("handle"),
+                ref_thing_id(h2).expect("handle"),
+            ]
+        };
+        let beta_handle = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, beta).with_tables(&mut reg);
+            ref_thing_id(new_table(&mut ctx, "mytab")).expect("handle")
+        };
+
+        let mut expected = alpha_handles.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            reg.handles_owned_by(TableRegistry::owner_of(alpha)),
+            expected,
+            "alpha's two tables, ascending"
+        );
+        assert_eq!(
+            reg.handles_owned_by(TableRegistry::owner_of(beta)),
+            vec![beta_handle]
+        );
+        assert!(reg
+            .handles_owned_by(TableRegistry::owner_of(ProcessId::new(3, 9)))
+            .is_empty());
+    }    /// An `auto` profile, for the profile-lifetime tests (the only non-boolean
     /// form besides the hidden lock count).
     fn auto_profile() -> resolve::TableProfile {
         resolve::TableProfile::Auto
