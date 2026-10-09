@@ -693,16 +693,11 @@ fn floats_round_trip_bit_exactly() {
         3.14f64.to_bits(),
         0.0f64.to_bits(),
         (-0.0f64).to_bits(),
-        f64::INFINITY.to_bits(),
-        f64::NEG_INFINITY.to_bits(),
-        f64::NAN.to_bits(),
-        0x7ff0_0000_0000_0001, // signaling NaN
-        0x7ff8_0000_dead_beef, // quiet NaN with a payload
-        0xfff0_0000_0000_0001, // negative signaling NaN
-        1,                     // the smallest subnormal
+        1, // the smallest subnormal
         f64::MIN_POSITIVE.to_bits(),
         f64::MIN.to_bits(),
         f64::MAX.to_bits(),
+        0x000f_ffff_ffff_ffff, // the largest subnormal
     ] {
         let mut h1 = heap(16);
         let t = make_float(&mut h1, f64::from_bits(bits)).unwrap();
@@ -713,6 +708,23 @@ fn floats_round_trip_bit_exactly() {
             bits,
             "bits {bits:#018x}"
         );
+    }
+
+    // A non-finite value has no `NEW_FLOAT_EXT` image the oracle will accept: the
+    // C rejects it at decode time (`if (!erts_isfinite(ff.fd)) goto error;`,
+    // `external.c:4667-4669`), so `binary_to_term/1` raises `badarg` for both an
+    // infinity and a NaN. Every one of these images must therefore be `BadArg`.
+    for &bits in &[
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        f64::NAN.to_bits(),
+        0x7ff0_0000_0000_0001, // signaling NaN
+        0x7ff8_0000_dead_beef, // quiet NaN with a payload
+        0xfff0_0000_0000_0001, // negative signaling NaN
+    ] {
+        let mut image = vec![VERSION_MAGIC, NEW_FLOAT_EXT];
+        image.extend_from_slice(&bits.to_be_bytes());
+        assert_bad_arg(&image);
     }
 }
 
@@ -1922,13 +1934,22 @@ fn binaries_and_bitstrings_round_trip() {
 }
 
 #[test]
-fn over_long_atoms_are_system_limit() {
-    // A crafted `ATOM_UTF8_EXT` carrying 256 characters.
+fn over_long_atoms_are_bad_arg() {
+    // A crafted `ATOM_UTF8_EXT` carrying 256 characters. Decoding it is malformed
+    // input (`badarg`), matching the oracle: C rejects an over-long name in
+    // `erts_atom_put`/`erts_atom_get` (`atom.c:258-274`, `atom.c:392-418`) and
+    // `dec_term` turns that into `goto error` (`external.c:4529-4539`).
     let mut image = vec![VERSION_MAGIC, ATOM_UTF8_EXT, 0x01, 0x00];
     image.extend(std::iter::repeat(b'a').take(256));
-    assert_system_limit(&image);
+    assert_bad_arg(&image);
 
-    // Interning a 256-character name and encoding it is a `SystemLimit` too.
+    // Latin-1 too.
+    let mut latin1 = vec![VERSION_MAGIC, ATOM_EXT, 0x01, 0x00];
+    latin1.extend(std::iter::repeat(b'a').take(256));
+    assert_bad_arg(&latin1);
+
+    // Encoding a 256-character name is still a `SystemLimit` (the encoder's own
+    // bound; the wire has no way to carry it).
     let mut atoms = AtomTable::new();
     let long = make_atom(atoms.intern(&"a".repeat(256)));
     assert!(matches!(
@@ -1959,9 +1980,44 @@ fn oversized_bignums_are_system_limit() {
 }
 
 #[test]
-fn signed_bignum_with_bad_sign_byte_is_bad_arg() {
-    // The sign byte is neither 0 nor 1.
-    assert_bad_arg(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 2, 5]);
+fn non_zero_bignum_sign_byte_means_negative() {
+    /// Decodes one image and returns the term plus the heap/atom table that own it.
+    fn decode(image: &[u8], cap: usize) -> (Eterm, Heap, AtomTable) {
+        let mut h = heap(cap);
+        let mut a = AtomTable::new();
+        let t = decode_term(image, &mut h, &mut a).expect("decode the fixture image");
+        (t, h, a)
+    }
+
+    // C reads `neg = get_int8(ep)` and treats it as a boolean: **any** non-zero
+    // sign byte means negative (`if (xsgn) d = -d;`, `big.c:3446-3448`), so the
+    // oracle's `binary_to_term(<<131,110,1,2,42>>)` is `-42`, not `badarg`.
+    let (t, _h, _a) = decode(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 2, 42], 64);
+    assert_eq!(t, make_small(-42));
+    assert!(is_small(t));
+
+    // Sign byte 1 is the canonical negative form.
+    let (t, _h, _a) = decode(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 1, 42], 64);
+    assert_eq!(t, make_small(-42));
+
+    // Sign byte 0 is positive.
+    let (t, _h, _a) = decode(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 0, 42], 64);
+    assert_eq!(t, make_small(42));
+
+    // A zero magnitude is zero whatever the sign byte is
+    // (`external.c:4484-4486` "Zero width bignum defaults to zero").
+    let (t, _h, _a) = decode(&[VERSION_MAGIC, SMALL_BIG_EXT, 1, 5, 0], 64);
+    assert_eq!(t, make_small(0));
+
+    // The same rule applies to a magnitude that becomes a bignum: 2^64 (nine
+    // base-256 bytes) with sign byte 200 is negative, and its digits are the
+    // magnitude's.
+    let mut image = vec![VERSION_MAGIC, SMALL_BIG_EXT, 9, 200];
+    image.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    let (t, _h, _a) = decode(&image, 64);
+    let (negative, digits) = big_parts(t).unwrap();
+    assert!(negative);
+    assert_eq!(digits, &[0, 1]);
 }
 
 #[test]

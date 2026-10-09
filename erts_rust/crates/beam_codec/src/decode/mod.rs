@@ -167,7 +167,14 @@ impl<'a> Decoder<'a> {
             }
             Tag::NewFloat => {
                 let bits = self.reader.u64be()?;
-                crate::term::make_float(heap, f64::from_bits(bits))
+                // `NEW_FLOAT_EXT` cannot carry an infinity or NaN:
+                // `if (!erts_isfinite(ff.fd)) goto error;` (`external.c:4667-4669`),
+                // so the oracle's `binary_to_term/1` raises `badarg` for both.
+                let value = f64::from_bits(bits);
+                if !value.is_finite() {
+                    return Err(bad_arg());
+                }
+                crate::term::make_float(heap, value)
             }
 
             // ---------------------------------------------------------------
@@ -441,10 +448,13 @@ impl<'a> Decoder<'a> {
 
     /// Interns `name` and returns the atom term.
     ///
-    /// A name longer than `MAX_ATOM_CHARS` *characters* is a `SystemLimit`.
+    /// A name longer than `MAX_ATOM_CHARS` *characters* is malformed input
+    /// (`badarg`): C rejects such a name in `erts_atom_put`/`erts_atom_get`
+    /// (`atom.c:258-274`, `atom.c:392-418`) and `dec_term` turns that into
+    /// `goto error` (`external.c:4529-4539`).
     fn atom_term(name: &str, atoms: &mut AtomTable) -> Result<Eterm> {
         if name.chars().count() > MAX_ATOM_CHARS {
-            return Err(system_limit());
+            return Err(bad_arg());
         }
         Ok(make_atom(atoms.intern(name)))
     }
@@ -471,11 +481,14 @@ impl<'a> Decoder<'a> {
     /// Decodes a `SMALL_BIG_EXT`/`LARGE_BIG_EXT` magnitude into a small integer
     /// when it fits one, otherwise into a bignum.
     ///
-    /// Mirrors `external.c:4464-4497` (`dec_term`): the sign byte is `0` (positive)
-    /// or `1` (negative), the magnitude is base-256 **least significant first**, and
-    /// a magnitude that fits a single `ErtsDigit` and a 60-bit small decodes to a
-    /// small (never a bignum). Leading zero bytes are stripped first, exactly as C
-    /// does "to avoid creating illegal bignums".
+    /// Mirrors `external.c:4457-4497` (`dec_term`): the sign byte is `neg =
+    /// get_int8(ep)` and C treats it as a boolean — **any non-zero value means
+    /// negative** (`bytes_to_big`'s `if (xsgn) d = -d;`, `big.c:3446-3448`), while
+    /// a zero magnitude defaults to `0` whatever the sign byte is
+    /// (`external.c:4484-4486`). The magnitude is base-256 **least significant
+    /// first**, and a magnitude that fits a single `ErtsDigit` and a 60-bit small
+    /// decodes to a small (never a bignum). Leading zero bytes are stripped first,
+    /// exactly as C does "to avoid creating illegal bignums".
     fn decode_big(&mut self, tag: Tag, heap: &mut Heap) -> Result<Eterm> {
         let byte_count = if tag == Tag::SmallBig {
             usize::from(self.reader.u8()?)
@@ -486,12 +499,8 @@ impl<'a> Decoder<'a> {
             }
             count
         };
-        let negative = match self.reader.u8()? {
-            0 => false,
-            1 => true,
-            // Any other sign byte is malformed.
-            _ => return Err(bad_arg()),
-        };
+        // Any non-zero sign byte means negative (`external.c:4471` + `big.c:3446`).
+        let negative = self.reader.u8()? != 0;
         let bytes = self.reader.bytes(byte_count)?;
 
         // Strip high-order zero bytes (the most significant end of a

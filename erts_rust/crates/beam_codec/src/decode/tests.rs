@@ -107,11 +107,17 @@
         let (_h, _a, term) = decode(&image);
         assert_eq!(float_value(term).unwrap(), 3.14);
 
-        // Negative zero and NaN survive bit-for-bit.
+        // Negative zero survives bit-for-bit.
         let (_h, _a, term) = decode(&[131, 70, 128, 0, 0, 0, 0, 0, 0, 0]);
         assert!(float_value(term).unwrap().is_sign_negative());
-        let (_h, _a, term) = decode(&[131, 70, 127, 248, 0, 0, 0, 0, 0, 0]);
-        assert!(float_value(term).unwrap().is_nan());
+
+        // A non-finite `NEW_FLOAT_EXT` is rejected: the wire cannot carry an
+        // infinity or NaN (`if (!erts_isfinite(ff.fd)) goto error;`,
+        // `external.c:4667-4669`), matching the oracle's `badarg`.
+        assert_bad_arg(&[131, 70, 127, 240, 0, 0, 0, 0, 0, 0]); // +inf
+        assert_bad_arg(&[131, 70, 255, 240, 0, 0, 0, 0, 0, 0]); // -inf
+        assert_bad_arg(&[131, 70, 127, 248, 0, 0, 0, 0, 0, 0]); // quiet NaN
+        assert_bad_arg(&[131, 70, 127, 240, 0, 0, 0, 0, 0, 1]); // signaling NaN
 
         // `FLOAT_EXT` accepts a short, NUL-terminated rendering.
         let mut image = vec![131, 99];
@@ -160,22 +166,37 @@
     }
 
     #[test]
-    fn over_long_atom_names_are_system_limit() {
+    fn over_long_atom_names_are_bad_arg() {
+        // An over-long name is malformed input, not a resource limit: C rejects it
+        // in `erts_atom_put`/`erts_atom_get` (`atom.c:258-274`, `atom.c:392-418`)
+        // and `dec_term` turns that into `goto error` (`external.c:4529-4539`).
         // 256 Latin-1 characters (one byte each).
         let mut latin1 = vec![131, 100, 1, 0];
         latin1.extend_from_slice(&[b'a'; 256]);
-        assert_system_limit(&latin1);
+        assert_bad_arg(&latin1);
 
         // 256 UTF-8 characters.
         let mut utf8 = vec![131, 118, 1, 0];
         utf8.extend_from_slice(&[b'a'; 256]);
-        assert_system_limit(&utf8);
+        assert_bad_arg(&utf8);
 
         // Exactly 255 characters is at the limit.
         let mut at_limit = vec![131, 100, 0, 255];
         at_limit.extend_from_slice(&[b'a'; 255]);
         let (_h, atoms, term) = decode(&at_limit);
         assert_eq!(atoms.name(atom_val(term)).map(str::len), Some(255));
+
+        // The limit counts *characters*, not UTF-8 bytes: a 150-character name
+        // spanning 300 bytes is legal (`erts_atom_put` bounds the char count,
+        // `atom.c:258-274`).
+        let mut multi_byte = vec![131, 118, 1, 44];
+        for _ in 0..150 {
+            multi_byte.extend_from_slice(&[0xC3, 0xA9]); // "é"
+        }
+        let (_h, atoms, term) = decode(&multi_byte);
+        let name = atoms.name(atom_val(term)).unwrap();
+        assert_eq!(name.chars().count(), 150);
+        assert_eq!(name.len(), 300);
     }
 
     #[test]
@@ -322,8 +343,14 @@
         assert!(!negative);
         assert_eq!(digits, &[0x42B6_4E76_7142_44CB, 0x029D]);
 
-        // The sign byte is 0 or 1 only.
-        assert_bad_arg(&[131, 110, 1, 2, 5]);
+        // The sign byte is a boolean: any non-zero value means negative
+        // (`if (xsgn) d = -d;`, `big.c:3446-3448`), so `2` negates 5.
+        let (_h, _a, term) = decode(&[131, 110, 1, 2, 5]);
+        assert_eq!(term, make_small(-5));
+        // A zero magnitude is zero whatever the sign byte is (`external.c:4484-4486`).
+        let (_h, _a, term) = decode(&[131, 110, 1, 5, 0]);
+        assert_eq!(term, make_small(0));
+
         // More base-256 bytes than `BIG_ARITY_MAX * sizeof(ErtsDigit)` (524280) is a
         // hard wire bound (`external.c:6146`).
         assert_system_limit(&[131, 111, 0, 8, 0, 25]);
