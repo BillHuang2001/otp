@@ -497,6 +497,15 @@ impl PortRegistry {
         self.registry.port_table_mut()
     }
 
+    /// The registry's port-number table, **read-only** — the inspecting counterpart of
+    /// [`PortRegistry::port_table_mut`].
+    ///
+    /// For observers that only look at a port's relationships (its incoming port-monitor set,
+    /// say) without changing them, so they need no `&mut` borrow of the registry. It forwards
+    /// [`beam_io::PortRegistry::port_table`], the same table `port_table_mut` hands out.
+    pub fn port_table(&self) -> &PortTable {
+        self.registry.port_table()
+    }
     /// The number of **live** ports — the value `erlang:system_info(port_count)` reports.
     pub fn len(&self) -> usize {
         self.meta.len()
@@ -1234,6 +1243,40 @@ impl PortHook for RuntimePorts {
 }
 
 impl Runtime {
+    /// The watcher pids currently monitoring `port`, read from the runtime's **authoritative**
+    /// port table ([`PortRegistry::port_table`] — the same `beam_process::PortTable`
+    /// `open_port/2` allocates from, `erlang:monitor(port, Port)` records an incoming
+    /// [`PortMonitor`](beam_process::PortMonitor) on, and a port close drains).
+    ///
+    /// This is the live **incoming** monitor set for the port: the entries
+    /// [`ProcessTable::monitor_port`](beam_process::ProcessTable::monitor_port) adds for each
+    /// `erlang:monitor(port, Port)` watch and the dead-watcher sweep
+    /// ([`Runtime::drain_port_monitor_exits`](crate::runtime::ets_owner)) removes when the
+    /// watching process dies first. It is the observable used by
+    /// `tests/port_monitor_cleanup.rs`; the port table sits behind a private
+    /// `Rc<RefCell<PortRegistry>>`, so there is no other public path to it.
+    ///
+    /// # Errors
+    ///
+    /// The typed `unsupported` capability gap when the port registry is already borrowed (a
+    /// nested port operation) — the same rule every other port accessor of this crate
+    /// follows, never a panic.
+    pub fn port_monitors(&self, port: PortId) -> Result<Vec<ProcessId>> {
+        // The `Rc` is cloned **first**, exactly like `crate::native::process::monitor`'s
+        // `with_port_table`, so the borrow is of the clone and a nested borrow is a typed gap
+        // rather than a panic.
+        let cell = Rc::clone(&self.ports);
+        let registry = cell
+            .try_borrow()
+            .map_err(|_| error::unsupported("the port table is already in use"))?;
+        Ok(registry
+            .port_table()
+            .monitors(port)
+            .iter()
+            .map(|monitor| monitor.watcher)
+            .collect())
+    }
+
     /// Drives the port poller for up to `timeout` and **delivers** every message the ports
     /// produced into its owning process's mailbox in `table`, returning how many were
     /// delivered.

@@ -525,6 +525,15 @@ impl Runtime {
                 Ok(executed) => ran += executed,
                 Err(err) => break Err(err),
             }
+            // The port-monitor half of the exit obligation: a process that died in the slices
+            // just run may have been watching a live port, and `beam_process`'s finalizer cannot
+            // remove the matching *incoming* entry because this runtime threads no port table
+            // into the termination. The dead watchers' recorded `(port, reference)` pairs are
+            // swept here, where the port registry is free (see `crate::runtime::ets_owner`).
+            // Nothing is delivered, so the pass does **not** go round again for it.
+            if let Err(err) = self.drain_port_monitor_exits() {
+                break Err(err);
+            }
             // The ETS owner-death half: a process that died in the slices just run may have
             // owned ETS tables. The obligation its exit observer recorded is discharged here,
             // where the ETS registry is free (see `crate::runtime::ets_owner`); a transfer

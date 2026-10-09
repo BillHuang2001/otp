@@ -18,27 +18,37 @@
 //
 // %CopyrightEnd%
 
-//! **ETS owner-death reclamation** (the `beam_process` `ProcessExitObserver` host).
+//! **Owner-death reclamation** — the runtime's host for the `beam_process`
+//! `ProcessExitObserver` seam, carrying the two obligations a death leaves behind:
 //!
-//! An ETS table belongs to the process that created it, so the runtime must release it the
-//! moment that process dies — the table disappears, or it is handed to its installed heir
-//! (`beam_ets::Table::owner_died`, contract A.1/`erl_db.c`). `beam_process` cannot know what
-//! the ETS registry allocated on a pid's behalf, so it exposes the
-//! [`ProcessExitObserver`](beam_process::ProcessExitObserver) seam: the runtime installs an
-//! observer on its [`ProcessTable`] and is called **exactly once per death**, from inside the
-//! finalizer, before the dying heap is released.
+//! * **ETS tables** (`erl_db.c`, contract A.1). An ETS table belongs to the process that
+//!   created it, so the runtime must release it the moment that process dies — the table
+//!   disappears, or it is handed to its installed heir (`beam_ets::Table::owner_died`).
+//!   [`Runtime::drain_ets_owner_exits`] discharges that obligation.
+//! * **Dangling port monitors** (`erl_ptab.c`, contract A.4). `erlang:monitor(port, Port)`
+//!   records an *incoming* monitor on the port, so a port close can deliver
+//!   `{'DOWN', Ref, port, Port, Reason}` to the watcher. When the **watcher** dies first, that
+//!   incoming entry outlives it — a port would keep a monitor for a process that no longer
+//!   exists. [`Runtime::drain_port_monitor_exits`] sweeps it.
+//!
+//! `beam_process` cannot know what the ETS registry allocated on a pid's behalf, and this
+//! runtime threads no [`PortTable`](beam_process::PortTable) into the termination path, so it
+//! exposes the [`ProcessExitObserver`](beam_process::ProcessExitObserver) seam instead: the
+//! runtime installs an observer on its [`ProcessTable`] and is called **exactly once per
+//! death**, from inside the finalizer, before the dying heap is released.
 //!
 //! # Why the observer only *records*
 //!
 //! The finalizer can run while a `RefCell` the runtime owns is already borrowed — a BIF call
-//! holds the shared ETS [`TableRegistry`](beam_bifs::TableRegistry) for the whole of its call,
-//! and a death inside that call would be reached with the cell taken. An observer that reached
-//! for the registry there would either panic or silently lose the obligation. So the observer
-//! touches **nothing but its own** [`OwnerIndex`] cell (a cell no BIF ever borrows): it pushes
-//! the dead pid and returns. [`Runtime::drain_ets_owner_exits`] then discharges the recorded
-//! obligations at a point where no ETS borrow is live — a scheduler-pass round — using
-//! `try_borrow_mut` and **deferring** (never dropping, never panicking) when the registry is
-//! still held.
+//! holds the shared ETS [`TableRegistry`](beam_bifs::TableRegistry) (or the shared port
+//! registry) for the whole of its call, and a death inside that call would be reached with the
+//! cell taken. An observer that reached for either there would either panic or silently lose
+//! the obligation. So the observer touches **nothing but its own** [`OwnerIndex`] cell (a cell
+//! no BIF ever borrows): it pushes the dead pid and the drained
+//! [`PortWatch`](beam_process::PortWatch) pairs and returns. The two drains then discharge the
+//! recorded obligations at a point where no such borrow is live — a scheduler-pass round —
+//! using `try_borrow_mut` and **deferring** (never dropping, never panicking) when the registry
+//! is still held.
 //!
 //! # What is reclaimed, and the honest gap
 //!
@@ -66,7 +76,8 @@ use std::rc::Rc;
 use beam_common::Result;
 use beam_ets::{OwnerDeath, OwnerId};
 use beam_process::{
-    ProcessExit, ProcessExitObserver, ProcessId, ProcessTable, Scheduler,
+    MonitorRef, PortId, PortWatch, ProcessExit, ProcessExitObserver, ProcessId, ProcessTable,
+    Scheduler,
 };
 use beam_term::{make_atom, Atom, Eterm};
 
@@ -91,18 +102,28 @@ pub(crate) struct OwnedTable {
     pub(crate) name: Atom,
 }
 
-/// The owner→named-table index plus the deaths waiting to be discharged.
+/// The owner→named-table index plus the death obligations waiting to be discharged.
 ///
 /// Shared through an [`Rc`]`<`[`RefCell`]`>` between the [`Runtime`] (which records creations
 /// and drains) and the [`EtsExitObserver`] (which records deaths). No BIF ever borrows this
 /// cell, so the observer can always take it — that is what makes the observer safe to run from
-/// inside the finalizer while an ETS borrow is live.
+/// inside the finalizer while an ETS (or port) borrow is live.
 #[derive(Default)]
 pub(crate) struct OwnerIndex {
     /// The `named_table`s each live owner created, keyed by [`owner_key`].
     tables: HashMap<u64, Vec<OwnedTable>>,
     /// The pids observed dead, in death order, waiting for a drain.
     deaths: Vec<ProcessId>,
+    /// The dangling **incoming port monitors** the dead watchers left behind, as
+    /// `(port, reference)` pairs, waiting for a drain.
+    ///
+    /// Recorded straight from the observer's
+    /// [`ProcessExit::port_monitors`](beam_process::ProcessExit::port_monitors) payload — a
+    /// [`PortWatch`] is a pair of plain values, so nothing has to be copied out of the dying
+    /// heap. Each pair is the `reference` of an `erlang:monitor(port, Port)` watch recorded on
+    /// the port table (see [`crate::port`]), which this drain removes so the port keeps no
+    /// monitor for a watcher that no longer exists.
+    port_watches: Vec<(PortId, MonitorRef)>,
 }
 
 impl OwnerIndex {
@@ -117,6 +138,21 @@ impl OwnerIndex {
         }
     }
 
+    /// Records that a dead process was watching each of `watches` (its drained outgoing port
+    /// monitors), so the matching incoming entries on the port table can be swept.
+    ///
+    /// Append-only: two deaths that watched the same port are two separate obligations, and a
+    /// reference is unique to one watch, so no de-duplication is needed (or wanted).
+    pub(crate) fn record_port_watches(&mut self, watches: &[PortWatch]) {
+        self.port_watches
+            .extend(watches.iter().map(|watch| (watch.port, watch.reference)));
+    }
+
+    /// Takes the recorded dangling port monitors out for a drain, leaving the cell empty.
+    pub(crate) fn take_port_watches(&mut self) -> Vec<(PortId, MonitorRef)> {
+        std::mem::take(&mut self.port_watches)
+    }
+
     /// The number of owners with at least one indexed table (test/diagnostic).
     #[cfg(test)]
     pub(crate) fn owner_count(&self) -> usize {
@@ -128,12 +164,23 @@ impl OwnerIndex {
     pub(crate) fn pending_deaths(&self) -> usize {
         self.deaths.len()
     }
+
+    /// The number of dangling port monitors waiting for a drain (test/diagnostic).
+    #[cfg(test)]
+    pub(crate) fn pending_port_watches(&self) -> usize {
+        self.port_watches.len()
+    }
 }
 
-/// The `ProcessExitObserver` host: records the dead pid, and nothing else.
+/// The `ProcessExitObserver` host: records the dead pid and its drained port watches, and
+/// nothing else.
 ///
 /// The `reason` is deliberately **not** retained (it may live in the dying heap, and no part
-/// of the ETS obligation needs it), so there is nothing to copy.
+/// of either obligation needs it), so there is nothing to copy. The
+/// [`PortWatch`](beam_process::PortWatch) pairs *are* retained as they are: a
+/// [`PortId`](beam_process::PortId) and a `MonitorRef` are plain values, so the slice the
+/// finalizer hands over stays valid after the dying heap is released (see
+/// [`ProcessExit`](beam_process::ProcessExit)).
 pub(crate) struct EtsExitObserver {
     /// The shared index the runtime drains.
     index: Rc<RefCell<OwnerIndex>>,
@@ -148,12 +195,15 @@ impl EtsExitObserver {
 
 impl ProcessExitObserver for EtsExitObserver {
     fn process_exited(&mut self, exit: &ProcessExit<'_>) {
-        // Only the pid is retained: it is an immediate (heap-independent), and it is the whole
-        // obligation — the affected tables are looked up at drain time.
-        self.index.borrow_mut().deaths.push(exit.pid());
+        // Only the pid and the port watches are retained: both are heap-independent (a pid and
+        // a `PortWatch` are plain values), and together they are the whole obligation — the
+        // affected ETS tables are looked up at drain time. The borrow is taken once and never
+        // held across the call.
+        let mut index = self.index.borrow_mut();
+        index.deaths.push(exit.pid());
+        index.record_port_watches(exit.port_monitors());
     }
 }
-
 /// Whether an owner read back from a table is still a live process.
 ///
 /// An owner that does not decode to an internal pid (never produced by `ets:new/2` here) can
@@ -325,6 +375,78 @@ impl Runtime {
         }
         Ok(delivered)
     }
+
+    /// Sweeps the **dangling incoming port monitors** dead watchers left on the runtime's live
+    /// port table (contract A.4).
+    ///
+    /// `erlang:monitor(port, Port)` records an incoming
+    /// [`PortMonitor`](beam_process::PortMonitor) on the port (the runtime's authoritative
+    /// `beam_process::PortTable`, see [`crate::port`]) so a port close can deliver
+    /// `{'DOWN', Ref, port, Port, Reason}` to the watcher. When the **watcher** dies instead,
+    /// that incoming entry outlives it: `beam_process`'s finalizer removes the matching
+    /// incoming entry only when a `PortTable` is threaded into the termination
+    /// ([`ProcessTable::terminate_with_ports`](beam_process::ProcessTable)), which this runtime
+    /// does not do — it hands the port table to no termination path. The
+    /// [`PortTable::monitors`](beam_process::PortTable::monitors) set would therefore keep the
+    /// dead pid forever (and `erlang:port_info(Port, monitors)`-style introspection would
+    /// report a watcher that cannot receive a `'DOWN'`).
+    ///
+    /// The exit observer therefore records each dead watcher's
+    /// [`ProcessExit::port_monitors`](beam_process::ProcessExit::port_monitors) pairs
+    /// ([`OwnerIndex::record_port_watches`]) and this drain removes exactly those entries —
+    /// there is no by-watcher-pid lookup on [`PortTable`](beam_process::PortTable), so the
+    /// `(port, reference)` pairs are the only handle. Only the pairs the table really holds are
+    /// removed: a port that has already closed drained its own side, so an unallocated id is
+    /// skipped rather than treated as an error (`demonitor` would answer `BadArg` for it).
+    ///
+    /// Must be called at a point where no borrow of the runtime's port registry from the call
+    /// path can be live (the same scheduler-pass round boundary as
+    /// [`Runtime::drain_ets_owner_exits`]). The registry is taken with `try_borrow_mut`: a
+    /// still-live borrow defers the sweep to the next drain — never a panic, never a dropped
+    /// obligation.
+    ///
+    /// Returns the number of entries removed. Idempotent and cheap with nothing pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BeamError::BadArg`](beam_common::BeamError::BadArg) only if a monitor survives
+    /// on a port that `contains` said was allocated and then vanished — unreachable under the
+    /// single-threaded runtime, so it is propagated rather than swallowed.
+    pub(crate) fn drain_port_monitor_exits(&mut self) -> Result<usize> {
+        let watches = {
+            let mut index = self.ets_owners.borrow_mut();
+            index.take_port_watches()
+        };
+        if watches.is_empty() {
+            return Ok(0);
+        }
+        // The `Rc` is cloned **before** the borrow so the returned `RefMut` borrows the clone
+        // rather than the runtime field — the same shape `crate::native::process::monitor` and
+        // `crate::port::deliver_port_messages` use.
+        let cell = Rc::clone(&self.ports);
+        let Ok(mut registry) = cell.try_borrow_mut() else {
+            // The port registry is held by an in-flight BIF call (a death reached the finalizer
+            // from inside it). Put the watches back, in order, in front of anything recorded
+            // since — and never drop them.
+            let mut index = self.ets_owners.borrow_mut();
+            let mut deferred = watches;
+            deferred.append(&mut index.port_watches);
+            index.port_watches = deferred;
+            return Ok(0);
+        };
+        let table = registry.port_table_mut();
+        let mut removed = 0usize;
+        for (port, reference) in watches {
+            if !table.contains(port) {
+                // The port closed before this drain: its own side is already gone.
+                continue;
+            }
+            if table.demonitor(port, reference)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
@@ -364,5 +486,41 @@ mod tests {
             ProcessId::from_eterm(Eterm::from_raw(owner_key(pid) as usize)).expect("decodes"),
             pid
         );
+    }
+
+    /// The observer's port-watch half records every `(port, reference)` pair a death drained,
+    /// append-only (two deaths on the same port are two separate obligations), and a drain
+    /// takes the whole backlog out — so a second drain has nothing to do.
+    #[test]
+    fn port_watches_are_recorded_append_only_and_taken_for_a_drain() {
+        let port_a = PortId::new(4);
+        let port_b = PortId::new(5);
+        // `MonitorRef` has no public constructor: references come out of the id allocator
+        // (the runtime's single ref space — see `crate::runtime::Runtime::refs_mut`).
+        let mut refs = beam_process::RefAllocator::new();
+        let (r1, r2, r3) = (refs.next(), refs.next(), refs.next());
+        let mut index = OwnerIndex::default();
+        assert_eq!(index.pending_port_watches(), 0);
+
+        index.record_port_watches(&[
+            PortWatch {
+                reference: r1,
+                port: port_a,
+            },
+            PortWatch {
+                reference: r2,
+                port: port_b,
+            },
+        ]);
+        index.record_port_watches(&[PortWatch {
+            reference: r3,
+            port: port_a,
+        }]);
+        assert_eq!(index.pending_port_watches(), 3);
+
+        let taken = index.take_port_watches();
+        assert_eq!(taken, vec![(port_a, r1), (port_b, r2), (port_a, r3)]);
+        assert_eq!(index.pending_port_watches(), 0);
+        assert!(index.take_port_watches().is_empty());
     }
 }
