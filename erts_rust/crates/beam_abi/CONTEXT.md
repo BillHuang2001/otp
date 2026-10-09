@@ -259,6 +259,17 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   bodies, so `unsafe` appears throughout; every declaration is documented and every `unsafe` block
   (term/pointer transmutes, the `NifEnv`/`DriverEnv` opaque-pointer recover paths) carries a
   preceding `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean.
+- **The raw-pointer ABI wrappers intentionally `allow(clippy::not_unsafe_ptr_arg_deref)`.** The
+  `DriverLibrary` callback wrappers (`src/driver/loader.rs`: `start`/`control`/`call`/`stop`/
+  `output`/`outputv`/`timeout`/`ready_input`/`ready_output`/`ready_async`/`flush`/`process_exit`/
+  `stop_select`/`emergency_close`) and `sync::thread_exit` are **safe** public fns whose parameters
+  are the raw pointers of the C `ErlDrvEntry`/pthread signatures, forwarded verbatim to the driver's
+  own callback (or `pthread_exit`): the pointer-validity contract belongs to the caller, exactly as
+  in the C. The lint is allowed with a recorded rationale — a module-scoped inner attribute in
+  `src/driver/loader.rs` and a function-scoped attribute on `thread_exit` — because making them
+  `unsafe fn` would be a breaking change to the frozen ABI-mirroring public API that `beam_rt`/
+  `beam_io` consume. `cargo clippy -p beam_abi --all-targets --no-deps` is error-free as a result
+  (warnings remain; the workspace clippy step is non-blocking).
 - **Nullability:** C function-pointer fields are `Option<unsafe extern "C" fn …>` (null-pointer
   optimized, same size/align as a raw pointer). Data pointers stay raw `*mut T`/`*const T`.
 - **Opaque handles** are `#[repr(C)] pub struct X { _private: [u8; 0] }` (incomplete C type), used
