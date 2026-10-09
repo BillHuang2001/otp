@@ -57,8 +57,11 @@
 //!   ([`Machine::current_code`]/[`Machine::entry_call`] and the derived
 //!   [`Machine::current_function`]/[`Machine::initial_call`]/
 //!   [`Machine::current_location`]/[`Machine::current_stacktrace`]).
-//! * `tests` — this module's unit tests, which exercise every part together.
-
+//! * `tests` — the cross-cutting end-to-end tests (the uniform raise funnel's
+//!   symbolic frames, run through real run entries), over the synthetic-module
+//!   scaffolding in `test_support`.
+//! * `test_support` — the `cfg(test)`-only synthetic-module builder (`Fixture`)
+//!   and the cross-module seam context (`seam`) the `machine` tests share.
 use beam_common::{ExceptionClass, Result};
 use beam_loader::{Module, SharedLiteralArea};
 use beam_term::Eterm;
@@ -81,7 +84,10 @@ mod frames;
 mod location;
 mod registers;
 mod run;
-/// Process-state core: x-register file, Erlang stack and call-frame stack.
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+pub(crate) mod test_support;/// Process-state core: x-register file, Erlang stack and call-frame stack.
 pub struct Machine {
     /// The X-register file (`x[0..max_register)`); the engine's argument/result file.
     pub(crate) x: Vec<Eterm>,
