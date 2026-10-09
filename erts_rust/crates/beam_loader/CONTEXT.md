@@ -187,6 +187,10 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   IsBitstr, IsList, IsNonemptyList, IsTuple, IsMap, IsBoolean, IsFunction, IsFunction2, IsTaggedTuple,
   TestArity`) with `TestKind::from_opcode(Opcode) -> Option<TestKind>`;
   `Instr::Test` carries the kind plus the failure label and the tested operands (`fail` is *not* in `args`).
+  The variant names carry the C semantics: `IsEq`/`IsNe` are **arithmetic** `==`/`!=` (`is_eq`/`is_ne`, C
+  `CMP_EQ_ACTION`/`CMP_NE_ACTION`) while `IsEqExact`/`IsNeExact` are **exact** `=:=`/`=/=`
+  (`is_eq_exact`/`is_ne_exact`, C `EQ`); `IsList` accepts `[]`, `IsNonemptyList` does not; `IsFunction2`
+  is a fun of exact arity, `IsTaggedTuple` a tuple of the given size whose element 0 is the tag.
 - `pub type LineRef` / `pub use beam_term::Eterm;` are re-exported from `ir.rs` (the resolved type of `Module::literal`).
 - `pub enum Opcode` (`src/opcode.rs`) — **one variant per generic opcode** (the full `genop.tab`
   roster), with `Opcode::from_u8(u8) -> Option<Opcode>`, `Opcode::as_u8(self) -> u8`,
