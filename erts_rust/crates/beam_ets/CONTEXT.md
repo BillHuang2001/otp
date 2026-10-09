@@ -165,7 +165,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   - `TableWrite<'g>` — metadata, mutations over caller-owned inputs (`insert`, `insert_new`,
     `insert_list`, `delete`, `delete_object`, `delete_all_objects`, `update_counter`,
     `update_counter_with`, `update_element`, `select_delete`, `match_delete`, `select_replace`,
-    `set_fixation`, `set_owner`, `set_heir`, `setopts`, `give_away`), `heir()`, `take ->
+    `set_fixation`, `set_owner`, `set_heir`, `set_access`, `setopts`, `give_away`), `heir()`, `take ->
     Vec<TableTerm<'_>>`, and `as_requester`.
   - **View-borrowed traversal** (`view/iter.rs`) — `TableRead::{iter_keys, iter_keys_rev, iter_objects,
     iter_objects_rev}` (each yields `TableTerm<'a>` bound to the view borrow via `ets:first|next` /
