@@ -79,8 +79,36 @@
 //! (`Step::Enter`) — no `apply`/`apply_last`, and every `call_ext*` target provably
 //! synchronous — because the JIT driver has no in-machine module switch and would turn such
 //! a step into a bogus exit reason. The mode is [`JitMode`](tier::JitMode):
-//! [`Auto`](tier::JitMode::Auto) (the default, gated by the predicate), or a forced
-//! interpreter/baseline from `BEAM_RT_TIER` / a test.
+//! [`Interpreter`](tier::JitMode::Interpreter) — **the default**, the always-correct tier —
+//! or [`Auto`](tier::JitMode::Auto) / [`Baseline`](tier::JitMode::Baseline) from
+//! `BEAM_RT_TIER` / a test.
+//!
+//! # Why the JIT is opt-in (`BEAM_RT_TIER=auto`), not the default
+//!
+//! The tier is taken on the **first** entry only, and a pre-empted process is **resumed on
+//! the interpreter** (a tier-aware resume is a missing engine seam), so a module whose hot
+//! loop reaches a heap-admission point (`test_heap`/`allocate_heap`) is ≈neutral: all but
+//! its first slice run interpreted. The baseline JIT's large win is confined to a hot loop
+//! with **no** heap-admission point anywhere, which stays in the one tier-chosen slice.
+//! Measured on the release build with `$ERTS_STDLIB_DIR` set (no per-process `erl`
+//! start-up), alternating runs, min/median seconds:
+//!
+//! | workload | interpreter | `auto` (JIT where safe) |
+//! |---|---|---|
+//! | `walk:cnt/1 20000000` (non-allocating tail loop) | 16.05 / 17.05 | 0.116 / 0.127 |
+//! | `al:tailnoalloc/1 20000000` (non-allocating tail loop) | 19.35 | 0.114 |
+//! | `fibn:fib/1 27` (allocating tree recursion) | 0.384 / 0.403 | 0.273 / 0.284 |
+//! | `al:list/1 3000000` (allocating tail loop) | 1.34 / 1.40 | 1.27 / 1.43 |
+//! | `slice:fib/1 300000` (the slice fixture) | 0.135 / 0.183 | 0.119 / 0.226 |
+//! | `slice:fib/1 32` (the slice fixture) | 0.026 / 0.033 | 0.022 / 0.029 |
+//!
+//! The JIT is never *clearly* faster on the named switch-free fixture (`slice.beam`:
+//! ≈1.0–1.15×, inside the run-to-run noise) and never beyond-noise *slower* either, and its
+//! 139–170× win needs the no-heap-admission-point shape. With the `Step::Enter` deopt and
+//! the tier-aware-resume seams missing, a slower-by-default runtime is unacceptable, so the
+//! default is the interpreter and `BEAM_RT_TIER=auto` opts **in** to the JIT exactly where
+//! [`tier::jit_is_switch_safe`] proves it safe. The selection machinery, the predicate and
+//! the per-module memo are permanent; only the default is conservative.
 //!
 //! # Layout
 //!

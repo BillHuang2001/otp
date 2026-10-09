@@ -75,6 +75,35 @@
 //! what makes the per-module memo in [`RunnerState`](super::RunnerState) sound; a stale
 //! *unsafe* verdict it might retain is only a missed optimisation (the interpreter is
 //! always correct), never a wrong result.
+//!
+//! # Why the JIT is **opt-in**, not the default
+//!
+//! The tier is selected for a process's **first entry** only: a process that pre-empts
+//! yields and is then **resumed on the interpreter** (a tier-aware resume is a missing
+//! engine seam — see `../CONTEXT.md`), so a module whose hot loop reaches a heap-admission
+//! point (`test_heap`/`allocate_heap`, the ordinary allocating shape) spends all but its
+//! first slice on the interpreter and the tier is ≈neutral. The baseline JIT's large win is
+//! confined to a hot loop with **no** heap-admission point anywhere, which then stays in the
+//! one tier-chosen slice. Measured on the release build with `$ERTS_STDLIB_DIR` set (so no
+//! per-process `erl` start-up is included), alternating runs:
+//!
+//! | workload | shape | interpreter (min/med) | `auto` (min/med) |
+//! |---|---|---|---|
+//! | `walk:cnt/1 20000000` | non-allocating tail loop | 16.05 / 17.05 s | 0.116 / 0.127 s |
+//! | `al:tailnoalloc/1 20000000` | non-allocating tail loop | 19.35 s | 0.114 s |
+//! | `fibn:fib/1 27` | allocating tree recursion | 0.384 / 0.403 s | 0.273 / 0.284 s |
+//! | `al:list/1 3000000` | allocating tail loop (`test_heap`) | 1.34 / 1.40 s | 1.27 / 1.43 s |
+//! | `slice:fib/1 300000` (the fixture) | bignum loop | 0.135 / 0.183 s | 0.119 / 0.226 s |
+//! | `slice:fib/1 32` (the fixture) | bignum loop, trivial | 0.026 / 0.033 s | 0.022 / 0.029 s |
+//!
+//! The JIT is never *clearly* faster on the objective's named switch-free fixture
+//! (`slice.beam`: ≈1.0–1.15×, within the run-to-run noise) and never *slower* beyond that
+//! noise either; its 139–170× win needs the no-heap-admission-point shape, whose verdict
+//! also depends on the missing `Step::Enter` deopt seam and on the unresumed-tier seam
+//! above. Because a slower-by-default runtime is unacceptable and those seams are missing,
+//! the **default is the always-correct interpreter** and the JIT is reached by opting in
+//! (`BEAM_RT_TIER=auto`). The selection machinery and the soundness predicate below are
+//! permanent; only the default is conservative.
 
 use std::sync::OnceLock;
 
@@ -92,30 +121,60 @@ use crate::runtime::Runtime;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum JitMode {
     /// The baseline JIT exactly when [`jit_is_switch_safe`] proves the entry module free
-    /// of a module-context switch; the interpreter otherwise. The default.
-    #[default]
+    /// of a module-context switch; the interpreter otherwise.
+    ///
+    /// This is the **opt-in** mode (the `BEAM_RT_TIER=auto` value), not the default: see
+    /// the module docs for the measurements behind the conservative default and
+    /// [`JitMode::Interpreter`] for the default itself.
     Auto,
-    /// The interpreter unconditionally (the reference tier).
+    /// The interpreter unconditionally (the reference tier). The default.
+    #[default]
     Interpreter,
     /// The baseline JIT unconditionally.
     ///
     /// This is an **explicit override of the safety predicate** (a measurement/debugging
-    /// knob), so it is only ever chosen deliberately, never by [`JitMode::Auto`].
+    /// knob), so it is only ever chosen deliberately, never by [`JitMode::Auto`]. Against
+    /// a module that can report a module-context switch (`Step::Enter`) it hits the JIT
+    /// driver's typed `unsupported("jit: module context switch outside the interpreter
+    /// driver")` — which on the runner path becomes the process's exit reason — so it must
+    /// not be used to run unknown code.
     Baseline,
+}
+
+/// [`JitMode`] for one `BEAM_RT_TIER` value — the **pure** resolution, and the single
+/// definition of the variable's semantics.
+///
+/// * `None` (the variable is unset) → [`JitMode::Interpreter`] — the default: the
+///   always-correct tier, with no measurable regression on any workload (see the module
+///   docs).
+/// * `Some("auto")` → [`JitMode::Auto`] — the safe way to opt **in** to the JIT: it is
+///   taken exactly where [`jit_is_switch_safe`] proves the entry module free of a
+///   module-context switch, the interpreter everywhere else.
+/// * `Some("baseline")` → [`JitMode::Baseline`] — the forced measurement/debug override of
+///   the predicate (see [`JitMode::Baseline`] for its risk).
+/// * `Some("interpreter")` and any other value → [`JitMode::Interpreter`] — an unknown
+///   value resolves to the safe default rather than being an error.
+///
+/// Pure (no environment read), so a test can pin the semantics without mutating the
+/// process environment (the crate is `#![deny(unsafe_code)]`, and `set_var` is `unsafe` in
+/// edition 2024).
+pub(super) fn mode_from_value(value: Option<&str>) -> JitMode {
+    match value {
+        Some("auto") => JitMode::Auto,
+        Some("baseline") => JitMode::Baseline,
+        _ => JitMode::Interpreter,
+    }
 }
 
 /// The process-wide default tier mode from the `BEAM_RT_TIER` environment variable.
 ///
-/// `"interpreter"` → [`JitMode::Interpreter`], `"baseline"` → [`JitMode::Baseline`], and
-/// anything else — including an unset variable — the sound default [`JitMode::Auto`]. Read
+/// The variable's semantics are [`mode_from_value`]'s; an unset or unknown value is the
+/// default [`JitMode::Interpreter`] (the JIT is opt-in, via `BEAM_RT_TIER=auto`). Read
 /// **once** (a `OnceLock`), so a long-running process pays no repeated `getenv`.
 pub(super) fn env_default() -> JitMode {
     static DEFAULT: OnceLock<JitMode> = OnceLock::new();
-    *DEFAULT.get_or_init(|| match std::env::var("BEAM_RT_TIER").as_deref() {
-        Ok("interpreter") => JitMode::Interpreter,
-        Ok("baseline") => JitMode::Baseline,
-        _ => JitMode::Auto,
-    })
+    *DEFAULT
+        .get_or_init(|| mode_from_value(std::env::var("BEAM_RT_TIER").ok().as_deref()))
 }
 
 /// The execution tier for a process's first entry.

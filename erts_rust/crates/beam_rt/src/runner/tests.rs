@@ -37,7 +37,7 @@ use super::entry::{ProcessEntry, RunnerState};
 use super::perf::record_baseline_code;
 use super::reason::{exit_reason, normal, parked_receive_timeout, timeout_delay};
 use super::run::RuntimeRunner;
-use super::tier::{jit_is_switch_safe, select_entry_tier, JitMode};
+use super::tier::{jit_is_switch_safe, mode_from_value, select_entry_tier, JitMode};
 use crate::runtime::Runtime;
 
 fn runtime() -> Runtime {
@@ -712,6 +712,37 @@ fn the_switch_safety_verdict_is_memoized_per_module() {
     assert_eq!(state.jit_safety.len(), 1, "no new entry");
 }
 
+// -- the process-wide default mode ----------------------------------------
+
+/// The effective mode for an **unset** (or unknown) `BEAM_RT_TIER` is the always-correct
+/// interpreter: the JIT is opt-in via `"auto"`, and `"baseline"` forces it. Pinned through
+/// the **pure** resolution helper ([`mode_from_value`]) rather than by mutating the process
+/// environment (the crate is `#![deny(unsafe_code)]`), and the derived [`JitMode::default`]
+/// must agree with it so no call site can pick a different tier by omission.
+#[test]
+fn the_unset_default_resolves_to_the_interpreter() {
+    assert_eq!(
+        mode_from_value(None),
+        JitMode::Interpreter,
+        "an unset BEAM_RT_TIER is the regression-free interpreter"
+    );
+    assert_eq!(
+        mode_from_value(Some("interpreter")),
+        JitMode::Interpreter
+    );
+    assert_eq!(
+        mode_from_value(Some("auto")),
+        JitMode::Auto,
+        "`auto` is how the JIT is opted into"
+    );
+    assert_eq!(mode_from_value(Some("baseline")), JitMode::Baseline);
+    // An unknown value is the safe default, never an error and never the JIT.
+    assert_eq!(mode_from_value(Some("jit")), JitMode::Interpreter);
+    assert_eq!(mode_from_value(Some("")), JitMode::Interpreter);
+    // The derived `Default` is the same tier an unset variable resolves to.
+    assert_eq!(JitMode::default(), JitMode::Interpreter);
+}
+
 // -- end-to-end tier equivalence on the scheduled path --------------------
 
 /// `slice:fib/1 10` through the **scheduled** runner records `55` on *both* tiers: the
@@ -774,7 +805,8 @@ fn fib_runs_to_the_same_result_on_both_tiers() {
 
 /// The whole runtime's **scheduler** path (not just one slice) runs `slice:fib/1 10` and
 /// records `55` — the tier selection is wired into the real `RuntimeRunner` the scheduler
-/// drives, on whatever mode the process environment selects (Auto ⇒ JIT by default).
+/// drives, on whatever mode the process environment selects (an unset `BEAM_RT_TIER` ⇒ the
+/// interpreter). The test asserts the *result*, so it holds on every tier.
 #[test]
 fn the_scheduler_path_computes_fib_under_the_selected_tier() {
     let mut rt = runtime();
