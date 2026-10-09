@@ -24,16 +24,26 @@
 //! either lands the exception in the handler registers (`x(0..=3)`, the C
 //! `handle_error` convention) or propagates as a typed
 //! [`BeamError::Raise`]. [`Machine::throw_with_trace`] is the **one uniform
-//! raise/unwind entry point** every instruction family calls
+//! raise/unwind entry point** every instruction family calls, and
+//! [`Machine::throw_with_stacktrace`] is that same entry carrying the raise's
+//! symbolic [`StackTrace`] (derived by [`Machine::raise_stacktrace`]) out of the
+//! machine on the uncaught path
 //! (`crate::families::exceptions` owns the handler opcodes that pop the frame).
 
-use beam_common::{BeamError, ExceptionClass, ExitReason, LiveReason, Raise, Result};
+use std::sync::Arc;
+
+use beam_common::{
+    AtomName, BeamError, ExceptionClass, ExitReason, LiveReason, Raise, Result, SourceLocation,
+    StackFrame, StackTrace,
+};
+use beam_loader::Module;
 use beam_term::{is_non_value, Eterm, NIL, THE_NON_VALUE};
 
 use crate::error;
+use crate::families::exceptions::stacktrace::nearest_line;
 use crate::Step;
 
-use super::Machine;
+use super::{Continuation, Machine};
 
 /// One entry of the machine's exception catch-frame stack.
 ///
@@ -217,7 +227,26 @@ impl Machine {
     }
 
     /// Raise a BEAM exception with class `class`, `reason` and raw stacktrace
-    /// `trace` (C: `c_p->fvalue`/`c_p->ftrace` at `find_func_info`).
+    /// `trace` (C: `c_p->fvalue`/`c_p->ftrace` at `find_func_info`), carrying no
+    /// symbolic frames.
+    ///
+    /// **The one uniform raise/unwind entry point** every instruction family calls
+    /// (the wave-2 contract); the exact semantics are documented on
+    /// [`Machine::throw_with_stacktrace`], to which this forwards with an empty
+    /// [`StackTrace`]. A raise site that can *name* its frames (the interpreter's
+    /// `func_info` arm, via [`Machine::raise_stacktrace`]) calls
+    /// `throw_with_stacktrace` directly instead.
+    pub(crate) fn throw_with_trace(
+        &mut self,
+        class: ExceptionClass,
+        reason: Eterm,
+        trace: Eterm,
+    ) -> Result<Step> {
+        self.throw_with_stacktrace(class, reason, trace, StackTrace::new())
+    }
+
+    /// [`Machine::throw_with_trace`] plus the symbolic [`StackTrace`] the raise
+    /// carries when it leaves the machine **uncaught**.
     ///
     /// A raise is *not* a bare `BeamError` — it is a control-flow decision:
     ///
@@ -238,13 +267,22 @@ impl Machine {
     ///    [`ExitReason::Structured`] keeps [`BeamError::as_atom`] answering `None`,
     ///    so a caller with a term representation can recover the compound reason.
     ///
+    /// `stacktrace` is [`beam_common`]'s term-independent frame list (the engine
+    /// derives it with [`Machine::raise_stacktrace`]); it is **metadata only** — the
+    /// landing registers ([`Machine::land_exception`]), the reason and the pending
+    /// class are untouched, so a caught raise behaves byte-identically with or
+    /// without it and only an **uncaught** raise carries the frames out (in its
+    /// `Raise::stacktrace`, which is what makes a bare-atom `function_clause`
+    /// localizable).
+    ///
     /// A family body typically ends with `machine.throw(class, reason).map(Some)`
     /// (or, for a `{badmatch,V}`-style raise, [`Machine::throw_error`]).
-    pub(crate) fn throw_with_trace(
+    pub(crate) fn throw_with_stacktrace(
         &mut self,
         class: ExceptionClass,
         reason: Eterm,
         trace: Eterm,
+        stacktrace: StackTrace,
     ) -> Result<Step> {
         self.pending_exception = Some((class, reason));
         let frame = match self.catch_frames.last() {
@@ -255,6 +293,7 @@ impl Machine {
             None => {
                 return Err(BeamError::Raise(
                     Raise::new(class, ExitReason::Structured)
+                        .with_stacktrace(stacktrace)
                         .with_live_reason(LiveReason::new(reason)),
                 ))
             }
@@ -303,6 +342,133 @@ impl Machine {
         self.set_x(3, class_atom)?;
         Ok(())
     }
+
+    /// The [`StackTrace`] of a raise happening at `(func, pc)` **inside
+    /// `entry_module`**: the raising function first, then every live caller frame,
+    /// innermost first.
+    ///
+    /// C captures this chain as the raw `StackTrace` object hung off the exception
+    /// (`c_p->ftrace`, the saved continuation pointers `build_stacktrace` later
+    /// resolves); the engine has no saved object, so it derives the frames from the
+    /// state it does hold — the live call frames, whose continuation-pointer slots
+    /// are `(func, pc)` pairs ([`Machine::resumption_addresses`]) — plus the
+    /// `(func, pc)` the dispatch loop is executing right now, which its caller
+    /// supplies because the machine does not track it inside an instruction. The
+    /// order is C's (`build_stacktrace` prepends the current function last,
+    /// `../../erts/emulator/beam/beam_common.c:1274-1288`).
+    ///
+    /// **Which module a frame belongs to.** A code address identifies its own
+    /// module (C's model, and this engine's: a frame's [`Continuation`] carries the
+    /// module context it returns into). `entry_module` is the run's entry module
+    /// (context `0`, which the machine borrows rather than owns); a registered
+    /// callee's module comes from [`Machine::module_context`]. A frame whose context
+    /// names neither (an id that was never registered) is **skipped** rather than
+    /// resolved against the wrong module — a frame is never named with a module the
+    /// address does not belong to.
+    ///
+    /// A frame whose function index is out of range, or whose module/function atom
+    /// the module's own table cannot name, is likewise skipped: this is
+    /// best-effort *metadata* attached to an uncaught raise, and it must never turn
+    /// a raise into a different error (or invent a name).
+    ///
+    /// Only the frames are derived: the reason and the class are untouched.
+    pub(crate) fn raise_stacktrace(
+        &self,
+        entry_module: &Module,
+        func: u32,
+        pc: u32,
+    ) -> StackTrace {
+        let mut trace = StackTrace::new();
+        // The raising function itself — the `(func, pc)` of the instruction that
+        // raised, in the module context executing right now.
+        if let Some(module) = self.frame_module(entry_module, self.context) {
+            push_stack_frame(&mut trace, &module, func, pc);
+        }
+        // Then the live caller chain, innermost frame first. The bottom frame's
+        // `Continuation::Halt` contributes nothing (there is no address to name).
+        for frame in self.frames.iter().rev() {
+            let Continuation::Address { func, pc, context } = frame.continuation else {
+                continue;
+            };
+            if let Some(module) = self.frame_module(entry_module, context) {
+                push_stack_frame(&mut trace, &module, func, pc);
+            }
+        }
+        trace
+    }
+
+    /// The module a frame in module context `id` belongs to — the borrowed entry
+    /// module for context `0`, else the registered context's `Arc<Module>`.
+    ///
+    /// `None` for a context that was never registered (see
+    /// [`Machine::raise_stacktrace`]).
+    fn frame_module<'a>(&self, entry_module: &'a Module, id: u32) -> Option<FrameModule<'a>> {
+        if id == 0 {
+            return Some(FrameModule::Entry(entry_module));
+        }
+        self.module_context(id)
+            .map(|handle| FrameModule::Registered(Arc::clone(&handle.module)))
+    }
+}
+
+/// The module a stack frame belongs to: the run's borrowed entry module (context
+/// `0`) or an owned handle to a registered callee context's module.
+enum FrameModule<'a> {
+    /// The run's entry module, owned by the caller of the run (never by the
+    /// machine), so it is borrowed.
+    Entry(&'a Module),
+    /// A registered module context's module ([`Machine::module_context`]).
+    Registered(Arc<Module>),
+}
+
+impl std::ops::Deref for FrameModule<'_> {
+    type Target = Module;
+
+    fn deref(&self) -> &Module {
+        match self {
+            FrameModule::Entry(module) => module,
+            FrameModule::Registered(module) => module,
+        }
+    }
+}
+
+/// Append one [`StackFrame`] naming `(func, pc)` of `module`.
+///
+/// An out-of-range `func`, or a module/function atom the module's own table cannot
+/// name, appends nothing: the frames are best-effort metadata and must never
+/// invent a name (see [`Machine::raise_stacktrace`]).
+fn push_stack_frame(trace: &mut StackTrace, module: &Module, func: u32, pc: u32) {
+    let Some(function) = module.functions.get(func as usize) else {
+        return;
+    };
+    let (Some(module_name), Some(function_name)) = (
+        module.atom_name(module.name),
+        module.atom_name(function.name),
+    ) else {
+        return;
+    };
+    let mut frame = StackFrame::new(
+        module_name.to_string(),
+        function_name.to_string(),
+        function.arity as u8,
+    );
+    frame.location = source_location(module, func, pc);
+    trace.push(frame);
+}
+
+/// The [`SourceLocation`] in effect at code offset `pc` of the function at index
+/// `func`, when the module knows one.
+///
+/// The `file` name comes from the module's `Line` chunk and the line from the
+/// `line` marker in effect — the same `nearest_line` lookup the symbolic
+/// (`build_stacktrace`) trace uses, so the two agree.
+fn source_location(module: &Module, func: u32, pc: u32) -> Option<SourceLocation> {
+    let entry = nearest_line(module, func, pc)?;
+    let file = module.line.files.get(entry.file as usize)?;
+    Some(SourceLocation {
+        file: AtomName::new(file.to_string()),
+        line: entry.line,
+    })
 }
 
 /// The class atoms a landing must be able to name, in [`Machine`]'s
@@ -327,12 +493,36 @@ pub(super) const UNRESOLVED_CLASS_ATOMS: [Eterm; 3] = [THE_NON_VALUE; 3];
 #[cfg(test)]
 mod tests {
     use super::{CatchFrame, Machine};
-    use beam_common::{BeamError, ExceptionClass};
-    use beam_loader::Atom;
+    use beam_common::{BeamError, ExceptionClass, StackFrame, StackTrace};
+    use beam_loader::{Atom, Function, Instr, Label, LineEntry, Module};
     use beam_term::{make_atom, Eterm, NIL};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
+    use crate::machine::Continuation;
     use crate::Step;
 
+    /// A module named `name` with one bare `return` function per `(name, arity)`
+    /// pair; the code itself is irrelevant to a stack frame.
+    fn module_with(name: &str, functions: &[(&str, u32)]) -> Module {
+        let mut module = Module::default();
+        module.name = module.atom_table.intern(name);
+        for (index, (function_name, arity)) in functions.iter().enumerate() {
+            let function_atom = module.atom_table.intern(function_name);
+            let module_atom = module.name;
+            module.functions.push(Function {
+                func_label: Label(index as u32),
+                entry_label: Label(index as u32),
+                module: module_atom,
+                name: function_atom,
+                arity: *arity,
+                code: vec![Instr::Return],
+                blocks: Vec::new(),
+                labels: BTreeMap::new(),
+            });
+        }
+        module
+    }
     #[test]
     fn throw_without_a_catch_frame_is_a_typed_error() {
         let mut machine = Machine::new();
@@ -423,5 +613,179 @@ mod tests {
         assert_eq!(machine.y(0), Some(Eterm::from_raw(0xAA)));
         // A stale index (no such frame) is a typed error, never a panic.
         assert!(machine.unwind_to_frame(9).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // the raise's stacktrace frames (`Machine::raise_stacktrace`)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn raise_stacktrace_names_the_raising_function_and_the_live_callers() {
+        let entry = module_with("m", &[("f", 1), ("g", 2)]);
+        let mut machine = Machine::new();
+        // The bottom frame, then a frame whose continuation returns into `f/1` at
+        // code offset 3 — i.e. `f` is suspended in the call the raising function is
+        // executing.
+        machine.push_frame(0).unwrap();
+        machine.push_frame(0).unwrap();
+        machine
+            .set_continuation(Continuation::Address {
+                func: 0,
+                pc: 3,
+                context: 0,
+            })
+            .unwrap();
+
+        let trace = machine.raise_stacktrace(&entry, 1, 7);
+        assert_eq!(trace.len(), 2, "the raising function then its caller");
+        // The function that raised comes first: `g/2` at `(1, 7)`.
+        assert_eq!(trace.frames[0].module.as_str(), "m");
+        assert_eq!(trace.frames[0].function.as_str(), "g");
+        assert_eq!(trace.frames[0].arity, 2);
+        assert_eq!(trace.frames[0].location, None, "no line marker in effect");
+        // Then the live caller, innermost first.
+        assert_eq!(trace.frames[1].module.as_str(), "m");
+        assert_eq!(trace.frames[1].function.as_str(), "f");
+        assert_eq!(trace.frames[1].arity, 1);
+    }
+
+    #[test]
+    fn raise_stacktrace_carries_the_location_marker_in_effect() {
+        let mut module = module_with("m", &[("f", 1)]);
+        module.line = beam_loader::LineTable {
+            flags: 0,
+            instruction_count: 0,
+            items: vec![LineEntry::default(), LineEntry { file: 0, line: 7 }],
+            files: vec!["m.erl".to_string()],
+        };
+        // `label 1; line 1; return` — the marker is in effect at code offset 2.
+        module.functions[0].code = vec![
+            Instr::Label(Label(1)),
+            Instr::Line(1),
+            Instr::Return,
+        ];
+
+        let trace = Machine::new().raise_stacktrace(&module, 0, 2);
+        let location = trace.frames[0]
+            .location
+            .as_ref()
+            .expect("the line marker is in effect");
+        assert_eq!(location.file.as_str(), "m.erl");
+        assert_eq!(location.line, 7);
+        // Before the marker there is no location (C's LINE_INVALID_LOCATION).
+        assert_eq!(Machine::new().raise_stacktrace(&module, 0, 0).frames[0].location, None);
+    }
+
+    #[test]
+    fn raise_stacktrace_resolves_each_frame_against_its_own_module_context() {
+        let entry = module_with("m", &[("f", 1)]);
+        let callee = Arc::new(module_with("c", &[("g", 0)]));
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.push_frame(0).unwrap();
+        // The caller frame returns into the ENTRY module (context 0)…
+        machine
+            .set_continuation(Continuation::Address {
+                func: 0,
+                pc: 1,
+                context: 0,
+            })
+            .unwrap();
+        // …while the machine is executing in a registered callee context, so the
+        // raising function belongs to the callee's module.
+        let id = machine.register_context(&callee);
+        machine.switch_context(id).unwrap();
+
+        let trace = machine.raise_stacktrace(&entry, 0, 5);
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace.frames[0].module.as_str(), "c", "the raising function");
+        assert_eq!(trace.frames[0].function.as_str(), "g");
+        assert_eq!(trace.frames[1].module.as_str(), "m", "the cross-module caller");
+        assert_eq!(trace.frames[1].function.as_str(), "f");
+    }
+
+    #[test]
+    fn raise_stacktrace_skips_a_frame_the_module_or_context_cannot_name() {
+        let entry = module_with("m", &[("f", 1)]);
+        // A function index outside the module's table is skipped, never invented.
+        assert!(Machine::new().raise_stacktrace(&entry, 9, 0).is_empty());
+
+        // A continuation in a context that was never registered is skipped too: the
+        // address cannot be attributed to a module, so it is not named at all.
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.push_frame(0).unwrap();
+        machine
+            .set_continuation(Continuation::Address {
+                func: 0,
+                pc: 1,
+                context: 9,
+            })
+            .unwrap();
+        let trace = machine.raise_stacktrace(&entry, 0, 0);
+        assert_eq!(trace.len(), 1, "only the raising function is named");
+        assert_eq!(trace.frames[0].function.as_str(), "f");
+    }
+
+    #[test]
+    fn throw_with_stacktrace_attaches_the_frames_to_the_uncaught_raise() {
+        let mut machine = Machine::new();
+        let mut frames = StackTrace::new();
+        frames.push(StackFrame::new("m", "f", 1));
+        let reason = Eterm::from_raw(0x1234);
+
+        let err = machine
+            .throw_with_stacktrace(ExceptionClass::Error, reason, NIL, frames)
+            .expect_err("no catch frame: the raise propagates");
+        match err {
+            BeamError::Raise(raise) => {
+                assert_eq!(raise.class, ExceptionClass::Error);
+                assert_eq!(raise.reason.as_atom(), None, "a structured reason");
+                assert_eq!(raise.stacktrace.len(), 1);
+                assert_eq!(raise.stacktrace.frames[0].module.as_str(), "m");
+                assert_eq!(raise.stacktrace.frames[0].function.as_str(), "f");
+                assert_eq!(raise.stacktrace.frames[0].arity, 1);
+                assert!(raise.live_reason().is_some(), "the reason term still rides out");
+            }
+            other => panic!("expected a raise, got {other:?}"),
+        }
+        // The rest of the raise is exactly `throw_with_trace`'s.
+        assert_eq!(machine.pending_exception(), Some((ExceptionClass::Error, reason)));
+    }
+
+    #[test]
+    fn throw_with_trace_leaves_the_frames_empty() {
+        let mut machine = Machine::new();
+        let err = machine
+            .throw(ExceptionClass::Throw, Eterm::from_raw(0x99))
+            .expect_err("no catch frame");
+        match err {
+            BeamError::Raise(raise) => assert!(raise.stacktrace.is_empty()),
+            other => panic!("expected a raise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_caught_raise_lands_unchanged_and_never_exposes_the_frames() {
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(9, 9, 0));
+        let class_atom = make_atom(Atom::from_raw(11));
+        machine.set_class_atom(ExceptionClass::Error, class_atom);
+        let reason = Eterm::from_raw(0x1234);
+        let mut frames = StackTrace::new();
+        frames.push(StackFrame::new("m", "f", 1));
+
+        let step = machine
+            .throw_with_stacktrace(ExceptionClass::Error, reason, NIL, frames)
+            .expect("a live frame catches");
+        assert_eq!(step, Step::Goto { func: 9, pc: 9 });
+        // The C landing convention is untouched by the frames: x0 = THE_NON_VALUE,
+        // x1 = reason, x2 = the caller's raw trace, x3 = the class atom.
+        assert_eq!(machine.x(0), Some(Eterm::non_value()));
+        assert_eq!(machine.x(1), Some(reason));
+        assert_eq!(machine.x(2), Some(NIL));
+        assert_eq!(machine.x(3), Some(class_atom));
+        assert_eq!(machine.catch_frame_depth(), 1, "the handler pops it");
     }
 }

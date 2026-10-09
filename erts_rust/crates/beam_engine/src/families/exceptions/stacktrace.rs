@@ -176,7 +176,11 @@ fn location_term(
 /// (`../../erts/emulator/beam/beam_file.c`) and that `erts_lookup_function_info`
 /// reads back for a saved code pointer. An instruction before any marker has no
 /// location (C's `LINE_INVALID_LOCATION`).
-fn nearest_line(module: &Module, func: u32, pc: u32) -> Option<LineEntry> {
+///
+/// Shared with the [`Machine::raise_stacktrace`](crate::machine::Machine::raise_stacktrace)
+/// metadata the uncaught path carries, so the symbolic trace and the raise's
+/// frames agree on a frame's location.
+pub(crate) fn nearest_line(module: &Module, func: u32, pc: u32) -> Option<LineEntry> {
     let function = module.functions.get(func as usize)?;
     if function.code.is_empty() {
         return None;
