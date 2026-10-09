@@ -18,30 +18,35 @@
 //
 // %CopyrightEnd%
 
-//! **The `MinimalContext` arena is chunked.**
+//! **The `MinimalContext` heap is a region heap.**
 //!
-//! [`MinimalContext::alloc_words`](beam_engine::ExecutionContext::alloc_words)
-//! backed every request with its own `Box<[Eterm]>`, which retained a whole boxed
-//! handle (plus an allocator header) per allocation. It now hands out sub-slices of
-//! a large fixed-size **chunk** (64 KiB), so an allocation costs its payload only
-//! and the arena retains **one** `Box` per chunk.
+//! [`MinimalContext::alloc_words`](beam_engine::ExecutionContext::alloc_words) used to
+//! back every request with its own `Box<[Eterm]>`, which retained a whole boxed handle
+//! (plus an allocator header) per allocation. It now reserves a **large address range**
+//! per region (4 MiB) and commits a slice of it up front (64 KiB), raising the visible
+//! slice **in place** by committing more words as requests arrive — the bump pointer
+//! does not move, so consecutive allocations stay contiguous. A region is abandoned for
+//! a fresh, **doubled** one only when its whole *reservation* is exhausted; the old
+//! region is left exactly as it was, so every pointer it handed out stays valid and
+//! unmoved for the context's lifetime.
 //!
-//! The three contracts this suite pins:
+//! The contracts this suite pins:
 //!
-//! * **few chunks** — many small allocations are served from a handful of chunks,
-//!   and one allocation never straddles a chunk boundary (proved structurally: two
-//!   consecutive `n`-word allocations from the same chunk are exactly `n` words
-//!   apart, so a chunk boundary is observable from the pointers alone);
-//! * **pointer stability** — a pointer handed out by `alloc_words` still points at
-//!   its own words after any number of later allocations (the chunks are boxed and
-//!   never move, only the `Vec` of chunk handles grows);
-//! * **oversized requests** — a request bigger than a chunk still works, and its
-//!   words are never handed out again.
+//! * **one region, no boundaries** — many small allocations are served from a single
+//!   region grown in place, so two consecutive `n`-word allocations are **exactly** `n`
+//!   words apart with no boundary between them (proved structurally from the pointers
+//!   alone);
+//! * **pointer stability** — a pointer handed out by `alloc_words` still points at its
+//!   own words after any number of later allocations (a region only ever grows in place
+//!   or is left behind for a fresh one, never moved);
+//! * **reservation exhaustion** — a request too large for a region's *remaining*
+//!   reservation is served from a fresh, larger region that does not overlap the old
+//!   one, and the old region — and every pointer into it — survives.
 //!
-//! It also **measures** the change with a counting global allocator and the
-//! process's resident-set size: [`the_chunked_arena_retains_payload_only`] runs the
-//! same allocation loop against the new chunked arena and against the old
-//! one-box-per-allocation shape (reproduced locally) and prints the comparison.
+//! It also **measures** the change with a counting global allocator and the process's
+//! resident-set size: [`the_region_heap_retains_payload_only`] runs the same allocation
+//! loop against the new region heap and against the old one-box-per-allocation shape
+//! (reproduced locally) and prints the comparison.
 //!
 //! # Running it
 //!
@@ -121,6 +126,12 @@ fn measure<T>(f: impl FnOnce() -> T) -> (usize, T) {
 /// The size of one heap word in bytes (what a small allocation advances by).
 const WORD_BYTES: usize = core::mem::size_of::<Eterm>();
 
+/// The first region's **reservation** in `Eterm` words (4 MiB), matching
+/// `beam_engine::context`'s `HEAP_RESERVE_WORDS`. It is the address range one region
+/// can grow in place before a fresh region is needed, so it bounds what a single run of
+/// contiguous allocations can cover.
+const RESERVE_WORDS: usize = 4 * 1024 * 1024 / WORD_BYTES;
+
 /// The process's resident set size in **pages**, from `/proc/self/statm`, or
 /// `None` when it cannot be read (the measurement test skips its RSS line then).
 fn rss_pages() -> Option<usize> {
@@ -128,22 +139,24 @@ fn rss_pages() -> Option<usize> {
     text.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// The chunks a sequence of pointers was served from: a boundary is any step that
-/// is **not** exactly the requested `words` (same-chunk allocations are contiguous).
-fn chunks_of(pointers: &[*mut Eterm], words: usize) -> Vec<usize> {
+/// The region starts a sequence of pointers was served from: a boundary is any step
+/// that is **not** exactly the requested `words` (allocations inside one region are
+/// contiguous, so a boundary marks the switch to a fresh region). A run served from a
+/// single region therefore yields exactly one element.
+fn region_boundaries_of(pointers: &[*mut Eterm], words: usize) -> Vec<usize> {
     let step = words * WORD_BYTES;
-    let mut chunk_starts = vec![0usize];
+    let mut region_starts = vec![0usize];
     for i in 1..pointers.len() {
         let delta = (pointers[i] as isize) - (pointers[i - 1] as isize);
         if delta != step as isize {
-            chunk_starts.push(i);
+            region_starts.push(i);
         }
     }
-    chunk_starts
+    region_starts
 }
 
-/// The pre-chunking arena shape, reproduced locally: one `Box<[Eterm]>` per
-/// allocation. Kept only as the comparison arm of the measurement test.
+/// The old one-box-per-allocation arena shape, reproduced locally: one `Box<[Eterm]>`
+/// per allocation. Kept only as the comparison arm of the measurement test.
 struct BoxPerAllocArena {
     blocks: Vec<Box<[Eterm]>>,
 }
@@ -165,19 +178,19 @@ impl BoxPerAllocArena {
 // The proof
 // ---------------------------------------------------------------------------
 
-/// Many small allocations come from a few chunks, one allocation never straddles a
-/// chunk boundary, and a chunk is the documented 64 KiB.
+/// Many small allocations are served from a **single** region grown in place: they are
+/// contiguous, word for word, with no boundary anywhere in the run.
 #[test]
-fn small_allocations_are_served_from_a_handful_of_chunks() {
+fn small_allocations_grow_one_region_in_place() {
     const WORDS: usize = 4;
     const N: usize = 10_000;
     let mut ctx = MinimalContext::new();
     let pointers: Vec<*mut Eterm> = (0..N)
-        .map(|_| ctx.alloc_words(WORDS).expect("the arena allocates"))
+        .map(|_| ctx.alloc_words(WORDS).expect("the region heap allocates"))
         .collect();
 
     // Write a distinguishing word through every allocation: the payload must never
-    // be shared with another allocation, and (see below) never straddle a chunk.
+    // be shared with another allocation.
     for (i, ptr) in pointers.iter().enumerate() {
         // SAFETY: `alloc_words(WORDS)` returned `WORDS` exclusively-owned words; a
         // `usize`-sized write stays inside them (`WORDS >= 1`).
@@ -188,33 +201,31 @@ fn small_allocations_are_served_from_a_handful_of_chunks() {
         assert_eq!(unsafe { ptr.cast::<usize>().read() }, i, "no aliasing");
     }
 
-    let starts = chunks_of(&pointers, WORDS);
-    assert!(
-        starts.len() >= 2,
-        "10 000 x {WORDS}-word allocations must span more than one chunk"
-    );
-    assert!(
-        starts.len() <= 8,
-        "10 000 x {WORDS}-word allocations must come from a handful of chunks, not {}",
-        starts.len()
-    );
-
-    // The observable chunk capacity: the number of same-chunk allocations before
-    // the first boundary (the *first* chunk is filled from zero).
-    let first_chunk_words = starts[1] * WORDS;
-    assert_eq!(
-        first_chunk_words * WORD_BYTES,
-        64 * 1024,
-        "the chunk is the documented 64 KiB ({first_chunk_words} words)"
-    );
-    // Every later chunk holds the same capacity; the last may be a partial chunk.
-    for pair in starts.windows(2) {
-        let words_in_chunk = (pair[1] - pair[0]) * WORDS;
-        assert!(
-            words_in_chunk <= first_chunk_words,
-            "a chunk handed out {words_in_chunk} words, more than its capacity"
+    // Every consecutive pair is EXACTLY `WORDS` apart: the region grew in place, so
+    // there is not a single boundary in the run.
+    for i in 1..N {
+        let delta = (pointers[i] as isize) - (pointers[i - 1] as isize);
+        assert_eq!(
+            delta,
+            (WORDS * WORD_BYTES) as isize,
+            "allocation {i} must follow allocation {} contiguously",
+            i - 1
         );
     }
+
+    // ...which is exactly "one region": the boundary scan finds only the start.
+    assert_eq!(
+        region_boundaries_of(&pointers, WORDS).len(),
+        1,
+        "10 000 x {WORDS}-word allocations must be served from a single region"
+    );
+
+    // The whole payload is well inside one region's reservation — the reason no fresh
+    // region was ever required.
+    assert!(
+        N * WORDS < RESERVE_WORDS,
+        "the payload ({N} x {WORDS} words) must fit one reservation ({RESERVE_WORDS} words)"
+    );
 }
 
 /// A pointer handed out by `alloc_words` is still valid (and unmoved) after many
@@ -222,17 +233,17 @@ fn small_allocations_are_served_from_a_handful_of_chunks() {
 #[test]
 fn pointers_stay_stable_across_later_allocations() {
     let mut ctx = MinimalContext::new();
-    let first = ctx.alloc_words(4).expect("the arena allocates");
+    let first = ctx.alloc_words(4).expect("the region heap allocates");
     let first_addr = first as usize;
     // SAFETY: `alloc_words(4)` returned four exclusively-owned writable words.
     unsafe {
         first.write(Eterm::from_raw(0xAABB_CCDD));
     }
 
-    // Enough later allocations to start several new chunks and to grow the chunk
-    // handle `Vec` more than once.
+    // Enough later allocations to grow the region's committed slice several times over:
+    // the region only ever commits more words in place, so `first` must not move.
     for _ in 0..5_000 {
-        let later = ctx.alloc_words(4).expect("the arena allocates");
+        let later = ctx.alloc_words(4).expect("the region heap allocates");
         // SAFETY: `alloc_words(4)` returned four exclusively-owned writable words.
         unsafe {
             later.write(Eterm::from_raw(0x1122_3344));
@@ -248,17 +259,55 @@ fn pointers_stay_stable_across_later_allocations() {
     );
 }
 
-/// A request larger than a chunk gets its own chunk, is fully writable, and its
-/// words are never handed out again.
+/// A request too large for a region's *remaining* reservation forces a fresh, larger
+/// region (`MoveRequired`): the oversized block is fully writable, it is disjoint from
+/// the earlier region, and the earlier region — and every pointer into it — survives.
 #[test]
-fn an_allocation_larger_than_a_chunk_works_and_does_not_alias() {
-    // The chunk capacity is 64 KiB (asserted by the test above); ask for more.
-    const CHUNK_WORDS: usize = 64 * 1024 / WORD_BYTES;
-    const BIG_WORDS: usize = CHUNK_WORDS + 100;
+fn an_exhausted_reservation_gets_a_fresh_region_and_does_not_alias() {
+    const WORDS: usize = 4;
+    // More words than a whole region reservation: a region that has already handed out
+    // the first two allocations cannot grow its reservation to cover this request.
+    const BIG_WORDS: usize = RESERVE_WORDS + 8;
 
     let mut ctx = MinimalContext::new();
-    let big = ctx.alloc_words(BIG_WORDS).expect("the arena allocates");
-    // The whole oversized request is writable.
+
+    // Region 0 hands out `first` at its base (offset 0).
+    let first = ctx
+        .alloc_words(WORDS)
+        .expect("region 0 serves the first allocation");
+    // SAFETY: `alloc_words(WORDS)` returned `WORDS` exclusively-owned words.
+    unsafe { first.write(Eterm::from_raw(0xAAAA_0001)) };
+    // SAFETY: as above.
+    assert_eq!(unsafe { first.read() }, Eterm::from_raw(0xAAAA_0001));
+
+    // ...and `middle` contiguously right after it, inside the same region.
+    let middle = ctx
+        .alloc_words(WORDS)
+        .expect("region 0 serves the second allocation");
+    assert_eq!(
+        middle as isize - first as isize,
+        (WORDS * WORD_BYTES) as isize,
+        "the two small allocations are contiguous inside region 0"
+    );
+    // SAFETY: `alloc_words(WORDS)` returned `WORDS` exclusively-owned words.
+    unsafe { middle.write(Eterm::from_raw(0xBBBB_0002)) };
+
+    // Region 0 has used `2 * WORDS = 8` words, so this request exceeds what is left of
+    // its *reservation*: only a fresh region can serve it.
+    let big = ctx
+        .alloc_words(BIG_WORDS)
+        .expect("a fresh region serves the oversized request");
+
+    // A fresh region is a separate reservation, so the oversized block starts OUTSIDE
+    // region 0's address span `[first, first + RESERVE_WORDS words)` — proving the
+    // fresh-region path ran rather than an in-place grow.
+    let region0_end = first as usize + RESERVE_WORDS * WORD_BYTES;
+    assert!(
+        !((first as usize)..region0_end).contains(&(big as usize)),
+        "the oversized block must be served from a fresh reservation, not region 0"
+    );
+
+    // The whole oversized block is writable and readable, word for word.
     for i in 0..BIG_WORDS {
         // SAFETY: `alloc_words(BIG_WORDS)` returned `BIG_WORDS` exclusively-owned
         // words, so index `i` is in bounds.
@@ -269,60 +318,87 @@ fn an_allocation_larger_than_a_chunk_works_and_does_not_alias() {
         assert_eq!(unsafe { big.add(i).read() }, Eterm::from_raw(i + 1));
     }
 
-    // A following small allocation must fall outside the oversized block.
-    let small = ctx.alloc_words(4).expect("the arena allocates");
+    // No aliasing: the oversized block's range excludes both earlier allocations...
     let big_range = big as usize..(big as usize + BIG_WORDS * WORD_BYTES);
+    assert!(
+        !big_range.contains(&(first as usize)),
+        "the oversized block aliased `first`"
+    );
+    assert!(
+        !big_range.contains(&(middle as usize)),
+        "the oversized block aliased `middle`"
+    );
+
+    // ...and a following small allocation is disjoint from it too.
+    let small = ctx
+        .alloc_words(WORDS)
+        .expect("the frontier region keeps allocating");
     assert!(
         !big_range.contains(&(small as usize)),
         "a small allocation aliased into the oversized block"
     );
-    // ...and writing it must not disturb the oversized payload's tail.
-    // SAFETY: `alloc_words(4)` returned four exclusively-owned writable words.
+    // SAFETY: `alloc_words(WORDS)` returned `WORDS` exclusively-owned writable words.
     unsafe { small.write(Eterm::from_raw(0xDEAD_BEEF)) };
     // SAFETY: still in bounds of the oversized allocation.
     assert_eq!(
         unsafe { big.add(BIG_WORDS - 1).read() },
         Eterm::from_raw(BIG_WORDS)
     );
+
+    // The OLD region is kept alive and unmoved: its markers survive the fresh region,
+    // read back through the ORIGINAL pointers.
+    // SAFETY: `first`/`middle` still point into the live region 0.
+    unsafe {
+        assert_eq!(first.read(), Eterm::from_raw(0xAAAA_0001));
+        assert_eq!(middle.read(), Eterm::from_raw(0xBBBB_0002));
+    }
 }
 
-/// A zero-word request still yields a non-null, well-aligned pointer (the
-/// documented "dangling but valid" result), including when the current chunk is
-/// exactly full.
+/// A zero-word request still yields a non-null, well-aligned pointer (the documented
+/// "dangling but valid" result) — on a fresh context that has reserved no region yet,
+/// and again after some real allocations.
 #[test]
 fn a_zero_word_allocation_is_non_null_and_aligned() {
-    const CHUNK_WORDS: usize = 64 * 1024 / WORD_BYTES;
     let mut ctx = MinimalContext::new();
-    // Fill a whole chunk exactly, so the arena frontier sits on a boundary.
-    let filler = ctx.alloc_words(CHUNK_WORDS).expect("the arena allocates");
-    assert!(!filler.is_null());
-    let ptr = ctx.alloc_words(0).expect("the arena allocates zero words");
+    // Fresh context: no region has been reserved.
+    let fresh = ctx
+        .alloc_words(0)
+        .expect("the region heap allocates zero words");
+    assert!(!fresh.is_null());
+    assert_eq!(fresh as usize % core::mem::align_of::<Eterm>(), 0);
+
+    // ...and again once a region exists and is in use.
+    let _ = ctx.alloc_words(8).expect("the region heap allocates");
+    let _ = ctx.alloc_words(64).expect("the region heap allocates");
+    let ptr = ctx
+        .alloc_words(0)
+        .expect("the region heap allocates zero words");
     assert!(!ptr.is_null());
     assert_eq!(ptr as usize % core::mem::align_of::<Eterm>(), 0);
 }
 
-/// The measurement: the chunked arena retains payload only.
+/// The measurement: the region heap retains payload only.
 ///
 /// The counters are process-global, so this is the file's single armed region; the
-/// other tests run concurrently and contribute a handful of chunk allocations,
+/// other tests run concurrently and contribute a handful of region allocations,
 /// which the generous bounds below absorb.
 #[test]
-fn the_chunked_arena_retains_payload_only() {
+fn the_region_heap_retains_payload_only() {
     const WORDS: usize = 4;
     const N: usize = 100_000;
 
-    // --- the new chunked arena (kept alive across the second measurement, so the
-    // second one cannot reuse the first one's freed pages) -------------------
+    // --- the new region heap (kept alive across the second measurement, so the second
+    // one cannot reuse the first one's freed pages) -------------------------
     let rss0 = rss_pages();
     let (new_allocs, (ctx, pointers)) = measure(|| {
         let mut ctx = MinimalContext::new();
         let pointers = (0..N)
-            .map(|_| ctx.alloc_words(WORDS).expect("the arena allocates"))
+            .map(|_| ctx.alloc_words(WORDS).expect("the region heap allocates"))
             .collect::<Vec<_>>();
         (ctx, pointers)
     });
     let rss1 = rss_pages();
-    let new_chunks = chunks_of(&pointers, WORDS).len();
+    let new_regions = region_boundaries_of(&pointers, WORDS).len();
 
     // --- the old one-box-per-allocation shape (reproduced locally) ----------
     let (old_allocs, old_arena) = measure(|| {
@@ -344,17 +420,28 @@ fn the_chunked_arena_retains_payload_only() {
     };
     println!(
         "gc_arena | N={N} x {WORDS} words ({payload_bytes} bytes of payload):\n\
-         \x20 chunked       : {new_allocs} heap allocations ({new_chunks} chunks), RSS {}\n\
+         \x20 region heap   : {new_allocs} heap allocations ({new_regions} region), RSS {}\n\
          \x20 box-per-alloc : {old_allocs} heap allocations, RSS {}",
         rss_line(rss0, rss1),
         rss_line(rss1, rss2),
     );
 
-    // The chunked arena's allocation count is bounded by its chunk count (plus the
-    // `Vec` growth and whatever the concurrently-running tests add), never by N.
+    // `N x WORDS` words fit inside one reservation, so the whole loop is served from a
+    // single region grown in place — no boundary anywhere in the run.
+    assert!(
+        N * WORDS < RESERVE_WORDS,
+        "the payload must fit one reservation for this to pin the single-region shape"
+    );
+    assert_eq!(
+        new_regions, 1,
+        "the payload fits one reservation, so it must be served from a single region"
+    );
+
+    // The region heap's allocation count is bounded by its region count (plus whatever
+    // the concurrently-running tests add), never by N.
     assert!(
         new_allocs < 256,
-        "{N} small allocations must cost a handful of chunk allocations, not {new_allocs}"
+        "{N} small allocations must cost a handful of region allocations, not {new_allocs}"
     );
     assert!(
         old_allocs >= N,
@@ -362,6 +449,6 @@ fn the_chunked_arena_retains_payload_only() {
     );
     assert!(
         new_allocs * 10 < old_allocs,
-        "the chunked arena must be dramatically cheaper: {new_allocs} vs {old_allocs}"
+        "the region heap must be dramatically cheaper: {new_allocs} vs {old_allocs}"
     );
 }

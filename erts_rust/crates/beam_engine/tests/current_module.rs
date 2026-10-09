@@ -243,7 +243,7 @@ struct SeamCtx {
     /// The `(module, function, arity)` triples the seam resolved, in call order.
     resolved: Vec<(String, String, u32)>,
     /// The term arena the position accessors build `{M,F,A}`/stacktrace terms in —
-    /// the same pointer-stable chunked heap `MinimalContext` serves, delegated so a
+    /// the same pointer-stable region heap `MinimalContext` serves, delegated so a
     /// seam context can hand the term builders words (the trait default is a typed
     /// `unsupported`).
     arena: MinimalContext,
