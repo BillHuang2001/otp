@@ -229,9 +229,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `select_reverse`(+_limit/_continue)/`select_count`/`match_object`/`match_`/`first`/`last`/`next`/`prev`/
   `tab2list`/`size`/`is_empty`/`set_fixation` (the oracle gates `safe_fixtable/2` as a READ) and the
   `/3`+`/1` limited forms. `ets:match_spec_run/2` is a free function over a list with no table/requester,
-  so it has no access concept. `ets:info/1,2` is deliberately **not** gated. `give_away(new_owner)` and `setopts(opt)` are
-  requester-implicit (`give_away` has no protection check — ownership is not a read/write op; `setopts`
-  is owner-gated, like the oracle).
+  so it has no access concept. `ets:info/1,2` is deliberately **not** gated. `give_away(new_owner)`,
+  `setopts(opt)` and `set_access(access)` are requester-implicit — `give_away` has no protection check
+  (ownership is not a read/write op), while `setopts`/`set_access` are owner-gated (through
+  `SetOpt::Access`), like the oracle.
 
 ### `table/update.rs` — `update_counter`/`update_element` operand machinery
 - `pub(crate)` helpers shared with the hash interior: `counter_slot`, `add_counters`,
