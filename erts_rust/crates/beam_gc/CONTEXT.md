@@ -556,6 +556,40 @@ still reproduces today's collector exactly.
   off-heap MSO, Local/External/Imported funs and an external pid, through 6 minors + 2 majors under **both**
   strategies; asserts structural equality after *each* collection, root relocation, single-copy sharing, a
   closing cycle, dropped garbage, and untouched off-heap payloads.
+- **`tests/collector_adversarial.rs` — the adversarial copy-correctness set.** Six break-attempts, each run
+  through BOTH `AnyCollector::Copying` and `AnyCollector::Immix` (explicit `GcConfig::copying`/`immix` pins,
+  asserted via `kind()`) and, where meaningful, the primitive `collect`/`HeapSpace`/`Copier` path, all
+  asserting the no-wrong-result / no-panic / no-leak invariants (empty nursery, roots relocated, structure +
+  values preserved, exact off-heap accounting): a 100 000-cell cons list + 50 000-deep 1-tuple chain (proves
+  the copier is **iterative** — the copied graph is walked by hand, never via the *recursive*
+  `compare::eq`/`size_object`); a live graph whose `used_words == capacity_words` (with a one-word-short
+  destination returning a typed `BeamError` and **nothing copied**); an off-heap `RefcBinary` root (refcount
+  stable, freed exactly once when dead); `Local`/`External`/`Imported` funs with boxed free variables; a
+  10 000-element tuple + a flat and a 500-key HAMT map; and an `Mso` (referenced only by its `OffHeap` slot)
+  untouched across collections whose destructor runs exactly once when swept.
+- **`tests/cyclic_safety.rs` — the cycle-safety gate.** Forges cycles by raw heap writes (self-loop cons,
+  2-cycles, a long chain with a back-edge, a deep tuple nesting folding back) and pins: (a)
+  `beam_term::size::size_object_bounded` (verified READ-ONLY through `beam_term`'s public API) returns the
+  typed `TermError::TermGraphCyclic` — never a hang — and Cyclic wins even when the budget runs out first,
+  with the distinct `TermGraphTooLarge` for a large acyclic term; (b) the collector's own per-object sizing
+  (`copy.rs::move_size`) is forwarding-pointer based, so a cyclic graph collects correctly and terminates
+  under both strategies + the primitive entry (cycles verified by pointer-chasing the **copies**;
+  `objects_copied` counts each object exactly once).
+- **`tests/fill_barrier.rs` — the young-heap-exhaustion / fill-barrier contract.** A too-small destination
+  returns the typed heap exhaustion *before* any copy — roots un-forwarded, bump pointer/counters
+  byte-identical, and a second identical attempt errors identically — for `collect_minor`/`collect_major` on
+  both `Collector` and `GenImmixCollector` (policy-clamped fullsweep included); `ensure_capacity` fails fast
+  under a `max_heap_words` ceiling (collector untouched) and otherwise runs exactly one collection and leaves
+  `available_words() >= need_words`; covers boundary cases (`cap == live` / one word below, exact-fit
+  nursery) and proves a term written into the grown nursery survives the next collection. Confirms a
+  half-forward is never observable.
+- **`tests/retained_vs_live.rs` — the GC-side retained-vs-live accounting.** A 220-round allocate/collect
+  loop (fresh bounded live graph + garbage each round, `fullsweep_after == 0`) through both strategies, with
+  the true live set sized independently and asserted against the words the heap spaces retain: copying
+  reaches `mature_used == live` exactly (**0** occupancy surplus) while Immix stays ≤4× live (line-granular;
+  measured 1.778×), capacities + occupancy are **constant** across the measured half (no growth per cycle),
+  the nursery is empty after every collection, and RSS plateaus ≤1.5× (`/proc/self/statm`, skipped loudly
+  off-Linux). Headline numbers are printed with `-- --nocapture`.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
