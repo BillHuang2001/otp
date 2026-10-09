@@ -105,8 +105,12 @@ The message itself is `RuntimeContext::signal_notify_message(name)` → `(from, 
   loader's `command` string, which its `start` calls through; the test skips **loudly** without `cc` or
   `erl_driver.h`.
 - Colocated units in `watch.rs`: nothing-to-poll with no disposition, the self-pipe registered once, and
-  `ready`/`drain` over a really-sent signal; plus `#[cfg(test)]` `test_guard`/`pending`/`send_to_self`
-  helpers shared by the three signal test modules.
+  `ready`/`drain` over a really-sent signal; plus `#[cfg(test)]` `test_guard`/`pending`/`send_to_self`/
+  `wait_until_pending` helpers shared by the three signal test modules. Every watch assertion about a
+  signal that was really sent (**not** one asserting nothing has arrived) first waits, bounded, for the
+  trampoline to *catch* it — `kill(1)` returns as soon as the kernel has queued the signal while the
+  handler that writes the self-pipe runs asynchronously, so `drain`/`ready` immediately after
+  `send_to_self` would be a race.
 - Integration: `../tests/driver.rs` (a real C driver via `event_driver.c`, modes 0–3 — the event/timer
   round, the `outputv`-only entry, and the two driver-emitted-term destinations — plus `reg.c` for the
   registry hooks and `../tests/port_wake.rs` for the resume-on-send wake) and the differential `driver/*`
