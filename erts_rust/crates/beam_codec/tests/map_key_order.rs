@@ -453,20 +453,34 @@ fn hashmap_terms_encode_and_roundtrip() {
 
     // (c) The wire carries the HAMT's *stored* order **reversed** — the C walks the tree
     //     through a LIFO work stack, so it emits the reverse of the ascending node-slot
-    //     pre-order `map_pairs_storage_order` returns. (Our decoder materializes any
-    //     MAP_EXT as one flat map, so its keys-tuple order *is* the wire order.)
-    let wire = map_pairs_storage_order(decoded).unwrap();
-    let mut reversed_stored = stored.clone();
+    //     pre-order `map_pairs_storage_order` returns. The decoded map is itself a HAMT
+    //     (40 > `MAP_SMALL_MAP_LIMIT`), rebuilt by the same `write_map`, so its storage
+    //     order equals the original's while the image carries the reverse.
+    let wire_stored = map_pairs_storage_order(decoded).unwrap();
+    assert_eq!(
+        wire_stored, stored,
+        "the decoded HAMT stores the same pairs in the same order as the original"
+    );
+    // Read the pair order straight off the image (every key/value is a small here) and
+    // check it is the reverse of that storage order.
+    let mut wire_keys: Vec<Eterm> = Vec::new();
+    let mut i = 6; // past `[version, MAP_EXT, count:4]`
+    for _ in 0..40 {
+        assert_eq!(bytes[i], 97, "SMALL_INTEGER_EXT key");
+        wire_keys.push(make_small(i64::from(bytes[i + 1])));
+        assert_eq!(bytes[i + 2], 97, "SMALL_INTEGER_EXT value");
+        i += 4;
+    }
+    let mut reversed_stored: Vec<Eterm> = stored.iter().map(|(k, _)| *k).collect();
     reversed_stored.reverse();
     assert_eq!(
-        wire, reversed_stored,
+        wire_keys, reversed_stored,
         "MAP_EXT must carry the reverse of the HAMT storage order (the C's LIFO walk)"
     );
     // ... and that order is NOT the sorted key order (1,2,…,40), proving no sort happened.
     let sorted_keys: Vec<Eterm> = (1..=40).map(make_small).collect();
     assert_ne!(
-        wire.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
-        sorted_keys,
+        wire_keys, sorted_keys,
         "the encoder must not sort HAMT pairs into key order"
     );
 

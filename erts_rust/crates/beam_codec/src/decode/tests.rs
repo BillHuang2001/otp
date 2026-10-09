@@ -285,25 +285,44 @@
         assert!(keys.is_empty());
         assert!(values.is_empty());
 
-        // 40 pairs (> `MAP_SMALL_MAP_LIMIT`) decodes as a flatmap of 40 pairs, in
-        // wire order — no HAMT builder is needed.
+        // 40 pairs (> `MAP_SMALL_MAP_LIMIT`) is a **hash map**: ERTS builds a HAMT for
+        // any count above 32 (`external.c:5087`), so the flat path rejects it. A HAMT
+        // needs more heap than the shared `decode` helper's tiny arena, so build a
+        // bigger one here.
         let mut image = vec![131, 116, 0, 0, 0, 40];
         for i in 0..40u8 {
             image.extend_from_slice(&[97, i]); // SMALL_INTEGER_EXT key
             image.extend_from_slice(&[97, i + 100]); // SMALL_INTEGER_EXT value
         }
-        let (_h, _a, term) = decode(&image);
-        let (keys, values) = flatmap_parts(term).unwrap();
-        assert_eq!(keys.len(), 40);
-        assert_eq!(values.len(), 40);
+        let mut heap = Heap::new(4096).expect("room for a 40-key HAMT");
+        let mut atoms = AtomTable::new();
+        let term = decode_term(&image, &mut heap, &mut atoms).expect("valid image decodes");
+        assert!(
+            flatmap_parts(term).is_err(),
+            "a > 32-pair map is a HAMT, not a flat map"
+        );
+        assert_eq!(beam_term::map::map_size(term, &atoms).unwrap(), 40);
         for i in 0..40i64 {
-            assert_eq!(keys[i as usize], make_small(i));
-            assert_eq!(values[i as usize], make_small(i + 100));
+            assert_eq!(
+                beam_term::map::map_get(term, make_small(i), &atoms).unwrap(),
+                Some(make_small(i + 100))
+            );
         }
 
-        // A pair count past `MAX_ARITYVAL` cannot be a flatmap `arityval`: a
-        // `SystemLimit`, and nothing is read past the count.
-        assert_system_limit(&[131, 116, 0x01, 0x00, 0x00, 0x00]);
+        // A pair count whose bit 31 is set is malformed: the sizing pass' `(n >> 31) != 0`
+        // guard (`external.c:6312`).
+        assert_bad_arg(&[131, 116, 0x80, 0x00, 0x00, 0x00]);
+        // A pair count that overruns the wire fails on the first truncated pair read —
+        // `BadArg`, not the old flatmap `arityval` `SystemLimit` (a HAMT has no
+        // `MAX_ARITYVAL` bound).
+        assert_bad_arg(&[131, 116, 0x01, 0x00, 0x00, 0x00]);
+
+        // Duplicate keys are rejected. ERTS checks for duplicates in **both**
+        // representations (`erts_validate_and_sort_flatmap` for a flat map,
+        // `erts_hashmap_from_array(..., 1)` for a HAMT — the `external.c:5438-5456`
+        // fixup), so `binary_to_term` is `badarg`; only `maps:from_list/1` collapses.
+        // `#{1 => 10, 1 => 20}` — key `1` twice.
+        assert_bad_arg(&[131, 116, 0, 0, 0, 2, 97, 1, 97, 10, 97, 1, 97, 20]);
     }
 
     #[test]
@@ -427,15 +446,21 @@
         // A `V4_PORT_EXT` whose id field is truncated is malformed.
         assert_bad_arg(&[131, 120, 119, 2, 110, 49, 0, 0, 0, 0]);
 
-        // `PORT_EXT` (legacy): a 16-bit id, 8-bit creation.
+        // `PORT_EXT` (legacy): a full 32-bit id, 8-bit creation (`get_uint32` +
+        // `get_int8`, `external.c:4702-4712`).
         let mut image = vec![131, 102];
         image.extend_from_slice(&NODE_N1);
-        image.extend_from_slice(&7u16.to_be_bytes());
-        image.push(9);
+        image.extend_from_slice(&0x0007_0001u32.to_be_bytes());
+        image.push(3);
         let (_h, _a, term) = decode(&image);
-        assert_eq!(external_port_parts(term).unwrap().1, 7);
-        assert_eq!(external_port_parts(term).unwrap().2, 9);
+        assert_eq!(external_port_parts(term).unwrap().1, 0x0007_0001);
+        assert_eq!(external_port_parts(term).unwrap().2, 3);
 
+        // A `PORT_EXT` whose 32-bit id field is truncated is malformed (the legacy
+        // form is 4 id bytes + 1 creation byte, not 2 + 1).
+        assert_bad_arg(&[131, 102, 119, 2, 110, 49, 0, 7, 3]);
+        // A legacy creation above 3 is not a tiny creation (`external.c:4709`).
+        assert_bad_arg(&[131, 102, 119, 2, 110, 49, 0, 0, 0, 1, 4]);
         // `NEWER_REFERENCE_EXT`.
         let mut image = vec![131, 90, 0, 2];
         image.extend_from_slice(&NODE_N1);
@@ -448,25 +473,42 @@
         assert_eq!(ids, &[1, 2]);
         assert_eq!(creation, 9);
 
-        // `NEW_REFERENCE_EXT`: 8-bit creation.
+        // `NEW_REFERENCE_EXT`: 8-bit creation, tiny creation required, and an
+        // 18-bit-bounded first id.
         let mut image = vec![131, 114, 0, 1];
         image.extend_from_slice(&NODE_N1);
-        image.push(7);
-        image.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        image.push(3);
+        image.extend_from_slice(&0x0001_2345u32.to_be_bytes());
         let (_h, _a, term) = decode(&image);
         let (_, ids, creation) = external_ref_parts(term).unwrap();
-        assert_eq!(ids, &[0xDEAD_BEEF]);
-        assert_eq!(creation, 7);
+        assert_eq!(ids, &[0x0001_2345]);
+        assert_eq!(creation, 3);
 
-        // `REFERENCE_EXT` (legacy).
+        // `REFERENCE_EXT` (legacy): creation 1 is tiny, its 18-bit first id is in range.
         let mut image = vec![131, 101];
         image.extend_from_slice(&NODE_N1);
-        image.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
-        image.push(5);
+        image.extend_from_slice(&0x0001_2345u32.to_be_bytes());
+        image.push(1);
         let (_h, _a, term) = decode(&image);
         let (_, ids, creation) = external_ref_parts(term).unwrap();
-        assert_eq!(ids, &[0xDEAD_BEEF]);
-        assert_eq!(creation, 5);
+        assert_eq!(ids, &[0x0001_2345]);
+        assert_eq!(creation, 1);
+        // A legacy creation above 3 is rejected by both reference forms
+        // (`external.c:4763`, `:4777`).
+        assert_bad_arg(&[131, 101, 119, 2, 110, 49, 0, 0, 0, 1, 7]);
+        assert_bad_arg(&[131, 114, 0, 1, 119, 2, 110, 49, 5, 0, 0, 0, 1]);
+        // The first id of both legacy reference forms is bounded by `MAX_REFERENCE`
+        // (`1 << 18` = 262144, `erl_term.h:771`; `external.c:4757`/`:4782`);
+        // `NEWER_REFERENCE_EXT` (`90`) carries no such bound.
+        assert_bad_arg(&[131, 101, 119, 2, 110, 49, 0, 4, 147, 224, 1]);
+        assert_bad_arg(&[131, 114, 0, 1, 119, 2, 110, 49, 0, 0, 4, 147, 224]);
+        // An id word with the high bit set: the C's `r0` is a `Uint32`
+        // (`external.c:4750`), so the bound is an *unsigned* comparison and
+        // `0xDEADBEEF` is out of range too (the oracle agrees: `badarg`).
+        assert_bad_arg(&[131, 101, 119, 2, 110, 49, 222, 173, 190, 239, 1]);
+        assert_bad_arg(&[131, 114, 0, 1, 119, 2, 110, 49, 3, 222, 173, 190, 239]);
+        // A legacy creation above 3 is rejected for a pid as well.
+        assert_bad_arg(&[131, 103, 119, 2, 110, 49, 0, 0, 0, 1, 0, 0, 0, 2, 4]);
 
         // A node field that is not an atom is malformed.
         assert_bad_arg(&[131, 88, 97, 5, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);

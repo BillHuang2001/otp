@@ -47,8 +47,11 @@
 //! run time, so their vectors pin **one observed generation** (node `nonode@nohost`,
 //! creation `0`). The test stays exact because the codec contract is a round trip
 //! over the pinned bytes, not a re-derivation of the id. The key order of a small
-//! map is likewise not canonicalised before encoding, so `MAP_A_1_B_2` pins one
-//! observed order; the decoder preserves the wire order and the encoder re-emits it.
+//! map is canonicalised on decode into `erts_cmp_flatmap_keys` order
+//! (`erl_map.c:3187`, what `binary_to_term/1` does); for two **atom** keys that is
+//! the *local atom-index* order, so `MAP_A_1_B_2` (integer keys — a re-encode is exact)
+//! differs from the atom-keyed pool in `literals_gen_server_decodes_with_its_export_funs`,
+//! whose canonical image is asserted to be a *fixed point* rather than the input bytes.
 //!
 //! ## Binaries and bitstrings
 //!
@@ -890,10 +893,28 @@ fn literals_gen_server_decodes_with_its_export_funs() {
     let mut atoms = AtomTable::new();
     let term = decode_term(LITERALS_GEN_SERVER, &mut heap, &mut atoms)
         .expect("a real module's literal pool must decode");
+    // The pool nests atom-keyed flat maps, and decoding a flat map **canonicalizes** it
+    // into `erts_cmp_flatmap_keys` order (`erl_map.c:3187`, what `binary_to_term/1`
+    // does). For two **atom** keys that order is the *local atom-table index* order —
+    // this process's interning order — which is never a cross-implementation invariant:
+    // an `erl` that interns `aaa` before decoding an image whose wire order is
+    // `qqq,aaa` re-encodes it as `aaa,qqq` too. The first re-encoding may therefore
+    // differ from the oracle bytes for such a map, while the canonical image is a
+    // **fixed point**: decode → encode → decode → encode is byte-stable.
+    let canonical = encode_term(term, &atoms).expect("a decoded literal pool re-encodes");
     assert_eq!(
-        encode_term(term, &atoms).expect("a decoded literal pool re-encodes"),
-        LITERALS_GEN_SERVER,
-        "re-encoding must reproduce the oracle bytes exactly"
+        canonical[..6],
+        LITERALS_GEN_SERVER[..6],
+        "the pool's outer `LIST_EXT`/arity header is unchanged by canonicalization"
+    );
+    let mut heap2 = Heap::new(1 << 16).expect("a 65536-word heap is available");
+    let mut atoms2 = AtomTable::new();
+    let term2 = decode_term(&canonical, &mut heap2, &mut atoms2)
+        .expect("our own canonical image must decode");
+    assert_eq!(
+        encode_term(term2, &atoms2).expect("re-encoding a canonical image"),
+        canonical,
+        "a canonical `MAP_EXT` image must be a fixed point of decode → encode"
     );
 
     let (heads, tail) = spine(term);

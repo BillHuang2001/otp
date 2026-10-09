@@ -333,6 +333,18 @@ fn terms_equal(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool {
             && ka.iter().zip(kb).all(|(x, y)| terms_equal(*x, *y, atoms))
             && va.iter().zip(vb).all(|(x, y)| terms_equal(*x, *y, atoms));
     }
+    // A **hash map** (> 32 pairs) is a HAMT, which `flatmap_parts` rejects. Compare through
+    // `map_pairs`, which sorts both sides into the same (term) key order, so the
+    // comparison is independent of the flat/HAMT representation.
+    if let (Ok(pa), Ok(pb)) = (
+        beam_term::map::map_pairs(a, atoms),
+        beam_term::map::map_pairs(b, atoms),
+    ) {
+        return pa.len() == pb.len()
+            && pa.iter().zip(&pb).all(|((ka, va), (kb, vb))| {
+                terms_equal(*ka, *kb, atoms) && terms_equal(*va, *vb, atoms)
+            });
+    }
     if let (Ok(pa), Ok(pb)) = (external_pid_parts(a), external_pid_parts(b)) {
         return terms_equal(pa.0, pb.0, atoms) && pa.1 == pb.1 && pa.2 == pb.2 && pa.3 == pb.3;
     }
