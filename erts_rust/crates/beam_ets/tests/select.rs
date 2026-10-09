@@ -2175,13 +2175,18 @@ fn documented_capability_gaps_are_typed_and_diverge_from_the_oracle() {
     let head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "_")]);
     let map = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
 
-    // 1. A map as a guard/body *expression* is `badarg` here; the oracle constructs it
-    //    (body `[#{a=>1}]` -> `[#{a=>1},#{a=>1}]`, and a map `=:=` map guard matches).
-    let spec = spec1(&mut heap, head, &[], &[map]);
-    assert!(
-        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
-        "DIVERGENCE: the oracle accepts a map body; this crate is documented `badarg`"
-    );
+    // 1. A map as a guard/body *expression* is **constructed** here, as the oracle
+    //    does: body `[#{a=>1}]` -> one map per matched object.
+    let spec = compile(spec1(&mut heap, head, &[], &[map]), &atoms)
+        .expect("a map body compiles (it is constructed, not a literal)");
+    let got = table.select(&spec, &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 2, "a map body yields one constructed map per object");
+    for term in &got {
+        assert!(
+            eq(*term, map, &atoms),
+            "the constructed map equals the spec's map literal"
+        );
+    }
 
     // 2. A wildcard inside a HEAD map under-matches here (the head map is a literal);
     //    the oracle matches structurally (`#{a=>'_'}` matches `#{a=>1}` and `#{a=>2}`).

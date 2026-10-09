@@ -18,6 +18,9 @@ API and its honest limits.
 - `shared.rs` — `SharedTable` (`Arc<RwLock<Table>>`): `read`/`write`/`with_read`/`with_write`/
   `try_into_inner`; a poisoned lock is the typed `unsupported_ets: table lock poisoned`.
 - `access.rs` — `TableAccess` (rechecks `can_read`/`can_write` per op; `badarg` on violation).
+  `size`/`is_empty` are the **ungated** `ets:info(T, size)` projection (the oracle admits a
+  non-owner of a `private` table); `give_away` has no protection check and `setopts`/`set_access`
+  are owner-gated, exactly as in `ets:*`.
 - `ownership.rs` — `Heir`/`SetOpt`, `install_heir`/`heir_data`/`copy_heir`/`replace_heir`.
 - `lifecycle.rs` — `OwnerDeath` + `Table::owner_died` (the owner-death transition).
 - `element.rs` — `Table::update_counter(+_with)`/`update_element` and `relocate_rebuilt_object`.
