@@ -358,7 +358,12 @@ fn a_matching_head_clause_never_raises_and_the_reason_is_unchanged() {
 // ---------------------------------------------------------------------------
 
 /// Run `expr` under the system `erl` and return its stdout, or `None` when no
-/// `erl` is available (or the expression failed).
+/// runnable `erl` is on `PATH` at all.
+///
+/// `None` means the `erl` process could not be **spawned** (the caller skips
+/// loudly). A spawned `erl` that exits non-zero is a **harness** failure, not
+/// "no oracle": it panics with the captured stderr, so a broken oracle can never
+/// masquerade as a silent skip — the same policy as `tests/trace.rs::oracle_eval`.
 fn oracle(expr: &str) -> Option<String> {
     let output = Command::new("erl")
         .arg("-noshell")
@@ -366,9 +371,12 @@ fn oracle(expr: &str) -> Option<String> {
         .arg(expr)
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    assert!(
+        output.status.success(),
+        "the system `erl` exited {} for `{expr}`\n  stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 

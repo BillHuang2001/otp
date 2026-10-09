@@ -32,12 +32,70 @@
 //!   `all_otp_beams`), which discovers every application/module generically with
 //!   no hardcoded name or path.
 //!
-//! Every lookup returns `None` when the oracle cannot be located; a caller must
-//! **skip loudly** (never fail) — see [`skip_reason`].
+//! Every lookup returns `None` when the oracle is **absent** (there is no usable
+//! override and `erl` could not be spawned); a caller must **skip loudly** (never
+//! fail) — see [`skip_reason`]. An `erl` that **ran and exited non-zero** is a
+//! harness failure and **panics** with the captured streams, never "no oracle":
+//! see [`run_discovery_probe`].
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+
+// ---------------------------------------------------------------------------
+// The fixed OTP probe: spawn failure => absent (skip), non-zero exit => PANIC
+// ---------------------------------------------------------------------------
+
+/// Runs one **fixed** `erl -noshell -eval <eval>` discovery probe and returns its
+/// stdout when the probe succeeded.
+///
+/// The classification is deliberate, because each outcome means something
+/// different and only one of them is a legitimate "skip and assert nothing":
+///
+/// * [`Command::output`] returns `Err` — `erl` could not be **spawned** at all
+///   (not on `PATH`, no execute permission, …). The oracle is genuinely *absent*,
+///   so this returns `None` and the caller **skips loudly** (never fails). This is
+///   the only legitimate vacuous outcome.
+/// * `erl` **ran and exited zero** — the probe's stdout is returned.
+/// * `erl` **ran and exited non-zero** — the probe input is fixed and cannot fail
+///   for a healthy install (`code:lib_dir/0,1` always succeeds; an *unknown*
+///   application name makes `erl` exit 1 with **empty** stdout/stderr). A non-zero
+///   exit therefore means a broken OTP install or an invalid application name: a
+///   **harness failure**, not a missing oracle. Folding that into `None` would let
+///   every caller skip and assert nothing, so this **panics** with the exit status,
+///   the captured stdout/stderr and the exact argv.
+fn run_discovery_probe(eval: &str) -> Option<String> {
+    let argv = format!("erl -noshell -eval {eval:?}");
+    classify_probe(
+        Command::new("erl").args(["-noshell", "-eval", eval]).output(),
+        &argv,
+    )
+}
+
+/// Classifies one spawned probe's [`std::process::Output`] (a pure function of the
+/// spawn result, so the absent-vs-failed policy is unit-tested directly rather than
+/// only through a real `erl`).
+///
+/// `argv` is the human-readable command, used verbatim in the panic message.
+fn classify_probe(output: std::io::Result<std::process::Output>, argv: &str) -> Option<String> {
+    let output = match output {
+        Ok(output) => output,
+        // A genuine spawn failure (no `erl` on `PATH`, …): the oracle is absent, so
+        // the caller must skip loudly. This loud SKIP is the only legitimate vacuity.
+        Err(_) => return None,
+    };
+    if !output.status.success() {
+        panic!(
+            "the OTP discovery probe `{argv}` RAN but exited with {} — \
+             a harness failure (a broken OTP install or an invalid application name), never a \
+             missing oracle.\n  stdout: {:?}\n  stderr: {:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
 // ---------------------------------------------------------------------------
 // Locating the system stdlib (with an env override + a loud skip on failure)
@@ -68,7 +126,10 @@ pub fn stdlib_ebin() -> Option<PathBuf> {
 ///    evaluated at test time.
 ///
 /// This is the general form of [`stdlib_ebin`]; a caller that gets `None` must
-/// **skip loudly** (never fail) — see [`skip_reason`].
+/// **skip loudly** (never fail) — see [`skip_reason`]. `None` means the oracle is
+/// *absent* (no usable `$ERTS_<APP>_DIR` override and `erl` could not be spawned);
+/// an `erl` that **ran and exited non-zero** is a harness failure and panics (see
+/// [`run_discovery_probe`]).
 pub fn app_ebin(app: &str) -> Option<PathBuf> {
     let env_key = format!("ERTS_{}_DIR", app.to_uppercase());
     if let Ok(dir) = env::var(&env_key) {
@@ -84,14 +145,9 @@ pub fn app_ebin(app: &str) -> Option<PathBuf> {
     }
 
     let eval = format!("io:format(\"~s\",[code:lib_dir({app})]),halt().");
-    let output = Command::new("erl")
-        .args(["-noshell", "-eval", &eval])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let dir = String::from_utf8(output.stdout).ok()?;
+    // `None` only when `erl` could not be spawned (absent oracle); a probe that ran and
+    // failed is a harness failure and PANICS (see [`run_discovery_probe`]).
+    let dir = run_discovery_probe(&eval)?;
     let ebin = PathBuf::from(dir.trim()).join("ebin");
     if has_beams(&ebin) {
         Some(ebin)
@@ -113,24 +169,19 @@ pub fn app_ebin(app: &str) -> Option<PathBuf> {
 /// 2. `erl -noshell -eval 'io:format("~s",[code:lib_dir()]),halt().'`.
 ///
 /// `None` when neither yields an existing directory; a caller that gets `None`
-/// must **skip loudly** (never fail) — see [`skip_reason`].
+/// must **skip loudly** (never fail) — see [`skip_reason`]. As with [`app_ebin`],
+/// `None` means the oracle is *absent* (no usable `$ERTS_LIB_DIR` override and
+/// `erl` could not be spawned); an `erl` that **ran and exited non-zero** is a
+/// harness failure and panics (see [`run_discovery_probe`]).
 pub fn otp_lib_root() -> Option<PathBuf> {
     if let Ok(dir) = env::var("ERTS_LIB_DIR") {
         let dir = PathBuf::from(dir);
         return dir.is_dir().then_some(dir);
     }
-    let output = Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s\",[code:lib_dir()]),halt().",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let dir = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    // `None` only when `erl` could not be spawned (absent oracle); a probe that ran and
+    // failed is a harness failure and PANICS (see [`run_discovery_probe`]).
+    let out = run_discovery_probe("io:format(\"~s\",[code:lib_dir()]),halt().")?;
+    let dir = PathBuf::from(out.trim());
     dir.is_dir().then_some(dir)
 }
 
@@ -279,5 +330,67 @@ pub fn skip_reason() -> Option<String> {
         )
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The absent-vs-failed policy, unit-tested without a real `erl`
+// ---------------------------------------------------------------------------
+
+/// Pins [`classify_probe`]'s three-way policy directly (no external process), which is
+/// what stops the "ran and failed" case from silently degrading to a skip again.
+///
+/// Note: integration-test crates (`tests/*.rs`) are compiled without `cfg(test)`, so
+/// this module is gated on `unix` alone; it is collected by every test binary that
+/// includes `mod support;`.
+#[cfg(unix)]
+mod tests {
+    use super::classify_probe;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    /// One synthetic probe result with the given raw `wait(2)` status.
+    fn probe(raw_status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
+        Output {
+            status: ExitStatus::from_raw(raw_status),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_spawn_failure_is_the_absent_oracle() {
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "no `erl` on PATH");
+        assert!(
+            classify_probe(Err(error), "erl -noshell -eval \"...\"").is_none(),
+            "a spawn failure must stay the loud SKIP (None), never a panic"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_ran_and_exited_zero_returns_its_stdout() {
+        // Raw status 0 == exit code 0.
+        let output = probe(0, b"/some/such/lib\n", b"");
+        assert_eq!(
+            classify_probe(Ok(output), "erl -noshell -eval \"...\"").as_deref(),
+            Some("/some/such/lib\n")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "RAN but exited")]
+    fn a_probe_that_ran_and_exited_non_zero_panics() {
+        // Raw status `1 << 8` == exit code 1 with **empty** stdout/stderr -- the exact
+        // silent-failure signature a real `erl` shows for an unknown application name.
+        let output = probe(1 << 8, b"", b"");
+        let _ = classify_probe(Ok(output), "erl -noshell -eval \"...\"");
+    }
+
+    #[test]
+    #[should_panic(expected = "RAN but exited")]
+    fn a_probe_that_ran_and_died_by_signal_panics() {
+        // Raw status 9 == killed by SIGKILL (`output.status.success()` is false).
+        let output = probe(9, b"", b"");
+        let _ = classify_probe(Ok(output), "erl -noshell -eval \"...\"");
     }
 }

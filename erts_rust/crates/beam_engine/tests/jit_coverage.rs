@@ -238,7 +238,19 @@ fn the_native_tiers_are_in_the_roster() {
         available_tiers().contains(&"jit-cranelift"),
         cfg!(feature = "jit-cranelift")
     );
-    assert_eq!(NATIVE_TIERS.contains(&Tier::Cranelift), cfg!(feature = "jit-cranelift"));
+    // `NATIVE_TIERS` is the set `agree` and the register-file tests below iterate, so
+    // every member must be a tier the crate actually reports as available. (Asserting
+    // the shape of `NATIVE_TIERS` *itself* — e.g. that it holds `Cranelift` exactly
+    // when `cfg!(feature = "jit-cranelift")` — could never fail: the constant is
+    // defined that way two screens up. Cross-checking it against the crate's roster is
+    // what makes the claim load-bearing.)
+    for tier in NATIVE_TIERS {
+        assert!(
+            tier.is_available(),
+            "{tier:?} is driven by NATIVE_TIERS but is not in the build roster {:?}",
+            available_tiers()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

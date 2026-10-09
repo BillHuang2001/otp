@@ -155,8 +155,6 @@ fn prefix_with_an_empty_binary_is_just_the_string() {
 fn two_strings_surround_an_integer() {
     // two(A) -> <<"ab", A:8, "cd">>. "ab" is at offset 0 and "cd" at offset 4, so
     // the second step exercises a string read from the middle of the table.
-    let mut ctx = MinimalContext::new();
-    let _ = &mut ctx;
     // `bsstring:two(255)` -> [97,98,255,99,100]
     expect_bytes("two", &[make_small(255)], &[97, 98, 255, 99, 100]);
 }
