@@ -73,7 +73,7 @@ pub(crate) fn run_commands(
                 let size = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 let unit = read_size(machine, ctx, cmd_at(commands, i + 2)?)?;
                 if !ensure_at_least(end.saturating_sub(pos), size, unit) {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 i += 3;
             }
@@ -81,7 +81,7 @@ pub(crate) fn run_commands(
             "ensure_exactly" => {
                 let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 if end.saturating_sub(pos) != stride {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 i += 2;
             }
@@ -89,10 +89,10 @@ pub(crate) fn run_commands(
             "skip" => {
                 let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 let Some(next) = pos.checked_add(stride) else {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 };
                 if next > end {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos = next;
                 i += 2;
@@ -104,12 +104,12 @@ pub(crate) fn run_commands(
                 let unit = read_size(machine, ctx, cmd_at(commands, i + 4)?)?;
                 let dst = cmd_at(commands, i + 5)?;
                 let Some(nbits) = size.checked_mul(unit) else {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 };
                 if nbits > end.saturating_sub(pos) {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
-                let value = read_integer_field(ctx, bytes, pos, nbits, flags)?;
+                let value = read_integer_field(machine, ctx, bytes, pos, nbits, flags)?;
                 write_operand(machine, dst, value)?;
                 pos += nbits;
                 i += 6;
@@ -125,14 +125,14 @@ pub(crate) fn run_commands(
                     let size = read_size(machine, ctx, size_op)?;
                     match size.checked_mul(unit) {
                         Some(nbits) => nbits,
-                        None => return fail_step(machine, module, labels, fail, term, ctx),
+                        None => return fail_step(machine, module, labels, fail, ctx_op, ctx),
                     }
                 };
                 if nbits > end.saturating_sub(pos) {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 let out = extract_bits(bytes, pos, nbits)?;
-                let value = raw::make_bits(ctx, &out, nbits)?;
+                let value = raw::make_bits(machine, ctx, &out, nbits)?;
                 write_operand(machine, dst, value)?;
                 pos += nbits;
                 i += 6;
@@ -144,7 +144,7 @@ pub(crate) fn run_commands(
                 let dst = cmd_at(commands, i + 3)?;
                 let nbits = end.saturating_sub(pos);
                 let out = extract_bits(bytes, pos, nbits)?;
-                let value = raw::make_bits(ctx, &out, nbits)?;
+                let value = raw::make_bits(machine, ctx, &out, nbits)?;
                 write_operand(machine, dst, value)?;
                 i += 4;
             }
@@ -162,10 +162,10 @@ pub(crate) fn run_commands(
                     return Err(error::unsupported("bs_match '=:=': non-integer value"));
                 };
                 if bits > 64 || bits > end.saturating_sub(pos) {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 if read_uint_be(bytes, pos, bits)? != want as u64 {
-                    return fail_step(machine, module, labels, fail, term, ctx);
+                    return fail_step(machine, module, labels, fail, ctx_op, ctx);
                 }
                 pos += bits;
                 i += 4;
