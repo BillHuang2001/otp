@@ -181,7 +181,7 @@ Current: **539 passing / 0 failing / 2 ignored** — **376** lib in-module (`#[c
   Input is not line-framed (no `line` verb): the `binary`/`list` choice rides `SpawnStream`.
 - **`port_control`/control atoms are not decoded here.** `port_control(op, &[u8])` takes a `&str` op + raw bytes; the C decodes Erlang tuples in `io.c`, so decoding `{command,…}`/`{connect,…}` is the runtime's job.
 - **This crate has no poll thread of its own.** `execute_port_tasks` runs a round on demand; the per-iteration drive (poll → `schedule_events`/`handle_events` → `execute_port_tasks`), the reduction budget and the single long-lived `Poller` live in `beam_rt`'s single-threaded main loop.
-- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1966, `src/drivers/inet/tests.rs` 1447, `src/drivers/efile.rs` 1343, `src/drivers/inet/mod.rs` 1296, `src/registry.rs` 1278, `src/abi/host.rs` 1267, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1141, `src/signal.rs` 1061 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
+- **File sizes (`wc -l`).** Over 1000: `src/drivers/spawn.rs` 1966, `src/drivers/inet/tests.rs` 1447, `src/drivers/efile.rs` 1343, `src/drivers/inet/mod.rs` 1296, `src/registry.rs` 1285, `src/abi/host.rs` 1267, `src/drivers/inet/packet.rs` 1245, `src/drivers/fd.rs` 1141, `src/signal.rs` 1105 — each is a source half plus its suite (or, for `inet`, a subtree with its own child doc).
   All other modules are under 1000; if a source half grows, split its test module into a sibling `tests/` file (as `src/drivers/inet/` already does).
 
 ## Handoff to beam_rt — the CPU-time facility
