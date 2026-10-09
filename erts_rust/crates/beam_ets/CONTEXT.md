@@ -193,6 +193,17 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   (`set_heir`, `setopts`, `install_heir`, `build`) funnels through, so the outgoing heir's copy is
   freed exactly once (the C `free_heir_data`). The non-copying primitives `set_heir`/`setopts` stay
   owner-level and documented as such.
+- **`Table::set_access(&mut self, access: Access)` is the post-creation protection setter** (the
+  owner-level primitive behind `setopts(_, SetOpt::Access(_))`). `Table` owns the live `access: Access`
+  field (initialized from `opts.access()` in `build_with`); `access()`, `info().access`, `check_read`
+  and `check_write` all read **that field**, so a runtime change is observable everywhere at once.
+  `TableAccess::set_access(&mut self, access: Access) -> Result<()>` is the enforcing form (it routes
+  through `setopts(self.requester, SetOpt::Access(access))`, so a non-owner is `badarg` and nothing
+  changes); `TableWrite::set_access` is the guard-scoped mirror. **`TableOptions` is NEVER mutated**:
+  the oracle does not re-normalize the fine-locking flags on a runtime protection change (a table
+  created `[public, {write_concurrency, true}]` then `setopts({protection, private})` still reports
+  `write_concurrency => true`, whereas a table created `private` reports `false`) — the creation-time
+  normalization stays a `TableOptions`/`beam_bifs` concern (`ETS_SURFACE.md` §1/§5).
 - `give_away` follows the C `ets_give_away_3` order (bad-pid → not-owner → self-gift, all `badarg`,
   owner unchanged on failure); `setopts` requires the caller to be the owner. The heir is stored as a
   full `Heir`; `ets:info` renders only the pid (a documented gap).
