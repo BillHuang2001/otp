@@ -9,7 +9,7 @@ All tag values/encodings are **wire-frozen**; read the C, never modify it.
 
 ## Status
 **Implemented (Milestone 1).** Every module carries real bodies — `tag`, `reader`/`writer`, `atom_cache`, `off_heap`, `compress` (zlib), `encode`/`decode`, the `term` forwarding layer (over `beam_term::{thing,fun,bitstring,refc,record,hashing}`) and `error`.
-Test count at this HEAD: **~340 tests** (`../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast` — re-run it for the live figure; the count moves as tests are added), 0 failures. Differential gate **`total=1242 agree=1239 mismatch=0 unsupported=3 skipped=0`** (`../tools/differential/GAPS.md`).
+Test count at this HEAD: **~350 tests** (`../../scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec --no-fail-fast` — re-run it for the live figure; the count moves as tests are added), 0 failures. Differential gate **`total=1242 agree=1239 mismatch=0 unsupported=3 skipped=0`** (the gate's own report, `../tools/differential/GAPS.md`; re-run `../tools/differential/gate.sh` for the live per-contract split).
 The full producible tag set round-trips and **no recognized tag is left `unsupported`** (§Tag coverage; §Internal ids; §Known Issues).
 A `FunKind::Local` (`make_fun3`) fun encodes as `NEW_FUN_EXT` (`112`) when the caller supplies the module identity its layout lacks (§Fun identity).
 
