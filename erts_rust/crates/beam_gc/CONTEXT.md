@@ -364,7 +364,13 @@ still reproduces today's collector exactly.
   `MatureSelection::Explicit(MatureKind::Copying)` regardless of size. The break-even is a **copy-work**
   break-even, not a wall-clock one; the measurement is a single-threaded in-process micro-benchmark and every
   harness assertion is on the deterministic counts (timings are printed, never asserted).
-- **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with
+- **Standing decision (re-confirmed by the two-axis sweep).** `Auto` **never** selects Immix for the default
+  policy — the rule reads the construction-time `initial_mature_words` (default 233 < one 256-word block), so
+  the first size it accepts is 2048 configured words; a default-policy process can never reach Immix however
+  large its mature generation grows later. Where Immix *is* selected it is a **wall-clock loss** (pause
+  1.24×–2.38×) while moving 2.8×–22× fewer words. **Keep `MatureKind::Copying` as the default**; Immix stays
+  reachable only by an explicit pin or a large configured mature generation. Covered by
+  `tests/immix_selection_curve.rs`.- **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with
   the new BOXED-tagged pointer (`IS_MOVED_BOXED = !is_header`, `erl_gc.h:36`); a cons cell's car is set
   to `THE_NON_VALUE` and its cdr to the new LIST pointer (`IS_MOVED_CONS`, `erl_gc.h:37,42-55`). The
   scan phase mirrors the C `sweep()` switch verbatim: walking the to-space word by word, a `BOXED`/`LIST`
