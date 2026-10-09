@@ -1027,6 +1027,72 @@ mod tests {
         }
     }
 
+    /// Where a seam's consumers all come from specific module(s), the table must be a
+    /// **subset** of those modules' rosters (the tables whose defining *module* is the
+    /// whole seam are covered by the **equality** guard above).
+    ///
+    /// This pins the doc's attribution — "the four `src/port.rs` operations",
+    /// "`erlang:send/2` and its quoted alias … the same `src/proc.rs`
+    /// implementation", `node/0,1` in `src/convert.rs`, the encoders split across
+    /// `src/binconv.rs`/`src/term_conv.rs`, the fun-taking surface across
+    /// `src/lists.rs`/`src/maps.rs` — and catches a key listed under the wrong module
+    /// (a typo, or a BIF that moved).
+    #[test]
+    fn subset_tables_are_contained_in_their_defining_modules() {
+        let cases: &[(&str, &[(&str, &str, u32)], &[fn(&mut BifRegistry)])] = &[
+            (
+                "MEMORY_HOOK_BIFS",
+                MEMORY_HOOK_BIFS,
+                &[crate::runtime::register],
+            ),
+            (
+                "LOCAL_FUN_IDENTITY_BIFS",
+                LOCAL_FUN_IDENTITY_BIFS,
+                &[crate::binconv::register, crate::term_conv::register],
+            ),
+            ("PORT_HOOK_BIFS", PORT_HOOK_BIFS, &[crate::port::register]),
+            ("SEND_HOOK_BIFS", SEND_HOOK_BIFS, &[crate::proc::register]),
+            (
+                "RECORD_SOURCE_BIFS",
+                RECORD_SOURCE_BIFS,
+                &[crate::records::register],
+            ),
+            (
+                "FUN_CALLER_BIFS",
+                FUN_CALLER_BIFS,
+                &[crate::lists::register, crate::maps::register],
+            ),
+            (
+                "LOCAL_NODE_BIFS",
+                LOCAL_NODE_BIFS,
+                &[
+                    crate::convert::register,
+                    crate::binconv::register,
+                    crate::term_conv::register,
+                ],
+            ),
+            (
+                "RUNTIME_HOOKS_BIFS",
+                RUNTIME_HOOKS_BIFS,
+                &[crate::runtime::register],
+            ),
+        ];
+        for (name, table, modules) in cases {
+            let mut roster: std::collections::HashSet<(String, String, u32)> =
+                std::collections::HashSet::new();
+            for register in *modules {
+                roster.extend(keys_of(*register));
+            }
+            for (module, function, arity) in *table {
+                assert!(
+                    roster.contains(&(module.to_string(), function.to_string(), *arity)),
+                    "{name} lists {module}:{function}/{arity}, which none of the module(s) \
+                     listed for it registers"
+                );
+            }
+        }
+    }
+
     /// The strongest guard: [`RUNTIME_HOOKS_BIFS`] is asserted **equal** to the roster
     /// of `src/runtime/`'s four `runtime_bif!` families, so the table is provably
     /// complete, not merely sound.
