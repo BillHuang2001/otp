@@ -417,8 +417,9 @@ fn a_registry_created_port_drives_through_the_ordinary_reactor_path() {
         )
         .expect("the port is created");
 
-    // `port_command` queues the bytes and schedules an OUTPUT task, which dispatches the port's
-    // write-readiness seam — the fixture's `ready_output` emits "W".
+    // `port_command` queues the bytes and schedules an OUTPUT task, which runs the port's
+    // `ready_output` seam: the C-ABI adapter writes the queued bytes through the fixture's `output`
+    // callback (which echoes them) and then runs the entry's `ready_output` slot (which emits "W").
     ports
         .port_command(&mut poller, id, b"hello", PortCommandOptions::EMPTY)
         .expect("the command is queued");
@@ -428,10 +429,9 @@ fn a_registry_created_port_drives_through_the_ordinary_reactor_path() {
     assert_eq!(outcome.ran, 1, "the queued command schedules one task");
     assert_eq!(
         data_of(&outcome, id),
-        vec![b"W".to_vec()],
-        "the OUTPUT task ran the driver's ready_output callback"
+        vec![b"helloW".to_vec()],
+        "the OUTPUT task wrote the bytes through output and then ran the driver's ready_output"
     );
-
     // A poll with a bounded timeout is the ordinary drive point and must not error.
     let events = poller
         .poll(Some(Duration::from_millis(1)))

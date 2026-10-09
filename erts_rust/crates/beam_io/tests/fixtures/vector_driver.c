@@ -10,8 +10,10 @@
  * the opposite shape:
  *
  *   * `.output = NULL`, `.outputv = vector_outputv` — the `outputv`-only port-command callback;
- *   * `.ready_output = NULL` — so the `no_ready_output_callback` fallback path
- *     (`io.c:7524-7533`) is the `output`/`outputv` write path too;
+ *   * `.ready_output = NULL` — the slot-absent shape: a `port_command` reaches the driver through
+ *     the `output`/`outputv` write path (`io.c:1782`/`io.c:1517`), with no write-readiness
+ *     notification to run; the C's `no_ready_output_callback` itself (`io.c:7531-7538`) writes
+ *     nothing at all;
  *   * `.ready_async = NULL` — the "async-free" shape: with no `ready_async` slot the host must
  *     release a finished `driver_async` job through the driver's own `async_free` (the C's
  *     `need_free` path, `io.c:5399-5406`).
@@ -243,7 +245,7 @@ static ErlDrvEntry vector_driver_entry = {
     .stop = vector_stop,
     .output = NULL,            /* the `outputv`-only shape */
     .ready_input = NULL,
-    .ready_output = NULL,      /* the `no_ready_output_callback` fallback is the write path */
+    .ready_output = NULL,      /* no write-readiness notification; the write path is `outputv` */
     .driver_name = "vector_driver",
     .finish = NULL,
     .handle = NULL,
