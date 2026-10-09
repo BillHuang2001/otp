@@ -42,8 +42,8 @@ use crate::error;
 /// distinguishes them by position, exactly as the Erlang scanner does.
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    /// An integer literal.
-    Int(i64),
+    /// An integer literal (an exact `i128`, so a value past 64 bits is still exact).
+    Int(i128),
     /// A float literal.
     Float(f64),
     /// A string literal (already unescaped).
@@ -137,7 +137,7 @@ impl<'a> Lexer<'a> {
             } else if c == '$' {
                 self.pos += 1;
                 let code = self.char_code()?;
-                out.push(Tok::Int(i64::from(code)));
+                out.push(Tok::Int(i128::from(code)));
             } else if c == '"' {
                 out.push(Tok::Str(self.quoted('"')?));
             } else if c == '\'' {
@@ -209,7 +209,7 @@ impl<'a> Lexer<'a> {
             if digits.is_empty() {
                 return Err(self.err("Base#Digits needs digits"));
             }
-            let value = i64::from_str_radix(&digits.chars().filter(|c| *c != '_').collect::<String>(), base)
+            let value = i128::from_str_radix(&digits.chars().filter(|c| *c != '_').collect::<String>(), base)
                 .map_err(|_| self.err("Base#Digits is out of range"))?;
             return Ok(Tok::Int(value));
         }
@@ -241,7 +241,7 @@ impl<'a> Lexer<'a> {
             return Ok(Tok::Float(value));
         }
 
-        let value: i64 = head
+        let value: i128 = head
             .parse()
             .map_err(|_| self.err("integer literal is out of range"))?;
         Ok(Tok::Int(value))
@@ -521,10 +521,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Requires an integer literal and returns it.
+    /// Requires an integer literal that fits an `i64` (a segment `unit:` or a fun arity).
     fn expect_int(&mut self) -> Result<i64> {
         match self.bump() {
-            Some(Tok::Int(value)) => Ok(value),
+            Some(Tok::Int(value)) => {
+                i64::try_from(value).map_err(|_| self.err("integer literal is out of range"))
+            }
             other => Err(self.err(&format!("expected an integer, found {other:?}"))),
         }
     }
@@ -702,17 +704,19 @@ impl<'a> Parser<'a> {
             self.expect_punct("]")?;
             return Ok(Expr::ListComp(Box::new(first), quals));
         }
-        if self.eat_punct("|") {
-            let tail = self.parse_expr(0)?;
-            self.expect_punct("]")?;
-            return Ok(Expr::List(vec![first], Some(Box::new(tail))));
-        }
         let mut elems = vec![first];
         while self.eat_punct(",") {
             elems.push(self.parse_expr(0)?);
         }
+        // An optional `| Tail` after the elements makes the list improper (`[1,2|3]`),
+        // exactly as `erl_parse`'s `list -> '[' … '|' expr ']'` rule does.
+        let tail = if self.eat_punct("|") {
+            Some(Box::new(self.parse_expr(0)?))
+        } else {
+            None
+        };
         self.expect_punct("]")?;
-        Ok(Expr::List(elems, None))
+        Ok(Expr::List(elems, tail))
     }
 
     /// Parses a tuple; the `{` was consumed.
@@ -1329,6 +1333,46 @@ mod tests {
             Expr::Remote(_, _, _)
         ));
         assert!(matches!(parsed("F(1)"), Expr::Call(name, _) if name == "F"));
+    }
+
+    #[test]
+    fn a_multi_element_improper_list_keeps_its_tail() {
+        // `[1,2|3]` is the multi-element improper list (Erlang's `list -> '[' … '|' expr ']'`);
+        // a tail after the elements used to be rejected as a capability gap.
+        assert_eq!(
+            parsed("[1,2|3]"),
+            Expr::List(
+                vec![Expr::Int(1), Expr::Int(2)],
+                Some(Box::new(Expr::Int(3)))
+            )
+        );
+        // A proper list still has no tail, and a single-element improper list is unchanged.
+        assert_eq!(
+            parsed("[1,2]"),
+            Expr::List(vec![Expr::Int(1), Expr::Int(2)], None)
+        );
+        assert_eq!(
+            parsed("[1|2]"),
+            Expr::List(vec![Expr::Int(1)], Some(Box::new(Expr::Int(2))))
+        );
+    }
+
+    #[test]
+    fn an_integer_literal_past_i64_stays_exact() {
+        // The parser is not the range limiter: a literal past `i64` (2^63 here) keeps its
+        // exact value as an `i128`, so the evaluator can materialize the bignum.
+        assert_eq!(
+            parsed("9223372036854775808"),
+            Expr::Int(9_223_372_036_854_775_808)
+        );
+        assert_eq!(
+            parsed("18446744073709551617"),
+            Expr::Int(18_446_744_073_709_551_617)
+        );
+        // Past `i128` is the honest capability gap.
+        let too_big = "100000000000000000000000000000000000000000000000000000";
+        let error = parse(too_big).expect_err("past i128");
+        assert!(crate::error::unsupported_reason(&error).is_some(), "{error}");
     }
 
     #[test]
