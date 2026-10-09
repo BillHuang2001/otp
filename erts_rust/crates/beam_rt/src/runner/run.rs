@@ -155,80 +155,123 @@ impl ProcessRunner for RuntimeRunner<'_> {
             // `erlang:load_nif/2`'s owning module from the call instruction, so a scheduled
             // process sets it exactly as `RuntimeContext::run_export` sets it for the
             // single-pass path (see [`RuntimeContext::enter_module`]).
-            if let ProcessEntry::Export { module, .. } = &engine.entry {
+            //
+            // A **fun-bodied** process whose fun is a `.beam` **local** (`make_fun3`)
+            // closure resolves its launch target **once**, on this first run: the defining
+            // module, the lambda's entry label and the combined (free ++ args) arguments.
+            // It is entered at that label on *this process's* machine (below), exactly as an
+            // export entry is, so a `receive` inside the closure — or inside a cross-module
+            // callee it calls — reports `RunOutcome::Wait` and the process can park instead
+            // of folding the suspension into the typed `blocked()` error that
+            // `ExecutionContext::apply_fun` reports (see [`ProcessEntry::Fun`]).
+            //
+            // The two fun kinds with **no** local label — an external `fun M:F/A` and the
+            // `-eval` evaluator's own closure — stay `None`, and are applied synchronously
+            // through `budget_ctx.apply_fun` below (the local resolver reports `Ok(None)`
+            // for both, and its error — a non-fun, or a local closure no loaded module
+            // defines — becomes this process's exit reason exactly as it would have).
+            let resolved = match &mut engine.entry {
+                ProcessEntry::Fun { fun, target } if target.is_none() => ctx
+                    .local_fun_target(*fun, &engine.args)
+                    .map(|resolved| *target = resolved),
+                _ => Ok(()),
+            };
+            // The process's call site is the module whose code it is about to run — the
+            // export's module, or the module a fun entry resolved to. A fun entry with no
+            // local label keeps `None` (it is applied as a value, not entered as code).
+            if let Some(module) = engine.entry.entry_module() {
                 ctx.enter_module(module);
-            }
-            // The slice's reduction budget, charged at the machine's heap-admission points
+            }            // The slice's reduction budget, charged at the machine's heap-admission points
             // (see the `run` docs).
             let mut probe = BudgetProbe::new(budget);
             let mut budget_ctx = BudgetContext {
                 inner: &mut ctx,
                 probe: &mut probe,
             };
-            let outcome = match engine.parked {
-                // A resume continues the SAME machine: the registers, the Erlang stack and
-                // the frames of the suspended `receive` must survive, so this deliberately
-                // does not reset (see `Machine::resume_outcome`). Only a module-export
-                // process can park, so a parked fun entry is unreachable — it is reported
-                // as a typed capability gap rather than run as a wrong (or empty) function.
-                Some((func, pc)) => match &engine.entry {
-                    ProcessEntry::Export { module, .. } => {
-                        engine.machine.resume_outcome(module, func, pc, &mut budget_ctx)
-                    }
-                    ProcessEntry::Fun { .. } => Err(crate::error::unsupported(
-                        "resume of a fun-bodied process (a fun entry never suspends)",
-                    )),
-                },
-                None => match &engine.entry {
-                    ProcessEntry::Export {
-                        module,
-                        function,
-                        arity,
-                    } => match module.export(*function, *arity) {
-                        // Entered at the export's own label on the **interpreter** tier.
-                        //
-                        // The tier is the interpreter, not the baseline JIT, because the
-                        // slice's process may **switch module context** mid-run: a
-                        // `call_ext*` the host resolves through
-                        // `ExecutionContext::resolve_external_call` (see
-                        // `src/context/mod.rs`) is entered in this same machine as a
-                        // `Step::Enter`, and a native tier has no in-machine module-context
-                        // switch (it reports the typed
-                        // `unsupported("jit: module context switch …")` rather than
-                        // running the callee). The interpreter is also the only tier the
-                        // resume path (`Machine::resume_outcome` below) enters, so both
-                        // halves of a parked-and-resumed process run on one tier.
-                        //
-                        // The label entry stays the equivalence-preserving route to the
-                        // export: `run_label_outcome` calls `Machine::enter_run`, so the
-                        // run's `initial_call`/`current_function` are recorded and
-                        // `process_info/2`'s execution-position items can be answered.
-                        Some(label) => engine.machine.run_label_outcome_with_tier(
-                            module,
-                            label,
-                            *arity,
-                            &engine.args,
-                            &mut budget_ctx,
-                            Tier::Interpreter,
-                        ),
-                        // An export the module does not define stays the engine's own typed
-                        // error, byte for byte (`Machine::run_export_outcome`'s). Unreachable
-                        // for a spawned entry (`Runtime::spawn_process` resolves the export
-                        // first), and never a fabricated result.
+            let outcome = match resolved {
+                Err(error) => Err(error),
+                Ok(()) => match engine.parked {
+                    // A resume continues the SAME machine: the registers, the Erlang stack and
+                    // the frames of the suspended `receive` must survive, so this deliberately
+                    // does not reset (see `Machine::resume_outcome`). The entry module is the
+                    // module the suspended `(func, pc)` are named against — the export's own
+                    // module, or the module a fun entry resolved to. A parked fun entry with
+                    // **no** resolved target is unreachable (it is applied synchronously and
+                    // never returns a resume address) and is reported as a typed capability
+                    // gap rather than run as a wrong (or empty) function.
+                    Some((func, pc)) => match engine.entry.entry_module() {
+                        Some(module) => {
+                            engine
+                                .machine
+                                .resume_outcome(module, func, pc, &mut budget_ctx)
+                        }
                         None => Err(crate::error::unsupported(
-                            "run_export: export not found",
+                            "resume of a fun-bodied process with no local entry",
                         )),
                     },
-                    // A fun entry is applied synchronously: `apply_fun` routes an `-eval`
-                    // closure back into the evaluator and a `.beam` fun into the engine's
-                    // label entry — the evaluator is never re-implemented here. A returned
-                    // value is the fun's result, so it records exactly like an export's.
-                    ProcessEntry::Fun { fun } => budget_ctx
-                        .apply_fun(*fun, &engine.args)
-                        .map(EngineRunOutcome::Returned),
+                    None => match &engine.entry {
+                        ProcessEntry::Export {
+                            module,
+                            function,
+                            arity,
+                        } => match module.export(*function, *arity) {
+                            // Entered at the export's own label on the **interpreter** tier.
+                            //
+                            // The tier is the interpreter, not the baseline JIT, because the
+                            // slice's process may **switch module context** mid-run: a
+                            // `call_ext*` the host resolves through
+                            // `ExecutionContext::resolve_external_call` (see
+                            // `src/context/mod.rs`) is entered in this same machine as a
+                            // `Step::Enter`, and a native tier has no in-machine module-context
+                            // switch (it reports the typed
+                            // `unsupported("jit: module context switch …")` rather than
+                            // running the callee). The interpreter is also the only tier the
+                            // resume path (`Machine::resume_outcome` below) enters, so both
+                            // halves of a parked-and-resumed process run on one tier.
+                            //
+                            // The label entry stays the equivalence-preserving route to the
+                            // export: `run_label_outcome` calls `Machine::enter_run`, so the
+                            // run's `initial_call`/`current_function` are recorded and
+                            // `process_info/2`'s execution-position items can be answered.
+                            Some(label) => engine.machine.run_label_outcome_with_tier(
+                                module,
+                                label,
+                                *arity,
+                                &engine.args,
+                                &mut budget_ctx,
+                                Tier::Interpreter,
+                            ),
+                            // An export the module does not define stays the engine's own typed
+                            // error, byte for byte (`Machine::run_export_outcome`'s). Unreachable
+                            // for a spawned entry (`Runtime::spawn_process` resolves the export
+                            // first), and never a fabricated result.
+                            None => Err(crate::error::unsupported(
+                                "run_export: export not found",
+                            )),
+                        },
+                        // A fun entry: a resolved **local** closure is entered at its own label
+                        // on this process's machine — the same entry an export takes, so its
+                        // `receive` can park the process (see above). A fun with no local label
+                        // is applied synchronously: `apply_fun` routes an `-eval` closure back
+                        // into the evaluator and an external `fun M:F/A` into an ordinary
+                        // dynamic call — neither is re-implemented here. A returned value is the
+                        // fun's result, so it records exactly like an export's.
+                        ProcessEntry::Fun { fun, target } => match target {
+                            Some(target) => engine.machine.run_label_outcome_with_tier(
+                                &target.module,
+                                target.label,
+                                target.arity,
+                                &target.args,
+                                &mut budget_ctx,
+                                Tier::Interpreter,
+                            ),
+                            None => budget_ctx
+                                .apply_fun(*fun, &engine.args)
+                                .map(EngineRunOutcome::Returned),
+                        },
+                    },
                 },
-            };
-            // The wrapper's borrow of the probe ends here (the machine is no longer
+            };            // The wrapper's borrow of the probe ends here (the machine is no longer
             // running), so the slice's accounting is readable.
             drop(budget_ctx);
             let used = probe.used();
@@ -304,9 +347,12 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 engine.parked = Some((func, pc));
                 // A `wait_timeout` with a statically known positive delay arms a deadline
                 // now: when it fires the process resumes at the timed-out path instead of
-                // waiting for a message (see `parked_receive_timeout`).
+                // waiting for a message (see `parked_receive_timeout`). The module the
+                // timeout is recovered from is the process's **entry** module — the export's
+                // own, or the module a fun entry resolved to — exactly as the parked address
+                // is resumed against it.
                 engine.parked_timeout = None;
-                if let ProcessEntry::Export { module, .. } = &engine.entry {
+                if let Some(module) = engine.entry.entry_module() {
                     if let Some((delay, (resume_func, resume_pc))) =
                         parked_receive_timeout(&engine.machine, module, func, pc)
                     {
