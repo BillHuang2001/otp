@@ -318,7 +318,7 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   same split as `beam_gc::copy`'s `move_size` — and `preflight_words`' `bounded_words` mirrors it to
   give the whole-graph count the copier will actually write. `beam_term::size_object` (`size_object_x`
   port) remains the canonical flat count and equals `bounded_words` for every shape that can cross a
-  copy boundary (they diverge only for a standalone `SUB_BITS` match context — see Known Issues). All
+  copy boundary (incl. a `SUB_BITS` match context, whose `object_words` is the flattened window size). All
   three size/walk every HAMT node kind with the same `1 + header_arity + popcount(MAP_HEADER_VAL)`
   formulation, so a hash map copies as a whole trie.
 ## Test Strategy
