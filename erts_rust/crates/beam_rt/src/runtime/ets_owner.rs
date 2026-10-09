@@ -118,11 +118,13 @@ impl OwnerIndex {
     }
 
     /// The number of owners with at least one indexed table (test/diagnostic).
+    #[cfg(test)]
     pub(crate) fn owner_count(&self) -> usize {
         self.tables.len()
     }
 
     /// The number of deaths waiting for a drain (test/diagnostic).
+    #[cfg(test)]
     pub(crate) fn pending_deaths(&self) -> usize {
         self.deaths.len()
     }
@@ -165,6 +167,56 @@ fn owner_is_alive(table: &ProcessTable, owner: OwnerId) -> bool {
 }
 
 impl Runtime {
+    /// Adopts a `named_table` this runtime's `ets:new/2` **just created** for `owner`: records
+    /// it in the owner index (so a later death reclaims it) and takes ownership of the
+    /// creation-time heir's gift term.
+    ///
+    /// Called from the runtime's `ets:new/2` interception
+    /// ([`RuntimeContext::call_bif`](crate::context::RuntimeContext::call_bif)) with the handle
+    /// the creation newly registered under `name` — the one point where the runtime, which
+    /// cannot see `beam_bifs`'s private table registry, can resolve a fresh table's handle.
+    pub(crate) fn adopt_created_table(&mut self, owner: ProcessId, handle: u64, name: Atom) {
+        self.ets_owners.borrow_mut().record(owner, handle, name);
+        self.own_heir_gift(handle);
+    }
+
+    /// Makes a freshly created table's heir gift term a **table-owned copy**.
+    ///
+    /// A creation-time `{heir, Pid, Data}` reaches the table as a raw term living in the
+    /// **creating process's** heap (`beam_bifs`'s `ets:new/2` installs the parsed heir with
+    /// [`Table::set_heir`](beam_ets::Table::set_heir), the non-copying primitive), so it
+    /// aliases that heap: the moment the creator dies — or its per-process heap is collected
+    /// over — the pointer dangles and the `{'ETS-TRANSFER', …, Data}` message would carry
+    /// garbage. The oracle instead stores the gift data in a table-owned term
+    /// (`copy_heir_data`, `erl_db.c`), which is what
+    /// [`Table::install_heir`](beam_ets::Table::install_heir) reproduces (the A.1 copy
+    /// boundary). This runs while the creator is still alive, so the copy reads a live term.
+    ///
+    /// A term outside `beam_ets`'s copyable subset (a fun, an off-heap bin ref, …) is that
+    /// crate's documented typed `badarg`; the raw reference is then left in place — the
+    /// behaviour from before this copy existed — so a gift term this runtime cannot own never
+    /// turns a working `ets:new/2` into a failure. (The oracle copies *any* term, so closing
+    /// that subset is a `beam_ets` handoff, not a wrong result here.)
+    fn own_heir_gift(&mut self, handle: u64) {
+        // The registry is free here (this runs right after the `ets:new/2` BIF returned), but a
+        // `try_borrow_mut` keeps a nested borrow a no-op instead of a panic — the same
+        // discipline [`Runtime::drain_ets_owner_exits`] follows.
+        let Ok(mut registry) = self.tables.try_borrow_mut() else {
+            return;
+        };
+        let Some(table) = registry.get_mut(handle) else {
+            return;
+        };
+        let Some(heir) = table.heir() else {
+            return;
+        };
+        let Some(data) = heir.data else {
+            // An arity-2 `{heir, Pid}` owns no gift storage — nothing to take ownership of.
+            return;
+        };
+        let _ = table.install_heir(heir.owner, Some(data));
+    }
+
     /// Discharges the ETS obligations recorded since the last drain: every indexed table owned
     /// by a process that has since died is dropped, or handed to its live heir with the
     /// oracle's `{'ETS-TRANSFER', Tid, FromPid, Data}` message.
@@ -249,7 +301,10 @@ impl Runtime {
         }
         // The message is built on the pooled BIF heap (returned below) and copied into the
         // receiver's mailbox by the delivery, exactly like the port half's messages.
-        let tag = self.intern("'ETS-TRANSFER'");
+        // The tag is the **bare** atom name: `intern` takes the atom's characters, not an
+        // Erlang source literal, so the quoting is the printer's business (`'ETS-TRANSFER'`
+        // here would intern an atom whose name literally contains quotes).
+        let tag = self.intern("ETS-TRANSFER");
         let mut heap = self.take_bif_heap()?;
         let mut delivered = 0usize;
         for (to, data, name, from) in transfers {

@@ -1349,10 +1349,10 @@ impl ExecutionContext for RuntimeContext<'_> {
                 if let (Some(atom), Ok(_)) = (name, &result) {
                     let after = self.runtime.tables.borrow().lookup_name(atom);
                     if let Some(handle) = after.filter(|handle| Some(*handle) != before) {
-                        self.runtime
-                            .ets_owners
-                            .borrow_mut()
-                            .record(self.mailbox_pid, handle, atom);
+                        // Indexing the table also takes ownership of its creation-time heir's
+                        // gift term, which `beam_bifs` installed as a raw reference into the
+                        // creating process's heap (see `runtime::ets_owner::own_heir_gift`).
+                        self.runtime.adopt_created_table(self.mailbox_pid, handle, atom);
                     }
                 }
                 return result;
