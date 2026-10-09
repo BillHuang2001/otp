@@ -53,6 +53,17 @@
 //! | `make_link/2` | `prim_file.erl:829-834` → `make_hard_link_nif` → `efile_make_hard_link` = `link(2)` (`unix_prim_file.c:963-969`) | `make_link("keep.txt","hl")`⇒`ok`; again⇒`{error,eexist}`; `make_link("missing","x")`⇒`{error,enoent}`; bad path⇒`{error,badarg}` |
 //! | `make_symlink/2` | `prim_file.erl:835-840` → `make_soft_link_nif` → `efile_make_soft_link` = `symlink(2)` (`unix_prim_file.c:971-977`) | `make_symlink("t","s")`⇒`ok` (the target need not exist); again⇒`{error,eexist}`; bad path⇒`{error,badarg}` |
 //! | `altname/1` | `prim_file.erl:842-848`; on Unix `efile_altname` is a **constant** (`unix_prim_file.c:1085-1090`) | `altname("f")`/`("missing")`/`(<<"f">>)`⇒`{error,enotsup}` (it does **not** return its argument); `altname(foo)`/`(1)`/`(<<"/tmp/a",0,"b">>)`⇒`{error,badarg}` |
+//! | `open/2` | `prim_file.erl:132-141` + `build_fd_data/5`; `efile_translate_modelist`/`get_flags`/`efile_open` | `{ok,Fd}`; a missing path⇒`{error,enoent}`; a directory with `[read]`⇒`{error,eisdir}`; `[write,exclusive]` on an existing file⇒`{error,eexist}`; a non-list mode term / bad path⇒`{error,badarg}` |
+//! | `read/2` | `prim_file.erl:162-205` (`read_1/5`) + `read_nif_impl` | `{ok,<<…>>}`; a drained file⇒`eof`; `0`⇒`{ok,<<>>}`; `-1`/an atom⇒`{error,badarg}`; a float/a bigint⇒`{error,einval}`; a write-only fd⇒`{error,ebadf}`; a directory fd⇒`{error,eisdir}`; a closed/bogus fd⇒`{error,einval}` |
+//! | `write/2` | `prim_file.erl:247-263` + `write_nif_impl` (`enif_inspect_iovec`) | `ok` for a binary/string/`[<<"a">>,<<"b">>]`/`[]`/`<<>>`; `{error,badarg}` for `foo`/`[256]`/`[-1]`/`[1.5]`/`[1\|2]`/`<<1:4>>`; a read-only fd⇒`{error,ebadf}`; a directory fd⇒`{error,ebadf}` |
+//! | `close/1` | `prim_file.erl:154-160` + `close_nif` | `ok`; a second close / an unknown handle⇒`{error,einval}`; a malformed descriptor⇒`{error,badarg}` |
+//! | `position/2` | `prim_file.erl:306-334` (`position_1/3`) + `efile_seek` | `{ok,N}`; `bof`/`cur`/`eof`⇒offset 0; a bare integer `N`⇒`{N,bof}`; `{bof,-1}`/`-3`⇒`{error,einval}`; `foo`/`{1,bof}`/`{bof,foo}`/`{bof,1.0}`/`{bof,1,2}`⇒`{error,badarg}`; past EOF⇒`{ok,100}`; a closed fd⇒`{error,einval}` |
+//!
+//! The five whole-file-descriptor entries (`open/2`, `read/2`, `write/2`, `close/1`,
+//! `position/2`) are served by the sibling [`prim_file`](super::prim_file) module — this
+//! table names them because [`RuntimeContext::prim_file_call`] is their dispatch site; each
+//! entry's ground truth, mode grammar, descriptor shape and documented divergences are
+//! documented there.
 //!
 //! # The errno REMAPS (the C's corrections to the platform's `errno`)
 //!
@@ -75,16 +86,18 @@
 //!
 //! # Not served
 //!
-//! The rest of `prim_file` (`open`/`read`/`write`/`position`/`stat`/…) still falls through
-//! to the preloaded `.beam`. Deliberately unclaimed here, with the reason:
-//! `truncate/1`, `sync/1`, `datasync/1`, `advise/4` (they take a `#file_descriptor{}` from
-//! `open`, which needs the open-file resource); `write_file/2` (pure Erlang over
-//! `open`/`write`/`close`); `copy/2` (does not exist — only `copy/3`); `list_dir/1` (its
-//! entries come back in `readdir(3)` order, which the oracle does not sort and this runtime
-//! cannot pin); and the whole `read_file_info/1,2` + `read_link_info/1,2` family (needs
-//! `access(2)`, which safe `std` does not expose, plus the local-time conversion the
-//! runtime lacks). `prim_zip:splitter/3` and the other `prim_*` modules (`prim_buffer`,
-//! `prim_eval`, `prim_inet`/`prim_socket`/`prim_net`, `erl_prim_loader`) are untouched —
+//! The rest of `prim_file` (`truncate`/`sync`/`datasync`/`advise`, `write_file/2`,
+//! `list_dir/1`, the whole `read_file_info`/`read_link_info` family, …) still falls through
+//! to the preloaded `.beam`. Deliberately unclaimed here, with the reason: `truncate/1`,
+//! `sync/1`, `datasync/1`, `advise/4` (they take a `#file_descriptor{}` and additionally
+//! need the raw `ftruncate(2)`/`fsync(2)` calls safe `std` does not expose); `write_file/2`
+//! (pure Erlang over `open`/`write`/`close`, which now round-trips for real);
+//! `copy/2` (does not exist — only `copy/3`); `list_dir/1` (its entries come back in
+//! `readdir(3)` order, which the oracle does not sort and this runtime cannot pin); and the
+//! whole `read_file_info/1,2` + `read_link_info/1,2` family (needs `access(2)`, which safe
+//! `std` does not expose, plus the local-time conversion the runtime lacks).
+//! `prim_zip:splitter/3` and the other `prim_*` modules (`prim_buffer`, `prim_eval`,
+//! `prim_inet`/`prim_socket`/`prim_net`, `erl_prim_loader`) are untouched —
 //! see `CONTEXT.md` for the machinery each needs.
 
 use std::fs;
@@ -122,6 +135,14 @@ impl RuntimeContext<'_> {
             ("make_link", 2) => Some(self.prim_make_link(args)),
             ("make_symlink", 2) => Some(self.prim_make_symlink(args)),
             ("altname", 1) => Some(self.prim_altname(args)),
+            // The whole-file-descriptor family lives in the sibling [`super::prim_file`]
+            // module; the descriptor it hands out is what the entries above this line take
+            // nothing of.
+            ("open", 2) => Some(self.prim_open(args)),
+            ("read", 2) => Some(self.prim_read(args)),
+            ("write", 2) => Some(self.prim_write(args)),
+            ("close", 1) => Some(self.prim_close(args)),
+            ("position", 2) => Some(self.prim_position(args)),
             _ => None,
         }
     }
@@ -450,7 +471,7 @@ impl RuntimeContext<'_> {
     /// The C's `encode_path/1` = `prim_file:internal_name2native/1`
     /// (`erl_unicode.c:2629-2733`): the accepted path forms as bytes, or `None` for the
     /// C's `badarg`.
-    fn encode_path(&self, term: Eterm) -> Option<Vec<u8>> {
+    pub(super) fn encode_path(&self, term: Eterm) -> Option<Vec<u8>> {
         // `prim_file` explicitly does not accept atoms (`erl_unicode.c:2641-2647`).
         if is_atom(term) {
             return None;
@@ -470,18 +491,18 @@ impl RuntimeContext<'_> {
     }
 
     /// The bare `ok` atom (the success value of every non-`{ok,_}` BIF).
-    fn ok_atom(&mut self) -> Result<Eterm> {
+    pub(super) fn ok_atom(&mut self) -> Result<Eterm> {
         self.atom("ok")
     }
 
     /// `{ok, Value}`.
-    fn ok_tuple(&mut self, value: Eterm) -> Result<Eterm> {
+    pub(super) fn ok_tuple(&mut self, value: Eterm) -> Result<Eterm> {
         let ok = self.atom("ok")?;
         terms::make_tuple(self, &[ok, value])
     }
 
     /// `{error, Reason}` for the literal atom `reason`.
-    fn error_tuple(&mut self, reason: &str) -> Result<Eterm> {
+    pub(super) fn error_tuple(&mut self, reason: &str) -> Result<Eterm> {
         let error = self.atom("error")?;
         let reason = self.atom(reason)?;
         terms::make_tuple(self, &[error, reason])
@@ -501,7 +522,7 @@ impl RuntimeContext<'_> {
     /// `std::fs` is syscall-only, so every error carries an errno (the C's exact input); an
     /// errno-less error has no C counterpart, and falls back to the C's unknown-errno form
     /// for `0` rather than invent an atom.
-    fn error_tuple_for(&mut self, error: &io::Error) -> Result<Eterm> {
+    pub(super) fn error_tuple_for(&mut self, error: &io::Error) -> Result<Eterm> {
         self.error_tuple_errno(error.raw_os_error().unwrap_or(0))
     }
 }
@@ -1277,5 +1298,482 @@ mod tests {
             assert_eq!(errno_name(errno), expected);
         }
         assert_eq!(errno_name(9_999), "errno_9999");
+    }
+
+    // -- prim_file:open/read/write/close/position ----------------------------
+    //
+    // The whole-file-descriptor family lives in the sibling [`super::prim_file`] module, but
+    // its observable contract is driven — and its tests live — here, next to the path-only
+    // half they share their dispatch and helpers with.
+
+    /// `elements` as an Erlang list on the runtime's pointer-stable arena.
+    fn list(runtime: &mut Runtime, elements: &[Eterm]) -> Eterm {
+        heap_term(runtime, |context| terms::make_list(context, elements))
+    }
+
+    /// `prim_file:open/2` on the scratch `dir`'s child `name` with `options`, returning
+    /// the `#file_descriptor{}` — panics if the open failed (the tests that expect a failure
+    /// assert it directly instead).
+    fn open_file(runtime: &mut Runtime, dir: &Path, name: &str, options: &[Eterm]) -> Eterm {
+        let path = path_in(runtime, dir, name);
+        let modes = list(runtime, options);
+        let answer = prim_file(runtime, "open", &[path, modes]);
+        ok_value(runtime, answer)
+    }
+
+    /// The `Data` map of `fd` as `(key name, value)` pairs.
+    fn descriptor_data(runtime: &Runtime, fd: Eterm) -> Vec<(String, Eterm)> {
+        assert_eq!(terms::tuple_arity(fd).expect("a tuple"), 3);
+        assert_eq!(atom_name(runtime, element(fd, 0)), "file_descriptor");
+        assert_eq!(atom_name(runtime, element(fd, 1)), "prim_file");
+        terms::map_entries(element(fd, 2))
+            .expect("a map")
+            .into_iter()
+            .map(|(key, value)| (atom_name(runtime, key), value))
+            .collect()
+    }
+
+    /// The value of `key` in a descriptor's `Data` pairs.
+    fn data_get(data: &[(String, Eterm)], key: &str) -> Option<Eterm> {
+        data.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| *value)
+    }
+
+    /// A `#file_descriptor{}` this runtime never opened, carrying registry id `id` — the
+    /// "well-shaped but unknown handle" the NIF answers `{error,einval}` for.
+    fn fake_descriptor(runtime: &mut Runtime, id: i64) -> Eterm {
+        let owner = runtime.self_pid().to_eterm();
+        let data = heap_term(runtime, |context| {
+            let pairs = [
+                (context.atom("handle")?, context.atom("h")?),
+                (context.atom("owner")?, owner),
+                (context.atom("fd_registry_id")?, make_small(id)),
+            ];
+            let atoms = context.runtime.code_server.atoms_handle();
+            terms::make_map(context, &pairs, &atoms)
+        });
+        heap_term(runtime, |context| {
+            let tag = context.atom("file_descriptor")?;
+            let module = context.atom("prim_file")?;
+            terms::make_tuple(context, &[tag, module, data])
+        })
+    }
+
+    /// The position `prim_file:position(fd, location)` answers with.
+    fn position_value(runtime: &mut Runtime, fd: Eterm, location: Eterm) -> i64 {
+        let answer = prim_file(runtime, "position", &[fd, location]);
+        signed_value(ok_value(runtime, answer))
+    }
+
+    /// The position `Loc` `{mark, offset}`.
+    fn pair(runtime: &mut Runtime, mark: &str, offset: i64) -> Eterm {
+        let mark = atom(runtime, mark);
+        heap_term(runtime, |context| terms::make_tuple(context, &[mark, make_small(offset)]))
+    }
+
+    /// The bytes of an `{ok, Binary}` answer.
+    fn ok_bytes(runtime: &Runtime, answer: Eterm) -> Vec<u8> {
+        terms::binary_bytes(ok_value(runtime, answer))
+            .expect("a binary")
+            .to_vec()
+    }
+
+    /// Oracle: `file:open(P,[read,binary])` and `[read,list]` both hand back a descriptor a
+    /// `read` round-trips on, and the file really opened (the host twin proves it).
+    #[test]
+    fn open_read_close_round_trips_in_binary_and_list_modes() {
+        let dir = scratch_dir("roundtrip");
+        let path = dir.join("data.txt");
+        std::fs::write(&path, b"hello world").expect("seed the file");
+        for option in ["binary", "list"] {
+            let mut runtime = runtime();
+            let read = atom(&mut runtime, "read");
+            let extra = atom(&mut runtime, option);
+            let fd = open_file(&mut runtime, &dir, "data.txt", &[read, extra]);
+            assert_eq!(
+                std::fs::read(&path).expect("the host reads the same file"),
+                b"hello world"
+            );
+            let answer = prim_file(&mut runtime, "read", &[fd, make_small(5)]);
+            assert_eq!(ok_bytes(&runtime, answer), b"hello");
+            assert_ok(&mut runtime, "close", &[fd]);
+        }
+    }
+
+    /// Oracle: sequential `read/2` calls advance through the file and then answer `eof`; a
+    /// zero-byte read is `{ok,<<>>}` even at end of file.
+    #[test]
+    fn sequential_reads_reach_eof() {
+        let dir = scratch_dir("eof");
+        std::fs::write(dir.join("d"), b"hello world").expect("seed");
+        let mut runtime = runtime();
+        let read = atom(&mut runtime, "read");
+        let fd = open_file(&mut runtime, &dir, "d", &[read]);
+        for expected in [&b"hello"[..], &b" worl"[..], &b"d"[..]] {
+            let answer = prim_file(&mut runtime, "read", &[fd, make_small(5)]);
+            assert_eq!(ok_bytes(&runtime, answer), expected);
+        }
+        let eof = prim_file(&mut runtime, "read", &[fd, make_small(5)]);
+        assert_eq!(atom_name(&runtime, eof), "eof");
+        let zero = prim_file(&mut runtime, "read", &[fd, make_small(0)]);
+        assert!(ok_bytes(&runtime, zero).is_empty());
+        assert_ok(&mut runtime, "close", &[fd]);
+    }
+
+    /// Oracle: `write/2`'s payload is really on disk (the host twin proves it), through the
+    /// nested iodata forms the oracle accepts.
+    #[test]
+    fn write_then_read_back_is_visible_to_the_host() {
+        let dir = scratch_dir("writeback");
+        let mut runtime = runtime();
+        let write = atom(&mut runtime, "write");
+        let fd = open_file(&mut runtime, &dir, "out.bin", &[write]);
+        let text = chars(&mut runtime, "ab");
+        let byte = make_small(99);
+        let binary_part = binary(&mut runtime, b"de");
+        let nested = list(&mut runtime, &[text, byte, binary_part]);
+        assert_ok(&mut runtime, "write", &[fd, nested]);
+        assert_ok(&mut runtime, "close", &[fd]);
+        assert_eq!(
+            std::fs::read(dir.join("out.bin")).expect("read back"),
+            b"abcde"
+        );
+    }
+
+    /// Oracle: `position/2`'s `Loc` grammar — the marker atoms, a bare integer (⇒ `{N,bof}`)
+    /// and `{Mark, Offset}` pairs, including a seek past EOF.
+    #[test]
+    fn position_marks_offsets_and_bare_integers() {
+        let dir = scratch_dir("position");
+        std::fs::write(dir.join("p"), b"0123456789a").expect("seed an 11-byte file");
+        let mut runtime = runtime();
+        let read = atom(&mut runtime, "read");
+        let fd = open_file(&mut runtime, &dir, "p", &[read]);
+        let bof = atom(&mut runtime, "bof");
+        let cur = atom(&mut runtime, "cur");
+        let eof = atom(&mut runtime, "eof");
+        assert_eq!(position_value(&mut runtime, fd, bof), 0);
+        assert_eq!(position_value(&mut runtime, fd, cur), 0);
+        assert_eq!(position_value(&mut runtime, fd, eof), 11);
+        // A bare integer is `{N,bof}`.
+        assert_eq!(position_value(&mut runtime, fd, make_small(3)), 3);
+        let cur_one = pair(&mut runtime, "cur", 1);
+        assert_eq!(position_value(&mut runtime, fd, cur_one), 4);
+        let eof_minus_one = pair(&mut runtime, "eof", -1);
+        assert_eq!(position_value(&mut runtime, fd, eof_minus_one), 10);
+        let bof_one = pair(&mut runtime, "bof", 1);
+        assert_eq!(position_value(&mut runtime, fd, bof_one), 1);
+        // A seek past EOF is legal.
+        assert_eq!(position_value(&mut runtime, fd, make_small(100)), 100);
+        assert_ok(&mut runtime, "close", &[fd]);
+    }
+
+    /// Oracle: the `Loc` forms the C rejects are `{error,badarg}`; a negative `bof` offset
+    /// is the kernel's `{error,einval}`.
+    #[test]
+    fn position_rejects_ill_formed_locations() {
+        let dir = scratch_dir("position_bad");
+        std::fs::write(dir.join("p"), b"0123456789a").expect("seed");
+        let mut runtime = runtime();
+        let read = atom(&mut runtime, "read");
+        let fd = open_file(&mut runtime, &dir, "p", &[read]);
+        let foo = atom(&mut runtime, "foo");
+        let bof = atom(&mut runtime, "bof");
+        // `{1, bof}` — the mark is not an atom.
+        let one_bof = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[make_small(1), bof])
+        });
+        // `{bof, foo}` — the offset is not an integer.
+        let bof_foo = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[bof, foo])
+        });
+        // `{bof, 1.0}` — a float is not an integer offset.
+        let float = heap_term(&mut runtime, |context| terms::make_float(context, 1.0));
+        let bof_float = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[bof, float])
+        });
+        // `{bof, 1, 2}` — an arity-3 tuple is not a `Loc` pair.
+        let bof_three = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[bof, make_small(1), make_small(2)])
+        });
+        for location in [foo, one_bof, bof_foo, bof_float, bof_three] {
+            assert_eq!(
+                prim_error(&mut runtime, "position", &[fd, location]),
+                "badarg"
+            );
+        }
+        // `{bof,-1}` and a bare `-3` are the kernel's `EINVAL`.
+        let bof_minus_one = pair(&mut runtime, "bof", -1);
+        assert_eq!(
+            prim_error(&mut runtime, "position", &[fd, bof_minus_one]),
+            "einval"
+        );
+        assert_eq!(
+            prim_error(&mut runtime, "position", &[fd, make_small(-3)]),
+            "einval"
+        );
+        assert_ok(&mut runtime, "close", &[fd]);
+    }
+
+    /// Oracle: a missing path ⇒ `{error,enoent}`; a directory with `[read]` ⇒
+    /// `{error,eisdir}`; a `[directory]` open of a regular file ⇒ `{error,enotdir}`;
+    /// `[write,exclusive]` on an existing file ⇒ `{error,eexist}`; a bad path and a
+    /// non-list mode term ⇒ `{error,badarg}`.
+    #[test]
+    fn open_reports_the_oracles_failures() {
+        let dir = scratch_dir("open_errors");
+        std::fs::write(dir.join("f"), b"x").expect("seed");
+        let mut runtime = runtime();
+        let read = atom(&mut runtime, "read");
+        let write = atom(&mut runtime, "write");
+        let exclusive = atom(&mut runtime, "exclusive");
+        let directory = atom(&mut runtime, "directory");
+
+        // A missing path.
+        let missing = chars(&mut runtime, "/nonexistent/beam_rt/prim_file/probe");
+        let modes = list(&mut runtime, &[read]);
+        assert_eq!(
+            prim_error(&mut runtime, "open", &[missing, modes]),
+            "enoent"
+        );
+
+        // A directory opened for reading — `open(2)` succeeds, the type check rejects it.
+        let dir_path = chars(&mut runtime, dir.to_str().expect("a UTF-8 path"));
+        let modes = list(&mut runtime, &[read]);
+        assert_eq!(prim_error(&mut runtime, "open", &[dir_path, modes]), "eisdir");
+
+        // `[directory]` on a regular file.
+        let file_path = path_in(&mut runtime, &dir, "f");
+        let modes = list(&mut runtime, &[directory]);
+        assert_eq!(
+            prim_error(&mut runtime, "open", &[file_path, modes]),
+            "enotdir"
+        );
+
+        // `[write,exclusive]` on an existing file.
+        let file_path = path_in(&mut runtime, &dir, "f");
+        let modes = list(&mut runtime, &[write, exclusive]);
+        assert_eq!(
+            prim_error(&mut runtime, "open", &[file_path, modes]),
+            "eexist"
+        );
+
+        // A bad path — an atom, and a NUL-containing binary.
+        let modes = list(&mut runtime, &[read]);
+        let bad_path = atom(&mut runtime, "nofile");
+        assert_eq!(
+            prim_error(&mut runtime, "open", &[bad_path, modes]),
+            "badarg"
+        );
+        let modes = list(&mut runtime, &[read]);
+        let nul = nul_path(&mut runtime);
+        assert_eq!(prim_error(&mut runtime, "open", &[nul, modes]), "badarg");
+
+        // A mode term that is not a list.
+        let file_path = path_in(&mut runtime, &dir, "f");
+        let non_list = atom(&mut runtime, "read");
+        assert_eq!(
+            prim_error(&mut runtime, "open", &[file_path, non_list]),
+            "badarg"
+        );
+    }
+
+    /// Oracle: the descriptor's `Data` map follows `build_fd_data/5` — the read shape
+    /// (`handle`/`owner`/`r_buffer`/`r_ahead_size`) or the write shape (`handle`/`owner`
+    /// only), with the read-ahead size the option list asked for.
+    #[test]
+    fn descriptor_shape_follows_the_mode_list() {
+        let dir = scratch_dir("shape");
+        std::fs::write(dir.join("f"), b"x").expect("seed");
+        let mut runtime = runtime();
+        let read = atom(&mut runtime, "read");
+        let write = atom(&mut runtime, "write");
+
+        // `[read]`: the read shape, with a zero read-ahead size.
+        let fd = open_file(&mut runtime, &dir, "f", &[read]);
+        let data = descriptor_data(&runtime, fd);
+        assert!(data_get(&data, "handle").is_some());
+        assert!(data_get(&data, "owner").is_some());
+        assert!(data_get(&data, "r_buffer").is_some());
+        assert_eq!(
+            signed_value(data_get(&data, "r_ahead_size").expect("r_ahead_size")),
+            0
+        );
+
+        assert_ok(&mut runtime, "close", &[fd]);
+
+        // `[]` — the default read shape.
+        let fd = open_file(&mut runtime, &dir, "f", &[]);
+        let data = descriptor_data(&runtime, fd);
+        assert!(data_get(&data, "r_buffer").is_some());
+        assert_ok(&mut runtime, "close", &[fd]);
+
+        // `[read,write]` and `[read,append]` are still the read shape.
+        for option in [write, atom(&mut runtime, "append")] {
+            let fd = open_file(&mut runtime, &dir, "f", &[read, option]);
+            let data = descriptor_data(&runtime, fd);
+            assert!(data_get(&data, "r_buffer").is_some());
+            assert_ok(&mut runtime, "close", &[fd]);
+        }
+
+        // `[write]`: the write shape, without `r_buffer`/`r_ahead_size`.
+        let fd = open_file(&mut runtime, &dir, "w1", &[write]);
+        let data = descriptor_data(&runtime, fd);
+        assert!(data_get(&data, "handle").is_some());
+        assert!(data_get(&data, "owner").is_some());
+        assert!(data_get(&data, "r_buffer").is_none());
+        assert!(data_get(&data, "r_ahead_size").is_none());
+        assert_ok(&mut runtime, "close", &[fd]);
+
+        // A bare `read_ahead` ⇒ 65536.
+        let read_ahead = atom(&mut runtime, "read_ahead");
+        let fd = open_file(&mut runtime, &dir, "f", &[read, read_ahead]);
+        let data = descriptor_data(&runtime, fd);
+        assert_eq!(
+            signed_value(data_get(&data, "r_ahead_size").expect("r_ahead_size")),
+            65536
+        );
+        assert_ok(&mut runtime, "close", &[fd]);
+
+        // `{read_ahead, 8}` ⇒ 8.
+        let tag = atom(&mut runtime, "read_ahead");
+        let read_ahead_8 = heap_term(&mut runtime, |context| {
+            terms::make_tuple(context, &[tag, make_small(8)])
+        });
+        let fd = open_file(&mut runtime, &dir, "f", &[read, read_ahead_8]);
+        let data = descriptor_data(&runtime, fd);
+        assert_eq!(
+            signed_value(data_get(&data, "r_ahead_size").expect("r_ahead_size")),
+            8
+        );
+        assert_ok(&mut runtime, "close", &[fd]);
+    }
+
+    /// Oracle: a closed descriptor and a well-shaped unknown one are the NIF's
+    /// `EFILE_STATE_CLOSED` `{error,einval}` for every operation (never a panic); a malformed
+    /// descriptor is `{error,badarg}`.
+    #[test]
+    fn closed_and_unknown_handles_are_einval() {
+        let dir = scratch_dir("einval");
+        std::fs::write(dir.join("f"), b"x").expect("seed");
+        let mut runtime = runtime();
+        let read = atom(&mut runtime, "read");
+        let fd = open_file(&mut runtime, &dir, "f", &[read]);
+        assert_ok(&mut runtime, "close", &[fd]);
+
+        // Every operation on the closed handle.
+        assert_eq!(prim_error(&mut runtime, "close", &[fd]), "einval");
+        assert_eq!(prim_error(&mut runtime, "read", &[fd, make_small(1)]), "einval");
+        let payload = binary(&mut runtime, b"x");
+        assert_eq!(prim_error(&mut runtime, "write", &[fd, payload]), "einval");
+        let bof = atom(&mut runtime, "bof");
+        assert_eq!(
+            prim_error(&mut runtime, "position", &[fd, bof]),
+            "einval"
+        );
+
+        // A well-shaped descriptor this runtime never opened.
+        let bogus = fake_descriptor(&mut runtime, 9_999_999);
+        assert_eq!(prim_error(&mut runtime, "close", &[bogus]), "einval");
+        assert_eq!(
+            prim_error(&mut runtime, "read", &[bogus, make_small(1)]),
+            "einval"
+        );
+
+        // A malformed descriptor is `{error,badarg}`.
+        let malformed = binary(&mut runtime, b"not a descriptor");
+        let not_atom = atom(&mut runtime, "foo");
+        let integer = make_small(1);
+        for term in [malformed, not_atom, integer] {
+            assert_eq!(prim_error(&mut runtime, "close", &[term]), "badarg");
+            assert_eq!(
+                prim_error(&mut runtime, "read", &[term, make_small(1)]),
+                "badarg"
+            );
+            let bof = atom(&mut runtime, "bof");
+            assert_eq!(
+                prim_error(&mut runtime, "position", &[term, bof]),
+                "badarg"
+            );
+        }
+    }
+
+    /// Oracle: a write-only (`[write]`/`[append]`) descriptor answers `{error,ebadf}` for
+    /// `read/2`; a read-only one answers the same for `write/2`.
+    #[test]
+    fn read_on_write_only_and_write_on_read_only_are_ebadf() {
+        let dir = scratch_dir("ebadf");
+        std::fs::write(dir.join("ro"), b"x").expect("seed");
+        let mut runtime = runtime();
+        let read = atom(&mut runtime, "read");
+        let write = atom(&mut runtime, "write");
+        let append = atom(&mut runtime, "append");
+
+        for option in [write, append] {
+            let fd = open_file(&mut runtime, &dir, "wo", &[option]);
+            assert_eq!(
+                prim_error(&mut runtime, "read", &[fd, make_small(1)]),
+                "ebadf"
+            );
+            assert_ok(&mut runtime, "close", &[fd]);
+        }
+
+        let fd = open_file(&mut runtime, &dir, "ro", &[read]);
+        let payload = binary(&mut runtime, b"y");
+        assert_eq!(prim_error(&mut runtime, "write", &[fd, payload]), "ebadf");
+        assert_ok(&mut runtime, "close", &[fd]);
+    }
+
+    /// Oracle: `write/2`'s iodata walk accepts a binary, a byte, an empty list and nested
+    /// forms; everything else is `{error,badarg}`. The accepted bytes are proved on disk.
+    #[test]
+    fn write_iodata_validation() {
+        let dir = scratch_dir("iodata");
+        let mut runtime = runtime();
+        let write = atom(&mut runtime, "write");
+        let fd = open_file(&mut runtime, &dir, "io.bin", &[write]);
+
+        // Accepted forms.
+        let empty_binary = binary(&mut runtime, b"");
+        assert_ok(&mut runtime, "write", &[fd, empty_binary]);
+        assert_ok(&mut runtime, "write", &[fd, NIL]);
+        let one = binary(&mut runtime, b"x");
+        assert_ok(&mut runtime, "write", &[fd, one]);
+        let a = binary(&mut runtime, b"a");
+        let b = binary(&mut runtime, b"b");
+        let two = list(&mut runtime, &[a, b]);
+        assert_ok(&mut runtime, "write", &[fd, two]);
+        let text = chars(&mut runtime, "ab");
+        let mixed = list(&mut runtime, &[text, make_small(99)]);
+        assert_ok(&mut runtime, "write", &[fd, mixed]);
+        let c = binary(&mut runtime, b"c");
+        let inner = list(&mut runtime, &[c]);
+        let a = binary(&mut runtime, b"a");
+        let b = binary(&mut runtime, b"b");
+        let deeply = list(&mut runtime, &[a, inner, b]);
+        assert_ok(&mut runtime, "write", &[fd, deeply]);
+
+        // Rejected forms.
+        let improper = heap_term(&mut runtime, |context| {
+            terms::make_cons(context, make_small(1), make_small(2))
+        });
+        let float = heap_term(&mut runtime, |context| terms::make_float(context, 1.5));
+        let rejected = [
+            atom(&mut runtime, "foo"),
+            list(&mut runtime, &[make_small(256)]),
+            improper,
+            list(&mut runtime, &[float]),
+            list(&mut runtime, &[make_small(-1)]),
+        ];
+        for term in rejected {
+            assert_eq!(prim_error(&mut runtime, "write", &[fd, term]), "badarg");
+        }
+
+        assert_ok(&mut runtime, "close", &[fd]);
+        assert_eq!(
+            std::fs::read(dir.join("io.bin")).expect("read back"),
+            b"xababcacb"
+        );
     }
 }
