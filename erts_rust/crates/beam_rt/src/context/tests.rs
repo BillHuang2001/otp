@@ -1201,7 +1201,7 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
     let false_atom = rt.intern("false");
     let run_queue = rt.intern("run_queue");
     let wall_clock = rt.intern("wall_clock");
-    let reductions = rt.intern("reductions");
+    let runtime_key = rt.intern("runtime");
     let atom_count = rt.intern("atom_count");
     // Captured before the context takes its `&mut Runtime` borrow: a fresh runtime queues
     // nothing, so this is the run-queue figure `statistics(run_queue)` must reproduce.
@@ -1271,13 +1271,15 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
 
     // A valid statistics key this runtime cannot measure is the typed capability gap (never
     // a fabricated number); a name that is not a statistics key at all is the oracle's
-    // `badarg`.
+    // `badarg`. `runtime` needs CPU time, which this crate cannot read without `unsafe`
+    // (`#![deny(unsafe_code)]`), so it is the honest gap; the counters it *can* measure are
+    // served (see `the_served_statistics_counters_read_the_runtimes_own_state`).
     let error = ctx
-        .call_bif("erlang", "statistics", 1, &[reductions])
-        .expect_err("reductions is an honest gap");
+        .call_bif("erlang", "statistics", 1, &[runtime_key])
+        .expect_err("runtime is an honest gap");
     assert_eq!(
         crate::error::unsupported_reason(&error).as_deref(),
-        Some("erlang:statistics/1: the `reductions` counter is not implemented")
+        Some("erlang:statistics/1: the `runtime` counter is not implemented")
     );
     for key in [atom_count, make_small(1)] {
         let error = ctx
@@ -1285,6 +1287,79 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
             .expect_err("an unknown statistics key is badarg");
         assert_eq!(error.as_atom(), Some("badarg"), "{error}");
     }
+}
+
+/// The counters this runtime keeps for `erlang:statistics/1` are read from its **own real
+/// state**: the node-global reduction/context-switch counters the runner and the scheduler
+/// charge, and the port subsystem's byte counters. Every figure is a real measurement — a
+/// fabricated or frozen counter would fail these assertions.
+#[test]
+fn the_served_statistics_counters_read_the_runtimes_own_state() {
+    let mut rt = runtime();
+    // The two cumulative counters are credited by their real charge sites
+    // (`Runtime::note_reductions`/`note_context_switches`, driven end to end by the
+    // scheduler unit tests); here the anchor and read semantics are pinned directly.
+    rt.note_reductions(7);
+    rt.note_context_switches(3);
+    let reductions = rt.intern("reductions");
+    let exact_reductions = rt.intern("exact_reductions");
+    let context_switches = rt.intern("context_switches");
+    let io = rt.intern("io");
+    let scheduler_wall_time = rt.intern("scheduler_wall_time");
+    let input = rt.intern("input");
+    let output = rt.intern("output");
+    let undefined = rt.intern("undefined");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    // A `{Total, SinceLast}` read of a served counter key.
+    let pair = |ctx: &mut RuntimeContext<'_>, key: Eterm| {
+        let value = ctx
+            .call_bif("erlang", "statistics", 1, &[key])
+            .expect("a served statistics key");
+        assert_eq!(terms::tuple_arity(value).expect("a 2-tuple"), 2);
+        let total = terms::tuple_element(value, 0).expect("the total");
+        let since = terms::tuple_element(value, 1).expect("the delta");
+        assert!(is_small(total) && is_small(since), "two small integers");
+        (signed_value(total), signed_value(since))
+    };
+
+    // `reductions`: the first read's delta is the whole total (the anchor starts at zero) and
+    // the very next read of the same key is a zero delta.
+    assert_eq!(pair(&mut ctx, reductions), (7, 7));
+    assert_eq!(pair(&mut ctx, reductions), (7, 0));
+    // `exact_reductions` names the same quantity but keeps its **own** anchor, so it has not
+    // been read yet — and reading it does not consume `reductions`' cursor.
+    assert_eq!(pair(&mut ctx, exact_reductions), (7, 7));
+    assert_eq!(pair(&mut ctx, reductions), (7, 0));
+    assert_eq!(pair(&mut ctx, exact_reductions), (7, 0));
+    // `context_switches`, same rule.
+    assert_eq!(pair(&mut ctx, context_switches), (3, 3));
+    assert_eq!(pair(&mut ctx, context_switches), (3, 0));
+
+    // `scheduler_wall_time` is the oracle's own "not enabled" answer.
+    assert_eq!(
+        ctx.call_bif("erlang", "statistics", 1, &[scheduler_wall_time])
+            .expect("scheduler_wall_time"),
+        undefined
+    );
+
+    // `io` is `{{input, In}, {output, Out}}`; this runtime has written nothing to a port and
+    // read nothing from one, so both byte counts are the honest zero.
+    let value = ctx
+        .call_bif("erlang", "statistics", 1, &[io])
+        .expect("statistics(io)");
+    let in_pair = terms::tuple_element(value, 0).expect("the input pair");
+    let out_pair = terms::tuple_element(value, 1).expect("the output pair");
+    assert_eq!(terms::tuple_element(in_pair, 0).expect("the tag"), input);
+    assert_eq!(terms::tuple_element(out_pair, 0).expect("the tag"), output);
+    assert_eq!(
+        signed_value(terms::tuple_element(in_pair, 1).expect("the input count")),
+        0
+    );
+    assert_eq!(
+        signed_value(terms::tuple_element(out_pair, 1).expect("the output count")),
+        0
+    );
 }
 
 /// A module that imports `erlang:load_nif/2`, `erlang:term_to_binary/1,2` or

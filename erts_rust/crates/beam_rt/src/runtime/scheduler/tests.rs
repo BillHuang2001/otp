@@ -126,6 +126,52 @@ fn every_spawned_process_makes_progress_to_completion_round_robin() {
     assert_eq!(rt.run_one_slice().expect("nothing left to run"), 0);
 }
 
+/// The committed pre-emption fixture (`tests/fixtures/preempt.beam`, reused by relative
+/// path): `alloc_loop/1` is an **allocating** tail-recursive loop, so the compiler emits a
+/// `test_heap` every iteration — the heap-admission point the slice's reduction budget is
+/// charged at.
+const PREEMPT_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/preempt.beam"
+);
+
+/// The node-global counters behind `erlang:statistics(reductions)` and
+/// `erlang:statistics(context_switches)` are credited by the **real** charge sites: every
+/// executed slice charges the reductions its `BudgetProbe` really spent and counts one
+/// process dispatch. A fresh runtime answers `(0, 0)` for both and a real run advances them,
+/// so a fabricated or frozen counter would fail this.
+#[test]
+fn the_scheduler_credits_the_reduction_and_context_switch_counters() {
+    let mut rt = runtime();
+    rt.load_module(PREEMPT_BEAM).expect("load preempt.beam");
+    // Nothing has run yet: both counters are the honest zero, and the first read's
+    // `SinceLast` is its own total (the anchor starts at zero).
+    assert_eq!(rt.reductions_statistics(false), (0, 0));
+    assert_eq!(rt.context_switch_statistics(), (0, 0));
+
+    // `alloc_loop/1` allocates once per iteration, so it really charges reductions at
+    // `test_heap` — well inside one slice's budget at N = 100 (the budget is `CONTEXT_REDS`,
+    // 4000), so the slice count stays exactly one either way.
+    rt.spawn_process("preempt", "alloc_loop", vec![make_small(100)])
+        .expect("preempt:alloc_loop/1 is exported");
+    assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+
+    let (reductions, since) = rt.reductions_statistics(false);
+    assert!(
+        reductions > 0,
+        "the slice charged the reductions it really spent: {reductions}"
+    );
+    assert_eq!(since, reductions, "the first read is the delta since zero");
+    // A second read of the same counter reports a zero delta: nothing has run since.
+    assert_eq!(rt.reductions_statistics(false), (reductions, 0));
+    // `exact_reductions` names the same quantity but keeps its own anchor.
+    assert_eq!(rt.reductions_statistics(true), (reductions, reductions));
+
+    // One slice dispatched exactly one process.
+    assert_eq!(rt.context_switch_statistics(), (1, 1));
+    assert_eq!(rt.context_switch_statistics(), (1, 0));
+}
+
 // -- erlang:send_after/3 on the scheduler path ----------------------------
 
 /// The committed receive fixture (`../beam_engine/tests/fixtures/recv.beam`), reused by

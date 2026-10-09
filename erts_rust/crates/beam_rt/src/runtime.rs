@@ -46,7 +46,7 @@
 //! this a *multi-module* host (native floor → `beam_bifs` registry → load-on-demand
 //! external call) lives in [`RuntimeContext::call_bif`](crate::context).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -77,7 +77,7 @@ use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
 use crate::nif::NifRegistry;
 use crate::perf_map::PerfMap;
-use crate::port::PortRegistry;
+use crate::port::{IoCounters, PortRegistry};
 use crate::runner::{ProcessEntry, RunnerState};
 use crate::seq_trace::SeqTrace;
 use crate::timers::{TimerHandle, Timers};
@@ -265,6 +265,32 @@ pub struct Runtime {
     pub(crate) persistent_terms: Rc<RefCell<PersistentTermStore>>,
     /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
+    /// The node-global **cumulative reduction count** — the `Total` behind
+    /// `erlang:statistics(reductions)`/`(exact_reductions)`.
+    ///
+    /// Bumped by the runner by exactly the reduction units it charged in a slice
+    /// ([`Runtime::note_reductions`]), so the figure is real scheduled work rather than a
+    /// placeholder. Per-process counters are reset by every slice and could not be summed
+    /// into an honest node total; this one is monotonic for the runtime's lifetime.
+    reductions: u64,
+    /// The anchor of the previous `erlang:statistics(reductions)` read (`SinceLast`).
+    reductions_anchor: Cell<u64>,
+    /// The anchor of the previous `erlang:statistics(exact_reductions)` read.
+    exact_reductions_anchor: Cell<u64>,
+    /// The node-global **process-dispatch count** — the `Total` behind
+    /// `erlang:statistics(context_switches)`.
+    ///
+    /// Bumped by the scheduler by the number of slices one pass dispatched
+    /// ([`Runtime::note_context_switches`]): one per process the run loop switched to.
+    context_switches: u64,
+    /// The anchor of the previous `erlang:statistics(context_switches)` read.
+    context_switches_anchor: Cell<u64>,
+    /// The shared **I/O byte counters** behind `erlang:statistics(io)`.
+    ///
+    /// A clone of the [`PortRegistry`]'s own handle ([`crate::port::IoCounters`]), bumped
+    /// where port bytes really move, so the `statistics(io)` arm reads them without borrowing
+    /// the port table.
+    io_counters: Rc<IoCounters>,
     /// Whether [`Runtime::boot`] has run.
     booted: bool,
     /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
@@ -474,6 +500,10 @@ impl Runtime {
         // flag selected no file, and a failure to create one is recorded on the `PerfMap`
         // (the oracle logs it and keeps running), never raised here.
         let perf_map = PerfMap::new(config.perf_map.clone());
+        // The port registry owns the I/O byte counters; the runtime keeps a clone of the very
+        // same `Rc` so `statistics(io)` reads them without borrowing the port table.
+        let ports = Rc::new(RefCell::new(PortRegistry::new()?));
+        let io_counters = ports.borrow().io_counters();
         Ok(Runtime {
             config,
             registry: Rc::new(BifRegistry::with_core_bifs()),
@@ -493,10 +523,16 @@ impl Runtime {
             eval_heap: Heap::new(heap_words)?,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             ets_owners,
-            ports: Rc::new(RefCell::new(PortRegistry::new()?)),
+            ports,
             nifs: Rc::new(RefCell::new(NifRegistry::new())),
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),
             self_pid,
+            reductions: 0,
+            reductions_anchor: Cell::new(0),
+            exact_reductions_anchor: Cell::new(0),
+            context_switches: 0,
+            context_switches_anchor: Cell::new(0),
+            io_counters,
             booted: false,
             halt: None,
             seq_trace: SeqTrace::new(),
@@ -1297,6 +1333,60 @@ impl Runtime {
     /// The number of processes waiting in the scheduler's run queue.
     pub fn run_queue_len(&self) -> usize {
         self.scheduler.run_queue().len()
+    }
+
+    /// Credits the `n` reduction units one scheduler slice charged to the node-global
+    /// cumulative count behind `erlang:statistics(reductions)`/`(exact_reductions)`.
+    ///
+    /// Called by the runner ([`crate::runner`]) with exactly what the slice's
+    /// `BudgetProbe` charged, so the figure is the runtime's real scheduled work. Saturating,
+    /// so a run long enough to overflow `u64` reductions degrades to a clamped count instead
+    /// of wrapping into a smaller one.
+    pub(crate) fn note_reductions(&mut self, n: u64) {
+        self.reductions = self.reductions.saturating_add(n);
+    }
+
+    /// Credits the `n` process dispatches one scheduler round performed to the node-global
+    /// context-switch count behind `erlang:statistics(context_switches)`.
+    ///
+    /// One dispatch is one process the run loop switched to (see
+    /// [`crate::runtime::scheduler`]); a passive port wait is not a process switch and is not
+    /// counted.
+    pub(crate) fn note_context_switches(&mut self, n: u64) {
+        self.context_switches = self.context_switches.saturating_add(n);
+    }
+
+    /// `erlang:statistics(reductions)`/`(exact_reductions)`: `(Total, SinceLast)`.
+    ///
+    /// `exact` selects which key's anchor is used, so each key's `SinceLast` is the delta
+    /// since the previous read of **that** key — a pair of independent cursors over the one
+    /// counter, exactly as the two oracle keys name the same quantity. `Total` is the
+    /// runtime's own cumulative reduction count since it started (its documented "different
+    /// zero", like `wall_clock`'s).
+    pub(crate) fn reductions_statistics(&self, exact: bool) -> (u64, u64) {
+        let anchor = if exact {
+            &self.exact_reductions_anchor
+        } else {
+            &self.reductions_anchor
+        };
+        let total = self.reductions;
+        let last = anchor.replace(total);
+        (total, total.saturating_sub(last))
+    }
+
+    /// `erlang:statistics(context_switches)`: `(Total, SinceLast)`, from the same cumulative
+    /// dispatch counter and the same per-key anchor rule as
+    /// [`Runtime::reductions_statistics`].
+    pub(crate) fn context_switch_statistics(&self) -> (u64, u64) {
+        let total = self.context_switches;
+        let last = self.context_switches_anchor.replace(total);
+        (total, total.saturating_sub(last))
+    }
+
+    /// `erlang:statistics(io)`: `(BytesIn, BytesOut)` from the port subsystem's own counters
+    /// (see [`IoCounters`]) — the bytes this runtime really read from and wrote to its ports.
+    pub(crate) fn io_statistics(&self) -> (u64, u64) {
+        self.io_counters.bytes()
     }
 
     /// The runtime's distributed node, when `-name`/`-sname` configured one.

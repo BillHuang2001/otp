@@ -134,7 +134,7 @@
 //! and a nested borrow is reported as a typed capability gap instead of panicking (the
 //! crate is `#![deny(unsafe_code)]` and never panics on runtime data).
 
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::rc::Rc;
@@ -384,6 +384,48 @@ enum PortEvent {
     },
 }
 
+/// The node-global **I/O byte counters** behind `erlang:statistics(io)`.
+///
+/// Shared as an [`Rc`] between the [`Runtime`](crate::Runtime) (which answers
+/// `statistics(io)` from them) and its [`PortRegistry`] (which bumps them exactly where port
+/// bytes move), so reading them never needs a borrow of the port table — and a `statistics`
+/// call can never be turned into a capability gap by an unrelated live borrow.
+///
+/// `input` counts the bytes a port delivered to the runtime (the payload of a
+/// `{Port, {data, …}}` message); `output` counts the bytes the runtime wrote to a port
+/// (`erlang:port_command/2,3`). Both are cumulative for the runtime's lifetime and are never
+/// reset, exactly the oracle's own semantics for `statistics(io)`
+/// (`erts/emulator/beam/erl_bif_info.c`'s `am_io` arm).
+///
+/// A `Runtime` counts only the port traffic **it** performed, so a runtime that never opened
+/// a port reports `{{input,0},{output,0}}` where the oracle reports its own standard-I/O
+/// traffic — the same "an answer that reads *this* runtime's own state" class as
+/// `erlang:ports/0`, never a fabricated figure.
+#[derive(Debug, Default)]
+pub struct IoCounters {
+    /// Bytes read *from* ports (delivered as `{Port, {data, …}}`).
+    input: Cell<u64>,
+    /// Bytes written *to* ports (`erlang:port_command/2,3`).
+    output: Cell<u64>,
+}
+
+impl IoCounters {
+    /// The `(bytes in, bytes out)` pair `erlang:statistics(io)` reports.
+    pub fn bytes(&self) -> (u64, u64) {
+        (self.input.get(), self.output.get())
+    }
+
+    /// Credits `n` bytes a port delivered to the runtime.
+    fn note_input(&self, n: usize) {
+        self.input.set(self.input.get().saturating_add(n as u64));
+    }
+
+    /// Credits `n` bytes the runtime wrote to a port.
+    fn note_output(&self, n: usize) {
+        self.output.set(self.output.get().saturating_add(n as u64));
+    }
+}
+
 /// The runtime's port subsystem state: one poller, one `beam_io` port registry, the
 /// `port_info` metadata and the term arena.
 ///
@@ -408,6 +450,11 @@ pub struct PortRegistry {
     /// exhaustion surfaces as the arena's typed allocation error rather than as a dangling
     /// term.
     heap: Heap,
+    /// The shared byte counters behind `erlang:statistics(io)` (see [`IoCounters`]).
+    ///
+    /// The runtime keeps a clone of this same [`Rc`], so the `statistics(io)` arm reads the
+    /// counters without borrowing this registry.
+    io_counters: Rc<IoCounters>,
 }
 
 impl PortRegistry {
@@ -428,7 +475,16 @@ impl PortRegistry {
             registry: IoPortRegistry::new(),
             meta: HashMap::new(),
             heap: Heap::new(PORT_HEAP_WORDS)?,
+            io_counters: Rc::new(IoCounters::default()),
         })
+    }
+
+    /// The shared I/O byte counters behind `erlang:statistics(io)` (see [`IoCounters`]).
+    ///
+    /// The runtime keeps a clone so its `statistics(io)` arm reads the counters without
+    /// borrowing this registry.
+    pub fn io_counters(&self) -> Rc<IoCounters> {
+        Rc::clone(&self.io_counters)
     }
 
     /// Registers `driver` as a new port and records its `port_info` `meta`.
@@ -483,6 +539,10 @@ impl PortRegistry {
         if !self.meta.contains_key(&id.number()) {
             return Err(BeamError::BadArg);
         }
+        // Every byte handed to a port counts as **output** for `erlang:statistics(io)`,
+        // whichever stream it goes to (the counters are bumped before the branch so a
+        // driver port and a child/`{fd,N}` port are counted alike).
+        self.io_counters.note_output(bytes.len());
         // A **C driver** port has no child pipe: `port_command` *is* the driver's own `output`
         // callback. `beam_io::PortRegistry::output` runs it inline, and the bytes the driver
         // answers with through `driver_output` are queued as this port's input for the next
@@ -656,6 +716,9 @@ impl PortRegistry {
                         // A notification for a port whose metadata is gone (closed while the
                         // task was queued) has no recipient and is dropped.
                         if let Some(meta) = self.meta.get(&port.number()) {
+                            // Bytes a port produced are **input** for
+                            // `erlang:statistics(io)`, counted where they really arrive.
+                            self.io_counters.note_input(bytes.len());
                             events.push(PortEvent::Data {
                                 port,
                                 bytes,
@@ -709,6 +772,9 @@ impl PortRegistry {
                 continue;
             }
             if let Some(meta) = self.meta.get(&number) {
+                // Bytes a driver answered with are **input** for
+                // `erlang:statistics(io)`, counted where they are harvested.
+                self.io_counters.note_input(bytes.len());
                 events.push(PortEvent::Data {
                     port,
                     bytes,
@@ -2292,6 +2358,48 @@ mod tests {
         assert_badarg(fx.registry.borrow_mut().write_command(PortId::new(9), b"x"));
         fx.hook.close_port(port).expect("port_close/1");
         assert_badarg(fx.registry.borrow_mut().write_command(port, b"x"));
+    }
+
+    /// `erlang:statistics(io)` reads the port subsystem's own byte counters: `output` is what
+    /// `port_command/2,3` handed to a port's stream and `input` is what a port delivered back
+    /// as `{Port, {data, …}}`. Both are bumped at the real read/write sites, so a byte count
+    /// can never be a fabricated constant.
+    #[test]
+    fn the_io_counters_track_the_bytes_written_to_and_read_from_a_port() {
+        let mut fx = fixture();
+        // The runtime keeps a clone of the registry's counters; grab it before borrowing the
+        // registry mutably below.
+        let counters = fx.registry.borrow().io_counters();
+        assert_eq!(counters.bytes(), (0, 0), "a fresh runtime has moved no port bytes");
+
+        let name = fx.spawn("cat");
+        let port = fx
+            .hook
+            .open_port(name, NIL)
+            .expect("open_port({spawn, \"cat\"}, [])");
+        // `cat` echoes exactly what it is given, so the write and the echo are both
+        // observable through the runtime's own poller.
+        fx.registry
+            .borrow_mut()
+            .write_command(port, b"hello")
+            .expect("port_command");
+        assert_eq!(
+            counters.bytes(),
+            (0, 5),
+            "the write is `output`; nothing has been read back yet"
+        );
+        let echo = pump_data(&mut fx.registry.borrow_mut(), port);
+        assert_eq!(&echo, b"hello");
+        assert_eq!(
+            counters.bytes(),
+            (5, 5),
+            "the echo `cat` produced is `input`"
+        );
+
+        // A rejected write moves nothing: the counters are bumped only after the port is
+        // resolved.
+        assert_badarg(fx.registry.borrow_mut().write_command(PortId::new(9), b"x"));
+        assert_eq!(counters.bytes(), (5, 5));
     }
 
     #[test]

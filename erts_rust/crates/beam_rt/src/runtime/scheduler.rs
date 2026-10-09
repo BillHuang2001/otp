@@ -522,7 +522,14 @@ impl Runtime {
                 scheduler.run_ready(&mut table, &mut runner, budget)
             };
             match slices {
-                Ok(executed) => ran += executed,
+                Ok(executed) => {
+                    ran += executed;
+                    // Each executed slice is one process the scheduler switched to: credit it to
+                    // the node-global context-switch counter behind
+                    // `erlang:statistics(context_switches)` (see
+                    // `Runtime::note_context_switches`).
+                    self.note_context_switches(executed);
+                }
                 Err(err) => break Err(err),
             }
             // The port-monitor half of the exit obligation: a process that died in the slices

@@ -694,6 +694,20 @@ impl<'a> RuntimeHooksBridge<'a> {
             // answer is therefore the exact one to give, not a substitute for a missing
             // measurement (`tests/runtime_hooks.rs` pins it against the live oracle).
             "scheduler_wall_time" => atom_term(atoms, "undefined"),
+            // The three `{Total, SinceLast}` counter pairs, read from the runtime's own real
+            // cumulative counters (`SinceLast` is the delta since the previous read of this
+            // same key — see `Runtime::reductions_statistics`).
+            "reductions" => counter_pair(heap, self.runtime.reductions_statistics(false)),
+            "exact_reductions" => counter_pair(heap, self.runtime.reductions_statistics(true)),
+            "context_switches" => counter_pair(heap, self.runtime.context_switch_statistics()),
+            // `{{input, BytesIn}, {output, BytesOut}}` from the port subsystem's own byte
+            // counters — the bytes this runtime really read from and wrote to its ports.
+            "io" => {
+                let (input, output) = self.runtime.io_statistics();
+                let in_pair = heap.tuple(&[atom_term(atoms, "input")?, small_u64(input)])?;
+                let out_pair = heap.tuple(&[atom_term(atoms, "output")?, small_u64(output)])?;
+                heap.tuple(&[in_pair, out_pair])
+            }
             other if STATISTICS_KEYS.contains(&other) => Err(error::unsupported(&format!(
                 "erlang:statistics/1: the `{other}` counter is not implemented"
             ))),
@@ -874,8 +888,8 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
 /// The list exists to tell a **valid** key this runtime cannot measure (the honest typed
 /// capability gap, [`RuntimeHooksBridge::statistics`]) from a name that is not a statistics
 /// key at all (the oracle's `badarg`) — the only two answers, since a fabricated figure is
-/// never acceptable (workspace `CONTEXT.md` §3). A key this runtime *does* serve is handled
-/// by its own arm above and must **not** appear here.
+/// never acceptable (workspace `CONTEXT.md` §3). A key this runtime *does* serve has its own
+/// arm in [`RuntimeHooksBridge::statistics`] and must **not** appear here.
 const STATISTICS_KEYS: &[&str] = &[
     "scheduler_wall_time_all",
     "total_active_tasks",
@@ -887,14 +901,27 @@ const STATISTICS_KEYS: &[&str] = &[
     "active_tasks_all",
     "run_queue_lengths_all",
     "microstate_accounting",
-    "context_switches",
     "garbage_collection",
-    "reductions",
-    "exact_reductions",
     "runtime",
-    "io",
     "run_queues",
 ];
+
+/// The `{Total, SinceLast}` pair of small integers the three counter keys answer with.
+///
+/// # Errors
+///
+/// Propagates the heap's failure when the tuple cannot be built.
+fn counter_pair(heap: &mut Heap, (total, since): (u64, u64)) -> Result<Eterm> {
+    heap.tuple(&[small_u64(total), small_u64(since)])
+}
+
+/// `value` as a small-integer term, saturated at `i64::MAX`.
+///
+/// A counter is `u64` so it can never wrap, while a term's small integer is signed; the
+/// saturation keeps the conversion total without ever trapping.
+fn small_u64(value: u64) -> Eterm {
+    make_small(i64::try_from(value).unwrap_or(i64::MAX))
+}
 
 thread_local! {
     /// The wall-clock anchor and the previous `statistics(wall_clock)` read, in one slot.
