@@ -508,10 +508,10 @@ dominates the small shapes.)
 - `src/error.rs` → `pub(crate)` copy-failure constructors + the public `is_message_heap_exhaustion` predicate (no new error type)
 - `tests/copy.rs` → flat-copy correctness: nested-graph equality, deep list, literal sharing, MSO refcount, exhaustion, HAMT trie
 - `tests/classes.rs` → term-class completeness across every copyable class
-- `tests/guards.rs` → non-term/cycle guards + the destination-relocation invariant
-- `tests/sizing.rs` → sized-then-copied exactness + too-small-reservation refusal
+- `tests/guards.rs` → non-term/cycle guards + the destination-relocation invariant (incl. a `SUB_BITS` match context)
+- `tests/sizing.rs` → sized-then-copied exactness (incl. the `SUB_BITS` match-context shape) + too-small-reservation refusal
 - `tests/share.rs` → sharing-preserving evidence: N-fold subterm, structural equality, no-sharing size, shared MSO identity
-- `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value
+- `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value + `SUB_BITS` match-context flattening (no source aliasing)
 - `tests/external.rs` → external pid/port/ref verbatim copy + node linkage/refcounting
 - `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path + send atomicity
 - `tests/fun.rs` → closure copy correctness: `make_fun`/`make_fun3` blocks sized/walked from the frozen `beam_term::fun` layout, `=:=` equality, byte-identical `NEW_FUN_EXT`, callability, `env[0]` fix-up
