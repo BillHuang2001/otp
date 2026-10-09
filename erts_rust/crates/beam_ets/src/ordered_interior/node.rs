@@ -110,6 +110,12 @@ impl BranchNode {
     }
 
     /// `keys[idx]`, the exact greatest key of `children[idx]`'s subtree.
+    ///
+    /// Test-only: the tree's own descents compare separators through
+    /// [`NodeStore::subtree_max_key`] or inside [`child_index`]'s binary search and
+    /// never read a stored separator back, so this accessor exists for the
+    /// invariant checker ([`super::Tree::check_invariants`]).
+    #[cfg(test)]
     pub(crate) fn separator(&self, idx: usize) -> Eterm {
         self.keys
             .get(idx)
@@ -171,26 +177,6 @@ impl Node {
         match self {
             Node::Leaf(leaf) => leaf.entries.len(),
             Node::Branch(branch) => branch.children.len(),
-        }
-    }
-
-    /// The greatest key in this node's own arrays (`entries.last()` / `keys.last()`).
-    ///
-    /// Infallible: the tree never stores an empty node — a node is created either
-    /// as a one-entry root leaf or as half of an over-full node — so the `expect`s
-    /// guard an internal invariant, never runtime input.
-    pub(crate) fn max_key(&self) -> Eterm {
-        match self {
-            Node::Leaf(leaf) => leaf
-                .entries
-                .last()
-                .map(|entry| entry.key)
-                .expect("a leaf is never empty"),
-            Node::Branch(branch) => branch
-                .keys
-                .last()
-                .copied()
-                .expect("a branch is never childless"),
         }
     }
 
@@ -283,6 +269,40 @@ impl NodeStore {
         match self.slot_mut(id) {
             Node::Branch(branch) => branch,
             Node::Leaf(_) => unreachable!("a branch id from the tree names a branch"),
+        }
+    }
+
+    /// The greatest key of the subtree rooted at `id`, as a **live** term: the
+    /// rightmost leaf's last entry key.
+    ///
+    /// Every separator materialised by the tree must go through this, never through
+    /// a branch's stored `keys.last()`: a separator is the maximum of a child
+    /// subtree, and the *stored* separator aliases the key element of the object
+    /// that established that maximum. Replacing that object (`ets:insert` upsert)
+    /// reclaims its table-owned storage, so the stored separator term would then read
+    /// a later, reused word as a different key and misroute the search. A leaf entry
+    /// key always aliases the live table-owned object it sits in, so descending to
+    /// the rightmost leaf yields a term that cannot go stale. Cost is the tree depth.
+    pub(crate) fn subtree_max_key(&self, id: NodeId) -> Eterm {
+        let mut cursor = id;
+        loop {
+            match self.node(cursor) {
+                Node::Leaf(leaf) => {
+                    return leaf
+                        .entries
+                        .last()
+                        .map(|entry| entry.key)
+                        .expect("a leaf is never empty");
+                }
+                Node::Branch(branch) => {
+                    // A branch always has at least one child (invariant 1).
+                    cursor = branch
+                        .children
+                        .last()
+                        .copied()
+                        .expect("a branch is never childless");
+                }
+            }
         }
     }
 
@@ -385,18 +405,45 @@ pub(crate) fn search_entries(entries: &[Entry], key: Eterm, atoms: &AtomTable) -
 /// maximum is `>= key` in **arithmetic** key order (every later child holds
 /// strictly greater keys), or its last child when `key` exceeds all separators.
 ///
+/// The separators are strictly ascending in `cmp_arith` (invariant 1), so the
+/// first one that is not `< key` is the **lower bound** of `key` among them,
+/// found by a binary search rather than a linear scan: this is the tree's hottest
+/// helper (every descent step of every lookup/insert/delete/navigation calls it)
+/// and the scan was `O(ORDER)` — up to 32 `cmp_arith` calls — per level, while a
+/// `set`/`ordered_set` lookup only needs `O(log ORDER)`. `cmp_arith` is exactly
+/// the comparator the leaf search ([`search_entries`]) already binary-searches
+/// with, so the two stay consistent by construction. Clamping the result to the
+/// last child covers "`key` exceeds every separator". The comparator is only
+/// well-defined as a *total* order on the stored keys, which is what invariant 1
+/// asserts.
+///
 /// Infallible: a branch always has at least one child.
 pub(crate) fn child_index(branch: &BranchNode, key: Eterm, atoms: &AtomTable) -> usize {
-    for idx in 0..branch.keys.len() {
-        if cmp_arith(branch.separator(idx), key, atoms) != Ordering::Less {
-            return idx;
-        }
-    }
-    branch
+    let keys = &branch.keys;
+    let last = branch
         .children
         .len()
         .checked_sub(1)
-        .expect("a branch is never childless")
+        .expect("a branch is never childless");
+    // A hand-written lower bound rather than `slice::binary_search_by`: the loop
+    // keeps `lo`/`count` in registers and calls `cmp_arith` directly, with no
+    // closure and no `Ok`/`Err` round trip. The invariant is that every index
+    // below `lo` is `< key` and every index at or above `lo + count` is `>= key`,
+    // so the loop settles on the first `>= key` position (or `len` when `key`
+    // exceeds every separator).
+    let mut lo = 0usize;
+    let mut count = keys.len();
+    while count != 0 {
+        let step = count / 2;
+        let mid = lo + step;
+        if cmp_arith(keys[mid], key, atoms) == Ordering::Less {
+            lo = mid + 1;
+            count -= step + 1;
+        } else {
+            count = step;
+        }
+    }
+    lo.min(last)
 }
 
 /// The number of `Eterm`-sized words a value of type `T` occupies (rounded up).

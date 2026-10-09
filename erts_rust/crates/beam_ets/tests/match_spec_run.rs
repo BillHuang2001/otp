@@ -41,8 +41,11 @@ use beam_term::prelude::*;
 fn atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
     for name in [
-        "_", "$_", "$$", "$1", "$2", "$3", "true", "false", "foo", "a", "b", "c", "d", "x", "y",
-        "ok", ">", "<", "andalso", "is_integer",
+        "_", "$_", "$$", "$0", "$1", "$2", "$3", "$5", "$x", "true", "false", "foo", "a", "b", "c",
+        "d", "x", "y", "ok", ">", "<", "=:=", "=/=", "==", "=<", ">=", "andalso", "orelse",
+        "or", "not", "const", "hd", "tl", "length", "abs", "size", "element", "self", "is_integer",
+        "is_float", "is_number", "is_atom", "is_list", "is_tuple", "is_binary", "is_bitstring",
+        "is_map",
     ] {
         atoms.intern(name);
     }
@@ -51,6 +54,17 @@ fn atoms() -> AtomTable {
 
 fn at(atoms: &AtomTable, name: &str) -> Eterm {
     make_atom(atoms.lookup(name).expect("interned by `atoms`"))
+}
+
+/// [`atoms`] plus the `EXIT` atom a failed match-spec *body* expression is replaced
+/// by (`exec::exit_term` — the C `FAIL_TERM`). `EXIT` is kept out of the shared
+/// [`atoms`] because the crate reports a typed `badarg` capability gap when the
+/// caller's table has not interned it; a real runtime always interns it
+/// (`beam_rt::boot::CORE_ATOMS`).
+fn atoms_with_exit() -> AtomTable {
+    let mut atoms = atoms();
+    let _ = atoms.intern("EXIT");
+    atoms
 }
 
 fn tup(heap: &mut Heap, elements: &[Eterm]) -> Eterm {
@@ -681,4 +695,531 @@ fn fun2ms_whole_object_body_returns_each_matching_element() {
         tup(&mut heap, &[make_small(5), make_small(10)]),
     ];
     assert_terms_eq(&got, &want, &atoms);
+}
+
+// ===========================================================================
+// Guard/body construct completeness over `match_spec_run/2`
+//
+// Same oracle and same convention as the rest of this file: every expectation is
+// the system `erl`'s (OTP 29 / erts-17.1), probed by wrapping the raw clause list
+// in `ets:match_spec_compile/1` (the oracle's `ets:match_spec_run/2` requires a
+// compiled spec), with the probe result quoted beside the assertion.
+// ===========================================================================
+
+/// Compile a one-clause `{Head, Guards, Body}` spec and run it over `input`.
+///
+/// (A helper rather than a `match_spec_run(input, spec1(&mut heap, head, …), …)`
+/// call, which cannot borrow the heap twice at once.)
+fn run_one(
+    input: Eterm,
+    head: Eterm,
+    guards: &[Eterm],
+    body: &[Eterm],
+    atoms: &AtomTable,
+    heap: &mut Heap,
+) -> beam_common::Result<Vec<Eterm>> {
+    let spec = spec1(heap, head, guards, body);
+    match_spec_run(input, spec, atoms, heap)
+}
+
+/// A float term on the test heap (the exact-versus-arithmetic comparison probe).
+fn float(heap: &mut Heap, value: f64) -> Eterm {
+    // SAFETY: `alloc_words(2)` hands back the two exclusively-owned, writable words a
+    // float occupies (`[HEADER_FLONUM, bits]`); `write_float` writes both before the
+    // term escapes, and the heap outlives it (it is never reset here).
+    unsafe {
+        let words = heap.alloc_words(2).expect("test heap has room for a float");
+        write_float(words, value)
+    }
+}
+
+/// A flat-map (`#{…}`, at most `MAP_SMALL_MAP_LIMIT` keys) term on the test heap.
+fn flat_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) -> Eterm {
+    let words = map_words_capacity(pairs.len());
+    // SAFETY: `alloc_words(map_words_capacity(len))` reserves the exact upper bound
+    // `write_map` writes; every returned word is written by the call and the heap
+    // outlives the term (it is never reset here).
+    unsafe {
+        let hp = heap
+            .alloc_words(words)
+            .expect("test heap has room for a map");
+        write_map(hp, pairs, atoms).expect("a well-formed flat map")
+    }
+}
+
+#[test]
+fn guard_connectives_short_circuit_versus_strict_filter_a_run() {
+    // erl:
+    //   [{'$1',[{'andalso',{'>','$1',1},{'<','$1',10}}],['$1']}]
+    //       over [1,3,5,10] -> [3,5]
+    //   [{'$1',[{'orelse',{'<','$1',2},{'>','$1',9}}],['$1']}]
+    //       over [1,3,5,10] -> [1,10]
+    //   [{'$1',[{'not',{'<','$1',2}}],['$1']}] over [1,3] -> [3]
+    //   [{'$1',[{'or',true,{'hd',5}}],['$1']}] over [1,3] -> []
+    //       (`or` is STRICT: it evaluates the raising operand, so no element matches)
+    //   [{'$1',[{'orelse',true,{'hd',5}}],['$1']}] over [1,3] -> [1,3]
+    //       (`orelse` short-circuits at `true` and never evaluates the raise)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = at(&atoms, "$1");
+
+    let input = list(
+        &mut heap,
+        &[make_small(1), make_small(3), make_small(5), make_small(10)],
+    );
+    let v = at(&atoms, "$1");
+
+    let greater = tup(&mut heap, &[at(&atoms, ">"), v, make_small(1)]);
+    let less_ten = tup(&mut heap, &[at(&atoms, "<"), v, make_small(10)]);
+    let conjunction = tup(&mut heap, &[at(&atoms, "andalso"), greater, less_ten]);
+    let got = run_one(input, head, &[conjunction], &[v], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[make_small(3), make_small(5)], &atoms);
+
+    let less_two = tup(&mut heap, &[at(&atoms, "<"), v, make_small(2)]);
+    let greater_nine = tup(&mut heap, &[at(&atoms, ">"), v, make_small(9)]);
+    let disjunction = tup(&mut heap, &[at(&atoms, "orelse"), less_two, greater_nine]);
+    let got = run_one(input, head, &[disjunction], &[v], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[make_small(1), make_small(10)], &atoms);
+
+    let small = list(&mut heap, &[make_small(1), make_small(3)]);
+    let less_two = tup(&mut heap, &[at(&atoms, "<"), v, make_small(2)]);
+    let negation = tup(&mut heap, &[at(&atoms, "not"), less_two]);
+    let got = run_one(small, head, &[negation], &[v], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[make_small(3)], &atoms);
+
+    let raising = tup(&mut heap, &[at(&atoms, "hd"), make_small(5)]);
+    let strict_or = tup(
+        &mut heap,
+        &[at(&atoms, "or"), at(&atoms, "true"), raising],
+    );
+    let got = run_one(small, head, &[strict_or], &[v], &atoms, &mut heap).unwrap();
+    assert!(
+        got.is_empty(),
+        "`or` is strict and the raising operand fails every clause"
+    );
+
+    let raising = tup(&mut heap, &[at(&atoms, "hd"), make_small(5)]);
+    let short = tup(
+        &mut heap,
+        &[at(&atoms, "orelse"), at(&atoms, "true"), raising],
+    );
+    let got = run_one(small, head, &[short], &[v], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[make_small(1), make_small(3)], &atoms);
+}
+
+#[test]
+fn comparisons_are_exact_versus_arithmetic_over_a_run() {
+    // erl on `[1, 1.0]` with guard `{Op,'$1',1}` and body `['$1']`:
+    //   '=:=' -> [1]      '=/=' -> [1.0]     '==' -> [1,1.0]
+    //   '=<'  -> [1,1.0]  '>='  -> [1,1.0]   '<'  -> []     '>'  -> []
+    // (`=:=`/`=/=` are exact, so the float `1.0` differs from the integer `1`; the
+    //  arithmetic family treats them as equal, per `beam_term::compare`.)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = at(&atoms, "$1");
+    let v = at(&atoms, "$1");
+    let one_point_zero = float(&mut heap, 1.0);
+    let input = list(&mut heap, &[make_small(1), one_point_zero]);
+
+    for (op, expected) in [
+        ("=:=", vec![OneOrFloat::Int]),
+        ("=/=", vec![OneOrFloat::Float]),
+        ("==", vec![OneOrFloat::Int, OneOrFloat::Float]),
+        ("=<", vec![OneOrFloat::Int, OneOrFloat::Float]),
+        (">=", vec![OneOrFloat::Int, OneOrFloat::Float]),
+        ("<", vec![]),
+        (">", vec![]),
+    ] {
+        let comparison = tup(
+            &mut heap,
+            &[at(&atoms, op), v, make_small(1)],
+        );
+        let got = run_one(input, head, &[comparison], &[v], &atoms, &mut heap).unwrap();
+        let want: Vec<Eterm> = expected
+            .iter()
+            .map(|which| match which {
+                OneOrFloat::Int => make_small(1),
+                OneOrFloat::Float => one_point_zero,
+            })
+            .collect();
+        assert_terms_eq(&got, &want, &atoms);
+    }
+}
+
+/// One of the two comparison operands in [`comparisons_are_exact_versus_arithmetic_over_a_run`].
+#[derive(Clone, Copy)]
+enum OneOrFloat {
+    Int,
+    Float,
+}
+
+#[test]
+fn type_tests_and_guard_bifs_filter_a_run() {
+    // erl:
+    //   [{'$1',[{is_integer,'$1'}],['$1']}] over [1,a,2,1.0] -> [1,2]
+    //   [{'$1',[{is_float,'$1'}],['$1']}]   over [1,a,2,1.0] -> [1.0]
+    //   [{'$1',[{is_number,'$1'}],['$1']}]  over [1,a,2,1.0] -> [1,2,1.0]
+    //   [{'$1',[{is_atom,'$1'}],['$1']}]    over [1,a,2]     -> [a]
+    //   [{'$1',[{is_list,'$1'}],['$_']}]    over [[1,2],{1}] -> [[1,2]]
+    //   [{'$1',[{is_tuple,'$1'}],['$_']}]   over [[1,2],{1}] -> [{1}]
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = at(&atoms, "$1");
+    let v = at(&atoms, "$1");
+
+    let one_point_zero = float(&mut heap, 1.0);
+    let mixed = list(
+        &mut heap,
+        &[make_small(1), at(&atoms, "a"), make_small(2), one_point_zero],
+    );
+    for (test, want) in [
+        (
+            "is_integer",
+            vec![make_small(1), make_small(2)],
+        ),
+        ("is_float", vec![one_point_zero]),
+        (
+            "is_number",
+            vec![make_small(1), make_small(2), one_point_zero],
+        ),
+    ] {
+        let guard = tup(&mut heap, &[at(&atoms, test), v]);
+        let got = run_one(mixed, head, &[guard], &[v], &atoms, &mut heap).unwrap();
+        assert_terms_eq(&got, &want, &atoms);
+    }
+    let atoms_only = list(&mut heap, &[make_small(1), at(&atoms, "a"), make_small(2)]);
+    let guard = tup(&mut heap, &[at(&atoms, "is_atom"), v]);
+    let got = run_one(atoms_only, head, &[guard], &[v], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[at(&atoms, "a")], &atoms);
+
+    let inner = list(&mut heap, &[make_small(1), make_small(2)]);
+    let one_tuple = tup(&mut heap, &[make_small(1)]);
+    let shapes = list(&mut heap, &[inner, one_tuple]);
+    let guard = tup(&mut heap, &[at(&atoms, "is_list"), v]);
+    let got = run_one(shapes, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[inner], &atoms);
+    let guard = tup(&mut heap, &[at(&atoms, "is_tuple"), v]);
+    let got = run_one(shapes, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[one_tuple], &atoms);
+
+    // Guard BIFs, each as an `=`/`=:=` comparison to a constant:
+    //   {'=:=',{'length','$1'},3}       over [[1,2,3],[4,5]]   -> [[1,2,3]]
+    //   {'=:=',{'hd','$1'},7}           over [[7,8],[9,8]]     -> [[7,8]]
+    //   {'=:=',{'tl','$1'},[8]}         over [[7,8],[9,8]]     -> [[7,8],[9,8]]
+    //   {'=:=',{abs,'$1'},7}            over [-7,7]            -> [-7,7]
+    //   {'=:=',{'size','$1'},2}         over [{a,b},{a,b,c}]   -> [{a,b}]
+    //   {'=:=',{'element',2,'$1'},b}    over [{a,b},{c,d}]     -> [{a,b}]
+    let three = list(&mut heap, &[make_small(1), make_small(2), make_small(3)]);
+    let two = list(&mut heap, &[make_small(4), make_small(5)]);
+    let lists = list(&mut heap, &[three, two]);
+    let length_call = tup(&mut heap, &[at(&atoms, "length"), v]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), length_call, make_small(3)]);
+    let got = run_one(lists, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[three], &atoms);
+
+    let pair_a = list(&mut heap, &[make_small(7), make_small(8)]);
+    let pair_b = list(&mut heap, &[make_small(9), make_small(8)]);
+    let pairs = list(&mut heap, &[pair_a, pair_b]);
+    let hd_call = tup(&mut heap, &[at(&atoms, "hd"), v]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), hd_call, make_small(7)]);
+    let got = run_one(pairs, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[pair_a], &atoms);
+
+    let tl_call = tup(&mut heap, &[at(&atoms, "tl"), v]);
+    let tail_only = list(&mut heap, &[make_small(8)]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), tl_call, tail_only]);
+    let got = run_one(pairs, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    // Both pairs end in `[8]`, so the guard matches both (oracle:
+    // `{'=:=',{'tl','$1'},[8]}` over `[[7,8],[9,8]]` -> `[[7,8],[9,8]]`).
+    assert_terms_eq(&got, &[pair_a, pair_b], &atoms);
+
+    let signed = list(&mut heap, &[make_small(-7), make_small(7)]);
+    let abs_call = tup(&mut heap, &[at(&atoms, "abs"), v]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), abs_call, make_small(7)]);
+    let got = run_one(signed, head, &[guard], &[v], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[make_small(-7), make_small(7)], &atoms);
+
+    let two_tuple = tup(&mut heap, &[at(&atoms, "a"), at(&atoms, "b")]);
+    let three_tuple = tup(
+        &mut heap,
+        &[at(&atoms, "a"), at(&atoms, "b"), at(&atoms, "c")],
+    );
+    let tuples = list(&mut heap, &[two_tuple, three_tuple]);
+    let size_call = tup(&mut heap, &[at(&atoms, "size"), v]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), size_call, make_small(2)]);
+    let got = run_one(tuples, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[two_tuple], &atoms);
+
+    let c_d = tup(&mut heap, &[at(&atoms, "c"), at(&atoms, "d")]);
+    let c_d_pair = list(&mut heap, &[two_tuple, c_d]);
+    let element_call = tup(
+        &mut heap,
+        &[at(&atoms, "element"), make_small(2), v],
+    );
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, "=:="), element_call, at(&atoms, "b")],
+    );
+    let got = run_one(c_d_pair, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[two_tuple], &atoms);
+}
+
+#[test]
+fn const_yields_its_argument_in_a_run() {
+    // erl:
+    //   [{'$1',[{'=:=',{const,5},5}],['$1']}] over [foo,1] -> [foo,1]
+    //   [{'$1',[],[{const,ok}]}]               over [foo,1] -> [ok,ok]
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = at(&atoms, "$1");
+    let v = at(&atoms, "$1");
+    let input = list(&mut heap, &[at(&atoms, "foo"), make_small(1)]);
+
+    let constant = tup(&mut heap, &[at(&atoms, "const"), make_small(5)]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), constant, make_small(5)]);
+    let got = run_one(input, head, &[guard], &[v], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[at(&atoms, "foo"), make_small(1)], &atoms);
+
+    let constant = tup(&mut heap, &[at(&atoms, "const"), at(&atoms, "ok")]);
+    let got = run_one(input, head, &[], &[constant], &atoms, &mut heap).unwrap();
+    assert_terms_eq(
+        &got,
+        &[at(&atoms, "ok"), at(&atoms, "ok")],
+        &atoms,
+    );
+}
+
+#[test]
+fn a_failing_body_yields_exit_per_element_in_a_run() {
+    // erl:
+    //   [{'$1',[],[{'hd',5}]}]     over [1,2] -> ['EXIT','EXIT'] (the C `FAIL_TERM`)
+    //   [{'$1',[],[{'hd',5},7]}]   over [1,2] -> [7,7] (the failure is discarded; the
+    //                                                     last body expression supplies
+    //                                                     the clause's value)
+    let atoms = atoms_with_exit();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = at(&atoms, "$1");
+    let input = list(&mut heap, &[make_small(1), make_small(2)]);
+
+    let raising = tup(&mut heap, &[at(&atoms, "hd"), make_small(5)]);
+    let got = run_one(input, head, &[], &[raising], &atoms, &mut heap).unwrap();
+    assert_terms_eq(
+        &got,
+        &[at(&atoms, "EXIT"), at(&atoms, "EXIT")],
+        &atoms,
+    );
+
+    let raising = tup(&mut heap, &[at(&atoms, "hd"), make_small(5)]);
+    let got = run_one(input, head, &[], &[raising, make_small(7)], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[make_small(7), make_small(7)], &atoms);
+}
+
+#[test]
+fn dollar_zero_binds_and_a_malformed_dollar_atom_is_a_literal_in_a_run() {
+    // erl:
+    //   [{{'$0','_'},[],['$0']}]     over [{7,8}]     -> [7]     (`'$0'` IS variable 0)
+    //   [{{'$x','_'},[],['$_']}]     over [{9,10}]    -> []      (an ordinary literal atom)
+    //   [{{'$1','$x'},[],['$1']}]    over [{9,'$x'}]  -> [9]     (the literal matches)
+    //   [{'$1',[],['$x']}]           over [1]         -> ['$x']  (a literal, not a variable)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let object = tup(&mut heap, &[make_small(7), make_small(8)]);
+    let head = tup(&mut heap, &[at(&atoms, "$0"), at(&atoms, "_")]);
+    let got = run_one(
+        list(&mut heap, &[object]),
+        head,
+        &[],
+        &[at(&atoms, "$0")],
+        &atoms,
+        &mut heap,
+    )
+    .unwrap();
+    assert_terms_eq(&got, &[make_small(7)], &atoms);
+
+    let object = tup(&mut heap, &[make_small(9), make_small(10)]);
+    let head = tup(&mut heap, &[at(&atoms, "$x"), at(&atoms, "_")]);
+    let got = run_one(
+        list(&mut heap, &[object]),
+        head,
+        &[],
+        &[at(&atoms, "$_")],
+        &atoms,
+        &mut heap,
+    )
+    .unwrap();
+    assert!(got.is_empty(), "'$x' is a literal atom that matches no tuple key");
+
+    let object = tup(&mut heap, &[make_small(9), at(&atoms, "$x")]);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$x")]);
+    let got = run_one(
+        list(&mut heap, &[object]),
+        head,
+        &[],
+        &[at(&atoms, "$1")],
+        &atoms,
+        &mut heap,
+    )
+    .unwrap();
+    assert_terms_eq(&got, &[make_small(9)], &atoms);
+
+    let got = run_one(
+        list(&mut heap, &[make_small(1)]),
+        at(&atoms, "$1"),
+        &[],
+        &[at(&atoms, "$x")],
+        &atoms,
+        &mut heap,
+    )
+    .unwrap();
+    assert_terms_eq(
+        &got,
+        &[at(&atoms, "$x")],
+        &atoms,
+    );
+}
+
+#[test]
+fn improper_and_nested_repeated_head_patterns_bind_in_a_run() {
+    // erl:
+    //   [{[10,20|'$1'],[],['$1']}]  over [[10,20,30]]   -> [[30]]
+    //       (an improper LIST head is allowed; `'$1'` binds the tail)
+    //   [{{'$1','$1'},[],['$1']}]   over [{7,7},{5,8}]  -> [7]
+    //       (a repeated `'$N'` inside a nested tuple enforces equality)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    let elements = list(&mut heap, &[make_small(10), make_small(20), make_small(30)]);
+    let head = heap.cons(make_small(20), at(&atoms, "$1")).expect("heap");
+    let head = heap.cons(make_small(10), head).expect("heap");
+    let got = run_one(
+        list(&mut heap, &[elements]),
+        head,
+        &[],
+        &[at(&atoms, "$1")],
+        &atoms,
+        &mut heap,
+    )
+    .unwrap();
+    let want = list(&mut heap, &[make_small(30)]);
+    assert_terms_eq(&got, &[want], &atoms);
+
+    let equal = tup(&mut heap, &[make_small(7), make_small(7)]);
+    let unequal = tup(&mut heap, &[make_small(5), make_small(8)]);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$1")]);
+    let got = run_one(
+        list(&mut heap, &[equal, unequal]),
+        head,
+        &[],
+        &[at(&atoms, "$1")],
+        &atoms,
+        &mut heap,
+    )
+    .unwrap();
+    assert_terms_eq(&got, &[make_small(7)], &atoms);
+}
+
+#[test]
+fn construct_bodies_build_fresh_terms_per_element_in_a_run() {
+    // erl:
+    //   [{{'$1','$2'},[],[{{'$2','$1'}}]}] over [{1,2}] -> [{2,1}]
+    //   [{{'$1','$2'},[], [['$1','$2']]}]  over [{1,2}] -> [[1,2]]
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let object = tup(&mut heap, &[make_small(1), make_small(2)]);
+
+    let swapped = tup(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$1")]);
+    let body_element = tup(&mut heap, &[swapped]);
+    let got = run_one(
+        list(&mut heap, &[object]),
+        head,
+        &[],
+        &[body_element],
+        &atoms,
+        &mut heap,
+    )
+    .unwrap();
+    let want = tup(&mut heap, &[make_small(2), make_small(1)]);
+    assert_terms_eq(&got, &[want], &atoms);
+
+    let body_element = list(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let got = run_one(
+        list(&mut heap, &[object]),
+        head,
+        &[],
+        &[body_element],
+        &atoms,
+        &mut heap,
+    )
+    .unwrap();
+    let want = list(&mut heap, &[make_small(1), make_small(2)]);
+    assert_terms_eq(&got, &[want], &atoms);
+}
+
+#[test]
+fn an_unbound_variable_makes_the_run_badarg() {
+    // erl: `ets:match_spec_compile([{'$1',[{'=:=','$5',1}],['$1']}])` -> error:badarg;
+    //      `ets:match_spec_compile([{'$1',[],['$5']}])` likewise. The whole call is
+    //      `badarg` (the spec is rejected), so nothing runs.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = at(&atoms, "$1");
+    let input = list(&mut heap, &[make_small(1)]);
+
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), at(&atoms, "$5"), make_small(1)]);
+    assert!(
+        matches!(
+            run_one(input, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap),
+            Err(BeamError::BadArg)
+        ),
+        "an unbound guard variable is badarg"
+    );
+
+    let head = at(&atoms, "$1");
+    assert!(
+        matches!(
+            run_one(input, head, &[], &[at(&atoms, "$5")], &atoms, &mut heap),
+            Err(BeamError::BadArg)
+        ),
+        "an unbound body variable is badarg"
+    );
+}
+
+/// Two constructs that this crate's match-spec subset turns into a typed outcome but
+/// the system `erl` (OTP 29 / erts-17.1) accepts. They are **recorded divergences** —
+/// this crate is strictly *less* capable here — kept so the gap cannot silently change
+/// sign; each is reported to the source owner rather than asserted as oracle behaviour.
+#[test]
+fn documented_gaps_diverge_from_the_oracle_in_a_run() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = at(&atoms, "$1");
+    let input = list(&mut heap, &[make_small(1), make_small(2)]);
+
+    // 1. A map as a body *expression*. oracle:
+    //      `[{'$1',[],[#{a=>1}]}]` over `[1,2]` -> `[#{a=>1},#{a=>1}]`;
+    //    this crate's expression decoder is a documented `badarg` for a bare map.
+    let map = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
+    assert!(
+        matches!(
+            run_one(input, head, &[], &[map], &atoms, &mut heap),
+            Err(BeamError::BadArg)
+        ),
+        "DIVERGENCE: the oracle accepts a map body; this crate is documented `badarg`"
+    );
+
+    // 2. `self/0` has no process identity at this layer, so it raises and the clause is
+    //    skipped. oracle: `[{'$1',[{'=:=',{self},{self}}],['$1']}]` over `[1]` -> `[1]`.
+    let self_call = tup(&mut heap, &[at(&atoms, "self")]);
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, "=:="), self_call, self_call],
+    );
+    let one = list(&mut heap, &[make_small(1)]);
+    let got = run_one(one, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert!(
+        got.is_empty(),
+        "DIVERGENCE: the oracle matches `{{self}} =:= {{self}}`; this crate's `self/0` raises"
+    );
 }

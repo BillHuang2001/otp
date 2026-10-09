@@ -71,6 +71,10 @@ struct Entry {
 pub struct HashInterior {
     /// Which multi-object rules apply.
     kind: TableKind,
+    /// The 1-based key position, used to re-derive a surviving entry's stored key
+    /// from one of its objects (see [`Interior::delete_object`]). It is the only
+    /// thing this interior needs `keypos` for; `Table` owns the key-position rules.
+    keypos: usize,
     /// The bucket array.
     buckets: Vec<Vec<Entry>>,
     /// The total number of stored objects.
@@ -78,10 +82,25 @@ pub struct HashInterior {
 }
 
 impl HashInterior {
-    /// A new empty interior for the given (hash-indexed) `kind`.
+    /// A new empty interior for the given (hash-indexed) `kind`, with the default
+    /// key position (`1`).
+    ///
+    /// The degenerate `object == key` callers (unit tests, `interior_bench`) drive
+    /// the interior directly without a table, so the default keeps them working;
+    /// a [`Table`](crate::Table) always uses [`with_keypos`](HashInterior::with_keypos).
     pub fn new(kind: TableKind) -> HashInterior {
+        HashInterior::with_keypos(kind, 1)
+    }
+
+    /// A new empty interior for `kind` with an explicit 1-based `keypos`.
+    ///
+    /// `keypos` is remembered so [`Interior::delete_object`] can re-anchor a
+    /// surviving entry's stored key term to one of its remaining table-owned
+    /// objects. It never changes the index's shape or hashing.
+    pub fn with_keypos(kind: TableKind, keypos: usize) -> HashInterior {
         HashInterior {
             kind,
+            keypos,
             buckets: (0..INITIAL_BUCKETS).map(|_| Vec::new()).collect(),
             len: 0,
         }
@@ -320,13 +339,23 @@ impl Interior for HashInterior {
                 let entry = &mut self.buckets[bi][pos];
                 match self.kind {
                     // `set`/`ordered_set` keep at most one object per key.
-                    TableKind::Set | TableKind::OrderedSet => match entry.objs.first_mut() {
-                        Some(slot) => *slot = object,
-                        None => {
-                            entry.objs.push(object);
-                            self.len += 1;
+                    TableKind::Set | TableKind::OrderedSet => {
+                        match entry.objs.first_mut() {
+                            Some(slot) => *slot = object,
+                            None => {
+                                entry.objs.push(object);
+                                self.len += 1;
+                            }
                         }
-                    },
+                        // The replacement object now anchors the entry: re-point the
+                        // stored key term at the *incoming* object's own key element,
+                        // which the caller (`Table::insert_stored`) guarantees is a
+                        // term inside `object` (table-owned and live). Leaving the old
+                        // key — which aliased the object the caller is about to
+                        // reclaim — would make it dangle and later read a reused word
+                        // as a different term.
+                        entry.key = key;
+                    }
                     // `bag` keeps *distinct* objects: an identical object is a no-op.
                     TableKind::Bag => {
                         if entry.objs.iter().any(|o| eq(*o, object, atoms)) {
@@ -381,11 +410,23 @@ impl Interior for HashInterior {
     fn delete_object(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<()> {
         let bi = self.bucket_index(key, atoms);
         if let Some(pos) = Self::entry_pos(&self.buckets[bi], key, atoms) {
+            let keypos = self.keypos;
             let empty = {
                 let entry = &mut self.buckets[bi][pos];
                 let before = entry.objs.len();
+                let previous_key = entry.key;
                 entry.objs.retain(|o| !eq(*o, object, atoms));
                 self.len -= before - entry.objs.len();
+                if let Some(&survivor) = entry.objs.first() {
+                    // The entry survives on other objects. Its stored key may have
+                    // aliased the object just removed (which the caller is about to
+                    // reclaim), so re-anchor it to a surviving — hence live,
+                    // table-owned — object's own key element. In the degenerate
+                    // `object == key` callers (unit tests, `interior_bench`) the
+                    // object is not a tuple and `key_of` cannot derive a key; keep
+                    // the existing key term there.
+                    entry.key = key_of(survivor, keypos).unwrap_or(previous_key);
+                }
                 entry.objs.is_empty()
             };
             if empty {

@@ -94,6 +94,15 @@ pub(super) fn spec_for_pattern(
 /// A guard that raises makes its clause fail (mirroring the C `matchCatch`), while
 /// a **body** expression that raises at runtime is replaced by the atom `EXIT`
 /// and evaluation continues (the C `FAIL_TERM`) — see the body comment below.
+///
+/// # Host requirement: `EXIT` must be interned
+///
+/// The `FAIL_TERM` substitution resolves `EXIT` from the caller's [`AtomTable`]
+/// ([`exit_term`]); the C's `FAIL_TERM` is a **static atom that always exists**, so
+/// a host must **pre-intern `EXIT`** before running a spec whose body can raise.
+/// Every real runtime does (`beam_rt::boot::CORE_ATOMS` seeds it, among others). If
+/// it is not interned a raising body yields the typed `badarg` capability gap
+/// instead of the oracle's `EXIT` term — never a silently substituted atom.
 pub(super) fn run_clauses(
     spec: &MatchSpec,
     object: Eterm,
@@ -148,6 +157,12 @@ pub(super) fn run_clauses(
 /// `FAIL_TERM`). `badarg` when the caller's table has not interned it — the C's
 /// `FAIL_TERM` is a static atom that always exists, so an uninterned `EXIT` is a
 /// capability gap here, never a silently substituted atom.
+///
+/// # Host requirement
+///
+/// A host that runs any spec whose body can raise must pre-intern `EXIT` in the
+/// [`AtomTable`] it passes (see [`run_clauses`]); real runtimes do
+/// (`beam_rt::boot::CORE_ATOMS`).
 fn exit_term(atoms: &AtomTable) -> Result<Eterm> {
     atoms
         .lookup("EXIT")
@@ -198,6 +213,39 @@ impl Table {
     pub fn select(&self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>> {
         let mut selected = Vec::new();
         for object in self.tab2list() {
+            if let Some(value) = run_clauses(spec, object, atoms, heap)? {
+                selected.push(value.into_term(atoms)?);
+            }
+        }
+        Ok(selected)
+    }
+
+    /// The body value of every object the spec selects, visiting the table in the
+    /// **reverse** of [`Self::select`]'s iteration order (`ets:select_reverse/2`).
+    ///
+    /// The traversal order is exactly the reverse of [`Table::tab2list`]: for an
+    /// `ordered_set` that is **descending numeric key order** — verified against the
+    /// system `erl` (OTP 29 / erts-17.1), whose `ets:select_reverse(T, [{'$1',[],
+    /// ['$1']}])` on the `ordered_set` `{1,1}..{5,5}` returns
+    /// `[{5,5},{4,4},{3,3},{2,2},{1,1}]`. For the hash kinds (`set`/`bag`/
+    /// `duplicate_bag`) the forward order is deliberately unspecified, so the
+    /// reverse is a complete permutation of the same result multiset (the oracle
+    /// walks its internal index backwards; this crate walks the reverse of its own
+    /// forward order — the same "hash-kind order is unspecified" freedom documented
+    /// elsewhere).
+    ///
+    /// Otherwise identical to [`Self::select`]: fresh tuples/lists are built on
+    /// `heap`; a result that is `'$_'`, a variable or a constant aliases table or
+    /// spec storage; a body whose value is a boolean is rendered as the atom
+    /// `true`/`false`, which must be interned in `atoms`.
+    pub fn select_reverse(
+        &self,
+        spec: &MatchSpec,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<Vec<Eterm>> {
+        let mut selected = Vec::new();
+        for object in self.tab2list().into_iter().rev() {
             if let Some(value) = run_clauses(spec, object, atoms, heap)? {
                 selected.push(value.into_term(atoms)?);
             }

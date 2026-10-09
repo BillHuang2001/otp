@@ -1,3 +1,23 @@
+// %CopyrightBegin%
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright Ericsson AB 2025-2026. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// %CopyrightEnd%
+
 //! [`TableRead`] — a read guard that hands out lifetime-tagged terms.
 //!
 //! It owns the `RwLockReadGuard`, so every [`TableTerm`] it produces is valid for
@@ -57,6 +77,16 @@ impl<'g> TableRead<'g> {
     // ------------------------------------------------------------------ metadata
     //
     // All of these return owned, copyable data, so they may escape the view.
+
+    /// The underlying table, for the sibling traversal iterators in `view::iter`.
+    ///
+    /// `pub(super)`: the `view` module's own `iter` child is the only caller. It
+    /// hands out **no terms** — every key/object the iterators read is wrapped in a
+    /// [`TableTerm`] tagged to this view's borrow — and the table itself cannot
+    /// escape, because this method borrows `&self` (which owns the guard).
+    pub(super) fn table(&self) -> &Table {
+        &self.guard
+    }
 
     /// The table identifier.
     pub fn id(&self) -> TableId {

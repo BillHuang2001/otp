@@ -208,6 +208,13 @@ fn node_insert(
     match node {
         Node::Collision(col) => match col.entries.iter_mut().find(|s| eq(s.key, key, atoms)) {
             Some(slot) => {
+                // Re-point *both* the key term and the object (the hash already
+                // matches, an equal key hashing equally): a `set` upsert replaces the
+                // stored object and the caller then reclaims the replaced object's
+                // storage, so leaving the old key — which aliased that storage —
+                // would dangle. `key` is the incoming object's own key element, so it
+                // aliases the live object.
+                slot.key = key;
                 slot.object = object;
                 Upsert::Replaced
             }
@@ -234,6 +241,10 @@ fn bitmap_insert(
         let i = slot_index(bm.datamap, bit);
         let same_hash = bm.data[i].hash == hash;
         if same_hash && eq(bm.data[i].key, key, atoms) {
+            // As in the collision arm: re-point the key term at the incoming object
+            // (and keep the hash, which already matches) so the slot's key never
+            // aliases the object being replaced and reclaimed.
+            bm.data[i].key = key;
             bm.data[i].object = object;
             return Upsert::Replaced;
         }

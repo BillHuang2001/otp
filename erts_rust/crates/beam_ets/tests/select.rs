@@ -43,14 +43,31 @@ use beam_ets::select::expr::set_arith_hook;
 fn atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
     for name in [
-        "_", "$_", "$$", "$0", "$x", "$1", "$2", "$3", "true", "false", "ok", "x", "a", "b",
-        "element", "abs", "size", "hd", "tl", "length", "self", "andalso", "orelse", "not",
-        "is_integer", "is_atom", "is_boolean", "is_list", "is_number", "is_tuple", "is_foo",
-        "=:=", "=/=", "==", "/=", "<", "=<", ">", ">=",
-        "+", "-", "*", "/", "div", "rem", "band", "bor", "bxor", "bsl", "bsr",
+        "_", "$_", "$$", "$0", "$x", "$1", "$2", "$3", "true", "false", "ok", "x", "a", "b", "c",
+        "element", "abs", "size", "hd", "tl", "length", "self", "andalso", "orelse", "not", "and",
+        "or", "const", "is_integer", "is_atom", "is_boolean", "is_list", "is_number",
+        "is_tuple", "is_float", "is_map", "is_pid", "is_port", "is_reference", "is_function",
+        "is_binary", "is_bitstring", "is_foo", "=:=", "=/=", "==", "/=", "<", "=<", ">", ">=",
+        "+", "-", "*", "/", "div", "rem", "band", "bor", "bxor", "bsl", "bsr", "$", "$1x", "$01",
+        "$5",
     ] {
         atoms.intern(name);
     }
+    atoms
+}
+
+/// [`atoms`] plus the `EXIT` atom a failed match-spec *body* expression is replaced
+/// by (`exec::exit_term` — the C `FAIL_TERM`).
+///
+/// `EXIT` is deliberately **not** in the shared [`atoms`]: the crate reports the
+/// typed `badarg` capability gap when the caller's table has not interned it, and
+/// the pre-existing `arithmetic_outside_the_small_integer_subset_is_a_typed_error`
+/// pins that non-interned outcome for a body `{div,1,0}`/`{rem,1,0}` (see the note
+/// there). A real runtime always interns `EXIT` (`beam_rt::boot::CORE_ATOMS`), so
+/// the `EXIT`-body tests below use this table instead of perturbing the shared one.
+fn atoms_with_exit() -> AtomTable {
+    let mut atoms = atoms();
+    let _ = atoms.intern("EXIT");
     atoms
 }
 
@@ -1530,4 +1547,857 @@ fn fun2ms_filter_spec_drives_select_delete() {
     let remaining = table.tab2list();
     let want = object(&mut heap, 2, at(&atoms, "b"), 20);
     assert_terms(&remaining, &[want], &atoms, "the surviving object");
+}
+
+// ===========================================================================
+// Match-spec completeness battery
+//
+// Every expectation below is the system `erl`'s (OTP 29 / erts-17.1), probed with
+// `ets:select/2` (and, for the divergent gaps, `ets:match_spec_run/2`); the probe
+// result is quoted beside each assertion.
+// ===========================================================================
+
+/// A byte-aligned binary term on the test heap.
+fn binary(heap: &mut Heap, bytes: &[u8]) -> Eterm {
+    let words = heap_bits_size_words(bytes.len() * 8);
+    // SAFETY: `alloc_words(words)` hands back exactly the `heap_bits_size_words(n_bits)`
+    // words `write_binary` writes; the heap outlives the term (it is never reset here).
+    unsafe {
+        let hp = heap
+            .alloc_words(words)
+            .expect("test heap has room for a binary");
+        write_binary(hp, bytes).expect("a byte-aligned binary")
+    }
+}
+
+/// A flat-map (`#{…}`, at most [`MAP_SMALL_MAP_LIMIT`] keys) term on the test heap.
+fn flat_map(heap: &mut Heap, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) -> Eterm {
+    let words = map_words_capacity(pairs.len());
+    // SAFETY: `alloc_words(map_words_capacity(len))` reserves the exact upper bound
+    // `write_map` writes; every returned word is written by the call and the heap
+    // outlives the term.
+    unsafe {
+        let hp = heap.alloc_words(words).expect("test heap has room for a map");
+        write_map(hp, pairs, atoms).expect("a well-formed flat map")
+    }
+}
+
+/// The stored `{K,V,W}` objects reordered by their small-integer key (element 0), so a
+/// hash kind's unspecified iteration order can be compared as a value multiset.
+fn sorted_by_key(mut objects: Vec<Eterm>) -> Vec<Eterm> {
+    objects.sort_by_key(|object| {
+        // SAFETY: every element is a stored `{K,V,W}` tuple, so element 0 is live.
+        unsafe { signed_value(tuple_element(*object, 0)) }
+    });
+    objects
+}
+
+/// The `match/2` binding lists reordered by their small-integer key (the list head).
+fn sorted_bindings_by_key(mut bindings: Vec<Eterm>) -> Vec<Eterm> {
+    bindings.sort_by_key(|binding| {
+        // SAFETY: every element is a non-empty binding list built by `match/2`.
+        unsafe { signed_value(car(*binding)) }
+    });
+    bindings
+}
+
+#[test]
+fn guard_connectives_short_circuit_versus_strict_match_the_oracle() {
+    // oracle (OTP 29 / erts-17.1) on a 2-object `{1,10}`/`{2,20}` table, guard list `[G]`:
+    //   {'orelse',true,{'hd',5}}   -> both  (`orelse` short-circuits at `true`, so the
+    //                                        raising operand is never evaluated)
+    //   {'or',true,{'hd',5}}       -> []    (`or` is STRICT: it evaluates `{hd,5}`, which
+    //                                        raises, so the clause fails)
+    //   {'andalso',false,{'hd',5}} -> []    {'and',false,{'hd',5}} -> [] (both fail)
+    //   {'andalso',true,true} -> both       {'and',true,true} -> both
+    //   {'andalso',true,false} -> []        {'andalso',false,true} -> []
+    //   {'orelse',false,false} -> []        {'orelse',false,true} -> both
+    //   {'or',false,false} -> []            {'or',false,true} -> both
+    //   {'not',true} -> []                  {'not',false} -> both
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    table
+        .insert(tup(&mut heap, &[make_small(2), make_small(20)]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "_")]);
+    let body = [at(&atoms, "$_")];
+
+    let yes = || at(&atoms, "true");
+    let no = || at(&atoms, "false");
+    let raising = |heap: &mut Heap| call(heap, at(&atoms, "hd"), &[make_small(5)]);
+
+    let count = |heap: &mut Heap, guard: Eterm| -> usize {
+        select_one(&table, head, &[guard], &body, &atoms, heap)
+            .unwrap()
+            .len()
+    };
+
+    let t = at(&atoms, "true");
+    let f = at(&atoms, "false");
+    // `orelse` short-circuits; `or` is strict and meets the raise.
+    let raising_term = raising(&mut heap);
+    let g = call(&mut heap, at(&atoms, "orelse"), &[t, raising_term]);
+    assert_eq!(count(&mut heap, g), 2, "orelse short-circuits at true");
+    let raising_term = raising(&mut heap);
+    let g = call(&mut heap, at(&atoms, "or"), &[t, raising_term]);
+    assert_eq!(count(&mut heap, g), 0, "or is strict and the operand raises");
+    // `andalso`/`and` with a false first operand both fail the clause.
+    let raising_term = raising(&mut heap);
+    let g = call(&mut heap, at(&atoms, "andalso"), &[f, raising_term]);
+    assert_eq!(count(&mut heap, g), 0, "andalso false");
+    let raising_term = raising(&mut heap);
+    let g = call(&mut heap, at(&atoms, "and"), &[f, raising_term]);
+    assert_eq!(count(&mut heap, g), 0, "and false");
+    // Truth tables.
+    for (name, left, right, expected) in [
+        ("andalso", true, true, 2usize),
+        ("andalso", true, false, 0),
+        ("andalso", false, true, 0),
+        ("and", true, true, 2),
+        ("orelse", false, false, 0),
+        ("orelse", false, true, 2),
+        ("or", false, false, 0),
+        ("or", false, true, 2),
+    ] {
+        let l = if left { t } else { f };
+        let r = if right { t } else { f };
+        let g = call(&mut heap, at(&atoms, name), &[l, r]);
+        assert_eq!(count(&mut heap, g), expected, "{name}({left},{right})");
+    }
+    // `not/1`.
+    let g = call(&mut heap, at(&atoms, "not"), &[yes()]);
+    assert_eq!(count(&mut heap, g), 0, "not true");
+    let g = call(&mut heap, at(&atoms, "not"), &[no()]);
+    assert_eq!(count(&mut heap, g), 2, "not false");
+}
+
+#[test]
+fn comparison_operators_agree_on_exact_versus_arithmetic_for_int_and_float() {
+    // oracle on `{1,1}`/`{2,1.0}` (ordered_set), guard `{Op,'$2',1}` body `['$1']`:
+    //   '=:=' -> [1]    '=/=' -> [2]    '==' -> [1,2]   '/=' -> []
+    //   '<'   -> []     '=<'  -> [1,2]  '>'  -> []      '>=' -> [1,2]
+    // (`=:=`/`=/=` are exact, so the float `1.0` is distinct from the integer `1`; the
+    //  arithmetic family treats them as equal, per `beam_term::compare`.)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(1)]), &atoms)
+        .unwrap();
+    let one_point_zero = float(&mut heap, 1.0);
+    table
+        .insert(tup(&mut heap, &[make_small(2), one_point_zero]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+
+    for (op, expected) in [
+        ("=:=", vec![1i64]),
+        ("=/=", vec![2]),
+        ("==", vec![1, 2]),
+        ("/=", vec![]),
+        ("<", vec![]),
+        ("=<", vec![1, 2]),
+        (">", vec![]),
+        (">=", vec![1, 2]),
+    ] {
+        let guard = call(&mut heap, at(&atoms, op), &[at(&atoms, "$2"), make_small(1)]);
+        let got = select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap)
+            .unwrap();
+        let want: Vec<Eterm> = expected.iter().map(|k| make_small(*k)).collect();
+        assert_eq!(got, want, "operator {op}");
+    }
+}
+
+#[test]
+fn every_guard_type_test_matches_the_oracle() {
+    // oracle on `{1,a}`,`{2,7}`,`{3,1.5}`,`{4,{x}}`,`{5,[1,2]}`,`{6,<<"hi">>}`,
+    // `{7,#{a=>1}}`,`{8,true}` (ordered_set), guard `{Test,'$2'}` body `['$1']`:
+    //   is_atom -> [1,8]  is_integer -> [2]  is_float -> [3]  is_number -> [2,3]
+    //   is_tuple -> [4]   is_list -> [5]     is_binary -> [6] is_bitstring -> [6]
+    //   is_map -> [7]     is_boolean -> [8]
+    //   is_pid/is_port/is_reference/is_function -> [] (no stored term is one of those)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+
+    let atom_obj = tup(&mut heap, &[make_small(1), at(&atoms, "a")]);
+    let int_obj = tup(&mut heap, &[make_small(2), make_small(7)]);
+    let fractional = float(&mut heap, 1.5);
+    let float_obj = tup(&mut heap, &[make_small(3), fractional]);
+    let inner = tup(&mut heap, &[at(&atoms, "x")]);
+    let tuple_obj = tup(&mut heap, &[make_small(4), inner]);
+    let elements = list(&mut heap, &[make_small(1), make_small(2)]);
+    let list_obj = tup(&mut heap, &[make_small(5), elements]);
+    let bytes = binary(&mut heap, b"hi");
+    let binary_obj = tup(&mut heap, &[make_small(6), bytes]);
+    let map = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
+    let map_obj = tup(&mut heap, &[make_small(7), map]);
+    let bool_obj = tup(&mut heap, &[make_small(8), at(&atoms, "true")]);
+    for object in [
+        atom_obj, int_obj, float_obj, tuple_obj, list_obj, binary_obj, map_obj, bool_obj,
+    ] {
+        table.insert(object, &atoms).unwrap();
+    }
+
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    for (test, expected) in [
+        ("is_atom", vec![1i64, 8]),
+        ("is_integer", vec![2]),
+        ("is_float", vec![3]),
+        ("is_number", vec![2, 3]),
+        ("is_tuple", vec![4]),
+        ("is_list", vec![5]),
+        ("is_binary", vec![6]),
+        ("is_bitstring", vec![6]),
+        ("is_map", vec![7]),
+        ("is_boolean", vec![8]),
+        ("is_pid", vec![]),
+        ("is_port", vec![]),
+        ("is_reference", vec![]),
+        ("is_function", vec![]),
+    ] {
+        let guard = call(&mut heap, at(&atoms, test), &[at(&atoms, "$2")]);
+        let got = select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap)
+            .unwrap();
+        let want: Vec<Eterm> = expected.iter().map(|k| make_small(*k)).collect();
+        assert_eq!(got, want, "type test {test}");
+    }
+}
+
+#[test]
+fn guard_bifs_element_abs_size_hd_tl_length_match_the_oracle() {
+    // oracle on `{1,1}`/`{2,1.0}` (ordered_set):
+    //   {'=:=',{abs,'$2'},1}          -> [1] (`abs(1)` is 1; `abs(1.0)` is 1.0 and
+    //                                         `1.0 =:= 1` is false)
+    //   {'=:=',{'hd','$2'},1}         -> []  (hd/1 on an integer raises -> clause skipped)
+    //   {'=:=',{'tl','$2'},[]}        -> []  (tl/1 on an integer raises)
+    //   {'=:=',{'length','$2'},1}     -> []
+    //   {'=:=',{'size','$2'},1}       -> []
+    //   {'=:=',{'element',1,'$2'},1}  -> []  (element/2 on an integer raises)
+    //   {'=:=',{'size',{{'$1','$2'}}},2}              -> [1,2] (the rebuilt tuple is arity 2)
+    //   {'=:=',{'element',2,{{'$1','$2'}}},'$2'}      -> [1,2]
+    //   {'=:=',{'abs',-5},5}                          -> [1,2] (a constant small int)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(1)]), &atoms)
+        .unwrap();
+    let one_point_zero = float(&mut heap, 1.0);
+    table
+        .insert(tup(&mut heap, &[make_small(2), one_point_zero]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+
+    for (name, arg, rhs) in [
+        ("abs", at(&atoms, "$2"), make_small(1)),
+        ("hd", at(&atoms, "$2"), make_small(1)),
+        ("length", at(&atoms, "$2"), make_small(1)),
+    ] {
+        let call_term = call(&mut heap, at(&atoms, name), &[arg]);
+        let guard = tup(&mut heap, &[at(&atoms, "=:="), call_term, rhs]);
+        let got = select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap)
+            .unwrap();
+        let want: Vec<Eterm> = if name == "abs" {
+            vec![make_small(1)]
+        } else {
+            vec![]
+        };
+        assert_eq!(got, want, "guard {name}/1");
+    }
+
+    // `tl`/`size`/`element` all raise on an integer operand.
+    let tl_call = call(&mut heap, at(&atoms, "tl"), &[at(&atoms, "$2")]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), tl_call, NIL]);
+    assert!(select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap)
+        .unwrap()
+        .is_empty());
+    let size_call = call(&mut heap, at(&atoms, "size"), &[at(&atoms, "$2")]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), size_call, make_small(1)]);
+    assert!(select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap)
+        .unwrap()
+        .is_empty());
+    let element_call = call(
+        &mut heap,
+        at(&atoms, "element"),
+        &[make_small(1), at(&atoms, "$2")],
+    );
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), element_call, make_small(1)]);
+    assert!(select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap)
+        .unwrap()
+        .is_empty());
+
+    // The positive `element/2`/`size/1` cases over a freshly built tuple.
+    let rebuilt = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let wrapped = tup(&mut heap, &[rebuilt]);
+    let element_call = call(&mut heap, at(&atoms, "element"), &[make_small(2), wrapped]);
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, "=:="), element_call, at(&atoms, "$2")],
+    );
+    let got = select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(1), make_small(2)], "element/2 == '$2'");
+
+    let rebuilt = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let wrapped = tup(&mut heap, &[rebuilt]);
+    let size_call = call(&mut heap, at(&atoms, "size"), &[wrapped]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), size_call, make_small(2)]);
+    let got = select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(1), make_small(2)], "size/1 == 2");
+
+    // A constant small-integer `abs/1` in a guard.
+    let abs_call = call(&mut heap, at(&atoms, "abs"), &[make_small(-5)]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), abs_call, make_small(5)]);
+    let got = select_one(&table, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(1), make_small(2)], "abs(-5) == 5");
+}
+
+#[test]
+fn const_yields_its_argument_in_guards_and_bodies() {
+    // oracle: guard `{'=:=',{const,5},5}` -> both objects; body `[{const,{a,b}}]` ->
+    // `[{a,b},{a,b}]`. `{const, Term}` is the only way a *map*/any literal reaches a
+    // body without the expression decoder rejecting it.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    table
+        .insert(tup(&mut heap, &[make_small(2), make_small(20)]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "_")]);
+
+    let constant = call(&mut heap, at(&atoms, "const"), &[make_small(5)]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), constant, make_small(5)]);
+    let got = select_one(&table, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 2, "const(5) =:= 5");
+
+    let pair = tup(&mut heap, &[at(&atoms, "a"), at(&atoms, "b")]);
+    let constant = call(&mut heap, at(&atoms, "const"), &[pair]);
+    let got = select_one(&table, head, &[], &[constant], &atoms, &mut heap).unwrap();
+    let want = tup(&mut heap, &[at(&atoms, "a"), at(&atoms, "b")]);
+    assert_terms(&got, &[want, want], &atoms, "const({a,b}) body");
+
+    // A `{const, Map}` body yields the map (a *bare* map body is a documented gap — see
+    // `documented_capability_gaps_diverge_from_the_oracle`).
+    let map = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
+    let constant = call(&mut heap, at(&atoms, "const"), &[map]);
+    let got = select_one(&table, head, &[], &[constant], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 2, "const(map) body");
+    for term in got {
+        // SAFETY: the body value is a live term; `is_map` classifies it through its
+        // tag/header word only, which is sound for any value word.
+        assert!(unsafe { is_map(term) }, "the body value is the map");
+    }
+}
+
+#[test]
+fn head_patterns_match_proper_improper_and_cons_lists() {
+    // oracle on `{1,[10,20,30]}` (set):
+    //   head {'_',['$1','$2','$3']} body ['$3'] -> [30]
+    //   head {'_',[10,20|'$1']}     body ['$1'] -> [[30]]   (an improper head IS allowed:
+    //                                                        `'$1'` binds the tail)
+    //   head {'_',[10|'$1']}        body ['$1'] -> [[20,30]]
+    //   head {'_',['$1'|'$2']}      body ['$1'] -> [10]
+    //   head {'_',[10,20,30]}       body ['$_'] -> [{1,[10,20,30]}]
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    let elements = list(&mut heap, &[make_small(10), make_small(20), make_small(30)]);
+    let object = tup(&mut heap, &[make_small(1), elements]);
+    table.insert(object, &atoms).unwrap();
+    let first = at(&atoms, "$1");
+    let second = at(&atoms, "$2");
+
+    // A proper three-element list head binding each position.
+    let pattern = list(&mut heap, &[first, second, at(&atoms, "$3")]);
+    let head = tup(&mut heap, &[at(&atoms, "_"), pattern]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$3")], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(30)], "['$1','$2','$3'] binds '$3'");
+
+    // `[10,20|'$1']` — the tail `'$1'` binds `[30]`.
+    let tail = heap.cons(make_small(20), first).expect("heap");
+    let pattern = heap.cons(make_small(10), tail).expect("heap");
+    let head = tup(&mut heap, &[at(&atoms, "_"), pattern]);
+    let got = select_one(&table, head, &[], &[first], &atoms, &mut heap).unwrap();
+    let want = list(&mut heap, &[make_small(30)]);
+    assert_terms(&got, &[want], &atoms, "[10,20|'$1'] binds the tail");
+
+    // `[10|'$1']` — the tail binds `[20,30]`.
+    let pattern = heap.cons(make_small(10), first).expect("heap");
+    let head = tup(&mut heap, &[at(&atoms, "_"), pattern]);
+    let got = select_one(&table, head, &[], &[first], &atoms, &mut heap).unwrap();
+    let want = list(&mut heap, &[make_small(20), make_small(30)]);
+    assert_terms(&got, &[want], &atoms, "[10|'$1'] binds the tail");
+
+    // `['$1'|'$2']` — the head binds `10`.
+    let pattern = heap.cons(first, second).expect("heap");
+    let head = tup(&mut heap, &[at(&atoms, "_"), pattern]);
+    let got = select_one(&table, head, &[], &[first], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(10)], "['$1'|'$2'] binds the head");
+
+    // An exact literal list head matches the whole object.
+    let pattern = list(
+        &mut heap,
+        &[make_small(10), make_small(20), make_small(30)],
+    );
+    let head = tup(&mut heap, &[at(&atoms, "_"), pattern]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1, "an exact list head matches");
+}
+
+#[test]
+fn construct_bodies_build_fresh_tuples_lists_and_their_combination() {
+    // oracle on `{1,[10,20]}` (ordered_set):
+    //   body [{{'$2','$1'}}]        -> [{[10,20],1}]
+    //   body [{{'$1',['$2','$2']}}] -> [{1,[[10,20],[10,20]]}]
+    //   body [{{{'$1'},['$2']}}]    -> badarg (a nested construct needs `{{…}}` at each
+    //                                          level; a bare `{'$1'}` is a *call*)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    let elements = list(&mut heap, &[make_small(10), make_small(20)]);
+    let object = tup(&mut heap, &[make_small(1), elements]);
+    table.insert(object, &atoms).unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+
+    // `{{'$2','$1'}}` — a tuple construct from the two bound variables.
+    let rebuilt = tup(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$1")]);
+    let wrapped = tup(&mut heap, &[rebuilt]);
+    let got = select_one(&table, head, &[], &[wrapped], &atoms, &mut heap).unwrap();
+    let elements = list(&mut heap, &[make_small(10), make_small(20)]);
+    let want = tup(&mut heap, &[elements, make_small(1)]);
+    assert_terms(&got, &[want], &atoms, "{{'$2','$1'}}");
+
+    // `{{'$1',['$2','$2']}}` — a tuple whose second element is a list construct.
+    let inner_list = list(&mut heap, &[at(&atoms, "$2"), at(&atoms, "$2")]);
+    let tuple = tup(&mut heap, &[at(&atoms, "$1"), inner_list]);
+    let wrapped = tup(&mut heap, &[tuple]);
+    let got = select_one(&table, head, &[], &[wrapped], &atoms, &mut heap).unwrap();
+    let inner_list = list(&mut heap, &[make_small(10), make_small(20)]);
+    let inner_list = list(&mut heap, &[inner_list, inner_list]);
+    let want = tup(&mut heap, &[make_small(1), inner_list]);
+    assert_terms(&got, &[want], &atoms, "{{'$1',['$2','$2']}}");
+
+    // A nested construct that is not itself written `{{…}}` is `badarg`.
+    let one_tuple = tup(&mut heap, &[at(&atoms, "$1")]);
+    let list_construct = list(&mut heap, &[at(&atoms, "$2")]);
+    let nested = tup(&mut heap, &[one_tuple, list_construct]);
+    let wrapped = tup(&mut heap, &[nested]);
+    let spec = spec1(&mut heap, head, &[], &[wrapped]);
+    assert!(
+        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+        "a bare single-element tuple in a construct is a call -> badarg"
+    );
+}
+
+#[test]
+fn a_failing_body_expression_becomes_the_atom_exit_and_evaluation_continues() {
+    // oracle on `{1,10}`/`{2,20}` (set):
+    //   body [{hd,5}]    -> ['EXIT','EXIT'] (the failure is the C `FAIL_TERM`, `EXIT`)
+    //   body [{hd,5},7]  -> [7,7]           (the failure is discarded and the last value
+    //                                        supplies the clause's value)
+    let atoms = atoms_with_exit();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    table
+        .insert(tup(&mut heap, &[make_small(2), make_small(20)]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "_")]);
+
+    let raising = call(&mut heap, at(&atoms, "hd"), &[make_small(5)]);
+    let got = select_one(&table, head, &[], &[raising], &atoms, &mut heap).unwrap();
+    assert_terms(
+        &got,
+        &[at(&atoms, "EXIT"), at(&atoms, "EXIT")],
+        &atoms,
+        "a failing body yields EXIT",
+    );
+
+    let raising = call(&mut heap, at(&atoms, "hd"), &[make_small(5)]);
+    let got = select_one(&table, head, &[], &[raising, make_small(7)], &atoms, &mut heap).unwrap();
+    assert_eq!(
+        got,
+        vec![make_small(7), make_small(7)],
+        "a later body expression supplies the value"
+    );
+
+    // The failed body also makes `select_count`/`select_delete` see `EXIT`, never `true`.
+    let raising = call(&mut heap, at(&atoms, "hd"), &[make_small(5)]);
+    let spec = compile(spec1(&mut heap, head, &[], &[raising]), &atoms).unwrap();
+    assert_eq!(table.select_count(&spec, &atoms, &mut heap).unwrap(), 0);
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    let raising = call(&mut heap, at(&atoms, "hd"), &[make_small(5)]);
+    let spec = compile(spec1(&mut heap, head, &[], &[raising]), &atoms).unwrap();
+    assert_eq!(table.select_delete(&spec, &atoms, &mut heap).unwrap(), 0);
+}
+
+#[test]
+fn dollar_zero_binds_and_malformed_dollar_atoms_are_literal_atoms() {
+    // oracle on `{1,a}`/`{2,7}` (ordered_set):
+    //   head {'$0','_'} body ['$_'] -> both        (`'$0'` IS variable 0)
+    //   head {'$0','_'} body ['$0'] -> [1,2]
+    //   head {'$x','_'} / {'$1x','_'} / {'$01','_'} -> [] (ordinary literal atoms)
+    //   body ['$x'] -> ['$x','$x'] (a literal atom, not a variable)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), at(&atoms, "a")]), &atoms)
+        .unwrap();
+    table
+        .insert(tup(&mut heap, &[make_small(2), make_small(7)]), &atoms)
+        .unwrap();
+
+    let head = tup(&mut heap, &[at(&atoms, "$0"), at(&atoms, "_")]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 2, "'$0' binds every object");
+    let head = tup(&mut heap, &[at(&atoms, "$0"), at(&atoms, "_")]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$0")], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(1), make_small(2)], "'$0' in a body");
+
+    for malformed in ["$x", "$1x", "$01"] {
+        let head = tup(&mut heap, &[at(&atoms, malformed), at(&atoms, "_")]);
+        let got = select_one(&table, head, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+        assert!(got.is_empty(), "`{malformed}` is a literal atom that matches nothing");
+    }
+
+    let head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "_")]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$x")], &atoms, &mut heap).unwrap();
+    assert_terms(
+        &got,
+        &[at(&atoms, "$x"), at(&atoms, "$x")],
+        &atoms,
+        "['$x'] is the literal atom",
+    );
+}
+
+#[test]
+fn nested_repeated_variable_enforces_equality_both_ways() {
+    // oracle: head `{'_',{'$1','$1'}}` on `{1,{7,7}}`,`{2,{5,8}}` -> only the first;
+    // and the repeated variable is also usable in the body.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    let equal = tup(&mut heap, &[make_small(7), make_small(7)]);
+    table
+        .insert(tup(&mut heap, &[make_small(1), equal]), &atoms)
+        .unwrap();
+    let unequal = tup(&mut heap, &[make_small(5), make_small(8)]);
+    table
+        .insert(tup(&mut heap, &[make_small(2), unequal]), &atoms)
+        .unwrap();
+
+    let inner = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$1")]);
+    let head = tup(&mut heap, &[at(&atoms, "_"), inner]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$1")], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(7)], "only the {{7,7}} object matches");
+
+    let inner = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$1")]);
+    let head = tup(&mut heap, &[at(&atoms, "_"), inner]);
+    let inner_body = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$1")]);
+    let wrapped = tup(&mut heap, &[inner_body]);
+    let got = select_one(&table, head, &[], &[wrapped], &atoms, &mut heap).unwrap();
+    let want = tup(&mut heap, &[make_small(7), make_small(7)]);
+    assert_terms(&got, &[want], &atoms, "the repeated binding in a body");
+}
+
+#[test]
+fn a_map_head_pattern_compares_as_an_exact_literal() {
+    // oracle: T = [{1,#{a=>1}},{2,#{a=>2}}]; head `{'_',#{a=>1}}` -> `[{1,#{a=>1}}]`
+    // (a map with *no* wildcard/variable in the head is a plain exact literal here).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    let one = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
+    let two = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(2))], &atoms);
+    let object_one = tup(&mut heap, &[make_small(1), one]);
+    let object_two = tup(&mut heap, &[make_small(2), two]);
+    table.insert(object_one, &atoms).unwrap();
+    table.insert(object_two, &atoms).unwrap();
+
+    let pattern = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "_"), pattern]);
+    let got = select_one(&table, head, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_terms(&got, &[object_one], &atoms, "an exact map head");
+}
+
+#[test]
+fn an_unbound_variable_in_a_guard_or_a_body_is_badarg() {
+    // oracle: a `'$N'` the head does not bind makes the whole `ets:select/2` `badarg`,
+    // whether it appears in a guard or in a body.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "_")]);
+
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), at(&atoms, "$5"), make_small(1)]);
+    let spec = spec1(&mut heap, head, &[guard], &[at(&atoms, "$_")]);
+    assert!(
+        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+        "an unbound guard variable is badarg"
+    );
+
+    let head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "_")]);
+    let spec = spec1(&mut heap, head, &[], &[at(&atoms, "$5")]);
+    assert!(
+        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+        "an unbound body variable is badarg"
+    );
+}
+
+/// The three constructs below are **documented capability gaps** of this crate
+/// (`src/select/mod.rs` "Known gaps"), each a typed outcome — never a wrong result.
+/// In every case the system `erl` (OTP 29 / erts-17.1) ACCEPTS the construct, so these
+/// are **recorded divergences**, not parity claims: this crate is strictly less
+/// capable here (reported to the source owner, not asserted as oracle behaviour).
+#[test]
+fn documented_capability_gaps_are_typed_and_diverge_from_the_oracle() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    table
+        .insert(tup(&mut heap, &[make_small(2), make_small(20)]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "_"), at(&atoms, "_")]);
+    let map = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
+
+    // 1. A map as a guard/body *expression* is `badarg` here; the oracle constructs it
+    //    (body `[#{a=>1}]` -> `[#{a=>1},#{a=>1}]`, and a map `=:=` map guard matches).
+    let spec = spec1(&mut heap, head, &[], &[map]);
+    assert!(
+        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+        "DIVERGENCE: the oracle accepts a map body; this crate is documented `badarg`"
+    );
+
+    // 2. A wildcard inside a HEAD map under-matches here (the head map is a literal);
+    //    the oracle matches structurally (`#{a=>'_'}` matches `#{a=>1}` and `#{a=>2}`).
+    let mut map_table = new_table(TableKind::Set);
+    let one = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
+    let two = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(2))], &atoms);
+    let object_one = tup(&mut heap, &[make_small(1), one]);
+    let object_two = tup(&mut heap, &[make_small(2), two]);
+    map_table.insert(object_one, &atoms).unwrap();
+    map_table.insert(object_two, &atoms).unwrap();
+    let wildcard_map = flat_map(&mut heap, &[(at(&atoms, "a"), at(&atoms, "_"))], &atoms);
+    let head = tup(&mut heap, &[at(&atoms, "_"), wildcard_map]);
+    let got = select_one(&map_table, head, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert!(
+        got.is_empty(),
+        "DIVERGENCE: the oracle matches a wildcard map head structurally; this crate \
+         compares the head map as an exact literal"
+    );
+
+    // 3. `self/0` has no process identity at the ETS layer, so it raises and its clause
+    //    is skipped; the oracle returns the pid (`{self} =:= {self}` matches).
+    let self_call = call(&mut heap, at(&atoms, "self"), &[]);
+    let guard = tup(
+        &mut heap,
+        &[at(&atoms, "=:="), self_call, self_call],
+    );
+    let got = select_one(&table, head, &[guard], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert!(
+        got.is_empty(),
+        "DIVERGENCE: the oracle matches `{{self}} =:= {{self}}`; this crate's `self/0` raises"
+    );
+}
+
+// ===========================================================================
+// Traversal-order semantics for the FORWARD select family
+//
+// oracle on `{3,c,30}`/`{1,a,10}`/`{2,b,20}` (inserted in that scrambled order):
+//   ordered_set -> select/match_object/match all `[{1,a,10},{2,b,20},{3,c,30}]`
+//                  (exact ascending arithmetic key order) and select_count -> 3
+//   set/bag/duplicate_bag -> the SAME objects in an *unspecified* order (the oracle
+//                  happens to emit `[{3,c,30},{2,b,20},{1,a,10}]`); the multiset is
+//                  pinned, never the hash order.
+// ===========================================================================
+
+/// The three traversal objects `{1,a,10}`,`{2,b,20}`,`{3,c,30}`, ascending by key.
+fn traversal_objects(heap: &mut Heap, atoms: &AtomTable) -> Vec<Eterm> {
+    vec![
+        object(heap, 1, at(atoms, "a"), 10),
+        object(heap, 2, at(atoms, "b"), 20),
+        object(heap, 3, at(atoms, "c"), 30),
+    ]
+}
+
+/// The `match/2` bindings `[K,V,W]` for the same three objects, ascending by key.
+fn traversal_bindings(heap: &mut Heap, atoms: &AtomTable) -> Vec<Eterm> {
+    vec![
+        list(heap, &[make_small(1), at(atoms, "a"), make_small(10)]),
+        list(heap, &[make_small(2), at(atoms, "b"), make_small(20)]),
+        list(heap, &[make_small(3), at(atoms, "c"), make_small(30)]),
+    ]
+}
+
+/// The `{K,V,W}` table for the traversal-order tests (inserted in scrambled order).
+fn traversal_table(kind: TableKind, atoms: &AtomTable, heap: &mut Heap) -> Table {
+    let mut table = new_table(kind);
+    for (key, value, third) in [(3i64, "c", 30i64), (1, "a", 10), (2, "b", 20)] {
+        let object = object(heap, key, at(atoms, value), third);
+        table.insert(object, atoms).unwrap();
+    }
+    table
+}
+
+/// Assert the traversal `got` is exactly `expect` for an `ordered_set`, or the same
+/// **multiset** for a hash kind (whose iteration order is unspecified).
+fn assert_traversal(
+    kind: TableKind,
+    got: &[Eterm],
+    expect: &[Eterm],
+    atoms: &AtomTable,
+    what: &str,
+) {
+    if kind == TableKind::OrderedSet {
+        assert_terms(got, expect, atoms, &format!("{what}: ordered_set exact order"));
+    } else {
+        let sorted = sorted_by_key(got.to_vec());
+        assert_terms(&sorted, expect, atoms, &format!("{what}: hash-kind multiset"));
+    }
+}
+
+#[test]
+fn forward_select_family_traversal_order_is_pinned_for_every_kind() {
+    for kind in KINDS {
+        let atoms = atoms();
+        let mut heap = Heap::new(8192).expect("test heap");
+        let table = traversal_table(kind, &atoms, &mut heap);
+        let expect = traversal_objects(&mut heap, &atoms);
+
+        // `select` with an `'$_'` body.
+        let head = tup(
+            &mut heap,
+            &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+        );
+        let spec = compile(spec1(&mut heap, head, &[], &[at(&atoms, "$_")]), &atoms).unwrap();
+        let got = table.select(&spec, &atoms, &mut heap).unwrap();
+        assert_traversal(kind, &got, &expect, &atoms, "select");
+
+        // `match_object` over the bare pattern.
+        let pattern = tup(
+            &mut heap,
+            &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+        );
+        let got = table.match_object(pattern, &atoms, &mut heap).unwrap();
+        assert_traversal(kind, &got, &expect, &atoms, "match_object");
+
+        // `match` over the bare pattern (each result is a binding list).
+        let pattern = tup(
+            &mut heap,
+            &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+        );
+        let got = table.match_(pattern, &atoms, &mut heap).unwrap();
+        let expect_bindings = traversal_bindings(&mut heap, &atoms);
+        if kind == TableKind::OrderedSet {
+            assert_terms(&got, &expect_bindings, &atoms, "match: ordered_set exact order");
+        } else {
+            let sorted = sorted_bindings_by_key(got);
+            assert_terms(&sorted, &expect_bindings, &atoms, "match: hash-kind multiset");
+        }
+
+        // `select_count` counts only the objects whose body is `true`.
+        let head = tup(
+            &mut heap,
+            &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+        );
+        let spec = compile(spec1(&mut heap, head, &[], &[at(&atoms, "true")]), &atoms).unwrap();
+        assert_eq!(
+            table.select_count(&spec, &atoms, &mut heap).unwrap(),
+            3,
+            "kind {kind:?}: select_count"
+        );
+    }
+}
+
+#[test]
+fn forward_delete_family_traversal_is_pinned_for_every_kind() {
+    // oracle: `ets:select_delete(T, [{{'$1','$2','$3'},[],[true]}])` deletes all three
+    // objects (returns 2 with a value guard — see the hash multiset check below) and
+    // `ets:match_delete(T, {'$1','$2','$3'})` deletes all three objects. Both are
+    // order-independent (they remove by value), so the *count* is pinned exactly and the
+    // surviving table is asserted empty.
+    for kind in KINDS {
+        let atoms = atoms();
+        let mut heap = Heap::new(8192).expect("test heap");
+
+        let mut table = traversal_table(kind, &atoms, &mut heap);
+        let head = tup(
+            &mut heap,
+            &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+        );
+        let spec = compile(spec1(&mut heap, head, &[], &[at(&atoms, "true")]), &atoms).unwrap();
+        assert_eq!(
+            table.select_delete(&spec, &atoms, &mut heap).unwrap(),
+            3,
+            "kind {kind:?}: select_delete count"
+        );
+        assert!(table.is_empty(), "kind {kind:?}: select_delete emptied the table");
+
+        // `match_delete` returns the deleted count in this crate (the BIF returns `true`).
+        let mut table = traversal_table(kind, &atoms, &mut heap);
+        let pattern = tup(
+            &mut heap,
+            &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+        );
+        assert_eq!(
+            table.match_delete(pattern, &atoms, &mut heap).unwrap(),
+            3,
+            "kind {kind:?}: match_delete count"
+        );
+        assert!(table.is_empty(), "kind {kind:?}: match_delete emptied the table");
+    }
+}
+
+#[test]
+fn ordered_set_merges_arithmetic_key_duplicates_while_hash_kinds_keep_them_distinct() {
+    // oracle: insert `{1,a}` then `{1.0,b}`:
+    //   ordered_set         -> size 1, tab2list `[{1.0,b}]`, lookup(1) `[{1.0,b}]`
+    //                          (keys compare arithmetically; the last-inserted key *term*
+    //                           is the one iterated)
+    //   set/bag/duplicate_bag -> size 2, lookup(1) `[{1,a}]`, lookup(1.0) `[{1.0,b}]`
+    //                          (exact `=:=` key equality)
+    let one_point_zero = |heap: &mut Heap| float(heap, 1.0);
+    for kind in KINDS {
+        let atoms = atoms();
+        let mut heap = Heap::new(8192).expect("test heap");
+        let mut table = new_table(kind);
+        let key_one = make_small(1);
+        let key_float = one_point_zero(&mut heap);
+        let object_int = tup(&mut heap, &[key_one, at(&atoms, "a")]);
+        let object_float = tup(&mut heap, &[key_float, at(&atoms, "b")]);
+        table.insert(object_int, &atoms).unwrap();
+        table.insert(object_float, &atoms).unwrap();
+
+        if kind == TableKind::OrderedSet {
+            assert_eq!(table.size(), 1, "ordered_set merges 1 and 1.0");
+            let listed = table.tab2list();
+            assert_terms(
+                &listed,
+                &[object_float],
+                &atoms,
+                "ordered_set iterates the last-inserted key term",
+            );
+        } else {
+            assert_eq!(table.size(), 2, "{kind:?} keeps 1 and 1.0 distinct");
+            let int_hit = table.lookup(key_one, &atoms);
+            assert_terms(&int_hit, &[object_int], &atoms, "lookup(1)");
+            let float_hit = table.lookup(key_float, &atoms);
+            assert_terms(&float_hit, &[object_float], &atoms, "lookup(1.0)");
+        }
+    }
 }

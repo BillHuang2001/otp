@@ -23,7 +23,8 @@
 //! Mirrors the option surface of the legacy `ets:new/2` (`db_new` in
 //! `../../erts/emulator/beam/erl_db.c`): the `type` (table kind), `keypos`, the
 //! `protection` (access mode), `named_table`, `compressed`,
-//! `{write_concurrency, Bool}`, `{read_concurrency, Bool}`,
+//! `{write_concurrency, Bool | auto | {debug_hash_fixed_number_of_locks, N}}`
+//! (modelled by [`WriteConcurrency`]), `{read_concurrency, Bool}`,
 //! `{heir, Pid}`/`{heir, Pid, Data}` and `{decentralized_counters, Bool}`
 //! options. Parsing the raw option list happens in `beam_bifs`; this module owns
 //! the **parsed** representation ([`TableOptions`]) and its defaults.
@@ -237,6 +238,116 @@ impl Concurrency {
     }
 }
 
+/// The parsed `{write_concurrency, …}` mode of `ets:new/2`.
+///
+/// Models the whole `{write_concurrency, _}` surface the oracle accepts — the
+/// boolean forms, the `auto` atom and the hidden
+/// `{debug_hash_fixed_number_of_locks, N}` granularity option
+/// (`ets_new_2`, `../../erts/emulator/beam/erl_db.c`:2624-2663) — as parsed
+/// options, exactly like [`TableKind`]/[`Access`].
+///
+/// # `ets:info(T, write_concurrency)`
+///
+/// The oracle's rendering is `table_info` (`erl_db.c`:5492-5506):
+///
+/// | mode | `ets:info(T, write_concurrency)` |
+/// |---|---|
+/// | [`Off`](WriteConcurrency::Off) | the atom `false` |
+/// | [`On`](WriteConcurrency::On) | the atom `true` |
+/// | [`Auto`](WriteConcurrency::Auto) | the atom `auto` (the `DB_FINE_LOCKED_AUTO` flag) |
+/// | [`FixedLocks`](WriteConcurrency::FixedLocks)`(N)` | `{debug_hash_fixed_number_of_locks, Nlocks}` |
+///
+/// so [`as_atom_name`](WriteConcurrency::as_atom_name) returns those three atoms
+/// and `None` for [`FixedLocks`](WriteConcurrency::FixedLocks) — the one form
+/// that renders as a **tuple**, not an atom. A `private` table never keeps the
+/// mode at all (the C's `is_fine_locked && !(status & DB_PRIVATE)` gate); see
+/// [`TableOptions::write_concurrency_mode`].
+///
+/// # The stored lock count is the *requested* one
+///
+/// [`FixedLocks`](WriteConcurrency::FixedLocks) carries the count **as
+/// requested**. The `Nlocks` the oracle reports is that count rounded *down* to a
+/// power of two and then clamped *up* to `NLOCKS_WITH_ITEM_COUNTERS` (64), which
+/// `db_hash_create`/`db_hash_init` (`../../erts/emulator/beam/erl_db_hash.c`)
+/// derives when the table is created — a table-creation detail, not part of this
+/// model. So is the `1..=32768` accept range (`DB_WRITE_CONCURRENCY_MIN_LOCKS`/
+/// `_MAX_LOCKS`, `erl_db.c`:65-66) and the `ordered_set` rejection of the
+/// explicit-granularity form (`erl_db.c`:2727-2732): both belong to the
+/// `beam_bifs` option parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WriteConcurrency {
+    /// `{write_concurrency, false}`, or the option omitted — the default. The
+    /// table is not fine-locked and reports the atom `false`.
+    #[default]
+    Off,
+    /// `{write_concurrency, true}` — fine-locked with the implementation's
+    /// default lock count. Reports the atom `true`.
+    On,
+    /// `{write_concurrency, auto}` — fine-locked with an automatically sized lock
+    /// set. Reports the atom `auto`.
+    Auto,
+    /// `{write_concurrency, {debug_hash_fixed_number_of_locks, N}}` — fine-locked
+    /// with an explicit lock granularity of the requested `N` locks. Reports the
+    /// tuple `{debug_hash_fixed_number_of_locks, Nlocks}` (the normalized count).
+    FixedLocks(u32),
+}
+
+impl WriteConcurrency {
+    /// Whether write concurrency is enabled at all — `false` only for
+    /// [`Off`](WriteConcurrency::Off).
+    ///
+    /// This is the C's `is_fine_locked` flag *before* the `DB_PRIVATE` gate:
+    /// `true` for every form that asks for concurrent writers
+    /// (`{write_concurrency, true}` / `auto` / `{debug_hash_fixed_number_of_locks,
+    /// _}`).
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, WriteConcurrency::Off)
+    }
+
+    /// The requested lock count for
+    /// [`FixedLocks`](WriteConcurrency::FixedLocks), `None` for every other mode.
+    ///
+    /// The count is the one the option named, un-normalized (see the type's
+    /// rustdoc).
+    pub fn fixed_locks(&self) -> Option<u32> {
+        match self {
+            WriteConcurrency::FixedLocks(locks) => Some(*locks),
+            _ => None,
+        }
+    }
+
+    /// The Erlang **atom** `ets:info(T, write_concurrency)` reports for this mode:
+    /// `"false"`, `"true"` or `"auto"` — and `None` for
+    /// [`FixedLocks`](WriteConcurrency::FixedLocks), which the oracle renders as
+    /// the tuple `{debug_hash_fixed_number_of_locks, Nlocks}`.
+    pub fn as_atom_name(&self) -> Option<&'static str> {
+        match self {
+            WriteConcurrency::Off => Some("false"),
+            WriteConcurrency::On => Some("true"),
+            WriteConcurrency::Auto => Some("auto"),
+            WriteConcurrency::FixedLocks(_) => None,
+        }
+    }
+
+    /// Parse a write-concurrency mode from the atom the option named; the
+    /// inverse of [`as_atom_name`](WriteConcurrency::as_atom_name) for the three
+    /// atom forms.
+    ///
+    /// Returns `None` for anything else, so the `ets:new/2` option parser can
+    /// reject it (`badarg`) at the call site. Note that this covers only the atom
+    /// forms: the `{debug_hash_fixed_number_of_locks, N}` value is a tuple, so it
+    /// is built by the parser (a [`FixedLocks`](WriteConcurrency::FixedLocks))
+    /// rather than parsed here.
+    pub fn from_atom_name(name: &str) -> Option<WriteConcurrency> {
+        match name {
+            "false" => Some(WriteConcurrency::Off),
+            "true" => Some(WriteConcurrency::On),
+            "auto" => Some(WriteConcurrency::Auto),
+            _ => None,
+        }
+    }
+}
+
 /// The parsed `ets:new/2` option set.
 ///
 /// Built with the fluent builder ([`TableOptions::new`] plus the `set_*`
@@ -259,9 +370,11 @@ pub struct TableOptions {
     name: Option<Atom>,
     /// Whether `compressed` was requested.
     compressed: bool,
-    /// Whether `write_concurrency` was requested. The **effective** value is
-    /// [`TableOptions::write_concurrency`] (a `private` table forces it off).
-    write_concurrency: bool,
+    /// The requested `{write_concurrency, …}` mode. The **effective** value is
+    /// [`TableOptions::write_concurrency_mode`] (a `private` table forces it to
+    /// [`WriteConcurrency::Off`]), whose `Off`/`On` projection is
+    /// [`TableOptions::write_concurrency`].
+    write_concurrency: WriteConcurrency,
     /// Whether `read_concurrency` was requested. The **effective** value is
     /// [`TableOptions::read_concurrency`] (a `private` table forces it off).
     read_concurrency: bool,
@@ -289,7 +402,7 @@ impl TableOptions {
             named: false,
             name: None,
             compressed: false,
-            write_concurrency: false,
+            write_concurrency: WriteConcurrency::Off,
             read_concurrency: false,
             heir: None,
             decentralized_counters: None,
@@ -341,12 +454,32 @@ impl TableOptions {
         self
     }
 
-    /// Set whether concurrent writers are allowed (`write_concurrency`).
+    /// Set whether concurrent writers are allowed (`{write_concurrency, Bool}`).
+    ///
+    /// The boolean form only: `false` selects [`WriteConcurrency::Off`] and `true`
+    /// [`WriteConcurrency::On`]. The richer `auto` /
+    /// `{debug_hash_fixed_number_of_locks, N}` forms go through
+    /// [`set_write_concurrency_mode`](TableOptions::set_write_concurrency_mode).
     pub fn set_write_concurrency(&mut self, write: bool) -> &mut Self {
-        self.write_concurrency = write;
+        self.write_concurrency = if write {
+            WriteConcurrency::On
+        } else {
+            WriteConcurrency::Off
+        };
         self
     }
 
+    /// Set the whole parsed `{write_concurrency, …}` mode.
+    ///
+    /// Installs the mode **as requested**: `auto` and
+    /// `{debug_hash_fixed_number_of_locks, N}` are stored verbatim, and a `private`
+    /// table only has them normalized away when they are read
+    /// ([`write_concurrency_mode`](TableOptions::write_concurrency_mode)), so the
+    /// builder may be told the access mode first or last.
+    pub fn set_write_concurrency_mode(&mut self, mode: WriteConcurrency) -> &mut Self {
+        self.write_concurrency = mode;
+        self
+    }
     /// Set whether concurrent readers are allowed (`read_concurrency`).
     pub fn set_read_concurrency(&mut self, read: bool) -> &mut Self {
         self.read_concurrency = read;
@@ -421,21 +554,43 @@ impl TableOptions {
         self.compressed
     }
 
-    /// Whether `write_concurrency` is **in effect** for the table.
+    /// Whether `write_concurrency` is **in effect** for the table — the `On`/`Off`
+    /// projection of the effective [`write_concurrency_mode`](Self::write_concurrency_mode).
     ///
     /// A `private` table never gets concurrent writers: the oracle only sets the
     /// fine-locked flag when the table is not `DB_PRIVATE`
     /// (`if (is_fine_locked && !(status & DB_PRIVATE))`,
     /// `../../erts/emulator/beam/erl_db.c`), so
     /// `ets:new(t, [private, {write_concurrency, true}])` reports `false` (verified
-    /// against the system `erl`, OTP 29 / erts-17.1). The normalization lives in
-    /// this getter — not in [`Table::info`](crate::Table::info) — so the option set
-    /// and every reader of the flag agree, and it is **order-independent**: the
-    /// builder may be told the access mode or the flag first.
+    /// against the system `erl`, OTP 29 / erts-17.1). True for **every** enabled
+    /// mode (`true`, `auto`, `{debug_hash_fixed_number_of_locks, _}`) — the flag
+    /// says the table is fine-locked, not which form was requested (that is what
+    /// [`write_concurrency_mode`](Self::write_concurrency_mode) is for). The
+    /// normalization lives in this getter — not in
+    /// [`Table::info`](crate::Table::info) — so the option set and every reader of
+    /// the flag agree, and it is **order-independent**: the builder may be told the
+    /// access mode or the flag first.
     pub fn write_concurrency(&self) -> bool {
-        self.write_concurrency && !self.is_private()
+        self.write_concurrency_mode().is_enabled()
     }
 
+    /// The **effective** [`WriteConcurrency`] mode: the mode as requested, or
+    /// [`WriteConcurrency::Off`] when the table is `private`.
+    ///
+    /// `private` is the one access mode the oracle treats specially: it forces the
+    /// fine-locked flag off (`if (is_fine_locked && !(status & DB_PRIVATE))`,
+    /// `erl_db.c`), so a private table reports `write_concurrency => false` however
+    /// the option asked — the atom `auto`/the
+    /// `{debug_hash_fixed_number_of_locks, _}` tuple included. Like
+    /// [`write_concurrency`](Self::write_concurrency) the normalization is applied
+    /// on read, so it is order-independent.
+    pub fn write_concurrency_mode(&self) -> WriteConcurrency {
+        if self.is_private() {
+            WriteConcurrency::Off
+        } else {
+            self.write_concurrency
+        }
+    }
     /// Whether `read_concurrency` is **in effect** for the table. Normalized like
     /// [`write_concurrency`](TableOptions::write_concurrency): a `private` table
     /// reports `false` even when the flag was requested.
@@ -480,8 +635,12 @@ impl TableOptions {
     /// legacy C `db_new` (`../../erts/emulator/beam/erl_db.c`), the observable
     /// value is `DB_FINE_LOCKED && is_decentralized_counters`, where
     /// `is_decentralized_counters` is the **explicit** option when given and
-    /// otherwise `true` only for an `ordered_set` (the `am_ordered_set` list
-    /// element sets it). Concretely:
+    /// otherwise derived by the C's option loop: `true` for an `ordered_set` (the
+    /// `am_ordered_set` arm), `true` for `{write_concurrency, auto}` and for
+    /// `{write_concurrency, {debug_hash_fixed_number_of_locks, _}}` (both arms set
+    /// it unconditionally), and `false` for a plain `{write_concurrency, true}`
+    /// unless the table is an `ordered_set` (`if (!(status & DB_ORDERED_SET))
+    /// is_decentralized_counters = false;`). Concretely:
     ///
     /// * `ordered_set` with `{write_concurrency, true}` ⇒ `true` (the CATREE
     ///   path), and an explicit `{decentralized_counters, false}` overrides it
@@ -489,20 +648,28 @@ impl TableOptions {
     /// * `set`/`bag`/`duplicate_bag` with `{write_concurrency, true}` ⇒ `false`,
     ///   but `{decentralized_counters, true}` **together with**
     ///   `{write_concurrency, true}` ⇒ `true`;
+    /// * **every** kind with `{write_concurrency, auto}` or
+    ///   `{write_concurrency, {debug_hash_fixed_number_of_locks, _}}` ⇒ `true`,
+    ///   unless an explicit `{decentralized_counters, false}` says otherwise;
     /// * the explicit option **alone** (no effective `write_concurrency`) ⇒
     ///   `false` — the fine-locked flag gates it, and a `private` table never gets
     ///   that flag (hence the normalized
-    ///   [`write_concurrency`](TableOptions::write_concurrency) here).
+    ///   [`write_concurrency`](TableOptions::write_concurrency) here), so a private
+    ///   table reports `false` even for the `auto`/fixed-locks forms.
     pub fn decentralized_counters(&self) -> bool {
         // `DB_FINE_LOCKED` (the normalized concurrency flag) gates the counters
-        // flag, which is the explicit option when given and the kind's default
-        // (`true` only for `ordered_set`) otherwise.
-        let counters_flag = self
-            .decentralized_counters
-            .unwrap_or(self.kind.is_ordered());
+        // flag, which is the explicit option when given and otherwise the kind's
+        // default: `true` for `ordered_set`, and `true` for the `auto` and
+        // fixed-lock forms whatever the kind (they ask for item counters).
+        let counters_flag = self.decentralized_counters.unwrap_or_else(|| {
+            self.kind.is_ordered()
+                || matches!(
+                    self.write_concurrency_mode(),
+                    WriteConcurrency::Auto | WriteConcurrency::FixedLocks(_)
+                )
+        });
         self.write_concurrency() && counters_flag
     }
-
     /// The concurrency mode in effect, derived from the normalized
     /// [`read_concurrency`](TableOptions::read_concurrency) /
     /// [`write_concurrency`](TableOptions::write_concurrency) flags (both set ⇒
@@ -566,457 +733,4 @@ pub fn can_write(access: Access, owner: Option<OwnerId>, requester: Option<Owner
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use beam_common::BeamError;
-
-    #[test]
-    fn table_kind_atom_names_and_predicates() {
-        assert_eq!(TableKind::Set.as_atom_name(), "set");
-        assert_eq!(TableKind::OrderedSet.as_atom_name(), "ordered_set");
-        assert_eq!(TableKind::Bag.as_atom_name(), "bag");
-        assert_eq!(TableKind::DuplicateBag.as_atom_name(), "duplicate_bag");
-
-        assert!(!TableKind::Set.is_multi());
-        assert!(!TableKind::OrderedSet.is_multi());
-        assert!(TableKind::Bag.is_multi());
-        assert!(TableKind::DuplicateBag.is_multi());
-
-        assert!(!TableKind::Set.is_ordered());
-        assert!(TableKind::OrderedSet.is_ordered());
-        assert!(!TableKind::Bag.is_ordered());
-        assert!(!TableKind::DuplicateBag.is_ordered());
-    }
-
-    #[test]
-    fn table_kind_default_is_set() {
-        assert_eq!(TableKind::default(), TableKind::Set);
-    }
-
-    #[test]
-    fn access_atom_names_and_default() {
-        assert_eq!(Access::Public.as_atom_name(), "public");
-        assert_eq!(Access::Protected.as_atom_name(), "protected");
-        assert_eq!(Access::Private.as_atom_name(), "private");
-        assert_eq!(Access::default(), Access::Protected);
-    }
-
-    #[test]
-    fn defaults_match_ets_new() {
-        let opts = TableOptions::new();
-        assert_eq!(opts.kind(), TableKind::Set);
-        assert_eq!(opts.keypos(), 1);
-        assert_eq!(opts.access(), Access::Protected);
-        assert!(!opts.is_named());
-        assert_eq!(opts.name(), None);
-        assert!(!opts.is_compressed());
-        assert!(!opts.write_concurrency());
-        assert!(!opts.read_concurrency());
-        assert_eq!(opts.heir(), None);
-        assert_eq!(opts.decentralized_counters_option(), None);
-        assert!(!opts.decentralized_counters());
-    }
-
-    #[test]
-    fn default_equals_new() {
-        let from_new = TableOptions::new();
-        let from_default = TableOptions::default();
-        assert_eq!(from_new.kind(), from_default.kind());
-        assert_eq!(from_new.keypos(), from_default.keypos());
-        assert_eq!(from_new.access(), from_default.access());
-        assert_eq!(from_new.is_named(), from_default.is_named());
-        assert_eq!(from_new.name(), from_default.name());
-        assert_eq!(from_new.is_compressed(), from_default.is_compressed());
-    }
-
-    #[test]
-    fn set_keypos_rejects_zero_but_accepts_positives() {
-        let mut opts = TableOptions::new();
-        assert!(matches!(
-            opts.set_keypos(0),
-            Err(BeamError::BadArg)
-        ));
-        // A rejected set must not have mutated the option set.
-        assert_eq!(opts.keypos(), 1);
-
-        assert!(opts.set_keypos(3).is_ok());
-        assert_eq!(opts.keypos(), 3);
-    }
-
-    #[test]
-    fn builder_methods_update_and_return_self() {
-        let mut opts = TableOptions::new();
-        opts.set_kind(TableKind::Bag)
-            .set_access(Access::Public)
-            .set_compressed(true)
-            .set_write_concurrency(true)
-            .set_read_concurrency(true)
-            .set_named(true);
-
-        assert_eq!(opts.kind(), TableKind::Bag);
-        assert_eq!(opts.access(), Access::Public);
-        assert!(opts.is_compressed());
-        assert!(opts.write_concurrency());
-        assert!(opts.read_concurrency());
-        assert!(opts.is_named());
-    }
-
-    /// The measured `ets:info(T, decentralized_counters)` rule, row by row.
-    ///
-    /// Every row is a live-oracle observation (system `erl`, OTP 29.1.1 /
-    /// erts-17.1) of `ets:new/2` followed by `ets:info(T, decentralized_counters)`
-    /// and reproduces the C `db_new`: the observable value is
-    /// `DB_FINE_LOCKED && is_decentralized_counters`, the explicit option
-    /// overrides the kind's default (which is `true` only for `ordered_set`), and
-    /// `DB_FINE_LOCKED` needs an effective `write_concurrency`.
-    #[test]
-    fn decentralized_counters_follows_the_measured_oracle_rule() {
-        // (kind, access, write_concurrency, explicit option, oracle value)
-        let rows: &[(TableKind, Access, bool, Option<bool>, bool)] = &[
-            // (a) option omitted: only `ordered_set` + effective `write_concurrency`.
-            (TableKind::Set, Access::Protected, false, None, false),
-            (TableKind::OrderedSet, Access::Protected, false, None, false),
-            (TableKind::Bag, Access::Protected, false, None, false),
-            (TableKind::DuplicateBag, Access::Protected, false, None, false),
-            (TableKind::Set, Access::Protected, true, None, false),
-            (TableKind::OrderedSet, Access::Protected, true, None, true),
-            (TableKind::Bag, Access::Protected, true, None, false),
-            (TableKind::DuplicateBag, Access::Protected, true, None, false),
-            // (b) an explicit option alone is gated on the fine-locked flag.
-            (TableKind::Set, Access::Protected, false, Some(true), false),
-            (TableKind::OrderedSet, Access::Protected, false, Some(true), false),
-            (TableKind::Bag, Access::Protected, false, Some(true), false),
-            // (c) the explicit option wins for a non-`ordered_set` kind.
-            (TableKind::Set, Access::Protected, true, Some(true), true),
-            (TableKind::Bag, Access::Protected, true, Some(true), true),
-            (TableKind::DuplicateBag, Access::Protected, true, Some(true), true),
-            // ... and it overrides `ordered_set`'s default both ways.
-            (TableKind::OrderedSet, Access::Protected, true, Some(true), true),
-            (TableKind::OrderedSet, Access::Protected, true, Some(false), false),
-            (TableKind::OrderedSet, Access::Protected, false, Some(false), false),
-            (TableKind::Set, Access::Protected, true, Some(false), false),
-            // A `private` table never gets the fine-locked flag.
-            (TableKind::OrderedSet, Access::Private, true, None, false),
-            (TableKind::Set, Access::Private, true, Some(true), false),
-            // `read_concurrency` does not affect it.
-            (TableKind::OrderedSet, Access::Public, true, None, true),
-        ];
-
-        for &(kind, access, write_concurrency, explicit, expected) in rows {
-            let mut opts = TableOptions::new();
-            opts.set_kind(kind)
-                .set_access(access)
-                .set_write_concurrency(write_concurrency)
-                .set_read_concurrency(write_concurrency)
-                .set_decentralized_counters(explicit);
-            assert_eq!(
-                opts.decentralized_counters(),
-                expected,
-                "{kind:?} {access:?} write_concurrency={write_concurrency} \
-                 explicit={explicit:?}"
-            );
-            assert_eq!(opts.decentralized_counters_option(), explicit);
-        }
-    }
-
-    /// Clearing the explicit option restores the kind's default; `TableOptions`
-    /// never hides the raw option.
-    #[test]
-    fn decentralized_counters_option_round_trips_and_resets() {
-        let mut opts = TableOptions::new();
-        opts.set_kind(TableKind::Set).set_write_concurrency(true);
-        assert!(!opts.decentralized_counters());
-
-        opts.set_decentralized_counters(Some(true));
-        assert_eq!(opts.decentralized_counters_option(), Some(true));
-        assert!(opts.decentralized_counters());
-
-        opts.set_decentralized_counters(None);
-        assert_eq!(opts.decentralized_counters_option(), None);
-        assert!(!opts.decentralized_counters());
-
-        // `{decentralized_counters,false}` on an `ordered_set` sticks.
-        let mut ordered = TableOptions::new();
-        ordered
-            .set_kind(TableKind::OrderedSet)
-            .set_write_concurrency(true)
-            .set_decentralized_counters(Some(false));
-        assert!(!ordered.decentralized_counters());
-    }
-
-    /// The creation-time heir is stored on the options **as given** (gift data
-    /// included — the copy into table storage happens later, in
-    /// [`Table::build`](crate::Table)) and can be cleared, exactly like
-    /// `{heir, Pid, Data}` / `{heir, none}` at creation. The arity-2
-    /// `{heir, Pid}` form is the `data: None` heir.
-    #[test]
-    fn creation_time_heir_is_stored_and_cleared() {
-        let mut opts = TableOptions::new();
-        assert_eq!(opts.heir(), None);
-
-        let heir = Heir {
-            owner: OwnerId::new(4),
-            data: Some(make_small(11)),
-        };
-        opts.set_heir(Some(heir));
-        assert_eq!(opts.heir(), Some(heir));
-        assert_eq!(opts.heir().and_then(|h| h.data), Some(make_small(11)));
-
-        // The arity-2 form: an heir with no gift data at all.
-        let arity_two = Heir {
-            owner: OwnerId::new(4),
-            data: None,
-        };
-        opts.set_heir(Some(arity_two));
-        assert_eq!(opts.heir(), Some(arity_two));
-        assert_eq!(opts.heir().and_then(|h| h.data), None);
-
-        opts.set_heir(None);
-        assert_eq!(opts.heir(), None);
-    }
-
-    #[test]
-    fn chained_keypos_returns_self() {
-        let mut opts = TableOptions::new();
-        let returned = opts.set_keypos(2).unwrap();
-        assert_eq!(returned.keypos(), 2);
-        assert_eq!(opts.keypos(), 2);
-    }
-
-    #[test]
-    fn set_name_does_not_imply_named() {
-        // `name` and `named_table` are independent, as in the oracle:
-        // `ets:info(ets:new(n, []), named_table) =:= false` while `name` is `n`.
-        let mut opts = TableOptions::new();
-        assert!(!opts.is_named());
-
-        let name = Atom::from_raw(7);
-        opts.set_name(name);
-        assert!(!opts.is_named());
-        assert_eq!(opts.name(), Some(name));
-
-        // The `named_table` option is what sets the flag (`set_named`).
-        opts.set_named(true);
-        assert!(opts.is_named());
-        assert_eq!(opts.name(), Some(name));
-    }
-
-    #[test]
-    fn set_named_false_does_not_clear_name() {
-        // `named_table` and the registered name are separate fields; clearing the
-        // flag leaves the name intact (the name is only set via `set_name`).
-        let mut opts = TableOptions::new();
-        opts.set_name(Atom::from_raw(3));
-        opts.set_named(false);
-        assert!(!opts.is_named());
-        assert_eq!(opts.name(), Some(Atom::from_raw(3)));
-    }
-
-    #[test]
-    fn table_kind_atom_name_round_trip() {
-        for kind in [
-            TableKind::Set,
-            TableKind::OrderedSet,
-            TableKind::Bag,
-            TableKind::DuplicateBag,
-        ] {
-            assert_eq!(TableKind::from_atom_name(kind.as_atom_name()), Some(kind));
-        }
-        assert_eq!(TableKind::from_atom_name("nope"), None);
-        assert_eq!(TableKind::from_atom_name(""), None);
-    }
-
-    #[test]
-    fn access_atom_name_round_trip() {
-        for access in [Access::Public, Access::Protected, Access::Private] {
-            assert_eq!(Access::from_atom_name(access.as_atom_name()), Some(access));
-        }
-        assert_eq!(Access::from_atom_name("nope"), None);
-        assert_eq!(Access::from_atom_name(""), None);
-    }
-
-    #[test]
-    fn concurrency_atom_name_round_trip() {
-        assert_eq!(Concurrency::None.as_atom_name(), "none");
-        assert_eq!(Concurrency::Read.as_atom_name(), "read");
-        assert_eq!(Concurrency::Write.as_atom_name(), "write");
-        assert_eq!(Concurrency::ReadWrite.as_atom_name(), "read_write");
-
-        for concurrency in [
-            Concurrency::None,
-            Concurrency::Read,
-            Concurrency::Write,
-            Concurrency::ReadWrite,
-        ] {
-            assert_eq!(
-                Concurrency::from_atom_name(concurrency.as_atom_name()),
-                Some(concurrency)
-            );
-        }
-        assert_eq!(Concurrency::from_atom_name("nope"), None);
-        assert_eq!(Concurrency::from_atom_name(""), None);
-    }
-
-    #[test]
-    fn options_concurrency_derives_from_flags() {
-        let mut opts = TableOptions::new();
-        assert_eq!(opts.concurrency(), Concurrency::None);
-
-        opts.set_read_concurrency(true);
-        assert_eq!(opts.concurrency(), Concurrency::Read);
-
-        opts.set_write_concurrency(true);
-        assert_eq!(opts.concurrency(), Concurrency::ReadWrite);
-
-        opts.set_read_concurrency(false);
-        assert_eq!(opts.concurrency(), Concurrency::Write);
-
-        opts.set_write_concurrency(false);
-        assert_eq!(opts.concurrency(), Concurrency::None);
-    }
-
-    /// A `private` table reports both concurrency flags as `false` however they
-    /// were requested — and whatever the order, since the rule is applied when the
-    /// flags are read. Verified against the system `erl` (OTP 29 / erts-17.1):
-    /// `ets:info(ets:new(t, [private, {write_concurrency,true},
-    /// {read_concurrency,true}]), write_concurrency) =:= false`.
-    #[test]
-    fn private_tables_force_the_concurrency_flags_off() {
-        for access in [Access::Public, Access::Protected] {
-            let mut opts = TableOptions::new();
-            opts.set_access(access)
-                .set_write_concurrency(true)
-                .set_read_concurrency(true);
-            assert!(opts.write_concurrency(), "{access:?} keeps write_concurrency");
-            assert!(opts.read_concurrency(), "{access:?} keeps read_concurrency");
-            assert_eq!(opts.concurrency(), Concurrency::ReadWrite);
-        }
-
-        // The flag may be set before or after the access mode: both orders agree.
-        let mut flag_first = TableOptions::new();
-        flag_first
-            .set_write_concurrency(true)
-            .set_read_concurrency(true)
-            .set_access(Access::Private);
-        let mut access_first = TableOptions::new();
-        access_first
-            .set_access(Access::Private)
-            .set_write_concurrency(true)
-            .set_read_concurrency(true);
-        for opts in [&flag_first, &access_first] {
-            assert!(!opts.write_concurrency());
-            assert!(!opts.read_concurrency());
-            assert_eq!(opts.concurrency(), Concurrency::None);
-        }
-
-        // `compressed` is **not** forced off by `private` (the oracle reports
-        // `compressed => true` for a private compressed table).
-        let mut compressed = TableOptions::new();
-        compressed.set_access(Access::Private).set_compressed(true);
-        assert!(compressed.is_compressed());
-        assert!(!compressed.write_concurrency());
-    }
-    #[test]
-    fn can_read_matrix() {
-        let a = OwnerId::new(1);
-        let b = OwnerId::new(2);
-
-        // Public: anyone may read, regardless of owner/requester.
-        for owner in [None, Some(a)] {
-            for requester in [None, Some(a), Some(b)] {
-                assert!(
-                    can_read(Access::Public, owner, requester),
-                    "public read owner={owner:?} requester={requester:?}"
-                );
-            }
-        }
-
-        // Protected: anyone may read, regardless of owner/requester.
-        for owner in [None, Some(a)] {
-            for requester in [None, Some(a), Some(b)] {
-                assert!(
-                    can_read(Access::Protected, owner, requester),
-                    "protected read owner={owner:?} requester={requester:?}"
-                );
-            }
-        }
-
-        // Private: only an exact owner match may read.
-        assert!(can_read(Access::Private, None, None)); // None == None
-        assert!(!can_read(Access::Private, None, Some(a)));
-        assert!(!can_read(Access::Private, Some(a), None));
-        assert!(can_read(Access::Private, Some(a), Some(a)));
-        assert!(!can_read(Access::Private, Some(a), Some(b)));
-        assert!(can_read(Access::Private, Some(b), Some(b)));
-        assert!(!can_read(Access::Private, Some(b), Some(a)));
-    }
-
-    #[test]
-    fn can_write_matrix() {
-        let a = OwnerId::new(1);
-        let b = OwnerId::new(2);
-
-        // Public: anyone may write, regardless of owner/requester.
-        for owner in [None, Some(a)] {
-            for requester in [None, Some(a), Some(b)] {
-                assert!(
-                    can_write(Access::Public, owner, requester),
-                    "public write owner={owner:?} requester={requester:?}"
-                );
-            }
-        }
-
-        // Protected: only an exact owner match may write.
-        assert!(can_write(Access::Protected, None, None)); // None == None
-        assert!(!can_write(Access::Protected, None, Some(a)));
-        assert!(!can_write(Access::Protected, Some(a), None));
-        assert!(can_write(Access::Protected, Some(a), Some(a)));
-        assert!(!can_write(Access::Protected, Some(a), Some(b)));
-        assert!(can_write(Access::Protected, Some(b), Some(b)));
-        assert!(!can_write(Access::Protected, Some(b), Some(a)));
-
-        // Private: only an exact owner match may write.
-        assert!(can_write(Access::Private, None, None)); // None == None
-        assert!(!can_write(Access::Private, None, Some(a)));
-        assert!(!can_write(Access::Private, Some(a), None));
-        assert!(can_write(Access::Private, Some(a), Some(a)));
-        assert!(!can_write(Access::Private, Some(a), Some(b)));
-        assert!(can_write(Access::Private, Some(b), Some(b)));
-        assert!(!can_write(Access::Private, Some(b), Some(a)));
-    }
-
-    #[test]
-    fn access_matrix_grid_matches_db_masks() {
-        // Exhaustive 3 access modes × owner ∈ {None, Some(a)} ×
-        // requester ∈ {None, Some(a), Some(b)}, cross-checked against the legacy
-        // status-mask model (DB_READ = PROTECTED|PUBLIC, DB_WRITE = PUBLIC) plus
-        // the exact `requester == owner` fall-back in handle_lacking_permission.
-        let a = OwnerId::new(1);
-        let b = OwnerId::new(2);
-        for access in [Access::Public, Access::Protected, Access::Private] {
-            for owner in [None, Some(a)] {
-                for requester in [None, Some(a), Some(b)] {
-                    let owner_ok = requester == owner;
-                    let expect_read = match access {
-                        Access::Public | Access::Protected => true,
-                        Access::Private => owner_ok,
-                    };
-                    let expect_write = match access {
-                        Access::Public => true,
-                        Access::Protected | Access::Private => owner_ok,
-                    };
-                    assert_eq!(
-                        can_read(access, owner, requester),
-                        expect_read,
-                        "read access={access:?} owner={owner:?} requester={requester:?}"
-                    );
-                    assert_eq!(
-                        can_write(access, owner, requester),
-                        expect_write,
-                        "write access={access:?} owner={owner:?} requester={requester:?}"
-                    );
-                }
-            }
-        }
-    }
-}
+mod tests;

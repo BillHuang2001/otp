@@ -25,7 +25,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use super::{OwnerId, SetOpt, Table};
+use super::{OwnerId, RenameOutcome, SetOpt, Table};
 use crate::select::{MatchContinuation, MatchSpec};
 
 /// An access-enforcing view over a [`Table`] for a specific requester process.
@@ -175,6 +175,29 @@ impl TableAccess<'_> {
     ) -> Result<usize> {
         self.table.check_write(self.requester)?;
         self.table.select_replace(spec, atoms, heap)
+    }
+
+    /// `ets:rename/2`, requiring **write** access.
+    ///
+    /// The oracle resolves the table with the `DB_WRITE` status mask
+    /// (`db_get_table_aux`), so a rename follows the same gate as every other
+    /// write: a non-owner may rename a `public` table, while a non-owner rename
+    /// of a `protected`/`private` table is `badarg`. It is deliberately **not**
+    /// owner-gated the way `ets:give_away/3` is — a rename is a name write, not
+    /// an ownership operation (`src/table/rename.rs` rule 3).
+    ///
+    /// The gate runs **before** the name write, so a denial leaves the table's
+    /// recorded name — like its objects, its [`TableId`](super::TableId), its
+    /// owner and its access mode — untouched. See [`Table::rename`] for the
+    /// name-conflict rules and the registry-rekey obligation the
+    /// [`RenameOutcome`] carries back to the caller.
+    pub fn rename(
+        &mut self,
+        name: Atom,
+        is_taken: impl FnOnce(Atom) -> bool,
+    ) -> Result<RenameOutcome> {
+        self.table.check_write(self.requester)?;
+        self.table.rename(name, is_taken)
     }
 
     // -------------------------------------------------------------------- reads
@@ -342,7 +365,8 @@ impl TableAccess<'_> {
     //
     // The `/3` forms and their `/1` resumptions are all **reads**: they scan the
     // table and build results, they never mutate it. They are therefore
-    // read-checked, like `select`/`match`.
+    // read-checked, like `select`/`match`. The same holds for the
+    // `select_reverse` family below (the reverse-direction `select`).
 
     /// `ets:select/3`, requiring read access. `Ok(None)` ⇒ `'$end_of_table'`.
     pub fn select_limit(
@@ -365,6 +389,43 @@ impl TableAccess<'_> {
     ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
         self.table.check_read(self.requester)?;
         self.table.select_continue(cont, atoms, heap)
+    }
+
+    /// `ets:select_reverse/2`, requiring read access.
+    ///
+    /// The reverse-direction analogue of [`Self::select`]: it only scans and
+    /// builds results, so it is gated as a **read**, exactly like `select`.
+    pub fn select_reverse(
+        &self,
+        spec: &MatchSpec,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<Vec<Eterm>> {
+        self.table.check_read(self.requester)?;
+        self.table.select_reverse(spec, atoms, heap)
+    }
+
+    /// `ets:select_reverse/3`, requiring read access. `Ok(None)` ⇒ `'$end_of_table'`.
+    pub fn select_reverse_limit(
+        &self,
+        spec: &MatchSpec,
+        limit: usize,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.select_reverse_limit(spec, limit, atoms, heap)
+    }
+
+    /// `ets:select_reverse/1`, requiring read access.
+    pub fn select_reverse_continue(
+        &self,
+        cont: &MatchContinuation,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.select_reverse_continue(cont, atoms, heap)
     }
 
     /// `ets:match/3`, requiring read access.

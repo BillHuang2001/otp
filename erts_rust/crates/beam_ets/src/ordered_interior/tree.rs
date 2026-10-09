@@ -295,7 +295,7 @@ impl Tree {
             Some((right_max, right)) => {
                 // The child's maximum may have moved (the split pushed its right
                 // half out), so re-derive the left separator from the child itself.
-                let left_max = self.store.node(child).max_key();
+                let left_max = self.store.subtree_max_key(child);
                 self.store
                     .branch_mut(id)
                     .adopt_split(idx, left_max, right, right_max);
@@ -304,12 +304,15 @@ impl Tree {
                 }
             }
             None => {
-                if inserted {
-                    // A key greater than every separator lands in the last child and
-                    // becomes its new maximum; keep the separator exact.
-                    let child_max = self.store.node(child).max_key();
-                    self.store.branch_mut(id).set_separator(idx, child_max);
-                }
+                // Re-derive the separator from the child's subtree on **every**
+                // descent, not only when a new key was added: an upsert replaces the
+                // object that established the child's maximum, and the caller reclaims
+                // that object's storage right after this call returns. A separator
+                // left pointing at it would go stale and misroute the next search.
+                // `subtree_max_key` descends to the rightmost leaf, so the term it
+                // yields always aliases a live table-owned object.
+                let child_max = self.store.subtree_max_key(child);
+                self.store.branch_mut(id).set_separator(idx, child_max);
             }
         }
         (inserted, None)
@@ -338,8 +341,11 @@ impl Tree {
                 let keys = branch.keys.split_off(ORDER / 2);
                 let children = branch.children.split_off(ORDER / 2);
                 // The right half of an over-full branch holds at least one child.
-                let right_max = *keys.last().expect("a split branch keeps children");
                 let right = self.store.alloc(Node::branch(keys, children));
+                // Re-derive the right half's maximum from its own rightmost leaf
+                // rather than from the last *stored* separator it inherited, which may
+                // alias an object the caller has already replaced and reclaimed.
+                let right_max = self.store.subtree_max_key(right);
                 self.store.put(id, Node::Branch(branch));
                 (right_max, right)
             }
@@ -350,7 +356,7 @@ impl Tree {
     /// become the two children of a fresh root.
     fn split_root(&mut self, right: NodeId, right_max: Eterm) {
         let left = self.root;
-        let left_max = self.store.node(left).max_key();
+        let left_max = self.store.subtree_max_key(left);
         self.root = self
             .store
             .alloc(Node::branch(vec![left_max, right_max], vec![left, right]));
@@ -385,7 +391,7 @@ impl Tree {
             idx
         };
         let settled_child = self.store.branch(id).child_at(settled);
-        let settled_max = self.store.node(settled_child).max_key();
+        let settled_max = self.store.subtree_max_key(settled_child);
         self.store
             .branch_mut(id)
             .set_separator(settled, settled_max);
@@ -454,7 +460,7 @@ impl Tree {
             .pop()
             .expect("a borrowing sibling holds an entry to give");
         self.store.leaf_mut(child).entries.insert(0, entry);
-        let left_max = self.store.node(left).max_key();
+        let left_max = self.store.subtree_max_key(left);
         self.store
             .branch_mut(parent)
             .set_separator(idx - 1, left_max);
@@ -476,7 +482,7 @@ impl Tree {
             .expect("a branching sibling has a child per separator");
         self.store.branch_mut(child).keys.insert(0, key);
         self.store.branch_mut(child).children.insert(0, moved);
-        let left_max = self.store.node(left).max_key();
+        let left_max = self.store.subtree_max_key(left);
         self.store
             .branch_mut(parent)
             .set_separator(idx - 1, left_max);
