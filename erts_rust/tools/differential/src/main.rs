@@ -119,8 +119,7 @@ fn dispatch(command: Command) -> Result<i32> {
             if let Some(gaps_path) = &gaps {
                 let empty = Allowlist::empty();
                 let list = list.as_ref().unwrap_or(&empty);
-                let markdown = ratchet::gaps_markdown(&report, list);
-                ratchet::write_markdown(gaps_path, &markdown)?;
+                ratchet::write_gaps(gaps_path, &report, list)?;
                 eprintln!("differential: wrote {}", gaps_path.display());
             }
             Ok(ratchet::suite_exit_code(&report, strict))

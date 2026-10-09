@@ -209,6 +209,48 @@ pub fn gaps_markdown(report: &RunReport, allowlist: &Allowlist) -> String {
     out
 }
 
+/// The file name of the hand-maintained divergences ledger.
+///
+/// When `suite --gaps <path>` writes the generated report, a file with this name sitting in
+/// the SAME directory as `<path>` is appended verbatim after a blank line, so the document
+/// ends with the ledger. Its absence leaves the generated output byte-for-byte unchanged.
+pub const DIVERGENCES_FILE: &str = "divergences.md";
+
+/// Write the `--gaps` document: the generated gap table (see [`gaps_markdown`]) plus, when a
+/// divergences ledger sits beside `path`, that ledger appended verbatim after a blank line.
+///
+/// The file read is deliberately confined here (never in the pure [`gaps_markdown`] renderer),
+/// so the renderer stays a pure function of the report and the allowlist. Only a *missing*
+/// ledger is tolerated (the section is then omitted); any other IO error is loud.
+pub fn write_gaps(path: &Path, report: &RunReport, allowlist: &Allowlist) -> Result<()> {
+    let mut text = gaps_markdown(report, allowlist);
+    if let Some(ledger) = read_divergences(path)? {
+        text.push('\n');
+        text.push_str(&ledger);
+    }
+    write_markdown(path, &text)
+}
+
+/// Read the divergences ledger that sits in the same directory as `gaps_path`.
+///
+/// Returns `Ok(None)` only when the ledger is absent (the documented "no section" case); an
+/// unreadable or non-UTF-8 ledger is a loud [`Error::Io`], never silently dropped.
+fn read_divergences(gaps_path: &Path) -> Result<Option<String>> {
+    let dir = match gaps_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let ledger = dir.join(DIVERGENCES_FILE);
+    match std::fs::read_to_string(&ledger) {
+        Ok(text) => Ok(Some(text)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::io(
+            format!("reading the divergences ledger '{}'", ledger.display()),
+            source,
+        )),
+    }
+}
+
 /// Write the generated `GAPS.md`, creating its parent directory if needed.
 pub fn write_markdown(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -231,7 +273,7 @@ pub fn write_markdown(path: &Path, text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gaps_markdown, report_from_suite, suite_exit_code, RatchetReport};
+    use super::{gaps_markdown, report_from_suite, suite_exit_code, write_gaps, RatchetReport};
     use crate::allowlist::Allowlist;
     use crate::compare::{FieldDiff, SideResult, Verdict};
     use crate::corpus::Contract;
@@ -454,6 +496,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn write_gaps_appends_the_divergences_ledger_when_present() {
+        use crate::test_support::Scratch;
+        let scratch = Scratch::new("write-gaps-present");
+        let run = report(
+            vec![case("a/gap", Verdict::Unsupported, Some("beam_rt: unsupported: x"))],
+            None,
+        );
+        let list = allowlist("a/gap  crate_a  why\n");
+        let ledger = "# Observed runtime divergences (handoffs)\n\n- a ledger line\n";
+        std::fs::write(scratch.dir.join("divergences.md"), ledger).expect("write the ledger");
+
+        let gaps_path = scratch.dir.join("GAPS.md");
+        write_gaps(&gaps_path, &run, &list).expect("writes the gaps report");
+        let written = std::fs::read_to_string(&gaps_path).expect("the report was written");
+
+        // The pure renderer's table, then a blank line, then the ledger verbatim.
+        assert_eq!(written, format!("{}\n{}", gaps_markdown(&run, &list), ledger));
+        assert!(written.ends_with(ledger), "the document ends with the ledger: {written}");
+    }
+
+    #[test]
+    fn write_gaps_omits_the_ledger_when_absent() {
+        use crate::test_support::Scratch;
+        let scratch = Scratch::new("write-gaps-absent");
+        let run = report(
+            vec![case("a/gap", Verdict::Unsupported, Some("beam_rt: unsupported: x"))],
+            None,
+        );
+        let list = allowlist("a/gap  crate_a  why\n");
+
+        let gaps_path = scratch.dir.join("GAPS.md");
+        write_gaps(&gaps_path, &run, &list).expect("writes the gaps report");
+        let written = std::fs::read_to_string(&gaps_path).expect("the report was written");
+
+        // No ledger beside the report → byte-for-byte the pure renderer's output.
+        assert_eq!(written, gaps_markdown(&run, &list));
+    }
     #[test]
     fn report_from_suite_carries_the_ratchet_and_the_suite_exit_code_still_gates() {
         // A pure synthetic suite: build a real one through the harness is oracle-backed, so
