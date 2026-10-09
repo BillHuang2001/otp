@@ -702,6 +702,10 @@ still reproduces today's collector exactly.
 - `tests/heap_growth.rs` → sustained-growth (nursery/mature grow, live terms intact), the no-half-forward typing under a too-small cap, and the `ensure_capacity` seam
 - `tests/memory_overhead.rs` → per-object overhead vs the frozen layout + the RSS/word-accounting no-leak plateau
 - `tests/stress_cross_generation.rs` → the mixed-term cross-generation correctness gate (cons/tuples/maps/binaries/refc/MSO/funs/pids) through both strategies
+- `tests/collector_adversarial.rs` → the adversarial copy-correctness set (deep nesting, exact-capacity boundary, off-heap refc binary + `Mso` freed exactly once, funs with boxed env, large tuple + flat/HAMT maps) through both strategies
+- `tests/cyclic_safety.rs` → `size_object_bounded` cyclic verdict (typed `TermGraphCyclic`, no hang) + the collector's forwarding-pointer cycle-safety under both strategies
+- `tests/fill_barrier.rs` → the young-heap-exhaustion / fill-barrier contract (typed error before any copy, no half-forward, `ensure_capacity` growth, boundary cases)
+- `tests/retained_vs_live.rs` → GC-side retained-vs-live accounting over a long allocate/collect loop (steady-state capacities, bounded non-growing surplus, RSS plateau)
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`/`adjust_after_fullsweep`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
 - `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`) (read-only)
