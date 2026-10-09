@@ -76,18 +76,15 @@
 //! *unsafe* verdict it might retain is only a missed optimisation (the interpreter is
 //! always correct), never a wrong result.
 //!
-//! # Why the JIT is **opt-in**, not the default
+//! # Why the default is `auto`
 //!
-//! The tier is selected for a process's **first entry** only: a process that pre-empts
-//! yields and is then **resumed on the interpreter** (a tier-aware resume is a missing
-//! engine seam — see `../CONTEXT.md`), so a module whose hot loop reaches a heap-admission
-//! point (`test_heap`/`allocate_heap`, the ordinary allocating shape) spends all but its
-//! first slice on the interpreter and the tier is ≈neutral. The baseline JIT's large win is
-//! confined to a hot loop with **no** heap-admission point anywhere, which then stays in the
-//! one tier-chosen slice. Measured on the release build with `$ERTS_STDLIB_DIR` set (so no
-//! per-process `erl` start-up is included), alternating runs:
+//! The tier costs nothing observable and never regresses a workload, so the **default is
+//! [`JitMode::Auto`]** — the JIT exactly where the soundness predicate proves the entry
+//! module free of a module-context switch, the always-correct interpreter everywhere else.
+//! Measured on the release build with `$ERTS_STDLIB_DIR` set (so no per-process `erl`
+//! start-up is included), alternating runs: **min / median wall seconds**:
 //!
-//! | workload | shape | interpreter (min/med) | `auto` (min/med) |
+//! | workload | shape | interpreter | `auto` |
 //! |---|---|---|---|
 //! | `walk:cnt/1 20000000` | non-allocating tail loop | 16.05 / 17.05 s | 0.116 / 0.127 s |
 //! | `al:tailnoalloc/1 20000000` | non-allocating tail loop | 19.35 s | 0.114 s |
@@ -96,14 +93,23 @@
 //! | `slice:fib/1 300000` (the fixture) | bignum loop | 0.135 / 0.183 s | 0.119 / 0.226 s |
 //! | `slice:fib/1 32` (the fixture) | bignum loop, trivial | 0.026 / 0.033 s | 0.022 / 0.029 s |
 //!
-//! The JIT is never *clearly* faster on the objective's named switch-free fixture
-//! (`slice.beam`: ≈1.0–1.15×, within the run-to-run noise) and never *slower* beyond that
-//! noise either; its 139–170× win needs the no-heap-admission-point shape, whose verdict
-//! also depends on the missing `Step::Enter` deopt seam and on the unresumed-tier seam
-//! above. Because a slower-by-default runtime is unacceptable and those seams are missing,
-//! the **default is the always-correct interpreter** and the JIT is reached by opting in
-//! (`BEAM_RT_TIER=auto`). The selection machinery and the soundness predicate below are
-//! permanent; only the default is conservative.
+//! The 139–170× win is the no-heap-admission-point shape (nothing can pre-empt such a loop,
+//! so it stays in its one tier-chosen slice); the plain `test_heap` shapes are ≈neutral
+//! because `auto` changes nothing there. The default is **not** the switch-blind
+//! [`JitMode::Baseline`] for exactly one reason: the predicate is what keeps a switch out of
+//! a JIT slice, and the engine's `Step::Enter` deopt seam is still missing, so a slice that
+//! could switch would turn a typed gap into a wrong exit reason.
+//!
+//! Two residual engine seams cap the tier; neither makes the default unsafe:
+//!
+//! * **No tier-aware resume.** The tier is chosen for a process's **first entry** only; a
+//!   process that pre-empts and is resumed continues on the interpreter (the tier is not
+//!   carried across a park). So an *allocating* hot loop spends all but its first slice on
+//!   the interpreter — hence the ≈neutral `test_heap` rows above.
+//! * **No in-machine module-context switch.** A step that reports `Step::Enter` ("continue
+//!   in another module's code") is the JIT driver's hard typed
+//!   `unsupported("jit: module context switch outside the interpreter driver")` — which is
+//!   why [`jit_is_switch_safe`] must hold before a module may be tiered.
 
 use std::sync::OnceLock;
 
@@ -121,14 +127,19 @@ use crate::runtime::Runtime;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum JitMode {
     /// The baseline JIT exactly when [`jit_is_switch_safe`] proves the entry module free
-    /// of a module-context switch; the interpreter otherwise.
+    /// of a module-context switch; the interpreter otherwise. **The default.**
     ///
-    /// This is the **opt-in** mode (the `BEAM_RT_TIER=auto` value), not the default: see
-    /// the module docs for the measurements behind the conservative default and
-    /// [`JitMode::Interpreter`] for the default itself.
-    Auto,
-    /// The interpreter unconditionally (the reference tier). The default.
+    /// This is both the unset-`BEAM_RT_TIER` default and the `BEAM_RT_TIER=auto` value: a
+    /// module the predicate cannot prove safe runs on the always-correct interpreter, so
+    /// the default carries no correctness risk (see the module docs for the measurements
+    /// and the residual engine seams).
     #[default]
+    Auto,
+    /// The interpreter unconditionally (the reference tier).
+    ///
+    /// The `BEAM_RT_TIER=interpreter` value: it is the tier the differential gate and the
+    /// pre-JIT measurements are taken against, and the one to pin when a divergence is
+    /// being chased.
     Interpreter,
     /// The baseline JIT unconditionally.
     ///
@@ -144,23 +155,23 @@ pub(super) enum JitMode {
 /// [`JitMode`] for one `BEAM_RT_TIER` value — the **pure** resolution, and the single
 /// definition of the variable's semantics.
 ///
-/// * `None` (the variable is unset) → [`JitMode::Interpreter`] — the default: the
-///   always-correct tier, with no measurable regression on any workload (see the module
-///   docs).
-/// * `Some("auto")` → [`JitMode::Auto`] — the safe way to opt **in** to the JIT: it is
-///   taken exactly where [`jit_is_switch_safe`] proves the entry module free of a
-///   module-context switch, the interpreter everywhere else.
+/// * `None` (the variable is unset) → [`JitMode::Auto`] — **the default**: the JIT exactly
+///   where [`jit_is_switch_safe`] proves the entry module free of a module-context switch,
+///   the interpreter everywhere else (no measurable regression on any workload — see the
+///   module docs).
+/// * `Some("auto")` → [`JitMode::Auto`] — the same mode, named explicitly.
 /// * `Some("baseline")` → [`JitMode::Baseline`] — the forced measurement/debug override of
 ///   the predicate (see [`JitMode::Baseline`] for its risk).
 /// * `Some("interpreter")` and any other value → [`JitMode::Interpreter`] — an unknown
-///   value resolves to the safe default rather than being an error.
+///   value resolves to the always-correct interpreter rather than being an error (so a typo
+///   re-enables the reference tier instead of silently enabling the JIT).
 ///
 /// Pure (no environment read), so a test can pin the semantics without mutating the
 /// process environment (the crate is `#![deny(unsafe_code)]`, and `set_var` is `unsafe` in
 /// edition 2024).
 pub(super) fn mode_from_value(value: Option<&str>) -> JitMode {
     match value {
-        Some("auto") => JitMode::Auto,
+        None | Some("auto") => JitMode::Auto,
         Some("baseline") => JitMode::Baseline,
         _ => JitMode::Interpreter,
     }
@@ -168,8 +179,8 @@ pub(super) fn mode_from_value(value: Option<&str>) -> JitMode {
 
 /// The process-wide default tier mode from the `BEAM_RT_TIER` environment variable.
 ///
-/// The variable's semantics are [`mode_from_value`]'s; an unset or unknown value is the
-/// default [`JitMode::Interpreter`] (the JIT is opt-in, via `BEAM_RT_TIER=auto`). Read
+/// The variable's semantics are [`mode_from_value`]'s; an unset value is the default
+/// [`JitMode::Auto`] and an unknown one the always-correct [`JitMode::Interpreter`]. Read
 /// **once** (a `OnceLock`), so a long-running process pays no repeated `getenv`.
 pub(super) fn env_default() -> JitMode {
     static DEFAULT: OnceLock<JitMode> = OnceLock::new();

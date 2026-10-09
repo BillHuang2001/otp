@@ -173,8 +173,8 @@ pub(crate) struct RunnerState {
 }
 impl RunnerState {
     /// The execution-tier mode in force: the explicitly set one, else the `BEAM_RT_TIER`
-    /// environment default ([`JitMode::Interpreter`](super::tier::JitMode::Interpreter) when
-    /// the variable is unset or unknown — the JIT is opt-in via `BEAM_RT_TIER=auto`).
+    /// environment default ([`JitMode::Auto`](super::tier::JitMode::Auto) when the variable
+    /// is unset — the JIT exactly where the predicate proves it safe).
     pub(super) fn jit_mode(&self) -> super::tier::JitMode {
         self.jit_mode.unwrap_or_else(super::tier::env_default)
     }

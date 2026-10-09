@@ -50,34 +50,39 @@
 //! using `try_borrow_mut` and **deferring** (never dropping, never panicking) when the registry
 //! is still held.
 //!
-//! # What is reclaimed, and the honest gap
+//! # Which tables a death reclaims
 //!
-//! `beam_bifs::TableRegistry` exposes no public owner→handle roster (`all_tids` is
-//! `pub(super)`) and no handle iterator, and an *unnamed* table's handle is only reachable from
-//! its on-heap ref thing through `unsafe`/crate-private decoders. This crate therefore indexes
-//! the tables it can prove: a **`named_table`**, whose handle is resolvable through the public
-//! `TableRegistry::lookup_name` surface at `ets:new/2` time (the creation is observed in
-//! [`RuntimeContext::call_bif`](crate::context::RuntimeContext::call_bif), on the same route
-//! every `ets:new/2` takes). A dead owner's named tables are dropped (and their name
-//! registration released), or handed to a live heir with the oracle's
-//! `{'ETS-TRANSFER', Tid, FromPid, Data}` message — carrying the table's **name atom** as the
-//! tid, exactly as the oracle does for a `named_table`.
+//! The **authority** is `beam_bifs::TableRegistry::handles_owned_by` — the public owner→handle
+//! roster. It lists every live table whose recorded owner is the dead pid, so it covers an
+//! **unnamed** table too (whose handle is the registry key and is reachable from no public term
+//! otherwise). The index recorded at `ets:new/2` time is kept only for what the roster cannot
+//! give: the **registered name** of a `named_table`, which must be released with
+//! [`TableRegistry::remove_name`] when the table is dropped (a table's *name* can only be looked
+//! up from a name one already knows, and an unnamed table has none).
 //!
-//! **Gap (an honest handoff, never a wrong result).** A table created *without* `named_table`
-//! is not indexed, so a dead owner's unnamed table is not reclaimed here (it leaks, as it did
-//! before this module existed) and no fabricated tid is ever produced. Closing that needs a
-//! public owner/handle roster (or a creation hook reporting "this call created handle `H` for
-//! pid `P`") on `beam_bifs::TableRegistry` — reported as a handoff.
+//! A marked table is dropped, or handed to a live heir with the oracle's
+//! `{'ETS-TRANSFER', Tid, FromPid, Data}` message. The tid is the oracle's in each case: the
+//! table's **name atom** for a `named_table`, and the table's **reference** for an unnamed one
+//! (see [`tid_ref_thing`] for how this unsafe-free crate materializes that frozen thing).
+//!
+//! # The unsubscribe gap (a handoff, never a wrong result)
+//!
+//! `ets:setopts(T, {heir, …})`/`ets:give_away/3` move a table without the runtime observing it,
+//! and a table's *name* discovered after creation (a `named_table` renamed by no one, but whose
+//! creation the runtime did not see) would leave a name registration behind. That is a name
+//! leak, not a table leak: the table itself is still reclaimed through the roster.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use beam_alloc::Heap;
+use beam_bifs::TableRegistry;
 use beam_common::Result;
 use beam_ets::{OwnerDeath, OwnerId};
 use beam_process::{
     MonitorRef, PortId, PortWatch, ProcessExit, ProcessExitObserver, ProcessId, ProcessTable,
-    Scheduler,
+    RefAllocator, Scheduler,
 };
 use beam_term::{make_atom, Atom, Eterm};
 
@@ -216,15 +221,58 @@ fn owner_is_alive(table: &ProcessTable, owner: OwnerId) -> bool {
     }
 }
 
+/// The **tid** the oracle puts in `{'ETS-TRANSFER', Tid, FromPid, Data}` for an *unnamed*
+/// table: the table's reference — this runtime's frozen 4-word ref thing
+/// `[make_header(3, REF_SUBTAG), 0, 0, id]` whose `id` **is the registry handle** (the
+/// table-taking BIFs decode a tid with `beam_bifs::access::ref_thing_id`, i.e. the last payload
+/// word, so a tid that does not decode back to the handle must never be built).
+///
+/// # Why this goes through [`MonitorRef`]
+///
+/// The only producer of that frozen thing is `beam_bifs::access::make_ref_thing`, which is
+/// `pub(crate)`, and [`MonitorRef`] has no public `from_id` constructor (`id` is private; only
+/// [`RefAllocator::next`] mints one). [`MonitorRef::to_eterm`] is byte-identical to
+/// `make_ref_thing` (both write `[make_header(3, REF_SUBTAG), 0, 0, id]`), so it is the
+/// **substitution** used here: a fresh [`RefAllocator`] hands out ids `0, 1, 2, …`, so `handle`
+/// is reached after `handle + 1` draws.
+///
+/// The caveat is the cost: the draw count is the handle value. That is bounded by the number of
+/// tables this OS process has created (`beam_ets`'s `TableId` counter is global-monotonic from
+/// `1`), and this path only runs for an unnamed table that carries an installed arity-3 heir,
+/// so it is small in every real run — but it is *not* O(1). A public mint — widen
+/// `beam_bifs::access::make_ref_thing` to `pub`, or add `MonitorRef::from_id(u64)` — removes the
+/// loop; both are cross-crate changes reported as a handoff.
+///
+/// Using a fresh allocator (rather than the runtime's own [`Runtime::refs_mut`]) is deliberate:
+/// the runtime's ref space hands out *its own* next id, which is **not** the handle, so the tid
+/// would not resolve back to the table — a wrong tid, worse than any substitute.
+///
+/// # Errors
+///
+/// Propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot fit the
+/// four words.
+fn tid_ref_thing(heap: &mut Heap, handle: u64) -> Result<Eterm> {
+    let mut refs = RefAllocator::new();
+    let mut reference = refs.next(); // id 0
+    for _ in 0..handle {
+        reference = refs.next();
+    }
+    reference.to_eterm(heap)
+}
+
 impl Runtime {
     /// Adopts a `named_table` this runtime's `ets:new/2` **just created** for `owner`: records
-    /// it in the owner index (so a later death reclaims it) and takes ownership of the
-    /// creation-time heir's gift term.
+    /// the `name` registration against its `handle` — the one thing
+    /// [`Runtime::drain_ets_owner_exits`] cannot recover from the registry afterwards, since a
+    /// table's name can only be looked up from a name one already knows — and takes ownership of
+    /// the creation-time heir's gift term.
     ///
     /// Called from the runtime's `ets:new/2` interception
     /// ([`RuntimeContext::call_bif`](crate::context::RuntimeContext::call_bif)) with the handle
     /// the creation newly registered under `name` — the one point where the runtime, which
     /// cannot see `beam_bifs`'s private table registry, can resolve a fresh table's handle.
+    /// (The *set* of tables a death reclaims no longer needs this: it comes from the registry's
+    /// owner→handle roster, so an unnamed table is covered too.)
     pub(crate) fn adopt_created_table(&mut self, owner: ProcessId, handle: u64, name: Atom) {
         self.ets_owners.borrow_mut().record(owner, handle, name);
         self.own_heir_gift(handle);
@@ -267,9 +315,16 @@ impl Runtime {
         let _ = table.install_heir(heir.owner, Some(data));
     }
 
-    /// Discharges the ETS obligations recorded since the last drain: every indexed table owned
-    /// by a process that has since died is dropped, or handed to its live heir with the
-    /// oracle's `{'ETS-TRANSFER', Tid, FromPid, Data}` message.
+    /// Discharges the ETS obligations recorded since the last drain: every table a dead process
+    /// owned is dropped, or handed to its live heir with the oracle's
+    /// `{'ETS-TRANSFER', Tid, FromPid, Data}` message.
+    ///
+    /// The set of tables to act on is the `beam_bifs::TableRegistry::handles_owned_by` roster
+    /// (which covers a table created **without** `named_table`, whose handle is the registry key
+    /// and is reachable from no public term), unioned with the handles the index recorded at
+    /// `ets:new/2` time and deduplicated in ascending handle order. The index contributes one
+    /// thing the roster cannot: the **registered name** of a `named_table`, needed to release the
+    /// name registration when the table is dropped.
     ///
     /// Must be called at a point where no ETS borrow from the runtime's own call path can be
     /// live (a scheduler-pass round boundary). The ETS registry is taken with `try_borrow_mut`:
@@ -305,31 +360,53 @@ impl Runtime {
             index.deaths = deferred;
             return Ok(0);
         };
-        // `(heir pid, gift data, table name, dead owner term)` per pending transfer.
-        let mut transfers: Vec<(ProcessId, Eterm, Atom, Eterm)> = Vec::new();
+        // `(heir pid, gift data, the handle's registered name, the handle, dead owner term)`
+        // per pending transfer. `name` is `Some` exactly for a `named_table` (the only kind the
+        // index records), and is what decides the tid: the name atom for a named table, the
+        // handle's ref thing for an unnamed one (see [`tid_ref_thing`]).
+        let mut transfers: Vec<(ProcessId, Eterm, Option<Atom>, u64, Eterm)> = Vec::new();
         for dead in deaths {
-            let owned = {
+            // The registered names this owner's `named_table`s were created under, keyed by
+            // handle. Taken (not just read) so the index holds nothing for a pid that has died.
+            let recorded: HashMap<u64, Atom> = {
                 let mut index = self.ets_owners.borrow_mut();
-                index.tables.remove(&owner_key(dead)).unwrap_or_default()
+                index
+                    .tables
+                    .remove(&owner_key(dead))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|owned| (owned.handle, owned.name))
+                    .collect()
             };
-            if owned.is_empty() {
-                continue;
-            }
             let dead_owner = OwnerId::new(owner_key(dead));
             let from = dead.to_eterm();
-            for record in owned {
+            // The roster is the authority on **which** tables the dead pid owned — including an
+            // *unnamed* table, which the index never held. The recorded handles are folded in
+            // (deduplicated, ascending) so the index's view can never lose an obligation the
+            // roster happened to omit; a handle the roster does not list is `NotOwner` at
+            // `owner_died` and is skipped there.
+            let mut handles = registry.handles_owned_by(TableRegistry::owner_of(dead));
+            handles.extend(recorded.keys().copied());
+            handles.sort_unstable();
+            handles.dedup();
+            for handle in handles {
+                let name = recorded.get(&handle).copied();
                 // The owner-death transition is `beam_ets`'s (it owns the heir/self-heir/dead-
                 // heir rules); the runtime only acts on the obligation it returns. A handle
                 // whose table was already deleted (`ets:delete/1`) is a stale index entry.
-                let outcome = match registry.get_mut(record.handle) {
+                let outcome = match registry.get_mut(handle) {
                     Some(entry) => entry.owner_died(dead_owner, |heir| owner_is_alive(table, heir)),
                     None => continue,
                 };
                 match outcome {
                     OwnerDeath::NotOwner => {}
                     OwnerDeath::Deleted => {
-                        registry.remove(record.handle);
-                        registry.remove_name(record.name);
+                        registry.remove(handle);
+                        // Only a `named_table` registered a name (an unnamed table still records
+                        // its name field but takes part in no registry — `beam_bifs::ets::new_2`).
+                        if let Some(name) = name {
+                            registry.remove_name(name);
+                        }
                     }
                     OwnerDeath::Transferred(heir) => {
                         // An arity-2 `{heir, Pid}` inherits in silence (the oracle sends no
@@ -338,7 +415,7 @@ impl Runtime {
                             if let Ok(to) =
                                 ProcessId::from_eterm(Eterm::from_raw(heir.owner.raw() as usize))
                             {
-                                transfers.push((to, data, record.name, from));
+                                transfers.push((to, data, name, handle, from));
                             }
                         }
                     }
@@ -357,13 +434,17 @@ impl Runtime {
         let tag = self.intern("ETS-TRANSFER");
         let mut heap = self.take_bif_heap()?;
         let mut delivered = 0usize;
-        for (to, data, name, from) in transfers {
+        for (to, data, name, handle, from) in transfers {
             // A terminated heir's slot is reclaimed and its serial bumped, so a stale pid must
             // be checked before delivery (the port half's model).
             if !table.contains(to) {
                 continue;
             }
-            let message = heap.tuple(&[tag, make_atom(name), from, data])?;
+            let tid = match name {
+                Some(name) => make_atom(name),
+                None => tid_ref_thing(&mut heap, handle)?,
+            };
+            let message = heap.tuple(&[tag, tid, from, data])?;
             table.deliver_simple(to, from, message)?;
             delivered += 1;
         }
@@ -486,6 +567,24 @@ mod tests {
             ProcessId::from_eterm(Eterm::from_raw(owner_key(pid) as usize)).expect("decodes"),
             pid
         );
+    }
+
+    /// The one non-obvious step of the [`tid_ref_thing`] substitution: a fresh [`RefAllocator`]
+    /// draws the ids `0, 1, 2, …`, so `handle + 1` draws land **exactly** on `handle`. An
+    /// off-by-one here would mint a tid that does not decode back to the table — the one
+    /// outcome the substitution must never produce. (The end-to-end proof that a tid built this
+    /// way really *resolves* is `tests/ets_owner.rs`'s unnamed-transfer flow, where the heir
+    /// `ets:insert/2`s through the received tid.)
+    #[test]
+    fn the_tid_substitution_lands_on_the_handle_id() {
+        for handle in [0u64, 1, 2, 7, 4096] {
+            let mut refs = RefAllocator::new();
+            let mut reference = refs.next();
+            for _ in 0..handle {
+                reference = refs.next();
+            }
+            assert_eq!(reference.id(), handle, "the substitution must land on {handle}");
+        }
     }
 
     /// The observer's port-watch half records every `(port, reference)` pair a death drained,

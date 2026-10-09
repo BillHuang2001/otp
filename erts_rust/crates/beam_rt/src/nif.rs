@@ -53,26 +53,40 @@
 //! predicted-index lists would corrupt each other. One shared list, committed once by the
 //! caller, keeps every predicted index exact.
 //!
-//! # Typed gaps (never a wrong result)
+//! # The host's runtime services
 //!
-//! [`NifHostImpl`] leaves `term_to_binary`/`binary_to_term`/`make_ref` at the trait defaults
-//! (the typed `None`), so an `enif_term_to_binary`/`enif_binary_to_term`/`enif_make_ref` NIF
-//! reports failure rather than fabricating a term. It **does** implement the whole
+//! [`NifHostImpl`] serves a NIF call the runtime state it can reach: the atom services
+//! (`intern_atom`/`atom_name`/`existing_atom`), the **ETF codec**
+//! (`term_to_binary`/`binary_to_term`, over the same `beam_codec` encoder/decoder and the same
+//! deferred-interner discipline the `erlang:term_to_binary/1` BIF uses), a **unique-integer
+//! source** (`unique_integer`, mirroring the C emulator's four counter sequences) and the
+//! emulator **system-information** block (`system_info`). It also implements the whole
 //! extra-environment family — `alloc_env`/`free_env` (a live message environment whose atoms are
 //! the runtime's own, see [`NifHost::alloc_env`]) and `make_copy` (the message-env idiom's term
-//! movement, see [`NifHost::make_copy`]) — and `erlang:load_nif/2` on an already-loaded module is
-//! a `reload` (the oracle's rule since OTP 20).
+//! movement, see [`NifHost::make_copy`]).
+//!
+//! # Typed gaps (never a wrong result)
+//!
+//! Two hooks stay at the trait default (the typed `None`). `make_ref` and `whereis_pid` need
+//! runtime state this host is **not** built with — the reference-id allocator and the process
+//! registry, which are fields of [`Runtime`](crate::Runtime) that only the borrowing
+//! [`RuntimeContext`](crate::context::RuntimeContext) can reach — so `enif_make_ref` raises
+//! `badarg` and `enif_whereis_pid` reports "not found" instead of fabricating a reference or a
+//! pid. `erlang:load_nif/2` on an already-loaded module is a `reload` (the oracle's rule since
+//! OTP 20).
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use beam_abi::nif::loader::{NifCallError, NifLibrary};
 use beam_abi::nif::types::ErlNifEnv;
-use beam_abi::{NifEnv, NifHost};
+use beam_abi::{ErlDrvSysInfo, NifEnv, NifHost};
 use beam_alloc::Heap;
 use beam_bifs::AtomInterner;
-use beam_term::prelude::{atom_val, is_atom, is_header, make_atom, Eterm};
+use beam_term::prelude::{atom_val, is_atom, is_header, make_atom, make_small, Eterm};
 use beam_term::AtomTable;
+use libc::c_char;
 
 use crate::context::PendingInterner;
 
@@ -217,6 +231,34 @@ impl NifHostImpl {
     }
 }
 
+/// The four independent unique-integer counters (one per property combination), exactly as the C
+/// emulator keeps four sequences.
+static UNIQUE_COUNTERS: [AtomicI64; 4] = [
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+    AtomicI64::new(0),
+];
+
+/// The monotonic-counter base — `erlang:unique_integer([monotonic])`'s first value.
+const UNIQUE_MONOTONIC_BASE: i64 = -576_460_752_303_423_488;
+/// The non-monotonic (negative) counter base — the oracle's first `erlang:unique_integer()`.
+const UNIQUE_NEGATIVE_BASE: i64 = -576_460_752_303_421_235;
+/// The first `erlang:unique_integer([positive])`.
+const UNIQUE_POSITIVE_BASE: i64 = 2_307;
+/// The first `erlang:unique_integer([positive, monotonic])`.
+const UNIQUE_POSITIVE_MONOTONIC_BASE: i64 = 2;
+
+/// `ERLANG_VERSION` — the emulator's ERTS version string, NUL-terminated ([`beam_common::ERTS_VERSION`]).
+///
+/// A `static` so the pointer handed out by `system_info` (`ErlDrvSysInfo::erts_version`) stays valid
+/// for as long as the caller may read it, which is what the C's emulator-owned string guarantees.
+static ERTS_VERSION_C: &[u8] = b"17.1\0";
+
+/// `ERLANG_OTP_RELEASE` — the OTP release string, NUL-terminated (the major of
+/// [`beam_common::OTP_VERSION`]).
+static OTP_RELEASE_C: &[u8] = b"30\0";
+
 impl NifHost for NifHostImpl {
     fn heap(&mut self) -> &mut Heap {
         &mut self.heap
@@ -242,6 +284,120 @@ impl NifHost for NifHostImpl {
     /// `erlang:self()` inside the NIF — the pid the calling process runs as.
     fn self_pid(&mut self) -> Option<Eterm> {
         Some(self.self_pid)
+    }
+
+    /// `enif_term_to_binary` — encode `term` as an External Term Format image.
+    ///
+    /// This is the **same** image `erlang:term_to_binary/1` produces: [`beam_codec::Encoder::new`]
+    /// writes the leading `VERSION_MAGIC` (`131`) and defaults to [`MinorVersion::V2`] with no
+    /// compression, which is precisely `term_to_binary/1`'s `TERM_TO_BINARY_DFLAGS`-with-`level=0`
+    /// option set. The runtime's local node identity is installed first (mirroring the BIF's
+    /// `encode_body`), so an internal pid/port id encodes as the oracle's `NEW_PID_EXT`/`V4_PORT_EXT`
+    /// rather than being unencodable.
+    ///
+    /// A tag the codec cannot write — most importantly a local (`make_fun3`) fun, whose identity is
+    /// the *compiled module's*, unreachable from this host — yields the typed `None`: `enif_term_to_binary`
+    /// then answers the C's failure code `0` and writes nothing, never a wrong image.
+    ///
+    /// [`MinorVersion::V2`]: beam_codec::MinorVersion::V2
+    fn term_to_binary(&mut self, term: Eterm) -> Option<Vec<u8>> {
+        // The local node identity is the fixed `nonode@nohost` sysname the runtime seeds into the
+        // shared table at boot (the same identity the node bridge hands `beam_codec`). Creation is
+        // not part of the term layout this runtime models, so it is the C's default `0`.
+        let node = self.atoms.lookup(crate::dist::NONODE_NAME);
+        let mut encoder = beam_codec::Encoder::new(&self.atoms);
+        if let Some(node) = node {
+            encoder = encoder.with_local_node(node, 0);
+        }
+        encoder.encode(term).ok()?;
+        Some(encoder.finish())
+    }
+
+    /// `enif_binary_to_term` — decode an External Term Format image onto this host's heap.
+    ///
+    /// The decoder owns the version-byte check and the `COMPRESSED` wrapper, and is strict about
+    /// trailing bytes in the plain form, so a malformed, truncated or wrong-version image is the
+    /// typed `None` (the C's `0`). `None` is also what an undecodable *tag* yields — never a partial
+    /// term.
+    ///
+    /// A name the image introduces is not yet in the runtime's shared table (this host may only
+    /// borrow it), so the shared table is **cloned** and the decoder interns into the clone; every
+    /// name the clone appended is then recorded on the shared [`PendingInterner`] at exactly the
+    /// index the clone assigned it, for the caller to materialise once its own borrow is released.
+    /// `intern` — not `intern_atom` — is load-bearing: the interner's `base` was fixed when this host
+    /// was built, so appending mid-sequence would shift the prediction of every later name.
+    fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
+        let mut local = (*self.atoms).clone();
+        let known = local.len();
+        let term = beam_codec::decode_term(bytes, &mut self.heap, &mut local).ok()?;
+        for index in known..local.len() {
+            let Some(name) = local.name(beam_term::Atom::from_raw(index as u32)) else {
+                continue;
+            };
+            self.interner.intern(name);
+        }
+        Some(term)
+    }
+
+    /// `enif_make_existing_atom` — look `name` up in the **committed** table, never creating it.
+    ///
+    /// `None` is the C's "no such atom" (`0`, `*atom` untouched). An atom interned earlier in the
+    /// *same* call is not yet committed, so it is not visible here — but `beam_abi`'s per-`NifEnv`
+    /// atom record ([`NifEnv::recorded_atom`](beam_abi::nif::host::NifEnv)) covers exactly that case
+    /// and is consulted before this hook, so a same-call atom still resolves.
+    fn existing_atom(&mut self, name: &str) -> Option<Eterm> {
+        self.atoms.lookup(name).map(make_atom)
+    }
+
+    /// `enif_make_unique_integer` — draw from the runtime's four NIF-facing unique sequences.
+    ///
+    /// One monotonic counter per property combination, so a value under `[positive, monotonic]` is
+    /// strictly increasing among its own draws. The bases mirror the C emulator's sequences (see
+    /// [`beam_abi`](beam_abi::nif::enif::time)'s built-in fallback), so a host-supplied value has the
+    /// same shape a library sees from any other runtime. `wrapping_add` keeps a counter that runs for
+    /// the lifetime of the process from ever overflowing into a panic.
+    ///
+    /// This runtime serves no `erlang:unique_integer/1`, so these sequences are the **only**
+    /// NIF-facing unique source — nothing else in the runtime draws from them.
+    fn unique_integer(&mut self, positive: bool, monotonic: bool) -> Option<Eterm> {
+        let index = (positive as usize) | ((monotonic as usize) << 1);
+        let base = match (positive, monotonic) {
+            (false, false) => UNIQUE_NEGATIVE_BASE,
+            (false, true) => UNIQUE_MONOTONIC_BASE,
+            (true, false) => UNIQUE_POSITIVE_BASE,
+            (true, true) => UNIQUE_POSITIVE_MONOTONIC_BASE,
+        };
+        let step = UNIQUE_COUNTERS[index].fetch_add(1, Ordering::Relaxed);
+        Some(make_small(base.wrapping_add(step)))
+    }
+
+    /// `enif_system_info` — the emulator's information block.
+    ///
+    /// The two version strings point at this file's `static`s, so they are NUL-terminated and outlive
+    /// the call. `thread_support`/`smp_support` are the build capabilities the C hard-codes to `1`
+    /// (`io.c`'s `driver_system_info`); `async_threads` is `0` and `scheduler_threads` is `1` because
+    /// this runtime really is single-threaded with no async pool. `dirty_scheduler_support` is `0`:
+    /// this runtime has **no** dirty schedulers and its `enif_schedule_nif` hook is unsupported, so
+    /// reporting them as available would be a capability lie the C only avoids because OTP always
+    /// builds them in. The four ABI-version fields are `beam_abi`'s compile-time constants (the C
+    /// hard-codes them in `driver_system_info` too), and `enif_system_info` overwrites them anyway.
+    ///
+    /// The scheduler count does not come from the runtime configuration (`+S N`) — this host is not
+    /// built with it — so `scheduler_threads` is the honest single-threaded `1`.
+    fn system_info(&mut self) -> Option<ErlDrvSysInfo> {
+        Some(ErlDrvSysInfo {
+            driver_major_version: beam_abi::ERL_DRV_EXTENDED_MAJOR_VERSION,
+            driver_minor_version: beam_abi::ERL_DRV_EXTENDED_MINOR_VERSION,
+            erts_version: ERTS_VERSION_C.as_ptr() as *mut c_char,
+            otp_release: OTP_RELEASE_C.as_ptr() as *mut c_char,
+            thread_support: 1,
+            smp_support: 1,
+            async_threads: 0,
+            scheduler_threads: 1,
+            nif_major_version: beam_abi::ERL_NIF_MAJOR_VERSION,
+            nif_minor_version: beam_abi::ERL_NIF_MINOR_VERSION,
+            dirty_scheduler_support: 0,
+        })
     }
 
     /// `enif_alloc_env()` — a fresh message environment owned by this host.
@@ -343,7 +499,25 @@ pub(crate) fn map_load_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beam_term::prelude::{make_small, Atom};
+    use beam_term::prelude::{is_small, make_small, signed_value, Atom, NIL};
+
+    /// A host over a fresh table that already holds every name in `seed`, plus the table handle and
+    /// the interner, so a test can observe exactly what the host committed (and what it did not).
+    fn host_with(seed: &[&str]) -> (NifHostImpl, Rc<AtomTable>, PendingInterner) {
+        let mut table = AtomTable::new();
+        for name in seed {
+            table.intern(name);
+        }
+        let atoms = Rc::new(table);
+        let interner = PendingInterner::new(atoms.len());
+        let host = NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            Rc::clone(&atoms),
+            interner.clone(),
+            make_small(7),
+        );
+        (host, atoms, interner)
+    }
 
     /// [`NifHost::make_copy`] is the **identity**: `alloc_env` builds the message env over this
     /// same host, so the message env and the call env share one heap and there is nothing to move.
@@ -492,5 +666,180 @@ mod tests {
             map_load_error(Abi::OldCode("f".into())),
             Bifs::OldCode("f".into())
         );
+    }
+
+    // The oracle byte vectors: `binary_to_list(term_to_binary(T))` from the system `erl`, pinned
+    // literally so the host's ETF encoder is checked against the real image, not a guess.
+    /// `42` → `[131, 97, 42]`.
+    const ORACLE_SMALL: &[u8] = &[131, 97, 42];
+    /// `[1,2,3]` → `[131, 107, 0, 3, 1, 2, 3]`.
+    const ORACLE_LIST: &[u8] = &[131, 107, 0, 3, 1, 2, 3];
+    /// `hello` → `[131, 119, 5, 104, 101, 108, 108, 111]`.
+    const ORACLE_ATOM: &[u8] = &[131, 119, 5, 104, 101, 108, 108, 111];
+    /// `#{a => 1}` → `[131, 116, 0, 0, 0, 1, 119, 1, 97, 97, 1]`.
+    const ORACLE_MAP: &[u8] = &[131, 116, 0, 0, 0, 1, 119, 1, 97, 97, 1];
+    /// `{a,1,<<"hi">>}` → `[131, 104, 3, 119, 1, 97, 97, 1, 109, 0, 0, 0, 2, 104, 105]`.
+    const ORACLE_TUPLE: &[u8] = &[131, 104, 3, 119, 1, 97, 97, 1, 109, 0, 0, 0, 2, 104, 105];
+
+    /// `term_to_binary` emits the very bytes `erlang:term_to_binary/1` emits — the version byte,
+    /// the `MinorVersion::V2` tag set, no compression.
+    #[test]
+    fn term_to_binary_matches_the_oracle_bytes() {
+        let (mut host, _atoms, _interner) = host_with(&["hello", "a"]);
+
+        assert_eq!(
+            host.term_to_binary(make_small(42)).as_deref(),
+            Some(ORACLE_SMALL)
+        );
+
+        // `hello` is committed, so the encoder can name it (a predicted-only atom could not).
+        let hello = host.intern_atom("hello").expect("seeded");
+        assert_eq!(host.term_to_binary(hello).as_deref(), Some(ORACLE_ATOM));
+
+        // Build `[1,2,3]` on the host's own heap; the returned pointers stay valid because the
+        // bump heap never moves its storage.
+        let heap = host.heap();
+        let l3 = heap.cons(make_small(3), NIL).expect("a test heap");
+        let l2 = heap.cons(make_small(2), l3).expect("a test heap");
+        let list = heap.cons(make_small(1), l2).expect("a test heap");
+        assert_eq!(host.term_to_binary(list).as_deref(), Some(ORACLE_LIST));
+    }
+
+    /// Every oracle image decodes and then re-encodes to exactly the bytes it came from.
+    #[test]
+    fn binary_to_term_round_trips_the_oracle_images() {
+        let (mut host, _atoms, _interner) = host_with(&["hello", "a"]);
+
+        for image in [ORACLE_SMALL, ORACLE_LIST, ORACLE_ATOM, ORACLE_MAP, ORACLE_TUPLE] {
+            let term = host.binary_to_term(image).expect("a decodable oracle image");
+            assert_eq!(
+                host.term_to_binary(term).as_deref(),
+                Some(image),
+                "the decoded term re-encodes to the image it came from"
+            );
+        }
+
+        assert_eq!(host.binary_to_term(ORACLE_SMALL), Some(make_small(42)));
+    }
+
+    /// A malformed, truncated or wrong-version image is the typed `None` — never a partial term.
+    #[test]
+    fn binary_to_term_rejects_malformed_and_truncated_images() {
+        let (mut host, _atoms, _interner) = host_with(&["a"]);
+        for bad in [
+            &[][..],
+            &[131][..],                 // no term after the version byte
+            &[131, 97][..],             // a small int with its byte missing
+            &[131, 107, 0, 3, 1, 2][..], // a list claiming 3 elements but holding 2
+            &[131, 97, 42, 0][..],      // a trailing byte after a complete plain term
+            &[130, 97, 42][..],         // the wrong version byte
+        ] {
+            assert_eq!(host.binary_to_term(bad), None, "rejected: {bad:?}");
+        }
+    }
+
+    /// A committed name decodes to its existing index; a new name is predicted at the index the
+    /// cloned table assigned it and materialises there once the caller commits.
+    #[test]
+    fn binary_to_term_resolves_and_predicts_atoms() {
+        let (mut host, atoms, interner) = host_with(&["known"]);
+        let known = atoms.lookup("known").expect("seeded");
+
+        // `known` — an atom already in the table, so the interner is untouched.
+        let existing = &[131u8, 119, 5, b'k', b'n', b'o', b'w', b'n'];
+        assert_eq!(host.binary_to_term(existing), Some(make_atom(known)));
+        assert!(interner.is_empty(), "an existing atom interns nothing");
+
+        // `fresh` — a name the table does not hold yet: predicted at the clone's first free index.
+        let fresh = &[131u8, 119, 5, b'f', b'r', b'e', b's', b'h'];
+        let term = host.binary_to_term(fresh).expect("decodes");
+        assert_eq!(term, make_atom(Atom::from_raw(atoms.len() as u32)));
+
+        // The commit lands the name at exactly that predicted index.
+        let mut committed = (*atoms).clone();
+        interner.commit(&mut committed);
+        assert_eq!(
+            committed.name(Atom::from_raw(atoms.len() as u32)),
+            Some("fresh")
+        );
+    }
+
+    /// `existing_atom` is a pure lookup: a miss interns nothing and records nothing.
+    #[test]
+    fn existing_atom_never_interns() {
+        let (mut host, atoms, interner) = host_with(&["known"]);
+        let before = atoms.len();
+
+        assert_eq!(
+            host.existing_atom("known"),
+            Some(make_atom(atoms.lookup("known").expect("seeded")))
+        );
+        assert_eq!(host.existing_atom("nope"), None, "an unknown name is a miss");
+        assert_eq!(atoms.len(), before, "a miss interns nothing");
+        assert!(interner.is_empty(), "a miss records nothing on the interner");
+    }
+
+    /// Each property combination draws from its own sequence: successive values are strictly
+    /// increasing, and `positive = true` yields a positive value.
+    #[test]
+    fn unique_integers_are_strictly_increasing_and_positive_when_asked() {
+        let (mut host, _atoms, _interner) = host_with(&[]);
+        for (positive, monotonic) in [(false, false), (false, true), (true, false), (true, true)] {
+            let first = host
+                .unique_integer(positive, monotonic)
+                .expect("always mints");
+            let second = host
+                .unique_integer(positive, monotonic)
+                .expect("always mints");
+            assert!(is_small(first) && is_small(second), "both are small integers");
+            assert!(
+                signed_value(second) > signed_value(first),
+                "strictly increasing for ({positive}, {monotonic})"
+            );
+            if positive {
+                assert!(signed_value(first) > 0, "positive = true yields > 0");
+            }
+        }
+    }
+
+    /// The emulator information block: NUL-terminated version strings equal to the workspace
+    /// constants, the build capabilities, and `beam_abi`'s ABI versions.
+    #[test]
+    fn system_info_reports_the_emulators_real_shape() {
+        // The statics are NUL-terminated and carry exactly the workspace's version strings.
+        assert_eq!(ERTS_VERSION_C.last(), Some(&0), "ERTS version is NUL-terminated");
+        assert_eq!(
+            &ERTS_VERSION_C[..ERTS_VERSION_C.len() - 1],
+            beam_common::ERTS_VERSION.as_bytes()
+        );
+        let otp_major = beam_common::OTP_VERSION
+            .split('.')
+            .next()
+            .expect("OTP_VERSION has a major");
+        assert_eq!(OTP_RELEASE_C.last(), Some(&0), "OTP release is NUL-terminated");
+        assert_eq!(
+            &OTP_RELEASE_C[..OTP_RELEASE_C.len() - 1],
+            otp_major.as_bytes()
+        );
+
+        let (mut host, _atoms, _interner) = host_with(&[]);
+        let info = host.system_info().expect("always supplies the block");
+        assert_eq!(info.erts_version, ERTS_VERSION_C.as_ptr() as *mut c_char);
+        assert_eq!(info.otp_release, OTP_RELEASE_C.as_ptr() as *mut c_char);
+        assert_eq!(info.thread_support, 1);
+        assert_eq!(info.smp_support, 1);
+        assert_eq!(info.async_threads, 0);
+        assert_eq!(info.scheduler_threads, 1);
+        assert_eq!(info.dirty_scheduler_support, 0);
+        assert_eq!(
+            info.driver_major_version,
+            beam_abi::ERL_DRV_EXTENDED_MAJOR_VERSION
+        );
+        assert_eq!(
+            info.driver_minor_version,
+            beam_abi::ERL_DRV_EXTENDED_MINOR_VERSION
+        );
+        assert_eq!(info.nif_major_version, beam_abi::ERL_NIF_MAJOR_VERSION);
+        assert_eq!(info.nif_minor_version, beam_abi::ERL_NIF_MINOR_VERSION);
     }
 }

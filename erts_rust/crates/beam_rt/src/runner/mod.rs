@@ -79,19 +79,18 @@
 //! (`Step::Enter`) — no `apply`/`apply_last`, and every `call_ext*` target provably
 //! synchronous — because the JIT driver has no in-machine module switch and would turn such
 //! a step into a bogus exit reason. The mode is [`JitMode`](tier::JitMode):
-//! [`Interpreter`](tier::JitMode::Interpreter) — **the default**, the always-correct tier —
-//! or [`Auto`](tier::JitMode::Auto) / [`Baseline`](tier::JitMode::Baseline) from
+//! [`Auto`](tier::JitMode::Auto) — **the default**, the JIT exactly where the predicate
+//! proves the entry module switch-safe and the interpreter everywhere else — or
+//! [`Interpreter`](tier::JitMode::Interpreter) / [`Baseline`](tier::JitMode::Baseline) from
 //! `BEAM_RT_TIER` / a test.
 //!
-//! # Why the JIT is opt-in (`BEAM_RT_TIER=auto`), not the default
+//! # Why the default is `auto`
 //!
-//! The tier is taken on the **first** entry only, and a pre-empted process is **resumed on
-//! the interpreter** (a tier-aware resume is a missing engine seam), so a module whose hot
-//! loop reaches a heap-admission point (`test_heap`/`allocate_heap`) is ≈neutral: all but
-//! its first slice run interpreted. The baseline JIT's large win is confined to a hot loop
-//! with **no** heap-admission point anywhere, which stays in the one tier-chosen slice.
-//! Measured on the release build with `$ERTS_STDLIB_DIR` set (no per-process `erl`
-//! start-up), alternating runs, min/median seconds:
+//! [`tier::jit_is_switch_safe`] is the only thing between a JIT slice and the driver's
+//! `Step::Enter` gap, so the default is the *predicate-guarded* mode, never the switch-blind
+//! [`Baseline`](tier::JitMode::Baseline): a module the predicate cannot prove safe runs on
+//! the always-correct interpreter. The measured picture (release build, `$ERTS_STDLIB_DIR`
+//! set so no per-process `erl` start-up is included, alternating runs, min/median seconds):
 //!
 //! | workload | interpreter | `auto` (JIT where safe) |
 //! |---|---|---|
@@ -102,13 +101,12 @@
 //! | `slice:fib/1 300000` (the slice fixture) | 0.135 / 0.183 | 0.119 / 0.226 |
 //! | `slice:fib/1 32` (the slice fixture) | 0.026 / 0.033 | 0.022 / 0.029 |
 //!
-//! The JIT is never *clearly* faster on the named switch-free fixture (`slice.beam`:
-//! ≈1.0–1.15×, inside the run-to-run noise) and never beyond-noise *slower* either, and its
-//! 139–170× win needs the no-heap-admission-point shape. With the `Step::Enter` deopt and
-//! the tier-aware-resume seams missing, a slower-by-default runtime is unacceptable, so the
-//! default is the interpreter and `BEAM_RT_TIER=auto` opts **in** to the JIT exactly where
-//! [`tier::jit_is_switch_safe`] proves it safe. The selection machinery, the predicate and
-//! the per-module memo are permanent; only the default is conservative.
+//! Nothing regresses beyond the run-to-run noise; the 139–170× win is the
+//! no-heap-admission-point shape, which stays in its one tier-chosen slice. The ≈neutral
+//! `allocate`/`test_heap` rows are the two missing **engine** seams — no tier-aware resume (a
+//! pre-empted process is resumed on the interpreter) and no in-machine module-context switch
+//! — so a *switch-safe* module is tiered for its first slice and interpreted after a park.
+//! [`tier`] owns the full soundness argument.
 //!
 //! # Layout
 //!
