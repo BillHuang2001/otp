@@ -1904,8 +1904,9 @@ fn monitor_list(heap: &mut Heap, atoms: &AtomTable, pids: &[ProcessId]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_io::signal::{Disposition, Signal};
     use beam_io::DriverContext;
-    use beam_process::SignalAtoms;
+    use beam_process::{ProcessState, SignalAtoms};
 
     use crate::boot;
     use crate::config::RuntimeConfig;
@@ -3286,5 +3287,351 @@ mod tests {
             ctx.stabilize_driver_term(make_small(9)).expect("stabilize")
         };
         assert_eq!(stable_immediate, make_small(9));
+    }
+
+    // --- `os:set_signal/2`'s delivery half (contract A.8) --------------------------------
+    //
+    // [`watch`] owns the mechanism (the one facility, the self-pipe, the dispositions) and
+    // [`PortRegistry::pump`] turns a caught signal into a [`PortEvent::Signal`]; the tests below
+    // prove the *delivery* [`Runtime::deliver_port_messages`] performs — the `{notify, Name}`
+    // 2-tuple, addressed by name to the `erl_signal_server` process with `system` as the sender
+    // (`signal_notify_requested`, `erts/emulator/sys/unix/sys.c:589-604`).
+    //
+    // Two properties of the subject shape every test here:
+    //
+    // * a disposition is **process-global**, so these tests serialize with the other
+    //   disposition-mutating tests of this crate's lib test binary on [`watch::test_guard`];
+    // * the signal is sent **from outside** with `kill(1)` (how an operator sends it), so it
+    //   arrives asynchronously — hence the bounded, poll-driven waits (each round is a real
+    //   [`PORT_POLL_SLICE`] poll of the runtime's own poller) rather than a single pump or a
+    //   fixed sleep.
+
+    /// How long a test waits for a signal it has sent to arrive and be delivered.
+    ///
+    /// Generous on purpose, and only ever spent on *failure*: a passing test returns as soon as
+    /// the delivery lands, and a signal is normally caught within the first slice.
+    const SIGNAL_DELIVERY_BOUND: Duration = Duration::from_secs(5);
+
+    /// A runtime and a [`ProcessTable`] sharing the **runtime's** atom table.
+    ///
+    /// The sharing is load-bearing: [`Runtime::deliver_port_messages`] resolves
+    /// `erl_signal_server` in the *runtime's* table and then asks `table.whereis` for the
+    /// process registered under that atom — a table built from an unrelated `AtomTable` would
+    /// hold the name under a different index and never find the server.
+    fn runtime_with_table() -> (Runtime, ProcessTable) {
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let table = ProcessTable::new(SignalAtoms::from_table(rt.code_server_atoms_mut()));
+        (rt, table)
+    }
+
+    /// Registers `pid` as `erl_signal_server`, interning the name into the runtime's shared
+    /// table (so the runtime's own `lookup` in [`Runtime::deliver_port_messages`] finds it).
+    fn register_signal_server(rt: &mut Runtime, table: &mut ProcessTable, pid: ProcessId) {
+        let name = rt.code_server_atoms_mut().intern("erl_signal_server");
+        table
+            .register(name, pid)
+            .expect("`erl_signal_server` is a free name");
+    }
+
+    /// Drives the port half until it has delivered `wanted` messages, returning the total
+    /// delivered — bounded by [`SIGNAL_DELIVERY_BOUND`].
+    ///
+    /// A signal's arrival is asynchronous, so the first round may legitimately observe nothing;
+    /// each round polls for up to [`PORT_POLL_SLICE`], making this a bounded wait on the
+    /// runtime's own poller rather than a race against a fixed sleep.
+    fn deliver_until(rt: &mut Runtime, table: &mut ProcessTable, wanted: usize) -> usize {
+        let deadline = Instant::now() + SIGNAL_DELIVERY_BOUND;
+        let mut delivered = 0;
+        while delivered < wanted && Instant::now() < deadline {
+            delivered += rt
+                .deliver_port_messages(table, PORT_POLL_SLICE)
+                .expect("the port poll must not fail");
+        }
+        delivered
+    }
+
+    /// Waits (bounded) until the signal self-pipe is readable — that is, until the trampoline
+    /// has really **caught** a signal — without consuming it (see `watch::watcher::pending`).
+    fn wait_until_caught() -> bool {
+        let deadline = Instant::now() + SIGNAL_DELIVERY_BOUND;
+        while Instant::now() < deadline {
+            if watch::watcher::pending() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    }
+
+    /// The `{notify, Name}` payload of the first message `pid` received.
+    fn notify_payload(table: &ProcessTable, pid: ProcessId) -> Eterm {
+        table
+            .get(pid)
+            .expect("the signal server is live")
+            .mailbox()
+            .peek()
+            .expect("the signal server received a message")
+            .payload()
+    }
+
+    /// A handled signal reaches the process registered as `erl_signal_server` as the 2-tuple
+    /// `{notify, Sigusr1}`, sent by the emulator itself (`system`) — and **wakes** that process,
+    /// which was blocked (`os:set_signal/2`'s delivery half, end to end).
+    #[test]
+    fn a_handled_signal_is_delivered_to_the_registered_signal_server() {
+        let _guard = watch::test_guard();
+        let (mut rt, mut table) = runtime_with_table();
+        let server = table.spawn_default().expect("the signal server process");
+        register_signal_server(&mut rt, &mut table, server);
+        // Blocked, like a process sitting in `receive {notify, _} -> … end`: the notification
+        // has to wake it through `beam_process`'s own resume-on-send path.
+        table
+            .get_mut(server)
+            .expect("the server")
+            .set_state(ProcessState::Waiting);
+
+        let before = watch::watcher::current(Signal::SigUsr1);
+        watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
+        watch::watcher::send_to_self(Signal::SigUsr1);
+        let delivered = deliver_until(&mut rt, &mut table, 1);
+        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
+
+        assert_eq!(
+            delivered, 1,
+            "a handled signal must reach the registered `erl_signal_server` within \
+             {SIGNAL_DELIVERY_BOUND:?}"
+        );
+        assert!(
+            table.woken().contains(&server),
+            "the blocked server must be woken by the delivery: {:?}",
+            table.woken()
+        );
+        assert_eq!(
+            table.get(server).expect("the server").state(),
+            ProcessState::Runnable,
+            "the wake puts the server back on the run queue"
+        );
+
+        let message = notify_payload(&table, server);
+        assert_eq!(
+            terms::tuple_arity(message).expect("the notification is a tuple"),
+            2,
+            "message={message:?}"
+        );
+        let tag = terms::tuple_element(message, 0).expect("element 0");
+        assert_eq!(
+            rt.atom_name_of(tag),
+            Some("notify"),
+            "element 0 is the `notify` atom"
+        );
+        let name = terms::tuple_element(message, 1).expect("element 1");
+        assert_eq!(
+            rt.atom_name_of(name),
+            Some("sigusr1"),
+            "element 1 names the signal with its own atom"
+        );
+        // The sender is the emulator (`am_system`), exactly as `signal_notify_requested` sends it
+        // — not a pid, and not the port-less `undefined`.
+        let from = table
+            .get(server)
+            .expect("the server")
+            .mailbox()
+            .peek()
+            .expect("a message")
+            .from();
+        assert_eq!(rt.atom_name_of(from), Some("system"), "sender is `system`");
+    }
+
+    /// With **no** process registered as `erl_signal_server`, a caught signal is dropped
+    /// silently: no message, no error, and [`Runtime::deliver_port_messages`] reports `Ok(0)` —
+    /// the C's own behaviour (nothing is sent when the name has no live process).
+    ///
+    /// The test first proves the signal really *was* caught (the self-pipe is readable), so the
+    /// `Ok(0)` is a **drop**, not a signal that never arrived.
+    #[test]
+    fn a_handled_signal_with_no_signal_server_is_dropped_silently() {
+        let _guard = watch::test_guard();
+        let (mut rt, mut table) = runtime_with_table();
+        // A live process that is deliberately *not* the signal server.
+        let bystander = table.spawn_default().expect("a bystander process");
+
+        let before = watch::watcher::current(Signal::SigUsr1);
+        watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
+        watch::watcher::send_to_self(Signal::SigUsr1);
+        assert!(
+            wait_until_caught(),
+            "the signal was never caught, so the assertion below would be vacuous"
+        );
+
+        let delivered = rt
+            .deliver_port_messages(&mut table, PORT_POLL_SLICE)
+            .expect("a caught signal with no recipient is not an error");
+        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
+
+        assert_eq!(delivered, 0, "no `erl_signal_server` ⇒ nothing is delivered");
+        assert!(
+            table
+                .get(bystander)
+                .expect("the bystander")
+                .mailbox()
+                .is_empty(),
+            "a notification must never reach an arbitrary process"
+        );
+        assert!(table.woken().is_empty(), "nothing was woken");
+    }
+
+    /// The watch survives its first drain: a **second** handled signal is delivered again, to
+    /// the same recipient, and wakes it again.
+    #[test]
+    fn a_second_handled_signal_is_delivered_again() {
+        let _guard = watch::test_guard();
+        let (mut rt, mut table) = runtime_with_table();
+        let server = table.spawn_default().expect("the signal server process");
+        register_signal_server(&mut rt, &mut table, server);
+
+        let before = watch::watcher::current(Signal::SigUsr1);
+        watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
+
+        table
+            .get_mut(server)
+            .expect("the server")
+            .set_state(ProcessState::Waiting);
+        watch::watcher::send_to_self(Signal::SigUsr1);
+        assert_eq!(
+            deliver_until(&mut rt, &mut table, 1),
+            1,
+            "the first signal is delivered"
+        );
+        assert!(
+            table.drain_woken().contains(&server),
+            "the first delivery wakes the server"
+        );
+
+        // The registration is *not* consumed by the first round: re-block the server, send a
+        // second signal, and the same watch reports it.
+        table
+            .get_mut(server)
+            .expect("the server")
+            .set_state(ProcessState::Waiting);
+        watch::watcher::send_to_self(Signal::SigUsr1);
+        let second = deliver_until(&mut rt, &mut table, 1);
+        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
+
+        assert_eq!(second, 1, "the second signal is delivered too");
+        assert!(
+            table.drain_woken().contains(&server),
+            "and it wakes the server again"
+        );
+        let mailbox = table.get(server).expect("the server").mailbox();
+        assert_eq!(mailbox.len(), 2, "one message per signal");
+        for message in mailbox.iter() {
+            let payload = message.payload();
+            assert_eq!(terms::tuple_arity(payload).expect("a tuple"), 2);
+            assert_eq!(
+                rt.atom_name_of(terms::tuple_element(payload, 0).expect("element 0")),
+                Some("notify")
+            );
+            assert_eq!(
+                rt.atom_name_of(terms::tuple_element(payload, 1).expect("element 1")),
+                Some("sigusr1")
+            );
+            assert_eq!(rt.atom_name_of(message.from()), Some("system"));
+        }
+    }
+
+    /// `ignore` and `default` produce no notification and leave the registry with **nothing to
+    /// poll**: no trampoline is installed, so the self-pipe can never become readable and the
+    /// runtime must not keep sleeping on it.
+    ///
+    /// Only `ignore` is actually *delivered* — the kernel discards it. `default` is never
+    /// exercised with a real signal: `sigusr1`'s default action terminates the process, so a test
+    /// that sent one would kill the whole test binary.
+    #[test]
+    fn ignore_and_default_leave_nothing_to_poll_and_notify_nobody() {
+        let _guard = watch::test_guard();
+        let (mut rt, mut table) = runtime_with_table();
+        let server = table.spawn_default().expect("the signal server process");
+        register_signal_server(&mut rt, &mut table, server);
+
+        let before = watch::watcher::current(Signal::SigUsr1);
+        for disposition in [Disposition::Ignore, Disposition::Default] {
+            watch::install(Signal::SigUsr1, disposition).expect("the OS accepts the disposition");
+            assert!(
+                !watch::watcher::pending(),
+                "{disposition:?} installs no trampoline, so nothing can be caught"
+            );
+            assert!(
+                rt.ports.borrow().has_nothing_to_poll(),
+                "{disposition:?} must leave the runtime nothing to poll"
+            );
+        }
+
+        // `ignore` really is exercised against the kernel: the signal is sent and discarded.
+        watch::install(Signal::SigUsr1, Disposition::Ignore).expect("install ignore on sigusr1");
+        watch::watcher::send_to_self(Signal::SigUsr1);
+        // Give the OS time to act on it, then show the runtime saw nothing at all.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !watch::watcher::pending(),
+            "an ignored signal never reaches the trampoline"
+        );
+        let delivered = rt
+            .deliver_port_messages(&mut table, PORT_POLL_SLICE)
+            .expect("deliver");
+        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
+
+        assert_eq!(delivered, 0, "an ignored signal notifies nobody");
+        assert!(
+            table.get(server).expect("the server").mailbox().is_empty(),
+            "the signal server receives nothing"
+        );
+        assert!(rt.ports.borrow().has_nothing_to_poll());
+    }
+
+    /// The regression guard for the "don't sleep" shortcut: with **zero** live ports but a
+    /// registered signal watch, [`PortRegistry::has_nothing_to_poll`] is false, so the pump
+    /// still registers the self-pipe and **waits** on it for its slice instead of returning at
+    /// once (the old port-only predicate would have let a caught signal sit undelivered).
+    #[test]
+    fn a_zero_port_runtime_still_polls_a_registered_signal_watch() {
+        let _guard = watch::test_guard();
+        let (mut rt, mut table) = runtime_with_table();
+        // No port is opened at all: the *ports* predicate is empty …
+        assert!(rt.ports.borrow().is_empty(), "no port is open");
+        assert!(
+            !rt.ports.borrow().watch.is_registered(),
+            "nothing is registered before the first round"
+        );
+
+        let before = watch::watcher::current(Signal::SigUsr1);
+        watch::install(Signal::SigUsr1, Disposition::Handle).expect("install handle on sigusr1");
+
+        // … yet a `handle` disposition means there is still something to wait on, so the pump
+        // must not take its early return.
+        assert!(
+            !rt.ports.borrow().has_nothing_to_poll(),
+            "a `handle` disposition keeps the poller awake with zero ports"
+        );
+
+        let started = Instant::now();
+        let delivered = rt
+            .deliver_port_messages(&mut table, PORT_POLL_SLICE)
+            .expect("deliver");
+        let elapsed = started.elapsed();
+        watch::install(Signal::SigUsr1, before).expect("restore the prior sigusr1 disposition");
+
+        assert_eq!(delivered, 0, "no signal has been sent in this test");
+        assert!(
+            rt.ports.borrow().watch.is_registered(),
+            "the round registered the self-pipe with the runtime's poller"
+        );
+        // The wait is real and bounded by the slice: the poll blocks for it when nothing is
+        // ready, where a port-only shortcut returned immediately (every other path in this test
+        // is unchanged whether the round waits or not, which is why the timing *is* the guard).
+        assert!(
+            elapsed >= Duration::from_millis(5),
+            "the zero-port pump must really poll the self-pipe, not return at once \
+             (it returned after {elapsed:?})"
+        );
     }
 }

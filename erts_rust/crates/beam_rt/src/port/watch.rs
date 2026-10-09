@@ -278,6 +278,7 @@ pub(crate) mod watcher {
     use super::*;
 
     use std::process::Command;
+    use std::time::Duration;
 
     use beam_io::signal::Disposition;
 
@@ -301,6 +302,34 @@ pub(crate) mod watcher {
     /// The disposition the kernel currently holds for `signal` (a `sigaction(2)` query).
     pub(crate) fn current(signal: Signal) -> Disposition {
         with_facility(|facility| facility.disposition(signal)).expect("a disposition query")
+    }
+
+    /// Whether the trampoline has **caught** a signal that no drain has consumed yet — a
+    /// **non-destructive** probe of the self-pipe.
+    ///
+    /// The record of what arrived is `beam_io`'s process-global bitmask, which only
+    /// [`SignalFacility::drain`] reads (and clears) — so a test that wants to prove a signal was
+    /// really caught *before* asserting what a delivery path does with it asks the **pipe**
+    /// instead: the trampoline writes it on the signal's way in, and a throwaway
+    /// [`Poller`] can see the readiness without consuming anything (draining would destroy the
+    /// very evidence the test needs). `false` when no facility exists: no `os:set_signal/2` ran,
+    /// so nothing can have been caught.
+    pub(crate) fn pending() -> bool {
+        let Some(fd) = with_existing_facility(|facility| facility.read_fd()) else {
+            return false;
+        };
+        let Ok(mut poller) = Poller::new() else {
+            return false;
+        };
+        if poller.register(fd, Interest::READABLE, SIGNAL_KEY).is_err() {
+            return false;
+        }
+        match poller.poll(Some(Duration::ZERO)) {
+            // Readiness is reported per registered key, and the sentinel cannot collide with the
+            // poller's own waker (see [`SIGNAL_KEY`]).
+            Ok(events) => events.iter().any(|event| event.key() == SIGNAL_KEY),
+            Err(_) => false,
+        }
     }
 
     #[test]
