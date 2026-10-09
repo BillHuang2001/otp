@@ -94,6 +94,8 @@ mod sink;
 mod slack;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+mod alloc_tests;
 
 pub use construct::{badmatch_reason, make_cons, make_heap_binary, make_list, make_tuple};
 pub use fun::{fun_arity, fun_free, fun_index, fun_num_free, fun_uniq, is_fun, make_fun};
