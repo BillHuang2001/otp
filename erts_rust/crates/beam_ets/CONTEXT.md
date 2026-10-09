@@ -407,6 +407,24 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   present, `first`+`next` is a permutation of the stored keys, and `next`/`prev` on an absent anchor are
   `badarg`; `ordered_set` navigation is exact (ascending arithmetic key order; absent keys read as
   bounds).
+- **An interior's stored key term aliases a live, table-owned object.** `key_of(object, keypos)` returns
+  a pointer *into* the object's table-owned `TermStore` storage, so an interior that keeps a key must
+  re-point it whenever it replaces or removes the object it aliased: on a `set` upsert
+  (`hash_interior`/`champ_interior`) and, for `bag`/`duplicate_bag`, when `delete_object` removes the
+  object whose key element the entry's stored key pointed at (re-derived from a surviving object at
+  `keypos`). `Table::relocate_rebuilt_object` derives the index key from the **table-owned copy**, never
+  the caller's key. This was the crate's live use-after-free class — see `tests/ets_reclamation.rs`.
+- **B+-tree branch separators are always re-materialised from the rightmost live leaf**
+  (`NodeStore::subtree_max_key`). An upsert replaces the object that established a subtree maximum and
+  reclaims its storage, so a stored separator term dangles even when the key *value* is unchanged. The
+  branch descent is a lower bound, so `node::child_index` **binary-searches** the strictly ascending
+  separators (`O(log ORDER)`, ≤5 `cmp_arith` at `ORDER = 32`) instead of scanning them. (Structural
+  change → `../../CHANGE.md`.)
+- **`{write_concurrency,_}` is a mode, not a bool.** `WriteConcurrency` (`Off`/`On`/`Auto`/`FixedLocks`)
+  is the model; the bool API is its `Off`/`On` projection, so `beam_bifs` stays source-compatible, and
+  `decentralized_counters` is derived from the mode.
+- **The guard-scoped view gains a view-borrowed traversal API** (`view/iter.rs`) returning `TableTerm`
+  bound to the borrow — so a full table walk is expressible without a bare `Eterm` escaping.
 
 ## Concurrency, fixation & sharing (current state)
 - **`Table` is `Send + Sync` and shareable across processes**: plain `Eterm` data + a
