@@ -165,6 +165,9 @@ mod shape;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod bench;
+
 pub use inline::SmallArith;
 
 use codegen::{compile_module, NativeFunc};
