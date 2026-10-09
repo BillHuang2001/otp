@@ -63,10 +63,14 @@ impl Machine {
     /// And charges **one reduction per interpreted instruction**: the slice's count
     /// starts at zero here and is read back through [`Machine::reductions`], while
     /// each charge is also offered to the host through
-    /// [`ExecutionContext::reduce`] — the only way a **non-allocating** loop can be
-    /// pre-empted, since `ensure_heap` is never reached by one. An `Err` from the
-    /// hook ends the run exactly like any other engine failure (the host has
-    /// exhausted its budget); it is never swallowed.
+    /// [`ExecutionContext::reduce_outcome`] — the only way a **non-allocating** loop
+    /// can be pre-empted, since `ensure_heap` is never reached by one. An `Err` from
+    /// the hook ends the run exactly like any other engine failure (the host has
+    /// exhausted its budget); it is never swallowed. A
+    /// [`ReduceOutcome::Yield`](crate::context::ReduceOutcome::Yield) answer is a **cooperative
+    /// pre-emption**: the step is applied first (so the reported address is the next
+    /// instruction), then the driver reports [`RunOutcome::Yield`] at that position —
+    /// the process is resumable there rather than unwound.
     pub(crate) fn drive(
         &mut self,
         module: &Module,
@@ -116,9 +120,18 @@ impl Machine {
             // host through `Machine::reductions`) and the host hook that lets a
             // **non-allocating** loop be pre-empted. `ensure_heap` — the only other
             // charge — is unreachable from such a loop, so this is the only point a
-            // host is offered one reduction per instruction.
+            // host is offered one reduction per instruction. The hook is the
+            // non-failing twin of `reduce` (`reduce_outcome`): its default forwards to
+            // `reduce` and answers `Continue`, so a host that overrides only `reduce`
+            // is byte-identical, while a host that wants a *cooperative* pre-emption
+            // answers `Yield` and this loop reports `RunOutcome::Yield` below.
             self.reductions = self.reductions.saturating_add(1);
-            ctx.reduce(1)?;
+            let outcome = ctx.reduce_outcome(1)?;
+            // Apply the step **first**, so a yield reported below names the *next*
+            // instruction (the one after the charge) — never a re-execution of the
+            // instruction already executed and charged, and (for a `Step::Enter`)
+            // after the context switch has been applied so `Machine::current_context`
+            // names the module the reported `(func, pc)` belong to.
             match step {
                 Step::Next => pc += 1,
                 Step::Goto { func: f, pc: p } => {
@@ -144,10 +157,18 @@ impl Machine {
                     func = f;
                     pc = p;
                 }
+                // A `wait`/`return` is its own outcome (the process is blocked rather
+                // than merely out of budget): the host's yield request is irrelevant
+                // there and is deliberately not reported.
                 Step::Wait { func: f, pc: p } => {
                     return Ok(RunOutcome::Wait { func: f, pc: p })
                 }
                 Step::Done => return self.finish().map(RunOutcome::Returned),
+            }
+            // The step has been applied: a cooperative pre-emption stops here, at the
+            // next instruction (in the context just entered, if any).
+            if outcome == crate::context::ReduceOutcome::Yield {
+                return Ok(RunOutcome::Yield { func, pc });
             }
         }
     }
@@ -181,12 +202,14 @@ impl Machine {
     /// The number of interpreted instructions charged in the current (or most
     /// recently finished) [`Machine::drive`] slice.
     ///
-    /// One `drive` call — a run, or a resume of a suspended process — is one
-    /// scheduling slice, and the counter is zeroed at its start, so this is that
-    /// slice's work in the unit the runtime prices pre-emption in. It is the
-    /// **engine-side twin** of [`ExecutionContext::reduce`]: the hook lets a host
-    /// act *during* the slice, this accessor lets it observe *after* the slice
-    /// returns (`RunOutcome::Wait` included) without keeping its own tally.
+    /// One `drive` call — a run, a resume of a suspended process, or a resume after a
+    /// cooperative [`RunOutcome::Yield`] — is one scheduling slice, and the counter is
+    /// zeroed at its start, so this is that slice's work in the unit the runtime prices
+    /// pre-emption in. It is the **engine-side twin** of
+    /// [`ExecutionContext::reduce_outcome`]: the hook lets a host act *during* the
+    /// slice (fail it, or ask for a [`RunOutcome::Yield`]), this accessor lets it
+    /// observe *after* the slice returns (`RunOutcome::Wait`/`RunOutcome::Yield`
+    /// included) without keeping its own tally.
     ///
     /// Honest by construction: only the interpreter's dispatch loop charges, so
     /// under the baseline JIT tier — where a natively executed block bypasses
@@ -204,5 +227,375 @@ impl Machine {
     /// a host that re-bases can still account for the work it saw.
     pub fn reset_reductions(&mut self) -> u64 {
         std::mem::replace(&mut self.reductions, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The driver's `Step::Enter` contract: **every** way a `Step::Enter` reaches this
+    //! loop must leave the machine's current module (its context and its literal
+    //! binding) on the module the reported `(func, pc)` actually index. The three
+    //! producers exercised here are a resolved cross-module `call_ext`, a
+    //! cross-module `return` onto a caller-context continuation, and a raise that
+    //! lands in a catch frame belonging to another module context. A wrong current
+    //! module would resolve the next instruction against the wrong module's labels and
+    //! literals — a silent correctness bug — so each test pins it explicitly.
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use beam_common::Result;
+    use beam_loader::{
+        Atom, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand,
+    };
+    use beam_term::{make_small, Eterm, NIL};
+
+    use crate::context::{Mailbox, MinimalContext};
+    use crate::machine::{Machine, RunOutcome};
+
+    /// Map every `Instr::Label` in `code` to its index.
+    fn labels_of(code: &[Instr]) -> BTreeMap<Label, usize> {
+        let mut labels = BTreeMap::new();
+        for (index, instr) in code.iter().enumerate() {
+            if let Instr::Label(label) = instr {
+                labels.insert(*label, index);
+            }
+        }
+        labels
+    }
+
+    /// One synthetic module with its own atom table.
+    struct Fixture {
+        module: Module,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Fixture {
+            let mut module = Module::default();
+            module.name = module.atom_table.intern(name);
+            Fixture { module }
+        }
+
+        fn atom(&mut self, name: &str) -> Atom {
+            self.module.atom_table.intern(name)
+        }
+
+        fn import(&mut self, module: &str, function: &str, arity: u32) -> ImportRef {
+            let module = self.atom(module);
+            let function = self.atom(function);
+            self.module.imports.push(Import {
+                module,
+                function,
+                arity,
+            });
+            ImportRef((self.module.imports.len() - 1) as u32)
+        }
+
+        fn add_function(&mut self, name: &str, arity: u32, code: Vec<Instr>) -> Label {
+            let name = self.atom(name);
+            let module_name = self.module.name;
+            let labels = labels_of(&code);
+            let entry = labels.keys().next().copied().unwrap_or(Label(0));
+            self.module.functions.push(Function {
+                func_label: entry,
+                entry_label: entry,
+                module: module_name,
+                name,
+                arity,
+                code,
+                blocks: Vec::new(),
+                labels,
+            });
+            entry
+        }
+
+        fn add_export(&mut self, name: &str, arity: u32, label: Label) {
+            let function = self.atom(name);
+            self.module.exports.push(Export {
+                function,
+                arity,
+                label,
+            });
+        }
+
+        fn finish(self) -> Module {
+            self.module
+        }
+    }
+
+    /// A mailbox that is always empty: `loop_rec` takes its fail label immediately.
+    struct EmptyMailbox;
+
+    impl Mailbox for EmptyMailbox {
+        fn send_message(&mut self, _to: Eterm, _message: Eterm) -> Result<()> {
+            Ok(())
+        }
+        fn receive_next(&mut self) -> Result<Option<Eterm>> {
+            Ok(None)
+        }
+        fn receive_skip(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn receive_remove(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn receive_reset(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+            Ok(NIL)
+        }
+        fn receive_marker_bind(&mut self, _marker: Eterm, _reference: Eterm) -> Result<()> {
+            Ok(())
+        }
+        fn receive_marker_use(&mut self, _reference: Eterm) -> Result<()> {
+            Ok(())
+        }
+        fn receive_marker_clear(&mut self, _reference: Eterm) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A `MinimalContext` whose cross-module seam resolves the named callees and
+    /// whose mailbox is empty.
+    fn seam(callees: Vec<(String, Arc<Module>)>) -> MinimalContext {
+        let mut ctx =
+            MinimalContext::with_external_resolver(Box::new(move |module, function, arity| {
+                for (name, callee) in &callees {
+                    if name != module {
+                        continue;
+                    }
+                    let Some(function) = callee.atom_table.lookup(function) else {
+                        continue;
+                    };
+                    if let Some(label) = callee.export(function, arity) {
+                        return Ok(Some((Arc::clone(callee), label)));
+                    }
+                }
+                Ok(None)
+            }));
+        ctx.set_mailbox(Box::new(EmptyMailbox));
+        ctx
+    }
+
+    /// The caller `m`: `run/0` allocates, `call_ext`s `c:<target>/0`, then receives
+    /// (suspending on the empty mailbox).
+    fn caller_then_receive(target: &str) -> (Module, Atom) {
+        let mut f = Fixture::new("m");
+        let call = f.import("c", target, 0);
+        let run = f.add_function(
+            "run",
+            0,
+            vec![
+                Instr::Label(Label(100)),
+                Instr::Allocate {
+                    stack_need: HeapNeed::Words(0),
+                    live: 0,
+                },
+                Instr::CallExt {
+                    target: call,
+                    arity: 0,
+                },
+                Instr::Deallocate(0),
+                // The value the callee returned is ignored; the caller now blocks on a
+                // receive, which is what lets the test observe which context it is in.
+                Instr::Label(Label(101)),
+                Instr::LoopRec {
+                    fail: Label(102),
+                    dst: Operand::X(0),
+                },
+                Instr::RemoveMessage,
+                Instr::Return,
+                Instr::Label(Label(102)),
+                Instr::Wait { target: Label(101) },
+            ],
+        );
+        f.add_export("run", 0, run);
+        let name = f.atom("run");
+        (f.finish(), name)
+    }
+
+    /// The callee `c`: `recv/0` (a bare receive that suspends on an empty mailbox) and
+    /// `noop/0` (returns immediately).
+    fn recv_callee() -> Module {
+        let mut f = Fixture::new("c");
+        let recv = f.add_function(
+            "recv",
+            0,
+            vec![
+                Instr::Label(Label(10)),
+                Instr::LoopRec {
+                    fail: Label(11),
+                    dst: Operand::X(0),
+                },
+                Instr::RemoveMessage,
+                Instr::Return,
+                Instr::Label(Label(11)),
+                Instr::Wait { target: Label(10) },
+            ],
+        );
+        f.add_export("recv", 0, recv);
+        let noop = f.add_function("noop", 0, vec![Instr::Label(Label(1)), Instr::Return]);
+        f.add_export("noop", 0, noop);
+        f.finish()
+    }
+
+    /// The caller `m`: a `try`/`catch` guarding a cross-module `call_ext c:boom/0`,
+    /// whose handler returns the landed reason from `x(1)`.
+    fn caller_guarding(target: &str) -> (Module, Atom) {
+        let mut f = Fixture::new("m");
+        let call = f.import("c", target, 0);
+        let run = f.add_function(
+            "run",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Allocate {
+                    stack_need: HeapNeed::Words(1),
+                    live: 0,
+                },
+                Instr::Try {
+                    frame: Operand::Y(0),
+                    fail: Label(20),
+                },
+                Instr::CallExt {
+                    target: call,
+                    arity: 0,
+                },
+                Instr::TryEnd {
+                    frame: Operand::Y(0),
+                },
+                Instr::Deallocate(1),
+                Instr::Return,
+                Instr::Label(Label(20)),
+                Instr::TryCase {
+                    frame: Operand::Y(0),
+                },
+                Instr::Move {
+                    src: Operand::X(1),
+                    dst: Operand::X(0),
+                },
+                Instr::Deallocate(1),
+                Instr::Return,
+            ],
+        );
+        f.add_export("run", 0, run);
+        let name = f.atom("run");
+        (f.finish(), name)
+    }
+
+    /// The callee `c`: `boom/0` raises `42` with class `throw`.
+    fn raising_callee() -> Module {
+        let mut f = Fixture::new("c");
+        let throw = f.atom("throw");
+        let boom = f.add_function(
+            "boom",
+            0,
+            vec![
+                Instr::Label(Label(50)),
+                Instr::Move {
+                    src: Operand::Atom(throw),
+                    dst: Operand::X(0),
+                },
+                Instr::Move {
+                    src: Operand::Integer(42),
+                    dst: Operand::X(1),
+                },
+                Instr::Move {
+                    src: Operand::Nil,
+                    dst: Operand::X(2),
+                },
+                Instr::RawRaise,
+            ],
+        );
+        f.add_export("boom", 0, boom);
+        f.finish()
+    }
+
+    /// Producer 1: a `call_ext` the host resolved through the seam runs the callee
+    /// **in this machine**, so the machine's current module must be the callee's.
+    #[test]
+    fn a_resolved_call_ext_puts_the_machine_in_the_callee_module() {
+        let (caller, run) = caller_then_receive("recv");
+        let callee = Arc::new(recv_callee());
+        let mut ctx = seam(vec![("c".to_string(), Arc::clone(&callee))]);
+        let mut machine = Machine::new();
+
+        let outcome = machine
+            .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+            .expect("the callee suspends on its empty mailbox");
+        assert!(
+            matches!(outcome, RunOutcome::Wait { .. }),
+            "the suspension is reported, got {outcome:?}"
+        );
+        assert_ne!(
+            machine.current_context(),
+            0,
+            "the machine is inside the registered callee"
+        );
+        let current = machine
+            .current_module()
+            .expect("a registered callee has a module handle");
+        assert!(
+            Arc::ptr_eq(&current, &callee),
+            "current_module must be the very handle the seam resolved with"
+        );
+    }
+
+    /// Producer 2: a cross-module `return` onto the caller's continuation is an
+    /// `Step::Enter { context: 0, .. }`, so the machine must switch **back** into the
+    /// entry module. The caller then suspends in its own `receive`, which pins both
+    /// the context and (via the resume address) the module the position belongs to.
+    #[test]
+    fn a_cross_module_return_switches_the_machine_back_into_the_caller_context() {
+        let (caller, run) = caller_then_receive("noop");
+        let callee = Arc::new(recv_callee());
+        let mut ctx = seam(vec![("c".to_string(), Arc::clone(&callee))]);
+        let mut machine = Machine::new();
+
+        let outcome = machine
+            .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+            .expect("the caller suspends after the callee returned");
+        // The `wait` resumes at `Label(101)`, which is code index 4 of the caller's own
+        // `run/0` — so the position is a caller address, not a callee one.
+        assert_eq!(outcome, RunOutcome::Wait { func: 0, pc: 4 });
+        assert_eq!(
+            machine.current_context(),
+            0,
+            "the return switched the machine back to the entry context"
+        );
+        assert!(
+            machine.current_module().is_none(),
+            "context 0 is the borrowed entry module, reported as None"
+        );
+    }
+
+    /// Producer 3: a raise inside the callee that lands in a catch frame belonging to
+    /// the caller is `Step::Enter { context: 0, .. }` — the handler's `(func, pc)` are
+    /// the caller's, so the machine must switch back before executing it.
+    #[test]
+    fn a_raise_landing_in_a_callers_catch_frame_switches_into_the_callers_context() {
+        let (caller, run) = caller_guarding("boom");
+        let callee = Arc::new(raising_callee());
+        let mut ctx = seam(vec![("c".to_string(), Arc::clone(&callee))]);
+        let mut machine = Machine::new();
+
+        let outcome = machine
+            .run_export_outcome(&caller, run, 0, &[], &mut ctx)
+            .expect("the caller's try contains the callee's raise");
+        assert_eq!(
+            outcome,
+            RunOutcome::Returned(make_small(42)),
+            "the handler returned the landed reason"
+        );
+        assert_eq!(
+            machine.current_context(),
+            0,
+            "the handler ran in the caller's context, not the callee's"
+        );
+        assert!(
+            machine.current_module().is_none(),
+            "context 0 is the borrowed entry module, reported as None"
+        );
+        assert_eq!(machine.catch_frame_depth(), 0, "the handler consumed its frame");
     }
 }

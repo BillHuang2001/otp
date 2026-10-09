@@ -284,6 +284,26 @@ pub enum TraceEvent<'a> {
     },
 }
 
+/// What a host wants the engine to do after a per-instruction reduction charge.
+///
+/// The return type of [`ExecutionContext::reduce_outcome`] — the **non-failing**
+/// twin of [`ExecutionContext::reduce`]: a host that has exhausted the running
+/// process's reduction budget asks for a *cooperative* yield instead of raising, so
+/// the engine reports [`crate::RunOutcome::Yield`] at the next instruction boundary
+/// and the host can reschedule the process rather than unwind it with an error.
+///
+/// [`Continue`](ReduceOutcome::Continue) is the ordinary answer (keep running);
+/// [`Yield`](ReduceOutcome::Yield) asks the dispatch driver to stop at the
+/// instruction boundary it has just reached and report a resumable position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceOutcome {
+    /// The process still has budget: keep running.
+    Continue,
+    /// The process's reduction budget is exhausted: stop at the next instruction
+    /// boundary and report [`crate::RunOutcome::Yield`] (a resumable position).
+    Yield,
+}
+
 /// Everything the engine needs from the runtime (BIF dispatch, heap/GC, limits).
 pub trait ExecutionContext {
     /// Dispatch `module:function/arity` with `args`, returning the result term.
@@ -574,6 +594,41 @@ pub trait ExecutionContext {
     fn reduce(&mut self, n: u32) -> Result<()> {
         let _ = n;
         Ok(())
+    }
+
+    /// The **non-failing** twin of [`reduce`](ExecutionContext::reduce): charge `n`
+    /// reductions and ask the engine for the next control decision.
+    ///
+    /// Called **once per interpreted instruction** by the dispatch driver
+    /// ([`Machine::drive`](crate::machine::Machine), and the baseline JIT driver's
+    /// per-instruction deopt path) *instead of* calling [`reduce`](ExecutionContext::reduce)
+    /// directly. A BEAM process is pre-empted at a **reduction boundary**, so the two
+    /// ways a host can end a slice are both expressed here:
+    ///
+    /// * return [`ReduceOutcome::Yield`] to ask for a **cooperative pre-emption**: the
+    ///   engine stops at the instruction boundary it has just reached (after applying
+    ///   the instruction's `Step`, so the reported address is the *next* instruction,
+    ///   never a re-execution) and reports [`crate::RunOutcome::Yield`]. The process is
+    ///   resumable at that address via
+    ///   [`Machine::resume_outcome`](crate::machine::Machine::resume_outcome), exactly
+    ///   like a [`Wait`](crate::RunOutcome::Wait) — the host reschedules it rather than
+    ///   unwinding it.
+    /// * return `Err` to **abort** the run with the host's own typed error, exactly as
+    ///   [`reduce`](ExecutionContext::reduce) does.
+    ///
+    /// The default body forwards to [`reduce`](ExecutionContext::reduce) and then
+    /// answers [`ReduceOutcome::Continue`], so a host that overrides only
+    /// [`reduce`](ExecutionContext::reduce) is **byte-identical** to before (the same
+    /// once-per-instruction charge, and an `Err` from it still ends the run) — the
+    /// cooperative-yield path is purely additive and a host opts into it by overriding
+    /// this hook.
+    ///
+    /// **The charge is still exactly one reduction per interpreted instruction** under
+    /// either override: the caller invokes this (not `reduce`) once per instruction, so
+    /// an override that wants both a tally and a yield calls `self.reduce(n)` itself.
+    fn reduce_outcome(&mut self, n: u32) -> Result<ReduceOutcome> {
+        self.reduce(n)?;
+        Ok(ReduceOutcome::Continue)
     }
 
     /// Cheap tracing gate: does the host want `call`/`return_from`/`return_to`

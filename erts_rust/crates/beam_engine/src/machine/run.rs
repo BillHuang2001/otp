@@ -40,14 +40,17 @@ use crate::jit::Tier;
 
 use super::Machine;
 
-/// The outcome of one engine run: either it returned a value, or the process blocked
-/// in a `receive` with no message available (and must be resumed at `func`/`pc`).
+/// The outcome of one engine run: either it returned a value, the process blocked
+/// in a `receive` with no message available (and must be resumed at `func`/`pc`), or
+/// the host asked for a **cooperative pre-emption** at the reduction boundary and
+/// the process must likewise be resumed at `func`/`pc`.
 ///
 /// Produced by the blocking-aware entries [`Machine::run_export_outcome`]/
 /// [`Machine::run_label_outcome`]/[`Machine::resume_outcome`]. The plain
 /// [`Machine::run_export`]/[`Machine::run_label`] (and the JIT backends'
 /// `run_export`) are **non-blocking**: they fold a [`RunOutcome::Wait`] into the
-/// typed `Err(`[`crate::error::blocked`]`)` rather than inventing a result.
+/// typed `Err(`[`crate::error::blocked`]`)` and a [`RunOutcome::Yield`] into a typed
+/// `unsupported` error rather than inventing a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
     /// The run finished; this is `x(0)`.
@@ -60,6 +63,24 @@ pub enum RunOutcome {
         /// The code offset within that function to resume at.
         pc: u32,
     },
+    /// The process was **pre-empted** at a reduction-budget boundary: the host's
+    /// [`ExecutionContext::reduce_outcome`](crate::ExecutionContext::reduce_outcome)
+    /// hook returned [`ReduceOutcome::Yield`](crate::context::ReduceOutcome::Yield) after an
+    /// interpreted instruction, so the driver stopped at the **next** instruction.
+    ///
+    /// Semantically this is a *suspend* exactly like [`RunOutcome::Wait`]: the process
+    /// is resumable at `func` (index into [`Module::functions`]) / `pc` via
+    /// [`Machine::resume_outcome`], and the machine is left untouched at that address.
+    /// The difference is only *why* it stopped — a yield means "you still have work to
+    /// do but your slice is over", whereas a wait means "you are blocked on a message".
+    /// A non-blocking entry folds this into a typed error, never a wrong result.
+    Yield {
+        /// The function index (into [`Module::functions`]) to resume in.
+        func: u32,
+        /// The code offset within that function to resume at (the *next*
+        /// instruction, never a re-execution of the one already charged).
+        pc: u32,
+    },
 }
 
 /// Fold a run's [`RunOutcome`] into the `Result<Eterm>` the non-blocking entries
@@ -67,11 +88,16 @@ pub enum RunOutcome {
 ///
 /// A [`RunOutcome::Returned`] is the value; a [`RunOutcome::Wait`] becomes the
 /// typed [`crate::error::blocked`] error, because a non-blocking entry cannot
-/// suspend the process and must never substitute a wrong result for the block.
+/// suspend the process and must never substitute a wrong result for the block. A
+/// [`RunOutcome::Yield`] is likewise a suspend the non-blocking entry cannot honour:
+/// it becomes a typed `unsupported` pre-emption error (never a wrong result).
 fn fold_outcome(outcome: RunOutcome) -> Result<Eterm> {
     match outcome {
         RunOutcome::Returned(value) => Ok(value),
         RunOutcome::Wait { .. } => Err(error::blocked()),
+        RunOutcome::Yield { .. } => Err(error::unsupported(
+            "run: process pre-empted (reduction budget exhausted)",
+        )),
     }
 }
 
@@ -128,6 +154,10 @@ impl Machine {
     /// [`Machine::run_label_outcome`]'s reset used to do; that is precisely
     /// [`Machine::run_loop`]'s body (literal binding + label map + dispatch loop,
     /// no reset), so this delegates to it.
+    ///
+    /// The same entry resumes a [`RunOutcome::Yield`] (a cooperative pre-emption):
+    /// both report a resumable `(func, pc)` and leave the machine untouched there, so
+    /// the two are indistinguishable to this method.
     ///
     /// An out-of-range `(func, pc)` is the loop's own typed error, never a panic.
     pub fn resume_outcome(
@@ -310,14 +340,27 @@ impl Machine {
 mod tests {
     use super::{Machine, RunOutcome};
     use beam_common::{BeamError, Result};
-    use beam_loader::{Atom, Block, Export, Function, Instr, Label, Module, Operand};
+    use beam_loader::{
+        Atom, Block, Export, Function, Import, ImportRef, Instr, Label, Module, Operand,
+    };
     use beam_term::{make_small, Eterm, NIL};
     use std::collections::VecDeque;
 
-    use crate::context::{Mailbox, MinimalContext};
+    use crate::context::{ExecutionContext, Mailbox, MinimalContext, ReduceOutcome};
     use crate::error;
     use crate::jit::Tier;
 
+    /// The `.n` of a typed engine raise.
+    fn reason(error: BeamError) -> String {
+        match error {
+            BeamError::Raise(raise) => raise
+                .reason
+                .as_atom()
+                .expect("a typed engine error names its reason")
+                .to_string(),
+            other => panic!("expected a typed raise, got {other:?}"),
+        }
+    }
     #[test]
     fn run_export_of_missing_export_is_a_typed_error() {
         let module = Module::default();
@@ -785,5 +828,275 @@ mod tests {
             ),
             other => panic!("expected the typed blocked error, got {other:?}"),
         }
+    }
+
+    // ---- the cooperative yield (reduction-budget pre-emption) -------------
+
+    /// A **non-allocating** counting loop **with a real import**:
+    /// `label 1 | bif0 host:counter/0 x0 | jump 1`, exported as `run/0`. There is no
+    /// `allocate`/`test_heap`, so `ensure_heap` is never reached and the per-instruction
+    /// reduction hook is the only way to interrupt it. One iteration executes three
+    /// interpreted instructions (the `label` marker at code 0, the `bif0` at code 1,
+    /// the `jump` at code 2).
+    fn yield_loop_module() -> (Module, Atom) {
+        let mut module = Module::default();
+        module.name = module.atom_table.intern("loop");
+        let function_name = module.atom_table.intern("run");
+        let host = module.atom_table.intern("host");
+        let counter = module.atom_table.intern("counter");
+        module.imports.push(Import {
+            module: host,
+            function: counter,
+            arity: 0,
+        });
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::Bif0 {
+                bif: ImportRef(0),
+                dst: Operand::X(0),
+            },
+            Instr::Jump { target: Label(1) },
+        ];
+        let labels = code
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ins)| match ins {
+                Instr::Label(l) => Some((*l, i)),
+                _ => None,
+            })
+            .collect();
+        module.functions = vec![Function {
+            func_label: Label(1),
+            entry_label: Label(1),
+            module: module.name,
+            name: function_name,
+            arity: 0,
+            code,
+            blocks: Vec::new(),
+            labels,
+        }];
+        module.exports = vec![Export {
+            function: function_name,
+            arity: 0,
+            label: Label(1),
+        }];
+        (module, function_name)
+    }
+
+    /// A host that serves `host:counter/0` (counting calls; the BIF stops the loop with
+    /// a typed error once `calls > stop_after`) and whose **cooperative-yield** hook
+    /// answers [`ReduceOutcome::Yield`] once it has accepted `yield_after` charges.
+    struct YieldCtx {
+        stop_after: u32,
+        calls: u32,
+        charges: u32,
+        yield_after: Option<u32>,
+        /// The `n` of every hook call, in order.
+        seen: Vec<u32>,
+    }
+
+    impl YieldCtx {
+        fn new(stop_after: u32) -> YieldCtx {
+            YieldCtx {
+                stop_after,
+                calls: 0,
+                charges: 0,
+                yield_after: None,
+                seen: Vec::new(),
+            }
+        }
+
+        fn yielding_after(mut self, n: u32) -> YieldCtx {
+            self.yield_after = Some(n);
+            self
+        }
+
+        /// Stop asking for a yield (so a resume runs the loop to its terminal outcome).
+        fn stop_yielding(&mut self) {
+            self.yield_after = None;
+        }
+    }
+
+    impl ExecutionContext for YieldCtx {
+        fn call_bif(
+            &mut self,
+            module: &str,
+            function: &str,
+            arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            if module == "host" && function == "counter" && arity == 0 {
+                self.calls += 1;
+                return if self.calls > self.stop_after {
+                    Err(error::unsupported("stop"))
+                } else {
+                    Ok(make_small(self.calls as i64))
+                };
+            }
+            Err(error::unsupported(&format!("bif {module}:{function}")))
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn reduce_outcome(&mut self, n: u32) -> Result<ReduceOutcome> {
+            self.seen.push(n);
+            self.charges += 1;
+            if let Some(budget) = self.yield_after {
+                if self.charges >= budget {
+                    return Ok(ReduceOutcome::Yield);
+                }
+            }
+            Ok(ReduceOutcome::Continue)
+        }
+    }
+
+    /// A host that overrides **only** [`ExecutionContext::reduce`] — the pre-existing
+    /// hook — and never the new [`ExecutionContext::reduce_outcome`]. The trait default
+    /// forwards to `reduce`, so this host is the control that proves the cooperative
+    /// path is purely additive.
+    struct ReduceOnlyCtx {
+        /// Accepted charges before the host's own typed error ends the run.
+        budget: u32,
+        charges: u32,
+    }
+
+    impl ExecutionContext for ReduceOnlyCtx {
+        fn call_bif(
+            &mut self,
+            module: &str,
+            function: &str,
+            arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            if module == "host" && function == "counter" && arity == 0 {
+                return Ok(make_small(1));
+            }
+            Err(error::unsupported(&format!("bif {module}:{function}")))
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn reduce(&mut self, n: u32) -> Result<()> {
+            assert_eq!(n, 1, "the engine charges exactly one reduction per instruction");
+            self.charges += 1;
+            if self.charges > self.budget {
+                return Err(error::unsupported("reduction budget exhausted"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_yielding_host_stops_the_loop_at_the_next_instruction() {
+        let (module, run) = yield_loop_module();
+        let mut machine = Machine::new();
+        let mut ctx = YieldCtx::new(100).yielding_after(2);
+
+        let outcome = machine
+            .run_export_outcome(&module, run, 0, &[], &mut ctx)
+            .expect("a yield is an outcome, not an error");
+
+        // Charges #1 and #2 were the `label` at code 0 and the `bif0` at code 1; the
+        // step was applied **first**, so the reported address is the *next* instruction
+        // (the `jump` at code 2) — never a re-execution of the instruction charged.
+        assert_eq!(outcome, RunOutcome::Yield { func: 0, pc: 2 });
+        assert_eq!(ctx.charges, 2, "one charge per interpreted instruction");
+        assert!(
+            ctx.seen.iter().all(|&n| n == 1),
+            "every charge is one reduction, got {:?}",
+            ctx.seen
+        );
+        assert_eq!(
+            machine.reductions(),
+            2,
+            "the engine's slice counter agrees with the host's tally"
+        );
+        assert_eq!(ctx.calls, 1, "only the first `bif0` ran before the yield");
+        assert_eq!(machine.frame_depth(), 1, "the resume needs the live frame");
+    }
+
+    #[test]
+    fn a_yield_address_resumes_the_loop_to_its_terminal_outcome() {
+        let (module, run) = yield_loop_module();
+        let mut machine = Machine::new();
+        // The BIF stops the loop on its 4th call, so the resumed run terminates
+        // deterministically with the host's typed error.
+        let mut ctx = YieldCtx::new(3).yielding_after(2);
+
+        let outcome = machine
+            .run_export_outcome(&module, run, 0, &[], &mut ctx)
+            .expect("the pre-emption is reported, not raised");
+        let RunOutcome::Yield { func, pc } = outcome else {
+            panic!("expected a yield, got {outcome:?}");
+        };
+        assert_eq!((func, pc), (0, 2));
+
+        // Resume at the reported address with the yield switched off: the process
+        // continues where it left off and runs on to its terminal (raising) outcome.
+        ctx.stop_yielding();
+        let err = machine
+            .resume_outcome(&module, func, pc, &mut ctx)
+            .expect_err("the counter BIF ends the loop");
+        assert_eq!(reason(err), "unsupported_opcode: stop");
+        assert_eq!(
+            ctx.calls, 4,
+            "the failing 4th call is not charged (the instruction did not succeed)"
+        );
+        // The resume is a fresh slice: `drive` re-zeroes the counter, and the resumed
+        // run charged exactly the eight instructions it interpreted before the raise.
+        assert_eq!(machine.reductions(), 8);
+    }
+
+    #[test]
+    fn a_non_blocking_entry_folds_a_yield_into_the_typed_preemption_error() {
+        let (module, run) = yield_loop_module();
+        let mut machine = Machine::new();
+        let mut ctx = YieldCtx::new(100).yielding_after(1);
+
+        let err = machine
+            .run_export(&module, run, 0, &[], &mut ctx)
+            .expect_err("a non-blocking entry cannot suspend a pre-empted process");
+        assert_eq!(
+            reason(err),
+            "unsupported_opcode: run: process pre-empted (reduction budget exhausted)"
+        );
+    }
+
+    #[test]
+    fn a_host_that_overrides_only_reduce_is_unchanged_by_the_yield_hook() {
+        let (module, run) = yield_loop_module();
+        let mut machine = Machine::new();
+        // The default `reduce_outcome` forwards to `reduce`, so the pre-existing
+        // per-instruction charge is preserved verbatim and an `Err` from it still ends
+        // the run (no yield is ever produced).
+        let mut ctx = ReduceOnlyCtx {
+            budget: 5,
+            charges: 0,
+        };
+
+        let err = machine
+            .run_export_outcome(&module, run, 0, &[], &mut ctx)
+            .expect_err("the host's reduction budget ends the run");
+        assert_eq!(reason(err), "unsupported_opcode: reduction budget exhausted");
+        // Five accepted charges plus the erroring sixth: exactly one charge per
+        // interpreted instruction, mirroring `tests/reductions.rs`.
+        assert_eq!(ctx.charges, 6);
+        assert_eq!(machine.reductions(), 6);
     }
 }
