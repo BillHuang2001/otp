@@ -189,7 +189,14 @@ impl Machine {
                 {
                     self.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
                 }
-                self.throw_error(reason)
+                // The raise carries the frames it happened through, the raising
+                // function first (`Machine::raise_stacktrace`): the reason is the
+                // bare atom (C's `EXC_FUNCTION_CLAUSE`), so without them an
+                // *uncaught* `function_clause` — the boot path's failure mode —
+                // would name no function at all. A caught raise is unaffected (the
+                // frames are metadata on the uncaught `Raise` only).
+                let frames = self.raise_stacktrace(module, func, pc);
+                self.throw_with_stacktrace(ExceptionClass::Error, reason, NIL, frames)
             }
             Instr::Move { src, dst } => {
                 let value = read_operand(self, ctx, src)?;
