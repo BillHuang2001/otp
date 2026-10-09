@@ -111,7 +111,19 @@ impl Machine {
                 Some(handle) => (&handle.module, &handle.labels),
                 None => (module, entry_labels),
             };
-            let step = self.step_instruction(active_module, active_labels, func, pc, ctx)?;
+            let step = match self.step_instruction(active_module, active_labels, func, pc, ctx) {
+                Ok(step) => step,
+                // The uniform raise funnel's second half: `step_instruction` already
+                // attached the frames when the raise happened in the run's **entry**
+                // context (`0`, where the active module IS `module`). A raise that
+                // happened inside a cross-module callee (a non-zero context) was left
+                // for here, where the driver knows the true entry module — so the
+                // caller-context frames are named against `module`, not the callee's.
+                // A raise that already carries frames is returned unchanged, so the
+                // two halves never double-derive them. `func`/`pc` still hold the
+                // raising instruction's address.
+                Err(err) => return Err(self.with_uncaught_frames(err, Some(module), func, pc)),
+            };
             // Price the instruction: the engine's own slice counter (read back by the
             // host through `Machine::reductions`) and the host hook that lets a
             // **non-allocating** loop be pre-empted. `ensure_heap` — the only other
