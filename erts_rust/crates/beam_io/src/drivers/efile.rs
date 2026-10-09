@@ -20,7 +20,11 @@
 
 //! The `efile` driver: [`FdDriver`] plus the `efile` control family.
 //!
-//! `efile` is the emulator's file driver (`erts/emulator/drivers/unix/efile_drv.c`). Like
+//! `efile` is the emulator's file driver. In this OTP the file operations are the
+//! `prim_file` NIFs — `erts/emulator/nifs/common/prim_file_nif.c` (mode/verb layer) over
+//! `erts/emulator/nifs/unix/unix_prim_file.c` (syscall layer) — with
+//! `erts/emulator/beam/io.c` owning the port command/control plumbing; those are the
+//! ground truth this driver reproduces (there is no `efile_drv.c` in this tree). Like
 //! the C driver it is a thin byte-stream driver over a file descriptor, so this wrapper
 //! **composes** an [`FdDriver`] (reusing all its registration, non-blocking read/write and
 //! line/phase handling — nothing is duplicated) and adds the `efile`-specific control
@@ -68,8 +72,10 @@
 //! as a string. `binary` therefore both selects the raw framing phase and records
 //! [`FileDataMode::Binary`].
 //!
-//! An unknown command, an unopened port given a file-position request, or an unparsable
-//! argument is rejected with [`beam_common::BeamError::BadArg`].
+//! An unknown command, an unopened port given a file-position request, an empty/`NUL`-carrying
+//! path, or a malformed numeric argument is rejected with
+//! [`beam_common::BeamError::BadArg`]. A *syscall* failure is never one of those: it is the
+//! typed [`beam_common::BeamError::Io`] carrying the raw `errno` (see *Open modes*).
 //!
 //! # Open modes
 //!
@@ -100,28 +106,44 @@
 //! refused with `EISDIR`, exactly as the oracle's `open_file_is_dir` type check does
 //! (`unix_prim_file.c:206-213`); `open(2)` alone would happily open one read-only.
 //!
+//! Two words the C's translator *does* know are deliberately not served here: `directory`
+//! (the C's `EFILE_MODE_DIRECTORY`, which adds `O_DIRECTORY`/`DIR_MODE` and takes the
+//! `ENOTDIR` branch instead of the `EISDIR` one, `unix_prim_file.c:180-213`) and the
+//! internal `skip_type_check`. A `directory` open is therefore not expressible, and every
+//! directory open — including one spelled with that word — is refused with `EISDIR`
+//! (raising this driver's coverage gap, never opening a directory by accident). Because a
+//! word outside the table above (e.g. `raw`, which the C's translator likewise ignores,
+//! `prim_file_nif.c:521-524`) makes the **whole argument** a path (see the paragraph above),
+//! an unserved mode is never silently dropped either.
+//!
 //! A failed `open` is reported as [`beam_common::BeamError::Io`] carrying the failing
 //! `errno`; the `{error, <errno-atom>}` rendering (`enoent`, `eexist`, `eisdir`, …) is the
-//! runtime's `prim_file` floor's job, not this driver's.
+//! runtime's `prim_file` floor's job, not this driver's. `errno_atom`/`erl_errno_id`'s rules
+//! are what the runtime applies (`posix_error_to_tuple`, `prim_file_nif.c:306-309`).
 //!
 //! # `read_ahead` and `delayed_write` (`prim_file` handoffs)
 //!
-//! These two `file:open/2` options are deliberately **not** implemented here: neither is an
-//! `open(2)` flag, so a driver-level equivalent would be a fabrication.
+//! These two `file:open/2` options are deliberately **not** implemented here: **neither is
+//! an `open(2)` flag**, so a driver-level equivalent would be a fabrication. Both are
+//! Erlang-level policies living *above* the driver.
 //!
 //! * The C's mode translator ignores them on purpose — *"Modes like 'raw', 'ram',
 //!   'delayed_writes' etc are handled further up the chain"* (`prim_file_nif.c:521-524`) —
-//!   and they appear nowhere in `efile_modes_t`.
+//!   and they appear nowhere in `efile_modes_t` (`prim_file_nif.h:26-41`), so they can
+//!   never reach `get_flags`/`open(2)`.
 //! * `read_ahead` is a **read cache** owned by `prim_file`: it sets `r_ahead_size` (default
 //!   `64 bsl 10`) and hangs an Erlang-side `prim_buffer` off the file data
-//!   (`erts/preloaded/src/prim_file.erl:516-521`), which `read/2` then refills and serves
+//!   (`erts/preloaded/src/prim_file.erl:518-521`), which `read/2` then refills and serves
 //!   from, tracking the *user's* logical position separately from the real one
-//!   (`prim_file.erl:487-497`). Reproducing it means owning that buffer and the
+//!   (`prim_file.erl:306-312`, `487-497`). Reproducing it means owning that buffer and the
 //!   logical-vs-real position bookkeeping — `prim_file` work, not a driver mode.
-//! * `delayed_write` is a **write-buffering policy** owned by `file`: it batches successive
-//!   `write/2` calls until `Size` bytes (`64 KiB` by default) or `Delay` ms have elapsed
-//!   and only then hands them to the driver (`lib/kernel/src/file.erl:1302-1323`). It is a
-//!   property of the Erlang-level writer, not of the underlying `open(2)`.
+//! * `delayed_write` is a **write-buffering policy** owned by the `file` layer: `file:open/2`
+//!   hands a raw open to `raw_file_io`, which layers `raw_file_io_delayed` over the driver
+//!   when the option is present (`lib/kernel/src/raw_file_io.erl:31-33`); that layer batches
+//!   successive `write/2` calls until the `{delayed_write, Size, Delay}` threshold (roughly
+//!   64 KB / 2 s for the bare atom, `lib/kernel/src/file.erl:1302-1325`) is reached and only
+//!   then hands them to the driver. It is a property of the Erlang-level writer, not of the
+//!   underlying `open(2)`.
 //!
 //! Both are therefore recorded as [`beam_rt`]'s `prim_file` floor handoffs rather than
 //! approximated here (see the crate `CONTEXT.md`).
@@ -556,9 +578,10 @@ pub fn make_efile() -> Result<Box<dyn Driver>> {
 ///
 /// # Errors
 ///
-/// Returns [`beam_common::BeamError::BadArg`] when a recognised flag list is empty (e.g. a
-/// leading or trailing comma) — a bare path is never an error here; the empty-path check is
-/// the caller's.
+/// Never fails: a token that is not entirely made of recognised flag words — an unknown word
+/// (e.g. the C-ignored `raw`), or an empty one from a leading/trailing comma — leaves the
+/// **whole** argument as the path (the grammar above), it is not an error here. The caller
+/// rejects an empty path with [`beam_common::BeamError::BadArg`].
 fn parse_open_arg(arg: &[u8]) -> Result<OpenArg> {
     let bare = OpenArg {
         flags: OpenFlags::default(),
@@ -674,7 +697,10 @@ fn is_directory(fd: RawFd) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{make_efile, EfileDriver};
+    use super::{
+        make_efile, parse_offset, parse_open_arg, parse_seek, Access, EfileDriver, FileDataMode,
+        OpenFlags,
+    };
     use crate::poller::Poller;
     use crate::port::PortRegistry;
     use beam_common::BeamError;
@@ -744,7 +770,197 @@ mod tests {
         assert!(!driver.eof());
     }
 
+    /// An `OpenFlags` with the given words set (the order of the words is documented).
+    fn flags(read: bool, write: bool, append: bool, exclusive: bool, sync: bool) -> OpenFlags {
+        OpenFlags {
+            read,
+            write,
+            append,
+            exclusive,
+            sync,
+        }
+    }
+
+    /// The `open(2)` flag word every flag combination must produce — the C's `get_flags`
+    /// (`unix_prim_file.c:142-171`) plus the two flags this reactor-served driver always adds
+    /// — and the access mode `efile_translate_modelist` implies (`prim_file_nif.c:529-536`).
+    ///
+    /// This is the bit-exact pin of the translation: `O_SYNC`/`O_EXCL` are not observable
+    /// from the driver's public surface, so the mapping is asserted where the C asserts it.
     #[test]
+    fn the_open_flag_translation_reproduces_get_flags() {
+        // (label, flag words, the C's `get_flags` result, the implied access mode)
+        let table: &[(&str, OpenFlags, libc::c_int, Access)] = &[
+            (
+                "(no flag word)",
+                flags(false, false, false, false, false),
+                libc::O_RDONLY,
+                Access::Read,
+            ),
+            (
+                "read",
+                flags(true, false, false, false, false),
+                libc::O_RDONLY,
+                Access::Read,
+            ),
+            (
+                "write",
+                flags(false, true, false, false, false),
+                libc::O_TRUNC | libc::O_WRONLY | libc::O_CREAT,
+                Access::Write,
+            ),
+            (
+                "read,write",
+                flags(true, true, false, false, false),
+                libc::O_RDWR | libc::O_CREAT,
+                Access::ReadWrite,
+            ),
+            (
+                "append",
+                flags(false, false, true, false, false),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                Access::Write,
+            ),
+            (
+                "read,append",
+                flags(true, false, true, false, false),
+                libc::O_RDWR | libc::O_CREAT | libc::O_APPEND,
+                Access::ReadWrite,
+            ),
+            (
+                "exclusive",
+                flags(false, false, false, true, false),
+                libc::O_TRUNC | libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                Access::Write,
+            ),
+            (
+                "read,exclusive",
+                flags(true, false, false, true, false),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                Access::ReadWrite,
+            ),
+            (
+                "write,append",
+                flags(false, true, true, false, false),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                Access::Write,
+            ),
+            (
+                "write,exclusive",
+                flags(false, true, false, true, false),
+                libc::O_TRUNC | libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                Access::Write,
+            ),
+            (
+                "write,sync",
+                flags(false, true, false, false, true),
+                libc::O_TRUNC | libc::O_WRONLY | libc::O_CREAT | libc::O_SYNC,
+                Access::Write,
+            ),
+            (
+                "read,sync",
+                flags(true, false, false, false, true),
+                libc::O_RDONLY | libc::O_SYNC,
+                Access::Read,
+            ),
+            (
+                "append,sync",
+                flags(false, false, true, false, true),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_SYNC,
+                Access::Write,
+            ),
+            (
+                "read,write,sync",
+                flags(true, true, false, false, true),
+                libc::O_RDWR | libc::O_CREAT | libc::O_SYNC,
+                Access::ReadWrite,
+            ),
+        ];
+        for (label, words, expected, access) in table {
+            assert_eq!(*access, words.access(), "`{label}`: the implied access mode");
+            assert_eq!(
+                *expected | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                words.to_oflags(),
+                "`{label}`: the open(2) flag word"
+            );
+        }
+        // `append` genuinely drops the truncation the write-only form carries...
+        assert_eq!(
+            flags(false, false, true, false, false).to_oflags() & libc::O_TRUNC,
+            0
+        );
+        // ...and `O_NONBLOCK`/`O_CLOEXEC` are on every single combination.
+        for (label, words, _, _) in table {
+            assert_eq!(
+                words.to_oflags() & (libc::O_NONBLOCK | libc::O_CLOEXEC),
+                libc::O_NONBLOCK | libc::O_CLOEXEC,
+                "`{label}`: the always-on flags"
+            );
+        }
+    }
+
+    /// The `seek` vocabulary is the C's `EFILE_SEEK_{BOF,CUR,EOF}` (`prim_file_nif.h:50-54`),
+    /// and the offset parser is the shared signed-decimal one.
+    #[test]
+    fn the_seek_whences_are_the_cs_efile_seek_values() {
+        assert_eq!(parse_seek(b"bof,7").expect("bof"), (libc::SEEK_SET, 7));
+        assert_eq!(parse_seek(b"cur,-1").expect("cur"), (libc::SEEK_CUR, -1));
+        assert_eq!(
+            parse_seek(b"eof").expect("the offset defaults to 0"),
+            (libc::SEEK_END, 0)
+        );
+        assert_eq!(
+            parse_seek(b" eof , 5 ").expect("surrounding whitespace is trimmed"),
+            (libc::SEEK_END, 5)
+        );
+        assert!(matches!(parse_seek(b"sideways,0"), Err(BeamError::BadArg)));
+        assert!(matches!(parse_seek(b"bof,x"), Err(BeamError::BadArg)));
+        assert!(matches!(parse_seek(b""), Err(BeamError::BadArg)));
+
+        assert_eq!(parse_offset(b" 42 ").expect("trimmed"), 42);
+        assert_eq!(parse_offset(b"-3").expect("signed"), -3);
+        for bad in [&b""[..], b"1x", b"--1", b"99999999999999999999"] {
+            assert!(
+                matches!(parse_offset(bad), Err(BeamError::BadArg)),
+                "{bad:?} is not an offset"
+            );
+        }
+    }
+
+    /// The `open` argument grammar: `[<flags> ]<path>`, recognised as a flag list only when
+    /// **every** comma-separated word is a known flag — so a path containing a space (or one
+    /// whose first token carries an unserved word such as the C-ignored `raw`) survives as a
+    /// path instead of being silently mangled.
+    #[test]
+    fn the_open_argument_grammar_is_the_documented_one() {
+        let bare = parse_open_arg(b"/tmp/plain").expect("a bare path");
+        assert_eq!(bare.path, b"/tmp/plain");
+        assert_eq!(
+            bare.flags,
+            OpenFlags::default(),
+            "a bare path is the read-only default"
+        );
+        assert_eq!(bare.data_mode, None);
+
+        let flagged = parse_open_arg(b"write,exclusive /tmp/x").expect("a flag list");
+        assert_eq!(flagged.path, b"/tmp/x", "the flag token is not the path");
+        assert!(flagged.flags.write && flagged.flags.exclusive);
+        assert!(!flagged.flags.read);
+
+        let mode = parse_open_arg(b"read,list /tmp/y").expect("a data-mode flag");
+        assert_eq!(mode.path, b"/tmp/y");
+        assert!(mode.flags.read);
+        assert_eq!(mode.data_mode, Some(FileDataMode::List));
+
+        for not_a_flag_list in [&b"/tmp/with space"[..], b"raw,read /tmp/z", b"read, /tmp/z", b""] {
+            let parsed = parse_open_arg(not_a_flag_list).expect("never an error here");
+            assert_eq!(
+                parsed.path, not_a_flag_list,
+                "{not_a_flag_list:?}: the whole argument stayed the path"
+            );
+            assert_eq!(parsed.flags, OpenFlags::default());
+        }
+    }    #[test]
     fn a_read_only_efile_reads_bytes_and_answers_getopts() {
         let (peer, read_end) = UnixStream::pair().expect("socketpair");
         // SAFETY: `read_end.as_raw_fd()` names an open descriptor of a live stream.
