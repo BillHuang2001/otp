@@ -435,6 +435,13 @@ pub struct Runtime {
     /// live in one thread — a process-global table would let their handles collide. See
     /// [`crate::native::prim_file`].
     open_files: HashMap<u64, std::fs::File>,
+    /// The **native `file_server_2` service** and its live io-devices (contract A.9) — see
+    /// [`crate::native::file_server`].
+    ///
+    /// `pub(crate)` because the service's whole implementation lives in that module (its
+    /// request decoding, reply shaping and scheduler-pass step); the field itself is the
+    /// state that ties the registered `file_server_2` pid to the runtime.
+    pub(crate) file_services: crate::native::file_server::FileServices,
 }
 
 impl Runtime {
@@ -485,6 +492,15 @@ impl Runtime {
         processes
             .register(init_name, self_pid)
             .map_err(|_| error::message("boot: the `init` name is already registered"))?;
+        // The native **`file_server_2` service** (contract A.9): a `Runnable`, never-enqueued
+        // process that answers the OTP file protocol, so the real `bootstrap/bin/start.boot`'s
+        // final `{apply,{c,erlangrc,[]}}` directive completes instead of dying with
+        // `{noproc,{gen_server,call,[file_server_2,…]}}` (see `src/native/file_server.rs`).
+        let file_services = crate::native::file_server::FileServices::start(
+            &mut processes,
+            code_server.atoms_mut(),
+            config.heap.policy().clone(),
+        )?;
         // A zero-word heap can hold nothing, so the configured size is floored — and a
         // `+hmax` the emulator was given is the ceiling (see `term_heap_words`).
         let heap_words = term_heap_words(&config);
@@ -563,6 +579,7 @@ impl Runtime {
             inbound_delivery: false,
             perf_map,
             open_files: HashMap::new(),
+            file_services,
         })
     }
 

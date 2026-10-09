@@ -82,6 +82,7 @@
 mod application;
 mod code;
 mod erts_internal;
+mod file_server;
 mod group_leader;
 mod init;
 pub(crate) mod memory;
