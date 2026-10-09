@@ -157,6 +157,7 @@ needs) a canonical owner **outside** `beam_common`; adopters listed — **none e
 - `src/error.rs` → `BeamError`/`Result` + term-independent exception machinery (`Raise`, `ExitReason`, …)
 - `src/version.rs` → OTP/ERTS version constants, `Version` parsing/`Display`
 - `src/config.rs` → `Flavor`, `FeatureFlags`, `RuntimeConfig`, `LogLevel`
+- `src/constants.rs` → canonical cross-crate ERTS constants (`CONTEXT_REDS`)
 - `src/logging.rs` → dependency-free logging facade + log macros
 - `src/safety.rs` → the workspace `unsafe` marker convention (docs only)
 - `src/lib.rs` → crate docs, module wiring, root re-exports
