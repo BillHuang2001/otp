@@ -532,7 +532,23 @@ impl Runtime {
                 }
                 Err(err) => break Err(err),
             }
-            // The port-monitor half of the exit obligation: a process that died in the slices
+            // The **native-service half**: drain the `file_server_2` service's and its
+            // io-devices' mailboxes and deliver each reply into the requesting process's
+            // mailbox (contract A.9, `src/native/file_server.rs`). A reply is what lets a
+            // caller blocked in `gen_server:call`'s `receive` make progress — the boot's
+            // `{apply,{c,erlangrc,[]}}` directive — so it is counted into `delivered`; the
+            // requesting process is normally the runtime's own `Runnable` `self_pid`, which
+            // the delivery therefore does **not** enqueue, and which resumes through the
+            // engine's blocking-aware entry rather than a scheduler slice.
+            match self.service_file_requests(&mut table) {
+                Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    scheduler.resume_woken(&mut table);
+                    continue;
+                }
+            }
             // just run may have been watching a live port, and `beam_process`'s finalizer cannot
             // remove the matching *incoming* entry because this runtime threads no port table
             // into the termination. The dead watchers' recorded `(port, reference)` pairs are
