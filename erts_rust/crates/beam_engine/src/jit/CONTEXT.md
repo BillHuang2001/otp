@@ -10,11 +10,11 @@ interpreter's own step. Block ABI, register cache, spill/root-set model and the 
 deopt are the load-bearing contracts.
 
 ## API Surface (crate-visible; `beam_engine::jit::…`)
-- `mod.rs` — `Tier { Interpreter, BaselineJit, Cranelift }` (`ALL`/`name`/`from_name`/`is_available`), `available_tiers()`, the `JitBackend` trait (`compile`/`run_compiled`/`run_export`), `CodeRegion`, feature gating (`jit-cranelift` default OFF; `jit-beamasm` aliases the baseline).
-- `cache.rs` — `CodeCache`, `ModuleKey`/`module_fingerprint` (content hash, never a pointer), thread-local `run_baseline_cached{,_outcome,_label_outcome}`, `baseline_code_map`.
+- `mod.rs` — `Tier { Interpreter, BaselineJit, Cranelift }` (`ALL`/`name`/`from_name`/`is_available`), `available_tiers()`, the `JitBackend` trait (`compile`/`run_compiled`/`run_export`), `CodeRegion`, feature gating (`jit-cranelift` default OFF; `jit-beamasm` aliases the baseline), and the feature-dispatched Cranelift entries (`run_cranelift{,_outcome,_label_outcome,_resume_outcome}`).
+- `cache.rs` — `CodeCache`, `ModuleKey`/`module_fingerprint` (content hash, never a pointer), thread-local `run_baseline_cached{,_outcome,_label_outcome,_resume_outcome}`, `baseline_code_map`. `run_baseline_cached_resume_outcome` is the **resume** entry (backs `Machine::resume_outcome_with_tier` for the baseline tier): it reuses the cached artifact (compiling uncached only on a `RefCell` re-entry) and delegates to the no-reset `baseline::run_compiled_resume_outcome`.
 - `tiering.rs` — `TierPolicy { baseline_threshold, hot_threshold }` (interpret → baseline → hot; a policy only).
-- `baseline/` — `BaselineJit`, `CompiledModule` (`entry`/`block_count`/`cached_registers`/`highest_{cached,native}_register`/`code_len`/`code_address_range`/`code_map`), the block ABI (`runtime.rs`: `encode_target`/`decode_target`/`encode_wait`/`decode_wait`/`HALT=-1`/`ERROR=-2`/`WAIT_BIT`), the drivers (`run_compiled{,_outcome,_label_outcome}`).
-- `cranelift/` (feature `jit-cranelift`) — `CraneliftJit`, `CompiledFunctions`, `CodegenReport`.
+- `baseline/` — `BaselineJit`, `CompiledModule` (`entry`/`block_count`/`cached_registers`/`highest_{cached,native}_register`/`code_len`/`code_address_range`/`code_map`), the block ABI (`runtime.rs`: `encode_target`/`decode_target`/`encode_wait`/`decode_wait`/`HALT=-1`/`ERROR=-2`/`WAIT_BIT`), the drivers (`run_compiled{,_outcome,_label_outcome}`) plus the no-reset `run_compiled_resume_outcome`.
+- `cranelift/` (feature `jit-cranelift`) — `CraneliftJit`, `CompiledFunctions`, `CodegenReport`, `run_resume_outcome` (a typed error — see below).
 - `emitter/` — `CodeBuffer`, `Reg`, `Cond`, `Label`: the crate's **only** executable-memory mapping.
 
 ## Key contracts (frozen)
@@ -22,6 +22,7 @@ deopt are the load-bearing contracts.
 - **Deopt = one interpreter step.** Every un-lowered instruction (or an inline sequence whose run-time guard rejects) spills the cached x-registers, calls `jit_step_one` → `Machine::step_instruction`, then continues **in-block** when the step advanced by exactly one (`Step::Next`); any other outcome returns word to the driver. `FuncInfo` is a raise (`function_clause`), deliberately never a metadata no-op.
 - **Root-set / spill**: a block exit may never skip the spill of its cached x-registers to `machine.x`; non-cached registers are addressed directly in `machine.x`. Both `call_r` sites (`emit/mod.rs` and `emit/link.rs`) spill first, so a helper (hence `ensure_heap`/`alloc_words`) sees the interpreter's exact live root set.
 - **`Step::Enter`** (cross-module context switch) is interpreter-only; both native tiers return the typed `unsupported("jit: module context switch outside the interpreter driver")`.
+- **Resume.** The baseline tier resumes a suspended process **without reset** (`run_compiled_resume_outcome`: `enter_run` + the shared `drive`, entering the compiled block at the reported `(func, pc)`), so a slice that suspended on the baseline tier resumes on it and stays interpreter-identical (same label map, same deopt, same reduction accounting at slice start). A resume in a **non-entry** module context (a suspension inside a cross-module callee) is the typed `unsupported("jit: cannot resume in a non-entry module context")`. The Cranelift tier bakes each compiled function's entry `pc` in, so a mid-function suspension address is unserviceable: `cranelift::run_resume_outcome` returns the typed `unsupported("cranelift jit: cannot resume at an arbitrary pc …")` — never a silent fallback to the interpreter.
 - `jit-cranelift` deps are optional/default-off; without the feature `cargo tree -p beam_engine` lists no `cranelift-*`.
 - Never RWX: `mmap` RW then `mprotect` RX (`emitter`).
 

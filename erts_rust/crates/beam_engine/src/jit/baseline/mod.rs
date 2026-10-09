@@ -477,6 +477,64 @@ pub(crate) fn run_compiled_label_outcome(
     run_native_label_outcome(machine, module, label, arity, args, ctx, &code)
 }
 
+/// Resume a suspended machine through the compiled blocks, reporting whether the
+/// resumed slice returned or blocked again.
+///
+/// This is the **no-reset** counterpart of [`run_compiled_outcome`]: the machine is
+/// the one a [`RunOutcome::Wait`](crate::RunOutcome::Wait) left suspended (its
+/// registers, Erlang stack and every call frame survive), and the driver re-enters
+/// at the reported `(func, pc)` — the address the suspension named — instead of
+/// resetting and seeding an export. It is what
+/// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
+/// runs for [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit), so a slice that
+/// suspended on the native tier resumes on it too.
+///
+/// It mirrors [`Machine::resume_outcome`](crate::Machine::resume_outcome)'s body
+/// exactly — the shared per-run prologue
+/// ([`Machine::enter_run`](crate::Machine), idempotent for a resume) followed by a
+/// driver loop — so the semantics are the interpreter's: the same module-wide label
+/// map, the same shared interpreter step ([`jit_step_one`]) for anything a block
+/// does not inline, and the same suspension reporting. The one difference is that a
+/// compiled block is entered for an address it covers; every other address stays on
+/// the documented per-instruction deopt. Because it shares [`drive`], the A.8
+/// tracing gate is latched here too.
+///
+/// Unlike [`run_native_outcome`] it **does not** call [`enter_machine`] (which
+/// resets): a resume must preserve the suspended process. It does zero the reduction
+/// counter at the slice start, exactly as
+/// [`Machine::drive`](crate::Machine) does for the interpreter entry, so the resumed
+/// slice's [`Machine::reductions`](crate::Machine::reductions) matches the
+/// interpreter's.
+///
+/// The compiled blocks, the label map and the literal area are all bound for the
+/// **entry** module (context `0`). A process suspended **inside a cross-module
+/// callee** (a non-zero module context) cannot be served here — a
+/// [`Step::Enter`](crate::Step::Enter) is the interpreter driver's job, exactly as
+/// [`jit_step_one`] documents — so it is the typed error
+/// `unsupported("jit: cannot resume in a non-entry module context")`, never a
+/// silently wrong result.
+pub(crate) fn run_compiled_resume_outcome(
+    compiled: &CompiledModule,
+    machine: &mut Machine,
+    module: &Module,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    if machine.current_context() != 0 {
+        return Err(error::unsupported(
+            "jit: cannot resume in a non-entry module context",
+        ));
+    }
+    // One resume is one scheduling slice: start the reduction count at zero, exactly
+    // as `Machine::drive` does for the interpreter's resume (`run_loop` -> `drive`).
+    machine.reset_reductions();
+    machine.enter_run(module, func);
+    let labels = interpreter::build_label_map(module);
+    let code = block_entries(compiled, machine);
+    drive(machine, module, labels, func, pc, ctx, &code)
+}
+
 /// The baseline tier's [`NativeCode`] lookup for `compiled`, carrying whether the
 /// running machine's register file is wide enough to enter native code.
 ///

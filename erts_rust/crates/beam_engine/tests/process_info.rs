@@ -446,7 +446,14 @@ fn reset_clears_the_recorded_position() {
 /// deterministic string: `"<current_function> <current_location-MFA>
 /// <location-shape> <initial_call>"`.
 ///
-/// `None` when no `erl` runs (the caller skips loudly).
+/// The fixture directory is **appended** (`-pz`, never `-pa`): it holds
+/// stand-in modules (e.g. `tests/fixtures/lists.beam`) that would shadow the real
+/// stdlib once prepended, crashing the emulator at boot.
+///
+/// `None` means no runnable `erl` at all (the caller skips loudly). A spawned
+/// `erl` that exits non-zero is a **harness** failure, not "no oracle" -- it
+/// panics with the captured stderr so a broken oracle can never masquerade as a
+/// silent skip.
 fn oracle_shape() -> Option<String> {
     let eval = concat!(
         "P = spawn(recv, wait, []), timer:sleep(50),",
@@ -457,13 +464,16 @@ fn oracle_shape() -> Option<String> {
         "io:format(\"~w ~w ~w ~w\", [MFA, {M2, F2, A2}, Shape, IC]), halt()."
     );
     let output = Command::new("erl")
-        .args(["-noshell", "-pa", FIXTURES_DIR, "-eval", eval])
+        .args(["-noshell", "-pz", FIXTURES_DIR, "-eval", eval])
         .output()
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    assert!(
+        output.status.success(),
+        "the system `erl` exited {} for `{eval}`\n  stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[test]

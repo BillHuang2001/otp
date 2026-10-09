@@ -87,7 +87,7 @@ const SLICE_BEAM: &str = concat!(
 const SLICE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../beam_loader/tests/fixtures");
 /// The committed tail-call frame-discipline fixture.
 const TAILCALL_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tailcall.beam");
-/// The fixture directory the oracle's `-pa` code path points at.
+/// The fixture directory the oracle's `-pz` (append) code path points at.
 const FIXTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
 // ---------------------------------------------------------------------------
@@ -667,20 +667,30 @@ leaf(N) ->
 ";
 
 /// Compile [`TRACEWRAP_SRC`] into a fresh temp dir, returning that dir; `None` when no
-/// usable `erlc` is on `PATH` (the caller skips loudly).
+/// runnable `erlc` is on `PATH` at all (the caller skips loudly).
+///
+/// `None` means `erlc` could not be **spawned**. An `erlc` that *ran* and exited
+/// non-zero is a **harness** failure (the source is valid Erlang), so it panics with
+/// the captured stderr rather than masquerading as an absent toolchain — the same
+/// policy as [`oracle_eval`].
 fn compile_tracewrap() -> Option<PathBuf> {
     let dir = std::env::temp_dir().join("beam_engine_trace_oracle");
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::write(dir.join("tracewrap.erl"), TRACEWRAP_SRC).ok()?;
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
+    std::fs::write(dir.join("tracewrap.erl"), TRACEWRAP_SRC)
+        .unwrap_or_else(|error| panic!("write tracewrap.erl: {error}"));
     let output = Command::new("erlc")
         .arg("+deterministic")
         .arg("tracewrap.erl")
         .current_dir(&dir)
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    assert!(
+        output.status.success(),
+        "the system `erlc` exited {} compiling tracewrap.erl\n  stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Some(dir)
 }
 

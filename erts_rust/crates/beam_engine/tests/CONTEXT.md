@@ -27,8 +27,14 @@ committed `.beam` fixtures, and `src/**` is never touched from here.
 - `TEST_NOTES.md` (crate-root, not owned here) is the authoritative per-suite enumeration; do not
   duplicate it here.
 - A suite needing the system toolchain (a real `.beam`, the `erl` oracle, or an `erlc` fixture
-  build) must SKIP LOUDLY when it is absent — a green run without `erl` proves nothing about
-  corpus parity.
+  build) must SKIP LOUDLY **only when the tool is absent** — a spawn failure
+  (`Command::new("erl"/"erlc").output()` returned `Err`, no tool on PATH); a green run without
+  `erl` proves nothing about corpus parity. A tool that RAN and exited non-zero is a HARNESS
+  failure and must PANIC with its captured stdout/stderr, never be folded into "no oracle".
+  Reference: `trace.rs::oracle_eval`.
+- The `fixtures/` directory holds stand-in modules (`lists.beam`, `recv.beam`, …) that SHADOW
+  stdlib when PREPENDED, so an oracle invocation must APPEND it (`erl -pz <dir>`), never prepend
+  (`-pa`, which crashes the emulator at boot with an EMPTY stdout+stderr).
 - `support/` is shared by every test crate; its facade re-exports the whole surface, so a
   re-export an individual crate does not use is not an unused import.
 

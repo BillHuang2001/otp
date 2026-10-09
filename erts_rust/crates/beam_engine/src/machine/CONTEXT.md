@@ -28,7 +28,10 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
 - `location.rs` — execution-position introspection (`current_code`, `current_function`, `current_location`,
   `initial_call`, `current_stacktrace`).
 - `run.rs` — `run_export`/`run_label` (non-blocking) and `run_export_outcome`/`run_label_outcome`/`resume_outcome`
-  (blocking-aware); `RunOutcome` (`Returned` / `Wait`), re-exported at the crate root.
+  (blocking-aware); the **tier-selecting** entries `run_with_tier`/`run_export_outcome_with_tier`/
+  `run_label_outcome_with_tier` (first entry) and `resume_outcome_with_tier` (**resume** — a slice that suspended on a
+  native tier resumes on it: `Interpreter` → `resume_outcome`, `BaselineJit` → the cached no-reset baseline resume,
+  `Cranelift` → a typed error); `RunOutcome` (`Returned` / `Wait`), re-exported at the crate root.
 - `drive.rs` — **`Machine::drive`**: owns the `(func, pc)` position *and* the module context those indices belong
   to, folds every `Step` back into that position, charges **exactly one reduction per interpreted instruction**
   through the defaulted `ExecutionContext::reduce` (the only pre-emption point a non-allocating loop reaches;

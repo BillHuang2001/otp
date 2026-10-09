@@ -451,6 +451,45 @@ pub(crate) fn run_baseline_cached_label_outcome(
     })
 }
 
+/// Resume a suspended machine on the baseline tier, reusing the **per-thread**
+/// cache.
+///
+/// This is what
+/// [`Machine::resume_outcome_with_tier`](crate::Machine::resume_outcome_with_tier)
+/// runs for [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit): the tier seam's
+/// resume path, so a slice that suspended on the native tier resumes on it. Like the
+/// other cached entries the module is compiled into the thread's cache on first sight
+/// (a hit reuses the artifact with no recompile), and the machine is **not** reset —
+/// [`baseline::run_compiled_resume_outcome`] re-enters the suspended process at
+/// `(func, pc)`.
+///
+/// A **re-entrant** call (a BIF or fun application that itself runs a baseline export
+/// on this thread while the cache is already borrowed) does not panic: it compiles
+/// its module uncached and runs it, exactly as [`run_baseline_cached_outcome`] does.
+/// A resume in a non-entry module context is the baseline driver's own typed error,
+/// never a silent fallback.
+pub(crate) fn run_baseline_cached_resume_outcome(
+    machine: &mut Machine,
+    module: &Module,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<RunOutcome> {
+    CODE_CACHE.with(|cell| {
+        let mut cache = match cell.try_borrow_mut() {
+            Ok(cache) => cache,
+            Err(_) => {
+                let compiled = baseline::compile_module(module)?;
+                return baseline::run_compiled_resume_outcome(
+                    &compiled, machine, module, func, pc, ctx,
+                );
+            }
+        };
+        let compiled = cache.get_or_compile(module)?;
+        baseline::run_compiled_resume_outcome(compiled, machine, module, func, pc, ctx)
+    })
+}
+
 /// The **real** generated code regions of `module` on the baseline tier.
 ///
 /// The host-facing entry to [`CompiledModule::code_map`] over the per-thread cached
