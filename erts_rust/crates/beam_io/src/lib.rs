@@ -48,6 +48,16 @@
 //! [`port_task`] (per-port task scheduling: the ERTS port-task queue, its reduction costs
 //! and the notification seam a task round reports through).
 //!
+//! The [`signal`] module is the **OS-signal facility** — the unsafe `sigaction(2)`/signal
+//! work `beam_rt` (which denies `unsafe_code`) cannot do itself: a self-pipe plus an
+//! async-signal-safe trampoline backing `os:set_signal/2`.
+//!
+//! The [`ddll`] module is the **dynamic-library primitive** — a safe wrapper over
+//! `dlopen(3)`/`dlsym(3)`/`dlclose(3)` (the emulator's `RTLD_NOW | RTLD_LOCAL` mode, the
+//! `dlerror` idiom and the `erl_ddll` error-atom vocabulary) backing `beam_rt`'s `erl_ddll`
+//! floor. It is deliberately *not* used by `beam_abi`'s own loaders, which would close a
+//! dependency cycle (`beam_io` depends on `beam_abi`); see [`ddll`]'s module docs.
+//!
 //! # Status
 //!
 //! Milestone-1 is implemented (see this crate's `CONTEXT.md`, Milestone-1 scope): the
@@ -79,6 +89,7 @@
 #![warn(missing_docs)]
 
 pub mod abi;
+pub mod ddll;
 pub mod driver;
 pub mod drivers;
 pub mod poller;
@@ -86,17 +97,20 @@ pub mod port;
 pub mod port_task;
 pub mod queue;
 pub mod registry;
+pub mod signal;
 pub mod timer;
 
 mod error; // `pub(crate)` constructors only — NOT public
 
 pub use crate::abi::*;
+pub use crate::ddll::*;
 pub use crate::driver::*;
 pub use crate::drivers::*;
 pub use crate::poller::*;
 pub use crate::port::*;
 pub use crate::port_task::*;
 pub use crate::queue::*;
+pub use crate::signal::*;
 pub use crate::timer::*;
 
 /// The conventional glob-import surface for downstream crates.
@@ -112,14 +126,19 @@ pub use crate::timer::*;
 /// [`TcpInetDriver`], [`InetState`]), the driver C-ABI host layer ([`DriverPort`],
 /// [`PortHost`], [`AbiHost`], [`LocalAtomPortHost`], [`DriverState`], [`AsyncJobs`],
 /// [`make_loaded`], [`DriverTable`], [`RegisteredDriver`]) and the timer/queue helpers
-/// ([`Timeout`], [`Timer`], [`ByteQueue`]) into scope.
+/// ([`Timeout`], [`Timer`], [`ByteQueue`]) plus the OS-signal facility ([`Signal`],
+/// [`Disposition`], [`SignalFacility`]) and the dynamic-library primitive ([`DynLib`],
+/// [`DynLibFlags`], [`DllError`], [`DllErrorKind`], [`ERRCODE_TAB`], [`format_error_text`])
+/// into scope.
 pub mod prelude {
     pub use crate::abi::*;
+    pub use crate::ddll::*;
     pub use crate::driver::*;
     pub use crate::drivers::*;
     pub use crate::poller::*;
     pub use crate::port::*;
     pub use crate::port_task::*;
     pub use crate::queue::*;
+    pub use crate::signal::*;
     pub use crate::timer::*;
 }

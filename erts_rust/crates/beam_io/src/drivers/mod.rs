@@ -43,7 +43,8 @@
 //!   `efile` control family; and
 //! * [`inet`] — the `tcp_inet` socket driver: one TCP socket behind one port, with the
 //!   `gen_tcp` control vocabulary (`open`/`bind`/`listen`/`accept`/`connect`/`send`/
-//!   `recv`/`shutdown`/`close`).
+//!   `recv`/`shutdown`/`close`) and the socket-option verbs
+//!   (`setopts`/`getopts`: `nodelay`/`keepalive`/`recbuf`/`sndbuf`).
 
 pub mod binary_io;
 pub mod efile;
@@ -53,12 +54,13 @@ pub mod line_buffer;
 pub mod spawn;
 
 pub use crate::drivers::binary_io::{Phase, PhaseChange};
-pub use crate::drivers::efile::{make_efile, EfileDriver};
+pub use crate::drivers::efile::{make_efile, EfileDriver, FileDataMode};
 pub use crate::drivers::fd::FdDriver;
 pub use crate::drivers::inet::{
     make_tcp_inet, InetState, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET,
-    INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_PROTO_TCP, INET_REP_ERROR, INET_REP_OK,
-    INET_TYPE_STREAM, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
+    INET_AF_LOOPBACK, INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT,
+    INET_PROTO_TCP, INET_REP_ERROR, INET_REP_OK, INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RD,
+    TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 pub use crate::drivers::line_buffer::{LineBuffer, DEFAULT_MAX_LINE_LEN};
 pub use crate::drivers::spawn::{

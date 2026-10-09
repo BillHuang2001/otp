@@ -29,7 +29,8 @@ use super::wire::InetAddr;
 use super::{
     ctl_error, ctl_ok, ctl_xerror, errno_name, make_tcp_inet, parse_address, socket_fd, InetState,
     PeerClose, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET, INET_AF_LOOPBACK,
-    INET_PROTO_DEFAULT, INET_REP_OK, INET_TYPE_STREAM, TCP_SHUT_RDWR, TCP_SHUT_WR,
+    INET_OPT_KEEPALIVE, INET_OPT_RCVBUF, INET_OPT_SNDBUF, INET_PROTO_DEFAULT, INET_REP_OK,
+    INET_TYPE_STREAM, TCP_OPT_NODELAY, TCP_SHUT_RDWR, TCP_SHUT_WR,
 };
 use crate::driver::{Driver, DriverContext, DriverFlags, PortArms};
 use crate::poller::Poller;
@@ -664,5 +665,273 @@ fn a_stalled_write_arms_write_readiness_and_defers_a_shutdown() {
         ctl_ok()
     );
     assert!(registry.get(id).expect("live").output_len() > 0);
+    registry.close(&mut poller, id).expect("closes");
+}
+
+// -----------------------------------------------------------------------
+// The socket options (`setopts` / `getopts`)
+// -----------------------------------------------------------------------
+
+/// One `[opt, val_be32]` record — the C's `while (len >= 5)` unit
+/// (`inet_set_opts`, `inet_drv.c:6908`).
+fn opt_record(code: u8, value: u32) -> Vec<u8> {
+    let mut record = vec![code];
+    record.extend_from_slice(&value.to_be_bytes());
+    record
+}
+
+/// The reply `getopts` answers for a single served code: the C's `[1]` followed by one
+/// `[opt, val_be32]` record.
+fn opt_reply(code: u8, value: u32) -> Vec<u8> {
+    let mut reply = ctl_ok();
+    reply.extend_from_slice(&opt_record(code, value));
+    reply
+}
+
+/// Decodes a `getopts` reply into its `(code, value)` records, asserting the `[1]` tag and the
+/// five-byte record framing.
+fn parse_opt_reply(reply: &[u8]) -> Vec<(u8, u32)> {
+    assert_eq!(
+        reply.first(),
+        Some(&INET_REP_OK),
+        "a `getopts` reply starts with the ok tag: {reply:?}"
+    );
+    let records = &reply[1..];
+    assert_eq!(records.len() % 5, 0, "records are five bytes each: {reply:?}");
+    records
+        .chunks_exact(5)
+        .map(|r| (r[0], u32::from_be_bytes([r[1], r[2], r[3], r[4]])))
+        .collect()
+}
+
+/// **The four served options round-trip**, and the read-back is the **kernel's** value, not the
+/// requested one — the oracle's `setopts 4096 -> getopts 8192` doubling for the two buffers.
+///
+/// The expected bytes are the ones the system `erl` reports for the identical sequence
+/// (`open`/`bind`/`listen`, then the records below): `setopts nodelay=1`/`getopts nodelay` is
+/// `[1]`/`[1,10,0,0,0,1]`, `keepalive` likewise `[1,1,0,0,0,1]`, and `recbuf`/`sndbuf` are
+/// `[1,7,0,0,32,0]`/`[1,6,0,0,32,0]` — i.e. 8192 for a 4096 request.
+#[test]
+fn the_served_socket_options_round_trip_like_the_oracle() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+    listen_on_loopback(&mut poller, &mut registry, id);
+
+    // The defaults a fresh AF_INET stream socket reports for the two boolean flags.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[TCP_OPT_NODELAY]),
+        opt_reply(TCP_OPT_NODELAY, 0)
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[INET_OPT_KEEPALIVE]),
+        opt_reply(INET_OPT_KEEPALIVE, 0)
+    );
+
+    // The two boolean flags: set, then read back as 1.
+    for code in [TCP_OPT_NODELAY, INET_OPT_KEEPALIVE] {
+        assert_eq!(
+            control(&mut registry, &mut poller, id, "setopts", &opt_record(code, 1)),
+            ctl_ok(),
+            "`setopts` answers the C's ctl_reply_ok whatever the option"
+        );
+        assert_eq!(
+            control(&mut registry, &mut poller, id, "getopts", &[code]),
+            opt_reply(code, 1),
+            "the option reads back as the kernel stored it"
+        );
+    }
+
+    // The two buffers: the kernel reports **twice** the requested size (Linux's
+    // `SO_RCVBUF`/`SO_SNDBUF` doubling), exactly as the oracle measured, because the driver
+    // reports the kernel's own `getsockopt(2)` value.
+    for code in [INET_OPT_RCVBUF, INET_OPT_SNDBUF] {
+        let requested = 4096u32;
+        assert_eq!(
+            control(
+                &mut registry,
+                &mut poller,
+                id,
+                "setopts",
+                &opt_record(code, requested)
+            ),
+            ctl_ok()
+        );
+        let reply = control(&mut registry, &mut poller, id, "getopts", &[code]);
+        assert_eq!(reply.len(), 6, "one record: {reply:?}");
+        assert_eq!(reply[1], code);
+        let value = u32::from_be_bytes([reply[2], reply[3], reply[4], reply[5]]);
+        assert_eq!(
+            value,
+            requested * 2,
+            "the driver reports the kernel's own value (Linux doubles a buffer request), \
+             never the requested one"
+        );
+    }
+    registry.close(&mut poller, id).expect("closes");
+}
+
+/// `getopts` answers **one record per request code, in request order**, each value read live
+/// from the socket — the C's `*ptr++ = opt; put_int32(ival, ptr);` loop (`inet_drv.c:9141`-
+/// `:9746`), which the oracle shows as `getopts <<1,10,6,7>>` answering the records in exactly
+/// that order.
+#[test]
+fn getopts_reads_the_records_in_request_order() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+    listen_on_loopback(&mut poller, &mut registry, id);
+
+    let order = [
+        INET_OPT_KEEPALIVE,
+        TCP_OPT_NODELAY,
+        INET_OPT_SNDBUF,
+        INET_OPT_RCVBUF,
+    ];
+    let reply = control(&mut registry, &mut poller, id, "getopts", &order);
+    let codes: Vec<u8> = parse_opt_reply(&reply)
+        .into_iter()
+        .map(|(code, _)| code)
+        .collect();
+    assert_eq!(codes, order, "the records follow the request order");
+
+    // A `setopts` of two records is reflected in the next read-back, in FIFO order.
+    let mut set = opt_record(TCP_OPT_NODELAY, 1);
+    set.extend_from_slice(&opt_record(INET_OPT_RCVBUF, 4096));
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "setopts", &set),
+        ctl_ok()
+    );
+
+    let records = parse_opt_reply(&control(
+        &mut registry,
+        &mut poller,
+        id,
+        "getopts",
+        &[TCP_OPT_NODELAY, INET_OPT_RCVBUF],
+    ));
+    assert_eq!(records[0], (TCP_OPT_NODELAY, 1));
+    assert_eq!(
+        records[1],
+        (INET_OPT_RCVBUF, 8192),
+        "the kernel's doubled value, read live"
+    );
+    registry.close(&mut poller, id).expect("closes");
+}
+
+/// A code this floor does not serve is the C's `default: return -1` becoming the **whole**
+/// `ctl_error(EINVAL)` reply (`inet_drv.c:7914`/`:9719` -> `:11062`/`:11128`), never a partial
+/// one: the oracle's `getopts <<1,200>>` is exactly `[0] ++ "einval"`.
+#[test]
+fn an_unserved_option_code_is_the_whole_einval_reply() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+    listen_on_loopback(&mut poller, &mut registry, id);
+
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[200]),
+        ctl_xerror("einval")
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "setopts", &opt_record(200, 1)),
+        ctl_xerror("einval")
+    );
+    // A **mixed** request answers the whole error, so `getopts` never returns a short reply
+    // that a caller could mistake for a partial success.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[INET_OPT_KEEPALIVE, 200]),
+        ctl_xerror("einval")
+    );
+    let mut mixed = opt_record(INET_OPT_KEEPALIVE, 1);
+    mixed.extend_from_slice(&opt_record(200, 1));
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "setopts", &mixed),
+        ctl_xerror("einval")
+    );
+    registry.close(&mut poller, id).expect("closes");
+}
+
+/// The payload framing: `setopts`'s `while (len >= 5)` ignores a trailing partial record
+/// (`inet_set_opts`, `inet_drv.c:6908`) and `inet_fill_opts`'s `while(len--)` makes an empty
+/// `getopts` payload a bare `[1]` — the oracle's `setopts <<7,0,0>>` = `[1]`, `getopts <<>>` =
+/// `[1]`, `setopts <<>>` = `[1]`.
+#[test]
+fn a_partial_or_empty_option_payload_is_ignored_like_the_c() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+    listen_on_loopback(&mut poller, &mut registry, id);
+
+    // A partial trailing record is ignored ...
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "setopts", &[INET_OPT_RCVBUF, 0, 0]),
+        ctl_ok()
+    );
+    // ... while a complete record before it is still applied.
+    let mut arg = opt_record(TCP_OPT_NODELAY, 1);
+    arg.extend_from_slice(&[INET_OPT_RCVBUF, 0]);
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "setopts", &arg),
+        ctl_ok()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[TCP_OPT_NODELAY]),
+        opt_reply(TCP_OPT_NODELAY, 1),
+        "the complete record was applied"
+    );
+
+    // An empty payload is the C's bare `[1]` for either verb.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[]),
+        ctl_ok()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "setopts", &[]),
+        ctl_ok()
+    );
+    registry.close(&mut poller, id).expect("closes");
+}
+
+/// Neither verb has the C's `IS_OPEN` guard (`inet_drv.c:11046`/`:11111`), so a port with **no
+/// socket at all** still answers: `setopts` is `[1]` (the `setsockopt` on the invalid descriptor
+/// fails and is not propagated), `getopts` is a bare `[1]` (the `getsockopt` fails and the C's
+/// `TRUNCATE_TO(0, ptr)` drops the record, `:9739`) — and an unserved code is still `einval`,
+/// because the option switch precedes the syscall.
+#[test]
+fn the_option_verbs_on_a_socket_less_port_match_the_oracle() {
+    let mut poller = poller();
+    let (mut registry, id) = open_port(&mut poller, make_tcp_inet().expect("a driver"));
+
+    assert_eq!(
+        control(
+            &mut registry,
+            &mut poller,
+            id,
+            "setopts",
+            &opt_record(INET_OPT_RCVBUF, 4096)
+        ),
+        ctl_ok()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[INET_OPT_RCVBUF]),
+        ctl_ok(),
+        "no socket: the record is dropped, so the reply is the bare [1]"
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[200]),
+        ctl_xerror("einval")
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "setopts", &opt_record(200, 1)),
+        ctl_xerror("einval")
+    );
+
+    // After a bare `open` (no `bind`/`listen`) the socket exists, so the read-back is live:
+    // the oracle reports `[1,1,0,0,0,0]` for `keepalive` on such a socket.
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "open", &open_arg()),
+        ctl_ok()
+    );
+    assert_eq!(
+        control(&mut registry, &mut poller, id, "getopts", &[INET_OPT_KEEPALIVE]),
+        opt_reply(INET_OPT_KEEPALIVE, 0)
+    );
     registry.close(&mut poller, id).expect("closes");
 }

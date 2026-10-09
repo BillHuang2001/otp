@@ -58,9 +58,11 @@
 //! end-of-file — otherwise it would report readiness forever.
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::io::Result as IoResult;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use beam_common::Result;
 
@@ -436,37 +438,79 @@ impl Poller {
     /// the wait is capped at [`FALLBACK_POLL_CAP`] so the always-ready fallback descriptor
     /// cannot deadlock the wait (see the module docs).
     ///
+    /// # An interrupted wait is retried, never reported as a failure
+    ///
+    /// A signal delivered to the process interrupts a blocking wait with `EINTR`, and —
+    /// unlike most blocking syscalls — `epoll_wait`, `poll` and `select` are **never**
+    /// restarted after a handler returns, not even under `SA_RESTART`. `signal(7)` says of
+    /// them that they *"are never restarted after being interrupted by a signal handler,
+    /// regardless of the use of `SA_RESTART`"*. A handled signal — such as one installed by
+    /// [`crate::signal::SignalFacility`] — would therefore surface as a spurious
+    /// `BeamError::Io` and break the runtime's poll loop, which drives this method. `poll`
+    /// instead **retries** an [`ErrorKind::Interrupted`] wait, so a handled signal is never
+    /// observable as a failure here.
+    ///
+    /// The retry **preserves the deadline**: for `timeout = Some(d)` the time already spent is
+    /// subtracted from the budget, so repeated signals can never make the call block longer
+    /// than `d`; for `timeout = None` the wait simply resumes. A signal facility is expected
+    /// to be registered with this poller (that is what makes its self-pipe readiness an
+    /// event), so a retry after `EINTR` normally returns the pipe's readiness at once instead
+    /// of blocking again.
+    ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` when the wait fails.
+    /// Returns `BeamError::Io` when the wait fails for any reason other than
+    /// [`ErrorKind::Interrupted`].
     pub fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<Event>> {
-        // Probe the fallback set first: a regular file is level-triggered, so `poll(2)`
-        // reports it ready as soon as it is watchable.
-        let mut merged = self.poll_fallbacks();
-        let fallback_ready = !merged.is_empty();
+        // The budget is measured from here, so that a retry after an interrupted wait can
+        // never extend the overall wait beyond the caller's requested `timeout`.
+        let started = Instant::now();
+        loop {
+            // Probe the fallback set first: a regular file is level-triggered, so `poll(2)`
+            // reports it ready as soon as it is watchable.
+            let mut merged = match self.poll_fallbacks() {
+                Ok(events) => events,
+                // The fallback probe is a `poll(2)` too, so it is never `SA_RESTART`-restarted
+                // either; retry it (with the remaining budget) rather than failing.
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) => return Err(crate::error::io(err)),
+            };
+            let fallback_ready = !merged.is_empty();
 
-        // Never block the `mio` wait indefinitely while a fallback registration exists; if
-        // the fallback probe already produced events, do not wait on `mio` at all.
-        let mio_timeout = if self.fallbacks.is_empty() {
-            timeout
-        } else if fallback_ready {
-            Some(Duration::ZERO)
-        } else {
-            Some(timeout.unwrap_or(FALLBACK_POLL_CAP).min(FALLBACK_POLL_CAP))
-        };
+            // Never block the `mio` wait indefinitely while a fallback registration exists;
+            // if the fallback probe already produced events, do not wait on `mio` at all.
+            let remaining = timeout.map(|limit| limit.saturating_sub(started.elapsed()));
+            let mio_timeout = if self.fallbacks.is_empty() {
+                remaining
+            } else if fallback_ready {
+                Some(Duration::ZERO)
+            } else {
+                // A fallback descriptor is always ready, so it can never be what a blocking
+                // wait waits for: keep the `mio` wait short.
+                let budget = remaining.unwrap_or(FALLBACK_POLL_CAP);
+                Some(budget.min(FALLBACK_POLL_CAP))
+            };
 
-        self.poll
-            .poll(&mut self.events, mio_timeout)
-            .map_err(crate::error::io)?;
-        let registrations = &self.registrations;
-        for event in self.events.iter() {
-            let index = event.token().0;
-            // Token `0` is the waker (and any token the map no longer knows is reported as
-            // a waker key, so it can never be mistaken for a port).
-            let key = registrations.get(&index).copied().unwrap_or(WAKER_KEY);
-            merged.push(Event::new(Token(index), key, to_ready(event)));
+            match self.poll.poll(&mut self.events, mio_timeout) {
+                Ok(()) => {}
+                // `epoll_wait` is never restarted after a signal handler runs, so an `EINTR`
+                // here is expected whenever a handled signal lands mid-wait. Retry instead of
+                // failing; once the budget is spent `remaining` is zero, so the retried wait
+                // returns immediately and the loop still cannot overshoot the deadline.
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) => return Err(crate::error::io(err)),
+            }
+
+            let registrations = &self.registrations;
+            for event in self.events.iter() {
+                let index = event.token().0;
+                // Token `0` is the waker (and any token the map no longer knows is reported as
+                // a waker key, so it can never be mistaken for a port).
+                let key = registrations.get(&index).copied().unwrap_or(WAKER_KEY);
+                merged.push(Event::new(Token(index), key, to_ready(event)));
+            }
+            return Ok(merged);
         }
-        Ok(merged)
     }
 
     /// Probes the fallback (regular-file) registrations with a non-blocking `poll(2)` and
@@ -476,9 +520,13 @@ impl Poller {
     /// essentially always. It is the *driver's* job to read the descriptor to end-of-file
     /// and then de-register it, so a regular-file registration does not report readiness
     /// forever.
-    fn poll_fallbacks(&self) -> Vec<Event> {
+    ///
+    /// The wait is `poll(2)` with a zero timeout, but its result is still reported as a
+    /// [`std::io::Error`] rather than folded into "no readiness": the caller retries an
+    /// [`ErrorKind::Interrupted`] probe and surfaces every other failure.
+    fn poll_fallbacks(&self) -> IoResult<Vec<Event>> {
         if self.fallbacks.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut fds: Vec<libc::pollfd> = Vec::with_capacity(self.fallbacks.len());
         let mut indices: Vec<usize> = Vec::with_capacity(self.fallbacks.len());
@@ -510,8 +558,13 @@ impl Poller {
         // that `poll(2)` only reads (the `fd`/`events` fields) and writes (the `revents`
         // fields). `poll` retains no pointer beyond the call.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
-        if ready <= 0 {
-            return Vec::new();
+        if ready < 0 {
+            // Report the failure (an interrupted probe included) instead of silently
+            // treating it as "no readiness"; the caller retries `EINTR` and surfaces the rest.
+            return Err(std::io::Error::last_os_error());
+        }
+        if ready == 0 {
+            return Ok(Vec::new());
         }
         let mut events = Vec::new();
         for (pfd, &index) in fds.iter().zip(indices.iter()) {
@@ -532,7 +585,7 @@ impl Poller {
                 .unwrap_or(WAKER_KEY);
             events.push(Event::new(Token(index), key, ready));
         }
-        events
+        Ok(events)
     }
 
     /// Returns a thread-safe [`Waker`] that unblocks a concurrent [`Poller::poll`].

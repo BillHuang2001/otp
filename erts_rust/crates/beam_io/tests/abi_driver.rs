@@ -37,16 +37,20 @@
 //! # The fixture's behaviour (see `tests/fixtures/host_driver.c`)
 //!
 //! `driver_name = "host_driver"`; `start` parses `fd=<n>` (the descriptor it will `driver_select`
-//! on), `log=<path>` (the file its callbacks append an event line to) and an optional bare token
-//! `upper` (its `output` upper-cases the bytes it echoes). Its integer `control` verbs are `1`
+//! on), `log=<path>` (the file its callbacks append an event line to) and optional bare tokens
+//! `upper` (its `output` upper-cases the bytes it echoes) and `hdl` (every callback additionally
+//! logs its stashed `ErlDrvPort`). Its integer `control` verbs are `1`
 //! echo into `rbuf`, `2` `driver_set_timer(ms)`, `3` `driver_cancel_timer`, `4`
 //! `driver_select(READ|USE)`, `5` `erl_drv_output_term({host_driver, 1})`, `6` `driver_async`,
 //! `7` `driver_select(READ, 0)`, `8` `driver_read_timer`, `9` `driver_select(READ|USE)`, `10`
 //! `driver_select(READ|USE_NO_CALLBACK)`, `11` `driver_select(READ)`, `12`
-//! `driver_select(READ, 0)` and `13` a fixed reply re-pointed at the driver's own buffer; any
+//! `driver_select(READ, 0)`, `13` a fixed reply re-pointed at the driver's own buffer, `14`–`16`
+//! the `driver_async` completions owned by a `ready_async`/`async_free` (the latter the subject of
+//! `tests/abi_async.rs`) and `17`/`18` the sticky `ERL_DRV_USE` re-selections; any
 //! other verb answers the negative `cres` that `port_control/3` reports as `badarg`. Its `output`
 //! echoes via `driver_output`, its `ready_input` reads the selected fd and `driver_output`s the
-//! bytes, its `ready_output` emits `"W"`, its `timeout` emits `"T"` and its `stop_select` appends
+//! bytes, its `ready_output` emits `"W"`, its `timeout` emits `"T"`, its `ready_async`/`async_free`
+//! log their arm and its `stop_select` appends
 //! `stop_select` to the log — so every callback's firing is observable as port data or as a log
 //! line.
 //!
@@ -66,249 +70,22 @@
 //! be non-blocking or that loop blocks forever (exactly why `SpawnDriver` switches an adopted
 //! `{fd, N}` descriptor to `O_NONBLOCK`); the socket-pair test below sets it explicitly.
 
-mod support;
+mod cdriver;
 
-use std::cell::RefCell;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use beam_common::BeamError;
 use beam_io::prelude::*;
-use beam_io::{DriverPort, PortHost};
 use beam_process::PortId;
-use beam_term::atom::AtomTable;
-use beam_term::immediate::{atom_val, is_atom, is_small, signed_value};
-use beam_term::prelude::{make_atom, Eterm};
+use beam_term::immediate::{is_atom, is_small, signed_value};
 
-use support::{cc_available, compile_so, erl_include_dir, scratch_dir, skip};
-
-// ---------------------------------------------------------------------------------------------
-// The runtime hook the driver needs: a [`PortHost`] over a private atom table
-// ---------------------------------------------------------------------------------------------
-
-/// The state a test observes through [`TestPortHost`].
-#[derive(Default)]
-struct HostState {
-    /// The host's atom table.
-    ///
-    /// `LocalAtomPortHost` interns into a private table too (see its docs): the atoms only have to
-    /// be *self-consistent* with the terms built through this same host, which is all this test
-    /// needs — a live runtime injects a host over its **shared** atom table instead.
-    atoms: AtomTable,
-    /// Every term `erl_drv_output_term`/`erl_drv_send_term` handed up, with its destination.
-    sent: Vec<(Option<Eterm>, Eterm)>,
-}
-
-/// A [`PortHost`] that interns atoms into its own table and records every term a driver sends up.
-struct TestPortHost {
-    state: Rc<RefCell<HostState>>,
-}
-
-impl TestPortHost {
-    /// A fresh host plus the shared handle a test reads its recorded terms through.
-    fn new() -> (TestPortHost, Rc<RefCell<HostState>>) {
-        let state = Rc::new(RefCell::new(HostState::default()));
-        (
-            TestPortHost {
-                state: Rc::clone(&state),
-            },
-            state,
-        )
-    }
-}
-
-impl PortHost for TestPortHost {
-    fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
-        Some(make_atom(self.state.borrow_mut().atoms.intern(name)))
-    }
-
-    fn send_term(&mut self, to: Option<Eterm>, term: Eterm) -> bool {
-        self.state.borrow_mut().sent.push((to, term));
-        true
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// Building and loading the C fixture
-// ---------------------------------------------------------------------------------------------
-
-/// The committed C fixture.
-fn fixture_source() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/host_driver.c")
-}
-
-/// Compile the fixture into a loadable `.so`, or print a loud `SKIP:` and answer `None` when the
-/// toolchain is unavailable (never a silent pass, never a failure for a missing toolchain).
-fn fixture_so() -> Option<PathBuf> {
-    let Some(include) = erl_include_dir() else {
-        skip("abi_driver: no OTP include directory (erl_driver.h) found");
-        return None;
-    };
-    if !cc_available() {
-        skip("abi_driver: no C compiler (cc / $CC) available");
-        return None;
-    }
-
-    let src = fixture_source();
-    assert!(
-        src.is_file(),
-        "the committed fixture is missing: {}",
-        src.display()
-    );
-
-    let dir = scratch_dir("abi-driver");
-    let so = dir.join("host_driver.so");
-    assert!(
-        compile_so(&src, &so, &include),
-        "the host_driver fixture must compile into a shared object at {}",
-        so.display()
-    );
-    Some(so)
-}
-
-/// Force the `#[no_mangle]` `driver_*` host symbols into this test binary's **dynamic** symbol
-/// table.
-///
-/// The fixture leaves `driver_*`/`erl_drv_*` undefined (exactly like a real OTP driver) and
-/// resolves them out of the loading process, so its `dlopen(RTLD_NOW)` only succeeds once those
-/// symbols are exported. `build.rs` adds `-Wl,--export-dynamic` to the test link, but that only
-/// exports symbols that are actually linked in: naming
-/// [`beam_abi::driver::drv::driver_api_table`] — the `#[used]` table that holds them — is what
-/// pulls `beam_abi`'s `drv` object file into this binary. Without this reference the load fails
-/// with `undefined symbol: driver_mk_port`.
-fn force_driver_symbols_link() {
-    let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
-}
-
-/// Loads the compiled fixture as a [`DriverPort`] over `host`, failing **loudly** when the object
-/// cannot be opened.
-///
-/// A load failure here is a *wiring* failure — the `driver_*` host symbols are missing from the
-/// test binary's dynamic symbol table — not a missing toolchain (that is [`fixture_so`]'s skip
-/// path), so the dynamic loader's own diagnostic (typically `undefined symbol: driver_mk_port`) is
-/// part of the panic message.
-fn load_driver(so: &Path, command: &str, host: Box<dyn PortHost>) -> DriverPort {
-    force_driver_symbols_link();
-    let path = so.to_str().expect("the fixture path is valid UTF-8");
-    match beam_abi::driver::loader::load(path, "host_driver") {
-        Ok(library) => assert_eq!(
-            library.name(),
-            "host_driver",
-            "a loaded driver reports the name its driver_init entry carries"
-        ),
-        Err(err) => panic!(
-            "the host_driver fixture could not be opened with dlopen(RTLD_NOW): {err}\n\
-             an `undefined symbol: driver_*` here means the driver_* host symbols are not in this \
-             test binary's dynamic symbol table — check build.rs's -Wl,--export-dynamic and the \
-             driver_api_table() reference in force_driver_symbols_link()."
-        ),
-    }
-    DriverPort::load(path, "host_driver", command, host)
-        .unwrap_or_else(|err| panic!("the port could not be created from the loaded driver: {err:?}"))
-}
-
-/// Opens a port around the fixture loaded with `command`, returning the reactor, the registry and
-/// the port id.
-fn open_port(so: &Path, command: &str, host: TestPortHost) -> (Poller, PortRegistry, PortId) {
-    let driver = load_driver(so, command, Box::new(host));
-    let mut poller = Poller::new().expect("a poll set");
-    let mut registry = PortRegistry::new();
-    let id = registry
-        .open(&mut poller, Box::new(driver))
-        .expect("the loaded driver opens as a port");
-    (poller, registry, id)
-}
-
-// ---------------------------------------------------------------------------------------------
-// Driving the port
-// ---------------------------------------------------------------------------------------------
-
-/// The `Data` payloads a port-task round reported for `id`.
-fn data_of(outcome: &PortTaskOutcome, id: PortId) -> Vec<Vec<u8>> {
-    outcome
-        .notifications
-        .iter()
-        .filter_map(|notification| match notification {
-            PortNotification::Data { port, bytes } if *port == id => Some(bytes.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Runs one port-task round and returns the bytes of the single [`PortNotification::Data`] it
-/// reported for `id`, or `None` when the round reported no data for that port.
-fn round_data(poller: &mut Poller, registry: &mut PortRegistry, id: PortId) -> Option<Vec<u8>> {
-    let outcome = registry
-        .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
-        .expect("the port-task round runs");
-    let mut data = data_of(&outcome, id).into_iter();
-    let first = data.next();
-    assert!(
-        data.next().is_none(),
-        "one port-task round reports at most one Data notification per port"
-    );
-    first
-}
-
-/// Polls and runs port-task rounds until the driver reports data for `id`, or `timeout` elapses
-/// (a panic — never a silent pass).
-///
-/// A `poller.poll` with a bounded timeout is what lets both drivers make progress: it delivers a
-/// readiness event for a `driver_select`ed descriptor **and** lets wall-clock time pass so a due
-/// `TIMEOUT` task can run.
-fn await_data(
-    poller: &mut Poller,
-    registry: &mut PortRegistry,
-    id: PortId,
-    timeout: Duration,
-) -> Vec<u8> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let events = poller
-            .poll(Some(Duration::from_millis(50)))
-            .expect("the poll succeeds");
-        registry.schedule_events(&events);
-        if let Some(bytes) = round_data(poller, registry, id) {
-            return bytes;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the driver reported no data for the port within {timeout:?}"
-        );
-    }
-}
-
-/// The `(arity, elements)` of `term`, which must be a live tuple.
-fn tuple_parts(term: Eterm) -> (usize, Vec<Eterm>) {
-    // SAFETY: `term` was handed up by erl_drv_output_term during a callback on a port that is
-    // still alive in this test, so it is a live tuple allocated on that port's driver heap.
-    unsafe {
-        assert!(beam_term::tuple::is_tuple(term), "the driver built a 2-tuple");
-        let arity = beam_term::tuple::tuple_size(term);
-        let elements = (0..arity)
-            .map(|i| beam_term::tuple::tuple_element(term, i))
-            .collect();
-        (arity, elements)
-    }
-}
-
-/// The name of the atom `term` denotes, resolved through the host's own table.
-fn atom_name(state: &RefCell<HostState>, term: Eterm) -> String {
-    let atom = state
-        .borrow()
-        .atoms
-        .name(atom_val(term))
-        .map(str::to_string);
-    atom.expect("the atom was interned in this host's table")
-}
+use cdriver::*;
 
 // ---------------------------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------------------------
-
 /// The driver's `output` callback echoes bytes back to the port owner.
 ///
 /// This is the driver→owner data path: `watch the port's output queue, the driver reads it in its
@@ -685,60 +462,6 @@ fn closing_a_loaded_driver_port_runs_stop_and_releases_the_port() {
 // (`erl_check_io.c:1210-1216`) and at port teardown for a registration the driver left selected
 // (`erl_check_io.c:2232-2238`).
 
-/// The lines the fixture appended to its callback log at `path`, or an empty vector while the
-/// file does not exist yet ("no callback has run" is the honest reading).
-fn log_lines(path: &Path) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => text.lines().map(str::to_string).collect(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => panic!(
-            "the driver's callback log at {} is unreadable: {err}",
-            path.display()
-        ),
-    }
-}
-
-/// A socket-pair descriptor a driver has been told to `driver_select`, kept **alive** (both ends
-/// owned, not just their numbers) for the whole test that owns it.
-///
-/// The read end of a socket pair stands in for the descriptor a driver would select on, and it is
-/// non-blocking for the same reason [`a_selected_descriptor_routes_input_through_ready_input`]
-/// needs it (the fixture's `ready_input` loops `read(2)` down to `EAGAIN` on an edge-triggered
-/// reactor). Owning the participant whose fd is selected is the point: returning the bare `RawFd`
-/// would drop the `UnixStream` and let another thread's short-lived descriptor recycle that number
-/// while the driver calls `driver_select`/`select(2)` on it, which is `EBADF` under the parallel
-/// test runner. This value must be held for the duration of the test.
-struct LoggedPort {
-    /// The scratch log path the fixture's `log=<path>` argument points at.
-    log: PathBuf,
-    /// The `fd=<n> log=<path>` command string the port is started with.
-    command: String,
-    /// The participant whose descriptor is selected on — held so its number stays valid.
-    _read_end: std::os::unix::net::UnixStream,
-    /// Its peer, held so the pair stays fully open for the test's lifetime.
-    _write_end: std::os::unix::net::UnixStream,
-}
-
-/// A fresh scratch log path (the directory is created so the fixture's append can succeed) bundled
-/// with the command string and the still-open, non-blocking descriptor to select on.
-fn logged_port_command(stem: &str) -> LoggedPort {
-    let dir = scratch_dir(stem);
-    std::fs::create_dir_all(&dir).expect("a scratch dir is creatable");
-    let log = dir.join("events.log");
-    let (read_end, write_end) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
-    read_end
-        .set_nonblocking(true)
-        .expect("the selected descriptor must be non-blocking");
-    let fd = read_end.as_raw_fd();
-    let command = format!("fd={fd} log={}", log.display());
-    LoggedPort {
-        log,
-        command,
-        _read_end: read_end,
-        _write_end: write_end,
-    }
-}
-
 /// `stop_select` fires when an `ERL_DRV_USE` selection is de-selected, and it fires for the
 /// *deselecting* `driver_select`'s event (the operand the C hands back).
 #[test]
@@ -897,6 +620,77 @@ fn stop_select_fires_when_a_port_is_dropped_without_being_closed() {
         "dropping a port without `stop` still releases the still-selected ERL_DRV_USE"
     );
     drop(poller);
+}
+
+/// A re-selection that omits `ERL_DRV_USE` keeps the release obligation an earlier select took on
+/// (the C's sticky `ERTS_EV_FLAG_USED`), so a later deselect still fires `stop_select`.
+///
+/// Control verb 17 is `driver_select(READ | ERL_DRV_USE, 1)` followed by
+/// `driver_select(READ, 1)`: the second call says nothing about `ERL_DRV_USE`, and the obligation
+/// must survive it.
+#[test]
+fn a_reselection_without_use_keeps_the_stop_select_obligation() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let probe = logged_port_command("stop-select-sticky-keep");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
+
+    registry
+        .port_control(&mut poller, id, "17", &[])
+        .expect("control verb 17 selects READ|USE and then re-selects READ");
+    assert_eq!(
+        poller.len(),
+        1,
+        "the USE-less re-selection re-registers the same fd, not a second one"
+    );
+
+    registry
+        .port_control(&mut poller, id, "12", &[])
+        .expect("control verb 12 de-selects");
+    assert_eq!(
+        log_lines(&probe.log),
+        vec!["start".to_string(), "stop_select".to_string()],
+        "the obligation survived the USE-less re-selection, so the deselect fired stop_select"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
+
+/// A re-selection that carries `ERL_DRV_USE_NO_CALLBACK` clears the obligation a select took on, so
+/// a later deselect fires no `stop_select` (the C's `no_stop_select_callback`).
+///
+/// Control verb 18 is `driver_select(READ | ERL_DRV_USE, 1)` followed by
+/// `driver_select(READ | ERL_DRV_USE_NO_CALLBACK, 1)`: the second call declines the callback.
+#[test]
+fn a_reselection_declining_the_callback_clears_the_stop_select_obligation() {
+    let Some(so) = fixture_so() else {
+        return;
+    };
+    let (host, _state) = TestPortHost::new();
+    let probe = logged_port_command("stop-select-sticky-decline");
+    let (mut poller, mut registry, id) = open_port(&so, &probe.command, host);
+
+    registry
+        .port_control(&mut poller, id, "18", &[])
+        .expect("control verb 18 selects READ|USE and then re-selects READ|USE_NO_CALLBACK");
+    assert_eq!(
+        poller.len(),
+        1,
+        "the declining re-selection re-registers the same fd, not a second one"
+    );
+
+    registry
+        .port_control(&mut poller, id, "12", &[])
+        .expect("control verb 12 de-selects");
+    assert_eq!(
+        log_lines(&probe.log),
+        vec!["start".to_string()],
+        "the _NO_CALLBACK re-selection cleared the obligation, so the deselect fires nothing"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
 }
 
 // ---------------------------------------------------------------------------------------------

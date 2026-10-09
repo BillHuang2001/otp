@@ -229,6 +229,17 @@ impl FdDriver {
         self.read_fd.is_some()
     }
 
+    /// Whether a write fd is currently attached.
+    pub(crate) fn has_write_fd(&self) -> bool {
+        self.write_fd.is_some()
+    }
+
+    /// The descriptor the file-position/sync/truncate operations act on: the read fd when one
+    /// is attached, else the write fd (so a write-only file is still reachable).
+    pub(crate) fn attached_fd(&self) -> Option<RawFd> {
+        self.read_fd.or(self.write_fd)
+    }
+
     /// Whether the read fd has reported end-of-file (after which [`Driver::ready_input`]
     /// is a no-op).
     pub fn eof(&self) -> bool {
@@ -273,6 +284,53 @@ impl FdDriver {
         self.read_eof = false;
         let token = self.in_token.take();
         let fd = self.read_fd.take();
+        let mut result = Ok(());
+        if let (Some(token), Some(fd)) = (token, fd) {
+            result = ctx.deregister(fd, token);
+        }
+        if let Some(fd) = fd {
+            // SAFETY: `fd` is owned by this driver and has just been removed from the
+            // struct, so it is closed exactly once.
+            let _ = unsafe { libc::close(fd) };
+        }
+        result
+    }
+
+    /// Attaches and registers a **write** fd opened after [`Driver::start`] (the `efile`
+    /// write-mode `open` path).
+    ///
+    /// The fd is put into non-blocking mode. Write readiness is armed only when the port's
+    /// output queue already holds bytes to flush; otherwise [`FdDriver::output`] writes
+    /// synchronously and [`FdDriver::write_pending`] arms readiness on demand — exactly what
+    /// [`Driver::start`] does for a write fd the driver was built with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when a write fd is already attached, or
+    /// whatever `fcntl`/registration returns.
+    pub(crate) fn adopt_write_fd(&mut self, ctx: &mut DriverContext<'_>, fd: RawFd) -> Result<()> {
+        if self.write_fd.is_some() {
+            return Err(error::badarg());
+        }
+        set_nonblocking(fd)?;
+        if !ctx.output().is_empty() {
+            self.out_token = Some(ctx.register(fd, Interest::WRITABLE)?);
+        }
+        self.write_fd = Some(fd);
+        Ok(())
+    }
+
+    /// Deregisters and closes the attached write fd, if any (the `efile` `close` path).
+    ///
+    /// A deregistration failure is reported but the fd is closed either way, and a write fd
+    /// whose readiness was never armed (nothing ever stalled) is still closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::Io` when the poller rejects the deregistration.
+    pub(crate) fn release_write_fd(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        let token = self.out_token.take();
+        let fd = self.write_fd.take();
         let mut result = Ok(());
         if let (Some(token), Some(fd)) = (token, fd) {
             result = ctx.deregister(fd, token);

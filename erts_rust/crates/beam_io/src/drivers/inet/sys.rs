@@ -22,9 +22,9 @@
 //!
 //! Every `unsafe` block of the driver lives here: the thin `libc` wrappers the control
 //! verbs are built on — `socket(2)`/`accept(2)`/`bind(2)`/`listen(2)`/`connect(2)`/
-//! `getsockname(2)`/`getsockopt(2)`/`shutdown(2)`/`close(2)` — plus the two kernel state
-//! probes the adopted-descriptor path needs ([`is_listening`] over `SO_ACCEPTCONN` and
-//! [`has_peer`] over `getpeername(2)`).
+//! `getsockname(2)`/`getsockopt(2)`/`setsockopt(2)`/`shutdown(2)`/`close(2)` — plus the two
+//! kernel state probes the adopted-descriptor path needs ([`is_listening`] over
+//! `SO_ACCEPTCONN` and [`has_peer`] over `getpeername(2)`).
 //!
 //! Each wrapper carries its own `// SAFETY:` rationale; the driver's *ownership* rules
 //! (which descriptor is closed when, and by whom) stay with the driver in [`super`]. The
@@ -190,6 +190,75 @@ pub(super) fn socket_error(fd: RawFd) -> Result<i32> {
         return Err(error::io(std::io::Error::last_os_error()));
     }
     Ok(err)
+}
+
+/// Reads an `int`-valued socket option of `fd` (`getsockopt(2)`).
+///
+/// This is the C's `sock_getopt` for the option family whose value is a plain `int`: the
+/// boolean flags (`SO_KEEPALIVE`, `TCP_NODELAY`) and the buffer sizes (`SO_RCVBUF`,
+/// `SO_SNDBUF`). The kernel's own value is returned **verbatim**, so a buffer size reports
+/// whatever the kernel actually stored — on Linux a doubled request, which is exactly what
+/// the oracle's `recbuf`/`sndbuf` report too.
+///
+/// # Errors
+///
+/// `BeamError::Io` when `getsockopt(2)` fails (an option the descriptor does not serve, or a
+/// descriptor that is no longer a socket).
+pub(super) fn get_socket_int_option(
+    fd: RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+) -> Result<i32> {
+    // SAFETY: `value` is a writable `c_int` and `len` its exact size, which is the
+    // out-parameter pair `getsockopt(2)` expects for an `int`-valued option, so the kernel
+    // writes at most `len` bytes into `value`.
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is a socket owned by this driver, `level`/`name` name a socket option, and
+    // `value`/`len` are a valid buffer and its size.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::addr_of_mut!(value).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    Ok(value)
+}
+
+/// Writes an `int`-valued socket option of `fd` (`setsockopt(2)`), the companion of
+/// [`get_socket_int_option`].
+///
+/// # Errors
+///
+/// `BeamError::Io` when `setsockopt(2)` fails.
+pub(super) fn set_socket_int_option(
+    fd: RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: i32,
+) -> Result<()> {
+    let value: libc::c_int = value;
+    // SAFETY: `value` is a local `c_int` and its size is passed as the option length, so the
+    // kernel reads only those initialized bytes and never retains the pointer.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(error::io(std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Shuts `fd` down in the direction `how` names (`SHUT_*`).
