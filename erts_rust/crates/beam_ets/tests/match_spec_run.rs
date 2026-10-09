@@ -45,7 +45,7 @@ fn atoms() -> AtomTable {
         "d", "x", "y", "ok", ">", "<", "=:=", "=/=", "==", "=<", ">=", "andalso", "orelse",
         "or", "not", "const", "hd", "tl", "length", "abs", "size", "element", "self", "is_integer",
         "is_float", "is_number", "is_atom", "is_list", "is_tuple", "is_binary", "is_bitstring",
-        "is_map",
+        "is_map", "/", "div",
     ] {
         atoms.intern(name);
     }
@@ -85,6 +85,14 @@ fn spec1(heap: &mut Heap, head: Eterm, guards: &[Eterm], body: &[Eterm]) -> Eter
     let body_list = list(heap, body);
     let clause = tup(heap, &[head, guard_list, body_list]);
     list(heap, &[clause])
+}
+
+/// A match-spec call term `{Name, Args…}` (the guard/body function-call form).
+fn call(heap: &mut Heap, name: Eterm, args: &[Eterm]) -> Eterm {
+    let mut elements = Vec::with_capacity(args.len() + 1);
+    elements.push(name);
+    elements.extend_from_slice(args);
+    tup(heap, &elements)
 }
 
 /// Assert two term sequences are structurally equal, element by element.
@@ -1215,5 +1223,88 @@ fn documented_gaps_diverge_from_the_oracle_in_a_run() {
     assert!(
         got.is_empty(),
         "DIVERGENCE: the oracle matches `{{self}} =:= {{self}}`; this crate's `self/0` raises"
+    );
+}
+
+// ===========================================================================
+// The guard-error classification over `ets:match_spec_run/2`
+//
+// The run-level mirror of `tests/select.rs`'s P0 guard tests: a guard this runtime
+// CANNOT evaluate is a typed error (the run is `Err`, never a silent `Ok([])`); a
+// guard the ORACLE itself raises merely skips the clause (`Ok([])`).
+// ===========================================================================
+
+#[test]
+fn unevaluable_guard_is_a_typed_error() {
+    // erl: `ets:match_spec_run([{1,10},{2,20}], ets:match_spec_compile([
+    //      {{'$1','$2'},[{'=:=',{'/',4,2},2.0}],['$1']}]))` -> `[1,2]`
+    // (`4/2` is `2.0`, so the guard holds and the body returns each key). This crate's
+    // default `ArithHook` refuses `/` (its Erlang result is always a float), so the
+    // guard cannot be evaluated: the run is the typed `unsupported_ets` raise — NEVER
+    // `Ok([])`, which would be a silent under-match (the P0 guard-error classification).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let rhs = float(&mut heap, 2.0);
+    let div = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), div, rhs]);
+    let input = pair_list(&mut heap, &[(1, 10), (2, 20)]);
+    let err = run_one(input, head, &[guard], &[at(&atoms, "$1")], &atoms, &mut heap)
+        .expect_err("a guard this runtime cannot evaluate is never a silent non-match");
+    let raise = err
+        .into_raise()
+        .expect("the arithmetic refusal is an explicit raise");
+    assert!(
+        raise
+            .reason
+            .as_atom()
+            .expect("the reason is an atom")
+            .starts_with("unsupported_ets: match-spec arithmetic"),
+        "the refusal names the unsupported arithmetic"
+    );
+}
+
+#[test]
+fn raising_guard_skips_the_clause_in_a_run() {
+    // erl: `ets:match_spec_run([{1,10},{2,20}], ets:match_spec_compile([
+    //      {{'$1','$2'},[{'=:=',{element,9,'$1'},1}],['$1']}]))` -> `[]`, and likewise
+    // for `{hd,'$1'}` and `{'div',1,0}`. Each guard RAISES in the oracle (`element/2`
+    // out of range, `hd` of a non-list, division by zero), so the clause is unmet and
+    // no element matches: `Ok([])`, NOT a typed error.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let input = pair_list(&mut heap, &[(1, 10), (2, 20)]);
+    let body = [at(&atoms, "$1")];
+
+    let element9 = call(
+        &mut heap,
+        at(&atoms, "element"),
+        &[make_small(9), at(&atoms, "$1")],
+    );
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), element9, make_small(1)]);
+    assert!(
+        run_one(input, head, &[guard], &body, &atoms, &mut heap)
+            .unwrap()
+            .is_empty(),
+        "element/2 out of range skips the clause"
+    );
+
+    let hd1 = call(&mut heap, at(&atoms, "hd"), &[at(&atoms, "$1")]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), hd1, make_small(1)]);
+    assert!(
+        run_one(input, head, &[guard], &body, &atoms, &mut heap)
+            .unwrap()
+            .is_empty(),
+        "hd/1 of a non-list skips the clause"
+    );
+
+    let div0 = call(&mut heap, at(&atoms, "div"), &[make_small(1), make_small(0)]);
+    let guard = tup(&mut heap, &[at(&atoms, "=:="), div0, make_small(1)]);
+    assert!(
+        run_one(input, head, &[guard], &body, &atoms, &mut heap)
+            .unwrap()
+            .is_empty(),
+        "div by zero skips the clause"
     );
 }

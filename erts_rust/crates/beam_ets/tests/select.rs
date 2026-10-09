@@ -32,7 +32,7 @@
 
 use std::rc::Rc;
 
-use beam_alloc::Heap;
+use beam_alloc::{Heap, RefcBinary};
 use beam_term::prelude::*;
 use beam_common::BeamError;
 use beam_ets::prelude::*;
@@ -2406,4 +2406,629 @@ fn ordered_set_merges_arithmetic_key_duplicates_while_hash_kinds_keep_them_disti
             assert_terms(&float_hit, &[object_float], &atoms, "lookup(1.0)");
         }
     }
+}
+
+// ===========================================================================
+// The guard-error classification (P0) and the guard-BIF battery
+//
+// Every expectation below is the system `erl`'s (OTP 29 / erts-17.1), probed with
+// `ets:select/2` / `ets:select_count/2` / `ets:select_delete/2` /
+// `ets:select_replace/2` (and `ets:match_spec_run/2` for the run-level cases); the
+// probe result is quoted beside each assertion.
+//
+// The two guard-error rules `exec::guards_hold` (P0) enforces are:
+//   * a guard the ORACLE itself raises (`badarg`) — `element/2` out of range, `hd`
+//     of a non-list, `div`/`rem` by zero, `map_get/2` with an absent key, … — makes
+//     the clause fail (`Ok(false)`), with NO error (the C `matchCatch`);
+//   * a guard this runtime CANNOT evaluate (a capability gap, e.g. the default
+//     `ArithHook` refusing `/` or bignum/float arithmetic) is a typed error that is
+//     PROPAGATED, never turned into a silent non-match (workspace `CONTEXT.md` §3).
+// ===========================================================================
+
+/// `select` a one-clause spec `{head, [guard], ['$1']}` and return the matched keys.
+fn guard_select_keys(
+    table: &Table,
+    head: Eterm,
+    guard: Eterm,
+    atoms: &AtomTable,
+    heap: &mut Heap,
+) -> Vec<Eterm> {
+    select_one(table, head, &[guard], &[at(atoms, "$1")], atoms, heap)
+        .expect("the spec compiles and the guard runs to completion")
+}
+
+/// `{'=:=', Left, Right}` — the guard form the battery below builds.
+fn exact_guard(heap: &mut Heap, atoms: &AtomTable, left: Eterm, right: Eterm) -> Eterm {
+    tup(heap, &[at(atoms, "=:="), left, right])
+}
+
+/// Assert a refusal is the crate's typed `unsupported_ets` capability-gap raise whose
+/// reason atom starts with `prefix`.
+fn assert_typed_gap(err: BeamError, prefix: &str) {
+    let raise = err
+        .into_raise()
+        .expect("a capability gap is an explicit raise");
+    assert_eq!(raise.class, beam_common::ExceptionClass::Error, "{prefix}");
+    let reason = raise
+        .reason
+        .as_atom()
+        .expect("the reason is an atom")
+        .to_string();
+    assert!(
+        reason.starts_with(prefix),
+        "expected a raise whose reason starts with `{prefix}`, got `{reason}`"
+    );
+}
+
+/// The ordered guard-probe table: one object per value shape.
+///
+/// oracle (OTP 29 / erts-17.1), `ordered_set`
+/// `[{1,10},{2,{7,8}},{3,<<"hello">>},{4,#{a=>1,b=>2}},{5,[1,2,3]},{6,1.5},{7,-3}]`.
+fn guard_probe_table(atoms: &AtomTable, heap: &mut Heap) -> Table {
+    let mut table = new_table(TableKind::OrderedSet);
+    let inner = tup(heap, &[make_small(7), make_small(8)]);
+    let bin = binary(heap, b"hello");
+    let map = flat_map(
+        heap,
+        &[
+            (at(atoms, "a"), make_small(1)),
+            (at(atoms, "b"), make_small(2)),
+        ],
+        atoms,
+    );
+    let lst = list(heap, &[make_small(1), make_small(2), make_small(3)]);
+    let fl = float(heap, 1.5);
+    table
+        .insert(tup(heap, &[make_small(1), make_small(10)]), atoms)
+        .unwrap();
+    table
+        .insert(tup(heap, &[make_small(2), inner]), atoms)
+        .unwrap();
+    table
+        .insert(tup(heap, &[make_small(3), bin]), atoms)
+        .unwrap();
+    table
+        .insert(tup(heap, &[make_small(4), map]), atoms)
+        .unwrap();
+    table
+        .insert(tup(heap, &[make_small(5), lst]), atoms)
+        .unwrap();
+    table
+        .insert(tup(heap, &[make_small(6), fl]), atoms)
+        .unwrap();
+    table
+        .insert(tup(heap, &[make_small(7), make_small(-3)]), atoms)
+        .unwrap();
+    table
+}
+
+#[test]
+fn unevaluable_guard_is_a_typed_error_never_a_silent_non_match() {
+    // oracle (OTP 29 / erts-17.1) on the `{1,10}`/`{2,20}` table, head `{'$1','$2'}`:
+    //   `ets:select(T, [{{'$1','$2'},[{'=:=',{'/',4,2},2.0}],['$1']}])` -> `[1,2]`
+    // `4/2` is `2.0`, so the guard HOLDS for both objects and the body returns each
+    // key. This crate's default `ArithHook` refuses `/` (its Erlang result is always a
+    // float), so the guard cannot be evaluated: every select-family entry must return
+    // the typed `unsupported_ets` raise — never `[]`/`0`/`Ok`, which would be a silent
+    // under-match (the P0 guard-error classification).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    table
+        .insert(tup(&mut heap, &[make_small(2), make_small(20)]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let rhs = float(&mut heap, 2.0);
+    let div = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
+    let guard = exact_guard(&mut heap, &atoms, div, rhs);
+    let spec = compile(spec1(&mut heap, head, &[guard], &[at(&atoms, "$_")]), &atoms).unwrap();
+
+    assert_unsupported_arithmetic(table.select(&spec, &atoms, &mut heap).unwrap_err(), "'/'");
+    assert_unsupported_arithmetic(
+        table.select_count(&spec, &atoms, &mut heap).unwrap_err(),
+        "'/'",
+    );
+    assert_unsupported_arithmetic(
+        table.select_delete(&spec, &atoms, &mut heap).unwrap_err(),
+        "'/'",
+    );
+    assert_unsupported_arithmetic(
+        table.select_replace(&spec, &atoms, &mut heap).unwrap_err(),
+        "'/'",
+    );
+    assert_eq!(
+        table.size(),
+        2,
+        "a refused select_delete/select_replace left the table unchanged"
+    );
+}
+
+#[test]
+fn an_oracle_raising_guard_skips_the_clause_without_an_error() {
+    // The A1-vs-A2 distinction: A1's `/` guard is a *capability gap* (typed error);
+    // the guards here RAISE in the ORACLE itself, so the clause is merely unmet and
+    // the whole call succeeds with an empty/zero result. oracle (OTP 29 / erts-17.1)
+    // on `{1,10}`/`{2,20}`, head `{'$1','$2'}`:
+    //   `{'=:=',{element,9,'$1'},1}`  -> select `[]`, select_count `0`, select_delete `0`
+    //   `{'=:=',{hd,'$1'},1}`         -> likewise
+    //   `{'=:=',{'div',1,0},1}`       -> likewise
+    // (`element/2` out of range, `hd` of a non-list/tuple and division by zero each
+    // raise `badarg`; the C `matchCatch` turns that into "guard unmet".)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    table
+        .insert(tup(&mut heap, &[make_small(2), make_small(20)]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let body = [at(&atoms, "$_")];
+
+    for (what, lhs) in [
+        (
+            "element/2 out of range",
+            call(
+                &mut heap,
+                at(&atoms, "element"),
+                &[make_small(9), at(&atoms, "$1")],
+            ),
+        ),
+        (
+            "hd/1 of a non-list",
+            call(&mut heap, at(&atoms, "hd"), &[at(&atoms, "$1")]),
+        ),
+        (
+            "div by zero",
+            call(&mut heap, at(&atoms, "div"), &[make_small(1), make_small(0)]),
+        ),
+    ] {
+        let guard = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+        let spec = compile(spec1(&mut heap, head, &[guard], &body), &atoms).unwrap();
+        assert_eq!(
+            table.select(&spec, &atoms, &mut heap).unwrap(),
+            Vec::<Eterm>::new(),
+            "{what}: select is empty, not an error"
+        );
+        assert_eq!(
+            table.select_count(&spec, &atoms, &mut heap).unwrap(),
+            0,
+            "{what}: select_count is 0"
+        );
+        assert_eq!(
+            table.select_delete(&spec, &atoms, &mut heap).unwrap(),
+            0,
+            "{what}: select_delete deletes nothing"
+        );
+        assert_eq!(
+            table.select_replace(&spec, &atoms, &mut heap).unwrap(),
+            0,
+            "{what}: select_replace replaces nothing"
+        );
+        assert_eq!(table.size(), 2, "{what}: the table is unchanged");
+    }
+}
+
+#[test]
+fn guard_bifs_match_the_oracle_for_map_tuple_binary_float_and_numeric_operands() {
+    // oracle (OTP 29 / erts-17.1) on `guard_probe_table`, head `{'$1','$2'}`, body
+    // `['$1']`, one guard `[G]` — each guard returns the listed keys:
+    //   {'=:=',{map_size,'$2'},2}         -> [4]
+    //   {'=:=',{map_get,a,'$2'},1}        -> [4]
+    //   {'=:=',{is_map_key,b,'$2'},true}  -> [4]
+    //   {'=:=',{tuple_size,'$2'},2}       -> [2]
+    //   {'=:=',{byte_size,'$2'},5}        -> [3]
+    //   {'=:=',{bit_size,'$2'},40}        -> [3]
+    //   {'=:=',{float,'$2'},1.5}          -> [6]
+    //   {'=:=',{float,'$1'},1.0}          -> [1]
+    //   {'=:=',{trunc,'$2'},1}            -> [6]
+    //   {'=:=',{round,'$2'},2}            -> [6]
+    //   {'=:=',{abs,'$2'},3}              -> [7]
+    //   {'=:=',{abs,'$2'},1.5}            -> [6]
+    let atoms = atoms();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let table = guard_probe_table(&atoms, &mut heap);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+
+    let unary = |heap: &mut Heap, name: &str| {
+        call(heap, at(&atoms, name), &[at(&atoms, "$2")])
+    };
+
+    let lhs = unary(&mut heap, "map_size");
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(2));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(4)]
+    );
+
+    let lhs = call(
+        &mut heap,
+        at(&atoms, "map_get"),
+        &[at(&atoms, "a"), at(&atoms, "$2")],
+    );
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(4)]
+    );
+
+    let lhs = call(
+        &mut heap,
+        at(&atoms, "is_map_key"),
+        &[at(&atoms, "b"), at(&atoms, "$2")],
+    );
+    let g = exact_guard(&mut heap, &atoms, lhs, at(&atoms, "true"));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(4)]
+    );
+
+    let lhs = unary(&mut heap, "tuple_size");
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(2));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(2)]
+    );
+
+    let lhs = unary(&mut heap, "byte_size");
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(5));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(3)]
+    );
+
+    let lhs = unary(&mut heap, "bit_size");
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(40));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(3)]
+    );
+
+    let lhs = unary(&mut heap, "float");
+    let rhs = float(&mut heap, 1.5);
+    let g = exact_guard(&mut heap, &atoms, lhs, rhs);
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(6)]
+    );
+
+    let lhs = call(&mut heap, at(&atoms, "float"), &[at(&atoms, "$1")]);
+    let rhs = float(&mut heap, 1.0);
+    let g = exact_guard(&mut heap, &atoms, lhs, rhs);
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(1)]
+    );
+
+    let lhs = unary(&mut heap, "trunc");
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(6)]
+    );
+
+    let lhs = unary(&mut heap, "round");
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(2));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(6)]
+    );
+
+    let lhs = unary(&mut heap, "abs");
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(3));
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(7)]
+    );
+
+    let lhs = unary(&mut heap, "abs");
+    let rhs = float(&mut heap, 1.5);
+    let g = exact_guard(&mut heap, &atoms, lhs, rhs);
+    assert_eq!(
+        guard_select_keys(&table, head, g, &atoms, &mut heap),
+        vec![make_small(6)]
+    );
+}
+
+#[test]
+fn guard_bifs_with_constant_operands_match_every_object() {
+    // oracle: on `guard_probe_table` each of these guards is a CONSTANT expression
+    // that holds for every object, so `ets:select/2` returns all seven keys
+    // `[1,2,3,4,5,6,7]`:
+    //   {'=:=',{trunc,1.9},1}    {'=:=',{round,2.5},3}    {'=:=',{round,-2.5},-3}
+    //   {'=:=',{trunc,-1.9},-1}  {'=:=',{abs,-3},3}       {'=:=',{abs,-1.5},1.5}
+    //   {'=:=',{float,1},1.0}
+    // (`round/1` rounds half away from zero: `round(2.5)` is 3, `round(-2.5)` is -3.)
+    let atoms = atoms();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let table = guard_probe_table(&atoms, &mut heap);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let all = vec![
+        make_small(1),
+        make_small(2),
+        make_small(3),
+        make_small(4),
+        make_small(5),
+        make_small(6),
+        make_small(7),
+    ];
+
+    // trunc(1.9) =:= 1
+    let f = float(&mut heap, 1.9);
+    let lhs = call(&mut heap, at(&atoms, "trunc"), &[f]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    assert_eq!(guard_select_keys(&table, head, g, &atoms, &mut heap), all);
+
+    // round(2.5) =:= 3
+    let f = float(&mut heap, 2.5);
+    let lhs = call(&mut heap, at(&atoms, "round"), &[f]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(3));
+    assert_eq!(guard_select_keys(&table, head, g, &atoms, &mut heap), all);
+
+    // round(-2.5) =:= -3
+    let f = float(&mut heap, -2.5);
+    let lhs = call(&mut heap, at(&atoms, "round"), &[f]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(-3));
+    assert_eq!(guard_select_keys(&table, head, g, &atoms, &mut heap), all);
+
+    // trunc(-1.9) =:= -1
+    let f = float(&mut heap, -1.9);
+    let lhs = call(&mut heap, at(&atoms, "trunc"), &[f]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(-1));
+    assert_eq!(guard_select_keys(&table, head, g, &atoms, &mut heap), all);
+
+    // abs(-3) =:= 3
+    let lhs = call(&mut heap, at(&atoms, "abs"), &[make_small(-3)]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(3));
+    assert_eq!(guard_select_keys(&table, head, g, &atoms, &mut heap), all);
+
+    // abs(-1.5) =:= 1.5
+    let f = float(&mut heap, -1.5);
+    let lhs = call(&mut heap, at(&atoms, "abs"), &[f]);
+    let rhs = float(&mut heap, 1.5);
+    let g = exact_guard(&mut heap, &atoms, lhs, rhs);
+    assert_eq!(guard_select_keys(&table, head, g, &atoms, &mut heap), all);
+
+    // float(1) =:= 1.0
+    let lhs = call(&mut heap, at(&atoms, "float"), &[make_small(1)]);
+    let rhs = float(&mut heap, 1.0);
+    let g = exact_guard(&mut heap, &atoms, lhs, rhs);
+    assert_eq!(guard_select_keys(&table, head, g, &atoms, &mut heap), all);
+}
+
+#[test]
+fn guard_bifs_on_a_non_map_or_non_binary_skip_the_clause() {
+    // oracle: `5` is neither a map nor a bitstring, so each guard below RAISES in the
+    // oracle and the clause is simply unmet — `ets:select/2` is `[]`, never an error:
+    //   {'=:=',{map_get,a,5},1}        -> []
+    //   {'=:=',{map_size,5},1}         -> []
+    //   {'=:=',{bit_size,5},1}         -> []
+    //   {'=:=',{is_map_key,a,5},true}  -> []
+    let atoms = atoms();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let table = guard_probe_table(&atoms, &mut heap);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+
+    let lhs = call(
+        &mut heap,
+        at(&atoms, "map_get"),
+        &[at(&atoms, "a"), make_small(5)],
+    );
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    assert!(guard_select_keys(&table, head, g, &atoms, &mut heap).is_empty());
+
+    let lhs = call(&mut heap, at(&atoms, "map_size"), &[make_small(5)]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    assert!(guard_select_keys(&table, head, g, &atoms, &mut heap).is_empty());
+
+    let lhs = call(&mut heap, at(&atoms, "bit_size"), &[make_small(5)]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    assert!(guard_select_keys(&table, head, g, &atoms, &mut heap).is_empty());
+
+    let lhs = call(
+        &mut heap,
+        at(&atoms, "is_map_key"),
+        &[at(&atoms, "a"), make_small(5)],
+    );
+    let g = exact_guard(&mut heap, &atoms, lhs, at(&atoms, "true"));
+    assert!(guard_select_keys(&table, head, g, &atoms, &mut heap).is_empty());
+}
+
+#[test]
+fn map_construction_in_a_guard_and_a_body_matches_the_oracle() {
+    // The spec-term map `#{'$1' => '$2'}` is a CONSTRUCTION evaluated per object:
+    // each object's key/value is bound to `'$1'`/`'$2'`, so a one-pair map is built
+    // from that object's own values.
+    // oracle (OTP 29 / erts-17.1) on `guard_probe_table`:
+    //   guard `{'=:=',{map_get,'$1',#{'$1' => '$2'}},'$2'}` -> all seven keys
+    //         (`map_get(Key, #{Key => Value})` is `Value`)
+    //   body  `[{map_size,#{'$1' => '$2'}}]`               -> `[1,1,1,1,1,1,1]`
+    let atoms = atoms();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let table = guard_probe_table(&atoms, &mut heap);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+
+    let spec_map = flat_map(
+        &mut heap,
+        &[(at(&atoms, "$1"), at(&atoms, "$2"))],
+        &atoms,
+    );
+    let lhs = call(
+        &mut heap,
+        at(&atoms, "map_get"),
+        &[at(&atoms, "$1"), spec_map],
+    );
+    let g = exact_guard(&mut heap, &atoms, lhs, at(&atoms, "$2"));
+    let got = guard_select_keys(&table, head, g, &atoms, &mut heap);
+    assert_eq!(
+        got,
+        vec![
+            make_small(1),
+            make_small(2),
+            make_small(3),
+            make_small(4),
+            make_small(5),
+            make_small(6),
+            make_small(7)
+        ],
+        "the constructed map in a guard matches every object"
+    );
+
+    let spec_map = flat_map(
+        &mut heap,
+        &[(at(&atoms, "$1"), at(&atoms, "$2"))],
+        &atoms,
+    );
+    let body_call = call(&mut heap, at(&atoms, "map_size"), &[spec_map]);
+    let spec = compile(spec1(&mut heap, head, &[], &[body_call]), &atoms).unwrap();
+    let got = table.select(&spec, &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(1); 7], "a constructed map body");
+}
+
+// ---------------------------------------------------------------------------
+// Typed divergences (this crate is strictly LESS capable than the oracle)
+//
+// Each is a typed `unsupported_ets` raise — never a wrong result — reported to the
+// source owner rather than asserted as oracle behaviour. `self/0` is a different
+// KIND of gap: an honest SEMANTIC under-match (it raises `badarg`, so its clause is
+// skipped, while the oracle evaluates it against the calling process); that case is
+// pinned by `documented_capability_gaps_are_typed_and_diverge_from_the_oracle` above
+// and is only referenced here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_to_tuple_is_not_a_guard_bif_and_is_badarg_like_the_oracle() {
+    // The oracle's `guard_tab` (`erl_db_util.c:572-976`) has no `list_to_tuple/1`, so
+    // `ets:select(T, [{{'$1','$2'},[{'=:=',{list_to_tuple,'$1'},5}],['$1']}])` is
+    // `error:badarg` — the whole call is rejected. This crate's `decode_call`
+    // fallthrough returns the same `badarg`, so the behaviour MATCHES the oracle
+    // (this is not a divergence, just an unsupported construct both reject).
+    let atoms = atoms();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let lhs = call(&mut heap, at(&atoms, "list_to_tuple"), &[at(&atoms, "$1")]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(5));
+    let spec = spec1(&mut heap, head, &[g], &[at(&atoms, "$1")]);
+    assert!(
+        matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+        "list_to_tuple/1 is not a guard BIF: `badarg`, as the oracle"
+    );
+}
+
+#[test]
+fn abs_on_a_bignum_is_a_typed_gap() {
+    // oracle: `abs/1` on a bignum returns a bignum (`abs(-(1 bsl 60))` is `1 bsl 60`),
+    // so a guard over it is evaluated. This crate's match-spec `abs/1` has no bignum
+    // arithmetic, so it is the typed `unsupported_ets` raise — never a `badarg` that
+    // would silently under-match.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    // A 1-digit bignum `1 bsl 60` (beyond the 60-bit small-integer range).
+    // SAFETY: `big_size_words(1)` (2) exclusively-owned words for a 1-digit bignum;
+    // the heap outlives the term.
+    let big = unsafe {
+        let hp = heap.alloc_words(big_size_words(1)).expect("bignum words");
+        write_big(hp, false, &[1u64 << 60])
+    };
+    let lhs = call(&mut heap, at(&atoms, "abs"), &[big]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    let spec = compile(spec1(&mut heap, head, &[g], &[at(&atoms, "true")]), &atoms).unwrap();
+    let err = table.select_count(&spec, &atoms, &mut heap).unwrap_err();
+    assert_typed_gap(err, "unsupported_ets: match-spec 'abs'");
+}
+
+#[test]
+fn trunc_and_round_beyond_the_small_range_are_a_typed_gap() {
+    // oracle: `trunc(1.0e30)` / `round(1.0e30)` return a BIGNUM
+    // (`1000000000000000019884624838656`), so the guard is evaluated. This crate's
+    // match-spec integral conversion is small-int only, so a result outside the 60-bit
+    // small range is the typed `unsupported_ets` raise — never a truncated wrong
+    // integer.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+
+    let big_float = float(&mut heap, 1.0e30);
+    let lhs = call(&mut heap, at(&atoms, "trunc"), &[big_float]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    let spec = compile(spec1(&mut heap, head, &[g], &[at(&atoms, "true")]), &atoms).unwrap();
+    let err = table.select_count(&spec, &atoms, &mut heap).unwrap_err();
+    assert_typed_gap(err, "unsupported_ets: match-spec 'trunc'/'round'");
+
+    let big_float = float(&mut heap, 1.0e30);
+    let lhs = call(&mut heap, at(&atoms, "round"), &[big_float]);
+    let g = exact_guard(&mut heap, &atoms, lhs, make_small(1));
+    let spec = compile(spec1(&mut heap, head, &[g], &[at(&atoms, "true")]), &atoms).unwrap();
+    let err = table.select_count(&spec, &atoms, &mut heap).unwrap_err();
+    assert_typed_gap(err, "unsupported_ets: match-spec 'trunc'/'round'");
+}
+
+#[test]
+fn byte_size_and_bit_size_read_an_off_heap_refc_binary_correctly() {
+    // oracle (OTP 29 / erts-17.1): `byte_size(<<"0123456789abcdefghij">>)` is 20 and
+    // `bit_size(...)` is 160, whether the binary is on-heap or an off-heap refc binary.
+    // This crate's `expr::bitstring_length` classifies the on-heap `[BinRef][ErlSubBits]`
+    // pair (root = the `ErlSubBits`) as `TermClass::Bitstring` and reads `end - start`,
+    // so both sizes come back CORRECT — oracle parity, not a typed gap. (Its
+    // `TermClass::BinRef` → `unsupported_ets` arm is reachable only for a *bare*
+    // `BinRef` term, which is not a user-visible term.)
+    //
+    // The table-owned deep copy rejects `BinRef`/`SubBits` (a documented `TermStore`
+    // limitation), so the guard runs over a `match_spec_run` input element, which is
+    // not copied.
+    let atoms = atoms();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let payload = RefcBinary::new(b"0123456789abcdefghij").expect("refc payload");
+    // SAFETY: exactly `ERL_REFC_BITS_SIZE` (8) exclusively-owned words are reserved at
+    // `hp` (the `write_refc_binary` contract); `payload.data_ptr()` is a live,
+    // word-aligned pointer to `20 * 8` bits of off-heap storage kept alive by `payload`
+    // for the whole test, and `null` is the (empty) off-heap chain link.
+    let refc = unsafe {
+        let hp = heap
+            .alloc_words(ERL_REFC_BITS_SIZE)
+            .expect("8 words for the pair");
+        write_refc_binary(
+            hp,
+            payload.data_ptr() as *mut Eterm,
+            core::ptr::null_mut(),
+            payload.data_ptr(),
+            0,
+            20 * 8,
+        )
+    };
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let object = tup(&mut heap, &[make_small(4), refc]);
+    let input = list(&mut heap, &[object]);
+    let body = [at(&atoms, "$1")];
+
+    let bs = call(&mut heap, at(&atoms, "byte_size"), &[at(&atoms, "$2")]);
+    let g = exact_guard(&mut heap, &atoms, bs, make_small(20));
+    let spec = spec1(&mut heap, head, &[g], &body);
+    assert_eq!(
+        match_spec_run(input, spec, &atoms, &mut heap).unwrap(),
+        vec![make_small(4)],
+        "byte_size of the off-heap refc binary is 20"
+    );
+
+    let bits = call(&mut heap, at(&atoms, "bit_size"), &[at(&atoms, "$2")]);
+    let g = exact_guard(&mut heap, &atoms, bits, make_small(160));
+    let spec = spec1(&mut heap, head, &[g], &body);
+    assert_eq!(
+        match_spec_run(input, spec, &atoms, &mut heap).unwrap(),
+        vec![make_small(4)],
+        "bit_size of the off-heap refc binary is 160"
+    );
 }
