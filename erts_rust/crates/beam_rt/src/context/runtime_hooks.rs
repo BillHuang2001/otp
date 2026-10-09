@@ -39,6 +39,7 @@
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
 //! | `erlang:statistics/1` | `run_queue` from [`Runtime::run_queue_len`]; `wall_clock` from the process clock |
+//! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
 //!
 //! Every **other** `(module, function, arity)` answers the same typed capability gap the
 //! defaulted seam does (see [`RuntimeHooksBridge::call`]), so installing this bridge never
@@ -57,6 +58,13 @@
 //!   the oracle accepts is a valid statistics key this runtime cannot answer honestly, so
 //!   it reports the typed capability gap. A name that is not a statistics key at all is
 //!   the oracle's `badarg`.
+//! * `os:set_signal/2` installs the disposition for real (the one process-global
+//!   [`signal`] facility), but the **notification leg** of ERTS's signal handling is not
+//!   wired: this runtime boots no `erl_signal_server` process and registers the facility's
+//!   read end with no poller, so a handled signal is never turned into a `{notify, Signal}`
+//!   message. The three `sigstop` forms are the oracle's `ok` without a syscall — the kernel
+//!   refuses every disposition change for a kernel-only signal. `signal`'s module docs carry
+//!   the full reasoning and the exact wiring a future pass must add.
 //!
 //! # Destination semantics (the C `erts_hl_timer`, read-only reference)
 //!
@@ -69,6 +77,7 @@ use beam_alloc::Heap;
 use beam_bifs::RuntimeHooks;
 use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
+use beam_io::signal::{Disposition, Signal};
 use beam_process::{PidTarget, ProcessId, ProcessTable};
 use beam_term::prelude::{atom_val, is_atom, is_small, make_small, signed_value};
 use beam_term::{AtomTable, Eterm};
@@ -80,6 +89,8 @@ use std::time::{Duration, Instant};
 use crate::error;
 use crate::runtime::Runtime;
 use crate::timers::{self, TimerTarget};
+
+use super::signal;
 
 /// The [`RuntimeHooks`] provider over the running runtime.
 ///
@@ -261,6 +272,56 @@ impl<'a> RuntimeHooksBridge<'a> {
                 .is_some_and(|loaded| module_exports(loaded, function, arity));
         let _ = heap;
         atom_term(atoms, if exported { "true" } else { "false" })
+    }
+
+    /// `os:set_signal/2` — install an OS-signal disposition.
+    ///
+    /// Oracle-verified (OTP 29/`erts-17.1`) against
+    /// `erts/emulator/beam/erl_bif_os.c:145-160` (`os_set_signal_2`) and
+    /// `erts/emulator/sys/unix/sys.c:698-767` (`signalterm_to_signum`/`erts_set_signal`):
+    ///
+    /// * both arguments must be **atoms** (`is_atom`; a string or an integer is `badarg`);
+    /// * the option must be exactly `default`, `handle` or `ignore` — in the C the option is
+    ///   validated **first**, so an unknown option is `badarg` even for an unknown signal,
+    ///   and both are `badarg` regardless of order here (the answer is the same);
+    /// * the signal must be one of the twelve atoms `signalterm_to_signum` maps
+    ///   ([`Signal::ALL`]) — `sigkill`, `sigttin`, `sigttou`, `siginfo` and every other atom
+    ///   are `badarg`;
+    /// * otherwise the answer is the bare atom `ok` and the disposition is installed
+    ///   *process-globally*: the C's `sys_signal` is a plain `sigaction(2)`, so the
+    ///   disposition outlives the calling process and is shared by the whole node. This
+    ///   runtime keeps that in the one long-lived [`signal`] facility, so
+    ///   `os:set_signal(sigusr1, ignore)` followed by `os:set_signal(sigusr1, handle)`
+    ///   really does leave `handle` installed.
+    ///
+    /// `sigstop` is the one accepted signal the kernel refuses to change (`sigaction(2)`
+    /// answers `EINVAL` for it, whose result the C discards); it is the oracle's `ok` here
+    /// too, without issuing the syscall — see [`signal::install`].
+    ///
+    /// The **notification** leg (ERTS's `{notify, SignalName}` to `erl_signal_server`) is
+    /// not wired: there is no such process and no poller registration for the facility's
+    /// read end (see [`signal`]). A handled signal is therefore recorded and not delivered —
+    /// a documented gap, never a fabricated recipient.
+    ///
+    /// # Errors
+    ///
+    /// `badarg` for a non-atom argument, an unknown signal name or an unknown option; a
+    /// genuine `BeamError::Io` only if the OS refuses to create the facility or install the
+    /// disposition (reported, never swallowed).
+    fn set_signal(&mut self, atoms: &AtomTable, args: &[Eterm]) -> Result<Eterm> {
+        let signal_term = *args.first().ok_or(BeamError::BadArg)?;
+        let option_term = *args.get(1).ok_or(BeamError::BadArg)?;
+        if !is_atom(signal_term) || !is_atom(option_term) {
+            return Err(BeamError::BadArg);
+        }
+        // A name the caller's shared table does not hold cannot be one of the accepted
+        // atoms, so it is the oracle's `badarg` — never the typed "not interned" gap.
+        let signal_name = atoms.name(atom_val(signal_term)).ok_or(BeamError::BadArg)?;
+        let option_name = atoms.name(atom_val(option_term)).ok_or(BeamError::BadArg)?;
+        let signal = Signal::from_name(signal_name).ok_or(BeamError::BadArg)?;
+        let disposition = Disposition::from_name(option_name).ok_or(BeamError::BadArg)?;
+        signal::install(signal, disposition)?;
+        atom_term(atoms, "ok")
     }
 
     /// `erlang:link/1`: link the calling process to `Target`, answering `true`.
@@ -735,6 +796,7 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             ("erlang", "send_after", 4) => self.send_after_4(heap, args),
             ("erlang", "cancel_timer", 2) => self.cancel_timer_2(heap, args),
             ("erlang", "function_exported", 3) => self.function_exported(heap, atoms, args),
+            ("os", "set_signal", 2) => self.set_signal(atoms, args),
             ("erlang", "link", 1) => self.link(args, false),
             ("erlang", "unlink", 1) => self.link(args, true),
             ("erlang", "dt_spread_tag", 1) => self.dt_spread_tag(atoms, args),

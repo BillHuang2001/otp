@@ -82,6 +82,7 @@ mod module_info;
 mod persistent_term;
 mod process_bridge;
 mod runtime_hooks;
+mod signal;
 mod trace;#[cfg(test)]
 mod test_support;
 #[cfg(test)]
