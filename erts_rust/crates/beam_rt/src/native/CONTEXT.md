@@ -133,7 +133,6 @@ value and never a false `badarg`. The gap names the missing accessor/hook:
 | item | missing accessor / hook |
 |---|---|
 | `catchlevel` | the runtime has no catch-frame store reachable from here |
-| `sequential_trace_token` | no `seq_trace` subsystem |
 | `backtrace` | no binary backtrace (see `current_stacktrace`) |
 | `magic_ref`, `parent`, `label` | no such PCB fields in M1 |
 | `async_dist`, `priority_messages` | no such process flags in M1 |
