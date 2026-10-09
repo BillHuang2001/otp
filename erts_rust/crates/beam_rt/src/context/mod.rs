@@ -1377,8 +1377,13 @@ impl RuntimeContext<'_> {
             return Ok(None);
         }
         let index = terms::fun_index(fun)?;
-        let mut combined = terms::fun_free(fun)?.to_vec();
-        combined.extend_from_slice(args);
+        // Calling convention for a closure body (see `erts/emulator/beam/beam_common.c::call_fun`):
+        // the call arguments occupy `x(0..arity)`, the captured free variables follow at
+        // `x(arity..arity+free)`. The compiler emits exactly this layout — for
+        // `fun({K,V}) -> {N,K,V} end` the body is `-f-fun-0-/2` and reads its *argument* from
+        // `{x,0}` and its free variable `N` from `{x,1}`.
+        let mut combined = args.to_vec();
+        combined.extend_from_slice(terms::fun_free(fun)?);
         let found = self
             .runtime
             .code_server
