@@ -291,6 +291,21 @@ pub struct Runtime {
     /// where port bytes really move, so the `statistics(io)` arm reads them without borrowing
     /// the port table.
     io_counters: Rc<IoCounters>,
+    /// The **one long-lived CPU-time clock** behind `erlang:statistics(runtime)`.
+    ///
+    /// [`beam_io::cpu_time::RuntimeClock`] measures the whole process's user CPU time with
+    /// `getrusage(RUSAGE_SELF)` and carries the anchor the C keeps in its process-global
+    /// `runtime_prev` (`erts/emulator/beam/erl_time_sup.c:1421-1481`). The runtime must own
+    /// **one** clock for its whole lifetime: a fresh clock per call would make
+    /// `SinceLastCall` always equal `Total` (see `beam_io/src/cpu_time.rs`). `beam_rt` is
+    /// `#![deny(unsafe_code)]`, so the syscall lives in `beam_io` behind a safe API and the
+    /// clock is read through [`Runtime::cpu_time_statistics`].
+    ///
+    /// The clock's reading is **stateful** while the `statistics/1` arm only has `&self`, so
+    /// the clock sits behind a [`RefCell`] — the same interior mutability the `reductions`/
+    /// `context_switches` anchors use for their own `&self` readers. The runtime is
+    /// single-threaded, so the borrow can never contend.
+    cpu_clock: RefCell<beam_io::cpu_time::RuntimeClock>,
     /// Whether [`Runtime::boot`] has run.
     booted: bool,
     /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
@@ -563,6 +578,7 @@ impl Runtime {
             context_switches: 0,
             context_switches_anchor: Cell::new(0),
             io_counters,
+            cpu_clock: RefCell::new(beam_io::cpu_time::RuntimeClock::new()),
             booted: false,
             halt: None,
             seq_trace: SeqTrace::new(),
@@ -1508,6 +1524,25 @@ impl Runtime {
         self.io_counters.bytes()
     }
 
+    /// `erlang:statistics(runtime)`: `(Total, SinceLastCall)` in **milliseconds of user CPU
+    /// time**, read from the runtime's one long-lived
+    /// [`RuntimeClock`](beam_io::cpu_time::RuntimeClock).
+    ///
+    /// `Total` is the whole process's accumulated user CPU time (`getrusage(RUSAGE_SELF)`,
+    /// exactly the C's measurement) and `SinceLastCall` is the delta since the previous read,
+    /// with the anchor starting at 0 — so the **first** read answers two equal elements,
+    /// matching `erts_runtime_elapsed_both` (`erts/emulator/beam/erl_time_sup.c:1421-1481`).
+    /// The clock is read through a [`RefCell`] so the `statistics/1` arm can call it with
+    /// `&self`, and it is the runtime's **one** clock, so the anchor persists across calls.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the clock's failure: a failing `getrusage(2)` is
+    /// [`BeamError::Io`] carrying the errno, never a silently fabricated `0` (the C aborts the
+    /// emulator at that point; this runtime returns the error instead).
+    pub(crate) fn cpu_time_statistics(&self) -> Result<(u64, u64)> {
+        self.cpu_clock.borrow_mut().runtime()
+    }
     /// The runtime's distributed node, when `-name`/`-sname` configured one.
     ///
     /// The observable surface of contract A.5's Phase 1: the node's name, its listen
@@ -1818,6 +1853,40 @@ mod tests {
         assert!(
             matches!(rt.stabilize_term(big), Err(BeamError::SystemLimit)),
             "an oversized return value is the documented system_limit, not a raw Alloc"
+        );
+    }
+
+    /// `erlang:statistics(runtime)` is read from the runtime's **one** long-lived CPU-time
+    /// clock, so its anchor persists: the first read's delta is the whole total (the clock's
+    /// anchor starts at 0, the C's `runtime_prev.data.user = 0`), and every later read's delta
+    /// is the increase since the previous read of the same clock. A clock rebuilt per call
+    /// would answer `total == since` every time.
+    #[test]
+    fn the_cpu_time_clock_anchors_across_statistics_reads() {
+        let rt = runtime();
+        let (total1, since1) = rt.cpu_time_statistics().expect("the first CPU-time read");
+        assert_eq!(
+            since1, total1,
+            "the first read's delta is the whole total (the clock anchor starts at 0)"
+        );
+
+        // Burn a little user CPU so the clock has something real to advance by, then read
+        // again from the **same** runtime (the same long-lived clock). `black_box` keeps the
+        // loop from being optimised out.
+        let mut spin: u64 = 0;
+        for i in 0..2_000_000u64 {
+            spin = std::hint::black_box(spin.wrapping_add(i ^ (spin >> 1)));
+        }
+
+        let (total2, since2) = rt.cpu_time_statistics().expect("the second CPU-time read");
+        assert!(
+            total2 >= total1,
+            "the process's user CPU time never goes backwards: {total2} >= {total1} (spin {spin})"
+        );
+        assert_eq!(
+            since2,
+            total2 - total1,
+            "a later read's delta is the increase since the previous read"
         );
     }
 

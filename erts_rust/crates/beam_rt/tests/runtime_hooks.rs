@@ -36,13 +36,12 @@
 //!   estimator read it. This runtime serves **only** the counters it can measure for real:
 //!   `run_queue` (its own single run queue: `beam_process`'s `Scheduler`), `wall_clock`
 //!   (the process monotonic clock), the cumulative counter pairs
-//!   `reductions`/`exact_reductions` and `context_switches`, `io` (the port subsystem's own
-//!   byte counters) and `scheduler_wall_time` (the atom `undefined` — this runtime never
-//!   enables it, exactly as the oracle answers when it is not enabled). Every other valid
-//!   key stays the honest typed gap, and a name that is not a statistics key at all is the
-//!   oracle's `badarg`. `runtime` (CPU time) is a documented gap: this crate is
-//!   `#![deny(unsafe_code)]` and cannot read a CPU clock, and wall-clock time must **not**
-//!   be substituted for it.
+//!   `reductions`/`exact_reductions` and `context_switches`, `runtime` (the user CPU time the
+//!   one long-lived `beam_io::cpu_time::RuntimeClock` measures with `getrusage(RUSAGE_SELF)`),
+//!   `io` (the port subsystem's own byte counters) and `scheduler_wall_time` (the atom
+//!   `undefined` — this runtime never enables it, exactly as the oracle answers when it is not
+//!   enabled). Every other valid key stays the honest typed gap, and a name that is not a
+//!   statistics key at all is the oracle's `badarg`.
 //!
 //! # What is compared, and what is recorded instead
 //!
@@ -217,11 +216,16 @@ io:format(\"~p~n\", [{In, Out, is_integer(InN), is_integer(OutN)}]), halt(0).";
 const EXPR_SCHEDULER_WALL_TIME: &str = "\
 io:format(\"~p~n\", [erlang:statistics(scheduler_wall_time)]), halt(0).";
 
+/// `statistics(runtime)`: a 2-tuple of integers (user CPU milliseconds; the values are
+/// volatile, so only the shape is pinned), in both runtimes.
+const EXPR_RUNTIME_SHAPE: &str = "\
+{T,S} = erlang:statistics(runtime), io:format(\"~p~n\", [{is_integer(T), is_integer(S)}]), halt(0).";
+
 /// A valid statistics key this runtime cannot measure: the honest typed capability gap.
 ///
-/// `runtime` is CPU time; this crate is `#![deny(unsafe_code)]` and no safe Rust API exposes a
-/// CPU clock, so it stays a gap rather than a wall-clock substitute.
-const EXPR_STATISTICS_GAP: &str = "erlang:statistics(runtime).";
+/// `garbage_collection` needs a real accumulative collector, which this runtime does not keep,
+/// so it stays a gap rather than a fabricated number.
+const EXPR_STATISTICS_GAP: &str = "erlang:statistics(garbage_collection).";
 
 /// A name that is not a statistics key at all: the oracle's `badarg` (exit 1).
 const EXPR_STATISTICS_BADARG: &str = "erlang:statistics(atom_count).";
@@ -311,6 +315,7 @@ fn the_served_statistics_shapes_match_the_live_oracle() {
             EXPR_CONTEXT_SWITCHES_SHAPE,
             "true",
         ),
+        ("statistics(runtime)", EXPR_RUNTIME_SHAPE, "{true,true}"),
         ("statistics(io)", EXPR_IO_SHAPE, "{input,output,true,true}"),
         ("statistics(scheduler_wall_time)", EXPR_SCHEDULER_WALL_TIME, "undefined"),
     ];
@@ -379,7 +384,7 @@ fn the_unmeasurable_and_invalid_statistics_keys_are_classified_honestly() {
         ours.err
     );
     assert!(
-        ours.err.contains("runtime"),
+        ours.err.contains("garbage_collection"),
         "the gap must name the counter: {}",
         ours.err
     );
@@ -390,12 +395,13 @@ fn the_unmeasurable_and_invalid_statistics_keys_are_classified_honestly() {
         assert!(ours.err.contains("badarg"), "{}", ours.err);
         return;
     };
-    // The oracle **accepts** `runtime` (it has the counters this runtime lacks), so the
-    // two runtimes differ by capability here — recorded, never asserted as agreement.
+    // The oracle **accepts** `garbage_collection` (it keeps the accumulative collector this
+    // runtime lacks), so the two runtimes differ by capability here — recorded, never
+    // asserted as agreement.
     let theirs = oracle_eval(&oracle, EXPR_STATISTICS_GAP);
     assert_eq!(theirs.code, 0, "oracle: exit {} — {}", theirs.code, theirs.err);
     eprintln!(
-        "note: statistics(runtime) — this runtime exit 3 (unsupported), oracle {} {:?}",
+        "note: statistics(garbage_collection) — this runtime exit 3 (unsupported), oracle {} {:?}",
         theirs.code, theirs.out
     );
 
