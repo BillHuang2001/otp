@@ -148,6 +148,99 @@ fn default_registry_contains_the_core_bifs() {
     assert_eq!(reg.entries().count(), reg.len());
 }
 
+/// The per-module shape of the assembled registry: every module in
+/// `default_registry()` with its key count, verbatim from the crate `CONTEXT.md`
+/// "the implemented BIFs (640)" census (26 modules).
+///
+/// This is the public-API complement of the crate-internal shadowing guard
+/// (`src/hook_sets.rs::tests::no_registration_body_shadows_another`). The internal
+/// guard proves the per-`register`-body rosters are pairwise disjoint;
+/// `BifRegistry::register` keeps the *last* implementation for a key, so an overlap
+/// would silently shadow the earlier one — and this pins each module's reachable key
+/// count in the assembled registry, so a key that stops being reachable under its own
+/// module, a wholesale rename, or a roster drifting from the documented census fails
+/// here rather than at runtime.
+const MODULE_KEY_COUNTS: &[(&str, usize)] = &[
+    ("atomics", 7),
+    ("binary", 25),
+    ("code", 7),
+    ("erl_ddll", 7),
+    ("erl_debugger", 13),
+    ("erlang", 281),
+    ("error_logger", 1),
+    ("erts_debug", 20),
+    ("erts_internal", 71),
+    ("erts_literal_area_collector", 2),
+    ("erts_trace_cleaner", 2),
+    ("ets", 59),
+    ("file", 1),
+    ("io", 3),
+    ("io_lib", 3),
+    ("lists", 45),
+    ("maps", 24),
+    ("math", 24),
+    ("net_kernel", 1),
+    ("os", 10),
+    ("persistent_term", 7),
+    ("prim_file", 4),
+    ("re", 8),
+    ("records", 8),
+    ("string", 1),
+    ("unicode", 6),
+];
+
+#[test]
+fn the_registry_matches_the_documented_per_module_census() {
+    let reg = default_registry();
+
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (module, _, _) in reg.names() {
+        *counts.entry(module).or_insert(0) += 1;
+    }
+    let expected: std::collections::BTreeMap<String, usize> = MODULE_KEY_COUNTS
+        .iter()
+        .map(|(module, count)| (module.to_string(), *count))
+        .collect();
+
+    assert_eq!(
+        counts, expected,
+        "the per-module key census drifted from CONTEXT.md"
+    );
+    // The pinned census is self-consistent with the registry size.
+    assert_eq!(
+        MODULE_KEY_COUNTS.iter().map(|(_, n)| n).sum::<usize>(),
+        reg.len()
+    );
+    assert_eq!(reg.len(), 640);
+}
+
+/// The registry resolves every key it advertises: `names()` (the enumeration a host
+/// gates on) and `lookup`/`contains` (the dispatch path) agree key-for-key, and no key
+/// is counted twice. A duplicate registration kept only the last implementation, so a
+/// *missing* advertised key is the observable symptom of a shadowed body.
+#[test]
+fn every_advertised_key_resolves_and_none_is_duplicated() {
+    let reg = default_registry();
+    let names = reg.names();
+
+    let mut distinct = std::collections::HashSet::new();
+    for (module, function, arity) in &names {
+        assert!(
+            distinct.insert((module.clone(), function.clone(), *arity)),
+            "{module}:{function}/{arity} is enumerated twice"
+        );
+        assert!(
+            reg.contains(module, function, *arity),
+            "{module}:{function}/{arity} is advertised but `contains` rejects it"
+        );
+        assert!(
+            reg.lookup(module, function, *arity).is_some(),
+            "{module}:{function}/{arity} is advertised but has no implementation"
+        );
+    }
+    assert_eq!(distinct.len(), reg.len(), "names() and len() must agree");
+}
+
 #[test]
 fn a_fresh_registry_is_empty_and_register_reports_the_previous_impl() {
     let mut reg = BifRegistry::new();
