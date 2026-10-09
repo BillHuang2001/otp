@@ -630,7 +630,14 @@ fn decompress_wrapper(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     }
     // `is_compressed_image` guarantees `bytes[..6]` is present.
     let size = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
-    let body = crate::compress::decompress(&bytes[6..])?;
+    // Inflate bounded by the declared size: the C allocates exactly `size` bytes and
+    // requires zlib to fill it (`dlen != dest_len` is an error, `external.c:1805-1810`),
+    // so a payload that inflates to more than the declaration is `badarg` too. Using the
+    // declaration (rather than `decompress`'s fixed 32 MiB ceiling) keeps a legitimately
+    // large payload — e.g. the 33 MiB binary `tests/compressed_oracle.rs` compresses —
+    // decodable, exactly as the oracle does (`external.c:1768-1781` measures the real
+    // uncompressed size instead of failing).
+    let body = crate::compress::decompress_bounded(&bytes[6..], size)?;
     if body.len() != size {
         return Err(bad_arg());
     }

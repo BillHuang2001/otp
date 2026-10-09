@@ -104,6 +104,44 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// Decompresses a zlib (RFC 1950) stream, refusing to inflate past `limit` bytes.
+///
+/// This is the bound the C actually applies when unwrapping a `COMPRESSED` image: it
+/// allocates exactly the 4-byte *declared* inner size and requires zlib to fill that
+/// buffer completely (`erl_zlib_uncompress(state->extp, &dlen, bytes, size) != Z_OK ||
+/// dlen != dest_len`, `external.c:1805-1810`). Inflating **more** than the declaration
+/// is therefore an error, and so is inflating less (the caller compares the returned
+/// length against the declaration).
+///
+/// Unlike [`decompress`]'s fixed [`MAX_UNCOMPRESSED`] ceiling — which the C only uses as
+/// a heuristic to decide whether to *pre-allocate* the declared size (`dest_len >
+/// 32*1024*1024`, `external.c:1768`) and which the C then bypasses by measuring the real
+/// uncompressed size first (`binary2term_uncomp_size`, `external.c:1741`) — this bound
+/// never rejects a legitimately large payload. Memory stays bounded by
+/// `min(actual, limit)` bytes: growth stops the moment `limit` is exceeded, so an
+/// inflated flow that never ends cannot exhaust memory.
+///
+/// Any zlib error (bad header, truncation, corrupt deflate block, bad Adler-32) or an
+/// inflated length `> limit` yields
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg). Never panics.
+pub fn decompress_bounded(data: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let mut decoder = ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        match decoder.read(&mut chunk) {
+            Ok(0) => return Ok(out),
+            Ok(read) => {
+                if out.len().saturating_add(read) > limit {
+                    return Err(bad_arg());
+                }
+                out.extend_from_slice(&chunk[..read]);
+            }
+            Err(_) => return Err(bad_arg()),
+        }
+    }
+}
+
 /// The `BeamError` a `level` outside [`MIN_LEVEL`]`..=`[`MAX_LEVEL`] yields.
 ///
 /// Exposed so [`crate::encode`]'s compressed entry points can reject an out-of-range
@@ -201,5 +239,36 @@ mod tests {
         for len in 0..packed.len() - 4 {
             assert_bad_arg(decompress(&packed[..len]));
         }
+    }
+
+    #[test]
+    fn decompress_bounded_inflates_exactly_within_its_limit() {
+        let data = vec![b'z'; 100_000];
+        let packed = compress(&data, 6).unwrap();
+        // The exact limit is fine; anything below it is rejected (the payload inflates
+        // past it), and the *empty* stream is only accepted at a limit of 0.
+        assert_eq!(decompress_bounded(&packed, data.len()).unwrap(), data);
+        assert_eq!(
+            decompress_bounded(&packed, data.len() + 1).unwrap(),
+            data,
+            "a limit larger than the payload is fine — the caller compares the length"
+        );
+        assert_bad_arg(decompress_bounded(&packed, data.len() - 1));
+        assert_bad_arg(decompress_bounded(&packed, 0));
+        assert!(decompress_bounded(&compress(&[], 6).unwrap(), 0)
+            .unwrap()
+            .is_empty());
+
+        // The bound never rejects a legitimately large payload, unlike the fixed
+        // `MAX_UNCOMPRESSED` ceiling of `decompress` (this is the divergence the
+        // `COMPRESSED` wrapper must not have — see `tests/compressed_oracle.rs`).
+        let big = vec![0u8; MAX_UNCOMPRESSED + 1];
+        let big_packed = compress(&big, 6).unwrap();
+        assert_bad_arg(decompress(&big_packed));
+        assert_eq!(
+            decompress_bounded(&big_packed, big.len()).unwrap(),
+            big,
+            "a payload above MAX_UNCOMPRESSED must inflate when the declared size says so"
+        );
     }
 }
