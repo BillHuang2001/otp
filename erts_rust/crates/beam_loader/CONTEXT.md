@@ -336,7 +336,21 @@ magnitude bytes; if `(byte>>5)==7` a `u`-tagged sub-varint gives `count = S+9` b
 carries `reg | (type_index << 10)` conceptually — but the loader keeps reg and `TypeIndex` **separate**
 in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag collapses to a plain
 `X`/`Y` operand (the type index is discarded).
-
+### Structural bounds enforced at decode (`src/decode.rs` / `src/lower.rs`)
+Mirrors the C reader's `LoadAssert`s, so a construct the C rejects is a typed error here too — never a
+silently-accepted wrong value:
+- a non-zero `f` label index `< label_count`, recursively inside a `z,1` list (`beam_file.c:2324-2331`);
+- `x`/`y` register index `< MAX_REG` (1024, `erl_vm.h:49`) and `z,2` float-register index `< MAX_REG`
+  (`beam_file.c:2335-2338,2381`);
+- `z,5` `tr` type index `< TypeTable.entries.len()` when the table is not a fallback (`beam_file.c:2437`);
+- `z,3` allocation list: `<= 4` entries (`beam_file.c:2241`), per-entry `number <= i32::MAX/3`
+  (`beam_file.c:2255-2256`) and running word total `<= i32::MAX` (`beam_file.c:2261-2274`) ⇒ `SystemLimit`;
+- a `z,1` argument list only in the instruction's final operand slot (`beam_file.c:2352`);
+- a `z,4` static-literal index `< the file's own LitT count` — checked in `src/lower.rs::build_module`
+  *before* synthesized literals are appended, so it covers `load`, `beam_rt`'s code-server path and
+  `beam_engine`'s test support (`beam_file.c:2412`);
+- a `z,4`/`h` magnitude that would truncate on the 32-bit `Operand` field ⇒ `SystemLimit` (never a
+  silently-wrapped, different-but-valid index).
 ## Design Decisions
 - **The opcode roster is embedded from `genop.tab`, not from generated C.** `Opcode` enumerates every
   generic opcode in `../../lib/compiler/src/genop.tab` (the checked-in, wire-frozen roster the compiler
