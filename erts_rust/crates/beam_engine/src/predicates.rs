@@ -69,6 +69,10 @@ pub(crate) fn is_tuple(x: Eterm) -> bool {
 ///
 /// The caller must pass `arity <= beam_term::MAX_ARITYVAL` (a larger arity can
 /// never match a real tuple header and would trip `beam_term`'s range assert).
+///
+/// For a **boxed** operand this is C's `test_arity` (`emu/instrs.tab:1055`) exactly
+/// — `tuple_val(p) == boxed_val(p)` — and it is strictly safer for an immediate,
+/// where C dereferences an out-of-term word (Handoff #6, behaviourally equivalent).
 pub(crate) fn is_tuple_arity(x: Eterm, arity: usize) -> bool {
     // SAFETY: as [`is_float`]; `arity` is bounded by the caller.
     unsafe { beam_term::is_tuple_arity(x, arity) }
@@ -154,6 +158,35 @@ mod tests {
         assert!(is_tuple_arity(t, 1));
         assert!(!is_tuple_arity(t, 2));
         assert!(!is_map(t));
+    }
+
+    #[test]
+    fn boxed_non_tuples_never_match_any_arity() {
+        // The equivalence with C's `test_arity` (`emu/instrs.tab:1055`): for a boxed
+        // operand both read the very same header word, which is an `ARITYVAL` only
+        // for a tuple — so a float / bignum / record never matches *any* arity.
+        let mut float_words = [beam_term::HEADER_FLONUM, make_small(0)];
+        let float = beam_term::make_boxed(float_words.as_mut_ptr());
+
+        let mut big_words = [
+            beam_term::make_header(1, beam_term::POS_BIG_SUBTAG),
+            make_small(0),
+        ];
+        let big = beam_term::make_boxed(big_words.as_mut_ptr());
+
+        let mut record_words = [
+            beam_term::make_header(2, beam_term::RECORD_SUBTAG),
+            make_small(0),
+            make_small(0),
+        ];
+        let record = beam_term::make_boxed(record_words.as_mut_ptr());
+
+        for x in [float, big, record] {
+            assert!(!is_tuple(x));
+            for arity in 0..=4 {
+                assert!(!is_tuple_arity(x, arity));
+            }
+        }
     }
 
     #[test]
