@@ -64,9 +64,10 @@ use beam_rt::{Runtime, RuntimeConfig};
 /// holds `bootstrap/`) is three ancestors up. The path is assembled from those ancestors
 /// rather than by concatenating `..` segments: an **absolute** path containing `..` currently
 /// trips an out-of-tree soundness bug on the engine's structured-raise path — a boot driven
-/// that way reports `beam_rt: allocation failure: message (…)` instead of the honest stop —
-/// so the suite must avoid it to measure the *boot chain* rather than that bug. (See the
-/// handoff note in `src/boot/CONTEXT.md`; the bug is owned by `beam_engine`.)
+/// that way exits 1 with `beam_rt: allocation failure: message (…)` instead of carrying the
+/// script through its 22 directives to `{progress,started}` — so the suite must avoid it to
+/// measure the *boot chain* rather than that bug. (See the handoff note in
+/// `src/boot/CONTEXT.md`; the bug is owned by `beam_engine`.)
 fn start_boot() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -336,7 +337,8 @@ fn the_real_start_boot_runs_to_completion() {
         "the boot chain ends at `{{progress,started}}`, found {:?}",
         script.instructions.last()
     );
-    // The directive the chain used to stop at really is the last `apply`.
+    // The last `apply` directive really is instruction 20 — the one the chain used to stop
+    // at before the native `file_server_2` service answered its `{open, …}`.
     assert!(
         matches!(
             script.instructions.get(20),

@@ -1064,9 +1064,10 @@ impl Runtime {
     /// The runtime boots first (the preloaded set and the system code path), the script is
     /// parsed into its typed form ([`crate::boot::bootscript::read`]) and then executed in
     /// instruction order ([`crate::boot::bootscript::execute`]). Execution stops at the
-    /// first directive that cannot run, returning its typed error — a real `start.boot`
-    /// loads every `primLoad` batch and then stops at the first directive M1 cannot run
-    /// (see the `bootscript` module docs). Nothing is printed.
+    /// first directive that cannot run, returning its typed error — the real `start.boot`
+    /// runs all 22 of its directives through to `{progress,started}`, and a script that
+    /// still needs machinery M1 does not have stops at the first such directive (see the
+    /// `bootscript` module docs). Nothing is printed.
     ///
     /// # Errors
     ///

@@ -57,9 +57,11 @@
 //!
 //! [`execute`] walks the instructions in order and returns the first error it meets —
 //! loading a module that is not on the code path, spawning a process whose function is not
-//! exported, or applying an MFA the runtime cannot run. This is the honest behaviour for
-//! a real `start.boot`: it loads every `primLoad` batch and then stops at the first
-//! directive that needs machinery this runtime does not have.
+//! exported, or applying an MFA the runtime cannot run. This is the honest behaviour: the
+//! real `start.boot` loads every `primLoad` batch, runs all three `kernelProcess`
+//! directives and reaches its final `{progress,started}`, and a script that still needs
+//! machinery this runtime does not have stops at the first such directive with its typed
+//! error rather than skipping it.
 //!
 //! # The directives that run processes advance the scheduler
 //!
@@ -263,7 +265,7 @@ impl BootStop {
     /// directive (an `M:F/A` or a `{kernelProcess,Name,…}`) and the error.
     ///
     /// The error is rendered by its [`Display`](std::fmt::Display), so a **structured** raise
-    /// reason (the boot chain's `noproc`) shows as `exit <structured reason>`. Use
+    /// reason (an `exit noproc`, say) shows as `exit <structured reason>`. Use
     /// [`describe_with`](Self::describe_with) to render the real reason term through a runtime.
     #[must_use]
     pub fn describe(&self) -> String {
@@ -274,10 +276,11 @@ impl BootStop {
     /// `runtime` when it carries one.
     ///
     /// A structured raise reason is an opaque term, so [`describe`](Self::describe) can only
-    /// show `exit <structured reason>`. This renders the real term — for the real `start.boot`
-    /// the `{noproc,{gen_server,call,[file_server_2,…]}}` of the failing `c:erlangrc/0` — so a
-    /// report names the failing call. A non-structured error, or a reason the printer itself
-    /// rejects, falls back to [`describe`](Self::describe) unchanged: never an invented reason.
+    /// show `exit <structured reason>`. This renders the real term — for a directive's unmet
+    /// `gen_server:call` the `{noproc,{gen_server,call,[Name,…]}}` that names the missing
+    /// server — so a report names the failing call. A non-structured error, or a reason the
+    /// printer itself rejects, falls back to [`describe`](Self::describe) unchanged: never an
+    /// invented reason.
     #[must_use]
     pub fn describe_with(&self, runtime: &mut Runtime) -> String {
         let Some(term) = crate::error::live_reason_term(&self.error) else {

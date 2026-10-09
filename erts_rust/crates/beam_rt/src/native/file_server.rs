@@ -23,9 +23,9 @@
 //! The last directive of the real `bootstrap/bin/start.boot` that does real work is
 //! `{apply,{c,erlangrc,[]}}`, and `c:erlangrc/0` (`lib/stdlib/src/c.erl:1049-1083`) reaches
 //! the file system through `file:path_eval/2` → `file:open/2` →
-//! `gen_server:call(file_server_2, {open,Name,ModeList}, infinity)`. Nothing in this
-//! runtime was ever registered under that name, so the call died with the oracle-shaped
-//! `{noproc,{gen_server,call,[file_server_2,…]}}` and the boot stopped.
+//! `gen_server:call(file_server_2, {open,Name,ModeList}, infinity)`. With nothing registered
+//! under that name the call dies with the oracle-shaped
+//! `{noproc,{gen_server,call,[file_server_2,…]}}` and the boot stops at that directive.
 //!
 //! This module supplies the missing **service process**: a [`beam_process::Process`] that
 //! is spawned, registered as `file_server_2` and kept **permanently `Runnable`** — never
