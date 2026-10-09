@@ -236,7 +236,8 @@ short form is the safe one. Repro:
   **skip loudly** when `erl`/`erlc` or the file are absent. The in-crate tests hand that path to `read`,
   never as a `-boot` CLI value, so its shape is not a factor here.
 - `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry;
-  `boot_from_script_reporting` is the boot-stop-position entry point.
+  `boot_from_script_reporting` is the boot-stop-position entry point, and the in-crate boot-script suite
+  exercises the `execute_reporting`/`BootStop` report API a genuine future stop would use.
 - `../tests/boot.rs` (integration, owned by this node): `start_boot()` builds a canonical, short `-boot`
   value (avoiding the heap-fragility above) and asserts the real-script stop is `stop.index == Some(20)`
   on the `{apply,{c,erlangrc,[]}}` directive, reporting the real `{noproc,…}` term; the `-boot` CLI drive;
