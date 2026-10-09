@@ -79,10 +79,11 @@
 //! The trampoline, the bitmask and the self-pipe's write end are **process-global** (they
 //! must be reachable from the handler without capturing a context). Only **one**
 //! [`SignalFacility`] should be alive at a time: a second [`SignalFacility::new`] re-points
-//! the global write end at its own pipe, so signals delivered while both exist would be
-//! reported by the newer facility. `Drop` restores only the signals *this* facility changed
-//! and, **only if the global write end still points at its own pipe**, clears that end and
-//! resets the pending bitmask — so a superseded facility neither re-points nor discards its
+//! the global write end at its own pipe, and — the pending bitmask being process-global too —
+//! a signal delivered while both exist is reported by whichever facility drains first (its
+//! byte lands in the newer facility's pipe). `Drop` restores only the signals *this* facility
+//! changed and, **only if the global write end still points at its own pipe**, clears that end
+//! and resets the pending bitmask — so a superseded facility neither re-points nor discards its
 //! successor's plumbing, and dropping/recreating a facility is safe. The runtime owns the one
 //! facility.
 //!
@@ -156,7 +157,13 @@ pub enum Signal {
     SigUsr2,
     /// `sigchld` — child status changed (`libc::SIGCHLD`).
     SigChld,
-    /// `sigstop` — stop (`libc::SIGSTOP`).
+    /// `sigstop` — stop (`libc::SIGSTOP`), one of the accepted names even though it is
+    /// **kernel-only**: `sigaction(2)` refuses *every* disposition change for it with
+    /// `EINVAL`, so this is the one accepted signal whose disposition provably cannot be
+    /// changed and [`SignalFacility::set`] with it always fails with
+    /// [`beam_common::BeamError::Io`]. The legacy C's `sys_signal` fails in exactly the same
+    /// way and *ignores* the result (`erts/emulator/sys/unix/sys.c:437-461`, `:754-767`),
+    /// which is how the oracle still answers `ok` for `os:set_signal(sigstop, _)`.
     SigStop,
     /// `sigtstp` — terminal stop (`libc::SIGTSTP`).
     SigTstp,
@@ -393,7 +400,9 @@ impl SignalFacility {
     /// `SA_RESTART` flag. `SA_RESTART` is chosen deliberately: the delivery channel is the
     /// self-pipe, so the runtime never needs `EINTR`-based logic, and auto-restarting an
     /// interrupted `read`/`write`/`poll` keeps a handled signal from disrupting unrelated
-    /// blocking I/O. (The legacy C's `sys_signal` sets `sa_flags = 0` and relies on explicit
+    /// blocking I/O. (The legacy C's `sys_signal` never sets `SA_RESTART`: its `sa_flags` is
+    /// `SA_ONSTACK` for a real handler when the JIT runs on native Erlang stacks and `0`
+    /// otherwise — `erts/emulator/sys/unix/sys.c:437-461` — and the C relies on explicit
     /// `EINTR` loops; `SA_RESTART` is this runtime's equivalent, documented choice.)
     ///
     /// The prior disposition is captured only the **first** time this facility changes a
@@ -401,7 +410,11 @@ impl SignalFacility {
     ///
     /// # Errors
     ///
-    /// `BeamError::Io` if `sigaction(2)` rejects the change.
+    /// `BeamError::Io` if `sigaction(2)` rejects the change. That is guaranteed for
+    /// [`Signal::SigStop`], the kernel-only signal whose disposition the kernel refuses to
+    /// change for *any* of the three dispositions (see [`Signal::SigStop`]) — the caller
+    /// decides what a refusal means there, exactly as the oracle's `ok` comes from the C
+    /// ignoring the failure.
     pub fn set(&mut self, sig: Signal, disp: Disposition) -> Result<()> {
         // SAFETY: `libc::sigaction` is a plain C struct of integer/pointer fields for which
         // an all-zero bit pattern is a valid, initialized value; `sa_sigaction`, `sa_flags`
@@ -620,6 +633,8 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
     use std::time::Duration;
 
+    use beam_common::BeamError;
+
     /// The process-global facility makes tests serialize on the installed dispositions and
     /// the shared self-pipe, so every test that creates a [`SignalFacility`] holds this
     /// lock. A poisoned lock (a test panicked while holding it) is recovered rather than
@@ -764,6 +779,35 @@ mod tests {
         facility
             .set(Signal::SigUsr1, Disposition::Default)
             .expect("restore");
+    }
+
+    #[test]
+    fn sigstop_is_the_one_accepted_signal_whose_disposition_cannot_change() {
+        let _guard = guard();
+        let mut facility = SignalFacility::new().expect("a self-pipe");
+        // `SIGSTOP` is kernel-only: `sigaction(2)` refuses *every* disposition change for it
+        // (`EINVAL`), so `set` answers the typed `BeamError::Io` instead of a silent success.
+        // The refusal must stay observable here — the caller decides what it means (the oracle
+        // answers `ok` because the C ignores the failed `sigaction`), so this layer never
+        // swallows it. Only the *disposition* is touched: `SIGSTOP` is never raised.
+        for disp in Disposition::ALL {
+            match facility.set(Signal::SigStop, disp) {
+                Err(BeamError::Io(_)) => {}
+                other => {
+                    panic!("sigstop's {disp:?} must be refused with BeamError::Io, got {other:?}")
+                }
+            }
+            // A refused install changed nothing and recorded no prior for `Drop` to restore.
+            assert_eq!(
+                facility.disposition(Signal::SigStop).expect("a query"),
+                Disposition::Default,
+                "sigstop keeps its immutable default"
+            );
+            assert!(
+                facility.prior[Signal::SigStop.bit() as usize].is_none(),
+                "a refused install records no prior"
+            );
+        }
     }
 
     #[test]
