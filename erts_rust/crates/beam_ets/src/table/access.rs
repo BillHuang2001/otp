@@ -26,6 +26,7 @@ use beam_common::Result;
 use beam_term::prelude::*;
 
 use super::{OwnerId, RenameOutcome, SetOpt, Table};
+use crate::kind::Access;
 use crate::select::{MatchContinuation, MatchSpec};
 
 /// An access-enforcing view over a [`Table`] for a specific requester process.
@@ -486,11 +487,24 @@ impl TableAccess<'_> {
         self.table.give_away(self.requester, new_owner)
     }
 
-    /// `ets:setopts/2` (the `{heir, ...}` option): the requester is the caller.
+    /// `ets:setopts/2` (the `{heir, ...}` and `{protection, Access}` options): the
+    /// requester is the caller.
     ///
     /// Requires the requester to be the table owner (`badarg` otherwise), exactly
     /// like the oracle; see [`Table::setopts`].
     pub fn setopts(&mut self, opt: SetOpt) -> Result<()> {
         self.table.setopts(self.requester, opt)
+    }
+
+    /// `ets:setopts(Tab, {protection, Access})`: an owner-gated access change.
+    ///
+    /// The oracle routes `{protection, _}` through `ets:setopts/2`, so this is
+    /// exactly [`SetOpt::Access`] with the requester supplied as the caller: the
+    /// requester must be the table owner (`badarg` otherwise, with the current
+    /// access mode unchanged — the gate runs before the mutation). Changing the
+    /// protection does **not** re-normalize the creation-time fine-locking flags;
+    /// see [`Table::set_access`].
+    pub fn set_access(&mut self, access: Access) -> Result<()> {
+        self.table.setopts(self.requester, SetOpt::Access(access))
     }
 }

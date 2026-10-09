@@ -35,6 +35,11 @@
 //!   ([`OrderedSetInterior`], the default) vs the sorted `Vec`
 //!   ([`SortedOrderedInterior`]).
 //!
+//! Both families time **`insert_new`** (the "add a key that is not there" path) on
+//! a disjoint key set in addition to `insert`, because `insert_new` is a distinct
+//! code path in every interior (the B+-tree's is a separate descent) and is the
+//! bulk-loading entry point (`ets:insert_new/2`).
+//!
 //! Run either with output:
 //! ```text
 //! erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets \
@@ -43,9 +48,15 @@
 //! Scale it with `BEAM_ETS_BENCH_SIZES=10,1000,100000,1000000` and restrict the
 //! shapes with `BEAM_ETS_BENCH_SHAPES=smallint,binary,tuple`.
 //!
+//! **Comparing two implementations** across processes needs
+//! `BEAM_ETS_BENCH_REPEATS=<passes>` (the reported figure is then the per-metric
+//! minimum over those passes, see [`repeats`]) and, for the ordered family, usually
+//! `BEAM_ETS_BENCH_INDEX=bplus` to leave the `O(n)`-per-op sorted `Vec` out of the
+//! run. A single pass is not comparable between runs on a shared machine.
+//!
 //! Each measurement also **asserts** the results (`size`, hit/miss answers,
-//! iteration count), so a wrong-but-fast index fails the run rather than winning
-//! the benchmark.
+//! iteration count, `insert_new`'s `true`/`false`), so a wrong-but-fast index fails
+//! the run rather than winning the benchmark.
 
 use std::time::Instant;
 use beam_term::bitstring::{heap_bits_size_words, write_binary};
@@ -127,6 +138,66 @@ fn shapes() -> Vec<Shape> {
     }
 }
 
+/// How many full measurement passes to run per cell. Default `1`.
+///
+/// The reported figure per cell is the **minimum** over the passes ([`Metrics::min`]),
+/// because a machine shared with other work can only ever make a pass *slower*: the
+/// minimum converges on the interference-free cost, while a mean (or a single pass)
+/// reports whatever contention happened to be present. Bump it with
+/// `BEAM_ETS_BENCH_REPEATS=7` when comparing two implementations across processes —
+/// a single pass is not comparable between runs.
+fn repeats() -> usize {
+    match std::env::var("BEAM_ETS_BENCH_REPEATS") {
+        Ok(spec) => {
+            let n: usize = spec
+                .trim()
+                .parse()
+                .expect("BEAM_ETS_BENCH_REPEATS is a pass count");
+            assert!(n >= 1, "BEAM_ETS_BENCH_REPEATS must be at least 1");
+            n
+        }
+        Err(_) => 1,
+    }
+}
+
+/// Which ordered interiors the `ordered_set` benchmark drives. Default `both`.
+///
+/// The sorted-`Vec` interior is `O(n)` per insert/delete, so it dominates a
+/// large-`n` run; `BEAM_ETS_BENCH_INDEX=bplus` (or `sorted`) measures one interior
+/// on its own, which is what an implementation A/B needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Indexes {
+    Both,
+    Bplus,
+    Sorted,
+}
+
+impl Indexes {
+    fn parse(spec: &str) -> Indexes {
+        match spec.trim() {
+            "both" => Indexes::Both,
+            "bplus" | "tree" => Indexes::Bplus,
+            "sorted" | "vec" => Indexes::Sorted,
+            other => panic!("BEAM_ETS_BENCH_INDEX: unknown interior {other:?}"),
+        }
+    }
+
+    fn measures_bplus(self) -> bool {
+        self != Indexes::Sorted
+    }
+
+    fn measures_sorted(self) -> bool {
+        self != Indexes::Bplus
+    }
+}
+
+fn indexes() -> Indexes {
+    match std::env::var("BEAM_ETS_BENCH_INDEX") {
+        Ok(spec) => Indexes::parse(&spec),
+        Err(_) => Indexes::Both,
+    }
+}
+
 /// Build `n` distinct keys of `shape`; `salt` shifts the key space so a second
 /// call with `salt = n` yields keys absent from the first.
 fn build_keys(shape: Shape, n: usize, atoms: &mut AtomTable, salt: u128) -> Keys {
@@ -181,6 +252,7 @@ fn build_keys(shape: Shape, n: usize, atoms: &mut AtomTable, salt: u128) -> Keys
 /// One interior's measurements for one (shape, size).
 struct Metrics {
     insert_ns: f64,
+    insert_new_ns: f64,
     hit_ns: f64,
     miss_ns: f64,
     iter_ns: f64,
@@ -188,13 +260,59 @@ struct Metrics {
     bytes_per_entry: f64,
 }
 
-/// Time `insert`, hit-lookup, miss-lookup, iteration and delete on `interior`,
-/// asserting the answers as it goes. The object stored for every key is the key
-/// itself, so the measurement is the *index* (key → object) cost only.
+impl Metrics {
+    /// The elementwise minimum of two passes over the same cell.
+    ///
+    /// Deliberate: a contended machine can only ever make a pass *slower*, so the
+    /// minimum over several passes is the interference-free estimate, whereas an
+    /// average reports the competition. (A *sub*-linear minimum would be a bug in
+    /// the interior, which the per-pass assertions catch.)
+    fn min(self, other: Metrics) -> Metrics {
+        Metrics {
+            insert_ns: self.insert_ns.min(other.insert_ns),
+            insert_new_ns: self.insert_new_ns.min(other.insert_new_ns),
+            hit_ns: self.hit_ns.min(other.hit_ns),
+            miss_ns: self.miss_ns.min(other.miss_ns),
+            iter_ns: self.iter_ns.min(other.iter_ns),
+            delete_ns: self.delete_ns.min(other.delete_ns),
+            bytes_per_entry: self.bytes_per_entry.min(other.bytes_per_entry),
+        }
+    }
+}
+
+/// Run [`measure`] on `repeats()` freshly built interiors and keep the per-metric
+/// minimum ([`Metrics::min`]).
+fn measure_best<I: Interior, F: FnMut() -> I>(
+    mut make: F,
+    present: &[Eterm],
+    missing: &[Eterm],
+    fresh: &[Eterm],
+    atoms: &AtomTable,
+) -> Metrics {
+    let mut best: Option<Metrics> = None;
+    for _ in 0..repeats() {
+        let mut interior = make();
+        let pass = measure(&mut interior, present, missing, fresh, atoms);
+        best = Some(match best {
+            Some(best) => best.min(pass),
+            None => pass,
+        });
+    }
+    best.expect("at least one measurement pass")
+}
+
+/// Time `insert`, `insert_new`, hit-lookup, miss-lookup, iteration and delete on
+/// `interior`, asserting the answers as it goes. The object stored for every key is
+/// the key itself, so the measurement is the *index* (key → object) cost only.
+///
+/// `present` are the keys the upsert/hit/miss/iterate/delete phases use; `fresh` is
+/// a **disjoint** key set the `insert_new` phase loads into the (by then emptied)
+/// interior, so every `insert_new` call takes the "key is new" path.
 fn measure<I: Interior>(
     interior: &mut I,
     present: &[Eterm],
     missing: &[Eterm],
+    fresh: &[Eterm],
     atoms: &AtomTable,
 ) -> Metrics {
     let n = present.len();
@@ -233,8 +351,34 @@ fn measure<I: Interior>(
     let delete_ns = start.elapsed().as_nanos() as f64 / nf;
     assert_eq!(interior.size(), 0, "every key must be removed");
 
+    // `insert_new` on an empty interior with a disjoint key set: every call adds a
+    // key (`true`), so the figure is the pure "insert a key that is absent" path.
+    assert_eq!(fresh.len(), n, "the insert_new key set matches the others");
+    let start = Instant::now();
+    for &key in fresh {
+        assert!(
+            interior.insert_new(key, key, atoms).unwrap(),
+            "a disjoint key must be new"
+        );
+    }
+    let insert_new_ns = start.elapsed().as_nanos() as f64 / nf;
+    assert_eq!(interior.size(), n, "every fresh key must be stored");
+    // …and a second pass over the same keys is refused (`false`) and stores nothing.
+    for &key in fresh {
+        assert!(
+            !interior.insert_new(key, key, atoms).unwrap(),
+            "an already-stored key must be refused"
+        );
+    }
+    assert_eq!(interior.size(), n, "a refused insert_new stores nothing");
+    for &key in fresh {
+        interior.delete(key, atoms).unwrap();
+    }
+    assert_eq!(interior.size(), 0, "the fresh keys must be removed again");
+
     Metrics {
         insert_ns,
+        insert_new_ns,
         hit_ns,
         miss_ns,
         iter_ns,
@@ -250,11 +394,12 @@ fn ns(v: f64) -> String {
 
 fn print_row(shape: Shape, index: &str, n: usize, m: &Metrics) {
     println!(
-        "{:<9} {:>9} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10.1}",
+        "{:<9} {:>9} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10.1}",
         shape.name(),
         n,
         index,
         ns(m.insert_ns),
+        ns(m.insert_new_ns),
         ns(m.hit_ns),
         ns(m.miss_ns),
         ns(m.iter_ns),
@@ -273,36 +418,40 @@ fn interior_microbenchmark() {
     println!("# beam_ets set-interior microbenchmark: chained (HashInterior) vs CHAMP (ChampInterior)");
     println!("# cells: ns per operation; last column: interior bytes per entry");
     println!(
-        "{:<9} {:>9} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "shape", "n", "index", "insert", "hit", "miss", "iter", "delete", "B/entry"
+        "{:<9} {:>9} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "shape", "n", "index", "insert", "insert_new", "hit", "miss", "iter", "delete", "B/entry"
     );
 
     for shape in shapes {
         for &n in &sizes {
             let present = build_keys(shape, n, &mut atoms, 0);
             let missing = build_keys(shape, n, &mut atoms, n as u128);
+            let fresh = build_keys(shape, n, &mut atoms, 2 * n as u128);
 
-            let chained = measure(
-                &mut HashInterior::new(TableKind::Set),
+            let chained = measure_best(
+                || HashInterior::new(TableKind::Set),
                 &present.keys,
                 &missing.keys,
+                &fresh.keys,
                 &atoms,
             );
-            let champ = measure(
-                &mut ChampInterior::new(),
+            let champ = measure_best(
+                ChampInterior::new,
                 &present.keys,
                 &missing.keys,
+                &fresh.keys,
                 &atoms,
             );
 
             print_row(shape, "chained", n, &chained);
             print_row(shape, "champ", n, &champ);
             println!(
-                "{:<9} {:>9} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+                "{:<9} {:>9} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
                 shape.name(),
                 n,
                 "champ/old",
                 ratio(champ.insert_ns, chained.insert_ns),
+                ratio(champ.insert_new_ns, chained.insert_new_ns),
                 ratio(champ.hit_ns, chained.hit_ns),
                 ratio(champ.miss_ns, chained.miss_ns),
                 ratio(champ.iter_ns, chained.iter_ns),
@@ -341,56 +490,73 @@ fn shuffled(keys: &[Eterm], seed: u64) -> Vec<Eterm> {
 /// It uses the same sizes as the `set` benchmark (`10`, `1e3`, `1e5` by default).
 /// It is the crate's *slow* benchmark because the sorted-`Vec` interior shifts the
 /// whole tail on every insert/delete (`O(n)`); iterate with
-/// `BEAM_ETS_BENCH_SIZES=10,1000,10000` to keep it quick, or extend the list for a
-/// scale curve.
+/// `BEAM_ETS_BENCH_SIZES=10,1000,10000` to keep it quick, extend the list for a
+/// scale curve, or measure one interior at a time with
+/// `BEAM_ETS_BENCH_INDEX=bplus`/`sorted` (see [`Indexes`]).
 #[test]
 fn ordered_interior_microbenchmark() {
     let sizes = sizes();
     let shapes = shapes();
+    let indexes = indexes();
     let mut atoms = AtomTable::new();
 
     println!();
     println!("# beam_ets ordered_set-interior microbenchmark: B+-tree (OrderedSetInterior) vs sorted Vec (SortedOrderedInterior)");
     println!("# keys are driven in a shuffled order (see `shuffled`); cells: ns per operation");
     println!(
-        "{:<9} {:>9} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "shape", "n", "index", "insert", "hit", "miss", "iter", "delete", "B/entry"
+        "{:<9} {:>9} {:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "shape", "n", "index", "insert", "insert_new", "hit", "miss", "iter", "delete", "B/entry"
     );
 
     for shape in shapes {
         for &n in &sizes {
             let present = build_keys(shape, n, &mut atoms, 0);
             let missing = build_keys(shape, n, &mut atoms, n as u128);
+            let fresh = build_keys(shape, n, &mut atoms, 2 * n as u128);
             let present_keys = shuffled(&present.keys, 0x9E37_79B9_7F4A_7C15);
             let missing_keys = shuffled(&missing.keys, 0x2545_F491_4F6C_DD1D);
+            let fresh_keys = shuffled(&fresh.keys, 0x6C07_8965_CA92_A6ED);
 
-            let tree = measure(
-                &mut OrderedSetInterior::new(),
-                &present_keys,
-                &missing_keys,
-                &atoms,
-            );
-            let sorted = measure(
-                &mut SortedOrderedInterior::new(),
-                &present_keys,
-                &missing_keys,
-                &atoms,
-            );
+            let tree = indexes.measures_bplus().then(|| {
+                measure_best(
+                    OrderedSetInterior::new,
+                    &present_keys,
+                    &missing_keys,
+                    &fresh_keys,
+                    &atoms,
+                )
+            });
+            let sorted = indexes.measures_sorted().then(|| {
+                measure_best(
+                    SortedOrderedInterior::new,
+                    &present_keys,
+                    &missing_keys,
+                    &fresh_keys,
+                    &atoms,
+                )
+            });
 
-            print_row(shape, "bplus", n, &tree);
-            print_row(shape, "sorted", n, &sorted);
-            println!(
-                "{:<9} {:>9} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
-                shape.name(),
-                n,
-                "sorted/tree",
-                ratio(sorted.insert_ns, tree.insert_ns),
-                ratio(sorted.hit_ns, tree.hit_ns),
-                ratio(sorted.miss_ns, tree.miss_ns),
-                ratio(sorted.iter_ns, tree.iter_ns),
-                ratio(sorted.delete_ns, tree.delete_ns),
-                ratio(sorted.bytes_per_entry, tree.bytes_per_entry),
-            );
+            if let Some(tree) = &tree {
+                print_row(shape, "bplus", n, tree);
+            }
+            if let Some(sorted) = &sorted {
+                print_row(shape, "sorted", n, sorted);
+            }
+            if let (Some(tree), Some(sorted)) = (&tree, &sorted) {
+                println!(
+                    "{:<9} {:>9} {:<8} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+                    shape.name(),
+                    n,
+                    "sorted/tree",
+                    ratio(sorted.insert_ns, tree.insert_ns),
+                    ratio(sorted.insert_new_ns, tree.insert_new_ns),
+                    ratio(sorted.hit_ns, tree.hit_ns),
+                    ratio(sorted.miss_ns, tree.miss_ns),
+                    ratio(sorted.iter_ns, tree.iter_ns),
+                    ratio(sorted.delete_ns, tree.delete_ns),
+                    ratio(sorted.bytes_per_entry, tree.bytes_per_entry),
+                );
+            }
         }
     }
     println!();

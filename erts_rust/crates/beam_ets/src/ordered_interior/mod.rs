@@ -353,6 +353,79 @@ mod tests {
         t.tree.check_invariants(&atoms);
     }
 
+    /// An upsert replaces the **key term** as well as the object, and an insert
+    /// only rewrites the branch separators whose child subtree maximum actually
+    /// moved — so a separator that should have moved must not be left holding the
+    /// term of the object the caller just replaced (which the table layer reclaims).
+    ///
+    /// Small-int keys cannot show this: equal small ints are the *same* word, so a
+    /// stranded separator still reads back as the right key. This test drives the
+    /// case that can: every key term is replaced by a freshly boxed float of the
+    /// same arithmetic value (`1` and `1.0` are the same `ordered_set` key but
+    /// different words), one key at a time, checking the full tree invariants — which
+    /// since the term-identity half of `check_invariants` also asserts that every
+    /// separator *is* its child subtree's live maximum term — after every step.
+    #[test]
+    fn an_upsert_that_moves_a_subtree_maximum_leaves_every_separator_live() {
+        let atoms = AtomTable::new();
+        let n = 1_000i64;
+        // Two passes of 2-element object tuples (3 words each) plus slack.
+        let mut heap = Heap::new(8 * n as usize + 64);
+        let mut t = OrderedSetInterior::new();
+        for k in 0..n {
+            let o = object(&mut heap, k, k * 10);
+            assert!(t.insert_new(make_small(k), o, &atoms).unwrap());
+        }
+        t.tree.check_invariants(&atoms);
+        assert!(
+            t.tree.height() >= 3,
+            "the case needs real branches, not a single leaf"
+        );
+
+        // Replace every key with a fresh float term of the same arithmetic value.
+        // The float terms are leaked (they must outlive the tree's use of them).
+        let mut replacements: Vec<(i64, Eterm)> = Vec::with_capacity(n as usize);
+        for k in shuffled(n, 7) {
+            let key = float_term(k as f64);
+            let o = heap
+                .tuple(&[key, make_small(k * 10)])
+                .expect("the arena was sized for every object");
+            t.insert(key, o, &atoms).unwrap();
+            assert_eq!(t.size(), n as usize, "an upsert adds no key");
+            replacements.push((k, key));
+            t.tree.check_invariants(&atoms);
+        }
+        assert_eq!(t.size(), n as usize, "no upsert changed the key count");
+
+        // The observable key terms followed their objects: `first`/`last` report the
+        // *replacement* float words (not the original small ints), and an arithmetic
+        // lookup by the original small-int key still resolves.
+        let lowering = |k: i64| -> Eterm {
+            replacements
+                .iter()
+                .find(|(other, _)| *other == k)
+                .map(|(_, key)| *key)
+                .expect("every key was replaced")
+        };
+        assert_eq!(t.first(&atoms), Some(lowering(0)), "0 is the minimum");
+        assert_eq!(
+            t.last(&atoms),
+            Some(lowering(n - 1)),
+            "{} is the maximum",
+            n - 1
+        );
+        assert_eq!(t.lookup(make_small(0), &atoms).len(), 1);
+        assert_eq!(t.lookup(make_small(n - 1), &atoms).len(), 1);
+
+        // Drain it, checking the invariants as the tree rebalances back to one leaf.
+        for (_, key) in &replacements {
+            t.delete(*key, &atoms).unwrap();
+            t.tree.check_invariants(&atoms);
+        }
+        assert_eq!(t.size(), 0);
+        assert!(t.first(&atoms).is_none());
+    }
+
     #[test]
     fn iterates_in_ascending_arithmetic_key_order_across_classes() {
         let mut atoms = AtomTable::new();

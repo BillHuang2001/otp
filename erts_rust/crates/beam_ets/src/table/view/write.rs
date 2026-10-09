@@ -312,9 +312,18 @@ impl<'g> TableWrite<'g> {
         self.guard.give_away(caller, new_owner)
     }
 
-    /// `ets:setopts/2` for the `{heir, ...}` option, with `caller` supplied
-    /// explicitly.
+    /// `ets:setopts/2` for the modelled options (`{heir, ...}` and
+    /// `{protection, Access}`), with `caller` supplied explicitly.
     pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()> {
         self.guard.setopts(caller, opt)
+    }
+
+    /// Set the current access mode directly (owner-level primitive, no gate).
+    ///
+    /// The access-checked `ets:setopts(Tab, {protection, Access})` form is
+    /// [`TableWrite::setopts`] with [`SetOpt::Access`]; see [`Table::set_access`]
+    /// for why the creation-time fine-locking flags are unaffected.
+    pub fn set_access(&mut self, access: Access) {
+        self.guard.set_access(access)
     }
 }

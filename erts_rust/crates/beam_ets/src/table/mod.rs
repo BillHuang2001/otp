@@ -129,8 +129,22 @@ impl OwnerId {
 pub struct Table {
     /// The table identifier.
     id: TableId,
-    /// The parsed `ets:new/2` options.
+    /// The parsed `ets:new/2` options. This is the **creation-time** model: the
+    /// fine-locking normalization ([`TableOptions::write_concurrency`] &c.) reads
+    /// [`TableOptions::access`] and is therefore never recomputed — see
+    /// [`Table::access`].
     opts: TableOptions,
+    /// The **current** access mode (`ets:info/2`'s `protection`).
+    ///
+    /// Initialised from [`TableOptions::access`] at build time and changed only by
+    /// [`Table::set_access`] / [`Table::setopts`]'s `{protection, …}` option. It is
+    /// deliberately *not* written back into the `opts` field: the oracle does **not**
+    /// re-normalize the fine-locking flags when the protection changes at runtime,
+    /// so a `public` table created with `{write_concurrency, true}` and then moved
+    /// to `private` still reports `write_concurrency => true` (probed against the
+    /// live `erl`), while a table *created* `private` with the same option reports
+    /// `false`.
+    access: Access,
     /// The owning process, if known.
     owner: Option<OwnerId>,
     /// The heir installed with `ets:setopts/2` / the creation-time `{heir, …}`
@@ -255,6 +269,7 @@ impl Table {
         let heir = Table::copy_heir(&mut store, opts.heir())?;
         Ok(Table {
             id,
+            access: opts.access(),
             opts,
             owner: None,
             heir,
@@ -301,9 +316,33 @@ impl Table {
         self.opts.keypos()
     }
 
-    /// The access mode.
+    /// The **current** access mode (`ets:info/2`'s `protection`).
+    ///
+    /// Initially the creation-time [`TableOptions::access`] and changed at runtime
+    /// by [`set_access`](Table::set_access) / [`setopts`](Table::setopts). Note the
+    /// fine-locking flags are *not* affected: they keep the creation-time
+    /// normalization recorded in the `opts` field.
     pub fn access(&self) -> Access {
-        self.opts.access()
+        self.access
+    }
+
+    /// Set the access mode directly (**owner-level primitive**; no access check).
+    ///
+    /// This is the primitive behind `ets:setopts(Tab, {protection, Access})`, the
+    /// counterpart of [`set_owner`](Table::set_owner)/[`set_heir`](Table::set_heir):
+    /// the BIF layer routes its access-checked form through
+    /// [`setopts`](Table::setopts) (or [`TableAccess::set_access`](TableAccess)) so
+    /// the owner gate is applied.
+    ///
+    /// **Only the access mode changes.** The creation-time fine-locking
+    /// normalization in [`TableOptions`] is left untouched, exactly like the oracle:
+    /// `ets:setopts(T, {protection, private})` on a `public` table created with
+    /// `{write_concurrency, true}` leaves `ets:info(T, write_concurrency)` and
+    /// `ets:info(T, decentralized_counters)` at `true`, whereas a table *created*
+    /// `private` with that option reports `false` (both probed against the live
+    /// `erl`).
+    pub fn set_access(&mut self, access: Access) {
+        self.access = access;
     }
 
     /// The owning process, if known.
@@ -368,13 +407,21 @@ impl Table {
         self.replace_heir(heir);
     }
 
-    /// `ets:setopts/2` for the `{heir, ...}` option: requires `caller` to be the
-    /// current owner (`badarg` otherwise), then installs/clears the heir.
+    /// `ets:setopts/2` for the modelled options: requires `caller` to be the
+    /// current owner (`badarg` otherwise), then applies the option.
     ///
     /// `SetOpt::Heir` carries the option's arity in [`Heir::data`]: `Some(term)` for
     /// `{heir, Pid, Data}` and `None` for `{heir, Pid}`. Like the primitive it
     /// reclaims the outgoing heir's copy, and like the primitive it does **not** copy
     /// the incoming gift data (prefer [`install_heir`](Table::install_heir)).
+    ///
+    /// `SetOpt::Access` is `{protection, Access}`: it moves the table's *current*
+    /// access mode ([`set_access`](Table::set_access)) and nothing else — the
+    /// creation-time concurrency normalization is deliberately left alone, matching
+    /// the oracle (see [`SetOpt::Access`] and [`Table::set_access`]).
+    ///
+    /// The owner gate runs **before** any mutation, so a denied call changes
+    /// nothing.
     pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()> {
         if caller != self.owner {
             return Err(badarg());
@@ -382,6 +429,7 @@ impl Table {
         match opt {
             SetOpt::Heir(heir) => self.replace_heir(Some(heir)),
             SetOpt::ClearHeir => self.replace_heir(None),
+            SetOpt::Access(access) => self.set_access(access),
         }
         Ok(())
     }
@@ -393,7 +441,7 @@ impl Table {
             name: self.opts.name(),
             kind: self.opts.kind(),
             keypos: self.opts.keypos(),
-            access: self.opts.access(),
+            access: self.access,
             size: self.interior.size(),
             memory: self.memory(),
             owner: self.owner,
@@ -632,7 +680,7 @@ impl Table {
     /// Whether `requester` may **read** the table; an access violation is
     /// `BeamError::BadArg`, matching how `ets` reports it.
     pub fn check_read(&self, requester: Option<OwnerId>) -> Result<()> {
-        if can_read(self.opts.access(), self.owner, requester) {
+        if can_read(self.access, self.owner, requester) {
             Ok(())
         } else {
             Err(badarg())
@@ -642,7 +690,7 @@ impl Table {
     /// Whether `requester` may **write** the table; an access violation is
     /// `BeamError::BadArg`, matching how `ets` reports it.
     pub fn check_write(&self, requester: Option<OwnerId>) -> Result<()> {
-        if can_write(self.opts.access(), self.owner, requester) {
+        if can_write(self.access, self.owner, requester) {
             Ok(())
         } else {
             Err(badarg())
@@ -985,5 +1033,77 @@ mod tests {
                 Err(BeamError::BadArg)
             ));
         }
+    }
+
+    /// `set_access` is the owner-level primitive (no access check) and the current
+    /// access mode — `access()` and `info().access` — follows it.
+    #[test]
+    fn set_access_is_the_owner_level_primitive() {
+        let mut t = table(TableKind::Set);
+        assert_eq!(t.access(), Access::Protected, "the default access mode");
+        assert_eq!(t.info().access, Access::Protected);
+
+        t.set_access(Access::Public);
+        assert_eq!(t.access(), Access::Public);
+        assert_eq!(t.info().access, Access::Public, "info reports the current mode");
+
+        // No owner is involved: the primitive is what the runtime itself uses.
+        assert_eq!(t.owner(), None);
+        t.set_access(Access::Private);
+        assert_eq!(t.access(), Access::Private);
+        assert_eq!(t.info().access, Access::Private);
+    }
+
+    /// A **runtime** protection change must not re-normalize the creation-time
+    /// fine-locking flags (`write_concurrency` / `decentralized_counters`).
+    ///
+    /// Oracle-verified: a `public` table created with `{write_concurrency, true}`
+    /// and then moved to `private` still reports `write_concurrency => true`, while
+    /// a table *created* `private` with the same option reports `false`. Modelling
+    /// the change as a mutation of [`TableOptions`] would retro-flip them.
+    #[test]
+    fn a_runtime_protection_change_does_not_renormalize_the_fine_locking_flags() {
+        // Created `public` + `{write_concurrency, true}`: the flags are on.
+        let mut opts = TableOptions::new();
+        opts.set_kind(TableKind::Set)
+            .set_access(Access::Public)
+            .set_write_concurrency(true);
+        let mut t = Table::new(TableId::next(), opts).expect("a fresh table");
+        assert!(t.info().write_concurrency, "public: the flag is on");
+
+        t.set_access(Access::Private);
+        assert_eq!(t.access(), Access::Private, "the access mode did change");
+        assert!(
+            t.info().write_concurrency,
+            "the runtime move to `private` must NOT re-normalize `write_concurrency`"
+        );
+
+        // The same option on a table *created* `private` normalizes the flag off.
+        let mut opts = TableOptions::new();
+        opts.set_kind(TableKind::Set)
+            .set_access(Access::Private)
+            .set_write_concurrency(true);
+        let created_private = Table::new(TableId::next(), opts).expect("a fresh table");
+        assert_eq!(created_private.access(), Access::Private);
+        assert!(
+            !created_private.info().write_concurrency,
+            "creation-time `private` forces `write_concurrency` off"
+        );
+
+        // `decentralized_counters` is derived from the same un-renormalized flag: an
+        // `ordered_set` (whose default is `true`) keeps it `true` across the move.
+        let mut opts = TableOptions::new();
+        opts.set_kind(TableKind::OrderedSet)
+            .set_access(Access::Public)
+            .set_write_concurrency(true);
+        let mut ordered = Table::new(TableId::next(), opts).expect("a fresh table");
+        assert!(ordered.info().decentralized_counters);
+        ordered.set_access(Access::Private);
+        assert_eq!(ordered.access(), Access::Private);
+        assert!(ordered.info().write_concurrency);
+        assert!(
+            ordered.info().decentralized_counters,
+            "the runtime move must not drop `decentralized_counters` either"
+        );
     }
 }
