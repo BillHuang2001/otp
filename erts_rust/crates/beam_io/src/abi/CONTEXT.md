@@ -86,9 +86,9 @@ Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p b
 - `job.rs` → `AsyncJobs`, `AsyncCompletion`, `AsyncData`, `KeepAlive`
 - `port.rs` → `DriverPort`, `load`/`from_library`/`poll_async`/`write_driver`, `make_loaded`, `LibraryKeepAlive`, the `stop_select` firing, `driver_flags`/`is_start_failure`/`load_failure`
 - `table.rs` → `DriverTable`, `RegisteredDriver`, `entry_identity`
-- `../../../tests/abi_driver.rs` (16), `../../../tests/abi_async.rs` (8), `../../../tests/abi_vector.rs` (7), `../../../tests/driver_table.rs` (5), `../../../tests/driver_registry_slots.rs` (3) → the end-to-end C-driver suites (parent node)
-- `../../../tests/fixture_builds.rs` (6) + `../../../tests/fixtures/{host_driver.c,host_driver_no_ready_async.c,vector_driver.c}` → the `cc`-built C-driver fixtures, with a load assertion
-- `../../../tests/cdriver/mod.rs` → the shared C-driver helpers (`compile_so`/`load_driver`/`open_port`/`round_data`/`await_log_line`/`logged_port_command`/`LoggedPort`)
+- `../../../tests/abi_driver.rs` (16), `../../../tests/abi_async.rs` (8), `../../../tests/abi_vector.rs` (7), `../../../tests/abi_lifecycle.rs` (3, port-exit + `take_exit_status`), `../../../tests/abi_start_failure.rs` (2, failing-`start` sentinels), `../../../tests/driver_table.rs` (5), `../../../tests/driver_registry_slots.rs` (3) → the end-to-end C-driver suites (parent node)
+- `../../../tests/fixture_builds.rs` (7) + `../../../tests/fixtures/{host_driver.c,host_driver_no_ready_async.c,host_driver_no_process_exit.c,vector_driver.c}` → the `cc`-built C-driver fixtures, with a load assertion (`host_driver.c` exposes the `HOST_DRIVER_{READY_ASYNC,PROCESS_EXIT,EMERGENCY_CLOSE}_SLOT` override macros its variants define)
+- `../../../tests/cdriver/mod.rs` → the shared C-driver helpers (`compile_so`/`load_driver`/`open_port`/`round_data`/`await_log_line`/`logged_port_command`/`LoggedPort` + the `variant_fixture_*`/`no_process_exit_variant_fixture_*` builders)
 
 ## See Also
 - `../../CONTEXT.md` → the `beam_io` crate root: the `Driver`/`DriverContext` seam, `PortRegistry`, `Port`/`pub(crate) PortArms`, `DriverRegistry`.
