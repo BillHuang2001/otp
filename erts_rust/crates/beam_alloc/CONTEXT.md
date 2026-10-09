@@ -354,7 +354,7 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - `src/strategy.rs` → `Strategy` selector (implementation module; A.6 config fidelity)
 - `src/mseg.rs` → facade for the mmap segment allocator; `src/mseg/{mapping,header,config,state,allocator}.rs`
 - `src/error.rs` → `pub(crate)` allocation-failure constructors (no new error enum)
-- `tests/` → crate-level integration tests (`allocator.rs`, `heap.rs`, `hot_path.rs`)
+- `tests/` → crate-level integration tests (`allocator.rs`, `heap.rs`, `reserved_heap.rs`, `hot_path.rs`)
 - `../../erts/emulator/beam/erl_alloc_util.c` → legacy carrier framework being mirrored (read-only)
 - `../../erts/emulator/beam/erl_alloc.types` → the type/class/allocator inventory source (read-only)
 - `../../erts/emulator/beam/erl_mseg.c` → legacy segment allocator being mirrored (read-only)
