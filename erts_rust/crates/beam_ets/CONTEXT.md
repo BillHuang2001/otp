@@ -453,6 +453,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   lock-step behind a `Barrier`, exact serial outcome), `concurrent_counter_increments_lose_no_updates`
   (8×500 with the exact multiset of returned values), `readers_see_only_consistent_states_under_writer_
   churn` and `concurrent_counter_total_agrees_with_the_live_oracle`); `tests/ets_fixtable.rs` (5 cases).
+  Plus `tests/ets_concurrency.rs` (7 cases): the coarse-lock scope (an exclusive write guard on one
+  table does not block writers on other tables; a writer on a held table blocks until release), sharded
+  serial-equivalence, lossless `insert_new`/`update_counter`/`select_replace` check-then-act under one
+  guard, and 3 extra `compile_fail` doctests proving an iterator/term/accumulator cannot escape a view.
 
 ## Test Strategy
 - Per-module `#[cfg(test)]` tests in every `src/` module (`store/tests.rs`, `kind/tests.rs`,
