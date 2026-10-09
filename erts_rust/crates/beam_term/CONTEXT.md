@@ -647,9 +647,13 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   over exactly the fields `compare` compares (so `eq ⇒ equal hash`, with the same `External`-last /
   kind-rank rules); native records hash over exactly the fields `cmp_records` compares (their content —
   the definition address is never mixed, so a record equals its copy hash-wise and `beam_ets`'s CHAMP
-  invariant holds). External pid/port/ref carry no pointer in their words, so their raw-word hash is
-  already content-stable; on-heap bin refs use an opaque raw-word fallback, so their hash is not stable
-  across processes/images.
+  invariant holds). External pid/port carry no pointer in their words, so their raw-word hash is
+  content-stable; internal refs and on-heap bin refs use an opaque raw-word fallback, so their hash is
+  not stable across processes/images. One marginal `eq ⇒ equal hash` gap: `hash_words` mixes the
+  external-ref block's header/arity, but `cmp_external_refs` (`src/compare.rs`) trims the longer id
+  slice's leading **zero** ids, so two external refs of different id-array lengths whose extra ids are
+  zero compare `Equal` yet hash differently. Reachable only with a forged/foreign ref (a real ref from
+  a given node always has one id length), so it is not observed through the safe API.
 - **Object-size approximation (`src/size.rs`).** Native records are treated like tuples (their
   field-table layout is not modelled).
 - **The HAMT is `erts_map_hash`-driven (`src/map.rs` + `src/ihash.rs`).** The map trie is placed by
