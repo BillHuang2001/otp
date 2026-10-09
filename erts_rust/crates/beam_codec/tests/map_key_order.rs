@@ -18,8 +18,9 @@
 //
 // %CopyrightEnd%
 
-//! The `MAP_EXT` (`116`) **key-order contract**: the codec *preserves* a flat map's
-//! stored pair order and never sorts or canonicalises it.
+//! The `MAP_EXT` (`116`) **key-order contract**: the encoder *preserves* a flat map's
+//! stored pair order and never sorts or canonicalises it, while the **decoder**
+//! canonicalises an incoming `MAP_EXT` exactly as ERTS does.
 //!
 //! ## Who owns the order
 //!
@@ -30,21 +31,28 @@
 //! (`erts_cmp`). A larger map is a **hash map** (HAMT), traversed in node-slot order
 //! (`external.c:3746-3823`).
 //!
-//! The encoder emits a flat map's pairs **in that stored order** (`external.c:3746-3769`
-//! — `flatmap_get_keys`/`flatmap_get_values`, `ENC_MAP_PAIR`, no sort unless the
-//! `deterministic` dflag is set). So *sorting is the constructor's job*, not the codec's:
-//! [`beam_term::map::write_map`] is what applies `cmp_flatmap_keys`, and every map built
-//! through the compiled path already carries ERTS's order. `beam_codec` therefore only
-//! *preserves* whatever order its input term stores — which is exactly what makes
-//! decode → re-encode **byte-stable** (see [`flatmap_pairs_encode_in_stored_order`] and
+//! The **encoder** emits a flat map's pairs **in that stored order**
+//! (`external.c:3746-3769` — `flatmap_get_keys`/`flatmap_get_values`, `ENC_MAP_PAIR`, no
+//! sort unless the `deterministic` dflag is set). So *sorting is the constructor's job*,
+//! not the encoder's: [`beam_term::map::write_map`] is what applies `cmp_flatmap_keys`,
+//! and every map built through the compiled path already carries ERTS's order.
+//! `beam_codec`'s encoder therefore only *preserves* whatever order its input term
+//! stores — which is exactly what makes decode → re-encode **byte-stable** (see
+//! [`flatmap_pairs_encode_in_stored_order`] and
 //! [`oracle_and_our_encoder_agree_for_integer_keyed_maps`]).
 //!
-//! **Sorting inside `beam_codec` would be wrong.** It breaks the byte-exact fixture
-//! `tests/ground_truth.rs::literals_gen_server_decodes_with_its_export_funs` — a real
-//! `gen_server` literal pool whose map wire order is *not* this crate's atom-table index
-//! order — and the live `interop` harness. (Confirmed by a throwaway experiment that
-//! sorted in `encode_map`: those two tests fail; the change was reverted. See the crate
-//! `CONTEXT.md`, "Map key encode order".)
+//! The **decoder** is the other half: `binary_to_term/1` canonicalises a `MAP_EXT` the
+//! way the C does — a ≤ 32-pair flat map is sorted into `erts_cmp_flatmap_keys` order
+//! (`erts_validate_and_sort_flatmap`, `external.c:5425-5453`), a larger one is rebuilt as
+//! a HAMT, and a **duplicate key** is `badarg`. A decode → re-encode therefore stays
+//! byte-stable for oracle-produced (already-canonical) input.
+//!
+//! **Sorting inside the `beam_codec` *encoder* would be wrong.** It breaks the byte-exact
+//! fixture `tests/ground_truth.rs::literals_gen_server_decodes_with_its_export_funs` — a
+//! real `gen_server` literal pool whose map wire order is *not* this crate's atom-table
+//! index order — and the live `interop` harness. (Confirmed by a throwaway experiment
+//! that sorted in `encode_map`: those two tests fail; the change was reverted. See the
+//! crate `CONTEXT.md`, "Map key encode order".)
 //!
 //! ## Why atom-keyed multi-key maps cannot be byte-compared across implementations
 //!

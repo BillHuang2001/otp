@@ -34,11 +34,12 @@
 //!
 //! Coverage: boundary integers (small/`INTEGER_EXT`/bignum/sign), bignums across the
 //! wire byte-count boundaries including high-zero stripping, every atom tag (short,
-//! long, multi-byte UTF-8, plus Latin-1), floats including `±0`, `±inf`, `NaN` (quiet
-//! and signaling) and subnormals, tuples at the arity boundaries, proper/improper lists
-//! and byte lists up to the `STRING_EXT`/`LIST_EXT` switchover, small maps,
-//! pids/ports/references and both fun tags — `EXPORT_EXT` (`113`) and `NEW_FUN_EXT`
-//! (`112`), standalone and nested inside tuples/lists/maps.
+//! long, multi-byte UTF-8, plus Latin-1), floats including `±0`, subnormals and the
+//! finite extremes (a non-finite `NEW_FLOAT_EXT` is `badarg`, matching the oracle —
+//! the wire cannot carry an infinity or NaN), tuples at the arity boundaries,
+//! proper/improper lists and byte lists up to the `STRING_EXT`/`LIST_EXT` switchover,
+//! small maps, pids/ports/references and both fun tags — `EXPORT_EXT` (`113`) and
+//! `NEW_FUN_EXT` (`112`), standalone and nested inside tuples/lists/maps.
 //!
 //! Two documented *non*-byte-identical transformations are asserted explicitly: a
 //! bignum whose magnitude fits the 60-bit small range decodes to a small (matching the
@@ -47,9 +48,10 @@
 //! Negative cases cover truncation at every byte offset (including every `NEW_FUN_EXT`
 //! field boundary), unknown/unsupported/obsolete tags (the removed `FUN_EXT`), the fun
 //! field rules (non-small `old_index`/`old_uniq`, a non-pid creator, `num_free` past
-//! its 8-bit field, missing environment terms), over-long atoms and bignums
-//! (`BeamError::SystemLimit`), oversized maps (`error::unsupported`), a malformed
-//! bignum sign and trailing bytes. Encoding a local (`make_fun3`) fun — which has no
+//! its 8-bit field, missing environment terms), over-long atoms (`badarg`, not a
+//! resource limit), bignums past the wire bound (`BeamError::SystemLimit`), oversized
+//! maps (`error::unsupported`), a non-zero bignum sign byte (any non-zero byte means
+//! negative) and trailing bytes. Encoding a local (`make_fun3`) fun — which has no
 //! faithful wire image — raises `unsupported_local_fun`, never a mis-encoded term.
 //! Every malformed input must yield an error — never a panic, never a silently
 //! truncated or mis-encoded term.
