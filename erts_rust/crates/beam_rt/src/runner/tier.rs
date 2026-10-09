@@ -76,6 +76,17 @@
 //! *unsafe* verdict it might retain is only a missed optimisation (the interpreter is
 //! always correct), never a wrong result.
 //!
+//! # The tier survives a suspension
+//!
+//! The tier is chosen for a process's **first** entry and remembered on its engine
+//! ([`ProcessEngine::tier`](super::entry::ProcessEngine)): a slice that pre-empts on the
+//! reduction budget, or a `receive` that parks, re-enters through
+//! [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier)
+//! on that **same** tier instead of dropping to the interpreter, so an allocating hot loop
+//! keeps its tier across its whole life. An interpreter-tier process is unaffected —
+//! [`Tier::Interpreter`](beam_engine::Tier::Interpreter) delegates to the plain
+//! [`Machine::resume_outcome`](beam_engine::Machine::resume_outcome).
+//!
 //! # Why the default is `auto`
 //!
 //! The tier costs nothing observable and never regresses a workload, so the **default is
@@ -94,18 +105,18 @@
 //! | `slice:fib/1 32` (the fixture) | bignum loop, trivial | 0.026 / 0.033 s | 0.022 / 0.029 s |
 //!
 //! The 139–170× win is the no-heap-admission-point shape (nothing can pre-empt such a loop,
-//! so it stays in its one tier-chosen slice); the plain `test_heap` shapes are ≈neutral
-//! because `auto` changes nothing there. The default is **not** the switch-blind
-//! [`JitMode::Baseline`] for exactly one reason: the predicate is what keeps a switch out of
-//! a JIT slice, and the engine's `Step::Enter` deopt seam is still missing, so a slice that
-//! could switch would turn a typed gap into a wrong exit reason.
+//! so it stays in its one tier-chosen slice). The allocating rows above are a snapshot from
+//! before the tier was carried across a park, so they are the conservative figure: a loop that
+//! **does** allocate is pre-empted and resumed, and it now keeps the JIT across every slice
+//! (see above). The committed `preempt:alloc_loop/1` fixture — one `test_heap` per iteration,
+//! so it pre-empts repeatedly — measures **min 0.180 s** on the interpreter vs **min 0.086 s**
+//! on `auto` (≈2.1×) on a release build, 3 alternating runs at N = 200 000. The default is
+//! **not** the switch-blind [`JitMode::Baseline`] for exactly one reason: the predicate is what
+//! keeps a switch out of a JIT slice, and the engine's `Step::Enter` deopt seam is still
+//! missing, so a slice that could switch would turn a typed gap into a wrong exit reason.
 //!
-//! Two residual engine seams cap the tier; neither makes the default unsafe:
+//! One residual engine seam caps the tier; it does not make the default unsafe:
 //!
-//! * **No tier-aware resume.** The tier is chosen for a process's **first entry** only; a
-//!   process that pre-empts and is resumed continues on the interpreter (the tier is not
-//!   carried across a park). So an *allocating* hot loop spends all but its first slice on
-//!   the interpreter — hence the ≈neutral `test_heap` rows above.
 //! * **No in-machine module-context switch.** A step that reports `Step::Enter` ("continue
 //!   in another module's code") is the JIT driver's hard typed
 //!   `unsupported("jit: module context switch outside the interpreter driver")` — which is
@@ -120,10 +131,12 @@ use super::entry::{ProcessEntry, RunnerState};
 use crate::nif::NifRegistry;
 use crate::runtime::Runtime;
 
-/// How the runner picks the execution tier for a process's **first** entry.
+/// How the runner picks the execution tier for a process.
 ///
-/// The tier only ever applies to a first entry: a resumed process continues the machine
-/// it suspended in, on the interpreter, with no tier entry at all.
+/// The mode selects the tier at a process's **first** entry, and the selection is remembered
+/// on the process (see [`ProcessEngine::tier`](super::entry::ProcessEngine)): every later
+/// resume — a pre-emption or a `receive` park — re-enters on that same tier through
+/// [`Machine::resume_outcome_with_tier`](beam_engine::Machine::resume_outcome_with_tier).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum JitMode {
     /// The baseline JIT exactly when [`jit_is_switch_safe`] proves the entry module free
@@ -194,6 +207,9 @@ pub(super) fn env_default() -> JitMode {
 /// resolved yet is conservatively the interpreter, because its module is only known once
 /// the context — which this must run *before* — resolves it) and, for
 /// [`JitMode::Auto`], consults the memoized switch-safety verdict.
+///
+/// Called **once** per process, at its first entry; the caller remembers the answer on the
+/// engine, so no later slice selects a tier again (see [`JitMode`]).
 pub(super) fn select_entry_tier(
     runtime: &Runtime,
     state: &mut RunnerState,
