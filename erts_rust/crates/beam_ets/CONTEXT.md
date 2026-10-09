@@ -309,8 +309,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   failure is replaced by the atom `EXIT` and evaluation continues (the C `FAIL_TERM`); a GUARD failure
   skips the clause.
 - `run.rs` — `match_spec_run(list, spec, atoms, heap)`.
-- `continuation.rs` — `pub struct MatchContinuation` (opaque: table id + compiled spec + limit +
-  position) and the limited forms, each `-> (Vec<Eterm>, Option<MatchContinuation>)`.
+- `continuation.rs` — `pub struct MatchContinuation` (opaque: table id + the table's **registered-name
+  atom** for a `named_table` (else `None`) + the compiled spec (body included) + limit + direction +
+  position) and the limited forms, each `-> (Vec<Eterm>, Option<MatchContinuation>)`. `resume` rejects a
+  continuation whose table id **or** recorded name does not match (a `named_table`'s continuations die
+  on `rename`, exactly like the oracle), and it re-applies the stored direction and spec so a `/1` resume
+  needs no direction/spec argument.
 
 ### `info.rs` — introspection (`ets:info`)
 - `pub struct TableInfo { id, name: Option<Atom>, kind, keypos, access, size, memory, owner:
