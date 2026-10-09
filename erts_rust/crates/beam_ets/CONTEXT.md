@@ -455,8 +455,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   churn` and `concurrent_counter_total_agrees_with_the_live_oracle`); `tests/ets_fixtable.rs` (5 cases).
 
 ## Test Strategy
-- Per-module `#[cfg(test)]` tests in every `src/` module (`store/tests.rs`, `table/view/tests.rs` hold
-  the big ones; `interior_parity.rs`/`interior_bench.rs` are `#[cfg(test)]` siblings). Coverage:
+- Per-module `#[cfg(test)]` tests in every `src/` module (`store/tests.rs`, `kind/tests.rs`,
+  `table/view/tests.rs` hold the big ones; `interior_parity.rs`/`interior_bench.rs` are `#[cfg(test)]`
+  siblings). Coverage:
   kind/options, key validation, store copy/free/reuse/relinquish, table insert/take accounting,
   hash-interior ops, CHAMP ops (round-trip, 2000-key churn, collision node, canonicalization,
   memory monotonicity), B+-tree invariants (incl. 10 000-key churn), the sorted-`Vec` interior, the
