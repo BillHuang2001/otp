@@ -57,13 +57,18 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `Module::record(&self, Atom) -> Option<&RecordDefinition>`,
   `Module::record_by_name(&self, &str) -> Option<&RecordDefinition>`,
   `Module::attributes_term(&self) -> Option<Eterm>` (the decoded `Attr` list) and
-  `Module::attribute_by_name(&self, &str) -> Option<Eterm>` (both `None` when the chunk is absent/malformed,
-  never a panic).
+  `Module::attribute_by_name(&self, &str) -> Option<Eterm>`,
+  `Module::compile_info_term(&self) -> Option<Eterm>` / `Module::compile_info_by_name(&self, &str) -> Option<Eterm>`
+  (the decoded `CInf` compile-info list — what `module_info(compile)` serves) and
+  `Module::meta_term(&self) -> Option<Eterm>` / `Module::meta_by_name(&self, &str) -> Option<Eterm>`
+  (the decoded `Meta` feature-metadata property list) — all `None` when the chunk is absent/malformed,
+  never a panic.
   `records` is the lowered `Recs` table (native-record definitions, declaration order); `record_by_name`
   resolves a *runtime* atom by looking its string up in the module's `atom_table` first (the lookup the
   `records:get_definition/2` BIF needs).
   `atoms[i]` = the atom for wire index `i`; `atoms[0]` = `Atom::MAX` (NIL placeholder, never a real atom).
-  `Module` is `Clone` (cheap: `literals` is shared behind the `Arc`) and `Debug`, but it is **neither
+  `Module` is `Clone` (cheap: `literals`/`attribute_table`/`compile_info_table`/`meta_table` are shared
+  behind `Arc`s) and `Debug`, but it is **neither
   `Send` nor `Sync`** (see `src/literal.rs` / Design Decisions) — a loaded module stays on its loading thread.
 - `pub struct Export { pub function: Atom, pub arity: u32, pub label: Label }` — `label` = the function **entry label**.
   `Module.locals` holds one `Export` per `LocT` entry (byte-for-byte the `ExpT` layout — the JIT-only
