@@ -30,7 +30,7 @@
 //! through `ExecutionContext::apply_fun` instead runs the closure on a fresh, non-blocking
 //! machine, so the `receive` folds into the typed `blocked()` capability gap, which is
 //! **uncatchable**: `proc_lib`'s own `try … catch … end` around `apply(M, F, A)` cannot
-//! contain it and the starter dies. This suite is the regression gate for the fix.
+//! contain it and the starter dies. This suite pins that path.
 //!
 //! # Two independent proofs
 //!

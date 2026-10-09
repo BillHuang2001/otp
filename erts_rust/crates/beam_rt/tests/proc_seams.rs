@@ -30,9 +30,9 @@
 //! [`ProcessBridge`] over its own `ProcessTable` / `Rc<RefCell<PortRegistry>>`.
 //!
 //! This suite pins that path at the library boundary: **nine** of the eleven BIFs are served
-//! through the registry + bridge (the floor no longer duplicates them), while `process_info/1,2`
-//! deliberately stay on the runtime-native floor (`src/native.rs` — see the module docs there),
-//! so they are exercised by `native::memory`'s own tests, not here.
+//! through the registry + bridge, while `process_info/1,2` deliberately stay on the
+//! runtime-native floor (`src/native.rs` — see the module docs there), so they are exercised by
+//! `native::memory`'s own tests, not here.
 //!
 //! # Oracle ground truth (OTP 29.1.1 / erts-17.1)
 //!
@@ -461,9 +461,8 @@ fn our_flags(rt: &mut Runtime) -> Vec<bool> {
 }
 
 /// Every one of the 24 observable outcomes above must match the system `erl`'s, which proves the
-/// de-duplication (the six BIFs whose `try_native` arms were deleted) is a faithful replacement
-/// and that the three newly served BIFs (`registered/0`, `is_process_alive/1`,
-/// `process_flag/2`) behave like the oracle. Skips **loudly** without a toolchain.
+/// registry + `ProcessBridge` path (including `registered/0`, `is_process_alive/1` and
+/// `process_flag/2`) behaves like the oracle. Skips **loudly** without a toolchain.
 #[test]
 fn the_observable_outcomes_match_the_live_oracle() {
     let Some(oracle) = support::require_oracle("proc_seams") else {

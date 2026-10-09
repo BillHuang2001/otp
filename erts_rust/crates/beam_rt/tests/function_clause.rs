@@ -42,7 +42,7 @@
 //! ```
 //!
 //! The committed fixture is loaded by relative path (a single source of truth — it is never
-//! copied), so this file needs no system toolchain and cannot hang: the raise *is* the fix.
+//! copied), so this file needs no system toolchain and cannot hang.
 
 use beam_common::ExceptionClass;
 use beam_engine::terms;

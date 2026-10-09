@@ -61,13 +61,7 @@ use beam_rt::{Runtime, RuntimeConfig};
 /// The committed `start.boot` of this checkout (the oracle-identical real script).
 ///
 /// `CARGO_MANIFEST_DIR` is `<repo>/erts_rust/crates/beam_rt`, so the repository root (which
-/// holds `bootstrap/`) is three ancestors up. The path is assembled from those ancestors
-/// rather than by concatenating `..` segments: an **absolute** path containing `..` currently
-/// trips an out-of-tree soundness bug on the engine's structured-raise path — a boot driven
-/// that way exits 1 with `beam_rt: allocation failure: message (…)` instead of carrying the
-/// script through its 22 directives to `{progress,started}` — so the suite must avoid it to
-/// measure the *boot chain* rather than that bug. (See the handoff note in
-/// `src/boot/CONTEXT.md`; the bug is owned by `beam_engine`.)
+/// holds `bootstrap/`) is three ancestors up.
 fn start_boot() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
