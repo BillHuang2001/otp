@@ -633,9 +633,11 @@ still reproduces today's collector exactly.
   default 233-word policy never reaches — so `GcConfig::default()`/`AnyCollector::from_config(default)` still
   build the copying `Collector`. The mark-region path is reached only by a caller that opts in
   (`GcConfig::immix` / `MatureSelection::Explicit`) or configures a large mature generation. No *outer* crate
-  consumes `GcConfig`/`AnyCollector` at all yet (`beam_process` owns a concrete `Collector`;
-  `beam_rt`/`beam_bifs` use neither `AnyCollector` nor `HeapInfo`), so the rule runs only in this crate's
-  tests — the runtime wiring is Stage-5 work.
+  consumes `GcConfig`/`AnyCollector` at all yet, so the strategy rule runs only in this crate's tests: the
+  runtime always builds the concrete copying `Collector` (`beam_process::Process`), which `beam_rt` **does**
+  drive at its heap-admission point (`beam_rt/src/context/gc.rs::ensure_heap` → `Process::collect`), and
+  `beam_rt` **does** use `HeapInfo` (in `system_info`/`process_info(garbage_collection)`). Only the
+  mark-region strategy *dispatch* stays unreached in production — Stage-5 work.
 - **The Immix region grows only by GC replacement, and only when the policy asks.** `ImmixSpace` wraps a
   `beam_alloc::Heap`; it never reallocates in place. A major whose `HeapPolicy::mature_after_fullsweep`
   target differs from the current capacity **relocates** the whole region into a fresh `ImmixSpace`
@@ -678,8 +680,11 @@ still reproduces today's collector exactly.
   off-heap ownership), or `copy_term` when the fragment must keep owning its payloads. At a safepoint:
   `FragmentRoots::materialize(&mut chain, &mut young, &mut off_heap)?`, then `gather_roots` alongside
   `x[0..live)`/the stack, `collect`, `scatter_roots`; `FragmentCounters` gives the no-leak check
-  (`live() == 0`, `off_heap_bytes() == 0` once every fragment is dropped/transferred). Note `beam_message`
-  is adding its own `HeapFragment` concurrently — reconcile with that type rather than duplicating it.
+  (`live() == 0`, `off_heap_bytes() == 0` once every fragment is dropped/transferred). `beam_message` has
+  since implemented its **own** fragment model (`beam_message/src/fragment.rs`: `HeapFragment`/`Fragments`,
+  the one used in production by `beam_message`/`beam_process`/`beam_rt`), so this crate's
+  `HeapFragment`/`FragmentChain`/`FragmentRoots` and its `GraphCopier` currently have **no** production
+  consumer — the two fragment models need reconciling rather than both being carried.
 - **The runtime should adopt the growth seam** (`beam_rt`): it currently hard-caps its term heap and
   translates exhaustion to `error:system_limit`; give the engine context a `beam_gc` collector and call
   `collector.ensure_capacity(heap_need, &mut roots)` from its `ensure_heap` (the root set —
@@ -692,9 +697,10 @@ still reproduces today's collector exactly.
   has no on-heap reference *term*: the safe reference is the `OffHeap::insert -> slot` index, never a
   raw pointer. Reach a refc binary's `BinRef` via the `ErlSubBits` `orig` slot, not pointer adjacency.
   Covered by `tests/stress_cross_generation.rs`.
-- **The runtime should surface `HeapInfo`** (`beam_rt`): `HeapInfo::of(&collector)` (or
-  `AnyCollector::heap_info()`) backs `erlang:process_info(Pid, garbage_collection)` and
-  `system_info(garbage_collection)`; `GARBAGE_COLLECTION_KEYS` is the oracle's key order.
+- **`HeapInfo` is surfaced by the runtime.** `beam_rt` builds it directly (`HeapInfo::new` and `HeapObservable`)
+  for `erlang:process_info(Pid, garbage_collection)` and `system_info(garbage_collection)`, in
+  `GARBAGE_COLLECTION_KEYS` order (`beam_rt/src/native/memory/mod.rs`, `src/info/memory.rs`); only
+  `AnyCollector::heap_info()` itself still has no production caller.
 - **Repo-root owned** (`../../CHANGE.md`): owed entries for the heap-sizing policy (the C-faithful
   per-collection growth/shrink, the `min_bin_vheap_words`/`fullsweep_after` fields and `HeapInfo`), the
   fragment support, and the measured GenImmix decision.
