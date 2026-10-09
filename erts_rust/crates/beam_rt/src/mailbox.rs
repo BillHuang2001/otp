@@ -375,6 +375,7 @@ mod tests {
     #[test]
     fn an_oversized_payload_reaches_a_blocked_receiver_through_a_fragment() {
         use beam_engine::{terms, ExecutionContext};
+        use beam_gc::HeapPolicy;
         use beam_process::ProcessState;
 
         use crate::context::RuntimeContext;
@@ -388,8 +389,18 @@ mod tests {
 
         let mut rt = Runtime::with_defaults().expect("the default runtime");
         rt.load_module(RECV_BEAM).expect("recv.beam loads");
+        // A **policy-bounded** receiver, because the fragment fallback is reached only when
+        // the receiver's own nursery genuinely refuses the payload. The runtime's default
+        // policy is unbounded (`+hmax 0`: `max_heap_words == 0`), and `Process::deliver`
+        // retries a refused copy after growing the nursery **on demand** — so an unbounded
+        // receiver simply absorbs the ~8000-word payload into its young heap and never takes
+        // the fragment path. Capping the nursery at 1024 words (comfortably above
+        // `recv:wait/0`'s live set, far below the payload) makes that growth impossible, so
+        // the retry reproduces the raw `AllocKind::Message` refusal the send path keys its
+        // fragment fallback on.
+        let policy = HeapPolicy::from_min_max(0, 1024);
         let receiver = rt
-            .spawn_process("recv", "wait", vec![])
+            .spawn_process_with_policy("recv", "wait", vec![], policy, None)
             .expect("spawn recv:wait/0");
 
         // 1. The receiver blocks on its empty mailbox *before* anything is sent, so the
