@@ -237,15 +237,105 @@ pub fn read(path: &Path) -> Result<BootScript> {
 ///
 /// The first directive's error (see above), propagated unchanged.
 pub fn execute(runtime: &mut Runtime, script: &BootScript) -> Result<()> {
+    execute_reporting(runtime, script).map_err(|stop| stop.error)
+}
+
+/// Where and why a boot script stopped — the [`execute_reporting`] report.
+///
+/// [`execute`] flattens a stop into its [`BeamError`]; this carries the **position** of that
+/// error so a caller can name the exact directive a boot reached (the runtime's boot
+/// observability, a differential case). All fields are the state at the moment of the stop.
+#[derive(Debug)]
+pub struct BootStop {
+    /// The 0-based index of the failing directive, or `None` when the runtime failed to boot
+    /// before the first directive ran.
+    pub index: Option<usize>,
+    /// The script's instruction count.
+    pub total: usize,
+    /// The failing directive, or `None` when no directive ran.
+    pub instruction: Option<Instruction>,
+    /// The error the failing directive reported.
+    pub error: BeamError,
+}
+
+impl BootStop {
+    /// A one-line, human-readable summary of the stop: the instruction position, the failing
+    /// directive (an `M:F/A` or a `{kernelProcess,Name,…}`) and the error.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match (self.index, &self.instruction) {
+            (Some(index), Some(instruction)) => format!(
+                "boot script stopped at instruction {index}/{}: {}: {}",
+                self.total,
+                render_instruction(instruction),
+                self.error
+            ),
+            _ => format!(
+                "boot script failed before its first directive: {}",
+                self.error
+            ),
+        }
+    }
+}
+
+/// Renders one directive compactly for [`BootStop::describe`] (`M:F/A`, or the debug form).
+fn render_instruction(instruction: &Instruction) -> String {
+    match instruction {
+        Instruction::Apply { mfa } => {
+            format!("{}:{}/{}", mfa.module, mfa.function, mfa.args.len())
+        }
+        Instruction::KernelProcess { name, mfa } => format!(
+            "{{kernelProcess,{name},{{{},{}/{}}}}}",
+            mfa.module,
+            mfa.function,
+            mfa.args.len()
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Executes `script` against `runtime`, reporting the exact directive the boot stopped at.
+///
+/// This is [`execute`] with the failure's position preserved: it returns the same `Ok(())` on
+/// a fully executed script, and on failure hands back a [`BootStop`] carrying the 0-based
+/// instruction `index`, the script's `total`, the failing `instruction` and the `error`.
+/// `execute` delegates to it (flattening the stop into its error), so the two can never drift.
+///
+/// The execution is identical to [`execute`]: the runtime is booted first (idempotent), one
+/// wall-clock [`DRIVE_DEADLINE`](super::drive::DRIVE_DEADLINE) covers every scheduler drive of
+/// the pass, and the walk stops at the first directive that cannot run.
+///
+/// # Errors
+///
+/// A [`BootStop`] for the first directive that cannot run (`instruction`/`index` set), or — if
+/// the runtime cannot boot before the first directive — one with `index`/`instruction` unset.
+pub fn execute_reporting(
+    runtime: &mut Runtime,
+    script: &BootScript,
+) -> std::result::Result<(), BootStop> {
     // The script's `$ROOT` expansion and its module loads both need the system code path,
     // so the runtime is booted first (idempotent): a caller may hand `execute` a fresh
     // runtime, exactly as `Runtime::boot_from_script` does.
-    runtime.boot()?;
+    let total = script.instructions.len();
+    let before_first = |error: BeamError| BootStop {
+        index: None,
+        total,
+        instruction: None,
+        error,
+    };
+    runtime.boot().map_err(before_first)?;
     // One deadline for the whole pass: every scheduler drive below shares it, so the boot's
     // wall-clock bound does not multiply by the number of process directives.
     let deadline = Instant::now() + drive::DRIVE_DEADLINE;
-    for instruction in &script.instructions {
-        execute_instruction(runtime, instruction, deadline)?;
+    for (index, instruction) in script.instructions.iter().enumerate() {
+        if let Err(error) = execute_instruction(runtime, instruction, deadline) {
+            return Err(BootStop {
+                index: Some(index),
+                total,
+                instruction: Some(instruction.clone()),
+                error,
+            });
+        }
     }
     Ok(())
 }
@@ -1007,6 +1097,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_real_start_boot_reports_its_stop_through_execute_reporting() {
+        // The **whole** script in one pass, reporting its exact stop: the three kernel
+        // processes must survive their short-lived directive processes' exits (`heart`,
+        // `logger` and `application_controller` really stay registered — the unlink in
+        // `drive::start_kernel_process`), and the boot must then stop at the first directive
+        // that needs one of them to *answer*.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let path = Path::new(START_BOOT);
+        if !path.is_file() {
+            eprintln!("SKIP: {START_BOOT} is absent");
+            return;
+        }
+        let script = read(path).expect("the real start.boot parses");
+        let stop = execute_reporting(&mut runtime, &script)
+            .expect_err("the real start.boot cannot fully boot in Milestone 1");
+        eprintln!("note: {}", stop.describe());
+        // The unlink in `drive::start_kernel_process` keeps the `application_controller`'s
+        // server alive past its directive process's `normal` exit, so it is still registered
+        // when a later directive needs it. (`heart` returns without registering and `logger`
+        // never reaches its registration, so `application_controller` is the one to pin.)
+        let registered = runtime
+            .atoms()
+            .lookup("application_controller")
+            .and_then(|atom| runtime.processes().whereis(atom))
+            .is_some();
+        assert!(
+            registered,
+            "the application_controller server must survive its directive process"
+        );
+        assert_eq!(
+            stop.total,
+            script.instructions.len(),
+            "the report counts every instruction"
+        );
+        let index = stop.index.expect("the stop names an instruction");
+        assert!(
+            index >= 16,
+            "the stop must be at or after instruction 16, found {index}"
+        );
+        assert!(
+            matches!(stop.instruction, Some(Instruction::Apply { .. })),
+            "the stop names an `apply`: {:?}",
+            stop.instruction
+        );
+    }
     // -----------------------------------------------------------------------
     // A synthetic script, executed end to end
     // -----------------------------------------------------------------------

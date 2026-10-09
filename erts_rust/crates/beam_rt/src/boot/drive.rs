@@ -83,9 +83,17 @@ pub(super) const KERNEL_BURST_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The per-`pump_scheduler`-call slice budget of a `{kernelProcess, …}` burst.
 ///
-/// The budget is deliberately small so the burst's deadline is always reachable and each
-/// directive's burst stays a *burst* rather than a scheduler pass of its own.
-pub(super) const KERNEL_BURST_SLICES: u64 = 64;
+/// The budget is **one slice**: the burst advances the scheduler one process at a time and
+/// re-checks `erlang:whereis(Name)` at the top of every iteration, so the check lands in the
+/// window between the kernel process registering its name and the short-lived directive
+/// process it is linked to resuming. That window is what makes the unlink in
+/// [`start_kernel_process`] beat the directive's `normal` exit: a coarser budget would let a
+/// single `pump_scheduler` call run both the registration *and* the directive's
+/// exit-signal-driven teardown, and a `{'EXIT', _, normal}` already queued in the kernel
+/// process's mailbox cannot be undone by a later unlink. The budget is also small enough that
+/// the burst's deadline is always reachable and the burst stays a *burst* rather than a
+/// scheduler pass of its own.
+pub(super) const KERNEL_BURST_SLICES: u64 = 1;
 
 /// The per-`pump_scheduler`-call slice budget of an `{apply, …}` block wait.
 ///
@@ -128,6 +136,28 @@ const APPLY_BLOCK_SLICES: u64 = 256;
 /// * the burst deadline ([`KERNEL_BURST_DEADLINE`], also capped by the pass's
 ///   [`DRIVE_DEADLINE`]) expires.
 ///
+/// # Surviving the directive's own exit
+///
+/// This runtime runs a `{kernelProcess, …}` MFA in a **short-lived** process that exits as soon
+/// as the MFA returns, whereas a real `init` runs it in the **one** long-lived `init` process
+/// (`erts/preloaded/src/init.erl:1520`, whose `start_in_kernel/5` is not exported). The kernel
+/// servers that matter here are `proc_lib`/`gen_server` children of that process
+/// (`logger_server:start_link/0` via `gen_server:start_link`, and
+/// `application_controller:start/1`'s `spawn_link`ed `init/2`); a server **traps exits** and
+/// terminates when its parent exits with `normal` (`proc_lib`'s parent-exit semantics). Left
+/// linked, the short-lived directive's ordinary return would therefore tear its own server
+/// down and release the name — the observed `exit noproc` at the real `start.boot`'s first
+/// dependent `{apply, …}`.
+///
+/// The fix is to **unlink** the server from the directive as soon as it has registered its
+/// name, while the directive is still alive (it is blocked in `receive` until the server
+/// acks): an unlink beats the exit because the server's `{'EXIT', _, normal}` is never
+/// produced. `KERNEL_BURST_SLICES` is `1` so `whereis` is re-checked between every scheduler
+/// slice — the window where the server has registered but the directive has not resumed — and
+/// a `{'EXIT', _, normal}` already queued cannot be undone by a later unlink. A directive that
+/// has *already* terminated by the time `name` resolves (`heart`'s `start/0` returns after it
+/// `spawn`s a process it does **not** link) is skipped, not an error.
+///
 /// A burst that ends **without** `name` being registered is deliberately **not** this
 /// directive's error: `init` never checks the name either, and the failure legitimately
 /// surfaces at the next directive that depends on the process (a `gen_server` call to the
@@ -149,11 +179,29 @@ pub(super) fn start_kernel_process(
     args: Vec<Eterm>,
     deadline: Instant,
 ) -> Result<()> {
-    runtime.spawn_process(&mfa.module, &mfa.function, args)?;
+    let directive = runtime.spawn_process(&mfa.module, &mfa.function, args)?;
     let atom = runtime.code_server_atoms_mut().intern(name);
     let burst = deadline.min(Instant::now() + KERNEL_BURST_DEADLINE);
     loop {
-        if runtime.processes().whereis(atom).is_some() {
+        // The kernel process has taken its first steps and registered `name` **itself**.
+        // Unlink it from this directive's short-lived process *now*, before that process can
+        // run its own `normal` exit: a `proc_lib`/`gen_server` server
+        // (`logger_server`, `application_controller`) traps exits and terminates on its
+        // parent's `{'EXIT', _, normal}`, and an exit signal already queued in its mailbox
+        // cannot be undone by a later unlink. `KERNEL_BURST_SLICES` is `1` so this check runs
+        // between every scheduler slice — the window where the server has registered but the
+        // directive (blocked in `start/1`'s / `sync_start`'s `receive` until the server's ack)
+        // has not yet resumed.
+        if let Some(kernel) = runtime.processes().whereis(atom) {
+            // A directive that already terminated (`heart`'s `start/0` returns after it
+            // `spawn`s a process that is **not** linked to it) has nothing to unlink: an
+            // unlink of a dead pid is the process table's unknown-pid diagnostic, so only
+            // unlink while the directive is still live.
+            if runtime.processes().contains(directive) {
+                // A directive that registered `name` *itself* yields `kernel == directive`,
+                // and `unlink(a, a)` is the process table's documented no-op.
+                runtime.unlink_processes(directive, kernel)?;
+            }
             return Ok(());
         }
         if Instant::now() >= burst {
