@@ -36,8 +36,8 @@ per-function bodies. Files:
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
-| `prim.rs` | the `prim_file` floor (11 entries) — see below |
-| `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
+| `prim.rs` | the `prim_file` floor (16 entries) — see below |
+| `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2`) + its unit tests || `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
 **`init:get_arguments/0` lists ONLY the command-line flags**, so it differs from the oracle by exactly its four automatic `root`/`bindir`/`progname`/`home` entries — which is why a `RuntimeConfig::default()` runtime (an empty `init_args`, so the listing is `[]`) stops the real boot script three instructions earlier, at instruction 16 (`application:load/1`, an `error function_clause`); the boot-chain consequence is in [`../boot/CONTEXT.md`](../boot/CONTEXT.md).
 
@@ -214,7 +214,11 @@ system (`std::fs`/`std::env`) — "primitive" is exactly what this layer is for.
 | `make_link/2` | `prim_file.erl:829-834` → `efile_make_hard_link` = `link(2)` (`unix_prim_file.c:963-969`) | `ok`; an existing link name ⇒ `{error,eexist}`; a missing source ⇒ `{error,enoent}`; bad path ⇒ `{error,badarg}` |
 | `make_symlink/2` | `prim_file.erl:835-840` → `efile_make_soft_link` = `symlink(2)` (`unix_prim_file.c:971-977`) | `ok` (the target need not exist); an existing link name ⇒ `{error,eexist}`; bad path ⇒ `{error,badarg}` |
 | `altname/1` | `prim_file.erl:842-848`; on Unix `efile_altname` is a constant `ENOTSUP` (`unix_prim_file.c:1085-1090`) | `{error,enotsup}` for every valid path (it does **not** return its argument); a bad path ⇒ `{error,badarg}` |
-
+| `open/2` | `prim_file.erl:132-141` (`open_nif(encode_path(Name), Modes)` → `make_fd/2` → `#file_descriptor{module = prim_file, data = build_fd_data(...)}`), `build_fd_data/5` (`:512-527`); C `efile_open` (`unix_prim_file.c:173-226`) + `efile_translate_modelist` (`common/prim_file_nif.c:500-539`) | `{ok, {file_descriptor, prim_file, Data}}` where `Data` is the oracle's map shape (`handle`, `owner`, plus `r_buffer`/`r_ahead_size` only for a **read-capable** descriptor) plus the private `fd_registry_id`. Modes follow the C's flags (`read`→`O_RDONLY`; `write` alone→`O_TRUNC\|O_WRONLY\|O_CREAT`; read+write→`O_RDWR\|O_CREAT`; `append`→`O_APPEND` and no `O_TRUNC`; `exclusive`, `sync`, `{read_ahead,S}`); **every** unmodelled option (`raw`, `binary`, `list`, `compress`, `retry_read`, …) is silently ignored, exactly as the C does. `{error,badarg}` for a bad path or a non-list mode list; `{error,enoent}`/`{error,eisdir}`/`{error,eexist}`/`{error,eacces}`/… from the errno; a `directory`-mode open is the honest `unsupported` gap (`std::fs::File` cannot `OPENDIR`) |
+| `read/2` | `prim_file.erl:162-171` + `read_1/5` (`:180-204`) → `read_nif`; C `read_nif_impl` (`common/prim_file_nif.c:632-663`) | `{ok, Binary}` (`N` bytes, fewer at EOF) \| `eof` (0 bytes read and `N` ≠ 0) \| `{error, Reason}`. One `read(2)` of at most `N`: **read-ahead is not reproduced** (`prim_buffer` is never called — its only export is `on_load/0`; divergence documented in `prim_file.rs`). `N` must be a non-negative integer (`-1` ⇒ `{error,badarg}`, `1 bsl 80` ⇒ `{error,einval}`); a write-only descriptor ⇒ `{error,ebadf}`; a malformed `Data` ⇒ `{error,badarg}`; a closed/unknown handle ⇒ `{error,einval}` |
+| `write/2` | `prim_file.erl:247-263` → `write_nif`; C `write_nif_impl` (`common/prim_file_nif.c:664-682`, `enif_inspect_iovec`) | `ok` \| `{error, Reason}`; the argument is iodata (a byte-aligned binary, a char list of byte-sized integers, proper sub-lists, `[]`, `<<>>`); an atom, a float, a negative/overflowing integer, a non-byte-aligned binary or an improper tail ⇒ `{error,badarg}`; a read-only descriptor ⇒ `{error,ebadf}` |
+| `close/1` | `prim_file.erl:154-160` → `close_nif`; C `close_nif` (`common/prim_file_nif.c:612-631`) | `ok`; releases the registry entry, so a second `close` and every later op on that handle ⇒ `{error,einval}` (the C `file_handle_wrapper` CLOSED branch); an unknown/non-resource handle ⇒ `{error,badarg}` |
+| `position/2` | `prim_file.erl:306-334` → `position_nif`; C `seek_nif_impl` (`common/prim_file_nif.c:782-806`) + `efile_seek` (`unix_prim_file.c:502-533`) | `{ok, NewPos}` \| `{error, Reason}`; `Loc` = `bof`/`cur`/`eof` (offset 0), `{Mark, Offset}`, or a bare non-negative integer (`{N, bof}`); a seek past EOF is legal; a negative resulting offset ⇒ `{error,einval}`; a bad mark or non-integer offset (`{1,bof}`, `foo`, `{bof,1.0}`) ⇒ `{error,badarg}`; a closed handle ⇒ `{error,einval}` |
 Every path-only entry is a direct NIF call wrapped by
 `try … catch error:badarg -> {error,badarg}` in `prim_file.erl`, so a **bad path is always the
 *value* `{error,badarg}`, never a raise**; the C's errno REMAPs (`EISDIR`→`EPERM`,
@@ -353,17 +357,24 @@ needs:
   `port_connect/2`, `port_control/3`, `port_info/1,2`) is **not** claimed *here*: the `erlang:*`
   counterparts are served by `../port.rs` + `beam_bifs`' `PortHook` seam. `erts_internal`'s own
   entries stay unclaimed (the preloaded wrapper is irrelevant to M1 callers).
-- **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` serves (the 11 entries in
-  its table) is on the floor; **every other** `prim_file` entry and all of `erl_prim_loader`,
-  `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval` are **Not
-  implemented** and still fall through to a real preloaded-`.beam` load (they ship in the `erts`
-  `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the matching
-  host. Two families are deliberately unclaimed:
-  * the **open-file / fd** entries — `open`/`read`/`write`/`position`/`pread`/`pwrite`/`allocate`/
-    `truncate`/`sync`/`datasync`/`advise`/`read_handle_info`/`copy/3`/`write_file/2` (the last a pure
-    Erlang composition) — all need the `#file_descriptor{}` resource machinery (and M1 has no
-    `open`; a non-fd argument raises the wrapper's uncaught `function_clause`, which is not modelled);
-  * **`read_file_info/1,2` / `read_link_info/1,2`** — the `#file_info{}` tuple is fillable from
+- **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` + `prim_file.rs` serve (the
+  16 entries in their tables) is on the floor; **every other** `prim_file` entry and all of
+  `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval`
+  are **Not implemented** and still fall through to a real preloaded-`.beam` load (they ship in the
+  `erts` `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the
+  matching host. Families still deliberately unclaimed:
+  * the **rest of the fd family** — `pread`/`pwrite`/`allocate`/`truncate`/`sync`/`datasync`/
+    `advise`/`read_handle_info`/`copy/3`/`write_file/2` (the last a pure Erlang composition) — plus
+    a `directory`-mode `open/2`, which `std::fs::File` cannot `OPENDIR` (that open is the honest
+    `unsupported` capability gap, never a fabricated handle);
+
+  The served fd family keeps the oracle's `#file_descriptor{}` shape so the Erlang glue above it
+  (`raw_file_io`, `raw_file_io_list`, `file_io_server`) pattern-matches unchanged, with three
+  documented divergences: the fd registry is keyed by a **private `fd_registry_id`** map entry
+  instead of decoding the `handle` reference (decoding needs `unsafe`); `r_buffer` holds a
+  **reference marker** rather than a real `prim_buffer` (dead code: `prim_buffer`'s only export is
+  `on_load/0`, and `read_1/5`'s `RBufSz >= RSz` clause always fires with one `read(2)`); and a
+  malformed `Data` answers `{error,badarg}` where the oracle sometimes raises `{badmatch,_}`.  * **`read_file_info/1,2` / `read_link_info/1,2`** — the `#file_info{}` tuple is fillable from
     `std::fs::Metadata`/`MetadataExt` for every field **except** `access` (the C calls `access(2)`,
     absent from safe `std::` and the crate is `deny(unsafe_code)`), and the *default* time type is
     `local`, needing a TZ conversion the runtime does not have. Only `[{time,posix}]` (and
