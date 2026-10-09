@@ -532,10 +532,10 @@ fn lowers_bs_create_bin_with_an_allocation_list_alloc() {
             segments,
         } => {
             assert_eq!(*fail, NO_FAIL);
-            // 4 heap words + 0 floats + 1 fun (the loader's `number`-words
-            // placeholder for a fun entry) — the word total the real loader
-            // computes with `marshal_allocation_list` (`beam_file.c:2234-2284`).
-            assert_eq!(*alloc, 5);
+            // 4 raw heap words + 0 floats + 1 fun (`ERL_FUN_SIZE` = 2 words, so
+            // 2 × 1 = 2) = 6 — the word total the real loader computes with
+            // `marshal_allocation_list` (`beam_file.c:2259-2284`).
+            assert_eq!(*alloc, 6);
             assert_eq!(*live, 2);
             assert_eq!(*unit, 8);
             assert_eq!(*dst, Operand::X(2));
@@ -584,8 +584,8 @@ fn lowers_stack_and_heap_need_operands_in_both_encodings() {
             HeapNeed::Alloc(entries) => {
                 let total = heap_need.words();
                 match total {
-                    // `make_adder/1`: `{alloc,[{words,1},{floats,0},{funs,1}]}`.
-                    2 => assert_eq!(
+                    // `make_adder/1`: `{alloc,[{words,1},{floats,0},{funs,1}]}` → 1 + 0 + 2.
+                    3 => assert_eq!(
                         entries,
                         &[
                             AllocKind {
@@ -601,11 +601,11 @@ fn lowers_stack_and_heap_need_operands_in_both_encodings() {
                             AllocKind {
                                 kind: 2,
                                 number: 1,
-                                words: 1
+                                words: 2
                             },
                         ]
                     ),
-                    // `safe_div/2`: `{alloc,[{words,3},{floats,1},{funs,0}]}`.
+                    // `safe_div/2`: `{alloc,[{words,3},{floats,1},{funs,0}]}` → 3 + 2 + 0.
                     5 => assert_eq!(
                         entries,
                         &[
@@ -641,7 +641,7 @@ fn lowers_stack_and_heap_need_operands_in_both_encodings() {
     );
     assert_eq!(
         alloc_totals,
-        vec![2, 5],
+        vec![3, 5],
         "the two allocation-list `test_heap`s"
     );
 }

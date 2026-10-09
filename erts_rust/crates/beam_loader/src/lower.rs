@@ -1464,7 +1464,7 @@ mod tests {
                         crate::operand::AllocKind {
                             kind: 2,
                             number: 1,
-                            words: 1,
+                            words: 2,
                         },
                     ]),
                     Operand::Integer(2),
@@ -1475,11 +1475,10 @@ mod tests {
             ),
             Instr::BsCreateBin {
                 fail: NO_FAIL,
-                // 4 heap words + 0 floats + 1 fun (the loader's `number`-words
-                // placeholder for a fun entry, `decode::allocation_entry`); exactly
-                // what the real loader produces (`marshal_allocation_list`,
-                // `beam_file.c:2234-2284`).
-                alloc: 5,
+                // 4 raw heap words + 0 floats + 1 fun (`ERL_FUN_SIZE` = 2 words, so
+                // 2 × 1 = 2) = 6, matching `marshal_allocation_list`
+                // (`beam_file.c:2259-2284`).
+                alloc: 6,
                 live: 2,
                 unit: 8,
                 dst: Operand::X(2),
@@ -1587,11 +1586,9 @@ mod tests {
         ]
     }
 
-    /// The fixture's real chunk set. Its `Code` stream is *not* loaded here: it
-    /// contains a `test_heap` with a `funs` allocation entry, which the
-    /// instruction lowering (`lower::instr`) does not model yet — a loader gap
-    /// unrelated to literals/funs. The `LitT`/`FunT`/`AtU8` tables are the real
-    /// ones, so the lowering under test is exercised on real data.
+    /// The fixture's real chunk set, used only for its `AtU8`/`FunT`/`LitT` tables:
+    /// the tests below supply their own synthetic instruction stream
+    /// (`minimal_stream`/the fun stand-in) rather than the fixture's `Code` bytes.
     fn coverage_chunks() -> Chunks<'static> {
         let container = crate::container::parse(COVERAGE).unwrap();
         crate::chunk::parse(&container).unwrap()

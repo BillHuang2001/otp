@@ -34,7 +34,9 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `Operand::Literal` (a bignum literal), so a loaded `Module` never carries it.
   `Operand::Literal(idx)` is an index into the module's decoded [`LiteralArea`], resolved through `Module::literal`.
 - `pub struct AllocKind { pub kind: u32, pub number: u32, pub words: u32 }` — one decoded
-  `z,3` allocation entry (`words` = the entry's contribution to the heap-word total).
+  `z,3` allocation entry, `words` per `marshal_allocation_list` (`beam_file.c:2259-2284`): kind `0`
+  (raw words) → `number`, kinds `1` (floats) / `2` (funs) / `3` (native records) → `2 × number`
+  (`FLOAT_SIZE_OBJECT` / `ERL_FUN_SIZE` / `RECORD_INST_SIZE(0)`, all `2` on 64-bit).
 - `pub enum HeapNeed { Words(u32), Alloc(Vec<AllocKind>) }` — the heap/stack-need operand of the frame
   instructions, in *either* wire encoding (a plain word count or a `z,3` allocation list), with
   `HeapNeed::words(&self) -> u32` (the saturating word total) and
@@ -549,16 +551,6 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   `../../crates/CONTEXT.md`).
 - **Lowering is one peephole pass, not a full `ops.tab` transform.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`. The only rewrite after that is `src/lower/fuse.rs` (`fuse`), a single forward pass that coalesces an **adjacent** `Deallocate(N); Return` pair in each function body into the one superinstruction `Instr::DeallocateReturn(N)`, run *before* `build_blocks` derives the blocks/labels (so a block's `start..end` indexes the same fused vector the engine dispatches on). `Label` is the only branch target, so two adjacent non-`Label` instructions share a block and the pair can never cross one; everything else is copied through verbatim, so `Deallocate`/`Return` stay live for hand-built modules that bypass the loader. That is the whole superinstruction surface here; the C builds a much larger set from `emu/ops.tab` in `beam_load.c` (a candidate for later). Never a correctness gap: `beam_engine`'s core `DeallocateReturn` arm executes exactly the two constituents in order.
 - **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
-- **Allocation-list word total is under-counted for `{funs,N}` / native-record entries.**
-  `decode::allocation_entry` (`src/decode.rs:559-575`) maps kind `2` (funs) and kind `3` (native
-  records) to `N` words, but the C `marshal_allocation_list` (`beam_file.c:2259-2275`) uses
-  `ERL_FUN_SIZE` / `RECORD_INST_SIZE(0)` — both `2` words — per element. Kinds `0` (raw words) and
-  `1` (floats ×`FLOAT_SIZE_OBJECT`=2) match the C; kinds `2`/`3` are short by `N` words, so any
-  `HeapNeed` the compiler emits as a `z,3` list is under-sized. The engine consumes that total
-  directly for admission (`beam_engine` `dispatch.rs` `test_heap`/`allocate_heap`/`allocate` →
-  `*.words()` → `ensure_heap`/`push_frame`; `bs_create_bin.alloc` is bound but ignored), so the
-  heap-overflow guard is too lax for those kinds. The test comment at `src/lower.rs:1478-1481`
-  ("exactly what the real loader produces") is wrong for kinds 2/3.
 - **Contract A.2 divergences from the C loader (`beam_load.c`/`beam_file.c`), both currently unenforced:**
   - **No `max_opcode` sanity bound.** `decode_stream` (`src/decode.rs:229`) only rejects an opcode *byte*
     above the chunk's `max_opcode`; the C also refuses `max_opcode > MAX_GENERIC_OPCODE` (193) and

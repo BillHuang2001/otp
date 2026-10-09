@@ -550,17 +550,20 @@ pub(crate) fn read_unsigned(r: &mut beam_codec::Reader<'_>, msg: &str) -> Result
 
 /// One `z,3` allocation-list entry, with its heap-word contribution.
 ///
-/// Mirrors `marshal_allocation_list` (`beam_file.c:2234-2284`): kind `0` counts raw
-/// heap words and kind `1` counts floats, each of which takes `FLOAT_SIZE_OBJECT`
-/// (2) words on the 64-bit emulator. Kinds `2` (funs) and `3` (native records) take
-/// `ERL_FUN_SIZE`/`RECORD_INST_SIZE` words per element in the C loader; those object
-/// layouts are not modeled by this crate yet, so `number` words is used as a
-/// documented Milestone-1 placeholder. Any other kind is malformed.
+/// Mirrors `marshal_allocation_list` (`beam_file.c:2259-2284`): kind `0` counts raw
+/// heap words, kind `1` counts floats (`FLOAT_SIZE_OBJECT` words per element), kind
+/// `2` counts funs (`ERL_FUN_SIZE` words per element) and kind `3` counts native
+/// records (`RECORD_INST_SIZE(0)` words per element). On the 64-bit emulator all
+/// three multipliers are `2`: `FLOAT_SIZE_OBJECT = DOUBLE_DATA_WORDS+1`
+/// (`erl_term.h:525-526`), `ERL_FUN_SIZE = sizeof(ErlFunThing)/sizeof(Eterm)`
+/// (`erl_fun.h:99`; `ErlFunThing` is `{thing_word, entry, env[]}`) and
+/// `RECORD_INST_SIZE(0) = sizeof(ErtsRecordInstance)/sizeof(Eterm)`
+/// (`erl_record.h:73-74`; `ErtsRecordInstance` is `{thing_word, record_definition,
+/// values[]}`). Any other kind is malformed.
 fn allocation_entry(kind: u64, number: u64) -> Result<AllocKind> {
     let words = match kind {
         0 => number,
-        1 => number.saturating_mul(2),
-        2 | 3 => number,
+        1 | 2 | 3 => number.saturating_mul(2),
         _ => return Err(bad_file("invalid allocation-list kind")),
     };
     // The IR stores 32-bit counts; a wider one is a system limit, not a `badarg`.
@@ -578,7 +581,7 @@ fn allocation_entry(kind: u64, number: u64) -> Result<AllocKind> {
 mod tests {
     use super::*;
     use crate::ir::{TestKind, Type};
-    use crate::operand::NO_FAIL;
+    use crate::operand::{HeapNeed, NO_FAIL};
     use beam_term::AtomTable;
 
     /// The `Code` header of the committed `slice.beam` fixture: `max_opcode 181`,
@@ -596,6 +599,10 @@ mod tests {
     const OP_IS_EQ_EXACT: u8 = 43;
     const OP_GC_BIF2: u8 = 125;
     const OP_INT_CODE_END: u8 = 3;
+    /// `allocate_heap/3` (`genop.tab:103`).
+    const OP_ALLOCATE_HEAP: u8 = 13;
+    /// `test_heap/2` (`genop.tab:129`).
+    const OP_TEST_HEAP: u8 = 16;
 
     /// Packs one `(tag, value)` operand into the file's tag/length byte plus
     /// magnitude bytes (`beam_file.c:167-240`), using the same three encodings the
@@ -1034,22 +1041,23 @@ mod tests {
                     number: 3,
                     words: 3
                 },
-                // kind 1: floats, 2 words each.
+                // kind 1: floats, `FLOAT_SIZE_OBJECT` = 2 words each.
                 AllocKind {
                     kind: 1,
                     number: 2,
                     words: 4
                 },
-                // kinds 2/3: M1 placeholder = `number` words each.
+                // kind 2: funs, `ERL_FUN_SIZE` = 2 words each.
                 AllocKind {
                     kind: 2,
                     number: 5,
-                    words: 5
+                    words: 10
                 },
+                // kind 3: native records, `RECORD_INST_SIZE(0)` = 2 words each.
                 AllocKind {
                     kind: 3,
                     number: 7,
-                    words: 7
+                    words: 14
                 },
             ])
         );
@@ -1064,6 +1072,130 @@ mod tests {
             &[],
             &fallback_types(),
         ));
+    }
+
+    #[test]
+    fn allocation_entry_counts_funs_and_records_at_two_words_each() {
+        // `ERL_FUN_SIZE = sizeof(ErlFunThing)/sizeof(Eterm)` (`erl_fun.h:99`) and
+        // `RECORD_INST_SIZE(0) = sizeof(ErtsRecordInstance)/sizeof(Eterm)`
+        // (`erl_record.h:73-74`) are both 2 words on the 64-bit emulator, exactly like
+        // `FLOAT_SIZE_OBJECT`, and `marshal_allocation_list` multiplies `number` by
+        // them (`beam_file.c:2264-2275`).
+        for kind in 0..=3 {
+            let entry = allocation_entry(kind, 5).unwrap();
+            assert_eq!(entry.kind, kind as u32, "the raw kind is preserved");
+            assert_eq!(entry.number, 5, "the raw count is preserved");
+            assert_eq!(entry.words, if kind == 0 { 5 } else { 10 }, "kind {kind}");
+        }
+        // A zero count contributes nothing, whatever the kind.
+        for kind in 0..=3 {
+            assert_eq!(allocation_entry(kind, 0).unwrap().words, 0, "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn allocation_entry_bounds_the_count_and_rejects_a_bad_kind() {
+        // Kind `0` counts raw words, so the `u32` ceiling is representable.
+        assert_eq!(
+            allocation_entry(0, u64::from(u32::MAX)).unwrap().words,
+            u32::MAX
+        );
+        // Kinds `1`/`2`/`3` multiply by 2, so the largest representable count is
+        // `u32::MAX / 2` (the C's equivalent bound is
+        // `ERTS_SINT32_MAX / MAX(FLOAT_SIZE_OBJECT, ERL_FUN_SIZE + 1)`,
+        // `beam_file.c:2255-2257`); one more overflows the `u32` word count and is a
+        // system limit, not a `badarg`.
+        let half = u64::from(u32::MAX) / 2;
+        assert_eq!(
+            allocation_entry(2, half).unwrap().words,
+            (half * 2) as u32,
+            "the product is exact at the boundary"
+        );
+        assert!(matches!(
+            allocation_entry(2, half + 1),
+            Err(beam_common::BeamError::SystemLimit)
+        ));
+        // The multiplication saturates before the guard: a count at the `u32` ceiling
+        // cannot wrap, it is rejected as a system limit instead.
+        assert!(matches!(
+            allocation_entry(3, u64::from(u32::MAX)),
+            Err(beam_common::BeamError::SystemLimit)
+        ));
+        // A count one past `u32` is a system limit too.
+        assert!(matches!(
+            allocation_entry(3, u64::from(u32::MAX) + 1),
+            Err(beam_common::BeamError::SystemLimit)
+        ));
+        // Kind 4 (and anything else) is malformed.
+        assert_bad_arg(allocation_entry(4, 1));
+    }
+
+    #[test]
+    fn recovers_the_c_word_total_from_an_allocation_list() {
+        // `test_heap/2` (16) with a `z,3` list of `{funs,3}` and native
+        // `{records,4}`, `live 1`; then `allocate_heap/3` (13) with a `z,3`
+        // stack-need list of `{funs,2}`, heap need `u,1`, `live 1`.
+        let bytes = stream(&[
+            &[OP_TEST_HEAP],
+            &tagged(7, 3),
+            &tagged(0, 2),
+            &tagged(0, 2),
+            &tagged(0, 3),
+            &tagged(0, 3),
+            &tagged(0, 4),
+            &tagged(0, 1),
+            &[OP_ALLOCATE_HEAP],
+            &tagged(7, 3),
+            &tagged(0, 1),
+            &tagged(0, 2),
+            &tagged(0, 2),
+            &tagged(0, 1),
+            &tagged(0, 1),
+            &[OP_INT_CODE_END],
+        ]);
+        let instrs = decode_stream(&bytes, &[], &VERSION, &fallback_types()).unwrap();
+
+        // `ERL_FUN_SIZE×3 + RECORD_INST_SIZE(0)×4` = 2×3 + 2×4 = 14 — the word total
+        // `marshal_allocation_list` reserves for the same list (`beam_file.c:2259-2284`).
+        assert_eq!(instrs[0].opcode, Opcode::test_heap);
+        assert_eq!(
+            HeapNeed::from_operand(&instrs[0].operands[0]).unwrap(),
+            HeapNeed::Alloc(vec![
+                AllocKind {
+                    kind: 2,
+                    number: 3,
+                    words: 6,
+                },
+                AllocKind {
+                    kind: 3,
+                    number: 4,
+                    words: 8,
+                },
+            ])
+        );
+        assert_eq!(
+            HeapNeed::from_operand(&instrs[0].operands[0])
+                .unwrap()
+                .words(),
+            14,
+            "the reserved word count is the C total, not the raw element count"
+        );
+        assert_eq!(instrs[0].operands[1], Operand::Integer(1));
+
+        // `allocate_heap`'s stack need: `ERL_FUN_SIZE×2` = 4 words.
+        assert_eq!(instrs[1].opcode, Opcode::allocate_heap);
+        let stack_need = HeapNeed::from_operand(&instrs[1].operands[0]).unwrap();
+        assert_eq!(stack_need.words(), 4);
+        assert_eq!(
+            stack_need,
+            HeapNeed::Alloc(vec![AllocKind {
+                kind: 2,
+                number: 2,
+                words: 4,
+            }])
+        );
+        assert_eq!(instrs[1].operands[1], Operand::Integer(1));
+        assert_eq!(instrs[1].operands[2], Operand::Integer(1));
     }
 
     #[test]
