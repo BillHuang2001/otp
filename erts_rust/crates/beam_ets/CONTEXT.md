@@ -490,8 +490,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 
 ## Test Strategy
 - Per-module `#[cfg(test)]` tests in every `src/` module (`store/tests.rs`, `kind/tests.rs`,
-  `table/view/tests.rs` hold the big ones; `interior_parity.rs`/`interior_bench.rs` are `#[cfg(test)]`
-  siblings). Coverage:
+  `table/tests.rs`, `table/view/tests.rs`, `ordered_interior/tests.rs` hold the big ones;
+  `interior_parity.rs`/`interior_bench.rs` are `#[cfg(test)]` siblings). Coverage:
   kind/options, key validation, store copy/free/reuse/relinquish, table insert/take accounting,
   hash-interior ops, CHAMP ops (round-trip, 2000-key churn, collision node, canonicalization,
   memory monotonicity), B+-tree invariants (incl. 10 000-key churn), the sorted-`Vec` interior, the
@@ -631,7 +631,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/relinquish/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
 - `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors, metadata/ownership accessors (incl. the live `access` field + `set_access`), write ops, access checks, `select_all`, module wiring
-- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`)
+- `src/table/tests.rs` → the table-level unit tests (write ops, metadata, access/protection, ownership/heir, counters, the store-accounting cases)- `src/table/read.rs` → the read/navigation `impl Table` (incl. `is_named_table`)
 - `src/table/rename.rs` → `Table::rename` + `RenameOutcome` (`ets:rename/2` semantics)
 - `src/table/shared.rs` → `SharedTable` (the locked handle) + its unit tests
 - `src/table/view/mod.rs`, `view/read.rs`, `view/write.rs`, `view/term.rs`, `view/iter.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence, incl. `TableWrite::set_access`) + the view-borrowed traversal API (iterators / `foldl` / `foldr` / `tab2list_into`)
@@ -647,7 +647,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/interior_parity.rs` → cross-interior equivalence + default-selection tests (`#[cfg(test)]`)
 - `src/interior_bench.rs` → the interior microbenchmarks (`#[cfg(test)]`)
 - `src/ordered_interior/{mod,sorted,node,tree,iter}.rs` → the B+-tree `ordered_set` interior (conditional separator refresh via `InsertStep`, single-descent `insert_new`), the sorted-`Vec` alternative, the node arena, the tree ops, the iterator
-- `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations (`MatchContinuation` carries the table id + registered name + spec + direction + position)
+- `src/ordered_interior/tests.rs` → the ordered-interior unit tests (B+-tree invariants, the sorted-`Vec` interior, the `cmp_arith` key-order cases)- `src/select/{mod,pattern,expr,exec,run,continuation}.rs` → the match-spec compiler, executor, runner and continuations (`MatchContinuation` carries the table id + registered name + spec + direction + position)
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors
 - `tests/common/mod.rs` → shared integration-test helpers; `tests/common/oracle.rs` → the live-`erl` plumbing
