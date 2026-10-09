@@ -63,10 +63,10 @@ use beam_term::prelude::*;
 // ---------------------------------------------------------------------------
 
 /// The atoms the specs and values below reference (`$1` is the head variable;
-/// `a`..`e` are the object values; `<` is the guard operator).
+/// `a`..`f` are the object values; `<` is the guard operator).
 fn atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    for name in ["_", "$1", "a", "b", "c", "d", "e", "<"] {
+    for name in ["_", "$1", "a", "b", "c", "d", "e", "f", "<"] {
         atoms.intern(name);
     }
     atoms
@@ -81,6 +81,12 @@ fn object(heap: &mut Heap, key: i64, value: Eterm) -> Eterm {
     heap.tuple(&[make_small(key), value]).expect("test heap has room")
 }
 
+/// `{K}` — the singleton object the direction probes use (as in the oracle's
+/// `{1}`..`{6}` fixture).
+fn singleton(heap: &mut Heap, key: i64) -> Eterm {
+    heap.tuple(&[make_small(key)]).expect("test heap has room")
+}
+
 /// An `ordered_set` of `{1,a}`..`{n,letter}` (deterministic iteration order).
 fn ordered_table(heap: &mut Heap, atoms: &AtomTable, entries: &[(i64, &str)]) -> Table {
     let mut opts = TableOptions::new();
@@ -93,7 +99,49 @@ fn ordered_table(heap: &mut Heap, atoms: &AtomTable, entries: &[(i64, &str)]) ->
     table
 }
 
-/// `[{ '$1', [], ['$1'] }]` — a bare-variable head that binds the whole object and
+/// An `ordered_set` `{1}`..`{count}` — the singleton-object fixture the direction
+/// and identity probes use (the oracle's `{1}`..`{6}`). `configure` may amend the
+/// `ets:new/2` options (the rename probes build `named_table`s and name-recorded
+/// tables this way).
+fn singleton_table(
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    count: i64,
+    configure: impl FnOnce(&mut TableOptions),
+) -> Table {
+    let mut opts = TableOptions::new();
+    opts.set_kind(TableKind::OrderedSet);
+    configure(&mut opts);
+    let mut table = Table::new(TableId::next(), opts).expect("a fresh table");
+    for key in 1..=count {
+        let obj = singleton(heap, key);
+        table.insert(obj, atoms).expect("insert into a fresh table");
+    }
+    table
+}
+
+/// The six `{1,a}`..`{6,f}` entries two full `limit = 3` chunks need.
+const SIX: &[(i64, &str)] = &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e"), (6, "f")];
+
+/// The signature every `/1` entry point shares with its siblings.
+type ResumeStep = fn(
+    &Table,
+    &MatchContinuation,
+    &AtomTable,
+    &mut Heap,
+) -> Result<(Vec<Eterm>, Option<MatchContinuation>), BeamError>;
+
+/// The four `/1` entry points, in the order the embedded oracle escript's list
+/// comprehensions name them. In the oracle all four are the **same** resumption —
+/// this crate routes them through one identity/direction/body check — so the tests
+/// below drive a single continuation through every one of them and require the
+/// identical chunk.
+const RESUMES: [(&str, ResumeStep); 4] = [
+    ("select", Table::select_continue),
+    ("select_reverse", Table::select_reverse_continue),
+    ("match", Table::match_continue),
+    ("match_object", Table::match_object_continue),
+];/// `[{ '$1', [], ['$1'] }]` — a bare-variable head that binds the whole object and
 /// returns it. This is the spec the oracle chunking probes below use.
 fn whole_object_spec(heap: &mut Heap, atoms: &AtomTable) -> MatchSpec {
     let head = at(atoms, "$1");
@@ -471,10 +519,401 @@ fn a_continuation_from_another_table_is_badarg() {
     ));
 }
 
+/// The "deleted table" case: a continuation never transfers to a table created
+/// *after* it, even one built identically — every [`Table`] gets its own monotonic
+/// [`TableId`](beam_ets::TableId), so the oracle's `ets:delete/1`-then-recreate
+/// scenario (`ets:select(Cont)` ⇒ `error:badarg`; probed) is modelled by the
+/// identity check.
+#[test]
+fn a_continuation_does_not_transfer_to_a_recreated_table() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let spec = whole_object_spec(&mut heap, &atoms);
+
+    let original = ordered_table(&mut heap, &atoms, SIX);
+    let (_chunk, cont) = original.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a continuation");
+    drop(original); // `ets:delete/1`
+
+    let recreated = ordered_table(&mut heap, &atoms, SIX);
+    assert!(matches!(
+        recreated.select_continue(&cont, &atoms, &mut out),
+        Err(BeamError::BadArg)
+    ));
+    // ...and the id is never handed out again, so a later table rejects it too.
+    let later = ordered_table(&mut heap, &atoms, SIX);
+    assert!(matches!(
+        later.select_continue(&cont, &atoms, &mut out),
+        Err(BeamError::BadArg)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// The direction and the body travel with the continuation, not with the `/1` name
+// ---------------------------------------------------------------------------
+
+/// **The continuation carries its own direction: the `/1` entry point's name does
+/// not override it.** All four names yield the identical chunk for a continuation.
+///
+/// Oracle probe (OTP 29.1.1 / erts-17.1), `ordered_set {1}`..`{6}`,
+/// `S = [{'_',[],['$_']}]`:
+/// ```text
+/// {FC, CFC} = ets:select(T, S, 3),          FC = [{1},{2},{3}]
+/// ets:select_reverse(CFC)      -> {[{4},{5},{6}],cont}   ets:match(CFC)    -> same
+/// {RC, CRC} = ets:select_reverse(T, S, 3),  RC = [{6},{5},{4}]
+/// ets:select(CRC)              -> {[{3},{2},{1}],cont}   ets:match_object(CRC) -> same
+/// ```
+#[test]
+fn the_resume_entry_point_does_not_override_the_carried_direction() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let table = singleton_table(&mut heap, &atoms, 6, |_| {});
+    let spec = whole_object_spec(&mut heap, &atoms);
+
+    let forward_first = [
+        singleton(&mut heap, 1),
+        singleton(&mut heap, 2),
+        singleton(&mut heap, 3),
+    ];
+    let forward_second = [
+        singleton(&mut heap, 4),
+        singleton(&mut heap, 5),
+        singleton(&mut heap, 6),
+    ];
+    let reverse_first = [
+        singleton(&mut heap, 6),
+        singleton(&mut heap, 5),
+        singleton(&mut heap, 4),
+    ];
+    let reverse_second = [
+        singleton(&mut heap, 3),
+        singleton(&mut heap, 2),
+        singleton(&mut heap, 1),
+    ];
+
+    let (chunk, cont) = table.select_limit(&spec, 3, &atoms, &mut out).unwrap();
+    assert_results(&chunk, &forward_first, &atoms);
+    let cont = cont.expect("the limit landed before the end");
+    for (via, resume) in RESUMES {
+        let (next, more) = resume(&table, &cont, &atoms, &mut out)
+            .unwrap_or_else(|error| panic!("{via}: {error:?}"));
+        assert_results(&next, &forward_second, &atoms);
+        // A full chunk still continues, and the *chained* resume keeps the
+        // direction too.
+        let more = more.unwrap_or_else(|| panic!("{via}: a full chunk still continues"));
+        let (left, end) = resume(&table, &more, &atoms, &mut out)
+            .unwrap_or_else(|error| panic!("{via} (chained): {error:?}"));
+        assert!(left.is_empty() && end.is_none(), "{via}: exhausted");
+    }
+
+    let (chunk, cont) = table
+        .select_reverse_limit(&spec, 3, &atoms, &mut out)
+        .unwrap();
+    assert_results(&chunk, &reverse_first, &atoms);
+    let cont = cont.expect("the limit landed before the end");
+    for (via, resume) in RESUMES {
+        let (next, more) = resume(&table, &cont, &atoms, &mut out)
+            .unwrap_or_else(|error| panic!("{via}: {error:?}"));
+        assert_results(&next, &reverse_second, &atoms);
+        let more = more.unwrap_or_else(|| panic!("{via}: a full reverse chunk continues"));
+        let (left, end) = resume(&table, &more, &atoms, &mut out)
+            .unwrap_or_else(|error| panic!("{via} (chained): {error:?}"));
+        assert!(left.is_empty() && end.is_none(), "{via}: exhausted");
+    }
+}
+
+/// The continuation carries its **body** (the compiled spec) as well, so the `/1`
+/// name never changes what a chunk contains:
+/// ```text
+/// {_, MC} = ets:match(T, {'$1','_'}, 3),  MC = [[1],[2],[3]]
+/// ets:select(MC), ets:match_object(MC)     -> {[[4],[5],[6]],cont}  (the BINDINGS)
+/// {_, SC} = ets:select(T, S, 3),
+/// ets:match(SC)                            -> {[{4,a},{5,a},{6,a}],cont}  (the body)
+/// ```
+#[test]
+fn a_continuation_carries_its_body_across_the_match_and_select_entry_points() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let table = ordered_table(&mut heap, &atoms, SIX);
+    let spec = whole_object_spec(&mut heap, &atoms);
+    let pattern = heap.tuple(&[at(&atoms, "$1"), at(&atoms, "_")]).unwrap();
+
+    let bindings = |heap: &mut Heap, key: i64| heap.cons(make_small(key), NIL).unwrap();
+    let want_bindings = [
+        bindings(&mut heap, 4),
+        bindings(&mut heap, 5),
+        bindings(&mut heap, 6),
+    ];
+    let want_objects = [
+        object(&mut heap, 4, at(&atoms, "d")),
+        object(&mut heap, 5, at(&atoms, "e")),
+        object(&mut heap, 6, at(&atoms, "f")),
+    ];
+
+    let (chunk, cont) = table.match_limit(pattern, 3, &atoms, &mut out).unwrap();
+    assert_eq!(chunk.len(), 3, "the bound variables of the first three objects");
+    let cont = cont.expect("a full chunk");
+    for (via, resume) in RESUMES {
+        let (next, _) = resume(&table, &cont, &atoms, &mut out)
+            .unwrap_or_else(|error| panic!("{via}: {error:?}"));
+        assert_results(&next, &want_bindings, &atoms);
+    }
+
+    let (chunk, cont) = table.select_limit(&spec, 3, &atoms, &mut out).unwrap();
+    assert_eq!(chunk.len(), 3, "the spec's body of the first three objects");
+    let cont = cont.expect("a full chunk");
+    for (via, resume) in RESUMES {
+        let (next, _) = resume(&table, &cont, &atoms, &mut out)
+            .unwrap_or_else(|error| panic!("{via}: {error:?}"));
+        assert_results(&next, &want_objects, &atoms);
+    }
+}
+
+/// A continuation is an **immutable value**: the oracle hands back the same chunk
+/// however often it is resumed, and a finished one keeps yielding the bare
+/// `'$end_of_table'` (`{_, RE} = ets:select(T, S, 3)`: `ets:select(RE)` twice gives
+/// the same `{chunk,'$end_of_table'}`; `{_, FI} = ets:select(T, S, 5)`:
+/// `ets:select(FI)` gives `'$end_of_table'` every time).
+#[test]
+fn a_continuation_is_an_immutable_value() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let table = ordered_table(&mut heap, &atoms, SIX);
+    let spec = whole_object_spec(&mut heap, &atoms);
+
+    // Resuming the same continuation twice yields the same chunk.
+    let (_, cont) = table.select_limit(&spec, 3, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a full chunk");
+    let (first, _) = table.select_continue(&cont, &atoms, &mut out).unwrap();
+    let (second, _) = table.select_continue(&cont, &atoms, &mut out).unwrap();
+    assert_results(&second, &first, &atoms);
+
+    // A finished continuation keeps reporting the end.
+    let (_, finished) = table.select_limit(&spec, 6, &atoms, &mut out).unwrap();
+    let finished = finished.expect("landing exactly on the last object still continues");
+    for _ in 0..3 {
+        let (left, end) = table.select_continue(&finished, &atoms, &mut out).unwrap();
+        assert!(left.is_empty() && end.is_none(), "the traversal is over");
+    }
+}
+
+/// Reuse after the table changed: resuming over a table **emptied** since the
+/// continuation was issued yields `([], None)` (the oracle's bare
+/// `'$end_of_table'`), and objects **appended** past the issued position do not
+/// disturb the resume (both probed on the system `erl`).
+///
+/// The oracle keeps a key-based cursor, so its resume also survives a deletion
+/// *at or behind* the cursor; this crate's position is an index into the iteration
+/// order, which does not. `src/select/continuation.rs` documents that as a known
+/// approximation, so it is deliberately not pinned here.
+#[test]
+fn a_continuation_resumes_over_a_table_emptied_or_extended_since_it_was_issued() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let spec = whole_object_spec(&mut heap, &atoms);
+
+    // Emptied: the oracle's `ets:select(K1)` is the bare `'$end_of_table'`.
+    let mut emptied = ordered_table(&mut heap, &atoms, SIX);
+    let (_, cont) = emptied.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a continuation");
+    emptied.delete_all_objects();
+    let (results, end) = emptied.select_continue(&cont, &atoms, &mut out).unwrap();
+    assert!(results.is_empty() && end.is_none());
+
+    // Extended: the oracle continues at `[{3,a},{4,d}]`.
+    let mut extended = ordered_table(&mut heap, &atoms, SIX);
+    let (_, cont) = extended.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a continuation");
+    extended
+        .insert(object(&mut heap, 7, at(&atoms, "a")), &atoms)
+        .expect("insert into a live table");
+    let (results, more) = extended.select_continue(&cont, &atoms, &mut out).unwrap();
+    assert_results(
+        &results,
+        &[
+            object(&mut heap, 3, at(&atoms, "c")),
+            object(&mut heap, 4, at(&atoms, "d")),
+        ],
+        &atoms,
+    );
+    assert!(more.is_some(), "the extended table still has objects left");
+}
+
+/// A **full final chunk** — the limit landing exactly on the table's last object —
+/// still yields a continuation in every family, whose own resume is the empty end;
+/// `limit > size` completes in one chunk instead, and a *partial* final chunk in the
+/// reverse family ends. Probes on `{1}`..`{6}` (`{K,letter}` locally):
+/// `ets:select(T,S,6)` / `ets:select_reverse(T,S,6)` / `ets:match(T,{'$1','_'},6)`
+/// each return 6 results **plus a continuation**; `ets:select_reverse(T,S,5)` resumes
+/// to the single remaining object; `ets:select(T,S,7)` returns
+/// `{[6 objects],'$end_of_table'}`.
+#[test]
+fn a_full_final_chunk_still_yields_a_continuation_in_every_family() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let table = ordered_table(&mut heap, &atoms, SIX);
+    let spec = whole_object_spec(&mut heap, &atoms);
+    let pattern = heap.tuple(&[at(&atoms, "$1"), at(&atoms, "_")]).unwrap();
+
+    // limit == size: every family continues, and its resume is the empty end.
+    let (r, c) = table.select_limit(&spec, 6, &atoms, &mut out).unwrap();
+    assert_eq!(r.len(), 6);
+    let (left, end) = table
+        .select_continue(&c.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    assert!(left.is_empty() && end.is_none());
+
+    let (r, c) = table
+        .select_reverse_limit(&spec, 6, &atoms, &mut out)
+        .unwrap();
+    assert_eq!(r.len(), 6);
+    let (left, end) = table
+        .select_reverse_continue(&c.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    assert!(left.is_empty() && end.is_none());
+
+    let (r, c) = table.match_limit(pattern, 6, &atoms, &mut out).unwrap();
+    assert_eq!(r.len(), 6);
+    let (left, end) = table
+        .match_continue(&c.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    assert!(left.is_empty() && end.is_none());
+
+    let (r, c) = table
+        .match_object_limit(pattern, 6, &atoms, &mut out)
+        .unwrap();
+    assert_eq!(r.len(), 6);
+    let (left, end) = table
+        .match_object_continue(&c.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    assert!(left.is_empty() && end.is_none());
+
+    // The reverse family's *partial* final chunk ends instead.
+    let (r, c) = table
+        .select_reverse_limit(&spec, 5, &atoms, &mut out)
+        .unwrap();
+    assert_eq!(r.len(), 5);
+    let (left, end) = table
+        .select_reverse_continue(&c.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    assert_results(&left, &[object(&mut heap, 1, at(&atoms, "a"))], &atoms);
+    assert!(end.is_none(), "a partial final chunk ends the traversal");
+
+    // limit > size completes with no continuation, in every family.
+    assert!(table
+        .select_limit(&spec, 7, &atoms, &mut out)
+        .unwrap()
+        .1
+        .is_none());
+    assert!(table
+        .select_reverse_limit(&spec, 7, &atoms, &mut out)
+        .unwrap()
+        .1
+        .is_none());
+    assert!(table
+        .match_limit(pattern, 7, &atoms, &mut out)
+        .unwrap()
+        .1
+        .is_none());
+    assert!(table
+        .match_object_limit(pattern, 7, &atoms, &mut out)
+        .unwrap()
+        .1
+        .is_none());
+}
+
+/// `limit == 0` is `error:badarg` in **all four** `/3` entry points (probed: the
+/// oracle raises, it does not return an empty chunk).
+#[test]
+fn limit_zero_is_badarg_in_every_family() {
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let table = ordered_table(&mut heap, &atoms, SIX);
+    let spec = whole_object_spec(&mut heap, &atoms);
+    let pattern = heap.tuple(&[at(&atoms, "$1"), at(&atoms, "_")]).unwrap();
+
+    for (via, result) in [
+        ("select", table.select_limit(&spec, 0, &atoms, &mut out)),
+        (
+            "select_reverse",
+            table.select_reverse_limit(&spec, 0, &atoms, &mut out),
+        ),
+        ("match", table.match_limit(pattern, 0, &atoms, &mut out)),
+        (
+            "match_object",
+            table.match_object_limit(pattern, 0, &atoms, &mut out),
+        ),
+    ] {
+        assert!(
+            matches!(result, Err(BeamError::BadArg)),
+            "{via}: limit 0 must be badarg"
+        );
+    }
+}
+
+/// Continuation identity is the table's *user-facing identifier*, exactly as in the
+/// oracle: a `named_table`'s continuation carries the **name atom**, so renaming the
+/// table makes it unresolvable (`error:badarg`); a table that is not a `named_table`
+/// — even one with a recorded name — keeps its continuation (it carries the runtime
+/// id). Probe: `ets:select` on a continuation whose table was renamed gives
+/// `{[{3},{4}],cont}` for an unnamed table and `error:badarg` for
+/// `ets:new(nm,[ordered_set,named_table])` (whose continuation's first element is
+/// the name atom, a `#Ref<…>` otherwise).
+#[test]
+fn a_named_tables_continuation_dies_with_its_name_but_an_unnamed_tables_survives() {
+    let mut atoms = atoms();
+    let named1 = atoms.intern("named1");
+    let anon = atoms.intern("anon");
+    let renamed = atoms.intern("renamed");
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut out = Heap::new(4096).expect("out heap");
+    let spec = whole_object_spec(&mut heap, &atoms);
+
+    // A `named_table`: the continuation dies with the name it was issued under.
+    let mut named = singleton_table(&mut heap, &atoms, 6, |opts| {
+        opts.set_named(true);
+        opts.set_name(named1);
+    });
+    let (_, cont) = named.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a continuation");
+    let (before, _) = named.select_continue(&cont, &atoms, &mut out).unwrap();
+    assert_eq!(before.len(), 2, "valid while the name still resolves");
+    named.rename(renamed, |_| false).expect("a free new name");
+    assert!(matches!(
+        named.select_continue(&cont, &atoms, &mut out),
+        Err(BeamError::BadArg)
+    ));
+
+    // A recorded name alone is *not* the identity — the `named_table` flag decides.
+    let mut recorded = singleton_table(&mut heap, &atoms, 6, |opts| {
+        opts.set_name(anon);
+    });
+    let (_, cont) = recorded.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a continuation");
+    recorded.rename(renamed, |_| false).expect("rename");
+    let (after, more) = recorded.select_continue(&cont, &atoms, &mut out).unwrap();
+    assert_eq!(after.len(), 2, "a name-recorded table is not a named_table");
+    assert!(more.is_some());
+
+    // ...and a plain unnamed table behaves the same way.
+    let mut plain = singleton_table(&mut heap, &atoms, 6, |_| {});
+    let (_, cont) = plain.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a continuation");
+    plain.rename(renamed, |_| false).expect("rename");
+    let (after, _) = plain.select_continue(&cont, &atoms, &mut out).unwrap();
+    assert_eq!(after.len(), 2, "an unnamed table's continuation survives a rename");
+}
+
 // ---------------------------------------------------------------------------
 // Reverse-traversal variants: `ets:select_reverse/3`+`select_reverse/1`
 // ---------------------------------------------------------------------------
-
 /// Reverse chunking on the `ordered_set {1,a}..{5,e}`, spec `[{'$1',[],['$1']}]`,
 /// limit 2 — the oracle's `[{5,e},{4,d}]`+cont · `[{3,c},{2,b}]`+cont ·
 /// `([{1,a}], None)` (the exact reverse of `ets:select/3`).
@@ -645,8 +1084,49 @@ main(_) ->
     line("rev5_3", tail(ets:select_reverse(Y2))),
     line("rev_zero", try ets:select_reverse(T, S, 0) of _ -> ok catch _:_ -> badarg end),
     line("rev_empty", tail(ets:select_reverse(E, S, 2))),
-    ok.
 
+    %% The direction AND the body travel with the continuation, not with the `/1`
+    %% name; a continuation is an immutable value; its identity is the table's name.
+    {_, DF} = ets:select(T, S, 3),
+    [line(N, tail(F(DF))) || {N, F} <- [
+        {"dir_fwd_via_select", fun ets:select/1},
+        {"dir_fwd_via_select_reverse", fun ets:select_reverse/1},
+        {"dir_fwd_via_match", fun ets:match/1},
+        {"dir_fwd_via_match_object", fun ets:match_object/1}]],
+    {_, DR} = ets:select_reverse(T, S, 3),
+    [line(N, tail(F(DR))) || {N, F} <- [
+        {"dir_rev_via_select", fun ets:select/1},
+        {"dir_rev_via_select_reverse", fun ets:select_reverse/1},
+        {"dir_rev_via_match", fun ets:match/1},
+        {"dir_rev_via_match_object", fun ets:match_object/1}]],
+    {_, BM} = ets:match(T, {'$1','_'}, 3),
+    line("body_match_via_select", tail(ets:select(BM))),
+    {_, BS} = ets:select(T, S, 3),
+    line("body_select_via_match", tail(ets:match(BS))),
+    {_, RE} = ets:select(T, S, 3),
+    line("reuse_first", tail(ets:select(RE))),
+    line("reuse_second", tail(ets:select(RE))),
+    {_, FI} = ets:select(T, S, 5),
+    line("finished_first", tail(ets:select(FI))),
+    line("finished_second", tail(ets:select(FI))),
+    {RV, RVC} = ets:select_reverse(T, S, 5),
+    line("rev_full_final", chunk(RV, RVC)),
+    line("rev_full_final_resume", tail(ets:select_reverse(RVC))),
+    {RP, RPC} = ets:select_reverse(T, S, 3),
+    line("rev_partial", chunk(RP, RPC)),
+    line("rev_partial_resume", tail(ets:select_reverse(RPC))),
+    UN = ets:new(un, [ordered_set]),
+    [ets:insert(UN,{I}) || I <- lists:seq(1,6)],
+    {_, UC} = ets:select(UN, S, 2),
+    ets:rename(UN, un_renamed),
+    line("unnamed_rename_resume", tail(ets:select(UC))),
+    _NM = ets:new(nm, [ordered_set, named_table]),
+    [ets:insert(nm,{I}) || I <- lists:seq(1,6)],
+    {_, NC} = ets:select(nm, S, 2),
+    ets:rename(nm, nm_renamed),
+    line("named_rename_resume",
+         try ets:select(NC) of _ -> "not-badarg" catch error:badarg -> "badarg" end),
+    ok.
 chunk(Results, _Cont) -> "{" ++ rlist(Results) ++ ",cont}".
 tail('$end_of_table') -> "end";
 tail({Results, '$end_of_table'}) -> "{" ++ rlist(Results) ++ ",end}";
@@ -736,11 +1216,10 @@ fn render_term(term: Eterm, atoms: &AtomTable) -> String {
 /// The `beam_ets` half of the battery — the same operations in the same order as
 /// [`ORACLE_PROGRAM`].
 fn rust_battery() -> BTreeMap<String, String> {
-    let atoms = atoms();
+    let mut atoms = atoms();
     let mut heap = Heap::new(65536).expect("test heap");
     let mut out = Heap::new(65536).expect("out heap");
     let mut cases = BTreeMap::new();
-
     let five = ordered_table(
         &mut heap,
         &atoms,
@@ -841,9 +1320,125 @@ fn rust_battery() -> BTreeMap<String, String> {
         .unwrap();
     cases.insert("rev_empty".into(), render_chunk(&r, c.as_ref(), &atoms));
 
+    // ---- the direction and the body travel with the continuation -------------
+    let (_, forward) = five.select_limit(&spec, 3, &atoms, &mut out).unwrap();
+    let forward = forward.expect("a full chunk");
+    for (via, resume) in RESUMES {
+        let (chunk, cont) = resume(&five, &forward, &atoms, &mut out)
+            .unwrap_or_else(|error| panic!("{via}: {error:?}"));
+        cases.insert(
+            format!("dir_fwd_via_{via}"),
+            render_chunk(&chunk, cont.as_ref(), &atoms),
+        );
+    }
+    let (_, reverse) = five
+        .select_reverse_limit(&spec, 3, &atoms, &mut out)
+        .unwrap();
+    let reverse = reverse.expect("a full chunk");
+    for (via, resume) in RESUMES {
+        let (chunk, cont) = resume(&five, &reverse, &atoms, &mut out)
+            .unwrap_or_else(|error| panic!("{via}: {error:?}"));
+        cases.insert(
+            format!("dir_rev_via_{via}"),
+            render_chunk(&chunk, cont.as_ref(), &atoms),
+        );
+    }
+
+    let (_, bindings) = five.match_limit(pattern, 3, &atoms, &mut out).unwrap();
+    let (chunk, cont) = five
+        .select_continue(&bindings.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    cases.insert(
+        "body_match_via_select".into(),
+        render_chunk(&chunk, cont.as_ref(), &atoms),
+    );
+    let (_, selected) = five.select_limit(&spec, 3, &atoms, &mut out).unwrap();
+    let (chunk, cont) = five
+        .match_continue(&selected.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    cases.insert(
+        "body_select_via_match".into(),
+        render_chunk(&chunk, cont.as_ref(), &atoms),
+    );
+
+    // ---- a continuation is an immutable value -------------------------------
+    let (_, reuse) = five.select_limit(&spec, 3, &atoms, &mut out).unwrap();
+    let reuse = reuse.expect("a full chunk");
+    let (chunk, cont) = five.select_continue(&reuse, &atoms, &mut out).unwrap();
+    cases.insert("reuse_first".into(), render_chunk(&chunk, cont.as_ref(), &atoms));
+    let (chunk, cont) = five.select_continue(&reuse, &atoms, &mut out).unwrap();
+    cases.insert("reuse_second".into(), render_chunk(&chunk, cont.as_ref(), &atoms));
+
+    let (_, finished) = five.select_limit(&spec, 5, &atoms, &mut out).unwrap();
+    let finished = finished.expect("limit == size still continues");
+    let (chunk, cont) = five.select_continue(&finished, &atoms, &mut out).unwrap();
+    cases.insert(
+        "finished_first".into(),
+        render_chunk(&chunk, cont.as_ref(), &atoms),
+    );
+    let (chunk, cont) = five.select_continue(&finished, &atoms, &mut out).unwrap();
+    cases.insert(
+        "finished_second".into(),
+        render_chunk(&chunk, cont.as_ref(), &atoms),
+    );
+
+    // ---- full and partial final reverse chunks ------------------------------
+    let (chunk, cont) = five
+        .select_reverse_limit(&spec, 5, &atoms, &mut out)
+        .unwrap();
+    cases.insert(
+        "rev_full_final".into(),
+        render_chunk(&chunk, cont.as_ref(), &atoms),
+    );
+    let (chunk, cont) = five
+        .select_reverse_continue(&cont.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    cases.insert(
+        "rev_full_final_resume".into(),
+        render_chunk(&chunk, cont.as_ref(), &atoms),
+    );
+    let (chunk, cont) = five
+        .select_reverse_limit(&spec, 3, &atoms, &mut out)
+        .unwrap();
+    cases.insert("rev_partial".into(), render_chunk(&chunk, cont.as_ref(), &atoms));
+    let (chunk, cont) = five
+        .select_reverse_continue(&cont.expect("a full chunk"), &atoms, &mut out)
+        .unwrap();
+    cases.insert(
+        "rev_partial_resume".into(),
+        render_chunk(&chunk, cont.as_ref(), &atoms),
+    );
+
+    // ---- identity: renaming a named_table kills its continuation ------------
+    let un_renamed = atoms.intern("un_renamed");
+    let nm = atoms.intern("nm");
+    let nm_renamed = atoms.intern("nm_renamed");
+    let mut un = singleton_table(&mut heap, &atoms, 6, |_| {});
+    let (_, cont) = un.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a continuation");
+    un.rename(un_renamed, |_| false).expect("rename");
+    let (chunk, cont) = un.select_continue(&cont, &atoms, &mut out).unwrap();
+    cases.insert(
+        "unnamed_rename_resume".into(),
+        render_chunk(&chunk, cont.as_ref(), &atoms),
+    );
+    let mut named = singleton_table(&mut heap, &atoms, 6, |opts| {
+        opts.set_named(true);
+        opts.set_name(nm);
+    });
+    let (_, cont) = named.select_limit(&spec, 2, &atoms, &mut out).unwrap();
+    let cont = cont.expect("a continuation");
+    named.rename(nm_renamed, |_| false).expect("rename");
+    cases.insert(
+        "named_rename_resume".into(),
+        match named.select_continue(&cont, &atoms, &mut out) {
+            Err(BeamError::BadArg) => "badarg".to_string(),
+            other => panic!("a renamed named_table must reject its continuation, got {other:?}"),
+        },
+    );
+
     cases
 }
-
 /// Locate the oracle's `escript` from `$ERTS_ORACLE`, then `$PATH`.
 ///
 /// Mirroring `tests/differential.rs`, a `$ERTS_ORACLE` that points at something

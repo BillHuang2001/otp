@@ -35,8 +35,60 @@
 //! `ets:select_reverse/3`+`select_reverse/1` are the **reverse-direction**
 //! analogues: they scan the reverse of [`Table::tab2list`] order (descending key
 //! order for an `ordered_set`, the reverse of the unspecified forward order for the
-//! hash kinds) and follow every rule below unchanged. The direction is carried by
-//! the [`MatchContinuation`], so a `/1` resume stays in the originating direction.
+//! hash kinds) and follow every rule below unchanged.
+//!
+//! # The direction *and* the body travel with the continuation, not with the `/1` name
+//!
+//! Every `/1` entry point is the **same** resumption: it continues the traversal the
+//! continuation was created from. Neither the direction nor the result body is taken
+//! from the function a caller resumes *through* — both are carried by the
+//! [`MatchContinuation`]. Verified against the system `erl` (OTP 29.1.1 /
+//! erts-17.1) on the `ordered_set` `{1}..{6}` with `S = [{'_',[],['$_']}]`:
+//!
+//! ```text
+//! {FC, CFC} = ets:select(T, S, 3),          FC  = [{1},{2},{3}]
+//! {RC, CRC} = ets:select_reverse(T, S, 3),  RC  = [{6},{5},{4}]
+//! ets:select(FC)              = {[{4},{5},{6}],cont}   (FORWARD chunk 2)
+//! ets:select_reverse(CFC)     = {[{4},{5},{6}],cont}   (still FORWARD!)
+//! ets:select(RC)              = {[{3},{2},{1}],cont}   (REVERSE chunk 2)
+//! ets:select_reverse(CRC)     = {[{3},{2},{1}],cont}   (still REVERSE!)
+//! {_, MC} = ets:match(T, {'$1','_'}, 3),   MC  = [[1],[2],[3]]
+//! ets:match(MC)               = {[[4],[5],[6]],cont}   (the BINDINGS body)
+//! ets:select(MC)              = {[[4],[5],[6]],cont}   (bindings, not objects!)
+//! ets:select_reverse(MC)      = {[[4],[5],[6]],cont}   (still FORWARD)
+//! ets:match_object(MC)        = {[[4],[5],[6]],cont}   (the carried body wins)
+//! {_, SC} = ets:select(T, S, 3),
+//! ets:match(SC)               = {[{4,a},{5,a},{6,a}],cont}  (the '$_' body)
+//! ```
+//!
+//! A resumed chunk is also reproducible: a continuation is an immutable value in the
+//! oracle (`ets:select(C)` returns the same chunk however often it is called, and
+//! re-resuming a finished continuation keeps yielding the bare `'$end_of_table'`),
+//! which is why this crate takes every continuation by `&` and never mutates one.
+//! Concretely that is why all four `/1` entry points route through one shared
+//! `resume`: it reruns the continuation's own `spec` at its own `position` in its own
+//! `reverse` order, and the entry point's name is never consulted.
+//!
+//! # A stale, foreign or forged continuation is `badarg`
+//!
+//! `ets:select/1` and its siblings raise `error:badarg` when the continuation's
+//! table can no longer be resolved. Verified against the system `erl`:
+//!
+//! * a continuation whose table was **deleted** (`ets:delete/1`) ⇒ `badarg`;
+//! * a continuation issued for a **`named_table`** and resumed after the table was
+//!   `ets:rename/2`d ⇒ `badarg` — the oracle's continuation stores the **name atom**
+//!   for a named table (its first element is `named1`, a `#Ref<…>` for an unnamed
+//!   one), so the old name no longer resolves. A continuation from an **unnamed**
+//!   table survives a rename (it stores the runtime id);
+//! * a forged or wrong-shaped term (`garbage`, `{foo,bar,baz}`, `ets:all()`) ⇒
+//!   `badarg`. The one special case is the atom `'$end_of_table'`, which is
+//!   idempotent (`ets:select('$end_of_table')` ⇒ `'$end_of_table'`); that is the BIF
+//!   bridge's rendering rule, not a traversal, so it does not appear here.
+//!
+//! This crate models the rule with the continuation's **identity**: the table's
+//! [`TableId`] plus — for a `named_table` only — the name it was issued under. A
+//! forged term cannot exist at all, because [`MatchContinuation`] is opaque and only
+//! the `/3` methods can build one.
 //!
 //! The chunking rule reproduced from the oracle (verified against OTP 29 /
 //! erts-17.1, `erl -noshell -eval`):
@@ -80,10 +132,14 @@
 //! A continuation stores the scan position as an **index into the table's
 //! iteration order**. This is faithful for an unmodified table (the tests hold the
 //! table fixed between chunks). A table mutated between a `/3` call and its `/1`
-//! resume may shift that index (the oracle instead keeps an internal cursor); the
-//! position is still bounds-checked, so a stale index never reads out of bounds —
-//! it just resumes at a possibly different object. This is the same "hash-kind
-//! order is unspecified" freedom the crate documents elsewhere.
+//! resume may shift that index, whereas the oracle keeps a **key-based cursor**:
+//! verified on the `ordered_set` `{1}..{6}` with `limit = 2`, deleting `{1}` behind
+//! the cursor still resumes at `[{3},{4}]` and inserting `{0}` before it does not
+//! shift the resume either — an index-based position would return `[{4},{5}]` and
+//! `[{1},{2}]` respectively. The position is still bounds-checked, so a stale index
+//! never reads out of bounds — it just resumes at a possibly different object. This
+//! is the same "hash-kind order is unspecified" freedom the crate documents
+//! elsewhere; a faithful `ordered_set` cursor is unlanded work.
 
 use beam_alloc::Heap;
 use beam_common::Result;
@@ -108,8 +164,15 @@ pub struct MatchContinuation {
     /// offered to a *different* table is rejected with `badarg` rather than being
     /// applied to unrelated objects.
     table_id: TableId,
+    /// The name the traversal's table was registered under, for a **`named_table`**
+    /// only (`None` for every other table). The oracle's continuation stores the
+    /// name atom for a named table, so a `rename` makes the previously-issued
+    /// continuations unresolvable; carrying the name reproduces that `badarg`.
+    name: Option<Atom>,
     /// The compiled spec the traversal runs (cloned from the originating `/3`
-    /// call, so a `/1` resume needs no spec argument).
+    /// call, so a `/1` resume needs no spec argument). It also carries the result
+    /// body, which is why a `match/3` continuation resumed through `ets:select/1`
+    /// still yields the bound variables.
     spec: MatchSpec,
     /// The limit the originating `/3` call used (reused by `/1`).
     limit: usize,
@@ -120,7 +183,7 @@ pub struct MatchContinuation {
     /// [`Table::tab2list`] order (`ets:select_reverse/3`, `true`) or forward
     /// (`ets:select/3`, `false`). A forward and a reverse traversal of the same
     /// table have different `position` spaces, so the direction must survive a
-    /// `/1` resume alongside the index.
+    /// `/1` resume alongside the index — and it does, whatever `/1` name is used.
     reverse: bool,
 }
 
@@ -171,16 +234,37 @@ impl Table {
         }
     }
 
-    /// Resume a continuation: recheck the table, rerun the carried spec from the
-    /// carried position with the carried limit (and direction), and rebuild the
-    /// continuation when another full chunk is produced.
+    /// The identity a continuation issued right now would carry for this table: the
+    /// name it is registered under for a **`named_table`** (`None` otherwise). The
+    /// oracle's continuation stores the name atom for a named table, so comparing it
+    /// at every resume reproduces the oracle's `badarg` for a continuation resumed
+    /// after an `ets:rename/2`.
+    fn continuation_name(&self) -> Option<Atom> {
+        if self.is_named_table() {
+            self.name()
+        } else {
+            None
+        }
+    }
+
+    /// Resume a continuation: recheck the table identity, rerun the carried spec
+    /// from the carried position with the carried limit and direction, and rebuild
+    /// the continuation when another full chunk is produced.
+    ///
+    /// The identity check is the crate's model of the oracle's "the table
+    /// identifier does not resolve" `badarg`: a continuation from another table, or
+    /// one issued before a `named_table` was renamed away from the name it was
+    /// issued under, is rejected. Note that the entry point's *name* is deliberately
+    /// irrelevant — [`Table::select_continue`], [`Table::select_reverse_continue`],
+    /// [`Table::match_continue`] and [`Table::match_object_continue`] are the same
+    /// resumption, exactly as in the oracle.
     fn resume(
         &self,
         cont: &MatchContinuation,
         atoms: &AtomTable,
         heap: &mut Heap,
     ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
-        if cont.table_id != self.id() {
+        if cont.table_id != self.id() || cont.name != self.continuation_name() {
             return Err(badarg());
         }
         let (results, resume) = self.traverse(
@@ -211,6 +295,7 @@ impl Table {
         let (results, resume) = self.traverse(spec, limit, 0, false, atoms, heap)?;
         let continuation = resume.map(|position| MatchContinuation {
             table_id: self.id(),
+            name: self.continuation_name(),
             spec: spec.clone(),
             limit,
             position,
@@ -257,6 +342,7 @@ impl Table {
         let (results, resume) = self.traverse(spec, limit, 0, true, atoms, heap)?;
         let continuation = resume.map(|position| MatchContinuation {
             table_id: self.id(),
+            name: self.continuation_name(),
             spec: spec.clone(),
             limit,
             position,
@@ -328,11 +414,12 @@ impl Table {
 }
 
 impl MatchContinuation {
-    /// A copy of `self` resuming at `position` (same table, spec, limit and
+    /// A copy of `self` resuming at `position` (same table identity, spec, limit and
     /// traversal direction).
     fn at(&self, position: usize) -> MatchContinuation {
         MatchContinuation {
             table_id: self.table_id,
+            name: self.name,
             spec: self.spec.clone(),
             limit: self.limit,
             position,
