@@ -165,19 +165,21 @@ short form is the safe one. Repro:
 `beam_rt: allocation failure: message (…)`; `… -boot "$PWD/bootstrap/bin/start"` → the boot completes
 (exit 0).
 
-### Remaining blocker chain (owner per link)
-1. **`beam_rt` / `kernel` (owner: the parent node, not `src/boot/**`) — no `file_server_2`.** The stop
-   is `c:erlangrc/0`'s file consult needing the `file_server_2` registered kernel server, which this
-   runtime never registers (it is a child of `kernel`'s `file_server`, started by the full
-   `application:start_boot` path this runtime does not complete).
-2. **`beam_engine`.** `Instr::Apply`/`ApplyLast` (`families/funs.rs::apply_target`) dispatch through the
-   synchronous `call_bif` instead of the `resolve_external_call`/`Step::Enter` seam, so
-   `proc_lib:init_p/5`'s `try apply(M,F,A) catch … end` cannot suspend; and a `func_info`-driven raise
-   carries an EMPTY `Raise.stacktrace.frames`, so a boot-path `function_clause` is unlocalizable.
-3. **`beam_rt` `../native/init.rs` — `init:get_arguments/0` lists only the command-line flags**, so
-   it omits the oracle's automatic `root`/`bindir`/`progname`/`home`. A `RuntimeConfig::default()`
-   runtime therefore stops three instructions earlier, at instruction 16 (`application:load/1`, an
-   `error function_clause`); the CLI-equivalent configuration reaches instruction 20.
+### Remaining gaps (owner per link)
+1. **`beam_engine`.** `Instr::Apply`/`ApplyLast` (`families/funs.rs::apply_target`) dispatch through the
+   synchronous `call_bif` instead of the `resolve_external_call`/`Step::Enter` seam, so a **scheduled**
+   process's `gen_server:call` to the native `file_server_2` service folds into `error::blocked()`
+   instead of suspending (a boot `{apply, …}` directive is unaffected — it runs in a non-slice machine
+   with a blocking-aware entry). A `func_info`-driven raise also carries an EMPTY
+   `Raise.stacktrace.frames`, so a boot-path `function_clause` is unlocalizable; and a native service
+   hosts no engine, so the `{get_until,…}` io request (`erl_scan:tokens/4`) cannot be served here.
+2. **`beam_rt` `../native.rs`** — `io:request/2` (the `file:read/2`/`read_line/1` device-read path) dies
+   on the unimplemented `net_kernel:dflag_unicode_io/1`, so the served `{get_chars,…}` device is
+   unreachable from library code.
+3. **`beam_rt` `../native/init.rs` — `init:get_arguments/0` lists only the command-line flags**, so it
+   omits the oracle's automatic `root`/`bindir`/`progname`/`home`. A `RuntimeConfig::default()` runtime
+   therefore stops at instruction 16 (`application:load/1`, an `error function_clause`); the
+   CLI-equivalent configuration runs the whole script.
 4. **`beam_bifs`.** Whatever the started applications still need past the above.
 
 ## Constraints
