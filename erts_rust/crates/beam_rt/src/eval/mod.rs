@@ -320,11 +320,22 @@ impl BitBuf {
 ///   evaluated expression (including `erlang:halt/0,1`), or a documented
 ///   Milestone-1 gap ([`crate::error::unsupported`]).
 pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
-    let tree = parse::parse(expr)?;
-    let mut evaluator = Evaluator { ctx };
-    let mut env = Env::new();
-    let outcome = evaluator.expr(&tree, &mut env);
-    finish(outcome, evaluator.ctx)
+    // The evaluator keeps its environment ([`Env`]) in Rust locals, so its terms are **not**
+    // in the root set a delivery-driven collection can publish: a reply delivered to this
+    // process while the evaluation waits would collect (and move) the heap under a term an
+    // earlier reply produced. The whole driver therefore runs with the process marked
+    // relocation-exempt, so such a delivery is refused and routed to the heap-fragment
+    // fallback instead of relocating anything (see
+    // [`RuntimeContext::with_relocation_exempt`]). The evaluator's own receive pump
+    // (`Runtime::pump_scheduler`) runs **inside** this scope, which is exactly when a reply to
+    // this very pid can arrive.
+    ctx.with_relocation_exempt(|ctx| {
+        let tree = parse::parse(expr)?;
+        let mut evaluator = Evaluator { ctx };
+        let mut env = Env::new();
+        let outcome = evaluator.expr(&tree, &mut env);
+        finish(outcome, evaluator.ctx)
+    })
 }
 
 /// Converts the evaluator's control flow into a runtime [`Result`].

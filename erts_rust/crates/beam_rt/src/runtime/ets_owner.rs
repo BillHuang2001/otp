@@ -117,6 +117,7 @@ use beam_process::{
 use beam_term::{make_atom, Atom, Eterm};
 
 use super::Runtime;
+use crate::RuntimeContext;
 
 /// The index key of an owner: the raw value of its internal pid immediate.
 ///
@@ -577,7 +578,12 @@ impl Runtime {
                 None => tid_ref_thing(&mut heap, handle)?,
             };
             let message = heap.tuple(&[tag, tid, from, data])?;
-            table.deliver_simple(to, from, message)?;
+            // The runtime's one **fragment-aware** delivery
+            // (`RuntimeContext::deliver_in_table`): an heir that is **relocation-exempt** (a
+            // process under the `-eval` evaluator or a nested machine) refuses the collection
+            // an exhausted delivery would otherwise run, so the heap-fragment fallback is what
+            // lets the transfer land.
+            RuntimeContext::deliver_in_table(self, table, to, from, message)?;
             delivered += 1;
         }
         self.put_bif_heap(heap);

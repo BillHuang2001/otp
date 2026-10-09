@@ -1635,7 +1635,12 @@ impl Runtime {
             if !table.contains(recipient) {
                 continue;
             }
-            table.deliver_simple(recipient, from, message)?;
+            // The runtime's one **fragment-aware** delivery
+            // (`RuntimeContext::deliver_in_table`): an owner that is **relocation-exempt** (a
+            // process under the `-eval` evaluator or a nested machine) refuses the collection
+            // an exhausted delivery would otherwise run, so the heap-fragment fallback is what
+            // lets the port message land.
+            RuntimeContext::deliver_in_table(self, table, recipient, from, message)?;
             delivered += 1;
         }
         Ok(delivered)

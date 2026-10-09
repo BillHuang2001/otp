@@ -59,6 +59,7 @@ use crate::error;
 use crate::runtime::Runtime;
 use crate::runner::{RunnerState, RuntimeRunner};
 use crate::timers::{TimerAction, TimerTarget};
+use crate::RuntimeContext;
 
 /// The longest [`Runtime::pump_scheduler`] (the `-eval` receive pump) may sleep waiting for
 /// the next timer deadline.
@@ -837,7 +838,12 @@ impl Runtime {
                     if !table.contains(pid) {
                         continue; // a pid that has already terminated
                     }
-                    table.deliver_simple(pid, from, message)?;
+                    // The runtime's one **fragment-aware** delivery
+                    // (`RuntimeContext::deliver_in_table`): a **relocation-exempt** receiver (a
+                    // process under the `-eval` evaluator or a nested machine) refuses the
+                    // collection an exhausted delivery would otherwise run, so the
+                    // heap-fragment fallback is what lets the timer's message land.
+                    RuntimeContext::deliver_in_table(self, table, pid, from, message)?;
                     effects += 1;
                 }
                 TimerAction::Resume { pid, func, pc } => {

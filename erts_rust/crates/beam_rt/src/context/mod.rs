@@ -349,6 +349,78 @@ impl<'a> RuntimeContext<'a> {
         }
     }
 
+    /// Runs `f` with this context's process ([`Self::pid`]) marked **relocation-exempt**,
+    /// restoring the previous mark **whatever `f` returns**.
+    ///
+    /// # What the exemption buys
+    ///
+    /// A delivery into an exempt process never relocates its heap
+    /// ([`Process::set_relocation_exempt`](beam_process::Process::set_relocation_exempt)):
+    /// an exhausted delivery returns the copier's **raw**
+    /// [`Alloc(AllocKind::Message)`](BeamError::Alloc) refusal instead of collecting, and
+    /// [`Self::deliver_message`] keys on exactly that to route the payload through the
+    /// heap-fragment fallback ([`Self::send_fragmented_message`]) — so the message still
+    /// arrives, with no word moved under the caller's feet.
+    ///
+    /// # Why the wrapped scopes need it
+    ///
+    /// Every wrapped scope runs code that holds `Eterm`s **outside** the root set a
+    /// delivery-driven collection can publish: the `-eval` evaluator's `Env`, and the
+    /// `x`/stack of a nested [`Machine`](beam_engine::Machine) built by
+    /// [`Self::run_export_blocking`]/[`Self::run_label_blocking`]/[`Self::apply_fun`].
+    /// [`Process::deliver`](beam_process::Process::deliver) collects the receiver's heap when
+    /// a message does not fit, publishing only the process's own containers, so a term the
+    /// caller copied out of an earlier message — an `io:scan_erl_exprs/4` result, say — would
+    /// be recycled by the *next* message's delivery. An exempt process refuses that
+    /// collection instead, which is what keeps the caller's handles valid.
+    ///
+    /// The scheduler slice is deliberately **not** wrapped: the runner drives it with
+    /// `run_export_outcome_with_tier`/`run_label_outcome_with_tier` directly, publishes a
+    /// parked machine's roots, and its `BudgetContext` arms the per-call GC latch for the
+    /// admission point that **is** the legitimate collection site
+    /// ([`gc::ensure_heap`](crate::context::gc::ensure_heap)).
+    ///
+    /// # Nesting
+    ///
+    /// The previous mark is read back with
+    /// [`ProcessTable::is_relocation_exempt`] and restored with
+    /// [`ProcessTable::set_relocation_exempt`], so a nested scope leaves the outer scope's
+    /// mark exactly as it found it — the `apply_fun` scope inside the
+    /// `run_export_blocking` scope, say.
+    ///
+    /// # Errors
+    ///
+    /// `f`'s own error wins. The **restore** failure is surfaced only when `f` succeeded: a
+    /// restore failure cannot un-run the closure, and the closure's diagnostic is the more
+    /// useful one. A pid this context's table does not hold is not an error — there is no
+    /// process to exempt, so `f` simply runs unguarded (whatever `f` does reports the miss).
+    pub(crate) fn with_relocation_exempt<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let pid = self.mailbox_pid;
+        let previous = match self.process_table().is_relocation_exempt(pid) {
+            Ok(previous) => Some(previous),
+            // A pid with no process has no heap to move, so there is nothing to exempt.
+            Err(BeamError::TermNotFound) => None,
+            Err(other) => return Err(other),
+        };
+        if previous.is_some() {
+            self.process_table_mut().set_relocation_exempt(pid, true)?;
+        }
+        let outcome = f(self);
+        let Some(previous) = previous else {
+            return outcome;
+        };
+        match self.process_table_mut().set_relocation_exempt(pid, previous) {
+            Ok(()) => outcome,
+            Err(restore) => match outcome {
+                Ok(_) => Err(restore),
+                Err(err) => Err(err),
+            },
+        }
+    }
+
     /// Re-syncs a **resuming** machine from this context's process root set (the runner's
     /// resume seam).
     ///
@@ -409,6 +481,40 @@ impl<'a> RuntimeContext<'a> {
                 .map_err(error::enforce_term_heap_limit),
             other => other.map(|_| ()).map_err(error::enforce_term_heap_limit),
         }
+    }
+
+    /// [`Self::deliver_message`] for a caller that already holds the runtime and the
+    /// destination's process table **separately** — the runtime's own delivery steps
+    /// ([`Runtime::service_file_requests`](crate::runtime::Runtime),
+    /// [`Runtime::deliver_port_messages`](crate::runtime::Runtime),
+    /// [`Runtime::fire_due_timers`](crate::runtime::Runtime),
+    /// [`Runtime::drain_ets_owner_exits`](crate::runtime::Runtime)), which run at a
+    /// scheduler-pass boundary where the table has been moved out of the runtime.
+    ///
+    /// It carries the **same** delivery semantics — the plain receiver-heap copy, the
+    /// heap-fragment fallback on the copier's raw [`AllocKind::Message`] refusal, and the
+    /// `error:system_limit` translation — so every message a process receives arrives through
+    /// one implementation. It matters most for a **relocation-exempt** receiver
+    /// ([`Self::with_relocation_exempt`]): such a process refuses the collection an exhausted
+    /// delivery would otherwise run, so without the fallback that refusal would fail the whole
+    /// scheduler pass instead of delivering the message.
+    ///
+    /// The throwaway context exists only to reach that one method: `to` is the destination, so
+    /// it addresses exactly the mailbox being delivered to and never pumps the scheduler
+    /// ([`RuntimeContext::for_process`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::deliver_message`]: the table's typed `TermNotFound` for a pid no process
+    /// exists for, and the fragment fallback's own failure translated to `error:system_limit`.
+    pub(crate) fn deliver_in_table(
+        runtime: &'a mut Runtime,
+        table: &'a mut ProcessTable,
+        to: ProcessId,
+        from: Eterm,
+        message: Eterm,
+    ) -> Result<()> {
+        RuntimeContext::for_process(runtime, table, to).deliver_message(to, from, message)
     }
     /// Delivers `message` into `to`'s mailbox through the **heap-fragment** model — the
     /// sender half of the C `erts_try_alloc_message_on_heap`/`new_message_buffer` path
@@ -659,23 +765,28 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        let mut machine = Machine::new();
-        let mut outcome = machine.run_export_outcome(module, function, arity, args, self)?;
-        loop {
-            match outcome {
-                RunOutcome::Returned(value) => return Ok(value),
-                RunOutcome::Wait { func, pc } => {
-                    if !self.may_pump_scheduler() {
-                        return Err(beam_engine::blocked());
+        // The fresh `Machine` below holds its `x`/stack outside the process root set a
+        // delivery-driven collection publishes, so the process is relocation-exempt for the
+        // whole run (see [`Self::with_relocation_exempt`]).
+        self.with_relocation_exempt(|this| {
+            let mut machine = Machine::new();
+            let mut outcome = machine.run_export_outcome(module, function, arity, args, this)?;
+            loop {
+                match outcome {
+                    RunOutcome::Returned(value) => return Ok(value),
+                    RunOutcome::Wait { func, pc } => {
+                        if !this.may_pump_scheduler() {
+                            return Err(beam_engine::blocked());
+                        }
+                        let ran = this.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+                        if ran == 0 {
+                            return Err(beam_engine::blocked());
+                        }
+                        outcome = machine.resume_outcome(module, func, pc, this)?;
                     }
-                    let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
-                    if ran == 0 {
-                        return Err(beam_engine::blocked());
-                    }
-                    outcome = machine.resume_outcome(module, func, pc, self)?;
                 }
             }
-        }
+        })
     }
 
     /// Runs the raw entry `label` of `module` to its `return`, **driving the scheduler**
@@ -720,23 +831,28 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        let mut machine = Machine::new();
-        let mut outcome = machine.run_label_outcome(module, label, arity, args, self)?;
-        loop {
-            match outcome {
-                RunOutcome::Returned(value) => return Ok(value),
-                RunOutcome::Wait { func, pc } => {
-                    if !self.may_pump_scheduler() {
-                        return Err(beam_engine::blocked());
+        // The closure's fresh `Machine` holds its `x`/stack outside the process root set a
+        // delivery-driven collection publishes, so the process is relocation-exempt for the
+        // whole run (see [`Self::with_relocation_exempt`]).
+        self.with_relocation_exempt(|this| {
+            let mut machine = Machine::new();
+            let mut outcome = machine.run_label_outcome(module, label, arity, args, this)?;
+            loop {
+                match outcome {
+                    RunOutcome::Returned(value) => return Ok(value),
+                    RunOutcome::Wait { func, pc } => {
+                        if !this.may_pump_scheduler() {
+                            return Err(beam_engine::blocked());
+                        }
+                        let ran = this.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+                        if ran == 0 {
+                            return Err(beam_engine::blocked());
+                        }
+                        outcome = machine.resume_outcome(module, func, pc, this)?;
                     }
-                    let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
-                    if ran == 0 {
-                        return Err(beam_engine::blocked());
-                    }
-                    outcome = machine.resume_outcome(module, func, pc, self)?;
                 }
             }
-        }
+        })
     }
 
     /// Records the module whose **code** this context is about to execute — the BIF call
@@ -1911,15 +2027,19 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   (`lists:map(fun(X) -> X*X end, …)`) which calls back into it, and the closure
     ///   body can only be run by the evaluator.
     fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
-        match self.local_fun_target(fun, args)? {
+        // A local closure enters a **fresh** `Machine` (below, through `run_label_blocking`),
+        // and the `-eval`-closure arm runs the evaluator's own environment; neither set of
+        // terms is in the process root set, so the process is relocation-exempt for the whole
+        // application (see [`Self::with_relocation_exempt`]).
+        self.with_relocation_exempt(|this| match this.local_fun_target(fun, args)? {
             Some(LocalFunTarget {
                 module,
                 label,
                 arity,
                 args,
-            }) => self.run_label_blocking(&module, label, arity, &args),
-            None => self.apply_non_local_fun(fun, args),
-        }
+            }) => this.run_label_blocking(&module, label, arity, &args),
+            None => this.apply_non_local_fun(fun, args),
+        })
     }
     /// `send`: deliver `message` to the pid term `to`.
     ///

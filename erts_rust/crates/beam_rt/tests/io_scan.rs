@@ -48,10 +48,19 @@
 //!
 //! # Note on the probe shape
 //!
-//! Each result is printed **immediately after** the request that produced it, in its own
-//! `io:format/2` call. A `{get_until, …}` request runs Erlang code on the engine, and this
-//! runtime does not yet keep an earlier request's answer valid across a later one, so
-//! holding several scan results and printing them together reads a recycled region.
+//! Every probe prints each result **immediately after** the request that produced it, in its
+//! own `io:format/2` call, except the deferred one below.
+//!
+//! A result may also be **held** across later requests: the `{get_until, …}` request runs
+//! Erlang code on the engine and its answer is copied onto the requesting process's own young
+//! heap, and this runtime keeps such an answer valid across later deliveries. The runtime
+//! marks the process **relocation-exempt** for the whole `-eval` driver (and for the nested
+//! machines a cross-module call or a fun application runs on), so a later delivery that
+//! cannot fit the receiver's heap goes through the heap-fragment fallback instead of
+//! collecting — a delivery-driven collection publishes only the process's own containers and
+//! would recycle a term the evaluator still holds.
+//! [`a_scan_result_held_across_later_requests_matches_the_live_oracle`] is the regression
+//! probe for exactly that.
 
 // The shared harness is compiled in whole, but this suite uses only its bounded runner and
 // its toolchain discovery; the unused remainder is expected here — the same shape
@@ -95,6 +104,20 @@ const SCAN_BODY: &str = "A=io:scan_erl_exprs(D,\"\",{1,1},[]), io:format(\"~p~n\
      C=io:scan_erl_exprs(D,\"\",{1,1},[]), io:format(\"~p~n\",[C]),\
      E=io:scan_erl_exprs(D,\"\",{1,1},[]), io:format(\"~p~n\",[E]),\
      file:close(D), halt(0).";
+
+/// The **deferred** scan: three `io:scan_erl_exprs/4` requests are issued back to back and
+/// only `A` — the result of the **first** — is printed, once every request has completed.
+///
+/// This is the discriminating shape for the relocation-exempt scope: `A` is copied onto the
+/// requesting process's young heap by the first reply and then held in the evaluator's
+/// environment while two further replies are delivered to the same process. A later delivery
+/// that does not fit would collect that heap, publishing only the process's own containers,
+/// and recycle the words `A` points at (the pre-fix symptom: `badarg` from the `~p` printer,
+/// where the oracle prints the token list).
+const HOLD_AND_PRINT_FIRST_BODY: &str = "A=io:scan_erl_exprs(D,\"\",{1,1},[]),\
+     B=io:scan_erl_exprs(D,\"\",{1,1},[]),\
+     C=io:scan_erl_exprs(D,\"\",{1,1},[]),\
+     io:format(\"~p~n\",[A]), file:close(D), halt(0).";
 
 /// `io:parse_erl_exprs/4` over the same fixture and the same four reads.
 ///
@@ -280,4 +303,28 @@ fn parsing_the_fixture_matches_the_live_oracle() {
         "the exhausted device reports `{{eof, _}}`, got {out}"
     );
     agrees_with_the_oracle("io:parse_erl_exprs/4", &expr, &out);
+}
+
+/// A result **held across later requests** stays valid: three `io:scan_erl_exprs/4` calls on
+/// one device, then the **first** result printed.
+///
+/// The three replies are copied onto the requesting process's young heap, and the evaluator
+/// keeps `A` in a Rust local, outside the process root set. Without the relocation-exempt
+/// scope a later reply's delivery collects that heap and recycles `A`'s words, and the printer
+/// then reports `badarg` instead of the token list — the oracle prints the first form's tokens
+/// either way.
+#[test]
+fn a_scan_result_held_across_later_requests_matches_the_live_oracle() {
+    let (_dir, path) = fixture("hold");
+    let expr = program(&path, HOLD_AND_PRINT_FIRST_BODY);
+    let out = ours("a held io:scan_erl_exprs/4 result", &expr);
+    assert!(
+        out.starts_with("{ok,[{'-',{1,1}}"),
+        "the first form's tokens, not a recycled region, got {out}"
+    );
+    assert!(
+        out.ends_with("{2,1}}"),
+        "the first form's end position, got {out}"
+    );
+    agrees_with_the_oracle("a held io:scan_erl_exprs/4 result", &expr, &out);
 }
