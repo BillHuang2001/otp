@@ -67,7 +67,7 @@
 
 use beam_alloc::Heap;
 use beam_bifs::RuntimeHooks;
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExitReason, Raise, Result};
 use beam_engine::terms;
 use beam_process::{PidTarget, ProcessId, ProcessTable};
 use beam_term::prelude::{atom_val, is_atom, is_small, make_small, signed_value};
@@ -491,15 +491,19 @@ impl<'a> RuntimeHooksBridge<'a> {
 
     /// `erts_literal_area_collector:release_area_switch/0` — the literal-area switch probe.
     ///
-    /// Oracle-verified (OTP 29/`erts-17.1`): answers the atom `notsup`, i.e. the facility is
-    /// not available in this build. This runtime has no literal-area-collector process at
-    /// all, so `notsup` is the honest answer rather than a fabricated success.
+    /// Oracle-verified (OTP 29/`erts-17.1`): the oracle **raises** `error notsup` (`i_notsup`
+    /// in `erts/emulator/beam/erl_bif_info.c`) — the facility is not compiled in — so this
+    /// arm must raise the same reason, never return the bare atom. This runtime has no
+    /// literal-area-collector process at all, so `notsup` is the honest answer rather than a
+    /// fabricated success.
     ///
     /// # Errors
     ///
-    /// The typed gap when the atom `notsup` is not interned.
-    fn notsup(&self, atoms: &AtomTable) -> Result<Eterm> {
-        atom_term(atoms, "notsup")
+    /// Always the `error notsup` raise the oracle produces.
+    fn notsup(&self) -> Result<Eterm> {
+        Err(BeamError::Raise(Raise::error(ExitReason::atom(String::from(
+            "notsup",
+        )))))
     }
 
     /// `erts_trace_cleaner:check/0` — whether the trace-cleaner has work to do.
@@ -758,7 +762,7 @@ impl RuntimeHooks for RuntimeHooksBridge<'_> {
             }
             ("erts_internal", "erase_persistent_terms", 0) => self.erase_persistent_terms(atoms),
             // The internal `notsup` probes and the trace-cleaner / error-logger constants.
-            ("erts_literal_area_collector", "release_area_switch", 0) => self.notsup(atoms),
+            ("erts_literal_area_collector", "release_area_switch", 0) => self.notsup(),
             ("erts_trace_cleaner", "check", 0) => self.trace_cleaner_check(atoms),
             ("error_logger", "warning_map", 0) => self.warning_map(atoms),
             // The `code:*` coverage-mode surface (see `set_coverage_mode`).
