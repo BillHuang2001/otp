@@ -680,8 +680,11 @@ still reproduces today's collector exactly.
   off-heap ownership), or `copy_term` when the fragment must keep owning its payloads. At a safepoint:
   `FragmentRoots::materialize(&mut chain, &mut young, &mut off_heap)?`, then `gather_roots` alongside
   `x[0..live)`/the stack, `collect`, `scatter_roots`; `FragmentCounters` gives the no-leak check
-  (`live() == 0`, `off_heap_bytes() == 0` once every fragment is dropped/transferred). Note `beam_message`
-  is adding its own `HeapFragment` concurrently — reconcile with that type rather than duplicating it.
+  (`live() == 0`, `off_heap_bytes() == 0` once every fragment is dropped/transferred). `beam_message` has
+  since implemented its **own** fragment model (`beam_message/src/fragment.rs`: `HeapFragment`/`Fragments`,
+  the one used in production by `beam_message`/`beam_process`/`beam_rt`), so this crate's
+  `HeapFragment`/`FragmentChain`/`FragmentRoots` and its `GraphCopier` currently have **no** production
+  consumer — the two fragment models need reconciling rather than both being carried.
 - **The runtime should adopt the growth seam** (`beam_rt`): it currently hard-caps its term heap and
   translates exhaustion to `error:system_limit`; give the engine context a `beam_gc` collector and call
   `collector.ensure_capacity(heap_need, &mut roots)` from its `ensure_heap` (the root set —
