@@ -59,21 +59,27 @@
 //! (`intern_atom`/`atom_name`/`existing_atom`), the **ETF codec**
 //! (`term_to_binary`/`binary_to_term`, over the same `beam_codec` encoder/decoder and the same
 //! deferred-interner discipline the `erlang:term_to_binary/1` BIF uses), a **unique-integer
-//! source** (`unique_integer`, mirroring the C emulator's four counter sequences) and the
-//! emulator **system-information** block (`system_info`). It also implements the whole
-//! extra-environment family — `alloc_env`/`free_env` (a live message environment whose atoms are
-//! the runtime's own, see [`NifHost::alloc_env`]) and `make_copy` (the message-env idiom's term
-//! movement, see [`NifHost::make_copy`]).
+//! source** (`unique_integer`, mirroring the C emulator's four counter sequences), the
+//! emulator **system-information** block (`system_info`, whose `scheduler_threads` is the
+//! runtime's real normal-scheduler count) and the **reference/registry** hooks
+//! (`make_ref`/`whereis_pid`, over the borrowed [`NifHostServices`] below). It also implements the
+//! whole extra-environment family — `alloc_env`/`free_env` (a live message environment whose atoms
+//! are the runtime's own, see [`NifHost::alloc_env`]) and `make_copy` (the message-env idiom's
+//! term movement, see [`NifHost::make_copy`]).
 //!
-//! # Typed gaps (never a wrong result)
+//! # Borrowed runtime services
 //!
-//! Two hooks stay at the trait default (the typed `None`). `make_ref` and `whereis_pid` need
-//! runtime state this host is **not** built with — the reference-id allocator and the process
-//! registry, which are fields of [`Runtime`](crate::Runtime) that only the borrowing
-//! [`RuntimeContext`](crate::context::RuntimeContext) can reach — so `enif_make_ref` raises
-//! `badarg` and `enif_whereis_pid` reports "not found" instead of fabricating a reference or a
-//! pid. `erlang:load_nif/2` on an already-loaded module is a `reload` (the oracle's rule since
-//! OTP 20).
+//! Two hooks need runtime state the host does not own: a fresh reference (`enif_make_ref`) and a
+//! name lookup (`enif_whereis_pid`). The host reaches both through an optional [`NifHostServices`]
+//! provider threaded in at construction. The **per-call** host (built by
+//! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) carries a
+//! [`RuntimeNifServices`] over the runtime's reference-id allocator, its reference registry and its
+//! process table, so both hooks are live there. The **load/unload** host (built by
+//! [`NifBridge::load_nif`](crate::context::bridges::NifBridge)) is *moved into* the runtime's NIF
+//! registry, so it cannot borrow the runtime and is built with `services = None`: both hooks then
+//! stay the trait default (the typed `None`), so a `load`/`unload` callback can never fabricate a
+//! reference or a pid. `erlang:load_nif/2` on an already-loaded module is a `reload` (the oracle's
+//! rule since OTP 20).
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -84,6 +90,7 @@ use beam_abi::nif::types::ErlNifEnv;
 use beam_abi::{ErlDrvSysInfo, NifEnv, NifHost};
 use beam_alloc::Heap;
 use beam_bifs::AtomInterner;
+use beam_process::{MonitorRef, ProcessTable, RefAllocator};
 use beam_term::prelude::{atom_val, is_atom, is_header, make_atom, make_small, Eterm};
 use beam_term::AtomTable;
 use libc::c_char;
@@ -103,12 +110,12 @@ pub(crate) struct NifEntry {
     /// Read only indirectly (through the erased pointer inside `lib`), which is why the field
     /// carries an explicit `allow`: it is the *ownership* that matters, not any Rust access.
     #[allow(dead_code)]
-    host: Box<NifHostImpl>,
+    host: Box<NifHostImpl<'static>>,
 }
 
 impl NifEntry {
     /// A library entry pairing `lib` with the `host` it was loaded against.
-    pub(crate) fn new(lib: NifLibrary, host: Box<NifHostImpl>) -> NifEntry {
+    pub(crate) fn new(lib: NifLibrary, host: Box<NifHostImpl<'static>>) -> NifEntry {
         NifEntry { lib, host }
     }
 
@@ -183,12 +190,73 @@ impl NifRegistry {
     }
 }
 
+/// The runtime services a NIF host calls back into.
+///
+/// The two `enif_*` hooks [`NifHost::make_ref`] and [`NifHost::whereis_pid`] need state the host
+/// does not own — a fresh reference and a name lookup — so the host borrows it through this trait
+/// instead of duplicating the runtime's minting/registry logic. The concrete provider is
+/// [`RuntimeNifServices`], built by
+/// [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext); the load/unload host carries
+/// no provider, so both hooks stay the typed `None` there.
+pub(crate) trait NifHostServices {
+    /// Mint a fresh internal reference on `heap` and register it in the runtime's reference
+    /// registry (a **plain** reference, so `demonitor/1` recognises it), returning its term.
+    ///
+    /// `None` only if the reference thing cannot be built on `heap` — never a fabricated value.
+    fn make_ref(&mut self, heap: &mut Heap) -> Option<Eterm>;
+
+    /// Resolve the registered name `name` (an atom) to an internal pid term; `None` for a
+    /// non-atom argument or an unregistered name.
+    fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm>;
+}
+
+/// The concrete [`NifHostServices`] over a runtime's own reference id space, reference registry
+/// and process table.
+///
+/// The three fields are **disjoint borrows** of the runtime ([`Runtime::refs`](crate::Runtime) /
+/// `references` / `processes`), so this provider co-exists with the rest of the NIF call's runtime
+/// uses. `processes` is the caller-supplied pass table when the call runs inside a scheduler slice,
+/// else the runtime's own — the same resolution [`RuntimeContext::process_table`] makes.
+pub(crate) struct RuntimeNifServices<'a> {
+    /// The one reference id space (`erlang:make_ref/0` and a monitor ref share it).
+    pub(crate) refs: &'a mut RefAllocator,
+    /// The runtime's reference registry; a minted plain reference is recorded here.
+    pub(crate) references: &'a mut HashMap<Eterm, Option<MonitorRef>>,
+    /// The process table a registered name is resolved against.
+    pub(crate) processes: &'a ProcessTable,
+}
+
+impl NifHostServices for RuntimeNifServices<'_> {
+    /// The same two operations `erlang:make_ref/0`
+    /// ([`crate::native::process::RuntimeContext::make_ref_0`]) performs: draw the next id from the
+    /// shared allocator, build its term on `heap`, and register it as a plain reference.
+    fn make_ref(&mut self, heap: &mut Heap) -> Option<Eterm> {
+        let reference = self.refs.next();
+        let term = reference.to_eterm(heap).ok()?;
+        self.references.insert(term, None);
+        Some(term)
+    }
+
+    /// Look `name` up in the process table's local name registry. A non-atom argument never names
+    /// a process.
+    fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm> {
+        if !is_atom(name) {
+            return None;
+        }
+        Some(self.processes.whereis(atom_val(name))?.to_eterm())
+    }
+}
+
 /// The runtime services one NIF call (or one library `load`/`unload`) draws on.
 ///
 /// It **owns** its [`Heap`] so it has a stable address when boxed (the library's erased host
 /// pointer must stay valid), and carries a handle to the runtime's one shared [`AtomTable`]
 /// plus the in-flight [`PendingInterner`] a new atom is recorded on.
-pub(crate) struct NifHostImpl {
+///
+/// The lifetime parameter is the borrow of the optional [`NifHostServices`] provider: the per-call
+/// host borrows a [`RuntimeNifServices`] for the duration of the call, while the load/unload host
+/// (which is moved into the runtime's NIF registry) carries `None` and is therefore `'static`.
+pub(crate) struct NifHostImpl<'a> {
     /// The term-allocation arena for the NIF's lifetime.
     heap: Heap,
     /// A handle to the runtime's one shared atom table (index resolution).
@@ -206,22 +274,33 @@ pub(crate) struct NifHostImpl {
     /// here so `enif_free_env` can find it by pointer; dropping the host drops any env a NIF forgot
     /// to free. See [`NifHost::alloc_env`].
     envs: Vec<Box<NifEnv>>,
+    /// The runtime's real normal-scheduler count (`+S`), reported by `system_info`.
+    ///
+    /// `i32` because that is [`ErlDrvSysInfo::scheduler_threads`]'s C type (`c_int`).
+    schedulers: i32,
+    /// The runtime services this host may call back into; `None` for the load/unload host.
+    services: Option<&'a mut dyn NifHostServices>,
 }
 
-impl NifHostImpl {
-    /// A host over `heap`, resolving atoms against `atoms`/`interner`, running as `self_pid`.
+impl<'a> NifHostImpl<'a> {
+    /// A host over `heap`, resolving atoms against `atoms`/`interner`, running as `self_pid`,
+    /// reporting `schedulers` normal schedulers and reaching the runtime through `services`.
     pub(crate) fn new(
         heap: Heap,
         atoms: Rc<AtomTable>,
         interner: PendingInterner,
         self_pid: Eterm,
-    ) -> NifHostImpl {
+        schedulers: i32,
+        services: Option<&'a mut dyn NifHostServices>,
+    ) -> NifHostImpl<'a> {
         NifHostImpl {
             heap,
             atoms,
             interner,
             self_pid,
             envs: Vec::new(),
+            schedulers,
+            services,
         }
     }
 
@@ -259,7 +338,7 @@ static ERTS_VERSION_C: &[u8] = b"17.1\0";
 /// [`beam_common::OTP_VERSION`]).
 static OTP_RELEASE_C: &[u8] = b"30\0";
 
-impl NifHost for NifHostImpl {
+impl NifHost for NifHostImpl<'_> {
     fn heap(&mut self) -> &mut Heap {
         &mut self.heap
     }
@@ -349,6 +428,29 @@ impl NifHost for NifHostImpl {
         self.atoms.lookup(name).map(make_atom)
     }
 
+    /// `enif_make_ref()` — a fresh reference, drawn from the runtime's one reference id space.
+    ///
+    /// Delegates to the borrowed [`NifHostServices`]: the provider allocates the next id, builds
+    /// the reference thing on **this host's** heap and registers it as a plain reference (so
+    /// `erlang:demonitor/1` recognises it and answers `true`, exactly as for `make_ref/0`). With no
+    /// provider (the load/unload host) this is the trait default `None` — `enif_make_ref` then
+    /// raises `badarg`, never a fabricated reference.
+    fn make_ref(&mut self) -> Option<Eterm> {
+        // Disjoint field borrows: `heap` and `services` are distinct fields of `self`.
+        let heap = &mut self.heap;
+        self.services.as_mut()?.make_ref(heap)
+    }
+
+    /// `enif_whereis_pid(name)` — resolve a registered name to a pid.
+    ///
+    /// Delegates to the borrowed [`NifHostServices`], which looks the name up in the process
+    /// table's local name registry. A non-atom argument, an unregistered name, or no provider (the
+    /// load/unload host) is the typed `None` — `enif_whereis_pid` then answers the C's `0` and
+    /// writes nothing, never a fabricated pid.
+    fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm> {
+        self.services.as_mut()?.whereis_pid(name)
+    }
+
     /// `enif_make_unique_integer` — draw from the runtime's four NIF-facing unique sequences.
     ///
     /// One monotonic counter per property combination, so a value under `[positive, monotonic]` is
@@ -375,15 +477,14 @@ impl NifHost for NifHostImpl {
     ///
     /// The two version strings point at this file's `static`s, so they are NUL-terminated and outlive
     /// the call. `thread_support`/`smp_support` are the build capabilities the C hard-codes to `1`
-    /// (`io.c`'s `driver_system_info`); `async_threads` is `0` and `scheduler_threads` is `1` because
-    /// this runtime really is single-threaded with no async pool. `dirty_scheduler_support` is `0`:
-    /// this runtime has **no** dirty schedulers and its `enif_schedule_nif` hook is unsupported, so
-    /// reporting them as available would be a capability lie the C only avoids because OTP always
-    /// builds them in. The four ABI-version fields are `beam_abi`'s compile-time constants (the C
-    /// hard-codes them in `driver_system_info` too), and `enif_system_info` overwrites them anyway.
-    ///
-    /// The scheduler count does not come from the runtime configuration (`+S N`) — this host is not
-    /// built with it — so `scheduler_threads` is the honest single-threaded `1`.
+    /// (`io.c`'s `driver_system_info`); `async_threads` is `0` because this runtime has no async
+    /// pool. `scheduler_threads` is the runtime's **real** normal-scheduler count, the value the
+    /// host was built with (from [`crate::info::schedulers_count`] — `+S N` or the machine's
+    /// parallelism). `dirty_scheduler_support` is `0`: this runtime has **no** dirty schedulers and
+    /// its `enif_schedule_nif` hook is unsupported, so reporting them as available would be a
+    /// capability lie the C only avoids because OTP always builds them in. The four ABI-version
+    /// fields are `beam_abi`'s compile-time constants (the C hard-codes them in `driver_system_info`
+    /// too), and `enif_system_info` overwrites them anyway.
     fn system_info(&mut self) -> Option<ErlDrvSysInfo> {
         Some(ErlDrvSysInfo {
             driver_major_version: beam_abi::ERL_DRV_EXTENDED_MAJOR_VERSION,
@@ -393,7 +494,7 @@ impl NifHost for NifHostImpl {
             thread_support: 1,
             smp_support: 1,
             async_threads: 0,
-            scheduler_threads: 1,
+            scheduler_threads: self.schedulers,
             nif_major_version: beam_abi::ERL_NIF_MAJOR_VERSION,
             nif_minor_version: beam_abi::ERL_NIF_MINOR_VERSION,
             dirty_scheduler_support: 0,
@@ -503,7 +604,7 @@ mod tests {
 
     /// A host over a fresh table that already holds every name in `seed`, plus the table handle and
     /// the interner, so a test can observe exactly what the host committed (and what it did not).
-    fn host_with(seed: &[&str]) -> (NifHostImpl, Rc<AtomTable>, PendingInterner) {
+    fn host_with(seed: &[&str]) -> (NifHostImpl<'static>, Rc<AtomTable>, PendingInterner) {
         let mut table = AtomTable::new();
         for name in seed {
             table.intern(name);
@@ -515,6 +616,8 @@ mod tests {
             Rc::clone(&atoms),
             interner.clone(),
             make_small(7),
+            1,
+            None,
         );
         (host, atoms, interner)
     }
@@ -535,6 +638,8 @@ mod tests {
             atoms,
             PendingInterner::new(0),
             make_small(7),
+            1,
+            None,
         );
         let mut env = NifEnv::new(&mut host);
 
@@ -582,6 +687,8 @@ mod tests {
             atoms,
             PendingInterner::new(0),
             make_small(7),
+            1,
+            None,
         );
         let mut env = NifEnv::new(&mut host);
         match registry.call("test_nif", "add", 2, &mut env, &[]) {
@@ -604,6 +711,8 @@ mod tests {
             Rc::clone(&atoms),
             interner.clone(),
             make_small(7),
+            1,
+            None,
         );
 
         // An existing atom keeps its index.
@@ -636,6 +745,8 @@ mod tests {
             atoms,
             PendingInterner::new(0),
             make_small(7),
+            1,
+            None,
         );
         let heap = host.into_heap();
         assert!(heap.available() > 0, "the heap survives the host");
@@ -841,5 +952,138 @@ mod tests {
         );
         assert_eq!(info.nif_major_version, beam_abi::ERL_NIF_MAJOR_VERSION);
         assert_eq!(info.nif_minor_version, beam_abi::ERL_NIF_MINOR_VERSION);
+    }
+
+    /// The [`NifHostServices`] provider a host delegates `make_ref`/`whereis_pid` to, recording
+    /// that `make_ref` was handed the host's own heap.
+    struct MockServices {
+        reference: Eterm,
+        name: Eterm,
+        pid: Eterm,
+        saw_heap: bool,
+    }
+
+    impl NifHostServices for MockServices {
+        fn make_ref(&mut self, heap: &mut Heap) -> Option<Eterm> {
+            self.saw_heap = heap.available() > 0;
+            Some(self.reference)
+        }
+
+        fn whereis_pid(&mut self, name: Eterm) -> Option<Eterm> {
+            (name == self.name).then_some(self.pid)
+        }
+    }
+
+    /// `make_ref`/`whereis_pid` delegate to the borrowed provider (the reference on the host's own
+    /// heap), and stay the typed `None` when the host carries no provider (the load/unload host) —
+    /// never a fabricated value.
+    #[test]
+    fn the_reference_and_registry_hooks_delegate_to_the_provider() {
+        use beam_term::Atom;
+
+        let atoms = Rc::new(AtomTable::new());
+        let registered = make_atom(Atom::from_raw(3));
+        let mut services = MockServices {
+            reference: make_small(11),
+            name: registered,
+            pid: make_small(22),
+            saw_heap: false,
+        };
+        let mut host = NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            atoms,
+            PendingInterner::new(0),
+            make_small(7),
+            1,
+            Some(&mut services),
+        );
+        assert_eq!(
+            host.make_ref(),
+            Some(make_small(11)),
+            "delegates to the provider"
+        );
+        assert_eq!(
+            host.whereis_pid(registered),
+            Some(make_small(22)),
+            "a registered name resolves through the provider"
+        );
+        assert_eq!(
+            host.whereis_pid(make_atom(Atom::from_raw(4))),
+            None,
+            "an unregistered name is the provider's miss"
+        );
+        drop(host);
+        assert!(services.saw_heap, "make_ref is handed the host's own heap");
+
+        // No provider (the load/unload host): the typed default, never a fabricated value.
+        let (mut bare, _atoms, _interner) = host_with(&[]);
+        assert_eq!(bare.make_ref(), None);
+        assert_eq!(bare.whereis_pid(registered), None);
+    }
+
+    /// `system_info` reports the scheduler count the host was built with — the runtime's real
+    /// normal-scheduler count (`+S`), not a hard-coded `1`.
+    #[test]
+    fn system_info_reports_the_built_scheduler_count() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            atoms,
+            PendingInterner::new(0),
+            make_small(7),
+            4,
+            None,
+        );
+        assert_eq!(
+            host.system_info()
+                .expect("always supplies the block")
+                .scheduler_threads,
+            4
+        );
+    }
+
+    /// [`RuntimeNifServices`] mints a reference from the runtime's **own** id space and registers
+    /// it, and resolves a name through the runtime's process table — the same two operations
+    /// `erlang:make_ref/0` and `erlang:whereis/1` perform.
+    #[test]
+    fn runtime_services_mint_a_registered_reference_and_resolve_a_name() {
+        let mut runtime = crate::Runtime::with_defaults().expect("the default runtime");
+        let name_atom = runtime.code_server_atoms_mut().intern("a_registered_name");
+        let absent = runtime.code_server_atoms_mut().intern("surely_not_registered");
+        let name = make_atom(name_atom);
+        let absent = make_atom(absent);
+        let pid = runtime.self_pid();
+        runtime
+            .processes
+            .register(name_atom, pid)
+            .expect("registers an unregistered name");
+
+        let mut heap = Heap::new(256).expect("a test heap");
+        let mut services = RuntimeNifServices {
+            refs: &mut runtime.refs,
+            references: &mut runtime.references,
+            processes: &runtime.processes,
+        };
+        let reference = services.make_ref(&mut heap).expect("mints a reference");
+        assert_eq!(
+            services.whereis_pid(name),
+            Some(pid.to_eterm()),
+            "a registered name resolves to its pid"
+        );
+        assert_eq!(
+            services.whereis_pid(absent),
+            None,
+            "an unregistered name is a miss"
+        );
+        assert_eq!(
+            services.whereis_pid(make_small(1)),
+            None,
+            "a non-atom never names a process"
+        );
+        drop(services);
+        assert!(
+            runtime.references.contains_key(&reference),
+            "the minted reference is registered in the runtime ({reference:?})"
+        );
     }
 }
