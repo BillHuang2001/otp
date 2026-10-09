@@ -20,8 +20,8 @@
 
 //! Fun / export forwarding layer over [`beam_term::fun`].
 //!
-//! The frozen interior layout of every kind of fun — the 3-word `EXPORT_EXT`
-//! (`[header, module, function]`) block and the 11-word `NEW_FUN_EXT` descriptor
+//! The frozen interior layout of every kind of fun — the 4-word `EXPORT_EXT`
+//! (`[header, module, function, arity]`) block and the 11-word `NEW_FUN_EXT` descriptor
 //! (`[header, module, uniq[0..8], uniq[8..16], index, old_index, old_uniq, pid…]`)
 //! plus its environment — is owned by [`beam_term::fun`] (the lowest common
 //! ancestor for term operations — workspace `CONTEXT.md` §2, "No duplication
@@ -52,9 +52,13 @@ use beam_term::prelude::{boxed_val, is_any_fun, Atom, Eterm};
 use crate::error;
 
 /// The frozen fun-layout surface dependents need to inspect, size or call a fun:
-/// the kind discriminator, the creator-pid struct, the arity ceiling and the word
-/// sizing helper. Re-exported verbatim from the layout owner (`beam_term::fun`).
-pub use beam_term::fun::{fun_kind_of_header, fun_words, FunKind, FunPid, FUN_MAX_FIELD, MAX_ARG};
+/// the kind discriminator, the creator-pid struct, the true-arity reader, the arity
+/// ceiling and the word sizing helpers. Re-exported verbatim from the layout owner
+/// (`beam_term::fun`).
+pub use beam_term::fun::{
+    fun_desc_words, fun_kind_of_header, fun_true_arity, fun_words, FunKind, FunPid,
+    FUN_DESC_WORDS_EXTERNAL, FUN_MAX_FIELD, MAX_ARG,
+};
 
 /// The header word of a fun **term**, or `BeamError::BadArg` for a non-fun.
 ///
@@ -74,11 +78,13 @@ fn fun_header_word(term: Eterm) -> Result<Eterm> {
 
 /// Materializes an `EXPORT_EXT` ([`FunKind::External`]) fun on `heap`.
 ///
-/// The `[header, module, function]` 3-word block is written by
+/// The `[header, module, function, arity]` 4-word block is written by
 /// [`beam_term::fun::write_fun_external`]; `module`/`function` are the exported
-/// MFA's atoms and there is no environment. `arity` is bounded by the header's
-/// 8-bit field (`0..=MAX_ARG`); a larger value is a `SystemLimit` (via
-/// `make_fun_header`), never a truncated header.
+/// MFA's atoms, there is no environment, and `arity` is stored **verbatim** in
+/// descriptor word 3 (the `Export`'s `info.mfa.arity`, which the C keeps out of
+/// line). Any arity is accepted: the header's 8-bit field only masks it (read back
+/// as `arity & 0xFF` by [`fun_arity_term`]), while [`fun_true_arity_term`] reports
+/// the full value an encoder must emit.
 pub fn make_fun_external(
     heap: &mut Heap,
     arity: usize,
@@ -131,9 +137,27 @@ pub fn fun_kind_term(term: Eterm) -> Result<FunKind> {
 /// The arity of a fun term; `BeamError::BadArg` for a non-fun.
 ///
 /// The term-level counterpart of [`beam_term::fun::fun_arity`], which takes a
-/// *header word*; the `_term` suffix keeps the two distinct.
+/// *header word*; the `_term` suffix keeps the two distinct. This is the **masked**
+/// arity from the header's 8-bit field (`fun_info(F, arity)`'s value); use
+/// [`fun_true_arity_term`] for the full arity an encoder must emit.
 pub fn fun_arity_term(term: Eterm) -> Result<usize> {
     Ok(fun::fun_arity(fun_header_word(term)?))
+}
+
+/// The **true** arity of a fun term — what an encoder must emit.
+///
+/// The term-level counterpart of [`beam_term::fun::fun_true_arity`]. For an
+/// external (`EXPORT_EXT`) fun this is descriptor word 3, *not* masked to the
+/// header's 8 bits — so an arity-256 external fun reports 256 here while
+/// [`fun_arity_term`] reports 0, exactly the oracle's split between
+/// `term_to_binary/1` and `fun_info(F, arity)`. For the local/imported kinds it is
+/// the header's 8-bit field (those arities *are* header-pinned). `BeamError::BadArg`
+/// for a non-fun.
+pub fn fun_true_arity_term(term: Eterm) -> Result<usize> {
+    fun_header_word(term)?;
+    // SAFETY: the guard established that `term` is a live boxed fun, the exact
+    // invariant `fun_true_arity` documents.
+    Ok(unsafe { fun::fun_true_arity(term)? })
 }
 
 /// The environment size (`num_free`) of a fun term; `BeamError::BadArg` for a
@@ -266,7 +290,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::term::tests::{assert_bad_arg, assert_system_limit, new_heap};
+    use crate::term::tests::{assert_bad_arg, new_heap};
 
     /// The `u64` a little-endian 8-byte window decodes to (the packing
     /// `write_fun_imported` applies to each half of the 16-byte `uniq`).
@@ -281,18 +305,19 @@ mod tests {
         let mut heap = new_heap();
         let module = Atom::from_raw(0x11);
         let function = Atom::from_raw(0x22);
-        let term = make_fun_external(&mut heap, 2, module, function).expect("3 words fit");
-        assert_eq!(heap.used(), 3, "the external fun is 1 + 2 words");
+        let term = make_fun_external(&mut heap, 2, module, function).expect("4 words fit");
+        assert_eq!(heap.used(), 4, "the external fun is 1 + 3 words");
 
         assert_eq!(fun_kind_term(term).unwrap(), FunKind::External);
         assert_eq!(fun_arity_term(term).unwrap(), 2);
+        assert_eq!(fun_true_arity_term(term).unwrap(), 2);
         assert_eq!(fun_num_free_term(term).unwrap(), 0);
         assert_eq!(fun_module(term).unwrap(), module);
         assert_eq!(fun_function(term).unwrap(), function);
         assert_eq!(fun_env(term).unwrap(), &[] as &[Eterm]);
 
-        // SAFETY: `term` is the 3-word external fun this test just built, so the
-        // block `[header, module, function]` is live; every index is in block.
+        // SAFETY: `term` is the 4-word external fun this test just built, so the
+        // block `[header, module, function, arity]` is live; every index is in block.
         unsafe {
             assert!(is_any_fun(term));
             let p = boxed_val(term);
@@ -300,11 +325,22 @@ mod tests {
             assert!(is_external_fun(*p));
             assert_eq!(*p.add(1), make_atom(module));
             assert_eq!(*p.add(2), make_atom(function));
+            assert_eq!((*p.add(3)).raw(), 2, "descriptor word 3 holds the true arity");
         }
 
-        // An arity past the 8-bit header field is a `SystemLimit`, never a
-        // truncated header.
-        assert_system_limit(make_fun_external(&mut heap, 256, module, function));
+        // Any arity is accepted. The header's 8-bit field masks it (255, 0, 255),
+        // while descriptor word 3 keeps the true arity an encoder must emit.
+        for (arity, masked) in [(255usize, 255usize), (256, 0), (511, 255)] {
+            let term = make_fun_external(&mut heap, arity, module, function).expect("fits");
+            assert_eq!(fun_arity_term(term).unwrap(), masked, "the header masks arity {arity}");
+            assert_eq!(fun_true_arity_term(term).unwrap(), arity);
+            // SAFETY: as above — the 4-word block is live; word 3 holds the arity.
+            unsafe {
+                let p = boxed_val(term);
+                assert_eq!(*p, make_fun_header(masked, 0, FunKind::External).unwrap());
+                assert_eq!((*p.add(3)).raw(), arity, "word 3 keeps the true arity");
+            }
+        }
     }
 
     #[test]

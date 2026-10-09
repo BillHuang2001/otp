@@ -66,13 +66,6 @@
         }
     }
 
-    pub(crate) fn assert_system_limit(bytes: &[u8]) {
-        match decode_err(bytes) {
-            BeamError::SystemLimit => {}
-            other => panic!("expected SystemLimit, got {other:?}"),
-        }
-    }
-
     /// The UTF-8 `"n1"` node atom, as it appears in an external identifier.
     const NODE_N1: [u8; 4] = [119, 2, 110, 49];
 

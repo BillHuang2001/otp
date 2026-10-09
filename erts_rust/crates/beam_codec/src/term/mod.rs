@@ -62,12 +62,14 @@ pub use binary::{
 };
 /// The whole fun / export forwarding layer ([`fun`]): the boxed fun-term
 /// constructors, the term-level accessors and the frozen layout surface
-/// (`fun_kind_of_header`/`fun_words` plus [`FunKind`], [`FunPid`], `FUN_MAX_FIELD`
-/// and `MAX_ARG`) re-exported verbatim from the layout owner (`beam_term::fun`).
+/// (`fun_kind_of_header`/`fun_words`/`fun_desc_words`/`fun_true_arity` plus
+/// [`FunKind`], [`FunPid`], `FUN_MAX_FIELD`, `FUN_DESC_WORDS_EXTERNAL` and
+/// `MAX_ARG`) re-exported verbatim from the layout owner (`beam_term::fun`).
 pub use fun::{
-    fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_of_header,
-    fun_kind_term, fun_module, fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes,
-    fun_words, make_fun_external, make_fun_imported, FunKind, FunPid, FUN_MAX_FIELD, MAX_ARG,
+    fun_arity_term, fun_creator_pid, fun_desc_words, fun_env, fun_function, fun_index,
+    fun_kind_of_header, fun_kind_term, fun_module, fun_num_free_term, fun_old_index, fun_old_uniq,
+    fun_true_arity, fun_true_arity_term, fun_uniq_bytes, fun_words, make_fun_external,
+    make_fun_imported, FunKind, FunPid, FUN_DESC_WORDS_EXTERNAL, FUN_MAX_FIELD, MAX_ARG,
 };
 #[cfg(test)]
 pub use fun::make_fun_local;
@@ -452,7 +454,11 @@ pub fn external_port_parts(term: Eterm) -> Result<(Eterm, u64, u32)> {
 /// written by [`beam_term::thing::write_external_ref`]; the `node`/`next` slots carry
 /// the sysname atom and `creation` (the M1 substitution described on
 /// [`make_external_pid`]) and `ids` are the 32-bit `NEWER_REFERENCE_EXT` identifier
-/// words. An empty or over-long `ids` slice (more than `MAX_REF_IDS`) yields
+/// words. Any count up to `MAX_REF_IDS` is accepted, **including zero**: a zero-id
+/// external reference is exactly what a `len == 0` `NEW_REFERENCE_EXT` /
+/// `NEWER_REFERENCE_EXT` image decodes to (the 4-word `[header, node, creation,
+/// count = 0]` block `write_external_ref` builds, re-encoding as the 11-byte
+/// `[90][0][node][creation]`). More than `MAX_REF_IDS` ids yields
 /// `BeamError::SystemLimit`.
 pub fn make_external_ref(
     heap: &mut Heap,
@@ -461,13 +467,13 @@ pub fn make_external_ref(
     creation: u32,
 ) -> Result<Eterm> {
     let n = ids.len();
-    if n == 0 || n > MAX_REF_IDS {
+    if n > MAX_REF_IDS {
         return Err(error::system_limit());
     }
     // SAFETY: `alloc_words` returned `thing::external_ref_size_words(n)`
     // exclusively-owned, writable words.
     let hp = unsafe { heap.alloc_words(thing::external_ref_size_words(n))? };
-    // SAFETY: `hp` owns `external_ref_size_words(n)` words and `1 <= n <= MAX_REF_IDS`,
+    // SAFETY: `hp` owns `external_ref_size_words(n)` words and `n <= MAX_REF_IDS`,
     // the preconditions `write_external_ref` documents.
     Ok(unsafe { thing::write_external_ref(hp, node, ids, creation) })
 }
@@ -475,9 +481,9 @@ pub fn make_external_ref(
 /// Splits an external reference term into `(node, ids, creation)`.
 ///
 /// `ids` is borrowed from the term's storage (the caller must keep the owning heap
-/// alive). Delegates to [`beam_term::thing::external_ref_parts`]. A term that is not
-/// an external reference, or whose id count does not fit its data section, yields
-/// `BeamError::BadArg`.
+/// alive). Delegates to [`beam_term::thing::external_ref_parts`]. A zero-id external
+/// reference reports an empty slice. A term that is not an external reference, or
+/// whose id count does not fit its data section, yields `BeamError::BadArg`.
 pub fn external_ref_parts<'a>(term: Eterm) -> Result<(Eterm, &'a [u32], u32)> {
     // SAFETY: `is_external_ref` reads only the header word of a boxed term (the
     // caller invariant for any `Eterm`).
@@ -494,12 +500,13 @@ pub fn external_ref_parts<'a>(term: Eterm) -> Result<(Eterm, &'a [u32], u32)> {
         return Err(error::bad_arg());
     };
     // The count is self-describing (`external_ref_no_numbers(x) = external_ref_data(x)[0]`),
-    // so it must fit the data section it was read from before any slice is built.
+    // so it must fit the data section it was read from before any slice is built. A
+    // zero count is legal (a `len == 0` wire reference).
     // SAFETY: the header arity fixed the block at `EXTERNAL_THING_HEAD_SIZE +
     // data_words` words, so the `data.ui32` section at word `EXTERNAL_THING_HEAD_SIZE`
     // is live and its first `u32` is initialised.
     let n = unsafe { *boxed_val(term).add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>() as usize };
-    if n == 0 || n > MAX_REF_IDS || n + 1 > data_words * U32_PER_WORD {
+    if n > MAX_REF_IDS || n + 1 > data_words * U32_PER_WORD {
         return Err(error::bad_arg());
     }
     // SAFETY: the guards established that `term` is a live external reference whose id
@@ -1009,11 +1016,40 @@ mod tests {
         assert_eq!(ids, &[0xDEAD_BEEF]);
         assert_eq!(cre, 0x01);
 
-        assert_system_limit(make_external_ref(&mut heap, NIL, &[], 0));
+        // A zero-id reference is representable (`external_ref_size_words(0) == 4`).
+        let zero = make_external_ref(&mut heap, NIL, &[], 0).expect("a zero-id ref fits");
+        assert_eq!(external_ref_parts(zero).unwrap().1, &[] as &[u32]);
+        // More than `MAX_REF_IDS` ids is a hard bound.
         assert_system_limit(make_external_ref(&mut heap, NIL, &[1, 2, 3, 4, 5, 6], 0));
         // `MAX_REF_IDS` itself is accepted.
         let max = make_external_ref(&mut heap, NIL, &[1, 2, 3, 4, 5], 0).expect("fits");
         assert_eq!(external_ref_parts(max).unwrap().1, &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn external_ref_zero_id_block_layout_and_parts() {
+        let mut heap = new_heap();
+        let r = make_external_ref(&mut heap, NIL, &[], 0x0123_4567).expect("fits");
+        // `external_ref_size_words(0) = 3 + 1 = 4` words: the head plus the one-word
+        // data section holding the zero count.
+        assert_eq!(heap.used(), EXTERNAL_THING_HEAD_SIZE + 1);
+        // SAFETY: `r` is the 4-word block this test just wrote; the data section holds
+        // the zero id count and no ids.
+        unsafe {
+            let p = boxed_val(r);
+            assert_eq!(
+                *p,
+                make_header(0 / U32_PER_WORD + 1 + EXTERNAL_THING_HEAD_SIZE - 1, EXTERNAL_REF_SUBTAG)
+            );
+            assert_eq!(*p.add(1), NIL);
+            assert_eq!((*p.add(2)).raw() as u32, 0x0123_4567);
+            let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+            assert_eq!(*data, 0, "the id count is zero");
+        }
+        let (n, ids, cre) = external_ref_parts(r).unwrap();
+        assert_eq!(n, NIL);
+        assert_eq!(ids, &[] as &[u32]);
+        assert_eq!(cre, 0x0123_4567);
     }
 
     #[test]
@@ -1026,13 +1062,6 @@ mod tests {
         unsafe {
             let data = boxed_val(r).add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
             *data = (MAX_REF_IDS + 1) as u32;
-        }
-        assert_bad_arg(external_ref_parts(r));
-
-        // SAFETY: as above — a zero id count is equally impossible.
-        unsafe {
-            let data = boxed_val(r).add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
-            *data = 0;
         }
         assert_bad_arg(external_ref_parts(r));
     }

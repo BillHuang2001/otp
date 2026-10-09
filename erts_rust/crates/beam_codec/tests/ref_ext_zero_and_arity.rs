@@ -17,12 +17,14 @@
 // limitations under the License.
 //
 // %CopyrightEnd%
-//! The two residual ETF *decode* fidelity gaps: a **zero-length external
-//! reference** (`NEW_REFERENCE_EXT` (`114`) / `NEWER_REFERENCE_EXT` (`90`) with
-//! `len == 0`) and an **`EXPORT_EXT` (`113`) arity above the 8-bit fun-header
-//! field** (`> MAX_ARG` = 255).
+//! Two ETF wire forms that carry a value the 8-bit fun-header field (and the
+//! `1 <= len` count assumption) cannot hold, both of which this codec now handles
+//! faithfully against the oracle: a **zero-length external reference**
+//! (`NEW_REFERENCE_EXT` (`114`) / `NEWER_REFERENCE_EXT` (`90`) with `len == 0`)
+//! and an **`EXPORT_EXT` (`113`) arity above the 8-bit fun-header field**
+//! (`> MAX_ARG` = 255).
 //!
-//! ## Gap 1 — the unconditional `r0` word of a reference
+//! ## A zero-length reference still carries the unconditional `r0` word
 //!
 //! `external.c:4743-4796` reads a reference's first number **unconditionally**,
 //! never gated on the wire id count:
@@ -43,33 +45,28 @@
 //! consumption directly observable in the oracle, and
 //! [`zero_length_reference_consumption_matches_the_oracle`] pins it.
 //!
-//! A `len == 0` reference is therefore **well-formed**, and the oracle accepts it
-//! (it builds a 0-number external-ref block). This tree cannot *materialize* one:
-//! [`beam_term::thing::write_external_ref`] — the term-layout owner, outside this
-//! crate's write scope — requires `1 <= ids.len() <= MAX_REF_IDS`, and
-//! `beam_term`'s `make_hash`/`make_hash2` index `ids[0]` directly. We therefore
-//! consume the `r0` word exactly like the C (so the byte accounting and the
-//! `r0 >= MAX_REFERENCE` rejection stay faithful) and then report the term with a
-//! typed `BeamError::SystemLimit` instead of materializing a truncated term. The
-//! *tightening* is honest and one-directional: the C's own "acceptance" of a
-//! `len == 0` image without the `r0` word reads 4 bytes **past** the input (the
-//! oracle's own 11-byte `NEWER_REFERENCE_EXT` output for such a ref is accepted
-//! only by that out-of-bounds read, and the same nested image is `badarg`), which
-//! this decoder can never reproduce.
+//! A `len == 0` reference is well-formed and decodes to a **zero-id** external ref
+//! (the C builds a 0-number external-ref block; `beam_term::thing::write_external_ref`
+//! accepts `0 <= ids.len() <= MAX_REF_IDS`). It re-encodes as the 11-byte
+//! `[90][0][node][creation]` image the C emits — the unconditional `r0` word is
+//! consumed for stream alignment but not stored. The one-directional *tightening*
+//! remains honest: the 11-byte image **without** an `r0` word is `badarg` here,
+//! because the C accepts it only through an out-of-bounds read this decoder can
+//! never reproduce.
 //!
-//! ## Gap 2 — `EXPORT_EXT` arity above 255
+//! ## `EXPORT_EXT` arity is not bounded by the header field
 //!
-//! The oracle **accepts** any non-negative arity: in C the true arity never lives
-//! in the term, it lives in the out-of-line `Export` table
-//! (`create_shared_lambda`, `export.c:46-58`), so `fun_arity/1` masks the header's
-//! 8-bit field (`erl_fun.h:92-93`) while the encoder reads the full arity back out
-//! of the `Export` (`external.c:5038`) and re-emits it unharmed. This tree inlines
-//! the descriptor instead (`beam_term::fun`, `External` = 3 words), leaving the
-//! arity only the header's 8-bit field — masking would silently drop it and
-//! mis-encode every later `term_to_binary/1`, so the image is rejected with a
-//! typed `SystemLimit`. [`export_ext_arity_matches_the_oracle_...`] pins both
+//! The oracle accepts any non-negative arity: in C the true arity never lives in
+//! the term, it lives in the out-of-line `Export` table (`create_shared_lambda`,
+//! `export.c:46-58`), so `fun_arity/1` masks the header's 8-bit field
+//! (`erl_fun.h:92-93`) while the encoder reads the full arity back out of the
+//! `Export` (`external.c:5038`) and re-emits it unharmed. This tree inlines it into
+//! the `External` descriptor's word 3 (`beam_term::fun`), so `fun_true_arity_term`
+//! reports the true value the encoder emits while `fun_arity_term` keeps the header
+//! mask — the same split as the oracle.
+//! [`export_ext_arity_matches_the_oracle_at_and_above_the_field_ceiling`] pins both
 //! sides (the oracle's `fun_info/2` arity, its byte-exact re-encode of the true
-//! arity, and our typed rejection); see the crate `CONTEXT.md` §Known Issues.
+//! arity, and ours).
 //!
 //! ## Oracle resolution
 //!
@@ -83,7 +80,9 @@ use std::process::{Command, Stdio};
 
 use beam_alloc::Heap;
 use beam_common::BeamError;
-use beam_codec::term::{external_ref_parts, fun_arity_term, fun_kind_term, FunKind};
+use beam_codec::term::{
+    external_ref_parts, fun_arity_term, fun_kind_term, fun_true_arity_term, FunKind,
+};
 use beam_codec::{decode_term, encode_term, VERSION_MAGIC};
 use beam_term::prelude::{AtomTable, Eterm};
 
@@ -180,15 +179,6 @@ fn assert_bad_arg(image: &[u8]) {
     match decode_err(image) {
         BeamError::BadArg => {}
         other => panic!("expected BadArg for {image:?}, got {other:?}"),
-    }
-}
-
-/// `image` must be a **well-formed** term this tree cannot represent
-/// (`BeamError::SystemLimit`) — a recorded capability gap, never a silent pass.
-fn assert_system_limit(image: &[u8]) {
-    match decode_err(image) {
-        BeamError::SystemLimit => {}
-        other => panic!("expected SystemLimit for {image:?}, got {other:?}"),
     }
 }
 
@@ -387,24 +377,31 @@ fn parse_ok_bytes(line: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Gap 1 — pure wire/wire-alignment rules (no oracle needed)
+// Zero-length references — pure wire/wire-alignment rules (no oracle needed)
 // ---------------------------------------------------------------------------
 
 /// `NEW_REFERENCE_EXT` with `len == 0` still carries the unconditional `r0` word:
-/// without it the image is truncated, with it the (well-formed) term is one this
-/// tree cannot represent.
+/// without it the image is truncated, with it the `r0` value is consumed for stream
+/// alignment but **not** stored, so the term is a zero-id reference.
 #[test]
 fn new_reference_ext_zero_length_consumes_the_unconditional_first_number() {
     // No `r0` word at all: the C would read 4 bytes past the term, so this image
     // is short for the documented read contract ⇒ `BadArg`.
     assert_bad_arg(&new_reference_image(0, None, &[]));
-    // With the `r0` word the image is exactly the C's read, and the term is the
-    // recorded 0-id capability gap (`beam_term` cannot materialize it).
-    assert_system_limit(&new_reference_image(0, Some(0), &[]));
-    assert_system_limit(&new_reference_image(0, Some(1), &[]));
-    assert_system_limit(&new_reference_image(0, Some(MAX_REFERENCE - 1), &[]));
-    // ... but the `r0 >= MAX_REFERENCE` rejection is decided *before* the count
-    // matters, so these agree with the oracle's `badarg`.
+    // With the `r0` word the image is exactly the C's read and decodes to a zero-id
+    // reference; the `r0` value never reaches the term (any first number gives the
+    // same term).
+    for r0 in [0u32, 1, MAX_REFERENCE - 1] {
+        let image = new_reference_image(0, Some(r0), &[]);
+        assert_eq!(ref_ids(&image), Vec::<u32>::new(), "r0={r0} is not stored");
+        assert_eq!(
+            reencode(&image),
+            newer_reference_image(0, None, &[]),
+            "a `114` len == 0 image re-encodes as the 11-byte `90` form"
+        );
+    }
+    // The `r0 >= MAX_REFERENCE` rejection is decided *before* the count matters, so
+    // these agree with the oracle's `badarg`.
     assert_bad_arg(&new_reference_image(0, Some(MAX_REFERENCE), &[]));
     assert_bad_arg(&new_reference_image(0, Some(u32::MAX), &[]));
     // A non-zero count keeps the 18-bit first-number bound on `r0`.
@@ -431,9 +428,12 @@ fn new_reference_ext_count_bound_is_bad_arg() {
 #[test]
 fn newer_reference_ext_zero_length_consumes_the_unconditional_first_number() {
     assert_bad_arg(&newer_reference_image(0, None, &[]));
-    assert_system_limit(&newer_reference_image(0, Some(0), &[]));
-    // No bound on a remote node's first number, exactly as the C.
-    assert_system_limit(&newer_reference_image(0, Some(u32::MAX), &[]));
+    // The `r0` word is consumed but not stored, whatever its (unbounded) value.
+    for r0 in [0u32, u32::MAX] {
+        let image = newer_reference_image(0, Some(r0), &[]);
+        assert_eq!(ref_ids(&image), Vec::<u32>::new());
+        assert_eq!(reencode(&image), newer_reference_image(0, None, &[]));
+    }
     assert_eq!(ref_ids(&newer_reference_image(1, Some(MAX_REFERENCE), &[])), vec![MAX_REFERENCE]);
     assert_eq!(ref_ids(&newer_reference_image(1, Some(u32::MAX), &[])), vec![u32::MAX]);
 }
@@ -507,15 +507,15 @@ fn reference_images_never_panic_on_truncation() {
 }
 
 // ---------------------------------------------------------------------------
-// Gap 1 — oracle cross-checks
+// Zero-length references — oracle cross-check
 // ---------------------------------------------------------------------------
 
 /// The C consumes the unconditional `r0` word, so a well-formed `len == 0`
 /// reference is exactly `4 + 4 * max(1, len)` bytes of "post-creation" payload and
-/// `binary_to_term/2 [used]` reports the whole image. Those images are accepted by
-/// the oracle; we record them as the 0-id capability gap (a typed `SystemLimit`),
-/// while every *class* we do decide — the `r0` bound, the count bound — agrees
-/// with the oracle's `badarg`.
+/// `binary_to_term/2 [used]` reports the whole image. Both sides accept those
+/// images; both decode the reference to **zero ids** and re-encode it to the
+/// 11-byte `[90][0][node][creation]` form. The classes we reject — the `r0` bound
+/// and the count bound — agree with the oracle's `badarg`.
 #[test]
 fn zero_length_reference_consumption_matches_the_oracle() {
     let Some(oracle) = oracle_or_skip("zero_length_reference_consumption_matches_the_oracle") else {
@@ -537,14 +537,27 @@ fn zero_length_reference_consumption_matches_the_oracle() {
             "the C consumes exactly the whole image (the unconditional `r0` word) \
              for {image:?}"
         );
-        // Recorded gap: the C builds a 0-number external ref, `beam_term`'s block
-        // layout cannot hold one, so this tree rejects it with a typed error.
-        assert_system_limit(image);
+        // We consume the same bytes and materialize a zero-id reference.
+        assert_eq!(ref_ids(image), Vec::<u32>::new());
     }
     // The padded `len == 0` images are 12 (`114`) and 15 (`90`) bytes: the C reads
     // `1 (tag) + 2 (len) + 3 (node) + 1|4 (creation) + 4 (r0)`.
     assert_eq!(zero_len[0].len(), 12);
     assert_eq!(zero_len[3].len(), 15);
+
+    // Both sides re-encode a `len == 0` reference to the same 11-byte image: the
+    // unconditional `r0` word is dropped and no id word is emitted.
+    let expected = newer_reference_image(0, None, &[]);
+    assert_eq!(expected.len(), 11);
+    let lines = oracle_lines(&oracle, &zero_len, REENCODE_EXPR);
+    for (image, line) in zero_len.iter().zip(&lines) {
+        assert_eq!(
+            parse_ok_bytes(line),
+            expected,
+            "the oracle re-encodes {image:?} to the 11-byte `90` form"
+        );
+        assert_eq!(reencode(image), expected);
+    }
 
     // Everything we *do* decide must agree with the oracle: the `r0` bound of the
     // legacy form, and the five-id count bound of both forms.
@@ -597,17 +610,18 @@ fn reference_id_corpus_round_trips_byte_exactly_against_the_oracle() {
 }
 
 // ---------------------------------------------------------------------------
-// Gap 2 — `EXPORT_EXT` arity
+// `EXPORT_EXT` arity
 // ---------------------------------------------------------------------------
 
 /// Below the 8-bit field both sides agree exactly; above it the oracle accepts
 /// (masking `fun_info/2`'s arity while re-encoding the true arity out of its
-/// `Export` table) and this tree reports a typed `SystemLimit` — the recorded
-/// capability gap from the crate `CONTEXT.md`, never a silently masked arity.
+/// `Export` table) and so does this tree — `fun_arity_term` reports the header mask
+/// (`arity & 0xFF`) while `fun_true_arity_term` keeps the true arity the encoder
+/// emits, so every image round-trips byte-exactly.
 #[test]
-fn export_ext_arity_matches_the_oracle_below_the_field_and_is_a_documented_rejection_above_it() {
+fn export_ext_arity_matches_the_oracle_at_and_above_the_field_ceiling() {
     let Some(oracle) = oracle_or_skip(
-        "export_ext_arity_matches_the_oracle_below_the_field_and_is_a_documented_rejection_above_it",
+        "export_ext_arity_matches_the_oracle_at_and_above_the_field_ceiling",
     ) else {
         return;
     };
@@ -626,31 +640,29 @@ fn export_ext_arity_matches_the_oracle_below_the_field_and_is_a_documented_rejec
             .split_once(' ')
             .unwrap_or_else(|| panic!("bad oracle line {line:?}"));
         // `fun_arity/1` masks the header's 8-bit field (`erl_fun.h:92-93`), so the
-        // oracle's reported arity is `arity & 0xFF` even when it accepted more.
+        // oracle's reported arity is `arity & 0xFF`.
         let masked = masked
             .parse::<u32>()
             .unwrap_or_else(|e| panic!("bad arity in the oracle line {line:?}: {e}"));
         assert_eq!(masked, arity & 0xFF, "the oracle masks arity {arity}");
         // The oracle's re-encode preserves the true arity (it lives in `Export`),
-        // so the image is stable — the property this tree cannot reproduce from an
-        // inlined 3-word descriptor.
+        // so the image is stable.
         assert_eq!(
             parse_int_list(bytes),
             *image,
             "the oracle re-encodes arity {arity} byte for byte"
         );
 
-        if *arity <= 255 {
-            let (_heap, atoms, term) = ok(image);
-            assert_eq!(fun_kind_term(term).expect("a fun"), FunKind::External);
-            assert_eq!(fun_arity_term(term).expect("an arity"), *arity as usize);
-            assert_eq!(
-                encode_term(term, &atoms).expect("the arity round-trips"),
-                *image,
-                "the arity round-trips byte-exactly"
-            );
-        } else {
-            assert_system_limit(image);
-        }
+        // Ours: the header mask via `fun_arity_term`, the true arity via
+        // `fun_true_arity_term`, and a byte-exact re-encode either way.
+        let (_heap, atoms, term) = ok(image);
+        assert_eq!(fun_kind_term(term).expect("a fun"), FunKind::External);
+        assert_eq!(fun_arity_term(term).expect("an arity"), (arity & 0xFF) as usize);
+        assert_eq!(fun_true_arity_term(term).expect("a true arity"), *arity as usize);
+        assert_eq!(
+            encode_term(term, &atoms).expect("the arity round-trips"),
+            *image,
+            "EXPORT_EXT arity {arity} round-trips byte-exactly"
+        );
     }
 }
