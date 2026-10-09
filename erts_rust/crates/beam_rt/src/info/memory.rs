@@ -178,27 +178,57 @@ fn garbage_collection(rt: &Runtime) -> InfoValue {
 /// |---|---|
 /// | `atom_space` | `{atom_space, B, B}`, `B` = the atom table's index slots |
 /// | `atom_table` | `B` |
-/// | `module_table`, `loaded_code` | one slot per **loaded** code module |
+/// | `module_table`, `module_refs`, `loaded_code` | one slot per **loaded** code module |
+/// | `export_table` | one slot per `ExpT` entry across every **loaded** module |
+/// | `fun_table` | one slot per `FunT` lambda descriptor across every **loaded** module |
 /// | `register_table` | one slot per locally **registered** name |
+/// | `dist_table` | one slot per **live** distribution link (`0` when not a node) |
+/// | `node_table` | this node's own row plus one per link (`0` when not a node) |
 /// | `process_table` | one slot per **live** process |
 /// | `port_table` | one slot per **live** port |
 /// | `ets_misc` | one slot per **live** ETS table |
-/// | every other item | `0` |
+/// | `sys_misc`, `static`, `bif_timer`, `external_alloc` | `0` (no counterpart) |
+/// | `export_list`, `fun_list` | `0` (no separate list — see below) |
 ///
 /// A "slot" is [`std::mem::size_of::<usize>`] bytes — the word the runtime's own tables
 /// spend per entry — so the figures are a real (if coarse) lower bound on this runtime's
 /// footprint, in the byte unit the oracle uses. The `0` items are the ones this runtime
-/// has **no counterpart** for (no `export`/BIF-timer/`fun` table, no distribution or node
-/// table, no external port-driver allocator), and a `0` is honest where an invented
-/// figure would not be.
+/// has **no counterpart** for, and a `0` is honest where an invented figure would not be:
+/// `sys_misc`/`static` (emulator/static-data areas — this runtime keeps no general C
+/// allocator bookkeeping), `bif_timer` (no BIF timers), `external_alloc` (no external
+/// port-driver allocator), and `export_list`/`fun_list` (there is **no** separate
+/// export-list/fun-list table here — an export or lambda lives once, in its module's own
+/// `ExpT`/`FunT` vector, already counted by `export_table`/`fun_table` and by
+/// `loaded_code`).
 fn allocated_areas(rt: &Runtime) -> Result<InfoValue> {
     let slot = std::mem::size_of::<usize>() as i64;
     let atoms = slot * rt.code_server.atoms().len() as i64;
-    let modules = slot * rt.loaded_modules().len() as i64;
+    let module_names = rt.loaded_modules();
+    let modules = slot * module_names.len() as i64;
     let registered = slot * rt.processes().registered().count() as i64;
     let processes = slot * rt.processes().len() as i64;
     let ports = slot * super::live_ports(rt)?;
     let tables = slot * super::live_tables(rt)?;
+    // The export/fun tables: one slot per `ExpT`/`FunT` entry across every loaded module.
+    let mut export_entries = 0usize;
+    let mut fun_entries = 0usize;
+    for name in &module_names {
+        if let Some(module) = rt.module(name) {
+            export_entries += module.exports.len();
+            fun_entries += module.funs.len();
+        }
+    }
+    let exports = slot * export_entries as i64;
+    let funs = slot * fun_entries as i64;
+    // The distribution/node tables exist only when this runtime is a node
+    // (`-name`/`-sname`): one row per live link, plus this node's own row for `node_table`.
+    let (dist, node) = match rt.dist_node() {
+        Some(dist) => {
+            let links = dist.connections().len() as i64;
+            (slot * links, slot * (1 + links))
+        }
+        None => (0, 0),
+    };
     Ok(InfoValue::List(vec![
         row("sys_misc", 0),
         row("static", 0),
@@ -209,15 +239,15 @@ fn allocated_areas(rt: &Runtime) -> Result<InfoValue> {
         ]),
         row("atom_table", atoms),
         row("module_table", modules),
-        row("export_table", 0),
+        row("export_table", exports),
         row("export_list", 0),
         row("register_table", registered),
-        row("fun_table", 0),
+        row("fun_table", funs),
         row("fun_list", 0),
-        row("module_refs", 0),
+        row("module_refs", modules),
         row("loaded_code", modules),
-        row("dist_table", 0),
-        row("node_table", 0),
+        row("dist_table", dist),
+        row("node_table", node),
         row("bif_timer", 0),
         row("process_table", processes),
         row("port_table", ports),
@@ -352,16 +382,48 @@ mod tests {
         );
     }
 
+    /// `allocated_areas` as `(name, values)` rows, for a given runtime.
+    fn allocated_area_rows(rt: &Runtime) -> Vec<(String, Vec<i64>)> {
+        let value = try_value("allocated_areas", rt).unwrap().unwrap();
+        let rows = match &value {
+            InfoValue::List(rows) => rows,
+            other => panic!("allocated_areas must be a list, got {other:?}"),
+        };
+        rows.iter()
+            .map(|row| match row {
+                InfoValue::Tupled(fields) => {
+                    let name = match &fields[0] {
+                        InfoValue::Atom(name) => (*name).to_string(),
+                        other => panic!("a row's first field must be an atom, got {other:?}"),
+                    };
+                    let values = fields[1..]
+                        .iter()
+                        .map(|field| match field {
+                            InfoValue::Int(value) => *value,
+                            other => panic!("{name}'s value must be an integer, got {other:?}"),
+                        })
+                        .collect();
+                    (name, values)
+                }
+                other => panic!("a row must be a tuple, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The first value of the `name` row of an `allocated_areas` answer.
+    fn area_value(pairs: &[(String, Vec<i64>)], name: &str) -> i64 {
+        pairs
+            .iter()
+            .find(|(key, _)| key == name)
+            .unwrap_or_else(|| panic!("{name} must be present"))
+            .1[0]
+    }
+
     #[test]
     fn allocated_areas_has_the_oracle_names_arities_and_derivations() {
         // The oracle's 19 items, in order (`erts_allocated_areas`,
         // `erl_alloc.c:2580-2699`), with `atom_space` as its three-element tuple.
         let rt = runtime();
-        let value = try_value("allocated_areas", &rt).unwrap().unwrap();
-        let rows = match &value {
-            InfoValue::List(rows) => rows,
-            other => panic!("allocated_areas must be a list, got {other:?}"),
-        };
         let expected = [
             "sys_misc",
             "static",
@@ -383,52 +445,80 @@ mod tests {
             "ets_misc",
             "external_alloc",
         ];
-        let pairs: Vec<(String, Vec<i64>)> = rows
-            .iter()
-            .map(|row| match row {
-                InfoValue::Tupled(fields) => {
-                    let name = match &fields[0] {
-                        InfoValue::Atom(name) => (*name).to_string(),
-                        other => panic!("a row's first field must be an atom, got {other:?}"),
-                    };
-                    let values = fields[1..]
-                        .iter()
-                        .map(|field| match field {
-                            InfoValue::Int(value) => *value,
-                            other => panic!("{name}'s value must be an integer, got {other:?}"),
-                        })
-                        .collect();
-                    (name, values)
-                }
-                other => panic!("a row must be a tuple, got {other:?}"),
-            })
-            .collect();
+        let pairs = allocated_area_rows(&rt);
         let names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, expected);
         assert_eq!(pairs[2].1.len(), 2, "atom_space carries a value and a peak");
 
         // The measured items reflect *this* runtime's own state (never a hardcoded oracle
         // figure): the atom table always holds the boot seed and the runtime always has
-        // its root process, while the items with no counterpart are honestly `0`.
-        let value_of = |name: &str| -> i64 {
-            pairs
-                .iter()
-                .find(|(key, _)| key == name)
-                .unwrap_or_else(|| panic!("{name} must be present"))
-                .1[0]
-        };
-        assert!(value_of("atom_table") > 0, "the atom table holds the core seed");
-        assert!(value_of("process_table") > 0, "the runtime has its root process");
+        // its root process. A fresh runtime has loaded **no** code module and is not a
+        // distributed node, so every item that counts loaded modules or distribution links
+        // is honestly `0`, as are the items with no counterpart at all.
+        assert!(
+            area_value(&pairs, "atom_table") > 0,
+            "the atom table holds the core seed"
+        );
+        assert!(
+            area_value(&pairs, "process_table") > 0,
+            "the runtime has its root process"
+        );
         for absent in [
+            "sys_misc",
+            "static",
             "bif_timer",
-            "dist_table",
-            "node_table",
             "external_alloc",
+            "export_list",
+            "fun_list",
+            "module_table",
             "export_table",
             "fun_table",
+            "module_refs",
+            "loaded_code",
+            "dist_table",
+            "node_table",
         ] {
-            assert_eq!(value_of(absent), 0, "{absent} has no counterpart here");
+            assert_eq!(
+                area_value(&pairs, absent),
+                0,
+                "{absent} has no counterpart with nothing loaded here"
+            );
         }
+
+        // Loading a real module makes the export and fun tables reflect its own `ExpT`/
+        // `FunT` entries (the `../beam_engine` fixture has both exports and lambdas), while
+        // the distribution/node tables stay honestly `0` — `RuntimeConfig::default()` is not
+        // a node.
+        let mut loaded = runtime();
+        loaded
+            .load_module(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../beam_engine/tests/fixtures/funs.beam"
+            ))
+            .expect("the funs fixture loads");
+        let loaded_pairs = allocated_area_rows(&loaded);
+        assert!(
+            area_value(&loaded_pairs, "export_table") > 0,
+            "a loaded module's `ExpT` entries are counted"
+        );
+        assert!(
+            area_value(&loaded_pairs, "fun_table") > 0,
+            "a loaded module's `FunT` lambdas are counted"
+        );
+        assert!(
+            area_value(&loaded_pairs, "module_refs") > 0,
+            "a loaded module is counted"
+        );
+        assert_eq!(
+            area_value(&loaded_pairs, "dist_table"),
+            0,
+            "not a distributed node"
+        );
+        assert_eq!(
+            area_value(&loaded_pairs, "node_table"),
+            0,
+            "not a distributed node"
+        );
     }
 
     #[test]
