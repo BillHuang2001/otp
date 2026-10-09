@@ -78,11 +78,13 @@
 //!
 //! The crate is `#![deny(unsafe_code)]`. Every exception is SAFETY-annotated and
 //! confined to a single responsibility: `predicates` wraps the `beam_term`
-//! boxed-term predicates (`unsafe fn` because they dereference a header word) and
+//! boxed-term predicates (`unsafe fn` because it dereferences a header word) and
 //! `terms` is the crate's single point of raw-heap term construction/reading
 //! behind the [`ExecutionContext::alloc_words`] seam — both allowed where they are
 //! declared below. A further set of modules carry a module-local
-//! `#![allow(unsafe_code)]`: `families::bitstrings::raw` (the frozen bitstring
+//! `#![allow(unsafe_code)]`: `context` (the `MinimalContext` region heap is the
+//! crate's raw `beam_alloc::ReservedHeap` bump seam — see
+//! [`context::MinimalContext`]), `families::bitstrings::raw` (the frozen bitstring
 //! layouts), [`jit::emitter`] (the x86-64 encoder and the crate's only
 //! executable-memory mapping — see that module for its W^X policy), the baseline
 //! backend (`jit::baseline`), and the feature-gated `jit::cranelift`.

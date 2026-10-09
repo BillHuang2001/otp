@@ -84,9 +84,20 @@
 //! [`alloc_words`]: ExecutionContext::alloc_words
 //! [`apply`]: ExecutionContext::apply
 //! [`apply_fun`]: ExecutionContext::apply_fun
+//!
+//! # `unsafe`
+//!
+//! The crate root keeps `#![deny(unsafe_code)]`; this module's `MinimalContext`
+//! heap ([`ContextHeap`]) is the crate's **raw `ReservedHeap` bump seam** — the one
+//! place the test/embedding heap advances another crate's bump pointer over
+//! uninitialised words — so it carries the module-local `#![allow(unsafe_code)]`
+//! below. Every `unsafe` block states its `// SAFETY:` rationale, exactly as
+//! [`crate::terms`] does for term construction.
+#![allow(unsafe_code)]
 
 use std::sync::Arc;
 
+use beam_alloc::{GrowOutcome, ReservedHeap};
 use beam_common::Result;
 use beam_loader::{Label, Module};
 use beam_term::Eterm;
@@ -350,6 +361,11 @@ pub trait ExecutionContext {
     /// or reclaim the block; it must never be retained across such a call. This
     /// mirrors the C heap-pointer convention (`HAlloc`/`heap_top`): the heap is
     /// owned by the context and the engine only borrows raw storage.
+    ///
+    /// A **zero-word** request (`n == 0`) asks for no storage at all: a host may
+    /// answer `Ok` with a **dangling but non-null, well-aligned** pointer (never an
+    /// error), so a caller that builds a zero-word shape does not have to special-case
+    /// it. Nothing may be read or written through such a pointer.
     ///
     /// The default body is a typed [`crate::error::unsupported`]: a context with
     /// no exposed heap (only `call_bif`/`ensure_heap`) cannot serve raw words.
@@ -639,78 +655,188 @@ pub type ApplyHook = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Eterm>>;
 pub type ExternalResolver =
     Box<dyn FnMut(&str, &str, u32) -> Result<Option<(Arc<Module>, Label)>>>;
 
-/// Arena chunk size in `Eterm` words (64 KiB).
+/// The first region's **reservation** in `Eterm` words (4 MiB).
 ///
-/// Large enough that the per-chunk `Box` handle (and the arena's own bookkeeping)
-/// is amortised to nothing over the thousands of small allocations a term-building
-/// run makes, yet small enough that a lightly-using context does not reserve 64 KiB
-/// for one word. A request that does not fit the current chunk's tail starts a new
-/// chunk (so no allocation straddles a boundary) and a request larger than a whole
-/// chunk gets a dedicated chunk of its own.
-const ARENA_CHUNK_WORDS: usize = 64 * 1024 / core::mem::size_of::<Eterm>();
+/// A [`ContextHeap`] region reserves a large address range up front and commits only
+/// a slice of it ([`HEAP_COMMIT_WORDS`]), so growth is normally a **commit**: the
+/// region's bump pointer does not move and every pointer it has already handed out
+/// stays valid. The reservation itself is *address space only* — `beam_alloc`'s
+/// carriers come from anonymous private `mmap` (via `mseg`), so reserved pages fault
+/// lazily and a large reservation commits no RSS. It bounds how far one region can
+/// grow *in place* before a fresh region is needed.
+const HEAP_RESERVE_WORDS: usize = 4 * 1024 * 1024 / core::mem::size_of::<Eterm>();
 
-/// A **chunked** pointer-stable arena: the backing store of
-/// [`MinimalContext::alloc_words`](ExecutionContext::alloc_words).
+/// A region's **initial committed** slice in `Eterm` words (64 KiB).
 ///
-/// Requests are served as sub-slices of a large fixed-size *chunk*, so an
-/// allocation costs its **payload only** — the arena holds **one** `Box` handle per
-/// chunk (a few thousand words), not one per allocation. (The previous shape boxed
-/// every request, retaining a whole `Box<[Eterm]>` handle plus an allocator
-/// header per allocation.)
+/// A lightly-using context commits only this much; the rest of the reservation is
+/// committed lazily (`try_grow`), one request at a time, as the context asks for more.
+const HEAP_COMMIT_WORDS: usize = 64 * 1024 / core::mem::size_of::<Eterm>();
+
+/// The pointer-stable heap backing
+/// [`MinimalContext::alloc_words`](ExecutionContext::alloc_words): a list of
+/// [`ReservedHeap`] **regions** that only ever grows.
 ///
-/// # Pointer stability
+/// # Why regions instead of one growable heap
 ///
-/// The chunks are boxed and pushed into a `Vec` that only ever grows: the `Vec`'s
-/// reallocation moves the *chunk handles*, never the chunk buffers, so a pointer
-/// handed out by [`Arena::alloc`] stays valid (and unmoved) until the context is
-/// dropped. A request **larger than a chunk** gets a dedicated chunk of its own,
-/// marked fully consumed, so a later small request can never alias into it.
-struct Arena {
-    /// The chunks, oldest first. The last one is the allocation frontier.
-    chunks: Vec<Box<[Eterm]>>,
-    /// Words already handed out of the newest chunk.
-    used: usize,
+/// A term the engine has built lives at a raw address the engine already holds — in
+/// an X-register, on the Erlang stack, inside a structure in flight — so
+/// `alloc_words` **may not move** a word it has handed out. That is the same
+/// "valid until the next `ensure_heap`" stability contract the trait documents (in
+/// this context `ensure_heap` never moves anything, so a pointer is valid until the
+/// context is dropped).
+///
+/// A single [`ReservedHeap`] cannot satisfy that once its reservation is exhausted:
+/// its only way forward is [`ReservedHeap::relocate`], which **moves the whole live
+/// block** and returns only the constant pointer delta. That would invalidate every
+/// pointer the context has already handed out, and it could not fix the *interior*
+/// pointers the heap's own words hold (a cons cell's `cdr`, a tuple's elements, a
+/// `BinRef`'s payload pointer) — telling a pointer word from raw payload bytes needs
+/// term-structure knowledge this heap seam deliberately does not have. So
+/// `relocate` is **never** called here.
+///
+/// Instead the heap is a `Vec` of reservations that only ever grows: an exhausted
+/// region is left exactly as it is (its words untouched, every pointer into it still
+/// valid) and a fresh, larger region becomes the allocation frontier. That is the
+/// identical "stable until dropped" shape the arena has always had, with
+/// [`ReservedHeap`] supplying the bump pointer, the in-place commit growth and a
+/// typed, return-based failure instead of a chunk-Box.
+///
+/// # Growth
+///
+/// An allocation is served from the **frontier** region (the newest one). When the
+/// request does not fit the frontier's committed slice, the region is asked to raise
+/// its committed limit **in place** ([`GrowOutcome::GrewInPlace`]): the bump pointer
+/// did not move, so the retry lands on the same region. Only when the whole
+/// *reservation* is exhausted ([`GrowOutcome::MoveRequired`]) is a fresh, doubled
+/// region created and pushed; every earlier region stays alive and unmoved for the
+/// context's lifetime.
+struct ContextHeap {
+    /// Every region ever handed out, oldest first. The **last one is the allocation
+    /// frontier** (`regions.len() - 1` is the current-region index); the `Vec` only
+    /// ever grows, so no region is freed — and no word moves — before the context is
+    /// dropped.
+    regions: Vec<ReservedHeap>,
+    /// The first region's reservation geometry, and the floor every later region's
+    /// reservation doubles up from.
+    reserve_words: usize,
+    /// The words committed up front in a region.
+    commit_words: usize,
 }
 
-impl Arena {
-    /// An empty arena (no chunk is allocated until the first request).
-    fn new() -> Arena {
-        Arena {
-            chunks: Vec::new(),
-            used: 0,
+impl ContextHeap {
+    /// An empty heap: no region is reserved until the first request, so a context
+    /// that never allocates costs no address space and `MinimalContext`'s
+    /// constructors can stay infallible.
+    fn new() -> ContextHeap {
+        ContextHeap {
+            regions: Vec::new(),
+            reserve_words: HEAP_RESERVE_WORDS,
+            commit_words: HEAP_COMMIT_WORDS,
         }
     }
 
-    /// Hand out `n` uninitialized words and return a stable pointer to them.
-    fn alloc(&mut self, n: usize) -> *mut Eterm {
-        // A request larger than a chunk gets its own chunk. `used` is set past its
-        // end so a later small request cannot be served from — and alias into — the
-        // bytes the caller is about to write.
-        if n > ARENA_CHUNK_WORDS {
-            let mut block = vec![Eterm::default(); n].into_boxed_slice();
-            let ptr = block.as_mut_ptr();
-            self.chunks.push(block);
-            self.used = n;
-            return ptr;
+    /// A heap with explicit first-region geometry, so the growth paths can be driven
+    /// deterministically with small, exact numbers. Test-only: production contexts
+    /// always take [`ContextHeap::new`]'s geometry.
+    #[cfg(test)]
+    fn with_geometry(reserve_words: usize, commit_words: usize) -> ContextHeap {
+        ContextHeap {
+            regions: Vec::new(),
+            reserve_words,
+            commit_words,
         }
-        // Room in the current chunk? (`saturating_sub` keeps the check total: no
-        // state can make `used` exceed a chunk's length.)
-        let room = match self.chunks.last() {
-            Some(chunk) => chunk.len().saturating_sub(self.used) >= n,
-            None => false,
-        };
-        if !room {
-            self.chunks
-                .push(vec![Eterm::default(); ARENA_CHUNK_WORDS].into_boxed_slice());
-            self.used = 0;
+    }
+
+    /// Hand out `n` contiguous, uninitialised words and return a pointer that stays
+    /// valid and **unmoved** until this heap is dropped.
+    ///
+    /// A zero-word request hands out nothing: it yields a dangling but non-null,
+    /// well-aligned pointer, exactly as
+    /// [`ExecutionContext::alloc_words`] documents, and reserves no region.
+    fn alloc(&mut self, n: usize) -> Result<*mut Eterm> {
+        if n == 0 {
+            // No storage is requested, so no region is reserved: the documented
+            // dangling-but-valid pointer is the answer.
+            return Ok(core::ptr::NonNull::<Eterm>::dangling().as_ptr());
         }
-        let chunk = self.chunks.last_mut().expect("a chunk was just ensured");
-        // Safe indexing into the free tail: the pointer to its first word. A
-        // zero-word request at the end of a full chunk yields a one-past-the-end
-        // (non-null, aligned) pointer, exactly as documented.
-        let ptr = chunk[self.used..].as_mut_ptr();
-        self.used += n;
-        ptr
+        // Reserve the first region lazily, on first use (construction stays
+        // infallible; a reservation failure surfaces here as a typed error).
+        if self.regions.is_empty() {
+            let first = self.fresh_region(n)?;
+            self.regions.push(first);
+        }
+        // Fast path: the frontier region's committed slice already has room.
+        if self.frontier().available() >= n {
+            return self.alloc_from_frontier(n);
+        }
+        // Otherwise raise the frontier's committed limit in place. The bump pointer
+        // does not move, so a retry on the SAME region is correct (only `limit()`
+        // moved, and `alloc_words` re-reads it).
+        let outcome = self.frontier_mut().try_grow(n)?;
+        if outcome == GrowOutcome::GrewInPlace {
+            return self.alloc_from_frontier(n);
+        }
+        // The whole reservation is exhausted, so this region can never serve the
+        // request. Never `relocate` (it moves the live block and would invalidate
+        // every pointer handed out — see the struct docs): keep every existing region
+        // alive and make a fresh, larger one the frontier. A reservation failure
+        // surfaces as a typed `BeamError::Alloc`, never a panic.
+        let fresh = self.fresh_region(n)?;
+        self.regions.push(fresh);
+        self.alloc_from_frontier(n)
+    }
+
+    /// The allocation frontier: the newest region. Only called once a region exists.
+    fn frontier(&self) -> &ReservedHeap {
+        self.regions
+            .last()
+            .expect("a region is ensured before the frontier is read")
+    }
+
+    /// The allocation frontier, mutably.
+    fn frontier_mut(&mut self) -> &mut ReservedHeap {
+        self.regions
+            .last_mut()
+            .expect("a region is ensured before the frontier is read")
+    }
+
+    /// Hand out `n` words from the frontier region's committed slice.
+    ///
+    /// The caller guarantees `n <= frontier.available()`: the fast path checked it,
+    /// and each growth path ends with the committed limit covering `n`.
+    fn alloc_from_frontier(&mut self, n: usize) -> Result<*mut Eterm> {
+        let heap = self.frontier_mut();
+        debug_assert!(
+            heap.available() >= n,
+            "the frontier's committed slice must cover the request"
+        );
+        // SAFETY: the caller guarantees `n <= heap.available()`, so the request lies
+        // wholly inside this region's committed slice — exactly `alloc_words`'s
+        // precondition. The region is owned exclusively by this heap (a `&mut self`
+        // method) and stays alive, unmoved, until the heap is dropped, so the returned
+        // pointer is valid (and stable) for the context's lifetime.
+        unsafe { heap.alloc_words(n) }
+    }
+
+    /// A fresh region that can serve `n` words with headroom.
+    ///
+    /// The reservation **doubles** the previous one (a fresh region only ever follows
+    /// an exhausted region, so total capacity stays exponential in the region count),
+    /// floored at the configured geometry and raised to at least `n`; at least `n`
+    /// words are committed, so the new frontier serves this very request without a
+    /// `try_grow`. A reservation failure (byte-size overflow, or the allocator's own
+    /// typed error) propagates as [`BeamError::Alloc`](beam_common::BeamError::Alloc).
+    fn fresh_region(&self, n: usize) -> Result<ReservedHeap> {
+        let reserved = self
+            .regions
+            .last()
+            .map_or(self.reserve_words, |prev| {
+                prev.reserved_words().saturating_mul(2)
+            })
+            .max(self.reserve_words)
+            .max(n);
+        let committed = self.commit_words.max(n).min(reserved);
+        ReservedHeap::new(reserved, committed)
     }
 }
 
@@ -720,7 +846,7 @@ impl Arena {
 /// heap is treated as unbounded), [`MinimalContext::new`] installs a default hook
 /// that rejects every BIF with [`crate::error::unsupported`], and
 /// [`MinimalContext::alloc_words`](ExecutionContext::alloc_words) hands out words
-/// from a pointer-stable arena (see the field docs).
+/// from a pointer-stable region heap (see the field docs).
 ///
 /// An **apply hook** ([`with_apply_hook`](MinimalContext::with_apply_hook) /
 /// [`set_apply_hook`](MinimalContext::set_apply_hook)) may additionally be installed
@@ -740,18 +866,16 @@ pub struct MinimalContext {
     external_resolver: Option<ExternalResolver>,
     /// An optional mailbox (the body of the nine receive-seam methods).
     mailbox: Option<Box<dyn Mailbox>>,
-    /// A **chunked**, pointer-stable arena backing
-    /// [`ExecutionContext::alloc_words`].
+    /// The pointer-stable heap backing [`ExecutionContext::alloc_words`].
     ///
-    /// Each allocation is served as a sub-slice of a large fixed-size chunk (see
-    /// [`Arena`]), so an allocation costs its payload only — one `Box` handle is
-    /// retained **per chunk**, not per allocation. Chunks are boxed, so growing the
-    /// arena moves the chunk handles but never a chunk's buffer: a pointer handed
-    /// out by `alloc_words` stays valid for the lifetime of the context (in this
-    /// context `ensure_heap` never moves anything). The chunks are never freed
-    /// before the context is dropped, which is exactly the "valid until the next
-    /// `ensure_heap`" stability contract the trait documents.
-    arena: Arena,
+    /// A [`ContextHeap`]: a list of [`ReservedHeap`] regions that only ever grows.
+    /// An allocation is served from the frontier region's committed slice (raised
+    /// **in place**, so no word ever moves), and only an exhausted *reservation*
+    /// pushes a fresh, larger region — leaving every earlier region alive and every
+    /// pointer it handed out valid. Nothing is freed before the context is dropped,
+    /// which is exactly the "valid until the next `ensure_heap`" stability contract
+    /// the trait documents (in this context `ensure_heap` never moves anything).
+    heap: ContextHeap,
 }
 
 impl MinimalContext {
@@ -771,7 +895,7 @@ impl MinimalContext {
             apply_hook: None,
             external_resolver: None,
             mailbox: None,
-            arena: Arena::new(),
+            heap: ContextHeap::new(),
         }
     }
 
@@ -875,12 +999,13 @@ impl ExecutionContext for MinimalContext {
     }
 
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
-        // The chunked arena hands out a sub-slice of a fixed-size chunk (its words
-        // are pre-initialised to NIL, so they are already the "uninitialized words"
-        // the trait contracts); a zero-word request still yields a non-null,
-        // well-aligned pointer. The pointer stays stable for the life of the
-        // context because the chunks are boxed and never move.
-        Ok(self.arena.alloc(n))
+        // The region heap hands out `n` uninitialised words whose pointer stays
+        // valid (and unmoved) for the life of the context: the frontier region
+        // commits more room in place and only an exhausted reservation pushes a
+        // fresh, larger region, leaving the old one — and every pointer into it —
+        // untouched. A zero-word request still yields a non-null, well-aligned
+        // pointer.
+        self.heap.alloc(n)
     }
 
     fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
@@ -1042,7 +1167,7 @@ mod tests {
     #[test]
     fn minimal_context_alloc_words_is_ok_and_non_null() {
         let mut ctx = MinimalContext::new();
-        let ptr = ctx.alloc_words(4).expect("arena allocates");
+        let ptr = ctx.alloc_words(4).expect("the region heap allocates");
         assert!(!ptr.is_null(), "a non-empty block has a non-null pointer");
     }
 
@@ -1051,7 +1176,9 @@ mod tests {
         // Documented: a zero-word request may return a dangling, but non-null,
         // well-aligned pointer.
         let mut ctx = MinimalContext::new();
-        let ptr = ctx.alloc_words(0).expect("arena allocates an empty block");
+        let ptr = ctx
+            .alloc_words(0)
+            .expect("the region heap allocates an empty block");
         assert!(!ptr.is_null());
         assert_eq!(ptr as usize % core::mem::align_of::<Eterm>(), 0);
     }
@@ -1063,6 +1190,153 @@ mod tests {
         let b = ctx.alloc_words(4).expect("second alloc");
         assert!(!a.is_null() && !b.is_null());
         assert_ne!(a, b, "distinct allocations own distinct storage");
+    }
+
+    #[test]
+    fn minimal_context_allocation_is_pointer_stable_across_growth() {
+        // The whole stability contract through the public API: a pointer handed out
+        // by `alloc_words` still owns its words after enough later allocations to
+        // grow the heap several times over.
+        let mut ctx = MinimalContext::new();
+        let first = ctx.alloc_words(4).expect("the region heap allocates");
+        // SAFETY: `alloc_words(4)` returned 4 exclusively-owned writable words.
+        unsafe { first.write(Eterm::from_raw(0x5A5A_5A5A)) };
+
+        for _ in 0..50_000 {
+            let later = ctx.alloc_words(4).expect("the region heap keeps allocating");
+            // SAFETY: `alloc_words(4)` returned 4 exclusively-owned writable words.
+            unsafe { later.write(Eterm::from_raw(0x1122_3344)) };
+        }
+
+        // SAFETY: `first` is still inside a live region and exclusively owned.
+        assert_eq!(
+            unsafe { first.read() },
+            Eterm::from_raw(0x5A5A_5A5A),
+            "the first allocation's words survive every later one"
+        );
+    }
+
+    // ---- the region heap (`ContextHeap`) ----------------------------------
+    //
+    // These drive the heap type directly with small, exact geometry (`with_geometry`)
+    // so each growth path is forced deterministically instead of by allocating
+    // megabytes; the tests above cover the same contracts through the public seam.
+
+    #[test]
+    fn a_zero_word_request_answers_ok_and_reserves_nothing() {
+        let mut heap = ContextHeap::with_geometry(8, 2);
+        let ptr = heap.alloc(0).expect("a zero-word request is Ok");
+        assert!(!ptr.is_null(), "a zero-word block is dangling but non-null");
+        assert_eq!(ptr as usize % core::mem::align_of::<Eterm>(), 0);
+        assert!(
+            heap.regions.is_empty(),
+            "a zero-word request must not reserve a region"
+        );
+
+        // ...and it stays non-null and aligned once a region exists.
+        let _ = heap.alloc(1).expect("the first region is reserved");
+        let ptr = heap.alloc(0).expect("a zero-word request is Ok");
+        assert!(!ptr.is_null());
+        assert_eq!(ptr as usize % core::mem::align_of::<Eterm>(), 0);
+    }
+
+    #[test]
+    fn an_in_place_grow_keeps_earlier_pointers_valid() {
+        // Reserve 64 words but commit only 4: the next request fits the reservation,
+        // so it must be served by raising the committed limit IN PLACE.
+        let mut heap = ContextHeap::with_geometry(64, 4);
+        let first = heap.alloc(4).expect("the committed slice serves 4 words");
+        // SAFETY: 4 exclusively-owned words; write the first.
+        unsafe { first.write(Eterm::from_raw(0xFEED_FACE)) };
+
+        // `used == committed == 4`, so this request needs growth — which the
+        // reservation can serve without moving the bump pointer.
+        let second = heap.alloc(2).expect("in-place growth serves the request");
+        assert_eq!(
+            heap.regions.len(),
+            1,
+            "an in-place grow must not add a region"
+        );
+        assert_eq!(
+            second as usize,
+            first as usize + 4 * core::mem::size_of::<Eterm>(),
+            "an in-place grow continues at the same (unmoved) bump pointer"
+        );
+        // SAFETY: `first` is still a live, exclusively-owned 4-word block.
+        assert_eq!(
+            unsafe { first.read() },
+            Eterm::from_raw(0xFEED_FACE),
+            "raising the committed limit never disturbs the words already handed out"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_reservation_keeps_the_old_region_alive() {
+        // Reserve == commit == 8, so one request fills the whole reservation and the
+        // next cannot be served in place: the MoveRequired path.
+        let mut heap = ContextHeap::with_geometry(8, 8);
+        let first = heap.alloc(8).expect("the whole reservation serves 8 words");
+        assert_eq!(heap.regions.len(), 1);
+        // SAFETY: 8 exclusively-owned words; write the first and the last.
+        unsafe {
+            first.write(Eterm::from_raw(0xDEAD_BEEF));
+            first.add(7).write(Eterm::from_raw(0xCAFE_BABE));
+        }
+
+        let second = heap.alloc(8).expect("a fresh region serves the request");
+        assert_eq!(
+            heap.regions.len(),
+            2,
+            "an exhausted reservation must be followed by a fresh region"
+        );
+        // The two regions are disjoint: the fresh region's 8 words do not overlap the
+        // old region's (either order is fine — they are separate reservations).
+        let span = 8 * core::mem::size_of::<Eterm>();
+        assert!(
+            second as usize >= first as usize + span
+                || (second as usize) + span <= first as usize,
+            "the fresh region must not overlap the region it replaces"
+        );
+        // The OLD region is kept ALIVE and UNMOVED: its contents survive, read back
+        // through the pointer handed out before the fresh region existed.
+        // SAFETY: `first` still points into the live first region.
+        unsafe {
+            assert_eq!(first.read(), Eterm::from_raw(0xDEAD_BEEF));
+            assert_eq!(first.add(7).read(), Eterm::from_raw(0xCAFE_BABE));
+        }
+    }
+
+    #[test]
+    fn an_exhausted_region_is_followed_by_a_larger_one() {
+        let mut heap = ContextHeap::with_geometry(8, 8);
+        let _ = heap.alloc(8).expect("the first reservation is served");
+        let _ = heap.alloc(8).expect("a fresh region is created");
+        assert_eq!(heap.regions.len(), 2);
+        assert!(
+            heap.regions[1].reserved_words() > heap.regions[0].reserved_words(),
+            "a fresh region doubles the reservation ({} -> {})",
+            heap.regions[0].reserved_words(),
+            heap.regions[1].reserved_words()
+        );
+    }
+
+    #[test]
+    fn a_request_larger_than_the_whole_reservation_is_served() {
+        // Reserve a mere 4 words: the first request cannot be served at all, so a
+        // fresh region sized to the request (with headroom) must be created.
+        let mut heap = ContextHeap::with_geometry(4, 4);
+        let big = heap.alloc(64).expect("a region sized to the request is created");
+        assert_eq!(heap.regions.len(), 1);
+        assert!(heap.regions[0].reserved_words() >= 64);
+        // The request was served in full: every word is writable and readable.
+        for i in 0..64 {
+            // SAFETY: `big` owns 64 exclusive words, so index `i` is in bounds.
+            unsafe { big.add(i).write(Eterm::from_raw(0x1000 + i)) };
+        }
+        for i in 0..64 {
+            // SAFETY: as above.
+            assert_eq!(unsafe { big.add(i).read() }, Eterm::from_raw(0x1000 + i));
+        }
     }
 
     #[test]

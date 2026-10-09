@@ -35,14 +35,17 @@ execution semantics are documented one level up in `../CONTEXT.md` (read it firs
   (`gen:call`'s `exit(noproc)` inside `gen_server:call/3`'s `catch`, say) is caught and unwound
   exactly as the oracle does; the reason a caller then sees is whatever the callee's own wrapper
   built (a compound term, carried out in the `Raise` live-reason slot, never reshaped).
-- `unsafe` only in the modules marked at the crate level (`terms`, `predicates`,
-  `families/bitstrings/raw.rs`, `families/records/raw.rs`, `jit/emitter/*`, `jit/baseline/*`,
-  feature-gated `jit/cranelift/*`), each with its `// SAFETY:` rationale. Errors are
+- `unsafe` only in the modules marked at the crate level (`terms`, `predicates`), each with its
+  `// SAFETY:` rationale, plus the modules carrying a module-local `#![allow(unsafe_code)]` under
+  the crate-wide deny (`context.rs` — the `MinimalContext` region heap is the crate's raw
+  `beam_alloc::ReservedHeap` bump seam — `families/bitstrings/raw.rs`, `families/records/raw.rs`,
+  `jit/emitter/*`, `jit/baseline/*`, feature-gated `jit/cranelift/*`). Errors are
   `beam_common::{Result, BeamError}` only, and unsupported cases stay typed errors.
 
 ## Routing Table
 - `lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `context.rs` → the `ExecutionContext` / `Mailbox` seams, `RootSet`, `MinimalContext`
+- `context.rs` → the `ExecutionContext` / `Mailbox` seams, `RootSet`, `MinimalContext` (incl. its
+  `ContextHeap` — the pointer-stable region heap over `beam_alloc::ReservedHeap`)
   (`CONTEXT.md` beside it: none — see `../CONTEXT.md`)
 - `machine/` → `Machine` (registers + the `x_mut`/`fr_mut`/`stack_mut`/`with_roots`/`alloc_rooted`
   root-set hand-off, frames, catch/unwind, run entries, `RunOutcome`, module contexts, driver,
