@@ -239,12 +239,13 @@ short form is the safe one. Repro:
   `boot_from_script_reporting` is the boot-stop-position entry point, and the in-crate boot-script suite
   exercises the `execute_reporting`/`BootStop` report API a genuine future stop would use.
 - `../tests/boot.rs` (integration, owned by this node): `start_boot()` builds a canonical, short `-boot`
-  value (avoiding the heap-fragility above) and asserts the real-script stop is `stop.index == Some(20)`
-  on the `{apply,{c,erlangrc,[]}}` directive, reporting the real `{noproc,…}` term; the `-boot` CLI drive;
-  the CLI's honest-stop diagnostic (`file_server_2` `noproc`, and **not** `application_controller`); a
-  synthetic-probe boot (the real script's first 20 directives + a `probe:run/0` `apply`, built with the
-  oracle) proving the `application_controller` kernel process survives its short-lived directive process
-  (`whereis` = a live pid); and the preloaded-only default.
+  value (avoiding the heap-fragility above) and, with the CLI-equivalent configuration, asserts the real
+  script runs **all 22 directives** to `{progress,started}` — instruction 20 is the `{apply,{c,erlangrc,[]}}`
+  directive the native `file_server_2` service unblocks, and the `primLoad` batches really loaded; the
+  `-boot` CLI drive of a synthetic script; the CLI running the real `start.boot` to completion (exit 0,
+  empty stdout/stderr); a synthetic-probe boot (the real script's first 20 directives + a `probe:run/0`
+  `apply`, built with the oracle) proving the `application_controller` kernel process survives its
+  short-lived directive process (`whereis` = a live pid); and the preloaded-only default.
 
 ## Notes for Agents — the `file_server_2` link is closed
 The A.9 boot chain's last link is closed by a **runtime-native `file_server_2` service**
