@@ -135,10 +135,14 @@ SMP pool:
     **without** a `PortTable` is the port-less control (the incoming entry stays); the owned-table
     accessors round-trip; and the wake list is absorbed after the slice and on the empty-queue early
     return.
-27. `exhaustion.rs` (3 tests) — `Process::deliver`'s collect-and-retry: a full nursery is grown one
-    curated step and the payload is enqueued exactly once (`minor_gcs == 1`), FIFO preserved for a
-    second delivery; and the typed `Err(BeamError::Alloc(AllocKind::Message))` path (a
-    `from_min_max(cap, cap)` policy cannot grow ⇒ mailbox untouched, no partial write, no panic).
+27. `exhaustion.rs` (4 tests) — `Process::deliver`'s collect-grow-and-retry over the **bounded**
+    nursery: a payload larger than the whole nursery is refused, the single retry collects once and
+    grows the nursery on demand to `next_heap_size(payload, 0)` (`minor_gcs == 1`) and the payload is
+    enqueued whole and exactly once, FIFO preserved for a second delivery; `ensure_capacity` is pinned
+    directly as the on-demand growth seam (empty nursery ⇒ `available_words() >= need_words`); and the
+    typed `Err(BeamError::Alloc(AllocKind::Message))` path (a `from_min_max(cap, cap)` policy cannot
+    grow ⇒ the growth is refused **fail-fast** with `minor_gcs == 0`, mailbox untouched, no partial
+    write, no panic, and a fitting payload still delivered afterwards).
 28. `common/mod.rs` — the **shared oracle driver** used by `registry_monitors.rs`, `dict_oracle.rs`,
     `monitor_tag.rs`, `capability_inventory.rs` and `port_monitor_cleanup.rs`: `ERL_TIMEOUT`,
     `erl_stdout`, `expect_oracle` and `strip_logger_reports` (+ 4 unit tests for the normalizer). It runs
@@ -166,7 +170,7 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **391 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **392 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,

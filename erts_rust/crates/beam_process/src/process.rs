@@ -667,14 +667,17 @@ impl Process {
     /// blocked (`Waiting`/`Suspended`), it is woken and the returned [`DeliverOutcome`] is
     /// [`DeliverOutcome::Woke`].
     ///
-    /// Retries once after a collection when the young heap (or the message table) is
+    /// Retries once after an on-demand growth when the young heap (or the message table) is
     /// exhausted: `AllocKind::Heap`/`AllocKind::Message` exhaustion is a *normal*
-    /// condition, not fatal OOM.
+    /// condition, not fatal OOM. The retry collects and grows the nursery to fit the refused
+    /// request ([`Process::ensure_capacity`], seeded with the word count the copier reported),
+    /// so a payload larger than the bounded nursery is still delivered — never duplicated and
+    /// never truncated.
     ///
     /// # Errors
     ///
-    /// Propagates the underlying `BeamError::Alloc` if the copy still does not fit after a
-    /// collection.
+    /// Propagates the retry's own `BeamError::Alloc` — an `AllocKind::Message` refusal — when
+    /// the payload still does not fit under the heap policy.
     pub fn deliver(
         &mut self,
         from: Eterm,
@@ -683,12 +686,31 @@ impl Process {
     ) -> Result<DeliverOutcome> {
         match self.copy_message(from, term, src_off_heap) {
             Ok(()) => {}
-            // A full young heap (or message table) is a normal condition: collect and
-            // retry exactly once. Any other failure is propagated untouched.
+            // A full young heap (or message table) is a normal condition: collect, grow the
+            // nursery on demand and retry exactly once. Any other failure is propagated
+            // untouched.
             Err(BeamError::Alloc(failure))
                 if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
-                self.collect()?;
+                // The copier reports the whole graph's flat word count in the failure (as
+                // bytes) — for the preflight `AllocKind::Message` refusal and the mid-copy
+                // `AllocKind::Heap` one alike — so the words the growth must cover are
+                // recoverable from it.
+                let need_words = failure.requested / core::mem::size_of::<Eterm>();
+                // Collect once and grow the nursery explicitly to fit `need_words`: a
+                // collection sizes the nursery from what it left alive in it, not from what
+                // this request is about to allocate, so an oversized payload needs the
+                // on-demand growth (`Process::ensure_capacity`).
+                //
+                // The growth's own error is deliberately ignored. When the policy's ceiling
+                // makes the request unreachable, `ensure_capacity` fails **fail-fast** with
+                // `AllocKind::Heap` without touching the collector; the retry below then
+                // reproduces the refusal as the raw `AllocKind::Message` the caller keys its
+                // fragment fallback on (`beam_rt::deliver_message`), so surfacing the growth's
+                // `AllocKind::Heap` error here would change the caller-visible contract. This
+                // is not a silent swallow — the retry's own result is authoritative and is
+                // what the delivery returns.
+                let _growth = self.ensure_capacity(need_words);
                 self.copy_message(from, term, src_off_heap)?;
             }
             Err(error) => return Err(error),
@@ -778,6 +800,46 @@ impl Process {
     ///
     /// Propagates the collector's and the rebuilding allocations' `BeamError`s.
     pub fn collect(&mut self) -> Result<Collection> {
+        self.run_rooted_collection(|collector, roots| collector.collect(roots))
+    }
+
+    /// Grows the young heap **on demand** so that a `need_words`-word allocation can proceed —
+    /// the sibling of [`Process::collect`] and the runtime's explicit growth seam (the one
+    /// [`Process::deliver`] drives on its refusal path).
+    ///
+    /// It runs one collection over the same root set [`Process::collect`] gathers (a minor,
+    /// escalating to a major when a minor cannot make room), then grows the now-empty nursery
+    /// to the smallest curated size covering `need_words`; afterwards
+    /// [`young().available_words()`](beam_gc::HeapSpace::available_words) `>= need_words`. A
+    /// collection sizes the nursery from what it left alive in it, not from what the caller is
+    /// about to allocate, so this explicit step is what lets a request larger than the
+    /// (otherwise **bounded**) nursery be met — the capacity never grows merely because a
+    /// collection ran.
+    ///
+    /// # Errors
+    ///
+    /// When [`max_heap_words`](beam_gc::HeapPolicy::max_heap_words) (or the growth table's
+    /// ceiling) makes the request unreachable, the typed [`BeamError::Alloc`] is returned
+    /// **fail-fast**, before anything is collected, leaving the collector untouched; otherwise
+    /// the collector's and the rebuilding allocations' `BeamError`s are propagated.
+    pub fn ensure_capacity(&mut self, need_words: usize) -> Result<Collection> {
+        self.run_rooted_collection(|collector, roots| collector.ensure_capacity(need_words, roots))
+    }
+
+    /// Gathers the process root set, runs `collect` over it and writes every region back — the
+    /// shared body of [`Process::collect`] and [`Process::ensure_capacity`].
+    ///
+    /// `collect` is the collection action: [`Collector::collect`] for a plain collection, or
+    /// [`Collector::ensure_capacity`] for an on-demand nursery growth. Every region is written
+    /// back **even when the action returned `Err`**: an `ensure_capacity` failure can happen
+    /// *after* its collection succeeded (the nursery growth was refused), at which point the
+    /// roots have already been relocated in place, so leaving them unwritten would corrupt the
+    /// heap. On a fail-fast / pre-copy failure the roots are un-relocated and the write-back is
+    /// a harmless no-op (it rewrites the same values and rebuilds equivalent messages).
+    fn run_rooted_collection<F>(&mut self, collect: F) -> Result<Collection>
+    where
+        F: FnOnce(&mut Collector, &mut [Eterm]) -> Result<Collection>,
+    {
         // 1. The flat root slice: `x[0..live)`, then the whole stack, then one word per
         //    queued mailbox payload. `reg_words` is where the mailbox roots start.
         let mut roots: Vec<Eterm> = Vec::new();
@@ -802,18 +864,9 @@ impl Process {
         let saved_start = self.saved_args.gather_roots(&mut roots);
         let signals_start = self.signals.gather_roots(&mut roots);
 
-        // 4. Collect. On failure the messages must not be silently lost, so put them back
-        //    before propagating (a collection of this heap cannot fail in practice: `collect`
-        //    escalates a would-not-fit minor to a major, which sizes its to-space up front).
-        let collection = match self.collector.collect(&mut roots) {
-            Ok(collection) => collection,
-            Err(error) => {
-                for message in drained {
-                    self.mailbox.enqueue(message);
-                }
-                return Err(error);
-            }
-        };
+        // 4. Run the collection action. Its result is returned *after* the write-back below,
+        //    because the roots may already have been relocated in place even when it is `Err`.
+        let action = collect(&mut self.collector, &mut roots);
 
         // 5. Write the (relocated) registers and stack words back.
         self.regs.scatter_roots(&roots, x_live);
@@ -833,7 +886,7 @@ impl Process {
         self.saved_args.scatter_roots(&roots, saved_start);
         self.signals.scatter_roots(&roots, signals_start);
 
-        Ok(collection)
+        action
     }
 
     /// Collects first when `need` more words do not fit, then reports whether a collection
