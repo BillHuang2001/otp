@@ -507,18 +507,18 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   interior_microbenchmark -- --nocapture` (or `ordered_interior_microbenchmark`); sizes/shapes via
   `BEAM_ETS_BENCH_SIZES`/`BEAM_ETS_BENCH_SHAPES`.
 - Crate-level integration over the **public API**: `tests/ets_{basic,order,select,bag,info,nav,access,
-  update,replace,continuation,ownership,fixtable,shared,options,rename,reclamation,concurrency}.rs`,
-  `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers from `tests/common/`, and the
-  live-`erl` plumbing in `tests/common/oracle.rs`.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **135 cases**
+  update,replace,continuation,continuation_direction,set_access,ownership,fixtable,shared,options,rename,
+  reclamation,concurrency}.rs`, `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers from
+  `tests/common/`, and the live-`erl` plumbing in `tests/common/oracle.rs`.
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **151 cases**
   (group files `tests/differential/battery/{kind,keypos,navigation,counter,lookup,matchspec,replace,
   continuation,info,large,access,reclamation,multikind}.rs`, the embedded oracle program in
   `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1) and under `beam_ets`,
   comparing canonical renderings line-by-line (`mismatch = 0`, `KNOWN_DIVERGENCES` empty). Without
   `erl` the live-oracle tests skip loudly; `BEAM_ETS_REQUIRE_ORACLE=1` turns a skip into a failure.
 - **Gates (GREEN required):**
-  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` (479 passed /
-  0 failed; the workspace is 6407/0) and `… --workspace`. Forced-oracle:
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` (**515 passed /
+  0 failed** across 23 test binaries + 8 compile-fail doctests) and `… --workspace`. Forced-oracle:
   `BEAM_ETS_REQUIRE_ORACLE=1 erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_ets --test differential`.
 
