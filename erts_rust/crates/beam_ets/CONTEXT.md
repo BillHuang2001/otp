@@ -345,7 +345,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   term-reading blocks in `select/` and `table/mod.rs` (`select_all`) — plus the `unsafe impl Send/Sync`
   on `TermStore`. Every `unsafe fn` has a `# Safety` section and every `unsafe` block a preceding
   `// SAFETY:` rationale (`beam_common::safety`).
-- **Files ~1000 lines**, one responsibility per file.
+- **Files ~1000 lines**, one responsibility per file. Every `src/` file is under it except
+  `src/hash_interior.rs` (~1074), one cohesive chained-index interior (buckets + the `Interior` impl +
+  the multi-kind object rules), kept whole rather than split. Large `tests/` modules are legitimate: the
+  embedded oracle program `tests/differential/erl_program.rs` (one Erlang source) and the comprehensive
+  `tests/select.rs`; the split-out unit-test siblings are `src/table/tests.rs`,
+  `src/ordered_interior/tests.rs`, `src/store/tests.rs`, `src/kind/tests.rs`.
 - **Licensing** Apache-2.0; no new external deps (only `beam_common`/`beam_term`/`beam_alloc`/`libc`).
 
 ## Design Decisions
