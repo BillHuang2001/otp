@@ -473,9 +473,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   interior_microbenchmark -- --nocapture` (or `ordered_interior_microbenchmark`); sizes/shapes via
   `BEAM_ETS_BENCH_SIZES`/`BEAM_ETS_BENCH_SHAPES`.
 - Crate-level integration over the **public API**: `tests/ets_{basic,order,select,bag,info,nav,access,
-  update,replace,continuation,ownership,fixtable,shared,options,rename}.rs`, `tests/select.rs`,
-  `tests/match_spec_run.rs`, sharing helpers from `tests/common/`, and the live-`erl` plumbing in
-  `tests/common/oracle.rs`.
+  update,replace,continuation,ownership,fixtable,shared,options,rename,reclamation,concurrency}.rs`,
+  `tests/select.rs`, `tests/match_spec_run.rs`, sharing helpers from `tests/common/`, and the
+  live-`erl` plumbing in `tests/common/oracle.rs`.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **135 cases**
   (group files `tests/differential/battery/{kind,keypos,navigation,counter,lookup,matchspec,replace,
   continuation,info,large,access,reclamation,multikind}.rs`, the embedded oracle program in
