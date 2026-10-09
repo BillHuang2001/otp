@@ -8,7 +8,8 @@ crate below must close the gap, after which a case can be added to the corpus.
 
 (The honest capability gaps — the runtime *does* signal them via its documented
 `beam_rt: unsupported: …` / exit-3 convention — are recorded in the allowlist table above,
-not here: today the `-eval` literal/parser trio and the `erlang:statistics/1` counters.)
+not here: today only `wire/new_fun_ext_encode`, `proc_signals/statistics_runtime_unsupported`
+and the A.9 boot seam remain.)
 
 ## A.3 — NIF C ABI (owner: `beam_abi` / `beam_rt` NifHost)
 - An atom name first interned *during* a NIF call is not readable back in the same call:
@@ -60,9 +61,10 @@ not here: today the `-eval` literal/parser trio and the `erlang:statistics/1` co
   uncompressed size and the trailing Adler-32 match, but the zlib deflate middle differs.
   Only `binary_to_term(term_to_binary(T, [compressed])) =:= T` round trips are pinned.
 - Legacy `PORT_EXT` (102) preserves the port id in the oracle but zeroes it in the Rust runtime.
-- (The `-eval` **literal/parser** limits — big-integer literal, improper-list tail, an integer
-  binary segment wider than 64 bits — are honest `unsupported` capability gaps, so they ARE
-  pinned as allowlisted corpus cases; see the table above, owner `beam_rt`.)
+- (The `-eval` **literal/parser** limits — a big-integer literal, an improper-list tail, an
+  integer binary segment wider than 64 bits — are no longer divergences: `beam_rt` now evaluates
+  each shape, so they are pinned as **agreeing** regression cases; see the table above, owner
+  `beam_rt`.)
 
 ## A.7 — process signals (owner: `beam_bifs` / `beam_process`)
 - A `{'DOWN', …}` for a monitored **port** is not delivered after `port_close/1`: the oracle

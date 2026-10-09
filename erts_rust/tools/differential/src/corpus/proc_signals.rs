@@ -19,13 +19,15 @@
 //! reaches a real IO server. (An already-dead leader would unblock via the monitor, but a
 //! *live* one would hang — the restore is what makes the case deterministic.)
 //!
-//! # The `erlang:statistics/1` counters are an honest capability gap
+//! # The `erlang:statistics/1` counters are now largely served
 //!
-//! The Rust runtime serves only `wall_clock`; every other counter raises the documented
-//! unsupported signal (`erlang:statistics/1: the \`<key>\` counter is not implemented`,
-//! exit 3), so those cases classify `unsupported`, never `mismatch`. Their goldens are the
-//! oracle's own (stable) shapes, so each flips to `agree` automatically once the counter
-//! is implemented.
+//! The Rust runtime serves `wall_clock`, `reductions`, `context_switches`, `io` and
+//! `scheduler_wall_time`, so the corresponding cases **`agree`** and are regression-pinned
+//! (their `_unsupported` id suffixes are historical — kept only so the ids stay byte-stable).
+//! Only `runtime` still raises the documented unsupported signal
+//! (`erlang:statistics/1: the \`runtime\` counter is not implemented`, exit 3), so that case
+//! classifies `unsupported`, never `mismatch`. The clock/counter **values** are volatile and
+//! are never asserted — every case pins only the tuple/atom shape and integer-ness.
 //!
 //! # The `{tag, _}` monitor option and port monitors are live
 //!
@@ -163,23 +165,25 @@ pub(crate) fn group() -> Vec<Case> {
             "exception error badarg",
         ),
         // --- erlang:statistics/1 -----------------------------------------------------------
-        // `wall_clock` is served by both runtimes; the value is volatile, so only the
-        // {Milliseconds, SinceLastCall} shape (two integers) is pinned.
+        // `wall_clock`, `reductions`, `context_switches`, `io` and `scheduler_wall_time` are
+        // served by both runtimes; every value is volatile, so only the tuple/atom shape and
+        // integer-ness are pinned. The `_unsupported` id suffixes on the counters that were
+        // once Rust capability gaps are historical — kept only so the ids stay byte-stable.
         case(
             "proc_signals/statistics_wall_clock_shape",
             "erlang:statistics(wall_clock) is a two-integer tuple (the values are volatile)",
             "begin {A, B} = erlang:statistics(wall_clock), {is_integer(A), is_integer(B)} end",
             "ok {true,true}",
         ),
-        // The remaining counters are a Rust capability gap (the runtime exits 3 with
-        // `erlang:statistics/1: the `<key>` counter is not implemented`), so they classify
-        // `unsupported`; each golden is the oracle's own stable shape.
         case(
             "proc_signals/statistics_reductions_unsupported",
-            "erlang:statistics(reductions) is a two-integer tuple (a Rust capability gap)",
+            "erlang:statistics(reductions) is a two-integer tuple (now served; regression-pinned agreement)",
             "is_integer(element(1, erlang:statistics(reductions)))",
             "ok true",
         ),
+        // `runtime` is the only remaining Rust capability gap (the runtime exits 3 with
+        // `erlang:statistics/1: the `runtime` counter is not implemented`), so it classifies
+        // `unsupported`; its golden is the oracle's own stable shape.
         case(
             "proc_signals/statistics_runtime_unsupported",
             "erlang:statistics(runtime) is a two-integer tuple (a Rust capability gap)",
@@ -188,14 +192,14 @@ pub(crate) fn group() -> Vec<Case> {
         ),
         case(
             "proc_signals/statistics_context_switches_unsupported",
-            "erlang:statistics(context_switches) is an integer (a Rust capability gap)",
+            "erlang:statistics(context_switches) is a two-integer tuple (now served; regression-pinned agreement)",
             "is_integer(element(1, erlang:statistics(context_switches)))",
             "ok true",
         ),
         case(
             "proc_signals/statistics_io_unsupported",
             "erlang:statistics(io) is a {{input,_},{output,_}} tuple of integers \
-             (a Rust capability gap)",
+             (now served; regression-pinned agreement)",
             "begin {{In, InN}, {Out, OutN}} = erlang:statistics(io), \
              {In, Out, is_integer(InN), is_integer(OutN)} end",
             "ok {input,output,true,true}",
@@ -203,9 +207,33 @@ pub(crate) fn group() -> Vec<Case> {
         case(
             "proc_signals/statistics_scheduler_wall_time_unsupported",
             "erlang:statistics(scheduler_wall_time) is `undefined` when not enabled \
-             (a Rust capability gap)",
+             (now served; regression-pinned agreement)",
             "erlang:statistics(scheduler_wall_time)",
             "ok undefined",
+        ),
+        // Regression coverage for the newly-served counters: pin each counter's **shape**
+        // structurally (tuple sizes, `input`/`output` tags, integer-ness). The values are
+        // volatile and are never asserted.
+        case(
+            "proc_signals/statistics_reductions_is_two_integer_tuple",
+            "erlang:statistics(reductions) is a 2-element tuple of integers",
+            "begin Red = erlang:statistics(reductions), {tuple_size(Red), \
+             is_integer(element(1, Red)), is_integer(element(2, Red))} end",
+            "ok {2,true,true}",
+        ),
+        case(
+            "proc_signals/statistics_context_switches_is_two_integer_tuple",
+            "erlang:statistics(context_switches) is a 2-element tuple of integers",
+            "begin Ctx = erlang:statistics(context_switches), {tuple_size(Ctx), \
+             is_integer(element(1, Ctx)), is_integer(element(2, Ctx))} end",
+            "ok {2,true,true}",
+        ),
+        case(
+            "proc_signals/statistics_io_outer_shape",
+            "erlang:statistics(io) is a 2-element tuple tagged input/output",
+            "begin {In, Out} = erlang:statistics(io), \
+             {tuple_size(erlang:statistics(io)), element(1, In), element(1, Out)} end",
+            "ok {2,input,output}",
         ),
         // --- spawn_monitor -----------------------------------------------------------------
         case(
@@ -378,6 +406,9 @@ mod tests {
         "proc_signals/statistics_context_switches_unsupported",
         "proc_signals/statistics_io_unsupported",
         "proc_signals/statistics_scheduler_wall_time_unsupported",
+        "proc_signals/statistics_reductions_is_two_integer_tuple",
+        "proc_signals/statistics_context_switches_is_two_integer_tuple",
+        "proc_signals/statistics_io_outer_shape",
     ];
 
     /// The monitor / `spawn_monitor` family.
@@ -473,7 +504,7 @@ mod tests {
             .filter_map(|id| case(cases, id).expr())
             .filter(|e| e.contains("erlang:statistics("))
             .collect();
-        assert_eq!(statistics.len(), 6, "six statistics cases are expected");
+        assert_eq!(statistics.len(), 9, "nine statistics cases are expected");
         for key in [
             "wall_clock",
             "reductions",
