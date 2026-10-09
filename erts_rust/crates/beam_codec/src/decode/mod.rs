@@ -38,7 +38,7 @@ use core::mem::size_of;
 use core::str;
 
 use beam_alloc::Heap;
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::prelude::{
     is_atom, make_atom, make_small, try_make_small, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL, NIL,
 };
@@ -62,6 +62,36 @@ const BIG_ARITY_MAX: usize = (1 << 16) - 1;
 /// wire bound is expressed in *bytes* (`n > BIG_ARITY_MAX*sizeof(ErtsDigit)`,
 /// `external.c:6146`).
 const BIG_DIGIT_BYTES: usize = size_of::<u64>();
+
+/// `MAX_REFERENCE` (`erl_term.h:771`): `1 << _REF_NUM_SIZE` = `1 << 18`. The first
+/// reference number of the legacy 18-bit forms (`REFERENCE_EXT` and
+/// `NEW_REFERENCE_EXT`) must stay below it (`external.c:4758` / `:4782`); the
+/// modern `NEWER_REFERENCE_EXT` (and a local node in the shared block,
+/// `external.c:4810`) enforces it only for its own first number.
+const MAX_REFERENCE: u32 = 1 << 18;
+
+/// The error for a **well-formed** external reference whose wire id count is zero.
+///
+/// A zero-length reference is *not* malformed: the C builds a 0-number external
+/// ref block for it (`ref_num[0] = r0` followed by the odd-size padding write,
+/// `external.c:4846-4856`; `external_ref_no_numbers()` then reports 0) and the
+/// oracle accepts it — verified against erts-17.1:
+/// `binary_to_term(<<131,90,0,0,119,1,$n,0,0,0,0,0,0,0,0,0>>)` ⇒ `#Ref<…>`, and
+/// `binary_to_term(<<131,114,0,0,119,1,$n,0,0,0,0>>)` ⇒ `#Ref<…>` with
+/// `[used]` = 12 (the extra `r0` word is consumed either way).
+///
+/// This tree's external-ref block **cannot represent** such a term:
+/// [`beam_term::thing::write_external_ref`] — the layout owner, out of this
+/// crate's scope — requires `1 <= ids.len() <= MAX_REF_IDS`, and
+/// `beam_term`'s `make_hash`/`make_hash2` index `ids[0]` directly. Reported as a
+/// typed `SystemLimit` (a wire-supplied length outside the *representable* range —
+/// the same error [`crate::term::make_external_ref`] returns for a zero-id slice)
+/// rather than materializing a term that would mis-encode on the way out. See the
+/// crate `CONTEXT.md` §Known Issues for the exact `beam_term` change that would
+/// close this gap.
+fn zero_length_ref() -> BeamError {
+    system_limit()
+}
 
 /// Incremental external term format decoder.
 ///
@@ -272,13 +302,13 @@ impl<'a> Decoder<'a> {
             // External identifiers (all carry a nested node atom)
             // ---------------------------------------------------------------
             Tag::Reference => {
+                // `[101][node atom][r0:4 BE][creation:1]` — the C reads `r0`
+                // **before** the 8-bit creation (`external.c:4752-4763`).
                 let node = self.decode_node_atom(heap, atoms)?;
-                let id = self.reader.u32be()?;
-                // `MAX_REFERENCE` (`erl_term.h:771`, `1 << _REF_NUM_SIZE` = `1 << 18`):
-                // this legacy shape has only an 18-bit count space, and the C rejects
-                // a first id at or past it (`external.c:4757`). The modern
-                // `NEWER_REFERENCE_EXT` carries no such bound.
-                if id >= 262_144u32 {
+                let r0 = self.reader.u32be()?;
+                // This legacy shape has only an 18-bit count space, and the C
+                // rejects a first number at or past it (`external.c:4758`).
+                if r0 >= MAX_REFERENCE {
                     return Err(bad_arg());
                 }
                 let creation = u32::from(self.reader.u8()?);
@@ -287,9 +317,19 @@ impl<'a> Decoder<'a> {
                 if creation > 3 {
                     return Err(bad_arg());
                 }
-                crate::term::make_external_ref(heap, node, &[id], creation)
+                crate::term::make_external_ref(heap, node, &[r0], creation)
             }
             Tag::NewReference => {
+                // `[114][len:2 BE][node atom][creation:1][r0:4][ids…]`. The C reads
+                // the count, the node, a *tiny* 8-bit creation and then `r0`
+                // **unconditionally** — never gated on `len > 0` (`external.c:4768-4784`):
+                // for `len >= 1` `r0` *is* the first number (`ref_num[0] = r0`,
+                // `external.c:4846`), and for `len == 0` it is read and then zeroed by
+                // the odd-size padding write (`external.c:4856`). So exactly
+                // `max(1, len)` id words follow the creation byte, which is what keeps
+                // the stream aligned (verified against erts-17.1 through
+                // `binary_to_term/2 [used]`: the 8-byte `len == 0` image without the
+                // trailing word reports `used = 12`).
                 let len = usize::from(self.reader.u16be()?);
                 let node = self.decode_node_atom(heap, atoms)?;
                 let creation = u32::from(self.reader.u8()?);
@@ -297,26 +337,53 @@ impl<'a> Decoder<'a> {
                 if creation > 3 {
                     return Err(bad_arg());
                 }
-                let ids = self.read_ids(len)?;
-                // The first id is 18-bit-bounded for this form too (`external.c:4782`).
-                if matches!(ids.first(), Some(&id) if id >= 262_144u32) {
+                let r0 = self.reader.u32be()?;
+                // `r0 >= MAX_REFERENCE` ⇒ `badarg` for this form on *every* node,
+                // local or remote (`external.c:4782`; verified against erts-17.1:
+                // `r0 = 262143` ⇒ a ref, `r0 = 262144` ⇒ `badarg`).
+                if r0 >= MAX_REFERENCE {
                     return Err(bad_arg());
                 }
-                crate::term::make_external_ref(heap, node, &ids, creation)
-            }
-            Tag::NewerReference => {
-                let len = usize::from(self.reader.u16be()?);
-                // `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`); `make_external_ref`
-                // enforces the same bound. The count bound is a *wire* bound, and the
-                // C routes every decode failure — bounds included — to `B2TBadArg`
-                // (`binary_to_term_int`, `external.c:1989-1991`), so the oracle reports
-                // **`badarg`** here, never `system_limit` (verified against erts-17.1).
+                // `ref_words > ERTS_MAX_REF_NUMBERS` ⇒ `badarg`
+                // (`external.c:4799`, in `ref_ext_common`, i.e. *after* `r0`). The
+                // count bound is a *wire* bound, and the C routes every decode
+                // failure — bounds included — to `B2TBadArg` (`binary_to_term_int`,
+                // `external.c:1989-1991`), so the oracle reports **`badarg`** here,
+                // never `system_limit` (verified against erts-17.1).
                 if len > crate::term::MAX_REF_IDS {
                     return Err(bad_arg());
                 }
+                if len == 0 {
+                    return Err(zero_length_ref());
+                }
+                let mut ids = Vec::with_capacity(len);
+                ids.push(r0);
+                ids.extend(self.read_ids(len - 1)?);
+                crate::term::make_external_ref(heap, node, &ids, creation)
+            }
+            Tag::NewerReference => {
+                // `[90][len:2 BE][node atom][creation:4][r0:4][ids…]`
+                // (`external.c:4786-4796`): a full 32-bit creation, the same
+                // unconditional `r0` as `NEW_REFERENCE_EXT`, and **no** tiny-creation
+                // or `r0` bound here — the C's `r0 >= MAX_REFERENCE` check sits in the
+                // *local*-node branch (`external.c:4810`), which a remote image never
+                // reaches (verified against erts-17.1: `r0 = 4294967295` ⇒ a ref whose
+                // `262144`-valued first number re-encodes unharmed).
+                let len = usize::from(self.reader.u16be()?);
                 let node = self.decode_node_atom(heap, atoms)?;
                 let creation = self.reader.u32be()?;
-                let ids = self.read_ids(len)?;
+                let r0 = self.reader.u32be()?;
+                // `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`) ⇒ `badarg` (verified
+                // against erts-17.1).
+                if len > crate::term::MAX_REF_IDS {
+                    return Err(bad_arg());
+                }
+                if len == 0 {
+                    return Err(zero_length_ref());
+                }
+                let mut ids = Vec::with_capacity(len);
+                ids.push(r0);
+                ids.extend(self.read_ids(len - 1)?);
                 crate::term::make_external_ref(heap, node, &ids, creation)
             }
             Tag::Port => {
