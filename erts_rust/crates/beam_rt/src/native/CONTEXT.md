@@ -464,7 +464,9 @@ needs:
     `[{time,universal}]` by pure arithmetic) would be exact — deferring the whole family keeps the
     default form from answering a wrong value.
   * `list_dir/1` is **not** claimed: its entries come back in `readdir(3)` order, which the oracle
-    does not sort and this runtime cannot pin. `prim_zip:splitter/3` is likewise unclaimed — pure
+    does not sort and this runtime cannot pin. (`file_server.rs` *does* serve the `{list_dir,Name}`
+    request — see above — over `std::fs::read_dir`, whose order the client is documented not to
+    rely on.) `prim_zip:splitter/3` is likewise unclaimed — pure
     Erlang over iolists (not a runtime primitive) whose error paths this floor does not reproduce.
   * Remaining machinery: the socket/NIF resource machinery (`prim_socket`, `prim_net`,
     `prim_inet`), zlib (`prim_zip`), a binary-buffer resource (`prim_buffer`), the boot loader
