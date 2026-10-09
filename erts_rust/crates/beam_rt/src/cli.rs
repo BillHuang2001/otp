@@ -1104,12 +1104,14 @@ fn drive(config: RuntimeConfig, snapshot: &mut Option<Runtime>) -> Result<()> {
 /// itself and in the script's own `{path, …}` directives. It is idempotent, and
 /// [`Runtime::boot_from_script`] boots again as its own precondition.
 ///
-/// Nothing is swallowed: a file on neither of `init`'s candidates, a malformed script and
-/// the script's own **honest stop** (the real `start.boot` stops at its `{apply,{c,erlangrc,
-/// []}}` directive — instruction 20 of 22 — because `c:erlangrc/0` needs the `file_server_2`
-/// kernel server this runtime never registers; see [`crate::boot`]) all return their typed
-/// [`BeamError`] — which [`run`] reports as `beam_rt: <error>` with exit code 1 — never a
-/// panic, a hang or a wrong result.
+/// Nothing is swallowed: a file on neither of `init`'s candidates, a malformed script and a
+/// directive the runtime cannot execute all return their typed [`BeamError`] — which [`run`]
+/// reports as `beam_rt: <error>` with exit code 1 — never a panic, a hang or a wrong result.
+///
+/// The real `start.boot` runs to **completion**: all 22 directives execute, the last being
+/// `{progress,started}`. The `{apply,{c,erlangrc,[]}}` directive's `{open, …}` of `$HOME/.erlang`
+/// is answered `{error,enoent}` by the native `file_server_2` service whenever that file is
+/// absent, which `file:path_eval/2` treats as success; see [`crate::boot`].
 fn run_boot_script(runtime: &mut Runtime, value: &str) -> Result<()> {
     runtime.boot()?;
     let path = resolve_boot_file(value, boot_file_root(runtime).as_deref())?;

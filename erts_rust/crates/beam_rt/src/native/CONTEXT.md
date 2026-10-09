@@ -242,8 +242,8 @@ form (`:47`) for an errno outside the table.
 ### `file_server.rs` — the native **`file_server_2`** service (contract A.9)
 The runtime-native **file service** that completes the real boot chain. `lib/kernel/src/file.erl`
 routes every non-`raw` file operation through `gen_server:call(file_server_2, Request, infinity)`,
-and the last working directive of `bootstrap/bin/start.boot` — `{apply,{c,erlangrc,[]}}` — is the
-first such caller (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
+and the file service is first *reached* at the `{apply,{c,erlangrc,[]}}` directive of
+`bootstrap/bin/start.boot` (`c:erlangrc/0` → `file:path_eval/2` → `file:open("$HOME/.erlang",[read])`).
 `FileServices` supplies the missing registered service. It is **not** a BIF: it is a process plus a
 scheduler-pass step, the topic of the rest of this subsection.
 
