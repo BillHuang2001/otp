@@ -26,11 +26,19 @@
 //! translation is `efile_translate_modelist` + `get_flags`,
 //! `erts/emulator/nifs/common/prim_file_nif.c:500-539` /
 //! `erts/emulator/nifs/unix/unix_prim_file.c:142-171`; `truncate/1` is `ftruncate(fd,
-//! lseek(fd, 0, SEEK_CUR))`, `unix_prim_file.c:693-704`). Every suite drives **real files**
-//! through the real reactor and reads the bytes back from the OS, and
-//! `the_file_verbs_and_flags_agree_with_the_erl_oracle` replays the identical operation
-//! sequence under the system `erl` and compares the observable outcome field for field.
-//! When `erl` is absent that check **skips loudly**, never fails.
+//! lseek(fd, 0, SEEK_CUR))`, `unix_prim_file.c:693-704`; the directory refusal is
+//! `open_file_is_dir`, `unix_prim_file.c:206-213`). Every suite drives **real files** through
+//! the real reactor and reads the bytes back from the OS, and two suites replay the identical
+//! operation sequence under the system `erl` and compare the observable outcome field for
+//! field: `every_open_mode_combination_agrees_with_the_erl_oracle` (the whole mode-list
+//! translation) and `the_file_verbs_and_flags_agree_with_the_erl_oracle` (the verbs, the
+//! directory/missing-path errors and the read-only framing). When `erl` is absent those
+//! checks **skip loudly**, never fail.
+//!
+//! The driver's error contract is deliberate and asserted here: a **syscall** failure reaches
+//! the caller as the raw [`BeamError::Io`] errno — the `{error, <atom>}` rendering
+//! (`posix_error_to_tuple` → `erl_errno_id`, `prim_file_nif.c:306-309`) belongs to the
+//! runtime's `prim_file` floor, never to the driver.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -172,7 +180,21 @@ fn errno_atom(err: &BeamError) -> Option<&'static str> {
         libc::ENOENT => Some("enoent"),
         libc::EEXIST => Some("eexist"),
         libc::ENOTDIR => Some("enotdir"),
+        libc::EACCES => Some("eacces"),
+        libc::EINVAL => Some("einval"),
         _ => None,
+    }
+}
+
+/// The oracle's rendering of a control command's outcome: `ok` for a success, else the
+/// `{error, <atom>}` name the oracle's `posix_error_to_tuple` would print.
+///
+/// `unmapped-errno` (never an oracle atom) makes a failure the caller cannot name a **visible
+/// mismatch** instead of a silent `ok`.
+fn outcome(result: Result<Vec<u8>, BeamError>) -> String {
+    match result {
+        Ok(_) => "ok".to_string(),
+        Err(err) => errno_atom(&err).unwrap_or("unmapped-errno").to_string(),
     }
 }
 
@@ -186,6 +208,8 @@ fn assert_errno(result: Result<Vec<u8>, BeamError>, expected: i32, what: &str) {
                 libc::ENOENT => "enoent",
                 libc::EEXIST => "eexist",
                 libc::ENOTDIR => "enotdir",
+                libc::EACCES => "eacces",
+                libc::EINVAL => "einval",
                 _ => "unmapped",
             }),
             "`{what}` should have failed with errno {expected}: {err:?}"
@@ -245,6 +269,19 @@ fn the_read_only_open_still_reads_a_regular_file_to_eof() {
         "end-of-file is latched"
     );
     assert!(poller.is_empty(), "EOF de-registers the regular file");
+
+    // Reading to EOF left the descriptor's offset at the file's end, so the argument-less
+    // `position` reports the file length — `lseek(fd, 0, SEEK_CUR)`, the C's `EFILE_SEEK_CUR`.
+    assert_eq!(
+        ctl_ok(&mut registry, &mut poller, id, "position", b""),
+        payload.len().to_string().into_bytes(),
+        "the offset advanced by exactly the bytes the driver read"
+    );
+    assert_eq!(
+        ctl_ok(&mut registry, &mut poller, id, "seek", b"bof"),
+        b"0",
+        "an absolute reposition replies the new offset"
+    );
 
     ctl_ok(&mut registry, &mut poller, id, "close", b"");
     assert!(poller.is_empty(), "`close` deregisters the file");
@@ -718,7 +755,8 @@ fn erl_stdout(expr: &str) -> Option<String> {
         Ok(Ok(out)) => {
             assert!(
                 out.status.success(),
-                "the oracle expression failed: {}",
+                "the oracle expression failed (stdout: {:?}; stderr: {:?})",
+                String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
             Some(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -733,8 +771,10 @@ fn erl_stdout(expr: &str) -> Option<String> {
 /// The fields are: the error atom of a read-only open of a directory, the error atom of a
 /// read-only open of a missing path, the offset a `{bof,3}` seek lands on, the file bytes
 /// after the truncate-at-position, the file bytes after an `O_RDWR` write, the file bytes
-/// after an `O_APPEND` write, the error atom of an exclusive open of an existing path, and
-/// the error atom of an exclusive creating open under a regular file.
+/// after an `O_APPEND` write, the error atom of an exclusive open of an existing path, the
+/// error atom of an exclusive creating open under a regular file, the offset a `{bof,0}` seek
+/// of a read-only descriptor lands on, the outcome of `truncate/1` on that read-only
+/// descriptor, and the outcome of `sync/1` on it.
 fn oracle_expression(dir: &str) -> String {
     format!(
         "D = \"{dir}\", P = D ++ \"/t.txt\", \
@@ -757,8 +797,13 @@ fn oracle_expression(dir: &str) -> String {
          {{ok, C3}} = file:read_file(P), \
          E3 = case file:open(P, [raw, write, exclusive]) of {{error, R3}} -> atom_to_list(R3); _ -> \"ok\" end, \
          E4 = case file:open(P ++ \"/sub\", [raw, write, exclusive]) of {{error, R4}} -> atom_to_list(R4); _ -> \"ok\" end, \
-         io:format(\"~s|~s|~s|~s|~s|~s|~s|~s\", \
-                   [E1, E2, integer_to_list(Pos), C1, C2, C3, E3, E4])"
+         {{ok, F4}} = file:open(P, [raw, read]), \
+         {{ok, P0}} = file:position(F4, {{bof, 0}}), \
+         T = case file:truncate(F4) of ok -> \"ok\"; {{error, R5}} -> atom_to_list(R5) end, \
+         S = case file:sync(F4) of ok -> \"ok\"; {{error, R6}} -> atom_to_list(R6) end, \
+         ok = file:close(F4), \
+         io:format(\"~s|~s|~s|~s|~s|~s|~s|~s|~s|~s|~s\", \
+                   [E1, E2, integer_to_list(Pos), C1, C2, C3, E3, E4, integer_to_list(P0), T, S])"
     )
 }
 
@@ -780,22 +825,16 @@ fn the_file_verbs_and_flags_agree_with_the_erl_oracle() {
     let id = open_efile(&mut registry, &mut poller);
 
     // 1. a read-only open of a directory ⇒ `eisdir`.
-    let e1 = match ctl(&mut registry, &mut poller, id, "open", scratch.bytes()) {
-        Err(err) => errno_atom(&err).unwrap_or("ok").to_string(),
-        Ok(_) => "ok".to_string(),
-    };
+    let e1 = outcome(ctl(&mut registry, &mut poller, id, "open", scratch.bytes()));
     // 2. a read-only open of a missing path ⇒ `enoent`.
     let missing = scratch.file("nope");
-    let e2 = match ctl(
+    let e2 = outcome(ctl(
         &mut registry,
         &mut poller,
         id,
         "open",
         &Scratch::bytes_of(&missing),
-    ) {
-        Err(err) => errno_atom(&err).unwrap_or("ok").to_string(),
-        Ok(_) => "ok".to_string(),
-    };
+    ));
 
     // 3./4. write, seek to 3, truncate at the position, sync.
     let mut arg = b"write ".to_vec();
@@ -828,25 +867,197 @@ fn the_file_verbs_and_flags_agree_with_the_erl_oracle() {
     // 7. an exclusive open of an existing path ⇒ `eexist`.
     let mut arg = b"write,exclusive ".to_vec();
     arg.extend_from_slice(&Scratch::bytes_of(&path));
-    let e3 = match ctl(&mut registry, &mut poller, id, "open", &arg) {
-        Err(err) => errno_atom(&err).unwrap_or("ok").to_string(),
-        Ok(_) => "ok".to_string(),
-    };
+    let e3 = outcome(ctl(&mut registry, &mut poller, id, "open", &arg));
     // 8. an exclusive creating open under a regular file ⇒ `enotdir`.
     let under = path.join("sub");
     let mut arg = b"write,exclusive ".to_vec();
     arg.extend_from_slice(&Scratch::bytes_of(&under));
-    let e4 = match ctl(&mut registry, &mut poller, id, "open", &arg) {
-        Err(err) => errno_atom(&err).unwrap_or("ok").to_string(),
-        Ok(_) => "ok".to_string(),
-    };
+    let e4 = outcome(ctl(&mut registry, &mut poller, id, "open", &arg));
 
-    let rust = format!("{e1}|{e2}|{pos}|{c1}|{c2}|{c3}|{e3}|{e4}");
+    // 9./10./11. a read-only open: the offset is where the last operation left it, and the
+    // read-only `truncate`/`sync` syscalls fail or succeed exactly as the oracle's do.
+    ctl_ok(&mut registry, &mut poller, id, "open", &Scratch::bytes_of(&path));
+    let p0 = String::from_utf8(ctl_ok(&mut registry, &mut poller, id, "position", b"0"))
+        .expect("the position reply is ASCII");
+    let trunc = outcome(ctl(&mut registry, &mut poller, id, "truncate", b""));
+    let sync = outcome(ctl(&mut registry, &mut poller, id, "sync", b""));
+    ctl_ok(&mut registry, &mut poller, id, "close", b"");
+
+    let rust = format!("{e1}|{e2}|{pos}|{c1}|{c2}|{c3}|{e3}|{e4}|{p0}|{trunc}|{sync}");
     assert_eq!(
         rust,
         oracle.trim(),
         "the efile driver's file operations must match the system Erlang's"
     );
+
+    registry.close(&mut poller, id).expect("closes the port");
+}
+
+/// The Erlang side of the mode sweep: for every mode list, (re)write `seed` into a per-mode
+/// path, open it with `[raw | <modes>]`, close it, and print `outcome:bytes`.
+///
+/// `raw` is always present so `file:open/2` goes straight to the `efile` layer instead of the
+/// `io` server — exactly what the C translator sees (`prim_file_nif.c:500-539`).
+fn oracle_mode_expression(dir: &str, modes: &[&str]) -> String {
+    let mut steps = String::new();
+    let mut fields = Vec::new();
+    for (i, mode_list) in modes.iter().enumerate() {
+        let atoms = mode_list.split(',').collect::<Vec<_>>().join(", ");
+        steps.push_str(&format!(
+            "P{i} = \"{dir}/m{i}.txt\", \
+             ok = file:write_file(P{i}, <<\"seed\">>), \
+             O{i} = case file:open(P{i}, [raw, {atoms}]) of \
+                 {{ok, H{i}}} -> ok = file:close(H{i}), \"ok\"; \
+                 {{error, R{i}}} -> atom_to_list(R{i}) end, \
+             {{ok, B{i}}} = file:read_file(P{i}), \
+             G{i} = O{i} ++ \":\" ++ binary_to_list(B{i}), "
+        ));
+        fields.push(format!("G{i}"));
+    }
+    format!(
+        "{steps}io:format(\"~s\", [lists:join(\"|\", [{}])])",
+        fields.join(", ")
+    )
+}
+
+/// The whole `efile_translate_modelist` sweep: every mode list the C's translator recognises
+/// is opened against an existing file under both the driver and the oracle, and the outcome
+/// **and** the file's resulting bytes must match. That pins the truncating `write` form, the
+/// non-truncating `read`/`read+write`/`append` forms and the `EEXIST` of `exclusive` at the
+/// level where they are observable.
+#[test]
+fn every_open_mode_combination_agrees_with_the_erl_oracle() {
+    const MODES: [&str; 12] = [
+        "read",
+        "write",
+        "read,write",
+        "append",
+        "read,append",
+        "exclusive",
+        "read,exclusive",
+        "write,exclusive",
+        "write,sync",
+        "read,sync",
+        "append,sync",
+        "read,write,sync",
+    ];
+    let scratch = Scratch::new("mode_sweep");
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+    let id = open_efile(&mut registry, &mut poller);
+
+    let mut rust = Vec::new();
+    for (i, modes) in MODES.iter().enumerate() {
+        let path = scratch.file(&format!("m{i}.txt"));
+        std::fs::write(&path, b"seed").expect("the fixture is written");
+        let mut arg = modes.as_bytes().to_vec();
+        arg.push(b' ');
+        arg.extend_from_slice(&Scratch::bytes_of(&path));
+        let opened = outcome(ctl(&mut registry, &mut poller, id, "open", &arg));
+        if opened == "ok" {
+            ctl_ok(&mut registry, &mut poller, id, "close", b"");
+        }
+        rust.push(format!("{opened}:{}", String::from_utf8_lossy(&content(&path))));
+    }
+
+    let dir = scratch.path().to_string_lossy().into_owned();
+    let Some(oracle) = erl_stdout(&oracle_mode_expression(&dir, &MODES)) else {
+        return;
+    };
+
+    assert_eq!(
+        rust.join("|"),
+        oracle.trim(),
+        "every open mode list must match the system Erlang's"
+    );
+    // Guard against a vacuously green sweep: it must contain real successes and a real
+    // truncation, or the comparison above would only be asserting error atoms against each
+    // other.
+    assert!(
+        rust.iter().any(|f| f == "ok:seed"),
+        "the sweep must contain successful non-truncating opens: {rust:?}"
+    );
+    assert!(
+        rust.iter().any(|f| f.starts_with("ok:") && f.len() == 3),
+        "the sweep must contain a truncating open: {rust:?}"
+    );
+
+    registry.close(&mut poller, id).expect("closes the port");
+}
+
+/// A **syscall** failure reaches the caller as the raw [`BeamError::Io`] `errno` — asserting
+/// `raw_os_error()` itself, not just the atom the runtime would render — while an argument
+/// fault is the typed `BadArg`. `{error, <atom>}` (`posix_error_to_tuple` → `erl_errno_id`,
+/// `prim_file_nif.c:306-309`) is the runtime `prim_file` floor's rendering, never the driver's.
+#[test]
+fn a_syscall_failure_reaches_the_caller_as_the_raw_errno() {
+    let scratch = Scratch::new("errno_contract");
+    let missing = scratch.file("missing.txt");
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+    let id = open_efile(&mut registry, &mut poller);
+
+    for (arg, expected, what) in [
+        (Scratch::bytes_of(&missing), libc::ENOENT, "a missing path"),
+        (scratch.bytes().to_vec(), libc::EISDIR, "a directory"),
+    ] {
+        match ctl(&mut registry, &mut poller, id, "open", &arg) {
+            Err(BeamError::Io(io)) => assert_eq!(
+                io.raw_os_error(),
+                Some(expected),
+                "`open` of {what} must carry the raw errno, not just render as an atom"
+            ),
+            other => panic!("`open` of {what} must be BeamError::Io, got {other:?}"),
+        }
+    }
+
+    // A read-only descriptor refuses `ftruncate(2)`: the syscall failure is an errno...
+    let path = scratch.file("ro.txt");
+    std::fs::write(&path, b"seed").expect("the fixture is written");
+    ctl_ok(&mut registry, &mut poller, id, "open", &Scratch::bytes_of(&path));
+    match ctl(&mut registry, &mut poller, id, "truncate", b"") {
+        Err(BeamError::Io(io)) => assert_eq!(
+            io.raw_os_error(),
+            Some(libc::EINVAL),
+            "ftruncate(2) refuses a read-only descriptor"
+        ),
+        other => panic!("a truncate of a read-only file must be BeamError::Io, got {other:?}"),
+    }
+    // ...on the very same descriptor `sync` succeeds, so the failure above was the syscall and
+    // not the verb or the port.
+    ctl_ok(&mut registry, &mut poller, id, "sync", b"");
+    ctl_ok(&mut registry, &mut poller, id, "close", b"");
+
+    // An argument fault is a `BadArg`, never an errno.
+    assert!(matches!(
+        ctl(&mut registry, &mut poller, id, "open", b""),
+        Err(BeamError::BadArg)
+    ));
+    ctl_ok(&mut registry, &mut poller, id, "open", &Scratch::bytes_of(&path));
+    assert!(matches!(
+        ctl(&mut registry, &mut poller, id, "truncate", b"-1"),
+        Err(BeamError::BadArg)
+    ));
+    ctl_ok(&mut registry, &mut poller, id, "close", b"");
+
+    // A FIFO cannot be synchronised, so `fsync(2)` fails — the raw errno again.
+    let fifo = scratch.file("pipe");
+    let mut c_fifo = Scratch::bytes_of(&fifo);
+    c_fifo.push(0);
+    // SAFETY: `c_fifo` is a NUL-terminated path owned by this test; `mkfifo` only reads it.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr().cast(), 0o600) }, 0);
+    ctl_ok(&mut registry, &mut poller, id, "open", &Scratch::bytes_of(&fifo));
+    match ctl(&mut registry, &mut poller, id, "sync", b"") {
+        Err(BeamError::Io(io)) => assert_eq!(
+            io.raw_os_error(),
+            Some(libc::EINVAL),
+            "fsync(2) of a FIFO is not supported"
+        ),
+        other => panic!("fsync(2) of a FIFO must be BeamError::Io, got {other:?}"),
+    }
+    ctl_ok(&mut registry, &mut poller, id, "close", b"");
+    // SAFETY: `c_fifo` names the FIFO this test created; unlinking removes the entry only.
+    unsafe { libc::unlink(c_fifo.as_ptr().cast()) };
 
     registry.close(&mut poller, id).expect("closes the port");
 }

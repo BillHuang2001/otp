@@ -59,8 +59,11 @@
 //! takes a `whence` of `bof`/`cur`/`eof` and an optional signed decimal offset (default
 //! `0`), mirroring the C's `EFILE_SEEK_{BOF,CUR,EOF}` (`prim_file_nif.h:50-54`). `truncate`
 //! with no argument truncates **at the current position**, exactly as the C's `truncate/1`
-//! does (`ftruncate(fd, lseek(fd, 0, SEEK_CUR))`, `unix_prim_file.c:693-704`); with an
-//! argument it truncates to that absolute length. The position/sync/truncate verbs act on
+//! does (`ftruncate(fd, lseek(fd, 0, SEEK_CUR))`, `unix_prim_file.c:693-704`); a `truncate
+//! <len>` argument truncates to that absolute length, which is an **additive extension not
+//! present in the C** — the reference's `efile_truncate` takes no length at all
+//! (`unix_prim_file.c:693-704`, `ASSERT(argc == 0)`, `prim_file_nif.c:827-834`) and the
+//! oracle's `file:truncate/2` is `undef`. The position/sync/truncate verbs act on
 //! the read fd when one is attached, else the write fd (for a read+write open the two are
 //! `dup(2)`s of one file description, so either names the same offset).
 //!
@@ -512,7 +515,8 @@ impl Driver for EfileDriver {
             "truncate" => {
                 let fd = self.attached_fd()?;
                 // No argument: truncate at the current position (the C's `truncate/1`,
-                // `unix_prim_file.c:693-704`). With one: truncate to that absolute length.
+                // `unix_prim_file.c:693-704`). With one: truncate to that absolute length —
+                // an additive extension, since the C's `efile_truncate` takes no length.
                 let len = if arg.is_empty() {
                     seek(fd, 0, libc::SEEK_CUR)?
                 } else {
