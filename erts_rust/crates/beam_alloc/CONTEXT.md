@@ -117,6 +117,46 @@ stay valid; growth is a new heap + copy by `beam_gc`). `new(capacity_words)`,
 `hp`, `hend`, `allocator`, `unsafe alloc_words`, `unsafe alloc_tuple`, `cons`, `tuple`, `Drop`
 returns the block. Exhaustion ⇒ `BeamError::Alloc(AllocKind::Heap)` (= "collect", not fatal OOM).
 
+### `reserved_heap` — the reservation-capable per-process term heap (`ReservedHeap`)
+The **frozen seam** for hosts that must grow a live process heap. One backing block of
+`reserved_words` term words, obtained exactly once from an `AllocRef` (mseg/`mmap`-backed, so reserved
+pages fault lazily and reserving address space does not commit RSS) and released exactly once in
+`Drop`. `committed_words` (alias `capacity()`, the `Heap::capacity` meaning) is the part currently
+handable out, so `hp() == base() + used()`, `limit() == base() + committed_words()` and
+`reservation_end() == base() + reserved_words()`. Constructors `new(reserved_words, initial_words)` /
+`with_allocator(alloc, reserved_words, initial_words)` (`initial_words > reserved_words` ⇒ `BadArg`;
+a `reserved_words * size_of::<Eterm>()` overflow ⇒ `BadArg`, never a wrap or a silent saturation).
+`try_grow(need_words) -> Result<GrowOutcome>`; `relocate(new_reserved_words) -> Result<isize>` (the
+byte delta the live block moved by); `reset`; `alloc_words`/`alloc_tuple`/`cons`/`tuple` with
+`Heap`'s exact exhaustion convention; `base`, `hp`, `limit`, `reservation_end`, `reserved_words`,
+`committed_words`, `capacity`, `used`, `available`, `peak_used`, `allocator`. Plus
+`pub enum GrowOutcome { GrewInPlace, MoveRequired }`. Re-exported at the crate root and in the prelude.
+
+**Host-adoption contract (the point of the type):**
+1. On an `AllocKind::Heap` exhaustion the host calls `try_grow(n)` and retries. `GrewInPlace` ⇒ the
+   committed limit was raised (to exactly `used + n`), the bump pointer did **not** move — a cached
+   `hp()` stays valid, but a cached `limit()` **must be re-read**. `try_grow` applies no growth policy;
+   the host owns it.
+2. `MoveRequired` ⇒ the request does not fit the reservation, and `try_grow` changed **nothing**. The
+   host must supply more address space: `relocate` to a larger reservation, or a fresh larger
+   `ReservedHeap` plus a pointer-aware copy.
+3. After any move every cached raw term pointer is invalid. The whole live block shifts by a
+   **constant delta** (the `relocate` return), so the caller re-bases by adding that delta to its
+   external roots (`x_regs[0..live]` ++ the Erlang stack — the same root-set shape the collector takes,
+   supplied by `beam_engine`'s `Machine::{x_mut, fr_mut, stack_mut}`) **and** to the pointer words
+   inside the moved region.
+4. `relocate` cannot fix the interior pointers itself — telling a pointer word from raw
+   bitstring/refc-binary payload bytes needs term-structure knowledge owned by
+   `beam_term`/`beam_gc` — so the fully-consistent move remains the collector's pointer-aware copy
+   (`copy_struct`/Cheney), i.e. growth by *replacement*. Never cache a raw term pointer across a move.
+
+### `bump` — the shared bump-pointer term-construction primitives (private, crate-internal)
+`alloc_words_at`/`alloc_tuple_at`/`cons_at`/`tuple_at`: pure `(hp, available, …)` helpers that
+reserve-or-reject and write, with no state and no allocation. Both `Heap` and `ReservedHeap` delegate
+to them, so the term-writing logic (arityval header, `CAR`/`CDR` offsets, the exhaustion error) exists
+exactly once and each heap keeps only its own `used`/`peak` bookkeeping. A rejected request **writes
+nothing** and reports `error::heap_exhausted` (`AllocKind::Heap`).
+
 ### `refcount` — the shared atomic reference count (`erts_refc_*`)
 `#[repr(transparent)] pub struct RefCount { count: AtomicUsize }` — `new`, `count`, `inc`, `dec`,
 `dec_and_test(min)`. Safe Rust; `Send + Sync`. The **single** refcount primitive for the workspace;
