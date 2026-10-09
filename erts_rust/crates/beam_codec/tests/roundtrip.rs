@@ -873,8 +873,11 @@ fn proper_and_improper_lists_round_trip() {
 
 #[test]
 fn maps_round_trip_at_pair_boundaries() {
-    // Includes counts past `MAP_SMALL_MAP_LIMIT` (32): every map is a flatmap now.
-    for &n in &[0usize, 1, 2, 32, 33, 40, 100] {
+    // A map of at most `MAP_SMALL_MAP_LIMIT` (32) distinct keys is a **flat map**, whose
+    // keys the decoder sorts into `erts_cmp_flatmap_keys` order
+    // (`beam_term::map::MAP_SMALL_MAP_LIMIT`, `erl_map.c:3187`). The atom keys below are
+    // interned in index order, so that sorted order is exactly the insertion order.
+    for &n in &[0usize, 1, 2, 32] {
         let mut atoms = AtomTable::new();
         let cap = 4 + 2 * n + 64;
         let mut h1 = heap(cap);
@@ -899,6 +902,66 @@ fn maps_round_trip_at_pair_boundaries() {
             assert!(is_atom(keys[i]));
             assert_eq!(a2.name(atom_val(keys[i])).unwrap(), expected.as_str());
             assert_eq!(values[i], make_small(i as i64));
+        }
+    }
+
+    // Above `MAP_SMALL_MAP_LIMIT` the map is a **HAMT**, so the canonical `MAP_EXT` image
+    // is the HAMT image ERTS emits — not the flat-map order of the input. A
+    // `write_map`-built HAMT is byte-identical to the oracle's image
+    // (`tests/map_key_order.rs`), so a canonical image round-trips byte-for-byte while a
+    // locally built flat map is first *canonicalized* into that HAMT image. Integer keys
+    // are used here because a HAMT's storage order depends on `erts_map_hash`, which for
+    // an atom depends on the per-VM-start atom index (see `tests/map_key_order.rs`)
+    // whereas for an integer it is stable.
+    for &n in &[33usize, 40, 100] {
+        let mut h1 = heap(4 + 2 * n + 64);
+        let pairs: Vec<(Eterm, Eterm)> = (0..n as i64)
+            .map(|i| (make_small(i), make_small(i + 100)))
+            .collect();
+        let flat = make_flatmap(&mut h1, &pairs).unwrap();
+        let flat_image = encode_term(flat, &AtomTable::new()).unwrap();
+        assert_eq!(flat_image[1], MAP_EXT);
+        assert_eq!(
+            u32::from_be_bytes([
+                flat_image[2],
+                flat_image[3],
+                flat_image[4],
+                flat_image[5]
+            ]) as usize,
+            n
+        );
+
+        // Decoding the (non-canonical) flat image yields a HAMT; re-encoding gives the
+        // canonical HAMT image.
+        let cap = beam_term::map::map_words_capacity(n) + 64;
+        let mut h2 = heap(cap);
+        let mut atoms2 = AtomTable::new();
+        let t2 = decode_term(&flat_image, &mut h2, &mut atoms2).unwrap();
+        assert!(
+            flatmap_parts(t2).is_err(),
+            "a > 32-pair map decodes to a HAMT, not a flat map"
+        );
+        assert_eq!(beam_term::map::map_size(t2, &atoms2).unwrap(), n);
+
+        let canonical = encode_term(t2, &atoms2).unwrap();
+        assert_eq!(canonical[1], MAP_EXT);
+        assert_eq!(
+            u32::from_be_bytes([canonical[2], canonical[3], canonical[4], canonical[5]]) as usize,
+            n
+        );
+
+        // The canonical image is itself byte-stable: decode → encode is the identity.
+        let mut h3 = heap(cap);
+        let mut atoms3 = AtomTable::new();
+        let t3 = decode_term(&canonical, &mut h3, &mut atoms3).unwrap();
+        assert_eq!(encode_term(t3, &atoms3).unwrap(), canonical);
+
+        // ... and every key maps to its value (checked independently of representation).
+        for i in 0..n as i64 {
+            assert_eq!(
+                beam_term::map::map_get(t2, make_small(i), &atoms2).unwrap(),
+                Some(make_small(i + 100))
+            );
         }
     }
 }
@@ -1966,31 +2029,61 @@ fn signed_bignum_with_bad_sign_byte_is_bad_arg() {
 
 #[test]
 fn maps_with_more_than_32_pairs_round_trip() {
-    // 40 pairs is a flatmap now: encode → decode → encode must be byte-stable, with a
-    // 40-pair `MAP_EXT` count and the wire order preserved.
+    // 40 pairs is above `MAP_SMALL_MAP_LIMIT`: the decoded map is a **HAMT**, so the
+    // canonical `MAP_EXT` image is the HAMT image ERTS emits (not the flat-map order of
+    // the input). A `write_map`-built HAMT is byte-identical to the oracle's image
+    // (`tests/map_key_order.rs`), so once canonicalized the wire form is byte-stable.
+    // Integer keys keep the HAMT deterministic (an atom key's hash depends on the
+    // per-VM-start atom index).
     let n = 40usize;
-    let mut atoms = AtomTable::new();
     let mut h1 = heap(4 + 2 * n + 64);
-    let mut pairs = Vec::new();
-    for i in 0..n {
-        let key = make_atom(atoms.intern(&format!("key{i}")));
-        pairs.push((key, make_small(i as i64)));
-    }
+    let pairs: Vec<(Eterm, Eterm)> = (0..n as i64)
+        .map(|i| (make_small(i), make_small(i + 100)))
+        .collect();
     let m = make_flatmap(&mut h1, &pairs).unwrap();
 
-    let (b1, t2, _h2, a2) = roundtrip(m, &atoms, 4 + 2 * n + 64);
+    let atoms = AtomTable::new();
+    let flat_image = encode_term(m, &atoms).unwrap();
+    assert_eq!(flat_image[1], MAP_EXT);
+    assert_eq!(
+        u32::from_be_bytes([flat_image[2], flat_image[3], flat_image[4], flat_image[5]]),
+        40
+    );
 
-    assert_eq!(b1[1], MAP_EXT);
-    assert_eq!(u32::from_be_bytes([b1[2], b1[3], b1[4], b1[5]]), 40);
-    let (keys, values) = flatmap_parts(t2).unwrap();
-    assert_eq!(keys.len(), n);
-    for i in 0..n {
-        assert_eq!(a2.name(atom_val(keys[i])).unwrap(), format!("key{i}"));
-        assert_eq!(values[i], make_small(i as i64));
+    // Decode → HAMT; the flat path no longer applies.
+    let cap = beam_term::map::map_words_capacity(n) + 64;
+    let mut h2 = heap(cap);
+    let mut atoms2 = AtomTable::new();
+    let t2 = decode_term(&flat_image, &mut h2, &mut atoms2).unwrap();
+    assert!(
+        flatmap_parts(t2).is_err(),
+        "a 40-pair map is a HAMT, not a flat map"
+    );
+    assert_eq!(beam_term::map::map_size(t2, &atoms2).unwrap(), 40);
+
+    // The canonical HAMT image round-trips byte-for-byte, and holds every pair.
+    let canonical = encode_term(t2, &atoms2).unwrap();
+    assert_eq!(canonical[1], MAP_EXT);
+    assert_eq!(
+        u32::from_be_bytes([canonical[2], canonical[3], canonical[4], canonical[5]]),
+        40
+    );
+    let mut h3 = heap(cap);
+    let mut atoms3 = AtomTable::new();
+    let t3 = decode_term(&canonical, &mut h3, &mut atoms3).unwrap();
+    assert_eq!(encode_term(t3, &atoms3).unwrap(), canonical);
+    for i in 0..n as i64 {
+        assert_eq!(
+            beam_term::map::map_get(t2, make_small(i), &atoms2).unwrap(),
+            Some(make_small(i + 100))
+        );
     }
 
-    // A pair count past `MAX_ARITYVAL` cannot be a flatmap `arityval`.
-    assert_system_limit(&[VERSION_MAGIC, MAP_EXT, 0x01, 0x00, 0x00, 0x00]);
+    // A pair count whose bit 31 is set is malformed (`external.c:6312`).
+    assert_bad_arg(&[VERSION_MAGIC, MAP_EXT, 0x80, 0x00, 0x00, 0x00]);
+    // A pair count that overruns the wire is `BadArg`: the old flatmap-`arityval`
+    // `SystemLimit` guard is gone, since a HAMT has no `MAX_ARITYVAL` bound.
+    assert_bad_arg(&[VERSION_MAGIC, MAP_EXT, 0x01, 0x00, 0x00, 0x00]);
 }
 
 #[test]

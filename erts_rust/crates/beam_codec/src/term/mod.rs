@@ -228,6 +228,37 @@ pub fn make_flatmap(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> 
     }
 }
 
+/// Materializes a **canonical** map on `heap` from a wire-order pair sequence.
+///
+/// This is the ERTS map constructor, used by the `MAP_EXT` decoder: duplicate
+/// keys are collapsed **last value wins** and the produced map is either a flat
+/// map whose keys are sorted in [`beam_term::map::cmp_flatmap_keys`] order (at
+/// most [`MAP_SMALL_MAP_LIMIT`] = 32 distinct keys) or a hash map (HAMT) above
+/// that — exactly the shape ERTS's `binary_to_term` produces
+/// (`erl_map.c:3187` `erts_validate_and_sort_flatmap`, `erl_map.c:644`
+/// `erts_hashmap_from_array`, both reached from the `external.c:5438-5456`
+/// fixup). A caller that must reject duplicate keys compares the produced
+/// [`beam_term::map::map_size`] against the input length.
+///
+/// Delegates the layout to [`beam_term::map::write_map`] (the LCA writer), which
+/// reserves nothing itself: this forwards the exact
+/// [`beam_term::map::map_words_capacity`]`(pairs.len())` reservation.
+/// See the crate `CONTEXT.md`, §"Map key encode order".
+pub fn make_map(
+    heap: &mut Heap,
+    pairs: &[(Eterm, Eterm)],
+    atoms: &beam_term::AtomTable,
+) -> Result<Eterm> {
+    // SAFETY: `alloc_words` returned `beam_term::map::map_words_capacity(pairs.len())`
+    // exclusively-owned, writable words — the exact reservation `write_map`
+    // documents.
+    let hp = unsafe { heap.alloc_words(beam_term::map::map_words_capacity(pairs.len()))? };
+    // SAFETY: `hp` points at those words; `write_map` writes every word of the
+    // produced map (flat or HAMT) and the returned term borrows `hp`'s storage,
+    // which the owning `heap` keeps live and unmoved.
+    Ok(unsafe { beam_term::map::write_map(hp, pairs, atoms)? })
+}
+
 /// Writes a flat map of any non-empty pair count at `hp` and returns the tagged
 /// root term.
 ///

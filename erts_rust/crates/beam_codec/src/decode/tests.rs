@@ -264,25 +264,44 @@
         assert!(keys.is_empty());
         assert!(values.is_empty());
 
-        // 40 pairs (> `MAP_SMALL_MAP_LIMIT`) decodes as a flatmap of 40 pairs, in
-        // wire order — no HAMT builder is needed.
+        // 40 pairs (> `MAP_SMALL_MAP_LIMIT`) is a **hash map**: ERTS builds a HAMT for
+        // any count above 32 (`external.c:5087`), so the flat path rejects it. A HAMT
+        // needs more heap than the shared `decode` helper's tiny arena, so build a
+        // bigger one here.
         let mut image = vec![131, 116, 0, 0, 0, 40];
         for i in 0..40u8 {
             image.extend_from_slice(&[97, i]); // SMALL_INTEGER_EXT key
             image.extend_from_slice(&[97, i + 100]); // SMALL_INTEGER_EXT value
         }
-        let (_h, _a, term) = decode(&image);
-        let (keys, values) = flatmap_parts(term).unwrap();
-        assert_eq!(keys.len(), 40);
-        assert_eq!(values.len(), 40);
+        let mut heap = Heap::new(4096).expect("room for a 40-key HAMT");
+        let mut atoms = AtomTable::new();
+        let term = decode_term(&image, &mut heap, &mut atoms).expect("valid image decodes");
+        assert!(
+            flatmap_parts(term).is_err(),
+            "a > 32-pair map is a HAMT, not a flat map"
+        );
+        assert_eq!(beam_term::map::map_size(term, &atoms).unwrap(), 40);
         for i in 0..40i64 {
-            assert_eq!(keys[i as usize], make_small(i));
-            assert_eq!(values[i as usize], make_small(i + 100));
+            assert_eq!(
+                beam_term::map::map_get(term, make_small(i), &atoms).unwrap(),
+                Some(make_small(i + 100))
+            );
         }
 
-        // A pair count past `MAX_ARITYVAL` cannot be a flatmap `arityval`: a
-        // `SystemLimit`, and nothing is read past the count.
-        assert_system_limit(&[131, 116, 0x01, 0x00, 0x00, 0x00]);
+        // A pair count whose bit 31 is set is malformed: the sizing pass' `(n >> 31) != 0`
+        // guard (`external.c:6312`).
+        assert_bad_arg(&[131, 116, 0x80, 0x00, 0x00, 0x00]);
+        // A pair count that overruns the wire fails on the first truncated pair read —
+        // `BadArg`, not the old flatmap `arityval` `SystemLimit` (a HAMT has no
+        // `MAX_ARITYVAL` bound).
+        assert_bad_arg(&[131, 116, 0x01, 0x00, 0x00, 0x00]);
+
+        // Duplicate keys are rejected. ERTS checks for duplicates in **both**
+        // representations (`erts_validate_and_sort_flatmap` for a flat map,
+        // `erts_hashmap_from_array(..., 1)` for a HAMT — the `external.c:5438-5456`
+        // fixup), so `binary_to_term` is `badarg`; only `maps:from_list/1` collapses.
+        // `#{1 => 10, 1 => 20}` — key `1` twice.
+        assert_bad_arg(&[131, 116, 0, 0, 0, 2, 97, 1, 97, 10, 97, 1, 97, 20]);
     }
 
     #[test]

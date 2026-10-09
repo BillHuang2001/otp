@@ -313,26 +313,44 @@ impl<'a> Decoder<'a> {
             }
             Tag::Map => {
                 let count = self.reader.u32be()? as usize;
-                // The pair count becomes a flatmap `arityval`, whose size field is
-                // `MAX_ARITYVAL` wide, so a larger map cannot be represented.
-                if count > MAX_ARITYVAL {
-                    return Err(system_limit());
+                // ERTS rejects a pair count with bit 31 set before reading any
+                // pair: the sizing pass' `(n >> 31) != 0` guard on 64-bit
+                // `ARCH_64` limits a map to `2^31 - 1` pairs
+                // (`external.c:6311-6315`). A larger count is malformed.
+                if (count >> 31) != 0 {
+                    return Err(bad_arg());
                 }
-                // The wire order (interleaved `K1,V1,…,Kn,Vn`) is what defines the map,
-                // so it is preserved verbatim: this crate never sorts or dedupes on
-                // decode either. ERTS stores a ≤ 32-pair map sorted in
-                // `erts_cmp_flatmap_keys` order and emits that order on the wire
-                // (`erl_map.h:181-199`, `external.c:3746-3769`), so a faithful
-                // decode→re-encode is byte-stable (see the crate `CONTEXT.md`,
-                // §"Map key encode order"). Any pair count (including a > 32-pair HAMT's
-                // image) is materialized as one flat map here.
+                // The pair count is attacker-controlled, so the pairs vector grows
+                // as pairs are read rather than being pre-sized from `count`; a
+                // count that overruns the wire fails on the first truncated read
+                // (below), never with a blind length-driven allocation. The wire
+                // order is interleaved `K1,V1,…,Kn,Vn`.
                 let mut pairs = Vec::new();
                 for _ in 0..count {
                     let key = self.decode(heap, atoms)?;
                     let value = self.decode(heap, atoms)?;
                     pairs.push((key, value));
                 }
-                crate::term::make_flatmap(heap, &pairs)
+                // ERTS canonicalizes the map here (the `external.c:5438-5456`
+                // fixup): `count <= MAP_SMALL_MAP_LIMIT` becomes a FLAT map with
+                // keys sorted in `erts_cmp_flatmap_keys` order
+                // (`erts_validate_and_sort_flatmap`, `erl_map.c:3187`), a larger
+                // count a HAMT (`erts_hashmap_from_array(..., 1)`, `erl_map.c:644`,
+                // keyed by `erts_map_hash`). `write_map` is that constructor, so the
+                // decoded map carries ERTS's storage order and re-encodes
+                // byte-identically (see the crate `CONTEXT.md`, §"Map key encode
+                // order").
+                let map = crate::term::make_map(heap, &pairs, atoms)?;
+                // `write_map` collapses duplicate keys (last value wins), whereas
+                // ERTS **rejects** them in both representations (`external.c:5448`
+                // `error_map_fixup`, reached when the fixup's duplicate check
+                // fails). `maps:from_list/1` is what collapses, not the codec, so a
+                // produced key count below the wire count means a duplicate was
+                // present and the image is malformed.
+                if beam_term::map::map_size(map, atoms)? != count {
+                    return Err(bad_arg());
+                }
+                Ok(map)
             }
 
             // ---------------------------------------------------------------
