@@ -144,6 +144,20 @@ fn the_access_checked_view_can_change_the_protection() {
     ));
     assert_eq!(t.access(), Access::Private);
     assert_eq!(t.info().access, Access::Private, "the denied call changed nothing");
+
+    // The generic `setopts` entry point carries the same option (and the same
+    // gate): `TableAccess::setopts(SetOpt::Access(_))` is `Table::setopts` with the
+    // view's requester supplied as the caller.
+    assert!(matches!(
+        t.as_requester(Some(other)).setopts(SetOpt::Access(Access::Public)),
+        Err(BeamError::BadArg)
+    ));
+    assert_eq!(t.access(), Access::Private, "still unchanged");
+    t.as_requester(Some(owner))
+        .setopts(SetOpt::Access(Access::Public))
+        .expect("the owner may change the protection through the generic entry point");
+    assert_eq!(t.access(), Access::Public);
+    assert_eq!(t.info().access, Access::Public);
 }
 
 /// The mode change is enforced **immediately** by the read/write checks the BIF
