@@ -581,7 +581,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - `src/table/read.rs` → the read/navigation `impl Table`
 - `src/table/rename.rs` → `Table::rename` + `RenameOutcome` (`ets:rename/2` semantics)
 - `src/table/shared.rs` → `SharedTable` (the locked handle) + its unit tests
-- `src/table/view/mod.rs`, `view/read.rs`, `view/write.rs`, `view/term.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence)
+- `src/table/view/mod.rs`, `view/read.rs`, `view/write.rs`, `view/term.rs`, `view/iter.rs` → the guard-scoped `TableRead`/`TableWrite`/`TableTerm` views (the aliasing defence) + the view-borrowed traversal API (iterators / `foldl` / `foldr` / `tab2list_into`)
 - `src/table/view/tests.rs` → the view-layer unit tests (incl. the aliasing evidence)
 - `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior`
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
