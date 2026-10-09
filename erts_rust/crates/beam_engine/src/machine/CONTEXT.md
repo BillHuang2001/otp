@@ -36,10 +36,6 @@ module-context-aware **dispatch loop that IS the interpreter's hot loop** (the `
   a raise landing in another context's live catch frame (pinned by `drive.rs`'s tests
   `a_cross_module_return_switches_the_machine_back_into_the_caller_context` and
   `a_raise_landing_in_a_callers_catch_frame_switches_into_the_callers_context`).
-- **`RunOutcome::Yield` is a suspend, not an error.** A host that exhausts its time slice reports it through
-  `ExecutionContext::reduce_outcome`; the machine applies the current instruction and yields at the *next* one, so a
-  `Yield` is resumed with `Machine::resume_outcome` exactly like a `Wait` address — no instruction is ever re-executed
-  or re-charged. The non-blocking entries fold it into a typed pre-emption error instead.
 - `reset` clears the register files, stacks, catch frames, contexts, pending exception and the trace gate, but **not**
   the `refc_binaries` arena.
 
