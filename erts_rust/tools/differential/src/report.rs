@@ -38,6 +38,7 @@ use crate::compare::{FieldDiff, SideResult, Verdict};
 use crate::corpus::{self, Case, Contract};
 use crate::error::{Error, Result};
 use crate::harness::{CaseOutcome, SuiteOutcome};
+use crate::ratchet::RatchetReport;
 use crate::runtime::{RuntimeId, RuntimeSpec};
 
 /// The report schema identifier (bump on any backwards-incompatible change).
@@ -59,6 +60,11 @@ pub struct RunReport {
     pub rust: RuntimeReport,
     /// Verdict counts over `cases`.
     pub summary: Summary,
+    /// The known-gaps ratchet classification. Present only when an allowlist drove the run
+    /// (`suite --allowlist`); omitted from the JSON otherwise, so a run without one is
+    /// byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ratchet: Option<RatchetReport>,
     /// Verdict counts rolled up per compatibility contract, keyed by the stable contract id
     /// (`"A.1"` … `"A.9"`) and ordered by it. A case contributes to every contract it
     /// declares, so these totals need not sum to [`Summary::total`]. Only contracts that
@@ -77,6 +83,17 @@ impl RunReport {
         rust: Option<&RuntimeSpec>,
         cases: Vec<CaseReport>,
     ) -> RunReport {
+        RunReport::new_with_ratchet(mode, oracle, rust, cases, None)
+    }
+
+    /// Build a report from resolved runtimes, per-case reports and an optional ratchet.
+    pub fn new_with_ratchet(
+        mode: &'static str,
+        oracle: &RuntimeSpec,
+        rust: Option<&RuntimeSpec>,
+        cases: Vec<CaseReport>,
+        ratchet: Option<RatchetReport>,
+    ) -> RunReport {
         let summary = Summary::of(&cases);
         let by_contract = by_contract_summary(&cases);
         RunReport {
@@ -85,6 +102,7 @@ impl RunReport {
             oracle: RuntimeReport::of(RuntimeId::Oracle, Some(oracle)),
             rust: RuntimeReport::of(RuntimeId::Rust, rust),
             summary,
+            ratchet,
             by_contract,
             cases,
         }
@@ -474,6 +492,16 @@ pub fn render_human(report: &RunReport, out: &mut impl Write) -> std::io::Result
         "summary: total={} agree={} mismatch={} unsupported={} skipped={}",
         summary.total, summary.agree, summary.mismatch, summary.unsupported, summary.skipped
     )?;
+    if let Some(ratchet) = &report.ratchet {
+        writeln!(
+            out,
+            "ratchet: allowlist={} allowed={} unauthorized={} stale={}",
+            ratchet.allowlist.as_deref().unwrap_or("(none)"),
+            ratchet.allowed,
+            ratchet.unauthorized,
+            ratchet.stale
+        )?;
+    }
     if !report.by_contract.is_empty() {
         writeln!(out, "by contract:")?;
         for (id, counts) in &report.by_contract {
@@ -583,6 +611,7 @@ mod tests {
     use crate::compare::{verdict_with, FieldDiff, GoldenCheck, Observables, SideResult, Verdict};
     use crate::corpus::{find_case, Contract};
     use crate::harness::{run_case, run_case_in, RuntimeContext};
+    use crate::ratchet::RatchetReport;
     use crate::runtime::{resolve_oracle, Observation, RuntimeId, RuntimeSource, RuntimeSpec};
     use std::path::PathBuf;
 
@@ -999,5 +1028,50 @@ mod tests {
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("A.2 — .beam binary/ETF bytes — "), "{text}");
         assert!(text.contains("  modules/add"), "{text}");
+    }
+
+    fn ratchet_report() -> RatchetReport {
+        RatchetReport {
+            allowlist: Some("known-gaps.txt".to_string()),
+            allowed: 9,
+            unauthorized: 0,
+            stale: 0,
+        }
+    }
+
+    /// The `ratchet` key is purely additive: omitted without an allowlist (so a plain run is
+    /// byte-for-byte unchanged) and rendered in both the JSON and the human output when
+    /// present. `report_from_suite` (the allowlisted path) is covered in `ratchet.rs`.
+    #[test]
+    fn the_ratchet_key_is_additive_and_rendered_only_when_present() {
+        let plain = report(Verdict::Unsupported, SideResult::unsupported("no beam_rt"), None);
+        let json: serde_json::Value =
+            serde_json::from_str(&plain.to_json_string().unwrap()).unwrap();
+        assert!(json.get("ratchet").is_none(), "{json}");
+        assert_eq!(json["schema"], SCHEMA, "an additive key never bumps the schema");
+        let mut buf = Vec::new();
+        render_human(&plain, &mut buf).expect("render");
+        assert!(!String::from_utf8(buf).expect("utf8").contains("ratchet:"));
+
+        let with = RunReport::new_with_ratchet(
+            "suite",
+            &spec(RuntimeId::Oracle, "/x/erl", RuntimeSource::Path),
+            None,
+            report(Verdict::Unsupported, SideResult::unsupported("no beam_rt"), None).cases,
+            Some(ratchet_report()),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&with.to_json_string().unwrap()).unwrap();
+        assert_eq!(json["ratchet"]["allowlist"], "known-gaps.txt");
+        assert_eq!(json["ratchet"]["allowed"], 9);
+        assert_eq!(json["ratchet"]["unauthorized"], 0);
+        assert_eq!(json["ratchet"]["stale"], 0);
+        let mut buf = Vec::new();
+        render_human(&with, &mut buf).expect("render");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(
+            text.contains("ratchet: allowlist=known-gaps.txt allowed=9 unauthorized=0 stale=0"),
+            "{text}"
+        );
     }
 }

@@ -666,3 +666,191 @@ fn a_rust_runtime_signalling_unsupported_is_honest_not_a_mismatch() {
     let strict = invoke(&["suite", "--strict", "--out", &scratch.arg()], &[("BEAM_RT", fake)]);
     assert_eq!(strict.code, Some(1), "{}", strict.describe());
 }
+
+/// Write a synthetic known-gaps allowlist (`<case-id> beam_bifs fixture` per line, with a
+/// leading `#`-comment) into `path`, creating its parent directory if needed.
+#[cfg(unix)]
+fn write_allowlist(path: &std::path::Path, case_ids: &[&str]) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create the allowlist dir");
+    }
+    let mut body = String::from("# a synthetic allowlist for the ratchet end-to-end test\n");
+    for id in case_ids {
+        body.push_str(&format!("{id} beam_bifs fixture\n"));
+    }
+    std::fs::write(path, body).expect("write the allowlist");
+}
+
+/// The ratchet, end to end, against the real corpus and a fake exit-3 runtime.
+///
+/// A fake `$BEAM_RT` that signals `beam_rt: unsupported: …` (exit 3) for **every** case makes
+/// every corpus case a capability gap (`unsupported`, or `skipped` when a host tool such as
+/// `erlc` is absent), so:
+///   * an allowlist recording **every** case id is a clean run (`exit 0`), with every gap
+///     classified `allowed` — state-independent, the corpus size is never hard-coded;
+///   * an allowlist that omits one id (an *unauthorized* gap) and adds a bogus id (a *stale*
+///     entry) is `exit 1`, and the generated `GAPS.md` names both.
+#[cfg(unix)]
+#[test]
+fn the_ratchet_tolerates_only_the_recorded_gaps_end_to_end() {
+    if !oracle_available() {
+        eprintln!("SKIP: oracle erl not available");
+        return;
+    }
+    let scratch = Scratch::new("ratchet");
+    let fake = fake_runtime(
+        &scratch,
+        "beam_rt-fake",
+        "echo 'beam_rt: unsupported: bogus feature' 1>&2\nexit 3",
+    );
+    let fake = fake.to_str().expect("utf-8 path");
+
+    let ids: Vec<&str> = differential::corpus::cases()
+        .iter()
+        .map(|case| case.id)
+        .collect();
+    assert!(!ids.is_empty(), "the corpus must not be empty");
+
+    // ---- clean run: an allowlist recording every case id is exit 0 ----------------------
+    let clean_list = scratch.0.join("all-gaps.txt");
+    write_allowlist(&clean_list, &ids);
+    let clean = invoke(
+        &[
+            "suite",
+            "--strict",
+            "--allowlist",
+            &clean_list.display().to_string(),
+            "--json",
+            "--out",
+            &scratch.arg(),
+        ],
+        &[("BEAM_RT", fake)],
+    );
+    assert_eq!(clean.code, Some(0), "{}", clean.describe());
+    let json: serde_json::Value = serde_json::from_str(&clean.stdout).expect("the report parses");
+    assert_eq!(json["summary"]["mismatch"], 0, "{}", clean.stdout);
+    assert_eq!(json["ratchet"]["unauthorized"], 0, "{}", clean.stdout);
+    assert_eq!(json["ratchet"]["stale"], 0, "{}", clean.stdout);
+    // State-independent: every gap is allowlisted, so `allowed` equals the gap total — the
+    // corpus size / split is never hard-coded.
+    let gaps = json["summary"]["unsupported"].as_u64().expect("unsupported count")
+        + json["summary"]["skipped"].as_u64().expect("skipped count");
+    assert!(
+        gaps >= 1,
+        "the fake exit-3 runtime must make at least one case a gap: {}",
+        clean.stdout
+    );
+    assert_eq!(
+        json["ratchet"]["allowed"].as_u64(),
+        Some(gaps),
+        "every gap is allowlisted: {}",
+        clean.stdout
+    );
+
+    // ---- dirty run: one gap omitted (unauthorized) + a bogus entry (stale) --------------
+    let omitted = ids[0];
+    let dirty_list = scratch.0.join("dirty-gaps.txt");
+    write_allowlist(&dirty_list, &ids[1..]);
+    let mut dirty_body = std::fs::read_to_string(&dirty_list).expect("read the dirty allowlist");
+    dirty_body.push_str("zzz/not-a-case beam_bifs a deliberate typo\n");
+    std::fs::write(&dirty_list, dirty_body).expect("write the dirty allowlist");
+
+    let gaps_path = scratch.0.join("GAPS.md");
+    let dirty = invoke(
+        &[
+            "suite",
+            "--strict",
+            "--allowlist",
+            &dirty_list.display().to_string(),
+            "--gaps",
+            &gaps_path.display().to_string(),
+            "--json",
+            "--out",
+            &scratch.arg(),
+        ],
+        &[("BEAM_RT", fake)],
+    );
+    assert_eq!(dirty.code, Some(1), "{}", dirty.describe());
+    let json: serde_json::Value = serde_json::from_str(&dirty.stdout).expect("the report parses");
+    assert_eq!(json["summary"]["mismatch"], 0, "{}", dirty.stdout);
+    assert_eq!(json["ratchet"]["unauthorized"], 1, "{}", dirty.stdout);
+    assert_eq!(json["ratchet"]["stale"], 1, "{}", dirty.stdout);
+
+    let markdown = std::fs::read_to_string(&gaps_path).expect("the gaps report was written");
+    assert!(
+        markdown.contains("| unauthorized |"),
+        "the report carries an unauthorized status cell: {markdown}"
+    );
+    assert!(
+        markdown.contains("| stale |"),
+        "the report carries a stale status cell: {markdown}"
+    );
+    assert!(
+        markdown.contains(omitted),
+        "the omitted (unauthorized) case id `{omitted}` is named: {markdown}"
+    );
+    assert!(
+        markdown.contains("zzz/not-a-case"),
+        "the bogus (stale) entry is named: {markdown}"
+    );
+}
+
+/// A missing/unreadable allowlist is a loud env error (exit 2) that fails **before** the
+/// corpus runs — no report is written.
+#[test]
+fn a_missing_allowlist_is_a_loud_env_error_with_no_corpus_run() {
+    let scratch = Scratch::new("ratchet-missing-allowlist");
+    let missing = scratch.0.join("does-not-exist-allowlist.txt");
+    let invocation = invoke(
+        &[
+            "suite",
+            "--strict",
+            "--allowlist",
+            &missing.display().to_string(),
+            "--out",
+            &scratch.arg(),
+        ],
+        &[],
+    );
+    assert_eq!(invocation.code, Some(2), "{}", invocation.describe());
+    assert!(
+        invocation.stderr.contains("allowlist"),
+        "the error names the allowlist: {}",
+        invocation.describe()
+    );
+    assert!(
+        invocation.stderr.contains("does-not-exist-allowlist.txt"),
+        "{}",
+        invocation.describe()
+    );
+    assert!(
+        !scratch.report().exists(),
+        "no report for an unreadable allowlist"
+    );
+}
+
+/// `--allowlist` without `--strict` is a usage error (exit 2): the ratchet is meaningful only
+/// under the strict gate.
+#[test]
+fn an_allowlist_without_strict_is_a_usage_error() {
+    let scratch = Scratch::new("ratchet-no-strict");
+    std::fs::create_dir_all(&scratch.0).expect("create the scratch dir");
+    let list = scratch.0.join("known-gaps.txt");
+    std::fs::write(&list, "# empty\n").expect("write the allowlist");
+    let invocation = invoke(
+        &[
+            "suite",
+            "--allowlist",
+            &list.display().to_string(),
+            "--out",
+            &scratch.arg(),
+        ],
+        &[],
+    );
+    assert_eq!(invocation.code, Some(2), "{}", invocation.describe());
+    assert!(
+        invocation.stderr.contains("requires '--strict'"),
+        "{}",
+        invocation.describe()
+    );
+}

@@ -26,7 +26,7 @@
 //! differential <SUBCOMMAND> [OPTIONS]
 //!   run     <case-id> [--json] [--out <dir>]
 //!   compare <expr> [--pa <dir>]… [--json] [--out <dir>]
-//!   suite   [--strict] [--json] [--out <dir>]
+//!   suite   [--strict] [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>]
 //!   list    [--by-contract] [--json] [--out <dir>]
 //!   help    [topic]
 //! ```
@@ -66,6 +66,11 @@ pub enum Command {
     Suite {
         /// Escalate `unsupported`/`skipped` cases to a failure exit code.
         strict: bool,
+        /// A known-gaps allowlist: tolerates the gaps it records, fails on an unauthorized
+        /// gap or a stale entry. Requires `strict`.
+        allowlist: Option<PathBuf>,
+        /// Also write the generated `GAPS.md` document to this path.
+        gaps: Option<PathBuf>,
         /// Print the JSON report to stdout.
         json: bool,
         /// Also write `<dir>/report.json`.
@@ -142,13 +147,15 @@ pub fn usage(topic: Option<&str>) -> String {
              -h, --help    show this help\n"
         ),
         Some("suite") => format!(
-            "differential suite [--strict] [--json] [--out <dir>]\n\n\
+            "differential suite [--strict] [--allowlist <file>] [--gaps <path>] [--json] [--out <dir>]\n\n\
              Run the whole built-in conformance corpus and compare every case.\n\n\
              OPTIONS:\n  \
-             --strict      treat `unsupported`/`skipped` cases as failures (exit 1)\n  \
-             --json        print the JSON report to stdout\n  \
-             --out <dir>   also write <dir>/report.json\n  \
-             -h, --help    show this help\n"
+             --strict            treat `unsupported`/`skipped` cases as failures (exit 1)\n  \
+             --allowlist <file>  ratchet: tolerate the known capability gaps recorded in <file>\n                      (requires --strict); fail on an unauthorized gap or a stale entry\n  \
+             --gaps <path>       also write the generated GAPS.md document to <path>\n  \
+             --json              print the JSON report to stdout\n  \
+             --out <dir>         also write <dir>/report.json\n  \
+             -h, --help          show this help\n"
         ),
         Some("list") => format!(
             "differential list [--by-contract] [--json] [--out <dir>]\n\n\
@@ -185,6 +192,8 @@ OPTIONS (per subcommand):
   --json          print the JSON report to stdout
   --out <dir>     also write <dir>/report.json
   --strict        (suite) treat unsupported/skipped cases as failures
+  --allowlist <file> (suite, with --strict) tolerate the recorded known capability gaps
+  --gaps <path>   (suite) also write the generated GAPS.md document to <path>
   --by-contract   (list) group the listing by compatibility contract
   --pa <dir>      (compare) add a code path for both runtimes, repeatable
   -h, --help      show help (valid at the root and after any subcommand)
@@ -348,6 +357,8 @@ fn parse_compare(args: &[String]) -> Result<Command> {
 
 fn parse_suite(args: &[String]) -> Result<Command> {
     let (mut json, mut out, mut strict) = (false, None, false);
+    let mut allowlist: Option<PathBuf> = None;
+    let mut gaps: Option<PathBuf> = None;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -361,13 +372,71 @@ fn parse_suite(args: &[String]) -> Result<Command> {
             index += 1;
             continue;
         }
+        if arg == "--allowlist" {
+            index += 1;
+            let value = args.get(index).ok_or_else(|| {
+                Error::usage(format!(
+                    "option '--allowlist' requires a file argument\n\n{}",
+                    usage(Some("suite"))
+                ))
+            })?;
+            allowlist = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--allowlist=") {
+            if value.is_empty() {
+                return Err(Error::usage(format!(
+                    "option '--allowlist' requires a file argument\n\n{}",
+                    usage(Some("suite"))
+                )));
+            }
+            allowlist = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if arg == "--gaps" {
+            index += 1;
+            let value = args.get(index).ok_or_else(|| {
+                Error::usage(format!(
+                    "option '--gaps' requires a path argument\n\n{}",
+                    usage(Some("suite"))
+                ))
+            })?;
+            gaps = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--gaps=") {
+            if value.is_empty() {
+                return Err(Error::usage(format!(
+                    "option '--gaps' requires a path argument\n\n{}",
+                    usage(Some("suite"))
+                )));
+            }
+            gaps = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
         if consume_common(arg, args, &mut index, &mut json, &mut out, "suite")? {
             index += 1;
             continue;
         }
         return Err(unknown_option(arg, "suite"));
     }
-    Ok(Command::Suite { strict, json, out })
+    if allowlist.is_some() && !strict {
+        return Err(Error::usage(format!(
+            "option '--allowlist' requires '--strict'\n\n{}",
+            usage(Some("suite"))
+        )));
+    }
+    Ok(Command::Suite {
+        strict,
+        allowlist,
+        gaps,
+        json,
+        out,
+    })
 }
 
 fn parse_list(args: &[String]) -> Result<Command> {
@@ -544,6 +613,8 @@ mod tests {
             parse(&argv(&["suite", "--strict", "--json"])).unwrap(),
             Command::Suite {
                 strict: true,
+                allowlist: None,
+                gaps: None,
                 json: true,
                 out: None,
             }
@@ -552,10 +623,102 @@ mod tests {
             parse(&argv(&["suite"])).unwrap(),
             Command::Suite {
                 strict: false,
+                allowlist: None,
+                gaps: None,
                 json: false,
                 out: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_suite_handles_the_allowlist_and_gaps_options() {
+        // Both spellings of each option, in any order.
+        assert_eq!(
+            parse(&argv(&[
+                "suite",
+                "--strict",
+                "--allowlist",
+                "known-gaps.txt",
+                "--gaps",
+                "GAPS.md",
+            ]))
+            .unwrap(),
+            Command::Suite {
+                strict: true,
+                allowlist: Some(PathBuf::from("known-gaps.txt")),
+                gaps: Some(PathBuf::from("GAPS.md")),
+                json: false,
+                out: None,
+            }
+        );
+        assert_eq!(
+            parse(&argv(&[
+                "suite",
+                "--strict",
+                "--gaps=out/GAPS.md",
+                "--allowlist=known-gaps.txt",
+            ]))
+            .unwrap(),
+            Command::Suite {
+                strict: true,
+                allowlist: Some(PathBuf::from("known-gaps.txt")),
+                gaps: Some(PathBuf::from("out/GAPS.md")),
+                json: false,
+                out: None,
+            }
+        );
+        // `--gaps` is independent of `--strict`; `--allowlist` is not.
+        assert_eq!(
+            parse(&argv(&["suite", "--gaps", "GAPS.md"])).unwrap(),
+            Command::Suite {
+                strict: false,
+                allowlist: None,
+                gaps: Some(PathBuf::from("GAPS.md")),
+                json: false,
+                out: None,
+            }
+        );
+    }
+
+    #[test]
+    fn allowlist_requires_strict_and_the_options_need_values() {
+        let err = parse(&argv(&["suite", "--allowlist", "known-gaps.txt"])).unwrap_err();
+        assert!(matches!(err, Error::Usage(_)), "{err:?}");
+        assert!(err.to_string().contains("requires '--strict'"), "{err}");
+
+        for args in [
+            vec!["suite", "--strict", "--allowlist"],
+            vec!["suite", "--strict", "--allowlist="],
+            vec!["suite", "--gaps"],
+            vec!["suite", "--gaps="],
+        ] {
+            let err = parse(&argv(&args)).unwrap_err();
+            assert!(matches!(err, Error::Usage(_)), "{args:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn allowlist_and_gaps_are_only_accepted_by_suite() {
+        for args in [
+            vec!["run", "etf/term_to_binary_tuple", "--allowlist", "x"],
+            vec!["compare", "1+1", "--allowlist=x"],
+            vec!["list", "--gaps", "x"],
+            vec!["list", "--gaps=x"],
+        ] {
+            assert!(
+                matches!(parse(&argv(&args)), Err(Error::Usage(_))),
+                "{args:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn allowlist_and_gaps_are_documented_in_suite_help() {
+        assert!(usage(Some("suite")).contains("--allowlist <file>"));
+        assert!(usage(Some("suite")).contains("--gaps <path>"));
+        assert!(ROOT_USAGE.contains("--allowlist <file>"));
+        assert!(ROOT_USAGE.contains("--gaps <path>"));
     }
 
     #[test]
@@ -621,6 +784,8 @@ mod tests {
             parse(&argv(&["suite", "--strict", "--strict"])).unwrap(),
             Command::Suite {
                 strict: true,
+                allowlist: None,
+                gaps: None,
                 json: false,
                 out: None,
             }
