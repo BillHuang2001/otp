@@ -697,8 +697,7 @@ mod tests {
         }
     }
 
-    /// Creates `$TMPDIR/beam_rt_codeserver_<pid>_<n>_<label>` (unique per test and run): the root
-    /// of a synthetic OTP installation layout.
+    /// Creates `$TMPDIR/beam_rt_codeserver_<pid>_<n>_<label>` (unique per test and run).
     fn scratch(label: &str) -> PathBuf {
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = env::temp_dir().join(format!(
@@ -711,8 +710,7 @@ mod tests {
         dir
     }
 
-    /// Creates an empty `<module>.beam` under `dir` (with its parents): the resolver's proof that a
-    /// directory is an application's `ebin`.
+    /// Creates an empty `<module>.beam` under `dir` (with its parents): the resolver's proof.
     fn touch(dir: &Path, module: &str) {
         std::fs::create_dir_all(dir).expect("an application directory");
         std::fs::write(dir.join(format!("{module}.beam")), b"").expect("a probe module");
@@ -831,14 +829,20 @@ mod tests {
 
     #[test]
     fn a_root_is_recognised_from_the_installation_layout() {
-        // An installed release: every application under `<root>/lib/<app>-<vsn>/ebin`.
+        // An installed release: every application under `<root>/lib/<app>-<vsn>/ebin` — both the
+        // native probe and the `$ERTS_STDLIB_DIR` override (from the stdlib directory) read it.
         let root = scratch("installed");
         for (app, module) in SYSTEM_APPS {
             touch(&installed_ebin(&root, app), module);
         }
+        let expected: Vec<PathBuf> =
+            SYSTEM_APPS.iter().map(|(app, _)| installed_ebin(&root, app)).collect();
+        assert_eq!(system_ebins_under(&root), Some(expected.clone()));
+        let stdlib_app = installed_ebin(&root, "stdlib");
         assert_eq!(
-            system_ebins_under(&root),
-            Some(SYSTEM_APPS.iter().map(|(app, _)| installed_ebin(&root, app)).collect())
+            stdlib_dir_override(stdlib_app.parent().expect("the stdlib app directory"))
+                .expect("the override resolves"),
+            expected
         );
 
         // The same, with the `erts` application *next to* `lib/` — the `--prefix` layout that
