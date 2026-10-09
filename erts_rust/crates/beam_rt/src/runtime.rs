@@ -83,6 +83,7 @@ use crate::seq_trace::SeqTrace;
 use crate::timers::{TimerHandle, Timers};
 use crate::trace::TraceState;
 
+mod ets_owner;
 mod gc;
 mod scheduler;
 
@@ -222,6 +223,15 @@ pub struct Runtime {
     /// applied by a BIF) finds it already borrowed and runs without ETS — the `ets:*` BIFs
     /// then raise `unsupported_bif`, never a wrong result.
     pub(crate) tables: Rc<RefCell<TableRegistry>>,
+    /// The **ETS owner-death index** (contract A.1): the `named_table`s each live process
+    /// created, plus the pids observed dead and waiting to be discharged.
+    ///
+    /// Shared with the [`ProcessExitObserver`](beam_process::ProcessExitObserver) installed on
+    /// the process table (see [`Runtime::new`]) — the observer only records a death here,
+    /// because it runs inside `beam_process`'s finalizer, which can be reached while the ETS
+    /// registry's `RefCell` is already borrowed. The runtime drains it at scheduler-pass
+    /// boundaries, where the registry is free (see [`crate::runtime::ets_owner`]).
+    pub(crate) ets_owners: Rc<RefCell<ets_owner::OwnerIndex>>,
     /// The port table and the live ports behind `erlang:open_port/2`.
     ///
     /// Shared through an [`Rc`]`<`[`RefCell`]`>` for the same reason as
@@ -409,6 +419,15 @@ impl Runtime {
         }
         let signals = SignalAtoms::from_table(code_server.atoms_mut());
         let mut processes = ProcessTable::new(signals);
+        // The ETS owner-death index and the observer that fills it: a process death records the
+        // pid here and nothing else, and the runtime drains the obligations at a scheduler
+        // boundary where the ETS registry is free (see [`crate::runtime::ets_owner`]). The
+        // observer touches only this cell, so it is safe to run from inside the finalizer even
+        // while a BIF call holds the ETS registry.
+        let ets_owners = Rc::new(RefCell::new(ets_owner::OwnerIndex::default()));
+        processes.set_process_exit_observer(Box::new(ets_owner::EtsExitObserver::new(Rc::clone(
+            &ets_owners,
+        ))));
         // The runtime's own root process carries the emulator's default heap policy — the
         // same one `erlang:spawn` gives a child — so `process_info(Pid, min_heap_size | …)`
         // reports the oracle's figures for it too (see [`Runtime::default_spawn_policy`]).
@@ -473,6 +492,7 @@ impl Runtime {
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             eval_heap: Heap::new(heap_words)?,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
+            ets_owners,
             ports: Rc::new(RefCell::new(PortRegistry::new()?)),
             nifs: Rc::new(RefCell::new(NifRegistry::new())),
             persistent_terms: Rc::new(RefCell::new(PersistentTermStore::new())),

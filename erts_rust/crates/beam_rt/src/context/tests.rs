@@ -1264,3 +1264,62 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
         assert_eq!(error.as_atom(), Some("badarg"), "{error}");
     }
 }
+
+/// A module that imports `erlang:load_nif/2`, `erlang:term_to_binary/1,2` or
+/// `erlang:external_size/1,2` is recognised as one whose own code **reads its call site**
+/// (see [`module_observes_its_call_site`]), so the cross-module call seam never enters it
+/// in-machine under the *caller's* identity. Every other import is ignored.
+#[test]
+fn only_the_call_site_reading_bifs_make_a_module_site_observant() {
+    /// A synthetic module importing exactly `imports` (as `{module, function, arity}`).
+    fn module_importing(imports: &[(&str, &str, u32)]) -> Module {
+        let mut module = Module::default();
+        for (name, function, arity) in imports {
+            let module_atom = module.atom_table.intern(name);
+            let function_atom = module.atom_table.intern(function);
+            module.imports.push(beam_loader::Import {
+                module: module_atom,
+                function: function_atom,
+                arity: *arity,
+            });
+        }
+        module
+    }
+
+    for observant in [
+        ("erlang", "load_nif", 2),
+        ("erlang", "term_to_binary", 1),
+        ("erlang", "term_to_binary", 2),
+        ("erlang", "external_size", 1),
+        ("erlang", "external_size", 2),
+    ] {
+        assert!(
+            module_observes_its_call_site(&module_importing(&[observant])),
+            "{observant:?} reads the call site"
+        );
+    }
+    // The same *names* in a foreign module, and a different arity of the same name, are not
+    // the runtime's call-site-reading BIFs.
+    for ordinary in [
+        ("erlang", "load_nif", 1),
+        ("erlang", "load_nif", 3),
+        ("erlang", "term_to_binary", 0),
+        ("erlang", "term_to_binary", 3),
+        ("some_module", "load_nif", 2),
+        ("some_module", "term_to_binary", 1),
+        ("erlang", "+", 2),
+        ("erlang", "send", 2),
+    ] {
+        assert!(
+            !module_observes_its_call_site(&module_importing(&[ordinary])),
+            "{ordinary:?} must not make a module site-observant"
+        );
+    }
+    // The predicate is "any import matches", not "the first does".
+    assert!(module_observes_its_call_site(&module_importing(&[
+        ("erlang", "+", 2),
+        ("lists", "map", 2),
+        ("erlang", "external_size", 2),
+    ])));
+    assert!(!module_observes_its_call_site(&module_importing(&[])));
+}

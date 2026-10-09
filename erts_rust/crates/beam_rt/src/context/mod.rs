@@ -1332,6 +1332,31 @@ impl ExecutionContext for RuntimeContext<'_> {
             return result.map_err(error::enforce_term_heap_limit);
         }
         if self.runtime.registry.contains(module, function, arity) {
+            // A table-creating `ets:new/2` is observed here so the runtime's owner index can
+            // release the table when its creator dies (see `crate::runtime::ets_owner`). Only
+            // a `named_table` is reachable through the registry's *public* surface, so only it
+            // is indexed: the handle is resolved by the name registration the call newly made
+            // (a `before`/`after` `lookup_name` delta distinguishes a real registration from a
+            // pre-existing name or an unnamed table that merely carries the same name).
+            if module == "ets" && function == "new" && arity == 2 {
+                let name = args
+                    .first()
+                    .copied()
+                    .filter(|term| beam_term::is_atom(*term))
+                    .map(beam_term::atom_val);
+                let before = name.and_then(|atom| self.runtime.tables.borrow().lookup_name(atom));
+                let result = self.call_registered(module, function, arity, args);
+                if let (Some(atom), Ok(_)) = (name, &result) {
+                    let after = self.runtime.tables.borrow().lookup_name(atom);
+                    if let Some(handle) = after.filter(|handle| Some(*handle) != before) {
+                        self.runtime
+                            .ets_owners
+                            .borrow_mut()
+                            .record(self.mailbox_pid, handle, atom);
+                    }
+                }
+                return result;
+            }
             return self.call_registered(module, function, arity, args);
         }
         if module == "erlang" {
@@ -1381,9 +1406,13 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///   at dispatch, the *whole* module carrying a loaded NIF was excluded below —, a
     ///   registered `beam_bifs` name ([`Runtime::registry`]) or the `erlang` BIF namespace →
     ///   `Ok(None)`;
-    /// * a module that is **not already loaded** → `Ok(None)`: no load-on-demand here, so the
-    ///   first call keeps the synchronous [`Self::call_bif`] path (which loads the module) and
-    ///   every later call is in-machine;
+    /// * a module that is **not already loaded** is loaded on demand exactly as
+    ///   [`Self::call_bif`] does (so the callee's `receive` suspends *this* process in the
+    ///   first call too, not only the second); a load failure → `Ok(None)`, leaving
+    ///   [`Self::call_bif`] to reproduce the identical `undef` diagnostic. A module loaded
+    ///   that way whose own code reads the call site it runs at
+    ///   ([`module_observes_its_call_site`]) → `Ok(None)` as well, so the on-demand route
+    ///   never widens the caller-identity caveat documented above;
     /// * a callee whose code touches the machine's **float-register file** → `Ok(None)` (the
     ///   float guard — see [`crate::context::gc`]: the in-machine callee runs under the
     ///   caller's recorded module identity, so a collection over it could dangle a live float
@@ -1439,10 +1468,38 @@ impl ExecutionContext for RuntimeContext<'_> {
         if self.runtime.registry.contains(module, function, arity) {
             return Ok(None);
         }
-        // No load-on-demand: the first call to an unloaded module goes through `call_bif`,
-        // which loads it and caches it; only an already-loaded module is entered here.
-        let Some(callee) = self.runtime.code_server.module_handle(module) else {
-            return Ok(None);
+        // Resolve the callee's module handle. A module that is **already cached** is entered
+        // here exactly as before; an uncached one is loaded **on demand**, exactly as
+        // [`Self::call_bif`] does, so the *first* call to a module runs in this machine too.
+        // Without that, a `receive` inside the callee would fold into `error::blocked()` at the
+        // call site — which is the A.9 boot blocker: `proc_lib:sync_start/2` waits in a module
+        // its caller has not touched yet, so the first `call_ext` into it is the blocking one.
+        //
+        // The load is the same `find_module_file` + `CodeServer::load` pair [`Self::call_bif`]
+        // runs, and it hands back the very same `Arc<Module>` the code server caches, so the
+        // handle the engine keeps (and reuses for a suspended frame's return) is the one a later
+        // call resolves to. A load failure returns `Ok(None)`: [`Self::call_bif`] then loads
+        // again and reports the identical `undef` for a genuinely missing/malformed module, so
+        // the seam never changes that diagnostic.
+        let callee = match self.runtime.code_server.module_handle(module) {
+            Some(callee) => callee,
+            None => {
+                let _ = self.runtime.find_module_file(module);
+                let Ok(callee) = self.runtime.code_server.load(module) else {
+                    return Ok(None);
+                };
+                // A module loaded **on demand here** is the only case this seam changes (it
+                // used to take the synchronous path), and an in-machine callee runs under the
+                // **caller's** recorded `current_module` (see the NIF exclusion above). Entering
+                // a module whose own code *reads* that call site would therefore be new
+                // exposure, so it keeps the synchronous [`Self::call_bif`] path — byte for byte
+                // its behaviour before this seam loaded it. An already-cached module is
+                // untouched by this check: entering it here is its pre-existing behaviour.
+                if module_observes_its_call_site(&callee) {
+                    return Ok(None);
+                }
+                callee
+            }
         };
         // The **float guard** (see [`crate::context::gc`]): a module whose code touches the
         // machine's float-register file must never be collected over — `Machine::fr` holds
@@ -1698,4 +1755,45 @@ impl ExecutionContext for RuntimeContext<'_> {
     fn trace_event(&mut self, event: beam_engine::TraceEvent<'_>) {
         self.execution_trace_event(event);
     }
+}
+
+/// Whether `module`'s **own code** can read the call site it runs at, i.e. whether it imports a
+/// BIF whose answer depends on [`RuntimeContext::current_module`].
+///
+/// The engine's cross-module call seam ([`ExecutionContext::resolve_external_call`]) runs a
+/// callee inside the **caller's** machine, and the engine's module-context switch never re-enters
+/// this context, so a callee keeps the caller's `current_module`. The two imported BIFs that
+/// *read* that identity are:
+///
+/// * `erlang:load_nif/2` — the module a NIF library is registered under, which the library's own
+///   `ErlNifEntry.name` is validated against: a stale identity is the oracle's `bad_lib` (and it
+///   is why a module carrying a *loaded* NIF is excluded from the seam altogether);
+/// * `erlang:term_to_binary/1,2` and `erlang:external_size/1,2` — the `NEW_FUN_EXT` identity
+///   (module atom, module MD5, `old_index`/`old_uniq`) of a **local** fun argument, which
+///   [`FunIdentityBridge`] derives from the calling module: a stale identity would name the wrong
+///   module.
+///
+/// The other `current_module` readers cannot be made wrong by a callee's stale identity:
+/// `records:get_definition/2` resolves its module from its **argument** ([`RecordBridge`] holds no
+/// call-site state at all), and the GC float guard ([`crate::context::gc`]) / the trace
+/// global-pattern approximation only use it conservatively.
+///
+/// The scan is over the module's `ImpT` table ([`Module::imports`]), which is where a compiled
+/// `M:F/A` call is recorded. A call reached only through `apply/3` is not covered — that is the
+/// documented residual, and it is no wider than the exposure the seam already had for a module
+/// that was cached before the call.
+///
+/// [`ExecutionContext::resolve_external_call`]: beam_engine::ExecutionContext::resolve_external_call
+/// [`Module::imports`]: beam_loader::Module::imports
+pub(crate) fn module_observes_its_call_site(module: &Module) -> bool {
+    module.imports.iter().any(|import| {
+        module.atom_name(import.module) == Some("erlang")
+            && match module.atom_name(import.function) {
+                Some("load_nif") => import.arity == 2,
+                Some("term_to_binary") | Some("external_size") => {
+                    import.arity == 1 || import.arity == 2
+                }
+                _ => false,
+            }
+    })
 }
