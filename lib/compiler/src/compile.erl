@@ -3281,9 +3281,6 @@ options() ->
     %% List them explicitly so that they show up in --help.
     help([{iff,loop_opt,  {ssa_opt_loop_opt,fun(_) -> ok end}},
           {iff,loop_arith_licm,{ssa_opt_loop_arith_licm,fun(_) -> ok end}},
-          {iff,loop_unroll,{ssa_opt_loop_unroll,fun(_) -> ok end}},
-          {iff,loop_index_narrowing,
-           {ssa_opt_loop_index_narrowing,fun(_) -> ok end}},
           {iff,fusion_opt,{ssa_opt_fus,     fun(_) -> ok end}},
           {iff,fbip_opt,  {ssa_opt_fbip,    fun(_) -> ok end}}]),
     %% Likewise for the opt-in SSA pass budget/watchdog and eligibility
