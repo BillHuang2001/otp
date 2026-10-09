@@ -116,11 +116,8 @@ and stops at **instruction 20** (0-based), `{apply,{c,erlangrc,[]}}`. The tail's
 `{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`, **15**
 `{progress,init_kernel_started}`, **16** `{apply,{application,load,[{application,stdlib,Props}]}}`,
 **17** `{progress,applications_loaded}`, **18**/ **19**
-`{apply,{application,start_boot,[{application,kernel|stdlib,Props},permanent]}}`, **20** the stop below,
-**21** `{progress,started}`.
-```
-{apply,{c,erlangrc,[]}}
-```
+`{apply,{application,start_boot,[{application,kernel|stdlib,Props},permanent]}}`, **20**
+`{apply,{c,erlangrc,[]}}` (the stop), **21** `{progress,started}`.
 - **The CLI and the in-crate executor stop at the same directive, with the same exit class.** The CLI
   (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **1** with
   `{noproc,{gen_server,call,[file_server_2,{open,"$HOME/.erlang",[read]},infinity]}}` — `file_server_2`
@@ -190,6 +187,16 @@ short form is the safe one. Repro:
   keep their existing semantics/return types; `boot()` stays idempotent and returns `Result<()>`;
   `execute_reporting` is purely additive (`execute` keeps its signature).
 - **Drives stay bounded** — an exhausted deadline is an honest typed error, never a spin.
+- **The `DRIVE_DEADLINE` bounds the outer drive, not a nested blocking pump.** A
+  `{kernelProcess, …}` burst and an `{apply, …}`'s `Wait` arm both go through
+  `drive_scheduler`, which checks the deadline between slices. An execution that suspends
+  *inside* a `RuntimeContext` blocking pump instead — `RunOutcome::Wait` handled by
+  `run_export_blocking`/`run_label_blocking` (`../context/mod.rs`) — loops until the machine
+  returns or a pump reports `0`, with no wall-clock cap, so a perpetually runnable process on
+  the queue would keep that pump going. On the real `start.boot` every boot-spawned process is
+  parked in a `receive`, so the queue drains and the pump returns; the gap is a latent one for
+  a boot chain that would spawn a busy process. The cap belongs in `../context/mod.rs` (this
+  node's, but not `src/boot/**`).
 - `bootscript.rs` is ~1690 lines (production ~700) with its oracle test module; `drive.rs` is ~380 lines.
   `#![deny(unsafe_code)]`; no `unwrap()` on runtime data.
 
