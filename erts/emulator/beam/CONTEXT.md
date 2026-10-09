@@ -205,6 +205,7 @@ The mandate is to delete it **module by module as Rust parity is proven** — ne
 - **CI gate scope**: `.github/workflows/erts_rust.yml` (path-triggered only on `erts_rust/**` + its own file) DOES build/test the Rust workspace and run `erts_rust/tools/differential/gate.sh`. It is deliberately separate from `main.yaml`/the OTP build — `main.yaml` and `path-filters.sh` have no `erts_rust` entry, so an `erts_rust`-only change gates nothing in the OTP build — and its `cargo test` step currently fails on a pre-existing `beam_gc` test. Parity verdicts are therefore still only as good as the last gate run: treat every verdict as stale until re-proven.
 ### Mechanical result
 - Checker reports `deletable: 0`; nothing here is mechanically unreferenced except the exempt vendored 3PP and CT fixtures.
+- Independent object-list cross-check (grep `$(OBJDIR)/<stem>.o` out of `../Makefile.in`): all 107 `beam/*.c` map to an explicit object-list entry (COMMON_OBJS/JIT_OBJS/EMU_OBJS/RUN_OBJS/LTTNG_OBJS/NIF_OBJS/DRV_OBJS/OS_OBJS/ESOCK_*_OBJS) — 0 missing, 0 `beam/*.c` present-but-unlisted. All 97 `beam/*.h` are `#include`d somewhere. Nothing in this directory is deletable.
 - Deleted in this pass: `../drivers/unix/bin_drv.c` (227 lines) — unreferenced by every `Makefile`, `#include` and symbol; `driver_tab.c` is generated only from `$(DRV_OBJS)`, so it was never linked (proof in the commit message). Previously removed: `../drivers/unix/{multi_drv,sig_drv}.c`, `../sys/unix/vxworks_resolv.c`.
 
 ## Known Issues / Gotchas
