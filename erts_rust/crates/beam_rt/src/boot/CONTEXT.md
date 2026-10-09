@@ -147,13 +147,13 @@ configuration and it runs **all 22 directives to completion**, ending at the fin
   and delivers the reply (counted into the pass's `delivered` by `service_file_requests`), and the call
   resumes — so the drive does not take its `ran == 0` (nothing happened) fold.
 
-### A `-boot` value's shape changes the observed stop (owner: `beam_engine` — handoff)
-The stop is a function of the whole command line, and the `-boot` **value's byte length** perturbs it on
-a knife edge: the short canonical form (`<repo>/bootstrap/bin/start`, ~71 chars) carries the script
-cleanly to instruction 20, while a slightly longer value — or one with a non-canonical segment (`.`, `..`,
-a doubled `/`), which shifts the byte count just as a longer name does — makes the runtime exit **1** with
-the raw `beam_rt: allocation failure: message (<garbage> bytes)` instead of the honest `{noproc,…}` (the
-count is deterministic for a given argv but varies with it: `21096`, `42408`, `17123030415440`, …).
+### A `-boot` value's shape can defeat the boot (owner: `beam_engine` — handoff)
+The boot's outcome is a function of the whole command line, and the `-boot` **value's byte length**
+perturbs it on a knife edge: the short canonical form (`<repo>/bootstrap/bin/start`, ~71 chars) carries
+the script cleanly to completion, while a slightly longer value — or one with a non-canonical segment
+(`.`, `..`, a doubled `/`), which shifts the byte count just as a longer name does — makes the runtime
+exit **1** with the raw `beam_rt: allocation failure: message (<garbage> bytes)` (the count is
+deterministic for a given argv but varies with it: `21096`, `42408`, `17123030415440`, …).
 `$P/bootstrap/bin/start` (71) is fine, `$P/bootstrap/./bin/start` (74) fails, and a padded long canonical
 path fails too — so it is heap layout, not path semantics. Pinned by inspection to `beam_engine`'s
 structured-raise path: `Machine::throw_with_stacktrace` (`machine/catch.rs`) attaches a `LiveReason` over
@@ -162,8 +162,8 @@ a term whose source heap frame is already gone, and a later copy (`beam_process`
 therefore builds its `-boot` value from `CARGO_MANIFEST_DIR`'s ancestors (`start_boot()`), whose canonical
 short form is the safe one. Repro:
 `ERL_CRASH_DUMP_SECONDS=0 beam_rt -noshell -boot "$PWD/bootstrap/./bin/start"` →
-`beam_rt: allocation failure: message (…)`; `… -boot "$PWD/bootstrap/bin/start"` → the `file_server_2`
-`noproc`.
+`beam_rt: allocation failure: message (…)`; `… -boot "$PWD/bootstrap/bin/start"` → the boot completes
+(exit 0).
 
 ### Remaining blocker chain (owner per link)
 1. **`beam_rt` / `kernel` (owner: the parent node, not `src/boot/**`) — no `file_server_2`.** The stop
