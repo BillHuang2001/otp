@@ -573,7 +573,7 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`
+- `src/kind.rs` → `TableKind`, `SetInterior`/`OrderedInterior`, `Access`, `Concurrency`, `WriteConcurrency`, `TableOptions` (incl. heir + `decentralized_counters`), `can_read`/`can_write`; unit tests in `src/kind/tests.rs`
 - `src/key.rs` → object/key validation (`key_of`, `is_valid_object`, `object_elements`)
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/relinquish/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
