@@ -104,63 +104,74 @@ registered but the directive has not resumed). A directive that has **already** 
 `unlink(a, a)` for a self-registering directive is the process table's documented no-op.
 
 ## Where the real `start.boot` stops now
-Execute the real script (`bootstrap/bin/start.boot`, 22 instructions) and it runs **instructions 0–15**
-(every `primLoad` batch and the three `kernelProcess` directives, each driven to its process's own
-registration) and stops at **instruction 16** (0-based). The tail's 0-based indices:
-**12** `{kernelProcess,heart,{heart,start,[]}}`, **13** `{kernelProcess,logger,{logger_server,start_link,[]}}`,
-**14** `{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`,
-**15** `{progress,init_kernel_started}`, **16** the `apply` below.
-
+Execute the real script (`bootstrap/bin/start.boot`, 22 instructions) and it runs **instructions 0–19**
+(every `primLoad` batch, the three `kernelProcess` directives and the three earlier `apply` directives)
+and stops at **instruction 20** (0-based), `{apply,{c,erlangrc,[]}}`. The tail's 0-based indices:
+**12** `{kernelProcess,heart,{heart,start,[]}}`, **13**
+`{kernelProcess,logger,{logger_server,start_link,[]}}`, **14**
+`{kernelProcess,application_controller,{application_controller,start,[KernelApp]}}`, **15**
+`{progress,init_kernel_started}`, **16** `{apply,{application,load,[{application,stdlib,Props}]}}`,
+**17** `{progress,applications_loaded}`, **18**/ **19**
+`{apply,{application,start_boot,[{application,kernel|stdlib,Props},permanent]}}`, **20** the stop below,
+**21** `{progress,started}`.
 ```
-{apply,{application,load,[{application,stdlib, Props}]}}
+{apply,{c,erlangrc,[]}}
 ```
-
-- **Failing operation:** `application:load/1`.
-- **Exit reason:** `unsupported: opcode: run: process blocked (no message available)` — the engine's
-  typed `beam_engine::blocked()`. The CLI (`beam_rt -noshell -boot bootstrap/bin/start`) prints exactly
-  `beam_rt: unsupported: opcode: run: process blocked (no message available)` and exits **3**. The
-  in-crate executor agrees: `BootStop::describe()` →
-  `boot script stopped at instruction 16/22: application:load/1: error unsupported_opcode: run: process blocked (no message available)`.
+- **The CLI and the in-crate executor stop at the same directive, with the same exit class.** The CLI
+  (`beam_rt -noshell -boot bootstrap/bin/start`, run from the repository root) exits **1** with
+  `{noproc,{gen_server,call,[file_server_2,{open,"$HOME/.erlang",[read]},infinity]}}` — `file_server_2`
+  is simply never registered, so `c:erlangrc/0`'s file consult fails. The in-crate executor
+  (`execute_reporting`) reports
+  `boot script stopped at instruction 20/22: c:erlangrc/0: exit <structured reason>` — the same
+  directive and the same exit class. `BootStop::describe` renders `BeamError`'s `Display`, which shows
+  `<structured reason>` for a term-carrying raise; the CLI's `reported_reason` renders the live reason
+  term itself.
+- **The configuration is part of the measurement.** The stop depends on the runtime's **complete**
+  configuration, above all the command line `init:get_arguments/0` reports. The executor tests build
+  their runtime with their own `system_runtime()` helper — the CLI's own parser (`crate::cli::parse`,
+  not `parse_with_env`: a test must not depend on `ERL_*FLAGS`) over the CLI argv
+  `beam_rt -noshell -boot bootstrap/bin/start` — because a `RuntimeConfig::default()` runtime (an empty
+  `init_args`) stops at a **different** instruction (16, `application:load/1`) with the
+  `application_controller` gone. Two configurations producing two different stops for the *same* script
+  under the *same* executor is a runtime bug, not a boot-script one (see "Runtime fragility" below).
 - **The kernel processes are ready when the stop is reached.** The three `{kernelProcess, …}` bursts
   drive until their directive's MFA returns, so `whereis(application_controller)` answers a live,
   registered server — the directive ran `application_controller:start/1` to its `{ok, AC}` return
   (`application_controller.erl:203-211`), i.e. the AC completed `init/2` (`:531-558`) and reached
   `gen_server:enter_loop`. `heart` and `logger` are not registered — both legitimately (heart returns
-  `ignore`; logger never reaches registration). Instructions 17–21 are unreached.
-- **The stop's fold is NOT `apply_boot_call`'s `RunOutcome::Wait` arm.** `application:load/1` never
-  reaches it: the top-level `run_export_outcome` returns the typed `blocked()` as an **`Err`** (its
-  `Raise` reason atom is `unsupported_opcode: run: process blocked (no message available)`, stacktrace
-  empty), so no `Wait { func, pc }` is ever produced (`drive.rs::apply_boot_call`'s `Wait` arm and its
-  `ran == 0` fold are unreached on this path).
+  `ignore`; logger never reaches registration). Instruction 21 is unreached.
+- **The stop's fold is `apply_boot_call`'s ordinary dispatch, not its `RunOutcome::Wait` arm.**
+  `c:erlangrc/0` runs to the typed `noproc` exit inside the AC's `gen_server:call`, so no
+  `Wait { func, pc }` is produced and `apply_boot_call`'s `Wait` arm (and its `ran == 0` fold) is
+  unreached on this path.
+
+### Runtime fragility (owner: outside `src/boot/**` — handoff)
+The stop moves with the configuration's init-argument **text**, size-sensitively rather than
+content-sensitively: `["-noshell"]`, `["-noshell","-foo"]` and a long absolute `-boot` value stop at 16,
+while `["-noshell","-boot","bootstrap/bin/start"]`, `["-foo","bar"]` and `["-foo","ba"]` carry the same
+script to 20. The failing configurations differ in *how* they lose the `application_controller` during
+its own `init/2`:
+* most often a `func_info`-driven `function_clause` (its `Raise.stacktrace.frames` is **empty**, so the
+  raise is not localizable from the message) — `beam_engine`'s raise path;
+* at least once a **message copy** into the AC failing with the raw internal
+  `allocation failure: message (N bytes)` text (`AllocKind::Message`, the `beam_message` copy engine's
+  destination-heap exhaustion), which `Runtime` is documented to translate into `error:system_limit`
+  (`src/runtime.rs`). An out-of-scope integration test invokes the CLI with the absolute `START_BOOT`
+  stem and observes exactly this diagnostic with a **garbage byte count** (`17535695143944`) — an
+  owner-side bug in `beam_rt`'s `src/context`/`src/runtime.rs` glue over `beam_message`.
+The boot tests therefore pin the **CLI-equivalent** configuration: the reproducible one, and the one
+comparable to `beam_rt`'s own CLI.
 
 ### Remaining blocker chain (owner per link)
-1. **`beam_engine` + `beam_rt` / `src/context` — the fun-application seam cannot suspend (the stop).**
-   The `application:load/1` chain enters its blocking callees **in-machine**
-   (`resolve_external_call`/`Step::Enter`: `application_controller:load_application/1`, `gen_server:call/3`,
-   `gen:call/4` — none of them is a floor/NIF/registry name), but `gen:call/4` dispatches through
-   `gen:do_for_proc/2`, whose body is
-   `{call_fun2,{atom,safe},1,{tr,{x,1},…}}` (verified by disassembling `gen.erl` with the system `erlc`)
-   — a **fun application**, not a `call_ext`. `Instr::CallFun2`
-   (`beam_engine/src/families/funs/mod.rs:165-173`) delegates to
-   `ExecutionContext::apply_fun`, and `RuntimeContext::apply_fun`
-   (`src/context/mod.rs:1794-1804`) runs the local fun body through the **non-blocking**
-   `Machine::new().run_label(...)` (`beam_engine/src/machine/run.rs:71-76` `fold_outcome`), which folds
-   `do_call/4`'s `receive` into `error::blocked()`. **The trait signature is the limitation**:
-   `ExecutionContext::apply_fun` returns `Result<Eterm>` and has no `Step::Enter`-style outcome, so no
-   caller (and no `src/boot/**` wrapper context) can make a fun-bodied callee suspend —
-   `Instr::CallFun`/`CallFun2` must first enter the fun **in the caller's machine** (as
-   `Instr::Apply`'s `apply_target` already does via `ApplyTarget::Enter`), i.e.
-   `beam_engine`: a blocking-aware fun-call seam; `beam_rt`/`src/context`: implement it.
-2. **`beam_rt` / `./drive.rs::apply_boot_call` — ready for the next link, not the fold.** The top-level
-   `run_export_outcome` is the blocking-aware entry and its `Wait` arm drives the scheduler and resumes
-   the machine (`drive.rs`), so once link 1 lands the index-16 chain suspends there and the scheduler
-   can carry `gen:do_call/4`'s `receive` to the AC's reply. The `ran == 0` arm then legitimately means
-   "nothing left that could wake the receiver".
-3. **`beam_rt` / `tests/**` (owner: the parent node).** `tests/boot.rs::the_cli_reports_the_boot_scripts_honest_stop_as_a_typed_error`
-   (line 507) still asserts the OLD stop — exit **1** with `noproc` in stderr. The stop is
-   exit **3** with `unsupported: … blocked`; the assertion must be updated to the honest stop.
-4. Benign remnants for instruction 16: `heart:init/2`'s `catch start_portprogram()` does not contain
-   `check_start_heart/0`'s `throw(no_heart)`; `init:get_argument/1` is empty in the boot path.
+1. **`beam_rt` / `kernel` (owner: the parent node, not `src/boot/**`) — no `file_server_2`.** The stop
+   is `c:erlangrc/0`'s file consult needing the `file_server_2` registered kernel server, which this
+   runtime never registers (it is a child of `kernel`'s `file_server`, started by the full
+   `application:start_boot` path this runtime does not complete).
+2. **`beam_engine`.** `Instr::Apply`/`ApplyLast` (`families/funs.rs::apply_target`) dispatch through the
+   synchronous `call_bif` instead of the `resolve_external_call`/`Step::Enter` seam, so
+   `proc_lib:init_p/5`'s `try apply(M,F,A) catch … end` cannot suspend; and a `func_info`-driven raise
+   carries an EMPTY `Raise.stacktrace.frames`, so a boot-path `function_clause` is unlocalizable.
+3. **`beam_bifs`.** Whatever the started applications still need past the above.
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
@@ -211,7 +222,10 @@ registration) and stops at **instruction 16** (0-based). The tail's 0-based indi
 - `../runtime.rs`: `boot_is_idempotent_and_reports_itself` pins `preloaded_loaded()` = the whole registry.
 - `../tests/boot.rs` (integration, owned by the parent node): the real-script stop, the `-boot` CLI drive
   and the preloaded-only default. NOTE: `the_cli_reports_the_boot_scripts_honest_stop_as_a_typed_error`
-  currently asserts the stale exit-1/`noproc` stop and fails against the current exit-3/`blocked` stop.
+  (out of scope) invokes the CLI with the **absolute** `START_BOOT` stem and asserts exit 1 with `noproc`
+  in stderr; that argv lands in the "Runtime fragility" configuration above, where the CLI reports
+  `beam_rt: allocation failure: message (<garbage> bytes)` instead (still exit 1, so only its `noproc`
+  assertion fails).
 
 ## Routing Table
 - `../boot.rs` → registry + core-atom seed + banner (module root; also `mod preloaded` + `mod bootscript` + `mod drive`)
