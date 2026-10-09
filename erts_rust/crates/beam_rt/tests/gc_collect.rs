@@ -52,7 +52,7 @@
 //! **arena**. `Runtime::gc_stats().fallbacks` is the
 //! counter that makes that visible, and it is the number to read when a workload's resident
 //! memory still grows with its input (`tests/gc_collect.rs` covers the armed path only; the
-//! `foreign` benchmark workload is the cross-module case).//!
+//! `foreign` benchmark workload is the cross-module case).
 //! # Fixtures
 //!
 //! `tests/fixtures/gc_loop.beam`, `gc_ints.beam` and `gc_floats.beam` are committed `.beam`
