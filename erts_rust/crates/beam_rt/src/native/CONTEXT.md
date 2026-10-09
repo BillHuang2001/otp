@@ -344,6 +344,11 @@ from the open mode) and `{put_chars,Enc,Chars}`. Every other request is the type
 - `memory/tests.rs` pins the `process_info` reply shapes, the failure modes, the `unsupported` set,
   and the oracle `registered_name` wrapping rules (the root pid is registered as `init`, so a test
   can `unregister` it to reach the live-unregistered case).
+- `file_server.rs`'s colocated units pin the wire decoders (`improper_list_head`'s `[alias|Ref]`
+  detection, `seek_from`'s `bof`/`cur`/`eof`/bare-integer forms, `iodata_bytes`, `tuple_fields`),
+  the errno→atom table and the `binary`/`list` open-mode parse; the service is proven end to end over
+  real temporary files/directories by `../tests/file_server.rs` (every rendering cross-checked
+  against the live `erl`).
 - **Oracle values** are quoted in each test's doc comment and were re-verified against the system
   `erl` (`erl -noshell -eval '…'`, OTP 29.1.1 / erts-17.1). Where the runtime answers a typed
   capability gap the oracle answers a value, the test pins the `unsupported` outcome with a
