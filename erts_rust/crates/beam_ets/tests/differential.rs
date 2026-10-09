@@ -80,8 +80,11 @@
 //! counter-incapable kinds, and a threshold/default combination); `update_element/3`;
 //! `lookup_element/3,4`; `select/2`
 //! with variables/wildcards/literals/guards (comparison, type test,
-//! `andalso`/`orelse`) and bodies (`'$_'`, `'$$'`, `'$N'`, constants, `{{…}}`
-//! construction) — incl. a whole `fun2ms`-shaped spec family
+//! `andalso`/`orelse`, `/`, `float/1`, `element/2`, `abs/1` over a small integer
+//! and a float, the map guards `map_size/1`/`is_map_key/2`/`map_get/2`,
+//! `tuple_size/1`, `byte_size/1`, `bit_size/1`) and bodies (`'$_'`, `'$$'`,
+//! `'$N'`, constants, `{{…}}` construction, map construction) — incl. a whole
+//! `fun2ms`-shaped spec family
 //! (`select`/`select_count`/`select_replace`/`select_delete`/`match`/`match_object`/
 //! `match_spec_run`); `select_delete/2`+`select_count/2`; the `match` family;
 //! malformed specs (`badarg`); `ets:match_spec_run/2` (variable/whole-element/
@@ -188,6 +191,15 @@
 //!   `delete_all_objects/1` leave only an observable trace (`size`, `member`,
 //!   `lookup`, `tab2list`); `memory` and the table `id` are never rendered
 //!   (`reclamation_observable`).
+//! * **A guard that is the runtime's own capability gap is *not* swallowed.**
+//!   `erl` runs match-spec arithmetic through the ordinary BIFs, so `/` (whose
+//!   Erlang result is always a float) and any float/bignum operand answer a
+//!   float/bignum. This crate's `DefaultArithHook` has no float/bignum arithmetic
+//!   and answers the typed `unsupported_ets` raise, which the guard path
+//!   propagates (only the oracle's own `badarg` skips a clause) — so
+//!   `select_guard_div` and `select_guard_float_arith` are the two recorded
+//!   [`KNOWN_DIVERGENCES`], rendered honestly through `cap_select` rather than
+//!   silently under-matching. Every other new guard/body construct agrees.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -441,10 +453,21 @@ const EXPECTED: &[(&str, &str)] = &[
     ("select_guard_comparison", "[2,3]"),
     ("select_guard_typetest", "[2]"),
     ("select_guard_andalso_orelse", "{[1,2],[1,3]}"),
+    ("select_guard_div", "ok:[2]"),
+    ("select_guard_float", "ok:[2]"),
+    ("select_guard_element", "ok:[2,3]"),
+    ("select_guard_abs", "{ok:[2,3],ok:[1]}"),
+    ("select_guard_map_size", "ok:[1]"),
+    ("select_guard_is_map_key", "ok:[1]"),
+    ("select_guard_map_get", "ok:[1]"),
+    ("select_guard_tuple_size", "ok:[1]"),
+    ("select_guard_size_family", "ok:[1]"),
+    ("select_guard_float_arith", "ok:[2]"),
     ("select_body_whole", "[{1,a,10},{2,b,20}]"),
     ("select_body_var", "[1,2]"),
     ("select_body_const", "[ok,ok]"),
     ("select_body_construct", "[{1,a},{2,b}]"),
+    ("select_body_map_construct", "ok:[10,20]"),
     ("select_delete_and_count", "{0,0,2,2,1,[1]}"),
     (
         "match_family",
@@ -686,13 +709,37 @@ fn expected_map() -> BTreeMap<String, String> {
 /// in the battery (rather than dropping them) keeps the oracle's real behaviour in
 /// `EXPECTED` and the gap actionable.
 ///
-/// **Currently empty**: the whole battery agrees with the live oracle, so every
-/// case is compared strictly. (The single former entry, `ordered_float_key_order`,
-/// recorded `ordered_set` grouping every integer before every float; it was fixed
-/// by ordering keys with `compare::cmp_arith` — ERTS's arithmetic key order — so
-/// the case now agrees and is compared strictly.)
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[];
-
+/// Both entries are the **same typed capability gap**: match-spec arithmetic
+/// outside the small-integer subset. The C runs every arithmetic operator through
+/// the ordinary BIFs, so a `/` (whose Erlang result is *always* a float) or any
+/// float/bignum operand answers a float/bignum; this crate's `DefaultArithHook`
+/// has no float/bignum arithmetic and deliberately answers the typed
+/// `unsupported_ets` raise instead of guessing (workspace `CONTEXT.md` §3 — never
+/// a wrong result). In a **guard** the error is not swallowed: `guards_hold`
+/// propagates everything but the oracle's own `badarg`, so `select` fails and
+/// [`Battery::cap_select`] renders `error:unsupported_ets: …` where the oracle
+/// renders the selected keys. A real runtime installs a full `ArithHook`
+/// (`set_arith_hook`), which is what closes both cases.
+const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
+    (
+        "select_guard_div",
+        "the `/` match-spec operator: Erlang's result is always a float, so \
+         DefaultArithHook answers the typed `unsupported_ets` instead of a \
+         fabricated small integer, and a guard propagates it (no silent \
+         under-match). The oracle selects `ok:[2]`; beam_ets renders \
+         `error:unsupported_ets: match-spec arithmetic '/': the result is a float`. \
+         Closed by installing a full ArithHook.",
+    ),
+    (
+        "select_guard_float_arith",
+        "match-spec arithmetic with a float operand (`{'*', '$2', 1.5}`): \
+         DefaultArithHook is small-integer only, so the operand is the typed \
+         `unsupported_ets` rather than a guessed value, and the guard propagates \
+         it. The oracle selects `ok:[2]`; beam_ets renders \
+         `error:unsupported_ets: match-spec arithmetic '*': operand 2 is not a \
+         small integer`. Closed by installing a full ArithHook.",
+    ),
+];
 /// `true` when `name` is a recorded divergence.
 fn is_known_divergence(name: &str) -> bool {
     KNOWN_DIVERGENCES.iter().any(|(case, _)| *case == name)

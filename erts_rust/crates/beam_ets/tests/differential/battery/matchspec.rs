@@ -135,6 +135,276 @@ impl Battery {
         tuple_of(&[self.inorder(&first), self.inorder(&second)])
     }
 
+    /// `{'==', {'/', '$2', 2}, 10.0}` — the `/` operator in a guard.
+    ///
+    /// `/` always yields a **float** in Erlang, and `DefaultArithHook` refuses it
+    /// (`unsupported_ets`) rather than guessing a small integer, so `beam_ets`
+    /// propagates the typed error instead of silently under-matching — rendered by
+    /// [`Battery::cap_select`] as `error:unsupported_ets: …`. A **recorded
+    /// divergence** (`tests/differential.rs::KNOWN_DIVERGENCES`).
+    fn select_guard_div(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        for key in [1i64, 2, 3] {
+            let object = self.object(key, key * 10);
+            table.insert(object, &self.atoms).expect("insert");
+        }
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let div = self.atom("/");
+        let half = self.tuple(&[div, v2, make_small(2)]);
+        let ten = self.float(10.0);
+        let guard = self.tuple(&[arith_eq, half, ten]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'==', {float, '$2'}, 20.0}` — `float/1` in a guard, over a small integer
+    /// and over a float value (both round to the same `f64` the guard compares
+    /// against).
+    fn select_guard_float(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let first = self.ints(&[1, 10]);
+        let value = self.float(20.0);
+        let second = self.tuple(&[make_small(2), value]);
+        let third = self.ints(&[3, 30]);
+        for object in [first, second, third] {
+            table.insert(object, &self.atoms).expect("insert");
+        }
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let float_fn = self.atom("float");
+        let call = self.tuple(&[float_fn, v2]);
+        let twenty = self.float(20.0);
+        let guard = self.tuple(&[arith_eq, call, twenty]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'>', {element, 3, '$_'}, 15}` — `element/2` applied to the whole object
+    /// (`'$_'` is an ordinary expression outside a head).
+    fn select_guard_element(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        for (key, letter, value) in [(1i64, "a", 10i64), (2, "b", 20), (3, "c", 30)] {
+            let letter = self.atom(letter);
+            let object = self.tuple(&[make_small(key), letter, make_small(value)]);
+            table.insert(object, &self.atoms).expect("insert");
+        }
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let v3 = self.atom("$3");
+        let head = self.tuple(&[v1, v2, v3]);
+        let gt = self.atom(">");
+        let element = self.atom("element");
+        let whole = self.atom("$_");
+        let call = self.tuple(&[element, make_small(3), whole]);
+        let guard = self.tuple(&[gt, call, make_small(15)]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `abs/1` in a guard, over a small integer (`{'>', {abs,'$2'}, 15}`) and over
+    /// a float (`{'==', {abs,'$2'}, 10.0}`).
+    fn select_guard_abs(&mut self) -> String {
+        let mut integer_table = self.table(TableKind::OrderedSet, 1);
+        for (key, value) in [(1i64, -10i64), (2, 20), (3, -30)] {
+            let object = self.object(key, value);
+            integer_table.insert(object, &self.atoms).expect("insert");
+        }
+        let mut float_table = self.table(TableKind::OrderedSet, 1);
+        let negative = self.float(-10.0);
+        let first = self.tuple(&[make_small(1), negative]);
+        let positive = self.float(20.0);
+        let second = self.tuple(&[make_small(2), positive]);
+        float_table.insert(first, &self.atoms).expect("insert");
+        float_table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let abs = self.atom("abs");
+        let call = self.tuple(&[abs, v2]);
+        let body = self.list(&[v1]);
+
+        let gt = self.atom(">");
+        let int_guard = self.tuple(&[gt, call, make_small(15)]);
+        let int_guards = self.list(&[int_guard]);
+        let int_spec = self.spec(head, int_guards, body);
+
+        let arith_eq = self.atom("==");
+        let ten = self.float(10.0);
+        let float_guard = self.tuple(&[arith_eq, call, ten]);
+        let float_guards = self.list(&[float_guard]);
+        let float_spec = self.spec(head, float_guards, body);
+
+        let ints = self.cap_select(&integer_table, int_spec);
+        let floats = self.cap_select(&float_table, float_spec);
+        tuple_of(&[ints, floats])
+    }
+
+    /// `{'==', {map_size, '$2'}, 2}` — `map_size/1` over stored flat maps.
+    fn select_guard_map_size(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let key_a = self.atom("a");
+        let key_b = self.atom("b");
+        let two_keys = self.map(&[(key_a, make_small(1)), (key_b, make_small(2))]);
+        let first = self.tuple(&[make_small(1), two_keys]);
+        let one_key = self.map(&[(key_a, make_small(1))]);
+        let second = self.tuple(&[make_small(2), one_key]);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let map_size = self.atom("map_size");
+        let call = self.tuple(&[map_size, v2]);
+        let guard = self.tuple(&[arith_eq, call, make_small(2)]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{is_map_key, a, '$2'}` — the key test, `true` only for the map holding `a`.
+    fn select_guard_is_map_key(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let key_a = self.atom("a");
+        let key_b = self.atom("b");
+        let with_a = self.map(&[(key_a, make_small(10))]);
+        let first = self.tuple(&[make_small(1), with_a]);
+        let with_b = self.map(&[(key_b, make_small(20))]);
+        let second = self.tuple(&[make_small(2), with_b]);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let is_map_key = self.atom("is_map_key");
+        let guard = self.tuple(&[is_map_key, key_a, v2]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'==', {map_get, a, '$2'}, 10}` — `map_get/2` with a present key, and with
+    /// an absent key (which raises `badarg` ⇒ the clause is skipped).
+    fn select_guard_map_get(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let key_a = self.atom("a");
+        let key_b = self.atom("b");
+        let with_a = self.map(&[(key_a, make_small(10))]);
+        let first = self.tuple(&[make_small(1), with_a]);
+        let with_b = self.map(&[(key_b, make_small(20))]);
+        let second = self.tuple(&[make_small(2), with_b]);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let map_get = self.atom("map_get");
+        let call = self.tuple(&[map_get, key_a, v2]);
+        let guard = self.tuple(&[arith_eq, call, make_small(10)]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'==', {tuple_size, '$2'}, 3}` — `tuple_size/1` over stored tuples.
+    fn select_guard_tuple_size(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let a = self.atom("a");
+        let b = self.atom("b");
+        let c = self.atom("c");
+        let triple = self.tuple(&[a, b, c]);
+        let first = self.tuple(&[make_small(1), triple]);
+        let pair = self.tuple(&[a, b]);
+        let second = self.tuple(&[make_small(2), pair]);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let tuple_size = self.atom("tuple_size");
+        let call = self.tuple(&[tuple_size, v2]);
+        let guard = self.tuple(&[arith_eq, call, make_small(3)]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'andalso', {'==', {byte_size,'$2'}, 3}, {'==', {bit_size,'$2'}, 24}}` —
+    /// the two bitstring size guards over stored binaries.
+    fn select_guard_size_family(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let three = self.binary(b"abc");
+        let first = self.tuple(&[make_small(1), three]);
+        let two = self.binary(b"ab");
+        let second = self.tuple(&[make_small(2), two]);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let byte_size = self.atom("byte_size");
+        let byte_call = self.tuple(&[byte_size, v2]);
+        let byte_guard = self.tuple(&[arith_eq, byte_call, make_small(3)]);
+        let bit_size = self.atom("bit_size");
+        let bit_call = self.tuple(&[bit_size, v2]);
+        let bit_guard = self.tuple(&[arith_eq, bit_call, make_small(24)]);
+        let andalso = self.atom("andalso");
+        let conjunction = self.tuple(&[andalso, byte_guard, bit_guard]);
+        let guards = self.list(&[conjunction]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
+    /// `{'==', {'*', '$2', 1.5}, 30.0}` — match-spec arithmetic with a **float**
+    /// operand, which `DefaultArithHook` refuses (`unsupported_ets`) rather than
+    /// guessing. A **recorded divergence**
+    /// (`tests/differential.rs::KNOWN_DIVERGENCES`).
+    fn select_guard_float_arith(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        for key in [1i64, 2] {
+            let object = self.object(key, key * 10);
+            table.insert(object, &self.atoms).expect("insert");
+        }
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let arith_eq = self.atom("==");
+        let star = self.atom("*");
+        let factor = self.float(1.5);
+        let product = self.tuple(&[star, v2, factor]);
+        let thirty = self.float(30.0);
+        let guard = self.tuple(&[arith_eq, product, thirty]);
+        let guards = self.list(&[guard]);
+        let body = self.list(&[v1]);
+        let spec_term = self.spec(head, guards, body);
+        self.cap_select(&table, spec_term)
+    }
+
     fn select_body_whole(&mut self) -> String {
         let mut table = self.table(TableKind::OrderedSet, 1);
         for (key, letter, value) in [(1i64, "a", 10i64), (2, "b", 20)] {
@@ -209,6 +479,25 @@ impl Battery {
         self.inorder(&selected)
     }
 
+    /// A map **constructed in a body** from the bound variables
+    /// (`#{'$1' => '$2'}`), read back with `map_get/2` so the clause value stays a
+    /// small integer — the canonical renderer has no map clause.
+    fn select_body_map_construct(&mut self) -> String {
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        let first = self.object(1, 10);
+        let second = self.object(2, 20);
+        table.insert(first, &self.atoms).expect("insert");
+        table.insert(second, &self.atoms).expect("insert");
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let built = self.map(&[(v1, v2)]);
+        let map_get = self.atom("map_get");
+        let call = self.tuple(&[map_get, v1, built]);
+        let body = self.list(&[call]);
+        let spec_term = self.spec(head, NIL, body);
+        self.cap_select(&table, spec_term)
+    }
     fn select_delete_and_count(&mut self) -> String {
         let mut table = self.table(TableKind::OrderedSet, 1);
         for key in [1i64, 2, 3] {
@@ -649,12 +938,50 @@ pub(super) fn matchspec_cases(battery: &mut Battery) -> Vec<(String, String)> {
         "select_guard_andalso_orelse".into(),
         battery.select_guard_andalso_orelse(),
     ));
+    cases.push(("select_guard_div".into(), battery.select_guard_div()));
+    cases.push((
+        "select_guard_float".into(),
+        battery.select_guard_float(),
+    ));
+    cases.push((
+        "select_guard_element".into(),
+        battery.select_guard_element(),
+    ));
+    cases.push(("select_guard_abs".into(), battery.select_guard_abs()));
+    cases.push((
+        "select_guard_map_size".into(),
+        battery.select_guard_map_size(),
+    ));
+    cases.push((
+        "select_guard_is_map_key".into(),
+        battery.select_guard_is_map_key(),
+    ));
+    cases.push((
+        "select_guard_map_get".into(),
+        battery.select_guard_map_get(),
+    ));
+    cases.push((
+        "select_guard_tuple_size".into(),
+        battery.select_guard_tuple_size(),
+    ));
+    cases.push((
+        "select_guard_size_family".into(),
+        battery.select_guard_size_family(),
+    ));
+    cases.push((
+        "select_guard_float_arith".into(),
+        battery.select_guard_float_arith(),
+    ));
     cases.push(("select_body_whole".into(), battery.select_body_whole()));
     cases.push(("select_body_var".into(), battery.select_body_var()));
     cases.push(("select_body_const".into(), battery.select_body_const()));
     cases.push((
         "select_body_construct".into(),
         battery.select_body_construct(),
+    ));
+    cases.push((
+        "select_body_map_construct".into(),
+        battery.select_body_map_construct(),
     ));
     cases.push((
         "select_delete_and_count".into(),
