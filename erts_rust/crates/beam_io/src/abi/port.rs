@@ -662,10 +662,24 @@ impl Driver for DriverPort {
     ///
     /// The output queue is drained into `output`'s shape first (the port's single write path); when
     /// the entry has a `ready_output` slot the drained buffer has nowhere to go — the C callback
-    /// takes only the event — and the driver is expected to write what it stashed from `output`. An
-    /// absent `ready_output` slot falls back to the `output`/`outputv` write path, matching the C's
-    /// `no_ready_output_callback` default (`io.c:7524-7533`, which calls `(*drv->output)(prt->data,
-    /// NULL, 0)` — here the drained bytes are handed over instead, the port's whole write path).
+    /// takes only the event — so those queued bytes are dropped and the driver is expected to write
+    /// what it stashed from `output`. An absent `ready_output` slot falls back to the
+    /// `output`/`outputv` write path, so a driver *without* the slot still receives a queued command.
+    ///
+    /// # The C writes nothing here (the source of the `ready_output`-present gap)
+    ///
+    /// The C's `no_ready_output_callback` (`io.c:7531-7538`) does **not** call `output` — it only
+    /// reports the missing callback and deselects — because the C never routes a command through
+    /// `ready_output`: `port_command` hands the bytes to `output`/`outputv` directly
+    /// (`io.c:1782`/`io.c:1517`) and an `ERTS_PORT_TASK_OUTPUT` task only reports write-readiness
+    /// (`erl_port_task.c:1793-1797`), while a *deferred* write is a separate `PROC_SIG` task whose
+    /// callback is `port_sig_output` → `call_driver_output` (`io.c:1537-1553`).
+    /// This port instead carries the output queue itself, so `PortRegistry::port_command`
+    /// (`src/registry.rs`) defers the write to the `OUTPUT` task: that task is therefore the write
+    /// path for a slot-absent entry, but leaves a slot-present entry's queued command bytes
+    /// undelivered (the adapter can hand the slot the event only). Closing that gap belongs to the
+    /// command path (`PortRegistry::port_command`), not to this adapter — see
+    /// `src/abi/CONTEXT.md` › *Known Issues*.
     fn ready_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         let mut buf = ctx.output().front().to_vec();
         let len = buf.len();
