@@ -4003,3 +4003,116 @@ fn the_inlined_select_val_agrees_and_deopts_like_the_interpreter() {
         Some(make_small(10)),
     );
 }
+
+// ---------------------------------------------------------------------------
+// The inlined x-register exchange (`swap`) and the frame-less local tail call
+// (`call_only`) (`src/jit/cranelift/{inline,codegen}.rs`)
+// ---------------------------------------------------------------------------
+//
+// Both lower to control flow the tier already emits exactly: `swap` reads both
+// x-register slots to SSA values **before** storing them exchanged (so an aliasing
+// pair is a no-op, as the interpreter's read-both-then-write-both is), and `call_only`
+// is a `DISPATCH_REL` — i.e. exactly the `jump` lowering — with no frame to pop.
+
+/// `swap_pair/2` — `swap x0 x1; return` (returns the exchanged `x0`, i.e. the 2nd arg).
+fn swap_pair(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::Swap {
+            a: Operand::X(0),
+            b: Operand::X(1),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `swap_self/1` — `swap x0 x0; return`: the aliasing pair must be a no-op.
+fn swap_self(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::Swap {
+            a: Operand::X(0),
+            b: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `tail_call/1` — `call_only 1 L; L: x0 = 42; return`: a same-function local tail
+/// call, lowered like a `jump` to the resolved label.
+fn tail_call(_entry: Label, a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::CallOnly {
+            arity: 1,
+            target: a1,
+        },
+        Instr::Label(a1),
+        Instr::Move {
+            src: Operand::Integer(42),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+#[test]
+fn the_inlined_swap_and_tail_call_agree_and_are_recorded() {
+    let module = shape_module(
+        "exchange",
+        &[
+            ("swap_pair", 2, swap_pair),
+            ("swap_self", 1, swap_self),
+            ("tail_call", 1, tail_call),
+        ],
+    );
+    let mut backend = CraneliftJit::new();
+    let compiled = backend.compile(&module).expect("compile the exchange fixtures");
+
+    // Artifact-level evidence that the fast paths — not `jit_step_one` — were compiled.
+    assert_eq!(
+        compiled.inlined_swap_count(),
+        2,
+        "both swap fixtures must inline their exchange"
+    );
+    assert_eq!(
+        compiled.inlined_tail_call_count(),
+        1,
+        "the frame-less tail call must inline"
+    );
+
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "swap_pair",
+        2,
+        &[make_small(1), make_small(2)],
+        Some(make_small(2)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "swap_pair",
+        2,
+        &[make_small(-7), make_small(9)],
+        Some(make_small(9)),
+    );
+    // The aliasing pair is a no-op, not a lost value.
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "swap_self",
+        1,
+        &[make_small(9)],
+        Some(make_small(9)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tail_call",
+        1,
+        &[make_small(0)],
+        Some(make_small(42)),
+    );
+}
