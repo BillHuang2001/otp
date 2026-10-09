@@ -8,9 +8,18 @@ is bypassed) for opcode/operand forms the standard compiler does not emit on thi
 Fixtures live in `fixtures/` (see `fixtures/README.md` for the regeneration recipe and the per-fixture
 opcode tables); expected values are oracle-derived, not guessed.
 
-These tests load committed fixtures rather than shelling out to `erl`, so they have **no environment
-skip-guards** — they always run (unlike `tests/process_info.rs`, `tests/tailcall.rs` and
-`tests/support/discovery.rs`, which invoke `erl` and skip loudly when it is absent).
+Most suites load committed fixtures rather than shelling out to `erl`, so they run unconditionally.
+Three invoke `erl` and skip loudly when the oracle is absent (`tests/process_info.rs`,
+`tests/tailcall.rs`, `tests/support/discovery.rs`) — but `process_info.rs:460` and `tailcall.rs:238`
+pass the fixture dir with **`-pa`**, and the committed `fixtures/lists.beam` stand-in shadows stdlib,
+so `erl` exits 1 and their live cross-checks skip **even though `erl` is on `PATH`** (use `-pz`, as
+`trace.rs:602` does correctly). The `jit-cranelift` suites (`jit_cranelift.rs:55`,
+`jit_cranelift_real.rs:78`) are file-level `#![cfg(feature = "jit-cranelift")]` and the feature is
+`default = []` (`../Cargo.toml:20`), which CI never enables — so they compile to zero tests in a
+default/CI run.
+
+49 top-level `.rs` test files (**630 `#[test]`** functions, of which 42 are the default-off Cranelift
+ones) plus the `support/` harness and `fixtures/`. No `#[ignore]`/`#[should_panic]` anywhere.
 
 ## Constraints
 - Apache-2.0 header block on every `.rs`; tests may use `#[allow(unsafe_code)]` for the frozen-layout
