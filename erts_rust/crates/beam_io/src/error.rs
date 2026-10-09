@@ -67,6 +67,19 @@ pub(crate) fn notsup() -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom("notsup")))
 }
 
+/// The typed "not implemented" diagnostic: a BEAM `error` whose reason is the atom
+/// `unsupported: <what>`.
+///
+/// This is the crate's standard diagnostic for a genuine **capability gap** in the I/O
+/// layer — distinct from [`notsup`], which is the oracle's own atom for a limitation it
+/// really reports. It is deliberately a [`BeamError::Raise`] rather than a silent default,
+/// so a caller always gets a typed error instead of a *wrong* result (the workspace §3
+/// error strategy); the reason string is the single place the `unsupported:` prefix is
+/// spelled, matching `beam_process::error::unsupported` and `beam_rt::error::unsupported`.
+pub(crate) fn unsupported(what: &str) -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom(format!("unsupported: {what}"))))
+}
+
 /// The error for a driver entry whose `init` callback refused registration
 /// (`driver_init_failed`).
 ///

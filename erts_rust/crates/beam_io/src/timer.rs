@@ -20,12 +20,19 @@
 
 //! Poll-deadline primitives: a single [`Timeout`] and a multi-deadline [`Timer`].
 //!
-//! The reactor needs a **time bound** on every blocking [`crate::poller::Poller::poll`]
-//! call: [`Timeout`] computes the remaining duration to hand to the poller (or `None` to
-//! block indefinitely), and [`Timer`] tracks the set of pending deadlines keyed by a `u64`
-//! so the reactor can wake exactly the ports/processes whose timers fired. This is the
-//! Rust analogue of the legacy C's timer wheel / poll timeout plumbing
+//! Both compute a **time bound** for a blocking [`crate::poller::Poller::poll`] call:
+//! [`Timeout`] yields the remaining duration to hand to the poller (or `None` to block
+//! indefinitely), and [`Timer`] tracks a set of pending deadlines keyed by a `u64` so a
+//! caller can bound its next poll by the nearest one and drain the keys that fired. This is
+//! the Rust analogue of the legacy C's timer wheel / poll timeout plumbing
 //! (`erts/emulator/beam/erl_time_sup.c`, `erl_poll.c`).
+//!
+//! They are self-contained helpers rather than this crate's own reactor plumbing: the poll
+//! bound used inside `beam_io` comes from
+//! [`crate::registry::PortRegistry::next_deadline`] (the earliest deadline a live driver
+//! declares) plus the per-port task queue, so nothing in this crate consults these types
+//! today. They stay public (and re-exported in the crate prelude) for a consumer that keeps
+//! its own keyed deadline set.
 
 use std::time::{Duration, Instant};
 
@@ -75,8 +82,8 @@ impl Timeout {
 
 /// A set of scheduled deadlines keyed by `u64`.
 ///
-/// Entries are `(deadline, key)` pairs; the reactor schedules a key when it arms a timer,
-/// asks [`Timer::poll_timeout`] for the nearest deadline to bound its next
+/// Entries are `(deadline, key)` pairs: a caller schedules a key when it arms a timer, asks
+/// [`Timer::poll_timeout`] for the nearest deadline to bound its next
 /// [`crate::poller::Poller::poll`], and drains the fired keys with
 /// [`Timer::pop_expired`].
 pub struct Timer {
@@ -92,7 +99,10 @@ impl Timer {
         }
     }
 
-    /// Schedules `key` to fire at `deadline`, replacing any earlier deadline for `key`.
+    /// Schedules `key` to fire at `deadline`.
+    ///
+    /// A key holds at most one deadline, so any deadline already scheduled for `key` is
+    /// replaced — whether it was earlier or later than `deadline`.
     pub fn schedule(&mut self, key: u64, deadline: Instant) {
         match self.entries.iter_mut().find(|(_, k)| *k == key) {
             Some(entry) => entry.0 = deadline,
@@ -114,8 +124,11 @@ impl Timer {
     }
 
     /// Removes and returns every key whose deadline is `<= now`.
+    ///
+    /// The keys are returned in the order they were scheduled, **not** in deadline order.
     pub fn pop_expired(&mut self, now: Instant) -> Vec<u64> {
-        // `Vec::remove` shifts, so the returned keys stay in schedule order (stable).
+        // `Vec::remove` shifts the following entries down while the walk advances, so the
+        // returned keys keep the order they were scheduled in (a stable walk of `entries`).
         let mut expired = Vec::new();
         let mut i = 0;
         while i < self.entries.len() {
@@ -182,6 +195,15 @@ mod tests {
     }
 
     #[test]
+    fn a_deadline_at_the_current_instant_is_expired() {
+        // The boundary is inclusive (`deadline <= now`, i.e. `Instant::now() >= deadline`) and
+        // `poll_timeout`'s zero coincides exactly with it.
+        let timeout = Timeout::at(Instant::now());
+        assert_eq!(timeout.poll_timeout(), Some(Duration::ZERO));
+        assert!(timeout.is_expired());
+    }
+
+    #[test]
     fn timer_is_empty_until_scheduled() {
         let mut timer = Timer::new();
         assert!(timer.is_empty());
@@ -208,6 +230,17 @@ mod tests {
     }
 
     #[test]
+    fn schedule_replaces_a_later_deadline_for_the_same_key() {
+        // The replacement is unconditional: a *later* deadline replaces an earlier one too.
+        let now = Instant::now();
+        let mut timer = Timer::new();
+        timer.schedule(7, now + Duration::from_secs(1));
+        timer.schedule(7, now + Duration::from_secs(10));
+        assert_eq!(timer.len(), 1, "a key has at most one deadline");
+        assert_eq!(timer.next_deadline(), Some(now + Duration::from_secs(10)));
+    }
+
+    #[test]
     fn next_deadline_is_the_minimum() {
         let now = Instant::now();
         let mut timer = Timer::new();
@@ -231,6 +264,17 @@ mod tests {
         assert_eq!(timer.len(), 1);
         assert!(timer.pop_expired(now).is_empty());
         assert_eq!(timer.next_deadline(), Some(now + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn pop_expired_returns_keys_in_schedule_order_not_deadline_order() {
+        // Schedule order and deadline order disagree here: key 1 is scheduled first but
+        // expires last, and `pop_expired` reports the schedule order.
+        let now = Instant::now();
+        let mut timer = Timer::new();
+        timer.schedule(1, now - Duration::from_secs(1));
+        timer.schedule(2, now - Duration::from_secs(2));
+        assert_eq!(timer.pop_expired(now), vec![1, 2]);
     }
 
     #[test]

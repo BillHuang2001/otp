@@ -27,37 +27,64 @@
 //! This module reproduces that shape:
 //!
 //! * [`PortTask`] — one unit of port work: a [`PortTaskKind`], an optional deadline for
-//!   task kinds that have one, and the enqueue sequence that gives the queue its stable
-//!   FIFO tie-break;
+//!   task kinds that have one, and the enqueue sequence number the task was stamped with;
 //! * [`PortTaskQueue`] — the per-port queue: **at most one pending task per kind** (the C
-//!   keeps a per-event handle, so one event can be scheduled only once), dequeued by
-//!   priority `INPUT` → `OUTPUT` → `TIMEOUT` (the `ErtsPortTaskType` order in
-//!   `erl_port_task.h`) and FIFO within that order. A task with a deadline is only handed
-//!   out once the deadline has passed, so a not-yet-due timer never runs early;
+//!   schedules an I/O direction only through that direction's own `ErtsIoTask` handle and a
+//!   port keeps a single `timeout_task` handle, so one kind can be scheduled only once at a
+//!   time), dequeued by priority `INPUT` → `OUTPUT` → `TIMEOUT` (the `ErtsPortTaskType`
+//!   order in `erl_port_task.h`). A task with a deadline is only handed out once the
+//!   deadline has passed, so a not-yet-due timer never runs early;
 //! * [`Readiness`] — the poller-readiness bits an event carries, and the rule that decides
 //!   which tasks it schedules (readability **or** read-EOF **or** an error schedules
-//!   `INPUT`; writability **or** write-EOF schedules `OUTPUT`);
+//!   `INPUT`; writability **or** write-EOF **or** an error schedules `OUTPUT` — a poll
+//!   error re-triggers *every* armed direction, see [`Readiness`]);
 //! * [`PortNotification`] / [`PortTaskOutcome`] — what an execution round reports back to
 //!   the runtime. This is the seam the runtime turns into `{Port, {data, Data}}` messages.
 //!
 //! # Reductions
 //!
-//! Running a task costs reductions, exactly as in the C: `ERTS_PORT_REDS_INPUT`/
-//! `ERTS_PORT_REDS_OUTPUT`/`ERTS_PORT_REDS_TIMEOUT` are `CONTEXT_REDS/100` (see
-//! [`PORT_REDS_INPUT`]) and a whole port execution round is given `ERTS_PORT_REDS_EXECUTE` =
-//! `CONTEXT_REDS/4` (see [`PORT_REDS_EXECUTE`]) — `erts/emulator/beam/erl_port.h`.
-//! [`crate::PortRegistry::execute_port_tasks`] stops as soon as the caller's budget is
-//! exhausted and leaves the remaining tasks queued.
+//! Running a task costs reductions, with the C's per-kind constants:
+//! `ERTS_PORT_REDS_INPUT`/`ERTS_PORT_REDS_OUTPUT`/`ERTS_PORT_REDS_TIMEOUT` are
+//! `CONTEXT_REDS/100` (see [`PORT_REDS_INPUT`]) and a port execution round is handed
+//! `ERTS_PORT_REDS_EXECUTE` = `CONTEXT_REDS/4` (see [`PORT_REDS_EXECUTE`]) —
+//! `erts/emulator/beam/erl_port.h`. [`crate::PortRegistry::execute_port_tasks`] stops as
+//! soon as the caller's budget is exhausted and leaves the remaining tasks queued, and
+//! [`PortTaskOutcome::reds_used`] is the sum of the per-task [`PortTaskKind::reductions`].
+//!
+//! That accounting is **not** the whole of the C's. `erts_port_task_execute` charges a task
+//! `ERTS_PORT_REDS_{INPUT,OUTPUT,TIMEOUT}` **plus** the extra reductions
+//! `erts_port_driver_callback_epilogue` returns (`ERTS_PORT_REDS_TERMINATE` when a closing
+//! port's I/O queue has drained, plus the cost of cutting that port's cross-port links,
+//! `erts/emulator/beam/erl_port.h:799-824`) **plus** `ERTS_PORT_CALLBACK_VREDS`
+//! (`CONTEXT_REDS/20`), adds `ERTS_PORT_REDS_FREE` when the port is being freed, and bounds
+//! the round at `CONTEXT_REDS` — the port's reds are *initialized* to
+//! `ERTS_PORT_REDS_EXECUTE` and the loop breaks once `pp->reds >= CONTEXT_REDS`
+//! (`erts/emulator/beam/erl_port_task.c:1730,1833,1848,1854-1860`). None of those extra
+//! charges (nor the `ERTS_PORT_REDS_FREE` teardown charge) is modelled here.
 //!
 //! # Ordering — what is matched, and what is not
 //!
 //! The C keeps *three* queues per port (a local queue, a busy-caller queue and the poll
 //! thread's inbound queue) and processes them FIFO; it has no task-type priority. This crate
 //! uses a single queue ordered by task **kind priority** (`INPUT` before `OUTPUT` before
-//! `TIMEOUT`, the enum order of `ErtsPortTaskType`) with the enqueue sequence as the stable
-//! tie-break. That is a documented Milestone-1 simplification of the C's queue split; the
-//! only observable difference is the order two different kinds are run in when both are
-//! scheduled within one round.
+//! `TIMEOUT`, the enum order of `ErtsPortTaskType`). That is a documented Milestone-1
+//! simplification of the C's queue split; the only observable difference is the order two
+//! different kinds are run in when both are scheduled within one round.
+//!
+//! Because the queue holds **at most one pending task per kind** and the three kinds have
+//! distinct priorities, [`PortTask::seq`] can never break a tie: the enqueue sequence is
+//! recorded and exposed, but the ordering is decided by the kind alone.
+//!
+//! The **deadline gate** is a second divergence. The C schedules a port's `TIMEOUT` task only
+//! once its timer has actually expired (`port_timeout_common`,
+//! `erts/emulator/beam/erl_hl_timer.c`), so the `ERTS_PTMR_IS_TIMED_OUT` test inside
+//! `erts_port_task_execute` is a race guard: a `TIMEOUT` task that is *not* yet timed out is
+//! **dequeued, charged 0 reductions and dropped without calling the driver's `timeout`**
+//! (`erts/emulator/beam/erl_port_task.c:1759-1774`). This crate instead arms the `TIMEOUT`
+//! task with its deadline up front and [`PortTaskQueue::pop_next`] answers `None` while the
+//! deadline has not passed, so the task **stays queued** and still reports through
+//! [`PortTaskQueue::next`]/[`PortTaskQueue::contains`]/[`PortTaskQueue::len`]. Neither design
+//! runs the callback early; they differ in what becomes of the not-yet-due task.
 
 use std::time::Instant;
 
@@ -120,15 +147,15 @@ impl PortTaskKind {
 /// One scheduled unit of port work.
 ///
 /// A task carries its [`PortTaskKind`], an optional `deadline` (only set for
-/// [`PortTaskKind::Timeout`] tasks) and the `seq` it was enqueued with, which is the stable
-/// FIFO tie-break between tasks of the same priority.
+/// [`PortTaskKind::Timeout`] tasks) and the `seq` it was enqueued with — its enqueue order;
+/// see [`PortTaskQueue`] for why the queue's ordering never consults it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PortTask {
     /// What the task does when it runs.
     kind: PortTaskKind,
     /// When the task may run; `None` means "as soon as possible".
     deadline: Option<Instant>,
-    /// The enqueue sequence (the FIFO tie-break).
+    /// The enqueue sequence number.
     seq: u64,
 }
 
@@ -163,7 +190,7 @@ impl PortTask {
 }
 
 /// A per-port task queue: one pending task per [`PortTaskKind`], ordered by kind priority
-/// and then by enqueue sequence.
+/// (the enqueue sequence is recorded, but cannot break a tie — see the module docs).
 ///
 /// Enqueueing a kind that is already pending is a no-op (it returns `false`), which is what
 /// keeps the queue from growing without bound when a descriptor stays ready across poll
@@ -282,8 +309,9 @@ impl PortTaskQueue {
         self.tasks.clear();
     }
 
-    /// The index of the pending task that runs first: lowest kind priority, then lowest
-    /// enqueue sequence.
+    /// The index of the pending task that runs first: lowest kind priority. The enqueue
+    /// sequence (`task.seq`) can never break this tie, because no two pending tasks share a
+    /// kind and hence a priority.
     fn highest_priority_index(&self) -> Option<usize> {
         self.tasks
             .iter()
@@ -298,7 +326,16 @@ impl PortTaskQueue {
 /// [`Readiness`] is deliberately a plain, constructible value (unlike [`Ready`], whose
 /// fields the poller owns) so the reactor's scheduling rule can be exercised directly:
 /// `read_ready` is readability **or** a read half-close **or** an error, and `write_ready`
-/// is writability **or** a write half-close.
+/// is writability **or** a write half-close **or** an error.
+///
+/// The `error` bit reaching **both** directions mirrors the legacy reactor. `EPOLLERR` and
+/// `EPOLLHUP` are one mask there (`ERTS_POLL_EV_ERR`, `erts/emulator/sys/common/erl_poll.h:184`),
+/// and a poll error is answered by re-triggering **every** event that has been selected — `revents
+/// = state->active_events` — after which both the out and the in callback fire
+/// (`erts/emulator/sys/common/erl_check_io.c:2018-2027`, `:2099-2110`). So a pure `EPOLLERR`
+/// without `EPOLLHUP` schedules `INPUT` *and* `OUTPUT`, not just `INPUT`. The armed-direction
+/// gate still applies (see [`crate::PortRegistry::schedule_readiness`]), so a port that never
+/// armed a write fd still gets no output task.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Readiness {
     /// The descriptor reported readability.
@@ -323,8 +360,15 @@ impl Readiness {
     }
 
     /// Whether the mask schedules an [`PortTaskKind::Output`] task.
+    ///
+    /// `error` is included for the same reason [`Readiness::read_ready`] includes it: the C
+    /// reactor re-triggers *every* armed direction on a poll error (`ERTS_POLL_EV_ERR` is
+    /// `EPOLLERR | EPOLLHUP`, `erl_poll.h:184`; `revents = state->active_events`,
+    /// `erl_check_io.c:2018-2027`), so a pure error also reaches the driver's `ready_output`.
+    /// Whether an `Output` task is actually scheduled is still gated on the driver having
+    /// armed a write fd (see [`crate::PortRegistry::schedule_readiness`]).
     pub fn write_ready(self) -> bool {
-        self.writable || self.write_closed
+        self.writable || self.write_closed || self.error
     }
 
     /// Whether the mask schedules nothing at all.
@@ -356,7 +400,8 @@ pub enum PortNotification {
     Data {
         /// The port that produced the bytes.
         port: PortId,
-        /// The bytes (never empty).
+        /// The bytes. A port-task round reports a payload only when it is non-empty, so a
+        /// consumer may rely on this never being empty.
         bytes: Vec<u8>,
     },
     /// The port was closed since the previous execution round.
@@ -371,7 +416,8 @@ pub enum PortNotification {
 pub struct PortTaskOutcome {
     /// How many port tasks ran.
     pub ran: usize,
-    /// How many reductions those tasks cost.
+    /// How many reductions those tasks cost: the sum of the per-task
+    /// [`PortTaskKind::reductions`] (see the module docs on what the C charges on top).
     pub reds_used: usize,
     /// The notifications the round produced (see [`PortNotification`]).
     pub notifications: Vec<PortNotification>,
@@ -383,8 +429,52 @@ mod tests {
         PortTaskKind, PortTaskQueue, Readiness, CONTEXT_REDS, PORT_REDS_EXECUTE, PORT_REDS_INPUT,
         PORT_REDS_OUTPUT, PORT_REDS_TIMEOUT,
     };
-    use crate::poller::Ready;
+    use crate::driver::{Driver, DriverContext};
+    use crate::drivers::FdDriver;
+    use crate::poller::{Interest, Poller, Ready, Token};
+    use crate::PortRegistry;
+    use beam_common::Result;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
+
+    /// A driver that arms **both** poll directions on one borrowed descriptor.
+    ///
+    /// [`FdDriver::pipe`] arms only `READABLE` (it registers its write fd only once there is
+    /// something to flush), so it cannot express "a port whose write direction is armed" — the
+    /// case a poll error must reach in both directions. This driver registers the descriptor
+    /// with [`Interest::BOTH`] and deregisters it on `stop`; the owning [`UnixStream`] owns
+    /// the fd, so the driver never closes it.
+    struct BothDirectionsDriver {
+        fd: RawFd,
+        token: Option<Token>,
+    }
+
+    impl Driver for BothDirectionsDriver {
+        fn name(&self) -> &str {
+            "both-directions-test"
+        }
+
+        fn start(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+            self.token = Some(ctx.register(self.fd, Interest::BOTH)?);
+            Ok(())
+        }
+
+        fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+            if let Some(token) = self.token.take() {
+                ctx.deregister(self.fd, token)?;
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn reduction_costs_match_the_legacy_constants() {
@@ -477,6 +567,56 @@ mod tests {
             PORT_REDS_INPUT,
             "the task knows its cost"
         );
+    }
+
+    #[test]
+    fn the_sequence_number_can_never_break_a_tie() {
+        // The queue holds at most one pending task per kind, and the three kinds have
+        // distinct priorities, so `highest_priority_index`'s `min_by_key((priority, seq))`
+        // never reaches the `seq` component: the ordering is decided by the kind alone. The
+        // `Timeout` task below is enqueued *before* the `Input` task (so it has the lower
+        // sequence number) yet runs last, and re-enqueueing a pending kind is a no-op, so no
+        // second same-priority task can ever exist.
+        let mut queue = PortTaskQueue::new();
+        assert!(queue.enqueue(PortTaskKind::Output));
+        assert!(queue.enqueue(PortTaskKind::Timeout));
+        assert!(queue.enqueue(PortTaskKind::Input));
+        assert!(!queue.enqueue(PortTaskKind::Output), "no second Output task");
+        assert!(!queue.enqueue(PortTaskKind::Timeout), "no second Timeout task");
+        assert!(!queue.enqueue(PortTaskKind::Input), "no second Input task");
+        assert_eq!(queue.len(), 3, "one task per kind, however often enqueued");
+
+        let now = Instant::now();
+        let popped: Vec<(PortTaskKind, u64)> = std::iter::from_fn(|| queue.pop_next(now))
+            .map(|task| (task.kind(), task.seq()))
+            .collect();
+        assert_eq!(
+            popped,
+            vec![
+                (PortTaskKind::Input, 2),
+                (PortTaskKind::Output, 0),
+                (PortTaskKind::Timeout, 1)
+            ],
+            "the kind priority decides: the *highest* sequence number runs first"
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_not_yet_due_timer_stays_queued() {
+        // The documented divergence from `erts_port_task_execute`: the C dequeues a `TIMEOUT`
+        // task that is not yet timed out, charges it 0 reductions and drops it
+        // (`erl_port_task.c:1759-1774`). Here the task stays pending — nothing runs either
+        // way, so no reductions are charged for a withheld timer.
+        let mut queue = PortTaskQueue::new();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(5);
+        assert!(queue.enqueue_timeout(deadline));
+
+        assert!(queue.pop_next(now).is_none(), "nothing may run yet");
+        assert_eq!(queue.len(), 1, "the timer is still pending, not consumed");
+        assert!(queue.contains(PortTaskKind::Timeout));
+        assert_eq!(queue.next(), Some(PortTaskKind::Timeout));
     }
 
     #[test]
@@ -585,12 +725,15 @@ mod tests {
         assert!(eof.read_ready(), "EOF must still reach ready_input");
         assert!(!eof.write_ready());
 
-        // An error condition is read readiness too.
+        // An error condition is readiness for **both** directions: the C reactor re-triggers
+        // every armed event on `ERTS_POLL_EV_ERR` (`EPOLLERR | EPOLLHUP`).
         let err = Readiness {
             error: true,
             ..Readiness::default()
         };
         assert!(err.read_ready());
+        assert!(err.write_ready());
+        assert!(!err.is_idle());
 
         // A half-closed write side schedules the output task.
         let wclosed = Readiness {
@@ -604,6 +747,100 @@ mod tests {
         assert!(Readiness::default().is_idle());
         assert!(!Readiness::default().read_ready());
         assert!(!Readiness::default().write_ready());
+    }
+
+    #[test]
+    fn a_poll_error_schedules_both_directions() {
+        // The legacy reactor turns a poll error into *every* armed event:
+        // `ERTS_POLL_EV_ERR == EPOLLERR | EPOLLHUP` (`erl_poll.h:184`) and
+        // `revents = state->active_events` (`erl_check_io.c:2018-2027`), after which both the
+        // out and the in callback fire. A pure `EPOLLERR` (no `EPOLLHUP`) must therefore be
+        // ready in *both* directions here.
+        let err = Readiness {
+            error: true,
+            ..Readiness::default()
+        };
+        assert!(err.read_ready(), "a poll error reaches ready_input");
+        assert!(
+            err.write_ready(),
+            "a poll error reaches ready_output as well"
+        );
+        assert!(!err.is_idle());
+
+        // The pre-existing rule is unchanged: a pure close (no error bit) is still not write
+        // readiness, so a read-only port's full close schedules no `OUTPUT` task.
+        let eof = Readiness {
+            read_closed: true,
+            ..Readiness::default()
+        };
+        assert!(eof.read_ready() && !eof.write_ready());
+    }
+
+    #[test]
+    fn a_pure_poll_error_schedules_output_only_for_an_armed_write_direction() {
+        // The C's rule end to end: `ERTS_POLL_EV_ERR` (`EPOLLERR | EPOLLHUP`, `erl_poll.h:184`)
+        // re-triggers *every* selected event (`revents = state->active_events`,
+        // `erl_check_io.c:2018-2027`), so a fully armed fd fires both `oready` and `iready`
+        // (`:2099-2110`) — while only the directions actually selected are fired.
+        let mut poller = Poller::new().expect("a poll set");
+        let mut registry = PortRegistry::new();
+
+        // A port that armed BOTH directions: the error bit reaches `write_ready` too, so an
+        // `Output` task is scheduled alongside the `Input` task.
+        let (stream, _peer) = UnixStream::pair().expect("a socketpair");
+        let id = registry
+            .open(
+                &mut poller,
+                Box::new(BothDirectionsDriver {
+                    fd: stream.as_raw_fd(),
+                    token: None,
+                }),
+            )
+            .expect("the both-directions port opens");
+        let err = Readiness {
+            error: true,
+            ..Readiness::default()
+        };
+        assert!(registry.schedule_readiness(id.number(), err));
+        assert!(
+            registry
+                .get(id)
+                .expect("live")
+                .has_pending_task(PortTaskKind::Input),
+            "a poll error reaches the armed read direction"
+        );
+        assert!(
+            registry
+                .get(id)
+                .expect("live")
+                .has_pending_task(PortTaskKind::Output),
+            "a poll error reaches the armed write direction too"
+        );
+
+        // A read-only port (`FdDriver::pipe` arms only `READABLE`): the armed-direction gate
+        // keeps the error bit from scheduling a direction the driver never armed.
+        let read_only = registry
+            .open(&mut poller, Box::new(FdDriver::pipe().expect("a pipe")))
+            .expect("a second, read-armed port");
+        assert!(registry.schedule_readiness(read_only.number(), err));
+        assert!(registry
+            .get(read_only)
+            .expect("live")
+            .has_pending_task(PortTaskKind::Input));
+        assert!(
+            !registry
+                .get(read_only)
+                .expect("live")
+                .has_pending_task(PortTaskKind::Output),
+            "an unarmed write direction is never scheduled, whatever the readiness"
+        );
+
+        registry.close(&mut poller, id).expect("closes");
+        registry.close(&mut poller, read_only).expect("closes");
+        assert!(
+            poller.is_empty(),
+            "closing deregisters both ports' descriptors"
+        );
     }
 
     #[test]
