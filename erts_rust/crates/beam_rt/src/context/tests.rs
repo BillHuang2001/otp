@@ -741,9 +741,11 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
     // it is `beam_bifs`' own `RUNTIME_HOOKS_BIFS` roster (every BIF registered through the
     // `runtime_bif!` macro, each reading the single `RuntimeHooks` seam), so the two sides
     // cannot drift. The keys the bridge serves are the timer family, the loaded-export
-    // check, the link set, the dynamic-tracing tag pair and `erlang:statistics/1`; every
-    // other key of the roster answers the same typed capability gap the *defaulted* seam
-    // reports (see `the_runtime_hooks_bridge_serves_the_timer_and_export_families`).
+    // check, the link set, the dynamic-tracing tag families, the code-store/loading probes,
+    // the internal process predicates and `notsup` probe, the trace-cleaner/error-logger
+    // constants, the `code:*` coverage surface and `erlang:statistics/1`; every other key of
+    // the roster answers the same typed capability gap the *defaulted* seam reports (the
+    // served-key behaviour is pinned by the `the_runtime_hooks_bridge_serves_*` tests).
     let served = [
         ("erlang", "start_timer", 3),
         ("erlang", "start_timer", 4),
@@ -754,6 +756,26 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
         ("erlang", "unlink", 1),
         ("erlang", "dt_spread_tag", 1),
         ("erlang", "dt_restore_tag", 1),
+        ("erlang", "dt_get_tag", 0),
+        ("erlang", "dt_get_tag_data", 0),
+        ("erlang", "dt_put_tag", 1),
+        ("erlang", "dt_append_vm_tag_data", 1),
+        ("erlang", "dt_prepend_vm_tag_data", 1),
+        ("erlang", "system_profile", 0),
+        ("erlang", "check_old_code", 1),
+        ("erlang", "finish_loading", 1),
+        ("erlang", "call_on_load_function", 1),
+        ("erlang", "has_prepared_code_on_load", 1),
+        ("erlang", "finish_after_on_load", 2),
+        ("erts_internal", "is_system_process", 1),
+        ("erts_internal", "is_process_executing_dirty", 1),
+        ("erts_internal", "erase_persistent_terms", 0),
+        ("erts_literal_area_collector", "release_area_switch", 0),
+        ("erts_trace_cleaner", "check", 0),
+        ("error_logger", "warning_map", 0),
+        ("code", "coverage_support", 0),
+        ("code", "get_coverage_mode", 0),
+        ("code", "set_coverage_mode", 1),
         ("erlang", "statistics", 1),
     ];
     for (module, function, arity) in served {
@@ -1322,4 +1344,275 @@ fn only_the_call_site_reading_bifs_make_a_module_site_observant() {
         ("erlang", "external_size", 2),
     ])));
     assert!(!module_observes_its_call_site(&module_importing(&[])));
+}
+
+// ---------------------------------------------------------------------------
+// The `RuntimeHooksBridge` arms beyond the timer/tag families.
+//
+// Each test drives the real dispatch (`RuntimeContext::call_bif`), so the arm is reached
+// through `call_registered`'s gate. The oracle-cross-checked answers (OTP 29 / `erts-17.1`)
+// are pinned alongside adversarial arguments: a rejected argument is the oracle's `badarg`,
+// a facility this runtime lacks is the typed `unsupported` gap (never a wrong index, never a
+// fabricated value), and a wrong arity misses the arm and falls through to the seam's
+// defaulted gap.
+// ---------------------------------------------------------------------------
+
+/// `erlang:dt_get_tag/0`, `dt_get_tag_data/0`, `dt_put_tag/1` (all the atom `undefined`) and
+/// `dt_append_vm_tag_data/1` / `dt_prepend_vm_tag_data/1` (the argument, unchanged).
+#[test]
+fn the_runtime_hooks_bridge_serves_the_dynamic_tracing_tag_family() {
+    let mut rt = runtime();
+    let undefined = rt.intern("undefined");
+    let me = rt.self_pid().to_eterm();
+    let mut scratch = beam_alloc::Heap::new(64).expect("a scratch heap");
+    let tuple = scratch
+        .tuple(&[make_small(1), undefined])
+        .expect("a two-tuple");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    for function in ["dt_get_tag", "dt_get_tag_data"] {
+        assert_eq!(
+            ctx.call_bif("erlang", function, 0, &[]).expect(function),
+            undefined,
+            "{function}/0 answers the atom `undefined`"
+        );
+    }
+    // `dt_put_tag/1` ignores whatever it is handed.
+    for argument in [undefined, make_small(42), NIL, me] {
+        assert_eq!(
+            ctx.call_bif("erlang", "dt_put_tag", 1, &[argument])
+                .expect("dt_put_tag/1"),
+            undefined,
+            "dt_put_tag/1 ignores its argument"
+        );
+    }
+    // The VM-probe helpers apply no type check at all: the argument comes back unchanged.
+    for function in ["dt_append_vm_tag_data", "dt_prepend_vm_tag_data"] {
+        for argument in [make_small(42), undefined, NIL, tuple] {
+            assert_eq!(
+                ctx.call_bif("erlang", function, 1, &[argument])
+                    .expect(function),
+                argument,
+                "{function}/1 returns its argument unchanged"
+            );
+        }
+    }
+    // A wrong arity misses the arm: the seam's defaulted answer names the key instead of
+    // substituting a neighbouring arity's behaviour.
+    for (function, arity) in [("dt_get_tag", 1u32), ("dt_put_tag", 0), ("dt_get_tag_data", 2)] {
+        let error = ctx
+            .call_bif("erlang", function, arity, &[make_small(1)])
+            .expect_err("an unserved arity is the typed gap");
+        shared_gap(&error, &format!("erlang:{function}/{arity}"));
+    }
+}
+
+/// `erlang:system_profile/0`, `erlang:check_old_code/1`, `erlang:finish_loading/1` and the
+/// three `badarg`-always on-load-hook primitives.
+#[test]
+fn the_runtime_hooks_bridge_serves_the_code_store_and_loading_probes() {
+    let mut rt = runtime();
+    let undefined = rt.intern("undefined");
+    let false_atom = rt.intern("false");
+    let ok = rt.intern("ok");
+    let some_module = rt.intern("some_module");
+    let mut scratch = beam_alloc::Heap::new(16).expect("a scratch heap");
+    let one_item = scratch.cons(some_module, NIL).expect("a one-element list");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    // No profiling subsystem runs, so the oracle's `system_profile/0` answers `undefined`.
+    assert_eq!(
+        ctx.call_bif("erlang", "system_profile", 0, &[])
+            .expect("system_profile/0"),
+        undefined
+    );
+
+    // `check_old_code/1`: any atom answers `false` (this runtime never replaces a live
+    // module); anything that is not an atom is `badarg`.
+    for argument in [some_module, ok] {
+        assert_eq!(
+            ctx.call_bif("erlang", "check_old_code", 1, &[argument])
+                .expect("check_old_code/1"),
+            false_atom
+        );
+    }
+    for argument in [make_small(42), NIL] {
+        let error = ctx
+            .call_bif("erlang", "check_old_code", 1, &[argument])
+            .expect_err("a non-atom is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
+
+    // `finish_loading/1`: only the empty list is accepted; the non-empty list a real
+    // `code:load_binary` would pass, and any non-list, are `badarg`.
+    assert_eq!(
+        ctx.call_bif("erlang", "finish_loading", 1, &[NIL])
+            .expect("finish_loading([])"),
+        ok
+    );
+    for argument in [one_item, make_small(42), some_module] {
+        let error = ctx
+            .call_bif("erlang", "finish_loading", 1, &[argument])
+            .expect_err("anything but [] is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
+
+    // The on-load-hook primitives always answer `badarg` on this BEAMASM build: they need an
+    // internal prepared-code term only `prepare_loading/2` can mint.
+    let trio: [(&str, u32, [beam_term::Eterm; 2]); 3] = [
+        ("call_on_load_function", 1, [one_item, NIL]),
+        ("has_prepared_code_on_load", 1, [ok, NIL]),
+        ("finish_after_on_load", 2, [ok, NIL]),
+    ];
+    for (function, arity, args) in trio {
+        let error = ctx
+            .call_bif("erlang", function, arity, &args[..arity as usize])
+            .expect_err("the on-load-hook primitives are always badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{function}/{arity}: {error}");
+    }
+}
+
+/// `erts_internal:is_system_process/1` / `is_process_executing_dirty/1`,
+/// `erts_literal_area_collector:release_area_switch/0`, `erts_trace_cleaner:check/0`,
+/// `error_logger:warning_map/0` and the `code:*` coverage-mode surface.
+#[test]
+fn the_runtime_hooks_bridge_serves_the_internal_notsup_and_constants() {
+    let mut rt = runtime();
+    let false_atom = rt.intern("false");
+    let true_atom = rt.intern("true");
+    let none = rt.intern("none");
+    let line = rt.intern("line");
+    let call = rt.intern("call");
+    let warning = rt.intern("warning");
+    let me = rt.self_pid().to_eterm();
+    let remote_node = rt.intern("elsewhere@host");
+    let mut remote_heap = beam_alloc::Heap::new(64).expect("a scratch heap");
+    let remote_pid =
+        beam_codec::term::make_external_pid(&mut remote_heap, remote_node, 1, 0, 0x1234_5678)
+            .expect("an external pid");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    for function in ["is_system_process", "is_process_executing_dirty"] {
+        assert_eq!(
+            ctx.call_bif("erts_internal", function, 1, &[me])
+                .expect(function),
+            false_atom,
+            "{function}/1 answers `false` for a local pid"
+        );
+        // A remote pid needs the peer's process record (distribution, contract A.5), so it
+        // is the typed gap rather than a fabricated `false`.
+        let error = ctx
+            .call_bif("erts_internal", function, 1, &[remote_pid])
+            .expect_err("a remote pid is a typed gap");
+        shared_gap(
+            &error,
+            &format!(
+                "erts_internal:{function}/1 on a remote pid: distribution is not implemented"
+            ),
+        );
+        // A term that is not a pid is `badarg`.
+        let error = ctx
+            .call_bif("erts_internal", function, 1, &[make_small(42)])
+            .expect_err("a non-pid is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{function}: {error}");
+    }
+
+    // `release_area_switch/0` **raises** `error notsup` (the facility is not compiled in) —
+    // never the bare atom.
+    let error = ctx
+        .call_bif("erts_literal_area_collector", "release_area_switch", 0, &[])
+        .expect_err("release_area_switch/0 raises");
+    let raise = error.into_raise().expect("a raise, not a reason variant");
+    assert_eq!(raise.class, beam_common::ExceptionClass::Error);
+    assert_eq!(raise.reason.as_atom(), Some("notsup"));
+
+    // The trace-cleaner and error-logger constants.
+    assert_eq!(
+        ctx.call_bif("erts_trace_cleaner", "check", 0, &[])
+            .expect("check/0"),
+        false_atom
+    );
+    assert_eq!(
+        ctx.call_bif("error_logger", "warning_map", 0, &[])
+            .expect("warning_map/0"),
+        warning
+    );
+
+    // The `code:*` coverage surface: support is `true`, the current mode `none`, and
+    // `set_coverage_mode/1` accepts only `none`/`line`, answering the previous `none`.
+    assert_eq!(
+        ctx.call_bif("code", "coverage_support", 0, &[])
+            .expect("coverage_support/0"),
+        true_atom
+    );
+    assert_eq!(
+        ctx.call_bif("code", "get_coverage_mode", 0, &[])
+            .expect("get_coverage_mode/0"),
+        none
+    );
+    for mode in [none, line] {
+        assert_eq!(
+            ctx.call_bif("code", "set_coverage_mode", 1, &[mode])
+                .expect("set_coverage_mode/1"),
+            none
+        );
+    }
+    for bad in [call, make_small(1), NIL] {
+        let error = ctx
+            .call_bif("code", "set_coverage_mode", 1, &[bad])
+            .expect_err("an unknown coverage mode is badarg");
+        assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+    }
+}
+
+/// `erts_internal:erase_persistent_terms/0` answers `true` **and** really clears the
+/// runtime's own persistent-term store.
+#[test]
+fn the_runtime_hooks_bridge_erases_the_persistent_term_store() {
+    let mut rt = runtime();
+    let key = rt.intern("a_persistent_key");
+    let value = rt.intern("a_persistent_value");
+    let default = rt.intern("the_default");
+    let ok = rt.intern("ok");
+    let true_atom = rt.intern("true");
+    let mut ctx = RuntimeContext::new(&mut rt);
+
+    // Store a term through the `PersistentTerm` arm and read it back.
+    assert_eq!(
+        ctx.call_bif("persistent_term", "put", 2, &[key, value])
+            .expect("put/2"),
+        ok
+    );
+    assert_eq!(
+        ctx.call_bif("persistent_term", "get", 2, &[key, default])
+            .expect("get/2"),
+        value
+    );
+
+    // The reset hook answers `true` and clears the store: the same lookup now answers the
+    // default, and `get/1` — which raises for an absent key — is `badarg`.
+    assert_eq!(
+        ctx.call_bif("erts_internal", "erase_persistent_terms", 0, &[])
+            .expect("erase_persistent_terms/0"),
+        true_atom
+    );
+    assert_eq!(
+        ctx.call_bif("persistent_term", "get", 2, &[key, default])
+            .expect("get/2 after the erase"),
+        default
+    );
+    let error = ctx
+        .call_bif("persistent_term", "get", 1, &[key])
+        .expect_err("an absent key is badarg");
+    assert_eq!(error.as_atom(), Some("badarg"), "{error}");
+}
+
+/// Assert `error` is the typed capability gap whose reason is `expected` (the reason the
+/// `unsupported_reason` classifier strips the leading token from).
+fn shared_gap(error: &BeamError, expected: &str) {
+    assert_eq!(
+        crate::error::unsupported_reason(error).as_deref(),
+        Some(expected),
+        "{error}"
+    );
 }
