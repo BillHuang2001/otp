@@ -56,12 +56,8 @@
 //!                         %%     itself as owner
 //! ```
 //!
-//! Flow (b) is also the regression pin for the two defects the owner-death work shipped with:
-//! the transfer tag was interned under the name `'ETS-TRANSFER'` (quotes included), so the
-//! pattern could never match; and the gift `Data` arrived as `{}` because the creation-time
-//! heir held a raw reference into the creating process's heap instead of a table-owned copy
-//! (`beam_rt`'s `Runtime::own_heir_gift`). Either defect turns (b) into `no_transfer` /
-//! `{true,true,{}}`, so the flow fails loudly if either regresses.
+//! Flow (b) pins that an arity-3 `{heir, Self, {gift,42}}` transfers the gift with `Tid` = the
+//! table's **name atom**.
 //!
 //! # *Unnamed* tables: reclaimed through the registry roster
 //!
@@ -354,11 +350,6 @@ fn the_owner_death_flows_match_the_live_oracle() {
 /// the gone tid of a dead owner's unnamed table, and the heir's
 /// `{'ETS-TRANSFER', Tid, FromPid, Data}` carrying the table's **reference** (a tid that still
 /// works), the dead owner's pid, the gift, and the heir's ownership afterwards.
-///
-/// This is the regression pin for the unnamed-table leak: before the runtime adopted
-/// `beam_bifs::TableRegistry::handles_owned_by` as the authority on which tables a death acts
-/// on, flow (e) printed `false` here (the table leaked) and flow (f) timed out into
-/// `no_transfer`.
 ///
 /// The oracle is consulted per flow, so a divergence fails on the side that disagrees.
 #[test]
