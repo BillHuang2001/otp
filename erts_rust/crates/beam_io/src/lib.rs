@@ -61,7 +61,16 @@
 //! The [`cpu_time`] module is the **CPU-time facility** — a safe `getrusage(2)`/
 //! `clock_gettime(2)` floor (the raw syscalls `beam_rt` cannot issue) plus [`RuntimeClock`],
 //! the `erlang:statistics(runtime)` counter with the oracle's `{Total, SinceLastCall}`
-//! semantics.//!
+//! semantics.
+//!
+//! The [`io_device`] module is the **io-device request layer** — the DEVICE SIDE of the
+//! incremental `{get_until, Enc, Prompt, Mod, Func, XtraArgs}` request of the `io`
+//! protocol: [`IoDevice`] reproduces `file_io_server`'s read loop (read sizes, the
+//! `{more,…}` loop, the stashed leftover fed before a fresh read, `eof`, the
+//! `invalid_unicode` stop) and the `io_lib` middleman's `latin1`/`unicode` conversions,
+//! while the one step that runs Erlang code — applying `Mod:Func` — is the caller-supplied
+//! [`Continuation`] seam ([`NoEngineContinuation`] is its typed `unsupported` default).
+//!
 //! # Status
 //!
 //! Milestone-1 is implemented (see this crate's `CONTEXT.md`, Milestone-1 scope): the
@@ -97,6 +106,7 @@ pub mod cpu_time;
 pub mod ddll;
 pub mod driver;
 pub mod drivers;
+pub mod io_device;
 pub mod poller;
 pub mod port;
 pub mod port_task;
@@ -112,6 +122,7 @@ pub use crate::cpu_time::*;
 pub use crate::ddll::*;
 pub use crate::driver::*;
 pub use crate::drivers::*;
+pub use crate::io_device::*;
 pub use crate::poller::*;
 pub use crate::port::*;
 pub use crate::port_task::*;
@@ -143,6 +154,7 @@ pub mod prelude {
     pub use crate::ddll::*;
     pub use crate::driver::*;
     pub use crate::drivers::*;
+    pub use crate::io_device::*;
     pub use crate::poller::*;
     pub use crate::port::*;
     pub use crate::port_task::*;
