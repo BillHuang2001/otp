@@ -911,6 +911,198 @@ fn a_driver_select_and_a_driver_timer_both_reach_the_owner() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The other two entry shapes the A.4 `port_command` path must drive: `outputv`, and the term-data
+// `erl_drv_output_term` / `erl_drv_send_term` pair
+// ---------------------------------------------------------------------------------------------
+
+/// Compiles the committed event fixture in `mode`, prepending the `#define` that selects it.
+///
+/// The C source is one committed file whose `output`/`outputv` pair is chosen by
+/// `EVENT_DRIVER_MODE` (`fixtures/event_driver.c`): mode 0 (the committed default) is the event/timer
+/// driver the tests above use, mode 1 declares **only** `outputv`, and modes 2/3 answer through the
+/// term-data path. The `driver_name` follows the mode, so each mode is compiled under its own stem —
+/// the runtime derives the name from the loaded path's stem, and the loader rejects a mismatch.
+fn compile_event_mode(label: &str, mode: u32, stem: &str) -> Option<Fixture> {
+    let source = format!("#define EVENT_DRIVER_MODE {mode}\n{EVENT_DRIVER_C}");
+    compile_c(label, stem, &source)
+}
+
+/// Drives the committed event fixture compiled in `mode` (under `stem`) through the Erlang entry
+/// point `fun`, and hands the returned term to `check`.
+///
+/// Skips — **loudly**, through [`compile_c`]/[`compile_erl`] — when the C compiler, the host
+/// `erl_driver.h` or `erlc` is missing, exactly like every other test in this file.
+fn with_event_mode(
+    label: &str,
+    mode: u32,
+    stem: &str,
+    fun: &str,
+    check: impl FnOnce(&mut Runtime, beam_term::prelude::Eterm),
+) {
+    // The A.4 link seam: the `.so` leaves its `driver_*`/`erl_drv_*` imports undefined, so the test
+    // binary must publish them (see `the_binary_exports_the_driver_symbols_a_driver_imports`).
+    let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
+
+    let Some(fixture) = compile_event_mode(label, mode, stem) else {
+        return;
+    };
+    // The Erlang fixture needs the driver's path (the loader appends the `.so` suffix), which only
+    // exists now.
+    let source = EVENT_DRIVER_ERL.replace("{path}", &fixture.stem.display().to_string());
+    let Some(beam) = compile_erl(&fixture.dir, "event_driver", &source) else {
+        fixture.cleanup();
+        return;
+    };
+
+    let mut rt = Runtime::with_defaults().expect("the default runtime");
+    rt.load_module(&beam).expect("the event fixture loads");
+    let pid = rt
+        .spawn_process("event_driver", fun, vec![])
+        .unwrap_or_else(|error| panic!("spawn event_driver:{fun}/0: {error:?}"));
+
+    // The same bounded scheduler drive the event/timer test uses: the entry opens the port and
+    // blocks in its `receive`, so only a later scheduler pass can deliver what the driver produced.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.process_result(pid).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "event_driver:{fun}/0 never returned (mode {mode})"
+        );
+        rt.run_scheduler().expect("the scheduler pass runs");
+        sleep(Duration::from_millis(5));
+    }
+
+    let result = rt.process_result(pid).expect("the receiver returned");
+    check(&mut rt, result);
+
+    // A returning process exits `normal` and leaves the table (its `x(0)` is not its exit reason).
+    assert!(
+        rt.process_exit(pid).is_none(),
+        "event_driver:{fun}/0 exited normally"
+    );
+    fixture.cleanup();
+}
+
+/// The **bare** `{7, 9}` the two term-data modes emit: the term itself, never a `{Port, Term}`
+/// wrapper (the C queues the decoded term, `io.c:6174`).
+///
+/// The C spec builds it from a plain `ERL_DRV_INT` (7) and an `ERL_DRV_EXT2TERM` operand carrying the
+/// ETF image `<<131, 97, 9>>` (VERSION_MAGIC + the small int 9), so the same assertion also proves
+/// the driver-side ETF decoder (`DriverHost::binary_to_term`) was reached **through** the spec
+/// decoder. The Erlang half matches the clause `{7, 9}` specifically, so the only other message this
+/// port can produce — a `{Port, {data, …}}` wrapper — would not have matched and would have surfaced
+/// as the `timeout` atom after 5 s.
+fn assert_is_the_7_9_tuple(rt: &mut Runtime, result: beam_term::prelude::Eterm, which: &str) {
+    let rendered = rt
+        .format_term_w(result, None)
+        .unwrap_or_else(|error| format!("<unprintable: {error}>"));
+    let Some(size) = terms::tuple_arity(result).ok() else {
+        panic!("{which}: the emitted term must reach its recipient as the bare `{{7, 9}}` tuple; \
+                got {rendered} (the `timeout` atom means nothing was delivered)");
+    };
+    assert_eq!(size, 2, "{which}: expected a 2-tuple; got {rendered}");
+    let low = terms::tuple_element(result, 0).expect("element 0 of the 2-tuple");
+    let high = terms::tuple_element(result, 1).expect("element 1 of the 2-tuple");
+    assert!(
+        is_small(low) && is_small(high),
+        "{which}: both elements must be small ints; got {rendered}"
+    );
+    assert_eq!(
+        (signed_value(low), signed_value(high)),
+        (7, 9),
+        "{which}: the `ERL_DRV_EXT2TERM` operand must decode to 9 and the `ERL_DRV_INT` to 7; \
+         got {rendered}"
+    );
+}
+
+/// An entry that declares **only** `outputv` (leaving `output` NULL) still receives `port_command`
+/// and its `driver_output` reply reaches the owner.
+///
+/// The C's own preference is the vector callback when a driver declares one
+/// (`if (drv->outputv) …` else `… drv->output`, `io.c:1782`), and an entry that declares *only*
+/// `outputv` must not be left without an output path. The fixture's `event_outputv` echoes the
+/// vector's data block (`iov[1]`) — the vector mirrors the C's build, `iov[0]` being the empty
+/// header block — so the bytes the owner receives are evidence of *both* halves: the callback ran
+/// (only `port_command` invokes it) and it really saw the payload it echoed.
+///
+/// Oracle ground truth (OTP 29 / `erts-17.1`, the very same `.so` compiled as `eventv`):
+///
+/// ```none
+/// $ erl -noshell -eval 'ok = erl_ddll:load_driver("<dir>", "eventv"),
+///       P = open_port({spawn_driver, "eventv"}, [binary]),
+///       true = port_command(P, <<"vv">>),
+///       receive {P,{data,D}} -> io:format("~p~n",[D]) after 5000 -> timeout end, halt(0).'
+/// <<"vv">>
+/// ```
+#[test]
+fn an_outputv_only_entry_receives_port_command() {
+    with_event_mode("outputv", 1, "eventv", "recv_v", |rt, result| {
+        let rendered = rt
+            .format_term_w(result, None)
+            .unwrap_or_else(|error| format!("<unprintable: {error}>"));
+        assert_eq!(
+            terms::binary_bytes(result).unwrap_or_else(|_| panic!(
+                "`outputv` must echo the payload as a binary, got {rendered}"
+            )),
+            &b"vv"[..],
+            "`outputv` must receive `port_command`'s data block and its `driver_output` reply must \
+             reach the owner; got {rendered}"
+        );
+    });
+}
+
+/// A term a driver emits with `erl_drv_output_term` is delivered to the port's **owner** as the
+/// **term itself**.
+///
+/// This is the end-to-end proof of the term-data path (contract A.4): `port_command` reaches the
+/// fixture's `output`, which decodes a spec holding an `ERL_DRV_EXT2TERM` operand and hands the term
+/// to this runtime's [`DriverPort`] host; the port pump drains it as a bare message
+/// (`PortEvent::Term { to: None, … }`, the owner) and the scheduler delivers it into the owner's
+/// mailbox, which is the only thing that can wake the blocked `receive {7, 9}`.
+///
+/// Oracle ground truth (OTP 29 / `erts-17.1`, the very same `.so` compiled as `eventt`):
+///
+/// ```none
+/// $ erl -noshell -eval 'ok = erl_ddll:load_driver("<dir>", "eventt"),
+///       P = open_port({spawn_driver, "eventt"}, [binary]),
+///       true = port_command(P, <<"go">>),
+///       receive {7,9} -> io:format("~p~n",[{7,9}]) after 5000 -> timeout end, halt(0).'
+/// {7,9}
+/// ```
+#[test]
+fn a_driver_output_term_reaches_the_owner_as_a_bare_term() {
+    with_event_mode("outputterm", 2, "eventt", "recv_term", |rt, result| {
+        assert_is_the_7_9_tuple(rt, result, "erl_drv_output_term");
+    });
+}
+
+/// The same term, emitted with `erl_drv_send_term` to `driver_connected`'s pid, reaches that
+/// **explicit destination**.
+///
+/// `erl_drv_send_term`'s `to` operand is the pid **term data** `driver_connected` answers with, so
+/// the port pump resolves it through `ProcessId::from_eterm` and delivers to the named pid
+/// (`PortEvent::Term { to: Some(pid), … }`) rather than defaulting to the owner — a destination this
+/// runtime cannot resolve is dropped, never misdelivered. The Erlang half is the same
+/// `recv_term/0`, so the assertion also shows the explicit-destination path is *indistinguishable*
+/// from the owner path when the connected process is the recipient, exactly as the oracle has it.
+///
+/// Oracle ground truth (OTP 29 / `erts-17.1`, the very same `.so` compiled as `eventp`):
+///
+/// ```none
+/// $ erl -noshell -eval 'ok = erl_ddll:load_driver("<dir>", "eventp"),
+///       P = open_port({spawn_driver, "eventp"}, [binary]),
+///       true = port_command(P, <<"go">>),
+///       receive {7,9} -> io:format("~p~n",[{7,9}]) after 5000 -> timeout end, halt(0).'
+/// {7,9}
+/// ```
+#[test]
+fn a_driver_send_term_reaches_the_connected_process() {
+    with_event_mode("sendterm", 3, "eventp", "recv_term", |rt, result| {
+        assert_is_the_7_9_tuple(rt, result, "erl_drv_send_term");
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
 // The driver registry surface: `driver_lock_driver` + `add_driver_entry`/`remove_driver_entry`
 // ---------------------------------------------------------------------------------------------
 

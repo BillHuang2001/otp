@@ -97,6 +97,12 @@
 //! whoever holds that queue — the runtime's port pump, which owns the process table — drains it
 //! and delivers each entry's term to its destination.
 //!
+//! One spec operand is not self-contained: `ERL_DRV_EXT2TERM` carries an external-term *image* the
+//! runtime has to decode. `beam_abi` owns no ETF decoder, so it calls
+//! [`DriverHost::binary_to_term`], which [`DriverPort`] implements over
+//! [`beam_codec::decode_term`] — the same acceptance rule the C's `binary2term_prepare`
+//! (`external.c:1745`) applies (a leading `VERSION_MAGIC`, plus the `COMPRESSED` wrapper). A
+//! malformed image aborts the whole decode (`ERTS_DDT_FAIL`), never a partial term.//!
 //! The queue is per port and shared by handle between the host (which pushes, from inside a
 //! callback) and the runtime (which takes the handle before the port is registered and drains it).
 //! Its one invariant is a lifetime one: a term's words live on [`DriverPort`]'s arena, so they may
@@ -587,6 +593,47 @@ impl DriverHost for DriverPort {
         Some(make_atom(self.interner.intern(name)))
     }
 
+    /// Decodes the external-term image behind the term-data machine's `ERL_DRV_EXT2TERM` operand
+    /// (`io.c:5824`).
+    ///
+    /// The C requires the image's leading `VERSION_MAGIC` and, when the byte after it is
+    /// `COMPRESSED`, inflates the inner body first (`binary2term_prepare`, `external.c:1745-1760`);
+    /// anything malformed is the driver's own "Invalid data" failure (`ERTS_DDT_FAIL`, `io.c:5842`).
+    /// [`beam_codec::decode_term`] implements exactly that acceptance rule for this runtime — it
+    /// owns both the version-byte check and the `COMPRESSED` wrapper, and it refuses trailing
+    /// garbage for the plain form — so this hook is a straight delegation. An invalid image answers
+    /// `None` (the whole term-data decode aborts, exactly like the C), never a partial or wrong
+    /// term.
+    ///
+    /// The term is built on **this host's own arena** ([`DriverHost::heap`]), which lives as long as
+    /// the driver does: the C builds the term on the *receiving process's* heap and delivers it from
+    /// inside the callback, but the frozen seam gives a host no receiver mailbox, so the decoded term
+    /// is queued instead (see the module docs) and the driver may keep reading it until the port is
+    /// torn down.
+    ///
+    /// Atom handling follows [`DriverHost::intern_atom`] exactly: a name the shared table already
+    /// holds keeps its index, and a name it does not is recorded on the pending interner at its
+    /// predicted index for [`DriverPort::commit_atoms`] to materialise once the caller's borrow of
+    /// the table is released. The decoder needs `&mut AtomTable`, so the shared table is **cloned**
+    /// (the [`beam_bifs::binconv`] precedent); nothing is ever minted *through* that clone — a fresh
+    /// name goes onto the interner — so this host can never hand out an index the runtime's own
+    /// table cannot see.
+    fn binary_to_term(&mut self, bytes: &[u8]) -> Option<Eterm> {
+        let mut local = (*self.atoms).clone();
+        let known = local.len();
+        let term = beam_codec::decode_term(bytes, &mut self.heap, &mut local).ok()?;
+        // Record the names the decoder appended, in order, so the interner predicts the very
+        // indices the cloned table assigned them. `intern` (not `intern_atom`) is load-bearing: the
+        // interner's `base` was fixed when this host was built, so appending mid-sequence would
+        // shift the prediction of every name recorded after it.
+        for index in known..local.len() {
+            let Some(name) = local.name(beam_term::Atom::from_raw(index as u32)) else {
+                continue;
+            };
+            self.interner.intern(name);
+        }
+        Some(term)
+    }
     /// Records the port's request to watch `event` (`driver_select`); the port lifecycle applies
     /// it as soon as this callback returns (see the module docs).
     ///
@@ -1381,6 +1428,139 @@ mod tests {
         // ...and the handle's own table still does not see it: it is the caller's job to commit
         // into the *live* table (see `DriverPort::commit_atoms`).
         assert_eq!(atoms.name(atom_val(fresh)), None);
+    }
+
+    /// The external-term image behind `ERL_DRV_EXT2TERM` decodes onto the host's own arena.
+    ///
+    /// The image is produced with `beam_codec` (this runtime's `term_to_binary`) and decoded
+    /// through the very hook `beam_abi`'s term-data machine calls. Comparing by **re-encoding** the
+    /// decoded term avoids the unsafe term accessors a unit test in this crate may not use, and it
+    /// still discriminates: a wrong term, a wrong atom index or a dropped element changes the
+    /// bytes.
+    #[test]
+    fn an_ext2term_image_decodes_onto_the_hosts_arena() {
+        let mut table = AtomTable::new();
+        let known = table.intern("known");
+        let atoms = Rc::new(table);
+        let mut host = host(&atoms);
+
+        // `{known, 42}` — both names already in the shared table.
+        let source = host
+            .heap()
+            .tuple(&[make_atom(known), beam_term::make_small(42)])
+            .expect("a two-tuple fits");
+        let mut encoder = beam_codec::Encoder::new(&atoms);
+        encoder.encode(source).expect("the source term encodes");
+        let image = encoder.finish();
+
+        let decoded = host
+            .binary_to_term(&image)
+            .expect("a valid external-term image decodes");
+        let mut encoder = beam_codec::Encoder::new(&atoms);
+        encoder.encode(decoded).expect("the decoded term re-encodes");
+        assert_eq!(encoder.finish(), image, "the decoded term is the {{known, 42}} tuple");
+    }
+
+    /// A name the image carries but the shared table does not hold is recorded on the **pending
+    /// interner** at the index the decoder's table clone assigned it — never minted through that
+    /// clone — so `commit_atoms` lands it at exactly that index.
+    #[test]
+    fn an_ext2term_image_predicts_a_new_atoms_index() {
+        // The shared table starts **empty**, so the image's atom is the first new name.
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+
+        // `{a, 7}`, encoded against a table that holds `a` at index 0.
+        let mut other = AtomTable::new();
+        let a = other.intern("a");
+        let mut encoder = beam_codec::Encoder::new(&other);
+        encoder
+            .encode(
+                host.heap()
+                    .tuple(&[make_atom(a), beam_term::make_small(7)])
+                    .expect("a two-tuple fits"),
+            )
+            .expect("the source term encodes");
+        let image = encoder.finish();
+
+        let decoded = host
+            .binary_to_term(&image)
+            .expect("a valid external-term image decodes");
+        // Not resolvable until committed: the hook never mints through the shared table.
+        assert_eq!(atoms.len(), 0, "the shared table is never written through the clone");
+
+        // Committing lands `a` at index 0, so re-encoding the decoded term against the committed
+        // table reproduces the image byte-for-byte — which it could not if the prediction had
+        // drifted.
+        let mut committed = (*atoms).clone();
+        host.commit_atoms(&mut committed);
+        assert_eq!(committed.name(Atom::from_raw(0)), Some("a"));
+        let mut encoder = beam_codec::Encoder::new(&committed);
+        encoder.encode(decoded).expect("the decoded term re-encodes");
+        assert_eq!(encoder.finish(), image, "the predicted atom index is the decoded one");
+    }
+
+    /// A malformed image is the C's `ERTS_DDT_FAIL` (`io.c:5842`) — `None`, never a partial term
+    /// and never a panic. `binary2term_prepare` (`external.c:1745`) requires the leading
+    /// `VERSION_MAGIC`, and `beam_codec::decode_term` enforces exactly that.
+    #[test]
+    fn an_invalid_ext2term_image_answers_none() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+        for image in [
+            &[][..],                      // no bytes at all
+            &[131],                       // the version byte alone: truncated
+            &[97, 1],                     // a term body with no version byte
+            &[131, 97],                   // a truncated small int
+            &[131, 104, 2, 97, 1],        // a 2-tuple with one element missing
+            &[131, 116, 0, 0, 0, 1],      // a map header with no pairs
+            &[131, 80, 0, 0, 0, 4, 1, 2], // a `COMPRESSED` wrapper with a bad stream
+        ] {
+            assert_eq!(host.binary_to_term(image), None, "image {image:?}");
+        }
+    }
+
+    /// The C's `binary2term_prepare` also accepts a top-level `COMPRESSED` wrapper
+    /// (`external.c:1754-1760`); the hook inherits `beam_codec::decode_term`'s handling of it.
+    #[test]
+    fn a_compressed_ext2term_image_decodes() {
+        let mut table = AtomTable::new();
+        let known = table.intern("known");
+        let atoms = Rc::new(table);
+        // A list of 400 cons cells needs more than the smoke-test arena.
+        let mut host = DriverPort::new(
+            Heap::new(4096).expect("a test heap"),
+            Rc::clone(&atoms),
+            ProcessId::new(1, 0),
+        );
+        let mut list = beam_term::NIL;
+        // A long list of small ints: big enough that zlib's framing pays off, so the image really
+        // carries the `COMPRESSED` wrapper (a small body reverts to the plain image).
+        for value in (0..400_i64).rev() {
+            list = host.heap().cons(beam_term::make_small(value), list).expect("fits");
+        }
+        let source = host
+            .heap()
+            .tuple(&[make_atom(known), list])
+            .expect("a two-tuple fits");
+        let mut encoder = beam_codec::Encoder::new(&atoms);
+        encoder.encode(source).expect("the source term encodes");
+        let plain = encoder.finish();
+        let mut encoder = beam_codec::Encoder::new(&atoms);
+        encoder.encode(source).expect("the source term encodes");
+        let compressed = encoder.finish_compressed(6).expect("zlib is available");
+        assert_eq!(
+            (compressed[0], compressed[1]),
+            (beam_codec::VERSION_MAGIC, 80),
+            "the image must carry the COMPRESSED wrapper for this case to mean anything"
+        );
+
+        let decoded = host
+            .binary_to_term(&compressed)
+            .expect("a valid compressed image decodes");
+        let mut encoder = beam_codec::Encoder::new(&atoms);
+        encoder.encode(decoded).expect("the decoded term re-encodes");
+        assert_eq!(encoder.finish(), plain, "the compressed image is the same term");
     }
 
     /// `erl_drv_output_term` / `erl_drv_send_term` queue their decoded term on the port's
