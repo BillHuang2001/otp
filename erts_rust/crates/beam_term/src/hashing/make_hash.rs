@@ -25,10 +25,22 @@
 //! `1 + (make_hash(T) % R)` for `R < 2^32`, and the raw `make_hash(T) + 1` for
 //! `R = 2^32` (`bif.c:5370-5420`). See the `common` submodule for the shared
 //! error-handling note and the `make_hash2` submodule for the other port.
+//!
+//! Two term shapes need care beyond the straight transcription:
+//!
+//! * a **native record** reaches the definition tuple (the C's `RECORD_DEF` arm
+//!   walks `boxed_val(term)+1`, `erl_term_hashing.c:369-378`), whose payload index 1
+//!   is the definition's cached `hash` word; that one word is hashed from
+//!   [`compute_record_definition_hash`] because `record::write_record` can only
+//!   store a placeholder (see the `HOp::RecordInit` arm);
+//! * an **internal reference** mixes `internal_ref_numbers(term)[0]`
+//!   (`:288-290`) — an id of the node container this tree's M1 `Ref` thing does not
+//!   carry — so it is refused with `TermError::RefIdentityUnavailable` rather than
+//!   mixed from a different word.
 
 use crate::atom::AtomTable;
 use crate::bitstring::float_bits;
-use crate::boxed::{arityval, boxed_val, header_subtag, internal_ref_numbers};
+use crate::boxed::{arityval, boxed_val, header_subtag};
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
 use crate::fun::{
@@ -36,7 +48,7 @@ use crate::fun::{
     fun_true_arity, FunKind,
 };
 use crate::immediate::{
-    atom_val, internal_port_data, is_byte, pid_number, signed_value, unsigned_value,
+    atom_val, internal_port_data, is_byte, make_small, pid_number, signed_value, unsigned_value,
 };
 use crate::list::{is_list, list_val};
 use crate::tag::{
@@ -52,7 +64,7 @@ use super::common::{
     bitstring_parts_any, uint32_hash_step, HItem, HOp, FN1, FN10, FN11, FN12, FN13, FN14, FN15,
     FN2, FN3, FN4, FN5, FN6, FN8, FN9,
 };
-use super::make_hash2::make_hash2;
+use super::make_hash2::{compute_record_definition_hash, make_hash2};
 
 /// `hash_binary_bytes(bin, hash)` (`erl_term_hashing.c:114-163`) — `make_hash`'s
 /// byte-wise binary hash.
@@ -155,6 +167,11 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
     let mut stack: Vec<HItem> = Vec::new();
     let mut term = t;
     let mut op = hash_tag_def(term)?;
+    // The native-record definition-`hash` override (see the `HOp::RecordInit` arm):
+    // the single payload word named here is hashed as the carried value instead of
+    // the word actually stored there. The address is unique in the term graph, so
+    // the slot fires at most once and is cleared as soon as it does.
+    let mut def_hash_patch: Option<(*const Eterm, Eterm)> = None;
 
     loop {
         match op {
@@ -246,8 +263,13 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
             }
             HOp::Ref | HOp::ExternalRef => {
                 let first = if op == HOp::Ref {
-                    // SAFETY: the tag says internal reference.
-                    unsafe { internal_ref_numbers(term)[0] }
+                    // The C mixes `internal_ref_numbers(term)[0]`
+                    // (`erl_term_hashing.c:288-290`) — the first id of the reference's
+                    // **node container**. This tree's M1 on-heap `Ref` thing carries a
+                    // single process-local id and no node container, so the oracle's
+                    // value (itself environment-dependent) cannot be reproduced.
+                    // Refuse rather than mix a wrong number.
+                    return Err(TermError::RefIdentityUnavailable);
                 } else {
                     // SAFETY: the tag says external reference.
                     // `external_ref_numbers(x)` is `&external_ref_data(x)[1]` — the word
@@ -283,6 +305,31 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
                 let base = boxed_val(term);
                 // SAFETY: word 0 is the (live) header.
                 let arity = arityval(unsafe { *base });
+                if op == HOp::RecordInit {
+                    // The C `RECORD_DEF` arm (`erl_term_hashing.c:369-378`) walks the
+                    // record instance's `[definition_term, v0..v(n-1)]` payload, so the
+                    // walk reaches the definition **tuple** — whose payload index 1 is
+                    // the definition's cached `hash` word. `records:create/4` stores the
+                    // true `make_hash2` value of the definition there
+                    // (`erl_record.c:1041-1054`), but this tree's
+                    // `record::write_record` can only store a caller-supplied
+                    // placeholder, so that one word is hashed from
+                    // `compute_record_definition_hash` instead. Everything else about
+                    // the walk (the `hash*FN9 + (n+5)` definition-tuple finish, the `n`
+                    // values, the `hash*FN15 + (n+1)` record finish) is unchanged.
+                    //
+                    // SAFETY: word 1 of a record instance is its boxed definition; the
+                    // readers validate it (a malformed definition is `BadRecord`
+                    // before any pointer arithmetic happens below).
+                    let def = unsafe { *base.add(1) };
+                    let def_hash = compute_record_definition_hash(def, atoms)?;
+                    // SAFETY: a validated definition block is an arityval block whose
+                    // payload index 1 (word 2) is the cached `hash` term.
+                    def_hash_patch = Some((
+                        unsafe { boxed_val(def).add(2) },
+                        make_small(i64::from(def_hash)),
+                    ));
+                }
                 stack.push(HItem::Count(arity));
                 // SAFETY: an arityval block has `arity` elements at words 1..=arity.
                 stack.push(HItem::Ptr(unsafe { base.add(1) }));
@@ -300,6 +347,13 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
                 if i != 0 {
                     // SAFETY: `ptr` is inside a live term array with `i` elements.
                     term = unsafe { *ptr };
+                    // The record-definition `hash` override (see `HOp::RecordInit`).
+                    if let Some((slot, value)) = def_hash_patch {
+                        if slot == ptr {
+                            term = value;
+                            def_hash_patch = None;
+                        }
+                    }
                     // SAFETY: one element fewer from the next word.
                     stack.push(HItem::Ptr(unsafe { ptr.add(1) }));
                     stack.push(HItem::Count(i - 1));
