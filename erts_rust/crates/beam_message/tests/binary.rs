@@ -193,6 +193,94 @@ fn an_on_heap_small_binary_is_copied_by_value() {
     assert_eq!(copied_bytes, &bytes[..]);
 }
 
+/// Whether `addr` lies inside `heap`'s live region `[base, hend)`.
+fn heap_contains(heap: &Heap, addr: usize) -> bool {
+    let base = heap.hp() as usize - heap.used() * core::mem::size_of::<Eterm>();
+    addr >= base && addr < heap.hend() as usize
+}
+
+#[test]
+fn a_match_context_is_flattened_and_leaves_no_dangling_source_reference() {
+    // An on-heap bitstring over a known, non-uniform pattern, so a bit shift would be visible.
+    let bytes = [0xA5u8, 0x3C, 0xDE, 0x7E, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let hb_bits = bytes.len() * 8; // 80
+
+    let mut src = Heap::new(64).expect("source heap");
+    // SAFETY: `heap_bits_size_words(80)` words hold the `ErlHeapBits`; the payload fits.
+    let original = unsafe {
+        let hp = src
+            .alloc_words(heap_bits_size_words(hb_bits))
+            .expect("the heap binary fits");
+        write_heap_bits(hp, &bytes, hb_bits).expect("the payload fits")
+    };
+
+    // A match context over it: the window starts at a NON-zero, NON-byte-aligned bit offset.
+    let start = 3usize;
+    let size = 21usize; // deliberately not a multiple of 8
+    let end = start + size;
+    // SAFETY: the on-heap bitstring's data base is word-aligned (its low flag bits are clear).
+    let base = unsafe { bitstring_parts(original) }.0;
+    // SAFETY: 5 words are reserved for the `ErlSubBits`; `base` covers bits `start..end`.
+    let mc = unsafe {
+        let hp = src.alloc_words(5).expect("the match context fits");
+        write_sub_bits(
+            hp,
+            Eterm::from_raw(base as usize),
+            Eterm::from_raw(start),
+            Eterm::from_raw(end),
+            original,
+        )
+    };
+    assert!(
+        !unsafe { is_refc_binary(mc) },
+        "the match context is not a refc binary"
+    );
+    // The preflight sizes the *flattened window*, NOT the 5-word `ErlSubBits` block.
+    assert_eq!(size_of_copy(mc), heap_bits_size_words(size));
+
+    // Copy the match context out of the source heap.
+    let mut dst = Heap::new(64).expect("destination heap");
+    let copy = copy_struct_simple(mc, &mut dst).expect("the copy succeeds");
+
+    // The copy is a fresh ON-HEAP bitstring (not an `ErlSubBits`), of the window's bit size.
+    // SAFETY: `copy` is a live boxed term.
+    let header = unsafe { *boxed_val(copy) };
+    assert_eq!(
+        header.raw() & TAG_HEADER_MASK,
+        HEAP_BITS_SUBTAG,
+        "a match context is flattened to an on-heap bitstring"
+    );
+    assert!(!unsafe { is_refc_binary(copy) });
+    let (copied_base, copied_off, copied_size) = unsafe { bitstring_parts(copy) };
+    assert_eq!((copied_off, copied_size), (0, size), "the window's bits, base-aligned");
+
+    // Every copied bit equals the SOURCE WINDOW bit `start + i` - the bit shift is honoured.
+    for i in 0..size {
+        // SAFETY: `original` and `copy` are live bitstrings covering the tested bits.
+        assert_eq!(
+            unsafe { bit_at(copy, i) },
+            unsafe { bit_at(original, start + i) },
+            "bit {i} of the copied window"
+        );
+    }
+
+    // The core property: the copy's data lives INSIDE the destination and NOT inside the source,
+    // so it stays valid once the source process/heap is gone.
+    assert!(
+        heap_contains(&dst, copied_base as usize),
+        "the copy's data is in the destination"
+    );
+    assert!(
+        !heap_contains(&src, copied_base as usize),
+        "no aliasing into the source heap"
+    );
+    assert!(
+        !heap_contains(&src, boxed_val(copy) as usize),
+        "the copied term is not in the source heap"
+    );
+    assert_eq!(dst.used(), heap_bits_size_words(size));
+}
+
 #[test]
 fn a_refc_binary_with_no_owning_handle_is_a_bad_term() {
     let bytes = payload();

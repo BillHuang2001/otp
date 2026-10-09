@@ -375,6 +375,33 @@ fn bin_ref(heap: &mut Heap, slot: usize) -> Eterm {
     }
 }
 
+/// Builds a `SUB_BITS` **match context** over a fresh on-heap bitstring on `heap`: a window
+/// starting at a NON-byte-aligned bit offset, whose `orig` is that on-heap bitstring.
+fn match_context(heap: &mut Heap) -> Eterm {
+    let bytes = [0x5Au8; 9];
+    let hb_bits = bytes.len() * 8;
+    // SAFETY: `heap_bits_size_words(hb_bits)` words are reserved and the payload fits.
+    let hb = unsafe {
+        let hp = heap.alloc_words(heap_bits_size_words(hb_bits)).expect("fits");
+        write_heap_bits(hp, &bytes, hb_bits).expect("the payload fits")
+    };
+    let start = 3usize;
+    let end = start + 21;
+    // SAFETY: the on-heap bitstring's data base is word-aligned, `hb`'s payload covers bits
+    // `start..end`, and 5 words are reserved for the `ErlSubBits`.
+    unsafe {
+        let base = bitstring_parts(hb).0;
+        let hp = heap.alloc_words(5).expect("the match context fits");
+        write_sub_bits(
+            hp,
+            Eterm::from_raw(base as usize),
+            Eterm::from_raw(start),
+            Eterm::from_raw(end),
+            hb,
+        )
+    }
+}
+
 /// Writes a flatmap (or HAMT map, past `MAP_SMALL_MAP_LIMIT`) on `heap`.
 fn write_map_term(heap: &mut Heap, pairs: &[(Eterm, Eterm)], atoms: &AtomTable) -> Eterm {
     // SAFETY: `map_words_capacity` is a sound upper bound on the words `write_map` writes.
@@ -404,8 +431,12 @@ fn no_live_term_is_left_pointing_into_the_source_heap() {
     let fun_env = src.tuple(&[make_small(11), list]).expect("the env fits");
     let fun = make_local_fun(&mut src, 2, 0xDEAD_BEEF_0000_0001, 7, &[fun_env]);
 
+    // A `SUB_BITS` match context: `copy_struct` must *flatten* it into an on-heap bitstring inside
+    // the destination (its `base_flags`/`orig` would otherwise still point into `src`).
+    let mc = match_context(&mut src);
+
     let root = src
-        .tuple(&[nested, list, flat_map, hamt_map, fun])
+        .tuple(&[nested, list, flat_map, hamt_map, fun, mc])
         .expect("the root tuple fits");
 
     let cap = size_of_copy(root) + 16;

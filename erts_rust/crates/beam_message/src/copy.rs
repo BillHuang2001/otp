@@ -155,7 +155,10 @@ fn needs_visit(term: Eterm) -> bool {
 /// It mirrors [`shallow`]/[`copy_refc_binary`]'s allocation exactly: `2` words per cons cell,
 /// [`ERL_BIN_REF_SIZE`] for an off-heap MSO container, [`ERL_REFC_BITS_SIZE`] for a refc binary,
 /// nothing for the shared zero-arity-tuple literal, and [`layout::object_words`] for every other
-/// boxed object (walking its child slots with [`layout::for_each_child_slot`]).
+/// boxed object (walking its child slots with [`layout::for_each_child_slot`]). A `SUB_BITS`
+/// **match context** is one of those "other" objects: [`layout::object_words`] returns the
+/// `heap_bits_size_words(size)` block [`copy_match_context`] writes and [`layout::for_each_child_slot`]
+/// yields no child, so this walk sizes it exactly as the copy writes it.
 ///
 /// The `limit` is what makes it cycle-safe: a forged cyclic graph revisits its own objects, so its
 /// count grows without bound and the walk stops at `limit` instead of looping forever. Every
@@ -189,6 +192,9 @@ fn bounded_words(term: Eterm, limit: usize) -> Option<usize> {
                     } else if layout::is_refc_binary_term(current) {
                         total = total.saturating_add(ERL_REFC_BITS_SIZE);
                     } else {
+                        // Everything else — including a `SUB_BITS` match context, whose
+                        // `object_words` is the flattened heap-bits block's size — is sized by
+                        // `object_words` and walked by `for_each_child_slot`.
                         let p = boxed_val(current);
                         // SAFETY: `current` is a live boxed term, so `p` addresses its header word.
                         let header = unsafe { *p };
@@ -369,6 +375,40 @@ fn copy_refc_binary(to: &mut Heap, ctx: &mut CopyContext<'_>, src: Eterm) -> Res
     }
 }
 
+/// Flattens the `SUB_BITS` **match context** `src` into a fresh on-heap bitstring on `to`.
+///
+/// Ground truth: `copy.c:849-863`. When an `ErlSubBits` is *not* a refc binary
+/// (`ERTS_GET_BITSTRING_REF(from_sb) == NULL`) the C takes the `else` branch and materialises a
+/// brand-new `ErlHeapBits` block for the window —
+/// `*argp = HEAP_BITSTRING(hbot, erl_sub_bits_get_base(from_sb), from_sb->start, size)` — so the
+/// destination carries no `base_flags`/`orig` pointer into the source process's heap.
+///
+/// The window is `size = end - start` bits taken from the source base starting at bit offset
+/// `start`, packed MSB-first (the bit order [`write_heap_bits`] expects). `size` is at most
+/// [`ERL_ONHEAP_BITS_LIMIT`] for a genuine match context (its `orig` is an on-heap bitstring),
+/// matching the C's `ASSERT(erl_sub_bits_is_match_context(from_sb))`.
+fn copy_match_context(to: &mut Heap, src: Eterm) -> Result<Eterm> {
+    // SAFETY: `src` is a live match-context `ErlSubBits`, so its words 1..4 are initialised and
+    // the window `start..end` is covered by its base storage.
+    let (_base_flags, start, end, _orig) = unsafe { sub_bits_parts(src) };
+    let size = end.raw().saturating_sub(start.raw());
+
+    // Pack the window bits MSB-first, bit by bit, exactly as the C `HEAP_BITSTRING` does.
+    let mut bytes = vec![0u8; bit_count_to_bytes(size)];
+    for i in 0..size {
+        // SAFETY: `src` is a live bitstring and `i < size` is within its bit range.
+        if unsafe { bit_at(src, i) } {
+            bytes[i >> 3] |= 1 << (7 - (i & 7));
+        }
+    }
+
+    // SAFETY: `alloc_words` returns `heap_bits_size_words(size)` exclusively-owned, writable words.
+    let dst = unsafe { to.alloc_words(heap_bits_size_words(size))? };
+    // SAFETY: `dst` owns `heap_bits_size_words(size)` words and `bytes` holds `ceil(size / 8)`;
+    // `?` maps a `TermError` into the crate error via `From<TermError> for BeamError`.
+    Ok(unsafe { write_heap_bits(dst, &bytes, size)? })
+}
+
 /// Materialises one destination object for `src` (the shallow half of the copy) and records a
 /// fix-up for each of its non-shared children, which the caller's worklist loop resolves.
 ///
@@ -420,6 +460,14 @@ pub(crate) fn shallow(
             // A refc binary (the `[BinRef][ErlSubBits]` pair) shares its off-heap payload.
             if layout::is_refc_binary_term(src) {
                 return copy_refc_binary(to, ctx, src);
+            }
+
+            // A `SUB_BITS` **match context** (an `ErlSubBits` over an on-heap bitstring) is
+            // *flattened* into a fresh on-heap bitstring, so the copy never leaves the destination
+            // term pointing into the source process's heap — the dangling reference a verbatim
+            // 5-word leaf copy (the generic path below) would produce.
+            if layout::is_match_context_term(src) {
+                return copy_match_context(to, src);
             }
 
             let src_obj = boxed_val(src);

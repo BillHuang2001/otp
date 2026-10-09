@@ -26,8 +26,8 @@
 //!
 //! 1. `size_object(term) == to.used()` and `to.used() <= to.capacity()` - the preflight is neither
 //!    an under- nor an over-reservation, for a corpus spanning immediates-free compounds, deep and
-//!    improper lists, flat maps, HAMT maps, funs, native records, on-heap bitstrings, off-heap MSO
-//!    containers and refc binaries;
+//!    improper lists, flat maps, HAMT maps, funs, native records, on-heap bitstrings, `SUB_BITS`
+//!    match contexts, off-heap MSO containers and refc binaries;
 //! 2. a destination one word short is **refused before a single word is written** - the error is the
 //!    typed message-heap allocation failure and `to.used() == 0` (no partial write), and no off-heap
 //!    artifact is registered either.
@@ -36,15 +36,10 @@
 //! file pins the agreement between it and `layout::object_words` - the per-object counter the
 //! incremental allocator reserves with - and would fail loudly if either drifted.
 //!
-//! # One documented disagreeing shape (excluded from the corpus)
-//!
-//! A **standalone `ErlSubBits` match context** (a `SUB_BITS` whose `orig` is an on-heap bitstring
-//! rather than a `BinRef`) is the one shape where the two sizings disagree by design:
-//! `beam_term::size_object` reports the size of the fresh heap-bits window the *C* copier
-//! materialises (`copy.c:232-239`), while this crate's copier treats the match context as an opaque
-//! leaf and copies its `ERL_SUB_BITS_SIZE` words verbatim (a documented M1 gap - no match-context
-//! constructor exists yet). The copier's preflight uses its **own** count, so the reservation is
-//! still exactly what is written; only the `size_object` cross-check does not hold for that shape.
+//! A standalone `ErlSubBits` **match context** (a `SUB_BITS` whose `orig` is an on-heap bitstring
+//! rather than a `BinRef`) is included: `beam_term::size_object` and this crate's copier both
+//! report the size of the fresh heap-bits window `copy_struct` materialises for it
+//! (`copy.c:232-239`), so the two counts agree for that shape too.
 
 use beam_alloc::{Heap, RefcBinary};
 use beam_common::{AllocKind, BeamError};
@@ -199,6 +194,33 @@ fn off_heap_container(s: &mut Src) -> Eterm {
     bin_ref(&mut s.heap, slot)
 }
 
+/// Builds a `SUB_BITS` **match context** over a fresh on-heap bitstring on `s.heap`: a window
+/// starting at a NON-byte-aligned bit offset, whose `orig` is the on-heap bitstring.
+fn match_context(s: &mut Src) -> Eterm {
+    let bytes = [0xA5u8; 12];
+    let hb_bits = bytes.len() * 8;
+    // SAFETY: `heap_bits_size_words(hb_bits)` words are reserved and the payload fits.
+    let hb = unsafe {
+        let hp = s.heap.alloc_words(heap_bits_size_words(hb_bits)).expect("fits");
+        write_heap_bits(hp, &bytes, hb_bits).expect("the payload fits")
+    };
+    let start = 5usize;
+    let end = start + 27;
+    // SAFETY: the on-heap bitstring's data base is word-aligned, `hb`'s payload covers bits
+    // `start..end`, and 5 words are reserved for the `ErlSubBits`.
+    unsafe {
+        let base = bitstring_parts(hb).0;
+        let hp = s.heap.alloc_words(5).expect("the match context fits");
+        write_sub_bits(
+            hp,
+            Eterm::from_raw(base as usize),
+            Eterm::from_raw(start),
+            Eterm::from_raw(end),
+            hb,
+        )
+    }
+}
+
 fn refc_binary(s: &mut Src) -> Eterm {
     let bytes: Vec<u8> = (0..200usize).map(|i| ((i * 7) % 251) as u8).collect();
     s.off.push_binary(RefcBinary::new(&bytes).expect("the payload allocates"));
@@ -249,6 +271,7 @@ const CORPUS: &[(&str, fn(&mut Src) -> Eterm)] = &[
     ("external fun", external_fun),
     ("native record", native_record),
     ("on-heap bitstring", on_heap_bitstring),
+    ("match context over an on-heap bitstring", match_context),
     ("off-heap MSO container", off_heap_container),
     ("refc binary", refc_binary),
     ("graph with a shared refc binary", graph_with_refc_binary),
