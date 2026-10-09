@@ -81,6 +81,13 @@ fn pair(reply: Eterm) -> (Eterm, Eterm) {
     )
 }
 
+/// The integer `process_info(Pid, trace)` answers.
+fn trace_of(runtime: &mut crate::Runtime, pid: Eterm) -> i64 {
+    let (key, value) = pair(info(runtime, pid, "trace").expect("process_info/2 trace"));
+    assert_eq!(runtime.atom_name_of(key), Some("trace"));
+    signed_value(value)
+}
+
 /// The key names of a `process_info/1` reply, in order.
 fn keys_of(runtime: &mut crate::Runtime, reply: Eterm) -> Vec<String> {
     terms::list_elements(reply)
@@ -261,6 +268,9 @@ fn the_reachable_items_have_their_oracle_shapes() {
         assert!(is_atom(value), "{name} is an atom");
         assert_eq!(runtime.atom_name_of(value), Some(expected), "{name}");
     }
+    // `trace` is an integer bitmask, `0` here because the root process is untraced; the live
+    // per-process values (`[call]` ⇒ 1024, `[all]` ⇒ 32763895) are pinned by
+    // `the_trace_item_is_the_live_erts_tracee_flag_bitmask`.
     for (name, expected) in [("trace", 0), ("min_heap_size", 233), ("min_bin_vheap_size", 46_422)] {
         let (key, value) = pair(info(&mut runtime, pid, name).expect("integer item"));
         assert_eq!(runtime.atom_name_of(key), Some(name));
@@ -303,6 +313,107 @@ fn the_reachable_items_have_their_oracle_shapes() {
     );
 }
 
+/// The `trace` item is the process's **live** ERTS tracee-flag **bitmask** — an integer, not
+/// the `trace_info(Pid, flags)` atom list — and it tracks `erlang:trace/3` for real.
+///
+/// Oracle (OTP 29.1.1 / erts-17.1), the very commands this test mirrors:
+///
+/// ```text
+/// P = spawn(fun() -> receive stop -> ok end end),
+/// process_info(P, trace)                               => {trace,0}
+/// erlang:trace(P,true,[call]), process_info(P, trace)  => {trace,1024}
+/// erlang:trace(P,false,[call]),
+/// erlang:trace(P,true,[all]),  process_info(P, trace)  => {trace,32763895}
+/// ```
+///
+/// C ground truth: `res = make_small(ERTS_IS_P_TRACED_FL(rp, TRACEE_FLAGS))`
+/// (`erl_bif_info.c:2133`).
+#[test]
+fn the_trace_item_is_the_live_erts_tracee_flag_bitmask() {
+    use crate::trace::flags_from_atoms;
+
+    let mut runtime = runtime();
+    let pid = root_pid(&mut runtime);
+    let internal = ProcessId::from_eterm(pid).expect("an internal pid");
+
+    // Untraced: the zero bitmask (the oracle's `{trace,0}`).
+    assert_eq!(trace_of(&mut runtime, pid), 0, "an untraced process is 0");
+
+    // A real `erlang:trace(P, true, [call])` is 1024.
+    runtime
+        .trace_mut()
+        .set(internal, flags_from_atoms(&["call"]).expect("call"), None);
+    assert_eq!(trace_of(&mut runtime, pid), 1024);
+
+    // `[all]` is 32763895 — the oracle's own `all` bitmask.
+    runtime
+        .trace_mut()
+        .set(internal, flags_from_atoms(&["all"]).expect("all"), None);
+    assert_eq!(trace_of(&mut runtime, pid), 32_763_895);
+
+    // ... and turning tracing off puts it back to 0.
+    runtime.trace_mut().clear(internal);
+    assert_eq!(trace_of(&mut runtime, pid), 0, "cleared ⇒ back to 0");
+}
+
+/// `trace_bitmask` maps **every** canonical trace-flag atom to the ERTS bit the oracle sets for
+/// an isolated `erlang:trace(P, true, [Atom])`.
+///
+/// Each expected value below was observed on OTP 29.1.1 / erts-17.1 (one `erl` per atom:
+/// `P = spawn(fun() -> receive stop -> ok end end), erlang:trace(P,true,[Atom]),
+/// io:format("~p~n",[element(2, process_info(P,trace))])`); they sum to the oracle's `[all]`
+/// bitmask, 32763895. The coverage assertion is the **drift guard**: if
+/// [`crate::trace::flags_to_atoms`] ever grows a canonical atom this table lacks (or the table
+/// loses one), the lengths differ and the test fails rather than silently dropping a bit.
+#[test]
+fn trace_bitmask_maps_every_canonical_atom_to_the_oracles_bit() {
+    use super::{trace_bitmask, ERTS_TRACE_FLAG_BITS};
+    use crate::trace::{flags_from_atoms, flags_to_atoms};
+
+    for (name, expected) in [
+        ("timestamp", 1),
+        ("strict_monotonic_timestamp", 2),
+        ("monotonic_timestamp", 4),
+        ("send", 16),
+        ("receive", 32),
+        ("set_on_spawn", 64),
+        ("set_on_first_spawn", 128),
+        ("set_on_link", 256),
+        ("set_on_first_link", 512),
+        ("call", 1024),
+        ("procs", 2048),
+        ("running", 8192),
+        ("garbage_collection", 16384),
+        ("arity", 32768),
+        ("return_to", 65536),
+        ("silent", 131_072),
+        ("running_ports", 1_048_576),
+        ("running_procs", 2_097_152),
+        ("ports", 4_194_304),
+        ("scheduler_id", 8_388_608),
+        ("exiting", 16_777_216),
+    ] {
+        let flags = flags_from_atoms(&[name]).expect("a canonical trace flag");
+        assert_eq!(trace_bitmask(flags), expected, "{name}");
+    }
+
+    // The canonical atom set and the table are the same set, so no bit can be dropped.
+    let all = flags_from_atoms(&["all"]).expect("all");
+    let canonical = flags_to_atoms(all);
+    assert_eq!(
+        canonical.len(),
+        ERTS_TRACE_FLAG_BITS.len(),
+        "the canonical atom set drifted from the ERTS bit table: {canonical:?}"
+    );
+    for name in &canonical {
+        assert!(
+            ERTS_TRACE_FLAG_BITS.iter().any(|(known, _)| known == name),
+            "{name} has no ERTS bit in the table"
+        );
+    }
+    // And the whole set is exactly the oracle's `[all]` bitmask.
+    assert_eq!(trace_bitmask(all), 32_763_895);
+}
 /// The `monitors` item carries **both** monitor families, each entry as `{process, Pid}` or
 /// `{port, Port}` — the oracle's shape (verified against OTP 29.1.1 / erts-17.1:
 /// `monitors => [{port,#Port<0.3>},{process,<0.84.0>}]`).

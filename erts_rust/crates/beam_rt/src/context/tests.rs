@@ -1274,6 +1274,7 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
     let run_queue = rt.intern("run_queue");
     let wall_clock = rt.intern("wall_clock");
     let runtime_key = rt.intern("runtime");
+    let garbage_collection = rt.intern("garbage_collection");
     let atom_count = rt.intern("atom_count");
     // Captured before the context takes its `&mut Runtime` borrow: a fresh runtime queues
     // nothing, so this is the run-queue figure `statistics(run_queue)` must reproduce.
@@ -1341,17 +1342,39 @@ fn the_runtime_hooks_bridge_serves_the_dynamic_tag_and_statistics_arms() {
         "the delta since the previous read is real: {second_since}"
     );
 
+    // `statistics(runtime)` is served from the runtime's one long-lived CPU-time clock
+    // (`beam_io::cpu_time::RuntimeClock`): `{Total, SinceLastCall}` in **milliseconds of user
+    // CPU time** (the C's `getrusage(RUSAGE_SELF)` measurement), so both elements are small
+    // integers. The clock's anchor starts at 0, so the very first read answers two equal
+    // elements — exactly the C's `runtime_prev.data.user = 0` semantics.
+    let runtime_pair = |ctx: &mut RuntimeContext<'_>| {
+        let value = ctx
+            .call_bif("erlang", "statistics", 1, &[runtime_key])
+            .expect("statistics(runtime)");
+        assert_eq!(terms::tuple_arity(value).expect("a 2-tuple"), 2);
+        let total = terms::tuple_element(value, 0).expect("the total");
+        let since = terms::tuple_element(value, 1).expect("the delta");
+        assert!(is_small(total) && is_small(since), "two small integers");
+        (signed_value(total), signed_value(since))
+    };
+    let (cpu_total, cpu_since) = runtime_pair(&mut ctx);
+    assert_eq!(
+        cpu_since, cpu_total,
+        "the first read's delta is the whole total (the clock anchor starts at 0)"
+    );
+    assert!(cpu_total >= 0, "a CPU-time reading is non-negative");
+
     // A valid statistics key this runtime cannot measure is the typed capability gap (never
     // a fabricated number); a name that is not a statistics key at all is the oracle's
-    // `badarg`. `runtime` needs CPU time, which this crate cannot read without `unsafe`
-    // (`#![deny(unsafe_code)]`), so it is the honest gap; the counters it *can* measure are
-    // served (see `the_served_statistics_counters_read_the_runtimes_own_state`).
+    // `badarg`. `garbage_collection` needs a real accumulative collector, so it stays the
+    // honest gap; the counters it *can* measure are served (see
+    // `the_served_statistics_counters_read_the_runtimes_own_state`).
     let error = ctx
-        .call_bif("erlang", "statistics", 1, &[runtime_key])
-        .expect_err("runtime is an honest gap");
+        .call_bif("erlang", "statistics", 1, &[garbage_collection])
+        .expect_err("garbage_collection is an honest gap");
     assert_eq!(
         crate::error::unsupported_reason(&error).as_deref(),
-        Some("erlang:statistics/1: the `runtime` counter is not implemented")
+        Some("erlang:statistics/1: the `garbage_collection` counter is not implemented")
     );
     for key in [atom_count, make_small(1)] {
         let error = ctx

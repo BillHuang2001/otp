@@ -38,7 +38,7 @@
 //! | `erlang:function_exported/3` | the [`CodeServer`](crate::CodeServer) + the BIF registry |
 //! | `erlang:link/1`, `erlang:unlink/1` | [`beam_process::ProcessTable`]'s link set |
 //! | `erlang:dt_spread_tag/1`, `erlang:dt_restore_tag/1` | the oracle's boolean check (dynamic tracing is compiled out) |
-//! | `erlang:statistics/1` | `run_queue`; `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `io` (the port subsystem's byte counters); `scheduler_wall_time` (`undefined`, never enabled) |
+//! | `erlang:statistics/1` | `run_queue`; `wall_clock` (the process clock); `reductions`/`exact_reductions`/`context_switches` (the runtime's own cumulative counters); `runtime` (the long-lived `beam_io::cpu_time::RuntimeClock`); `io` (the port subsystem's byte counters); `scheduler_wall_time` (`undefined`, never enabled) |
 //! | `os:set_signal/2` | [`signal`] — the one long-lived `beam_io::signal::SignalFacility` (the dispositions persist for the runtime's life) |
 //!
 //! Every **other** `(module, function, arity)` answers the same typed capability gap the
@@ -54,8 +54,8 @@
 //!   exposes — so the absolute form is reported as the typed capability gap rather than
 //!   approximated by a millisecond-off estimate. `{abs, false}` (the default) IS served.
 //! * `statistics/1` serves **only** the keys this runtime can measure for real
-//!   (`run_queue`, `wall_clock`, `reductions`/`exact_reductions`, `context_switches`, `io`
-//!   and the never-enabled `scheduler_wall_time`, see
+//!   (`run_queue`, `wall_clock`, `reductions`/`exact_reductions`, `context_switches`,
+//!   `runtime`, `io` and the never-enabled `scheduler_wall_time`, see
 //!   [`RuntimeHooksBridge::statistics`]); every other key the oracle accepts is a valid
 //!   statistics key this runtime cannot answer honestly, so it reports the typed capability
 //!   gap. A name that is not a statistics key at all is the oracle's `badarg`.
@@ -641,6 +641,14 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// * `context_switches` → `{Total, SinceLast}` from the node-global process-dispatch
     ///   counter the scheduler keeps ([`Runtime::note_context_switches`]): one per slice the
     ///   run loop dispatched. `SinceLast` is the delta since the previous read.
+    /// * `runtime` → `{Total, SinceLastCall}` in **milliseconds of user CPU time** from the
+    ///   runtime's one long-lived [`beam_io::cpu_time::RuntimeClock`]
+    ///   ([`Runtime::cpu_time_statistics`]): the whole process's `getrusage(RUSAGE_SELF)` user
+    ///   time, exactly what the oracle's `erts_runtime_elapsed_both` measures
+    ///   (`erts/emulator/beam/erl_time_sup.c:1421-1481`). The runtime owns **one** clock, so
+    ///   its anchor persists across calls and the first read answers two equal elements, like
+    ///   the C's process-global `runtime_prev`. `beam_rt` is `#![deny(unsafe_code)]`, so the
+    ///   syscall lives in `beam_io` behind a safe API (never a wall-clock substitute).
     /// * `io` → `{{input, BytesIn}, {output, BytesOut}}` from the shared byte counters the
     ///   port subsystem bumps ([`crate::port::IoCounters`]): bytes delivered from a port as
     ///   `{Port, {data, …}}` and bytes written to a port by `port_command/2,3`.
@@ -660,15 +668,13 @@ impl<'a> RuntimeHooksBridge<'a> {
     /// oracle counts far more of both because it runs a much larger emulator.
     ///
     /// Every **other** key the oracle accepts is a genuine statistics key this runtime
-    /// cannot measure — `runtime` needs CPU time this crate cannot read without `unsafe`
-    /// (it is `#![deny(unsafe_code)]` and `std` exposes no CPU-time clock, so wall-clock
-    /// time is deliberately **not** substituted), `garbage_collection` a real accumulative
-    /// collector, `scheduler_wall_time_all`/`*_run_queue_lengths*`/`active_tasks*`/
-    /// `run_queues` per-scheduler queue lists and CPU time, and `microstate_accounting` the
-    /// MSACC machinery — so each answers the typed capability gap rather than a fabricated
-    /// number (workspace `CONTEXT.md` §3). A name that is **not** a statistics key at all is
-    /// the oracle's `badarg` (`erl_bif_info.c:4333`), which is reproduced rather than
-    /// reported as a gap.
+    /// cannot measure — `garbage_collection` needs a real accumulative collector,
+    /// `scheduler_wall_time_all`/`*_run_queue_lengths*`/`active_tasks*`/`run_queues`
+    /// per-scheduler queue lists and CPU time, and `microstate_accounting` the MSACC
+    /// machinery — so each answers the typed capability gap rather than a fabricated number
+    /// (workspace `CONTEXT.md` §3). A name that is **not** a statistics key at all is the
+    /// oracle's `badarg` (`erl_bif_info.c:4333`), which is reproduced rather than reported as
+    /// a gap.
     ///
     /// # Errors
     ///
@@ -701,6 +707,12 @@ impl<'a> RuntimeHooksBridge<'a> {
             "reductions" => counter_pair(heap, self.runtime.reductions_statistics(false)),
             "exact_reductions" => counter_pair(heap, self.runtime.reductions_statistics(true)),
             "context_switches" => counter_pair(heap, self.runtime.context_switch_statistics()),
+            // `{Total, SinceLast}` in **milliseconds of user CPU time** from the runtime's one
+            // long-lived `beam_io::cpu_time::RuntimeClock` (the C's `getrusage(RUSAGE_SELF)`
+            // measurement, `erts_runtime_elapsed_both`, `erl_time_sup.c:1421-1481`). The clock
+            // is the runtime's own, so its anchor persists across calls exactly as the C's
+            // `runtime_prev` does.
+            "runtime" => counter_pair(heap, self.runtime.cpu_time_statistics()?),
             // `{{input, BytesIn}, {output, BytesOut}}` from the port subsystem's own byte
             // counters — the bytes this runtime really read from and wrote to its ports.
             "io" => {
@@ -906,7 +918,6 @@ const STATISTICS_KEYS: &[&str] = &[
     "run_queue_lengths_all",
     "microstate_accounting",
     "garbage_collection",
-    "runtime",
     "run_queues",
 ];
 

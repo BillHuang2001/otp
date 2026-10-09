@@ -87,11 +87,11 @@
 //! | `garbage_collection` | the oracle's five-item proplist (see below) |
 //! | `min_heap_size` / `min_bin_vheap_size` / `fullsweep_after` | the emulator's heap policy |
 //! | `max_heap_size` | the process flag **map** |
-//! | `message_queue_data` | `on_heap` (an unchanging runtime default — see below) |
-//! | `trace` | `0` (no tracing subsystem in M1 — an unchanging default) |
+//! | `message_queue_data` | `on_heap` — this runtime's real *current* placement (the queue is heap-resident; see the divergence note below) |
+//! | `trace` | the process's **live** ERTS tracee-flag **bitmask**, as an integer (`0` while it is untraced) — see below |
 //! | `sequential_trace_token` | the process's sequential-trace token tuple, or the bare `[]` while tracing is inactive for it (see [`crate::seq_trace`]) |
 //! | `suspending` | `[]` (no `suspend_process` in M1) |
-//! | `last_calls` | `false` (no tracing subsystem in M1) |
+//! | `last_calls` | `false` — the oracle's own answer for a process with no saved-calls buffer |
 //! | `memory` | this process's real bytes (heap + stack + off-heap) |
 //!
 //! ## Items this runtime honestly cannot answer (`unsupported`)
@@ -120,6 +120,32 @@
 //! while it runs, and the `-eval` root process has no machine at all), a fun-bodied process
 //! (its entry is a fun value: no module could name `M`/`F`), and any pid this runtime never
 //! scheduled.
+//!
+//! ## `trace`
+//!
+//! The C answers the process's **tracee-flag bitmask** as an *integer* —
+//! `res = make_small(ERTS_IS_P_TRACED_FL(rp, TRACEE_FLAGS))` (`erl_bif_info.c:2133`) — never the
+//! atom list `erlang:trace_info(Pid, flags)` reports. Verified against the oracle (OTP 29.1.1 /
+//! erts-17.1):
+//!
+//! ```text
+//! P = spawn(fun() -> receive stop -> ok end end),
+//! process_info(P, trace)                              => {trace,0}
+//! erlang:trace(P, true, [call]), process_info(P,trace) => {trace,1024}
+//! erlang:trace(P, true, [all]),  process_info(P,trace) => {trace,32763895}
+//! ```
+//!
+//! The value is read out of this runtime's **live** per-process trace state
+//! ([`crate::trace::TraceState`] — what `erlang:trace/3` maintains), so a traced process reports
+//! its real flag bitmask and an untraced one the zero bitmask. This runtime's *internal* flag
+//! bits are deliberately not ERTS's ([`crate::trace`]'s constants are its own), so the
+//! translation goes through the public [`crate::trace::flags_to_atoms`] and
+//! [`ERTS_TRACE_FLAG_BITS`], the ERTS bit each canonical atom sets
+//! (`F_TRACE_FLAG(n) = 1 << (ERTS_TRACE_TS_TYPE_BITS + n)`, `erl_process.h:1760`, with
+//! `ERTS_TRACE_TS_TYPE_BITS = 3`, plus the three low timestamp bits). The two flags this runtime
+//! carries that have **no** canonical atom (`return_from`, `cpu_timestamp`) are deliberately
+//! unmapped: the oracle's own `all` bitmask excludes them and `erlang:trace(P, true, [ThatFlag])`
+//! is `badarg` on this oracle.
 //!
 //! ## `garbage_collection`
 //!
@@ -162,9 +188,12 @@
 //!   `erlang:group_leader/0` answers — not the oracle's `<0.70.0>` io process.
 //! * `reductions` is *this* process's real counter, whose absolute value differs from the
 //!   oracle's because the executed code differs.
-//! * `message_queue_data` is reported as `on_heap`: this runtime's [`beam_message::Queue`] is
-//!   a heap-resident FIFO, so `on_heap` is the true current placement (there is no
-//!   `message_queue_data` process flag in M1 that could change it).
+//! * `message_queue_data` is reported as `on_heap` because that is this runtime's **true current
+//!   placement**: [`beam_message::Queue`] is a heap-resident FIFO, so `on_heap` is the real
+//!   value and not an arbitrary default. The one divergence is an **explicit**
+//!   `process_flag(message_queue_data, off_heap)`, which [`super::process`] accepts and ignores
+//!   (honouring it needs per-process storage in `beam_process::Process` — outside this crate),
+//!   so such a process reports `on_heap` where the oracle would report `off_heap`.
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
@@ -269,6 +298,66 @@ const POSITION_ITEMS: &[&str] = &[
     "current_location",
     "current_stacktrace",
 ];
+
+/// The **ERTS** tracee-flag bit each canonical trace-flag atom sets — the `trace` item's
+/// vocabulary (`F_TRACE_FLAG(n) = 1 << (ERTS_TRACE_TS_TYPE_BITS + n)` with
+/// `ERTS_TRACE_TS_TYPE_BITS = 3`, `erl_process.h:1760`, plus the three low timestamp bits,
+/// `erl_trace.h:32-34`).
+///
+/// The bits are pinned to the oracle's own `erlang:process_info(P, trace)` answers, one isolated
+/// `erlang:trace(P, true, [Atom])` per row (verified on OTP 29.1.1 / erts-17.1); the 21 rows sum
+/// to `32763895`, exactly the oracle's `[all]` bitmask. The two flags this runtime carries with
+/// **no** canonical atom (`return_from`, `cpu_timestamp`) are absent here on purpose: they are
+/// not part of the oracle's `all` and `erlang:trace(P, true, [ThatFlag])` is `badarg` there.
+///
+/// The one-atom-per-row values are pinned by
+/// `trace_bitmask_maps_every_canonical_atom_to_the_oracles_bit` in `tests.rs`, which also fails
+/// if [`crate::trace::flags_to_atoms`] ever reports an atom this table lacks (the drift guard
+/// the table's coverage relies on).
+const ERTS_TRACE_FLAG_BITS: &[(&str, i64)] = &[
+    ("timestamp", 1 << 0),                  // 1
+    ("strict_monotonic_timestamp", 1 << 1), // 2
+    ("monotonic_timestamp", 1 << 2),        // 4
+    ("send", 1 << 4),                       // 16
+    ("receive", 1 << 5),                    // 32
+    ("set_on_spawn", 1 << 6),               // 64
+    ("set_on_first_spawn", 1 << 7),         // 128
+    ("set_on_link", 1 << 8),                // 256
+    ("set_on_first_link", 1 << 9),          // 512
+    ("call", 1 << 10),                      // 1024
+    ("procs", 1 << 11),                     // 2048
+    ("running", 1 << 13),                   // 8192
+    ("garbage_collection", 1 << 14),        // 16384
+    ("arity", 1 << 15),                     // 32768
+    ("return_to", 1 << 16),                 // 65536
+    ("silent", 1 << 17),                    // 131072
+    ("running_ports", 1 << 20),             // 1048576
+    ("running_procs", 1 << 21),             // 2097152
+    ("ports", 1 << 22),                     // 4194304
+    ("scheduler_id", 1 << 23),              // 8388608
+    ("exiting", 1 << 24),                   // 16777216
+];
+
+/// This runtime's per-process trace flags as the **ERTS** tracee-flag bitmask the `trace` item
+/// reports.
+///
+/// [`crate::trace`]'s internal bits are its own (its `CANONICAL` order is not ERTS's and two of
+/// its flags have no canonical atom), so the translation goes through the public
+/// [`crate::trace::flags_to_atoms`] and [`ERTS_TRACE_FLAG_BITS`] rather than reading any bit
+/// directly. An untraced process has [`TraceFlags::default`] (no atoms) ⇒ `0`, the oracle's
+/// answer.
+///
+/// [`TraceFlags::default`]: crate::trace::TraceFlags::default
+fn trace_bitmask(flags: crate::trace::TraceFlags) -> i64 {
+    let atoms = crate::trace::flags_to_atoms(flags);
+    let mut bits: i64 = 0;
+    for (name, bit) in ERTS_TRACE_FLAG_BITS {
+        if atoms.contains(name) {
+            bits |= bit;
+        }
+    }
+    bits
+}
 
 impl Item {
     /// The term the reply's `{Item, Value}` pair uses as its first element.
@@ -577,10 +666,24 @@ impl RuntimeContext<'_> {
                 let flags = self.runtime.config().heap_options().max_heap_flags();
                 self.max_heap_size_map(size, flags)?
             }
-            // An unchanging M1 runtime default: this runtime's queue is heap-resident.
+            // This runtime's real, current queue placement: [`beam_message::Queue`] is
+            // heap-resident, so `on_heap` is the true value (an explicit
+            // `process_flag(message_queue_data, off_heap)` is accepted-and-ignored — see the
+            // divergence note in the module docs).
             "message_queue_data" => self.atom("on_heap")?,
-            // An unchanging M1 default: no tracing subsystem exists.
-            "trace" => make_small(0),
+            // The process's **live** tracee-flag bitmask (the C's
+            // `ERTS_IS_P_TRACED_FL(rp, TRACEE_FLAGS)`, `erl_bif_info.c:2133`) — read out of the
+            // trace state `erlang:trace/3` maintains, translated to ERTS's bit layout by
+            // [`trace_bitmask`]. Untraced ⇒ `0`, the oracle's answer.
+            "trace" => {
+                let flags = self
+                    .runtime
+                    .trace()
+                    .get(snapshot.pid)
+                    .map(|entry| entry.flags)
+                    .unwrap_or_default();
+                make_small(trace_bitmask(flags))
+            }
             // The sequential-trace token (contract A.8): the C copies the process's token
             // tuple verbatim, which is the bare `[]` while that process's tracing is inactive
             // (`erl_bif_info.c:2162-2166`). Read out of [`Runtime`](crate::Runtime)'s
@@ -591,7 +694,10 @@ impl RuntimeContext<'_> {
             },
             // An unchanging M1 default: no `suspend_process`.
             "suspending" => NIL,
-            // An unchanging M1 default: no tracing subsystem exists.
+            // The oracle's own answer for a process with no saved-calls buffer
+            // (`erl_bif_info.c:2184-2188` returns `am_false`), which is every process this
+            // runtime runs: it never saves calls, so there is no `call`-flag call list to
+            // report. Not a placeholder — the true value.
             "last_calls" => self.atom("false")?,
             "memory" => make_small(
                 ((snapshot.total_heap_size + snapshot.stack_size) * 8 + snapshot.off_heap_bytes)
