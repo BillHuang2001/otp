@@ -372,7 +372,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `refc_size` on the copy, `dst.used() == ERL_REFC_BITS_SIZE`, dropping the destination table returning
   the source refcount to 1; two occurrences sharing one payload; a refc binary with no owning handle ⇒
   `BadArg`; and an on-heap `ErlHeapBits` small binary copied by value (equal bytes, distinct address,
-  `heap_bits_size_words` words).
+  `heap_bits_size_words` words); and a `SUB_BITS` **match context** over an on-heap bitstring is
+  **flattened** — the copy is a fresh on-heap bitstring (`HEAP_BITS_SUBTAG`, not a `SUB_BITS`) whose
+  bits equal the source window (a non-byte-aligned `start` exercises the bit shift) and whose data base
+  lies inside the destination region, not the source.
 - `tests/external.rs` — external thing copy: words verbatim and the node atom/creation preserved (via
   `external_*_parts`), one node entry per distinct node, two references to the same node ⇒ one entry
   with refcount 2, port and reference nodes registered separately, and dropping the destination
