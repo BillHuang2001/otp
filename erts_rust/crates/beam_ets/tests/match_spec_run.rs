@@ -1197,17 +1197,11 @@ fn documented_gaps_diverge_from_the_oracle_in_a_run() {
     let head = at(&atoms, "$1");
     let input = list(&mut heap, &[make_small(1), make_small(2)]);
 
-    // 1. A map as a body *expression*. oracle:
-    //      `[{'$1',[],[#{a=>1}]}]` over `[1,2]` -> `[#{a=>1},#{a=>1}]`;
-    //    this crate's expression decoder is a documented `badarg` for a bare map.
+    // 1. A map as a body *expression* is **constructed** here, as the oracle does:
+    //      `[{'$1',[],[#{a=>1}]}]` over `[1,2]` -> `[#{a=>1},#{a=>1}]`.
     let map = flat_map(&mut heap, &[(at(&atoms, "a"), make_small(1))], &atoms);
-    assert!(
-        matches!(
-            run_one(input, head, &[], &[map], &atoms, &mut heap),
-            Err(BeamError::BadArg)
-        ),
-        "DIVERGENCE: the oracle accepts a map body; this crate is documented `badarg`"
-    );
+    let got = run_one(input, head, &[], &[map], &atoms, &mut heap).unwrap();
+    assert_terms_eq(&got, &[map, map], &atoms);
 
     // 2. `self/0` has no process identity at this layer, so it raises and the clause is
     //    skipped. oracle: `[{'$1',[{'=:=',{self},{self}}],['$1']}]` over `[1]` -> `[1]`.
