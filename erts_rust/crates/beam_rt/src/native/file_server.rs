@@ -350,7 +350,8 @@ impl Runtime {
     }
 
     /// `file_server:handle_call({list_dir, Name}, …)` → `prim_file:list_dir/1`:
-    /// `{ok, Names}` with the entries **sorted** (the oracle's order), or `{error, Reason}`.
+    /// `{ok, Names}` with the entries in the **host directory order** (`file.erl:1044`
+    /// documents "The names are not sorted"), or `{error, Reason}`.
     fn reply_list_dir(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let Some(path) = self.encode_path(args[0]) else {
             return self.error_tuple("badarg");
@@ -365,7 +366,6 @@ impl Runtime {
                         Err(failure) => return self.error_tuple_for(&failure),
                     }
                 }
-                names.sort();
                 let mut terms_out = Vec::with_capacity(names.len());
                 for name in &names {
                     terms_out.push(self.charlist(name)?);
@@ -382,13 +382,25 @@ impl Runtime {
     /// A request this module cannot serve faithfully is the typed capability gap described
     /// in the module docs — never a plausible-looking wrong term.
     fn serve_device_request(&mut self, service: ProcessId, request: Eterm) -> Result<(Eterm, bool)> {
-        let Some(fields) = tuple_fields(request) else {
-            return Err(error::unsupported("file_server: a non-tuple io request"));
+        // `file.erl` sends `close`/`sync`/`datasync`/`truncate` as the **bare** command atom
+        // (`close(File) when is_pid(File) -> file_request(File, close)`, `file.erl:1536`) and
+        // the positioned forms as a 1-tuple (`{position,At}`, `file.erl:1954`), so a request is
+        // either an atom or a tuple whose head is the command.
+        let (command, args) = if is_atom(request) {
+            match self.atom_name(request) {
+                Some(name) => (name, Vec::new()),
+                None => return Err(error::unsupported("file_server: an unnamed io request")),
+            }
+        } else {
+            let Some(fields) = tuple_fields(request) else {
+                return Err(error::unsupported("file_server: a non-tuple io request"));
+            };
+            let Some(command) = self.atom_name(fields[0]) else {
+                return Err(error::unsupported("file_server: an unnamed io request"));
+            };
+            (command, fields[1..].to_vec())
         };
-        let Some(command) = self.atom_name(fields[0]) else {
-            return Err(error::unsupported("file_server: an unnamed io request"));
-        };
-        let args = &fields[1..];
+        let args = &args[..];
         match (command.as_str(), args.len()) {
             // -- file_request ------------------------------------------------------------
             ("close", 0) => {
@@ -603,12 +615,12 @@ fn tuple_fields(term: Eterm) -> Option<Vec<Eterm>> {
 
 /// The head of an **improper** list `[Head | Tail]` whose tail is not a list — the shape of
 /// `gen:reply/2`'s `[alias|Ref]` tag. `None` for a proper list (or tail) and for a non-list.
+///
+/// `is_list/1` is the **proper**-list predicate, so it reports `false` for `[alias|Ref]`; the
+/// cons accessors are what decide whether the term is a cons cell at all.
 fn improper_list_head(term: Eterm) -> Option<Eterm> {
-    if !is_list(term) {
-        return None;
-    }
     let tail = terms::cons_tail(term).ok()?;
-    if is_list(tail) {
+    if tail == NIL || is_list(tail) {
         return None;
     }
     terms::cons_head(term).ok()
@@ -616,6 +628,14 @@ fn improper_list_head(term: Eterm) -> Option<Eterm> {
 
 /// The `SeekFrom` a `{position, At}` request denotes (`file_io_server.erl:268-273`).
 fn seek_from(at: Eterm, runtime: &Runtime) -> Result<SeekFrom> {
+    // A bare integer is the `bof` shorthand of `file.erl`'s `location()`
+    // (`integer() | {bof,integer()} | cur | {cur,integer()} | eof | {eof,integer()}`).
+    if is_small(at) {
+        let offset = signed_value(at);
+        return Ok(SeekFrom::Start(
+            u64::try_from(offset).map_err(|_| BeamError::BadArg)?,
+        ));
+    }
     let name = runtime.atom_name(at);
     match name.as_deref() {
         Some("bof") => return Ok(SeekFrom::Start(0)),
@@ -831,8 +851,13 @@ mod tests {
             terms::make_tuple(ctx, &[cur, make_small(7)]).unwrap()
         });
         assert!(matches!(seek_from(at, &runtime).unwrap(), SeekFrom::Current(7)));
+        // A bare integer is the `bof` shorthand of `file.erl`'s `location()`.
+        assert!(matches!(
+            seek_from(make_small(3), &runtime).unwrap(),
+            SeekFrom::Start(3)
+        ));
         // An unknown form is the typed gap.
-        let at = build(&mut runtime, |_ctx| make_small(3));
+        let at = build(&mut runtime, |ctx| ctx.atom("nope").unwrap());
         assert!(seek_from(at, &runtime).is_err());
     }
 
