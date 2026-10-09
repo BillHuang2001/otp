@@ -550,9 +550,10 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   non-pid/dead-pid target (both `badarg`); an unknown table id is the registry/BIF layer's concern.
   `Table::owner_died` decides the transition and returns `OwnerDeath`; the delivery of the transfer
   message and the dropping of the table stay the runtime's job.
-- **`ets:setopts/2` is modelled only for `{heir, …}`.** Other options (`safe_fixtable`,
-  `{write_concurrency, _}`, …) are out of scope; `ets:info(T, holder)` is `badarg` in the oracle and
-  none is emitted. The BIF itself is still a seam-backed `unsupported_bif` in `beam_bifs`.
+- **`ets:setopts/2` is modelled for `{heir, …}` and `{protection, Access}`.** `SetOpt` carries
+  `Heir(Heir)`/`ClearHeir`/`Access(Access)`; other options (`safe_fixtable`, `{write_concurrency, _}`,
+  …) are out of scope; `ets:info(T, holder)` is `badarg` in the oracle and none is emitted. The BIF
+  bridge's `{protection, _}` wiring belongs to `beam_bifs`.
 - **Scalar `lookup_element` is unsupported for the multi kinds.** `Table::lookup_element`/
   `lookup_element_or` raise `unsupported_ets` for `bag`/`duplicate_bag` (the oracle returns a *list*);
   the faithful forms are `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the `beam_bifs`
