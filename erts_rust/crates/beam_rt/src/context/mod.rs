@@ -650,8 +650,66 @@ impl<'a> RuntimeContext<'a> {
         }
     }
 
-    /// Records the module whose **code** this context is about to execute — the BIF call
-    /// site, for the duration of one entry.
+    /// Runs the raw entry `label` of `module` to its `return`, **driving the scheduler**
+    /// while the callee is suspended in a `receive`.
+    ///
+    /// This is [`Machine::run_label`] made blocking-aware: the label-addressed counterpart of
+    /// [`RuntimeContext::run_export_blocking`], entering the body directly rather than
+    /// through an export. A local (`make_fun3`) closure has no export name — only a label —
+    /// so a fun whose body blocks (`gen:do_call/4`'s `receive`, reached through
+    /// `gen:do_for_proc/2`'s `call_fun2`) would otherwise collapse into the typed
+    /// [`beam_engine::blocked`] gap even though the process it waits on is merely *runnable*.
+    ///
+    /// The `Machine` is **reused** across a suspension ([`Machine::resume_outcome`] does not
+    /// `reset`), so the closure's registers, its captured free variables and its Erlang stack
+    /// survive the pump and it continues at exactly the reported `(func, pc)`. The
+    /// non-blocking case is byte-for-byte [`Machine::run_label`], which is itself
+    /// `fold_outcome(run_label_outcome(…))`.
+    ///
+    /// # When it cannot pump
+    ///
+    /// A context that is itself inside a scheduler slice ([`RuntimeContext::for_process`],
+    /// `may_pump_scheduler() == false`) must never re-enter the scheduler — that would run a
+    /// second process from within a slice — so it keeps the plain non-blocking entry's typed
+    /// [`beam_engine::blocked`] gap. A pump that reports **nothing ran** (`0`) is the same
+    /// honest gap: no process could have changed the mailbox, so spinning further would only
+    /// hang, never produce a value.
+    ///
+    /// # Why the paused terms stay valid
+    ///
+    /// A collection moves terms in place, so it must never run while a machine whose roots it
+    /// cannot see is suspended. This crate collects **only** at the slice's own heap-admission
+    /// point, and only when its per-call GC latch is armed
+    /// ([`RuntimeContext::arm_gc`] — the sole armer is the slice's `BudgetContext`, see
+    /// [`crate::context::gc`]). This context is never a slice, so its latch is never armed, the
+    /// pump's allocations fall back to the pointer-stable arena and nothing paused here is
+    /// moved — the suspended machine's terms stay valid across the resume. Arming the latch
+    /// here too would move the paused roots.
+    fn run_label_blocking(
+        &mut self,
+        module: &Module,
+        label: Label,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        let mut machine = Machine::new();
+        let mut outcome = machine.run_label_outcome(module, label, arity, args, self)?;
+        loop {
+            match outcome {
+                RunOutcome::Returned(value) => return Ok(value),
+                RunOutcome::Wait { func, pc } => {
+                    if !self.may_pump_scheduler() {
+                        return Err(beam_engine::blocked());
+                    }
+                    let ran = self.runtime.pump_scheduler(RUN_EXPORT_PUMP_SLICES)?;
+                    if ran == 0 {
+                        return Err(beam_engine::blocked());
+                    }
+                    outcome = machine.resume_outcome(module, func, pc, self)?;
+                }
+            }
+        }
+    }
     ///
     /// [`RuntimeContext::run_export`] sets `current_module` itself for the single-pass path;
     /// a scheduled process runs its entry through the engine's blocking-aware
@@ -1775,9 +1833,12 @@ impl ExecutionContext for RuntimeContext<'_> {
     ///
     /// A `.beam` **local** (`make_fun3`) closure is resolved to its
     /// [`LocalFunTarget`] — the module, the lambda's entry label and the combined
-    /// arguments — and entered there on a **fresh** machine; the resolution is the
-    /// shared [`RuntimeContext::local_fun_target`] seam, so a fun-bodied *process*
-    /// resolves its entry through exactly the same lookup
+    /// arguments — and entered there on a **fresh** machine through the
+    /// blocking-aware [`RuntimeContext::run_label_blocking`], so a `receive` inside
+    /// the closure body suspends the process and is resumed by the scheduler
+    /// instead of folding into the typed [`beam_engine::blocked`] gap. The
+    /// resolution is the shared [`RuntimeContext::local_fun_target`] seam, so a
+    /// fun-bodied *process* resolves its entry through exactly the same lookup
     /// ([`crate::runner`]).
     ///
     /// The two fun kinds with no local label entry keep their own synchronous apply:
@@ -1798,7 +1859,7 @@ impl ExecutionContext for RuntimeContext<'_> {
                 label,
                 arity,
                 args,
-            }) => Machine::new().run_label(&module, label, arity, &args, self),
+            }) => self.run_label_blocking(&module, label, arity, &args),
             None => self.apply_non_local_fun(fun, args),
         }
     }
