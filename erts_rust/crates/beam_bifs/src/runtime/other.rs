@@ -67,9 +67,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     crate::runtime::runtime_bif!(reg, "re", run, 3);
     crate::runtime::runtime_bif!(reg, "re", version, 0);
 
-    // `erl_ddll` -- the dynamically linked driver loader.
+    // `erl_ddll` -- the dynamically linked driver loader. `format_error_int/1` is
+    // the one self-contained key and is implemented for real in `src/runtime/ddll.rs`.
     crate::runtime::runtime_bif!(reg, "erl_ddll", demonitor, 1);
-    crate::runtime::runtime_bif!(reg, "erl_ddll", format_error_int, 1);
     crate::runtime::runtime_bif!(reg, "erl_ddll", info, 2);
     crate::runtime::runtime_bif!(reg, "erl_ddll", loaded_drivers, 0);
     crate::runtime::runtime_bif!(reg, "erl_ddll", monitor, 2);
