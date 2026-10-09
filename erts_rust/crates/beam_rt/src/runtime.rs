@@ -417,10 +417,11 @@ pub struct Runtime {
     ///
     /// Created here — the runtime-construction step, the equivalent of the C's
     /// `beamasm_metadata_early_init` at emulator start — and appended to the moment a native
-    /// code range becomes known ([`PerfMap::record`]). This runtime's baseline JIT exposes no
-    /// ranges, so the map is a well-formed **empty** file; an address is never fabricated. An
-    /// unopenable file is recorded on the [`PerfMap`] (never raised, never printed), exactly
-    /// as the oracle logs it and carries on. See [`crate::perf_map`].
+    /// code range becomes known ([`PerfMap::record`]). The runner feeds it the baseline JIT's
+    /// **real** cached ranges as a scheduled process enters a module export (`+JPperf map`
+    /// only); an address is never fabricated, and the map stays empty when no such entry runs.
+    /// An unopenable file is recorded on the [`PerfMap`] (never raised, never printed),
+    /// exactly as the oracle logs it and carries on. See [`crate::perf_map`].
     perf_map: PerfMap,
     /// The open **whole-file descriptors** `prim_file:open/2` handed out and
     /// `prim_file:close/1` has not yet removed (contract A.7).
@@ -632,10 +633,11 @@ impl Runtime {
     }
     /// The **perf-map / JIT-dump** files `+JPperf` selected (contract A.8).
     ///
-    /// Empty unless the flag enabled a file; see [`crate::perf_map`] for exactly what this
-    /// runtime writes (a well-formed map with the oracle's exact line grammar and **no**
-    /// fabricated addresses: this runtime exposes no JIT ranges) and why a file it could not
-    /// create is recorded rather than raised.
+    /// Inactive (no file open) unless the flag selected one; see [`crate::perf_map`] for
+    /// exactly what this runtime writes (a map with the oracle's exact line grammar, filled
+    /// with the baseline JIT's **real** code ranges as a scheduled process runs, and **no**
+    /// fabricated addresses) and why a file it could not create is recorded rather than
+    /// raised.
     pub fn perf_map(&self) -> &PerfMap {
         &self.perf_map
     }

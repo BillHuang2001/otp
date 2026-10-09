@@ -53,19 +53,22 @@
 //! constructed ([`Runtime::new`](crate::Runtime::new) — the emulator-start equivalent of the
 //! C's `beamasm_metadata_early_init`).
 //!
-//! What is **not** produced is any *range*. This runtime executes the typed IR on the
-//! interpreter and `beam_engine`'s baseline JIT exposes no native code ranges to `beam_rt`, so
-//! there is no honest `(start, size, name)` triple to write. An address is **never**
-//! fabricated: the map is a well-formed **empty** file (zero lines), and [`PerfMap::record`]
-//! is the single entry a future runtime that does expose its JIT ranges calls. The
-//! `jit-<pid>.dump` file carries the exact 40-byte JITDUMP header and no
-//! `JIT_CODE_LOAD`/`JIT_CODE_DEBUG_INFO` record, for the same reason.
+//! Every line the map holds is a **real** native code range — an address is **never**
+//! fabricated. A **scheduled** process (`run <file.beam>`) enters a module export on the
+//! baseline tier, and the runner then snapshots that module's cached baseline artifacts
+//! (`beam_engine::jit::cache::baseline_code_map`) into the map through [`PerfMap::record`],
+//! once per first entry, so each line names code the baseline backend actually mapped. The
+//! map is **empty** in exactly the cases where no such entry happens: `+JPperf` is off (no
+//! file is opened at all), or the run is a single-pass action (`-eval`/`-s`/`-run`) that
+//! never enters a module export through the runner. The `jit-<pid>.dump` file carries the
+//! exact 40-byte JITDUMP header and no `JIT_CODE_LOAD`/`JIT_CODE_DEBUG_INFO` record (the dump
+//! is not fed by the runner).
 //!
 //! # Where and when
 //!
 //! | `+JPperf` value | file |
 //! |---|---|
-//! | `map` | `<directory>/perf-<pid>.map` (empty: the map lines are the missing part) |
+//! | `map` | `<directory>/perf-<pid>.map` (the baseline JIT's real code ranges, appended per first entry; empty when no scheduled process runs) |
 //! | `dump` | `<directory>/jit-<pid>.dump` (the 40-byte header, no records) |
 //! | `true` | both (`true` is `map` **and** `dump`) |
 //! | `fp` / `no_fp` | neither — frame pointers are a code-generation choice, and select no file |
@@ -447,10 +450,10 @@ impl PerfMap {
 
     /// Appends one code range to the perf map and returns its line count.
     ///
-    /// This is the single writer of the map's line grammar ([`format_line`]); nothing calls
-    /// it today, because this runtime's baseline JIT exposes no native ranges (see the module
-    /// docs). A caller that has a real `(start, size, name)` triple gets the oracle's exact
-    /// line.
+    /// This is the single writer of the map's line grammar ([`format_line`]). The runner calls
+    /// it once per module-export first entry (`runner::perf::record_baseline_code`) with the
+    /// baseline JIT's real cached `(start, size, name)` triples, so each line is the oracle's
+    /// exact line and never a fabricated address (see the module docs).
     ///
     /// # Errors
     ///
