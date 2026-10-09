@@ -63,14 +63,10 @@ impl Machine {
     /// And charges **one reduction per interpreted instruction**: the slice's count
     /// starts at zero here and is read back through [`Machine::reductions`], while
     /// each charge is also offered to the host through
-    /// [`ExecutionContext::reduce_outcome`] — the only way a **non-allocating** loop
-    /// can be pre-empted, since `ensure_heap` is never reached by one. An `Err` from
-    /// the hook ends the run exactly like any other engine failure (the host has
-    /// exhausted its budget); it is never swallowed. A
-    /// [`ReduceOutcome::Yield`](crate::context::ReduceOutcome::Yield) answer is a **cooperative
-    /// pre-emption**: the step is applied first (so the reported address is the next
-    /// instruction), then the driver reports [`RunOutcome::Yield`] at that position —
-    /// the process is resumable there rather than unwound.
+    /// [`ExecutionContext::reduce`] — the only way a **non-allocating** loop can be
+    /// pre-empted, since `ensure_heap` is never reached by one. An `Err` from the
+    /// hook ends the run exactly like any other engine failure (the host has
+    /// exhausted its budget); it is never swallowed.
     pub(crate) fn drive(
         &mut self,
         module: &Module,
@@ -120,18 +116,9 @@ impl Machine {
             // host through `Machine::reductions`) and the host hook that lets a
             // **non-allocating** loop be pre-empted. `ensure_heap` — the only other
             // charge — is unreachable from such a loop, so this is the only point a
-            // host is offered one reduction per instruction. The hook is the
-            // non-failing twin of `reduce` (`reduce_outcome`): its default forwards to
-            // `reduce` and answers `Continue`, so a host that overrides only `reduce`
-            // is byte-identical, while a host that wants a *cooperative* pre-emption
-            // answers `Yield` and this loop reports `RunOutcome::Yield` below.
+            // host is offered one reduction per instruction.
             self.reductions = self.reductions.saturating_add(1);
-            let outcome = ctx.reduce_outcome(1)?;
-            // Apply the step **first**, so a yield reported below names the *next*
-            // instruction (the one after the charge) — never a re-execution of the
-            // instruction already executed and charged, and (for a `Step::Enter`)
-            // after the context switch has been applied so `Machine::current_context`
-            // names the module the reported `(func, pc)` belong to.
+            ctx.reduce(1)?;
             match step {
                 Step::Next => pc += 1,
                 Step::Goto { func: f, pc: p } => {
@@ -157,18 +144,10 @@ impl Machine {
                     func = f;
                     pc = p;
                 }
-                // A `wait`/`return` is its own outcome (the process is blocked rather
-                // than merely out of budget): the host's yield request is irrelevant
-                // there and is deliberately not reported.
                 Step::Wait { func: f, pc: p } => {
                     return Ok(RunOutcome::Wait { func: f, pc: p })
                 }
                 Step::Done => return self.finish().map(RunOutcome::Returned),
-            }
-            // The step has been applied: a cooperative pre-emption stops here, at the
-            // next instruction (in the context just entered, if any).
-            if outcome == crate::context::ReduceOutcome::Yield {
-                return Ok(RunOutcome::Yield { func, pc });
             }
         }
     }
@@ -202,14 +181,12 @@ impl Machine {
     /// The number of interpreted instructions charged in the current (or most
     /// recently finished) [`Machine::drive`] slice.
     ///
-    /// One `drive` call — a run, a resume of a suspended process, or a resume after a
-    /// cooperative [`RunOutcome::Yield`] — is one scheduling slice, and the counter is
-    /// zeroed at its start, so this is that slice's work in the unit the runtime prices
-    /// pre-emption in. It is the **engine-side twin** of
-    /// [`ExecutionContext::reduce_outcome`]: the hook lets a host act *during* the
-    /// slice (fail it, or ask for a [`RunOutcome::Yield`]), this accessor lets it
-    /// observe *after* the slice returns (`RunOutcome::Wait`/`RunOutcome::Yield`
-    /// included) without keeping its own tally.
+    /// One `drive` call — a run, or a resume of a suspended process — is one
+    /// scheduling slice, and the counter is zeroed at its start, so this is that
+    /// slice's work in the unit the runtime prices pre-emption in. It is the
+    /// **engine-side twin** of [`ExecutionContext::reduce`]: the hook lets a host
+    /// act *during* the slice, this accessor lets it observe *after* the slice
+    /// returns (`RunOutcome::Wait` included) without keeping its own tally.
     ///
     /// Honest by construction: only the interpreter's dispatch loop charges, so
     /// under the baseline JIT tier — where a natively executed block bypasses
