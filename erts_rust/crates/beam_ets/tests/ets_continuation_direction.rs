@@ -37,8 +37,9 @@
 //! 2. A **live-oracle cross-check** ([`rust_battery_agrees_with_the_live_oracle`])
 //!    that runs the whole continuation battery under the real `erl` (via the
 //!    embedded `escript` below) and under `beam_ets`, comparing canonical
-//!    renderings. It skips loudly when no Erlang is installed; set
-//!    `BEAM_ETS_REQUIRE_ORACLE=1` to make that skip a failure.
+//!    renderings. The oracle cross-check is **required by default** — a genuinely
+//!    absent Erlang fails it, not skips it; set `BEAM_ETS_ALLOW_NO_ORACLE=1` to opt
+//!    out explicitly (see `tests/common/oracle.rs`, the crate's single gate).
 //!
 //! # The rendering contract both sides share
 //!
@@ -50,16 +51,17 @@
 //! (`Some` ⇒ `cont`, `None` with results ⇒ `end`, `None` empty ⇒ bare `end`).
 
 use std::collections::BTreeMap;
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::time::Duration;
 
 use beam_alloc::Heap;
 use beam_common::BeamError;
 use beam_ets::prelude::*;
 use beam_term::prelude::*;
+
+mod common;
+
+use common::oracle;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -768,85 +770,16 @@ fn rust_battery() -> BTreeMap<String, String> {
 
     cases
 }
-/// Locate the oracle's `escript` from `$ERTS_ORACLE`, then `$PATH`.
-///
-/// Mirroring `tests/differential.rs`, a `$ERTS_ORACLE` that points at something
-/// non-executable is a **hard error** (a misconfiguration must not be mistaken for
-/// "no oracle"), while a genuinely absent Erlang is a skip.
-fn resolve_escript() -> Option<PathBuf> {
-    let erl = match env::var_os("ERTS_ORACLE") {
-        Some(value) => {
-            let candidate = PathBuf::from(&value);
-            assert!(
-                is_executable(&candidate),
-                "$ERTS_ORACLE is set to '{}', which is not an executable file",
-                candidate.display()
-            );
-            candidate
-        }
-        None => find_in_path("erl")?,
-    };
-    let sibling = erl.with_file_name("escript");
-    if is_executable(&sibling) {
-        Some(sibling)
-    } else {
-        find_in_path("escript")
-    }
-}
-
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    for dir in env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
 
 /// Run the embedded `escript` and return its `name -> rendering` pairs.
 fn run_oracle(escript: &Path) -> Vec<(String, String)> {
-    let dir = env::temp_dir().join(format!("beam_ets_continuation_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("the oracle scratch directory is creatable");
-    let script = dir.join("beam_ets_continuation.escript");
-    fs::write(&script, ORACLE_PROGRAM).expect("the oracle program is writable");
-
-    let mut command = Command::new(escript);
-    command.arg(&script).current_dir(&dir);
-    let output = run_bounded(&mut command, Duration::from_secs(60)).unwrap_or_else(|error| {
-        panic!("escript ({}) could not run the oracle: {error}", escript.display())
-    });
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "the oracle escript exited with {}:\n{stderr}",
-        output.status
+    let output = oracle::run_escript(
+        escript,
+        ORACLE_PROGRAM,
+        &[],
+        "continuation",
+        Duration::from_secs(60),
     );
-    let _ = fs::remove_dir_all(&dir);
-
     parse_emitted(&String::from_utf8_lossy(&output.stdout))
 }
 
@@ -862,42 +795,15 @@ fn parse_emitted(stdout: &str) -> Vec<(String, String)> {
     pairs
 }
 
-/// Spawn `command` with both pipes captured and a wall-clock bound.
-fn run_bounded(
-    command: &mut Command,
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
-    use std::process::Stdio;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                return Err(format!("timed out after {timeout:?}"));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
 /// The compatibility cross-check: the live oracle and `beam_ets` must render every
 /// chunk identically.
 #[test]
 fn rust_battery_agrees_with_the_live_oracle() {
-    let Some(escript) = resolve_escript() else {
-        let note = "rust_battery_agrees_with_the_live_oracle: SKIPPED — no Erlang oracle \
-                    found ($ERTS_ORACLE unset and no executable `escript` on $PATH).";
-        if oracle_required() {
-            panic!("{note} $BEAM_ETS_REQUIRE_ORACLE is set, so this is a failure.");
-        }
-        eprintln!("[continuation] {note}");
+    let Some(escript) = oracle::resolve_escript() else {
+        oracle::skip(
+            "rust_battery_agrees_with_the_live_oracle",
+            "no Erlang oracle found ($ERTS_ORACLE unset and no executable `escript` on $PATH)",
+        );
         return;
     };
 
@@ -914,12 +820,5 @@ fn rust_battery_agrees_with_the_live_oracle() {
             rust_value, &oracle[name],
             "case {name}: beam_ets and the oracle disagree"
         );
-    }
-}
-
-fn oracle_required() -> bool {
-    match env::var("BEAM_ETS_REQUIRE_ORACLE") {
-        Ok(value) => !value.is_empty() && value != "0",
-        Err(_) => false,
     }
 }

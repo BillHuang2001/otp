@@ -58,11 +58,11 @@
 //!
 //! # Skipping without Erlang
 //!
-//! Tests 2 and 3 resolve `erl`/`erlc` from `$ERTS_ORACLE` and then `$PATH`. When
-//! they are absent the test prints a note and returns — CI without Erlang stays
-//! green. Set `BEAM_ETS_REQUIRE_ORACLE=1` to turn that skip into a failure (what
-//! this repository's gate run does, so a silently-skipped differential can never
-//! look like a pass).
+//! Tests 2, 3 and 4 resolve `erl`/`erlc` from `$ERTS_ORACLE` and then `$PATH`. The
+//! oracle cross-checks are **required by default** — a genuinely absent Erlang makes
+//! them fail, so a silently-skipped differential can never look like a pass. Set
+//! `BEAM_ETS_ALLOW_NO_ORACLE=1` to opt out explicitly (see `tests/common/oracle.rs`,
+//! the crate's single gate); `BEAM_ETS_REQUIRE_ORACLE=1` still forces the requirement.
 //!
 //! # Battery coverage
 //!
@@ -192,10 +192,9 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
 
 // The support modules live in `tests/differential/` so that they are *not*
 // themselves integration-test targets (Cargo only builds the `.rs` files
@@ -206,7 +205,10 @@ mod battery;
 #[path = "differential/erl_program.rs"]
 mod erl_program;
 
+mod common;
+
 use battery::rust_battery;
+use common::oracle;
 
 /// How long the oracle is given to compile and then to run. Generous: the two
 /// 10 001-key cases build and walk a large table, and a loaded CI box can be slow.
@@ -532,14 +534,6 @@ struct Oracle {
     erlc: PathBuf,
 }
 
-/// Whether `$BEAM_ETS_REQUIRE_ORACLE` asks for the oracle to be mandatory.
-fn oracle_required() -> bool {
-    match env::var("BEAM_ETS_REQUIRE_ORACLE") {
-        Ok(value) => !value.is_empty() && value != "0",
-        Err(_) => false,
-    }
-}
-
 /// Resolve the oracle from `$ERTS_ORACLE`, then `$PATH`.
 ///
 /// Returns `None` when no Erlang is installed (the caller skips), but **fails
@@ -550,59 +544,24 @@ fn resolve_oracle() -> Option<Oracle> {
         Some(value) => {
             let candidate = PathBuf::from(&value);
             assert!(
-                is_executable(&candidate),
+                oracle::is_executable(&candidate),
                 "$ERTS_ORACLE is set to '{}', which is not an executable file",
                 candidate.display()
             );
             candidate
         }
-        None => find_in_path("erl")?,
+        None => oracle::find_in_path("erl")?,
     };
     // `erlc` normally sits next to `erl`; fall back to `$PATH` (a wrapper script
     // may install only `erl`).
     let sibling = erl.with_file_name("erlc");
-    let erlc = if is_executable(&sibling) {
+    let erlc = if oracle::is_executable(&sibling) {
         sibling
     } else {
-        find_in_path("erlc")?
+        oracle::find_in_path("erlc")?
     };
     Some(Oracle { erl, erlc })
 }
-
-/// The first executable `name` on `$PATH`.
-fn find_in_path(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    for dir in env::split_paths(&path) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// Whether `path` is an executable file.
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 /// Compile the embedded oracle program and run its battery, returning the
 /// `case_name -> rendered_result` pairs it emitted.
 ///
@@ -629,7 +588,7 @@ fn run_oracle(oracle: &Oracle) -> Vec<(String, String)> {
         .arg(&dir)
         .arg(&source)
         .current_dir(&dir);
-    let compiled = run_bounded(&mut compile, ORACLE_TIMEOUT).unwrap_or_else(|error| {
+    let compiled = oracle::run_bounded(&mut compile, ORACLE_TIMEOUT).unwrap_or_else(|error| {
         panic!(
             "erlc ({}) could not compile the oracle program: {error}",
             oracle.erlc.display()
@@ -655,7 +614,7 @@ fn run_oracle(oracle: &Oracle) -> Vec<(String, String)> {
         .arg("-s")
         .arg("init")
         .arg("stop");
-    let output = run_bounded(&mut run, ORACLE_TIMEOUT).unwrap_or_else(|error| {
+    let output = oracle::run_bounded(&mut run, ORACLE_TIMEOUT).unwrap_or_else(|error| {
         panic!(
             "erl ({}) could not run the oracle battery: {error}",
             oracle.erl.display()
@@ -676,41 +635,6 @@ fn run_oracle(oracle: &Oracle) -> Vec<(String, String)> {
     let emitted = parse_emitted(&String::from_utf8_lossy(&output.stdout));
     let _ = fs::remove_dir_all(&dir);
     emitted
-}
-
-/// Spawn `command`, wait at most `timeout` for it, and collect its output.
-///
-/// Both pipes are read only after the child has exited; the battery writes a few
-/// kilobytes, far below the pipe capacity, so that cannot deadlock.
-fn run_bounded(command: &mut Command, timeout: Duration) -> Result<Output, String> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to spawn: {error}"))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("timed out after {timeout:?}"));
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("failed while waiting: {error}"));
-            }
-        }
-    }
-    child
-        .wait_with_output()
-        .map_err(|error| format!("failed to collect the output: {error}"))
 }
 
 /// Parse the oracle's `name|rendered` lines.
@@ -814,21 +738,18 @@ fn assert_agree(expected: &BTreeMap<String, String>, actual: &BTreeMap<String, S
 
 /// Resolve the oracle, or skip the calling test with a note.
 ///
-/// `None` means "skip": no Erlang on this machine. When
-/// `$BEAM_ETS_REQUIRE_ORACLE` is set, a missing oracle is a failure instead.
+/// `None` means "skip": this environment explicitly accepted a missing oracle
+/// (`BEAM_ETS_ALLOW_NO_ORACLE=1`). Because the oracle is **required by default**, a
+/// genuinely absent Erlang **fails** the test instead — see `oracle::skip`.
 fn oracle_or_skip(test: &str) -> Option<Oracle> {
     match resolve_oracle() {
         Some(oracle) => Some(oracle),
         None => {
-            assert!(
-                !oracle_required(),
-                "{test}: $BEAM_ETS_REQUIRE_ORACLE is set but neither $ERTS_ORACLE nor an \
-                 executable `erl` on $PATH could be found"
-            );
-            eprintln!(
-                "{test}: SKIPPED — no Erlang oracle found ($ERTS_ORACLE unset and no executable \
-                 `erl` on $PATH). The embedded, erl-derived expectation table is still checked by \
-                 `rust_battery_matches_the_embedded_oracle_table`."
+            oracle::skip(
+                test,
+                "no Erlang oracle found ($ERTS_ORACLE unset and no executable `erl` on $PATH); the \
+                 embedded, erl-derived expectation table is still checked by \
+                 `rust_battery_matches_the_embedded_oracle_table`",
             );
             None
         }
