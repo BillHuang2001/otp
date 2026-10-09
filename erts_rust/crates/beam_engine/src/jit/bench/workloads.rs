@@ -18,28 +18,33 @@
 //
 // %CopyrightEnd%
 
-//! The measured workloads: four hand-built synthetic modules over the opcode shapes the
-//! baseline tier does **not** inline.
+//! The workload **type** and the four shapes the baseline tier does **not** inline.
 //!
 //! Each workload is a [`Workload`] — a [`Module`] assembled with the loader's own block
 //! decomposition ([`beam_loader::lower::build_blocks`]), an exported `function/arity`,
 //! how to obtain the call arguments, and a value check that pins the result the body is
 //! *supposed* to compute (so a tier that "agrees" on a wrong answer still fails).
 //!
+//! This file owns the four shapes whose lowering story is "every instruction is a
+//! `jit_step_one` helper round-trip on a native tier": `build/0`
+//! (`put_tuple2`/`put_list`), `map/2` (the map family), `select/1` (`select_val`) and
+//! `walk/2` (a tail-recursive cons-list walk). The shapes the tier *inlines* are in
+//! [`super::inlined`], and [`workloads`] is the concatenation of both.
+//!
 //! The harness half (the parent module) owns the tiers, the timing and the reporting;
-//! this file owns only the programs. See the parent for the method and the caveats
-//! (mean `ns/op`, shared/high-load sandbox, and the fact that correctness — never
-//! "the JIT is faster" — is the only thing asserted).
+//! this file owns the workload type and the deopted programs. See the parent for the
+//! method and the caveats (mean `ns/op`, shared/high-load sandbox, and the fact that
+//! correctness — never "the JIT is faster" — is the only thing asserted).
 
 use beam_common::Result;
 use beam_loader::{Instr, Label, MapWriteArgs, Module, Operand, TestKind, NO_FAIL};
-use beam_term::{make_small, Atom, Eterm, NIL};
+use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
-use crate::context::MinimalContext;
+use crate::context::{BifHook, MinimalContext};
 use crate::terms;
 
 use super::checks::{verify_build, verify_map, verify_select, verify_walk};
-use super::support::Fixture;
+use super::support::{arith_hook, Fixture};
 
 // ---------------------------------------------------------------------------
 // Workload parameters
@@ -72,7 +77,7 @@ pub(super) const AGREEMENT_RUNS: u32 = 4;
 // Workloads
 // ---------------------------------------------------------------------------
 /// How a workload's call arguments are produced for a run.
-enum Args {
+pub(super) enum Args {
     /// Immediate-only arguments: identical in every context, so they can be shared.
     Fixed(Vec<Eterm>),
     /// Arguments that are **heap terms** and therefore must be built in the run's own
@@ -97,10 +102,31 @@ pub(super) struct Workload {
     /// A shape check pinned to the workload (never a tautology: it pins the value the
     /// body is *supposed* to compute, so a tier that "agrees" on a wrong answer still
     /// fails).
-    verify: fn(Eterm) -> std::result::Result<(), String>,
+    verify: fn(&Workload, Eterm) -> std::result::Result<(), String>,
 }
 
 impl Workload {
+    /// Assemble a workload. The constructor exists so a workload defined outside this
+    /// file (see [`super::inlined`]) can build one without naming its private
+    /// `args`/`verify` fields.
+    pub(super) fn new(
+        label: String,
+        module: Module,
+        function: Atom,
+        arity: u32,
+        args: Args,
+        verify: fn(&Workload, Eterm) -> std::result::Result<(), String>,
+    ) -> Workload {
+        Workload {
+            label,
+            module,
+            function,
+            arity,
+            args,
+            verify,
+        }
+    }
+
     /// The call arguments for a run, obtained **in the run's own context**.
     ///
     /// A heap term (the map, the list) must be built in the context that will own it:
@@ -115,18 +141,44 @@ impl Workload {
 
     /// Pin `result` to this workload's intended value.
     pub(super) fn verify(&self, result: Eterm) -> std::result::Result<(), String> {
-        (self.verify)(result)
+        (self.verify)(self, result)
+    }
+
+    /// The BIF hook this workload's runs need — the pluggable body of the
+    /// interpreter's `ctx.call_bif`.
+    ///
+    /// Every arithmetic workload uses the small-int [`arith_hook`]. The comparison
+    /// kernel needs one thing more: the result of a comparison is the module's **own**
+    /// `true`/`false` atom word, and an atom index only means something inside the
+    /// [`AtomTable`] it was interned in (each workload owns a private table), so the two
+    /// words can only come from *this* module's table. They are handed to the hook only
+    /// when the module interns **both** — the hook panics rather than fabricate a
+    /// missing one, so a half-supplied pair must not reach it.
+    ///
+    /// [`AtomTable`]: beam_term::AtomTable
+    pub(super) fn bif_hook(&self) -> BifHook {
+        match (
+            self.module.atom_table.lookup("true").map(make_atom),
+            self.module.atom_table.lookup("false").map(make_atom),
+        ) {
+            (Some(truthy), Some(falsy)) => arith_hook(Some(truthy), Some(falsy)),
+            _ => arith_hook(None, None),
+        }
     }
 }
 
-/// The four workloads, freshly built.
+/// Every workload the tier table measures: the shapes the baseline tier **deopts**
+/// ([`build_workload`]/[`map_workload`]/[`select_workload`]/[`walk_workload`]) followed
+/// by the shapes it **inlines** (`super::inlined`).
 pub(super) fn workloads() -> Vec<Workload> {
-    vec![
+    let mut all = vec![
         build_workload(),
         map_workload(),
         select_workload(),
         walk_workload(),
-    ]
+    ];
+    all.extend(super::inlined::inlined_workloads());
+    all
 }
 
 /// `build/0` — [`BUILD_ROUNDS`] `put_tuple2` + `put_list` pairs, then `return`.

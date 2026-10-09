@@ -120,12 +120,11 @@ impl Fixture {
 
     /// Intern `name` in the module's own atom table.
     ///
-    /// Cranelift kernels need atoms beyond the ones a name/import creates (the
-    /// `badmatch` a deopt path could name, the comparison kernels' `true`/`false`), so
-    /// this is gated on the very feature that compiles those kernels — the
-    /// interpreter-vs-baseline workloads never need it and the feature-off build would
-    /// otherwise carry dead code.
-    #[cfg(feature = "jit-cranelift")]
+    /// The hand-built kernels need atoms beyond the ones a name or an import
+    /// creates: the comparison kernel's `true`/`false` (a comparison returns the
+    /// module's **own** atom word, never a fabricated boolean) and the `badmatch` a
+    /// deopt path could name. Ungated — both the feature-on Cranelift kernels and the
+    /// always-built interpreter-vs-baseline kernels need it.
     pub(crate) fn intern(&mut self, name: &str) -> Atom {
         self.module.atom_table.intern(name)
     }
@@ -195,10 +194,10 @@ impl Fixture {
 /// The per-tier samples of one measurement.
 ///
 /// Consumed by the order-balanced Cranelift harness (the only one that collects a
-/// *distribution* of samples rather than a single aggregate), hence the feature gate:
-/// without `jit-cranelift` no harness here builds one, and the ungated definition would
-/// be dead code.
-#[cfg(feature = "jit-cranelift")]
+/// *distribution* of samples rather than a single aggregate), hence the gate: no
+/// always-built harness here builds one, so without `jit-cranelift` **and** a unit-test
+/// build the type would be dead code.
+#[cfg(all(test, feature = "jit-cranelift"))]
 pub(crate) struct Samples {
     /// The tier's name.
     pub(crate) tier: &'static str,
@@ -208,7 +207,7 @@ pub(crate) struct Samples {
     pub(crate) ns_per_op: Vec<f64>,
 }
 
-#[cfg(feature = "jit-cranelift")]
+#[cfg(all(test, feature = "jit-cranelift"))]
 impl Samples {
     /// The minimum ns/op (the robust statistic under additive background load).
     pub(crate) fn min(&self) -> f64 {

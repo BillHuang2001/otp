@@ -18,31 +18,30 @@
 //
 // %CopyrightEnd%
 
-//! Owner-side interpreter-vs-baseline measurement harness for the opcode shapes the
-//! integration-level `tests/jit_bench.rs` does **not** cover.
+//! The engine's interpreter-vs-baseline tier measurement harness, over **every**
+//! measured workload.
 //!
-//! `tests/jit_bench.rs` measures the arithmetic/register/comparison/aggregate-read
-//! inlines (`fib`/`kernel`/`wide`/`aggr`/`cmp`). This harness adds the four shapes
-//! whose lowering story is the *opposite* one — they are **not** in the baseline
-//! tier's inline set, so every one of them is a `jit_step_one` helper round-trip on a
-//! native tier:
+//! This module is the single home for the JIT benchmark: the tier seam, the timing
+//! loop, the reporting (here), the workload programs ([`workloads`], [`inlined`]), the
+//! per-workload result checks ([`checks`]) and the shared scaffolding ([`support`],
+//! which the sibling Cranelift ABBA harness also consumes). The `#[test]` entry points
+//! live in the integration test `tests/jit_bench.rs`, which calls
+//! [`assert_tier_agreement`] (fast, in the ordinary suite) and
+//! [`run_measurement_table`] (the `#[ignore]`d table). Keeping the harness here is what
+//! stops the unit-test and integration-test halves from growing a copy each.
 //!
-//! * **`build/0`** — a straight-line body of `put_tuple2` / `put_list` constructors.
-//!   Neither constructor is inlined, so each one is one interpreter step on the
-//!   baseline tier (plus one heap allocation in the context's arena).
-//! * **`map/2`** — a body of the map instructions (`has_map_fields`,
-//!   `get_map_elements`, `put_map_assoc`) over a flat map built once by the harness.
-//!   All three are family instructions, i.e. deopts.
-//! * **`select/1`** — a body dominated by `select_val` dispatch, deliberately mixing
-//!   the **inlined** shape (immediate alternatives + a resolved fail label, lowered by
-//!   `src/jit/baseline/emit/select.rs`) with the **deopted** shape (a register
-//!   alternative, which `constant_word` refuses), so the measurement sees both.
-//! * **`walk/2`** — a hot tail-recursive loop walking a cons list (an
-//!   `is_nonempty_list` guard + `get_list` + a small-int `'+'/2` + `call_only`), i.e.
-//!   control flow the straight-line `aggr/2` workload never exercises. The list is
-//!   built by the harness (in the run's own context) so the timed loop is the walk only.
+//! Nine workloads, split by lowering story:
 //!
-//! # Method (copied from `tests/jit_bench.rs`, deliberately)
+//! * The shapes the baseline tier **deopts** (every instruction is a `jit_step_one`
+//!   helper round-trip on a native tier) — **`build/0`** (`put_tuple2`/`put_list`),
+//!   **`map/2`** (`has_map_fields`/`get_map_elements`/`put_map_assoc`), **`select/1`**
+//!   (a body dominated by `select_val`, deliberately mixing the inlined immediate shape
+//!   with the deopted register shape) and **`walk/2`** (a hot tail-recursive cons-list
+//!   walk: an `is_nonempty_list` guard + `get_list` + a small-int `'+'/2` + `call_only`).
+//! * The shapes the tier **inlines** ([`inlined`]) — **`slice:fib/1`** (a real `.beam`
+//!   fixture), **`kernel/2`**, **`wide/2`**, **`aggr/2`** and **`cmp/2`**.
+//!
+//! # Method
 //!
 //! Every workload is a hand-built synthetic [`Module`] assembled by the loader's own
 //! block decomposition ([`beam_loader::lower::build_blocks`]), run on the shared
@@ -59,24 +58,22 @@
 //!   pinning, so treat them as order-of-magnitude evidence, not precise figures.
 //! * These tiers are **correctness-first mechanisms, not optimisers** (Part II §F).
 //!   Nothing here asserts that a native tier is faster — that is environment dependent
-//!   and would be flaky. Every workload asserts only that the two tiers **agree** on
+//!   and would be flaky. Every workload asserts only that the tiers **agree** on
 //!   the result, and that the result is the value the workload is supposed to compute
 //!   (compared **structurally**, since the two machines have separate heaps).
 //! * Both tiers allocate in the context's arena, which is never freed
 //!   (`MinimalContext` has no collector), so a workload that builds terms per run grows
 //!   RSS with the iteration count. The counts are chosen to keep that bounded.
+//! * **`beam_rt` still hardcodes `Tier::Interpreter`**, so these are engine-mechanism
+//!   figures, not end-to-end runtime figures.
 //!
 //! # Layout
 //!
-//! [`support`] owns the scaffolding both measurement harnesses share (the synthetic
-//! [`Module`] builder, the arithmetic BIF hook and the ns/op report primitives);
-//! [`workloads`] owns the workload definitions (the synthetic modules, their argument
-//! preparation and their result-shape checks); this file owns the measurement harness
-//! (the tier seam, the timing loop and the reporting).
-//!
-//! The timing test is `#[ignore]`d (run it with `--ignored --nocapture`); the agreement
-//! test is not, so a plain `cargo test -p beam_engine` still checks that every workload
-//! behaves identically on both tiers.
+//! [`support`] owns the scaffolding the harnesses share (the synthetic [`Module`]
+//! builder, the arithmetic BIF hook and the ns/op report primitives); [`workloads`]
+//! owns the workload type and the deopted programs, [`inlined`] the tier-inlined ones;
+//! [`checks`] owns the per-workload result checks; this file owns the tier seam, the
+//! timing loop and the reporting.
 
 use std::cmp::Ordering;
 use std::time::{Duration, Instant};
@@ -95,9 +92,10 @@ use crate::machine::Machine;
 mod checks;
 /// The scaffolding shared with the sibling Cranelift bench (`crate::jit::cranelift::bench`).
 pub(crate) mod support;
+mod inlined;
 mod workloads;
 
-use support::{arith_hook, ns_per_op, ops_per_sec};
+use support::{ns_per_op, ops_per_sec};
 use workloads::{workloads, Workload};
 
 // ---------------------------------------------------------------------------
@@ -213,7 +211,7 @@ impl Measurement {
     /// A measurement of `runs` timed runs of `workload` on `tier`.
     fn run(tier: Tier, workload: &Workload, runs: u32) -> Measurement {
         let mut machine = Machine::new();
-        let mut context = MinimalContext::with_bif_hook(arith_hook(None, None));
+        let mut context = MinimalContext::with_bif_hook(workload.bif_hook());
         let args = workload
             .arguments(&mut context)
             .expect("the workload's arguments must build");
@@ -339,15 +337,16 @@ fn bench_workload(workload: &Workload) {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Entry points (driven by the integration test `tests/jit_bench.rs`)
 // ---------------------------------------------------------------------------
 
-/// Every workload runs **identically** on the interpreter and on every native tier.
+/// Every workload runs **identically** on the interpreter and on every native tier,
+/// each producing the value it is *supposed* to compute.
 ///
-/// Deliberately not timing-sensitive: this is the correctness half, kept in the
-/// ordinary test run so the default `cargo test -p beam_engine` covers it.
-#[test]
-fn the_interpreter_and_the_baseline_tier_agree_on_every_workload() {
+/// Deliberately not timing-sensitive: this is the correctness half, so the `#[test]`
+/// that calls it (`tests/jit_bench.rs`) runs in the ordinary `cargo test` suite.
+/// Panics with a named message on the first disagreement.
+pub fn assert_tier_agreement() {
     for workload in workloads() {
         for tier in benchmarked_tiers() {
             let measurement = Measurement::run(tier, &workload, workloads::AGREEMENT_RUNS);
@@ -379,12 +378,11 @@ fn the_interpreter_and_the_baseline_tier_agree_on_every_workload() {
 /// The measurement table: `ns/op` + `ops/s` per `(workload, tier)`, plus the speed-up
 /// over the interpreter.
 ///
-/// `#[ignore]`d because it is a benchmark, not a unit test:
-/// `... -p beam_engine --lib -- --ignored --nocapture`. One test (not several) so the
-/// workload timings never run concurrently and contaminate each other.
-#[test]
-#[ignore = "measurement table: run with --ignored --nocapture"]
-fn interpreter_versus_native_tiers_measurement_table() {
+/// The `#[test]` that calls it (`tests/jit_bench.rs`) is `#[ignore]`d because this is a
+/// benchmark, not a unit test: run one test (not several) so the workload timings never
+/// run concurrently and contaminate each other —
+/// `... -p beam_engine --test jit_bench -- --ignored --nocapture`.
+pub fn run_measurement_table() {
     for workload in workloads() {
         bench_workload(&workload);
     }

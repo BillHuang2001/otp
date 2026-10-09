@@ -748,43 +748,72 @@ fn the_mock_collector_relocates_a_root_across_every_collection() {
 // Deliverable #4 — measured peak words, before vs after
 // ---------------------------------------------------------------------------
 
-/// The reroute's memory payoff, measured on the same allocation-heavy loop.
+/// The loop lengths the memory table below is measured over.
+const PEAK_TABLE_LENGTHS: [usize; 4] = [1_000, 5_000, 20_000, 50_000];
+
+/// The reroute's memory payoff, measured on the same allocation-heavy loop
+/// ([`unrooted_peak_words`]/[`rooted_peak_live_words`], i.e. the rooted
+/// [`make_tuple_rooted`]/[`make_list_rooted`]/[`make_map_rooted`] builders) over a
+/// growing loop length, printed as a **before/after** table
+/// (`... -p beam_engine --lib -- --nocapture`).
 ///
-/// * **BEFORE** (the unrooted [`MinimalContext`] arena) never frees, so its peak
-///   resident words grow linearly in the loop length.
-/// * **AFTER** (rooted + the collecting [`MovingContext`]) reclaims every
-///   iteration's garbage, so the peak **live** words stay bounded however long the
-///   loop runs.
+/// * **BEFORE** — the local reproduction of the unrooted path: the never-freeing
+///   [`MinimalContext`] arena, whose cumulative resident words are its peak and grow
+///   with the loop length.
+/// * **AFTER** — the rooted path plus the collecting [`MovingContext`], which reclaims
+///   every iteration's garbage, so its peak **live** words stay bounded however long the
+///   loop runs (the live set is the map rooted at `x(0)` plus the blocks in flight).
 #[test]
-fn rooted_collection_bounds_peak_live_words_while_the_unrooted_arena_grows() {
+fn the_rooted_seam_bounds_peak_live_words_as_the_loop_grows() {
     let mut atoms = AtomTable::new();
     let (k1, k2) = (atoms.intern("a"), atoms.intern("b"));
 
-    // BEFORE: the arena hands out words forever, so 4x the loop is 4x the peak.
-    let peak_2k = unrooted_peak_words(2_000, &atoms, k1, k2);
-    let peak_8k = unrooted_peak_words(8_000, &atoms, k1, k2);
-    assert!(
-        peak_8k > 3 * peak_2k,
-        "the unrooted peak must grow with N: {peak_2k} -> {peak_8k}"
-    );
-
-    // AFTER: the live set is one map block plus the block in flight — independent of N.
-    let (live, collections) = rooted_peak_live_words(8_000, &atoms, k1, k2);
-    // Printed for the record (a measurement test; `cargo test` captures it).
     println!(
-        "peak words: unrooted N=2000 {peak_2k}, unrooted N=8000 {peak_8k}; \
-         rooted+collecting N=8000 live {live} over {collections} collections"
+        "{:>6} | {:>35} | {:>29} | {:>11}",
+        "N", "BEFORE: unrooted words", "AFTER: rooted live", "collections"
     );
+    let mut unrooted = Vec::new();
+    let mut rooted = Vec::new();
+    for n in PEAK_TABLE_LENGTHS {
+        let before = unrooted_peak_words(n, &atoms, k1, k2);
+        let (live, collections) = rooted_peak_live_words(n, &atoms, k1, k2);
+        println!("{n:>6} | {before:>35} | {live:>29} | {collections:>11}");
+
+        // Every iteration's three builders reserve once each through the rooted seam,
+        // so the collector runs at least once per reservation.
+        assert!(
+            collections >= 3 * n,
+            "the collector must run on every rooted reservation at N={n}: {collections}"
+        );
+        assert!(
+            live < 64,
+            "the rooted live set must stay bounded at N={n}: {live}"
+        );
+        unrooted.push(before);
+        rooted.push(live);
+    }
+
+    // BEFORE grows with N (each iteration hands out a constant number of words).
+    for pair in unrooted.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "the unrooted peak must grow with N: {unrooted:?}"
+        );
+    }
+    // AFTER does not: the collecting live set is the same handful of words at every N.
+    let bounded = rooted[0];
+    for live in &rooted {
+        assert_eq!(
+            *live, bounded,
+            "the rooted live set must not grow with N: {rooted:?}"
+        );
+    }
+    // And the two are orders of magnitude apart at the largest N.
+    let largest_unrooted = unrooted.last().copied().expect("a table row");
+    let largest_rooted = rooted.last().copied().expect("a table row");
     assert!(
-        collections >= 8_000,
-        "the collector must run at least once per iteration: {collections}"
-    );
-    assert!(
-        live < 64,
-        "peak live words must stay bounded, got {live} for 8000 iterations"
-    );
-    assert!(
-        live * 100 < peak_8k,
-        "the collecting live set ({live}) must be far below the unrooted peak ({peak_8k})"
+        largest_rooted * 1000 < largest_unrooted,
+        "the collecting live set ({largest_rooted}) must be far below the unrooted peak \
+         ({largest_unrooted})"
     );
 }

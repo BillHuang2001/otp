@@ -24,10 +24,16 @@
 //! compute. The check is what makes "the tiers agree" meaningful: two tiers agreeing on
 //! a **wrong** answer still fails here, so a workload can never degenerate into a
 //! tautology that only compares a value against itself.
+//!
+//! A check receives the [`Workload`] as well as the result, because a couple of them
+//! need the workload's own atom table: a comparison never fabricates a boolean, it
+//! returns the module's **own** `true`/`false` atom word, and an atom index only means
+//! something inside the table it was interned in.
 
-use beam_term::{is_small, signed_value, Eterm};
+use beam_term::{is_small, make_atom, signed_value, Eterm};
 
-use super::workloads::{BUILD_ROUNDS, MAP_ROUNDS, SELECT_ROUNDS, WALK_LENGTH};
+use super::inlined::{AGGR_RESULT, FIB_RESULT, KERNEL_RESULT, WIDE_RESULT};
+use super::workloads::{Workload, BUILD_ROUNDS, MAP_ROUNDS, SELECT_ROUNDS, WALK_LENGTH};
 use crate::terms;
 
 /// Assert `result` is the small integer `expected`.
@@ -38,8 +44,46 @@ fn expect_small(result: Eterm, expected: i64) -> std::result::Result<(), String>
     Ok(())
 }
 
+/// `fib/1` must return the 20th Fibonacci number the fixture computes.
+pub(crate) fn verify_fib(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
+    expect_small(result, FIB_RESULT)
+}
+
+/// The arithmetic kernel's fixed point: both accumulators start at `0`, so every
+/// chained `'+'` stays `0`.
+pub(crate) fn verify_kernel(
+    _workload: &Workload,
+    result: Eterm,
+) -> std::result::Result<(), String> {
+    expect_small(result, KERNEL_RESULT)
+}
+
+/// The wide kernel's final register: each round writes `1` into `x(r)` and accumulates
+/// it into `x(r + 1)`, so the last round (`r = WIDE_OPS - 1`) leaves `1` in `x(0)`.
+pub(crate) fn verify_wide(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
+    expect_small(result, WIDE_RESULT)
+}
+
+/// The aggregate kernel multiplies by the constant the reads produce (`1`), so the
+/// accumulator stays `1` (a taken fail arm would make it `-1`).
+pub(crate) fn verify_aggr(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
+    expect_small(result, AGGR_RESULT)
+}
+
+/// The comparison kernel's trailing comparison is `x(2)` (3) `<` `x(1)` (20), so the
+/// result must be the module's **own** `true` atom — not a fabricated boolean.
+pub(crate) fn verify_cmp(workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
+    match workload.module.atom_table.lookup("true").map(make_atom) {
+        Some(truthy) if result == truthy => Ok(()),
+        Some(truthy) => Err(format!(
+            "expected the module's `true` atom ({truthy:?}), got {result:?}"
+        )),
+        None => Err("the comparison module must intern `true`".to_string()),
+    }
+}
+
 /// `build/0` must return a list of [`BUILD_ROUNDS`] ones.
-pub(super) fn verify_build(result: Eterm) -> std::result::Result<(), String> {
+pub(crate) fn verify_build(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
     let items = terms::list_elements(result).map_err(|e| format!("not a proper list: {e:?}"))?;
     if items.len() != BUILD_ROUNDS {
         return Err(format!(
@@ -57,16 +101,16 @@ pub(super) fn verify_build(result: Eterm) -> std::result::Result<(), String> {
 }
 
 /// `map/2` must return `MAP_ROUNDS * 6` (1 + 2 + 3 per round).
-pub(super) fn verify_map(result: Eterm) -> std::result::Result<(), String> {
+pub(crate) fn verify_map(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
     expect_small(result, (MAP_ROUNDS * 6) as i64)
 }
 
 /// `select/1` must return `SELECT_ROUNDS * 3` (the scrutinee per round).
-pub(super) fn verify_select(result: Eterm) -> std::result::Result<(), String> {
+pub(crate) fn verify_select(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
     expect_small(result, (SELECT_ROUNDS * 3) as i64)
 }
 
 /// `walk/2` must return [`WALK_LENGTH`] (one per cell).
-pub(super) fn verify_walk(result: Eterm) -> std::result::Result<(), String> {
+pub(crate) fn verify_walk(_workload: &Workload, result: Eterm) -> std::result::Result<(), String> {
     expect_small(result, WALK_LENGTH as i64)
 }
