@@ -323,6 +323,16 @@ struct PortMeta {
     /// [`driver::DriverPortAdapter`]) and are drained by [`PortRegistry::take_driver_outputs`],
     /// while every other port's come from its registered descriptor through the port-task round.
     kind: PortName,
+    /// The term queue of a `{spawn_driver, Name}` port: the terms its C driver emitted through
+    /// `erl_drv_output_term`/`erl_drv_send_term`, drained by
+    /// [`PortRegistry::take_driver_terms`].
+    ///
+    /// `None` for every port without a C driver (a `spawn`/`fd` port). It is the port host's own
+    /// [`driver::TermQueue`], seized with [`driver::DriverPort::term_queue`] **before** the host is
+    /// moved into the port lifecycle (the boxed driver exposes no host). The host empties the queue
+    /// when the driver is unloaded, so a term is only ever drained while the arena it was built on
+    /// is alive (see the queue's lifetime contract).
+    driver_terms: Option<driver::TermQueue>,
 }
 
 /// A message a live port has produced: the child's stream bytes, or its reaped exit status.
@@ -352,6 +362,24 @@ enum PortEvent {
         /// The child's status (its own exit code, or `128 + signal`).
         status: i32,
         /// The process the message belongs to.
+        owner: ProcessId,
+    },
+    /// A C driver emitted a term (`erl_drv_output_term`/`erl_drv_send_term`, `io.c:5664`).
+    ///
+    /// The delivered message **is** the term itself — never a `{Port, Term}` wrapper: the C hands
+    /// the decoded term straight to the destination's mailbox. The term's words live on the driver
+    /// host's arena, which dies with the driver, so the consumer copies it onto a pointer-stable
+    /// heap before it is used ([`RuntimeContext::stabilize_driver_term`]) — exactly as the
+    /// `{Port, {data, …}}` builders already allocate their message on the runtime's arena.
+    Term {
+        /// The port whose driver emitted the term (the sender).
+        port: PortId,
+        /// The destination: `None` = the port's connected process (`erl_drv_output_term`),
+        /// `Some(pid)` = the explicit destination (`erl_drv_send_term`).
+        to: Option<ProcessId>,
+        /// The decoded term, built on the driver host's arena.
+        term: Eterm,
+        /// The process the port belongs to (used when `to` is `None`).
         owner: ProcessId,
     },
 }
@@ -591,8 +619,10 @@ impl PortRegistry {
     fn pump(&mut self, timeout: Duration) -> Result<Vec<PortEvent>> {
         let mut events = self.take_due_exit_statuses()?;
         // The driver ports' bytes may already be queued (a `port_command` on a driver port ran
-        // the driver's `output` callback inline), so they are harvested before any wait too.
+        // the driver's `output` callback inline), so they are harvested before any wait too —
+        // together with the terms a driver's callback emitted (`erl_drv_output_term`).
         events.extend(self.take_driver_outputs());
+        events.extend(self.take_driver_terms());
         if self.registry.is_empty() {
             return Ok(events);
         }
@@ -641,6 +671,7 @@ impl PortRegistry {
                 }
             }
             events.extend(self.take_driver_outputs());
+            events.extend(self.take_driver_terms());
             events.extend(self.take_due_exit_statuses()?);
             if !events.is_empty() || Instant::now() >= deadline {
                 return Ok(events);
@@ -683,6 +714,58 @@ impl PortRegistry {
                     bytes,
                     stream: meta.stream,
                     owner: meta.owner,
+                });
+            }
+        }
+        events
+    }
+
+    /// The terms the **C driver** ports have emitted (`erl_drv_output_term`/`erl_drv_send_term`).
+    ///
+    /// A driver's callback decodes its term-data spec on the host's arena and queues the resulting
+    /// term on the port's [`driver::TermQueue`] ([`driver::DriverPort::send_term`]); this drains
+    /// every live driver port's queue, in emission order. The delivered message **is** the term —
+    /// never a `{Port, Term}` wrapper (`io.c:6174`) — and its destination is the port's connected
+    /// process for `erl_drv_output_term` (`None`) or the pid `erl_drv_send_term` named. The C
+    /// answers `0` (not delivered) for a destination it cannot resolve, so a `to` that is not one
+    /// of this node's pids is dropped rather than misdelivered to the owner.
+    ///
+    /// A port that has gone away (closed while the term was queued) has no metadata and no
+    /// recipient, so its terms are dropped exactly as [`PortRegistry::take_driver_outputs`] drops
+    /// the bytes of a closed port. A driver's queue is emptied when it is unloaded, so this never
+    /// reports a term whose arena is gone (see [`driver::TermQueue`]'s lifetime contract).
+    fn take_driver_terms(&mut self) -> Vec<PortEvent> {
+        let numbers: Vec<u64> = self
+            .meta
+            .iter()
+            .filter(|(_, meta)| meta.driver_terms.is_some())
+            .map(|(number, _)| *number)
+            .collect();
+        let mut events = Vec::new();
+        for number in numbers {
+            let Some(meta) = self.meta.get(&number) else {
+                continue;
+            };
+            let Some(queue) = meta.driver_terms.as_ref() else {
+                continue;
+            };
+            let owner = meta.owner;
+            for (destination, term) in queue.take() {
+                // `None` = the port's connected process (`erl_drv_output_term`); `Some(pid_term)`
+                // = the destination `erl_drv_send_term` named. A destination this node does not
+                // hold is the C's own "not delivered" (`io.c:5664`), never a misdelivery.
+                let to = match destination {
+                    None => None,
+                    Some(pid_term) => match ProcessId::from_eterm(pid_term) {
+                        Ok(pid) => Some(pid),
+                        Err(_) => continue,
+                    },
+                };
+                events.push(PortEvent::Term {
+                    port: PortId::new(number),
+                    to,
+                    term,
+                    owner,
                 });
             }
         }
@@ -1182,6 +1265,11 @@ impl PortHook for RuntimePorts {
                 Rc::clone(&self.atoms),
                 self.owner,
             );
+            // Seize the driver's term queue **before** the host is moved into the port lifecycle
+            // (the boxed driver exposes no host): it is the handle a driver callback's
+            // `erl_drv_output_term`/`erl_drv_send_term` pushes onto and
+            // [`PortRegistry::take_driver_terms`] drains.
+            let driver_terms = host.term_queue();
             let adapter =
                 driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command.clone())
                     .map_err(|_| BeamError::BadArg)?;
@@ -1195,6 +1283,7 @@ impl PortHook for RuntimePorts {
                 monitors: Vec::new(),
                 owner: self.owner,
                 kind: PortName::SpawnDriver,
+                driver_terms: Some(driver_terms),
             };
             let mut registry = self.registry_mut()?;
             return registry.register(Box::new(adapter), meta);
@@ -1216,6 +1305,8 @@ impl PortHook for RuntimePorts {
             monitors: Vec::new(),
             owner: self.owner,
             kind: spec.kind,
+            // A `spawn`/`fd` port has no C driver, so no driver term queue exists.
+            driver_terms: None,
         };
         // The registry stays borrowed across `register`: starting a port cannot re-enter a
         // port operation, and a nested borrow is a typed error rather than a panic.
@@ -1323,8 +1414,11 @@ impl Runtime {
         for event in events {
             // The term is built on the runtime's arena (the `RuntimeContext` the builders
             // need) *after* the registry borrow has been released — the same snapshot rule
-            // the `-eval` poller follows.
-            let (owner, from, message) = {
+            // the `-eval` poller follows. A driver-emitted term is stabilised the same way:
+            // it was built on the *driver host's* arena, so it is copied onto the
+            // pointer-stable `eval_heap` before the `deliver_simple` copy reads it, and can
+            // never dangle when the driver is unloaded.
+            let (recipient, from, message) = {
                 let mut ctx = RuntimeContext::new(&mut *self);
                 match &event {
                     PortEvent::Data {
@@ -1342,14 +1436,26 @@ impl Runtime {
                         port.to_eterm(),
                         ctx.port_exit_message(*port, *status)?,
                     ),
+                    PortEvent::Term {
+                        port,
+                        to,
+                        term,
+                        owner,
+                    } => (
+                        // `erl_drv_output_term` targets the port's owner; `erl_drv_send_term`
+                        // names its destination explicitly (`io.c:5664`).
+                        to.unwrap_or(*owner),
+                        port.to_eterm(),
+                        ctx.stabilize_driver_term(*term)?,
+                    ),
                 }
             };
-            // A port whose owner has since terminated has no recipient: the message is
+            // A port whose recipient has since terminated has no recipient: the message is
             // dropped, not an error.
-            if !table.contains(owner) {
+            if !table.contains(recipient) {
                 continue;
             }
-            table.deliver_simple(owner, from, message)?;
+            table.deliver_simple(recipient, from, message)?;
             delivered += 1;
         }
         Ok(delivered)
@@ -1398,9 +1504,39 @@ impl RuntimeContext<'_> {
                 PortEvent::Exited { port, status, .. } => {
                     messages.push(self.port_exit_message(port, status)?)
                 }
+                // A driver-emitted term is the message itself, never a `{Port, Term}` wrapper
+                // (`io.c:6174`). The evaluator can only observe its **own** process's mailbox, so
+                // a term the driver addressed to a *different* process is not returned here — the
+                // scheduler path ([`Runtime::deliver_port_messages`]) delivers it into that
+                // process's mailbox instead — rather than being matched as if it were the
+                // evaluator's own.
+                PortEvent::Term { to, term, owner, .. } => {
+                    if to.unwrap_or(owner) != self.pid() {
+                        continue;
+                    }
+                    messages.push(self.stabilize_driver_term(term)?);
+                }
             }
         }
         Ok(messages)
+    }
+
+    /// Copies a driver-emitted term onto the runtime's pointer-stable arena.
+    ///
+    /// A term a C driver emitted (`erl_drv_output_term`/`erl_drv_send_term`) is decoded on the
+    /// **driver host's** arena, which is freed when the driver is unloaded. It is copied onto
+    /// [`Runtime::eval_heap`](crate::runtime::Runtime) — runtime-lifetime and never reset — before
+    /// it is delivered into a mailbox or returned to the `-eval` evaluator, exactly as the
+    /// `{Port, {data, …}}` builders already allocate their message on the runtime's arena. An
+    /// immediate is returned unchanged (the copier shares it).
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the term does not fit, translated to the emulator's
+    /// documented `error:system_limit` — never a dangling term (see
+    /// [`Runtime::stabilize_term`](crate::runtime::Runtime)).
+    pub(crate) fn stabilize_driver_term(&mut self, term: Eterm) -> Result<Eterm> {
+        self.runtime.stabilize_term(term)
     }
 
     /// The `{Port, {data, Data}}` message of one port-stream read.
@@ -1555,8 +1691,11 @@ fn monitor_list(heap: &mut Heap, atoms: &AtomTable, pids: &[ProcessId]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boot;
     use beam_io::DriverContext;
+    use beam_process::SignalAtoms;
+
+    use crate::boot;
+    use crate::config::RuntimeConfig;
 
     /// The process every port the fixture's hook opens claims as its owner.
     const OWNER: ProcessId = ProcessId::new(7, 0);
@@ -1734,6 +1873,7 @@ mod tests {
             notify_exit: false,
             monitors: Vec::new(),
             owner: OWNER,
+            driver_terms: None,
         }
     }
 
@@ -2533,5 +2673,363 @@ mod tests {
         fx.hook.close_port(first).expect("closing the first port");
         assert!(!fx.registry.borrow().contains(first));
         assert_eq!(fx.registry.borrow().ids(), vec![second]);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The driver-emitted-term delivery handoff (`erl_drv_output_term`/`erl_drv_send_term`)
+    // -----------------------------------------------------------------------------------------
+
+    /// A `DriverPort` host plus the `port_info` metadata a `{spawn_driver, Name}` `open_port/2`
+    /// builds for it: the two halves of the driver-term handoff (see
+    /// [`RuntimePorts::open_port`]).
+    ///
+    /// The host's [`driver::TermQueue`] is the **same** handle stored on `meta.driver_terms`, so
+    /// pushing through the host (what a driver callback does) is exactly what the port's drain
+    /// observes.
+    fn driver_term_host(atoms: &Rc<AtomTable>, owner: ProcessId) -> (driver::DriverPort, PortMeta) {
+        let host = driver::DriverPort::new(
+            Heap::new(64).expect("a driver heap"),
+            Rc::clone(atoms),
+            owner,
+        );
+        let queue = host.term_queue();
+        let mut meta = test_meta("driver");
+        meta.kind = PortName::SpawnDriver;
+        meta.owner = owner;
+        meta.driver_terms = Some(queue);
+        (host, meta)
+    }
+
+    /// The same, registered in the fixture's registry (a port with no OS child, driven by a
+    /// [`RecorderDriver`]).
+    fn driver_term_fixture(
+        fx: &Fixture,
+        owner: ProcessId,
+    ) -> (driver::DriverPort, PortId) {
+        let (host, meta) = driver_term_host(&fx.atoms, owner);
+        let port = fx
+            .registry
+            .borrow_mut()
+            .register(
+                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+                meta,
+            )
+            .expect("a registered driver port");
+        (host, port)
+    }
+
+    /// A term a C driver emitted is drained off the port's [`driver::TermQueue`] as a
+    /// [`PortEvent::Term`] — the decoded term itself, with the destination `erl_drv_output_term`
+    /// (`None` = the owner) or `erl_drv_send_term` (`Some(pid)`) named — and a destination this
+    /// node cannot resolve is dropped (the C's own "not delivered", `io.c:5664`).
+    #[test]
+    fn a_driver_emitted_term_is_drained_as_a_term_event() {
+        use beam_abi::DriverHost;
+
+        let fx = fixture();
+        let (mut host, port) = driver_term_fixture(&fx, OWNER);
+
+        // Nothing queued yet.
+        assert!(fx.registry.borrow_mut().take_driver_terms().is_empty());
+
+        let recipient = ProcessId::new(9, 0);
+        // `erl_drv_output_term`: the port's connected process.
+        assert_eq!(host.send_term(std::ptr::null_mut(), None, make_small(1)), 0);
+        // `erl_drv_send_term`: an explicit destination.
+        assert_eq!(
+            host.send_term(std::ptr::null_mut(), Some(recipient.to_eterm()), make_small(2)),
+            0
+        );
+        // A destination that is not a pid of this node: the C's refusal, never a misdelivery.
+        assert_eq!(
+            host.send_term(std::ptr::null_mut(), Some(make_small(3)), make_small(4)),
+            0
+        );
+
+        let events = fx.registry.borrow_mut().take_driver_terms();
+        assert_eq!(
+            events.len(),
+            2,
+            "the unresolvable destination is dropped: {events:?}"
+        );
+        match &events[0] {
+            PortEvent::Term {
+                port: source,
+                to,
+                term,
+                owner,
+            } => {
+                assert_eq!(*source, port);
+                assert_eq!(*to, None, "`None` = the port owner");
+                assert_eq!(*term, make_small(1));
+                assert_eq!(*owner, OWNER);
+            }
+            other => panic!("expected a term event, got {other:?}"),
+        }
+        match &events[1] {
+            PortEvent::Term { to, term, .. } => {
+                assert_eq!(*to, Some(recipient));
+                assert_eq!(*term, make_small(2));
+            }
+            other => panic!("expected a term event, got {other:?}"),
+        }
+        // Draining empties the queue: a second round reports nothing.
+        assert!(fx.registry.borrow_mut().take_driver_terms().is_empty());
+    }
+
+    /// The port pump surfaces a driver-emitted term as its own event (it is one of the two
+    /// producers [`PortRegistry::pump`] harvests, next to `driver_output`'s bytes).
+    #[test]
+    fn the_pump_reports_a_driver_emitted_term() {
+        use beam_abi::DriverHost;
+
+        let fx = fixture();
+        let (mut host, port) = driver_term_fixture(&fx, OWNER);
+        assert_eq!(host.send_term(std::ptr::null_mut(), None, make_small(7)), 0);
+
+        let events = fx
+            .registry
+            .borrow_mut()
+            .pump(Duration::from_millis(1))
+            .expect("pump");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PortEvent::Term { port: p, term, .. } if *p == port && *term == make_small(7)
+            )),
+            "the pump must report the driver's term: {events:?}"
+        );
+        // Handed out exactly once.
+        assert!(fx.registry.borrow_mut().take_driver_terms().is_empty());
+    }
+
+    /// A driver-emitted term is delivered into its recipient's mailbox by
+    /// [`Runtime::deliver_port_messages`]: the term itself (never a `{Port, Term}` wrapper), to the
+    /// port's owner for `erl_drv_output_term` and to the named pid for `erl_drv_send_term`.
+    ///
+    /// The term was built on the **driver host's** arena, so it is copied onto the runtime's
+    /// pointer-stable heap before delivery — the mailbox payload is a fresh copy, not the driver's
+    /// own words (see [`RuntimeContext::stabilize_driver_term`]).
+    #[test]
+    fn a_driver_emitted_term_is_delivered_into_the_recipients_mailbox() {
+        use beam_abi::DriverHost;
+
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+        let owner = table.spawn_default().expect("the port's owner");
+        let other = table.spawn_default().expect("an explicit destination");
+
+        // A two-element tuple built on the *host's* arena, so the delivered copy proves the term
+        // was stabilised off that heap rather than shared. A fresh `AtomTable` is fine: nothing in
+        // this term is an atom.
+        let atoms = Rc::new(AtomTable::new());
+        let (mut host, meta) = driver_term_host(&atoms, owner);
+        let mut scratch = Heap::new(16).expect("a scratch heap");
+        let queued = scratch
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("a small tuple");
+        assert_eq!(host.send_term(std::ptr::null_mut(), None, queued), 0);
+        assert_eq!(
+            host.send_term(std::ptr::null_mut(), Some(other.to_eterm()), queued),
+            0
+        );
+
+        let port = rt
+            .ports
+            .borrow_mut()
+            .register(
+                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+                meta,
+            )
+            .expect("a registered driver port");
+
+        let delivered = rt
+            .deliver_port_messages(&mut table, Duration::from_millis(1))
+            .expect("deliver");
+        assert_eq!(delivered, 2, "both terms are delivered");
+
+        // The owner got the `erl_drv_output_term` term; the explicit destination got its own.
+        let in_owner = table
+            .get(owner)
+            .expect("the owner")
+            .mailbox()
+            .peek()
+            .expect("a message")
+            .payload();
+        assert_eq!(
+            terms::tuple_arity(in_owner).expect("the term itself is the message"),
+            2,
+            "in_owner={in_owner:?}"
+        );
+        assert_eq!(signed_value(terms::tuple_element(in_owner, 0).unwrap()), 1);
+        assert_eq!(signed_value(terms::tuple_element(in_owner, 1).unwrap()), 2);
+        assert_ne!(
+            in_owner.raw(),
+            queued.raw(),
+            "the delivered term is a copy off the driver's arena"
+        );
+
+        let in_other = table
+            .get(other)
+            .expect("the explicit destination")
+            .mailbox()
+            .peek()
+            .expect("a message")
+            .payload();
+        assert_eq!(terms::tuple_arity(in_other).unwrap(), 2, "{in_other:?}");
+
+        // The `from` of both messages is the port itself (what send-tracing reports).
+        assert_eq!(
+            table.get(owner).unwrap().mailbox().peek().unwrap().from(),
+            port.to_eterm()
+        );
+    }
+
+    /// An unresolvable `erl_drv_send_term` destination is dropped at the drain, so
+    /// [`Runtime::deliver_port_messages`] delivers nothing for it — the C's own "not delivered".
+    #[test]
+    fn a_driver_term_with_an_unresolvable_destination_is_not_delivered() {
+        use beam_abi::DriverHost;
+
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+        let owner = table.spawn_default().expect("the port's owner");
+
+        let atoms = Rc::new(AtomTable::new());
+        let (mut host, meta) = driver_term_host(&atoms, owner);
+        assert_eq!(
+            host.send_term(std::ptr::null_mut(), Some(make_small(3)), make_small(4)),
+            0
+        );
+        let _ = rt
+            .ports
+            .borrow_mut()
+            .register(
+                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+                meta,
+            )
+            .expect("a registered driver port");
+
+        let delivered = rt
+            .deliver_port_messages(&mut table, Duration::from_millis(1))
+            .expect("deliver");
+        assert_eq!(delivered, 0, "the unresolvable destination is dropped");
+        assert!(
+            table.get(owner).expect("the owner").mailbox().is_empty(),
+            "nothing reaches the owner"
+        );
+    }
+
+    /// A term addressed to a process that is **not** the port's owner and not the evaluating
+    /// process is delivered to the named process, not to the owner.
+    #[test]
+    fn an_explicit_destination_overrides_the_owner() {
+        use beam_abi::DriverHost;
+
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let mut table = ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()));
+        let owner = table.spawn_default().expect("the port's owner");
+        let other = table.spawn_default().expect("the destination");
+
+        let atoms = Rc::new(AtomTable::new());
+        let (mut host, meta) = driver_term_host(&atoms, owner);
+        assert_eq!(
+            host.send_term(std::ptr::null_mut(), Some(other.to_eterm()), make_small(42)),
+            0
+        );
+        let _ = rt
+            .ports
+            .borrow_mut()
+            .register(
+                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+                meta,
+            )
+            .expect("a registered driver port");
+
+        let delivered = rt
+            .deliver_port_messages(&mut table, Duration::from_millis(1))
+            .expect("deliver");
+        assert_eq!(delivered, 1);
+        assert_eq!(
+            table.get(other).unwrap().mailbox().peek().unwrap().payload(),
+            make_small(42)
+        );
+        assert!(
+            table.get(owner).unwrap().mailbox().is_empty(),
+            "the owner receives nothing for an explicit destination"
+        );
+    }
+
+    /// The `-eval` receive path returns a driver term addressed to the runtime's own process and
+    /// skips one addressed elsewhere (it can only observe its own mailbox).
+    #[test]
+    fn the_eval_receive_path_returns_only_its_own_driver_terms() {
+        use beam_abi::DriverHost;
+
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let me = rt.self_pid();
+        let elsewhere = ProcessId::new(1234, 0);
+
+        let atoms = Rc::new(AtomTable::new());
+        let (mut host, meta) = driver_term_host(&atoms, me);
+        // Addressed to the runtime's own process (the port owner).
+        assert_eq!(host.send_term(std::ptr::null_mut(), None, make_small(11)), 0);
+        // Addressed explicitly to the same process.
+        assert_eq!(
+            host.send_term(std::ptr::null_mut(), Some(me.to_eterm()), make_small(12)),
+            0
+        );
+        // Addressed to another process: not observable here.
+        assert_eq!(
+            host.send_term(std::ptr::null_mut(), Some(elsewhere.to_eterm()), make_small(13)),
+            0
+        );
+        let _ = rt
+            .ports
+            .borrow_mut()
+            .register(
+                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+                meta,
+            )
+            .expect("a registered driver port");
+
+        let messages = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.poll_port_messages(Duration::from_millis(1))
+                .expect("poll")
+        };
+        let values: Vec<i64> = messages.iter().map(|term| signed_value(*term)).collect();
+        assert_eq!(
+            values,
+            vec![11, 12],
+            "only the terms addressed to the evaluating process are returned"
+        );
+    }
+
+    /// [`RuntimeContext::stabilize_driver_term`] copies a heap term onto the runtime's
+    /// pointer-stable arena: the copy is at a different address and is structurally the same.
+    #[test]
+    fn stabilize_driver_term_copies_a_heap_term() {
+        let mut rt = Runtime::new(RuntimeConfig::default()).expect("the default runtime");
+        let mut src = Heap::new(16).expect("a source heap");
+        let term = src
+            .tuple(&[make_small(5), make_small(6)])
+            .expect("a small tuple");
+
+        let stable = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.stabilize_driver_term(term).expect("stabilize")
+        };
+        assert_ne!(stable.raw(), term.raw(), "the term is copied off its source heap");
+        assert_eq!(terms::tuple_arity(stable).unwrap(), 2);
+        assert_eq!(signed_value(terms::tuple_element(stable, 0).unwrap()), 5);
+        assert_eq!(signed_value(terms::tuple_element(stable, 1).unwrap()), 6);
+
+        // An immediate is shared, not copied.
+        let stable_immediate = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.stabilize_driver_term(make_small(9)).expect("stabilize")
+        };
+        assert_eq!(stable_immediate, make_small(9));
     }
 }
