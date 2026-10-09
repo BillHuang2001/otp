@@ -402,19 +402,20 @@ fn a_cross_function_jump_is_linked_straight_to_the_successors_entry() {
     assert_ne!(from, to);
 
     // Read the leaving block's code and look for the direct jump to the successor's
-    // compiled entry.
+    // compiled entry. The scan *is* the assertion: it only returns an offset whose
+    // five bytes are a `jmp rel32` landing exactly on `to`, so the block really leaves
+    // by jumping to the successor's native entry instead of returning its `(func, pc)`
+    // word to the driver. (No separate "the jump lies inside the block" check: the
+    // scan walks `windows(5)`, so a found offset cannot run past the end — such an
+    // assertion could never fail.)
     let exit_code = code_bytes(&compiled, from, to);
-    let site = direct_jump_to(&exit_code, from, to).unwrap_or_else(|| {
+    direct_jump_to(&exit_code, from, to).unwrap_or_else(|| {
         panic!(
             "the block at {from:#x} must `jmp` directly to the successor's compiled entry \
              {to:#x}; its {} bytes contain no such jump",
             exit_code.len()
         )
     });
-    assert!(
-        site + 5 <= exit_code.len(),
-        "the link is a real instruction inside the block"
-    );
 }
 
 #[test]
@@ -444,7 +445,11 @@ fn a_linked_jump_into_a_helper_calling_successor_is_interpreter_identical() {
         "both blocks' `gc_bif` go through the host"
     );
 
-    // The linked native run: same result, and the successor's helper call really ran.
+    // The linked native run: same result, and both blocks still reach the host through
+    // the helper seam. Every argument is deliberately non-`NIL`: `machine.x` slots start
+    // out as `NIL`, so a successor prologue that reloaded a *stale* slot instead of the
+    // spilled value would be indistinguishable from a correct spill if the argument
+    // were `NIL` — the comparison against the argument is what detects that.
     for arg in [make_small(0), make_small(41), make_small(-12345)] {
         let native_calls = Arc::new(AtomicUsize::new(0));
         let jitted = run_on_tier(
@@ -461,13 +466,15 @@ fn a_linked_jump_into_a_helper_calling_successor_is_interpreter_identical() {
             "the value must survive the linked exit (the spill) and the successor's \
              prologue (the `rdi` reload)"
         );
-        assert_ne!(
-            arg, NIL,
-            "a non-NIL argument is what makes a missing spill visible"
-        );
-        assert!(
-            native_calls.load(Ordering::SeqCst) >= 1,
-            "the successor block's `gc_bif` must reach the host"
+        // `entry/1` calls the host once and the *successor* `tail/1` calls it once, so
+        // the native run must reproduce the interpreter's count exactly — a `>= 1`
+        // bound would be satisfied by the leaving block alone and would not prove the
+        // linked-to block ran its own `gc_bif` at all.
+        assert_eq!(
+            native_calls.load(Ordering::SeqCst),
+            interpreted_calls.load(Ordering::SeqCst),
+            "both blocks' `gc_bif` must reach the host on the native tier, as on the \
+             interpreter"
         );
     }
 }
