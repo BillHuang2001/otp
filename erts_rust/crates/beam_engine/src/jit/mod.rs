@@ -86,6 +86,8 @@ use crate::context::ExecutionContext;
 use crate::{Machine, RunOutcome};
 
 pub mod baseline;
+#[cfg(test)]
+mod bench;
 pub mod cache;
 #[cfg(feature = "jit-cranelift")]
 pub mod cranelift;
