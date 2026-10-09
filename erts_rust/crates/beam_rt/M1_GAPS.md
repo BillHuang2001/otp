@@ -36,12 +36,17 @@ or a measured own-state difference — never a wrong result. Present-state docum
   <non-integer>)` returns the previous value where the oracle raises `badarg` (`bif.c:1911`).
 
 ## Process-control families (`src/native/`)
-`monitor(port, Port)` stays `unsupported` (`beam_process::PortTable` is private inside
-`beam_io::PortRegistry`), as do a remote `{Name, Node}` monitor and `monitor/3`'s `{tag, T}` option
-(`Monitor`/`MonitoredBy` carry no tag field). `exit/2,3` matches the oracle except an internal **port**
-target answers `true` without closing the port, and a foreign/decoded reference or ETS id is `badarg` vs
-the oracle's `true`. `spawn_opt`'s `{scheduler, N}`/`{async_dist, B}` stay `unsupported`; every other
-option is applied for real.
+`erlang:monitor/2,3` serves a **process** target (a pid, a registered name, or a `{Name, Node}` pair on
+this node) and a **port** target: a port monitor is recorded on the runtime's live port table
+(`PortRegistry::port_table_mut` → `ProcessTable::monitor_port_term_with_tag`), the same table
+`open_port/2` allocates from, so its `{'DOWN', Ref, port, Port, Reason}` fires when the port closes.
+`erlang:monitor/3`'s `{tag, T}` option is served on both paths for an **immediately-representable** tag;
+a heap-resident tag is `beam_process`'s typed `error::unsupported_tag`. The two remaining monitor gaps
+are a **named** port monitor `monitor(port, Name)` (`error::named_port_monitor` — the local registry
+resolves names to processes only) and a remote `{Name, Node}` monitor (contract A.5). `exit/2,3` matches
+the oracle except an internal **port** target answers `true` without closing the port, and a
+foreign/decoded reference or ETS id is `badarg` vs the oracle's `true`. `spawn_opt`'s
+`{scheduler, N}`/`{async_dist, B}` stay `unsupported`; every other option is applied for real.
 
 ## ETS ownership
 The runtime-global `beam_bifs::TableRegistry` ([`Runtime::tables`]) keys tables by handle only;
@@ -141,13 +146,11 @@ re-basing, and `beam_bifs` per-object `hp` re-fetch.
   before `beam_message::Fragments::move_into` can be called at receive — which also needs heap growth,
   since the fragment payload is larger than the receiver's ungrowable M1 heap. Plus a `!Send`-friendly
   `SchedulerPool` for SMP adoption (`Runtime` holds `Rc`/`RefCell` tables and `*mut Eterm` heaps, so
-  `beam_process`'s `unsafe impl Send` escape is unavailable here) and a `tag` field on
-  `Monitor`/`MonitoredBy` (for `monitor/3`'s `{tag, T}`).
+  `beam_process`'s `unsafe impl Send` escape is unavailable here).
 * **`beam_io` lifecycle.** Finish the driver-port lifecycle (the `async` default, `port_control/3`
   reaching `control`, a delivered `send_term`, `ERL_DRV_USE`'s `stop_select`, a per-registration
   `ErlDrvEvent` identity), and revisit `open_port({spawn_executable, <a DIRECTORY path>}, [])` (oracle: a
-  port; here: `error:eacces`). An accessor `PortRegistry::port_table_mut() -> &mut
-  beam_process::PortTable` is also needed to serve `monitor(port, Port)`.
+  port; here: `error:eacces`).
 * **`beam_bifs` registry key allocation.** `BifRegistry::contains`/`lookup` build owned `(String, String)`
   key tuples per lookup, and the dispatch path does both (`contains` in `call_bif`, then `lookup` inside
   `BifRegistry::call`) — ~4 small `String` allocations per registered call, the largest attributable

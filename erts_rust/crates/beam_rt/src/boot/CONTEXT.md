@@ -72,28 +72,14 @@ these eight directives, the full modelled set:
   soon as a `pump_scheduler` call reports `0`. A capability gap stays an `error::unsupported` raise.
   A `{kernelProcess, …}` burst deliberately does **not** surface the spawned process's own crash —
   the directive's contract is spawn+register, so the failure surfaces at the next dependent directive.
-- **Honest M1 stop.** The full real `start.boot` executes instructions 0–15 (every `primLoad` batch and
-  the three `kernelProcess` directives, each driven to its process's own registration) and stops at
-  **instruction 16**, `{apply,{application,load,[{application,stdlib,Props}]}}`, with a
-  `BeamError::Raise` rendered **`exit noproc`**: `application:load/1` →
-  `application_controller:load_application/1` → `gen_server:call/2` finds no live registered
-  `application_controller`. Not a wrong value and not a hang. `application_controller:init/1`
-  (`lib/kernel/src/application_controller.erl`) dies before it registers/acks, and the whole remaining
-  chain is outside this directory:
-  1. `init/1:545` calls `ets:new(ac_tab,[set,public,named_table,{read_concurrency,true}])` **uncaught**;
-     the sibling `beam_bifs` (`src/ets.rs::parse_options`) rejects every 2-tuple option except
-     `{keypos,N}` ⇒ `badarg`, killing the child.
-  2. Past that, `load/2:1364` → `add_env/2`'s `ets:insert(ac_tab, {{env,Name,Key},Value})` is `badarg`
-     because the sibling `beam_bifs`' table-taking BIFs decode their table argument with `ref_thing_id`
-     only, so an **atom `named_table` name** is unreachable (`ets:new` also returns a ref where the
-     oracle returns the name atom).
-  3. Instruction 13's `logger` cannot start: `logger_server:start_link/0` → `gen_server:start_link` →
-     `proc_lib:sync_start/2`'s `receive` sits in a **cross-module callee**, and the engine's synchronous
-     `Instr::CallExt` arm folds the callee's suspend into `beam_engine::blocked()` instead of suspending
-     the process (the seam pinned by `../../tests/proc_lib_start.rs`); the later `kernel:start/2` needs
-     the registered `logger`, so this is a real blocker.
-  Instruction 12's `heart` is **benign**: `heart:start/0` returns `ignore` (its internal
-  `throw(no_heart)` is caught). Instructions 17–21 are unreached.
+- **Honest M1 stop.** The full real `start.boot` executes instructions 0–15 (every `primLoad` batch and the three `kernelProcess` directives, each driven to its process's own registration) and stops at **instruction 16**, `{apply,{application,load,[{application,stdlib,Props}]}}`, with a `BeamError::Raise` rendered **`exit noproc`**: `application:load/1` → `application_controller:load_application/1` → `gen_server:call/2` finds no live registered `application_controller`.
+  Not a wrong value and not a hang; instructions 17–21 are unreached.
+  `ets:new/2` accepts `{read_concurrency,true}` and `add_env/2`'s `ets:insert(ac_tab, …)` resolves the `named_table` name atom, so `application_controller:init/1` (`lib/kernel/src/application_controller.erl`) runs past its ETS setup.
+  The two causes that keep the `application_controller` from coming up are outside this directory, both owned by the sibling `beam_engine`:
+  1. The engine's `Instr::Apply`/`ApplyLast` opcodes dispatch through the synchronous `ExecutionContext::call_bif` (`beam_engine/src/families/funs.rs::apply_target`), not the `resolve_external_call`/`Step::Enter` seam, so `proc_lib:init_p/5`'s `try apply(M,F,A) catch … end` cannot suspend and a blocking callee folds into the uncatchable `error::blocked()`; `logger` and its `spawn_link` parent then die.
+  2. `application_controller`'s spawned child returns `{'load error', function_clause}` before it loops, and the failure is not localizable because a `func_info`-driven raise carries an **empty** stacktrace (`Raise.stacktrace.frames == []`).
+  Every smaller remnant is benign for instruction 16: `heart:init/2`'s `catch start_portprogram()` does not contain `check_start_heart/0`'s `throw(no_heart)`, and `init:get_argument/1` is empty in the boot path.
+  The CLI never runs a boot script (`-boot F` is only recorded as an init argument); the executor is reached solely through the public `Runtime::boot_from_script`, driven by `tests/boot.rs` and the `bootscript.rs`/`drive.rs` unit tests.
 
 ## Constraints
 - **No silent skip.** A preloaded `.beam` that is missing or malformed is a typed `BeamError` (a missing
