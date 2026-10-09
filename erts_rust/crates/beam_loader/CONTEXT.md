@@ -250,6 +250,10 @@ parsed-as-raw, or tooling-only (with a reason). `Docs` (a compressed ExDoc term)
   (`beam_file.c:262-297`). Total entries = `count+1`.
 - **`Code`** — header `u32 head_size` (== 16) then `u32 format_number` (== `BEAM_FORMAT_NUMBER` 0,
   guarded), `u32 max_opcode`, `u32 label_count`, `u32 function_count`; then the instruction stream.
+  `max_opcode` must lie in `[169, 193]` — `169` = `swap/2` (`genop_swap_2`, `lib/compiler/src/genop.tab:611`),
+  `193` = `MAX_GENERIC_OPCODE` (the last `genop.tab` entry, `193: update_record_id/7`); outside that window
+  the image is rejected with `BadArg`, exactly as the C refuses an OTP-22-or-earlier or later-version image
+  (`beam_load.c:189-225`).
   The stream ends at the `int_code_end/0` instruction (genop 3), not at size exhaustion
   (`beam_file.c:1527,2596`). Instruction = 1 opcode byte (`1..=max_opcode`) + `Opcode::arity` operands.
 - **`ExpT`** — `i32 count` × `{ i32 function_atom, i32 arity, i32 label }` (label = **entry** label).
