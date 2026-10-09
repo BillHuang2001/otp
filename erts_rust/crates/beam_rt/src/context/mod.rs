@@ -95,7 +95,7 @@ use beam_bifs::{BifContext, OutputSink};
 use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::{Label, Module};
-use beam_message::{Fragments, HeapFragment, Message, OffHeapTable, Queue};
+use beam_message::{CopyContext, Message, OffHeapTable, Queue};
 use beam_process::{ProcessId, ProcessTable};
 use beam_term::Eterm;
 
@@ -373,24 +373,33 @@ impl<'a> RuntimeContext<'a> {
             other => other.map(|_| ()).map_err(error::enforce_term_heap_limit),
         }
     }
-    /// The running process's mailbox **message queue** and **scan state**, borrowed
-    /// together.
-    ///
-    /// The queue lives in the `Process` (in the caller-supplied table or the runtime's
-    /// own); the scan state lives in [`Runtime::mailboxes`](crate::runtime::Runtime).
-    /// They are disjoint, so both are handed out mutably at once. A pid with no process
-    /// is the typed [`crate::error::no_mailbox`] capability gap.
     /// Delivers `message` into `to`'s mailbox through the **heap-fragment** model — the
     /// sender half of the C `erts_try_alloc_message_on_heap`/`new_message_buffer` path
     /// (`erl_message.c:622-691`), reached when the receiver's own heap cannot hold the
     /// payload (`../../erts/emulator/beam/erl_message.c`).
     ///
-    /// The payload is copied into a fresh [`HeapFragment`] sized to hold all of it, the
-    /// fragment is pushed onto a [`Fragments`] chain, and the enqueued [`Message`] owns
-    /// that chain, so its [`payload`](Message::payload) has a stable home the receiver's
-    /// heap is not involved in. The off-heap objects the payload references are refcounted
-    /// into the **fragment's** table (a fresh [`OffHeapTable`] as the copy's source — the
-    /// same empty source [`beam_process`]'s own delivery uses), so the fragment owns them.
+    /// The work is [`beam_message::send_fragmented`]`(from, message, heap, mailbox, ctx, 0)`
+    /// driven straight into the receiver's own [`Process`](beam_process::Process) through
+    /// [`heap_and_mailbox_mut`](beam_process::Process::heap_and_mailbox_mut) — the split
+    /// borrow that hands out the receiver's young **heap** and its **mailbox** at the same
+    /// time. The payload is copied into a fresh
+    /// [`HeapFragment`](beam_message::HeapFragment) sized to hold all of it (the `0`
+    /// capacity hint means "at least the whole payload"), the fragment is pushed onto a
+    /// [`Fragments`](beam_message::Fragments) chain, and the enqueued
+    /// [`Message`](beam_message::Message) owns that chain, so its payload has a stable home
+    /// the receiver's heap is not involved in. The off-heap objects the payload references
+    /// are refcounted into the **fragment's** table (the copy's source is the same empty
+    /// [`OffHeapTable`] `deliver_simple` uses, so the fragment owns them).
+    ///
+    /// # The redundant preflight, and why it is harmless
+    ///
+    /// `send_fragmented` first retries the ordinary receiver-heap copy and falls back to a
+    /// fragment only when *that* reports [`AllocKind::Message`]. This method is reached
+    /// from exactly that failure, so the retry fails identically — and the retry is
+    /// **side-effect free**: [`beam_message::copy_struct`] preflights the destination's
+    /// capacity and refuses a graph it cannot hold *before* writing a word, so the
+    /// receiver's heap is left byte for byte as it was (the composed body this replaced
+    /// skipped the retry and went straight to a fragment).
     ///
     /// The recipient is woken exactly as the ordinary path wakes it, except that the wake
     /// cannot go through the process table's wake list (that list is filled by
@@ -399,52 +408,44 @@ impl<'a> RuntimeContext<'a> {
     /// [`Runtime::scheduler_pass`](crate::runtime::Runtime) absorbs it into the real run
     /// queue at the same points it absorbs the table's own wake list.
     ///
-    /// # Why this is not `beam_message::send_fragmented`
-    ///
-    /// `send_fragmented` wants the receiver's **heap** *and* its **mailbox** at the same
-    /// time, but [`beam_process::Process`] exposes them only through two `&mut self`
-    /// accessors ([`heap_mut`](beam_process::Process::heap_mut) /
-    /// [`mailbox_mut`](beam_process::Process::mailbox_mut)) — no split borrow — so the two
-    /// cannot be handed out of `beam_rt` together. This method therefore composes the same
-    /// public [`beam_message`] fragment primitives the function itself composes (the
-    /// message is already known not to fit, so its preflight attempt is redundant anyway);
-    /// see the crate `CONTEXT.md` handoff for the seam that would let it be deleted.
-    ///
     /// # Errors
     ///
-    /// The failures are **raw**: `HeapFragment::new`'s host-allocation failure and
-    /// `copy_root`'s copy-engine exhaustion ([`AllocKind::Message`]). The single caller
+    /// The failures are **raw**: the fragment's host-allocation failure and the copy
+    /// engine's exhaustion ([`AllocKind::Message`]). The single caller
     /// ([`Self::deliver_message`]) translates a genuine exhaustion to `error:system_limit`
     /// with [`error::enforce_term_heap_limit`]; that translation lives at the call site
     /// because the `Message` kind must stay recognizable as the retry trigger on the
     /// first `deliver_simple` attempt.
     fn send_fragmented_message(&mut self, to: ProcessId, from: Eterm, message: Eterm) -> Result<()> {
-        // A fragment sized to hold the whole payload (the C sizes `new_message_buffer` the
-        // same way). `size_object` is > 0 for any payload that failed the preflight.
-        let mut fragment = HeapFragment::new(beam_term::size_object(message))?;
         // An empty source off-heap table: the sender's term carries no off-heap slot this
         // runtime can resolve (the engine seam hands over only the term), exactly as
         // `deliver_simple` assumes.
         let source = OffHeapTable::new();
-        let root = fragment.copy_root(message, &source)?;
-        let mut fragments = Fragments::new();
-        fragments.push(fragment);
-        let woken = {
-            let process = self
-                .process_table_mut()
-                .get_mut(to)
-                .ok_or(BeamError::TermNotFound)?;
-            process
-                .mailbox_mut()
-                .enqueue(Message::new(root, from).with_fragments(fragments));
-            process.wake()
-        };
+        // A fresh destination off-heap table: the fragment path gives the payload to the
+        // **fragment's** own table (see `beam_message::send_fragmented`), so this one is
+        // only the preflight's — which cannot succeed here — and stays empty.
+        let mut dst = OffHeapTable::new();
+        let mut ctx = CopyContext::new(&source, &mut dst);
+        let process = self
+            .process_table_mut()
+            .get_mut(to)
+            .ok_or(BeamError::TermNotFound)?;
+        let (heap, mailbox) = process.heap_and_mailbox_mut();
+        beam_message::send_fragmented(from, message, heap, mailbox, &mut ctx, 0)?;
+        let woken = process.wake();
         if woken {
             self.runtime.note_fragment_wake(to);
         }
         Ok(())
     }
 
+    /// The running process's mailbox **message queue** and **scan state**, borrowed
+    /// together.
+    ///
+    /// The queue lives in the `Process` (in the caller-supplied table or the runtime's
+    /// own); the scan state lives in [`Runtime::mailboxes`](crate::runtime::Runtime).
+    /// They are disjoint, so both are handed out mutably at once. A pid with no process
+    /// is the typed [`crate::error::no_mailbox`] capability gap.
     fn mailbox_parts(&mut self) -> Result<(&mut Queue, &mut MailboxState)> {
         let pid = self.mailbox_pid;
         let Runtime {
@@ -1056,44 +1057,29 @@ impl<'a> RuntimeContext<'a> {
         result.map_err(error::enforce_term_heap_limit)
     }
 
-    /// Whether `(module, function, arity)` is one of the five process-dictionary BIFs that
-    /// must run against the calling process's [`Dict`](beam_process::Dict).
+    /// Whether `(module, function, arity)` is one of the process-dictionary BIFs that must
+    /// run against the calling process's [`Dict`](beam_process::Dict).
     ///
     /// These BIFs take a `&mut ProcessTable` (the running process), which cannot co-exist
     /// with [`FunBridge`]'s `&mut Runtime` borrow — so [`Self::call_registered`] installs a
     /// [`DictBridge`] for them **instead of** the fun-caller bridge. No dict BIF applies a
     /// fun argument, so the fun-caller seam is never needed for one.
+    ///
+    /// The set is [`beam_bifs::DICT_HOOK_BIFS`] — `beam_bifs`' own roster of the BIFs that
+    /// read the [`DictHook`](beam_bifs::DictHook) seam — so this gate can never drift from
+    /// what the registry actually routes through that seam.
     fn uses_dict(module: &str, function: &str, arity: u32) -> bool {
-        matches!(
-            (module, function, arity),
-            ("erlang", "put", 2)
-                | ("erlang", "get", 1)
-                | ("erlang", "erase", 1)
-                | ("erlang", "get_keys", 0)
-                | ("erlang", "get_keys", 1)
-                | ("erlang", "get", 0)
-                | ("erlang", "erase", 0)
-        )
+        beam_bifs::needs_dict_hook(module, function, arity)
     }
 
-    /// Whether `(module, function, arity)` is one of the eleven process/name/global-state
-    /// BIFs that run against the [`ProcessBridge`] (the process-table and port-registry
-    /// seam), so the runtime-native floor no longer serves them and no BIF is duplicated.
+    /// Whether `(module, function, arity)` is one of the process/name/global-state BIFs
+    /// that run against the [`ProcessBridge`] (the process-table and port-registry seam),
+    /// so the runtime-native floor no longer serves them and no BIF is duplicated.
+    ///
+    /// The set is [`beam_bifs::PROCESS_HOOK_BIFS`] — `beam_bifs`' own roster of the BIFs
+    /// that read the [`ProcessHook`](beam_bifs::ProcessHook) seam.
     fn uses_process_hook(module: &str, function: &str, arity: u32) -> bool {
-        matches!(
-            (module, function, arity),
-            ("erlang", "whereis", 1)
-                | ("erlang", "register", 2)
-                | ("erlang", "unregister", 1)
-                | ("erlang", "registered", 0)
-                | ("erlang", "is_process_alive", 1)
-                | ("erlang", "processes", 0)
-                | ("erlang", "ports", 0)
-                | ("erlang", "process_info", 1)
-                | ("erlang", "process_info", 2)
-                | ("erlang", "process_flag", 2)
-                | ("erlang", "group_leader", 0)
-        )
+        beam_bifs::needs_process_hook(module, function, arity)
     }
 
     /// Whether a call with `args` can re-enter the runtime by *applying a fun argument*.
@@ -1112,10 +1098,13 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The bridge needs `&mut Runtime` to store the loaded library, so it cannot co-exist with
     /// [`FunBridge`]'s `&mut Runtime` borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
-    /// [`Self::call_registered`] installs exactly one of the five. `load_nif/2` takes no fun
+    /// [`Self::call_registered`] installs exactly one of them. `load_nif/2` takes no fun
     /// argument and no dictionary, so nothing is lost.
+    ///
+    /// The set is [`beam_bifs::NIF_LOADER_BIFS`] — `beam_bifs`' own roster of the BIFs that
+    /// read the [`NifLoader`](beam_bifs::NifLoader) seam.
     fn uses_nif_loader(module: &str, function: &str, arity: u32) -> bool {
-        matches!((module, function, arity), ("erlang", "load_nif", 2))
+        beam_bifs::needs_nif_loader(module, function, arity)
     }
 
     /// Whether `(module, function, arity)` is `records:get_definition/2`, which must run
@@ -1123,10 +1112,13 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The bridge borrows the code server's module map (`&Runtime`), so it cannot co-exist
     /// with [`FunBridge`]'s `&mut Runtime` or [`DictBridge`]'s `&mut ProcessTable` borrow —
-    /// [`Self::call_registered`] installs exactly one of the five. `get_definition/2` takes no
+    /// [`Self::call_registered`] installs exactly one of them. `get_definition/2` takes no
     /// fun argument and no dictionary, so nothing is lost.
+    ///
+    /// The set is [`beam_bifs::RECORD_SOURCE_BIFS`] — `beam_bifs`' own roster of the BIFs
+    /// that read the [`RecordSource`](beam_bifs::RecordSource) seam.
     fn uses_record_source(module: &str, function: &str, arity: u32) -> bool {
-        matches!((module, function, arity), ("records", "get_definition", 2))
+        beam_bifs::needs_record_source(module, function, arity)
     }
 
     /// Whether `(module, function, arity)` is a message-sending BIF that must run against the
@@ -1147,8 +1139,11 @@ impl<'a> RuntimeContext<'a> {
     /// directly. This predicate is for the `erlang:send/2`/`erlang:'!'/2` *BIF call* — which is
     /// what `erlang:send(Pid, Msg)` compiles to, and what the `-eval` evaluator dispatches for
     /// the same call.
+    ///
+    /// The set is [`beam_bifs::SEND_HOOK_BIFS`] — `beam_bifs`' own roster of the BIFs that
+    /// read the [`SendHook`](beam_bifs::SendHook) seam.
     fn uses_send_hook(module: &str, function: &str, arity: u32) -> bool {
-        matches!((module, function, arity), ("erlang", "send", 2) | ("erlang", "!", 2))
+        beam_bifs::needs_send_hook(module, function, arity)
     }
 
     /// Whether `(module, function, arity)` is `erlang:get_module_info/1,2`, which must run
@@ -1158,31 +1153,28 @@ impl<'a> RuntimeContext<'a> {
     /// with [`FunBridge`]'s `&mut Runtime` or [`SendBridge`]'s `&mut Runtime` borrow —
     /// [`Self::call_registered`] installs exactly one of them. `get_module_info/1,2` takes
     /// no fun argument and touches no dictionary, so nothing is lost.
+    ///
+    /// The set is [`beam_bifs::MODULE_INFO_BIFS`] — `beam_bifs`' own roster of the BIFs
+    /// that read the [`ModuleInfo`](beam_bifs::ModuleInfo) seam.
     fn uses_module_info(module: &str, function: &str, arity: u32) -> bool {
-        matches!((module, function, arity), ("erlang", "get_module_info", 1) | ("erlang", "get_module_info", 2))
+        beam_bifs::needs_module_info(module, function, arity)
     }
 
-    /// Whether `(module, function, arity)` is one of the seven `persistent_term:*` BIFs,
+    /// Whether `(module, function, arity)` is one of the `persistent_term:*` BIFs,
     /// which must run against the [`PersistentTermBridge`] (the node-global store seam).
     ///
     /// The bridge holds a cheap clone of the runtime's shared store (`Rc<RefCell<…>>`), so
     /// it borrows **no** part of the runtime and can coexist with every other arm; it is an
-    /// own `else if` arm only for symmetry and clarity. None of the seven takes a fun
+    /// own `else if` arm only for symmetry and clarity. None of them takes a fun
     /// argument or a dictionary, so nothing is lost.
+    ///
+    /// The set is [`beam_bifs::PERSISTENT_TERM_BIFS`] — `beam_bifs`' own roster of the BIFs
+    /// that read the [`PersistentTerm`](beam_bifs::PersistentTerm) seam.
     fn uses_persistent_term(module: &str, function: &str, arity: u32) -> bool {
-        matches!(
-            (module, function, arity),
-            ("persistent_term", "get", 0)
-                | ("persistent_term", "get", 1)
-                | ("persistent_term", "get", 2)
-                | ("persistent_term", "put", 2)
-                | ("persistent_term", "put_new", 2)
-                | ("persistent_term", "erase", 1)
-                | ("persistent_term", "info", 0)
-        )
+        beam_bifs::needs_persistent_term(module, function, arity)
     }
 
-    /// Whether `(module, function, arity)` is one of the runtime-coupled BIF families the
+    /// Whether `(module, function, arity)` is one of the runtime-coupled BIFs the
     /// [`RuntimeHooksBridge`] serves: the timer family (`erlang:start_timer/3,4`,
     /// `erlang:send_after/4`, `erlang:cancel_timer/2`), the loaded-export check
     /// (`erlang:function_exported/3`), the link set (`erlang:link/1`, `erlang:unlink/1`),
@@ -1195,24 +1187,25 @@ impl<'a> RuntimeContext<'a> {
     /// (the link set) — the same pair [`DictBridge`]/[`ProcessBridge`] resolve — so it cannot
     /// co-exist with the fun-caller bridge or the dict/process arms.
     ///
+    /// # The gate is the whole seam roster, not just the served keys
+    ///
+    /// The set is [`beam_bifs::RUNTIME_HOOKS_BIFS`] — `beam_bifs`' own roster of **every**
+    /// BIF that reads the [`RuntimeHooks`](beam_bifs::RuntimeHooks) seam (each registered
+    /// through the `runtime_bif!` macro), which is far wider than the keys above. Gating on
+    /// the whole roster is what keeps the two sides from drifting: a BIF that reads the
+    /// seam but does not get the bridge installed can only ever answer the seam's typed
+    /// `unsupported_bif` default, so a key `beam_bifs` starts routing through the seam must
+    /// reach the bridge automatically. A key this bridge does not serve therefore answers
+    /// the **same** typed capability gap the defaulted seam reports — only with the key
+    /// named in the reason (the fallback arm of the bridge's own `RuntimeHooks::call`) —
+    /// never a fabricated value.
+    ///
     /// [`RuntimeHooks`]: beam_bifs::RuntimeHooks
     fn uses_runtime_hooks(module: &str, function: &str, arity: u32) -> bool {
-        matches!(
-            (module, function, arity),
-            ("erlang", "start_timer", 3)
-                | ("erlang", "start_timer", 4)
-                | ("erlang", "send_after", 4)
-                | ("erlang", "cancel_timer", 2)
-                | ("erlang", "function_exported", 3)
-                | ("erlang", "link", 1)
-                | ("erlang", "unlink", 1)
-                | ("erlang", "dt_spread_tag", 1)
-                | ("erlang", "dt_restore_tag", 1)
-                | ("erlang", "statistics", 1)
-        )
+        beam_bifs::needs_runtime_hooks(module, function, arity)
     }
 
-    /// Whether `(module, function, arity)` is one of the two `erlang:memory/0,1` BIFs —
+    /// Whether `(module, function, arity)` is one of the `erlang:memory/0,1` BIFs —
     /// the **only** consumers of the [`MemoryHook`](beam_bifs::MemoryHook) seam.
     ///
     /// These are not a bridge arm (the seam coexists with every arm) but a *build* gate:
@@ -1221,11 +1214,11 @@ impl<'a> RuntimeContext<'a> {
     /// ~10 us per arithmetic BIF (see [`Self::call_registered`]). With no hook installed
     /// `beam_bifs`' `ctx.memory()` is the typed `unsupported_bif` capability gap, so the gate
     /// must cover **exactly** the keys that read the seam (workspace `CONTEXT.md` §3).
+    ///
+    /// The set is [`beam_bifs::MEMORY_HOOK_BIFS`] — `beam_bifs`' own roster of the BIFs that
+    /// read that seam.
     fn uses_memory_hook(module: &str, function: &str, arity: u32) -> bool {
-        matches!(
-            (module, function, arity),
-            ("erlang", "memory", 0) | ("erlang", "memory", 1)
-        )
+        beam_bifs::needs_memory_hook(module, function, arity)
     }
 
     /// Whether `(module, function, arity)` is one of the BIFs that consult the
@@ -1238,14 +1231,11 @@ impl<'a> RuntimeContext<'a> {
     /// read produces. Building the bridge eagerly for *every* registered call copies the
     /// caller module's `Arc` and allocates its `.beam` path, so it is built only here — the
     /// hook's absence is otherwise indistinguishable, since no other BIF calls the accessor.
+    ///
+    /// The set is [`beam_bifs::LOCAL_FUN_IDENTITY_BIFS`] — `beam_bifs`' own roster of the
+    /// BIFs that read that seam.
     fn uses_fun_identity(module: &str, function: &str, arity: u32) -> bool {
-        matches!(
-            (module, function, arity),
-            ("erlang", "term_to_binary", 1)
-                | ("erlang", "term_to_binary", 2)
-                | ("erlang", "external_size", 1)
-                | ("erlang", "external_size", 2)
-        )
+        beam_bifs::needs_local_fun_identity(module, function, arity)
     }
 
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.

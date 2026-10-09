@@ -737,10 +737,14 @@ fn the_local_fun_identity_hook_is_a_clean_miss_when_the_answer_is_unknown() {
 #[test]
 fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
     // The `RuntimeHooksBridge` arm is one of the mutually exclusive bridges installed per
-    // call, so its predicate must claim exactly the keys the bridge serves — the timer
-    // family, the loaded-export check, the link set, the dynamic-tracing tag pair and
-    // `erlang:statistics/1` — and no others.
-    for (module, function, arity) in [
+    // call. Its gate is neither the list of keys the bridge **serves** nor a list kept here:
+    // it is `beam_bifs`' own `RUNTIME_HOOKS_BIFS` roster (every BIF registered through the
+    // `runtime_bif!` macro, each reading the single `RuntimeHooks` seam), so the two sides
+    // cannot drift. The keys the bridge serves are the timer family, the loaded-export
+    // check, the link set, the dynamic-tracing tag pair and `erlang:statistics/1`; every
+    // other key of the roster answers the same typed capability gap the *defaulted* seam
+    // reports (see `the_runtime_hooks_bridge_serves_the_timer_and_export_families`).
+    let served = [
         ("erlang", "start_timer", 3),
         ("erlang", "start_timer", 4),
         ("erlang", "send_after", 4),
@@ -751,31 +755,44 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
         ("erlang", "dt_spread_tag", 1),
         ("erlang", "dt_restore_tag", 1),
         ("erlang", "statistics", 1),
-    ] {
+    ];
+    for (module, function, arity) in served {
         assert!(
             RuntimeContext::uses_runtime_hooks(module, function, arity),
             "{module}:{function}/{arity}"
         );
+        assert!(
+            beam_bifs::RUNTIME_HOOKS_BIFS.contains(&(module, function, arity)),
+            "{module}:{function}/{arity} is served by the bridge but absent from the roster"
+        );
     }
-    // Near misses: a sibling arity of a served key, a BIF another arm owns, an unrelated
-    // module's function of the same name.
+    // Roster keys the bridge does **not** serve are claimed too — that is the point of
+    // gating on the whole roster: `beam_bifs` can never route a key through the seam without
+    // the bridge being installed. The reasons these are not in `served` are per-key gaps.
+    for (module, function, arity) in [
+        ("erlang", "read_timer", 1),
+        ("erlang", "system_info", 1),
+        ("erl_ddll", "info", 2),
+    ] {
+        assert!(
+            RuntimeContext::uses_runtime_hooks(module, function, arity),
+            "{module}:{function}/{arity} reads the seam, so the bridge must be installed"
+        );
+        assert!(
+            !served.contains(&(module, function, arity)),
+            "{module}:{function}/{arity} is not one of the keys the bridge serves"
+        );
+    }
+    // Near misses — every one of them from `beam_bifs`' own must-miss set for this table:
+    // a sibling arity of a roster key, an unrelated module's function of the same name, and
+    // a key that belongs to another seam entirely (the memory hook, the ETS registry, the
+    // module-info seam).
     for (module, function, arity) in [
         ("erlang", "start_timer", 2),
-        ("erlang", "send_after", 3),
-        ("erlang", "cancel_timer", 1),
-        ("erlang", "function_exported", 2),
-        ("erlang", "link", 2),
-        ("erlang", "unlink", 0),
-        ("erlang", "dt_spread_tag", 2),
-        ("erlang", "dt_restore_tag", 0),
-        ("erlang", "statistics", 0),
-        ("erlang", "statistics", 2),
-        ("timer", "send_after", 4),
-        ("erlang", "send", 2),
-        ("erlang", "get", 1),
-        ("erlang", "load_nif", 2),
-        ("records", "get_definition", 2),
-        ("persistent_term", "get", 1),
+        ("erlang", "nodes", 3),
+        ("erlang", "memory", 0),
+        ("lists", "reverse", 1),
+        ("ets", "lookup", 2),
         ("erlang", "get_module_info", 1),
     ] {
         assert!(
@@ -783,20 +800,9 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
             "{module}:{function}/{arity}"
         );
     }
-    // Pairwise disjoint with every other mutually exclusive arm: each served key needs
+    // Pairwise disjoint with every other mutually exclusive arm: each roster key needs
     // `&mut Runtime` plus a `&mut ProcessTable`, so none of the other bridges may claim it.
-    for (function, arity) in [
-        ("start_timer", 3),
-        ("start_timer", 4),
-        ("send_after", 4),
-        ("cancel_timer", 2),
-        ("function_exported", 3),
-        ("link", 1),
-        ("unlink", 1),
-        ("dt_spread_tag", 1),
-        ("dt_restore_tag", 1),
-        ("statistics", 1),
-    ] {
+    for (function, arity) in served.iter().map(|(_, function, arity)| (*function, *arity)) {
         assert!(!RuntimeContext::uses_dict("erlang", function, arity));
         assert!(!RuntimeContext::uses_process_hook("erlang", function, arity));
         assert!(!RuntimeContext::uses_nif_loader("erlang", function, arity));
@@ -820,6 +826,285 @@ fn the_runtime_hooks_predicate_selects_only_its_own_bifs() {
         assert!(
             !RuntimeContext::uses_runtime_hooks(module, function, arity),
             "{module}:{function}/{arity}"
+        );
+    }
+}
+
+/// A `(module, function, arity)` BIF key.
+type HookKey = (&'static str, &'static str, u32);
+
+/// A `needs_*` / `uses_*` hook predicate over a BIF key.
+type HookPred = fn(&str, &str, u32) -> bool;
+
+/// One `beam_bifs` hook roster: its name, its keys, its own predicate, the `beam_rt` gate
+/// that must delegate to it (`None` where this crate installs the seam on **every** arm, so
+/// there is no gate: the port provider and the local-node identity) and the keys the
+/// predicate must **not** claim — the same near misses `beam_bifs`' own `hook_sets` tests
+/// pin.
+struct HookRoster {
+    name: &'static str,
+    table: &'static [HookKey],
+    needs: HookPred,
+    gate: Option<HookPred>,
+    misses: &'static [HookKey],
+}
+
+/// Every exported hook roster, so the agreement and disjointness assertions below are
+/// written once against `beam_bifs`' own tables rather than a second copy of the lists.
+fn hook_rosters() -> [HookRoster; 13] {
+    [
+        HookRoster {
+            name: "MEMORY_HOOK_BIFS",
+            table: beam_bifs::MEMORY_HOOK_BIFS,
+            needs: beam_bifs::needs_memory_hook,
+            gate: Some(RuntimeContext::uses_memory_hook as HookPred),
+            misses: &[
+                ("erlang", "memory", 2),
+                ("erlang", "system_info", 1),
+                ("lists", "memory", 1),
+                ("erlang", "binary_to_term", 1),
+            ],
+        },
+        HookRoster {
+            name: "LOCAL_FUN_IDENTITY_BIFS",
+            table: beam_bifs::LOCAL_FUN_IDENTITY_BIFS,
+            needs: beam_bifs::needs_local_fun_identity,
+            gate: Some(RuntimeContext::uses_fun_identity as HookPred),
+            misses: &[
+                ("erlang", "term_to_binary", 0),
+                ("erlang", "term_to_binary", 3),
+                ("erlang", "external_size", 0),
+                ("erlang", "binary_to_term", 1),
+                ("lists", "term_to_binary", 1),
+                ("erlang", "-", 2),
+            ],
+        },
+        HookRoster {
+            name: "DICT_HOOK_BIFS",
+            table: beam_bifs::DICT_HOOK_BIFS,
+            needs: beam_bifs::needs_dict_hook,
+            gate: Some(RuntimeContext::uses_dict as HookPred),
+            misses: &[
+                ("erlang", "put", 3),
+                ("erlang", "erase", 2),
+                ("erlang", "memory", 0),
+                ("proc_lib", "put", 2),
+                ("erlang", "process_info", 1),
+            ],
+        },
+        HookRoster {
+            name: "PROCESS_HOOK_BIFS",
+            table: beam_bifs::PROCESS_HOOK_BIFS,
+            needs: beam_bifs::needs_process_hook,
+            gate: Some(RuntimeContext::uses_process_hook as HookPred),
+            misses: &[
+                ("erlang", "whereis", 0),
+                ("erlang", "process_info", 3),
+                ("erlang", "group_leader", 1),
+                ("erlang", "nodes", 0),
+                ("erlang", "get_module_info", 1),
+            ],
+        },
+        HookRoster {
+            name: "PORT_HOOK_BIFS",
+            table: beam_bifs::PORT_HOOK_BIFS,
+            needs: beam_bifs::needs_port_hook,
+            // No gate: `call_registered` installs the port provider on every arm.
+            gate: None,
+            misses: &[
+                ("erlang", "open_port", 1),
+                ("erlang", "port_info", 3),
+                ("erlang", "list_to_port", 1),
+                ("erlang", "port_to_list", 1),
+                ("erts_internal", "port_close", 1),
+            ],
+        },
+        HookRoster {
+            name: "SEND_HOOK_BIFS",
+            table: beam_bifs::SEND_HOOK_BIFS,
+            needs: beam_bifs::needs_send_hook,
+            gate: Some(RuntimeContext::uses_send_hook as HookPred),
+            misses: &[
+                ("erlang", "send", 3),
+                ("erlang", "self", 0),
+                ("erlang", "!", 1),
+                ("maps", "send", 2),
+            ],
+        },
+        HookRoster {
+            name: "NIF_LOADER_BIFS",
+            table: beam_bifs::NIF_LOADER_BIFS,
+            needs: beam_bifs::needs_nif_loader,
+            gate: Some(RuntimeContext::uses_nif_loader as HookPred),
+            misses: &[
+                ("erlang", "load_nif", 1),
+                ("erlang", "load_nif", 3),
+                ("code", "load_nif", 2),
+            ],
+        },
+        HookRoster {
+            name: "RECORD_SOURCE_BIFS",
+            table: beam_bifs::RECORD_SOURCE_BIFS,
+            needs: beam_bifs::needs_record_source,
+            gate: Some(RuntimeContext::uses_record_source as HookPred),
+            misses: &[
+                ("records", "get_definition", 1),
+                ("records", "get", 2),
+                ("records", "is_exported", 1),
+                ("erlang", "get_definition", 2),
+            ],
+        },
+        HookRoster {
+            name: "MODULE_INFO_BIFS",
+            table: beam_bifs::MODULE_INFO_BIFS,
+            needs: beam_bifs::needs_module_info,
+            gate: Some(RuntimeContext::uses_module_info as HookPred),
+            misses: &[
+                ("erlang", "get_module_info", 0),
+                ("erlang", "get_module_info", 3),
+                ("code", "get_module_info", 1),
+            ],
+        },
+        HookRoster {
+            name: "PERSISTENT_TERM_BIFS",
+            table: beam_bifs::PERSISTENT_TERM_BIFS,
+            needs: beam_bifs::needs_persistent_term,
+            gate: Some(RuntimeContext::uses_persistent_term as HookPred),
+            misses: &[
+                ("persistent_term", "put", 3),
+                ("persistent_term", "erase", 0),
+                ("persistent_term", "put_new", 3),
+                ("persistent_term", "keys", 0),
+                ("erlang", "persistent_term", 1),
+            ],
+        },
+        HookRoster {
+            name: "FUN_CALLER_BIFS",
+            table: beam_bifs::FUN_CALLER_BIFS,
+            needs: beam_bifs::needs_fun_caller,
+            // No gate: the fun caller is the fallback arm, installed for every key no gated
+            // arm claims (`Self::uses_fun_caller` does not exist).
+            gate: None,
+            misses: &[
+                ("lists", "map", 3),
+                ("lists", "foldl", 2),
+                ("lists", "usort", 1),
+                ("lists", "sort", 1),
+                ("lists", "reverse", 1),
+                ("maps", "next", 1),
+                ("maps", "merge", 2),
+                ("sets", "map", 2),
+            ],
+        },
+        HookRoster {
+            name: "LOCAL_NODE_BIFS",
+            table: beam_bifs::LOCAL_NODE_BIFS,
+            needs: beam_bifs::needs_local_node,
+            // No gate: the local-node identity is installed on every arm.
+            gate: None,
+            misses: &[
+                ("erlang", "node", 2),
+                ("erlang", "term_to_binary", 0),
+                ("erlang", "list_to_pid", 1),
+                ("erlang", "local_node", 0),
+                ("erlang", "open_port", 2),
+            ],
+        },
+        HookRoster {
+            name: "RUNTIME_HOOKS_BIFS",
+            table: beam_bifs::RUNTIME_HOOKS_BIFS,
+            needs: beam_bifs::needs_runtime_hooks,
+            gate: Some(RuntimeContext::uses_runtime_hooks as HookPred),
+            misses: &[
+                ("erlang", "start_timer", 2),
+                ("erlang", "nodes", 3),
+                ("erlang", "memory", 0),
+                ("lists", "reverse", 1),
+                ("ets", "lookup", 2),
+                ("erlang", "get_module_info", 1),
+            ],
+        },
+    ]
+}
+
+#[test]
+fn the_rt_gates_delegate_to_the_exported_hook_predicates() {
+    let rosters = hook_rosters();
+    // Every key every roster claims, plus every near miss: the gate comparison below runs on
+    // all of them, so a `beam_rt` gate can neither claim a key `beam_bifs` does not route
+    // through its seam nor drop one it does.
+    let keys: Vec<HookKey> = rosters
+        .iter()
+        .flat_map(|roster| roster.table.iter().chain(roster.misses.iter()).copied())
+        .collect();
+    for roster in &rosters {
+        for key in roster.table {
+            let (module, function, arity) = *key;
+            assert!(
+                (roster.needs)(module, function, arity),
+                "{} must claim {module}:{function}/{arity}",
+                roster.name
+            );
+        }
+        for key in roster.misses {
+            let (module, function, arity) = *key;
+            assert!(
+                !(roster.needs)(module, function, arity),
+                "{} must reject {module}:{function}/{arity}",
+                roster.name
+            );
+        }
+        // The `beam_rt` gate answers **exactly** like the exported predicate, on its own
+        // keys and on every other roster's — the delegation is what keeps the two from
+        // drifting (`beam_bifs`' own `hook_sets` tests pin the tables themselves against
+        // each module's `register`).
+        let Some(gate) = roster.gate else { continue };
+        for key in &keys {
+            let (module, function, arity) = *key;
+            assert_eq!(
+                gate(module, function, arity),
+                (roster.needs)(module, function, arity),
+                "the {} gate drifted from `beam_bifs` on {module}:{function}/{arity}",
+                roster.name
+            );
+        }
+    }
+}
+
+#[test]
+fn the_mutually_exclusive_dispatch_arms_are_pairwise_disjoint() {
+    // `call_registered` installs exactly **one** arm per call — first match wins — so two
+    // arms claiming the same key would silently starve the later one's seam (a fun-taking
+    // BIF routed to the dict arm would lose its fun caller, and so on). The nine arms are
+    // the eight gated bridges plus the fallback (the fun caller).
+    let arms: [(&str, HookPred); 9] = [
+        ("DICT_HOOK_BIFS", beam_bifs::needs_dict_hook),
+        ("PROCESS_HOOK_BIFS", beam_bifs::needs_process_hook),
+        ("NIF_LOADER_BIFS", beam_bifs::needs_nif_loader),
+        ("RECORD_SOURCE_BIFS", beam_bifs::needs_record_source),
+        ("SEND_HOOK_BIFS", beam_bifs::needs_send_hook),
+        ("MODULE_INFO_BIFS", beam_bifs::needs_module_info),
+        ("PERSISTENT_TERM_BIFS", beam_bifs::needs_persistent_term),
+        ("RUNTIME_HOOKS_BIFS", beam_bifs::needs_runtime_hooks),
+        ("FUN_CALLER_BIFS", beam_bifs::needs_fun_caller),
+    ];
+    // Every roster key and every near miss is a probe: a key two arms share would surface
+    // here even if neither arm's own table lists it.
+    let rosters = hook_rosters();
+    let keys: Vec<HookKey> = rosters
+        .iter()
+        .flat_map(|roster| roster.table.iter().chain(roster.misses.iter()).copied())
+        .collect();
+    for key in &keys {
+        let (module, function, arity) = *key;
+        let claimants: Vec<&str> = arms
+            .iter()
+            .filter(|(_, predicate)| predicate(module, function, arity))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            claimants.len() <= 1,
+            "{module}:{function}/{arity} is claimed by more than one mutually exclusive arm: {claimants:?}"
         );
     }
 }
@@ -868,14 +1153,16 @@ fn the_runtime_hooks_bridge_serves_the_timer_and_export_families() {
         .expect("function_exported/3"),
         false_atom
     );
-    // A key this bridge does **not** claim still answers the typed capability gap the
-    // defaulted `RuntimeHooks` seam reports — never a fabricated value.
+    // A key this bridge does **not** serve still answers a typed capability gap — never a
+    // fabricated value. The gate claims `beam_bifs`' whole `RUNTIME_HOOKS_BIFS` roster, so
+    // `read_timer/1` reaches the bridge (rather than the registry's defaulted seam) and the
+    // bridge's fallback arm names the key in the reason instead of the bare `bif`.
     let error = ctx
         .call_bif("erlang", "read_timer", 1, &[reference])
         .expect_err("read_timer/1 is not served by this bridge");
     assert_eq!(
         crate::error::unsupported_reason(&error).as_deref(),
-        Some("bif")
+        Some("erlang:read_timer/1")
     );
 }
 

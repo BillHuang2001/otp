@@ -1280,9 +1280,11 @@ mod tests {
             is_small(remaining),
             "cancel_timer/1 answers the remaining milliseconds for a pending timer"
         );
-        // An unclaimed key of the same family still resolves through the `RuntimeHooks`
-        // seam as the typed capability gap (exit 3), not the bare `undef` the
-        // `erlang`-namespace fallback raises for an unknown name.
+        // An unclaimed key of the same family still resolves as the typed capability gap
+        // (exit 3), not the bare `undef` the `erlang`-namespace fallback raises for an
+        // unknown name. `read_timer/1` is a key of `beam_bifs`' `RUNTIME_HOOKS_BIFS`
+        // roster, so the `RuntimeHooksBridge` — installed for the whole roster — answers
+        // it, naming the key in its typed gap rather than the defaulted seam's bare `bif`.
         let error = call(
             &mut runtime,
             "erlang",
@@ -1292,8 +1294,8 @@ mod tests {
         .expect_err("read_timer/1 has no host hook installed");
         assert_eq!(
             error::unsupported_reason(&error).as_deref(),
-            Some("bif"),
-            "read_timer/1 is the registry's typed unsupported_bif gap: {error}"
+            Some("erlang:read_timer/1"),
+            "read_timer/1 is the bridge's typed capability gap: {error}"
         );
     }
 
