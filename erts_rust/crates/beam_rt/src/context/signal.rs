@@ -18,7 +18,8 @@
 //
 // %CopyrightEnd%
 
-//! The runtime half of `os:set_signal/2`: the process-global signal dispositions.
+//! The runtime half of `os:set_signal/2`: the process-global signal dispositions and the
+//! `{notify, Signal}` notifications they produce.
 //!
 //! `beam_bifs` registers `os:set_signal/2` as one of its `RuntimeHooks`-gated keys (it is in
 //! [`hook_sets::RUNTIME_HOOKS_BIFS`](beam_bifs::hook_sets), so
@@ -27,26 +28,21 @@
 //! from here. The *mechanism* — the twelve POSIX signal numbers, the `sigaction(2)` install,
 //! the async-signal-safe trampoline and the self-pipe — is `beam_io::signal`'s, the module
 //! that owns the `unsafe` this crate's `#![deny(unsafe_code)]` cannot contain. This module
-//! owns the *runtime* half: the one long-lived facility and the KRTS's exact answer surface.
+//! owns the *runtime* half: the KRTS's exact answer surface, delegating the one long-lived
+//! facility and its poller registration to [`crate::port::watch`] (the port layer owns the
+//! runtime's one poller).
 //!
 //! # Ownership and lifetime: one facility for the process
 //!
 //! An Erlang signal disposition is **process-global** in ERTS: `os:set_signal/2` ends in
 //! `sys_signal` (`erts/emulator/sys/unix/sys.c`), a plain `sigaction(2)` on the emulator
 //! process, so the disposition outlives the calling Erlang process and is shared by every
-//! process in the node. The Rust runtime reproduces that with **one** [`SignalFacility`]
-//! held in the `thread_local!` slot [`FACILITY`] and created lazily by the first
-//! `os:set_signal/2`; it is never dropped while the runtime lives, so a later call observes
+//! process in the node. [`crate::port::watch`] reproduces that with **one**
+//! [`SignalFacility`](beam_io::signal::SignalFacility) created lazily by the first
+//! `os:set_signal/2` and never dropped while the runtime lives, so a later call observes
 //! exactly the disposition an earlier one installed (a per-call facility would be dropped at
 //! the end of the call, and `SignalFacility::drop` restores the prior dispositions — see
 //! `the_facility_is_shared_across_calls` below).
-//!
-//! A `thread_local` (rather than a field of [`Runtime`](crate::Runtime)) is sound for exactly
-//! the reason [`context::trace`](super::trace)'s slot is: the runtime is single-threaded
-//! (`!Send` — it owns `Rc`/`RefCell` tables and raw `*mut Eterm` heaps), so this slot *is*
-//! the process's one facility in practice. `beam_io` documents the single-instance rule the
-//! other way round: a second live facility re-points the trampoline's write end at its own
-//! pipe, which this module never allows.
 //!
 //! # The oracle's exact surface
 //!
@@ -72,29 +68,27 @@
 //! syscall for such a signal: the disposition provably cannot change, so nothing is lost and
 //! nothing is swallowed — there is no error to swallow (see [`is_kernel_only`]).
 //!
-//! # The `{notify, Signal}` leg is NOT wired (documented gap)
+//! # The `{notify, Signal}` leg
 //!
 //! ERTS's emulator turns a handled signal into a message to the process registered as
-//! `erl_signal_server`: `generic_signal_handler` wakes the emulator, which sends
-//! `{notify, SignalName}` to that name. Two things are missing here, and neither is
-//! fabricated:
+//! `erl_signal_server`: a caught signal is written to a self-pipe, the dispatcher reads it and
+//! calls `signal_notify_requested(signum)` (`erts/emulator/sys/unix/sys.c:589-604`), which
+//! resolves the name and queues `{notify, SignalName}` to that process with `am_system` as the
+//! sender — and sends **nothing** when no such process exists.
 //!
-//! 1. **No recipient.** This runtime boots no `erl_signal_server` (the differential corpus
-//!    never registers one), so `whereis(erl_signal_server)` finds nothing to deliver to. A
-//!    message is never sent to a name that has no live process.
-//! 2. **No drain point.** [`SignalFacility::read_fd`] has to be registered with the runtime's
-//!    poller and drained from its reactor loop; both the poller (the private
-//!    `PortRegistry::poller` in `src/port.rs`) and the loop that would drive it are outside
-//!    this node, so a handled signal is recorded in the facility's bitmask and never
-//!    delivered. This is a *delivery* gap only — the disposition itself is installed exactly
-//!    as the oracle installs it.
+//! That leg is wired here: [`crate::port::watch`] registers the facility's read end with the
+//! runtime's one poller, drains the handled signals through the port layer's poll round, and
+//! `src/port.rs`'s message pumps turn each one into the 2-tuple `{notify, Signal::name()}`
+//! delivered to the pid [`whereis`](beam_process::ProcessTable::whereis) resolves for the
+//! interned `erl_signal_server` atom — through
+//! [`ProcessTable::deliver_simple`](beam_process::ProcessTable::deliver_simple), so a blocked
+//! receiver is woken. With no such process (the differential corpus never registers one)
+//! there is no recipient and the notification is dropped, exactly as the C drops it.
 //!
-//! The wiring, when it lands, is: register [`SignalFacility::read_fd`] with the process
-//! poller, call [`SignalFacility::drain`] on readiness, and for each returned [`Signal`]
-//! deliver the 2-tuple `{notify, Signal::name()}` to the process
-//! [`whereis`](beam_process::ProcessTable::whereis) resolves for the interned
-//! `erl_signal_server` atom — through [`ProcessTable::deliver_simple`](beam_process::ProcessTable::deliver_simple),
-//! so a blocked receiver is woken.
+//! One honest asymmetry: the `-eval` evaluator path
+//! ([`RuntimeContext::poll_port_messages`](crate::context::RuntimeContext)) can only observe
+//! *its own* mailbox, so it does not return a notification addressed to some other process —
+//! the scheduler path delivers it instead (see `src/port.rs`).
 //!
 //! # Errors
 //!
@@ -103,26 +97,20 @@
 //! the argument surface is validated by the caller ([`RuntimeHooksBridge::set_signal`](super::RuntimeHooksBridge)),
 //! which owns the oracle's `badarg`. No `unwrap()`/`panic!` on runtime data, no `unsafe`.
 
-use std::cell::RefCell;
-
 use beam_common::Result;
-use beam_io::signal::{Disposition, Signal, SignalFacility};
+use beam_io::signal::{Disposition, Signal};
 
-thread_local! {
-    /// The runtime's one long-lived signal facility, created by the first
-    /// `os:set_signal/2` and kept for the process's life (see the module docs on the
-    /// single-instance rule).
-    ///
-    /// `RefCell<Option<..>>` rather than a `OnceLock` because the constructor is fallible:
-    /// the first call either fills the slot or reports the pipe-creation failure, and a
-    /// failed creation leaves the slot empty so a later call can try again.
-    static FACILITY: RefCell<Option<SignalFacility>> = const { RefCell::new(None) };
-}
+use crate::port::watch;
 
 /// Installs `disposition` for `signal` — the body of the `os:set_signal/2` arm.
 ///
 /// Argument validation (the oracle's `badarg`) belongs to the caller, which holds the
 /// caller's atom table; this function is total over the two closed enums.
+///
+/// The facility itself — the one long-lived [`SignalFacility`](beam_io::signal::SignalFacility),
+/// its `thread_local` slot and its poller registration — is
+/// [`crate::port::watch`]'s, so a later scheduler pass really drains a caught signal (see the
+/// module docs).
 ///
 /// # Errors
 ///
@@ -135,7 +123,7 @@ pub(super) fn install(signal: Signal, disposition: Disposition) -> Result<()> {
         // there is no error to swallow.
         return Ok(());
     }
-    with_facility(|facility| facility.set(signal, disposition))
+    watch::install(signal, disposition)
 }
 
 /// Whether the kernel refuses *every* disposition change for `signal`.
@@ -148,47 +136,28 @@ fn is_kernel_only(signal: Signal) -> bool {
     matches!(signal, Signal::SigStop)
 }
 
-/// Runs the fallible `f` against the process's one signal facility, creating it on first
-/// use.
-///
-/// # Errors
-///
-/// A failed creation of the facility (the self-pipe) is a real I/O failure and is reported,
-/// never swallowed; the slot stays empty so the next call retries. `f`'s own failure is
-/// returned untouched.
-fn with_facility<R>(f: impl FnOnce(&mut SignalFacility) -> Result<R>) -> Result<R> {
-    FACILITY.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let facility = match slot.as_mut() {
-            Some(facility) => facility,
-            None => slot.insert(SignalFacility::new()?),
-        };
-        f(facility)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
-    /// The dispositions are **process-global** (that is the point of this module), so every
-    /// test that changes one serializes on this lock. A poisoned lock (a test panicked while
-    /// holding it) is recovered rather than propagated — the lock guards OS state, not
-    /// shared Rust data.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::port::watch::{test_guard, with_facility};
 
     /// Acquires the process-global test guard.
+    ///
+    /// The lock itself lives in [`crate::port::watch`] — the module that owns the facility —
+    /// so the disposition-mutating tests of `context::signal`, `port::watch` and `port` all
+    /// serialize on **one** lock rather than each guarding only its own module (the
+    /// dispositions are process-global, which is the point of this module).
     fn guard() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+        test_guard()
     }
 
     /// The disposition the kernel currently holds for `signal`.
     fn current(signal: Signal) -> Disposition {
         with_facility(|facility| facility.disposition(signal)).expect("a disposition query")
     }
-
     /// The signals the round-trip test mutates.
     ///
     /// `sigchld` is deliberately **absent**: its disposition is process-global too, and

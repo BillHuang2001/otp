@@ -141,12 +141,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub mod driver;
+pub(crate) mod watch;
 use beam_alloc::Heap;
 use beam_bifs::PortHook;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_io::{
-    Driver, Poller, PortCommandOptions, PortExitReason, PortNotification,
+    Driver, Event, Poller, PortCommandOptions, PortExitReason, PortNotification,
     PortRegistry as IoPortRegistry, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
     PORT_REDS_EXECUTE,
 };
@@ -382,6 +383,18 @@ enum PortEvent {
         /// The process the port belongs to (used when `to` is `None`).
         owner: ProcessId,
     },
+    /// A **handled signal** arrived (`os:set_signal(Sig, handle)`) — the delivery half of the
+    /// A.4/A.8 signal surface, drained from the self-pipe [`watch::SignalWatch`] registers.
+    ///
+    /// Unlike every other variant this one has **no port and no pid owner**: it is a
+    /// node-global notification that ERTS addresses to the process registered as
+    /// `erl_signal_server` (`signal_notify_requested`, `sys.c:589-604`), so the recipient is
+    /// resolved by name in the delivering pump, not carried here. The message is the 2-tuple
+    /// `{notify, Name}` with the emulator itself (`system`) as the sender.
+    Signal {
+        /// The signal's BEAM atom name — [`beam_io::signal::Signal::name`] (`"sigusr1"`, …).
+        name: &'static str,
+    },
 }
 
 /// The node-global **I/O byte counters** behind `erlang:statistics(io)`.
@@ -455,6 +468,9 @@ pub struct PortRegistry {
     /// The runtime keeps a clone of this same [`Rc`], so the `statistics(io)` arm reads the
     /// counters without borrowing this registry.
     io_counters: Rc<IoCounters>,
+    /// The signal self-pipe's registration with [`PortRegistry::poller`] — the delivery half of
+    /// `os:set_signal/2` (see [`watch`]).
+    watch: watch::SignalWatch,
 }
 
 impl PortRegistry {
@@ -471,11 +487,13 @@ impl PortRegistry {
         // `beam_abi`'s driver codegen unit in the link so there *are* symbols to publish. Without
         // it, a `dlopen(RTLD_NOW)` of a real driver would fail on an unresolved symbol.
         let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
-        Ok(PortRegistry {            poller: Poller::new()?,
+        Ok(PortRegistry {
+            poller: Poller::new()?,
             registry: IoPortRegistry::new(),
             meta: HashMap::new(),
             heap: Heap::new(PORT_HEAP_WORDS)?,
             io_counters: Rc::new(IoCounters::default()),
+            watch: watch::SignalWatch::new(),
         })
     }
 
@@ -600,10 +618,29 @@ impl PortRegistry {
     }
 
     /// Whether no port is open.
+    ///
+    /// This counts **ports only**. It is deliberately *not* the "is there anything to poll?"
+    /// question — a registered signal watch is pollable with zero ports — so a caller deciding
+    /// whether a blocked process can still be woken asks [`PortRegistry::has_nothing_to_poll`].
     pub fn is_empty(&self) -> bool {
         self.meta.is_empty()
     }
 
+    /// Whether there is nothing for [`PortRegistry::pump`] to wait on: no live port **and** no
+    /// registered signal watch (`os:set_signal/2`'s self-pipe — see [`watch`]).
+    ///
+    /// This is the "nothing pollable" predicate. It is what tells a caller that a blocked
+    /// process can no longer be woken and that a poll round is pure sleep: a live port can
+    /// deliver `{Port, {data, …}}`, and a registered signal watch can deliver
+    /// `{notify, Signal}` — either one keeps the runtime awake.
+    ///
+    /// It is *false* as soon as a `handle` disposition is installed, even before the
+    /// descriptor is registered, because [`watch::SignalWatch::sync`] will register it on the
+    /// very next poll round (the facility is created by `os:set_signal/2`, so it cannot exist
+    /// when the registry is built).
+    pub fn has_nothing_to_poll(&self) -> bool {
+        self.meta.is_empty() && !self.watch.is_pollable()
+    }
     /// The ids of the **live** ports, in port-number order.
     ///
     /// The metadata map holds exactly the ports `open_port/2` recorded, so it is the direct
@@ -669,21 +706,31 @@ impl PortRegistry {
     /// tasks, a due `TIMEOUT` task is serviced immediately — no busy loop, and the slice's
     /// other work is unchanged.
     ///
-    /// Nothing at all is polled when no port is live, so a runtime that never opened a port
-    /// never sleeps here.
+    /// Nothing at all is polled when there is nothing pollable — no live port and no registered
+    /// signal watch (see [`PortRegistry::has_nothing_to_poll`]) — so a runtime that never opened
+    /// a port and never handled a signal never sleeps here.
     ///
     /// # Errors
     ///
-    /// The poller's own failures ([`BeamError::Io`] when the poll syscall fails) and any
-    /// error a port's driver raises while a scheduled task runs.
+    /// The poller's own failures ([`BeamError::Io`] when the poll syscall fails, and whatever it
+    /// reports when the signal self-pipe cannot be registered) and any error a port's driver
+    /// raises while a scheduled task runs.
     fn pump(&mut self, timeout: Duration) -> Result<Vec<PortEvent>> {
+        // The signal self-pipe is considered first: the facility that owns it is created by
+        // `os:set_signal/2`, so the descriptor to register only exists after that call — the
+        // watch catches up here, on the first round after the first `handle` disposition.
+        self.watch.sync(&mut self.poller)?;
         let mut events = self.take_due_exit_statuses()?;
         // The driver ports' bytes may already be queued (a `port_command` on a driver port ran
         // the driver's `output` callback inline), so they are harvested before any wait too —
         // together with the terms a driver's callback emitted (`erl_drv_output_term`).
         events.extend(self.take_driver_outputs());
         events.extend(self.take_driver_terms());
-        if self.registry.is_empty() {
+        // A signal handled before this round — or while the runtime was not polling — is
+        // recorded in the facility's own bitmask, so it is drained unconditionally rather than
+        // keyed to the readiness event.
+        events.extend(self.take_signals());
+        if self.registry.is_empty() && !self.watch.is_pollable() {
             return Ok(events);
         }
         let deadline = Instant::now() + timeout;
@@ -699,10 +746,28 @@ impl PortRegistry {
                 wait = wait.min(next.saturating_duration_since(now));
             }
             let polled = self.poller.poll(Some(wait))?;
+            // The signal self-pipe is **not** a port: its readiness means "the dispatcher caught
+            // something", so it is read here — the C's own model — and the descriptor's event is
+            // filtered out of the batch before the port scheduler sees it, so nothing but
+            // [`watch::SignalWatch`] can ever act on the sentinel key. (What *arrived* is the
+            // facility's bitmask; the pipe bytes are discarded — `beam_io::signal`'s coalescing
+            // policy. A signal caught while the runtime was not polling is caught by the
+            // unconditional drain above, so this readiness-driven read is the fast path, not the
+            // only one.)
+            if self.watch.ready(&polled) {
+                events.extend(self.take_signals());
+            }
             if !polled.is_empty() {
                 // Readiness becomes *scheduled tasks* (the ERTS port-task model) — the
                 // driver is called when the task runs, never from the event loop.
-                self.registry.schedule_events(&polled);
+                let port_events: Vec<Event> = polled
+                    .iter()
+                    .copied()
+                    .filter(|event| event.key() != watch::SIGNAL_KEY)
+                    .collect();
+                if !port_events.is_empty() {
+                    self.registry.schedule_events(&port_events);
+                }
             }
             let outcome = self
                 .registry
@@ -870,6 +935,30 @@ impl PortRegistry {
         Ok(events)
     }
 
+    /// The `{notify, Signal}` notifications of the **handled** signals caught since the last
+    /// drain — the delivery half of `os:set_signal/2` (contract A.8).
+    ///
+    /// ERTS's emulator turns each handled signal into a message to the process registered as
+    /// `erl_signal_server`; this is where such a signal enters the runtime (the recipient is
+    /// resolved by the port layer's message pumps, because the notification is addressed by
+    /// *name*, not to a pid — see [`PortEvent::Signal`]).
+    ///
+    /// Each *distinct* signal caught since the previous drain is reported exactly once
+    /// (`beam_io::signal`'s coalescing policy), in [`beam_io::signal::Signal::ALL`] order, and an
+    /// `ignore`/`default` disposition never produces one at all (the kernel does not run the
+    /// facility's trampoline for it). A signal caught while the runtime was not polling is still
+    /// reported, because the record is the facility's bitmask rather than the self-pipe's
+    /// readiness.
+    ///
+    /// Nothing is drained when no `os:set_signal/2` ever ran (there is no facility, so no
+    /// signal can have been handled by it) — never an error, and never an invented notification.
+    fn take_signals(&mut self) -> Vec<PortEvent> {
+        self.watch
+            .drain()
+            .into_iter()
+            .map(|name| PortEvent::Signal { name })
+            .collect()
+    }
     /// The `{Item, Value}` pairs of `port` — the `port_info/1,2` answer.
     ///
     /// Every item atom is resolved through `atoms` (the runtime's one shared table). A port
@@ -1445,8 +1534,17 @@ impl Runtime {
     /// is `copy_struct`-ed into the recipient's heap by `deliver_simple`, so the transient
     /// term built here on the runtime's arena is not shared.
     ///
-    /// Nothing is polled when no port is live (so a runtime that never opened a port pays
-    /// nothing), and a message whose owner is no longer in `table` is skipped rather than
+    /// A [`PortEvent::Signal`] — `os:set_signal/2`'s delivery half — is addressed by **name**
+    /// rather than to a pid: it is the 2-tuple `{notify, Name}` for the process
+    /// [`whereis`](beam_process::ProcessTable::whereis) resolves for the interned
+    /// `erl_signal_server` atom, sent by the emulator itself (`system`), exactly as
+    /// `signal_notify_requested` (`erts/emulator/sys/unix/sys.c:589-604`) sends it. With no such
+    /// process there is no recipient and the notification is dropped — the C's own behaviour,
+    /// never an error and never a message to a name that has no live process.
+    ///
+    /// Nothing is polled when no port is live **and** no signal watch is pollable (see
+    /// [`PortRegistry::has_nothing_to_poll`]), so a runtime that never opened a port pays
+    /// nothing; a message whose owner is no longer in `table` is skipped rather than
     /// treated as an error.
     ///
     /// # Errors
@@ -1459,13 +1557,14 @@ impl Runtime {
         table: &mut ProcessTable,
         timeout: Duration,
     ) -> Result<usize> {
-        // No live port ⇒ nothing to wait for: never sleep.
+        // Nothing pollable ⇒ nothing to wait for: never sleep. A registered signal watch keeps
+        // this false even with zero ports, because a caught signal must still be delivered.
         {
             let registry = self
                 .ports
                 .try_borrow()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
-            if registry.is_empty() {
+            if registry.has_nothing_to_poll() {
                 return Ok(0);
             }
         }
@@ -1476,6 +1575,11 @@ impl Runtime {
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
             registry.pump(timeout)?
         };
+        // The name `os:set_signal/2`'s notifications are addressed to, resolved **once** and by
+        // `lookup` rather than `intern`: the shared table holds the atom only if some code
+        // interned it, which is exactly when a process can be registered under it. `None` ⇒
+        // there is no `erl_signal_server`, so (like the C) nothing is sent.
+        let signal_server = self.code_server.atoms().lookup("erl_signal_server");
         let mut delivered = 0;
         for event in events {
             // The term is built on the runtime's arena (the `RuntimeContext` the builders
@@ -1514,6 +1618,16 @@ impl Runtime {
                         port.to_eterm(),
                         ctx.stabilize_driver_term(*term)?,
                     ),
+                    // A handled signal goes to the `erl_signal_server` process by name, with the
+                    // emulator (`system`) as the sender. An unregistered name resolves to no pid,
+                    // in which case there is nobody to notify and the signal is dropped.
+                    PortEvent::Signal { name } => {
+                        let Some(server) = signal_server.and_then(|atom| table.whereis(atom)) else {
+                            continue;
+                        };
+                        let (from, message) = ctx.signal_notify_message(name)?;
+                        (server, from, message)
+                    }
                 }
             };
             // A port whose recipient has since terminated has no recipient: the message is
@@ -1582,6 +1696,13 @@ impl RuntimeContext<'_> {
                     }
                     messages.push(self.stabilize_driver_term(term)?);
                 }
+                // A handled signal is addressed to the `erl_signal_server` process, and the
+                // evaluator is not it: a `RuntimeContext` can only observe its **own** mailbox, so
+                // the notification is not returned here — the scheduler path
+                // ([`Runtime::deliver_port_messages`]) delivers it into that process's mailbox
+                // instead — rather than being matched as if it were the evaluator's own. Same
+                // reasoning as the driver-term arm above.
+                PortEvent::Signal { .. } => continue,
             }
         }
         Ok(messages)
@@ -1645,6 +1766,32 @@ impl RuntimeContext<'_> {
         let tag = make_atom(self.runtime.code_server.atoms_mut().intern("exit_status"));
         let inner = terms::make_tuple(self, &[tag, make_small(i64::from(status))])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
+    }
+
+    /// The `{notify, SignalName}` message a **handled signal** produces, and its sender — the
+    /// delivery half of `os:set_signal/2` (contract A.8).
+    ///
+    /// ERTS's signal dispatcher queues exactly this 2-tuple to the process registered as
+    /// `erl_signal_server`, with `am_system` as the sender
+    /// (`signal_notify_requested`, `erts/emulator/sys/unix/sys.c:589-604`) — so the sender this
+    /// returns is the bare atom `system`, not a pid. `name` is the signal's own atom name
+    /// ([`beam_io::signal::Signal::name`]), and both atoms are interned in the runtime's **one
+    /// shared** table, so the message is nameable by the printer and matchable by a `receive`
+    /// clause that spells `{notify, sigusr1}`.
+    ///
+    /// The caller resolves the recipient ([`beam_process::ProcessTable::whereis`]); this builder
+    /// deliberately knows nothing about it, so the same helper serves any delivery path.
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the tuple does not fit.
+    pub(crate) fn signal_notify_message(&mut self, name: &str) -> Result<(Eterm, Eterm)> {
+        let atoms = self.runtime.code_server.atoms_mut();
+        let notify = make_atom(atoms.intern("notify"));
+        let signal = make_atom(atoms.intern(name));
+        let sender = make_atom(atoms.intern("system"));
+        let message = terms::make_tuple(self, &[notify, signal])?;
+        Ok((sender, message))
     }
 }
 
