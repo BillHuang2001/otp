@@ -303,9 +303,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   Map/tuple/binary operands are read through `beam_term` primitives (`map::map_get`/`map_size`, …),
   never a local reader. **Arithmetic** (`+ - * / div rem band bor bxor bsl bsr`, unary `+`/`-`) routes
   through the `pub trait ArithHook` seam (default methods) with `DefaultArithHook` installed via a
-  `thread_local` (`set_arith_hook`) — no crate edge to `beam_bifs`; the default does checked i64
-  arithmetic (overflow/bignum/float/`/` ⇒ typed `unsupported`, `div`/`rem` by zero ⇒ `badarg`, a
-  negative shift count reverses direction, `bsr` saturates — the C `erts_shift`). Bodies: sequences
+  `thread_local` (`set_arith_hook`) — no crate edge to `beam_bifs`. The default does checked i64
+  arithmetic and **faithful float arithmetic** (Erlang semantics): `+`/`-`/`*` yield a float when either
+  operand is a float, `/` is **always** a float, unary `+`/`-` on a float yields a float, and a
+  non-finite result ⇒ `badarg`; integer-only operators and a result that leaves the 60-bit small range
+  (incl. a bignum operand) stay the typed `unsupported`; `div`/`rem`/`/` by zero ⇒ `badarg`; a negative
+  shift count reverses direction; `bsr` saturates — the C `erts_shift`. Bodies: sequences
   (value = last expression), tuple/list/**map** construction, literals, `'$N'`, `'$_'`, `'$$'`. Guard
   truth is an internal `Expr::Bool` (independent of whether `true`/`false` are interned). Anything
   outside the recognised set ⇒ `compile`/`expr` `badarg`.
@@ -531,10 +534,8 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` runs **157 cases**
   (13 case-group files under `tests/differential/battery/` plus the shared harness `battery/mod.rs`, the
   embedded oracle program in `erl_program.rs`) identically under the system `erl` (OTP 29.1.1 / erts-17.1)
-  and under `beam_ets`, comparing canonical renderings line-by-line — **no case is a mismatch**: every
-  case agrees except the 2 recorded typed divergences. `KNOWN_DIVERGENCES` records those (the
-  match-spec-arithmetic cases), where `beam_ets` answers the typed `unsupported_ets` the corpus shows as
-  a loud honest gap, never a wrong result. The oracle is **required by default** — a genuinely absent
+  and under `beam_ets`, comparing canonical renderings line-by-line — **every case agrees**;
+  `KNOWN_DIVERGENCES` is empty. The oracle is **required by default** — a genuinely absent
   `erl` FAILS the cross-check rather than skipping it (`BEAM_ETS_ALLOW_NO_ORACLE=1` opts out with a loud
   skip; `BEAM_ETS_REQUIRE_ORACLE=1` forces the requirement).
 - **Gate (this crate):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets`
@@ -635,8 +636,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   default is the typed `badarg` — the ETS layer has no process identity, so without an installed hook a
   `self/0` guard clause is skipped and a `self/0` body is `badarg` (the oracle evaluates it against the
   calling process: a semantic under-match); `abs/1`/`bnot/1` on a bignum, `trunc`/`round`/`ceil`/`floor`
-  beyond the 60-bit small range and non-small-integer arithmetic via `DefaultArithHook` are the typed
-  `unsupported_ets`; `binary_part/2,3` on a non-byte-aligned source is `badarg`, as the oracle.
+  beyond the 60-bit small range, and integer arithmetic whose result leaves the 60-bit small range (incl.
+  a bignum operand) via `DefaultArithHook` are the typed `unsupported_ets` (float `+ - * /` **is**
+  computed); `binary_part/2,3` on a non-byte-aligned source is `badarg`, as the oracle.
   `byte_size`/
   `bit_size` on an off-heap refc binary are **parity** (the `[BinRef][ErlSubBits]` root classifies as a
   bitstring). A match-spec **body** runtime failure yields the atom `EXIT` resolved from the caller's

@@ -139,11 +139,9 @@ impl Battery {
 
     /// `{'==', {'/', '$2', 2}, 10.0}` — the `/` operator in a guard.
     ///
-    /// `/` always yields a **float** in Erlang, and `DefaultArithHook` refuses it
-    /// (`unsupported_ets`) rather than guessing a small integer, so `beam_ets`
-    /// propagates the typed error instead of silently under-matching — rendered by
-    /// [`Battery::cap_select`] as `error:unsupported_ets: …`. A **recorded
-    /// divergence** (`tests/differential.rs::KNOWN_DIVERGENCES`).
+    /// `/` always yields a **float** in Erlang; `DefaultArithHook` computes it, so
+    /// the guard holds for the row whose `$2 / 2` is the float `10.0` — matching the
+    /// oracle.
     fn select_guard_div(&mut self) -> String {
         let mut table = self.table(TableKind::OrderedSet, 1);
         for key in [1i64, 2, 3] {
@@ -672,9 +670,7 @@ impl Battery {
     }
 
     /// `{'==', {'*', '$2', 1.5}, 30.0}` — match-spec arithmetic with a **float**
-    /// operand, which `DefaultArithHook` refuses (`unsupported_ets`) rather than
-    /// guessing. A **recorded divergence**
-    /// (`tests/differential.rs::KNOWN_DIVERGENCES`).
+    /// operand: `DefaultArithHook` computes it in `f64`, matching the oracle.
     fn select_guard_float_arith(&mut self) -> String {
         let mut table = self.table(TableKind::OrderedSet, 1);
         for key in [1i64, 2] {

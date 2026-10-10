@@ -2,11 +2,8 @@
 Static census of the **real** ETS surface OTP 29 / erts-17.1 exposes, against this workspace.
 Purpose: a future agent must not re-derive "is `ets:X` implemented, and where?".
 Gate source of truth for *behaviour* is the differential suite (`tests/differential.rs`, **157 cases**,
-live oracle, `mismatch = 0` with exactly **2 recorded typed divergences** in `KNOWN_DIVERGENCES` — the
-two match-spec-arithmetic cases `select_guard_div` / `select_guard_float_arith`, where
-`DefaultArithHook` answers the typed `unsupported_ets` instead of the float/bignum the oracle computes,
-closed by a host installing a full `ArithHook` via `set_arith_hook` — never a wrong result); this file
-is the *coverage* map.
+live oracle, `mismatch = 0`, `KNOWN_DIVERGENCES` **empty** — every case agrees); this file is the
+*coverage* map.
 Three owners exist:
 * **`beam_ets`** (this crate) — the table state + the observable `ets:*` semantics.
 * **`beam_bifs`** — the BIF layer: argument parsing, the `TableRegistry` (id → table, name → id,
