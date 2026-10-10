@@ -75,6 +75,7 @@ fn the_runtime_layout_matches_the_offsets_generated_code_uses() {
         labels: &labels,
         ctx: &mut ctx,
         error: None,
+        enter: None,
     };
     let base = &rt as *const JitRuntime as usize;
     let machine_field = &rt.machine as *const *mut Machine as usize;

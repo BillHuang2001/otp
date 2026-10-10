@@ -157,6 +157,8 @@
 
 use crate::interpreter::LabelMap;
 use std::mem;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use beam_common::Result;
 use beam_loader::{Atom, Label, Module};
@@ -179,7 +181,7 @@ mod tests;
 // The block ABI lives in `runtime`; re-export its names here so every item path
 // outside this module (`crate::jit::baseline::…`) stays exactly what it was.
 pub(crate) use emit::compile_module;
-pub use runtime::{decode_target, decode_wait, encode_target, encode_wait, ERROR, HALT, WAIT_BIT};
+pub use runtime::{decode_target, decode_wait, encode_target, encode_wait, ENTER, ERROR, HALT, WAIT_BIT};
 pub(crate) use runtime::{jit_step_one, JitRuntime};
 
 use runtime::NativeBlock;
@@ -200,6 +202,23 @@ use runtime::NativeBlock;
 pub(crate) trait NativeCode {
     /// Run `(func, pc)` natively if this tier compiled it for that address.
     fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64>;
+
+    /// The compiled blocks this tier holds for `module` — a module the driver has
+    /// switched **into** (a non-entry module context) — or `None` when it has none.
+    ///
+    /// A cross-module transfer ([`Step::Enter`]) executes in a module other than the
+    /// one this tier was entered for, so the driver needs that module's block table to
+    /// run it natively; an owned handle ([`Rc`]) is returned rather than a borrow
+    /// because the tier's store may be touched again while the driver holds it.
+    ///
+    /// The **default is `None`**, so an implementor that predates this method keeps
+    /// the entry-only behaviour: a cross-module transfer still *executes* (the driver
+    /// runs it on its per-instruction interpreter step, exactly like any address the
+    /// tier compiled no block for), it simply is not accelerated.
+    fn module_blocks(&self, module: &Arc<Module>) -> Option<Rc<CompiledModule>> {
+        let _ = module;
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,18 +584,44 @@ struct BlockEntries<'a> {
 
 impl NativeCode for BlockEntries<'_> {
     fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64> {
-        if !self.native_ok {
-            return None;
-        }
-        let block_entry = self.compiled.entry(func, pc)?;
-        // SAFETY: `block_entry` points just past the start of a complete native
-        // function emitted by `emit_block` with exactly the `NativeBlock` signature
-        // (`extern "C" fn(*mut JitRuntime) -> i64`), inside a buffer sealed
-        // read+execute by `compile_module`; `rt` is the live driver-owned runtime
-        // block the driver does not otherwise borrow during the call.
-        let block: NativeBlock = unsafe { mem::transmute(block_entry) };
-        Some(block(rt))
+        enter_compiled(self.compiled, self.native_ok, rt, func, pc)
     }
+
+    /// A cross-module callee is not part of the caller-owned artifact, so the tier's
+    /// **shared** compiled-block store is consulted: the per-thread
+    /// [`CodeCache`](crate::jit::cache) compiles the callee on first sight and hands
+    /// back the artifact it owns (so the code stays mapped for the run). A cache that
+    /// is unavailable — a genuine `RefCell` re-entrancy, or a compile failure — is
+    /// `None`, and the driver then runs that module on its interpreter step rather
+    /// than aborting the run.
+    fn module_blocks(&self, module: &Arc<Module>) -> Option<Rc<CompiledModule>> {
+        crate::jit::cache::cached_module_blocks(module)
+    }
+}
+
+/// Run `(func, pc)` in `compiled` natively, or report "no native entry here".
+///
+/// [`NativeCode::enter`]'s body, shared with the driver's cross-module path: a block
+/// is entered only when the running machine's register file covers every register the
+/// artifact touches natively ([`block_entries`]).
+fn enter_compiled(
+    compiled: &CompiledModule,
+    native_ok: bool,
+    rt: *mut JitRuntime<'_>,
+    func: u32,
+    pc: u32,
+) -> Option<i64> {
+    if !native_ok {
+        return None;
+    }
+    let block_entry = compiled.entry(func, pc)?;
+    // SAFETY: `block_entry` points just past the start of a complete native
+    // function emitted by `emit_block` with exactly the `NativeBlock` signature
+    // (`extern "C" fn(*mut JitRuntime) -> i64`), inside a buffer sealed
+    // read+execute by `compile_module`; `rt` is the live driver-owned runtime
+    // block the driver does not otherwise borrow during the call.
+    let block: NativeBlock = unsafe { mem::transmute(block_entry) };
+    Some(block(rt))
 }
 
 /// Reset `machine`, seed `x[0..arity)` from `args`, push the bottom frame, bind the
@@ -703,6 +748,121 @@ pub(crate) fn run_native_label_outcome(
     drive(machine, module, labels, func, pc, ctx, code)
 }
 
+/// One non-entry module context the native driver has entered, with its compiled
+/// blocks resolved **once** (a context id is stable for the run, so a repeated or
+/// recursive cross-module call re-enters the same artifact instead of re-resolving it).
+struct CalleeCode {
+    /// The module context id this code belongs to.
+    context: u32,
+    /// The callee's compiled blocks, from the tier's own store
+    /// ([`NativeCode::module_blocks`]); `None` when the tier has none, in which case the
+    /// driver runs the module on its per-instruction interpreter step.
+    compiled: Option<Rc<CompiledModule>>,
+    /// Whether the running machine's register file covers every register those blocks
+    /// touch natively (the same guard [`block_entries`] applies to the entry module).
+    native_ok: bool,
+}
+
+/// The native driver's "which module is executing" state.
+///
+/// The interpreter driver carries the same information as `module`/`labels` plus the
+/// machine's `Contexts` handle ([`Machine::drive`]); the native driver needs it as
+/// explicit raw pointers because generated code holds raw pointers into the active
+/// module and its label map, and both change at a module-context transfer.
+struct DriverContext {
+    /// The active module context (see [`Machine::current_context`]).
+    context: u32,
+    /// The active module (`context == 0` is the caller's `module`, else the callee's).
+    module: *const Module,
+    /// The active module's label map.
+    labels: *const LabelMap,
+    /// The `Arc<Module>` of the active callee, if any: an explicit liveness handle for
+    /// `module` (the machine holds the module too, but a raw pointer's provenance
+    /// should not rest on that).
+    callee_module: Option<Arc<Module>>,
+    /// The compiled blocks of every non-entry context entered so far.
+    callees: Vec<CalleeCode>,
+    /// The index into `callees` of the active non-entry context, `None` in context `0`
+    /// (or for a non-entry context the tier has no blocks for — the driver then takes
+    /// its per-instruction interpreter step there).
+    active: Option<usize>,
+}
+
+/// Land the native driver in module context `context`, binding the active module, its
+/// label map and (for a non-entry context) its compiled blocks.
+///
+/// This replicates the interpreter driver's [`Step::Enter`] handling
+/// ([`Machine::drive`]) exactly: the machine's context is switched through
+/// [`Machine::switch_context`] — which re-binds the literal area, is idempotent for
+/// the context already current, and reports an unknown context as a typed error — and
+/// the driver's own module/label handles follow it.
+fn switch_into(
+    machine: &mut Machine,
+    code: &dyn NativeCode,
+    entry_module: &Module,
+    entry_labels: &LabelMap,
+    state: &mut DriverContext,
+    context: u32,
+) -> Result<()> {
+    if context != machine.current_context() {
+        machine.switch_context(context)?;
+    }
+    if context == state.context {
+        return Ok(());
+    }
+    if context == 0 {
+        state.module = entry_module as *const Module;
+        state.labels = entry_labels as *const LabelMap;
+        state.callee_module = None;
+        state.active = None;
+    } else {
+        let handle = machine
+            .module_context(context)
+            .ok_or_else(|| error::unsupported("jit: unknown module context"))?;
+        let module = &*handle.module as *const Module;
+        let labels = &handle.labels as *const LabelMap;
+        // Resolve the callee's compiled blocks once per context. A context the tier
+        // has no blocks for keeps `active = None`: the driver runs that module on its
+        // per-instruction interpreter step, exactly as it does an address its entry
+        // artifact did not compile.
+        let index = match state.callees.iter().position(|code| code.context == context) {
+            Some(index) => index,
+            None => {
+                let index = state.callees.len();
+                // Resolve the callee's compiled blocks once per context. A module the tier
+                // has no blocks for keeps `compiled = None` / `active = None`: the driver
+                // runs it on its per-instruction interpreter step, exactly as it does an
+                // address its entry artifact did not compile.
+                let compiled = code.module_blocks(&handle.module);
+                let native_ok = match &compiled {
+                    Some(compiled) => match compiled.highest_native_register {
+                        Some(highest) => machine.x.len() > highest as usize,
+                        None => true,
+                    },
+                    None => false,
+                };
+                state.callees.push(CalleeCode {
+                    context,
+                    compiled,
+                    native_ok,
+                });
+                index
+            }
+        };
+        let resolved = &state.callees[index];
+        state.active = if resolved.native_ok {
+            Some(index)
+        } else {
+            None
+        };
+        state.module = module;
+        state.labels = labels;
+        state.callee_module = Some(Arc::clone(&handle.module));
+    }
+    state.context = context;
+    Ok(())
+}
+
 /// The shared driver loop over an already-prepared machine and entry address.
 ///
 /// The A.8 tracing gate is latched here — **once per run** — so the driver's own
@@ -712,6 +872,23 @@ pub(crate) fn run_native_label_outcome(
 /// latched, without the per-instruction `trace_enabled()` vtable call. Both native
 /// tiers enter here (`run_native_outcome` and `run_native_label_outcome`, the latter
 /// shared with the Cranelift tier), so the flag is set for either.
+///
+/// A **traced** run refuses native entry entirely: it hands the whole slice to the
+/// interpreter's own driver ([`Machine::drive`]). A natively executed block emits no
+/// trace event (the engine reports trace events from `step_instruction` only) and the
+/// gate is latched once, so letting native code run would make a traced tier-run
+/// observably different from a traced interpreter run; refusing costs one
+/// `trace_enabled()` call per run and nothing at all when tracing is off.
+///
+/// The driver owns the machine's **module context** the way the interpreter driver
+/// does: a [`Step::Enter`] (from its own interpreter step, or handed back by a block
+/// as the [`ENTER`] word) switches context, re-binds the active module, its label map
+/// and its compiled blocks ([`switch_into`]), and continues — in the callee's compiled
+/// code when the tier has it, otherwise on the interpreter step. A cross-module
+/// transfer is therefore a **driver round-trip by construction**: a seal-time link
+/// across modules is unsound (each [`CompiledModule`] owns a separate executable
+/// mapping and its `rel32` fixups are buffer-local), and the runtime bakes the entry
+/// module into [`JitRuntime::module`]/[`JitRuntime::labels`].
 fn drive(
     machine: &mut Machine,
     module: &Module,
@@ -721,27 +898,71 @@ fn drive(
     ctx: &mut dyn ExecutionContext,
     code: &dyn NativeCode,
 ) -> Result<RunOutcome> {
+    if ctx.trace_enabled() {
+        machine.trace_on = true;
+        return machine.drive(module, Some(&labels), func, pc, ctx);
+    }
     // Latch the per-run tracing gate (see the `Machine::trace_on` field docs): the
     // deopt path's `step_instruction` reads the plain `bool`, so this single call
     // replaces a vtable call per call/return instruction.
-    machine.trace_on = ctx.trace_enabled();
+    machine.trace_on = false;
     // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
     // no `&mut` of the driver's aliases them while a native call is in flight.
     let x_regs: *mut Eterm = machine.x.as_mut_ptr();
     let machine_ptr: *mut Machine = &mut *machine;
     let ctx_ptr = &mut *ctx as *mut dyn ExecutionContext;
+    // The starting context: `0` for a fresh run; the context a suspended process
+    // blocked in for a resume (which does not reset, so a cross-module callee's
+    // context is still registered).
+    let mut state = DriverContext {
+        context: 0,
+        module: module as *const Module,
+        labels: &labels as *const LabelMap,
+        callee_module: None,
+        callees: Vec::new(),
+        active: None,
+    };
+    let start_context = unsafe { (*machine_ptr).current_context() };
+    if start_context != 0 {
+        // SAFETY: `machine_ptr` points at the live driver-owned `Machine`; no native
+        // code is running here.
+        switch_into(
+            unsafe { &mut *machine_ptr },
+            code,
+            module,
+            &labels,
+            &mut state,
+            start_context,
+        )?;
+    }
     let mut rt = JitRuntime {
         machine: machine_ptr,
         x_regs,
-        module: module as *const Module,
-        labels: &labels as *const LabelMap,
+        module: state.module,
+        labels: state.labels,
         ctx: ctx_ptr,
         error: None,
+        enter: None,
     };
 
     loop {
-        if let Some(word) = code.enter(&mut rt, func, pc) {
+        // Native entry for the ACTIVE module: the caller-owned artifact in context
+        // `0`, the callee's blocks (if the tier has any) in a non-entry context.
+        let native = match state.active {
+            None if state.context == 0 => code.enter(&mut rt, func, pc),
+            None => None,
+            Some(index) => {
+                let resolved = &state.callees[index];
+                match &resolved.compiled {
+                    Some(compiled) => {
+                        enter_compiled(compiled, resolved.native_ok, &mut rt, func, pc)
+                    }
+                    None => None,
+                }
+            }
+        };
+        if let Some(word) = native {
             if word == HALT {
                 // SAFETY: `machine_ptr` points at the live driver-owned `Machine`;
                 // no native code is running here.
@@ -752,6 +973,27 @@ fn drive(
                     .error
                     .take()
                     .unwrap_or_else(|| error::unsupported("jit: helper error")));
+            }
+            if word == ENTER {
+                let (context, target_func, target_pc) = rt
+                    .enter
+                    .take()
+                    .ok_or_else(|| error::unsupported("jit: enter word without a target"))?;
+                // SAFETY: `machine_ptr` points at the live driver-owned `Machine`;
+                // no native code is running here.
+                switch_into(
+                    unsafe { &mut *machine_ptr },
+                    code,
+                    module,
+                    &labels,
+                    &mut state,
+                    context,
+                )?;
+                rt.module = state.module;
+                rt.labels = state.labels;
+                func = target_func;
+                pc = target_pc;
+                continue;
             }
             if let Some((wait_func, wait_pc)) = decode_wait(word) {
                 // A block deopted at a `wait`/`wait_timeout`: its exit already spilled
@@ -774,8 +1016,22 @@ fn drive(
 
         // SAFETY: the native call returned, so no `&mut` derived from `rt` is alive;
         // `machine_ptr`/`ctx_ptr` point at the driver's live, distinct objects
-        // (`Machine` and the `ExecutionContext`), never at each other.
-        let step = unsafe { (*machine_ptr).step_instruction(module, &labels, func, pc, &mut *ctx_ptr)? };
+        // (`Machine` and the `ExecutionContext`), never at each other; `state.module`/
+        // `state.labels` point at the active module and its label map, both alive for
+        // the loop (the entry module is the caller's, a callee's is held by the machine
+        // and by `state`).
+        let step = unsafe {
+            (*machine_ptr).step_instruction(&*state.module, &*state.labels, func, pc, &mut *ctx_ptr)
+        };
+        // The uniform raise funnel's second half, exactly as `Machine::drive` runs it:
+        // `step_instruction` attached the frames itself when the raise happened in the
+        // run's **entry** context (`0`); a raise inside a cross-module callee was left
+        // for here, where the driver knows the true entry module.
+        let step = step.map_err(|err| {
+            // SAFETY: `machine_ptr` points at the live driver-owned `Machine`; no
+            // native code is running here.
+            unsafe { (*machine_ptr).with_uncaught_frames(err, Some(module), func, pc) }
+        })?;
         match step {
             Step::Next => pc += 1,
             Step::Goto {
@@ -794,13 +1050,25 @@ fn drive(
                     pc: wait_pc,
                 })
             }
-            // A module-context switch is the interpreter driver's job (see
-            // `jit_step_one`): the blocks, the label map and the literal area of this
-            // driver are all bound for the entry module.
-            Step::Enter { .. } => {
-                return Err(error::unsupported(
-                    "jit: module context switch outside the interpreter driver",
-                ))
+            Step::Enter {
+                context,
+                func: target_func,
+                pc: target_pc,
+            } => {
+                // SAFETY: `machine_ptr` points at the live driver-owned `Machine`;
+                // no native code is running here.
+                switch_into(
+                    unsafe { &mut *machine_ptr },
+                    code,
+                    module,
+                    &labels,
+                    &mut state,
+                    context,
+                )?;
+                rt.module = state.module;
+                rt.labels = state.labels;
+                func = target_func;
+                pc = target_pc;
             }
             Step::Done => {
                 // SAFETY: `machine_ptr` points at the live driver-owned `Machine`.

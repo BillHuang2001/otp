@@ -56,6 +56,18 @@ pub const HALT: i64 = -1;
 /// `error` slot and the driver must propagate it.
 pub const ERROR: i64 = -2;
 
+/// The `ENTER` block-return word: the block's per-instruction deopt hit a
+/// module-context transfer ([`Step::Enter`]) and stored the target in the runtime's
+/// [`JitRuntime::enter`] slot.
+///
+/// A compiled block can only address **one** module's code, label map and literal
+/// area, so a transfer into another module is a *driver* action: the block hands the
+/// resolved `(context, func, pc)` back and the driver performs the switch exactly as
+/// [`Machine::drive`](crate::Machine) does, then re-enters native code in the new
+/// module. Like [`HALT`]/[`ERROR`] the word carries no address, and it is negative so
+/// it can never be confused with a real [`encode_target`] continuation.
+pub const ENTER: i64 = -3;
+
 /// Encodes a `(func, pc)` continuation as the block-return word.
 ///
 /// `func` is the function index into [`Module::functions`], `pc` the code offset
@@ -100,9 +112,10 @@ pub const fn encode_wait(func: u32, pc: u32) -> i64 {
 }
 
 /// Decodes a [`Step::Wait`] block-return word into its `(func, pc)` resume address,
-/// or `None` for every other word (a real continuation, [`HALT`] or [`ERROR`]).
+/// or `None` for every other word (a real continuation, [`HALT`], [`ERROR`] or
+/// [`ENTER`]).
 pub const fn decode_wait(word: i64) -> Option<(u32, u32)> {
-    if word >= 0 || word == HALT || word == ERROR {
+    if word >= 0 || word == HALT || word == ERROR || word == ENTER {
         return None;
     }
     decode_target(word & !WAIT_BIT)
@@ -145,6 +158,12 @@ pub(crate) struct JitRuntime<'a> {
     /// Set by a helper that hit a propagating `Err`; the `ERROR` word tells the
     /// driver to take it.
     pub(crate) error: Option<BeamError>,
+    /// The `(context, func, pc)` of a module-context transfer a helper reported with
+    /// the [`ENTER`] word; the driver takes it, switches context and re-enters there.
+    ///
+    /// Read and written **only by Rust** (the driver and [`jit_step_one`]); the
+    /// generated code loads no field past [`RUNTIME_XREGS_DISP`].
+    pub(crate) enter: Option<(u32, u32, u32)>,
 }
 
 /// A compiled block's native signature.
@@ -157,6 +176,10 @@ pub(crate) type StepHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32
 /// The `jit_tail_call` helper's native signature (the block ABI plus the resolved
 /// successor word and the frame size a local `call_last` pops).
 pub(crate) type TailHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, i64, u32) -> i64;
+
+/// The `jit_set_position` helper's native signature (the block ABI plus the block's
+/// own `(func, pc)`); it returns nothing — a position store cannot fail.
+pub(crate) type PositionHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32);
 
 /// The byte offset of [`JitRuntime::machine`] — the field the helper scaffolding is
 /// handed; generated code reads [`JitRuntime::x_regs`] instead.
@@ -217,16 +240,20 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
         // the typed `blocked` error (never a wrong result and never a silent
         // continue at the `wait`'s own re-examination label).
         Ok(Step::Wait { func, pc }) => encode_wait(func, pc),
-        // A module-context switch (a `call_ext*` the host resolved through
-        // `ExecutionContext::resolve_external_call`) is an **interpreter-driver**
-        // capability: a compiled block's module, label map and literal area are all
-        // bound for one module, so a tier cannot execute another module's code.
-        // Reported as a typed error, never a silently wrong block.
-        Ok(Step::Enter { .. }) => {
-            runtime.error = Some(crate::error::unsupported(
-                "jit: module context switch outside the interpreter driver",
-            ));
-            ERROR
+        // A module-context transfer (a `call_ext*` the host resolved through
+        // `ExecutionContext::resolve_external_call`, a `return` onto a
+        // caller-context continuation, or a raise landing in another context's catch
+        // frame). A compiled block's code, label map and literal area are all bound
+        // for one module, so the block cannot make the switch itself: it hands the
+        // resolved target to the driver, which owns the module-context registry
+        // (`Machine::switch_context`) exactly as the interpreter's driver does.
+        Ok(Step::Enter {
+            context,
+            func,
+            pc,
+        }) => {
+            runtime.enter = Some((context, func, pc));
+            ENTER
         }
         Ok(Step::Done) => HALT,
         Err(err) => {
@@ -234,6 +261,34 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
             ERROR
         }
     }
+}
+
+/// The **position store** helper: record a compiled block's own `(func, pc)` as the
+/// machine's current execution position.
+///
+/// Every compiled block calls this from its **prologue**, so
+/// [`Machine::current_code`](crate::Machine::current_code) (and the derived
+/// `process_info/2` position items) reflect block-granularity position even across
+/// blocks reached by a *linked* branch — a linked jump/tail call never returns to the
+/// driver, so a store only in the driver's loop would miss exactly those. A parked
+/// `receive` and a raise stay exact because both go through the interpreter step
+/// ([`jit_step_one`] → [`Machine::step_instruction`](crate::Machine)), which records
+/// the *instruction* address itself.
+///
+/// This is [`Machine::set_current_code`](crate::Machine) — the accessor the setter
+/// exists for — reached through the block ABI. It is infallible and touches no
+/// register file, so it is safe to call with the block's cached x-registers live in
+/// the callee-saved registers; it clobbers only the caller-saved ones.
+pub(crate) extern "C" fn jit_set_position(rt: *mut JitRuntime<'_>, func: u32, pc: u32) {
+    // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
+    // `JitRuntime` and never aliases it for the duration of the call; `runtime.machine`
+    // points at the driver's live `Machine`, and no other `&mut Machine` exists while
+    // the helper runs (the driver is blocked in the block call that reached us).
+    let runtime = unsafe { &mut *rt };
+    // SAFETY: see above — `runtime.machine` is a non-null pointer to the driver's live
+    // `Machine`.
+    let machine = unsafe { &mut *runtime.machine };
+    machine.set_current_code(func, pc);
 }
 
 /// The **local tail-call** helper: pop the current frame with the interpreter's
