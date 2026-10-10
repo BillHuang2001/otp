@@ -61,7 +61,7 @@ Term order is never re-implemented here (workspace Prevent-Duplication rule).
 periodically re-asserts `check_invariants`, checks membership/`lookup` and
 `first`/`last`/`next`/`prev` (incl. bounds), walks the full ascending key run, removes every third key,
 re-checks membership + the walk, re-inserts everything, walks again, then drains back to empty — all
-with immediates (no `Heap`), so it measures the index alone (~0.4 s). `mod.rs` tests cover the empty
+with immediates (no `Heap`), so it measures the index alone (~0.4 s). `tests.rs` tests cover the empty
 case, replace/`insert_new`/`delete_object`, mixed key classes, present/absent/boundary navigation, the
 replace-key-term rule, and memory monotonicity; both interiors are driven through the `Interior` seam
 by shared helpers. `../interior_parity.rs` proves the B+-tree and the sorted `Vec` produce identical
