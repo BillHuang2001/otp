@@ -38,10 +38,10 @@ per-function bodies. Files:
 | `erts_internal.rs` | the `erts_internal` floor (`erts_internal_call`; the dispatch table is the source of truth) — see below |
 | `erts_internal/trace.rs` | the `erts_internal:trace/3` + `:trace_pattern/3` handler bodies (`erlang:trace/2,3` and `erlang:trace_pattern/2,3` call them) + their private pattern/target helpers, over `crate::trace` — see below |
 | `prim.rs` | the `prim_file` floor (27 entries) — see below |
-| `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2` `pread/2,3` `pwrite/2,3` `truncate/1` `sync/1` `datasync/1` `write_file/2` `set_cwd/1` `ipread_s32bu_p32bu/3` `get_handle/1`) + its unit tests |
-| `file_server.rs` | the native **`file_server_2` service** (contract A.9) — the registered service process + its native io-devices, the `gen_server`/`file`/`io` wire, and the scheduler-pass step that services their mailboxes (see below) |
-| `file_server/get_until.rs` | the `{get_until, …}` io-device request (`get_until::serve` + the engine-backed `EngineContinuation`) — the one io-device step that runs Erlang code, driving `Mod:Func(Cont, Data, XtraArgs…)` on the engine (see below); its unit tests live in `file_server/get_until/tests.rs` |
-| `file_server/get_line.rs` | the `{get_line, Enc, _Prompt}` io-device request (`get_line::serve` + the `LineContinuation` implementing `io_lib:collect_line/4`'s semantics and the `cast/4` reply table) — what makes `file:read_line/1` work (see below); its unit tests live in `file_server/get_line/tests.rs` |
+| `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor + its unit tests — see below |
+| `file_server.rs` | the native **`file_server_2` service** (contract A.9): the registered service process, its native io-devices, the `gen_server`/`file`/`io` wire and the scheduler-pass mailbox step (see below) |
+| `file_server/get_until.rs` | the `{get_until, …}` io-device request (`get_until::serve` + the engine-backed `EngineContinuation`) + tests in `file_server/get_until/tests.rs` (see below) |
+| `file_server/get_line.rs` | the `{get_line, Enc, _Prompt}` io-device request (`get_line::serve` + the `LineContinuation`) + tests in `file_server/get_line/tests.rs` (see below) |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
 **`init:get_arguments/0` lists ONLY the command-line flags**, so it differs from the oracle by exactly its four automatic `root`/`bindir`/`progname`/`home` entries — which is why a `RuntimeConfig::default()` runtime (an empty `init_args`, so the listing is `[]`) stops the real boot script earlier, at instruction 16 (`application:load/1`, an `error function_clause`); the CLI-equivalent configuration runs the whole script to `{progress,started}` — the boot-chain consequence is in [`../boot/CONTEXT.md`](../boot/CONTEXT.md).
