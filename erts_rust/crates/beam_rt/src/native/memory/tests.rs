@@ -840,7 +840,6 @@ fn catchlevel_with_a_readable_engine_is_the_live_catch_frame_depth() {
     let target = pid.to_eterm();
     let item = atom(&mut runtime, "catchlevel");
     let reply = {
-        let mut sink = NullSink;
         let mut context =
             RuntimeContext::for_process_with_engines(&mut runtime, &mut table, pid, &engines);
         context
@@ -871,7 +870,6 @@ fn catchlevel_is_the_gap_for_a_fun_bodied_process() {
     let target = pid.to_eterm();
     let item = atom(&mut runtime, "catchlevel");
     let error = {
-        let mut sink = NullSink;
         let mut context =
             RuntimeContext::for_process_with_engines(&mut runtime, &mut table, pid, &engines);
         context
