@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use beam_common::{BeamError, ExitReason};
 use beam_engine::jit::cache::{baseline_cache_len, clear_baseline_cache};
-use beam_engine::{Machine, Tier};
-use beam_loader::{Function, Import, ImportRef, Instr, Label, Module, Operand};
+use beam_engine::{Machine, Mailbox, MinimalContext, RunOutcome as EngineOutcome, Tier};
+use beam_loader::{Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand};
 use beam_process::{ProcessId, ProcessRunner, ProcessTable, RunOutcome as ProcOutcome, SignalAtoms};
-use beam_term::{make_small, signed_value, Atom, AtomTable};
+use beam_term::{make_atom, make_small, signed_value, Atom, AtomTable, Eterm};
 
 use super::budget::BudgetProbe;
 use super::entry::{ProcessEntry, RunnerState};
@@ -383,10 +383,177 @@ fn a_timeout_delay_must_be_a_statically_known_positive_millisecond_count() {
     assert_eq!(
         timeout_delay(&machine, &module, &Operand::Y(0)),
         None,
-        "a y (stack) register is not readable by the machine"
+        "no frame ⇒ no Y slot to read; a parked frame's slot IS read (see the y-delay tests)"
     );
 }
 
+// -- a runtime-variable (`Y`-register) `receive … after T` ----------------
+
+/// A mailbox that never holds a message, so a `receive` suspends at its scan address.
+struct EmptyMailbox;
+
+impl Mailbox for EmptyMailbox {
+    fn send_message(&mut self, _to: Eterm, _message: Eterm) -> beam_common::Result<()> {
+        Ok(())
+    }
+    fn receive_next(&mut self) -> beam_common::Result<Option<Eterm>> {
+        Ok(None)
+    }
+    fn receive_skip(&mut self) -> beam_common::Result<()> {
+        Ok(())
+    }
+    fn receive_remove(&mut self) -> beam_common::Result<()> {
+        Ok(())
+    }
+    fn receive_reset(&mut self) -> beam_common::Result<()> {
+        Ok(())
+    }
+    fn receive_marker_reserve(&mut self) -> beam_common::Result<Eterm> {
+        Err(BeamError::BadArg)
+    }
+    fn receive_marker_bind(&mut self, _marker: Eterm, _reference: Eterm) -> beam_common::Result<()> {
+        Err(BeamError::BadArg)
+    }
+    fn receive_marker_use(&mut self, _reference: Eterm) -> beam_common::Result<()> {
+        Err(BeamError::BadArg)
+    }
+    fn receive_marker_clear(&mut self, _reference: Eterm) -> beam_common::Result<()> {
+        Err(BeamError::BadArg)
+    }
+}
+
+/// A one-function synthetic module for a `receive … after T` whose `T` is a **runtime
+/// variable**, so the compiler kept it in a **Y** slot and the parked `wait_timeout`'s `Time`
+/// operand is [`Operand::Y(0)`](Operand::Y) — never a literal the loader could fold.
+///
+/// This is the shape `erlc` emits for `recv(T) -> receive m -> ok after T -> timeout end.`
+/// (the delay is a `{bif,max,…}`-style runtime value), with the `timeout` continuation at code
+/// index 9:
+///
+/// ```text
+/// 0  label 1
+/// 1  allocate 1
+/// 2  move <delay>, y0
+/// 3  label 2
+/// 4  loop_rec 3, x0
+/// 5  remove_message
+/// 6  return
+/// 7  label 3
+/// 8  wait_timeout 2, y0     ; <-- the parked instruction
+/// 9  timeout                ; <-- the timed-out continuation (pc + 1)
+/// 10 return
+/// ```
+fn y_delay_module(delay: Operand) -> Module {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(1),
+            live: 0,
+        },
+        Instr::Move {
+            src: delay,
+            dst: Operand::Y(0),
+        },
+        Instr::Label(Label(2)),
+        Instr::LoopRec {
+            fail: Label(3),
+            dst: Operand::X(0),
+        },
+        Instr::RemoveMessage,
+        Instr::Return,
+        Instr::Label(Label(3)),
+        Instr::WaitTimeout {
+            target: Label(2),
+            time: Operand::Y(0),
+        },
+        Instr::Timeout,
+        Instr::Return,
+    ];
+    let mut labels = BTreeMap::new();
+    for (index, instr) in code.iter().enumerate() {
+        if let Instr::Label(label) = instr {
+            labels.insert(*label, index);
+        }
+    }
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("recv");
+    let module_atom = module.name;
+    let name = module.atom_table.intern("recv");
+    module.functions.push(Function {
+        func_label: Label(1),
+        entry_label: Label(1),
+        module: module_atom,
+        name,
+        arity: 1,
+        code,
+        blocks: Vec::new(),
+        labels,
+    });
+    module
+}
+
+/// Run `recv/1` of [`y_delay_module`] against an empty mailbox, returning the parked machine.
+fn park_on_y_delay(module: &Module) -> (EngineOutcome, Machine, MinimalContext) {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_mailbox(Box::new(EmptyMailbox));
+    let outcome = machine
+        .run_label_outcome(module, Label(1), 1, &[make_small(7)], &mut ctx)
+        .expect("run recv/1");
+    (outcome, machine, ctx)
+}
+
+#[test]
+fn a_y_register_receive_delay_is_armed_and_fires() {
+    // A `receive … after T` with `T` a runtime variable keeps the delay in a Y slot; the runner
+    // reads that slot back through the public `Machine::y` accessor while the process is parked,
+    // so the deadline is recovered rather than lost.
+    let module = y_delay_module(Operand::Integer(20));
+    let (outcome, mut machine, mut ctx) = park_on_y_delay(&module);
+    // The non-zero delay suspends at the receive's scan label (`label 2` = code index 3).
+    assert_eq!(outcome, EngineOutcome::Wait { func: 0, pc: 3 });
+
+    // The Y slot of the parked frame IS readable — the deadline is a real 20 ms, not a guess.
+    assert_eq!(machine.y(0), Some(make_small(20)));
+    assert_eq!(
+        timeout_delay(&machine, &module, &Operand::Y(0)),
+        Some(Duration::from_millis(20))
+    );
+    let (delay, resume) = parked_receive_timeout(&machine, &module, 0, 3)
+        .expect("the y-register delay arms a 20 ms deadline");
+    assert_eq!(delay, Duration::from_millis(20));
+    assert_eq!(resume, (0, 9), "resume at the `timeout` after wait_timeout");
+    assert_eq!(module.functions[0].code[9], Instr::Timeout);
+
+    // ...and it fires: resuming at the recovered address runs the timed-out continuation.
+    let fired = machine
+        .resume_outcome(&module, resume.0, resume.1, &mut ctx)
+        .expect("a fired deadline resumes at the timeout instruction");
+    assert_eq!(fired, EngineOutcome::Returned(make_small(7)));
+
+    // Bounds: the frame owns exactly one Y slot, and an out-of-range one is no deadline.
+    assert_eq!(machine.y(1), None, "the frame has one Y slot");
+    assert_eq!(timeout_delay(&machine, &module, &Operand::Y(1)), None);
+}
+
+#[test]
+fn a_y_register_delay_that_is_not_a_positive_integer_arms_nothing() {
+    // `infinity` (like a zero/negative or non-integer value) in the Y slot is the honest
+    // absence of a deadline: the process parks until a message arrives, never on a guessed one.
+    let mut module = y_delay_module(Operand::Integer(20));
+    let infinity = module.atom_table.intern("infinity");
+    module.functions[0].code[2] = Instr::Move {
+        src: Operand::Atom(infinity),
+        dst: Operand::Y(0),
+    };
+
+    let (outcome, machine, _ctx) = park_on_y_delay(&module);
+    // A non-integer delay still suspends (it is not the small integer 0), so the machine IS
+    // parked — and the unreadable slot must therefore stay "no deadline", not become one.
+    assert_eq!(outcome, EngineOutcome::Wait { func: 0, pc: 3 });
+    assert_eq!(machine.y(0), Some(make_atom(infinity)));
+    assert_eq!(timeout_delay(&machine, &module, &Operand::Y(0)), None);
+    assert_eq!(parked_receive_timeout(&machine, &module, 0, 3), None);
+}
 // -- execution-tier selection (`super::tier`) -----------------------------
 
 /// The committed engine harness fixture that calls **non-floor, non-registry** `.beam`
