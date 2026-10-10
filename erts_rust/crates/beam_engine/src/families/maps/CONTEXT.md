@@ -83,11 +83,14 @@ Verified against the system `erlc` (OTP 29) disassembly:
   oracle raises `error:{badkey,b}`. This is the `badkey` path (`write.rs:141`).
 - A **non-map** source with `NO_FAIL` is **not** reachable: the compiler always emits
   `test,is_map Fail` first, and its `Fail` path builds `{badmap,X}` and calls
-  `erlang:error/1` itself — the `badmap` arms (`read.rs:63,95`, `write.rs:84,135`) are reached
+  `erlang:error/1` itself — the `badmap` arms (`read.rs:65,93`, `write.rs:84,135`) are reached
   only from hand-built IR.
 - `get_map_elements`/`has_map_fields` are always emitted with the clause/case fail label (the
-  matching forms), so `jump_or_unsupported`'s key-absent `NO_FAIL` arm is likewise only
-  reachable from hand-built IR.
+  matching forms), so their key-absent `NO_FAIL` branch (the engine-defined bare
+  `function_clause`) is likewise only reachable from hand-built IR.
+- Because `function_clause` is a common atom, a real `.beam` for a matching function usually
+  names it — but nameability is still a host load-time obligation (see above): the engine never
+  substitutes a foreign index.
 
 ## Constraints
 - `#![deny(unsafe_code)]` (crate-wide): this node carries no `unsafe`.
