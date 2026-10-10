@@ -70,15 +70,23 @@
 //!    (which counts `2 + ceil(bits/64)`) where C switches to the 8-word
 //!    `[BinRef][ErlSubBits]` pair.
 //!
-//! A **hashmap** (>32-pair map), an external pid/port/ref (whose `node` slot is
-//! likewise inlined by this runtime) and any boxed subtag this module does not
-//! positively recognize as representation-identical are treated the same way:
-//! conservatively divergent, never guessed. Everything else — immediates, cons
-//! cells, tuples and native records, floats, bignums, flat maps, on-heap
-//! bitstrings up to 512 bits and the 8-word refc pair itself — is counted exactly
-//! as the C does, because it is the same algorithm over the same frozen layouts
-//! (note `heap_bits_size(bits) == 2 + ceil(bits/64)`, identical to
-//! [`beam_term::bitstring::heap_bits_size_words`]).
+//! An external pid/port/ref (whose `node` slot is likewise inlined by this runtime)
+//! and any boxed subtag this module does not positively recognize as
+//! representation-identical are treated the same way: conservatively divergent,
+//! never guessed. Everything else — immediates, cons cells, tuples and native
+//! records, floats, bignums, flat maps, **hash maps** (their HAMT node interiors are
+//! the ERTS layout, `copy.c:192-214`, which
+//! [`beam_term::layout`](beam_term) sizes exactly), on-heap bitstrings up to 512
+//! bits and the 8-word refc pair itself — is counted exactly as the C does, because
+//! it is the same algorithm over the same frozen layouts (note
+//! `heap_bits_size(bits) == 2 + ceil(bits/64)`, identical to
+//! [`beam_term::bitstring::heap_bits_size_words`]). Oracle-pinned:
+//! `erts_debug:flat_size(maps:from_list([{N,N*10} || N <- lists:seq(1,33)]))` ⇒ `123`,
+//! the count this runtime's own 33-pair HAMT produces. A hash map's *trie shape* —
+//! and therefore its count — is driven by `erts_map_hash`, which for an atom key
+//! reads the atom's runtime index, so an atom-keyed HAMT can legitimately count
+//! differently here than in the oracle; that is a differing *input map*, not a
+//! differing representation, and the number is this runtime's true flat size.
 //!
 //! # The internal integer parsers *return* their failure atoms
 //!
@@ -104,18 +112,19 @@
 //!   shared-term walk, the emulator's internal state and the BEAM code loader).
 //! * Typed gaps *inside* a registered BIF (each returns
 //!   [`crate::error::unsupported_bif`], never a wrong value):
-//!   `map_next/3` on a hashmap (`erl_map.c:3739+` walks HAMT nodes with path
-//!   bignums and reduction-budget chunking) and `map_hashmap_children/1` on a
-//!   non-flat node (the raw node walk, `erl_map.c:3425-3461`); `flat_size/1` for
-//!   the divergent representations above. `term_type/1` distinguishes the on-heap
-//!   (`heap_binary`) from the off-heap (`sub_binary`) bitstring by the layout rule
-//!   itself; the C `refc_binary` name is unreachable because a bare `BinRef` header
-//!   is not `is_bitstring`, so such a term falls into the unrecognized-tag gap
-//!   (this runtime builds no standalone `BinRef` term anyway).
-
+//!   `map_hashmap_children/1` on a hash-map node (the raw slot walk,
+//!   `erl_map.c:3425-3461`, needs a node-interior accessor the LCA does not expose —
+//!   see its own doc); `flat_size/1` for the divergent representations above.
+//!   `term_type/1` distinguishes the on-heap (`heap_binary`) from the off-heap
+//!   (`sub_binary`) bitstring by the layout rule itself; the C `refc_binary` name is
+//!   unreachable because a bare `BinRef` header is not `is_bitstring`, so such a term
+//!   falls into the unrecognized-tag gap (this runtime builds no standalone `BinRef`
+//!   term anyway). `map_next/3` walks both map representations; only its continuation
+//!   *path encoding* and per-call chunk size are this implementation's own (see
+//!   [`map_next_3`]).
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{boxed_val, make_small, signed_value};
-use beam_term::{atom_val, compare, Eterm};
+use beam_term::{atom_val, Eterm};
 
 use crate::access;
 use crate::arith;
@@ -285,18 +294,23 @@ fn has_representation_divergence(term: Eterm) -> bool {
                 Err(_) => return true,
             }
         }
-        if access::is_flatmap(current) {
-            match access::flatmap_pairs(current) {
-                Ok((keys, values)) => {
-                    work.extend(keys);
-                    work.extend(values);
+        if access::is_map(current) {
+            // Both representations: a flat map (`map_pairs_storage_order` reads its
+            // keys tuple) and a HAMT (`size_object` sizes the frozen ERTS node
+            // interiors, so only the keys/values can carry a divergence).
+            match access::map_pairs_storage_order(current) {
+                Ok(pairs) => {
+                    for (key, value) in pairs {
+                        work.push(key);
+                        work.push(value);
+                    }
                     continue;
                 }
                 Err(_) => return true,
             }
         }
-        // A hashmap (`is_map` beyond the flat map) or any subtag not positively
-        // recognized above: its word count is not verifiable through the safe API.
+        // Any subtag not positively recognized above: its word count is not
+        // verifiable through the safe API.
         return true;
     }
     false
@@ -393,6 +407,12 @@ fn unsafe_base_of(term: Eterm) -> *const u8 {
 /// `erts_internal:map_to_tuple_keys/1` — a flat map's key tuple
 /// (`erl_map.c:3318-3328`). The C returns the map's own key-tuple object; this
 /// builds a fresh tuple that is `=:=`-equal to it.
+///
+/// A **hash map is `badarg`** — not `{badmap, _}`: the C reaches a map's keys only
+/// through the flat-map head's `keys` word, so `erts_internal_map_to_tuple_keys_1`
+/// errors explicitly for a HAMT (`erl_map.c:3322-3323`). Oracle-pinned:
+/// `erts_internal:map_to_tuple_keys(maps:from_list([{N,N} || N <- lists:seq(1,33)]))`
+/// ⇒ `error:badarg` (and `#{}`⇒`{}`, `[1,2]`⇒`error:{badmap,[1,2]}`).
 fn map_to_tuple_keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let term = args[0];
     if access::is_flatmap(term) {
@@ -400,7 +420,6 @@ fn map_to_tuple_keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm
         return ctx.tuple(&keys);
     }
     if access::is_map(term) {
-        // A hashmap: the C raises `badarg`.
         return Err(badarg());
     }
     Err(structured_error(ctx, "badmap", &[term])?)
@@ -408,6 +427,15 @@ fn map_to_tuple_keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm
 
 /// `erts_internal:map_hashmap_children/1` — the slot values of one hashmap node
 /// (`erl_map.c:3425-3461`). Only the two non-node cases are reproducible here.
+///
+/// The C returns the node's own **in-heap slot words** — every leaf cons cell, every
+/// sub-node term and every collision tuple of the node reached by the argument — in
+/// reverse slot order. Reaching them needs a node-interior accessor: a head-array
+/// node is `[hdr][size][16 slots]`, a bitmap node `[hdr][(size)][n slots]` and a
+/// collision node a plain arityval tuple, and the slot words are pointers into the
+/// existing map. `beam_term::map`'s public surface is pairs-level only
+/// (`map_pairs`/`map_pairs_storage_order`/`map_size`/`map_get`) and this crate
+/// confines `unsafe` to `src/access.rs`, so a node argument stays the typed gap.
 fn map_hashmap_children_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let term = args[0];
     if !access::is_map(term) {
@@ -417,24 +445,54 @@ fn map_hashmap_children_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Et
         // `HAMT_SUBTAG_HEAD_FLATMAP` ⇒ the C raises `badarg`.
         return Err(badarg());
     }
-    // Any other node needs the raw HAMT slot walk (head-array/head-bitmap/node-bitmap
-    // and the collision-node arityval form), which the public term API does not
-    // expose.
     Err(unsupported_bif())
 }
 
+/// The HAMT positional walk's per-call chunk cap, `MAP_SMALL_MAP_LIMIT`
+/// (`erl_map.h:96`) — the oracle's deterministic *first*-call ceiling
+/// (`erl_map.c:3799-3801`). [`crate::maps`]'s `next/1` uses the same cap and the
+/// same storage-order offset encoding, so the two implementations of this BIF agree.
+const HAMT_CHUNK: usize = 32;
+
 /// `erts_internal:map_next/3` — one step of `maps:next/1`'s iteration
-/// (`erl_map.c:3636-3920`).
+/// (`erl_map.c:3636-4122`).
 ///
-/// The ordered-iterator path (`Path` a list with mode `iterator`) folds the looked-up
-/// pairs into `{K0,V0,{K1,V1,…none}}`; the flat-map path folds either that tuple
-/// chain (iterator mode) or `[{K,V} | Acc]` (list mode) over the map's **stored**
-/// pairs, ignoring the position value beyond its `n >= Path` bound check.
+/// Three shapes, decided by the arguments exactly as the C does:
 ///
-/// The C caps the ordered path at `MAX(1, reds_left/32)` elements and, when it stops
-/// early, returns the raw `{…, [RestPath|Map]}` continuation. That truncation is
-/// unreachable for the ≤32-element paths a flat map can hold, so this implementation
-/// never truncates; end-to-end `maps:next/1` results are unaffected.
+/// * **ordered iterator** (`Mode == iterator` and a list/NIL `Path`): `Path` is the
+///   key list `maps:iterator(M, ordered)` built, and the result is
+///   `{K, maps:get(K, Map), …}` over it, one triple per key, terminating in `none`.
+/// * **iterator** (any other `Path` with `Mode == iterator`): the look-ahead chain
+///   `{K0,V0,{K1,V1,…}}`, ending in `none` — or in the `[NextPath | Map]`
+///   continuation a caller (`maps:next/1`) resumes from.
+/// * **list mode** (`Mode` a list or NIL, `Path` an integer): the `{K,V}` pairs are
+///   prepended onto `Mode` and the result is `[NextPath, Map | Accumulated]` while a
+///   chunk remains (`maps.erl:526-542` accumulates it) or the plain list once the map
+///   is exhausted.
+///
+/// Both positional walks read the map's pairs in the order
+/// [`crate::access::map_pairs_storage_order`] reports — a flat map's key-tuple order,
+/// a HAMT's slot-traversal order, i.e. the oracle's `maps:to_list/1` order. A flat
+/// map (≤ [`HAMT_CHUNK`] pairs) always emits its whole chain, ignoring the offset
+/// beyond the bound check; a HAMT is chunked.
+///
+/// # Deviation: the `Path` is an opaque storage-order offset and the chunking is fixed
+///
+/// The C's `Path` is an internal trie-nibble encoding (`erl_map.c:4058-4111`, a
+/// bignum past 15 levels, with "offset from end" semantics in list mode) and, after
+/// the first call, its element count is `min(remaining reductions / 4, size)`
+/// (`erl_map.c:3783-3792`) — a function of the *process's* reduction budget, so two
+/// identical calls in one process can return different amounts. Neither is
+/// reproducible here: no node-interior accessor exists (see
+/// [`map_hashmap_children_1`]) and a [`BifContext`] carries no reduction counter.
+/// This implementation therefore emits the oracle's *deterministic* first-call cap
+/// ([`HAMT_CHUNK`]) and then one further [`HAMT_CHUNK`] per call, using its own
+/// offset (an integer, so `maps.erl`'s `is_integer(Path)` guard accepts it) as the
+/// continuation. The **pair sequence**, the **order** and the terminal `none` are
+/// the oracle's; only the intermediate chunk boundaries and the continuation values
+/// differ, and only for a map with more than 2×[`HAMT_CHUNK`] pairs (below that the
+/// chunking coincides). `crate::maps`'s `next/1` uses the same encoding, so
+/// `maps:next/1` and `maps:to_list/1` agree end-to-end.
 fn map_next_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let (path, map, mode) = (args[0], args[1], args[2]);
     // (1) A non-map is a plain `badarg` here — *not* `{badmap, _}` (`erl_map.c:3644`).
@@ -449,63 +507,111 @@ fn map_next_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
     // (3) Ordered iterator: the path is the key list to visit.
     if iterator && (access::is_nil(path) || access::is_list(path)) {
-        if !access::is_flatmap(map) {
-            return Err(unsupported_bif());
-        }
-        let (keys, values) = access::flatmap_pairs(map)?;
-        let mut visited_keys: Vec<Eterm> = Vec::new();
-        let mut visited_values: Vec<Eterm> = Vec::new();
-        let mut current = path;
-        while access::is_list(current) {
-            let key = access::car(current);
-            match keys
-                .iter()
-                .position(|&k| compare::eq(k, key, ctx.atoms()))
-            {
-                Some(i) => {
-                    visited_keys.push(key);
-                    visited_values.push(values[i]);
-                }
-                None => return Err(badarg()),
-            }
-            current = access::cdr(current);
-        }
-        let none = atom(ctx, "none")?;
-        let mut result = none;
-        for i in (0..visited_keys.len()).rev() {
-            result = ctx.tuple(&[visited_keys[i], visited_values[i], result])?;
-        }
-        return Ok(result);
+        return ordered_next(ctx, path, map);
     }
 
-    if !access::is_flatmap(map) {
-        // The HAMT path walk (path bignums, node stack, reduction chunking).
-        return Err(unsupported_bif());
-    }
-    let (keys, values) = access::flatmap_pairs(map)?;
-    let n = keys.len();
-    // (4) The position must be a small integer with `n >= unsigned_val(Path)`; a
-    // negative small integer has a huge unsigned value and is therefore a `badarg`.
+    // (4) The positional walks. The offset must be a small integer no greater than
+    // the pair count — a negative small integer has a huge unsigned value and is
+    // therefore a `badarg`, exactly as the C's `n < unsigned_val(Path)` test.
+    let pairs = access::map_pairs_storage_order(map)?;
+    let n = pairs.len();
     if !access::is_small(path) || (n as u64) < unsigned_val(path) {
         return Err(badarg());
     }
-    if iterator {
-        let mut result = atom(ctx, "none")?;
-        for i in (0..n).rev() {
-            result = ctx.tuple(&[keys[i], values[i], result])?;
+    let offset = unsigned_val(path) as usize;
+
+    if access::is_flatmap(map) {
+        // A flat map's chain is emitted whole, whatever the offset.
+        if iterator {
+            let none = atom(ctx, "none")?;
+            return chain(ctx, &pairs, 0, n, none);
         }
-        Ok(result)
-    } else {
-        // List mode: the accumulator is the caller's third argument, verbatim.
         let mut result = mode;
         for i in (0..n).rev() {
-            let pair = ctx.tuple(&[keys[i], values[i]])?;
+            let pair = ctx.tuple(&[pairs[i].0, pairs[i].1])?;
             result = ctx.cons(pair, result)?;
         }
-        Ok(result)
+        return Ok(result);
     }
+    if iterator {
+        let end = core::cmp::min(offset + HAMT_CHUNK, n);
+        let terminal = if end < n {
+            ctx.cons(ctx.int(end as i64)?, map)?
+        } else {
+            atom(ctx, "none")?
+        };
+        return chain(ctx, &pairs, offset, end, terminal);
+    }
+
+    // List mode: the chunk *ending* at `to`. The C traverses the trie backwards
+    // (`erl_map.c:3975-4054`) and `CONS`es each pair onto the accumulator, so the
+    // first call yields the map's *trailing* chunk and later calls prepend earlier
+    // ones — the accumulated list ends up in storage order. Path `0` is that first
+    // call; any other path resumes one chunk further down.
+    let (from, to) = if offset == 0 {
+        (n.saturating_sub(HAMT_CHUNK), n)
+    } else {
+        (offset.saturating_sub(HAMT_CHUNK), offset)
+    };
+    let mut result = mode;
+    for i in (from..to).rev() {
+        let pair = ctx.tuple(&[pairs[i].0, pairs[i].1])?;
+        result = ctx.cons(pair, result)?;
+    }
+    if from > 0 {
+        let next = ctx.int(from as i64)?;
+        result = ctx.cons(map, result)?;
+        result = ctx.cons(next, result)?;
+    }
+    Ok(result)
 }
 
+/// Folds the pairs `from..end` (ascending) into the iterator-mode look-ahead chain
+/// `{K0,V0,{K1,V1,…}}`, ending in `terminal`.
+fn chain(
+    ctx: &mut BifContext<'_>,
+    pairs: &[(Eterm, Eterm)],
+    from: usize,
+    end: usize,
+    terminal: Eterm,
+) -> Result<Eterm> {
+    let mut result = terminal;
+    for i in (from..end).rev() {
+        result = ctx.tuple(&[pairs[i].0, pairs[i].1, result])?;
+    }
+    Ok(result)
+}
+
+/// The ordered-iterator walk (`erl_map.c:3656-3707`): for every key of `keys_path`,
+/// a `{Key, Value, …}` triple whose value is `maps:get(Key, Map)` — any map kind,
+/// flat or hash — terminating in `none`. A `NIL` path yields `none` itself.
+///
+/// # Errors
+///
+/// `badarg` for a key the map does not hold (the C's `ordered_badarg`).
+fn ordered_next(ctx: &mut BifContext<'_>, keys_path: Eterm, map: Eterm) -> Result<Eterm> {
+    let mut keys: Vec<Eterm> = Vec::new();
+    let mut current = keys_path;
+    while access::is_list(current) {
+        keys.push(access::car(current));
+        current = access::cdr(current);
+    }
+    // `current` is `NIL` here: the caller admitted only a proper list or `NIL`.
+    // Look every value up before building, so no `ctx.atoms()` borrow is held across
+    // a `ctx.tuple` allocation.
+    let mut values: Vec<Eterm> = Vec::with_capacity(keys.len());
+    for &key in &keys {
+        match access::map_get(map, key, ctx.atoms())? {
+            Some(value) => values.push(value),
+            None => return Err(badarg()),
+        }
+    }
+    let mut result = atom(ctx, "none")?;
+    for i in (0..keys.len()).rev() {
+        result = ctx.tuple(&[keys[i], values[i], result])?;
+    }
+    Ok(result)
+}
 /// `erts_internal:time_unit/0` — the runtime's native time unit in units per second
 /// (`erl_time_sup.c:2537-2540`, `ERTS_MONOTONIC_TIME_UNIT`). This runtime fixes the
 /// native unit to **nanoseconds** (see `src/time.rs`), as on this Linux host;
@@ -846,7 +952,7 @@ mod tests {
             let expected_rest = ctx.list(&[x]).unwrap();
             let result = list_to_integer_2(ctx, &[list, ten]).unwrap();
             assert_eq!(access::tuple_element(result, 0), make_small(12));
-            assert!(compare::eq(
+            assert!(beam_term::compare::eq(
                 access::tuple_element(result, 1),
                 expected_rest,
                 ctx.atoms()
