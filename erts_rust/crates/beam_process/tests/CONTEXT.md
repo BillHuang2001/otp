@@ -287,7 +287,8 @@ SMP pool:
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
   `preemption.rs`, `dict.rs`, `fragments.rs`, `scheduler_ports.rs`, `exhaustion.rs`,
-  `signal_exhaustion.rs`, `gc_exemption.rs`, `message_relocation.rs`, `gc_refc_binary_message.rs` →
+  `signal_exhaustion.rs`, `gc_exemption.rs`, `message_relocation.rs`, `gc_refc_binary_message.rs`,
+  `off_heap_send_isolation.rs`, `message_from_is_immediate.rs` →
   the single-threaded scheduler (incl. the port-aware slice cleanup), mailbox, signals, GC roots, PCB state,
   pre-emption/fairness, the collect-grow-and-retry exhaustion path of `Process::deliver` and the
   `{'EXIT',…}`/`{'DOWN',…}` signal builders, the host-controllable GC relocation exemption, and the
