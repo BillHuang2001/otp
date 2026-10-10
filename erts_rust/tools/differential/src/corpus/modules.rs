@@ -42,7 +42,9 @@
 //! The `modules/erl_error_format_exception_*` block additionally pins a **crash
 //! regression**: `erl_error:format_exception/3` on a **heap-allocated** reason (the `{1,2}` /
 //! `{a,b}` tuples) used to `SIGSEGV` the Rust runtime where the oracle answered a value, so
-//! each of those cases now agrees.
+//! each of those cases now agrees. `modules/bif_base64_encode_empty_size` pins a second
+//! regression on the `run` result path: a zero-length binary result (`base64:encode/1` of an
+//! empty input, an off-heap refc binary) used to be refused (`beam_rt: badarg`, exit `1`).
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 
@@ -66,7 +68,7 @@ pub(crate) const DIFF_MOD_SOURCE: &str = "-module(diff_mod).\n\
 ///
 /// * arithmetic and comparison — contract A.1 (language semantics);
 /// * guards, `case`, recursion — contract A.1;
-/// * `element/2`/`tuple_size/1` and the `lists`/`maps`/`binary` calls — contract A.7.
+/// * `element/2`/`tuple_size/1` and the `lists`/`maps`/`binary`/`base64` calls — contract A.7.
 pub(crate) const DIFF_OPS_SOURCE: &str = "-module(diff_ops).\n\
      -export([add2/2, sub2/2, mul2/2, idiv2/2, irem2/2, neg1/1, iabs/1, precedence0/0,\n\
      \x20        mn2/2, mx2/2,\n\
@@ -78,7 +80,7 @@ pub(crate) const DIFF_OPS_SOURCE: &str = "-module(diff_ops).\n\
      \x20        msize0/0, mapget0/0, seqsum/1,\n\
      \x20        foldl_sum0/0, map_len0/0, append_len0/0, rev_head0/0, tuple_elem3_0/0,\n\
      \x20        bin_at0/0, bit_size0/0, maps_get_k0/0, member10/0, seq_len0/0,\n\
-     \x20        lists_last0/0, int_to_list_len0/0, sum_range/2]).\n\
+     \x20        lists_last0/0, int_to_list_len0/0, sum_range/2, b64_empty_size/1]).\n\
      add2(A,B) -> A+B.\n\
      sub2(A,B) -> A-B.\n\
      mul2(A,B) -> A*B.\n\
@@ -149,7 +151,8 @@ pub(crate) const DIFF_OPS_SOURCE: &str = "-module(diff_ops).\n\
      lists_last0() -> lists:last([1,2,3]).\n\
      int_to_list_len0() -> length(integer_to_list(12345)).\n\
      sum_range(A, B) when A > B -> 0;\n\
-     sum_range(A, B) -> A + sum_range(A + 1, B).\n";
+     sum_range(A, B) -> A + sum_range(A + 1, B).\n\
+     b64_empty_size(N) -> byte_size(base64:encode(binary:copy(<<N>>, 0))).\n";
 
 /// The source compiled for the `erl_error:format_exception/3` regression cases.
 ///
@@ -837,6 +840,20 @@ pub(crate) fn group() -> Vec<Case> {
             "erl_error:format_exception/3 on the immediate reason (error, badarg) agrees",
             "fmt_error_badarg",
             "29",
+        ),
+        // The `run`-action zero-length-binary regression: `base64:encode/1` returns an
+        // **off-heap** refc binary even for a zero-length input, and the CLI used to refuse to
+        // render it (`beam_rt: badarg`, exit 1) where the oracle printed `<<>>`. The exported
+        // function returns the byte size (an integer — a module-run golden must be one), so the
+        // case pins the whole `run` path end to end: `0` (this) versus a crash/refusal before.
+        case(
+            "modules/bif_base64_encode_empty_size",
+            "the run action returns a zero-length base64:encode/1 result (byte size 0)",
+            &[BeamAsm, OtpApps],
+            "b64_empty_size",
+            1,
+            &[65],
+            "0",
         ),
     ]
 }
