@@ -129,9 +129,6 @@
 //!   entry is `(destination, term)` only, so the runtime that drains it delivers the term itself
 //!   (`erl_drv_output_term` sends the decoded term, never a `{Port, Term}` wrapper) with no
 //!   sending-port identity.
-//! * **`ERL_DRV_USE` / `stop_select`** is accepted but never fires: a deselected event is
-//!   deregistered from the poll set, yet the driver's `stop_select` callback is not run.
-
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -141,7 +138,7 @@ use libc::{c_int, c_ulong};
 use beam_abi::driver::loader::{self, DriverLibrary, DriverLoadError};
 use beam_abi::driver::types::{
     ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlIOVec, ERTS_INVALID_ERL_DRV_PORT,
-    ERL_DRV_READ, ERL_DRV_WRITE,
+    ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
 use beam_abi::{DriverEnv, DriverHost, SysIOVec};
 use beam_common::BeamError;
@@ -287,7 +284,7 @@ impl beam_bifs::AtomInterner for DriverAtoms {
 struct SelectRequest {
     /// The descriptor the driver selected (or deselected).
     fd: c_int,
-    /// The `ERL_DRV_READ`/`ERL_DRV_WRITE` (and, unhandled, `ERL_DRV_USE`) mode bits.
+    /// The `ERL_DRV_READ`/`ERL_DRV_WRITE`/`ERL_DRV_USE` mode bits, verbatim.
     mode: c_int,
     /// Non-zero to select, zero to deselect (`driver_select`'s `on` argument).
     on: c_int,
@@ -991,7 +988,6 @@ pub fn load_driver(
 /// * `driver_control` (the entry's `control` callback behind `port_control/3`) is not routed here
 ///   yet, so [`beam_io::Driver::control`]'s default (no reply bytes) is used.
 /// * A queued term is delivered without a sending-port identity (the C stamps `from = prt`).
-/// * `ERL_DRV_USE` is accepted but its `stop_select` callback never fires.
 /// * `take_exit_status` is always `Ok(None)`: a driver port owns no child to reap, so no
 ///   `{Port, {exit_status, …}}` message is ever synthesized for it.
 pub struct DriverPortAdapter {
@@ -1143,30 +1139,68 @@ impl DriverPortAdapter {
     /// The C's rule is per `(event, direction)`: `on` arms the `ERL_DRV_READ`/`ERL_DRV_WRITE`
     /// directions named by `mode`, `!on` clears them, and the event is deregistered once no
     /// direction is left (`erl_check_io.c:987`).
+    ///
+    /// A **deselect** whose `mode` carries `ERL_DRV_USE` *without* the cancel bit — the C's
+    /// `(mode & ERL_DRV_USE_NO_CALLBACK) == ERL_DRV_USE` test (`erl_check_io.c:1177`) — is the
+    /// "I am done with this event" form: it also clears **both** directions
+    /// (`mode |= ERL_DRV_READ | ERL_DRV_WRITE`, `erl_check_io.c:1044`) and, once the event has no
+    /// armed direction left, runs the driver's `stop_select` callback. The same form fires it on an
+    /// event this port never armed, which is the C's "unknown fd" fast track
+    /// (`erl_check_io.c:1030-1040`). The cancel bit (`ERL_DRV_USE_NO_CALLBACK`) suppresses the
+    /// callback, which is why the C tests the pair rather than `ERL_DRV_USE` alone — and why the
+    /// substituted `no_ready_*_callback` (which deselects with `ERL_DRV_USE_NO_CALLBACK`,
+    /// `io.c:7522`/`7534`) never re-enters `stop_select`.
+    ///
+    /// The C stores the same obligation on its per-fd event state (`ERTS_EV_FLAG_USED`,
+    /// `erl_check_io.c:86`) and keeps a plain deselect from removing the fd from the poll set while
+    /// that flag is set (`erl_check_io.c:1111`/`1123`/`1170`). The flag is read off the request that
+    /// carries it here instead, because that is the very input the C's callback branch tests and
+    /// `beam_io`'s `DriverContext` has no "registered with no armed direction" state
+    /// ([`Interest`] has no empty value): the difference is poll-set bookkeeping only — never an
+    /// observable change through the driver ABI, and never a wrong `stop_select` decision.
     fn apply_select(
         &mut self,
         ctx: &mut DriverContext<'_>,
         request: SelectRequest,
     ) -> beam_common::Result<()> {
+        // `driver_select(p, e, ERL_DRV_USE, 0)` — the "done with this event" form.
+        let stop_use = request.on == 0
+            && (request.mode & ERL_DRV_USE_NO_CALLBACK) == ERL_DRV_USE;
+        let mode = if stop_use {
+            request.mode | ERL_DRV_READ | ERL_DRV_WRITE
+        } else {
+            request.mode
+        };
         let index = self.selected.iter().position(|s| s.fd == request.fd);
         let current = index.map_or_else(Armed::default, |i| self.selected[i].armed);
-        let next = current.with(request.mode, request.on != 0);
+        let next = current.with(mode, request.on != 0);
         match (index, next.interest()) {
             // Nothing was armed and nothing becomes armed: a no-op (`ERL_DRV_USE` on its own, or a
-            // deselect of a direction this port never held).
-            (None, None) => Ok(()),
-            // Still armed: re-register with the new direction mask.
+            // deselect of a direction this port never held). The C's fast path still runs
+            // `stop_select` for the "done with this event" form.
+            (None, None) => {
+                if stop_use {
+                    self.fire_stop_select(request.fd)?;
+                }
+                Ok(())
+            }
+            // Still armed: re-register with the new direction mask. A direction is left, so the C
+            // never reaches its `ASSERT(state->events == 0)` branch and no `stop_select` runs.
             (Some(i), Some(interest)) => {
                 let token = self.selected[i].token;
                 ctx.reregister(request.fd, token, interest)?;
                 self.selected[i].armed = next;
                 Ok(())
             }
-            // The last direction went away: drop the registration.
+            // The last direction went away: drop the registration, and run the driver's
+            // `stop_select` when this call was the "done with this event" form.
             (Some(i), None) => {
                 let token = self.selected[i].token;
                 ctx.deregister(request.fd, token)?;
                 self.selected.remove(i);
+                if stop_use {
+                    self.fire_stop_select(request.fd)?;
+                }
                 Ok(())
             }
             // A new descriptor.
@@ -1179,6 +1213,38 @@ impl DriverPortAdapter {
                 });
                 Ok(())
             }
+        }
+    }
+
+    /// Runs the driver's `stop_select` for `fd` — the C's `(*drv_ptr->stop_select)(e, NULL)`
+    /// (`erl_check_io.c:1212-1216`), the driver's licence to release the event.
+    ///
+    /// The event handed back is `fd as ErlDrvEvent`, which **is** the value the C passes on: it
+    /// forwards the very `ErlDrvEvent` the driver gave `driver_select`, and this runtime only ever
+    /// accepted one that reduces to an fd ([`DriverPort`]'s `select` refuses anything else with the
+    /// C's `-1`), so rebuilding the pointer from the descriptor is the identical handle — a driver
+    /// that compares the two sees the same event.
+    ///
+    /// An entry with no `stop_select` slot is the C's `no_stop_select_callback`
+    /// (`io.c:7546-7553`, a log line) — a no-op here, the same rule every other absent callback
+    /// follows.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has already been torn down, and [`BeamError::Io`] when
+    /// the callback reports a failure.
+    fn fire_stop_select(&mut self, fd: c_int) -> beam_common::Result<()> {
+        let Some(driver) = self.driver.as_mut() else {
+            return Err(BeamError::BadArg);
+        };
+        let event = fd as isize as ErlDrvEvent;
+        let called = publishing(driver, |library| {
+            library.stop_select(event, std::ptr::null_mut())
+        });
+        match called {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_absent() => Ok(()),
+            Err(error) => Err(driver_call_error(error)),
         }
     }
 

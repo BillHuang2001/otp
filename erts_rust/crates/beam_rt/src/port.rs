@@ -3136,6 +3136,102 @@ mod tests {
         // Handed out exactly once.
         assert!(fx.registry.borrow_mut().take_driver_terms().is_empty());
     }
+    /// A name a driver interned inside a callback lands in the **live** atom table at the port
+    /// boundary — the registry half of the deferred-commit rule.
+    ///
+    /// A driver host cannot mint an atom inline (the live table is borrowed for the whole callback
+    /// and this crate is `#![deny(unsafe_code)]`), so it hands the driver a **predicted** index and
+    /// records the name on its [`driver::DriverAtoms`] handle. [`PortRegistry::commit_driver_atoms`]
+    /// is the only thing that makes that index name anything: without the call the name stays
+    /// unresolvable, which is what the first half pins. The second half pins the drift rule — a
+    /// name whose predicted index something else has already taken is *reported*, never interned at
+    /// a different index (which would make the driver's already-built term name a different atom).
+    #[test]
+    fn a_driver_interned_name_lands_in_the_live_atom_table_at_the_port_boundary() {
+        use beam_abi::DriverHost;
+        // The table is uniquely owned again by the time the commit runs (the host is dropped
+        // below), so `Rc::make_mut` hands the commit the *live* table rather than a copy of it.
+        let mut table = AtomTable::new();
+        let existing = table.intern("existing");
+        let mut atoms = Rc::new(table);
+        let (mut host, meta) = driver_term_host(&atoms, OWNER);
+        let pending = meta.driver_atoms.clone().expect("the pending handle");
+        // A name the table already holds keeps its shared index and is never recorded: only a
+        // *new* name has to land at a predicted one.
+        assert_eq!(host.intern_atom("existing"), Some(make_atom(existing)));
+        assert!(pending.is_empty());
+        // A fresh name is predicted at the table's next index and names nothing yet.
+        let fresh = host
+            .intern_atom("driver_fresh")
+            .expect("interning always answers");
+        let predicted = atom_val(fresh);
+        assert_eq!(predicted, beam_term::Atom::from_raw(atoms.len() as u32));
+        assert_eq!(
+            atoms.lookup("driver_fresh"),
+            None,
+            "unresolvable before the boundary"
+        );
+        // Hand the host away: nothing but this test holds the table now.
+        drop(host);
+        let registry = Rc::new(RefCell::new(PortRegistry::new().expect("a port registry")));
+        let _port = registry
+            .borrow_mut()
+            .register(
+                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+                meta,
+            )
+            .expect("a registered driver port");
+        // The boundary: the port layer lands the predicted name in the live table.
+        let live = Rc::make_mut(&mut atoms);
+        assert_eq!(registry.borrow_mut().commit_driver_atoms(live), Vec::new());
+        assert_eq!(
+            live.name(predicted),
+            Some("driver_fresh"),
+            "the commit must land the name at exactly its predicted index"
+        );
+        assert_eq!(live.lookup("driver_fresh"), Some(predicted));
+        assert_eq!(
+            live.lookup("existing"),
+            Some(existing),
+            "the known name is untouched"
+        );
+        // Landed once: nothing is left in the window, so a second boundary commits nothing.
+        assert!(pending.is_empty());
+        assert_eq!(registry.borrow_mut().commit_driver_atoms(live), Vec::new());
+
+        // The drift half: something else interns between the driver's prediction and the boundary,
+        // so the predicted index is taken by a different name.
+        let mut atoms = Rc::new(AtomTable::new());
+        let (mut host, meta) = driver_term_host(&atoms, OWNER);
+        let pending = meta.driver_atoms.clone().expect("the pending handle");
+        assert!(
+            host.intern_atom("drifted").is_some(),
+            "a new name is always predicted"
+        );
+        drop(host);
+        // The interleaving intern: the table now ends past the prediction.
+        Rc::make_mut(&mut atoms).intern("interleaved");
+        let registry = Rc::new(RefCell::new(PortRegistry::new().expect("a port registry")));
+        let port = registry
+            .borrow_mut()
+            .register(
+                Box::new(RecorderDriver::new("recorder", Rc::new(RefCell::new(Vec::new())))),
+                meta,
+            )
+            .expect("a registered driver port");
+        let live = Rc::make_mut(&mut atoms);
+        assert_eq!(
+            registry.borrow_mut().commit_driver_atoms(live),
+            vec![(port, "drifted".to_string())],
+            "a drifted name is reported, never silently dropped"
+        );
+        assert_eq!(
+            live.lookup("drifted"),
+            None,
+            "a drifted name is never interned at an index that names something else"
+        );
+        assert!(pending.is_empty(), "a dropped name leaves the window");
+    }
 
     /// A driver-emitted term is delivered into its recipient's mailbox by
     /// [`Runtime::deliver_port_messages`]: the term itself (never a `{Port, Term}` wrapper), to the
