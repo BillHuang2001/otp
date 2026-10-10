@@ -1326,8 +1326,9 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::TermNotFound` when the pid is unknown; propagates the
-    /// propagation's allocation and signalling errors.
+    /// Returns `BeamError::TermNotFound` when the pid is unknown. Once the pid **is** live the
+    /// termination completes: a per-peer signalling failure is dropped-and-logged and the cascade
+    /// continues (see [`ProcessTable::terminate_into`]), so this returns `Ok(())` for a live pid.
     pub fn terminate(&mut self, pid: ProcessId, reason: Eterm) -> Result<()> {
         let mut ports: Option<&mut PortTable> = None;
         self.terminate_and_cascade(&mut ports, pid, reason)
@@ -1387,6 +1388,30 @@ impl ProcessTable {
     /// outgoing [`PortWatch`]es then remove their incoming [`PortMonitor`](crate::port::PortMonitor)
     /// entries. The **process-death observer** (see [`ProcessExitObserver`]) is notified exactly
     /// once, here, after the death has been propagated and before `drop(process)`.
+    ///
+    /// # Best-effort propagation (a dying process's termination always completes)
+    ///
+    /// `pid` is reclaimed **first** (the `take` below bumps its slot serial), so by the time the
+    /// per-peer signals are generated the death has *already happened*. Every per-peer step is
+    /// therefore **best-effort**: a failure to queue a local `{'EXIT', …}`/`{'DOWN', …}` (an
+    /// unreachable receiver heap, or a relocation-exempt receiver refusing to grow) or to route a
+    /// remote [`DistSignal::Exit`] is **logged** — never silently swallowed — and the cascade
+    /// **continues** to the remaining peers, so the process-death observer (step 5) and the port
+    /// monitor cleanup (step 6) always run. Aborting mid-cascade instead would leave later peers
+    /// unsignalled, the observer unrun (leaking the host resources it releases, e.g. ETS tables
+    /// owned by the pid) and the port table holding dangling incoming `PortMonitor` entries.
+    ///
+    /// This mirrors what ERTS does with a control signal it cannot deliver: the signal is
+    /// **dropped and logged** (`erts_dsig_drop` / `dist.c` — a down remote node, an unreachable
+    /// peer), never turned into an abort of the death. A watcher's outgoing monitor record is
+    /// resolved regardless of whether its `{'DOWN', …}` reached the wire, because the target is
+    /// gone and a retained record could never be resolved.
+    ///
+    /// # Errors
+    ///
+    /// Always `Ok(())` today: the process is already reclaimed when the cascade starts, so there
+    /// is no remaining table-level failure to report. The `Result` is retained so a genuine
+    /// table-level failure can be surfaced without changing every caller.
     fn terminate_into(
         &mut self,
         ports: &mut Option<&mut PortTable>,
@@ -1434,6 +1459,10 @@ impl ProcessTable {
 
         // 1. Links: drop the back-link, then queue an exit signal on the peer. The peer decides
         //    (through `exit_policy`, at service time) whether it terminates or traps.
+        //
+        //    Best-effort (see the fn docs): a peer whose heap cannot take the reason copy is
+        //    dropped-and-logged and the cascade continues — `pid` is already reclaimed, so the
+        //    remaining peers must still be told.
         for target in links {
             if let Some(peer) = self.get_mut(target) {
                 peer.links_mut().remove(pid);
@@ -1442,7 +1471,17 @@ impl ProcessTable {
                 // The peer died earlier in this same propagation.
                 continue;
             }
-            self.enqueue_exit_signal(target, pid, reason, Some(process.off_heap()))?;
+            if let Err(failure) =
+                self.enqueue_exit_signal(target, pid, reason, Some(process.off_heap()))
+            {
+                beam_common::beam_error!(
+                    "beam_process: dropping exit signal {:?} -> {:?}: {:?}; termination continues",
+                    pid,
+                    target,
+                    failure
+                );
+                continue;
+            }
             receivers.push(target);
         }
 
@@ -1465,7 +1504,7 @@ impl ProcessTable {
                 continue;
             }
             let tag = self.tags.get(&watcher.reference).copied();
-            self.enqueue_down_signal(
+            let queued = match self.enqueue_down_signal(
                 watcher.watcher,
                 watcher.reference,
                 pid,
@@ -1473,12 +1512,32 @@ impl ProcessTable {
                 tag,
                 reason,
                 Some(process.off_heap()),
-            )?;
+            ) {
+                Ok(()) => true,
+                Err(failure) => {
+                    // Best-effort (see the fn docs): the watcher's heap could not take the DOWN.
+                    // Log and carry on — the target is dead either way, so the outgoing record is
+                    // still resolved below (it could never be resolved afterwards), and the named
+                    // monitor's `{Name, node}` descriptor goes with it: nothing will ever
+                    // materialise the DOWN that would have consumed it.
+                    beam_common::beam_error!(
+                        "beam_process: dropping DOWN signal {:?} -> {:?}: {:?}; termination \
+                         continues",
+                        pid,
+                        watcher.watcher,
+                        failure
+                    );
+                    self.named_monitors.remove(&watcher.reference);
+                    false
+                }
+            };
             forget_tag(&mut self.tags, watcher.reference);
             if let Some(watcher_process) = self.get_mut(watcher.watcher) {
                 watcher_process.monitors_mut().remove(watcher.reference);
             }
-            receivers.push(watcher.watcher);
+            if queued {
+                receivers.push(watcher.watcher);
+            }
         }
 
         // 3. The dying process's own outgoing monitors vanish with it — and so do the
@@ -1500,17 +1559,30 @@ impl ProcessTable {
         //    `drop(process)` because `reason` may live in the dying heap the router reads. A
         //    link partner's death is the **link** exit, so it routes `DistSignal::Exit`
         //    (`DOP_EXIT`) — never `DistSignal::Exit2` (`erlang:exit/2`'s `DOP_EXIT2`).
+        //
+        //    Best-effort (see the fn docs): a router transport failure (a down remote node, an
+        //    I/O error) drops-and-logs that signal — exactly ERTS's `erts_dsig_drop` — and the
+        //    remaining partners are still routed; the death must not abort on a peer that cannot
+        //    be reached. `remote_links` was already drained, so no record is left behind.
         for remote in self.remote_links.remove(&pid).unwrap_or_default() {
-            self.route(DistSignal::Exit {
+            if let Err(failure) = self.route(DistSignal::Exit {
                 from: pid,
                 to: remote,
                 reason,
-            })?;
+            }) {
+                beam_common::beam_error!(
+                    "beam_process: dropping remote exit signal {:?} -> {:?}: {:?}; termination \
+                     continues",
+                    pid,
+                    remote,
+                    failure
+                );
+            }
         }
+
         // Outgoing *remote* monitors die with the watcher: the remote node will simply
         // never see a `DOP_DEMONITOR_P`, which mirrors the local case above.
         self.remote_monitors.remove(&pid);
-
         // 5. Notify the process-death observer exactly once, now that the death has been
         //    propagated and *before* `drop(process)`: `reason` may live in the dying heap, so the
         //    payload is only valid up to the drop below. The observer is isolated (a panic is
@@ -1523,14 +1595,24 @@ impl ProcessTable {
         //    (`erlang:port_info(Port, monitors)` would still list the dead pid). With no port
         //    table in hand this is skipped (the observer still saw the watches). A port that has
         //    already closed has drained its side, so an unallocated id is not an error.
+        //
+        //    Best-effort per watch (see the fn docs): one watch that cannot be cleaned must not
+        //    leave the remaining watches dangling.
         if let Some(ports) = ports.as_deref_mut() {
             for watch in &port_monitors {
                 if ports.contains(watch.port) {
-                    ports.demonitor(watch.port, watch.reference)?;
+                    if let Err(failure) = ports.demonitor(watch.port, watch.reference) {
+                        beam_common::beam_error!(
+                            "beam_process: port-monitor cleanup for {:?} on port {:?} failed: \
+                             {:?}; termination continues",
+                            pid,
+                            watch.port,
+                            failure
+                        );
+                    }
                 }
             }
         }
-
         // Every copy that read `reason` from the dying heap is done — release it.
         drop(process);
 

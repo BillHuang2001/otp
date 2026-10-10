@@ -199,6 +199,21 @@ SMP pool:
     `demonitor(Ref, [flush])` removing a queued DOWN for a **pid** target. Every oracle expression is
     synchronized on a message (no sleeps); variable names are kept distinct per receive in the `-eval`
     text so no earlier binding is silently re-used as a pattern.
+32. `terminate_best_effort.rs` (2 tests) — the **best-effort termination cascade** of
+    `ProcessTable::terminate`/`terminate_with_ports`: a dying process is reclaimed *first*, so a
+    per-peer signalling failure is dropped-and-logged (ERTS's `erts_dsig_drop`) and the cascade
+    continues, letting the process-death observer and the port-monitor cleanup always run. Two
+    failures are forced, each hitting a different step: a `DistSignalRouter` whose transport always
+    fails (`Err(BeamError::Io(NotConnected))`) despite which the routing is **attempted once per
+    remote link partner** — asserting the second partner was still routed after the first failed —
+    and a relocation-exempt link peer whose bounded nursery refuses the exit-reason copy (raw
+    `Alloc`), after which the *next* link partner is still signalled. In both cases `terminate`
+    returns `Ok`, the observer fired **exactly once**, the local watcher still got its
+    `{'DOWN', …}`, and the dead watcher's incoming `PortMonitor` is gone. **Discriminating by
+    construction: both tests FAIL (a typed `Io` / `Alloc` out of `terminate`, observer unrun, port
+    monitor still listed) the moment the per-peer `?`-propagation is restored.** Deterministic —
+    the refusal size is the exempt peer's own bounded nursery capacity + 1 word, no sleeps /
+    wall-clock bounds / oracle.
 
 ## Constraints
 - **Anti-flakiness (BINDING).** Every assertion is forced by **synchronization**, never a bare
@@ -218,7 +233,7 @@ SMP pool:
 - Run the whole crate gate with
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_process` (never `cd`,
   sandbox `$HOME` is read-only). Cross-checks against the real system ERTS belong to the sibling
-  `../../../tools/differential/` harness, not here. Current: **411 passed, 0 failed, 1 ignored**.
+  `../../../tools/differential/` harness, not here. Current: **413 passed, 0 failed, 1 ignored**.
 
 ## Routing Table
 - `scheduler.rs`, `messaging.rs`, `signals.rs`, `gc.rs`, `priority.rs`, `pending_signals.rs`,
@@ -237,6 +252,9 @@ SMP pool:
   `heap_and_mailbox_mut` + `send_fragmented`)
 - `process_exit_observer.rs`, `port_monitor_cleanup.rs` → the process-death observer seam and the
   death-side port-monitor cleanup
+- `terminate_best_effort.rs` → the best-effort termination cascade (a failing `DistSignalRouter` /
+  an unreachable peer heap must not abort the death; the observer and the port-monitor cleanup still
+  run)
 - `dict_oracle.rs`, `registry_monitors.rs`, `monitor_tag.rs`, `lifecycle_oracle.rs`,
   `port_monitor_cleanup.rs` (oracle tests) →
   `erl`-cross-checked process-dictionary, process-control, lifecycle and port-monitor evidence (loud skip
