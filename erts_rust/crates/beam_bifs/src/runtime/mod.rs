@@ -34,9 +34,9 @@ use crate::registry::BifRegistry;
 
 pub(crate) mod atomics;
 pub(crate) mod ddll;
-mod erlang;
-mod erts_debug;
-mod erts_internal;
+pub(crate) mod erlang;
+pub(crate) mod erts_debug;
+pub(crate) mod erts_internal;
 mod memory;
 mod other;
 
@@ -107,9 +107,11 @@ mod tests {
     }
 
     /// The per-family key counts this module's `CONTEXT.md` states, pinned against the
-    /// actual registrations: `77 + 56 + 18 + 44 = 195` `RuntimeHooks` seam keys, plus the
-    /// 2 `MemoryHook` (`erlang:memory/0,1`), 13 `atomics`/`counters` and 1 `ddll` real keys
-    /// — **211** registered under `runtime/`. A family that drifts must update the doc.
+    /// actual registrations: `77 + 56 + 18 + 44 = 195` keys registered across the four
+    /// `runtime_bif!` families, of which **188** forward to the `RuntimeHooks` seam (the
+    /// other seven are the families' real `REAL_BIFS`), plus the 2 `MemoryHook`
+    /// (`erlang:memory/0,1`), 13 `atomics`/`counters` and 1 `ddll` real keys — **211**
+    /// registered under `runtime/`. A family that drifts must update the doc.
     #[test]
     fn the_family_key_counts_are_pinned() {
         fn count(register: fn(&mut BifRegistry)) -> usize {
@@ -129,10 +131,22 @@ mod tests {
         assert_eq!(count(super::atomics::register), 13, "runtime/atomics.rs");
         assert_eq!(count(super::ddll::register), 1, "runtime/ddll.rs");
 
-        let seam = 77 + 56 + 18 + 44;
-        assert_eq!(seam, 195, "the RuntimeHooks seam roster");
+        let family = 77 + 56 + 18 + 44;
+        assert_eq!(family, 195, "the four runtime_bif! families' registered keys");
+        // The subset of those keys that really forwards to the `RuntimeHooks` seam is
+        // `family` minus every family's real `REAL_BIFS`; it must equal the authoritative
+        // `crate::hook_sets::RUNTIME_HOOKS_BIFS` roster.
+        let seam = family
+            - super::erlang::REAL_BIFS.len()
+            - super::erts_debug::REAL_BIFS.len()
+            - super::erts_internal::REAL_BIFS.len();
+        assert_eq!(
+            seam,
+            crate::hook_sets::RUNTIME_HOOKS_BIFS.len(),
+            "the family keys that forward to the RuntimeHooks seam"
+        );
         let mut all = BifRegistry::new();
         super::register(&mut all);
-        assert_eq!(all.len(), seam + 2 + 13 + 1, "211 runtime-coupled keys");
+        assert_eq!(all.len(), family + 2 + 13 + 1, "211 runtime-coupled keys");
     }
 }
