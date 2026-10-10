@@ -401,6 +401,14 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   `beam_message::Message::with_payload` (`../../beam_message/src/message.rs:115`), which replaces the payload while carrying
   `from`/`token`/`off_heap`/`binaries`/`nodes`/`fragments`; the lossy path is `Message::new(...)` + re-applying the builders.
   No test covers a message carrying off-heap ownership across a collection (`tests/gc.rs` roots only immediate/cons/tuple payloads).
+- **`Message::from` is not a GC root, yet a named-monitor `'DOWN'` stores an on-heap term in it (un-relocated young-heap root).**
+  `Process::run_rooted_collection` gathers only each queued message's `payload` (`src/process.rs:939`) and its rebuild copies
+  `message.from()` verbatim (`:963`), so `from` is **never** relocated. The ordinary send path stores an internal-pid immediate
+  (relocation-free), but `ProcessTable`'s named-monitor DOWN enqueues `Message::new(term, target_term)` where `target_term` is the
+  on-heap `{Name, node}` tuple (`src/ptab.rs:1902-1919`) — so after a collection that message's `from` is a stale young-heap pointer
+  (the copy inside `payload` is relocated, the `from` copy is not). Reachable via `erlang:monitor(process, Name)` on a named target
+  plus a later GC; not on the `format_exception` path (no monitor). `Process::exit_reason` (`:291`) is likewise not gathered, but it is
+  set only in `terminate_into` (`src/ptab.rs:1447`) immediately before the PCB is dropped, so no collection runs after it.
 - **The `noproc` DOWN is delivered eagerly (documented deviation).** `monitor/2` on a non-live target
   materialises `{'DOWN', Ref, process, Target, noproc}` straight into the watcher's mailbox, so
   `process_info(self(), message_queue_len)` reports 1 immediately after the call where the oracle reports
