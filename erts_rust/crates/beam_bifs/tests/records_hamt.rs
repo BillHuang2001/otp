@@ -193,15 +193,13 @@ fn structured_reason(result: Result<Eterm>) -> Eterm {
     }
 }
 
-/// The second element of the `{{Module,Name}, Key}` payload of a `badfield` reason.
+/// The `Key` of the `{{Module,Name}, Key}` payload of a `badfield` reason.
 ///
-/// Read as the reason tuple's **last** element, so it is independent of how deeply
-/// the `{Module,Name}` identifier nests (the oracle's `{badfield,{{m,r},k}}` and
-/// this crate's `{badfield,{m,r},k}` both put the key last — see the divergence
-/// note on [`a_hash_map_update_with_a_bad_key_reports_the_lowest_index_offender`]).
+/// The crate raises the oracle's nested 2-tuple `{badfield,{{Module,Name},Key}}`, so
+/// the key is element 1 of the reason's element 1.
 fn badfield_key(reason: Eterm) -> Eterm {
-    let arity = beam_codec::term::tuple_arity(reason).expect("a tuple");
-    beam_codec::term::tuple_element(reason, arity - 1).expect("the key")
+    let pair = beam_codec::term::tuple_element(reason, 1).expect("the {{M,N},K} pair");
+    beam_codec::term::tuple_element(pair, 1).expect("the key")
 }
 
 /// The `[*_I …]` Erlang **source** for a list of `n` atoms named `{prefix}{I}`, plus
@@ -427,17 +425,20 @@ fn a_hash_map_update_with_a_bad_key_reports_the_lowest_index_offender() {
         4,
         &[rec, underscore, underscore, bad_map],
     ));
-    // NOTE — reason *shape* divergence: the oracle raises `{badfield,{{m,r},g1}}`
-    // (the `{Module,Name}` identifier nested inside a 2-tuple with the key), while
-    // this crate's `error::structured_error` flattens it into a 3-tuple
-    // `{badfield,{m,r},g1}`. That is a **pre-existing, documented** divergence of
-    // the flat-map path too (`tools/differential/src/corpus/records.rs`, "Honest
-    // coverage"), out of this task's scope; the point pinned here is that the HAMT
-    // path produces *exactly the flat path's* reason, key and all.
-    assert_eq!(beam_codec::term::tuple_arity(reason).expect("a tuple"), 3);
+    // The reason is the oracle's nested 2-tuple `{badfield,{{m,r},g1}}`: the
+    // `{Module,Name}` identifier nests inside a 2-tuple with the key, so the whole
+    // reason has arity 2. Both the HAMT path and the flat-map path produce exactly
+    // this shape (`tools/differential/src/corpus/records.rs`).
+    assert_eq!(beam_codec::term::tuple_arity(reason).expect("a tuple"), 2);
     let tag = beam_codec::term::tuple_element(reason, 0).expect("tag");
     assert_eq!(atoms.name(beam_term::atom_val(tag)).as_deref(), Some("badfield"));
-    let identifier = beam_codec::term::tuple_element(reason, 1).expect("id");
+    let pair = beam_codec::term::tuple_element(reason, 1).expect("the {{M,N},K} pair");
+    assert_eq!(
+        beam_codec::term::tuple_arity(pair).expect("a tuple"),
+        2,
+        "the payload is the pair of the module/name identifier and the key"
+    );
+    let identifier = beam_codec::term::tuple_element(pair, 0).expect("the {M,N} identifier");
     assert_eq!(
         beam_term::atom_val(
             beam_codec::term::tuple_element(identifier, 0).expect("module")
@@ -564,8 +565,8 @@ fn the_live_oracle_agrees_on_the_hamt_corpus() {
     );
 
     // The reported bad key: the oracle names the record's own `f*`-less `g1`; the
-    // crate must report the same key (extracted shape-independently — see the
-    // divergence note on the key test above).
+    // crate must report the same key out of the same nested
+    // `{badfield,{{m,r},g1}}` reason shape.
     let bad_src = pair_list_src("g", FIELD_COUNT, |i| i as i64);
     let bad_statement = format!(
         "begin \

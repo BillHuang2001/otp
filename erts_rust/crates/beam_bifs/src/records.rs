@@ -102,9 +102,14 @@ fn definition_or_badrecord(ctx: &mut BifContext<'_>, term: Eterm) -> Result<Eter
 /// try records:update(R,m,r,#{zz=>9}) catch C:E -> io:format("~p:~p~n",[C,E]) end,
 /// halt().'` ⇒ `error:{badfield,{{m,r},zz}}` (with the record's own module/name, even
 /// when the caller passed the `'_'` wildcard).
+///
+/// The reason is a **2-tuple** whose single element is the `{{Module, Name}, Key}`
+/// pair, not a flat 3-tuple: the `{Module, Name}` identifier is nested one level
+/// deeper, exactly as the C builds it (`erl_record.c`).
 fn badfield(ctx: &mut BifContext<'_>, module: Eterm, name: Eterm, key: Eterm) -> Result<BeamError> {
     let identifier = ctx.tuple(&[module, name])?;
-    error::structured_error(ctx, "badfield", &[identifier, key])
+    let pair = ctx.tuple(&[identifier, key])?;
+    error::structured_error(ctx, "badfield", &[pair])
 }
 
 /// `records:get/2` (`records_get_2`, `erl_record.c:1247-1274`): a native record
@@ -845,11 +850,12 @@ mod tests {
             let non_atom_key = ctx.list(&[non_atom_pair]).unwrap();
             let good_opts = opts(ctx, false);
             let identifier = ctx.tuple(&[module, name]).unwrap();
+            let pair = ctx.tuple(&[identifier, one]).unwrap();
             assert_structured(
                 create(ctx, &[module, name, non_atom_key, good_opts]),
                 ctx,
                 "badfield",
-                &[identifier, one],
+                &[pair],
             );
             // A duplicate key: badarg.
             let dup_a = ctx.tuple(&[key_a, one]).unwrap();
@@ -951,11 +957,36 @@ mod tests {
             //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},zz}}
             let bad_key = updates(ctx, "other", 9);
             let identifier = ctx.tuple(&[module, name]).unwrap();
+            let pair_other = ctx.tuple(&[identifier, other]).unwrap();
             assert_structured(
                 update(ctx, &[rec, module, name, bad_key]),
                 ctx,
                 "badfield",
-                &[identifier, other],
+                &[pair_other],
+            );
+            // A non-atom update key names no field either.
+            //   erl -noshell -eval 'R = records:create(m,r,[{a,1}],#{is_exported=>true}),
+            //     try records:update(R, m, r, #{1=>1}) catch C:T ->
+            //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},1}}
+            let non_atom_update =
+                access::make_flatmap(ctx.heap(), &[(make_small(1), make_small(1))]).expect("fits");
+            let pair_one = ctx.tuple(&[identifier, make_small(1)]).unwrap();
+            assert_structured(
+                update(ctx, &[rec, module, name, non_atom_update]),
+                ctx,
+                "badfield",
+                &[pair_one],
+            );
+            // The `'_'` wildcard still reports the RECORD's own module/name.
+            //   erl -noshell -eval 'R = records:create(m,r,[{a,1}],#{is_exported=>true}),
+            //     try records:update(R, '"'"'_'"'"', '"'"'_'"'"', #{other=>9}) catch C:T ->
+            //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},other}}
+            let underscore = atom_of(ctx, "_");
+            assert_structured(
+                update(ctx, &[rec, underscore, underscore, bad_key]),
+                ctx,
+                "badfield",
+                &[pair_other],
             );
         });
     }
