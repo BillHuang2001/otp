@@ -82,7 +82,8 @@ MODULES= \
 	z_SUITE \
 	zlc_SUITE \
 	test_lib \
-        erl_md5
+        erl_md5 \
+	stage2_bench
 
 NO_BOOL_OPT= \
 	guard \
