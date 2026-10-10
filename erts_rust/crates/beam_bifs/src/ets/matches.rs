@@ -222,8 +222,15 @@ fn select_delete_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `badarg` (verified against OTP 29 / erts-17.1), and [`compile`] rejects the ref
 /// thing for the same reason it rejects any non-list spec. A `bag` table is
 /// `badarg` before the spec or the contents are looked at
-/// (`beam_ets::Table::select_replace`); a replacement that does not keep the
-/// matched object's key makes the whole call `badarg` with the table unchanged.
+/// (`beam_ets::Table::select_replace`).
+///
+/// The spec's body must be a shape that provably keeps the matched object's key —
+/// the oracle's static `db_match_keeps_key` check (`../../erts/emulator/beam/erl_db_util.c:1422`),
+/// applied **before** the table is traversed. A rejected body therefore makes the
+/// whole call `badarg` with the table unchanged *even when the spec matches
+/// nothing*; a valid body on a never-matching spec replaces 0 objects, and that is
+/// the oracle's count `0` (verified: `[{{z},[],[{{z}}]}]` on a `set` is `0`, while
+/// `[{{z},[],[true]}]` is `badarg`). `beam_ets` owns the check.
 fn select_replace_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = resolve::resolve_handle(ctx, args[0])?;
     let spec = compile(args[1], ctx.atoms())?;
@@ -368,10 +375,37 @@ mod tests {
         ctx.list(&[clause]).expect("fits")
     }
 
-    /// `[{{z}, [], [true]}]` — a spec whose head matches no 2-tuple object **and**
-    /// whose body (`true`) cannot keep the object's key, so `ets:select_replace/2`
-    /// rejects the whole call up front.
+    /// `[{{z}, [], [{{z}}]}]` — a **valid** `ets:select_replace/2` spec that
+    /// matches no 2-tuple object.
+    ///
+    /// The head is the 1-tuple `{z}`, which cannot match a `{Key, Value}` object,
+    /// and the body is the construction form `{{z}}` (it builds the 1-tuple `{z}`),
+    /// whose keypos-1 element `z` is provably the head's key. That is exactly the
+    /// shape the oracle's static `db_match_keeps_key` check accepts
+    /// (`../../erts/emulator/beam/erl_db_util.c:1422`), so the whole call is a
+    /// successful replacement of 0 objects.
     fn no_match_spec(ctx: &mut BifContext<'_>) -> Eterm {
+        let z = ctx.atom("z").expect("seeded");
+        // `{z}` — the head, a 1-tuple no 2-tuple object can match.
+        let head = ctx.tuple(&[z]).expect("fits");
+        let guards = ctx.list(&[]).expect("fits");
+        // The `{{ … }}` construction form: a 1-tuple holding the tuple to build —
+        // `{{z}}` constructs `{z}`, keeping the head's key `z`.
+        let constructed = ctx.tuple(&[z]).expect("fits");
+        let body_item = ctx.tuple(&[constructed]).expect("fits");
+        let body = ctx.list(&[body_item]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+
+    /// `[{{z}, [], [true]}]` — a spec whose head matches no 2-tuple object but whose
+    /// body (`[true]`) is **not** a key-keeping construction.
+    ///
+    /// The oracle validates the body's *shape* up front (`db_match_keeps_key`, the
+    /// spec's `on_match_validation`), so `ets:select_replace/2` rejects the whole call
+    /// with `badarg` **even though the head matches nothing** (verified: on a `set`
+    /// the oracle raises `badarg` here rather than returning 0).
+    fn rejected_body_spec(ctx: &mut BifContext<'_>) -> Eterm {
         let z = ctx.atom("z").expect("seeded");
         let head = ctx.tuple(&[z]).expect("fits");
         let guards = ctx.list(&[]).expect("fits");
@@ -551,21 +585,28 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert!(beam_term::compare::eq(stored[0], b_b, &atoms));
 
-        // A body that cannot be proven to keep the object's key is `badarg` for
-        // the WHOLE call — even though this spec's head matches nothing. The
-        // oracle validates each clause's body *statically*, before it traverses
-        // anything (C `analyze_pattern` → `db_match_keeps_key`, mirrored by
-        // `beam_ets`' `select::exec::static_keeps_key`). Oracle:
+        // A **valid** key-keeping spec that matches nothing replaces nothing: the
+        // oracle's count is 0 (the head `{z}` cannot match a 2-tuple object and the
+        // `{{z}}` body provably keeps the key, so the static body check passes).
+        let spec = no_match_spec(&mut ctx);
+        let count = select_replace_2(&mut ctx, &[handle, spec]).expect("no match");
+        assert_eq!(signed_value(count), 0);
+
+        // A body that does **not** keep the object's key is `badarg` for the WHOLE
+        // call — even though this spec's head matches nothing. The oracle validates
+        // each clause's body *statically*, before it traverses anything (C
+        // `analyze_pattern` → `db_match_keeps_key`, mirrored by `beam_ets`'
+        // `select::exec::static_keeps_key`). Oracle:
         //   T = ets:new(mytab,[set]), ets:insert(T,[{a,1},{b,2}]),
         //   ets:select_replace(T, [{{z},[],[true]}])  ⇒  {error,badarg}
-        let spec = no_match_spec(&mut ctx);
+        let spec = rejected_body_spec(&mut ctx);
         assert!(matches!(
             select_replace_2(&mut ctx, &[handle, spec]),
             Err(BeamError::BadArg)
         ));
 
-        // A spec that matches nothing replaces nothing — provided its body keeps
-        // the key, so the static check above passes. Oracle:
+        // A never-matching spec with a 2-tuple head and a key-keeping body is a
+        // no-op too. Oracle:
         //   ets:select_replace(T, [{{z,'$1'},[],[{{z,'$1'}}]}])  ⇒  0,
         //   ets:tab2list(T)  ⇒  [{a,1},{b,2}]  (unchanged)
         // Here the table already holds the `{a,b}`/`{b,b}` of the replacement
@@ -608,6 +649,10 @@ mod tests {
         let stored = proper_list(lookup_2(&mut ctx, &[dup, a]).expect("lookup")).expect("list");
         assert_eq!(stored.len(), 1);
         assert!(beam_term::compare::eq(stored[0], a_b, &atoms));
+        // A valid spec that matches nothing counts 0 on a `duplicate_bag` too.
+        let spec = no_match_spec(&mut ctx);
+        let count = select_replace_2(&mut ctx, &[dup, spec]).expect("duplicate_bag no match");
+        assert_eq!(signed_value(count), 0);
 
         // A malformed spec and a non-ref handle are `badarg`.
         let one = ctx.int(1).expect("fits");

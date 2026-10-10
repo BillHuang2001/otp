@@ -528,13 +528,12 @@ shared/oversubscribed host — prefer ratios.
 - **`copy_struct_shared` preflights the *flat* word count.** It is a safe upper bound, so a caller sizes
   the destination heap as for `copy_struct`; the memory saving is in the words written, not in the
   accepted capacity.
-- **The fragment model is adopted only by `beam_rt`, and untested.** `beam_process::deliver` still calls
-  `send` (a payload over its heap ⇒ `AllocKind::Message`); `beam_rt`'s `deliver_message`
-  (`src/context/mod.rs`) catches that, composes `HeapFragment`/`copy_root`/`Fragments` itself (its own
-  `Runtime::send_fragmented_message`) and enqueues a message owning the chain — it does **not** call
-  `beam_message::send_fragmented` because `beam_process::Process` exposes `heap_mut`/`mailbox_mut` as two
-  disjoint `&mut self` borrows with no split. No `beam_rt/tests/*` nor differential case exercises
-  fragmentation, and a received message's `Fragments` are never `move_into`'d.
+- **The fragment path is driven by `beam_rt`, and untested.** `beam_process::deliver` still calls
+  `send` (a payload over its heap ⇒ `AllocKind::Message`); `beam_rt`'s `send_fragmented_message`
+  (`src/context/mod.rs`) catches that and calls `beam_message::send_fragmented` through the split
+  borrow `beam_process::Process::heap_and_mailbox_mut` (`process.rs`), enqueuing a message owning the
+  chain. No `beam_rt/tests/*` nor differential case exercises fragmentation, and a received message's
+  `Fragments` are never `move_into`'d (`beam_rt`'s `MailboxState` retains them instead).
 - **A fragment holds the whole payload; there is no automatic multi-fragment split.** The C streams an
   oversized message across a chain of `new_message_buffer` fragments; here one fragment is sized to the
   whole payload (`fragment_capacity_words.max(size_object(term))`) and the chain is built by the caller

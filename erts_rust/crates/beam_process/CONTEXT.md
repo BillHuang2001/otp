@@ -390,6 +390,14 @@ The rationale (why) behind the frozen API and constraints lives in **`DESIGN_DEC
   signal-vs-message ordering barrier remain follow-ups. The queue itself is unbounded (a `VecDeque`,
   matching the oracle's effectively-unbounded signal queue) with total, defensive GC gather/scatter — it
   has no overflow or panic path.
+- **`Message::from` is not a GC root, yet a named-monitor `'DOWN'` stores an on-heap term in it (un-relocated young-heap root).**
+  `Process::run_rooted_collection` gathers only each queued message's `payload` (`src/process.rs:945`) and re-enqueues every drained
+  envelope around that relocated payload (`:974`), so `from` is **never** relocated. The ordinary send path stores an internal-pid
+  immediate (relocation-free), but `ProcessTable`'s named-monitor DOWN enqueues `Message::new(term, target_term)` where `target_term`
+  is the on-heap `{Name, node}` tuple (`src/ptab.rs:1919`) — so after a collection that message's `from` is a stale young-heap pointer
+  (the copy inside `payload` is relocated, the `from` copy is not). Reachable via `erlang:monitor(process, Name)` on a named target
+  plus a later GC; not on the `format_exception` path (no monitor). `Process::exit_reason` (`:291`) is likewise not gathered, but it is
+  set only in `terminate_into` (`src/ptab.rs:1415`) immediately before the PCB is dropped, so no collection runs after it.
 - **The `noproc` DOWN is delivered eagerly (documented deviation).** `monitor/2` on a non-live target
   materialises `{'DOWN', Ref, process, Target, noproc}` straight into the watcher's mailbox, so
   `process_info(self(), message_queue_len)` reports 1 immediately after the call where the oracle reports

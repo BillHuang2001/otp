@@ -1963,3 +1963,430 @@ fn shared_gap(error: &BeamError, expected: &str) {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// The GC root-set hand-off: every x register and the whole FR file
+// ---------------------------------------------------------------------------------------
+
+/// The integer-only fixture (`tests/fixtures/gc_ints.beam`), used here for one property
+/// only: its code contains **no** float-family instruction, so the module guard
+/// ([`super::gc::module_uses_floats`]) lets a collection run over it. The bytes are never
+/// executed by these cases.
+const GC_INTS_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/gc_ints.beam");
+
+/// The call site's module name — a module the rig has loaded (so [`module_may_be_collected`]
+/// answers `true` from the real code server, not from a stubbed cache).
+///
+/// [`module_may_be_collected`]: super::gc::module_may_be_collected
+const GC_CALL_SITE: &str = "gc_ints";
+
+/// The rig the two root-hand-off cases share: a runtime with the float-free fixture loaded
+/// as the call site, plus a process living in a **caller-supplied** [`ProcessTable`] — the
+/// shape a scheduler slice has ([`RuntimeContext::for_process`]), and the one where a
+/// collection is a legitimate admission point.
+fn gc_root_set_rig() -> (Runtime, ProcessTable, ProcessId) {
+    let mut rt = runtime();
+    rt.load_module(GC_INTS_BEAM)
+        .expect("the float-free fixture loads into the code server");
+    let mut table = ProcessTable::new(beam_process::SignalAtoms::from_table(
+        &mut AtomTable::new(),
+    ));
+    let pid = table.spawn_default().expect("spawn a process");
+    (rt, table, pid)
+}
+
+/// Builds the two terms the root-set hand-off cases need on `pid`'s **own young heap**:
+///
+/// * `beyond` — the term that will sit in `x[1]` while the engine declares only `x[0]`
+///   live (`live = 1`); and
+/// * `fr_only` — the term that will be reachable **only** through the machine's FR file.
+///
+/// Both are two-element tuples of small integers, so their relocation is checked by value
+/// (`{7, 8}` / `{9, 10}`), never by address arithmetic.
+fn gc_root_terms(table: &mut ProcessTable, pid: ProcessId) -> (Eterm, Eterm) {
+    let process = table.get_mut(pid).expect("the spawned process");
+    let heap = process.heap_mut();
+    let beyond = heap
+        .tuple(&[make_small(7), make_small(8)])
+        .expect("the young heap builds {7,8}");
+    let fr_only = heap
+        .tuple(&[make_small(9), make_small(10)])
+        .expect("the young heap builds {9,10}");
+    (beyond, fr_only)
+}
+
+/// Assert `relocated` is `expected`'s tuple **at its new address** — the term really moved
+/// (a copied term never keeps its from-space address) and the copy is intact.
+fn assert_relocated_tuple(relocated: Eterm, stale: Eterm, expected: [i64; 2], what: &str) {
+    assert_ne!(
+        relocated, stale,
+        "{what}: the term was left pointing into the from-space — a collection moved the \
+         heap without relocating it"
+    );
+    assert_eq!(
+        terms::tuple_arity(relocated).unwrap_or_else(|e| panic!("{what}: {e}")),
+        2,
+        "{what}: the relocated word is not the two-element tuple it was"
+    );
+    for (index, value) in expected.iter().enumerate() {
+        assert_eq!(
+            terms::tuple_element(relocated, index).expect("in range"),
+            make_small(*value),
+            "{what}: element {index} of the relocated tuple"
+        );
+    }
+}
+
+/// **The hole-1 regression guard: a collection must root the WHOLE root set.**
+///
+/// The engine's `live` count is only a *hint* — a slot it declares dead at one admission
+/// point can still be read later in the same run — and the FR file holds `Eterm` term slots
+/// at Milestone 1, so a float register is a root like any other. Both are invisible to the
+/// narrow `ensure_heap` door (it receives only an x prefix and the stack), so a collection it
+/// drove would move the heap out from under them.
+///
+/// The case therefore drives the **full-root** admission point
+/// ([`ExecutionContext::ensure_heap_full`]) with `live = 1` while a live term sits in `x[1]`
+/// and a second lives only in `fr[0]`. A forced collection runs; both must come back
+/// relocated (a different word, still the same tuple). A runtime that publishes only
+/// `x[0..live)` and discards the FR file leaves both words stale, which is exactly the
+/// failure this asserts against.
+#[test]
+fn a_admission_point_roots_every_x_register_and_the_whole_fr_file() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    // `x[1]` is a live term the engine declares DEAD (`live = 1`); `fr[0]` is reachable
+    // through the FR file alone. Neither is in the narrow door's published root set.
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the forced collection really ran; {after:?}"
+    );
+    assert_eq!(
+        after.halted, before.halted,
+        "the collection and its scatter completed; {after:?}"
+    );
+
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (beyond the `live` hint)");
+    assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
+}
+
+/// **The same guard for the collecting allocation seam.**
+///
+/// [`ExecutionContext::alloc_words_rooted`] is the engine's term-building admission point:
+/// when the running process's young heap cannot serve `n` raw words it collects over the
+/// handed-in root set and retries. The root set it receives is the machine's whole
+/// [`RootSet`], so the same two roots must survive: an x register beyond the engine's `live`
+/// hint, and a term reachable only through the FR file.
+///
+/// The nursery is filled with garbage first, so the first bump genuinely fails and the
+/// collection is the only way the retry can be served.
+#[test]
+fn a_collecting_allocation_roots_every_x_register_and_the_whole_fr_file() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    // Fill the nursery with unreachable tuples so a 16-word bump cannot be served.
+    {
+        let process = table.get_mut(pid).expect("the spawned process");
+        let filler = [make_small(1)];
+        while process.heap().available() >= 16 {
+            process
+                .heap_mut()
+                .tuple(&filler)
+                .expect("the nursery has room for a two-word tuple");
+        }
+    }
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    let before = rt.gc_stats();
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.alloc_words_rooted(16, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("a rooted allocation");
+    }
+
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the refused bump collected over the handed-in roots; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "{after:?}");
+    assert_eq!(
+        after.fallbacks, before.fallbacks,
+        "the collection emptied the nursery, so the retry was served from the young heap \
+         (no arena fallback); {after:?}"
+    );
+
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (beyond the `live` hint)");
+    assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
+}
+
+// ---------------------------------------------------------------------------------------
+// The GC root-set hand-off, hole 2: a root in a region the collector does not scan
+// ---------------------------------------------------------------------------------------
+
+/// Builds the pooled-BIF-heap shape the `erl_error:format_exception` repro hit: a **cons
+/// cell built on the runtime's pooled BIF heap** (a region the copying collector classifies
+/// as `Target::Foreign` — it leaves the pointer in place and does not follow it) whose `car`
+/// aliases a term on `pid`'s **own young heap**.
+///
+/// Returns `(foreign, child)`:
+///
+/// * `child` — a two-element tuple `{7,8}` on the process's young heap (a term the collector
+///   *would* relocate); and
+/// * `foreign` — the one-element list `[child]` whose cons cell lives in `rt.bif_heaps[0]`.
+///
+/// The list's own address is in neither the young nor the mature space of `pid`, so it is
+/// exactly the root [`super::gc::root_is_unscanned`] must flag. The pool heap lives in the
+/// runtime (index `0` is never popped in these tests), so the cons cell stays valid.
+fn foreign_root_aliasing_a_young_child(
+    rt: &mut Runtime,
+    table: &mut ProcessTable,
+    pid: ProcessId,
+) -> (Eterm, Eterm) {
+    let child = table
+        .get_mut(pid)
+        .expect("the spawned process")
+        .heap_mut()
+        .tuple(&[make_small(7), make_small(8)])
+        .expect("the young heap builds {7,8}");
+    let foreign = rt
+        .bif_heaps
+        .first_mut()
+        .expect("the runtime always owns its pooled BIF heap")
+        .cons(child, NIL)
+        .expect("the pooled BIF heap builds the cons cell");
+    (foreign, child)
+}
+
+/// **The hole-2 regression guard: a collection is DECLINED while a live machine root is a
+/// container in a region the collector does not scan.**
+///
+/// A copying collector relocates exactly the words in its *from* set (here the process's
+/// young space) and classifies every other address as `Target::Foreign`
+/// (`../../beam_gc/src/copy.rs`): it leaves such a pointer where it is **and does not follow
+/// it**, so a young word the foreign container points *at* is neither kept alive by it nor
+/// updated when it moves — the term goes stale.
+///
+/// The `erl_error:format_exception` repro hit exactly this: a registered BIF built its result
+/// on the runtime's pooled BIF heap (`../context/mod.rs`'s `call_registered` heart) and left
+/// it in `x[0]` when the process's minor collection ran. This case reproduces the shape
+/// directly at the admission point: `x[0]` holds a cons cell built on `rt.bif_heaps[0]` whose
+/// `car` is a young `{7,8}`, and a **forced** collection asks the runtime to move that heap.
+///
+/// The fix declines the move: `gc_stats().collections` must **not** advance, the forced
+/// request must stay armed (it is consumed only by a collection that is committed to), and
+/// the root must remain the valid `[child]` list — its `car` still reads back the intact
+/// `{7,8}` from the young heap it aliases. Without the valve the collection runs and the
+/// `collections` assertion is the one that fires.
+#[test]
+fn a_collection_is_declined_when_a_live_root_lives_in_an_unscanned_region() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (foreign, _child) = foreign_root_aliasing_a_young_child(&mut rt, &mut table, pid);
+
+    // The predicate on its own: the cons cell's address is in no region this process's
+    // collector scans (neither the young space nor the mature space).
+    {
+        let process = table.get(pid).expect("the spawned process");
+        assert!(
+            super::gc::root_is_unscanned(process, foreign),
+            "a cons cell built on the pooled BIF heap is not a young/mature-heap pointer, so \
+             the root is unscanned"
+        );
+        assert!(
+            super::gc::any_root_is_unscanned(process, [foreign].iter()),
+            "`any_root_is_unscanned` must agree with the single-term predicate"
+        );
+    }
+
+    let mut x = [foreign, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+
+    // The decline: the forced collection was NOT run.
+    assert_eq!(
+        after.collections, before.collections,
+        "the collection must be declined while a live root is a container in an unscanned \
+         region — it would relocate this heap's young words out from under that root; {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "nothing failed; {after:?}");
+    assert!(
+        rt.gc_request_pending(pid),
+        "a declined collection must leave the forced request armed for the runner's park arm"
+    );
+
+    // The heap kept its terms, so the root is still the valid `[child]` list and its `car`
+    // still reads the intact young `{7,8}` it aliases.
+    assert_eq!(
+        x[0], foreign,
+        "the declined collection moved nothing, so the root word is unchanged"
+    );
+    assert!(
+        beam_term::compare::eq(x[0], foreign, rt.atoms()),
+        "the root is structurally the same list after the decline"
+    );
+    let head = terms::cons_head(x[0]).expect("the root is a cons cell");
+    assert!(
+        beam_term::compare::eq(terms::cons_tail(x[0]).expect("a cons cell"), NIL, rt.atoms()),
+        "the root is exactly the one-element list `[child]`"
+    );
+    assert_eq!(
+        terms::tuple_arity(head).expect("the `car` is a tuple"),
+        2,
+        "the aliased young child is still the two-element tuple"
+    );
+    assert_eq!(
+        terms::tuple_element(head, 0).expect("in range"),
+        make_small(7),
+        "element 0 of the aliased child survived the declined collection"
+    );
+    assert_eq!(
+        terms::tuple_element(head, 1).expect("in range"),
+        make_small(8),
+        "element 1 of the aliased child survived the declined collection"
+    );
+}
+
+/// **The valve's non-firing guard: an ordinary young-only root set is never declined.**
+///
+/// A root set made only of immediates and pointers into the process's **own young heap** is
+/// fully scanned, so the valve must not fire: `any_root_is_unscanned` is `false` and the
+/// forced admission-point collection really runs and relocates both terms (the x register
+/// beyond the engine's `live` hint *and* the FR-only term). This is the guard against the
+/// valve over-firing and quietly disabling collection for every ordinary workload.
+#[test]
+fn an_ordinary_young_only_root_set_is_never_declined() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (beyond, fr_only) = gc_root_terms(&mut table, pid);
+
+    let mut x = [make_small(0), beyond, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [fr_only];
+
+    {
+        let process = table.get(pid).expect("the spawned process");
+        assert!(
+            !super::gc::any_root_is_unscanned(process, x.iter().chain(stack.iter()).chain(fr.iter())),
+            "immediates and own-young-heap pointers are all in scanned regions, so no root \
+             may be reported as unscanned"
+        );
+    }
+
+    let before = rt.gc_stats();
+    rt.request_gc(pid);
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        ctx.ensure_heap_full(0, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the heap-admission point never fails the program");
+    }
+    let after = rt.gc_stats();
+    assert_eq!(
+        after.collections,
+        before.collections + 1,
+        "the valve must not fire for a young-only root set: the forced collection really ran; \
+         {after:?}"
+    );
+    assert_eq!(after.halted, before.halted, "{after:?}");
+
+    assert_relocated_tuple(x[1], beyond, [7, 8], "x[1] (beyond the `live` hint)");
+    assert_relocated_tuple(fr[0], fr_only, [9, 10], "fr[0] (reachable only through the FR file)");
+}
+
+/// **The same guard on the collecting allocation seam.**
+///
+/// [`ExecutionContext::alloc_words_rooted`] is the second site the fix reconciles: when the
+/// running process's young bump fails it collects over the handed-in root set — but a root in
+/// an unscanned region makes that move unsound, so the valve must decline the collection and
+/// take the pointer-stable arena fallback instead (`Runtime::gc_stats().fallbacks` advances,
+/// `collections` does not). The nursery is filled with garbage first, so the bump genuinely
+/// fails and the collection is the only way the retry could be served.
+#[test]
+fn a_rooted_allocation_is_declined_when_a_live_root_lives_in_an_unscanned_region() {
+    let (mut rt, mut table, pid) = gc_root_set_rig();
+    let (foreign, _child) = foreign_root_aliasing_a_young_child(&mut rt, &mut table, pid);
+
+    // Fill the nursery with unreachable tuples so a 16-word bump cannot be served.
+    {
+        let process = table.get_mut(pid).expect("the spawned process");
+        let filler = [make_small(1)];
+        while process.heap().available() >= 16 {
+            process
+                .heap_mut()
+                .tuple(&filler)
+                .expect("the nursery has room for a two-word tuple");
+        }
+    }
+
+    let mut x = [foreign, NIL, NIL, NIL];
+    let mut stack = [NIL];
+    let mut fr = [NIL];
+
+    let before = rt.gc_stats();
+    {
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        ctx.current_module = Some(GC_CALL_SITE.to_string());
+        ctx.arm_gc();
+        let block = ctx
+            .alloc_words_rooted(16, RootSet::new(&mut x, &mut stack, &mut fr, 1))
+            .expect("the declined collection falls back to the arena, which never errors");
+        assert!(!block.is_null(), "a block was really handed out");
+    }
+    let after = rt.gc_stats();
+
+    assert_eq!(
+        after.collections, before.collections,
+        "the refused bump must NOT collect over a root set holding a container in an unscanned \
+         region; {after:?}"
+    );
+    assert_eq!(
+        after.fallbacks,
+        before.fallbacks + 1,
+        "the declined collection takes the pointer-stable arena fallback; {after:?}"
+    );
+    assert_eq!(
+        x[0], foreign,
+        "the arena fallback moved nothing, so the unscanned root is unchanged"
+    );
+    let head = terms::cons_head(x[0]).expect("the root is still the cons cell");
+    assert_eq!(
+        terms::tuple_element(head, 0).expect("in range"),
+        make_small(7),
+        "the aliased young child is still intact"
+    );
+}

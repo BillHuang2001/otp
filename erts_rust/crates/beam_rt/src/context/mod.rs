@@ -428,18 +428,21 @@ impl<'a> RuntimeContext<'a> {
     /// collection ([`Process::deliver`](beam_process::Process::deliver)'s exit cascade, which —
     /// unlike the in-slice admission point — is **not** gated by
     /// [`gc_process_enabled`](Runtime::gc_process_enabled)) rewrites the process's `regs` in
-    /// place, so the machine's own `x`/`stack` point into the abandoned space. The process's
-    /// root set is the truth a resume must run from, so this copies it back into the machine.
-    /// If their slice lengths no longer match, the process's collection is halted rather than
-    /// run against inconsistent roots ([`crate::context::gc`] documents the hand-off).
+    /// place, so the machine's own `x`/`stack`/`fr` point into the abandoned space. The
+    /// process's root set is the truth a resume must run from, so this copies it back into the
+    /// machine — all three containers
+    /// ([`gc::scatter_roots_full`](crate::context::gc::scatter_roots_full), the FR file
+    /// included). If their slice lengths no longer match, the process's collection is halted
+    /// rather than run against inconsistent roots ([`crate::context::gc`] documents the
+    /// hand-off).
     ///
     /// A `pid` with no process reconciles nothing: the runner only calls this for a parked pid
     /// whose process it owns.
     pub(crate) fn resync_parked_roots(&mut self, pid: ProcessId, machine: &mut Machine) {
         let reconciled = match self.process_table().get(pid) {
             Some(process) => machine.with_roots(RootSet::ALL_LIVE, |roots| {
-                let live = roots.live_len();
-                gc::scatter_roots(process, live, roots.x, roots.stack)
+                let mut roots = roots;
+                gc::scatter_roots_full(process, &mut roots)
             }),
             None => true,
         };
@@ -2032,6 +2035,20 @@ impl ExecutionContext for RuntimeContext<'_> {
         gc::ensure_heap(self, heap_need, live, x_regs, stack, armed)
     }
 
+    /// Ensures `heap_need` words are available with the machine's **whole live root set**
+    /// handed in, collecting over all of it (see [`crate::context::gc`]).
+    ///
+    /// This is the primary admission point: `test_heap`/`allocate_heap` reach it through
+    /// [`Machine::ensure_heap`](beam_engine::Machine), so a collection here sees **every** x
+    /// register, the whole Erlang stack **and the whole FR file** — not just the x prefix the
+    /// engine declared live. The [`gc_armed`](Self::gc_armed) latch is
+    /// [`take`](std::mem::take)n exactly as in [`ensure_heap`](Self::ensure_heap), so only the
+    /// admission point the slice's own [`BudgetContext`](crate::runner) armed can collect.
+    fn ensure_heap_full(&mut self, heap_need: u32, roots: RootSet<'_>) -> Result<()> {
+        let armed = std::mem::take(&mut self.gc_armed);
+        gc::ensure_heap_full(self, heap_need, roots, armed)
+    }
+
     /// Heap words still available (see [`RuntimeContext::heap_available`]).
     fn heap_available(&self) -> usize {
         gc::heap_available(self)
@@ -2042,6 +2059,18 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// [`crate::context::gc`]).
     fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
         gc::alloc_words(self, n)
+    }
+
+    /// Allocates `n` raw heap words with the machine's **whole live root set** handed in, so a
+    /// slice whose young heap cannot serve the request collects over those roots and retries
+    /// (see [`crate::context::gc`]).
+    ///
+    /// The [`gc_armed`](Self::gc_armed) latch is [`take`](std::mem::take)n here too, so a
+    /// nested machine ([`Self::run_export`], a fun a BIF applied, the evaluator) behaves
+    /// exactly like [`alloc_words`](Self::alloc_words) and never collects.
+    fn alloc_words_rooted(&mut self, n: usize, roots: RootSet<'_>) -> Result<*mut Eterm> {
+        let armed = std::mem::take(&mut self.gc_armed);
+        gc::alloc_words_rooted(self, n, roots, armed)
     }
 
     /// Applies a fun/closure value.
