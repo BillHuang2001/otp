@@ -67,8 +67,7 @@ Caller liveness: `driver_monitor_process`/`driver_demonitor_process` on async co
 
 ## Known Issues / Gotchas
 - The `dummy_tcp_driver_entry`/`dummy_udp_driver_entry`/`dummy_sctp_driver_entry` structs (`inet_drv.c:2196/2212/2229`, win32-only `#ifdef __WIN32__`) are defined but never referenced or `add_driver_entry`'d anywhere in the tree — they are dead code, not a runtime fallback.
-- `ram_file_drv.c`'s `#ifdef LOADABLE` block (`:147`-`:166`, `driver_init`/`rfile_finish`) is dead: the driver is static-only.
-- `ram_file_drv.c`'s `rfile_command` (`:397`) silently ignores unknown opcodes ("let the caller hang", `:531`) — no reply is sent, which is expected by `ram_file.erl` for unsupported ops.
+- `ram_file_drv.c`'s `rfile_command` (`:377`) silently ignores unknown opcodes ("let the caller hang", `:512`) — no reply is sent, which is expected by `ram_file.erl` for unsupported ops.
 - `inet_drv.c` uses the private `prim_inet` protocol as its control ABI (magic-number-offset cmd + packed binaries), not `erl_driver`'s higher-level helpers; the Erlang half must stay in sync (`erts/preloaded/src/prim_inet.erl`).
 - The socket `driver_select` event is the OS fd on unix and a Winsock event handle on win32 (`inet_descriptor.event`, `:1225`), so event-based reasoning differs per platform.
 - `INET_MAX_ASYNC` is 1 (one outstanding async op per descriptor); a descriptor running multi-accept keeps additional ops in a separate list.
