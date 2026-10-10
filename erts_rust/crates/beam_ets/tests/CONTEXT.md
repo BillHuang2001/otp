@@ -40,7 +40,7 @@ Read together with `../CONTEXT.md` (crate API + design) and `../ETS_SURFACE.md` 
 - `ets_continuation.rs` → limited/continuation forms: fixed-expectation pins (its live-oracle battery is in the `_direction` sibling, so it needs no gate)
 - `ets_continuation_direction.rs` → the direction/identity half of the continuation family + the shared live-oracle battery (gated through `common::oracle`)
 - `ets_update.rs` → `update_counter`/`update_element` operands
-- `ets_replace.rs` → `select_replace/2` + body-runtime-failure (`EXIT`) rule; oracle renderings quoted inline (offline-derived — pin tests, not live cross-checks) + `recorded_divergence_*` for the oracle's stricter static body check
+- `ets_replace.rs` → `select_replace/2` + body-runtime-failure (`EXIT`) rule; oracle renderings quoted inline (offline-derived — pin tests, not live cross-checks) + `static_check_*` pinning the oracle's static body check (`db_match_keeps_key`): a rejected body is `badarg` and leaves the table unchanged
 - `ets_info.rs` → `ets:info` 15-field proplist
 - `ets_ownership.rs` → `give_away`/`heir`/`setopts`/owner-death
 - `ets_rename.rs` → `ets:rename/2`

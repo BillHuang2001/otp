@@ -302,7 +302,7 @@ fn clause_keeps_key(
             let sub_key = elems[keypos - 1];
             // 6. Structural equality with the head's key; 7. const mode rejects
             //    any mismatch (no `{element, KeyPos, '$_'}` rescue).
-            eq_body_raw(head_key, sub_key, true, atoms)
+            eq_body(head_key, BodySide::Raw(sub_key), true, atoms)
         }
         // 3. `{X}` — the construction form; `parts` are `X`'s elements.
         expr::Expr::Tuple(parts) => {
@@ -605,28 +605,28 @@ impl Table {
     /// * Objects are visited in [`Table::tab2list`] order. The first clause whose
     ///   head matches and whose guards hold supplies the replacement: the value of
     ///   the body's **last** expression (see [`run_clauses`]).
-    /// * The replacement must be a tuple of arity `>= keypos` whose `keypos`
-    ///   element **equals** the matched object's key ([`keeps_key`]); anything else
-    ///   makes the whole call `badarg`.
-    /// * A `badarg` leaves the table **unchanged**: every replacement is computed
-    ///   and validated before the first mutation, matching the oracle, which
-    ///   validates the spec up front (`db_match_keeps_key`) and only then traverses.
+    /// * The spec's body must keep the matched object's key **syntactically**:
+    ///   [`static_keeps_key`] (the C `db_match_keeps_key`) runs before the table is
+    ///   traversed, so a spec that fails it makes the whole call `badarg` up front,
+    ///   even when nothing matches. See the section below for the accepted forms.
+    /// * A `badarg` leaves the table **unchanged**: the spec is validated up front
+    ///   and every replacement is computed and validated before the first mutation,
+    ///   matching the oracle, which runs `db_match_keeps_key` and only then
+    ///   traverses.
     /// * A `'$_'` body (or any body whose value equals the matched object) is the
     ///   identity: the object is still counted as replaced.
     ///
-    /// # Divergence from the oracle's *static* body check
+    /// # The static body check (the C `db_match_keeps_key`)
     ///
-    /// The C validates the body's **shape** statically — `db_match_keeps_key`
+    /// The body's **shape** is validated statically — `db_match_keeps_key`
     /// (`../../erts/emulator/beam/erl_db_util.c:1422`), installed as the match
-    /// spec's `on_match_validation` — so it rejects a body that is not a
-    /// one-expression list of `'$_'`, the `{{ … }}` construction form or
-    /// `{const, {…}}`, and a head key of `'_'` paired with a constant body tuple,
-    /// **even when nothing matches**. This implementation validates the *value* each
-    /// body produces instead. The two agree on every case the differential battery
-    /// pins; the value-based rule is strictly more permissive in three corners (an
-    /// empty/never-matching table with an otherwise-rejected body, a
-    /// multi-expression body whose last value keeps the key, and a `'_'` head key
-    /// with a constant body tuple). Recorded here rather than silently tolerated.
+    /// spec's `on_match_validation` — so the whole call is `badarg`, **even when
+    /// nothing matches**, unless every clause's body is a one-expression list of
+    /// `'$_'`, the `{{ … }}` construction form or `{const, {…}}` whose key element
+    /// is provably the head's key (or the `{element, KeyPos, '$_'}` form). Verified
+    /// against the system `erl` (OTP 29.1.1 / erts-17.1): a multi-expression body, a
+    /// rejected body on a never-matching spec and a rejected body on an empty table
+    /// are all `badarg`, and the table is left unchanged.
     ///
     /// # Storage
     ///
@@ -666,7 +666,7 @@ impl Table {
         let mut replacements: Vec<Eterm> = Vec::new();
         let mut keys: Vec<Eterm> = Vec::new();
         for object in self.tab2list() {
-            let Some(replacement) = replacement_for(spec, object, keypos, atoms, heap)? else {
+            let Some(replacement) = replacement_for(spec, object, atoms, heap)? else {
                 continue;
             };
             if multi {
@@ -690,7 +690,7 @@ impl Table {
                 let taken = self.take(key, atoms)?;
                 let mut rebuilt = Vec::with_capacity(taken.len());
                 for object in taken {
-                    match replacement_for(spec, object, keypos, atoms, heap)? {
+                    match replacement_for(spec, object, atoms, heap)? {
                         Some(replacement) => rebuilt.push(replacement),
                         None => rebuilt.push(object),
                     }
@@ -710,36 +710,19 @@ impl Table {
 /// no clause matches.
 ///
 /// The replacement is the clause body's value (the value of its last expression,
-/// `'$_'` for the whole object); it must keep the object's key — see [`keeps_key`].
+/// `'$_'` for the whole object). Whether the body keeps the object's key is settled
+/// **statically**, before any traversal, by [`static_keeps_key`].
 fn replacement_for(
     spec: &MatchSpec,
     object: Eterm,
-    keypos: usize,
     atoms: &AtomTable,
     heap: &mut Heap,
 ) -> Result<Option<Eterm>> {
     let Some(value) = run_clauses(spec, object, atoms, heap)? else {
         return Ok(None);
     };
-    let replacement = value.into_term(atoms)?;
-    if !keeps_key(replacement, object, keypos, atoms) {
-        return Err(crate::error::badarg());
-    }
-    Ok(Some(replacement))
-}
-
-/// Whether a replacement object keeps the key of the object it replaces: it must
-/// be a tuple of arity `>= keypos` whose `keypos` element equals the matched
-/// object's key (`beam_term::compare::eq`, never a local key comparison).
-///
-/// This is the observable rule of `ets:select_replace/2`; the C reaches it
-/// statically through `db_match_keeps_key`
-/// (`../../erts/emulator/beam/erl_db_util.c:1422`) and reports `badarg` when it
-/// cannot prove the key is kept. A non-tuple or too-short replacement cannot keep
-/// a key, so it is a failure here too (`key_of` → `badarg`).
-fn keeps_key(replacement: Eterm, matched: Eterm, keypos: usize, atoms: &AtomTable) -> bool {
-    let (Ok(new_key), Ok(old_key)) = (key_of(replacement, keypos), key_of(matched, keypos)) else {
-        return false;
-    };
-    eq(new_key, old_key, atoms)
+    // The key is kept by construction: `static_keeps_key` rejected the whole call
+    // up front otherwise, and the body's value is a pure function of the matched
+    // object's head bindings.
+    Ok(Some(value.into_term(atoms)?))
 }
