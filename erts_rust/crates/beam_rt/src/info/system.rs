@@ -68,7 +68,6 @@
 //!
 //! | key | shape | this runtime |
 //! |---|---|---|
-//! | `build_type` | atom, `opt`/`debug` | the same build tag as `emu_type` (`am_build_type` and `am_emu_type` share one arm in the C) |
 //! | `compat_rel` | int | this runtime's own OTP release (`erts_compat_rel` defaults to the emulator's release number) |
 //! | `endian` | atom, `little`/`big` | the target's endianness (`WORDS_BIGENDIAN` in the C) — a fact about the host |
 //! | `eager_check_io` | bool, `true` | the C arm answers `am_true` unconditionally; this runtime's scheduler pass checks I/O every step |
@@ -88,6 +87,14 @@
 //! **3-bit pointer tag with a literal-area bit**, so `tag` is this runtime's truthful
 //! answer — the same word the C uses for a tag-based literal test — and it is compared
 //! **shape-only**.
+//!
+//! `build_type` is **not** served here. It shares the C arm with `emu_type`
+//! (`erl_bif_info.c:2800`, `am_build_type || am_emu_type`), but `emu_type` is `debug` in a
+//! debug build of *this* runtime whereas the oracle's release build answers `opt`, so its
+//! stable truthful value (`cfg!(debug_assertions)`) does not agree with the oracle's by
+//! construction. A stable-but-disagreeing own-state value must not be traded for the
+//! oracle's `opt`, so `build_type` is the honest typed `unsupported` gap instead (see
+//! `super::unsupported`).
 
 use beam_abi::{
     ERL_DRV_EXTENDED_MAJOR_VERSION, ERL_DRV_EXTENDED_MINOR_VERSION, ERL_NIF_MAJOR_VERSION,
@@ -154,7 +161,6 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "halt_flush_timeout" => Some(Ok(InfoValue::Atom("infinity"))),
         "creation" => Some(Ok(InfoValue::Int(creation(rt)))),
         // The emulator's own build/implementation flags (see the module docs).
-        "build_type" => Some(Ok(emu_type())),
         "compat_rel" => Some(Ok(InfoValue::Int(i64::from(beam_common::otp_version().major)))),
         "endian" => Some(Ok(InfoValue::Atom(endian()))),
         "eager_check_io" => Some(Ok(InfoValue::Bool(true))),
@@ -404,12 +410,11 @@ mod tests {
     #[test]
     fn the_build_and_implementation_flags_are_this_runtime_s_own() {
         let rt = runtime();
-        // `build_type` and `emu_type` share one arm in the C, so they must agree here too.
-        assert_eq!(
-            try_value("build_type", &rt).unwrap().unwrap(),
-            emu_type(),
-            "build_type is the same build tag as emu_type"
-        );
+        // `build_type` is a typed `unsupported` gap now (see `super::unsupported`): it
+        // shares the C arm with `emu_type`, but this runtime's own build tier
+        // (`cfg!(debug_assertions)`) is not the oracle's release tag (`opt`), so the
+        // `system` family no longer claims it.
+        assert!(try_value("build_type", &rt).is_none());
         // `compat_rel` is the emulator's own release number by default.
         assert_eq!(
             try_value("compat_rel", &rt).unwrap().unwrap(),

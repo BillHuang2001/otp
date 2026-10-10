@@ -37,8 +37,8 @@
 //!   into two honest groups:
 //!     1. this runtime's own version strings, which are deliberately its **own**
 //!        (`version` = our erts version, `otp_release` = our OTP major, `emu_type` =
-//!        our build tier, `build_type` = the same tier, `compat_rel` = our release
-//!        number, `debug_compiled` = our debug tier);
+//!        our build tier, `compat_rel` = our release number, `debug_compiled` = our
+//!        debug tier);
 //!     2. keys that read **this runtime's own live tables** (`atom_count`,
 //!        `process_count`, `port_count`, `ets_count`, the scheduler-state keys,
 //!        `scheduling_statistics`' honest zeros, `allocated_areas`, …) and are
@@ -166,11 +166,10 @@ const SHAPE_ONLY_KEYS: &[&str] = &[
     "allocated_areas",
     // The scheduler **state** keys and the emulator's own build/implementation flags whose
     // value legitimately differs from the oracle's (see `src/info/schedulers.rs` and
-    // `src/info/system.rs`): the scheduler counts are this runtime's own, `build_type` is
-    // *our* build tier, `compat_rel` *our* release number, `literal_test` is `tag` because
-    // this runtime's literal test is a tag bit (the oracle's 64-bit build answers `range`),
-    // and the scheduling-statistics counters are this runtime's honest zeros.
-    "build_type",
+    // `src/info/system.rs`): the scheduler counts are this runtime's own, `compat_rel` is
+    // *our* release number, `literal_test` is `tag` because this runtime's literal test is
+    // a tag bit (the oracle's 64-bit build answers `range`), and the scheduling-statistics
+    // counters are this runtime's honest zeros.
     "compat_rel",
     "literal_test",
     "cpu_quota",
@@ -186,6 +185,11 @@ const SHAPE_ONLY_KEYS: &[&str] = &[
 /// Keys the oracle accepts that this runtime answers with an honest capability gap.
 /// Pinned here so a future `unsupported` key is checked against the oracle too.
 const ORACLE_ACCEPTED_UNSUPPORTED_KEYS: &[&str] = &[
+    // The emulator's own build tag: it shares the C arm with `emu_type`
+    // (`erl_bif_info.c:2800`), but this runtime's own build tier (`debug` in a dev build) is
+    // not the oracle's release tag (`opt`), so it is an own-state divergence answered as a
+    // typed gap rather than the oracle's `opt` (see `src/info/unsupported.rs`).
+    "build_type",
     "allocator",
     "time_offset",
     "time_correction",
