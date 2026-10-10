@@ -49,6 +49,8 @@
 //! | `erts_internal:perf_counter_unit/0` | `erl_time_sup.c:2537` | `1000000000` |
 //! | `erts_internal:get_creation/0` | `dist.c:5594-5604` | `undefined` on a non-distributed node |
 //! | `erts_internal:is_process_alive/1` | `erl_bif_info.c:4069` | `self()`→`true`; after a process exits→`false`; `foo`→`error:badarg` |
+//! | `erts_internal:is_process_alive/2` | `erl_bif_info.c:4058-4067` | `(self(), make_ref())`→`ok` for a live **and** a dead pid; `(foo, Ref)`/`(self(), foo)`→`error:badarg` |
+//! | `erts_internal:process_flag/3` | `bif.c:2262-2297` (`process_flag_aux:1896-2022`) | `(self(), save_calls, N)`→the previous length (`0` first, then `7`, `4`, …); `(self(), trap_exit, true)`/`(self(), save_calls, true)`/`(self(), save_calls, 10001)`→`error:badarg`; `(foo\|123, save_calls, 1)`→the **value** `badtype` |
 //! | `erts_internal:no_aux_work_threads/0` | `erl_process.c:9234-9237` (`:6219-6223`) | `erl`→`17` (16 schedulers + 1 + no dirty-alloc instances); `erl +S 1`→`2` |
 //! | `erts_internal:processes_next/1` | `bif.c:4111-4120` | `processes_next(1000000000000)`→`badarg`; `foo`→`badarg` |
 //! | `erts_internal:term_to_string/1,2` | `bif.c:4160-4189` | `{a,1}`→`"{a,1}"` (one line, `~w`); a limit `1`→`error:badarg` |
@@ -240,6 +242,8 @@ impl RuntimeContext<'_> {
             ("perf_counter_unit", 0) => Some(self.erts_perf_counter_unit()),
             ("get_creation", 0) => Some(self.erts_get_creation()),
             ("is_process_alive", 1) => Some(self.erts_is_process_alive(args)),
+            ("is_process_alive", 2) => Some(self.erts_is_process_alive_2(args)),
+            ("process_flag", 3) => Some(self.erts_process_flag(args)),
             // The per-process group leader (`bif.tab:79-80`, `bif.c:4949-5021`): the two
             // counterparts of `erlang:group_leader/2` (which `erlang.erl:3328-3341` wraps).
             // The floor runs before the registry, so it preempts the defaulted
@@ -708,6 +712,121 @@ impl RuntimeContext<'_> {
         }
     }
 
+    // -- erts_internal:is_process_alive/2 ------------------------------------
+
+    /// `erts_internal:is_process_alive/2` — `erl_bif_info.c:4058-4067`.
+    ///
+    /// The C's contract is an **argument test plus a signal send**: it rejects
+    /// `!is_internal_pid(Arg1) || !is_internal_ordinary_ref(Arg2)` with `badarg` and then
+    /// queues an is-alive request; the BIF's own return value is the atom `ok` in exactly
+    /// those cases. A pid the process table does **not** hold still answers `ok` — the C
+    /// never consults the table here, it just sends the request, and the reply (if any)
+    /// arrives as a message; probing OTP 29.1.1 / erts-17.1 confirms that for a live and a
+    /// dead pid alike, while a non-pid or a non-reference first/second argument is
+    /// `error:badarg`.
+    ///
+    /// The request itself is signal/distribution machinery this runtime has no peer for;
+    /// `erlang:is_process_alive/1` — the table lookup above, which is the form every caller
+    /// uses — is the answer this runtime serves for "is it alive".
+    ///
+    /// # Why the reference test is the runtime's own registry
+    ///
+    /// Reading a reference thing's payload to classify it is `unsafe`
+    /// (`beam_term::boxed_val`) and this crate is `#![deny(unsafe_code)]`. The safe
+    /// substitute is the same one `erlang:cancel_timer/1` and `erts_internal:group_leader/3`
+    /// share: [`RuntimeContext::is_runtime_reference`], i.e. "a reference **this runtime
+    /// minted**" (`Runtime::references`, plus the timer reference space). Every internal
+    /// ordinary reference in this runtime comes from that one id space, so the test is exact
+    /// for the terms a program can hold; any other term is the C's `badarg`.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] unless `Arg1` is an internal pid **and** `Arg2` is a reference
+    /// this runtime minted.
+    fn erts_is_process_alive_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let pid = *args.first().ok_or(BeamError::BadArg)?;
+        let reference = *args.get(1).ok_or(BeamError::BadArg)?;
+        if !is_internal_pid(pid) || !self.is_runtime_reference(reference) {
+            return Err(BeamError::BadArg);
+        }
+        self.atom("ok")
+    }
+
+    // -- erts_internal:process_flag/3 ----------------------------------------
+
+    /// `erts_internal:process_flag/3` — `bif.c:2262-2297`.
+    ///
+    /// The C has a three-way split, in this order:
+    ///
+    /// 1. `Arg1` is the **calling** process (`BIF_P->common.id == BIF_ARG_1`): the body is
+    ///    `process_flag_aux(BIF_P, NULL, Flag, Value)` (`bif.c:1896-2022`), and that helper
+    ///    implements exactly **one** flag — `save_calls`. `process_flag/2` is *not* the same
+    ///    function: it has its own chain for `trap_exit`/`priority`/`sensitive`/`error_handler`
+    ///    (…), so the direct form rejects every one of them with `badarg` (probed: the oracle
+    ///    answers `error:badarg` for `process_flag(self(), trap_exit, true)` while
+    ///    `erlang:process_flag(trap_exit, true)` succeeds). This arm must therefore **not**
+    ///    delegate to `erlang:process_flag/2`.
+    /// 2. `Arg1` is not an internal pid: the C returns the **value** atom `badtype`
+    ///    (`BIF_RET(am_badtype)`, *not* `badarg`) — probed for an atom and for an integer.
+    /// 3. any other internal pid: `erts_proc_sig_send_rpc_request(…)` answers an internal
+    ///    **reference** and later delivers `{Ref, Result}` to the caller.
+    ///
+    /// `process_flag_aux`'s `save_calls` semantics, faithfully: a **non-small** value and one
+    /// outside `0..=10000` are `badarg`; otherwise the buffer length is set and the *previous*
+    /// length is returned (`0` when there was none, so `7` then `4` then `0` answers `0`, `7`,
+    /// `4`).
+    ///
+    /// # The one remaining gap
+    ///
+    /// Case 3 is the typed capability gap: this runtime has no cross-process RPC with a
+    /// reference-keyed reply, so a reference minted here would never be answered — a
+    /// fabricated success the workspace error strategy forbids (`../CONTEXT.md` §3).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for the calling process and any flag other than `save_calls`, or
+    /// a `save_calls` value that is not a small integer in `0..=10000`; the typed
+    /// [`unsupported`](crate::error::unsupported) gap for another process.
+    fn erts_process_flag(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        /// The async flag RPC (the C's case 3).
+        const RPC_GAP: &str = "erts_internal:process_flag/3 targeting another process (the async \
+                               flag RPC answers a reference this runtime could never reply to)";
+        let pid_term = *args.first().ok_or(BeamError::BadArg)?;
+        let flag = *args.get(1).ok_or(BeamError::BadArg)?;
+        let value = *args.get(2).ok_or(BeamError::BadArg)?;
+        if pid_term == self.pid().to_eterm() {
+            // `process_flag_aux`: the direct form implements `save_calls` only.
+            if self.atom_name(flag).as_deref() != Some("save_calls") {
+                return Err(BeamError::BadArg);
+            }
+            if !is_small(value) {
+                return Err(BeamError::BadArg);
+            }
+            let next = signed_value(value);
+            if !(0..=10_000).contains(&next) {
+                return Err(BeamError::BadArg);
+            }
+            let pid = self.pid();
+            let Some(process) = self.process_table_mut().get_mut(pid) else {
+                // The calling process has no PCB, so there is nowhere to store the flag. An
+                // internal invariant of every dispatch path (the `-eval` root process and
+                // every scheduled slice are both in the table) — reported honestly rather
+                // than panicking.
+                return Err(error::unsupported(
+                    "erts_internal:process_flag/3: the calling process has no process-table entry",
+                ));
+            };
+            let previous = process.save_calls();
+            process.set_save_calls(next as u16);
+            return Ok(make_small(i64::from(previous)));
+        }
+        if !is_internal_pid(pid_term) {
+            // The C's `badtype`: a **value** atom, not a raise.
+            return self.atom("badtype");
+        }
+        Err(error::unsupported(RPC_GAP))
+    }
+
     // -- erts_internal:processes_next/1 --------------------------------------
 
     /// `erts_internal:processes_next/1` — `bif.c:4111-4120` over
@@ -1113,7 +1232,7 @@ mod tests {
     use crate::native::test_support::{atom, call, chars, runtime, string_of, system_runtime};
     use crate::runtime::Runtime;
     use beam_bifs::NullSink;
-    use beam_term::NIL;
+    use beam_term::{make_internal_pid, make_pid_data, NIL};
 
     // -- fixtures -------------------------------------------------------------
     //

@@ -23,17 +23,22 @@
 //! The oracle values are pinned against the system `erl` (OTP 29.1.1 / erts-17.1); the
 //! oracle-comparison test skips **loudly** when `erl` is absent.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use beam_bifs::NullSink;
 use beam_common::BeamError;
 use beam_engine::terms;
+use beam_engine::ExecutionContext;
 use beam_gc::HeapObservable;
-use beam_process::ProcessId;
-use beam_term::{atom_val, is_atom, make_small, signed_value, Eterm, NIL};
+use beam_process::{ProcessId, ProcessTable, SignalAtoms};
+use beam_term::{atom_val, is_atom, make_small, signed_value, AtomTable, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::native::test_support::{atom, call, runtime};
+use crate::runner::{ProcessEntry, RunnerState};
 
 /// The runtime's own root process — a live process in the process table.
 fn root_pid(runtime: &mut crate::Runtime) -> Eterm {
@@ -480,7 +485,6 @@ fn every_unsupported_item_raises_the_typed_capability_gap() {
     let mut runtime = runtime();
     let pid = root_pid(&mut runtime);
     for name in [
-        "catchlevel",
         "backtrace",
         "magic_ref",
         "parent",
@@ -751,4 +755,297 @@ fn the_position_items_are_the_typed_capability_gap_for_the_callers_own_process()
             "the gap names the item it cannot answer: {reason}"
         );
     }
+}
+
+// -- `catchlevel` (the one gap closed) ------------------------------------
+
+/// The committed vertical-slice module, reused by relative path (the entry engine of the
+/// positive `catchlevel` case needs a real [`beam_loader::Module`]).
+fn slice_fixture() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../beam_loader/tests/fixtures/slice.beam"
+    )
+}
+
+/// A process table independent of the runtime (what a scheduler pass owns) holding **one**
+/// scheduled process, plus that process's engine state — the shape that makes the
+/// engine-derived items readable (see [`RuntimeContext::for_process_with_engines`]).
+fn pass_table_with_one_engine() -> (ProcessTable, RunnerState, ProcessId) {
+    let mut atoms = AtomTable::new();
+    let mut table = ProcessTable::new(SignalAtoms::from_table(&mut atoms));
+    let pid = table.spawn_default().expect("a fresh process");
+    let mut engines = RunnerState::default();
+    let module = Arc::new(beam_loader::load_file(slice_fixture()).expect("slice.beam"));
+    let function = module
+        .atom_table
+        .lookup("add")
+        .expect("`add` is interned in slice.beam");
+    engines.spawn(
+        pid,
+        ProcessEntry::Export {
+            module,
+            function,
+            arity: 2,
+        },
+        Vec::new(),
+    );
+    (table, engines, pid)
+}
+
+/// The same table shape, but the process's entry point is a **fun value**.
+fn pass_table_with_one_fun_engine() -> (ProcessTable, RunnerState, ProcessId) {
+    let mut atoms = AtomTable::new();
+    let mut table = ProcessTable::new(SignalAtoms::from_table(&mut atoms));
+    let pid = table.spawn_default().expect("a fresh process");
+    let mut engines = RunnerState::default();
+    engines.spawn_fun(pid, make_small(0), Vec::new());
+    (table, engines, pid)
+}
+
+/// `catchlevel` is a **valid** oracle item, so a process whose engine this runtime does not
+/// hold answers the typed capability gap — never `badarg` and never a fabricated `0`.
+///
+/// The `-eval` root process making the call is exactly such a process: its evaluator has no
+/// engine of its own (see the module docs).
+#[test]
+fn catchlevel_is_the_typed_capability_gap_without_a_readable_engine() {
+    let mut runtime = runtime();
+    let pid = root_pid(&mut runtime);
+    let error = info(&mut runtime, pid, "catchlevel").expect_err("no engine ⇒ capability gap");
+    let reason = crate::error::unsupported_reason(&error)
+        .unwrap_or_else(|| panic!("catchlevel must be a typed `unsupported` gap, got {error}"));
+    assert!(
+        reason.contains("catchlevel"),
+        "the gap names the item it cannot answer: {reason}"
+    );
+    assert!(
+        reason.contains("no engine"),
+        "the gap names the missing piece (the engine), not a placeholder: {reason}"
+    );
+}
+
+/// With a readable engine the item is answered **for real**: a process whose machine has run
+/// no `try`/`catch` reports the integer `0`.
+///
+/// `0` is the oracle's own answer for a process parked outside any catch frame (see the
+/// oracle cross-check below), and the value is tied to the engine's own
+/// [`Machine::catch_frame_depth`](beam_engine::Machine::catch_frame_depth) — the C's
+/// `catchlevel(rp)` (`beam_common.c:2347-2350`) — so a future regression in the wiring shows
+/// up as a mismatch rather than a silent constant.
+#[test]
+fn catchlevel_with_a_readable_engine_is_the_live_catch_frame_depth() {
+    let mut runtime = runtime();
+    let (mut table, engines, pid) = pass_table_with_one_engine();
+    let target = pid.to_eterm();
+    let item = atom(&mut runtime, "catchlevel");
+    let reply = {
+        let mut sink = NullSink;
+        let mut context =
+            RuntimeContext::for_process_with_engines(&mut runtime, &mut table, pid, &engines);
+        context
+            .call_bif("erlang", "process_info", 2, &[target, item])
+            .expect("process_info/2 catchlevel")
+    };
+    let (key, value) = pair(reply);
+    assert_eq!(runtime.atom_name_of(key), Some("catchlevel"));
+    assert_eq!(
+        signed_value(value),
+        engines
+            .engine_at(pid)
+            .expect("the pid has an engine")
+            .1
+            .catch_frame_depth() as i64,
+        "the item is the engine's own catch-frame depth"
+    );
+    assert_eq!(signed_value(value), 0, "a machine that ran no try/catch is at depth 0");
+}
+
+/// A **fun-bodied** process has an engine, but no module to name a position from — so
+/// `catchlevel` stays the honest capability gap there too (the engine's depth would belong to
+/// a launch that has not happened yet, so `0` would be a guess).
+#[test]
+fn catchlevel_is_the_gap_for_a_fun_bodied_process() {
+    let mut runtime = runtime();
+    let (mut table, engines, pid) = pass_table_with_one_fun_engine();
+    let target = pid.to_eterm();
+    let item = atom(&mut runtime, "catchlevel");
+    let error = {
+        let mut sink = NullSink;
+        let mut context =
+            RuntimeContext::for_process_with_engines(&mut runtime, &mut table, pid, &engines);
+        context
+            .call_bif("erlang", "process_info", 2, &[target, item])
+            .expect_err("a fun-bodied process has no readable engine")
+    };
+    let reason = crate::error::unsupported_reason(&error)
+        .unwrap_or_else(|| panic!("catchlevel must be a typed `unsupported` gap, got {error}"));
+    assert!(reason.contains("catchlevel"), "{reason}");
+}
+
+// -- the remaining gaps ---------------------------------------------------
+
+/// Every remaining gap names **what is missing** — the accessor/hook a future implementation
+/// would need — rather than a vague placeholder.
+#[test]
+fn every_remaining_gap_names_its_missing_accessor() {
+    let mut runtime = runtime();
+    let pid = root_pid(&mut runtime);
+    for (name, missing) in [
+        ("backtrace", "stack-dump"),
+        ("magic_ref", "magic ref"),
+        ("parent", "parent field"),
+        ("label", "label field"),
+        ("async_dist", "async_dist flag"),
+        ("priority_messages", "priority_messages flag"),
+        ("garbage_collection_info", "per-generation"),
+        ("binary", "off-heap refc binaries"),
+    ] {
+        let error = info(&mut runtime, pid, name).expect_err("must be a capability gap");
+        let reason = crate::error::unsupported_reason(&error)
+            .unwrap_or_else(|| panic!("{name} must be a typed `unsupported` gap, got {error}"));
+        assert!(reason.contains(name), "the gap names the item: {reason}");
+        assert!(
+            reason.contains(missing),
+            "the gap names the missing piece ({missing:?}): {reason}"
+        );
+    }
+}
+
+// -- oracle cross-checks (bounded; skip loudly without the toolchain) -----
+
+/// Runs `erl -noshell -eval EXPR` with a **bounded** poll/kill and returns its trimmed
+/// stdout, or `None` when the system `erl` is unavailable or the probe did not finish (the
+/// caller then skips **loudly**).
+///
+/// Every probe below ends in `halt()`, so it really terminates; the bound exists so a probe
+/// that hangs (or an `erl` that never starts) can never wedge the suite.
+fn oracle_eval(expression: &str) -> Option<String> {
+    const ORACLE_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut child = Command::new("erl")
+        .args(["-noshell", "-eval", expression])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + ORACLE_TIMEOUT;
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!(
+                    "SKIPPING the process_info oracle test: `erl` did not exit within \
+                     {ORACLE_TIMEOUT:?}"
+                );
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    Some(text.trim().to_string())
+}
+
+/// `text` without any whitespace — `~p` wraps long terms across lines, and the comparison
+/// cares about the terms, not the layout.
+fn without_whitespace(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+/// The `catchlevel` semantics the C implements (`catchlevel(rp) = rp->catches`,
+/// `beam_common.c:2347-2350`; the loader rewrites `try` into the single `catch` that
+/// increments it, `emu/ops.tab:234`): a **parked process outside any `try`/`catch`** reports
+/// `0`, while a process inside one reports a positive depth.
+///
+/// Measured on OTP 29.1.1 / erts-17.1: the probe prints `0 3` — the `3` is the `-eval`
+/// *interpreter*'s own depth (`erl_eval` pushes two frames per nested `try`), so only the
+/// shape (a positive integer while a handler is live) is asserted.
+#[test]
+fn the_oracle_reports_zero_catchlevel_outside_a_try_and_a_depth_inside_one() {
+    let Some(line) = oracle_eval(
+        "P = spawn(fun() -> receive stop -> ok end end), \
+         io:format(\"~p ~p~n\", [element(2, process_info(P, catchlevel)), \
+         (try element(2, process_info(self(), catchlevel)) catch _:_ -> err end)]), halt().",
+    ) else {
+        eprintln!("SKIPPING the catchlevel oracle test: the system `erl` is unavailable");
+        return;
+    };
+    let mut fields = line.split_whitespace();
+    assert_eq!(
+        fields.next(),
+        Some("0"),
+        "a parked process outside any try has catchlevel 0: {line}"
+    );
+    let inside = fields
+        .next()
+        .and_then(|field| field.parse::<i64>().ok())
+        .unwrap_or_else(|| panic!("a live catch frame reports an integer depth: {line}"));
+    assert!(
+        inside > 0,
+        "a process inside a try reports a positive catchlevel: {line}"
+    );
+}
+
+/// The **oracle values** of the eight items this runtime still cannot answer, so the gaps are
+/// grounded in the real reference runtime rather than in a guess (OTP 29.1.1 / erts-17.1):
+/// `magic_ref`/`binary` are `[]`, `label` is `undefined`, `async_dist`/`priority_messages` are
+/// `false`, `parent`/`backtrace` exist (a pid / a binary), and `garbage_collection_info` is
+/// the 11-key per-generation proplist whose block detail this collector does not measure.
+#[test]
+fn the_oracle_backs_the_remaining_gaps_values() {
+    let Some(line) = oracle_eval(
+        "P = spawn(fun() -> receive stop -> ok end end), \
+         io:format(\"~p~n\", [[element(1, process_info(P, magic_ref)), \
+         element(2, process_info(P, magic_ref)), element(2, process_info(P, label)), \
+         element(2, process_info(P, async_dist)), element(2, process_info(P, priority_messages)), \
+         element(1, process_info(P, parent)), element(1, process_info(P, backtrace)), \
+         is_binary(element(2, process_info(P, backtrace))), \
+         [element(1, X) || X <- element(2, process_info(P, garbage_collection_info))], \
+         element(2, process_info(P, binary))]]), halt().",
+    ) else {
+        eprintln!("SKIPPING the process_info gap oracle test: the system `erl` is unavailable");
+        return;
+    };
+    assert_eq!(
+        without_whitespace(&line),
+        without_whitespace(
+            "[magic_ref,[],undefined,false,false,parent,backtrace,true,\
+             [old_heap_block_size,heap_block_size,mbuf_size,recent_size,stack_size,\
+             old_heap_size,heap_size,bin_vheap_size,bin_vheap_block_size,\
+             bin_old_vheap_size,bin_old_vheap_block_size],[]]"
+        )
+    );
+}
+
+/// `{binary, []}` would be a **lie** for a reachable state: the oracle lists a process's
+/// off-heap refc binaries as `[{Ptr, Size, Refc}, …]`, so a process holding a large binary
+/// reports a non-empty roster (measured `true` on OTP 29.1.1 / erts-17.1).
+///
+/// This is why the item stays a gap here: the engine does hold such binaries
+/// (`Machine::refc_binaries`), but no process registers them in its off-heap table, so this
+/// floor could not enumerate them.
+#[test]
+fn the_oracle_lists_a_processes_off_heap_binaries() {
+    let Some(line) = oracle_eval(
+        "P = spawn(fun() -> B = binary:copy(<<1,2,3>>,100), W = <<B/binary,7>>, \
+         receive stop -> {B,W} end end), timer:sleep(100), \
+         io:format(\"~p~n\", [element(2, process_info(P, binary)) =/= []]), halt().",
+    ) else {
+        eprintln!("SKIPPING the `binary` oracle test: the system `erl` is unavailable");
+        return;
+    };
+    assert_eq!(
+        line, "true",
+        "a process holding a large binary lists it in `binary`: {line}"
+    );
 }
