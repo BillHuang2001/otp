@@ -358,8 +358,9 @@ fn bad_operands_stay_badarg_family_errors() {
     // A float operand is `badarith` for `div`/`rem` (they are integer operations).
     assert!(matches!(fx.call("div", &[one_point_oh, two_to_70]), Err(BeamError::BadArith)));
     assert!(matches!(fx.call("rem", &[two_to_70, one_point_oh]), Err(BeamError::BadArith)));
-    // A non-number is `badarith` (`true + 1` in the oracle).
+    // A non-number is `badarith` (`true + 1` in the oracle) — except for `abs/1`,
+    // where the C `abs_1` falls through to `badarg` (`abs(true)` in the oracle).
     let truth = fx.call("=:=", &[two_to_70, two_to_70]).expect("erlang:'=:='/2");
     assert!(matches!(fx.call("+", &[truth, ok]), Err(BeamError::BadArith)));
-    assert!(matches!(fx.call("abs", &[truth]), Err(BeamError::BadArith)));
+    assert!(matches!(fx.call("abs", &[truth]), Err(BeamError::BadArg)));
 }

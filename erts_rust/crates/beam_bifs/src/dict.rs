@@ -63,8 +63,13 @@ use crate::context::BifContext;
 use crate::registry::BifRegistry;
 
 /// The atom `undefined` — the value returned for an absent key.
-fn undefined(ctx: &BifContext<'_>) -> Result<Eterm> {
-    ctx.atom("undefined")
+///
+/// *Produced* by this module, so it is interned on demand
+/// ([`BifContext::intern_atom`]) rather than looked up: a runtime whose boot seed
+/// lacks `undefined` would otherwise abort the whole process with an uncatchable
+/// `TermNotFound`.
+fn undefined(ctx: &mut BifContext<'_>) -> Result<Eterm> {
+    ctx.intern_atom("undefined")
 }
 
 /// `erlang:put(Key, Value)` — stores `value` under `key` and returns the

@@ -320,9 +320,10 @@ fn string_list(ctx: &mut BifContext<'_>, s: &str) -> Result<Eterm> {
 
 /// `{error, warning}` — the shape `prim_file:internal_native2name/1` returns for
 /// bytes that are not valid UTF-8 (`erts_get_filename_warning_type/0` is
-/// `warning` on this host).
+/// `warning` on this host). Both atoms are *produced* here, so both are interned
+/// on demand rather than looked up.
 fn error_warning(ctx: &mut BifContext<'_>) -> Result<Eterm> {
-    let error = ctx.atom("error")?;
+    let error = ctx.intern_atom("error")?;
     let warning = ctx.intern_atom("warning")?;
     ctx.tuple(&[error, warning])
 }
@@ -437,7 +438,7 @@ fn getenv_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let key = key_from_term(args[0], ctx.atoms()).ok_or_else(badarg)?;
     let value = env_lock().get(&key).cloned();
     match value {
-        None => ctx.atom("false"),
+        None => ctx.intern_atom("false"),
         Some(bytes) => native_to_filename(ctx, &bytes),
     }
 }
@@ -447,14 +448,14 @@ fn putenv_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let key = key_from_term(args[0], ctx.atoms()).ok_or_else(badarg)?;
     let value = value_from_term(args[1], ctx.atoms()).ok_or_else(badarg)?;
     env_lock().insert(key, value);
-    ctx.atom("true")
+    ctx.intern_atom("true")
 }
 
 /// `os:unsetenv/1` — remove one variable; always `true`.
 fn unsetenv_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let key = key_from_term(args[0], ctx.atoms()).ok_or_else(badarg)?;
     env_lock().remove(&key);
-    ctx.atom("true")
+    ctx.intern_atom("true")
 }
 
 /// `os:env/0` — the whole environment as `{KeyString, ValueString}` 2-tuples,

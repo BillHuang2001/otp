@@ -641,7 +641,7 @@ fn keysearch(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         list = cdr(list);
         if is_tuple(elem) && pos <= tuple_size(elem) {
             if cmp_arith(key, tuple_element(elem, pos - 1), ctx.atoms()) == Ordering::Equal {
-                let tag = ctx.atom("value")?;
+                let tag = ctx.intern_atom("value")?;
                 return ctx.tuple(&[tag, elem]);
             }
         }

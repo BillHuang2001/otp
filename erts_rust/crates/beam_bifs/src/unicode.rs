@@ -559,9 +559,10 @@ fn sub_binary(ctx: &mut BifContext<'_>, orig: &[u8], offset: usize) -> Result<Et
     bits::make_binary(ctx.heap(), &orig[offset..])
 }
 
-/// `{Tag, A, B}` with `Tag` an existing atom.
+/// `{Tag, A, B}` with `Tag` **produced** by the caller (`error`/`incomplete`/`ok`),
+/// so it is interned on demand rather than looked up.
 fn tuple3(ctx: &mut BifContext<'_>, tag: &str, a: Eterm, b: Eterm) -> Result<Eterm> {
-    let tag = ctx.atom(tag)?;
+    let tag = ctx.intern_atom(tag)?;
     ctx.tuple(&[tag, a, b])
 }
 

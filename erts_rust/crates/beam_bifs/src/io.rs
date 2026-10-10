@@ -213,7 +213,9 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 /// the default `latin1` — exactly what the oracle reports without `+pc`
 /// (`erl -noshell -eval 'io:printable_range()'` ⇒ `latin1`).
 fn printable_range_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    ctx.atom("latin1")
+    // `latin1` is *produced* here, so it is interned on demand: the name is not
+    // guaranteed to be in the runtime's table.
+    ctx.intern_atom("latin1")
 }
 
 /// `io_lib:printable_list/1` — `true` iff the argument is a proper list of

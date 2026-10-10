@@ -355,7 +355,7 @@ fn find_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             let ok = ctx.ok()?;
             ctx.tuple(&[ok, value])
         }
-        None => ctx.atom("error"),
+        None => ctx.intern_atom("error"),
     }
 }
 
@@ -432,7 +432,7 @@ fn take_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         .iter()
         .position(|&(k, _)| compare::eq(k, args[0], ctx.atoms()))
     else {
-        return ctx.atom("error");
+        return ctx.intern_atom("error");
     };
     let value = pairs[index].1;
     let rest: Vec<(Eterm, Eterm)> = pairs
@@ -596,7 +596,7 @@ fn iterator_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn next_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let iter = args[0];
     if is_atom_named(ctx, iter, "none") {
-        return ctx.atom("none");
+        return ctx.intern_atom("none");
     }
     if access::is_tuple(iter) && access::tuple_size(iter) == 3 {
         return Ok(iter);
@@ -632,7 +632,7 @@ fn next_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
     if !access::is_hashmap(map) {
         // A flat map ignores the path beyond the bound check and emits the whole chain.
-        let none = ctx.atom("none")?;
+        let none = ctx.intern_atom("none")?;
         return chain(ctx, &pairs, 0, n, none);
     }
     // A HAMT: chunk at `MAP_SMALL_MAP_LIMIT`, continuing at `[start + chunk | Map]`.
@@ -641,7 +641,7 @@ fn next_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         let next_path = ctx.int(end as i64)?;
         ctx.cons(next_path, map)?
     } else {
-        ctx.atom("none")?
+        ctx.intern_atom("none")?
     };
     chain(ctx, &pairs, start, end, terminal)
 }
@@ -689,7 +689,7 @@ fn ordered_next(ctx: &mut BifContext<'_>, keys_list: Eterm, map: Eterm) -> Resul
             None => return Err(badarg()),
         }
     }
-    let none = ctx.atom("none")?;
+    let none = ctx.intern_atom("none")?;
     let mut result = none;
     for i in (0..keys.len()).rev() {
         result = ctx.tuple(&[keys[i], values[i], result])?;
