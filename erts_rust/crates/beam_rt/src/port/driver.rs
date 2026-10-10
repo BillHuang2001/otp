@@ -1642,6 +1642,11 @@ impl Drop for DriverPortAdapter {
 #[cfg(test)]
 mod ready_output_tests;
 
+/// The A.4 **`ERL_DRV_USE` / `stop_select` regression test** for
+/// [`DriverPortAdapter::apply_select`], with the real C driver fixture it compiles: the C's
+/// "done with this event" form, the plain deselect that must not fire it, and the cancel form.
+#[cfg(test)]
+mod stop_select_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
