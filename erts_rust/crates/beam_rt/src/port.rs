@@ -596,6 +596,34 @@ impl PortRegistry {
         Ok(())
     }
 
+    /// Delivers a named port-control operation to the port's driver — the runtime side of
+    /// `erts_internal:port_control/3`.
+    ///
+    /// The operation is forwarded **verbatim** to [`beam_io::PortRegistry::port_control`], which
+    /// hands it to the port's driver: for a [`PortName::SpawnDriver`] port that is
+    /// [`DriverPortAdapter::control`](driver::DriverPortAdapter::control), i.e. the C driver's own
+    /// `control` callback, and for the built-in drivers the string verbs they own. `op` for a C
+    /// driver is the verb as a decimal `c_uint` string — `erts_internal:port_control/3` reads its
+    /// `Command` with `term_to_Uint` (`../../erts/emulator/beam/erl_bif_port.c:322-340`), which is
+    /// the same convention `beam_io` uses (`beam_io/src/abi/port.rs:716`).
+    ///
+    /// [`beam_io::PortControl::CLOSE`] (`"close"`) is **reserved** by that forwardee: it closes the
+    /// port instead of reaching a driver. A C driver's verbs are integers, so the reserved verb can
+    /// only arrive from a caller that meant the built-in drivers' close — and it closes the port
+    /// through `beam_io`, which is why a caller that must keep this registry's own metadata in step
+    /// uses [`PortRegistry::close`] instead.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never opened) —
+    /// `beam_io`'s own answer for an unknown port, and the oracle's for `port_control` on a dead
+    /// one — the driver's own rejection (a C driver with no `control` slot, or a negative result,
+    /// is also `badarg`), and the typed capability gap for a reply the driver answers from memory of
+    /// its own (see [`driver::DriverPortAdapter::control_reply`]).
+    pub fn port_control(&mut self, id: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
+        self.registry.port_control(&mut self.poller, id, op, arg)
+    }
+
     /// The registry's port-number table, mutably — the seam the **port-monitor** BIFs drive.
     ///
     /// This is the **same** [`beam_process::PortTable`] instance
@@ -1209,6 +1237,26 @@ impl RuntimePorts {
             .map_err(|_| error::unsupported("the port table is already in use"))
     }
 
+    /// `erts_internal:port_control(Port, Op, Data)` — deliver a port-control operation to the
+    /// port's driver and return its reply bytes.
+    ///
+    /// This is the runtime side of the `control` callback: it forwards to
+    /// [`PortRegistry::port_control`] (see there for the verb convention, the reserved `"close"`
+    /// verb and the full error set), which reaches the driver through `beam_io`'s port registry.
+    /// The reply is the **driver's own bytes**: this method never invents one, so an unsupported
+    /// driver state is a typed error rather than an empty answer.
+    ///
+    /// No `PortHook` method takes it yet — the port-control BIF arm
+    /// (`erts_internal:port_control/3`) does not exist — so this is the entry point that arm will
+    /// call (see `src/port/CONTEXT.md`'s Handoffs for the exact seam).
+    ///
+    /// # Errors
+    ///
+    /// As for [`PortRegistry::port_control`]; a nested borrow of the registry is the typed
+    /// capability gap of [`RuntimePorts::registry_mut`], never a panic.
+    pub fn port_control(&mut self, port: PortId, op: &str, arg: &[u8]) -> Result<Vec<u8>> {
+        self.registry_mut()?.port_control(port, op, arg)
+    }
     /// The name of `term`, when `term` is an atom interned in the shared table.
     fn atom_name(&self, term: Eterm) -> Option<&str> {
         if !is_atom(term) {

@@ -121,9 +121,14 @@
 //!   is present — `erl_async.c:604-613`) needs the driver's private state and entry, which the
 //!   frozen [`DriverHost`] seam does not give the host. It is reported as the C's own failure code
 //!   (`-1`) rather than faked.
-//! * **`driver_control`** (the driver's `control` callback behind `port_control/3`). It is
-//!   reachable only from the port lifecycle, and its reply protocol (`rbuf`/`rlen`, plus the
-//!   `driver_free_buf` rule for a driver-allocated reply) is not modelled here.
+//! * **`driver_control`'s reply *source*.** The entry's `control` callback behind `port_control/3`
+//!   **is** routed ([`DriverPortAdapter::control`]), but the C lets a driver answer from a buffer it
+//!   allocated itself (`*resp_bufp = driver_alloc(…)`, `io.c:4141-4168`), and reading that raw
+//!   pointer is precisely the raw-memory access this crate's `#![deny(unsafe_code)]` forbids. A
+//!   reply the driver writes into the buffer it was handed (and the C's `NIL`, a `NULL` reply
+//!   pointer) is served; a reply from the driver's own memory is the typed *unsupported* gap — never
+//!   a fabricated or truncated reply. Closing it needs a **safe** copy helper on `beam_abi`'s
+//!   [`DriverLibrary`] (recorded in `port/CONTEXT.md`'s Handoffs).
 //! * **A queued term carries no sending port.** The C stamps the port into the message header
 //!   (`from = prt->common.id`, `io.c:6172`), which is what send-tracing shows; a [`TermQueue`]
 //!   entry is `(destination, term)` only, so the runtime that drains it delivers the term itself
@@ -133,19 +138,19 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use libc::{c_int, c_ulong};
+use libc::{c_int, c_uint, c_ulong};
 
 use beam_abi::driver::loader::{self, DriverLibrary, DriverLoadError};
 use beam_abi::driver::types::{
-    ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlIOVec, ERTS_INVALID_ERL_DRV_PORT,
-    ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
+    ErlDrvBinary, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvSizeT, ErlIOVec,
+    ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_USE, ERL_DRV_USE_NO_CALLBACK, ERL_DRV_WRITE,
 };
 use beam_abi::{DriverEnv, DriverHost, SysIOVec};
 use beam_common::BeamError;
 use beam_alloc::Heap;
 use beam_io::{DriverContext, Interest, Token};
 use beam_process::ProcessId;
-use beam_term::{make_atom, Atom, AtomTable, Eterm};
+use beam_term::{make_atom, refc::ERL_ONHEAP_BINARY_LIMIT, Atom, AtomTable, Eterm};
 
 /// The atoms a driver first interned inside a callback, awaiting the port layer's commit.
 ///
@@ -985,8 +990,9 @@ pub fn load_driver(
 /// * `driver_async` keeps the [`beam_abi::DriverHost`] default (`-1`): see the module docs — there
 ///   is no async pool, and the C's in-band path needs the entry and the driver's private state,
 ///   which the frozen host seam does not hand the host function.
-/// * `driver_control` (the entry's `control` callback behind `port_control/3`) is not routed here
-///   yet, so [`beam_io::Driver::control`]'s default (no reply bytes) is used.
+/// * `driver_control` (the entry's `control` callback behind `port_control/3`) is routed by
+///   [`DriverPortAdapter::control`]; its only gap is a reply the driver answers from memory of its
+///   own rather than from the buffer it was handed (a typed *unsupported*, see the module docs).
 /// * A queued term is delivered without a sending-port identity (the C stamps `from = prt`).
 /// * `take_exit_status` is always `Ok(None)`: a driver port owns no child to reap, so no
 ///   `{Port, {exit_status, …}}` message is ever synthesized for it.
@@ -1308,8 +1314,9 @@ impl DriverPortAdapter {
     /// readiness the task was actually scheduled for.
     ///
     /// An entry that declares no callback for the direction is the C's `no_ready_*_callback`, which
-    /// the C substitutes for a `NULL` slot (`io.c:7523-7538`): it logs and **deselects** the event,
-    /// so the registration is dropped rather than spinning on a readiness nothing consumes.
+    /// the C substitutes for a `NULL` slot (`io.c:7518-7534`): it logs and **deselects** that
+    /// direction — with `ERL_DRV_USE_NO_CALLBACK`, so the substituted callback never re-enters
+    /// `stop_select` — rather than spinning on a readiness nothing consumes.
     ///
     /// # Errors
     ///
@@ -1336,13 +1343,19 @@ impl DriverPortAdapter {
         });
         match called {
             Ok(()) => {}
-            // The entry has no callback for this direction: the C's `no_ready_*_callback`.
+            // The entry has no callback for this direction: the C's `no_ready_input_callback`
+            // (`io.c:7518-7523`) / `no_ready_output_callback` (`io.c:7529-7534`), which deselect
+            // **exactly the direction the readiness was for** with the cancel bit
+            // (`ERL_DRV_READ|ERL_DRV_USE_NO_CALLBACK`, resp. the `ERL_DRV_WRITE` form). The cancel
+            // bit is load-bearing: it is what keeps the substituted callback from re-entering
+            // `stop_select` through `apply_select`'s "done with this event" form.
             Err(error) if error.is_absent() => {
+                let direction = if read { ERL_DRV_READ } else { ERL_DRV_WRITE };
                 self.apply_select(
                     ctx,
                     SelectRequest {
                         fd,
-                        mode: ERL_DRV_READ | ERL_DRV_WRITE,
+                        mode: direction | ERL_DRV_USE_NO_CALLBACK,
                         on: 0,
                     },
                 )?;
@@ -1378,6 +1391,56 @@ impl DriverPortAdapter {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// The bytes a `control` call answered with, read from whichever buffer the driver left its
+    /// reply pointer in.
+    ///
+    /// The C reads `cres` bytes from `*rbuf` unconditionally, because it is C: the pointer the
+    /// driver leaves is either the pre-allocated buffer it was handed or memory the driver owns.
+    /// Both are the *same bytes*; the difference is only whether this crate may read them. It is
+    /// `#![deny(unsafe_code)]` (workspace `../CONTEXT.md` §3), so a raw pointer may not be
+    /// dereferenced here — and the driver's own allocation (`driver_alloc` is a plain `malloc`,
+    /// `beam_abi`'s `driver/drv/mem.rs:62`) is exactly such a pointer.
+    ///
+    /// The reply is therefore sliced out of the buffers this call **owns** whenever the driver's
+    /// pointer addresses them — the reply buffer it was handed (the buffer-filling driver, and the
+    /// `ctl_reply` shape of `inet_drv.c`, which re-points `*rbuf` only when its answer does not fit
+    /// the 64 bytes it was given) or the request buffer it was passed. A pointer that addresses
+    /// neither is reported as the typed *unsupported* capability gap: the runtime cannot read the
+    /// driver's memory without the raw access its crate attributes forbid, and a truncated or empty
+    /// reply would be a fabricated one.
+    ///
+    /// A `NULL` reply pointer is the C's `NIL` (`io.c:4126`) — an empty reply, which is what this
+    /// returns.
+    ///
+    /// # Errors
+    ///
+    /// The typed capability gap for a reply from the driver's own memory.
+    fn control_reply(
+        reply: &[u8],
+        request: &[u8],
+        rbuf: *const std::os::raw::c_char,
+        len: usize,
+    ) -> beam_common::Result<Vec<u8>> {
+        if rbuf.is_null() {
+            return Ok(Vec::new());
+        }
+        let start = rbuf as usize;
+        for source in [reply, request] {
+            let base = source.as_ptr() as usize;
+            if start < base {
+                continue;
+            }
+            let offset = start - base;
+            // `offset + len <= source.len()`, written without an addition that could overflow.
+            if offset <= source.len() && len <= source.len() - offset {
+                return Ok(source[offset..offset + len].to_vec());
+            }
+        }
+        Err(crate::error::unsupported(
+            "a driver control reply from the driver's own memory",
+        ))
     }
 }
 /// Maps a driver-callback failure onto the runtime's error type.
@@ -1545,6 +1608,76 @@ impl beam_io::Driver for DriverPortAdapter {
         Ok(written)
     }
 
+    /// Runs the driver's `control` callback — the driver half of `erlang:port_control/3`
+    /// (`call_driver_control`, `io.c:4024-4078`).
+    ///
+    /// `command` is a C driver's verb, an **integer** on the wire: `erts_internal:port_control/3`
+    /// converts its `Command` with `term_to_Uint` (`erl_bif_port.c:322-340`, `> UINT_MAX` ⇒
+    /// `badarg`), which is why [`beam_io`]'s built-in C-driver host parses the same `&str` as a
+    /// decimal `c_uint` (`beam_io/src/abi/port.rs:716`). A verb that is not one is the caller's
+    /// `badarg`, never a driver call with a substituted command.
+    ///
+    /// The reply protocol is the C's exactly. The caller hands the driver a pre-allocated
+    /// [`ERL_ONHEAP_BINARY_LIMIT`]-byte buffer (`char resp_buf[…]`, `io.c:4352-4354`), `*rbuf`
+    /// initially pointing at it; the driver either writes into that buffer, re-points `*rbuf` at
+    /// memory of its own, or leaves it `NULL` — which the C renders as `NIL`
+    /// (`write_port_control_result`, `io.c:4126`). The bytes it reports (`cres`) are the reply.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the entry declares no `control` slot — the C's
+    /// `if (!prt->drv_ptr->control) return ERTS_PORT_OP_BADARG;` (`io.c:4035`) — when `command` is
+    /// not a decimal `c_uint`, or when the driver returned a negative result (`io.c:4074`), and the
+    /// typed capability gap of [`DriverPortAdapter::control_reply`] for a reply the driver answers
+    /// from memory of its own.
+    fn control(
+        &mut self,
+        ctx: &mut beam_io::DriverContext<'_>,
+        command: &str,
+        arg: &[u8],
+    ) -> beam_common::Result<Vec<u8>> {
+        let Some(driver) = self.driver.as_mut() else {
+            return Err(BeamError::BadArg);
+        };
+        let cmd: c_uint = command.parse().map_err(|_| BeamError::BadArg)?;
+        let state = self.state;
+        // The C passes the caller's `Data` as a writable buffer (`basep`, `io.c:4343-4348`) and the
+        // driver may read it for the duration of the call only — an owned copy gives it exactly
+        // that lifetime.
+        let mut buf = arg.to_vec();
+        // The C's reply buffer (`io.c:4352-4354`): `char resp_buf[ERL_ONHEAP_BINARY_LIMIT];
+        // char *resp_bufp = &resp_buf[0]; ErlDrvSizeT resp_size = sizeof(resp_buf);`.
+        let mut reply = vec![0u8; ERL_ONHEAP_BINARY_LIMIT];
+        let mut rbuf = reply.as_mut_ptr() as *mut std::os::raw::c_char;
+        let rlen = reply.len() as ErlDrvSizeT;
+        let called = publishing(driver, |library| {
+            library.control(
+                state,
+                cmd,
+                buf.as_mut_ptr() as *mut std::os::raw::c_char,
+                buf.len() as ErlDrvSizeT,
+                &mut rbuf,
+                rlen,
+            )
+        });
+        let cres = match called {
+            Ok(cres) => cres,
+            // The C's absent-`control` badarg (`io.c:4035`).
+            Err(error) if error.is_absent() => return Err(BeamError::BadArg),
+            Err(error) => return Err(driver_call_error(error)),
+        };
+        if cres < 0 {
+            // The C's `if (cres < 0) return ERTS_PORT_OP_BADARG;` (`io.c:4074`).
+            return Err(BeamError::BadArg);
+        }
+        let bytes = Self::control_reply(&reply, &buf, rbuf, cres as usize)?;
+        // A `control` callback is an ordinary driver callback: whatever it asked of its port (a
+        // `driver_select`, a `driver_set_timer`, a `driver_output`) is applied now, exactly as for
+        // every other callback (see [`DriverPortAdapter::settle`]).
+        self.settle(ctx)?;
+        Ok(bytes)
+    }
+
     /// Runs the driver's `timeout` callback for a fired port timer.
     ///
     /// The pending deadline is cleared **first** (the C's own order), so a callback that re-arms
@@ -1647,6 +1780,12 @@ mod ready_output_tests;
 /// "done with this event" form, the plain deselect that must not fire it, and the cancel form.
 #[cfg(test)]
 mod stop_select_tests;
+
+/// The A.4 **port-control regression suite** for [`DriverPortAdapter::control`] — the driver half of
+/// `port_control/3` — with the real C driver fixture it compiles (five reply verbs, plus the
+/// absent-slot build) and the reply-source rule of [`DriverPortAdapter::control_reply`].
+#[cfg(test)]
+mod control_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
