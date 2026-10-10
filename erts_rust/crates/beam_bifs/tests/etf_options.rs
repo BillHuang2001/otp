@@ -41,14 +41,22 @@
 //!   and `0` also clears `DFLAG_NEW_FLOATS` (legacy 31-byte `FLOAT_EXT`, `99`)
 //!   — with a UTF-8-tag fallback for a name that is not Latin-1-representable
 //!   (`external.c:2906-2932`), and combined with `compressed`;
-//! * `binary_to_term/2`'s `used` count (which includes the `131` version byte)
-//!   and `safe` (which refuses an image that would create an atom).
+//! * `binary_to_term/2`'s `used` count (which includes the `131` version byte, and
+//!   for a top-level `COMPRESSED` image stops at the zlib stream's end, so bytes after
+//!   the image are uncounted) and `safe` (which refuses an image that would create an
+//!   atom);
+//! * the two remaining `term_to_binary/2` flags: `deterministic` (byte-exact when no
+//!   map needs its keys re-sorted into atom-name order, a typed `unsupported_bif`
+//!   otherwise) and `local` (always a typed `unsupported_bif` — its `LOCAL_EXT` payload
+//!   is the node-local hash), plus the C's `badarg` for `iovec`/`fragment`, their
+//!   tuples, and the mutually exclusive `local` + `deterministic` pair.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, AtomInterner, BifContext};
+use beam_codec::compress::compress as zlib_compress;
 use beam_codec::term as codec_term;
 use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
@@ -75,8 +83,14 @@ const EXPORT_EXT_BLOB: &[u8] = &[
 
 /// The names every test table is seeded with. `compressed`, `minor_version`,
 /// `used`, `safe` and `bogus` are the option atoms the BIFs recognise (or
-/// reject); `lists`/`reverse` are **deliberately absent** so the `EXPORT_EXT`
-/// test actually exercises the [`AtomInterner`] seam.
+/// reject); `local`/`deterministic` select a flag and `iovec`/`fragment` are the
+/// oracle's `badarg` for a `term_to_binary/2` caller; `lists`/`reverse` are
+/// **deliberately absent** so the `EXPORT_EXT` test actually exercises the
+/// [`AtomInterner`] seam.
+///
+/// `a` is seeded before `b`, so `a`'s atom index is the lower one — the
+/// `deterministic` tests rely on that making a `[(a, _), (b, _)]` flat map's
+/// storage order coincide with the atom-name order the option demands.
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
     atoms.seed([
@@ -91,6 +105,10 @@ fn seeded_atoms() -> AtomTable {
         "used",
         "safe",
         "bogus",
+        "deterministic",
+        "local",
+        "iovec",
+        "fragment",
     ]);
     atoms
 }
@@ -136,6 +154,15 @@ fn assert_badarg(result: Result<Eterm>) {
         matches!(result, Err(BeamError::BadArg)),
         "expected badarg, got {result:?}"
     );
+}
+
+/// Whether `err` is the typed `unsupported_bif` capability gap (as opposed to a
+/// `badarg` rejection or the codec's `unsupported_external_term`).
+fn is_unsupported_bif(err: &BeamError) -> bool {
+    match err {
+        BeamError::Raise(raise) => raise.reason.as_atom() == Some("unsupported_bif"),
+        _ => false,
+    }
 }
 
 #[test]
@@ -720,4 +747,313 @@ fn binary_to_term_safe_option_refuses_a_fresh_atom() {
         reg.call("erlang", "binary_to_term", 1, &mut ctx, &[fresh]),
         Err(BeamError::TermNotFound)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// The `local` / `deterministic` options and the C's `badarg` rejections
+// ---------------------------------------------------------------------------
+
+/// `term_to_binary/2` accepts exactly `parse_t2b_opts`'s option set: `compressed`,
+/// `{compressed, Level}`, `{minor_version, N}`, the bare `deterministic`/`local`
+/// atoms — and nothing else. `iovec`/`fragment` (and their tuples) are the C's
+/// `badarg` for this caller, and `local` + `deterministic` are mutually exclusive.
+#[test]
+fn term_to_binary_accepts_the_oracles_option_set() {
+    let reg = default_registry();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let list = ctx
+        .list(&[
+            ctx.int(1).expect("fits"),
+            ctx.int(2).expect("fits"),
+            ctx.int(3).expect("fits"),
+        ])
+        .expect("fits");
+
+    // erl -noshell -eval 'io:format("~p~n",[term_to_binary([1,2,3],[deterministic])]),halt().'
+    //   % <<131,107,0,3,1,2,3>>   (a map-free term has nothing to re-sort, so the
+    //   option is accepted *and* byte-identical to the default image)
+    let deterministic = option_atom(&mut ctx, "deterministic");
+    assert_eq!(
+        bytes_of(
+            reg.call(
+                "erlang",
+                "term_to_binary",
+                2,
+                &mut ctx,
+                &[list, deterministic]
+            )
+            .expect("term_to_binary([1,2,3],[deterministic])")
+        ),
+        vec![VERSION_MAGIC, 107, 0, 3, 1, 2, 3]
+    );
+
+    // erl ... 'term_to_binary([1,2,3],[deterministic,deterministic])'  % <<131,107,0,3,1,2,3>>
+    // (repeating one option is fine; only the `local`+`deterministic` *pair* is refused)
+    let repeated = ctx
+        .list(&[
+            ctx.atom("deterministic").expect("seeded"),
+            ctx.atom("deterministic").expect("seeded"),
+        ])
+        .expect("fits");
+    assert_eq!(
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 2, &mut ctx, &[list, repeated])
+                .expect("term_to_binary([1,2,3],[deterministic,deterministic])")
+        ),
+        vec![VERSION_MAGIC, 107, 0, 3, 1, 2, 3]
+    );
+
+    // erl -noshell -eval 'try [term_to_binary([1,2,3],[O]) || O <- [iovec, fragment]]
+    //   catch error:badarg -> io:format("badarg") end, halt().'  % badarg
+    // `iovec` and `fragment` are accepted by `parse_t2b_opts` only for a caller that
+    // can receive an iovec / passed a fragment size (`external.c:1565-1617`);
+    // `term_to_binary/2` passes `NULL` for both, so it answers `badarg` — as it does
+    // for their tuples (`[{iovec,1}]`/`[{fragment,10}]` ⇒ `badarg`).
+    for name in ["iovec", "fragment"] {
+        let option = option_atom(&mut ctx, name);
+        assert_badarg(reg.call("erlang", "term_to_binary", 2, &mut ctx, &[list, option]));
+        let tuple = option_tuple(&mut ctx, name, 1);
+        assert_badarg(reg.call("erlang", "term_to_binary", 2, &mut ctx, &[list, tuple]));
+    }
+
+    // erl -noshell -eval 'try term_to_binary([1,2,3],[local,deterministic])
+    //   catch error:badarg -> io:format("badarg") end, halt().'  % badarg
+    // `parse_t2b_opts` rejects the pair after scanning the list
+    // (`external.c:1543-1545`), so the order does not matter.
+    for order in [["local", "deterministic"], ["deterministic", "local"]] {
+        let both = ctx
+            .list(&[
+                ctx.atom(order[0]).expect("seeded"),
+                ctx.atom(order[1]).expect("seeded"),
+            ])
+            .expect("fits");
+        assert_badarg(reg.call("erlang", "term_to_binary", 2, &mut ctx, &[list, both]));
+    }
+}
+
+/// `[local]` wraps the image in `[131][LOCAL_EXT][4-byte node hash]`; the hash is
+/// `local_node_hash(...)` — node/runtime state (`beam_rt`/`beam_dist`), re-derived on
+/// every VM start — so the BIF reports the typed `unsupported_bif` gap rather than a
+/// fabricated hash (`beam_codec::Encoder::finish_local` can write the wrapper; the
+/// missing piece is the hash value).
+#[test]
+fn term_to_binary_local_is_a_typed_gap() {
+    let reg = default_registry();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // erl -noshell -eval 'io:format("~p~n",[term_to_binary([1,2],[local])]),halt().'
+    //   % <<131,121,Hash:4/binary,107,0,2,1,2>>   (LOCAL_EXT is tag 121; `Hash` is
+    //   different on every run, which is exactly why it cannot be fabricated here)
+    let list = ctx
+        .list(&[ctx.int(1).expect("fits"), ctx.int(2).expect("fits")])
+        .expect("fits");
+    let local = option_atom(&mut ctx, "local");
+    let err = reg
+        .call("erlang", "term_to_binary", 2, &mut ctx, &[list, local])
+        .expect_err("local has no seam for the node hash");
+    assert!(
+        is_unsupported_bif(&err),
+        "expected the typed unsupported_bif gap, got {err:?}"
+    );
+
+    // `[local,compressed]` is a valid oracle option list, but the gap is reached
+    // before compression is considered, so it reports the same typed gap.
+    let both = ctx
+        .list(&[
+            ctx.atom("local").expect("seeded"),
+            ctx.atom("compressed").expect("seeded"),
+        ])
+        .expect("fits");
+    let err = reg
+        .call("erlang", "term_to_binary", 2, &mut ctx, &[list, both])
+        .expect_err("local + compressed still hits the hash gap");
+    assert!(is_unsupported_bif(&err), "local + compressed, got {err:?}");
+}
+
+/// The oracle's `[deterministic]` image of `#{a=>1,b=>2}` — pairs sorted by atom
+/// **name**. (The plain image of the same map is ordered by atom index instead, which
+/// for this table is the reverse: `<<…,119,1,98,97,2,119,1,97,97,1>>`.)
+///
+/// `erl -noshell -eval 'io:format("~p~n",[term_to_binary(#{a=>1,b=>2},
+/// [deterministic])]),halt().'`
+///   % <<131,116,0,0,0,2,119,1,97,97,1,119,1,98,97,2>>
+const DETERMINISTIC_MAP_AB: &[u8] = &[
+    131, 116, 0, 0, 0, 2, 119, 1, 97, 97, 1, 119, 1, 98, 97, 2,
+];
+
+/// `[deterministic]` is honoured byte-exactly whenever no map needs re-sorting: a
+/// map-free term is unchanged, and a flat map whose stored order already is the
+/// atom-name order is emitted as-is (the codec's map arms keep the stored order).
+#[test]
+fn term_to_binary_deterministic_is_byte_exact_when_no_resort_is_needed() {
+    let reg = default_registry();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let a = ctx.atom("a").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let one = ctx.int(1).expect("fits");
+    let two = ctx.int(2).expect("fits");
+
+    // `seeded_atoms` interns `a` before `b`, so this pair order is both the storage
+    // order and the deterministic (name) order — `make_flatmap` preserves the caller's
+    // order (sorting is the map constructor's job).
+    let map = codec_term::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
+    let deterministic = option_atom(&mut ctx, "deterministic");
+    assert_eq!(
+        bytes_of(
+            reg.call(
+                "erlang",
+                "term_to_binary",
+                2,
+                &mut ctx,
+                &[map, deterministic]
+            )
+            .expect("term_to_binary(#{a=>1,b=>2},[deterministic])")
+        ),
+        DETERMINISTIC_MAP_AB.to_vec()
+    );
+
+    // The same map with no option is byte-identical (its stored order already is the
+    // deterministic order) — erl ... 'term_to_binary(#{a=>1,b=>2})' would only differ
+    // for a table whose `a`/`b` indices were reversed.
+    let map = codec_term::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
+    assert_eq!(
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 1, &mut ctx, &[map])
+                .expect("term_to_binary(#{a=>1,b=>2})")
+        ),
+        DETERMINISTIC_MAP_AB.to_vec()
+    );
+
+    // A map nested in a container is walked too —
+    // erl ... 'term_to_binary({1,#{a=>1,b=>2}},[deterministic])'
+    //   % <<131,104,2,97,1,116,0,0,0,2,119,1,97,97,1,119,1,98,97,2>>
+    let map = codec_term::make_flatmap(ctx.heap(), &[(a, one), (b, two)]).expect("fits");
+    let nested = ctx.tuple(&[one, map]).expect("fits");
+    let deterministic = option_atom(&mut ctx, "deterministic");
+    let mut expected = vec![VERSION_MAGIC, 104, 2, 97, 1];
+    expected.extend_from_slice(&DETERMINISTIC_MAP_AB[1..]);
+    assert_eq!(
+        bytes_of(
+            reg.call(
+                "erlang",
+                "term_to_binary",
+                2,
+                &mut ctx,
+                &[nested, deterministic]
+            )
+            .expect("term_to_binary({1,#{a=>1,b=>2}},[deterministic])")
+        ),
+        expected
+    );
+}
+
+/// A map whose storage order differs from the deterministic (`erts_cmp`, i.e. atom
+/// **name**) order needs the re-sort `beam_codec`'s encoder cannot do, so
+/// `[deterministic]` reports the typed `unsupported_bif` — never the wrongly ordered
+/// plain image. Closing it needs `beam_codec::Encoder::with_deterministic()`.
+#[test]
+fn term_to_binary_deterministic_reports_a_typed_gap_when_a_map_must_be_resorted() {
+    let reg = default_registry();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let a = ctx.atom("a").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let one = ctx.int(1).expect("fits");
+    let two = ctx.int(2).expect("fits");
+
+    // Storage order `[b, a]` vs the name order `[a, b]`.
+    let map = codec_term::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
+    let deterministic = option_atom(&mut ctx, "deterministic");
+    let err = reg
+        .call(
+            "erlang",
+            "term_to_binary",
+            2,
+            &mut ctx,
+            &[map, deterministic],
+        )
+        .expect_err("the map needs a re-sort the encoder cannot do");
+    assert!(
+        is_unsupported_bif(&err),
+        "expected the typed unsupported_bif gap, got {err:?}"
+    );
+
+    // ...and the plain form of the very same map still encodes (the option is the only
+    // difference), so the gap is the re-sort and nothing else.
+    let map = codec_term::make_flatmap(ctx.heap(), &[(b, one), (a, two)]).expect("fits");
+    assert!(reg
+        .call("erlang", "term_to_binary", 1, &mut ctx, &[map])
+        .is_ok());
+}
+
+/// `binary_to_term/2`'s `[used]` count for a top-level `COMPRESSED` (tag 80) image is
+/// the image's own length: the C's count starts at the whole input and subtracts what
+/// the inflater left unread once the zlib stream ended
+/// (`external.c:1797-1801`/`:2011-2014`), so bytes *after* the stream are not counted.
+#[test]
+fn binary_to_term_used_option_counts_only_the_compressed_image() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 16).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // A hand-built image of a tiny body, so the count is exact whatever
+    // `term_to_binary/2`'s revert rule would do with the body:
+    // `[131][80][len:4 BE][zlib]` followed by four trailing bytes.
+    let body = [107u8, 0, 3, 1, 2, 3]; // LIST_EXT of [1,2,3], no version byte
+    let stream = zlib_compress(&body, 6).expect("deflate");
+    let mut image = vec![VERSION_MAGIC, COMPRESSED_EXT];
+    image.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    image.extend_from_slice(&stream);
+    let image_len = image.len();
+    let mut padded = image.clone();
+    padded.extend_from_slice(&[9, 8, 7, 6]);
+
+    // erl -noshell -eval 'Body = binary:part(term_to_binary([1,2,3]),1,6),
+    //   Z = zlib:compress(Body), C = <<131,80,6:32,Z/binary>>,
+    //   {T,N} = binary_to_term(<<C/binary,9,8,7,6>>,[used]),
+    //   io:format("~p~n",[{T =:= [1,2,3], N =:= byte_size(C)}]),halt().'  % {true,true}
+    //   (the count is the image's length, never the padded input's)
+    let blob = codec_term::make_binary(ctx.heap(), &padded).expect("fits");
+    let used = option_atom(&mut ctx, "used");
+    let result = reg
+        .call("erlang", "binary_to_term", 2, &mut ctx, &[blob, used])
+        .expect("binary_to_term of a padded COMPRESSED image");
+    assert_eq!(
+        signed_value(codec_term::tuple_element(result, 1).expect("element 1")),
+        image_len as i64,
+        "the count must stop at the zlib stream's end, not the padded input's"
+    );
+    // The decoded term is `[1,2,3]`: re-encoding it yields the body's plain image, and
+    // the four trailing bytes did not reach the decoder.
+    let decoded = codec_term::tuple_element(result, 0).expect("element 0");
+    assert_eq!(
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 1, &mut ctx, &[decoded])
+                .expect("the decoded list re-encodes")
+        ),
+        vec![VERSION_MAGIC, 107, 0, 3, 1, 2, 3]
+    );
+
+    // Without trailing bytes the count is the whole input (the common case, answered by
+    // a single probe rather than the search).
+    let blob = codec_term::make_binary(ctx.heap(), &image).expect("fits");
+    let used = option_atom(&mut ctx, "used");
+    let result = reg
+        .call("erlang", "binary_to_term", 2, &mut ctx, &[blob, used])
+        .expect("binary_to_term of the unpadded COMPRESSED image");
+    assert_eq!(
+        signed_value(codec_term::tuple_element(result, 1).expect("element 1")),
+        image_len as i64
+    );
 }
