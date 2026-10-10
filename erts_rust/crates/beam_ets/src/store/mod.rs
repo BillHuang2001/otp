@@ -49,15 +49,26 @@
 //! `unsafe fn` carries a `# Safety` section and every `unsafe` block a preceding
 //! `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
 //!
-//! # The copied subset (M1)
+//! # The copied subset
 //!
-//! [`TermStore::copy`] reproduces a term graph faithfully for: immediates
-//! (returned unchanged — their value is the word), cons cells, tuples, **flat
-//! maps**, and the pointer-free boxed leaves (float, bignum, internal ref, on-heap
-//! bitstring). Every other boxed kind — funs, records, external pid/port/ref,
-//! sub-bitstrings, off-heap binary references and hash maps — aliases storage that
-//! lives outside the term graph (code, another heap, an MSO binary) and is rejected
-//! with `badarg`; see the crate `CONTEXT.md`, *Known Issues*.
+//! [`TermStore::copy`] reproduces a term graph faithfully for every kind the oracle
+//! accepts in `ets:insert/2`: immediates (returned unchanged — their value is the
+//! word), cons cells, tuples, **flat maps**, **hash maps** (HAMT nodes, collision
+//! nodes and their leaf cells, copied node by node so no `AtomTable` is needed),
+//! **funs** (all three kinds — the self-contained header/descriptor words verbatim
+//! plus a deep-copied environment), the pointer-free boxed leaves (float, bignum,
+//! internal ref, on-heap bitstring), **external pid/port/reference** (the raw data
+//! words, with the `node` term slot deep-copied), and **sub-bitstrings** / off-heap
+//! refc binaries, which are re-materialised as self-contained on-heap bitstrings
+//! (the payload bytes are gathered and re-written, so no off-heap pointer survives).
+//!
+//! The residual typed gaps (`badarg`, never a wrong result) are terms the oracle
+//! cannot produce here or that are not standalone terms at all: a bare `BinRef` (it
+//! is only ever reached as the `orig` of the refc pair [`TermStore::copy_sub_bits`]
+//! reconstructs), a native record (`RECORD_SUBTAG` — an OTP-29 feature this
+//! toolchain does not enable), the reserved boxed subtags (`0x04`/`0x3C`), a bare
+//! header word, and a malformed `ErlSubBits` whose base pointer is null or whose
+//! `end` precedes its `start`. See the crate `CONTEXT.md`, *Known Issues*.
 //!
 //! # Flat-map layout (why `copy` reads the size word, not the header arity)
 //!
@@ -596,15 +607,34 @@ impl TermStore {
                 if is_flatmap_header(hdr) {
                     self.copy_flatmap(term, hdr)
                 } else {
-                    // Hash maps (HAMT heads, bitmap/array nodes and collision nodes)
-                    // share node blocks reachable from several terms; not copyable
-                    // in M1.
-                    Err(crate::error::badarg())
+                    // A >32-key map is a HAMT: a head node (array/bitmap) plus inner
+                    // bitmap nodes and collision nodes, with the leaf `[Key, Value]`
+                    // cons cells. Every node block is copied recursively into table
+                    // storage (see [`TermStore::copy_hashmap`]).
+                    self.copy_hashmap(term, hdr)
                 }
             }
 
-            // Fun, Record, SubBits, BinRef, ExternalPid/Port/Ref and the reserved
-            // subtags: each aliases storage outside the term graph.
+            // A fun (local `make_fun3`, external `EXPORT_EXT` or imported
+            // `NEW_FUN_EXT`): the header and descriptor words are self-contained
+            // (atoms + raw scalars), the environment is deep-copied.
+            Some(BoxedTag::Fun) => self.copy_fun(term, hdr),
+
+            // A sub-bitstring (a match context or a refc binary's window): its data
+            // lives in storage outside the term graph (off-heap payload, or another
+            // heap), so it is re-materialised as a self-contained on-heap bitstring.
+            Some(BoxedTag::SubBits) => self.copy_sub_bits(term),
+
+            // External pid / port / reference: the three-word head plus a raw
+            // `u32`/`u64` payload — no off-heap pointer survives the copy.
+            Some(BoxedTag::ExternalPid)
+            | Some(BoxedTag::ExternalPort)
+            | Some(BoxedTag::ExternalRef) => self.copy_external(term),
+
+            // A bare `BinRef` is never a standalone term (it is reached only as the
+            // `orig` of the refc pair `copy_sub_bits` reconstructs), a native record
+            // (`RECORD_SUBTAG`) is an OTP-29 feature this toolchain does not enable,
+            // and `0x04`/`0x3C` are reserved subtags: each is a typed `badarg`.
             _ => Err(crate::error::badarg()),
         }
     }
@@ -656,6 +686,163 @@ impl TermStore {
         }
         Ok(make_boxed(p as *const Eterm))
     }
+
+    /// Copies a **hash map** node (`term`'s header word is `hdr`, not a flat-map
+    /// header).
+    ///
+    /// A HAMT node is `[header][arity words][slot …]`: the two head kinds
+    /// (`MAP_HEADER_TAG_HAMT_HEAD_ARRAY`/`_BITMAP`) carry one raw `size` word after
+    /// the header (`header_arity(hdr) == 1`), an inner node (`_NODE_BITMAP`) none
+    /// (`header_arity(hdr) == 0`), and one slot per set occupancy bit
+    /// (`map_header_val(hdr).count_ones()`). A slot is either a `[Key, Value]` cons
+    /// cell, a sub-node, or a collision node (an ordinary arityval tuple of cons
+    /// cells); each is copied recursively. This reproduces the ERTS interior exactly,
+    /// without needing the `AtomTable` that `beam_term::map::write_map` requires.
+    fn copy_hashmap(&mut self, term: Eterm, hdr: Eterm) -> Result<Eterm> {
+        let src = boxed_val(term);
+        // SAFETY: `term` is a live hash-map node whose header word is `hdr`.
+        let words = unsafe { object_words(hdr, src) };
+        let arity = header_arity(hdr);
+        let nslots = map_header_val(hdr).count_ones() as usize;
+        let p = self.alloc_words(words)?;
+        // SAFETY: `p` addresses `words` freshly reserved words; the header plus the
+        // head kinds' single raw `size` word are never terms, so they are reproduced
+        // word for word.
+        unsafe { core::ptr::copy_nonoverlapping(src, p, 1 + arity) };
+        for i in 0..nslots {
+            let off = 1 + arity + i;
+            // SAFETY: slot `off` lies inside the source node's `words` words.
+            let slot = unsafe { *src.add(off) };
+            let slot = if is_list(slot) {
+                self.copy_term(slot)?
+            } else if is_boxed_term(slot) {
+                // SAFETY: a non-leaf slot is a live sub-node or collision tuple.
+                let shdr = unsafe { *boxed_val(slot) };
+                self.copy_boxed(slot, shdr)?
+            } else {
+                return Err(crate::error::badarg());
+            };
+            // SAFETY: slot `off` lies inside the freshly reserved block.
+            unsafe { *p.add(off) = slot };
+        }
+        Ok(make_boxed(p as *const Eterm))
+    }
+
+    /// Copies a **fun** block (`term`'s header word is `hdr`).
+    ///
+    /// The header and the descriptor words carry only atom immediates and raw
+    /// scalars (the M1 inlined-descriptor substitution — `beam_term::fun`), so they
+    /// are reproduced word for word; the `num_free` environment words
+    /// (`env[i]` at `1 + desc_words(kind) + i`) are deep-copied. One arm covers all
+    /// three kinds ([`FunKind::Local`]/[`FunKind::External`]/[`FunKind::Imported`]).
+    fn copy_fun(&mut self, term: Eterm, hdr: Eterm) -> Result<Eterm> {
+        let desc = fun_desc_words(fun_kind_of_header(hdr));
+        let num_free = fun_num_free(hdr);
+        let words = 1 + desc + num_free;
+        let p = self.alloc_words(words)?;
+        // SAFETY: `p` addresses `words` freshly reserved words and the source fun block
+        // is exactly that size; header + descriptor contain no interior term pointer.
+        unsafe { core::ptr::copy_nonoverlapping(boxed_val(term), p, 1 + desc) };
+        for i in 0..num_free {
+            // SAFETY: `env[i]` lives at `1 + desc + i` inside the source fun block.
+            let var = unsafe { *boxed_val(term).add(1 + desc + i) };
+            let var = self.copy_term(var)?;
+            // SAFETY: the environment slot is inside the reserved block.
+            unsafe { *p.add(1 + desc + i) = var };
+        }
+        Ok(make_boxed(p as *const Eterm))
+    }
+
+    /// Copies a **sub-bitstring** (`ErlSubBits`) as a self-contained on-heap
+    /// bitstring, so the copy never aliases the source's storage — an off-heap
+    /// refc payload (or the source's own heap) that may be reclaimed independently.
+    ///
+    /// The bit window (`start`/`end`, a bit range, not a byte range) is gathered
+    /// through the source's masked base pointer and re-materialised with
+    /// `beam_term::bitstring::write_heap_bits` over `heap_bits_size_words(size_bits)`
+    /// words. A window whose base is null (a malformed synthetic `ErlSubBits`, which
+    /// the C would dereference) or whose `end` precedes its `start` is a typed
+    /// `badarg` rather than a fault.
+    fn copy_sub_bits(&mut self, term: Eterm) -> Result<Eterm> {
+        // SAFETY: `term` is a live `ErlSubBits` — the caller dispatched on its header.
+        let (base_flags, start, end, _orig) = unsafe { sub_bits_parts(term) };
+        let start_bits = start.raw();
+        let end_bits = end.raw();
+        let size_bits = match end_bits.checked_sub(start_bits) {
+            Some(size) => size,
+            None => return Err(crate::error::badarg()),
+        };
+        let base = (base_flags.raw() & !(ERL_SUB_BITS_FLAG_MASK as usize)) as *const u8;
+        if base.is_null() && size_bits > 0 {
+            // No readable payload: reject instead of dereferencing a null base.
+            return Err(crate::error::badarg());
+        }
+        let bytes = gather_bits(base, start_bits, size_bits);
+        let p = self.alloc_words(heap_bits_size_words(size_bits))?;
+        // SAFETY: `p` addresses `heap_bits_size_words(size_bits)` words — exactly what
+        // `write_heap_bits` writes for a `size_bits`-bit string — and `bytes` holds the
+        // gathered window.
+        let copied = unsafe { write_heap_bits(p, &bytes, size_bits) }?;
+        Ok(copied)
+    }
+
+    /// Copies an external pid/port/reference block (`[header, node, next, payload]`).
+    ///
+    /// The tail words are a raw `u32`/`u64` payload (never terms) and `next` carries
+    /// the node creation (the M1 substitution — `beam_term::thing`), so the block is
+    /// reproduced verbatim. Word 1 (`node`) **is** a term slot and is deep-copied when
+    /// it is not an immediate, so a boxed node never left pointing at the source.
+    fn copy_external(&mut self, term: Eterm) -> Result<Eterm> {
+        let src = boxed_val(term);
+        // SAFETY: `term` is a live external pid/port/reference, so word 0 is its header
+        // and the block is `object_words` words long.
+        let words = unsafe { object_words(*src, src) };
+        let p = self.alloc_words(words)?;
+        // SAFETY: `p` addresses `words` freshly reserved words and the source block is
+        // exactly that size; both are live and non-overlapping.
+        unsafe { core::ptr::copy_nonoverlapping(src, p, words) };
+        // SAFETY: word 1 of an external thing is its `node` term slot.
+        let node = unsafe { *src.add(1) };
+        if !is_immediate(node) {
+            let node = self.copy_term(node)?;
+            // SAFETY: word 1 lies inside the reserved block.
+            unsafe { *p.add(1) = node };
+        }
+        Ok(make_boxed(p as *const Eterm))
+    }
+}
+
+/// Gathers `size_bits` bits starting at bit `offset` of `base` into a fresh byte
+/// buffer of [`bit_count_to_bytes`]`(size_bits)` bytes, most-significant bit of the
+/// first byte first — the ERTS bitstring convention (`beam_term::bitstring`).
+///
+/// The byte-aligned case (the common one: a full refc binary, or a byte-aligned
+/// match window) is a plain slice copy; a non-byte-aligned window is re-packed bit
+/// by bit.
+///
+/// # Safety
+///
+/// `base` must address storage covering bits `offset .. offset + size_bits` (a null
+/// `base` is only ever passed with `size_bits == 0`, which reads nothing).
+fn gather_bits(base: *const u8, offset: usize, size_bits: usize) -> Vec<u8> {
+    let n_bytes = bit_count_to_bytes(size_bits);
+    let mut bytes = vec![0u8; n_bytes];
+    if n_bytes == 0 {
+        return bytes;
+    }
+    // SAFETY: the caller guarantees `base` covers the requested bit window.
+    unsafe {
+        if offset % 8 == 0 {
+            let src = core::slice::from_raw_parts(base.add(offset / 8), n_bytes);
+            bytes.copy_from_slice(src);
+            return bytes;
+        }
+        for i in 0..size_bits {
+            let bit = (*base.add((offset + i) >> 3) >> (7 - ((offset + i) & 7))) & 1;
+            bytes[i >> 3] |= bit << (7 - (i & 7));
+        }
+    }
+    bytes
 }
 
 impl Drop for TermStore {
