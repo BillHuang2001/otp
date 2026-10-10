@@ -57,7 +57,7 @@ Edit the tracked generator *inputs* instead: `beam/{bif.tab,erl_dirty_bif.tab,at
 ## Design Decisions
 - **One source tree, two execution engines.** `beam/emu/` (portable C interpreter) and `beam/jit/` (BeamAsm, C++ on asmjit, x86_64/aarch64) implement the same opcode semantics; the instruction set is defined once in `.tab` files consumed by `utils/beam_makeops`. JIT is the default on supported platforms; the interpreter is the fallback and the semantic reference.
 - **Opcode metamodel.** `lib/compiler/src/genop.tab` + `beam/predicates.tab` + `beam/generators.tab` + the flavor's `ops.tab` are the single source of truth; `beam_makeops` emits both the interpreter's code and the JIT's emit switch/prototypes. The compiler and the emulator share that generator.
-- **OS differences are expressed by directory, not by `#ifdef`.** `drivers/{common,unix,win32,vxworks}`, `nifs/{common,unix,win32}`, `sys/{common,unix,win32}`; `ERLANG_OSTYPE` selects the OS subtree and cross-platform code lives in `common/`.
+- **OS differences are expressed by directory, not by `#ifdef`.** `drivers/{common,win32}`, `nifs/{common,unix,win32}`, `sys/{common,unix,win32}`; `ERLANG_OSTYPE` selects the OS subtree and cross-platform code lives in `common/`.
 - **Third-party code is vendored and swappable.** Vendored copies keep the build hermetic; `--enable-builtin-ryu|zstd|zlib` (and `--enable-use-embedded-3pp-alternatives`) select system libraries instead. PCRE2 is always built from `pcre/` (no system alternative).
 - **Yielding C functions.** `../lib_src/yielding_c_fun` source-to-source rewrites selected functions of `beam/erl_db.c`, `beam/erl_map.c`, `beam/utils.c` so long-running BIF work can trap/yield; it is built before the emulator and also shipped in `bootstrap/`.
 - **PGO is a first-class build mode.** `PROFILE=generate` builds `beam.prof*` and runs `test/estone_SUITE` as the training workload; `PROFILE=use` rebuilds with the profile data. Top-level `make` drives this via `USE_PGO`.
@@ -107,7 +107,7 @@ Edit the tracked generator *inputs* instead: `beam/{bif.tab,erl_dirty_bif.tab,at
 - `beam/` → VM core C sources & public headers (`erl_driver.h`/`erl_nif.h`/…), BIFs, GC, processes, ETS, allocators, code loading, distribution, tracing
   - `beam/jit/` → BeamAsm JIT (C++/asmjit) and its `x86/` + `arm/` backends, `ops.tab`/`instr_*.cpp`
   - `beam/emu/` → the C interpreter (`beam_emu.c`), `emu_load.c`, and all interpreter `.tab` files
-- `drivers/` → built-in static drivers (`common/`, `unix/`, `win32/`, legacy `vxworks/`)
+- `drivers/` → built-in static drivers (`common/`: `inet_drv.c`, `ram_file_drv.c`; `win32/`: `registry_drv.c`)
 - `nifs/` → built-in static NIFs (`common/` incl. the esock socket NIFs, `unix/`, `win32/`)
 - `sys/` → OS abstraction layer: poll/check_io, mmap/mseg, timers, `main()`, ddll, `erl_child_setup`, per-OS `driver_int.h`
 - `utils/` → build code generators (Perl/shell/escript): `beam_makeops`, `make_tables`, `make_preload`, `make_alloc_types`, `make_driver_tab`, `make_version`, `make_compiler_flags`, `gen_git_version`, `beam_emu_vars`, `find_cross_ycf`
