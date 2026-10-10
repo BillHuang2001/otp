@@ -232,20 +232,37 @@ fn map_of_the_empty_list_calls_nothing() {
 
 #[test]
 fn map_rejects_a_non_list_and_an_improper_list() {
+    // A **non-list** matches neither clause of `map/2`'s own
+    // `case List of [Hd|Tail] -> …; [] -> … end`, so the oracle raises
+    // `{case_clause, a}`. `case_clause` is not a predefined emulator atom and this
+    // mock's context installs no `AtomInterner`, so the structured raise degrades to
+    // the crate's historical `badarg`; the exact reason is pinned against the oracle
+    // by `tests/lists_errors.rs`, which seeds the tag.
     let ((), calls) = with_mock(|reg, ctx| {
         let non_list = ctx.atom("a").expect("seeded");
-        let improper = ctx.cons(make_small(1), make_small(2)).expect("fits");
-        for bad in [non_list, improper] {
-            let args = [make_small(SQUARE), bad];
-            // The oracle raises `case_clause`/`function_clause`; Milestone-1 reports
-            // `badarg` (documented in the module docs).
-            assert!(matches!(
-                reg.call("lists", "map", 2, ctx, &args),
-                Err(BeamError::BadArg)
-            ));
-        }
+        let args = [make_small(SQUARE), non_list];
+        assert!(matches!(
+            reg.call("lists", "map", 2, ctx, &args),
+            Err(BeamError::BadArg)
+        ));
     });
     assert!(calls.is_empty(), "no element of a rejected list is visited");
+
+    // An **improper tail** is reached *after* the leading elements: the `map_1/2`
+    // worker has no clause for it, so `map/2` runs the fun on the leading element(s)
+    // and then raises `error:function_clause` (oracle:
+    // `lists:map(fun(X) -> X end, [1|2])` calls the fun on `1` and then fails).
+    let ((), calls) = with_mock(|reg, ctx| {
+        let improper = ctx.cons(make_small(1), make_small(2)).expect("fits");
+        let args = [make_small(SQUARE), improper];
+        assert!(matches!(
+            reg.call("lists", "map", 2, ctx, &args),
+            Err(BeamError::Raise(r))
+                if r.class == ExceptionClass::Error
+                    && r.reason == ExitReason::atom("function_clause")
+        ));
+    });
+    assert_eq!(calls, vec![(SQUARE, vec![make_small(1)])], "the leading element ran");
 
     // A *proper* list of non-integers is **not** rejected by `map/2` itself: the walk
     // reaches the fun, whose own failure is what surfaces (oracle:
