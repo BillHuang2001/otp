@@ -148,6 +148,7 @@ use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
@@ -540,6 +541,136 @@ impl RuntimeContext<'_> {
         }
         let list = terms::make_list(self, &results)?;
         self.ok_tuple(list)
+    }
+
+    // -- prim_file:ipread_s32bu_p32bu/3 ---------------------------------------
+
+    /// `prim_file:ipread_s32bu_p32bu/3` — the indirectly addressed block DETS reads
+    /// (`prim_file.erl:450-477`, `ipread_s32bu_p32bu_nif_impl`,
+    /// `prim_file_nif.c:914-987`).
+    ///
+    /// The 8 bytes at `Offset` are a **pointer block**,
+    /// `<<Size:32/big-unsigned, Pointer:32/big-unsigned>>` (`get_int32`, `sys.h:1274`):
+    /// `Size` is the payload's length and `Pointer` its absolute address. The C reads the
+    /// block, answers the bare `eof` when fewer than 8 bytes came back, answers `eof` again
+    /// when `Size` exceeds `MaxSize`, and then reads `Size` bytes at `Pointer`: nothing
+    /// there is `{ok,{Size,Pointer,eof}}`, otherwise the bytes (shrunk to what was really
+    /// read). A host failure is its `errno`, before **or** after the pointer read.
+    ///
+    /// The wrapper's clause set (`prim_file.erl:459-468`) is reproduced in order: **any**
+    /// atom for `MaxSize` is the `infinity` form (so it always wins), which substitutes
+    /// `(1 bsl 31) - 1` and then still needs an integer `Offset`; the integer clause needs
+    /// **both** to be integers; everything else is the *value* `{error,badarg}`. Both
+    /// wrapper clauses and the NIF's own `enif_get_int64` split a bignum out of that: it
+    /// satisfies `is_integer/1` but not `int64`, so it is `{error,einval}` — while a float,
+    /// which the guard itself rejects, is `{error,badarg}`.
+    ///
+    /// Oracle (file = `>II(5,64)` + 56 zero bytes + `<<"HELLO">>` at 64):
+    /// `ipread(Fd,0,100)`⇒`{ok,{5,64,<<"HELLO">>}}`; `ipread(Fd,0,5)`⇒the same;
+    /// `ipread(Fd,0,3)`/`(Fd,0,0)`⇒`eof` (`5 > MaxSize`); `ipread(Fd,100,100)`⇒`eof`
+    /// (short pointer read); `ipread(Fd,64,100)`⇒`eof`;
+    /// `ipread(Fd,-1,10)`/`(Fd,0,1 bsl 31)`⇒`{error,einval}`;
+    /// `ipread(Fd,0,foo)`/`(Fd,0,infinity)`⇒the `{ok,…}` above (any atom is `infinity`);
+    /// `ipread(Fd,0.0,10)`/`(Fd,0,10.0)`/`(Fd,"a",10)`⇒`{error,badarg}`;
+    /// `ipread(ClosedFd,0,100)`⇒`{error,einval}`.
+    ///
+    /// `// documented divergence:` a term that is not a `#file_descriptor{}` raises
+    /// `function_clause` in the oracle; this runtime answers the shared
+    /// malformed-descriptor value `{error,badarg}`.
+    pub(super) fn prim_ipread(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let offset = *args.get(1).ok_or(BeamError::BadArg)?;
+        let max = *args.get(2).ok_or(BeamError::BadArg)?;
+        // `ipread_s32bu_p32bu/3`'s head guards, before the descriptor is consulted at all.
+        let offset_arg = integer_arg(offset);
+        let max_arg = integer_arg(max);
+        let max_is_integer = is_atom(max) || !matches!(max_arg, IntegerArg::NotInteger);
+        if !max_is_integer || matches!(offset_arg, IntegerArg::NotInteger) {
+            return self.error_tuple("badarg");
+        }
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        // The NIF entry's state check runs before the body: a closed (or unknown) handle is
+        // `{error,einval}` whatever the offsets are.
+        if !self.runtime.open_files_mut().contains_key(&descriptor.id) {
+            return self.error_tuple("einval");
+        }
+        // The NIF's own argument checks (`prim_file_nif.c:926-928`), `Offset` first.
+        let offset = match offset_arg {
+            IntegerArg::Value(value) => value,
+            IntegerArg::Big => return self.error_tuple("einval"),
+            // Unreachable: the guard above already answered a non-integer. Kept as the same
+            // value rather than a panic.
+            IntegerArg::NotInteger => return self.error_tuple("badarg"),
+        };
+        let max = match max_arg {
+            IntegerArg::Value(value) => value,
+            IntegerArg::Big => return self.error_tuple("einval"),
+            // Only an atom reaches here (the guard above): `infinity`'s replacement,
+            // `(1 bsl 31) - 1` (`prim_file.erl:460`).
+            IntegerArg::NotInteger => INFINITE_MAX_PAYLOAD,
+        };
+        if offset < 0 || max >= 1 << 31 {
+            return self.error_tuple("einval");
+        }
+        let outcome = match self.runtime.open_files_mut().get(&descriptor.id) {
+            None => None,
+            Some(file) => Some(ipread(file, offset as u64, max)),
+        };
+        match outcome {
+            None => self.error_tuple("einval"),
+            Some(Err(error)) => self.error_tuple_for(&error),
+            Some(Ok(IpRead::Eof)) => self.atom("eof"),
+            Some(Ok(IpRead::Payload { size, offset, bytes })) => {
+                let size = make_small(i64::from(size));
+                let offset = make_small(i64::from(offset));
+                let data = match bytes {
+                    None => self.atom("eof")?,
+                    Some(bytes) => beam_codec::term::make_binary(self.eval_heap(), &bytes)?,
+                };
+                let block = terms::make_tuple(self, &[size, offset, data])?;
+                self.ok_tuple(block)
+            }
+        }
+    }
+
+    // -- prim_file:get_handle/1 -----------------------------------------------
+
+    /// `prim_file:get_handle/1` — the underlying native descriptor as a binary
+    /// (`prim_file.erl:473-484` → `get_handle_nif` → `efile_get_handle`,
+    /// `unix_prim_file.c:103-113`).
+    ///
+    /// The C copies the native `int` descriptor into a fresh binary of `sizeof(fd)` bytes
+    /// on the **native** byte order; this runtime reuses the very descriptor the `read`/
+    /// `write`/`pread`/`pwrite` entries above operate on, through
+    /// [`AsRawFd::as_raw_fd`] + `i32::to_ne_bytes` — the same `int`, the same order.
+    ///
+    /// Oracle: a 4-byte binary (`<<17,0,0,0>>` on a little-endian host);
+    /// `get_handle(ClosedFd)`⇒`{error,einval}`.
+    ///
+    /// `// documented divergence:` the descriptor *number* is this runtime's own open-file
+    /// table's (`Runtime::open_files_mut` really owns the `std::fs::File`, and the process
+    /// that happens to hold it is this one), so it cannot equal the oracle's number for the
+    /// same logical file — the **shape** (4 bytes, native order, the descriptor every
+    /// operation above really uses) is exact. A term that is not a `#file_descriptor{}`
+    /// raises `function_clause` in the oracle; this runtime answers the shared
+    /// malformed-descriptor value `{error,badarg}`.
+    pub(super) fn prim_get_handle(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fd = *args.first().ok_or(BeamError::BadArg)?;
+        let Some(descriptor) = self.decode_descriptor(fd) else {
+            return self.error_tuple("badarg");
+        };
+        self.check_owner(&descriptor)?;
+        let outcome = match self.runtime.open_files_mut().get(&descriptor.id) {
+            None => None,
+            Some(file) => Some(file.as_raw_fd().to_ne_bytes()),
+        };
+        match outcome {
+            None => self.error_tuple("einval"),
+            Some(bytes) => beam_codec::term::make_binary(self.eval_heap(), &bytes),
+        }
     }
 
     // -- prim_file:pwrite/3, pwrite/2 -----------------------------------------
@@ -1156,7 +1287,83 @@ enum ReadPiece {
     /// The bytes the kernel returned ⇒ a binary.
     Bytes(Vec<u8>),
 }
-/// The flattened bytes of a `write/2` iodata argument — `erlang:iolist_to_iovec/1`'s walk
+
+/// The payload size `ipread_s32bu_p32bu/3` substitutes for the `infinity` form
+/// (`(1 bsl 31) - 1`, `prim_file.erl:460`).
+///
+/// It is one below the NIF's own refusal bound (`max_payload_size >= 1u << 31` ⇒ `EINVAL`,
+/// `prim_file_nif.c:926-928`), which is exactly what makes `infinity` legal.
+const INFINITE_MAX_PAYLOAD: i64 = (1 << 31) - 1;
+
+/// The `ipread_s32bu_p32bu/3` pointer block's size in bytes (`sizeof(pointer_block)`,
+/// `prim_file_nif.c:920`).
+const IPREAD_POINTER_BYTES: usize = 8;
+
+/// One `ipread` argument, classified by the wrapper's `is_integer/1` **and** the NIF's
+/// `enif_get_int64` (`prim_file.erl:459-462`, `prim_file_nif.c:926-928`).
+///
+/// The two disagree on a bignum — the Erlang guard accepts it, `enif_get_int64` does not —
+/// and that gap is precisely what separates the wrapper's `{error,badarg}` (a float, an
+/// atom, a list, which the *guard* rejects) from the NIF's `{error,einval}`.
+#[derive(Debug, Clone, Copy)]
+enum IntegerArg {
+    /// A small integer, i.e. an `int64` for the C.
+    Value(i64),
+    /// A bignum: `is_integer/1` accepts it, `enif_get_int64` refuses it.
+    Big,
+    /// Not an integer at all ⇒ the wrapper's `{error,badarg}`.
+    NotInteger,
+}
+
+/// Classifies `term` the way `is_integer/1` + `enif_get_int64` do.
+fn integer_arg(term: Eterm) -> IntegerArg {
+    if is_small(term) {
+        return IntegerArg::Value(signed_value(term));
+    }
+    if beam_codec::term::big_parts(term).is_ok() {
+        return IntegerArg::Big;
+    }
+    IntegerArg::NotInteger
+}
+
+/// The two-read sequence of `ipread_s32bu_p32bu_nif_impl` (`prim_file_nif.c:914-987`).
+enum IpRead {
+    /// Fewer than [`IPREAD_POINTER_BYTES`] bytes at the pointer offset (`am_eof`), or a
+    /// payload size above `MaxSize` ⇒ the bare atom `eof`.
+    Eof,
+    /// The payload block: `bytes` is `None` for the C's zero-byte read (`am_eof` as the
+    /// triple's third element) and the really-read bytes otherwise.
+    Payload {
+        /// `Size`, the payload length the pointer block declared.
+        size: u32,
+        /// `Pointer`, the payload's absolute offset.
+        offset: u32,
+        /// The bytes the payload read returned, `None` when it returned none.
+        bytes: Option<Vec<u8>>,
+    },
+}
+
+/// The `ipread` read sequence: the big-endian pointer block at `pointer_offset`, then the
+/// payload at the address it names.
+///
+/// Both reads are [`pread_extent`]'s (the same one-`pread(2)`-per-extent rule this module's
+/// `pread/3` uses, i.e. the C's `efile_preadv`), so the file position is never touched.
+fn ipread(file: &File, pointer_offset: u64, max_payload: i64) -> io::Result<IpRead> {
+    let block = pread_extent(file, pointer_offset, IPREAD_POINTER_BYTES)?;
+    if block.len() < IPREAD_POINTER_BYTES {
+        return Ok(IpRead::Eof);
+    }
+    // `get_int32` (`sys.h:1274`) is a big-endian 32-bit read, reinterpreted unsigned
+    // (`(Uint32)get_int32(...)`, `prim_file_nif.c:948-949`).
+    let size = u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
+    let offset = u32::from_be_bytes([block[4], block[5], block[6], block[7]]);
+    if i64::from(size) > max_payload {
+        return Ok(IpRead::Eof);
+    }
+    let bytes = pread_extent(file, u64::from(offset), size as usize)?;
+    let bytes = if bytes.is_empty() { None } else { Some(bytes) };
+    Ok(IpRead::Payload { size, offset, bytes })
+}/// The flattened bytes of a `write/2` iodata argument — `erlang:iolist_to_iovec/1`'s walk
 /// (`erl_bif_binary.c`), `None` for the `badarg` it raises.
 ///
 /// Accepted: a byte-aligned binary (its bytes), a byte (`0..=255`), and a proper list of

@@ -134,7 +134,7 @@ use beam_engine::terms;
 use beam_term::{is_atom, is_list, is_nil, is_small, signed_value, Eterm};
 
 use super::RuntimeContext;
-
+use crate::error;
 impl RuntimeContext<'_> {
     /// The `prim_file:*` half of the native floor.
     ///
@@ -176,6 +176,56 @@ impl RuntimeContext<'_> {
             ("datasync", 1) => Some(self.prim_datasync(args)),
             ("write_file", 2) => Some(self.prim_write_file(args)),
             ("set_cwd", 1) => Some(self.prim_set_cwd(args)),
+            ("ipread_s32bu_p32bu", 3) => Some(self.prim_ipread(args)),
+            ("get_handle", 1) => Some(self.prim_get_handle(args)),
+            // -- honest typed capability gaps (contract A.7) ----------------------
+            //
+            // Every name below is a **real** oracle BIF (`prim_file`'s own NIF surface), so
+            // claiming it is what converts a caller's silent, *wrong* answer into the honest
+            // `unsupported: …` gap. Left unclaimed it falls through to the preloaded
+            // `prim_file.beam`, whose `read_info_1`'s `catch error:_ -> {error,badarg}`
+            // swallows the inner `undef` — and `{error,badarg}` is a value the oracle never
+            // returns for any of them. Each reason names the facility this runtime lacks.
+            //
+            // Deliberately **absent**, because the oracle itself answers `error:undef` for
+            // them (verified against OTP 29.1.1 / erts-17.1) and claiming them would *create*
+            // a divergence: `copy/2`, `write_file/3`, `delayed_close/1`. Absent too, for the
+            // same reason, is `sendfile/8`: its `Headers`/`Trailers`-empty clause calls
+            // `prim_inet:sendfile/4` (the oracle answers `{error,badarg}` there) and the
+            // other clause's documented answer is the *value* `{error,enotsup}`
+            // (`prim_file.erl:438-439`) — a value this floor cannot produce without the
+            // `sendfile(2)`/socket machinery, and one the fall-through already reaches.
+            ("read_file_info", 1 | 2) | ("read_link_info", 1 | 2) => Some(Err(
+                error::unsupported(
+                    "prim_file: the #file_info{} `access` slot needs access(2), which no safe \
+                     std API exposes",
+                ),
+            )),
+            ("read_handle_info", 1 | 2) => Some(Err(error::unsupported(
+                "prim_file: the #file_info{} `access` slot needs geteuid(2)/getegid(2) and the \
+                 mode bits, which no safe std API exposes",
+            ))),
+            ("write_file_info", 2 | 3) => Some(Err(error::unsupported(
+                "prim_file: needs raw chmod(2)/chown(2)/utimes(2), which no safe std API exposes",
+            ))),
+            ("advise", 4) => Some(Err(error::unsupported(
+                "prim_file:advise/4: needs posix_fadvise(2), which no safe std API exposes",
+            ))),
+            ("allocate", 3) => Some(Err(error::unsupported(
+                "prim_file:allocate/3: needs posix_fallocate(2), which no safe std API exposes",
+            ))),
+            ("list_dir", 1) | ("list_dir_all", 1) => Some(Err(error::unsupported(
+                "prim_file:list_dir/1: the answer is raw readdir(3) order, a property of the \
+                 on-disk directory state that cannot be pinned deterministically",
+            ))),
+            ("read_line", 1) => Some(Err(error::unsupported(
+                "prim_file:read_line/1: its Erlang body drives the prim_buffer:* resource NIFs, \
+                 which this runtime does not model",
+            ))),
+            ("file_desc_to_ref", 2) => Some(Err(error::unsupported(
+                "prim_file:file_desc_to_ref/2: needs raw descriptor adoption/dup(2), which no \
+                 safe std API exposes",
+            ))),
             _ => None,
         }
     }
@@ -798,6 +848,21 @@ mod tests {
         let mut sink = NullSink;
         let mut context = RuntimeContext::with_output(runtime, &mut sink);
         beam_codec::term::make_binary(context.eval_heap(), bytes).expect("a binary")
+    }
+    /// A bignum on the runtime's pointer-stable arena, `digits` least-significant limb first
+    /// (`beam_codec::term::make_big`, the same builder `erts_internal`'s family uses).
+    fn bignum(runtime: &mut Runtime, negative: bool, digits: &[u64]) -> Eterm {
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(runtime, &mut sink);
+        beam_codec::term::make_big(context.eval_heap(), negative, digits).expect("a bignum")
+    }
+    /// `term` rendered by the registered `io:format/2` `~p` printer, with the printer's one
+    /// trailing newline stripped so a test can compare a shape inline.
+    fn rendered(runtime: &mut Runtime, term: Eterm) -> String {
+        let text = runtime
+            .format_term(term, None)
+            .expect("a printable answer");
+        text.strip_suffix('\n').map_or(text.clone(), str::to_string)
     }
 
     /// `term` as the atom name it is (the tests assert names, never indices).
@@ -2505,6 +2570,300 @@ mod tests {
                 std::env::current_dir().expect("a cwd")
             );
         });
+    }
+
+    // -- prim_file:ipread_s32bu_p32bu/3 ---------------------------------------
+
+    /// The `ipread` fixture both halves of this section run on: the **pointer block**
+    /// `>II(5,64)` — payload size 5 at the absolute offset 64 — then 56 zero bytes and
+    /// `<<"HELLO">>` at that offset, so the file is `8 + 56 + 5 = 69` bytes.
+    ///
+    /// `>II` is big-endian, which is what `get_int32` reads (`sys.h:1274`).
+    fn write_ipread_fixture(path: &Path) {
+        let mut bytes = vec![0u8; 8 + 56];
+        bytes[0..4].copy_from_slice(&5u32.to_be_bytes());
+        bytes[4..8].copy_from_slice(&64u32.to_be_bytes());
+        bytes.extend_from_slice(b"HELLO");
+        std::fs::write(path, bytes).expect("the fixture is writable");
+    }
+
+    /// Opens `name` `[read]` and answers the descriptor (`open/2` is the only way in).
+    fn open_read(runtime: &mut Runtime, dir: &Path, name: &str) -> Eterm {
+        let path = path_in(runtime, dir, name);
+        let read = atom(runtime, "read");
+        let modes = list(runtime, &[read]);
+        let answer = prim_file(runtime, "open", &[path, modes]);
+        ok_value(runtime, answer)
+    }
+
+    /// Oracle (file = `>II(5,64)` + 56 zero bytes + `<<"HELLO">>` at 64), pinned live on
+    /// OTP 29.1.1 / erts-17.1: `ipread(Fd,0,100)`⇒`{ok,{5,64,<<"HELLO">>}}`;
+    /// `ipread(Fd,0,5)`/`(Fd,0,6)`⇒ the same; `ipread(Fd,0,(1 bsl 31) - 1)`⇒ the same;
+    /// `ipread(Fd,0,infinity)`/`(Fd,0,foo)`⇒ the same (**any** atom is the `infinity` form).
+    ///
+    /// `ipread(Fd,0,3)`/`(Fd,0,4)`/`(Fd,0,0)`⇒`eof` (the declared size 5 exceeds `MaxSize`),
+    /// `ipread(Fd,100,100)`/`(Fd,64,100)`⇒`eof` (fewer than 8 bytes at the pointer offset),
+    /// `ipread(Fd,100,100)` reads nothing while `ipread(Fd,64,100)` reads the 5 payload bytes
+    /// as a short pointer block — both are the bare `eof`.
+    #[test]
+    fn ipread_s32bu_p32bu_reads_the_indirect_block() {
+        let mut runtime = runtime();
+        let dir = scratch_dir("ipread");
+        write_ipread_fixture(&dir.join("ipread.bin"));
+        let fd = open_read(&mut runtime, &dir, "ipread.bin");
+
+        // The sizes that admit the payload: the declared 5, more, and both `infinity` forms.
+        let five = "{ok,{5,64,<<\"HELLO\">>}}";
+        for max in [100, 5, 6, (1 << 31) - 1] {
+            let answer = prim_file(
+                &mut runtime,
+                "ipread_s32bu_p32bu",
+                &[fd, make_small(0), make_small(max)],
+            );
+            assert_eq!(rendered(&mut runtime, answer), five, "MaxSize {max}");
+        }
+        for name in ["infinity", "foo"] {
+            let max = atom(&mut runtime, name);
+            let answer =
+                prim_file(&mut runtime, "ipread_s32bu_p32bu", &[fd, make_small(0), max]);
+            assert_eq!(rendered(&mut runtime, answer), five, "MaxSize {name}");
+        }
+
+        // A `MaxSize` below the declared size, and a pointer offset the block does not fit
+        // in, are all the bare atom `eof`.
+        for (offset, max) in [(0, 3), (0, 4), (0, 0), (100, 100), (64, 100), (65, 100)] {
+            let answer = prim_file(
+                &mut runtime,
+                "ipread_s32bu_p32bu",
+                &[fd, make_small(offset), make_small(max)],
+            );
+            assert_eq!(
+                atom_name(&runtime, answer),
+                "eof",
+                "offset {offset}, MaxSize {max}"
+            );
+        }
+        // The cursor is never moved (both reads are positioned).
+        let cur = atom(&mut runtime, "cur");
+        let answer = prim_file(&mut runtime, "position", &[fd, cur]);
+        assert_eq!(ok_value(&runtime, answer), make_small(0));
+        assert_ok(&mut runtime, "close", &[fd]);
+    }
+
+    /// Oracle: `ipread(Fd,-1,10)`/`(Fd,0,1 bsl 31)`⇒`{error,einval}`;
+    /// `ipread(Fd,0.0,10)`/`(Fd,0,10.0)`/`(Fd,"a",10)`/`(Fd,0,[a])`⇒`{error,badarg}`;
+    /// `ipread(ClosedFd,0,100)`⇒`{error,einval}`; `ipread(foo,0,10)`/`(#{},0,10)` raise
+    /// `function_clause` in the oracle (reproduced as the shared malformed-descriptor
+    /// `{error,badarg}`).
+    #[test]
+    fn ipread_s32bu_p32bu_reports_the_oracles_failures() {
+        let mut runtime = runtime();
+        let dir = scratch_dir("ipread_fail");
+        write_ipread_fixture(&dir.join("ipread.bin"));
+        let fd = open_read(&mut runtime, &dir, "ipread.bin");
+
+        // The NIF's own range checks.
+        for (offset, max) in [(-1, 10), (0, 1 << 31), (-1, 1 << 31)] {
+            assert_eq!(
+                prim_error(
+                    &mut runtime,
+                    "ipread_s32bu_p32bu",
+                    &[fd, make_small(offset), make_small(max)]
+                ),
+                "einval",
+                "offset {offset}, MaxSize {max}"
+            );
+        }
+        // A bignum passes `is_integer/1` but fails `enif_get_int64` ⇒ `einval`.
+        let big = bignum(&mut runtime, true, &[0, 1]);
+        assert_eq!(
+            prim_error(&mut runtime, "ipread_s32bu_p32bu", &[fd, big, make_small(10)]),
+            "einval"
+        );
+        assert_eq!(
+            prim_error(&mut runtime, "ipread_s32bu_p32bu", &[fd, make_small(0), big]),
+            "einval"
+        );
+
+        // The wrapper's clause set: a float, a string and a list are all the *value*
+        // `{error,badarg}` (the guard needs integers), and a float `MaxSize` is not an atom.
+        let float = heap_term(&mut runtime, |context| {
+            terms::make_float(context, 0.0)
+        });
+        let string = chars(&mut runtime, "a");
+        let one_list =
+            heap_term(&mut runtime, |context| terms::make_list(context, &[make_small(97)]));
+        for (offset, max) in [
+            (float, make_small(10)),
+            (make_small(0), float),
+            (string, make_small(10)),
+            (make_small(0), one_list),
+        ] {
+            assert_eq!(
+                prim_error(&mut runtime, "ipread_s32bu_p32bu", &[fd, offset, max]),
+                "badarg"
+            );
+        }
+
+        // A term that is not a descriptor at all.
+        let not_a_descriptor = atom(&mut runtime, "foo");
+        assert_eq!(
+            prim_error(
+                &mut runtime,
+                "ipread_s32bu_p32bu",
+                &[not_a_descriptor, make_small(0), make_small(10)]
+            ),
+            "badarg"
+        );
+        let empty_map = heap_term(&mut runtime, |context| {
+            let atoms = context.runtime.code_server.atoms_handle();
+            terms::make_map(context, &[], &atoms)
+        });
+        assert_eq!(
+            prim_error(
+                &mut runtime,
+                "ipread_s32bu_p32bu",
+                &[empty_map, make_small(0), make_small(10)]
+            ),
+            "badarg"
+        );
+
+        // A closed descriptor is the NIF's `{error,einval}` — for an in-range request and
+        // for an out-of-range one alike.
+        assert_ok(&mut runtime, "close", &[fd]);
+        for (offset, max) in [(0, 100), (-1, 10)] {
+            assert_eq!(
+                prim_error(
+                    &mut runtime,
+                    "ipread_s32bu_p32bu",
+                    &[fd, make_small(offset), make_small(max)]
+                ),
+                "einval"
+            );
+        }
+    }
+
+    // -- prim_file:get_handle/1 -----------------------------------------------
+
+    /// Oracle: `get_handle(Fd)`⇒a **4-byte** binary (a live host reported
+    /// `<<17,0,0,0>>`: `byte_size/1`⇒`4`); `get_handle(ClosedFd)`⇒`{error,einval}`;
+    /// `get_handle(foo)`/`get_handle(#{})` raise `function_clause` (reproduced as the shared
+    /// malformed-descriptor `{error,badarg}`).
+    ///
+    /// The **value** is this runtime's own descriptor number (the entry's documented
+    /// divergence — the number is a property of the process that holds the file), so only
+    /// the shape and the host's own `as_raw_fd` are pinned here; the oracle cross-check
+    /// compares the shape too.
+    #[test]
+    fn get_handle_returns_the_native_descriptor_binary() {
+        let mut runtime = runtime();
+        let dir = scratch_dir("get_handle");
+        std::fs::write(dir.join("h.txt"), b"hello").expect("the file is writable");
+        let fd = open_read(&mut runtime, &dir, "h.txt");
+
+        let answer = prim_file(&mut runtime, "get_handle", &[fd]);
+        let bytes = terms::binary_bytes(answer).expect("a bare 4-byte binary, not {ok,_}");
+        assert_eq!(bytes.len(), 4, "the native `int` descriptor is 4 bytes");
+        // The 4 bytes really are **this** runtime's own hosted descriptor, in the host's
+        // native byte order — not a plausible-looking constant. (The exact number is the
+        // entry's documented divergence; `prim_file.rs`'s own test pins it against the
+        // held `std::fs::File`'s `as_raw_fd` through the private descriptor accessor.)
+        let number = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert!(number > 2, "a live host descriptor, got {number}");
+        // The descriptor is live: the sibling `read/2` reads the file's bytes through it.
+        let two = make_small(2);
+        let read = prim_file(&mut runtime, "read", &[fd, two]);
+        let read = ok_value(&mut runtime, read);
+        assert_eq!(terms::binary_bytes(read).expect("a binary"), b"he");
+        // A closed descriptor is `{error,einval}`, a malformed one the shared `{error,badarg}`.
+        assert_ok(&mut runtime, "close", &[fd]);
+        assert_eq!(prim_error(&mut runtime, "get_handle", &[fd]), "einval");
+        let not_a_descriptor = atom(&mut runtime, "foo");
+        assert_eq!(
+            prim_error(&mut runtime, "get_handle", &[not_a_descriptor]),
+            "badarg"
+        );
+        let empty_map = heap_term(&mut runtime, |context| {
+            let atoms = context.runtime.code_server.atoms_handle();
+            terms::make_map(context, &[], &atoms)
+        });
+        assert_eq!(prim_error(&mut runtime, "get_handle", &[empty_map]), "badarg");
+    }
+
+    // -- the typed capability gaps of the unserved prim_file entries -----------
+
+    /// The `prim_file` entries this floor cannot serve are **claimed** so a caller gets the
+    /// honest `unsupported: …` capability gap (CLI exit 3) instead of falling through into
+    /// the preloaded `prim_file.beam` — where `read_info_1`'s and `read_handle_info_1`'s
+    /// `catch error:_ -> {error,badarg}` swallow the inner `undef` and answer a *value* the
+    /// oracle never returns.
+    ///
+    /// The oracle's own answers, verified live against OTP 29.1.1 / erts-17.1: for a regular
+    /// file `read_file_info/1`⇒`{ok,{file_info,69,regular,read_write,
+    /// {{Y,M,D},{H,Mi,S}}×3,33188,1,Dev,0,Ino,Uid,Gid}}` (`read_link_info/1` and
+    /// `read_handle_info/1` the same), `write_file_info/2`⇒`ok`,
+    /// `advise(Fd,0,1,sequential)`⇒`ok`, `allocate(Fd,0,10)`⇒`ok`,
+    /// `list_dir/1`⇒`{ok,[Names]}` in raw `readdir(3)` order, `read_line(Fd)`⇒`{ok,Line}`
+    /// and `file_desc_to_ref(1,[])`⇒`{ok,{file_descriptor,prim_file,#{…}}}`.
+    ///
+    /// `copy/2`, `write_file/3`, `delayed_close/1` and `sendfile/8` are deliberately **not**
+    /// claimed: the oracle answers `error:undef` for the first three (`{error,undef}` as the
+    /// caught value) and the *value* `{error,enotsup}` on `sendfile/8`'s second clause, so
+    /// claiming any of them would replace an agreeing answer with a non-agreeing one.
+    #[test]
+    fn the_unserved_prim_file_entries_are_typed_capability_gaps() {
+        let mut runtime = runtime();
+        let path = chars(&mut runtime, "/tmp/gap");
+        let one = [path];
+        let two = [path, path];
+        let three = [path, path, path];
+        let four = [path, path, path, path];
+        for (function, args) in [
+            ("read_file_info", &one[..]),
+            ("read_file_info", &two[..]),
+            ("read_link_info", &one[..]),
+            ("read_link_info", &two[..]),
+            ("read_handle_info", &one[..]),
+            ("read_handle_info", &two[..]),
+            ("write_file_info", &two[..]),
+            ("write_file_info", &three[..]),
+            ("advise", &four[..]),
+            ("allocate", &three[..]),
+            ("list_dir", &one[..]),
+            ("list_dir_all", &one[..]),
+            ("read_line", &one[..]),
+            ("file_desc_to_ref", &two[..]),
+        ] {
+            let arity = args.len();
+            let error = call(&mut runtime, "prim_file", function, args)
+                .expect_err(&format!("prim_file:{function}/{arity} is a capability gap"));
+            let reason = crate::error::unsupported_reason(&error);
+            assert!(
+                reason.is_some(),
+                "prim_file:{function}/{arity} must be classified `unsupported`, got {error}"
+            );
+        }
+
+        // The names the oracle itself rejects with `undef` are still **unclaimed**, so the
+        // call falls through to the preloaded module exactly as before (`try_native`
+        // answering `None` *is* that fall-through).
+        let eight = [path, path, path, path, path, path, path, path];
+        for (function, args) in [
+            ("copy", &two[..]),
+            ("write_file", &three[..]),
+            ("delayed_close", &one[..]),
+            ("sendfile", &eight[..]),
+        ] {
+            let mut sink = NullSink;
+            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+            assert!(
+                context
+                    .try_native("prim_file", function, args.len() as u32, args)
+                    .is_none(),
+                "prim_file:{function}/{} must stay unclaimed",
+                args.len()
+            );
+        }
     }
 
     // -- the oracle cross-check -----------------------------------------------
