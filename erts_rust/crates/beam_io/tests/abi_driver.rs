@@ -844,7 +844,10 @@ const ERL_DRV_NO_SIZE: u64 = u64::MAX;
 /// carries no such field.
 fn reply_bytes(reply: &[u8]) -> Vec<u8> {
     const MARKER: &[u8] = b"bytes=";
-    match reply.windows(MARKER.len()).position(|window| window == MARKER) {
+    match reply
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    {
         Some(at) => reply[at + MARKER.len()..].to_vec(),
         None => Vec::new(),
     }
@@ -855,7 +858,10 @@ fn reply_bytes(reply: &[u8]) -> Vec<u8> {
 /// bytes can never be mistaken for a field.
 fn reply_field(reply: &[u8], key: &str) -> u64 {
     const MARKER: &[u8] = b"bytes=";
-    let header = match reply.windows(MARKER.len()).position(|window| window == MARKER) {
+    let header = match reply
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+    {
         Some(at) => &reply[..at],
         None => reply,
     };
@@ -993,7 +999,10 @@ fn the_driver_queue_round_trips_enq_size_peek_and_deq() {
         2,
         "a failed deq leaves the queue exactly as it was"
     );
-    assert_eq!(queue_peek(&mut poller, &mut registry, id), (1, b"BC".to_vec()));
+    assert_eq!(
+        queue_peek(&mut poller, &mut registry, id),
+        (1, b"BC".to_vec())
+    );
 
     // Draining the rest empties the queue again.
     assert_eq!(queue_deq(&mut poller, &mut registry, id, 2), 0);
