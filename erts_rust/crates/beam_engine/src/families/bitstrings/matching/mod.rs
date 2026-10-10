@@ -430,10 +430,26 @@ pub(super) fn exec(
 }
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the pure decoders the `bs_*` match opcodes call. Their expected
-    //! values are the system `erl` oracle's answers for the same bit patterns.
+    //! Unit tests for the pure decoders the `bs_*` match opcodes call — their expected
+    //! values are the system `erl` oracle's answers for the same bit patterns — plus
+    //! [`empty_binary_bs_match_commands_and_the_writable_accumulator`], the
+    //! instruction-level regression for the **empty-binary match** path itself.
     use super::super::BSF_LITTLE;
     use super::*;
+
+    // The instruction-level regression drives whole instructions through the
+    // **family** dispatch ([`family_exec`], which routes to this module's [`exec`]
+    // and to `create::exec`), so it needs the machine host and the raw bitstring
+    // writers beside the decoders above.
+    use super::super::exec as family_exec;
+    use crate::context::MinimalContext;
+    use crate::families::bitstrings::raw;
+    use crate::interpreter::LabelMap;
+    use crate::machine::Machine;
+    use crate::terms::binary_bytes;
+    use crate::Step;
+    use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
+
     // -- decode_utf8 (erts_bs_get_utf8) -------------------------------------
     #[test]
     fn utf8_decodes_each_sequence_length() {
@@ -585,5 +601,230 @@ mod tests {
         assert!(ensure_at_least(15, 0, 1)); // redundant no-op
         assert!(ensure_at_least(15, 0, 5)); // alignment to Unit
         assert!(!ensure_at_least(14, 0, 5));
+    }
+
+    // -- the empty-binary match (the `base64:encode(<<>>)` shape) -----------
+    /// The **empty-binary match**: the two `bs_match` command lists the installed
+    /// `erlc` emits for `base64:encode_binary/4`'s first and empty clauses, driven as
+    /// whole instructions over a 0-bit subject, plus the 0-bit `bs_init_writable`
+    /// accumulator the empty clause returns.
+    ///
+    /// `base64:encode/2` opens its accumulator with `move {integer,256} -> x(0)` +
+    /// `bs_init_writable` and tail-calls `encode_binary/4` with that accumulator in
+    /// `x(3)`; `beam_disasm:file/1` shows `encode_binary/4` (base64.erl:218) as
+    ///
+    /// ```text
+    /// {label,19},
+    /// {bs_start_match4,{atom,no_fail},4,{x,2},{x,2}},
+    /// {bs_get_position,{x,2},{x,4},4},
+    /// {bs_match,{f,20},{x,2},
+    ///     {commands,[{ensure_at_least,48,1},
+    ///                {integer,4,{literal,[]},6,1,{x,4}},
+    ///                … {integer,11,{literal,[]},6,1,{x,11}}]}},
+    /// …
+    /// {label,20},                                        % <fail>: the empty clause
+    /// {bs_set_position,{x,2},{x,4}},
+    /// {bs_match,{f,21},{x,2},{commands,[{ensure_exactly,0}]}},
+    /// {move,{x,3},{x,0}},
+    /// return
+    /// ```
+    ///
+    /// The loop body appends with a `bs_create_bin` whose first segment is
+    /// `{atom,private_append},1,1,nil,{tr,{x,3},{t_bs_matchable,1}},{atom,all}` (the
+    /// accumulator in `x(3)` again).
+    ///
+    /// On `<<>>` the first `bs_match` must take the fail label (that is the first
+    /// clause refusing an empty subject) and the second must fall through — which is
+    /// what makes the accumulator `bs_init_writable` built the value returned. The
+    /// oracle prints that accumulator as `<<>>`:
+    ///
+    /// ```text
+    /// $ erl -noshell -eval 'io:format("~p~n",[base64:encode(<<>>)]),halt().'
+    /// <<>>
+    /// ```
+    ///
+    /// The end-to-end counterpart (the real installed `base64:encode/1` over the whole
+    /// sweep host) lives in `tests/stdlib_sweep.rs`.
+    #[test]
+    fn empty_binary_bs_match_commands_and_the_writable_accumulator() {
+        let mut machine = Machine::with_max_register(4);
+        let mut ctx = MinimalContext::new();
+
+        // The command/segment atoms the family reads from the **running module** (a
+        // real module's atom table carries them; a synthetic one must intern them).
+        let mut module = Module::default();
+        for name in [
+            "no_fail",
+            "ensure_exactly",
+            "ensure_at_least",
+            "private_append",
+            "all",
+        ] {
+            module.atom_table.intern(name);
+        }
+        let atom = |module: &Module, name: &str| {
+            Operand::Atom(
+                module
+                    .atom_table
+                    .lookup(name)
+                    .unwrap_or_else(|| panic!("atom {name:?} interned above")),
+            )
+        };
+
+        // The empty subject `<<>>` `encode_binary/4` is called on: a 0-bit on-heap
+        // binary, exactly what `terms::make_heap_binary(ctx, &[])` builds.
+        let subject = raw::make_bits(&mut machine, &mut ctx, &[], 0).expect("a 0-bit binary");
+        machine.set_x(0, subject).expect("root the subject");
+
+        // `bs_start_match4 {atom,no_fail},4,{x,0},{x,1}` — the match entry. Nothing can
+        // fail here (`no_fail`), and `<<>>` still enters a (0..0) match context.
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &LabelMap::new(),
+            &Instr::BsStartMatch4 {
+                fail: atom(&module, "no_fail"),
+                live: 4,
+                src: Operand::X(0),
+                dst: Operand::X(1),
+            },
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_start_match4 reports no raise")
+        .expect("the family claims bs_start_match4");
+        assert_eq!(step, Step::Next, "`<<>>` enters a match with `no_fail`");
+
+        // The live fail label both `bs_match`es branch to (the empty clause's entry).
+        const FAIL: Label = Label(1);
+        let mut labels = LabelMap::new();
+        labels.insert(FAIL, (0, 7));
+
+        // (1) The empty clause: `{commands,[{ensure_exactly,0}]}` MATCHES `<<>>` — the
+        // engine reports `Next` (the instruction after `bs_match`), never the fail
+        // label. (Both clauses share the context at `x(1)`; `ensure_exactly` only
+        // tests, so it does not advance it.)
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &labels,
+            &Instr::BsMatch {
+                fail: FAIL,
+                ctx: Operand::X(1),
+                commands: vec![atom(&module, "ensure_exactly"), Operand::Integer(0)],
+            },
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_match reports no raise")
+        .expect("the family claims bs_match");
+        assert_eq!(step, Step::Next, "`ensure_exactly 0` matches `<<>>`");
+
+        // (2) The first clause: `{commands,[{ensure_at_least,48,1}]}` FAILS on `<<>>`
+        // (there are 0 of the 48 required bits), so the engine branches to the live
+        // fail label instead of falling through.
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &labels,
+            &Instr::BsMatch {
+                fail: FAIL,
+                ctx: Operand::X(1),
+                commands: vec![
+                    atom(&module, "ensure_at_least"),
+                    Operand::Integer(48),
+                    Operand::Integer(1),
+                ],
+            },
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_match reports no raise")
+        .expect("the family claims bs_match");
+        assert_eq!(
+            step,
+            Step::Goto { func: 0, pc: 7 },
+            "`ensure_at_least 48` refuses `<<>>` and takes the fail label"
+        );
+
+        // (3) The accumulator the empty clause returns: `move {integer,256} -> x(0)`
+        // followed by `bs_init_writable` (the C `erts_bs_init_writable` keeps the
+        // capacity hint in `x(0)` and reports a **zero-length** window).
+        machine
+            .set_x(0, beam_term::make_small(256))
+            .expect("the capacity hint");
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &labels,
+            &Instr::BsInitWritable,
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_init_writable reports no raise")
+        .expect("the family claims bs_init_writable");
+        assert_eq!(step, Step::Next);
+        let accumulator = machine.x(0).expect("the accumulator");
+        assert_eq!(
+            raw::heap_bits(accumulator).map(|(_, bits)| bits),
+            Some(0),
+            "`bs_init_writable` returns a 0-bit bitstring"
+        );
+        assert_eq!(
+            binary_bytes(accumulator).expect("a byte binary"),
+            &[] as &[u8],
+            "the accumulator the empty clause returns reads as `<<>>`"
+        );
+
+        // `call_last 4 {base64,encode_binary,4}` hands that accumulator to the next
+        // clause in `x(3)` (the C argument-register convention), which is where the
+        // loop body's `bs_create_bin` keeps it.
+        machine.set_x(3, accumulator).expect("the accumulator in x(3)");
+
+        // The loop body's `{atom,private_append},1,1,nil,{x,3},{atom,all}` segment
+        // seeded from that accumulator appends nothing, so the built result is still
+        // `<<>>` and the frozen readers accept it. (`alloc`/`live`/`unit` are the
+        // operands `base64.beam` emits; the private_append arm reads neither.)
+        let step = family_exec(
+            &mut machine,
+            &module,
+            &labels,
+            &Instr::BsCreateBin {
+                fail: NO_FAIL,
+                alloc: 0,
+                live: 12,
+                unit: 32,
+                dst: Operand::X(3),
+                segments: vec![
+                    atom(&module, "private_append"),
+                    Operand::Integer(1), // Index (a compiler-side identifier)
+                    Operand::Integer(1), // Unit
+                    Operand::Nil,        // Flags (no little/signed/native)
+                    Operand::X(3),       // the `bs_init_writable` accumulator
+                    atom(&module, "all"), // Size
+                ],
+            },
+            0,
+            0,
+            &mut ctx,
+        )
+        .expect("bs_create_bin reports no raise")
+        .expect("the family claims bs_create_bin");
+        assert_eq!(step, Step::Next);
+        let built = machine.x(3).expect("the built binary");
+        assert_eq!(
+            raw::heap_bits(built).map(|(_, bits)| bits),
+            Some(0),
+            "a `private_append` of nothing onto `<<>>` is `<<>>`"
+        );
+        assert_eq!(
+            binary_bytes(built).expect("a byte binary"),
+            &[] as &[u8],
+            "the built result reads as `<<>>`"
+        );
     }
 }

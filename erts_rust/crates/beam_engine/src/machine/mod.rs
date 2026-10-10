@@ -459,6 +459,34 @@ impl Machine {
         self.refc_binaries.push(binary);
         Ok(data)
     }
+
+    /// The **off-heap ref-counted binary payload handles** this machine keeps alive
+    /// for the refc terms it built: the read-only view of
+    /// [`Machine::refc_binaries`], in build order.
+    ///
+    /// A `bs_init_writable` / `bs_create_bin` result larger than
+    /// [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] bytes is stored off the process
+    /// heap: the on-heap term is the frozen 8-word `[BinRef][ErlSubBits]` pair whose
+    /// `BinRef.val` word points at the payload ([`beam_term::refc`]), and the
+    /// payload itself is one of these [`beam_alloc::RefcBinary`] handles
+    /// (`Machine::alloc_refc_binary`).
+    ///
+    /// **Why a host reads them.** A host that moves a term off this machine — a
+    /// message send, a process return — copies it with the copy engine, which
+    /// resolves a refc binary's payload **by its data pointer** through the copy's
+    /// *source* off-heap table (`beam_message::OffHeapTable::binary_by_data_ptr`).
+    /// The empty source table the simple copy path (`copy_struct_simple`) uses
+    /// cannot serve that lookup, so the host first **clones** the handles the copy
+    /// needs into that source table (`beam_message::OffHeapTable::push_binary`).
+    /// Cloning a handle bumps the [`beam_alloc::RefcBinary`] refcount, so a cloned
+    /// handle kept in a destination table keeps the payload alive (and unmoved)
+    /// after this machine is dropped.
+    ///
+    /// The slice is **never cleared by [`Machine::reset`]**, so a payload a returned
+    /// term still points at survives the next run.
+    pub fn refc_binaries(&self) -> &[beam_alloc::RefcBinary] {
+        &self.refc_binaries
+    }
 }
 
 impl Default for Machine {
