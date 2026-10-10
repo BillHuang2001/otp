@@ -36,7 +36,7 @@ per-function bodies. Files:
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `get_application/0` (always `undefined` — there is no application controller and no owning application), `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
 | `erts_internal.rs` | the `erts_internal` floor (14 BIFs) — see below |
-| `prim.rs` | the `prim_file` floor (16 entries) — see below |
+| `prim.rs` | the `prim_file` floor (27 entries) — see below |
 | `prim_file.rs` | the whole-file-descriptor half of the `prim_file` floor (`open/2` `read/2` `write/2` `close/1` `position/2`) + its unit tests |
 | `file_server.rs` | the native **`file_server_2` service** (contract A.9) — the registered service process + its native io-devices, the `gen_server`/`file`/`io` wire, and the scheduler-pass step that services their mailboxes (see below) |
 | `file_server/get_until.rs` | the `{get_until, …}` io-device request (`get_until::serve` + the engine-backed `EngineContinuation`) — the one io-device step that runs Erlang code, driving `Mod:Func(Cont, Data, XtraArgs…)` on the engine (see below); its unit tests live in `file_server/get_until/tests.rs` |
