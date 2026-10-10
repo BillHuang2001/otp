@@ -152,12 +152,26 @@
 //!   `~p`/`~P`.
 //! * **`io_lib:format/3` ignores unknown options but not `chars_limit`.** The only
 //!   option erts-17.1 recognises is `{chars_limit, N}`; other elements are ignored
-//!   (verified against the oracle). A *limiting* `chars_limit` (`N >= 0`) selects
-//!   `io_lib_pretty`'s "…"-eliding rendering, which Milestone-1 does not implement,
-//!   so it is rejected with a typed error (`error:unsupported_bif`) rather than
-//!   emitting a wrong (unlimited) line. A non-integer `N` is `badarg`, and a
-//!   non-list `Options` is `badarg`, exactly as in the oracle; a negative
-//!   `chars_limit` (the oracle's default, i.e. no limit) behaves like `format/2`.
+//!   (verified against the oracle). A non-integer `N` is `badarg`, and a non-list
+//!   `Options` is `badarg`, exactly as in the oracle; a negative `chars_limit`
+//!   (the oracle's default, i.e. no limit) behaves like `format/2`.
+//! * **A *limiting* `chars_limit` (`N >= 0`) is an honest, typed, catchable gap.**
+//!   The oracle then returns a *limited* deep list — literal format text is never
+//!   limited, but each "big" control (`~w`/`~W`/`~p`/`~P`, and `~s` of a list or
+//!   binary) is rendered at a per-directive budget and elided with `"..."`, so
+//!   `io_lib:format("~w", [[1,2,3]], [{chars_limit,3}])` is `["[","...","]"]`
+//!   while `{chars_limit,100}`/`{chars_limit,-1}` are the normal deep list.
+//!   Reproducing that needs `io_lib_format`'s [`check_options`]/`build_limited`
+//!   two-pass **plus** `io_lib_pretty:intermediate/7` + `find_upper/11` +
+//!   `search_depth/9` + `expand/3` (a binary search over the depth/limit space
+//!   that grows a template until it just fits the budget). [`crate::print::pretty`]
+//!   already threads the template's `T`/`Dots` through `print_length/7` and owns
+//!   `tsub`/the `T =:= 0` elision, but it has **no `More` closure** on its `Node`
+//!   and none of the four `intermediate`-side functions, and `render_format`
+//!   performs no `count_small`/`build_limited` pass — see [`check_options`] for
+//!   the exact boundary. Until that is ported this is refused with the typed,
+//!   **catchable** `error:unsupported_bif` raise rather than emitting a wrong
+//!   (unlimited) line.
 
 use beam_codec::term::big_parts;
 use beam_common::Result;
@@ -260,21 +274,60 @@ fn format_lib_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `io_lib:format(Format, Args, Options)` — the rendering as an iolist, with the
 /// oracle's `format_options()` (`[{chars_limit, N}]`).
 ///
-/// Only the default/unlimited options are reproduced (see [`check_options`]).
+/// Only the default/unlimited options are reproduced (see [`check_options`]): a
+/// *limiting* `chars_limit` (`N >= 0`) is the typed, catchable `unsupported_bif`
+/// gap. The gap is a plain `BeamError::Raise` (reason atom `unsupported_bif`), so
+/// interpreted/compiled Erlang code can `try … catch error:unsupported_bif -> …`
+/// it; it never aborts the runtime. (The CLI's `-eval` entry point reports every
+/// capability gap as an unrecoverable `Flow::Fatal` by design — a `beam_rt`
+/// policy, not a property of this BIF.)
 fn format_lib_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     check_options(ctx, args[2])?;
     io_lib_format(ctx, args[0], Some(args[1]))
 }
 
 /// Validates `io_lib:format/3`'s `Options` list
-/// (`io_lib_format:get_option/3` over `lists:keyfind/3`).
+/// (`io_lib_format:get_option/3` over `lists:keyfind/3`) and rejects the
+/// not-yet-ported *limiting* `chars_limit`.
 ///
 /// `Options` must be a proper list (`badarg` otherwise, as in the oracle).
 /// Elements other than `{chars_limit, N}` are ignored — the oracle only reads that
-/// one key. A limiting `chars_limit` (`N >= 0`) would need `io_lib_pretty`'s
-/// "…"-eliding rendering, which Milestone-1 does not implement, so it is a typed
-/// error ([`unsupported_bif`]) rather than a wrong (unlimited) line; a negative
-/// `N` is the oracle's default (no limit) and is accepted.
+/// one key — and a negative `N` is the oracle's default (no limit). A limiting
+/// `chars_limit` (`N >= 0`) is a typed [`unsupported_bif`] gap.
+///
+/// **What is missing** (precisely bounded — the oracle's own algorithm):
+///
+/// * `io_lib_format:build/2`'s two passes: `build_small(FormatList, CharsLimit)`
+///   (a `lists:flatten` of every *small* control's rendering, with
+///   `limit_field(F, CL) = max(3, min(F, CL))` applied when `CL >= 0`), then
+///   `count_small/1` partitioning the result into the big-control counts
+///   `P`/`S`/`W` (`~p`/`~P`, `~s`-of-list/binary, `~w`/`~W`) and `Other` (the
+///   `io_lib:chars_length` of every literal/`small`-spliced character), and only
+///   then `build_limited/5`.
+/// * `build_limited(Res1, NumOfPs, Count0, RemainingChars, I)` with
+///   `RemainingChars = CharsLimit - Other`, the per-directive budget
+///   `MaxChars = if MaxLen0 < 0 -> MaxLen0; true -> MaxLen0 div Count0 end`,
+///   `MaxLen = MaxLen0 - chars_length(S)` after each big control, `decr_pc/2` (only
+///   `~p`/`~P` decrement the `P` budget) and the `indentation/2`-threaded column
+///   `I` (`I + 1` is a `~p`/`~P`'s default initial column).
+/// * That per-directive budget for `~w`/`~W` is
+///   `io_lib_pretty:intermediate(Term, Depth, T, Enc, RFun, StrFun, Ord)`: build the
+///   template at depth `D0 = 1` with `print_length(Term, 1, T, …)` and, when
+///   `Dots =/= 0 orelse Len > T orelse D0 =:= 1` is *not* decisive, binary-search
+///   the depth via `find_upper(…, Lower = 1, Upper = 2, …)` + `search_depth/9`
+///   (with its `Du - Dl =:= 1 ⇒ Lower iff its Len =:= T` tie rule) and `expand/3`
+///   (which re-derives *more* of the term at the winning depth by re-running the
+///   `More` closure each non-dots node carries). `~p`/`~P` under a limit take the
+///   same `intermediate` + the **flat** `write/1` (the `pp/8` re-flow is unreached,
+///   so a limited `~p` never breaks lines).
+///
+/// [`crate::print::pretty`] already models the `print_length/7` side of that
+/// (`build` + `tsub` + the `T =:= 0` elision + `Tpl::Container`/`SeqTail::Dots`)
+/// and `write/1` — but its `Node` carries **no `More` closure**, and
+/// `intermediate`/`find_upper`/`search_depth`/`expand`, `count_small`,
+/// `build_limited` and `limit_field` are all absent. So the port is a real
+/// algorithm addition, not a flag flip; half-implementing it would produce a
+/// *wrong* limited rendering, which this crate must never do.
 fn check_options(ctx: &BifContext<'_>, options: Eterm) -> Result<()> {
     for option in proper_list(options).ok_or_else(badarg)? {
         if let Some(limit) = chars_limit_option(ctx, option)? {
@@ -1238,7 +1291,7 @@ mod tests {
     use super::*;
     use crate::print::flatten;
     use beam_alloc::Heap;
-    use beam_common::{BeamError, ExitReason};
+    use beam_common::{BeamError, ExceptionClass, ExitReason};
     use beam_process::ProcessId;
     use beam_term::{make_small, AtomTable, NIL};
 
@@ -2258,11 +2311,14 @@ mod tests {
         let (three, two) = run_lib3("~w", &[42], option_chars_limit_neg);
         assert_eq!(text(three), text(two));
 
-        // A limiting `chars_limit` is a typed error, never a wrong (unlimited) line.
+        // A limiting `chars_limit` is a typed, *catchable* error, never a wrong
+        // (unlimited) line and never a runtime abort: `unsupported_bif` is a plain
+        // `BeamError::Raise`, i.e. the `error:unsupported_bif` a BEAM `catch` sees.
         let (three, _) = run_lib3("~w", &[42], option_chars_limit_three);
         match three {
             Outcome::Err(BeamError::Raise(raise)) => {
                 assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"));
+                assert_eq!(raise.class, ExceptionClass::Error);
             }
             other => panic!("expected a typed unsupported-option error, got {other:?}"),
         }
