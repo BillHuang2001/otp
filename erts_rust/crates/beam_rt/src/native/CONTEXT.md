@@ -139,12 +139,13 @@ Each raises the capability gap `unsupported: process_info: <name> …` (exit 3) 
 value and never a false `badarg`. The gap names the missing accessor/hook:
 | item | missing accessor / hook |
 |---|---|
-| `catchlevel` | the runtime has no catch-frame store reachable from here |
-| `backtrace` | no binary backtrace (see `current_stacktrace`) |
-| `magic_ref`, `parent`, `label` | no such PCB fields in M1 |
-| `async_dist`, `priority_messages` | no such process flags in M1 |
-| `garbage_collection_info` | per-generation block detail beyond `beam_gc::HeapInfo` |
-| `binary` | no process registers off-heap refc binaries yet, and `beam_alloc::RefcBinary` exposes no refcount accessor for the `{Ptr,Size,Refc}` third field |
+| `backtrace` | no raw/binary stack-dump accessor (`Machine` exposes only the cooked `current_stacktrace`) |
+| `magic_ref` | the NIF resource API (`enif_alloc_resource`/`enif_make_resource`) is unbound, so no resource is bound into a process's off-heap table (oracle `[]`) |
+| `parent` | no parent field on `beam_process::Process`/`ProcessFlags` — the spawner is not recorded |
+| `label` | no label field on the PCB (`spawn_opt(_, [{label,_}])` is `badarg` even on the oracle) |
+| `async_dist`, `priority_messages` | no such flags in `beam_process::ProcessFlags` |
+| `garbage_collection_info` | `beam_gc::HeapInfo` measures no per-generation block sizes (the oracle's 11-key proplist) |
+| `binary` | `beam_alloc::RefcBinary` exposes `refcount()`/`len()`/`data_ptr()`, but no process registers off-heap refc binaries in `Process::off_heap` (the engine holds them privately on `Machine::refc_binaries`), so the oracle's `[{Ptr,Size,Refc},…]` roster cannot be built (answering `[]` would be wrong for a process holding a large binary) |
 
 An item this runtime cannot answer is **omitted** by `process_info/1` (the same mechanism the C uses
 for an unregistered `registered_name`), so the list is a genuine, shorter-by-construction answer.
